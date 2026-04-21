@@ -13,8 +13,8 @@ A bridge between chat platforms (Discord today, Slack tomorrow) and ACP-compatib
 
 - Run a chat bot on a server / home lab / VM.
 - From your phone (Discord), spin up a session per thread.
-- Pick a repo with emoji reactions; chat with a coding agent in the thread.
-- Switch model on the fly. Switch mode (Agent / Plan / Autopilot). Switch agent (later).
+- Pick a repo with interactive buttons; chat with a coding agent in the thread.
+- Switch model on the fly (interactive picker). Switch mode (Agent / Plan / Autopilot). Switch agent.
 
 ## Why ACP
 
@@ -34,10 +34,13 @@ Copy `.env.example` to `.env` and fill it in.
 | `DISCORD_ALLOWED_USER_IDS` | yes | Comma-separated Discord user IDs that can control the bot (e.g. `123,456`) |
 | `DISCORD_DEV_GUILD_ID` | no | Set to register slash commands instantly to one guild (good for dev) |
 | `REPOS_ROOT` | yes | Root folder containing repos the agent can touch |
+| `ATTACH_ROOTS` | no | Comma-separated extra absolute directories the `/seam attach` command (and the agent-side fence-to-file shortcut) can read from. `REPOS_ROOT` is always allowed. |
 | `DATA_DIR` | no | Defaults to `./data` (sqlite lives here) |
-| `DEFAULT_AGENT` | no | `copilot` for now |
+| `DEFAULT_AGENT` | no | `copilot` or `gemini` |
 | `DEFAULT_MODEL` | no | e.g. `gpt-5.4`, `claude-sonnet-4.5`, `claude-opus-4.7`, `auto` |
 | `COPILOT_CLI_PATH` | no | If `copilot` is not on `PATH` |
+| `GEMINI_CLI_PATH` | no | If `gemini` is not on `PATH` |
+| `GEMINI_DEFAULT_MODEL` | no | e.g. `gemini-2.5-pro` |
 | `TURN_TIMEOUT_SECONDS` | no | Default 900 |
 | `LOG_LEVEL` | no | `fatal` / `error` / `warn` / `info` / `debug` / `trace` |
 | `HEALTH_PORT` | no | Default 3000 — exposes `GET /health` |
@@ -70,11 +73,12 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 
 | Command | What it does |
 |---|---|
-| `/seam new [name]` | Create a new public thread in the current channel |
+| `/seam new [name]` | Create a new public thread, bind a session to it, and post the repo picker — all in one step |
 | `/seam init` | Bind the current thread as a session and post the repo picker |
 | `/seam repo <path>` | Set the working repo (relative to `REPOS_ROOT` or absolute under it) |
-| `/seam repos` | List repos found under `REPOS_ROOT` |
-| `/seam model [id]` | Get / set the model for this session (live if a runtime is active) |
+| `/seam repos` | List repos found under `REPOS_ROOT` (hidden directories are skipped) |
+| `/seam agent [id]` | With no id: posts an interactive picker of registered profiles. With id: switch directly. |
+| `/seam model [id]` | With no id: starts the agent if needed and posts a picker of advertised models. With id: set directly (live if a runtime is active). |
 | `/seam mode <id>` | Set the agent operational mode (e.g. plan / agent / autopilot) |
 | `/seam effort <low\|medium\|high>` | Set reasoning effort (model-dependent) |
 | `/seam tools <allow\|exclude> [csv]` | Tool allow / exclude list (empty list = clear) |
@@ -83,8 +87,11 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seam config` | Show the session config JSON |
 | `/seam config-set <json>` | Replace the session config wholesale |
 | `/seam sessions` | List recent sessions across the bot |
+| `/seam attach <path>` | Upload a host-side file (under `REPOS_ROOT` or `ATTACH_ROOTS`) into the channel without involving the agent |
 | `/seam avatar` | Re-push the bot avatar to Discord (force re-upload) |
 | `/seam help` | Show this list |
+
+Interactive pickers use buttons for ≤15 choices (laid out across up to 3 rows of 5) and a select menu for 16–25.
 
 Free-form messages in a thread are sent straight to the agent. You can attach
 files to a message and they'll be forwarded as ACP content blocks: images and
@@ -98,16 +105,17 @@ Discord attachment. Discord's free-tier 25 MB upload limit applies.
 
 The bot also auto-uploads two adjacent cases:
 
-- **Tool-emitted files on disk.** Any tool that writes a file under the
-  session's cwd or a configured scratch dir and narrates the path in
-  its result (Playwright screenshots, `write_file`, etc.) gets picked
-  up by a path-watcher that reads the file and uploads it. Whitelist of
-  extensions: png/jpg/gif/webp/svg/pdf/md/csv/json/xml/html/txt/log/mp3/wav/ogg/webm/mp4.
-- **Inlined fenced code blocks.** When the agent emits a substantial
-  fenced block (≥ 20 lines for code, ≥ 5 for markdown) with a known
-  language tag, the bot uploads it as `snippet-N.<ext>` after the turn
-  finishes. Mirrors what Claude.ai's UI does. Untagged blocks and
-  short snippets stay inline as plain text.
+- **Streaming fence-to-file.** Every fenced code block the agent emits is
+  captured as it streams, stripped from chat, and uploaded as a Discord
+  attachment named `snippet-N.<ext>` (extension inferred from the language
+  tag; unknown tags fall back to `.txt`). This keeps long code out of the
+  chat, makes the empty-pill / unclosed-fence runaway bug architecturally
+  impossible, and gives consistent UX for any size snippet.
+- **Fence-as-file shortcut.** If a fence's entire content is a single line
+  that resolves to a real file under `REPOS_ROOT` or `ATTACH_ROOTS`, the
+  bot uploads the *referenced file* instead of the snippet text. Symlinks
+  are followed and the realpath is re-validated. Useful for "give me back
+  that doc as an attachment" prompts.
 
 ### MCP servers
 
@@ -119,8 +127,8 @@ session. Configure them via env vars:
 | `MCP_PLAYWRIGHT_ENABLED=true` | [`@playwright/mcp`](https://www.npmjs.com/package/@playwright/mcp) | Real Chromium browser. Lets the agent navigate sites and take screenshots; screenshots flow back as Discord attachments via the agent-file pipeline. Chromium (~150 MB) is downloaded by Playwright on first run. |
 
 Add new servers in `src/mcp.ts`. Anything that emits `image` / `audio` /
-embedded resource content blocks will be picked up by Phase 2 and
-uploaded to the thread automatically.
+embedded resource content blocks will be picked up automatically and
+uploaded to the thread.
 
 ## Architecture
 
@@ -145,7 +153,7 @@ AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agen
 ## Testing
 
 ```sh
-npm test         # 30 unit tests + 1 integration test against `copilot --acp`
+npm test         # unit tests + 1 integration test against `copilot --acp`
 npm run typecheck
 npm run build
 ```

@@ -16,7 +16,7 @@ import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { splitForFlush, hasOpenFence } from "../../core/stream-flush.js";
-import { detectFileBlocks } from "../../agents/code-block-detector.js";
+import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import {
   defaultSessionConfig,
   type SessionConfigState,
@@ -131,12 +131,17 @@ export class Orchestrator {
 
     let textBuffer = "";
     let textSent = false;
-    /**
-     * Full assistant text accumulated this turn (before chunk-flushing).
-     * Used after streaming ends to detect file-shaped fenced code blocks
-     * and upload them as Discord attachments.
-     */
-    let fullTurnText = "";
+    let totalAgentChars = 0;
+    // Streaming fence extractor: pulls every ```lang ... ``` block out
+    // of the agent's text and turns each into a Discord file attachment
+    // so fenced code never has to render in chat.
+    const fenceStream = new FenceStream();
+    let fenceCounter = 0;
+    // Watchdog: if a fence stays open longer than this with no closer,
+    // we drop the bytes to avoid runaway accumulation. Checked on each
+    // chunk + at end-of-turn.
+    const FENCE_MAX_OPEN_MS = 60_000;
+    let fenceWatchdogTripped = false;
     // Per-turn timing for diagnosing slow turns. Set when we send the
     // prompt; first-chunk + total recorded as info logs.
     let turnStartedAt = 0;
@@ -324,8 +329,57 @@ export class Orchestrator {
                 return;
               }
             }
-            textBuffer += event.text;
-            fullTurnText += event.text;
+            totalAgentChars += event.text.length;
+            // Run text through the fence extractor: prose flows into the
+            // chat pipeline, completed fences become file uploads.
+            const fenceResult = fenceStream.feed(event.text);
+            for (const fence of fenceResult.fences) {
+              fenceCounter += 1;
+              await this.uploadFenceAsFile(channel, fence, fenceCounter);
+              textSent = true;
+            }
+            // Watchdog: drop the bytes if a fence has been open too long.
+            if (
+              !fenceWatchdogTripped &&
+              fenceStream.inFence &&
+              fenceStream.openSinceMs() > FENCE_MAX_OPEN_MS
+            ) {
+              fenceWatchdogTripped = true;
+              this.logger.warn(
+                { session: record.id },
+                "open fence exceeded watchdog timeout; dropping bytes"
+              );
+              try {
+                await this.adapter.sendMessage(
+                  channel,
+                  "⚠️ Agent opened a code block that never closed — dropping its contents."
+                );
+                textSent = true;
+              } catch (err) {
+                this.logger.warn({ err }, "fence watchdog notice failed");
+              }
+              try {
+                await runtime.cancel();
+              } catch (err) {
+                this.logger.warn({ err }, "cancel after fence watchdog failed");
+              }
+              return;
+            }
+            if (!fenceResult.prose) {
+              // Buffered into a fence; nothing to flush right now.
+              if (firstChunkAt === undefined) {
+                firstChunkAt = Date.now();
+                this.logger.info(
+                  {
+                    ttftMs: firstChunkAt - turnStartedAt,
+                    session: record.id,
+                  },
+                  "agent first text chunk"
+                );
+              }
+              return;
+            }
+            textBuffer += fenceResult.prose;
             maybeFlush();
             armIdleFlush();
             // Track time-to-first-chunk so we can tell whether the
@@ -397,6 +451,34 @@ export class Orchestrator {
       const result = await raceWithTimeout(turnPromise, timeoutMs);
 
       cancelFlushTimer();
+      // Drain the fence extractor: any final prose enters the chat
+      // pipeline; an unclosed fence is dropped with a notice.
+      const tail = fenceStream.flush();
+      if (tail.prose) textBuffer += tail.prose;
+      for (const fence of tail.fences) {
+        fenceCounter += 1;
+        await this.uploadFenceAsFile(channel, fence, fenceCounter);
+        textSent = true;
+      }
+      if (tail.unclosed && !fenceWatchdogTripped) {
+        this.logger.warn(
+          {
+            session: record.id,
+            lang: tail.unclosed.lang,
+            chars: tail.unclosed.content.length,
+          },
+          "agent ended turn with an unclosed code fence; dropping"
+        );
+        try {
+          await this.adapter.sendMessage(
+            channel,
+            "⚠️ Agent ended with an unclosed code block — dropped its contents."
+          );
+          textSent = true;
+        } catch (err) {
+          this.logger.warn({ err }, "unclosed-fence notice failed");
+        }
+      }
       await flushChunks();
       this.logger.info(
         {
@@ -404,14 +486,11 @@ export class Orchestrator {
           totalMs: Date.now() - turnStartedAt,
           ttftMs:
             firstChunkAt !== undefined ? firstChunkAt - turnStartedAt : null,
-          chars: fullTurnText.length,
+          chars: totalAgentChars,
+          fenceFiles: fenceCounter,
         },
         "turn timing"
       );
-      // After all text has been flushed, scan it for file-shaped fenced
-      // code blocks (markdown docs, JSON configs, scripts, etc.) and
-      // upload each as a Discord attachment.
-      await this.uploadDetectedCodeBlocks(channel, fullTurnText);
 
       if (
         result !== "timeout" &&
@@ -1011,46 +1090,47 @@ export class Orchestrator {
   }
 
   /**
-   * After a turn finishes, scan the assistant's accumulated text for
-   * fenced code blocks that look like complete file artifacts (markdown
-   * docs, JSON configs, scripts, etc.) and upload each as a Discord
-   * attachment. Mirrors what Claude.ai's UI does — the model only
-   * emits text; the client decides what's file-shaped.
-   *
-   * Failures are logged but never crash the turn.
+   * Upload a code fence captured by the streaming extractor as a
+   * Discord file attachment. Failures are logged, never thrown.
    */
-  private async uploadDetectedCodeBlocks(
+  private async uploadFenceAsFile(
     channel: ChannelRef,
-    fullText: string
+    fence: CompletedFence,
+    counter: number
   ): Promise<void> {
-    if (!this.adapter.sendFile) return;
-    let blocks;
-    try {
-      blocks = detectFileBlocks(fullText);
-    } catch (err) {
-      this.logger.warn({ err }, "code-block detection failed");
+    if (!this.adapter.sendFile) {
+      // No file support — fall back to posting the fenced block inline.
+      const fenceText = `\`\`\`${fence.lang}\n${fence.content}\n\`\`\``;
+      try {
+        await this.adapter.sendMessage(channel, fenceText);
+      } catch (err) {
+        this.logger.warn({ err }, "fence inline fallback failed");
+      }
       return;
     }
-    if (blocks.length === 0) return;
-    this.logger.info(
-      { count: blocks.length, langs: blocks.map((b) => b.lang) },
-      "uploading detected code blocks"
-    );
-    for (const b of blocks) {
-      try {
-        const buf = Buffer.from(b.content, "utf8");
-        if (buf.byteLength > 25 * 1024 * 1024) continue;
-        await this.adapter.sendFile(channel, {
-          data: buf,
-          filename: b.filename,
-          mimeType: b.mimeType,
-        });
-      } catch (err) {
-        this.logger.warn(
-          { err, filename: b.filename },
-          "code-block upload failed"
+    const filename =
+      fence.ext === "Dockerfile"
+        ? counter === 1
+          ? "Dockerfile"
+          : `Dockerfile.${counter}`
+        : `snippet-${counter}.${fence.ext}`;
+    try {
+      const buf = Buffer.from(fence.content, "utf8");
+      const MAX = 25 * 1024 * 1024;
+      if (buf.byteLength > MAX) {
+        await this.adapter.sendMessage(
+          channel,
+          `_Code block too large to upload (${buf.byteLength} B, Discord 25 MB limit)._`
         );
+        return;
       }
+      await this.adapter.sendFile(channel, {
+        data: buf,
+        filename,
+        mimeType: fence.mimeType,
+      });
+    } catch (err) {
+      this.logger.warn({ err, filename }, "fence upload failed");
     }
   }
 

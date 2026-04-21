@@ -20,7 +20,14 @@ export function buildGlobalMcpServers(logger: Logger): McpServer[] {
     servers.push({
       name: "playwright",
       command: "npx",
-      args: ["-y", "@playwright/mcp@latest", "--isolated"],
+      args: [
+        "-y",
+        "@playwright/mcp@latest",
+        "--isolated",
+        "--headless",
+        "--image-responses",
+        "allow",
+      ],
       env: [],
     });
     logger.info("MCP enabled: playwright (browser automation + screenshots)");

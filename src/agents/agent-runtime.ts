@@ -495,7 +495,7 @@ export class AgentRuntime {
       return;
     }
 
-    this.logger.debug(
+    this.logger.info(
       { source, blockType: block.type },
       "non-text content block from agent"
     );
@@ -527,6 +527,13 @@ export class AgentRuntime {
   private async handleToolCallContent(tc: unknown): Promise<void> {
     if (!tc || typeof tc !== "object") return;
     const t = tc as { type?: string; content?: unknown };
+    // Trace what shape arrives from each tool — invaluable for figuring out
+    // why an MCP server's image / file output isn't surfacing as an upload.
+    const inner = (t.content as { type?: string } | undefined)?.type;
+    this.logger.debug(
+      { tcType: t.type, contentType: inner },
+      "tool_call content entry"
+    );
     if (t.type !== "content") {
       // diff / terminal — handled elsewhere or ignored for now.
       return;

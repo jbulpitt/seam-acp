@@ -20,7 +20,6 @@ import {
   type RejectedAttachment,
 } from "./attachments.js";
 import { blockToFile } from "./agent-content.js";
-import { readFilesFromText } from "./path-watcher.js";
 
 /** Events surfaced from the ACP `session/update` stream. */
 export type AgentEvent =
@@ -111,7 +110,6 @@ export class AgentRuntime {
   private readonly logger: Logger;
   private readonly permissionPolicy: PermissionPolicy;
   private readonly mcpServers: McpServer[];
-  private readonly extraSafeRoots: string[];
 
   private child?: ReturnType<AgentProfile["spawn"]>;
   private connection?: ClientSideConnection;
@@ -119,8 +117,6 @@ export class AgentRuntime {
   private sessionInfo?: SessionInfo;
   private promptCapabilities?: PromptCapabilities;
   private sessionCwd?: string;
-  /** Absolute paths uploaded during the current turn; reset on each prompt. */
-  private uploadedPathsThisTurn = new Set<string>();
 
   private eventHandler?: AgentEventHandler;
 
@@ -129,17 +125,10 @@ export class AgentRuntime {
     logger: Logger;
     permissionPolicy?: PermissionPolicy;
     mcpServers?: McpServer[];
-    /**
-     * Additional directories the path-watcher is allowed to read files from
-     * (beyond the session's cwd). E.g. an MCP scratch dir like
-     * `<DATA_DIR>/agent-scratch/playwright`.
-     */
-    extraSafeRoots?: string[];
   }) {
     this.profile = opts.profile;
     this.logger = opts.logger.child({ agent: opts.profile.id });
     this.mcpServers = opts.mcpServers ?? [];
-    this.extraSafeRoots = opts.extraSafeRoots ?? [];
     this.permissionPolicy =
       opts.permissionPolicy ??
       (async (req) => {
@@ -278,8 +267,6 @@ export class AgentRuntime {
   ): Promise<PromptOutcome> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
-    // Reset per-turn dedup so files re-emitted across turns still upload.
-    this.uploadedPathsThisTurn = new Set<string>();
 
     const prompt: Array<import("@agentclientprotocol/sdk").ContentBlock> = [];
     if (text) prompt.push({ type: "text", text });
@@ -515,10 +502,6 @@ export class AgentRuntime {
           text,
           ...(extra.messageId ? { messageId: extra.messageId } : {}),
         });
-        // Scan the assistant's narration for file paths under our safe
-        // roots — catches things like "Saved to /tmp/foo.pdf" without
-        // dragging in every file the agent merely reads.
-        await this.scanToolTextForFiles(text);
       }
       return;
     }
@@ -547,40 +530,6 @@ export class AgentRuntime {
         kind: "agent-text",
         text: `🔗 [${label}](${link.uri ?? ""})`,
         ...(extra.messageId ? { messageId: extra.messageId } : {}),
-      });
-    }
-  }
-
-  private async scanToolTextForFiles(text: string): Promise<void> {
-    const roots: string[] = [];
-    if (this.sessionCwd) roots.push(this.sessionCwd);
-    roots.push(...this.extraSafeRoots);
-    if (roots.length === 0) return;
-
-    let files;
-    try {
-      files = await readFilesFromText(text, {
-        roots,
-        seen: this.uploadedPathsThisTurn,
-      });
-    } catch (err) {
-      this.logger.warn({ err }, "path-watcher scan failed");
-      return;
-    }
-
-    for (const f of files) {
-      this.logger.info(
-        { path: f.absPath, mimeType: f.mimeType, bytes: f.data.byteLength },
-        "uploading file referenced by tool output"
-      );
-      await this.emit({
-        kind: "agent-file",
-        source: "tool",
-        filename: f.filename,
-        mimeType: f.mimeType,
-        data: f.data.toString("base64"),
-        base64: true,
-        uri: f.absPath,
       });
     }
   }

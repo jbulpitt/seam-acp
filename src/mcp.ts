@@ -17,13 +17,6 @@ import type { Logger } from "./lib/logger.js";
 
 export interface McpServersResult {
   servers: McpServer[];
-  /**
-   * Extra directories the path-watcher should treat as safe roots when
-   * scanning tool output for file paths. Anything an MCP server is
-   * configured to write into should be listed here so screenshots and
-   * other emitted files can be uploaded to chat.
-   */
-  extraSafeRoots: string[];
 }
 
 export function buildGlobalMcpServers(
@@ -31,7 +24,6 @@ export function buildGlobalMcpServers(
   opts: { dataDir: string }
 ): McpServersResult {
   const servers: McpServer[] = [];
-  const extraSafeRoots: string[] = [];
 
   if (parseBool(process.env.MCP_PLAYWRIGHT_ENABLED)) {
     // Pin Playwright's outputs to a known scratch dir under DATA_DIR so
@@ -54,14 +46,13 @@ export function buildGlobalMcpServers(
       ],
       env: [],
     });
-    extraSafeRoots.push(scratch);
     logger.info(
       { outputDir: scratch },
       "MCP enabled: playwright (browser automation + screenshots)"
     );
   }
 
-  return { servers, extraSafeRoots };
+  return { servers };
 }
 
 function parseBool(v: string | undefined): boolean {

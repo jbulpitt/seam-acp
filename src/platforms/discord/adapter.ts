@@ -12,6 +12,7 @@ import {
   ButtonStyle,
   ComponentType,
   EmbedBuilder,
+  StringSelectMenuBuilder,
   type Message,
   type TextChannel,
   type ThreadChannel,
@@ -153,6 +154,117 @@ export class DiscordAdapter implements ChatAdapter {
       } catch (err) {
         this.logger.warn({ err, reaction: r }, "addReaction failed");
       }
+    }
+  }
+
+  /**
+   * Show an interactive picker. Uses a button row when the choice count
+   * fits Discord's 5-button limit; otherwise falls back to a string-select
+   * menu (capped at the platform's 25-option limit). Returns null on
+   * timeout or unauthorized interaction.
+   */
+  async sendChoicePicker(
+    channel: ChannelRef,
+    opts: {
+      prompt: string;
+      choices: ReadonlyArray<{ value: string; label: string; description?: string }>;
+      timeoutMs?: number;
+      authorizedUserIds?: ReadonlySet<string>;
+    }
+  ): Promise<{ value: string; userId: string } | null> {
+    const ch = await this.fetchSendableChannel(channel.id);
+    const timeoutMs = opts.timeoutMs ?? 5 * 60 * 1000;
+
+    const choices = opts.choices.slice(0, 25);
+    if (choices.length === 0) return null;
+
+    const useButtons = choices.length <= 5;
+    const customId = `seam-pick:${Date.now()}`;
+
+    let component: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>;
+    if (useButtons) {
+      const buttons = choices.map((c, idx) =>
+        new ButtonBuilder()
+          .setCustomId(`${customId}:${idx}`)
+          .setLabel(c.label.slice(0, 80))
+          .setStyle(ButtonStyle.Secondary)
+      );
+      component = new ActionRowBuilder<ButtonBuilder>().addComponents(buttons);
+    } else {
+      const select = new StringSelectMenuBuilder()
+        .setCustomId(customId)
+        .setPlaceholder("Choose…")
+        .addOptions(
+          choices.map((c, idx) => ({
+            value: String(idx),
+            label: c.label.slice(0, 100),
+            ...(c.description ? { description: c.description.slice(0, 100) } : {}),
+          }))
+        );
+      component = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+    }
+
+    const msg = await ch.send({
+      content: opts.prompt,
+      components: [component as ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>],
+    });
+
+    try {
+      const interaction = await msg.awaitMessageComponent({
+        filter: (i) => {
+          if (
+            opts.authorizedUserIds &&
+            !opts.authorizedUserIds.has(i.user.id)
+          ) {
+            i.reply({
+              content: "This bot is not available to you.",
+              flags: MessageFlags.Ephemeral,
+            }).catch(() => {});
+            return false;
+          }
+          return true;
+        },
+        time: timeoutMs,
+      });
+
+      let pickedIdx: number;
+      if (interaction.componentType === ComponentType.Button) {
+        pickedIdx = Number.parseInt(
+          interaction.customId.split(":").pop() ?? "",
+          10
+        );
+      } else if (interaction.componentType === ComponentType.StringSelect) {
+        pickedIdx = Number.parseInt(interaction.values[0] ?? "", 10);
+      } else {
+        return null;
+      }
+
+      const chosen = choices[pickedIdx];
+      if (!chosen) {
+        await msg.edit({ content: `${opts.prompt}\n_Invalid choice._`, components: [] });
+        return null;
+      }
+
+      await msg.edit({
+        content: `${opts.prompt}\n✅ **${chosen.label}** (${interaction.user.username})`,
+        components: [],
+      });
+      try {
+        await interaction.deferUpdate();
+      } catch {
+        /* ignore */
+      }
+      return { value: chosen.value, userId: interaction.user.id };
+    } catch {
+      try {
+        await msg.edit({
+          content: `${opts.prompt}\n⏱️ _Timed out._`,
+          components: [],
+        });
+      } catch {
+        /* ignore */
+      }
+      return null;
     }
   }
 

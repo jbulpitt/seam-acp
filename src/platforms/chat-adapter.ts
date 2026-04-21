@@ -92,6 +92,22 @@ export interface ChatAdapter {
   /** Optional: pre-add reactions to a message (for emoji menus). */
   addReactions?(message: MessageRef, reactions: string[]): Promise<void>;
 
+  /**
+   * Optional: present an interactive choice picker (buttons / select menu)
+   * and resolve when the user picks one. Returns null on timeout / cancel.
+   * Implementations may impose their own choice-count limits (e.g. Discord
+   * select menus cap at 25).
+   */
+  sendChoicePicker?(
+    channel: ChannelRef,
+    opts: {
+      prompt: string;
+      choices: ReadonlyArray<{ value: string; label: string; description?: string }>;
+      timeoutMs?: number;
+      authorizedUserIds?: ReadonlySet<string>;
+    }
+  ): Promise<{ value: string; userId: string } | null>;
+
   /** Subscribe to bot-relevant incoming messages. */
   onMessage(handler: (msg: IncomingMessage) => void | Promise<void>): void;
 

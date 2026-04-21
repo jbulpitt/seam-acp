@@ -10,7 +10,6 @@ import type {
   ChannelRef,
   IncomingMessage,
   MessageRef,
-  ReactionEvent,
 } from "../chat-adapter.js";
 import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
@@ -29,25 +28,6 @@ const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
 
-const REPO_PICK_EMOJIS = [
-  "1️⃣",
-  "2️⃣",
-  "3️⃣",
-  "4️⃣",
-  "5️⃣",
-  "6️⃣",
-  "7️⃣",
-  "8️⃣",
-  "9️⃣",
-  "🔟",
-] as const;
-
-interface RepoPickerState {
-  channel: ChannelRef;
-  repoPaths: string[];
-  createdAt: number;
-}
-
 /**
  * Glues the Discord adapter, the SessionRouter, and the agent runtimes
  * together. Handles incoming thread messages and `/seam` slash commands.
@@ -59,9 +39,6 @@ export class Orchestrator {
   private readonly router: SessionRouter;
   private readonly store: SessionStore;
   private readonly renderer: Renderer;
-
-  /** message-id → picker state (only owner can react). */
-  private readonly repoPickers = new Map<string, RepoPickerState>();
 
   constructor(opts: {
     logger: Logger;
@@ -81,7 +58,6 @@ export class Orchestrator {
 
   install(): void {
     this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
-    this.adapter.onReaction?.((event) => this.handleReaction(event));
   }
 
   // --- message turn ---
@@ -1310,58 +1286,51 @@ export class Orchestrator {
       );
       return;
     }
-    const top = dirs.slice(0, REPO_PICK_EMOJIS.length);
-    const lines = top.map(
-      (p, idx) => `${REPO_PICK_EMOJIS[idx]} ${path.basename(p)}`
-    );
-    const body =
-      "🗂️ **Select repo**\n" +
-      this.renderer.codeBlock(lines.join("\n")) +
-      "\nReact with a number to choose, or use `/seam repo <path>`.";
 
-    const sent = await this.adapter.sendMessage(channel, body);
-    this.repoPickers.set(sent.id, {
-      channel,
-      repoPaths: top,
-      createdAt: Date.now(),
+    if (!this.adapter.sendChoicePicker) {
+      // Adapter without interactive picker: list paths and let the user
+      // pick via /seam repo <path>.
+      const lines = dirs
+        .slice(0, 20)
+        .map((p) => `• ${path.basename(p)}`)
+        .join("\n");
+      await this.adapter.sendMessage(
+        channel,
+        `🗂️ **Available repos**\n${this.renderer.codeBlock(lines)}\nUse \`/seam repo <name>\`.`
+      );
+      return;
+    }
+
+    // Discord allows up to 25 select options; cap and warn if needed.
+    const top = dirs.slice(0, 25);
+    const overflow = dirs.length - top.length;
+
+    const result = await this.adapter.sendChoicePicker(channel, {
+      prompt:
+        "🗂️ **Select a repo to begin:**" +
+        (overflow > 0 ? `\n_(showing first 25 of ${dirs.length}; use \`/seam repo <path>\` for the rest)_` : ""),
+      choices: top.map((p) => ({
+        value: p,
+        label: path.basename(p),
+      })),
+      authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
     });
 
-    if (this.adapter.addReactions) {
-      try {
-        await this.adapter.addReactions(
-          sent,
-          REPO_PICK_EMOJIS.slice(0, top.length).map((e) => e)
-        );
-      } catch (err) {
-        this.logger.warn({ err }, "failed to add picker reactions");
-      }
-    }
-  }
+    if (!result) return;
 
-  private async handleReaction(event: ReactionEvent): Promise<void> {
-    const picker = this.repoPickers.get(event.message.id);
-    if (!picker) return;
-    const idx = REPO_PICK_EMOJIS.indexOf(
-      event.reaction as (typeof REPO_PICK_EMOJIS)[number]
-    );
-    if (idx < 0 || idx >= picker.repoPaths.length) return;
-    const picked = picker.repoPaths[idx];
-    if (!picked) return;
-
+    const picked = result.value;
     if (!isWithinRoot(picked, this.config.REPOS_ROOT)) {
       await this.adapter.sendMessage(
-        picker.channel,
+        channel,
         `🛡️ Repo \`${picked}\` is outside REPOS_ROOT.`
       );
       return;
     }
 
     const record = this.router.ensureSessionRecord({
-      platform: picker.channel.platform,
-      channelRef: picker.channel.id,
-      ...(picker.channel.parentId
-        ? { parentRef: picker.channel.parentId }
-        : {}),
+      platform: channel.platform,
+      channelRef: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
     this.store.upsert({
@@ -1370,10 +1339,9 @@ export class Orchestrator {
       updatedUtc: new Date().toISOString(),
     });
     await this.router.invalidate(record.id);
-    this.repoPickers.delete(event.message.id);
 
     await this.adapter.sendMessage(
-      picker.channel,
+      channel,
       `📌 Repo set to \`${this.repoDisplay(picked)}\`. Send a message to begin.`
     );
   }

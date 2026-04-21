@@ -5,3 +5,7 @@ dist
 data/
 *.log
 .DS_Store
+
+# Playwright MCP scratch outputs
+.playwright-mcp/
+*.png

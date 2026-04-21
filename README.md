@@ -1,5 +1,10 @@
 # seam-acp
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="seam-acp-logo-dark.svg">
+  <img src="seam-acp-logo-light.svg" alt="seam-acp" height="60">
+</picture>
+
 A bridge between chat platforms (Discord today, Slack tomorrow) and ACP-compatible coding agents (GitHub Copilot today, Claude Code / others tomorrow).
 
 > **Status:** v0 — feature parity with the C# `copilot-discord-bot` complete. Multi-platform / multi-agent abstractions baked in from day one; only Discord + Copilot are implemented today.

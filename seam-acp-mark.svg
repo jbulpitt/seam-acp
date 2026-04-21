@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="seam-acp">
+  <title>seam-acp</title>
+  <g transform="translate(11, 32)" fill="none" stroke="#1AA093" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M7 -12 L0 -12 L0 12 L7 12"/>
+    <line x1="14" y1="0" x2="18" y2="0"/>
+    <line x1="21" y1="0" x2="25" y2="0"/>
+    <line x1="28" y1="0" x2="32" y2="0"/>
+    <path d="M35 -12 L42 -12 L42 12 L35 12"/>
+  </g>
+</svg>

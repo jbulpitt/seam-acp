@@ -214,6 +214,16 @@ export class Orchestrator {
     const RETRY_REGEX = /response was interrupted.*retrying/i;
     let currentMessageId: string | undefined;
     let postedRetryNotice = false;
+    // Runaway-loop detector: some agent models (notably Copilot when asked
+    // to wrap output in a fence) get stuck spamming the same short token
+    // — e.g. "markdown" — for hundreds of chunks. Detect a long run of
+    // identical short chunks and cancel the turn before it eats the
+    // whole timeout window.
+    const LOOP_THRESHOLD = 12;
+    const LOOP_CHUNK_MAX = 40;
+    let loopChunk: string | null = null;
+    let loopCount = 0;
+    let loopAborted = false;
     const noteRetry = async () => {
       if (postedRetryNotice) return;
       postedRetryNotice = true;
@@ -243,6 +253,48 @@ export class Orchestrator {
               postedRetryNotice = false; // allow future retries to notify again
             }
             if (event.messageId) currentMessageId = event.messageId;
+            // Runaway-loop check (cheap; runs before buffering).
+            if (!loopAborted) {
+              const trimmed = event.text.trim();
+              if (trimmed && trimmed.length <= LOOP_CHUNK_MAX) {
+                if (trimmed === loopChunk) {
+                  loopCount += 1;
+                } else {
+                  loopChunk = trimmed;
+                  loopCount = 1;
+                }
+              } else {
+                loopChunk = null;
+                loopCount = 0;
+              }
+              if (loopCount >= LOOP_THRESHOLD) {
+                loopAborted = true;
+                this.logger.warn(
+                  {
+                    session: record.id,
+                    chunk: loopChunk,
+                    repeats: loopCount,
+                  },
+                  "runaway chunk loop detected; cancelling turn"
+                );
+                try {
+                  await runtime.cancel();
+                } catch (err) {
+                  this.logger.warn({ err }, "cancel after loop failed");
+                }
+                try {
+                  await flushChunks();
+                  await this.adapter.sendMessage(
+                    channel,
+                    `⚠️ Agent got stuck repeating \`${loopChunk}\` — turn cancelled. Try rephrasing.`
+                  );
+                  textSent = true;
+                } catch (err) {
+                  this.logger.warn({ err }, "loop notice send failed");
+                }
+                return;
+              }
+            }
             textBuffer += event.text;
             fullTurnText += event.text;
             maybeFlush();

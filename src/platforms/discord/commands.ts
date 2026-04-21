@@ -165,6 +165,20 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
+    sub
+      .setName("attach")
+      .setDescription("Upload a local file from the host machine to this channel")
+      .addStringOption((o) =>
+        o
+          .setName("path")
+          .setDescription(
+            "Absolute path, or path relative to an allowed root (REPOS_ROOT / ATTACH_ROOTS)"
+          )
+          .setRequired(true)
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
     sub.setName("avatar").setDescription("Push the bot avatar to Discord (force re-upload)")
   );
 
@@ -191,6 +205,7 @@ export type SeamSubcommand =
   | "init"
   | "approve"
   | "agent"
+  | "attach"
   | "avatar"
   | "help";
 

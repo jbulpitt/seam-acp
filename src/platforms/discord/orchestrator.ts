@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { MessageFlags, type ChatInputCommandInteraction, type EmbedBuilder } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
@@ -17,6 +18,7 @@ import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { splitForFlush, hasOpenFence } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
+import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import {
   defaultSessionConfig,
   type SessionConfigState,
@@ -574,6 +576,8 @@ export class Orchestrator {
         return this.cmdApprove(interaction);
       case "agent":
         return this.cmdAgent(interaction);
+      case "attach":
+        return this.cmdAttach(interaction);
       case "avatar":
         return this.cmdAvatar(interaction);
       case "help":
@@ -1005,6 +1009,92 @@ export class Orchestrator {
     await i.reply({ content: messages[policy], flags: MessageFlags.Ephemeral });
   }
 
+  /**
+   * Read a file from the host machine and post it to the channel as a
+   * Discord attachment. The path must resolve under REPOS_ROOT or one
+   * of the configured ATTACH_ROOTS — symlinks are followed and the
+   * realpath is re-checked.
+   */
+  private async cmdAttach(i: ChatInputCommandInteraction): Promise<void> {
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel) {
+      await i.reply({
+        content: "Use `/seam attach` from inside a thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (!this.adapter.sendFile) {
+      await i.reply({
+        content: "This platform does not support file uploads.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const requested = i.options.getString("path", true).trim().replace(/^"|"$/g, "");
+    const allowedRoots = [
+      this.config.REPOS_ROOT,
+      ...this.config.ATTACH_ROOTS,
+    ].map((p) => path.resolve(p));
+
+    // Relative paths resolve against the first allowed root.
+    const candidate = path.isAbsolute(requested)
+      ? path.resolve(requested)
+      : path.resolve(allowedRoots[0] ?? this.config.REPOS_ROOT, requested);
+
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+
+    let real: string;
+    let stat: fs.Stats;
+    try {
+      real = await fsp.realpath(candidate);
+      stat = await fsp.stat(real);
+    } catch (err) {
+      await i.editReply(`File not found: \`${candidate}\` (${(err as Error).message})`);
+      return;
+    }
+
+    if (!stat.isFile()) {
+      await i.editReply(`Not a regular file: \`${real}\``);
+      return;
+    }
+
+    if (!allowedRoots.some((r) => isWithinRoot(real, r))) {
+      await i.editReply(
+        `🛡️ Refusing: \`${real}\` is outside REPOS_ROOT and ATTACH_ROOTS.`
+      );
+      return;
+    }
+
+    const MAX = 25 * 1024 * 1024;
+    if (stat.size > MAX) {
+      await i.editReply(
+        `File too large for Discord: ${stat.size} B (25 MB limit).`
+      );
+      return;
+    }
+
+    let data: Buffer;
+    try {
+      data = await fsp.readFile(real);
+    } catch (err) {
+      await i.editReply(`Read failed: ${(err as Error).message}`);
+      return;
+    }
+
+    const filename = path.basename(real);
+    const mimeType = mimeTypeForFilename(filename);
+
+    try {
+      await this.adapter.sendFile(channel, { data, filename, mimeType });
+      await i.editReply(`📎 Posted \`${filename}\` (${data.byteLength} B).`);
+    } catch (err) {
+      this.logger.warn({ err, filename }, "/seam attach upload failed");
+      await i.editReply(`Upload failed: ${(err as Error).message}`);
+    }
+  }
+
   private async cmdAvatar(i: ChatInputCommandInteraction): Promise<void> {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
     try {
@@ -1035,6 +1125,7 @@ export class Orchestrator {
       "`/seam config` — show session config JSON",
       "`/seam config-set <json>` — replace session config",
       "`/seam sessions` — list known sessions",
+      "`/seam attach <path>` — upload a host-side file (under REPOS_ROOT or ATTACH_ROOTS) to this channel",
       "`/seam avatar` — re-push bot avatar to Discord",
       "",
       "Free-form messages in a thread are sent to the agent.",

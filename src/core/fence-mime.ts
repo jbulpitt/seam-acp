@@ -105,3 +105,13 @@ export const EXT_MIME: Record<string, string> = {
   patch: "text/x-diff",
   txt: "text/plain",
 };
+
+/** Infer a MIME type from a filename's extension; defaults to octet-stream. */
+export function mimeTypeForFilename(filename: string): string {
+  const base = filename.split("/").pop() ?? filename;
+  if (base === "Dockerfile") return EXT_MIME.Dockerfile ?? "text/plain";
+  const dot = base.lastIndexOf(".");
+  if (dot < 0) return "application/octet-stream";
+  const ext = base.slice(dot + 1).toLowerCase();
+  return EXT_MIME[ext] ?? "application/octet-stream";
+}

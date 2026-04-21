@@ -22,6 +22,21 @@ const Schema = z.object({
 
   REPOS_ROOT: z.string().min(1, "REPOS_ROOT is required"),
   DATA_DIR: z.string().default("./data"),
+  /**
+   * Comma-separated list of absolute directories the `/seam attach`
+   * slash command is allowed to read from. REPOS_ROOT is always
+   * implicitly allowed. Defaults to empty (only REPOS_ROOT).
+   */
+  ATTACH_ROOTS: z
+    .string()
+    .default("")
+    .transform((v) =>
+      v
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((p) => path.resolve(p))
+    ),
 
   DEFAULT_AGENT: z.string().default("copilot"),
   DEFAULT_MODEL: z.string().default("gpt-5.4"),

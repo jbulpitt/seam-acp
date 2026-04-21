@@ -128,12 +128,13 @@ export class Orchestrator {
     }, STATUS_HEARTBEAT_MS);
 
     let textBuffer = "";
-    // Streaming policy: only flush mid-turn on paragraph breaks (safe — the
-    // model has clearly finished a thought) or when we cross the hard cap.
-    // Final flush always happens at end-of-turn. The status panel handles
-    // live progress, so we don't need a fallback idle timer.
+    // Streaming policy: only flush mid-turn when we have a *substantial*
+    // amount of buffered text AND a clean paragraph boundary exists.
+    // Otherwise wait for end-of-turn — Discord rate-limits us hard if we
+    // send one tiny message per paragraph (e.g. each verse of "99 bottles"
+    // would be its own message).
     const HARD_MAX = 1800;
-    const SOFT_MIN = 1;
+    const SOFT_MIN = 800;
     const drainBuffer = async (force: boolean) => {
       while (textBuffer) {
         const split = splitForFlush(textBuffer, {

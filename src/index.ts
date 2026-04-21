@@ -5,6 +5,7 @@ import { startHealthServer } from "./lib/health.js";
 import { SessionStore } from "./core/session-store.js";
 import { SessionRouter } from "./core/session-router.js";
 import { makeCopilotProfile } from "./agents/profiles/copilot.js";
+import { makeGeminiProfile } from "./agents/profiles/gemini.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { Orchestrator } from "./platforms/discord/orchestrator.js";
@@ -37,10 +38,16 @@ async function main(): Promise<void> {
     mcpServers,
   });
 
+  const gemini = makeGeminiProfile({
+    ...(config.GEMINI_CLI_PATH ? { cliPath: config.GEMINI_CLI_PATH } : {}),
+    defaultModel: config.GEMINI_DEFAULT_MODEL,
+    mcpServers,
+  });
+
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot],
+    profiles: [copilot, gemini],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".

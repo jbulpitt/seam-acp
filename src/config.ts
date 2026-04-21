@@ -26,6 +26,9 @@ const Schema = z.object({
   DEFAULT_AGENT: z.string().default("copilot"),
   DEFAULT_MODEL: z.string().default("gpt-5.4"),
   COPILOT_CLI_PATH: z.string().optional(),
+  GEMINI_CLI_PATH: z.string().optional(),
+  /** Per-agent model override for the Gemini profile. */
+  GEMINI_DEFAULT_MODEL: z.string().default("gemini-2.5-pro"),
 
   TURN_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(3600).default(900),
   LOG_LEVEL: z

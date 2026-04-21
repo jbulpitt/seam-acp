@@ -1,0 +1,20 @@
+services:
+  seam-acp:
+    build: .
+    image: seam-acp:dev
+    container_name: seam-acp
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      REPOS_ROOT: /repos
+    volumes:
+      - seam-data:/data
+      # Bind-mount the host's repos root read-write so the agent can edit code.
+      - ${REPOS_ROOT}:/repos
+    ports:
+      - "${HEALTH_PORT:-3000}:3000"
+
+volumes:
+  seam-data:

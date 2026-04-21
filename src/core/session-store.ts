@@ -129,7 +129,7 @@ export class SessionStore {
     return JSON.stringify(cfg, null, 2);
   }
 
-  static defaultConfig(defaultModel: string): SessionConfigState {
-    return defaultSessionConfig(defaultModel);
+  static defaultConfig(defaultModel: string, autoApprove = false): SessionConfigState {
+    return defaultSessionConfig(defaultModel, autoApprove);
   }
 }

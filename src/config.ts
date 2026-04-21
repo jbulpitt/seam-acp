@@ -25,6 +25,17 @@ const Schema = z.object({
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .default("info"),
   HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+  /**
+   * Bot-wide default for new sessions. When false (the default), the agent
+   * will ask for permission before running potentially destructive tools and
+   * the session policy defaults to "deny" until the user runs
+   * `/seam approve always`. Set to true to default every new session to
+   * auto-approve (yolo mode).
+   */
+  DEFAULT_AUTO_APPROVE: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
 });
 
 export type Config = z.infer<typeof Schema>;

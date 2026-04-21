@@ -19,8 +19,11 @@ export interface SessionConfigState {
   autoApprovePermissions?: boolean;
 }
 
-export function defaultSessionConfig(defaultModel: string): SessionConfigState {
-  return { model: defaultModel };
+export function defaultSessionConfig(
+  defaultModel: string,
+  autoApprove = false
+): SessionConfigState {
+  return { model: defaultModel, autoApprovePermissions: autoApprove };
 }
 
 /**

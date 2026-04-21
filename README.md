@@ -36,6 +36,7 @@ Copy `.env.example` to `.env` and fill it in.
 | `TURN_TIMEOUT_SECONDS` | no | Default 900 |
 | `LOG_LEVEL` | no | `fatal` / `error` / `warn` / `info` / `debug` / `trace` |
 | `HEALTH_PORT` | no | Default 3000 — exposes `GET /health` |
+| `DEFAULT_AUTO_APPROVE` | no | `false` (safe default) — set `true` to auto-approve all agent permission requests bot-wide. Override per-session with `/seam approve`. |
 
 You also need the GitHub Copilot CLI installed locally (`brew install github/gh/copilot` or `npm i -g @github/copilot`) and authenticated (`copilot auth login`). The Docker image installs and runs the CLI for you, but you still need to mount auth state or sign in inside the container.
 
@@ -71,7 +72,7 @@ All commands are owner-only and (where it matters) thread-scoped.
 | `/seam mode <id>` | Set the agent operational mode (e.g. plan / agent / autopilot) |
 | `/seam effort <low\|medium\|high>` | Set reasoning effort (model-dependent) |
 | `/seam tools <allow\|exclude> [csv]` | Tool allow / exclude list (empty list = clear) |
-| `/seam approve <ask\|always>` | Permission policy. `always` auto-approves; `ask` denies (interactive prompts coming) |
+| `/seam approve <ask\|always>` | Permission policy. `always` auto-approves all tool permission requests; `ask` denies them (safe default). |
 | `/seam abort` | Cancel the in-flight turn |
 | `/seam config` | Show the session config JSON |
 | `/seam config-set <json>` | Replace the session config wholesale |
@@ -112,4 +113,4 @@ The ACP integration test is automatically skipped if `copilot` is not on `PATH`.
 
 ## License
 
-TBD.
+MIT — see [LICENSE](LICENSE).

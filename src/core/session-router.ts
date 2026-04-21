@@ -151,7 +151,7 @@ export class SessionRouter {
       profile,
       logger: this.logger.child({ session: record.id }),
       permissionPolicy: async (req) => {
-        const allow = cfg.autoApprovePermissions !== false;
+        const allow = cfg.autoApprovePermissions === true;
         if (allow) {
           const opt =
             req.options.find((o) => o.kind?.startsWith("allow_")) ??

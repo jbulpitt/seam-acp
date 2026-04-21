@@ -473,7 +473,7 @@ export class Orchestrator {
       return;
     }
     const cfg =
-      this.store.readConfig(record) ?? defaultSessionConfig(this.config.DEFAULT_MODEL);
+      this.store.readConfig(record) ?? defaultSessionConfig(this.config.DEFAULT_MODEL, this.config.DEFAULT_AUTO_APPROVE);
     await i.reply({
       content: this.renderer.codeBlock(JSON.stringify(cfg, null, 2), "json"),
       flags: MessageFlags.Ephemeral,
@@ -600,7 +600,10 @@ export class Orchestrator {
     cfg.autoApprovePermissions = policy === "always";
     this.persistConfig(record, cfg);
     await i.reply({
-      content: `Approval policy set to \`${policy}\`.${policy === "always" ? " (Auto-approve all permission requests.)" : " (Permission requests will be denied; future versions will prompt interactively.)"}`,
+      content:
+        policy === "always"
+          ? "Approval policy set to `always`. ⚠️ The agent will auto-approve all permission requests (shell exec, file writes, etc.)."
+          : "Approval policy set to `ask`. The agent will be denied any permission request it makes — use `always` to let it run freely.",
       flags: MessageFlags.Ephemeral,
     });
   }

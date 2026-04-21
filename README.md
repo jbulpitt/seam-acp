@@ -92,6 +92,10 @@ text-ish files (markdown, source code, JSON, CSV, logs, etc.) are inlined when
 the agent supports it; everything else is sent as a CDN link the agent can
 fetch. Limits per message: 8 attachments, 5 MB each, text inlined up to 256 KB.
 
+If the agent emits an image, audio file, or embedded resource (in a tool
+result or its own message stream), the bot uploads it to the thread as a
+Discord attachment. Discord's free-tier 25 MB upload limit applies.
+
 ## Architecture
 
 ```

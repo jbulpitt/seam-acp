@@ -18,6 +18,7 @@ import {
   mapAttachmentsToBlocks,
   type RejectedAttachment,
 } from "./attachments.js";
+import { blockToFile } from "./agent-content.js";
 
 /** Events surfaced from the ACP `session/update` stream. */
 export type AgentEvent =
@@ -34,6 +35,19 @@ export type AgentEvent =
       toolCallId: string;
       status?: string;
       title?: string;
+    }
+  | {
+      kind: "agent-file";
+      /** "message" if from agent_message_chunk; "tool" if from a tool call. */
+      source: "message" | "tool";
+      filename: string;
+      mimeType: string;
+      /** Base64 for binary (image/audio/blob); plain text for text resources. */
+      data: string;
+      /** True when `data` is base64-encoded binary; false when it's UTF-8 text. */
+      base64: boolean;
+      /** Optional: the source URI if the agent referenced one. */
+      uri?: string;
     }
   | { kind: "mode-changed"; modeId: string }
   | { kind: "model-changed"; modelId: string }
@@ -392,14 +406,9 @@ export class AgentRuntime {
   private async handleSessionUpdate(update: SessionUpdate): Promise<void> {
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
-        const text = textFromContent(update.content);
-        if (text) {
-          await this.emit({
-            kind: "agent-text",
-            text,
-            messageId: update.messageId ?? undefined,
-          });
-        }
+        await this.handleContentBlock(update.content, "message", {
+          messageId: update.messageId ?? undefined,
+        });
         return;
       }
       case "agent_thought_chunk": {
@@ -414,6 +423,9 @@ export class AgentRuntime {
           title: update.title,
           kindLabel: update.kind,
         });
+        if (Array.isArray(update.content)) {
+          for (const tc of update.content) await this.handleToolCallContent(tc);
+        }
         return;
       }
       case "tool_call_update": {
@@ -423,6 +435,9 @@ export class AgentRuntime {
           status: update.status ?? undefined,
           title: update.title ?? undefined,
         });
+        if (Array.isArray(update.content)) {
+          for (const tc of update.content) await this.handleToolCallContent(tc);
+        }
         return;
       }
       case "current_mode_update": {
@@ -449,6 +464,70 @@ export class AgentRuntime {
         // session_info_update, usage_update — currently ignored.
         return;
     }
+  }
+
+  /**
+   * Inspect a single ContentBlock from an `agent_message_chunk` and emit the
+   * right downstream event (text or file). Logs every non-text block at debug
+   * level so we can observe what real agents actually send.
+   */
+  private async handleContentBlock(
+    content: unknown,
+    source: "message" | "tool",
+    extra: { messageId?: string } = {}
+  ): Promise<void> {
+    if (!content || typeof content !== "object") return;
+    const block = content as { type?: string };
+
+    if (block.type === "text") {
+      const text = (block as { text?: string }).text;
+      if (typeof text === "string" && text.length > 0) {
+        await this.emit({
+          kind: "agent-text",
+          text,
+          ...(extra.messageId ? { messageId: extra.messageId } : {}),
+        });
+      }
+      return;
+    }
+
+    this.logger.debug(
+      { source, blockType: block.type },
+      "non-text content block from agent"
+    );
+
+    const file = blockToFile(block);
+    if (file) {
+      await this.emit({ kind: "agent-file", source, ...file });
+      return;
+    }
+
+    if (block.type === "resource_link") {
+      // Surface as inline text so users see it in the chat. Easier than
+      // building a separate UI for it.
+      const link = block as {
+        name?: string;
+        uri?: string;
+        mimeType?: string | null;
+      };
+      const label = link.name ?? link.uri ?? "resource";
+      await this.emit({
+        kind: "agent-text",
+        text: `🔗 [${label}](${link.uri ?? ""})`,
+        ...(extra.messageId ? { messageId: extra.messageId } : {}),
+      });
+    }
+  }
+
+  /** Inspect a ToolCallContent entry; only the "content" variant interests us. */
+  private async handleToolCallContent(tc: unknown): Promise<void> {
+    if (!tc || typeof tc !== "object") return;
+    const t = tc as { type?: string; content?: unknown };
+    if (t.type !== "content") {
+      // diff / terminal — handled elsewhere or ignored for now.
+      return;
+    }
+    await this.handleContentBlock(t.content, "tool");
   }
 
   private buildSessionInfo(

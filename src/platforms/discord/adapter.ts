@@ -128,6 +128,18 @@ export class DiscordAdapter implements ChatAdapter {
     await msg.edit({ content: text });
   }
 
+  async sendFile(
+    channel: ChannelRef,
+    file: { data: Buffer; filename: string; mimeType: string; caption?: string }
+  ): Promise<MessageRef> {
+    const ch = await this.fetchSendableChannel(channel.id);
+    const sent = await ch.send({
+      ...(file.caption ? { content: file.caption } : {}),
+      files: [{ attachment: file.data, name: file.filename }],
+    });
+    return { channel, id: sent.id };
+  }
+
   async addReactions(message: MessageRef, reactions: string[]): Promise<void> {
     const ch = await this.fetchSendableChannel(message.channel.id);
     const msg = await ch.messages.fetch(message.id);

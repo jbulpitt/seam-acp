@@ -224,6 +224,25 @@ export class Orchestrator {
             status.setModel(event.modelId);
             await refresh();
             return;
+          case "agent-file": {
+            // Flush pending text first so the file shows up after the
+            // assistant's narration in the thread.
+            await flushChunks();
+            try {
+              await this.sendAgentFile(channel, event);
+              textSent = true;
+            } catch (err) {
+              this.logger.warn(
+                { err, filename: event.filename },
+                "sendFile failed; falling back to text notice"
+              );
+              await this.adapter.sendMessage(
+                channel,
+                `_Agent produced a file (\`${event.filename}\`) but it couldn't be uploaded._`
+              );
+            }
+            return;
+          }
           case "agent-thought":
           case "config-options":
           case "error":
@@ -676,6 +695,53 @@ export class Orchestrator {
       "Free-form messages in a thread are sent to the agent.",
     ];
     await i.reply({ content: lines.join("\n"), flags: MessageFlags.Ephemeral });
+  }
+
+  // --- agent file uploads (Phase 2) ---
+
+  /**
+   * Upload a file produced by the agent (image / audio / embedded resource)
+   * to the Discord thread. Falls back to inline text if the adapter doesn't
+   * implement sendFile or the file is over Discord's free-tier 25 MB limit.
+   */
+  private async sendAgentFile(
+    channel: ChannelRef,
+    event: {
+      filename: string;
+      mimeType: string;
+      data: string;
+      base64: boolean;
+      uri?: string;
+    }
+  ): Promise<void> {
+    const buf = event.base64
+      ? Buffer.from(event.data, "base64")
+      : Buffer.from(event.data, "utf8");
+
+    if (!this.adapter.sendFile) {
+      await this.adapter.sendMessage(
+        channel,
+        `_Agent produced \`${event.filename}\` (${event.mimeType}, ${buf.byteLength} B) but this platform doesn't support file uploads._`
+      );
+      return;
+    }
+
+    const MAX_DISCORD_BYTES = 25 * 1024 * 1024;
+    if (buf.byteLength > MAX_DISCORD_BYTES) {
+      await this.adapter.sendMessage(
+        channel,
+        `_Agent produced \`${event.filename}\` (${buf.byteLength} B) — too large for Discord (25 MB limit)._${
+          event.uri ? ` Source: ${event.uri}` : ""
+        }`
+      );
+      return;
+    }
+
+    await this.adapter.sendFile(channel, {
+      data: buf,
+      filename: event.filename,
+      mimeType: event.mimeType,
+    });
   }
 
   // --- repo picker ---

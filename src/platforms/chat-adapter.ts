@@ -72,6 +72,20 @@ export interface ChatAdapter {
   sendMessage(channel: ChannelRef, text: string): Promise<MessageRef>;
   editMessage(message: MessageRef, text: string): Promise<void>;
 
+  /**
+   * Optional: upload a file to the channel. Required for the agent → Discord
+   * file path. Implementations may also send caption text alongside the file.
+   */
+  sendFile?(
+    channel: ChannelRef,
+    file: {
+      data: Buffer;
+      filename: string;
+      mimeType: string;
+      caption?: string;
+    }
+  ): Promise<MessageRef>;
+
   /** Optional: platforms that support threads should implement this. */
   createThread?(parent: ChannelRef, name: string): Promise<ChannelRef>;
 

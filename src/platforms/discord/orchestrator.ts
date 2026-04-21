@@ -166,14 +166,43 @@ export class Orchestrator {
       }, FLUSH_IDLE_MS);
     };
 
+    const RETRY_MARKER = "— 🔁 retried — output above may repeat —";
+    const RETRY_REGEX = /response was interrupted.*retrying/i;
+    let currentMessageId: string | undefined;
+    let postedRetryNotice = false;
+    const noteRetry = async () => {
+      if (postedRetryNotice) return;
+      postedRetryNotice = true;
+      // Flush whatever we already buffered from the failed attempt first.
+      await flushChunks();
+      try {
+        await this.adapter.sendMessage(channel, RETRY_MARKER);
+      } catch (err) {
+        this.logger.warn({ err }, "retry notice send failed");
+      }
+    };
+
     try {
       const runtime = await this.router.getOrStartRuntime(record);
       runtime.onEvent(async (event) => {
         switch (event.kind) {
-          case "agent-text":
+          case "agent-text": {
+            // Detect Copilot CLI retry: either the agent emits a "Retrying"
+            // sentinel, or the messageId rolls over mid-turn.
+            const isRetrySentinel = RETRY_REGEX.test(event.text);
+            const isNewMessage =
+              event.messageId !== undefined &&
+              currentMessageId !== undefined &&
+              event.messageId !== currentMessageId;
+            if (isRetrySentinel || isNewMessage) {
+              await noteRetry();
+              postedRetryNotice = false; // allow future retries to notify again
+            }
+            if (event.messageId) currentMessageId = event.messageId;
             textBuffer += event.text;
             maybeFlush();
             return;
+          }
           case "tool-start":
             status.setAction(`Tool: ${event.title ?? event.kindLabel ?? "…"}`);
             await refresh();

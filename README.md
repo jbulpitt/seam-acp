@@ -36,12 +36,15 @@ Copy `.env.example` to `.env` and fill it in.
 | `REPOS_ROOT` | yes | Root folder containing repos the agent can touch |
 | `ATTACH_ROOTS` | no | Comma-separated extra absolute directories the `/seam attach` command (and the agent-side fence-to-file shortcut) can read from. `REPOS_ROOT` is always allowed. |
 | `DATA_DIR` | no | Defaults to `./data` (sqlite lives here) |
-| `DEFAULT_AGENT` | no | `copilot` (default) or `gemini`. Plus any `copilot-<id>` registered via `COPILOT_PROFILES`. |
+| `DEFAULT_AGENT` | no | `copilot` (default), `gemini`, or `claude`. Plus any `copilot-<id>` / `claude-<id>` registered via the `*_PROFILES` vars. |
 | `DEFAULT_MODEL` | no | Default Copilot model. Applies to **all** Copilot profiles (including extras from `COPILOT_PROFILES`). e.g. `gpt-5.4`, `claude-sonnet-4.5`, `claude-opus-4.7`, `auto` |
 | `COPILOT_CLI_PATH` | no | If `copilot` is not on `PATH` |
 | `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
 | `GEMINI_CLI_PATH` | no | If `gemini` is not on `PATH` |
 | `GEMINI_DEFAULT_MODEL` | no | Default Gemini model — applied even when `DEFAULT_AGENT` is `copilot`. Default `gemini-2.5-pro`. |
+| `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
+| `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
+| `CLAUDE_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `claude-<id>` profile pinned to its own `CLAUDE_CONFIG_DIR`. See "Multiple Claude accounts" below. |
 | `TURN_TIMEOUT_SECONDS` | no | Default 900 |
 | `LOG_LEVEL` | no | `fatal` / `error` / `warn` / `info` / `debug` / `trace` |
 | `HEALTH_PORT` | no | Default 3000 — exposes `GET /health` |
@@ -49,6 +52,15 @@ Copy `.env.example` to `.env` and fill it in.
 | `DEFAULT_AUTO_APPROVE` | no | *Deprecated.* When `true`, forces the bot-wide default to `always`. Prefer `DEFAULT_PERMISSION_POLICY`. |
 
 You also need the GitHub Copilot CLI installed locally (`brew install github/gh/copilot` or `npm i -g @github/copilot`) and authenticated (`copilot auth login`). The Docker image installs and runs the CLI for you, but you still need to mount auth state or sign in inside the container.
+
+To use the **Anthropic Claude** profile, install the ACP adapter (and the underlying CLI for auth):
+
+```sh
+npm i -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp
+claude /login
+```
+
+To use the **Google Gemini** profile, install the Gemini CLI (`brew install google-gemini/cli/gemini` or `npm i -g @google/gemini-cli`) and run `gemini /auth`. Each agent profile is independent — install only the ones you'll use.
 
 ## Run (local dev)
 
@@ -145,6 +157,31 @@ COPILOT_HOME=/Users/me/.copilot-personal copilot login
 Verify in a thread with `/seam whoami` — the bot reads
 `<config-dir>/config.json` and reports the GitHub login.
 
+### Multiple Claude accounts
+
+Same pattern as Copilot, using `CLAUDE_PROFILES`:
+
+```sh
+CLAUDE_PROFILES=work:/Users/me/.claude-work,personal:/Users/me/.claude-personal
+```
+
+For each entry the bot spawns `claude-agent-acp` with
+`CLAUDE_CONFIG_DIR=<dir>` in the child env. Each dir holds its own
+auth and settings. Profiles show up in `/seam agent` as `claude-work`
+and `claude-personal` alongside the default `claude` profile.
+
+One-time setup per account on the host:
+
+```sh
+CLAUDE_CONFIG_DIR=/Users/me/.claude-work claude /login
+CLAUDE_CONFIG_DIR=/Users/me/.claude-personal claude /login
+```
+
+`/seam whoami` is best-effort for Claude — it tries to read the email /
+account from `<config-dir>/.credentials.json` (and a couple of fallbacks).
+If that fails (file format changes upstream, etc.) the command still
+reports which profile id you're on.
+
 ### MCP servers
 
 The bot can attach Model Context Protocol servers globally to every
@@ -175,7 +212,7 @@ AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agen
 - **`src/platforms/chat-adapter.ts`** — generic chat platform interface.
 - **`src/platforms/discord/`** — discord.js v14 implementation + slash commands + repo picker.
 - **`src/agents/agent-runtime.ts`** — wraps `@agentclientprotocol/sdk` + a child process running an ACP server. Handles `initialize`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, model / mode / config option setters, and emits typed events.
-- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Add a sibling for any other ACP-compatible agent (a Gemini profile ships in `src/agents/profiles/gemini.ts`).
+- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Sibling profiles ship for Google Gemini (`gemini.ts`) and Anthropic Claude Code (`claude.ts`, via the `claude-agent-acp` adapter). Add a new profile by writing one of these.
 - **`src/core/`** — pure utilities: text chunker, path safety, sqlite store, session router, status panel.
 
 ## Testing

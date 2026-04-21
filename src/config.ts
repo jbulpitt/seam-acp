@@ -78,6 +78,40 @@ const Schema = z.object({
   /** Per-agent model override for the Gemini profile. */
   GEMINI_DEFAULT_MODEL: z.string().default("gemini-2.5-pro"),
 
+  /** Path to the `claude-agent-acp` binary. Defaults to looking it up on PATH. */
+  CLAUDE_CLI_PATH: z.string().optional(),
+  /** Per-agent model override for the Claude profile. */
+  CLAUDE_DEFAULT_MODEL: z.string().default("claude-sonnet-4.5"),
+  /**
+   * Same shape as COPILOT_PROFILES — register additional Claude profiles
+   * each pinned to its own --config-dir (auth / settings). Format:
+   *   id1:/abs/dir1,id2:/abs/dir2
+   * Each becomes an agent profile named `claude-<id>` in /seam agent.
+   */
+  CLAUDE_PROFILES: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const out: Array<{ id: string; configDir: string }> = [];
+      for (const entry of v.split(",").map((s) => s.trim()).filter(Boolean)) {
+        const idx = entry.indexOf(":");
+        if (idx <= 0 || idx === entry.length - 1) {
+          throw new Error(
+            `CLAUDE_PROFILES entry must be 'id:/abs/path' (got '${entry}')`
+          );
+        }
+        const id = entry.slice(0, idx).trim();
+        const dir = path.resolve(entry.slice(idx + 1).trim());
+        if (!/^[a-z0-9][a-z0-9-]*$/i.test(id)) {
+          throw new Error(
+            `CLAUDE_PROFILES id '${id}' must be alphanumeric (dashes allowed)`
+          );
+        }
+        out.push({ id, configDir: dir });
+      }
+      return out;
+    }),
+
   TURN_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(3600).default(900),
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])

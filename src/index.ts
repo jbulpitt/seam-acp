@@ -6,6 +6,7 @@ import { SessionStore } from "./core/session-store.js";
 import { SessionRouter } from "./core/session-router.js";
 import { makeCopilotProfile } from "./agents/profiles/copilot.js";
 import { makeGeminiProfile } from "./agents/profiles/gemini.js";
+import { makeClaudeProfile } from "./agents/profiles/claude.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { Orchestrator } from "./platforms/discord/orchestrator.js";
@@ -54,10 +55,27 @@ async function main(): Promise<void> {
     mcpServers,
   });
 
+  const claude = makeClaudeProfile({
+    ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
+    defaultModel: config.CLAUDE_DEFAULT_MODEL,
+    mcpServers,
+  });
+
+  const extraClaudes = config.CLAUDE_PROFILES.map((p) =>
+    makeClaudeProfile({
+      id: `claude-${p.id}`,
+      displayName: `Anthropic Claude (${p.id})`,
+      configDir: p.configDir,
+      ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
+      defaultModel: config.CLAUDE_DEFAULT_MODEL,
+      mcpServers,
+    })
+  );
+
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, ...extraCopilots, gemini],
+    profiles: [copilot, ...extraCopilots, gemini, claude, ...extraClaudes],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".

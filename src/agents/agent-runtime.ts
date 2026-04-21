@@ -502,17 +502,17 @@ export class AgentRuntime {
     if (block.type === "text") {
       const text = (block as { text?: string }).text;
       if (typeof text === "string" && text.length > 0) {
-        await this.emit({
-          kind: "agent-text",
-          text,
-          ...(extra.messageId ? { messageId: extra.messageId } : {}),
-        });
-        // Tool results sometimes "produce a file" by writing to disk and
-        // narrating the path (Playwright MCP, write_file, etc.). Scan the
-        // text for file paths under our safe roots and emit them as
-        // agent-file events so the orchestrator uploads them to chat.
         if (source === "tool") {
+          // Tool stdout/stderr (curl progress, file dumps, exit codes) is
+          // NOT a model reply — never post it to chat. We only scan it for
+          // file paths so the path-watcher can upload referenced files.
           await this.scanToolTextForFiles(text);
+        } else {
+          await this.emit({
+            kind: "agent-text",
+            text,
+            ...(extra.messageId ? { messageId: extra.messageId } : {}),
+          });
         }
       }
       return;

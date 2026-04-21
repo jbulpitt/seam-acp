@@ -1,8 +1,8 @@
 # seam-acp
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="seam-acp-logo-dark.svg">
-  <img src="seam-acp-logo-light.svg" alt="seam-acp" height="60">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/seam-acp-logo-dark.svg">
+  <img src="assets/seam-acp-logo-light.svg" alt="seam-acp" height="60">
 </picture>
 
 A bridge between chat platforms (Discord today, Slack tomorrow) and ACP-compatible coding agents (GitHub Copilot today, Claude Code / others tomorrow).

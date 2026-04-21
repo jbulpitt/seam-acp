@@ -124,7 +124,20 @@ export class Orchestrator {
 
     let textBuffer = "";
     let flushTimer: NodeJS.Timeout | undefined;
+    // Stream-flush policy: avoid Discord's ~5 msg / 5 s per-channel limit.
+    // Flush early only when we've accumulated a meaningful block; otherwise
+    // wait for a longer idle period so short bursts get coalesced.
+    const FLUSH_LINES = 10;
+    const FLUSH_CHARS = 1500;
+    const FLUSH_IDLE_MS = 1500;
+    const cancelFlushTimer = () => {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = undefined;
+      }
+    };
     const flushChunks = async () => {
+      cancelFlushTimer();
       if (!textBuffer) return;
       const chunks = this.renderer.chunk(textBuffer);
       textBuffer = "";
@@ -132,12 +145,25 @@ export class Orchestrator {
         await this.adapter.sendMessage(channel, chunk);
       }
     };
-    const scheduleFlush = () => {
+    const countLines = (s: string) => {
+      let n = 0;
+      for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++;
+      return n;
+    };
+    const maybeFlush = () => {
+      if (
+        textBuffer.length >= FLUSH_CHARS ||
+        countLines(textBuffer) >= FLUSH_LINES
+      ) {
+        cancelFlushTimer();
+        void flushChunks();
+        return;
+      }
       if (flushTimer) return;
       flushTimer = setTimeout(() => {
         flushTimer = undefined;
         void flushChunks();
-      }, 250);
+      }, FLUSH_IDLE_MS);
     };
 
     try {
@@ -146,7 +172,7 @@ export class Orchestrator {
         switch (event.kind) {
           case "agent-text":
             textBuffer += event.text;
-            scheduleFlush();
+            maybeFlush();
             return;
           case "tool-start":
             status.setAction(`Tool: ${event.title ?? event.kindLabel ?? "…"}`);

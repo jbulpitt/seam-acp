@@ -41,8 +41,6 @@ const EXT_MIME: Record<string, string> = {
   html: "text/html",
   txt: "text/plain",
   log: "text/plain",
-  yaml: "text/yaml",
-  yml: "text/yaml",
   mp3: "audio/mpeg",
   wav: "audio/wav",
   ogg: "audio/ogg",

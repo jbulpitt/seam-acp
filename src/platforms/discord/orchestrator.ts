@@ -324,6 +324,8 @@ export class Orchestrator {
         return this.cmdEffort(interaction);
       case "abort":
         return this.cmdAbort(interaction);
+      case "reset":
+        return this.cmdReset(interaction);
       case "tools":
         return this.cmdTools(interaction);
       case "config":
@@ -509,6 +511,31 @@ export class Orchestrator {
     const rt = await this.router.getOrStartRuntime(record);
     await rt.cancel();
     await i.reply({ content: "Cancelled.", flags: MessageFlags.Ephemeral });
+  }
+
+  private async cmdReset(i: ChatInputCommandInteraction): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({
+        content: "Use inside a thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    // Stop the live runtime (if any) so any in-flight turn is killed.
+    await this.router.invalidate(record.id);
+    // Clear the persisted ACP session id so the next message creates a
+    // fresh session (which picks up any new MCP servers / config).
+    this.store.upsert({
+      ...record,
+      acpSessionId: "",
+      updatedAt: new Date().toISOString(),
+    });
+    await i.reply({
+      content:
+        "Session reset. Your next message will start a fresh ACP session (history is gone, but config is kept).",
+      flags: MessageFlags.Ephemeral,
+    });
   }
 
   private async cmdConfig(i: ChatInputCommandInteraction): Promise<void> {

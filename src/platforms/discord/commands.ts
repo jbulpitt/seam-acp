@@ -78,6 +78,14 @@ export function buildSeamCommand(): SlashCommandBuilder {
 
   cmd.addSubcommand((sub) =>
     sub
+      .setName("reset")
+      .setDescription(
+        "End the current ACP session for this thread; next message starts fresh"
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub
       .setName("tools")
       .setDescription("Set tool allow / exclude lists")
       .addStringOption((o) =>

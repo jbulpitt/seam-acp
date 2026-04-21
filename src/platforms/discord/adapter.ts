@@ -155,10 +155,15 @@ export class DiscordAdapter implements ChatAdapter {
     const choices = opts.choices.slice(0, 25);
     if (choices.length === 0) return null;
 
-    const useButtons = choices.length <= 5;
+    // Discord allows 5 buttons per row × 5 rows = 25 buttons total.
+    // We cap at 15 (3 rows) so the picker stays visually manageable;
+    // anything bigger drops to a single dropdown.
+    const BUTTON_LIMIT = 15;
+    const BUTTONS_PER_ROW = 5;
+    const useButtons = choices.length <= BUTTON_LIMIT;
     const customId = `seam-pick:${Date.now()}`;
 
-    let component: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>;
+    const components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [];
     if (useButtons) {
       const buttons = choices.map((c, idx) =>
         new ButtonBuilder()
@@ -166,7 +171,13 @@ export class DiscordAdapter implements ChatAdapter {
           .setLabel(c.label.slice(0, 80))
           .setStyle(ButtonStyle.Secondary)
       );
-      component = new ActionRowBuilder<ButtonBuilder>().addComponents(buttons);
+      for (let i = 0; i < buttons.length; i += BUTTONS_PER_ROW) {
+        components.push(
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            buttons.slice(i, i + BUTTONS_PER_ROW)
+          )
+        );
+      }
     } else {
       const select = new StringSelectMenuBuilder()
         .setCustomId(customId)
@@ -178,12 +189,14 @@ export class DiscordAdapter implements ChatAdapter {
             ...(c.description ? { description: c.description.slice(0, 100) } : {}),
           }))
         );
-      component = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+      components.push(
+        new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)
+      );
     }
 
     const msg = await ch.send({
       content: opts.prompt,
-      components: [component as ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>],
+      components,
     });
 
     try {

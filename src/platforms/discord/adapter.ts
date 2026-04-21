@@ -192,7 +192,7 @@ export class DiscordAdapter implements ChatAdapter {
   ): Promise<void> {
     if (!this.reactionHandler) return;
     if (user.bot) return;
-    if (user.id !== this.config.DISCORD_OWNER_USER_ID) return;
+    if (!this.config.DISCORD_ALLOWED_USER_IDS.has(user.id)) return;
 
     // Resolve partials so we have name + message id reliably.
     let resolved: MessageReaction;
@@ -224,7 +224,7 @@ export class DiscordAdapter implements ChatAdapter {
   private async handleMessage(msg: Message): Promise<void> {
     if (!this.messageHandler) return;
     if (msg.author.bot) return;
-    if (msg.author.id !== this.config.DISCORD_OWNER_USER_ID) return;
+    if (!this.config.DISCORD_ALLOWED_USER_IDS.has(msg.author.id)) return;
     if (!msg.channel.isThread()) return;
 
     const thread = msg.channel as ThreadChannel;
@@ -255,7 +255,7 @@ export class DiscordAdapter implements ChatAdapter {
   private async handleSlash(
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
-    if (interaction.user.id !== this.config.DISCORD_OWNER_USER_ID) {
+    if (!this.config.DISCORD_ALLOWED_USER_IDS.has(interaction.user.id)) {
       await interaction.reply({
         content: "This bot is not available to you.",
         flags: MessageFlags.Ephemeral,

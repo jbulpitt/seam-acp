@@ -5,9 +5,16 @@ import { z } from "zod";
 
 const Schema = z.object({
   DISCORD_BOT_TOKEN: z.string().min(1, "DISCORD_BOT_TOKEN is required"),
-  DISCORD_OWNER_USER_ID: z
+  DISCORD_ALLOWED_USER_IDS: z
     .string()
-    .regex(/^\d+$/, "DISCORD_OWNER_USER_ID must be a numeric Discord user id"),
+    .min(1, "DISCORD_ALLOWED_USER_IDS is required")
+    .transform((v) => {
+      const ids = v.split(",").map((s) => s.trim()).filter(Boolean);
+      if (ids.some((id) => !/^\d+$/.test(id))) {
+        throw new Error("DISCORD_ALLOWED_USER_IDS must be comma-separated numeric Discord user IDs");
+      }
+      return new Set(ids);
+    }),
   DISCORD_DEV_GUILD_ID: z
     .string()
     .regex(/^\d+$/)

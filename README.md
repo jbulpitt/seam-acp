@@ -26,7 +26,7 @@ Copy `.env.example` to `.env` and fill it in.
 | Variable | Required | Notes |
 |---|---|---|
 | `DISCORD_BOT_TOKEN` | yes | From the Discord developer portal |
-| `DISCORD_OWNER_USER_ID` | yes | Only this user can control the bot |
+| `DISCORD_ALLOWED_USER_IDS` | yes | Comma-separated Discord user IDs that can control the bot (e.g. `123,456`) |
 | `DISCORD_DEV_GUILD_ID` | no | Set to register slash commands instantly to one guild (good for dev) |
 | `REPOS_ROOT` | yes | Root folder containing repos the agent can touch |
 | `DATA_DIR` | no | Defaults to `./data` (sqlite lives here) |
@@ -60,7 +60,7 @@ Pass `--build-arg INSTALL_COPILOT_CLI=false` if you want to mount your own Copil
 
 ## Slash commands
 
-All commands are owner-only and (where it matters) thread-scoped.
+All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (where it matters) thread-scoped.
 
 | Command | What it does |
 |---|---|

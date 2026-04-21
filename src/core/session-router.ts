@@ -154,7 +154,10 @@ export class SessionRouter {
       profile,
       logger: this.logger.child({ session: record.id }),
       permissionPolicy: async (req) => {
-        const allow = cfg.autoApprovePermissions ?? this.defaultAutoApprove;
+        // Always re-read: the captured `cfg` would be stale if the user later
+        // changes the policy via `/seam approve` while the runtime is alive.
+        const fresh = this.store.readConfig(record);
+        const allow = fresh.autoApprovePermissions ?? this.defaultAutoApprove;
         if (allow) {
           const opt =
             req.options.find((o) => o.kind?.startsWith("allow_")) ??

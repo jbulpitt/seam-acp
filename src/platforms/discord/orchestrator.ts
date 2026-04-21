@@ -1015,6 +1015,40 @@ export class Orchestrator {
    * of the configured ATTACH_ROOTS — symlinks are followed and the
    * realpath is re-checked.
    */
+  /**
+   * Resolve a user/agent-supplied path to an existing file under one of
+   * the allowed roots (REPOS_ROOT + ATTACH_ROOTS). Returns null on any
+   * failure (not found, not a regular file, escapes roots, etc.).
+   * Symlinks are followed and the realpath is re-checked.
+   */
+  private async resolveAllowedHostFile(
+    requested: string
+  ): Promise<{ realPath: string; size: number } | null> {
+    const cleaned = requested.trim().replace(/^"|"$/g, "");
+    if (!cleaned) return null;
+
+    const allowedRoots = [
+      this.config.REPOS_ROOT,
+      ...this.config.ATTACH_ROOTS,
+    ].map((p) => path.resolve(p));
+
+    const candidate = path.isAbsolute(cleaned)
+      ? path.resolve(cleaned)
+      : path.resolve(allowedRoots[0] ?? this.config.REPOS_ROOT, cleaned);
+
+    let real: string;
+    let stat: fs.Stats;
+    try {
+      real = await fsp.realpath(candidate);
+      stat = await fsp.stat(real);
+    } catch {
+      return null;
+    }
+    if (!stat.isFile()) return null;
+    if (!allowedRoots.some((r) => isWithinRoot(real, r))) return null;
+    return { realPath: real, size: stat.size };
+  }
+
   private async cmdAttach(i: ChatInputCommandInteraction): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
@@ -1032,58 +1066,34 @@ export class Orchestrator {
       return;
     }
 
-    const requested = i.options.getString("path", true).trim().replace(/^"|"$/g, "");
-    const allowedRoots = [
-      this.config.REPOS_ROOT,
-      ...this.config.ATTACH_ROOTS,
-    ].map((p) => path.resolve(p));
-
-    // Relative paths resolve against the first allowed root.
-    const candidate = path.isAbsolute(requested)
-      ? path.resolve(requested)
-      : path.resolve(allowedRoots[0] ?? this.config.REPOS_ROOT, requested);
-
+    const requested = i.options.getString("path", true);
     await i.deferReply({ flags: MessageFlags.Ephemeral });
 
-    let real: string;
-    let stat: fs.Stats;
-    try {
-      real = await fsp.realpath(candidate);
-      stat = await fsp.stat(real);
-    } catch (err) {
-      await i.editReply(`File not found: \`${candidate}\` (${(err as Error).message})`);
-      return;
-    }
-
-    if (!stat.isFile()) {
-      await i.editReply(`Not a regular file: \`${real}\``);
-      return;
-    }
-
-    if (!allowedRoots.some((r) => isWithinRoot(real, r))) {
+    const resolved = await this.resolveAllowedHostFile(requested);
+    if (!resolved) {
       await i.editReply(
-        `🛡️ Refusing: \`${real}\` is outside REPOS_ROOT and ATTACH_ROOTS.`
+        `Could not attach \`${requested}\` — file not found, not a regular file, or outside REPOS_ROOT / ATTACH_ROOTS.`
       );
       return;
     }
 
     const MAX = 25 * 1024 * 1024;
-    if (stat.size > MAX) {
+    if (resolved.size > MAX) {
       await i.editReply(
-        `File too large for Discord: ${stat.size} B (25 MB limit).`
+        `File too large for Discord: ${resolved.size} B (25 MB limit).`
       );
       return;
     }
 
     let data: Buffer;
     try {
-      data = await fsp.readFile(real);
+      data = await fsp.readFile(resolved.realPath);
     } catch (err) {
       await i.editReply(`Read failed: ${(err as Error).message}`);
       return;
     }
 
-    const filename = path.basename(real);
+    const filename = path.basename(resolved.realPath);
     const mimeType = mimeTypeForFilename(filename);
 
     try {
@@ -1199,6 +1209,46 @@ export class Orchestrator {
       }
       return;
     }
+
+    // If the fenced content is *only* a single non-empty line that
+    // resolves to a real file under our allowed roots, send the actual
+    // file instead of the snippet — far more useful than a fence
+    // containing a bare path.
+    const trimmed = fence.content.trim();
+    if (trimmed.length > 0 && !trimmed.includes("\n")) {
+      const resolved = await this.resolveAllowedHostFile(trimmed);
+      if (resolved) {
+        const MAX = 25 * 1024 * 1024;
+        if (resolved.size > MAX) {
+          await this.adapter.sendMessage(
+            channel,
+            `_Referenced file too large to upload: \`${path.basename(resolved.realPath)}\` (${resolved.size} B, 25 MB limit)._`
+          );
+          return;
+        }
+        try {
+          const data = await fsp.readFile(resolved.realPath);
+          const filename = path.basename(resolved.realPath);
+          await this.adapter.sendFile(channel, {
+            data,
+            filename,
+            mimeType: mimeTypeForFilename(filename),
+          });
+          this.logger.info(
+            { realPath: resolved.realPath, bytes: data.byteLength },
+            "fence resolved to host file — uploaded actual file"
+          );
+          return;
+        } catch (err) {
+          this.logger.warn(
+            { err, realPath: resolved.realPath },
+            "fence-to-file resolution read failed; falling back to snippet"
+          );
+          // fall through to snippet upload
+        }
+      }
+    }
+
     const filename =
       fence.ext === "Dockerfile"
         ? counter === 1

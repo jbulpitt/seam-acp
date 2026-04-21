@@ -504,16 +504,21 @@ export class AgentRuntime {
       if (typeof text === "string" && text.length > 0) {
         if (source === "tool") {
           // Tool stdout/stderr (curl progress, file dumps, exit codes) is
-          // NOT a model reply — never post it to chat. We only scan it for
-          // file paths so the path-watcher can upload referenced files.
-          await this.scanToolTextForFiles(text);
-        } else {
-          await this.emit({
-            kind: "agent-text",
-            text,
-            ...(extra.messageId ? { messageId: extra.messageId } : {}),
-          });
+          // NOT a model reply — never post it to chat, and don't scan it
+          // for file paths either: that would upload every doc the agent
+          // reads. Files the agent *produces* are caught by scanning the
+          // assistant's message text below.
+          return;
         }
+        await this.emit({
+          kind: "agent-text",
+          text,
+          ...(extra.messageId ? { messageId: extra.messageId } : {}),
+        });
+        // Scan the assistant's narration for file paths under our safe
+        // roots — catches things like "Saved to /tmp/foo.pdf" without
+        // dragging in every file the agent merely reads.
+        await this.scanToolTextForFiles(text);
       }
       return;
     }

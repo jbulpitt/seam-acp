@@ -5,6 +5,7 @@ import {
   ndJsonStream,
   RequestError,
   type Client,
+  type McpServer,
   type PromptCapabilities,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
@@ -108,6 +109,7 @@ export class AgentRuntime {
   private readonly profile: AgentProfile;
   private readonly logger: Logger;
   private readonly permissionPolicy: PermissionPolicy;
+  private readonly mcpServers: McpServer[];
 
   private child?: ReturnType<AgentProfile["spawn"]>;
   private connection?: ClientSideConnection;
@@ -121,9 +123,11 @@ export class AgentRuntime {
     profile: AgentProfile;
     logger: Logger;
     permissionPolicy?: PermissionPolicy;
+    mcpServers?: McpServer[];
   }) {
     this.profile = opts.profile;
     this.logger = opts.logger.child({ agent: opts.profile.id });
+    this.mcpServers = opts.mcpServers ?? [];
     this.permissionPolicy =
       opts.permissionPolicy ??
       (async (req) => {
@@ -202,7 +206,7 @@ export class AgentRuntime {
 
     const result = await conn.newSession({
       cwd: opts.cwd,
-      mcpServers: [],
+      mcpServers: this.mcpServers,
       ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
     });
 
@@ -237,7 +241,7 @@ export class AgentRuntime {
     const result = await conn.loadSession({
       sessionId: opts.sessionId,
       cwd: opts.cwd,
-      mcpServers: [],
+      mcpServers: this.mcpServers,
     });
     this.sessionId = opts.sessionId;
     this.sessionInfo = {

@@ -96,6 +96,19 @@ If the agent emits an image, audio file, or embedded resource (in a tool
 result or its own message stream), the bot uploads it to the thread as a
 Discord attachment. Discord's free-tier 25 MB upload limit applies.
 
+### MCP servers
+
+The bot can attach Model Context Protocol servers globally to every
+session. Configure them via env vars:
+
+| Env var | Server | What it adds |
+|---|---|---|
+| `MCP_PLAYWRIGHT_ENABLED=true` | [`@playwright/mcp`](https://www.npmjs.com/package/@playwright/mcp) | Real Chromium browser. Lets the agent navigate sites and take screenshots; screenshots flow back as Discord attachments via the agent-file pipeline. Chromium (~150 MB) is downloaded by Playwright on first run. |
+
+Add new servers in `src/mcp.ts`. Anything that emits `image` / `audio` /
+embedded resource content blocks will be picked up by Phase 2 and
+uploaded to the thread automatically.
+
 ## Architecture
 
 ```

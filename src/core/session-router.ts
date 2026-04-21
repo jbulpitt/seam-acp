@@ -6,6 +6,7 @@ import type { SessionRecord, PermissionPolicyMode } from "./types.js";
 import { defaultSessionConfig, resolvePermissionMode } from "./types.js";
 import { makeSessionId } from "./session-store.js";
 import type {
+  McpServer,
   RequestPermissionRequest,
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
@@ -31,6 +32,7 @@ export class SessionRouter {
   private readonly defaultAgentId: string;
   private readonly defaultModel: string;
   private readonly defaultPermissionMode: PermissionPolicyMode;
+  private readonly mcpServers: McpServer[];
   private askUser?: AskUserFn;
 
   private readonly runtimes = new Map<string, AgentRuntime>();
@@ -45,6 +47,7 @@ export class SessionRouter {
     defaultAgentId: string;
     defaultModel: string;
     defaultPermissionMode?: PermissionPolicyMode;
+    mcpServers?: McpServer[];
   }) {
     this.logger = opts.logger.child({ comp: "session-router" });
     this.store = opts.store;
@@ -52,6 +55,7 @@ export class SessionRouter {
     this.defaultAgentId = opts.defaultAgentId;
     this.defaultModel = opts.defaultModel;
     this.defaultPermissionMode = opts.defaultPermissionMode ?? "ask";
+    this.mcpServers = opts.mcpServers ?? [];
   }
 
   /**
@@ -172,6 +176,7 @@ export class SessionRouter {
     const runtime = new AgentRuntime({
       profile,
       logger: this.logger.child({ session: record.id }),
+      mcpServers: this.mcpServers,
       permissionPolicy: async (req) => {
         // Always re-read: the captured `cfg` would be stale if the user later
         // changes the policy via `/seam approve` while the runtime is alive.

@@ -8,6 +8,7 @@ import { makeCopilotProfile } from "./agents/profiles/copilot.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { Orchestrator } from "./platforms/discord/orchestrator.js";
+import { buildGlobalMcpServers } from "./mcp.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -40,6 +41,7 @@ async function main(): Promise<void> {
     defaultPermissionMode: config.DEFAULT_AUTO_APPROVE
       ? "always"
       : config.DEFAULT_PERMISSION_POLICY,
+    mcpServers: buildGlobalMcpServers(logger),
   });
 
   const renderer = discordRenderer;

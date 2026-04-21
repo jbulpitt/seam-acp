@@ -88,7 +88,7 @@ export class SessionRouter {
     const existing = this.store.get(id);
     if (existing) return existing;
 
-    const cfg = defaultSessionConfig(this.defaultModel);
+    const cfg = defaultSessionConfig(this.defaultModel, this.defaultPermissionMode);
     const now = new Date().toISOString();
     // We don't yet know the ACP session id — it will be filled in by the
     // first runtime start. Store an empty marker for now.

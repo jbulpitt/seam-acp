@@ -26,7 +26,10 @@ async function main(): Promise<void> {
 
   const store = new SessionStore(path.join(config.DATA_DIR, "seam.db"));
 
-  const mcpServers = buildGlobalMcpServers(logger);
+  const { servers: mcpServers, extraSafeRoots } = buildGlobalMcpServers(
+    logger,
+    { dataDir: config.DATA_DIR }
+  );
 
   const copilot = makeCopilotProfile({
     ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
@@ -45,6 +48,7 @@ async function main(): Promise<void> {
       ? "always"
       : config.DEFAULT_PERMISSION_POLICY,
     mcpServers,
+    extraSafeRoots,
   });
 
   const renderer = discordRenderer;

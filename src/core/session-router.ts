@@ -33,6 +33,7 @@ export class SessionRouter {
   private readonly defaultModel: string;
   private readonly defaultPermissionMode: PermissionPolicyMode;
   private readonly mcpServers: McpServer[];
+  private readonly extraSafeRoots: string[];
   private askUser?: AskUserFn;
 
   private readonly runtimes = new Map<string, AgentRuntime>();
@@ -48,6 +49,7 @@ export class SessionRouter {
     defaultModel: string;
     defaultPermissionMode?: PermissionPolicyMode;
     mcpServers?: McpServer[];
+    extraSafeRoots?: string[];
   }) {
     this.logger = opts.logger.child({ comp: "session-router" });
     this.store = opts.store;
@@ -56,6 +58,7 @@ export class SessionRouter {
     this.defaultModel = opts.defaultModel;
     this.defaultPermissionMode = opts.defaultPermissionMode ?? "ask";
     this.mcpServers = opts.mcpServers ?? [];
+    this.extraSafeRoots = opts.extraSafeRoots ?? [];
   }
 
   /**
@@ -177,6 +180,7 @@ export class SessionRouter {
       profile,
       logger: this.logger.child({ session: record.id }),
       mcpServers: this.mcpServers,
+      extraSafeRoots: this.extraSafeRoots,
       permissionPolicy: async (req) => {
         // Always re-read: the captured `cfg` would be stale if the user later
         // changes the policy via `/seam approve` while the runtime is alive.

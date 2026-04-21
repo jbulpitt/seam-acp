@@ -10,13 +10,35 @@
  * is available; for binaries we assume the user has them installed.
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { Logger } from "./lib/logger.js";
 
-export function buildGlobalMcpServers(logger: Logger): McpServer[] {
+export interface McpServersResult {
+  servers: McpServer[];
+  /**
+   * Extra directories the path-watcher should treat as safe roots when
+   * scanning tool output for file paths. Anything an MCP server is
+   * configured to write into should be listed here so screenshots and
+   * other emitted files can be uploaded to chat.
+   */
+  extraSafeRoots: string[];
+}
+
+export function buildGlobalMcpServers(
+  logger: Logger,
+  opts: { dataDir: string }
+): McpServersResult {
   const servers: McpServer[] = [];
+  const extraSafeRoots: string[] = [];
 
   if (parseBool(process.env.MCP_PLAYWRIGHT_ENABLED)) {
+    // Pin Playwright's outputs to a known scratch dir under DATA_DIR so
+    // they don't pollute whatever repo the session happens to be in.
+    const scratch = path.resolve(opts.dataDir, "agent-scratch", "playwright");
+    fs.mkdirSync(scratch, { recursive: true });
+
     servers.push({
       name: "playwright",
       command: "npx",
@@ -27,13 +49,19 @@ export function buildGlobalMcpServers(logger: Logger): McpServer[] {
         "--headless",
         "--image-responses",
         "allow",
+        "--output-dir",
+        scratch,
       ],
       env: [],
     });
-    logger.info("MCP enabled: playwright (browser automation + screenshots)");
+    extraSafeRoots.push(scratch);
+    logger.info(
+      { outputDir: scratch },
+      "MCP enabled: playwright (browser automation + screenshots)"
+    );
   }
 
-  return servers;
+  return { servers, extraSafeRoots };
 }
 
 function parseBool(v: string | undefined): boolean {

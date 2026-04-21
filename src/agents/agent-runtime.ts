@@ -105,6 +105,23 @@ interface AvailableMode {
  * One AgentRuntime per chat thread. The chat layer fans events to the user via
  * a single onEvent handler (set with `onEvent`).
  */
+/**
+ * How long to wait for ACP `initialize` and `session/new` to complete
+ * before treating the agent as wedged. Generous (45s) to allow for
+ * slow npm-installed adapters to bootstrap on first run, but bounded
+ * enough that a wedge surfaces an actionable error instead of a
+ * 15-minute Discord deferred-reply timeout.
+ */
+const START_TIMEOUT_MS = 45_000;
+const NEW_SESSION_TIMEOUT_MS = 45_000;
+
+function withTimeout<T = never>(ms: number, message: string): Promise<T> {
+  return new Promise((_resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(message)), ms);
+    if (typeof t.unref === "function") t.unref();
+  });
+}
+
 export class AgentRuntime {
   private readonly profile: AgentProfile;
   private readonly logger: Logger;
@@ -157,6 +174,31 @@ export class AgentRuntime {
     const child = this.profile.spawn();
     this.child = child;
 
+    // Capture spawn errors (ENOENT, EACCES, etc.) so they surface as a
+    // rejected start() promise instead of letting the ACP handshake hang
+    // indefinitely on a stdout that will never produce data.
+    let spawnError: Error | undefined;
+    const errorWaiter = new Promise<never>((_resolve, reject) => {
+      child.once("error", (err: NodeJS.ErrnoException) => {
+        spawnError = err;
+        const hint =
+          err.code === "ENOENT"
+            ? ` (binary not found on PATH; did you 'npm i -g' the agent's CLI?)`
+            : "";
+        reject(new Error(`agent spawn failed: ${err.message}${hint}`));
+      });
+      child.once("exit", (code, signal) => {
+        if (!spawnError && this.connection === undefined) {
+          // Process died before initialize completed.
+          reject(
+            new Error(
+              `agent process exited before initialize (code=${code}, signal=${signal})`
+            )
+          );
+        }
+      });
+    });
+
     child.on("exit", (code, signal) => {
       this.logger.warn({ code, signal }, "agent process exited");
     });
@@ -178,12 +220,20 @@ export class AgentRuntime {
     const client = this.makeClient();
     this.connection = new ClientSideConnection(() => client, stream);
 
-    const initResult = await this.connection.initialize({
-      protocolVersion: PROTOCOL_VERSION,
-      clientCapabilities: {
-        fs: { readTextFile: false, writeTextFile: false },
-      },
-    });
+    const initResult = await Promise.race([
+      this.connection.initialize({
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+        },
+      }),
+      errorWaiter,
+      withTimeout(
+        START_TIMEOUT_MS,
+        `ACP initialize timed out after ${START_TIMEOUT_MS / 1000}s ` +
+          `(agent never responded; check that '${this.profile.id}' is installed and authenticated)`
+      ),
+    ]);
     this.promptCapabilities =
       initResult.agentCapabilities?.promptCapabilities ?? undefined;
     this.logger.debug(
@@ -205,11 +255,18 @@ export class AgentRuntime {
       ...(opts.meta ?? {}),
     };
 
-    const result = await conn.newSession({
-      cwd: opts.cwd,
-      mcpServers: this.mcpServers,
-      ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
-    });
+    const result = await Promise.race([
+      conn.newSession({
+        cwd: opts.cwd,
+        mcpServers: this.mcpServers,
+        ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
+      }),
+      withTimeout<never>(
+        NEW_SESSION_TIMEOUT_MS,
+        `ACP session/new timed out after ${NEW_SESSION_TIMEOUT_MS / 1000}s ` +
+          `(agent '${this.profile.id}' did not create a session — check auth and cwd)`
+      ),
+    ]);
 
     this.sessionCwd = opts.cwd;
     this.sessionId = result.sessionId;

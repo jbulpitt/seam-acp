@@ -124,19 +124,12 @@ export class Orchestrator {
     }, 1000);
 
     let textBuffer = "";
-    let flushTimer: NodeJS.Timeout | undefined;
-    // Flush policy: prefer clean breaks (paragraph > line > sentence) and
-    // never split inside an open code fence. We keep the buffer below the
-    // hard cap; otherwise force a (fence-aware) cut.
+    // Streaming policy: only flush mid-turn on paragraph breaks (safe — the
+    // model has clearly finished a thought) or when we cross the hard cap.
+    // Final flush always happens at end-of-turn. The status panel handles
+    // live progress, so we don't need a fallback idle timer.
     const HARD_MAX = 1800;
-    const SOFT_MIN = 400;
-    const FLUSH_IDLE_MS = 1500;
-    const cancelFlushTimer = () => {
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = undefined;
-      }
-    };
+    const SOFT_MIN = 1;
     const drainBuffer = async (force: boolean) => {
       while (textBuffer) {
         const split = splitForFlush(textBuffer, {
@@ -149,29 +142,21 @@ export class Orchestrator {
         if (split.send) {
           await this.adapter.sendMessage(channel, split.send);
         }
-        // Soft mode: take at most one chunk per call so we don't spam.
         if (!force) return;
       }
     };
     const flushChunks = async () => {
-      cancelFlushTimer();
       await drainBuffer(true);
     };
+    const cancelFlushTimer = () => {
+      // No idle timer in paragraph-only mode; kept as a no-op for retry path.
+    };
     const maybeFlush = () => {
-      // Force-flush if we've crossed the hard cap; otherwise try a soft drain
-      // and, failing that, schedule an idle flush.
       if (textBuffer.length >= HARD_MAX) {
-        cancelFlushTimer();
         void drainBuffer(true);
         return;
       }
-      void drainBuffer(false).then(() => {
-        if (!textBuffer || flushTimer) return;
-        flushTimer = setTimeout(() => {
-          flushTimer = undefined;
-          void drainBuffer(true);
-        }, FLUSH_IDLE_MS);
-      });
+      void drainBuffer(false);
     };
 
     const RETRY_MARKER = "— 🔁 retried — output above may repeat —";
@@ -241,10 +226,7 @@ export class Orchestrator {
       const timeoutMs = this.config.TURN_TIMEOUT_SECONDS * 1000;
       const result = await raceWithTimeout(turnPromise, timeoutMs);
 
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = undefined;
-      }
+      cancelFlushTimer();
       await flushChunks();
 
       if (result === "timeout") {
@@ -260,10 +242,7 @@ export class Orchestrator {
       }
     } catch (err) {
       this.logger.error({ err }, "turn failed");
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = undefined;
-      }
+      cancelFlushTimer();
       await flushChunks();
       status.setState("Failed");
       const m = err instanceof Error ? err.message : String(err);

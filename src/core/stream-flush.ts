@@ -52,20 +52,22 @@ function findOpenFence(buf: string): OpenFence | null {
 function findCleanSplit(
   buf: string,
   minIdx: number,
-  maxIdx: number
+  maxIdx: number,
+  paragraphOnly = false
 ): { idx: number; skip: number } | null {
   const window = buf.slice(0, Math.min(buf.length, maxIdx));
 
-  // Paragraph break
+  // Paragraph break (preferred — only safe boundary mid-stream).
   const para = window.lastIndexOf("\n\n");
   if (para >= minIdx) return { idx: para, skip: 2 };
+
+  if (paragraphOnly) return null;
 
   // Line break
   const nl = window.lastIndexOf("\n");
   if (nl >= minIdx) return { idx: nl, skip: 1 };
 
-  // Sentence break: ". ", "! ", "? " (avoid splitting decimals/abbreviations
-  // by requiring the following char to be a space).
+  // Sentence break: ". ", "! ", "? "
   for (let i = window.length - 2; i >= minIdx; i--) {
     const c = window.charCodeAt(i);
     if ((c === 46 || c === 33 || c === 63) && window.charCodeAt(i + 1) === 32) {
@@ -85,10 +87,12 @@ export function splitForFlush(
   const softMin = opts.softMin ?? 1;
   const fence = findOpenFence(buffer);
 
-  // --- Soft path: only flush on a clean boundary outside any open fence.
+  // --- Soft path: only flush on a paragraph break outside any open fence.
+  // Mid-stream the model emits punctuation as separate chunks, so anything
+  // less safe than a paragraph break risks landing mid-sentence.
   if (!force) {
     if (fence) return null;
-    const split = findCleanSplit(buffer, softMin, buffer.length);
+    const split = findCleanSplit(buffer, softMin, buffer.length, true);
     if (!split) return null;
     const send = buffer.slice(0, split.idx).replace(/\s+$/, "");
     const keep = buffer.slice(split.idx + split.skip);

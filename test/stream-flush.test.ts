@@ -23,19 +23,14 @@ describe("splitForFlush — soft", () => {
     expect(out).toEqual({ send: "Para one.", keep: "Para two so far" });
   });
 
-  it("falls back to last newline if no paragraph break", () => {
+  it("defers when only line breaks exist (paragraph-only soft mode)", () => {
     const buf = "line one\nline two\nstill writing";
-    const out = splitForFlush(buf, { maxLen: MAX, force: false });
-    expect(out).toEqual({ send: "line one\nline two", keep: "still writing" });
+    expect(splitForFlush(buf, { maxLen: MAX, force: false })).toBeNull();
   });
 
-  it("falls back to sentence break if no newline", () => {
+  it("defers when only sentence breaks exist (paragraph-only soft mode)", () => {
     const buf = "First sentence. Second one is in progress";
-    const out = splitForFlush(buf, { maxLen: MAX, force: false });
-    expect(out).toEqual({
-      send: "First sentence.",
-      keep: "Second one is in progress",
-    });
+    expect(splitForFlush(buf, { maxLen: MAX, force: false })).toBeNull();
   });
 
   it("never splits inside an open code fence", () => {
@@ -43,13 +38,18 @@ describe("splitForFlush — soft", () => {
     expect(splitForFlush(buf, { maxLen: MAX, force: false })).toBeNull();
   });
 
-  it("flushes once a code fence has closed", () => {
-    const buf = "Here is code:\n```ts\nconst x = 1;\n```\nMore prose now";
+  it("flushes at paragraph break after a closed code fence", () => {
+    const buf = "Here is code:\n```ts\nconst x = 1;\n```\n\nMore prose now";
     const out = splitForFlush(buf, { maxLen: MAX, force: false });
     expect(out).not.toBeNull();
     expect(out!.send).toContain("```ts");
-    expect(out!.send).toContain("```");
+    expect(out!.send.endsWith("```")).toBe(true);
     expect(out!.keep).toBe("More prose now");
+  });
+
+  it("defers when a code fence has closed but no paragraph break follows", () => {
+    const buf = "Here is code:\n```ts\nconst x = 1;\n```\nMore prose now";
+    expect(splitForFlush(buf, { maxLen: MAX, force: false })).toBeNull();
   });
 });
 

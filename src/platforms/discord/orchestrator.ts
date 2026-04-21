@@ -21,7 +21,8 @@ import {
   type SessionConfigState,
 } from "../../core/types.js";
 
-const STATUS_EDIT_DEBOUNCE_MS = 1000;
+const STATUS_EDIT_DEBOUNCE_MS = 2500;
+const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
 
 const REPO_PICK_EMOJIS = [
@@ -118,10 +119,13 @@ export class Orchestrator {
       }
     };
 
-    // Heartbeat: tick the elapsed counter every second.
+    // Heartbeat: tick the elapsed counter periodically. Edits to the same
+    // message are heavily rate-limited by Discord (~5/5s per message), and
+    // those rate-limit waits also queue behind regular sends — so we keep
+    // this conservative.
     const heartbeat = setInterval(() => {
       void refresh();
-    }, 1000);
+    }, STATUS_HEARTBEAT_MS);
 
     let textBuffer = "";
     // Streaming policy: only flush mid-turn on paragraph breaks (safe — the

@@ -142,6 +142,10 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
+    sub.setName("avatar").setDescription("Push the bot avatar to Discord (force re-upload)")
+  );
+
+  cmd.addSubcommand((sub) =>
     sub.setName("help").setDescription("Show help")
   );
 
@@ -162,6 +166,7 @@ export type SeamSubcommand =
   | "repos"
   | "init"
   | "approve"
+  | "avatar"
   | "help";
 
 export function getSubcommand(

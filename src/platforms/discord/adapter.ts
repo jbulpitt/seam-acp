@@ -16,6 +16,9 @@ import {
   type User,
   type PartialUser,
 } from "discord.js";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
 import type {
@@ -92,6 +95,7 @@ export class DiscordAdapter implements ChatAdapter {
     this.botUserId = this.client.user?.id;
     this.logger.info({ botUserId: this.botUserId }, "discord adapter ready");
     await this.registerSlashCommands();
+    await this.applyAvatarIfNeeded();
   }
 
   async stop(): Promise<void> {
@@ -263,6 +267,30 @@ export class DiscordAdapter implements ChatAdapter {
       return;
     }
     await this.slashHandler(interaction);
+  }
+
+  /** Push the PNG avatar. Resolves with true on success, false if file not found. */
+  async pushAvatar(): Promise<boolean> {
+    const avatarPath = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../../assets/seam-acp-avatar.png"
+    );
+    if (!fs.existsSync(avatarPath)) {
+      this.logger.warn({ avatarPath }, "avatar file not found; skipping");
+      return false;
+    }
+    await this.client.user!.setAvatar(avatarPath);
+    this.logger.info("bot avatar updated");
+    return true;
+  }
+
+  private async applyAvatarIfNeeded(): Promise<void> {
+    if (this.client.user?.avatar) return; // already has one
+    try {
+      await this.pushAvatar();
+    } catch (err) {
+      this.logger.warn({ err }, "failed to set bot avatar (rate-limited or missing file)");
+    }
   }
 
   private async fetchSendableChannel(

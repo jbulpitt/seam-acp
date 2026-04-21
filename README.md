@@ -82,6 +82,7 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seam config` | Show the session config JSON |
 | `/seam config-set <json>` | Replace the session config wholesale |
 | `/seam sessions` | List recent sessions across the bot |
+| `/seam avatar` | Re-push the bot avatar to Discord (force re-upload) |
 | `/seam help` | Show this list |
 
 Free-form messages in a thread are sent straight to the agent.

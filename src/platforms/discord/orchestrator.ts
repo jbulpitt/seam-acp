@@ -20,6 +20,7 @@ import {
   defaultSessionConfig,
   type SessionConfigState,
 } from "../../core/types.js";
+import type { DiscordAdapter } from "./adapter.js";
 
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
@@ -295,6 +296,8 @@ export class Orchestrator {
         return this.cmdInit(interaction);
       case "approve":
         return this.cmdApprove(interaction);
+      case "avatar":
+        return this.cmdAvatar(interaction);
       case "help":
         return this.cmdHelp(interaction);
       default:
@@ -608,6 +611,19 @@ export class Orchestrator {
     });
   }
 
+  private async cmdAvatar(i: ChatInputCommandInteraction): Promise<void> {
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      const ok = await (this.adapter as unknown as DiscordAdapter).pushAvatar();
+      await i.editReply({
+        content: ok ? "✅ Bot avatar updated." : "⚠️ Avatar file not found (`assets/seam-acp-avatar.png`).",
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await i.editReply({ content: `❌ Failed to update avatar: ${msg}` });
+    }
+  }
+
   private async cmdHelp(i: ChatInputCommandInteraction): Promise<void> {
     const lines = [
       "**seam-acp** — control the agent in this thread.",
@@ -625,6 +641,7 @@ export class Orchestrator {
       "`/seam config` — show session config JSON",
       "`/seam config-set <json>` — replace session config",
       "`/seam sessions` — list known sessions",
+      "`/seam avatar` — re-push bot avatar to Discord",
       "",
       "Free-form messages in a thread are sent to the agent.",
     ];

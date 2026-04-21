@@ -129,6 +129,7 @@ export class Orchestrator {
     }, STATUS_HEARTBEAT_MS);
 
     let textBuffer = "";
+    let textSent = false;
     // Streaming policy: only flush mid-turn when we have a *substantial*
     // amount of buffered text AND a clean paragraph boundary exists.
     // Otherwise wait for end-of-turn — Discord rate-limits us hard if we
@@ -147,6 +148,7 @@ export class Orchestrator {
         textBuffer = split.keep;
         if (split.send) {
           await this.adapter.sendMessage(channel, split.send);
+          textSent = true;
         }
         if (!force) return;
       }
@@ -239,7 +241,7 @@ export class Orchestrator {
       cancelFlushTimer();
       await flushChunks();
 
-      if (!textBuffer && result !== "timeout" && !(result as { cancelled?: boolean }).cancelled) {
+      if (!textSent && result !== "timeout" && !(result as { cancelled?: boolean }).cancelled) {
         // Turn completed but the agent produced no visible text (e.g. tools ran
         // but emitted no assistant message). Make it visible so the user isn't
         // left wondering if their message was received.

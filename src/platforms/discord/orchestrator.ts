@@ -400,6 +400,8 @@ export class Orchestrator {
         return this.cmdInit(interaction);
       case "approve":
         return this.cmdApprove(interaction);
+      case "agent":
+        return this.cmdAgent(interaction);
       case "avatar":
         return this.cmdAvatar(interaction);
       case "help":
@@ -594,6 +596,69 @@ export class Orchestrator {
     await i.reply({
       content:
         "Session reset. Your next message will start a fresh ACP session (history is gone, but config is kept).",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  /**
+   * `/seam agent` — show or change the agent bound to this thread.
+   *
+   * Changing agents mid-thread is destructive: the old agent's
+   * conversation history can't be replayed against a different CLI, so
+   * we invalidate the live runtime and clear the stored ACP session id
+   * (same as `/seam reset`). The new agent's `defaultModel` is applied
+   * to the session config so the first turn uses something sensible.
+   */
+  private async cmdAgent(i: ChatInputCommandInteraction): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({
+        content: "Use inside a thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const id = i.options.getString("id");
+    const profiles = this.router.listProfiles();
+    const listing = profiles
+      .map((p) => `\`${p.id}\` — ${p.displayName}`)
+      .join(", ");
+    if (!id) {
+      await i.reply({
+        content: `Current agent: \`${record.agentId}\`\nAvailable: ${listing}`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const profile = this.router.getProfile(id);
+    if (!profile) {
+      await i.reply({
+        content: `Unknown agent \`${id}\`. Available: ${listing}`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (record.agentId === id) {
+      await i.reply({
+        content: `Agent is already \`${id}\`.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    // Kill the live runtime (ends any in-flight turn) and wipe the ACP
+    // session id so the next message spawns the new agent fresh.
+    await this.router.invalidate(record.id);
+    const cfg = this.store.readConfig(record);
+    cfg.model = profile.defaultModel;
+    this.persistConfig(record, cfg);
+    this.store.upsert({
+      ...record,
+      agentId: id,
+      acpSessionId: "",
+      updatedUtc: new Date().toISOString(),
+    });
+    await i.reply({
+      content: `Agent switched to \`${id}\` (${profile.displayName}), model \`${profile.defaultModel}\`. Next message will start a fresh session.`,
       flags: MessageFlags.Ephemeral,
     });
   }

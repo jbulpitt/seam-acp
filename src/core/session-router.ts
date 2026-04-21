@@ -70,6 +70,16 @@ export class SessionRouter {
     this.askUser = fn;
   }
 
+  /** List the registered agent profiles. */
+  listProfiles(): AgentProfile[] {
+    return [...this.profileById.values()];
+  }
+
+  /** Look up a registered profile by id, or undefined if not found. */
+  getProfile(id: string): AgentProfile | undefined {
+    return this.profileById.get(id);
+  }
+
   /** Look up or create the SessionRecord for a given chat channel. */
   ensureSessionRecord(opts: {
     platform: string;

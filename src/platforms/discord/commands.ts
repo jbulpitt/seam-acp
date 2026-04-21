@@ -151,6 +151,20 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
+    sub
+      .setName("agent")
+      .setDescription(
+        "Get or set the agent for this thread (resets the session when changed)"
+      )
+      .addStringOption((o) =>
+        o
+          .setName("id")
+          .setDescription("Agent id (e.g. copilot, gemini)")
+          .setRequired(false)
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
     sub.setName("avatar").setDescription("Push the bot avatar to Discord (force re-upload)")
   );
 
@@ -168,6 +182,7 @@ export type SeamSubcommand =
   | "mode"
   | "effort"
   | "abort"
+  | "reset"
   | "tools"
   | "config"
   | "config-set"
@@ -175,6 +190,7 @@ export type SeamSubcommand =
   | "repos"
   | "init"
   | "approve"
+  | "agent"
   | "avatar"
   | "help";
 

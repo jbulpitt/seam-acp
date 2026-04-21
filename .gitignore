@@ -9,3 +9,7 @@ data/
 # Playwright MCP scratch outputs
 .playwright-mcp/
 *.png
+
+# Untracked dev artifacts
+test-file.txt
+scripts/acp-bench.ts

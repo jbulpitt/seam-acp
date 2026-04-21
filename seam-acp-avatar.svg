@@ -2,12 +2,12 @@
   <title>seam-acp</title>
   <!-- Background -->
   <rect width="256" height="256" rx="48" fill="#0D1B27"/>
-  <!-- Mark: [ ... ] scaled up and centred -->
-  <g transform="translate(128, 128)" fill="none" stroke="#1AA093" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M28 -48 L0 -48 L0 48 L28 48"/>
-    <line x1="56" y1="0" x2="72" y2="0"/>
-    <line x1="84" y1="0" x2="100" y2="0"/>
-    <line x1="112" y1="0" x2="128" y2="0"/>
-    <path d="M140 -48 L168 -48 L168 48 L140 48"/>
+  <!-- Mark: original coords (x 0→42, y -12→12, center 21,0), scaled 4x and centred -->
+  <g transform="translate(128, 128) scale(4) translate(-21, 0)" fill="none" stroke="#1AA093" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M7 -12 L0 -12 L0 12 L7 12"/>
+    <line x1="14" y1="0" x2="18" y2="0"/>
+    <line x1="21" y1="0" x2="25" y2="0"/>
+    <line x1="28" y1="0" x2="32" y2="0"/>
+    <path d="M35 -12 L42 -12 L42 12 L35 12"/>
   </g>
 </svg>

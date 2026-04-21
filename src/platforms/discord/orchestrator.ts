@@ -226,6 +226,12 @@ export class Orchestrator {
     let loopChunk: string | null = null;
     let loopCount = 0;
     let loopAborted = false;
+    // Whitespace runaway: when the model gets stuck emitting nothing but
+    // newlines/spaces, no trimmed chunk ever lands so the repeat-detector
+    // can't fire. Count whitespace-only chunks separately and bail out
+    // after enough of them in a row.
+    const WHITESPACE_RUN_THRESHOLD = 30;
+    let whitespaceRun = 0;
     const noteRetry = async () => {
       if (postedRetryNotice) return;
       postedRetryNotice = true;
@@ -259,6 +265,7 @@ export class Orchestrator {
             if (!loopAborted) {
               const trimmed = event.text.trim();
               if (trimmed) {
+                whitespaceRun = 0;
                 if (trimmed === loopChunk) {
                   loopCount += 1;
                 } else {
@@ -266,24 +273,33 @@ export class Orchestrator {
                   loopCount = 1;
                 }
               } else {
-                // pure-whitespace chunks don't reset the run (a trickle
-                // of newlines between repeats is still a loop) but
-                // don't count toward it either.
+                // pure-whitespace chunk: track separately so a runaway
+                // newline loop still trips the canary.
+                whitespaceRun += 1;
               }
-              const threshold =
+              const repeatThreshold =
                 loopChunk && loopChunk.length <= LOOP_SHORT_MAX
                   ? LOOP_THRESHOLD_SHORT
                   : LOOP_THRESHOLD_LONG;
-              if (loopChunk && loopCount >= threshold) {
+              const repeatTripped =
+                loopChunk !== null && loopCount >= repeatThreshold;
+              const whitespaceTripped =
+                whitespaceRun >= WHITESPACE_RUN_THRESHOLD;
+              if (repeatTripped || whitespaceTripped) {
                 loopAborted = true;
+                const reason = whitespaceTripped
+                  ? "whitespace"
+                  : "repeated chunk";
                 this.logger.warn(
                   {
                     session: record.id,
-                    chunkLen: loopChunk.length,
-                    chunkPreview: loopChunk.slice(0, 80),
+                    reason,
+                    chunkLen: loopChunk?.length ?? 0,
+                    chunkPreview: loopChunk?.slice(0, 80),
                     repeats: loopCount,
+                    whitespaceRun,
                   },
-                  "runaway chunk loop detected; cancelling turn"
+                  "runaway agent output detected; cancelling turn"
                 );
                 try {
                   await runtime.cancel();
@@ -292,14 +308,15 @@ export class Orchestrator {
                 }
                 try {
                   await flushChunks();
-                  const preview =
-                    loopChunk.length > 80
-                      ? `${loopChunk.slice(0, 77)}...`
-                      : loopChunk;
-                  await this.adapter.sendMessage(
-                    channel,
-                    `⚠️ Agent got stuck repeating the same output (\`${preview}\`) — turn cancelled. Try rephrasing.`
-                  );
+                  const notice = whitespaceTripped
+                    ? "⚠️ Agent got stuck emitting blank output — turn cancelled. Try rephrasing."
+                    : (() => {
+                        const c = loopChunk ?? "";
+                        const preview =
+                          c.length > 80 ? `${c.slice(0, 77)}...` : c;
+                        return `⚠️ Agent got stuck repeating the same output (\`${preview}\`) — turn cancelled. Try rephrasing.`;
+                      })();
+                  await this.adapter.sendMessage(channel, notice);
                   textSent = true;
                 } catch (err) {
                   this.logger.warn({ err }, "loop notice send failed");

@@ -2,9 +2,18 @@ import { AgentRuntime } from "../agents/agent-runtime.js";
 import type { AgentProfile } from "../agents/agent-profile.js";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore } from "./session-store.js";
-import type { SessionRecord } from "./types.js";
-import { defaultSessionConfig } from "./types.js";
+import type { SessionRecord, PermissionPolicyMode } from "./types.js";
+import { defaultSessionConfig, resolvePermissionMode } from "./types.js";
 import { makeSessionId } from "./session-store.js";
+import type {
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+} from "@agentclientprotocol/sdk";
+
+export type AskUserFn = (
+  record: SessionRecord,
+  req: RequestPermissionRequest
+) => Promise<RequestPermissionResponse>;
 
 /**
  * Holds one AgentRuntime per chat session id, with:
@@ -21,7 +30,8 @@ export class SessionRouter {
   private readonly profileById: Map<string, AgentProfile>;
   private readonly defaultAgentId: string;
   private readonly defaultModel: string;
-  private readonly defaultAutoApprove: boolean;
+  private readonly defaultPermissionMode: PermissionPolicyMode;
+  private askUser?: AskUserFn;
 
   private readonly runtimes = new Map<string, AgentRuntime>();
   private readonly creationLocks = new Map<string, Promise<AgentRuntime>>();
@@ -34,14 +44,23 @@ export class SessionRouter {
     profiles: AgentProfile[];
     defaultAgentId: string;
     defaultModel: string;
-    defaultAutoApprove?: boolean;
+    defaultPermissionMode?: PermissionPolicyMode;
   }) {
     this.logger = opts.logger.child({ comp: "session-router" });
     this.store = opts.store;
     this.profileById = new Map(opts.profiles.map((p) => [p.id, p]));
     this.defaultAgentId = opts.defaultAgentId;
     this.defaultModel = opts.defaultModel;
-    this.defaultAutoApprove = opts.defaultAutoApprove ?? false;
+    this.defaultPermissionMode = opts.defaultPermissionMode ?? "ask";
+  }
+
+  /**
+   * Provide the callback that prompts a real user for an approval decision.
+   * Used only when a session's permission policy is "ask". If unset, "ask"
+   * behaves like "deny".
+   */
+  setAskUser(fn: AskUserFn): void {
+    this.askUser = fn;
   }
 
   /** Look up or create the SessionRecord for a given chat channel. */
@@ -157,8 +176,8 @@ export class SessionRouter {
         // Always re-read: the captured `cfg` would be stale if the user later
         // changes the policy via `/seam approve` while the runtime is alive.
         const fresh = this.store.readConfig(record);
-        const allow = fresh.autoApprovePermissions ?? this.defaultAutoApprove;
-        if (allow) {
+        const mode = resolvePermissionMode(fresh, this.defaultPermissionMode);
+        if (mode === "always") {
           const opt =
             req.options.find((o) => o.kind?.startsWith("allow_")) ??
             req.options[0];
@@ -167,7 +186,17 @@ export class SessionRouter {
               outcome: { outcome: "selected", optionId: opt.optionId },
             };
           }
+          return { outcome: { outcome: "cancelled" } };
         }
+        if (mode === "ask" && this.askUser) {
+          try {
+            return await this.askUser(record, req);
+          } catch (err) {
+            this.logger.warn({ err, sessionId: record.id }, "askUser failed; denying");
+            return { outcome: { outcome: "cancelled" } };
+          }
+        }
+        // mode === "deny" (or "ask" with no askUser wired)
         return { outcome: { outcome: "cancelled" } };
       },
     });

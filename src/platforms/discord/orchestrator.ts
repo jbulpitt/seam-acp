@@ -499,7 +499,7 @@ export class Orchestrator {
       return;
     }
     const cfg =
-      this.store.readConfig(record) ?? defaultSessionConfig(this.config.DEFAULT_MODEL, this.config.DEFAULT_AUTO_APPROVE);
+      this.store.readConfig(record) ?? defaultSessionConfig(this.config.DEFAULT_MODEL);
     await i.reply({
       content: this.renderer.codeBlock(JSON.stringify(cfg, null, 2), "json"),
       flags: MessageFlags.Ephemeral,
@@ -621,17 +621,24 @@ export class Orchestrator {
       await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const policy = i.options.getString("policy", true);
+    const policy = i.options.getString("policy", true) as
+      | "always"
+      | "ask"
+      | "deny";
     const cfg = this.store.readConfig(record);
-    cfg.autoApprovePermissions = policy === "always";
+    cfg.permissionPolicy = policy;
+    // Drop the deprecated field so it can never override the new value.
+    delete cfg.autoApprovePermissions;
     this.persistConfig(record, cfg);
-    await i.reply({
-      content:
-        policy === "always"
-          ? "Approval policy set to `always`. ⚠️ The agent will auto-approve all permission requests (shell exec, file writes, etc.)."
-          : "Approval policy set to `ask`. The agent will be denied any permission request it makes — use `always` to let it run freely.",
-      flags: MessageFlags.Ephemeral,
-    });
+    const messages: Record<typeof policy, string> = {
+      always:
+        "Approval policy set to `always`. ⚠️ The agent will auto-approve every permission request (shell exec, file writes, network, etc.).",
+      ask:
+        "Approval policy set to `ask`. The bot will post a Discord prompt for each permission request and auto-deny after 5 minutes.",
+      deny:
+        "Approval policy set to `deny`. The agent will be auto-denied every permission request — useful for read-only sessions.",
+    };
+    await i.reply({ content: messages[policy], flags: MessageFlags.Ephemeral });
   }
 
   private async cmdAvatar(i: ChatInputCommandInteraction): Promise<void> {
@@ -659,7 +666,7 @@ export class Orchestrator {
       "`/seam mode <id>` — set agent operational mode",
       "`/seam effort <low|medium|high>` — reasoning effort",
       "`/seam tools <allow|exclude> [list]` — tool filters",
-      "`/seam approve <ask|always>` — permission policy",
+      "`/seam approve <always|ask|deny>` — permission policy",
       "`/seam abort` — cancel current turn",
       "`/seam config` — show session config JSON",
       "`/seam config-set <json>` — replace session config",

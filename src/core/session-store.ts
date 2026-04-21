@@ -129,7 +129,10 @@ export class SessionStore {
     return JSON.stringify(cfg, null, 2);
   }
 
-  static defaultConfig(defaultModel: string, autoApprove = false): SessionConfigState {
-    return defaultSessionConfig(defaultModel, autoApprove);
+  static defaultConfig(
+    defaultModel: string,
+    defaultPolicy?: import("./types.js").PermissionPolicyMode
+  ): SessionConfigState {
+    return defaultSessionConfig(defaultModel, defaultPolicy);
   }
 }

@@ -33,11 +33,21 @@ const Schema = z.object({
     .default("info"),
   HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   /**
-   * Bot-wide default for new sessions. When false (the default), the agent
-   * will ask for permission before running potentially destructive tools and
-   * the session policy defaults to "deny" until the user runs
-   * `/seam approve always`. Set to true to default every new session to
-   * auto-approve (yolo mode).
+   * Bot-wide default permission policy for new sessions.
+   * - "always": auto-approve every request (yolo)
+   * - "ask": prompt the user in Discord; deny on timeout (recommended)
+   * - "deny": auto-deny every request
+   *
+   * For backward compat, `DEFAULT_AUTO_APPROVE=true` (legacy var) overrides
+   * this to "always" when set; `false` is ignored.
+   */
+  DEFAULT_PERMISSION_POLICY: z
+    .enum(["always", "ask", "deny"])
+    .default("ask"),
+  /**
+   * @deprecated Use DEFAULT_PERMISSION_POLICY instead. When `true`, forces
+   * the bot-wide default to "always" (auto-approve everything for new
+   * sessions). When `false`, has no effect.
    */
   DEFAULT_AUTO_APPROVE: z
     .enum(["true", "false"])

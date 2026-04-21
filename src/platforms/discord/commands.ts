@@ -128,15 +128,16 @@ export function buildSeamCommand(): SlashCommandBuilder {
   cmd.addSubcommand((sub) =>
     sub
       .setName("approve")
-      .setDescription("Set permission policy")
+      .setDescription("Set permission policy for this thread")
       .addStringOption((o) =>
         o
           .setName("policy")
-          .setDescription("ask | always")
+          .setDescription("always | ask | deny")
           .setRequired(true)
           .addChoices(
-            { name: "ask (deny on prompt)", value: "ask" },
-            { name: "always (auto-approve)", value: "always" }
+            { name: "always (auto-approve everything)", value: "always" },
+            { name: "ask (prompt me on Discord)", value: "ask" },
+            { name: "deny (auto-deny everything)", value: "deny" }
           )
       )
   );

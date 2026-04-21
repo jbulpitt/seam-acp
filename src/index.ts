@@ -36,7 +36,10 @@ async function main(): Promise<void> {
     profiles: [copilot],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
-    defaultAutoApprove: config.DEFAULT_AUTO_APPROVE,
+    // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".
+    defaultPermissionMode: config.DEFAULT_AUTO_APPROVE
+      ? "always"
+      : config.DEFAULT_PERMISSION_POLICY,
   });
 
   const renderer = discordRenderer;
@@ -59,6 +62,21 @@ async function main(): Promise<void> {
   });
 
   orchestrator.install();
+
+  // Wire the ask-the-user callback now that both the router and the adapter
+  // exist. Router calls this when a session's policy is "ask".
+  router.setAskUser(async (record, req) => {
+    if (!adapter.requestApproval) {
+      return { outcome: { outcome: "cancelled" } };
+    }
+    const channel = {
+      platform: record.platform,
+      id: record.channelRef,
+      ...(record.parentRef ? { parentId: record.parentRef } : {}),
+    };
+    return adapter.requestApproval(channel, req);
+  });
+
   await adapter.start();
 
   logger.info("seam-acp ready");

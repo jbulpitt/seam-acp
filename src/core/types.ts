@@ -1,3 +1,6 @@
+/** Per-session permission policy. */
+export type PermissionPolicyMode = "always" | "ask" | "deny";
+
 /**
  * Per-session, agent-specific settings. Stored as JSON in `sessions.config_json`.
  * Mostly mirrors the C# `SessionConfigState`, generalized for multi-agent use.
@@ -15,15 +18,42 @@ export interface SessionConfigState {
   excludedTools?: string[];
   /** Vendor-specific MCP server configuration (passed via ACP `_meta`). */
   mcpServers?: unknown;
-  /** Per-session permission policy. */
+  /**
+   * Per-session permission policy.
+   * - "always": auto-approve every request (yolo)
+   * - "ask":    prompt the user in Discord; deny on timeout
+   * - "deny":   auto-deny every request
+   */
+  permissionPolicy?: PermissionPolicyMode;
+  /**
+   * @deprecated Use `permissionPolicy` instead. Kept for read-time backward
+   * compatibility: legacy `true` → "always", legacy `false`/missing → fall
+   * back to the bot-wide default policy.
+   */
   autoApprovePermissions?: boolean;
 }
 
 export function defaultSessionConfig(
   defaultModel: string,
-  autoApprove = false
+  defaultPolicy: PermissionPolicyMode = "ask"
 ): SessionConfigState {
-  return { model: defaultModel, autoApprovePermissions: autoApprove };
+  return { model: defaultModel, permissionPolicy: defaultPolicy };
+}
+
+/**
+ * Resolve the effective permission mode for a session, honoring (in order):
+ *   1. The new `permissionPolicy` field
+ *   2. The legacy `autoApprovePermissions` field — but only when it is `true`
+ *      (`false` / missing both fall through so the new safer default wins)
+ *   3. The bot-wide default
+ */
+export function resolvePermissionMode(
+  cfg: SessionConfigState,
+  defaultMode: PermissionPolicyMode
+): PermissionPolicyMode {
+  if (cfg.permissionPolicy) return cfg.permissionPolicy;
+  if (cfg.autoApprovePermissions === true) return "always";
+  return defaultMode;
 }
 
 /**

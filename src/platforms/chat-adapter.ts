@@ -1,4 +1,8 @@
 import type { SessionRecord } from "../core/types.js";
+import type {
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+} from "@agentclientprotocol/sdk";
 
 /** Reference to a channel or thread on a chat platform. */
 export interface ChannelRef {
@@ -79,6 +83,18 @@ export interface ChatAdapter {
 
   /** Optional: subscribe to reaction events. */
   onReaction?(handler: (event: ReactionEvent) => void | Promise<void>): void;
+
+  /**
+   * Optional: ask the user to approve / deny a tool permission request,
+   * blocking until they respond or the timeout elapses. Required for the
+   * `ask` permission policy. Implementations should default to "cancelled"
+   * on timeout.
+   */
+  requestApproval?(
+    channel: ChannelRef,
+    req: RequestPermissionRequest,
+    opts?: { timeoutMs?: number }
+  ): Promise<RequestPermissionResponse>;
 }
 
 /**

@@ -7,6 +7,11 @@ import {
   REST,
   Routes,
   MessageFlags,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ComponentType,
+  EmbedBuilder,
   type Message,
   type TextChannel,
   type ThreadChannel,
@@ -16,6 +21,10 @@ import {
   type User,
   type PartialUser,
 } from "discord.js";
+import type {
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+} from "@agentclientprotocol/sdk";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -301,6 +310,97 @@ export class DiscordAdapter implements ChatAdapter {
     }
   }
 
+  /**
+   * Post an approval prompt with one button per ACP option and wait for a
+   * click. Defaults to "cancelled" on timeout. Only an allowed user can
+   * answer.
+   */
+  async requestApproval(
+    channel: ChannelRef,
+    req: RequestPermissionRequest,
+    opts: { timeoutMs?: number } = {}
+  ): Promise<RequestPermissionResponse> {
+    const timeoutMs = opts.timeoutMs ?? 5 * 60 * 1000;
+    const ch = await this.fetchSendableChannel(channel.id);
+
+    const tool = req.toolCall;
+    const title = tool?.title ?? `Tool: ${tool?.kind ?? tool?.toolCallId ?? "unknown"}`;
+    const embed = new EmbedBuilder()
+      .setTitle("🔐 Permission requested")
+      .setDescription(`The agent wants to run **${title}**.`)
+      .setColor(0xfaa61a)
+      .setFooter({
+        text: `Auto-denies in ${Math.round(timeoutMs / 1000)}s.`,
+      });
+
+    if (tool?.kind) embed.addFields({ name: "Tool kind", value: tool.kind, inline: true });
+    if (tool?.toolCallId)
+      embed.addFields({ name: "Call ID", value: `\`${tool.toolCallId}\``, inline: true });
+
+    // Discord allows up to 5 buttons per row. Most agents send 2–4 options.
+    const buttons = req.options.slice(0, 5).map((opt, idx) =>
+      new ButtonBuilder()
+        .setCustomId(`seam-perm:${idx}:${opt.optionId.slice(0, 80)}`)
+        .setLabel(opt.name.slice(0, 80))
+        .setStyle(buttonStyleForKind(opt.kind))
+        .setEmoji(buttonEmojiForKind(opt.kind))
+    );
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(buttons);
+
+    const msg = await ch.send({ embeds: [embed], components: [row] });
+
+    try {
+      const interaction = await msg.awaitMessageComponent({
+        componentType: ComponentType.Button,
+        filter: (i) => {
+          if (!this.config.DISCORD_ALLOWED_USER_IDS.has(i.user.id)) {
+            i.reply({
+              content: "This bot is not available to you.",
+              flags: MessageFlags.Ephemeral,
+            }).catch(() => {});
+            return false;
+          }
+          return true;
+        },
+        time: timeoutMs,
+      });
+
+      const idxStr = interaction.customId.split(":")[1] ?? "";
+      const idx = Number.parseInt(idxStr, 10);
+      const chosen = req.options[idx];
+      if (!chosen) {
+        await msg.edit({ embeds: [embed.setFooter({ text: "❓ Invalid choice." })], components: [] });
+        return { outcome: { outcome: "cancelled" } };
+      }
+
+      await msg.edit({
+        embeds: [
+          embed.setFooter({
+            text: `${decisionEmoji(chosen.kind)} ${interaction.user.username} chose: ${chosen.name}`,
+          }),
+        ],
+        components: [],
+      });
+      try {
+        await interaction.deferUpdate();
+      } catch {
+        /* ignore */
+      }
+      return { outcome: { outcome: "selected", optionId: chosen.optionId } };
+    } catch {
+      // timeout / collector ended
+      try {
+        await msg.edit({
+          embeds: [embed.setFooter({ text: "⏱️ Timed out — auto-denied." })],
+          components: [],
+        });
+      } catch {
+        /* ignore */
+      }
+      return { outcome: { outcome: "cancelled" } };
+    }
+  }
+
   private async fetchSendableChannel(
     channelId: string
   ): Promise<TextChannel | ThreadChannel> {
@@ -345,4 +445,36 @@ export class DiscordAdapter implements ChatAdapter {
       this.logger.info("registered global slash commands");
     }
   }
+}
+
+function buttonStyleForKind(kind: string): ButtonStyle {
+  switch (kind) {
+    case "allow_always":
+      return ButtonStyle.Success;
+    case "allow_once":
+      return ButtonStyle.Primary;
+    case "reject_always":
+      return ButtonStyle.Danger;
+    case "reject_once":
+    default:
+      return ButtonStyle.Secondary;
+  }
+}
+
+function buttonEmojiForKind(kind: string): string {
+  switch (kind) {
+    case "allow_always":
+      return "✅";
+    case "allow_once":
+      return "👍";
+    case "reject_always":
+      return "🛑";
+    case "reject_once":
+    default:
+      return "✋";
+  }
+}
+
+function decisionEmoji(kind: string): string {
+  return kind.startsWith("allow_") ? "✅" : "🚫";
 }

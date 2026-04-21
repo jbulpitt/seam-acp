@@ -41,7 +41,8 @@ Copy `.env.example` to `.env` and fill it in.
 | `TURN_TIMEOUT_SECONDS` | no | Default 900 |
 | `LOG_LEVEL` | no | `fatal` / `error` / `warn` / `info` / `debug` / `trace` |
 | `HEALTH_PORT` | no | Default 3000 — exposes `GET /health` |
-| `DEFAULT_AUTO_APPROVE` | no | `false` (safe default) — set `true` to auto-approve all agent permission requests bot-wide. Override per-session with `/seam approve`. |
+| `DEFAULT_PERMISSION_POLICY` | no | `ask` (recommended). Bot-wide default policy for new sessions. One of `always` (auto-approve), `ask` (prompt me on Discord), `deny` (auto-deny). Override per-session with `/seam approve`. |
+| `DEFAULT_AUTO_APPROVE` | no | *Deprecated.* When `true`, forces the bot-wide default to `always`. Prefer `DEFAULT_PERMISSION_POLICY`. |
 
 You also need the GitHub Copilot CLI installed locally (`brew install github/gh/copilot` or `npm i -g @github/copilot`) and authenticated (`copilot auth login`). The Docker image installs and runs the CLI for you, but you still need to mount auth state or sign in inside the container.
 
@@ -77,7 +78,7 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seam mode <id>` | Set the agent operational mode (e.g. plan / agent / autopilot) |
 | `/seam effort <low\|medium\|high>` | Set reasoning effort (model-dependent) |
 | `/seam tools <allow\|exclude> [csv]` | Tool allow / exclude list (empty list = clear) |
-| `/seam approve <ask\|always>` | Permission policy. `always` auto-approves all tool permission requests; `ask` denies them (safe default). |
+| `/seam approve <always\|ask\|deny>` | Permission policy for this thread. `always` auto-approves every request; `ask` posts a Discord prompt with buttons (auto-denies after 5 min); `deny` auto-denies. |
 | `/seam abort` | Cancel the in-flight turn |
 | `/seam config` | Show the session config JSON |
 | `/seam config-set <json>` | Replace the session config wholesale |

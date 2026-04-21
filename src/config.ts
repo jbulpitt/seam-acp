@@ -1,4 +1,6 @@
 import "dotenv/config";
+import fs from "node:fs";
+import path from "node:path";
 import { z } from "zod";
 
 const Schema = z.object({
@@ -35,5 +37,15 @@ export function loadConfig(): Config {
       .join("\n");
     throw new Error(`Invalid configuration:\n${issues}`);
   }
-  return parsed.data;
+  const cfg = parsed.data;
+  const reposRoot = path.resolve(cfg.REPOS_ROOT);
+  if (!fs.existsSync(reposRoot) || !fs.statSync(reposRoot).isDirectory()) {
+    throw new Error(
+      `REPOS_ROOT does not exist or is not a directory: ${reposRoot}\n` +
+        `Set REPOS_ROOT in your .env to a real folder containing your repos ` +
+        `(e.g. REPOS_ROOT=${path.join(process.env.HOME ?? "", "Projects")}).`
+    );
+  }
+  cfg.REPOS_ROOT = reposRoot;
+  return cfg;
 }

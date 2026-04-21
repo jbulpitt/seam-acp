@@ -1,9 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type {
-  ChatInputCommandInteraction,
-  EmbedBuilder,
-} from "discord.js";
+import { MessageFlags, type ChatInputCommandInteraction, type EmbedBuilder } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
 import type { Renderer } from "../renderer.js";
@@ -252,7 +249,7 @@ export class Orchestrator {
       default:
         await interaction.reply({
           content: `Unknown subcommand: ${sub}`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
     }
   }
@@ -261,16 +258,16 @@ export class Orchestrator {
     if (!this.adapter.createThread) {
       await i.reply({
         content: "This platform does not support creating threads.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
     const name = i.options.getString("name") ?? "seam";
     if (!i.channelId) {
-      await i.reply({ content: "No channel.", ephemeral: true });
+      await i.reply({ content: "No channel.", flags: MessageFlags.Ephemeral });
       return;
     }
-    await i.deferReply({ ephemeral: true });
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
     const parent: ChannelRef = { platform: PLATFORM, id: i.channelId };
     const thread = await this.adapter.createThread(parent, name);
     await i.editReply(`Created thread <#${thread.id}>. Send a message there.`);
@@ -281,7 +278,7 @@ export class Orchestrator {
     if (!channel) {
       await i.reply({
         content: "Use `/seam repo` from inside a thread.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -292,7 +289,7 @@ export class Orchestrator {
     } catch (err) {
       await i.reply({
         content: `Invalid path: ${(err as Error).message}`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -311,14 +308,14 @@ export class Orchestrator {
     await this.router.invalidate(record.id);
     await i.reply({
       content: `Repo set to \`${this.repoDisplay(resolved)}\`. Next message starts a fresh session.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
   private async cmdModel(i: ChatInputCommandInteraction): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
-      await i.reply({ content: "Use inside a thread.", ephemeral: true });
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
     const record = this.router.ensureSessionRecord({
@@ -332,7 +329,7 @@ export class Orchestrator {
       const cfg = this.store.readConfig(record);
       await i.reply({
         content: `Current model: \`${cfg.model ?? this.config.DEFAULT_MODEL}\``,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -345,7 +342,7 @@ export class Orchestrator {
         await rt.setModel(id);
         await i.reply({
           content: `Model set to \`${id}\` (live).`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       } catch (err) {
@@ -354,14 +351,14 @@ export class Orchestrator {
     }
     await i.reply({
       content: `Model will be \`${id}\` on the next turn.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
   private async cmdMode(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
     if (!record) {
-      await i.reply({ content: "Use inside a thread.", ephemeral: true });
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
     const id = i.options.getString("id", true);
@@ -376,13 +373,13 @@ export class Orchestrator {
         this.logger.warn({ err }, "live mode set failed");
       }
     }
-    await i.reply({ content: `Mode set to \`${id}\`.`, ephemeral: true });
+    await i.reply({ content: `Mode set to \`${id}\`.`, flags: MessageFlags.Ephemeral });
   }
 
   private async cmdEffort(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
     if (!record) {
-      await i.reply({ content: "Use inside a thread.", ephemeral: true });
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
     const level = i.options.getString("level", true);
@@ -396,46 +393,46 @@ export class Orchestrator {
       } catch (err) {
         await i.reply({
           content: `Effort saved but agent rejected live update: ${(err as Error).message}`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
     }
     await i.reply({
       content: `Reasoning effort set to \`${level}\`.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
   private async cmdAbort(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
     if (!record || !this.router.hasRuntime(record.id)) {
-      await i.reply({ content: "No active turn.", ephemeral: true });
+      await i.reply({ content: "No active turn.", flags: MessageFlags.Ephemeral });
       return;
     }
     const rt = await this.router.getOrStartRuntime(record);
     await rt.cancel();
-    await i.reply({ content: "Cancelled.", ephemeral: true });
+    await i.reply({ content: "Cancelled.", flags: MessageFlags.Ephemeral });
   }
 
   private async cmdConfig(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
     if (!record) {
-      await i.reply({ content: "Use inside a thread.", ephemeral: true });
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
     const cfg =
       this.store.readConfig(record) ?? defaultSessionConfig(this.config.DEFAULT_MODEL);
     await i.reply({
       content: this.renderer.codeBlock(JSON.stringify(cfg, null, 2), "json"),
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
   private async cmdSessions(i: ChatInputCommandInteraction): Promise<void> {
     const list = this.store.list();
     if (list.length === 0) {
-      await i.reply({ content: "No sessions yet.", ephemeral: true });
+      await i.reply({ content: "No sessions yet.", flags: MessageFlags.Ephemeral });
       return;
     }
     const lines = list
@@ -444,13 +441,13 @@ export class Orchestrator {
         (r) =>
           `• ${r.platform}:${r.channelRef} → repo \`${this.repoDisplay(r.repoPath)}\` (agent: ${r.agentId})`
       );
-    await i.reply({ content: lines.join("\n"), ephemeral: true });
+    await i.reply({ content: lines.join("\n"), flags: MessageFlags.Ephemeral });
   }
 
   private async cmdTools(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
     if (!record) {
-      await i.reply({ content: "Use inside a thread.", ephemeral: true });
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
     const action = i.options.getString("action", true);
@@ -462,7 +459,7 @@ export class Orchestrator {
     await this.router.invalidate(record.id);
     await i.reply({
       content: `Tool ${action} list: ${list.length === 0 ? "(cleared)" : "`" + list.join(", ") + "`"}. Next turn starts a fresh runtime.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -471,7 +468,7 @@ export class Orchestrator {
   ): Promise<void> {
     const record = this.recordFromInteraction(i);
     if (!record) {
-      await i.reply({ content: "Use inside a thread.", ephemeral: true });
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
     const json = i.options.getString("json", true);
@@ -483,7 +480,7 @@ export class Orchestrator {
     } catch (err) {
       await i.reply({
         content: `Invalid JSON: ${(err as Error).message}`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -492,7 +489,7 @@ export class Orchestrator {
     await this.router.invalidate(record.id);
     await i.reply({
       content: "Config replaced; next turn starts a fresh runtime.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -501,21 +498,21 @@ export class Orchestrator {
     if (!dirs) {
       await i.reply({
         content: `REPOS_ROOT not found: \`${this.config.REPOS_ROOT}\``,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
     if (dirs.length === 0) {
       await i.reply({
         content: `No repos under \`${this.config.REPOS_ROOT}\`.`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
     const lines = dirs.slice(0, 50).map((d) => `- ${path.basename(d)}`);
     await i.reply({
       content: `**Repos**\n${this.renderer.codeBlock(lines.join("\n"))}`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -524,7 +521,7 @@ export class Orchestrator {
     if (!channel) {
       await i.reply({
         content: "Use `/seam init` inside a thread.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -536,7 +533,7 @@ export class Orchestrator {
     });
     await i.reply({
       content: "Session ready. Pick a repo to begin:",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     await this.sendRepoPicker(channel);
   }
@@ -544,7 +541,7 @@ export class Orchestrator {
   private async cmdApprove(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
     if (!record) {
-      await i.reply({ content: "Use inside a thread.", ephemeral: true });
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
     const policy = i.options.getString("policy", true);
@@ -553,7 +550,7 @@ export class Orchestrator {
     this.persistConfig(record, cfg);
     await i.reply({
       content: `Approval policy set to \`${policy}\`.${policy === "always" ? " (Auto-approve all permission requests.)" : " (Permission requests will be denied; future versions will prompt interactively.)"}`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -577,7 +574,7 @@ export class Orchestrator {
       "",
       "Free-form messages in a thread are sent to the agent.",
     ];
-    await i.reply({ content: lines.join("\n"), ephemeral: true });
+    await i.reply({ content: lines.join("\n"), flags: MessageFlags.Ephemeral });
   }
 
   // --- repo picker ---

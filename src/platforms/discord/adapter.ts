@@ -6,6 +6,7 @@ import {
   ChannelType,
   REST,
   Routes,
+  MessageFlags,
   type Message,
   type TextChannel,
   type ThreadChannel,
@@ -126,10 +127,31 @@ export class DiscordAdapter implements ChatAdapter {
   }
 
   async createThread(parent: ChannelRef, name: string): Promise<ChannelRef> {
-    const ch = await this.client.channels.fetch(parent.id);
-    if (!ch || ch.type !== ChannelType.GuildText) {
-      throw new Error(`Parent channel ${parent.id} is not a text channel`);
+    let ch = await this.client.channels.fetch(parent.id);
+    if (!ch) throw new Error(`Channel ${parent.id} not found`);
+
+    // If invoked from inside a thread, walk up to its parent.
+    if (ch.isThread()) {
+      const parentId = ch.parentId;
+      if (!parentId) {
+        throw new Error(`Thread ${parent.id} has no parent channel`);
+      }
+      const parentCh = await this.client.channels.fetch(parentId);
+      if (!parentCh) {
+        throw new Error(`Parent channel ${parentId} not found`);
+      }
+      ch = parentCh;
     }
+
+    if (
+      ch.type !== ChannelType.GuildText &&
+      ch.type !== ChannelType.GuildAnnouncement
+    ) {
+      throw new Error(
+        `Channel ${ch.id} (type ${ch.type}) does not support threads`
+      );
+    }
+
     const thread = await (ch as TextChannel).threads.create({
       name,
       autoArchiveDuration: 1440,
@@ -138,7 +160,7 @@ export class DiscordAdapter implements ChatAdapter {
     return {
       platform: PLATFORM,
       id: thread.id,
-      parentId: parent.id,
+      parentId: ch.id,
     };
   }
 
@@ -236,7 +258,7 @@ export class DiscordAdapter implements ChatAdapter {
     if (interaction.user.id !== this.config.DISCORD_OWNER_USER_ID) {
       await interaction.reply({
         content: "This bot is not available to you.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -250,6 +272,7 @@ export class DiscordAdapter implements ChatAdapter {
     if (!ch) throw new Error(`Channel ${channelId} not found`);
     if (
       ch.type === ChannelType.GuildText ||
+      ch.type === ChannelType.GuildAnnouncement ||
       ch.type === ChannelType.PublicThread ||
       ch.type === ChannelType.PrivateThread ||
       ch.type === ChannelType.AnnouncementThread

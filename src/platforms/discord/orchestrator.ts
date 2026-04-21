@@ -656,36 +656,37 @@ export class Orchestrator {
     });
     const id = i.options.getString("id");
     if (!id) {
-      // No id given — show an interactive picker if we can enumerate
-      // models from a live runtime; otherwise tell the user to start
-      // a turn first.
+      // No id given — show an interactive picker. Eagerly start the
+      // runtime if needed so we have an availableModels list (the model
+      // catalog comes from the agent at session-start, not from us).
       const cfg = this.store.readConfig(record);
       const current = cfg.model ?? this.config.DEFAULT_MODEL;
-      if (!this.router.hasRuntime(record.id) || !this.adapter.sendChoicePicker) {
+      if (!this.adapter.sendChoicePicker) {
         await i.reply({
-          content: `Current model: \`${current}\`\n_(send a message in this thread first to populate the available-models list from the agent.)_`,
+          content: `Current model: \`${current}\``,
           flags: MessageFlags.Ephemeral,
         });
         return;
       }
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
       let models: ReadonlyArray<{ modelId: string; name?: string }> = [];
       try {
         const rt = await this.router.getOrStartRuntime(record);
         models = rt.getSessionInfo()?.availableModels ?? [];
       } catch (err) {
-        this.logger.warn({ err }, "could not enumerate available models");
-      }
-      if (models.length === 0) {
-        await i.reply({
-          content: `Current model: \`${current}\`\n_(agent did not advertise any models — pass an id manually: \`/seam model id:<name>\`.)_`,
-          flags: MessageFlags.Ephemeral,
-        });
+        this.logger.warn({ err }, "could not start runtime / enumerate models");
+        await i.editReply(
+          `Current model: \`${current}\`\nFailed to start the agent to list models: ${(err as Error).message}`
+        );
         return;
       }
-      await i.reply({
-        content: `Current model: \`${current}\`. Posting picker…`,
-        flags: MessageFlags.Ephemeral,
-      });
+      if (models.length === 0) {
+        await i.editReply(
+          `Current model: \`${current}\`\n_(agent did not advertise any models — pass an id manually: \`/seam model id:<name>\`.)_`
+        );
+        return;
+      }
+      await i.editReply(`Current model: \`${current}\`. Posting picker…`);
       const picked = await this.adapter.sendChoicePicker(channel, {
         prompt: `🧠 **Choose a model** (current: \`${current}\`)`,
         choices: models.slice(0, 25).map((m) => ({

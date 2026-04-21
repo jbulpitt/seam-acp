@@ -487,8 +487,29 @@ export class Orchestrator {
     const id = i.options.getString("id");
     if (!id) {
       const cfg = this.store.readConfig(record);
+      const current = cfg.model ?? this.config.DEFAULT_MODEL;
+      let availableLine = "";
+      if (this.router.hasRuntime(record.id)) {
+        try {
+          const rt = await this.router.getOrStartRuntime(record);
+          const info = rt.getSessionInfo();
+          const models = info?.availableModels ?? [];
+          if (models.length > 0) {
+            availableLine =
+              "\nAvailable: " +
+              models
+                .map((m) => `\`${m.modelId}\`${m.name ? ` (${m.name})` : ""}`)
+                .join(", ");
+          }
+        } catch (err) {
+          this.logger.warn({ err }, "could not enumerate available models");
+        }
+      } else {
+        availableLine =
+          "\n_(send a message in this thread first to populate the available-models list from the agent.)_";
+      }
       await i.reply({
-        content: `Current model: \`${cfg.model ?? this.config.DEFAULT_MODEL}\``,
+        content: `Current model: \`${current}\`${availableLine}`,
         flags: MessageFlags.Ephemeral,
       });
       return;

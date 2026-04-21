@@ -245,6 +245,11 @@ export class AgentRuntime {
     return this.sessionInfo;
   }
 
+  /** The active session info, if any. Populated after newSession/loadSession. */
+  getSessionInfo(): SessionInfo | undefined {
+    return this.sessionInfo;
+  }
+
   /** Resume an existing ACP session. */
   async loadSession(opts: {
     sessionId: string;

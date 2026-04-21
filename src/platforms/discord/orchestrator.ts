@@ -10,6 +10,7 @@ import type {
   ChannelRef,
   IncomingMessage,
   MessageRef,
+  SessionRecord,
 } from "../chat-adapter.js";
 import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
@@ -655,54 +656,84 @@ export class Orchestrator {
     });
     const id = i.options.getString("id");
     if (!id) {
+      // No id given — show an interactive picker if we can enumerate
+      // models from a live runtime; otherwise tell the user to start
+      // a turn first.
       const cfg = this.store.readConfig(record);
       const current = cfg.model ?? this.config.DEFAULT_MODEL;
-      let availableLine = "";
-      if (this.router.hasRuntime(record.id)) {
-        try {
-          const rt = await this.router.getOrStartRuntime(record);
-          const info = rt.getSessionInfo();
-          const models = info?.availableModels ?? [];
-          if (models.length > 0) {
-            availableLine =
-              "\nAvailable: " +
-              models
-                .map((m) => `\`${m.modelId}\`${m.name ? ` (${m.name})` : ""}`)
-                .join(", ");
-          }
-        } catch (err) {
-          this.logger.warn({ err }, "could not enumerate available models");
-        }
-      } else {
-        availableLine =
-          "\n_(send a message in this thread first to populate the available-models list from the agent.)_";
+      if (!this.router.hasRuntime(record.id) || !this.adapter.sendChoicePicker) {
+        await i.reply({
+          content: `Current model: \`${current}\`\n_(send a message in this thread first to populate the available-models list from the agent.)_`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      let models: ReadonlyArray<{ modelId: string; name?: string }> = [];
+      try {
+        const rt = await this.router.getOrStartRuntime(record);
+        models = rt.getSessionInfo()?.availableModels ?? [];
+      } catch (err) {
+        this.logger.warn({ err }, "could not enumerate available models");
+      }
+      if (models.length === 0) {
+        await i.reply({
+          content: `Current model: \`${current}\`\n_(agent did not advertise any models — pass an id manually: \`/seam model id:<name>\`.)_`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
       }
       await i.reply({
-        content: `Current model: \`${current}\`${availableLine}`,
+        content: `Current model: \`${current}\`. Posting picker…`,
         flags: MessageFlags.Ephemeral,
       });
+      const picked = await this.adapter.sendChoicePicker(channel, {
+        prompt: `🧠 **Choose a model** (current: \`${current}\`)`,
+        choices: models.slice(0, 25).map((m) => ({
+          value: m.modelId,
+          label: m.name ?? m.modelId,
+          description: m.modelId,
+        })),
+        authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+      });
+      if (!picked) return;
+      await this.applyModelChange(channel, record, picked.value);
       return;
     }
+    await this.applyModelChange(channel, record, id, i);
+  }
+
+  /**
+   * Persist + (best-effort) live-apply a model id. If `interaction` is
+   * supplied, reply ephemerally to it; otherwise post the result to the
+   * channel (for picker-driven flows).
+   */
+  private async applyModelChange(
+    channel: ChannelRef,
+    record: SessionRecord,
+    id: string,
+    interaction?: ChatInputCommandInteraction
+  ): Promise<void> {
     const cfg = this.store.readConfig(record);
     cfg.model = id;
     this.persistConfig(record, cfg);
+    let message: string;
     if (this.router.hasRuntime(record.id)) {
       try {
         const rt = await this.router.getOrStartRuntime(record);
         await rt.setModel(id);
-        await i.reply({
-          content: `Model set to \`${id}\` (live).`,
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
+        message = `🧠 Model set to \`${id}\` (live).`;
       } catch (err) {
         this.logger.warn({ err }, "live model set failed; will apply next turn");
+        message = `🧠 Model will be \`${id}\` on the next turn.`;
       }
+    } else {
+      message = `🧠 Model will be \`${id}\` on the next turn.`;
     }
-    await i.reply({
-      content: `Model will be \`${id}\` on the next turn.`,
-      flags: MessageFlags.Ephemeral,
-    });
+    if (interaction) {
+      await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
+    } else {
+      await this.adapter.sendMessage(channel, message);
+    }
   }
 
   private async cmdMode(i: ChatInputCommandInteraction): Promise<void> {
@@ -800,28 +831,58 @@ export class Orchestrator {
    * to the session config so the first turn uses something sensible.
    */
   private async cmdAgent(i: ChatInputCommandInteraction): Promise<void> {
-    const record = this.recordFromInteraction(i);
-    if (!record) {
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel) {
       await i.reply({
         content: "Use inside a thread.",
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
+    const record = this.router.ensureSessionRecord({
+      platform: channel.platform,
+      channelRef: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
     const id = i.options.getString("id");
     const profiles = this.router.listProfiles();
-    const listing = profiles
-      .map((p) => `\`${p.id}\` — ${p.displayName}`)
-      .join(", ");
+
     if (!id) {
+      // Show interactive picker.
+      if (!this.adapter.sendChoicePicker || profiles.length === 0) {
+        const listing = profiles
+          .map((p) => `\`${p.id}\` — ${p.displayName}`)
+          .join(", ");
+        await i.reply({
+          content: `Current agent: \`${record.agentId}\`\nAvailable: ${listing}`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
       await i.reply({
-        content: `Current agent: \`${record.agentId}\`\nAvailable: ${listing}`,
+        content: `Current agent: \`${record.agentId}\`. Posting picker…`,
         flags: MessageFlags.Ephemeral,
       });
+      const picked = await this.adapter.sendChoicePicker(channel, {
+        prompt: `🤖 **Choose an agent** (current: \`${record.agentId}\`)`,
+        choices: profiles.map((p) => ({
+          value: p.id,
+          label: p.displayName,
+          description: p.id,
+        })),
+        authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+      });
+      if (!picked) return;
+      await this.applyAgentChange(channel, record, picked.value);
       return;
     }
+
     const profile = this.router.getProfile(id);
     if (!profile) {
+      const listing = profiles
+        .map((p) => `\`${p.id}\` — ${p.displayName}`)
+        .join(", ");
       await i.reply({
         content: `Unknown agent \`${id}\`. Available: ${listing}`,
         flags: MessageFlags.Ephemeral,
@@ -833,6 +894,28 @@ export class Orchestrator {
         content: `Agent is already \`${id}\`.`,
         flags: MessageFlags.Ephemeral,
       });
+      return;
+    }
+    await this.applyAgentChange(channel, record, id, i);
+  }
+
+  private async applyAgentChange(
+    channel: ChannelRef,
+    record: SessionRecord,
+    id: string,
+    interaction?: ChatInputCommandInteraction
+  ): Promise<void> {
+    const profile = this.router.getProfile(id);
+    if (!profile) {
+      const msg = `Unknown agent \`${id}\`.`;
+      if (interaction) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
+      else await this.adapter.sendMessage(channel, msg);
+      return;
+    }
+    if (record.agentId === id) {
+      const msg = `Agent is already \`${id}\`.`;
+      if (interaction) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
+      else await this.adapter.sendMessage(channel, msg);
       return;
     }
     // Kill the live runtime (ends any in-flight turn) and wipe the ACP
@@ -847,10 +930,12 @@ export class Orchestrator {
       acpSessionId: "",
       updatedUtc: new Date().toISOString(),
     });
-    await i.reply({
-      content: `Agent switched to \`${id}\` (${profile.displayName}), model \`${profile.defaultModel}\`. Next message will start a fresh session.`,
-      flags: MessageFlags.Ephemeral,
-    });
+    const message = `🤖 Agent switched to \`${id}\` (${profile.displayName}), model \`${profile.defaultModel}\`. Next message will start a fresh session.`;
+    if (interaction) {
+      await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
+    } else {
+      await this.adapter.sendMessage(channel, message);
+    }
   }
 
   private async cmdConfig(i: ChatInputCommandInteraction): Promise<void> {

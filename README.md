@@ -96,6 +96,19 @@ If the agent emits an image, audio file, or embedded resource (in a tool
 result or its own message stream), the bot uploads it to the thread as a
 Discord attachment. Discord's free-tier 25 MB upload limit applies.
 
+The bot also auto-uploads two adjacent cases:
+
+- **Tool-emitted files on disk.** Any tool that writes a file under the
+  session's cwd or a configured scratch dir and narrates the path in
+  its result (Playwright screenshots, `write_file`, etc.) gets picked
+  up by a path-watcher that reads the file and uploads it. Whitelist of
+  extensions: png/jpg/gif/webp/svg/pdf/md/csv/json/xml/html/txt/log/mp3/wav/ogg/webm/mp4.
+- **Inlined fenced code blocks.** When the agent emits a substantial
+  fenced block (≥ 20 lines for code, ≥ 5 for markdown) with a known
+  language tag, the bot uploads it as `snippet-N.<ext>` after the turn
+  finishes. Mirrors what Claude.ai's UI does. Untagged blocks and
+  short snippets stay inline as plain text.
+
 ### MCP servers
 
 The bot can attach Model Context Protocol servers globally to every

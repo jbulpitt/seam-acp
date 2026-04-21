@@ -16,6 +16,7 @@ import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { splitForFlush } from "../../core/stream-flush.js";
+import { detectFileBlocks } from "../../agents/code-block-detector.js";
 import {
   defaultSessionConfig,
   type SessionConfigState,
@@ -130,6 +131,12 @@ export class Orchestrator {
 
     let textBuffer = "";
     let textSent = false;
+    /**
+     * Full assistant text accumulated this turn (before chunk-flushing).
+     * Used after streaming ends to detect file-shaped fenced code blocks
+     * and upload them as Discord attachments.
+     */
+    let fullTurnText = "";
     // Streaming policy: only flush mid-turn when we have a *substantial*
     // amount of buffered text AND a clean paragraph boundary exists.
     // Otherwise wait for end-of-turn — Discord rate-limits us hard if we
@@ -201,6 +208,7 @@ export class Orchestrator {
             }
             if (event.messageId) currentMessageId = event.messageId;
             textBuffer += event.text;
+            fullTurnText += event.text;
             maybeFlush();
             return;
           }
@@ -259,6 +267,10 @@ export class Orchestrator {
 
       cancelFlushTimer();
       await flushChunks();
+      // After all text has been flushed, scan it for file-shaped fenced
+      // code blocks (markdown docs, JSON configs, scripts, etc.) and
+      // upload each as a Discord attachment.
+      await this.uploadDetectedCodeBlocks(channel, fullTurnText);
 
       if (
         result !== "timeout" &&
@@ -769,6 +781,50 @@ export class Orchestrator {
       filename: event.filename,
       mimeType: event.mimeType,
     });
+  }
+
+  /**
+   * After a turn finishes, scan the assistant's accumulated text for
+   * fenced code blocks that look like complete file artifacts (markdown
+   * docs, JSON configs, scripts, etc.) and upload each as a Discord
+   * attachment. Mirrors what Claude.ai's UI does — the model only
+   * emits text; the client decides what's file-shaped.
+   *
+   * Failures are logged but never crash the turn.
+   */
+  private async uploadDetectedCodeBlocks(
+    channel: ChannelRef,
+    fullText: string
+  ): Promise<void> {
+    if (!this.adapter.sendFile) return;
+    let blocks;
+    try {
+      blocks = detectFileBlocks(fullText);
+    } catch (err) {
+      this.logger.warn({ err }, "code-block detection failed");
+      return;
+    }
+    if (blocks.length === 0) return;
+    this.logger.info(
+      { count: blocks.length, langs: blocks.map((b) => b.lang) },
+      "uploading detected code blocks"
+    );
+    for (const b of blocks) {
+      try {
+        const buf = Buffer.from(b.content, "utf8");
+        if (buf.byteLength > 25 * 1024 * 1024) continue;
+        await this.adapter.sendFile(channel, {
+          data: buf,
+          filename: b.filename,
+          mimeType: b.mimeType,
+        });
+      } catch (err) {
+        this.logger.warn(
+          { err, filename: b.filename },
+          "code-block upload failed"
+        );
+      }
+    }
   }
 
   // --- repo picker ---

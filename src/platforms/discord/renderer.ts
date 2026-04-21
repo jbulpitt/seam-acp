@@ -19,6 +19,8 @@ function box(opts: {
   title: string;
   icon?: string;
   rows: KV[];
+  /** Optional extra lines appended inside the code block, after the rows. */
+  extra?: string;
   footer?: string;
 }): string {
   const icon = opts.icon ?? "ℹ️";
@@ -28,6 +30,9 @@ function box(opts: {
   lines.push("```text");
   for (const { key, value } of opts.rows) {
     lines.push(`${key.padEnd(maxKey)} : ${value}`);
+  }
+  if (opts.extra && opts.extra.length > 0) {
+    lines.push(opts.extra);
   }
   lines.push("```");
   if (opts.footer && opts.footer.trim().length > 0) {
@@ -44,14 +49,15 @@ export const discordRenderer: Renderer = {
       { key: "model", value: trim(state.model, 40) },
       { key: "doing", value: trim(state.action, 220) },
     ];
-    if (state.activity && state.activity.length > 0) {
-      const lines = state.activity.map((a) => `  • ${trim(a, 80)}`).join("\n");
-      rows.push({ key: "recent", value: `\n${lines}` });
-    }
+    const activityLines =
+      state.activity && state.activity.length > 0
+        ? state.activity.map((a) => `  • ${trim(a, 80)}`).join("\n")
+        : undefined;
     return box({
       title: state.state,
       icon: ICON_BY_STATE[state.state],
       rows,
+      ...(activityLines ? { extra: activityLines } : {}),
     });
   },
 

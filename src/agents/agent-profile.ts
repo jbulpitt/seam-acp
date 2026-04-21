@@ -24,4 +24,20 @@ export interface AgentProfile {
    * pass extra hints (e.g. effort) without polluting the generic API.
    */
   newSessionMeta?(): Record<string, unknown> | undefined;
+
+  /**
+   * Best-effort identity probe: which account is this profile authenticated
+   * as. Read from local CLI config files — no network call. Returns `null`
+   * when unknown (CLI never logged in, file missing, parse error, profile
+   * doesn't support the concept).
+   */
+  whoami?(): Promise<AgentIdentity | null>;
+}
+
+/** Identity of the account a profile is authenticated as. */
+export interface AgentIdentity {
+  /** Username / login (e.g. GitHub login). */
+  login: string;
+  /** Optional host (e.g. `https://github.com` or a GHE URL). */
+  host?: string;
 }

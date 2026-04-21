@@ -39,6 +39,7 @@ Copy `.env.example` to `.env` and fill it in.
 | `DEFAULT_AGENT` | no | `copilot` or `gemini` |
 | `DEFAULT_MODEL` | no | e.g. `gpt-5.4`, `claude-sonnet-4.5`, `claude-opus-4.7`, `auto` |
 | `COPILOT_CLI_PATH` | no | If `copilot` is not on `PATH` |
+| `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
 | `GEMINI_CLI_PATH` | no | If `gemini` is not on `PATH` |
 | `GEMINI_DEFAULT_MODEL` | no | e.g. `gemini-2.5-pro` |
 | `TURN_TIMEOUT_SECONDS` | no | Default 900 |
@@ -88,6 +89,7 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seam config-set <json>` | Replace the session config wholesale |
 | `/seam sessions` | List recent sessions across the bot |
 | `/seam attach <path>` | Upload a host-side file (under `REPOS_ROOT` or `ATTACH_ROOTS`) into the channel without involving the agent |
+| `/seam whoami` | Show which account this thread's agent profile is signed in as (Copilot only — reads `<config-dir>/config.json`) |
 | `/seam avatar` | Re-push the bot avatar to Discord (force re-upload) |
 | `/seam help` | Show this list |
 
@@ -116,6 +118,31 @@ The bot also auto-uploads two adjacent cases:
   bot uploads the *referenced file* instead of the snippet text. Symlinks
   are followed and the realpath is re-validated. Useful for "give me back
   that doc as an attachment" prompts.
+
+### Multiple Copilot accounts
+
+You can register more than one Copilot profile, each authenticated as a
+different GitHub account, by setting `COPILOT_PROFILES`:
+
+```sh
+COPILOT_PROFILES=work:/Users/me/.copilot-work,personal:/Users/me/.copilot-personal
+```
+
+For each entry the bot spawns `copilot --acp --config-dir <dir>`. Copilot
+keeps **all** of its state per `--config-dir` — auth tokens, MCP config,
+session history — so the two profiles are fully isolated CLIs sharing
+one binary. They show up in `/seam agent` as `copilot-work` and
+`copilot-personal` alongside the default `copilot` profile.
+
+One-time setup per account on the host (or inside the container):
+
+```sh
+COPILOT_HOME=/Users/me/.copilot-work copilot login
+COPILOT_HOME=/Users/me/.copilot-personal copilot login
+```
+
+Verify in a thread with `/seam whoami` — the bot reads
+`<config-dir>/config.json` and reports the GitHub login.
 
 ### MCP servers
 

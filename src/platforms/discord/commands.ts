@@ -179,6 +179,10 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
+    sub.setName("whoami").setDescription("Show which account this thread's agent is signed in as")
+  );
+
+  cmd.addSubcommand((sub) =>
     sub.setName("avatar").setDescription("Push the bot avatar to Discord (force re-upload)")
   );
 
@@ -206,6 +210,7 @@ export type SeamSubcommand =
   | "approve"
   | "agent"
   | "attach"
+  | "whoami"
   | "avatar"
   | "help";
 

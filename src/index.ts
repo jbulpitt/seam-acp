@@ -37,6 +37,17 @@ async function main(): Promise<void> {
     mcpServers,
   });
 
+  const extraCopilots = config.COPILOT_PROFILES.map((p) =>
+    makeCopilotProfile({
+      id: `copilot-${p.id}`,
+      displayName: `GitHub Copilot (${p.id})`,
+      configDir: p.configDir,
+      ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
+      defaultModel: config.DEFAULT_MODEL,
+      mcpServers,
+    })
+  );
+
   const gemini = makeGeminiProfile({
     ...(config.GEMINI_CLI_PATH ? { cliPath: config.GEMINI_CLI_PATH } : {}),
     defaultModel: config.GEMINI_DEFAULT_MODEL,
@@ -46,7 +57,7 @@ async function main(): Promise<void> {
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, gemini],
+    profiles: [copilot, ...extraCopilots, gemini],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".

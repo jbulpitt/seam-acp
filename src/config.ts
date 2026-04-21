@@ -41,6 +41,39 @@ const Schema = z.object({
   DEFAULT_AGENT: z.string().default("copilot"),
   DEFAULT_MODEL: z.string().default("gpt-5.4"),
   COPILOT_CLI_PATH: z.string().optional(),
+  /**
+   * Comma-separated list of additional Copilot profiles, each of the form
+   * `id:/abs/path/to/config-dir`. Each entry registers a separate agent
+   * profile with `--config-dir` pointed at its own directory, giving
+   * fully-isolated auth / MCP / sessions. Lets a single bot serve multiple
+   * GitHub accounts. Example:
+   *   COPILOT_PROFILES=work:/Users/me/.copilot-work,personal:/Users/me/.copilot-personal
+   * Each id must be unique and not collide with built-in profile ids
+   * (`copilot`, `gemini`).
+   */
+  COPILOT_PROFILES: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const out: Array<{ id: string; configDir: string }> = [];
+      for (const entry of v.split(",").map((s) => s.trim()).filter(Boolean)) {
+        const idx = entry.indexOf(":");
+        if (idx <= 0 || idx === entry.length - 1) {
+          throw new Error(
+            `COPILOT_PROFILES entry must be 'id:/abs/path' (got '${entry}')`
+          );
+        }
+        const id = entry.slice(0, idx).trim();
+        const dir = path.resolve(entry.slice(idx + 1).trim());
+        if (!/^[a-z0-9][a-z0-9-]*$/i.test(id)) {
+          throw new Error(
+            `COPILOT_PROFILES id '${id}' must be alphanumeric (dashes allowed)`
+          );
+        }
+        out.push({ id, configDir: dir });
+      }
+      return out;
+    }),
   GEMINI_CLI_PATH: z.string().optional(),
   /** Per-agent model override for the Gemini profile. */
   GEMINI_DEFAULT_MODEL: z.string().default("gemini-2.5-pro"),

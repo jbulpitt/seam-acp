@@ -555,6 +555,8 @@ export class Orchestrator {
         return this.cmdAgent(interaction);
       case "attach":
         return this.cmdAttach(interaction);
+      case "whoami":
+        return this.cmdWhoami(interaction);
       case "avatar":
         return this.cmdAvatar(interaction);
       case "help":
@@ -1184,6 +1186,47 @@ export class Orchestrator {
     }
   }
 
+  private async cmdWhoami(i: ChatInputCommandInteraction): Promise<void> {
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel) {
+      await i.editReply({ content: "Use inside a thread." });
+      return;
+    }
+    const record = this.router.ensureSessionRecord({
+      platform: channel.platform,
+      channelRef: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+    const profile = this.router.getProfile(record.agentId);
+    if (!profile) {
+      await i.editReply({
+        content: `Agent \`${record.agentId}\` is not registered on this bot.`,
+      });
+      return;
+    }
+    if (!profile.whoami) {
+      await i.editReply({
+        content: `Agent \`${profile.id}\` (${profile.displayName}) does not expose account info.`,
+      });
+      return;
+    }
+    const id = await profile.whoami();
+    if (!id) {
+      await i.editReply({
+        content:
+          `Agent \`${profile.id}\` (${profile.displayName}) — no logged-in account found. ` +
+          `Run \`copilot login\` (set \`COPILOT_HOME\` for non-default profiles) on the host.`,
+      });
+      return;
+    }
+    const hostNote = id.host ? ` (${id.host})` : "";
+    await i.editReply({
+      content: `Agent \`${profile.id}\` (${profile.displayName}) is signed in as **${id.login}**${hostNote}.`,
+    });
+  }
+
   private async cmdAvatar(i: ChatInputCommandInteraction): Promise<void> {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
     try {
@@ -1215,6 +1258,7 @@ export class Orchestrator {
       "`/seam config-set <json>` — replace session config",
       "`/seam sessions` — list known sessions",
       "`/seam attach <path>` — upload a host-side file (under REPOS_ROOT or ATTACH_ROOTS) to this channel",
+      "`/seam whoami` — show the account this thread's agent is signed in as",
       "`/seam avatar` — re-push bot avatar to Discord",
       "",
       "Free-form messages in a thread are sent to the agent.",

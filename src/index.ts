@@ -36,6 +36,7 @@ async function main(): Promise<void> {
     profiles: [copilot],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
+    defaultAutoApprove: config.DEFAULT_AUTO_APPROVE,
   });
 
   const renderer = discordRenderer;

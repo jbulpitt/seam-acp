@@ -21,6 +21,7 @@ export class SessionRouter {
   private readonly profileById: Map<string, AgentProfile>;
   private readonly defaultAgentId: string;
   private readonly defaultModel: string;
+  private readonly defaultAutoApprove: boolean;
 
   private readonly runtimes = new Map<string, AgentRuntime>();
   private readonly creationLocks = new Map<string, Promise<AgentRuntime>>();
@@ -33,12 +34,14 @@ export class SessionRouter {
     profiles: AgentProfile[];
     defaultAgentId: string;
     defaultModel: string;
+    defaultAutoApprove?: boolean;
   }) {
     this.logger = opts.logger.child({ comp: "session-router" });
     this.store = opts.store;
     this.profileById = new Map(opts.profiles.map((p) => [p.id, p]));
     this.defaultAgentId = opts.defaultAgentId;
     this.defaultModel = opts.defaultModel;
+    this.defaultAutoApprove = opts.defaultAutoApprove ?? false;
   }
 
   /** Look up or create the SessionRecord for a given chat channel. */
@@ -151,7 +154,7 @@ export class SessionRouter {
       profile,
       logger: this.logger.child({ session: record.id }),
       permissionPolicy: async (req) => {
-        const allow = cfg.autoApprovePermissions === true;
+        const allow = cfg.autoApprovePermissions ?? this.defaultAutoApprove;
         if (allow) {
           const opt =
             req.options.find((o) => o.kind?.startsWith("allow_")) ??

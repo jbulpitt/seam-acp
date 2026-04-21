@@ -239,6 +239,13 @@ export class Orchestrator {
       cancelFlushTimer();
       await flushChunks();
 
+      if (!textBuffer && result !== "timeout" && !(result as { cancelled?: boolean }).cancelled) {
+        // Turn completed but the agent produced no visible text (e.g. tools ran
+        // but emitted no assistant message). Make it visible so the user isn't
+        // left wondering if their message was received.
+        await this.adapter.sendMessage(channel, "_Agent completed with no text response._");
+      }
+
       if (result === "timeout") {
         await runtime.cancel();
         status.setState("Timed out");

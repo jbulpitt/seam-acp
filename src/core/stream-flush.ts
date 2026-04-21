@@ -114,11 +114,30 @@ export function splitForFlush(
     // Reserve room for closing "\n```".
     const reserve = 4;
     const windowEnd = Math.min(buffer.length, maxLen - reserve);
-    // Don't cut before the fence opener + its lang line; we need at least one
-    // content line inside the fence on the sent side.
-    const minIdx = fence.start + 3 + fence.lang.length;
-    const split = findCleanSplit(buffer, minIdx + 1, windowEnd);
+    // Index just past the fence opener + lang tag (the content starts here).
+    const fenceContentStart = fence.start + 3 + fence.lang.length;
+    // If everything inside the fence fits and there's no extra trailing
+    // text after the (unclosed) fence, just emit the whole buffer with a
+    // closer appended — no need to split or re-open.
+    const inner = buffer.slice(fenceContentStart).replace(/^\n/, "");
+    if (buffer.length + reserve <= maxLen) {
+      // No real content inside yet → nothing useful to send. Drop the
+      // orphan opener so the caller's drain loop terminates instead of
+      // re-emitting empty fences forever.
+      if (!inner.trim()) {
+        return { send: "", keep: "" };
+      }
+      const sent = buffer.replace(/\s+$/, "") + "\n```";
+      return { send: sent, keep: "" };
+    }
+    const split = findCleanSplit(buffer, fenceContentStart + 1, windowEnd);
     const cutIdx = split ? split.idx : windowEnd;
+    // Refuse to split before any actual content lands inside the fence —
+    // otherwise we'd emit an empty ```lang ... ``` block and reopen with
+    // the same empty opener, looping forever.
+    if (cutIdx <= fenceContentStart || !inner.trim()) {
+      return { send: "", keep: "" };
+    }
     const skip = split ? split.skip : 0;
     const sentInner = buffer.slice(0, cutIdx).replace(/\s+$/, "");
     const send = sentInner + "\n```";

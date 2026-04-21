@@ -81,4 +81,42 @@ describe("splitForFlush — forced", () => {
     expect(out!.send.length).toBe(MAX);
     expect(out!.keep.length).toBe(50);
   });
+
+  it("does not loop forever on an orphan fence opener with no content", () => {
+    const out = splitForFlush("```markdown\n", { maxLen: 80, force: true });
+    expect(out).toEqual({ send: "", keep: "" });
+  });
+
+  it("does not loop forever when a re-opened fence has only whitespace", () => {
+    const out = splitForFlush("```ts\n   \n", { maxLen: 80, force: true });
+    expect(out).toEqual({ send: "", keep: "" });
+  });
+
+  it("force-drains an open fence in finite steps without empty pills", () => {
+    // Simulates Copilot wrapping a long reply in ```markdown ... ```
+    // and our drain loop iterating to completion.
+    const inner =
+      "Subject: hello\n\n" +
+      Array.from({ length: 30 }, (_, i) => `Line ${i + 1} of the reply.`).join(
+        "\n"
+      ) +
+      "\n";
+    let buf = "```markdown\n" + inner + "```";
+    const sends: string[] = [];
+    let safety = 20;
+    while (buf && safety-- > 0) {
+      const out = splitForFlush(buf, { maxLen: 200, force: true });
+      if (!out) break;
+      buf = out.keep;
+      if (out.send) sends.push(out.send);
+    }
+    expect(safety).toBeGreaterThan(0); // didn't infinite-loop
+    expect(buf).toBe("");
+    // Every emitted message should have non-trivial content (not an empty
+    // ```lang ... ``` pill).
+    for (const s of sends) {
+      const stripped = s.replace(/```\w*\s*\n?/g, "").replace(/```/g, "");
+      expect(stripped.trim().length).toBeGreaterThan(0);
+    }
+  });
 });

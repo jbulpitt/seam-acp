@@ -26,9 +26,12 @@ async function main(): Promise<void> {
 
   const store = new SessionStore(path.join(config.DATA_DIR, "seam.db"));
 
+  const mcpServers = buildGlobalMcpServers(logger);
+
   const copilot = makeCopilotProfile({
     ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
     defaultModel: config.DEFAULT_MODEL,
+    mcpServers,
   });
 
   const router = new SessionRouter({
@@ -41,7 +44,7 @@ async function main(): Promise<void> {
     defaultPermissionMode: config.DEFAULT_AUTO_APPROVE
       ? "always"
       : config.DEFAULT_PERMISSION_POLICY,
-    mcpServers: buildGlobalMcpServers(logger),
+    mcpServers,
   });
 
   const renderer = discordRenderer;

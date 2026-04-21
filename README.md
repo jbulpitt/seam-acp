@@ -7,7 +7,7 @@
 
 A bridge between chat platforms (Discord today, Slack tomorrow) and ACP-compatible coding agents (GitHub Copilot today, Claude Code / others tomorrow).
 
-> **Status:** v0 — feature parity with the C# `copilot-discord-bot` complete. Multi-platform / multi-agent abstractions baked in from day one; only Discord + Copilot are implemented today.
+> **Status:** v0 — Discord + GitHub Copilot is the proven path. A Gemini ACP profile ships in the box; the multi-platform / multi-agent abstractions are designed in from day one.
 
 ## What it does
 
@@ -36,12 +36,12 @@ Copy `.env.example` to `.env` and fill it in.
 | `REPOS_ROOT` | yes | Root folder containing repos the agent can touch |
 | `ATTACH_ROOTS` | no | Comma-separated extra absolute directories the `/seam attach` command (and the agent-side fence-to-file shortcut) can read from. `REPOS_ROOT` is always allowed. |
 | `DATA_DIR` | no | Defaults to `./data` (sqlite lives here) |
-| `DEFAULT_AGENT` | no | `copilot` or `gemini` |
-| `DEFAULT_MODEL` | no | e.g. `gpt-5.4`, `claude-sonnet-4.5`, `claude-opus-4.7`, `auto` |
+| `DEFAULT_AGENT` | no | `copilot` (default) or `gemini`. Plus any `copilot-<id>` registered via `COPILOT_PROFILES`. |
+| `DEFAULT_MODEL` | no | Default Copilot model. Applies to **all** Copilot profiles (including extras from `COPILOT_PROFILES`). e.g. `gpt-5.4`, `claude-sonnet-4.5`, `claude-opus-4.7`, `auto` |
 | `COPILOT_CLI_PATH` | no | If `copilot` is not on `PATH` |
 | `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
 | `GEMINI_CLI_PATH` | no | If `gemini` is not on `PATH` |
-| `GEMINI_DEFAULT_MODEL` | no | e.g. `gemini-2.5-pro` |
+| `GEMINI_DEFAULT_MODEL` | no | Default Gemini model — applied even when `DEFAULT_AGENT` is `copilot`. Default `gemini-2.5-pro`. |
 | `TURN_TIMEOUT_SECONDS` | no | Default 900 |
 | `LOG_LEVEL` | no | `fatal` / `error` / `warn` / `info` / `debug` / `trace` |
 | `HEALTH_PORT` | no | Default 3000 — exposes `GET /health` |
@@ -85,6 +85,7 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seam tools <allow\|exclude> [csv]` | Tool allow / exclude list (empty list = clear) |
 | `/seam approve <always\|ask\|deny>` | Permission policy for this thread. `always` auto-approves every request; `ask` posts a Discord prompt with buttons (auto-denies after 5 min); `deny` auto-denies. |
 | `/seam abort` | Cancel the in-flight turn |
+| `/seam reset` | End the current ACP session for this thread; next message starts a fresh one |
 | `/seam config` | Show the session config JSON |
 | `/seam config-set <json>` | Replace the session config wholesale |
 | `/seam sessions` | List recent sessions across the bot |
@@ -174,7 +175,7 @@ AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agen
 - **`src/platforms/chat-adapter.ts`** — generic chat platform interface.
 - **`src/platforms/discord/`** — discord.js v14 implementation + slash commands + repo picker.
 - **`src/agents/agent-runtime.ts`** — wraps `@agentclientprotocol/sdk` + a child process running an ACP server. Handles `initialize`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, model / mode / config option setters, and emits typed events.
-- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Add a sibling for any other ACP-compatible agent.
+- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Add a sibling for any other ACP-compatible agent (a Gemini profile ships in `src/agents/profiles/gemini.ts`).
 - **`src/core/`** — pure utilities: text chunker, path safety, sqlite store, session router, status panel.
 
 ## Testing

@@ -606,7 +606,24 @@ export class Orchestrator {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
     const parent: ChannelRef = { platform: PLATFORM, id: i.channelId };
     const thread = await this.adapter.createThread(parent, name);
-    await i.editReply(`Created thread <#${thread.id}>. Send a message there.`);
+
+    // Auto-init: bind a session to the new thread and post the repo
+    // picker so the user doesn't have to /seam init themselves.
+    try {
+      this.router.ensureSessionRecord({
+        platform: thread.platform,
+        channelRef: thread.id,
+        ...(thread.parentId ? { parentRef: thread.parentId } : {}),
+        cwd: this.config.REPOS_ROOT,
+      });
+      await this.sendRepoPicker(thread);
+      await i.editReply(`Created thread <#${thread.id}> and initialized it.`);
+    } catch (err) {
+      this.logger.warn({ err, threadId: thread.id }, "auto-init after /seam new failed");
+      await i.editReply(
+        `Created thread <#${thread.id}>. Run \`/seam init\` there to begin.`
+      );
+    }
   }
 
   private async cmdRepo(i: ChatInputCommandInteraction): Promise<void> {

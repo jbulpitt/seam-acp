@@ -77,11 +77,68 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
+    sub
+      .setName("tools")
+      .setDescription("Set tool allow / exclude lists")
+      .addStringOption((o) =>
+        o
+          .setName("action")
+          .setDescription("allow | exclude")
+          .setRequired(true)
+          .addChoices(
+            { name: "allow", value: "allow" },
+            { name: "exclude", value: "exclude" }
+          )
+      )
+      .addStringOption((o) =>
+        o
+          .setName("list")
+          .setDescription("Comma-separated tool names (empty = clear)")
+          .setRequired(false)
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
     sub.setName("config").setDescription("Show current session config")
   );
 
   cmd.addSubcommand((sub) =>
+    sub
+      .setName("config-set")
+      .setDescription("Replace session config with a JSON blob")
+      .addStringOption((o) =>
+        o.setName("json").setDescription("Config JSON").setRequired(true)
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
     sub.setName("sessions").setDescription("List recent sessions")
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub.setName("repos").setDescription("List repos under REPOS_ROOT")
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub
+      .setName("init")
+      .setDescription("Bind this thread as a session and show repo picker")
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub
+      .setName("approve")
+      .setDescription("Set permission policy")
+      .addStringOption((o) =>
+        o
+          .setName("policy")
+          .setDescription("ask | always")
+          .setRequired(true)
+          .addChoices(
+            { name: "ask (deny on prompt)", value: "ask" },
+            { name: "always (auto-approve)", value: "always" }
+          )
+      )
   );
 
   cmd.addSubcommand((sub) =>
@@ -98,8 +155,13 @@ export type SeamSubcommand =
   | "mode"
   | "effort"
   | "abort"
+  | "tools"
   | "config"
+  | "config-set"
   | "sessions"
+  | "repos"
+  | "init"
+  | "approve"
   | "help";
 
 export function getSubcommand(

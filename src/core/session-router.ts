@@ -146,15 +146,29 @@ export class SessionRouter {
         `Unknown agent profile "${record.agentId}" for session ${record.id}`
       );
     }
+    const cfg = this.store.readConfig(record);
     const runtime = new AgentRuntime({
       profile,
       logger: this.logger.child({ session: record.id }),
+      permissionPolicy: async (req) => {
+        const allow = cfg.autoApprovePermissions !== false;
+        if (allow) {
+          const opt =
+            req.options.find((o) => o.kind?.startsWith("allow_")) ??
+            req.options[0];
+          if (opt) {
+            return {
+              outcome: { outcome: "selected", optionId: opt.optionId },
+            };
+          }
+        }
+        return { outcome: { outcome: "cancelled" } };
+      },
     });
 
     await runtime.start();
 
     const cwd = record.repoPath ?? process.cwd();
-    const cfg = this.store.readConfig(record);
 
     if (record.acpSessionId) {
       try {

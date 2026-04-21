@@ -1,8 +1,9 @@
+import fs from "node:fs";
+import path from "node:path";
 import type {
   ChatInputCommandInteraction,
   EmbedBuilder,
 } from "discord.js";
-import path from "node:path";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
 import type { Renderer } from "../renderer.js";
@@ -11,15 +12,38 @@ import type {
   ChannelRef,
   IncomingMessage,
   MessageRef,
+  ReactionEvent,
 } from "../chat-adapter.js";
 import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
-import { resolveRepoPath } from "../../core/path-utils.js";
-import { defaultSessionConfig } from "../../core/types.js";
+import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
+import {
+  defaultSessionConfig,
+  type SessionConfigState,
+} from "../../core/types.js";
 
 const STATUS_EDIT_DEBOUNCE_MS = 1000;
 const PLATFORM = "discord";
+
+const REPO_PICK_EMOJIS = [
+  "1️⃣",
+  "2️⃣",
+  "3️⃣",
+  "4️⃣",
+  "5️⃣",
+  "6️⃣",
+  "7️⃣",
+  "8️⃣",
+  "9️⃣",
+  "🔟",
+] as const;
+
+interface RepoPickerState {
+  channel: ChannelRef;
+  repoPaths: string[];
+  createdAt: number;
+}
 
 /**
  * Glues the Discord adapter, the SessionRouter, and the agent runtimes
@@ -32,6 +56,9 @@ export class Orchestrator {
   private readonly router: SessionRouter;
   private readonly store: SessionStore;
   private readonly renderer: Renderer;
+
+  /** message-id → picker state (only owner can react). */
+  private readonly repoPickers = new Map<string, RepoPickerState>();
 
   constructor(opts: {
     logger: Logger;
@@ -51,6 +78,7 @@ export class Orchestrator {
 
   install(): void {
     this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
+    this.adapter.onReaction?.((event) => this.handleReaction(event));
   }
 
   // --- message turn ---
@@ -205,10 +233,20 @@ export class Orchestrator {
         return this.cmdEffort(interaction);
       case "abort":
         return this.cmdAbort(interaction);
+      case "tools":
+        return this.cmdTools(interaction);
       case "config":
         return this.cmdConfig(interaction);
+      case "config-set":
+        return this.cmdConfigSet(interaction);
       case "sessions":
         return this.cmdSessions(interaction);
+      case "repos":
+        return this.cmdRepos(interaction);
+      case "init":
+        return this.cmdInit(interaction);
+      case "approve":
+        return this.cmdApprove(interaction);
       case "help":
         return this.cmdHelp(interaction);
       default:
@@ -409,22 +447,239 @@ export class Orchestrator {
     await i.reply({ content: lines.join("\n"), ephemeral: true });
   }
 
+  private async cmdTools(i: ChatInputCommandInteraction): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({ content: "Use inside a thread.", ephemeral: true });
+      return;
+    }
+    const action = i.options.getString("action", true);
+    const list = parseCsv(i.options.getString("list") ?? "");
+    const cfg = this.store.readConfig(record);
+    if (action === "allow") cfg.availableTools = list;
+    else if (action === "exclude") cfg.excludedTools = list;
+    this.persistConfig(record, cfg);
+    await this.router.invalidate(record.id);
+    await i.reply({
+      content: `Tool ${action} list: ${list.length === 0 ? "(cleared)" : "`" + list.join(", ") + "`"}. Next turn starts a fresh runtime.`,
+      ephemeral: true,
+    });
+  }
+
+  private async cmdConfigSet(
+    i: ChatInputCommandInteraction
+  ): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({ content: "Use inside a thread.", ephemeral: true });
+      return;
+    }
+    const json = i.options.getString("json", true);
+    let cfg: SessionConfigState;
+    try {
+      const parsed = JSON.parse(json) as unknown;
+      if (!parsed || typeof parsed !== "object") throw new Error("not an object");
+      cfg = parsed as SessionConfigState;
+    } catch (err) {
+      await i.reply({
+        content: `Invalid JSON: ${(err as Error).message}`,
+        ephemeral: true,
+      });
+      return;
+    }
+    if (!cfg.model) cfg.model = this.config.DEFAULT_MODEL;
+    this.persistConfig(record, cfg);
+    await this.router.invalidate(record.id);
+    await i.reply({
+      content: "Config replaced; next turn starts a fresh runtime.",
+      ephemeral: true,
+    });
+  }
+
+  private async cmdRepos(i: ChatInputCommandInteraction): Promise<void> {
+    const dirs = this.listRepoDirs();
+    if (!dirs) {
+      await i.reply({
+        content: `REPOS_ROOT not found: \`${this.config.REPOS_ROOT}\``,
+        ephemeral: true,
+      });
+      return;
+    }
+    if (dirs.length === 0) {
+      await i.reply({
+        content: `No repos under \`${this.config.REPOS_ROOT}\`.`,
+        ephemeral: true,
+      });
+      return;
+    }
+    const lines = dirs.slice(0, 50).map((d) => `- ${path.basename(d)}`);
+    await i.reply({
+      content: `**Repos**\n${this.renderer.codeBlock(lines.join("\n"))}`,
+      ephemeral: true,
+    });
+  }
+
+  private async cmdInit(i: ChatInputCommandInteraction): Promise<void> {
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel) {
+      await i.reply({
+        content: "Use `/seam init` inside a thread.",
+        ephemeral: true,
+      });
+      return;
+    }
+    this.router.ensureSessionRecord({
+      platform: channel.platform,
+      channelRef: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+    await i.reply({
+      content: "Session ready. Pick a repo to begin:",
+      ephemeral: true,
+    });
+    await this.sendRepoPicker(channel);
+  }
+
+  private async cmdApprove(i: ChatInputCommandInteraction): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({ content: "Use inside a thread.", ephemeral: true });
+      return;
+    }
+    const policy = i.options.getString("policy", true);
+    const cfg = this.store.readConfig(record);
+    cfg.autoApprovePermissions = policy === "always";
+    this.persistConfig(record, cfg);
+    await i.reply({
+      content: `Approval policy set to \`${policy}\`.${policy === "always" ? " (Auto-approve all permission requests.)" : " (Permission requests will be denied; future versions will prompt interactively.)"}`,
+      ephemeral: true,
+    });
+  }
+
   private async cmdHelp(i: ChatInputCommandInteraction): Promise<void> {
     const lines = [
       "**seam-acp** — control the agent in this thread.",
       "",
       "`/seam new [name]` — create a new agent thread",
+      "`/seam init` — bind this thread + show repo picker",
       "`/seam repo <path>` — set working repo (under REPOS_ROOT)",
+      "`/seam repos` — list repos under REPOS_ROOT",
       "`/seam model [id]` — get / set agent model",
       "`/seam mode <id>` — set agent operational mode",
       "`/seam effort <low|medium|high>` — reasoning effort",
+      "`/seam tools <allow|exclude> [list]` — tool filters",
+      "`/seam approve <ask|always>` — permission policy",
       "`/seam abort` — cancel current turn",
       "`/seam config` — show session config JSON",
+      "`/seam config-set <json>` — replace session config",
       "`/seam sessions` — list known sessions",
       "",
       "Free-form messages in a thread are sent to the agent.",
     ];
     await i.reply({ content: lines.join("\n"), ephemeral: true });
+  }
+
+  // --- repo picker ---
+
+  private async sendRepoPicker(channel: ChannelRef): Promise<void> {
+    const dirs = this.listRepoDirs();
+    if (!dirs) {
+      await this.adapter.sendMessage(
+        channel,
+        `❌ REPOS_ROOT not found: \`${this.config.REPOS_ROOT}\``
+      );
+      return;
+    }
+    if (dirs.length === 0) {
+      await this.adapter.sendMessage(
+        channel,
+        `⚠️ No repos under \`${this.config.REPOS_ROOT}\`. Use \`/seam repo <path>\`.`
+      );
+      return;
+    }
+    const top = dirs.slice(0, REPO_PICK_EMOJIS.length);
+    const lines = top.map(
+      (p, idx) => `${REPO_PICK_EMOJIS[idx]} ${path.basename(p)}`
+    );
+    const body =
+      "🗂️ **Select repo**\n" +
+      this.renderer.codeBlock(lines.join("\n")) +
+      "\nReact with a number to choose, or use `/seam repo <path>`.";
+
+    const sent = await this.adapter.sendMessage(channel, body);
+    this.repoPickers.set(sent.id, {
+      channel,
+      repoPaths: top,
+      createdAt: Date.now(),
+    });
+
+    if (this.adapter.addReactions) {
+      try {
+        await this.adapter.addReactions(
+          sent,
+          REPO_PICK_EMOJIS.slice(0, top.length).map((e) => e)
+        );
+      } catch (err) {
+        this.logger.warn({ err }, "failed to add picker reactions");
+      }
+    }
+  }
+
+  private async handleReaction(event: ReactionEvent): Promise<void> {
+    const picker = this.repoPickers.get(event.message.id);
+    if (!picker) return;
+    const idx = REPO_PICK_EMOJIS.indexOf(
+      event.reaction as (typeof REPO_PICK_EMOJIS)[number]
+    );
+    if (idx < 0 || idx >= picker.repoPaths.length) return;
+    const picked = picker.repoPaths[idx];
+    if (!picked) return;
+
+    if (!isWithinRoot(picked, this.config.REPOS_ROOT)) {
+      await this.adapter.sendMessage(
+        picker.channel,
+        `🛡️ Repo \`${picked}\` is outside REPOS_ROOT.`
+      );
+      return;
+    }
+
+    const record = this.router.ensureSessionRecord({
+      platform: picker.channel.platform,
+      channelRef: picker.channel.id,
+      ...(picker.channel.parentId
+        ? { parentRef: picker.channel.parentId }
+        : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+    this.store.upsert({
+      ...record,
+      repoPath: picked,
+      updatedUtc: new Date().toISOString(),
+    });
+    await this.router.invalidate(record.id);
+    this.repoPickers.delete(event.message.id);
+
+    await this.adapter.sendMessage(
+      picker.channel,
+      `📌 Repo set to \`${this.repoDisplay(picked)}\`. Send a message to begin.`
+    );
+  }
+
+  private listRepoDirs(): string[] | undefined {
+    const root = this.config.REPOS_ROOT;
+    if (!fs.existsSync(root)) return undefined;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch (err) {
+      this.logger.warn({ err, root }, "readdir failed");
+      return [];
+    }
+    return entries
+      .filter((e) => e.isDirectory())
+      .map((e) => path.join(root, e.name))
+      .sort((a, b) => a.localeCompare(b));
   }
 
   // --- helpers ---
@@ -494,6 +749,13 @@ async function raceWithTimeout<T>(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function parseCsv(s: string): string[] {
+  return s
+    .split(",")
+    .map((x) => x.trim())
+    .filter((x) => x.length > 0);
 }
 
 // Re-export for convenience.

@@ -36,6 +36,10 @@ interface OpenFence {
 }
 
 /** Returns the open fence info if the buffer has an unclosed ```, else null. */
+export function hasOpenFence(buf: string): boolean {
+  return findOpenFence(buf) !== null;
+}
+
 function findOpenFence(buf: string): OpenFence | null {
   const re = /```([^\n`]*)/g;
   const matches: { start: number; lang: string }[] = [];

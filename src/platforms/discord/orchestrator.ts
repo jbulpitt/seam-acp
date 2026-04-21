@@ -15,7 +15,7 @@ import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
-import { splitForFlush } from "../../core/stream-flush.js";
+import { splitForFlush, hasOpenFence } from "../../core/stream-flush.js";
 import { detectFileBlocks } from "../../agents/code-block-detector.js";
 import {
   defaultSessionConfig,
@@ -175,6 +175,10 @@ export class Orchestrator {
      * (e.g. a short poem).
      */
     const IDLE_FLUSH_MS = 4000;
+    // Hard ceiling: even inside an open fence, force-flush if the buffer
+    // grows past this. Defends against runaway model loops (e.g. Copilot
+    // spamming the language tag) without losing legitimate long fences.
+    const FENCE_BUFFER_CEILING = 16000;
     let idleTimer: NodeJS.Timeout | undefined;
     const cancelFlushTimer = () => {
       if (idleTimer) {
@@ -185,6 +189,14 @@ export class Orchestrator {
     const armIdleFlush = () => {
       cancelFlushTimer();
       if (!textBuffer) return;
+      // If we're mid-fence, hold off — splitting a fenced block across
+      // messages renders badly. Turn-end flush will still post it.
+      if (
+        hasOpenFence(textBuffer) &&
+        textBuffer.length < FENCE_BUFFER_CEILING
+      ) {
+        return;
+      }
       idleTimer = setTimeout(() => {
         idleTimer = undefined;
         if (textBuffer) void drainBuffer(true);

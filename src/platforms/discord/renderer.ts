@@ -38,15 +38,20 @@ function box(opts: {
 
 export const discordRenderer: Renderer = {
   statusPanel(state) {
+    const rows: KV[] = [
+      { key: "elapsed", value: `${state.elapsedSeconds}s` },
+      { key: "repo", value: trim(state.repoDisplay, 80) },
+      { key: "model", value: trim(state.model, 40) },
+      { key: "doing", value: trim(state.action, 220) },
+    ];
+    if (state.activity && state.activity.length > 0) {
+      const lines = state.activity.map((a) => `  • ${trim(a, 80)}`).join("\n");
+      rows.push({ key: "recent", value: `\n${lines}` });
+    }
     return box({
       title: state.state,
       icon: ICON_BY_STATE[state.state],
-      rows: [
-        { key: "elapsed", value: `${state.elapsedSeconds}s` },
-        { key: "repo", value: trim(state.repoDisplay, 80) },
-        { key: "model", value: trim(state.model, 40) },
-        { key: "doing", value: trim(state.action, 220) },
-      ],
+      rows,
     });
   },
 

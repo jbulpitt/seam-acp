@@ -57,6 +57,8 @@ export interface StatusPanel {
   elapsedSeconds: number;
   /** Optional usage line shown when token / multiplier info is known. */
   usage?: string;
+  /** Recent tool / progress activity (oldest → newest). */
+  activity?: string[];
 }
 
 /** Result of one agent turn (reply round-trip). */

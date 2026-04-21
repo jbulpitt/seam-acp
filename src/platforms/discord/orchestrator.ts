@@ -201,15 +201,19 @@ export class Orchestrator {
             maybeFlush();
             return;
           }
-          case "tool-start":
-            status.setAction(`Tool: ${event.title ?? event.kindLabel ?? "…"}`);
+          case "tool-start": {
+            const label = event.title ?? event.kindLabel ?? "…";
+            status.setAction(`Tool: ${label}`);
+            status.pushActivity(label);
             await refresh();
             return;
+          }
           case "tool-update":
             if (event.status === "completed" || event.status === "failed") {
               status.setAction("Working…");
             } else if (event.title) {
               status.setAction(`Tool: ${event.title}`);
+              status.pushActivity(event.title);
             }
             await refresh();
             return;

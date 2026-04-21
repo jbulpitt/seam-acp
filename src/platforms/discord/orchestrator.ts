@@ -144,6 +144,10 @@ export class Orchestrator {
     let consecutiveWhitespaceChars = 0;
     let runawayDetected = false;
     const RUNAWAY_WHITESPACE_THRESHOLD = 500;
+    // Per-turn timing for diagnosing slow turns. Set when we send the
+    // prompt; first-chunk + total recorded as info logs.
+    let turnStartedAt = 0;
+    let firstChunkAt: number | undefined;
     // Streaming policy: only flush mid-turn when we have a *substantial*
     // amount of buffered text AND a clean paragraph boundary exists.
     // Otherwise wait for end-of-turn — Discord rate-limits us hard if we
@@ -170,8 +174,28 @@ export class Orchestrator {
     const flushChunks = async () => {
       await drainBuffer(true);
     };
+    /**
+     * Idle-flush timer: if text has been buffered for IDLE_FLUSH_MS
+     * with no new chunks arriving, force-flush whatever's there. This
+     * keeps UX responsive when the agent emits a slow trickle that
+     * never crosses HARD_MAX or hits a clean paragraph boundary
+     * (e.g. a short poem).
+     */
+    const IDLE_FLUSH_MS = 4000;
+    let idleTimer: NodeJS.Timeout | undefined;
     const cancelFlushTimer = () => {
-      // No idle timer in paragraph-only mode; kept as a no-op for retry path.
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = undefined;
+      }
+    };
+    const armIdleFlush = () => {
+      cancelFlushTimer();
+      if (!textBuffer) return;
+      idleTimer = setTimeout(() => {
+        idleTimer = undefined;
+        if (textBuffer) void drainBuffer(true);
+      }, IDLE_FLUSH_MS);
     };
     const maybeFlush = () => {
       if (textBuffer.length >= HARD_MAX) {
@@ -246,6 +270,19 @@ export class Orchestrator {
               return;
             }
             maybeFlush();
+            armIdleFlush();
+            // Track time-to-first-chunk so we can tell whether the
+            // agent or the orchestrator is responsible for slow turns.
+            if (firstChunkAt === undefined) {
+              firstChunkAt = Date.now();
+              this.logger.info(
+                {
+                  ttftMs: firstChunkAt - turnStartedAt,
+                  session: record.id,
+                },
+                "agent first text chunk"
+              );
+            }
             return;
           }
           case "tool-start": {
@@ -298,11 +335,22 @@ export class Orchestrator {
       await refresh(true);
 
       const turnPromise = runtime.prompt(msg.text, msg.attachments);
+      turnStartedAt = Date.now();
       const timeoutMs = this.config.TURN_TIMEOUT_SECONDS * 1000;
       const result = await raceWithTimeout(turnPromise, timeoutMs);
 
       cancelFlushTimer();
       await flushChunks();
+      this.logger.info(
+        {
+          session: record.id,
+          totalMs: Date.now() - turnStartedAt,
+          ttftMs:
+            firstChunkAt !== undefined ? firstChunkAt - turnStartedAt : null,
+          chars: fullTurnText.length,
+        },
+        "turn timing"
+      );
       // After all text has been flushed, scan it for file-shaped fenced
       // code blocks (markdown docs, JSON configs, scripts, etc.) and
       // upload each as a Discord attachment.

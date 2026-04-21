@@ -55,6 +55,8 @@ export interface StatusPanel {
   model: string;
   action: string;
   elapsedSeconds: number;
+  /** Optional usage line shown when token / multiplier info is known. */
+  usage?: string;
 }
 
 /** Result of one agent turn (reply round-trip). */

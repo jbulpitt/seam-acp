@@ -15,6 +15,7 @@ import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
+import { splitForFlush } from "../../core/stream-flush.js";
 import {
   defaultSessionConfig,
   type SessionConfigState,
@@ -124,11 +125,11 @@ export class Orchestrator {
 
     let textBuffer = "";
     let flushTimer: NodeJS.Timeout | undefined;
-    // Stream-flush policy: avoid Discord's ~5 msg / 5 s per-channel limit.
-    // Flush early only when we've accumulated a meaningful block; otherwise
-    // wait for a longer idle period so short bursts get coalesced.
-    const FLUSH_LINES = 10;
-    const FLUSH_CHARS = 1500;
+    // Flush policy: prefer clean breaks (paragraph > line > sentence) and
+    // never split inside an open code fence. We keep the buffer below the
+    // hard cap; otherwise force a (fence-aware) cut.
+    const HARD_MAX = 1800;
+    const SOFT_MIN = 400;
     const FLUSH_IDLE_MS = 1500;
     const cancelFlushTimer = () => {
       if (flushTimer) {
@@ -136,34 +137,41 @@ export class Orchestrator {
         flushTimer = undefined;
       }
     };
+    const drainBuffer = async (force: boolean) => {
+      while (textBuffer) {
+        const split = splitForFlush(textBuffer, {
+          maxLen: HARD_MAX,
+          softMin: SOFT_MIN,
+          force,
+        });
+        if (!split) return;
+        textBuffer = split.keep;
+        if (split.send) {
+          await this.adapter.sendMessage(channel, split.send);
+        }
+        // Soft mode: take at most one chunk per call so we don't spam.
+        if (!force) return;
+      }
+    };
     const flushChunks = async () => {
       cancelFlushTimer();
-      if (!textBuffer) return;
-      const chunks = this.renderer.chunk(textBuffer);
-      textBuffer = "";
-      for (const chunk of chunks) {
-        await this.adapter.sendMessage(channel, chunk);
-      }
-    };
-    const countLines = (s: string) => {
-      let n = 0;
-      for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++;
-      return n;
+      await drainBuffer(true);
     };
     const maybeFlush = () => {
-      if (
-        textBuffer.length >= FLUSH_CHARS ||
-        countLines(textBuffer) >= FLUSH_LINES
-      ) {
+      // Force-flush if we've crossed the hard cap; otherwise try a soft drain
+      // and, failing that, schedule an idle flush.
+      if (textBuffer.length >= HARD_MAX) {
         cancelFlushTimer();
-        void flushChunks();
+        void drainBuffer(true);
         return;
       }
-      if (flushTimer) return;
-      flushTimer = setTimeout(() => {
-        flushTimer = undefined;
-        void flushChunks();
-      }, FLUSH_IDLE_MS);
+      void drainBuffer(false).then(() => {
+        if (!textBuffer || flushTimer) return;
+        flushTimer = setTimeout(() => {
+          flushTimer = undefined;
+          void drainBuffer(true);
+        }, FLUSH_IDLE_MS);
+      });
     };
 
     const RETRY_MARKER = "— 🔁 retried — output above may repeat —";

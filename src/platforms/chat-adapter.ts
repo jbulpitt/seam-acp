@@ -43,15 +43,6 @@ export interface IncomingMessage {
   raw?: unknown;
 }
 
-/** Reaction event normalized across platforms. */
-export interface ReactionEvent {
-  message: MessageRef;
-  /** Platform-specific reaction identifier (Discord: emoji name, e.g. "1️⃣"). */
-  reaction: string;
-  userId: string;
-  userIsBot: boolean;
-}
-
 /**
  * Generic chat adapter contract. Discord today, Slack tomorrow.
  *
@@ -89,9 +80,6 @@ export interface ChatAdapter {
   /** Optional: platforms that support threads should implement this. */
   createThread?(parent: ChannelRef, name: string): Promise<ChannelRef>;
 
-  /** Optional: pre-add reactions to a message (for emoji menus). */
-  addReactions?(message: MessageRef, reactions: string[]): Promise<void>;
-
   /**
    * Optional: present an interactive choice picker (buttons / select menu)
    * and resolve when the user picks one. Returns null on timeout / cancel.
@@ -110,9 +98,6 @@ export interface ChatAdapter {
 
   /** Subscribe to bot-relevant incoming messages. */
   onMessage(handler: (msg: IncomingMessage) => void | Promise<void>): void;
-
-  /** Optional: subscribe to reaction events. */
-  onReaction?(handler: (event: ReactionEvent) => void | Promise<void>): void;
 
   /**
    * Optional: ask the user to approve / deny a tool permission request,

@@ -1443,7 +1443,7 @@ export class Orchestrator {
       return [];
     }
     return entries
-      .filter((e) => e.isDirectory())
+      .filter((e) => e.isDirectory() && !e.name.startsWith("."))
       .map((e) => path.join(root, e.name))
       .sort((a, b) => a.localeCompare(b));
   }

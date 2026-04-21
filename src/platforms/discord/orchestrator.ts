@@ -137,6 +137,13 @@ export class Orchestrator {
      * and upload them as Discord attachments.
      */
     let fullTurnText = "";
+    /**
+     * Counter for the canary that aborts runaway whitespace loops.
+     * Reset whenever a chunk contains any non-whitespace character.
+     */
+    let consecutiveWhitespaceChars = 0;
+    let runawayDetected = false;
+    const RUNAWAY_WHITESPACE_THRESHOLD = 500;
     // Streaming policy: only flush mid-turn when we have a *substantial*
     // amount of buffered text AND a clean paragraph boundary exists.
     // Otherwise wait for end-of-turn — Discord rate-limits us hard if we
@@ -209,6 +216,35 @@ export class Orchestrator {
             if (event.messageId) currentMessageId = event.messageId;
             textBuffer += event.text;
             fullTurnText += event.text;
+            // Runaway-whitespace canary. Some models fall into a
+            // newline-only repetition loop (often after asking them to
+            // re-emit content inside a ```markdown fence). The loop can
+            // run for the full turn timeout (15min by default) producing
+            // nothing useful. Detect a long run of whitespace-only
+            // output and abort the turn.
+            consecutiveWhitespaceChars = /\S/.test(event.text)
+              ? 0
+              : consecutiveWhitespaceChars + event.text.length;
+            if (
+              consecutiveWhitespaceChars >= RUNAWAY_WHITESPACE_THRESHOLD &&
+              !runawayDetected
+            ) {
+              runawayDetected = true;
+              this.logger.warn(
+                { whitespaceRun: consecutiveWhitespaceChars },
+                "runaway whitespace detected — cancelling turn"
+              );
+              try {
+                await this.adapter.sendMessage(
+                  channel,
+                  "_⚠️ Agent fell into a whitespace loop — cancelling turn. Try rephrasing without a fenced wrapper (e.g. \"as a markdown file\" instead of \"as raw markdown\")._"
+                );
+              } catch {
+                /* ignore */
+              }
+              void runtime.cancel();
+              return;
+            }
             maybeFlush();
             return;
           }

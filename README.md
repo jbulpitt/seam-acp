@@ -85,7 +85,11 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seam avatar` | Re-push the bot avatar to Discord (force re-upload) |
 | `/seam help` | Show this list |
 
-Free-form messages in a thread are sent straight to the agent.
+Free-form messages in a thread are sent straight to the agent. You can attach
+files to a message and they'll be forwarded as ACP content blocks: images and
+text-ish files (markdown, source code, JSON, CSV, logs, etc.) are inlined when
+the agent supports it; everything else is sent as a CDN link the agent can
+fetch. Limits per message: 8 attachments, 5 MB each, text inlined up to 256 KB.
 
 ## Architecture
 

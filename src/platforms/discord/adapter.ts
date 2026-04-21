@@ -25,6 +25,7 @@ import type {
   ChatAdapter,
   ChannelRef,
   IncomingMessage,
+  MessageAttachment,
   MessageRef,
   ReactionEvent,
 } from "../chat-adapter.js";
@@ -237,7 +238,13 @@ export class DiscordAdapter implements ChatAdapter {
     const parentId = thread.parentId ?? undefined;
 
     const text = (msg.content ?? "").trim();
-    if (!text) return;
+    const attachments: MessageAttachment[] = msg.attachments.map((a) => ({
+      url: a.url,
+      filename: a.name ?? "attachment",
+      contentType: a.contentType ?? null,
+      size: a.size ?? 0,
+    }));
+    if (!text && attachments.length === 0) return;
 
     const channel: ChannelRef = {
       platform: PLATFORM,
@@ -250,6 +257,7 @@ export class DiscordAdapter implements ChatAdapter {
       authorId: msg.author.id,
       authorIsBot: false,
       text,
+      ...(attachments.length > 0 ? { attachments } : {}),
       raw: msg,
     };
 

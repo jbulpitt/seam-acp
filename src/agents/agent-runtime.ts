@@ -5,6 +5,7 @@ import {
   ndJsonStream,
   RequestError,
   type Client,
+  type PromptCapabilities,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionNotification,
@@ -12,6 +13,11 @@ import {
 } from "@agentclientprotocol/sdk";
 import type { AgentProfile } from "./agent-profile.js";
 import type { Logger } from "../lib/logger.js";
+import type { MessageAttachment } from "../platforms/chat-adapter.js";
+import {
+  mapAttachmentsToBlocks,
+  type RejectedAttachment,
+} from "./attachments.js";
 
 /** Events surfaced from the ACP `session/update` stream. */
 export type AgentEvent =
@@ -61,6 +67,8 @@ export interface SessionInfo {
 export interface PromptOutcome {
   stopReason: string;
   cancelled: boolean;
+  /** Attachments that couldn't be forwarded (e.g. unsupported audio, oversize). */
+  rejectedAttachments?: RejectedAttachment[];
 }
 
 interface AvailableModel {
@@ -91,6 +99,7 @@ export class AgentRuntime {
   private connection?: ClientSideConnection;
   private sessionId?: string;
   private sessionInfo?: SessionInfo;
+  private promptCapabilities?: PromptCapabilities;
 
   private eventHandler?: AgentEventHandler;
 
@@ -150,13 +159,23 @@ export class AgentRuntime {
     const client = this.makeClient();
     this.connection = new ClientSideConnection(() => client, stream);
 
-    await this.connection.initialize({
+    const initResult = await this.connection.initialize({
       protocolVersion: PROTOCOL_VERSION,
       clientCapabilities: {
         fs: { readTextFile: false, writeTextFile: false },
       },
     });
-    this.logger.debug("acp initialized");
+    this.promptCapabilities =
+      initResult.agentCapabilities?.promptCapabilities ?? undefined;
+    this.logger.debug(
+      { promptCapabilities: this.promptCapabilities },
+      "acp initialized"
+    );
+  }
+
+  /** Capabilities advertised by the agent during `initialize`. */
+  getPromptCapabilities(): PromptCapabilities | undefined {
+    return this.promptCapabilities;
   }
 
   /** Create a new ACP session in `cwd`. */
@@ -221,16 +240,40 @@ export class AgentRuntime {
     return this.sessionInfo;
   }
 
-  async prompt(text: string): Promise<PromptOutcome> {
+  async prompt(
+    text: string,
+    attachments?: ReadonlyArray<MessageAttachment>
+  ): Promise<PromptOutcome> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
-    const res = await conn.prompt({
-      sessionId: sid,
-      prompt: [{ type: "text", text }],
-    });
+
+    const prompt: Array<import("@agentclientprotocol/sdk").ContentBlock> = [];
+    if (text) prompt.push({ type: "text", text });
+
+    let rejected: RejectedAttachment[] | undefined;
+    if (attachments && attachments.length > 0) {
+      const mapped = await mapAttachmentsToBlocks(attachments, {
+        capabilities: this.promptCapabilities,
+        logger: this.logger,
+      });
+      prompt.push(...mapped.blocks);
+      if (mapped.rejected.length > 0) rejected = mapped.rejected;
+    }
+
+    if (prompt.length === 0) {
+      // Caller passed empty text and no usable attachments.
+      return {
+        stopReason: "end_turn",
+        cancelled: false,
+        ...(rejected ? { rejectedAttachments: rejected } : {}),
+      };
+    }
+
+    const res = await conn.prompt({ sessionId: sid, prompt });
     return {
       stopReason: res.stopReason,
       cancelled: res.stopReason === "cancelled",
+      ...(rejected ? { rejectedAttachments: rejected } : {}),
     };
   }
 

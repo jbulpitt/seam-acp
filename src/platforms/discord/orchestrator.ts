@@ -234,12 +234,26 @@ export class Orchestrator {
       status.setAction("Thinking…");
       await refresh(true);
 
-      const turnPromise = runtime.prompt(msg.text);
+      const turnPromise = runtime.prompt(msg.text, msg.attachments);
       const timeoutMs = this.config.TURN_TIMEOUT_SECONDS * 1000;
       const result = await raceWithTimeout(turnPromise, timeoutMs);
 
       cancelFlushTimer();
       await flushChunks();
+
+      if (
+        result !== "timeout" &&
+        result.rejectedAttachments &&
+        result.rejectedAttachments.length > 0
+      ) {
+        const lines = result.rejectedAttachments
+          .map((r) => `• \`${r.filename}\` — ${r.reason}`)
+          .join("\n");
+        await this.adapter.sendMessage(
+          channel,
+          `_Some attachments were not sent to the agent:_\n${lines}`
+        );
+      }
 
       if (!textSent && result !== "timeout" && !(result as { cancelled?: boolean }).cancelled) {
         // Turn completed but the agent produced no visible text (e.g. tools ran

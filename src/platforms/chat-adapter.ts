@@ -16,12 +16,25 @@ export interface MessageRef {
   id: string;
 }
 
+/** A file attached to an incoming message, normalized across platforms. */
+export interface MessageAttachment {
+  /** Stable URL the bot can fetch (Discord CDN URL). */
+  url: string;
+  filename: string;
+  /** MIME type if the platform reported one. */
+  contentType: string | null;
+  /** Size in bytes. */
+  size: number;
+}
+
 /** Incoming user message, normalized across platforms. */
 export interface IncomingMessage {
   channel: ChannelRef;
   authorId: string;
   authorIsBot: boolean;
   text: string;
+  /** Files attached to the message, if any. */
+  attachments?: MessageAttachment[];
   /** Platform-specific raw object for advanced handlers. */
   raw?: unknown;
 }

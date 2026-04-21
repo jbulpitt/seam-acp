@@ -214,13 +214,15 @@ export class Orchestrator {
     const RETRY_REGEX = /response was interrupted.*retrying/i;
     let currentMessageId: string | undefined;
     let postedRetryNotice = false;
-    // Runaway-loop detector: some agent models (notably Copilot when asked
-    // to wrap output in a fence) get stuck spamming the same short token
-    // — e.g. "markdown" — for hundreds of chunks. Detect a long run of
-    // identical short chunks and cancel the turn before it eats the
-    // whole timeout window.
-    const LOOP_THRESHOLD = 12;
-    const LOOP_CHUNK_MAX = 40;
+    // Runaway-loop detector: some agent models get stuck repeating the
+    // same chunk — Copilot spams short language tags (e.g. "markdown"),
+    // Gemini sometimes loops a full sentence. Cancel the turn once the
+    // exact same trimmed chunk repeats. Threshold is lower for long
+    // chunks (a repeated full sentence is much more obviously broken
+    // than a repeated short token).
+    const LOOP_THRESHOLD_SHORT = 12; // for chunks <= 40 chars
+    const LOOP_THRESHOLD_LONG = 4; // for longer chunks
+    const LOOP_SHORT_MAX = 40;
     let loopChunk: string | null = null;
     let loopCount = 0;
     let loopAborted = false;
@@ -256,7 +258,7 @@ export class Orchestrator {
             // Runaway-loop check (cheap; runs before buffering).
             if (!loopAborted) {
               const trimmed = event.text.trim();
-              if (trimmed && trimmed.length <= LOOP_CHUNK_MAX) {
+              if (trimmed) {
                 if (trimmed === loopChunk) {
                   loopCount += 1;
                 } else {
@@ -264,15 +266,21 @@ export class Orchestrator {
                   loopCount = 1;
                 }
               } else {
-                loopChunk = null;
-                loopCount = 0;
+                // pure-whitespace chunks don't reset the run (a trickle
+                // of newlines between repeats is still a loop) but
+                // don't count toward it either.
               }
-              if (loopCount >= LOOP_THRESHOLD) {
+              const threshold =
+                loopChunk && loopChunk.length <= LOOP_SHORT_MAX
+                  ? LOOP_THRESHOLD_SHORT
+                  : LOOP_THRESHOLD_LONG;
+              if (loopChunk && loopCount >= threshold) {
                 loopAborted = true;
                 this.logger.warn(
                   {
                     session: record.id,
-                    chunk: loopChunk,
+                    chunkLen: loopChunk.length,
+                    chunkPreview: loopChunk.slice(0, 80),
                     repeats: loopCount,
                   },
                   "runaway chunk loop detected; cancelling turn"
@@ -284,9 +292,13 @@ export class Orchestrator {
                 }
                 try {
                   await flushChunks();
+                  const preview =
+                    loopChunk.length > 80
+                      ? `${loopChunk.slice(0, 77)}...`
+                      : loopChunk;
                   await this.adapter.sendMessage(
                     channel,
-                    `⚠️ Agent got stuck repeating \`${loopChunk}\` — turn cancelled. Try rephrasing.`
+                    `⚠️ Agent got stuck repeating the same output (\`${preview}\`) — turn cancelled. Try rephrasing.`
                   );
                   textSent = true;
                 } catch (err) {

@@ -529,7 +529,7 @@ export class Orchestrator {
     this.store.upsert({
       ...record,
       acpSessionId: "",
-      updatedAt: new Date().toISOString(),
+      updatedUtc: new Date().toISOString(),
     });
     await i.reply({
       content:

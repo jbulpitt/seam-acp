@@ -118,14 +118,17 @@ export class DiscordAdapter implements ChatAdapter {
 
   async sendMessage(channel: ChannelRef, text: string): Promise<MessageRef> {
     const ch = await this.fetchSendableChannel(channel.id);
-    const sent = await ch.send({ content: text });
+    const sent = await ch.send({
+      content: text,
+      flags: MessageFlags.SuppressEmbeds,
+    });
     return { channel, id: sent.id };
   }
 
   async editMessage(message: MessageRef, text: string): Promise<void> {
     const ch = await this.fetchSendableChannel(message.channel.id);
     const msg = await ch.messages.fetch(message.id);
-    await msg.edit({ content: text });
+    await msg.edit({ content: text, flags: MessageFlags.SuppressEmbeds });
   }
 
   async sendFile(
@@ -136,6 +139,7 @@ export class DiscordAdapter implements ChatAdapter {
     const sent = await ch.send({
       ...(file.caption ? { content: file.caption } : {}),
       files: [{ attachment: file.data, name: file.filename }],
+      flags: MessageFlags.SuppressEmbeds,
     });
     return { channel, id: sent.id };
   }

@@ -1,6 +1,9 @@
 services:
   seam-acp:
-    build: .
+    build:
+      context: .
+      args:
+        INSTALL_COPILOT_CLI: "true"
     image: seam-acp:dev
     container_name: seam-acp
     restart: unless-stopped
@@ -9,12 +12,19 @@ services:
     environment:
       DATA_DIR: /data
       REPOS_ROOT: /repos
+      HEALTH_PORT: "3000"
     volumes:
       - seam-data:/data
       # Bind-mount the host's repos root read-write so the agent can edit code.
       - ${REPOS_ROOT}:/repos
     ports:
       - "${HEALTH_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
 volumes:
   seam-data:

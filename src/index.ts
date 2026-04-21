@@ -55,6 +55,17 @@ async function main(): Promise<void> {
     mcpServers,
   });
 
+  const extraGeminis = config.GEMINI_PROFILES.map((p) =>
+    makeGeminiProfile({
+      id: `gemini-${p.id}`,
+      displayName: `Google Gemini (${p.id})`,
+      configDir: p.configDir,
+      ...(config.GEMINI_CLI_PATH ? { cliPath: config.GEMINI_CLI_PATH } : {}),
+      defaultModel: config.GEMINI_DEFAULT_MODEL,
+      mcpServers,
+    })
+  );
+
   const claude = makeClaudeProfile({
     ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
     defaultModel: config.CLAUDE_DEFAULT_MODEL,
@@ -75,7 +86,7 @@ async function main(): Promise<void> {
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, ...extraCopilots, gemini, claude, ...extraClaudes],
+    profiles: [copilot, ...extraCopilots, gemini, ...extraGeminis, claude, ...extraClaudes],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".

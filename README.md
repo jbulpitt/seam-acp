@@ -36,12 +36,13 @@ Copy `.env.example` to `.env` and fill it in.
 | `REPOS_ROOT` | yes | Root folder containing repos the agent can touch |
 | `ATTACH_ROOTS` | no | Comma-separated extra absolute directories the `/seam attach` command (and the agent-side fence-to-file shortcut) can read from. `REPOS_ROOT` is always allowed. |
 | `DATA_DIR` | no | Defaults to `./data` (sqlite lives here) |
-| `DEFAULT_AGENT` | no | `copilot` (default), `gemini`, or `claude`. Plus any `copilot-<id>` / `claude-<id>` registered via the `*_PROFILES` vars. |
+| `DEFAULT_AGENT` | no | `copilot` (default), `gemini`, or `claude`. Plus any `copilot-<id>` / `gemini-<id>` / `claude-<id>` registered via the `*_PROFILES` vars. |
 | `DEFAULT_MODEL` | no | Default Copilot model. Applies to **all** Copilot profiles (including extras from `COPILOT_PROFILES`). e.g. `gpt-5.4`, `claude-sonnet-4.5`, `claude-opus-4.7`, `auto` |
 | `COPILOT_CLI_PATH` | no | If `copilot` is not on `PATH` |
 | `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
 | `GEMINI_CLI_PATH` | no | If `gemini` is not on `PATH` |
 | `GEMINI_DEFAULT_MODEL` | no | Default Gemini model — applied even when `DEFAULT_AGENT` is `copilot`. Default `gemini-2.5-pro`. |
+| `GEMINI_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `gemini-<id>` profile pinned to its own `GEMINI_CLI_HOME` (acts as a fake home — Gemini reads `<dir>/.gemini/`). See "Multiple Gemini accounts" below. |
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
 | `CLAUDE_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `claude-<id>` profile pinned to its own `CLAUDE_CONFIG_DIR`. See "Multiple Claude accounts" below. |
@@ -156,6 +157,35 @@ COPILOT_HOME=/Users/me/.copilot-personal copilot login
 
 Verify in a thread with `/seam whoami` — the bot reads
 `<config-dir>/config.json` and reports the GitHub login.
+
+### Multiple Gemini accounts
+
+Same pattern, using `GEMINI_PROFILES`:
+
+```sh
+GEMINI_PROFILES=work:/Users/me/gemini-work,personal:/Users/me/gemini-personal
+```
+
+For each entry the bot spawns `gemini --acp` with `GEMINI_CLI_HOME=<dir>`
+in the child env. The Gemini CLI treats that as a *home directory
+override* and stores all state under `<dir>/.gemini/` (auth tokens,
+credentials, settings, session history). Profiles show up in
+`/seam agent` as `gemini-work` and `gemini-personal` alongside the
+default `gemini` profile.
+
+> **Note:** the path you give is the *fake home dir* — not the
+> `.gemini` folder itself. The CLI will create `<dir>/.gemini/` for
+> you on first use.
+
+One-time setup per account on the host:
+
+```sh
+GEMINI_CLI_HOME=/Users/me/gemini-work gemini /auth
+GEMINI_CLI_HOME=/Users/me/gemini-personal gemini /auth
+```
+
+`/seam whoami` reads `<dir>/.gemini/google_accounts.json` and reports
+the active Google account email.
 
 ### Multiple Claude accounts
 

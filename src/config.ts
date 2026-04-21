@@ -77,6 +77,37 @@ const Schema = z.object({
   GEMINI_CLI_PATH: z.string().optional(),
   /** Per-agent model override for the Gemini profile. */
   GEMINI_DEFAULT_MODEL: z.string().default("gemini-2.5-pro"),
+  /**
+   * Same shape as COPILOT_PROFILES — register additional Gemini profiles
+   * each pinned to its own home directory (auth / settings). Format:
+   *   id1:/abs/dir1,id2:/abs/dir2
+   * Each becomes an agent profile named `gemini-<id>` in /seam agent.
+   * The bot injects `GEMINI_CLI_HOME=<dir>` into the child process env;
+   * Gemini CLI resolves all state under `<dir>/.gemini/`.
+   */
+  GEMINI_PROFILES: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const out: Array<{ id: string; configDir: string }> = [];
+      for (const entry of v.split(",").map((s) => s.trim()).filter(Boolean)) {
+        const idx = entry.indexOf(":");
+        if (idx <= 0 || idx === entry.length - 1) {
+          throw new Error(
+            `GEMINI_PROFILES entry must be 'id:/abs/path' (got '${entry}')`
+          );
+        }
+        const id = entry.slice(0, idx).trim();
+        const dir = path.resolve(entry.slice(idx + 1).trim());
+        if (!/^[a-z0-9][a-z0-9-]*$/i.test(id)) {
+          throw new Error(
+            `GEMINI_PROFILES id '${id}' must be alphanumeric (dashes allowed)`
+          );
+        }
+        out.push({ id, configDir: dir });
+      }
+      return out;
+    }),
 
   /** Path to the `claude-agent-acp` binary. Defaults to looking it up on PATH. */
   CLAUDE_CLI_PATH: z.string().optional(),

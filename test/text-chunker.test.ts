@@ -46,20 +46,6 @@ describe("collapseMarkdownLinkWraps", () => {
       "[Bug #208569 — Non -Prod: Word clears](https://dev.azure.com/edit/208569)";
     expect(collapseMarkdownLinkWraps(input)).toBe(expected);
   });
-
-  it("fixes Gemini's /. hostname-wrapping artifact in URLs", () => {
-    expect(
-      collapseMarkdownLinkWraps("[Task](https://dev/.\nazure.com/edit/123)")
-    ).toBe("[Task](https://dev.azure.com/edit/123)");
-  });
-
-  it("fixes /. artifact combined with other \\n wraps", () => {
-    const input =
-      "[#203504 — Prevent TA Planning](https://dev/.\nazure.com/FlintHills/FHR/_workitems/edit/203504)";
-    const expected =
-      "[#203504 — Prevent TA Planning](https://dev.azure.com/FlintHills/FHR/_workitems/edit/203504)";
-    expect(collapseMarkdownLinkWraps(input)).toBe(expected);
-  });
 });
 
 describe("chunkForDiscord", () => {

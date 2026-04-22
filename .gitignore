@@ -15,4 +15,4 @@ test-file.txt
 scripts/acp-bench.ts
 
 # Agent instructions (local only — customize per environment)
-AGENTS.md
+# AGENTS.md

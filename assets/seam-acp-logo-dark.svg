@@ -9,6 +9,6 @@
       <path d="M73 -24 L88 -24 L88 24 L73 24"/>
     </g>
     <text x="118" y="19" font-family="'Syne','Inter','Helvetica Neue',Arial,sans-serif" font-weight="800" font-size="58" fill="#F5F7FA" letter-spacing="-2">seam</text>
-    <text x="278" y="19" font-family="'IBM Plex Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace" font-weight="300" font-size="30" fill="#1AA093" letter-spacing="1.5">-acp</text>
+    <text x="263" y="19" font-family="'IBM Plex Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace" font-weight="300" font-size="30" fill="#1AA093" letter-spacing="1.5">--acp</text>
   </g>
 </svg>

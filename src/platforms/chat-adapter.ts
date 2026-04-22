@@ -100,6 +100,13 @@ export interface ChatAdapter {
   onMessage(handler: (msg: IncomingMessage) => void | Promise<void>): void;
 
   /**
+   * Optional: trigger a typing indicator in the channel. The indicator
+   * lasts ~10 s on Discord; call again before it expires to extend it.
+   * Best-effort — implementations should never throw.
+   */
+  sendTyping?(channel: ChannelRef): Promise<void>;
+
+  /**
    * Optional: ask the user to approve / deny a tool permission request,
    * blocking until they respond or the timeout elapses. Required for the
    * `ask` permission policy. Implementations should default to "cancelled"

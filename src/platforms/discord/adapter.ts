@@ -134,6 +134,15 @@ export class DiscordAdapter implements ChatAdapter {
     return { channel, id: sent.id };
   }
 
+  async sendTyping(channel: ChannelRef): Promise<void> {
+    try {
+      const ch = await this.fetchSendableChannel(channel.id);
+      await ch.sendTyping();
+    } catch {
+      // Best-effort — typing indicators must never break a turn.
+    }
+  }
+
   /**
    * Show an interactive picker. Uses a button row when the choice count
    * fits Discord's 5-button limit; otherwise falls back to a string-select

@@ -108,6 +108,24 @@ export class Orchestrator {
       void refresh();
     }, STATUS_HEARTBEAT_MS);
 
+    // Typing indicator: refresh on real agent activity (text, tool calls,
+    // thoughts) rather than a dumb timer. Discord's typing indicator
+    // expires after ~10s, so we re-arm it every 8s while the agent is
+    // working. Stops once we start posting actual messages — keeping it
+    // alive past that point looks wrong.
+    const TYPING_INTERVAL_MS = 8_000;
+    let lastTypingSentAt = 0;
+    let typingDone = false;
+    const refreshTyping = (): void => {
+      if (typingDone) return;
+      const now = Date.now();
+      if (now - lastTypingSentAt < TYPING_INTERVAL_MS) return;
+      lastTypingSentAt = now;
+      if (this.adapter.sendTyping) {
+        void this.adapter.sendTyping(channel).catch(() => {});
+      }
+    };
+
     let textBuffer = "";
     let textSent = false;
     let totalAgentChars = 0;
@@ -144,6 +162,7 @@ export class Orchestrator {
         if (split.send) {
           await this.adapter.sendMessage(channel, split.send);
           textSent = true;
+          typingDone = true;
         }
         if (!force) return;
       }
@@ -233,6 +252,7 @@ export class Orchestrator {
       runtime.onEvent(async (event) => {
         switch (event.kind) {
           case "agent-text": {
+            refreshTyping();
             // Detect Copilot CLI retry: either the agent emits a "Retrying"
             // sentinel, or the messageId rolls over mid-turn.
             const isRetrySentinel = RETRY_REGEX.test(event.text);
@@ -376,6 +396,7 @@ export class Orchestrator {
             return;
           }
           case "tool-start": {
+            refreshTyping();
             const label = event.title ?? event.kindLabel ?? "…";
             status.setAction(`Tool: ${label}`);
             status.pushActivity(label);
@@ -383,6 +404,7 @@ export class Orchestrator {
             return;
           }
           case "tool-update":
+            refreshTyping();
             if (event.status === "completed" || event.status === "failed") {
               status.setAction("Working…");
             } else if (event.title) {
@@ -415,6 +437,8 @@ export class Orchestrator {
             return;
           }
           case "agent-thought":
+            refreshTyping();
+            return;
           case "config-options":
           case "error":
             return;
@@ -423,6 +447,7 @@ export class Orchestrator {
 
       status.setAction("Thinking…");
       await refresh(true);
+      refreshTyping();
 
       const turnPromise = runtime.prompt(msg.text, msg.attachments);
       turnStartedAt = Date.now();

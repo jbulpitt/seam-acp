@@ -333,6 +333,9 @@ export class DiscordAdapter implements ChatAdapter {
     // If parent isn't accessible / not text, ignore.
     const parentId = thread.parentId ?? undefined;
 
+    const allowedChannels = this.config.DISCORD_ALLOWED_CHANNEL_IDS;
+    if (allowedChannels && (!parentId || !allowedChannels.has(parentId))) return;
+
     const text = (msg.content ?? "").trim();
     const attachments: MessageAttachment[] = msg.attachments.map((a) => ({
       url: a.url,

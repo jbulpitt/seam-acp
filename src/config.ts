@@ -15,6 +15,21 @@ const Schema = z.object({
       }
       return new Set(ids);
     }),
+  /**
+   * Optional comma-separated list of parent channel IDs the bot is allowed to
+   * operate in. When set, the bot only responds in threads whose parent channel
+   * is in this list. When unset (default), all channels are allowed.
+   */
+  DISCORD_ALLOWED_CHANNEL_IDS: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const ids = v.split(",").map((s) => s.trim()).filter(Boolean);
+      if (ids.some((id) => !/^\d+$/.test(id))) {
+        throw new Error("DISCORD_ALLOWED_CHANNEL_IDS must be comma-separated numeric Discord channel IDs");
+      }
+      return ids.length > 0 ? new Set(ids) : undefined;
+    }),
   DISCORD_DEV_GUILD_ID: z
     .string()
     .regex(/^\d+$/)

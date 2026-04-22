@@ -32,6 +32,7 @@ Copy `.env.example` to `.env` and fill it in.
 |---|---|---|
 | `DISCORD_BOT_TOKEN` | yes | From the Discord developer portal |
 | `DISCORD_ALLOWED_USER_IDS` | yes | Comma-separated Discord user IDs that can control the bot (e.g. `123,456`) |
+| `DISCORD_ALLOWED_CHANNEL_IDS` | no | Comma-separated parent channel IDs the bot is allowed to operate in. When set, the bot only responds in threads whose parent channel is in this list. When unset, all channels are allowed. |
 | `DISCORD_DEV_GUILD_ID` | no | Set to register slash commands instantly to one guild (good for dev) |
 | `REPOS_ROOT` | yes | Root folder containing repos the agent can touch |
 | `ATTACH_ROOTS` | no | Comma-separated extra absolute directories the `/seam attach` command (and the agent-side fence-to-file shortcut) can read from. `REPOS_ROOT` is always allowed. |

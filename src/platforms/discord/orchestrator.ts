@@ -17,7 +17,6 @@ import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { splitForFlush, hasOpenFence } from "../../core/stream-flush.js";
-import { collapseMarkdownLinkWraps } from "../../core/text-chunker.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import {
@@ -153,7 +152,6 @@ export class Orchestrator {
     const SOFT_MIN = 800;
     const drainBuffer = async (force: boolean) => {
       while (textBuffer) {
-        textBuffer = collapseMarkdownLinkWraps(textBuffer);
         const split = splitForFlush(textBuffer, {
           maxLen: HARD_MAX,
           softMin: SOFT_MIN,

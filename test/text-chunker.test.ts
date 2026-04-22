@@ -1,52 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { chunkForDiscord, collapseMarkdownLinkWraps } from "../src/core/text-chunker.js";
-
-describe("collapseMarkdownLinkWraps", () => {
-  it("no-ops on text without markdown links", () => {
-    const text = "Hello\nworld\n\nParagraph two";
-    expect(collapseMarkdownLinkWraps(text)).toBe(text);
-  });
-
-  it("collapses \\n inside link text with a space", () => {
-    expect(collapseMarkdownLinkWraps("[Bug #\n202748 — desc](url)")).toBe(
-      "[Bug # 202748 — desc](url)"
-    );
-  });
-
-  it("collapses \\n inside link URL with no space", () => {
-    expect(
-      collapseMarkdownLinkWraps("](https://example.com/path\n/more)")
-    ).toBe("](https://example.com/path/more)");
-  });
-
-  it("handles multiple \\n inside a single link construct", () => {
-    expect(collapseMarkdownLinkWraps("[a\nb\nc](url)")).toBe("[a b c](url)");
-  });
-
-  it("handles multiple \\n inside a URL", () => {
-    expect(collapseMarkdownLinkWraps("](https://x.com/a\n/b\n/c)")).toBe(
-      "](https://x.com/a/b/c)"
-    );
-  });
-
-  it("preserves intentional paragraph breaks between links", () => {
-    const text = "[link1](url1)\n\n[link2](url2)";
-    expect(collapseMarkdownLinkWraps(text)).toBe(text);
-  });
-
-  it("preserves \\n between items outside of link constructs", () => {
-    const text = "Task #1 — Done\nTask #2 — In Progress";
-    expect(collapseMarkdownLinkWraps(text)).toBe(text);
-  });
-
-  it("handles a full Gemini-style wrapped link", () => {
-    const input =
-      "[Bug #208569 — Non\n-Prod: Word clears](https://dev.azure.com/edit/20\n8569)";
-    const expected =
-      "[Bug #208569 — Non -Prod: Word clears](https://dev.azure.com/edit/208569)";
-    expect(collapseMarkdownLinkWraps(input)).toBe(expected);
-  });
-});
+import { chunkForDiscord } from "../src/core/text-chunker.js";
 
 describe("chunkForDiscord", () => {
   it("returns empty for empty input", () => {

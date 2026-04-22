@@ -1,4 +1,34 @@
 /**
+ * Collapses soft-wrapped newlines that some agent CLIs (e.g. Gemini) insert
+ * inside markdown link constructs when applying column-based word wrapping.
+ *
+ * - `\n` inside `[link text]` → replaced with a space.
+ * - `\n` inside `](url)` URL sections → removed entirely (spaces break URLs).
+ *
+ * Only complete `[...]` and `](...)` constructs are processed; partial ones
+ * (no closing bracket yet) are left as-is so the next call can normalize them
+ * once more streamed text has arrived.
+ */
+export function collapseMarkdownLinkWraps(text: string): string {
+  let result = text;
+  let prev: string;
+
+  // Collapse \n inside [...] link text → space. Loop for multiple \n per link.
+  do {
+    prev = result;
+    result = result.replace(/(\[[^\[\]]*)\n([^\[\]]*\])/g, "$1 $2");
+  } while (result !== prev);
+
+  // Collapse \n inside ](...) URL portions → remove. Loop for multiple \n.
+  do {
+    prev = result;
+    result = result.replace(/(\]\([^()]*)\n([^()]*\))/g, "$1$2");
+  } while (result !== prev);
+
+  return result;
+}
+
+/**
  * Splits text into chunks suitable for sending as Discord messages.
  *
  * Behavior is a port of the C# `TextChunker.ChunkForDiscord`:

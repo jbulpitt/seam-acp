@@ -82,6 +82,32 @@ docker compose up -d --build
 
 Pass `--build-arg INSTALL_COPILOT_CLI=false` if you want to mount your own Copilot CLI binary.
 
+## Run (PM2 — background process, no Docker)
+
+PM2 keeps the bot running in the background, restarts it on crashes, and can auto-start it at login.
+
+```sh
+npm install -g pm2
+npm run build
+pm2 start ecosystem.config.cjs  # starts the bot as a background daemon
+pm2 save                         # persist the process list
+pm2 startup                      # prints a command — run it to enable auto-start at login
+```
+
+**After making code changes**, use the dedicated redeploy script instead of restarting PM2 directly. A direct `pm2 restart` would kill the bot mid-reply if an agent issued the command:
+
+```sh
+npm run redeploy   # builds, then restarts PM2 after a 3-second delay
+```
+
+Other useful commands:
+
+```sh
+pm2 status              # check if the bot is running
+pm2 logs seam-acp       # tail live logs
+pm2 stop seam-acp       # stop the bot
+```
+
 ## Slash commands
 
 All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (where it matters) thread-scoped.

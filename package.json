@@ -21,6 +21,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "redeploy": "npm run build && (sleep 3 && pm2 restart seam-acp &) && echo 'Build complete — restarting in 3s'",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

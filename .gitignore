@@ -13,3 +13,6 @@ data/
 # Untracked dev artifacts
 test-file.txt
 scripts/acp-bench.ts
+
+# Agent instructions (local only — customize per environment)
+AGENTS.md

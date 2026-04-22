@@ -4,7 +4,7 @@
   <g transform="translate(44, 128)" fill="none" stroke="#1AA093" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
     <path d="M28 -48 L0 -48 L0 48 L28 48"/>
     <line x1="48" y1="0" x2="64" y2="0"/>
-    <line x1="76" y1="0" x2="92" y2="0"/>
+    <line x1="76" y1="0" x2="92" y2="0" stroke="#E8B86A"/>
     <line x1="104" y1="0" x2="120" y2="0"/>
     <path d="M140 -48 L168 -48 L168 48 L140 48"/>
   </g>

@@ -183,7 +183,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
-    sub.setName("avatar").setDescription("Push the bot avatar to Discord (force re-upload)")
+    sub.setName("avatar").setDescription("Push the bot avatar and banner to Discord (force re-upload)")
   );
 
   cmd.addSubcommand((sub) =>

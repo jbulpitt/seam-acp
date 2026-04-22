@@ -1255,10 +1255,31 @@ export class Orchestrator {
   private async cmdAvatar(i: ChatInputCommandInteraction): Promise<void> {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
     try {
-      const ok = await (this.adapter as unknown as DiscordAdapter).pushAvatar();
-      await i.editReply({
-        content: ok ? "✅ Bot avatar updated." : "⚠️ Avatar file not found (`assets/seam-acp-avatar.png`).",
-      });
+      const adapter = this.adapter as unknown as DiscordAdapter;
+      const avatarOk = await adapter.pushAvatar();
+      let bannerOk = false;
+      let bannerErr: string | undefined;
+      try {
+        bannerOk = await adapter.pushBanner();
+      } catch (err: unknown) {
+        bannerErr = err instanceof Error ? err.message : String(err);
+      }
+      const parts: string[] = [];
+      parts.push(
+        avatarOk
+          ? "✅ Bot avatar updated."
+          : "⚠️ Avatar file not found (`assets/seam-acp-avatar.png`)."
+      );
+      if (bannerErr) {
+        parts.push(`⚠️ Banner update failed: ${bannerErr}`);
+      } else {
+        parts.push(
+          bannerOk
+            ? "✅ Bot banner updated."
+            : "⚠️ Banner file not found (`assets/seam-acp-banner.png`)."
+        );
+      }
+      await i.editReply({ content: parts.join("\n") });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       await i.editReply({ content: `❌ Failed to update avatar: ${msg}` });

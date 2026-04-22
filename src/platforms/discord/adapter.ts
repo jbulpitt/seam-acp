@@ -388,12 +388,28 @@ export class DiscordAdapter implements ChatAdapter {
     return true;
   }
 
+  /** Push the PNG banner. Resolves with true on success, false if file not found. */
+  async pushBanner(): Promise<boolean> {
+    const bannerPath = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../../assets/seam-acp-banner.png"
+    );
+    if (!fs.existsSync(bannerPath)) {
+      this.logger.warn({ bannerPath }, "banner file not found; skipping");
+      return false;
+    }
+    await this.client.user!.setBanner(bannerPath);
+    this.logger.info("bot banner updated");
+    return true;
+  }
+
   private async applyAvatarIfNeeded(): Promise<void> {
     if (this.client.user?.avatar) return; // already has one
     try {
       await this.pushAvatar();
+      await this.pushBanner();
     } catch (err) {
-      this.logger.warn({ err }, "failed to set bot avatar (rate-limited or missing file)");
+      this.logger.warn({ err }, "failed to set bot avatar/banner (rate-limited or missing file)");
     }
   }
 

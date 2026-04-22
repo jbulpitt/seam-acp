@@ -3,6 +3,8 @@
  * inside markdown link constructs when applying column-based word wrapping.
  *
  * - `\n` inside `[link text]` → replaced with a space.
+ * - `/.\n` inside `](url)` → replaced with `.` (Gemini wraps hostnames at dots
+ *   and inserts a spurious `/` before breaking: `dev/.\nazure` → `dev.azure`).
  * - `\n` inside `](url)` URL sections → removed entirely (spaces break URLs).
  *
  * Only complete `[...]` and `](...)` constructs are processed; partial ones
@@ -19,7 +21,13 @@ export function collapseMarkdownLinkWraps(text: string): string {
     result = result.replace(/(\[[^\[\]]*)\n([^\[\]]*\])/g, "$1 $2");
   } while (result !== prev);
 
-  // Collapse \n inside ](...) URL portions → remove. Loop for multiple \n.
+  // Fix Gemini's /.\n hostname-wrapping artifact: dev/.\nazure → dev.azure
+  do {
+    prev = result;
+    result = result.replace(/(\]\([^()]*)\/\.\n([^()]*\))/g, "$1.$2");
+  } while (result !== prev);
+
+  // Collapse remaining \n inside ](...) URL sections → remove. Loop for multiple \n.
   do {
     prev = result;
     result = result.replace(/(\]\([^()]*)\n([^()]*\))/g, "$1$2");

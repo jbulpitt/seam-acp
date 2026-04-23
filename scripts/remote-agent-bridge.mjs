@@ -98,41 +98,81 @@ function spawnAgent(copilotCmd) {
 }
 
 /**
- * Attach an existing agent process to a WebSocket.
- * Does NOT kill the agent when the WS closes — caller handles reconnect.
- * Returns a cleanup function to detach listeners.
+ * Send a multiplexed message over a WebSocket.
+ * Protocol: { slot, type, data?, code? }
+ *   "data"  — ACP payload (UTF-8 text)
+ *   "kill"  — seam-acp → bridge: terminate agent for this slot
+ *   "exit"  — bridge → seam-acp: agent exited
  */
-function attachAgentToWs(agent, ws, WebSocket, localCwd) {
-  const onMessage = (data) => {
-    if (!agent.killed) {
-      const text = data instanceof Buffer ? data.toString("utf8") : String(data);
-      agent.stdin.write(rewriteCwdInChunk(text, localCwd));
+function muxSend(ws, WebSocket, slot, type, payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ slot, type, ...payload }));
+}
+
+/**
+ * Create a slot manager that multiplexes multiple agent processes over one WS.
+ * Each slot gets its own agent process, spawned lazily on first message.
+ * Agents survive WS reconnects — stdout is routed to `currentWs`.
+ */
+function makeSlotManager(copilotCmd, localCwd, WebSocket) {
+  let currentWs = null;
+  const slots = new Map(); // slot -> ChildProcess
+
+  function setWs(ws) {
+    currentWs = ws;
+  }
+
+  function getOrSpawnSlot(slot) {
+    if (slots.has(slot)) return slots.get(slot);
+
+    console.error(`[bridge] Slot ${slot}: spawning agent`);
+    const agent = spawnAgent(copilotCmd);
+    slots.set(slot, agent);
+
+    agent.stdout.on("data", (chunk) => {
+      muxSend(currentWs, WebSocket, slot, "data", { data: chunk.toString("utf8") });
+    });
+
+    agent.on("error", (err) => {
+      console.error(`[bridge] Slot ${slot} agent error: ${err.message}`);
+      slots.delete(slot);
+      muxSend(currentWs, WebSocket, slot, "exit", { code: 1 });
+    });
+
+    agent.on("exit", (code, signal) => {
+      console.error(`[bridge] Slot ${slot} agent exited (code=${code}, signal=${signal})`);
+      slots.delete(slot);
+      muxSend(currentWs, WebSocket, slot, "exit", { code: code ?? 1 });
+    });
+
+    return agent;
+  }
+
+  function handleMessage(raw) {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg.type === "data" && msg.data !== undefined) {
+      const agent = getOrSpawnSlot(msg.slot);
+      if (agent && !agent.killed) {
+        agent.stdin.write(rewriteCwdInChunk(msg.data, localCwd));
+      }
+    } else if (msg.type === "kill") {
+      const agent = slots.get(msg.slot);
+      if (agent) {
+        console.error(`[bridge] Slot ${msg.slot}: kill received — terminating agent`);
+        agent.kill();
+        slots.delete(msg.slot);
+      }
     }
-  };
-  const onStdout = (chunk) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
-  };
-  ws.on("message", onMessage);
-  agent.stdout.on("data", onStdout);
-  return () => {
-    ws.off("message", onMessage);
-    agent.stdout.off("data", onStdout);
-  };
+  }
+
+  return { setWs, handleMessage };
 }
 
 async function runClientMode(wsUrl, token, copilotCmd, localCwd) {
   const { WebSocket } = await loadWs();
-
-  // Spawn the agent once; keep it alive across WS reconnects.
-  let agent = spawnAgent(copilotCmd);
-  agent.on("error", (err) => {
-    console.error(`[bridge] Agent error: ${err.message} — will respawn on next connect`);
-    agent = null;
-  });
-  agent.on("exit", (code, signal) => {
-    console.error(`[bridge] Agent exited (code=${code}, signal=${signal}) — will respawn on next connect`);
-    agent = null;
-  });
+  const mgr = makeSlotManager(copilotCmd, localCwd, WebSocket);
 
   function connect() {
     console.error(`[bridge] Connecting to ${wsUrl} ...`);
@@ -142,33 +182,18 @@ async function runClientMode(wsUrl, token, copilotCmd, localCwd) {
 
     ws.on("open", () => {
       console.error("[bridge] Connected.");
+      mgr.setWs(ws);
 
-      // Keep the tunnel alive with periodic pings.
       const keepalive = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.ping();
       }, KEEPALIVE_PING_MS);
       ws.once("close", () => clearInterval(keepalive));
-
-      // Respawn agent if it died while we were disconnected.
-      if (!agent || agent.killed) {
-        console.error("[bridge] Agent was not running — respawning...");
-        agent = spawnAgent(copilotCmd);
-        agent.on("error", (err) => {
-          console.error(`[bridge] Agent error: ${err.message}`);
-          ws.close(1011, "agent error");
-          agent = null;
-        });
-        agent.on("exit", (code, signal) => {
-          console.error(`[bridge] Agent exited (code=${code}, signal=${signal})`);
-          ws.close(1000, "agent exited");
-          agent = null;
-        });
-      }
-      const detach = attachAgentToWs(agent, ws, WebSocket, localCwd);
-      ws.once("close", detach);
     });
 
+    ws.on("message", (raw) => mgr.handleMessage(raw));
+
     ws.on("close", (code, reason) => {
+      mgr.setWs(null);
       console.error(`[bridge] Disconnected (code=${code}, reason=${reason || "(none)"})`);
       if (code !== 4001) {
         console.error(`[bridge] Reconnecting in ${RECONNECT_DELAY_MS / 1000}s...`);
@@ -189,6 +214,7 @@ async function runClientMode(wsUrl, token, copilotCmd, localCwd) {
 
 async function runServerMode(port, token, copilotCmd, localCwd) {
   const { WebSocket, WebSocketServer } = await loadWs();
+  const mgr = makeSlotManager(copilotCmd, localCwd, WebSocket);
 
   const wss = new WebSocketServer({ port });
 
@@ -196,10 +222,6 @@ async function runServerMode(port, token, copilotCmd, localCwd) {
     console.error(`[bridge] Listening on ws://localhost:${port}`);
     console.error(`[bridge] Expose with: cloudflared tunnel --url ws://localhost:${port}`);
   });
-
-  let agent = spawnAgent(copilotCmd);
-  agent.on("error", (err) => { console.error(`[bridge] Agent error: ${err.message}`); agent = null; });
-  agent.on("exit", (code, signal) => { console.error(`[bridge] Agent exited (code=${code}, signal=${signal})`); agent = null; });
 
   wss.on("connection", (ws, req) => {
     const auth = req.headers["authorization"];
@@ -209,14 +231,19 @@ async function runServerMode(port, token, copilotCmd, localCwd) {
       return;
     }
     console.error("[bridge] seam-acp connected.");
-    if (!agent || agent.killed) {
-      console.error("[bridge] Agent was not running — respawning...");
-      agent = spawnAgent(copilotCmd);
-      agent.on("error", (err) => { console.error(`[bridge] Agent error: ${err.message}`); agent = null; });
-      agent.on("exit", (code, signal) => { console.error(`[bridge] Agent exited (code=${code}, signal=${signal})`); agent = null; });
-    }
-    const detach = attachAgentToWs(agent, ws, WebSocket, localCwd);
-    ws.once("close", detach);
+    mgr.setWs(ws);
+
+    const keepalive = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.ping();
+    }, KEEPALIVE_PING_MS);
+    ws.once("close", () => clearInterval(keepalive));
+
+    ws.on("message", (raw) => mgr.handleMessage(raw));
+
+    ws.on("close", () => {
+      mgr.setWs(null);
+      console.error("[bridge] seam-acp disconnected.");
+    });
   });
 
   wss.on("error", (err) => {

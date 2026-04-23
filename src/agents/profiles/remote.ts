@@ -10,18 +10,40 @@ import type { IncomingMessage } from "node:http";
 import type { AgentIdentity, AgentProfile } from "../agent-profile.js";
 
 /**
- * How long spawn() will wait for a connection before emitting an error (just
- * under AgentRuntime's 45 s START_TIMEOUT_MS so errors are actionable).
+ * How long spawn() will wait for a bridge connection before emitting an error
+ * (just under AgentRuntime's 45 s START_TIMEOUT_MS so errors are actionable).
  */
 const CONNECT_TIMEOUT_MS = 44_000;
 
-/** How often to ping idle pending connections to detect stale ones. */
-const PENDING_PING_INTERVAL_MS = 30_000;
-
-/** How often to ping active (attached) connections to keep tunnels alive. */
+/** How often to ping the bridge WS to keep tunnels/proxies alive. */
 const ACTIVE_PING_INTERVAL_MS = 25_000;
 
-type Connector = (ws: WebSocket) => void;
+// ---------------------------------------------------------------------------
+// Multiplexed message protocol
+// ---------------------------------------------------------------------------
+// Every WS message in both directions is a JSON object:
+//   { slot: number, type: "data" | "kill" | "exit", data?: string, code?: number }
+//
+//   "data"  — ACP payload (UTF-8 text)
+//   "kill"  — seam-acp → bridge: terminate the agent for this slot
+//   "exit"  — bridge → seam-acp: agent exited (with exit code)
+//
+// This lets a single WS connection serve multiple concurrent sessions.
+
+interface MuxMsg {
+  slot: number;
+  type: "data" | "kill" | "exit";
+  data?: string;
+  code?: number;
+}
+
+interface SlotEntry {
+  stdout: PassThrough;
+  fake: FakeProcess;
+  /** ACP chunks buffered while the bridge is offline. */
+  stdinQueue: string[];
+  killed: boolean;
+}
 
 type FakeProcess = EventEmitter & {
   stdin: NodeWritable;
@@ -31,117 +53,158 @@ type FakeProcess = EventEmitter & {
   kill(): void;
 };
 
-/**
- * Builds and returns a fake ChildProcess object backed by PassThrough streams.
- * The caller provides an `attach` function that will be called once a WebSocket
- * connection is available. Returns both the fake process and the attach callback
- * so callers can store the callback for deferred use (server mode) or call it
- * immediately (client mode).
- */
-/** Grace period to wait for a bridge reconnect before declaring the process dead. */
-const RECONNECT_GRACE_MS = 20_000;
-
-function makeFakeProcess(opts: {
-  id: string;
-  onKill?: () => void;
-  /** Called when the WS closes abnormally — caller decides whether to re-attach or let the process die. */
-  onWsSuspended?: (reattach: Connector) => void;
-}): { fake: FakeProcess; attach: Connector } {
-  const stdinPT = new PassThrough();
-  const stdoutPT = new PassThrough();
-  const stderrPT = new PassThrough();
-  const emitter = new EventEmitter();
-
-  let killed = false;
-  let attachedWs: WebSocket | undefined;
-
-  const fake = Object.assign(emitter, {
-    stdin: stdinPT as NodeWritable,
-    stdout: stdoutPT as NodeReadable,
-    stderr: stderrPT as NodeReadable,
-    get killed() {
-      return killed;
-    },
-    kill() {
-      if (killed) return;
-      killed = true;
-      opts.onKill?.();
-      if (attachedWs && attachedWs.readyState === WebSocket.OPEN) {
-        attachedWs.close(1000, "disposed");
-      }
-      stdinPT.destroy();
-      stdoutPT.push(null);
-    },
-  }) as FakeProcess;
-
-  const attach: Connector = (ws: WebSocket) => {
-    if (killed) {
-      ws.close(1000, "runtime already disposed");
-      return;
-    }
-    attachedWs = ws;
-
-    // Keep the active connection alive through tunnels/proxies.
-    const keepalive = setInterval(() => {
-      if (attachedWs === ws && ws.readyState === WebSocket.OPEN) ws.ping();
-    }, ACTIVE_PING_INTERVAL_MS);
-
-    // Guard stdin forwarder to only send to the currently attached WS.
-    const stdinForwarder = (chunk: Buffer) => {
-      if (attachedWs === ws && ws.readyState === WebSocket.OPEN) ws.send(chunk);
-    };
-    stdinPT.on("data", stdinForwarder);
-    stdinPT.once("end", () => {
-      if (attachedWs === ws && ws.readyState === WebSocket.OPEN) ws.close(1000, "stdin ended");
-    });
-
-    ws.on("message", (data) => {
-      if (!killed && attachedWs === ws) {
-        const buf =
-          data instanceof Buffer
-            ? data
-            : Buffer.from(data as unknown as ArrayBuffer);
-        stdoutPT.push(buf);
-      }
-    });
-
-    ws.on("error", () => {
-      if (!killed && attachedWs === ws) {
-        clearInterval(keepalive);
-        stdinPT.off("data", stdinForwarder);
-        if (opts.onWsSuspended) {
-          opts.onWsSuspended(attach);
-        } else {
-          stdoutPT.push(null);
-          fake.emit("exit", 1, null);
-        }
-      }
-    });
-
-    ws.on("close", (code) => {
-      if (!killed && attachedWs === ws) {
-        clearInterval(keepalive);
-        stdinPT.off("data", stdinForwarder);
-        if (code === 1000) {
-          // Clean close — terminate normally.
-          stdoutPT.push(null);
-          fake.emit("exit", 0, null);
-        } else if (opts.onWsSuspended) {
-          // Abnormal close — give the bridge a chance to reconnect.
-          opts.onWsSuspended(attach);
-        } else {
-          stdoutPT.push(null);
-          fake.emit("exit", 1, null);
-        }
-      }
-    });
-  };
-
-  return { fake, attach };
-}
-
 function remoteDisplayName(id: string): string {
   return `GitHub Copilot (Remote: ${id.replace(/^copilot-remote-/, "")})`;
+}
+
+// ---------------------------------------------------------------------------
+// Shared mux logic
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a multiplexed session manager over a shared WebSocket.
+ *
+ * - `attach(ws)` — called whenever a new bridge WS arrives; replaces the old one.
+ * - `spawn()` — allocates a slot and returns a fake ChildProcess; stdin/stdout
+ *   are routed through the shared WS with slot-tagged envelopes.
+ *
+ * When the bridge is offline, stdin data is queued and flushed on reconnect.
+ * Fake processes survive bridge reconnects transparently.
+ */
+function makeMux(opts: { id: string }) {
+  let bridgeWs: WebSocket | null = null;
+  let nextSlot = 0;
+  const slots = new Map<number, SlotEntry>();
+  /** Timeout handles for spawn() calls waiting for the bridge to come online. */
+  const bridgeWaiters: Array<{ slot: number; timeout: ReturnType<typeof setTimeout> }> = [];
+
+  function send(msg: MuxMsg) {
+    if (bridgeWs?.readyState === WebSocket.OPEN) {
+      bridgeWs.send(JSON.stringify(msg));
+    }
+  }
+
+  function flushQueues() {
+    for (const [slot, entry] of slots) {
+      if (!entry.killed && entry.stdinQueue.length > 0) {
+        for (const text of entry.stdinQueue.splice(0)) {
+          send({ slot, type: "data", data: text });
+        }
+      }
+    }
+  }
+
+  function attach(newWs: WebSocket) {
+    // Replace the old bridge connection.
+    if (bridgeWs && bridgeWs !== newWs && bridgeWs.readyState === WebSocket.OPEN) {
+      bridgeWs.close(1001, "replaced by new bridge connection");
+    }
+    bridgeWs = newWs;
+
+    // All pending spawn() calls can now proceed.
+    for (const { timeout } of bridgeWaiters.splice(0)) {
+      clearTimeout(timeout);
+    }
+
+    // Send any stdin that arrived while the bridge was offline.
+    flushQueues();
+
+    newWs.on("message", (raw) => {
+      let msg: MuxMsg;
+      try {
+        msg = JSON.parse(raw.toString()) as MuxMsg;
+      } catch {
+        return;
+      }
+      const entry = slots.get(msg.slot);
+      if (!entry || entry.killed) return;
+
+      if (msg.type === "data" && msg.data !== undefined) {
+        entry.stdout.push(msg.data);
+      } else if (msg.type === "exit") {
+        entry.killed = true;
+        slots.delete(msg.slot);
+        entry.stdout.push(null);
+        entry.fake.emit("exit", msg.code ?? 1, null);
+      }
+    });
+
+    newWs.on("close", () => {
+      if (bridgeWs === newWs) bridgeWs = null;
+    });
+
+    newWs.on("error", () => {
+      if (bridgeWs === newWs) bridgeWs = null;
+    });
+  }
+
+  function spawn(): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable> {
+    const slot = nextSlot++;
+    const stdinPT = new PassThrough();
+    const stdoutPT = new PassThrough();
+    const stderrPT = new PassThrough();
+    const emitter = new EventEmitter();
+    const stdinQueue: string[] = [];
+    let killed = false;
+
+    const fake = Object.assign(emitter, {
+      stdin: stdinPT as NodeWritable,
+      stdout: stdoutPT as NodeReadable,
+      stderr: stderrPT as NodeReadable,
+      get killed() {
+        return killed;
+      },
+      kill() {
+        if (killed) return;
+        killed = true;
+        const entry = slots.get(slot);
+        if (entry) entry.killed = true;
+        slots.delete(slot);
+        send({ slot, type: "kill" });
+        stdinPT.destroy();
+        stdoutPT.push(null);
+      },
+    }) as FakeProcess;
+
+    slots.set(slot, { stdout: stdoutPT, fake, stdinQueue, killed: false });
+
+    stdinPT.on("data", (chunk: Buffer) => {
+      if (killed) return;
+      const text = chunk.toString("utf8");
+      if (bridgeWs?.readyState === WebSocket.OPEN) {
+        // Flush any previously buffered data first.
+        for (const queued of stdinQueue.splice(0)) {
+          send({ slot, type: "data", data: queued });
+        }
+        send({ slot, type: "data", data: text });
+      } else {
+        stdinQueue.push(text);
+      }
+    });
+
+    // If bridge isn't online yet, start a connect timeout.
+    if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
+      const timeout = setTimeout(() => {
+        const idx = bridgeWaiters.findIndex((w) => w.slot === slot);
+        if (idx >= 0) bridgeWaiters.splice(idx, 1);
+        if (!killed) {
+          fake.emit(
+            "error",
+            new Error(
+              `Remote agent '${opts.id}' did not connect within ${CONNECT_TIMEOUT_MS / 1000}s. ` +
+                `Ensure the bridge script is running and pointed at this server.`
+            )
+          );
+        }
+      }, CONNECT_TIMEOUT_MS);
+      if (typeof timeout.unref === "function") timeout.unref();
+      bridgeWaiters.push({ slot, timeout });
+    }
+
+    return fake as unknown as ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
+  }
+
+  return { attach, spawn };
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +216,10 @@ function remoteDisplayName(id: string): string {
  * bridge script running on the remote machine. The remote machine runs
  * `scripts/remote-agent-bridge.mjs <ws-url> <token>` — where `ws-url` points
  * at this server — and pipes `copilot --acp` stdio over the socket.
+ *
+ * A single WebSocket connection from the bridge carries all concurrent sessions
+ * via slot-tagged message envelopes, so multiple Discord threads work in
+ * parallel without needing multiple bridge connections.
  *
  * Use this mode when you can expose a port on the seam-acp server (directly or
  * via a Cloudflare Tunnel on the seam-acp side).
@@ -166,30 +233,8 @@ export function makeRemoteCopilotServerProfile(opts: {
   token: string;
   defaultModel: string;
 }): AgentProfile {
-  const pendingConnections: WebSocket[] = [];
-  const waiters: Array<{ connect: Connector; timeout: ReturnType<typeof setTimeout> }> = [];
-
-  // Suspended sessions: bridge disconnected abnormally, waiting to reconnect.
-  const suspendedSessions: Array<{
-    reattach: Connector;
-    expireTimeout: ReturnType<typeof setTimeout>;
-    fake: FakeProcess;
-  }> = [];
-
+  const mux = makeMux({ id: opts.id });
   const wss = new WebSocketServer({ port: opts.wsPort });
-
-  // Heartbeat: prune stale idle connections from the pending pool.
-  const pingInterval = setInterval(() => {
-    for (let i = pendingConnections.length - 1; i >= 0; i--) {
-      const ws = pendingConnections[i];
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        pendingConnections.splice(i, 1);
-      } else {
-        ws.ping();
-      }
-    }
-  }, PENDING_PING_INTERVAL_MS);
-  pingInterval.unref();
 
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     const auth = req.headers["authorization"];
@@ -198,98 +243,19 @@ export function makeRemoteCopilotServerProfile(opts: {
       return;
     }
 
-    // Prefer re-attaching to a suspended session over creating a new one.
-    if (suspendedSessions.length > 0) {
-      const session = suspendedSessions.shift()!;
-      clearTimeout(session.expireTimeout);
-      session.reattach(ws);
-      return;
-    }
+    const keepalive = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.ping();
+    }, ACTIVE_PING_INTERVAL_MS);
+    ws.once("close", () => clearInterval(keepalive));
 
-    if (waiters.length > 0) {
-      const { connect, timeout } = waiters.shift()!;
-      clearTimeout(timeout);
-      connect(ws);
-    } else {
-      pendingConnections.push(ws);
-      ws.once("close", () => {
-        const i = pendingConnections.indexOf(ws);
-        if (i >= 0) pendingConnections.splice(i, 1);
-      });
-    }
+    mux.attach(ws);
   });
 
   return {
     id: opts.id,
     displayName: opts.displayName ?? remoteDisplayName(opts.id),
     defaultModel: opts.defaultModel,
-
-    spawn(): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable> {
-      let suspendedEntry: typeof suspendedSessions[number] | undefined;
-
-      const { fake, attach } = makeFakeProcess({
-        id: opts.id,
-        onKill() {
-          // Remove from waiters if still waiting for a connection.
-          const idx = waiters.findIndex((w) => w.connect === attach);
-          if (idx >= 0) {
-            const entry = waiters[idx];
-            if (entry) clearTimeout(entry.timeout);
-            waiters.splice(idx, 1);
-          }
-          // Remove from suspended sessions if suspended.
-          if (suspendedEntry) {
-            const si = suspendedSessions.indexOf(suspendedEntry);
-            if (si >= 0) {
-              clearTimeout(suspendedEntry.expireTimeout);
-              suspendedSessions.splice(si, 1);
-            }
-          }
-        },
-        onWsSuspended(reattach) {
-          // Abnormal disconnect — hold the fake process alive briefly.
-          const expireTimeout = setTimeout(() => {
-            const si = suspendedSessions.indexOf(suspendedEntry!);
-            if (si >= 0) suspendedSessions.splice(si, 1);
-            if (!fake.killed) {
-              fake.emit("exit", 1, null);
-            }
-          }, RECONNECT_GRACE_MS);
-          if (typeof expireTimeout.unref === "function") expireTimeout.unref();
-          suspendedEntry = { reattach, expireTimeout, fake };
-          suspendedSessions.push(suspendedEntry);
-        },
-      });
-
-      const available = pendingConnections.shift();
-      if (available) {
-        attach(available);
-      } else {
-        const timeout = setTimeout(() => {
-          const idx = waiters.findIndex((w) => w.connect === attach);
-          if (idx >= 0) waiters.splice(idx, 1);
-          if (!fake.killed) {
-            fake.emit(
-              "error",
-              new Error(
-                `Remote agent '${opts.id}' did not connect within ` +
-                  `${CONNECT_TIMEOUT_MS / 1000}s. ` +
-                  `Ensure the bridge script is running and pointed at this server.`
-              )
-            );
-          }
-        }, CONNECT_TIMEOUT_MS);
-        if (typeof timeout.unref === "function") timeout.unref();
-        waiters.push({ connect: attach, timeout });
-      }
-
-      return fake as unknown as ChildProcessByStdio<
-        NodeWritable,
-        NodeReadable,
-        NodeReadable
-      >;
-    },
-
+    spawn: mux.spawn.bind(mux),
     whoami(): Promise<AgentIdentity | null> {
       return Promise.resolve(null);
     },
@@ -306,6 +272,9 @@ export function makeRemoteCopilotServerProfile(opts: {
  * `scripts/remote-agent-bridge.mjs --server <port> <token>` and exposes it via
  * a Cloudflare Tunnel (or any other means) so seam-acp can reach it.
  *
+ * A single outbound WS connection carries all concurrent sessions via
+ * slot-tagged message envelopes. Reconnects automatically on disconnect.
+ *
  * Use this mode when you prefer to run `cloudflared` on the remote machine
  * rather than on the seam-acp server, and seam-acp has no open inbound ports.
  */
@@ -318,54 +287,40 @@ export function makeRemoteCopilotClientProfile(opts: {
   token: string;
   defaultModel: string;
 }): AgentProfile {
+  const mux = makeMux({ id: opts.id });
+
+  function connect() {
+    const ws = new WebSocket(opts.wsUrl, {
+      headers: { Authorization: `Bearer ${opts.token}` },
+    });
+
+    const keepalive = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.ping();
+    }, ACTIVE_PING_INTERVAL_MS);
+    ws.once("close", () => clearInterval(keepalive));
+
+    ws.on("open", () => {
+      mux.attach(ws);
+    });
+
+    ws.on("close", (code) => {
+      if (code !== 4001) {
+        setTimeout(connect, 5_000);
+      }
+    });
+
+    ws.on("error", () => {
+      // close event will fire after error and handle reconnect.
+    });
+  }
+
+  connect();
+
   return {
     id: opts.id,
     displayName: opts.displayName ?? remoteDisplayName(opts.id),
     defaultModel: opts.defaultModel,
-
-    spawn(): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable> {
-      let connected = false;
-
-      const { fake, attach } = makeFakeProcess({
-        id: opts.id,
-        onKill() {
-          ws.terminate();
-        },
-      });
-
-      const ws = new WebSocket(opts.wsUrl, {
-        headers: { Authorization: `Bearer ${opts.token}` },
-      });
-
-      ws.on("open", () => {
-        connected = true;
-        attach(ws);
-      });
-
-      ws.on("error", (err) => {
-        if (!fake.killed) {
-          if (!connected) {
-            // Pre-connect failure: surface as spawn error so AgentRuntime's
-            // errorWaiter catches it.
-            fake.emit(
-              "error",
-              new Error(
-                `Remote agent '${opts.id}' connection failed: ${err.message}`
-              )
-            );
-          }
-          // Post-connect errors are handled by the attach() ws.on("error")
-          // listener which translates them to "exit".
-        }
-      });
-
-      return fake as unknown as ChildProcessByStdio<
-        NodeWritable,
-        NodeReadable,
-        NodeReadable
-      >;
-    },
-
+    spawn: mux.spawn.bind(mux),
     whoami(): Promise<AgentIdentity | null> {
       return Promise.resolve(null);
     },

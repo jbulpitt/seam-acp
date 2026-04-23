@@ -60,30 +60,20 @@ async function loadWs() {
 }
 
 /**
- * Rewrites the `cwd` field in ACP `initialize` and `create_session` messages
- * so the agent uses a valid local path instead of the server's path.
+ * Rewrites the `cwd` field in an ACP chunk when it contains an initialize or
+ * create_session message. Uses simple text replacement — safe because cwd is
+ * always a plain path string and the method check prevents false positives.
  */
-function rewriteCwd(line, localCwd) {
-  try {
-    const msg = JSON.parse(line);
-    if (
-      msg &&
-      (msg.method === "initialize" || msg.method === "create_session") &&
-      msg.params &&
-      msg.params.cwd
-    ) {
-      msg.params.cwd = localCwd;
-      // Clear server-side additional directories — they won't exist locally.
-      if (Array.isArray(msg.params.additionalDirectories)) {
-        msg.params.additionalDirectories = [];
-      }
-      console.error(`[bridge] Rewrote cwd in '${msg.method}' to: ${localCwd}`);
-      return JSON.stringify(msg);
-    }
-  } catch {
-    // Not valid JSON or not an ACP message — pass through as-is.
+function rewriteCwdInChunk(text, localCwd) {
+  if (!text.includes('"initialize"') && !text.includes('"create_session"')) {
+    return text;
   }
-  return line;
+  const escaped = localCwd.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const rewritten = text.replace(/"cwd"\s*:\s*"[^"]*"/g, `"cwd":"${escaped}"`);
+  if (rewritten !== text) {
+    console.error(`[bridge] Rewrote cwd to: ${localCwd}`);
+  }
+  return rewritten;
 }
 
 /**
@@ -107,18 +97,10 @@ function bridgeConnection(ws, copilotCmd, WebSocket, localCwd) {
     ws.close(1000, "agent exited");
   });
 
-  // Buffer partial ndjson lines and rewrite cwd before forwarding to the agent.
-  let lineBuffer = "";
   ws.on("message", (data) => {
     if (!agent.killed) {
-      lineBuffer += data instanceof Buffer ? data.toString("utf8") : String(data);
-      const lines = lineBuffer.split("\n");
-      lineBuffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (line.trim()) {
-          agent.stdin.write(rewriteCwd(line, localCwd) + "\n");
-        }
-      }
+      const text = data instanceof Buffer ? data.toString("utf8") : String(data);
+      agent.stdin.write(rewriteCwdInChunk(text, localCwd));
     }
   });
 

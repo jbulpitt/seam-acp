@@ -16,3 +16,9 @@ scripts/acp-bench.ts
 
 # Agent instructions (local only — customize per environment)
 # AGENTS.md
+
+# Local OCI provisioning context
+oci-context.md
+
+# Local research artifacts
+streaming-markdown-research.md

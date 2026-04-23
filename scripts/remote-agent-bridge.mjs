@@ -88,7 +88,12 @@ function bridgeConnection(ws, copilotCmd, WebSocket, localCwd) {
   // Support "node /path/to/cli.js" style commands by splitting on first space.
   const cmdParts = copilotCmd.split(" ");
   const cmd = cmdParts[0];
-  const cmdArgs = [...cmdParts.slice(1), "--acp"];
+  // COPILOT_ARGS overrides the default "--acp" flag (e.g. set to "" for CLIs
+  // that run in ACP mode by default without needing a flag).
+  const extraArgs = process.env.COPILOT_ARGS !== undefined
+    ? process.env.COPILOT_ARGS.split(" ").filter(Boolean)
+    : ["--acp"];
+  const cmdArgs = [...cmdParts.slice(1), ...extraArgs];
   console.error(`[bridge] Spawning agent: ${cmd} ${cmdArgs.join(" ")} (GH_TOKEN: ${ghToken ? ghToken.slice(0, 8) + "..." : "MISSING"})`);
 
   const agent = spawn(cmd, cmdArgs, {

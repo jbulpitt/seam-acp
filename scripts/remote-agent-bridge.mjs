@@ -49,6 +49,9 @@ import { homedir } from "node:os";
 /** Milliseconds to wait before reconnecting after a disconnect (client mode). */
 const RECONNECT_DELAY_MS = 5_000;
 
+/** Interval for sending WS ping frames to keep the tunnel/proxy alive. */
+const KEEPALIVE_PING_MS = 25_000;
+
 async function loadWs() {
   try {
     const mod = await import("ws");
@@ -139,6 +142,13 @@ async function runClientMode(wsUrl, token, copilotCmd, localCwd) {
 
     ws.on("open", () => {
       console.error("[bridge] Connected.");
+
+      // Keep the tunnel alive with periodic pings.
+      const keepalive = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.ping();
+      }, KEEPALIVE_PING_MS);
+      ws.once("close", () => clearInterval(keepalive));
+
       // Respawn agent if it died while we were disconnected.
       if (!agent || agent.killed) {
         console.error("[bridge] Agent was not running — respawning...");

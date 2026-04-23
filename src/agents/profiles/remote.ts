@@ -18,6 +18,9 @@ const CONNECT_TIMEOUT_MS = 44_000;
 /** How often to ping idle pending connections to detect stale ones. */
 const PENDING_PING_INTERVAL_MS = 30_000;
 
+/** How often to ping active (attached) connections to keep tunnels alive. */
+const ACTIVE_PING_INTERVAL_MS = 25_000;
+
 type Connector = (ws: WebSocket) => void;
 
 type FakeProcess = EventEmitter & {
@@ -35,9 +38,14 @@ type FakeProcess = EventEmitter & {
  * so callers can store the callback for deferred use (server mode) or call it
  * immediately (client mode).
  */
+/** Grace period to wait for a bridge reconnect before declaring the process dead. */
+const RECONNECT_GRACE_MS = 20_000;
+
 function makeFakeProcess(opts: {
   id: string;
   onKill?: () => void;
+  /** Called when the WS closes abnormally — caller decides whether to re-attach or let the process die. */
+  onWsSuspended?: (reattach: Connector) => void;
 }): { fake: FakeProcess; attach: Connector } {
   const stdinPT = new PassThrough();
   const stdoutPT = new PassThrough();
@@ -73,15 +81,22 @@ function makeFakeProcess(opts: {
     }
     attachedWs = ws;
 
-    stdinPT.on("data", (chunk: Buffer) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
-    });
-    stdinPT.on("end", () => {
-      if (ws.readyState === WebSocket.OPEN) ws.close(1000, "stdin ended");
+    // Keep the active connection alive through tunnels/proxies.
+    const keepalive = setInterval(() => {
+      if (attachedWs === ws && ws.readyState === WebSocket.OPEN) ws.ping();
+    }, ACTIVE_PING_INTERVAL_MS);
+
+    // Guard stdin forwarder to only send to the currently attached WS.
+    const stdinForwarder = (chunk: Buffer) => {
+      if (attachedWs === ws && ws.readyState === WebSocket.OPEN) ws.send(chunk);
+    };
+    stdinPT.on("data", stdinForwarder);
+    stdinPT.once("end", () => {
+      if (attachedWs === ws && ws.readyState === WebSocket.OPEN) ws.close(1000, "stdin ended");
     });
 
     ws.on("message", (data) => {
-      if (!killed) {
+      if (!killed && attachedWs === ws) {
         const buf =
           data instanceof Buffer
             ? data
@@ -90,19 +105,34 @@ function makeFakeProcess(opts: {
       }
     });
 
-    // Post-connect WS errors: translate to exit (NOT "error") so they don't
-    // become unhandled events after AgentRuntime's once("error") has fired.
     ws.on("error", () => {
-      if (!killed) {
-        stdoutPT.push(null);
-        fake.emit("exit", 1, null);
+      if (!killed && attachedWs === ws) {
+        clearInterval(keepalive);
+        stdinPT.off("data", stdinForwarder);
+        if (opts.onWsSuspended) {
+          opts.onWsSuspended(attach);
+        } else {
+          stdoutPT.push(null);
+          fake.emit("exit", 1, null);
+        }
       }
     });
 
     ws.on("close", (code) => {
-      if (!killed) {
-        stdoutPT.push(null);
-        fake.emit("exit", code === 1000 ? 0 : 1, null);
+      if (!killed && attachedWs === ws) {
+        clearInterval(keepalive);
+        stdinPT.off("data", stdinForwarder);
+        if (code === 1000) {
+          // Clean close — terminate normally.
+          stdoutPT.push(null);
+          fake.emit("exit", 0, null);
+        } else if (opts.onWsSuspended) {
+          // Abnormal close — give the bridge a chance to reconnect.
+          opts.onWsSuspended(attach);
+        } else {
+          stdoutPT.push(null);
+          fake.emit("exit", 1, null);
+        }
       }
     });
   };
@@ -139,6 +169,13 @@ export function makeRemoteCopilotServerProfile(opts: {
   const pendingConnections: WebSocket[] = [];
   const waiters: Array<{ connect: Connector; timeout: ReturnType<typeof setTimeout> }> = [];
 
+  // Suspended sessions: bridge disconnected abnormally, waiting to reconnect.
+  const suspendedSessions: Array<{
+    reattach: Connector;
+    expireTimeout: ReturnType<typeof setTimeout>;
+    fake: FakeProcess;
+  }> = [];
+
   const wss = new WebSocketServer({ port: opts.wsPort });
 
   // Heartbeat: prune stale idle connections from the pending pool.
@@ -161,6 +198,14 @@ export function makeRemoteCopilotServerProfile(opts: {
       return;
     }
 
+    // Prefer re-attaching to a suspended session over creating a new one.
+    if (suspendedSessions.length > 0) {
+      const session = suspendedSessions.shift()!;
+      clearTimeout(session.expireTimeout);
+      session.reattach(ws);
+      return;
+    }
+
     if (waiters.length > 0) {
       const { connect, timeout } = waiters.shift()!;
       clearTimeout(timeout);
@@ -180,15 +225,39 @@ export function makeRemoteCopilotServerProfile(opts: {
     defaultModel: opts.defaultModel,
 
     spawn(): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable> {
+      let suspendedEntry: typeof suspendedSessions[number] | undefined;
+
       const { fake, attach } = makeFakeProcess({
         id: opts.id,
         onKill() {
+          // Remove from waiters if still waiting for a connection.
           const idx = waiters.findIndex((w) => w.connect === attach);
           if (idx >= 0) {
             const entry = waiters[idx];
             if (entry) clearTimeout(entry.timeout);
             waiters.splice(idx, 1);
           }
+          // Remove from suspended sessions if suspended.
+          if (suspendedEntry) {
+            const si = suspendedSessions.indexOf(suspendedEntry);
+            if (si >= 0) {
+              clearTimeout(suspendedEntry.expireTimeout);
+              suspendedSessions.splice(si, 1);
+            }
+          }
+        },
+        onWsSuspended(reattach) {
+          // Abnormal disconnect — hold the fake process alive briefly.
+          const expireTimeout = setTimeout(() => {
+            const si = suspendedSessions.indexOf(suspendedEntry!);
+            if (si >= 0) suspendedSessions.splice(si, 1);
+            if (!fake.killed) {
+              fake.emit("exit", 1, null);
+            }
+          }, RECONNECT_GRACE_MS);
+          if (typeof expireTimeout.unref === "function") expireTimeout.unref();
+          suspendedEntry = { reattach, expireTimeout, fake };
+          suspendedSessions.push(suspendedEntry);
         },
       });
 

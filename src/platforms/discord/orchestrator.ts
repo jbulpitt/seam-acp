@@ -548,12 +548,26 @@ export class Orchestrator {
         status.setAction(result.stopReason);
       }
     } catch (err) {
-      this.logger.error({ err }, "turn failed");
+      this.logger.error({ err, session: record.id }, "turn failed");
       cancelFlushTimer();
       await flushChunks();
+      // If the agent reports that the session is gone (e.g. bridge restarted
+      // with a fresh agent process), evict the dead runtime so the next message
+      // triggers a clean newSession rather than repeatedly failing.
+      const msg = err instanceof Error ? err.message : String(err);
+      // The ACP SDK surfaces session-not-found as RequestError with
+      // message "Internal error" and data.details = "Session not found".
+      // Check both the top-level message and the nested details string.
+      const details = String((err as any)?.data?.details ?? "");
+      const isSessionGone =
+        msg.toLowerCase().includes("session not found") ||
+        details.toLowerCase().includes("session not found");
+      if (isSessionGone) {
+        this.logger.warn({ session: record.id }, "session not found on agent; invalidating runtime");
+        await this.router.invalidate(record.id);
+      }
       status.setState("Failed");
-      const m = err instanceof Error ? err.message : String(err);
-      status.setAction(this.renderer.trimShort(m, 120));
+      status.setAction(this.renderer.trimShort(isSessionGone ? "Session lost — please resend your message." : msg, 120));
     } finally {
       clearInterval(heartbeat);
       await refresh(true);

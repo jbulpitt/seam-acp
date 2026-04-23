@@ -65,7 +65,7 @@ async function loadWs() {
  * always a plain path string and the method check prevents false positives.
  */
 function rewriteCwdInChunk(text, localCwd) {
-  if (!text.includes('"initialize"') && !text.includes('"create_session"')) {
+  if (!text.includes('"initialize"') && !text.includes('"session/new"') && !text.includes('"session/resume"')) {
     return text;
   }
   const escaped = localCwd.replace(/\\/g, "\\\\").replace(/"/g, '\\"');

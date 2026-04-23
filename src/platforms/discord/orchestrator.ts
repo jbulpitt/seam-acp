@@ -564,7 +564,7 @@ export class Orchestrator {
         details.toLowerCase().includes("session not found");
       if (isSessionGone) {
         this.logger.warn({ session: record.id }, "session not found on agent; invalidating runtime");
-        await this.router.invalidate(record.id);
+        await this.router.invalidate(record.id, { clearAcpSession: true });
       }
       status.setState("Failed");
       status.setAction(this.renderer.trimShort(isSessionGone ? "Session lost — please resend your message." : msg, 120));

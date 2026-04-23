@@ -147,14 +147,22 @@ export class SessionRouter {
   }
 
   /** Drop a runtime from the cache (e.g. on session/not-found). */
-  async invalidate(sessionId: string): Promise<void> {
+  async invalidate(sessionId: string, opts?: { clearAcpSession?: boolean }): Promise<void> {
     const rt = this.runtimes.get(sessionId);
-    if (!rt) return;
-    this.runtimes.delete(sessionId);
-    try {
-      await rt.dispose();
-    } catch (err) {
-      this.logger.warn({ err, sessionId }, "dispose during invalidate failed");
+    if (rt) {
+      this.runtimes.delete(sessionId);
+      try {
+        await rt.dispose();
+      } catch (err) {
+        this.logger.warn({ err, sessionId }, "dispose during invalidate failed");
+      }
+    }
+    if (opts?.clearAcpSession) {
+      const record = this.store.get(sessionId);
+      if (record?.acpSessionId) {
+        this.store.upsert({ ...record, acpSessionId: "", updatedUtc: new Date().toISOString() });
+        this.logger.info({ sessionId }, "cleared stored acp session id");
+      }
     }
   }
 

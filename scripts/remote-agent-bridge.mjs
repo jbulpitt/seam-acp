@@ -43,7 +43,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { homedir } from "node:os";
 
 /** Milliseconds to wait before reconnecting after a disconnect (client mode). */
@@ -81,10 +81,18 @@ function rewriteCwdInChunk(text, localCwd) {
  * Intercepts ACP initialize/create_session to rewrite the cwd to localCwd.
  */
 function bridgeConnection(ws, copilotCmd, WebSocket, localCwd) {
-  console.error("[bridge] Spawning agent...");
+  const ghToken = process.env.GH_TOKEN || (() => {
+    try { return execSync("gh auth token", { stdio: ["pipe", "pipe", "ignore"] }).toString().trim(); }
+    catch { return ""; }
+  })();
+  console.error(`[bridge] Spawning agent (GH_TOKEN: ${ghToken ? ghToken.slice(0, 8) + "..." : "MISSING"})...`);
 
   const agent = spawn(copilotCmd, ["--acp"], {
     stdio: ["pipe", "pipe", "inherit"],
+    env: {
+      ...process.env,
+      ...(ghToken ? { GH_TOKEN: ghToken } : {}),
+    },
   });
 
   agent.on("error", (err) => {

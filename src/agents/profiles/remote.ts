@@ -10,39 +10,124 @@ import type { IncomingMessage } from "node:http";
 import type { AgentIdentity, AgentProfile } from "../agent-profile.js";
 
 /**
- * How long spawn() will wait for a Mac bridge connection before emitting an
- * error (just under AgentRuntime's 45 s START_TIMEOUT_MS so the error message
- * is actionable rather than a generic "initialize timed out").
+ * How long spawn() will wait for a connection before emitting an error (just
+ * under AgentRuntime's 45 s START_TIMEOUT_MS so errors are actionable).
  */
 const CONNECT_TIMEOUT_MS = 44_000;
 
-/**
- * How often to ping idle pending connections to detect stale ones.
- */
+/** How often to ping idle pending connections to detect stale ones. */
 const PENDING_PING_INTERVAL_MS = 30_000;
 
 type Connector = (ws: WebSocket) => void;
 
+type FakeProcess = EventEmitter & {
+  stdin: NodeWritable;
+  stdout: NodeReadable;
+  stderr: NodeReadable;
+  readonly killed: boolean;
+  kill(): void;
+};
+
 /**
- * Creates an AgentProfile whose transport is a remote WebSocket connection
- * rather than a locally spawned process. Intended for cases where the agent
- * CLI (e.g. Copilot) runs on a separate machine that cannot accept inbound
- * connections but CAN make outbound WebSocket connections (e.g. via a
- * Cloudflare Tunnel).
- *
- * One profile = one WebSocket server port. The remote machine runs the
- * bridge script (`scripts/remote-agent-bridge.mjs`) which:
- *   1. Connects outbound to this server.
- *   2. Spawns `copilot --acp` locally.
- *   3. Pipes stdio ↔ WebSocket.
- *
- * Because ACP allows multiple sessions per process, a single bridge
- * connection can serve multiple concurrent Discord sessions. If a second
- * spawn() is requested while a bridge connection is already claimed, it
- * will wait up to CONNECT_TIMEOUT_MS for another bridge connection.
+ * Builds and returns a fake ChildProcess object backed by PassThrough streams.
+ * The caller provides an `attach` function that will be called once a WebSocket
+ * connection is available. Returns both the fake process and the attach callback
+ * so callers can store the callback for deferred use (server mode) or call it
+ * immediately (client mode).
  */
-export function makeRemoteCopilotProfile(opts: {
-  /** Unique profile id; will be prefixed `copilot-remote-` in the router. */
+function makeFakeProcess(opts: {
+  id: string;
+  onKill?: () => void;
+}): { fake: FakeProcess; attach: Connector } {
+  const stdinPT = new PassThrough();
+  const stdoutPT = new PassThrough();
+  const stderrPT = new PassThrough();
+  const emitter = new EventEmitter();
+
+  let killed = false;
+  let attachedWs: WebSocket | undefined;
+
+  const fake = Object.assign(emitter, {
+    stdin: stdinPT as NodeWritable,
+    stdout: stdoutPT as NodeReadable,
+    stderr: stderrPT as NodeReadable,
+    get killed() {
+      return killed;
+    },
+    kill() {
+      if (killed) return;
+      killed = true;
+      opts.onKill?.();
+      if (attachedWs && attachedWs.readyState === WebSocket.OPEN) {
+        attachedWs.close(1000, "disposed");
+      }
+      stdinPT.destroy();
+      stdoutPT.push(null);
+    },
+  }) as FakeProcess;
+
+  const attach: Connector = (ws: WebSocket) => {
+    if (killed) {
+      ws.close(1000, "runtime already disposed");
+      return;
+    }
+    attachedWs = ws;
+
+    stdinPT.on("data", (chunk: Buffer) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
+    });
+    stdinPT.on("end", () => {
+      if (ws.readyState === WebSocket.OPEN) ws.close(1000, "stdin ended");
+    });
+
+    ws.on("message", (data) => {
+      if (!killed) {
+        const buf =
+          data instanceof Buffer
+            ? data
+            : Buffer.from(data as unknown as ArrayBuffer);
+        stdoutPT.push(buf);
+      }
+    });
+
+    // Post-connect WS errors: translate to exit (NOT "error") so they don't
+    // become unhandled events after AgentRuntime's once("error") has fired.
+    ws.on("error", () => {
+      if (!killed) {
+        stdoutPT.push(null);
+        fake.emit("exit", 1, null);
+      }
+    });
+
+    ws.on("close", (code) => {
+      if (!killed) {
+        stdoutPT.push(null);
+        fake.emit("exit", code === 1000 ? 0 : 1, null);
+      }
+    });
+  };
+
+  return { fake, attach };
+}
+
+function remoteDisplayName(id: string): string {
+  return `GitHub Copilot (Remote: ${id.replace(/^copilot-remote-/, "")})`;
+}
+
+// ---------------------------------------------------------------------------
+// Server mode: seam-acp hosts the WebSocket server; bridge dials in.
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates an AgentProfile that listens for inbound WebSocket connections from a
+ * bridge script running on the remote machine. The remote machine runs
+ * `scripts/remote-agent-bridge.mjs <ws-url> <token>` — where `ws-url` points
+ * at this server — and pipes `copilot --acp` stdio over the socket.
+ *
+ * Use this mode when you can expose a port on the seam-acp server (directly or
+ * via a Cloudflare Tunnel on the seam-acp side).
+ */
+export function makeRemoteCopilotServerProfile(opts: {
   id: string;
   displayName?: string;
   /** Local TCP port for the WebSocket server. */
@@ -52,7 +137,7 @@ export function makeRemoteCopilotProfile(opts: {
   defaultModel: string;
 }): AgentProfile {
   const pendingConnections: WebSocket[] = [];
-  const waiters: Connector[] = [];
+  const waiters: Array<{ connect: Connector; timeout: ReturnType<typeof setTimeout> }> = [];
 
   const wss = new WebSocketServer({ port: opts.wsPort });
 
@@ -77,11 +162,10 @@ export function makeRemoteCopilotProfile(opts: {
     }
 
     if (waiters.length > 0) {
-      // A runtime is already waiting — hand off immediately.
-      const waiter = waiters.shift()!;
-      waiter(ws);
+      const { connect, timeout } = waiters.shift()!;
+      clearTimeout(timeout);
+      connect(ws);
     } else {
-      // Park the connection until a runtime needs it.
       pendingConnections.push(ws);
       ws.once("close", () => {
         const i = pendingConnections.indexOf(ws);
@@ -92,113 +176,42 @@ export function makeRemoteCopilotProfile(opts: {
 
   return {
     id: opts.id,
-    displayName:
-      opts.displayName ?? `GitHub Copilot (Remote: ${opts.id.replace(/^copilot-remote-/, "")})`,
+    displayName: opts.displayName ?? remoteDisplayName(opts.id),
     defaultModel: opts.defaultModel,
 
     spawn(): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable> {
-      const stdinPT = new PassThrough();
-      const stdoutPT = new PassThrough();
-      const stderrPT = new PassThrough();
-      const emitter = new EventEmitter();
-
-      let killed = false;
-      let attachedWs: WebSocket | undefined;
-      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-
-      const fake = Object.assign(emitter, {
-        stdin: stdinPT as NodeWritable,
-        stdout: stdoutPT as NodeReadable,
-        stderr: stderrPT as NodeReadable,
-        get killed() {
-          return killed;
-        },
-        kill() {
-          if (killed) return;
-          killed = true;
-          // Dequeue from waiters if we haven't connected yet.
-          const idx = waiters.indexOf(connect);
-          if (idx >= 0) waiters.splice(idx, 1);
-          if (timeoutHandle) {
-            clearTimeout(timeoutHandle);
-            timeoutHandle = undefined;
+      const { fake, attach } = makeFakeProcess({
+        id: opts.id,
+        onKill() {
+          const idx = waiters.findIndex((w) => w.connect === attach);
+          if (idx >= 0) {
+            const entry = waiters[idx];
+            if (entry) clearTimeout(entry.timeout);
+            waiters.splice(idx, 1);
           }
-          if (attachedWs && attachedWs.readyState === WebSocket.OPEN) {
-            attachedWs.close(1000, "disposed");
-          }
-          stdinPT.destroy();
-          stdoutPT.push(null);
         },
       });
 
-      const connect: Connector = (ws: WebSocket) => {
-        if (killed) {
-          // Runtime was disposed before we got a connection.
-          ws.close(1000, "runtime already disposed");
-          return;
-        }
-        if (timeoutHandle) {
-          clearTimeout(timeoutHandle);
-          timeoutHandle = undefined;
-        }
-        attachedWs = ws;
-
-        // stdin PassThrough → WebSocket
-        stdinPT.on("data", (chunk: Buffer) => {
-          if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
-        });
-        stdinPT.on("end", () => {
-          // Propagate graceful shutdown to remote side.
-          if (ws.readyState === WebSocket.OPEN) ws.close(1000, "stdin ended");
-        });
-
-        // WebSocket → stdout PassThrough
-        ws.on("message", (data) => {
-          if (!killed) {
-            const buf = data instanceof Buffer ? data : Buffer.from(data as unknown as ArrayBuffer);
-            stdoutPT.push(buf);
-          }
-        });
-
-        // Post-connect WS errors: do NOT emit "error" (would be unhandled
-        // after AgentRuntime's once("error") fires). Translate to exit.
-        ws.on("error", () => {
-          if (!killed) {
-            stdoutPT.push(null);
-            fake.emit("exit", 1, null);
-          }
-        });
-
-        ws.on("close", (code) => {
-          if (!killed) {
-            stdoutPT.push(null);
-            fake.emit("exit", code === 1000 ? 0 : 1, null);
-          }
-        });
-      };
-
       const available = pendingConnections.shift();
       if (available) {
-        connect(available);
+        attach(available);
       } else {
-        waiters.push(connect);
-        timeoutHandle = setTimeout(() => {
-          const idx = waiters.indexOf(connect);
+        const timeout = setTimeout(() => {
+          const idx = waiters.findIndex((w) => w.connect === attach);
           if (idx >= 0) waiters.splice(idx, 1);
-          if (!killed) {
-            // Emit "error" here — this fires before init completes, so the
-            // AgentRuntime's errorWaiter (once("error")) will handle it.
+          if (!fake.killed) {
             fake.emit(
               "error",
               new Error(
                 `Remote agent '${opts.id}' did not connect within ` +
                   `${CONNECT_TIMEOUT_MS / 1000}s. ` +
-                  `Ensure the bridge script is running and can reach this server.`
+                  `Ensure the bridge script is running and pointed at this server.`
               )
             );
           }
         }, CONNECT_TIMEOUT_MS);
-        if (typeof timeoutHandle.unref === "function") timeoutHandle.unref();
+        if (typeof timeout.unref === "function") timeout.unref();
+        waiters.push({ connect: attach, timeout });
       }
 
       return fake as unknown as ChildProcessByStdio<
@@ -209,8 +222,89 @@ export function makeRemoteCopilotProfile(opts: {
     },
 
     whoami(): Promise<AgentIdentity | null> {
-      // Cannot read remote CLI config from this host.
       return Promise.resolve(null);
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Client mode: seam-acp dials out; bridge hosts the WebSocket server.
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates an AgentProfile that connects outbound as a WebSocket client to a
+ * bridge script running on the remote machine. The remote machine runs
+ * `scripts/remote-agent-bridge.mjs --server <port> <token>` and exposes it via
+ * a Cloudflare Tunnel (or any other means) so seam-acp can reach it.
+ *
+ * Use this mode when you prefer to run `cloudflared` on the remote machine
+ * rather than on the seam-acp server, and seam-acp has no open inbound ports.
+ */
+export function makeRemoteCopilotClientProfile(opts: {
+  id: string;
+  displayName?: string;
+  /** WebSocket URL to connect to, e.g. `wss://random.trycloudflare.com`. */
+  wsUrl: string;
+  /** Shared secret — sent as `Authorization: Bearer <token>`. */
+  token: string;
+  defaultModel: string;
+}): AgentProfile {
+  return {
+    id: opts.id,
+    displayName: opts.displayName ?? remoteDisplayName(opts.id),
+    defaultModel: opts.defaultModel,
+
+    spawn(): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable> {
+      let connected = false;
+
+      const { fake, attach } = makeFakeProcess({
+        id: opts.id,
+        onKill() {
+          ws.terminate();
+        },
+      });
+
+      const ws = new WebSocket(opts.wsUrl, {
+        headers: { Authorization: `Bearer ${opts.token}` },
+      });
+
+      ws.on("open", () => {
+        connected = true;
+        attach(ws);
+      });
+
+      ws.on("error", (err) => {
+        if (!fake.killed) {
+          if (!connected) {
+            // Pre-connect failure: surface as spawn error so AgentRuntime's
+            // errorWaiter catches it.
+            fake.emit(
+              "error",
+              new Error(
+                `Remote agent '${opts.id}' connection failed: ${err.message}`
+              )
+            );
+          }
+          // Post-connect errors are handled by the attach() ws.on("error")
+          // listener which translates them to "exit".
+        }
+      });
+
+      return fake as unknown as ChildProcessByStdio<
+        NodeWritable,
+        NodeReadable,
+        NodeReadable
+      >;
+    },
+
+    whoami(): Promise<AgentIdentity | null> {
+      return Promise.resolve(null);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Back-compat alias — existing code that calls makeRemoteCopilotProfile keeps
+// working; it maps to the server mode.
+// ---------------------------------------------------------------------------
+export const makeRemoteCopilotProfile = makeRemoteCopilotServerProfile;

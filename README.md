@@ -47,7 +47,7 @@ Copy `.env.example` to `.env` and fill it in.
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
 | `CLAUDE_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `claude-<id>` profile pinned to its own `CLAUDE_CONFIG_DIR`. See "Multiple Claude accounts" below. |
-| `REMOTE_COPILOT_PROFILES` | no | Register Copilot profiles running on remote machines via WebSocket bridge. Format: `id:port:token` (comma-separated). Each entry starts a local WS server and registers a `copilot-remote-<id>` profile. See [docs/remote-agent.md](docs/remote-agent.md). |
+| `REMOTE_COPILOT_PROFILES` | no | Register Copilot profiles running on remote machines via WebSocket bridge. Two formats: `id:port:token` (server mode — seam-acp hosts WS server) or `id:wss://url:token` (client mode — seam-acp dials out). See [docs/remote-agent.md](docs/remote-agent.md). |
 | `TURN_TIMEOUT_SECONDS` | no | Default 900 |
 | `LOG_LEVEL` | no | `fatal` / `error` / `warn` / `info` / `debug` / `trace` |
 | `HEALTH_PORT` | no | Default 3000 — exposes `GET /health` |
@@ -242,22 +242,23 @@ reports which profile id you're on.
 
 ### Remote agent profiles (Mac / off-server machine)
 
-You can run an agent CLI on a **separate machine** — one that cannot accept inbound connections — and expose it as a regular agent profile. This uses a WebSocket relay bridge that the remote machine connects to outbound.
+You can run an agent CLI on a **separate machine** — one that cannot accept inbound connections — and expose it as a regular agent profile via a WebSocket bridge. Two modes are supported:
 
-Typical use case: a Mac laptop with `copilot` authenticated under a personal account, sitting behind NAT, that cannot be SSH'd into.
+- **Server mode**: seam-acp hosts the WS server (and `cloudflared`); remote machine dials in outbound.
+- **Client mode**: remote machine hosts the WS server (and `cloudflared`); seam-acp dials out.
 
 ```sh
-# .env on the seam-acp server
+# Server mode (.env on seam-acp):
 REMOTE_COPILOT_PROFILES=mac:9999:your-secret-token
+# Run on remote machine: node scripts/remote-agent-bridge.mjs wss://tunnel-url your-token
+
+# Client mode (.env on seam-acp):
+REMOTE_COPILOT_PROFILES=mac:wss://random.trycloudflare.com:your-secret-token
+# Run on remote machine: node scripts/remote-agent-bridge.mjs --server 9999 your-token
+#   then: cloudflared tunnel --url ws://localhost:9999
 ```
 
-The profile appears in `/seam agent` as `copilot-remote-mac`. On the Mac, run the bridge script:
-
-```sh
-node scripts/remote-agent-bridge.mjs wss://agent.yourdomain.com your-secret-token
-```
-
-For full setup instructions including Cloudflare Tunnel (recommended — no open inbound ports on either machine), see **[docs/remote-agent.md](docs/remote-agent.md)**.
+The profile appears in `/seam agent` as `copilot-remote-mac`. Neither machine needs an open inbound port — both modes use Cloudflare Tunnel for the outbound-only connection. See **[docs/remote-agent.md](docs/remote-agent.md)** for full setup instructions.
 
 ### MCP servers
 

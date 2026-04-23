@@ -159,42 +159,81 @@ const Schema = z.object({
     }),
 
   /**
-   * Comma-separated list of remote Copilot profiles, each of the form
-   * `id:port:token`. Each entry starts a WebSocket server on the given port
-   * and registers an agent profile named `copilot-remote-<id>`. The remote
-   * machine runs `scripts/remote-agent-bridge.mjs` to connect back.
-   * Example:
-   *   REMOTE_COPILOT_PROFILES=mac:9999:mysecrettoken
-   * Tokens may contain colons.
+   * Comma-separated list of remote Copilot profiles. Each entry registers an
+   * agent profile named `copilot-remote-<id>` that pipes ACP over a WebSocket
+   * to a bridge script running on the remote machine.
+   *
+   * Two modes are supported, distinguished by the format:
+   *
+   * **Server mode** (seam-acp hosts the WS server; bridge dials in):
+   *   `id:port:token`
+   *   Example: `mac:9999:mysecrettoken`
+   *   Run on the remote machine:
+   *     `node scripts/remote-agent-bridge.mjs wss://<seam-acp-host>:9999 mysecrettoken`
+   *
+   * **Client mode** (bridge hosts the WS server; seam-acp dials out):
+   *   `id:wss://url:token`   (url starts with ws:// or wss://)
+   *   Example: `mac:wss://random.trycloudflare.com:mysecrettoken`
+   *   Run on the remote machine:
+   *     `node scripts/remote-agent-bridge.mjs --server 9999 mysecrettoken`
+   *   Then expose with: `cloudflared tunnel --url ws://localhost:9999`
+   *
+   * Multiple entries are comma-separated. Token may contain colons in server
+   * mode; in client mode the token must not contain colons (it is split on the
+   * last colon after the URL).
    */
   REMOTE_COPILOT_PROFILES: z
     .string()
     .default("")
     .transform((v) => {
-      const out: Array<{ id: string; wsPort: number; token: string }> = [];
+      const out: Array<
+        | { id: string; mode: "server"; wsPort: number; token: string }
+        | { id: string; mode: "client"; wsUrl: string; token: string }
+      > = [];
       for (const entry of v.split(",").map((s) => s.trim()).filter(Boolean)) {
         const first = entry.indexOf(":");
-        const second = entry.indexOf(":", first + 1);
-        if (first <= 0 || second <= first + 1 || second === entry.length - 1) {
+        if (first <= 0) {
           throw new Error(
-            `REMOTE_COPILOT_PROFILES entry must be 'id:port:token' (got '${entry}')`
+            `REMOTE_COPILOT_PROFILES entry must be 'id:port:token' or 'id:wsUrl:token' (got '${entry}')`
           );
         }
         const id = entry.slice(0, first).trim();
-        const portStr = entry.slice(first + 1, second).trim();
-        const token = entry.slice(second + 1);
-        const wsPort = Number(portStr);
         if (!/^[a-z0-9][a-z0-9-]*$/i.test(id)) {
           throw new Error(
             `REMOTE_COPILOT_PROFILES id '${id}' must be alphanumeric (dashes allowed)`
           );
         }
-        if (!Number.isInteger(wsPort) || wsPort < 1 || wsPort > 65535) {
-          throw new Error(
-            `REMOTE_COPILOT_PROFILES port '${portStr}' must be a valid port number`
-          );
+        const rest = entry.slice(first + 1);
+
+        if (rest.startsWith("ws://") || rest.startsWith("wss://")) {
+          // Client mode: id:wsUrl:token — split on last colon for token.
+          const lastColon = rest.lastIndexOf(":");
+          if (lastColon <= "wss://".length || lastColon === rest.length - 1) {
+            throw new Error(
+              `REMOTE_COPILOT_PROFILES client entry must be 'id:wsUrl:token' (got '${entry}')`
+            );
+          }
+          const wsUrl = rest.slice(0, lastColon);
+          const token = rest.slice(lastColon + 1);
+          out.push({ id, mode: "client", wsUrl, token });
+        } else {
+          // Server mode: id:port:token — token may contain colons.
+          const second = rest.indexOf(":");
+          if (second <= 0 || second === rest.length - 1) {
+            throw new Error(
+              `REMOTE_COPILOT_PROFILES server entry must be 'id:port:token' (got '${entry}')`
+            );
+          }
+          const portStr = rest.slice(0, second).trim();
+          const token = rest.slice(second + 1);
+          const wsPort = Number(portStr);
+          if (!Number.isInteger(wsPort) || wsPort < 1 || wsPort > 65535) {
+            throw new Error(
+              `REMOTE_COPILOT_PROFILES port '${portStr}' must be a valid port number`
+            );
+          }
+          out.push({ id, mode: "server", wsPort, token });
         }
-        out.push({ id, wsPort, token });
       }
       return out;
     }),

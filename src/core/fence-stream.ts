@@ -2,22 +2,28 @@
  * Streaming code-fence extractor.
  *
  * Feed text chunks in as they arrive from the agent. The extractor
- * separates the stream into:
- *   - "prose": text that lives outside any code fence; goes to chat
- *     through the normal chunk/flush pipeline.
- *   - "completed fences": closed ```lang ... ``` blocks, returned as
- *     uploadable file payloads.
+ * produces an in-order stream of segments:
+ *   - { kind: 'prose', text }        text outside any fence
+ *   - { kind: 'fence-open' }         opening ``` was just consumed
+ *   - { kind: 'fence-close', fence } closing ``` was just consumed
  *
- * The fence opener and closer themselves are NOT included in either
- * stream — they are consumed. This means a Discord user sees the
- * model's prose plus file attachments, never raw fence syntax.
+ * The opening and closing backticks themselves are NOT included in any
+ * prose segment. Fence content is captured internally and returned in
+ * the `fence-close` segment.
+ *
+ * Within-chunk ordering is preserved: a single chunk containing
+ * `prose1 [fence] prose2` produces three segments in that order.
  *
  * Design notes:
  *   - Pure state machine. No I/O, no logging.
  *   - Robust to fences split across chunk boundaries (the opener
  *     ``` is buffered byte-by-byte).
  *   - `flush()` at end-of-turn returns any unclosed fence as
- *     `unclosed`, so the caller can post a notice and discard.
+ *     `unclosed`, so the caller can decide what to do (emit with a
+ *     notice, drop, etc).
+ *   - `forceClose()` takes a snapshot of the current open fence and
+ *     resets the state to outside-fence; subsequent `feed()` bytes
+ *     flow as prose. Used by the watchdog.
  */
 
 import { LANG_EXT, EXT_MIME } from "./fence-mime.js";
@@ -35,14 +41,19 @@ export interface CompletedFence {
   openedAtMs: number;
 }
 
+export type Segment =
+  | { kind: "prose"; text: string }
+  | { kind: "fence-open" }
+  | { kind: "fence-close"; fence: CompletedFence };
+
 export interface FeedResult {
-  /** Text that should be forwarded to the chat-text pipeline. */
-  prose: string;
-  /** Fences that closed during this feed. */
-  fences: CompletedFence[];
+  /** Segments in stream order. */
+  segments: Segment[];
 }
 
-export interface FlushResult extends FeedResult {
+export interface FlushResult {
+  /** Trailing prose / fence-close segments produced by draining buffered state. */
+  segments: Segment[];
   /** A fence that was open when flush() was called, if any. */
   unclosed: CompletedFence | null;
 }
@@ -76,8 +87,9 @@ function makeState(): State {
 }
 
 /**
- * Streaming fence-to-file extractor. Construct one per turn; call
- * `feed()` for every text chunk and `flush()` at end-of-turn.
+ * Streaming fence extractor. Construct one per turn; call `feed()` for
+ * every text chunk and `flush()` at end-of-turn. Use `forceClose()` to
+ * abort a stuck open fence (e.g. watchdog trip).
  */
 export class FenceStream {
   private state: State = makeState();
@@ -85,6 +97,20 @@ export class FenceStream {
   /** True iff a fence is currently open. */
   get inFence(): boolean {
     return this.state.inFence;
+  }
+
+  /** Current open fence's language tag (empty string if none / not yet known). */
+  currentFenceLang(): string {
+    if (!this.state.inFence) return "";
+    return this.state.fenceLangComplete ? this.state.fenceLang : "";
+  }
+
+  /** Bytes captured inside the currently open fence (0 if none). */
+  currentFenceContentLength(): number {
+    if (!this.state.inFence) return 0;
+    return this.state.fenceLangComplete
+      ? this.state.fenceInner.length
+      : this.state.fenceLangBuf.length;
   }
 
   /** Time in ms since the current open fence started, or 0 if none. */
@@ -95,7 +121,15 @@ export class FenceStream {
 
   /** Feed a chunk of streamed agent text. */
   feed(text: string, now: number = Date.now()): FeedResult {
-    const out: FeedResult = { prose: "", fences: [] };
+    const segments: Segment[] = [];
+    let proseBuf = "";
+    const flushProse = () => {
+      if (proseBuf.length > 0) {
+        segments.push({ kind: "prose", text: proseBuf });
+        proseBuf = "";
+      }
+    };
+
     let i = 0;
     while (i < text.length) {
       const c = text[i];
@@ -105,16 +139,20 @@ export class FenceStream {
           // Flip state. Don't emit the backticks.
           this.state.backtickRun = 0;
           if (!this.state.inFence) {
+            // Opening fence — flush any pending prose first so segments
+            // stay ordered, then announce open.
+            flushProse();
             this.state.inFence = true;
             this.state.fenceLangBuf = "";
             this.state.fenceLangComplete = false;
             this.state.fenceLang = "";
             this.state.fenceInner = "";
             this.state.fenceOpenedAtMs = now;
+            segments.push({ kind: "fence-open" });
           } else {
             // Closing fence — emit and reset.
             const fence = this.finalizeFence();
-            out.fences.push(fence);
+            segments.push({ kind: "fence-close", fence });
           }
         }
         i += 1;
@@ -129,7 +167,7 @@ export class FenceStream {
         if (this.state.inFence) {
           this.appendInner(stray);
         } else {
-          out.prose += stray;
+          proseBuf += stray;
         }
       }
 
@@ -148,31 +186,53 @@ export class FenceStream {
           this.state.fenceInner += c;
         }
       } else {
-        out.prose += c;
+        proseBuf += c;
       }
       i += 1;
     }
-    return out;
+
+    flushProse();
+    return { segments };
   }
 
-  /** Drain any trailing 1–2 backticks as content (they aren't a fence). */
+  /**
+   * Drain any trailing 1–2 backticks as content (they aren't a fence).
+   * If a fence is still open, its snapshot is returned as `unclosed`
+   * and internal state is reset so the instance is reusable.
+   */
   flush(): FlushResult {
-    const out: FlushResult = { prose: "", fences: [], unclosed: null };
+    const segments: Segment[] = [];
     if (this.state.backtickRun > 0) {
       const stray = "`".repeat(this.state.backtickRun);
       this.state.backtickRun = 0;
       if (this.state.inFence) {
         this.appendInner(stray);
       } else {
-        out.prose += stray;
+        segments.push({ kind: "prose", text: stray });
       }
     }
+    let unclosed: CompletedFence | null = null;
     if (this.state.inFence) {
-      out.unclosed = this.snapshotOpenFence();
-      // Reset so the instance is reusable.
+      unclosed = this.snapshotOpenFence();
       this.state = makeState();
     }
-    return out;
+    return { segments, unclosed };
+  }
+
+  /**
+   * Snapshot the currently open fence and reset to outside-fence so
+   * subsequent `feed()` bytes flow as prose. Returns null if no fence
+   * is open.
+   */
+  forceClose(): CompletedFence | null {
+    if (!this.state.inFence) return null;
+    const snap = this.snapshotOpenFence();
+    // Preserve any pending backtickRun (extremely unlikely to matter,
+    // but keeps semantics predictable for callers).
+    const backtickRun = this.state.backtickRun;
+    this.state = makeState();
+    this.state.backtickRun = backtickRun;
+    return snap;
   }
 
   private appendInner(s: string): void {

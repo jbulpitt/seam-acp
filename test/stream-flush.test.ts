@@ -120,3 +120,117 @@ describe("splitForFlush — forced", () => {
     }
   });
 });
+
+import { findFirstUnsafeIndex } from "../src/core/stream-flush.js";
+
+describe("findFirstUnsafeIndex", () => {
+  it("returns -1 for plain prose", () => {
+    expect(findFirstUnsafeIndex("just some prose")).toBe(-1);
+  });
+  it("returns -1 when all links are closed", () => {
+    expect(
+      findFirstUnsafeIndex("see [here](https://example.com) for more")
+    ).toBe(-1);
+  });
+  it("flags an unclosed link text", () => {
+    const buf = "prose [Some Link Text";
+    expect(findFirstUnsafeIndex(buf)).toBe(buf.indexOf("["));
+  });
+  it("flags an unclosed url after ](", () => {
+    const buf = "prose [Some Link](https://exam";
+    expect(findFirstUnsafeIndex(buf)).toBe(buf.indexOf("["));
+  });
+  it("allows balanced parens inside url", () => {
+    const buf =
+      "see [x](https://en.wikipedia.org/wiki/Function_(mathematics)) ok";
+    expect(findFirstUnsafeIndex(buf)).toBe(-1);
+  });
+  it("allows link title inside same outer parens", () => {
+    expect(
+      findFirstUnsafeIndex('see [x](https://example.com "a title") ok')
+    ).toBe(-1);
+  });
+  it("flags an unclosed link with title still open", () => {
+    const buf = 'see [x](https://example.com "open title';
+    expect(findFirstUnsafeIndex(buf)).toBe(buf.indexOf("["));
+  });
+  it("ignores escaped brackets", () => {
+    expect(findFirstUnsafeIndex("prose \\[ not a link")).toBe(-1);
+  });
+  it("does NOT escape when backslash itself is escaped", () => {
+    const buf = "prose \\\\[Real Link";
+    expect(findFirstUnsafeIndex(buf)).toBe(buf.indexOf("[Real"));
+  });
+  it("treats `[text]` not followed by `(` as plain text", () => {
+    expect(findFirstUnsafeIndex("see [bracketed] later")).toBe(-1);
+  });
+  it("uses the `!` as unsafe start for an open image", () => {
+    const buf = "alt ![image desc";
+    expect(findFirstUnsafeIndex(buf)).toBe(buf.indexOf("!"));
+  });
+  it("reports the OUTERMOST open link when multiple are open", () => {
+    const buf = "first [unclosed and then [also unclosed";
+    expect(findFirstUnsafeIndex(buf)).toBe(buf.indexOf("[unclosed"));
+  });
+});
+
+describe("splitForFlush — link-aware (forced)", () => {
+  it("under-cap with open link sends safe prefix and keeps tail", () => {
+    const buf = "Hello world. See [Some Link](https://exam";
+    const out = splitForFlush(buf, { maxLen: 200, force: true });
+    expect(out).toEqual({
+      send: "Hello world. See",
+      keep: "[Some Link](https://exam",
+    });
+  });
+  it("under-cap with link starting at index 0 returns null (waits)", () => {
+    const buf = "[Some Link](https://exam";
+    expect(splitForFlush(buf, { maxLen: 200, force: true })).toBeNull();
+  });
+  it("under-cap with closed links sends whole buffer", () => {
+    const buf = "See [a](https://x) and [b](https://y) ok";
+    const out = splitForFlush(buf, { maxLen: 200, force: true });
+    expect(out).toEqual({ send: buf, keep: "" });
+  });
+  it("allowUnsafeCut bypasses the safety check", () => {
+    const buf = "[Some Link](https://exam";
+    const out = splitForFlush(buf, {
+      maxLen: 200,
+      force: true,
+      allowUnsafeCut: true,
+    });
+    expect(out).toEqual({ send: buf, keep: "" });
+  });
+  it("over-cap caps clean-split window at unsafeIdx", () => {
+    const head = "A".repeat(50) + "\n";
+    const buf = head + "[Open Link](https://stillopen";
+    const out = splitForFlush(buf, { maxLen: 80, force: true });
+    expect(out).not.toBeNull();
+    expect(out!.send).toBe(head.replace(/\s+$/, ""));
+    expect(out!.keep).toBe("[Open Link](https://stillopen");
+  });
+  it("end-of-turn allowUnsafeCut drains everything including open link", () => {
+    const buf = "prose [Open Link](https://never-closed";
+    const out = splitForFlush(buf, {
+      maxLen: 200,
+      force: true,
+      allowUnsafeCut: true,
+    });
+    expect(out).toEqual({ send: buf, keep: "" });
+  });
+});
+
+describe("splitForFlush — link-aware (soft)", () => {
+  it("refuses a soft cut that would split inside an open link", () => {
+    const buf = "Para [open\n\nlink keeps going...";
+    expect(splitForFlush(buf, { maxLen: 200, force: false })).toBeNull();
+  });
+  it("allows a soft cut when the open link is AFTER the paragraph break", () => {
+    const buf = "Para one done.\n\nNew para [open link...";
+    const out = splitForFlush(buf, { maxLen: 200, force: false });
+    expect(out).toEqual({
+      send: "Para one done.",
+      keep: "New para [open link...",
+    });
+  });
+});

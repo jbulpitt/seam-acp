@@ -28,6 +28,12 @@ import type { DiscordAdapter } from "./adapter.js";
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
+// Maximum total size of an inline-rendered fence message
+// (```lang\n...\n``` plus optional notice). Fences whose rendered
+// inline form would exceed this are uploaded as attachments instead.
+// Discord's hard limit per message is 2000 chars; 1900 leaves headroom
+// for the optional `_(notice)_` paragraph and a tiny safety margin.
+const ORCH_INLINE_FENCE_MAX = 1900;
 
 /**
  * Glues the Discord adapter, the SessionRouter, and the agent runtimes
@@ -130,13 +136,14 @@ export class Orchestrator {
     let textSent = false;
     let totalAgentChars = 0;
     // Streaming fence extractor: pulls every ```lang ... ``` block out
-    // of the agent's text and turns each into a Discord file attachment
-    // so fenced code never has to render in chat.
+    // of the agent's text and emits ordered segments. Fence-close
+    // segments are routed to inline-or-attachment rendering based on
+    // size; bare-filename fences resolve to a host-file upload.
     const fenceStream = new FenceStream();
     let fenceCounter = 0;
     // Watchdog: if a fence stays open longer than this with no closer,
-    // we drop the bytes to avoid runaway accumulation. Checked on each
-    // chunk + at end-of-turn.
+    // we emit whatever's accumulated and treat the fence as closed so
+    // subsequent bytes flow as prose. Checked on each chunk.
     const FENCE_MAX_OPEN_MS = 60_000;
     let fenceWatchdogTripped = false;
     // Per-turn timing for diagnosing slow turns. Set when we send the
@@ -150,12 +157,13 @@ export class Orchestrator {
     // would be its own message).
     const HARD_MAX = 1800;
     const SOFT_MIN = 800;
-    const drainBuffer = async (force: boolean) => {
+    const drainBuffer = async (force: boolean, allowUnsafeCut = false) => {
       while (textBuffer) {
         const split = splitForFlush(textBuffer, {
           maxLen: HARD_MAX,
           softMin: SOFT_MIN,
           force,
+          allowUnsafeCut,
         });
         if (!split) return;
         textBuffer = split.keep;
@@ -168,7 +176,9 @@ export class Orchestrator {
       }
     };
     const flushChunks = async () => {
-      await drainBuffer(true);
+      // End-of-turn: must drain everything. An open link will never be
+      // closed, so allow unsafe cuts here.
+      await drainBuffer(true, true);
     };
     /**
      * Idle-flush timer: if text has been buffered for IDLE_FLUSH_MS
@@ -202,7 +212,10 @@ export class Orchestrator {
       }
       idleTimer = setTimeout(() => {
         idleTimer = undefined;
-        if (textBuffer) void drainBuffer(true);
+        // Idle for IDLE_FLUSH_MS — any open markdown link is probably
+        // never going to close. Allow unsafe cuts so we don't strand
+        // the buffer waiting for a `)` that won't come.
+        if (textBuffer) void drainBuffer(true, true);
       }, IDLE_FLUSH_MS);
     };
     const maybeFlush = () => {
@@ -329,15 +342,36 @@ export class Orchestrator {
               }
             }
             totalAgentChars += event.text.length;
-            // Run text through the fence extractor: prose flows into the
-            // chat pipeline, completed fences become file uploads.
+            // Run text through the fence extractor and process each
+            // ordered segment. Prose flows into the chat pipeline;
+            // fence-open forces a flush of preceding prose; fence-close
+            // routes to inline-or-attachment rendering based on size.
             const fenceResult = fenceStream.feed(event.text);
-            for (const fence of fenceResult.fences) {
-              fenceCounter += 1;
-              await this.uploadFenceAsFile(channel, fence, fenceCounter);
-              textSent = true;
+            for (const seg of fenceResult.segments) {
+              if (seg.kind === "prose") {
+                if (seg.text) {
+                  textBuffer += seg.text;
+                  maybeFlush();
+                  armIdleFlush();
+                }
+              } else if (seg.kind === "fence-open") {
+                // Commit any pending prose before the fence so message
+                // ordering matches the agent's stream order.
+                cancelFlushTimer();
+                await drainBuffer(true);
+              } else {
+                // fence-close: emit as inline message or attachment.
+                fenceCounter += 1;
+                await this.emitClosedFence(channel, seg.fence, fenceCounter, {
+                  preferredRoot: record.repoPath,
+                });
+                textSent = true;
+                typingDone = true;
+              }
             }
-            // Watchdog: drop the bytes if a fence has been open too long.
+            // Watchdog: if a fence has been open too long, snapshot what
+            // we have, emit it with a notice, and treat the fence as
+            // closed so subsequent bytes flow as prose.
             if (
               !fenceWatchdogTripped &&
               fenceStream.inFence &&
@@ -346,43 +380,20 @@ export class Orchestrator {
               fenceWatchdogTripped = true;
               this.logger.warn(
                 { session: record.id },
-                "open fence exceeded watchdog timeout; dropping bytes"
+                "open fence exceeded watchdog timeout; emitting partial content"
               );
-              try {
-                await this.adapter.sendMessage(
-                  channel,
-                  "⚠️ Agent opened a code block that never closed — dropping its contents."
-                );
+              const snap = fenceStream.forceClose();
+              if (snap) {
+                fenceCounter += 1;
+                await this.emitClosedFence(channel, snap, fenceCounter, {
+                  preferredRoot: record.repoPath,
+                  notice:
+                    "_(fence exceeded the watchdog timeout and was closed early)_",
+                });
                 textSent = true;
-              } catch (err) {
-                this.logger.warn({ err }, "fence watchdog notice failed");
+                typingDone = true;
               }
-              try {
-                await runtime.cancel();
-              } catch (err) {
-                this.logger.warn({ err }, "cancel after fence watchdog failed");
-              }
-              return;
             }
-            if (!fenceResult.prose) {
-              // Buffered into a fence; nothing to flush right now.
-              if (firstChunkAt === undefined) {
-                firstChunkAt = Date.now();
-                this.logger.info(
-                  {
-                    ttftMs: firstChunkAt - turnStartedAt,
-                    session: record.id,
-                  },
-                  "agent first text chunk"
-                );
-              }
-              return;
-            }
-            textBuffer += fenceResult.prose;
-            maybeFlush();
-            armIdleFlush();
-            // Track time-to-first-chunk so we can tell whether the
-            // agent or the orchestrator is responsible for slow turns.
             if (firstChunkAt === undefined) {
               firstChunkAt = Date.now();
               this.logger.info(
@@ -455,14 +466,23 @@ export class Orchestrator {
       const result = await raceWithTimeout(turnPromise, timeoutMs);
 
       cancelFlushTimer();
-      // Drain the fence extractor: any final prose enters the chat
-      // pipeline; an unclosed fence is dropped with a notice.
+      // Drain the fence extractor: any final segments enter the chat
+      // pipeline; an unclosed fence is emitted with a notice rather
+      // than dropped.
       const tail = fenceStream.flush();
-      if (tail.prose) textBuffer += tail.prose;
-      for (const fence of tail.fences) {
-        fenceCounter += 1;
-        await this.uploadFenceAsFile(channel, fence, fenceCounter);
-        textSent = true;
+      for (const seg of tail.segments) {
+        if (seg.kind === "prose") {
+          if (seg.text) textBuffer += seg.text;
+        } else if (seg.kind === "fence-open") {
+          // Shouldn't appear in flush output, but handle defensively.
+          await drainBuffer(true, true);
+        } else {
+          fenceCounter += 1;
+          await this.emitClosedFence(channel, seg.fence, fenceCounter, {
+            preferredRoot: record.repoPath,
+          });
+          textSent = true;
+        }
       }
       if (tail.unclosed && !fenceWatchdogTripped) {
         this.logger.warn(
@@ -471,17 +491,16 @@ export class Orchestrator {
             lang: tail.unclosed.lang,
             chars: tail.unclosed.content.length,
           },
-          "agent ended turn with an unclosed code fence; dropping"
+          "agent ended turn with an unclosed code fence; emitting partial"
         );
-        try {
-          await this.adapter.sendMessage(
-            channel,
-            "⚠️ Agent ended with an unclosed code block — dropped its contents."
-          );
-          textSent = true;
-        } catch (err) {
-          this.logger.warn({ err }, "unclosed-fence notice failed");
-        }
+        // Drain any prose preceding the unclosed fence first.
+        await drainBuffer(true, true);
+        fenceCounter += 1;
+        await this.emitClosedFence(channel, tail.unclosed, fenceCounter, {
+          preferredRoot: record.repoPath,
+          notice: "_(fence was not closed by the agent)_",
+        });
+        textSent = true;
       }
       await flushChunks();
       this.logger.info(
@@ -1128,7 +1147,8 @@ export class Orchestrator {
    * Symlinks are followed and the realpath is re-checked.
    */
   private async resolveAllowedHostFile(
-    requested: string
+    requested: string,
+    opts: { preferredRoot?: string | null } = {}
   ): Promise<{ realPath: string; size: number } | null> {
     const cleaned = requested.trim().replace(/^"|"$/g, "");
     if (!cleaned) return null;
@@ -1138,21 +1158,37 @@ export class Orchestrator {
       ...this.config.ATTACH_ROOTS,
     ].map((p) => path.resolve(p));
 
-    const candidate = path.isAbsolute(cleaned)
-      ? path.resolve(cleaned)
-      : path.resolve(allowedRoots[0] ?? this.config.REPOS_ROOT, cleaned);
-
-    let real: string;
-    let stat: fs.Stats;
-    try {
-      real = await fsp.realpath(candidate);
-      stat = await fsp.stat(real);
-    } catch {
-      return null;
+    // For relative paths, try each candidate base in order until one
+    // resolves to an existing regular file inside an allowed root:
+    //   1. The session's repoPath (the thread's current repo) if any.
+    //   2. Each allowed root in order.
+    // For absolute paths, resolve directly.
+    const candidates: string[] = [];
+    if (path.isAbsolute(cleaned)) {
+      candidates.push(path.resolve(cleaned));
+    } else {
+      const bases: string[] = [];
+      if (opts.preferredRoot) bases.push(path.resolve(opts.preferredRoot));
+      for (const r of allowedRoots) {
+        if (!bases.includes(r)) bases.push(r);
+      }
+      for (const base of bases) candidates.push(path.resolve(base, cleaned));
     }
-    if (!stat.isFile()) return null;
-    if (!allowedRoots.some((r) => isWithinRoot(real, r))) return null;
-    return { realPath: real, size: stat.size };
+
+    for (const candidate of candidates) {
+      let real: string;
+      let stat: fs.Stats;
+      try {
+        real = await fsp.realpath(candidate);
+        stat = await fsp.stat(real);
+      } catch {
+        continue;
+      }
+      if (!stat.isFile()) continue;
+      if (!allowedRoots.some((r) => isWithinRoot(real, r))) continue;
+      return { realPath: real, size: stat.size };
+    }
+    return null;
   }
 
   private async cmdAttach(i: ChatInputCommandInteraction): Promise<void> {
@@ -1360,64 +1396,138 @@ export class Orchestrator {
   }
 
   /**
-   * Upload a code fence captured by the streaming extractor as a
-   * Discord file attachment. Failures are logged, never thrown.
+   * Render a closed fence to the chat thread. Routes between an inline
+   * markdown message and a file attachment based on the rendered inline
+   * size; bare-filename fences that resolve to a real host file under
+   * the allowed roots are uploaded as the actual file.
+   *
+   * Failures are logged, never thrown.
    */
-  private async uploadFenceAsFile(
+  private async emitClosedFence(
     channel: ChannelRef,
     fence: CompletedFence,
-    counter: number
+    counter: number,
+    opts: { notice?: string; preferredRoot?: string | null } = {}
   ): Promise<void> {
-    if (!this.adapter.sendFile) {
-      // No file support — fall back to posting the fenced block inline.
-      const fenceText = `\`\`\`${fence.lang}\n${fence.content}\n\`\`\``;
-      try {
-        await this.adapter.sendMessage(channel, fenceText);
-      } catch (err) {
-        this.logger.warn({ err }, "fence inline fallback failed");
-      }
+    // Inline-rendered total size = ```lang\n<content>\n``` plus optional
+    // trailing notice on its own paragraph.
+    const inlineMessageLen =
+      3 + fence.lang.length + 1 + fence.content.length + 1 + 3 +
+      (opts.notice ? 2 + opts.notice.length : 0);
+    const fitsInline = inlineMessageLen <= ORCH_INLINE_FENCE_MAX;
+
+    // Bare-filename short-circuit (only meaningful for small content; a
+    // long fence can't be a single-line filename anyway).
+    if (fitsInline) {
+      const sentAsFile = await this.tryEmitBareFilenameFence(
+        channel,
+        fence,
+        opts
+      );
+      if (sentAsFile) return;
+    }
+
+    if (fitsInline || !this.adapter.sendFile) {
+      await this.emitFenceInline(channel, fence, opts);
       return;
     }
+    await this.emitFenceAttachment(channel, fence, counter, opts);
+  }
 
-    // If the fenced content is *only* a single non-empty line that
-    // resolves to a real file under our allowed roots, send the actual
-    // file instead of the snippet — far more useful than a fence
-    // containing a bare path.
+  /**
+   * If the fence content is a single non-empty line that resolves to a
+   * file under our allowed roots, upload that real file (with optional
+   * trailing notice) and return true. Otherwise return false.
+   */
+  private async tryEmitBareFilenameFence(
+    channel: ChannelRef,
+    fence: CompletedFence,
+    opts: { notice?: string; preferredRoot?: string | null }
+  ): Promise<boolean> {
+    if (!this.adapter.sendFile) return false;
     const trimmed = fence.content.trim();
-    if (trimmed.length > 0 && !trimmed.includes("\n")) {
-      const resolved = await this.resolveAllowedHostFile(trimmed);
-      if (resolved) {
-        const MAX = 25 * 1024 * 1024;
-        if (resolved.size > MAX) {
-          await this.adapter.sendMessage(
-            channel,
-            `_Referenced file too large to upload: \`${path.basename(resolved.realPath)}\` (${resolved.size} B, 25 MB limit)._`
-          );
-          return;
-        }
+    if (trimmed.length === 0 || trimmed.includes("\n")) return false;
+    const resolved = await this.resolveAllowedHostFile(trimmed, {
+      preferredRoot: opts.preferredRoot ?? null,
+    });
+    if (!resolved) return false;
+
+    const MAX = 25 * 1024 * 1024;
+    if (resolved.size > MAX) {
+      try {
+        await this.adapter.sendMessage(
+          channel,
+          `_Referenced file too large to upload: \`${path.basename(resolved.realPath)}\` (${resolved.size} B, 25 MB limit)._${
+            opts.notice ? `\n\n${opts.notice}` : ""
+          }`
+        );
+      } catch (err) {
+        this.logger.warn({ err }, "bare-filename oversize notice failed");
+      }
+      return true;
+    }
+    try {
+      const data = await fsp.readFile(resolved.realPath);
+      const filename = path.basename(resolved.realPath);
+      await this.adapter.sendFile(channel, {
+        data,
+        filename,
+        mimeType: mimeTypeForFilename(filename),
+      });
+      if (opts.notice) {
         try {
-          const data = await fsp.readFile(resolved.realPath);
-          const filename = path.basename(resolved.realPath);
-          await this.adapter.sendFile(channel, {
-            data,
-            filename,
-            mimeType: mimeTypeForFilename(filename),
-          });
-          this.logger.info(
-            { realPath: resolved.realPath, bytes: data.byteLength },
-            "fence resolved to host file — uploaded actual file"
-          );
-          return;
+          await this.adapter.sendMessage(channel, opts.notice);
         } catch (err) {
-          this.logger.warn(
-            { err, realPath: resolved.realPath },
-            "fence-to-file resolution read failed; falling back to snippet"
-          );
-          // fall through to snippet upload
+          this.logger.warn({ err }, "bare-filename notice send failed");
         }
       }
+      this.logger.info(
+        { realPath: resolved.realPath, bytes: data.byteLength },
+        "fence resolved to host file — uploaded actual file"
+      );
+      return true;
+    } catch (err) {
+      this.logger.warn(
+        { err, realPath: resolved.realPath },
+        "fence-to-file resolution read failed; falling back to inline"
+      );
+      return false;
     }
+  }
 
+  /**
+   * Render a fence as an inline ```lang\n...\n``` Discord message,
+   * with an optional trailing notice paragraph.
+   */
+  private async emitFenceInline(
+    channel: ChannelRef,
+    fence: CompletedFence,
+    opts: { notice?: string } = {}
+  ): Promise<void> {
+    const body = `\`\`\`${fence.lang}\n${fence.content}\n\`\`\``;
+    const text = opts.notice ? `${body}\n\n${opts.notice}` : body;
+    try {
+      await this.adapter.sendMessage(channel, text);
+    } catch (err) {
+      this.logger.warn({ err }, "fence inline send failed");
+    }
+  }
+
+  /**
+   * Upload a fence as a Discord file attachment. Falls back to inline
+   * rendering if the adapter doesn't support file uploads or the
+   * content exceeds Discord's 25 MB limit.
+   */
+  private async emitFenceAttachment(
+    channel: ChannelRef,
+    fence: CompletedFence,
+    counter: number,
+    opts: { notice?: string } = {}
+  ): Promise<void> {
+    if (!this.adapter.sendFile) {
+      await this.emitFenceInline(channel, fence, opts);
+      return;
+    }
     const filename =
       fence.ext === "Dockerfile"
         ? counter === 1
@@ -1430,7 +1540,9 @@ export class Orchestrator {
       if (buf.byteLength > MAX) {
         await this.adapter.sendMessage(
           channel,
-          `_Code block too large to upload (${buf.byteLength} B, Discord 25 MB limit)._`
+          `_Code block too large to upload (${buf.byteLength} B, Discord 25 MB limit)._${
+            opts.notice ? `\n\n${opts.notice}` : ""
+          }`
         );
         return;
       }
@@ -1439,6 +1551,13 @@ export class Orchestrator {
         filename,
         mimeType: fence.mimeType,
       });
+      if (opts.notice) {
+        try {
+          await this.adapter.sendMessage(channel, opts.notice);
+        } catch (err) {
+          this.logger.warn({ err }, "fence attachment notice send failed");
+        }
+      }
     } catch (err) {
       this.logger.warn({ err, filename }, "fence upload failed");
     }

@@ -26,6 +26,13 @@ export interface SplitOptions {
    * Minimum send size for a soft (non-forced) flush. Below this, defer.
    */
   softMin?: number;
+  /**
+   * If true, allow cutting inside an open markdown link/image. Used by
+   * idle-flush and end-of-turn paths where the agent may never close the
+   * construct, and by the must-drain fallback when the buffer is over cap
+   * and no safe prefix exists.
+   */
+  allowUnsafeCut?: boolean;
 }
 
 interface OpenFence {
@@ -50,6 +57,95 @@ function findOpenFence(buf: string): OpenFence | null {
   if (matches.length % 2 === 0) return null;
   const last = matches[matches.length - 1];
   return last ?? null;
+}
+
+/**
+ * Find the index of the EARLIEST still-open markdown link/image construct at
+ * end of buffer. Returns -1 if all link constructs are closed.
+ *
+ * Tracked constructs (inline syntax only):
+ *   - `[text](url)` link
+ *   - `![alt](url)` image — unsafe start is the `!`
+ *   - `[text](url "title")` / `[text](url 'title')` / `[text](url (title))`
+ *     — handled as part of the outer `(...)` after `](`
+ *
+ * Backslash escapes (`\[`, `\]`, `\(`, `\)`, `\\`) are honored via consecutive
+ * backslash counting (odd → next char escaped, even → literal).
+ *
+ * Out of scope (v1): inline code spans, fenced code (handled upstream),
+ * reference-style links, autolinks, angle-bracket destinations.
+ */
+export function findFirstUnsafeIndex(buf: string): number {
+  // Stack of open constructs. Each entry tracks its outermost start index
+  // (the position we'd send up-to as the "safe prefix" if it never closes).
+  type State =
+    | { kind: "text"; start: number; depth: number } // inside [...]
+    | { kind: "url"; start: number; depth: number }; // inside ](...)
+  const stack: State[] = [];
+  let i = 0;
+  const n = buf.length;
+  while (i < n) {
+    const ch = buf.charCodeAt(i);
+    // Backslash escape: skip the next char if odd run length.
+    if (ch === 92) {
+      let run = 1;
+      while (i + run < n && buf.charCodeAt(i + run) === 92) run++;
+      i += run;
+      if (run % 2 === 1 && i < n) i += 1;
+      continue;
+    }
+    const top = stack[stack.length - 1];
+    if (top && top.kind === "url") {
+      if (ch === 40) {
+        // nested ( inside url destination/title
+        top.depth += 1;
+      } else if (ch === 41) {
+        top.depth -= 1;
+        if (top.depth === 0) {
+          stack.pop();
+        }
+      }
+      i += 1;
+      continue;
+    }
+    // Not in a url destination. We're either at top level or inside [text].
+    if (ch === 91) {
+      // `[` — opens link text. Detect image marker `![` for safe-start.
+      const isImage = i > 0 && buf.charCodeAt(i - 1) === 33;
+      const start = isImage ? i - 1 : i;
+      stack.push({ kind: "text", start, depth: 1 });
+      i += 1;
+      continue;
+    }
+    if (ch === 93 && top && top.kind === "text") {
+      // `]` — closes link text (depth-1 since we don't nest `[` in text).
+      top.depth -= 1;
+      if (top.depth === 0) {
+        // Look for the matching `(` that starts the destination. Per
+        // CommonMark it must immediately follow `]` (no whitespace).
+        if (i + 1 < n && buf.charCodeAt(i + 1) === 40) {
+          // Consume `]` and `(`, switch to url state, but inherit the
+          // ORIGINAL [start] so an unclosed url still rolls back to it.
+          const origStart = top.start;
+          stack.pop();
+          stack.push({ kind: "url", start: origStart, depth: 1 });
+          i += 2;
+          continue;
+        } else {
+          // `]` not followed by `(` → not a link, just text. Drop the state.
+          stack.pop();
+          i += 1;
+          continue;
+        }
+      }
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  if (stack.length === 0) return -1;
+  // Earliest open construct = bottom of stack.
+  return stack[0]!.start;
 }
 
 /** Best clean split point in [minIdx, maxIdx]. Returns -1 if none found. */
@@ -89,7 +185,12 @@ export function splitForFlush(
   if (!buffer) return null;
   const { maxLen, force } = opts;
   const softMin = opts.softMin ?? 1;
+  const allowUnsafeCut = opts.allowUnsafeCut ?? false;
   const fence = findOpenFence(buffer);
+  // Only check link-safety when the caller actually cares. Fences are
+  // handled separately and dominate when present (closing/reopening).
+  const unsafeIdx =
+    !allowUnsafeCut && !fence ? findFirstUnsafeIndex(buffer) : -1;
 
   // --- Soft path: only flush on a paragraph break outside any open fence.
   // Mid-stream the model emits punctuation as separate chunks, so anything
@@ -98,6 +199,8 @@ export function splitForFlush(
     if (fence) return null;
     const split = findCleanSplit(buffer, softMin, buffer.length, true);
     if (!split) return null;
+    // Refuse soft cut that lands inside an open link/image construct.
+    if (unsafeIdx !== -1 && split.idx > unsafeIdx) return null;
     const send = buffer.slice(0, split.idx).replace(/\s+$/, "");
     const keep = buffer.slice(split.idx + split.skip);
     if (!send) return null;
@@ -106,7 +209,15 @@ export function splitForFlush(
 
   // --- Forced path.
   if (buffer.length <= maxLen && !fence) {
-    return { send: buffer.replace(/\s+$/, ""), keep: "" };
+    if (unsafeIdx === -1) {
+      return { send: buffer.replace(/\s+$/, ""), keep: "" };
+    }
+    // Open link/image with safe prefix. Send what's safe; keep the tail.
+    if (unsafeIdx === 0) return null; // nothing safe to send yet
+    const send = buffer.slice(0, unsafeIdx).replace(/\s+$/, "");
+    const keep = buffer.slice(unsafeIdx);
+    if (!send) return null;
+    return { send, keep };
   }
 
   // Forced and (over cap or open fence). Need to cut within [0, maxLen].
@@ -147,11 +258,28 @@ export function splitForFlush(
   }
 
   // Forced over-cap, no fence.
-  const split = findCleanSplit(buffer, Math.floor(maxLen / 4), maxLen);
+  const minSplit = Math.floor(maxLen / 4);
+  // Cap the search window at unsafeIdx if there's an open link/image, so
+  // we don't pick a clean break that lands inside the link.
+  const windowMax =
+    unsafeIdx === -1 ? maxLen : Math.min(maxLen, unsafeIdx);
+  const split =
+    windowMax > minSplit
+      ? findCleanSplit(buffer, minSplit, windowMax)
+      : null;
   if (split) {
     return {
       send: buffer.slice(0, split.idx).replace(/\s+$/, ""),
       keep: buffer.slice(split.idx + split.skip),
+    };
+  }
+  // No safe clean split. If we have an open link with a meaningful safe
+  // prefix, send that. Otherwise we MUST drain (Discord rejects >2000),
+  // so fall back to an unsafe hard cut.
+  if (unsafeIdx !== -1 && unsafeIdx >= minSplit) {
+    return {
+      send: buffer.slice(0, unsafeIdx).replace(/\s+$/, ""),
+      keep: buffer.slice(unsafeIdx),
     };
   }
   return {

@@ -12,6 +12,7 @@ import type {
   MessageRef,
   SessionRecord,
 } from "../chat-adapter.js";
+import type { PromptOutcome } from "../../agents/agent-runtime.js";
 import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
@@ -260,9 +261,18 @@ export class Orchestrator {
       }
     };
 
+    const isSessionGoneError = (e: unknown): boolean => {
+      const message = e instanceof Error ? e.message : String(e);
+      const details = String((e as any)?.data?.details ?? "");
+      return (
+        message.toLowerCase().includes("session not found") ||
+        details.toLowerCase().includes("session not found")
+      );
+    };
+
     try {
-      const runtime = await this.router.getOrStartRuntime(record);
-      runtime.onEvent(async (event) => {
+      let activeRuntime = await this.router.getOrStartRuntime(record);
+      const eventHandler = async (event: Parameters<Parameters<typeof activeRuntime.onEvent>[0]>[0]) => {
         switch (event.kind) {
           case "agent-text": {
             refreshTyping();
@@ -319,7 +329,7 @@ export class Orchestrator {
                   "runaway agent output detected; cancelling turn"
                 );
                 try {
-                  await runtime.cancel();
+                  await activeRuntime.cancel();
                 } catch (err) {
                   this.logger.warn({ err }, "cancel after loop failed");
                 }
@@ -454,16 +464,33 @@ export class Orchestrator {
           case "error":
             return;
         }
-      });
+      };
+      activeRuntime.onEvent(eventHandler);
 
       status.setAction("Thinking…");
       await refresh(true);
       refreshTyping();
 
-      const turnPromise = runtime.prompt(msg.text, msg.attachments);
       turnStartedAt = Date.now();
       const timeoutMs = this.config.TURN_TIMEOUT_SECONDS * 1000;
-      const result = await raceWithTimeout(turnPromise, timeoutMs);
+
+      // One transparent retry if the agent has lost the session (e.g. bridge
+      // restarted). Session-gone fires immediately before any output, so
+      // textBuffer/fenceStream are still clean and the retry is invisible.
+      let result: PromptOutcome | "timeout";
+      try {
+        result = await raceWithTimeout(activeRuntime.prompt(msg.text, msg.attachments), timeoutMs);
+      } catch (promptErr) {
+        if (isSessionGoneError(promptErr)) {
+          this.logger.warn({ session: record.id }, "session-gone on prompt; invalidating and retrying with new session");
+          await this.router.invalidate(record.id, { clearAcpSession: true });
+          activeRuntime = await this.router.getOrStartRuntime(record);
+          activeRuntime.onEvent(eventHandler);
+          result = await raceWithTimeout(activeRuntime.prompt(msg.text, msg.attachments), timeoutMs);
+        } else {
+          throw promptErr;
+        }
+      }
 
       cancelFlushTimer();
       // Drain the fence extractor: any final segments enter the chat
@@ -537,7 +564,7 @@ export class Orchestrator {
       }
 
       if (result === "timeout") {
-        await runtime.cancel();
+        await activeRuntime.cancel();
         status.setState("Timed out");
         status.setAction(`Exceeded ${this.config.TURN_TIMEOUT_SECONDS}s`);
       } else if (result.cancelled) {
@@ -554,20 +581,13 @@ export class Orchestrator {
       // If the agent reports that the session is gone (e.g. bridge restarted
       // with a fresh agent process), evict the dead runtime so the next message
       // triggers a clean newSession rather than repeatedly failing.
-      const msg = err instanceof Error ? err.message : String(err);
-      // The ACP SDK surfaces session-not-found as RequestError with
-      // message "Internal error" and data.details = "Session not found".
-      // Check both the top-level message and the nested details string.
-      const details = String((err as any)?.data?.details ?? "");
-      const isSessionGone =
-        msg.toLowerCase().includes("session not found") ||
-        details.toLowerCase().includes("session not found");
-      if (isSessionGone) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (isSessionGoneError(err)) {
         this.logger.warn({ session: record.id }, "session not found on agent; invalidating runtime");
         await this.router.invalidate(record.id, { clearAcpSession: true });
       }
       status.setState("Failed");
-      status.setAction(this.renderer.trimShort(isSessionGone ? "Session lost — please resend your message." : msg, 120));
+      status.setAction(this.renderer.trimShort(isSessionGoneError(err) ? "Session lost — please resend your message." : errMsg, 120));
     } finally {
       clearInterval(heartbeat);
       await refresh(true);

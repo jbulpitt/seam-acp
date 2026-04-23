@@ -85,9 +85,13 @@ function bridgeConnection(ws, copilotCmd, WebSocket, localCwd) {
     try { return execSync("gh auth token", { stdio: ["pipe", "pipe", "ignore"] }).toString().trim(); }
     catch { return ""; }
   })();
-  console.error(`[bridge] Spawning agent (GH_TOKEN: ${ghToken ? ghToken.slice(0, 8) + "..." : "MISSING"})...`);
+  // Support "node /path/to/cli.js" style commands by splitting on first space.
+  const cmdParts = copilotCmd.split(" ");
+  const cmd = cmdParts[0];
+  const cmdArgs = [...cmdParts.slice(1), "--acp"];
+  console.error(`[bridge] Spawning agent: ${cmd} ${cmdArgs.join(" ")} (GH_TOKEN: ${ghToken ? ghToken.slice(0, 8) + "..." : "MISSING"})`);
 
-  const agent = spawn(copilotCmd, ["--acp"], {
+  const agent = spawn(cmd, cmdArgs, {
     stdio: ["pipe", "pipe", "inherit"],
     env: {
       ...process.env,

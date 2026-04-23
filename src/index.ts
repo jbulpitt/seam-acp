@@ -90,13 +90,13 @@ async function main(): Promise<void> {
           id: `copilot-remote-${p.id}`,
           wsPort: p.wsPort,
           token: p.token,
-          defaultModel: config.DEFAULT_MODEL,
+          defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
         })
       : makeRemoteCopilotClientProfile({
           id: `copilot-remote-${p.id}`,
           wsUrl: p.wsUrl,
           token: p.token,
-          defaultModel: config.DEFAULT_MODEL,
+          defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
         })
   );
 

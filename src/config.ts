@@ -187,8 +187,8 @@ const Schema = z.object({
     .default("")
     .transform((v) => {
       const out: Array<
-        | { id: string; mode: "server"; wsPort: number; token: string }
-        | { id: string; mode: "client"; wsUrl: string; token: string }
+        | { id: string; mode: "server"; wsPort: number; token: string; defaultModel?: string }
+        | { id: string; mode: "client"; wsUrl: string; token: string; defaultModel?: string }
       > = [];
       for (const entry of v.split(",").map((s) => s.trim()).filter(Boolean)) {
         const first = entry.indexOf(":");
@@ -214,8 +214,9 @@ const Schema = z.object({
             );
           }
           const wsUrl = rest.slice(0, lastColon);
-          const token = rest.slice(lastColon + 1);
-          out.push({ id, mode: "client", wsUrl, token });
+          const tokenAndModel = rest.slice(lastColon + 1);
+          const [token, defaultModel] = tokenAndModel.split("@");
+          out.push({ id, mode: "client", wsUrl, token: token!, defaultModel });
         } else {
           // Server mode: id:port:token — token may contain colons.
           const second = rest.indexOf(":");
@@ -225,14 +226,15 @@ const Schema = z.object({
             );
           }
           const portStr = rest.slice(0, second).trim();
-          const token = rest.slice(second + 1);
+          const tokenAndModel = rest.slice(second + 1);
+          const [token, defaultModel] = tokenAndModel.split("@");
           const wsPort = Number(portStr);
           if (!Number.isInteger(wsPort) || wsPort < 1 || wsPort > 65535) {
             throw new Error(
               `REMOTE_COPILOT_PROFILES port '${portStr}' must be a valid port number`
             );
           }
-          out.push({ id, mode: "server", wsPort, token });
+          out.push({ id, mode: "server", wsPort, token: token!, defaultModel });
         }
       }
       return out;

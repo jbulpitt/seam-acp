@@ -187,6 +187,10 @@ export class SessionRouter {
       profile,
       logger: this.logger.child({ session: record.id }),
       mcpServers: this.mcpServers,
+      onDead: () => {
+        this.logger.info({ sessionId: record.id }, "agent process died; evicting runtime for auto-resume");
+        this.runtimes.delete(record.id);
+      },
       permissionPolicy: async (req) => {
         // Always re-read: the captured `cfg` would be stale if the user later
         // changes the policy via `/seam approve` while the runtime is alive.

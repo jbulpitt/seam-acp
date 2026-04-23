@@ -127,6 +127,7 @@ export class AgentRuntime {
   private readonly logger: Logger;
   private readonly permissionPolicy: PermissionPolicy;
   private readonly mcpServers: McpServer[];
+  private readonly onDead?: () => void;
 
   private child?: ReturnType<AgentProfile["spawn"]>;
   private connection?: ClientSideConnection;
@@ -142,10 +143,13 @@ export class AgentRuntime {
     logger: Logger;
     permissionPolicy?: PermissionPolicy;
     mcpServers?: McpServer[];
+    /** Called when the agent process exits after a successful initialize. */
+    onDead?: () => void;
   }) {
     this.profile = opts.profile;
     this.logger = opts.logger.child({ agent: opts.profile.id });
     this.mcpServers = opts.mcpServers ?? [];
+    this.onDead = opts.onDead;
     this.permissionPolicy =
       opts.permissionPolicy ??
       (async (req) => {
@@ -201,6 +205,11 @@ export class AgentRuntime {
 
     child.on("exit", (code, signal) => {
       this.logger.warn({ code, signal }, "agent process exited");
+      // If initialize already completed, notify the router so it can evict
+      // this runtime and attempt session/load on the next incoming message.
+      if (this.connection !== undefined) {
+        this.onDead?.();
+      }
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {

@@ -1,34 +1,30 @@
 # Remote agent profiles
 
-A remote agent profile lets you run an agent CLI (e.g. GitHub Copilot) on a **separate machine** — one that cannot accept inbound connections (e.g. a Mac behind NAT) — and expose it in seam-acp as a regular `/seam agent` option.
+A remote agent profile lets you run an agent CLI (e.g. GitHub Copilot, Claude Code) on a **separate machine** — one that cannot accept inbound connections (e.g. a Mac behind a corporate NAT) — and expose it in seam-acp as a regular `/seam agent` option.
 
-Two modes are supported. The difference is which side hosts the WebSocket server and which side runs `cloudflared`:
+The bridge script (`scripts/remote-agent-bridge.mjs`) runs on the remote machine, spawns the agent CLI, and pipes its ACP stdio over a WebSocket to seam-acp. Two topologies are supported:
 
-| | Server mode | Client mode |
+| | **Mode A — seam-acp hosts WS server** | **Mode B — remote machine hosts WS server** |
 |---|---|---|
-| WS server runs on | seam-acp machine | Remote machine (Mac) |
-| `cloudflared` runs on | seam-acp machine | Remote machine (Mac) |
-| seam-acp needs open port | No (Cloudflare tunnel) | No |
-| Remote machine needs open port | No | No |
+| WS server runs on | seam-acp machine | Remote machine |
+| `cloudflared` runs on | seam-acp machine | Remote machine |
 | Config format | `id:port:token` | `id:wss://url:token` |
+| Best for | You control the server; remote is untrusted/mobile | Your Mac stays fixed; server is the client |
 
-Both modes use the same bridge script (`scripts/remote-agent-bridge.mjs`) and the same `REMOTE_COPILOT_PROFILES` env var. Choose the mode based on where you'd prefer to run `cloudflared`.
+Both modes use the same bridge script and the same `REMOTE_COPILOT_PROFILES` env var. Neither side needs an open inbound port — both use Cloudflare Tunnel for an outbound-only connection.
 
 ---
 
-## Mode A: Server mode (seam-acp hosts the WS server)
-
-The seam-acp server runs both the WebSocket server and `cloudflared`. The remote machine runs the bridge script which dials **outbound** to the Cloudflare URL.
+## Mode A: seam-acp hosts the WS server
 
 ```
 Remote machine (Mac)
-  └─ bridge script (client mode)
-       └─ outbound wss:// ──→ Cloudflare edge ←──cloudflared tunnel── seam-acp
-                                                                          └─ WS server (port 9999)
-                                                                               └─ AgentRuntime
+  └─ bridge (client mode)
+       └─ outbound wss:// ──→ Cloudflare edge ←── cloudflared ── seam-acp
+                                                                    └─ WS server (port 9999)
 ```
 
-### 1. Install and run `cloudflared` on the seam-acp server
+### 1. Install `cloudflared` on the seam-acp server
 
 ```sh
 # Linux
@@ -39,105 +35,171 @@ curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloud
 brew install cloudflare/cloudflare/cloudflared
 ```
 
-Start a tunnel pointing at the local WS port:
+Start a quick tunnel (no account required):
 
 ```sh
 cloudflared tunnel --url ws://localhost:9999
 # → prints wss://random-name.trycloudflare.com
 ```
 
-For a permanent URL, [create a named tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/) and map `agent.yourdomain.com → localhost:9999`.
+For a permanent URL, [create a named tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/) pointing `agent.yourdomain.com → localhost:9999`.
 
 ### 2. Configure seam-acp
 
-Add to `.env`:
-
 ```sh
+# .env on the seam-acp server
 # Format: id:port:token
 REMOTE_COPILOT_PROFILES=mac:9999:your-secret-token
 ```
 
 Run `npm run redeploy` to apply.
 
-### 3. Run the bridge script on the remote machine (client mode)
-
-Install the `ws` dependency if not already in the repo:
+### 3. Run the bridge on the remote machine (client mode)
 
 ```sh
-npm install ws
+# From the seam-acp repo directory (ws package already installed):
+node scripts/remote-agent-bridge.mjs wss://random-name.trycloudflare.com your-secret-token --cwd /Users/you/Projects
+
+# Or with a permanent domain:
+node scripts/remote-agent-bridge.mjs wss://agent.yourdomain.com your-secret-token --cwd /Users/you/Projects
 ```
-
-Start the bridge:
-
-```sh
-node scripts/remote-agent-bridge.mjs wss://random-name.trycloudflare.com your-secret-token
-# or with a permanent domain:
-node scripts/remote-agent-bridge.mjs wss://agent.yourdomain.com your-secret-token
-```
-
-The bridge connects outbound, spawns `copilot --acp`, and reconnects automatically on disconnect.
 
 ---
 
-## Mode B: Client mode (remote machine hosts the WS server)
-
-The remote machine (Mac) runs both the WebSocket server and `cloudflared`. seam-acp connects **outbound** to the Cloudflare URL — no open ports or `cloudflared` needed on the seam-acp server.
+## Mode B: remote machine hosts the WS server
 
 ```
 seam-acp
   └─ AgentRuntime
-       └─ outbound wss:// ──→ Cloudflare edge ←──cloudflared tunnel── Remote machine (Mac)
-                                                                          └─ bridge script (server mode)
-                                                                               └─ WS server (port 9999)
-                                                                                    └─ copilot --acp
+       └─ outbound wss:// ──→ Cloudflare edge ←── cloudflared ── Remote machine (Mac)
+                                                                    └─ bridge (server mode)
+                                                                         └─ WS server (port 9999)
 ```
 
-### 1. Install `cloudflared` on the remote machine (Mac)
+### 1. Install `cloudflared` on the remote machine
 
 ```sh
 brew install cloudflare/cloudflare/cloudflared
 ```
 
-### 2. Run the bridge script in server mode on the remote machine
+### 2. Run the bridge in server mode
 
 ```sh
-# Install ws if needed
-npm install ws
-
-# Start the bridge server
-node scripts/remote-agent-bridge.mjs --server 9999 your-secret-token
+node scripts/remote-agent-bridge.mjs --server 9999 your-secret-token --cwd /Users/you/Projects
 # [bridge] Listening on ws://localhost:9999
 ```
 
-### 3. Expose it with Cloudflare Tunnel
+### 3. Start the Cloudflare Tunnel
 
-In a separate terminal on the Mac:
+In a separate terminal on the same machine:
 
 ```sh
 cloudflared tunnel --url ws://localhost:9999
 # → prints wss://random-name.trycloudflare.com
 ```
 
-For a permanent URL, create a named tunnel mapping `agent.yourdomain.com → localhost:9999`.
-
 ### 4. Configure seam-acp
 
-Add to `.env` on the seam-acp server:
-
 ```sh
-# Format: id:wss://url:token  (URL must start with ws:// or wss://)
+# .env on the seam-acp server
+# Format: id:wss://url:token  (URL must begin with ws:// or wss://)
 REMOTE_COPILOT_PROFILES=mac:wss://random-name.trycloudflare.com:your-secret-token
 ```
 
-Run `npm run redeploy` to apply. seam-acp will dial out to the tunnel URL each time a new session needs the remote agent.
+Run `npm run redeploy` to apply.
 
 ---
 
-## Running the bridge as a background service (optional)
+## Running a different agent (e.g. claude-agent-acp)
+
+By default the bridge spawns `copilot --acp`. You can point it at any ACP-compatible CLI using env vars:
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `COPILOT_CMD` | `copilot` | The command (or full path) to spawn |
+| `COPILOT_ARGS` | `--acp` | Arguments passed to the command. Set to `""` if the command takes no args. |
+
+### Example: claude-agent-acp
+
+Install Claude Code on the remote machine (official installer):
+
+```sh
+curl -fsSL https://claude.ai/install.sh | bash
+# → installs to ~/.local/bin/claude
+```
+
+Install the ACP adapter:
+
+```sh
+npm install -g @agentclientprotocol/claude-agent-acp
+```
+
+Start the bridge:
+
+```sh
+COPILOT_CMD=claude-agent-acp COPILOT_ARGS="" \
+  node scripts/remote-agent-bridge.mjs wss://your-tunnel.trycloudflare.com your-token --cwd /Users/you/Projects
+```
+
+If `claude-agent-acp` can't find the `claude` binary automatically, point it explicitly:
+
+```sh
+COPILOT_CMD=claude-agent-acp COPILOT_ARGS="" CLAUDE_CODE_EXECUTABLE="$HOME/.local/bin/claude" \
+  node scripts/remote-agent-bridge.mjs wss://your-tunnel.trycloudflare.com your-token --cwd /Users/you/Projects
+```
+
+---
+
+## Running as a background service
+
+### PM2 (recommended)
+
+```sh
+npm install -g pm2
+
+# Client mode (copilot):
+pm2 start scripts/remote-agent-bridge.mjs \
+  --name remote-agent-bridge \
+  -- wss://agent.yourdomain.com your-secret-token --cwd /Users/you/Projects
+pm2 save
+
+# Client mode (claude-agent-acp) — pass env vars via ecosystem config or --env:
+pm2 start scripts/remote-agent-bridge.mjs \
+  --name remote-agent-bridge \
+  --env COPILOT_CMD=claude-agent-acp \
+  --env COPILOT_ARGS="" \
+  --env CLAUDE_CODE_EXECUTABLE=/Users/you/.local/bin/claude \
+  -- wss://agent.yourdomain.com your-secret-token --cwd /Users/you/Projects
+pm2 save
+
+# Server mode:
+pm2 start scripts/remote-agent-bridge.mjs \
+  --name remote-agent-bridge \
+  -- --server 9999 your-secret-token --cwd /Users/you/Projects
+pm2 save
+```
+
+Or use a `ecosystem.config.cjs` on the Mac:
+
+```js
+module.exports = {
+  apps: [{
+    name: "remote-agent-bridge",
+    script: "/path/to/seam-acp/scripts/remote-agent-bridge.mjs",
+    args: "wss://agent.yourdomain.com your-secret-token --cwd /Users/you/Projects",
+    env: {
+      COPILOT_CMD: "claude-agent-acp",
+      COPILOT_ARGS: "",
+      CLAUDE_CODE_EXECUTABLE: "/Users/you/.local/bin/claude",
+      // NODE_EXTRA_CA_CERTS: "/path/to/corporate-ca.pem",  // if behind a TLS-inspecting proxy
+    },
+  }],
+};
+```
 
 ### launchd (macOS)
 
-Create `~/Library/LaunchAgents/com.seam.copilot-bridge.plist`:
+Create `~/Library/LaunchAgents/com.seam.remote-agent-bridge.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -145,7 +207,7 @@ Create `~/Library/LaunchAgents/com.seam.copilot-bridge.plist`:
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.seam.copilot-bridge</string>
+  <string>com.seam.remote-agent-bridge</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/node</string>
@@ -153,197 +215,90 @@ Create `~/Library/LaunchAgents/com.seam.copilot-bridge.plist`:
     <!-- client mode: -->
     <string>wss://agent.yourdomain.com</string>
     <string>your-secret-token</string>
-    <!-- server mode: replace above three lines with:
+    <string>--cwd</string>
+    <string>/Users/you/Projects</string>
+    <!-- server mode: replace the three lines above with:
     <string>- -server</string>
     <string>9999</string>
     <string>your-secret-token</string>
     -->
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>COPILOT_CMD</key>
+    <string>claude-agent-acp</string>
+    <key>COPILOT_ARGS</key>
+    <string></string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardErrorPath</key>
-  <string>/tmp/copilot-bridge.log</string>
+  <string>/tmp/remote-agent-bridge.log</string>
 </dict>
 </plist>
 ```
 
 ```sh
-launchctl load ~/Library/LaunchAgents/com.seam.copilot-bridge.plist
-```
-
-### pm2
-
-```sh
-npm install -g pm2
-
-# Client mode:
-pm2 start scripts/remote-agent-bridge.mjs \
-  --name copilot-bridge \
-  -- wss://agent.yourdomain.com your-secret-token
-
-# Server mode:
-pm2 start scripts/remote-agent-bridge.mjs \
-  --name copilot-bridge \
-  -- --server 9999 your-secret-token
-
-pm2 save
+launchctl load ~/Library/LaunchAgents/com.seam.remote-agent-bridge.plist
 ```
 
 ---
 
 ## Multiple remote profiles
 
-Both modes can be mixed in the same env var (comma-separated):
+You can mix both modes in the same env var (comma-separated):
 
 ```sh
 REMOTE_COPILOT_PROFILES=mac:wss://mac.trycloudflare.com:token-a,workstation:9998:token-b
 ```
 
-Each becomes an independent agent profile in `/seam agent`.
+Each entry becomes an independent agent profile in `/seam agent`. Run a separate bridge instance per machine.
+
+---
+
+## Resilience behaviour
+
+The bridge and seam-acp are designed to survive disconnects automatically:
+
+- **Keepalive pings** — both sides ping every 25 s to prevent idle-connection drops from Cloudflare Tunnel or corporate proxies.
+- **Automatic reconnect** — the bridge reconnects after 5 s on disconnect. seam-acp waits up to 44 s for the bridge to reconnect before surfacing an error.
+- **Grace period** — on an abnormal close, seam-acp holds the agent process for 20 s. If the bridge reconnects within that window, the session resumes immediately with no user-visible interruption.
+- **Session restore** — if the bridge stays disconnected longer than the grace period (or the agent process exits), seam-acp attempts to restore the session from disk on the next message using the ACP `session/load` call. If that fails, a new session is started transparently and the turn is retried — the user never sees an error.
+
+---
+
+## Corporate proxy / TLS inspection
+
+If the agent CLI makes HTTPS calls through a TLS-inspecting proxy (e.g. Zscaler), you may see certificate errors. Set `NODE_EXTRA_CA_CERTS` to the proxy's root CA certificate:
+
+```sh
+# Find the Zscaler cert in the system keychain on macOS:
+security find-certificate -c "Zscaler Root CA" -p /Library/Keychains/System.keychain > ~/zscaler-ca.pem
+
+# Pass it to the bridge (and child processes inherit it):
+NODE_EXTRA_CA_CERTS=~/zscaler-ca.pem \
+  node scripts/remote-agent-bridge.mjs wss://your-tunnel.trycloudflare.com your-token --cwd /Users/you/Projects
+```
+
+Add `NODE_EXTRA_CA_CERTS` to the PM2 env or launchd `EnvironmentVariables` to make it permanent.
 
 ---
 
 ## Security notes
 
-- Use `wss://` (TLS) in production. Cloudflare Tunnel always uses TLS end-to-end.
+- Use `wss://` (TLS) in production. Cloudflare Tunnel always terminates TLS at the edge.
 - Tokens are stored in `.env` — keep that file out of version control (it is in `.gitignore`).
-- In server mode, the WS port is bound to `0.0.0.0` by default. If using a Cloudflare Tunnel you can bind it to `127.0.0.1` instead to prevent direct access — this would require a small code change to `makeRemoteCopilotServerProfile`.
-- Authentication uses `Authorization: Bearer <token>` during the HTTP upgrade handshake. Connections with a missing or incorrect token are rejected before any data is exchanged (close code `4001`).
-- In client mode, the token must not contain colons (it is parsed as the segment after the last `:` in the URL entry).
+- Authentication uses `Authorization: Bearer <token>` during the HTTP upgrade handshake. Connections with a missing or wrong token are rejected before any data is exchanged (close code `4001`).
+- In server mode, the WS port is bound to `0.0.0.0`. If you're using Cloudflare Tunnel you can tighten this to `127.0.0.1` by modifying the bind address in `makeRemoteCopilotServerProfile` in `src/agents/profiles/remote.ts`.
+- In client mode, the token must not contain colons (it is the segment after the last `:` in the config value).
 
 ---
 
 ## Limitations
 
-- **No `whoami` support.** `/seam whoami` always returns unknown for remote profiles — the agent's local config files are not readable from the seam-acp host.
-- **Agent CLI must be pre-authenticated.** Run `copilot auth login` on the remote machine before starting the bridge.
-- **One copilot process per bridge connection.** ACP supports multiple sessions per process, so one bridge connection can serve multiple concurrent Discord threads. In server mode, if the bridge is disconnected, new sessions queue for up to ~44 seconds before timing out.
+- **No `/seam whoami` support.** Remote profiles always return unknown — the agent's local config files are not readable from the seam-acp host.
+- **Agent CLI must be pre-authenticated.** Run `copilot auth login` (or `claude /login`) on the remote machine before starting the bridge.
+- **One agent process per bridge.** A single bridge connection can serve multiple concurrent Discord threads (ACP supports multiple sessions per process). Run a separate bridge instance if you want separate agent processes.
 
-
-A remote agent profile lets you run an agent CLI (e.g. GitHub Copilot) on a **separate machine** — one that cannot accept inbound connections — and expose it inside seam-acp as a regular `/seam agent` option.
-
-The use case this was designed for: a Mac laptop that has Copilot CLI authenticated under a personal account, sitting behind a corporate NAT, that can make **outbound** connections but cannot be SSH'd into.
-
-## How it works
-
-```
-Mac (Copilot CLI)
-  └─ bridge script
-       └─ outbound WebSocket ──→ seam-acp WS server (port 9999)
-                                      │
-                               AgentRuntime
-                               (ndjson over WS, same as local stdio)
-```
-
-1. seam-acp starts a WebSocket server on a configurable local port.
-2. The **bridge script** (`scripts/remote-agent-bridge.mjs`) runs on the Mac. It connects outbound to the WebSocket server and spawns `copilot --acp` locally, piping its stdio over the socket.
-3. seam-acp treats the resulting byte stream identically to a locally spawned process — no changes to AgentRuntime or the ACP protocol.
-
-The remote profile appears in `/seam agent` like any other profile. If the bridge disconnects, the next spawn attempt waits up to ~44 seconds for a new connection, then surfaces a clear error.
-
-## Recommended network setup (Cloudflare Tunnel)
-
-The WebSocket server port only needs to be reachable by the bridge — it does **not** need to be open on the public internet, and seam-acp does not need any inbound ports at all.
-
-The cleanest way to expose it without opening firewall ports on either side is a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/):
-
-```
-Mac ──outbound HTTPS──→ Cloudflare edge ←──outbound tunnel── seam-acp server
-```
-
-Both sides connect **outbound** to Cloudflare. Neither machine needs an inbound port.
-
-### 1. Install and run `cloudflared` on the seam-acp server
-
-```sh
-# macOS
-brew install cloudflare/cloudflare/cloudflared
-
-# Linux
-curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-  -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
-```
-
-Start a quick tunnel (no account required for testing):
-
-```sh
-cloudflared tunnel --url ws://localhost:9999
-```
-
-Cloudflare prints a temporary URL like `wss://random-name.trycloudflare.com`. For a permanent URL, [create a named tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/) pointing `agent.yourdomain.com → localhost:9999`.
-
-### 2. Configure seam-acp
-
-Add to `.env`:
-
-```sh
-# Format: id:port:token  (comma-separate multiple entries)
-REMOTE_COPILOT_PROFILES=mac:9999:your-secret-token
-```
-
-- **id** — unique name for this profile (appears as `copilot-remote-mac` in `/seam agent`)
-- **port** — local TCP port the WebSocket server listens on
-- **token** — shared secret; the bridge must present this as `Authorization: Bearer <token>`
-
-Run `npm run redeploy` to apply the change.
-
-### 3. Run the bridge script on the Mac
-
-The bridge script lives in `scripts/remote-agent-bridge.mjs` in this repo. Copy it to the Mac, or clone the repo there.
-
-Install its only dependency:
-
-```sh
-npm install ws
-```
-
-Then start the bridge:
-
-```sh
-node scripts/remote-agent-bridge.mjs wss://random-name.trycloudflare.com your-secret-token
-# or with a permanent domain:
-node scripts/remote-agent-bridge.mjs wss://agent.yourdomain.com your-secret-token
-```
-
-The bridge automatically reconnects on disconnect. You can run it as a background service (launchd on macOS, or `pm2` if Node is available):
-
-```sh
-# Keep running in background with pm2 (optional)
-npm install -g pm2
-pm2 start scripts/remote-agent-bridge.mjs \
-  --name copilot-bridge \
-  -- wss://agent.yourdomain.com your-secret-token
-pm2 save
-```
-
-If `copilot` is not on `PATH`, pass the binary path as a third argument or set `COPILOT_CMD`:
-
-```sh
-COPILOT_CMD=/opt/homebrew/bin/copilot \
-  node scripts/remote-agent-bridge.mjs wss://agent.yourdomain.com your-secret-token
-```
-
-## Multiple remote profiles
-
-You can register multiple remote profiles pointing to different ports and/or different machines:
-
-```sh
-REMOTE_COPILOT_PROFILES=mac:9999:token-a,workstation:9998:token-b
-```
-
-Each becomes an independent agent profile (`copilot-remote-mac`, `copilot-remote-workstation`) and runs its own WebSocket server. Run a separate bridge instance per machine.
-
-## Security notes
-
-- Tokens are transmitted over TLS when using `wss://` (Cloudflare Tunnel always uses TLS). Do not use `ws://` over the public internet.
-- Tokens are stored in `.env` — keep that file out of version control (it's in `.gitignore`).
-- The WebSocket port is bound to all interfaces by default (`0.0.0.0`). If you're using Cloudflare Tunnel you can tighten this to `127.0.0.1` by setting `WS_HOST=127.0.0.1` — though this is not yet a config option and would require a small code change.
-- Connections are authenticated via `Authorization: Bearer <token>` during the HTTP upgrade handshake. Connections with a missing or wrong token are rejected before any data is exchanged.
-
-## Limitations
-
-- **No `whoami` support.** The remote profile always returns `null` for `/seam whoami` because it cannot read the CLI's local config files from the seam-acp host.
-- **Agent CLI must be pre-authenticated.** The bridge just spawns `copilot --acp` — you need to run `copilot auth login` on the Mac beforehand.
-- **One copilot process per bridge connection.** ACP supports multiple sessions per process, so a single bridge connection can serve multiple concurrent Discord threads. However, if the bridge is not connected, new sessions will queue for up to ~44 seconds before timing out.

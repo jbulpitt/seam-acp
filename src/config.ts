@@ -158,6 +158,47 @@ const Schema = z.object({
       return out;
     }),
 
+  /**
+   * Comma-separated list of remote Copilot profiles, each of the form
+   * `id:port:token`. Each entry starts a WebSocket server on the given port
+   * and registers an agent profile named `copilot-remote-<id>`. The remote
+   * machine runs `scripts/remote-agent-bridge.mjs` to connect back.
+   * Example:
+   *   REMOTE_COPILOT_PROFILES=mac:9999:mysecrettoken
+   * Tokens may contain colons.
+   */
+  REMOTE_COPILOT_PROFILES: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const out: Array<{ id: string; wsPort: number; token: string }> = [];
+      for (const entry of v.split(",").map((s) => s.trim()).filter(Boolean)) {
+        const first = entry.indexOf(":");
+        const second = entry.indexOf(":", first + 1);
+        if (first <= 0 || second <= first + 1 || second === entry.length - 1) {
+          throw new Error(
+            `REMOTE_COPILOT_PROFILES entry must be 'id:port:token' (got '${entry}')`
+          );
+        }
+        const id = entry.slice(0, first).trim();
+        const portStr = entry.slice(first + 1, second).trim();
+        const token = entry.slice(second + 1);
+        const wsPort = Number(portStr);
+        if (!/^[a-z0-9][a-z0-9-]*$/i.test(id)) {
+          throw new Error(
+            `REMOTE_COPILOT_PROFILES id '${id}' must be alphanumeric (dashes allowed)`
+          );
+        }
+        if (!Number.isInteger(wsPort) || wsPort < 1 || wsPort > 65535) {
+          throw new Error(
+            `REMOTE_COPILOT_PROFILES port '${portStr}' must be a valid port number`
+          );
+        }
+        out.push({ id, wsPort, token });
+      }
+      return out;
+    }),
+
   TURN_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(3600).default(900),
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])

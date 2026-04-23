@@ -7,6 +7,7 @@ import { SessionRouter } from "./core/session-router.js";
 import { makeCopilotProfile } from "./agents/profiles/copilot.js";
 import { makeGeminiProfile } from "./agents/profiles/gemini.js";
 import { makeClaudeProfile } from "./agents/profiles/claude.js";
+import { makeRemoteCopilotProfile } from "./agents/profiles/remote.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { Orchestrator } from "./platforms/discord/orchestrator.js";
@@ -83,10 +84,19 @@ async function main(): Promise<void> {
     })
   );
 
+  const remoteCopilots = config.REMOTE_COPILOT_PROFILES.map((p) =>
+    makeRemoteCopilotProfile({
+      id: `copilot-remote-${p.id}`,
+      wsPort: p.wsPort,
+      token: p.token,
+      defaultModel: config.DEFAULT_MODEL,
+    })
+  );
+
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, ...extraCopilots, gemini, ...extraGeminis, claude, ...extraClaudes],
+    profiles: [copilot, ...extraCopilots, gemini, ...extraGeminis, claude, ...extraClaudes, ...remoteCopilots],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".

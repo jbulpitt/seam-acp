@@ -47,6 +47,7 @@ Copy `.env.example` to `.env` and fill it in.
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
 | `CLAUDE_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `claude-<id>` profile pinned to its own `CLAUDE_CONFIG_DIR`. See "Multiple Claude accounts" below. |
+| `REMOTE_COPILOT_PROFILES` | no | Register Copilot profiles running on remote machines via WebSocket bridge. Format: `id:port:token` (comma-separated). Each entry starts a local WS server and registers a `copilot-remote-<id>` profile. See [docs/remote-agent.md](docs/remote-agent.md). |
 | `TURN_TIMEOUT_SECONDS` | no | Default 900 |
 | `LOG_LEVEL` | no | `fatal` / `error` / `warn` / `info` / `debug` / `trace` |
 | `HEALTH_PORT` | no | Default 3000 — exposes `GET /health` |
@@ -239,6 +240,25 @@ account from `<config-dir>/.credentials.json` (and a couple of fallbacks).
 If that fails (file format changes upstream, etc.) the command still
 reports which profile id you're on.
 
+### Remote agent profiles (Mac / off-server machine)
+
+You can run an agent CLI on a **separate machine** — one that cannot accept inbound connections — and expose it as a regular agent profile. This uses a WebSocket relay bridge that the remote machine connects to outbound.
+
+Typical use case: a Mac laptop with `copilot` authenticated under a personal account, sitting behind NAT, that cannot be SSH'd into.
+
+```sh
+# .env on the seam-acp server
+REMOTE_COPILOT_PROFILES=mac:9999:your-secret-token
+```
+
+The profile appears in `/seam agent` as `copilot-remote-mac`. On the Mac, run the bridge script:
+
+```sh
+node scripts/remote-agent-bridge.mjs wss://agent.yourdomain.com your-secret-token
+```
+
+For full setup instructions including Cloudflare Tunnel (recommended — no open inbound ports on either machine), see **[docs/remote-agent.md](docs/remote-agent.md)**.
+
 ### MCP servers
 
 The bot can attach Model Context Protocol servers globally to every
@@ -269,7 +289,7 @@ AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agen
 - **`src/platforms/chat-adapter.ts`** — generic chat platform interface.
 - **`src/platforms/discord/`** — discord.js v14 implementation + slash commands + repo picker.
 - **`src/agents/agent-runtime.ts`** — wraps `@agentclientprotocol/sdk` + a child process running an ACP server. Handles `initialize`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, model / mode / config option setters, and emits typed events.
-- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Sibling profiles ship for Google Gemini (`gemini.ts`) and Anthropic Claude Code (`claude.ts`, via the `claude-agent-acp` adapter). Add a new profile by writing one of these.
+- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Sibling profiles ship for Google Gemini (`gemini.ts`) and Anthropic Claude Code (`claude.ts`, via the `claude-agent-acp` adapter). **`remote.ts`** provides a WebSocket-backed profile for agent CLIs running on separate machines (see [docs/remote-agent.md](docs/remote-agent.md)). Add a new profile by writing one of these.
 - **`src/core/`** — pure utilities: text chunker, path safety, sqlite store, session router, status panel.
 
 ## Testing

@@ -76,7 +76,10 @@ export async function mapAttachmentsToBlocks(
           });
           continue;
         }
-        blocks.push(toResourceLink(a));
+        rejected.push({
+          filename: a.filename,
+          reason: "this agent does not support image attachments",
+        });
         continue;
       }
 
@@ -112,12 +115,25 @@ export async function mapAttachmentsToBlocks(
           });
           continue;
         }
-        blocks.push(toResourceLink(a));
+        if (!caps?.embeddedContext) {
+          rejected.push({
+            filename: a.filename,
+            reason: "this agent does not support inline file content",
+          });
+        } else {
+          rejected.push({
+            filename: a.filename,
+            reason: `file too large to inline (limit is ${formatBytes(MAX_INLINE_TEXT_BYTES)}); save it to the repo and reference the path`,
+          });
+        }
         continue;
       }
 
-      // Unknown / generic binary: always-supported resource_link.
-      blocks.push(toResourceLink(a));
+      // Unknown / generic binary (e.g. docx, pdf, zip): cannot be inlined.
+      rejected.push({
+        filename: a.filename,
+        reason: "binary format cannot be sent to the agent; save the file to your repo and reference the path instead",
+      });
     } catch (err) {
       opts.logger?.warn(
         { err, filename: a.filename, url: a.url },

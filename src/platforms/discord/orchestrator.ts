@@ -270,6 +270,13 @@ export class Orchestrator {
       );
     };
 
+    // A 400 error from the agent means the current prompt was rejected (e.g.
+    // invalid image). The session itself may still be valid, but we invalidate
+    // anyway so the next message doesn't replay the same bad content.
+    const isAgentRejectionError = (e: unknown): boolean => {
+      return (e as any)?.code === 400;
+    };
+
     try {
       let activeRuntime = await this.router.getOrStartRuntime(record);
       const eventHandler = async (event: Parameters<Parameters<typeof activeRuntime.onEvent>[0]>[0]) => {
@@ -584,6 +591,9 @@ export class Orchestrator {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (isSessionGoneError(err)) {
         this.logger.warn({ session: record.id }, "session not found on agent; invalidating runtime");
+        await this.router.invalidate(record.id, { clearAcpSession: true });
+      } else if (isAgentRejectionError(err)) {
+        this.logger.warn({ session: record.id }, "agent rejected prompt (400); invalidating session to prevent replay");
         await this.router.invalidate(record.id, { clearAcpSession: true });
       }
       status.setState("Failed");

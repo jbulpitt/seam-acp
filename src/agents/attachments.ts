@@ -76,10 +76,8 @@ export async function mapAttachmentsToBlocks(
           });
           continue;
         }
-        rejected.push({
-          filename: a.filename,
-          reason: "this agent does not support image attachments",
-        });
+        // No vision capability — send as a link so a local agent can still reference it.
+        blocks.push(toResourceLink(a));
         continue;
       }
 
@@ -115,25 +113,27 @@ export async function mapAttachmentsToBlocks(
           });
           continue;
         }
-        if (!caps?.embeddedContext) {
-          rejected.push({
-            filename: a.filename,
-            reason: "this agent does not support inline file content",
-          });
-        } else {
-          rejected.push({
-            filename: a.filename,
-            reason: `file too large to inline (limit is ${formatBytes(MAX_INLINE_TEXT_BYTES)}); save it to the repo and reference the path`,
-          });
-        }
+        // Too large to inline or no capability — send as a link.
+        blocks.push(toResourceLink(a));
         continue;
       }
 
-      // Unknown / generic binary (e.g. docx, pdf, zip): cannot be inlined.
-      rejected.push({
-        filename: a.filename,
-        reason: "binary format cannot be sent to the agent; save the file to your repo and reference the path instead",
-      });
+      // Unknown / generic binary (e.g. docx, pdf, zip).
+      // Inline as a blob if the agent supports embedded context; otherwise send
+      // as a resource_link so a local agent with network tools can fetch it.
+      if (caps?.embeddedContext && a.size <= MAX_BYTES_PER_ATTACHMENT) {
+        const blob = await downloadBase64(a.url, fetchFn);
+        blocks.push({
+          type: "resource",
+          resource: {
+            uri: `attachment://${a.filename}`,
+            mimeType: mime || "application/octet-stream",
+            blob,
+          },
+        } as import("@agentclientprotocol/sdk").ContentBlock);
+        continue;
+      }
+      blocks.push(toResourceLink(a));
     } catch (err) {
       opts.logger?.warn(
         { err, filename: a.filename, url: a.url },
@@ -150,9 +150,8 @@ function toResourceLink(a: MessageAttachment): ContentBlock {
   return {
     type: "resource_link",
     name: a.filename,
-    // Use a local URI — the source URL is ephemeral and auth-gated (e.g.
-    // Discord CDN) and must not be forwarded to the agent.
-    uri: `attachment://${a.filename}`,
+    // Use the original source URL so local agents with network tools can fetch it.
+    uri: a.url,
     ...(a.contentType ? { mimeType: a.contentType } : {}),
     ...(typeof a.size === "number" ? { size: a.size } : {}),
   };

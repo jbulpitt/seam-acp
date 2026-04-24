@@ -56,14 +56,14 @@ describe("mapAttachmentsToBlocks", () => {
     });
   });
 
-  it("rejects images when capability missing", async () => {
+  it("falls back to resource_link for images when capability missing", async () => {
     const url = "https://cdn.example/cat.png";
     const r = await mapAttachmentsToBlocks(
       [a({ url, filename: "cat.png", contentType: "image/png", size: 3 })],
       { capabilities: {} }
     );
-    expect(r.blocks).toHaveLength(0);
-    expect(r.rejected[0]).toMatchObject({ filename: "cat.png", reason: expect.stringContaining("image") });
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url, name: "cat.png" });
+    expect(r.rejected).toHaveLength(0);
   });
 
   it("rejects audio when capability missing", async () => {
@@ -110,32 +110,45 @@ describe("mapAttachmentsToBlocks", () => {
     expect(r.blocks[0]).toMatchObject({ type: "resource" });
   });
 
-  it("rejects text files when over inline-size limit", async () => {
+  it("falls back to resource_link for text files when over inline-size limit", async () => {
     const url = "https://cdn.example/big.txt";
     const r = await mapAttachmentsToBlocks(
       [a({ url, filename: "big.txt", contentType: "text/plain", size: MAX_INLINE_TEXT_BYTES + 1 })],
       { capabilities: { embeddedContext: true } }
     );
-    expect(r.blocks).toHaveLength(0);
-    expect(r.rejected[0]).toMatchObject({ filename: "big.txt", reason: expect.stringContaining("too large") });
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url });
+    expect(r.rejected).toHaveLength(0);
   });
 
-  it("rejects text files when capability missing", async () => {
+  it("falls back to resource_link for text files when capability missing", async () => {
+    const url = "https://cdn.example/notes.md";
     const r = await mapAttachmentsToBlocks(
-      [a({ filename: "notes.md", contentType: "text/markdown", size: 10 })],
+      [a({ url, filename: "notes.md", contentType: "text/markdown", size: 10 })],
       { capabilities: {} }
     );
-    expect(r.blocks).toHaveLength(0);
-    expect(r.rejected[0]).toMatchObject({ filename: "notes.md" });
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url, name: "notes.md" });
+    expect(r.rejected).toHaveLength(0);
   });
 
-  it("rejects unknown binary types", async () => {
+  it("inlines unknown binary as blob when embeddedContext present", async () => {
+    const url = "https://cdn.example/report.docx";
+    const bytes = new Uint8Array([1, 2, 3]);
     const r = await mapAttachmentsToBlocks(
-      [a({ filename: "report.docx", contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", size: 100 })],
-      { capabilities: { image: true, embeddedContext: true } }
+      [a({ url, filename: "report.docx", contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", size: 3 })],
+      { capabilities: { embeddedContext: true }, fetchFn: fakeFetch({ [url]: { body: bytes } }) }
     );
-    expect(r.blocks).toHaveLength(0);
-    expect(r.rejected[0]).toMatchObject({ filename: "report.docx", reason: expect.stringContaining("binary") });
+    expect(r.blocks[0]).toMatchObject({ type: "resource" });
+    expect(r.rejected).toHaveLength(0);
+  });
+
+  it("falls back to resource_link for unknown binary when no embeddedContext", async () => {
+    const url = "https://cdn.example/report.docx";
+    const r = await mapAttachmentsToBlocks(
+      [a({ url, filename: "report.docx", contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", size: 100 })],
+      { capabilities: {} }
+    );
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url });
+    expect(r.rejected).toHaveLength(0);
   });
 
   it("rejects attachments larger than the per-file byte limit", async () => {
@@ -149,15 +162,11 @@ describe("mapAttachmentsToBlocks", () => {
   });
 
   it("rejects attachments past the count limit", async () => {
-    // Use text files with embeddedContext so the first MAX_ATTACHMENTS inline fine;
-    // the extras are rejected for exceeding the limit.
-    const url = "https://cdn.example/f.txt";
-    const text = "hi";
     const list = Array.from({ length: MAX_ATTACHMENTS + 2 }, (_, i) =>
-      a({ url, filename: `f${i}.txt`, contentType: "text/plain", size: text.length })
+      a({ filename: `f${i}.dat`, contentType: "application/x-thing", size: 10 })
     );
-    const fetchAll = fakeFetch(Object.fromEntries(list.map((f) => [url, { body: text }])));
-    const r = await mapAttachmentsToBlocks(list, { capabilities: { embeddedContext: true }, fetchFn: fetchAll });
+    const r = await mapAttachmentsToBlocks(list, { capabilities: {} });
+    // With no embeddedContext, binary files become resource_links (not rejected).
     expect(r.blocks).toHaveLength(MAX_ATTACHMENTS);
     expect(r.rejected).toHaveLength(2);
     expect(r.rejected[0].reason).toMatch(/limit/i);
@@ -172,7 +181,7 @@ describe("mapAttachmentsToBlocks", () => {
       [a({ url, filename: "cat.png", contentType: "image/png", size: 3 })],
       { capabilities: { image: true }, fetchFn: failing }
     );
-    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: "attachment://cat.png" });
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url });
     expect(r.rejected).toEqual([]);
   });
 });

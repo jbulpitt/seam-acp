@@ -64,7 +64,7 @@ describe("mapAttachmentsToBlocks", () => {
     );
     expect(r.blocks[0]).toMatchObject({
       type: "resource_link",
-      uri: url,
+      uri: "attachment://cat.png",
       name: "cat.png",
       mimeType: "image/png",
     });
@@ -100,7 +100,7 @@ describe("mapAttachmentsToBlocks", () => {
     );
     expect(r.blocks[0]).toMatchObject({
       type: "resource",
-      resource: { uri: url, mimeType: "text/markdown", text },
+      resource: { uri: "attachment://notes.md", mimeType: "text/markdown", text },
     });
   });
 
@@ -120,7 +120,7 @@ describe("mapAttachmentsToBlocks", () => {
       [a({ url, filename: "big.txt", contentType: "text/plain", size: MAX_INLINE_TEXT_BYTES + 1 })],
       { capabilities: { embeddedContext: true } }
     );
-    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url });
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: "attachment://big.txt" });
   });
 
   it("falls back to resource_link for text files when capability missing", async () => {
@@ -168,7 +168,7 @@ describe("mapAttachmentsToBlocks", () => {
       [a({ url, filename: "cat.png", contentType: "image/png", size: 3 })],
       { capabilities: { image: true }, fetchFn: failing }
     );
-    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url });
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: "attachment://cat.png" });
     expect(r.rejected).toEqual([]);
   });
 });

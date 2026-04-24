@@ -103,7 +103,9 @@ export async function mapAttachmentsToBlocks(
           blocks.push({
             type: "resource",
             resource: {
-              uri: a.url,
+              // Use a local URI — the content is already inlined and the agent
+              // must not attempt to fetch the (ephemeral, auth-gated) source URL.
+              uri: `attachment://${a.filename}`,
               mimeType: mime || "text/plain",
               text,
             },
@@ -132,7 +134,9 @@ function toResourceLink(a: MessageAttachment): ContentBlock {
   return {
     type: "resource_link",
     name: a.filename,
-    uri: a.url,
+    // Use a local URI — the source URL is ephemeral and auth-gated (e.g.
+    // Discord CDN) and must not be forwarded to the agent.
+    uri: `attachment://${a.filename}`,
     ...(a.contentType ? { mimeType: a.contentType } : {}),
     ...(typeof a.size === "number" ? { size: a.size } : {}),
   };

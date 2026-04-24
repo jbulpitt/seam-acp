@@ -150,8 +150,7 @@ function toResourceLink(a: MessageAttachment): ContentBlock {
   return {
     type: "resource_link",
     name: a.filename,
-    // Use the original source URL so local agents with network tools can fetch it.
-    uri: a.url,
+    uri: `attachment://${a.filename}`,
     ...(a.contentType ? { mimeType: a.contentType } : {}),
     ...(typeof a.size === "number" ? { size: a.size } : {}),
   };

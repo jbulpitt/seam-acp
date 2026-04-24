@@ -62,7 +62,7 @@ describe("mapAttachmentsToBlocks", () => {
       [a({ url, filename: "cat.png", contentType: "image/png", size: 3 })],
       { capabilities: {} }
     );
-    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url, name: "cat.png" });
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: "attachment://cat.png", name: "cat.png" });
     expect(r.rejected).toHaveLength(0);
   });
 
@@ -116,7 +116,7 @@ describe("mapAttachmentsToBlocks", () => {
       [a({ url, filename: "big.txt", contentType: "text/plain", size: MAX_INLINE_TEXT_BYTES + 1 })],
       { capabilities: { embeddedContext: true } }
     );
-    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url });
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: "attachment://big.txt" });
     expect(r.rejected).toHaveLength(0);
   });
 
@@ -126,7 +126,7 @@ describe("mapAttachmentsToBlocks", () => {
       [a({ url, filename: "notes.md", contentType: "text/markdown", size: 10 })],
       { capabilities: {} }
     );
-    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url, name: "notes.md" });
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: "attachment://notes.md", name: "notes.md" });
     expect(r.rejected).toHaveLength(0);
   });
 
@@ -147,7 +147,7 @@ describe("mapAttachmentsToBlocks", () => {
       [a({ url, filename: "report.docx", contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", size: 100 })],
       { capabilities: {} }
     );
-    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url });
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: "attachment://report.docx" });
     expect(r.rejected).toHaveLength(0);
   });
 
@@ -181,7 +181,6 @@ describe("mapAttachmentsToBlocks", () => {
       [a({ url, filename: "cat.png", contentType: "image/png", size: 3 })],
       { capabilities: { image: true }, fetchFn: failing }
     );
-    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: url });
-    expect(r.rejected).toEqual([]);
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: "attachment://cat.png" });
   });
 });

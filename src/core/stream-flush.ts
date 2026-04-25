@@ -148,6 +148,34 @@ export function findFirstUnsafeIndex(buf: string): number {
   return stack[0]!.start;
 }
 
+/**
+ * Returns true if position `pos` in `buf` is inside a single-backtick
+ * inline-code span (e.g. `foo`).  Multi-backtick runs (`` `` ``, ` ``` `)
+ * are skipped — triple-backtick fences are consumed upstream by FenceStream
+ * and never appear in the prose buffer.
+ */
+function isInsideInlineCode(buf: string, pos: number): boolean {
+  let inCode = false;
+  let i = 0;
+  while (i < pos) {
+    if (buf.charCodeAt(i) === 96 /* ` */) {
+      // Count the backtick run length.
+      let run = 1;
+      while (i + run < buf.length && buf.charCodeAt(i + run) === 96) run++;
+      if (run === 1) {
+        // Single backtick toggles the inline-code state.
+        inCode = !inCode;
+      }
+      // Multi-backtick runs are skipped (they open/close a different span
+      // kind that we don't track here).
+      i += run;
+    } else {
+      i++;
+    }
+  }
+  return inCode;
+}
+
 /** Best clean split point in [minIdx, maxIdx]. Returns -1 if none found. */
 function findCleanSplit(
   buf: string,
@@ -158,14 +186,29 @@ function findCleanSplit(
   const window = buf.slice(0, Math.min(buf.length, maxIdx));
 
   // Paragraph break (preferred — only safe boundary mid-stream).
-  const para = window.lastIndexOf("\n\n");
-  if (para >= minIdx) return { idx: para, skip: 2 };
+  // Scan backwards so we find the latest one that is not inside a code span.
+  {
+    let end = window.length;
+    while (true) {
+      const para = window.lastIndexOf("\n\n", end - 1);
+      if (para < minIdx) break;
+      if (!isInsideInlineCode(window, para)) return { idx: para, skip: 2 };
+      end = para; // try an earlier paragraph break
+    }
+  }
 
   if (paragraphOnly) return null;
 
-  // Line break
-  const nl = window.lastIndexOf("\n");
-  if (nl >= minIdx) return { idx: nl, skip: 1 };
+  // Line break — find the last one that is not inside an inline-code span.
+  {
+    let end = window.length;
+    while (true) {
+      const nl = window.lastIndexOf("\n", end - 1);
+      if (nl < minIdx) break;
+      if (!isInsideInlineCode(window, nl)) return { idx: nl, skip: 1 };
+      end = nl; // try an earlier line break
+    }
+  }
 
   // Sentence break: ". ", "! ", "? "
   for (let i = window.length - 2; i >= minIdx; i--) {

@@ -234,3 +234,53 @@ describe("splitForFlush — link-aware (soft)", () => {
     });
   });
 });
+
+describe("splitForFlush — inline code span protection", () => {
+  it("force: does not split at \\n inside a backtick span (over-cap path)", () => {
+    // Simulates `docusign_agent\n` where the newline is inside the span.
+    // The safe \n is before the opening backtick; the \n inside the span is skipped.
+    const buf = "prefix text\n`name\nmore` suffix";
+    const out = splitForFlush(buf, { maxLen: 18, force: true });
+    expect(out).not.toBeNull();
+    expect(out!.send).toBe("prefix text");
+    expect(out!.keep).toBe("`name\nmore` suffix");
+  });
+
+  it("force: sends whole buffer when span is closed and buffer fits", () => {
+    // A closed span with a newline inside — fits in maxLen, so sent whole.
+    const buf = "before\n`code\nspan` after";
+    const out = splitForFlush(buf, { maxLen: 200, force: true });
+    expect(out).toEqual({ send: buf, keep: "" });
+  });
+
+  it("soft: skips \\n\\n inside a backtick span", () => {
+    // Double newline inside a span — very unusual, but must not be chosen.
+    const buf = "intro `code\n\nspan` done.\n\nParagraph two";
+    const out = splitForFlush(buf, { maxLen: 200, force: false });
+    expect(out).not.toBeNull();
+    // The \n\n after "done." is outside the span and should be chosen.
+    expect(out!.send).toBe("intro `code\n\nspan` done.");
+    expect(out!.keep).toBe("Paragraph two");
+  });
+
+  it("allowUnsafeCut still splits even inside a backtick span", () => {
+    // End-of-turn drain must always produce output.
+    const buf = "line one\n`code\nspan` line three";
+    const out = splitForFlush(buf, {
+      maxLen: 200,
+      force: true,
+      allowUnsafeCut: true,
+    });
+    expect(out).toEqual({ send: buf, keep: "" });
+  });
+
+  it("multi-backtick run does not count as inline code opener", () => {
+    // ``double`` inline uses 2-backtick delimiters; single-backtick tracking
+    // ignores those runs, so the \n inside is a valid split point.
+    const buf = "``double\nnot code`` rest";
+    const out = splitForFlush(buf, { maxLen: 12, force: true });
+    expect(out).not.toBeNull();
+    expect(out!.send).toBe("``double");
+    expect(out!.keep).toBe("not code`` rest");
+  });
+});

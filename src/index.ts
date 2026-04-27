@@ -12,6 +12,7 @@ import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { Orchestrator } from "./platforms/discord/orchestrator.js";
 import { buildGlobalMcpServers } from "./mcp.js";
+import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -152,11 +153,22 @@ async function main(): Promise<void> {
 
   logger.info("seam-acp ready");
 
+  // Best-effort startup notification to a configured channel.
+  void orchestrator.postNotification("✅ Seam online.");
+
+  // Publish quick-tunnel URL to gist whenever it changes.
+  let stopTunnelGist: (() => void) | undefined;
+  if (config.TUNNEL_GIST_ID) {
+    const urlFile = path.join(config.DATA_DIR, "tunnel-url.txt");
+    stopTunnelGist = startTunnelGistPublisher(config.TUNNEL_GIST_ID, urlFile, logger);
+  }
+
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, "shutting down");
+    stopTunnelGist?.();
     try {
       await adapter.stop();
     } catch (err) {

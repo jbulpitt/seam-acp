@@ -266,9 +266,57 @@ const Schema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
+
+  /**
+   * Optional Discord channel/thread id where bot lifecycle notifications
+   * (startup, restart pending) are posted. When unset, no notifications are
+   * sent.
+   */
+  DISCORD_NOTIFICATIONS_CHANNEL_ID: z
+    .string()
+    .regex(/^\d+$/, "DISCORD_NOTIFICATIONS_CHANNEL_ID must be a numeric Discord channel id")
+    .optional(),
+
+  /**
+   * Optional path to a JSON file that pre-configures specific Discord parent
+   * channels with locked or default agent / model / cwd. When unset, the
+   * feature is inactive. See PresetsFileSchema below for the shape.
+   */
+  CHANNEL_PRESETS_FILE: z.string().optional(),
+
+  /**
+   * Optional GitHub Gist ID used to publish the current Cloudflare quick-tunnel
+   * WebSocket URL on startup. When set, seam-acp writes the current wss://
+   * URL from data/tunnel-url.txt to the gist so remote bridge scripts can
+   * discover the endpoint without a stable hostname. Requires `gh` CLI to be
+   * authenticated. The gist is also re-published whenever the tunnel URL file
+   * changes (i.e. after an independent cloudflared restart).
+   */
+  TUNNEL_GIST_ID: z.string().optional(),
 });
 
-export type Config = z.infer<typeof Schema>;
+const PresetFieldSchema = <T extends z.ZodType>(value: T) =>
+  z.object({ value, locked: z.boolean().optional().default(false) });
+
+const PresetsFileSchema = z.record(
+  z.string().regex(/^\d+$/, "preset key must be a numeric Discord channel id"),
+  z.object({
+    agent: PresetFieldSchema(z.string().min(1)).optional(),
+    model: PresetFieldSchema(z.string().min(1)).optional(),
+    cwd: PresetFieldSchema(z.string().min(1)).optional(),
+  })
+);
+
+export type ChannelPresetField<T> = { value: T; locked: boolean };
+export type ChannelPreset = {
+  agent?: ChannelPresetField<string>;
+  model?: ChannelPresetField<string>;
+  cwd?: ChannelPresetField<string>;
+};
+
+export type Config = z.infer<typeof Schema> & {
+  channelPresets: Map<string, ChannelPreset>;
+};
 
 export function loadConfig(): Config {
   const parsed = Schema.safeParse(process.env);
@@ -288,5 +336,45 @@ export function loadConfig(): Config {
     );
   }
   cfg.REPOS_ROOT = reposRoot;
-  return cfg;
+
+  const channelPresets = loadChannelPresets(cfg.CHANNEL_PRESETS_FILE);
+  return { ...cfg, channelPresets };
+}
+
+function loadChannelPresets(file: string | undefined): Map<string, ChannelPreset> {
+  const out = new Map<string, ChannelPreset>();
+  if (!file) return out;
+  const abs = path.resolve(file);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(abs, "utf8");
+  } catch (err) {
+    throw new Error(
+      `CHANNEL_PRESETS_FILE could not be read: ${abs} (${(err as Error).message})`
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(
+      `CHANNEL_PRESETS_FILE is not valid JSON: ${abs} (${(err as Error).message})`
+    );
+  }
+  const result = PresetsFileSchema.safeParse(parsed);
+  if (!result.success) {
+    const issues = result.error.issues
+      .map((i) => `  - ${i.path.join(".") || "(root)"}: ${i.message}`)
+      .join("\n");
+    throw new Error(`Invalid CHANNEL_PRESETS_FILE (${abs}):\n${issues}`);
+  }
+  for (const [channelId, preset] of Object.entries(result.data)) {
+    if (!preset) continue;
+    const normalized: ChannelPreset = {};
+    if (preset.agent) normalized.agent = preset.agent;
+    if (preset.model) normalized.model = preset.model;
+    if (preset.cwd) normalized.cwd = { ...preset.cwd, value: path.resolve(preset.cwd.value) };
+    out.set(channelId, normalized);
+  }
+  return out;
 }

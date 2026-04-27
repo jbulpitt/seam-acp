@@ -256,20 +256,59 @@ async function runServerMode(port, token, copilotCmd, localCwd) {
 
 const rawArgs = process.argv.slice(2);
 
-// Extract --cwd <path> from args
-let localCwd = process.cwd();
-const cwdIdx = rawArgs.indexOf("--cwd");
-if (cwdIdx !== -1) {
-  const cwdVal = rawArgs[cwdIdx + 1];
-  if (!cwdVal || cwdVal.startsWith("-")) {
-    console.error("Error: --cwd requires a path argument");
+/** Extract a named flag + its value from rawArgs in-place. Returns value or null. */
+function extractFlag(flag) {
+  const idx = rawArgs.indexOf(flag);
+  if (idx === -1) return null;
+  const val = rawArgs[idx + 1];
+  if (!val || val.startsWith("-")) {
+    console.error(`Error: ${flag} requires a value argument`);
     process.exit(1);
   }
-  localCwd = cwdVal.replace(/^~/, homedir());
-  rawArgs.splice(cwdIdx, 2);
+  rawArgs.splice(idx, 2);
+  return val;
 }
 
+// Extract all named flags before touching positional args.
+const cwdArg = extractFlag("--cwd");
+const gistArg = extractFlag("--gist");
+
+let localCwd = cwdArg ? cwdArg.replace(/^~/, homedir()) : process.cwd();
+
 console.error(`[bridge] Local cwd: ${localCwd}`);
+
+/**
+ * Resolve a WebSocket URL from a GitHub Gist.
+ * Uses the GitHub API to avoid hardcoding the owner username in the raw URL.
+ */
+async function resolveUrlFromGist(gistId) {
+  console.error(`[bridge] Fetching tunnel URL from gist ${gistId} …`);
+  const apiRes = await fetch(`https://api.github.com/gists/${gistId}`, {
+    headers: { "User-Agent": "seam-acp-bridge", Accept: "application/vnd.github+json" },
+  });
+  if (!apiRes.ok) {
+    console.error(`[bridge] Gist API error: ${apiRes.status} ${apiRes.statusText}`);
+    process.exit(1);
+  }
+  const gist = await apiRes.json();
+  const file = gist.files?.["tunnel-url.txt"];
+  if (!file?.raw_url) {
+    console.error("[bridge] Gist does not contain tunnel-url.txt");
+    process.exit(1);
+  }
+  const rawRes = await fetch(file.raw_url, { headers: { "User-Agent": "seam-acp-bridge" } });
+  if (!rawRes.ok) {
+    console.error(`[bridge] Failed to fetch raw gist content: ${rawRes.status}`);
+    process.exit(1);
+  }
+  const url = (await rawRes.text()).trim();
+  if (!url.startsWith("wss://")) {
+    console.error(`[bridge] Unexpected URL in gist: ${url}`);
+    process.exit(1);
+  }
+  console.error(`[bridge] Resolved tunnel URL: ${url}`);
+  return url;
+}
 
 if (rawArgs[0] === "--server") {
   const port = Number(rawArgs[1]);
@@ -283,15 +322,34 @@ if (rawArgs[0] === "--server") {
 
   runServerMode(port, token, copilotCmd, localCwd);
 } else {
-  const wsUrl = rawArgs[0];
+  // wsUrl may come from --gist flag or as a positional arg.
+  const wsUrlPositional = rawArgs[0];
   const token = rawArgs[1];
   const copilotCmd = process.env.COPILOT_CMD ?? rawArgs[2] ?? "copilot";
 
-  if (!wsUrl || !token) {
-    console.error("Usage: node remote-agent-bridge.mjs <ws-url> <token> [--cwd <path>] [copilot-cmd]");
+  if (!token && !gistArg) {
+    console.error("Usage: node remote-agent-bridge.mjs [--gist <gistId>] <ws-url> <token> [--cwd <path>] [copilot-cmd]");
     console.error("       node remote-agent-bridge.mjs --server <port> <token> [--cwd <path>] [copilot-cmd]");
     process.exit(1);
   }
 
-  runClientMode(wsUrl, token, copilotCmd, localCwd);
+  if (gistArg) {
+    // When --gist is provided the positional arg order shifts: token is first.
+    const tokenFromArg = rawArgs[0];
+    const copilotCmdFromArg = process.env.COPILOT_CMD ?? rawArgs[1] ?? "copilot";
+    if (!tokenFromArg) {
+      console.error("Usage: node remote-agent-bridge.mjs --gist <gistId> <token> [--cwd <path>] [copilot-cmd]");
+      process.exit(1);
+    }
+    resolveUrlFromGist(gistArg).then((wsUrl) => {
+      runClientMode(wsUrl, tokenFromArg, copilotCmdFromArg, localCwd);
+    });
+  } else {
+    if (!wsUrlPositional || !token) {
+      console.error("Usage: node remote-agent-bridge.mjs <ws-url> <token> [--cwd <path>] [copilot-cmd]");
+      console.error("       node remote-agent-bridge.mjs --server <port> <token> [--cwd <path>] [copilot-cmd]");
+      process.exit(1);
+    }
+    runClientMode(wsUrlPositional, token, copilotCmd, localCwd);
+  }
 }

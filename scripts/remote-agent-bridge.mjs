@@ -79,7 +79,7 @@ function rewriteCwdInChunk(text, localCwd) {
   return rewritten;
 }
 
-function spawnAgent(copilotCmd) {
+function spawnAgent(copilotCmd, localCwd) {
   const ghToken = process.env.GH_TOKEN || (() => {
     try { return execSync("gh auth token", { stdio: ["pipe", "pipe", "ignore"] }).toString().trim(); }
     catch { return ""; }
@@ -92,6 +92,7 @@ function spawnAgent(copilotCmd) {
   const cmdArgs = [...cmdParts.slice(1), ...extraArgs];
   console.error(`[bridge] Spawning agent: ${cmd} ${cmdArgs.join(" ")} (GH_TOKEN: ${ghToken ? ghToken.slice(0, 8) + "..." : "MISSING"})`);
   return spawn(cmd, cmdArgs, {
+    cwd: localCwd,
     stdio: ["pipe", "pipe", "inherit"],
     env: { ...process.env, ...(ghToken ? { GH_TOKEN: ghToken } : {}) },
   });
@@ -126,7 +127,7 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
     if (slots.has(slot)) return slots.get(slot);
 
     console.error(`[bridge] Slot ${slot}: spawning agent`);
-    const agent = spawnAgent(copilotCmd);
+    const agent = spawnAgent(copilotCmd, localCwd);
     slots.set(slot, agent);
 
     agent.stdout.on("data", (chunk) => {

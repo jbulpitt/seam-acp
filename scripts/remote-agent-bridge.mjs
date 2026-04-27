@@ -279,29 +279,24 @@ console.error(`[bridge] Local cwd: ${localCwd}`);
 
 /**
  * Resolve a WebSocket URL from a GitHub Gist.
- * Uses the GitHub API to avoid hardcoding the owner username in the raw URL.
+ * Accepts "owner/gistId" and fetches the raw content directly from
+ * gist.githubusercontent.com — no API call, no rate limits.
  */
-async function resolveUrlFromGist(gistId) {
-  console.error(`[bridge] Fetching tunnel URL from gist ${gistId} …`);
-  const apiRes = await fetch(`https://api.github.com/gists/${gistId}`, {
-    headers: { "User-Agent": "seam-acp-bridge", Accept: "application/vnd.github+json" },
-  });
-  if (!apiRes.ok) {
-    console.error(`[bridge] Gist API error: ${apiRes.status} ${apiRes.statusText}`);
+async function resolveUrlFromGist(ownerAndId) {
+  const parts = ownerAndId.split("/");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    console.error(`[bridge] --gist must be in "owner/gistId" format, got: ${ownerAndId}`);
     process.exit(1);
   }
-  const gist = await apiRes.json();
-  const file = gist.files?.["tunnel-url.txt"];
-  if (!file?.raw_url) {
-    console.error("[bridge] Gist does not contain tunnel-url.txt");
+  const [owner, gistId] = parts;
+  const rawUrl = `https://gist.githubusercontent.com/${owner}/${gistId}/raw/tunnel-url.txt`;
+  console.error(`[bridge] Fetching tunnel URL from gist …`);
+  const res = await fetch(rawUrl, { headers: { "User-Agent": "seam-acp-bridge" } });
+  if (!res.ok) {
+    console.error(`[bridge] Failed to fetch gist content: ${res.status} ${res.statusText}`);
     process.exit(1);
   }
-  const rawRes = await fetch(file.raw_url, { headers: { "User-Agent": "seam-acp-bridge" } });
-  if (!rawRes.ok) {
-    console.error(`[bridge] Failed to fetch raw gist content: ${rawRes.status}`);
-    process.exit(1);
-  }
-  const url = (await rawRes.text()).trim();
+  const url = (await res.text()).trim();
   if (!url.startsWith("wss://")) {
     console.error(`[bridge] Unexpected URL in gist: ${url}`);
     process.exit(1);
@@ -328,7 +323,7 @@ if (rawArgs[0] === "--server") {
   const copilotCmd = process.env.COPILOT_CMD ?? rawArgs[2] ?? "copilot";
 
   if (!token && !gistArg) {
-    console.error("Usage: node remote-agent-bridge.mjs [--gist <gistId>] <ws-url> <token> [--cwd <path>] [copilot-cmd]");
+    console.error("Usage: node remote-agent-bridge.mjs [--gist <owner/gistId>] <ws-url> <token> [--cwd <path>] [copilot-cmd]");
     console.error("       node remote-agent-bridge.mjs --server <port> <token> [--cwd <path>] [copilot-cmd]");
     process.exit(1);
   }
@@ -338,7 +333,7 @@ if (rawArgs[0] === "--server") {
     const tokenFromArg = rawArgs[0];
     const copilotCmdFromArg = process.env.COPILOT_CMD ?? rawArgs[1] ?? "copilot";
     if (!tokenFromArg) {
-      console.error("Usage: node remote-agent-bridge.mjs --gist <gistId> <token> [--cwd <path>] [copilot-cmd]");
+      console.error("Usage: node remote-agent-bridge.mjs --gist <owner/gistId> <token> [--cwd <path>] [copilot-cmd]");
       process.exit(1);
     }
     resolveUrlFromGist(gistArg).then((wsUrl) => {

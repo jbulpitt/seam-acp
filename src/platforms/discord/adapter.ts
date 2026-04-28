@@ -7,6 +7,7 @@ import {
   REST,
   Routes,
   MessageFlags,
+  MessageType,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -325,6 +326,7 @@ export class DiscordAdapter implements ChatAdapter {
   private async handleMessage(msg: Message): Promise<void> {
     if (!this.messageHandler) return;
     if (msg.author.bot) return;
+    if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) return;
     if (!this.config.DISCORD_ALLOWED_USER_IDS.has(msg.author.id)) return;
     if (!msg.channel.isThread()) return;
 

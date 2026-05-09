@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { promises as fsp } from "node:fs";
+import fs, { promises as fsp } from "node:fs";
 import path from "node:path";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { AgentIdentity, AgentProfile } from "../agent-profile.js";
@@ -49,14 +49,21 @@ export function makeCopilotProfile(opts: {
     defaultModel: opts.defaultModel,
     spawn() {
       const args = ["--acp"];
-      if (configDir) {
-        args.push("--config-dir", configDir);
-      }
       if (additionalMcpJson) {
         args.push("--additional-mcp-config", additionalMcpJson);
       }
+      const env: NodeJS.ProcessEnv = { ...process.env };
+      if (configDir) {
+        // --config-dir is not a supported CLI flag. Instead, read the OAuth
+        // token from the profile's config.json and inject it via
+        // COPILOT_GITHUB_TOKEN, which the CLI checks before the system
+        // credential store — giving us true per-profile auth isolation.
+        const token = readCopilotTokenSync(configDir);
+        if (token) env.COPILOT_GITHUB_TOKEN = token;
+      }
       return spawn(cli, args, {
         stdio: ["pipe", "pipe", "pipe"],
+        env,
       });
     },
     async whoami() {
@@ -65,6 +72,29 @@ export function makeCopilotProfile(opts: {
       return identityCache;
     },
   };
+}
+
+/**
+ * Synchronously read the OAuth token for the last logged-in user from a
+ * Copilot config.json. Used at spawn time to inject COPILOT_GITHUB_TOKEN.
+ * Returns undefined on any failure.
+ */
+function readCopilotTokenSync(configDir: string): string | undefined {
+  const file = path.join(configDir, "config.json");
+  try {
+    // Strip JS-style comments before parsing (Copilot uses JSONC)
+    const raw = fs.readFileSync(file, "utf8").replace(/^\s*\/\/.*$/gm, "");
+    const parsed = JSON.parse(raw) as {
+      lastLoggedInUser?: { host?: string; login?: string };
+      copilotTokens?: Record<string, string>;
+    };
+    const u = parsed.lastLoggedInUser;
+    if (!u?.host || !u?.login) return undefined;
+    const key = `${u.host}:${u.login}`;
+    return parsed.copilotTokens?.[key];
+  } catch {
+    return undefined;
+  }
 }
 
 /**

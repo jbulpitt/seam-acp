@@ -158,6 +158,11 @@ const Schema = z.object({
       return out;
     }),
 
+  /** Path to the `agy` (Antigravity) binary. Defaults to `~/.local/bin/agy` if present, else `agy` on PATH. */
+  AGY_CLI_PATH: z.string().optional(),
+  /** Cosmetic model id reported by the Antigravity profile. */
+  AGY_DEFAULT_MODEL: z.string().default("antigravity"),
+
   /**
    * Comma-separated list of remote Copilot profiles. Each entry registers an
    * agent profile named `copilot-remote-<id>` that pipes ACP over a WebSocket
@@ -240,7 +245,7 @@ const Schema = z.object({
       return out;
     }),
 
-  TURN_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(3600).default(900),
+  TURN_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(604800).default(900),
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .default("info"),

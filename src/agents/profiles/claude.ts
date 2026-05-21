@@ -61,14 +61,6 @@ export function makeClaudeProfile(opts: {
       if (maxThinkingTokens && maxThinkingTokens > 0) {
         env.MAX_THINKING_TOKENS = String(maxThinkingTokens);
       }
-      // The Claude Code SDK only advertises `default/sonnet/sonnet[1m]/haiku`
-      // unless ANTHROPIC_MODEL is set — that env var both adds the requested
-      // model to availableModels and selects it as current. Without it, sessions
-      // sit on `default`, which (mis)behaves with extended thinking (the adapter
-      // emits a start chunk but no delta content). Forwarding the configured
-      // default here gives the user real Opus/Sonnet access and makes thinking
-      // actually populate.
-      if (opts.defaultModel) env.ANTHROPIC_MODEL = opts.defaultModel;
       return spawn(cli, [], {
         stdio: ["pipe", "pipe", "pipe"],
         env,

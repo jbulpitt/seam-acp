@@ -3,6 +3,22 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 
+const ModelsListSchema = z
+  .string()
+  .default("")
+  .transform((v) => {
+    const out: Array<{ modelId: string; name: string }> = [];
+    for (const entry of v.split(",").map((s) => s.trim()).filter(Boolean)) {
+      const idx = entry.indexOf(":");
+      if (idx > 0 && idx < entry.length - 1) {
+        out.push({ modelId: entry.slice(0, idx).trim(), name: entry.slice(idx + 1).trim() });
+      } else {
+        out.push({ modelId: entry, name: entry });
+      }
+    }
+    return out.length > 0 ? out : undefined;
+  });
+
 const Schema = z.object({
   DISCORD_BOT_TOKEN: z.string().min(1, "DISCORD_BOT_TOKEN is required"),
   DISCORD_ALLOWED_USER_IDS: z
@@ -89,6 +105,7 @@ const Schema = z.object({
       }
       return out;
     }),
+  COPILOT_MODELS: ModelsListSchema,
   GEMINI_CLI_PATH: z.string().optional(),
   /** Per-agent model override for the Gemini profile. */
   GEMINI_DEFAULT_MODEL: z.string().default("gemini-2.5-pro"),
@@ -123,6 +140,8 @@ const Schema = z.object({
       }
       return out;
     }),
+
+  GEMINI_MODELS: ModelsListSchema,
 
   /** Path to the `claude-agent-acp` binary. Defaults to looking it up on PATH. */
   CLAUDE_CLI_PATH: z.string().optional(),
@@ -165,10 +184,13 @@ const Schema = z.object({
       return out;
     }),
 
+  CLAUDE_MODELS: ModelsListSchema,
+
   /** Path to the `agy` (Antigravity) binary. Defaults to `~/.local/bin/agy` if present, else `agy` on PATH. */
   AGY_CLI_PATH: z.string().optional(),
   /** Cosmetic model id reported by the Antigravity profile. */
   AGY_DEFAULT_MODEL: z.string().default("antigravity"),
+  AGY_MODELS: ModelsListSchema,
 
   /**
    * Comma-separated list of remote Copilot profiles. Each entry registers an
@@ -305,6 +327,15 @@ const Schema = z.object({
    * changes (i.e. after an independent cloudflared restart).
    */
   TUNNEL_GIST_ID: z.string().optional(),
+
+  /**
+   * Controls the `/seam new` and `/seam init` thread initialization flow.
+   * - "repo":  (default) only show the repo picker
+   * - "full":  after repo selection, also present an agent picker and a
+   *            model picker in sequence so the user can configure the
+   *            session before sending their first message
+   */
+  NEW_THREAD_WIZARD: z.enum(["repo", "full"]).default("repo"),
 });
 
 const PresetFieldSchema = <T extends z.ZodType>(value: T) =>

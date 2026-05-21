@@ -730,6 +730,8 @@ export class Orchestrator {
         return this.cmdAttach(interaction);
       case "whoami":
         return this.cmdWhoami(interaction);
+      case "usage":
+        return this.cmdUsage(interaction);
       case "avatar":
         return this.cmdAvatar(interaction);
       case "help":
@@ -1417,6 +1419,53 @@ export class Orchestrator {
     });
   }
 
+  private async cmdUsage(i: ChatInputCommandInteraction): Promise<void> {
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel) {
+      await i.editReply({ content: "Use inside a thread." });
+      return;
+    }
+    const record = this.router.ensureSessionRecord({
+      platform: channel.platform,
+      channelRef: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+    const isAgy = record.agentId === "agy";
+    const isClaude = record.agentId === "claude" || record.agentId.startsWith("claude-");
+    const isCopilot =
+      record.agentId === "copilot" ||
+      (record.agentId.startsWith("copilot-") && !record.agentId.startsWith("copilot-remote"));
+    if (!isAgy && !isClaude && !isCopilot) {
+      await i.editReply({
+        content: `\`/seam usage\` is only available for the \`agy\`, \`claude\`, and \`copilot\` agents. This thread uses \`${record.agentId}\`.`,
+      });
+      return;
+    }
+    try {
+      const profile = this.router.getProfile(record.agentId);
+      const configDir = profile?.configDir;
+      if (isAgy) {
+        const { fetchAgyUserStatus } = await import("../../agents/profiles/agy.js");
+        const data = await fetchAgyUserStatus(this.config.AGY_CLI_PATH);
+        await i.editReply({ content: formatAgyUsage(data) });
+      } else if (isClaude) {
+        const { fetchClaudeUsage } = await import("../../agents/profiles/claude.js");
+        const data = await fetchClaudeUsage(configDir);
+        await i.editReply({ content: formatClaudeUsage(data) });
+      } else {
+        const { fetchCopilotUsage } = await import("../../agents/profiles/copilot.js");
+        const data = await fetchCopilotUsage(configDir);
+        await i.editReply({ content: formatCopilotUsage(data) });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.warn({ err }, "/seam usage failed");
+      await i.editReply({ content: `Couldn't fetch usage: ${msg}` });
+    }
+  }
+
   private async cmdAvatar(i: ChatInputCommandInteraction): Promise<void> {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
     try {
@@ -1470,6 +1519,7 @@ export class Orchestrator {
       "`/seam sessions` — list known sessions",
       "`/seam attach <path>` — upload a host-side file (under REPOS_ROOT or ATTACH_ROOTS) to this channel",
       "`/seam whoami` — show the account this thread's agent is signed in as",
+      "`/seam usage` — show usage / credits (agy only)",
       "`/seam avatar` — re-push bot avatar to Discord",
       "",
       "Free-form messages in a thread are sent to the agent.",
@@ -1764,10 +1814,20 @@ export class Orchestrator {
     });
     await this.router.invalidate(record.id);
 
-    await this.adapter.sendMessage(
-      channel,
-      `📌 Repo set to \`${this.repoDisplay(picked)}\`. Send a message to begin.`
-    );
+    if (this.config.NEW_THREAD_WIZARD === "full") {
+      await this.adapter.sendMessage(
+        channel,
+        `📌 Repo set to \`${this.repoDisplay(picked)}\`.`
+      );
+      // Re-read the record after repo was set.
+      const freshRecord = this.store.get(record.id) ?? record;
+      await this.runSetupWizard(channel, freshRecord);
+    } else {
+      await this.adapter.sendMessage(
+        channel,
+        `📌 Repo set to \`${this.repoDisplay(picked)}\`. Send a message to begin.`
+      );
+    }
   }
 
   private listRepoDirs(): string[] | undefined {
@@ -1784,6 +1844,123 @@ export class Orchestrator {
       .filter((e) => e.isDirectory() && !e.name.startsWith("."))
       .map((e) => path.join(root, e.name))
       .sort((a, b) => a.localeCompare(b));
+  }
+
+  /**
+   * Post-repo-selection setup wizard: presents an agent picker followed by a
+   * model picker. Called from `sendRepoPicker` when `NEW_THREAD_WIZARD=full`.
+   *
+   * Either picker can be skipped (only one option, user timeout, adapter
+   * lacks `sendChoicePicker`). A runtime start failure for the model picker
+   * is handled gracefully with a fallback notice.
+   */
+  private async runSetupWizard(
+    channel: ChannelRef,
+    record: SessionRecord
+  ): Promise<void> {
+    let currentRecord = record;
+
+    // Step 1: Agent picker (skip when there's only one profile).
+    const profiles = this.router.listProfiles();
+    if (profiles.length > 1 && this.adapter.sendChoicePicker) {
+      const picked = await this.adapter.sendChoicePicker(channel, {
+        prompt: `🤖 **Choose an agent** (default: \`${currentRecord.agentId}\`)`,
+        choices: profiles.map((p) => ({
+          value: p.id,
+          label: p.displayName,
+          description:
+            p.id === currentRecord.agentId ? `${p.id} (current)` : p.id,
+        })),
+        authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+      });
+      if (!picked) {
+        // User timed out / cancelled — rename with default agent and end wizard.
+        await this.renameThreadForSetup(channel, currentRecord);
+        await this.adapter.sendMessage(
+          channel,
+          `✅ Setup complete. Send a message to begin.`
+        );
+        return;
+      }
+      if (picked.value !== currentRecord.agentId) {
+        await this.applyAgentChange(channel, currentRecord, picked.value);
+        // Re-read: applyAgentChange updated agent + model in the DB.
+        currentRecord = this.store.get(currentRecord.id) ?? currentRecord;
+      }
+    }
+
+    // Rename the thread now that we know the final agent.
+    await this.renameThreadForSetup(channel, currentRecord);
+
+    // Step 2: Model picker (requires a live runtime to enumerate models).
+    if (this.adapter.sendChoicePicker) {
+      try {
+        const rt = await this.router.getOrStartRuntime(currentRecord);
+        const models = rt.getSessionInfo()?.availableModels ?? [];
+        if (models.length > 1) {
+          const cfg = this.store.readConfig(currentRecord);
+          const current = cfg.model ?? this.config.DEFAULT_MODEL;
+          const picked = await this.adapter.sendChoicePicker(channel, {
+            prompt: `🧠 **Choose a model** (default: \`${current}\`)`,
+            choices: models.slice(0, 25).map((m) => ({
+              value: m.modelId,
+              label: m.name ?? m.modelId,
+              description:
+                m.modelId === current ? `${m.modelId} (current)` : m.modelId,
+            })),
+            authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+          });
+          if (picked && picked.value !== current) {
+            await this.applyModelChange(channel, currentRecord, picked.value);
+          }
+        }
+      } catch (err) {
+        this.logger.warn(
+          { err },
+          "wizard: could not start runtime for model picker"
+        );
+        await this.adapter.sendMessage(
+          channel,
+          `_Could not list models: ${(err as Error).message}. Use \`/seam model\` later._`
+        );
+      }
+    }
+
+    await this.adapter.sendMessage(
+      channel,
+      `✅ Setup complete. Send a message to begin.`
+    );
+  }
+
+  /**
+   * Rename a thread to "<repo-basename> [<agent-abbr>]" after setup.
+   * Best-effort: silently skipped if the adapter, channel, or profile doesn't
+   * support it.
+   */
+  private async renameThreadForSetup(
+    channel: ChannelRef,
+    record: SessionRecord
+  ): Promise<void> {
+    if (!this.adapter.renameThread) return;
+    if (!channel.parentId) return; // not a thread
+    const repoPath = record.repoPath;
+    if (!repoPath) return;
+    const profile = this.router.getProfile(record.agentId);
+    const abbr = profile?.threadAbbr;
+    if (!abbr) return;
+    // Only rename if the thread still has the default "seam" name; skip if
+    // the user already gave it a custom name when running /seam new.
+    if (this.adapter.getThreadName) {
+      const current = await this.adapter.getThreadName(channel);
+      if (current !== undefined && current !== "seam") return;
+    }
+    const repoName = path.basename(repoPath);
+    const newName = `${repoName} [${abbr}]`;
+    try {
+      await this.adapter.renameThread(channel, newName);
+    } catch (err) {
+      this.logger.warn({ err }, "wizard: renameThread failed");
+    }
   }
 
   // --- helpers ---
@@ -1860,6 +2037,128 @@ function parseCsv(s: string): string[] {
     .split(",")
     .map((x) => x.trim())
     .filter((x) => x.length > 0);
+}
+
+function usageBar(pct: number): string {
+  const filled = Math.min(20, Math.round(pct / 5));
+  return "█".repeat(filled) + "░".repeat(20 - filled);
+}
+
+function usageLine(pct: number | null, label: string): string {
+  const bar = pct !== null ? usageBar(pct) : "░░░░░░░░░░░░░░░░░░░░";
+  const pctStr = pct !== null ? `${Math.round(pct)}%`.padStart(4) : "  — ";
+  return `\`${bar}\`  ${pctStr}  ${label}`;
+}
+
+function formatAgyUsage(d: import("../../agents/profiles/agy.js").AgyUsage): string {
+  const lines: string[] = [];
+  const who = [d.name, d.email].filter(Boolean).join(" · ");
+  lines.push(`**Antigravity usage**${who ? ` — ${who}` : ""}`);
+  const fmt = (n?: number): string =>
+    typeof n === "number" ? n.toLocaleString("en-US") : "—";
+  if (d.monthlyPromptCredits !== undefined || d.availablePromptCredits !== undefined) {
+    const avail = d.availablePromptCredits ?? 0;
+    const total = d.monthlyPromptCredits ?? 0;
+    const pct = total > 0 ? ((total - avail) / total) * 100 : 0;
+    lines.push(usageLine(pct, `Prompt credits — ${fmt(avail)} / ${fmt(total)} remaining`));
+  }
+  if (d.monthlyFlowCredits !== undefined || d.availableFlowCredits !== undefined) {
+    const avail = d.availableFlowCredits ?? 0;
+    const total = d.monthlyFlowCredits ?? 0;
+    const pct = total > 0 ? ((total - avail) / total) * 100 : 0;
+    lines.push(usageLine(pct, `Flow credits — ${fmt(avail)} / ${fmt(total)} remaining`));
+  }
+  const modelsWithQuota = d.models.filter(
+    (m) => typeof m.remainingFraction === "number" || m.resetTime,
+  );
+  if (modelsWithQuota.length > 0) {
+    lines.push("", "**Per-model quotas**");
+    for (const m of modelsWithQuota) {
+      if (typeof m.remainingFraction !== "number") continue;
+      const pct = (1 - m.remainingFraction) * 100;
+      const reset = m.resetTime ? ` · resets ${formatResetTime(m.resetTime)}` : "";
+      lines.push(usageLine(pct, `${m.label}${reset}`));
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatCopilotUsage(
+  d: import("../../agents/profiles/copilot.js").CopilotUsageData
+): string {
+  const lines: string[] = [];
+  const who = [d.login, d.org ? `(${d.org})` : null].filter(Boolean).join(" ");
+  lines.push(`**GitHub Copilot usage**${who ? ` — ${who}` : ""}`);
+  if (d.plan) lines.push(`Plan: \`${d.plan}\``);
+  const fmtQuota = (
+    label: string,
+    q: import("../../agents/profiles/copilot.js").CopilotQuotaSnapshot | null
+  ): string | null => {
+    if (!q) return null;
+    if (q.unlimited) return `${label}: unlimited`;
+    const used = q.entitlement - q.remaining;
+    const pct = q.entitlement > 0 ? (used / q.entitlement) * 100 : 0;
+    const over = q.overageCount > 0 ? ` (+${q.overageCount} overage)` : "";
+    return usageLine(pct, `${label} — ${used} / ${q.entitlement}${over}`);
+  };
+  const quotas = [
+    fmtQuota("Premium interactions", d.premiumInteractions),
+    fmtQuota("Chat", d.chat),
+    fmtQuota("Completions", d.completions),
+  ].filter((s): s is string => s !== null);
+  if (quotas.length > 0) {
+    lines.push("", "**Quotas**", ...quotas);
+    if (d.quotaResetAt) lines.push(`Resets ${formatResetTime(d.quotaResetAt)}`);
+  }
+  return lines.join("\n");
+}
+
+function formatClaudeUsage(
+  d: import("../../agents/profiles/claude.js").ClaudeUsageData
+): string {
+  const lines: string[] = [];
+  lines.push(`**Claude Code usage**${d.login ? ` — ${d.login}` : ""}`);
+  if (d.subscriptionType) {
+    const tier = d.rateLimitTier ? ` (${d.rateLimitTier})` : "";
+    lines.push(`Subscription: \`${d.subscriptionType}${tier}\``);
+  }
+  const fmtBucket = (
+    label: string,
+    b: import("../../agents/profiles/claude.js").ClaudeUsageBucket | null
+  ): string | null => {
+    if (!b) return null;
+    const reset = b.resetsAt ? ` · resets ${formatResetTime(b.resetsAt)}` : "";
+    return usageLine(b.utilization, `${label}${reset}`);
+  };
+  const buckets = [
+    fmtBucket("Current 5h session", d.fiveHour),
+    fmtBucket("Current week (all models)", d.sevenDay),
+    fmtBucket("Current week (Sonnet)", d.sevenDaySonnet),
+    fmtBucket("Current week (Opus)", d.sevenDayOpus),
+  ].filter((s): s is string => s !== null);
+  if (buckets.length > 0) {
+    lines.push("", "**Rate-limit utilization**", ...buckets);
+  }
+  if (d.extraUsage && d.extraUsage.enabled) {
+    const dollars = (n: number): string => `$${(n / 100).toFixed(2)}`;
+    const pct = d.extraUsage.utilization;
+    lines.push(
+      "",
+      "**Usage credits**",
+      usageLine(d.extraUsage.utilization, `${dollars(d.extraUsage.used)} / ${dollars(d.extraUsage.limit)}`),
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatResetTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const secs = Math.round((d.getTime() - Date.now()) / 1000);
+  if (secs <= 0) return "now";
+  if (secs < 3600) return `in ${Math.round(secs / 60)}m`;
+  if (secs < 86400) return `in ${Math.round(secs / 3600)}h`;
+  return `in ${Math.round(secs / 86400)}d`;
 }
 
 // Re-export for convenience.

@@ -38,6 +38,8 @@ async function main(): Promise<void> {
   const copilot = makeCopilotProfile({
     ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
     defaultModel: config.DEFAULT_MODEL,
+    staticModels: config.COPILOT_MODELS,
+    threadAbbr: "cp-fhr",
     mcpServers,
   });
 
@@ -48,6 +50,8 @@ async function main(): Promise<void> {
       configDir: p.configDir,
       ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
       defaultModel: config.DEFAULT_MODEL,
+      staticModels: config.COPILOT_MODELS,
+      threadAbbr: `cp-${p.id}`,
       mcpServers,
     })
   );
@@ -55,6 +59,8 @@ async function main(): Promise<void> {
   const gemini = makeGeminiProfile({
     ...(config.GEMINI_CLI_PATH ? { cliPath: config.GEMINI_CLI_PATH } : {}),
     defaultModel: config.GEMINI_DEFAULT_MODEL,
+    staticModels: config.GEMINI_MODELS,
+    threadAbbr: "gg",
     mcpServers,
   });
 
@@ -65,6 +71,7 @@ async function main(): Promise<void> {
       configDir: p.configDir,
       ...(config.GEMINI_CLI_PATH ? { cliPath: config.GEMINI_CLI_PATH } : {}),
       defaultModel: config.GEMINI_DEFAULT_MODEL,
+      staticModels: config.GEMINI_MODELS,
       mcpServers,
     })
   );
@@ -72,6 +79,8 @@ async function main(): Promise<void> {
   const claude = makeClaudeProfile({
     ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
     defaultModel: config.CLAUDE_DEFAULT_MODEL,
+    staticModels: config.CLAUDE_MODELS,
+    threadAbbr: "cc",
     maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
     mcpServers,
   });
@@ -83,6 +92,7 @@ async function main(): Promise<void> {
       configDir: p.configDir,
       ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
       defaultModel: config.CLAUDE_DEFAULT_MODEL,
+      staticModels: config.CLAUDE_MODELS,
       maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
       mcpServers,
     })
@@ -91,6 +101,8 @@ async function main(): Promise<void> {
   const agy = makeAgyProfile({
     ...(config.AGY_CLI_PATH ? { cliPath: config.AGY_CLI_PATH } : {}),
     defaultModel: config.AGY_DEFAULT_MODEL,
+    staticModels: config.AGY_MODELS,
+    threadAbbr: "agy",
     dataDir: config.DATA_DIR,
   });
 
@@ -101,12 +113,16 @@ async function main(): Promise<void> {
           wsPort: p.wsPort,
           token: p.token,
           defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
+          staticModels: config.COPILOT_MODELS,
+          threadAbbr: "cp-fs",
         })
       : makeRemoteCopilotClientProfile({
           id: `copilot-remote-${p.id}`,
           wsUrl: p.wsUrl,
           token: p.token,
           defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
+          staticModels: config.COPILOT_MODELS,
+          threadAbbr: "cp-fs",
         })
   );
 

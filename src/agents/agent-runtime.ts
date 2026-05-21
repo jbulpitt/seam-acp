@@ -633,6 +633,9 @@ export class AgentRuntime {
   private toAvailableModels(
     models: import("@agentclientprotocol/sdk").NewSessionResponse["models"]
   ): ReadonlyArray<AvailableModel> {
+    if (this.profile.staticModels && this.profile.staticModels.length > 0) {
+      return this.profile.staticModels;
+    }
     if (!models) return [];
     const list = (
       models as { availableModels?: Array<AvailableModel> }

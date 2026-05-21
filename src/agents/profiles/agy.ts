@@ -134,6 +134,8 @@ export function makeAgyProfile(opts: {
    * to the legacy location for back-compat.
    */
   dataDir?: string;
+  staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  threadAbbr?: string;
 } = {}): AgentProfile {
   const cli = opts.cliPath?.trim() || resolveAgyBinary();
   const defaultModel = opts.defaultModel ?? "antigravity";
@@ -147,6 +149,8 @@ export function makeAgyProfile(opts: {
     id: "agy",
     displayName: "Antigravity",
     defaultModel,
+    staticModels: opts.staticModels,
+    threadAbbr: opts.threadAbbr,
     spawn() {
       return makeFakeAgyProcess(cli, mappingFile);
     },
@@ -840,6 +844,139 @@ function getCatalog(cli: string): Promise<AgyCatalogEntry[]> {
     return [];
   });
   return catalogPromise;
+}
+
+/**
+ * Snapshot of `/usage` data scraped from the agy LS's `GetUserStatus` endpoint.
+ * Captures plan tier, monthly + remaining credits (prompt and flow), and
+ * per-model quota fractions with reset times.
+ */
+export interface AgyUsage {
+  name?: string;
+  email?: string;
+  planName?: string;
+  teamsTier?: string;
+  monthlyPromptCredits?: number;
+  availablePromptCredits?: number;
+  monthlyFlowCredits?: number;
+  availableFlowCredits?: number;
+  models: Array<{
+    label: string;
+    remainingFraction?: number;
+    resetTime?: string;
+  }>;
+}
+
+interface UserStatusResponse {
+  userStatus?: {
+    name?: string;
+    email?: string;
+    planStatus?: {
+      planInfo?: {
+        planName?: string;
+        teamsTier?: string;
+        monthlyPromptCredits?: number | string;
+        monthlyFlowCredits?: number | string;
+      };
+      availablePromptCredits?: number | string;
+      availableFlowCredits?: number | string;
+    };
+    cascadeModelConfigData?: {
+      clientModelConfigs?: Array<{
+        label?: string;
+        quotaInfo?: { remainingFraction?: number; resetTime?: string };
+      }>;
+    };
+  };
+}
+
+// Cache the usage snapshot briefly so repeated `/seam usage` calls don't pay
+// the ~5s LS spawn cost. 60s strikes a balance between freshness and snappiness.
+const USAGE_CACHE_TTL_MS = 60_000;
+let usageCache: { at: number; data: AgyUsage } | null = null;
+
+/**
+ * Fetch the current user's Antigravity usage snapshot. Spawns a transient
+ * `agy -p` to bring the local LS up, hits `GetUserStatus`, and parses the
+ * response. Cached for {@link USAGE_CACHE_TTL_MS} after a successful call.
+ */
+export async function fetchAgyUserStatus(cliPath?: string): Promise<AgyUsage> {
+  if (usageCache && Date.now() - usageCache.at < USAGE_CACHE_TTL_MS) {
+    return usageCache.data;
+  }
+  const cli = cliPath?.trim() || resolveAgyBinary();
+  const start = Date.now();
+  const proc = spawn(cli, ["-p", "ok", "--print-timeout", "30s", "--dangerously-skip-permissions"], {
+    cwd: "/tmp",
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  try {
+    const ls = await discoverAgyLs({
+      timeoutMs: 15_000,
+      newerThanMs: start - 1_000,
+    });
+    // /healthz comes up before the LS finishes silent-auth, so GetUserStatus
+    // initially 500s with "GetCascadeModelConfigData() is nil". Retry briefly
+    // until auth lands (usually 1–2s).
+    const url = `http://localhost:${ls.port}/exa.language_server_pb.LanguageServerService/GetUserStatus`;
+    const deadline = Date.now() + 10_000;
+    let lastStatus = 0;
+    while (Date.now() < deadline) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (res.ok) {
+        const json = (await res.json()) as UserStatusResponse;
+        const data = parseAgyUserStatus(json);
+        usageCache = { at: Date.now(), data };
+        return data;
+      }
+      lastStatus = res.status;
+      if (res.status !== 500) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    throw new Error(`GetUserStatus HTTP ${lastStatus}`);
+  } finally {
+    try { proc.kill(); } catch { /* already gone */ }
+  }
+}
+
+function parseAgyUserStatus(json: UserStatusResponse): AgyUsage {
+  const us = json.userStatus ?? {};
+  const ps = us.planStatus ?? {};
+  const pi = ps.planInfo ?? {};
+  const num = (v: number | string | undefined): number | undefined =>
+    typeof v === "number" ? v : typeof v === "string" && v ? Number(v) : undefined;
+  const models = (us.cascadeModelConfigData?.clientModelConfigs ?? [])
+    .filter((m) => m.label)
+    .map((m) => ({
+      label: m.label!,
+      ...(typeof m.quotaInfo?.remainingFraction === "number"
+        ? { remainingFraction: m.quotaInfo.remainingFraction }
+        : {}),
+      ...(m.quotaInfo?.resetTime ? { resetTime: m.quotaInfo.resetTime } : {}),
+    }));
+  return {
+    ...(us.name ? { name: us.name } : {}),
+    ...(us.email ? { email: us.email } : {}),
+    ...(pi.planName ? { planName: pi.planName } : {}),
+    ...(pi.teamsTier ? { teamsTier: pi.teamsTier } : {}),
+    ...(num(pi.monthlyPromptCredits) !== undefined
+      ? { monthlyPromptCredits: num(pi.monthlyPromptCredits) }
+      : {}),
+    ...(num(ps.availablePromptCredits) !== undefined
+      ? { availablePromptCredits: num(ps.availablePromptCredits) }
+      : {}),
+    ...(num(pi.monthlyFlowCredits) !== undefined
+      ? { monthlyFlowCredits: num(pi.monthlyFlowCredits) }
+      : {}),
+    ...(num(ps.availableFlowCredits) !== undefined
+      ? { availableFlowCredits: num(ps.availableFlowCredits) }
+      : {}),
+    models,
+  };
 }
 
 async function fetchAgyCatalog(cli: string): Promise<AgyCatalogEntry[]> {

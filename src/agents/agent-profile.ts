@@ -16,6 +16,25 @@ export interface AgentProfile {
   /** Default model id this agent should use unless the session overrides it. */
   readonly defaultModel: string;
 
+  /**
+   * Optional static list of models to use for this profile. When provided,
+   * these override any models advertised dynamically by the agent via ACP.
+   */
+  readonly staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+
+  /**
+   * Optional short abbreviation displayed in thread names when the new-thread
+   * wizard renames the thread after setup (e.g. "cp-fhr", "agy").
+   */
+  readonly threadAbbr?: string;
+
+  /**
+   * Optional config/data directory used by this profile. Profiles that
+   * support multi-account isolation (Claude, Copilot) expose this so other
+   * subsystems (e.g. usage fetching) can locate the right credentials file.
+   */
+  readonly configDir?: string;
+
   /** Spawn the agent as an ACP server over stdio. */
   spawn(): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
 

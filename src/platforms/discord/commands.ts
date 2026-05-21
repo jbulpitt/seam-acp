@@ -183,6 +183,10 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
+    sub.setName("usage").setDescription("Show usage / credits for this thread's agent (agy only)")
+  );
+
+  cmd.addSubcommand((sub) =>
     sub.setName("avatar").setDescription("Push the bot avatar and banner to Discord (force re-upload)")
   );
 
@@ -211,6 +215,7 @@ export type SeamSubcommand =
   | "agent"
   | "attach"
   | "whoami"
+  | "usage"
   | "avatar"
   | "help";
 

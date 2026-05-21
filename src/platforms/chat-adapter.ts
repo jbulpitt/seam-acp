@@ -80,6 +80,12 @@ export interface ChatAdapter {
   /** Optional: platforms that support threads should implement this. */
   createThread?(parent: ChannelRef, name: string): Promise<ChannelRef>;
 
+  /** Optional: rename a thread (no-op on platforms that don't support it). */
+  renameThread?(channel: ChannelRef, name: string): Promise<void>;
+
+  /** Optional: return the current display name of a thread/channel. */
+  getThreadName?(channel: ChannelRef): Promise<string | undefined>;
+
   /**
    * Optional: present an interactive choice picker (buttons / select menu)
    * and resolve when the user picks one. Returns null on timeout / cancel.

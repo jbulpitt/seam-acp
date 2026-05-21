@@ -36,6 +36,8 @@ export function makeCopilotProfile(opts: {
    * `<dir>/config.json`. When omitted, the CLI uses its default (~/.copilot).
    */
   configDir?: string;
+  staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  threadAbbr?: string;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "copilot";
   const additionalMcpJson = buildCopilotMcpConfigJson(opts.mcpServers ?? []);
@@ -47,6 +49,9 @@ export function makeCopilotProfile(opts: {
     id: opts.id ?? "copilot",
     displayName: opts.displayName ?? "GitHub Copilot",
     defaultModel: opts.defaultModel,
+    staticModels: opts.staticModels,
+    threadAbbr: opts.threadAbbr,
+    configDir,
     spawn() {
       const args = ["--acp"];
       if (additionalMcpJson) {
@@ -121,6 +126,83 @@ async function readCopilotIdentity(
   } catch {
     return null;
   }
+}
+
+export interface CopilotQuotaSnapshot {
+  unlimited: boolean;
+  entitlement: number;
+  remaining: number;
+  percentRemaining: number;
+  overagePermitted: boolean;
+  overageCount: number;
+}
+
+export interface CopilotUsageData {
+  login: string | null;
+  plan: string | null;
+  org: string | null;
+  quotaResetAt: string | null;
+  chat: CopilotQuotaSnapshot | null;
+  completions: CopilotQuotaSnapshot | null;
+  premiumInteractions: CopilotQuotaSnapshot | null;
+}
+
+/**
+ * Fetches Copilot plan and quota data from GitHub's internal user endpoint.
+ * Uses the OAuth token stored in config.json. Returns what it can on failure.
+ */
+export async function fetchCopilotUsage(
+  configDir?: string
+): Promise<CopilotUsageData> {
+  const dir = configDir?.trim() || path.join(process.env.HOME ?? "", ".copilot");
+  const result: CopilotUsageData = {
+    login: null,
+    plan: null,
+    org: null,
+    quotaResetAt: null,
+    chat: null,
+    completions: null,
+    premiumInteractions: null,
+  };
+  const identity = await readCopilotIdentity(configDir);
+  if (identity?.login) result.login = identity.login;
+  const token = readCopilotTokenSync(dir);
+  if (!token) return result;
+  try {
+    const res = await fetch("https://api.github.com/copilot_internal/user", {
+      headers: { Authorization: `token ${token}`, Accept: "application/json" },
+    });
+    if (res.ok) {
+      const body = (await res.json()) as Record<string, unknown>;
+      result.login = (body.login as string | undefined) ?? result.login;
+      result.plan = (body.copilot_plan as string | undefined) ?? null;
+      result.quotaResetAt = (body.quota_reset_date_utc as string | undefined) ?? null;
+      const orgs = body.organization_list as Array<{ name?: string; login?: string }> | undefined;
+      if (orgs && orgs.length > 0) result.org = orgs[0]?.name ?? orgs[0]?.login ?? null;
+      const snaps = body.quota_snapshots as Record<string, unknown> | undefined;
+      if (snaps) {
+        result.chat = parseQuota(snaps.chat);
+        result.completions = parseQuota(snaps.completions);
+        result.premiumInteractions = parseQuota(snaps.premium_interactions);
+      }
+    }
+  } catch {
+    /* return what we have */
+  }
+  return result;
+}
+
+function parseQuota(raw: unknown): CopilotQuotaSnapshot | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  return {
+    unlimited: r.unlimited === true,
+    entitlement: typeof r.entitlement === "number" ? r.entitlement : 0,
+    remaining: typeof r.remaining === "number" ? r.remaining : 0,
+    percentRemaining: typeof r.percent_remaining === "number" ? r.percent_remaining : 0,
+    overagePermitted: r.overage_permitted === true,
+    overageCount: typeof r.overage_count === "number" ? r.overage_count : 0,
+  };
 }
 
 /**

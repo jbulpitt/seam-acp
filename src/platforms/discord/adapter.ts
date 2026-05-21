@@ -306,6 +306,26 @@ export class DiscordAdapter implements ChatAdapter {
     };
   }
 
+  async renameThread(channel: ChannelRef, name: string): Promise<void> {
+    try {
+      const ch = await this.client.channels.fetch(channel.id);
+      if (!ch?.isThread()) return;
+      await (ch as ThreadChannel).edit({ name: name.slice(0, 100) });
+    } catch (err) {
+      this.logger.warn({ err, channelId: channel.id }, "renameThread failed");
+    }
+  }
+
+  async getThreadName(channel: ChannelRef): Promise<string | undefined> {
+    try {
+      const ch = await this.client.channels.fetch(channel.id);
+      if (!ch?.isThread()) return undefined;
+      return (ch as ThreadChannel).name ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   // --- internals ---
 
   private wire(): void {

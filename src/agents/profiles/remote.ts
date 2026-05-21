@@ -232,6 +232,8 @@ export function makeRemoteCopilotServerProfile(opts: {
   /** Shared secret — bridge must send `Authorization: Bearer <token>`. */
   token: string;
   defaultModel: string;
+  staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  threadAbbr?: string;
 }): AgentProfile {
   const mux = makeMux({ id: opts.id });
   const wss = new WebSocketServer({ port: opts.wsPort });
@@ -255,6 +257,8 @@ export function makeRemoteCopilotServerProfile(opts: {
     id: opts.id,
     displayName: opts.displayName ?? remoteDisplayName(opts.id),
     defaultModel: opts.defaultModel,
+    staticModels: opts.staticModels,
+    threadAbbr: opts.threadAbbr,
     spawn: mux.spawn.bind(mux),
     whoami(): Promise<AgentIdentity | null> {
       return Promise.resolve(null);
@@ -286,6 +290,8 @@ export function makeRemoteCopilotClientProfile(opts: {
   /** Shared secret — sent as `Authorization: Bearer <token>`. */
   token: string;
   defaultModel: string;
+  staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  threadAbbr?: string;
 }): AgentProfile {
   const mux = makeMux({ id: opts.id });
 
@@ -320,6 +326,8 @@ export function makeRemoteCopilotClientProfile(opts: {
     id: opts.id,
     displayName: opts.displayName ?? remoteDisplayName(opts.id),
     defaultModel: opts.defaultModel,
+    staticModels: opts.staticModels,
+    threadAbbr: opts.threadAbbr,
     spawn: mux.spawn.bind(mux),
     whoami(): Promise<AgentIdentity | null> {
       return Promise.resolve(null);

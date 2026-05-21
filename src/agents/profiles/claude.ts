@@ -34,6 +34,8 @@ export function makeClaudeProfile(opts: {
    * adapter's default (~/.claude) is used.
    */
   configDir?: string;
+  staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  threadAbbr?: string;
   /** Default model id for sessions on this profile (e.g. "claude-sonnet-4.5"). */
   defaultModel: string;
   /**
@@ -55,6 +57,9 @@ export function makeClaudeProfile(opts: {
     id: opts.id ?? "claude",
     displayName: opts.displayName ?? "Anthropic Claude",
     defaultModel: opts.defaultModel,
+    staticModels: opts.staticModels,
+    threadAbbr: opts.threadAbbr,
+    configDir,
     spawn() {
       const env: NodeJS.ProcessEnv = { ...process.env };
       if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
@@ -71,6 +76,117 @@ export function makeClaudeProfile(opts: {
       identityCache = await readClaudeIdentity(configDir);
       return identityCache;
     },
+  };
+}
+
+export interface ClaudeUsageBucket {
+  utilization: number;
+  resetsAt: string | null;
+}
+
+export interface ClaudeUsageData {
+  login: string | null;
+  subscriptionType: string | null;
+  rateLimitTier: string | null;
+  fiveHour: ClaudeUsageBucket | null;
+  sevenDay: ClaudeUsageBucket | null;
+  sevenDaySonnet: ClaudeUsageBucket | null;
+  sevenDayOpus: ClaudeUsageBucket | null;
+  extraUsage: {
+    enabled: boolean;
+    used: number;
+    limit: number;
+    utilization: number;
+    currency: string;
+  } | null;
+}
+
+/**
+ * Reads subscription info from credentials, then calls the same
+ * `/api/oauth/usage` endpoint Claude Code's `/usage` command uses to
+ * fetch utilization. Requires the `oauth-2025-04-20` beta header.
+ * Returns whatever fields could be populated; never throws.
+ */
+export async function fetchClaudeUsage(
+  configDir?: string
+): Promise<ClaudeUsageData> {
+  const dir = configDir?.trim() || path.join(process.env.HOME ?? "", ".claude");
+  const result: ClaudeUsageData = {
+    login: null,
+    subscriptionType: null,
+    rateLimitTier: null,
+    fiveHour: null,
+    sevenDay: null,
+    sevenDaySonnet: null,
+    sevenDayOpus: null,
+    extraUsage: null,
+  };
+  let accessToken: string | null = null;
+  const candidates = [
+    path.join(dir, ".credentials.json"),
+    path.join(dir, "credentials.json"),
+  ];
+  for (const file of candidates) {
+    try {
+      const raw = await fsp.readFile(file, "utf8");
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined;
+      result.login =
+        pickLogin(parsed) ??
+        (oauth ? pickStringField(oauth as Record<string, unknown>, ["email", "login"]) : undefined) ??
+        null;
+      result.subscriptionType = pickStringField(oauth ?? {}, ["subscriptionType"]) ?? null;
+      result.rateLimitTier = pickStringField(oauth ?? {}, ["rateLimitTier"]) ?? null;
+      const tok = pickStringField(oauth ?? {}, ["accessToken"]);
+      if (tok) accessToken = tok;
+      break;
+    } catch {
+      /* try next */
+    }
+  }
+  if (!result.login) {
+    const identity = await readClaudeIdentity(configDir);
+    if (identity?.login) result.login = identity.login;
+  }
+  if (accessToken) {
+    try {
+      const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "anthropic-beta": "oauth-2025-04-20",
+        },
+      });
+      if (res.ok) {
+        const body = (await res.json()) as Record<string, unknown>;
+        result.fiveHour = parseBucket(body.five_hour);
+        result.sevenDay = parseBucket(body.seven_day);
+        result.sevenDaySonnet = parseBucket(body.seven_day_sonnet);
+        result.sevenDayOpus = parseBucket(body.seven_day_opus);
+        const extra = body.extra_usage as Record<string, unknown> | null | undefined;
+        if (extra && typeof extra === "object") {
+          result.extraUsage = {
+            enabled: extra.is_enabled === true,
+            used: typeof extra.used_credits === "number" ? extra.used_credits : 0,
+            limit: typeof extra.monthly_limit === "number" ? extra.monthly_limit : 0,
+            utilization: typeof extra.utilization === "number" ? extra.utilization : 0,
+            currency: typeof extra.currency === "string" ? extra.currency : "USD",
+          };
+        }
+      }
+    } catch {
+      /* network failure — return what we have from credentials */
+    }
+  }
+  return result;
+}
+
+function parseBucket(raw: unknown): ClaudeUsageBucket | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.utilization !== "number") return null;
+  return {
+    utilization: r.utilization,
+    resetsAt: typeof r.resets_at === "string" ? r.resets_at : null,
   };
 }
 

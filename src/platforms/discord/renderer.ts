@@ -59,7 +59,7 @@ export const discordRenderer: Renderer = {
     const thinkingFooter =
       state.thinking && state.thinking.length > 0
         ? state.thinking
-            .map((t) => `> ${trim(t.replace(/[*_`]/g, ""), 100)}`)
+            .map((t) => `> ${trim(t.replace(/[*_`]/g, ""), 300)}`)
             .join("\n")
         : undefined;
     return box({

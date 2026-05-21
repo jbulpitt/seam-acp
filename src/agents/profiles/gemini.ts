@@ -38,6 +38,8 @@ export function makeGeminiProfile(opts: {
    * the real home directory.
    */
   configDir?: string;
+  staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  threadAbbr?: string;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "gemini";
   const allow = opts.allowedMcpServerNames?.filter(Boolean) ?? [];
@@ -49,6 +51,8 @@ export function makeGeminiProfile(opts: {
     id: opts.id ?? "gemini",
     displayName: opts.displayName ?? "Google Gemini",
     defaultModel: opts.defaultModel,
+    staticModels: opts.staticModels,
+    threadAbbr: opts.threadAbbr,
     spawn() {
       const args = ["--acp"];
       if (allow.length > 0) {

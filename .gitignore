@@ -13,6 +13,9 @@ data/
 # Untracked dev artifacts
 test-file.txt
 scripts/acp-bench.ts
+scripts/prune-dead-sessions.mjs
+scripts/rename-threads.mjs
+scripts/fix-cpfs-threads.mjs
 
 # Agent instructions (local only — customize per environment)
 # AGENTS.md

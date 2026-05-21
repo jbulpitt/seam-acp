@@ -126,8 +126,14 @@ const Schema = z.object({
 
   /** Path to the `claude-agent-acp` binary. Defaults to looking it up on PATH. */
   CLAUDE_CLI_PATH: z.string().optional(),
-  /** Per-agent model override for the Claude profile. */
-  CLAUDE_DEFAULT_MODEL: z.string().default("claude-sonnet-4.5"),
+  /**
+   * Per-agent default model for the Claude profile. Forwarded to the spawned
+   * adapter as `ANTHROPIC_MODEL`. Accepted forms include the Claude Code short
+   * aliases (`opus`, `opus[1m]`, `sonnet`, `sonnet[1m]`, `haiku`) or any full
+   * Anthropic model id (e.g. `claude-opus-4-7`). The adapter's tokenized
+   * resolver handles both shapes.
+   */
+  CLAUDE_DEFAULT_MODEL: z.string().default("opus"),
   /**
    * Extended-thinking budget for the Claude profile, in tokens. Set to 0 to
    * disable. The adapter only emits `agent_thought_chunk` (which seam shows

@@ -733,7 +733,11 @@ function transformAgyText(text: string, cwd: string): string {
       try { p = decodeURIComponent(urlPath); } catch { p = urlPath; }
       if (p === cwdNorm) return `\`${label}\``;
       if (p.startsWith(cwdNorm + "/")) {
-        return `\`${label}\` (\`${p.slice(cwdNorm.length + 1)}\`)`;
+        const rel = p.slice(cwdNorm.length + 1);
+        // When the label is just the file's basename it adds no new info;
+        // collapse to the relative path to avoid awkward `name` (`path/to/name`).
+        if (label === path.basename(rel)) return `\`${rel}\``;
+        return `\`${label}\` (\`${rel}\`)`;
       }
       return `\`${label}\``;
     },

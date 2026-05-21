@@ -53,11 +53,21 @@ export const discordRenderer: Renderer = {
       state.activity && state.activity.length > 0
         ? state.activity.map((a) => `  • ${trim(a, 80)}`).join("\n")
         : undefined;
+    // Thoughts go in a blockquote BELOW the code block — blockquote markdown
+    // doesn't render inside a code fence. Edits to the same status message
+    // carry both sections in one Discord request.
+    const thinkingFooter =
+      state.thinking && state.thinking.length > 0
+        ? state.thinking
+            .map((t) => `> ${trim(t.replace(/[*_`]/g, ""), 100)}`)
+            .join("\n")
+        : undefined;
     return box({
       title: state.state,
       icon: ICON_BY_STATE[state.state],
       rows,
       ...(activityLines ? { extra: activityLines } : {}),
+      ...(thinkingFooter ? { footer: thinkingFooter } : {}),
     });
   },
 

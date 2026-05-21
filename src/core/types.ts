@@ -92,6 +92,8 @@ export interface StatusPanel {
   usage?: string;
   /** Recent tool / progress activity (oldest → newest). */
   activity?: string[];
+  /** Last few lines of model reasoning (oldest → newest). */
+  thinking?: string[];
 }
 
 /** Result of one agent turn (reply round-trip). */

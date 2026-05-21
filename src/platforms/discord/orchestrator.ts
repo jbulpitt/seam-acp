@@ -549,6 +549,8 @@ export class Orchestrator {
           }
           case "agent-thought":
             refreshTyping();
+            status.pushThinkingChunk(event.text);
+            void refresh();
             return;
           case "config-options":
           case "error":

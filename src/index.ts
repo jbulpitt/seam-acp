@@ -72,6 +72,7 @@ async function main(): Promise<void> {
   const claude = makeClaudeProfile({
     ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
     defaultModel: config.CLAUDE_DEFAULT_MODEL,
+    maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
     mcpServers,
   });
 
@@ -82,6 +83,7 @@ async function main(): Promise<void> {
       configDir: p.configDir,
       ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
       defaultModel: config.CLAUDE_DEFAULT_MODEL,
+      maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
       mcpServers,
     })
   );

@@ -36,11 +36,18 @@ export function makeClaudeProfile(opts: {
   configDir?: string;
   /** Default model id for sessions on this profile (e.g. "claude-sonnet-4.5"). */
   defaultModel: string;
+  /**
+   * Extended-thinking budget in tokens. The adapter only emits
+   * `agent_thought_chunk` when its child sees `MAX_THINKING_TOKENS` in the
+   * env, so we forward this through. 0 / undefined leaves thinking off.
+   */
+  maxThinkingTokens?: number;
   /** Accepted for parity; unused — MCP servers are forwarded via ACP. */
   mcpServers?: McpServer[];
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "claude-agent-acp";
   const configDir = opts.configDir?.trim() || undefined;
+  const maxThinkingTokens = opts.maxThinkingTokens;
 
   let identityCache: AgentIdentity | null | undefined;
 
@@ -51,6 +58,9 @@ export function makeClaudeProfile(opts: {
     spawn() {
       const env: NodeJS.ProcessEnv = { ...process.env };
       if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
+      if (maxThinkingTokens && maxThinkingTokens > 0) {
+        env.MAX_THINKING_TOKENS = String(maxThinkingTokens);
+      }
       return spawn(cli, [], {
         stdio: ["pipe", "pipe", "pipe"],
         env,

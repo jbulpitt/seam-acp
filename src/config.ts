@@ -129,6 +129,13 @@ const Schema = z.object({
   /** Per-agent model override for the Claude profile. */
   CLAUDE_DEFAULT_MODEL: z.string().default("claude-sonnet-4.5"),
   /**
+   * Extended-thinking budget for the Claude profile, in tokens. Set to 0 to
+   * disable. The adapter only emits `agent_thought_chunk` (which seam shows
+   * in the status panel's reasoning blockquote) when this is non-zero.
+   * Surfaced to the adapter via the `MAX_THINKING_TOKENS` env var it reads.
+   */
+  CLAUDE_MAX_THINKING_TOKENS: z.coerce.number().int().min(0).max(64000).default(8000),
+  /**
    * Same shape as COPILOT_PROFILES — register additional Claude profiles
    * each pinned to its own --config-dir (auth / settings). Format:
    *   id1:/abs/dir1,id2:/abs/dir2

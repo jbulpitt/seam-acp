@@ -57,23 +57,25 @@ import {
   type AgyStep,
 } from "../agy-stream.js";
 
-const CONVERSATION_DIR = path.join(
-  process.env.HOME ?? "/root",
-  ".gemini/antigravity-cli/conversations",
-);
+const AGY_HOME = path.join(process.env.HOME ?? "/root", ".gemini/antigravity-cli");
+const CONVERSATION_DIR = path.join(AGY_HOME, "conversations");
+const SETTINGS_FILE = path.join(AGY_HOME, "settings.json");
 
 export function makeAgyProfile(opts: {
   /** Override the agy binary location. Defaults to `agy` on PATH. */
   cliPath?: string;
   /**
-   * Model id to advertise. Antigravity's CLI ignores ACP `set_model`, so this
-   * is purely cosmetic — the actual model is whatever agy picks. We pass through
-   * a reasonable default so the AgentRuntime has something to record.
+   * Model id to advertise as the profile-level default. Per-session model
+   * comes from the catalog returned by `newSession` (or whatever the user
+   * has set in `~/.gemini/antigravity-cli/settings.json`).
    */
   defaultModel?: string;
 } = {}): AgentProfile {
   const cli = opts.cliPath?.trim() || resolveAgyBinary();
   const defaultModel = opts.defaultModel ?? "antigravity";
+  // Warm the model catalog cache in the background — first /seam model call
+  // will read the cached promise instead of paying the ~5s spawn cost inline.
+  void getCatalog(cli);
   return {
     id: "agy",
     displayName: "Antigravity",
@@ -179,7 +181,20 @@ class AgyAgent implements Agent {
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     const id = randomUUID();
     this.sessions.set(id, { cwd: params.cwd });
-    return { sessionId: id };
+    const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
+    if (catalog.length === 0) {
+      return { sessionId: id };
+    }
+    return {
+      sessionId: id,
+      models: {
+        availableModels: catalog.map((e) => ({
+          modelId: e.modelId,
+          name: pickerLabel(e),
+        })),
+        currentModelId: readCurrentModelId(catalog),
+      },
+    };
   }
 
   async loadSession(_params: LoadSessionRequest): Promise<LoadSessionResponse> {
@@ -195,8 +210,27 @@ class AgyAgent implements Agent {
   }
 
   async setSessionModel(
-    _params: SetSessionModelRequest,
+    params: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse> {
+    // agy reads its active model from ~/.gemini/antigravity-cli/settings.json
+    // at every CLI invocation. Since we spawn a fresh `agy -p` per prompt,
+    // editing that file takes effect on the next turn.
+    const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
+    const entry = catalog.find((e) => e.modelId === params.modelId);
+    if (!entry) return {};
+    try {
+      let json: Record<string, unknown> = {};
+      try {
+        json = JSON.parse(fsSync.readFileSync(SETTINGS_FILE, "utf8")) as Record<string, unknown>;
+      } catch { /* fresh settings */ }
+      json["model"] = entry.rawDisplayName;
+      fsSync.writeFileSync(SETTINGS_FILE, JSON.stringify(json, null, 2) + "\n");
+    } catch (err) {
+      if (process.env.AGY_PROFILE_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.error("[agy] setSessionModel failed:", err);
+      }
+    }
     return {};
   }
 
@@ -643,4 +677,153 @@ async function waitForNewCascade(
   throw new Error(
     "no new agy conversation appeared within 30s — is `agy` installed and logged in?",
   );
+}
+
+// ---------------------------------------------------------------------------
+// Model catalog
+// ---------------------------------------------------------------------------
+//
+// agy's local language server exposes the live model list via the Connect
+// endpoint /exa.language_server_pb.LanguageServerService/GetAvailableModels.
+// We spawn a transient `agy -p` once at profile creation, scrape the catalog,
+// and cache it for the life of the process. The selected model lives in
+// ~/.gemini/antigravity-cli/settings.json under the `model` key (a display
+// name like "Gemini 3.5 Flash (High)"), which agy reads on every CLI call.
+
+interface AgyCatalogEntry {
+  /** API id (e.g. "gemini-3-flash-agent") — what we put in ACP `modelId`. */
+  modelId: string;
+  /** Cleaned-up name for the Discord picker (tier word → icon, no "(Thinking)"). */
+  displayName: string;
+  /** Original Antigravity display name — what we write to settings.json. */
+  rawDisplayName: string;
+  /** Human-readable context window (e.g. "1M", "250K"). */
+  ctx: string;
+  recommended: boolean;
+  supportsThinking: boolean;
+  supportsImages: boolean;
+}
+
+let catalogPromise: Promise<AgyCatalogEntry[]> | null = null;
+
+function getCatalog(cli: string): Promise<AgyCatalogEntry[]> {
+  if (catalogPromise) return catalogPromise;
+  const p = fetchAgyCatalog(cli);
+  catalogPromise = p.catch((err) => {
+    // Don't pin the cache to an error — let the next caller retry.
+    catalogPromise = null;
+    if (process.env.AGY_PROFILE_DEBUG) {
+      // eslint-disable-next-line no-console
+      console.error("[agy] catalog fetch failed:", err);
+    }
+    return [];
+  });
+  return catalogPromise;
+}
+
+async function fetchAgyCatalog(cli: string): Promise<AgyCatalogEntry[]> {
+  // Spawn a tiny agy turn just to bring the LS up. The "ok" prompt produces
+  // a few tokens of throwaway output; the cost is acceptable given the result
+  // is cached for the process lifetime.
+  const start = Date.now();
+  const proc = spawn(cli, ["-p", "ok", "--print-timeout", "30s", "--dangerously-skip-permissions"], {
+    cwd: "/tmp",
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  try {
+    const ls = await discoverAgyLs({
+      timeoutMs: 15_000,
+      newerThanMs: start - 1_000,
+    });
+    const res = await fetch(
+      `http://localhost:${ls.port}/exa.language_server_pb.LanguageServerService/GetAvailableModels`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+    );
+    if (!res.ok) throw new Error(`GetAvailableModels HTTP ${res.status}`);
+    const json = (await res.json()) as { response?: { models?: Record<string, AgyRawModel> } };
+    return parseAgyCatalog(json);
+  } finally {
+    try { proc.kill(); } catch { /* already gone */ }
+  }
+}
+
+interface AgyRawModel {
+  displayName?: string;
+  maxTokens?: number;
+  recommended?: boolean;
+  supportsThinking?: boolean;
+  supportsImages?: boolean;
+  isInternal?: boolean;
+}
+
+function parseAgyCatalog(json: { response?: { models?: Record<string, AgyRawModel> } }): AgyCatalogEntry[] {
+  const models = json.response?.models ?? {};
+  const rows: AgyCatalogEntry[] = [];
+  for (const [id, m] of Object.entries(models)) {
+    if (m.isInternal || !m.displayName) continue;
+    rows.push({
+      modelId: id,
+      rawDisplayName: m.displayName,
+      displayName: cleanAgyDisplayName(m.displayName),
+      ctx: formatTokens(m.maxTokens ?? 0),
+      recommended: !!m.recommended,
+      supportsThinking: !!m.supportsThinking,
+      supportsImages: !!m.supportsImages,
+    });
+  }
+  // Antigravity ships multiple ids with the same displayName (rebrand aliases
+  // and stale labels). Pick the id whose slug best matches the displayName so
+  // the picker doesn't show literal duplicates.
+  const byName = new Map<string, AgyCatalogEntry>();
+  const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const score = (r: AgyCatalogEntry) => {
+    const a = slug(r.rawDisplayName);
+    const b = slug(r.modelId);
+    let s = 0;
+    for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] === b[i]) s++;
+    return s;
+  };
+  for (const r of rows) {
+    const prev = byName.get(r.rawDisplayName);
+    if (!prev || score(r) > score(prev)) byName.set(r.rawDisplayName, r);
+  }
+  return [...byName.values()].sort(
+    (a, b) => Number(b.recommended) - Number(a.recommended) || a.displayName.localeCompare(b.displayName),
+  );
+}
+
+const TIER_ICON: Record<string, string> = { high: "🔼", medium: "▶️", low: "🔽" };
+
+function cleanAgyDisplayName(s: string): string {
+  // "(Thinking)" is redundant — we already show 🧠 in the label suffix.
+  let out = s.replace(/\s*\(Thinking\)\s*$/i, "");
+  out = out.replace(
+    /\s*\((High|Medium|Low)\)\s*$/i,
+    (_m, t: string) => ` ${TIER_ICON[t.toLowerCase()] ?? ""}`,
+  );
+  return out.trim();
+}
+
+function formatTokens(n: number): string {
+  if (!n) return "—";
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n % 1_000_000 ? 1 : 0).replace(/\.0$/, "") + "M";
+  if (n >= 1_000) return Math.round(n / 1_000) + "K";
+  return String(n);
+}
+
+function pickerLabel(e: AgyCatalogEntry): string {
+  const caps = [e.supportsThinking ? "🧠" : "", e.supportsImages ? "🖼️" : ""].filter(Boolean).join("");
+  return `${e.recommended ? "★ " : ""}${e.displayName} — 🪟${e.ctx}${caps ? " " + caps : ""}`;
+}
+
+function readCurrentModelId(catalog: ReadonlyArray<AgyCatalogEntry>): string {
+  try {
+    const raw = fsSync.readFileSync(SETTINGS_FILE, "utf8");
+    const dn = (JSON.parse(raw) as { model?: unknown }).model;
+    if (typeof dn === "string") {
+      const match = catalog.find((e) => e.rawDisplayName === dn);
+      if (match) return match.modelId;
+    }
+  } catch { /* fall through to default */ }
+  return catalog.find((e) => e.recommended)?.modelId ?? catalog[0]?.modelId ?? "";
 }

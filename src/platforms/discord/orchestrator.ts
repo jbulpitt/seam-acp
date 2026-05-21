@@ -50,7 +50,6 @@ export class Orchestrator {
 
   private activeTurns = 0;
   private restartPending = false;
-  private sentinelWatcher: fs.FSWatcher | null = null;
 
   constructor(opts: {
     logger: Logger;
@@ -83,10 +82,14 @@ export class Orchestrator {
     }
   }
 
+  private sentinelPoller: ReturnType<typeof setInterval> | null = null;
+
   /** Stop the sentinel file watcher (call on shutdown). */
   stopSentinelWatcher(): void {
-    this.sentinelWatcher?.close();
-    this.sentinelWatcher = null;
+    if (this.sentinelPoller) {
+      clearInterval(this.sentinelPoller);
+      this.sentinelPoller = null;
+    }
   }
 
   private sentinelPath(): string {
@@ -94,25 +97,17 @@ export class Orchestrator {
   }
 
   private watchSentinel(): void {
-    const sentinelPath = this.sentinelPath();
-    const dataDir = this.config.DATA_DIR;
-
     const checkSentinel = () => {
       if (this.restartPending) return;
-      if (!fs.existsSync(sentinelPath)) return;
+      if (!fs.existsSync(this.sentinelPath())) return;
       this.logger.info("restart sentinel detected");
       void this.handleRestartSentinel();
     };
 
-    try {
-      this.sentinelWatcher = fs.watch(dataDir, (_event, filename) => {
-        if (filename === ".restart-pending") checkSentinel();
-      });
-      // Also check immediately in case it was written before we started watching.
-      checkSentinel();
-    } catch (err) {
-      this.logger.warn({ err }, "failed to watch data dir for restart sentinel");
-    }
+    // Poll every 2s — more reliable than fs.watch on Linux
+    this.sentinelPoller = setInterval(checkSentinel, 2000);
+    // Also check immediately in case sentinel was written before startup
+    checkSentinel();
   }
 
   private async handleRestartSentinel(): Promise<void> {

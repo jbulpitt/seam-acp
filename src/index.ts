@@ -89,6 +89,7 @@ async function main(): Promise<void> {
   const agy = makeAgyProfile({
     ...(config.AGY_CLI_PATH ? { cliPath: config.AGY_CLI_PATH } : {}),
     defaultModel: config.AGY_DEFAULT_MODEL,
+    dataDir: config.DATA_DIR,
   });
 
   const remoteCopilots = config.REMOTE_COPILOT_PROFILES.map((p) =>

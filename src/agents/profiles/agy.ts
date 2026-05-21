@@ -60,6 +60,64 @@ import {
 const AGY_HOME = path.join(process.env.HOME ?? "/root", ".gemini/antigravity-cli");
 const CONVERSATION_DIR = path.join(AGY_HOME, "conversations");
 const SETTINGS_FILE = path.join(AGY_HOME, "settings.json");
+/** Legacy mapping file from before we moved this state out of agy's home dir. */
+const LEGACY_MAPPING_FILE = path.join(AGY_HOME, "seam_sessions.json");
+
+/**
+ * On-disk session record. `maxStepIndex` is the highest cascade step idx we've
+ * already emitted to the ACP client — used to skip the LS's history replay on
+ * subscribe. Anything ≤ this we've already shown the user.
+ */
+interface PersistedSession {
+  cascadeId: string;
+  maxStepIndex: number;
+}
+
+type SessionMapping = Record<string, PersistedSession | string>;
+
+async function loadPersistedSession(
+  file: string,
+  sessionId: string,
+): Promise<PersistedSession | undefined> {
+  for (const candidate of [file, LEGACY_MAPPING_FILE]) {
+    try {
+      const data = await fs.readFile(candidate, "utf8");
+      const mapping = JSON.parse(data) as SessionMapping;
+      const entry = mapping[sessionId];
+      if (!entry) continue;
+      // Old format stored just the cascadeId as a string. Anything in the
+      // legacy file pre-dates step-index tracking, so the cascade was already
+      // fully delivered to the user by the previous turn — pin maxStepIndex
+      // high so the next turn skips the LS's history replay entirely.
+      if (typeof entry === "string") {
+        return { cascadeId: entry, maxStepIndex: Number.MAX_SAFE_INTEGER };
+      }
+      return entry;
+    } catch { /* try next */ }
+  }
+  return undefined;
+}
+
+async function savePersistedSession(
+  file: string,
+  sessionId: string,
+  entry: PersistedSession,
+): Promise<void> {
+  try {
+    let mapping: SessionMapping = {};
+    try {
+      mapping = JSON.parse(await fs.readFile(file, "utf8")) as SessionMapping;
+    } catch { /* fresh file */ }
+    mapping[sessionId] = entry;
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, JSON.stringify(mapping, null, 2) + "\n");
+  } catch (err) {
+    if (process.env.AGY_PROFILE_DEBUG) {
+      // eslint-disable-next-line no-console
+      console.error("[agy] failed to save session mapping:", err);
+    }
+  }
+}
 
 export function makeAgyProfile(opts: {
   /** Override the agy binary location. Defaults to `agy` on PATH. */
@@ -70,9 +128,18 @@ export function makeAgyProfile(opts: {
    * has set in `~/.gemini/antigravity-cli/settings.json`).
    */
   defaultModel?: string;
+  /**
+   * seam-acp's own state directory. The agy profile stores its ACP→cascade
+   * mapping here, separate from agy's `~/.gemini/antigravity-cli/`. Defaults
+   * to the legacy location for back-compat.
+   */
+  dataDir?: string;
 } = {}): AgentProfile {
   const cli = opts.cliPath?.trim() || resolveAgyBinary();
   const defaultModel = opts.defaultModel ?? "antigravity";
+  const mappingFile = opts.dataDir
+    ? path.join(opts.dataDir, "agy-sessions.json")
+    : LEGACY_MAPPING_FILE;
   // Warm the model catalog cache in the background — first /seam model call
   // will read the cached promise instead of paying the ~5s spawn cost inline.
   void getCatalog(cli);
@@ -81,7 +148,7 @@ export function makeAgyProfile(opts: {
     displayName: "Antigravity",
     defaultModel,
     spawn() {
-      return makeFakeAgyProcess(cli);
+      return makeFakeAgyProcess(cli, mappingFile);
     },
   };
 }
@@ -92,14 +159,14 @@ export function makeAgyProfile(opts: {
 
 type FakeProc = ChildProcessByStdio<Writable, Readable, Readable>;
 
-function makeFakeAgyProcess(cli: string): FakeProc {
+function makeFakeAgyProcess(cli: string, mappingFile: string): FakeProc {
   const fakeStdin = new PassThrough(); // client writes here; we read from it
   const fakeStdout = new PassThrough(); // we write here; client reads from it
   const fakeStderr = new PassThrough();
   const emitter = new EventEmitter();
   let killed = false;
 
-  const agent = new AgyAgent(cli);
+  const agent = new AgyAgent(cli, mappingFile);
 
   const stream = ndJsonStream(
     Writable.toWeb(fakeStdout),
@@ -142,6 +209,12 @@ interface AgySession {
   cwd: string;
   /** Set after the first `agy -p` run; used for `--conversation` continuity. */
   cascadeId?: string;
+  /**
+   * Highest cascade step idx already emitted to the ACP client. The LS replays
+   * the full step history on every subscribe; we use this as a high-water mark
+   * to skip everything we've shown before. -1 = nothing yet.
+   */
+  maxStepIndex: number;
 }
 
 interface ActiveRun {
@@ -155,7 +228,10 @@ class AgyAgent implements Agent {
   private readonly sessions = new Map<string, AgySession>();
   private active?: ActiveRun;
 
-  constructor(private readonly cli: string) {}
+  constructor(
+    private readonly cli: string,
+    private readonly mappingFile: string,
+  ) {}
 
   bind(conn: AgentSideConnection): void {
     this.conn = conn;
@@ -168,7 +244,7 @@ class AgyAgent implements Agent {
         // agy only consumes text prompts from us; richer block support can be
         // added later if we want to forward attachments through the CLI.
         promptCapabilities: {},
-        loadSession: false,
+        loadSession: true,
       },
       authMethods: [],
     };
@@ -180,7 +256,7 @@ class AgyAgent implements Agent {
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     const id = randomUUID();
-    this.sessions.set(id, { cwd: params.cwd });
+    this.sessions.set(id, { cwd: params.cwd, maxStepIndex: -1 });
     const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
     if (catalog.length === 0) {
       return { sessionId: id };
@@ -197,10 +273,26 @@ class AgyAgent implements Agent {
     };
   }
 
-  async loadSession(_params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    // `loadSession: false` was advertised in initialize, but the SDK still
-    // requires the method to exist. Reject loads explicitly.
-    throw RequestError.methodNotFound("session/load");
+  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const persisted = await loadPersistedSession(this.mappingFile, params.sessionId);
+    this.sessions.set(params.sessionId, {
+      cwd: params.cwd,
+      cascadeId: persisted?.cascadeId,
+      maxStepIndex: persisted?.maxStepIndex ?? -1,
+    });
+    const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
+    if (catalog.length === 0) {
+      return {};
+    }
+    return {
+      models: {
+        availableModels: catalog.map((e) => ({
+          modelId: e.modelId,
+          name: pickerLabel(e),
+        })),
+        currentModelId: readCurrentModelId(catalog),
+      },
+    };
   }
 
   async setSessionMode(
@@ -209,7 +301,7 @@ class AgyAgent implements Agent {
     return {};
   }
 
-  async setSessionModel(
+  async unstable_setSessionModel(
     params: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse> {
     // agy reads its active model from ~/.gemini/antigravity-cli/settings.json
@@ -313,13 +405,23 @@ class AgyAgent implements Agent {
         signal: cancelAbort.signal,
       });
       const cid = sess.cascadeId ?? (await waitForNewCascade(before, cancelAbort.signal));
-      sess.cascadeId = cid;
+      if (!sess.cascadeId) {
+        sess.cascadeId = cid;
+        await savePersistedSession(this.mappingFile, params.sessionId, {
+          cascadeId: cid,
+          maxStepIndex: sess.maxStepIndex,
+        });
+      }
 
       const lastText = new Map<number, string>();
       const lastThinking = new Map<number, string>();
       const heldText = new Map<number, string>();
       const heldThinking = new Map<number, string>();
       const toolCallIds = new Map<number, string>();
+      // High-water mark from prior turns. The LS replays every step at or
+      // below this on subscribe — skip them so the user doesn't see the entire
+      // previous conversation repeated. Anything strictly above is new.
+      const skipUpTo = sess.maxStepIndex;
 
       try {
         for await (const update of subscribeToAgyStream({
@@ -334,6 +436,7 @@ class AgyAgent implements Agent {
             const idx = sup.indices[i];
             const step = sup.steps[i];
             if (idx === undefined || step === undefined) continue;
+            if (idx <= skipUpTo) continue;
             await this.emitStep(
               params.sessionId,
               idx,
@@ -345,6 +448,7 @@ class AgyAgent implements Agent {
               heldThinking,
               sess.cwd,
             );
+            if (idx > sess.maxStepIndex) sess.maxStepIndex = idx;
           }
         }
       } catch (streamErr) {
@@ -368,6 +472,14 @@ class AgyAgent implements Agent {
       // Flush any text held back as a potentially-partial pattern.
       await this.flushHeld(params.sessionId, heldText, "agent_message_chunk", sess.cwd);
       await this.flushHeld(params.sessionId, heldThinking, "agent_thought_chunk", sess.cwd);
+      // Persist the new high-water mark so the next turn (or a restart) can
+      // skip everything we've already emitted.
+      if (sess.cascadeId && sess.maxStepIndex > skipUpTo) {
+        await savePersistedSession(this.mappingFile, params.sessionId, {
+          cascadeId: sess.cascadeId,
+          maxStepIndex: sess.maxStepIndex,
+        });
+      }
     } catch (err) {
       if (cancelAbort.signal.aborted) return { stopReason: "cancelled" };
       const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();

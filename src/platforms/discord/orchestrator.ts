@@ -48,6 +48,10 @@ export class Orchestrator {
   private readonly store: SessionStore;
   private readonly renderer: Renderer;
 
+  private activeTurns = 0;
+  private restartPending = false;
+  private sentinelWatcher: fs.FSWatcher | null = null;
+
   constructor(opts: {
     logger: Logger;
     config: Config;
@@ -66,6 +70,7 @@ export class Orchestrator {
 
   install(): void {
     this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
+    this.watchSentinel();
   }
 
   async postNotification(message: string): Promise<void> {
@@ -78,9 +83,82 @@ export class Orchestrator {
     }
   }
 
+  /** Stop the sentinel file watcher (call on shutdown). */
+  stopSentinelWatcher(): void {
+    this.sentinelWatcher?.close();
+    this.sentinelWatcher = null;
+  }
+
+  private sentinelPath(): string {
+    return path.join(this.config.DATA_DIR, ".restart-pending");
+  }
+
+  private watchSentinel(): void {
+    const sentinelPath = this.sentinelPath();
+    const dataDir = this.config.DATA_DIR;
+
+    const checkSentinel = () => {
+      if (this.restartPending) return;
+      if (!fs.existsSync(sentinelPath)) return;
+      this.logger.info("restart sentinel detected");
+      void this.handleRestartSentinel();
+    };
+
+    try {
+      this.sentinelWatcher = fs.watch(dataDir, (_event, filename) => {
+        if (filename === ".restart-pending") checkSentinel();
+      });
+      // Also check immediately in case it was written before we started watching.
+      checkSentinel();
+    } catch (err) {
+      this.logger.warn({ err }, "failed to watch data dir for restart sentinel");
+    }
+  }
+
+  private async handleRestartSentinel(): Promise<void> {
+    this.restartPending = true;
+
+    if (this.activeTurns > 0) {
+      const turnWord = this.activeTurns === 1 ? "turn" : "turn(s)";
+      await this.postNotification(
+        `♻️ Restart requested — waiting for ${this.activeTurns} ${turnWord} to finish.`
+      );
+      this.logger.info({ activeTurns: this.activeTurns }, "restart pending, draining turns");
+
+      await new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (this.activeTurns === 0) {
+            clearInterval(check);
+            resolve();
+          }
+        }, 500);
+      });
+    }
+
+    this.logger.info("all turns drained, executing restart");
+    try {
+      await fsp.unlink(this.sentinelPath());
+    } catch {
+      // ignore if already gone
+    }
+
+    // exec replaces this process — pm2 revives with the new dist/
+    const { execSync } = await import("node:child_process");
+    execSync("pm2 restart seam-acp", { stdio: "inherit" });
+  }
+
   // --- message turn ---
 
   private async handleIncomingMessage(msg: IncomingMessage): Promise<void> {
+    this.activeTurns++;
+    try {
+      await this.handleIncomingMessageInner(msg);
+    } finally {
+      this.activeTurns--;
+    }
+  }
+
+  private async handleIncomingMessageInner(msg: IncomingMessage): Promise<void> {
     const channel = msg.channel;
     const record = this.router.ensureSessionRecord({
       platform: channel.platform,

@@ -5,6 +5,7 @@ module.exports = {
       script: "dist/index.js",
       cwd: __dirname,
       interpreter: "node",
+      kill_timeout: 120000,
       // Restart automatically on crash; back off if it crashes repeatedly
       restart_delay: 3000,
       max_restarts: 10,

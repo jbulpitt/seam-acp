@@ -7,6 +7,7 @@ import { SessionRouter } from "./core/session-router.js";
 import { makeCopilotProfile } from "./agents/profiles/copilot.js";
 import { makeGeminiProfile } from "./agents/profiles/gemini.js";
 import { makeClaudeProfile } from "./agents/profiles/claude.js";
+import { makeAgyProfile } from "./agents/profiles/agy.js";
 import { makeRemoteCopilotServerProfile, makeRemoteCopilotClientProfile } from "./agents/profiles/remote.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
@@ -85,6 +86,11 @@ async function main(): Promise<void> {
     })
   );
 
+  const agy = makeAgyProfile({
+    ...(config.AGY_CLI_PATH ? { cliPath: config.AGY_CLI_PATH } : {}),
+    defaultModel: config.AGY_DEFAULT_MODEL,
+  });
+
   const remoteCopilots = config.REMOTE_COPILOT_PROFILES.map((p) =>
     p.mode === "server"
       ? makeRemoteCopilotServerProfile({
@@ -104,7 +110,7 @@ async function main(): Promise<void> {
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, ...extraCopilots, gemini, ...extraGeminis, claude, ...extraClaudes, ...remoteCopilots],
+    profiles: [copilot, ...extraCopilots, gemini, ...extraGeminis, claude, ...extraClaudes, agy, ...remoteCopilots],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".
@@ -168,6 +174,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, "shutting down");
+    orchestrator.stopSentinelWatcher();
     stopTunnelGist?.();
     try {
       await adapter.stop();

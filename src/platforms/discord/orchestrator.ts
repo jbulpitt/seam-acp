@@ -68,6 +68,16 @@ export class Orchestrator {
     this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
   }
 
+  async postNotification(message: string): Promise<void> {
+    const channelId = this.config.DISCORD_NOTIFICATIONS_CHANNEL_ID;
+    if (!channelId) return;
+    try {
+      await this.adapter.sendMessage({ platform: PLATFORM, id: channelId }, message);
+    } catch (err) {
+      this.logger.warn({ err }, "failed to post notification");
+    }
+  }
+
   // --- message turn ---
 
   private async handleIncomingMessage(msg: IncomingMessage): Promise<void> {

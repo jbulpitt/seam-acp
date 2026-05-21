@@ -355,6 +355,11 @@ class AgyAgent implements Agent {
       "--print-timeout",
       "600s",
       "--dangerously-skip-permissions",
+      // agy ignores the process cwd for its "workspace" — that's controlled
+      // separately via --add-dir. Without this, file tools default to $HOME
+      // and report "no active workspace set".
+      "--add-dir",
+      sess.cwd,
     ];
     if (sess.cascadeId) {
       args.push("--conversation", sess.cascadeId);

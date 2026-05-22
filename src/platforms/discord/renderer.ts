@@ -101,21 +101,10 @@ export const discordRenderer: Renderer = {
     // --- footer: thinking lines (💡) + elapsed time (⏱) ---
     const footerParts: string[] = [];
     if (state.thinking && state.thinking.length > 0) {
-      const filteredThinking = state.thinking.filter((t) => {
-        const lower = t.toLowerCase();
-        return (
-          !lower.includes("tool specificity") &&
-          !lower.includes("critical instruction") &&
-          !lower.includes("avoid cat for file creation") &&
-          !lower.includes("grepsearch")
-        );
-      });
-      if (filteredThinking.length > 0) {
-        const thinkingLines = filteredThinking
-          .map((t) => `💡 ${trim(t.replace(/[*_`]/g, ""), 200)}`)
-          .join("\n");
-        footerParts.push(thinkingLines);
-      }
+      const thinkingLines = state.thinking
+        .map((t) => `💡 ${trim(t.replace(/[*_`]/g, ""), 200)}`)
+        .join("\n");
+      footerParts.push(thinkingLines);
     }
     footerParts.push(`\n⏱ ${state.elapsedSeconds}s elapsed`);
 

@@ -97,6 +97,24 @@ export class TurnStatus {
     }
   }
 
+  private isSystemInstruction(text: string): boolean {
+    const lower = text.toLowerCase();
+    return (
+      lower.includes("tool specificity") ||
+      lower.includes("critical instruction") ||
+      lower.includes("avoid cat for file creation") ||
+      lower.includes("grepsearch") ||
+      lower.includes("refining tool usage") ||
+      lower.includes("refining my approach") ||
+      lower.includes("specific tool usage") ||
+      lower.includes("in tool selection") ||
+      lower.includes("precise tool utilization") ||
+      lower.includes("focused on adhering") ||
+      lower.includes("more specific tool selections") ||
+      lower.includes("explicit tool listings")
+    );
+  }
+
   /**
    * Append a streamed thought chunk. Thoughts arrive as deltas that may end
    * mid-line; we buffer until we hit a newline, then promote complete lines
@@ -112,7 +130,7 @@ export class TurnStatus {
     this.thinkingPending = this.thinkingPending.slice(lastNl + 1);
     for (const raw of complete.split("\n")) {
       const t = raw.trim();
-      if (!t) continue;
+      if (!t || this.isSystemInstruction(t)) continue;
       this.thinkingLines.push(t);
       if (this.thinkingLines.length > TurnStatus.MAX_THINKING) {
         this.thinkingLines.shift();
@@ -123,9 +141,10 @@ export class TurnStatus {
   /** Rolling window of the last N thought lines plus the in-flight tail. */
   thinkingWindow(): string[] | undefined {
     const pending = this.thinkingPending.trim();
-    if (this.thinkingLines.length === 0 && !pending) return undefined;
-    const lines = pending ? [...this.thinkingLines, pending] : [...this.thinkingLines];
-    return lines.slice(-TurnStatus.MAX_THINKING);
+    const showPending = pending && !this.isSystemInstruction(pending);
+    if (this.thinkingLines.length === 0 && !showPending) return undefined;
+    const lines = showPending ? [...this.thinkingLines, pending] : [...this.thinkingLines];
+    return lines.length > 0 ? lines.slice(-TurnStatus.MAX_THINKING) : undefined;
   }
 
   toInput(): StatusPanelInput {

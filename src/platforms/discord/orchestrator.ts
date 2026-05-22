@@ -77,7 +77,7 @@ export class Orchestrator {
     const channelId = this.config.DISCORD_NOTIFICATIONS_CHANNEL_ID;
     if (!channelId) return;
     try {
-      await this.adapter.sendMessage({ platform: PLATFORM, id: channelId }, message);
+      await this.adapter.sendMessage({ platform: PLATFORM, id: channelId }, `**seam-acp**: ${message}`);
     } catch (err) {
       this.logger.warn({ err }, "failed to post notification");
     }

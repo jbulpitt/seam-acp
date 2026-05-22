@@ -1,5 +1,5 @@
 import path from "node:path";
-import { loadConfig } from "./config.js";
+import { loadConfig, REMOTE_MAC_MODELS } from "./config.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
 import { SessionStore } from "./core/session-store.js";
@@ -113,7 +113,7 @@ async function main(): Promise<void> {
           wsPort: p.wsPort,
           token: p.token,
           defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
-          staticModels: config.COPILOT_MODELS,
+          staticModels: p.id === "mac" ? REMOTE_MAC_MODELS : config.COPILOT_MODELS,
           threadAbbr: "cp-fs",
         })
       : makeRemoteCopilotClientProfile({
@@ -121,7 +121,7 @@ async function main(): Promise<void> {
           wsUrl: p.wsUrl,
           token: p.token,
           defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
-          staticModels: config.COPILOT_MODELS,
+          staticModels: p.id === "mac" ? REMOTE_MAC_MODELS : config.COPILOT_MODELS,
           threadAbbr: "cp-fs",
         })
   );

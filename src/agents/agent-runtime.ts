@@ -261,7 +261,7 @@ export class AgentRuntime {
   async newSession(opts: NewSessionOptions): Promise<SessionInfo> {
     const conn = this.requireConnection();
     const meta: Record<string, unknown> = {
-      ...(this.profile.newSessionMeta?.() ?? {}),
+      ...(this.profile.newSessionMeta?.(opts.model) ?? {}),
       ...(opts.meta ?? {}),
     };
 
@@ -287,14 +287,17 @@ export class AgentRuntime {
     if (
       wantedModel &&
       this.sessionInfo.currentModelId &&
-      wantedModel !== this.sessionInfo.currentModelId &&
-      this.sessionInfo.availableModels.some((m) => m.modelId === wantedModel)
+      wantedModel !== this.sessionInfo.currentModelId
     ) {
-      try {
-        await this.setModel(wantedModel);
-        this.sessionInfo = { ...this.sessionInfo, currentModelId: wantedModel };
-      } catch (err) {
-        this.logger.warn({ err, wantedModel }, "failed to set initial model");
+      const isExplicit = opts.model !== undefined;
+      const isAvailable = this.sessionInfo.availableModels.some((m) => m.modelId === wantedModel);
+      if (isExplicit || isAvailable) {
+        try {
+          await this.setModel(wantedModel);
+          this.sessionInfo = { ...this.sessionInfo, currentModelId: wantedModel };
+        } catch (err) {
+          this.logger.warn({ err, wantedModel }, "failed to set initial model");
+        }
       }
     }
 
@@ -305,12 +308,17 @@ export class AgentRuntime {
   async loadSession(opts: {
     sessionId: string;
     cwd: string;
+    model?: string;
   }): Promise<SessionInfo> {
     const conn = this.requireConnection();
+    const meta: Record<string, unknown> = {
+      ...(this.profile.newSessionMeta?.(opts.model) ?? {}),
+    };
     const result = await conn.loadSession({
       sessionId: opts.sessionId,
       cwd: opts.cwd,
       mcpServers: this.mcpServers,
+      ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
     });
     this.sessionCwd = opts.cwd;
     this.sessionId = opts.sessionId;
@@ -368,7 +376,12 @@ export class AgentRuntime {
   async setModel(modelId: string): Promise<void> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
-    await conn.unstable_setSessionModel({ sessionId: sid, modelId });
+    try {
+      await conn.unstable_setSessionModel({ sessionId: sid, modelId });
+    } catch (err) {
+      this.logger.warn({ err, modelId }, "unstable_setSessionModel failed; trying setSessionConfigOption fallback");
+      await this.setConfigOption("model", modelId);
+    }
     if (this.sessionInfo) {
       this.sessionInfo = { ...this.sessionInfo, currentModelId: modelId };
     }
@@ -429,10 +442,22 @@ export class AgentRuntime {
       } catch {
         /* ignore */
       }
-      try {
-        child.kill();
-      } catch {
-        /* ignore */
+      if (child.pid && (child as any).detached) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            /* ignore */
+          }
+        }
+      } else {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* ignore */
+        }
       }
     }
     this.connection = undefined;

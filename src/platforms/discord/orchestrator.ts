@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
-import { MessageFlags, type ChatInputCommandInteraction, type EmbedBuilder } from "discord.js";
+import { randomUUID } from "node:crypto";
+import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, type ChatInputCommandInteraction } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
 import type { Renderer } from "../renderer.js";
@@ -13,7 +14,8 @@ import type {
   MessageRef,
   SessionRecord,
 } from "../chat-adapter.js";
-import type { PromptOutcome } from "../../agents/agent-runtime.js";
+import { AgentRuntime, type PromptOutcome } from "../../agents/agent-runtime.js";
+import { cleanTextForPreview, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "../../agents/session-manager.js";
 import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
@@ -51,6 +53,7 @@ export class Orchestrator {
 
   private activeTurns = 0;
   private restartPending = false;
+  private readonly channelQueues = new Map<string, Promise<void>>();
 
   constructor(opts: {
     logger: Logger;
@@ -138,20 +141,42 @@ export class Orchestrator {
       // ignore if already gone
     }
 
-    // exec replaces this process — pm2 revives with the new dist/
-    const { execSync } = await import("node:child_process");
-    execSync("pm2 restart seam-acp", { stdio: "inherit" });
+    // Spawn pm2 restart in a detached process so this process can be killed
+    // without interrupting the restart command mid-flight.
+    const { spawn } = await import("node:child_process");
+    const child = spawn("pm2", ["restart", "seam-acp"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
   }
 
   // --- message turn ---
 
   private async handleIncomingMessage(msg: IncomingMessage): Promise<void> {
-    this.activeTurns++;
-    try {
-      await this.handleIncomingMessageInner(msg);
-    } finally {
-      this.activeTurns--;
-    }
+    const channelId = msg.channel.id;
+    const existingQueue = this.channelQueues.get(channelId) ?? Promise.resolve();
+
+    const newQueue = existingQueue.then(async () => {
+      this.activeTurns++;
+      try {
+        await this.handleIncomingMessageInner(msg);
+      } catch (err) {
+        this.logger.error({ err, channelId }, "error in handleIncomingMessageInner");
+      } finally {
+        this.activeTurns--;
+      }
+    });
+
+    this.channelQueues.set(channelId, newQueue);
+
+    void newQueue.then(() => {
+      if (this.channelQueues.get(channelId) === newQueue) {
+        this.channelQueues.delete(channelId);
+      }
+    });
+
+    await newQueue;
   }
 
   private async handleIncomingMessageInner(msg: IncomingMessage): Promise<void> {
@@ -177,9 +202,23 @@ export class Orchestrator {
 
     let lastEdit = 0;
     let lastRendered = "";
+    let pendingRefresh: NodeJS.Timeout | undefined;
     const refresh = async (force = false) => {
       const now = Date.now();
-      if (!force && now - lastEdit < STATUS_EDIT_DEBOUNCE_MS) return;
+      if (!force && now - lastEdit < STATUS_EDIT_DEBOUNCE_MS) {
+        if (!pendingRefresh) {
+          const remaining = STATUS_EDIT_DEBOUNCE_MS - (now - lastEdit);
+          pendingRefresh = setTimeout(() => {
+            pendingRefresh = undefined;
+            void refresh(false);
+          }, remaining);
+        }
+        return;
+      }
+      if (pendingRefresh) {
+        clearTimeout(pendingRefresh);
+        pendingRefresh = undefined;
+      }
       const panel = renderStatusPanel(this.renderer, status.toInput(), now);
       const fingerprint = JSON.stringify(panel);
       if (fingerprint === lastRendered) return;
@@ -689,20 +728,55 @@ export class Orchestrator {
         this.logger.warn({ session: record.id }, "session not found on agent; invalidating runtime");
         await this.router.invalidate(record.id, { clearAcpSession: true });
       } else if (isAgentRejectionError(err) || errMsg.includes("Prompt is too long")) {
-        this.logger.warn({ session: record.id }, "agent rejected prompt (400); invalidating session to prevent replay");
-        await this.router.invalidate(record.id, { clearAcpSession: true });
+        const isPromptTooLong = errMsg.includes("Prompt is too long");
+        this.logger.warn(
+          { session: record.id, isPromptTooLong },
+          "agent rejected prompt (400); invalidating session runtime"
+        );
+        // If it's prompt too long, we keep the ACP session ID so the user can retry.
+        // Otherwise, we clear it.
+        await this.router.invalidate(record.id, { clearAcpSession: !isPromptTooLong });
         
-        if (errMsg.includes("Prompt is too long")) {
-          await this.adapter.sendMessage(
-            channel,
-            "⚠️ **Claude hit its context limit before auto-compacting.** The context grew too large in a single turn. Try running `/compact` to free up space!"
-          );
+        if (isPromptTooLong) {
+          const profile = this.router.getProfile(record.agentId);
+          const manager = profile?.sessionManager;
+          const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+          let repaired = false;
+
+          if (manager && typeof manager.repairSession === "function" && record.acpSessionId) {
+            try {
+              this.logger.info(
+                { session: record.id, acpSessionId: record.acpSessionId },
+                "auto-repairing session due to context size rejection"
+              );
+              await manager.repairSession(cwd, record.acpSessionId);
+              repaired = true;
+            } catch (repairErr) {
+              this.logger.error({ err: repairErr, session: record.id }, "failed to auto-repair session");
+            }
+          }
+
+          if (repaired) {
+            await this.adapter.sendMessage(
+              channel,
+              "⚠️ **Claude hit its context limit before auto-compacting.** The session was automatically repaired by stripping heavy base64 image payloads and rolling back the last incomplete message. You can safely retry your message now!"
+            );
+          } else {
+            await this.adapter.sendMessage(
+              channel,
+              "⚠️ **Claude hit its context limit before auto-compacting.** The context grew too large in a single turn. Try running `/compact` to free up space!"
+            );
+          }
         }
       }
       status.setState("Failed");
       status.setAction(this.renderer.trimShort(isSessionGoneError(err) ? "Session lost — please resend your message." : errMsg, 120));
     } finally {
       clearInterval(heartbeat);
+      if (pendingRefresh) {
+        clearTimeout(pendingRefresh);
+        pendingRefresh = undefined;
+      }
       await refresh(true);
     }
   }
@@ -1003,13 +1077,18 @@ export class Orchestrator {
 
   private async cmdAbort(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
-    if (!record || !this.router.hasRuntime(record.id)) {
+    if (!record) {
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!this.router.hasRuntime(record.id)) {
       await i.reply({ content: "No active turn.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const rt = await this.router.getOrStartRuntime(record);
-    await rt.cancel();
-    await i.reply({ content: "Cancelled.", flags: MessageFlags.Ephemeral });
+    // Hard-invalidate the active session to force-kill the subprocess
+    // and immediately free the message queue.
+    await this.router.invalidate(record.id);
+    await i.reply({ content: "Active turn aborted. Subprocess terminated.", flags: MessageFlags.Ephemeral });
   }
 
   private async cmdReset(i: ChatInputCommandInteraction): Promise<void> {
@@ -1159,6 +1238,7 @@ export class Orchestrator {
       acpSessionId: "",
       updatedUtc: new Date().toISOString(),
     });
+    await this.updateThreadAbbreviation(channel, record.agentId, id);
     const message = `🤖 Agent switched to \`${id}\` (${profile.displayName}), model \`${profile.defaultModel}\`. Next message will start a fresh session.`;
     if (interaction) {
       await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
@@ -1182,18 +1262,954 @@ export class Orchestrator {
   }
 
   private async cmdSessions(i: ChatInputCommandInteraction): Promise<void> {
-    const list = this.store.list();
-    if (list.length === 0) {
-      await i.reply({ content: "No sessions yet.", flags: MessageFlags.Ephemeral });
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const lines = list
-      .slice(0, 20)
-      .map(
-        (r) =>
-          `• ${r.platform}:${r.channelRef} → repo \`${this.repoDisplay(r.repoPath)}\` (agent: ${r.agentId})`
+
+    const profile = this.router.getProfile(record.agentId);
+    if (!profile) {
+      await i.reply({ content: `Agent profile "${record.agentId}" not found.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    const manager = profile.sessionManager;
+    if (!manager) {
+      await i.reply({
+        content: `Agent profile \`${record.agentId}\` (${profile.displayName}) does not support session management.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    let sessions: SessionSummary[];
+    try {
+      sessions = await manager.listSessions(cwd);
+    } catch (err: any) {
+      await i.editReply({
+        content: `Failed to list sessions: ${err.message}`,
+      });
+      return;
+    }
+
+    if (sessions.length === 0) {
+      await i.editReply({
+        content: `No sessions found for agent \`${record.agentId}\` in workspace \`${this.repoDisplay(cwd)}\`.`,
+      });
+      return;
+    }
+
+    let currentIndex = 0;
+
+    const formatLine = (line: SessionSummaryLine) => {
+      const prefix = line.sender === "human" ? "👤" : "🤖";
+      const cleaned = cleanTextForPreview(line.text);
+      if (!cleaned) return null;
+      const truncatedText = cleaned.length > 80 ? cleaned.substring(0, 77) + "..." : cleaned;
+      return `${prefix} ${truncatedText}`;
+    };
+
+    const makeSessionMessageOptions = (idx: number, list: SessionSummary[], activeId: string, mgr: ISessionManager) => {
+      const session = list[idx];
+      if (!session) return { content: "No sessions found.", embeds: [], components: [] };
+
+      const formatted = session.previewLines.map(formatLine).filter(Boolean) as string[];
+      const previewText = formatted.length > 0
+        ? formatted.join("\n")
+        : "*No meaningful messages in this session.*";
+
+      const embed = new EmbedBuilder()
+        .setTitle(`Browse & Manage Sessions — ${profile.displayName}`)
+        .setDescription(
+          `**Session ID:** \`${session.sessionId}\`\n` +
+          `**Created:** ${session.createdAt ? `<t:${Math.floor(session.createdAt / 1000)}:f>` : "Unknown"}\n` +
+          `**Last Activity:** ${session.lastActivityAt ? `<t:${Math.floor(session.lastActivityAt / 1000)}:R>` : "Unknown"}\n` +
+          `**Status:** ${activeId === session.sessionId ? "🟢 **Active Session in this channel**" : "⚪ Inactive"}\n\n` +
+          `**Preview (Heuristic):**\n` +
+          previewText
+        )
+        .setColor(activeId === session.sessionId ? 0x2ecc71 : 0x3498db);
+
+      let footerText = `Session ${idx + 1} of ${list.length}`;
+      if (session.estimatedTokens !== undefined) {
+        footerText += ` • Estimated Context: ${session.estimatedTokens.toLocaleString()} tokens`;
+      }
+      embed.setFooter({ text: footerText });
+
+      const prevBtn = new ButtonBuilder()
+        .setCustomId("sessions:prev")
+        .setLabel("◀ Prev")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(idx === 0);
+
+      const nextBtn = new ButtonBuilder()
+        .setCustomId("sessions:next")
+        .setLabel("Next ▶")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(idx === list.length - 1);
+
+      const closeBtn = new ButtonBuilder()
+        .setCustomId("sessions:close")
+        .setLabel("Close")
+        .setStyle(ButtonStyle.Danger);
+
+      const attachBtn = new ButtonBuilder()
+        .setCustomId("sessions:attach")
+        .setLabel("Attach")
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(activeId === session.sessionId);
+
+      const cloneBtn = new ButtonBuilder()
+        .setCustomId("sessions:clone")
+        .setLabel("Clone")
+        .setStyle(ButtonStyle.Primary);
+
+      const cloneAttachBtn = new ButtonBuilder()
+        .setCustomId("sessions:clone_attach")
+        .setLabel("Clone & Attach")
+        .setStyle(ButtonStyle.Success);
+
+      const deleteBtn = new ButtonBuilder()
+        .setCustomId("sessions:delete")
+        .setLabel("Delete")
+        .setStyle(ButtonStyle.Danger);
+
+      const summaryBtn = new ButtonBuilder()
+        .setCustomId("sessions:summary")
+        .setLabel("🪄 AI Summary")
+        .setStyle(ButtonStyle.Primary);
+
+      const targetProfiles = this.router.listProfiles().filter(p =>
+        p.id !== record.agentId &&
+        p.sessionManager &&
+        typeof p.sessionManager.compactSession === "function"
       );
-    await i.reply({ content: lines.join("\n"), flags: MessageFlags.Ephemeral });
+
+      const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(prevBtn, nextBtn, closeBtn);
+      const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(attachBtn, cloneBtn, cloneAttachBtn, deleteBtn);
+
+      const row3Buttons = [summaryBtn];
+
+      if (typeof mgr.compactSession === "function") {
+        row3Buttons.push(
+          new ButtonBuilder()
+            .setCustomId("sessions:compact")
+            .setLabel("🗳️ Compact")
+            .setStyle(ButtonStyle.Success)
+        );
+      }
+
+      if (typeof mgr.repairSession === "function") {
+        row3Buttons.push(
+          new ButtonBuilder()
+            .setCustomId("sessions:repair")
+            .setLabel("Repair")
+            .setStyle(ButtonStyle.Danger)
+        );
+      }
+
+      if (targetProfiles.length > 0) {
+        row3Buttons.push(
+          new ButtonBuilder()
+            .setCustomId("sessions:migrate")
+            .setLabel("Migrate Agent")
+            .setStyle(ButtonStyle.Primary)
+        );
+      }
+
+      const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(row3Buttons);
+
+      return {
+        content: "",
+        embeds: [embed],
+        components: [row1, row2, row3],
+      };
+    };
+
+    // Render first session in the list
+    const msg = await i.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+
+    const collector = msg.createMessageComponentCollector({
+      filter: (btnInteraction) => btnInteraction.user.id === i.user.id,
+      time: 600_000, // 10 minutes
+    });
+
+    collector.on("collect", async (btnInteraction) => {
+      const customId = btnInteraction.customId;
+
+      if (customId === "sessions:prev") {
+        await btnInteraction.deferUpdate();
+        if (currentIndex > 0) {
+          currentIndex--;
+          await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+        }
+      } else if (customId === "sessions:next") {
+        await btnInteraction.deferUpdate();
+        if (currentIndex < sessions.length - 1) {
+          currentIndex++;
+          await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+        }
+      } else if (customId === "sessions:close") {
+        await btnInteraction.deferUpdate();
+        await btnInteraction.deleteReply().catch(() => {});
+        await i.deleteReply().catch(() => {});
+        collector.stop("user_closed");
+      } else if (customId === "sessions:attach") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session) {
+          await this.router.invalidate(record.id);
+          this.store.upsert({
+            ...record,
+            acpSessionId: session.sessionId,
+            updatedUtc: new Date().toISOString(),
+          });
+          const fresh = this.store.get(record.id);
+          if (fresh) {
+            record.acpSessionId = fresh.acpSessionId;
+          }
+          await btnInteraction.editReply({
+            embeds: [
+              new EmbedBuilder()
+                .setTitle("Session Attached")
+                .setDescription(`🟢 Session \`${session.sessionId}\` has been attached to this channel. Next message will run in this session.`)
+                .setColor(0x2ecc71)
+            ],
+            components: [],
+          });
+          collector.stop();
+        }
+      } else if (customId === "sessions:clone") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session) {
+          const newSessionId = randomUUID();
+          try {
+            await manager.cloneSession(cwd, session.sessionId, newSessionId);
+            sessions = await manager.listSessions(cwd);
+            const newIndex = sessions.findIndex(s => s.sessionId === newSessionId);
+            if (newIndex !== -1) {
+              currentIndex = newIndex;
+            }
+            const opts = makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager);
+            const embed = opts.embeds?.[0];
+            if (embed) {
+              embed.setDescription(
+                `✨ **Cloned successfully as** \`${newSessionId}\`!\n\n` +
+                (embed.data.description ?? "")
+              );
+            }
+            await btnInteraction.editReply(opts);
+          } catch (err: any) {
+            await btnInteraction.followUp({
+              content: `❌ Failed to clone session: ${err.message}`,
+              flags: MessageFlags.Ephemeral,
+            });
+          }
+        }
+      } else if (customId === "sessions:clone_attach") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session) {
+          const newSessionId = randomUUID();
+          try {
+            await manager.cloneSession(cwd, session.sessionId, newSessionId);
+            sessions = await manager.listSessions(cwd);
+
+            await this.router.invalidate(record.id);
+            this.store.upsert({
+              ...record,
+              acpSessionId: newSessionId,
+              updatedUtc: new Date().toISOString(),
+            });
+            const fresh = this.store.get(record.id);
+            if (fresh) {
+              record.acpSessionId = fresh.acpSessionId;
+            }
+
+            await btnInteraction.editReply({
+              embeds: [
+                new EmbedBuilder()
+                  .setTitle("Session Cloned & Attached")
+                  .setDescription(
+                    `✨ **Cloned successfully as** \`${newSessionId}\`!\n\n` +
+                    `🟢 **This new session has been attached to this channel.** Next message will run in this session.`
+                  )
+                  .setColor(0x2ecc71)
+              ],
+              components: [],
+            });
+            collector.stop();
+          } catch (err: any) {
+            await btnInteraction.followUp({
+              content: `❌ Failed to clone and attach session: ${err.message}`,
+              flags: MessageFlags.Ephemeral,
+            });
+          }
+        }
+      } else if (customId === "sessions:delete") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session) {
+          const confirmEmbed = new EmbedBuilder()
+            .setTitle("⚠️ Delete Session?")
+            .setDescription(`Are you sure you want to permanently delete session \`${session.sessionId}\`? This action cannot be undone.`)
+            .setColor(0xe74c3c);
+
+          const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId("sessions:delete_confirm")
+              .setLabel("Yes, Delete")
+              .setStyle(ButtonStyle.Danger),
+            new ButtonBuilder()
+              .setCustomId("sessions:delete_cancel")
+              .setLabel("No, Cancel")
+              .setStyle(ButtonStyle.Secondary)
+          );
+
+          await btnInteraction.editReply({
+            embeds: [confirmEmbed],
+            components: [row],
+          });
+        }
+      } else if (customId === "sessions:delete_cancel") {
+        await btnInteraction.deferUpdate();
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+      } else if (customId === "sessions:delete_confirm") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session) {
+          try {
+            await manager.deleteSession(cwd, session.sessionId);
+            if (record.acpSessionId === session.sessionId) {
+              await this.router.invalidate(record.id, { clearAcpSession: true });
+              const fresh = this.store.get(record.id);
+              if (fresh) {
+                record.acpSessionId = fresh.acpSessionId;
+              } else {
+                record.acpSessionId = "";
+              }
+            }
+            sessions = await manager.listSessions(cwd);
+            if (sessions.length === 0) {
+              await btnInteraction.editReply({
+                embeds: [
+                  new EmbedBuilder()
+                    .setTitle("No Sessions")
+                    .setDescription("All sessions have been deleted.")
+                    .setColor(0x7f8c8d)
+                ],
+                components: [
+                  new ActionRowBuilder<ButtonBuilder>().addComponents(
+                    new ButtonBuilder()
+                      .setCustomId("sessions:close")
+                      .setLabel("Close")
+                      .setStyle(ButtonStyle.Secondary)
+                  )
+                ],
+              });
+            } else {
+              currentIndex = 0;
+              await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+            }
+          } catch (err: any) {
+            await btnInteraction.followUp({
+              content: `❌ Failed to delete session: ${err.message}`,
+              flags: MessageFlags.Ephemeral,
+            });
+          }
+        }
+      } else if (customId === "sessions:repair") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session) {
+          const confirmEmbed = new EmbedBuilder()
+            .setTitle("⚠️ Repair Session?")
+            .setDescription(`This will attempt to repair session \`${session.sessionId}\` by rolling back to the last clean user state. Proceed?`)
+            .setColor(0xe74c3c);
+
+          const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId("sessions:repair_confirm")
+              .setLabel("Yes, Repair")
+              .setStyle(ButtonStyle.Danger),
+            new ButtonBuilder()
+              .setCustomId("sessions:repair_cancel")
+              .setLabel("No, Cancel")
+              .setStyle(ButtonStyle.Secondary)
+          );
+
+          await btnInteraction.editReply({
+            embeds: [confirmEmbed],
+            components: [row],
+          });
+        }
+      } else if (customId === "sessions:repair_cancel") {
+        await btnInteraction.deferUpdate();
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+      } else if (customId === "sessions:repair_confirm") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session && typeof manager.repairSession === "function") {
+          try {
+            await manager.repairSession(cwd, session.sessionId);
+            if (record.acpSessionId === session.sessionId) {
+              await this.router.invalidate(record.id);
+            }
+            sessions = await manager.listSessions(cwd);
+            const opts = makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager);
+            const embed = opts.embeds?.[0];
+            if (embed) {
+              embed.setDescription(
+                `✨ **Session repaired successfully!**\n\n` +
+                (embed.data.description ?? "")
+              );
+            }
+            await btnInteraction.editReply(opts);
+          } catch (err: any) {
+            await btnInteraction.followUp({
+              content: `❌ Failed to repair session: ${err.message}`,
+              flags: MessageFlags.Ephemeral,
+            });
+          }
+        }
+      } else if (customId === "sessions:summary") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session) {
+          await btnInteraction.editReply({
+            embeds: [
+              new EmbedBuilder()
+                .setTitle("🪄 Generating AI Summary...")
+                .setDescription(`Analyzing transcript logs for session \`${session.sessionId}\`...`)
+                .setColor(0xe67e22)
+            ],
+            components: [],
+          });
+
+          void (async () => {
+            let tempRuntime: AgentRuntime | undefined;
+            try {
+              const transcript = await manager.getTranscript(cwd, session.sessionId);
+              if (!transcript.trim()) {
+                throw new Error("The session transcript is empty.");
+              }
+
+              let sanitizedTranscript = transcript
+                .split("\n")
+                .map((line) => {
+                  if (line.length > 1000) {
+                    return line.substring(0, 1000) + " ... [Line truncated]";
+                  }
+                  return line;
+                })
+                .join("\n");
+
+              let maxTranscriptLength = 50000;
+              if (record.agentId === "agy") {
+                maxTranscriptLength = 8000;
+              }
+              if (sanitizedTranscript.length > maxTranscriptLength) {
+                const keepHead = Math.floor(maxTranscriptLength * 0.3);
+                const keepTail = Math.floor(maxTranscriptLength * 0.6);
+                sanitizedTranscript =
+                  sanitizedTranscript.substring(0, keepHead) +
+                  "\n\n... [Transcript truncated due to length limits] ...\n\n" +
+                  sanitizedTranscript.substring(sanitizedTranscript.length - keepTail);
+              }
+
+              let summaryModel = "";
+              if (record.agentId === "copilot" || record.agentId.startsWith("copilot-")) {
+                summaryModel = "gpt-5-mini";
+              } else if (record.agentId === "remote") {
+                summaryModel = "gpt-5-mini";
+              } else if (record.agentId === "claude" || record.agentId.startsWith("claude-")) {
+                summaryModel = "haiku";
+              } else if (record.agentId === "agy") {
+                summaryModel = "gemini-3-flash";
+              } else {
+                throw new Error(`AI Summary is not supported for agent profile \`${record.agentId}\``);
+              }
+
+              tempRuntime = new AgentRuntime({
+                profile,
+                logger: this.logger.child({ session: `temp-summary-${session.sessionId}` }),
+                mcpServers: [],
+              });
+
+              await tempRuntime.start();
+
+              await tempRuntime.newSession({
+                cwd,
+                model: summaryModel,
+                meta: { reasoningEffort: "low" },
+              });
+
+              let summaryText = "";
+              tempRuntime.onEvent((event) => {
+                if (event.kind === "agent-text") {
+                  summaryText += event.text;
+                }
+              });
+
+              const summaryPrompt =
+                `Please summarize the following conversation session. Highlight:\n` +
+                `1. The primary goal of the session.\n` +
+                `2. What key changes, debugging steps, or features were implemented.\n` +
+                `3. The current status or remaining tasks.\n\n` +
+                `Conversation Transcript:\n` +
+                `${sanitizedTranscript}`;
+
+              const outcome = await tempRuntime.prompt(summaryPrompt);
+
+              if (!summaryText.trim()) {
+                throw new Error("Agent completed but returned an empty summary.");
+              }
+
+              const displaySummary = summaryText.length > 4000 ? summaryText.substring(0, 3997) + "..." : summaryText;
+
+              const summaryEmbed = new EmbedBuilder()
+                .setTitle(`🪄 AI Summary — ${profile.displayName}`)
+                .setDescription(
+                  `**Session ID:** \`${session.sessionId}\`\n\n` +
+                  `${displaySummary}`
+                )
+                .setColor(0x9b59b6);
+
+              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                  .setCustomId("sessions:summary_back")
+                  .setLabel("⬅ Back to Manage")
+                  .setStyle(ButtonStyle.Secondary)
+              );
+
+              await btnInteraction.editReply({
+                embeds: [summaryEmbed],
+                components: [row],
+              });
+            } catch (err: any) {
+              this.logger.error({ err, sessionId: session.sessionId }, "failed to generate AI summary");
+
+              const errorEmbed = new EmbedBuilder()
+                .setTitle("❌ AI Summary Failed")
+                .setDescription(`An error occurred while generating the summary:\n\`\`\`\n${err.message}\n\`\`\``)
+                .setColor(0xe74c3c);
+
+              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                  .setCustomId("sessions:summary_back")
+                  .setLabel("⬅ Back to Manage")
+                  .setStyle(ButtonStyle.Secondary)
+              );
+
+              await btnInteraction.editReply({
+                embeds: [errorEmbed],
+                components: [row],
+              });
+            } finally {
+              if (tempRuntime) {
+                await tempRuntime.dispose().catch(() => {});
+              }
+            }
+          })();
+        }
+      } else if (customId === "sessions:compact") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session) {
+          await btnInteraction.editReply({
+            embeds: [
+              new EmbedBuilder()
+                .setTitle("🗳️ Compacting Session...")
+                .setDescription(`Generating premium AI compaction summary for session \`${session.sessionId}\`...`)
+                .setColor(0xe67e22)
+            ],
+            components: [],
+          });
+
+          void (async () => {
+            let tempRuntime: AgentRuntime | undefined;
+            try {
+              const transcript = await manager.getTranscript(cwd, session.sessionId);
+              if (!transcript.trim()) {
+                throw new Error("The session transcript is empty.");
+              }
+
+              let sanitizedTranscript = transcript
+                .split("\n")
+                .map((line) => {
+                  if (line.length > 1000) {
+                    return line.substring(0, 1000) + " ... [Line truncated]";
+                  }
+                  return line;
+                })
+                .join("\n");
+
+              let maxTranscriptLength = 50000;
+              if (record.agentId === "agy") {
+                maxTranscriptLength = 8000;
+              }
+              if (sanitizedTranscript.length > maxTranscriptLength) {
+                const keepHead = Math.floor(maxTranscriptLength * 0.3);
+                const keepTail = Math.floor(maxTranscriptLength * 0.6);
+                sanitizedTranscript =
+                  sanitizedTranscript.substring(0, keepHead) +
+                  "\n\n... [Transcript truncated due to length limits] ...\n\n" +
+                  sanitizedTranscript.substring(sanitizedTranscript.length - keepTail);
+              }
+
+              let compactionModel = "";
+              if (record.agentId === "agy") {
+                compactionModel = "gemini-pro-agent";
+              } else if (record.agentId === "claude" || record.agentId.startsWith("claude-")) {
+                compactionModel = "sonnet";
+              } else if (record.agentId === "copilot" || record.agentId.startsWith("copilot-") || record.agentId === "remote") {
+                compactionModel = "claude-sonnet-4.6";
+              } else {
+                throw new Error(`Manual compaction is not supported for agent profile \`${record.agentId}\``);
+              }
+
+              const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+              const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
+
+              tempRuntime = new AgentRuntime({
+                profile,
+                logger: this.logger.child({ session: `temp-compact-${session.sessionId}` }),
+                mcpServers: [],
+              });
+
+              await tempRuntime.start();
+
+              await tempRuntime.newSession({
+                cwd,
+                model: compactionModel,
+                meta: { reasoningEffort: "low" },
+              });
+
+              let summaryText = "";
+              tempRuntime.onEvent((event) => {
+                if (event.kind === "agent-text") {
+                  summaryText += event.text;
+                }
+              });
+
+              const outcome = await tempRuntime.prompt(compactionPrompt);
+
+              if (!summaryText.trim()) {
+                throw new Error("Agent completed but returned an empty summary.");
+              }
+
+              await manager.compactSession!(cwd, session.sessionId, summaryText);
+
+              // Reload sessions to reflect updated token count and preview
+              sessions = await manager.listSessions(cwd);
+              const newIndex = sessions.findIndex(s => s.sessionId === session.sessionId);
+              if (newIndex !== -1) {
+                currentIndex = newIndex;
+              }
+
+              const successEmbed = new EmbedBuilder()
+                .setTitle("🗳️ Session Compacted Successfully!")
+                .setDescription(`Session \`${session.sessionId}\` has been manually compacted. The old history has been replaced with the premium summary.`)
+                .setColor(0x2ecc71);
+
+              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                  .setCustomId("sessions:summary_back")
+                  .setLabel("⬅ Back to Manage")
+                  .setStyle(ButtonStyle.Secondary)
+              );
+
+              await btnInteraction.editReply({
+                embeds: [successEmbed],
+                components: [row],
+              });
+            } catch (err: any) {
+              this.logger.error({ err, sessionId: session.sessionId }, "failed to compact session");
+
+              const errorEmbed = new EmbedBuilder()
+                .setTitle("❌ Compaction Failed")
+                .setDescription(`An error occurred during compaction:\n\`\`\`\n${err.message}\n\`\`\``)
+                .setColor(0xe74c3c);
+
+              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                  .setCustomId("sessions:summary_back")
+                  .setLabel("⬅ Back to Manage")
+                  .setStyle(ButtonStyle.Secondary)
+              );
+
+              await btnInteraction.editReply({
+                embeds: [errorEmbed],
+                components: [row],
+              });
+            } finally {
+              if (tempRuntime) {
+                await tempRuntime.dispose().catch(() => {});
+              }
+            }
+          })();
+        }
+      } else if (customId === "sessions:migrate") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session) {
+          const targetProfiles = this.router.listProfiles().filter(p =>
+            p.id !== record.agentId &&
+            p.sessionManager &&
+            typeof p.sessionManager.compactSession === "function"
+          );
+
+          const embed = new EmbedBuilder()
+            .setTitle(`Migrate Session — ${profile.displayName}`)
+            .setDescription(
+              `Migrate session \`${session.sessionId}\` to a different agent.\n\n` +
+              `This will generate a premium AI compaction summary of the current session and initialize a brand-new session under the selected target agent.`
+            )
+            .setColor(0xf1c40f);
+
+          const select = new StringSelectMenuBuilder()
+            .setCustomId("sessions:migrate_target")
+            .setPlaceholder("Select target agent...")
+            .addOptions(
+              targetProfiles.map(p => ({
+                label: p.displayName,
+                value: p.id,
+                description: `Migrate to ${p.displayName} agent`
+              }))
+            );
+
+          const cancelRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId("sessions:migrate_cancel")
+              .setLabel("⬅ Cancel")
+              .setStyle(ButtonStyle.Secondary)
+          );
+
+          await btnInteraction.editReply({
+            embeds: [embed],
+            components: [
+              new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select),
+              cancelRow
+            ],
+          });
+        }
+      } else if (customId === "sessions:migrate_cancel") {
+        await btnInteraction.deferUpdate();
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+      } else if (btnInteraction.isStringSelectMenu() && customId === "sessions:migrate_target") {
+        await btnInteraction.deferUpdate();
+        const targetAgentId = btnInteraction.values[0];
+        const session = sessions[currentIndex];
+        if (session && targetAgentId) {
+          const targetProfile = this.router.getProfile(targetAgentId);
+          const targetManager = targetProfile?.sessionManager;
+          if (!targetProfile || !targetManager || typeof targetManager.compactSession !== "function") {
+            await btnInteraction.followUp({
+              content: `❌ Target agent \`${targetAgentId}\` is not compatible or does not support session management.`,
+              flags: MessageFlags.Ephemeral,
+            });
+            return;
+          }
+
+          await btnInteraction.editReply({
+            embeds: [
+              new EmbedBuilder()
+                .setTitle("🗳️ Migrating Session...")
+                .setDescription(`Generating premium AI compaction summary and initializing new session under agent \`${targetProfile.displayName}\`...`)
+                .setColor(0xe67e22)
+            ],
+            components: [],
+          });
+
+          void (async () => {
+            let tempRuntime: AgentRuntime | undefined;
+            try {
+              const transcript = await manager.getTranscript(cwd, session.sessionId);
+              if (!transcript.trim()) {
+                throw new Error("The session transcript is empty.");
+              }
+
+              let sanitizedTranscript = transcript
+                .split("\n")
+                .map((line) => {
+                  if (line.length > 1000) {
+                    return line.substring(0, 1000) + " ... [Line truncated]";
+                  }
+                  return line;
+                })
+                .join("\n");
+
+              let maxTranscriptLength = 50000;
+              if (record.agentId === "agy") {
+                maxTranscriptLength = 8000;
+              }
+              if (sanitizedTranscript.length > maxTranscriptLength) {
+                const keepHead = Math.floor(maxTranscriptLength * 0.3);
+                const keepTail = Math.floor(maxTranscriptLength * 0.6);
+                sanitizedTranscript =
+                  sanitizedTranscript.substring(0, keepHead) +
+                  "\n\n... [Transcript truncated due to length limits] ...\n\n" +
+                  sanitizedTranscript.substring(sanitizedTranscript.length - keepTail);
+              }
+
+              let compactionModel = "";
+              if (record.agentId === "agy") {
+                compactionModel = "gemini-pro-agent";
+              } else if (record.agentId === "claude" || record.agentId.startsWith("claude-")) {
+                compactionModel = "sonnet";
+              } else if (record.agentId === "copilot" || record.agentId.startsWith("copilot-") || record.agentId === "remote") {
+                compactionModel = "claude-sonnet-4.6";
+              } else {
+                throw new Error(`Migration compaction is not supported for source agent profile \`${record.agentId}\``);
+              }
+
+              const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+              const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
+
+              tempRuntime = new AgentRuntime({
+                profile,
+                logger: this.logger.child({ session: `temp-migrate-${session.sessionId}` }),
+                mcpServers: [],
+              });
+
+              await tempRuntime.start();
+
+              await tempRuntime.newSession({
+                cwd,
+                model: compactionModel,
+                meta: { reasoningEffort: "low" },
+              });
+
+              let summaryText = "";
+              tempRuntime.onEvent((event) => {
+                if (event.kind === "agent-text") {
+                  summaryText += event.text;
+                }
+              });
+
+              const outcome = await tempRuntime.prompt(compactionPrompt);
+
+              if (!summaryText.trim()) {
+                throw new Error("Agent completed but returned an empty summary.");
+              }
+
+              const newSessionId = randomUUID();
+              await targetManager.compactSession!(cwd, newSessionId, summaryText);
+
+              // Update active session record
+              await this.router.invalidate(record.id);
+              this.store.upsert({
+                ...record,
+                agentId: targetAgentId,
+                acpSessionId: newSessionId,
+                updatedUtc: new Date().toISOString(),
+              });
+
+              const fresh = this.store.get(record.id);
+              if (fresh) {
+                record.agentId = fresh.agentId;
+                record.acpSessionId = fresh.acpSessionId;
+              }
+
+              const channel = {
+                platform: record.platform,
+                id: record.channelRef,
+                parentId: record.parentRef || undefined,
+              };
+              await this.updateThreadAbbreviation(channel, record.agentId, targetAgentId);
+
+              const successEmbed = new EmbedBuilder()
+                .setTitle("🎉 Session Migrated Successfully!")
+                .setDescription(
+                  `Successfully migrated to agent **${targetProfile.displayName}**.\n\n` +
+                  `**New Session ID:** \`${newSessionId}\`\n\n` +
+                  `🟢 **This new session is now active and attached to this channel.** Any future messages will run in this session.`
+                )
+                .setColor(0x2ecc71);
+
+              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                  .setCustomId("sessions:close")
+                  .setLabel("Close")
+                  .setStyle(ButtonStyle.Secondary)
+              );
+
+              await btnInteraction.editReply({
+                embeds: [successEmbed],
+                components: [row],
+              });
+
+              collector.stop();
+            } catch (err: any) {
+              this.logger.error({ err, sessionId: session.sessionId }, "failed to migrate session");
+
+              const errorEmbed = new EmbedBuilder()
+                .setTitle("❌ Migration Failed")
+                .setDescription(`An error occurred during migration:\n\`\`\`\n${err.message}\n\`\`\``)
+                .setColor(0xe74c3c);
+
+              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                  .setCustomId("sessions:summary_back")
+                  .setLabel("⬅ Back to Manage")
+                  .setStyle(ButtonStyle.Secondary)
+              );
+
+              await btnInteraction.editReply({
+                embeds: [errorEmbed],
+                components: [row],
+              });
+            } finally {
+              if (tempRuntime) {
+                await tempRuntime.dispose().catch(() => {});
+              }
+            }
+          })();
+        }
+      } else if (customId === "sessions:summary_back") {
+        await btnInteraction.deferUpdate();
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+      }
+    });
+
+    collector.on("end", async (collected, reason) => {
+      if (reason === "user_closed") {
+        return;
+      }
+      try {
+        const fresh = this.store.get(record.id);
+        const activeId = fresh ? fresh.acpSessionId : record.acpSessionId;
+        const currentSession = sessions[currentIndex];
+        if (currentSession) {
+          const embed = new EmbedBuilder()
+            .setTitle(`Browse Sessions — ${profile.displayName} (Closed)`)
+            .setDescription(
+              `**Session ID:** \`${currentSession.sessionId}\`\n` +
+              `**Created:** ${currentSession.createdAt ? `<t:${Math.floor(currentSession.createdAt / 1000)}:f>` : "Unknown"}\n` +
+              `**Last Activity:** ${currentSession.lastActivityAt ? `<t:${Math.floor(currentSession.lastActivityAt / 1000)}:R>` : "Unknown"}\n` +
+              `**Status:** ${activeId === currentSession.sessionId ? "🟢 **Active Session in this channel**" : "⚪ Inactive"}\n\n` +
+              `**Preview (Heuristic):**\n` +
+              (currentSession.previewLines.length > 0
+                ? currentSession.previewLines.map(formatLine).filter(Boolean).join("\n") || "*No meaningful messages in this session.*"
+                : "*No messages in this session yet.*")
+            )
+            .setColor(activeId === currentSession.sessionId ? 0x2ecc71 : 0x7f8c8d)
+            .setFooter({ text: `Session ${currentIndex + 1} of ${sessions.length} (Menu Timed Out)` });
+
+          await i.editReply({
+            embeds: [embed],
+            components: [],
+          });
+        }
+      } catch {
+        // ignore errors on end
+      }
+    });
   }
 
   private async cmdTools(i: ChatInputCommandInteraction): Promise<void> {
@@ -1885,6 +2901,8 @@ export class Orchestrator {
       const freshRecord = this.store.get(record.id) ?? record;
       await this.runSetupWizard(channel, freshRecord);
     } else {
+      const freshRecord = this.store.get(record.id) ?? record;
+      await this.renameThreadForSetup(channel, freshRecord);
       await this.adapter.sendMessage(
         channel,
         `📌 Repo set to \`${this.repoDisplay(picked)}\`. Send a message to begin.`
@@ -1979,6 +2997,8 @@ export class Orchestrator {
           const rt = await this.router.getOrStartRuntime(currentRecord);
           models = rt.getSessionInfo()?.availableModels ?? [];
         }
+        
+        this.logger.info({ agentId: currentRecord.agentId, modelsLength: models.length }, "Setup wizard checking models for picker");
 
         if (models.length > 1) {
           const cfg = this.store.readConfig(currentRecord);
@@ -2046,16 +3066,71 @@ export class Orchestrator {
     if (!abbr) return;
     // Only rename if the thread still has the default "seam" name; skip if
     // the user already gave it a custom name when running /seam new.
+    let current: string | undefined;
     if (this.adapter.getThreadName) {
-      const current = await this.adapter.getThreadName(channel);
+      current = await this.adapter.getThreadName(channel);
       if (current !== undefined && current !== "seam") return;
     }
-    const repoName = path.basename(repoPath);
-    const newName = `${repoName} [${abbr}]`;
+    const repoDisplayStr = this.repoDisplay(repoPath);
+    const newName = `${repoDisplayStr} [${abbr}]`;
+    this.logger.info({ channelId: channel.id, oldName: current, newName }, "Renaming thread");
     try {
       await this.adapter.renameThread(channel, newName);
     } catch (err) {
       this.logger.warn({ err }, "wizard: renameThread failed");
+    }
+  }
+
+  /**
+   * Update the thread name abbreviation when migrating or switching agents.
+   * Replaces any known agent abbreviations in brackets (e.g. [agy]) with the new target agent's abbreviation.
+   */
+  private async updateThreadAbbreviation(
+    channel: ChannelRef,
+    oldAgentId: string,
+    newAgentId: string
+  ): Promise<void> {
+    if (!this.adapter.getThreadName || !this.adapter.renameThread || !channel.parentId) {
+      return;
+    }
+    try {
+      const currentName = await this.adapter.getThreadName(channel);
+      if (!currentName) return;
+
+      const targetProfile = this.router.getProfile(newAgentId);
+      const targetAbbr = targetProfile?.threadAbbr;
+      if (!targetAbbr) return;
+
+      const allAbbrs = this.router.listProfiles()
+        .map((p) => p.threadAbbr)
+        .filter((abbr): abbr is string => typeof abbr === "string" && abbr.length > 0)
+        .filter((abbr) => abbr.toLowerCase() !== targetAbbr.toLowerCase());
+
+      let newName = currentName;
+      let replaced = false;
+
+      for (const abbr of allAbbrs) {
+        const needle = `[${abbr}]`.toLowerCase();
+        let idx = newName.toLowerCase().indexOf(needle);
+        while (idx !== -1) {
+          newName = newName.substring(0, idx) + `[${targetAbbr}]` + newName.substring(idx + needle.length);
+          replaced = true;
+          idx = newName.toLowerCase().indexOf(needle);
+        }
+      }
+
+      if (replaced && newName !== currentName) {
+        await this.adapter.renameThread(channel, newName);
+        this.logger.info(
+          { channelId: channel.id, oldName: currentName, newName },
+          "Updated thread name abbreviation on agent transition"
+        );
+      }
+    } catch (err) {
+      this.logger.warn(
+        { err, channelId: channel.id },
+        "Failed to update thread name abbreviation"
+      );
     }
   }
 
@@ -2105,11 +3180,23 @@ export class Orchestrator {
     if (!repoPath) return "(unset)";
     const root = path.resolve(this.config.REPOS_ROOT);
     const abs = path.resolve(repoPath);
-    if (abs === root) return "/";
-    if (abs.startsWith(root + path.sep)) {
-      return abs.slice(root.length + 1);
+    
+    let displayName = abs;
+    if (abs === root) {
+      displayName = "/";
+    } else if (abs.startsWith(root + path.sep)) {
+      displayName = abs.slice(root.length + 1);
     }
-    return abs;
+
+    if (displayName !== "/" && displayName !== "(unset)" && displayName !== abs) {
+      const rootFolder = displayName.split(path.sep)[0] ?? "";
+      const emoji = this.config.REPO_EMOJIS.get(rootFolder) || this.config.REPO_EMOJIS.get(displayName);
+      if (emoji) {
+        return `${emoji} ${displayName}`;
+      }
+    }
+
+    return displayName;
   }
 }
 

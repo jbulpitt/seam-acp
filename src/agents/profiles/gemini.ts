@@ -63,6 +63,7 @@ export function makeGeminiProfile(opts: {
       return spawn(cli, args, {
         stdio: ["pipe", "pipe", "pipe"],
         env,
+        detached: true,
       });
     },
     async whoami() {

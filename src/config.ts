@@ -1,4 +1,5 @@
-import "dotenv/config";
+import * as dotenv from "dotenv";
+dotenv.config({ override: true });
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
@@ -68,6 +69,25 @@ const Schema = z.object({
         .filter(Boolean)
         .map((p) => path.resolve(p))
     ),
+
+  /**
+   * Comma-separated list of repo names mapped to an emoji for display, e.g. "seam-acp:🧵,core:📦"
+   */
+  REPO_EMOJIS: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const map = new Map<string, string>();
+      for (const entry of v.split(",").map((s) => s.trim()).filter(Boolean)) {
+        const idx = entry.indexOf(":");
+        if (idx <= 0) continue;
+        const repo = entry.slice(0, idx).trim();
+        const emoji = entry.slice(idx + 1).trim();
+        map.set(repo, emoji);
+      }
+      return map;
+    }),
+
 
   DEFAULT_AGENT: z.string().default("copilot"),
   DEFAULT_MODEL: z.string().default("gpt-5.4"),
@@ -154,6 +174,11 @@ const Schema = z.object({
    * Surfaced to the adapter via the `MAX_THINKING_TOKENS` env var it reads.
    */
   CLAUDE_MAX_THINKING_TOKENS: z.coerce.number().int().min(0).max(64000).default(8000),
+  /**
+   * Context token threshold to trigger compaction. Set to 0 to disable.
+   * If <= 1.0, treated as a fraction of the model's context window.
+   */
+  CLAUDE_COMPACTION_TOKEN_THRESHOLD: z.coerce.number().min(0).default(0.8),
   /**
    * Same shape as COPILOT_PROFILES — register additional Claude profiles
    * each pinned to its own --config-dir (auth / settings). Format:

@@ -43,8 +43,60 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import { spawn, execSync } from "node:child_process";
+import { spawn, execSync, execFileSync } from "node:child_process";
 import { homedir } from "node:os";
+import fsp from "node:fs/promises";
+import path from "node:path";
+
+const copilotDir = path.join(homedir(), ".copilot");
+const dbPath = path.join(copilotDir, "session-store.db");
+const sessionStateDir = path.join(copilotDir, "session-state");
+
+function escapeSql(val) {
+  if (val === null || val === undefined) return "NULL";
+  if (typeof val === "number") return String(val);
+  return "'" + String(val).replace(/'/g, "''") + "'";
+}
+
+function parseSqliteLineFormat(stdout) {
+  const lines = stdout.split("\n");
+  const results = [];
+  let currentRow = null;
+  for (const line of lines) {
+    if (!line.trim()) {
+      if (currentRow) {
+        results.push(currentRow);
+        currentRow = null;
+      }
+      continue;
+    }
+    const match = line.match(/^\s*([^=\s]+)\s*=\s*(.*)$/);
+    if (match) {
+      if (!currentRow) currentRow = {};
+      currentRow[match[1]] = match[2];
+    }
+  }
+  if (currentRow) {
+    results.push(currentRow);
+  }
+  return results;
+}
+
+function execSql(dbPath, sql) {
+  try {
+    const stdout = execFileSync("sqlite3", ["-json", dbPath, sql], { encoding: "utf8" });
+    return stdout.trim() ? JSON.parse(stdout) : [];
+  } catch (err) {
+    try {
+      const stdout = execFileSync("sqlite3", ["-line", dbPath, sql], { encoding: "utf8" });
+      return parseSqliteLineFormat(stdout);
+    } catch (fallbackErr) {
+      console.error("[bridge] SQL execution error:", err.message, fallbackErr.message);
+      throw err;
+    }
+  }
+}
+
 
 /** Milliseconds to wait before reconnecting after a disconnect (client mode). */
 const RECONNECT_DELAY_MS = 5_000;
@@ -149,6 +201,184 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
     return agent;
   }
 
+  function wsSend(payload) {
+    if (currentWs && currentWs.readyState === WebSocket.OPEN) {
+      currentWs.send(JSON.stringify(payload));
+    }
+  }
+
+  async function handleCmd(msg) {
+    const { cmdId, action, payload } = msg;
+    try {
+      let result;
+      if (action === "listSessions") {
+        try {
+          await fsp.access(dbPath);
+        } catch {
+          wsSend({ type: "cmd_reply", cmdId, payload: [] });
+          return;
+        }
+        const sessions = execSql(
+          dbPath,
+          `SELECT * FROM sessions WHERE cwd = ${escapeSql(payload.cwd)} ORDER BY updated_at DESC`
+        );
+        const summaries = [];
+        for (const sess of sessions) {
+          const sessionId = sess.id;
+          const createdAt = sess.created_at ? Date.parse(sess.created_at) : Date.now();
+          const lastActivityAt = sess.updated_at ? Date.parse(sess.updated_at) : Date.now();
+          const turns = execSql(
+            dbPath,
+            `SELECT * FROM turns WHERE session_id = ${escapeSql(sessionId)} ORDER BY turn_index ASC`
+          );
+          const allMessages = [];
+          for (const turn of turns) {
+            if (turn.user_message) {
+              allMessages.push({ sender: "human", text: turn.user_message });
+            }
+            if (turn.assistant_response) {
+              allMessages.push({ sender: "agent", text: turn.assistant_response });
+            }
+          }
+          let previewLines = [];
+          if (allMessages.length <= 16) {
+            previewLines = allMessages;
+          } else {
+            const firstSix = allMessages.slice(0, 6);
+            const lastTen = allMessages.slice(-10);
+            previewLines = [...firstSix, ...lastTen];
+          }
+          const transcriptLines = [];
+          for (const turn of turns) {
+            if (turn.user_message?.trim()) {
+              transcriptLines.push(`### User\n${turn.user_message.trim()}`);
+            }
+            if (turn.assistant_response?.trim()) {
+              transcriptLines.push(`### Assistant\n${turn.assistant_response.trim()}`);
+            }
+          }
+          const estimatedTokens = Math.ceil(transcriptLines.join("\n\n").length / 4);
+
+          summaries.push({
+            sessionId,
+            createdAt,
+            lastActivityAt,
+            previewLines,
+            estimatedTokens,
+          });
+        }
+        result = summaries;
+      } else if (action === "cloneSession") {
+        const sessions = execSql(
+          dbPath,
+          `SELECT * FROM sessions WHERE id = ${escapeSql(payload.oldSessionId)}`
+        );
+        const sessionRow = sessions[0];
+        if (sessionRow) {
+          const nowIso = new Date().toISOString();
+          execSql(
+            dbPath,
+            `INSERT INTO sessions (id, cwd, repository, host_type, branch, summary, created_at, updated_at)
+             VALUES (
+               ${escapeSql(payload.newSessionId)},
+               ${escapeSql(payload.cwd)},
+               ${escapeSql(sessionRow.repository)},
+               ${escapeSql(sessionRow.host_type)},
+               ${escapeSql(sessionRow.branch)},
+               ${escapeSql(sessionRow.summary)},
+               ${escapeSql(nowIso)},
+               ${escapeSql(nowIso)}
+             )`
+          );
+        }
+        const turns = execSql(
+          dbPath,
+          `SELECT * FROM turns WHERE session_id = ${escapeSql(payload.oldSessionId)} ORDER BY turn_index ASC`
+        );
+        for (const turn of turns) {
+          execSql(
+            dbPath,
+            `INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp)
+             VALUES (
+               ${escapeSql(payload.newSessionId)},
+               ${escapeSql(turn.turn_index)},
+               ${escapeSql(turn.user_message)},
+               ${escapeSql(turn.assistant_response)},
+               ${escapeSql(turn.timestamp)}
+             )`
+          );
+        }
+        const oldSubDir = path.join(sessionStateDir, payload.oldSessionId);
+        const newSubDir = path.join(sessionStateDir, payload.newSessionId);
+        try {
+          const stat = await fsp.stat(oldSubDir);
+          if (stat.isDirectory()) {
+            await fsp.mkdir(newSubDir, { recursive: true });
+            await fsp.cp(oldSubDir, newSubDir, { recursive: true });
+          }
+        } catch {
+          // ignore
+        }
+        result = null;
+      } else if (action === "deleteSession") {
+        execSql(dbPath, `DELETE FROM sessions WHERE id = ${escapeSql(payload.sessionId)}`);
+        execSql(dbPath, `DELETE FROM turns WHERE session_id = ${escapeSql(payload.sessionId)}`);
+        try {
+          execSql(dbPath, `DELETE FROM search_index_content WHERE c1 = ${escapeSql(payload.sessionId)}`);
+        } catch {
+          // ignore
+        }
+        const subDir = path.join(sessionStateDir, payload.sessionId);
+        try {
+          await fsp.rm(subDir, { recursive: true, force: true });
+        } catch {
+          // ignore
+        }
+        result = null;
+      } else if (action === "getTranscript") {
+        const turns = execSql(
+          dbPath,
+          `SELECT * FROM turns WHERE session_id = ${escapeSql(payload.sessionId)} ORDER BY turn_index ASC`
+        );
+        const transcriptLines = [];
+        for (const turn of turns) {
+          if (turn.user_message?.trim()) {
+            transcriptLines.push(`### User\n${turn.user_message.trim()}`);
+          }
+          if (turn.assistant_response?.trim()) {
+            transcriptLines.push(`### Assistant\n${turn.assistant_response.trim()}`);
+          }
+        }
+        result = transcriptLines.join("\n\n");
+      } else if (action === "compactSession") {
+        execSql(dbPath, `DELETE FROM turns WHERE session_id = ${escapeSql(payload.sessionId)}`);
+        const nowIso = new Date().toISOString();
+        execSql(
+          dbPath,
+          `INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp)
+           VALUES (
+             ${escapeSql(payload.sessionId)},
+             0,
+             ${escapeSql("[Session history compacted due to context limits]")},
+             ${escapeSql(payload.summary)},
+             ${escapeSql(nowIso)}
+           )`
+        );
+        execSql(
+          dbPath,
+          `UPDATE sessions SET updated_at = ${escapeSql(nowIso)} WHERE id = ${escapeSql(payload.sessionId)}`
+        );
+        result = null;
+      } else {
+        throw new Error(`Unknown action: ${action}`);
+      }
+      wsSend({ type: "cmd_reply", cmdId, payload: result });
+    } catch (err) {
+      console.error(`[bridge] Error handling cmd ${action}:`, err);
+      wsSend({ type: "cmd_reply", cmdId, error: err.message });
+    }
+  }
+
   function handleMessage(raw) {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -165,6 +395,8 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
         agent.kill();
         slots.delete(msg.slot);
       }
+    } else if (msg.type === "cmd") {
+      handleCmd(msg);
     }
   }
 

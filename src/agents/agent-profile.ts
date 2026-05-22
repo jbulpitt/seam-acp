@@ -1,5 +1,6 @@
 import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable as NodeReadable, Writable as NodeWritable } from "node:stream";
+import type { ISessionManager } from "./session-manager.js";
 
 /**
  * Describes how to spawn and configure an ACP-compatible coding agent.
@@ -42,7 +43,7 @@ export interface AgentProfile {
    * Optional `_meta` payload to attach to `session/new`. Lets a vendor
    * pass extra hints (e.g. effort) without polluting the generic API.
    */
-  newSessionMeta?(): Record<string, unknown> | undefined;
+  newSessionMeta?(modelId?: string): Record<string, unknown> | undefined;
 
   /**
    * Best-effort identity probe: which account is this profile authenticated
@@ -51,6 +52,7 @@ export interface AgentProfile {
    * doesn't support the concept).
    */
   whoami?(): Promise<AgentIdentity | null>;
+  sessionManager?: ISessionManager;
 }
 
 /** Identity of the account a profile is authenticated as. */

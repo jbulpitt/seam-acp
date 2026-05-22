@@ -234,7 +234,11 @@ export class SessionRouter {
 
     if (record.acpSessionId) {
       try {
-        await runtime.loadSession({ sessionId: record.acpSessionId, cwd });
+        await runtime.loadSession({
+          sessionId: record.acpSessionId,
+          cwd,
+          model: cfg.model ?? this.defaultModel,
+        });
         this.logger.debug(
           { sessionId: record.id, acpSessionId: record.acpSessionId },
           "resumed acp session"

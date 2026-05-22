@@ -26,6 +26,8 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
+import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 import { PassThrough, Readable, Writable } from "node:stream";
 import {
   AgentSideConnection,
@@ -71,6 +73,7 @@ const LEGACY_MAPPING_FILE = path.join(AGY_HOME, "seam_sessions.json");
 interface PersistedSession {
   cascadeId: string;
   maxStepIndex: number;
+  cwd?: string;
 }
 
 type SessionMapping = Record<string, PersistedSession | string>;
@@ -136,6 +139,7 @@ export function makeAgyProfile(opts: {
   dataDir?: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
   threadAbbr?: string;
+  printTimeoutSeconds?: number;
 } = {}): AgentProfile {
   const cli = opts.cliPath?.trim() || resolveAgyBinary();
   const defaultModel = opts.defaultModel ?? "antigravity";
@@ -152,8 +156,363 @@ export function makeAgyProfile(opts: {
     staticModels: opts.staticModels,
     threadAbbr: opts.threadAbbr,
     spawn() {
-      return makeFakeAgyProcess(cli, mappingFile);
+      return makeFakeAgyProcess(cli, mappingFile, opts.printTimeoutSeconds);
     },
+    sessionManager: {
+      async listSessions(cwd: string): Promise<SessionSummary[]> {
+        try {
+          const fileExists = await fs.access(mappingFile).then(() => true).catch(() => false);
+          if (!fileExists) return [];
+          const data = await fs.readFile(mappingFile, "utf8");
+          const mapping = JSON.parse(data) as SessionMapping;
+          const summaries: SessionSummary[] = [];
+
+          // Query seam.db as a fallback/source of truth for session directories
+          const seamDbSessions = new Set<string>();
+          try {
+            const dataDir = process.env.DATA_DIR ?? "./data";
+            const seamDbPath = path.resolve(dataDir, "seam.db");
+            const db = new Database(seamDbPath);
+            try {
+              const rows = db.prepare("SELECT acp_session_id FROM sessions WHERE repo_path = ? AND agent_id = ?").all(cwd, 'agy') as any[];
+              for (const row of rows) {
+                if (row.acp_session_id) {
+                  seamDbSessions.add(row.acp_session_id);
+                }
+              }
+            } finally {
+              db.close();
+            }
+          } catch {
+            // ignore database lookup errors
+          }
+
+          for (const sessionId of Object.keys(mapping)) {
+            const entry = mapping[sessionId];
+            let cascadeId: string | undefined;
+            let entryCwd: string | undefined;
+
+            if (typeof entry === "string") {
+              cascadeId = entry;
+            } else if (entry && typeof entry === "object") {
+              cascadeId = entry.cascadeId;
+              entryCwd = entry.cwd;
+            }
+
+            if (!cascadeId) continue;
+
+            // Check if it belongs to this cwd
+            const matchesCwd = entryCwd
+              ? (entryCwd === cwd)
+              : seamDbSessions.has(sessionId);
+
+            if (!matchesCwd) continue;
+
+            const transcriptFile = path.join(
+              AGY_HOME,
+              "brain",
+              cascadeId,
+              ".system_generated",
+              "logs",
+              "transcript.jsonl"
+            );
+
+            try {
+              const stat = await fs.stat(transcriptFile);
+              let createdAt = stat.birthtimeMs;
+              let lastActivityAt = stat.mtimeMs;
+
+              const content = await fs.readFile(transcriptFile, "utf8");
+              const lines = content.split("\n").filter(l => l.trim().length > 0);
+              const allMessages: Array<{ sender: "human" | "agent"; text: string; timestamp?: number }> = [];
+
+              for (const line of lines) {
+                try {
+                  const entryObj = JSON.parse(line);
+                  const ts = entryObj.created_at ? Date.parse(entryObj.created_at) : undefined;
+                  
+                  if (entryObj.type === "USER_INPUT") {
+                    let text = entryObj.content || "";
+                    const match = text.match(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/);
+                    if (match) {
+                      text = match[1].trim();
+                    }
+                    if (text.trim()) {
+                      allMessages.push({ sender: "human", text: text.trim(), timestamp: ts });
+                    }
+                  } else if (entryObj.type === "PLANNER_RESPONSE") {
+                    const text = entryObj.content || "";
+                    if (text.trim()) {
+                      allMessages.push({ sender: "agent", text: text.trim(), timestamp: ts });
+                    }
+                  }
+                } catch {
+                  // ignore
+                }
+              }
+
+              const validTimestamps = allMessages
+                .map(m => m.timestamp)
+                .filter((t): t is number => t !== undefined && !isNaN(t));
+              if (validTimestamps.length > 0) {
+                createdAt = validTimestamps[0]!;
+                lastActivityAt = validTimestamps[validTimestamps.length - 1]!;
+              }
+
+              let previewLines: SessionSummaryLine[] = [];
+              if (allMessages.length <= 16) {
+                previewLines = allMessages.map(m => ({ sender: m.sender, text: m.text }));
+              } else {
+                const firstSix = allMessages.slice(0, 6);
+                const lastTen = allMessages.slice(-10);
+                previewLines = [...firstSix, ...lastTen].map(m => ({ sender: m.sender, text: m.text }));
+              }
+
+              const transcriptLines: string[] = [];
+              for (const m of allMessages) {
+                if (m.text.trim()) {
+                  const prefix = m.sender === "human" ? "### User\n" : "### Assistant\n";
+                  transcriptLines.push(`${prefix}${m.text.trim()}`);
+                }
+              }
+              const estimatedTokens = Math.ceil(transcriptLines.join("\n\n").length / 4);
+
+              summaries.push({
+                sessionId,
+                createdAt,
+                lastActivityAt,
+                previewLines,
+                estimatedTokens,
+              });
+            } catch {
+              // ignore if transcript file doesn't exist/can't be parsed
+            }
+          }
+
+          return summaries.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
+        } catch {
+          return [];
+        }
+      },
+
+      async cloneSession(cwd: string, oldSessionId: string, newSessionId: string): Promise<void> {
+        const fileExists = await fs.access(mappingFile).then(() => true).catch(() => false);
+        if (!fileExists) throw new Error("No sessions found to clone");
+        const data = await fs.readFile(mappingFile, "utf8");
+        const mapping = JSON.parse(data) as SessionMapping;
+
+        const oldEntry = mapping[oldSessionId];
+        if (!oldEntry) throw new Error(`Old session ${oldSessionId} not found in mapping`);
+
+        let oldCascadeId: string;
+        let oldMaxStepIndex = -1;
+        if (typeof oldEntry === "string") {
+          oldCascadeId = oldEntry;
+        } else {
+          oldCascadeId = oldEntry.cascadeId;
+          oldMaxStepIndex = oldEntry.maxStepIndex;
+        }
+
+        const newCascadeId = randomUUID();
+
+        // 1. Copy pb file
+        const oldPb = path.join(AGY_HOME, "conversations", `${oldCascadeId}.pb`);
+        const newPb = path.join(AGY_HOME, "conversations", `${newCascadeId}.pb`);
+        try {
+          await fs.copyFile(oldPb, newPb);
+        } catch {
+          // ignore if pb file doesn't exist
+        }
+
+        // 2. Copy brain folder recursively
+        const oldBrain = path.join(AGY_HOME, "brain", oldCascadeId);
+        const newBrain = path.join(AGY_HOME, "brain", newCascadeId);
+        try {
+          await fs.mkdir(newBrain, { recursive: true });
+          await fs.cp(oldBrain, newBrain, { recursive: true });
+        } catch {
+          // ignore if brain folder doesn't exist
+        }
+
+        // 3. Update mapping
+        mapping[newSessionId] = {
+          cascadeId: newCascadeId,
+          maxStepIndex: oldMaxStepIndex,
+          cwd,
+        };
+        await fs.writeFile(mappingFile, JSON.stringify(mapping, null, 2) + "\n");
+      },
+
+      async deleteSession(cwd: string, sessionId: string): Promise<void> {
+        const fileExists = await fs.access(mappingFile).then(() => true).catch(() => false);
+        if (!fileExists) return;
+        const data = await fs.readFile(mappingFile, "utf8");
+        const mapping = JSON.parse(data) as SessionMapping;
+
+        const entry = mapping[sessionId];
+        if (!entry) return;
+
+        let cascadeId: string;
+        if (typeof entry === "string") {
+          cascadeId = entry;
+        } else {
+          cascadeId = entry.cascadeId;
+        }
+
+        // 1. Delete pb file
+        const pbFile = path.join(AGY_HOME, "conversations", `${cascadeId}.pb`);
+        try {
+          await fs.unlink(pbFile);
+        } catch {
+          // ignore
+        }
+
+        // 2. Delete brain folder
+        const brainFolder = path.join(AGY_HOME, "brain", cascadeId);
+        try {
+          await fs.rm(brainFolder, { recursive: true, force: true });
+        } catch {
+          // ignore
+        }
+
+        // 3. Delete from mapping
+        delete mapping[sessionId];
+        await fs.writeFile(mappingFile, JSON.stringify(mapping, null, 2) + "\n");
+      },
+
+      async getTranscript(cwd: string, sessionId: string): Promise<string> {
+        const fileExists = await fs.access(mappingFile).then(() => true).catch(() => false);
+        if (!fileExists) return "";
+        const data = await fs.readFile(mappingFile, "utf8");
+        const mapping = JSON.parse(data) as SessionMapping;
+
+        const entry = mapping[sessionId];
+        if (!entry) return "";
+
+        let cascadeId: string;
+        if (typeof entry === "string") {
+          cascadeId = entry;
+        } else {
+          cascadeId = entry.cascadeId;
+        }
+
+        const transcriptFile = path.join(
+          AGY_HOME,
+          "brain",
+          cascadeId,
+          ".system_generated",
+          "logs",
+          "transcript.jsonl"
+        );
+
+        const content = await fs.readFile(transcriptFile, "utf8");
+        const lines = content.split("\n").filter(l => l.trim().length > 0);
+        const transcriptLines: string[] = [];
+
+        for (const line of lines) {
+          try {
+            const entryObj = JSON.parse(line);
+            if (entryObj.type === "USER_INPUT") {
+              let text = entryObj.content || "";
+              const match = text.match(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/);
+              if (match) {
+                text = match[1].trim();
+              }
+              if (text.trim()) {
+                transcriptLines.push(`### User\n${text.trim()}`);
+              }
+            } else if (entryObj.type === "PLANNER_RESPONSE") {
+              const text = entryObj.content || "";
+              if (text.trim()) {
+                transcriptLines.push(`### Assistant\n${text.trim()}`);
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        return transcriptLines.join("\n\n");
+      },
+
+      async compactSession(cwd: string, sessionId: string, summaryText: string): Promise<void> {
+        const fileExists = await fs.access(mappingFile).then(() => true).catch(() => false);
+        if (!fileExists) throw new Error("No session mapping file found");
+        const data = await fs.readFile(mappingFile, "utf8");
+        const mapping = JSON.parse(data) as SessionMapping;
+
+        const oldEntry = mapping[sessionId];
+        let oldCascadeId: string | undefined;
+        let oldMaxStepIndex = -1;
+        if (oldEntry) {
+          if (typeof oldEntry === "string") {
+            oldCascadeId = oldEntry;
+          } else {
+            oldCascadeId = oldEntry.cascadeId;
+            oldMaxStepIndex = oldEntry.maxStepIndex;
+          }
+        }
+
+        const before = await listConversations();
+        const promptText = `[Session history compacted due to context limits]\n\n${summaryText}`;
+        const proc = spawn(cli, [
+          "-p",
+          promptText,
+          "--print-timeout",
+          "30s",
+          "--dangerously-skip-permissions",
+          "--add-dir",
+          cwd
+        ], {
+          cwd,
+          stdio: ["ignore", "ignore", "ignore"]
+        });
+
+        // Setup abort controller for waiting
+        const abort = new AbortController();
+        proc.once("exit", () => {
+          abort.abort();
+        });
+        proc.once("error", () => {
+          abort.abort();
+        });
+
+        let newCascadeId: string;
+        try {
+          newCascadeId = await waitForNewCascade(before, abort.signal);
+        } finally {
+          try {
+            proc.kill();
+          } catch {}
+        }
+
+        // Update mapping
+        mapping[sessionId] = {
+          cascadeId: newCascadeId,
+          maxStepIndex: oldMaxStepIndex,
+          cwd,
+        };
+        await fs.writeFile(mappingFile, JSON.stringify(mapping, null, 2) + "\n");
+
+        // Clean up old cascade if it exists
+        if (oldCascadeId) {
+          // 1. Delete old pb file
+          const oldPb = path.join(CONVERSATION_DIR, `${oldCascadeId}.pb`);
+          try {
+            await fs.unlink(oldPb);
+          } catch {
+            // ignore
+          }
+          // 2. Delete old brain folder
+          const oldBrain = path.join(AGY_HOME, "brain", oldCascadeId);
+          try {
+            await fs.rm(oldBrain, { recursive: true, force: true });
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
   };
 }
 
@@ -163,14 +522,14 @@ export function makeAgyProfile(opts: {
 
 type FakeProc = ChildProcessByStdio<Writable, Readable, Readable>;
 
-function makeFakeAgyProcess(cli: string, mappingFile: string): FakeProc {
+function makeFakeAgyProcess(cli: string, mappingFile: string, printTimeoutSeconds?: number): FakeProc {
   const fakeStdin = new PassThrough(); // client writes here; we read from it
   const fakeStdout = new PassThrough(); // we write here; client reads from it
   const fakeStderr = new PassThrough();
   const emitter = new EventEmitter();
   let killed = false;
 
-  const agent = new AgyAgent(cli, mappingFile);
+  const agent = new AgyAgent(cli, mappingFile, printTimeoutSeconds);
 
   const stream = ndJsonStream(
     Writable.toWeb(fakeStdout),
@@ -225,6 +584,7 @@ interface ActiveRun {
   proc: ChildProcess;
   abort: AbortController;
   sessionId: string;
+  userCancelled?: boolean;
 }
 
 class AgyAgent implements Agent {
@@ -235,6 +595,7 @@ class AgyAgent implements Agent {
   constructor(
     private readonly cli: string,
     private readonly mappingFile: string,
+    private readonly printTimeoutSeconds?: number,
   ) {}
 
   bind(conn: AgentSideConnection): void {
@@ -346,6 +707,7 @@ class AgyAgent implements Agent {
 
     // Cancel any prior run for this session before starting a new one.
     if (this.active?.sessionId === params.sessionId) {
+      this.active.userCancelled = true;
       try { this.active.proc.kill(); } catch {}
       this.active.abort.abort();
       this.active = undefined;
@@ -357,7 +719,7 @@ class AgyAgent implements Agent {
       "-p",
       promptText,
       "--print-timeout",
-      "600s",
+      `${this.printTimeoutSeconds ?? 600}s`,
       "--dangerously-skip-permissions",
       // agy ignores the process cwd for its "workspace" — that's controlled
       // separately via --add-dir. Without this, file tools default to $HOME
@@ -396,6 +758,7 @@ class AgyAgent implements Agent {
       }
       procExited = true;
       exitCode = code;
+      cancelAbort.abort();
       if (this.active === runRef) this.active = undefined;
     });
     proc.once("error", (e) => {
@@ -419,6 +782,7 @@ class AgyAgent implements Agent {
         await savePersistedSession(this.mappingFile, params.sessionId, {
           cascadeId: cid,
           maxStepIndex: sess.maxStepIndex,
+          cwd: sess.cwd,
         });
       }
 
@@ -433,31 +797,65 @@ class AgyAgent implements Agent {
       const skipUpTo = sess.maxStepIndex;
 
       try {
+        let hasBeenActive = false;
         for await (const update of subscribeToAgyStream({
           port: ls.port,
           conversationId: cid,
           signal: cancelAbort.signal,
         })) {
           if (cancelAbort.signal.aborted) break;
+
+          const isRunning = update.status === "CASCADE_RUN_STATUS_RUNNING";
           const sup = update.mainTrajectoryUpdate?.stepsUpdate;
-          if (!sup?.indices || !sup.steps) continue;
-          for (let i = 0; i < sup.indices.length; i++) {
-            const idx = sup.indices[i];
-            const step = sup.steps[i];
-            if (idx === undefined || step === undefined) continue;
-            if (idx <= skipUpTo) continue;
-            await this.emitStep(
-              params.sessionId,
-              idx,
-              step,
-              lastText,
-              lastThinking,
-              toolCallIds,
-              heldText,
-              heldThinking,
-              sess.cwd,
-            );
-            if (idx > sess.maxStepIndex) sess.maxStepIndex = idx;
+          let hasNewSteps = false;
+          if (sup?.indices && sup.steps) {
+            for (let i = 0; i < sup.indices.length; i++) {
+              const idx = sup.indices[i];
+              const step = sup.steps[i];
+              if (idx !== undefined && step !== undefined && idx > skipUpTo) {
+                if (
+                  step.type &&
+                  step.type !== "CORTEX_STEP_TYPE_USER_INPUT" &&
+                  step.type !== "CORTEX_STEP_TYPE_CONVERSATION_HISTORY"
+                ) {
+                  hasNewSteps = true;
+                }
+              }
+            }
+          }
+
+          if (isRunning || hasNewSteps) {
+            hasBeenActive = true;
+          }
+
+          if (sup?.indices && sup.steps) {
+            for (let i = 0; i < sup.indices.length; i++) {
+              const idx = sup.indices[i];
+              const step = sup.steps[i];
+              if (idx === undefined || step === undefined) continue;
+              if (idx <= skipUpTo) continue;
+              await this.emitStep(
+                params.sessionId,
+                idx,
+                step,
+                lastText,
+                lastThinking,
+                toolCallIds,
+                heldText,
+                heldThinking,
+                sess.cwd,
+              );
+              if (idx > sess.maxStepIndex) sess.maxStepIndex = idx;
+            }
+          }
+
+          const isIdle = update.status === "CASCADE_RUN_STATUS_IDLE" || update.fullyIdle === true;
+          if (isIdle && hasBeenActive) {
+            if (process.env.AGY_PROFILE_DEBUG) {
+              // eslint-disable-next-line no-console
+              console.error(`[agy] cascade run completed and idle. Breaking stream loop.`);
+            }
+            break;
           }
         }
       } catch (streamErr) {
@@ -466,7 +864,7 @@ class AgyAgent implements Agent {
         // read) since Connect doesn't always send a final HTTP trailer.
         // Treat any post-subscribe stream error as natural EOF — except
         // for an explicit user cancel.
-        if (cancelAbort.signal.aborted) {
+        if (cancelAbort.signal.aborted && runRef.userCancelled) {
           return { stopReason: "cancelled" };
         }
         if (process.env.AGY_PROFILE_DEBUG) {
@@ -487,22 +885,43 @@ class AgyAgent implements Agent {
         await savePersistedSession(this.mappingFile, params.sessionId, {
           cascadeId: sess.cascadeId,
           maxStepIndex: sess.maxStepIndex,
+          cwd: sess.cwd,
         });
       }
     } catch (err) {
-      if (cancelAbort.signal.aborted) return { stopReason: "cancelled" };
-      const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-      if (stderr) {
-        await this.conn.sessionUpdate({
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: `\n[agy error]\n${stderr.slice(0, 2000)}` },
-          },
-        }).catch(() => {});
+      if (cancelAbort.signal.aborted && runRef.userCancelled) return { stopReason: "cancelled" };
+      if (cancelAbort.signal.aborted && !runRef.userCancelled) {
+        // Swallowed because the child process exited normally or abnormally,
+        // and we aborted the stream/discovery deliberately.
+        if (process.env.AGY_PROFILE_DEBUG) {
+          // eslint-disable-next-line no-console
+          console.error(`[agy] run aborted due to process exit:`, err);
+        }
+      } else {
+        const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+        if (stderr) {
+          await this.conn.sessionUpdate({
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: `\n[agy error]\n${stderr.slice(0, 2000)}` },
+            },
+          }).catch(() => {});
+        }
+        throw err;
       }
-      throw err;
     } finally {
+      if (!procExited) {
+        if (process.env.AGY_PROFILE_DEBUG) {
+          // eslint-disable-next-line no-console
+          console.error(`[agy] killing active child process on prompt completion`);
+        }
+        try {
+          proc.kill();
+        } catch {
+          // ignore
+        }
+      }
       if (this.active === runRef) this.active = undefined;
     }
 
@@ -523,6 +942,7 @@ class AgyAgent implements Agent {
 
   async cancel(params: CancelNotification): Promise<void> {
     if (this.active?.sessionId === params.sessionId) {
+      this.active.userCancelled = true;
       this.active.abort.abort();
       try { this.active.proc.kill(); } catch {}
     }
@@ -530,6 +950,7 @@ class AgyAgent implements Agent {
 
   shutdown(): void {
     if (this.active) {
+      this.active.userCancelled = true;
       try { this.active.proc.kill(); } catch {}
       this.active.abort.abort();
       this.active = undefined;
@@ -837,10 +1258,7 @@ function getCatalog(cli: string): Promise<AgyCatalogEntry[]> {
   catalogPromise = p.catch((err) => {
     // Don't pin the cache to an error — let the next caller retry.
     catalogPromise = null;
-    if (process.env.AGY_PROFILE_DEBUG) {
-      // eslint-disable-next-line no-console
-      console.error("[agy] catalog fetch failed:", err);
-    }
+    console.error("[agy] catalog fetch failed:", err);
     return [];
   });
   return catalogPromise;

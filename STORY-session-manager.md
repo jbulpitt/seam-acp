@@ -14,6 +14,15 @@ A `/sessions` or `/manage-sessions` slash command that acts as a powerful, agent
    - **Clone:** Duplicate a historical session into a new session ID for the current channel.
    - **Recover/Rewind:** If a session is bricked by a bad turn (e.g., "Prompt is too long"), "rewind" it cleanly using a `clone > modify > attach` pipeline to avoid modifying active/locked files entirely!
    - **Delete:** Permanently purge a session from the agent's history. *(Caveat: If the session file is currently locked by an active agent process, we simply catch the filesystem lock and return a friendly Discord error).*
+   - **🪄 AI Summary:** Spawn a temporary, short-lived `AgentRuntime` instance with a designated summary model override, prompt the agent to summarize the conversation transcript, display the output in Discord, and cleanly dispose of the temporary runtime.
+
+## AI Summary Model Selections
+To perform the summary, the bot utilizes the following lightweight/fast model mappings for the temporary runtimes:
+- **Local Copilot agents:** `gpt-5-mini`
+- **Remote Mac agent:** `gpt-5-mini`
+- **Claude Code:** `haiku`
+- **Antigravity:** `gemini-3-flash`
+- **Gemini CLI:** *(Skipped entirely)*
 
 ## Gaps & Blockers to Consider
 

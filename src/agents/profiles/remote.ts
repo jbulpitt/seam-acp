@@ -8,6 +8,7 @@ import type {
 import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "node:http";
 import type { AgentIdentity, AgentProfile } from "../agent-profile.js";
+import type { ISessionManager } from "../session-manager.js";
 
 /**
  * How long spawn() will wait for a bridge connection before emitting an error
@@ -31,10 +32,14 @@ const ACTIVE_PING_INTERVAL_MS = 25_000;
 // This lets a single WS connection serve multiple concurrent sessions.
 
 interface MuxMsg {
-  slot: number;
-  type: "data" | "kill" | "exit";
+  slot?: number;
+  type: "data" | "kill" | "exit" | "cmd" | "cmd_reply";
   data?: string;
   code?: number;
+  cmdId?: string;
+  action?: string;
+  payload?: any;
+  error?: string;
 }
 
 interface SlotEntry {
@@ -77,6 +82,7 @@ function makeMux(opts: { id: string }) {
   const slots = new Map<number, SlotEntry>();
   /** Timeout handles for spawn() calls waiting for the bridge to come online. */
   const bridgeWaiters: Array<{ slot: number; timeout: ReturnType<typeof setTimeout> }> = [];
+  const pendingCmds = new Map<string, { resolve: (val: any) => void; reject: (err: Error) => void }>();
 
   function send(msg: MuxMsg) {
     if (bridgeWs?.readyState === WebSocket.OPEN) {
@@ -116,6 +122,21 @@ function makeMux(opts: { id: string }) {
       } catch {
         return;
       }
+
+      if (msg.type === "cmd_reply" && msg.cmdId) {
+        const handler = pendingCmds.get(msg.cmdId);
+        if (handler) {
+          pendingCmds.delete(msg.cmdId);
+          if (msg.error) {
+            handler.reject(new Error(msg.error));
+          } else {
+            handler.resolve(msg.payload);
+          }
+        }
+        return;
+      }
+
+      if (msg.slot === undefined) return;
       const entry = slots.get(msg.slot);
       if (!entry || entry.killed) return;
 
@@ -204,7 +225,26 @@ function makeMux(opts: { id: string }) {
     return fake as unknown as ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
   }
 
-  return { attach, spawn };
+  async function sendCmd(action: string, payload: any): Promise<any> {
+    if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
+      throw new Error(`Remote bridge is offline. Make sure the bridge is running.`);
+    }
+    const cmdId = Math.random().toString(36).substring(2, 15);
+    return new Promise((resolve, reject) => {
+      pendingCmds.set(cmdId, { resolve, reject });
+      const timeout = setTimeout(() => {
+        if (pendingCmds.has(cmdId)) {
+          pendingCmds.delete(cmdId);
+          reject(new Error(`Command '${action}' timed out after 15s`));
+        }
+      }, 15000);
+      if (typeof timeout.unref === "function") timeout.unref();
+
+      send({ type: "cmd", cmdId, action, payload });
+    });
+  }
+
+  return { attach, spawn, sendCmd };
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +303,7 @@ export function makeRemoteCopilotServerProfile(opts: {
     whoami(): Promise<AgentIdentity | null> {
       return Promise.resolve(null);
     },
+    sessionManager: buildSessionManager(mux),
   };
 }
 
@@ -331,6 +372,27 @@ export function makeRemoteCopilotClientProfile(opts: {
     spawn: mux.spawn.bind(mux),
     whoami(): Promise<AgentIdentity | null> {
       return Promise.resolve(null);
+    },
+    sessionManager: buildSessionManager(mux),
+  };
+}
+
+function buildSessionManager(mux: ReturnType<typeof makeMux>): ISessionManager {
+  return {
+    async listSessions(cwd: string) {
+      return mux.sendCmd("listSessions", { cwd });
+    },
+    async cloneSession(cwd: string, oldSessionId: string, newSessionId: string) {
+      return mux.sendCmd("cloneSession", { cwd, oldSessionId, newSessionId });
+    },
+    async deleteSession(cwd: string, sessionId: string) {
+      return mux.sendCmd("deleteSession", { cwd, sessionId });
+    },
+    async getTranscript(cwd: string, sessionId: string) {
+      return mux.sendCmd("getTranscript", { cwd, sessionId });
+    },
+    async compactSession(cwd: string, sessionId: string, summary: string) {
+      return mux.sendCmd("compactSession", { cwd, sessionId, summary });
     },
   };
 }

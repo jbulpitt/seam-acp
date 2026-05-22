@@ -17,6 +17,7 @@ import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  console.log(`[BOOT] Loaded REPO_EMOJIS with ${config.REPO_EMOJIS.size} entries.`);
   logger.info(
     {
       agent: config.DEFAULT_AGENT,
@@ -51,7 +52,7 @@ async function main(): Promise<void> {
       ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
       defaultModel: config.DEFAULT_MODEL,
       staticModels: config.COPILOT_MODELS,
-      threadAbbr: `cp-${p.id}`,
+      threadAbbr: p.id === "jbulpitt" ? "cp-jb" : `cp-${p.id}`,
       mcpServers,
     })
   );
@@ -82,6 +83,7 @@ async function main(): Promise<void> {
     staticModels: config.CLAUDE_MODELS,
     threadAbbr: "cc",
     maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
+    compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
     mcpServers,
   });
 
@@ -94,6 +96,7 @@ async function main(): Promise<void> {
       defaultModel: config.CLAUDE_DEFAULT_MODEL,
       staticModels: config.CLAUDE_MODELS,
       maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
+      compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
       mcpServers,
     })
   );
@@ -104,6 +107,7 @@ async function main(): Promise<void> {
     staticModels: config.AGY_MODELS,
     threadAbbr: "agy",
     dataDir: config.DATA_DIR,
+    printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
   });
 
   const remoteCopilots = config.REMOTE_COPILOT_PROFILES.map((p) =>

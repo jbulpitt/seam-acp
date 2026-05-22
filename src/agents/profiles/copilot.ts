@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
 import fs, { promises as fsp } from "node:fs";
 import path from "node:path";
+import Database from "better-sqlite3";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { AgentIdentity, AgentProfile } from "../agent-profile.js";
+import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 
 /**
  * GitHub Copilot CLI as an ACP server (`copilot --acp`).
@@ -69,12 +71,241 @@ export function makeCopilotProfile(opts: {
       return spawn(cli, args, {
         stdio: ["pipe", "pipe", "pipe"],
         env,
+        detached: true,
       });
     },
     async whoami() {
       if (identityCache !== undefined) return identityCache;
       identityCache = await readCopilotIdentity(configDir);
       return identityCache;
+    },
+    sessionManager: {
+      async listSessions(cwd: string): Promise<SessionSummary[]> {
+        const dir = configDir ?? path.join(process.env.HOME ?? "", ".copilot");
+        const dbPath = path.join(dir, "session-store.db");
+        try {
+          await fsp.access(dbPath);
+          const db = new Database(dbPath);
+          try {
+            // Query seam.db as a source of truth for session IDs associated with this repo path.
+            const seamDbSessions = new Set<string>();
+            try {
+              const dataDir = process.env.DATA_DIR ?? "./data";
+              const seamDbPath = path.resolve(dataDir, "seam.db");
+              const seamDb = new Database(seamDbPath);
+              try {
+                // Find all sessions in seam.db that have this repo path
+                const rows = seamDb.prepare("SELECT acp_session_id FROM sessions WHERE repo_path = ?").all(cwd) as any[];
+                for (const row of rows) {
+                  if (row.acp_session_id) {
+                    seamDbSessions.add(row.acp_session_id);
+                  }
+                }
+              } finally {
+                seamDb.close();
+              }
+            } catch (err) {
+              // ignore seamDb query failures
+            }
+
+            // Fetch all sessions from the copilot DB.
+            const allSessions = db.prepare("SELECT * FROM sessions ORDER BY updated_at DESC").all() as any[];
+            const sessions: any[] = [];
+            for (const s of allSessions) {
+              const matchesCwd = s.cwd === cwd;
+              const matchesSeamDb = s.id && seamDbSessions.has(s.id);
+
+              if (matchesCwd || (matchesSeamDb && !s.cwd)) {
+                sessions.push(s);
+              }
+            }
+
+            const summaries: SessionSummary[] = [];
+
+            for (const sess of sessions) {
+              const sessionId = sess.id;
+              const createdAt = sess.created_at ? Date.parse(sess.created_at) : Date.now();
+              const lastActivityAt = sess.updated_at ? Date.parse(sess.updated_at) : Date.now();
+
+              const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(sessionId) as any[];
+              
+              const allMessages: Array<{ sender: "human" | "agent"; text: string }> = [];
+              for (const turn of turns) {
+                if (turn.user_message) {
+                  allMessages.push({ sender: "human", text: turn.user_message });
+                }
+                if (turn.assistant_response) {
+                  allMessages.push({ sender: "agent", text: turn.assistant_response });
+                }
+              }
+
+              const transcriptLines: string[] = [];
+              for (const turn of turns) {
+                if (turn.user_message?.trim()) {
+                  transcriptLines.push(`### User\n${turn.user_message.trim()}`);
+                }
+                if (turn.assistant_response?.trim()) {
+                  transcriptLines.push(`### Assistant\n${turn.assistant_response.trim()}`);
+                }
+              }
+              const estimatedTokens = Math.ceil(transcriptLines.join("\n\n").length / 4);
+
+              let previewLines: SessionSummaryLine[] = [];
+              if (allMessages.length <= 16) {
+                previewLines = allMessages;
+              } else {
+                const firstSix = allMessages.slice(0, 6);
+                const lastTen = allMessages.slice(-10);
+                previewLines = [...firstSix, ...lastTen];
+              }
+
+              summaries.push({
+                sessionId,
+                createdAt,
+                lastActivityAt,
+                previewLines,
+                estimatedTokens,
+              });
+            }
+            return summaries;
+          } finally {
+            db.close();
+          }
+        } catch {
+          return [];
+        }
+      },
+
+      async cloneSession(cwd: string, oldSessionId: string, newSessionId: string): Promise<void> {
+        const dir = configDir ?? path.join(process.env.HOME ?? "", ".copilot");
+        const dbPath = path.join(dir, "session-store.db");
+        const sessionStateDir = path.join(dir, "session-state");
+
+        const db = new Database(dbPath);
+        try {
+          const sessionRow = db.prepare("SELECT * FROM sessions WHERE id = ?").get(oldSessionId) as any;
+          if (sessionRow) {
+            const nowIso = new Date().toISOString();
+            db.prepare(`
+              INSERT INTO sessions (id, cwd, repository, host_type, branch, summary, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+              newSessionId,
+              cwd,
+              sessionRow.repository,
+              sessionRow.host_type,
+              sessionRow.branch,
+              sessionRow.summary,
+              nowIso,
+              nowIso
+            );
+          }
+
+          const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(oldSessionId) as any[];
+          const insertTurn = db.prepare(`
+            INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+          `);
+          for (const turn of turns) {
+            insertTurn.run(
+              newSessionId,
+              turn.turn_index,
+              turn.user_message,
+              turn.assistant_response,
+              turn.timestamp
+            );
+          }
+
+          const oldSubDir = path.join(sessionStateDir, oldSessionId);
+          const newSubDir = path.join(sessionStateDir, newSessionId);
+          try {
+            const stat = await fsp.stat(oldSubDir);
+            if (stat.isDirectory()) {
+              await fsp.mkdir(newSubDir, { recursive: true });
+              await fsp.cp(oldSubDir, newSubDir, { recursive: true });
+            }
+          } catch {
+            // ignore
+          }
+        } finally {
+          db.close();
+        }
+      },
+
+      async deleteSession(cwd: string, sessionId: string): Promise<void> {
+        const dir = configDir ?? path.join(process.env.HOME ?? "", ".copilot");
+        const dbPath = path.join(dir, "session-store.db");
+        const sessionStateDir = path.join(dir, "session-state");
+
+        const db = new Database(dbPath);
+        try {
+          db.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
+          db.prepare("DELETE FROM turns WHERE session_id = ?").run(sessionId);
+          try {
+            db.prepare("DELETE FROM search_index_content WHERE c1 = ?").run(sessionId);
+          } catch {
+            // ignore
+          }
+        } finally {
+          db.close();
+        }
+
+        const subDir = path.join(sessionStateDir, sessionId);
+        try {
+          await fsp.rm(subDir, { recursive: true, force: true });
+        } catch {
+          // ignore
+        }
+      },
+
+      async getTranscript(cwd: string, sessionId: string): Promise<string> {
+        const dir = configDir ?? path.join(process.env.HOME ?? "", ".copilot");
+        const dbPath = path.join(dir, "session-store.db");
+        const db = new Database(dbPath);
+        try {
+          const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(sessionId) as any[];
+          const transcriptLines: string[] = [];
+          for (const turn of turns) {
+            if (turn.user_message?.trim()) {
+              transcriptLines.push(`### User\n${turn.user_message.trim()}`);
+            }
+            if (turn.assistant_response?.trim()) {
+              transcriptLines.push(`### Assistant\n${turn.assistant_response.trim()}`);
+            }
+          }
+          return transcriptLines.join("\n\n");
+        } finally {
+          db.close();
+        }
+      },
+
+      async compactSession(cwd: string, sessionId: string, summaryText: string): Promise<void> {
+        const dir = configDir ?? path.join(process.env.HOME ?? "", ".copilot");
+        const dbPath = path.join(dir, "session-store.db");
+        const db = new Database(dbPath);
+        try {
+          const runTx = db.transaction(() => {
+            db.prepare("DELETE FROM turns WHERE session_id = ?").run(sessionId);
+            db.prepare(`
+              INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp)
+              VALUES (?, ?, ?, ?, ?)
+            `).run(
+              sessionId,
+              0,
+              "[Session history compacted due to context limits]",
+              summaryText,
+              new Date().toISOString()
+            );
+            db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run(
+              new Date().toISOString(),
+              sessionId
+            );
+          });
+          runTx();
+        } finally {
+          db.close();
+        }
+      }
     },
   };
 }

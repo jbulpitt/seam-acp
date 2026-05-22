@@ -24,5 +24,24 @@ Users can branch off "what-if" tangents or ask side-questions in Discord threads
 
 ---
 
-## 2. [Add future ideas here...]
+## 2. Session Manager (Agent-Specific Slash Command)
 
+**Concept:**
+A `/sessions` or `/manage-sessions` slash command that acts as a powerful, agent-specific session manager. It would allow users to visually browse, manage, and recover recent sessions directly from Discord.
+
+**Proposed Functionality:**
+1. **Load & Summarize:** Query the underlying agent's session store (e.g., Claude Code's local history directory), load the most recent sessions, and use an LLM (or heuristics) to generate a brief summary of what each session was working on.
+2. **Interactive UI:** Present the sessions using Discord's `StringSelectMenuBuilder` or interactive buttons.
+3. **Actions:**
+   - **Attach:** Hot-swap the current Discord channel's session with a selected historical session.
+   - **Clone:** Duplicate a historical session into a new session ID for the current channel (similar to the Thread-based context inheritance).
+   - **Recover/Rewind:** If a session is bricked by a bad turn (e.g., "Prompt is too long" or a corrupted context state), provide a way to "rewind" the history by deleting the last $N$ turns from the underlying store and reattaching it.
+   - **Delete:** Permanently purge a session from the agent's history to free up disk space or remove clutter.
+
+**Challenges:**
+- Because this relies on modifying the raw history files (or calling specific ACP/Agent endpoints that might not exist yet), the implementation would have to be highly agent-specific (e.g., a Claude Code adapter vs. a Copilot adapter).
+- The bridge would need to safely parse and mutate the agent's proprietary history format (like `messages.json` or an SQLite DB) without corrupting it.
+
+---
+
+## 3. [Add future ideas here...]

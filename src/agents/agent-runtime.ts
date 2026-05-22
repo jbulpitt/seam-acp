@@ -53,6 +53,7 @@ export type AgentEvent =
   | { kind: "mode-changed"; modeId: string }
   | { kind: "model-changed"; modelId: string }
   | { kind: "config-options"; options: unknown }
+  | { kind: "agent-state"; state: string }
   | { kind: "error"; message: string };
 
 export type AgentEventHandler = (event: AgentEvent) => void | Promise<void>;
@@ -555,6 +556,10 @@ export class AgentRuntime {
     if (block.type === "text") {
       const text = (block as { text?: string }).text;
       if (typeof text === "string" && text.length > 0) {
+        if (text === "Compacting...") {
+          await this.emit({ kind: "agent-state", state: "Compacting memory…" });
+          return;
+        }
         if (source === "tool") {
           // Tool stdout/stderr (curl progress, file dumps, exit codes) is
           // NOT a model reply — never post it to chat, and don't scan it

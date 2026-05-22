@@ -558,6 +558,11 @@ export class Orchestrator {
             status.pushThinkingChunk(event.text);
             void refresh();
             return;
+          case "agent-state":
+            refreshTyping();
+            status.setAction(event.state);
+            void refresh();
+            return;
           case "config-options":
           case "error":
             return;

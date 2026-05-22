@@ -35,8 +35,8 @@ A `/sessions` or `/manage-sessions` slash command that acts as a powerful, agent
 3. **Actions:**
    - **Attach:** Hot-swap the current Discord channel's session with a selected historical session.
    - **Clone:** Duplicate a historical session into a new session ID for the current channel (similar to the Thread-based context inheritance).
-   - **Recover/Rewind:** If a session is bricked by a bad turn (e.g., "Prompt is too long" or a corrupted context state), provide a way to "rewind" the history by deleting the last $N$ turns from the underlying store and reattaching it.
-   - **Delete:** Permanently purge a session from the agent's history to free up disk space or remove clutter.
+   - **Recover/Rewind:** If a session is bricked by a bad turn (e.g., "Prompt is too long"), "rewind" it cleanly using a `clone > modify > attach` pipeline. By cloning the file, slicing the last $N$ turns from the clone, and then attaching the fresh clone, we avoid modifying active/locked files entirely!
+   - **Delete:** Permanently purge a session from the agent's history. *(Caveat: If the session file is currently locked by an active agent process, we simply catch the filesystem lock and return a friendly Discord error rather than trying to force-kill processes).*
 
 **Challenges:**
 - Because this relies on modifying the raw history files (or calling specific ACP/Agent endpoints that might not exist yet), the implementation would have to be highly agent-specific (e.g., a Claude Code adapter vs. a Copilot adapter).

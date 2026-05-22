@@ -688,9 +688,16 @@ export class Orchestrator {
       if (isSessionGoneError(err)) {
         this.logger.warn({ session: record.id }, "session not found on agent; invalidating runtime");
         await this.router.invalidate(record.id, { clearAcpSession: true });
-      } else if (isAgentRejectionError(err)) {
+      } else if (isAgentRejectionError(err) || errMsg.includes("Prompt is too long")) {
         this.logger.warn({ session: record.id }, "agent rejected prompt (400); invalidating session to prevent replay");
         await this.router.invalidate(record.id, { clearAcpSession: true });
+        
+        if (errMsg.includes("Prompt is too long")) {
+          await this.adapter.sendMessage(
+            channel,
+            "⚠️ **Claude hit its context limit before auto-compacting.** The context grew too large in a single turn. Try running `/compact` to free up space!"
+          );
+        }
       }
       status.setState("Failed");
       status.setAction(this.renderer.trimShort(isSessionGoneError(err) ? "Session lost — please resend your message." : errMsg, 120));

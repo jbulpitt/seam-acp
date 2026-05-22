@@ -102,3 +102,24 @@ export interface TurnOutcome {
   timedOut: boolean;
   errorMessage?: string;
 }
+
+/**
+ * Platform-agnostic rich status card. The renderer produces this structure and
+ * the adapter converts it to the platform's native rich format (Discord embed,
+ * Slack block-kit, etc.). A text-serialization fallback is provided for
+ * adapters that only support plain text.
+ */
+export interface StructuredPanel {
+  /** Sidebar / accent color as a hex number (e.g. 0x57F287 for green). */
+  color: number;
+  /** Main title line (e.g. "⏳ Working"). */
+  title: string;
+  /** Optional author line (e.g. agent display name). */
+  author?: string;
+  /** Optional body text rendered as markdown (activity log, thinking, etc.). */
+  description?: string;
+  /** Key/value fields for the embed grid. */
+  fields: Array<{ name: string; value: string; inline?: boolean }>;
+  /** Footer text (e.g. "⏱ 12s elapsed"). */
+  footer?: string;
+}

@@ -5,6 +5,7 @@ import { MessageFlags, type ChatInputCommandInteraction, type EmbedBuilder } fro
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
 import type { Renderer } from "../renderer.js";
+import { serializePanelText } from "../renderer.js";
 import type {
   ChatAdapter,
   ChannelRef,
@@ -169,22 +170,27 @@ export class Orchestrator {
       repoDisplay,
     });
 
-    const statusMsg = await this.adapter.sendMessage(
-      channel,
-      renderStatusPanel(this.renderer, status.toInput(), Date.now())
-    );
+    const initialPanel = renderStatusPanel(this.renderer, status.toInput(), Date.now());
+    const statusMsg = this.adapter.sendPanel
+      ? await this.adapter.sendPanel(channel, initialPanel)
+      : await this.adapter.sendMessage(channel, serializePanelText(initialPanel));
 
     let lastEdit = 0;
     let lastRendered = "";
     const refresh = async (force = false) => {
       const now = Date.now();
       if (!force && now - lastEdit < STATUS_EDIT_DEBOUNCE_MS) return;
-      const text = renderStatusPanel(this.renderer, status.toInput(), now);
-      if (text === lastRendered) return;
-      lastRendered = text;
+      const panel = renderStatusPanel(this.renderer, status.toInput(), now);
+      const fingerprint = JSON.stringify(panel);
+      if (fingerprint === lastRendered) return;
+      lastRendered = fingerprint;
       lastEdit = now;
       try {
-        await this.adapter.editMessage(statusMsg, text);
+        if (this.adapter.editPanel) {
+          await this.adapter.editPanel(statusMsg, panel);
+        } else {
+          await this.adapter.editMessage(statusMsg, serializePanelText(panel));
+        }
       } catch (err) {
         this.logger.warn({ err }, "status edit failed");
       }
@@ -847,16 +853,23 @@ export class Orchestrator {
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       let models: ReadonlyArray<{ modelId: string; name?: string }> = [];
-      try {
-        const rt = await this.router.getOrStartRuntime(record);
-        models = rt.getSessionInfo()?.availableModels ?? [];
-      } catch (err) {
-        this.logger.warn({ err }, "could not start runtime / enumerate models");
-        await i.editReply(
-          `Current model: \`${current}\`\nFailed to start the agent to list models: ${(err as Error).message}`
-        );
-        return;
+      const profile = this.router.getProfile(record.agentId);
+
+      if (profile?.staticModels && profile.staticModels.length > 0) {
+        models = profile.staticModels;
+      } else {
+        try {
+          const rt = await this.router.getOrStartRuntime(record);
+          models = rt.getSessionInfo()?.availableModels ?? [];
+        } catch (err) {
+          this.logger.warn({ err }, "could not start runtime / enumerate models");
+          await i.editReply(
+            `Current model: \`${current}\`\nFailed to start the agent to list models: ${(err as Error).message}`
+          );
+          return;
+        }
       }
+
       if (models.length === 0) {
         await i.editReply(
           `Current model: \`${current}\`\n_(agent did not advertise any models — pass an id manually: \`/seam model id:<name>\`.)_`
@@ -865,13 +878,26 @@ export class Orchestrator {
       }
       await i.editReply(`Current model: \`${current}\`. Posting picker…`);
       const picked = await this.adapter.sendChoicePicker(channel, {
-        prompt: `🧠 **Choose a model** (current: \`${current}\`)`,
+        panel: {
+          color: 0x5865f2,
+          title: "🧠 Choose a model",
+          fields: [{ name: "Current", value: `\`${current}\``, inline: true }],
+        },
         choices: models.slice(0, 25).map((m) => ({
           value: m.modelId,
           label: m.name ?? m.modelId,
           description: m.modelId,
         })),
         authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+        successPanel: (pickedChoice, username) => ({
+          color: 0x57f287,
+          title: "✅ Model changed",
+          fields: [
+            { name: "Previous", value: `\`${current}\``, inline: true },
+            { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
+          ],
+          footer: `Changed by ${username}`
+        }),
       });
       if (!picked) return;
       await this.applyModelChange(channel, record, picked.value);
@@ -1043,13 +1069,26 @@ export class Orchestrator {
         flags: MessageFlags.Ephemeral,
       });
       const picked = await this.adapter.sendChoicePicker(channel, {
-        prompt: `🤖 **Choose an agent** (current: \`${record.agentId}\`)`,
+        panel: {
+          color: 0x5865f2,
+          title: "🤖 Choose an agent",
+          fields: [{ name: "Current", value: `\`${record.agentId}\``, inline: true }],
+        },
         choices: profiles.map((p) => ({
           value: p.id,
           label: p.displayName,
           description: p.id,
         })),
         authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+        successPanel: (pickedChoice, username) => ({
+          color: 0x57f287,
+          title: "✅ Agent changed",
+          fields: [
+            { name: "Previous", value: `\`${record.agentId}\``, inline: true },
+            { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
+          ],
+          footer: `Changed by ${username}`
+        }),
       });
       if (!picked) return;
       await this.applyAgentChange(channel, record, picked.value);
@@ -1780,14 +1819,25 @@ export class Orchestrator {
     const overflow = dirs.length - top.length;
 
     const result = await this.adapter.sendChoicePicker(channel, {
-      prompt:
-        "🗂️ **Select a repo to begin:**" +
-        (overflow > 0 ? `\n_(showing first 25 of ${dirs.length}; use \`/seam repo <path>\` for the rest)_` : ""),
+      panel: {
+        color: 0x5865f2,
+        title: "🗂️ Select a project to begin",
+        description: overflow > 0 ? `_(Showing first 25 of ${dirs.length} projects. Use \`/seam repo <path>\` to access the rest.)_` : undefined,
+        fields: [],
+      },
       choices: top.map((p) => ({
         value: p,
         label: path.basename(p),
       })),
       authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+      successPanel: (pickedChoice, username) => ({
+        color: 0x57f287,
+        title: "✅ Project selected",
+        fields: [
+          { name: "Project", value: `\`${pickedChoice.label}\``, inline: true },
+        ],
+        footer: `Started by ${username}`
+      }),
     });
 
     if (!result) return;
@@ -1864,7 +1914,11 @@ export class Orchestrator {
     const profiles = this.router.listProfiles();
     if (profiles.length > 1 && this.adapter.sendChoicePicker) {
       const picked = await this.adapter.sendChoicePicker(channel, {
-        prompt: `🤖 **Choose an agent** (default: \`${currentRecord.agentId}\`)`,
+        panel: {
+          color: 0x5865f2,
+          title: "🤖 Choose an agent",
+          fields: [{ name: "Default", value: `\`${currentRecord.agentId}\``, inline: true }],
+        },
         choices: profiles.map((p) => ({
           value: p.id,
           label: p.displayName,
@@ -1872,6 +1926,15 @@ export class Orchestrator {
             p.id === currentRecord.agentId ? `${p.id} (current)` : p.id,
         })),
         authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+        successPanel: (pickedChoice, username) => ({
+          color: 0x57f287,
+          title: "✅ Agent changed",
+          fields: [
+            { name: "Default", value: `\`${currentRecord.agentId}\``, inline: true },
+            { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
+          ],
+          footer: `Changed by ${username}`
+        }),
       });
       if (!picked) {
         // User timed out / cancelled — rename with default agent and end wizard.
@@ -1892,16 +1955,28 @@ export class Orchestrator {
     // Rename the thread now that we know the final agent.
     await this.renameThreadForSetup(channel, currentRecord);
 
-    // Step 2: Model picker (requires a live runtime to enumerate models).
+    // Step 2: Model picker
     if (this.adapter.sendChoicePicker) {
       try {
-        const rt = await this.router.getOrStartRuntime(currentRecord);
-        const models = rt.getSessionInfo()?.availableModels ?? [];
+        let models: ReadonlyArray<{ modelId: string; name?: string }> = [];
+        const profile = this.router.getProfile(currentRecord.agentId);
+        
+        if (profile?.staticModels && profile.staticModels.length > 0) {
+          models = profile.staticModels;
+        } else {
+          const rt = await this.router.getOrStartRuntime(currentRecord);
+          models = rt.getSessionInfo()?.availableModels ?? [];
+        }
+
         if (models.length > 1) {
           const cfg = this.store.readConfig(currentRecord);
           const current = cfg.model ?? this.config.DEFAULT_MODEL;
           const picked = await this.adapter.sendChoicePicker(channel, {
-            prompt: `🧠 **Choose a model** (default: \`${current}\`)`,
+            panel: {
+              color: 0x5865f2,
+              title: "🧠 Choose a model",
+              fields: [{ name: "Default", value: `\`${current}\``, inline: true }],
+            },
             choices: models.slice(0, 25).map((m) => ({
               value: m.modelId,
               label: m.name ?? m.modelId,
@@ -1909,6 +1984,15 @@ export class Orchestrator {
                 m.modelId === current ? `${m.modelId} (current)` : m.modelId,
             })),
             authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+            successPanel: (pickedChoice, username) => ({
+              color: 0x57f287,
+              title: "✅ Model changed",
+              fields: [
+                { name: "Default", value: `\`${current}\``, inline: true },
+                { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
+              ],
+              footer: `Changed by ${username}`
+            }),
           });
           if (picked && picked.value !== current) {
             await this.applyModelChange(channel, currentRecord, picked.value);

@@ -1,4 +1,4 @@
-import type { SessionRecord } from "../core/types.js";
+import type { SessionRecord, StructuredPanel } from "../core/types.js";
 import type {
   RequestPermissionRequest,
   RequestPermissionResponse,
@@ -86,6 +86,12 @@ export interface ChatAdapter {
   /** Optional: return the current display name of a thread/channel. */
   getThreadName?(channel: ChannelRef): Promise<string | undefined>;
 
+  /** Optional: send a rich structured panel (embed on Discord). */
+  sendPanel?(channel: ChannelRef, panel: StructuredPanel): Promise<MessageRef>;
+
+  /** Optional: edit a previously-sent panel. */
+  editPanel?(message: MessageRef, panel: StructuredPanel): Promise<void>;
+
   /**
    * Optional: present an interactive choice picker (buttons / select menu)
    * and resolve when the user picks one. Returns null on timeout / cancel.
@@ -95,10 +101,12 @@ export interface ChatAdapter {
   sendChoicePicker?(
     channel: ChannelRef,
     opts: {
-      prompt: string;
+      prompt?: string;
+      panel?: StructuredPanel;
       choices: ReadonlyArray<{ value: string; label: string; description?: string }>;
       timeoutMs?: number;
       authorizedUserIds?: ReadonlySet<string>;
+      successPanel?: (picked: { value: string; label: string }, username: string) => StructuredPanel;
     }
   ): Promise<{ value: string; userId: string } | null>;
 

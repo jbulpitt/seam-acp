@@ -153,10 +153,12 @@ export class DiscordAdapter implements ChatAdapter {
   async sendChoicePicker(
     channel: ChannelRef,
     opts: {
-      prompt: string;
+      prompt?: string;
+      panel?: import("../../core/types.js").StructuredPanel;
       choices: ReadonlyArray<{ value: string; label: string; description?: string }>;
       timeoutMs?: number;
       authorizedUserIds?: ReadonlySet<string>;
+      successPanel?: (picked: { value: string; label: string }, username: string) => import("../../core/types.js").StructuredPanel;
     }
   ): Promise<{ value: string; userId: string } | null> {
     const ch = await this.fetchSendableChannel(channel.id);
@@ -204,8 +206,10 @@ export class DiscordAdapter implements ChatAdapter {
       );
     }
 
+    const embeds = opts.panel ? [DiscordAdapter.buildEmbed(opts.panel)] : [];
     const msg = await ch.send({
       content: opts.prompt,
+      embeds,
       components,
     });
 
@@ -241,14 +245,44 @@ export class DiscordAdapter implements ChatAdapter {
 
       const chosen = choices[pickedIdx];
       if (!chosen) {
-        await msg.edit({ content: `${opts.prompt}\n_Invalid choice._`, components: [] });
+        if (opts.panel) {
+          const errEmbed = DiscordAdapter.buildEmbed(opts.panel).setColor(0xed4245);
+          errEmbed.setDescription("_Invalid choice._");
+          await msg.edit({ content: opts.prompt, embeds: [errEmbed], components: [] });
+        } else {
+          await msg.edit({ content: `${opts.prompt ?? ""}\n_Invalid choice._`, components: [] });
+        }
         return null;
       }
 
-      await msg.edit({
-        content: `${opts.prompt}\n✅ **${chosen.label}** (${interaction.user.username})`,
-        components: [],
-      });
+      if (opts.successPanel) {
+        const successPanel = opts.successPanel(
+          { value: chosen.value, label: chosen.label },
+          interaction.user.username
+        );
+        const successEmbed = DiscordAdapter.buildEmbed(successPanel);
+        await msg.edit({
+          content: opts.prompt,
+          embeds: [successEmbed],
+          components: [],
+        });
+      } else if (opts.panel) {
+        const successEmbed = DiscordAdapter.buildEmbed(opts.panel).setColor(0x57f287);
+        const newDesc = opts.panel.description 
+          ? `${opts.panel.description}\n\n✅ **${chosen.label}** (${interaction.user.username})`
+          : `✅ **${chosen.label}** (${interaction.user.username})`;
+        successEmbed.setDescription(newDesc.slice(0, 4096));
+        await msg.edit({
+          content: opts.prompt,
+          embeds: [successEmbed],
+          components: [],
+        });
+      } else {
+        await msg.edit({
+          content: `${opts.prompt ?? ""}\n✅ **${chosen.label}** (${interaction.user.username})`,
+          components: [],
+        });
+      }
       try {
         await interaction.deferUpdate();
       } catch {
@@ -324,6 +358,51 @@ export class DiscordAdapter implements ChatAdapter {
     } catch {
       return undefined;
     }
+  }
+
+  async sendPanel(
+    channel: ChannelRef,
+    panel: import("../../core/types.js").StructuredPanel
+  ): Promise<MessageRef> {
+    const ch = await this.fetchSendableChannel(channel.id);
+    const embed = DiscordAdapter.buildEmbed(panel);
+    const sent = await ch.send({ embeds: [embed] });
+    return { channel, id: sent.id };
+  }
+
+  async editPanel(
+    message: MessageRef,
+    panel: import("../../core/types.js").StructuredPanel
+  ): Promise<void> {
+    const ch = await this.fetchSendableChannel(message.channel.id);
+    const msg = await ch.messages.fetch(message.id);
+    const embed = DiscordAdapter.buildEmbed(panel);
+    await msg.edit({ content: "", embeds: [embed] });
+  }
+
+  private static buildEmbed(
+    panel: import("../../core/types.js").StructuredPanel
+  ): EmbedBuilder {
+    const embed = new EmbedBuilder()
+      .setColor(panel.color)
+      .setTitle(panel.title);
+    if (panel.author) {
+      embed.setAuthor({ name: panel.author });
+    }
+    if (panel.description) {
+      embed.setDescription(panel.description.slice(0, 4096));
+    }
+    for (const f of panel.fields) {
+      embed.addFields({
+        name: f.name.slice(0, 256),
+        value: f.value.slice(0, 1024) || "\u200B",
+        inline: f.inline ?? false,
+      });
+    }
+    if (panel.footer) {
+      embed.setFooter({ text: panel.footer.slice(0, 2048) });
+    }
+    return embed;
   }
 
   // --- internals ---

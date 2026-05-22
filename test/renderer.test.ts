@@ -10,12 +10,21 @@ describe("discordRenderer", () => {
       action: "Starting…",
       elapsedSeconds: 3,
     });
-    expect(out).toContain("⏳");
-    expect(out).toContain("**Working**");
-    expect(out).toContain("elapsed : 3s");
-    expect(out).toContain("repo    : myrepo");
-    expect(out).toContain("model   : gpt-5.4");
-    expect(out).toContain("doing   : Starting…");
+    expect(out.title).toBe("Working");
+    expect(out.color).toBeDefined();
+    
+    // Check fields
+    const repoField = out.fields?.find(f => f.name === "Repo");
+    expect(repoField?.value).toBe("myrepo");
+    
+    const modelField = out.fields?.find(f => f.name === "Model");
+    expect(modelField?.value).toBe("gpt-5.4");
+    
+    const actionField = out.fields?.find(f => f.name === "Action");
+    expect(actionField?.value).toBe("Starting…");
+
+    // Check footer
+    expect(out.footer).toContain("⏱ 3s elapsed");
   });
 
   it("info box renders title, rows, and footer", () => {

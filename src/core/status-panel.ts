@@ -1,5 +1,5 @@
 import type { Renderer } from "../platforms/renderer.js";
-import type { TurnState, StatusPanel } from "./types.js";
+import type { TurnState, StatusPanel, StructuredPanel } from "./types.js";
 
 /**
  * Renders the single editable status panel that the bot keeps for each
@@ -24,7 +24,7 @@ export function renderStatusPanel(
   renderer: Renderer,
   input: StatusPanelInput,
   nowUtc: number
-): string {
+): StructuredPanel {
   const elapsedSeconds = Math.max(
     0,
     Math.floor((nowUtc - input.startedUtc) / 1000)
@@ -56,7 +56,7 @@ export class TurnStatus {
   usage?: string;
   /** Rolling activity log (oldest → newest). Capped to last N entries. */
   activity: string[] = [];
-  private static readonly MAX_ACTIVITY = 5;
+  private static readonly MAX_ACTIVITY = 20;
   /** Last N complete lines of model reasoning (oldest → newest). */
   private thinkingLines: string[] = [];
   /** Incoming thought chunks may end mid-line — buffer until we see a \n. */

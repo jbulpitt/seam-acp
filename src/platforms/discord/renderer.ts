@@ -1,6 +1,15 @@
 import { chunkForDiscord } from "../../core/text-chunker.js";
-import type { StatusPanel } from "../../core/types.js";
+import type { StatusPanel, StructuredPanel } from "../../core/types.js";
 import type { KV, Renderer } from "../renderer.js";
+
+/** Color palette keyed by turn state. */
+const COLOR_BY_STATE: Record<StatusPanel["state"], number> = {
+  Working: 0xfaa61a,   // amber
+  Done: 0x57f287,      // green
+  Failed: 0xed4245,    // red
+  "Timed out": 0x95a5a6, // grey
+  Waiting: 0x5865f2,   // blurple
+};
 
 const ICON_BY_STATE: Record<StatusPanel["state"], string> = {
   Done: "✅",
@@ -41,34 +50,82 @@ function box(opts: {
   return lines.join("\n").replace(/\s+$/, "");
 }
 
+/** Map tool label keywords to a relevant emoji. */
+const TOOL_EMOJI: [RegExp, string][] = [
+  [/\b(grep|search|find|semantic)\b/i, "🔍"],
+  [/\b(read|view|cat|head|wc)\b/i, "📄"],
+  [/\b(edit|write|replace|creat)\b/i, "✏️"],
+  [/\b(run|command|exec|terminal|bash|sh\b)/i, "▶️"],
+  [/\b(npm|node|npx|tsc|build|compile)\b/i, "🔨"],
+  [/\b(python|py)\b/i, "🐍"],
+  [/\b(web|url|browse|curl|fetch|http)\b/i, "🌐"],
+  [/\b(list|ls|dir|directory)\b/i, "📂"],
+  [/\b(git|commit|push|pull|stage|stash|diff|log)\b/i, "📦"],
+  [/\b(image|screenshot|crop|photo)\b/i, "🖼️"],
+  [/\b(delete|remove|clean|rm)\b/i, "🗑️"],
+  [/\b(test|check|lint|verify|validate)\b/i, "✅"],
+  [/\b(sleep|wait|restart|stop|kill)\b/i, "⏸️"],
+  [/\b(string|debug|probe|inspect)\b/i, "🔬"],
+  [/\bcode action\b/i, "📑"],
+];
+
+function toolEmoji(label: string): string {
+  for (const [pattern, emoji] of TOOL_EMOJI) {
+    if (pattern.test(label)) return emoji;
+  }
+  return "⚙️";
+}
+
 export const discordRenderer: Renderer = {
-  statusPanel(state) {
-    const rows: KV[] = [
-      { key: "elapsed", value: `${state.elapsedSeconds}s` },
-      { key: "repo", value: trim(state.repoDisplay, 80) },
-      { key: "model", value: trim(state.model, 40) },
-      { key: "doing", value: trim(state.action, 220) },
+  statusPanel(state): StructuredPanel {
+    const icon = ICON_BY_STATE[state.state];
+
+    // --- fields (all inline) ---
+    const fields: StructuredPanel["fields"] = [
+      { name: "Repo", value: trim(state.repoDisplay, 80), inline: true },
+      { name: "Model", value: trim(state.model, 40), inline: true },
+      { name: "Action", value: trim(state.action, 220), inline: true },
     ];
-    const activityLines =
-      state.activity && state.activity.length > 0
-        ? state.activity.map((a) => `  • ${trim(a, 80)}`).join("\n")
-        : undefined;
-    // Thoughts go in a blockquote BELOW the code block — blockquote markdown
-    // doesn't render inside a code fence. Edits to the same status message
-    // carry both sections in one Discord request.
-    const thinkingFooter =
-      state.thinking && state.thinking.length > 0
-        ? state.thinking
-            .map((t) => `> ${trim(t.replace(/[*_`]/g, ""), 300)}`)
-            .join("\n")
-        : undefined;
-    return box({
+    if (state.usage) {
+      fields.push({ name: "Usage", value: trim(state.usage, 80), inline: true });
+    }
+
+    // --- description: activity as inline code "tags" ---
+    let description: string | undefined;
+    if (state.activity && state.activity.length > 0) {
+      description = state.activity
+        .map((a) => `\`${toolEmoji(a)} ${trim(a, 60)}\``)
+        .join("  ");
+    }
+
+    // --- footer: thinking lines (💡) + elapsed time (⏱) ---
+    const footerParts: string[] = [];
+    if (state.thinking && state.thinking.length > 0) {
+      const filteredThinking = state.thinking.filter((t) => {
+        const lower = t.toLowerCase();
+        return (
+          !lower.includes("tool specificity") &&
+          !lower.includes("critical instruction") &&
+          !lower.includes("avoid cat for file creation") &&
+          !lower.includes("grepsearch")
+        );
+      });
+      if (filteredThinking.length > 0) {
+        const thinkingLines = filteredThinking
+          .map((t) => `💡 ${trim(t.replace(/[*_`]/g, ""), 200)}`)
+          .join("\n");
+        footerParts.push(thinkingLines);
+      }
+    }
+    footerParts.push(`\n⏱ ${state.elapsedSeconds}s elapsed`);
+
+    return {
+      color: COLOR_BY_STATE[state.state],
       title: state.state,
-      icon: ICON_BY_STATE[state.state],
-      rows,
-      ...(activityLines ? { extra: activityLines } : {}),
-      ...(thinkingFooter ? { footer: thinkingFooter } : {}),
-    });
+      fields,
+      description,
+      footer: footerParts.join("\n"),
+    };
   },
 
   infoBox(opts) {

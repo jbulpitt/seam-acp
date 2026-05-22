@@ -30,7 +30,7 @@ Users can branch off "what-if" tangents or ask side-questions in Discord threads
 A `/sessions` or `/manage-sessions` slash command that acts as a powerful, agent-specific session manager. It would allow users to visually browse, manage, and recover recent sessions directly from Discord.
 
 **Proposed Functionality:**
-1. **Load & Summarize:** Query the underlying agent's session store. To avoid latency and API costs, use **heuristics by default**: extract the first few and last few messages (truncated to a single line each) alongside the session's start timestamp and last activity timestamp. This provides an instant, highly readable preview.
+1. **Load & Summarize:** Query the underlying agent's session store. To avoid latency and API costs, use **heuristics by default**: extract the first few messages (e.g., `head -n 2`) and the last few messages (e.g., `tail -n 6`), truncating each to fit on a single line. Present these alongside the session's start timestamp and last activity timestamp. This provides an instant, highly readable preview.
 2. **Interactive UI:** Present the sessions using Discord's `StringSelectMenuBuilder` or interactive buttons. Include a "🪄 Generate AI Summary" action button next to a session to manually request a deep LLM summary if the heuristic preview isn't descriptive enough.
 3. **Actions:**
    - **Attach:** Hot-swap the current Discord channel's session with a selected historical session.

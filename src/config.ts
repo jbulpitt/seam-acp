@@ -423,17 +423,17 @@ function loadChannelPresets(file: string | undefined): Map<string, ChannelPreset
 }
 
 export const REMOTE_MAC_MODELS = [
-  { modelId: "claude-opus-4-6", name: "Claude Opus 4.6" },
-  { modelId: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
-  { modelId: "gpt-5-2-codex", name: "GPT-5.2-Codex" },
-  { modelId: "gpt-5-3-codex", name: "GPT-5.3-Codex" },
-  { modelId: "gpt-5-4", name: "GPT-5.4" },
+  { modelId: "claude-opus-4.6", name: "Claude Opus 4.6" },
+  { modelId: "claude-sonnet-4.6", name: "Claude Sonnet 4.6" },
+  { modelId: "gpt-5.2-codex", name: "GPT-5.2-Codex" },
+  { modelId: "gpt-5.3-codex", name: "GPT-5.3-Codex" },
+  { modelId: "gpt-5.4", name: "GPT-5.4" },
   { modelId: "gpt-5-mini", name: "GPT-5 mini" },
-  { modelId: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
-  { modelId: "claude-opus-4-5", name: "Claude Opus 4.5" },
-  { modelId: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
-  { modelId: "gemini-2-5-pro", name: "Gemini 2.5 Pro" },
-  { modelId: "gpt-5-2", name: "GPT-5.2" },
-  { modelId: "gpt-3-5-turbo-0613", name: "GPT 3.5 Turbo" },
-  { modelId: "gpt-3-5-turbo", name: "GPT 3.5 Turbo" }
+  { modelId: "claude-sonnet-4.5", name: "Claude Sonnet 4.5" },
+  { modelId: "claude-opus-4.5", name: "Claude Opus 4.5" },
+  { modelId: "claude-haiku-4.5", name: "Claude Haiku 4.5" },
+  { modelId: "gemini-2.5-pro", name: "Gemini 2.5 Pro" },
+  { modelId: "gpt-5.2", name: "GPT-5.2" },
+  { modelId: "gpt-3.5-turbo-0613", name: "GPT 3.5 Turbo" },
+  { modelId: "gpt-3.5-turbo", name: "GPT 3.5 Turbo" }
 ];

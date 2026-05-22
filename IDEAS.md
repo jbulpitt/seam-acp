@@ -24,24 +24,4 @@ Users can branch off "what-if" tangents or ask side-questions in Discord threads
 
 ---
 
-## 2. Session Manager (Agent-Specific Slash Command)
-
-**Concept:**
-A `/sessions` or `/manage-sessions` slash command that acts as a powerful, agent-specific session manager. It would allow users to visually browse, manage, and recover recent sessions directly from Discord.
-
-1. **Load & Summarize:** Query the underlying agent's session store. To avoid latency and API costs, use **heuristics by default**: extract the first few messages (e.g., `head -n 2`) and the last few messages (e.g., `tail -n 6`). Prefix these lines with 👤 for human input and 🤖 for agent output to provide a readable preview alongside timestamps.
-2. **Interactive UI Flow:** Because Discord dropdown descriptions are limited to 100 characters, we avoid dropdowns for the summaries. Instead, we use a two-step "Card" flow:
-   - **Step 1: Paginated Preview.** An Embed displays the rich 8-line heuristic summary for a single session. Below it are buttons: `[◀ Prev]` `[Next ▶]` and a prominent `[Manage This Session]` button.
-   - **Step 2: Session Actions Card.** Clicking "Manage" edits the message to show a detailed card for that specific session. The card features an array of action buttons: `[Attach]` `[Clone]` `[Repair]` `[Delete]` `[🪄 AI Summary]`, and a `[⬅ Back to List]` button to return to the paginated view.
-   - **Attach:** Hot-swap the current Discord channel's session with a selected historical session.
-   - **Clone:** Duplicate a historical session into a new session ID for the current channel (similar to the Thread-based context inheritance).
-   - **Recover/Rewind:** If a session is bricked by a bad turn (e.g., "Prompt is too long"), "rewind" it cleanly using a `clone > modify > attach` pipeline. By cloning the file, slicing the last $N$ turns from the clone, and then attaching the fresh clone, we avoid modifying active/locked files entirely!
-   - **Delete:** Permanently purge a session from the agent's history. *(Caveat: If the session file is currently locked by an active agent process, we simply catch the filesystem lock and return a friendly Discord error rather than trying to force-kill processes).*
-
-**Challenges:**
-- Because this relies on modifying the raw history files (or calling specific ACP/Agent endpoints that might not exist yet), the implementation would have to be highly agent-specific (e.g., a Claude Code adapter vs. a Copilot adapter).
-- The bridge would need to safely parse and mutate the agent's proprietary history format (like `messages.json` or an SQLite DB) without corrupting it.
-
----
-
 ## 3. [Add future ideas here...]

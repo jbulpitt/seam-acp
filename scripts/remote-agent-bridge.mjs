@@ -63,8 +63,42 @@ function claudeProjectDir(cwd) {
   return path.join(claudeDir, "projects", slug);
 }
 
+/** Find the actual project directory Claude Code uses for a given cwd.
+ *  Claude's slug is `cwd.replace(/\//g, "-")` but some builds normalise
+ *  dots or trailing slashes differently. Scan all project dirs and return
+ *  the one whose slug best matches. Falls back to the computed slug. */
+async function resolveClaudeProjectDir(cwd) {
+  const computed = claudeProjectDir(cwd);
+  try {
+    await fsp.access(computed);
+    return computed; // fast path: computed slug exists
+  } catch { /* continue to scan */ }
+
+  const projectsRoot = path.join(claudeDir, "projects");
+  let entries;
+  try {
+    entries = await fsp.readdir(projectsRoot);
+  } catch {
+    return computed; // no projects dir at all
+  }
+
+  // Normalise both sides: lowercase, strip dots, collapse repeated dashes.
+  const norm = (s) => s.toLowerCase().replace(/\./g, "").replace(/-+/g, "-");
+  const cwdSlug = norm(cwd.replace(/\//g, "-"));
+  console.error(`[bridge] scanning project dirs for cwd=${cwd} (norm slug: ${cwdSlug})`);
+  console.error(`[bridge] available project dirs: ${entries.join(", ")}`);
+
+  const match = entries.find((e) => norm(e) === cwdSlug);
+  if (match) {
+    console.error(`[bridge] matched project dir: ${match}`);
+    return path.join(projectsRoot, match);
+  }
+  // No match — return computed so the caller logs the right path in the error.
+  return computed;
+}
+
 async function claudeListSessions(cwd) {
-  const projectDir = claudeProjectDir(cwd);
+  const projectDir = await resolveClaudeProjectDir(cwd);
   let files;
   try {
     files = await fsp.readdir(projectDir);
@@ -118,7 +152,7 @@ async function claudeListSessions(cwd) {
 }
 
 async function claudeGetTranscript(cwd, sessionId) {
-  const filePath = path.join(claudeProjectDir(cwd), `${sessionId}.jsonl`);
+  const filePath = path.join(await resolveClaudeProjectDir(cwd), `${sessionId}.jsonl`);
   const content = await fsp.readFile(filePath, "utf8");
   const lines = content.split("\n").filter(l => l.trim());
   const out = [];
@@ -137,7 +171,7 @@ async function claudeGetTranscript(cwd, sessionId) {
 }
 
 async function claudeDeleteSession(cwd, sessionId) {
-  const projectDir = claudeProjectDir(cwd);
+  const projectDir = await resolveClaudeProjectDir(cwd);
   const file = path.join(projectDir, `${sessionId}.jsonl`);
   await fsp.unlink(file).catch(() => {});
   const subDir = path.join(projectDir, sessionId);
@@ -145,7 +179,7 @@ async function claudeDeleteSession(cwd, sessionId) {
 }
 
 async function claudeCompactSession(cwd, sessionId, summaryText) {
-  const projectDir = claudeProjectDir(cwd);
+  const projectDir = await resolveClaudeProjectDir(cwd);
   await fsp.mkdir(projectDir, { recursive: true });
   const newSessionId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const newFile = path.join(projectDir, `${newSessionId}.jsonl`);
@@ -156,7 +190,7 @@ async function claudeCompactSession(cwd, sessionId, summaryText) {
 }
 
 async function claudeCloneSession(cwd, oldSessionId, newSessionId) {
-  const projectDir = claudeProjectDir(cwd);
+  const projectDir = await resolveClaudeProjectDir(cwd);
   const src = path.join(projectDir, `${oldSessionId}.jsonl`);
   const dst = path.join(projectDir, `${newSessionId}.jsonl`);
   await fsp.copyFile(src, dst);

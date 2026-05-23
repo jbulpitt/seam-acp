@@ -132,7 +132,9 @@ function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
       // events so runtimes are evicted and re-initialized on next message.
       if ((msg as any).type === "bridge_hello") {
         const newId = (msg as any).instanceId as string | undefined;
-        if (newId && lastBridgeInstanceId && newId !== lastBridgeInstanceId) {
+        const isNewInstance = !!(newId && lastBridgeInstanceId && newId !== lastBridgeInstanceId);
+
+        if (isNewInstance) {
           for (const [slot, entry] of slots) {
             if (!entry.killed) {
               // Tell the new bridge process to kill any agent it spawned for
@@ -146,6 +148,27 @@ function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
           slots.clear();
         }
         lastBridgeInstanceId = newId;
+
+        // For same-instance reconnects (WS drop/reconnect without bridge restart),
+        // probe which slots are still live. Any seam-acp slot the bridge no longer
+        // knows about had its turn complete (or was lost) while the WS was down —
+        // evict it immediately so the turn fails fast rather than waiting for the
+        // turn timeout.
+        if (!isNewInstance && slots.size > 0) {
+          void sendCmd("listSlots", {}).then((reply: { slots: number[] }) => {
+            const liveOnBridge = new Set<number>(reply.slots);
+            for (const [slot, entry] of [...slots]) {
+              if (!entry.killed && !liveOnBridge.has(slot)) {
+                send({ slot, type: "kill" });
+                entry.killed = true;
+                entry.stdout.push(null);
+                entry.fake.emit("exit", 1, null);
+                slots.delete(slot);
+              }
+            }
+          }).catch(() => { /* bridge may not support listSlots — ignore */ });
+        }
+
         return;
       }
 

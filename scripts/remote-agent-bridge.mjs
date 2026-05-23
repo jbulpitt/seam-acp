@@ -571,6 +571,10 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
           `UPDATE sessions SET updated_at = ${escapeSql(nowIso)} WHERE id = ${escapeSql(payload.sessionId)}`
         );
         result = null;
+      } else if (action === "listSlots") {
+        // Returns the slot IDs of currently-active agent processes so the
+        // seam-acp side can detect and evict stale slots on reconnect.
+        result = { slots: [...slots.keys()] };
       } else {
         throw new Error(`Unknown action: ${action}`);
       }

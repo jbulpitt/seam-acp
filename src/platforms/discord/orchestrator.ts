@@ -432,6 +432,15 @@ export class Orchestrator {
       return (e as any)?.code === 400;
     };
 
+    // ACP connection dropped mid-turn — typically the remote bridge restarted or
+    // the underlying WS dropped after the agent had already finished its response.
+    // Different from session-gone: the session files are still intact, so we can
+    // invalidate (keeping the session ID) and replay the prompt on reconnect.
+    const isConnectionClosedError = (e: unknown): boolean => {
+      const msg = e instanceof Error ? e.message : String(e);
+      return msg.includes("ACP connection closed");
+    };
+
     try {
       let activeRuntime = await this.router.getOrStartRuntime(record);
       const eventHandler = async (event: Parameters<Parameters<typeof activeRuntime.onEvent>[0]>[0]) => {
@@ -643,9 +652,12 @@ export class Orchestrator {
       turnStartedAt = Date.now();
       const timeoutMs = this.config.TURN_TIMEOUT_SECONDS * 1000;
 
-      // One transparent retry if the agent has lost the session (e.g. bridge
-      // restarted). Session-gone fires immediately before any output, so
-      // textBuffer/fenceStream are still clean and the retry is invisible.
+      // One transparent retry on transient failures. Both cases fire before any
+      // output is buffered so the retry is invisible to the user.
+      //   session-gone: session files are lost; start a fresh session.
+      //   connection-closed: bridge/agent restarted mid-turn but session files
+      //     are intact; keep the session ID so loadSession() resumes context.
+      //     getOrStartRuntime will wait up to 44s for the bridge to reconnect.
       let result: PromptOutcome | "timeout";
       try {
         result = await raceWithTimeout(activeRuntime.prompt(msg.text, msg.attachments), timeoutMs);
@@ -653,6 +665,12 @@ export class Orchestrator {
         if (isSessionGoneError(promptErr)) {
           this.logger.warn({ session: record.id }, "session-gone on prompt; invalidating and retrying with new session");
           await this.router.invalidate(record.id, { clearAcpSession: true });
+          activeRuntime = await this.router.getOrStartRuntime(record);
+          activeRuntime.onEvent(eventHandler);
+          result = await raceWithTimeout(activeRuntime.prompt(msg.text, msg.attachments), timeoutMs);
+        } else if (isConnectionClosedError(promptErr)) {
+          this.logger.warn({ session: record.id }, "connection closed mid-turn; waiting for reconnect and retrying");
+          await this.router.invalidate(record.id, { clearAcpSession: false });
           activeRuntime = await this.router.getOrStartRuntime(record);
           activeRuntime.onEvent(eventHandler);
           result = await raceWithTimeout(activeRuntime.prompt(msg.text, msg.attachments), timeoutMs);

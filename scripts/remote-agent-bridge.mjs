@@ -174,6 +174,8 @@ function muxSend(ws, WebSocket, slot, type, payload) {
 function makeSlotManager(copilotCmd, localCwd, WebSocket) {
   let currentWs = null;
   const slots = new Map(); // slot -> ChildProcess
+  let draining = false;
+  const lastStdoutAt = new Map(); // slot -> timestamp
 
   function setWs(ws) {
     currentWs = ws;
@@ -188,12 +190,17 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
 
   function getOrSpawnSlot(slot) {
     if (slots.has(slot)) return slots.get(slot);
+    if (draining) {
+      console.error(`[bridge] Slot ${slot}: drain mode — ignoring new slot spawn`);
+      return null;
+    }
 
     console.error(`[bridge] Slot ${slot}: spawning agent`);
     const agent = spawnAgent(copilotCmd, localCwd);
     slots.set(slot, agent);
 
     agent.stdout.on("data", (chunk) => {
+      lastStdoutAt.set(slot, Date.now());
       muxSend(currentWs, WebSocket, slot, "data", { data: chunk.toString("utf8") });
     });
 
@@ -206,6 +213,7 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
     agent.on("exit", (code, signal) => {
       console.error(`[bridge] Slot ${slot} agent exited (code=${code}, signal=${signal})`);
       slots.delete(slot);
+      lastStdoutAt.delete(slot);
       muxSend(currentWs, WebSocket, slot, "exit", { code: code ?? 1 });
     });
 
@@ -424,12 +432,62 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
     }
   }
 
-  return { setWs, handleMessage };
+  function drain() {
+    if (draining) return;
+    draining = true;
+
+    if (slots.size === 0) {
+      console.error("[bridge] Drain complete (no active slots) — exiting for restart");
+      process.exit(0);
+    }
+
+    console.error(`[bridge] Drain mode entered — waiting for ${slots.size} active slot(s) to go idle`);
+
+    const IDLE_SILENCE_MS = 10_000;
+    const POLL_INTERVAL_MS = 2_000;
+    const HARD_TIMEOUT_MS = 5 * 60 * 1_000;
+    const deadline = Date.now() + HARD_TIMEOUT_MS;
+
+    const timer = setInterval(() => {
+      const now = Date.now();
+      if (now >= deadline) {
+        clearInterval(timer);
+        console.error("[bridge] Drain hard timeout reached — forcing exit for restart");
+        process.exit(0);
+      }
+
+      if (slots.size === 0) {
+        clearInterval(timer);
+        console.error("[bridge] Drain complete — exiting for restart");
+        process.exit(0);
+      }
+
+      const allIdle = [...slots.keys()].every((slot) => {
+        const last = lastStdoutAt.get(slot) ?? 0;
+        return now - last >= IDLE_SILENCE_MS;
+      });
+
+      if (allIdle) {
+        clearInterval(timer);
+        console.error("[bridge] Drain complete — exiting for restart");
+        process.exit(0);
+      }
+
+      const remaining = [...slots.keys()].filter((slot) => {
+        const last = lastStdoutAt.get(slot) ?? 0;
+        return now - last < IDLE_SILENCE_MS;
+      });
+      console.error(`[bridge] Draining — ${remaining.length} slot(s) still active`);
+    }, POLL_INTERVAL_MS);
+  }
+
+  return { setWs, handleMessage, drain };
 }
 
 async function runClientMode(wsUrl, token, copilotCmd, localCwd) {
   const { WebSocket } = await loadWs();
   const mgr = makeSlotManager(copilotCmd, localCwd, WebSocket);
+  activeMgr = mgr;
 
   function connect() {
     console.error(`[bridge] Connecting to ${wsUrl} ...`);
@@ -472,6 +530,7 @@ async function runClientMode(wsUrl, token, copilotCmd, localCwd) {
 async function runServerMode(port, token, copilotCmd, localCwd) {
   const { WebSocket, WebSocketServer } = await loadWs();
   const mgr = makeSlotManager(copilotCmd, localCwd, WebSocket);
+  activeMgr = mgr;
 
   const wss = new WebSocketServer({ port });
 
@@ -561,6 +620,19 @@ async function resolveUrlFromGist(ownerAndId) {
   console.error(`[bridge] Resolved tunnel URL: ${url}`);
   return url;
 }
+
+// Set by runClientMode / runServerMode so the signal handler can reach the mgr.
+let activeMgr = null;
+
+process.on("SIGUSR2", () => {
+  console.error("[bridge] SIGUSR2 received — entering drain mode");
+  if (activeMgr) {
+    activeMgr.drain();
+  } else {
+    console.error("[bridge] No active slot manager — exiting immediately");
+    process.exit(0);
+  }
+});
 
 if (rawArgs[0] === "--server") {
   const port = Number(rawArgs[1]);

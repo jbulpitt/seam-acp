@@ -1112,10 +1112,11 @@ export class Orchestrator {
       await i.reply({ content: "No active turn.", flags: MessageFlags.Ephemeral });
       return;
     }
-    // Cleanly cancel the active turn without destroying the subprocess.
-    // The running prompt will gracefully reject and the queue will advance.
-    await this.router.abortTurn(record.id);
-    await i.reply({ content: "Active turn cancelled.", flags: MessageFlags.Ephemeral });
+    // Hard-kill the subprocess so the turn stops immediately and reliably,
+    // including for remote agents that don't honour soft cancel. Preserve
+    // the acpSessionId so the next message can resume the session.
+    await this.router.invalidate(record.id, { clearAcpSession: false });
+    await i.reply({ content: "Active turn aborted.", flags: MessageFlags.Ephemeral });
   }
 
   private async cmdReset(i: ChatInputCommandInteraction): Promise<void> {

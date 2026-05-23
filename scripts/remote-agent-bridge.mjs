@@ -727,7 +727,7 @@ const gistArg = extractFlag("--gist");
 const sessionTypeArg = extractFlag("--session-type"); // "copilot" (default) or "claude"
 
 let localCwd = cwdArg ? cwdArg.replace(/^~/, homedir()) : process.cwd();
-const sessionType = sessionTypeArg ?? "copilot";
+const sessionType = sessionTypeArg ?? "claude";
 
 console.error(`[bridge] Local cwd: ${localCwd}`);
 

@@ -52,6 +52,116 @@ const copilotDir = path.join(homedir(), ".copilot");
 const dbPath = path.join(copilotDir, "session-store.db");
 const sessionStateDir = path.join(copilotDir, "session-state");
 
+// ---------------------------------------------------------------------------
+// Claude Code session helpers (used when --session-type claude)
+// Claude stores sessions as ~/.claude/projects/<cwd-slug>/<sessionId>.jsonl
+// ---------------------------------------------------------------------------
+const claudeDir = path.join(homedir(), ".claude");
+
+function claudeProjectDir(cwd) {
+  const slug = cwd.replace(/\//g, "-");
+  return path.join(claudeDir, "projects", slug);
+}
+
+async function claudeListSessions(cwd) {
+  const projectDir = claudeProjectDir(cwd);
+  let files;
+  try {
+    files = await fsp.readdir(projectDir);
+  } catch {
+    console.error(`[bridge] claudeListSessions: project dir not found: ${projectDir}`);
+    return [];
+  }
+  const summaries = [];
+  for (const file of files) {
+    if (!file.endsWith(".jsonl")) continue;
+    const sessionId = file.slice(0, -6);
+    const filePath = path.join(projectDir, file);
+    try {
+      const stat = await fsp.stat(filePath);
+      let createdAt = stat.birthtimeMs;
+      let lastActivityAt = stat.mtimeMs;
+      const content = await fsp.readFile(filePath, "utf8");
+      const lines = content.split("\n").filter(l => l.trim());
+      const allMessages = [];
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line);
+          if (entry.isMeta === true || entry.isSidechain === true) continue;
+          let text = "";
+          const msgContent = entry.message?.content;
+          if (typeof msgContent === "string") {
+            text = msgContent;
+          } else if (Array.isArray(msgContent)) {
+            text = msgContent.filter(c => c.type === "text").map(c => c.text || "").join("\n");
+          }
+          const ts = entry.timestamp ? Date.parse(entry.timestamp) : undefined;
+          if (ts && !isNaN(ts)) {
+            if (allMessages.length === 0) createdAt = ts;
+            lastActivityAt = ts;
+          }
+          if (text.trim()) {
+            allMessages.push({ sender: entry.type === "user" ? "human" : "agent", text: text.trim() });
+          }
+        } catch { /* skip malformed line */ }
+      }
+      let previewLines = allMessages.length <= 16
+        ? allMessages
+        : [...allMessages.slice(0, 6), ...allMessages.slice(-10)];
+      const estimatedTokens = Math.ceil(allMessages.map(m => m.text).join("\n\n").length / 4);
+      summaries.push({ sessionId, createdAt, lastActivityAt, previewLines, estimatedTokens });
+    } catch { /* skip unreadable file */ }
+  }
+  summaries.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
+  console.error(`[bridge] claudeListSessions: found ${summaries.length} session(s)`);
+  return summaries;
+}
+
+async function claudeGetTranscript(cwd, sessionId) {
+  const filePath = path.join(claudeProjectDir(cwd), `${sessionId}.jsonl`);
+  const content = await fsp.readFile(filePath, "utf8");
+  const lines = content.split("\n").filter(l => l.trim());
+  const out = [];
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      if (entry.isMeta === true || entry.isSidechain === true) continue;
+      let text = "";
+      const msgContent = entry.message?.content;
+      if (typeof msgContent === "string") text = msgContent;
+      else if (Array.isArray(msgContent)) text = msgContent.filter(c => c.type === "text").map(c => c.text || "").join("\n");
+      if (text.trim()) out.push(`### ${entry.type === "user" ? "User" : "Assistant"}\n${text.trim()}`);
+    } catch { /* skip */ }
+  }
+  return out.join("\n\n");
+}
+
+async function claudeDeleteSession(cwd, sessionId) {
+  const projectDir = claudeProjectDir(cwd);
+  const file = path.join(projectDir, `${sessionId}.jsonl`);
+  await fsp.unlink(file).catch(() => {});
+  const subDir = path.join(projectDir, sessionId);
+  await fsp.rm(subDir, { recursive: true, force: true }).catch(() => {});
+}
+
+async function claudeCompactSession(cwd, sessionId, summaryText) {
+  const projectDir = claudeProjectDir(cwd);
+  await fsp.mkdir(projectDir, { recursive: true });
+  const newSessionId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const newFile = path.join(projectDir, `${newSessionId}.jsonl`);
+  const now = new Date().toISOString();
+  const summaryEntry = { type: "user", message: { role: "user", content: summaryText }, timestamp: now, sessionId: newSessionId, isMeta: false };
+  await fsp.writeFile(newFile, JSON.stringify(summaryEntry) + "\n");
+  return newSessionId;
+}
+
+async function claudeCloneSession(cwd, oldSessionId, newSessionId) {
+  const projectDir = claudeProjectDir(cwd);
+  const src = path.join(projectDir, `${oldSessionId}.jsonl`);
+  const dst = path.join(projectDir, `${newSessionId}.jsonl`);
+  await fsp.copyFile(src, dst);
+}
+
 function escapeSql(val) {
   if (val === null || val === undefined) return "NULL";
   if (typeof val === "number") return String(val);
@@ -235,9 +345,29 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
     const payload = msg.payload && msg.payload.cwd
       ? { ...msg.payload, cwd: localCwd }
       : msg.payload;
-    console.error(`[bridge] cmd: ${action} (cmdId=${cmdId})`);
+    console.error(`[bridge] cmd: ${action} (cmdId=${cmdId}, session-type=${sessionType})`);
     try {
       let result;
+      // Route to Claude Code session handlers when --session-type claude is set.
+      if (sessionType === "claude") {
+        if (action === "listSessions") {
+          result = await claudeListSessions(payload.cwd);
+        } else if (action === "getTranscript") {
+          result = await claudeGetTranscript(payload.cwd, payload.sessionId);
+        } else if (action === "deleteSession") {
+          await claudeDeleteSession(payload.cwd, payload.sessionId);
+          result = null;
+        } else if (action === "cloneSession") {
+          await claudeCloneSession(payload.cwd, payload.oldSessionId, payload.newSessionId);
+          result = null;
+        } else if (action === "compactSession") {
+          result = await claudeCompactSession(payload.cwd, payload.sessionId, payload.summary);
+        } else {
+          throw new Error(`Unknown action: ${action}`);
+        }
+        wsSend({ type: "cmd_reply", cmdId, payload: result });
+        return;
+      }
       if (action === "listSessions") {
         try {
           await fsp.access(dbPath);
@@ -594,8 +724,10 @@ function extractFlag(flag) {
 // Extract all named flags before touching positional args.
 const cwdArg = extractFlag("--cwd");
 const gistArg = extractFlag("--gist");
+const sessionTypeArg = extractFlag("--session-type"); // "copilot" (default) or "claude"
 
 let localCwd = cwdArg ? cwdArg.replace(/^~/, homedir()) : process.cwd();
+const sessionType = sessionTypeArg ?? "copilot";
 
 console.error(`[bridge] Local cwd: ${localCwd}`);
 

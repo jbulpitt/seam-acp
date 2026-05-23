@@ -208,7 +208,14 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
   }
 
   async function handleCmd(msg) {
-    const { cmdId, action, payload } = msg;
+    const { cmdId, action } = msg;
+    // Rewrite the cwd in session-management payloads to the local path, the
+    // same way rewriteCwdInChunk handles it for ACP messages. Without this,
+    // listSessions/compactSession/etc. send the seam-acp host's path which
+    // never matches rows stored under the remote machine's localCwd.
+    const payload = msg.payload && msg.payload.cwd
+      ? { ...msg.payload, cwd: localCwd }
+      : msg.payload;
     try {
       let result;
       if (action === "listSessions") {

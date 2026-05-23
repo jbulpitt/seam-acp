@@ -101,6 +101,10 @@ function execSql(dbPath, sql) {
 /** Milliseconds to wait before reconnecting after a disconnect (client mode). */
 const RECONNECT_DELAY_MS = 5_000;
 
+// Unique ID for this bridge process lifetime. Sent to seam-acp on every WS
+// connect so it can detect a bridge restart and evict stale runtimes.
+const BRIDGE_INSTANCE_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+
 /** Interval for sending WS ping frames to keep the tunnel/proxy alive. */
 const KEEPALIVE_PING_MS = 25_000;
 
@@ -173,6 +177,13 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
 
   function setWs(ws) {
     currentWs = ws;
+    if (ws) {
+      // Announce our instance ID immediately. seam-acp uses this to detect a
+      // bridge restart and evict its stale runtimes before sending new traffic.
+      try {
+        ws.send(JSON.stringify({ type: "bridge_hello", instanceId: BRIDGE_INSTANCE_ID }));
+      } catch { /* ws may not be open yet — best effort */ }
+    }
   }
 
   function getOrSpawnSlot(slot) {

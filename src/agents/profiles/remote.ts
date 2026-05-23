@@ -78,6 +78,7 @@ function remoteDisplayName(id: string): string {
  */
 function makeMux(opts: { id: string }) {
   let bridgeWs: WebSocket | null = null;
+  let lastBridgeInstanceId: string | undefined;
   let nextSlot = 0;
   const slots = new Map<number, SlotEntry>();
   /** Timeout handles for spawn() calls waiting for the bridge to come online. */
@@ -120,6 +121,25 @@ function makeMux(opts: { id: string }) {
       try {
         msg = JSON.parse(raw.toString()) as MuxMsg;
       } catch {
+        return;
+      }
+
+      // Bridge announces its instance ID on every connect. If it changed, the
+      // bridge process restarted and all its agent slots are gone — emit exit
+      // events so runtimes are evicted and re-initialized on next message.
+      if ((msg as any).type === "bridge_hello") {
+        const newId = (msg as any).instanceId as string | undefined;
+        if (newId && lastBridgeInstanceId && newId !== lastBridgeInstanceId) {
+          for (const [, entry] of slots) {
+            if (!entry.killed) {
+              entry.killed = true;
+              entry.stdout.push(null);
+              entry.fake.emit("exit", 1, null);
+            }
+          }
+          slots.clear();
+        }
+        lastBridgeInstanceId = newId;
         return;
       }
 

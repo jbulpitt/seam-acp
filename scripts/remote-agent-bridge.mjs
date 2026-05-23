@@ -235,19 +235,25 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
     const payload = msg.payload && msg.payload.cwd
       ? { ...msg.payload, cwd: localCwd }
       : msg.payload;
+    console.error(`[bridge] cmd: ${action} (cmdId=${cmdId})`);
     try {
       let result;
       if (action === "listSessions") {
         try {
           await fsp.access(dbPath);
         } catch {
+          console.error(`[bridge] listSessions: DB not found at ${dbPath}`);
           wsSend({ type: "cmd_reply", cmdId, payload: [] });
           return;
         }
+        // Match sessions by cwd OR by sessions with no cwd (created before the
+        // cwd-rewrite fix). The latter covers existing sessions on the remote
+        // machine that the Copilot CLI stored without a cwd value.
         const sessions = execSql(
           dbPath,
-          `SELECT * FROM sessions WHERE cwd = ${escapeSql(payload.cwd)} ORDER BY updated_at DESC`
+          `SELECT * FROM sessions WHERE cwd = ${escapeSql(payload.cwd)} OR cwd IS NULL OR cwd = '' ORDER BY updated_at DESC LIMIT 50`
         );
+        console.error(`[bridge] listSessions: found ${sessions.length} session(s) for cwd=${payload.cwd}`);
         const summaries = [];
         for (const sess of sessions) {
           const sessionId = sess.id;

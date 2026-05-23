@@ -430,9 +430,12 @@ export class AgentRuntime {
   async dispose(): Promise<void> {
     if (this.sessionId) {
       try {
-        await this.cancel();
-      } catch {
-        /* ignore */
+        await Promise.race([
+          this.cancel(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("cancel timeout")), 2000))
+        ]);
+      } catch (err) {
+        this.logger.warn({ err }, "cancel during dispose timed out or failed");
       }
     }
     const child = this.child;
@@ -442,21 +445,45 @@ export class AgentRuntime {
       } catch {
         /* ignore */
       }
+      const exitPromise = new Promise((resolve) => {
+        child.once("exit", resolve);
+        child.once("error", resolve);
+      });
+
       if (child.pid && (child as any).detached) {
         try {
-          process.kill(-child.pid, "SIGKILL");
+          process.kill(-child.pid, "SIGTERM");
         } catch {
           try {
-            child.kill("SIGKILL");
+            child.kill("SIGTERM");
           } catch {
             /* ignore */
           }
         }
       } else {
         try {
-          child.kill("SIGKILL");
+          child.kill("SIGTERM");
         } catch {
           /* ignore */
+        }
+      }
+
+      // Wait up to 3 seconds for graceful exit
+      await Promise.race([
+        exitPromise,
+        new Promise((resolve) => setTimeout(resolve, 3000))
+      ]);
+
+      // Force kill if still alive
+      if (child.exitCode === null && child.signalCode === null) {
+        if (child.pid && (child as any).detached) {
+          try {
+            process.kill(-child.pid, "SIGKILL");
+          } catch { /* ignore */ }
+        } else {
+          try {
+            child.kill("SIGKILL");
+          } catch { /* ignore */ }
         }
       }
     }

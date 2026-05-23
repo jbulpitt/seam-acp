@@ -159,7 +159,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .addStringOption((o) =>
         o
           .setName("id")
-          .setDescription("Agent id (e.g. copilot, gemini)")
+          .setDescription("Agent id (e.g. copilot, claude)")
           .setRequired(false)
       )
   );

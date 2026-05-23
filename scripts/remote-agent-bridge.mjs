@@ -351,8 +351,14 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
         }
         result = transcriptLines.join("\n\n");
       } else if (action === "compactSession") {
-        execSql(dbPath, `DELETE FROM turns WHERE session_id = ${escapeSql(payload.sessionId)}`);
         const nowIso = new Date().toISOString();
+        execSql(
+          dbPath,
+          `INSERT INTO sessions (id, cwd, updated_at) 
+           VALUES (${escapeSql(payload.sessionId)}, ${escapeSql(payload.cwd)}, ${escapeSql(nowIso)}) 
+           ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at`
+        );
+        execSql(dbPath, `DELETE FROM turns WHERE session_id = ${escapeSql(payload.sessionId)}`);
         execSql(
           dbPath,
           `INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp)

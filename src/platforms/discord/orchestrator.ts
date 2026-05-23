@@ -54,6 +54,7 @@ export class Orchestrator {
   private activeTurns = 0;
   private restartPending = false;
   private readonly channelQueues = new Map<string, Promise<void>>();
+  private readonly channelGenerations = new Map<string, number>();
 
   constructor(opts: {
     logger: Logger;
@@ -134,6 +135,12 @@ export class Orchestrator {
       });
     }
 
+    // Give agents 2 seconds to flush their SQLite DBs and transcripts after the
+    // final JSON-RPC prompt() response is returned. Without this, the instant 
+    // SIGTERM during shutdown can interrupt the final background DB commit.
+    this.logger.info("turns drained; waiting 2s for background I/O to flush");
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
     this.logger.info("all turns drained, executing restart");
     try {
       await fsp.unlink(this.sentinelPath());
@@ -155,9 +162,29 @@ export class Orchestrator {
 
   private async handleIncomingMessage(msg: IncomingMessage): Promise<void> {
     const channelId = msg.channel.id;
+
+    // Bump the generation so any previously-queued (but not-yet-started) tasks
+    // for this channel know they've been superseded and should skip themselves.
+    const myGen = (this.channelGenerations.get(channelId) ?? 0) + 1;
+    this.channelGenerations.set(channelId, myGen);
+
+    if (this.channelQueues.has(channelId)) {
+      const channel = msg.channel;
+      const record = this.router.ensureSessionRecord({
+        platform: channel.platform,
+        channelRef: channel.id,
+        ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+        cwd: this.config.REPOS_ROOT,
+      });
+      this.logger.info({ channelId, sessionId: record.id }, "new message arrived while turn active; cleanly aborting running turn");
+      await this.router.abortTurn(record.id);
+    }
+
     const existingQueue = this.channelQueues.get(channelId) ?? Promise.resolve();
 
     const newQueue = existingQueue.then(async () => {
+      // A newer message arrived after us — skip this turn entirely.
+      if ((this.channelGenerations.get(channelId) ?? 0) > myGen) return;
       this.activeTurns++;
       try {
         await this.handleIncomingMessageInner(msg);
@@ -1085,10 +1112,10 @@ export class Orchestrator {
       await i.reply({ content: "No active turn.", flags: MessageFlags.Ephemeral });
       return;
     }
-    // Hard-invalidate the active session to force-kill the subprocess
-    // and immediately free the message queue.
-    await this.router.invalidate(record.id);
-    await i.reply({ content: "Active turn aborted. Subprocess terminated.", flags: MessageFlags.Ephemeral });
+    // Cleanly cancel the active turn without destroying the subprocess.
+    // The running prompt will gracefully reject and the queue will advance.
+    await this.router.abortTurn(record.id);
+    await i.reply({ content: "Active turn cancelled.", flags: MessageFlags.Ephemeral });
   }
 
   private async cmdReset(i: ChatInputCommandInteraction): Promise<void> {
@@ -1297,10 +1324,7 @@ export class Orchestrator {
     }
 
     if (sessions.length === 0) {
-      await i.editReply({
-        content: `No sessions found for agent \`${record.agentId}\` in workspace \`${this.repoDisplay(cwd)}\`.`,
-      });
-      return;
+      // Empty state logic handled inside makeSessionMessageOptions instead of returning early
     }
 
     let currentIndex = 0;
@@ -1314,6 +1338,31 @@ export class Orchestrator {
     };
 
     const makeSessionMessageOptions = (idx: number, list: SessionSummary[], activeId: string, mgr: ISessionManager) => {
+      const isOrphaned = !list.some((s) => s.sessionId === activeId);
+
+      if (list.length === 0) {
+        const embed = new EmbedBuilder()
+          .setTitle(`Browse & Manage Sessions — ${profile.displayName}`)
+          .setDescription(
+            `⚠️ **Warning:** The current Discord thread is completely disconnected from any known backend session.\n\n` +
+            `*There are no sessions in the database for this workspace.*`
+          )
+          .setColor(0xe74c3c);
+
+        const rebuildBtn = new ButtonBuilder()
+          .setCustomId("sessions:rebuild")
+          .setLabel("🏗️ Rebuild from Thread")
+          .setStyle(ButtonStyle.Primary);
+
+        const row = new ActionRowBuilder<ButtonBuilder>().addComponents(rebuildBtn);
+
+        return {
+          content: "",
+          embeds: [embed],
+          components: [row],
+        };
+      }
+
       const session = list[idx];
       if (!session) return { content: "No sessions found.", embeds: [], components: [] };
 
@@ -1325,6 +1374,7 @@ export class Orchestrator {
       const embed = new EmbedBuilder()
         .setTitle(`Browse & Manage Sessions — ${profile.displayName}`)
         .setDescription(
+          (isOrphaned ? `⚠️ **Warning:** The current Discord thread is completely disconnected from any known backend session.\n\n` : "") +
           `**Session ID:** \`${session.sessionId}\`\n` +
           `**Created:** ${session.createdAt ? `<t:${Math.floor(session.createdAt / 1000)}:f>` : "Unknown"}\n` +
           `**Last Activity:** ${session.lastActivityAt ? `<t:${Math.floor(session.lastActivityAt / 1000)}:R>` : "Unknown"}\n` +
@@ -1332,7 +1382,7 @@ export class Orchestrator {
           `**Preview (Heuristic):**\n` +
           previewText
         )
-        .setColor(activeId === session.sessionId ? 0x2ecc71 : 0x3498db);
+        .setColor(activeId === session.sessionId ? 0x2ecc71 : (isOrphaned ? 0xe74c3c : 0x3498db));
 
       let footerText = `Session ${idx + 1} of ${list.length}`;
       if (session.estimatedTokens !== undefined) {
@@ -1420,6 +1470,13 @@ export class Orchestrator {
             .setStyle(ButtonStyle.Primary)
         );
       }
+
+      const rebuildBtn = new ButtonBuilder()
+        .setCustomId("sessions:rebuild")
+        .setLabel("🏗️ Rebuild from Thread")
+        .setStyle(ButtonStyle.Primary);
+
+      row3Buttons.push(rebuildBtn);
 
       const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(row3Buttons);
 
@@ -1677,6 +1734,165 @@ export class Orchestrator {
             });
           }
         }
+      } else if (customId === "sessions:rebuild") {
+        await btnInteraction.deferUpdate();
+        await btnInteraction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle("🏗️ Rebuilding Session...")
+              .setDescription(`Fetching historical messages from this Discord thread to reconstruct a premium summary...`)
+              .setColor(0xe67e22)
+          ],
+          components: [],
+        });
+
+        void (async () => {
+          let tempRuntime: AgentRuntime | undefined;
+          try {
+            const channelRef = { platform: "discord", id: i.channelId };
+            if (typeof this.adapter.fetchThreadMessages !== "function") {
+              throw new Error("Chat adapter does not support fetching thread messages.");
+            }
+
+            const rawMessages = await this.adapter.fetchThreadMessages(channelRef);
+            if (rawMessages.length === 0) {
+              throw new Error("No messages found in this Discord thread to reconstruct.");
+            }
+
+            const transcript = rawMessages.map(m => `${m.authorIsBot ? "Agent" : "Human"}: ${m.text}`).join("\n");
+
+            let sanitizedTranscript = transcript
+              .split("\n")
+              .map((line) => {
+                if (line.length > 1000) {
+                  return line.substring(0, 1000) + " ... [Line truncated]";
+                }
+                return line;
+              })
+              .join("\n");
+
+            let maxTranscriptLength = 50000;
+            if (record.agentId === "agy") {
+              maxTranscriptLength = 8000;
+            }
+            if (sanitizedTranscript.length > maxTranscriptLength) {
+              const keepHead = Math.floor(maxTranscriptLength * 0.3);
+              const keepTail = Math.floor(maxTranscriptLength * 0.6);
+              sanitizedTranscript =
+                sanitizedTranscript.substring(0, keepHead) +
+                "\n\n... [Transcript truncated due to length limits] ...\n\n" +
+                sanitizedTranscript.substring(sanitizedTranscript.length - keepTail);
+            }
+
+            let compactionModel = "";
+            if (record.agentId === "agy") {
+              compactionModel = "gemini-pro-agent";
+            } else if (record.agentId === "claude" || record.agentId.startsWith("claude-")) {
+              compactionModel = "sonnet";
+            } else if (record.agentId === "copilot" || record.agentId.startsWith("copilot-") || record.agentId === "remote") {
+              compactionModel = "claude-sonnet-4.6";
+            } else {
+              throw new Error(`Rebuild is not supported for agent profile \`${record.agentId}\``);
+            }
+
+            const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+            const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
+
+            tempRuntime = new AgentRuntime({
+              profile,
+              logger: this.logger.child({ session: `temp-rebuild-${i.channelId}` }),
+              mcpServers: [],
+            });
+
+            await tempRuntime.start();
+
+            await tempRuntime.newSession({
+              cwd,
+              model: compactionModel,
+              meta: { reasoningEffort: "low" },
+            });
+
+            let summaryText = "";
+            tempRuntime.onEvent((event) => {
+              if (event.kind === "agent-text") {
+                summaryText += event.text;
+              }
+            });
+
+            const outcome = await tempRuntime.prompt(compactionPrompt);
+
+            if (!summaryText.trim()) {
+              throw new Error("Agent completed but returned an empty summary.");
+            }
+
+            const newSessionId = randomUUID();
+            await manager.compactSession!(cwd, newSessionId, summaryText);
+
+            // Update active session record
+            await this.router.invalidate(record.id);
+            this.store.upsert({
+              ...record,
+              acpSessionId: newSessionId,
+              updatedUtc: new Date().toISOString(),
+            });
+
+            // Update thread name
+            await this.renameThreadForSetup(channelRef, record);
+
+            // Refresh sessions list
+            sessions = await manager.listSessions(cwd);
+            const newIndex = sessions.findIndex(s => s.sessionId === newSessionId);
+            if (newIndex !== -1) {
+              currentIndex = newIndex;
+            }
+
+            const successEmbed = new EmbedBuilder()
+              .setTitle("🏗️ Session Rebuilt Successfully!")
+              .setDescription(`Thread has been reconstructed from Discord history.\n\n**New Session ID:** \`${newSessionId}\`\n\n**Summary:**\n${summaryText.substring(0, 1500)}${summaryText.length > 1500 ? "..." : ""}`)
+              .setColor(0x2ecc71);
+
+            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder()
+                .setCustomId("sessions:summary_back")
+                .setLabel("⬅ Back to Manage")
+                .setStyle(ButtonStyle.Secondary)
+            );
+
+            await btnInteraction.editReply({
+              embeds: [successEmbed],
+              components: [row],
+            });
+          } catch (err: any) {
+            this.logger.error({ err, channelId: i.channelId }, "failed to rebuild session");
+
+            const errorEmbed = new EmbedBuilder()
+              .setTitle("❌ Rebuild Failed")
+              .setDescription(`An error occurred while reconstructing the session:\n\`\`\`\n${err.message}\n\`\`\``)
+              .setColor(0xe74c3c);
+
+            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder()
+                .setCustomId("sessions:summary_back")
+                .setLabel("⬅ Back to Manage")
+                .setStyle(ButtonStyle.Secondary)
+            );
+
+            await btnInteraction.editReply({
+              embeds: [errorEmbed],
+              components: [row],
+            });
+          } finally {
+            if (tempRuntime) {
+              const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
+              await tempRuntime.dispose().catch(() => {});
+              if (tempSessionId) {
+                await manager.deleteSession(cwd, tempSessionId).catch((err) => {
+                  this.logger.warn({ err, sessionId: tempSessionId }, "failed to clean up temporary summary session");
+                });
+              }
+            }
+          }
+        })();
       } else if (customId === "sessions:summary") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
@@ -1812,7 +2028,13 @@ export class Orchestrator {
               });
             } finally {
               if (tempRuntime) {
+                const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
                 await tempRuntime.dispose().catch(() => {});
+                if (tempSessionId) {
+                  await manager.deleteSession(cwd, tempSessionId).catch((err) => {
+                    this.logger.warn({ err, sessionId: tempSessionId }, "failed to clean up temporary summary session");
+                  });
+                }
               }
             }
           })();
@@ -1949,7 +2171,13 @@ export class Orchestrator {
               });
             } finally {
               if (tempRuntime) {
+                const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
                 await tempRuntime.dispose().catch(() => {});
+                if (tempSessionId) {
+                  await manager.deleteSession(cwd, tempSessionId).catch((err) => {
+                    this.logger.warn({ err, sessionId: tempSessionId }, "failed to clean up temporary summary session");
+                  });
+                }
               }
             }
           })();
@@ -2166,7 +2394,13 @@ export class Orchestrator {
               });
             } finally {
               if (tempRuntime) {
+                const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
                 await tempRuntime.dispose().catch(() => {});
+                if (tempSessionId) {
+                  await manager.deleteSession(cwd, tempSessionId).catch((err) => {
+                    this.logger.warn({ err, sessionId: tempSessionId }, "failed to clean up temporary summary session");
+                  });
+                }
               }
             }
           })();
@@ -3072,7 +3306,7 @@ export class Orchestrator {
       if (current !== undefined && current !== "seam") return;
     }
     const repoDisplayStr = this.repoDisplay(repoPath);
-    const newName = `${repoDisplayStr} [${abbr}]`;
+    const newName = `${repoDisplayStr} ${abbr}`;
     this.logger.info({ channelId: channel.id, oldName: current, newName }, "Renaming thread");
     try {
       await this.adapter.renameThread(channel, newName);
@@ -3110,12 +3344,12 @@ export class Orchestrator {
       let replaced = false;
 
       for (const abbr of allAbbrs) {
-        const needle = `[${abbr}]`.toLowerCase();
-        let idx = newName.toLowerCase().indexOf(needle);
+        const needle = abbr;
+        let idx = newName.indexOf(needle);
         while (idx !== -1) {
-          newName = newName.substring(0, idx) + `[${targetAbbr}]` + newName.substring(idx + needle.length);
+          newName = newName.substring(0, idx) + targetAbbr + newName.substring(idx + needle.length);
           replaced = true;
-          idx = newName.toLowerCase().indexOf(needle);
+          idx = newName.indexOf(needle);
         }
       }
 

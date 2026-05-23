@@ -360,6 +360,42 @@ export class DiscordAdapter implements ChatAdapter {
     }
   }
 
+  async fetchThreadMessages(channel: ChannelRef): Promise<Array<{ authorIsBot: boolean; text: string }>> {
+    const ch = await this.fetchSendableChannel(channel.id);
+    if (!ch.isThread()) throw new Error("Channel is not a thread.");
+    
+    const messages = [];
+    let lastId: string | undefined;
+    
+    while (true) {
+      const options: { limit: number; before?: string } = { limit: 100 };
+      if (lastId) options.before = lastId;
+      
+      const chunk = await ch.messages.fetch(options);
+      if (chunk.size === 0) break;
+      
+      for (const msg of chunk.values()) {
+        if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) continue;
+        if (!msg.content?.trim() && msg.attachments.size === 0) continue;
+        
+        let text = msg.content ?? "";
+        if (msg.attachments.size > 0) {
+          const names = msg.attachments.map((a: any) => a.name).join(", ");
+          text += ` [Attachments: ${names}]`;
+        }
+        
+        messages.push({
+          authorIsBot: msg.author.bot,
+          text: text.trim(),
+        });
+      }
+      
+      lastId = chunk.last()?.id;
+    }
+    
+    return messages.reverse();
+  }
+
   async sendPanel(
     channel: ChannelRef,
     panel: import("../../core/types.js").StructuredPanel

@@ -86,6 +86,9 @@ export interface ChatAdapter {
   /** Optional: return the current display name of a thread/channel. */
   getThreadName?(channel: ChannelRef): Promise<string | undefined>;
 
+  /** Optional: fetch historical messages for a thread (chronological order). */
+  fetchThreadMessages?(channel: ChannelRef): Promise<Array<{ authorIsBot: boolean; text: string }>>;
+
   /** Optional: send a rich structured panel (embed on Discord). */
   sendPanel?(channel: ChannelRef, panel: StructuredPanel): Promise<MessageRef>;
 

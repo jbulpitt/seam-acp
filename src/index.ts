@@ -5,7 +5,6 @@ import { startHealthServer } from "./lib/health.js";
 import { SessionStore } from "./core/session-store.js";
 import { SessionRouter } from "./core/session-router.js";
 import { makeCopilotProfile } from "./agents/profiles/copilot.js";
-import { makeGeminiProfile } from "./agents/profiles/gemini.js";
 import { makeClaudeProfile } from "./agents/profiles/claude.js";
 import { makeAgyProfile } from "./agents/profiles/agy.js";
 import { makeRemoteCopilotServerProfile, makeRemoteCopilotClientProfile } from "./agents/profiles/remote.js";
@@ -40,7 +39,7 @@ async function main(): Promise<void> {
     ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
     defaultModel: config.DEFAULT_MODEL,
     staticModels: config.COPILOT_MODELS,
-    threadAbbr: "cp-fhr",
+    threadAbbr: "🤖🛢️",
     mcpServers,
   });
 
@@ -52,27 +51,7 @@ async function main(): Promise<void> {
       ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
       defaultModel: config.DEFAULT_MODEL,
       staticModels: config.COPILOT_MODELS,
-      threadAbbr: p.id === "jbulpitt" ? "cp-jb" : `cp-${p.id}`,
-      mcpServers,
-    })
-  );
-
-  const gemini = makeGeminiProfile({
-    ...(config.GEMINI_CLI_PATH ? { cliPath: config.GEMINI_CLI_PATH } : {}),
-    defaultModel: config.GEMINI_DEFAULT_MODEL,
-    staticModels: config.GEMINI_MODELS,
-    threadAbbr: "gg",
-    mcpServers,
-  });
-
-  const extraGeminis = config.GEMINI_PROFILES.map((p) =>
-    makeGeminiProfile({
-      id: `gemini-${p.id}`,
-      displayName: `Google Gemini (${p.id})`,
-      configDir: p.configDir,
-      ...(config.GEMINI_CLI_PATH ? { cliPath: config.GEMINI_CLI_PATH } : {}),
-      defaultModel: config.GEMINI_DEFAULT_MODEL,
-      staticModels: config.GEMINI_MODELS,
+      threadAbbr: p.id === "jbulpitt" ? "🤖 👨‍💻" : "🤖",
       mcpServers,
     })
   );
@@ -81,7 +60,7 @@ async function main(): Promise<void> {
     ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
     defaultModel: config.CLAUDE_DEFAULT_MODEL,
     staticModels: config.CLAUDE_MODELS,
-    threadAbbr: "cc",
+    threadAbbr: "👾",
     maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
     compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
     mcpServers,
@@ -105,7 +84,7 @@ async function main(): Promise<void> {
     ...(config.AGY_CLI_PATH ? { cliPath: config.AGY_CLI_PATH } : {}),
     defaultModel: config.AGY_DEFAULT_MODEL,
     staticModels: config.AGY_MODELS,
-    threadAbbr: "agy",
+    threadAbbr: "🌌",
     dataDir: config.DATA_DIR,
     printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
   });
@@ -118,7 +97,7 @@ async function main(): Promise<void> {
           token: p.token,
           defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
           staticModels: p.id === "mac" ? REMOTE_MAC_MODELS : config.COPILOT_MODELS,
-          threadAbbr: "cp-fs",
+          threadAbbr: "🤖 💳",
         })
       : makeRemoteCopilotClientProfile({
           id: `copilot-remote-${p.id}`,
@@ -126,14 +105,14 @@ async function main(): Promise<void> {
           token: p.token,
           defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
           staticModels: p.id === "mac" ? REMOTE_MAC_MODELS : config.COPILOT_MODELS,
-          threadAbbr: "cp-fs",
+          threadAbbr: "🤖 💳",
         })
   );
 
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, ...extraCopilots, gemini, ...extraGeminis, claude, ...extraClaudes, agy, ...remoteCopilots],
+    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, agy, ...remoteCopilots],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".

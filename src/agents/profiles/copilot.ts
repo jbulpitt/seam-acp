@@ -285,6 +285,12 @@ export function makeCopilotProfile(opts: {
         const db = new Database(dbPath);
         try {
           const runTx = db.transaction(() => {
+            db.prepare(`
+              INSERT INTO sessions (id, cwd, updated_at)
+              VALUES (?, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at
+            `).run(sessionId, cwd, new Date().toISOString());
+
             db.prepare("DELETE FROM turns WHERE session_id = ?").run(sessionId);
             db.prepare(`
               INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp)
@@ -295,10 +301,6 @@ export function makeCopilotProfile(opts: {
               "[Session history compacted due to context limits]",
               summaryText,
               new Date().toISOString()
-            );
-            db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run(
-              new Date().toISOString(),
-              sessionId
             );
           });
           runTx();

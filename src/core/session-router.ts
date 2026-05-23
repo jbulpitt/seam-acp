@@ -166,6 +166,15 @@ export class SessionRouter {
     }
   }
 
+  /** Cleanly abort the active turn for a session without terminating the agent process. */
+  async abortTurn(sessionId: string): Promise<void> {
+    const rt = this.runtimes.get(sessionId);
+    if (rt) {
+      await rt.cancel();
+      this.logger.info({ sessionId }, "sent cancel signal to agent runtime");
+    }
+  }
+
   /** Dispose all runtimes (graceful shutdown). */
   async disposeAll(): Promise<void> {
     const all = Array.from(this.runtimes.values());

@@ -76,7 +76,7 @@ function remoteDisplayName(id: string): string {
  * When the bridge is offline, stdin data is queued and flushed on reconnect.
  * Fake processes survive bridge reconnects transparently.
  */
-function makeMux(opts: { id: string }) {
+function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
   let bridgeWs: WebSocket | null = null;
   let lastBridgeInstanceId: string | undefined;
   let nextSlot = 0;
@@ -107,6 +107,9 @@ function makeMux(opts: { id: string }) {
       bridgeWs.close(1001, "replaced by new bridge connection");
     }
     bridgeWs = newWs;
+
+    // Notify listener that a fresh bridge connection arrived.
+    opts.onBridgeConnect?.();
 
     // All pending spawn() calls can now proceed.
     for (const { timeout } of bridgeWaiters.splice(0)) {
@@ -294,8 +297,9 @@ export function makeRemoteCopilotServerProfile(opts: {
   defaultModel: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
   threadAbbr?: string;
+  onBridgeConnect?: () => void;
 }): AgentProfile {
-  const mux = makeMux({ id: opts.id });
+  const mux = makeMux({ id: opts.id, onBridgeConnect: opts.onBridgeConnect });
   const wss = new WebSocketServer({ port: opts.wsPort });
 
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
@@ -353,8 +357,9 @@ export function makeRemoteCopilotClientProfile(opts: {
   defaultModel: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
   threadAbbr?: string;
+  onBridgeConnect?: () => void;
 }): AgentProfile {
-  const mux = makeMux({ id: opts.id });
+  const mux = makeMux({ id: opts.id, onBridgeConnect: opts.onBridgeConnect });
 
   function connect() {
     const ws = new WebSocket(opts.wsUrl, {

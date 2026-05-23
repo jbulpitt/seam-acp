@@ -89,6 +89,9 @@ async function main(): Promise<void> {
     printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
   });
 
+  // Late-bound so the callback can reference `orchestrator` which isn't created yet.
+  let notifyBridgeConnect: (id: string) => void = () => {};
+
   const remoteCopilots = config.REMOTE_COPILOT_PROFILES.map((p) =>
     p.mode === "server"
       ? makeRemoteCopilotServerProfile({
@@ -98,6 +101,7 @@ async function main(): Promise<void> {
           defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
           staticModels: p.id === "mac" ? REMOTE_MAC_MODELS : config.COPILOT_MODELS,
           threadAbbr: "🤖 💳",
+          onBridgeConnect: () => notifyBridgeConnect(`copilot-remote-${p.id}`),
         })
       : makeRemoteCopilotClientProfile({
           id: `copilot-remote-${p.id}`,
@@ -106,6 +110,7 @@ async function main(): Promise<void> {
           defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
           staticModels: p.id === "mac" ? REMOTE_MAC_MODELS : config.COPILOT_MODELS,
           threadAbbr: "🤖 💳",
+          onBridgeConnect: () => notifyBridgeConnect(`copilot-remote-${p.id}`),
         })
   );
 
@@ -142,6 +147,10 @@ async function main(): Promise<void> {
   });
 
   orchestrator.install();
+
+  // Now that orchestrator exists, wire the bridge-connect notification callback.
+  notifyBridgeConnect = (id) =>
+    void orchestrator.postNotification(`🟢 Remote bridge connected: ${id}`);
 
   // Wire the ask-the-user callback now that both the router and the adapter
   // exist. Router calls this when a session's policy is "ask".

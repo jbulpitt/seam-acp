@@ -733,7 +733,15 @@ export class Orchestrator {
       }
 
       if (result === "timeout") {
-        await activeRuntime.cancel();
+        // Guard against cancel() hanging when the agent connection is broken
+        // (e.g. remote bridge restarted while a turn was in progress). Without
+        // a timeout here, cancel() can await a response that never arrives and
+        // the channel queue stays locked indefinitely.
+        await Promise.race([
+          activeRuntime.cancel(),
+          new Promise<void>((r) => setTimeout(r, 5_000)),
+        ]);
+        await this.router.invalidate(record.id, { clearAcpSession: false });
         status.setState("Timed out");
         status.setAction(`Exceeded ${this.config.TURN_TIMEOUT_SECONDS}s`);
       } else if (result.cancelled) {

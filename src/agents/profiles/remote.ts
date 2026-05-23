@@ -133,8 +133,11 @@ function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
       if ((msg as any).type === "bridge_hello") {
         const newId = (msg as any).instanceId as string | undefined;
         if (newId && lastBridgeInstanceId && newId !== lastBridgeInstanceId) {
-          for (const [, entry] of slots) {
+          for (const [slot, entry] of slots) {
             if (!entry.killed) {
+              // Tell the new bridge process to kill any agent it spawned for
+              // this slot (flushQueues may have already sent stdin to it).
+              send({ slot, type: "kill" });
               entry.killed = true;
               entry.stdout.push(null);
               entry.fake.emit("exit", 1, null);

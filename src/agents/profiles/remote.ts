@@ -14,7 +14,7 @@ import type { ISessionManager } from "../session-manager.js";
  * How long spawn() will wait for a bridge connection before emitting an error
  * (just under AgentRuntime's 45 s START_TIMEOUT_MS so errors are actionable).
  */
-const CONNECT_TIMEOUT_MS = 44_000;
+const CONNECT_TIMEOUT_MS = 10_000;
 
 /** How often to ping the bridge WS to keep tunnels/proxies alive. */
 const ACTIVE_PING_INTERVAL_MS = 25_000;

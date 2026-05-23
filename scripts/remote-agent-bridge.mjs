@@ -82,8 +82,8 @@ async function resolveClaudeProjectDir(cwd) {
     return computed; // no projects dir at all
   }
 
-  // Normalise both sides: lowercase, strip dots, collapse repeated dashes.
-  const norm = (s) => s.toLowerCase().replace(/\./g, "").replace(/-+/g, "-");
+  // Normalise both sides: lowercase, dots→dashes, collapse repeated dashes.
+  const norm = (s) => s.toLowerCase().replace(/\./g, "-").replace(/-+/g, "-");
   const cwdSlug = norm(cwd.replace(/\//g, "-"));
   console.error(`[bridge] scanning project dirs for cwd=${cwd} (norm slug: ${cwdSlug})`);
   console.error(`[bridge] available project dirs: ${entries.join(", ")}`);

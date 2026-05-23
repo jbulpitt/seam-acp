@@ -54,7 +54,8 @@ export type AgentEvent =
   | { kind: "model-changed"; modelId: string }
   | { kind: "config-options"; options: unknown }
   | { kind: "agent-state"; state: string }
-  | { kind: "error"; message: string };
+  | { kind: "error"; message: string }
+  | { kind: "usage-update"; used: number; size: number };
 
 export type AgentEventHandler = (event: AgentEvent) => void | Promise<void>;
 export type PermissionPolicy = (
@@ -585,9 +586,16 @@ export class AgentRuntime {
         await this.emit({ kind: "config-options", options: opts });
         return;
       }
+      case "usage_update": {
+        const u = update as unknown as { used?: number; size?: number };
+        if (typeof u.used === "number" && typeof u.size === "number" && u.size > 0) {
+          await this.emit({ kind: "usage-update", used: u.used, size: u.size });
+        }
+        return;
+      }
       default:
         // user_message_chunk, plan, available_commands_update,
-        // session_info_update, usage_update — currently ignored.
+        // session_info_update — currently ignored.
         return;
     }
   }

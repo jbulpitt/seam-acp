@@ -638,6 +638,14 @@ export class Orchestrator {
             status.setAction(event.state);
             void refresh();
             return;
+          case "usage-update": {
+            const pct = Math.round((event.used / event.size) * 100);
+            const usedK = Math.round(event.used / 1000);
+            const sizeK = Math.round(event.size / 1000);
+            status.usage = `${usedK}k / ${sizeK}k tokens (${pct}%)`;
+            void refresh();
+            return;
+          }
           case "config-options":
           case "error":
             return;

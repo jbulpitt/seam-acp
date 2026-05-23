@@ -1851,16 +1851,16 @@ export class Orchestrator {
               .setDescription(`Thread has been reconstructed from Discord history.\n\n**New Session ID:** \`${newSessionId}\`\n\n**Summary:**\n${summaryText.substring(0, 1500)}${summaryText.length > 1500 ? "..." : ""}`)
               .setColor(0x2ecc71);
 
-            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-              new ButtonBuilder()
-                .setCustomId("sessions:summary_back")
-                .setLabel("⬅ Back to Manage")
-                .setStyle(ButtonStyle.Secondary)
-            );
-
             await btnInteraction.editReply({
               embeds: [successEmbed],
-              components: [row],
+              components: [
+                new ActionRowBuilder<ButtonBuilder>().addComponents(
+                  new ButtonBuilder()
+                    .setCustomId("sessions:close")
+                    .setLabel("Close")
+                    .setStyle(ButtonStyle.Secondary)
+                ),
+              ],
             });
           } catch (err: any) {
             this.logger.error({ err, channelId: i.channelId }, "failed to rebuild session");

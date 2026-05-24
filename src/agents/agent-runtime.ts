@@ -330,6 +330,29 @@ export class AgentRuntime {
       availableModes: this.toAvailableModes(result.modes),
       currentModeId: this.toCurrentModeId(result.modes),
     };
+
+    // Re-apply model preference on resume — Claude Code sessions don't persist
+    // the model choice across subprocess restarts, so it would otherwise revert
+    // to whatever is in settings.json (typically the default model, not the
+    // per-session override the user selected).
+    const wantedModel = opts.model ?? this.profile.defaultModel;
+    if (
+      wantedModel &&
+      this.sessionInfo.currentModelId &&
+      wantedModel !== this.sessionInfo.currentModelId
+    ) {
+      const isExplicit = opts.model !== undefined;
+      const isAvailable = this.sessionInfo.availableModels.some((m) => m.modelId === wantedModel);
+      if (isExplicit || isAvailable) {
+        try {
+          await this.setModel(wantedModel);
+          this.sessionInfo = { ...this.sessionInfo, currentModelId: wantedModel };
+        } catch (err) {
+          this.logger.warn({ err, wantedModel }, "failed to re-apply model on session load");
+        }
+      }
+    }
+
     return this.sessionInfo;
   }
 

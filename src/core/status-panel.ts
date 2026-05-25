@@ -12,8 +12,8 @@ export interface StatusPanelInput {
   repoDisplay: string;
   model: string;
   action: string;
-  /** Optional usage line shown when tokens/multiplier are known. */
-  usage?: string;
+  /** Optional context-window line shown when tokens are known. */
+  context?: string;
   /** Recent activity (oldest → newest). */
   activity?: string[];
   /** Last few lines of model reasoning (oldest → newest). */
@@ -35,7 +35,7 @@ export function renderStatusPanel(
     repoDisplay: input.repoDisplay,
     model: input.model,
     action: input.action,
-    usage: input.usage,
+    context: input.context,
     activity: input.activity,
     thinking: input.thinking,
   };
@@ -53,7 +53,7 @@ export class TurnStatus {
   model: string;
   repoDisplay: string;
   startedUtc: number;
-  usage?: string;
+  context?: string;
   /** Rolling activity log (oldest → newest). Capped to last N entries. */
   activity: string[] = [];
   private static readonly MAX_ACTIVITY = 20;
@@ -155,7 +155,7 @@ export class TurnStatus {
       repoDisplay: this.repoDisplay,
       model: this.model,
       action: this.action,
-      usage: this.usage,
+      context: this.context,
       activity: this.activity.length ? [...this.activity] : undefined,
       ...(thinking ? { thinking } : {}),
     };

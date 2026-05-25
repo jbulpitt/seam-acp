@@ -86,8 +86,8 @@ export const discordRenderer: Renderer = {
       { name: "Model", value: trim(state.model, 40), inline: true },
       { name: "Action", value: trim(state.action, 220), inline: true },
     ];
-    if (state.usage) {
-      fields.push({ name: "Usage", value: trim(state.usage, 80), inline: true });
+    if (state.context) {
+      fields.push({ name: "Context", value: trim(state.context, 80), inline: true });
     }
 
     // --- description: activity as inline code "tags" ---

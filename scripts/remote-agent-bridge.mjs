@@ -196,6 +196,80 @@ async function claudeCloneSession(cwd, oldSessionId, newSessionId) {
   await fsp.copyFile(src, dst);
 }
 
+/** Match the same logic claude-agent-acp uses to decide if a model has a 1M
+ *  context window. The "1m" token appears either as "opus[1m]" or as a
+ *  hyphenated suffix like "claude-opus-4-7-1m" in API model ids. */
+function inferClaudeContextLimit(model) {
+  if (!model) return 200_000;
+  if (/\b1m\b/i.test(model) || /-1m\b/i.test(model)) return 1_000_000;
+  return 200_000;
+}
+
+/** Read the most recent assistant `usage` block from a Claude Code JSONL
+ *  transcript. Returns zeros if no JSONL or no assistant message found. */
+async function claudeGetUsage(cwd, sessionId) {
+  const empty = { model: null, totalUsed: 0, contextLimit: 200_000 };
+  const projectDir = await resolveClaudeProjectDir(cwd);
+  let files;
+  try {
+    files = await fsp.readdir(projectDir);
+  } catch {
+    return empty;
+  }
+
+  let targetPath;
+  if (sessionId) {
+    const file = `${sessionId}.jsonl`;
+    if (files.includes(file)) targetPath = path.join(projectDir, file);
+  }
+  if (!targetPath) {
+    let newest = null;
+    let newestMtime = 0;
+    for (const f of files) {
+      if (!f.endsWith(".jsonl")) continue;
+      try {
+        const stat = await fsp.stat(path.join(projectDir, f));
+        if (stat.mtimeMs > newestMtime) {
+          newest = f;
+          newestMtime = stat.mtimeMs;
+        }
+      } catch { /* skip */ }
+    }
+    if (!newest) return empty;
+    targetPath = path.join(projectDir, newest);
+  }
+
+  let content;
+  try {
+    content = await fsp.readFile(targetPath, "utf8");
+  } catch {
+    return empty;
+  }
+  const lines = content.split("\n").filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(lines[i]);
+      if (entry.type !== "assistant" || !entry.message?.usage) continue;
+      const u = entry.message.usage;
+      const model = entry.message.model ?? null;
+      const inputTokens = u.input_tokens || 0;
+      const cacheRead = u.cache_read_input_tokens || 0;
+      const cacheCreation = u.cache_creation_input_tokens || 0;
+      const outputTokens = u.output_tokens || 0;
+      return {
+        model,
+        input_tokens: inputTokens,
+        cache_read_input_tokens: cacheRead,
+        cache_creation_input_tokens: cacheCreation,
+        output_tokens: outputTokens,
+        totalUsed: inputTokens + cacheRead + cacheCreation + outputTokens,
+        contextLimit: inferClaudeContextLimit(model),
+      };
+    } catch { /* skip malformed line */ }
+  }
+  return empty;
+}
+
 function escapeSql(val) {
   if (val === null || val === undefined) return "NULL";
   if (typeof val === "number") return String(val);
@@ -396,6 +470,8 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
           result = null;
         } else if (action === "compactSession") {
           result = await claudeCompactSession(payload.cwd, payload.sessionId, payload.summary);
+        } else if (action === "getUsage") {
+          result = await claudeGetUsage(payload.cwd, payload.sessionId);
         } else {
           throw new Error(`Unknown action: ${action}`);
         }

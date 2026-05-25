@@ -14,7 +14,7 @@ import type {
   MessageRef,
   SessionRecord,
 } from "../chat-adapter.js";
-import { AgentRuntime, type PromptOutcome } from "../../agents/agent-runtime.js";
+import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
 import { cleanTextForPreview, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "../../agents/session-manager.js";
 import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
@@ -639,10 +639,7 @@ export class Orchestrator {
             void refresh();
             return;
           case "usage-update": {
-            const pct = Math.round((event.used / event.size) * 100);
-            const usedK = Math.round(event.used / 1000);
-            const sizeK = Math.round(event.size / 1000);
-            status.usage = `${usedK}k / ${sizeK}k tokens (${pct}%)`;
+            status.context = formatContextUsage(event.used, event.size);
             void refresh();
             return;
           }
@@ -777,6 +774,40 @@ export class Orchestrator {
         status.setState("Done");
         status.setAction(result.stopReason);
       }
+
+      // Surface context-window usage after the turn. Two paths:
+      //   1. Profiles with a side-channel `getUsage` (e.g. remote bridge that
+      //      reads Claude Code's JSONL transcript) — preferred, no extra prompt.
+      //   2. Copilot CLI fallback — probe its `/context` slash command, which
+      //      the CLI handles client-side (no LLM call).
+      if (result !== "timeout" && !result.cancelled) {
+        const profile = this.router.getProfile(record.agentId);
+        const usageReader = profile?.sessionManager?.getUsage;
+        let sideChannelEmitted = false;
+        if (usageReader) {
+          try {
+            const cwd = record.repoPath ?? process.cwd();
+            const usage = await usageReader.call(
+              profile.sessionManager,
+              cwd,
+              record.acpSessionId || undefined
+            );
+            if (usage && usage.contextLimit > 0 && usage.totalUsed > 0) {
+              await eventHandler({
+                kind: "usage-update",
+                used: usage.totalUsed,
+                size: usage.contextLimit,
+              });
+              sideChannelEmitted = true;
+            }
+          } catch (err) {
+            this.logger.debug({ err }, "getUsage side-channel unavailable");
+          }
+        }
+        if (!sideChannelEmitted && record.agentId.startsWith("copilot")) {
+          await this.probeCopilotContext(activeRuntime, eventHandler, refresh);
+        }
+      }
     } catch (err) {
       this.logger.error({ err, session: record.id }, "turn failed");
       cancelFlushTimer();
@@ -894,6 +925,44 @@ export class Orchestrator {
           content: `Unknown subcommand: ${sub}`,
           flags: MessageFlags.Ephemeral,
         });
+    }
+  }
+
+  private async probeCopilotContext(
+    runtime: AgentRuntime,
+    realHandler: AgentEventHandler,
+    refresh: () => void
+  ): Promise<void> {
+    let captured = "";
+    runtime.onEvent(async (event) => {
+      if (event.kind === "agent-text") {
+        captured += event.text;
+        return;
+      }
+      await realHandler(event);
+    });
+    try {
+      await Promise.race([
+        runtime.prompt("/context"),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("/context probe timed out")), 5_000)
+        ),
+      ]);
+      const m = captured.match(
+        /(\d+(?:\.\d+)?)k\s*\/\s*(\d+(?:\.\d+)?)k\s*tokens/i
+      );
+      if (m) {
+        const used = Math.round(parseFloat(m[1]!) * 1000);
+        const size = Math.round(parseFloat(m[2]!) * 1000);
+        if (size > 0) {
+          await realHandler({ kind: "usage-update", used, size });
+          refresh();
+        }
+      }
+    } catch (err) {
+      this.logger.warn({ err }, "copilot /context probe failed");
+    } finally {
+      runtime.onEvent(realHandler);
     }
   }
 
@@ -3500,6 +3569,16 @@ function usageLine(pct: number | null, label: string): string {
   const bar = pct !== null ? usageBar(pct) : "░░░░░░░░░░░░░░░░░░░░";
   const pctStr = pct !== null ? `${Math.round(pct)}%`.padStart(4) : "  — ";
   return `\`${bar}\`  ${pctStr}  ${label}`;
+}
+
+function formatContextUsage(used: number, size: number): string {
+  const pct = Math.round((used / size) * 100);
+  return `${fmtTokens(used)} / ${fmtTokens(size)} tokens (${pct}%)`;
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${Math.round(n / 1_000_000)}m`;
+  return `${Math.round(n / 1_000)}k`;
 }
 
 function formatAgyUsage(d: import("../../agents/profiles/agy.js").AgyUsage): string {

@@ -88,8 +88,8 @@ export interface StatusPanel {
   model: string;
   action: string;
   elapsedSeconds: number;
-  /** Optional usage line shown when token / multiplier info is known. */
-  usage?: string;
+  /** Optional context-window line shown when token info is known. */
+  context?: string;
   /** Recent tool / progress activity (oldest → newest). */
   activity?: string[];
   /** Last few lines of model reasoning (oldest → newest). */

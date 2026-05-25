@@ -796,6 +796,12 @@ class AgyAgent implements Agent {
       // previous conversation repeated. Anything strictly above is new.
       const skipUpTo = sess.maxStepIndex;
 
+      const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
+      const currentModelId = readCurrentModelId(catalog);
+      const currentModel = catalog.find((m) => m.modelId === currentModelId);
+      const maxTokens = currentModel?.maxTokens ?? 1_000_000;
+      const usageTracker = { maxUsed: 0 };
+
       try {
         let hasBeenActive = false;
         for await (const update of subscribeToAgyStream({
@@ -844,6 +850,8 @@ class AgyAgent implements Agent {
                 heldText,
                 heldThinking,
                 sess.cwd,
+                maxTokens,
+                usageTracker,
               );
               if (idx > sess.maxStepIndex) sess.maxStepIndex = idx;
             }
@@ -971,8 +979,31 @@ class AgyAgent implements Agent {
     heldText: Map<number, string>,
     heldThinking: Map<number, string>,
     cwd: string,
+    maxTokens: number,
+    usageTracker: { maxUsed: number },
   ): Promise<void> {
     if (!this.conn) return;
+
+    if (step.metadata?.modelUsage) {
+      const u = step.metadata.modelUsage;
+      const input = parseInt(u.inputTokens ?? "0", 10) || 0;
+      const output = parseInt(u.outputTokens ?? "0", 10) || 0;
+      const used = input + output;
+      if (used > usageTracker.maxUsed) {
+        usageTracker.maxUsed = used;
+        if (maxTokens > 0) {
+          await this.conn.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "usage_update",
+              used,
+              size: maxTokens,
+            } as any
+          }).catch(() => {});
+        }
+      }
+    }
+
     const type = step.type ?? "";
 
     if (type === "CORTEX_STEP_TYPE_PLANNER_RESPONSE") {
@@ -1248,6 +1279,8 @@ interface AgyCatalogEntry {
   recommended: boolean;
   supportsThinking: boolean;
   supportsImages: boolean;
+  /** Maximum context window size in tokens. */
+  maxTokens: number;
 }
 
 let catalogPromise: Promise<AgyCatalogEntry[]> | null = null;
@@ -1445,6 +1478,7 @@ function parseAgyCatalog(json: { response?: { models?: Record<string, AgyRawMode
       recommended: !!m.recommended,
       supportsThinking: !!m.supportsThinking,
       supportsImages: !!m.supportsImages,
+      maxTokens: m.maxTokens ?? 0,
     });
   }
   // Antigravity ships multiple ids with the same displayName (rebrand aliases

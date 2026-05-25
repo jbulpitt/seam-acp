@@ -11,6 +11,15 @@ export interface SessionSummary {
   estimatedTokens?: number;
 }
 
+export interface ContextUsage {
+  /** Underlying API model id if known (e.g. "claude-opus-4-7"). */
+  model: string | null;
+  /** Total tokens currently in the context window. */
+  totalUsed: number;
+  /** Context window size for the active model. */
+  contextLimit: number;
+}
+
 export interface ISessionManager {
   listSessions(cwd: string): Promise<SessionSummary[]>;
   cloneSession(cwd: string, oldSessionId: string, newSessionId: string): Promise<void>;
@@ -18,6 +27,10 @@ export interface ISessionManager {
   getTranscript(cwd: string, sessionId: string): Promise<string>;
   repairSession?(cwd: string, sessionId: string): Promise<void>;
   compactSession?(cwd: string, sessionId: string, summary: string): Promise<void>;
+  /** Optional side-channel readout of the most recent context-window usage
+   *  (e.g. parsed from session transcripts on disk). Used by profiles where
+   *  the ACP path doesn't surface live `usage_update` notifications. */
+  getUsage?(cwd: string, sessionId?: string): Promise<ContextUsage>;
 }
 
 export function cleanTextForPreview(text: string): string {

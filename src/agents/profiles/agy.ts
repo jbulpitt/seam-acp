@@ -122,6 +122,26 @@ async function savePersistedSession(
   }
 }
 
+async function clearPersistedSession(
+  file: string,
+  sessionId: string,
+): Promise<void> {
+  try {
+    let mapping: SessionMapping;
+    try {
+      mapping = JSON.parse(await fs.readFile(file, "utf8")) as SessionMapping;
+    } catch { return; /* nothing on disk */ }
+    if (!(sessionId in mapping)) return;
+    delete mapping[sessionId];
+    await fs.writeFile(file, JSON.stringify(mapping, null, 2) + "\n");
+  } catch (err) {
+    if (process.env.AGY_PROFILE_DEBUG) {
+      // eslint-disable-next-line no-console
+      console.error("[agy] failed to clear session mapping:", err);
+    }
+  }
+}
+
 export function makeAgyProfile(opts: {
   /** Override the agy binary location. Defaults to `agy` on PATH. */
   cliPath?: string;
@@ -949,11 +969,23 @@ class AgyAgent implements Agent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
-    if (this.active?.sessionId === params.sessionId) {
+    const wasActive = this.active?.sessionId === params.sessionId;
+    if (wasActive && this.active) {
       this.active.userCancelled = true;
       this.active.abort.abort();
       try { this.active.proc.kill(); } catch {}
     }
+    if (!wasActive) return;
+    // The aborted cascade gets parked in a "done" state in agy's LS, so
+    // rejoining it on the next prompt yields an immediate empty stream
+    // (chars:0, ~4s turns). Clear the cascadeId + step high-water so the
+    // next prompt allocates a fresh cascade via waitForNewCascade.
+    const sess = this.sessions.get(params.sessionId);
+    if (sess) {
+      sess.cascadeId = undefined;
+      sess.maxStepIndex = -1;
+    }
+    await clearPersistedSession(this.mappingFile, params.sessionId);
   }
 
   shutdown(): void {

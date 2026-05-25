@@ -21,7 +21,13 @@ export interface AgentProfile {
    * Optional static list of models to use for this profile. When provided,
    * these override any models advertised dynamically by the agent via ACP.
    */
-  readonly staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  readonly staticModels?: ReadonlyArray<{
+    modelId: string;
+    name: string;
+    /** Context window size in tokens. Used to compute usage percentages when
+     *  the agent doesn't surface a `size` via ACP `usage_update`. */
+    contextLimit?: number;
+  }>;
 
   /**
    * Optional short abbreviation displayed in thread names when the new-thread

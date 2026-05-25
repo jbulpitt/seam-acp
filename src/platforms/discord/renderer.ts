@@ -86,10 +86,6 @@ export const discordRenderer: Renderer = {
       { name: "Model", value: trim(state.model, 40), inline: true },
       { name: "Action", value: trim(state.action, 220), inline: true },
     ];
-    if (state.context) {
-      fields.push({ name: "Context", value: trim(state.context, 80), inline: true });
-    }
-
     // --- description: activity as inline code "tags" ---
     let description: string | undefined;
     if (state.activity && state.activity.length > 0) {
@@ -106,7 +102,10 @@ export const discordRenderer: Renderer = {
         .join("\n");
       footerParts.push(thinkingLines);
     }
-    footerParts.push(`\n⏱ ${state.elapsedSeconds}s elapsed`);
+    const elapsedLine = state.context
+      ? `\n⏱ ${state.elapsedSeconds}s elapsed • 🪟 ${state.context}`
+      : `\n⏱ ${state.elapsedSeconds}s elapsed`;
+    footerParts.push(elapsedLine);
 
     return {
       color: COLOR_BY_STATE[state.state],

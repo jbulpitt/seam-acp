@@ -54,6 +54,11 @@ export class TurnStatus {
   repoDisplay: string;
   startedUtc: number;
   context?: string;
+  /** Monotonic ceiling on context-window `used` for this turn. Some agents
+   *  emit a falling reading mid-turn (e.g. a fresh API call that excludes
+   *  cached tokens, or post-compaction); we want the panel to show the
+   *  highest watermark seen so it doesn't visibly drop. Reset per turn. */
+  contextUsedHighWater = 0;
   /** Rolling activity log (oldest → newest). Capped to last N entries. */
   activity: string[] = [];
   private static readonly MAX_ACTIVITY = 20;

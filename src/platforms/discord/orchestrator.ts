@@ -639,7 +639,19 @@ export class Orchestrator {
             void refresh();
             return;
           case "usage-update": {
-            status.context = formatContextUsage(event.used, event.size);
+            if (event.size <= 0) return;
+            // claude-agent-acp emits used:0 immediately after a compact_boundary
+            // so the panel reflects the post-compaction state rather than the
+            // stale pre-compaction high-water. Treat it as an explicit reset.
+            if (event.used === 0) {
+              status.contextUsedHighWater = 0;
+              status.context = formatContextUsage(0, event.size);
+              void refresh();
+              return;
+            }
+            const used = Math.max(event.used, status.contextUsedHighWater);
+            status.contextUsedHighWater = used;
+            status.context = formatContextUsage(used, event.size);
             void refresh();
             return;
           }
@@ -792,11 +804,19 @@ export class Orchestrator {
               cwd,
               record.acpSessionId || undefined
             );
-            if (usage && usage.contextLimit > 0 && usage.totalUsed > 0) {
+            // Trust seam-acp's per-profile model→limit table over whatever the
+            // bridge inferred from the JSONL — on proxied setups the JSONL
+            // model id can be remapped/wrong.
+            const selectedModel = cfg.model ?? profile?.defaultModel;
+            const modelEntry = profile?.staticModels?.find(
+              (m) => m.modelId === selectedModel
+            );
+            const size = modelEntry?.contextLimit ?? usage?.contextLimit ?? 0;
+            if (usage && usage.totalUsed > 0 && size > 0) {
               await eventHandler({
                 kind: "usage-update",
                 used: usage.totalUsed,
-                size: usage.contextLimit,
+                size,
               });
               sideChannelEmitted = true;
             }
@@ -3573,7 +3593,7 @@ function usageLine(pct: number | null, label: string): string {
 
 function formatContextUsage(used: number, size: number): string {
   const pct = Math.round((used / size) * 100);
-  return `${fmtTokens(used)} / ${fmtTokens(size)} tokens (${pct}%)`;
+  return `${fmtTokens(used)} / ${fmtTokens(size)} (${pct}%)`;
 }
 
 function fmtTokens(n: number): string {

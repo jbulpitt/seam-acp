@@ -101,6 +101,7 @@ async function main(): Promise<void> {
           defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
           staticModels: p.id === "mac" ? REMOTE_MAC_MODELS : config.COPILOT_MODELS,
           threadAbbr: "🤖 💳",
+          restrictDiscordAccess: config.REMOTE_DISCORD_RESTRICTED_PROFILES.has(p.id),
           onBridgeConnect: () => notifyBridgeConnect(`copilot-remote-${p.id}`),
         })
       : makeRemoteCopilotClientProfile({
@@ -110,6 +111,7 @@ async function main(): Promise<void> {
           defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
           staticModels: p.id === "mac" ? REMOTE_MAC_MODELS : config.COPILOT_MODELS,
           threadAbbr: "🤖 💳",
+          restrictDiscordAccess: config.REMOTE_DISCORD_RESTRICTED_PROFILES.has(p.id),
           onBridgeConnect: () => notifyBridgeConnect(`copilot-remote-${p.id}`),
         })
   );

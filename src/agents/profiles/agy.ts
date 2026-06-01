@@ -1067,6 +1067,15 @@ class AgyAgent implements Agent {
       return;
     }
 
+    // Generated images: agy writes the file to its brain dir and assumes the
+    // host UI (the Antigravity IDE) can read it from there. Our chat pipeline
+    // can't — we need to read the file and surface it as an ACP `image`
+    // content block so agent-runtime can route it through to Discord.
+    if (type === "CORTEX_STEP_TYPE_GENERATE_IMAGE") {
+      await this.emitGeneratedImageBlock(sessionId, step);
+      return;
+    }
+
     // Anything else (VIEW_FILE, RUN_COMMAND, …) becomes a tool call.
     const status = mapToolStatus(step.status);
     const title = toolTitle(step);
@@ -1098,6 +1107,55 @@ class AgyAgent implements Agent {
   }
 
   /**
+   * Pull the generated image path out of a GENERATE_IMAGE step's content
+   * text, read the bytes off disk, and emit them as an ACP `image` content
+   * block on `agent_message_chunk`. The content text follows the shape:
+   *     "Generated image is saved at <absolute-path>."
+   */
+  private async emitGeneratedImageBlock(
+    sessionId: string,
+    step: AgyStep,
+  ): Promise<void> {
+    if (!this.conn) return;
+    const content = typeof step.content === "string" ? step.content : "";
+    const m = content.match(/saved at\s+(\S+\.(?:png|jpe?g|gif|webp|svg))/i);
+    const imagePath = m?.[1];
+    if (!imagePath) {
+      if (process.env.AGY_PROFILE_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.error("[agy] GENERATE_IMAGE step had no parseable file path");
+      }
+      return;
+    }
+    let data: string;
+    try {
+      const buf = await fs.readFile(imagePath);
+      data = buf.toString("base64");
+    } catch (err) {
+      if (process.env.AGY_PROFILE_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.error("[agy] failed to read generated image:", imagePath, err);
+      }
+      return;
+    }
+    const ext = imagePath.toLowerCase().split(".").pop() ?? "";
+    const mimeType =
+      ext === "png" ? "image/png" :
+      ext === "jpg" || ext === "jpeg" ? "image/jpeg" :
+      ext === "gif" ? "image/gif" :
+      ext === "webp" ? "image/webp" :
+      ext === "svg" ? "image/svg+xml" :
+      "application/octet-stream";
+    await this.conn.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "image", data, mimeType, uri: `file://${imagePath}` },
+      },
+    });
+  }
+
+  /**
    * Append `delta` to any previously-held tail for `idx`, emit the safe
    * portion (transformed for Discord), and re-hold whatever might still be
    * mid-pattern (unclosed markdown link or partial cwd prefix).
@@ -1116,7 +1174,31 @@ class AgyAgent implements Agent {
     const safe = combined.slice(0, safeLen);
     held.set(idx, combined.slice(safeLen));
     if (!safe) return;
-    const transformed = transformAgyText(safe, cwd);
+    // Visible agent text may embed local images via markdown (e.g. agy
+    // emitting `![alt](/abs/path.png)` to reference a file it wrote to its
+    // brain dir). Pull each such reference out, emit the bytes as a separate
+    // image content block, and strip the markdown so the surviving text
+    // isn't littered with broken path-only links in Discord.
+    const { textWithoutImages, imagesToEmit } =
+      updateType === "agent_message_chunk"
+        ? await extractInlineImagePaths(safe)
+        : { textWithoutImages: safe, imagesToEmit: [] };
+    for (const img of imagesToEmit) {
+      await this.conn.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "image",
+            data: img.data,
+            mimeType: img.mimeType,
+            uri: `file://${img.path}`,
+          },
+        },
+      });
+    }
+    const transformed = transformAgyText(textWithoutImages, cwd);
+    if (!transformed) return;
     await this.conn.sessionUpdate({
       sessionId,
       update: { sessionUpdate: updateType, content: { type: "text", text: transformed } },
@@ -1133,7 +1215,25 @@ class AgyAgent implements Agent {
     if (!this.conn) return;
     for (const tail of held.values()) {
       if (!tail) continue;
-      const transformed = transformAgyText(tail, cwd);
+      const { textWithoutImages, imagesToEmit } =
+        updateType === "agent_message_chunk"
+          ? await extractInlineImagePaths(tail)
+          : { textWithoutImages: tail, imagesToEmit: [] };
+      for (const img of imagesToEmit) {
+        await this.conn.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "image",
+              data: img.data,
+              mimeType: img.mimeType,
+              uri: `file://${img.path}`,
+            },
+          },
+        });
+      }
+      const transformed = transformAgyText(textWithoutImages, cwd);
       if (!transformed) continue;
       await this.conn.sessionUpdate({
         sessionId,
@@ -1182,13 +1282,78 @@ function toolTitle(step: AgyStep): string {
  * unclosed `[label](url)` markdown link, or a partial absolute path that may
  * complete into the session cwd.
  */
+interface InlineImageMatch {
+  path: string;
+  data: string;
+  mimeType: string;
+}
+
+/** Scan an agent message for `![label](path)` markdown image references.
+ *  For each match whose path resolves to an existing local image file,
+ *  read+base64-encode the bytes and remove the markdown from the text.
+ *  Other matches (broken paths, non-images) are left intact so the user
+ *  still sees the agent's intended formatting. */
+async function extractInlineImagePaths(
+  text: string,
+): Promise<{ textWithoutImages: string; imagesToEmit: InlineImageMatch[] }> {
+  const re = /!\[([^\]]*)\]\(([^)]+)\)/g;
+  const matches: Array<{ full: string; pathRef: string }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    matches.push({ full: m[0]!, pathRef: m[2]! });
+  }
+  if (matches.length === 0) {
+    return { textWithoutImages: text, imagesToEmit: [] };
+  }
+  const imagesToEmit: InlineImageMatch[] = [];
+  let textWithoutImages = text;
+  for (const { full, pathRef } of matches) {
+    const cleanPath = pathRef.startsWith("file://")
+      ? decodeURIComponent(pathRef.slice("file://".length))
+      : pathRef;
+    if (!path.isAbsolute(cleanPath)) continue;
+    const ext = cleanPath.toLowerCase().split(".").pop() ?? "";
+    const mimeType =
+      ext === "png" ? "image/png" :
+      ext === "jpg" || ext === "jpeg" ? "image/jpeg" :
+      ext === "gif" ? "image/gif" :
+      ext === "webp" ? "image/webp" :
+      ext === "svg" ? "image/svg+xml" :
+      "";
+    if (!mimeType) continue;
+    try {
+      const buf = await fs.readFile(cleanPath);
+      imagesToEmit.push({
+        path: cleanPath,
+        data: buf.toString("base64"),
+        mimeType,
+      });
+      textWithoutImages = textWithoutImages.replace(full, "").replace(/\n{3,}/g, "\n\n");
+    } catch {
+      // Path doesn't resolve — leave the markdown intact for the user to see.
+    }
+  }
+  return { textWithoutImages, imagesToEmit };
+}
+
 function findSafeBoundary(text: string, cwd: string): number {
   let safe = text.length;
 
   const lastOpenBracket = text.lastIndexOf("[");
   if (lastOpenBracket !== -1) {
     const after = text.slice(lastOpenBracket);
-    if (!/\]\([^)]*\)/.test(after)) safe = Math.min(safe, lastOpenBracket);
+    if (!/\]\([^)]*\)/.test(after)) {
+      // If the bracket is preceded by `!`, hold back from the `!` so the
+      // full `![label](path)` image markdown stays atomic across delta
+      // boundaries — otherwise the `!` ships in an earlier safe chunk and
+      // image extraction can't recognise the resulting `[…](…)` as an
+      // image (it looks like a normal link).
+      const start =
+        lastOpenBracket > 0 && text[lastOpenBracket - 1] === "!"
+          ? lastOpenBracket - 1
+          : lastOpenBracket;
+      safe = Math.min(safe, start);
+    }
   }
 
   const minStart = Math.max(0, text.length - cwd.length);

@@ -66,6 +66,9 @@ export interface NewSessionOptions {
   cwd: string;
   /** Optional model override (passed via `_meta`; agent applied via `set_model`). */
   model?: string;
+  /** Optional reasoning effort (low|medium|high|xhigh|max). Passed via
+   *  `newSessionMeta` into `_meta.claudeCode.options.effort`. */
+  effort?: string;
   /** Extra ACP `_meta` to merge into `session/new`. */
   meta?: Record<string, unknown>;
 }
@@ -262,7 +265,7 @@ export class AgentRuntime {
   async newSession(opts: NewSessionOptions): Promise<SessionInfo> {
     const conn = this.requireConnection();
     const meta: Record<string, unknown> = {
-      ...(this.profile.newSessionMeta?.(opts.model) ?? {}),
+      ...(this.profile.newSessionMeta?.(opts.model, opts.effort) ?? {}),
       ...(opts.meta ?? {}),
     };
 
@@ -310,10 +313,11 @@ export class AgentRuntime {
     sessionId: string;
     cwd: string;
     model?: string;
+    effort?: string;
   }): Promise<SessionInfo> {
     const conn = this.requireConnection();
     const meta: Record<string, unknown> = {
-      ...(this.profile.newSessionMeta?.(opts.model) ?? {}),
+      ...(this.profile.newSessionMeta?.(opts.model, opts.effort) ?? {}),
     };
     const result = await conn.loadSession({
       sessionId: opts.sessionId,

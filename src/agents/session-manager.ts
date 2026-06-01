@@ -30,7 +30,16 @@ export interface ISessionManager {
   /** Optional side-channel readout of the most recent context-window usage
    *  (e.g. parsed from session transcripts on disk). Used by profiles where
    *  the ACP path doesn't surface live `usage_update` notifications. */
-  getUsage?(cwd: string, sessionId?: string): Promise<ContextUsage>;
+  getUsage?(cwd: string, sessionId?: string, newerThanMs?: number): Promise<ContextUsage>;
+  /** Optional: write an uploaded attachment to the agent's filesystem and
+   *  return the absolute path. Used by network-restricted profiles (e.g.
+   *  remote-mac) where the agent can't fetch Discord CDN URLs but can
+   *  consume local files. */
+  writeAttachment?(
+    cwd: string,
+    filename: string,
+    base64: string
+  ): Promise<{ path: string }>;
 }
 
 export function cleanTextForPreview(text: string): string {

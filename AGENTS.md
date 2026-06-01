@@ -57,3 +57,35 @@ Key variables are defined and validated in `src/config.ts`. Notable ones:
 - `DEFAULT_AGENT` — which agent profile to use by default (`copilot`, `gemini`, `claude`)
 
 After changing `.env`, run `npm run redeploy` to rebuild and restart.
+
+## ⚠️ CRITICAL: Claude model & effort selection is a minefield
+
+The `claude-agent-acp` wrapper resolves model strings **inconsistently and
+silently wrong** (e.g. the alias `opus[1m]` resolves to *Sonnet*; the full ID
+`claude-sonnet-4-6[1m]` silently gives a 200K window). Months of work once ran
+on the wrong model because of this. **Do not trust model aliases, labels, or a
+model's self-report.** Before changing anything about Claude models or effort:
+
+**READ `docs/model-management-runbook.md` first.** It is the authoritative,
+empirical process. Key non-negotiables from it:
+
+- **Verify against JSONL ground truth** (`entry.message.model`), never by asking
+  the model what it is — self-reports are unreliable.
+- **A local patch is required**: `scripts/patch-claude-agent-acp.mjs` (run
+  `npm run patch-acp`) makes full `claude-*` IDs bypass the broken resolver. It
+  is wiped by any `npm i -g @agentclientprotocol/claude-agent-acp@latest` and
+  **must be re-applied + re-verified after every update**.
+- **The `CLAUDE_MODELS` picker in `.env`** contains only JSONL-verified entries.
+  Don't add a model without running the §4 probe in the runbook.
+- **The `[1m]` suffix is load-bearing** — it drives `getClaudeContextWindow`
+  (`src/agents/profiles/claude.ts`) → the compaction threshold. A 1M model
+  without the suffix compacts at 160K.
+- **Effort** is injected via `_meta.claudeCode.options.effort` (runbook §11),
+  NOT `set_config_option` (which errors). Valid levels are bounded by the
+  bundled SDK's `EffortLevel` type (`ultra` is not available).
+- The status card shows the **resolved** model + effort every turn — that is the
+  standing regression alarm. If it ever shows the wrong model, stop and consult
+  the runbook.
+
+When updating `claude-agent-acp` or `@anthropic-ai/claude-code`, follow the
+runbook end to end (§1 pull → §2 changelogs → §3 update → §3a patch → §4 verify).

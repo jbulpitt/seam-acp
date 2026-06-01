@@ -81,9 +81,13 @@ export const discordRenderer: Renderer = {
     const icon = ICON_BY_STATE[state.state];
 
     // --- fields (all inline) ---
+    const modelValue =
+      state.resolvedModel && state.resolvedModel !== state.model
+        ? trim(state.resolvedModel, 40) + " (" + trim(state.model, 40) + ")"
+        : trim(state.model, 40);
     const fields: StructuredPanel["fields"] = [
       { name: "Repo", value: trim(state.repoDisplay, 80), inline: true },
-      { name: "Model", value: trim(state.model, 40), inline: true },
+      { name: "Model", value: modelValue, inline: true },
       { name: "Action", value: trim(state.action, 220), inline: true },
     ];
     // --- description: activity as inline code "tags" ---
@@ -102,10 +106,10 @@ export const discordRenderer: Renderer = {
         .join("\n");
       footerParts.push(thinkingLines);
     }
-    const elapsedLine = state.context
-      ? `\n⏱ ${state.elapsedSeconds}s elapsed • 🪟 ${state.context}`
-      : `\n⏱ ${state.elapsedSeconds}s elapsed`;
-    footerParts.push(elapsedLine);
+    const segments = [`⏱ ${state.elapsedSeconds}s elapsed`];
+    if (state.context) segments.push(`🪟 ${state.context}`);
+    segments.push(`🧠 ${state.effort ?? "default"} effort`);
+    footerParts.push("\n" + segments.join(" • "));
 
     return {
       color: COLOR_BY_STATE[state.state],

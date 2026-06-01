@@ -181,6 +181,25 @@ export class FenceStream {
             this.state.fenceLangBuf = "";
           } else {
             this.state.fenceLangBuf += c;
+            // Check if this looks like a fake opener (e.g. LLM forgot a newline after a closing fence,
+            // or the fence was split across turns and this is actually the continuation as prose).
+            // A valid language tag shouldn't contain spaces followed by alphanumeric chars,
+            // colons, or exceed a reasonable length.
+            if (this.state.fenceLangBuf.length > 50 || /:\s|\s[a-zA-Z0-9]/.test(this.state.fenceLangBuf)) {
+              // Abort! Treat this as prose.
+              this.state.inFence = false;
+              proseBuf += "```" + this.state.fenceLangBuf;
+              this.state.fenceLangBuf = "";
+              this.state.fenceOpenedAtMs = 0;
+              // Remove the 'fence-open' segment we emitted earlier for this fake fence
+              for (let j = segments.length - 1; j >= 0; j--) {
+                const seg = segments[j];
+                if (seg && seg.kind === "fence-open") {
+                  segments.splice(j, 1);
+                  break;
+                }
+              }
+            }
           }
         } else {
           this.state.fenceInner += c;

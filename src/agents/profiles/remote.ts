@@ -321,8 +321,9 @@ export function makeRemoteCopilotServerProfile(opts: {
   /** Shared secret — bridge must send `Authorization: Bearer <token>`. */
   token: string;
   defaultModel: string;
-  staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
   threadAbbr?: string;
+  restrictDiscordAccess?: boolean;
   onBridgeConnect?: () => void;
 }): AgentProfile {
   const mux = makeMux({ id: opts.id, onBridgeConnect: opts.onBridgeConnect });
@@ -349,6 +350,7 @@ export function makeRemoteCopilotServerProfile(opts: {
     defaultModel: opts.defaultModel,
     staticModels: opts.staticModels,
     threadAbbr: opts.threadAbbr,
+    ...(opts.restrictDiscordAccess ? { restrictDiscordAccess: true } : {}),
     spawn: mux.spawn.bind(mux),
     whoami(): Promise<AgentIdentity | null> {
       return Promise.resolve(null);
@@ -381,8 +383,9 @@ export function makeRemoteCopilotClientProfile(opts: {
   /** Shared secret — sent as `Authorization: Bearer <token>`. */
   token: string;
   defaultModel: string;
-  staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
   threadAbbr?: string;
+  restrictDiscordAccess?: boolean;
   onBridgeConnect?: () => void;
 }): AgentProfile {
   const mux = makeMux({ id: opts.id, onBridgeConnect: opts.onBridgeConnect });
@@ -420,6 +423,7 @@ export function makeRemoteCopilotClientProfile(opts: {
     defaultModel: opts.defaultModel,
     staticModels: opts.staticModels,
     threadAbbr: opts.threadAbbr,
+    ...(opts.restrictDiscordAccess ? { restrictDiscordAccess: true } : {}),
     spawn: mux.spawn.bind(mux),
     whoami(): Promise<AgentIdentity | null> {
       return Promise.resolve(null);
@@ -445,8 +449,15 @@ function buildSessionManager(mux: ReturnType<typeof makeMux>): ISessionManager {
     async compactSession(cwd: string, sessionId: string, summary: string) {
       return mux.sendCmd("compactSession", { cwd, sessionId, summary });
     },
-    async getUsage(cwd: string, sessionId?: string) {
-      return mux.sendCmd("getUsage", { cwd, ...(sessionId ? { sessionId } : {}) });
+    async getUsage(cwd: string, sessionId?: string, newerThanMs?: number) {
+      return mux.sendCmd("getUsage", {
+        cwd,
+        ...(sessionId ? { sessionId } : {}),
+        ...(newerThanMs !== undefined ? { newerThanMs } : {}),
+      });
+    },
+    async writeAttachment(cwd: string, filename: string, base64: string) {
+      return mux.sendCmd("writeAttachment", { cwd, filename, base64 });
     },
   };
 }

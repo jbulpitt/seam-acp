@@ -144,6 +144,40 @@ const Schema = z.object({
    */
   CLAUDE_COMPACTION_TOKEN_THRESHOLD: z.coerce.number().min(0).default(0.8),
   /**
+   * Context-usage fraction (0–1) at which agy auto-compacts. agy has no
+   * built-in auto-compaction, so seam-acp watches its `usage_update` events
+   * and runs the same /compact flow at end-of-turn once usage crosses this.
+   * Set to 0 to disable.
+   */
+  AGY_AUTO_COMPACT_THRESHOLD: z.coerce.number().min(0).max(1).default(0.8),
+  /**
+   * Comma-separated list of remote profile ids (without the `copilot-remote-`
+   * prefix) whose host has network restrictions that block Discord. For these
+   * profiles, attachments are downloaded server-side and written to the
+   * agent's filesystem via the bridge's `writeAttachment` cmd; the LLM gets a
+   * local path in the prompt instead of a Discord URL.
+   */
+  REMOTE_DISCORD_RESTRICTED_PROFILES: z
+    .string()
+    .default("")
+    .transform((v) => new Set(v.split(",").map((s) => s.trim()).filter(Boolean))),
+  /** Raw Google AI Studio API key for /seam image. Leave empty and set
+   *  GOOGLE_AI_STUDIO_API_KEY_FILE instead to read from a file. */
+  GOOGLE_AI_STUDIO_API_KEY: z.string().default(""),
+  /** Path to a file whose first non-empty line is the Google AI Studio key. */
+  GOOGLE_AI_STUDIO_API_KEY_FILE: z.string().default(""),
+  /** Black Forest Labs API key for FLUX 2 models in /seam image. */
+  BFL_API_KEY: z.string().default(""),
+  /**
+   * Model used to generate compaction summaries (auto + manual `/compact`).
+   * Picked per-agent. Should be a high-context model with strong summarization
+   * — the session's own model may be too small to fit a near-full transcript
+   * (e.g. Sonnet 200K compacting at 80% leaves no headroom for the response).
+   */
+  AGY_COMPACTION_MODEL: z.string().default("Gemini 3.1 Pro (High)"),
+  CLAUDE_COMPACTION_MODEL: z.string().default("opus[1m]"),
+  COPILOT_COMPACTION_MODEL: z.string().default("gpt-5.5"),
+  /**
    * Same shape as COPILOT_PROFILES — register additional Claude profiles
    * each pinned to its own --config-dir (auth / settings). Format:
    *   id1:/abs/dir1,id2:/abs/dir2

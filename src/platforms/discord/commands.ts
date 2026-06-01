@@ -58,22 +58,36 @@ export function buildSeamCommand(): SlashCommandBuilder {
   cmd.addSubcommand((sub) =>
     sub
       .setName("effort")
-      .setDescription("Set reasoning effort (if model supports it)")
+      .setDescription("Set reasoning effort (or run with no level to see current)")
       .addStringOption((o) =>
         o
           .setName("level")
-          .setDescription("low | medium | high")
-          .setRequired(true)
+          .setDescription("low | medium | high | xhigh | max — agent falls back if model doesn't support it")
+          .setRequired(false)
           .addChoices(
             { name: "low", value: "low" },
             { name: "medium", value: "medium" },
-            { name: "high", value: "high" }
+            { name: "high", value: "high" },
+            { name: "xhigh", value: "xhigh" },
+            { name: "max", value: "max" }
           )
       )
   );
 
   cmd.addSubcommand((sub) =>
     sub.setName("abort").setDescription("Cancel the current turn")
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub
+      .setName("image")
+      .setDescription("Generate an image (Nano Banana 2 / Pro, Imagen 4, FLUX 2)")
+      .addStringOption((o) =>
+        o
+          .setName("prompt")
+          .setDescription("Image prompt. Leave blank to type a longer one in a modal.")
+          .setRequired(false)
+      )
   );
 
   cmd.addSubcommand((sub) =>
@@ -204,6 +218,7 @@ export type SeamSubcommand =
   | "mode"
   | "effort"
   | "abort"
+  | "image"
   | "reset"
   | "tools"
   | "config"

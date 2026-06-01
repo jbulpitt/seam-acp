@@ -31,6 +31,20 @@ export interface SessionConfigState {
    * back to the bot-wide default policy.
    */
   autoApprovePermissions?: boolean;
+  /**
+   * Last-known context-window usage at end of the previous turn. Used to
+   * seed the status panel at turn start so the user sees continuity. Cleared
+   * on model change. May go stale after out-of-band session edits — corrected
+   * by the post-turn side-channel `getUsage` read in normal operation.
+   */
+  lastContextUsage?: {
+    used: number;
+    size: number;
+    /** The model id this measurement was taken under. Used to invalidate
+     *  on model change without needing a separate field. */
+    model: string;
+    atUtc: string;
+  };
 }
 
 export function defaultSessionConfig(
@@ -86,6 +100,10 @@ export interface StatusPanel {
   state: TurnState;
   repoDisplay: string;
   model: string;
+  /** Resolved API model id (e.g. "claude-opus-4-8[1m]"), if different from model alias. */
+  resolvedModel?: string;
+  /** Reasoning effort for this turn, if set (low|medium|high|xhigh|max). */
+  effort?: string;
   action: string;
   elapsedSeconds: number;
   /** Optional context-window line shown when token info is known. */

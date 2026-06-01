@@ -42,22 +42,7 @@ interface OpenFence {
   lang: string;
 }
 
-/** Returns the open fence info if the buffer has an unclosed ```, else null. */
-export function hasOpenFence(buf: string): boolean {
-  return findOpenFence(buf) !== null;
-}
 
-function findOpenFence(buf: string): OpenFence | null {
-  const re = /```([^\n`]*)/g;
-  const matches: { start: number; lang: string }[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(buf)) !== null) {
-    matches.push({ start: m.index, lang: (m[1] ?? "").trim() });
-  }
-  if (matches.length % 2 === 0) return null;
-  const last = matches[matches.length - 1];
-  return last ?? null;
-}
 
 /**
  * Find the index of the EARLIEST still-open markdown link/image construct at
@@ -229,17 +214,14 @@ export function splitForFlush(
   const { maxLen, force } = opts;
   const softMin = opts.softMin ?? 1;
   const allowUnsafeCut = opts.allowUnsafeCut ?? false;
-  const fence = findOpenFence(buffer);
-  // Only check link-safety when the caller actually cares. Fences are
-  // handled separately and dominate when present (closing/reopening).
-  const unsafeIdx =
-    !allowUnsafeCut && !fence ? findFirstUnsafeIndex(buffer) : -1;
+  // Fences are handled separately upstream by FenceStream, so the prose buffer
+  // never contains unclosed code blocks. We only check link-safety.
+  const unsafeIdx = !allowUnsafeCut ? findFirstUnsafeIndex(buffer) : -1;
 
-  // --- Soft path: only flush on a paragraph break outside any open fence.
+  // --- Soft path: only flush on a paragraph break.
   // Mid-stream the model emits punctuation as separate chunks, so anything
   // less safe than a paragraph break risks landing mid-sentence.
   if (!force) {
-    if (fence) return null;
     const split = findCleanSplit(buffer, softMin, buffer.length, true);
     if (!split) return null;
     // Refuse soft cut that lands inside an open link/image construct.
@@ -251,7 +233,7 @@ export function splitForFlush(
   }
 
   // --- Forced path.
-  if (buffer.length <= maxLen && !fence) {
+  if (buffer.length <= maxLen) {
     if (unsafeIdx === -1) {
       return { send: buffer.replace(/\s+$/, ""), keep: "" };
     }
@@ -263,44 +245,7 @@ export function splitForFlush(
     return { send, keep };
   }
 
-  // Forced and (over cap or open fence). Need to cut within [0, maxLen].
-  if (fence) {
-    // Reserve room for closing "\n```".
-    const reserve = 4;
-    const windowEnd = Math.min(buffer.length, maxLen - reserve);
-    // Index just past the fence opener + lang tag (the content starts here).
-    const fenceContentStart = fence.start + 3 + fence.lang.length;
-    // If everything inside the fence fits and there's no extra trailing
-    // text after the (unclosed) fence, just emit the whole buffer with a
-    // closer appended — no need to split or re-open.
-    const inner = buffer.slice(fenceContentStart).replace(/^\n/, "");
-    if (buffer.length + reserve <= maxLen) {
-      // No real content inside yet → nothing useful to send. Drop the
-      // orphan opener so the caller's drain loop terminates instead of
-      // re-emitting empty fences forever.
-      if (!inner.trim()) {
-        return { send: "", keep: "" };
-      }
-      const sent = buffer.replace(/\s+$/, "") + "\n```";
-      return { send: sent, keep: "" };
-    }
-    const split = findCleanSplit(buffer, fenceContentStart + 1, windowEnd);
-    const cutIdx = split ? split.idx : windowEnd;
-    // Refuse to split before any actual content lands inside the fence —
-    // otherwise we'd emit an empty ```lang ... ``` block and reopen with
-    // the same empty opener, looping forever.
-    if (cutIdx <= fenceContentStart || !inner.trim()) {
-      return { send: "", keep: "" };
-    }
-    const skip = split ? split.skip : 0;
-    const sentInner = buffer.slice(0, cutIdx).replace(/\s+$/, "");
-    const send = sentInner + "\n```";
-    const tail = buffer.slice(cutIdx + skip);
-    const keep = "```" + fence.lang + "\n" + tail;
-    return { send, keep };
-  }
-
-  // Forced over-cap, no fence.
+  // Forced over-cap.
   const minSplit = Math.floor(maxLen / 4);
   // Cap the search window at unsafeIdx if there's an open link/image, so
   // we don't pick a clean break that lands inside the link.

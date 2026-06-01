@@ -7,6 +7,38 @@ import type { AgentIdentity, AgentProfile } from "../agent-profile.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 
 /**
+ * Resolve the Claude Code projects directory for a given cwd. Claude Code's
+ * slug algorithm replaces both `/` and `.` with `-`, but our naive
+ * `cwd.replace(/\//g, "-")` leaves dots intact. When the cwd contains a dot
+ * (e.g. `.od`), the computed slug won't match the directory on disk.
+ *
+ * Fast path: if the computed slug exists, use it. Otherwise scan all project
+ * dirs and match with a normalised comparison (dots→dashes, collapse runs).
+ */
+async function resolveProjectDir(claudeDir: string, cwd: string): Promise<string> {
+  const slug = cwd.replace(/\//g, "-");
+  const computed = path.join(claudeDir, "projects", slug);
+  try {
+    await fsp.access(computed);
+    return computed;
+  } catch { /* try scan */ }
+
+  const projectsRoot = path.join(claudeDir, "projects");
+  let entries: string[];
+  try {
+    entries = await fsp.readdir(projectsRoot);
+  } catch {
+    return computed;
+  }
+
+  const norm = (s: string) =>
+    s.toLowerCase().replace(/\./g, "-").replace(/-+/g, "-");
+  const target = norm(slug);
+  const match = entries.find((e) => norm(e) === target);
+  return match ? path.join(projectsRoot, match) : computed;
+}
+
+/**
  * Anthropic Claude Code as an ACP server, via the official adapter
  * `@agentclientprotocol/claude-agent-acp` (binary `claude-agent-acp`).
  *
@@ -76,26 +108,34 @@ export function makeClaudeProfile(opts: {
         detached: true,
       });
     },
-    newSessionMeta(modelId?: string) {
+    newSessionMeta(modelId?: string, effort?: string) {
       const model = modelId || opts.defaultModel;
+      const options: Record<string, unknown> = {};
+
       let threshold = opts.compactionTokenThreshold;
       if (threshold && threshold > 0) {
         if (threshold <= 1.0) {
           const cw = getClaudeContextWindow(model);
           threshold = Math.round(cw * threshold);
         }
-        return {
-          claudeCode: {
-            options: {
-              compactionControl: {
-                enabled: true,
-                contextTokenThreshold: threshold,
-              },
-            },
-          },
+        options.compactionControl = {
+          enabled: true,
+          contextTokenThreshold: threshold,
         };
       }
-      return undefined;
+
+      // Reasoning effort is injected via _meta.claudeCode.options.effort, which
+      // claude-agent-acp spreads straight into the SDK query Options.effort.
+      // This is the ONLY path that reliably applies effort: set_config_option
+      // for "effort" errors, and the wrapper never reads `reasoningEffort`.
+      // Verified: the SDK validates the value (rejects garbage, accepts
+      // low|medium|high|xhigh|max). Omitting it leaves the model default.
+      if (effort && effort !== "default") {
+        options.effort = effort;
+      }
+
+      if (Object.keys(options).length === 0) return undefined;
+      return { claudeCode: { options } };
     },
     async whoami() {
       if (identityCache !== undefined) return identityCache;
@@ -105,8 +145,7 @@ export function makeClaudeProfile(opts: {
     sessionManager: {
       async listSessions(cwd: string): Promise<SessionSummary[]> {
         const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
-        const slug = cwd.replace(/\//g, "-");
-        const projectDir = path.join(dir, "projects", slug);
+        const projectDir = await resolveProjectDir(dir, cwd);
 
         try {
           const files = await fsp.readdir(projectDir);
@@ -215,8 +254,7 @@ export function makeClaudeProfile(opts: {
 
       async cloneSession(cwd: string, oldSessionId: string, newSessionId: string): Promise<void> {
         const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
-        const slug = cwd.replace(/\//g, "-");
-        const projectDir = path.join(dir, "projects", slug);
+        const projectDir = await resolveProjectDir(dir, cwd);
 
         const oldFile = path.join(projectDir, `${oldSessionId}.jsonl`);
         const newFile = path.join(projectDir, `${newSessionId}.jsonl`);
@@ -259,8 +297,7 @@ export function makeClaudeProfile(opts: {
 
       async deleteSession(cwd: string, sessionId: string): Promise<void> {
         const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
-        const slug = cwd.replace(/\//g, "-");
-        const projectDir = path.join(dir, "projects", slug);
+        const projectDir = await resolveProjectDir(dir, cwd);
 
         const file = path.join(projectDir, `${sessionId}.jsonl`);
         try {
@@ -277,10 +314,76 @@ export function makeClaudeProfile(opts: {
         }
       },
 
+      async getUsage(cwd: string, sessionId?: string, newerThanMs?: number) {
+        const empty = { model: null, totalUsed: 0, contextLimit: 200_000 };
+        const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
+        const projectDir = await resolveProjectDir(dir, cwd);
+        let targetPath: string | undefined;
+        if (sessionId) {
+          targetPath = path.join(projectDir, `${sessionId}.jsonl`);
+          try { await fsp.access(targetPath); } catch { targetPath = undefined; }
+        }
+        if (!targetPath) {
+          try {
+            const files = await fsp.readdir(projectDir);
+            let newestMtime = 0;
+            for (const f of files) {
+              if (!f.endsWith(".jsonl")) continue;
+              const stat = await fsp.stat(path.join(projectDir, f));
+              if (stat.mtimeMs > newestMtime) {
+                newestMtime = stat.mtimeMs;
+                targetPath = path.join(projectDir, f);
+              }
+            }
+          } catch { return empty; }
+        }
+        if (!targetPath) return empty;
+        let content: string;
+        try { content = await fsp.readFile(targetPath, "utf8"); }
+        catch { return empty; }
+        const lines = content.split("\n").filter(Boolean);
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const entry = JSON.parse(lines[i]!);
+            if (entry.type !== "assistant" || !entry.message?.usage) continue;
+            // If a timestamp filter is provided, skip entries older than the threshold.
+            if (newerThanMs !== undefined && entry.timestamp) {
+              const entryMs = Date.parse(entry.timestamp);
+              if (!isNaN(entryMs) && entryMs < newerThanMs) continue;
+            }
+            const u = entry.message.usage;
+            const model = entry.message.model ?? null;
+            const input = u.input_tokens || 0;
+            const cacheRead = u.cache_read_input_tokens || 0;
+            const cacheCreation = u.cache_creation_input_tokens || 0;
+            const output = u.output_tokens || 0;
+            const totalUsed = input + cacheRead + cacheCreation + output;
+            // The JSONL model id has the [1m] suffix stripped (the API records
+            // e.g. "claude-opus-4-8"), so it can't always reveal the true
+            // window — the orchestrator's monotonic ceiling + cfg.model are the
+            // real source. This is a best-effort fallback only:
+            //  - explicit 1m token → 1M
+            //  - current Opus (4.7+) → 1M (auto-upgraded on Max, native on 4.8)
+            //  - everything else → 200K
+            const contextLimit =
+              /\b1m\b/i.test(model ?? "") ||
+              /-1m\b/i.test(model ?? "") ||
+              /^claude-opus-4-(?:[7-9]|\d\d)\b/.test(model ?? "")
+                ? 1_000_000
+                : 200_000;
+            return {
+              model,
+              totalUsed,
+              contextLimit,
+            };
+          } catch { /* skip malformed */ }
+        }
+        return empty;
+      },
+
       async getTranscript(cwd: string, sessionId: string): Promise<string> {
         const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
-        const slug = cwd.replace(/\//g, "-");
-        const projectDir = path.join(dir, "projects", slug);
+        const projectDir = await resolveProjectDir(dir, cwd);
         const file = path.join(projectDir, `${sessionId}.jsonl`);
 
         const content = await fsp.readFile(file, "utf8");
@@ -330,8 +433,7 @@ export function makeClaudeProfile(opts: {
 
       async repairSession(cwd: string, sessionId: string): Promise<void> {
         const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
-        const slug = cwd.replace(/\//g, "-");
-        const projectDir = path.join(dir, "projects", slug);
+        const projectDir = await resolveProjectDir(dir, cwd);
         const file = path.join(projectDir, `${sessionId}.jsonl`);
 
         const content = await fsp.readFile(file, "utf8");
@@ -434,8 +536,7 @@ export function makeClaudeProfile(opts: {
 
       async compactSession(cwd: string, sessionId: string, summaryText: string): Promise<void> {
         const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
-        const slug = cwd.replace(/\//g, "-");
-        const projectDir = path.join(dir, "projects", slug);
+        const projectDir = await resolveProjectDir(dir, cwd);
         const file = path.join(projectDir, `${sessionId}.jsonl`);
 
         const now = new Date().toISOString();
@@ -654,8 +755,19 @@ function pickStringField(
   return undefined;
 }
 
+/** Map a model id to its TRUE context window, which drives the auto-compaction
+ *  threshold in newSessionMeta. Getting this wrong causes premature compaction
+ *  (200K threshold on a 1M model throws away 800K of usable context).
+ *
+ *  Rules verified empirically against claude-agent-acp 0.39 (JSONL ground truth):
+ *  - Any model carrying a `1m` token → 1M (e.g. claude-opus-4-8[1m], sonnet[1m]).
+ *  - `default` → 1M: on Max/Team-Premium it resolves to the latest Opus, which
+ *    is 1M. (On lower tiers default is Sonnet 200K; if this bot ever runs on a
+ *    non-Max account, revisit this.)
+ *  - Everything else → 200K. */
 function getClaudeContextWindow(modelId?: string): number {
   if (!modelId) return 200_000;
   if (/\b1m\b/i.test(modelId) || /-1m\b/i.test(modelId)) return 1_000_000;
+  if (/^default$/i.test(modelId.trim())) return 1_000_000;
   return 200_000;
 }

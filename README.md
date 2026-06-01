@@ -240,6 +240,32 @@ account from `<config-dir>/.credentials.json` (and a couple of fallbacks).
 If that fails (file format changes upstream, etc.) the command still
 reports which profile id you're on.
 
+#### ⚠️ Claude model selection & the `claude-agent-acp` resolver
+
+Claude model handling has a sharp edge: the `claude-agent-acp` wrapper resolves
+model strings **inconsistently** — some aliases and full IDs silently resolve to
+the wrong model or the wrong context window. For example, the alias `opus[1m]`
+resolves to *Sonnet*, and the full ID `claude-sonnet-4-6[1m]` silently gives a
+200K window instead of 1M.
+
+Because of this:
+
+- The `CLAUDE_MODELS` picker in `.env` contains only **empirically verified**
+  entries (each one checked against JSONL ground truth, not the model's
+  self-report). Don't add a model without verifying it.
+- A small local patch — `scripts/patch-claude-agent-acp.mjs`, run via
+  `npm run patch-acp` — makes full `claude-*` IDs bypass the broken resolver so
+  they resolve to exactly themselves (and unlocks e.g. Opus 4.6 @ 1M). It is
+  **wiped by any global `npm` update of the package and must be re-applied**.
+- The status card shows the **resolved** API model id and the current reasoning
+  effort on every turn, so a wrong-model regression is visible immediately.
+
+**Anyone updating `claude-agent-acp` / `@anthropic-ai/claude-code`, changing the
+model picker, or touching effort handling must follow
+[`docs/model-management-runbook.md`](docs/model-management-runbook.md)** — the
+authoritative, step-by-step empirical process (pull versions → read changelogs →
+update → re-apply patch → verify against JSONL → confirm new/resumed sessions).
+
 ### Remote agent profiles (Mac / off-server machine)
 
 You can run an agent CLI on a **separate machine** — one that cannot accept inbound connections — and expose it as a regular agent profile via a WebSocket bridge. Two modes are supported:

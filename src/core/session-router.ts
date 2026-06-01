@@ -247,6 +247,7 @@ export class SessionRouter {
           sessionId: record.acpSessionId,
           cwd,
           model: cfg.model ?? this.defaultModel,
+          ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
         });
         this.logger.debug(
           { sessionId: record.id, acpSessionId: record.acpSessionId },
@@ -264,6 +265,7 @@ export class SessionRouter {
     const info = await runtime.newSession({
       cwd,
       model: cfg.model ?? this.defaultModel,
+      ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
     });
     // Persist the new ACP session id so we can resume on restart.
     this.store.upsert({

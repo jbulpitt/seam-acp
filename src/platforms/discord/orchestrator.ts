@@ -2,7 +2,17 @@ import fs from "node:fs";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, type ChatInputCommandInteraction } from "discord.js";
+import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type MessageComponentInteraction, type Message } from "discord.js";
+import {
+  IMAGE_MODELS,
+  getImageModelById,
+  generateImage,
+  resolveGoogleApiKey,
+  type AspectRatio,
+  type ImageModel,
+  type ReferenceImage,
+  type Resolution,
+} from "../../core/image-gen.js";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
 import type { Renderer } from "../renderer.js";
@@ -20,12 +30,13 @@ import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
-import { splitForFlush, hasOpenFence } from "../../core/stream-flush.js";
+import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import {
   defaultSessionConfig,
   type SessionConfigState,
+  type StructuredPanel,
 } from "../../core/types.js";
 import type { DiscordAdapter } from "./adapter.js";
 
@@ -220,7 +231,26 @@ export class Orchestrator {
     const status = new TurnStatus({
       model: cfg.model ?? this.config.DEFAULT_MODEL,
       repoDisplay,
+      ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
     });
+
+    // Seed the status panel with the last-known usage from the previous turn,
+    // so the user sees continuity before any usage_update events fire. The
+    // saved value is invalidated when the model changes (size belongs to a
+    // different model). Any staleness is corrected by the post-turn
+    // side-channel read.
+    const cachedUsage = cfg.lastContextUsage;
+    const activeModel = cfg.model ?? this.config.DEFAULT_MODEL;
+    if (
+      cachedUsage &&
+      cachedUsage.model === activeModel &&
+      cachedUsage.size > 0 &&
+      cachedUsage.used > 0
+    ) {
+      status.contextUsedHighWater = cachedUsage.used;
+      status.contextWindowSize = cachedUsage.size;
+      status.context = formatContextUsage(cachedUsage.used, cachedUsage.size);
+    }
 
     const initialPanel = renderStatusPanel(this.renderer, status.toInput(), Date.now());
     const statusMsg = this.adapter.sendPanel
@@ -291,6 +321,10 @@ export class Orchestrator {
     let textBuffer = "";
     let textSent = false;
     let totalAgentChars = 0;
+    // Set true mid-turn (in the usage-update handler) when agy's context
+    // usage crosses AGY_AUTO_COMPACT_THRESHOLD; consumed post-turn to run
+    // the /compact flow before the next prompt.
+    let agyAutoCompactNeeded = false;
     // Streaming fence extractor: pulls every ```lang ... ``` block out
     // of the agent's text and emits ordered segments. Fence-close
     // segments are routed to inline-or-attachment rendering based on
@@ -358,14 +392,6 @@ export class Orchestrator {
     const armIdleFlush = () => {
       cancelFlushTimer();
       if (!textBuffer) return;
-      // If we're mid-fence, hold off — splitting a fenced block across
-      // messages renders badly. Turn-end flush will still post it.
-      if (
-        hasOpenFence(textBuffer) &&
-        textBuffer.length < FENCE_BUFFER_CEILING
-      ) {
-        return;
-      }
       idleTimer = setTimeout(() => {
         idleTimer = undefined;
         // Idle for IDLE_FLUSH_MS — any open markdown link is probably
@@ -640,18 +666,34 @@ export class Orchestrator {
             return;
           case "usage-update": {
             if (event.size <= 0) return;
-            // claude-agent-acp emits used:0 immediately after a compact_boundary
-            // so the panel reflects the post-compaction state rather than the
-            // stale pre-compaction high-water. Treat it as an explicit reset.
-            if (event.used === 0) {
-              status.contextUsedHighWater = 0;
-              status.context = formatContextUsage(0, event.size);
-              void refresh();
-              return;
-            }
+            // Ignore mid-turn used:0 events. claude-agent-acp emits them on
+            // compact_boundary, but the remote-claude→copilot-api proxy path
+            // also surfaces spurious 0s when intermediate response chunks
+            // arrive with missing usage fields — making the display flicker.
+            // We can't tell the two apart, so hold steady. The end-of-turn
+            // side-channel (getUsage / JSONL read) lands the authoritative
+            // post-compaction value if a compaction really did happen.
+            if (event.used === 0) return;
             const used = Math.max(event.used, status.contextUsedHighWater);
             status.contextUsedHighWater = used;
-            status.context = formatContextUsage(used, event.size);
+            // Monotonic ceiling on the window too. claude-agent-acp starts each
+            // session at its 200K default and the authoritative window (e.g. 1M)
+            // arrives a beat later — without this, the card blips 200K→1M on the
+            // first event. The window only ever grows within a turn (default →
+            // authoritative); it never legitimately shrinks (compaction changes
+            // `used`, not `size`; model switches clear the cache between turns).
+            const size = Math.max(event.size, status.contextWindowSize);
+            status.contextWindowSize = size;
+            status.context = formatContextUsage(used, size);
+            // agy has no built-in auto-compaction. Mark the turn for an
+            // end-of-turn /compact when usage crosses the configured threshold.
+            if (
+              this.config.AGY_AUTO_COMPACT_THRESHOLD > 0 &&
+              record.agentId.startsWith("agy") &&
+              used / size >= this.config.AGY_AUTO_COMPACT_THRESHOLD
+            ) {
+              agyAutoCompactNeeded = true;
+            }
             void refresh();
             return;
           }
@@ -669,6 +711,51 @@ export class Orchestrator {
       turnStartedAt = Date.now();
       const timeoutMs = this.config.TURN_TIMEOUT_SECONDS * 1000;
 
+      // If the active profile is on a Discord-restricted host (e.g. remote
+      // Mac with strict network policy), don't expose Discord CDN URLs to
+      // the LLM. Instead, download the bytes server-side and stream them to
+      // the agent's filesystem via the bridge's `writeAttachment` cmd. The
+      // model gets a local path in the prompt; attachments are stripped.
+      let promptText = msg.text;
+      let promptAttachments = msg.attachments;
+      const activeProfile = this.router.getProfile(record.agentId);
+      if (
+        activeProfile?.restrictDiscordAccess &&
+        msg.attachments &&
+        msg.attachments.length > 0 &&
+        typeof activeProfile.sessionManager?.writeAttachment === "function"
+      ) {
+        const writer = activeProfile.sessionManager.writeAttachment.bind(
+          activeProfile.sessionManager
+        );
+        const cwd = record.repoPath ?? process.cwd();
+        const pathLines: string[] = [];
+        for (const a of msg.attachments) {
+          try {
+            const res = await fetch(a.url);
+            if (!res.ok) throw new Error(`download ${res.status} ${res.statusText}`);
+            const buf = Buffer.from(await res.arrayBuffer());
+            const { path: written } = await writer(
+              cwd,
+              a.filename,
+              buf.toString("base64")
+            );
+            pathLines.push(`- \`${a.filename}\` → \`${written}\``);
+          } catch (err) {
+            this.logger.warn(
+              { err, filename: a.filename },
+              "failed to write attachment to restricted agent; falling back to skipping"
+            );
+            pathLines.push(`- \`${a.filename}\` — could not be transferred to the agent host`);
+          }
+        }
+        const hint =
+          `\n\n_The following file${pathLines.length === 1 ? " was" : "s were"} ` +
+          `uploaded and saved to the agent's filesystem:_\n${pathLines.join("\n")}`;
+        promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
+        promptAttachments = undefined; // already on disk; no ACP attachment blocks
+      }
+
       // One transparent retry on transient failures. Both cases fire before any
       // output is buffered so the retry is invisible to the user.
       //   session-gone: session files are lost; start a fresh session.
@@ -677,20 +764,20 @@ export class Orchestrator {
       //     getOrStartRuntime will wait up to 44s for the bridge to reconnect.
       let result: PromptOutcome | "timeout";
       try {
-        result = await raceWithTimeout(activeRuntime.prompt(msg.text, msg.attachments), timeoutMs);
+        result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
       } catch (promptErr) {
         if (isSessionGoneError(promptErr)) {
           this.logger.warn({ session: record.id }, "session-gone on prompt; invalidating and retrying with new session");
           await this.router.invalidate(record.id, { clearAcpSession: true });
           activeRuntime = await this.router.getOrStartRuntime(record);
           activeRuntime.onEvent(eventHandler);
-          result = await raceWithTimeout(activeRuntime.prompt(msg.text, msg.attachments), timeoutMs);
+          result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
         } else if (isConnectionClosedError(promptErr)) {
           this.logger.warn({ session: record.id }, "connection closed mid-turn; waiting for reconnect and retrying");
           await this.router.invalidate(record.id, { clearAcpSession: false });
           activeRuntime = await this.router.getOrStartRuntime(record);
           activeRuntime.onEvent(eventHandler);
-          result = await raceWithTimeout(activeRuntime.prompt(msg.text, msg.attachments), timeoutMs);
+          result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
         } else {
           throw promptErr;
         }
@@ -802,7 +889,8 @@ export class Orchestrator {
             const usage = await usageReader.call(
               profile.sessionManager,
               cwd,
-              record.acpSessionId || undefined
+              record.acpSessionId || undefined,
+              turnStartedAt || undefined
             );
             // Trust seam-acp's per-profile model→limit table over whatever the
             // bridge inferred from the JSONL — on proxied setups the JSONL
@@ -811,13 +899,24 @@ export class Orchestrator {
             const modelEntry = profile?.staticModels?.find(
               (m) => m.modelId === selectedModel
             );
-            const size = modelEntry?.contextLimit ?? usage?.contextLimit ?? 0;
+            const computedSize = modelEntry?.contextLimit ?? usage?.contextLimit ?? 0;
+            // `used` may legitimately drop (post-compaction), so we bypass its
+            // ceiling. But the window must never shrink: getUsage can return a
+            // stale 200K default when the JSONL model id (which has [1m]
+            // stripped, e.g. "claude-opus-4-8") doesn't reveal the real window.
+            // Trust the larger of the computed value and what the live stream /
+            // cache already established for this turn.
+            const size = Math.max(status.contextWindowSize, computedSize);
             if (usage && usage.totalUsed > 0 && size > 0) {
-              await eventHandler({
-                kind: "usage-update",
-                used: usage.totalUsed,
-                size,
-              });
+              status.contextUsedHighWater = usage.totalUsed;
+              status.contextWindowSize = size;
+              status.context = formatContextUsage(usage.totalUsed, size);
+              // Record the resolved model id (e.g. "claude-opus-4-8[1m]") so
+              // the status card can display the actual model alongside the alias.
+              if (usage.model) {
+                status.resolvedModel = usage.model;
+              }
+              void refresh();
               sideChannelEmitted = true;
             }
           } catch (err) {
@@ -826,6 +925,33 @@ export class Orchestrator {
         }
         if (!sideChannelEmitted && record.agentId.startsWith("copilot")) {
           await this.probeCopilotContext(activeRuntime, eventHandler, refresh);
+        }
+
+        // Persist final usage to the session record so the next turn can
+        // seed its status panel without waiting for the first usage_update.
+        if (status.contextUsedHighWater > 0 && status.contextWindowSize > 0) {
+          try {
+            const persistedCfg = this.store.readConfig(record);
+            persistedCfg.lastContextUsage = {
+              used: status.contextUsedHighWater,
+              size: status.contextWindowSize,
+              model: cfg.model ?? this.config.DEFAULT_MODEL,
+              atUtc: new Date().toISOString(),
+            };
+            this.persistConfig(record, persistedCfg);
+          } catch (err) {
+            this.logger.debug({ err }, "failed to persist lastContextUsage");
+          }
+        }
+      }
+
+      // agy has no native auto-compaction. If usage crossed the threshold
+      // mid-turn, run the same /compact flow now before the next prompt.
+      if (agyAutoCompactNeeded && result !== "timeout" && !result.cancelled) {
+        try {
+          await this.runAgyAutoCompact(record, channel, status, refresh, status.contextUsedHighWater);
+        } catch (err) {
+          this.logger.warn({ err, session: record.id }, "agy auto-compact failed");
         }
       }
     } catch (err) {
@@ -912,6 +1038,8 @@ export class Orchestrator {
         return this.cmdEffort(interaction);
       case "abort":
         return this.cmdAbort(interaction);
+      case "image":
+        return this.cmdImage(interaction);
       case "reset":
         return this.cmdReset(interaction);
       case "tools":
@@ -986,6 +1114,154 @@ export class Orchestrator {
     }
   }
 
+  /** Returns the configured compaction model for an agent id, or "" if the
+   *  agent isn't supported. Compaction always uses a known-good high-context
+   *  summarizer rather than the session's own model — the latter can be too
+   *  small to fit a near-full transcript with any response headroom. */
+  private compactionModelFor(agentId: string): string {
+    if (agentId === "agy" || agentId.startsWith("agy-")) {
+      return this.config.AGY_COMPACTION_MODEL;
+    }
+    if (agentId === "claude" || agentId.startsWith("claude-")) {
+      return this.config.CLAUDE_COMPACTION_MODEL;
+    }
+    if (
+      agentId === "copilot" ||
+      agentId.startsWith("copilot-") ||
+      agentId === "remote"
+    ) {
+      return this.config.COPILOT_COMPACTION_MODEL;
+    }
+    return "";
+  }
+
+  /** End-of-turn auto-compaction for agy. Mirrors the manual /compact flow
+   *  (read transcript → spawn temp runtime → ask for summary → call
+   *  manager.compactSession in place) but runs unattended when usage crosses
+   *  AGY_AUTO_COMPACT_THRESHOLD. The seam-acp session id is preserved; only
+   *  the underlying agy cascade is replaced. */
+  private async runAgyAutoCompact(
+    record: SessionRecord,
+    channel: ChannelRef,
+    status: TurnStatus,
+    refresh: (force?: boolean) => Promise<void>,
+    tokensBefore: number
+  ): Promise<void> {
+    const profile = this.router.getProfile(record.agentId);
+    const manager = profile?.sessionManager;
+    if (!profile || !manager?.compactSession || !manager?.getTranscript) {
+      this.logger.debug({ agent: record.agentId }, "auto-compact skipped: missing manager methods");
+      return;
+    }
+
+    status.setState("Working");
+    status.setAction("Auto-compacting context…");
+    await refresh(true);
+
+    const compactStartedAt = Date.now();
+    const thresholdPct = Math.round(this.config.AGY_AUTO_COMPACT_THRESHOLD * 100);
+
+    // Status card so a queued follow-up message has context for why it's waiting.
+    const inProgressPanel: StructuredPanel = {
+      color: 0xe67e22,
+      title: "🗜️ Auto-Compacting Context",
+      fields: [
+        { name: "Trigger", value: `≥ ${thresholdPct}% used`, inline: true },
+        { name: "Before", value: fmtTokens(tokensBefore), inline: true },
+        { name: "Status", value: "Generating summary…", inline: true },
+      ],
+    };
+    let cardRef: MessageRef | undefined;
+    try {
+      if (this.adapter.sendPanel) {
+        cardRef = await this.adapter.sendPanel(channel, inProgressPanel);
+      } else {
+        cardRef = await this.adapter.sendMessage(channel, serializePanelText(inProgressPanel));
+      }
+    } catch { /* best-effort — don't block compaction on a failed card send */ }
+
+    const cwd = record.repoPath ?? process.cwd();
+    let transcript: string;
+    try {
+      transcript = await manager.getTranscript(cwd, record.acpSessionId);
+    } catch (err) {
+      this.logger.warn({ err, session: record.id }, "auto-compact: getTranscript failed");
+      return;
+    }
+    if (!transcript.trim()) return;
+
+    let sanitized = transcript
+      .split("\n")
+      .map((line) => (line.length > 1000 ? line.substring(0, 1000) + " ... [Line truncated]" : line))
+      .join("\n");
+
+    const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+    const summaryModel = this.compactionModelFor(record.agentId);
+    if (!summaryModel) {
+      this.logger.warn({ agent: record.agentId }, "auto-compact: no compaction model configured");
+      return;
+    }
+    const windowTokens = compactionWindowFor(summaryModel);
+    const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
+    sanitized = fitTranscriptToWindow(sanitized, templateOverhead, windowTokens);
+    const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitized}`;
+
+    let tempRuntime: AgentRuntime | undefined;
+    let summaryText = "";
+    try {
+      tempRuntime = new AgentRuntime({
+        profile,
+        logger: this.logger.child({ session: `auto-compact-${record.id}` }),
+        mcpServers: [],
+      });
+      await tempRuntime.start();
+      await tempRuntime.newSession({
+        cwd,
+        model: summaryModel,
+        meta: { reasoningEffort: "low" },
+      });
+      tempRuntime.onEvent((event) => {
+        if (event.kind === "agent-text") summaryText += event.text;
+      });
+      await tempRuntime.prompt(compactionPrompt);
+    } finally {
+      if (tempRuntime) {
+        try { await tempRuntime.dispose(); } catch { /* best-effort */ }
+      }
+    }
+
+    if (!summaryText.trim()) {
+      this.logger.warn({ session: record.id }, "auto-compact: empty summary from temp runtime");
+      return;
+    }
+
+    await manager.compactSession(cwd, record.acpSessionId, summaryText);
+    await this.router.invalidate(record.id, { clearAcpSession: false });
+
+    const elapsedSec = Math.round((Date.now() - compactStartedAt) / 1000);
+    // Rough estimate — 4 chars per token. The next real turn will replace this
+    // with an authoritative usage_update reading.
+    const tokensAfterEst = Math.ceil(summaryText.length / 4);
+    const completedPanel: StructuredPanel = {
+      color: 0x57f287,
+      title: "✅ Compaction Complete",
+      fields: [
+        { name: "Before", value: fmtTokens(tokensBefore), inline: true },
+        { name: "After (~)", value: fmtTokens(tokensAfterEst), inline: true },
+        { name: "Duration", value: `${elapsedSec}s`, inline: true },
+      ],
+    };
+    try {
+      if (cardRef && this.adapter.editPanel) {
+        await this.adapter.editPanel(cardRef, completedPanel);
+      } else if (cardRef && this.adapter.editMessage) {
+        await this.adapter.editMessage(cardRef, serializePanelText(completedPanel));
+      } else {
+        await this.adapter.sendMessage(channel, serializePanelText(completedPanel));
+      }
+    } catch { /* best-effort */ }
+  }
+
   private async cmdNew(i: ChatInputCommandInteraction): Promise<void> {
     if (!this.adapter.createThread) {
       await i.reply({
@@ -1034,7 +1310,7 @@ export class Orchestrator {
     const requested = i.options.getString("path", true);
     let resolved: string;
     try {
-      resolved = resolveRepoPath(requested, this.config.REPOS_ROOT);
+      resolved = resolveRepoPath(this.config.REPOS_ROOT, requested);
     } catch (err) {
       await i.reply({
         content: `Invalid path: ${(err as Error).message}`,
@@ -1080,9 +1356,10 @@ export class Orchestrator {
       // catalog comes from the agent at session-start, not from us).
       const cfg = this.store.readConfig(record);
       const current = cfg.model ?? this.config.DEFAULT_MODEL;
+      const displayCurrent = `\`${current}\``;
       if (!this.adapter.sendChoicePicker) {
         await i.reply({
-          content: `Current model: \`${current}\``,
+          content: `Current model: ${displayCurrent}`,
           flags: MessageFlags.Ephemeral,
         });
         return;
@@ -1090,7 +1367,6 @@ export class Orchestrator {
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       let models: ReadonlyArray<{ modelId: string; name?: string }> = [];
       const profile = this.router.getProfile(record.agentId);
-
       if (profile?.staticModels && profile.staticModels.length > 0) {
         models = profile.staticModels;
       } else {
@@ -1100,7 +1376,7 @@ export class Orchestrator {
         } catch (err) {
           this.logger.warn({ err }, "could not start runtime / enumerate models");
           await i.editReply(
-            `Current model: \`${current}\`\nFailed to start the agent to list models: ${(err as Error).message}`
+            `Current model: ${displayCurrent}\nFailed to start the agent to list models: ${(err as Error).message}`
           );
           return;
         }
@@ -1108,16 +1384,16 @@ export class Orchestrator {
 
       if (models.length === 0) {
         await i.editReply(
-          `Current model: \`${current}\`\n_(agent did not advertise any models — pass an id manually: \`/seam model id:<name>\`.)_`
+          `Current model: ${displayCurrent}\n_(agent did not advertise any models — pass an id manually: \`/seam model id:<name>\`.)_`
         );
         return;
       }
-      await i.editReply(`Current model: \`${current}\`. Posting picker…`);
+      await i.editReply(`Current model: ${displayCurrent}. Posting picker…`);
       const picked = await this.adapter.sendChoicePicker(channel, {
         panel: {
           color: 0x5865f2,
           title: "🧠 Choose a model",
-          fields: [{ name: "Current", value: `\`${current}\``, inline: true }],
+          fields: [{ name: "Current", value: displayCurrent, inline: true }],
         },
         choices: models.slice(0, 25).map((m) => ({
           value: m.modelId,
@@ -1155,6 +1431,10 @@ export class Orchestrator {
   ): Promise<void> {
     const cfg = this.store.readConfig(record);
     cfg.model = id;
+    // The cached usage was measured under the prior model; window/used both
+    // belong to a different model now. Invalidate so the next turn starts
+    // clean rather than seeding the panel with mismatched numbers.
+    cfg.lastContextUsage = undefined;
     this.persistConfig(record, cfg);
     let message: string;
     if (this.router.hasRuntime(record.id)) {
@@ -1203,24 +1483,29 @@ export class Orchestrator {
       await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const level = i.options.getString("level", true);
+    const level = i.options.getString("level");
     const cfg = this.store.readConfig(record);
+    // No argument → report current state (or "unset → agent default").
+    if (!level) {
+      const current = cfg.reasoningEffort;
+      const body = current
+        ? `Reasoning effort: \`${current}\`.`
+        : "Reasoning effort is **unset** for this thread — the agent is using its own default.";
+      await i.reply({ content: body, flags: MessageFlags.Ephemeral });
+      return;
+    }
     cfg.reasoningEffort = level;
     this.persistConfig(record, cfg);
+    // Effort is applied via _meta.claudeCode.options.effort at session
+    // creation (the only path that works — set_config_option for "effort"
+    // errors and the wrapper ignores `reasoningEffort`). Invalidate the live
+    // runtime so the next turn recreates/resumes the session with the new
+    // effort baked into _meta. Preserve the ACP session id so context survives.
     if (this.router.hasRuntime(record.id)) {
-      try {
-        const rt = await this.router.getOrStartRuntime(record);
-        await rt.setConfigOption("reasoning_effort", level);
-      } catch (err) {
-        await i.reply({
-          content: `Effort saved but agent rejected live update: ${(err as Error).message}`,
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
+      await this.router.invalidate(record.id, { clearAcpSession: false });
     }
     await i.reply({
-      content: `Reasoning effort set to \`${level}\`.`,
+      content: `Reasoning effort set to \`${level}\` — applies on your next message.`,
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -1240,6 +1525,346 @@ export class Orchestrator {
     // the acpSessionId so the next message can resume the session.
     await this.router.invalidate(record.id, { clearAcpSession: false });
     await i.reply({ content: "Active turn aborted.", flags: MessageFlags.Ephemeral });
+  }
+
+  // -----------------------------------------------------------------------
+  // /seam image — multi-provider image generation picker
+  // -----------------------------------------------------------------------
+
+  private imagePickers = new Map<string, ImagePickerState>();
+
+  private async cmdImage(i: ChatInputCommandInteraction): Promise<void> {
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel) {
+      await i.reply({ content: "Use `/seam image` from inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const initialPrompt = i.options.getString("prompt") ?? "";
+
+    // If no prompt was provided, open a modal so the user can paste a longer one.
+    let prompt = initialPrompt;
+    if (!prompt.trim()) {
+      const modalId = `img:prompt:${i.id}`;
+      const modal = new ModalBuilder()
+        .setCustomId(modalId)
+        .setTitle("New image prompt")
+        .addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(
+            new TextInputBuilder()
+              .setCustomId("prompt")
+              .setLabel("Describe the image")
+              .setStyle(TextInputStyle.Paragraph)
+              .setRequired(true)
+              .setMaxLength(4000)
+          )
+        );
+      await i.showModal(modal);
+      const submitted = await i.awaitModalSubmit({
+        filter: (m) => m.customId === modalId && m.user.id === i.user.id,
+        time: 300_000,
+      }).catch(() => null);
+      if (!submitted) return;
+      prompt = submitted.fields.getTextInputValue("prompt").trim();
+      if (!prompt) {
+        await submitted.reply({ content: "Empty prompt — cancelled.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await submitted.deferReply();
+      const state = this.makePickerState(prompt);
+      await submitted.editReply(renderImagePicker(state));
+      const msg = await submitted.fetchReply();
+      this.imagePickers.set(msg.id, state);
+      this.attachImagePickerCollector(msg as Message, state);
+      return;
+    }
+
+    await i.deferReply();
+    const state = this.makePickerState(prompt);
+    await i.editReply(renderImagePicker(state));
+    const msg = await i.fetchReply();
+    this.imagePickers.set(msg.id, state);
+    this.attachImagePickerCollector(msg as Message, state);
+  }
+
+  private makePickerState(prompt: string): ImagePickerState {
+    const defaultModel =
+      getImageModelById("nano-banana-2") ?? IMAGE_MODELS[0]!;
+    return {
+      prompt,
+      modelId: defaultModel.id,
+      aspectRatio: defaultModel.aspectRatios.includes("16:9") ? "16:9" : defaultModel.aspectRatios[0]!,
+      resolution: defaultModel.resolutions.includes("1K") ? "1K" : defaultModel.resolutions[0]!,
+      count: 1,
+      references: [],
+      bflKeyAvailable: this.config.BFL_API_KEY.trim().length > 0,
+    };
+  }
+
+  private attachImagePickerCollector(msg: Message, state: ImagePickerState): void {
+    const collector = msg.createMessageComponentCollector({ time: 30 * 60_000 });
+    collector.on("collect", async (bi) => {
+      const customId = bi.customId;
+      try {
+        if (customId === "img:cancel") {
+          collector.stop("cancelled");
+          await bi.update({ content: "Cancelled.", embeds: [], components: [] });
+          return;
+        }
+        if (customId === "img:edit") {
+          const modalId = `img:edit:${bi.id}`;
+          const modal = new ModalBuilder()
+            .setCustomId(modalId)
+            .setTitle("Edit image prompt")
+            .addComponents(
+              new ActionRowBuilder<TextInputBuilder>().addComponents(
+                new TextInputBuilder()
+                  .setCustomId("prompt")
+                  .setLabel("Describe the image")
+                  .setStyle(TextInputStyle.Paragraph)
+                  .setRequired(true)
+                  .setMaxLength(4000)
+                  .setValue(state.prompt.slice(0, 4000))
+              )
+            );
+          await bi.showModal(modal);
+          const submitted = await bi.awaitModalSubmit({
+            filter: (m) => m.customId === modalId && m.user.id === bi.user.id,
+            time: 300_000,
+          }).catch(() => null);
+          if (!submitted) return;
+          state.prompt = submitted.fields.getTextInputValue("prompt").trim();
+          await submitted.deferUpdate();
+          await submitted.editReply(renderImagePicker(state));
+          return;
+        }
+        if (customId === "img:model") {
+          if (!bi.isStringSelectMenu()) return;
+          const picked = bi.values[0]!;
+          const model = getImageModelById(picked);
+          if (!model) return;
+          state.modelId = model.id;
+          if (!model.aspectRatios.includes(state.aspectRatio)) {
+            state.aspectRatio = model.aspectRatios.includes("16:9") ? "16:9" : model.aspectRatios[0]!;
+          }
+          if (!model.resolutions.includes(state.resolution)) {
+            state.resolution = model.resolutions.includes("1K") ? "1K" : model.resolutions[0]!;
+          }
+          if (state.references.length > model.maxReferenceImages) {
+            state.references = state.references.slice(0, model.maxReferenceImages);
+          }
+          if (state.count > model.maxCount) state.count = model.maxCount;
+          await bi.update(renderImagePicker(state));
+          return;
+        }
+        if (customId.startsWith("img:aspect:")) {
+          state.aspectRatio = customId.slice("img:aspect:".length) as AspectRatio;
+          await bi.update(renderImagePicker(state));
+          return;
+        }
+        if (customId === "img:aspect-select") {
+          if (!bi.isStringSelectMenu()) return;
+          state.aspectRatio = bi.values[0]! as AspectRatio;
+          await bi.update(renderImagePicker(state));
+          return;
+        }
+        if (customId.startsWith("img:count:")) {
+          state.count = parseInt(customId.slice("img:count:".length), 10) || 1;
+          await bi.update(renderImagePicker(state));
+          return;
+        }
+        if (customId.startsWith("img:res:")) {
+          state.resolution = customId.slice("img:res:".length) as Resolution;
+          await bi.update(renderImagePicker(state));
+          return;
+        }
+        if (customId === "img:refs") {
+          await this.handleImageRefsButton(bi, state);
+          return;
+        }
+        if (customId === "img:clear-refs") {
+          state.references = [];
+          await bi.update(renderImagePicker(state));
+          return;
+        }
+        if (customId === "img:generate") {
+          await this.handleImageGenerate(bi, state, msg);
+          return;
+        }
+      } catch (err) {
+        this.logger.error({ err, customId }, "image picker handler error");
+        if (!bi.replied && !bi.deferred) {
+          await bi.reply({ content: `Picker error: ${(err as Error).message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+        }
+      }
+    });
+    collector.on("end", () => {
+      this.imagePickers.delete(msg.id);
+    });
+  }
+
+  private async handleImageRefsButton(bi: MessageComponentInteraction, state: ImagePickerState): Promise<void> {
+    const model = getImageModelById(state.modelId);
+    if (!model || model.maxReferenceImages === 0) {
+      await bi.reply({ content: "This model doesn't support reference images.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const remaining = model.maxReferenceImages - state.references.length;
+    if (remaining <= 0) {
+      await bi.reply({ content: `Already at the ${model.maxReferenceImages}-ref limit.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await bi.reply({
+      content: `Upload up to **${remaining}** reference image${remaining === 1 ? "" : "s"} in this channel within 60 seconds. (Or send any non-image message to cancel.)`,
+      flags: MessageFlags.Ephemeral,
+    });
+
+    const channel = bi.channel;
+    if (!channel || !("createMessageCollector" in channel)) {
+      await bi.followUp({ content: "Channel doesn't support uploads.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const mCollector = channel.createMessageCollector({
+      filter: (m) => m.author.id === bi.user.id,
+      time: 60_000,
+    });
+    mCollector.on("collect", async (m) => {
+      const images = m.attachments.filter((a) =>
+        (a.contentType ?? "").startsWith("image/")
+      );
+      if (images.size === 0) {
+        mCollector.stop("done");
+        return;
+      }
+      let added = 0;
+      for (const a of images.values()) {
+        if (state.references.length >= model.maxReferenceImages) break;
+        try {
+          const res = await fetch(a.url);
+          if (!res.ok) continue;
+          const buf = Buffer.from(await res.arrayBuffer());
+          state.references.push({
+            data: buf,
+            mimeType: a.contentType ?? "image/png",
+            ...(a.name ? { filename: a.name } : {}),
+          });
+          added++;
+        } catch { /* skip */ }
+      }
+      try {
+        const picker = renderImagePicker(state);
+        await bi.message.edit(picker);
+      } catch { /* ignore */ }
+      if (added < images.size) mCollector.stop("done");
+    });
+    mCollector.on("end", () => {
+      try {
+        bi.message.edit(renderImagePicker(state)).catch(() => {});
+      } catch { /* ignore */ }
+    });
+  }
+
+  private async handleImageGenerate(
+    bi: MessageComponentInteraction,
+    state: ImagePickerState,
+    msg: Message
+  ): Promise<void> {
+    const model = getImageModelById(state.modelId);
+    if (!model) {
+      await bi.reply({ content: "Model not found.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const googleApiKey = await resolveGoogleApiKey(
+      this.config.GOOGLE_AI_STUDIO_API_KEY,
+      this.config.GOOGLE_AI_STUDIO_API_KEY_FILE
+    );
+    const bflKey = this.config.BFL_API_KEY.trim();
+    if (model.provider === "google" && !googleApiKey) {
+      await bi.reply({ content: "Google AI Studio API key not configured.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (model.provider === "bfl" && !bflKey) {
+      await bi.reply({ content: "BFL API key not configured.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    await bi.update(renderImagePicker(state, { status: "generating" }));
+    const started = Date.now();
+
+    let result;
+    try {
+      result = await generateImage(
+        {
+          model,
+          prompt: state.prompt,
+          aspectRatio: state.aspectRatio,
+          resolution: state.resolution,
+          count: state.count,
+          references: state.references,
+        },
+        { googleApiKey, bflApiKey: bflKey }
+      );
+    } catch (err) {
+      this.logger.error({ err, model: model.id }, "image generation failed");
+      await bi.editReply(
+        renderImagePicker(state, {
+          status: "error",
+          errorMessage: (err as Error).message,
+        })
+      );
+      return;
+    }
+
+    // Save each to <cwd>/.seam-images/<ts>.png and post as Discord attachments.
+    const parentId = (msg.channel as { parentId?: string | null } | undefined)?.parentId ?? undefined;
+    const record = this.router.ensureSessionRecord({
+      platform: "discord",
+      channelRef: msg.channelId,
+      ...(parentId ? { parentRef: parentId } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    const saveDir = path.join(cwd, ".seam-images");
+    try {
+      await fsp.mkdir(saveDir, { recursive: true });
+    } catch { /* best effort */ }
+    const ts = Date.now();
+    const files: AttachmentBuilder[] = [];
+    const savedPaths: string[] = [];
+    for (let i = 0; i < result.images.length; i++) {
+      const img = result.images[i]!;
+      const ext = img.mimeType === "image/jpeg" ? "jpg" : "png";
+      const filename = `${model.id}-${ts}-${i + 1}.${ext}`;
+      const absPath = path.join(saveDir, filename);
+      try {
+        await fsp.writeFile(absPath, img.data);
+        savedPaths.push(absPath);
+      } catch (err) {
+        this.logger.warn({ err, absPath }, "failed to save generated image");
+      }
+      files.push(new AttachmentBuilder(img.data, { name: filename }));
+    }
+
+    const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+    await bi.editReply(
+      renderImagePicker(state, {
+        status: "done",
+        elapsedSec: elapsed,
+        savedPaths,
+      })
+    );
+
+    // Post the generated images as a follow-up message so they don't replace
+    // the picker (the user may want to iterate).
+    try {
+      await bi.followUp({
+        content:
+          `**${model.displayName}** · ${state.aspectRatio} · ${result.images.length} image${result.images.length === 1 ? "" : "s"} · ${elapsed}s` +
+          (savedPaths.length > 0 ? `\n\`${savedPaths[0]}\`` : ""),
+        files,
+      });
+    } catch (err) {
+      this.logger.error({ err }, "failed to post generated images to thread");
+    }
   }
 
   private async cmdReset(i: ChatInputCommandInteraction): Promise<void> {
@@ -1382,6 +2007,9 @@ export class Orchestrator {
     await this.router.invalidate(record.id);
     const cfg = this.store.readConfig(record);
     cfg.model = profile.defaultModel;
+    // Different agent → different context-window characteristics; cached
+    // usage no longer applies.
+    cfg.lastContextUsage = undefined;
     this.persistConfig(record, cfg);
     this.store.upsert({
       ...record,
@@ -1604,10 +2232,24 @@ export class Orchestrator {
 
       const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(row3Buttons);
 
+      const row4Buttons: ButtonBuilder[] = [];
+      if (typeof mgr.compactSession === "function") {
+        row4Buttons.push(
+          new ButtonBuilder()
+            .setCustomId("sessions:import_to_cwd")
+            .setLabel("📤 Import to Cwd")
+            .setStyle(ButtonStyle.Primary)
+        );
+      }
+      const components: ActionRowBuilder<ButtonBuilder>[] = [row1, row2, row3];
+      if (row4Buttons.length > 0) {
+        components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(row4Buttons));
+      }
+
       return {
         content: "",
         embeds: [embed],
-        components: [row1, row2, row3],
+        components,
       };
     };
 
@@ -1895,31 +2537,17 @@ export class Orchestrator {
               })
               .join("\n");
 
-            let maxTranscriptLength = 50000;
-            if (record.agentId === "agy") {
-              maxTranscriptLength = 8000;
-            }
-            if (sanitizedTranscript.length > maxTranscriptLength) {
-              const keepHead = Math.floor(maxTranscriptLength * 0.3);
-              const keepTail = Math.floor(maxTranscriptLength * 0.6);
-              sanitizedTranscript =
-                sanitizedTranscript.substring(0, keepHead) +
-                "\n\n... [Transcript truncated due to length limits] ...\n\n" +
-                sanitizedTranscript.substring(sanitizedTranscript.length - keepTail);
-            }
-
-            let compactionModel = "";
-            if (record.agentId === "agy") {
-              compactionModel = "gemini-pro-agent";
-            } else if (record.agentId === "claude" || record.agentId.startsWith("claude-")) {
-              compactionModel = "sonnet";
-            } else if (record.agentId === "copilot" || record.agentId.startsWith("copilot-") || record.agentId === "remote") {
-              compactionModel = "claude-sonnet-4.6";
-            } else {
+            const compactionModel = this.compactionModelFor(record.agentId);
+            if (!compactionModel) {
               throw new Error(`Rebuild is not supported for agent profile \`${record.agentId}\``);
             }
-
             const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+            const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
+            sanitizedTranscript = fitTranscriptToWindow(
+              sanitizedTranscript,
+              templateOverhead,
+              compactionWindowFor(compactionModel)
+            );
             const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
 
             tempRuntime = new AgentRuntime({
@@ -2195,31 +2823,17 @@ export class Orchestrator {
                 })
                 .join("\n");
 
-              let maxTranscriptLength = 50000;
-              if (record.agentId === "agy") {
-                maxTranscriptLength = 8000;
-              }
-              if (sanitizedTranscript.length > maxTranscriptLength) {
-                const keepHead = Math.floor(maxTranscriptLength * 0.3);
-                const keepTail = Math.floor(maxTranscriptLength * 0.6);
-                sanitizedTranscript =
-                  sanitizedTranscript.substring(0, keepHead) +
-                  "\n\n... [Transcript truncated due to length limits] ...\n\n" +
-                  sanitizedTranscript.substring(sanitizedTranscript.length - keepTail);
-              }
-
-              let compactionModel = "";
-              if (record.agentId === "agy") {
-                compactionModel = "gemini-pro-agent";
-              } else if (record.agentId === "claude" || record.agentId.startsWith("claude-")) {
-                compactionModel = "sonnet";
-              } else if (record.agentId === "copilot" || record.agentId.startsWith("copilot-") || record.agentId === "remote") {
-                compactionModel = "claude-sonnet-4.6";
-              } else {
+              const compactionModel = this.compactionModelFor(record.agentId);
+              if (!compactionModel) {
                 throw new Error(`Manual compaction is not supported for agent profile \`${record.agentId}\``);
               }
-
               const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+              const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
+              sanitizedTranscript = fitTranscriptToWindow(
+                sanitizedTranscript,
+                templateOverhead,
+                compactionWindowFor(compactionModel)
+              );
               const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
 
               tempRuntime = new AgentRuntime({
@@ -2306,6 +2920,175 @@ export class Orchestrator {
             }
           })();
         }
+      } else if (customId === "sessions:import_to_cwd") {
+        const session = sessions[currentIndex];
+        if (!session) return;
+        const compactionModel = this.compactionModelFor(record.agentId);
+        if (!compactionModel || typeof manager.compactSession !== "function") {
+          await btnInteraction.reply({
+            content: `❌ Import is not supported for this agent.`,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const modal = new ModalBuilder()
+          .setCustomId(`sessions:import_cwd_modal:${session.sessionId}`)
+          .setTitle("Import Session to New Cwd")
+          .addComponents(
+            new ActionRowBuilder<TextInputBuilder>().addComponents(
+              new TextInputBuilder()
+                .setCustomId("target_cwd")
+                .setLabel("Target cwd (absolute or under REPOS_ROOT)")
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true)
+                .setPlaceholder("/home/ubuntu/Projects/some-repo")
+            )
+          );
+
+        await btnInteraction.showModal(modal);
+
+        const submission = await btnInteraction.awaitModalSubmit({
+          filter: (mi) =>
+            mi.customId === `sessions:import_cwd_modal:${session.sessionId}` &&
+            mi.user.id === btnInteraction.user.id,
+          time: 120_000,
+        }).catch(() => null);
+
+        if (!submission) return;
+
+        const rawCwd = submission.fields.getTextInputValue("target_cwd").trim();
+        let targetCwd: string;
+        try {
+          targetCwd = resolveRepoPath(this.config.REPOS_ROOT, rawCwd);
+        } catch (err) {
+          await submission.reply({
+            content: `❌ Invalid cwd: ${(err as Error).message}`,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        await submission.deferUpdate();
+        await submission.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle("📤 Importing Session…")
+              .setDescription(
+                `Summarizing session \`${session.sessionId}\` and creating a new session under \`${this.repoDisplay(targetCwd)}\`…`
+              )
+              .setColor(0xe67e22),
+          ],
+          components: [],
+        });
+
+        void (async () => {
+          let tempRuntime: AgentRuntime | undefined;
+          try {
+            const transcript = await manager.getTranscript(cwd, session.sessionId);
+            if (!transcript.trim()) {
+              throw new Error("The session transcript is empty.");
+            }
+
+            let sanitizedTranscript = transcript
+              .split("\n")
+              .map((line) =>
+                line.length > 1000
+                  ? line.substring(0, 1000) + " ... [Line truncated]"
+                  : line
+              )
+              .join("\n");
+
+            const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+            const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
+            sanitizedTranscript = fitTranscriptToWindow(
+              sanitizedTranscript,
+              templateOverhead,
+              compactionWindowFor(compactionModel)
+            );
+            const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
+
+            tempRuntime = new AgentRuntime({
+              profile,
+              logger: this.logger.child({ session: `temp-import-${session.sessionId}` }),
+              mcpServers: [],
+            });
+
+            await tempRuntime.start();
+            await tempRuntime.newSession({
+              cwd: targetCwd,
+              model: compactionModel,
+              meta: { reasoningEffort: "low" },
+            });
+
+            let summaryText = "";
+            tempRuntime.onEvent((event) => {
+              if (event.kind === "agent-text") summaryText += event.text;
+            });
+
+            await tempRuntime.prompt(compactionPrompt);
+
+            if (!summaryText.trim()) {
+              throw new Error("Agent completed but returned an empty summary.");
+            }
+
+            const newSessionId = randomUUID();
+            await manager.compactSession!(targetCwd, newSessionId, summaryText);
+
+            // Re-anchor the current thread to the new cwd + new session.
+            await this.router.invalidate(record.id);
+            this.store.upsert({
+              ...record,
+              repoPath: targetCwd,
+              acpSessionId: newSessionId,
+              updatedUtc: new Date().toISOString(),
+            });
+
+            const successEmbed = new EmbedBuilder()
+              .setTitle("📤 Session Imported Successfully!")
+              .setDescription(
+                `Summary of \`${session.sessionId}\` was seeded into a fresh session.\n\n` +
+                `**New Cwd:** \`${this.repoDisplay(targetCwd)}\`\n` +
+                `**New Session ID:** \`${newSessionId}\``
+              )
+              .setColor(0x2ecc71);
+
+            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder()
+                .setCustomId("sessions:summary_back")
+                .setLabel("⬅ Back to Manage")
+                .setStyle(ButtonStyle.Secondary)
+            );
+
+            await submission.editReply({ embeds: [successEmbed], components: [row] });
+          } catch (err: any) {
+            this.logger.error({ err, sessionId: session.sessionId }, "failed to import session");
+            const errorEmbed = new EmbedBuilder()
+              .setTitle("❌ Import Failed")
+              .setDescription(`An error occurred during import:\n\`\`\`\n${err.message}\n\`\`\``)
+              .setColor(0xe74c3c);
+            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+              new ButtonBuilder()
+                .setCustomId("sessions:summary_back")
+                .setLabel("⬅ Back to Manage")
+                .setStyle(ButtonStyle.Secondary)
+            );
+            await submission.editReply({ embeds: [errorEmbed], components: [row] });
+          } finally {
+            if (tempRuntime) {
+              const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
+              await tempRuntime.dispose().catch(() => {});
+              if (tempSessionId) {
+                await manager.deleteSession(targetCwd, tempSessionId).catch((cleanupErr) => {
+                  this.logger.warn(
+                    { err: cleanupErr, sessionId: tempSessionId },
+                    "failed to clean up temporary import session"
+                  );
+                });
+              }
+            }
+          }
+        })();
       } else if (customId === "sessions:migrate") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
@@ -2396,31 +3179,17 @@ export class Orchestrator {
                 })
                 .join("\n");
 
-              let maxTranscriptLength = 50000;
-              if (record.agentId === "agy") {
-                maxTranscriptLength = 8000;
-              }
-              if (sanitizedTranscript.length > maxTranscriptLength) {
-                const keepHead = Math.floor(maxTranscriptLength * 0.3);
-                const keepTail = Math.floor(maxTranscriptLength * 0.6);
-                sanitizedTranscript =
-                  sanitizedTranscript.substring(0, keepHead) +
-                  "\n\n... [Transcript truncated due to length limits] ...\n\n" +
-                  sanitizedTranscript.substring(sanitizedTranscript.length - keepTail);
-              }
-
-              let compactionModel = "";
-              if (record.agentId === "agy") {
-                compactionModel = "gemini-pro-agent";
-              } else if (record.agentId === "claude" || record.agentId.startsWith("claude-")) {
-                compactionModel = "sonnet";
-              } else if (record.agentId === "copilot" || record.agentId.startsWith("copilot-") || record.agentId === "remote") {
-                compactionModel = "claude-sonnet-4.6";
-              } else {
+              const compactionModel = this.compactionModelFor(record.agentId);
+              if (!compactionModel) {
                 throw new Error(`Migration compaction is not supported for source agent profile \`${record.agentId}\``);
               }
-
               const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+              const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
+              sanitizedTranscript = fitTranscriptToWindow(
+                sanitizedTranscript,
+                templateOverhead,
+                compactionWindowFor(compactionModel)
+              );
               const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
 
               tempRuntime = new AgentRuntime({
@@ -3601,6 +4370,40 @@ function fmtTokens(n: number): string {
   return `${Math.round(n / 1_000)}k`;
 }
 
+/** Hardcoded context windows for the models we use as compaction summarizers.
+ *  Hardcoded rather than discovered because the call sites need the window
+ *  BEFORE spawning the temp runtime that would learn it from usage_update. */
+const COMPACTION_MODEL_WINDOWS: Record<string, number> = {
+  "opus[1m]": 1_000_000,
+  "gpt-5.5": 400_000,
+  "Gemini 3.1 Pro (High)": 1_000_000,
+};
+
+function compactionWindowFor(modelId: string): number {
+  return COMPACTION_MODEL_WINDOWS[modelId] ?? 200_000;
+}
+
+/** Trim a sanitized transcript so that `template + transcript` fits within
+ *  ~80% of the summarizer model's window (leaving headroom for the response).
+ *  Drops middle content with a marker; keeps 30% head + 60% tail of the
+ *  budget. ~4 chars/token is conservative — real tokenizers pack denser. */
+function fitTranscriptToWindow(
+  transcript: string,
+  templateOverhead: number,
+  modelWindowTokens: number
+): string {
+  const maxChars = Math.floor(modelWindowTokens * 4 * 0.8);
+  const targetLen = Math.max(0, maxChars - templateOverhead);
+  if (transcript.length <= targetLen) return transcript;
+  const keepHead = Math.floor(targetLen * 0.3);
+  const keepTail = Math.floor(targetLen * 0.6);
+  return (
+    transcript.substring(0, keepHead) +
+    "\n\n... [Transcript truncated to fit context window] ...\n\n" +
+    transcript.substring(transcript.length - keepTail)
+  );
+}
+
 function formatAgyUsage(d: import("../../agents/profiles/agy.js").AgyUsage): string {
   const lines: string[] = [];
   const who = [d.name, d.email].filter(Boolean).join(" · ");
@@ -3714,3 +4517,190 @@ function formatResetTime(iso: string): string {
 
 // Re-export for convenience.
 export type { EmbedBuilder };
+
+// -----------------------------------------------------------------------
+// /seam image picker — state + render
+// -----------------------------------------------------------------------
+
+interface ImagePickerState {
+  prompt: string;
+  modelId: string;
+  aspectRatio: AspectRatio;
+  resolution: Resolution;
+  count: number;
+  references: ReferenceImage[];
+  bflKeyAvailable: boolean;
+}
+
+interface ImagePickerRenderOpts {
+  status?: "idle" | "generating" | "done" | "error";
+  elapsedSec?: string;
+  errorMessage?: string;
+  savedPaths?: string[];
+}
+
+function renderImagePicker(
+  state: ImagePickerState,
+  opts: ImagePickerRenderOpts = {}
+): { embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] } {
+  const model = getImageModelById(state.modelId) ?? IMAGE_MODELS[0]!;
+  const status = opts.status ?? "idle";
+
+  const colorByStatus: Record<string, number> = {
+    idle: 0x5865f2,
+    generating: 0xfaa61a,
+    done: 0x57f287,
+    error: 0xed4245,
+  };
+
+  let title = "🎨 Image Generator";
+  if (status === "generating") title = "🎨 Generating…";
+  if (status === "done") title = `✅ Generated in ${opts.elapsedSec ?? "?"}s`;
+  if (status === "error") title = "❌ Generation failed";
+
+  const promptPreview =
+    state.prompt.length > 1000
+      ? state.prompt.slice(0, 997) + "…"
+      : state.prompt;
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setColor(colorByStatus[status]!)
+    .setDescription(`> ${promptPreview.replace(/\n/g, "\n> ")}`);
+
+  embed.addFields(
+    { name: "Model", value: `${model.displayName}`, inline: true },
+    { name: "Aspect", value: state.aspectRatio, inline: true },
+    { name: "Resolution", value: state.resolution, inline: true },
+    { name: "Count", value: `${state.count}`, inline: true }
+  );
+  if (model.maxReferenceImages > 0) {
+    embed.addFields({
+      name: "Refs",
+      value: `${state.references.length} / ${model.maxReferenceImages}`,
+      inline: true,
+    });
+  }
+  if (status === "error" && opts.errorMessage) {
+    embed.addFields({ name: "Error", value: "```\n" + opts.errorMessage.slice(0, 1000) + "\n```" });
+  }
+  if (status === "done" && opts.savedPaths && opts.savedPaths.length > 0) {
+    embed.addFields({
+      name: "Saved",
+      value: opts.savedPaths.map((p) => `\`${p}\``).join("\n").slice(0, 1024),
+    });
+  }
+
+  if (status === "generating") {
+    // Keep the picker visible but disable the controls during generation.
+    return {
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId("img:noop")
+            .setLabel("Generating…")
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(true)
+        ),
+      ],
+    };
+  }
+
+  // Model select
+  const visibleModels = IMAGE_MODELS.filter(
+    (m) => m.provider !== "bfl" || state.bflKeyAvailable
+  );
+  const modelSelect = new StringSelectMenuBuilder()
+    .setCustomId("img:model")
+    .setPlaceholder("Pick model")
+    .addOptions(
+      visibleModels.map((m) => ({
+        label: m.displayName,
+        description: m.description.slice(0, 100),
+        value: m.id,
+        default: m.id === state.modelId,
+      }))
+    );
+
+  // Aspect: button row when ≤5 ratios, select menu otherwise (Discord caps
+  // ActionRow at 5 buttons; FLUX has 6 ratios with 21:9 added).
+  const aspectRow =
+    model.aspectRatios.length <= 5
+      ? new ActionRowBuilder<ButtonBuilder>().addComponents(
+          ...model.aspectRatios.map((ar) =>
+            new ButtonBuilder()
+              .setCustomId(`img:aspect:${ar}`)
+              .setLabel(ar)
+              .setStyle(ar === state.aspectRatio ? ButtonStyle.Primary : ButtonStyle.Secondary)
+          )
+        )
+      : new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+          new StringSelectMenuBuilder()
+            .setCustomId("img:aspect-select")
+            .setPlaceholder("Aspect ratio")
+            .addOptions(
+              model.aspectRatios.map((ar) => ({
+                label: ar,
+                value: ar,
+                default: ar === state.aspectRatio,
+              }))
+            )
+        );
+
+  // Resolution row (1K / 2K / 4K — per-model)
+  const resolutionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    ...model.resolutions.map((r) =>
+      new ButtonBuilder()
+        .setCustomId(`img:res:${r}`)
+        .setLabel(r)
+        .setStyle(r === state.resolution ? ButtonStyle.Primary : ButtonStyle.Secondary)
+    )
+  );
+
+  // Count buttons (1..maxCount, capped at 4 visible)
+  const countChoices: number[] = [];
+  for (let n = 1; n <= Math.min(model.maxCount, 4); n++) countChoices.push(n);
+  const countRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    ...countChoices.map((n) =>
+      new ButtonBuilder()
+        .setCustomId(`img:count:${n}`)
+        .setLabel(`${n}`)
+        .setStyle(n === state.count ? ButtonStyle.Primary : ButtonStyle.Secondary)
+    )
+  );
+
+  // Action row (refs + edit + generate + cancel)
+  const actionButtons: ButtonBuilder[] = [];
+  if (model.maxReferenceImages > 0) {
+    actionButtons.push(
+      new ButtonBuilder()
+        .setCustomId("img:refs")
+        .setLabel(`📎 ${state.references.length}/${model.maxReferenceImages}`)
+        .setStyle(ButtonStyle.Secondary)
+    );
+    if (state.references.length > 0) {
+      actionButtons.push(
+        new ButtonBuilder()
+          .setCustomId("img:clear-refs")
+          .setLabel("🗑️")
+          .setStyle(ButtonStyle.Secondary)
+      );
+    }
+  }
+  actionButtons.push(
+    new ButtonBuilder().setCustomId("img:edit").setLabel("✍️ Edit").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("img:generate").setLabel("✨ Generate").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("img:cancel").setLabel("✖️ Cancel").setStyle(ButtonStyle.Danger)
+  );
+
+  return {
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(modelSelect),
+      aspectRow,
+      resolutionRow,
+      countRow,
+      new ActionRowBuilder<ButtonBuilder>().addComponents(...actionButtons),
+    ],
+  };
+}

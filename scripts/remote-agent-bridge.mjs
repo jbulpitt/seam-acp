@@ -196,6 +196,21 @@ async function claudeCloneSession(cwd, oldSessionId, newSessionId) {
   await fsp.copyFile(src, dst);
 }
 
+/** Write an uploaded attachment to this machine's filesystem under
+ *  `<cwd>/.seam-attachments/<filename>` and return the absolute path. Used by
+ *  network-restricted remote agents that can't fetch Discord CDN URLs but
+ *  can still consume local files. */
+async function writeAttachment(cwd, filename, base64) {
+  // Sanitize filename: strip path separators so callers can't write outside
+  // the .seam-attachments directory.
+  const safe = path.basename(filename).replace(/[\/\\]/g, "_");
+  const dir = path.join(cwd, ".seam-attachments");
+  await fsp.mkdir(dir, { recursive: true });
+  const absPath = path.join(dir, safe);
+  await fsp.writeFile(absPath, Buffer.from(base64, "base64"));
+  return { path: absPath };
+}
+
 /** Match the same logic claude-agent-acp uses to decide if a model has a 1M
  *  context window. The "1m" token appears either as "opus[1m]" or as a
  *  hyphenated suffix like "claude-opus-4-7-1m" in API model ids. */
@@ -206,8 +221,9 @@ function inferClaudeContextLimit(model) {
 }
 
 /** Read the most recent assistant `usage` block from a Claude Code JSONL
- *  transcript. Returns zeros if no JSONL or no assistant message found. */
-async function claudeGetUsage(cwd, sessionId) {
+ *  transcript. Returns zeros if no JSONL or no assistant message found.
+ *  When newerThanMs is provided, skips any entry whose timestamp is older. */
+async function claudeGetUsage(cwd, sessionId, newerThanMs) {
   const empty = { model: null, totalUsed: 0, contextLimit: 200_000 };
   const projectDir = await resolveClaudeProjectDir(cwd);
   let files;
@@ -245,11 +261,17 @@ async function claudeGetUsage(cwd, sessionId) {
   } catch {
     return empty;
   }
+  const cutoff = typeof newerThanMs === "number" ? newerThanMs : 0;
   const lines = content.split("\n").filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
       const entry = JSON.parse(lines[i]);
       if (entry.type !== "assistant" || !entry.message?.usage) continue;
+      // If a timestamp filter is set, skip entries older than the cutoff.
+      if (cutoff > 0 && entry.timestamp) {
+        const entryMs = Date.parse(entry.timestamp);
+        if (!isNaN(entryMs) && entryMs < cutoff) continue;
+      }
       const u = entry.message.usage;
       const model = entry.message.model ?? null;
       const inputTokens = u.input_tokens || 0;
@@ -471,7 +493,9 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
         } else if (action === "compactSession") {
           result = await claudeCompactSession(payload.cwd, payload.sessionId, payload.summary);
         } else if (action === "getUsage") {
-          result = await claudeGetUsage(payload.cwd, payload.sessionId);
+          result = await claudeGetUsage(payload.cwd, payload.sessionId, payload.newerThanMs);
+        } else if (action === "writeAttachment") {
+          result = await writeAttachment(payload.cwd, payload.filename, payload.base64);
         } else {
           throw new Error(`Unknown action: ${action}`);
         }
@@ -651,6 +675,8 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
         // Returns the slot IDs of currently-active agent processes so the
         // seam-acp side can detect and evict stale slots on reconnect.
         result = { slots: [...slots.keys()] };
+      } else if (action === "writeAttachment") {
+        result = await writeAttachment(payload.cwd, payload.filename, payload.base64);
       } else {
         throw new Error(`Unknown action: ${action}`);
       }

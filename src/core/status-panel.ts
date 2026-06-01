@@ -11,6 +11,10 @@ export interface StatusPanelInput {
   startedUtc: number;
   repoDisplay: string;
   model: string;
+  /** Resolved API model id (e.g. "claude-opus-4-8[1m]"), if different from model alias. */
+  resolvedModel?: string;
+  /** Reasoning effort for this turn, if set. */
+  effort?: string;
   action: string;
   /** Optional context-window line shown when tokens are known. */
   context?: string;
@@ -34,6 +38,8 @@ export function renderStatusPanel(
     elapsedSeconds,
     repoDisplay: input.repoDisplay,
     model: input.model,
+    ...(input.resolvedModel ? { resolvedModel: input.resolvedModel } : {}),
+    ...(input.effort ? { effort: input.effort } : {}),
     action: input.action,
     context: input.context,
     activity: input.activity,
@@ -51,6 +57,12 @@ export class TurnStatus {
   state: TurnState = "Working";
   action = "Starting…";
   model: string;
+  /** Resolved API model id returned by getUsage (e.g. "claude-opus-4-8[1m]").
+   *  Set after the turn completes; cleared on each new TurnStatus instance. */
+  resolvedModel?: string;
+  /** Reasoning effort for this turn (low|medium|high|xhigh|max), or undefined
+   *  when unset (the model's built-in default applies). */
+  effort?: string;
   repoDisplay: string;
   startedUtc: number;
   context?: string;
@@ -59,6 +71,10 @@ export class TurnStatus {
    *  cached tokens, or post-compaction); we want the panel to show the
    *  highest watermark seen so it doesn't visibly drop. Reset per turn. */
   contextUsedHighWater = 0;
+  /** Last-known context-window size for the active model, learned from
+   *  usage-update events. Auto-compact uses this to size the summary prompt
+   *  so it fits comfortably in the same window. 0 = unknown. */
+  contextWindowSize = 0;
   /** Rolling activity log (oldest → newest). Capped to last N entries. */
   activity: string[] = [];
   private static readonly MAX_ACTIVITY = 20;
@@ -68,9 +84,10 @@ export class TurnStatus {
   private thinkingPending = "";
   private static readonly MAX_THINKING = 5;
 
-  constructor(opts: { model: string; repoDisplay: string }) {
+  constructor(opts: { model: string; repoDisplay: string; effort?: string }) {
     this.model = opts.model;
     this.repoDisplay = opts.repoDisplay;
+    if (opts.effort) this.effort = opts.effort;
     this.startedUtc = Date.now();
   }
 
@@ -159,6 +176,8 @@ export class TurnStatus {
       startedUtc: this.startedUtc,
       repoDisplay: this.repoDisplay,
       model: this.model,
+      ...(this.resolvedModel ? { resolvedModel: this.resolvedModel } : {}),
+      ...(this.effort ? { effort: this.effort } : {}),
       action: this.action,
       context: this.context,
       activity: this.activity.length ? [...this.activity] : undefined,

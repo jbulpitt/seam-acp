@@ -36,6 +36,14 @@ export interface AgentProfile {
   readonly threadAbbr?: string;
 
   /**
+   * If true, the agent's host has network restrictions that block Discord
+   * (CDN URLs, etc.). When true, attachments are downloaded server-side and
+   * written to the agent's filesystem via `sessionManager.writeAttachment`;
+   * the LLM gets a local file path in the prompt instead of a Discord URL.
+   */
+  readonly restrictDiscordAccess?: boolean;
+
+  /**
    * Optional config/data directory used by this profile. Profiles that
    * support multi-account isolation (Claude, Copilot) expose this so other
    * subsystems (e.g. usage fetching) can locate the right credentials file.
@@ -47,9 +55,14 @@ export interface AgentProfile {
 
   /**
    * Optional `_meta` payload to attach to `session/new`. Lets a vendor
-   * pass extra hints (e.g. effort) without polluting the generic API.
+   * pass extra hints (compaction threshold, reasoning effort) without
+   * polluting the generic API. `effort` is one of low|medium|high|xhigh|max;
+   * undefined leaves the model's built-in default in place.
    */
-  newSessionMeta?(modelId?: string): Record<string, unknown> | undefined;
+  newSessionMeta?(
+    modelId?: string,
+    effort?: string
+  ): Record<string, unknown> | undefined;
 
   /**
    * Best-effort identity probe: which account is this profile authenticated

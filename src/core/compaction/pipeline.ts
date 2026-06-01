@@ -80,6 +80,16 @@ async function mapLimit<T, R>(
   return results;
 }
 
+/** Render only the events within [fromTs, toTs] (inclusive). Open-ended when a
+ *  bound is undefined. Used to give each deep-dive just its region instead of
+ *  the whole history. */
+function sliceByRange(events: HistoryEvent[], fromTs?: string, toTs?: string): string {
+  const from = fromTs ? Date.parse(fromTs) : -Infinity;
+  const to = toTs ? Date.parse(toTs) : Infinity;
+  const inRange = events.filter((e) => e.ts === 0 || (e.ts >= from && e.ts <= to));
+  return renderHistory(inRange.length ? inRange : events);
+}
+
 /** Render the last events that fit a token budget, for the verbatim window. */
 function recentVerbatim(events: HistoryEvent[], budgetTokens: number): string {
   const budgetChars = budgetTokens * 4;
@@ -136,10 +146,13 @@ export async function runPremiumCompaction(
   const targets = meta.deepDiveTargets ?? [];
   log(`deep-diving ${targets.length} region(s)`);
   const deepDives = await mapLimit(targets, concurrency, async (t, i) => {
-    // Choose the text for the region: Discord text when the meta says so and we
-    // have it; otherwise the session render. (Region slicing by timestamp is a
-    // build-time refinement; v1 hands the relevant whole-source text.)
-    const text = t.source === "discord" && discordText ? discordText : fullText;
+    // Give each deep-dive only its region: Discord text when the meta flagged
+    // this range Discord-preferred and we have it; otherwise the session events
+    // sliced to the target's timestamp range.
+    const text =
+      t.source === "discord" && discordText
+        ? discordText
+        : sliceByRange(richHistory.events, t.fromTs, t.toTs);
     const raw = await runAgent(
       deepDivePrompt({ fromTs: t.fromTs, toTs: t.toTs, depth: t.depth, source: t.source, text }),
       `deepdive-${i}`

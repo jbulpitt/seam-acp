@@ -43,6 +43,15 @@ cheap, high-leverage wins and they belong in the default tier too):
    each agent's stored richness** (graceful degradation): Claude can offer
    thinking + tool context; agy/Copilot offer whatever their stores persisted.
    You can only preserve what was written to disk.
+   - **Verified reality (2026-06-01):** even within Claude, cleartext thinking is
+     *opportunistic* — one real session stored 155/821 thinking blocks in
+     cleartext; another stored **0/803** (all redacted to signature-only). So the
+     "thinking as a first-class source" pillar is *present-when-available*, never
+     assumed. The reader reports `thinkingAvailable`; the deep-dive must adapt.
+   - **Verified compression (2026-06-01):** the richest-source reader compresses
+     two real 15MB+ sessions to ~515K and ~339K estimated tokens — **both fit in
+     a single 1M window.** So map-reduce chunking is genuinely a tail-case path;
+     most sessions analyze in one pass, and the reduce step never overflows.
 3. **The analysis never runs in the live session.** It spawns separate temp
    agents that read chunks **from disk**, so the live session being near-full is
    irrelevant — no chicken-and-egg.

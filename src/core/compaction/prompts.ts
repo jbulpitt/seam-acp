@@ -172,15 +172,18 @@ export function synthesizerPrompt(args: {
 }): string {
   return `Assemble the deep-dive extractions and the meta-analysis into the session's RESUMPTION SUMMARY — a working brief a fresh agent reads to continue the work seamlessly. Favor specificity over narrative.
 
-Structure it EXACTLY as these markdown sections:
+Structure it EXACTLY as these markdown sections (and ONLY these):
 ## Purpose
 ## Current state
 ## Open threads
 ## Decisions & rationale
-## Pinned constraints
-(Carry the pinned constraints verbatim from the provided pinned-facts; do not paraphrase them.)
 
-Do NOT restate a verbatim recent-message window — it is appended to the session separately. Output the markdown directly (no JSON, no fences).
+Do NOT add a pinned-constraints section — the verbatim pinned facts are appended
+to the session separately and must not be paraphrased here. Do NOT restate a
+verbatim recent-message window — it is also appended separately. Output the
+markdown directly (no JSON, no fences). The pinned facts are provided below only
+as context so your prose is consistent with them — reference them naturally, do
+not reproduce them as a list.
 
 === META-ANALYSIS ===
 ${JSON.stringify(args.meta, null, 1)}
@@ -188,7 +191,7 @@ ${JSON.stringify(args.meta, null, 1)}
 === DEEP DIVES ===
 ${JSON.stringify(args.deepDives, null, 1)}
 
-=== PINNED FACTS (carry verbatim into ## Pinned constraints) ===
+=== PINNED FACTS (context only — do NOT reproduce as a section) ===
 ${JSON.stringify(args.pinnedFacts, null, 1)}`;
 }
 

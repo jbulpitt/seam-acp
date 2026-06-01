@@ -21,6 +21,7 @@ import {
   pinnedFactsPrompt,
   assembleNewSession,
   parseJsonOutput,
+  mergePinnedFacts,
   JSON_REPARSE_INSTRUCTION,
   type ChunkAnalysis,
   type MetaAnalysis,
@@ -42,6 +43,11 @@ export interface PremiumCompactionInput {
   concurrency?: number;
   /** Token budget for the verbatim recent window kept in the new session. */
   recentWindowTokens?: number;
+  /** Per-chunk token budget for the pinned-facts pass. Kept well under the
+   *  standard 200K context window so the pass NEVER makes one giant call (which
+   *  both forces the credit-gated 1M tier and is the run's fragile long-pole).
+   *  Each chunk is extracted independently and the results are merged. */
+  pinnedChunkTokens?: number;
   log?: (msg: string) => void;
 }
 
@@ -139,10 +145,10 @@ export async function runPremiumCompaction(
     runAgent,
     concurrency = 6,
     recentWindowTokens = 12_000,
+    pinnedChunkTokens = 120_000,
     log = () => {},
   } = input;
 
-  const fullText = renderHistory(richHistory.events);
   const thinkingAvailable = richHistory.stats.thinkingAvailable;
 
   // --- Stage 1: chunk + analyze (fan-out) -------------------------------------
@@ -197,14 +203,21 @@ export async function runPremiumCompaction(
     }
   });
 
-  // --- Pinned facts (shared) --------------------------------------------------
-  log("extracting pinned facts");
-  const pinnedFacts = await runStructured<PinnedFacts>(
-    runAgent,
-    pinnedFactsPrompt({ text: fullText, thinkingAvailable }),
-    "pinned",
-    log
+  // --- Pinned facts (shared) — chunked fan-out + merge ------------------------
+  // Extract verbatim facts per ~120K-token chunk in parallel, then union them.
+  // This keeps every call under the standard 200K window (no 1M-tier dependency,
+  // no single fragile mega-call) while reconstructing the single-pass result.
+  const pinnedChunks = chunkHistory(richHistory.events, pinnedChunkTokens);
+  log(`extracting pinned facts (${pinnedChunks.length} chunk(s))`);
+  const pinnedParts = await mapLimit(pinnedChunks, concurrency, (c, i) =>
+    runStructured<PinnedFacts>(
+      runAgent,
+      pinnedFactsPrompt({ text: c.text, thinkingAvailable }),
+      `pinned-${i}`,
+      log
+    )
   );
+  const pinnedFacts = mergePinnedFacts(pinnedParts);
 
   // --- Stage 4: synthesize ----------------------------------------------------
   log("synthesizing");

@@ -364,6 +364,34 @@ export interface PinnedFacts {
   rules: string[];
 }
 
+/** Union several per-chunk PinnedFacts into one, de-duplicating each category by
+ *  a normalized key (trimmed, whitespace-collapsed, case-folded) while keeping
+ *  the first-seen original (verbatim) string and its order. Chunked extraction
+ *  avoids ever sending the whole transcript in one call; merging restores the
+ *  single-pass result. Empty/missing arrays are tolerated. */
+export function mergePinnedFacts(parts: Array<Partial<PinnedFacts> | null | undefined>): PinnedFacts {
+  const keys: Array<keyof PinnedFacts> = [
+    "corrections", "constraints", "decisions", "openTodos", "activePaths", "rules",
+  ];
+  const out: PinnedFacts = { corrections: [], constraints: [], decisions: [], openTodos: [], activePaths: [], rules: [] };
+  const norm = (s: string) => s.trim().replace(/\s+/g, " ").toLowerCase();
+  for (const key of keys) {
+    const seen = new Set<string>();
+    for (const part of parts) {
+      const arr = part?.[key];
+      if (!Array.isArray(arr)) continue;
+      for (const item of arr) {
+        if (typeof item !== "string") continue;
+        const k = norm(item);
+        if (!k || seen.has(k)) continue;
+        seen.add(k);
+        out[key].push(item);
+      }
+    }
+  }
+  return out;
+}
+
 export function pinnedFactsPrompt(args: { text: string; thinkingAvailable: boolean }): string {
   return `${ANALYST_FRAME}
 

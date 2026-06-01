@@ -21,6 +21,7 @@ import {
   pinnedFactsPrompt,
   assembleNewSession,
   parseJsonOutput,
+  JSON_REPARSE_INSTRUCTION,
   type ChunkAnalysis,
   type MetaAnalysis,
   type DeepDive,
@@ -58,6 +59,29 @@ export interface PremiumCompactionResult {
     unpreservedItems: number;
     recoveriesRequested: number;
   };
+}
+
+/** Run a structured stage with one corrective retry. The dominant real-run
+ *  failure is an unescaped `"` inside a long free-text field (e.g. a deep-dive
+ *  narrative), which corrupts the whole object's brace-balance and makes it
+ *  unparseable. On the first parse failure we re-prompt once, appending an
+ *  explicit "re-emit as valid JSON, escape interior quotes" instruction — the
+ *  standard self-heal. Throws only if the retry also fails. */
+async function runStructured<T>(
+  runAgent: RunAgent,
+  prompt: string,
+  label: string,
+  log: (msg: string) => void
+): Promise<T> {
+  const raw = await runAgent(prompt, label);
+  try {
+    return parseJsonOutput<T>(raw);
+  } catch (err) {
+    log(`  [${label}] parse failed (${(err as Error).message.slice(0, 80)}); retrying`);
+    const retryPrompt = `${prompt}\n\n${JSON_REPARSE_INSTRUCTION}`;
+    const raw2 = await runAgent(retryPrompt, `${label}-retry`);
+    return parseJsonOutput<T>(raw2);
+  }
 }
 
 /** Bounded-concurrency map. Preserves order; a thrown task rejects the whole
@@ -124,23 +148,23 @@ export async function runPremiumCompaction(
   // --- Stage 1: chunk + analyze (fan-out) -------------------------------------
   const chunks = chunkHistory(richHistory.events);
   log(`analyzing ${chunks.length} chunk(s)`);
-  const chunkAnalyses = await mapLimit(chunks, concurrency, async (c, i) => {
-    const raw = await runAgent(chunkAnalyzerPrompt(c), `chunk-${i}`);
-    return parseJsonOutput<ChunkAnalysis>(raw);
-  });
+  const chunkAnalyses = await mapLimit(chunks, concurrency, (c, i) =>
+    runStructured<ChunkAnalysis>(runAgent, chunkAnalyzerPrompt(c), `chunk-${i}`, log)
+  );
 
   // --- Stage 2: meta-analyze (reduce) -----------------------------------------
   log("meta-analyzing");
-  const metaRaw = await runAgent(
+  const meta = await runStructured<MetaAnalysis>(
+    runAgent,
     metaAnalyzerPrompt({
       chunkAnalyses,
       gapSignals: gapReport.signals.map((s) => `${s.kind}: ${s.detail}`),
       discordRanges: gapReport.discordRanges,
       thinkingAvailable,
     }),
-    "meta"
+    "meta",
+    log
   );
-  const meta = parseJsonOutput<MetaAnalysis>(metaRaw);
 
   // --- Stage 3: deep-dive every target (fan-out, UN-GATED) --------------------
   const targets = meta.deepDiveTargets ?? [];
@@ -153,17 +177,34 @@ export async function runPremiumCompaction(
       t.source === "discord" && discordText
         ? discordText
         : sliceByRange(richHistory.events, t.fromTs, t.toTs);
-    const raw = await runAgent(
-      deepDivePrompt({ fromTs: t.fromTs, toTs: t.toTs, depth: t.depth, source: t.source, text }),
-      `deepdive-${i}`
-    );
-    return parseJsonOutput<DeepDive>(raw);
+    const prompt = deepDivePrompt({ fromTs: t.fromTs, toTs: t.toTs, depth: t.depth, source: t.source, text });
+    try {
+      return await runStructured<DeepDive>(runAgent, prompt, `deepdive-${i}`, log);
+    } catch (err) {
+      // Deep-dives are independent regions. One unrecoverable region must NOT
+      // abort the whole (multi-minute) run — degrade it to a stub the
+      // synthesizer can note, and let the completeness critic flag any gap.
+      log(`  [deepdive-${i}] UNRECOVERABLE after retry (${(err as Error).message.slice(0, 80)}); stubbing region`);
+      return {
+        timeRange: { fromTs: t.fromTs, toTs: t.toTs },
+        narrative: `[deep-dive failed to parse for region ${t.fromTs ?? "?"} → ${t.toTs ?? "?"}; this region was not extracted]`,
+        causalPairs: [],
+        selfCoachedRules: [],
+        userCorrections: [],
+        decisions: [],
+        artifacts: [],
+      } satisfies DeepDive;
+    }
   });
 
   // --- Pinned facts (shared) --------------------------------------------------
   log("extracting pinned facts");
-  const pinnedRaw = await runAgent(pinnedFactsPrompt({ text: fullText, thinkingAvailable }), "pinned");
-  const pinnedFacts = parseJsonOutput<PinnedFacts>(pinnedRaw);
+  const pinnedFacts = await runStructured<PinnedFacts>(
+    runAgent,
+    pinnedFactsPrompt({ text: fullText, thinkingAvailable }),
+    "pinned",
+    log
+  );
 
   // --- Stage 4: synthesize ----------------------------------------------------
   log("synthesizing");
@@ -173,11 +214,12 @@ export async function runPremiumCompaction(
 
   // --- Stage 5: completeness critic (inverted gate) ---------------------------
   log("verifying completeness");
-  const critiqueRaw = await runAgent(
+  const critique = await runStructured<CritiqueResult>(
+    runAgent,
     completenessCriticPrompt({ summaryMarkdown, riskChecklist: meta.riskChecklist ?? [] }),
-    "critic"
+    "critic",
+    log
   );
-  const critique = parseJsonOutput<CritiqueResult>(critiqueRaw);
 
   // Assemble the new-session seed (verbatim recent window appended).
   const assembledSeed = assembleNewSession({

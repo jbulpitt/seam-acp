@@ -45,58 +45,109 @@ export function parseJsonOutput<T = unknown>(raw: string): T {
   if (fence) s = fence[1]!.trim();
 
   // Our contracts are always JSON OBJECTS (never arrays). Try each `{` position
-  // as a candidate start, balanced-extract, and return the first that PARSES.
+  // as a candidate start, balanced-extract, and keep the largest that PARSES.
   // This is resilient to leading garbage that misbehaving stages emit before the
   // real JSON: shell globs like "{ts,js,mjs,json}", or a model that role-plays
   // the transcript for thousands of chars and only emits its JSON at the very
-  // end. Prefer the LAST parseable object when several parse, since the intended
-  // answer is typically the final emission.
-  const balancedEnd = (from: number): number => {
-    let depth = 0, inStr = false, esc = false;
-    for (let i = from; i < s.length; i++) {
-      const ch = s[i]!;
-      if (inStr) {
-        if (esc) esc = false;
-        else if (ch === "\\") esc = true;
-        else if (ch === '"') inStr = false;
-        continue;
-      }
-      if (ch === '"') inStr = true;
-      else if (ch === "{") depth++;
-      else if (ch === "}") { depth--; if (depth === 0) return i; }
-    }
-    return -1;
-  };
-
+  // end.
+  //
   // Prefer the LARGEST parseable object. The intended answer is the outer
   // container (e.g. the whole MetaAnalysis); nested elements (a single
   // deepDiveTarget) and stray braces (globs) parse too but are smaller, and
   // prose ramble doesn't form a large balanced-brace block. "Largest" robustly
   // selects the real object over inner ones. We skip past each chosen object so
   // we don't re-scan its interior.
-  let chosen: T | undefined;
-  let chosenLen = -1;
-  let lastErr = "";
-  for (let i = s.indexOf("{"); i !== -1; i = s.indexOf("{", i + 1)) {
-    const end = balancedEnd(i);
-    if (end === -1) break; // no balanced close from here on
-    const candidate = s.slice(i, end + 1);
-    try {
-      JSON.parse(candidate);
-      if (candidate.length > chosenLen) {
-        chosen = JSON.parse(candidate) as T;
-        chosenLen = candidate.length;
+  const scan = (text: string): { chosen?: T; len: number; lastErr: string } => {
+    let chosen: T | undefined;
+    let chosenLen = -1;
+    let lastErr = "";
+    for (let i = text.indexOf("{"); i !== -1; i = text.indexOf("{", i + 1)) {
+      const end = balancedEndIn(text, i);
+      // Don't give up at the first unbalanced brace: a long narrative field with
+      // an unescaped `"` corrupts string-tracking from THIS `{` onward, but a
+      // later top-level `{` (or the repaired pass) may still balance. Continue.
+      if (end === -1) continue;
+      const candidate = text.slice(i, end + 1);
+      try {
+        const parsed = JSON.parse(candidate) as T;
+        if (candidate.length > chosenLen) {
+          chosen = parsed;
+          chosenLen = candidate.length;
+        }
+        i = end; // skip the interior of this parsed object
+      } catch (err) {
+        lastErr = (err as Error).message;
       }
-      i = end; // skip the interior of this parsed object
-    } catch (err) {
-      lastErr = (err as Error).message;
     }
-  }
-  if (chosen !== undefined) return chosen;
+    return { chosen, len: chosenLen, lastErr };
+  };
+
+  // Scan BOTH the raw text and a control-char-repaired copy, then take the
+  // LARGEST object across both. We can't just fall back to the repaired pass
+  // only when the raw pass finds nothing: when the intended (outer) object
+  // contains a raw newline it fails JSON.parse, yet a SMALLER nested object
+  // (e.g. timeRange) still parses raw — so the raw pass returns the wrong, tiny
+  // object. Repairing control chars is a no-op on already-valid JSON (valid
+  // strings never carry raw control chars), so comparing by length is safe and
+  // recovers the full object. (LLMs frequently emit literal newlines/tabs inside
+  // JSON string values, which JSON.parse rejects.)
+  const raw1 = scan(s);
+  const raw2 = scan(repairJsonControlChars(s));
+  const best = raw2.len > raw1.len ? raw2 : raw1;
+  if (best.chosen !== undefined) return best.chosen;
   throw new Error(
-    `parseJsonOutput: no parseable JSON object found (last error: ${lastErr || "none"}). raw[0..200]: ${raw.slice(0, 200)}`
+    `parseJsonOutput: no parseable JSON object found (last error: ${best.lastErr || raw1.lastErr || "none"}). raw[0..200]: ${raw.slice(0, 200)}`
   );
 }
+
+/** Balanced-brace end index for an object starting at `from` in `text`, or -1
+ *  if it never closes. String-aware (braces inside JSON strings don't count). */
+function balancedEndIn(text: string, from: number): number {
+  let depth = 0, inStr = false, esc = false;
+  for (let i = from; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+/** Escape raw control characters (newline/CR/tab) that appear INSIDE JSON string
+ *  values — a common LLM mistake that makes otherwise-valid JSON unparseable.
+ *  Walks the text string-aware so structural whitespace is left untouched. */
+function repairJsonControlChars(text: string): string {
+  let out = "";
+  let inStr = false, esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inStr) {
+      if (esc) { out += ch; esc = false; continue; }
+      if (ch === "\\") { out += ch; esc = true; continue; }
+      if (ch === '"') { out += ch; inStr = false; continue; }
+      if (ch === "\n") { out += "\\n"; continue; }
+      if (ch === "\r") { out += "\\r"; continue; }
+      if (ch === "\t") { out += "\\t"; continue; }
+      out += ch;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    out += ch;
+  }
+  return out;
+}
+
+/** Corrective suffix re-sent when a structured stage's first reply won't parse.
+ *  The dominant cause is unescaped `"` inside long free-text fields, so we name
+ *  it explicitly. Kept terse so it doesn't re-trigger the role-play failure. */
+export const JSON_REPARSE_INSTRUCTION =
+  "Your previous reply could not be parsed as JSON. Re-emit the SAME analysis as a single valid JSON object and nothing else. Critically: inside every string value, escape all double-quotes as \\\" and all newlines as \\n. Begin your reply with `{`.";
 
 /** Closing instruction appended AFTER the transcript data — an "instruction
  *  sandwich" so the model's last-read directive is to emit JSON, not to continue

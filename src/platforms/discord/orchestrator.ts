@@ -43,6 +43,17 @@ import type { DiscordAdapter } from "./adapter.js";
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
+
+/** Reasoning-effort options for the `/seam effort` picker. Mirror of the SDK's
+ *  EffortLevel type — keep in sync with commands.ts and the bundled SDK
+ *  (docs/model-management-runbook.md §11). `ultra` is not in the SDK. */
+const EFFORT_CHOICES = [
+  { value: "low", label: "Low", description: "Fastest, least reasoning" },
+  { value: "medium", label: "Medium", description: "Light reasoning" },
+  { value: "high", label: "High", description: "Default for most models" },
+  { value: "xhigh", label: "X-High", description: "Deeper reasoning (Opus 4.7+)" },
+  { value: "max", label: "Max", description: "Maximum reasoning depth" },
+];
 // Maximum total size of an inline-rendered fence message
 // (```lang\n...\n``` plus optional notice). Fences whose rendered
 // inline form would exceed this are uploaded as attachments instead.
@@ -1485,29 +1496,68 @@ export class Orchestrator {
     }
     const level = i.options.getString("level");
     const cfg = this.store.readConfig(record);
-    // No argument → report current state (or "unset → agent default").
+    const current = cfg.reasoningEffort ?? "default";
+
+    // No argument → interactive picker (falling back to a text report when the
+    // adapter has no picker support).
     if (!level) {
-      const current = cfg.reasoningEffort;
-      const body = current
-        ? `Reasoning effort: \`${current}\`.`
-        : "Reasoning effort is **unset** for this thread — the agent is using its own default.";
-      await i.reply({ content: body, flags: MessageFlags.Ephemeral });
+      const channel = this.channelRefFromInteraction(i);
+      if (!channel || !this.adapter.sendChoicePicker) {
+        const body =
+          cfg.reasoningEffort
+            ? `Reasoning effort: \`${cfg.reasoningEffort}\`.`
+            : "Reasoning effort is **unset** — the agent uses its own default. Set with `/seam effort level:<low|medium|high|xhigh|max>`.";
+        await i.reply({ content: body, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      await i.editReply(`Current effort: \`${current}\`. Posting picker…`);
+      const picked = await this.adapter.sendChoicePicker(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: "🧠 Choose reasoning effort",
+          fields: [{ name: "Current", value: `\`${current}\``, inline: true }],
+        },
+        choices: EFFORT_CHOICES,
+        authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+        successPanel: (pickedChoice, username) => ({
+          color: 0x57f287,
+          title: "✅ Effort changed",
+          fields: [
+            { name: "Previous", value: `\`${current}\``, inline: true },
+            { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
+          ],
+          footer: `Changed by ${username} — applies on the next message`,
+        }),
+      });
+      if (!picked) return;
+      await this.applyEffortChange(record, picked.value);
       return;
     }
-    cfg.reasoningEffort = level;
-    this.persistConfig(record, cfg);
-    // Effort is applied via _meta.claudeCode.options.effort at session
-    // creation (the only path that works — set_config_option for "effort"
-    // errors and the wrapper ignores `reasoningEffort`). Invalidate the live
-    // runtime so the next turn recreates/resumes the session with the new
-    // effort baked into _meta. Preserve the ACP session id so context survives.
-    if (this.router.hasRuntime(record.id)) {
-      await this.router.invalidate(record.id, { clearAcpSession: false });
-    }
+
+    await this.applyEffortChange(record, level);
     await i.reply({
       content: `Reasoning effort set to \`${level}\` — applies on your next message.`,
       flags: MessageFlags.Ephemeral,
     });
+  }
+
+  /** Persist the effort and invalidate the live runtime so the next turn
+   *  recreates/resumes the session with the new effort in `_meta`. */
+  private async applyEffortChange(
+    record: SessionRecord,
+    level: string
+  ): Promise<void> {
+    const cfg = this.store.readConfig(record);
+    cfg.reasoningEffort = level;
+    this.persistConfig(record, cfg);
+    // Effort applies via _meta.claudeCode.options.effort at session creation
+    // (the only path that works — set_config_option for "effort" errors and the
+    // wrapper ignores `reasoningEffort`). Invalidate so the next turn rebuilds
+    // the session with the new effort; preserve the ACP session id for context.
+    if (this.router.hasRuntime(record.id)) {
+      await this.router.invalidate(record.id, { clearAcpSession: false });
+    }
   }
 
   private async cmdAbort(i: ChatInputCommandInteraction): Promise<void> {

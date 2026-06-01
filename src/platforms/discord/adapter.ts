@@ -396,6 +396,50 @@ export class DiscordAdapter implements ChatAdapter {
     return messages.reverse();
   }
 
+  async fetchThreadMessagesTimed(
+    channel: ChannelRef,
+    opts?: { fromTs?: number; toTs?: number }
+  ): Promise<Array<{ ts: number; authorIsBot: boolean; text: string }>> {
+    const ch = await this.fetchSendableChannel(channel.id);
+    if (!ch.isThread()) throw new Error("Channel is not a thread.");
+    const from = opts?.fromTs ?? -Infinity;
+    const to = opts?.toTs ?? Infinity;
+
+    const messages: Array<{ ts: number; authorIsBot: boolean; text: string }> = [];
+    let lastId: string | undefined;
+
+    while (true) {
+      const options: { limit: number; before?: string } = { limit: 100 };
+      if (lastId) options.before = lastId;
+
+      const chunk = await ch.messages.fetch(options);
+      if (chunk.size === 0) break;
+
+      let allOlderThanFrom = true;
+      for (const msg of chunk.values()) {
+        const ts = msg.createdTimestamp;
+        if (ts >= from) allOlderThanFrom = false;
+        if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) continue;
+        if (!msg.content?.trim() && msg.attachments.size === 0) continue;
+        if (ts < from || ts > to) continue;
+
+        let text = msg.content ?? "";
+        if (msg.attachments.size > 0) {
+          const names = msg.attachments.map((a: any) => a.name).join(", ");
+          text += ` [Attachments: ${names}]`;
+        }
+        messages.push({ ts, authorIsBot: msg.author.bot, text: text.trim() });
+      }
+
+      // We page backwards (newest→oldest). Once an entire page is older than the
+      // lower bound, everything further back is too — stop paginating.
+      if (allOlderThanFrom) break;
+      lastId = chunk.last()?.id;
+    }
+
+    return messages.sort((a, b) => a.ts - b.ts);
+  }
+
   async sendPanel(
     channel: ChannelRef,
     panel: import("../../core/types.js").StructuredPanel

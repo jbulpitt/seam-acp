@@ -381,6 +381,18 @@ export function makeClaudeProfile(opts: {
         return empty;
       },
 
+      async getHistoryPath(cwd: string, sessionId: string): Promise<string | undefined> {
+        const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
+        const projectDir = await resolveProjectDir(dir, cwd);
+        const file = path.join(projectDir, `${sessionId}.jsonl`);
+        try {
+          await fsp.access(file);
+          return file;
+        } catch {
+          return undefined;
+        }
+      },
+
       async getTranscript(cwd: string, sessionId: string): Promise<string> {
         const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
         const projectDir = await resolveProjectDir(dir, cwd);

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type MessageComponentInteraction, type Message } from "discord.js";
 import {
@@ -26,6 +27,10 @@ import type {
 } from "../chat-adapter.js";
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
 import { cleanTextForPreview, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "../../agents/session-manager.js";
+import { readRichHistory } from "../../core/compaction/source-reader.js";
+import { analyzeSessionCoverage, detectGaps, type TimeRange } from "../../core/compaction/gap-detector.js";
+import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
+import type { AgentProfile } from "../../agents/agent-profile.js";
 import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
@@ -1273,6 +1278,136 @@ export class Orchestrator {
     } catch { /* best-effort */ }
   }
 
+  /** Build a premium-compaction `runAgent`: each call spawns a FRESH throwaway
+   *  AgentRuntime (model "default" → real Opus @ 1M; the "opus[1m]" alias
+   *  mis-resolves) in cwd /tmp so the analysis sessions never pollute the real
+   *  project's session list, collects the agent's text, and tears down +
+   *  deletes the temp session. Fresh-per-call is required: the pipeline fans out
+   *  ~16 concurrent calls, and a shared session would accumulate context and
+   *  mis-attribute interleaved text. */
+  private makeCompactionRunAgent(profile: AgentProfile, manager: ISessionManager): RunAgent {
+    return async (prompt: string, label: string): Promise<string> => {
+      let rt: AgentRuntime | undefined;
+      try {
+        rt = new AgentRuntime({
+          profile,
+          logger: this.logger.child({ compaction: label }),
+          mcpServers: [],
+        });
+        await rt.start();
+        await rt.newSession({ cwd: "/tmp", model: "default" });
+        let text = "";
+        rt.onEvent((event) => {
+          if (event.kind === "agent-text") text += event.text;
+        });
+        await rt.prompt(prompt);
+        return text;
+      } finally {
+        if (rt) {
+          const tempSessionId = rt.getSessionInfo()?.sessionId;
+          await rt.dispose().catch(() => {});
+          if (tempSessionId) {
+            await manager.deleteSession("/tmp", tempSessionId).catch(() => {});
+          }
+        }
+      }
+    };
+  }
+
+  /** Render flagged Discord ranges to plain text for the deep-dive of any span
+   *  where the session store is summary-only/absent (gap-detector's call). */
+  private renderDiscordRanges(
+    msgs: Array<{ ts: number; authorIsBot: boolean; text: string }>,
+    ranges: TimeRange[]
+  ): string {
+    const inAny = (ts: number) =>
+      ranges.some((r) => {
+        const from = r.fromTs ? Date.parse(r.fromTs) : -Infinity;
+        const to = r.toTs ? Date.parse(r.toTs) : Infinity;
+        return ts >= from && ts <= to;
+      });
+    return msgs
+      .filter((m) => m.text && inAny(m.ts))
+      .map((m) => `[${new Date(m.ts).toISOString()}] ${m.authorIsBot ? "ASSISTANT" : "USER"}: ${m.text}`)
+      .join("\n\n");
+  }
+
+  /** Run the premium multi-agent compaction pipeline for a session, READ-ONLY
+   *  w.r.t. the real session (analysis runs in temp /tmp runtimes). Resolves the
+   *  raw JSONL, runs mandatory gap-detection, pulls Discord only for flagged
+   *  ranges, then fans out the pipeline. Returns the full result; the caller
+   *  decides whether to write it back via compactSession. */
+  private async runPremiumCompactionForSession(args: {
+    profile: AgentProfile;
+    manager: ISessionManager;
+    sessionId: string;
+    cwd: string;
+    channel?: ChannelRef;
+    onProgress?: (msg: string) => void;
+  }): Promise<PremiumCompactionResult> {
+    const { profile, manager, sessionId, cwd, channel, onProgress } = args;
+    const log = (m: string) => { onProgress?.(m); this.logger.debug({ compaction: sessionId }, m); };
+
+    if (!manager.getHistoryPath) {
+      throw new Error(`Premium compaction needs a raw-history reader; agent \`${profile.id}\` has none.`);
+    }
+    const jsonlPath = await manager.getHistoryPath(cwd, sessionId);
+    if (!jsonlPath) throw new Error("Could not locate the session's raw history file.");
+
+    log("reading session history…");
+    const richHistory = await readRichHistory(jsonlPath);
+
+    // Mandatory gap-detection. Pull the thread's messages (with timestamps) when
+    // the adapter supports it, both to anchor threadFirstTs and to enrich any
+    // flagged ranges where Discord out-fidelities the session store.
+    const coverage = await analyzeSessionCoverage(jsonlPath);
+    let threadMsgs: Array<{ ts: number; authorIsBot: boolean; text: string }> = [];
+    if (channel && typeof this.adapter.fetchThreadMessagesTimed === "function") {
+      try { threadMsgs = await this.adapter.fetchThreadMessagesTimed(channel); }
+      catch (err) { this.logger.warn({ err }, "premium-compact: thread fetch failed"); }
+    }
+    const threadFirstTs = threadMsgs[0]?.ts ? new Date(threadMsgs[0]!.ts).toISOString() : undefined;
+    const gapReport = detectGaps({ coverage, ...(threadFirstTs ? { threadFirstTs } : {}) });
+
+    let discordText: string | undefined;
+    if (gapReport.needDiscord && threadMsgs.length > 0) {
+      discordText = this.renderDiscordRanges(threadMsgs, gapReport.discordRanges);
+      log(`gap-detection: ${gapReport.signals.map((s) => s.kind).join(", ")} → ${gapReport.discordRanges.length} Discord range(s)`);
+    } else if (gapReport.needDiscord) {
+      log(`gap-detection flagged ${gapReport.signals.length} gap(s) but Discord history is unavailable`);
+    }
+
+    const runAgent = this.makeCompactionRunAgent(profile, manager);
+    return runPremiumCompaction({
+      richHistory,
+      gapReport,
+      ...(discordText ? { discordText } : {}),
+      runAgent,
+      log,
+    });
+  }
+
+  /** Full human-readable report of a premium-compaction run (critic verdicts,
+   *  recovery requests, pinned facts, the assembled seed) so the detail is
+   *  reviewable beyond the Discord summary card. */
+  private formatPremiumReport(result: PremiumCompactionResult, sessionId: string): string {
+    const v = result.critique.verdicts ?? [];
+    const rec = result.critique.recoveries ?? [];
+    return [
+      `# Premium compaction report — ${sessionId}`,
+      ``,
+      `- Stats: ${JSON.stringify(result.stats)}`,
+      ``,
+      `## Completeness critic (${v.filter((x) => x.preserved).length}/${v.length} preserved)`,
+      ...v.map((x) => `- ${x.preserved ? "✅" : "❌"} **${x.checklistItem}** — ${x.evidence}`),
+      rec.length ? `\n### Recovery requests\n` + rec.map((r) => `- ${r.what} (${r.fromTs ?? "?"}→${r.toTs ?? "?"}, ${r.source})`).join("\n") : `\n(no recoveries requested)`,
+      ``, `---`, ``,
+      `## Pinned facts (verbatim)`, "```json", JSON.stringify(result.pinnedFacts, null, 2), "```",
+      ``, `---`, ``,
+      `## Assembled session seed`, ``, result.assembledSeed,
+    ].join("\n");
+  }
+
   private async cmdNew(i: ChatInputCommandInteraction): Promise<void> {
     if (!this.adapter.createThread) {
       await i.reply({
@@ -2291,6 +2426,16 @@ export class Orchestrator {
             .setStyle(ButtonStyle.Primary)
         );
       }
+      // Premium (multi-agent) compaction — needs both a raw-history reader and
+      // a way to write the result back.
+      if (typeof mgr.compactSession === "function" && typeof mgr.getHistoryPath === "function") {
+        row4Buttons.push(
+          new ButtonBuilder()
+            .setCustomId("sessions:premium")
+            .setLabel("✨ Premium Compact")
+            .setStyle(ButtonStyle.Success)
+        );
+      }
       const components: ActionRowBuilder<ButtonBuilder>[] = [row1, row2, row3];
       if (row4Buttons.length > 0) {
         components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(row4Buttons));
@@ -2967,6 +3112,88 @@ export class Orchestrator {
                   });
                 }
               }
+            }
+          })();
+        }
+      } else if (customId === "sessions:premium") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session) {
+          const channelRef = this.channelRefFromInteraction(i);
+          const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setCustomId("sessions:summary_back").setLabel("⬅ Back to Manage").setStyle(ButtonStyle.Secondary)
+          );
+          const progressEmbed = new EmbedBuilder()
+            .setTitle("✨ Premium Compaction")
+            .setDescription(`Running multi-agent compaction on \`${session.sessionId}\`…\nThis can take several minutes (fan-out → reduce → deep-dive → synthesize → verify).`)
+            .setColor(0x9b59b6);
+          await btnInteraction.editReply({ embeds: [progressEmbed], components: [] });
+
+          void (async () => {
+            // Throttle progress edits so we don't hit Discord's rate limit.
+            let lastEdit = 0;
+            let editing = false;
+            const lines: string[] = [];
+            const pushProgress = (m: string) => {
+              lines.push(m);
+              const now = Date.now();
+              if (editing || now - lastEdit < 2500) return;
+              editing = true;
+              lastEdit = now;
+              const tail = lines.slice(-8).map((l) => `• ${l}`).join("\n");
+              btnInteraction.editReply({
+                embeds: [EmbedBuilder.from(progressEmbed).setDescription(`Compacting \`${session.sessionId}\`…\n\n${tail}`)],
+                components: [],
+              }).catch(() => {}).finally(() => { editing = false; });
+            };
+
+            try {
+              const result = await this.runPremiumCompactionForSession({
+                profile,
+                manager,
+                sessionId: session.sessionId,
+                cwd,
+                ...(channelRef ? { channel: channelRef } : {}),
+                onProgress: pushProgress,
+              });
+
+              if (!result.assembledSeed.trim()) throw new Error("Pipeline produced an empty result.");
+
+              await manager.compactSession!(cwd, session.sessionId, result.assembledSeed);
+              sessions = await manager.listSessions(cwd);
+              const newIndex = sessions.findIndex((s) => s.sessionId === session.sessionId);
+              if (newIndex !== -1) currentIndex = newIndex;
+
+              const reportPath = path.join(os.tmpdir(), `premium-compaction-${session.sessionId}.md`);
+              await fsp.writeFile(reportPath, this.formatPremiumReport(result, session.sessionId), "utf8").catch(() => {});
+
+              const v = result.critique.verdicts ?? [];
+              const preserved = v.filter((x) => x.preserved).length;
+              const successEmbed = new EmbedBuilder()
+                .setTitle("✨ Premium Compaction Complete")
+                .setDescription(`Session \`${session.sessionId}\` was compacted with the multi-agent pipeline.`)
+                .addFields(
+                  { name: "Chunks", value: String(result.stats.chunks), inline: true },
+                  { name: "Deep-dives", value: String(result.stats.deepDives), inline: true },
+                  { name: "Completeness", value: `${preserved}/${v.length} preserved`, inline: true },
+                  { name: "Recoveries flagged", value: String(result.stats.recoveriesRequested), inline: true },
+                )
+                .setColor(0x2ecc71);
+
+              await btnInteraction.editReply({
+                embeds: [successEmbed],
+                components: [backRow],
+                files: [new AttachmentBuilder(reportPath, { name: `premium-compaction-${session.sessionId}.md` })],
+              }).catch(async () => {
+                await btnInteraction.editReply({ embeds: [successEmbed], components: [backRow] }).catch(() => {});
+              });
+            } catch (err: any) {
+              this.logger.error({ err, sessionId: session.sessionId }, "premium compaction failed");
+              const errorEmbed = new EmbedBuilder()
+                .setTitle("❌ Premium Compaction Failed")
+                .setDescription(`\`\`\`\n${(err?.message ?? String(err)).slice(0, 1500)}\n\`\`\``)
+                .setColor(0xe74c3c);
+              await btnInteraction.editReply({ embeds: [errorEmbed], components: [backRow] }).catch(() => {});
             }
           })();
         }

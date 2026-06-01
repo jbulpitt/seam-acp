@@ -89,6 +89,15 @@ export interface ChatAdapter {
   /** Optional: fetch historical messages for a thread (chronological order). */
   fetchThreadMessages?(channel: ChannelRef): Promise<Array<{ authorIsBot: boolean; text: string }>>;
 
+  /** Optional: fetch historical messages with timestamps (ms epoch), optionally
+   *  bounded to [fromTs, toTs]. Used by premium compaction to pull only the
+   *  Discord ranges the gap-detector flagged as higher-fidelity than the session
+   *  store. Chronological order. */
+  fetchThreadMessagesTimed?(
+    channel: ChannelRef,
+    opts?: { fromTs?: number; toTs?: number }
+  ): Promise<Array<{ ts: number; authorIsBot: boolean; text: string }>>;
+
   /** Optional: send a rich structured panel (embed on Discord). */
   sendPanel?(channel: ChannelRef, panel: StructuredPanel): Promise<MessageRef>;
 

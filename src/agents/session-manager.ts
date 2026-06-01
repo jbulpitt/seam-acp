@@ -27,6 +27,12 @@ export interface ISessionManager {
   getTranscript(cwd: string, sessionId: string): Promise<string>;
   repairSession?(cwd: string, sessionId: string): Promise<void>;
   compactSession?(cwd: string, sessionId: string, summary: string): Promise<void>;
+  /** Optional: absolute path to the session's raw on-disk history (e.g. the
+   *  Claude JSONL), if this backend stores one. Premium compaction reads this
+   *  directly for the richest source (thinking + tool context) rather than the
+   *  text-only `getTranscript`. Returns undefined when the file doesn't exist or
+   *  the backend has no raw-history file. */
+  getHistoryPath?(cwd: string, sessionId: string): Promise<string | undefined>;
   /** Optional side-channel readout of the most recent context-window usage
    *  (e.g. parsed from session transcripts on disk). Used by profiles where
    *  the ACP path doesn't surface live `usage_update` notifications. */

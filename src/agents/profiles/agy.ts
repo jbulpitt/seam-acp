@@ -175,6 +175,9 @@ export function makeAgyProfile(opts: {
     defaultModel,
     staticModels: opts.staticModels,
     threadAbbr: opts.threadAbbr,
+    // agy bakes effort into the model choice (high/med/low model variants) —
+    // there is no separate reasoning-effort knob, so the picker is suppressed.
+    effort: { mechanism: "modelBaked", levels: [] },
     spawn() {
       return makeFakeAgyProcess(cli, mappingFile, opts.printTimeoutSeconds);
     },

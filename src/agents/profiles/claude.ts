@@ -96,6 +96,8 @@ export function makeClaudeProfile(opts: {
     staticModels: opts.staticModels,
     threadAbbr: opts.threadAbbr,
     configDir,
+    // Effort is applied via `_meta.claudeCode.options.effort` in newSessionMeta.
+    effort: { mechanism: "meta", levels: ["low", "medium", "high", "xhigh", "max"] },
     spawn() {
       const env: NodeJS.ProcessEnv = { ...process.env };
       if (configDir) env.CLAUDE_CONFIG_DIR = configDir;

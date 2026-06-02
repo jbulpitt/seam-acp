@@ -54,6 +54,27 @@ export interface AgentProfile {
   spawn(): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
 
   /**
+   * How this agent exposes reasoning effort, if at all. Drives both the
+   * `/seam effort` picker (which levels to offer, or whether to show it) and
+   * the application path in AgentRuntime:
+   *   - "meta"        → folded into `session/new` `_meta` via `newSessionMeta`
+   *                     (Claude: `_meta.claudeCode.options.effort`).
+   *   - "configOption"→ applied after session creation via ACP
+   *                     `setSessionConfigOption` (Copilot: `reasoning_effort`).
+   *   - "modelBaked"  → effort is part of the model choice; no separate control
+   *                     (agy ships high/med/low model variants).
+   *   - "none"        → the agent has no reasoning-effort concept.
+   * Omit entirely to mean "not settable" (treated like "none").
+   */
+  readonly effort?: {
+    readonly mechanism: "meta" | "configOption" | "modelBaked" | "none";
+    /** ACP config option id for mechanism "configOption" (e.g. "reasoning_effort"). */
+    readonly configId?: string;
+    /** Levels the picker should offer. Empty ⇒ effort is not separately settable. */
+    readonly levels: ReadonlyArray<string>;
+  };
+
+  /**
    * Optional `_meta` payload to attach to `session/new`. Lets a vendor
    * pass extra hints (compaction threshold, reasoning effort) without
    * polluting the generic API. `effort` is one of low|medium|high|xhigh|max;

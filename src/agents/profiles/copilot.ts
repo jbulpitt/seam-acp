@@ -54,6 +54,10 @@ export function makeCopilotProfile(opts: {
     staticModels: opts.staticModels,
     threadAbbr: opts.threadAbbr,
     configDir,
+    // Copilot exposes reasoning effort as an ACP config option (verified via
+    // `copilot --acp`: configOptions[id=reasoning_effort], low|medium|high).
+    // Applied post-session-create via setSessionConfigOption (AgentRuntime).
+    effort: { mechanism: "configOption", configId: "reasoning_effort", levels: ["low", "medium", "high"] },
     spawn() {
       const args = ["--acp"];
       if (additionalMcpJson) {

@@ -305,6 +305,9 @@ export class AgentRuntime {
       }
     }
 
+    // Apply reasoning effort for agents that take it as a config option (Copilot).
+    await this.applyConfigOptionEffort(opts.effort);
+
     return this.sessionInfo;
   }
 
@@ -356,6 +359,10 @@ export class AgentRuntime {
         }
       }
     }
+
+    // Re-apply reasoning effort on resume (config options don't persist across
+    // a subprocess restart any more than the model does).
+    await this.applyConfigOptionEffort(opts.effort);
 
     return this.sessionInfo;
   }
@@ -443,6 +450,24 @@ export class AgentRuntime {
         configId,
         value,
       });
+    }
+  }
+
+  /** Apply reasoning effort for agents that take it as an ACP config option
+   *  (e.g. Copilot's "reasoning_effort"). Claude folds effort into `_meta` via
+   *  newSessionMeta instead; modelBaked/none agents have nothing to set. Must
+   *  run after the session exists — config options require a live session. */
+  private async applyConfigOptionEffort(effort?: string): Promise<void> {
+    const eff = this.profile.effort;
+    if (!eff || eff.mechanism !== "configOption" || !eff.configId) return;
+    if (!effort || effort === "default" || !eff.levels.includes(effort)) return;
+    try {
+      await this.setConfigOption(eff.configId, effort);
+    } catch (err) {
+      this.logger.warn(
+        { err, effort, configId: eff.configId },
+        "failed to apply reasoning-effort config option"
+      );
     }
   }
 

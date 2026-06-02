@@ -30,6 +30,7 @@ import { cleanTextForPreview, type SessionSummary, type SessionSummaryLine, type
 import { readRichHistory } from "../../core/compaction/source-reader.js";
 import { analyzeSessionCoverage, detectGaps, type TimeRange } from "../../core/compaction/gap-detector.js";
 import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
+import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, assembleNewSession, type PinnedFacts } from "../../core/compaction/prompts.js";
 import type { AgentProfile } from "../../agents/agent-profile.js";
 import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
@@ -1197,64 +1198,34 @@ export class Orchestrator {
     } catch { /* best-effort — don't block compaction on a failed card send */ }
 
     const cwd = record.repoPath ?? process.cwd();
-    let transcript: string;
-    try {
-      transcript = await manager.getTranscript(cwd, record.acpSessionId);
-    } catch (err) {
-      this.logger.warn({ err, session: record.id }, "auto-compact: getTranscript failed");
-      return;
-    }
-    if (!transcript.trim()) return;
-
-    let sanitized = transcript
-      .split("\n")
-      .map((line) => (line.length > 1000 ? line.substring(0, 1000) + " ... [Line truncated]" : line))
-      .join("\n");
-
-    const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
-    const summaryModel = this.compactionModelFor(record.agentId);
-    if (!summaryModel) {
+    if (!this.compactionModelFor(record.agentId)) {
       this.logger.warn({ agent: record.agentId }, "auto-compact: no compaction model configured");
       return;
     }
-    const windowTokens = compactionWindowFor(summaryModel);
-    const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
-    sanitized = fitTranscriptToWindow(sanitized, templateOverhead, windowTokens);
-    const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitized}`;
 
-    let tempRuntime: AgentRuntime | undefined;
-    let summaryText = "";
+    let built: { seed: string; keptTurns: number; summarizedTurns: number; pinnedCount: number } | null = null;
     try {
-      tempRuntime = new AgentRuntime({
+      built = await this.buildDefaultCompactionSeed({
         profile,
-        logger: this.logger.child({ session: `auto-compact-${record.id}` }),
-        mcpServers: [],
-      });
-      await tempRuntime.start();
-      await tempRuntime.newSession({
+        manager,
+        agentId: record.agentId,
         cwd,
-        model: summaryModel,
-        meta: { reasoningEffort: "low" },
+        sessionId: record.acpSessionId,
       });
-      tempRuntime.onEvent((event) => {
-        if (event.kind === "agent-text") summaryText += event.text;
-      });
-      await tempRuntime.prompt(compactionPrompt);
-    } finally {
-      if (tempRuntime) {
-        try { await tempRuntime.dispose(); } catch { /* best-effort */ }
-      }
+    } catch (err) {
+      this.logger.warn({ err, session: record.id }, "auto-compact: seed build failed");
+      return;
     }
-
-    if (!summaryText.trim()) {
-      this.logger.warn({ session: record.id }, "auto-compact: empty summary from temp runtime");
+    if (!built) {
+      this.logger.warn({ session: record.id }, "auto-compact: nothing to compact");
       return;
     }
 
-    await manager.compactSession(cwd, record.acpSessionId, summaryText);
+    await manager.compactSession(cwd, record.acpSessionId, built.seed);
     await this.router.invalidate(record.id, { clearAcpSession: false });
 
     const elapsedSec = Math.round((Date.now() - compactStartedAt) / 1000);
+    const summaryText = built.seed;
     // Rough estimate — 4 chars per token. The next real turn will replace this
     // with an authoritative usage_update reading.
     const tokensAfterEst = Math.ceil(summaryText.length / 4);
@@ -1285,7 +1256,13 @@ export class Orchestrator {
    *  deletes the temp session. Fresh-per-call is required: the pipeline fans out
    *  ~16 concurrent calls, and a shared session would accumulate context and
    *  mis-attribute interleaved text. */
-  private makeCompactionRunAgent(profile: AgentProfile, manager: ISessionManager): RunAgent {
+  private makeCompactionRunAgent(
+    profile: AgentProfile,
+    manager: ISessionManager,
+    opts?: { model?: string; cwd?: string }
+  ): RunAgent {
+    const model = opts?.model ?? "default";
+    const cwd = opts?.cwd ?? "/tmp";
     return async (prompt: string, label: string): Promise<string> => {
       let rt: AgentRuntime | undefined;
       try {
@@ -1295,7 +1272,7 @@ export class Orchestrator {
           mcpServers: [],
         });
         await rt.start();
-        await rt.newSession({ cwd: "/tmp", model: "default" });
+        await rt.newSession({ cwd, model, meta: { reasoningEffort: "low" } });
         let text = "";
         rt.onEvent((event) => {
           if (event.kind === "agent-text") text += event.text;
@@ -1307,7 +1284,7 @@ export class Orchestrator {
           const tempSessionId = rt.getSessionInfo()?.sessionId;
           await rt.dispose().catch(() => {});
           if (tempSessionId) {
-            await manager.deleteSession("/tmp", tempSessionId).catch(() => {});
+            await manager.deleteSession(cwd, tempSessionId).catch(() => {});
           }
         }
       }
@@ -1385,6 +1362,93 @@ export class Orchestrator {
       runAgent,
       log,
     });
+  }
+
+  /** Split a `getTranscript` rendering ("### User\n…\n\n### Assistant\n…") into
+   *  its turn blocks, preserving order and the role headers. */
+  private splitTranscriptTurns(transcript: string): string[] {
+    return transcript
+      .split(/\n\n(?=### (?:User|Assistant)\n)/)
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0);
+  }
+
+  /** Default-tier ("cheap") compaction seed, with the three shared wins backported
+   *  (design §1): a verbatim recent window (last turns kept word-for-word), a
+   *  verbatim pinned-facts block, and a visible drop-note so loss is recoverable.
+   *  Returns null when there's nothing to compact or no summarizer model — the
+   *  caller then keeps the legacy behavior. Works for any agent with a transcript
+   *  reader; analysis runs in throwaway runtimes. */
+  private async buildDefaultCompactionSeed(args: {
+    profile: AgentProfile;
+    manager: ISessionManager;
+    agentId: string;
+    cwd: string;
+    sessionId: string;
+    recentWindowTokens?: number;
+    log?: (msg: string) => void;
+  }): Promise<{ seed: string; keptTurns: number; summarizedTurns: number; pinnedCount: number } | null> {
+    const { profile, manager, agentId, cwd, sessionId } = args;
+    const log = args.log ?? (() => {});
+    const recentWindowTokens = args.recentWindowTokens ?? 12_000;
+
+    const transcript = await manager.getTranscript(cwd, sessionId);
+    if (!transcript.trim()) return null;
+    const compactionModel = this.compactionModelFor(agentId);
+    if (!compactionModel) return null;
+
+    // Split into the verbatim recent window (kept word-for-word) and the older
+    // prefix (summarized). Budget by chars (~4/token).
+    const turns = this.splitTranscriptTurns(transcript);
+    const budgetChars = recentWindowTokens * 4;
+    const recent: string[] = [];
+    let chars = 0;
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const len = turns[i]!.length + 2;
+      if (chars + len > budgetChars && recent.length > 0) break;
+      recent.unshift(turns[i]!);
+      chars += len;
+    }
+    const olderTurns = turns.slice(0, turns.length - recent.length);
+    const recentVerbatim = recent.join("\n\n");
+    const window = compactionWindowFor(compactionModel);
+    const runAgent = this.makeCompactionRunAgent(profile, manager, { model: compactionModel, cwd });
+
+    // Summary of the older prefix via the existing single-pass template.
+    let summaryMarkdown = "_(No older history beyond the recent window.)_";
+    if (olderTurns.length > 0) {
+      log("summarizing older history…");
+      const olderText = olderTurns.join("\n\n");
+      const template = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+      const overhead = template.length + "\n\nConversation Transcript:\n".length;
+      const fitted = fitTranscriptToWindow(olderText, overhead, window);
+      summaryMarkdown = (await runAgent(`${template}\n\nConversation Transcript:\n${fitted}`, "summary")).trim();
+      if (!summaryMarkdown) throw new Error("Summarizer returned empty output.");
+    }
+
+    // Verbatim pinned-facts (one pass on the fit-to-window transcript). A parse
+    // failure degrades to an empty block rather than failing the whole compaction.
+    log("extracting pinned facts…");
+    let pinnedFacts: PinnedFacts = { corrections: [], constraints: [], decisions: [], openTodos: [], activePaths: [], rules: [] };
+    try {
+      const fittedAll = fitTranscriptToWindow(transcript, 0, window);
+      const raw = await runAgent(pinnedFactsPrompt({ text: fittedAll, thinkingAvailable: false }), "pinned");
+      pinnedFacts = mergePinnedFacts([parseJsonOutput<PinnedFacts>(raw)]);
+    } catch (err) {
+      this.logger.warn({ err, sessionId }, "default-compact: pinned-facts extraction failed; continuing without it");
+    }
+
+    const pinnedCount =
+      pinnedFacts.corrections.length + pinnedFacts.constraints.length + pinnedFacts.rules.length +
+      pinnedFacts.openTodos.length + pinnedFacts.activePaths.length;
+    const dropNote =
+      `## Compaction note\n` +
+      `- Summarized ${olderTurns.length} older turn(s); kept the last ${recent.length} verbatim below.\n` +
+      `- Pinned ${pinnedCount} verbatim constraint(s)/correction(s)/rule(s)/path(s).\n` +
+      `- If something important seems missing, the full prior transcript is recoverable from the Discord thread (and the session's pre-compaction history).`;
+
+    const seed = assembleNewSession({ summaryMarkdown, pinnedFacts, recentVerbatim, dropNote });
+    return { seed, keptTurns: recent.length, summarizedTurns: olderTurns.length, pinnedCount };
   }
 
   /** Full human-readable report of a premium-compaction run (critic verdicts,
@@ -2994,124 +3058,48 @@ export class Orchestrator {
             embeds: [
               new EmbedBuilder()
                 .setTitle("🗳️ Compacting Session...")
-                .setDescription(`Generating premium AI compaction summary for session \`${session.sessionId}\`...`)
+                .setDescription(`Generating compaction summary for session \`${session.sessionId}\` (summary + verbatim recent window + pinned facts)...`)
                 .setColor(0xe67e22)
             ],
             components: [],
           });
 
+          const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setCustomId("sessions:summary_back").setLabel("⬅ Back to Manage").setStyle(ButtonStyle.Secondary)
+          );
+
           void (async () => {
-            let tempRuntime: AgentRuntime | undefined;
             try {
-              const transcript = await manager.getTranscript(cwd, session.sessionId);
-              if (!transcript.trim()) {
-                throw new Error("The session transcript is empty.");
+              if (typeof manager.compactSession !== "function") {
+                throw new Error(`Compaction is not supported for agent profile \`${record.agentId}\``);
               }
-
-              let sanitizedTranscript = transcript
-                .split("\n")
-                .map((line) => {
-                  if (line.length > 1000) {
-                    return line.substring(0, 1000) + " ... [Line truncated]";
-                  }
-                  return line;
-                })
-                .join("\n");
-
-              const compactionModel = this.compactionModelFor(record.agentId);
-              if (!compactionModel) {
-                throw new Error(`Manual compaction is not supported for agent profile \`${record.agentId}\``);
-              }
-              const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
-              const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
-              sanitizedTranscript = fitTranscriptToWindow(
-                sanitizedTranscript,
-                templateOverhead,
-                compactionWindowFor(compactionModel)
-              );
-              const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
-
-              tempRuntime = new AgentRuntime({
+              const built = await this.buildDefaultCompactionSeed({
                 profile,
-                logger: this.logger.child({ session: `temp-compact-${session.sessionId}` }),
-                mcpServers: [],
-              });
-
-              await tempRuntime.start();
-
-              await tempRuntime.newSession({
+                manager,
+                agentId: record.agentId,
                 cwd,
-                model: compactionModel,
-                meta: { reasoningEffort: "low" },
+                sessionId: session.sessionId,
               });
+              if (!built) throw new Error("Nothing to compact (empty transcript or no summarizer model).");
 
-              let summaryText = "";
-              tempRuntime.onEvent((event) => {
-                if (event.kind === "agent-text") {
-                  summaryText += event.text;
-                }
-              });
+              await manager.compactSession(cwd, session.sessionId, built.seed);
 
-              const outcome = await tempRuntime.prompt(compactionPrompt);
-
-              if (!summaryText.trim()) {
-                throw new Error("Agent completed but returned an empty summary.");
-              }
-
-              await manager.compactSession!(cwd, session.sessionId, summaryText);
-
-              // Reload sessions to reflect updated token count and preview
               sessions = await manager.listSessions(cwd);
               const newIndex = sessions.findIndex(s => s.sessionId === session.sessionId);
-              if (newIndex !== -1) {
-                currentIndex = newIndex;
-              }
+              if (newIndex !== -1) currentIndex = newIndex;
 
               const successEmbed = new EmbedBuilder()
-                .setTitle("🗳️ Session Compacted Successfully!")
-                .setDescription(`Session \`${session.sessionId}\` has been manually compacted. The old history has been replaced with the premium summary.`)
+                .setTitle("🗳️ Session Compacted")
+                .setDescription(`Session \`${session.sessionId}\` was compacted: summarized ${built.summarizedTurns} older turn(s), kept ${built.keptTurns} verbatim, pinned ${built.pinnedCount} fact(s).`)
                 .setColor(0x2ecc71);
-
-              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-                new ButtonBuilder()
-                  .setCustomId("sessions:summary_back")
-                  .setLabel("⬅ Back to Manage")
-                  .setStyle(ButtonStyle.Secondary)
-              );
-
-              await btnInteraction.editReply({
-                embeds: [successEmbed],
-                components: [row],
-              });
+              await btnInteraction.editReply({ embeds: [successEmbed], components: [backRow] });
             } catch (err: any) {
               this.logger.error({ err, sessionId: session.sessionId }, "failed to compact session");
-
               const errorEmbed = new EmbedBuilder()
                 .setTitle("❌ Compaction Failed")
-                .setDescription(`An error occurred during compaction:\n\`\`\`\n${err.message}\n\`\`\``)
+                .setDescription(`An error occurred during compaction:\n\`\`\`\n${(err?.message ?? String(err)).slice(0, 1500)}\n\`\`\``)
                 .setColor(0xe74c3c);
-
-              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-                new ButtonBuilder()
-                  .setCustomId("sessions:summary_back")
-                  .setLabel("⬅ Back to Manage")
-                  .setStyle(ButtonStyle.Secondary)
-              );
-
-              await btnInteraction.editReply({
-                embeds: [errorEmbed],
-                components: [row],
-              });
-            } finally {
-              if (tempRuntime) {
-                const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
-                await tempRuntime.dispose().catch(() => {});
-                if (tempSessionId) {
-                  await manager.deleteSession(cwd, tempSessionId).catch((err) => {
-                    this.logger.warn({ err, sessionId: tempSessionId }, "failed to clean up temporary summary session");
-                  });
-                }
-              }
+              await btnInteraction.editReply({ embeds: [errorEmbed], components: [backRow] });
             }
           })();
         }
@@ -4651,6 +4639,7 @@ function fmtTokens(n: number): string {
  *  Hardcoded rather than discovered because the call sites need the window
  *  BEFORE spawning the temp runtime that would learn it from usage_update. */
 const COMPACTION_MODEL_WINDOWS: Record<string, number> = {
+  default: 1_000_000, // resolves to latest Opus @ 1M on this account
   "opus[1m]": 1_000_000,
   "gpt-5.5": 400_000,
   "Gemini 3.1 Pro (High)": 1_000_000,

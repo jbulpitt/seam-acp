@@ -175,7 +175,9 @@ const Schema = z.object({
    * (e.g. Sonnet 200K compacting at 80% leaves no headroom for the response).
    */
   AGY_COMPACTION_MODEL: z.string().default("Gemini 3.1 Pro (High)"),
-  CLAUDE_COMPACTION_MODEL: z.string().default("opus[1m]"),
+  // "default" resolves to the latest Opus @ 1M; the bare "opus[1m]" alias
+  // mis-resolves to the credit-gated sonnet[1m] in claude-agent-acp 0.39.
+  CLAUDE_COMPACTION_MODEL: z.string().default("default"),
   COPILOT_COMPACTION_MODEL: z.string().default("gpt-5.5"),
   /**
    * Same shape as COPILOT_PROFILES — register additional Claude profiles

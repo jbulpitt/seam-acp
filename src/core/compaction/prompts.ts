@@ -432,6 +432,9 @@ export function assembleNewSession(args: {
   summaryMarkdown: string;
   pinnedFacts: PinnedFacts;
   recentVerbatim: string;
+  /** Optional visible "what was compressed / how to recover it" note, appended
+   *  so loss is visible and recoverable rather than silent (design §1). */
+  dropNote?: string;
 }): string {
   const pinned = [
     "## Pinned constraints (verbatim)",
@@ -448,6 +451,7 @@ export function assembleNewSession(args: {
     args.summaryMarkdown,
     "",
     pinned,
+    ...(args.dropNote ? ["", args.dropNote] : []),
     "",
     "--- Recent context (verbatim) ---",
     args.recentVerbatim,

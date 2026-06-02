@@ -475,6 +475,13 @@ export class Orchestrator {
       return (e as any)?.code === 400;
     };
 
+    // The Anthropic vision API caps per-image dimensions at 2000px once a request
+    // carries many images (~20+). A run of high-res testing screenshots trips
+    // this, and then EVERY follow-up turn that re-sends the history fails the same
+    // way. Recognize it so we can auto-strip images (repairSession) and recover.
+    const isImageDimensionError = (msg: string): boolean =>
+      /dimension limit for many-image|exceeds the dimension limit/i.test(msg);
+
     // ACP connection dropped mid-turn — typically the remote bridge restarted or
     // the underlying WS dropped after the agent had already finished its response.
     // Different from session-gone: the session files are still intact, so we can
@@ -982,17 +989,20 @@ export class Orchestrator {
       if (isSessionGoneError(err)) {
         this.logger.warn({ session: record.id }, "session not found on agent; invalidating runtime");
         await this.router.invalidate(record.id, { clearAcpSession: true });
-      } else if (isAgentRejectionError(err) || errMsg.includes("Prompt is too long")) {
+      } else if (isAgentRejectionError(err) || errMsg.includes("Prompt is too long") || isImageDimensionError(errMsg)) {
         const isPromptTooLong = errMsg.includes("Prompt is too long");
+        const isImageDimension = isImageDimensionError(errMsg);
+        // Both "prompt too long" and the many-image dimension cap are fixed by
+        // stripping images from the on-disk history; keep the ACP session ID so
+        // the repaired (image-stripped) JSONL is re-resumed on retry.
+        const needsRepair = isPromptTooLong || isImageDimension;
         this.logger.warn(
-          { session: record.id, isPromptTooLong },
-          "agent rejected prompt (400); invalidating session runtime"
+          { session: record.id, isPromptTooLong, isImageDimension },
+          "agent rejected prompt; invalidating session runtime"
         );
-        // If it's prompt too long, we keep the ACP session ID so the user can retry.
-        // Otherwise, we clear it.
-        await this.router.invalidate(record.id, { clearAcpSession: !isPromptTooLong });
-        
-        if (isPromptTooLong) {
+        await this.router.invalidate(record.id, { clearAcpSession: !needsRepair });
+
+        if (needsRepair) {
           const profile = this.router.getProfile(record.agentId);
           const manager = profile?.sessionManager;
           const cwd = record.repoPath ?? this.config.REPOS_ROOT;
@@ -1001,8 +1011,8 @@ export class Orchestrator {
           if (manager && typeof manager.repairSession === "function" && record.acpSessionId) {
             try {
               this.logger.info(
-                { session: record.id, acpSessionId: record.acpSessionId },
-                "auto-repairing session due to context size rejection"
+                { session: record.id, acpSessionId: record.acpSessionId, reason: isImageDimension ? "image-dimension" : "context-size" },
+                "auto-repairing session"
               );
               await manager.repairSession(cwd, record.acpSessionId);
               repaired = true;
@@ -1011,7 +1021,12 @@ export class Orchestrator {
             }
           }
 
-          if (repaired) {
+          if (repaired && isImageDimension) {
+            await this.adapter.sendMessage(
+              channel,
+              "⚠️ **An image in the conversation exceeded the 2000px many-image limit.** The session was automatically repaired by stripping image payloads from the history (testing screenshots are the usual cause). You can safely retry your message now!"
+            );
+          } else if (repaired) {
             await this.adapter.sendMessage(
               channel,
               "⚠️ **Claude hit its context limit before auto-compacting.** The session was automatically repaired by stripping heavy base64 image payloads and rolling back the last incomplete message. You can safely retry your message now!"
@@ -1697,6 +1712,23 @@ export class Orchestrator {
     const cfg = this.store.readConfig(record);
     const current = cfg.reasoningEffort ?? "default";
 
+    // Gate by the active agent's effort capability. Not every agent exposes a
+    // settable reasoning effort: agy bakes it into the model choice; others have
+    // none. Showing the picker for those would be a false "✅ changed".
+    const profile = this.router.getProfile(record.agentId);
+    const eff = profile?.effort;
+    const supported = eff?.levels ?? [];
+    if (supported.length === 0) {
+      const msg =
+        eff?.mechanism === "modelBaked"
+          ? `Effort for \`${record.agentId}\` is part of the **model** choice — pick a high/med/low model variant with \`/seam model\`.`
+          : `The active agent (\`${record.agentId}\`) doesn't support a reasoning-effort setting.`;
+      await i.reply({ content: msg, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const effortChoices = EFFORT_CHOICES.filter((c) => supported.includes(c.value));
+    const supportedList = supported.map((l) => `\`${l}\``).join(", ");
+
     // No argument → interactive picker (falling back to a text report when the
     // adapter has no picker support).
     if (!level) {
@@ -1705,7 +1737,7 @@ export class Orchestrator {
         const body =
           cfg.reasoningEffort
             ? `Reasoning effort: \`${cfg.reasoningEffort}\`.`
-            : "Reasoning effort is **unset** — the agent uses its own default. Set with `/seam effort level:<low|medium|high|xhigh|max>`.";
+            : `Reasoning effort is **unset** — the agent uses its own default. Set with \`/seam effort level:<${supported.join("|")}>\`.`;
         await i.reply({ content: body, flags: MessageFlags.Ephemeral });
         return;
       }
@@ -1717,7 +1749,7 @@ export class Orchestrator {
           title: "🧠 Choose reasoning effort",
           fields: [{ name: "Current", value: `\`${current}\``, inline: true }],
         },
-        choices: EFFORT_CHOICES,
+        choices: effortChoices,
         authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
         successPanel: (pickedChoice, username) => ({
           color: 0x57f287,
@@ -1734,6 +1766,16 @@ export class Orchestrator {
       return;
     }
 
+    // Explicit level: validate against what THIS agent supports. The slash
+    // command registers the full 5-level list statically, so an agent with a
+    // narrower range (e.g. Copilot: low/medium/high) must reject xhigh/max here.
+    if (!supported.includes(level)) {
+      await i.reply({
+        content: `\`${level}\` isn't supported by \`${record.agentId}\` — choose one of: ${supportedList}.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     await this.applyEffortChange(record, level);
     await i.reply({
       content: `Reasoning effort set to \`${level}\` — applies on your next message.`,
@@ -1742,7 +1784,7 @@ export class Orchestrator {
   }
 
   /** Persist the effort and invalidate the live runtime so the next turn
-   *  recreates/resumes the session with the new effort in `_meta`. */
+   *  recreates/resumes the session with the new effort applied. */
   private async applyEffortChange(
     record: SessionRecord,
     level: string
@@ -1750,10 +1792,11 @@ export class Orchestrator {
     const cfg = this.store.readConfig(record);
     cfg.reasoningEffort = level;
     this.persistConfig(record, cfg);
-    // Effort applies via _meta.claudeCode.options.effort at session creation
-    // (the only path that works — set_config_option for "effort" errors and the
-    // wrapper ignores `reasoningEffort`). Invalidate so the next turn rebuilds
-    // the session with the new effort; preserve the ACP session id for context.
+    // Effort is applied when the session is (re)built, per the agent's
+    // mechanism: Claude via `_meta.claudeCode.options.effort` (set_config_option
+    // for "effort" errors there); Copilot via the `reasoning_effort` config
+    // option (AgentRuntime.applyConfigOptionEffort). Invalidate so the next turn
+    // rebuilds with the new effort; preserve the ACP session id for context.
     if (this.router.hasRuntime(record.id)) {
       await this.router.invalidate(record.id, { clearAcpSession: false });
     }

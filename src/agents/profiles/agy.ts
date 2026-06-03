@@ -338,13 +338,17 @@ export function makeAgyProfile(opts: {
 
         const newCascadeId = randomUUID();
 
-        // 1. Copy pb file
-        const oldPb = path.join(AGY_HOME, "conversations", `${oldCascadeId}.pb`);
-        const newPb = path.join(AGY_HOME, "conversations", `${newCascadeId}.pb`);
-        try {
-          await fs.copyFile(oldPb, newPb);
-        } catch {
-          // ignore if pb file doesn't exist
+        // 1. Copy the conversation file (.db current format; .pb legacy).
+        for (const ext of [".db", ".pb"]) {
+          try {
+            await fs.copyFile(
+              path.join(CONVERSATION_DIR, `${oldCascadeId}${ext}`),
+              path.join(CONVERSATION_DIR, `${newCascadeId}${ext}`),
+            );
+            break; // copied whichever exists
+          } catch {
+            // try next extension / ignore if neither exists
+          }
         }
 
         // 2. Copy brain folder recursively
@@ -382,12 +386,13 @@ export function makeAgyProfile(opts: {
           cascadeId = entry.cascadeId;
         }
 
-        // 1. Delete pb file
-        const pbFile = path.join(AGY_HOME, "conversations", `${cascadeId}.pb`);
-        try {
-          await fs.unlink(pbFile);
-        } catch {
-          // ignore
+        // 1. Delete the conversation file(s) (.db current, .pb legacy).
+        for (const ext of [".db", ".pb"]) {
+          try {
+            await fs.unlink(path.join(CONVERSATION_DIR, `${cascadeId}${ext}`));
+          } catch {
+            // ignore
+          }
         }
 
         // 2. Delete brain folder
@@ -519,12 +524,13 @@ export function makeAgyProfile(opts: {
 
         // Clean up old cascade if it exists
         if (oldCascadeId) {
-          // 1. Delete old pb file
-          const oldPb = path.join(CONVERSATION_DIR, `${oldCascadeId}.pb`);
-          try {
-            await fs.unlink(oldPb);
-          } catch {
-            // ignore
+          // 1. Delete old conversation file(s) (.db current, .pb legacy)
+          for (const ext of [".db", ".pb"]) {
+            try {
+              await fs.unlink(path.join(CONVERSATION_DIR, `${oldCascadeId}${ext}`));
+            } catch {
+              // ignore
+            }
           }
           // 2. Delete old brain folder
           const oldBrain = path.join(AGY_HOME, "brain", oldCascadeId);
@@ -1445,7 +1451,11 @@ async function waitForNewCascade(
     if (signal.aborted) throw new Error("aborted waiting for new cascade");
     const now = await listConversations();
     for (const name of now) {
-      if (!before.has(name) && name.endsWith(".pb")) {
+      // agy switched conversation files from `.pb` to `.db` (CLI update ~2026-06);
+      // match both so a fresh turn detects its new cascade and persists the id.
+      // Both extensions are 3 chars. (Sqlite sidecars end in `.db-wal`/`.db-shm`,
+      // not `.db`, so they're correctly ignored.)
+      if (!before.has(name) && (name.endsWith(".db") || name.endsWith(".pb"))) {
         return name.slice(0, -3);
       }
     }

@@ -255,6 +255,12 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .addStringOption((o) => o.setName("id").setDescription("Schedule id").setRequired(true))
           .addStringOption((o) => o.setName("filename").setDescription("Filename to remove").setRequired(true))
       )
+      .addSubcommand((sub) =>
+        sub
+          .setName("edit")
+          .setDescription("Edit a scheduled prompt (reopens the builder card)")
+          .addStringOption((o) => o.setName("id").setDescription("Schedule id").setRequired(true))
+      )
   );
 
   return cmd;

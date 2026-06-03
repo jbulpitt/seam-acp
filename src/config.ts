@@ -139,6 +139,14 @@ const Schema = z.object({
    */
   CLAUDE_MAX_THINKING_TOKENS: z.coerce.number().int().min(0).max(64000).default(8000),
   /**
+   * How adaptive-thinking models (Opus 4.6+) surface their reasoning. These
+   * models default to "omitted" — their thinking never reaches the status panel.
+   * "summarized" makes them stream a readable summary instead. Applied via
+   * `_meta.claudeCode.options.thinking.display`; Sonnet/Haiku ignore it (they
+   * stream thinking via the token-budget path regardless).
+   */
+  CLAUDE_THINKING_DISPLAY: z.enum(["summarized", "omitted"]).default("summarized"),
+  /**
    * Context token threshold to trigger compaction. Set to 0 to disable.
    * If <= 1.0, treated as a fraction of the model's context window.
    */

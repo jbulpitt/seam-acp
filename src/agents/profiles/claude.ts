@@ -78,6 +78,14 @@ export function makeClaudeProfile(opts: {
    * env, so we forward this through. 0 / undefined leaves thinking off.
    */
   maxThinkingTokens?: number;
+  /**
+   * How thinking content is surfaced for adaptive-thinking models (Opus 4.6+),
+   * via `_meta.claudeCode.options.thinking.display`. These models default to
+   * "omitted" (empty thought chunks); "summarized" makes them stream a readable
+   * summary of their reasoning. Non-adaptive models (Sonnet/Haiku) ignore this —
+   * they already stream thinking via the maxThinkingTokens path.
+   */
+  thinkingDisplay?: "summarized" | "omitted";
   /** Accepted for parity; unused — MCP servers are forwarded via ACP. */
   mcpServers?: McpServer[];
   /** Optional context token threshold to trigger context compaction. */
@@ -86,6 +94,7 @@ export function makeClaudeProfile(opts: {
   const cli = opts.cliPath?.trim() || "claude-agent-acp";
   const configDir = opts.configDir?.trim() || undefined;
   const maxThinkingTokens = opts.maxThinkingTokens;
+  const thinkingDisplay = opts.thinkingDisplay;
 
   let identityCache: AgentIdentity | null | undefined;
 
@@ -134,6 +143,16 @@ export function makeClaudeProfile(opts: {
       // low|medium|high|xhigh|max). Omitting it leaves the model default.
       if (effort && effort !== "default") {
         options.effort = effort;
+      }
+
+      // Thinking display: adaptive-thinking models (Opus 4.6+) default to
+      // "omitted" — their reasoning never surfaces. Forwarding an adaptive
+      // ThinkingConfig with display lets us show a summary. Verified end-to-end:
+      // `thinking:{type:'adaptive',display:'summarized'}` flips Opus 4.8 from
+      // empty thought chunks to readable summarized reasoning. Only applied to
+      // adaptive models — Sonnet/Haiku stream thinking via the budget path.
+      if (thinkingDisplay && isAdaptiveThinkingModel(model)) {
+        options.thinking = { type: "adaptive", display: thinkingDisplay };
       }
 
       if (Object.keys(options).length === 0) return undefined;
@@ -784,4 +803,18 @@ function getClaudeContextWindow(modelId?: string): number {
   if (/\b1m\b/i.test(modelId) || /-1m\b/i.test(modelId)) return 1_000_000;
   if (/^default$/i.test(modelId.trim())) return 1_000_000;
   return 200_000;
+}
+
+/** Whether a model uses ADAPTIVE thinking (the SDK's ThinkingConfig marks this
+ *  "Opus 4.6+"), which is the family whose thinking display defaults to
+ *  "omitted". Only these take a `thinking:{type:'adaptive',display}` override;
+ *  Sonnet/Haiku stream thinking via the budget path and are left untouched.
+ *   - `default` → latest Opus on Max → adaptive.
+ *   - claude-opus-4-6 and newer (4-6, 4-7, 4-8, … 4-10+); 4-5 and older are not. */
+function isAdaptiveThinkingModel(modelId?: string): boolean {
+  if (!modelId) return false;
+  const m = modelId.toLowerCase().trim();
+  if (m === "default") return true;
+  // Match "opus-4-6"/"opus-4.6" and up (single digit 6-9 or two-digit 10+).
+  return /opus-4[.-](?:[6-9]|\d\d)\b/.test(m);
 }

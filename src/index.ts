@@ -62,6 +62,7 @@ async function main(): Promise<void> {
     staticModels: config.CLAUDE_MODELS,
     threadAbbr: "👾",
     maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
+    thinkingDisplay: config.CLAUDE_THINKING_DISPLAY,
     compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
     mcpServers,
   });
@@ -75,6 +76,7 @@ async function main(): Promise<void> {
       defaultModel: config.CLAUDE_DEFAULT_MODEL,
       staticModels: config.CLAUDE_MODELS,
       maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
+      thinkingDisplay: config.CLAUDE_THINKING_DISPLAY,
       compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
       mcpServers,
     })

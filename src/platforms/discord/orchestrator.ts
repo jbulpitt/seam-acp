@@ -1582,36 +1582,46 @@ export class Orchestrator {
   async runScheduledPrompt(id: string): Promise<void> {
     const row = this.store.getScheduled(id);
     if (!row) return;
-    const channel: ChannelRef = {
+    const bindingThread: ChannelRef = {
       platform: PLATFORM,
       id: row.channelRef,
       ...(row.parentRef ? { parentId: row.parentRef } : {}),
     };
+    // Output goes to the configured target channel, or the schedule's own thread.
+    const target: ChannelRef = row.targetChannel
+      ? { platform: PLATFORM, id: row.targetChannel }
+      : bindingThread;
 
-    // 1. Thread lifecycle: run / skip-locked / drop-deleted.
+    // 1. Can we post to the output target? run / skip-locked / drop-deleted.
     if (typeof this.adapter.getThreadLiveState === "function") {
       let state: { locked: boolean; archived: boolean } | undefined;
       try {
-        state = await this.adapter.getThreadLiveState(channel);
+        state = await this.adapter.getThreadLiveState(target);
       } catch (err) {
-        this.logger.warn({ id, err }, "scheduled: thread state check failed (transient); skipping");
-        this.patchScheduledStatus(id, "skipped: thread unreachable");
+        this.logger.warn({ id, err }, "scheduled: target state check failed (transient); skipping");
+        this.patchScheduledStatus(id, "skipped: target unreachable");
         return;
       }
       if (state === undefined) {
-        this.logger.info({ id, channel: row.channelRef }, "scheduled: thread deleted; dropping schedule");
-        this.store.deleteScheduled(id);
-        this.scheduledManager?.disarm(id);
-        await deleteScheduledAttachmentDir(this.config.DATA_DIR, id).catch(() => {});
+        if (target.id === row.channelRef) {
+          // The schedule's own (binding) thread is gone — drop the schedule.
+          this.logger.info({ id, channel: row.channelRef }, "scheduled: thread deleted; dropping schedule");
+          this.store.deleteScheduled(id);
+          this.scheduledManager?.disarm(id);
+          await deleteScheduledAttachmentDir(this.config.DATA_DIR, id).catch(() => {});
+        } else {
+          this.patchScheduledStatus(id, "skipped: target deleted");
+        }
         return;
       }
       if (state.locked) {
-        this.patchScheduledStatus(id, "skipped: locked");
+        this.patchScheduledStatus(id, "skipped: target locked");
         return;
       }
     }
 
-    // 2. Resolve the thread's agent / model / cwd.
+    // 2. Resolve the agent / model / cwd from the binding thread's record,
+    //    with per-schedule overrides.
     const record = this.router.ensureSessionRecord({
       platform: PLATFORM,
       channelRef: row.channelRef,
@@ -1624,51 +1634,50 @@ export class Orchestrator {
       return;
     }
     const cfg = this.store.readConfig(record);
-    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    const cwd = row.cwd ?? record.repoPath ?? this.config.REPOS_ROOT;
+    const model = row.model ?? cfg.model;
 
-    // 3. Announce card (also auto-reopens an archived-but-unlocked thread).
+    // 3. Announce card — stays as a permanent run record (also auto-reopens an
+    //    archived-but-unlocked thread). Not edited later.
     const running: StructuredPanel = {
       color: SCHEDULED_COLOR,
-      title: `⏰ Scheduled: ${row.name}`,
-      description: "Running…",
-      fields: [],
-      footer: describeCron(row.cron),
+      title: `⏰ Running scheduled: ${row.name}`,
+      fields: [
+        { name: "Schedule", value: `${describeCron(row.cron)} (${row.timezone})` },
+        { name: "Working dir", value: `\`${cwd}\``, inline: true },
+        { name: "Model", value: model ? `\`${model}\`` : "session default", inline: true },
+        ...(row.attachments.length
+          ? [{ name: "Files", value: row.attachments.map((a) => `\`${a.filename}\``).join(", ") }]
+          : []),
+      ],
+      footer: `id ${id} · output: ${row.outputType}`,
     };
-    let cardRef: MessageRef | undefined;
     try {
-      cardRef = this.adapter.sendPanel
-        ? await this.adapter.sendPanel(channel, running)
-        : await this.adapter.sendMessage(channel, `⏰ Running scheduled prompt "${row.name}"…`);
+      if (this.adapter.sendPanel) await this.adapter.sendPanel(target, running);
+      else await this.adapter.sendMessage(target, `⏰ Running scheduled prompt "${row.name}"…`);
     } catch (err) {
       this.logger.warn({ id, err }, "scheduled: announce card failed");
     }
 
     // 4. Run isolated + capture.
     const attachments = await loadScheduledAttachments(this.config.DATA_DIR, id, row.attachments);
-    const model = row.model ?? cfg.model;
     const result = await this.runIsolatedScheduledJob({
       profile,
       cwd,
       ...(model ? { model } : {}),
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
-      channel,
+      channel: target,
       promptText: row.promptText,
       attachments,
     });
 
-    // 5. Post result + record status.
+    // 5. Post result as NEW message(s) + record status.
     if (result.error) {
       this.patchScheduledStatus(id, `error: ${result.error.slice(0, 200)}`);
-      await this.editOrSendPanel(channel, cardRef, {
-        color: 0xe74c3c,
-        title: `⏰ Scheduled: ${row.name}`,
-        description: `❌ Failed:\n\`\`\`\n${result.error.slice(0, 1500)}\n\`\`\``,
-        fields: [],
-        footer: describeCron(row.cron),
-      });
+      await this.sendResultCard(target, `⏰ ${row.name} — failed`, `❌ ${result.error.slice(0, 1500)}`, 0xe74c3c);
     } else {
       this.patchScheduledStatus(id, "ok");
-      await this.postScheduledOutput(channel, row.name, result.text, cardRef);
+      await this.postScheduledResult(target, row.name, result.text, row.outputType);
     }
   }
 
@@ -1723,57 +1732,64 @@ export class Orchestrator {
     }
   }
 
-  /** Post captured output as blue cards; overflow → a single file attachment. */
-  private async postScheduledOutput(
+  /** Post captured output as fresh message(s) — blue cards or plain chunked
+   *  messages per `outputType`; overflow → a single file attachment. Never edits
+   *  the running card (it stays as a run record). */
+  private async postScheduledResult(
     channel: ChannelRef,
     name: string,
     text: string,
-    cardRef?: MessageRef
+    outputType: "card" | "messages"
   ): Promise<void> {
-    const title = `⏰ Scheduled: ${name}`;
     const body = text.trim();
-    const panel = (description: string, footer?: string): StructuredPanel => ({
-      color: SCHEDULED_COLOR,
-      title,
-      description,
-      fields: [],
-      ...(footer ? { footer } : {}),
-    });
     if (!body) {
-      await this.editOrSendPanel(channel, cardRef, panel("✅ Done — no output."));
+      await this.sendResultCard(channel, `⏰ ${name}`, "✅ Done — no output.", SCHEDULED_COLOR);
       return;
     }
-    const MAX = 3900;
-    const chunks: string[] = [];
-    for (let i = 0; i < body.length; i += MAX) chunks.push(body.slice(i, i + MAX));
 
+    if (outputType === "messages") {
+      const chunks = this.chunkString(body, 1900);
+      if (chunks.length <= 8) {
+        for (const c of chunks) await this.adapter.sendMessage(channel, c);
+      } else {
+        await this.adapter.sendMessage(channel, `⏰ **${name}** — output attached (${body.length} chars).`);
+        await this.sendResultFile(channel, name, body);
+      }
+      return;
+    }
+
+    // card output
+    const chunks = this.chunkString(body, 3900);
     if (chunks.length <= 3) {
-      await this.editOrSendPanel(
-        channel,
-        cardRef,
-        panel(chunks[0]!, chunks.length > 1 ? `1/${chunks.length}` : undefined)
-      );
-      for (let j = 1; j < chunks.length; j++) {
-        if (this.adapter.sendPanel) await this.adapter.sendPanel(channel, panel(chunks[j]!, `${j + 1}/${chunks.length}`));
-        else await this.adapter.sendMessage(channel, chunks[j]!);
+      for (let j = 0; j < chunks.length; j++) {
+        const suffix = chunks.length > 1 ? ` (${j + 1}/${chunks.length})` : "";
+        await this.sendResultCard(channel, `⏰ ${name}${suffix}`, chunks[j]!, SCHEDULED_COLOR);
       }
     } else {
-      await this.editOrSendPanel(channel, cardRef, panel(`✅ Done — full output attached (${body.length} chars).`));
-      const filename = `scheduled-${name.replace(/[^\w.-]+/g, "_") || "output"}.md`;
-      if (this.adapter.sendFile) {
-        await this.adapter.sendFile(channel, { data: Buffer.from(body, "utf8"), filename, mimeType: "text/markdown" });
-      } else {
-        for (const c of chunks) await this.adapter.sendMessage(channel, c);
-      }
+      await this.sendResultCard(channel, `⏰ ${name}`, `✅ Done — full output attached (${body.length} chars).`, SCHEDULED_COLOR);
+      await this.sendResultFile(channel, name, body);
     }
   }
 
-  private async editOrSendPanel(channel: ChannelRef, cardRef: MessageRef | undefined, p: StructuredPanel): Promise<void> {
-    if (cardRef && this.adapter.editPanel) {
-      try { await this.adapter.editPanel(cardRef, p); return; } catch { /* fall through */ }
+  private chunkString(s: string, max: number): string[] {
+    const out: string[] = [];
+    for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
+    return out;
+  }
+
+  private async sendResultCard(channel: ChannelRef, title: string, description: string, color: number): Promise<void> {
+    const p: StructuredPanel = { color, title, description: description.slice(0, 4096), fields: [] };
+    if (this.adapter.sendPanel) await this.adapter.sendPanel(channel, p);
+    else await this.adapter.sendMessage(channel, `${title}\n${description}`);
+  }
+
+  private async sendResultFile(channel: ChannelRef, name: string, body: string): Promise<void> {
+    const filename = `scheduled-${name.replace(/[^\w.-]+/g, "_") || "output"}.md`;
+    if (this.adapter.sendFile) {
+      await this.adapter.sendFile(channel, { data: Buffer.from(body, "utf8"), filename, mimeType: "text/markdown" });
+    } else {
+      for (const c of this.chunkString(body, 1900)) await this.adapter.sendMessage(channel, c);
     }
-    if (this.adapter.sendPanel) { await this.adapter.sendPanel(channel, p); return; }
-    await this.adapter.sendMessage(channel, `${p.title}\n${p.description ?? ""}`);
   }
 
   /** Update last_run/last_status, preserving next_run (manager-owned). */
@@ -1947,6 +1963,9 @@ export class Orchestrator {
       cron: null as string | null,
       timezone: SCHEDULE_DEFAULT_TZ,
       model: null as string | null, // null = use session model
+      cwd: null as string | null, // null = thread's repoPath
+      target: null as string | null, // null = this thread
+      outputType: "card" as "card" | "messages",
       files: pending,
     };
 
@@ -1968,6 +1987,9 @@ export class Orchestrator {
           { name: "🕐 Runs", value: cronLine + (next ? `\nNext: <t:${Math.floor(next.getTime() / 1000)}:F>` : ""), inline: true },
           { name: "🌍 Timezone", value: state.timezone, inline: true },
           { name: "🤖 Model", value: state.model ? `\`${state.model}\`` : `Session default${sessionModel ? ` (\`${sessionModel}\`)` : ""}`, inline: true },
+          { name: "📂 Working dir", value: state.cwd ? `\`${state.cwd}\`` : "*(this thread's repo)*", inline: true },
+          { name: "📮 Output to", value: state.target ? `<#${state.target}>` : "*(this thread)*", inline: true },
+          { name: "🖼️ Output as", value: state.outputType === "messages" ? "plain messages" : "status cards", inline: true },
           { name: "📎 Files", value: state.files.length ? state.files.map((f) => `\`${f.name}\``).join(", ") : "*(none)*" }
         );
       const cadence = new StringSelectMenuBuilder()
@@ -1979,7 +2001,8 @@ export class Orchestrator {
         .setPlaceholder("🌍 Timezone")
         .addOptions(SCHEDULE_TIMEZONES.map((z) => ({ label: z, value: z, default: z === state.timezone })));
       const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId("sched:prompt").setLabel("✏️ Prompt & name").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("sched:prompt").setLabel("✏️ Prompt & details").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("sched:output").setLabel(state.outputType === "messages" ? "🖼️ Output: messages" : "🖼️ Output: cards").setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId("sched:create").setLabel("✅ Create").setStyle(ButtonStyle.Success).setDisabled(!state.cron || !state.promptText || !state.name),
         new ButtonBuilder().setCustomId("sched:cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
       );
@@ -2042,8 +2065,11 @@ export class Orchestrator {
             state.cron = v;
             await c.update(render());
           }
+        } else if (c.isButton() && c.customId === "sched:output") {
+          state.outputType = state.outputType === "messages" ? "card" : "messages";
+          await c.update(render());
         } else if (c.isButton() && c.customId === "sched:prompt") {
-          const modal = new ModalBuilder().setCustomId(`sched:promptmodal:${msg.id}`).setTitle("Scheduled prompt")
+          const modal = new ModalBuilder().setCustomId(`sched:promptmodal:${msg.id}`).setTitle("Prompt & details")
             .addComponents(
               new ActionRowBuilder<TextInputBuilder>().addComponents(
                 new TextInputBuilder().setCustomId("name").setLabel("Name").setStyle(TextInputStyle.Short).setRequired(true).setValue(state.name).setMaxLength(80)
@@ -2052,6 +2078,14 @@ export class Orchestrator {
                 new TextInputBuilder().setCustomId("prompt").setLabel("Prompt (stands on its own — no prior context)")
                   .setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(state.promptText)
                   .setPlaceholder("e.g. Run `npm test`, then post any failures as file:line with a one-line fix.")
+              ),
+              new ActionRowBuilder<TextInputBuilder>().addComponents(
+                new TextInputBuilder().setCustomId("cwd").setLabel("Working dir (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(state.cwd ?? "")
+                  .setPlaceholder("blank = this thread's repo; or a path under REPOS_ROOT")
+              ),
+              new ActionRowBuilder<TextInputBuilder>().addComponents(
+                new TextInputBuilder().setCustomId("target").setLabel("Output channel/thread id (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(state.target ?? "")
+                  .setPlaceholder("blank = post here; or a numeric channel/thread id")
               )
             );
           await c.showModal(modal);
@@ -2059,8 +2093,20 @@ export class Orchestrator {
           if (sub) {
             state.name = sub.fields.getTextInputValue("name").trim();
             state.promptText = sub.fields.getTextInputValue("prompt").trim();
+            const errors: string[] = [];
+            const rawCwd = sub.fields.getTextInputValue("cwd").trim();
+            if (rawCwd) {
+              try { state.cwd = resolveRepoPath(this.config.REPOS_ROOT, rawCwd); }
+              catch (e) { errors.push(`cwd: ${(e as Error).message}`); }
+            } else state.cwd = null;
+            const rawTarget = sub.fields.getTextInputValue("target").trim();
+            if (rawTarget) {
+              if (/^\d+$/.test(rawTarget)) state.target = rawTarget;
+              else errors.push("output id must be a numeric channel/thread id");
+            } else state.target = null;
             await sub.deferUpdate();
             await i.editReply(render());
+            if (errors.length) await sub.followUp({ content: `⚠️ ${errors.join("; ")}`, flags: MessageFlags.Ephemeral });
           }
         } else if (c.isButton() && c.customId === "sched:cancel") {
           collector.stop("cancel");
@@ -2084,7 +2130,7 @@ export class Orchestrator {
           const row: ScheduledPrompt = {
             id, platform: PLATFORM, channelRef: channel.id, parentRef: channel.parentId ?? null,
             name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
-            model: state.model,
+            model: state.model, cwd: state.cwd, targetChannel: state.target, outputType: state.outputType,
             catchupSeconds: 900, enabled: true, attachments, createdBy: i.user.id,
             createdUtc: now, updatedUtc: now, lastRunUtc: null, lastStatus: null,
             nextRunUtc: next ? next.toISOString() : null, pinnedSessionId: null,
@@ -2098,6 +2144,9 @@ export class Orchestrator {
             .setDescription(
               `**${state.name}** \`${id}\`\nRuns ${describeCron(state.cron)} (${state.timezone})` +
               (state.model ? `\nModel: \`${state.model}\`` : "") +
+              (state.cwd ? `\nWorking dir: \`${state.cwd}\`` : "") +
+              (state.target ? `\nOutput to: <#${state.target}>` : "") +
+              `\nOutput as: ${state.outputType === "messages" ? "plain messages" : "status cards"}` +
               (next ? `\nNext run: <t:${Math.floor(next.getTime() / 1000)}:F>` : "") +
               (attachments.length ? `\n📎 ${attachments.length} file(s) attached` : "") +
               `\n\nIt runs on a clean session with no memory of this conversation. Manage it with \`/seam schedule list\`.`

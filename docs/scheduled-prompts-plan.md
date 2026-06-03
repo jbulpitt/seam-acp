@@ -239,3 +239,24 @@ catch-up). No surgery on the core turn path.
    last run for audit via `/seam sessions`.
 3. **Runner model** — use the thread's configured model/effort (default) vs. a
    dedicated scheduled-job model.
+
+---
+
+## 10. Post-v1 enhancements (built)
+
+- **Running card is a permanent record**, not edited later: it carries the run
+  details (schedule, working dir, model, output target, files) and stays as
+  history. Output arrives as **fresh** message(s) back-to-back.
+- **Per-schedule overrides** (all default to current behavior, leaning into the
+  session-decoupling):
+  - `cwd` — working directory for the job (default: the thread's repoPath;
+    validated under REPOS_ROOT at creation).
+  - `targetChannel` — where the announce card + output post (default: the
+    schedule's own thread). The schedule stays *bound* to its origin thread
+    (`channelRef`) for management + delete-cleanup; only output is redirected.
+    Fire-time lock/delete checks run against the *target*.
+  - `outputType` — `card` (blue embeds) or `messages` (plain chunked text). The
+    "running" announcement is always a card.
+- New nullable columns `cwd`, `target_channel`, `output_type` with defensive
+  ALTERs; builder card gained the working-dir / output-id fields (in the
+  Prompt & details modal) and an output-type toggle button.

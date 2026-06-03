@@ -406,8 +406,10 @@ export class DiscordAdapter implements ChatAdapter {
   ): Promise<{ locked: boolean; archived: boolean } | undefined> {
     try {
       const ch = await this.client.channels.fetch(channel.id);
-      if (!ch || !ch.isThread()) return undefined; // not a thread / gone
-      return { locked: ch.locked ?? false, archived: ch.archived ?? false };
+      if (!ch) return undefined; // gone
+      if (ch.isThread()) return { locked: ch.locked ?? false, archived: ch.archived ?? false };
+      if (ch.isTextBased()) return { locked: false, archived: false }; // plain channel — always postable
+      return undefined; // not a postable channel
     } catch (err) {
       // 10003 = Unknown Channel → confirmed deleted. Anything else is transient;
       // rethrow so the caller skips this run rather than dropping the schedule.

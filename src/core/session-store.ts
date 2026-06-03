@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS scheduled_prompts (
   cron               TEXT NOT NULL,
   timezone           TEXT NOT NULL,
   model              TEXT,
+  cwd                TEXT,
+  target_channel     TEXT,
+  output_type        TEXT NOT NULL DEFAULT 'card',
   catchup_seconds    INTEGER NOT NULL DEFAULT 900,
   enabled            INTEGER NOT NULL DEFAULT 1,
   attachments_json   TEXT NOT NULL DEFAULT '[]',
@@ -91,6 +94,9 @@ interface ScheduledRow {
   cron: string;
   timezone: string;
   model: string | null;
+  cwd: string | null;
+  target_channel: string | null;
+  output_type: string;
   catchup_seconds: number;
   enabled: number;
   attachments_json: string;
@@ -119,6 +125,9 @@ const mapScheduled = (r: ScheduledRow): ScheduledPrompt => {
     cron: r.cron,
     timezone: r.timezone,
     model: r.model,
+    cwd: r.cwd,
+    targetChannel: r.target_channel,
+    outputType: r.output_type === "messages" ? "messages" : "card",
     catchupSeconds: r.catchup_seconds,
     enabled: r.enabled !== 0,
     attachments,
@@ -142,7 +151,12 @@ export class SessionStore {
     this.db.exec(SCHEMA);
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
-    for (const ddl of ["ALTER TABLE scheduled_prompts ADD COLUMN model TEXT"]) {
+    for (const ddl of [
+      "ALTER TABLE scheduled_prompts ADD COLUMN model TEXT",
+      "ALTER TABLE scheduled_prompts ADD COLUMN cwd TEXT",
+      "ALTER TABLE scheduled_prompts ADD COLUMN target_channel TEXT",
+      "ALTER TABLE scheduled_prompts ADD COLUMN output_type TEXT NOT NULL DEFAULT 'card'",
+    ]) {
       try { this.db.exec(ddl); } catch { /* column exists */ }
     }
   }
@@ -205,12 +219,14 @@ export class SessionStore {
       .prepare(
         `INSERT INTO scheduled_prompts
            (id, platform, channel_ref, parent_ref, name, prompt_text, cron,
-            timezone, model, catchup_seconds, enabled, attachments_json, created_by,
+            timezone, model, cwd, target_channel, output_type, catchup_seconds,
+            enabled, attachments_json, created_by,
             created_utc, updated_utc, last_run_utc, last_status, next_run_utc,
             pinned_session_id)
          VALUES
            (@id, @platform, @channelRef, @parentRef, @name, @promptText, @cron,
-            @timezone, @model, @catchupSeconds, @enabled, @attachmentsJson, @createdBy,
+            @timezone, @model, @cwd, @targetChannel, @outputType, @catchupSeconds,
+            @enabled, @attachmentsJson, @createdBy,
             @createdUtc, @updatedUtc, @lastRunUtc, @lastStatus, @nextRunUtc,
             @pinnedSessionId)
          ON CONFLICT(id) DO UPDATE SET
@@ -219,6 +235,9 @@ export class SessionStore {
            cron             = excluded.cron,
            timezone         = excluded.timezone,
            model            = excluded.model,
+           cwd              = excluded.cwd,
+           target_channel   = excluded.target_channel,
+           output_type      = excluded.output_type,
            catchup_seconds  = excluded.catchup_seconds,
            enabled          = excluded.enabled,
            attachments_json = excluded.attachments_json,
@@ -238,6 +257,9 @@ export class SessionStore {
         cron: s.cron,
         timezone: s.timezone,
         model: s.model,
+        cwd: s.cwd,
+        targetChannel: s.targetChannel,
+        outputType: s.outputType,
         catchupSeconds: s.catchupSeconds,
         enabled: s.enabled ? 1 : 0,
         attachmentsJson: JSON.stringify(s.attachments ?? []),

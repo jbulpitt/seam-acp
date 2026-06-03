@@ -26,6 +26,13 @@ export interface ScheduledPrompt {
   timezone: string;
   /** Model id to run the job under. null = use the thread session's model. */
   model: string | null;
+  /** Working directory to run the job in. null = the thread's repoPath. */
+  cwd: string | null;
+  /** Channel/thread id to post output to. null = the schedule's own thread. */
+  targetChannel: string | null;
+  /** How to render the result. "card" = blue embed card(s); "messages" = plain
+   *  chunked text messages. The "running" announcement is always a card. */
+  outputType: "card" | "messages";
   /** Missed-fire catch-up window in seconds. 0 = never catch up. Default 900. */
   catchupSeconds: number;
   enabled: boolean;

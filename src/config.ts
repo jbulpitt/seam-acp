@@ -132,12 +132,15 @@ const Schema = z.object({
   /** Per-agent model override for the Claude profile. */
   CLAUDE_DEFAULT_MODEL: z.string().default("claude-sonnet-4.5"),
   /**
-   * Extended-thinking budget for the Claude profile, in tokens. Set to 0 to
-   * disable. The adapter only emits `agent_thought_chunk` (which seam shows
-   * in the status panel's reasoning blockquote) when this is non-zero.
-   * Surfaced to the adapter via the `MAX_THINKING_TOKENS` env var it reads.
+   * Optional fixed extended-thinking budget, forwarded as the (deprecated)
+   * `MAX_THINKING_TOKENS` env var. Default 0 = unset, which is what you want:
+   * modern models think on their own — Sonnet 4.6 / Haiku 4.5 stream thinking by
+   * default, and adaptive models (Opus 4.6+) decide their own budget and ignore
+   * this (their visibility is governed by CLAUDE_THINKING_DISPLAY). Set > 0 only
+   * to cap/force a budget on an older model that needs it. (Verified: with this
+   * unset, Sonnet/Haiku still emit thinking and Opus summarized-display works.)
    */
-  CLAUDE_MAX_THINKING_TOKENS: z.coerce.number().int().min(0).max(64000).default(8000),
+  CLAUDE_MAX_THINKING_TOKENS: z.coerce.number().int().min(0).max(64000).default(0),
   /**
    * How adaptive-thinking models (Opus 4.6+) surface their reasoning. These
    * models default to "omitted" — their thinking never reaches the status panel.

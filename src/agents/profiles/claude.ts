@@ -73,9 +73,11 @@ export function makeClaudeProfile(opts: {
   /** Default model id for sessions on this profile (e.g. "claude-sonnet-4.5"). */
   defaultModel: string;
   /**
-   * Extended-thinking budget in tokens. The adapter only emits
-   * `agent_thought_chunk` when its child sees `MAX_THINKING_TOKENS` in the
-   * env, so we forward this through. 0 / undefined leaves thinking off.
+   * Optional fixed thinking budget, forwarded as the deprecated
+   * `MAX_THINKING_TOKENS` env var. 0 / undefined leaves it unset — modern models
+   * still stream thinking on their own (Sonnet 4.6, Haiku 4.5), and adaptive
+   * models (Opus 4.6+) ignore it. Only set to cap/force a budget on an older
+   * model. Thinking *visibility* for Opus is governed by `thinkingDisplay`.
    */
   maxThinkingTokens?: number;
   /**

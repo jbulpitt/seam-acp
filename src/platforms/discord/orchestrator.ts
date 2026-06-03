@@ -198,6 +198,10 @@ export class Orchestrator {
 
   private async handleRestartSentinel(): Promise<void> {
     this.restartPending = true;
+    // Stop firing NEW scheduled jobs immediately so the drain only waits for
+    // jobs already in flight (they're counted in activeTurns). Timers re-arm from
+    // the DB after the restart.
+    this.scheduledManager?.stop();
 
     if (this.activeTurns > 0) {
       const turnWord = this.activeTurns === 1 ? "turn" : "turn(s)";
@@ -1582,6 +1586,19 @@ export class Orchestrator {
   async runScheduledPrompt(id: string): Promise<void> {
     const row = this.store.getScheduled(id);
     if (!row) return;
+    // Count scheduled jobs in the restart-drain counter (activeTurns) so a
+    // redeploy/sentinel waits for an in-flight job to finish instead of killing
+    // its agent child mid-run.
+    this.activeTurns++;
+    try {
+      await this.runScheduledPromptInner(row);
+    } finally {
+      this.activeTurns--;
+    }
+  }
+
+  private async runScheduledPromptInner(row: ScheduledPrompt): Promise<void> {
+    const id = row.id;
     const bindingThread: ChannelRef = {
       platform: PLATFORM,
       id: row.channelRef,
@@ -1717,7 +1734,13 @@ export class Orchestrator {
           }
         }
       });
-      await rt.prompt(promptText, attachments.length ? attachments : undefined);
+      const outcome = await raceWithTimeout(
+        rt.prompt(promptText, attachments.length ? attachments : undefined),
+        this.config.TURN_TIMEOUT_SECONDS * 1000
+      );
+      if (outcome === "timeout") {
+        return { text, error: `timed out after ${this.config.TURN_TIMEOUT_SECONDS}s` };
+      }
       return { text };
     } catch (err) {
       return { text, error: (err as Error).message };

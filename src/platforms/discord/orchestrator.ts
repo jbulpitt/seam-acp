@@ -490,6 +490,15 @@ export class Orchestrator {
       const msg = e instanceof Error ? e.message : String(e);
       return msg.includes("ACP connection closed");
     };
+    // Transient server-side throttle — "Server is temporarily limiting requests
+    // (not your usage limit) · Rate limited". NOT a quota/usage error; it clears
+    // on its own, so a short backoff-and-retry recovers it invisibly.
+    const isRateLimitError = (e: unknown): boolean => {
+      const err = e as { data?: { errorKind?: string }; message?: string } | undefined;
+      if (err?.data?.errorKind === "rate_limit") return true;
+      const msg = e instanceof Error ? e.message : String(e);
+      return /temporarily limiting requests|rate limited/i.test(msg);
+    };
 
     try {
       let activeRuntime = await this.router.getOrStartRuntime(record);
@@ -802,6 +811,25 @@ export class Orchestrator {
           activeRuntime = await this.router.getOrStartRuntime(record);
           activeRuntime.onEvent(eventHandler);
           result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
+        } else if (isRateLimitError(promptErr) && !textSent && !textBuffer) {
+          // Transient server-side throttle with nothing emitted yet: the session
+          // is intact, so back off and retry the SAME prompt on the SAME runtime
+          // (no invalidate). Guarded on no-output-yet so a mid-stream limit can't
+          // double-emit — if output already started we fall through and surface
+          // it. Schedule clears typical brief throttles invisibly.
+          let rlResult: PromptOutcome | "timeout" | undefined;
+          for (const backoffMs of [2_000, 5_000, 10_000]) {
+            this.logger.warn({ session: record.id, backoffMs }, "rate limited before output; backing off and retrying");
+            await new Promise((r) => setTimeout(r, backoffMs));
+            try {
+              rlResult = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
+              break;
+            } catch (rlErr) {
+              if (!isRateLimitError(rlErr)) throw rlErr; // a different failure — surface it
+            }
+          }
+          if (rlResult === undefined) throw promptErr; // still throttled after backoff
+          result = rlResult;
         } else {
           throw promptErr;
         }

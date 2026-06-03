@@ -1,6 +1,6 @@
 # Scheduled prompts — build plan
 
-**Status:** draft / proposal
+**Status:** implemented (v1) — type-checked + unit-tested; pending live Discord shake-out
 **Purpose:** let a user create one or more **cron-style scheduled prompts** tied to
 a Discord thread. When one fires, a card announces it, the prompt runs as a
 **self-contained job in its own isolated session**, and the output is posted back

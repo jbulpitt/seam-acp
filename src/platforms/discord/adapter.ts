@@ -62,6 +62,7 @@ export class DiscordAdapter implements ChatAdapter {
   private readonly slashHandler: SlashHandler;
 
   private messageHandler?: (msg: IncomingMessage) => void | Promise<void>;
+  private threadDeleteHandler?: (channelRef: string) => void | Promise<void>;
   private botUserId?: string;
 
   constructor(opts: {
@@ -84,6 +85,10 @@ export class DiscordAdapter implements ChatAdapter {
 
   onMessage(handler: (msg: IncomingMessage) => void | Promise<void>): void {
     this.messageHandler = handler;
+  }
+
+  onThreadDelete(handler: (channelRef: string) => void | Promise<void>): void {
+    this.threadDeleteHandler = handler;
   }
 
   async start(): Promise<void> {
@@ -396,6 +401,21 @@ export class DiscordAdapter implements ChatAdapter {
     return messages.reverse();
   }
 
+  async getThreadLiveState(
+    channel: ChannelRef
+  ): Promise<{ locked: boolean; archived: boolean } | undefined> {
+    try {
+      const ch = await this.client.channels.fetch(channel.id);
+      if (!ch || !ch.isThread()) return undefined; // not a thread / gone
+      return { locked: ch.locked ?? false, archived: ch.archived ?? false };
+    } catch (err) {
+      // 10003 = Unknown Channel → confirmed deleted. Anything else is transient;
+      // rethrow so the caller skips this run rather than dropping the schedule.
+      if ((err as { code?: number })?.code === 10003) return undefined;
+      throw err;
+    }
+  }
+
   async fetchThreadMessagesTimed(
     channel: ChannelRef,
     opts?: { fromTs?: number; toTs?: number }
@@ -498,6 +518,11 @@ export class DiscordAdapter implements ChatAdapter {
       if (interaction.commandName !== "seam") return;
       this.handleSlash(interaction).catch((err) => {
         this.logger.error({ err }, "slash handler crashed");
+      });
+    });
+    this.client.on(Events.ThreadDelete, (thread) => {
+      void Promise.resolve(this.threadDeleteHandler?.(thread.id)).catch((err) => {
+        this.logger.error({ err }, "thread-delete handler crashed");
       });
     });
   }

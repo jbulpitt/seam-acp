@@ -6,6 +6,7 @@ import {
   type SessionConfigState,
   type SessionRecord,
 } from "./types.js";
+import type { ScheduledPrompt } from "./scheduled-prompts/types.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -22,6 +23,31 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_platform_channel
   ON sessions(platform, channel_ref);
+
+CREATE TABLE IF NOT EXISTS scheduled_prompts (
+  id                 TEXT PRIMARY KEY,
+  platform           TEXT NOT NULL,
+  channel_ref        TEXT NOT NULL,
+  parent_ref         TEXT,
+  name               TEXT NOT NULL,
+  prompt_text        TEXT NOT NULL,
+  cron               TEXT NOT NULL,
+  timezone           TEXT NOT NULL,
+  catchup_seconds    INTEGER NOT NULL DEFAULT 900,
+  enabled            INTEGER NOT NULL DEFAULT 1,
+  attachments_json   TEXT NOT NULL DEFAULT '[]',
+  created_by         TEXT NOT NULL,
+  created_utc        TEXT NOT NULL,
+  updated_utc        TEXT NOT NULL,
+  last_run_utc       TEXT,
+  last_status        TEXT,
+  next_run_utc       TEXT,
+  pinned_session_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_channel
+  ON scheduled_prompts(platform, channel_ref);
+CREATE INDEX IF NOT EXISTS idx_scheduled_enabled
+  ON scheduled_prompts(enabled);
 `;
 
 interface Row {
@@ -53,6 +79,55 @@ const mapRow = (r: Row): SessionRecord => ({
 export function makeSessionId(platform: string, channelRef: string): string {
   return `${platform}:${channelRef}`;
 }
+
+interface ScheduledRow {
+  id: string;
+  platform: string;
+  channel_ref: string;
+  parent_ref: string | null;
+  name: string;
+  prompt_text: string;
+  cron: string;
+  timezone: string;
+  catchup_seconds: number;
+  enabled: number;
+  attachments_json: string;
+  created_by: string;
+  created_utc: string;
+  updated_utc: string;
+  last_run_utc: string | null;
+  last_status: string | null;
+  next_run_utc: string | null;
+  pinned_session_id: string | null;
+}
+
+const mapScheduled = (r: ScheduledRow): ScheduledPrompt => {
+  let attachments: ScheduledPrompt["attachments"] = [];
+  try {
+    const parsed = JSON.parse(r.attachments_json);
+    if (Array.isArray(parsed)) attachments = parsed;
+  } catch { /* keep empty */ }
+  return {
+    id: r.id,
+    platform: r.platform,
+    channelRef: r.channel_ref,
+    parentRef: r.parent_ref,
+    name: r.name,
+    promptText: r.prompt_text,
+    cron: r.cron,
+    timezone: r.timezone,
+    catchupSeconds: r.catchup_seconds,
+    enabled: r.enabled !== 0,
+    attachments,
+    createdBy: r.created_by,
+    createdUtc: r.created_utc,
+    updatedUtc: r.updated_utc,
+    lastRunUtc: r.last_run_utc,
+    lastStatus: r.last_status,
+    nextRunUtc: r.next_run_utc,
+    pinnedSessionId: r.pinned_session_id,
+  };
+};
 
 export class SessionStore {
   private readonly db: Database.Database;
@@ -113,6 +188,91 @@ export class SessionStore {
            updated_utc     = excluded.updated_utc`
       )
       .run(record);
+  }
+
+  // --- scheduled prompts ----------------------------------------------------
+
+  upsertScheduled(s: ScheduledPrompt): void {
+    this.db
+      .prepare(
+        `INSERT INTO scheduled_prompts
+           (id, platform, channel_ref, parent_ref, name, prompt_text, cron,
+            timezone, catchup_seconds, enabled, attachments_json, created_by,
+            created_utc, updated_utc, last_run_utc, last_status, next_run_utc,
+            pinned_session_id)
+         VALUES
+           (@id, @platform, @channelRef, @parentRef, @name, @promptText, @cron,
+            @timezone, @catchupSeconds, @enabled, @attachmentsJson, @createdBy,
+            @createdUtc, @updatedUtc, @lastRunUtc, @lastStatus, @nextRunUtc,
+            @pinnedSessionId)
+         ON CONFLICT(id) DO UPDATE SET
+           name             = excluded.name,
+           prompt_text      = excluded.prompt_text,
+           cron             = excluded.cron,
+           timezone         = excluded.timezone,
+           catchup_seconds  = excluded.catchup_seconds,
+           enabled          = excluded.enabled,
+           attachments_json = excluded.attachments_json,
+           updated_utc      = excluded.updated_utc,
+           last_run_utc     = excluded.last_run_utc,
+           last_status      = excluded.last_status,
+           next_run_utc     = excluded.next_run_utc,
+           pinned_session_id = excluded.pinned_session_id`
+      )
+      .run({
+        id: s.id,
+        platform: s.platform,
+        channelRef: s.channelRef,
+        parentRef: s.parentRef,
+        name: s.name,
+        promptText: s.promptText,
+        cron: s.cron,
+        timezone: s.timezone,
+        catchupSeconds: s.catchupSeconds,
+        enabled: s.enabled ? 1 : 0,
+        attachmentsJson: JSON.stringify(s.attachments ?? []),
+        createdBy: s.createdBy,
+        createdUtc: s.createdUtc,
+        updatedUtc: s.updatedUtc,
+        lastRunUtc: s.lastRunUtc,
+        lastStatus: s.lastStatus,
+        nextRunUtc: s.nextRunUtc,
+        pinnedSessionId: s.pinnedSessionId,
+      });
+  }
+
+  getScheduled(id: string): ScheduledPrompt | null {
+    const row = this.db
+      .prepare<[string], ScheduledRow>("SELECT * FROM scheduled_prompts WHERE id = ?")
+      .get(id);
+    return row ? mapScheduled(row) : null;
+  }
+
+  listScheduledByChannel(platform: string, channelRef: string): ScheduledPrompt[] {
+    return this.db
+      .prepare<[string, string], ScheduledRow>(
+        "SELECT * FROM scheduled_prompts WHERE platform = ? AND channel_ref = ? ORDER BY created_utc ASC"
+      )
+      .all(platform, channelRef)
+      .map(mapScheduled);
+  }
+
+  listScheduledEnabled(): ScheduledPrompt[] {
+    return this.db
+      .prepare<[], ScheduledRow>("SELECT * FROM scheduled_prompts WHERE enabled = 1")
+      .all()
+      .map(mapScheduled);
+  }
+
+  listAllScheduled(): ScheduledPrompt[] {
+    return this.db
+      .prepare<[], ScheduledRow>("SELECT * FROM scheduled_prompts ORDER BY created_utc ASC")
+      .all()
+      .map(mapScheduled);
+  }
+
+  deleteScheduled(id: string): void {
+    this.db.prepare("DELETE FROM scheduled_prompts WHERE id = ?").run(id);
   }
 
   readConfig(record: SessionRecord): SessionConfigState {

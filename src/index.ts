@@ -13,6 +13,7 @@ import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { Orchestrator } from "./platforms/discord/orchestrator.js";
 import { buildGlobalMcpServers } from "./mcp.js";
 import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
+import { ScheduledPromptManager } from "./core/scheduled-prompts/manager.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -172,6 +173,17 @@ async function main(): Promise<void> {
 
   await adapter.start();
 
+  // Scheduled prompts: arm timers from the DB once Discord is connected (so a
+  // catch-up fire can post immediately). onFire runs the schedule as an isolated
+  // job and posts output to the thread.
+  const scheduledManager = new ScheduledPromptManager({
+    store,
+    logger: logger.child({ mod: "scheduled" }),
+    onFire: (id) => orchestrator.runScheduledPrompt(id),
+  });
+  orchestrator.setScheduledManager(scheduledManager);
+  scheduledManager.start();
+
   logger.info("seam-acp ready");
 
   // Best-effort startup notification to a configured channel.
@@ -190,6 +202,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, "shutting down");
     orchestrator.stopSentinelWatcher();
+    scheduledManager.stop();
     stopTunnelGist?.();
     try {
       await adapter.stop();

@@ -89,6 +89,18 @@ export interface ChatAdapter {
   /** Optional: fetch historical messages for a thread (chronological order). */
   fetchThreadMessages?(channel: ChannelRef): Promise<Array<{ authorIsBot: boolean; text: string }>>;
 
+  /** Optional: register a handler called when a thread is deleted (channelRef =
+   *  the thread id). Used by scheduled prompts for instant cleanup. */
+  onThreadDelete?(handler: (channelRef: string) => void | Promise<void>): void;
+
+  /** Optional: live state of a thread. Returns `undefined` only when the thread
+   *  is *confirmed gone* (e.g. Discord "Unknown Channel"); throws on transient
+   *  errors so callers don't mistake a blip for a deletion. Used by scheduled
+   *  prompts to decide run / skip-locked / drop-deleted at fire time. */
+  getThreadLiveState?(
+    channel: ChannelRef
+  ): Promise<{ locked: boolean; archived: boolean } | undefined>;
+
   /** Optional: fetch historical messages with timestamps (ms epoch), optionally
    *  bounded to [fromTs, toTs]. Used by premium compaction to pull only the
    *  Discord ranges the gap-detector flagged as higher-fidelity than the session

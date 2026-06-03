@@ -23,6 +23,7 @@ import type {
   ChannelRef,
   IncomingMessage,
   MessageRef,
+  MessageAttachment,
   SessionRecord,
 } from "../chat-adapter.js";
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
@@ -32,6 +33,40 @@ import { analyzeSessionCoverage, detectGaps, type TimeRange } from "../../core/c
 import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
 import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, assembleNewSession, type PinnedFacts } from "../../core/compaction/prompts.js";
 import type { AgentProfile } from "../../agents/agent-profile.js";
+import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
+import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
+import {
+  loadScheduledAttachments,
+  deleteScheduledAttachmentDir,
+  saveScheduledAttachment,
+  deleteScheduledAttachment,
+} from "../../core/scheduled-prompts/attachments.js";
+import { describeCron, validateCron, nextRun as cronNextRun } from "../../core/scheduled-prompts/cron.js";
+
+/** Accent color for scheduled-prompt cards ("cron blue"). */
+const SCHEDULED_COLOR = 0x3498db;
+
+const SCHEDULE_DEFAULT_TZ = "America/Chicago";
+const SCHEDULE_TIMEZONES = [
+  "America/Chicago",
+  "America/New_York",
+  "America/Denver",
+  "America/Los_Angeles",
+  "UTC",
+  "Europe/London",
+  "Europe/Berlin",
+  "Asia/Tokyo",
+];
+/** Common-cadence presets for the builder card; value is a full cron or the
+ *  sentinel for the custom-cron modal. */
+const SCHEDULE_PRESETS: Array<{ label: string; value: string }> = [
+  { label: "Every day at 9:00 AM", value: "0 9 * * *" },
+  { label: "Weekdays at 9:00 AM", value: "0 9 * * 1-5" },
+  { label: "Every Monday at 9:00 AM", value: "0 9 * * 1" },
+  { label: "Every hour", value: "0 * * * *" },
+  { label: "Every 15 minutes", value: "*/15 * * * *" },
+  { label: "Custom cron…", value: "__custom__" },
+];
 import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
@@ -83,6 +118,9 @@ export class Orchestrator {
   private restartPending = false;
   private readonly channelQueues = new Map<string, Promise<void>>();
   private readonly channelGenerations = new Map<string, number>();
+  /** Set by index.ts after construction; used by /seam schedule handlers to
+   *  arm/disarm timers and by the fire runner to drop deleted-thread schedules. */
+  private scheduledManager?: ScheduledPromptManager;
 
   constructor(opts: {
     logger: Logger;
@@ -102,7 +140,22 @@ export class Orchestrator {
 
   install(): void {
     this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
+    this.adapter.onThreadDelete?.((channelRef) => this.handleThreadDeleted(channelRef));
     this.watchSentinel();
+  }
+
+  /** Instant cleanup when a thread is deleted: drop its scheduled prompts and
+   *  their stored attachments. (Fire-time 404 is the lazy fallback if the bot
+   *  was offline when the delete happened.) */
+  private async handleThreadDeleted(channelRef: string): Promise<void> {
+    const rows = this.store.listScheduledByChannel(PLATFORM, channelRef);
+    if (rows.length === 0) return;
+    this.logger.info({ channelRef, count: rows.length }, "thread deleted; dropping scheduled prompts");
+    for (const row of rows) {
+      this.scheduledManager?.disarm(row.id);
+      this.store.deleteScheduled(row.id);
+      await deleteScheduledAttachmentDir(this.config.DATA_DIR, row.id).catch(() => {});
+    }
   }
 
   async postNotification(message: string): Promise<void> {
@@ -1084,6 +1137,9 @@ export class Orchestrator {
   async handleSlashInteraction(
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
+    if (interaction.options.getSubcommandGroup(false) === "schedule") {
+      return this.cmdSchedule(interaction);
+    }
     const sub = interaction.options.getSubcommand(true);
     switch (sub) {
       case "new":
@@ -1513,6 +1569,523 @@ export class Orchestrator {
       ``, `---`, ``,
       `## Assembled session seed`, ``, result.assembledSeed,
     ].join("\n");
+  }
+
+  setScheduledManager(m: ScheduledPromptManager): void {
+    this.scheduledManager = m;
+  }
+
+  /** Manager `onFire` handler: run a scheduled prompt as an **isolated job** (own
+   *  throwaway session, thread's repo + model + attachments) and post the output
+   *  to the thread as blue cards. Owns last_run/last_status only — the manager
+   *  owns next_run. Read-only w.r.t. the thread's live session. */
+  async runScheduledPrompt(id: string): Promise<void> {
+    const row = this.store.getScheduled(id);
+    if (!row) return;
+    const channel: ChannelRef = {
+      platform: PLATFORM,
+      id: row.channelRef,
+      ...(row.parentRef ? { parentId: row.parentRef } : {}),
+    };
+
+    // 1. Thread lifecycle: run / skip-locked / drop-deleted.
+    if (typeof this.adapter.getThreadLiveState === "function") {
+      let state: { locked: boolean; archived: boolean } | undefined;
+      try {
+        state = await this.adapter.getThreadLiveState(channel);
+      } catch (err) {
+        this.logger.warn({ id, err }, "scheduled: thread state check failed (transient); skipping");
+        this.patchScheduledStatus(id, "skipped: thread unreachable");
+        return;
+      }
+      if (state === undefined) {
+        this.logger.info({ id, channel: row.channelRef }, "scheduled: thread deleted; dropping schedule");
+        this.store.deleteScheduled(id);
+        this.scheduledManager?.disarm(id);
+        await deleteScheduledAttachmentDir(this.config.DATA_DIR, id).catch(() => {});
+        return;
+      }
+      if (state.locked) {
+        this.patchScheduledStatus(id, "skipped: locked");
+        return;
+      }
+    }
+
+    // 2. Resolve the thread's agent / model / cwd.
+    const record = this.router.ensureSessionRecord({
+      platform: PLATFORM,
+      channelRef: row.channelRef,
+      ...(row.parentRef ? { parentRef: row.parentRef } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+    const profile = this.router.getProfile(record.agentId);
+    if (!profile) {
+      this.patchScheduledStatus(id, `error: unknown agent ${record.agentId}`);
+      return;
+    }
+    const cfg = this.store.readConfig(record);
+    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+
+    // 3. Announce card (also auto-reopens an archived-but-unlocked thread).
+    const running: StructuredPanel = {
+      color: SCHEDULED_COLOR,
+      title: `⏰ Scheduled: ${row.name}`,
+      description: "Running…",
+      fields: [],
+      footer: describeCron(row.cron),
+    };
+    let cardRef: MessageRef | undefined;
+    try {
+      cardRef = this.adapter.sendPanel
+        ? await this.adapter.sendPanel(channel, running)
+        : await this.adapter.sendMessage(channel, `⏰ Running scheduled prompt "${row.name}"…`);
+    } catch (err) {
+      this.logger.warn({ id, err }, "scheduled: announce card failed");
+    }
+
+    // 4. Run isolated + capture.
+    const attachments = await loadScheduledAttachments(this.config.DATA_DIR, id, row.attachments);
+    const result = await this.runIsolatedScheduledJob({
+      profile,
+      cwd,
+      ...(cfg.model ? { model: cfg.model } : {}),
+      ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+      channel,
+      promptText: row.promptText,
+      attachments,
+    });
+
+    // 5. Post result + record status.
+    if (result.error) {
+      this.patchScheduledStatus(id, `error: ${result.error.slice(0, 200)}`);
+      await this.editOrSendPanel(channel, cardRef, {
+        color: 0xe74c3c,
+        title: `⏰ Scheduled: ${row.name}`,
+        description: `❌ Failed:\n\`\`\`\n${result.error.slice(0, 1500)}\n\`\`\``,
+        fields: [],
+        footer: describeCron(row.cron),
+      });
+    } else {
+      this.patchScheduledStatus(id, "ok");
+      await this.postScheduledOutput(channel, row.name, result.text, cardRef);
+    }
+  }
+
+  /** Spawn a throwaway runtime, run one prompt with attachments, collect the
+   *  text, forward any files the agent produced to the thread, then tear down
+   *  and delete the temp session (so it doesn't clutter `/seam sessions`). */
+  private async runIsolatedScheduledJob(args: {
+    profile: AgentProfile;
+    cwd: string;
+    model?: string;
+    effort?: string;
+    channel: ChannelRef;
+    promptText: string;
+    attachments: MessageAttachment[];
+  }): Promise<{ text: string; error?: string }> {
+    const { profile, cwd, model, effort, channel, promptText, attachments } = args;
+    const manager = profile.sessionManager;
+    let rt: AgentRuntime | undefined;
+    let text = "";
+    try {
+      rt = new AgentRuntime({ profile, logger: this.logger.child({ scheduled: "run" }), mcpServers: [] });
+      await rt.start();
+      await rt.newSession({ cwd, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+      rt.onEvent(async (event) => {
+        if (event.kind === "agent-text") {
+          text += event.text;
+        } else if (event.kind === "agent-file") {
+          try {
+            if (this.adapter.sendFile) {
+              const data = event.base64
+                ? Buffer.from(event.data, "base64")
+                : Buffer.from(event.data, "utf8");
+              await this.adapter.sendFile(channel, { data, filename: event.filename, mimeType: event.mimeType });
+            }
+          } catch (err) {
+            this.logger.warn({ err }, "scheduled: forward agent file failed");
+          }
+        }
+      });
+      await rt.prompt(promptText, attachments.length ? attachments : undefined);
+      return { text };
+    } catch (err) {
+      return { text, error: (err as Error).message };
+    } finally {
+      if (rt) {
+        const sid = rt.getSessionInfo()?.sessionId;
+        await rt.dispose().catch(() => {});
+        if (sid && manager?.deleteSession) {
+          await manager.deleteSession(cwd, sid).catch(() => {});
+        }
+      }
+    }
+  }
+
+  /** Post captured output as blue cards; overflow → a single file attachment. */
+  private async postScheduledOutput(
+    channel: ChannelRef,
+    name: string,
+    text: string,
+    cardRef?: MessageRef
+  ): Promise<void> {
+    const title = `⏰ Scheduled: ${name}`;
+    const body = text.trim();
+    const panel = (description: string, footer?: string): StructuredPanel => ({
+      color: SCHEDULED_COLOR,
+      title,
+      description,
+      fields: [],
+      ...(footer ? { footer } : {}),
+    });
+    if (!body) {
+      await this.editOrSendPanel(channel, cardRef, panel("✅ Done — no output."));
+      return;
+    }
+    const MAX = 3900;
+    const chunks: string[] = [];
+    for (let i = 0; i < body.length; i += MAX) chunks.push(body.slice(i, i + MAX));
+
+    if (chunks.length <= 3) {
+      await this.editOrSendPanel(
+        channel,
+        cardRef,
+        panel(chunks[0]!, chunks.length > 1 ? `1/${chunks.length}` : undefined)
+      );
+      for (let j = 1; j < chunks.length; j++) {
+        if (this.adapter.sendPanel) await this.adapter.sendPanel(channel, panel(chunks[j]!, `${j + 1}/${chunks.length}`));
+        else await this.adapter.sendMessage(channel, chunks[j]!);
+      }
+    } else {
+      await this.editOrSendPanel(channel, cardRef, panel(`✅ Done — full output attached (${body.length} chars).`));
+      const filename = `scheduled-${name.replace(/[^\w.-]+/g, "_") || "output"}.md`;
+      if (this.adapter.sendFile) {
+        await this.adapter.sendFile(channel, { data: Buffer.from(body, "utf8"), filename, mimeType: "text/markdown" });
+      } else {
+        for (const c of chunks) await this.adapter.sendMessage(channel, c);
+      }
+    }
+  }
+
+  private async editOrSendPanel(channel: ChannelRef, cardRef: MessageRef | undefined, p: StructuredPanel): Promise<void> {
+    if (cardRef && this.adapter.editPanel) {
+      try { await this.adapter.editPanel(cardRef, p); return; } catch { /* fall through */ }
+    }
+    if (this.adapter.sendPanel) { await this.adapter.sendPanel(channel, p); return; }
+    await this.adapter.sendMessage(channel, `${p.title}\n${p.description ?? ""}`);
+  }
+
+  /** Update last_run/last_status, preserving next_run (manager-owned). */
+  private patchScheduledStatus(id: string, status: string): void {
+    const fresh = this.store.getScheduled(id);
+    if (!fresh) return;
+    this.store.upsertScheduled({ ...fresh, lastStatus: status, lastRunUtc: new Date().toISOString() });
+  }
+
+  // --- /seam schedule … -----------------------------------------------------
+
+  private async cmdSchedule(i: ChatInputCommandInteraction): Promise<void> {
+    const sub = i.options.getSubcommand(true);
+    switch (sub) {
+      case "add": return this.cmdScheduleAdd(i);
+      case "list": return this.cmdScheduleList(i);
+      case "remove": return this.cmdScheduleRemove(i);
+      case "toggle": return this.cmdScheduleToggle(i);
+      case "addfile": return this.cmdScheduleAddFile(i);
+      case "removefile": return this.cmdScheduleRemoveFile(i);
+      default:
+        await i.reply({ content: `Unknown schedule subcommand: ${sub}`, flags: MessageFlags.Ephemeral });
+    }
+  }
+
+  /** Download a Discord attachment's bytes (URL is valid now; we persist them
+   *  because Discord CDN URLs expire ~24h). */
+  private async downloadAttachmentBytes(url: string): Promise<Buffer> {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`download failed (${res.status})`);
+    return Buffer.from(await res.arrayBuffer());
+  }
+
+  private scheduleSummaryLine(s: ScheduledPrompt): string {
+    const state = s.enabled ? "🟢" : "⏸️";
+    const last = s.lastStatus ? ` · last: ${s.lastStatus}` : "";
+    const next = s.enabled && s.nextRunUtc ? ` · next: <t:${Math.floor(Date.parse(s.nextRunUtc) / 1000)}:R>` : "";
+    const files = s.attachments.length ? ` · 📎${s.attachments.length}` : "";
+    return `${state} **${s.name}** \`${s.id}\`\n   ${describeCron(s.cron)} (${s.timezone})${files}${next}${last}`;
+  }
+
+  private async cmdScheduleList(i: ChatInputCommandInteraction): Promise<void> {
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel) {
+      await i.reply({ content: "Use this inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const rows = this.store.listScheduledByChannel(PLATFORM, channel.id);
+    if (rows.length === 0) {
+      await i.reply({ content: "No scheduled prompts for this thread. Create one with `/seam schedule add`.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const embed = new EmbedBuilder()
+      .setTitle("⏰ Scheduled prompts")
+      .setColor(SCHEDULED_COLOR)
+      .setDescription(rows.map((r) => this.scheduleSummaryLine(r)).join("\n\n"));
+    await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+  }
+
+  private async cmdScheduleRemove(i: ChatInputCommandInteraction): Promise<void> {
+    const id = i.options.getString("id", true);
+    const row = this.store.getScheduled(id);
+    const channel = this.channelRefFromInteraction(i);
+    if (!row || !channel || row.channelRef !== channel.id) {
+      await i.reply({ content: `No schedule \`${id}\` in this thread.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    this.scheduledManager?.disarm(id);
+    this.store.deleteScheduled(id);
+    await deleteScheduledAttachmentDir(this.config.DATA_DIR, id).catch(() => {});
+    await i.reply({ content: `🗑️ Deleted scheduled prompt **${row.name}** (\`${id}\`).`, flags: MessageFlags.Ephemeral });
+  }
+
+  private async cmdScheduleToggle(i: ChatInputCommandInteraction): Promise<void> {
+    const id = i.options.getString("id", true);
+    const row = this.store.getScheduled(id);
+    const channel = this.channelRefFromInteraction(i);
+    if (!row || !channel || row.channelRef !== channel.id) {
+      await i.reply({ content: `No schedule \`${id}\` in this thread.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const updated: ScheduledPrompt = { ...row, enabled: !row.enabled, updatedUtc: new Date().toISOString() };
+    this.store.upsertScheduled(updated);
+    if (updated.enabled) this.scheduledManager?.armFromRow(updated);
+    else this.scheduledManager?.disarm(id);
+    await i.reply({
+      content: `${updated.enabled ? "🟢 Enabled" : "⏸️ Disabled"} **${row.name}** (\`${id}\`).`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  private async cmdScheduleAddFile(i: ChatInputCommandInteraction): Promise<void> {
+    const id = i.options.getString("id", true);
+    const file = i.options.getAttachment("file", true);
+    const row = this.store.getScheduled(id);
+    const channel = this.channelRefFromInteraction(i);
+    if (!row || !channel || row.channelRef !== channel.id) {
+      await i.reply({ content: `No schedule \`${id}\` in this thread.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      const bytes = await this.downloadAttachmentBytes(file.url);
+      const saved = await saveScheduledAttachment(this.config.DATA_DIR, id, {
+        filename: file.name,
+        mime: file.contentType ?? "application/octet-stream",
+        bytes,
+      });
+      const updated: ScheduledPrompt = {
+        ...row,
+        attachments: [...row.attachments.filter((a) => a.filename !== saved.filename), saved],
+        updatedUtc: new Date().toISOString(),
+      };
+      this.store.upsertScheduled(updated);
+      await i.editReply(`📎 Added \`${saved.filename}\` to **${row.name}** (${updated.attachments.length} file(s)).`);
+    } catch (err) {
+      await i.editReply(`❌ Failed to add file: ${(err as Error).message}`);
+    }
+  }
+
+  private async cmdScheduleRemoveFile(i: ChatInputCommandInteraction): Promise<void> {
+    const id = i.options.getString("id", true);
+    const filename = i.options.getString("filename", true);
+    const row = this.store.getScheduled(id);
+    const channel = this.channelRefFromInteraction(i);
+    if (!row || !channel || row.channelRef !== channel.id) {
+      await i.reply({ content: `No schedule \`${id}\` in this thread.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await deleteScheduledAttachment(this.config.DATA_DIR, id, filename).catch(() => {});
+    const updated: ScheduledPrompt = {
+      ...row,
+      attachments: row.attachments.filter((a) => a.filename !== filename),
+      updatedUtc: new Date().toISOString(),
+    };
+    this.store.upsertScheduled(updated);
+    await i.reply({ content: `🗑️ Removed \`${filename}\` from **${row.name}**.`, flags: MessageFlags.Ephemeral });
+  }
+
+  private async cmdScheduleAdd(i: ChatInputCommandInteraction): Promise<void> {
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel) {
+      await i.reply({ content: "Use `/seam schedule add` inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    // Bind the thread to a session record if it isn't already (so the job has a
+    // repo/agent to run under).
+    this.router.ensureSessionRecord({
+      platform: PLATFORM,
+      channelRef: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+
+    // Capture any files supplied on the command (references held; bytes fetched
+    // on Create, while the URLs are still valid).
+    const pending: Array<{ name: string; url: string; mime: string }> = [];
+    for (const opt of ["file", "file2", "file3"]) {
+      const a = i.options.getAttachment(opt, false);
+      if (a) pending.push({ name: a.name, url: a.url, mime: a.contentType ?? "application/octet-stream" });
+    }
+
+    const state = {
+      name: "",
+      promptText: "",
+      cron: null as string | null,
+      timezone: SCHEDULE_DEFAULT_TZ,
+      files: pending,
+    };
+
+    const render = () => {
+      const cronLine = state.cron
+        ? `${describeCron(state.cron)} \`${state.cron}\``
+        : "*(not set)*";
+      const next = state.cron ? cronNextRun(state.cron, state.timezone) : null;
+      const embed = new EmbedBuilder()
+        .setTitle("⏰ New scheduled prompt")
+        .setColor(SCHEDULED_COLOR)
+        .setDescription(
+          "This runs **on its own, on a clean session** — it won't remember this conversation. " +
+          "Write the prompt so it stands alone, and attach any files it needs (re-sent every run)."
+        )
+        .addFields(
+          { name: "🏷️ Name", value: state.name || "*(not set)*" },
+          { name: "✏️ Prompt", value: state.promptText ? "```\n" + state.promptText.slice(0, 1000) + "\n```" : "*(not set — click ✏️ Prompt & name)*" },
+          { name: "🕐 Runs", value: cronLine + (next ? `\nNext: <t:${Math.floor(next.getTime() / 1000)}:F>` : ""), inline: true },
+          { name: "🌍 Timezone", value: state.timezone, inline: true },
+          { name: "📎 Files", value: state.files.length ? state.files.map((f) => `\`${f.name}\``).join(", ") : "*(none)*" }
+        );
+      const cadence = new StringSelectMenuBuilder()
+        .setCustomId("sched:cadence")
+        .setPlaceholder("🕐 How often?")
+        .addOptions(SCHEDULE_PRESETS.map((p) => ({ label: p.label, value: p.value })));
+      const tz = new StringSelectMenuBuilder()
+        .setCustomId("sched:tz")
+        .setPlaceholder("🌍 Timezone")
+        .addOptions(SCHEDULE_TIMEZONES.map((z) => ({ label: z, value: z, default: z === state.timezone })));
+      const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("sched:prompt").setLabel("✏️ Prompt & name").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("sched:create").setLabel("✅ Create").setStyle(ButtonStyle.Success).setDisabled(!state.cron || !state.promptText || !state.name),
+        new ButtonBuilder().setCustomId("sched:cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+      );
+      return {
+        embeds: [embed],
+        components: [
+          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(cadence),
+          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(tz),
+          buttons,
+        ],
+      };
+    };
+
+    await i.reply({ ...render(), flags: MessageFlags.Ephemeral });
+    const msg = await i.fetchReply();
+    const collector = msg.createMessageComponentCollector({
+      filter: (c) => c.user.id === i.user.id,
+      time: 600_000,
+    });
+
+    collector.on("collect", async (c) => {
+      try {
+        if (c.isStringSelectMenu() && c.customId === "sched:tz") {
+          state.timezone = c.values[0]!;
+          await c.update(render());
+        } else if (c.isStringSelectMenu() && c.customId === "sched:cadence") {
+          const v = c.values[0]!;
+          if (v === "__custom__") {
+            const modal = new ModalBuilder().setCustomId(`sched:cronmodal:${msg.id}`).setTitle("Custom schedule")
+              .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+                new TextInputBuilder().setCustomId("cron").setLabel("Cron expression (min hour dom mon dow)")
+                  .setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder("0 9 * * 1-5")
+              ));
+            await c.showModal(modal);
+            const sub = await c.awaitModalSubmit({ filter: (m) => m.customId === `sched:cronmodal:${msg.id}` && m.user.id === i.user.id, time: 120_000 }).catch(() => null);
+            if (sub) {
+              const cron = sub.fields.getTextInputValue("cron").trim();
+              const v2 = validateCron(cron, state.timezone);
+              if (!v2.ok) {
+                await sub.reply({ content: `❌ Invalid cron: ${v2.error}`, flags: MessageFlags.Ephemeral });
+              } else {
+                state.cron = cron;
+                await sub.deferUpdate();
+                await i.editReply(render());
+              }
+            }
+          } else {
+            state.cron = v;
+            await c.update(render());
+          }
+        } else if (c.isButton() && c.customId === "sched:prompt") {
+          const modal = new ModalBuilder().setCustomId(`sched:promptmodal:${msg.id}`).setTitle("Scheduled prompt")
+            .addComponents(
+              new ActionRowBuilder<TextInputBuilder>().addComponents(
+                new TextInputBuilder().setCustomId("name").setLabel("Name").setStyle(TextInputStyle.Short).setRequired(true).setValue(state.name).setMaxLength(80)
+              ),
+              new ActionRowBuilder<TextInputBuilder>().addComponents(
+                new TextInputBuilder().setCustomId("prompt").setLabel("Prompt (stands on its own — no prior context)")
+                  .setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(state.promptText)
+                  .setPlaceholder("e.g. Run `npm test`, then post any failures as file:line with a one-line fix.")
+              )
+            );
+          await c.showModal(modal);
+          const sub = await c.awaitModalSubmit({ filter: (m) => m.customId === `sched:promptmodal:${msg.id}` && m.user.id === i.user.id, time: 600_000 }).catch(() => null);
+          if (sub) {
+            state.name = sub.fields.getTextInputValue("name").trim();
+            state.promptText = sub.fields.getTextInputValue("prompt").trim();
+            await sub.deferUpdate();
+            await i.editReply(render());
+          }
+        } else if (c.isButton() && c.customId === "sched:cancel") {
+          collector.stop("cancel");
+          await c.update({ content: "Cancelled.", embeds: [], components: [] });
+        } else if (c.isButton() && c.customId === "sched:create") {
+          await c.deferUpdate();
+          if (!state.cron || !state.promptText || !state.name) return;
+          const id = `sch_${randomUUID().slice(0, 8)}`;
+          // Download + persist files now.
+          const attachments = [];
+          for (const f of state.files) {
+            try {
+              const bytes = await this.downloadAttachmentBytes(f.url);
+              attachments.push(await saveScheduledAttachment(this.config.DATA_DIR, id, { filename: f.name, mime: f.mime, bytes }));
+            } catch (err) {
+              this.logger.warn({ err, file: f.name }, "schedule: file download failed");
+            }
+          }
+          const now = new Date().toISOString();
+          const next = cronNextRun(state.cron, state.timezone);
+          const row: ScheduledPrompt = {
+            id, platform: PLATFORM, channelRef: channel.id, parentRef: channel.parentId ?? null,
+            name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
+            catchupSeconds: 900, enabled: true, attachments, createdBy: i.user.id,
+            createdUtc: now, updatedUtc: now, lastRunUtc: null, lastStatus: null,
+            nextRunUtc: next ? next.toISOString() : null, pinnedSessionId: null,
+          };
+          this.store.upsertScheduled(row);
+          this.scheduledManager?.armFromRow(row);
+          collector.stop("created");
+          const confirm = new EmbedBuilder()
+            .setTitle("⏰ Scheduled prompt created")
+            .setColor(0x2ecc71)
+            .setDescription(
+              `**${state.name}** \`${id}\`\nRuns ${describeCron(state.cron)} (${state.timezone})` +
+              (next ? `\nNext run: <t:${Math.floor(next.getTime() / 1000)}:F>` : "") +
+              (attachments.length ? `\n📎 ${attachments.length} file(s) attached` : "") +
+              `\n\nIt runs on a clean session with no memory of this conversation. Manage it with \`/seam schedule list\`.`
+            );
+          await i.editReply({ embeds: [confirm], components: [] });
+        }
+      } catch (err) {
+        this.logger.error({ err }, "schedule builder interaction failed");
+      }
+    });
   }
 
   private async cmdNew(i: ChatInputCommandInteraction): Promise<void> {

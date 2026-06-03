@@ -208,6 +208,55 @@ export function buildSeamCommand(): SlashCommandBuilder {
     sub.setName("help").setDescription("Show help")
   );
 
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("schedule")
+      .setDescription("Recurring scheduled prompts for this thread")
+      .addSubcommand((sub) =>
+        sub
+          .setName("add")
+          .setDescription("Create a scheduled prompt (finish setup on the card)")
+          .addAttachmentOption((o) =>
+            o.setName("file").setDescription("Optional reference file (re-sent on every run)").setRequired(false)
+          )
+          .addAttachmentOption((o) =>
+            o.setName("file2").setDescription("Optional reference file").setRequired(false)
+          )
+          .addAttachmentOption((o) =>
+            o.setName("file3").setDescription("Optional reference file").setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub.setName("list").setDescription("List this thread's scheduled prompts")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("remove")
+          .setDescription("Delete a scheduled prompt")
+          .addStringOption((o) => o.setName("id").setDescription("Schedule id (see /seam schedule list)").setRequired(true))
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("toggle")
+          .setDescription("Enable or disable a scheduled prompt")
+          .addStringOption((o) => o.setName("id").setDescription("Schedule id").setRequired(true))
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("addfile")
+          .setDescription("Attach another reference file to a scheduled prompt")
+          .addStringOption((o) => o.setName("id").setDescription("Schedule id").setRequired(true))
+          .addAttachmentOption((o) => o.setName("file").setDescription("File to add").setRequired(true))
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("removefile")
+          .setDescription("Remove a reference file from a scheduled prompt")
+          .addStringOption((o) => o.setName("id").setDescription("Schedule id").setRequired(true))
+          .addStringOption((o) => o.setName("filename").setDescription("Filename to remove").setRequired(true))
+      )
+  );
+
   return cmd;
 }
 

@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS scheduled_prompts (
   prompt_text        TEXT NOT NULL,
   cron               TEXT NOT NULL,
   timezone           TEXT NOT NULL,
+  model              TEXT,
   catchup_seconds    INTEGER NOT NULL DEFAULT 900,
   enabled            INTEGER NOT NULL DEFAULT 1,
   attachments_json   TEXT NOT NULL DEFAULT '[]',
@@ -89,6 +90,7 @@ interface ScheduledRow {
   prompt_text: string;
   cron: string;
   timezone: string;
+  model: string | null;
   catchup_seconds: number;
   enabled: number;
   attachments_json: string;
@@ -116,6 +118,7 @@ const mapScheduled = (r: ScheduledRow): ScheduledPrompt => {
     promptText: r.prompt_text,
     cron: r.cron,
     timezone: r.timezone,
+    model: r.model,
     catchupSeconds: r.catchup_seconds,
     enabled: r.enabled !== 0,
     attachments,
@@ -137,6 +140,11 @@ export class SessionStore {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
+    // Defensive column adds for tables created by an earlier schema version
+    // (no migration framework). Ignored if the column already exists.
+    for (const ddl of ["ALTER TABLE scheduled_prompts ADD COLUMN model TEXT"]) {
+      try { this.db.exec(ddl); } catch { /* column exists */ }
+    }
   }
 
   close(): void {
@@ -197,12 +205,12 @@ export class SessionStore {
       .prepare(
         `INSERT INTO scheduled_prompts
            (id, platform, channel_ref, parent_ref, name, prompt_text, cron,
-            timezone, catchup_seconds, enabled, attachments_json, created_by,
+            timezone, model, catchup_seconds, enabled, attachments_json, created_by,
             created_utc, updated_utc, last_run_utc, last_status, next_run_utc,
             pinned_session_id)
          VALUES
            (@id, @platform, @channelRef, @parentRef, @name, @promptText, @cron,
-            @timezone, @catchupSeconds, @enabled, @attachmentsJson, @createdBy,
+            @timezone, @model, @catchupSeconds, @enabled, @attachmentsJson, @createdBy,
             @createdUtc, @updatedUtc, @lastRunUtc, @lastStatus, @nextRunUtc,
             @pinnedSessionId)
          ON CONFLICT(id) DO UPDATE SET
@@ -210,6 +218,7 @@ export class SessionStore {
            prompt_text      = excluded.prompt_text,
            cron             = excluded.cron,
            timezone         = excluded.timezone,
+           model            = excluded.model,
            catchup_seconds  = excluded.catchup_seconds,
            enabled          = excluded.enabled,
            attachments_json = excluded.attachments_json,
@@ -228,6 +237,7 @@ export class SessionStore {
         promptText: s.promptText,
         cron: s.cron,
         timezone: s.timezone,
+        model: s.model,
         catchupSeconds: s.catchupSeconds,
         enabled: s.enabled ? 1 : 0,
         attachmentsJson: JSON.stringify(s.attachments ?? []),

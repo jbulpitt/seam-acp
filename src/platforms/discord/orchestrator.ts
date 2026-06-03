@@ -1645,10 +1645,11 @@ export class Orchestrator {
 
     // 4. Run isolated + capture.
     const attachments = await loadScheduledAttachments(this.config.DATA_DIR, id, row.attachments);
+    const model = row.model ?? cfg.model;
     const result = await this.runIsolatedScheduledJob({
       profile,
       cwd,
-      ...(cfg.model ? { model: cfg.model } : {}),
+      ...(model ? { model } : {}),
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
       channel,
       promptText: row.promptText,
@@ -1811,7 +1812,8 @@ export class Orchestrator {
     const last = s.lastStatus ? ` · last: ${s.lastStatus}` : "";
     const next = s.enabled && s.nextRunUtc ? ` · next: <t:${Math.floor(Date.parse(s.nextRunUtc) / 1000)}:R>` : "";
     const files = s.attachments.length ? ` · 📎${s.attachments.length}` : "";
-    return `${state} **${s.name}** \`${s.id}\`\n   ${describeCron(s.cron)} (${s.timezone})${files}${next}${last}`;
+    const model = s.model ? ` · 🤖${s.model}` : "";
+    return `${state} **${s.name}** \`${s.id}\`\n   ${describeCron(s.cron)} (${s.timezone})${model}${files}${next}${last}`;
   }
 
   private async cmdScheduleList(i: ChatInputCommandInteraction): Promise<void> {
@@ -1920,12 +1922,16 @@ export class Orchestrator {
     }
     // Bind the thread to a session record if it isn't already (so the job has a
     // repo/agent to run under).
-    this.router.ensureSessionRecord({
+    const record = this.router.ensureSessionRecord({
       platform: PLATFORM,
       channelRef: channel.id,
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
+    const profile = this.router.getProfile(record.agentId);
+    const cfg = this.store.readConfig(record);
+    const sessionModel = cfg.model ?? profile?.defaultModel ?? null;
+    const models = (profile?.staticModels ?? []).slice(0, 24);
 
     // Capture any files supplied on the command (references held; bytes fetched
     // on Create, while the URLs are still valid).
@@ -1940,6 +1946,7 @@ export class Orchestrator {
       promptText: "",
       cron: null as string | null,
       timezone: SCHEDULE_DEFAULT_TZ,
+      model: null as string | null, // null = use session model
       files: pending,
     };
 
@@ -1960,6 +1967,7 @@ export class Orchestrator {
           { name: "✏️ Prompt", value: state.promptText ? "```\n" + state.promptText.slice(0, 1000) + "\n```" : "*(not set — click ✏️ Prompt & name)*" },
           { name: "🕐 Runs", value: cronLine + (next ? `\nNext: <t:${Math.floor(next.getTime() / 1000)}:F>` : ""), inline: true },
           { name: "🌍 Timezone", value: state.timezone, inline: true },
+          { name: "🤖 Model", value: state.model ? `\`${state.model}\`` : `Session default${sessionModel ? ` (\`${sessionModel}\`)` : ""}`, inline: true },
           { name: "📎 Files", value: state.files.length ? state.files.map((f) => `\`${f.name}\``).join(", ") : "*(none)*" }
         );
       const cadence = new StringSelectMenuBuilder()
@@ -1975,14 +1983,22 @@ export class Orchestrator {
         new ButtonBuilder().setCustomId("sched:create").setLabel("✅ Create").setStyle(ButtonStyle.Success).setDisabled(!state.cron || !state.promptText || !state.name),
         new ButtonBuilder().setCustomId("sched:cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
       );
-      return {
-        embeds: [embed],
-        components: [
-          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(cadence),
-          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(tz),
-          buttons,
-        ],
-      };
+      const rows: ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] = [
+        new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(cadence),
+        new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(tz),
+      ];
+      if (models.length > 0) {
+        const modelSelect = new StringSelectMenuBuilder()
+          .setCustomId("sched:model")
+          .setPlaceholder("🤖 Model")
+          .addOptions(
+            { label: `Session default${sessionModel ? ` (${sessionModel})` : ""}`.slice(0, 100), value: "__default__", default: state.model === null },
+            ...models.map((m) => ({ label: m.name.slice(0, 100), value: m.modelId, default: m.modelId === state.model }))
+          );
+        rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(modelSelect));
+      }
+      rows.push(buttons);
+      return { embeds: [embed], components: rows };
     };
 
     await i.reply({ ...render(), flags: MessageFlags.Ephemeral });
@@ -1996,6 +2012,10 @@ export class Orchestrator {
       try {
         if (c.isStringSelectMenu() && c.customId === "sched:tz") {
           state.timezone = c.values[0]!;
+          await c.update(render());
+        } else if (c.isStringSelectMenu() && c.customId === "sched:model") {
+          const v = c.values[0]!;
+          state.model = v === "__default__" ? null : v;
           await c.update(render());
         } else if (c.isStringSelectMenu() && c.customId === "sched:cadence") {
           const v = c.values[0]!;
@@ -2064,6 +2084,7 @@ export class Orchestrator {
           const row: ScheduledPrompt = {
             id, platform: PLATFORM, channelRef: channel.id, parentRef: channel.parentId ?? null,
             name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
+            model: state.model,
             catchupSeconds: 900, enabled: true, attachments, createdBy: i.user.id,
             createdUtc: now, updatedUtc: now, lastRunUtc: null, lastStatus: null,
             nextRunUtc: next ? next.toISOString() : null, pinnedSessionId: null,
@@ -2076,6 +2097,7 @@ export class Orchestrator {
             .setColor(0x2ecc71)
             .setDescription(
               `**${state.name}** \`${id}\`\nRuns ${describeCron(state.cron)} (${state.timezone})` +
+              (state.model ? `\nModel: \`${state.model}\`` : "") +
               (next ? `\nNext run: <t:${Math.floor(next.getTime() / 1000)}:F>` : "") +
               (attachments.length ? `\n📎 ${attachments.length} file(s) attached` : "") +
               `\n\nIt runs on a clean session with no memory of this conversation. Manage it with \`/seam schedule list\`.`

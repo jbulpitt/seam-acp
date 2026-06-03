@@ -24,6 +24,8 @@ export interface ScheduledPrompt {
   cron: string;
   /** IANA timezone, e.g. "America/Chicago". */
   timezone: string;
+  /** Model id to run the job under. null = use the thread session's model. */
+  model: string | null;
   /** Missed-fire catch-up window in seconds. 0 = never catch up. Default 900. */
   catchupSeconds: number;
   enabled: boolean;

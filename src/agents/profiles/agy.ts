@@ -1487,13 +1487,26 @@ let catalogPromise: Promise<AgyCatalogEntry[]> | null = null;
 
 function getCatalog(cli: string): Promise<AgyCatalogEntry[]> {
   if (catalogPromise) return catalogPromise;
-  const p = fetchAgyCatalog(cli);
-  catalogPromise = p.catch((err) => {
-    // Don't pin the cache to an error — let the next caller retry.
-    catalogPromise = null;
-    console.error("[agy] catalog fetch failed:", err);
-    return [];
-  });
+  const p = fetchAgyCatalog(cli)
+    .then((rows) => {
+      // Don't PIN an empty result. A cold-start LS (or any transient empty
+      // response) would otherwise poison this module-level cache for the whole
+      // process lifetime, leaving the model picker permanently empty for every
+      // agy session — direct /seam model AND the new-thread wizard both read it.
+      // Only memoize a real catalog; reset so the next caller retries.
+      if (rows.length === 0) {
+        catalogPromise = null;
+        console.error("[agy] catalog fetch returned no usable models — not caching; will retry");
+      }
+      return rows;
+    })
+    .catch((err) => {
+      // Don't pin the cache to an error — let the next caller retry.
+      catalogPromise = null;
+      console.error("[agy] catalog fetch failed:", err);
+      return [];
+    });
+  catalogPromise = p;
   return catalogPromise;
 }
 

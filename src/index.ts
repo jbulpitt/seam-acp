@@ -7,6 +7,7 @@ import { SessionRouter } from "./core/session-router.js";
 import { makeCopilotProfile } from "./agents/profiles/copilot.js";
 import { makeClaudeProfile } from "./agents/profiles/claude.js";
 import { makeAgyProfile } from "./agents/profiles/agy.js";
+import { makeOpencodeProfile } from "./agents/profiles/opencode.js";
 import { makeRemoteCopilotServerProfile, makeRemoteCopilotClientProfile } from "./agents/profiles/remote.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
@@ -92,21 +93,24 @@ async function main(): Promise<void> {
     printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
   });
 
-  // Optional Ollama-backed agent: a Claude Code (ACP) instance whose config dir
-  // routes the Anthropic API to a local Ollama via an Anthropic→OpenAI proxy.
-  // Only registered when OLLAMA_CONFIG_DIR is set (i.e. once the proxy is up).
-  const ollama = config.OLLAMA_CONFIG_DIR
-    ? makeClaudeProfile({
-        id: "ollama",
+  // Optional "Ollama 🦙" agent: opencode (sst/opencode) over ACP, pointed at a
+  // local/remote Ollama via opencode's own config. Provider-agnostic, so it
+  // drives local models natively — no Anthropic proxy. Only registered when
+  // OPENCODE_ENABLED (i.e. once opencode is installed + its provider configured).
+  const ollama = config.OPENCODE_ENABLED
+    ? makeOpencodeProfile({
+        id: "opencode",
         displayName: "Ollama 🦙",
         threadAbbr: "🦙",
-        configDir: config.OLLAMA_CONFIG_DIR,
-        defaultModel: config.OLLAMA_DEFAULT_MODEL,
-        ...(config.OLLAMA_MODELS ? { staticModels: config.OLLAMA_MODELS } : {}),
-        // Local backend — not a real Anthropic model: no reasoning-effort knob,
-        // no [1m]/adaptive-thinking. Hide the effort picker (like agy).
-        effort: { mechanism: "none", levels: [] },
-        mcpServers,
+        ...(config.OPENCODE_CLI_PATH ? { cliPath: config.OPENCODE_CLI_PATH } : {}),
+        defaultModel: config.OPENCODE_DEFAULT_MODEL,
+        // Keep in sync with ~/.config/opencode/opencode.json. Model ids carry `/`
+        // and `:`, so they're listed here rather than via a colon-delimited env.
+        staticModels: [
+          { modelId: "ollama-remote/gemma4:26b", name: "Gemma4 26B 🦙" },
+          { modelId: "ollama-remote/gemma4:e4b", name: "Gemma4 e4b 🦙" },
+          { modelId: "ollama-remote/gemma3:27b", name: "Gemma3 27B 🦙" },
+        ],
       })
     : undefined;
 

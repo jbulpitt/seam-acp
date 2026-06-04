@@ -229,18 +229,20 @@ const Schema = z.object({
   AGY_MODELS: ModelsListSchema,
 
   /**
-   * When set, registers an "Ollama 🦙" agent: a Claude Code (ACP) instance whose
-   * CLAUDE_CONFIG_DIR points here. That dir's settings.json `env` block routes
-   * the Anthropic API at a local Ollama via an Anthropic→OpenAI proxy
-   * (claude-code-router / LiteLLM). Unset → the agent isn't registered.
+   * Register the "Ollama 🦙" agent: opencode (sst/opencode, `opencode acp`) — a
+   * provider-agnostic ACP agent pointed at a local/remote Ollama via opencode's
+   * own config (~/.config/opencode/opencode.json: an @ai-sdk/openai-compatible
+   * provider with the Ollama /v1 baseURL). ACP-native + Ollama-native, no
+   * Anthropic translation proxy. false → not registered.
    */
-  OLLAMA_CONFIG_DIR: z.string().optional(),
-  /** Default model id for the Ollama profile's picker (must match a name the
-   *  proxy/Ollama knows, e.g. "llama3.3"). */
-  OLLAMA_DEFAULT_MODEL: z.string().default("local"),
-  /** Picker model list for the Ollama profile (e.g. "llama3.3:Llama 3.3,
-   *  qwen2.5-coder:Qwen Coder"). Empty → falls back to ACP-advertised models. */
-  OLLAMA_MODELS: ModelsListSchema,
+  OPENCODE_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  /** Path to the opencode binary. Defaults to `opencode` on PATH. */
+  OPENCODE_CLI_PATH: z.string().optional(),
+  /** Default opencode model id (opencode form, e.g. "ollama-remote/gemma4:26b"). */
+  OPENCODE_DEFAULT_MODEL: z.string().default("ollama-remote/gemma4:26b"),
 
   /**
    * Comma-separated list of remote Copilot profiles. Each entry registers an

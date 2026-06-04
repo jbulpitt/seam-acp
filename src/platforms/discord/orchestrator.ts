@@ -1376,10 +1376,15 @@ export class Orchestrator {
   private makeCompactionRunAgent(
     profile: AgentProfile,
     manager: ISessionManager,
-    opts?: { model?: string; cwd?: string }
+    opts?: { model?: string; cwd?: string; effort?: string }
   ): RunAgent {
     const model = opts?.model ?? "default";
     const cwd = opts?.cwd ?? "/tmp";
+    // Effort MUST be passed as `opts.effort` so newSessionMeta folds it into
+    // `_meta.claudeCode.options.effort` — the only path the wrapper honors. (A
+    // prior `meta: { reasoningEffort }` was a silent no-op: the wrapper never
+    // reads top-level `_meta.reasoningEffort`, so the runner ran at SDK default.)
+    const effort = opts?.effort ?? "high";
     return async (prompt: string, label: string): Promise<string> => {
       let rt: AgentRuntime | undefined;
       try {
@@ -1389,7 +1394,7 @@ export class Orchestrator {
           mcpServers: [],
         });
         await rt.start();
-        await rt.newSession({ cwd, model, meta: { reasoningEffort: "low" } });
+        await rt.newSession({ cwd, model, effort });
         let text = "";
         rt.onEvent((event) => {
           if (event.kind === "agent-text") text += event.text;
@@ -1471,7 +1476,8 @@ export class Orchestrator {
       log(`gap-detection flagged ${gapReport.signals.length} gap(s) but Discord history is unavailable`);
     }
 
-    const runAgent = this.makeCompactionRunAgent(profile, manager);
+    // Premium tier runs every stage at xhigh — fidelity is the whole point.
+    const runAgent = this.makeCompactionRunAgent(profile, manager, { effort: "xhigh" });
     return runPremiumCompaction({
       richHistory,
       gapReport,
@@ -1529,7 +1535,8 @@ export class Orchestrator {
     const olderTurns = turns.slice(0, turns.length - recent.length);
     const recentVerbatim = recent.join("\n\n");
     const window = compactionWindowFor(compactionModel);
-    const runAgent = this.makeCompactionRunAgent(profile, manager, { model: compactionModel, cwd });
+    // Cheap tier (single-pass summary) runs at high — quality without xhigh cost.
+    const runAgent = this.makeCompactionRunAgent(profile, manager, { model: compactionModel, cwd, effort: "high" });
 
     // Summary of the older prefix via the existing single-pass template.
     let summaryMarkdown = "_(No older history beyond the recent window.)_";

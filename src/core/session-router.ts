@@ -167,12 +167,49 @@ export class SessionRouter {
   }
 
   /** Cleanly abort the active turn for a session without terminating the agent process. */
-  async abortTurn(sessionId: string): Promise<void> {
+  /** Abort the active turn for a session. Graceful by default (ACP cancel only,
+   *  which a healthy turn honors). With `force`, escalate: if the turn is still
+   *  running shortly after the cancel (a hung turn ignoring it), invalidate the
+   *  runtime — which disposes it and force-kills the agent process group.
+   *  Returns "idle" | "cancelled" | "killed". */
+  async abortTurn(
+    sessionId: string,
+    opts?: { force?: boolean; graceMs?: number }
+  ): Promise<"idle" | "cancelled" | "killed"> {
     const rt = this.runtimes.get(sessionId);
-    if (rt) {
-      await rt.cancel();
-      this.logger.info({ sessionId }, "sent cancel signal to agent runtime");
+    if (!rt) return "idle";
+    const wasBusy = rt.busy;
+    await rt.cancel().catch(() => {});
+    this.logger.info({ sessionId }, "sent cancel signal to agent runtime");
+    if (!wasBusy) return "idle";
+    if (!opts?.force) return "cancelled";
+
+    // Escalation: give the graceful cancel a moment to actually end the turn.
+    const graceMs = opts.graceMs ?? 3000;
+    const deadline = Date.now() + graceMs;
+    while (Date.now() < deadline) {
+      if (!rt.busy) return "cancelled";
+      await new Promise((r) => setTimeout(r, 200));
     }
+    if (!rt.busy) return "cancelled";
+    // Still hung — force-kill by disposing the runtime (keeps the session id so
+    // the next message can resume cleanly).
+    this.logger.warn({ sessionId }, "turn did not cancel; force-killing runtime");
+    await this.invalidate(sessionId, { clearAcpSession: false });
+    return "killed";
+  }
+
+  /** Force-kill EVERY live runtime (and its agent process group). Returns how
+   *  many were killed. Session ids are preserved so threads resume cleanly on
+   *  their next message. Used by /seam kill. */
+  async killAll(opts?: { exceptId?: string }): Promise<number> {
+    const ids = Array.from(this.runtimes.keys()).filter((id) => id !== opts?.exceptId);
+    for (const id of ids) {
+      await this.invalidate(id, { clearAcpSession: false }).catch((err) =>
+        this.logger.warn({ err, id }, "killAll: invalidate failed")
+      );
+    }
+    return ids.length;
   }
 
   /** Dispose all runtimes (graceful shutdown). */

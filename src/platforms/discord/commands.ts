@@ -75,7 +75,15 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
-    sub.setName("abort").setDescription("Cancel the current turn")
+    sub.setName("abort").setDescription("Stop the current turn — cancel, then force-kill if it's hung")
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub.setName("cancel").setDescription("Gracefully cancel the current turn (cleaner; use abort if it ignores it)")
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub.setName("kill").setDescription("Force-kill ALL active agent sessions (this thread spared)")
   );
 
   cmd.addSubcommand((sub) =>
@@ -273,6 +281,8 @@ export type SeamSubcommand =
   | "mode"
   | "effort"
   | "abort"
+  | "cancel"
+  | "kill"
   | "image"
   | "reset"
   | "tools"

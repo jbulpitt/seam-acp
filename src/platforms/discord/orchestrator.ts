@@ -261,8 +261,10 @@ export class Orchestrator {
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
         cwd: this.config.REPOS_ROOT,
       });
-      this.logger.info({ channelId, sessionId: record.id }, "new message arrived while turn active; cleanly aborting running turn");
-      await this.router.abortTurn(record.id);
+      this.logger.info({ channelId, sessionId: record.id }, "new message arrived while turn active; aborting running turn");
+      // Escalate to a force-kill if the turn ignores the graceful cancel, so a
+      // hung turn can't block the new message behind it forever.
+      await this.router.abortTurn(record.id, { force: true });
     }
 
     const existingQueue = this.channelQueues.get(channelId) ?? Promise.resolve();
@@ -1158,6 +1160,10 @@ export class Orchestrator {
         return this.cmdEffort(interaction);
       case "abort":
         return this.cmdAbort(interaction);
+      case "cancel":
+        return this.cmdCancel(interaction);
+      case "kill":
+        return this.cmdKill(interaction);
       case "image":
         return this.cmdImage(interaction);
       case "reset":
@@ -2571,6 +2577,26 @@ export class Orchestrator {
     }
   }
 
+  /** Graceful: ask the agent to stop the current turn (ACP cancel). Usually the
+   *  cleanest — the runtime stays alive and the session continues. A truly hung
+   *  turn may ignore it; use /seam abort to force the kill. */
+  private async cmdCancel(i: ChatInputCommandInteraction): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    const outcome = await this.router.abortTurn(record.id, { force: false });
+    await i.editReply(
+      outcome === "idle" ? "No active turn." :
+      "🟡 Cancel sent. If the turn doesn't stop shortly, use `/seam abort` to force it."
+    );
+  }
+
+  /** Escalating: cancel first, and if the turn is still running after a short
+   *  grace period (a hung turn ignoring the cancel), force-kill the agent
+   *  process. The acpSessionId is preserved so the next message resumes cleanly. */
   private async cmdAbort(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
     if (!record) {
@@ -2581,11 +2607,27 @@ export class Orchestrator {
       await i.reply({ content: "No active turn.", flags: MessageFlags.Ephemeral });
       return;
     }
-    // Hard-kill the subprocess so the turn stops immediately and reliably,
-    // including for remote agents that don't honour soft cancel. Preserve
-    // the acpSessionId so the next message can resume the session.
-    await this.router.invalidate(record.id, { clearAcpSession: false });
-    await i.reply({ content: "Active turn aborted.", flags: MessageFlags.Ephemeral });
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    const outcome = await this.router.abortTurn(record.id, { force: true });
+    await i.editReply(
+      outcome === "idle" ? "No active turn." :
+      outcome === "killed" ? "🔪 Turn was hung — force-killed the agent. Your next message resumes the session." :
+      "🛑 Active turn aborted."
+    );
+  }
+
+  /** Nuclear: force-kill EVERY active agent session the bot is running — except
+   *  this thread (so you don't kill the session you're issuing the command from).
+   *  Each killed session resumes cleanly on its next message. */
+  private async cmdKill(i: ChatInputCommandInteraction): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    const killed = await this.router.killAll(record ? { exceptId: record.id } : undefined);
+    await i.editReply(
+      killed === 0
+        ? "No other active sessions to kill."
+        : `🔪 Force-killed ${killed} active session(s)${record ? " (this thread spared)" : ""}. Each resumes on its next message.`
+    );
   }
 
   // -----------------------------------------------------------------------

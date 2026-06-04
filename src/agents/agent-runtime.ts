@@ -138,6 +138,9 @@ export class AgentRuntime {
   private connection?: ClientSideConnection;
   private sessionId?: string;
   private sessionInfo?: SessionInfo;
+  /** True while a `session/prompt` is awaiting a response — lets the abort path
+   *  tell whether a graceful cancel actually ended the turn before escalating. */
+  private promptInFlight = false;
   private promptCapabilities?: PromptCapabilities;
   private sessionCwd?: string;
 
@@ -400,12 +403,22 @@ export class AgentRuntime {
       };
     }
 
-    const res = await conn.prompt({ sessionId: sid, prompt });
-    return {
-      stopReason: res.stopReason,
-      cancelled: res.stopReason === "cancelled",
-      ...(rejected ? { rejectedAttachments: rejected } : {}),
-    };
+    this.promptInFlight = true;
+    try {
+      const res = await conn.prompt({ sessionId: sid, prompt });
+      return {
+        stopReason: res.stopReason,
+        cancelled: res.stopReason === "cancelled",
+        ...(rejected ? { rejectedAttachments: rejected } : {}),
+      };
+    } finally {
+      this.promptInFlight = false;
+    }
+  }
+
+  /** Whether a prompt is currently in flight (turn running). */
+  get busy(): boolean {
+    return this.promptInFlight;
   }
 
   async setModel(modelId: string): Promise<void> {

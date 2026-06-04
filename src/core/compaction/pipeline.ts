@@ -109,9 +109,15 @@ async function runStructured<T>(
       return parseJsonOutput<T>(raw);
     } catch (err) {
       // Non-empty but unparseable: next attempt re-emits with explicit escaping.
+      // Log the raw length + head — NOT the parser's long message, which gets
+      // truncated right at "raw[0..200]:" and hides what actually came back
+      // (preamble? prose? a refusal? malformed JSON?).
       lastErr = (err as Error).message;
       appendReparse = true;
-      if (attempt < maxAttempts) log(`  [${thisLabel}] parse failed (${lastErr.slice(0, 80)}); retrying with reparse`);
+      const head = raw.replace(/\s+/g, " ").trim().slice(0, 160);
+      if (attempt < maxAttempts) {
+        log(`  [${thisLabel}] unparseable: len=${raw.length}, no JSON object; head="${head}"; retrying with reparse`);
+      }
     }
   }
   throw new Error(`[${label}] no parseable output after ${maxAttempts} attempts (last: ${lastErr.slice(0, 120)})`);

@@ -3700,8 +3700,15 @@ export class Orchestrator {
               throw new Error("Agent completed but returned an empty summary.");
             }
 
-            const newSessionId = randomUUID();
-            await manager.compactSession!(cwd, newSessionId, summaryText);
+            // Seed a NEW resumable session with the rebuilt summary (instead of a
+            // synthetic compactSession overwrite, which won't resume).
+            const rbCfg = this.store.readConfig(record);
+            const newSessionId = await this.seedNewSession({
+              profile, cwd,
+              ...(rbCfg.model ? { model: rbCfg.model } : {}),
+              ...(rbCfg.reasoningEffort ? { effort: rbCfg.reasoningEffort } : {}),
+              summary: summaryText,
+            });
 
             // Update active session record
             await this.router.invalidate(record.id);
@@ -4196,8 +4203,14 @@ export class Orchestrator {
               throw new Error("Agent completed but returned an empty summary.");
             }
 
-            const newSessionId = randomUUID();
-            await manager.compactSession!(targetCwd, newSessionId, summaryText);
+            // Seed a NEW resumable session (in the target cwd) with the summary.
+            const imCfg = this.store.readConfig(record);
+            const newSessionId = await this.seedNewSession({
+              profile, cwd: targetCwd,
+              ...(imCfg.model ? { model: imCfg.model } : {}),
+              ...(imCfg.reasoningEffort ? { effort: imCfg.reasoningEffort } : {}),
+              summary: summaryText,
+            });
 
             // Re-anchor the current thread to the new cwd + new session.
             await this.router.invalidate(record.id);
@@ -4383,8 +4396,13 @@ export class Orchestrator {
                 throw new Error("Agent completed but returned an empty summary.");
               }
 
-              const newSessionId = randomUUID();
-              await targetManager.compactSession!(cwd, newSessionId, summaryText);
+              // Seed a NEW resumable session under the TARGET agent (its own
+              // default model/effort) with the summary.
+              const newSessionId = await this.seedNewSession({
+                profile: targetProfile,
+                cwd,
+                summary: summaryText,
+              });
 
               // Update active session record
               await this.router.invalidate(record.id);

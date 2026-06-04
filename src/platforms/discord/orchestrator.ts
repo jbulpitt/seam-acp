@@ -3099,7 +3099,14 @@ export class Orchestrator {
       // Empty state logic handled inside makeSessionMessageOptions instead of returning early
     }
 
+    // Open on this thread's active session (if it has one and it's in the list),
+    // so the first thing shown — and the default compaction target — is the
+    // session the user almost always means. Falls back to most-recent.
     let currentIndex = 0;
+    if (record.acpSessionId) {
+      const activeIdx = sessions.findIndex((s) => s.sessionId === record.acpSessionId);
+      if (activeIdx !== -1) currentIndex = activeIdx;
+    }
 
     const formatLine = (line: SessionSummaryLine) => {
       const prefix = line.sender === "human" ? "👤" : "🤖";

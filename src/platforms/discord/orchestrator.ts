@@ -1324,7 +1324,16 @@ export class Orchestrator {
       return;
     }
 
-    await manager.compactSession(cwd, record.acpSessionId, built.seed);
+    // Non-destructive: seed a new resumable session and bind the thread to it
+    // (the original session is preserved on disk).
+    const acCfg = this.store.readConfig(record);
+    const acNewId = await this.seedNewSession({
+      profile, cwd,
+      ...(acCfg.model ? { model: acCfg.model } : {}),
+      ...(acCfg.reasoningEffort ? { effort: acCfg.reasoningEffort } : {}),
+      summary: built.seed,
+    });
+    this.store.upsert({ ...record, acpSessionId: acNewId, updatedUtc: new Date().toISOString() });
     await this.router.invalidate(record.id, { clearAcpSession: false });
 
     const elapsedSec = Math.round((Date.now() - compactStartedAt) / 1000);
@@ -1573,6 +1582,38 @@ export class Orchestrator {
       ``, `---`, ``,
       `## Assembled session seed`, ``, result.assembledSeed,
     ].join("\n");
+  }
+
+  /** Non-destructive compaction primitive (the user's original design): create a
+   *  BRAND-NEW session via the SDK and seed it by sending the summary as the
+   *  first prompt — a real turn Claude Code writes itself, so it RESUMES cleanly
+   *  (unlike overwriting a JSONL with a synthetic assistant message, which hangs
+   *  on `--resume`). Returns the new session id; the caller binds the thread to
+   *  it and the original session is left intact (recoverable / deletable). */
+  private async seedNewSession(args: {
+    profile: AgentProfile;
+    cwd: string;
+    model?: string;
+    effort?: string;
+    summary: string;
+  }): Promise<string> {
+    const { profile, cwd, model, effort, summary } = args;
+    let rt: AgentRuntime | undefined;
+    try {
+      rt = new AgentRuntime({ profile, logger: this.logger.child({ compaction: "seed" }), mcpServers: [] });
+      await rt.start();
+      const info = await rt.newSession({ cwd, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+      const prompt =
+        "[Loading prior-session context after compaction — read the summary below, reply with a one-line acknowledgement, then await the next instruction. Do not begin work yet.]\n\n" +
+        summary;
+      await rt.prompt(prompt);
+      // Brief pause so Claude Code finishes flushing the new session's JSONL
+      // before we tear down (the turn is the only content; it must land on disk).
+      await new Promise((r) => setTimeout(r, 1000));
+      return info.sessionId;
+    } finally {
+      if (rt) await rt.dispose().catch(() => {});
+    }
   }
 
   setScheduledManager(m: ScheduledPromptManager): void {
@@ -3862,21 +3903,33 @@ export class Orchestrator {
               });
               if (!built) throw new Error("Nothing to compact (empty transcript or no summarizer model).");
 
-              await manager.compactSession(cwd, session.sessionId, built.seed);
-              // Evict the live runtime if this is the thread's active session, so
-              // the next message reloads the compacted JSONL (else token count
-              // won't drop).
-              if (session.sessionId === record.acpSessionId) {
+              // Non-destructive: seed a NEW session with the summary (resumable),
+              // bind the thread to it if this was its active session, and leave
+              // the original intact.
+              const cfg = this.store.readConfig(record);
+              const newId = await this.seedNewSession({
+                profile, cwd,
+                ...(cfg.model ? { model: cfg.model } : {}),
+                ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+                summary: built.seed,
+              });
+              const wasActive = session.sessionId === record.acpSessionId;
+              if (wasActive) {
+                this.store.upsert({ ...record, acpSessionId: newId, updatedUtc: new Date().toISOString() });
                 await this.router.invalidate(record.id, { clearAcpSession: false });
               }
 
               sessions = await manager.listSessions(cwd);
-              const newIndex = sessions.findIndex(s => s.sessionId === session.sessionId);
+              const newIndex = sessions.findIndex(s => s.sessionId === newId);
               if (newIndex !== -1) currentIndex = newIndex;
 
               const successEmbed = new EmbedBuilder()
                 .setTitle("🗳️ Session Compacted")
-                .setDescription(`Session \`${session.sessionId}\` was compacted: summarized ${built.summarizedTurns} older turn(s), kept ${built.keptTurns} verbatim, pinned ${built.pinnedCount} fact(s).`)
+                .setDescription(
+                  `Compacted into a **new session** \`${newId}\` (summarized ${built.summarizedTurns} older turn(s), kept ${built.keptTurns} verbatim, pinned ${built.pinnedCount} fact(s)).` +
+                  (wasActive ? `\nThis thread is now bound to it.` : ``) +
+                  `\n\nThe original \`${session.sessionId}\` is **preserved** — find it in this list to review or delete.`
+                )
                 .setColor(0x2ecc71);
               await btnInteraction.editReply({ embeds: [successEmbed], components: [backRow] });
             } catch (err: any) {
@@ -3933,16 +3986,22 @@ export class Orchestrator {
 
               if (!result.assembledSeed.trim()) throw new Error("Pipeline produced an empty result.");
 
-              await manager.compactSession!(cwd, session.sessionId, result.assembledSeed);
-              // If we compacted the thread's ACTIVE session, evict its live
-              // runtime (keeping the session id) so the next message re-resumes
-              // the now-compacted JSONL instead of the full in-memory history —
-              // otherwise the context/token count doesn't actually drop.
-              if (session.sessionId === record.acpSessionId) {
+              // Non-destructive: seed a NEW resumable session with the summary,
+              // bind the thread if this was its active session, preserve the original.
+              const cfg = this.store.readConfig(record);
+              const newId = await this.seedNewSession({
+                profile, cwd,
+                ...(cfg.model ? { model: cfg.model } : {}),
+                ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+                summary: result.assembledSeed,
+              });
+              const wasActive = session.sessionId === record.acpSessionId;
+              if (wasActive) {
+                this.store.upsert({ ...record, acpSessionId: newId, updatedUtc: new Date().toISOString() });
                 await this.router.invalidate(record.id, { clearAcpSession: false });
               }
               sessions = await manager.listSessions(cwd);
-              const newIndex = sessions.findIndex((s) => s.sessionId === session.sessionId);
+              const newIndex = sessions.findIndex((s) => s.sessionId === newId);
               if (newIndex !== -1) currentIndex = newIndex;
 
               const reportPath = path.join(os.tmpdir(), `premium-compaction-${session.sessionId}.md`);
@@ -3952,7 +4011,11 @@ export class Orchestrator {
               const preserved = v.filter((x) => x.preserved).length;
               const successEmbed = new EmbedBuilder()
                 .setTitle("✨ Premium Compaction Complete")
-                .setDescription(`Session \`${session.sessionId}\` was compacted with the multi-agent pipeline.`)
+                .setDescription(
+                  `Compacted into a **new session** \`${newId}\` with the multi-agent pipeline.` +
+                  (wasActive ? ` This thread is now bound to it.` : ``) +
+                  `\nOriginal \`${session.sessionId}\` is **preserved** (review or delete it from this list).`
+                )
                 .addFields(
                   { name: "Chunks", value: String(result.stats.chunks), inline: true },
                   { name: "Deep-dives", value: String(result.stats.deepDives), inline: true },

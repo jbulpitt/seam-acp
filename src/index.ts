@@ -7,7 +7,7 @@ import { SessionRouter } from "./core/session-router.js";
 import { makeCopilotProfile } from "./agents/profiles/copilot.js";
 import { makeClaudeProfile } from "./agents/profiles/claude.js";
 import { makeAgyProfile } from "./agents/profiles/agy.js";
-import { makeOpencodeProfile } from "./agents/profiles/opencode.js";
+import { makeOpencodeProfile, fetchOllamaOpencodeModels } from "./agents/profiles/opencode.js";
 import { makeRemoteCopilotServerProfile, makeRemoteCopilotClientProfile } from "./agents/profiles/remote.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
@@ -95,8 +95,21 @@ async function main(): Promise<void> {
 
   // Optional "Ollama 🦙" agent: opencode (sst/opencode) over ACP, pointed at a
   // local/remote Ollama via opencode's own config. Provider-agnostic, so it
-  // drives local models natively — no Anthropic proxy. Only registered when
-  // OPENCODE_ENABLED (i.e. once opencode is installed + its provider configured).
+  // drives local models natively — no Anthropic proxy. The picker model list is
+  // discovered dynamically from the Ollama server at startup (no hardcoding);
+  // opencode auto-discovers the same models from the endpoint. Only registered
+  // when OPENCODE_ENABLED.
+  let opencodeModels: Array<{ modelId: string; name: string }> | undefined;
+  if (config.OPENCODE_ENABLED && config.OPENCODE_OLLAMA_URL) {
+    opencodeModels = await fetchOllamaOpencodeModels(
+      config.OPENCODE_OLLAMA_URL,
+      config.OPENCODE_MODEL_PREFIX,
+    ).catch((err) => {
+      logger.warn({ err }, "opencode: Ollama model discovery failed; picker empty until reachable");
+      return [];
+    });
+    logger.info({ count: opencodeModels.length }, "opencode: discovered Ollama models");
+  }
   const ollama = config.OPENCODE_ENABLED
     ? makeOpencodeProfile({
         id: "opencode",
@@ -104,13 +117,7 @@ async function main(): Promise<void> {
         threadAbbr: "🦙",
         ...(config.OPENCODE_CLI_PATH ? { cliPath: config.OPENCODE_CLI_PATH } : {}),
         defaultModel: config.OPENCODE_DEFAULT_MODEL,
-        // Keep in sync with ~/.config/opencode/opencode.json. Model ids carry `/`
-        // and `:`, so they're listed here rather than via a colon-delimited env.
-        staticModels: [
-          { modelId: "ollama-remote/gemma4:26b", name: "Gemma4 26B 🦙" },
-          { modelId: "ollama-remote/gemma4:e4b", name: "Gemma4 e4b 🦙" },
-          { modelId: "ollama-remote/gemma3:27b", name: "Gemma3 27B 🦙" },
-        ],
+        ...(opencodeModels && opencodeModels.length > 0 ? { staticModels: opencodeModels } : {}),
       })
     : undefined;
 

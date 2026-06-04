@@ -2,6 +2,36 @@ import { spawn } from "node:child_process";
 import type { AgentProfile } from "../agent-profile.js";
 
 /**
+ * Discover the live model list from an Ollama server's `/api/tags` and map each
+ * to its opencode id (`<prefix>/<ollama-model>`, e.g. `ollama-remote/gemma4:26b`).
+ * opencode auto-discovers the same models from the endpoint, so this keeps the
+ * seam-acp picker in sync with whatever is actually pulled on the box — no
+ * hardcoded list. Returns [] on any failure (so the agent still registers; the
+ * picker is just empty until Ollama is reachable). 10s timeout.
+ */
+export async function fetchOllamaOpencodeModels(
+  baseUrl: string,
+  prefix: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<Array<{ modelId: string; name: string }>> {
+  const url = baseUrl.replace(/\/+$/, "") + "/api/tags";
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10_000);
+  try {
+    const res = await fetchFn(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`Ollama /api/tags HTTP ${res.status}`);
+    const body = (await res.json()) as { models?: Array<{ name?: string }> };
+    return (body.models ?? [])
+      .map((m) => m.name)
+      .filter((n): n is string => typeof n === "string" && n.length > 0)
+      .sort()
+      .map((n) => ({ modelId: `${prefix}/${n}`, name: `${n} 🦙` }));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * opencode (sst/opencode) as an ACP server (`opencode acp`).
  *
  * opencode is a provider-agnostic coding agent. Pointed at a local/remote Ollama

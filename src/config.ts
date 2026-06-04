@@ -243,6 +243,13 @@ const Schema = z.object({
   OPENCODE_CLI_PATH: z.string().optional(),
   /** Default opencode model id (opencode form, e.g. "ollama-remote/gemma4:26b"). */
   OPENCODE_DEFAULT_MODEL: z.string().default("ollama-remote/gemma4:26b"),
+  /** Root URL of the Ollama server, used to DISCOVER the model list dynamically
+   *  (`/api/tags`) at startup so the picker isn't hardcoded. Unset → no discovery
+   *  (only the default model is usable). e.g. "https://ollama.jessebulpitt.com". */
+  OPENCODE_OLLAMA_URL: z.string().optional(),
+  /** opencode provider name (the key under `provider` in opencode's config) that
+   *  the discovered Ollama models are prefixed with. */
+  OPENCODE_MODEL_PREFIX: z.string().default("ollama-remote"),
 
   /**
    * Comma-separated list of remote Copilot profiles. Each entry registers an

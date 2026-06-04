@@ -1381,10 +1381,11 @@ export class Orchestrator {
     const model = opts?.model ?? "default";
     const cwd = opts?.cwd ?? "/tmp";
     // Effort MUST be passed as `opts.effort` so newSessionMeta folds it into
-    // `_meta.claudeCode.options.effort` — the only path the wrapper honors. (A
-    // prior `meta: { reasoningEffort }` was a silent no-op: the wrapper never
-    // reads top-level `_meta.reasoningEffort`, so the runner ran at SDK default.)
-    const effort = opts?.effort ?? "high";
+    // `_meta.claudeCode.options.effort` (Claude) or applyConfigOptionEffort sets
+    // `reasoning_effort` (Copilot) — the paths the wrappers actually honor. (A
+    // prior `meta: { reasoningEffort }` was a silent no-op.) Undefined ⇒ no knob
+    // for this agent (agy is modelBaked; remote has none) — left at its default.
+    const effort = opts?.effort;
     return async (prompt: string, label: string): Promise<string> => {
       let rt: AgentRuntime | undefined;
       try {
@@ -1411,6 +1412,22 @@ export class Orchestrator {
         }
       }
     };
+  }
+
+  /** Resolve the reasoning-effort level for a compaction tier against the
+   *  AGENT'S OWN scale — effort levels are not portable across agents. Claude
+   *  (low→max) deliberately uses xhigh for premium (not max) and high for cheap.
+   *  A generic scale like Copilot's (low/medium/high) tops out lower, so premium
+   *  takes the top level and cheap one below it. agy (modelBaked — effort IS the
+   *  model choice) and the remote Mac (no effort mechanism) return undefined:
+   *  there is no separate knob to set, so the runner leaves the agent's default. */
+  private compactionEffortFor(profile: AgentProfile, tier: "premium" | "cheap"): string | undefined {
+    const levels = profile.effort?.levels ?? [];
+    if (levels.length === 0) return undefined;
+    if (levels.includes("xhigh")) return tier === "premium" ? "xhigh" : "high";
+    return tier === "premium"
+      ? levels[levels.length - 1]
+      : levels[levels.length - 2] ?? levels[levels.length - 1];
   }
 
   /** Render flagged Discord ranges to plain text for the deep-dive of any span
@@ -1476,8 +1493,12 @@ export class Orchestrator {
       log(`gap-detection flagged ${gapReport.signals.length} gap(s) but Discord history is unavailable`);
     }
 
-    // Premium tier runs every stage at xhigh — fidelity is the whole point.
-    const runAgent = this.makeCompactionRunAgent(profile, manager, { effort: "xhigh" });
+    // Premium tier runs every stage at the agent's top reasoning level (Claude
+    // xhigh, Copilot high; agy/remote have no separate knob) — fidelity is the
+    // whole point of this tier.
+    const runAgent = this.makeCompactionRunAgent(profile, manager, {
+      effort: this.compactionEffortFor(profile, "premium"),
+    });
     return runPremiumCompaction({
       richHistory,
       gapReport,
@@ -1535,8 +1556,13 @@ export class Orchestrator {
     const olderTurns = turns.slice(0, turns.length - recent.length);
     const recentVerbatim = recent.join("\n\n");
     const window = compactionWindowFor(compactionModel);
-    // Cheap tier (single-pass summary) runs at high — quality without xhigh cost.
-    const runAgent = this.makeCompactionRunAgent(profile, manager, { model: compactionModel, cwd, effort: "high" });
+    // Cheap tier (single-pass summary): a notch below premium on each agent's
+    // own scale (Claude high, Copilot medium).
+    const runAgent = this.makeCompactionRunAgent(profile, manager, {
+      model: compactionModel,
+      cwd,
+      effort: this.compactionEffortFor(profile, "cheap"),
+    });
 
     // Summary of the older prefix via the existing single-pass template.
     let summaryMarkdown = "_(No older history beyond the recent window.)_";

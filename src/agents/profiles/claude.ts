@@ -88,6 +88,13 @@ export function makeClaudeProfile(opts: {
    * they already stream thinking via the maxThinkingTokens path.
    */
   thinkingDisplay?: "summarized" | "omitted";
+  /**
+   * Override the effort descriptor. Defaults to the Anthropic meta-effort path
+   * (low|medium|high|xhigh|max via _meta). Set to {mechanism:"none",levels:[]}
+   * for non-Anthropic backends (e.g. a Claude Code instance routed to Ollama) so
+   * the `/seam effort` picker correctly reports effort isn't settable.
+   */
+  effort?: AgentProfile["effort"];
   /** Accepted for parity; unused — MCP servers are forwarded via ACP. */
   mcpServers?: McpServer[];
   /** Optional context token threshold to trigger context compaction. */
@@ -108,7 +115,8 @@ export function makeClaudeProfile(opts: {
     threadAbbr: opts.threadAbbr,
     configDir,
     // Effort is applied via `_meta.claudeCode.options.effort` in newSessionMeta.
-    effort: { mechanism: "meta", levels: ["low", "medium", "high", "xhigh", "max"] },
+    // Overridable for non-Anthropic backends (e.g. Ollama → mechanism "none").
+    effort: opts.effort ?? { mechanism: "meta", levels: ["low", "medium", "high", "xhigh", "max"] },
     spawn() {
       const env: NodeJS.ProcessEnv = { ...process.env };
       if (configDir) env.CLAUDE_CONFIG_DIR = configDir;

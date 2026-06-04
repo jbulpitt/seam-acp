@@ -92,6 +92,24 @@ async function main(): Promise<void> {
     printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
   });
 
+  // Optional Ollama-backed agent: a Claude Code (ACP) instance whose config dir
+  // routes the Anthropic API to a local Ollama via an Anthropic→OpenAI proxy.
+  // Only registered when OLLAMA_CONFIG_DIR is set (i.e. once the proxy is up).
+  const ollama = config.OLLAMA_CONFIG_DIR
+    ? makeClaudeProfile({
+        id: "ollama",
+        displayName: "Ollama 🦙",
+        threadAbbr: "🦙",
+        configDir: config.OLLAMA_CONFIG_DIR,
+        defaultModel: config.OLLAMA_DEFAULT_MODEL,
+        ...(config.OLLAMA_MODELS ? { staticModels: config.OLLAMA_MODELS } : {}),
+        // Local backend — not a real Anthropic model: no reasoning-effort knob,
+        // no [1m]/adaptive-thinking. Hide the effort picker (like agy).
+        effort: { mechanism: "none", levels: [] },
+        mcpServers,
+      })
+    : undefined;
+
   // Late-bound so the callback can reference `orchestrator` which isn't created yet.
   let notifyBridgeConnect: (id: string) => void = () => {};
 
@@ -122,7 +140,7 @@ async function main(): Promise<void> {
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, agy, ...remoteCopilots],
+    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, agy, ...(ollama ? [ollama] : []), ...remoteCopilots],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".

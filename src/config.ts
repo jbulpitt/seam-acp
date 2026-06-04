@@ -229,6 +229,20 @@ const Schema = z.object({
   AGY_MODELS: ModelsListSchema,
 
   /**
+   * When set, registers an "Ollama 🦙" agent: a Claude Code (ACP) instance whose
+   * CLAUDE_CONFIG_DIR points here. That dir's settings.json `env` block routes
+   * the Anthropic API at a local Ollama via an Anthropic→OpenAI proxy
+   * (claude-code-router / LiteLLM). Unset → the agent isn't registered.
+   */
+  OLLAMA_CONFIG_DIR: z.string().optional(),
+  /** Default model id for the Ollama profile's picker (must match a name the
+   *  proxy/Ollama knows, e.g. "llama3.3"). */
+  OLLAMA_DEFAULT_MODEL: z.string().default("local"),
+  /** Picker model list for the Ollama profile (e.g. "llama3.3:Llama 3.3,
+   *  qwen2.5-coder:Qwen Coder"). Empty → falls back to ACP-advertised models. */
+  OLLAMA_MODELS: ModelsListSchema,
+
+  /**
    * Comma-separated list of remote Copilot profiles. Each entry registers an
    * agent profile named `copilot-remote-<id>` that pipes ACP over a WebSocket
    * to a bridge script running on the remote machine.

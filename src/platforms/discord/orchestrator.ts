@@ -3854,6 +3854,12 @@ export class Orchestrator {
               if (!built) throw new Error("Nothing to compact (empty transcript or no summarizer model).");
 
               await manager.compactSession(cwd, session.sessionId, built.seed);
+              // Evict the live runtime if this is the thread's active session, so
+              // the next message reloads the compacted JSONL (else token count
+              // won't drop).
+              if (session.sessionId === record.acpSessionId) {
+                await this.router.invalidate(record.id, { clearAcpSession: false });
+              }
 
               sessions = await manager.listSessions(cwd);
               const newIndex = sessions.findIndex(s => s.sessionId === session.sessionId);
@@ -3919,6 +3925,13 @@ export class Orchestrator {
               if (!result.assembledSeed.trim()) throw new Error("Pipeline produced an empty result.");
 
               await manager.compactSession!(cwd, session.sessionId, result.assembledSeed);
+              // If we compacted the thread's ACTIVE session, evict its live
+              // runtime (keeping the session id) so the next message re-resumes
+              // the now-compacted JSONL instead of the full in-memory history —
+              // otherwise the context/token count doesn't actually drop.
+              if (session.sessionId === record.acpSessionId) {
+                await this.router.invalidate(record.id, { clearAcpSession: false });
+              }
               sessions = await manager.listSessions(cwd);
               const newIndex = sessions.findIndex((s) => s.sessionId === session.sessionId);
               if (newIndex !== -1) currentIndex = newIndex;

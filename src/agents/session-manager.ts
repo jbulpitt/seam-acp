@@ -8,7 +8,13 @@ export interface SessionSummary {
   createdAt?: number;       // timestamp in ms
   lastActivityAt?: number;  // timestamp in ms
   previewLines: SessionSummaryLine[];
+  /** Context size in tokens. Real (from the last turn's usage) when
+   *  `tokensFromUsage` is true; a rough text-only estimate otherwise. */
   estimatedTokens?: number;
+  /** True when `estimatedTokens` came from real usage data (accurate); false/
+   *  undefined when it's a char-based fallback (e.g. a freshly compacted session
+   *  with no usage rows yet — undercounts system/tool overhead). */
+  tokensFromUsage?: boolean;
 }
 
 export interface ContextUsage {

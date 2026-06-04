@@ -273,6 +273,7 @@ export function makeClaudeProfile(opts: {
                 lastActivityAt,
                 previewLines,
                 estimatedTokens,
+                tokensFromUsage: realTokens > 0,
               });
             } catch (err) {
               // Ignore individual session parsing errors

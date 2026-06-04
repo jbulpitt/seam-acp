@@ -1588,13 +1588,29 @@ async function fetchAgyCatalog(cli: string): Promise<AgyCatalogEntry[]> {
       timeoutMs: 15_000,
       newerThanMs: start - 1_000,
     });
-    const res = await fetch(
-      `http://localhost:${ls.port}/exa.language_server_pb.LanguageServerService/GetAvailableModels`,
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
-    );
-    if (!res.ok) throw new Error(`GetAvailableModels HTTP ${res.status}`);
-    const json = (await res.json()) as { response?: { models?: Record<string, AgyRawModel> } };
-    return parseAgyCatalog(json);
+    const url = `http://localhost:${ls.port}/exa.language_server_pb.LanguageServerService/GetAvailableModels`;
+    // The LS answers as soon as it's discovered, but its model catalog finishes
+    // loading a beat later (~1-2s): query too early and `response.models` is
+    // empty/internal-only, so parseAgyCatalog yields nothing — which the caller
+    // then refuses to cache, leaving the picker permanently empty. Poll until
+    // the catalog has usable models. Returns whatever we last parsed if warmup
+    // never completes within the deadline (caller treats [] as "retry later").
+    const deadline = Date.now() + 12_000;
+    let last: AgyCatalogEntry[] = [];
+    for (;;) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (res.ok) {
+        const json = (await res.json()) as { response?: { models?: Record<string, AgyRawModel> } };
+        last = parseAgyCatalog(json);
+        if (last.length > 0) return last;
+      }
+      if (Date.now() >= deadline) return last;
+      await new Promise((r) => setTimeout(r, 400));
+    }
   } finally {
     try { proc.kill(); } catch { /* already gone */ }
   }

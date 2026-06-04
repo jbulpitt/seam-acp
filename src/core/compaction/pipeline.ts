@@ -73,27 +73,48 @@ export interface PremiumCompactionResult {
   };
 }
 
-/** Run a structured stage with one corrective retry. The dominant real-run
- *  failure is an unescaped `"` inside a long free-text field (e.g. a deep-dive
- *  narrative), which corrupts the whole object's brace-balance and makes it
- *  unparseable. On the first parse failure we re-prompt once, appending an
- *  explicit "re-emit as valid JSON, escape interior quotes" instruction — the
- *  standard self-heal. Throws only if the retry also fails. */
+/** Run a structured stage with bounded retries that distinguish the two real
+ *  failure modes:
+ *   - EMPTY completion — the runner emitted no agent text at all. A transient
+ *     ACP/model hiccup (seen when several runners spawn at once); re-running the
+ *     SAME prompt fresh is the fix. The reparse corrective is meaningless here
+ *     (there is no prior reply to re-emit), so we do NOT append it — appending
+ *     "re-emit the SAME analysis" to an empty turn only confuses the model.
+ *   - NON-EMPTY but unparseable — usually an unescaped `"`/newline inside a long
+ *     free-text field. Append JSON_REPARSE_INSTRUCTION so the model re-emits the
+ *     same analysis with valid escaping.
+ *  Throws only after `maxAttempts` are exhausted; fan-out callers catch that and
+ *  stub the one item rather than abort the whole multi-minute run. */
 async function runStructured<T>(
   runAgent: RunAgent,
   prompt: string,
   label: string,
-  log: (msg: string) => void
+  log: (msg: string) => void,
+  maxAttempts = 3
 ): Promise<T> {
-  const raw = await runAgent(prompt, label);
-  try {
-    return parseJsonOutput<T>(raw);
-  } catch (err) {
-    log(`  [${label}] parse failed (${(err as Error).message.slice(0, 80)}); retrying`);
-    const retryPrompt = `${prompt}\n\n${JSON_REPARSE_INSTRUCTION}`;
-    const raw2 = await runAgent(retryPrompt, `${label}-retry`);
-    return parseJsonOutput<T>(raw2);
+  let lastErr = "unknown";
+  let appendReparse = false;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const thisPrompt = appendReparse ? `${prompt}\n\n${JSON_REPARSE_INSTRUCTION}` : prompt;
+    const thisLabel = attempt === 1 ? label : `${label}-retry${attempt - 1}`;
+    const raw = await runAgent(thisPrompt, thisLabel);
+    if (!raw.trim()) {
+      // Empty completion: transient, not a formatting problem — re-run fresh.
+      lastErr = "empty completion (no agent text)";
+      appendReparse = false;
+      if (attempt < maxAttempts) log(`  [${thisLabel}] empty completion; re-running fresh`);
+      continue;
+    }
+    try {
+      return parseJsonOutput<T>(raw);
+    } catch (err) {
+      // Non-empty but unparseable: next attempt re-emits with explicit escaping.
+      lastErr = (err as Error).message;
+      appendReparse = true;
+      if (attempt < maxAttempts) log(`  [${thisLabel}] parse failed (${lastErr.slice(0, 80)}); retrying with reparse`);
+    }
   }
+  throw new Error(`[${label}] no parseable output after ${maxAttempts} attempts (last: ${lastErr.slice(0, 120)})`);
 }
 
 /** Bounded-concurrency map. Preserves order; a thrown task rejects the whole
@@ -178,9 +199,27 @@ export async function runPremiumCompaction(
   // Chunk small enough that NO single chunk-analysis call can blow the context.
   const chunks = chunkHistory(richHistory.events, maxCallTokens);
   log(`analyzing ${chunks.length} chunk(s)`);
-  const chunkAnalyses = await mapLimit(chunks, concurrency, (c, i) =>
-    runStructured<ChunkAnalysis>(runAgent, chunkAnalyzerPrompt(c), `chunk-${i}`, log)
-  );
+  const chunkAnalyses = await mapLimit(chunks, concurrency, async (c, i) => {
+    try {
+      return await runStructured<ChunkAnalysis>(runAgent, chunkAnalyzerPrompt(c), `chunk-${i}`, log);
+    } catch (err) {
+      // One transient chunk must not abort the whole run. Degrade to an empty
+      // index entry — the deep-dive of this region still re-reads it in full,
+      // and the completeness critic will flag anything genuinely lost.
+      log(`  [chunk-${i}] UNRECOVERABLE after retries (${(err as Error).message.slice(0, 80)}); stubbing chunk`);
+      return {
+        chunkIndex: i,
+        timeRange: { fromTs: c.firstTs, toTs: c.lastTs },
+        topics: [],
+        decisions: [],
+        userCorrections: [],
+        selfCoachedRules: [],
+        openThreads: [],
+        toolFindings: [],
+        notableQuotes: [],
+      } satisfies ChunkAnalysis;
+    }
+  });
 
   // --- Stage 2: meta-analyze (reduce) -----------------------------------------
   log("meta-analyzing");
@@ -235,14 +274,20 @@ export async function runPremiumCompaction(
   // no single fragile mega-call) while reconstructing the single-pass result.
   const pinnedChunks = chunkHistory(richHistory.events, pinnedChunkTokens);
   log(`extracting pinned facts (${pinnedChunks.length} chunk(s))`);
-  const pinnedParts = await mapLimit(pinnedChunks, concurrency, (c, i) =>
-    runStructured<PinnedFacts>(
-      runAgent,
-      pinnedFactsPrompt({ text: c.text, thinkingAvailable }),
-      `pinned-${i}`,
-      log
-    )
-  );
+  const pinnedParts = await mapLimit(pinnedChunks, concurrency, async (c, i) => {
+    try {
+      return await runStructured<PinnedFacts>(
+        runAgent,
+        pinnedFactsPrompt({ text: c.text, thinkingAvailable }),
+        `pinned-${i}`,
+        log
+      );
+    } catch (err) {
+      // Tolerate one bad chunk: mergePinnedFacts unions whatever the rest found.
+      log(`  [pinned-${i}] UNRECOVERABLE after retries (${(err as Error).message.slice(0, 80)}); skipping chunk`);
+      return { corrections: [], constraints: [], decisions: [], openTodos: [], activePaths: [], rules: [] } satisfies PinnedFacts;
+    }
+  });
   const pinnedFacts = mergePinnedFacts(pinnedParts);
 
   // --- Stage 4: synthesize ----------------------------------------------------
@@ -251,21 +296,25 @@ export async function runPremiumCompaction(
     await runAgent(synthesizerPrompt({ meta, deepDives, pinnedFacts }), "synthesize")
   ).trim();
 
-  // --- Stage 5: completeness critic (inverted gate) ---------------------------
-  log("verifying completeness");
-  const critique = await runStructured<CritiqueResult>(
-    runAgent,
-    completenessCriticPrompt({ summaryMarkdown, riskChecklist: meta.riskChecklist ?? [] }),
-    "critic",
-    log
-  );
-
-  // Assemble the new-session seed (verbatim recent window appended).
+  // Assemble the new-session seed BEFORE auditing. The critic must check what
+  // actually ships — the prose summary + the pinned-facts block + the recent
+  // verbatim window — not the prose alone, or it false-flags facts that are
+  // preserved verbatim in the pinned block as "lost" (they're invisible to a
+  // summary-only audit, which is what inflated the unpreserved count).
   const assembledSeed = assembleNewSession({
     summaryMarkdown,
     pinnedFacts,
     recentVerbatim: recentVerbatim(richHistory.events, recentWindowTokens),
   });
+
+  // --- Stage 5: completeness critic (inverted gate) ---------------------------
+  log("verifying completeness");
+  const critique = await runStructured<CritiqueResult>(
+    runAgent,
+    completenessCriticPrompt({ assembled: assembledSeed, riskChecklist: meta.riskChecklist ?? [] }),
+    "critic",
+    log
+  );
 
   return {
     summaryMarkdown,

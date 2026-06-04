@@ -332,12 +332,12 @@ export interface CritiqueResult {
 }
 
 export function completenessCriticPrompt(args: {
-  summaryMarkdown: string;
+  assembled: string;
   riskChecklist: MetaAnalysis["riskChecklist"];
 }): string {
   return `${ANALYST_FRAME}
 
-Audit this compaction against the risk checklist. For EACH checklist item, decide whether the summary preserves it with enough fidelity to resume safely, citing where in the summary. For any item that thinned out or vanished, emit a targeted recovery request (which time range + source to re-read, and what to recover).
+Audit this compaction against the risk checklist. The material below is the COMPLETE seed that will start the new session: a prose summary FOLLOWED BY a pinned-facts block (verbatim corrections / constraints / decisions / rules / paths) and a recent-verbatim window. An item counts as preserved if it appears ANYWHERE in this material — including the pinned-facts block — not only in the prose summary. For EACH checklist item, decide whether the seed preserves it with enough fidelity to resume safely, citing where it appears. For any item that genuinely thinned out or vanished, emit a targeted recovery request (which time range + source to re-read, and what to recover).
 
 Default to "not preserved" when uncertain — a false miss is cheap to re-check; a real loss is not.
 
@@ -347,8 +347,8 @@ ${JSON_ONLY} Shape:
 === RISK CHECKLIST ===
 ${JSON.stringify(args.riskChecklist, null, 1)}
 
-=== COMPACTION SUMMARY ===
-${args.summaryMarkdown}${ANALYST_CLOSER}`;
+=== ASSEMBLED COMPACTION SEED (summary + pinned facts + recent verbatim) ===
+${args.assembled}${ANALYST_CLOSER}`;
 }
 
 // ---------------------------------------------------------------------------

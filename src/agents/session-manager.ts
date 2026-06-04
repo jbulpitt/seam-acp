@@ -32,7 +32,6 @@ export interface ISessionManager {
   deleteSession(cwd: string, sessionId: string): Promise<void>;
   getTranscript(cwd: string, sessionId: string): Promise<string>;
   repairSession?(cwd: string, sessionId: string): Promise<void>;
-  compactSession?(cwd: string, sessionId: string, summary: string): Promise<void>;
   /** Optional: absolute path to the session's raw on-disk history (e.g. the
    *  Claude JSONL), if this backend stores one. Premium compaction reads this
    *  directly for the richest source (thinking + tool context) rather than the

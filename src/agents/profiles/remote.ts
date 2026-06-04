@@ -446,9 +446,6 @@ function buildSessionManager(mux: ReturnType<typeof makeMux>): ISessionManager {
     async getTranscript(cwd: string, sessionId: string) {
       return mux.sendCmd("getTranscript", { cwd, sessionId });
     },
-    async compactSession(cwd: string, sessionId: string, summary: string) {
-      return mux.sendCmd("compactSession", { cwd, sessionId, summary });
-    },
     async getUsage(cwd: string, sessionId?: string, newerThanMs?: number) {
       return mux.sendCmd("getUsage", {
         cwd,

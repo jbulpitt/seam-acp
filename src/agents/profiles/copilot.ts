@@ -281,36 +281,6 @@ export function makeCopilotProfile(opts: {
         } finally {
           db.close();
         }
-      },
-
-      async compactSession(cwd: string, sessionId: string, summaryText: string): Promise<void> {
-        const dir = configDir ?? path.join(process.env.HOME ?? "", ".copilot");
-        const dbPath = path.join(dir, "session-store.db");
-        const db = new Database(dbPath);
-        try {
-          const runTx = db.transaction(() => {
-            db.prepare(`
-              INSERT INTO sessions (id, cwd, updated_at)
-              VALUES (?, ?, ?)
-              ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at
-            `).run(sessionId, cwd, new Date().toISOString());
-
-            db.prepare("DELETE FROM turns WHERE session_id = ?").run(sessionId);
-            db.prepare(`
-              INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp)
-              VALUES (?, ?, ?, ?, ?)
-            `).run(
-              sessionId,
-              0,
-              "[Session history compacted due to context limits]",
-              summaryText,
-              new Date().toISOString()
-            );
-          });
-          runTx();
-        } finally {
-          db.close();
-        }
       }
     },
   };

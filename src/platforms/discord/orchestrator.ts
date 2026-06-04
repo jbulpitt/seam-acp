@@ -1262,10 +1262,9 @@ export class Orchestrator {
   }
 
   /** End-of-turn auto-compaction for agy. Mirrors the manual /compact flow
-   *  (read transcript → spawn temp runtime → ask for summary → call
-   *  manager.compactSession in place) but runs unattended when usage crosses
-   *  AGY_AUTO_COMPACT_THRESHOLD. The seam-acp session id is preserved; only
-   *  the underlying agy cascade is replaced. */
+   *  (read transcript → summarize → seed the summary into a NEW session and bind
+   *  the thread to it) but runs unattended when usage crosses
+   *  AGY_AUTO_COMPACT_THRESHOLD. The original session is preserved. */
   private async runAgyAutoCompact(
     record: SessionRecord,
     channel: ChannelRef,
@@ -1275,7 +1274,7 @@ export class Orchestrator {
   ): Promise<void> {
     const profile = this.router.getProfile(record.agentId);
     const manager = profile?.sessionManager;
-    if (!profile || !manager?.compactSession || !manager?.getTranscript) {
+    if (!profile || !manager?.getTranscript) {
       this.logger.debug({ agent: record.agentId }, "auto-compact skipped: missing manager methods");
       return;
     }
@@ -1431,7 +1430,7 @@ export class Orchestrator {
    *  w.r.t. the real session (analysis runs in temp /tmp runtimes). Resolves the
    *  raw JSONL, runs mandatory gap-detection, pulls Discord only for flagged
    *  ranges, then fans out the pipeline. Returns the full result; the caller
-   *  decides whether to write it back via compactSession. */
+   *  seeds the assembled summary into a new session. */
   private async runPremiumCompactionForSession(args: {
     profile: AgentProfile;
     manager: ISessionManager;
@@ -3298,10 +3297,14 @@ export class Orchestrator {
         .setLabel("🪄 AI Summary")
         .setStyle(ButtonStyle.Primary);
 
+      // "Can compact" now means: there's a configured summarizer model for this
+      // agent. (The write-back is a seedNewSession turn, which any agent with a
+      // runtime supports — no special manager method required.)
+      const canCompact = this.compactionModelFor(record.agentId) !== "";
+      // Any agent with a session manager can receive a migrated session (the
+      // summary is seeded into a fresh session under that agent).
       const targetProfiles = this.router.listProfiles().filter(p =>
-        p.id !== record.agentId &&
-        p.sessionManager &&
-        typeof p.sessionManager.compactSession === "function"
+        p.id !== record.agentId && !!p.sessionManager
       );
 
       const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(prevBtn, nextBtn, closeBtn);
@@ -3309,7 +3312,7 @@ export class Orchestrator {
 
       const row3Buttons = [summaryBtn];
 
-      if (typeof mgr.compactSession === "function") {
+      if (canCompact) {
         row3Buttons.push(
           new ButtonBuilder()
             .setCustomId("sessions:compact")
@@ -3346,7 +3349,7 @@ export class Orchestrator {
       const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(row3Buttons);
 
       const row4Buttons: ButtonBuilder[] = [];
-      if (typeof mgr.compactSession === "function") {
+      if (canCompact) {
         row4Buttons.push(
           new ButtonBuilder()
             .setCustomId("sessions:import_to_cwd")
@@ -3354,9 +3357,8 @@ export class Orchestrator {
             .setStyle(ButtonStyle.Primary)
         );
       }
-      // Premium (multi-agent) compaction — needs both a raw-history reader and
-      // a way to write the result back.
-      if (typeof mgr.compactSession === "function" && typeof mgr.getHistoryPath === "function") {
+      // Premium (multi-agent) compaction — needs a raw-history reader (Claude).
+      if (canCompact && typeof mgr.getHistoryPath === "function") {
         row4Buttons.push(
           new ButtonBuilder()
             .setCustomId("sessions:premium")
@@ -3941,8 +3943,8 @@ export class Orchestrator {
 
           void (async () => {
             try {
-              if (typeof manager.compactSession !== "function") {
-                throw new Error(`Compaction is not supported for agent profile \`${record.agentId}\``);
+              if (!this.compactionModelFor(record.agentId)) {
+                throw new Error(`Compaction is not supported for agent profile \`${record.agentId}\` (no summarizer model).`);
               }
               const built = await this.buildDefaultCompactionSeed({
                 profile,
@@ -4095,7 +4097,7 @@ export class Orchestrator {
         const session = sessions[currentIndex];
         if (!session) return;
         const compactionModel = this.compactionModelFor(record.agentId);
-        if (!compactionModel || typeof manager.compactSession !== "function") {
+        if (!compactionModel) {
           await btnInteraction.reply({
             content: `❌ Import is not supported for this agent.`,
             flags: MessageFlags.Ephemeral,
@@ -4272,8 +4274,7 @@ export class Orchestrator {
         if (session) {
           const targetProfiles = this.router.listProfiles().filter(p =>
             p.id !== record.agentId &&
-            p.sessionManager &&
-            typeof p.sessionManager.compactSession === "function"
+            !!p.sessionManager
           );
 
           const embed = new EmbedBuilder()
@@ -4320,7 +4321,7 @@ export class Orchestrator {
         if (session && targetAgentId) {
           const targetProfile = this.router.getProfile(targetAgentId);
           const targetManager = targetProfile?.sessionManager;
-          if (!targetProfile || !targetManager || typeof targetManager.compactSession !== "function") {
+          if (!targetProfile || !targetManager) {
             await btnInteraction.followUp({
               content: `❌ Target agent \`${targetAgentId}\` is not compatible or does not support session management.`,
               flags: MessageFlags.Ephemeral,

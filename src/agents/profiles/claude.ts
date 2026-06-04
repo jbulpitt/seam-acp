@@ -580,47 +580,6 @@ export function makeClaudeProfile(opts: {
         });
 
         await fsp.writeFile(file, sanitizedLines.join("\n"), "utf8");
-      },
-
-      async compactSession(cwd: string, sessionId: string, summaryText: string): Promise<void> {
-        const dir = configDir ?? path.join(process.env.HOME ?? "", ".claude");
-        const projectDir = await resolveProjectDir(dir, cwd);
-        const file = path.join(projectDir, `${sessionId}.jsonl`);
-
-        const now = new Date().toISOString();
-        const userUuid = crypto.randomUUID();
-        const assistantUuid = crypto.randomUUID();
-
-        const userEntry = {
-          type: "user",
-          message: {
-            role: "user",
-            content: "[Session history compacted due to context limits]"
-          },
-          uuid: userUuid,
-          timestamp: now,
-          sessionId,
-          cwd
-        };
-
-        const assistantEntry = {
-          type: "assistant",
-          message: {
-            role: "assistant",
-            content: summaryText
-          },
-          uuid: assistantUuid,
-          parentUuid: userUuid,
-          timestamp: now,
-          sessionId,
-          cwd
-        };
-
-        await fsp.writeFile(
-          file,
-          JSON.stringify(userEntry) + "\n" + JSON.stringify(assistantEntry) + "\n",
-          "utf8"
-        );
       }
     }
   };

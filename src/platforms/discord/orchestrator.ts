@@ -2616,17 +2616,18 @@ export class Orchestrator {
     );
   }
 
-  /** Nuclear: force-kill EVERY active agent session the bot is running — except
-   *  this thread (so you don't kill the session you're issuing the command from).
-   *  Each killed session resumes cleanly on its next message. */
+  /** Nuclear: force-kill EVERY active agent session the bot is running,
+   *  INCLUDING this thread — a slash command isn't an LLM turn, so it runs even
+   *  when the current thread's turn is wedged, and that wedged turn is usually
+   *  exactly what you're trying to kill. Session ids are preserved, so every
+   *  killed session resumes cleanly on its next message. */
   private async cmdKill(i: ChatInputCommandInteraction): Promise<void> {
-    const record = this.recordFromInteraction(i);
     await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const killed = await this.router.killAll(record ? { exceptId: record.id } : undefined);
+    const killed = await this.router.killAll();
     await i.editReply(
       killed === 0
-        ? "No other active sessions to kill."
-        : `🔪 Force-killed ${killed} active session(s)${record ? " (this thread spared)" : ""}. Each resumes on its next message.`
+        ? "No active sessions to kill."
+        : `🔪 Force-killed ${killed} active session(s) — including this thread. Each resumes on its next message.`
     );
   }
 

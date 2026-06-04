@@ -83,7 +83,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
-    sub.setName("kill").setDescription("Force-kill ALL active agent sessions (this thread spared)")
+    sub.setName("kill").setDescription("Force-kill ALL active agent sessions, including this thread (each resumes on next message)")
   );
 
   cmd.addSubcommand((sub) =>

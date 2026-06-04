@@ -48,6 +48,12 @@ export interface PremiumCompactionInput {
    *  both forces the credit-gated 1M tier and is the run's fragile long-pole).
    *  Each chunk is extracted independently and the results are merged. */
   pinnedChunkTokens?: number;
+  /** Hard per-call input budget (est. tokens) for the chunk-analysis and
+   *  deep-dive stages — the two stages that send raw history. No single agent
+   *  call's input may exceed this, so a large session can never produce a
+   *  "Prompt is too long" error. Deliberately well under even the standard 200K
+   *  window (chars/4 undercounts dense code, so we leave a wide margin). */
+  maxCallTokens?: number;
   log?: (msg: string) => void;
 }
 
@@ -120,6 +126,21 @@ function sliceByRange(events: HistoryEvent[], fromTs?: string, toTs?: string): s
   return renderHistory(inRange.length ? inRange : events);
 }
 
+/** Truncate text to a char budget, keeping head + tail with an elision marker.
+ *  Guarantees a single agent call's input can never exceed the model context
+ *  ("Prompt is too long"), even for an unexpectedly huge deep-dive region. */
+function fitText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const head = Math.floor(maxChars * 0.55);
+  const tail = Math.max(0, maxChars - head - 120);
+  const elided = text.length - head - tail;
+  return (
+    text.slice(0, head) +
+    `\n\n… [${elided.toLocaleString()} chars of this region elided to fit the model context window] …\n\n` +
+    text.slice(text.length - tail)
+  );
+}
+
 /** Render the last events that fit a token budget, for the verbatim window. */
 function recentVerbatim(events: HistoryEvent[], budgetTokens: number): string {
   const budgetChars = budgetTokens * 4;
@@ -146,13 +167,16 @@ export async function runPremiumCompaction(
     concurrency = 6,
     recentWindowTokens = 12_000,
     pinnedChunkTokens = 120_000,
+    maxCallTokens = 130_000,
     log = () => {},
   } = input;
 
   const thinkingAvailable = richHistory.stats.thinkingAvailable;
+  const maxCallChars = maxCallTokens * 4;
 
   // --- Stage 1: chunk + analyze (fan-out) -------------------------------------
-  const chunks = chunkHistory(richHistory.events);
+  // Chunk small enough that NO single chunk-analysis call can blow the context.
+  const chunks = chunkHistory(richHistory.events, maxCallTokens);
   log(`analyzing ${chunks.length} chunk(s)`);
   const chunkAnalyses = await mapLimit(chunks, concurrency, (c, i) =>
     runStructured<ChunkAnalysis>(runAgent, chunkAnalyzerPrompt(c), `chunk-${i}`, log)
@@ -179,10 +203,12 @@ export async function runPremiumCompaction(
     // Give each deep-dive only its region: Discord text when the meta flagged
     // this range Discord-preferred and we have it; otherwise the session events
     // sliced to the target's timestamp range.
-    const text =
+    const rawText =
       t.source === "discord" && discordText
         ? discordText
         : sliceByRange(richHistory.events, t.fromTs, t.toTs);
+    // Cap the region so an oversized deep-dive can never exceed the context.
+    const text = fitText(rawText, maxCallChars);
     const prompt = deepDivePrompt({ fromTs: t.fromTs, toTs: t.toTs, depth: t.depth, source: t.source, text });
     try {
       return await runStructured<DeepDive>(runAgent, prompt, `deepdive-${i}`, log);

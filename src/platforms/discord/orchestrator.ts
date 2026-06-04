@@ -3165,7 +3165,7 @@ export class Orchestrator {
 
       let footerText = `Session ${idx + 1} of ${list.length}`;
       if (session.estimatedTokens !== undefined) {
-        footerText += ` • Estimated Context: ${session.estimatedTokens.toLocaleString()} tokens`;
+        footerText += ` • Context: ${session.estimatedTokens.toLocaleString()} tokens`;
       }
       embed.setFooter({ text: footerText });
 

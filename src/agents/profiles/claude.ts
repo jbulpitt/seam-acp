@@ -188,6 +188,11 @@ export function makeClaudeProfile(opts: {
               const lines = content.split("\n").filter(l => l.trim().length > 0);
               
               const allMessages: Array<{ sender: "human" | "agent"; text: string; timestamp?: number }> = [];
+              // Real context size = the last assistant turn's usage (input + cache
+              // + output), which counts tool I/O, thinking, and cache the text-only
+              // estimate misses. Falls back to the char estimate when no turn has
+              // usage (e.g. a freshly compacted session).
+              let lastUsage: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number; output_tokens?: number } | null = null;
 
               for (const line of lines) {
                 try {
@@ -221,6 +226,7 @@ export function makeClaudeProfile(opts: {
                     
                     const ts = entry.timestamp ? Date.parse(entry.timestamp) : undefined;
                     allMessages.push({ sender: "agent", text, timestamp: ts });
+                    if (entry.message?.usage) lastUsage = entry.message.usage;
                   }
                 } catch {
                   // ignore malformed lines
@@ -253,7 +259,13 @@ export function makeClaudeProfile(opts: {
                   transcriptLines.push(`${prefix}${m.text.trim()}`);
                 }
               }
-              const estimatedTokens = Math.ceil(transcriptLines.join("\n\n").length / 4);
+              const realTokens = lastUsage
+                ? (lastUsage.input_tokens || 0) + (lastUsage.cache_read_input_tokens || 0) +
+                  (lastUsage.cache_creation_input_tokens || 0) + (lastUsage.output_tokens || 0)
+                : 0;
+              const estimatedTokens = realTokens > 0
+                ? realTokens
+                : Math.ceil(transcriptLines.join("\n\n").length / 4);
 
               summaries.push({
                 sessionId,

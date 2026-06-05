@@ -2166,6 +2166,25 @@ export class Orchestrator {
       time: 600_000,
     });
 
+    // If the builder times out with nothing saved, clear the (now-inert) buttons
+    // and say so. Otherwise the card sits there looking clickable but dead — a
+    // second silent-failure path on top of the Create no-op: the user keeps
+    // clicking a timed-out builder and nothing happens or persists.
+    collector.on("end", async (_collected, reason) => {
+      // "created"/"saved"/"cancel" already replaced the message; only handle the
+      // timeout (and ignore message-deleted, where there's nothing to edit).
+      if (reason !== "time") return;
+      try {
+        await i.editReply({
+          content: "⏰ Schedule builder timed out — nothing was saved. Run the schedule builder again to start over.",
+          embeds: [],
+          components: [],
+        });
+      } catch {
+        /* interaction token expired (>15 min) — nothing we can edit */
+      }
+    });
+
     collector.on("collect", async (c) => {
       try {
         if (c.isStringSelectMenu() && c.customId === "sched:tz") {

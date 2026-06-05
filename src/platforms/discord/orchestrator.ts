@@ -2248,7 +2248,23 @@ export class Orchestrator {
           await c.update({ content: "Cancelled.", embeds: [], components: [] });
         } else if (c.isButton() && c.customId === "sched:create") {
           await c.deferUpdate();
-          if (!state.cron || !state.promptText || !state.name) return;
+          // Don't silently no-op on a half-filled form. Clicking Create with an
+          // unset name/prompt/cadence previously just vanished (deferUpdate ack'd
+          // the click, then `return`), so a schedule the user believed they had
+          // created was never persisted and never ran. Tell them what's missing
+          // and keep the builder open. (Single combined guard so TS narrows the
+          // three fields to non-null for the row construction below.)
+          if (!state.name || !state.promptText || !state.cron) {
+            const missing: string[] = [];
+            if (!state.name) missing.push("a name");
+            if (!state.promptText) missing.push("a prompt");
+            if (!state.cron) missing.push("a cadence/schedule");
+            await c.followUp({
+              content: `⚠️ Not created yet — still need ${missing.join(", ")}. Use **Prompt & details** to set the name + prompt and pick a cadence, then click Create.`,
+              flags: MessageFlags.Ephemeral,
+            });
+            return;
+          }
           const now = new Date().toISOString();
           const next = cronNextRun(state.cron, state.timezone);
           let row: ScheduledPrompt;

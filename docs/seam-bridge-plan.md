@@ -12,6 +12,56 @@ entries.
 
 ---
 
+## Orientation — read this first (cold start)
+
+Starting from empty context? Read this, then the files it names, before §0.
+
+**What seam-acp is.** A Discord bot that drives ACP coding agents (Claude Code, GitHub
+Copilot CLI, Antigravity = "agy", and opencode → LM Studio). Each Discord thread is a
+session; one user message = one ACP `session/prompt` awaited to `end_turn`. Runs under
+pm2; redeploy with `npm run redeploy` (writes a restart sentinel — the process
+self-restarts). Persistent state lives in `data/seam.db` (SQLite: thread→session
+mapping) plus each agent's own on-disk session store.
+
+**What ACP is.** Agent Client Protocol — JSON-RPC over stdio. seam-acp spawns an agent
+as an ACP server and drives it: `initialize` → `session/new` → `session/set_model` →
+`session/prompt` (text/image content blocks) → streamed `session/update`s →
+`stopReason: end_turn`. At `initialize` the agent advertises
+`agentCapabilities.promptCapabilities` (e.g. `image: true`). Model/effort/capabilities
+all ride this pipe — which is why a bridged agent inherits them "for free" (§3). Smoke
+test: spawn `<agent> acp`, write those four JSON-RPC messages to stdin, read updates
+from stdout (~70-line Node script).
+
+**Read these files, in order:**
+| File | What it is / why |
+|---|---|
+| `AGENTS.md`, `docs/model-management-runbook.md` | repo conventions + model/effort gotchas — first |
+| `src/agents/agent-profile.ts` | the **`AgentProfile`** interface PR1 evolves into `AgentAdapter` (§4) |
+| `src/agents/agent-runtime.ts` | how a profile is consumed: `spawn()`, `newSessionMeta`, effort, `sessionManager`, `promptCapabilities` |
+| `src/agents/profiles/{claude,copilot,agy,opencode}.ts` | the four agents to recast as adapters (PR1) |
+| `src/agents/profiles/remote.ts` | current remote bridge — `makeMux` transport to **keep**, copilot-shape to **delete** |
+| `scripts/remote-agent-bridge.mjs` | current bridge script (transport + ad-hoc cmd bus + session handlers) |
+| `src/agents/session-manager.ts` | `ISessionManager` (list/clone/delete/usage/transcript) |
+| `src/platforms/discord/orchestrator.ts` | turn lifecycle, pickers, status cards, `/seam sessions` UI |
+| `src/config.ts`, `src/index.ts` | env config + profile registration/wiring |
+
+**Current `AgentProfile` (PR1's "from" state).** Members: `spawn()`, `defaultModel`,
+`staticModels`, `threadAbbr`, the `effort` descriptor, `newSessionMeta(model, effort)`,
+`whoami()`, optional `sessionManager`, `configDir`, `restrictDiscordAccess`. The adapter
+(§4) keeps all of these and adds `listWorkspaces`/`prepare`/`install`/`describe`, and
+routes `spawn`/sessions over the bus when remote.
+
+**Dev loop.** `npm run build` (tsc) · `npm test` (vitest — ~4 *known* pre-existing
+failures in `thread-rename`, ignore them) · `npm run redeploy` (build + restart
+sentinel) · `npm run patch-acp` (re-apply the claude-agent-acp model-resolver patch
+after any update to that package). `.env` is gitignored (config + secrets live there).
+
+**Companion specs:** [display-naming-plan.md](./display-naming-plan.md) (emoji/short-name
+standard, consumed by D10) · [integrations-research.md](./integrations-research.md)
+(future skills research — not needed to build the bridge).
+
+---
+
 ## 0. Terminology (canonical — use these exact words)
 
 - **seam-acp** — the core app and **control plane**. The *only* brain: it owns

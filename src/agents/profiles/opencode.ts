@@ -138,16 +138,23 @@ export async function syncOpencodeLmStudioConfig(opts: {
   }
   if (!cfg.$schema) cfg.$schema = "https://opencode.ai/config.json";
   const providers = (cfg.provider && typeof cfg.provider === "object" ? cfg.provider : {}) as Record<string, unknown>;
-  // Declare each model WITH its capability flags. `attachment: true` is the
-  // load-bearing one — without it opencode strips images from prompts to this
-  // model (the "can't see images" bug), even though LM Studio serves it as a vlm.
+  // Declare each model WITH its capability flags. For vision, opencode needs BOTH
+  // `attachment: true` AND `modalities.input` containing "image" — and the latter
+  // is the load-bearing one: opencode's message-builder consults `modalities` to
+  // decide whether to forward image parts to the provider. With only `attachment`
+  // (or neither), opencode accepts the image from the ACP client but silently
+  // drops it before the model — the "can't see images" bug. Verified end-to-end:
+  // adding modalities.input:["text","image"] flips gemma-4-26b from "I cannot see
+  // any image" to reading it correctly.
   const modelsBlock: Record<string, Record<string, unknown>> = {};
   for (const m of opts.models) {
+    const input = ["text", ...(m.attachment ? ["image"] : [])];
     modelsBlock[m.rawId] = {
       name: modelLabel(m.rawId),
       ...(m.attachment ? { attachment: true } : {}),
       ...(m.toolCall ? { tool_call: true } : {}),
       ...(m.reasoning ? { reasoning: true } : {}),
+      modalities: { input, output: ["text"] },
     };
   }
   providers[opts.providerKey] = {

@@ -141,6 +141,11 @@ export class AgentRuntime {
   /** True while a `session/prompt` is awaiting a response — lets the abort path
    *  tell whether a graceful cancel actually ended the turn before escalating. */
   private promptInFlight = false;
+  /** Reject fn for the in-flight `conn.prompt()` promise while a turn runs. Lets
+   *  us force that await to settle the instant the child exits or the runtime is
+   *  disposed — the SDK does not reliably reject pending RPCs on an abnormal
+   *  child exit, which otherwise wedges the turn (and the channel queue) forever. */
+  private rejectInFlightPrompt?: (err: Error) => void;
   private promptCapabilities?: PromptCapabilities;
   private sessionCwd?: string;
 
@@ -213,6 +218,16 @@ export class AgentRuntime {
 
     child.on("exit", (code, signal) => {
       this.logger.warn({ code, signal }, "agent process exited");
+      // Reject any in-flight prompt FIRST so a turn awaiting it unblocks
+      // immediately. Without this, an abnormal child exit leaves the
+      // orchestrator's `await prompt()` pending forever (the SDK doesn't
+      // reliably reject pending RPCs on a hard exit): the runtime gets evicted
+      // but the channel queue wedges — card stuck "working", activeTurns never
+      // decrements, no new turn starts, and `/seam abort` reports "no active
+      // turn" (the runtime is already gone). Previously only a restart cleared it.
+      this.rejectInFlightPrompt?.(
+        new Error(`agent process exited mid-turn (code=${code}, signal=${signal})`)
+      );
       // If initialize already completed, notify the router so it can evict
       // this runtime and attempt session/load on the next incoming message.
       if (this.connection !== undefined) {
@@ -405,7 +420,14 @@ export class AgentRuntime {
 
     this.promptInFlight = true;
     try {
-      const res = await conn.prompt({ sessionId: sid, prompt });
+      // Race the ACP prompt RPC against a death/dispose rejection. Storing the
+      // reject lets the child-exit handler (and dispose) force this await to
+      // settle instead of hanging when the connection dies without a clean
+      // close. On normal completion the RPC resolves first.
+      const res = await new Promise<{ stopReason: string }>((resolve, reject) => {
+        this.rejectInFlightPrompt = reject;
+        conn.prompt({ sessionId: sid, prompt }).then(resolve, reject);
+      });
       return {
         stopReason: res.stopReason,
         cancelled: res.stopReason === "cancelled",
@@ -413,6 +435,7 @@ export class AgentRuntime {
       };
     } finally {
       this.promptInFlight = false;
+      this.rejectInFlightPrompt = undefined;
     }
   }
 

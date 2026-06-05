@@ -6,6 +6,10 @@ This file contains instructions for AI agents (Copilot, Claude, Gemini, etc.) wo
 
 `seam-acp` is the Discord bot you are currently running inside. It bridges Discord messages to AI agent CLIs via the Agent Client Protocol (ACP). You are likely talking to yourself.
 
+## Output formatting
+
+Your output is streamed to Discord, which does **not** support markdown tables. Avoid using tables in your responses — they render as garbled text. Use bullet lists, bold labels, or plain text instead.
+
 ## ⚠️ CRITICAL: Applying code changes or restarting the app
 
 **Never run `pm2 restart seam-acp` directly.** The bot is managed by PM2. A direct restart kills the process immediately — including the agent session running the command — so your reply will never be delivered to Discord.

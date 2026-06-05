@@ -17,6 +17,28 @@ JSONL probes.
 
 ---
 
+## Cold start — read these first
+
+If you are an agent with no prior context about this project, read the following
+before running any procedure in this runbook:
+
+1. **[AGENTS.md](../AGENTS.md)** — what seam-acp is, project structure, critical
+   rules (never `pm2 restart`, always `npm run redeploy`), and the Claude model
+   management warning that points here.
+2. **§0 below** ("Mental model") — the data-flow diagram showing where model
+   strings travel and where they can break. This is the conceptual foundation for
+   every other section.
+3. **Current state** — skim these files to understand what's deployed right now:
+   - `.env` — `CLAUDE_DEFAULT_MODEL` and `CLAUDE_MODELS` (the picker values)
+   - `src/agents/profiles/claude.ts` — `getClaudeContextWindow()` (compaction
+     threshold logic) and `newSessionMeta()` (how `_meta` is built)
+   - `src/config.ts` — env var validation, `REMOTE_MAC_MODELS` (remote Copilot
+     agent, separate ID format)
+   - `scripts/patch-claude-agent-acp.mjs` — the local resolver-bypass patch
+4. **The "Current verified picture" table** above — the last-known-good mapping
+   of picker values → API models → context windows. Treat it as stale if any
+   version has changed since the date shown.
+
 ## Current verified picture (last verified 2026-06-01, claude-agent-acp 0.39 + patch)
 
 This table is the *output* of the §4 process, kept here as a quick reference.
@@ -106,11 +128,25 @@ If either is behind, **do not update yet** — read the changelogs first (§2).
 ## 2. Read the changelogs and report findings
 
 Sources:
-- Claude Code CLI: https://github.com/anthropics/claude-code/releases
-- claude-agent-acp: https://github.com/zed-industries/claude-code-acp/releases
-  (also published to npm; `npm view @agentclientprotocol/claude-agent-acp` for metadata)
-- Model/platform docs: https://platform.claude.com/docs/en/about-claude/models/overview
-- Model config / effort docs: https://code.claude.com/docs/en/model-config
+- Claude Code CLI changelog: https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md
+- claude-agent-acp changelog: https://github.com/agentclientprotocol/claude-agent-acp/blob/main/CHANGELOG.md
+- Version detection (JSON): https://registry.npmjs.org/@anthropic-ai/claude-code (check `dist-tags.latest`)
+  and https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp
+- Model/platform docs: https://platform.claude.com/docs/en/about-claude/models/overview.md
+- Model config / effort docs: https://code.claude.com/docs/en/model-config.md
+- Claude Code overview: https://code.claude.com/docs/en/overview.md
+- Claude Code changelog: https://code.claude.com/docs/en/changelog.md
+- Pricing: https://platform.claude.com/docs/en/about-claude/pricing.md
+- System prompts / release notes: https://platform.claude.com/docs/en/release-notes/system-prompts.md
+
+> **Agent readability:** All sources above return **clean markdown** suitable for
+> agent-driven scanning. The Anthropic docs sites (platform.claude.com,
+> code.claude.com) serve raw markdown when the URL ends in `.md` — the SPA pages
+> (without `.md`) are NOT readable via HTTP fetch. Always use the `.md` suffix.
+>
+> **Discovery indexes** (list every available `.md` page):
+> - https://platform.claude.com/docs/llms.txt
+> - https://code.claude.com/docs/llms.txt
 
 For the version range between **installed** and **latest**, scan for and
 explicitly report on each of these categories:

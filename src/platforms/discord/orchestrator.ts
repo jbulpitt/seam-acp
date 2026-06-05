@@ -317,6 +317,13 @@ export class Orchestrator {
     // side-channel read.
     const cachedUsage = cfg.lastContextUsage;
     const activeModel = cfg.model ?? this.config.DEFAULT_MODEL;
+    // Authoritative per-model window when seam-acp knows it (staticModels
+    // contextLimit — e.g. opencode/Ollama, discovered from /api/show). Some
+    // agents report a generic default (~200K) in usage_update regardless of the
+    // real window; use this as a FLOOR so the panel shows the true size.
+    const turnProfile = this.router.getProfile(record.agentId);
+    const modelContextFloor =
+      turnProfile?.staticModels?.find((m) => m.modelId === activeModel)?.contextLimit ?? 0;
     if (
       cachedUsage &&
       cachedUsage.model === activeModel &&
@@ -326,6 +333,10 @@ export class Orchestrator {
       status.contextUsedHighWater = cachedUsage.used;
       status.contextWindowSize = cachedUsage.size;
       status.context = formatContextUsage(cachedUsage.used, cachedUsage.size);
+    }
+    if (modelContextFloor > status.contextWindowSize) {
+      status.contextWindowSize = modelContextFloor;
+      status.context = formatContextUsage(status.contextUsedHighWater, modelContextFloor);
     }
 
     const initialPanel = renderStatusPanel(this.renderer, status.toInput(), Date.now());
@@ -774,7 +785,9 @@ export class Orchestrator {
             // first event. The window only ever grows within a turn (default →
             // authoritative); it never legitimately shrinks (compaction changes
             // `used`, not `size`; model switches clear the cache between turns).
-            const size = Math.max(event.size, status.contextWindowSize);
+            // `modelContextFloor` overrides an agent's generic default (e.g.
+            // opencode reporting 200K for a 256K gemma model).
+            const size = Math.max(event.size, modelContextFloor, status.contextWindowSize);
             status.contextWindowSize = size;
             status.context = formatContextUsage(used, size);
             // agy has no built-in auto-compaction. Mark the turn for an

@@ -123,7 +123,12 @@ async function main(): Promise<void> {
         providerKey: config.OPENCODE_MODEL_PREFIX,
         baseURL: config.OPENCODE_LMSTUDIO_URL.replace(/\/+$/, "") + "/v1",
         ...(config.OPENCODE_LMSTUDIO_API_KEY ? { apiKey: config.OPENCODE_LMSTUDIO_API_KEY } : {}),
-        models: discovered.map((m) => ({ rawId: m.rawId })),
+        models: discovered.map((m) => ({
+          rawId: m.rawId,
+          ...(m.attachment ? { attachment: true } : {}),
+          ...(m.toolCall ? { toolCall: true } : {}),
+          ...(m.reasoning ? { reasoning: true } : {}),
+        })),
       }).catch((err) => logger.warn({ err }, "opencode: config sync failed"));
       opencodeModels = discovered.map(({ modelId, name, contextLimit }) => ({
         modelId,

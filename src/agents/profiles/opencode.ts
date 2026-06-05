@@ -4,8 +4,22 @@ import path from "node:path";
 import type { AgentProfile } from "../agent-profile.js";
 
 /** A discovered LM Studio model. `rawId` is the server's model id (e.g.
- *  `google/gemma-4-26b-a4b`); `modelId` is its opencode form (`<prefix>/<rawId>`). */
-type LmStudioModel = { rawId: string; modelId: string; name: string; contextLimit?: number };
+ *  `google/gemma-4-26b-a4b`); `modelId` is its opencode form (`<prefix>/<rawId>`).
+ *  The capability flags mirror opencode's per-model fields — WITHOUT them opencode
+ *  treats a custom-provider model as text-only and STRIPS image attachments, so a
+ *  vision model would silently never receive images. */
+type LmStudioModel = {
+  rawId: string;
+  modelId: string;
+  name: string;
+  contextLimit?: number;
+  /** Accepts image attachments — true for LM Studio `type: "vlm"`. */
+  attachment?: boolean;
+  /** Supports tool/function calling — from `capabilities` containing "tool_use". */
+  toolCall?: boolean;
+  /** Emits reasoning in a separate `reasoning_content` — from `capabilities`. */
+  reasoning?: boolean;
+};
 
 /** One fetch with a 10s abort timeout. */
 async function fetchJson<T>(fetchFn: typeof fetch, url: string, init?: RequestInit): Promise<T> {
@@ -46,7 +60,15 @@ export async function fetchLmStudioModels(
 ): Promise<LmStudioModel[]> {
   const root = baseUrl.replace(/\/+$/, "");
   const headers: Record<string, string> = apiKey ? { authorization: `Bearer ${apiKey}` } : {};
-  let body: { data?: Array<{ id?: string; max_context_length?: number; loaded_context_length?: number }> };
+  let body: {
+    data?: Array<{
+      id?: string;
+      type?: string;
+      max_context_length?: number;
+      loaded_context_length?: number;
+      capabilities?: string[];
+    }>;
+  };
   try {
     body = await fetchJson(fetchFn, `${root}/api/v0/models`, { headers });
   } catch {
@@ -60,11 +82,21 @@ export async function fetchLmStudioModels(
     const contextLimit =
       typeof loaded === "number" && loaded > 0 ? loaded :
       typeof max === "number" && max > 0 ? max : undefined;
+    // LM Studio reports `type: "vlm"` for vision models and a `capabilities`
+    // array (e.g. ["tool_use"]). Map these to opencode's per-model flags so it
+    // forwards images / tool calls instead of silently dropping them.
+    const caps = Array.isArray(m.capabilities) ? m.capabilities : [];
+    const attachment = m.type === "vlm";
+    const toolCall = caps.includes("tool_use") || caps.includes("tools");
+    const reasoning = caps.includes("thinking") || caps.includes("reasoning");
     out.push({
       rawId: m.id,
       modelId: `${prefix}/${m.id}`,
       name: `${modelLabel(m.id)} 🦙`,
       ...(contextLimit ? { contextLimit } : {}),
+      ...(attachment ? { attachment: true } : {}),
+      ...(toolCall ? { toolCall: true } : {}),
+      ...(reasoning ? { reasoning: true } : {}),
     });
   }
   return out.sort((a, b) => a.modelId.localeCompare(b.modelId));
@@ -94,7 +126,7 @@ export async function syncOpencodeLmStudioConfig(opts: {
   providerKey: string;
   baseURL: string;
   apiKey?: string;
-  models: ReadonlyArray<{ rawId: string }>;
+  models: ReadonlyArray<{ rawId: string; attachment?: boolean; toolCall?: boolean; reasoning?: boolean }>;
 }): Promise<void> {
   if (opts.models.length === 0) return;
   let cfg: Record<string, unknown> = {};
@@ -106,8 +138,18 @@ export async function syncOpencodeLmStudioConfig(opts: {
   }
   if (!cfg.$schema) cfg.$schema = "https://opencode.ai/config.json";
   const providers = (cfg.provider && typeof cfg.provider === "object" ? cfg.provider : {}) as Record<string, unknown>;
-  const modelsBlock: Record<string, { name: string }> = {};
-  for (const m of opts.models) modelsBlock[m.rawId] = { name: modelLabel(m.rawId) };
+  // Declare each model WITH its capability flags. `attachment: true` is the
+  // load-bearing one — without it opencode strips images from prompts to this
+  // model (the "can't see images" bug), even though LM Studio serves it as a vlm.
+  const modelsBlock: Record<string, Record<string, unknown>> = {};
+  for (const m of opts.models) {
+    modelsBlock[m.rawId] = {
+      name: modelLabel(m.rawId),
+      ...(m.attachment ? { attachment: true } : {}),
+      ...(m.toolCall ? { tool_call: true } : {}),
+      ...(m.reasoning ? { reasoning: true } : {}),
+    };
+  }
   providers[opts.providerKey] = {
     npm: "@ai-sdk/openai-compatible",
     name: "LM Studio Remote",

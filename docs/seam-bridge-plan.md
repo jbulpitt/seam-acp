@@ -1,7 +1,7 @@
 # Seam Bridge — generalized machine-to-machine agent conduit
 
-**Status:** draft spec (core decisions recorded) · **Created:** 2026-06-05 ·
-**Updated:** 2026-06-05 · **Owner:** jbulpitt
+**Status:** build-ready spec (D0–D11 locked) · **Created:** 2026-06-05 ·
+**Updated:** 2026-06-05 · **Owner:** jbulpitt · **Start at:** §9 PR0
 
 Reframe the "remote agent" from a bespoke *agent type* into a generic *transport +
 command bus* so any agent (claude, copilot, agy, opencode, …) can run on any number
@@ -56,7 +56,11 @@ locally, or on the **mac** bridge?"*
   for local, on the remote-bridge for remote). Implemented as a shared
   **agent-adapter** contract that the remote-bridge hosts and seam-acp invokes over
   the command bus. *Consequence:* adapter code must be **shippable to the bridge** (a
-  shared, version-negotiated contract). Accepted cost.
+  shared, version-negotiated contract). Accepted cost. *Note:* because every adapter
+  runs co-located (D9 makes even `local` a loopback host), there is **no
+  central-execution-against-remote-fs path** — so **no `Storage` abstraction is
+  needed**; adapters use local fs directly (a thin fs seam is optional, for unit-test
+  mocking only).
 - **`[decided]` D4 — seam-acp owns the brain; each host owns the hands + keychain.**
   See §6 ownership table. seam-acp owns orchestration + adapter contracts; each host
   owns execution mechanics, **local secrets**, and storage. Secrets never traverse
@@ -79,9 +83,9 @@ locally, or on the **mac** bridge?"*
   cross-host debugging runs from one pane of glass (`/seam debug <bridge>`) instead of
   SSH-into-each-box. Deliberately minimal — no audit/scoping/expiry now; harden later
   (§6.1).
-- **`[decided]` D8 — Per-bridge pairing.** seam-acp generates a per-bridge
-  `{ bridgeId, token }` at pair time; paste it into the bridge once. Per-bridge, not
-  one global token. (The pairing *handshake* wire-flow is still to spec — §11.)
+- **`[decided]` D8 — Per-bridge pairing.** seam-acp mints a per-bridge
+  `{ bridgeId, token }` at pair time; you run a one-line bootstrap on the host once.
+  Per-bridge, not one global token. Concrete flow in §6.2.
 - **`[decided]` D9 — `local` is a loopback bridge.** Local agents go through the *same*
   adapter-over-bus interface via an in-process transport — one code path for
   local + remote, so dev mode (D7), reconciliation (§4.1), and diagnostics behave
@@ -224,6 +228,22 @@ SSH-to-every-box (same power, just made ergonomic), so it's not *new* risk.
 a separate dev token, an audit log, path scoping, auto-expiry. Cut intentionally to
 avoid bloat — revisit if the project grows beyond a single operator.
 
+### 6.2 Pairing flow (D8)
+
+1. **`/seam bridge add <name>`** on seam-acp → mints `{ bridgeId, token }`, records the
+   transport mode + URL, and prints a one-line bootstrap, e.g.
+   `seam-bridge connect --server <wss-url> --id <bridgeId> --token <token>`.
+2. **Run the one-liner on the host.** The bridge stores the credential locally and
+   dials in (server mode) — or `seam-bridge serve` + hand seam-acp the tunnel URL
+   (client mode).
+3. **seam-acp validates** the token (sent in the WS auth header, same mechanism as
+   today) against what it issued → marks the bridge **paired**.
+4. **Rotation:** `/seam bridge rotate <name>` issues a new token, pushed over the
+   already-authenticated channel (or re-bootstrap).
+
+No PKI; reuses the current token-in-header auth. The only new pieces are seam-acp
+minting/storing per-bridge creds and the `/seam bridge add|rotate` UX.
+
 ## 7. Workspace / cwd model
 
 - **Detection runs at the agent.** The repo/cwd picker calls the adapter's
@@ -251,35 +271,43 @@ but creds cross the wire every spawn, seam-acp becomes a multi-machine secret va
 (big blast radius), and it duplicates the local creds whoami/usage already require.
 Not worth it.
 
-## 9. Phasing (updated)
+## 9. Build sequence (each PR is safe + value-preserving)
 
-0. **Delete** the `copilot-remote` machinery (D5 clean slate).
-1. **Adapter refactor.** Recast `claude/copilot/agy/opencode` profiles as
-   `AgentAdapter`s (§4); seam-acp loads them locally. Behavior-preserving.
-2. **Set up the monorepo + bridge artifact (D6).** Restructure into workspace
-   packages (`adapters`/`core`/`bridge`); pull `makeMux`/transport into the shared
-   module; build the bridge as a lean standalone installable (adapter-host + command
-   bus).
-3. **Command bus (§5)** + **reconciliation handshake (§4.1)**.
-4. **Location binding (D1/D2)** — `agentId@location`, picker "pick agent → pick
-   where," sessions pinned.
-5. **Capability discovery + graceful errors + guarded install (§6).**
-6. **Workspace-at-host (§7)**; remove the cwd-rewrite hack.
+> **Keystone:** PR1 *ratifies* the §4 agent-adapter contract by implementing it four
+> times — producing the interface and starting the build are the same step.
+
+- **PR0 — Subtract.** Delete the `copilot-remote` machinery (D5):
+  `REMOTE_COPILOT_PROFILES`, `makeRemoteCopilot*`, the bridge `--session-type`
+  branches, the `rewriteCwdInChunk`/`localCwd` hack. Nothing uses it now — pure
+  cleanup.
+- **PR1 — Adapter refactor (in-place, behavior-preserving).** Recast
+  `claude/copilot/agy/opencode` as the `AgentAdapter` contract (§4), still running
+  locally in-process. App behaves identically. **No bridge yet** — lowest-risk
+  foundation; this is where the contract is ratified.
+- **PR2 — Monorepo (D6).** Restructure into `packages/{adapters,core,bridge}`; extract
+  `makeMux`/transport into the shared module; build the bridge as a lean standalone
+  installable.
+- **PR3 — The bridge.** Command bus (§5) + reconciliation handshake (§4.1) + per-bridge
+  pairing (D8/§6.2) + dev mode (D7/§6.1) + `install()` (§6).
+- **PR4 — Location binding.** D9 loopback + D10 flattened/host-prefixed selection +
+  per-thread `agentId@location` persistence + workspace-at-host (D11/§7).
+
+**Parallel, anytime:** the display-naming standard
+([display-naming-plan.md](./display-naming-plan.md)) isn't gated by any of this and
+improves the app today — landing `resolveDisplay` to retire
+`threadAbbr`/`REPO_EMOJIS`/hand-baked emoji is a standalone win.
 
 ## 10. Preserve (regression tests)
 Instance-id eviction · SIGUSR2 drain · `listSlots` recovery · queued-stdin-on-
 reconnect · ACP-transparency of model/effort/caps/thinking. Pin these as conformance
 tests in `seam-bridge`.
 
-## 11. Still open
-- `[research]` `protocolVersion` negotiation + how much adapter-contract version skew
-  between seam-acp and a bridge is tolerated.
-- `[research]` Install-recipe format + provenance/pinning.
-- `[research]` Pairing **handshake** wire-flow (D8 fixed the model — per-bridge
-  `{bridgeId, token}` — but not how the credential is delivered/exchanged).
-- `[research]` Whether to build the **D3 `Storage` seam** up front (lets an adapter
-  run centrally) or run adapters at-host first and retrofit it.
-- `[idea]` Independent/public bridge distribution — trigger to revisit **D6**
+## 11. Deferred (settle when building the relevant piece — none block starting)
+- `[deferred]` `protocolVersion` negotiation + tolerated adapter-contract skew →
+  settle when writing the handshake (§4.1 / §5), during PR3.
+- `[deferred]` Install-recipe format + provenance/pinning → settle when building
+  `install()` (PR3).
+- `[idea]` Independent/public bridge distribution — the trigger to revisit **D6**
   (monorepo); would move adapters+bridge into a shared lower package seam-acp depends
   on.
 - `[ref]` Display / short-name standard (host emoji, cwd names) is specced separately:

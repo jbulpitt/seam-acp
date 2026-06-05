@@ -171,6 +171,14 @@ locally, or on the **mac** bridge?"*
 branches, and the `rewriteCwdInChunk`/`localCwd` path-rewrite hack (§7 removes the
 need for it).
 
+**Debt retired (a consequence of the above, not extra work).** Executing the plan
+removes a whole cluster of existing debt for free: the claude/copilot **session-logic
+duplication** (typed profiles *and* the untyped `.mjs` bridge → one co-located adapter,
+D3), the **identity/location conflation** (D1/D9), the **cwd-rewrite hack** (§7), the
+bridge's **raw-SQL/`sqlite3`-CLI** access (→ typed adapter), and the untyped `.mjs`
+itself (→ TS, D6). Full register + the parts the plan does *not* touch:
+[tech-debt-notes.md](./tech-debt-notes.md).
+
 ## 4. Agent-adapter contract
 
 One interface, same whether it runs locally or on a bridge. seam-acp calls it
@@ -347,6 +355,18 @@ Not worth it.
 improves the app today — landing `resolveDisplay` to retire
 `threadAbbr`/`REPO_EMOJIS`/hand-baked emoji is a standalone win.
 
+**Debt discipline (executed *within* the PRs above — full register:
+[tech-debt-notes.md](./tech-debt-notes.md)):**
+- **PR1:** tighten the `as any` parse-boundary types in the four profiles while you're
+  rewriting them (C3).
+- **PR3/PR4:** introduce bridge config as a **structured file**, not more `REMOTE_*`-style
+  env parsing — keeps `config.ts` from growing (C2); and **extract** the new
+  `/seam bridge`, `/seam debug`, and selection UI into their *own* orchestrator modules
+  rather than growing the 5.9k-LOC `orchestrator.ts` (A1 — *targeted only*; a full
+  decomposition is a separate project, out of scope here).
+- **Parallel:** the naming resolver (D10) retires the
+  `threadAbbr`/`REPO_EMOJIS`/hand-baked-emoji sprawl.
+
 ## 10. Rollout & session continuity
 
 Built incrementally so daily use is never disrupted. The work runs on a feature branch
@@ -401,6 +421,8 @@ tests in `seam-bridge`.
   [display-naming-plan.md](./display-naming-plan.md).
 
 ## 13. Related
+- Debt assessment + how this plan intersects it (and what it does *not* touch):
+  [tech-debt-notes.md](./tech-debt-notes.md).
 - Current implementation: `src/agents/profiles/remote.ts`,
   `scripts/remote-agent-bridge.mjs`, consumed in `src/agents/agent-runtime.ts`.
 - The browser-automation substrate in [integrations-research.md](./integrations-research.md)

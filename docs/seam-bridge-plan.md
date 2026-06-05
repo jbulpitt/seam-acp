@@ -76,7 +76,7 @@ locally, or on the **mac** bridge?"*
   Discord/orchestrator deps), preserving easy-install. Cross-host build skew is
   handled by the `protocolVersion` handshake (§5). *"Separate repo" was a proxy for
   "clean standalone installable" — we keep the installable, drop the separate source.
-  Revisit only if the bridge needs independent/public distribution (see §11).*
+  Revisit only if the bridge needs independent/public distribution (see §12).*
 - **`[decided]` D7 — Dev mode (unrestricted command tunnel).** A single `--dev` flag
   (off by default, **same bridge token** — no separate credential) turns the bus into
   an unrestricted `exec`/`shell`/`tailLog`/`writeFile` tunnel for that host, so
@@ -297,12 +297,49 @@ Not worth it.
 improves the app today — landing `resolveDisplay` to retire
 `threadAbbr`/`REPO_EMOJIS`/hand-baked emoji is a standalone win.
 
-## 10. Preserve (regression tests)
+## 10. Rollout & session continuity
+
+Built incrementally so daily use is never disrupted. The work runs on a feature branch
+in a **separate git worktree** (`git worktree add ../seam-bridge-dev …`) — production
+keeps serving `main` from `dist/`, untouched, until each PR is verified and merged.
+Each PR is one restart, deployed in a quiet window.
+
+**Per-stage rollback (rule).** Every completion stage **outputs its rollback command**
+on deploy — pre-staged, not improvised: capture the prior-good SHA *before* merging,
+and record `git checkout <prev-good-sha> && npm run redeploy` alongside the deploy.
+(Proven 2026-06-05: a revert+redeploy during the auth scare took ~1 min.) Keep PRs
+small so each rollback is clean and single-step.
+
+**The only disruption you feel:** a redeploy restart kills an *in-flight* turn — resend
+that one message. Everything else survives: thread→session mapping (`seam.db`),
+history, and **auto-resume on the next message**. `/seam sessions` re-attach is the
+*safety net* for a rare wedged thread, not a routine step.
+
+**Two hard rules → no history loss / no forced re-attach:**
+1. **PR1 preserves on-disk session formats + the `seam.db` schema** (Claude JSONL stays
+   JSONL, Copilot SQLite stays as-is) — existing threads stay readable.
+2. **PR4's `agentId@location` binding is an *additive* migration** — a nullable column
+   defaulting to `local`; existing threads are implicitly `@local`, untouched.
+
+**Per-PR user impact:**
+| PR | User-facing change | Risk |
+|---|---|---|
+| PR0 delete dead remote code | none (already unused) | ~zero |
+| PR1 adapters (in-place) | none — identical behavior | low — verify all 4 agents |
+| PR2 monorepo restructure | none — build-only | low |
+| PR3 the bridge | additive (new capability) | isolated (opt-in) |
+| PR4 location binding | additive + opt-in | isolated |
+
+**Opt-in coexistence (the big de-risker):** the bridge is additive — until you pair a
+bridge and bind a thread to `@<bridge>`, nothing about local workflow changes. Old and
+new paths run side by side; you move threads over one at a time, on your schedule.
+
+## 11. Preserve (regression tests)
 Instance-id eviction · SIGUSR2 drain · `listSlots` recovery · queued-stdin-on-
 reconnect · ACP-transparency of model/effort/caps/thinking. Pin these as conformance
 tests in `seam-bridge`.
 
-## 11. Deferred (settle when building the relevant piece — none block starting)
+## 12. Deferred (settle when building the relevant piece — none block starting)
 - `[deferred]` `protocolVersion` negotiation + tolerated adapter-contract skew →
   settle when writing the handshake (§4.1 / §5), during PR3.
 - `[deferred]` Install-recipe format + provenance/pinning → settle when building
@@ -313,7 +350,7 @@ tests in `seam-bridge`.
 - `[ref]` Display / short-name standard (host emoji, cwd names) is specced separately:
   [display-naming-plan.md](./display-naming-plan.md).
 
-## 12. Related
+## 13. Related
 - Current implementation: `src/agents/profiles/remote.ts`,
   `scripts/remote-agent-bridge.mjs`, consumed in `src/agents/agent-runtime.ts`.
 - The browser-automation substrate in [integrations-research.md](./integrations-research.md)

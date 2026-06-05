@@ -99,7 +99,7 @@ async function main(): Promise<void> {
   // discovered dynamically from the Ollama server at startup (no hardcoding);
   // opencode auto-discovers the same models from the endpoint. Only registered
   // when OPENCODE_ENABLED.
-  let opencodeModels: Array<{ modelId: string; name: string }> | undefined;
+  let opencodeModels: Array<{ modelId: string; name: string; contextLimit?: number }> | undefined;
   if (config.OPENCODE_ENABLED && config.OPENCODE_OLLAMA_URL) {
     opencodeModels = await fetchOllamaOpencodeModels(
       config.OPENCODE_OLLAMA_URL,

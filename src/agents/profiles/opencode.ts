@@ -1,7 +1,11 @@
 import { spawn } from "node:child_process";
+import { promises as fsp } from "node:fs";
+import path from "node:path";
 import type { AgentProfile } from "../agent-profile.js";
 
-type OpencodeModel = { modelId: string; name: string; contextLimit?: number };
+/** A discovered LM Studio model. `rawId` is the server's model id (e.g.
+ *  `google/gemma-4-26b-a4b`); `modelId` is its opencode form (`<prefix>/<rawId>`). */
+type LmStudioModel = { rawId: string; modelId: string; name: string; contextLimit?: number };
 
 /** One fetch with a 10s abort timeout. */
 async function fetchJson<T>(fetchFn: typeof fetch, url: string, init?: RequestInit): Promise<T> {
@@ -16,77 +20,122 @@ async function fetchJson<T>(fetchFn: typeof fetch, url: string, init?: RequestIn
   }
 }
 
-/**
- * Read a model's native context window from Ollama `/api/show` (GGUF metadata —
- * no need to load the model). The key is `<arch>.context_length` (e.g.
- * `gemma4.context_length`). On this server models are served at their native
- * window, so this is the effective limit; if you ever cap below native via
- * OLLAMA_CONTEXT_LENGTH, the truth shifts to /api/ps (loaded). Undefined on any
- * failure — the model just won't carry a contextLimit. */
-async function fetchContextLength(fetchFn: typeof fetch, root: string, model: string): Promise<number | undefined> {
-  try {
-    const j = await fetchJson<{ model_info?: Record<string, unknown> }>(fetchFn, `${root}/api/show`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model }),
-    });
-    const mi = j.model_info ?? {};
-    const key = Object.keys(mi).find((k) => k.endsWith(".context_length"));
-    const v = key ? mi[key] : undefined;
-    return typeof v === "number" && v > 0 ? v : undefined;
-  } catch {
-    return undefined;
-  }
+/** Display label for a model id: the part after the last `/` (drops the
+ *  publisher prefix, e.g. `google/gemma-4-26b-a4b` → `gemma-4-26b-a4b`). */
+function modelLabel(rawId: string): string {
+  return rawId.includes("/") ? rawId.slice(rawId.lastIndexOf("/") + 1) : rawId;
 }
 
 /**
- * Discover the live model list from an Ollama server's `/api/tags` and map each
- * to its opencode id (`<prefix>/<ollama-model>`, e.g. `ollama-remote/gemma4:26b`),
- * also reading each model's native context window from `/api/show` so the picker
- * carries an accurate `contextLimit` for the usage display. opencode auto-
- * discovers the same models from the endpoint, so this keeps the seam-acp picker
- * in sync with whatever is actually pulled — no hardcoded list. Returns [] if the
- * tag list can't be fetched (the agent still registers; picker empty until
- * Ollama is reachable). Each call has a 10s timeout.
+ * Discover the live model list from an LM Studio server's `/api/v0/models`
+ * (LM Studio's native REST API — unlike the OpenAI `/v1/models` it returns the
+ * served context window and capabilities in one call). Each model maps to its
+ * opencode id (`<prefix>/<rawId>`, e.g. `lmstudio-remote/google/gemma-4-26b-a4b`)
+ * and carries the served window (`loaded_context_length`, falling back to
+ * `max_context_length`) so the picker's usage display is accurate.
+ *
+ * Auth: LM Studio behind the tunnel requires a bearer token. Returns [] if the
+ * list can't be fetched (the agent still registers; picker empty until LM Studio
+ * is reachable). 10s timeout.
  */
-export async function fetchOllamaOpencodeModels(
+export async function fetchLmStudioModels(
   baseUrl: string,
+  apiKey: string | undefined,
   prefix: string,
   fetchFn: typeof fetch = fetch,
-): Promise<OpencodeModel[]> {
+): Promise<LmStudioModel[]> {
   const root = baseUrl.replace(/\/+$/, "");
-  let body: { models?: Array<{ name?: string }> };
+  const headers: Record<string, string> = apiKey ? { authorization: `Bearer ${apiKey}` } : {};
+  let body: { data?: Array<{ id?: string; max_context_length?: number; loaded_context_length?: number }> };
   try {
-    body = await fetchJson(fetchFn, `${root}/api/tags`);
+    body = await fetchJson(fetchFn, `${root}/api/v0/models`, { headers });
   } catch {
     return [];
   }
-  const names = (body.models ?? [])
-    .map((m) => m.name)
-    .filter((n): n is string => typeof n === "string" && n.length > 0)
-    .sort();
+  const out: LmStudioModel[] = [];
+  for (const m of body.data ?? []) {
+    if (typeof m.id !== "string" || m.id.length === 0) continue;
+    const loaded = m.loaded_context_length;
+    const max = m.max_context_length;
+    const contextLimit =
+      typeof loaded === "number" && loaded > 0 ? loaded :
+      typeof max === "number" && max > 0 ? max : undefined;
+    out.push({
+      rawId: m.id,
+      modelId: `${prefix}/${m.id}`,
+      name: `${modelLabel(m.id)} 🦙`,
+      ...(contextLimit ? { contextLimit } : {}),
+    });
+  }
+  return out.sort((a, b) => a.modelId.localeCompare(b.modelId));
+}
 
-  return Promise.all(
-    names.map(async (n): Promise<OpencodeModel> => {
-      const contextLimit = await fetchContextLength(fetchFn, root, n);
-      return { modelId: `${prefix}/${n}`, name: `${n} 🦙`, ...(contextLimit ? { contextLimit } : {}) };
-    }),
-  );
+/**
+ * Write the custom LM Studio provider block into opencode's global config
+ * (`~/.config/opencode/opencode.json`) from the discovered model list.
+ *
+ * Why seam-acp owns this: opencode 1.15.x does NOT auto-discover models for a
+ * custom `@ai-sdk/openai-compatible` provider — they must be declared, or
+ * `set_model` fails with "Model not found". (The provider name must also avoid
+ * colliding with a models.dev built-in like `lmstudio`, hence `lmstudio-remote`.)
+ * So we keep the declared `models` block in sync with what LM Studio actually
+ * serves — fully dynamic, no hardcoding, no drift from the seam-acp picker.
+ *
+ * The apiKey is written literally (sourced from seam-acp's `.env`, so `.env`
+ * stays the single source of truth — seam-acp just propagates it into opencode's
+ * own config, which is a local, non-repo file). opencode's `{env:VAR}`
+ * interpolation would avoid the second copy, but the literal value is the
+ * configuration verified end-to-end, so we use it for determinism. Other
+ * providers in the file are preserved. No-op when `models` is empty, so a
+ * transient discovery failure never wipes a good config.
+ */
+export async function syncOpencodeLmStudioConfig(opts: {
+  configPath: string;
+  providerKey: string;
+  baseURL: string;
+  apiKey?: string;
+  models: ReadonlyArray<{ rawId: string }>;
+}): Promise<void> {
+  if (opts.models.length === 0) return;
+  let cfg: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(await fsp.readFile(opts.configPath, "utf8"));
+    if (parsed && typeof parsed === "object") cfg = parsed as Record<string, unknown>;
+  } catch {
+    /* missing/invalid → start fresh */
+  }
+  if (!cfg.$schema) cfg.$schema = "https://opencode.ai/config.json";
+  const providers = (cfg.provider && typeof cfg.provider === "object" ? cfg.provider : {}) as Record<string, unknown>;
+  const modelsBlock: Record<string, { name: string }> = {};
+  for (const m of opts.models) modelsBlock[m.rawId] = { name: modelLabel(m.rawId) };
+  providers[opts.providerKey] = {
+    npm: "@ai-sdk/openai-compatible",
+    name: "LM Studio Remote",
+    options: { baseURL: opts.baseURL, ...(opts.apiKey ? { apiKey: opts.apiKey } : {}) },
+    models: modelsBlock,
+  };
+  cfg.provider = providers;
+  await fsp.mkdir(path.dirname(opts.configPath), { recursive: true });
+  await fsp.writeFile(opts.configPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 }
 
 /**
  * opencode (sst/opencode) as an ACP server (`opencode acp`).
  *
- * opencode is a provider-agnostic coding agent. Pointed at a local/remote Ollama
- * via its own config (`~/.config/opencode/opencode.json` — a custom
- * `@ai-sdk/openai-compatible` provider with the Ollama `/v1` baseURL), it drives
- * local models **natively over ACP** with no Anthropic translation proxy. Verified
- * end-to-end: clean ACP handshake (initialize → session/new → set_model →
- * session/prompt) and a real turn against `gemma4` through the tunnel.
+ * opencode is a provider-agnostic coding agent. Pointed at a local/remote
+ * LM Studio via its own config (`~/.config/opencode/opencode.json` — a custom
+ * `@ai-sdk/openai-compatible` provider with the LM Studio `/v1` baseURL +
+ * bearer token), it drives local models **natively over ACP** with no Anthropic
+ * translation proxy. The provider's `models` block is kept in sync with LM
+ * Studio's live `/api/v0/models` by `syncOpencodeLmStudioConfig` (opencode does
+ * not auto-discover custom providers). Verified end-to-end: clean ACP handshake
+ * (initialize → session/new → set_model → session/prompt) and a real turn
+ * against `gemma-4-26b-a4b` (a vision-capable MLX model) through the tunnel.
  *
- * Models are referenced by their opencode id (e.g. `ollama-remote/gemma4:26b`).
- * Those ids carry `/` and `:`, so the picker list is provided as `staticModels`
- * (set in code) rather than the colon-delimited MODELS env format.
+ * Models are referenced by their opencode id (e.g.
+ * `lmstudio-remote/google/gemma-4-26b-a4b`). Those ids carry `/`, so the picker
+ * list is provided as `staticModels` (set in code) rather than the
+ * colon-delimited MODELS env format.
  *
  * Minimal by design: opencode owns its own session storage, so this profile
  * doesn't implement the optional `sessionManager` (the `/seam sessions` family is

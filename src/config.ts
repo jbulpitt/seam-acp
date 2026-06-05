@@ -229,11 +229,12 @@ const Schema = z.object({
   AGY_MODELS: ModelsListSchema,
 
   /**
-   * Register the "Ollama 🦙" agent: opencode (sst/opencode, `opencode acp`) — a
-   * provider-agnostic ACP agent pointed at a local/remote Ollama via opencode's
-   * own config (~/.config/opencode/opencode.json: an @ai-sdk/openai-compatible
-   * provider with the Ollama /v1 baseURL). ACP-native + Ollama-native, no
-   * Anthropic translation proxy. false → not registered.
+   * Register the "LM Studio 🦙" agent: opencode (sst/opencode, `opencode acp`) —
+   * a provider-agnostic ACP agent pointed at a local/remote LM Studio via
+   * opencode's own config (~/.config/opencode/opencode.json: an
+   * @ai-sdk/openai-compatible provider with the LM Studio /v1 baseURL + bearer
+   * token). ACP-native + local-model-native, no Anthropic translation proxy.
+   * false → not registered.
    */
   OPENCODE_ENABLED: z
     .enum(["true", "false"])
@@ -241,15 +242,25 @@ const Schema = z.object({
     .transform((v) => v === "true"),
   /** Path to the opencode binary. Defaults to `opencode` on PATH. */
   OPENCODE_CLI_PATH: z.string().optional(),
-  /** Default opencode model id (opencode form, e.g. "ollama-remote/gemma4:26b"). */
-  OPENCODE_DEFAULT_MODEL: z.string().default("ollama-remote/gemma4:26b"),
-  /** Root URL of the Ollama server, used to DISCOVER the model list dynamically
-   *  (`/api/tags`) at startup so the picker isn't hardcoded. Unset → no discovery
-   *  (only the default model is usable). e.g. "https://ollama.jessebulpitt.com". */
-  OPENCODE_OLLAMA_URL: z.string().optional(),
-  /** opencode provider name (the key under `provider` in opencode's config) that
-   *  the discovered Ollama models are prefixed with. */
-  OPENCODE_MODEL_PREFIX: z.string().default("ollama-remote"),
+  /** Default opencode model id (opencode form, e.g.
+   *  "lmstudio-remote/google/gemma-4-26b-a4b"). */
+  OPENCODE_DEFAULT_MODEL: z.string().default("lmstudio-remote/google/gemma-4-26b-a4b"),
+  /** Root URL of the LM Studio server. Used both to DISCOVER the live model list
+   *  (`/api/v0/models`) at startup — so the picker isn't hardcoded — and as the
+   *  opencode provider baseURL (`<url>/v1`). Unset → no discovery / sync (only the
+   *  default model is usable). e.g. "https://llm.jessebulpitt.com". */
+  OPENCODE_LMSTUDIO_URL: z.string().optional(),
+  /** Bearer token for the LM Studio endpoint (it requires auth behind the
+   *  tunnel). Used for discovery and written into the opencode provider config. */
+  OPENCODE_LMSTUDIO_API_KEY: z.string().default(""),
+  /** opencode provider name — the key under `provider` in opencode's config, and
+   *  the prefix on each discovered model id. Must NOT collide with a models.dev
+   *  built-in provider (e.g. `lmstudio`), or opencode uses that curated list
+   *  instead of the live one — hence `lmstudio-remote`. */
+  OPENCODE_MODEL_PREFIX: z.string().default("lmstudio-remote"),
+  /** Path to opencode's global config that seam-acp keeps the provider block in
+   *  sync in. Defaults to `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.json`. */
+  OPENCODE_CONFIG_PATH: z.string().optional(),
 
   /**
    * Comma-separated list of remote Copilot profiles. Each entry registers an

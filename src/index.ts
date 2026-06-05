@@ -7,7 +7,7 @@ import { SessionRouter } from "./core/session-router.js";
 import { makeCopilotProfile } from "./agents/profiles/copilot.js";
 import { makeClaudeProfile } from "./agents/profiles/claude.js";
 import { makeAgyProfile } from "./agents/profiles/agy.js";
-import { makeOpencodeProfile, fetchOllamaOpencodeModels } from "./agents/profiles/opencode.js";
+import { makeOpencodeProfile, fetchLmStudioModels, syncOpencodeLmStudioConfig } from "./agents/profiles/opencode.js";
 import { makeRemoteCopilotServerProfile, makeRemoteCopilotClientProfile } from "./agents/profiles/remote.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
@@ -93,27 +93,50 @@ async function main(): Promise<void> {
     printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
   });
 
-  // Optional "Ollama 🦙" agent: opencode (sst/opencode) over ACP, pointed at a
-  // local/remote Ollama via opencode's own config. Provider-agnostic, so it
-  // drives local models natively — no Anthropic proxy. The picker model list is
-  // discovered dynamically from the Ollama server at startup (no hardcoding);
-  // opencode auto-discovers the same models from the endpoint. Only registered
-  // when OPENCODE_ENABLED.
+  // Optional "LM Studio 🦙" agent: opencode (sst/opencode) over ACP, pointed at a
+  // local/remote LM Studio via opencode's own config. Provider-agnostic, so it
+  // drives local models natively — no Anthropic proxy. The model list is
+  // discovered live from LM Studio's /api/v0/models at startup (no hardcoding),
+  // and seam-acp writes the matching `models` block into opencode's config —
+  // opencode does NOT auto-discover custom providers, so the declared list must
+  // track what the server serves. Only registered when OPENCODE_ENABLED.
   let opencodeModels: Array<{ modelId: string; name: string; contextLimit?: number }> | undefined;
-  if (config.OPENCODE_ENABLED && config.OPENCODE_OLLAMA_URL) {
-    opencodeModels = await fetchOllamaOpencodeModels(
-      config.OPENCODE_OLLAMA_URL,
+  if (config.OPENCODE_ENABLED && config.OPENCODE_LMSTUDIO_URL) {
+    const discovered = await fetchLmStudioModels(
+      config.OPENCODE_LMSTUDIO_URL,
+      config.OPENCODE_LMSTUDIO_API_KEY || undefined,
       config.OPENCODE_MODEL_PREFIX,
     ).catch((err) => {
-      logger.warn({ err }, "opencode: Ollama model discovery failed; picker empty until reachable");
+      logger.warn({ err }, "opencode: LM Studio model discovery failed; picker empty until reachable");
       return [];
     });
-    logger.info({ count: opencodeModels.length }, "opencode: discovered Ollama models");
+    if (discovered.length > 0) {
+      const opencodeConfigPath =
+        config.OPENCODE_CONFIG_PATH ||
+        path.join(
+          process.env.XDG_CONFIG_HOME || path.join(process.env.HOME ?? "", ".config"),
+          "opencode",
+          "opencode.json",
+        );
+      await syncOpencodeLmStudioConfig({
+        configPath: opencodeConfigPath,
+        providerKey: config.OPENCODE_MODEL_PREFIX,
+        baseURL: config.OPENCODE_LMSTUDIO_URL.replace(/\/+$/, "") + "/v1",
+        ...(config.OPENCODE_LMSTUDIO_API_KEY ? { apiKey: config.OPENCODE_LMSTUDIO_API_KEY } : {}),
+        models: discovered.map((m) => ({ rawId: m.rawId })),
+      }).catch((err) => logger.warn({ err }, "opencode: config sync failed"));
+      opencodeModels = discovered.map(({ modelId, name, contextLimit }) => ({
+        modelId,
+        name,
+        ...(contextLimit ? { contextLimit } : {}),
+      }));
+    }
+    logger.info({ count: discovered.length }, "opencode: discovered LM Studio models");
   }
   const ollama = config.OPENCODE_ENABLED
     ? makeOpencodeProfile({
         id: "opencode",
-        displayName: "Ollama 🦙",
+        displayName: "LM Studio 🦙",
         threadAbbr: "🦙",
         ...(config.OPENCODE_CLI_PATH ? { cliPath: config.OPENCODE_CLI_PATH } : {}),
         defaultModel: config.OPENCODE_DEFAULT_MODEL,

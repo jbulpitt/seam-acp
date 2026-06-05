@@ -26,3 +26,7 @@ oci-context.md
 # Local research artifacts
 streaming-markdown-research.md
 coverage/
+
+# Runtime cache (path→id map) and throwaway debug/probe scripts
+cache/
+scratch/

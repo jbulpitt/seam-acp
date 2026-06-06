@@ -206,6 +206,27 @@ function findCleanSplit(
   return null;
 }
 
+/** Find the first COMPLETE "---" separator — a line that is EXACTLY three
+ *  hyphens (optionally padded with spaces/tabs) AND terminated by a newline.
+ *  Exactly three (not `-{3,}`) so a longer run like "----------" or a setext
+ *  underline is left alone — the marker is literally "---" by itself. Requiring
+ *  the trailing newline means a half-streamed "--" or a "--- heading" never
+ *  triggers a cut, and table separator rows (which contain `|`) are excluded by
+ *  construction. Fenced code never reaches this buffer (FenceStream strips it
+ *  upstream — only `prose` segments are appended), and inline-code `---` spans
+ *  are skipped below. Returns the slice bounds to DROP: `from` = the rule line's
+ *  start (its preceding newline, if any), `to` = just past its trailing newline. */
+function findThematicBreakCut(buf: string): { from: number; to: number } | null {
+  const re = /(^|\n)[ \t]*-{3}[ \t]*\n/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(buf)) !== null) {
+    const lineStart = m.index + (m[1] ? m[1].length : 0);
+    if (isInsideInlineCode(buf, lineStart)) continue;
+    return { from: m.index, to: m.index + m[0].length };
+  }
+  return null;
+}
+
 export function splitForFlush(
   buffer: string,
   opts: SplitOptions
@@ -214,6 +235,28 @@ export function splitForFlush(
   const { maxLen, force } = opts;
   const softMin = opts.softMin ?? 1;
   const allowUnsafeCut = opts.allowUnsafeCut ?? false;
+
+  // Honor an explicit markdown thematic break ("---" on its own line) as a hard
+  // message boundary — the user's "start a new message here" marker — in BOTH
+  // the soft and forced paths, regardless of size. Drop the rule itself (the
+  // message split replaces it). Only act when the content before the rule fits
+  // one message; if it's over cap, let the length logic below chunk it first
+  // and the rule is honored on a later drain.
+  const rule = findThematicBreakCut(buffer);
+  if (rule) {
+    const before = buffer.slice(0, rule.from).replace(/\s+$/, "");
+    const after = buffer.slice(rule.to);
+    if (!before) {
+      // Leading rule (nothing before it) — drop it, continue on the remainder.
+      return splitForFlush(after, opts);
+    }
+    if (before.length <= maxLen) {
+      const u = allowUnsafeCut ? -1 : findFirstUnsafeIndex(buffer);
+      // Don't cut if an open link/image construct starts before the rule.
+      if (u === -1 || rule.from <= u) return { send: before, keep: after };
+    }
+    // before is over cap (or the rule sits past an open link) — fall through.
+  }
   // Fences are handled separately upstream by FenceStream, so the prose buffer
   // never contains unclosed code blocks. We only check link-safety.
   const unsafeIdx = !allowUnsafeCut ? findFirstUnsafeIndex(buffer) : -1;

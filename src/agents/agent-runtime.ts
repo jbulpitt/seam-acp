@@ -306,11 +306,12 @@ export class AgentRuntime {
 
     // Apply model override after session creation if requested and supported.
     const wantedModel = opts.model ?? this.profile.defaultModel;
-    if (
-      wantedModel &&
-      this.sessionInfo.currentModelId &&
-      wantedModel !== this.sessionInfo.currentModelId
-    ) {
+    // Do NOT require `currentModelId` here: opencode's session/new (and loadSession)
+    // returns no `models`, so currentModelId is undefined — gating on it skipped
+    // set_model entirely and left opencode on its built-in default (`big-pickle`,
+    // no vision). `wantedModel !== undefined` is true, so we (re)apply; if it
+    // already matches the reported current model we still skip the redundant call.
+    if (wantedModel && wantedModel !== this.sessionInfo.currentModelId) {
       const isExplicit = opts.model !== undefined;
       const isAvailable = this.sessionInfo.availableModels.some((m) => m.modelId === wantedModel);
       if (isExplicit || isAvailable) {
@@ -361,11 +362,12 @@ export class AgentRuntime {
     // to whatever is in settings.json (typically the default model, not the
     // per-session override the user selected).
     const wantedModel = opts.model ?? this.profile.defaultModel;
-    if (
-      wantedModel &&
-      this.sessionInfo.currentModelId &&
-      wantedModel !== this.sessionInfo.currentModelId
-    ) {
+    // Do NOT require `currentModelId` here: opencode's session/new (and loadSession)
+    // returns no `models`, so currentModelId is undefined — gating on it skipped
+    // set_model entirely and left opencode on its built-in default (`big-pickle`,
+    // no vision). `wantedModel !== undefined` is true, so we (re)apply; if it
+    // already matches the reported current model we still skip the redundant call.
+    if (wantedModel && wantedModel !== this.sessionInfo.currentModelId) {
       const isExplicit = opts.model !== undefined;
       const isAvailable = this.sessionInfo.availableModels.some((m) => m.modelId === wantedModel);
       if (isExplicit || isAvailable) {

@@ -133,6 +133,9 @@ export async function syncOpencodeLmStudioConfig(opts: {
    *  non-vision model. Setting a real loaded model as the default removes that
    *  fallback entirely. */
   defaultModel?: string;
+  /** opencode `mcp` entries to merge in (name → server config), e.g. a web-search
+   *  MCP. Merged into any existing `cfg.mcp`, preserving other entries. */
+  mcp?: Record<string, unknown>;
   models: ReadonlyArray<{ rawId: string; attachment?: boolean; toolCall?: boolean; reasoning?: boolean }>;
 }): Promise<void> {
   if (opts.models.length === 0) return;
@@ -172,6 +175,10 @@ export async function syncOpencodeLmStudioConfig(opts: {
   };
   cfg.provider = providers;
   if (opts.defaultModel) cfg.model = opts.defaultModel;
+  if (opts.mcp && Object.keys(opts.mcp).length > 0) {
+    const existingMcp = (cfg.mcp && typeof cfg.mcp === "object" ? cfg.mcp : {}) as Record<string, unknown>;
+    cfg.mcp = { ...existingMcp, ...opts.mcp };
+  }
   await fsp.mkdir(path.dirname(opts.configPath), { recursive: true });
   await fsp.writeFile(opts.configPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 }

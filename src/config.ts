@@ -261,6 +261,13 @@ const Schema = z.object({
   /** Path to opencode's global config that seam-acp keeps the provider block in
    *  sync in. Defaults to `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.json`. */
   OPENCODE_CONFIG_PATH: z.string().optional(),
+  /** Add a free, no-API-key DuckDuckGo web-search MCP (`@oevortex/ddg_search`, run
+   *  via `npx -y`) to the opencode agent's config, so local models get a search tool
+   *  (opencode ships `webfetch` but no search). false → not added. */
+  OPENCODE_DDG_SEARCH: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
 
   /**
    * Comma-separated list of remote Copilot profiles. Each entry registers an

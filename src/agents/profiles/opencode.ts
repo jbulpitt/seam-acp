@@ -126,6 +126,13 @@ export async function syncOpencodeLmStudioConfig(opts: {
   providerKey: string;
   baseURL: string;
   apiKey?: string;
+  /** Full opencode model id (e.g. "lmstudio-remote/google/gemma-4-26b-a4b-qat")
+   *  written as the config's top-level `model`. CRITICAL: without it opencode falls
+   *  back to its built-in default model (`big-pickle`, which has no vision) whenever
+   *  a per-session set_model doesn't stick — so images silently went to the wrong,
+   *  non-vision model. Setting a real loaded model as the default removes that
+   *  fallback entirely. */
+  defaultModel?: string;
   models: ReadonlyArray<{ rawId: string; attachment?: boolean; toolCall?: boolean; reasoning?: boolean }>;
 }): Promise<void> {
   if (opts.models.length === 0) return;
@@ -164,6 +171,7 @@ export async function syncOpencodeLmStudioConfig(opts: {
     models: modelsBlock,
   };
   cfg.provider = providers;
+  if (opts.defaultModel) cfg.model = opts.defaultModel;
   await fsp.mkdir(path.dirname(opts.configPath), { recursive: true });
   await fsp.writeFile(opts.configPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 }

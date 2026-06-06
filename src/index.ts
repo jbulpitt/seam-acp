@@ -101,6 +101,7 @@ async function main(): Promise<void> {
   // opencode does NOT auto-discover custom providers, so the declared list must
   // track what the server serves. Only registered when OPENCODE_ENABLED.
   let opencodeModels: Array<{ modelId: string; name: string; contextLimit?: number }> | undefined;
+  let opencodeDefaultModel = config.OPENCODE_DEFAULT_MODEL;
   if (config.OPENCODE_ENABLED && config.OPENCODE_LMSTUDIO_URL) {
     const discovered = await fetchLmStudioModels(
       config.OPENCODE_LMSTUDIO_URL,
@@ -118,11 +119,18 @@ async function main(): Promise<void> {
           "opencode",
           "opencode.json",
         );
+      // Pick a real, loaded default so opencode never falls back to its built-in
+      // `big-pickle` (no vision): the configured default if it's actually loaded,
+      // else the first discovered model.
+      opencodeDefaultModel =
+        discovered.find((m) => m.modelId === config.OPENCODE_DEFAULT_MODEL)?.modelId ??
+        discovered[0]!.modelId;
       await syncOpencodeLmStudioConfig({
         configPath: opencodeConfigPath,
         providerKey: config.OPENCODE_MODEL_PREFIX,
         baseURL: config.OPENCODE_LMSTUDIO_URL.replace(/\/+$/, "") + "/v1",
         ...(config.OPENCODE_LMSTUDIO_API_KEY ? { apiKey: config.OPENCODE_LMSTUDIO_API_KEY } : {}),
+        defaultModel: opencodeDefaultModel,
         models: discovered.map((m) => ({
           rawId: m.rawId,
           ...(m.attachment ? { attachment: true } : {}),
@@ -144,7 +152,7 @@ async function main(): Promise<void> {
         displayName: "LM Studio 🦙",
         threadAbbr: "🦙",
         ...(config.OPENCODE_CLI_PATH ? { cliPath: config.OPENCODE_CLI_PATH } : {}),
-        defaultModel: config.OPENCODE_DEFAULT_MODEL,
+        defaultModel: opencodeDefaultModel,
         ...(opencodeModels && opencodeModels.length > 0 ? { staticModels: opencodeModels } : {}),
       })
     : undefined;

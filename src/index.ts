@@ -165,8 +165,8 @@ async function main(): Promise<void> {
   const ollama = config.OPENCODE_ENABLED
     ? makeOpencodeProfile({
         id: "opencode",
-        displayName: "LM Studio 🦙",
-        threadAbbr: "🦙",
+        displayName: "LM Studio 🔮",
+        threadAbbr: "🔮",
         ...(config.OPENCODE_CLI_PATH ? { cliPath: config.OPENCODE_CLI_PATH } : {}),
         defaultModel: opencodeDefaultModel,
         ...(opencodeModels && opencodeModels.length > 0 ? { staticModels: opencodeModels } : {}),

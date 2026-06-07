@@ -268,6 +268,10 @@ const Schema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
+  /** Tavily hosted MCP URL (the API key is a query param) for web search. When set,
+   *  seam-acp adds it to opencode's `mcp` block so the agent gets Tavily's
+   *  LLM-optimized search tools. e.g. `https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-…` */
+  OPENCODE_TAVILY_URL: z.string().optional(),
 
   /**
    * Comma-separated list of remote Copilot profiles. Each entry registers an

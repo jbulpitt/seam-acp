@@ -133,9 +133,12 @@ export async function syncOpencodeLmStudioConfig(opts: {
    *  non-vision model. Setting a real loaded model as the default removes that
    *  fallback entirely. */
   defaultModel?: string;
-  /** opencode `mcp` entries to merge in (name → server config), e.g. a web-search
-   *  MCP. Merged into any existing `cfg.mcp`, preserving other entries. */
+  /** opencode `mcp` entries seam-acp manages (name → server config), e.g. a web-search
+   *  MCP. Added to `cfg.mcp`. */
   mcp?: Record<string, unknown>;
+  /** Keys seam-acp owns in `cfg.mcp` — cleared before re-adding `mcp` each sync, so
+   *  disabling a source actually removes it. User-added entries (not listed) survive. */
+  mcpManagedKeys?: ReadonlyArray<string>;
   models: ReadonlyArray<{ rawId: string; attachment?: boolean; toolCall?: boolean; reasoning?: boolean }>;
 }): Promise<void> {
   if (opts.models.length === 0) return;
@@ -175,9 +178,12 @@ export async function syncOpencodeLmStudioConfig(opts: {
   };
   cfg.provider = providers;
   if (opts.defaultModel) cfg.model = opts.defaultModel;
-  if (opts.mcp && Object.keys(opts.mcp).length > 0) {
+  if (opts.mcpManagedKeys && opts.mcpManagedKeys.length > 0) {
     const existingMcp = (cfg.mcp && typeof cfg.mcp === "object" ? cfg.mcp : {}) as Record<string, unknown>;
-    cfg.mcp = { ...existingMcp, ...opts.mcp };
+    for (const k of opts.mcpManagedKeys) delete existingMcp[k];          // reconcile: drop seam-managed
+    const next = { ...existingMcp, ...(opts.mcp ?? {}) };                // re-add currently-enabled
+    if (Object.keys(next).length > 0) cfg.mcp = next;
+    else delete (cfg as Record<string, unknown>).mcp;
   }
   await fsp.mkdir(path.dirname(opts.configPath), { recursive: true });
   await fsp.writeFile(opts.configPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");

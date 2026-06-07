@@ -125,23 +125,28 @@ async function main(): Promise<void> {
       opencodeDefaultModel =
         discovered.find((m) => m.modelId === config.OPENCODE_DEFAULT_MODEL)?.modelId ??
         discovered[0]!.modelId;
-      const opencodeMcp = config.OPENCODE_DDG_SEARCH
-        ? {
-            "ddg-search": {
-              type: "local",
-              command: ["npx", "-y", "@oevortex/ddg_search"],
-              enabled: true,
-              timeout: 20000,
-            },
-          }
-        : undefined;
+      // Web-search MCP(s) for the agent. seam-acp manages these keys, reconciling on
+      // each sync (disabling a source removes its entry).
+      const opencodeMcp: Record<string, unknown> = {};
+      if (config.OPENCODE_DDG_SEARCH) {
+        opencodeMcp["ddg-search"] = {
+          type: "local",
+          command: ["npx", "-y", "@oevortex/ddg_search"],
+          enabled: true,
+          timeout: 20000,
+        };
+      }
+      if (config.OPENCODE_TAVILY_URL) {
+        opencodeMcp["tavily"] = { type: "remote", url: config.OPENCODE_TAVILY_URL, enabled: true };
+      }
       await syncOpencodeLmStudioConfig({
         configPath: opencodeConfigPath,
         providerKey: config.OPENCODE_MODEL_PREFIX,
         baseURL: config.OPENCODE_LMSTUDIO_URL.replace(/\/+$/, "") + "/v1",
         ...(config.OPENCODE_LMSTUDIO_API_KEY ? { apiKey: config.OPENCODE_LMSTUDIO_API_KEY } : {}),
         defaultModel: opencodeDefaultModel,
-        ...(opencodeMcp ? { mcp: opencodeMcp } : {}),
+        mcp: opencodeMcp,
+        mcpManagedKeys: ["ddg-search", "tavily"],
         models: discovered.map((m) => ({
           rawId: m.rawId,
           ...(m.attachment ? { attachment: true } : {}),

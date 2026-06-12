@@ -47,10 +47,24 @@ const Schema = z.object({
       }
       return ids.length > 0 ? new Set(ids) : undefined;
     }),
+  /**
+   * Optional comma-separated list of guild (server) IDs to register the `/seam`
+   * slash commands to. Guild-scoped registration is INSTANT (vs ~1h for global),
+   * so list every server you want the command menu in and we register to each.
+   * Empty/unset → register GLOBALLY (appears in every server the bot is in, with
+   * ~1h propagation). A single id still works (backward compatible). The name is
+   * kept for compatibility even though it now accepts multiple ids.
+   */
   DISCORD_DEV_GUILD_ID: z
     .string()
-    .regex(/^\d+$/)
-    .optional(),
+    .default("")
+    .transform((v) => {
+      const ids = v.split(",").map((s) => s.trim()).filter(Boolean);
+      if (ids.some((id) => !/^\d+$/.test(id))) {
+        throw new Error("DISCORD_DEV_GUILD_ID must be comma-separated numeric Discord guild IDs");
+      }
+      return ids;
+    }),
 
   REPOS_ROOT: z.string().min(1, "REPOS_ROOT is required"),
   DATA_DIR: z.string().default("./data"),

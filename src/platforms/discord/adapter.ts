@@ -742,18 +742,18 @@ export class DiscordAdapter implements ChatAdapter {
       this.config.DISCORD_BOT_TOKEN
     );
     const body = [buildSeamCommand().toJSON()];
-    if (this.config.DISCORD_DEV_GUILD_ID) {
-      await rest.put(
-        Routes.applicationGuildCommands(
-          appId,
-          this.config.DISCORD_DEV_GUILD_ID
-        ),
-        { body }
-      );
-      this.logger.info(
-        { guildId: this.config.DISCORD_DEV_GUILD_ID },
-        "registered guild slash commands"
-      );
+    const guildIds = this.config.DISCORD_DEV_GUILD_ID;
+    if (guildIds.length > 0) {
+      // Register to each listed guild — instant, and scoped to servers we
+      // explicitly opt in (vs global, which exposes /seam in every server the
+      // bot is in and takes ~1h to propagate).
+      for (const guildId of guildIds) {
+        await rest.put(
+          Routes.applicationGuildCommands(appId, guildId),
+          { body }
+        );
+        this.logger.info({ guildId }, "registered guild slash commands");
+      }
     } else {
       await rest.put(Routes.applicationCommands(appId), { body });
       this.logger.info("registered global slash commands");

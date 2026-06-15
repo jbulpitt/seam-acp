@@ -4800,10 +4800,22 @@ export class Orchestrator {
     const requested = i.options.getString("path", true);
     await i.deferReply({ flags: MessageFlags.Ephemeral });
 
-    const resolved = await this.resolveAllowedHostFile(requested);
+    // Resolve a relative path against THIS thread's current project (repoPath)
+    // first, then the allowed roots. Without passing preferredRoot, `/seam
+    // attach src/foo.ts` only tried REPOS_ROOT/ATTACH_ROOTS and never the active
+    // repo — so project-relative paths failed.
+    const record = this.router.ensureSessionRecord({
+      platform: channel.platform,
+      channelRef: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+    const resolved = await this.resolveAllowedHostFile(requested, {
+      preferredRoot: record.repoPath ?? null,
+    });
     if (!resolved) {
       await i.editReply(
-        `Could not attach \`${requested}\` — file not found, not a regular file, or outside REPOS_ROOT / ATTACH_ROOTS.`
+        `Could not attach \`${requested}\` — file not found (relative to the thread's repo or an allowed root), not a regular file, or outside REPOS_ROOT / ATTACH_ROOTS.`
       );
       return;
     }

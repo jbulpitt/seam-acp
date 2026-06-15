@@ -71,6 +71,7 @@ import type { SessionStore } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
+import { ATTACH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
 import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
@@ -821,7 +822,10 @@ export class Orchestrator {
       // the LLM. Instead, download the bytes server-side and stream them to
       // the agent's filesystem via the bridge's `writeAttachment` cmd. The
       // model gets a local path in the prompt; attachments are stripped.
-      let promptText = msg.text;
+      // Prepend the standing agent conventions (attach-fence, table rendering)
+      // as a provenance-tagged preamble so every backend knows the operating
+      // rules without depending on a per-backend system-prompt path.
+      let promptText = withHarnessPreamble(msg.text);
       let promptAttachments = msg.attachments;
       const activeProfile = this.router.getProfile(record.agentId);
       if (
@@ -5058,23 +5062,23 @@ export class Orchestrator {
     counter: number,
     opts: { notice?: string; preferredRoot?: string | null } = {}
   ): Promise<void> {
+    // Explicit file-attach signal: a fence tagged `seam-attach` whose body is a
+    // workspace file path. Upload the real file (resolved against the thread's
+    // repo) and suppress the block — it's a directive, not content to render.
+    // Replaces the old existence-based "bare filename" auto-attach, which would
+    // attach ANY fenced path that happened to exist — a footgun when an agent
+    // merely references files while narrating its work.
+    if (fence.lang === ATTACH_FENCE_LANG) {
+      await this.emitAttachFence(channel, fence, opts);
+      return;
+    }
+
     // Inline-rendered total size = ```lang\n<content>\n``` plus optional
     // trailing notice on its own paragraph.
     const inlineMessageLen =
       3 + fence.lang.length + 1 + fence.content.length + 1 + 3 +
       (opts.notice ? 2 + opts.notice.length : 0);
     const fitsInline = inlineMessageLen <= ORCH_INLINE_FENCE_MAX;
-
-    // Bare-filename short-circuit (only meaningful for small content; a
-    // long fence can't be a single-line filename anyway).
-    if (fitsInline) {
-      const sentAsFile = await this.tryEmitBareFilenameFence(
-        channel,
-        fence,
-        opts
-      );
-      if (sentAsFile) return;
-    }
 
     if (fitsInline || !this.adapter.sendFile) {
       await this.emitFenceInline(channel, fence, opts);
@@ -5084,36 +5088,41 @@ export class Orchestrator {
   }
 
   /**
-   * If the fence content is a single non-empty line that resolves to a
-   * file under our allowed roots, upload that real file (with optional
-   * trailing notice) and return true. Otherwise return false.
+   * Upload a workspace file the agent requested via a `seam-attach` fence. The
+   * first non-empty line of the fence body is the path; it is resolved against
+   * the thread's repo first, then the allowed roots (the realpath within-root
+   * check blocks `..` escapes). On any failure we post a short note rather than
+   * silently rendering the directive as a raw code block.
    */
-  private async tryEmitBareFilenameFence(
+  private async emitAttachFence(
     channel: ChannelRef,
     fence: CompletedFence,
     opts: { notice?: string; preferredRoot?: string | null }
-  ): Promise<boolean> {
-    if (!this.adapter.sendFile) return false;
-    const trimmed = fence.content.trim();
-    if (trimmed.length === 0 || trimmed.includes("\n")) return false;
-    const resolved = await this.resolveAllowedHostFile(trimmed, {
+  ): Promise<void> {
+    const note = opts.notice ? `\n\n${opts.notice}` : "";
+    if (!this.adapter.sendFile) {
+      await this.adapter
+        .sendMessage(channel, `_(Agent requested a file attachment, but this platform can't upload files.)_${note}`)
+        .catch(() => {});
+      return;
+    }
+    const reqPath = (fence.content.split("\n").find((l) => l.trim()) ?? "").trim();
+    if (!reqPath) return;
+    const resolved = await this.resolveAllowedHostFile(reqPath, {
       preferredRoot: opts.preferredRoot ?? null,
     });
-    if (!resolved) return false;
-
+    if (!resolved) {
+      await this.adapter
+        .sendMessage(channel, `_(Couldn't attach \`${reqPath}\` — not found relative to the repo or an allowed root, or outside REPOS_ROOT / ATTACH_ROOTS.)_${note}`)
+        .catch(() => {});
+      return;
+    }
     const MAX = 25 * 1024 * 1024;
     if (resolved.size > MAX) {
-      try {
-        await this.adapter.sendMessage(
-          channel,
-          `_Referenced file too large to upload: \`${path.basename(resolved.realPath)}\` (${resolved.size} B, 25 MB limit)._${
-            opts.notice ? `\n\n${opts.notice}` : ""
-          }`
-        );
-      } catch (err) {
-        this.logger.warn({ err }, "bare-filename oversize notice failed");
-      }
-      return true;
+      await this.adapter
+        .sendMessage(channel, `_(Can't attach \`${path.basename(resolved.realPath)}\` — ${resolved.size} B exceeds the 25 MB limit.)_${note}`)
+        .catch(() => {});
+      return;
     }
     try {
       const data = await fsp.readFile(resolved.realPath);
@@ -5124,23 +5133,17 @@ export class Orchestrator {
         mimeType: mimeTypeForFilename(filename),
       });
       if (opts.notice) {
-        try {
-          await this.adapter.sendMessage(channel, opts.notice);
-        } catch (err) {
-          this.logger.warn({ err }, "bare-filename notice send failed");
-        }
+        await this.adapter.sendMessage(channel, opts.notice).catch(() => {});
       }
       this.logger.info(
         { realPath: resolved.realPath, bytes: data.byteLength },
-        "fence resolved to host file — uploaded actual file"
+        "seam-attach fence → uploaded workspace file"
       );
-      return true;
     } catch (err) {
-      this.logger.warn(
-        { err, realPath: resolved.realPath },
-        "fence-to-file resolution read failed; falling back to inline"
-      );
-      return false;
+      this.logger.warn({ err, realPath: resolved.realPath }, "seam-attach read/upload failed");
+      await this.adapter
+        .sendMessage(channel, `_(Failed to read \`${reqPath}\` for attachment.)_${note}`)
+        .catch(() => {});
     }
   }
 

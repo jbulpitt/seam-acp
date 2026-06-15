@@ -200,8 +200,9 @@ interface AgentAdapter {
   // identity — runs at the host
   whoami(): Identity | null
   usage(): UsageReport | null
-  // restricted-host attachment write
-  writeAttachment(cwd, filename, bytes)
+  // host-side attachment I/O (§4.2)
+  writeAttachment(cwd, filename, bytes)                          // seam-acp → host: stage a user-sent upload
+  readAttachment(cwd, path): { bytes, filename, size } | null    // host → seam-acp: ferry a `seam-attach`-requested file
 }
 ```
 
@@ -224,6 +225,24 @@ interface AgentAdapter {
 5. On disconnect → mark that bridge's agents unavailable + evict runtimes (existing
    instance-id logic). On reconnect → re-run idempotent reconcile.
 
+### 4.2 Outbound file attachment — the `seam-attach` ferry
+seam-acp ships an agent-agnostic file-attach convention: an agent emits a fenced
+block tagged `seam-attach` whose body is a workspace file path, and seam-acp
+uploads that file to the user (detected in `emitClosedFence`; the convention is
+taught via the per-turn `<seam-harness>` preamble in `agent-conventions.ts`). For
+a **local** agent the file is on the same host, so seam-acp reads it directly. For
+a **remote** agent the fenced text arrives over the bus but **the file lives on the
+bridge host** — the control plane can't read it. `readAttachment(cwd, path)` closes
+that gap: on seeing a `seam-attach` fence from a remote agent, seam-acp calls it
+over the bus; the **adapter resolves the path host-side** (project-cwd-relative
+first, then the host's workspace root; realpath within-root check blocks `..`
+escapes; honors the 25 MB attach cap) and returns the bytes, which seam-acp then
+uploads. Same convention, same detection, same UX — only the file-read relocates
+to the host (D3/D4). The teaching preamble is host-neutral, so remote agents
+already know the convention the moment they're reachable; only the ferry is new.
+Until PR3 lands, a `seam-attach` from a remote agent fails gracefully (seam-acp
+posts a "couldn't read the file from the host" note) rather than misbehaving.
+
 ## 5. Command-bus protocol (v1 draft)
 
 One persistent WebSocket per bridge (both server/client modes retained). All frames
@@ -240,7 +259,13 @@ JSON `{ v, type, … }`; `protocolVersion` negotiated in `hello`.
 | `ping` / `pong` | both | keepalive (existing) |
 
 - `rpc.method` ∈ the **adapter method allow-list** only (§4) — there is **no generic
-  shell / read-arbitrary-file primitive** (security, §6).
+  shell / read-arbitrary-file primitive** (security, §6). `readAttachment` (§4.2)
+  is **not** an exception: it is allow-listed, **scoped to the host's workspace
+  root**, and carries the same within-root + 25 MB guards as the local path — a
+  narrow attachment ferry, not a general file read.
+- `readAttachment` returns file **bytes** over the bus — base64 in the `rpc_reply`,
+  or chunked `event` frames for large files (`[research]` chunk threshold; the
+  25 MB attach cap bounds it either way).
 - Versioning: `hello` negotiates `protocolVersion`; mismatches degrade gracefully or
   refuse with a clear message. `[research]` exact negotiation rules.
 
@@ -346,7 +371,9 @@ Not worth it.
   `makeMux`/transport into the shared module; build the bridge as a lean standalone
   installable.
 - **PR3 — The bridge.** Command bus (§5) + reconciliation handshake (§4.1) + per-bridge
-  pairing (D8/§6.2) + dev mode (D7/§6.1) + `install()` (§6).
+  pairing (D8/§6.2) + dev mode (D7/§6.1) + `install()` (§6) + the `readAttachment`
+  **`seam-attach` ferry** (§4.2), so the already-shipped file-attach convention works
+  for remote agents (file on the host) and not just local ones.
 - **PR4 — Location binding.** D9 loopback + D10 flattened/host-prefixed selection +
   per-thread `agentId@location` persistence + workspace-at-host (D11/§7).
 

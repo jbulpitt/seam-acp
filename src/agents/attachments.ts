@@ -200,6 +200,28 @@ function isTextLikeMime(mime: string, filename: string): boolean {
   return TEXT_EXTENSIONS.has(ext);
 }
 
+/** MIME types the model reads directly as an image content block. Discord's
+ *  other image formats (HEIC/HEIF/TIFF/BMP/SVG) are NOT model-viewable and must
+ *  be staged to a file path instead, not sent as an (unsupported) image block. */
+const MODEL_IMAGE_MIMES = new Set([
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
+
+/** True when an attachment can be turned into a content block the model reads
+ *  directly — inline text, or a supported image. Everything else (PDF, office
+ *  docs, HEIC, archives, audio, unknown binary) can't be inlined and should be
+ *  staged to a file path for the agent's tools instead. */
+export function isModelInlineableAttachment(mime: string, filename: string): boolean {
+  const m = (mime || "").toLowerCase();
+  if (MODEL_IMAGE_MIMES.has(m)) return true;
+  if (isTextLikeMime(m, filename)) return true;
+  return false;
+}
+
 async function downloadBase64(
   url: string,
   fetchFn: typeof fetch

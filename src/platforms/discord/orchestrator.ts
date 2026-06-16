@@ -72,6 +72,8 @@ import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { ATTACH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
+import { isModelInlineableAttachment } from "../../agents/attachments.js";
+import { stageAttachment, sweepStagedAttachments } from "../../agents/attachment-staging.js";
 import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
@@ -195,6 +197,9 @@ export class Orchestrator {
     this.sentinelPoller = setInterval(checkSentinel, 2000);
     // Also check immediately in case sentinel was written before startup
     checkSentinel();
+
+    // Clear out any stale staged attachments from prior runs (TTL backstop).
+    void sweepStagedAttachments();
   }
 
   private async handleRestartSentinel(): Promise<void> {
@@ -863,6 +868,52 @@ export class Orchestrator {
           `uploaded and saved to the agent's filesystem:_\n${pathLines.join("\n")}`;
         promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
         promptAttachments = undefined; // already on disk; no ACP attachment blocks
+      } else if (
+        !activeProfile?.restrictDiscordAccess &&
+        msg.attachments &&
+        msg.attachments.length > 0
+      ) {
+        // Local agent: text + standard images go inline as content blocks (the
+        // model reads them directly). Any other type — PDF, office docs, HEIC,
+        // archives, unknown binaries — can't be turned into a block the model
+        // consumes, so previously it was attached as a resource the agent
+        // ignored (silently invisible). Instead, stage those to a temp dir and
+        // hand the agent the path; it reads them with its own file tools (and
+        // copies into the workspace anything worth keeping — temp is swept ~48h).
+        const STAGE_MAX = 100 * 1024 * 1024; // don't fill /tmp with huge files
+        const inline: MessageAttachment[] = [];
+        const stagedLines: string[] = [];
+        const batchId = randomUUID().slice(0, 8);
+        for (const a of msg.attachments) {
+          if (isModelInlineableAttachment(a.contentType ?? "", a.filename)) {
+            inline.push(a);
+            continue;
+          }
+          if (a.size > STAGE_MAX) {
+            stagedLines.push(`- \`${a.filename}\` — too large to stage (${a.size} B)`);
+            continue;
+          }
+          try {
+            const res = await fetch(a.url);
+            if (!res.ok) throw new Error(`download ${res.status} ${res.statusText}`);
+            const buf = Buffer.from(await res.arrayBuffer());
+            const dest = await stageAttachment(a.filename, buf, batchId);
+            stagedLines.push(`- \`${a.filename}\` → \`${dest}\``);
+          } catch (err) {
+            this.logger.warn({ err, filename: a.filename }, "failed to stage attachment");
+            stagedLines.push(`- \`${a.filename}\` — could not be downloaded`);
+          }
+        }
+        if (stagedLines.length > 0) {
+          const one = stagedLines.length === 1;
+          const hint =
+            `\n\n_The following file${one ? " was" : "s were"} saved to a temporary directory ` +
+            `(auto-cleaned after ~48h) — read ${one ? "it" : "them"} with your file tools, and copy ` +
+            `into the workspace anything you need to keep:_\n${stagedLines.join("\n")}`;
+          promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
+          void sweepStagedAttachments();
+        }
+        promptAttachments = inline.length > 0 ? inline : undefined;
       }
 
       // One transparent retry on transient failures. Both cases fire before any

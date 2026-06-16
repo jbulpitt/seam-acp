@@ -30,3 +30,7 @@ coverage/
 # Runtime cache (path→id map) and throwaway debug/probe scripts
 cache/
 scratch/
+
+# Local cron scripts (host-specific operational glue;
+# backed up via the OCI boot-volume snapshot, not git)
+crons/

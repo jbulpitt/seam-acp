@@ -748,11 +748,22 @@ export class DiscordAdapter implements ChatAdapter {
       // explicitly opt in (vs global, which exposes /seam in every server the
       // bot is in and takes ~1h to propagate).
       for (const guildId of guildIds) {
-        await rest.put(
-          Routes.applicationGuildCommands(appId, guildId),
-          { body }
-        );
-        this.logger.info({ guildId }, "registered guild slash commands");
+        // Per-guild try/catch: a guild the bot hasn't been invited to (or lost
+        // access to) returns Missing Access / Unknown Guild. Skip it with a
+        // clear warning so it can't abort registration for the other guilds or
+        // disrupt boot — important now that the list is multi-guild.
+        try {
+          await rest.put(
+            Routes.applicationGuildCommands(appId, guildId),
+            { body }
+          );
+          this.logger.info({ guildId }, "registered guild slash commands");
+        } catch (err) {
+          this.logger.warn(
+            { err, guildId },
+            "failed to register guild slash commands — is the bot a member of this guild? skipping; other guilds unaffected"
+          );
+        }
       }
     } else {
       await rest.put(Routes.applicationCommands(appId), { body });

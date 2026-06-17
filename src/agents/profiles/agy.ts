@@ -58,6 +58,7 @@ import {
   subscribeToAgyStream,
   type AgyStep,
 } from "../agy-stream.js";
+import { STAGING_ROOT } from "../attachment-staging.js";
 
 const AGY_HOME = path.join(process.env.HOME ?? "/root", ".gemini/antigravity-cli");
 const CONVERSATION_DIR = path.join(AGY_HOME, "conversations");
@@ -556,9 +557,13 @@ class AgyAgent implements Agent {
     return {
       protocolVersion: PROTOCOL_VERSION,
       agentCapabilities: {
-        // agy only consumes text prompts from us; richer block support can be
-        // added later if we want to forward attachments through the CLI.
-        promptCapabilities: {},
+        // agy takes a single text prompt, but we DO forward attachments: the
+        // mapper inlines text files as `resource` blocks (advertise
+        // embeddedContext so it inlines rather than emitting an un-fetchable
+        // resource_link), and flattenPrompt folds their text into the prompt.
+        // Binary files are staged to a path (orchestrator) that agy reads via
+        // the staging --add-dir below. No image capability (agy CLI is text-in).
+        promptCapabilities: { embeddedContext: true },
         loadSession: true,
       },
       authMethods: [],
@@ -676,6 +681,10 @@ class AgyAgent implements Agent {
       // and report "no active workspace set".
       "--add-dir",
       sess.cwd,
+      // Also expose the attachment staging dir so agy can read files we staged
+      // there (PDFs/binaries we reference by path in the prompt text).
+      "--add-dir",
+      STAGING_ROOT,
     ];
     if (sess.cascadeId) {
       args.push("--conversation", sess.cascadeId);
@@ -1179,10 +1188,28 @@ class AgyAgent implements Agent {
 // ---------------------------------------------------------------------------
 
 function flattenPrompt(blocks: ReadonlyArray<ContentBlock>): string {
-  return blocks
-    .map((b) => (b.type === "text" ? b.text : ""))
-    .filter(Boolean)
-    .join("\n");
+  const parts: string[] = [];
+  for (const b of blocks) {
+    if (b.type === "text") {
+      if (b.text) parts.push(b.text);
+    } else if (b.type === "resource") {
+      // Text attachments arrive inlined as a resource with `.text` — fold the
+      // file content into the prompt so agy actually sees it (previously these
+      // were dropped, so an attached text file was invisible to agy).
+      const r = b.resource;
+      const name = r.uri ? r.uri.replace(/^attachment:\/\//, "") : "file";
+      if ("text" in r && typeof r.text === "string") {
+        parts.push(`[Attached file: ${name}]\n${r.text}`);
+      } else {
+        parts.push(`[Attached file: ${name} — binary content not inlined]`);
+      }
+    } else if (b.type === "resource_link") {
+      const name = (b as { name?: string }).name ?? b.uri;
+      parts.push(`[Attached file referenced: ${name}]`);
+    }
+    // image/audio: agy CLI is text-only (no vision) — skip.
+  }
+  return parts.join("\n");
 }
 
 function mapToolStatus(

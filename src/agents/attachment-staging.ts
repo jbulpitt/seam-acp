@@ -15,7 +15,9 @@ import type { Dirent } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-const STAGING_ROOT = path.join(os.tmpdir(), "seam-attachments");
+/** Where staged attachments live. Exported so text-only agents (agy) can add it
+ *  to their workspace (`--add-dir`) and actually read the files we stage. */
+export const STAGING_ROOT = path.join(os.tmpdir(), "seam-attachments");
 const MAX_AGE_MS = 48 * 60 * 60 * 1000; // 48h
 
 /** Write bytes to `<tmp>/seam-attachments/<batchId>/<safe-filename>` and return

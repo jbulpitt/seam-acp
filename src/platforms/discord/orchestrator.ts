@@ -2026,11 +2026,69 @@ export class Orchestrator {
       await i.reply({ content: "No scheduled prompts for this thread. Create one with `/seam schedule add`.", flags: MessageFlags.Ephemeral });
       return;
     }
+    await i.reply({ ...this.buildScheduleListMessage(channel), flags: MessageFlags.Ephemeral });
+    const msg = await i.fetchReply();
+    const collector = msg.createMessageComponentCollector({
+      filter: (c) => c.user.id === i.user.id,
+      time: 600_000,
+    });
+    collector.on("collect", async (c) => {
+      try {
+        if (!c.isButton()) return;
+        const [, action, id] = c.customId.split(":");
+        const row = id ? this.store.getScheduled(id) : undefined;
+        if (!row || !id || row.channelRef !== channel.id) {
+          await c.reply({ content: "That schedule no longer exists.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (action === "edit") {
+          collector.stop("edit");
+          await this.cmdScheduleAdd(c, row); // opens the builder card in edit mode
+        } else if (action === "toggle") {
+          const updated: ScheduledPrompt = { ...row, enabled: !row.enabled, updatedUtc: new Date().toISOString() };
+          this.store.upsertScheduled(updated);
+          if (updated.enabled) this.scheduledManager?.armFromRow(updated);
+          else this.scheduledManager?.disarm(id);
+          await c.update(this.buildScheduleListMessage(channel));
+        } else if (action === "del") {
+          this.scheduledManager?.disarm(id);
+          this.store.deleteScheduled(id);
+          await deleteScheduledAttachmentDir(this.config.DATA_DIR, id).catch(() => {});
+          await c.update(this.buildScheduleListMessage(channel));
+        }
+      } catch (err) {
+        this.logger.warn({ err }, "schedule-list button handler failed");
+      }
+    });
+  }
+
+  /** `/seam schedule list` message: a summary embed plus per-schedule
+   *  Edit / Enable-Disable / Delete buttons (first 5 schedules; manage the rest
+   *  via the id-based `/seam schedule …` commands). Rebuilt after toggle/delete. */
+  private buildScheduleListMessage(channel: ChannelRef): {
+    embeds: EmbedBuilder[];
+    components: ActionRowBuilder<ButtonBuilder>[];
+  } {
+    const rows = this.store.listScheduledByChannel(PLATFORM, channel.id);
     const embed = new EmbedBuilder()
       .setTitle("⏰ Scheduled prompts")
       .setColor(SCHEDULED_COLOR)
-      .setDescription(rows.map((r) => this.scheduleSummaryLine(r)).join("\n\n"));
-    await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+      .setDescription(
+        rows.length
+          ? rows.map((r) => this.scheduleSummaryLine(r)).join("\n\n")
+          : "_No scheduled prompts for this thread._"
+      );
+    const components: ActionRowBuilder<ButtonBuilder>[] = [];
+    for (const r of rows.slice(0, 5)) {
+      components.push(
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(`sl:edit:${r.id}`).setLabel(`✏️ ${r.name}`.slice(0, 80)).setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId(`sl:toggle:${r.id}`).setLabel(r.enabled ? "⏸️ Disable" : "🟢 Enable").setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId(`sl:del:${r.id}`).setLabel("🗑️ Delete").setStyle(ButtonStyle.Danger),
+        )
+      );
+    }
+    return { embeds: [embed], components };
   }
 
   private async cmdScheduleRemove(i: ChatInputCommandInteraction): Promise<void> {
@@ -2127,7 +2185,7 @@ export class Orchestrator {
   /** Shared builder card for create (existing undefined) and edit (existing set).
    *  In edit mode the schedule's stored attachments are managed separately via
    *  addfile/removefile; the card edits prompt/schedule/model/cwd/output. */
-  private async cmdScheduleAdd(i: ChatInputCommandInteraction, existing?: ScheduledPrompt): Promise<void> {
+  private async cmdScheduleAdd(i: ChatInputCommandInteraction | MessageComponentInteraction, existing?: ScheduledPrompt): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
       await i.reply({ content: "Use `/seam schedule add` inside a thread.", flags: MessageFlags.Ephemeral });
@@ -2149,9 +2207,11 @@ export class Orchestrator {
     // Capture any files supplied on the command (references held; bytes fetched
     // on Create, while the URLs are still valid).
     const pending: Array<{ name: string; url: string; mime: string }> = [];
-    for (const opt of ["file", "file2", "file3"]) {
-      const a = i.options.getAttachment(opt, false);
-      if (a) pending.push({ name: a.name, url: a.url, mime: a.contentType ?? "application/octet-stream" });
+    if (i.isChatInputCommand()) {
+      for (const opt of ["file", "file2", "file3"]) {
+        const a = i.options.getAttachment(opt, false);
+        if (a) pending.push({ name: a.name, url: a.url, mime: a.contentType ?? "application/octet-stream" });
+      }
     }
 
     const state = {
@@ -2165,6 +2225,11 @@ export class Orchestrator {
       outputType: (existing?.outputType ?? "card") as "card" | "messages",
       files: pending,
     };
+    // Edit mode: manage the row's stored attachments live — remove via the select
+    // on the card, add via `/seam schedule addfile` (Discord cards can't accept a
+    // file upload). Mutable copy so Save writes the current set, not the stale
+    // original spread from `existing`.
+    const editFiles = existing ? [...existing.attachments] : [];
 
     const render = () => {
       const cronLine = state.cron
@@ -2172,9 +2237,9 @@ export class Orchestrator {
         : "*(not set)*";
       const next = state.cron ? cronNextRun(state.cron, state.timezone) : null;
       const filesValue = existing
-        ? (existing.attachments.length
-            ? existing.attachments.map((a) => `\`${a.filename}\``).join(", ") + " · *(use addfile/removefile)*"
-            : "*(none — use `/seam schedule addfile`)*")
+        ? (editFiles.length
+            ? editFiles.map((a) => `\`${a.filename}\``).join(", ") + " · *(remove below; add via `/seam schedule addfile`)*"
+            : "*(none — add via `/seam schedule addfile`)*")
         : (state.files.length ? state.files.map((f) => `\`${f.name}\``).join(", ") : "*(none)*");
       const embed = new EmbedBuilder()
         .setTitle(existing ? `✏️ Edit scheduled prompt \`${existing.id}\`` : "⏰ New scheduled prompt")
@@ -2223,6 +2288,14 @@ export class Orchestrator {
         rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(modelSelect));
       }
       rows.push(buttons);
+      // Edit mode with files: a select to remove one (removal persists live).
+      if (existing && editFiles.length > 0) {
+        const rmfile = new StringSelectMenuBuilder()
+          .setCustomId("sched:rmfile")
+          .setPlaceholder("🗑️ Remove a file…")
+          .addOptions(editFiles.slice(0, 25).map((a) => ({ label: a.filename.slice(0, 100), value: a.filename })));
+        rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(rmfile));
+      }
       return { embeds: [embed], components: rows };
     };
 
@@ -2260,6 +2333,17 @@ export class Orchestrator {
         } else if (c.isStringSelectMenu() && c.customId === "sched:model") {
           const v = c.values[0]!;
           state.model = v === "__default__" ? null : v;
+          await c.update(render());
+        } else if (c.isStringSelectMenu() && c.customId === "sched:rmfile") {
+          // Remove a stored file immediately (matches /seam schedule removefile),
+          // independent of Save; keep editFiles in sync so Save writes the rest.
+          const filename = c.values[0]!;
+          if (existing) {
+            await deleteScheduledAttachment(this.config.DATA_DIR, existing.id, filename).catch(() => {});
+            const idx = editFiles.findIndex((a) => a.filename === filename);
+            if (idx >= 0) editFiles.splice(idx, 1);
+            this.store.upsertScheduled({ ...existing, attachments: editFiles, updatedUtc: new Date().toISOString() });
+          }
           await c.update(render());
         } else if (c.isStringSelectMenu() && c.customId === "sched:cadence") {
           const v = c.values[0]!;
@@ -2355,11 +2439,14 @@ export class Orchestrator {
           const next = cronNextRun(state.cron, state.timezone);
           let row: ScheduledPrompt;
           if (existing) {
-            // Edit: preserve id, attachments, created*, enabled, last-run.
+            // Edit: preserve id, created*, enabled, last-run. Use editFiles (the
+            // live-managed set) for attachments so a file removed via the card's
+            // select isn't re-added by spreading the stale `existing`.
             row = {
               ...existing,
               name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
               model: state.model, cwd: state.cwd, targetChannel: state.target, outputType: state.outputType,
+              attachments: editFiles,
               updatedUtc: now, nextRunUtc: next ? next.toISOString() : null,
             };
             this.store.upsertScheduled(row);
@@ -5606,7 +5693,7 @@ export class Orchestrator {
   // --- helpers ---
 
   private channelRefFromInteraction(
-    i: ChatInputCommandInteraction
+    i: ChatInputCommandInteraction | MessageComponentInteraction
   ): ChannelRef | undefined {
     if (!i.channelId) return undefined;
     const ch = i.channel;

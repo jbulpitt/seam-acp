@@ -5666,12 +5666,15 @@ export class Orchestrator {
       let replaced = false;
 
       for (const abbr of allAbbrs) {
-        const needle = abbr;
-        let idx = newName.indexOf(needle);
-        while (idx !== -1) {
-          newName = newName.substring(0, idx) + targetAbbr + newName.substring(idx + needle.length);
+        // Case-insensitive replace so a thread named "… [AGY]" still matches the
+        // "agy" abbreviation. Escape the abbr for the RegExp; a single .replace
+        // pass also avoids the old indexOf-loop's infinite loop when a target
+        // abbreviation contains the one being replaced.
+        const re = new RegExp(abbr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+        const next = newName.replace(re, targetAbbr);
+        if (next !== newName) {
+          newName = next;
           replaced = true;
-          idx = newName.indexOf(needle);
         }
       }
 

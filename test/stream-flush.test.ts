@@ -60,19 +60,12 @@ describe("splitForFlush — forced", () => {
     expect(out).toEqual({ send: "short reply.", keep: "" });
   });
 
-  it("closes and reopens an open fence with the same language", () => {
-    const inner = "const a = 1;\n".repeat(20);
-    const buf = "```ts\n" + inner;
-    const out = splitForFlush(buf, { maxLen: 80, force: true });
-    expect(out).not.toBeNull();
-    expect(out!.send.endsWith("```")).toBe(true);
-    expect(out!.keep.startsWith("```ts\n")).toBe(true);
-    // Round-trip check: stripping the closing/reopening fences should give
-    // back the original inner content.
-    const sentInner = out!.send.replace(/^```ts\n/, "").replace(/\n```$/, "");
-    const keptInner = out!.keep.replace(/^```ts\n/, "");
-    expect(sentInner + "\n" + keptInner).toBe(buf.replace(/^```ts\n/, ""));
-  });
+  // NOTE: open-fence handling — closing/reopening a fence across a forced cut,
+  // and dropping orphan ```openers / whitespace-only fences — moved OUT of
+  // splitForFlush into FenceStream. The prose buffer splitForFlush sees no
+  // longer contains code fences (FenceStream extracts them upstream), so those
+  // cases are FenceStream's responsibility and are covered by its tests. The
+  // three tests that asserted that removed behavior were deleted here.
 
   it("hard-cuts only when no clean break exists in window", () => {
     const buf = "x".repeat(150);
@@ -80,16 +73,6 @@ describe("splitForFlush — forced", () => {
     expect(out).not.toBeNull();
     expect(out!.send.length).toBe(MAX);
     expect(out!.keep.length).toBe(50);
-  });
-
-  it("does not loop forever on an orphan fence opener with no content", () => {
-    const out = splitForFlush("```markdown\n", { maxLen: 80, force: true });
-    expect(out).toEqual({ send: "", keep: "" });
-  });
-
-  it("does not loop forever when a re-opened fence has only whitespace", () => {
-    const out = splitForFlush("```ts\n   \n", { maxLen: 80, force: true });
-    expect(out).toEqual({ send: "", keep: "" });
   });
 
   it("force-drains an open fence in finite steps without empty pills", () => {

@@ -1,11 +1,16 @@
 /**
  * Streaming-aware text splitter for chat platforms.
  *
- * Decides, for an in-flight buffer of agent text, whether to flush now and
+ * Decides, for an in-flight buffer of agent PROSE, whether to flush now and
  * where to cut. Honors:
- *   - open ``` code fences (never split inside one unless forced)
+ *   - a standalone `---` thematic break (a hard, forced message boundary)
+ *   - open markdown links/images (never cut inside one unless forced)
  *   - paragraph / line / sentence boundaries (in that preference order)
  *   - a hard max length (e.g. Discord's 2000-char limit, with headroom)
+ *
+ * Code fences are NOT handled here — FenceStream extracts them upstream, so the
+ * buffer this sees never contains a ``` fence (older tests for in-splitter fence
+ * close/reopen were removed when that logic moved to FenceStream).
  *
  * Returns:
  *   - `null` if nothing should be flushed right now

@@ -873,46 +873,11 @@ export class Orchestrator {
         msg.attachments &&
         msg.attachments.length > 0
       ) {
-        // Local agent: text + standard images go inline as content blocks (the
-        // model reads them directly). Any other type — PDF, office docs, HEIC,
-        // archives, unknown binaries — can't be turned into a block the model
-        // consumes, so previously it was attached as a resource the agent
-        // ignored (silently invisible). Instead, stage those to a temp dir and
-        // hand the agent the path; it reads them with its own file tools (and
-        // copies into the workspace anything worth keeping — temp is swept ~48h).
-        const STAGE_MAX = 100 * 1024 * 1024; // don't fill /tmp with huge files
-        const inline: MessageAttachment[] = [];
-        const stagedLines: string[] = [];
-        const batchId = randomUUID().slice(0, 8);
-        for (const a of msg.attachments) {
-          if (isModelInlineableAttachment(a.contentType ?? "", a.filename)) {
-            inline.push(a);
-            continue;
-          }
-          if (a.size > STAGE_MAX) {
-            stagedLines.push(`- \`${a.filename}\` — too large to stage (${a.size} B)`);
-            continue;
-          }
-          try {
-            const res = await fetch(a.url);
-            if (!res.ok) throw new Error(`download ${res.status} ${res.statusText}`);
-            const buf = Buffer.from(await res.arrayBuffer());
-            const dest = await stageAttachment(a.filename, buf, batchId);
-            stagedLines.push(`- \`${a.filename}\` → \`${dest}\``);
-          } catch (err) {
-            this.logger.warn({ err, filename: a.filename }, "failed to stage attachment");
-            stagedLines.push(`- \`${a.filename}\` — could not be downloaded`);
-          }
-        }
-        if (stagedLines.length > 0) {
-          const one = stagedLines.length === 1;
-          const hint =
-            `\n\n_The following file${one ? " was" : "s were"} saved to a temporary directory ` +
-            `(auto-cleaned after ~48h) — read ${one ? "it" : "them"} with your file tools, and copy ` +
-            `into the workspace anything you need to keep:_\n${stagedLines.join("\n")}`;
-          promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
-          void sweepStagedAttachments();
-        }
+        // Local agent: text + standard images go inline; everything else
+        // (PDF/Office/HEIC/binary) is staged to a temp path the agent opens with
+        // its file tools. Shared with the scheduled fire runner.
+        const { inline, hint } = await this.partitionAndStageAttachments(msg.attachments);
+        if (hint) promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
         promptAttachments = inline.length > 0 ? inline : undefined;
       }
 
@@ -1823,16 +1788,21 @@ export class Orchestrator {
       this.logger.warn({ id, err }, "scheduled: announce card failed");
     }
 
-    // 4. Run isolated + capture.
-    const attachments = await loadScheduledAttachments(this.config.DATA_DIR, id, row.attachments);
+    // 4. Run isolated + capture. Stage non-inlineable files (PDF/Office/HEIC/…)
+    //    to a path the agent reads with its tools — same handling as a live turn,
+    //    so scheduled jobs aren't limited to text/image attachments.
+    const loaded = await loadScheduledAttachments(this.config.DATA_DIR, id, row.attachments);
+    const { inline, hint } = profile.restrictDiscordAccess
+      ? { inline: loaded, hint: null as string | null }
+      : await this.partitionAndStageAttachments(loaded);
     const result = await this.runIsolatedScheduledJob({
       profile,
       cwd,
       ...(model ? { model } : {}),
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
       channel: target,
-      promptText: row.promptText,
-      attachments,
+      promptText: hint ? `${row.promptText}${hint}` : row.promptText,
+      attachments: inline,
     });
 
     // 5. Post result as NEW message(s) + record status.
@@ -1945,6 +1915,48 @@ export class Orchestrator {
     const out: string[] = [];
     for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
     return out;
+  }
+
+  /** Split attachments into those the model reads inline (text + supported
+   *  images → `inline`) and the rest (PDF/Office/HEIC/binary), which are staged
+   *  to a temp path the agent opens with its file tools and described in `hint`.
+   *  Shared by the live-turn path and the scheduled fire runner so both handle
+   *  non-inlineable files identically. Works for https CDN and data: URLs. */
+  private async partitionAndStageAttachments(
+    attachments: ReadonlyArray<MessageAttachment>
+  ): Promise<{ inline: MessageAttachment[]; hint: string | null }> {
+    const STAGE_MAX = 100 * 1024 * 1024; // don't fill /tmp with huge files
+    const inline: MessageAttachment[] = [];
+    const stagedLines: string[] = [];
+    const batchId = randomUUID().slice(0, 8);
+    for (const a of attachments) {
+      if (isModelInlineableAttachment(a.contentType ?? "", a.filename)) {
+        inline.push(a);
+        continue;
+      }
+      if (a.size > STAGE_MAX) {
+        stagedLines.push(`- \`${a.filename}\` — too large to stage (${a.size} B)`);
+        continue;
+      }
+      try {
+        const res = await fetch(a.url);
+        if (!res.ok) throw new Error(`download ${res.status} ${res.statusText}`);
+        const buf = Buffer.from(await res.arrayBuffer());
+        const dest = await stageAttachment(a.filename, buf, batchId);
+        stagedLines.push(`- \`${a.filename}\` → \`${dest}\``);
+      } catch (err) {
+        this.logger.warn({ err, filename: a.filename }, "failed to stage attachment");
+        stagedLines.push(`- \`${a.filename}\` — could not be downloaded`);
+      }
+    }
+    if (stagedLines.length === 0) return { inline, hint: null };
+    void sweepStagedAttachments();
+    const one = stagedLines.length === 1;
+    const hint =
+      `\n\n_The following file${one ? " was" : "s were"} saved to a temporary directory ` +
+      `(auto-cleaned after ~48h) — read ${one ? "it" : "them"} with your file tools, and copy ` +
+      `into the workspace anything you need to keep:_\n${stagedLines.join("\n")}`;
+    return { inline, hint };
   }
 
   private async sendResultCard(channel: ChannelRef, title: string, description: string, color: number): Promise<void> {

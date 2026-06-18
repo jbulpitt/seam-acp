@@ -83,6 +83,17 @@ const Schema = z.object({
         .filter(Boolean)
         .map((p) => path.resolve(p))
     ),
+  /**
+   * When true, `/seam attach` and `seam-attach` fences may upload ANY readable
+   * file on the host, bypassing the REPOS_ROOT / ATTACH_ROOTS confinement.
+   * Off by default — only enable on a single-user, fully-trusted instance, since
+   * it lets the agent (and anyone who can prompt it) exfiltrate any file the bot
+   * process can read.
+   */
+  ATTACH_ALLOW_ANY_PATH: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
 
   /**
    * Comma-separated list of repo names mapped to an emoji for display, e.g. "seam-acp:🧵,core:📦"

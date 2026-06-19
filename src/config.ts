@@ -125,7 +125,7 @@ const Schema = z.object({
    * GitHub accounts. Example:
    *   COPILOT_PROFILES=work:/Users/me/.copilot-work,personal:/Users/me/.copilot-personal
    * Each id must be unique and not collide with built-in profile ids
-   * (`copilot`, `gemini`).
+   * (`copilot`, `agy`, `claude`).
    */
   COPILOT_PROFILES: z
     .string()

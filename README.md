@@ -37,13 +37,11 @@ Copy `.env.example` to `.env` and fill it in.
 | `REPOS_ROOT` | yes | Root folder containing repos the agent can touch |
 | `ATTACH_ROOTS` | no | Comma-separated extra absolute directories the `/seam attach` command (and the agent-side fence-to-file shortcut) can read from. `REPOS_ROOT` is always allowed. |
 | `DATA_DIR` | no | Defaults to `./data` (sqlite lives here) |
-| `DEFAULT_AGENT` | no | `copilot` (default), `gemini`, or `claude`. Plus any `copilot-<id>` / `gemini-<id>` / `claude-<id>` registered via the `*_PROFILES` vars. |
+| `DEFAULT_AGENT` | no | `copilot` (default), `agy`, or `claude`. Plus any `copilot-<id>` / `agy-<id>` / `claude-<id>` registered via the `*_PROFILES` vars. |
 | `DEFAULT_MODEL` | no | Default Copilot model. Applies to **all** Copilot profiles (including extras from `COPILOT_PROFILES`). e.g. `gpt-5.4`, `claude-sonnet-4.5`, `claude-opus-4.7`, `auto` |
 | `COPILOT_CLI_PATH` | no | If `copilot` is not on `PATH` |
 | `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
-| `GEMINI_CLI_PATH` | no | If `gemini` is not on `PATH` |
-| `GEMINI_DEFAULT_MODEL` | no | Default Gemini model — applied even when `DEFAULT_AGENT` is `copilot`. Default `gemini-2.5-pro`. |
-| `GEMINI_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `gemini-<id>` profile pinned to its own `GEMINI_CLI_HOME` (acts as a fake home — Gemini reads `<dir>/.gemini/`). See "Multiple Gemini accounts" below. |
+| `AGY_CLI_PATH` | no | If `agy` is not on `PATH` (checks `~/.local/bin/agy` first) |
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
 | `CLAUDE_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `claude-<id>` profile pinned to its own `CLAUDE_CONFIG_DIR`. See "Multiple Claude accounts" below. |
@@ -63,7 +61,7 @@ npm i -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp
 claude /login
 ```
 
-To use the **Google Gemini** profile, install the Gemini CLI (`brew install google-gemini/cli/gemini` or `npm i -g @google/gemini-cli`) and run `gemini /auth`. Each agent profile is independent — install only the ones you'll use.
+To use the **Google Antigravity (agy)** profile, install the Antigravity CLI binary from [github.com/google-antigravity/antigravity-cli](https://github.com/google-antigravity/antigravity-cli/releases) and run `agy /auth`. Each agent profile is independent — install only the ones you'll use.
 
 ## Run (local dev)
 
@@ -186,34 +184,11 @@ COPILOT_HOME=/Users/me/.copilot-personal copilot login
 Verify in a thread with `/seam whoami` — the bot reads
 `<config-dir>/config.json` and reports the GitHub login.
 
-### Multiple Gemini accounts
+### Multiple agy accounts
 
-Same pattern, using `GEMINI_PROFILES`:
+> **Note:** agy (Antigravity CLI) is Google's official replacement for the deprecated Gemini CLI. The Gemini CLI service was sunset on June 18, 2026.
 
-```sh
-GEMINI_PROFILES=work:/Users/me/gemini-work,personal:/Users/me/gemini-personal
-```
-
-For each entry the bot spawns `gemini --acp` with `GEMINI_CLI_HOME=<dir>`
-in the child env. The Gemini CLI treats that as a *home directory
-override* and stores all state under `<dir>/.gemini/` (auth tokens,
-credentials, settings, session history). Profiles show up in
-`/seam agent` as `gemini-work` and `gemini-personal` alongside the
-default `gemini` profile.
-
-> **Note:** the path you give is the *fake home dir* — not the
-> `.gemini` folder itself. The CLI will create `<dir>/.gemini/` for
-> you on first use.
-
-One-time setup per account on the host:
-
-```sh
-GEMINI_CLI_HOME=/Users/me/gemini-work gemini /auth
-GEMINI_CLI_HOME=/Users/me/gemini-personal gemini /auth
-```
-
-`/seam whoami` reads `<dir>/.gemini/google_accounts.json` and reports
-the active Google account email.
+The `agy` profile currently uses a single global agy session (`~/.gemini/antigravity-cli/`). Multi-account support for agy is not yet implemented — see `src/agents/profiles/agy.ts` for the current integration.
 
 ### Multiple Claude accounts
 
@@ -316,7 +291,7 @@ AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agen
 - **`src/platforms/chat-adapter.ts`** — generic chat platform interface.
 - **`src/platforms/discord/`** — discord.js v14 implementation + slash commands + repo picker.
 - **`src/agents/agent-runtime.ts`** — wraps `@agentclientprotocol/sdk` + a child process running an ACP server. Handles `initialize`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, model / mode / config option setters, and emits typed events.
-- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Sibling profiles ship for Google Gemini (`gemini.ts`) and Anthropic Claude Code (`claude.ts`, via the `claude-agent-acp` adapter). **`remote.ts`** provides a WebSocket-backed profile for agent CLIs running on separate machines (see [docs/remote-agent.md](docs/remote-agent.md)). Add a new profile by writing one of these.
+- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Sibling profiles: `agy.ts` (Google Antigravity CLI, in-process ACP bridge), `claude.ts` (Anthropic Claude Code, via the `claude-agent-acp` adapter), `opencode.ts` (LM Studio local models via opencode), and `remote.ts` (WebSocket-backed profile for agents on separate machines — see [docs/remote-agent.md](docs/remote-agent.md)). Add a new profile by writing one of these.
 - **`src/core/`** — pure utilities: text chunker, path safety, sqlite store, session router, status panel.
 
 ## Testing

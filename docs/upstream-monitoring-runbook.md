@@ -4,7 +4,7 @@
 >
 > **Cadence**: Weekly sweep (recommended: Monday), with ad-hoc checks when a major release is announced.
 >
-> **Last updated**: 2026-06-03
+> **Last updated**: 2026-06-19
 
 ---
 
@@ -56,7 +56,7 @@ before running any procedure in this runbook:
 
 > **Antigravity CLI (`agy`)** is Google's official replacement for the Gemini CLI. It is a Go-native binary (not npm-based). seam-acp has a dedicated `agy` profile ([`agy.ts`](../src/agents/profiles/agy.ts)) that bridges agy into ACP in-process since agy doesn't speak ACP natively. **This is the only actively monitored Google agent integration.**
 
-> **⚠️ Gemini CLI is deprecated.** The npm-based `@google/gemini-cli` is being sunset (June 18, 2026). It is no longer actively monitored in this runbook. seam-acp still ships a legacy [`gemini.ts`](../src/agents/profiles/gemini.ts) profile, but it should be considered for removal. See §5.5 for the deprecation/removal playbook.
+> **⚠️ Gemini CLI is deprecated.** The npm-based `@google/gemini-cli` is being sunset (June 18, 2026). It is no longer actively monitored in this runbook. The legacy `gemini.ts` profile has **already been removed** from `src/agents/profiles/` (as of the 2026-06-15 sweep); only stale doc references remain (see §5.5 and the README). The `agy` profile below is the live Google integration.
 
 | Source | URL | What It Covers | Feed |
 |---|---|---|---|
@@ -81,7 +81,8 @@ before running any procedure in this runbook:
 - Conversations stored as `.db` files in `~/.gemini/antigravity-cli/conversations/`
 - Transcripts in `~/.gemini/antigravity-cli/brain/<cascadeId>/.system_generated/logs/transcript.jsonl`
 - Effort is baked into model choice (no separate knob) — picker suppressed
-- Profile source: [`agy.ts`](../src/agents/profiles/agy.ts) (1763 lines — largest profile)
+- Profile source: [`agy.ts`](../src/agents/profiles/agy.ts) (1699 lines — largest profile)
+- Latest agy as of 2026-06-19 sweep: **1.0.10** (Go binary; conversation format is now `.db` SQLite as of agy 1.0.4 — `agy.ts` handles both `.db`/`.pb`)
 
 ### 1.2 Anthropic — Claude Code
 
@@ -127,10 +128,22 @@ before running any procedure in this runbook:
 - Usage: `https://api.anthropic.com/api/oauth/usage` with `anthropic-beta: oauth-2025-04-20` header
 - Session storage: JSONL files at `~/.claude/projects/<slug>/<sessionId>.jsonl`
 - **Critical**: Patch script `scripts/patch-claude-agent-acp.mjs` fixes broken model resolver — wiped by any global npm update
-- Profile source: [`claude.ts`](../src/agents/profiles/claude.ts) (823 lines)
+- Profile source: [`claude.ts`](../src/agents/profiles/claude.ts) (802 lines)
 - Update process: [`model-management-runbook.md`](model-management-runbook.md) (564 lines, authoritative)
 
-> **⚠️ CAUTION**: The `claude-agent-acp` resolver bug is well-documented: in v0.39, `unstable_setSessionModel` runs ALL model strings through `resolveModelPreference` which fuzzy-matches against a tiny 4-entry curated list. Full Opus IDs find no Opus entry → fuzzy-match to **Sonnet**. The patch (`npm run patch-acp`) makes canonical full IDs bypass the broken resolver. It is **wiped by any global npm update and must be re-applied + re-verified**. See §5.2 and [`model-management-runbook.md`](model-management-runbook.md).
+> **🔑 PATCH MAY BE OBSOLETE — verify on next upgrade.** As of the 2026-06-18
+> sweep we run `claude-agent-acp` **0.39.0 (patched)**, but upstream **v0.42.0
+> (2026-06-05)** shipped a fix: *"Prevent cross-family model matching in
+> `resolveModelPreference`"* — the exact bug our patch works around. When
+> upgrading to ≥0.42.0, the patch ANCHOR will almost certainly no longer match
+> (the script exits 1 by design). **Before re-deriving the patch, probe whether
+> full Opus `[1m]` IDs now resolve correctly natively** (per
+> [`model-management-runbook.md`](model-management-runbook.md) §4, against JSONL
+> ground truth) — the patch may be removable entirely. Latest versions at sweep:
+> claude-code **2.1.181**, claude-agent-acp **0.47.0** (maintained by Zed
+> Industries).
+
+> **⚠️ CAUTION**: The `claude-agent-acp` resolver bug is well-documented: in v0.39, `unstable_setSessionModel` runs ALL model strings through `resolveModelPreference` which fuzzy-matches against a tiny 4-entry curated list. Full Opus IDs find no Opus entry → fuzzy-match to **Sonnet**. The patch (`npm run patch-acp`) makes canonical full IDs bypass the broken resolver. It is **wiped by any global npm update and must be re-applied + re-verified**. See §5.2 and [`model-management-runbook.md`](model-management-runbook.md). **As of the 2026-06-18 sweep**, we run 0.39.0 (patched); upstream latest is **0.47.0**.
 
 ### 1.3 GitHub Copilot
 
@@ -159,7 +172,7 @@ before running any procedure in this runbook:
 - Identity: reads `<configDir>/config.json` → `lastLoggedInUser.login`
 - Quota: `https://api.github.com/copilot_internal/user`
 - Session storage: SQLite at `<configDir>/session-store.db`
-- Profile source: [`copilot.ts`](../src/agents/profiles/copilot.ts) (481 lines)
+- Profile source: [`copilot.ts`](../src/agents/profiles/copilot.ts) (450 lines)
 
 #### Copilot in VS Code
 
@@ -215,8 +228,9 @@ before running any procedure in this runbook:
 |---|---|---|---|
 | Official Site | https://agentclientprotocol.com/ | Spec, documentation | — |
 | Updates Page | https://agentclientprotocol.com/updates | Protocol stability updates | [RSS](https://agentclientprotocol.com/updates/rss.xml) |
-| GitHub Repo | https://github.com/agentclientprotocol/agent-client-protocol | Spec + reference implementations | [Atom](https://github.com/agentclientprotocol/agent-client-protocol/releases.atom) |
-| npm: `@agentclientprotocol/sdk` | https://www.npmjs.com/package/@agentclientprotocol/sdk | SDK versions | [API](https://registry.npmjs.org/@agentclientprotocol/sdk) |
+| GitHub Repo (monorepo) | https://github.com/agentclientprotocol/agent-client-protocol | Spec + Rust/schema impl (e.g. `schema-v1.13.7`). **No longer tracks npm SDK versions** as of 2026-06-16. | [Atom](https://github.com/agentclientprotocol/agent-client-protocol/releases.atom) |
+| GitHub Repo (TS SDK) | https://github.com/agentclientprotocol/typescript-sdk | **The npm `@agentclientprotocol/sdk` package** — releases + CHANGELOG live here as of 2026-06-16 (split out of the monorepo) | [Atom](https://github.com/agentclientprotocol/typescript-sdk/releases.atom) |
+| npm: `@agentclientprotocol/sdk` | https://www.npmjs.com/package/@agentclientprotocol/sdk | SDK versions (changelog now in the `typescript-sdk` repo) | [API](https://registry.npmjs.org/@agentclientprotocol/sdk) |
 | Yarn: `@agentclientprotocol/sdk` | https://yarnpkg.com/package/@agentclientprotocol/sdk | Also has changelog visibility | — |
 
 **seam-acp integration points**:
@@ -227,7 +241,7 @@ before running any procedure in this runbook:
 - Communication: nd-JSON over stdio for all agents (except agy which fakes it in-process)
 - Timeouts: `START_TIMEOUT_MS` = 45s (initialize), `NEW_SESSION_TIMEOUT_MS` = 45s (session/new)
 
-> **⚠️ IMPORTANT**: The ACP SDK is the foundational dependency. A major version bump here could require changes across the entire agent layer — all four profiles plus the runtime.
+> **⚠️ IMPORTANT**: The ACP SDK is the foundational dependency. A major version bump here could require changes across the entire agent layer — every agent profile plus the runtime.
 
 ### 1.6 Remote Agent Infrastructure
 
@@ -243,7 +257,35 @@ before running any procedure in this runbook:
 - Tunnel URL publishing: `TUNNEL_GIST_ID` env var (GitHub Gist)
 - Profile source: [`remote.ts`](../src/agents/profiles/remote.ts) (470 lines)
 
-### 1.7 Billing & Pricing (All Providers)
+### 1.7 Opencode / LM Studio (local models)
+
+> **Opencode** (`opencode acp`, from [sst/opencode](https://github.com/sst/opencode)) is the
+> CLI behind seam-acp's **"LM Studio 🦙"** agent. seam-acp uses it to expose
+> **local** LM Studio models (not a hosted provider) over ACP. It was added
+> after the original runbook was written and is now a first-class integration.
+
+| Source | URL | What It Covers | Feed |
+|---|---|---|---|
+| opencode site / docs | https://opencode.ai/ | Docs, config schema (`https://opencode.ai/config.json`) | — |
+| opencode GitHub repo | https://github.com/anomalyco/opencode | Source, issues, releases (repo moved from sst/opencode as of 2026-06-18 sweep) | [Atom](https://github.com/anomalyco/opencode/releases.atom) |
+| npm: `opencode-ai` | https://registry.npmjs.org/opencode-ai | Versions (latest: 1.17.8 at 2026-06-18 sweep) | [API](https://registry.npmjs.org/opencode-ai) |
+| LM Studio | https://lmstudio.ai/ | Local model server (the model source) | — |
+
+**seam-acp integration points**:
+- CLI binary: `opencode acp` (env: `OPENCODE_CLI_PATH`, default `opencode` on PATH)
+- Enable flag: `OPENCODE_ENABLED` env var
+- opencode reads its **global** config at `~/.config/opencode/opencode.json` — seam-acp **writes a custom LM Studio provider block** into it (opencode ≤1.15.x does NOT auto-discover models for a custom provider)
+- **Capability flags are load-bearing**: each model must declare `modalities` (vision) or opencode silently strips image attachments before sending to a vision model
+- Model IDs are `<prefix>/<rawId>` (e.g. `lmstudio-remote/google/gemma-4-26b-a4b`)
+- MCP entries managed under the config's `mcp` key; `{env:VAR}` substitution supported
+- Profile source: [`opencode.ts`](../src/agents/profiles/opencode.ts) (249 lines)
+
+> **Watch for**: opencode config-schema changes (`opencode.json` shape, the
+> per-model capability/`modalities` fields), changes to `opencode acp`, and
+> whether opencode adds auto-discovery for custom providers (would let seam-acp
+> stop writing the provider block itself).
+
+### 1.8 Billing & Pricing (All Providers)
 
 | Provider | URL | Notes |
 |---|---|---|
@@ -355,9 +397,14 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 - [ ] Check [Coding Agent docs](https://docs.github.com/en/copilot/using-github-copilot/using-copilot-coding-agent) for updates
 - [ ] Check [GitHub Community Announcements](https://github.com/orgs/community/discussions/categories/announcements) for billing/policy updates
 
+#### Opencode / LM Studio
+- [ ] Check [opencode releases](https://github.com/anomalyco/opencode/releases) and npm [`opencode-ai`](https://registry.npmjs.org/opencode-ai/latest) — last checked version: ___
+- [ ] Check [opencode config schema](https://opencode.ai/config.json) for shape changes (esp. per-model `modalities`/capability fields)
+- [ ] Check for `opencode acp` subcommand changes or custom-provider auto-discovery
+
 #### ACP Protocol
-- [ ] Check [ACP SDK npm](https://www.npmjs.com/package/@agentclientprotocol/sdk) — current pinned: `^0.22.1`, latest: ___
-- [ ] Check [ACP repo releases](https://github.com/agentclientprotocol/agent-client-protocol/releases) for spec changes
+- [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^0.22.1`, latest: ___ (changelog now in the [typescript-sdk repo](https://github.com/agentclientprotocol/typescript-sdk/releases), split out 2026-06-16)
+- [ ] Check [ACP monorepo releases](https://github.com/agentclientprotocol/agent-client-protocol/releases) for spec/schema changes (`schema-v*` tags; no longer carries npm SDK versions)
 - [ ] Check [ACP updates page](https://agentclientprotocol.com/updates)
 - [ ] Scan [ACP repo issues](https://github.com/agentclientprotocol/agent-client-protocol/issues) for breaking change discussions
 ```
@@ -393,7 +440,7 @@ Every finding should be analyzed from three angles:
 | **Session storage?** | Does this change session file formats, paths, or storage mechanisms? |
 
 **Key files to consider**:
-- Agent profiles: `src/agents/profiles/{copilot,claude,agy,remote}.ts` (plus deprecated `gemini.ts`)
+- Agent profiles: `src/agents/profiles/{copilot,claude,agy,opencode,remote}.ts` (`gemini.ts` has been removed)
 - Runtime: `src/agents/agent-runtime.ts`
 - Config: `src/config.ts`
 - Patch: `scripts/patch-claude-agent-acp.mjs`
@@ -438,7 +485,7 @@ Every finding should be analyzed from three angles:
 > **⚠️ CAUTION**: This is the highest-risk update. Follow every step. See also [`model-management-runbook.md`](model-management-runbook.md) for the authoritative end-to-end process.
 
 1. **Read the changelog** for both packages before updating — check both GitHub releases and CHANGELOG.md.
-2. **Check the `resolveModelPreference` function** — if it changed, the patch may need updating.
+2. **Check the `resolveModelPreference` function** — if it changed, the patch may need updating. **NOTE (2026-06-15):** upstream v0.42.0 already fixed this ("Prevent cross-family model matching in `resolveModelPreference`"). On any upgrade to ≥0.42.0, first determine whether the patch is still needed *at all* (probe full Opus `[1m]` IDs against JSONL) before re-deriving it — it may be removable.
 3. **Update the package**: `npm i -g @agentclientprotocol/claude-agent-acp@latest`
 4. **Re-apply the patch immediately**: `npm run patch-acp`
    - If exit code 1 (anchor not found): upstream changed the resolver — the patch script needs updating.
@@ -450,7 +497,7 @@ Every finding should be analyzed from three angles:
 
 ### 5.3 ACP SDK version bump
 
-1. Check the [ACP releases](https://github.com/agentclientprotocol/agent-client-protocol/releases) and [updates page](https://agentclientprotocol.com/updates) for breaking changes.
+1. Check the [TS SDK releases](https://github.com/agentclientprotocol/typescript-sdk/releases) (npm package changelog, split out of the monorepo 2026-06-16), the [ACP monorepo releases](https://github.com/agentclientprotocol/agent-client-protocol/releases) (spec/`schema-v*` tags), and the [updates page](https://agentclientprotocol.com/updates) for breaking changes.
 2. Review the diff of protocol types (especially `AcpClient`/`ClientSideConnection` constructor, session methods, event types).
 3. Update `package.json`: `npm install @agentclientprotocol/sdk@latest`
 4. Run `npm run typecheck` — type errors reveal breaking changes.
@@ -470,17 +517,16 @@ Every finding should be analyzed from three angles:
 
 ### 5.5 Gemini CLI deprecation & removal
 
-> **Status**: Gemini CLI (`@google/gemini-cli`) is deprecated as of June 18, 2026. Antigravity CLI (`agy`) is Google's official replacement.
+> **Status (2026-06-15)**: Gemini CLI (`@google/gemini-cli`) service sunsets **June 18, 2026**. Antigravity CLI (`agy`) is Google's official replacement. The `gemini.ts` profile has **already been removed** from `src/agents/profiles/` — this playbook is now a **cleanup checklist for the remaining stale references**.
 
-The legacy `gemini.ts` profile in seam-acp should be considered for removal. Steps when ready:
+Remaining cleanup:
 
-1. Confirm no active sessions are using the `gemini` or `gemini-*` agent profiles.
-2. Remove `src/agents/profiles/gemini.ts`.
-3. Remove Gemini-specific env vars from `src/config.ts`: `GEMINI_CLI_PATH`, `GEMINI_DEFAULT_MODEL`, `GEMINI_MODELS`, `GEMINI_PROFILES`.
-4. Remove Gemini entries from `.env.example`.
-5. Update `README.md` to remove Gemini CLI setup instructions.
-6. Run `npm run typecheck && npm test && npm run build`.
-7. Update this runbook to remove remaining Gemini CLI references.
+1. ✅ `src/agents/profiles/gemini.ts` — already removed.
+2. ✅ Confirm Gemini env vars are gone from `src/config.ts`: `GEMINI_CLI_PATH`, `GEMINI_DEFAULT_MODEL`, `GEMINI_MODELS`, `GEMINI_PROFILES` (all absent; one stale comment on line 128 fixed in 2026-06-19 sweep).
+3. ✅ Remove Gemini entries from `.env.example` (verify — env vars absent from config.ts schema confirms they were removed).
+4. ✅ **Update `README.md`** — Gemini env var rows, install instructions, multi-account section, and profile mention all removed in 2026-06-19 sweep.
+5. ✅ Run `npm run typecheck && npm test && npm run build` — done in 2026-06-19 sweep; only 3 pre-existing type errors (unrelated to Gemini cleanup).
+6. ✅ Grep this runbook for any remaining `gemini.ts` / Gemini-CLI references — done in 2026-06-19 sweep. Remaining references are appropriate historical/contextual mentions (§1.1 deprecation notice, §4 note, §5.5 history). No further removal needed.
 
 ### 5.6 Copilot CLI updated
 
@@ -509,6 +555,14 @@ The legacy `gemini.ts` profile in seam-acp should be considered for removal. Ste
 4. Update any cost guidance in project docs.
 5. For GitHub AI Credits: check if agentic usage metering changed.
 6. For Anthropic: check if agent SDK billing separation affects our usage.
+
+### 5.9 Opencode (sst/opencode) updated
+
+1. Check [releases](https://github.com/sst/opencode/releases.atom) and npm [`opencode-ai`](https://registry.npmjs.org/opencode-ai).
+2. Check for changes to the `opencode acp` subcommand.
+3. **Check the config schema** (`https://opencode.ai/config.json`) — seam-acp writes a custom provider block into `~/.config/opencode/opencode.json`; a schema change (esp. the per-model `modalities`/capability fields) can silently break vision (images stripped). See [`opencode.ts`](../src/agents/profiles/opencode.ts).
+4. Check whether opencode added **auto-discovery for custom providers** — if so, seam-acp could stop writing the provider block.
+5. Test an "LM Studio 🦙" session via Discord; confirm models load and an image attachment reaches a vision model.
 
 ---
 
@@ -577,10 +631,11 @@ Record current versions at time of sweep:
 | Package / Tool | Version | Last Updated |
 |---|---|---|
 | `agy` (Antigravity CLI) | | |
-| `@google/gemini-cli` (⚠️ deprecated) | | |
+| `@google/gemini-cli` (⚠️ removed — profile gone, service sunsets 2026-06-18) | | |
 | `@anthropic-ai/claude-code` | | |
 | `@agentclientprotocol/claude-agent-acp` | | |
 | `copilot` CLI (`@github/copilot`) | | |
+| `opencode` (`opencode-ai`, LM Studio profile) | | |
 | `@agentclientprotocol/sdk` | | |
 | `discord.js` | | |
 | Claude patch applied? | yes/no | |

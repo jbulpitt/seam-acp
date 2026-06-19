@@ -20,6 +20,7 @@ import {
   type RejectedAttachment,
 } from "./attachments.js";
 import { blockToFile } from "./agent-content.js";
+import { SerialQueue } from "../core/serial-queue.js";
 
 /** Events surfaced from the ACP `session/update` stream. */
 export type AgentEvent =
@@ -150,6 +151,16 @@ export class AgentRuntime {
   private sessionCwd?: string;
 
   private eventHandler?: AgentEventHandler;
+
+  /**
+   * Serializes session-update processing. The ACP SDK's read loop dispatches
+   * notifications concurrently (it calls processMessage without awaiting it),
+   * so a later chunk's handler can run while an earlier one is parked on an
+   * await and mutate shared state (e.g. the orchestrator's streamed-text
+   * buffer) out of order. Funnelling every update through this queue restores
+   * strict arrival order end-to-end.
+   */
+  private readonly sessionUpdates = new SerialQueue();
 
   constructor(opts: {
     profile: AgentProfile;
@@ -620,7 +631,12 @@ export class AgentRuntime {
     };
   }
 
-  private async handleSessionUpdate(update: SessionUpdate): Promise<void> {
+  private handleSessionUpdate(update: SessionUpdate): Promise<void> {
+    // Process updates one at a time, in arrival order. See `sessionUpdates`.
+    return this.sessionUpdates.run(() => this.handleSessionUpdateInner(update));
+  }
+
+  private async handleSessionUpdateInner(update: SessionUpdate): Promise<void> {
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
         await this.handleContentBlock(update.content, "message", {

@@ -76,6 +76,7 @@ import { isModelInlineableAttachment } from "../../agents/attachments.js";
 import { stageAttachment, sweepStagedAttachments } from "../../agents/attachment-staging.js";
 import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
+import { SerialQueue } from "../../core/serial-queue.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import {
   defaultSessionConfig,
@@ -440,7 +441,7 @@ export class Orchestrator {
     // would be its own message).
     const HARD_MAX = 1800;
     const SOFT_MIN = 800;
-    const drainBuffer = async (force: boolean, allowUnsafeCut = false) => {
+    const drainBufferInner = async (force: boolean, allowUnsafeCut = false) => {
       while (textBuffer) {
         const split = splitForFlush(textBuffer, {
           maxLen: HARD_MAX,
@@ -458,6 +459,15 @@ export class Orchestrator {
         if (!force) return;
       }
     };
+    // Serialize every drain. maybeFlush(), the idle timer, fence boundaries,
+    // and end-of-turn all trigger drains; without this they could run
+    // concurrently, each reassigning `textBuffer` and issuing an independent
+    // sendMessage whose delivery order isn't guaranteed — reordering output.
+    // Enqueueing is synchronous, so drains (and their sends) run strictly in
+    // call order.
+    const flushQueue = new SerialQueue();
+    const drainBuffer = (force: boolean, allowUnsafeCut = false): Promise<void> =>
+      flushQueue.run(() => drainBufferInner(force, allowUnsafeCut));
     const flushChunks = async () => {
       // End-of-turn: must drain everything. An open link will never be
       // closed, so allow unsafe cuts here.

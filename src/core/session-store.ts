@@ -3,6 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   defaultSessionConfig,
+  type Preset,
+  type ThreadAlias,
+  type PermissionPolicyMode,
   type SessionConfigState,
   type SessionRecord,
 } from "./types.js";
@@ -52,6 +55,31 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_channel
   ON scheduled_prompts(platform, channel_ref);
 CREATE INDEX IF NOT EXISTS idx_scheduled_enabled
   ON scheduled_prompts(enabled);
+
+CREATE TABLE IF NOT EXISTS presets (
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL UNIQUE,
+  description   TEXT,
+  agent_id      TEXT,
+  model         TEXT,
+  effort        TEXT,
+  repo_path     TEXT,
+  permission    TEXT,
+  tools_json    TEXT,
+  instructions  TEXT,
+  created_by    TEXT NOT NULL,
+  created_utc   TEXT NOT NULL,
+  updated_utc   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_presets_name ON presets(name);
+
+CREATE TABLE IF NOT EXISTS thread_aliases (
+  alias        TEXT PRIMARY KEY,
+  channel_ref  TEXT NOT NULL,
+  description  TEXT,
+  created_by   TEXT NOT NULL,
+  created_utc  TEXT NOT NULL
+);
 `;
 
 interface Row {
@@ -140,6 +168,66 @@ const mapScheduled = (r: ScheduledRow): ScheduledPrompt => {
     pinnedSessionId: r.pinned_session_id,
   };
 };
+
+interface PresetRow {
+  id: string;
+  name: string;
+  description: string | null;
+  agent_id: string | null;
+  model: string | null;
+  effort: string | null;
+  repo_path: string | null;
+  permission: string | null;
+  tools_json: string | null;
+  instructions: string | null;
+  created_by: string;
+  created_utc: string;
+  updated_utc: string;
+}
+
+const mapPreset = (r: PresetRow): Preset => {
+  let toolsAllow: string[] | null = null;
+  let toolsExclude: string[] | null = null;
+  if (r.tools_json) {
+    try {
+      const parsed = JSON.parse(r.tools_json);
+      if (parsed.allow) toolsAllow = parsed.allow;
+      if (parsed.exclude) toolsExclude = parsed.exclude;
+    } catch { /* keep null */ }
+  }
+  return {
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    agentId: r.agent_id,
+    model: r.model,
+    effort: r.effort,
+    repoPath: r.repo_path,
+    permission: r.permission as PermissionPolicyMode | null,
+    toolsAllow,
+    toolsExclude,
+    instructions: r.instructions,
+    createdBy: r.created_by,
+    createdUtc: r.created_utc,
+    updatedUtc: r.updated_utc,
+  };
+};
+
+interface AliasRow {
+  alias: string;
+  channel_ref: string;
+  description: string | null;
+  created_by: string;
+  created_utc: string;
+}
+
+const mapAlias = (r: AliasRow): ThreadAlias => ({
+  alias: r.alias,
+  channelRef: r.channel_ref,
+  description: r.description,
+  createdBy: r.created_by,
+  createdUtc: r.created_utc,
+});
 
 export class SessionStore {
   private readonly db: Database.Database;
@@ -319,6 +407,114 @@ export class SessionStore {
 
   writeConfig(cfg: SessionConfigState): string {
     return JSON.stringify(cfg, null, 2);
+  }
+
+  // --- presets ---------------------------------------------------------------
+
+  upsertPreset(p: Preset): void {
+    const toolsJson = (p.toolsAllow || p.toolsExclude)
+      ? JSON.stringify({ allow: p.toolsAllow ?? undefined, exclude: p.toolsExclude ?? undefined })
+      : null;
+    this.db
+      .prepare(
+        `INSERT INTO presets
+           (id, name, description, agent_id, model, effort, repo_path,
+            permission, tools_json, instructions, created_by,
+            created_utc, updated_utc)
+         VALUES
+           (@id, @name, @description, @agentId, @model, @effort, @repoPath,
+            @permission, @toolsJson, @instructions, @createdBy,
+            @createdUtc, @updatedUtc)
+         ON CONFLICT(id) DO UPDATE SET
+           name         = excluded.name,
+           description  = excluded.description,
+           agent_id     = excluded.agent_id,
+           model        = excluded.model,
+           effort       = excluded.effort,
+           repo_path    = excluded.repo_path,
+           permission   = excluded.permission,
+           tools_json   = excluded.tools_json,
+           instructions = excluded.instructions,
+           updated_utc  = excluded.updated_utc`
+      )
+      .run({
+        id: p.id,
+        name: p.name,
+        description: p.description,
+        agentId: p.agentId,
+        model: p.model,
+        effort: p.effort,
+        repoPath: p.repoPath,
+        permission: p.permission,
+        toolsJson: toolsJson,
+        instructions: p.instructions,
+        createdBy: p.createdBy,
+        createdUtc: p.createdUtc,
+        updatedUtc: p.updatedUtc,
+      });
+  }
+
+  getPreset(id: string): Preset | null {
+    const row = this.db
+      .prepare<[string], PresetRow>("SELECT * FROM presets WHERE id = ?")
+      .get(id);
+    return row ? mapPreset(row) : null;
+  }
+
+  getPresetByName(name: string): Preset | null {
+    const row = this.db
+      .prepare<[string], PresetRow>("SELECT * FROM presets WHERE name = ? COLLATE NOCASE")
+      .get(name);
+    return row ? mapPreset(row) : null;
+  }
+
+  listPresets(): Preset[] {
+    return this.db
+      .prepare<[], PresetRow>("SELECT * FROM presets ORDER BY name ASC")
+      .all()
+      .map(mapPreset);
+  }
+
+  deletePreset(id: string): void {
+    this.db.prepare("DELETE FROM presets WHERE id = ?").run(id);
+  }
+
+  // --- thread aliases --------------------------------------------------------
+
+  upsertAlias(a: ThreadAlias): void {
+    this.db
+      .prepare(
+        `INSERT INTO thread_aliases (alias, channel_ref, description, created_by, created_utc)
+         VALUES (@alias, @channelRef, @description, @createdBy, @createdUtc)
+         ON CONFLICT(alias) DO UPDATE SET
+           channel_ref = excluded.channel_ref,
+           description = excluded.description`
+      )
+      .run({
+        alias: a.alias,
+        channelRef: a.channelRef,
+        description: a.description,
+        createdBy: a.createdBy,
+        createdUtc: a.createdUtc,
+      });
+  }
+
+  getAlias(alias: string): ThreadAlias | null {
+    const row = this.db
+      .prepare<[string], AliasRow>("SELECT * FROM thread_aliases WHERE alias = ? COLLATE NOCASE")
+      .get(alias);
+    return row ? mapAlias(row) : null;
+  }
+
+  listAliases(): ThreadAlias[] {
+    return this.db
+      .prepare<[], AliasRow>("SELECT * FROM thread_aliases ORDER BY alias ASC")
+      .all()
+      .map(mapAlias);
+  }
+
+  deleteAlias(alias: string): void {
+    this.db.prepare("DELETE FROM thread_aliases WHERE alias = ? COLLATE NOCASE").run(alias);
   }
 
   static defaultConfig(

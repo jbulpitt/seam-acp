@@ -54,6 +54,33 @@ export function defaultSessionConfig(
   return { model: defaultModel, permissionPolicy: defaultPolicy };
 }
 
+/** A named, reusable bundle of session configuration. */
+export interface Preset {
+  id: string;
+  name: string;
+  description: string | null;
+  agentId: string | null;
+  model: string | null;
+  effort: string | null;
+  repoPath: string | null;
+  permission: PermissionPolicyMode | null;
+  toolsAllow: string[] | null;
+  toolsExclude: string[] | null;
+  instructions: string | null;
+  createdBy: string;
+  createdUtc: string;
+  updatedUtc: string;
+}
+
+/** A short name mapping to a Discord thread, used for cross-thread delegation and reading. */
+export interface ThreadAlias {
+  alias: string;
+  channelRef: string;
+  description: string | null;
+  createdBy: string;
+  createdUtc: string;
+}
+
 /**
  * Resolve the effective permission mode for a session, honoring (in order):
  *   1. The new `permissionPolicy` field

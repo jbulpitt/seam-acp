@@ -271,6 +271,135 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("preset")
+      .setDescription("Manage reusable session presets")
+      .addSubcommand((sub) =>
+        sub
+          .setName("list")
+          .setDescription("List all presets")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("create")
+          .setDescription("Create a new preset (opens a builder card)")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("apply")
+          .setDescription("Apply a preset to the current thread")
+          .addStringOption((o) =>
+            o
+              .setName("name")
+              .setDescription("Preset name")
+              .setRequired(true)
+              .setAutocomplete(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("delete")
+          .setDescription("Delete a preset")
+          .addStringOption((o) =>
+            o
+              .setName("name")
+              .setDescription("Preset name")
+              .setRequired(true)
+              .setAutocomplete(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("show")
+          .setDescription("Show a preset's details")
+          .addStringOption((o) =>
+            o
+              .setName("name")
+              .setDescription("Preset name")
+              .setRequired(true)
+              .setAutocomplete(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("edit")
+          .setDescription("Edit an existing preset (reopens the builder card)")
+          .addStringOption((o) =>
+            o
+              .setName("name")
+              .setDescription("Preset name")
+              .setRequired(true)
+              .setAutocomplete(true)
+          )
+      )
+  );
+
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("alias")
+      .setDescription("Manage thread aliases for cross-thread interactions")
+      .addSubcommand((sub) =>
+        sub
+          .setName("set")
+          .setDescription("Create or update a thread alias")
+          .addStringOption((o) =>
+            o
+              .setName("name")
+              .setDescription("Short alias name (e.g. worker3, qa, planner)")
+              .setRequired(true)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("thread")
+              .setDescription("Thread/channel ID (or 'here' for this thread)")
+              .setRequired(true)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("description")
+              .setDescription("Optional description (shown in the agent preamble)")
+              .setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("list")
+          .setDescription("List all thread aliases")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("remove")
+          .setDescription("Remove a thread alias")
+          .addStringOption((o) =>
+            o
+              .setName("name")
+              .setDescription("Alias to remove")
+              .setRequired(true)
+          )
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub
+      .setName("peek")
+      .setDescription("Read recent messages from another thread by alias")
+      .addStringOption((o) =>
+        o
+          .setName("alias")
+          .setDescription("Thread alias (see /seam alias list)")
+          .setRequired(true)
+      )
+      .addIntegerOption((o) =>
+        o
+          .setName("count")
+          .setDescription("Number of recent messages to fetch (default 20, max 50)")
+          .setRequired(false)
+          .setMinValue(1)
+          .setMaxValue(50)
+      )
+  );
+
   return cmd;
 }
 
@@ -297,7 +426,8 @@ export type SeamSubcommand =
   | "whoami"
   | "usage"
   | "avatar"
-  | "help";
+  | "help"
+  | "peek";
 
 export function getSubcommand(
   i: ChatInputCommandInteraction

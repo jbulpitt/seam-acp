@@ -32,6 +32,18 @@ before running any procedure in this runbook:
 > sweep. All implementation work flows through GitHub issues. See §3 Phase 4 and
 > §4 Angle 4 for the exact decision tree.
 
+> **⚠️ ENVIRONMENT: agy inside seam-acp (Discord bot) — NO SUBAGENTS.**
+> If you are running as an `agy` agent bridged through seam-acp (i.e. you were
+> triggered by a Discord message), each of your turns runs as a one-shot
+> `agy -p <prompt>` process. The process **exits when your turn ends**. The
+> `invoke_subagent` tool will appear to succeed — subagents will be spawned —
+> but they will be orphaned and killed as soon as the turn ends, and their
+> responses will never arrive. **Do not use `invoke_subagent` in this
+> environment.** Instead, perform all research **inline** within a single turn
+> using `read_url_content`, `search_web`, and `run_command` directly. The sweep
+> will be slower (sequential instead of parallel) but reliable. See §3 Phase 1
+> for the full checklist of URLs to fetch.
+
 1. **[AGENTS.md](../AGENTS.md)** — what seam-acp is, project structure, critical
    rules (never `pm2 restart`, always `npm run redeploy`), output formatting
    constraints (no markdown tables in Discord).

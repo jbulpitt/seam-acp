@@ -2,8 +2,12 @@ node_modules
 dist
 .env
 .env.local
+.env*.bak*
 data/
 *.log
+
+# Local docs (reports, plans, specs — not committed; tracked files unaffected)
+docs/
 .DS_Store
 
 # Playwright MCP scratch outputs

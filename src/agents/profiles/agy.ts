@@ -914,17 +914,17 @@ class AgyAgent implements Agent {
       this.active.abort.abort();
       try { this.active.proc.kill(); } catch {}
     }
-    if (!wasActive) return;
-    // The aborted cascade gets parked in a "done" state in agy's LS, so
-    // rejoining it on the next prompt yields an immediate empty stream
-    // (chars:0, ~4s turns). Clear the cascadeId + step high-water so the
-    // next prompt allocates a fresh cascade via waitForNewCascade.
-    const sess = this.sessions.get(params.sessionId);
-    if (sess) {
-      sess.cascadeId = undefined;
-      sess.maxStepIndex = -1;
-    }
-    await clearPersistedSession(this.mappingFile, params.sessionId);
+    // IMPORTANT: do NOT wipe the cascadeId or clear the persisted mapping on
+    // cancel. Doing so destroyed the entire conversation on every interrupt /
+    // stop / timeout — the next prompt would allocate a brand-new cascade and
+    // the agent would "forget" the whole thread (root cause of the 2026-06-19
+    // session-loss bug). The "empty stream on rejoin" this once guarded against
+    // only happens when rejoining a cascade within the SAME language-server
+    // lifecycle (the just-aborted cascade is parked in that LS's memory). Each
+    // prompt spawns a fresh `agy -p` (fresh LS), so by the next turn the cascade
+    // resumes cleanly WITH full context (verified 2026-06-19). A rare immediate
+    // re-prompt right after a cancel may still yield one empty ~4s turn, but
+    // resending recovers it and no context is lost.
   }
 
   shutdown(): void {

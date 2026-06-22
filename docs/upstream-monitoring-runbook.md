@@ -4,7 +4,9 @@
 >
 > **Cadence**: Weekly sweep (recommended: Monday), with ad-hoc checks when a major release is announced.
 >
-> **Last updated**: 2026-06-19
+> **Last updated**: 2026-06-22
+>
+> **⚠️ AGENT CONSTRAINT — READ-ONLY / REPORTING MODE**: Agents executing this runbook must **never** modify seam-acp source files, run `npm run redeploy`, apply patches, or make any code changes during a monitoring sweep. All code work is tracked via GitHub issues and implemented in **separate, explicitly tasked sessions**. Your job during a sweep is to **find, classify, and file or update GitHub issues** — not to implement fixes.
 
 ---
 
@@ -24,6 +26,11 @@
 
 If you are an agent with no prior context about this project, read the following
 before running any procedure in this runbook:
+
+> **⚠️ STOP — NO CODE CHANGES.** You are in monitoring/reporting mode. Do not
+> modify any source file, run `npm run redeploy`, or apply any patch during this
+> sweep. All implementation work flows through GitHub issues. See §3 Phase 4 and
+> §4 Angle 4 for the exact decision tree.
 
 1. **[AGENTS.md](../AGENTS.md)** — what seam-acp is, project structure, critical
    rules (never `pm2 restart`, always `npm run redeploy`), output formatting
@@ -140,10 +147,11 @@ before running any procedure in this runbook:
 > full Opus `[1m]` IDs now resolve correctly natively** (per
 > [`model-management-runbook.md`](model-management-runbook.md) §4, against JSONL
 > ground truth) — the patch may be removable entirely. Latest versions at sweep:
-> claude-code **2.1.181**, claude-agent-acp **0.47.0** (maintained by Zed
-> Industries).
+> claude-code **2.1.183**, claude-agent-acp **0.48.0** (maintained by Zed
+> Industries). ACP SDK latest: **0.28.1** (v0.27.0 was a major ergonomic rewrite
+> — old `AcpClient`/`ClientSideConnection` deprecated, see MIGRATION_0.26_0.27.md).
 
-> **⚠️ CAUTION**: The `claude-agent-acp` resolver bug is well-documented: in v0.39, `unstable_setSessionModel` runs ALL model strings through `resolveModelPreference` which fuzzy-matches against a tiny 4-entry curated list. Full Opus IDs find no Opus entry → fuzzy-match to **Sonnet**. The patch (`npm run patch-acp`) makes canonical full IDs bypass the broken resolver. It is **wiped by any global npm update and must be re-applied + re-verified**. See §5.2 and [`model-management-runbook.md`](model-management-runbook.md). **As of the 2026-06-18 sweep**, we run 0.39.0 (patched); upstream latest is **0.47.0**.
+> **⚠️ CAUTION**: The `claude-agent-acp` resolver bug is well-documented: in v0.39, `unstable_setSessionModel` runs ALL model strings through `resolveModelPreference` which fuzzy-matches against a tiny 4-entry curated list. Full Opus IDs find no Opus entry → fuzzy-match to **Sonnet**. The patch (`npm run patch-acp`) makes canonical full IDs bypass the broken resolver. It is **wiped by any global npm update and must be re-applied + re-verified**. See §5.2 and [`model-management-runbook.md`](model-management-runbook.md). **As of the 2026-06-20 sweep**, we run 0.39.0 (patched); upstream latest is **0.48.0**.
 
 ### 1.3 GitHub Copilot
 
@@ -419,7 +427,14 @@ Write up findings using the [Report Template](#6-report-template).
 
 ### Phase 4: Act
 
-For any item tagged `action-required`, create a task or issue and link it in the report. Use the [Reaction Playbooks](#5-reaction-playbooks-seam-acp-specific) for common scenarios.
+**Never make code changes during the sweep.** For each finding, follow the decision tree in [§4 Angle 4](#angle-4-upgrade-action-decision-tree). The outcome is always one of:
+
+- A plain report entry (no seam-acp code changes needed)
+- A mention of an existing GitHub issue that already covers the finding
+- An update to an existing GitHub issue with new scope or version details
+- A new, detailed GitHub issue (written so another agent can implement it autonomously)
+
+Use the [Reaction Playbooks](#5-reaction-playbooks-seam-acp-specific) for common scenarios. Link all issue numbers in the report.
 
 ---
 
@@ -465,9 +480,92 @@ Every finding should be analyzed from three angles:
 | **Research relevance?** | Does this connect to interesting research or novel capabilities? |
 | **Community impact?** | How is the developer community reacting? |
 
+### Angle 4: Upgrade Action Decision Tree
+
+Every finding that involves a potential version upgrade, a behavioral change, or a newly identified seam-acp requirement must be processed through this decision tree. **Never make code changes during the sweep.**
+
+**Step 1 — Does this finding require seam-acp code changes?**
+
+Use the Angle 1 checklist above. If **no** (purely informational, billing note, general industry trend, model that's already handled dynamically by agy's live catalog, etc.):
+→ **Add to report as normal. Stop here — no further action required.**
+
+If **yes** (new CLI flag, changed API behavior, new model needing registration, ACP type changes, patch script breakage, config schema change, session storage format change, etc.):
+→ **Continue to Step 2.**
+
+**Step 2 — Check the GitHub Issues list for seam-acp.**
+
+Search [https://github.com/jbulpitt/seam-acp/issues](https://github.com/jbulpitt/seam-acp/issues) for an existing issue covering this upgrade. Search by:
+- Package/tool name (e.g., `claude-agent-acp`, `opencode`, `ACP SDK`, `copilot`)
+- Version number(s) involved
+- Symptom or behavior keyword (e.g., `model resolver`, `resolveModelPreference`, `modalities`, `EffortLevel`)
+
+**Step 3a — Issue exists AND already covers this specific version and change?**
+→ Mention the issue number in the report. Stop here — no further action required.
+*Example report note*: "Tracked in #42 — no new scope identified."
+
+**Step 3b — Issue exists but this finding adds new scope, version details, or edge cases?**
+→ **Update the existing GitHub issue** — be additive, preserve original content, and append a clearly dated update block (e.g., `**Update 2026-06-22 (sweep):**`). Mention the issue number and the update in the report.
+*Example report note*: "Updated #42 with new scope from claude-agent-acp 0.50.0 changelog."
+
+**Step 3c — No issue exists?**
+→ **Create a new, detailed GitHub issue** following the Issue Writing Guidelines below. Link the new issue number in the report.
+
+---
+
+**Issue Writing Guidelines (Step 3c)**
+
+The goal is an issue detailed enough that another agent can autonomously implement the change. Every issue must include:
+
+1. **Title** — Clear and specific. Include the package name and version if applicable.
+   *Example*: `Upgrade claude-agent-acp to ≥0.42.0 and verify/remove model resolver patch`
+
+2. **Context** — Why this change is needed. Link to the upstream changelog, release notes, GitHub release, or commit. Include the relevant excerpt or quote so the implementer doesn't have to re-find it.
+
+3. **Affected files** — List the specific seam-acp source files that will likely need changes. Reference the integration points from §1 and the key files in §4 Angle 1. Be specific about file paths.
+
+4. **Proposed changes** — Step-by-step description of what needs to happen. Be concrete:
+   - Name specific env vars, function names, config keys, file paths
+   - Reference the relevant reaction playbook (§5.x) or runbook section
+   - If it involves the Claude patch, reference [`model-management-runbook.md`](model-management-runbook.md) and the specific sections
+   - If it involves new model IDs, describe the verification steps (JSONL probe, status card check)
+
+5. **Research notes** — Anything discovered during the sweep that helps the implementer: relevant upstream commits, potential gotchas, related issues, prior art, links to spec/schema changes.
+
+6. **Acceptance criteria (AC)** — A concrete checklist the implementer can tick off to confirm the work is complete. Examples:
+   - `[ ] Patch re-applied and exits 0` (or confirmed removable)
+   - `[ ] JSONL ground truth confirms correct model (not self-report)`
+   - `[ ] Status card shows expected model + effort after restart`
+   - `[ ] npm run typecheck passes`
+   - `[ ] npm run build passes`
+   - `[ ] Live Discord session confirms expected behavior`
+
+7. **Priority / deadline** — Note if there is a deprecation date, sunset date, or if the change is actively breaking current functionality. Flag as blocking if appropriate.
+
 ---
 
 ## 5. Reaction Playbooks (seam-acp-specific)
+
+### 5.0 GitHub Issue Workflow (Quick Reference)
+
+> **This section is a quick reference.** The full decision tree and issue-writing guidelines are in [§4 Angle 4](#angle-4-upgrade-action-decision-tree).
+
+**Rule**: Never make code changes during a monitoring sweep.
+
+For every finding, ask: does this require seam-acp code changes?
+
+- **No** → add to report as normal. Done.
+- **Yes** → search [GitHub Issues](https://github.com/jbulpitt/seam-acp/issues).
+  - **Issue exists, exact scope covered** → mention issue # in report. Done.
+  - **Issue exists, needs updates** → append a dated update block to the issue. Mention issue # and update in report.
+  - **No issue exists** → write a detailed new issue (see §4 Angle 4 for guidelines). Mention new issue # in report.
+
+When writing a new issue, always include:
+- Upstream source (changelog URL, release URL, or commit)
+- Affected files in seam-acp with specific paths
+- Step-by-step proposed changes with concrete function/env var names
+- Acceptance criteria checklist
+- Deadline or urgency signal if applicable
+- Enough detail that another agent can implement autonomously
 
 ### 5.1 New model released by any provider
 

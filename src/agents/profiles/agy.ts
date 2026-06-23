@@ -79,6 +79,30 @@ interface PersistedSession {
 
 type SessionMapping = Record<string, PersistedSession | string>;
 
+/**
+ * Highest step index recorded in a cascade's conversation DB, or -1 if it can't
+ * be read. Used to seed the replay high-water mark for legacy mapping entries
+ * that pre-date step-index tracking: skip the already-recorded history but
+ * still deliver anything new. The DB is opened read-only so it never contends
+ * with the live language server writing the cascade.
+ */
+function conversationMaxStepIndex(cascadeId: string): number {
+  const dbPath = path.join(CONVERSATION_DIR, `${cascadeId}.db`);
+  try {
+    const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    try {
+      const row = db.prepare("SELECT MAX(idx) AS m FROM steps").get() as
+        | { m: number | null }
+        | undefined;
+      return typeof row?.m === "number" ? row.m : -1;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return -1;
+  }
+}
+
 async function loadPersistedSession(
   file: string,
   sessionId: string,
@@ -89,12 +113,14 @@ async function loadPersistedSession(
       const mapping = JSON.parse(data) as SessionMapping;
       const entry = mapping[sessionId];
       if (!entry) continue;
-      // Old format stored just the cascadeId as a string. Anything in the
-      // legacy file pre-dates step-index tracking, so the cascade was already
-      // fully delivered to the user by the previous turn — pin maxStepIndex
-      // high so the next turn skips the LS's history replay entirely.
+      // Old format stored just the cascadeId as a string, pre-dating step-index
+      // tracking. Seed the high-water mark from the conversation DB's current
+      // max idx: skip the LS's replay of already-recorded history, but still
+      // deliver new steps. (The previous Number.MAX_SAFE_INTEGER pin skipped
+      // EVERYTHING forever, so replies were never delivered — a silent
+      // empty-response trap if a legacy entry was ever loaded.)
       if (typeof entry === "string") {
-        return { cascadeId: entry, maxStepIndex: Number.MAX_SAFE_INTEGER };
+        return { cascadeId: entry, maxStepIndex: conversationMaxStepIndex(entry) };
       }
       return entry;
     } catch { /* try next */ }

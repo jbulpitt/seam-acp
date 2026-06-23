@@ -160,8 +160,24 @@ export class SessionRouter {
     if (opts?.clearAcpSession) {
       const record = this.store.get(sessionId);
       if (record?.acpSessionId) {
-        this.store.upsert({ ...record, acpSessionId: "", updatedUtc: new Date().toISOString() });
-        this.logger.info({ sessionId }, "cleared stored acp session id");
+        // For agy, the stored acp_session_id is the durable key into the
+        // agy-sessions.json cascade mapping. Per fix 17670d1, each `agy -p`
+        // spawns a fresh language server, so the cascade survives a cancel /
+        // session-gone and the agent resumes its full context next turn.
+        // Clearing it here would orphan that preserved mapping: the next turn
+        // sees an empty acp, calls newSession → a brand-new cascade, and the
+        // reply is dropped / the thread goes amnesiac (the 2026-06-23 empty-
+        // response bug). So preserve it for agy; only clear for agents whose
+        // ACP session genuinely dies on session-gone (claude / copilot).
+        if (record.agentId?.startsWith("agy")) {
+          this.logger.info(
+            { sessionId },
+            "preserving agy acp/cascade id across invalidate (durable across agy -p spawns)"
+          );
+        } else {
+          this.store.upsert({ ...record, acpSessionId: "", updatedUtc: new Date().toISOString() });
+          this.logger.info({ sessionId }, "cleared stored acp session id");
+        }
       }
     }
   }

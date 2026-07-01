@@ -47,8 +47,9 @@ import {
   type NewSessionResponse,
   type PromptRequest,
   type PromptResponse,
-  type SetSessionModelRequest,
-  type SetSessionModelResponse,
+  type SessionConfigOption,
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
@@ -610,13 +611,7 @@ class AgyAgent implements Agent {
     }
     return {
       sessionId: id,
-      models: {
-        availableModels: catalog.map((e) => ({
-          modelId: e.modelId,
-          name: pickerLabel(e),
-        })),
-        currentModelId: readCurrentModelId(catalog),
-      },
+      configOptions: buildAgyConfigOptions(catalog),
     };
   }
 
@@ -632,13 +627,7 @@ class AgyAgent implements Agent {
       return {};
     }
     return {
-      models: {
-        availableModels: catalog.map((e) => ({
-          modelId: e.modelId,
-          name: pickerLabel(e),
-        })),
-        currentModelId: readCurrentModelId(catalog),
-      },
+      configOptions: buildAgyConfigOptions(catalog),
     };
   }
 
@@ -648,33 +637,40 @@ class AgyAgent implements Agent {
     return {};
   }
 
-  async unstable_setSessionModel(
-    params: SetSessionModelRequest,
-  ): Promise<SetSessionModelResponse> {
+  async setSessionConfigOption(
+    params: SetSessionConfigOptionRequest,
+  ): Promise<SetSessionConfigOptionResponse> {
+    const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
+    // Only the "model" selector is advertised; anything else is a no-op that
+    // still echoes the current option set back per the ACP contract.
+    if (params.configId !== "model" || typeof params.value !== "string") {
+      return { configOptions: buildAgyConfigOptions(catalog) };
+    }
+    const modelId = params.value;
     const sess = this.sessions.get(params.sessionId);
     if (sess) {
-      sess.modelId = params.modelId;
+      sess.modelId = modelId;
     }
     // agy reads its active model from ~/.gemini/antigravity-cli/settings.json
     // at every CLI invocation. Since we spawn a fresh `agy -p` per prompt,
     // editing that file takes effect on the next turn.
-    const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
-    const entry = catalog.find((e) => e.modelId === params.modelId);
-    if (!entry) return {};
-    try {
-      let json: Record<string, unknown> = {};
+    const entry = catalog.find((e) => e.modelId === modelId);
+    if (entry) {
       try {
-        json = JSON.parse(fsSync.readFileSync(SETTINGS_FILE, "utf8")) as Record<string, unknown>;
-      } catch { /* fresh settings */ }
-      json["model"] = entry.rawDisplayName;
-      fsSync.writeFileSync(SETTINGS_FILE, JSON.stringify(json, null, 2) + "\n");
-    } catch (err) {
-      if (process.env.AGY_PROFILE_DEBUG) {
-        // eslint-disable-next-line no-console
-        console.error("[agy] setSessionModel failed:", err);
+        let json: Record<string, unknown> = {};
+        try {
+          json = JSON.parse(fsSync.readFileSync(SETTINGS_FILE, "utf8")) as Record<string, unknown>;
+        } catch { /* fresh settings */ }
+        json["model"] = entry.rawDisplayName;
+        fsSync.writeFileSync(SETTINGS_FILE, JSON.stringify(json, null, 2) + "\n");
+      } catch (err) {
+        if (process.env.AGY_PROFILE_DEBUG) {
+          // eslint-disable-next-line no-console
+          console.error("[agy] setSessionConfigOption failed:", err);
+        }
       }
     }
-    return {};
+    return { configOptions: buildAgyConfigOptions(catalog, modelId) };
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
@@ -1841,6 +1837,29 @@ function formatTokens(n: number): string {
 function pickerLabel(e: AgyCatalogEntry): string {
   const caps = [e.supportsThinking ? "🧠" : "", e.supportsImages ? "🖼️" : ""].filter(Boolean).join("");
   return `${e.recommended ? "★ " : ""}${e.displayName} — 🪟${e.ctx}${caps ? " " + caps : ""}`;
+}
+
+/** Build the ACP session config options advertised by the agy agent. ACP 1.x
+ *  no longer has a dedicated `models` field on session responses — the model
+ *  selector is a `configOption` with category/id "model". */
+function buildAgyConfigOptions(
+  catalog: ReadonlyArray<AgyCatalogEntry>,
+  currentModelId?: string,
+): SessionConfigOption[] {
+  return [
+    {
+      id: "model",
+      name: "Model",
+      description: "Antigravity model to use",
+      category: "model",
+      type: "select",
+      currentValue: currentModelId ?? readCurrentModelId(catalog),
+      options: catalog.map((e) => ({
+        value: e.modelId,
+        name: pickerLabel(e),
+      })),
+    },
+  ];
 }
 
 function readCurrentModelId(catalog: ReadonlyArray<AgyCatalogEntry>): string {

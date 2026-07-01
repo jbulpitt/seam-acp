@@ -113,7 +113,12 @@ export function makeClaudeProfile(opts: {
     id: opts.id ?? "claude",
     displayName: opts.displayName ?? "Anthropic Claude",
     defaultModel: opts.defaultModel,
-    staticModels: opts.staticModels,
+    // Stamp each picker entry with its canonical contextLimit so the
+    // orchestrator's staticModels→modelContextFloor path (used by every other
+    // agent) also seeds the Claude display window.
+    staticModels: opts.staticModels
+      ? withClaudeContextLimits(opts.staticModels)
+      : undefined,
     threadAbbr: opts.threadAbbr,
     configDir,
     // Effort is applied via `_meta.claudeCode.options.effort` in newSessionMeta.
@@ -414,19 +419,11 @@ export function makeClaudeProfile(opts: {
             const cacheCreation = u.cache_creation_input_tokens || 0;
             const output = u.output_tokens || 0;
             const totalUsed = input + cacheRead + cacheCreation + output;
-            // The JSONL model id has the [1m] suffix stripped (the API records
-            // e.g. "claude-opus-4-8"), so it can't always reveal the true
-            // window — the orchestrator's monotonic ceiling + cfg.model are the
-            // real source. This is a best-effort fallback only:
-            //  - explicit 1m token → 1M
-            //  - current Opus (4.7+) → 1M (auto-upgraded on Max, native on 4.8)
-            //  - everything else → 200K
-            const contextLimit =
-              /\b1m\b/i.test(model ?? "") ||
-              /-1m\b/i.test(model ?? "") ||
-              /^claude-opus-4-(?:[7-9]|\d\d)\b/.test(model ?? "")
-                ? 1_000_000
-                : 200_000;
+            // Best-effort fallback from the JSONL model id (the orchestrator's
+            // monotonic ceiling + the agent-reported UsageUpdate.size are the
+            // real source). Uses the same canonical table as compaction so the
+            // two never diverge.
+            const contextLimit = getClaudeContextWindow(model ?? undefined);
             return {
               model,
               totalUsed,
@@ -782,21 +779,56 @@ function pickStringField(
   return undefined;
 }
 
+/** Canonical context windows for Claude models, keyed by full model id. Single
+ *  source of truth for BOTH auto-compaction sizing (newSessionMeta) and the
+ *  staticModels `contextLimit` the orchestrator uses to seed the display window.
+ *
+ *  Since claude-agent-acp ≥0.42 resolves full canonical IDs correctly and 1.x
+ *  reports the true window at runtime (ACP UsageUpdate.size), model IDs no
+ *  longer carry a `[1m]` suffix — each model just declares its native window
+ *  here, and the agent-reported size refines this seed once a turn completes. */
+const CLAUDE_CONTEXT_WINDOWS: Record<string, number> = {
+  "claude-opus-4-8": 1_000_000,
+  "claude-opus-4-7": 1_000_000,
+  "claude-opus-4-6": 200_000,
+  "claude-fable-5": 1_000_000,
+  "claude-sonnet-5": 1_000_000,
+  "claude-sonnet-4-6": 200_000,
+  "claude-haiku-4-5": 200_000,
+};
+
+/** Family fallback for ids not in the exact table (dated ids, future point
+ *  releases): Opus 4.7+, Sonnet 5+, and Fable/Mythos 5+ are 1M; Opus 4.6 and
+ *  older, Sonnet 4.6 and older, and Haiku are 200K. */
+function claudeContextWindowFamily(id: string): number {
+  if (/opus-4[.-](?:[7-9]|\d{2,})\b/.test(id)) return 1_000_000;
+  if (/(?:sonnet|fable|mythos)-(?:[5-9]|\d{2,})\b/.test(id)) return 1_000_000;
+  return 200_000;
+}
+
 /** Map a model id to its TRUE context window, which drives the auto-compaction
  *  threshold in newSessionMeta. Getting this wrong causes premature compaction
- *  (200K threshold on a 1M model throws away 800K of usable context).
- *
- *  Rules verified empirically against claude-agent-acp 0.39 (JSONL ground truth):
- *  - Any model carrying a `1m` token → 1M (e.g. claude-opus-4-8[1m], sonnet[1m]).
- *  - `default` → 1M: on Max/Team-Premium it resolves to the latest Opus, which
- *    is 1M. (On lower tiers default is Sonnet 200K; if this bot ever runs on a
- *    non-Max account, revisit this.)
- *  - Everything else → 200K. */
-function getClaudeContextWindow(modelId?: string): number {
+ *  (a 200K threshold on a 1M model throws away 800K of usable context). */
+export function getClaudeContextWindow(modelId?: string): number {
   if (!modelId) return 200_000;
-  if (/\b1m\b/i.test(modelId) || /-1m\b/i.test(modelId)) return 1_000_000;
-  if (/^default$/i.test(modelId.trim())) return 1_000_000;
-  return 200_000;
+  // `default` resolves to the latest Opus on Max/Team-Premium → 1M. (On lower
+  // tiers it is Sonnet 200K; revisit if this bot ever runs on a non-Max account.)
+  const id = modelId.trim().toLowerCase().replace(/\[1m\]$/, "");
+  if (id === "default") return 1_000_000;
+  if (/\b1m\b/.test(id)) return 1_000_000; // tolerate any residual legacy suffix
+  return CLAUDE_CONTEXT_WINDOWS[id] ?? claudeContextWindowFamily(id);
+}
+
+/** Stamp each picker entry with its canonical contextLimit so the orchestrator's
+ *  `staticModels[].contextLimit → modelContextFloor` path (shared with every
+ *  other agent) also works for Claude, seeding the display window on turn 1. */
+function withClaudeContextLimits<T extends { modelId: string; name: string }>(
+  models: ReadonlyArray<T>
+): Array<T & { contextLimit: number }> {
+  return models.map((m) => ({
+    ...m,
+    contextLimit: getClaudeContextWindow(m.modelId),
+  }));
 }
 
 /** Whether a model uses ADAPTIVE thinking (the SDK's ThinkingConfig marks this
@@ -809,6 +841,10 @@ function isAdaptiveThinkingModel(modelId?: string): boolean {
   if (!modelId) return false;
   const m = modelId.toLowerCase().trim();
   if (m === "default") return true;
-  // Match "opus-4-6"/"opus-4.6" and up (single digit 6-9 or two-digit 10+).
-  return /opus-4[.-](?:[6-9]|\d\d)\b/.test(m);
+  // Opus 4.6+, Sonnet 5+, and Fable/Mythos 5+ are always-on adaptive thinking;
+  // Sonnet 4.6 and Haiku stream thinking via the budget path and are left alone.
+  return (
+    /opus-4[.-](?:[6-9]|\d{2,})\b/.test(m) ||
+    /(?:sonnet|fable|mythos)-(?:[5-9]|\d{2,})\b/.test(m)
+  );
 }

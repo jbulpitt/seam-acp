@@ -102,6 +102,21 @@ interface AvailableMode {
   name: string;
 }
 
+/** ACP select options may be a flat list of options or a list of groups; this
+ *  flattens either shape to the leaf options. */
+function flattenConfigSelectOptions(
+  options: import("@agentclientprotocol/sdk").SessionConfigSelectOptions
+): ReadonlyArray<
+  import("@agentclientprotocol/sdk").SessionConfigSelectOption
+> {
+  return (
+    options as ReadonlyArray<
+      | import("@agentclientprotocol/sdk").SessionConfigSelectOption
+      | import("@agentclientprotocol/sdk").SessionConfigSelectGroup
+    >
+  ).flatMap((o) => ("options" in o ? o.options : [o]));
+}
+
 /**
  * Owns one ACP child process and (optionally) one ACP session.
  *
@@ -362,8 +377,8 @@ export class AgentRuntime {
     this.sessionId = opts.sessionId;
     this.sessionInfo = {
       sessionId: opts.sessionId,
-      availableModels: this.toAvailableModels(result.models),
-      currentModelId: this.toCurrentModelId(result.models),
+      availableModels: this.toAvailableModels(result.configOptions),
+      currentModelId: this.toCurrentModelId(result.configOptions),
       availableModes: this.toAvailableModes(result.modes),
       currentModeId: this.toCurrentModeId(result.modes),
     };
@@ -463,14 +478,11 @@ export class AgentRuntime {
   }
 
   async setModel(modelId: string): Promise<void> {
-    const conn = this.requireConnection();
-    const sid = this.requireSessionId();
-    try {
-      await conn.unstable_setSessionModel({ sessionId: sid, modelId });
-    } catch (err) {
-      this.logger.warn({ err, modelId }, "unstable_setSessionModel failed; trying setSessionConfigOption fallback");
-      await this.setConfigOption("model", modelId);
-    }
+    // ACP 1.x: model selection is a session config option (configId "model");
+    // the old `unstable_setSessionModel` RPC is gone. Full canonical IDs
+    // exact-match the agent's advertised option values and bypass the fuzzy
+    // resolver; aliases (e.g. "default") fall through to it agent-side.
+    await this.setConfigOption("model", modelId);
     if (this.sessionInfo) {
       this.sessionInfo = { ...this.sessionInfo, currentModelId: modelId };
     }
@@ -799,31 +811,55 @@ export class AgentRuntime {
   ): SessionInfo {
     return {
       sessionId: result.sessionId,
-      availableModels: this.toAvailableModels(result.models),
-      currentModelId: this.toCurrentModelId(result.models),
+      availableModels: this.toAvailableModels(result.configOptions),
+      currentModelId: this.toCurrentModelId(result.configOptions),
       availableModes: this.toAvailableModes(result.modes),
       currentModeId: this.toCurrentModeId(result.modes),
     };
   }
 
+  /** Locate the model selector among the agent's session config options
+   *  (ACP 1.x: models moved from a dedicated `models` field into
+   *  `configOptions` with category/id "model"). */
+  private findModelOption(
+    configOptions:
+      | ReadonlyArray<import("@agentclientprotocol/sdk").SessionConfigOption>
+      | null
+      | undefined
+  ): import("@agentclientprotocol/sdk").SessionConfigOption | undefined {
+    if (!configOptions) return undefined;
+    return configOptions.find((o) => o.category === "model" || o.id === "model");
+  }
+
   private toAvailableModels(
-    models: import("@agentclientprotocol/sdk").NewSessionResponse["models"]
+    configOptions:
+      | ReadonlyArray<import("@agentclientprotocol/sdk").SessionConfigOption>
+      | null
+      | undefined
   ): ReadonlyArray<AvailableModel> {
+    // Profile-declared static models win: they carry the picker labels and
+    // contextLimit the agent doesn't advertise (Claude/Copilot pickers,
+    // opencode discovery).
     if (this.profile.staticModels && this.profile.staticModels.length > 0) {
       return this.profile.staticModels;
     }
-    if (!models) return [];
-    const list = (
-      models as { availableModels?: Array<AvailableModel> }
-    ).availableModels;
-    return Array.isArray(list) ? list : [];
+    const opt = this.findModelOption(configOptions);
+    if (!opt || opt.type !== "select") return [];
+    return flattenConfigSelectOptions(opt.options).map((o) => ({
+      modelId: o.value,
+      name: o.name,
+    }));
   }
 
   private toCurrentModelId(
-    models: import("@agentclientprotocol/sdk").NewSessionResponse["models"]
+    configOptions:
+      | ReadonlyArray<import("@agentclientprotocol/sdk").SessionConfigOption>
+      | null
+      | undefined
   ): string | undefined {
-    if (!models) return undefined;
-    return (models as { currentModelId?: string }).currentModelId;
+    const opt = this.findModelOption(configOptions);
+    if (!opt || opt.type !== "select") return undefined;
+    return typeof opt.currentValue === "string" ? opt.currentValue : undefined;
   }
 
   private toAvailableModes(

@@ -29,7 +29,7 @@
     "patch-acp": "node scripts/patch-claude-agent-acp.mjs"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^0.22.1",
+    "@agentclientprotocol/sdk": "^1.1.0",
     "@types/ws": "^8.18.1",
     "better-sqlite3": "^11.7.0",
     "croner": "^10.0.1",

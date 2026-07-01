@@ -122,6 +122,10 @@ export class Orchestrator {
   private restartPending = false;
   private readonly channelQueues = new Map<string, Promise<void>>();
   private readonly channelGenerations = new Map<string, number>();
+  /** Per-session timers that settle a woken "Working" card back to "Monitoring"
+   *  after background activity goes quiet. Display-only; cleared when a new turn
+   *  takes over the session's status card. */
+  private readonly bgSettleTimers = new Map<string, NodeJS.Timeout>();
   /** Set by index.ts after construction; used by /seam schedule handlers to
    *  arm/disarm timers and by the fire runner to drop deleted-thread schedules. */
   private scheduledManager?: ScheduledPromptManager;
@@ -308,6 +312,23 @@ export class Orchestrator {
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
+
+    // A new turn owns this session's status card now — cancel any lingering
+    // "settle back to Monitoring" timer left by the previous turn's background
+    // activity so it can't edit the new card.
+    const prevSettle = this.bgSettleTimers.get(record.id);
+    if (prevSettle) {
+      clearTimeout(prevSettle);
+      this.bgSettleTimers.delete(record.id);
+    }
+    // `backgroundLaunched`: the agent started a Monitor / background task this
+    // turn, so it should rest at "Monitoring" instead of "Done". `turnFinalized`:
+    // the main turn has fully finalized, so any *further* generative activity is
+    // an agent-initiated woken turn (not the trailing in-turn backlog the idle()
+    // drain handles) and should flip the card back to Working. Display-only.
+    const BG_SETTLE_MS = 10_000;
+    let backgroundLaunched = false;
+    let turnFinalized = false;
 
     const cfg = this.store.readConfig(record);
     const repoDisplay = this.repoDisplay(record.repoPath);
@@ -589,6 +610,43 @@ export class Orchestrator {
     try {
       let activeRuntime = await this.router.getOrStartRuntime(record);
       const eventHandler = async (event: Parameters<Parameters<typeof activeRuntime.onEvent>[0]>[0]) => {
+        // Note the agent launching a Monitor so the turn rests at "Monitoring"
+        // rather than "Done" even before any woken activity arrives. Anchored to
+        // the title start to avoid matching ordinary tools that merely mention
+        // "monitor" (e.g. reading monitor.ts); the reactive path below backstops
+        // any miss when the first woken activity actually arrives.
+        if (event.kind === "tool-start" && /^\s*monitor\b/i.test(event.title ?? "")) {
+          backgroundLaunched = true;
+        }
+        // Woken/background turn: once the main turn has finalized, further
+        // generative activity is the agent resuming on its own (a Monitor wake
+        // or a background task reporting). Flip the card back to Working and
+        // settle to Monitoring on quiescence, so it never sits on a stale "Done"
+        // while output is still streaming. Display-only — no session state touched.
+        if (
+          turnFinalized &&
+          (event.kind === "agent-text" ||
+            event.kind === "agent-thought" ||
+            event.kind === "tool-start")
+        ) {
+          backgroundLaunched = true;
+          if (status.state !== "Working") {
+            status.setState("Working");
+            status.setAction("Resumed — background activity");
+            void refresh();
+          }
+          const prev = this.bgSettleTimers.get(record.id);
+          if (prev) clearTimeout(prev);
+          this.bgSettleTimers.set(
+            record.id,
+            setTimeout(() => {
+              this.bgSettleTimers.delete(record.id);
+              status.setState("Monitoring");
+              status.setAction("🛰️ Background task active — resumes when it reports");
+              void refresh(true);
+            }, BG_SETTLE_MS)
+          );
+        }
         switch (event.kind) {
           case "agent-text": {
             refreshTyping();
@@ -1045,6 +1103,12 @@ export class Orchestrator {
       } else if (result.cancelled) {
         status.setState("Failed");
         status.setAction("Cancelled");
+      } else if (backgroundLaunched) {
+        // The agent launched a Monitor / background task and yielded the turn —
+        // it isn't finished, it's watching and may resume. Rest at Monitoring;
+        // a woken turn flips it back to Working (see the event handler).
+        status.setState("Monitoring");
+        status.setAction("🛰️ Background task active — resumes when it reports");
       } else {
         status.setState("Done");
         status.setAction(result.stopReason);
@@ -1194,6 +1258,10 @@ export class Orchestrator {
       status.setState("Failed");
       status.setAction(this.renderer.trimShort(isSessionGoneError(err) ? "Session lost — please resend your message." : errMsg, 120));
     } finally {
+      // The main turn is fully finalized: any further generative activity on
+      // this runtime is an agent-initiated woken turn (handled in eventHandler),
+      // not the in-turn backlog already drained above.
+      turnFinalized = true;
       clearInterval(heartbeat);
       if (pendingRefresh) {
         clearTimeout(pendingRefresh);

@@ -94,7 +94,10 @@ export type TurnState =
   | "Done"
   | "Failed"
   | "Timed out"
-  | "Waiting";
+  | "Waiting"
+  // Turn ended but the agent left background/monitor work running that may
+  // resume on its own (Claude Monitor tool / run_in_background tasks).
+  | "Monitoring";
 
 export interface StatusPanel {
   state: TurnState;

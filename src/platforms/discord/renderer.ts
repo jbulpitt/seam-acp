@@ -9,6 +9,7 @@ const COLOR_BY_STATE: Record<StatusPanel["state"], number> = {
   Failed: 0xed4245,    // red
   "Timed out": 0x95a5a6, // grey
   Waiting: 0x5865f2,   // blurple
+  Monitoring: 0x1abc9c, // teal — resting, background work pending
 };
 
 const ICON_BY_STATE: Record<StatusPanel["state"], string> = {
@@ -17,6 +18,7 @@ const ICON_BY_STATE: Record<StatusPanel["state"], string> = {
   "Timed out": "⏱️",
   Waiting: "⏸️",
   Working: "⏳",
+  Monitoring: "💤",
 };
 
 function trim(s: string, max: number): string {

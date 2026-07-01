@@ -295,23 +295,39 @@ export class SessionRouter {
     const cwd = record.repoPath ?? process.cwd();
 
     if (record.acpSessionId) {
-      try {
-        await runtime.loadSession({
-          sessionId: record.acpSessionId,
-          cwd,
-          model: cfg.model ?? this.defaultModel,
-          ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
-        });
-        this.logger.debug(
-          { sessionId: record.id, acpSessionId: record.acpSessionId },
-          "resumed acp session"
-        );
-        return runtime;
-      } catch (err) {
-        this.logger.warn(
-          { err, sessionId: record.id },
-          "session/load failed, creating new session"
-        );
+      // Resume with a couple short retries. Right after a redeploy the agent
+      // subprocess can still be spinning up when the first message lands, so
+      // the first loadSession can fail transiently — and falling straight
+      // through to newSession would overwrite the (good) acpSessionId and
+      // detach the thread from its conversation. A brief escalating backoff
+      // lets the agent finish starting before we give up.
+      const RESUME_ATTEMPTS = 3;
+      const RESUME_RETRY_MS = 400;
+      for (let attempt = 1; attempt <= RESUME_ATTEMPTS; attempt++) {
+        try {
+          await runtime.loadSession({
+            sessionId: record.acpSessionId,
+            cwd,
+            model: cfg.model ?? this.defaultModel,
+            ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+          });
+          this.logger.debug(
+            { sessionId: record.id, acpSessionId: record.acpSessionId, attempt },
+            "resumed acp session"
+          );
+          return runtime;
+        } catch (err) {
+          const lastAttempt = attempt === RESUME_ATTEMPTS;
+          this.logger.warn(
+            { err, sessionId: record.id, attempt, lastAttempt },
+            lastAttempt
+              ? "session/load failed after retries, creating new session"
+              : "session/load failed; retrying after short delay"
+          );
+          if (!lastAttempt) {
+            await new Promise((r) => setTimeout(r, RESUME_RETRY_MS * attempt));
+          }
+        }
       }
     }
 

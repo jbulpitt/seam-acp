@@ -210,7 +210,7 @@ const Schema = z.object({
    * — the session's own model may be too small to fit a near-full transcript
    * (e.g. Sonnet 200K compacting at 80% leaves no headroom for the response).
    */
-  AGY_COMPACTION_MODEL: z.string().default("Gemini 3.1 Pro (High)"),
+  AGY_COMPACTION_MODEL: z.string().default("Claude Opus 4.6 (Thinking)"),
   // "default" resolves to the latest Opus @ 1M; the bare "opus[1m]" alias
   // mis-resolves to the credit-gated sonnet[1m] in claude-agent-acp 0.39.
   CLAUDE_COMPACTION_MODEL: z.string().default("default"),
@@ -247,11 +247,53 @@ const Schema = z.object({
 
   CLAUDE_MODELS: ModelsListSchema,
 
+  CLAUDE_VERTEX_PROJECT_ID: z.string().optional(),
+  CLAUDE_VERTEX_REGION: z.string().default("us-central1"),
+
   /** Path to the `agy` (Antigravity) binary. Defaults to `~/.local/bin/agy` if present, else `agy` on PATH. */
   AGY_CLI_PATH: z.string().optional(),
   /** Cosmetic model id reported by the Antigravity profile. */
   AGY_DEFAULT_MODEL: z.string().default("antigravity"),
   AGY_MODELS: ModelsListSchema,
+
+  /**
+   * Register the OpenAI Codex agent: `@agentclientprotocol/codex-acp` — a
+   * dedicated ACP adapter for the Codex CLI (`@openai/codex`). When enabled,
+   * an "OpenAI Codex" profile appears in `/seam agent`.
+   * false → not registered.
+   */
+  CODEX_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  /** Path to the `codex-acp` binary. Defaults to `codex-acp` on PATH. */
+  CODEX_CLI_PATH: z.string().optional(),
+  /** Default model id for the Codex profile (e.g. "o3", "gpt-5.5"). */
+  CODEX_DEFAULT_MODEL: z.string().default("gpt-5.5"),
+  CODEX_MODELS: ModelsListSchema,
+  /** Model used for /compact on Codex sessions. Defaults to same as Copilot. */
+  CODEX_COMPACTION_MODEL: z.string().default("gpt-5.5"),
+
+  /**
+   * Register the xAI Grok Build agent.  The `grok` CLI speaks ACP natively
+   * via `grok agent stdio` — no separate adapter is needed.
+   * When enabled, a "Grok Build" profile appears in `/seam agent`.
+   * false → not registered.
+   */
+  GROK_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  /** Path to the `grok` binary. Defaults to `grok` on PATH. */
+  GROK_CLI_PATH: z.string().optional(),
+  /** Default model id for the Grok profile (e.g. "grok-build-0.1"). */
+  GROK_DEFAULT_MODEL: z.string().default("grok-build-0.1"),
+  GROK_MODELS: ModelsListSchema,
+  /** Model used for /compact on Grok sessions. */
+  GROK_COMPACTION_MODEL: z.string().default("grok-build-0.1"),
+  /** xAI API key.  When set, enables dynamic model discovery at startup via
+   *  GET https://api.x.ai/v1/models and is passed to the grok CLI process. */
+  GROK_API_KEY: z.string().optional(),
 
   /**
    * Register the "LM Studio 🦙" agent: opencode (sst/opencode, `opencode acp`) —
@@ -527,6 +569,29 @@ function loadChannelPresets(file: string | undefined): Map<string, ChannelPreset
   }
   return out;
 }
+
+/** Models from the Codex CLI's bundled catalog (models.json in openai/codex).
+ *  `context_window` is the default working window; `max_context_window` is the
+ *  extended limit (only gpt-5.4 supports extended context to 1M). We use
+ *  `context_window` for `contextLimit` since that's the practical size.
+ *  CODEX_MODELS env var overrides this list when set. */
+export const CODEX_STATIC_MODELS = [
+  { modelId: "gpt-5.5",           name: "GPT-5.5",            contextLimit: 272_000 },
+  { modelId: "gpt-5.4",           name: "GPT-5.4",            contextLimit: 272_000 },
+  { modelId: "gpt-5.4-mini",      name: "GPT-5.4 mini",       contextLimit: 272_000 },
+  { modelId: "gpt-5.3-codex",     name: "GPT-5.3-Codex",      contextLimit: 272_000 },
+  { modelId: "gpt-5.2",           name: "GPT-5.2",            contextLimit: 272_000 },
+];
+
+/** Models for xAI Grok Build.  Context windows from docs.x.ai/developers/models.
+ *  GROK_MODELS env var overrides this list when set. */
+export const GROK_STATIC_MODELS = [
+  { modelId: "grok-build-0.1",                 name: "Grok Build 0.1",             contextLimit: 256_000 },
+  { modelId: "grok-4.3",                       name: "Grok 4.3",                   contextLimit: 1_000_000 },
+  { modelId: "grok-4.20-0309-reasoning",       name: "Grok 4.20 Reasoning",        contextLimit: 1_000_000 },
+  { modelId: "grok-4.20-0309-non-reasoning",   name: "Grok 4.20 Non-Reasoning",    contextLimit: 1_000_000 },
+  { modelId: "grok-4.20-multi-agent-0309",     name: "Grok 4.20 Multi-Agent",      contextLimit: 1_000_000 },
+];
 
 export const REMOTE_MAC_MODELS = [
   { modelId: "claude-opus-4.6", name: "Claude Opus 4.6", contextLimit: 200_000 },

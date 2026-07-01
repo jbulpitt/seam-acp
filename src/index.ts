@@ -1,5 +1,5 @@
 import path from "node:path";
-import { loadConfig, REMOTE_MAC_MODELS } from "./config.js";
+import { loadConfig, REMOTE_MAC_MODELS, CODEX_STATIC_MODELS, GROK_STATIC_MODELS } from "./config.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
 import { SessionStore } from "./core/session-store.js";
@@ -8,6 +8,8 @@ import { makeCopilotProfile } from "./agents/profiles/copilot.js";
 import { makeClaudeProfile } from "./agents/profiles/claude.js";
 import { makeAgyProfile } from "./agents/profiles/agy.js";
 import { makeOpencodeProfile, fetchLmStudioModels, syncOpencodeLmStudioConfig } from "./agents/profiles/opencode.js";
+import { makeCodexProfile } from "./agents/profiles/codex.js";
+import { makeGrokProfile, fetchXaiModels } from "./agents/profiles/grok.js";
 import { makeRemoteCopilotServerProfile, makeRemoteCopilotClientProfile } from "./agents/profiles/remote.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
@@ -84,6 +86,29 @@ async function main(): Promise<void> {
     })
   );
 
+  // Optional Vertex AI Claude profile: same claude-agent-acp binary, but with
+  // CLAUDE_CODE_USE_VERTEX=1 and GCP project/region injected per-spawn so the
+  // standard `claude` profile stays on the direct Anthropic API.
+  const claudeVertex = config.CLAUDE_VERTEX_PROJECT_ID
+    ? makeClaudeProfile({
+        id: "claude-vertex",
+        displayName: "Claude (Vertex AI)",
+        ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
+        defaultModel: config.CLAUDE_DEFAULT_MODEL,
+        staticModels: config.CLAUDE_MODELS,
+        threadAbbr: "👾☁️",
+        maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
+        thinkingDisplay: config.CLAUDE_THINKING_DISPLAY,
+        compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
+        mcpServers,
+        extraEnv: {
+          CLAUDE_CODE_USE_VERTEX: "1",
+          ANTHROPIC_VERTEX_PROJECT_ID: config.CLAUDE_VERTEX_PROJECT_ID,
+          CLOUD_ML_REGION: config.CLAUDE_VERTEX_REGION,
+        },
+      })
+    : undefined;
+
   const agy = makeAgyProfile({
     ...(config.AGY_CLI_PATH ? { cliPath: config.AGY_CLI_PATH } : {}),
     defaultModel: config.AGY_DEFAULT_MODEL,
@@ -92,6 +117,40 @@ async function main(): Promise<void> {
     dataDir: config.DATA_DIR,
     printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
   });
+
+  // Optional OpenAI Codex agent via @agentclientprotocol/codex-acp.
+  const codex = config.CODEX_ENABLED
+    ? makeCodexProfile({
+        ...(config.CODEX_CLI_PATH ? { cliPath: config.CODEX_CLI_PATH } : {}),
+        defaultModel: config.CODEX_DEFAULT_MODEL,
+        staticModels: config.CODEX_MODELS ?? CODEX_STATIC_MODELS,
+        threadAbbr: "🧬",
+      })
+    : undefined;
+
+  // Optional xAI Grok Build agent — speaks ACP natively via `grok agent stdio`.
+  // When GROK_API_KEY is set and no explicit GROK_MODELS override, discover the
+  // live model list from xAI's /v1/models endpoint so the picker stays current.
+  let grokModels: Array<{ modelId: string; name: string; contextLimit?: number }> | undefined;
+  if (config.GROK_ENABLED && !config.GROK_MODELS && config.GROK_API_KEY) {
+    const discovered = await fetchXaiModels(config.GROK_API_KEY).catch((err) => {
+      logger.warn({ err }, "grok: xAI model discovery failed; using static list");
+      return [];
+    });
+    if (discovered.length > 0) {
+      grokModels = discovered;
+      logger.info({ count: discovered.length }, "grok: discovered xAI models");
+    }
+  }
+  const grok = config.GROK_ENABLED
+    ? makeGrokProfile({
+        ...(config.GROK_CLI_PATH ? { cliPath: config.GROK_CLI_PATH } : {}),
+        defaultModel: config.GROK_DEFAULT_MODEL,
+        staticModels: config.GROK_MODELS ?? grokModels ?? GROK_STATIC_MODELS,
+        threadAbbr: "🪐",
+        ...(config.GROK_API_KEY ? { extraEnv: { XAI_API_KEY: config.GROK_API_KEY } } : {}),
+      })
+    : undefined;
 
   // Optional "LM Studio 🦙" agent: opencode (sst/opencode) over ACP, pointed at a
   // local/remote LM Studio via opencode's own config. Provider-agnostic, so it
@@ -203,7 +262,7 @@ async function main(): Promise<void> {
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, agy, ...(ollama ? [ollama] : []), ...remoteCopilots],
+    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(ollama ? [ollama] : []), ...remoteCopilots],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".

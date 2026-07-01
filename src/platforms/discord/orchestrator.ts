@@ -28,8 +28,8 @@ import type {
 } from "../chat-adapter.js";
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
 import { cleanTextForPreview, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "../../agents/session-manager.js";
-import { readRichHistory } from "../../core/compaction/source-reader.js";
-import { analyzeSessionCoverage, detectGaps, type TimeRange } from "../../core/compaction/gap-detector.js";
+import { readRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
+import { analyzeSessionCoverage, detectGaps, type TimeRange, type GapReport } from "../../core/compaction/gap-detector.js";
 import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
 import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, assembleNewSession, type PinnedFacts } from "../../core/compaction/prompts.js";
 import type { AgentProfile } from "../../agents/agent-profile.js";
@@ -1301,6 +1301,12 @@ export class Orchestrator {
     ) {
       return this.config.COPILOT_COMPACTION_MODEL;
     }
+    if (agentId === "codex" || agentId.startsWith("codex-")) {
+      return this.config.CODEX_COMPACTION_MODEL;
+    }
+    if (agentId === "grok" || agentId.startsWith("grok-")) {
+      return this.config.GROK_COMPACTION_MODEL;
+    }
     return "";
   }
 
@@ -1429,8 +1435,12 @@ export class Orchestrator {
     // prior `meta: { reasoningEffort }` was a silent no-op.) Undefined ⇒ no knob
     // for this agent (agy is modelBaked; remote has none) — left at its default.
     const effort = opts?.effort;
+    // The AGY CLI (Gemini) silently truncates stdin prompts larger than ~150KB.
+    // For large prompts, write the content to a temp file and reference it.
+    const LARGE_PROMPT_THRESHOLD = 100 * 1024; // 100 KB
     return async (prompt: string, label: string): Promise<string> => {
       let rt: AgentRuntime | undefined;
+      let tempFile: string | undefined;
       try {
         rt = new AgentRuntime({
           profile,
@@ -1443,9 +1453,25 @@ export class Orchestrator {
         rt.onEvent((event) => {
           if (event.kind === "agent-text") text += event.text;
         });
-        await rt.prompt(prompt);
+
+        let actualPrompt = prompt;
+        if (prompt.length > LARGE_PROMPT_THRESHOLD) {
+          tempFile = path.join(os.tmpdir(), `compaction-prompt-${label}-${Date.now()}.txt`);
+          await fsp.writeFile(tempFile, prompt, "utf8");
+          actualPrompt =
+            `Your full instructions and content have been saved to the file: ${tempFile}\n` +
+            `Read that file NOW and follow all instructions in it. ` +
+            `The file is ${Math.round(prompt.length / 1024)} KB. ` +
+            `You MUST read the ENTIRE file before producing your response.`;
+        }
+
+        await rt.prompt(actualPrompt);
+        await rt.idle();
         return text;
       } finally {
+        if (tempFile) {
+          await fsp.unlink(tempFile).catch(() => {});
+        }
         if (rt) {
           const tempSessionId = rt.getSessionInfo()?.sessionId;
           await rt.dispose().catch(() => {});
@@ -1551,6 +1577,81 @@ export class Orchestrator {
     });
   }
 
+  /** Run the premium multi-agent compaction pipeline reconstructed from the full
+   *  Discord thread history. Works for any compactable agent profile. */
+  private async runPremiumCompactionForDiscord(args: {
+    profile: AgentProfile;
+    manager: ISessionManager;
+    sessionId: string;
+    cwd: string;
+    channel?: ChannelRef;
+    onProgress?: (msg: string) => void;
+  }): Promise<PremiumCompactionResult> {
+    const { profile, manager, sessionId, cwd, channel, onProgress } = args;
+    const log = (m: string) => { onProgress?.(m); this.logger.debug({ compaction: `discord-${sessionId}` }, m); };
+
+    if (!channel) {
+      throw new Error("Discord compaction requires an active channel context.");
+    }
+    if (typeof this.adapter.fetchThreadMessagesTimed !== "function") {
+      throw new Error("Chat adapter does not support fetching timed thread messages.");
+    }
+
+    log("fetching thread history from Discord…");
+    const threadMsgs = await this.adapter.fetchThreadMessagesTimed(channel);
+    if (threadMsgs.length === 0) {
+      throw new Error("No messages found in this Discord thread to compact.");
+    }
+
+    log(`fetched ${threadMsgs.length} message(s) from Discord, mapping to rich history…`);
+
+    const events: HistoryEvent[] = threadMsgs.map((m) => ({
+      kind: m.authorIsBot ? "assistant" : "user",
+      ts: m.ts,
+      text: m.text,
+    }));
+
+    const userTurns = events.filter((e) => e.kind === "user").length;
+    const assistantTurns = events.filter((e) => e.kind === "assistant").length;
+    const firstEvent = events[0];
+    const lastEvent = events[events.length - 1];
+    const firstTs = firstEvent?.ts ? new Date(firstEvent.ts).toISOString() : undefined;
+    const lastTs = lastEvent?.ts ? new Date(lastEvent.ts).toISOString() : undefined;
+    const estimatedTokens = Math.ceil(renderHistory(events).length / 4);
+
+    const richHistory: RichHistory = {
+      events,
+      stats: {
+        totalEvents: events.length,
+        userTurns,
+        assistantTurns,
+        thinkingKept: 0,
+        thinkingRedactedSkipped: 0,
+        toolEvents: 0,
+        ...(firstTs ? { firstTs } : {}),
+        ...(lastTs ? { lastTs } : {}),
+        estimatedTokens,
+        thinkingAvailable: false,
+      },
+    };
+
+    const gapReport: GapReport = {
+      signals: [],
+      discordRanges: [],
+      needDiscord: false,
+    };
+
+    const runAgent = this.makeCompactionRunAgent(profile, manager, {
+      effort: this.compactionEffortFor(profile, "premium"),
+    });
+    return runPremiumCompaction({
+      richHistory,
+      gapReport,
+      runAgent,
+      log,
+    });
+  }
+
   /** Split a `getTranscript` rendering ("### User\n…\n\n### Assistant\n…") into
    *  its turn blocks, preserving order and the role headers. */
   private splitTranscriptTurns(transcript: string): string[] {
@@ -1648,17 +1749,13 @@ export class Orchestrator {
    *  recovery requests, pinned facts, the assembled seed) so the detail is
    *  reviewable beyond the Discord summary card. */
   private formatPremiumReport(result: PremiumCompactionResult, sessionId: string): string {
-    const v = result.critique.verdicts ?? [];
-    const rec = result.critique.recoveries ?? [];
     return [
       `# Premium compaction report — ${sessionId}`,
       ``,
       `- Stats: ${JSON.stringify(result.stats)}`,
       ``,
-      `## Completeness critic (${v.filter((x) => x.preserved).length}/${v.length} preserved)`,
-      ...v.map((x) => `- ${x.preserved ? "✅" : "❌"} **${x.checklistItem}** — ${x.evidence}`),
-      rec.length ? `\n### Recovery requests\n` + rec.map((r) => `- ${r.what} (${r.fromTs ?? "?"}→${r.toTs ?? "?"}, ${r.source})`).join("\n") : `\n(no recoveries requested)`,
-      ``, `---`, ``,
+      `---`,
+      ``,
       `## Pinned facts (verbatim)`, "```json", JSON.stringify(result.pinnedFacts, null, 2), "```",
       ``, `---`, ``,
       `## Assembled session seed`, ``, result.assembledSeed,
@@ -3602,12 +3699,21 @@ export class Orchestrator {
             .setStyle(ButtonStyle.Primary)
         );
       }
-      // Premium (multi-agent) compaction — needs a raw-history reader (Claude).
+      // Premium (session JSONL based) — needs a raw-history reader (Claude/agy).
       if (canCompact && typeof mgr.getHistoryPath === "function") {
         row4Buttons.push(
           new ButtonBuilder()
             .setCustomId("sessions:premium")
-            .setLabel("✨ Premium Compact")
+            .setLabel("✨ Premium Compact (Session)")
+            .setStyle(ButtonStyle.Success)
+        );
+      }
+      // Premium (Discord thread based) — works for any compactable agent.
+      if (canCompact) {
+        row4Buttons.push(
+          new ButtonBuilder()
+            .setCustomId("sessions:premium_discord")
+            .setLabel("✨ Premium Compact (Discord)")
             .setStyle(ButtonStyle.Success)
         );
       }
@@ -3900,8 +4006,8 @@ export class Orchestrator {
             let sanitizedTranscript = transcript
               .split("\n")
               .map((line) => {
-                if (line.length > 1000) {
-                  return line.substring(0, 1000) + " ... [Line truncated]";
+                if (line.length > 2000) {
+                  return line.substring(0, 2000) + " ... [Line truncated]";
                 }
                 return line;
               })
@@ -3912,13 +4018,46 @@ export class Orchestrator {
               throw new Error(`Rebuild is not supported for agent profile \`${record.agentId}\``);
             }
             const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
-            const templateOverhead = promptTemplate.length + "\n\nConversation Transcript:\n".length;
+            // Add a rebuild-specific addendum: the compact.md template was designed
+            // for mid-session compaction. For full thread reconstruction we need the
+            // model to cover the entire conversation — especially the end.
+            const rebuildAddendum =
+              "\n\nIMPORTANT: This is a full thread reconstruction from Discord history. " +
+              "The transcript below contains the ENTIRE conversation. You MUST cover " +
+              "the full conversation from start to finish in your summary. Give " +
+              "special emphasis to the most RECENT work (the last ~30% of the " +
+              "transcript) — that is the current state the user needs to resume from. " +
+              "Do NOT spend excessive detail on early/introductory messages at the " +
+              "expense of recent ones. If the analysis section is getting very long, " +
+              "abbreviate the early parts and expand on the latest work.\n";
+            const fullTemplate = promptTemplate + rebuildAddendum;
+            const templateOverhead = fullTemplate.length + "\n\nConversation Transcript:\n".length;
             sanitizedTranscript = fitTranscriptToWindow(
               sanitizedTranscript,
               templateOverhead,
               compactionWindowFor(compactionModel)
             );
-            const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
+            this.logger.info(
+              { channelId: i.channelId, msgCount: rawMessages.length,
+                transcriptChars: sanitizedTranscript.length, model: compactionModel },
+              "rebuild: transcript assembled",
+            );
+
+            // Write transcript to a temp file rather than inlining it in the
+            // prompt. The AGY CLI (Gemini) truncates stdin prompts larger than
+            // ~150KB, but the model can read arbitrarily large files via its
+            // file-reading tools without any truncation.
+            const transcriptFile = path.join(
+              cwd, `.rebuild-transcript-${i.channelId}-${Date.now()}.txt`,
+            );
+            await fsp.writeFile(transcriptFile, sanitizedTranscript, "utf8");
+
+            const compactionPrompt =
+              `${fullTemplate}\n\n` +
+              `The conversation transcript has been saved to the file: ${transcriptFile}\n` +
+              `Read that file NOW and then produce your summary. ` +
+              `The file contains ${rawMessages.length} messages (${sanitizedTranscript.length} chars). ` +
+              `You MUST read the ENTIRE file before summarizing — do not stop partway through.`;
 
             tempRuntime = new AgentRuntime({
               profile,
@@ -3941,7 +4080,12 @@ export class Orchestrator {
               }
             });
 
-            const outcome = await tempRuntime.prompt(compactionPrompt);
+            try {
+              const outcome = await tempRuntime.prompt(compactionPrompt);
+            } finally {
+              // Clean up the temp transcript file
+              await fsp.unlink(transcriptFile).catch(() => {});
+            }
 
             if (!summaryText.trim()) {
               throw new Error("Agent completed but returned an empty summary.");
@@ -4304,8 +4448,6 @@ export class Orchestrator {
               const reportPath = path.join(os.tmpdir(), `premium-compaction-${session.sessionId}.md`);
               await fsp.writeFile(reportPath, this.formatPremiumReport(result, session.sessionId), "utf8").catch(() => {});
 
-              const v = result.critique.verdicts ?? [];
-              const preserved = v.filter((x) => x.preserved).length;
               const successEmbed = new EmbedBuilder()
                 .setTitle("✨ Premium Compaction Complete")
                 .setDescription(
@@ -4315,9 +4457,6 @@ export class Orchestrator {
                 )
                 .addFields(
                   { name: "Chunks", value: String(result.stats.chunks), inline: true },
-                  { name: "Deep-dives", value: String(result.stats.deepDives), inline: true },
-                  { name: "Completeness", value: `${preserved}/${v.length} preserved`, inline: true },
-                  { name: "Recoveries flagged", value: String(result.stats.recoveriesRequested), inline: true },
                 )
                 .setColor(0x2ecc71);
 
@@ -4330,6 +4469,99 @@ export class Orchestrator {
               });
             } catch (err: any) {
               this.logger.error({ err, sessionId: session.sessionId }, "premium compaction failed");
+              const errorEmbed = new EmbedBuilder()
+                .setTitle("❌ Premium Compaction Failed")
+                .setDescription(`\`\`\`\n${(err?.message ?? String(err)).slice(0, 1500)}\n\`\`\``)
+                .setColor(0xe74c3c);
+              await btnInteraction.editReply({ embeds: [errorEmbed], components: [backRow] }).catch(() => {});
+            }
+          })();
+        }
+      } else if (customId === "sessions:premium_discord") {
+        await btnInteraction.deferUpdate();
+        const session = sessions[currentIndex];
+        if (session) {
+          const channelRef = this.channelRefFromInteraction(i);
+          const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setCustomId("sessions:summary_back").setLabel("⬅ Back to Manage").setStyle(ButtonStyle.Secondary)
+          );
+          const progressEmbed = new EmbedBuilder()
+            .setTitle("✨ Premium Compaction (Discord)")
+            .setDescription(`Running multi-agent compaction on full Discord history…\nThis can take several minutes (fan-out → reduce → deep-dive → synthesize → verify).`)
+            .setColor(0x9b59b6);
+          await btnInteraction.editReply({ embeds: [progressEmbed], components: [] });
+
+          void (async () => {
+            let lastEdit = 0;
+            let editing = false;
+            const lines: string[] = [];
+            const pushProgress = (m: string) => {
+              lines.push(m);
+              const now = Date.now();
+              if (editing || now - lastEdit < 2500) return;
+              editing = true;
+              lastEdit = now;
+              const tail = lines.slice(-8).map((l) => `• ${l}`).join("\n");
+              btnInteraction.editReply({
+                embeds: [EmbedBuilder.from(progressEmbed).setDescription(`Compacting from Discord history…\n\n${tail}`)],
+                components: [],
+              }).catch(() => {}).finally(() => { editing = false; });
+            };
+
+            try {
+              const result = await this.runPremiumCompactionForDiscord({
+                profile,
+                manager,
+                sessionId: session.sessionId,
+                cwd,
+                ...(channelRef ? { channel: channelRef } : {}),
+                onProgress: pushProgress,
+              });
+
+              if (!result.assembledSeed.trim()) throw new Error("Pipeline produced an empty result.");
+
+              // Non-destructive: seed a NEW resumable session with the summary,
+              // bind the thread if this was its active session, preserve the original.
+              const cfg = this.store.readConfig(record);
+              const newId = await this.seedNewSession({
+                profile, cwd,
+                ...(cfg.model ? { model: cfg.model } : {}),
+                ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+                summary: result.assembledSeed,
+              });
+              const wasActive = session.sessionId === record.acpSessionId;
+              if (wasActive) {
+                this.store.upsert({ ...record, acpSessionId: newId, updatedUtc: new Date().toISOString() });
+                await this.router.invalidate(record.id, { clearAcpSession: false });
+              }
+              sessions = await manager.listSessions(cwd);
+              const newIndex = sessions.findIndex((s) => s.sessionId === newId);
+              if (newIndex !== -1) currentIndex = newIndex;
+
+              const reportPath = path.join(os.tmpdir(), `premium-compaction-discord-${session.sessionId}.md`);
+              await fsp.writeFile(reportPath, this.formatPremiumReport(result, session.sessionId), "utf8").catch(() => {});
+
+              const successEmbed = new EmbedBuilder()
+                .setTitle("✨ Premium Compaction (Discord) Complete")
+                .setDescription(
+                  `Compacted from Discord thread history into a **new session** \`${newId}\` with the multi-agent pipeline.` +
+                  (wasActive ? ` This thread is now bound to it.` : ``) +
+                  `\nOriginal \`${session.sessionId}\` is **preserved** (review or delete it from this list).`
+                )
+                .addFields(
+                  { name: "Chunks", value: String(result.stats.chunks), inline: true },
+                )
+                .setColor(0x2ecc71);
+
+              await btnInteraction.editReply({
+                embeds: [successEmbed],
+                components: [backRow],
+                files: [new AttachmentBuilder(reportPath, { name: `premium-compaction-discord-${session.sessionId}.md` })],
+              }).catch(async () => {
+                await btnInteraction.editReply({ embeds: [successEmbed], components: [backRow] }).catch(() => {});
+              });
+            } catch (err: any) {
+              this.logger.error({ err, sessionId: session.sessionId }, "premium compaction (Discord) failed");
               const errorEmbed = new EmbedBuilder()
                 .setTitle("❌ Premium Compaction Failed")
                 .setDescription(`\`\`\`\n${(err?.message ?? String(err)).slice(0, 1500)}\n\`\`\``)
@@ -5828,6 +6060,7 @@ const COMPACTION_MODEL_WINDOWS: Record<string, number> = {
   "opus[1m]": 1_000_000,
   "gpt-5.5": 400_000,
   "Gemini 3.1 Pro (High)": 1_000_000,
+  "Claude Opus 4.6 (Thinking)": 250_000,
 };
 
 function compactionWindowFor(modelId: string): number {

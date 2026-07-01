@@ -99,6 +99,8 @@ export function makeClaudeProfile(opts: {
   mcpServers?: McpServer[];
   /** Optional context token threshold to trigger context compaction. */
   compactionTokenThreshold?: number;
+  /** Custom environment variables to inject into the spawned process environment. */
+  extraEnv?: Record<string, string>;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "claude-agent-acp";
   const configDir = opts.configDir?.trim() || undefined;
@@ -122,6 +124,16 @@ export function makeClaudeProfile(opts: {
       if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
       if (maxThinkingTokens && maxThinkingTokens > 0) {
         env.MAX_THINKING_TOKENS = String(maxThinkingTokens);
+      }
+      if (opts.extraEnv) {
+        for (const [k, v] of Object.entries(opts.extraEnv)) {
+          if (v !== undefined) {
+            env[k] = v;
+          }
+        }
+        if (opts.extraEnv.CLAUDE_CODE_USE_VERTEX === "1") {
+          delete env.ANTHROPIC_API_KEY;
+        }
       }
       return spawn(cli, [], {
         stdio: ["pipe", "pipe", "pipe"],

@@ -4,7 +4,7 @@
 >
 > **Cadence**: Weekly sweep (recommended: Monday), with ad-hoc checks when a major release is announced.
 >
-> **Last updated**: 2026-06-22
+> **Last updated**: 2026-07-01 (Tuesday sweep)
 >
 > **⚠️ AGENT CONSTRAINT — READ-ONLY / REPORTING MODE**: Agents executing this runbook must **never** modify seam-acp source files, run `npm run redeploy`, apply patches, or make any code changes during a monitoring sweep. All code work is tracked via GitHub issues and implemented in **separate, explicitly tasked sessions**. Your job during a sweep is to **find, classify, and file or update GitHub issues** — not to implement fixes.
 
@@ -101,7 +101,7 @@ before running any procedure in this runbook:
 - Transcripts in `~/.gemini/antigravity-cli/brain/<cascadeId>/.system_generated/logs/transcript.jsonl`
 - Effort is baked into model choice (no separate knob) — picker suppressed
 - Profile source: [`agy.ts`](../src/agents/profiles/agy.ts) (1699 lines — largest profile)
-- Latest agy as of 2026-06-19 sweep: **1.0.10** (Go binary; conversation format is now `.db` SQLite as of agy 1.0.4 — `agy.ts` handles both `.db`/`.pb`)
+- Latest agy as of 2026-06-30 sweep: **1.0.14** (Go binary; conversation format is now `.db` SQLite as of agy 1.0.4 — `agy.ts` handles both `.db`/`.pb`)
 
 ### 1.2 Anthropic — Claude Code
 
@@ -150,20 +150,27 @@ before running any procedure in this runbook:
 - Profile source: [`claude.ts`](../src/agents/profiles/claude.ts) (802 lines)
 - Update process: [`model-management-runbook.md`](model-management-runbook.md) (564 lines, authoritative)
 
-> **🔑 PATCH MAY BE OBSOLETE — verify on next upgrade.** As of the 2026-06-18
-> sweep we run `claude-agent-acp` **0.39.0 (patched)**, but upstream **v0.42.0
-> (2026-06-05)** shipped a fix: *"Prevent cross-family model matching in
-> `resolveModelPreference`"* — the exact bug our patch works around. When
-> upgrading to ≥0.42.0, the patch ANCHOR will almost certainly no longer match
-> (the script exits 1 by design). **Before re-deriving the patch, probe whether
-> full Opus `[1m]` IDs now resolve correctly natively** (per
+> **🔑 PATCH MAY BE OBSOLETE — verify on next upgrade.** As of the 2026-06-30
+> sweep we run `claude-agent-acp` **0.39.0 (patched)**, but upstream is now at
+> **v0.53.0**. v0.42.0 shipped the exact fix our patch works around (*"Prevent
+> cross-family model matching in `resolveModelPreference`"*). v0.48.0 "Updated
+> to new ACP SDK patterns" almost certainly restructured the resolver — the patch
+> ANCHOR will not match. **Before re-deriving the patch, probe whether full Opus
+> `[1m]` IDs now resolve correctly natively** (per
 > [`model-management-runbook.md`](model-management-runbook.md) §4, against JSONL
-> ground truth) — the patch may be removable entirely. Latest versions at sweep:
-> claude-code **2.1.183**, claude-agent-acp **0.48.0** (maintained by Zed
-> Industries). ACP SDK latest: **0.28.1** (v0.27.0 was a major ergonomic rewrite
-> — old `AcpClient`/`ClientSideConnection` deprecated, see MIGRATION_0.26_0.27.md).
+> ground truth) — the patch may be removable entirely. Additionally, v0.49.0
+> added "Infer 1M context from model descriptions" — investigate interaction with
+> `[1m]` suffix before re-deriving. v0.50.0 added "Handle ACP request
+> cancellation signals" — new behavior. v0.52.0 added version flag and session
+> title push. v0.53.0 added ACP logout support and bumped claude-agent-sdk to
+> 0.3.195. Latest versions at sweep: claude-code **2.1.193** (published) /
+> **2.1.163** (installed), claude-agent-acp **0.53.0**. ACP SDK latest:
+> **1.1.0** (v1.0.0 reached stable GA 2026-06-24 with schema v1.16.0;
+> claude-agent-acp 0.53.0 pins to sdk@1.0.0; old `AcpClient`/`ClientSideConnection`
+> deprecated since 0.27.0, will be removed in a future major version —
+> see MIGRATION_0.26_0.27.md).
 
-> **⚠️ CAUTION**: The `claude-agent-acp` resolver bug is well-documented: in v0.39, `unstable_setSessionModel` runs ALL model strings through `resolveModelPreference` which fuzzy-matches against a tiny 4-entry curated list. Full Opus IDs find no Opus entry → fuzzy-match to **Sonnet**. The patch (`npm run patch-acp`) makes canonical full IDs bypass the broken resolver. It is **wiped by any global npm update and must be re-applied + re-verified**. See §5.2 and [`model-management-runbook.md`](model-management-runbook.md). **As of the 2026-06-20 sweep**, we run 0.39.0 (patched); upstream latest is **0.48.0**.
+> **⚠️ CAUTION**: The `claude-agent-acp` resolver bug is well-documented: in v0.39, `unstable_setSessionModel` runs ALL model strings through `resolveModelPreference` which fuzzy-matches against a tiny 4-entry curated list. Full Opus IDs find no Opus entry → fuzzy-match to **Sonnet**. The patch (`npm run patch-acp`) makes canonical full IDs bypass the broken resolver. It is **wiped by any global npm update and must be re-applied + re-verified**. See §5.2 and [`model-management-runbook.md`](model-management-runbook.md). **As of the 2026-06-26 sweep**, we run 0.39.0 (patched); upstream latest is **0.52.0**.
 
 ### 1.3 GitHub Copilot
 
@@ -423,7 +430,7 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 - [ ] Check for `opencode acp` subcommand changes or custom-provider auto-discovery
 
 #### ACP Protocol
-- [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^0.22.1`, latest: ___ (changelog now in the [typescript-sdk repo](https://github.com/agentclientprotocol/typescript-sdk/releases), split out 2026-06-16)
+- [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^0.22.1`, latest: **1.1.0** as of 2026-06-30 (v1.0.0 GA; changelog now in the [typescript-sdk repo](https://github.com/agentclientprotocol/typescript-sdk/releases), split out 2026-06-16)
 - [ ] Check [ACP monorepo releases](https://github.com/agentclientprotocol/agent-client-protocol/releases) for spec/schema changes (`schema-v*` tags; no longer carries npm SDK versions)
 - [ ] Check [ACP updates page](https://agentclientprotocol.com/updates)
 - [ ] Scan [ACP repo issues](https://github.com/agentclientprotocol/agent-client-protocol/issues) for breaking change discussions

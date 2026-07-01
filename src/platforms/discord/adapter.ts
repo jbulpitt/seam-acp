@@ -382,6 +382,11 @@ export class DiscordAdapter implements ChatAdapter {
       for (const msg of chunk.values()) {
         if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) continue;
         if (!msg.content?.trim() && msg.attachments.size === 0) continue;
+
+        // Skip bot messages that are status cards / panels. These are embed-
+        // only messages (or embed + minimal content) that show operational info
+        // (model, context usage, timing) — useless noise for rebuild summaries.
+        if (msg.author.bot && msg.embeds.length > 0 && !msg.content?.trim()) continue;
         
         let text = msg.content ?? "";
         if (msg.attachments.size > 0) {

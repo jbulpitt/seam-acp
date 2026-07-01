@@ -93,3 +93,21 @@ empirical process. Key non-negotiables from it:
 
 When updating `claude-agent-acp` or `@anthropic-ai/claude-code`, follow the
 runbook end to end (§1 pull → §2 changelogs → §3 update → §3a patch → §4 verify).
+
+## Troubleshooting: 500 / server errors from the Claude API
+
+When a Claude Code session returns persistent `500 Internal server error`
+responses (visible in `pm2 logs` as `"turn failed"` with
+`"errorKind":"server_error"`), **check https://status.claude.com first** before
+investigating code-level causes. The error message itself directs you there.
+
+Signs it's an upstream outage rather than a bot bug:
+- Multiple threads/sessions fail around the same time.
+- Other threads on the same model work fine (outages can be partial / per-model).
+- The status page shows an active incident (look for `status-major` or
+  `status-critical` on the page body, or unresolved incidents tagged
+  `impact-critical`).
+- Retries keep failing with the same 500, not a different error.
+
+**Do not** waste time debugging seam-acp code or session state when the root
+cause is an Anthropic-side outage. Wait for the incident to resolve, then retry.

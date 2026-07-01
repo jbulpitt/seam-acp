@@ -555,6 +555,7 @@ interface AgySession {
    * to skip everything we've shown before. -1 = nothing yet.
    */
   maxStepIndex: number;
+  modelId?: string;
 }
 
 interface ActiveRun {
@@ -650,6 +651,10 @@ class AgyAgent implements Agent {
   async unstable_setSessionModel(
     params: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse> {
+    const sess = this.sessions.get(params.sessionId);
+    if (sess) {
+      sess.modelId = params.modelId;
+    }
     // agy reads its active model from ~/.gemini/antigravity-cli/settings.json
     // at every CLI invocation. Since we spawn a fresh `agy -p` per prompt,
     // editing that file takes effect on the next turn.
@@ -696,9 +701,23 @@ class AgyAgent implements Agent {
 
     const before = await listConversations();
     const agyStart = Date.now();
+
+    const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
+    const currentModelId = sess.modelId || readCurrentModelId(catalog);
+    const currentModel = catalog.find((m) => m.modelId === currentModelId);
+    const maxTokens = currentModel?.maxTokens ?? 1_000_000;
+
+    // Linux limits each individual argv/envp string to MAX_ARG_STRLEN
+    // (PAGE_SIZE * 32 = 131,072 bytes on x86-64), independent of the overall
+    // ARG_MAX (~2MB) cap. The `-p <prompt>` arg is a single string, so prompts
+    // over ~128KB hit `spawn E2BIG`. When that happens we pipe the prompt via
+    // stdin instead — agy reads from stdin when no `-p` value is provided.
+    const MAX_ARG_STRLEN = 120_000; // ~8KB headroom under the 131,072 kernel limit
+    const useStdin = Buffer.byteLength(promptText, "utf8") > MAX_ARG_STRLEN;
+
     const args = [
-      "-p",
-      promptText,
+      ...(useStdin ? [] : ["-p", promptText]),
+      ...(currentModel ? ["--model", currentModel.rawDisplayName] : []),
       "--print-timeout",
       `${this.printTimeoutSeconds ?? 600}s`,
       "--dangerously-skip-permissions",
@@ -718,12 +737,18 @@ class AgyAgent implements Agent {
 
     if (process.env.AGY_PROFILE_DEBUG) {
       // eslint-disable-next-line no-console
-      console.error(`[agy] spawn ${this.cli} cwd=${sess.cwd} args=${JSON.stringify(args)}`);
+      console.error(`[agy] spawn ${this.cli} cwd=${sess.cwd} useStdin=${useStdin} args=${JSON.stringify(args)}`);
     }
     const proc = spawn(this.cli, args, {
       cwd: sess.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
     });
+
+    if (useStdin && proc.stdin) {
+      proc.stdin.write(promptText);
+      proc.stdin.end();
+    }
+
     const stderrChunks: Buffer[] = [];
     proc.stdout?.on("data", () => {}); // drain; we get the real output via gRPC
     proc.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
@@ -737,27 +762,25 @@ class AgyAgent implements Agent {
     this.active = { proc, abort: cancelAbort, sessionId: params.sessionId };
     const runRef = this.active;
     proc.once("exit", (code, signal) => {
-      if (process.env.AGY_PROFILE_DEBUG) {
-        // eslint-disable-next-line no-console
-        console.error(`[agy] child exit code=${code} signal=${signal}`);
-      }
+      // Always log — essential for diagnosing empty-turn bugs where the
+      // process exits before producing any output.
+      // eslint-disable-next-line no-console
+      console.error(`[agy] child exit code=${code} signal=${signal} elapsed=${Date.now() - agyStart}ms`);
       procExited = true;
       exitCode = code;
       cancelAbort.abort();
       if (this.active === runRef) this.active = undefined;
     });
     proc.once("error", (e) => {
-      if (process.env.AGY_PROFILE_DEBUG) {
-        // eslint-disable-next-line no-console
-        console.error(`[agy] child error`, e);
-      }
+      // eslint-disable-next-line no-console
+      console.error(`[agy] child spawn/process error:`, e);
       cancelAbort.abort();
       if (this.active === runRef) this.active = undefined;
     });
 
     try {
       const ls = await discoverAgyLs({
-        timeoutMs: 30_000,
+        timeoutMs: 90_000,
         newerThanMs: agyStart - 1_000,
         signal: cancelAbort.signal,
       });
@@ -779,96 +802,162 @@ class AgyAgent implements Agent {
       // High-water mark from prior turns. The LS replays every step at or
       // below this on subscribe — skip them so the user doesn't see the entire
       // previous conversation repeated. Anything strictly above is new.
-      const skipUpTo = sess.maxStepIndex;
+      let skipUpTo = sess.maxStepIndex;
+      if (sess.cascadeId) {
+        const dbMax = conversationMaxStepIndex(sess.cascadeId);
+        if (dbMax !== -1) {
+          if (process.env.AGY_PROFILE_DEBUG || dbMax < skipUpTo) {
+            // eslint-disable-next-line no-console
+            console.error(`[agy] aligning skipUpTo from database: stored=${skipUpTo}, db=${dbMax}`);
+          }
+          skipUpTo = dbMax;
+        }
+      }
 
-      const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
-      const currentModelId = readCurrentModelId(catalog);
-      const currentModel = catalog.find((m) => m.modelId === currentModelId);
-      const maxTokens = currentModel?.maxTokens ?? 1_000_000;
       const usageTracker = { maxUsed: 0 };
 
-      try {
-        let hasBeenActive = false;
-        for await (const update of subscribeToAgyStream({
-          port: ls.port,
-          conversationId: cid,
-          signal: cancelAbort.signal,
-        })) {
-          if (cancelAbort.signal.aborted) break;
+      // Outer retry loop: if the stream closes without any activity (hasBeenActive
+      // stays false), it means we subscribed during the idle window between the LS
+      // closing after the previous turn and AGY picking up our new prompt.
+      // Re-subscribe after a brief delay (up to STALE_IDLE_RETRY_MS total).
+      const STALE_IDLE_RETRY_DELAY_MS = 1_500;
+      const STALE_IDLE_RETRY_TIMEOUT_MS = 30_000;
+      const staleIdleDeadline = Date.now() + STALE_IDLE_RETRY_TIMEOUT_MS;
+      let hasBeenActive = false;
+      let staleIdleRetryCount = 0;
+      outer: while (true) {
+        hasBeenActive = false;
+        try {
+          for await (const update of subscribeToAgyStream({
+            port: ls.port,
+            conversationId: cid,
+            signal: cancelAbort.signal,
+          })) {
+            if (cancelAbort.signal.aborted) break outer;
 
-          const isRunning = update.status === "CASCADE_RUN_STATUS_RUNNING";
-          const sup = update.mainTrajectoryUpdate?.stepsUpdate;
-          let hasNewSteps = false;
-          if (sup?.indices && sup.steps) {
-            for (let i = 0; i < sup.indices.length; i++) {
-              const idx = sup.indices[i];
-              const step = sup.steps[i];
-              if (idx !== undefined && step !== undefined && idx > skipUpTo) {
-                if (
-                  step.type &&
-                  step.type !== "CORTEX_STEP_TYPE_USER_INPUT" &&
-                  step.type !== "CORTEX_STEP_TYPE_CONVERSATION_HISTORY"
-                ) {
-                  hasNewSteps = true;
+            const isRunning = update.status === "CASCADE_RUN_STATUS_RUNNING";
+            const sup = update.mainTrajectoryUpdate?.stepsUpdate;
+            let hasNewSteps = false;
+            if (sup?.indices && sup.steps) {
+              for (let i = 0; i < sup.indices.length; i++) {
+                const idx = sup.indices[i];
+                const step = sup.steps[i];
+                if (idx !== undefined && step !== undefined && idx > skipUpTo) {
+                  if (
+                    step.type &&
+                    step.type !== "CORTEX_STEP_TYPE_USER_INPUT" &&
+                    step.type !== "CORTEX_STEP_TYPE_CONVERSATION_HISTORY"
+                  ) {
+                    hasNewSteps = true;
+                  }
                 }
               }
             }
-          }
 
-          if (isRunning || hasNewSteps) {
-            hasBeenActive = true;
-          }
+            if (isRunning || hasNewSteps) {
+              hasBeenActive = true;
+            }
 
-          if (sup?.indices && sup.steps) {
-            for (let i = 0; i < sup.indices.length; i++) {
-              const idx = sup.indices[i];
-              const step = sup.steps[i];
-              if (idx === undefined || step === undefined) continue;
-              if (idx <= skipUpTo) continue;
-              await this.emitStep(
-                params.sessionId,
-                idx,
-                step,
-                lastText,
-                lastThinking,
-                toolCallIds,
-                heldText,
-                heldThinking,
-                sess.cwd,
-                maxTokens,
-                usageTracker,
-              );
-              if (idx > sess.maxStepIndex) sess.maxStepIndex = idx;
+            if (sup?.indices && sup.steps) {
+              for (let i = 0; i < sup.indices.length; i++) {
+                const idx = sup.indices[i];
+                const step = sup.steps[i];
+                if (idx === undefined || step === undefined) continue;
+                if (idx <= skipUpTo) continue;
+                await this.emitStep(
+                  params.sessionId,
+                  idx,
+                  step,
+                  lastText,
+                  lastThinking,
+                  toolCallIds,
+                  heldText,
+                  heldThinking,
+                  sess.cwd,
+                  maxTokens,
+                  usageTracker,
+                );
+                if (idx > sess.maxStepIndex) sess.maxStepIndex = idx;
+              }
+            }
+
+            // CASCADE_RUN_STATUS_IDLE fires when the MAIN trajectory pauses
+            // (e.g. waiting for a subagent to finish). Only `fullyIdle` means
+            // the entire cascade — including all subagents — has completed.
+            // Breaking on plain IDLE alone causes premature turn termination
+            // whenever AGY delegates to background tasks or subagents.
+            const mainIdle = update.status === "CASCADE_RUN_STATUS_IDLE";
+            const fully = update.fullyIdle === true;
+            if ((mainIdle || fully) && hasBeenActive) {
+              if (!fully) {
+                // Main trajectory went idle but cascade isn't fully done —
+                // a subagent or background task is still running. Log and
+                // continue waiting.
+                if (process.env.AGY_PROFILE_DEBUG) {
+                  // eslint-disable-next-line no-console
+                  console.error(
+                    `[agy] main trajectory idle but NOT fullyIdle — continuing to wait`,
+                    { status: update.status, fullyIdle: update.fullyIdle,
+                      executableStatus: update.executableStatus,
+                      executorLoopStatus: update.executorLoopStatus },
+                  );
+                }
+                continue;
+              }
+              if (process.env.AGY_PROFILE_DEBUG) {
+                // eslint-disable-next-line no-console
+                console.error(`[agy] cascade fully idle. Breaking stream loop.`);
+              }
+              break outer;
             }
           }
-
-          const isIdle = update.status === "CASCADE_RUN_STATUS_IDLE" || update.fullyIdle === true;
-          if (isIdle && hasBeenActive) {
-            if (process.env.AGY_PROFILE_DEBUG) {
-              // eslint-disable-next-line no-console
-              console.error(`[agy] cascade run completed and idle. Breaking stream loop.`);
-            }
-            break;
+        } catch (streamErr) {
+          // The LS closes the socket after the cascade reaches IDLE; undici
+          // surfaces that as `TypeError: terminated` (incomplete chunked
+          // read) since Connect doesn't always send a final HTTP trailer.
+          // Treat any post-subscribe stream error as natural EOF — except
+          // for an explicit user cancel.
+          if (cancelAbort.signal.aborted && runRef.userCancelled) {
+            return { stopReason: "cancelled" };
           }
+          if (process.env.AGY_PROFILE_DEBUG) {
+            // eslint-disable-next-line no-console
+            console.error(
+              `[agy] stream ended:`,
+              streamErr instanceof Error ? streamErr.message : streamErr,
+            );
+          }
+          // Fall through — check whether we need to retry below.
         }
-      } catch (streamErr) {
-        // The LS closes the socket after the cascade reaches IDLE; undici
-        // surfaces that as `TypeError: terminated` (incomplete chunked
-        // read) since Connect doesn't always send a final HTTP trailer.
-        // Treat any post-subscribe stream error as natural EOF — except
-        // for an explicit user cancel.
-        if (cancelAbort.signal.aborted && runRef.userCancelled) {
-          return { stopReason: "cancelled" };
+
+        // If we got activity, we're done.
+        if (hasBeenActive) break;
+
+        // Stream closed without any activity (hasBeenActive still false).
+        // This is a race: we subscribed while the cascade was idle between
+        // the prior turn ending and AGY picking up our new prompt. Retry.
+        if (cancelAbort.signal.aborted) break;
+        if (procExited) break; // agy itself exited — no point retrying
+        const remaining = staleIdleDeadline - Date.now();
+        if (remaining <= 0) {
+          if (process.env.AGY_PROFILE_DEBUG) {
+            // eslint-disable-next-line no-console
+            console.error(
+              `[agy] stale-idle retry deadline exceeded after ${staleIdleRetryCount} retries`,
+            );
+          }
+          break;
         }
+        staleIdleRetryCount += 1;
         if (process.env.AGY_PROFILE_DEBUG) {
           // eslint-disable-next-line no-console
           console.error(
-            `[agy] stream ended:`,
-            streamErr instanceof Error ? streamErr.message : streamErr,
+            `[agy] stream ended with no activity (stale idle) — retry #${staleIdleRetryCount} in ${STALE_IDLE_RETRY_DELAY_MS}ms`,
           );
         }
-        // Fall through to end_turn — agy completed and the LS closed.
+        await new Promise<void>((r) => setTimeout(r, STALE_IDLE_RETRY_DELAY_MS));
       }
+
       // Flush any text held back as a potentially-partial pattern.
       await this.flushHeld(params.sessionId, heldText, "agent_message_chunk", sess.cwd);
       await this.flushHeld(params.sessionId, heldThinking, "agent_thought_chunk", sess.cwd);
@@ -884,11 +973,26 @@ class AgyAgent implements Agent {
     } catch (err) {
       if (cancelAbort.signal.aborted && runRef.userCancelled) return { stopReason: "cancelled" };
       if (cancelAbort.signal.aborted && !runRef.userCancelled) {
-        // Swallowed because the child process exited normally or abnormally,
-        // and we aborted the stream/discovery deliberately.
-        if (process.env.AGY_PROFILE_DEBUG) {
-          // eslint-disable-next-line no-console
-          console.error(`[agy] run aborted due to process exit:`, err);
+        // The child process exited (normally or abnormally) and we aborted the
+        // stream/discovery deliberately. Always log so empty-turn bugs are
+        // diagnosable without AGY_PROFILE_DEBUG (previously silent).
+        const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+        // eslint-disable-next-line no-console
+        console.error(
+          `[agy] process exited during prompt (code=${exitCode}, signal=${proc.signalCode ?? "none"})` +
+            (stderr ? `\nstderr: ${stderr.slice(0, 2000)}` : "") +
+            `\nerr: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        // Surface the error to the user so a 0-char turn shows *something*
+        // instead of complete silence (the "empty results" bug).
+        if (stderr && this.conn) {
+          await this.conn.sessionUpdate({
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: `\n[agy exit ${exitCode ?? "?"}]\n${stderr.slice(0, 2000)}` },
+            },
+          }).catch(() => {});
         }
       } else {
         const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();

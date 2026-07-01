@@ -457,6 +457,11 @@ export class AgentRuntime {
     return this.promptInFlight;
   }
 
+  /** Wait for all asynchronous session updates to be processed. */
+  async idle(): Promise<void> {
+    await this.sessionUpdates.idle();
+  }
+
   async setModel(modelId: string): Promise<void> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();

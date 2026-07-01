@@ -1,32 +1,21 @@
 /**
  * Premium-compaction pipeline (docs/premium-compaction-design.md §4).
  *
- * Orchestrates the fan-out → reduce → fan-out → synthesize → critic flow over
- * the richest-source history + (where the gap-detector says) Discord ranges.
+ * Orchestrates the simplified fan-out compaction flow:
+ * Partitions history into verbatim Head (10%), verbatim Tail (20%), and Middle (70%).
+ * Chunks the Middle dynamically (120KB default, max 12 chunks) and summarizes in parallel.
+ * Re-integrates the verbatim Head, Middle chunk summaries, verbatim Tail, and verbatim Pinned Facts.
  *
- * Decoupled from AgentRuntime: the caller injects `runAgent(prompt) => text`
- * (the orchestrator wraps temp-runtime spawning). This keeps the pipeline pure
- * and structure-testable with a mock runner before it spends a real LLM call.
- * End-to-end fidelity is proven separately by the §10 tuning loop.
+ * Isolated to the premium compaction offering only.
  */
 
 import { chunkHistory, renderHistory, type HistoryEvent, type RichHistory } from "./source-reader.js";
 import type { GapReport } from "./gap-detector.js";
 import {
-  chunkAnalyzerPrompt,
-  metaAnalyzerPrompt,
-  deepDivePrompt,
-  synthesizerPrompt,
-  completenessCriticPrompt,
   pinnedFactsPrompt,
   assembleNewSession,
   parseJsonOutput,
   mergePinnedFacts,
-  JSON_REPARSE_INSTRUCTION,
-  type ChunkAnalysis,
-  type MetaAnalysis,
-  type DeepDive,
-  type CritiqueResult,
   type PinnedFacts,
 } from "./prompts.js";
 
@@ -43,16 +32,9 @@ export interface PremiumCompactionInput {
   concurrency?: number;
   /** Token budget for the verbatim recent window kept in the new session. */
   recentWindowTokens?: number;
-  /** Per-chunk token budget for the pinned-facts pass. Kept well under the
-   *  standard 200K context window so the pass NEVER makes one giant call (which
-   *  both forces the credit-gated 1M tier and is the run's fragile long-pole).
-   *  Each chunk is extracted independently and the results are merged. */
+  /** Per-chunk token budget for the pinned-facts pass. */
   pinnedChunkTokens?: number;
-  /** Hard per-call input budget (est. tokens) for the chunk-analysis and
-   *  deep-dive stages — the two stages that send raw history. No single agent
-   *  call's input may exceed this, so a large session can never produce a
-   *  "Prompt is too long" error. Deliberately well under even the standard 200K
-   *  window (chars/4 undercounts dense code, so we leave a wide margin). */
+  /** Hard per-call input budget (est. tokens). */
   maxCallTokens?: number;
   log?: (msg: string) => void;
 }
@@ -60,71 +42,98 @@ export interface PremiumCompactionInput {
 export interface PremiumCompactionResult {
   summaryMarkdown: string;
   pinnedFacts: PinnedFacts;
-  meta: MetaAnalysis;
-  critique: CritiqueResult;
   /** The full text to seed the new session with. */
   assembledSeed: string;
   stats: {
     chunks: number;
-    deepDives: number;
-    checklistItems: number;
-    unpreservedItems: number;
-    recoveriesRequested: number;
   };
 }
 
-/** Run a structured stage with bounded retries that distinguish the two real
- *  failure modes:
- *   - EMPTY completion — the runner emitted no agent text at all. A transient
- *     ACP/model hiccup (seen when several runners spawn at once); re-running the
- *     SAME prompt fresh is the fix. The reparse corrective is meaningless here
- *     (there is no prior reply to re-emit), so we do NOT append it — appending
- *     "re-emit the SAME analysis" to an empty turn only confuses the model.
- *   - NON-EMPTY but unparseable — usually an unescaped `"`/newline inside a long
- *     free-text field. Append JSON_REPARSE_INSTRUCTION so the model re-emits the
- *     same analysis with valid escaping.
- *  Throws only after `maxAttempts` are exhausted; fan-out callers catch that and
- *  stub the one item rather than abort the whole multi-minute run. */
-async function runStructured<T>(
-  runAgent: RunAgent,
-  prompt: string,
-  label: string,
-  log: (msg: string) => void,
-  maxAttempts = 3
-): Promise<T> {
-  let lastErr = "unknown";
-  let appendReparse = false;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const thisPrompt = appendReparse ? `${prompt}\n\n${JSON_REPARSE_INSTRUCTION}` : prompt;
-    const thisLabel = attempt === 1 ? label : `${label}-retry${attempt - 1}`;
-    const raw = await runAgent(thisPrompt, thisLabel);
-    if (!raw.trim()) {
-      // Empty completion: transient, not a formatting problem — re-run fresh.
-      lastErr = "empty completion (no agent text)";
-      appendReparse = false;
-      if (attempt < maxAttempts) log(`  [${thisLabel}] empty completion; re-running fresh`);
-      continue;
+// --- helpers ----------------------------------------------------------------
+
+/**
+ * Partition events into head, middle, and tail arrays based on character budget
+ * (10% head, 20% tail, 70% middle).
+ */
+function partitionHistory(
+  events: HistoryEvent[],
+  headPercent = 0.1,
+  tailPercent = 0.2
+): { head: HistoryEvent[]; middle: HistoryEvent[]; tail: HistoryEvent[] } {
+  // Estimate size of each event
+  const eventSizes = events.map(e => renderHistory([e]).length + 2);
+  const totalChars = eventSizes.reduce((s, x) => s + x, 0);
+
+  const headBudget = totalChars * headPercent;
+  const tailBudget = totalChars * tailPercent;
+
+  let headEndIndex = 0;
+  let headSum = 0;
+  for (let i = 0; i < events.length; i++) {
+    const size = eventSizes[i]!;
+    if (headSum + size > headBudget && i > 0) {
+      break;
     }
-    try {
-      return parseJsonOutput<T>(raw);
-    } catch (err) {
-      // Non-empty but unparseable: next attempt re-emits with explicit escaping.
-      // Log the raw length + head — NOT the parser's long message, which gets
-      // truncated right at "raw[0..200]:" and hides what actually came back
-      // (preamble? prose? a refusal? malformed JSON?).
-      lastErr = (err as Error).message;
-      appendReparse = true;
-      const head = raw.replace(/\s+/g, " ").trim().slice(0, 160);
-      if (attempt < maxAttempts) {
-        log(`  [${thisLabel}] unparseable: len=${raw.length}, no JSON object; head="${head}"; retrying with reparse`);
-      }
-    }
+    headSum += size;
+    headEndIndex = i + 1;
   }
-  throw new Error(`[${label}] no parseable output after ${maxAttempts} attempts (last: ${lastErr.slice(0, 120)})`);
+
+  let tailStartIndex = events.length;
+  let tailSum = 0;
+  for (let i = events.length - 1; i >= headEndIndex; i--) {
+    const size = eventSizes[i]!;
+    if (tailSum + size > tailBudget && i < events.length - 1) {
+      break;
+    }
+    tailSum += size;
+    tailStartIndex = i;
+  }
+
+  const head = events.slice(0, headEndIndex);
+  const middle = events.slice(headEndIndex, tailStartIndex);
+  const tail = events.slice(tailStartIndex);
+
+  return { head, middle, tail };
 }
 
-/** Bounded-concurrency map. Preserves order; a thrown task rejects the whole
- *  run (the caller decides whether to keep the original session). */
+/**
+ * Split an array of events into chunks where each chunk's rendered size
+ * is strictly under maxCharsPerChunk.
+ */
+function chunkEvents(
+  events: HistoryEvent[],
+  maxCharsPerChunk: number
+): Array<{ index: number; firstTs?: string; lastTs?: string; text: string }> {
+  const chunks: Array<{ index: number; firstTs?: string; lastTs?: string; text: string }> = [];
+  let cur: HistoryEvent[] = [];
+  let curChars = 0;
+
+  const flush = () => {
+    if (cur.length === 0) return;
+    const text = renderHistory(cur);
+    const firstTs = cur[0]!.ts ? new Date(cur[0]!.ts).toISOString() : undefined;
+    const lastTs = cur[cur.length - 1]!.ts ? new Date(cur[cur.length - 1]!.ts).toISOString() : undefined;
+    chunks.push({
+      index: chunks.length,
+      ...(firstTs ? { firstTs } : {}),
+      ...(lastTs ? { lastTs } : {}),
+      text,
+    });
+    cur = [];
+    curChars = 0;
+  };
+
+  for (const e of events) {
+    const len = renderHistory([e]).length + 2;
+    if (curChars + len > maxCharsPerChunk && cur.length > 0) flush();
+    cur.push(e);
+    curChars += len;
+  }
+  flush();
+  return chunks;
+}
+
+/** Bounded-concurrency map. Preserves order. */
 async function mapLimit<T, R>(
   items: T[],
   limit: number,
@@ -143,197 +152,140 @@ async function mapLimit<T, R>(
   return results;
 }
 
-/** Render only the events within [fromTs, toTs] (inclusive). Open-ended when a
- *  bound is undefined. Used to give each deep-dive just its region instead of
- *  the whole history. */
-function sliceByRange(events: HistoryEvent[], fromTs?: string, toTs?: string): string {
-  const from = fromTs ? Date.parse(fromTs) : -Infinity;
-  const to = toTs ? Date.parse(toTs) : Infinity;
-  const inRange = events.filter((e) => e.ts === 0 || (e.ts >= from && e.ts <= to));
-  return renderHistory(inRange.length ? inRange : events);
+function chunkProseSummarizerPrompt(text: string): string {
+  return `You are summarizing a segment of a long technical conversation between a human and an AI agent. This is one chunk of a larger conversation — your summary will be concatenated with summaries of other chunks to form a complete record.
+
+Your summary must:
+1. Preserve ALL specific technical decisions, corrections, and constraints mentioned.
+2. Preserve exact file paths, command names, error messages, and configuration values.
+3. Capture the user's explicit instructions and corrections verbatim where possible.
+4. Note any problems encountered and how they were resolved.
+5. Maintain chronological flow so the reader understands what happened in order.
+
+Do NOT:
+- Omit details because they seem minor — everything the user said matters.
+- Paraphrase user corrections — quote them.
+- Skip over error diagnosis and resolution steps.
+- Produce a high-level overview — this needs to be detailed enough to resume work.
+
+The conversation chunk to summarize follows. Read the ENTIRE chunk before summarizing.
+
+=== CONVERSATION CHUNK ===
+${text}
+=== END OF CONVERSATION CHUNK ===`;
 }
 
-/** Truncate text to a char budget, keeping head + tail with an elision marker.
- *  Guarantees a single agent call's input can never exceed the model context
- *  ("Prompt is too long"), even for an unexpectedly huge deep-dive region. */
-function fitText(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  const head = Math.floor(maxChars * 0.55);
-  const tail = Math.max(0, maxChars - head - 120);
-  const elided = text.length - head - tail;
-  return (
-    text.slice(0, head) +
-    `\n\n… [${elided.toLocaleString()} chars of this region elided to fit the model context window] …\n\n` +
-    text.slice(text.length - tail)
-  );
-}
-
-/** Render the last events that fit a token budget, for the verbatim window. */
-function recentVerbatim(events: HistoryEvent[], budgetTokens: number): string {
-  const budgetChars = budgetTokens * 4;
-  const kept: HistoryEvent[] = [];
-  let chars = 0;
-  for (let i = events.length - 1; i >= 0; i--) {
-    const e = events[i]!;
-    const len = renderHistory([e]).length + 2;
-    if (chars + len > budgetChars && kept.length > 0) break;
-    kept.unshift(e);
-    chars += len;
-  }
-  return renderHistory(kept);
-}
+// --- pipeline execution -----------------------------------------------------
 
 export async function runPremiumCompaction(
   input: PremiumCompactionInput
 ): Promise<PremiumCompactionResult> {
   const {
     richHistory,
-    gapReport,
-    discordText,
     runAgent,
     concurrency = 6,
-    recentWindowTokens = 12_000,
-    pinnedChunkTokens = 120_000,
-    maxCallTokens = 130_000,
     log = () => {},
   } = input;
 
   const thinkingAvailable = richHistory.stats.thinkingAvailable;
-  const maxCallChars = maxCallTokens * 4;
 
-  // --- Stage 1: chunk + analyze (fan-out) -------------------------------------
-  // Chunk small enough that NO single chunk-analysis call can blow the context.
-  const chunks = chunkHistory(richHistory.events, maxCallTokens);
-  log(`analyzing ${chunks.length} chunk(s)`);
-  const chunkAnalyses = await mapLimit(chunks, concurrency, async (c, i) => {
+  // --- Step 1: Partition events into Head (10%), Middle (70%), Tail (20%) -----
+  log("partitioning history into head, middle, and tail…");
+  const { head, middle, tail } = partitionHistory(richHistory.events, 0.1, 0.2);
+
+  const headText = renderHistory(head);
+  const tailText = renderHistory(tail);
+  
+  // Measure middle segment size
+  const middleChars = middle.map(e => renderHistory([e]).length + 2).reduce((s, x) => s + x, 0);
+  log(`middle segment size: ${Math.round(middleChars / 1024)} KB`);
+
+  // --- Step 2: Chunk the middle segment (Max 12 chunks, default 120KB) ---------
+  const DEFAULT_CHUNK_CHARS = 120 * 1024;
+  const MAX_CHUNKS = 12;
+
+  let chunkCharsBudget = DEFAULT_CHUNK_CHARS;
+  let chunks = chunkEvents(middle, chunkCharsBudget);
+  if (chunks.length > MAX_CHUNKS) {
+    let factor = 1.0;
+    while (chunks.length > MAX_CHUNKS) {
+      factor += 0.05;
+      chunkCharsBudget = Math.ceil((middleChars / MAX_CHUNKS) * factor);
+      chunks = chunkEvents(middle, chunkCharsBudget);
+    }
+    log(`scaled chunk size budget to ${Math.round(chunkCharsBudget / 1024)} KB to keep chunk count at ${chunks.length}`);
+  } else {
+    log(`using default 120 KB chunk size; split middle into ${chunks.length} chunk(s)`);
+  }
+
+  // --- Step 3: Run summarization on middle chunks in parallel (concurrency limit = 6) ---
+  log(`summarizing ${chunks.length} middle chunk(s) (max concurrency = ${concurrency})`);
+  const chunkSummaries = await mapLimit(chunks, concurrency, async (c, i) => {
+    log(`  [chunk-${i}] starting summarization`);
+    const prompt = chunkProseSummarizerPrompt(c.text);
     try {
-      return await runStructured<ChunkAnalysis>(runAgent, chunkAnalyzerPrompt(c), `chunk-${i}`, log);
+      const summary = await runAgent(prompt, `chunk-${i}`);
+      if (!summary.trim()) throw new Error("empty summary returned");
+      log(`  [chunk-${i}] completed`);
+      return summary.trim();
     } catch (err) {
-      // One transient chunk must not abort the whole run. Degrade to an empty
-      // index entry — the deep-dive of this region still re-reads it in full,
-      // and the completeness critic will flag anything genuinely lost.
-      log(`  [chunk-${i}] UNRECOVERABLE after retries (${(err as Error).message.slice(0, 80)}); stubbing chunk`);
-      return {
-        chunkIndex: i,
-        timeRange: { fromTs: c.firstTs, toTs: c.lastTs },
-        topics: [],
-        decisions: [],
-        userCorrections: [],
-        selfCoachedRules: [],
-        openThreads: [],
-        toolFindings: [],
-        notableQuotes: [],
-      } satisfies ChunkAnalysis;
+      log(`  [chunk-${i}] failed: ${(err as Error).message}`);
+      return `[Failed to summarize middle segment ${i + 1}]`;
     }
   });
 
-  // --- Stage 2: meta-analyze (reduce) -----------------------------------------
-  log("meta-analyzing");
-  const meta = await runStructured<MetaAnalysis>(
-    runAgent,
-    metaAnalyzerPrompt({
-      chunkAnalyses,
-      gapSignals: gapReport.signals.map((s) => `${s.kind}: ${s.detail}`),
-      discordRanges: gapReport.discordRanges,
-      thinkingAvailable,
-    }),
-    "meta",
-    log
-  );
-
-  // --- Stage 3: deep-dive every target (fan-out, UN-GATED) --------------------
-  const targets = meta.deepDiveTargets ?? [];
-  log(`deep-diving ${targets.length} region(s)`);
-  const deepDives = await mapLimit(targets, concurrency, async (t, i) => {
-    // Give each deep-dive only its region: Discord text when the meta flagged
-    // this range Discord-preferred and we have it; otherwise the session events
-    // sliced to the target's timestamp range.
-    const rawText =
-      t.source === "discord" && discordText
-        ? discordText
-        : sliceByRange(richHistory.events, t.fromTs, t.toTs);
-    // Cap the region so an oversized deep-dive can never exceed the context.
-    const text = fitText(rawText, maxCallChars);
-    const prompt = deepDivePrompt({ fromTs: t.fromTs, toTs: t.toTs, depth: t.depth, source: t.source, text });
-    try {
-      return await runStructured<DeepDive>(runAgent, prompt, `deepdive-${i}`, log);
-    } catch (err) {
-      // Deep-dives are independent regions. One unrecoverable region must NOT
-      // abort the whole (multi-minute) run — degrade it to a stub the
-      // synthesizer can note, and let the completeness critic flag any gap.
-      log(`  [deepdive-${i}] UNRECOVERABLE after retry (${(err as Error).message.slice(0, 80)}); stubbing region`);
-      return {
-        timeRange: { fromTs: t.fromTs, toTs: t.toTs },
-        narrative: `[deep-dive failed to parse for region ${t.fromTs ?? "?"} → ${t.toTs ?? "?"}; this region was not extracted]`,
-        causalPairs: [],
-        selfCoachedRules: [],
-        userCorrections: [],
-        decisions: [],
-        artifacts: [],
-      } satisfies DeepDive;
-    }
-  });
-
-  // --- Pinned facts (shared) — chunked fan-out + merge ------------------------
-  // Extract verbatim facts per ~120K-token chunk in parallel, then union them.
-  // This keeps every call under the standard 200K window (no 1M-tier dependency,
-  // no single fragile mega-call) while reconstructing the single-pass result.
+  // --- Step 4: Extract pinned facts in parallel (concurrency limit = 6) -----------
+  const pinnedChunkTokens = 120_000;
   const pinnedChunks = chunkHistory(richHistory.events, pinnedChunkTokens);
-  log(`extracting pinned facts (${pinnedChunks.length} chunk(s))`);
+  log(`extracting pinned facts from ${pinnedChunks.length} chunk(s)`);
   const pinnedParts = await mapLimit(pinnedChunks, concurrency, async (c, i) => {
     try {
-      return await runStructured<PinnedFacts>(
-        runAgent,
-        pinnedFactsPrompt({ text: c.text, thinkingAvailable }),
-        `pinned-${i}`,
-        log
-      );
+      const raw = await runAgent(pinnedFactsPrompt({ text: c.text, thinkingAvailable }), `pinned-${i}`);
+      return parseJsonOutput<PinnedFacts>(raw);
     } catch (err) {
-      // Tolerate one bad chunk: mergePinnedFacts unions whatever the rest found.
-      log(`  [pinned-${i}] UNRECOVERABLE after retries (${(err as Error).message.slice(0, 80)}); skipping chunk`);
+      log(`  [pinned-${i}] extraction failed: ${(err as Error).message}`);
       return { corrections: [], constraints: [], decisions: [], openTodos: [], activePaths: [], rules: [] } satisfies PinnedFacts;
     }
   });
   const pinnedFacts = mergePinnedFacts(pinnedParts);
+  const pinnedCount =
+    pinnedFacts.corrections.length +
+    pinnedFacts.constraints.length +
+    pinnedFacts.rules.length +
+    pinnedFacts.openTodos.length +
+    pinnedFacts.activePaths.length;
+  log(`pinned ${pinnedCount} facts`);
 
-  // --- Stage 4: synthesize ----------------------------------------------------
-  log("synthesizing");
-  const summaryMarkdown = (
-    await runAgent(synthesizerPrompt({ meta, deepDives, pinnedFacts }), "synthesize")
-  ).trim();
+  // --- Step 5: Assemble output -----------------------------------------------
+  let summaryMarkdown = "";
+  if (headText) {
+    summaryMarkdown += `## Verbatim Conversation Start (Head)\n\n${headText}\n\n`;
+  }
+  if (chunkSummaries.length > 0) {
+    summaryMarkdown += `## Chronological Summaries of Middle Conversation\n\n`;
+    summaryMarkdown += chunkSummaries.map((s, idx) => `### Middle Segment ${idx + 1}\n\n${s}`).join("\n\n") + "\n\n";
+  }
 
-  // Assemble the new-session seed BEFORE auditing. The critic must check what
-  // actually ships — the prose summary + the pinned-facts block + the recent
-  // verbatim window — not the prose alone, or it false-flags facts that are
-  // preserved verbatim in the pinned block as "lost" (they're invisible to a
-  // summary-only audit, which is what inflated the unpreserved count).
+  const dropNote = 
+    `## Premium Compaction Note\n` +
+    `- Kept first 10% of conversation verbatim (${head.length} events) as head.\n` +
+    `- Summarized middle section into ${chunks.length} segments using Gemini.\n` +
+    `- Kept last 20% of conversation verbatim (${tail.length} events) as tail.\n` +
+    `- Pinned ${pinnedCount} verbatim constraint(s)/correction(s)/rule(s)/path(s).`;
+
   const assembledSeed = assembleNewSession({
     summaryMarkdown,
     pinnedFacts,
-    recentVerbatim: recentVerbatim(richHistory.events, recentWindowTokens),
+    recentVerbatim: tailText,
+    dropNote,
   });
-
-  // --- Stage 5: completeness critic (inverted gate) ---------------------------
-  log("verifying completeness");
-  const critique = await runStructured<CritiqueResult>(
-    runAgent,
-    completenessCriticPrompt({ assembled: assembledSeed, riskChecklist: meta.riskChecklist ?? [] }),
-    "critic",
-    log
-  );
 
   return {
     summaryMarkdown,
     pinnedFacts,
-    meta,
-    critique,
     assembledSeed,
     stats: {
       chunks: chunks.length,
-      deepDives: deepDives.length,
-      checklistItems: (meta.riskChecklist ?? []).length,
-      unpreservedItems: (critique.verdicts ?? []).filter((v) => !v.preserved).length,
-      recoveriesRequested: (critique.recoveries ?? []).length,
     },
   };
 }

@@ -1409,7 +1409,8 @@ export class Orchestrator {
       ...(acCfg.reasoningEffort ? { effort: acCfg.reasoningEffort } : {}),
       summary: built.seed,
     });
-    this.store.upsert({ ...record, acpSessionId: acNewId, updatedUtc: new Date().toISOString() });
+    record.acpSessionId = acNewId; // keep the in-memory record in sync (see getOrStartRuntime)
+    this.store.upsert({ ...record, updatedUtc: new Date().toISOString() });
     await this.router.invalidate(record.id, { clearAcpSession: false });
 
     const elapsedSec = Math.round((Date.now() - compactStartedAt) / 1000);
@@ -6000,8 +6001,14 @@ export class Orchestrator {
     record: ReturnType<SessionRouter["ensureSessionRecord"]>,
     cfg: ReturnType<SessionStore["readConfig"]>
   ): void {
+    // acp_session_id is assigned out-of-band (getOrStartRuntime / compaction),
+    // so the caller's in-memory record can lag the DB. A config write must NEVER
+    // clobber the live session binding — take the authoritative id from the DB
+    // when present (defense-in-depth on top of keeping the record in sync).
+    const live = this.store.get(record.id)?.acpSessionId;
     this.store.upsert({
       ...record,
+      ...(live ? { acpSessionId: live } : {}),
       configJson: this.store.writeConfig(cfg),
       updatedUtc: new Date().toISOString(),
     });

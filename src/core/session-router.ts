@@ -336,10 +336,15 @@ export class SessionRouter {
       model: cfg.model ?? this.defaultModel,
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
     });
-    // Persist the new ACP session id so we can resume on restart.
+    // Persist the new ACP session id so we can resume on restart. Also sync the
+    // caller's in-memory record: getOrStartRuntime receives the same record the
+    // orchestrator reuses for the rest of the turn, and if it kept the empty
+    // placeholder, a later config write (persistConfig spreads `...record`)
+    // would upsert "" back over this id — silently unbinding the thread so the
+    // NEXT restart resumes nothing and the user has to re-attach.
+    record.acpSessionId = info.sessionId;
     this.store.upsert({
       ...record,
-      acpSessionId: info.sessionId,
       updatedUtc: new Date().toISOString(),
     });
     return runtime;

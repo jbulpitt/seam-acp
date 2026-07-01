@@ -137,40 +137,49 @@ before running any procedure in this runbook:
 **seam-acp integration points**:
 - CLI binary: `claude-agent-acp` (env: `CLAUDE_CLI_PATH`)
 - Config dir: `CLAUDE_CONFIG_DIR=<dir>` (default: `~/.claude`)
-- Default model: `CLAUDE_DEFAULT_MODEL` (currently `claude-sonnet-4.5`)
-- Model picker: `CLAUDE_MODELS` env var — **curated, JSONL-verified entries only**
-- Context window: `[1m]` suffix → 1,000,000 tokens; without → 200,000 tokens. **The `[1m]` suffix is load-bearing** — stripped before API call but drives compaction threshold.
+- Default model: `CLAUDE_DEFAULT_MODEL` (currently `default` → latest Opus @ 1M on Max)
+- Model picker: `CLAUDE_MODELS` env var — **curated, JSONL-verified entries only**; now **bare full IDs** (e.g. `claude-opus-4-8`, `claude-fable-5`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-haiku-4-5`) plus the `default` alias. **No `[1m]` suffix** — it was retired at claude-agent-acp 0.54.1.
+- Model selection RPC: `setSessionConfigOption({ sessionId, configId: "model", value })` (ACP schema v1.16.0 dropped the dedicated `models` field; selection is now a `"model"` `SessionConfigSelect`). The old `unstable_setSessionModel` RPC is gone.
+- Context window: declared per-model in the `CLAUDE_CONTEXT_WINDOWS` table in `claude.ts`, resolved by `getClaudeContextWindow(modelId)` and stamped onto every picker entry's `contextLimit` (orchestrator `staticModels[].contextLimit → modelContextFloor` seed). The agent also reports the true window at runtime via ACP `UsageUpdate.size`. The `[1m]` suffix is **no longer load-bearing**.
 - Effort injection: `_meta.claudeCode.options.effort` (not `set_config_option`, not `reasoningEffort` field)
 - Valid effort levels: `low`, `medium`, `high`, `xhigh`, `max` (bounded by bundled SDK's `EffortLevel` type; `ultra` NOT available)
 - Adaptive thinking (Opus 4.6+): `_meta.claudeCode.options.thinking = { type: "adaptive", display: "summarized" | "omitted" }`
 - Identity: reads `~/.claude/.credentials.json` or `~/.claude/credentials.json`
 - Usage: `https://api.anthropic.com/api/oauth/usage` with `anthropic-beta: oauth-2025-04-20` header
 - Session storage: JSONL files at `~/.claude/projects/<slug>/<sessionId>.jsonl`
-- **Critical**: Patch script `scripts/patch-claude-agent-acp.mjs` fixes broken model resolver — wiped by any global npm update
-- Profile source: [`claude.ts`](../src/agents/profiles/claude.ts) (802 lines)
-- Update process: [`model-management-runbook.md`](model-management-runbook.md) (564 lines, authoritative)
+- **Account caveat (live warning)**: this account's Claude Code SDK advertises only `default/sonnet/sonnet[1m]/haiku` in `availableModels`. Since 0.54.1's `setSessionConfigOption` requires the value to be advertised-or-resolvable, an un-advertised full ID can be REJECTED (`Invalid value for config option model`). `default` → latest Opus @ 1M is the proven path; the explicit full-ID picker entries added 2026-07-01 are PENDING live validation.
+- **No patch script.** The former `scripts/patch-claude-agent-acp.mjs` (`npm run patch-acp`) was **retired and deleted** at 0.54.1 — the resolver now exact-matches advertised full IDs before fuzzy-matching, so the bypass is unnecessary; its anchor no longer exists.
+- Profile source: [`claude.ts`](../src/agents/profiles/claude.ts)
+- Update process: [`model-management-runbook.md`](model-management-runbook.md) (authoritative)
 
-> **🔑 PATCH MAY BE OBSOLETE — verify on next upgrade.** As of the 2026-06-30
-> sweep we run `claude-agent-acp` **0.39.0 (patched)**, but upstream is now at
-> **v0.53.0**. v0.42.0 shipped the exact fix our patch works around (*"Prevent
-> cross-family model matching in `resolveModelPreference`"*). v0.48.0 "Updated
-> to new ACP SDK patterns" almost certainly restructured the resolver — the patch
-> ANCHOR will not match. **Before re-deriving the patch, probe whether full Opus
-> `[1m]` IDs now resolve correctly natively** (per
-> [`model-management-runbook.md`](model-management-runbook.md) §4, against JSONL
-> ground truth) — the patch may be removable entirely. Additionally, v0.49.0
-> added "Infer 1M context from model descriptions" — investigate interaction with
-> `[1m]` suffix before re-deriving. v0.50.0 added "Handle ACP request
-> cancellation signals" — new behavior. v0.52.0 added version flag and session
-> title push. v0.53.0 added ACP logout support and bumped claude-agent-sdk to
-> 0.3.195. Latest versions at sweep: claude-code **2.1.193** (published) /
-> **2.1.163** (installed), claude-agent-acp **0.53.0**. ACP SDK latest:
-> **1.1.0** (v1.0.0 reached stable GA 2026-06-24 with schema v1.16.0;
-> claude-agent-acp 0.53.0 pins to sdk@1.0.0; old `AcpClient`/`ClientSideConnection`
-> deprecated since 0.27.0, will be removed in a future major version —
-> see MIGRATION_0.26_0.27.md).
-
-> **⚠️ CAUTION**: The `claude-agent-acp` resolver bug is well-documented: in v0.39, `unstable_setSessionModel` runs ALL model strings through `resolveModelPreference` which fuzzy-matches against a tiny 4-entry curated list. Full Opus IDs find no Opus entry → fuzzy-match to **Sonnet**. The patch (`npm run patch-acp`) makes canonical full IDs bypass the broken resolver. It is **wiped by any global npm update and must be re-applied + re-verified**. See §5.2 and [`model-management-runbook.md`](model-management-runbook.md). **As of the 2026-06-26 sweep**, we run 0.39.0 (patched); upstream latest is **0.52.0**.
+> **✅ PATCH RETIRED — we now run the upgrade, unpatched.** As of 2026-07-01 we
+> run `claude-agent-acp` **0.54.1** with **ACP SDK 1.1.0** (`package.json` pins
+> `@agentclientprotocol/sdk` `^1.1.0`). The former local resolver patch
+> (`scripts/patch-claude-agent-acp.mjs` / `npm run patch-acp`) has been **deleted**.
+> Any older instruction to "run `patch-acp`" or "re-apply the patch after a global
+> update" is now WRONG. Why it's gone: ACP schema v1.16.0 removed the dedicated
+> `models` field — model selection is now a `"model"` `SessionConfigSelect` set via
+> `setSessionConfigOption({ configId: "model", value })`; the old
+> `unstable_setSessionModel` RPC (the patch's anchor) no longer exists. In 0.54.1
+> `setSessionConfigOption` **exact-matches the requested value against the agent's
+> advertised model list BEFORE calling `resolveModelPreference`**, so an advertised
+> full canonical ID resolves to itself and the fuzzy resolver is only a fallback
+> for aliases — the exact behavior the patch used to force, now upstream (on top of
+> v0.42.0's "prevent cross-family matching"). The `[1m]` suffix is likewise retired
+> (bare full IDs now; window comes from `CLAUDE_CONTEXT_WINDOWS` in `claude.ts`).
+>
+> **Live warning still open (account caveat):** this account's SDK advertises only
+> `default/sonnet/sonnet[1m]/haiku`; because 0.54.1 requires the config value to be
+> advertised-or-resolvable, an **un-advertised full ID can be REJECTED** with
+> `Invalid value for config option model`. `default` → latest Opus @ 1M is the
+> proven path; the explicit full-ID picker entries added 2026-07-01 are PENDING
+> live validation (probe per [`model-management-runbook.md`](model-management-runbook.md)
+> §4). If a full ID is rejected, forward it via `ANTHROPIC_MODEL` in the
+> `claude.ts` spawn env, or re-derive a fresh patch against 0.54.1.
+>
+> Note: old `AcpClient`/`ClientSideConnection` were deprecated since SDK 0.27.0 and
+> may be removed in a future major (see MIGRATION_0.26_0.27.md) — track on future
+> sweeps.
 
 ### 1.3 GitHub Copilot
 
@@ -261,8 +270,8 @@ before running any procedure in this runbook:
 | Yarn: `@agentclientprotocol/sdk` | https://yarnpkg.com/package/@agentclientprotocol/sdk | Also has changelog visibility | — |
 
 **seam-acp integration points**:
-- Current version: `^0.22.1` (in `package.json`)
-- Used by: [`agent-runtime.ts`](../src/agents/agent-runtime.ts) — `AcpClient` / `ClientSideConnection` is the core protocol client
+- Current version: `^1.1.0` (in `package.json`) — upgraded from `^0.22.1` on 2026-07-01, tracking the v1.0.0 GA line (schema v1.16.0)
+- Used by: [`agent-runtime.ts`](../src/agents/agent-runtime.ts) — `AcpClient` / `ClientSideConnection` is the core protocol client (both deprecated since 0.27.0; migrate before the next SDK major)
 - Also used by: [`agy.ts`](../src/agents/profiles/agy.ts) — `AgentSideConnection` for in-process ACP bridge
 - Key types: `ContentBlock`, `McpServer`, `PromptCapabilities`, `RequestError`, `ndJsonStream`, `PROTOCOL_VERSION`
 - Communication: nd-JSON over stdio for all agents (except agy which fakes it in-process)
@@ -430,7 +439,7 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 - [ ] Check for `opencode acp` subcommand changes or custom-provider auto-discovery
 
 #### ACP Protocol
-- [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^0.22.1`, latest: **1.1.0** as of 2026-06-30 (v1.0.0 GA; changelog now in the [typescript-sdk repo](https://github.com/agentclientprotocol/typescript-sdk/releases), split out 2026-06-16)
+- [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^1.1.0` (upgraded 2026-07-01), latest: **1.1.0** (v1.0.0 GA; changelog now in the [typescript-sdk repo](https://github.com/agentclientprotocol/typescript-sdk/releases), split out 2026-06-16)
 - [ ] Check [ACP monorepo releases](https://github.com/agentclientprotocol/agent-client-protocol/releases) for spec/schema changes (`schema-v*` tags; no longer carries npm SDK versions)
 - [ ] Check [ACP updates page](https://agentclientprotocol.com/updates)
 - [ ] Scan [ACP repo issues](https://github.com/agentclientprotocol/agent-client-protocol/issues) for breaking change discussions
@@ -469,7 +478,7 @@ Every finding should be analyzed from three angles:
 | **New capabilities to adopt?** | Is there a new feature we should expose (new model, new mode, new CLI flag)? |
 | **Policy impact?** | Does a policy change affect how we spawn agents, store data, or handle permissions? |
 | **Deadline?** | Is there a deprecation date, sunset timeline, or required-by date? |
-| **Patch impact?** | Does this affect the Claude `patch-claude-agent-acp.mjs` script? |
+| **Model-resolution impact?** | Does this change how `claude-agent-acp` selects models (the `"model"` config option, `resolveModelPreference`, advertised `availableModels`, exact-match-before-fuzzy order)? The local patch was retired at 0.54.1 — a regression here would be handled in `claude.ts` (e.g. `ANTHROPIC_MODEL` forwarding) or a freshly re-derived patch, per the model-management runbook, NOT by "re-applying patch-acp" (that script no longer exists). |
 | **Config changes?** | Do we need to update `.env.example`, model picker env vars, or defaults? |
 | **Session storage?** | Does this change session file formats, paths, or storage mechanisms? |
 
@@ -477,7 +486,7 @@ Every finding should be analyzed from three angles:
 - Agent profiles: `src/agents/profiles/{copilot,claude,agy,opencode,remote}.ts` (`gemini.ts` has been removed)
 - Runtime: `src/agents/agent-runtime.ts`
 - Config: `src/config.ts`
-- Patch: `scripts/patch-claude-agent-acp.mjs`
+- Claude model/context config: `src/agents/profiles/claude.ts` (`CLAUDE_CONTEXT_WINDOWS`, `getClaudeContextWindow`) — replaces the retired `scripts/patch-claude-agent-acp.mjs`
 - Model management: `docs/model-management-runbook.md`
 - Session management: `src/agents/session-manager.ts`
 
@@ -508,7 +517,7 @@ Every finding that involves a potential version upgrade, a behavioral change, or
 Use the Angle 1 checklist above. If **no** (purely informational, billing note, general industry trend, model that's already handled dynamically by agy's live catalog, etc.):
 → **Add to report as normal. Stop here — no further action required.**
 
-If **yes** (new CLI flag, changed API behavior, new model needing registration, ACP type changes, patch script breakage, config schema change, session storage format change, etc.):
+If **yes** (new CLI flag, changed API behavior, new model needing registration, ACP type changes, model-selection/`setSessionConfigOption` behavior change, config schema change, session storage format change, etc.):
 → **Continue to Step 2.**
 
 **Step 2 — Check the GitHub Issues list for seam-acp.**
@@ -536,7 +545,7 @@ Search [https://github.com/jbulpitt/seam-acp/issues](https://github.com/jbulpitt
 The goal is an issue detailed enough that another agent can autonomously implement the change. Every issue must include:
 
 1. **Title** — Clear and specific. Include the package name and version if applicable.
-   *Example*: `Upgrade claude-agent-acp to ≥0.42.0 and verify/remove model resolver patch`
+   *Example*: `Upgrade claude-agent-acp to ≥0.55.0 and re-verify model selection via setSessionConfigOption`
 
 2. **Context** — Why this change is needed. Link to the upstream changelog, release notes, GitHub release, or commit. Include the relevant excerpt or quote so the implementer doesn't have to re-find it.
 
@@ -545,13 +554,13 @@ The goal is an issue detailed enough that another agent can autonomously impleme
 4. **Proposed changes** — Step-by-step description of what needs to happen. Be concrete:
    - Name specific env vars, function names, config keys, file paths
    - Reference the relevant reaction playbook (§5.x) or runbook section
-   - If it involves the Claude patch, reference [`model-management-runbook.md`](model-management-runbook.md) and the specific sections
-   - If it involves new model IDs, describe the verification steps (JSONL probe, status card check)
+   - If it involves Claude model selection or context windows, reference [`model-management-runbook.md`](model-management-runbook.md) and the specific sections (the local resolver patch was retired at 0.54.1 — do NOT reintroduce "run patch-acp")
+   - If it involves new model IDs, describe the verification steps (JSONL probe, status card check, and the account caveat — confirm the ID is advertised or `setSessionConfigOption` will reject it)
 
 5. **Research notes** — Anything discovered during the sweep that helps the implementer: relevant upstream commits, potential gotchas, related issues, prior art, links to spec/schema changes.
 
 6. **Acceptance criteria (AC)** — A concrete checklist the implementer can tick off to confirm the work is complete. Examples:
-   - `[ ] Patch re-applied and exits 0` (or confirmed removable)
+   - `[ ] Model selection via setSessionConfigOption verified (no "Invalid value for config option model" rejection)`
    - `[ ] JSONL ground truth confirms correct model (not self-report)`
    - `[ ] Status card shows expected model + effort after restart`
    - `[ ] npm run typecheck passes`
@@ -589,7 +598,7 @@ When writing a new issue, always include:
 ### 5.1 New model released by any provider
 
 1. **Identify the model ID** exactly as the provider specifies it.
-2. **For Claude models**: Follow [`model-management-runbook.md`](model-management-runbook.md) §4 (probe against JSONL) before adding to `CLAUDE_MODELS`. Check if it supports `[1m]` context window. Check if it supports adaptive thinking.
+2. **For Claude models**: Follow [`model-management-runbook.md`](model-management-runbook.md) §4 (probe against JSONL) before adding the **bare full ID** to `CLAUDE_MODELS` (no `[1m]` suffix). Add its native context window to `CLAUDE_CONTEXT_WINDOWS` in `claude.ts` (or confirm the `claudeContextWindowFamily` heuristic covers it). Confirm the ID is advertised — an un-advertised full ID is REJECTED by 0.54.1's `setSessionConfigOption` (account caveat). Check if it supports adaptive thinking.
 3. **For Gemini models** (legacy — deprecated): No longer actively maintained. If still using Gemini CLI, test with `gemini --acp`.
 4. **For Copilot models**: Test with `copilot --acp` that the model is available. Add to `COPILOT_MODELS` in `.env`.
 5. **For Antigravity models**: Models are fetched dynamically from agy's language server — usually no code change needed. If the model naming convention changes, update `AGY_MODELS` or the model catalog logic in [`agy.ts`](../src/agents/profiles/agy.ts).
@@ -602,15 +611,15 @@ When writing a new issue, always include:
 > **⚠️ CAUTION**: This is the highest-risk update. Follow every step. See also [`model-management-runbook.md`](model-management-runbook.md) for the authoritative end-to-end process.
 
 1. **Read the changelog** for both packages before updating — check both GitHub releases and CHANGELOG.md.
-2. **Check the `resolveModelPreference` function** — if it changed, the patch may need updating. **NOTE (2026-06-15):** upstream v0.42.0 already fixed this ("Prevent cross-family model matching in `resolveModelPreference`"). On any upgrade to ≥0.42.0, first determine whether the patch is still needed *at all* (probe full Opus `[1m]` IDs against JSONL) before re-deriving it — it may be removable.
-3. **Update the package**: `npm i -g @agentclientprotocol/claude-agent-acp@latest`
-4. **Re-apply the patch immediately**: `npm run patch-acp`
-   - If exit code 1 (anchor not found): upstream changed the resolver — the patch script needs updating.
-5. **Verify the patch**: Follow [`model-management-runbook.md`](model-management-runbook.md) §4 — probe against JSONL ground truth. **Never trust model self-reports.**
+2. **Check model-selection behavior** — the local resolver patch was **retired at 0.54.1** (there is no `patch-acp` script anymore). Model selection is now the `"model"` `SessionConfigSelect` set via `setSessionConfigOption`, and 0.54.1 exact-matches advertised full IDs before fuzzy-matching. Watch the changelog for any change to `setSessionConfigOption`, `resolveModelPreference`, the exact-match-before-fuzzy order, or advertised `availableModels` — a regression here is the highest-risk change.
+3. **Update the packages**: `npm i -g @agentclientprotocol/claude-agent-acp@latest @anthropic-ai/claude-code@latest`, and bump `@agentclientprotocol/sdk` in `package.json` if it moved (`npm install`).
+4. **Confirm pristine**: a clean install should report PRISTINE (we no longer patch — a MODIFIED result means unexpected tampering). Do NOT run any patch step.
+5. **Verify model selection**: Follow [`model-management-runbook.md`](model-management-runbook.md) §4 — probe every picker entry against JSONL ground truth and confirm none is rejected with `Invalid value for config option model` (account caveat). **Never trust model self-reports.**
 6. **Test a session**: Start a Claude session via Discord, confirm the status card shows the correct resolved model and effort.
 7. **Check for new features**: Look for new CLI flags, env vars, or ACP capabilities.
 8. **Check `EffortLevel` type**: If the bundled SDK's `EffortLevel` enum changed, update effort handling in [`claude.ts`](../src/agents/profiles/claude.ts).
 9. **Check adaptive thinking**: If thinking display options changed, update the `_meta.claudeCode.options.thinking` logic.
+10. **If a full ID gets rejected**: the old `query.setModel(fullId)` escape hatch is gone — forward the model via `ANTHROPIC_MODEL` in the `claude.ts` spawn env, or re-derive a fresh patch against the new version (per the model-management runbook). Do this in a separately tasked session, not during a sweep.
 
 ### 5.3 ACP SDK version bump
 
@@ -755,7 +764,7 @@ Record current versions at time of sweep:
 | `opencode` (`opencode-ai`, LM Studio profile) | | |
 | `@agentclientprotocol/sdk` | | |
 | `discord.js` | | |
-| Claude patch applied? | yes/no | |
+| Claude resolver patch | RETIRED at 0.54.1 (no patch) | |
 
 ## Previous Report
 
@@ -810,7 +819,7 @@ For teams wanting to reduce manual effort, these are automatable:
 | Version snapshot | Script that runs `npm ls @agentclientprotocol/sdk`, `npm list -g @anthropic-ai/claude-code --depth=0`, etc. |
 | Diff detection | `git log --oneline` on watched repos between sweep dates |
 | Report scaffolding | Script that copies the §6 template, fills in today's date, and pre-populates the version snapshot |
-| Patch verification | Run `npm run patch-acp` and check exit code as part of a CI/scheduled job |
+| Model-selection verification | Run the `model-management-runbook.md` §4 JSONL probe on a schedule; flag any picker entry that resolves wrong or is rejected with `Invalid value for config option model` (there is no patch to verify anymore — the resolver patch was retired at 0.54.1) |
 
 ---
 
@@ -848,8 +857,9 @@ npm view @agentclientprotocol/claude-agent-acp version
 npm view @github/copilot version
 # npm view @google/gemini-cli version  # DEPRECATED
 
-# ── Re-apply Claude patch after any update ──
-npm run patch-acp
+# ── Claude resolver patch: RETIRED at 0.54.1 — there is no patch-acp script. ──
+# Model selection is verified via the model-management-runbook §4 JSONL probe, not
+# by re-applying a patch. A clean claude-agent-acp install should stay PRISTINE.
 
 # ── Validate the build after any dependency update ──
 npm run typecheck
@@ -897,7 +907,7 @@ https://registry.npmjs.org/@github/copilot
 
 ## Appendix C: Related seam-acp Documentation
 
-- [`model-management-runbook.md`](model-management-runbook.md) — Authoritative Claude model management process (564 lines)
+- [`model-management-runbook.md`](model-management-runbook.md) — Authoritative Claude model management process
 - [`remote-agent.md`](remote-agent.md) — Remote agent setup via WebSocket bridge
 - [`premium-compaction-design.md`](premium-compaction-design.md) — Compaction system design
 - [`durable-jobs-plan.md`](durable-jobs-plan.md) — Durable jobs feature plan

@@ -40,9 +40,10 @@ files are **~45% of the codebase**, and one file is **34%**.
   location-as-binding.
 
 **B. Pragmatic hacks (isolated, justified-but-smelly)**
-- **B1 `[out-of-scope]` `patch-acp` monkey-patches a `node_module` dist** (must re-run
-  after every package update). Tied to an upstream resolver bug — revisit when upstream
-  fixes it; not the plan's concern.
+- **B1 `[resolved]` ~~`patch-acp` monkey-patches a `node_module` dist~~** — retired at
+  `claude-agent-acp` 0.54.1: `setSessionConfigOption` exact-matches full canonical IDs
+  before the fuzzy resolver, so the resolver-bypass patch is no longer needed. The
+  script and the `npm run patch-acp` command have been deleted.
 - **B2 `[retired-by-plan]` cwd-rewrite** string-munges ACP messages to swap paths. →
   **§7** workspace-at-host; deleted in **PR0**.
 - **B3 `[retired-by-plan]` raw-SQL string-building + `sqlite3`-CLI shelling** in the
@@ -73,7 +74,7 @@ files are **~45% of the codebase**, and one file is **34%**.
 | dead remote code | **Deleted** — PR0 |
 | naming sprawl | **Fixed** *if* the naming resolver (D10) is done |
 | **A1 orchestrator** | **Not addressed — likely grows** (selection UI, `/seam bridge`, `/seam debug` land there) |
-| B1 patch-acp | Untouched (upstream-bug tie) |
+| B1 patch-acp | **Resolved** — patch retired at claude-agent-acp 0.54.1 (upstream exact-match fix) |
 | C1 tests | Partly helped; 4 failures remain |
 | C2 config sprawl | **At risk of growing** unless bridge config is a structured file |
 | C3 `as any` | Opportunity in PR1 |
@@ -91,7 +92,7 @@ A1 and risks worsening A1/C2 if you're not deliberate.
   the plan adds (`/seam bridge`, `/seam debug`, selection UI) into their own modules so
   it doesn't grow and decomposition starts where you're already working. A **full**
   orchestrator teardown is a separate project — high risk for a daily-driver app.
-- **Leave alone now:** B1 patch-acp · C1 broad test coverage · C4 agy cleanup.
+- **Leave alone now:** C1 broad test coverage · C4 agy cleanup. *(B1 patch-acp is resolved — patch retired at 0.54.1.)*
 
 ## Related
 - [seam-bridge-plan.md](./seam-bridge-plan.md) — §3 "debt retired", §9 "debt

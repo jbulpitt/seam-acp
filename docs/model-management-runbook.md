@@ -7,13 +7,26 @@ JSONL ground truth.** Every claim about "what model is running" or "what context
 window is active" must be proven by reading the API's own output, not by asking
 the model or trusting the string we passed in.
 
-This exists because the `claude-agent-acp` wrapper reimplements model-alias
-resolution in a way that is **inconsistent and silently wrong** for some inputs
-(e.g. `opus[1m]` has resolved to Sonnet; `claude-sonnet-4-6[1m]` silently gives a
-200K window). We carry a one-line local patch (`scripts/patch-claude-agent-acp.mjs`,
-§3a) that makes full `claude-*` IDs bypass the broken resolver, plus we route
-around the still-broken aliases — and we continuously prove the routing with
-JSONL probes.
+This exists because the `claude-agent-acp` wrapper historically reimplemented
+model-alias resolution in a way that was **inconsistent and silently wrong** for
+some inputs (e.g. `opus` has resolved to a different family; a full ID could fuzzy-
+match to the wrong model). **As of claude-agent-acp 0.54.1 that resolver was fixed
+structurally** (see below) and the local patch we used to carry has been
+**retired and deleted**. We still verify every entry against JSONL ground truth —
+the discipline is unchanged even though the workaround is gone.
+
+**Model selection is now an ACP session config option.** Since ACP schema v1.16.0
+(shipped in SDK 1.x) the dedicated `models` field was removed from session
+responses; model selection is exposed as a `SessionConfigSelect` whose
+`id`/`category` is `"model"`, and switching models uses
+`setSessionConfigOption({ sessionId, configId: "model", value })`. The old
+`unstable_setSessionModel` RPC is gone. In 0.54.1, `setSessionConfigOption` for
+the model option **exact-matches the requested value against the agent's
+advertised model list BEFORE calling `resolveModelPreference`** — so a full
+canonical ID (e.g. `claude-opus-4-8`) that is advertised resolves to itself, and
+the fuzzy resolver is only a fallback for aliases. This is the structural fix (on
+top of v0.42.0's "prevent cross-family matching") that made the local patch
+unnecessary.
 
 ---
 
@@ -29,50 +42,70 @@ before running any procedure in this runbook:
    strings travel and where they can break. This is the conceptual foundation for
    every other section.
 3. **Current state** — skim these files to understand what's deployed right now:
-   - `.env` — `CLAUDE_DEFAULT_MODEL` and `CLAUDE_MODELS` (the picker values)
-   - `src/agents/profiles/claude.ts` — `getClaudeContextWindow()` (compaction
-     threshold logic) and `newSessionMeta()` (how `_meta` is built)
+   - `.env` — `CLAUDE_DEFAULT_MODEL` and `CLAUDE_MODELS` (the picker values, now
+     bare full IDs plus the `default` alias — no `[1m]` suffix)
+   - `src/agents/profiles/claude.ts` — the `CLAUDE_CONTEXT_WINDOWS` table +
+     `getClaudeContextWindow()` (compaction threshold + `contextLimit` seed),
+     `withClaudeContextLimits()` (stamps every picker entry's `contextLimit`), and
+     `newSessionMeta()` (how `_meta` is built)
    - `src/config.ts` — env var validation, `REMOTE_MAC_MODELS` (remote Copilot
      agent, separate ID format)
-   - `scripts/patch-claude-agent-acp.mjs` — the local resolver-bypass patch
+   - **No patch script.** The former `scripts/patch-claude-agent-acp.mjs` and the
+     `npm run patch-acp` script were retired at 0.54.1 and no longer exist.
 4. **The "Current verified picture" table** above — the last-known-good mapping
    of picker values → API models → context windows. Treat it as stale if any
    version has changed since the date shown.
 
-## Current verified picture (last verified 2026-06-01, claude-agent-acp 0.39 + patch)
+## Current verified picture (last updated 2026-07-01, claude-agent-acp 0.54.1 + ACP SDK 1.1.0, no patch)
 
 This table is the *output* of the §4 process, kept here as a quick reference.
 **It is not a substitute for re-running §4 after any update** — treat it as stale
-the moment you touch versions. "Patch" = requires `npm run patch-acp` applied.
+the moment you touch versions. Model IDs are now **bare** (no `[1m]` suffix); each
+model's native window comes from the `CLAUDE_CONTEXT_WINDOWS` table in
+`claude.ts`, and the agent also reports the true window at runtime via
+`UsageUpdate.size`.
 
 | Picker value | Resolves to (JSONL) | Window | Mechanism |
 |---|---|---|---|
 | `default` ⭐ | claude-opus-4-8 (auto-rolls) | 1M | alias (Max → latest Opus) |
-| `claude-opus-4-8[1m]` | claude-opus-4-8 | 1M | full ID |
-| `claude-opus-4-7[1m]` | claude-opus-4-7 | 1M | full ID |
-| `claude-opus-4-6[1m]` | claude-opus-4-6 | 1M | full ID (**needs patch**) |
-| `claude-opus-4-6` | claude-opus-4-6 | 200K | full ID |
-| `sonnet[1m]` | claude-sonnet-4-6 | 1M | alias |
+| `claude-opus-4-8` | claude-opus-4-8 | 1M | full ID (exact-match) † |
+| `claude-opus-4-7` | claude-opus-4-7 | 1M | full ID (exact-match) † |
+| `claude-opus-4-6` | claude-opus-4-6 | 200K | full ID (exact-match) † |
+| `claude-fable-5` | claude-fable-5 | 1M | full ID (exact-match) † |
+| `claude-sonnet-5` | claude-sonnet-5 | 1M | full ID (exact-match) † |
 | `sonnet` | claude-sonnet-4-6 | 200K | alias |
-| `claude-sonnet-4-6[1m]` | claude-sonnet-4-6 | 1M | full ID (**needs patch**) |
-| `claude-sonnet-4-6` | claude-sonnet-4-6 | 200K | full ID |
+| `claude-sonnet-4-6` | claude-sonnet-4-6 | 200K | full ID (exact-match) † |
 | `haiku` | claude-haiku-4-5-20251001 | 200K | alias |
-| `claude-haiku-4-5` | claude-haiku-4-5-20251001 | 200K | full ID |
+| `claude-haiku-4-5` | claude-haiku-4-5-20251001 | 200K | full ID (exact-match) † |
 
-**Broken — never put in the picker** (verified to resolve wrong):
-`opus`, `opus[1m]`, `best` → Sonnet. Bare `claude-opus-4-8`/`-4-7` → run at 1M
-but set a 200K compaction threshold (no `1m` token). Without the patch:
-`claude-opus-4-6[1m]` → Sonnet, `claude-sonnet-4-6[1m]` → 200K.
+**† Account caveat (LIVE WARNING — verify these on next use):** this account's
+Claude Code SDK advertises only `default / sonnet / sonnet[1m] / haiku` in
+`availableModels`. Because 0.54.1's `setSessionConfigOption` requires the value to
+be **advertised-or-resolvable**, an un-advertised full ID can be REJECTED with
+`Invalid value for config option model`. `default` → latest Opus @ 1M is the
+**proven** path. The explicit `claude-opus-4-8` / `claude-fable-5` /
+`claude-sonnet-5` (and the other bare full IDs) picker entries were added
+2026-07-01 and are **PENDING live-usage validation** — probe them via §4. If they
+fail to switch, the old patch's `query.setModel(fullId)` escape hatch is gone; the
+fix is to restore `ANTHROPIC_MODEL` forwarding of the selected model in the
+`claude.ts` spawn env (which both adds it to `availableModels` AND selects it), or
+re-derive a patch against 0.54.1.
+
+**Never put in the picker** (verified to resolve wrong historically):
+`opus`, `best` → resolve to a non-Opus family. Do not add aliases that fuzzy-match.
 
 Two non-obvious truths this table encodes:
-1. **The `[1m]` suffix is stripped before the API**, so the JSONL model id
-   (`claude-opus-4-8`) never shows it. The suffix's real jobs are (a) the
-   wrapper's window heuristic and (b) seam-acp's compaction-threshold math
-   (`getClaudeContextWindow`). Window correctness depends on the suffix even
-   though the API model id doesn't carry it.
-2. **Opus 4.7/4.8 are 1M with or without `[1m]` on Max** (auto-upgrade); Opus
-   4.6 is 200K unless you pass `[1m]`. So `claude-opus-4-6` and
-   `claude-opus-4-6[1m]` are genuinely different windows; the 4.8 pair is not.
+1. **The `[1m]` suffix is retired and is NOT load-bearing.** Model IDs are bare;
+   the JSONL model id (`claude-opus-4-8`) matches what you passed. Each model's
+   native window is declared in the `CLAUDE_CONTEXT_WINDOWS` table in `claude.ts`,
+   resolved by `getClaudeContextWindow(modelId)` and stamped onto every picker
+   entry (`contextLimit`) by `withClaudeContextLimits` — so the orchestrator's
+   `staticModels[].contextLimit → modelContextFloor` path seeds the window on
+   turn 1, and the agent's runtime `UsageUpdate.size` refines it. (`getClaudeContextWindow`
+   still strips any residual legacy `[1m]` for safety, but nothing relies on it.)
+2. **Opus 4.7/4.8/Fable-5/Sonnet-5 are 1M; Opus 4.6, Sonnet 4.6, and Haiku are
+   200K** — the window is a property of the model, declared in the table, not of a
+   string suffix.
 
 ---
 
@@ -80,29 +113,34 @@ Two non-obvious truths this table encodes:
 
 ```
 seam-acp .env (CLAUDE_MODELS, CLAUDE_DEFAULT_MODEL)
-   │  the model string you chose
+   │  the model string you chose (bare full ID or `default`)
    ▼
 seam-acp DB (sessions.config_json → cfg.model)
-   │  setModel(cfg.model) on every newSession AND loadSession
+   │  setSessionConfigOption(configId:"model", value:cfg.model) on every
+   │  newSession AND loadSession
    ▼
-claude-agent-acp  ← THE LANDMINE: resolveModelPreference() fuzzy-matches
-   │                 your string against a tiny curated list and can pick
-   │                 the WRONG model. The [1m] token also drives our
-   │                 compaction-threshold math (getClaudeContextWindow).
+claude-agent-acp 0.54.1  ← exact-matches the value against the agent's
+   │                        advertised model list FIRST; a full canonical ID
+   │                        that IS advertised resolves to itself.
+   │                        resolveModelPreference() is now only a fuzzy
+   │                        FALLBACK for aliases. CAVEAT: an un-advertised full
+   │                        ID can be REJECTED (see account caveat, §5).
    ▼
-Claude Code CLI  ← resolves correctly on its own; the wrapper is the problem
+Claude Code CLI  ← resolves correctly on its own
    ▼
 Anthropic API  → writes entry.message.model into the JSONL = GROUND TRUTH
 ```
 
 Two independent things must both be right:
 1. **Which model actually runs** — `entry.message.model` in the JSONL.
-2. **Which context window is active** — `usage_update.size` (sourced from the
-   API's `modelUsage.contextWindow`), AND the compaction threshold seam-acp
-   computes from `getClaudeContextWindow()` in `src/agents/profiles/claude.ts`.
+2. **Which context window is active** — `usage_update.size` (the agent reports
+   the true window at runtime, sourced from the API's `modelUsage.contextWindow`),
+   AND the compaction threshold seam-acp computes from the `CLAUDE_CONTEXT_WINDOWS`
+   table via `getClaudeContextWindow()` in `src/agents/profiles/claude.ts`.
 
-A model can run correctly but get a wrong compaction threshold (the `[1m]`-token
-trap). Check both.
+A model can run correctly but get a wrong compaction threshold if its window is
+missing from `CLAUDE_CONTEXT_WINDOWS` (falls through to the family heuristic or
+the 200K default). Check both.
 
 ---
 
@@ -154,11 +192,11 @@ explicitly report on each of these categories:
 | Category | What to look for | Why it matters here |
 |---|---|---|
 | **New models** | New Opus/Sonnet/Haiku versions, new full IDs | The picker (`CLAUDE_MODELS`) must be updated AND re-verified |
-| **Alias behavior** | "alias", "resolve", "model match", "default" changes | This is exactly what broke `opus[1m]`→Sonnet. Highest-risk category. |
+| **Model config option / resolver** | changes to the `"model"` `SessionConfigSelect`, `setSessionConfigOption`, `resolveModelPreference`, advertised `availableModels`, or the exact-match-before-fuzzy order | Highest-risk category: this is how models are selected in 1.x. A regression here can reject full IDs or re-introduce cross-family fuzzy matching. |
 | **Effort defaults** | New default effort per model, new tiers (`xhigh`, `max`, `ultra`) | Unset effort uses the model default; a default change silently alters behavior |
-| **Context window** | 1M support, auto-upgrade rules, `[1m]` handling | Drives compaction threshold and cost |
+| **Context window** | new model windows, 1M support, auto-upgrade rules | Drives compaction threshold (`CLAUDE_CONTEXT_WINDOWS`) and cost |
 | **Compaction** | auto-compact thresholds, `compactionControl` shape | We pass `compactionTokenThreshold`; the API contract could change |
-| **ACP protocol** | new `_meta` fields, `usage_update` shape, `set_model` semantics | Our `getUsage`/status-card plumbing depends on these |
+| **ACP protocol** | new `_meta` fields, `UsageUpdate` shape, config-option semantics, schema version bumps | Our `getUsage`/status-card and model-selection plumbing depend on these |
 | **Tool signatures** | new params on built-in tools (e.g. image aspect ratio) | Could unlock features currently worked around |
 
 **Deliverable**: a short written report, one bullet per relevant change, each
@@ -180,56 +218,48 @@ node -p "require(process.env.HOME + '/.nvm/versions/node/' + process.version + '
 - The binaries are looked up on PATH and spawned fresh per session, so a
   seam-acp restart is **not strictly required** — new turns pick up the new
   version. Run `npm run redeploy` if you want every runtime cycled immediately.
-- **Confirm the freshly-installed package is pristine** (a clean baseline before
-  we apply our patch — §3a). Run this immediately after the `npm i -g`, BEFORE
-  patching:
+- **Confirm the freshly-installed package is pristine.** We no longer patch the
+  package, so a clean install should always report PRISTINE — a MODIFIED result
+  now means something else tampered with it and should be investigated. Run:
   ```bash
   cd /tmp && npm pack @agentclientprotocol/claude-agent-acp@$(npm view @agentclientprotocol/claude-agent-acp version) >/dev/null 2>&1
   tar xzf agentclientprotocol-claude-agent-acp-*.tgz
   PKG=$(npm root -g)/@agentclientprotocol/claude-agent-acp
   diff -rq /tmp/package/dist "$PKG/dist" && echo "PRISTINE" || echo "MODIFIED — investigate"
   ```
+- Also bump the `@agentclientprotocol/sdk` dependency in `package.json` if the SDK
+  moved (we currently pin `^1.1.0`); run `npm install`, `npm run typecheck`, and
+  `npm run build`.
 
 **After ANY update, treat every model entry as unverified until §4 passes.**
-Model-resolution behavior has regressed across patch releases before.
+Model-resolution behavior has regressed across releases before.
 
-## 3a. Re-apply the local resolver patch (REQUIRED after every update)
+## 3a. Local resolver patch — RETIRED at 0.54.1 (do not re-apply)
 
-We carry one local patch to `claude-agent-acp` (`scripts/patch-claude-agent-acp.mjs`).
-A global `npm i -g` overwrites the package and **wipes the patch**, so it must be
-re-applied after every update.
+**There is no patch anymore.** The former local patch
+(`scripts/patch-claude-agent-acp.mjs` / `npm run patch-acp`) has been **deleted**.
+Any older instruction to "run `npm run patch-acp`" or "re-apply the patch after a
+global update" is now WRONG.
 
-**What it fixes:** in 0.39, `unstable_setSessionModel` runs every model string
-through `resolveModelPreference` against a 4-entry curated list. Full Opus IDs
-find no Opus entry and fuzzy-match to Sonnet (e.g. `claude-opus-4-6[1m]` → Sonnet;
-`claude-sonnet-4-6[1m]` → silently 200K). The patch makes canonical full IDs
-(`/^claude-…(\[1m\])?$/`) **bypass** the resolver and pass straight to
-`query.setModel`, which handles them correctly (the raw CLI proves it). Aliases
-are untouched. Result: every full ID resolves to exactly itself at the right
-window, and Opus 4.6 @ 1M becomes available.
+**Why it's gone.** The patch existed to work around a resolver in the old
+`unstable_setSessionModel` RPC that fuzzy-matched full IDs to the wrong model. In
+0.54.1 that RPC no longer exists (model selection is now
+`setSessionConfigOption({ configId: "model", value })`), and the config-option
+handler **exact-matches the requested value against the agent's advertised model
+list BEFORE calling `resolveModelPreference`**. So an advertised full canonical ID
+resolves to itself and the fuzzy resolver is only a fallback for aliases — the
+exact behavior the patch used to force, now upstream. The patch's anchor
+(`resolveModelPreference` inside `unstable_setSessionModel`) is also simply gone,
+and a global `npm i -g` would wipe any local edit anyway. Nothing to re-apply,
+nothing to re-derive on a routine update.
 
-```bash
-npm run patch-acp     # idempotent; safe to run anytime
-```
-
-- Exit 0 + "already patched" → nothing to do.
-- Exit 0 + "applied" → patch went in; **re-verify with §4 before trusting it**.
-- Exit 1 + "ANCHOR NOT FOUND" → upstream moved the code. Open
-  `scripts/patch-claude-agent-acp.mjs`, re-derive the bypass against the new
-  `unstable_setSessionModel`, update ANCHOR/REPLACEMENT, re-run, re-verify.
-
-**Decision record (why we patch despite the maintenance cost):** the patch is a
-one-line, exactly-anchored bypass — cheap to re-apply and re-derive. It buys two
-things we genuinely want: (1) zero model-resolution ambiguity — every full ID
-does exactly what it says; (2) Opus 4.6 @ 1M, which is otherwise unreachable
-through the wrapper. The alternative (route around with only the handful of
-full IDs that happen to resolve correctly) leaves traps in the picker and no 4.6
-1M. Verification work (§4) is required either way, so the patch's only marginal
-cost is the re-apply step — which `npm run patch-acp` makes trivial.
-
-**Note:** once patched, the §3 pristine check will (correctly) report MODIFIED.
-That's expected. Run the pristine check only on the fresh install, before
-`patch-acp`.
+**Escape hatch, if a full ID is REJECTED.** See the account caveat in §5: an
+un-advertised full ID can be rejected with `Invalid value for config option
+model`. The old patch used to sidestep this by calling `query.setModel(fullId)`
+directly (which accepted any id) — that escape hatch is gone. The current fix is
+to forward the selected model via `ANTHROPIC_MODEL` in the `claude.ts` spawn env
+(adds it to `availableModels` + selects it), or re-derive a fresh patch against
+0.54.1. Only reach for this if §4 shows a picker entry being rejected.
 
 ---
 
@@ -247,14 +277,15 @@ import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-// Edit this list to whatever you need to verify:
+// Edit this list to whatever you need to verify (bare full IDs — no `[1m]`):
 const MODELS = [
   "default",
-  "claude-opus-4-8[1m]",
-  "claude-opus-4-7[1m]",
+  "claude-opus-4-8",
+  "claude-opus-4-7",
   "claude-opus-4-6",
+  "claude-fable-5",
+  "claude-sonnet-5",
   "sonnet",
-  "sonnet[1m]",
   "claude-sonnet-4-6",
   "haiku",
   "claude-haiku-4-5",
@@ -279,7 +310,11 @@ async function probe(modelId) {
   await call("initialize", { protocolVersion: 1, clientCapabilities: { fs: {}, terminal: false } });
   const s = await call("session/new", { cwd: "/tmp", mcpServers: [] });
   const sid = s.result.sessionId;
-  await call("session/set_model", { sessionId: sid, modelId });
+  // 0.54.1: model selection is a session config option, not the old
+  // unstable_setSessionModel RPC. An un-advertised full ID may be REJECTED here
+  // with `Invalid value for config option model` — capture that instead of hanging.
+  const setRes = await call("session/set_config_option", { sessionId: sid, configId: "model", value: modelId });
+  const setModelError = setRes.error ? setRes.error.message : null;
   notes.length = 0;
   await call("session/prompt", { sessionId: sid, prompt: [{ type: "text", text: "ok" }] });
 
@@ -302,12 +337,13 @@ async function probe(modelId) {
   // Active context window from the ACP usage stream (sourced from API modelUsage).
   const sizes = [...new Set(notes.filter(n => n.update?.sessionUpdate === "usage_update").map(n => n.update.size))];
   const window = Math.max(0, ...sizes) >= 1_000_000 ? "1M" : (Math.max(0, ...sizes) / 1000) + "K";
-  return { requested: modelId, apiModel, window, allSizes: sizes };
+  return { requested: modelId, apiModel, window, allSizes: sizes, setModelError };
 }
 
 for (const m of MODELS) {
   const r = await probe(m);
-  console.log(r.requested.padEnd(24), "→ API:", String(r.apiModel).padEnd(24), "window:", r.window, " sizes:", r.allSizes.join(","));
+  const err = r.setModelError ? "  ⚠ set_config_option REJECTED: " + r.setModelError : "";
+  console.log(r.requested.padEnd(24), "→ API:", String(r.apiModel).padEnd(24), "window:", r.window, " sizes:", r.allSizes.join(",") + err);
 }
 ```
 
@@ -317,12 +353,18 @@ timeout 300 node /tmp/probe-models.mjs 2>/dev/null
 ```
 
 **How to read the output — a model entry is VERIFIED only if ALL hold:**
-1. `API model` matches the model you intended (e.g. `default` → `claude-opus-4-8`,
-   NOT `claude-sonnet-...`).
-2. `window` matches the label you plan to show (1M vs 200K).
-3. `sizes` does not reveal a problematic flicker you care about (a bare 1M-capable
-   Opus ID shows `200000,1000000` — it ends at 1M but seam-acp's compaction
-   threshold will be wrong unless the string carries a `1m` token; see §6).
+1. `set_config_option` was NOT rejected (no `⚠ ... REJECTED` on the line). A
+   rejection with `Invalid value for config option model` means the full ID is
+   not advertised on this account and cannot be selected as-is — see the account
+   caveat in §5 for the fix.
+2. `API model` matches the model you intended (e.g. `default` → `claude-opus-4-8`,
+   NOT a different family).
+3. `window` matches the label you plan to show (1M vs 200K), AND `getClaudeContextWindow`
+   returns the same value for that ID (§6). A 1M model whose ID is missing from
+   `CLAUDE_CONTEXT_WINDOWS` (and not caught by the family heuristic) would seed a
+   200K compaction threshold.
+4. `sizes` shows the expected window; a 1M model typically shows `200000,1000000`
+   (the agent's runtime `UsageUpdate.size` overwriting the 200K default — see §4a).
 
 ### 4a. Cross-check the window with the raw CLI (authoritative)
 
@@ -339,7 +381,7 @@ To get the real window independent of the wrapper, ask the **raw Claude Code
 CLI**, which computes the window from genuine model metadata:
 
 ```bash
-for m in claude-opus-4-6 claude-opus-4-6[1m] claude-opus-4-8 claude-opus-4-8[1m]; do
+for m in claude-opus-4-6 claude-opus-4-8 claude-sonnet-4-6 claude-sonnet-5; do
   echo "=== $m ==="
   timeout 40 claude --model "$m" -p "/context" 2>/dev/null | grep -iE "Model:|Tokens:"
 done
@@ -347,21 +389,23 @@ done
 
 `/context` prints e.g. `**Tokens:** 23.6k / 200k (12%)` — the denominator is the
 authoritative window. **A window claim is only proven when the raw CLI `/context`
-agrees with it.** (Empirically: bare `claude-opus-4-6` = 200K, `claude-opus-4-6[1m]`
-= 1M in the raw CLI — but the wrapper breaks the `[1m]` variant to Sonnet, so 4.6
-is 200K-only through our stack.)
+agrees with it.** (Empirically: bare `claude-opus-4-6` = 200K, `claude-opus-4-8`
+= 1M in the raw CLI.)
 
-**Known traps to re-confirm every time (these have ALL bitten us):**
-- `opus`, `opus[1m]`, `best` → resolve to **Sonnet**. Never use.
-- `claude-sonnet-4-6[1m]` (full ID) → silently **200K**. For 1M Sonnet use the
-  `sonnet[1m]` **alias** only.
-- `claude-opus-4-6[1m]` → resolves to **Sonnet**. Opus 4.6 is **200K-only** via
-  the wrapper.
-- bare `claude-opus-4-8` / `claude-opus-4-7` → run at 1M but, lacking a `1m`
-  token, make seam-acp compute a **200K compaction threshold** → premature
-  compaction. Use the `[1m]` form.
-- `default` → correct model + 1M window, but the string has no `1m` token, so
-  `getClaudeContextWindow` MUST special-case it (it does — verify §6).
+**Known traps to re-confirm every time:**
+- `opus`, `best` → fuzzy-resolve to a **different family**. Never put an alias
+  that fuzzy-matches in the picker; use the bare full ID or `default`.
+- **Un-advertised full IDs may be REJECTED** by 0.54.1's `setSessionConfigOption`
+  (`Invalid value for config option model`) if this account's SDK doesn't
+  advertise them — see the account caveat in §5. `default` → latest Opus @ 1M is
+  the proven path.
+- A 1M model whose window is **missing from `CLAUDE_CONTEXT_WINDOWS`** (and not
+  matched by the family heuristic in `claudeContextWindowFamily`) makes seam-acp
+  compute a **200K compaction threshold** → premature compaction. Add it to the
+  table (§6). The `[1m]` suffix is retired and does NOT influence this — the table
+  is the single source of truth.
+- `default` → correct model + 1M window; `getClaudeContextWindow` special-cases it
+  to 1M (it does — verify §6).
 
 ---
 
@@ -371,20 +415,28 @@ The picker is `CLAUDE_MODELS` in `.env`, comma-separated `modelId:Label` pairs.
 `CLAUDE_DEFAULT_MODEL` is the model new threads start on.
 
 Rules (enforced by §4 evidence, not by intuition):
-- **One correct entry per (model, window).** No trap variants, no redundant
-  bare/suffixed pairs.
-- **Opus 1M** → full ID **with** `[1m]` (`claude-opus-4-8[1m]`). The suffix is
-  load-bearing for the compaction threshold.
-- **Opus 200K-only models** (e.g. 4.6) → bare full ID.
-- **Sonnet 1M** → `sonnet[1m]` **alias** (the only thing that works).
-- **Sonnet/Haiku 200K** → alias (`sonnet`,`haiku`) for auto-roll, and/or full ID
-  (`claude-sonnet-4-6`,`claude-haiku-4-5`) to pin a version.
-- **`default`** → the auto-rolling "latest Opus @ 1M" entry (Max tier).
+- **Bare full IDs only — no `[1m]` suffix.** The suffix is retired; window is a
+  property of the model, declared in `CLAUDE_CONTEXT_WINDOWS` (§6), not the string.
+  Current picker: `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`,
+  `claude-fable-5`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-haiku-4-5`,
+  plus the `default` alias.
+- **One entry per model.** No trap variants, no redundant pairs.
+- **`default`** → the auto-rolling "latest Opus @ 1M" entry (Max tier); the proven
+  path (always advertised).
+- **Full IDs are subject to the account caveat.** In 0.54.1 a full ID must be
+  advertised-or-resolvable, and this account advertises only
+  `default/sonnet/sonnet[1m]/haiku`. An un-advertised full ID can be REJECTED
+  (`Invalid value for config option model`). §4-probe every new full ID; the bare
+  full-ID picker entries added 2026-07-01 are PENDING live validation. If one is
+  rejected, forward it via `ANTHROPIC_MODEL` in the `claude.ts` spawn env (adds it
+  to `availableModels` + selects it) or re-derive a patch against 0.54.1.
+- **Aliases** (`sonnet`, `haiku`) may be used for auto-roll where advertised; do
+  NOT add a fuzzy-matching alias like `opus`/`best`.
 - Label format: `Name • <window> 🪟` (+ `⭐` for the recommended default). The
-  window in the label MUST match the §4-verified window.
+  window in the label MUST match the §4-verified / `CLAUDE_CONTEXT_WINDOWS` window.
 
 After editing `.env`, **re-run §4** for every entry you added or changed. Then
-update the compaction map if needed (§6) and deploy:
+update the compaction table if needed (§6) and deploy:
 ```bash
 npm run redeploy
 ```
@@ -397,33 +449,43 @@ DB (§9).
 ## 6. Verify the compaction threshold (the silent trap)
 
 `getClaudeContextWindow(modelId)` in `src/agents/profiles/claude.ts` decides the
-window used to compute the auto-compaction threshold (`newSessionMeta`). If it
+window used to compute the auto-compaction threshold (`newSessionMeta`), and — via
+`withClaudeContextLimits` — the `contextLimit` stamped on every picker entry (the
+orchestrator's `staticModels[].contextLimit → modelContextFloor` seed). If it
 returns 200K for a model that's actually 1M, Claude Code compacts at
-`0.8 × 200K = 160K` and throws away 840K of usable context.
+`0.8 × 200K = 160K` and throws away 840K of usable context. (The agent also
+reports the true window at runtime via `UsageUpdate.size`, which refines the
+display once a turn completes — but the compaction threshold is computed up front
+from this table, so the table must be right.)
 
-For **every** model in `CLAUDE_MODELS`, confirm `getClaudeContextWindow` returns
-the same window §4 proved:
+The window is resolved by an **exact-match table** (`CLAUDE_CONTEXT_WINDOWS`) with
+a family-heuristic fallback (`claudeContextWindowFamily`) and a `default` → 1M
+special case. `[1m]` is no longer meaningful (it's stripped for legacy safety
+only). For **every** model in `CLAUDE_MODELS`, confirm `getClaudeContextWindow`
+returns the same window §4 proved — call the real exported function so the check
+can't drift from the implementation:
 
 ```bash
 node -e '
-const re1 = s => /\b1m\b/i.test(s) || /-1m\b/i.test(s);
-const reDefault = s => /^default$/i.test(s.trim());
-const gcw = s => !s ? 200000 : (re1(s) || reDefault(s)) ? 1000000 : 200000;
-for (const m of ["default","claude-opus-4-8[1m]","claude-opus-4-7[1m]","claude-opus-4-6","sonnet","sonnet[1m]","claude-sonnet-4-6","haiku","claude-haiku-4-5"]) {
-  console.log(m.padEnd(24), "→ compaction window:", gcw(m));
+require("tsx/cjs");
+const { getClaudeContextWindow } = require("./src/agents/profiles/claude.ts");
+for (const m of ["default","claude-opus-4-8","claude-opus-4-7","claude-opus-4-6","claude-fable-5","claude-sonnet-5","sonnet","claude-sonnet-4-6","haiku","claude-haiku-4-5"]) {
+  console.log(m.padEnd(24), "→ compaction window:", getClaudeContextWindow(m));
 }
-'
+' 2>/dev/null || echo "(no tsx loader? import from the built dist/ instead, or read CLAUDE_CONTEXT_WINDOWS directly)"
 ```
 
-Each line must equal the §4 `window`. If a 1M model shows 200K here (e.g. a new
-alias like `default2`, or a bare 1M Opus ID), **fix `getClaudeContextWindow`**
-to recognize it, rebuild, and re-run.
+Each line must equal the §4 `window`. If a 1M model shows 200K here, **add it to
+the `CLAUDE_CONTEXT_WINDOWS` table** in `claude.ts` (or extend
+`claudeContextWindowFamily` for a whole new family), rebuild, and re-run.
 
 ---
 
 ## 7. Test NEW sessions apply the model correctly
 
-The orchestrator calls `setModel(cfg.model)` after `newSession`. To prove a fresh
+The orchestrator calls `AgentRuntime.setModel(cfg.model)` after `newSession`
+(which now issues `setSessionConfigOption({ configId: "model", value })` under
+the hood — the old `unstable_setSessionModel` RPC is gone). To prove a fresh
 thread runs the intended model:
 
 1. Create a new Discord thread (or `/seam new`) and set the model via `/seam model`.
@@ -460,8 +522,11 @@ The fix lives in `AgentRuntime.loadSession` (re-applies `opts.model` via
    `npm run redeploy` (drains turns, then restarts), or `/seam abort` then a new
    message, or just wait for an idle eviction.
 3. Send another message. The status card's resolved model MUST be unchanged.
-4. If it reverted to the default/Sonnet, `loadSession` is not re-applying —
-   inspect `AgentRuntime.loadSession` and the `setModel` call.
+4. If it reverted to the default, `loadSession` is not re-applying — inspect
+   `AgentRuntime.loadSession` and the `setModel` call (now the config-option RPC).
+   Note: if the model was rejected as un-advertised (account caveat, §5), the turn
+   may fall back to `default` here too — check the runtime logs for
+   `Invalid value for config option model`.
 
 **Shared-session caveat:** the seam-acp dev thread (`bdf3a481-…`) shares its
 JSONL with the interactive Claude Code session you talk to. `getUsage` filters
@@ -494,7 +559,10 @@ target):
 node -e '
 const D=require("./node_modules/better-sqlite3");
 const db=new D("./data/seam.db");
-const broken=["opus","opus[1m]","best","claude-opus-4-6[1m]","claude-sonnet-4-6[1m]"];
+// Stale/removed values to sweep. The `[1m]`-suffixed IDs are legacy: they no
+// longer appear in the picker, so any session still carrying one should migrate
+// to its bare equivalent (or to `default`, the always-advertised proven path).
+const broken=["opus","opus[1m]","best","claude-opus-4-8[1m]","claude-opus-4-7[1m]","claude-opus-4-6[1m]","claude-sonnet-4-6[1m]","claude-sonnet-5[1m]","claude-fable-5[1m]"];
 const target="default";
 let n=0;
 for(const r of db.prepare("SELECT id,config_json FROM sessions WHERE agent_id LIKE ?").all("%claude%")){
@@ -529,8 +597,10 @@ done — a clean build is not proof.
 A model-management change is complete only when:
 - [ ] Versions pulled and changelogs reported with tagged actions (§1–§2)
 - [ ] Update applied; package confirmed pristine on the fresh install (§3)
-- [ ] `npm run patch-acp` re-applied and reports success (§3a)
-- [ ] §4 probe shows every picker entry resolves to the intended API model + window
+- [ ] No patch to re-apply — the local resolver patch was retired at 0.54.1 (§3a).
+      A MODIFIED pristine check now means unexpected tampering, not our patch.
+- [ ] §4 probe shows every picker entry resolves to the intended API model +
+      window AND `set_config_option` was NOT rejected (account caveat, §5)
 - [ ] §4a raw-CLI `/context` cross-check agrees with every window claim
 - [ ] §6 confirms the compaction window matches for every entry
 - [ ] §7 a new session shows the correct resolved model on the card AND in JSONL
@@ -562,8 +632,10 @@ The value is threaded from `cfg.reasoningEffort` through `session-router` →
 it and invalidates the runtime so the next turn rebuilds the session with the new
 effort baked into `_meta`.
 
-**Why this path and not a wrapper patch:** it's our own code, survives every
-wrapper update untouched, nothing to re-apply (unlike the model patch in §3a).
+**Why this path and not a wrapper patch:** it's our own code and survives every
+wrapper update untouched. (The model path is also patch-free now — the local
+resolver patch was retired at 0.54.1, §3a — so neither model nor effort needs any
+re-apply step after an update.)
 
 **Verification (the deterministic test):** pass a *bogus* effort via `_meta` and
 confirm the SDK rejects it, then a valid one and confirm it's accepted. You don't
@@ -586,7 +658,8 @@ work, or reconstruct from the snippet above.)
 SDK=$(npm root -g)/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk
 grep -n "EffortLevel =" "$SDK/sdk.d.ts"
 ```
-As of SDK 0.3.156–0.3.159: `'low' | 'medium' | 'high' | 'xhigh' | 'max'`.
+As of SDK 0.3.197 (bundled inside claude-agent-acp 0.54.1):
+`'low' | 'medium' | 'high' | 'xhigh' | 'max'`.
 **`ultra` is NOT in the SDK** (even latest) — it appears to be interactive-CLI
 branding, not exposed programmatically. The SDK is *bundled inside*
 claude-agent-acp, so it can't be updated independently; `ultra` arrives only when

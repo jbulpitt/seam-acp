@@ -228,10 +228,11 @@ Because of this:
 - The `CLAUDE_MODELS` picker in `.env` contains only **empirically verified**
   entries (each one checked against JSONL ground truth, not the model's
   self-report). Don't add a model without verifying it.
-- A small local patch — `scripts/patch-claude-agent-acp.mjs`, run via
-  `npm run patch-acp` — makes full `claude-*` IDs bypass the broken resolver so
-  they resolve to exactly themselves (and unlocks e.g. Opus 4.6 @ 1M). It is
-  **wiped by any global `npm` update of the package and must be re-applied**.
+- As of `claude-agent-acp` 0.54.1 (ACP SDK 1.1.0) no local patch is needed:
+  model selection goes through `setSessionConfigOption`, which exact-matches full
+  canonical `claude-*` IDs against the advertised list before the fuzzy resolver.
+  Native context windows are declared in `src/agents/profiles/claude.ts`
+  (`CLAUDE_CONTEXT_WINDOWS`) — no `[1m]` suffix.
 - The status card shows the **resolved** API model id and the current reasoning
   effort on every turn, so a wrong-model regression is visible immediately.
 

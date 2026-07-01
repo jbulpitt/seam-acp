@@ -25,8 +25,7 @@
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "patch-acp": "node scripts/patch-claude-agent-acp.mjs"
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.1.0",

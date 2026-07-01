@@ -53,8 +53,8 @@ routes `spawn`/sessions over the bus when remote.
 
 **Dev loop.** `npm run build` (tsc) · `npm test` (vitest — ~4 *known* pre-existing
 failures in `thread-rename`, ignore them) · `npm run redeploy` (build + restart
-sentinel) · `npm run patch-acp` (re-apply the claude-agent-acp model-resolver patch
-after any update to that package). `.env` is gitignored (config + secrets live there).
+sentinel). `.env` is gitignored (config + secrets live there). (The old
+`npm run patch-acp` step was retired at claude-agent-acp 0.54.1.)
 
 **Companion specs:** [display-naming-plan.md](./display-naming-plan.md) (emoji/short-name
 standard, consumed by D10) · [integrations-research.md](./integrations-research.md)

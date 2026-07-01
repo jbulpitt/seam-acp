@@ -945,6 +945,20 @@ export class Orchestrator {
         }
       }
 
+      // Drain the session-update queue so every update received before the
+      // prompt response is processed into the chat pipeline BEFORE we flush and
+      // finalize. Without this, updates still backlogged in the SerialQueue post
+      // and refresh the status card AFTER it already shows "Done" — the display
+      // trails the (already-finished) turn. Skip on timeout (the agent may be
+      // hung and idle() could then block), and race a short guard so a stuck
+      // update handler can't lock the turn open.
+      if (result !== "timeout") {
+        await Promise.race([
+          activeRuntime.idle(),
+          new Promise<void>((r) => setTimeout(r, 5_000)),
+        ]);
+      }
+
       cancelFlushTimer();
       // Drain the fence extractor: any final segments enter the chat
       // pipeline; an unclosed fence is emitted with a notice rather

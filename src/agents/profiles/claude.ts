@@ -822,12 +822,15 @@ export function getClaudeContextWindow(modelId?: string): number {
 /** Stamp each picker entry with its canonical contextLimit so the orchestrator's
  *  `staticModels[].contextLimit → modelContextFloor` path (shared with every
  *  other agent) also works for Claude, seeding the display window on turn 1. */
-function withClaudeContextLimits<T extends { modelId: string; name: string }>(
+function withClaudeContextLimits<T extends { modelId: string; name: string; contextLimit?: number }>(
   models: ReadonlyArray<T>
 ): Array<T & { contextLimit: number }> {
   return models.map((m) => ({
     ...m,
-    contextLimit: getClaudeContextWindow(m.modelId),
+    // Preserve explicit contextLimit (e.g. from OLLAMA_CLOUD_STATIC_MODELS or
+    // ZAI_STATIC_MODELS) — only fall back to the Claude lookup for models that
+    // don't already declare one.
+    contextLimit: m.contextLimit ?? getClaudeContextWindow(m.modelId),
   }));
 }
 

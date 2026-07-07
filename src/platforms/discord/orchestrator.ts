@@ -350,8 +350,15 @@ export class Orchestrator {
     // agents report a generic default (~200K) in usage_update regardless of the
     // real window; use this as a FLOOR so the panel shows the true size.
     const turnProfile = this.router.getProfile(record.agentId);
+    // Look up the authoritative context window from static models.  When
+    // claude-agent-acp is pointed at a non-Anthropic backend (Ollama Cloud,
+    // Z.ai) it reports its *internal* Claude model name, not the real model.
+    // Fallback: if the activeModel doesn't match any static entry, try the
+    // profile's defaultModel — that's what the backend is actually running.
     const modelContextFloor =
-      turnProfile?.staticModels?.find((m) => m.modelId === activeModel)?.contextLimit ?? 0;
+      turnProfile?.staticModels?.find((m) => m.modelId === activeModel)?.contextLimit
+        ?? turnProfile?.staticModels?.find((m) => m.modelId === turnProfile.defaultModel)?.contextLimit
+        ?? 0;
     if (
       cachedUsage &&
       cachedUsage.model === activeModel &&
@@ -1138,6 +1145,8 @@ export class Orchestrator {
             const selectedModel = cfg.model ?? profile?.defaultModel;
             const modelEntry = profile?.staticModels?.find(
               (m) => m.modelId === selectedModel
+            ) ?? profile?.staticModels?.find(
+              (m) => m.modelId === profile.defaultModel
             );
             const computedSize = modelEntry?.contextLimit ?? usage?.contextLimit ?? 0;
             // `used` may legitimately drop (post-compaction), so we bypass its
@@ -1396,6 +1405,12 @@ export class Orchestrator {
     }
     if (agentId === "grok" || agentId.startsWith("grok-")) {
       return this.config.GROK_COMPACTION_MODEL;
+    }
+    if (agentId === "zai" || agentId.startsWith("zai-")) {
+      return this.config.ZAI_COMPACTION_MODEL;
+    }
+    if (agentId === "ollama-cloud" || agentId.startsWith("ollama-cloud-")) {
+      return this.config.OLLAMA_CLOUD_COMPACTION_MODEL;
     }
     return "";
   }
@@ -6158,6 +6173,9 @@ const COMPACTION_MODEL_WINDOWS: Record<string, number> = {
   "gpt-5.5": 400_000,
   "Gemini 3.1 Pro (High)": 1_000_000,
   "Claude Opus 4.6 (Thinking)": 250_000,
+  "glm-5.2": 1_000_000,
+  "qwen3-coder:480b-cloud": 256_000,
+  "glm-5.2:cloud": 976_000,
 };
 
 function compactionWindowFor(modelId: string): number {

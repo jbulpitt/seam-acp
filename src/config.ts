@@ -296,6 +296,41 @@ const Schema = z.object({
   GROK_API_KEY: z.string().optional(),
 
   /**
+   * Register the Z.ai (Zhipu) agent — Claude Code (claude-agent-acp) pointed
+   * at Z.ai's Anthropic-compatible endpoint (api.z.ai/api/anthropic).
+   * Uses GLM models (glm-5.2, glm-4.7, etc.).  false → not registered.
+   */
+  ZAI_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  /** Z.ai API key (from the Z.ai developer console). */
+  ZAI_API_KEY: z.string().optional(),
+  /** Default model id for the Z.ai profile (e.g. "glm-5.2"). */
+  ZAI_DEFAULT_MODEL: z.string().default("glm-5.2"),
+  ZAI_MODELS: ModelsListSchema,
+  /** Model used for /compact on Z.ai sessions. */
+  ZAI_COMPACTION_MODEL: z.string().default("glm-5.2"),
+
+  /**
+   * Register the Ollama Cloud agent — Claude Code (claude-agent-acp) pointed
+   * at Ollama's Anthropic-compatible endpoint (https://ollama.com).
+   * Uses open-weight models hosted on Ollama's cloud infrastructure.
+   * Only registered when OLLAMA_CLOUD_ENABLED and OLLAMA_CLOUD_API_KEY are set.
+   */
+  OLLAMA_CLOUD_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  /** Ollama Cloud API key (from ollama.com account settings). */
+  OLLAMA_CLOUD_API_KEY: z.string().optional(),
+  /** Default model id for Ollama Cloud sessions. */
+  OLLAMA_CLOUD_DEFAULT_MODEL: z.string().default("glm-5.2:cloud"),
+  OLLAMA_CLOUD_MODELS: ModelsListSchema,
+  /** Model used for /compact on Ollama Cloud sessions. */
+  OLLAMA_CLOUD_COMPACTION_MODEL: z.string().default("glm-5.2:cloud"),
+
+  /**
    * Register the "LM Studio 🦙" agent: opencode (sst/opencode, `opencode acp`) —
    * a provider-agnostic ACP agent pointed at a local/remote LM Studio via
    * opencode's own config (~/.config/opencode/opencode.json: an
@@ -591,6 +626,32 @@ export const GROK_STATIC_MODELS = [
   { modelId: "grok-4.20-0309-reasoning",       name: "Grok 4.20 Reasoning",        contextLimit: 1_000_000 },
   { modelId: "grok-4.20-0309-non-reasoning",   name: "Grok 4.20 Non-Reasoning",    contextLimit: 1_000_000 },
   { modelId: "grok-4.20-multi-agent-0309",     name: "Grok 4.20 Multi-Agent",      contextLimit: 1_000_000 },
+];
+
+/** Models for Z.ai (Zhipu).  ZAI_MODELS env var overrides this list when set. */
+export const ZAI_STATIC_MODELS = [
+  { modelId: "glm-5.2",           name: "GLM 5.2",             contextLimit: 1_000_000 },
+  { modelId: "glm-5",             name: "GLM 5",               contextLimit: 1_000_000 },
+  { modelId: "glm-5v-turbo",      name: "GLM 5V Turbo",        contextLimit: 1_000_000 },
+  { modelId: "glm-4.7",           name: "GLM 4.7",             contextLimit: 200_000 },
+  { modelId: "glm-4.5-air",       name: "GLM 4.5 Air",         contextLimit: 128_000 },
+];
+
+/** Models for Ollama Cloud.  OLLAMA_CLOUD_MODELS env var overrides this list when set.
+ *  These are the primary cloud-hosted open-weight models available on ollama.com. */
+export const OLLAMA_CLOUD_STATIC_MODELS = [
+  { modelId: "glm-5.2:cloud",               name: "GLM 5.2",              contextLimit: 976_000 },
+  { modelId: "glm-5.1:cloud",               name: "GLM 5.1",              contextLimit: 976_000 },
+  { modelId: "qwen3-coder:cloud",           name: "Qwen3 Coder",          contextLimit: 256_000 },
+  { modelId: "qwen3.6:cloud",               name: "Qwen3.6",              contextLimit: 256_000 },
+  { modelId: "deepseek-v4-pro:cloud",       name: "DeepSeek V4 Pro",      contextLimit: 1_000_000 },
+  { modelId: "deepseek-v4-flash:cloud",     name: "DeepSeek V4 Flash",    contextLimit: 512_000 },
+  { modelId: "deepseek-v3.2:cloud",         name: "DeepSeek V3.2",        contextLimit: 128_000 },
+  { modelId: "kimi-k2.7-code:cloud",        name: "Kimi K2.7 Code",       contextLimit: 256_000 },
+  { modelId: "kimi-k2.6:cloud",             name: "Kimi K2.6",            contextLimit: 256_000 },
+  { modelId: "minimax-m3:cloud",            name: "MiniMax M3",           contextLimit: 512_000 },
+  { modelId: "llama4:scout-cloud",          name: "Llama 4 Scout",        contextLimit: 512_000 },
+  { modelId: "gemma4:cloud",                name: "Gemma 4",              contextLimit: 128_000 },
 ];
 
 export const REMOTE_MAC_MODELS = [

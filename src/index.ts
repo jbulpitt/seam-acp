@@ -1,5 +1,5 @@
 import path from "node:path";
-import { loadConfig, REMOTE_MAC_MODELS, CODEX_STATIC_MODELS, GROK_STATIC_MODELS } from "./config.js";
+import { loadConfig, REMOTE_MAC_MODELS, CODEX_STATIC_MODELS, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
 import { SessionStore } from "./core/session-store.js";
@@ -152,6 +152,54 @@ async function main(): Promise<void> {
       })
     : undefined;
 
+  // Optional Z.ai (Zhipu) agent: Claude Code (claude-agent-acp) pointed at Z.ai's
+  // Anthropic-compatible endpoint.  Uses GLM models (glm-5.2 flagship, 1M context).
+  // Only registered when ZAI_ENABLED and ZAI_API_KEY are set.
+  const zai = config.ZAI_ENABLED && config.ZAI_API_KEY
+    ? makeClaudeProfile({
+        id: "zai",
+        displayName: "Z.ai (Zhipu GLM)",
+        defaultModel: config.ZAI_DEFAULT_MODEL,
+        staticModels: config.ZAI_MODELS ?? ZAI_STATIC_MODELS,
+        threadAbbr: "🀄",
+        // GLM models don't support Anthropic's effort mechanism.
+        effort: { mechanism: "none" as const, levels: [] },
+        extraEnv: {
+          ANTHROPIC_BASE_URL: "https://api.z.ai/api/anthropic",
+          ANTHROPIC_API_KEY: config.ZAI_API_KEY,
+        },
+      })
+    : undefined;
+
+  // Optional Ollama Cloud agent: Claude Code (claude-agent-acp) pointed at
+  // Ollama's Anthropic-compatible endpoint.  Runs open-weight models
+  // (qwen3-coder 480B, deepseek-v3.1 671B, etc.) on Ollama's cloud GPUs.
+  // Only registered when OLLAMA_CLOUD_ENABLED and OLLAMA_CLOUD_API_KEY are set.
+  const ollamaCloud = config.OLLAMA_CLOUD_ENABLED && config.OLLAMA_CLOUD_API_KEY
+    ? makeClaudeProfile({
+        id: "ollama-cloud",
+        displayName: "Ollama Cloud",
+        defaultModel: config.OLLAMA_CLOUD_DEFAULT_MODEL,
+        staticModels: config.OLLAMA_CLOUD_MODELS ?? OLLAMA_CLOUD_STATIC_MODELS,
+        threadAbbr: "🦙☁️",
+        // Open-weight models don't support Anthropic's effort mechanism.
+        effort: { mechanism: "none" as const, levels: [] },
+        extraEnv: {
+          ANTHROPIC_BASE_URL: "https://ollama.com",
+          // Ollama Cloud expects Authorization: Bearer — ANTHROPIC_AUTH_TOKEN
+          // sends the key as a Bearer token; ANTHROPIC_API_KEY would send it
+          // via x-api-key which Ollama rejects (401).
+          ANTHROPIC_AUTH_TOKEN: config.OLLAMA_CLOUD_API_KEY,
+          // Remap claude-agent-acp's internal model aliases so it doesn't try
+          // to resolve "claude-sonnet-5" etc. against Ollama's endpoint.
+          ANTHROPIC_DEFAULT_SONNET_MODEL: config.OLLAMA_CLOUD_DEFAULT_MODEL,
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: config.OLLAMA_CLOUD_DEFAULT_MODEL,
+          ANTHROPIC_DEFAULT_OPUS_MODEL: config.OLLAMA_CLOUD_DEFAULT_MODEL,
+          ANTHROPIC_MODEL: config.OLLAMA_CLOUD_DEFAULT_MODEL,
+        },
+      })
+    : undefined;
+
   // Optional "LM Studio 🦙" agent: opencode (sst/opencode) over ACP, pointed at a
   // local/remote LM Studio via opencode's own config. Provider-agnostic, so it
   // drives local models natively — no Anthropic proxy. The model list is
@@ -262,7 +310,7 @@ async function main(): Promise<void> {
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(ollama ? [ollama] : []), ...remoteCopilots],
+    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : []), ...(ollama ? [ollama] : []), ...remoteCopilots],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".

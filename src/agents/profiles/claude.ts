@@ -124,7 +124,7 @@ export function makeClaudeProfile(opts: {
     // Effort is applied via `_meta.claudeCode.options.effort` in newSessionMeta.
     // Overridable for non-Anthropic backends (e.g. Ollama → mechanism "none").
     effort: opts.effort ?? { mechanism: "meta", levels: ["low", "medium", "high", "xhigh", "max"] },
-    spawn() {
+    spawn(modelOverride?: string) {
       const env: NodeJS.ProcessEnv = { ...process.env };
       if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
       if (maxThinkingTokens && maxThinkingTokens > 0) {
@@ -139,6 +139,16 @@ export function makeClaudeProfile(opts: {
         if (opts.extraEnv.CLAUDE_CODE_USE_VERTEX === "1") {
           delete env.ANTHROPIC_API_KEY;
         }
+      }
+      // For non-Anthropic backends (Ollama Cloud, Z.ai, etc.): override the
+      // model env vars so the adapter sends the right model to the backend.
+      // setModel() (ACP config option) is rejected by claude-agent-acp for
+      // non-Claude model IDs, so this is the only way to switch models.
+      if (modelOverride && opts.extraEnv?.ANTHROPIC_BASE_URL) {
+        env.ANTHROPIC_MODEL = modelOverride;
+        env.ANTHROPIC_DEFAULT_SONNET_MODEL = modelOverride;
+        env.ANTHROPIC_DEFAULT_HAIKU_MODEL = modelOverride;
+        env.ANTHROPIC_DEFAULT_OPUS_MODEL = modelOverride;
       }
       return spawn(cli, [], {
         stdio: ["pipe", "pipe", "pipe"],

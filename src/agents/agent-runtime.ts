@@ -164,6 +164,10 @@ export class AgentRuntime {
   private rejectInFlightPrompt?: (err: Error) => void;
   private promptCapabilities?: PromptCapabilities;
   private sessionCwd?: string;
+  /** Model override applied at spawn time for non-Anthropic backends where
+   *  `setModel()` (ACP config option) is rejected by the adapter. Set by the
+   *  session-router before calling `start()`. */
+  modelOverride?: string;
 
   private eventHandler?: AgentEventHandler;
 
@@ -214,7 +218,7 @@ export class AgentRuntime {
   /** Start the agent process and complete ACP `initialize`. */
   async start(): Promise<void> {
     if (this.connection) return;
-    const child = this.profile.spawn();
+    const child = this.profile.spawn(this.modelOverride);
     this.child = child;
 
     // Capture spawn errors (ENOENT, EACCES, etc.) so they surface as a

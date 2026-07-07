@@ -50,8 +50,11 @@ export interface AgentProfile {
    */
   readonly configDir?: string;
 
-  /** Spawn the agent as an ACP server over stdio. */
-  spawn(): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
+  /** Spawn the agent as an ACP server over stdio.
+   *  @param modelOverride — when set, the spawned process should use this model
+   *  instead of the profile default. Used for non-Anthropic backends where
+   *  `setModel()` (ACP config option) is rejected by the adapter. */
+  spawn(modelOverride?: string): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
 
   /**
    * How this agent exposes reasoning effort, if at all. Drives both the

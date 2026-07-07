@@ -181,6 +181,7 @@ async function main(): Promise<void> {
         displayName: "Ollama Cloud",
         defaultModel: config.OLLAMA_CLOUD_DEFAULT_MODEL,
         staticModels: config.OLLAMA_CLOUD_MODELS ?? OLLAMA_CLOUD_STATIC_MODELS,
+        configDir: path.join(process.env.HOME ?? "", ".claude-ollama-cloud"),
         threadAbbr: "🦙☁️",
         // Open-weight models don't support Anthropic's effort mechanism.
         effort: { mechanism: "none" as const, levels: [] },

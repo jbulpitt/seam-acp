@@ -2890,8 +2890,12 @@ export class Orchestrator {
         await rt.setModel(id);
         message = `🧠 Model set to \`${id}\` (live).`;
       } catch (err) {
-        this.logger.warn({ err }, "live model set failed; will apply next turn");
-        message = `🧠 Model will be \`${id}\` on the next turn.`;
+        this.logger.warn({ err }, "live model set failed; invalidating runtime for respawn");
+        // Kill the runtime so next turn spawns with the correct model in env
+        // vars (ANTHROPIC_MODEL). Without this, non-Anthropic backends (Ollama
+        // Cloud, Z.ai) keep running the old model since setModel() is rejected.
+        await this.router.invalidate(record.id);
+        message = `🧠 Model will be \`${id}\` on the next turn (session respawn).`;
       }
     } else {
       message = `🧠 Model will be \`${id}\` on the next turn.`;

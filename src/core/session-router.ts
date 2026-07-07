@@ -290,6 +290,9 @@ export class SessionRouter {
       },
     });
 
+    // For non-Anthropic backends (Ollama Cloud, Z.ai), setModel() is rejected
+    // by claude-agent-acp. Pass the model at spawn time via env vars instead.
+    runtime.modelOverride = cfg.model ?? this.defaultModel;
     await runtime.start();
 
     const cwd = record.repoPath ?? process.cwd();

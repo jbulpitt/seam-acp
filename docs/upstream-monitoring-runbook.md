@@ -4,7 +4,7 @@
 >
 > **Cadence**: Weekly sweep (recommended: Monday), with ad-hoc checks when a major release is announced.
 >
-> **Last updated**: 2026-07-01 (Tuesday sweep)
+> **Last updated**: 2026-07-07 (Monday sweep)
 >
 > **⚠️ AGENT CONSTRAINT — READ-ONLY / REPORTING MODE**: Agents executing this runbook must **never** modify seam-acp source files, run `npm run redeploy`, apply patches, or make any code changes during a monitoring sweep. All code work is tracked via GitHub issues and implemented in **separate, explicitly tasked sessions**. Your job during a sweep is to **find, classify, and file or update GitHub issues** — not to implement fixes.
 
@@ -101,7 +101,7 @@ before running any procedure in this runbook:
 - Transcripts in `~/.gemini/antigravity-cli/brain/<cascadeId>/.system_generated/logs/transcript.jsonl`
 - Effort is baked into model choice (no separate knob) — picker suppressed
 - Profile source: [`agy.ts`](../src/agents/profiles/agy.ts) (1699 lines — largest profile)
-- Latest agy as of 2026-06-30 sweep: **1.0.14** (Go binary; conversation format is now `.db` SQLite as of agy 1.0.4 — `agy.ts` handles both `.db`/`.pb`)
+- Latest agy as of 2026-07-03 sweep: **1.0.16** (Go binary; conversation format is now `.db` SQLite as of agy 1.0.4 — `agy.ts` handles both `.db`/`.pb`)
 
 ### 1.2 Anthropic — Claude Code
 
@@ -434,12 +434,12 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 - [ ] Check [GitHub Community Announcements](https://github.com/orgs/community/discussions/categories/announcements) for billing/policy updates
 
 #### Opencode / LM Studio
-- [ ] Check [opencode releases](https://github.com/anomalyco/opencode/releases) and npm [`opencode-ai`](https://registry.npmjs.org/opencode-ai/latest) — last checked version: ___
+- [ ] Check [opencode releases](https://github.com/anomalyco/opencode/releases) and npm [`opencode-ai`](https://registry.npmjs.org/opencode-ai/latest) — last checked version: 1.17.13 (latest 1.17.14 — see #12)
 - [ ] Check [opencode config schema](https://opencode.ai/config.json) for shape changes (esp. per-model `modalities`/capability fields)
 - [ ] Check for `opencode acp` subcommand changes or custom-provider auto-discovery
 
 #### ACP Protocol
-- [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^1.1.0` (upgraded 2026-07-01), latest: **1.1.0** (v1.0.0 GA; changelog now in the [typescript-sdk repo](https://github.com/agentclientprotocol/typescript-sdk/releases), split out 2026-06-16)
+- [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^1.1.0`, latest: **1.2.0** (schema v1.19.0; changelog in [typescript-sdk repo](https://github.com/agentclientprotocol/typescript-sdk/releases) — upgrade tracked in #28)
 - [ ] Check [ACP monorepo releases](https://github.com/agentclientprotocol/agent-client-protocol/releases) for spec/schema changes (`schema-v*` tags; no longer carries npm SDK versions)
 - [ ] Check [ACP updates page](https://agentclientprotocol.com/updates)
 - [ ] Scan [ACP repo issues](https://github.com/agentclientprotocol/agent-client-protocol/issues) for breaking change discussions

@@ -168,6 +168,10 @@ export class AgentRuntime {
    *  `setModel()` (ACP config option) is rejected by the adapter. Set by the
    *  session-router before calling `start()`. */
   modelOverride?: string;
+  /** Effort override applied at spawn time for agents that accept reasoning
+   *  effort via CLI flags (e.g. Grok `--reasoning-effort`). Set by the
+   *  session-router before calling `start()`. */
+  effortOverride?: string;
 
   private eventHandler?: AgentEventHandler;
 
@@ -218,12 +222,17 @@ export class AgentRuntime {
   /** Start the agent process and complete ACP `initialize`. */
   async start(): Promise<void> {
     if (this.connection) return;
-    const child = this.profile.spawn(this.modelOverride);
+    const child = this.profile.spawn(this.modelOverride, this.effortOverride);
     this.child = child;
 
     // Capture spawn errors (ENOENT, EACCES, etc.) so they surface as a
     // rejected start() promise instead of letting the ACP handshake hang
     // indefinitely on a stdout that will never produce data.
+    // Ring buffer of the agent's recent stderr so an abnormal exit can report
+    // WHY it died (agent stderr is otherwise debug-only, dropped at info level).
+    // Bounded to the last ~100 lines.
+    const stderrRing: string[] = [];
+
     let spawnError: Error | undefined;
     const errorWaiter = new Promise<never>((_resolve, reject) => {
       child.once("error", (err: NodeJS.ErrnoException) => {
@@ -247,7 +256,14 @@ export class AgentRuntime {
     });
 
     child.on("exit", (code, signal) => {
-      this.logger.warn({ code, signal }, "agent process exited");
+      // 130 = SIGINT, 143 = SIGTERM, etc. Surface the agent's own stderr tail on
+      // any abnormal exit so we can tell a self-interrupt/timeout from a crash.
+      const abnormal = (code !== 0 && code !== null) || signal != null;
+      const stderrTail = stderrRing.slice(-40).join("\n").slice(-4000);
+      this.logger.warn(
+        { code, signal, ...(abnormal && stderrTail ? { stderrTail } : {}) },
+        abnormal ? "agent process exited abnormally" : "agent process exited"
+      );
       // Reject any in-flight prompt FIRST so a turn awaiting it unblocks
       // immediately. Without this, an abnormal child exit leaves the
       // orchestrator's `await prompt()` pending forever (the SDK doesn't
@@ -267,7 +283,11 @@ export class AgentRuntime {
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       const line = chunk.trimEnd();
-      if (line) this.logger.debug({ stderr: line }, "agent stderr");
+      if (line) {
+        this.logger.debug({ stderr: line }, "agent stderr");
+        stderrRing.push(line);
+        if (stderrRing.length > 100) stderrRing.splice(0, stderrRing.length - 100);
+      }
     });
 
     const writable = Writable.toWeb(

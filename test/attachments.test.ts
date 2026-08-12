@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   mapAttachmentsToBlocks,
+  isInlineableForAgent,
   MAX_ATTACHMENTS,
   MAX_BYTES_PER_ATTACHMENT,
   MAX_INLINE_TEXT_BYTES,
@@ -33,6 +34,33 @@ const a = (over: Partial<MessageAttachment> = {}): MessageAttachment => ({
   ...over,
 });
 
+describe("isInlineableForAgent", () => {
+  it("stages standard images for a no-vision agent (image:false)", () => {
+    // The bug: a JPEG to Grok (advertises image:false) was classed inlineable,
+    // so it was never staged — and mapAttachmentsToBlocks then degraded it to a
+    // bytes-less attachment:// link. It must be treated as non-inlineable so the
+    // caller stages it to a readable path instead.
+    expect(isInlineableForAgent("image/jpeg", "IMG_1181.jpg", false)).toBe(false);
+    expect(isInlineableForAgent("image/png", "shot.png", false)).toBe(false);
+  });
+
+  it("keeps images inline for a vision agent, or when capability is unknown", () => {
+    expect(isInlineableForAgent("image/jpeg", "IMG_1181.jpg", true)).toBe(true);
+    expect(isInlineableForAgent("image/jpeg", "IMG_1181.jpg", undefined)).toBe(true);
+  });
+
+  it("keeps text inlineable regardless of vision (delivered via embeddedContext)", () => {
+    expect(isInlineableForAgent("text/plain", "notes.txt", false)).toBe(true);
+    expect(isInlineableForAgent("application/json", "data.json", false)).toBe(true);
+  });
+
+  it("leaves non-inlineable binaries (PDF/HEIC) non-inlineable — always staged", () => {
+    expect(isInlineableForAgent("application/pdf", "doc.pdf", true)).toBe(false);
+    expect(isInlineableForAgent("image/heic", "page.heic", true)).toBe(false);
+    expect(isInlineableForAgent("image/heic", "page.heic", false)).toBe(false);
+  });
+});
+
 describe("mapAttachmentsToBlocks", () => {
   it("returns empty for empty input", async () => {
     const r = await mapAttachmentsToBlocks([], {});
@@ -63,6 +91,15 @@ describe("mapAttachmentsToBlocks", () => {
       { capabilities: {} }
     );
     expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: "attachment://cat.png", name: "cat.png" });
+    expect(r.rejected).toHaveLength(0);
+  });
+
+  it("falls back to resource_link for HEIC even when image capability present", async () => {
+    const r = await mapAttachmentsToBlocks(
+      [a({ filename: "photo.heic", contentType: "image/heic", size: 3 })],
+      { capabilities: { image: true } }
+    );
+    expect(r.blocks[0]).toMatchObject({ type: "resource_link", uri: "attachment://photo.heic", name: "photo.heic" });
     expect(r.rejected).toHaveLength(0);
   });
 

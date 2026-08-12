@@ -16,6 +16,7 @@ import {
 } from "../../core/image-gen.js";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
+import { resolveChannelPreset, isChannelLocked } from "../../config.js";
 import type { Renderer } from "../renderer.js";
 import { serializePanelText } from "../renderer.js";
 import type {
@@ -72,7 +73,7 @@ import { SessionRouter } from "../../core/session-router.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { ATTACH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
-import { isModelInlineableAttachment } from "../../agents/attachments.js";
+import { isInlineableForAgent } from "../../agents/attachments.js";
 import { stageAttachment, sweepStagedAttachments } from "../../agents/attachment-staging.js";
 import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
@@ -912,8 +913,15 @@ export class Orchestrator {
       // model gets a local path in the prompt; attachments are stripped.
       // Prepend the standing agent conventions (attach-fence, table rendering)
       // as a provenance-tagged preamble so every backend knows the operating
-      // rules without depending on a per-backend system-prompt path.
-      let promptText = withHarnessPreamble(msg.text);
+      // rules without depending on a per-backend system-prompt path. Channel
+      // and thread riders from CHANNEL_PRESETS_FILE stack on top (additive,
+      // never replacing the base conventions above).
+      const { riders } = resolveChannelPreset(
+        this.config,
+        record.parentRef ?? undefined,
+        record.channelRef
+      );
+      let promptText = withHarnessPreamble(msg.text, riders);
       let promptAttachments = msg.attachments;
       const activeProfile = this.router.getProfile(record.agentId);
       if (
@@ -958,8 +966,15 @@ export class Orchestrator {
       ) {
         // Local agent: text + standard images go inline; everything else
         // (PDF/Office/HEIC/binary) is staged to a temp path the agent opens with
-        // its file tools. Shared with the scheduled fire runner.
-        const { inline, hint } = await this.partitionAndStageAttachments(msg.attachments);
+        // its file tools. Shared with the scheduled fire runner. Images are only
+        // inlineable when the agent advertises image prompt capability — for a
+        // no-vision ACP bridge (e.g. Grok) they're staged to disk instead so its
+        // own tools can read them, rather than becoming a bytes-less link.
+        const agentHasVision = activeRuntime.getPromptCapabilities()?.image;
+        const { inline, hint } = await this.partitionAndStageAttachments(
+          msg.attachments,
+          agentHasVision
+        );
         if (hint) promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
         promptAttachments = inline.length > 0 ? inline : undefined;
       }
@@ -1282,13 +1297,36 @@ export class Orchestrator {
 
   // --- slash commands ---
 
+  /** Subcommands still allowed in a locked channel/thread — narrow enough
+   *  that a kid can unstick a hung turn without being able to touch config. */
+  private static readonly LOCK_EXEMPT_SUBCOMMANDS = new Set(["abort", "cancel"]);
+
   async handleSlashInteraction(
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
+    const sub = interaction.options.getSubcommand(true);
+    // Resolve the *locked-channel* scope id. Only a real thread's parentId
+    // points at the channel we key presets on — a plain (non-thread)
+    // channel's `parentId` is its Discord *category*, which is never in
+    // channelPresets, so that must NOT be used as a fallback here (that
+    // previously let /seam new bypass the lock when the channel sat inside
+    // a category). For a command run directly in a channel (e.g. /seam
+    // new), the scope is the channel itself.
+    const ic = interaction.channel;
+    const scopeChannelId = ic?.isThread() ? (ic.parentId ?? undefined) : interaction.channelId ?? undefined;
+    if (
+      isChannelLocked(this.config, scopeChannelId) &&
+      !Orchestrator.LOCK_EXEMPT_SUBCOMMANDS.has(sub)
+    ) {
+      await interaction.reply({
+        content: "🔒 This channel is locked — its configuration can't be changed.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     if (interaction.options.getSubcommandGroup(false) === "schedule") {
       return this.cmdSchedule(interaction);
     }
-    const sub = interaction.options.getSubcommand(true);
     switch (sub) {
       case "new":
         return this.cmdNew(interaction);
@@ -2134,16 +2172,27 @@ export class Orchestrator {
    *  images → `inline`) and the rest (PDF/Office/HEIC/binary), which are staged
    *  to a temp path the agent opens with its file tools and described in `hint`.
    *  Shared by the live-turn path and the scheduled fire runner so both handle
-   *  non-inlineable files identically. Works for https CDN and data: URLs. */
+   *  non-inlineable files identically. Works for https CDN and data: URLs.
+   *
+   *  `agentHasVision` is the agent's ACP-advertised `promptCapabilities.image`.
+   *  When it's explicitly `false` (e.g. the Grok CLI's `agent stdio` bridge,
+   *  which reports image:false even though grok-4.5 has vision), standard images
+   *  can't be sent as prompt image blocks — mapAttachmentsToBlocks would degrade
+   *  them to a useless `attachment://<name>` resource link with no bytes. So we
+   *  stage them like other binaries instead, giving the agent a real file path
+   *  its own tools can open. When vision is present (`true`) or unknown
+   *  (`undefined`, e.g. the scheduled path with no live runtime), images stay
+   *  inline as before. */
   private async partitionAndStageAttachments(
-    attachments: ReadonlyArray<MessageAttachment>
+    attachments: ReadonlyArray<MessageAttachment>,
+    agentHasVision?: boolean
   ): Promise<{ inline: MessageAttachment[]; hint: string | null }> {
     const STAGE_MAX = 100 * 1024 * 1024; // don't fill /tmp with huge files
     const inline: MessageAttachment[] = [];
     const stagedLines: string[] = [];
     const batchId = randomUUID().slice(0, 8);
     for (const a of attachments) {
-      if (isModelInlineableAttachment(a.contentType ?? "", a.filename)) {
+      if (isInlineableForAgent(a.contentType ?? "", a.filename, agentHasVision)) {
         inline.push(a);
         continue;
       }

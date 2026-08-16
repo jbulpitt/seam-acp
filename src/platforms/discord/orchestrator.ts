@@ -68,7 +68,14 @@ const SCHEDULE_PRESETS: Array<{ label: string; value: string }> = [
   { label: "Custom cron…", value: "__custom__" },
 ];
 import type { SessionStore } from "../../core/session-store.js";
+import { makeSessionId } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
+import {
+  isSessionRecord,
+  type InjectTarget,
+  type InjectTurnOptions,
+  type InjectTurnResult,
+} from "../../core/inject-turn.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { ATTACH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
@@ -1521,6 +1528,186 @@ export class Orchestrator {
     } catch { /* best-effort */ }
   }
 
+  /**
+   * Run one agent turn **programmatically** — no Discord user message behind
+   * it. The single primitive every non-user-initiated turn goes through.
+   *
+   * `target` is the thread or session the turn belongs to. It may be `null`
+   * for profile-driven isolated runs that have no thread at all (the
+   * compaction fan-out), in which case `opts.profile` is required.
+   *
+   * Never throws for turn-level failures: start/session/prompt errors come
+   * back as `{ error, cause }` with whatever text was captured before the
+   * failure. Callers that need the *original* error (compaction stages do)
+   * rethrow `result.cause`.
+   *
+   * ⚠️ `session: "live"` reuses the target's persistent runtime and calls
+   * `runtime.onEvent()`, which **replaces** the single handler an in-flight
+   * live turn installed. It is safe only when no user turn is running on that
+   * thread. Nothing calls it yet; report-back correlation (#20) is what will,
+   * and multiplexing the handler is that issue's problem to solve.
+   */
+  async injectTurn(
+    target: InjectTarget | null,
+    prompt: string,
+    opts: InjectTurnOptions
+  ): Promise<InjectTurnResult> {
+    const correlation = opts.correlationId
+      ? { correlationId: opts.correlationId }
+      : {};
+    const logger = this.logger.child({ ...(opts.logContext ?? {}), ...correlation });
+
+    // Agent-emitted files go to the explicit route, else to the target when
+    // it's a chat thread. No route ⇒ files are dropped.
+    const outputTo: ChannelRef | undefined =
+      opts.outputTo ?? (target && !isSessionRecord(target) ? target : undefined);
+
+    let text = "";
+    const handler: AgentEventHandler = async (event) => {
+      if (event.kind === "agent-text") {
+        text += event.text;
+      } else if (event.kind === "agent-file") {
+        try {
+          if (outputTo && this.adapter.sendFile) {
+            const data = event.base64
+              ? Buffer.from(event.data, "base64")
+              : Buffer.from(event.data, "utf8");
+            await this.adapter.sendFile(outputTo, {
+              data,
+              filename: event.filename,
+              mimeType: event.mimeType,
+            });
+          }
+        } catch (err) {
+          logger.warn({ err }, "injectTurn: forward agent file failed");
+        }
+      }
+      await opts.onEvent?.(event);
+    };
+
+    const attachments =
+      opts.attachments && opts.attachments.length > 0 ? opts.attachments : undefined;
+    const runPrompt = async (rt: AgentRuntime): Promise<PromptOutcome | "timeout"> =>
+      opts.timeoutMs === undefined
+        ? await rt.prompt(prompt, attachments)
+        : await raceWithTimeout(rt.prompt(prompt, attachments), opts.timeoutMs);
+
+    if (opts.session === "isolated") {
+      const profile = opts.profile ?? this.profileForTarget(target);
+      if (!profile) {
+        return { text, error: "injectTurn: no agent profile for target", ...correlation };
+      }
+      const cwd =
+        opts.cwd ??
+        (target && isSessionRecord(target) ? target.repoPath : undefined) ??
+        this.config.REPOS_ROOT;
+      const manager = opts.sessionManager ?? profile.sessionManager;
+      let rt: AgentRuntime | undefined;
+      let sessionId: string | undefined;
+      try {
+        rt = new AgentRuntime({ profile, logger, mcpServers: [] });
+        await rt.start();
+        const info = await rt.newSession({
+          cwd,
+          ...(opts.model ? { model: opts.model } : {}),
+          ...(opts.effort ? { effort: opts.effort } : {}),
+        });
+        sessionId = info.sessionId;
+        // Registered after newSession: the session-creation handshake emits no
+        // events we want, and this matches the order the callers used.
+        rt.onEvent(handler);
+        const outcome = await runPrompt(rt);
+        if (outcome === "timeout") {
+          return {
+            text,
+            timedOut: true,
+            error: `timed out after ${opts.timeoutMs! / 1000}s`,
+            ...(sessionId ? { sessionId } : {}),
+            ...correlation,
+          };
+        }
+        if (opts.awaitIdle) await rt.idle();
+        return {
+          text,
+          stopReason: outcome.stopReason,
+          cancelled: outcome.cancelled,
+          ...(sessionId ? { sessionId } : {}),
+          ...correlation,
+        };
+      } catch (err) {
+        return {
+          text,
+          error: (err as Error).message,
+          cause: err,
+          ...(sessionId ? { sessionId } : {}),
+          ...correlation,
+        };
+      } finally {
+        // Isolated runs guarantee teardown: kill the child, then drop the
+        // throwaway session so it never clutters `/seam sessions`.
+        if (rt) {
+          const sid = rt.getSessionInfo()?.sessionId;
+          await rt.dispose().catch(() => {});
+          if (sid && manager?.deleteSession) {
+            await manager.deleteSession(cwd, sid).catch(() => {});
+          }
+        }
+      }
+    }
+
+    // --- live: reuse the thread's persistent session; no teardown. ---
+    if (!target) {
+      return { text, error: "injectTurn: live mode requires a target", ...correlation };
+    }
+    const record = isSessionRecord(target)
+      ? target
+      : this.router.ensureSessionRecord({
+          platform: target.platform,
+          channelRef: target.id,
+          ...(target.parentId ? { parentRef: target.parentId } : {}),
+          cwd: opts.cwd ?? this.config.REPOS_ROOT,
+        });
+    try {
+      const rt = await this.router.getOrStartRuntime(record);
+      rt.onEvent(handler);
+      const outcome = await runPrompt(rt);
+      if (outcome === "timeout") {
+        return {
+          text,
+          timedOut: true,
+          error: `timed out after ${opts.timeoutMs! / 1000}s`,
+          sessionId: record.acpSessionId,
+          ...correlation,
+        };
+      }
+      if (opts.awaitIdle) await rt.idle();
+      return {
+        text,
+        stopReason: outcome.stopReason,
+        cancelled: outcome.cancelled,
+        sessionId: record.acpSessionId,
+        ...correlation,
+      };
+    } catch (err) {
+      return {
+        text,
+        error: (err as Error).message,
+        cause: err,
+        sessionId: record.acpSessionId,
+        ...correlation,
+      };
+    }
+  }
+
+  /** Resolve the agent profile bound to an inject target, if any. */
+  private profileForTarget(target: InjectTarget | null): AgentProfile | undefined {
+    if (!target) return undefined;
+    const record = isSessionRecord(target)
+      ? target
+      : this.store.get(makeSessionId(target.platform, target.id));
+    return record ? this.router.getProfile(record.agentId) : undefined;
+  }
+
   /** Build a premium-compaction `runAgent`: each call spawns a FRESH throwaway
    *  AgentRuntime (model "default" → real Opus @ 1M; the "opus[1m]" alias
    *  mis-resolves) in cwd /tmp so the analysis sessions never pollute the real
@@ -1545,21 +1732,8 @@ export class Orchestrator {
     // For large prompts, write the content to a temp file and reference it.
     const LARGE_PROMPT_THRESHOLD = 100 * 1024; // 100 KB
     return async (prompt: string, label: string): Promise<string> => {
-      let rt: AgentRuntime | undefined;
       let tempFile: string | undefined;
       try {
-        rt = new AgentRuntime({
-          profile,
-          logger: this.logger.child({ compaction: label }),
-          mcpServers: [],
-        });
-        await rt.start();
-        await rt.newSession({ cwd, model, effort });
-        let text = "";
-        rt.onEvent((event) => {
-          if (event.kind === "agent-text") text += event.text;
-        });
-
         let actualPrompt = prompt;
         if (prompt.length > LARGE_PROMPT_THRESHOLD) {
           tempFile = path.join(os.tmpdir(), `compaction-prompt-${label}-${Date.now()}.txt`);
@@ -1571,19 +1745,27 @@ export class Orchestrator {
             `You MUST read the ENTIRE file before producing your response.`;
         }
 
-        await rt.prompt(actualPrompt);
-        await rt.idle();
-        return text;
+        // No target: these analysis runs belong to no thread, so agent files
+        // are dropped and only the text is collected. No timeout — a fan-out
+        // stage runs as long as it needs. `awaitIdle` drains trailing chunks
+        // before the text is handed to the pipeline.
+        const result = await this.injectTurn(null, actualPrompt, {
+          session: "isolated",
+          profile,
+          sessionManager: manager,
+          cwd,
+          model,
+          ...(effort ? { effort } : {}),
+          awaitIdle: true,
+          logContext: { compaction: label },
+        });
+        // The pipeline treats a rejected stage as a recoverable per-chunk
+        // failure, so propagate the ORIGINAL error, not a re-wrapped one.
+        if (result.error) throw result.cause ?? new Error(result.error);
+        return result.text;
       } finally {
         if (tempFile) {
           await fsp.unlink(tempFile).catch(() => {});
-        }
-        if (rt) {
-          const tempSessionId = rt.getSessionInfo()?.sessionId;
-          await rt.dispose().catch(() => {});
-          if (tempSessionId) {
-            await manager.deleteSession(cwd, tempSessionId).catch(() => {});
-          }
         }
       }
     };
@@ -2010,6 +2192,7 @@ export class Orchestrator {
       : await this.partitionAndStageAttachments(loaded);
     const result = await this.runIsolatedScheduledJob({
       profile,
+      record,
       cwd,
       ...(model ? { model } : {}),
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
@@ -2033,6 +2216,7 @@ export class Orchestrator {
    *  and delete the temp session (so it doesn't clutter `/seam sessions`). */
   private async runIsolatedScheduledJob(args: {
     profile: AgentProfile;
+    record: SessionRecord;
     cwd: string;
     model?: string;
     effort?: string;
@@ -2040,49 +2224,22 @@ export class Orchestrator {
     promptText: string;
     attachments: MessageAttachment[];
   }): Promise<{ text: string; error?: string }> {
-    const { profile, cwd, model, effort, channel, promptText, attachments } = args;
-    const manager = profile.sessionManager;
-    let rt: AgentRuntime | undefined;
-    let text = "";
-    try {
-      rt = new AgentRuntime({ profile, logger: this.logger.child({ scheduled: "run" }), mcpServers: [] });
-      await rt.start();
-      await rt.newSession({ cwd, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
-      rt.onEvent(async (event) => {
-        if (event.kind === "agent-text") {
-          text += event.text;
-        } else if (event.kind === "agent-file") {
-          try {
-            if (this.adapter.sendFile) {
-              const data = event.base64
-                ? Buffer.from(event.data, "base64")
-                : Buffer.from(event.data, "utf8");
-              await this.adapter.sendFile(channel, { data, filename: event.filename, mimeType: event.mimeType });
-            }
-          } catch (err) {
-            this.logger.warn({ err }, "scheduled: forward agent file failed");
-          }
-        }
-      });
-      const outcome = await raceWithTimeout(
-        rt.prompt(promptText, attachments.length ? attachments : undefined),
-        this.config.TURN_TIMEOUT_SECONDS * 1000
-      );
-      if (outcome === "timeout") {
-        return { text, error: `timed out after ${this.config.TURN_TIMEOUT_SECONDS}s` };
-      }
-      return { text };
-    } catch (err) {
-      return { text, error: (err as Error).message };
-    } finally {
-      if (rt) {
-        const sid = rt.getSessionInfo()?.sessionId;
-        await rt.dispose().catch(() => {});
-        if (sid && manager?.deleteSession) {
-          await manager.deleteSession(cwd, sid).catch(() => {});
-        }
-      }
-    }
+    const { profile, record, cwd, model, effort, channel, promptText, attachments } = args;
+    // Target = the binding thread's session (what the job belongs to);
+    // outputTo = where the run reports, which may be a different channel when
+    // the schedule sets an explicit target.
+    const result = await this.injectTurn(record, promptText, {
+      session: "isolated",
+      profile,
+      cwd,
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+      outputTo: channel,
+      attachments,
+      timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
+      logContext: { scheduled: "run" },
+    });
+    return { text: result.text, ...(result.error ? { error: result.error } : {}) };
   }
 
   /** Post captured output as fresh message(s) — blue cards or plain chunked

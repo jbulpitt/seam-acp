@@ -83,7 +83,7 @@ import {
   type InjectTurnOptions,
   type InjectTurnResult,
 } from "../../core/inject-turn.js";
-import type { DispatchSpec } from "../../core/dispatch/types.js";
+import { dispatchDirs, type DispatchSpec } from "../../core/dispatch/types.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { ATTACH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
@@ -2204,7 +2204,7 @@ export class Orchestrator {
     try {
       this.store.recordDelegation({
         id: spec.id,
-        kind: "handoff",
+        kind: spec.kind ?? "handoff",
         sourceRef: null,
         targetRef: spec.target,
         promptPreview: spec.prompt,
@@ -2244,6 +2244,14 @@ export class Orchestrator {
       await this.postDispatchOutput(target, spec, result.text, result.error);
       const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
       try { this.store.updateDelegationStatus(spec.id, ledgerStatus); } catch { /* best-effort */ }
+      // Report-back: if the caller set returnTo, deliver the result back by
+      // enqueuing a fresh dispatch into that thread (correlation-linked). The
+      // runtime owns this — the worker never had to "remember" to report.
+      if (spec.returnTo) {
+        await this.enqueueReportBack(spec, result.text, result.error).catch((err) =>
+          this.logger.warn({ err, dispatch: spec.id }, "dispatch: report-back enqueue failed")
+        );
+      }
       if (result.error) throw new Error(result.error);
       return { output: result.text, stopReason: result.stopReason ?? "" };
     };
@@ -2260,6 +2268,47 @@ export class Orchestrator {
     } finally {
       this.activeTurns--;
     }
+  }
+
+  /** Report-back: enqueue a fresh dispatch that delivers a completed handoff's
+   *  output into its `returnTo` thread, wrapped so the receiving agent knows it
+   *  is a report-back and from where. Correlation-linked; kind = report_back.
+   *  Written atomically (tmp + rename) so the watcher never reads a half-file. */
+  private async enqueueReportBack(
+    spec: DispatchSpec,
+    output: string,
+    error?: string
+  ): Promise<void> {
+    const returnTo = spec.returnTo;
+    if (!returnTo) return;
+    const correlation = spec.correlationId ?? spec.id;
+    const body = error
+      ? `The worker did not complete cleanly: ${error}\n\n--- partial output ---\n${output}`
+      : output;
+    const wrapped = [
+      `<seam-report-back correlation="${correlation}" from-thread="${spec.target}">`,
+      body,
+      `</seam-report-back>`,
+      ``,
+      `The worker you handed off to (thread ${spec.target}) has finished — its output is above. Continue based on it.`,
+    ].join("\n");
+    const id = randomUUID();
+    const reportSpec: DispatchSpec = {
+      id,
+      target: returnTo,
+      prompt: wrapped,
+      session: "live",
+      correlationId: correlation,
+      kind: "report_back",
+      createdUtc: new Date().toISOString(),
+    };
+    const dirs = dispatchDirs(this.config.DATA_DIR);
+    await fsp.mkdir(dirs.pending, { recursive: true });
+    const tmp = path.join(dirs.pending, `.${id}.json.tmp`);
+    const final = path.join(dirs.pending, `${id}.json`);
+    await fsp.writeFile(tmp, JSON.stringify(reportSpec, null, 2), "utf8");
+    await fsp.rename(tmp, final);
+    this.logger.info({ reportBack: id, returnTo, correlation }, "dispatch: report-back enqueued");
   }
 
   /** Post a dispatch's captured output to the target thread — cards, or a file

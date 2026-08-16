@@ -11,6 +11,7 @@
  */
 import { z } from "zod";
 import * as path from "node:path";
+import type { DelegationKind } from "../types.js";
 
 /** How the dispatched turn acquires its ACP session — see `InjectTurnOptions`. */
 export type DispatchSessionMode = "live" | "isolated";
@@ -28,6 +29,12 @@ export interface DispatchSpec {
   effort?: string;
   cwd?: string;
   correlationId?: string;
+  /** When set, after this turn completes the runtime auto-dispatches the
+   *  captured output back into this thread (report-back). */
+  returnTo?: string;
+  /** Ledger classification; defaults to "handoff". The report-back
+   *  re-injection sets "report_back". */
+  kind?: DelegationKind;
   createdUtc: string;
 }
 
@@ -61,6 +68,8 @@ export const DispatchSpecSchema = z.object({
   effort: z.string().min(1).optional(),
   cwd: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
+  returnTo: z.string().min(1).optional(),
+  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "peek"]).optional(),
   createdUtc: z.string().optional(),
 });
 
@@ -91,6 +100,8 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.effort ? { effort: d.effort } : {}),
     ...(d.cwd ? { cwd: d.cwd } : {}),
     ...(d.correlationId ? { correlationId: d.correlationId } : {}),
+    ...(d.returnTo ? { returnTo: d.returnTo } : {}),
+    ...(d.kind ? { kind: d.kind } : {}),
     createdUtc: d.createdUtc ?? new Date().toISOString(),
   };
 }

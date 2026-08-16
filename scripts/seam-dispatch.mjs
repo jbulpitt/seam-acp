@@ -23,6 +23,7 @@
  *   --effort <level>        Isolated runs only
  *   --cwd <path>            Working directory for the turn
  *   --correlation <id>      Opaque id echoed into the result file
+ *   --return-to <id>        On completion, auto-dispatch the captured output back into this thread
  *   --wait                  Poll for the result and print it
  *   --timeout <secs>        With --wait; default 900
  *   --output-only           With --wait; print just the agent's text
@@ -42,6 +43,7 @@ const FLAGS_WITH_VALUES = new Set([
   "effort",
   "cwd",
   "correlation",
+  "return-to",
   "timeout",
   "data-dir",
 ]);
@@ -121,6 +123,7 @@ async function main() {
     ...(args.effort ? { effort: args.effort } : {}),
     ...(args.cwd ? { cwd: path.resolve(args.cwd) } : {}),
     ...(args.correlation ? { correlationId: args.correlation } : {}),
+    ...(args["return-to"] ? { returnTo: args["return-to"] } : {}),
     createdUtc: new Date().toISOString(),
   };
 

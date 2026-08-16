@@ -316,6 +316,31 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
+  // Projects: DB-backed channel activation (#22). Activating a channel makes it
+  // respond at runtime — additive to the static env allowlist, no redeploy.
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("project")
+      .setDescription("Activate this channel for the bot (DB-backed, no redeploy)")
+      .addSubcommand((sub) =>
+        sub
+          .setName("new")
+          .setDescription("Activate the current channel")
+          .addStringOption((o) =>
+            o
+              .setName("description")
+              .setDescription("Optional note about this project")
+              .setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub.setName("list").setDescription("List active channels")
+      )
+      .addSubcommand((sub) =>
+        sub.setName("remove").setDescription("Deactivate the current channel")
+      )
+  );
+
   return cmd;
 }
 

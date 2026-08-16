@@ -5,6 +5,13 @@ import {
   defaultSessionConfig,
   type PermissionPolicyMode,
   type Preset,
+  DELEGATION_ACTIVE_STATUSES,
+  PROMPT_PREVIEW_MAX,
+  type DelegationKind,
+  type DelegationStatus,
+  type LedgerEntry,
+  type LedgerEntryInput,
+  type LedgerPatch,
   type SessionConfigState,
   type SessionRecord,
 } from "./types.js";
@@ -217,6 +224,7 @@ export class SessionStore {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
+    this.db.exec(DELEGATION_SCHEMA);
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -471,4 +479,181 @@ export class SessionStore {
   ): SessionConfigState {
     return defaultSessionConfig(defaultModel, defaultPolicy);
   }
+
+  // --- delegation ledger ----------------------------------------------------
+
+  /**
+   * Insert one ledger row. `status` defaults to "dispatched" and the
+   * timestamps to now. `promptPreview` is truncated to `PROMPT_PREVIEW_MAX`
+   * so the column can never grow into a full prompt copy. Returns the row as
+   * persisted, so the caller sees the stamped defaults.
+   */
+  recordDelegation(entry: LedgerEntryInput): LedgerEntry {
+    const now = new Date().toISOString();
+    const createdUtc = entry.createdUtc ?? now;
+    const row: LedgerEntry = {
+      id: entry.id,
+      sourceRef: entry.sourceRef ?? null,
+      targetRef: entry.targetRef ?? null,
+      worker: entry.worker ?? null,
+      kind: entry.kind,
+      promptPreview: truncatePreview(entry.promptPreview ?? null),
+      correlationId: entry.correlationId ?? null,
+      status: entry.status ?? "dispatched",
+      createdUtc,
+      updatedUtc: entry.updatedUtc ?? createdUtc,
+    };
+    this.db
+      .prepare(
+        `INSERT INTO delegation_log
+           (id, source_ref, target_ref, worker, kind, prompt_preview,
+            correlation_id, status, created_utc, updated_utc)
+         VALUES
+           (@id, @sourceRef, @targetRef, @worker, @kind, @promptPreview,
+            @correlationId, @status, @createdUtc, @updatedUtc)`
+      )
+      .run(row);
+    return row;
+  }
+
+  /**
+   * Move a row to a new status, re-stamping `updated_utc`. `patch` may amend
+   * the mutable fields in the same write — e.g. attaching the resolved
+   * `targetRef` when a dispatched handoff starts running. Unknown ids are a
+   * silent no-op (the ledger is observability, never a control path).
+   */
+  updateDelegationStatus(
+    id: string,
+    status: DelegationStatus,
+    patch?: LedgerPatch
+  ): void {
+    const sets = ["status = @status", "updated_utc = @updatedUtc"];
+    const params: Record<string, string | null> = {
+      id,
+      status,
+      updatedUtc: new Date().toISOString(),
+    };
+    for (const [key, column] of Object.entries(LEDGER_PATCH_COLUMNS) as Array<
+      [keyof LedgerPatch, string]
+    >) {
+      if (!patch || !(key in patch)) continue;
+      const value = patch[key] ?? null;
+      sets.push(`${column} = @${key}`);
+      params[key] = key === "promptPreview" ? truncatePreview(value) : value;
+    }
+    this.db
+      .prepare(`UPDATE delegation_log SET ${sets.join(", ")} WHERE id = @id`)
+      .run(params);
+  }
+
+  /**
+   * The originating row for a correlation id. A correlation identifies one
+   * logical delegation whose single row is mutated through its lifecycle; if
+   * rows ever share one, the earliest-created wins so the answer is stable.
+   */
+  getDelegationByCorrelation(correlationId: string): LedgerEntry | null {
+    const row = this.db
+      .prepare<[string], LedgerRow>(
+        `SELECT * FROM delegation_log WHERE correlation_id = ?
+         ORDER BY created_utc ASC, rowid ASC LIMIT 1`
+      )
+      .get(correlationId);
+    return row ? mapLedger(row) : null;
+  }
+
+  /** Rows still in flight, oldest first — the order a watchdog wants. */
+  listActiveDelegations(): LedgerEntry[] {
+    const placeholders = DELEGATION_ACTIVE_STATUSES.map(() => "?").join(", ");
+    return this.db
+      .prepare<string[], LedgerRow>(
+        `SELECT * FROM delegation_log WHERE status IN (${placeholders})
+         ORDER BY created_utc ASC, rowid ASC`
+      )
+      .all(...DELEGATION_ACTIVE_STATUSES)
+      .map(mapLedger);
+  }
+
+  listRecentDelegations(limit = 50): LedgerEntry[] {
+    return this.db
+      .prepare<[number], LedgerRow>(
+        `SELECT * FROM delegation_log
+         ORDER BY created_utc DESC, rowid DESC LIMIT ?`
+      )
+      .all(limit)
+      .map(mapLedger);
+  }
+
+  listDelegationsBySource(sourceRef: string): LedgerEntry[] {
+    return this.db
+      .prepare<[string], LedgerRow>(
+        `SELECT * FROM delegation_log WHERE source_ref = ?
+         ORDER BY created_utc DESC, rowid DESC`
+      )
+      .all(sourceRef)
+      .map(mapLedger);
+  }
+}
+
+// --- delegation ledger schema + row mapping ---------------------------------
+
+const DELEGATION_SCHEMA = `
+CREATE TABLE IF NOT EXISTS delegation_log (
+  id              TEXT PRIMARY KEY,
+  source_ref      TEXT,
+  target_ref      TEXT,
+  worker          TEXT,
+  kind            TEXT NOT NULL,
+  prompt_preview  TEXT,
+  correlation_id  TEXT,
+  status          TEXT NOT NULL,
+  created_utc     TEXT NOT NULL,
+  updated_utc     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_delegation_correlation
+  ON delegation_log(correlation_id);
+CREATE INDEX IF NOT EXISTS idx_delegation_source
+  ON delegation_log(source_ref);
+`;
+
+interface LedgerRow {
+  id: string;
+  source_ref: string | null;
+  target_ref: string | null;
+  worker: string | null;
+  kind: string;
+  prompt_preview: string | null;
+  correlation_id: string | null;
+  status: string;
+  created_utc: string;
+  updated_utc: string;
+}
+
+const mapLedger = (r: LedgerRow): LedgerEntry => ({
+  id: r.id,
+  sourceRef: r.source_ref,
+  targetRef: r.target_ref,
+  worker: r.worker,
+  kind: r.kind as DelegationKind,
+  promptPreview: r.prompt_preview,
+  correlationId: r.correlation_id,
+  status: r.status as DelegationStatus,
+  createdUtc: r.created_utc,
+  updatedUtc: r.updated_utc,
+});
+
+/** Column whitelist for `updateDelegationStatus` — keeps the dynamic SET
+ *  clause free of caller-supplied identifiers. */
+const LEDGER_PATCH_COLUMNS: Record<keyof LedgerPatch, string> = {
+  sourceRef: "source_ref",
+  targetRef: "target_ref",
+  worker: "worker",
+  promptPreview: "prompt_preview",
+  correlationId: "correlation_id",
+};
+
+function truncatePreview(text: string | null): string | null {
+  if (text === null) return null;
+  return text.length <= PROMPT_PREVIEW_MAX
+    ? text
+    : text.slice(0, PROMPT_PREVIEW_MAX);
 }

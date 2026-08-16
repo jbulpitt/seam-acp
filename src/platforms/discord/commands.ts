@@ -232,20 +232,24 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
-  cmd.addSubcommand((sub) =>
-    sub.setName("whoami").setDescription("Show which account this thread's agent is signed in as")
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub.setName("usage").setDescription("Show usage / credits for this thread's agent (agy only)")
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub.setName("avatar").setDescription("Push the bot avatar and banner to Discord (force re-upload)")
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub.setName("help").setDescription("Show help")
+  // Grouped under `/seam info` to stay within Discord's 25-option-per-command
+  // cap (these are low-frequency meta commands). Routed via getSubcommandGroup.
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("info")
+      .setDescription("Bot & account info")
+      .addSubcommand((sub) =>
+        sub.setName("whoami").setDescription("Show which account this thread's agent is signed in as")
+      )
+      .addSubcommand((sub) =>
+        sub.setName("usage").setDescription("Show usage / credits for this thread's agent (agy only)")
+      )
+      .addSubcommand((sub) =>
+        sub.setName("avatar").setDescription("Push the bot avatar and banner to Discord (force re-upload)")
+      )
+      .addSubcommand((sub) =>
+        sub.setName("help").setDescription("Show help")
+      )
   );
 
   cmd.addSubcommandGroup((g) =>

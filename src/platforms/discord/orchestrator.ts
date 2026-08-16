@@ -1406,6 +1406,18 @@ export class Orchestrator {
     if (interaction.options.getSubcommandGroup(false) === "project") {
       return this.cmdProject(interaction);
     }
+    if (interaction.options.getSubcommandGroup(false) === "info") {
+      switch (interaction.options.getSubcommand(true)) {
+        case "whoami":
+          return this.cmdWhoami(interaction);
+        case "usage":
+          return this.cmdUsage(interaction);
+        case "avatar":
+          return this.cmdAvatar(interaction);
+        case "help":
+          return this.cmdHelp(interaction);
+      }
+    }
     switch (sub) {
       case "new":
         return this.cmdNew(interaction);

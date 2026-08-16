@@ -63,6 +63,8 @@ export class DiscordAdapter implements ChatAdapter {
 
   private messageHandler?: (msg: IncomingMessage) => void | Promise<void>;
   private threadDeleteHandler?: (channelRef: string) => void | Promise<void>;
+  /** DB-backed channel activation (#22): additive to the env allowlist. */
+  private activeChannelCheck?: (channelRef: string) => boolean;
   private botUserId?: string;
 
   constructor(opts: {
@@ -89,6 +91,10 @@ export class DiscordAdapter implements ChatAdapter {
 
   onThreadDelete(handler: (channelRef: string) => void | Promise<void>): void {
     this.threadDeleteHandler = handler;
+  }
+
+  setActiveChannelCheck(check: (channelRef: string) => boolean): void {
+    this.activeChannelCheck = check;
   }
 
   async start(): Promise<void> {
@@ -546,8 +552,13 @@ export class DiscordAdapter implements ChatAdapter {
     // If parent isn't accessible / not text, ignore.
     const parentId = thread.parentId ?? undefined;
 
+    // Channel gate: the static env allowlist OR a DB-backed activation row (#22).
+    // The env path is unchanged; an enabled active_projects row (keyed on the
+    // parent channel) makes a channel respond at runtime without a redeploy.
     const allowedChannels = this.config.DISCORD_ALLOWED_CHANNEL_IDS;
-    if (allowedChannels && (!parentId || !allowedChannels.has(parentId))) return;
+    const envAllows = !allowedChannels || (!!parentId && allowedChannels.has(parentId));
+    const dbAllows = !!parentId && (this.activeChannelCheck?.(parentId) ?? false);
+    if (!envAllows && !dbAllows) return;
 
     const text = (msg.content ?? "").trim();
     const attachments: MessageAttachment[] = msg.attachments.map((a) => ({

@@ -93,6 +93,10 @@ export interface ChatAdapter {
    *  the thread id). Used by scheduled prompts for instant cleanup. */
   onThreadDelete?(handler: (channelRef: string) => void | Promise<void>): void;
 
+  /** Optional: install a predicate the message gate consults to allow a channel
+   *  at runtime, additive to the static env allowlist (DB-backed activation, #22). */
+  setActiveChannelCheck?(check: (channelRef: string) => boolean): void;
+
   /** Optional: live state of a thread. Returns `undefined` only when the thread
    *  is *confirmed gone* (e.g. Discord "Unknown Channel"); throws on transient
    *  errors so callers don't mistake a blip for a deletion. Used by scheduled

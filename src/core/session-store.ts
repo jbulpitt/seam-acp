@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   defaultSessionConfig,
+  type ActiveProject,
   type PermissionPolicyMode,
   type Preset,
   DELEGATION_ACTIVE_STATUSES,
@@ -225,6 +226,7 @@ export class SessionStore {
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
     this.db.exec(DELEGATION_SCHEMA);
+    this.db.exec(ACTIVE_PROJECTS_SCHEMA);
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -473,6 +475,70 @@ export class SessionStore {
     this.db.prepare("DELETE FROM presets WHERE id = ?").run(id);
   }
 
+  // --- active projects (DB-backed channel activation, #22) ------------------
+
+  upsertActiveProject(p: ActiveProject): void {
+    this.db
+      .prepare(
+        `INSERT INTO active_projects
+           (channel_ref, enabled, config_json, created_utc, updated_utc)
+         VALUES
+           (@channelRef, @enabled, @configJson, @createdUtc, @updatedUtc)
+         ON CONFLICT(channel_ref) DO UPDATE SET
+           enabled     = excluded.enabled,
+           config_json = excluded.config_json,
+           updated_utc = excluded.updated_utc`
+      )
+      .run({
+        channelRef: p.channelRef,
+        enabled: p.enabled ? 1 : 0,
+        configJson: p.configJson,
+        createdUtc: p.createdUtc,
+        updatedUtc: p.updatedUtc,
+      });
+  }
+
+  getActiveProject(channelRef: string): ActiveProject | null {
+    const row = this.db
+      .prepare<[string], ActiveProjectRow>(
+        "SELECT * FROM active_projects WHERE channel_ref = ?"
+      )
+      .get(channelRef);
+    return row ? mapActiveProject(row) : null;
+  }
+
+  listActiveProjects(): ActiveProject[] {
+    return this.db
+      .prepare<[], ActiveProjectRow>(
+        "SELECT * FROM active_projects ORDER BY created_utc ASC"
+      )
+      .all()
+      .map(mapActiveProject);
+  }
+
+  setProjectEnabled(channelRef: string, enabled: boolean): void {
+    this.db
+      .prepare(
+        "UPDATE active_projects SET enabled = ?, updated_utc = ? WHERE channel_ref = ?"
+      )
+      .run(enabled ? 1 : 0, new Date().toISOString(), channelRef);
+  }
+
+  removeActiveProject(channelRef: string): void {
+    this.db.prepare("DELETE FROM active_projects WHERE channel_ref = ?").run(channelRef);
+  }
+
+  /** True when `ref` has an enabled activation row. The additive half of the
+   *  channel gate — OR'd with the env allowlist, never replacing it. */
+  isChannelActive(ref: string): boolean {
+    const row = this.db
+      .prepare<[string], { one: number }>(
+        "SELECT 1 AS one FROM active_projects WHERE channel_ref = ? AND enabled = 1"
+      )
+      .get(ref);
+    return row !== undefined;
+  }
+
   static defaultConfig(
     defaultModel: string,
     defaultPolicy?: import("./types.js").PermissionPolicyMode
@@ -593,6 +659,34 @@ export class SessionStore {
       .map(mapLedger);
   }
 }
+
+// --- active projects schema + row mapping (#22) -----------------------------
+
+const ACTIVE_PROJECTS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS active_projects (
+  channel_ref  TEXT PRIMARY KEY,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  config_json  TEXT,
+  created_utc  TEXT NOT NULL,
+  updated_utc  TEXT NOT NULL
+);
+`;
+
+interface ActiveProjectRow {
+  channel_ref: string;
+  enabled: number;
+  config_json: string | null;
+  created_utc: string;
+  updated_utc: string;
+}
+
+const mapActiveProject = (r: ActiveProjectRow): ActiveProject => ({
+  channelRef: r.channel_ref,
+  enabled: r.enabled !== 0,
+  configJson: r.config_json,
+  createdUtc: r.created_utc,
+  updatedUtc: r.updated_utc,
+});
 
 // --- delegation ledger schema + row mapping ---------------------------------
 

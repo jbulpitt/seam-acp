@@ -80,3 +80,61 @@ describe("SessionStore", () => {
     expect(JSON.parse(json)).toEqual({ model: "claude-haiku-4.5" });
   });
 });
+
+describe("SessionStore active_projects (#22)", () => {
+  const now = new Date().toISOString();
+
+  it("returns null / false for an unknown channel", () => {
+    expect(store.getActiveProject("nope")).toBeNull();
+    expect(store.isChannelActive("nope")).toBe(false);
+    expect(store.listActiveProjects()).toEqual([]);
+  });
+
+  it("upserts, reads back, and reports active", () => {
+    store.upsertActiveProject({
+      channelRef: "chan-1",
+      enabled: true,
+      configJson: JSON.stringify({ description: "docs channel" }),
+      createdUtc: now,
+      updatedUtc: now,
+    });
+    expect(store.getActiveProject("chan-1")).toEqual({
+      channelRef: "chan-1",
+      enabled: true,
+      configJson: JSON.stringify({ description: "docs channel" }),
+      createdUtc: now,
+      updatedUtc: now,
+    });
+    expect(store.isChannelActive("chan-1")).toBe(true);
+  });
+
+  it("upsert on the same channel_ref updates in place (PK conflict)", () => {
+    store.upsertActiveProject({ channelRef: "chan-1", enabled: true, configJson: null, createdUtc: now, updatedUtc: now });
+    const later = new Date(Date.now() + 1000).toISOString();
+    store.upsertActiveProject({ channelRef: "chan-1", enabled: true, configJson: JSON.stringify({ description: "x" }), createdUtc: now, updatedUtc: later });
+    expect(store.listActiveProjects()).toHaveLength(1);
+    expect(store.getActiveProject("chan-1")?.configJson).toBe(JSON.stringify({ description: "x" }));
+  });
+
+  it("setProjectEnabled(false) keeps the row but stops granting access", () => {
+    store.upsertActiveProject({ channelRef: "chan-1", enabled: true, configJson: null, createdUtc: now, updatedUtc: now });
+    store.setProjectEnabled("chan-1", false);
+    expect(store.getActiveProject("chan-1")?.enabled).toBe(false);
+    expect(store.isChannelActive("chan-1")).toBe(false);
+    store.setProjectEnabled("chan-1", true);
+    expect(store.isChannelActive("chan-1")).toBe(true);
+  });
+
+  it("removeActiveProject deletes the row", () => {
+    store.upsertActiveProject({ channelRef: "chan-1", enabled: true, configJson: null, createdUtc: now, updatedUtc: now });
+    store.removeActiveProject("chan-1");
+    expect(store.getActiveProject("chan-1")).toBeNull();
+    expect(store.isChannelActive("chan-1")).toBe(false);
+  });
+
+  it("listActiveProjects returns oldest-created first", () => {
+    store.upsertActiveProject({ channelRef: "chan-b", enabled: true, configJson: null, createdUtc: "2026-01-01T00:00:00Z", updatedUtc: now });
+    store.upsertActiveProject({ channelRef: "chan-a", enabled: false, configJson: null, createdUtc: "2025-01-01T00:00:00Z", updatedUtc: now });
+    expect(store.listActiveProjects().map((p) => p.channelRef)).toEqual(["chan-a", "chan-b"]);
+  });
+});

@@ -98,6 +98,7 @@ import { SerialQueue } from "../../core/serial-queue.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import {
   defaultSessionConfig,
+  type ActiveProject,
   type PermissionPolicyMode,
   type Preset,
   type SessionConfigState,
@@ -169,6 +170,9 @@ export class Orchestrator {
   install(): void {
     this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
     this.adapter.onThreadDelete?.((channelRef) => this.handleThreadDeleted(channelRef));
+    // DB-backed channel activation (#22): let the adapter's channel gate treat
+    // an enabled active_projects row as allowed, additive to the env allowlist.
+    this.adapter.setActiveChannelCheck?.((ref) => this.store.isChannelActive(ref));
     this.watchSentinel();
   }
 
@@ -1387,6 +1391,9 @@ export class Orchestrator {
     }
     if (interaction.options.getSubcommandGroup(false) === "preset") {
       return this.cmdPreset(interaction);
+    }
+    if (interaction.options.getSubcommandGroup(false) === "project") {
+      return this.cmdProject(interaction);
     }
     switch (sub) {
       case "new":
@@ -6557,6 +6564,122 @@ export class Orchestrator {
           flags: MessageFlags.Ephemeral,
         });
     }
+  }
+
+  // --- projects: DB-backed channel activation (#22) -------------------------
+
+  private async cmdProject(i: ChatInputCommandInteraction): Promise<void> {
+    const sub = i.options.getSubcommand(true);
+    switch (sub) {
+      case "new": return this.cmdProjectNew(i);
+      case "list": return this.cmdProjectList(i);
+      case "remove": return this.cmdProjectRemove(i);
+      default:
+        await i.reply({
+          content: `Unknown project subcommand: ${sub}`,
+          flags: MessageFlags.Ephemeral,
+        });
+    }
+  }
+
+  /**
+   * The channel id to activate/deactivate. This must match what the incoming-
+   * message gate checks — a thread's *parent* channel (`DISCORD_ALLOWED_CHANNEL_IDS`
+   * is keyed on parents). Run in a thread → the parent; run in a plain channel →
+   * the channel itself. Mirrors the scope resolution in handleSlashInteraction.
+   */
+  private projectScopeId(
+    i: ChatInputCommandInteraction
+  ): string | undefined {
+    const ch = i.channel;
+    return ch?.isThread() ? (ch.parentId ?? undefined) : i.channelId ?? undefined;
+  }
+
+  private projectDescription(p: ActiveProject): string | null {
+    if (!p.configJson) return null;
+    try {
+      const parsed = JSON.parse(p.configJson) as { description?: string };
+      return parsed.description ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async cmdProjectNew(i: ChatInputCommandInteraction): Promise<void> {
+    const channelRef = this.projectScopeId(i);
+    if (!channelRef) {
+      await i.reply({
+        content: "Use `/seam project new` inside a server channel or thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const description = i.options.getString("description") ?? null;
+    const existing = this.store.getActiveProject(channelRef);
+    const now = new Date().toISOString();
+    // Preserve an earlier description if none is supplied on re-activation.
+    const configJson = description
+      ? JSON.stringify({ description })
+      : existing?.configJson ?? null;
+    this.store.upsertActiveProject({
+      channelRef,
+      enabled: true,
+      configJson,
+      createdUtc: existing?.createdUtc ?? now,
+      updatedUtc: now,
+    });
+    const wasActive = existing?.enabled === true;
+    await i.reply({
+      content:
+        `${wasActive ? "🔁 Re-activated" : "✅ Activated"} <#${channelRef}> for seam-acp.` +
+        (description ? `\n📝 ${description}` : "") +
+        `\nThreads here now respond even without an env allowlist entry.`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  private async cmdProjectList(i: ChatInputCommandInteraction): Promise<void> {
+    const projects = this.store.listActiveProjects();
+    if (projects.length === 0) {
+      await i.reply({
+        content: "No active projects yet. Activate one with `/seam project new`.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const lines = projects.map((p) => {
+      const desc = this.projectDescription(p);
+      const state = p.enabled ? "🟢" : "⚪";
+      return `${state} <#${p.channelRef}>${desc ? ` — ${desc}` : ""}`;
+    });
+    await i.reply({
+      content: `**Active projects** (${projects.length})\n${lines.join("\n")}`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  private async cmdProjectRemove(i: ChatInputCommandInteraction): Promise<void> {
+    const channelRef = this.projectScopeId(i);
+    if (!channelRef) {
+      await i.reply({
+        content: "Use `/seam project remove` inside a server channel or thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const existing = this.store.getActiveProject(channelRef);
+    if (!existing) {
+      await i.reply({
+        content: `<#${channelRef}> is not an active project.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    this.store.removeActiveProject(channelRef);
+    await i.reply({
+      content: `🗑️ Deactivated <#${channelRef}>. It now relies on the env allowlist only.`,
+      flags: MessageFlags.Ephemeral,
+    });
   }
 
   private presetSummaryLine(p: Preset): string {

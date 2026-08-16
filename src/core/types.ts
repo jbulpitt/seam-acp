@@ -96,6 +96,26 @@ export function resolvePermissionMode(
 }
 
 /**
+ * A channel activated for the bot at runtime via the DB (issue #22).
+ *
+ * Additive to the static env allowlist (`DISCORD_ALLOWED_CHANNEL_IDS`): an
+ * enabled row makes a channel respond even when it is not in the env seed, and
+ * takes effect without a redeploy. The env path is never weakened — the DB is
+ * strictly additive truth. Keyed by `channelRef`, the same channel id the
+ * incoming-message gate checks (a thread's parent channel).
+ */
+export interface ActiveProject {
+  /** Channel id the message gate matches (a thread's parent channel). */
+  channelRef: string;
+  /** Disabled rows are retained but do not grant access. */
+  enabled: boolean;
+  /** Optional JSON blob for per-project metadata (e.g. `{ description }`). */
+  configJson: string | null;
+  createdUtc: string;
+  updatedUtc: string;
+}
+
+/**
  * Persisted record for one chat session (one Discord thread, one Slack thread, etc.).
  * Multi-platform / multi-agent ready: keyed by composite (`platform`, `channel_ref`).
  */

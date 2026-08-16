@@ -2370,34 +2370,6 @@ export class Orchestrator {
     await fsp.writeFile(tmp, JSON.stringify(reportSpec, null, 2), "utf8");
     await fsp.rename(tmp, final);
     this.logger.info({ reportBack: id, returnTo, correlation }, "dispatch: report-back enqueued");
-    await this.postArrivalCard(
-      returnTo,
-      `📨 Report-back · ${spec.kind ?? "handoff"} ${correlation.slice(0, 8)}`,
-      error ? `❌ ${error}\n${output}` : output
-    );
-  }
-
-  /** Post a compact card into the caller/origin thread announcing an inbound
-   *  report-back or chain result, so the human watching that thread actually
-   *  sees it arrive — the delivery itself is injected as that thread's next
-   *  turn, which is otherwise invisible. Best-effort; never blocks or fails the
-   *  underlying delivery. */
-  private async postArrivalCard(
-    returnTo: string,
-    title: string,
-    content: string
-  ): Promise<void> {
-    try {
-      const preview = content.trim().slice(0, 600);
-      await this.sendResultCard(
-        { platform: PLATFORM, id: returnTo },
-        title,
-        (preview || "(no output)") + (content.length > 600 ? " …" : ""),
-        DISPATCH_COLOR
-      );
-    } catch (err) {
-      this.logger.warn({ err, returnTo }, "arrival card post failed");
-    }
   }
 
   /**
@@ -2492,7 +2464,6 @@ export class Orchestrator {
     };
     await enqueueDispatchSpec(this.config.DATA_DIR, spec);
     this.logger.info({ chainId, originRef, delivery: id }, "chain: origin delivery enqueued");
-    await this.postArrivalCard(originRef, `📨 Chain result · ${chainId.slice(0, 8)}`, body);
   }
 
   /** Post a dispatch's captured output to the target thread — cards, or a file

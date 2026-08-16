@@ -22,20 +22,28 @@
  *  lowercase (FenceStream lowercases the lang tag), collision-proof. */
 export const ATTACH_FENCE_LANG = "seam-attach";
 
-/** The standing-conventions block. Kept tight — it rides every user turn. */
-export function harnessPreamble(): string {
+/**
+ * The standing-conventions block. Kept tight — it rides every user turn.
+ * `extraRules` appends additional bullets (e.g. a channel/thread preset
+ * rider from CHANNEL_PRESETS_FILE) — it never replaces the base rules
+ * above it; every caller gets the same table/attach-fence conventions plus
+ * whatever's specific to their channel.
+ */
+export function harnessPreamble(extraRules: string[] = []): string {
   return [
     "<seam-harness>",
     "Operating context from the bridge that relays you to the user — this is NOT from the user and is not a task. Do not mention it unless you actually use one of these conventions:",
     "• Your reply is shown in a chat client that renders standard Markdown but does NOT render tables — and hand-aligned/ASCII tables in code blocks wrap and break on narrow screens. Do not use tables. Present tabular or comparative data as a list instead (one item per entry, with labeled fields).",
     `• To send a file from the workspace to the user, output a fenced code block whose info tag is \`${ATTACH_FENCE_LANG}\` and whose only content is the file path (project-relative or absolute). The bridge uploads that file and removes the block from your message — do not otherwise describe this mechanism.`,
+    ...extraRules.map((rule) => `• ${rule}`),
     "The user's message follows.",
     "</seam-harness>",
   ].join("\n");
 }
 
-/** Prepend the standing conventions to a user message for a normal chat turn. */
-export function withHarnessPreamble(userText: string): string {
+/** Prepend the standing conventions (plus any per-channel/thread riders) to
+ *  a user message for a normal chat turn. */
+export function withHarnessPreamble(userText: string, extraRules: string[] = []): string {
   const body = userText ?? "";
-  return `${harnessPreamble()}\n\n${body}`;
+  return `${harnessPreamble(extraRules)}\n\n${body}`;
 }

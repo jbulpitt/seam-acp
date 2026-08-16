@@ -1,5 +1,10 @@
 import { spawn } from "node:child_process";
+import { createReadStream } from "node:fs";
+import { readdir, stat, readFile } from "node:fs/promises";
+import * as path from "node:path";
+import * as readline from "node:readline";
 import type { AgentProfile } from "../agent-profile.js";
+import type { ContextUsage, ISessionManager, SessionSummary } from "../session-manager.js";
 
 /**
  * Known context windows for xAI text models (from docs.x.ai/developers/models).
@@ -8,6 +13,7 @@ import type { AgentProfile } from "../agent-profile.js";
  */
 const KNOWN_CONTEXT_WINDOWS: Record<string, number> = {
   "grok-build-0.1":                     256_000,
+  "grok-4.5":                           500_000,
   "grok-4.3":                         1_000_000,
   "grok-4.20-0309-reasoning":         1_000_000,
   "grok-4.20-0309-non-reasoning":     1_000_000,
@@ -116,9 +122,10 @@ export async function fetchXaiModels(
  * exposed by `initialize` are `xai.api_key` (uses $XAI_API_KEY) and
  * `cached_token` (from `grok login`).
  *
- * Reasoning effort: the docs mention reasoning levels but no ACP config
- * option for effort has been confirmed yet.  We leave `effort` as "none"
- * by default; callers can override via opts.effort if xAI adds it.
+ * Reasoning effort: as of grok CLI 0.2.93+, the `grok agent` command
+ * supports `--reasoning-effort <low|medium|high>` (alias `--effort`).
+ * Grok 4.5 supports reasoning_effort via the API; the CLI flag maps to
+ * the same parameter.  We pass effort via CLI args at spawn time.
  */
 export function makeGrokProfile(opts: {
   /** Profile id. Defaults to "grok". */
@@ -145,23 +152,175 @@ export function makeGrokProfile(opts: {
     defaultModel: opts.defaultModel,
     staticModels: opts.staticModels,
     threadAbbr: opts.threadAbbr,
-    // No confirmed ACP reasoning-effort mechanism yet.
+    // Reasoning effort: grok CLI 0.2.93+ supports --reasoning-effort on
+    // `grok agent`.  Grok 4.5 supports low/medium/high; Grok 4.20 multi-agent
+    // also supports xhigh.  We pass effort via CLI flag at spawn time and
+    // expose it through the spawn-args effort mechanism.
     effort: opts.effort ?? {
       mechanism: "none",
-      levels: [],
+      levels: ["low", "medium", "high"],
     },
-    spawn() {
+    spawn(modelOverride?: string, effortOverride?: string) {
       const env: NodeJS.ProcessEnv = { ...process.env };
       if (opts.extraEnv) {
         for (const [k, v] of Object.entries(opts.extraEnv)) {
           if (v !== undefined) env[k] = v;
         }
       }
-      return spawn(cli, ["agent", "stdio"], {
+      // Build CLI args: `grok agent [--model X] [--reasoning-effort Y] stdio`
+      const args: string[] = ["agent"];
+      const model = modelOverride ?? opts.defaultModel;
+      if (model) args.push("--model", model);
+      if (effortOverride && effortOverride !== "default") {
+        args.push("--reasoning-effort", effortOverride);
+      }
+      args.push("stdio");
+      return spawn(cli, args, {
         stdio: ["pipe", "pipe", "pipe"],
         env,
         detached: true,
       });
     },
+    sessionManager: new GrokSessionManager(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Grok session manager — minimal implementation for context-window display.
+// Reads chat_history.jsonl from ~/.grok/sessions/<encodedCwd>/<sessionId>/
+// and estimates token usage by character count (~4 chars/token).
+// ---------------------------------------------------------------------------
+
+/** URL-encode a cwd path the same way grok does for its session directories. */
+function encodeCwd(cwd: string): string {
+  return encodeURIComponent(cwd).replace(/%2F/gi, "%2F");
+}
+
+class GrokSessionManager implements ISessionManager {
+  private grokHome(): string {
+    return process.env.GROK_HOME ?? path.join(process.env.HOME ?? "", ".grok");
+  }
+
+  private sessionsDir(cwd: string): string {
+    // Strip trailing slash — Grok encodes cwd without it.
+    const normalized = cwd.replace(/\/+$/, "");
+    return path.join(this.grokHome(), "sessions", encodeCwd(normalized));
+  }
+
+  async listSessions(cwd: string): Promise<SessionSummary[]> {
+    const dir = this.sessionsDir(cwd);
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      return [];
+    }
+    const summaries: SessionSummary[] = [];
+    for (const entry of entries) {
+      // Session dirs are UUIDs; skip non-dir entries like prompt_history.jsonl.
+      if (!entry.match(/^[0-9a-f]{8}-/)) continue;
+      const sessionDir = path.join(dir, entry);
+      try {
+        const summaryPath = path.join(sessionDir, "summary.json");
+        const raw = await readFile(summaryPath, "utf-8");
+        const data = JSON.parse(raw);
+        summaries.push({
+          sessionId: entry,
+          createdAt: data.created_at ? new Date(data.created_at).getTime() : undefined,
+          lastActivityAt: data.updated_at ? new Date(data.updated_at).getTime() : undefined,
+          previewLines: [{ sender: "agent", text: data.session_summary ?? "" }],
+        });
+      } catch {
+        // Damaged or incomplete session — skip.
+      }
+    }
+    return summaries.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
+  }
+
+  async cloneSession(_cwd: string, _oldId: string, _newId: string): Promise<void> {
+    // Not implemented for Grok.
+  }
+
+  async deleteSession(_cwd: string, _sessionId: string): Promise<void> {
+    // Not implemented for Grok.
+  }
+
+  async getTranscript(cwd: string, sessionId: string): Promise<string> {
+    const chatPath = path.join(this.sessionsDir(cwd), sessionId, "chat_history.jsonl");
+    const lines: string[] = [];
+    try {
+      const rl = readline.createInterface({ input: createReadStream(chatPath) });
+      for await (const line of rl) {
+        try {
+          const d = JSON.parse(line);
+          if (d.type === "user" || d.type === "assistant") {
+            const sender = d.type === "user" ? "Human" : "Assistant";
+            const text = typeof d.content === "string" ? d.content : "";
+            lines.push(`${sender}: ${text.slice(0, 500)}`);
+          }
+        } catch { /* skip bad lines */ }
+      }
+    } catch { /* file missing */ }
+    return lines.join("\n\n");
+  }
+
+  async getUsage(cwd: string, sessionId?: string): Promise<ContextUsage> {
+    const dir = this.sessionsDir(cwd);
+    let targetId = sessionId;
+
+    if (!targetId) {
+      // Find the most recently modified session.
+      try {
+        const entries = await readdir(dir);
+        let latest = { id: "", mtime: 0 };
+        for (const entry of entries) {
+          if (!entry.match(/^[0-9a-f]{8}-/)) continue;
+          const s = await stat(path.join(dir, entry)).catch(() => null);
+          if (s && s.mtimeMs > latest.mtime) {
+            latest = { id: entry, mtime: s.mtimeMs };
+          }
+        }
+        targetId = latest.id || undefined;
+      } catch {
+        return { model: null, totalUsed: 0, contextLimit: 0 };
+      }
+    }
+    if (!targetId) return { model: null, totalUsed: 0, contextLimit: 0 };
+
+    // Read summary.json for model.
+    let model: string | null = null;
+    try {
+      const raw = await readFile(path.join(dir, targetId, "summary.json"), "utf-8");
+      const data = JSON.parse(raw);
+      model = data.current_model_id ?? null;
+    } catch { /* ok */ }
+
+    // Estimate tokens from chat_history.jsonl character count.
+    const chatPath = path.join(dir, targetId, "chat_history.jsonl");
+    let totalChars = 0;
+    try {
+      const rl = readline.createInterface({ input: createReadStream(chatPath) });
+      for await (const line of rl) {
+        try {
+          const d = JSON.parse(line);
+          const content = d.content;
+          if (typeof content === "string") {
+            totalChars += content.length;
+          } else if (Array.isArray(content)) {
+            for (const block of content) {
+              if (block && typeof block === "object" && typeof block.text === "string") {
+                totalChars += block.text.length;
+              }
+            }
+          }
+        } catch { /* skip bad lines */ }
+      }
+    } catch { /* file missing */ }
+
+    // Rough estimate: ~4 chars per token.
+    const estimatedTokens = Math.round(totalChars / 4);
+    const contextLimit = model ? (KNOWN_CONTEXT_WINDOWS[model] ?? 256_000) : 256_000;
+
+    return { model, totalUsed: estimatedTokens, contextLimit };
+  }
 }

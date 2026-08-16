@@ -5,6 +5,8 @@ import type { SessionStore } from "./session-store.js";
 import type { SessionRecord, PermissionPolicyMode } from "./types.js";
 import { defaultSessionConfig, resolvePermissionMode } from "./types.js";
 import { makeSessionId } from "./session-store.js";
+import { resolveChannelPreset } from "../config.js";
+import type { ChannelPreset, ThreadPreset } from "../config.js";
 import type {
   McpServer,
   RequestPermissionRequest,
@@ -33,6 +35,8 @@ export class SessionRouter {
   private readonly defaultModel: string;
   private readonly defaultPermissionMode: PermissionPolicyMode;
   private readonly mcpServers: McpServer[];
+  private readonly channelPresets: Map<string, ChannelPreset>;
+  private readonly threadPresets: Map<string, ThreadPreset>;
   private askUser?: AskUserFn;
 
   private readonly runtimes = new Map<string, AgentRuntime>();
@@ -48,6 +52,8 @@ export class SessionRouter {
     defaultModel: string;
     defaultPermissionMode?: PermissionPolicyMode;
     mcpServers?: McpServer[];
+    channelPresets?: Map<string, ChannelPreset>;
+    threadPresets?: Map<string, ThreadPreset>;
   }) {
     this.logger = opts.logger.child({ comp: "session-router" });
     this.store = opts.store;
@@ -56,6 +62,8 @@ export class SessionRouter {
     this.defaultModel = opts.defaultModel;
     this.defaultPermissionMode = opts.defaultPermissionMode ?? "ask";
     this.mcpServers = opts.mcpServers ?? [];
+    this.channelPresets = opts.channelPresets ?? new Map();
+    this.threadPresets = opts.threadPresets ?? new Map();
   }
 
   /**
@@ -88,7 +96,23 @@ export class SessionRouter {
     const existing = this.store.get(id);
     if (existing) return existing;
 
-    const cfg = defaultSessionConfig(this.defaultModel, this.defaultPermissionMode);
+    // Stamp the channel/thread preset into the record at creation so the
+    // persisted agent/model/cwd match what will actually run. Without this the
+    // record gets the global defaults (e.g. copilot / DEFAULT_MODEL / REPOS_ROOT)
+    // while startRuntime silently overrides them from the locked preset — a
+    // split brain where the agent runs correctly but the record and status card
+    // (and every `getProfile(record.agentId)` capability/usage lookup) show the
+    // wrong agent. The runtime still re-resolves the preset each start, so the
+    // file remains the source of truth; this just keeps the record honest.
+    const preset = resolveChannelPreset(
+      { channelPresets: this.channelPresets, threadPresets: this.threadPresets },
+      opts.parentRef ?? undefined,
+      opts.channelRef
+    );
+    const cfg = defaultSessionConfig(
+      preset.model?.value ?? this.defaultModel,
+      this.defaultPermissionMode
+    );
     const now = new Date().toISOString();
     // We don't yet know the ACP session id — it will be filled in by the
     // first runtime start. Store an empty marker for now.
@@ -97,9 +121,9 @@ export class SessionRouter {
       platform: opts.platform,
       channelRef: opts.channelRef,
       parentRef: opts.parentRef ?? null,
-      agentId: this.defaultAgentId,
+      agentId: preset.agent?.value ?? this.defaultAgentId,
       acpSessionId: "",
-      repoPath: opts.cwd,
+      repoPath: preset.cwd?.value ?? opts.cwd,
       configJson: JSON.stringify(cfg),
       createdUtc: now,
       updatedUtc: now,
@@ -246,13 +270,38 @@ export class SessionRouter {
   }
 
   private async startRuntime(record: SessionRecord): Promise<AgentRuntime> {
-    const profile = this.profileById.get(record.agentId);
+    // Channel/thread presets are the source of truth for locked-down
+    // channels: re-resolved on every runtime start (not just session
+    // creation) so a stored record can never drift from the config file —
+    // whatever's in CHANNEL_PRESETS_FILE wins, regardless of what's in the
+    // DB. See resolveChannelPreset in config.ts.
+    const preset = resolveChannelPreset(
+      { channelPresets: this.channelPresets, threadPresets: this.threadPresets },
+      record.parentRef ?? undefined,
+      record.channelRef
+    );
+
+    const agentId = preset.agent?.value ?? record.agentId;
+    const profile = this.profileById.get(agentId);
     if (!profile) {
       throw new Error(
-        `Unknown agent profile "${record.agentId}" for session ${record.id}`
+        `Unknown agent profile "${agentId}" for session ${record.id}`
       );
     }
     const cfg = this.store.readConfig(record);
+    const model = preset.model?.value ?? cfg.model ?? this.defaultModel;
+    // Only honor a preset effort if this agent actually supports that level —
+    // e.g. a channel preset might set "medium" but the locked agent has no
+    // effort concept at all, in which case we silently fall back instead of
+    // erroring.
+    const presetEffortUsable =
+      preset.effort?.value &&
+      profile.effort &&
+      profile.effort.mechanism !== "none" &&
+      profile.effort.levels.includes(preset.effort.value);
+    const effort = presetEffortUsable ? preset.effort!.value : cfg.reasoningEffort;
+    const cwd = preset.cwd?.value ?? record.repoPath ?? process.cwd();
+
     const runtime = new AgentRuntime({
       profile,
       logger: this.logger.child({ session: record.id }),
@@ -292,10 +341,11 @@ export class SessionRouter {
 
     // For non-Anthropic backends (Ollama Cloud, Z.ai), setModel() is rejected
     // by claude-agent-acp. Pass the model at spawn time via env vars instead.
-    runtime.modelOverride = cfg.model ?? this.defaultModel;
+    runtime.modelOverride = model;
+    // For agents that accept reasoning effort via CLI flags (e.g. Grok
+    // --reasoning-effort), pass it at spawn time.
+    runtime.effortOverride = effort;
     await runtime.start();
-
-    const cwd = record.repoPath ?? process.cwd();
 
     if (record.acpSessionId) {
       // Resume with a couple short retries. Right after a redeploy the agent
@@ -311,8 +361,8 @@ export class SessionRouter {
           await runtime.loadSession({
             sessionId: record.acpSessionId,
             cwd,
-            model: cfg.model ?? this.defaultModel,
-            ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+            model,
+            ...(effort ? { effort } : {}),
           });
           this.logger.debug(
             { sessionId: record.id, acpSessionId: record.acpSessionId, attempt },
@@ -336,8 +386,8 @@ export class SessionRouter {
 
     const info = await runtime.newSession({
       cwd,
-      model: cfg.model ?? this.defaultModel,
-      ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+      model,
+      ...(effort ? { effort } : {}),
     });
     // Persist the new ACP session id so we can resume on restart. Also sync the
     // caller's in-memory record: getOrStartRuntime receives the same record the

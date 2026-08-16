@@ -43,7 +43,12 @@ import {
   deleteScheduledAttachment,
 } from "../../core/scheduled-prompts/attachments.js";
 import { describeCron, validateCron, nextRun as cronNextRun } from "../../core/scheduled-prompts/cron.js";
-import { formatWorkflowsView, clampFieldValue } from "./workflows-view.js";
+import {
+  formatWorkflowsView,
+  clampFieldValue,
+  formatAnomalyLines,
+} from "./workflows-view.js";
+import { summarizeAnomalies } from "../../core/watchdog.js";
 
 /** Accent color for scheduled-prompt cards ("cron blue"). */
 const SCHEDULED_COLOR = 0x3498db;
@@ -4056,10 +4061,12 @@ export class Orchestrator {
    *  writes, no schema, purely observability. */
   private async cmdWorkflows(i: ChatInputCommandInteraction): Promise<void> {
     const limit = i.options.getInteger("limit") ?? 20;
+    const now = new Date();
+    const active = this.store.listActiveDelegations();
     const view = formatWorkflowsView(
-      this.store.listActiveDelegations(),
+      active,
       this.store.listRecentDelegations(limit),
-      new Date()
+      now
     );
 
     const embed = new EmbedBuilder()
@@ -4083,6 +4090,30 @@ export class Orchestrator {
           value: clampFieldValue(view.recent.lines),
         });
       }
+
+      // Additive anomaly scan (issue #26). Detection over a wider history than
+      // the displayed `recent` tail so frequency spikes are actually visible;
+      // union with active so a long-quiet dispatched row isn't missed if it
+      // falls past the recent cutoff. Read-only — no parking, no writes.
+      const scanRows = [
+        ...new Map(
+          [
+            ...active,
+            ...this.store.listRecentDelegations(Math.max(limit, 200)),
+          ].map((e) => [e.id, e])
+        ).values(),
+      ];
+      const anomalyLines = formatAnomalyLines(
+        summarizeAnomalies(scanRows, now),
+        now
+      );
+      if (anomalyLines.length > 0) {
+        embed.addFields({
+          name: `⚠️ Anomalies (${anomalyLines.length})`,
+          value: clampFieldValue(anomalyLines),
+        });
+      }
+
       embed.setFooter({ text: `showing up to ${limit} recent rows` });
     }
 

@@ -293,6 +293,41 @@ const Schema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((v) => v === "true"),
+
+  /**
+   * Speaker identity (issue #57). When true, each human chat turn carries a
+   * harness-stamped speaker name + id into the `<seam-harness>` preamble so the
+   * agent can attribute turns across a multi-person thread. Default false is the
+   * rollback guarantee: when off, the emitted prompt is byte-identical to before.
+   */
+  SPEAKER_IDENTITY_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+
+  /**
+   * Optional override map of Discord user id → display name, e.g.
+   * "1487094572696867019:Jesse,1534937951044112505:Allie". Takes precedence over
+   * the Discord nickname/global-name/username, both to guarantee a clean label
+   * (raw display names are often unusable, e.g. "xX_allie_Xx") and — the load-
+   * bearing reason — to move the displayed name from user control to admin
+   * control (issue #57 D5). Parsed like REPO_EMOJIS (`:101`); ids are numeric so
+   * splitting on the first `:` is unambiguous.
+   */
+  DISCORD_USER_NAMES: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const map = new Map<string, string>();
+      for (const entry of v.split(",").map((s) => s.trim()).filter(Boolean)) {
+        const idx = entry.indexOf(":");
+        if (idx <= 0) continue;
+        const id = entry.slice(0, idx).trim();
+        const name = entry.slice(idx + 1).trim();
+        if (id && name) map.set(id, name);
+      }
+      return map;
+    }),
   /** Path to the `grok` binary. Defaults to `grok` on PATH. */
   GROK_CLI_PATH: z.string().optional(),
   /** Default model id for the Grok profile (e.g. "grok-build-0.1"). */

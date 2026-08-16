@@ -35,6 +35,10 @@ export interface MessageAttachment {
 export interface IncomingMessage {
   channel: ChannelRef;
   authorId: string;
+  /** Resolved, sanitized display name of the author (issue #57). Optional so
+   *  other adapters and synthetic messages need no change; the Discord adapter
+   *  resolves it per D5 (override map → nickname → global name → username). */
+  authorName?: string;
   authorIsBot: boolean;
   text: string;
   /** Files attached to the message, if any. */
@@ -87,7 +91,9 @@ export interface ChatAdapter {
   getThreadName?(channel: ChannelRef): Promise<string | undefined>;
 
   /** Optional: fetch historical messages for a thread (chronological order). */
-  fetchThreadMessages?(channel: ChannelRef): Promise<Array<{ authorIsBot: boolean; text: string }>>;
+  fetchThreadMessages?(
+    channel: ChannelRef
+  ): Promise<Array<{ authorIsBot: boolean; text: string; authorName?: string }>>;
 
   /** Optional: register a handler called when a thread is deleted (channelRef =
    *  the thread id). Used by scheduled prompts for instant cleanup. */
@@ -112,7 +118,7 @@ export interface ChatAdapter {
   fetchThreadMessagesTimed?(
     channel: ChannelRef,
     opts?: { fromTs?: number; toTs?: number }
-  ): Promise<Array<{ ts: number; authorIsBot: boolean; text: string }>>;
+  ): Promise<Array<{ ts: number; authorIsBot: boolean; text: string; authorName?: string }>>;
 
   /** Optional: send a rich structured panel (embed on Discord). */
   sendPanel?(channel: ChannelRef, panel: StructuredPanel): Promise<MessageRef>;

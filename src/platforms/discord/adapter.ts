@@ -36,8 +36,34 @@ import type {
   MessageRef,
 } from "../chat-adapter.js";
 import { buildSeamCommand } from "./commands.js";
+import { sanitizeSpeakerName } from "../../core/agent-conventions.js";
 
 const PLATFORM = "discord";
+
+/**
+ * Resolve a Discord author's display name per issue #57 D5:
+ *   config override map → guild nickname → global name → username,
+ * then sanitize (control chars / length) via the shared preamble sanitizer so
+ * the result is safe wherever it lands (preamble, history render). The override
+ * map matters most because it moves the name from user control to admin control.
+ */
+export function resolveDiscordSpeakerName(
+  author: {
+    userId: string;
+    nickname?: string | null;
+    globalName?: string | null;
+    username: string;
+  },
+  overrides: Map<string, string>
+): string {
+  const raw =
+    overrides.get(author.userId) ??
+    author.nickname ??
+    author.globalName ??
+    author.username ??
+    "";
+  return sanitizeSpeakerName(raw);
+}
 
 export type SlashHandler = (
   interaction: ChatInputCommandInteraction
@@ -123,6 +149,9 @@ export class DiscordAdapter implements ChatAdapter {
     const sent = await ch.send({
       content: text,
       flags: MessageFlags.SuppressEmbeds,
+      // M0 (#57): never turn a model-emitted <@id> into a real ping. Mentions
+      // still render as a highlighted name; they just don't notify.
+      allowedMentions: { parse: [] },
     });
     return { channel, id: sent.id };
   }
@@ -130,7 +159,11 @@ export class DiscordAdapter implements ChatAdapter {
   async editMessage(message: MessageRef, text: string): Promise<void> {
     const ch = await this.fetchSendableChannel(message.channel.id);
     const msg = await ch.messages.fetch(message.id);
-    await msg.edit({ content: text, flags: MessageFlags.SuppressEmbeds });
+    await msg.edit({
+      content: text,
+      flags: MessageFlags.SuppressEmbeds,
+      allowedMentions: { parse: [] },
+    });
   }
 
   async sendFile(
@@ -142,6 +175,7 @@ export class DiscordAdapter implements ChatAdapter {
       ...(file.caption ? { content: file.caption } : {}),
       files: [{ attachment: file.data, name: file.filename }],
       flags: MessageFlags.SuppressEmbeds,
+      allowedMentions: { parse: [] },
     });
     return { channel, id: sent.id };
   }
@@ -371,20 +405,22 @@ export class DiscordAdapter implements ChatAdapter {
     }
   }
 
-  async fetchThreadMessages(channel: ChannelRef): Promise<Array<{ authorIsBot: boolean; text: string }>> {
+  async fetchThreadMessages(
+    channel: ChannelRef
+  ): Promise<Array<{ authorIsBot: boolean; text: string; authorName?: string }>> {
     const ch = await this.fetchSendableChannel(channel.id);
     if (!ch.isThread()) throw new Error("Channel is not a thread.");
     
-    const messages = [];
+    const messages: Array<{ authorIsBot: boolean; text: string; authorName?: string }> = [];
     let lastId: string | undefined;
-    
+
     while (true) {
       const options: { limit: number; before?: string } = { limit: 100 };
       if (lastId) options.before = lastId;
-      
+
       const chunk = await ch.messages.fetch(options);
       if (chunk.size === 0) break;
-      
+
       for (const msg of chunk.values()) {
         if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) continue;
         if (!msg.content?.trim() && msg.attachments.size === 0) continue;
@@ -393,16 +429,17 @@ export class DiscordAdapter implements ChatAdapter {
         // only messages (or embed + minimal content) that show operational info
         // (model, context usage, timing) — useless noise for rebuild summaries.
         if (msg.author.bot && msg.embeds.length > 0 && !msg.content?.trim()) continue;
-        
+
         let text = msg.content ?? "";
         if (msg.attachments.size > 0) {
           const names = msg.attachments.map((a: any) => a.name).join(", ");
           text += ` [Attachments: ${names}]`;
         }
-        
+
         messages.push({
           authorIsBot: msg.author.bot,
           text: text.trim(),
+          ...(msg.author.bot ? {} : { authorName: this.resolveAuthorName(msg) }),
         });
       }
       
@@ -432,13 +469,13 @@ export class DiscordAdapter implements ChatAdapter {
   async fetchThreadMessagesTimed(
     channel: ChannelRef,
     opts?: { fromTs?: number; toTs?: number }
-  ): Promise<Array<{ ts: number; authorIsBot: boolean; text: string }>> {
+  ): Promise<Array<{ ts: number; authorIsBot: boolean; text: string; authorName?: string }>> {
     const ch = await this.fetchSendableChannel(channel.id);
     if (!ch.isThread()) throw new Error("Channel is not a thread.");
     const from = opts?.fromTs ?? -Infinity;
     const to = opts?.toTs ?? Infinity;
 
-    const messages: Array<{ ts: number; authorIsBot: boolean; text: string }> = [];
+    const messages: Array<{ ts: number; authorIsBot: boolean; text: string; authorName?: string }> = [];
     let lastId: string | undefined;
 
     while (true) {
@@ -461,7 +498,12 @@ export class DiscordAdapter implements ChatAdapter {
           const names = msg.attachments.map((a: any) => a.name).join(", ");
           text += ` [Attachments: ${names}]`;
         }
-        messages.push({ ts, authorIsBot: msg.author.bot, text: text.trim() });
+        messages.push({
+          ts,
+          authorIsBot: msg.author.bot,
+          text: text.trim(),
+          ...(msg.author.bot ? {} : { authorName: this.resolveAuthorName(msg) }),
+        });
       }
 
       // We page backwards (newest→oldest). Once an entire page is older than the
@@ -540,6 +582,19 @@ export class DiscordAdapter implements ChatAdapter {
     });
   }
 
+  /** Resolve a message author's display name for speaker identity (issue #57 D5). */
+  private resolveAuthorName(msg: Message): string {
+    return resolveDiscordSpeakerName(
+      {
+        userId: msg.author.id,
+        nickname: msg.member?.displayName ?? null,
+        globalName: msg.author.globalName ?? null,
+        username: msg.author.username,
+      },
+      this.config.DISCORD_USER_NAMES
+    );
+  }
+
   private async handleMessage(msg: Message): Promise<void> {
     if (!this.messageHandler) return;
     if (msg.author.bot) return;
@@ -578,6 +633,7 @@ export class DiscordAdapter implements ChatAdapter {
     const incoming: IncomingMessage = {
       channel,
       authorId: msg.author.id,
+      authorName: this.resolveAuthorName(msg),
       authorIsBot: false,
       text,
       ...(attachments.length > 0 ? { attachments } : {}),

@@ -994,7 +994,15 @@ export class Orchestrator {
         record.parentRef ?? undefined,
         record.channelRef
       );
-      let promptText = withHarnessPreamble(msg.text, riders);
+      // Speaker identity (#57): stamp the human's name/id into the preamble when
+      // the flag is on and we have an author id. Gated here (single decision
+      // point) rather than in the adapter; injectTurn-driven turns bypass the
+      // preamble entirely, so dispatch/scheduled turns emit no speaker line (D7).
+      const speaker =
+        this.config.SPEAKER_IDENTITY_ENABLED && msg.authorId
+          ? { id: msg.authorId, name: msg.authorName ?? "" }
+          : undefined;
+      let promptText = withHarnessPreamble(msg.text, riders, speaker);
       let promptAttachments = msg.attachments;
       const activeProfile = this.router.getProfile(record.agentId);
       if (
@@ -1916,7 +1924,7 @@ export class Orchestrator {
   /** Render flagged Discord ranges to plain text for the deep-dive of any span
    *  where the session store is summary-only/absent (gap-detector's call). */
   private renderDiscordRanges(
-    msgs: Array<{ ts: number; authorIsBot: boolean; text: string }>,
+    msgs: Array<{ ts: number; authorIsBot: boolean; text: string; authorName?: string }>,
     ranges: TimeRange[]
   ): string {
     const inAny = (ts: number) =>
@@ -1927,7 +1935,12 @@ export class Orchestrator {
       });
     return msgs
       .filter((m) => m.text && inAny(m.ts))
-      .map((m) => `[${new Date(m.ts).toISOString()}] ${m.authorIsBot ? "ASSISTANT" : "USER"}: ${m.text}`)
+      .map((m) => {
+        // Attribute human turns by name where the refetch surfaced it (#57 M3).
+        const role = m.authorIsBot ? "ASSISTANT" : "USER";
+        const label = !m.authorIsBot && m.authorName ? `${role} (${m.authorName})` : role;
+        return `[${new Date(m.ts).toISOString()}] ${label}: ${m.text}`;
+      })
       .join("\n\n");
   }
 
@@ -4874,7 +4887,12 @@ export class Orchestrator {
               throw new Error("No messages found in this Discord thread to reconstruct.");
             }
 
-            const transcript = rawMessages.map(m => `${m.authorIsBot ? "Agent" : "Human"}: ${m.text}`).join("\n");
+            const transcript = rawMessages.map(m => {
+              // Attribute human turns by name where present (#57 M3).
+              const role = m.authorIsBot ? "Agent" : "Human";
+              const label = !m.authorIsBot && m.authorName ? `${role} (${m.authorName})` : role;
+              return `${label}: ${m.text}`;
+            }).join("\n");
 
             let sanitizedTranscript = transcript
               .split("\n")

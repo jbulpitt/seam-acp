@@ -19,6 +19,8 @@ import { buildGlobalMcpServers } from "./mcp.js";
 import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
 import { ScheduledPromptManager } from "./core/scheduled-prompts/manager.js";
 import { WakeManager } from "./core/wake/manager.js";
+import { WatchManager } from "./core/watch/manager.js";
+import { evaluateWatch } from "./core/watch/evaluate.js";
 import { DispatchWatcher } from "./core/dispatch/watcher.js";
 import { enqueueDispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
@@ -411,6 +413,25 @@ async function main(): Promise<void> {
       // the DB row; the WakeManager sweeper fires it via the dispatch queue.
       scheduleWake: (record, req) => orchestrator.scheduleWake(record, req),
       cancelWake: (record, id) => orchestrator.cancelWake(record, id),
+      // Agent-defined watches (#60): register/cancel/list a bridge-evaluated
+      // condition trigger for the calling thread. The orchestrator owns the
+      // guards (including the D8 command gate) and the DB row; the WatchManager
+      // sweeper evaluates the predicate and fires via the dispatch queue.
+      createWatch: (record, req) =>
+        orchestrator.createWatch(record, req as Parameters<typeof orchestrator.createWatch>[1]),
+      cancelWatch: (record, id) => orchestrator.cancelWatch(record, id),
+      listWatches: (record) =>
+        orchestrator.listWatches(record.platform, record.channelRef).map((w) => ({
+          id: w.id,
+          kind: w.kind,
+          spec: w.spec,
+          intervalSeconds: w.intervalSeconds,
+          mode: w.mode,
+          fireCount: w.fireCount,
+          maxFires: w.maxFires,
+          expiresAtUtc: w.expiresAtUtc,
+          reason: w.reason,
+        })),
       // Durable multi-hop chains (#25): create the chain row and pop hop 1, so
       // the `chain` tool can enqueue the first dispatch. The runtime advances
       // the rest (Orchestrator.advanceChain).
@@ -491,6 +512,27 @@ async function main(): Promise<void> {
   orchestrator.setWakeManager(wakeManager);
   wakeManager.start();
 
+  // Agent-defined watches (#60): a DB sweeper polls each watch's predicate on
+  // its interval and fires a turn via the dispatch queue ONLY when a condition
+  // trips — the model is never invoked to check (D1). Restart-safe like the wake
+  // sweeper. The command source is gated by config (D8): the evaluator re-checks
+  // WATCH_COMMAND_ENABLED + the allowlist as a backstop to registration-time
+  // refusal, so a command watch persisted before the flag flipped won't run.
+  const watchManager = new WatchManager({
+    store,
+    logger: logger.child({ mod: "watch" }),
+    evaluate: (watch) =>
+      evaluateWatch(watch, {
+        enabled: config.WATCH_COMMAND_ENABLED,
+        allowlist: config.WATCH_COMMAND_ALLOWLIST,
+      }),
+    onFire: (watch, eventText) => orchestrator.fireWatch(watch, eventText),
+    onExpire: (watch) => orchestrator.fireWatchExpiry(watch),
+    onStopped: (watch, reason) => orchestrator.postWatchStopped(watch, reason),
+  });
+  orchestrator.setWatchManager(watchManager);
+  watchManager.start();
+
   // Operator-dispatch bridge: a trusted process drops a spec into
   // <DATA_DIR>/dispatch/pending/ and the watcher runs it as a turn in the
   // target thread, writing the captured output to done/. Started after the
@@ -536,6 +578,7 @@ async function main(): Promise<void> {
     orchestrator.stopSentinelWatcher();
     scheduledManager.stop();
     wakeManager.stop();
+    watchManager.stop();
     dispatchWatcher.stop();
     stopPresetsWatch?.();
     await seamMcpServer?.stop().catch((err) =>

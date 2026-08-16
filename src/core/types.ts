@@ -188,6 +188,10 @@ export type DelegationKind =
    *  Distinct from "scheduled" so watchdog policy can treat agent-initiated
    *  re-entry differently from human-scheduled cron runs (D7). */
   | "wake"
+  /** Agent-defined watch (#60) — a bridge-evaluated condition tripped and
+   *  re-entered its owning thread. Distinct from "wake" so watchdog policy can
+   *  tell a time-triggered self-resumption from a condition-triggered one. */
+  | "watch"
   /** Read-only cross-thread inspection. */
   | "peek";
 

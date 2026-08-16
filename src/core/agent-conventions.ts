@@ -29,6 +29,14 @@ export const ATTACH_FENCE_LANG = "seam-attach";
  *  The `schedule_wake` MCP tool is sugar over the same path. */
 export const WAKE_FENCE_LANG = "seam-wake";
 
+/** Reserved fenced-block info tag an agent WITHOUT the seam-MCP tools (e.g. agy)
+ *  uses to register a bridge-evaluated watch (#60). The output pipeline
+ *  intercepts a fence whose lang equals this, parses its JSON body
+ *  (`{ kind, spec, intervalSeconds, prompt, expiresInSeconds, ... }`), arms the
+ *  watch, and suppresses the block. The `watch_create` MCP tool is sugar over
+ *  the same path. */
+export const WATCH_FENCE_LANG = "seam-watch";
+
 /** A per-turn speaker stamp (issue #57). `id` is the authoritative, harness-
  *  stamped identity (not user-controlled); `name` is a user-editable convenience
  *  label that must never drive a scope/permission decision (D4). */

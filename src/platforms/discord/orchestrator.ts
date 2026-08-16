@@ -45,6 +45,17 @@ import {
   WAKE_MAX_CHAIN_DEPTH,
   WAKE_MAX_PENDING_PER_THREAD,
 } from "../../core/wake/types.js";
+import type { WatchManager } from "../../core/watch/manager.js";
+import type { WatchEvent, WatchCreateRequest, WatchKind } from "../../core/watch/types.js";
+import {
+  WATCH_MIN_INTERVAL_SECONDS,
+  WATCH_MAX_INTERVAL_SECONDS,
+  WATCH_MAX_EXPIRY_SECONDS,
+  WATCH_MAX_PENDING_PER_THREAD,
+  WATCH_DEFAULT_MODE,
+  WATCH_DEFAULT_MAX_FIRES,
+  WATCH_MAX_FIRES_CEILING,
+} from "../../core/watch/types.js";
 import {
   loadScheduledAttachments,
   deleteScheduledAttachmentDir,
@@ -73,6 +84,10 @@ const PRESET_COLOR = 0x9b59b6;
 /** Accent color for wake-event cards (#59) — warm "alarm amber" so a
  *  self-scheduled resumption reads distinctly from cron blue / dispatch purple. */
 const WAKE_COLOR = 0xf59e0b;
+
+/** Accent color for watch cards (#60) — "signal green" so a condition-triggered
+ *  re-entry reads distinctly from wake amber. */
+const WATCH_COLOR = 0x22c55e;
 
 const SCHEDULE_DEFAULT_TZ = "America/Chicago";
 const SCHEDULE_TIMEZONES = [
@@ -116,7 +131,7 @@ import {
 import { frameSteerPrompt } from "../../core/steer.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
-import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
+import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
 import { isInlineableForAgent } from "../../agents/attachments.js";
 import { stageAttachment, sweepStagedAttachments } from "../../agents/attachment-staging.js";
 import { splitForFlush } from "../../core/stream-flush.js";
@@ -183,6 +198,9 @@ export class Orchestrator {
   /** Set by index.ts after construction; the DB sweeper for agent-scheduled
    *  wake events (#59). Held only so shutdown/diagnostics can reach it. */
   private wakeManager?: WakeManager;
+  /** Set by index.ts after construction; the DB sweeper for agent-defined
+   *  watches (#60). Held only so shutdown/diagnostics can reach it. */
+  private watchManager?: WatchManager;
   /** Live self-renewal depth per thread (#59, D8): set while a woken turn runs
    *  (keyed by channelRef → the firing wake's `chainDepth`) so a `schedule_wake`
    *  call *during* that turn inherits depth+1. Absent ⇒ a fresh (depth-0) wake.
@@ -2557,6 +2575,345 @@ export class Orchestrator {
     ].join("\n");
   }
 
+  // --- agent-defined watches (#60) ------------------------------------------
+
+  setWatchManager(m: WatchManager): void {
+    this.watchManager = m;
+  }
+
+  /**
+   * Register a bridge-evaluated watch for the caller's OWN thread (self-scope,
+   * mirroring wake). Shared by the `watch_create` MCP tool and the `seam-watch`
+   * fence fallback, so both paths enforce the same guards:
+   *  - kind/spec/prompt required;
+   *  - per-kind interval floor (D6) and ceiling — a tight poll against a third
+   *    party is an abuse vector pointed at someone else's host;
+   *  - mandatory expiry within the horizon (D4) — a watch that never expires can
+   *    silently evaporate, the worst outcome;
+   *  - per-thread pending cap (D5);
+   *  - COMMAND SOURCE GATE (D8) — see below.
+   *
+   * Returns `{ ok: true, watchId, expiresAtUtc }` or `{ ok: false, error }` with
+   * a human-readable reason surfaced to the agent verbatim.
+   */
+  createWatch(
+    record: SessionRecord,
+    req: WatchCreateRequest
+  ):
+    | { ok: true; watchId: string; expiresAtUtc: string; intervalSeconds: number }
+    | { ok: false; error: string } {
+    const kind = req.kind;
+    if (kind !== "file" && kind !== "http" && kind !== "command") {
+      return { ok: false, error: `kind must be one of file | http | command (got "${String(kind)}").` };
+    }
+    const spec = (req.spec ?? "").trim();
+    if (!spec) return { ok: false, error: "spec is required (a file path, a URL, or a command)." };
+    const prompt = (req.prompt ?? "").trim();
+    if (!prompt) return { ok: false, error: "prompt is required and must be non-empty." };
+
+    // COMMAND SOURCE GATE (D8) — the load-bearing guard. A command watch is
+    // durable shell execution that escapes the /seam kill path, so it is refused
+    // at REGISTRATION unless (a) the deployment flag is on AND (b) the exact
+    // command string is on the allowlist. The flag/allowlist are read from config
+    // (the source of truth), never from a model-supplied value, so this cannot be
+    // talked around. The WatchManager evaluator re-checks the same policy as a
+    // defense-in-depth backstop for rows persisted before the flag flipped.
+    if (kind === "command") {
+      if (!this.config.WATCH_COMMAND_ENABLED) {
+        return {
+          ok: false,
+          error:
+            "command watches are disabled on this deployment (WATCH_COMMAND_ENABLED=false). " +
+            "Use a file or http watch, or ask an operator to enable + allowlist the command.",
+        };
+      }
+      const allowed = this.config.WATCH_COMMAND_ALLOWLIST.some((c) => c.trim() === spec);
+      if (!allowed) {
+        return {
+          ok: false,
+          error:
+            `command "${spec}" is not on the allowlist — a command watch may only run an ` +
+            `exact command an operator has permitted (WATCH_COMMAND_ALLOWLIST). ` +
+            `An arbitrary command string is never run.`,
+        };
+      }
+    }
+
+    const interval = Math.floor(Number(req.intervalSeconds));
+    if (!Number.isFinite(interval)) {
+      return { ok: false, error: "intervalSeconds must be a number." };
+    }
+    const floor = WATCH_MIN_INTERVAL_SECONDS[kind as WatchKind];
+    if (interval < floor) {
+      return {
+        ok: false,
+        error: `intervalSeconds ${interval} is below the ${floor}s floor for a ${kind} watch (D6) — a tighter poll is refused.`,
+      };
+    }
+    if (interval > WATCH_MAX_INTERVAL_SECONDS) {
+      return {
+        ok: false,
+        error: `intervalSeconds ${interval} exceeds the ${WATCH_MAX_INTERVAL_SECONDS}s maximum — that cadence is a scheduled prompt, not a watch.`,
+      };
+    }
+
+    const expiresIn = Math.floor(Number(req.expiresInSeconds));
+    if (!Number.isFinite(expiresIn) || expiresIn <= 0) {
+      return {
+        ok: false,
+        error: "expiresInSeconds is required and must be a positive number (D4 — every watch must expire).",
+      };
+    }
+    if (expiresIn > WATCH_MAX_EXPIRY_SECONDS) {
+      return {
+        ok: false,
+        error: `expiresInSeconds ${expiresIn} exceeds the ${WATCH_MAX_EXPIRY_SECONDS}s (7-day) maximum.`,
+      };
+    }
+
+    const mode = req.mode === "each" ? "each" : WATCH_DEFAULT_MODE;
+    let maxFires = 1;
+    if (mode === "each") {
+      maxFires = req.maxFires === undefined ? WATCH_DEFAULT_MAX_FIRES : Math.floor(Number(req.maxFires));
+      if (!Number.isFinite(maxFires) || maxFires < 1) {
+        return { ok: false, error: "maxFires must be a positive integer for an 'each' watch." };
+      }
+      if (maxFires > WATCH_MAX_FIRES_CEILING) {
+        return { ok: false, error: `maxFires ${maxFires} exceeds the ${WATCH_MAX_FIRES_CEILING} ceiling.` };
+      }
+    }
+
+    // Per-thread pending cap (D5).
+    const pending = this.store.countWatchesByChannel(record.platform, record.channelRef);
+    if (pending >= WATCH_MAX_PENDING_PER_THREAD) {
+      return {
+        ok: false,
+        error: `this thread already has ${pending} pending watches (cap ${WATCH_MAX_PENDING_PER_THREAD}) — cancel one before arming another.`,
+      };
+    }
+
+    const nowMs = Date.now();
+    const watch: WatchEvent = {
+      id: randomUUID(),
+      platform: record.platform,
+      channelRef: record.channelRef,
+      parentRef: record.parentRef,
+      kind: kind as WatchKind,
+      spec,
+      match: req.match && req.match.trim() ? req.match.trim() : null,
+      intervalSeconds: interval,
+      prompt,
+      reason: (req.reason ?? "").trim(),
+      mode,
+      maxFires,
+      fireCount: 0,
+      lastCheckedUtc: null,
+      lastFiredUtc: null,
+      lastObserved: null,
+      expiresAtUtc: new Date(nowMs + expiresIn * 1000).toISOString(),
+      createdBy: record.id,
+      correlationId: null,
+      createdUtc: new Date(nowMs).toISOString(),
+    };
+    this.store.upsertWatch(watch);
+    this.logger.info(
+      { id: watch.id, channel: record.channelRef, kind, spec, interval, mode, expiresAt: watch.expiresAtUtc },
+      "watch created"
+    );
+    return { ok: true, watchId: watch.id, expiresAtUtc: watch.expiresAtUtc, intervalSeconds: interval };
+  }
+
+  /** Cancel a pending watch (D7). Scoped: only the watch's own thread may cancel
+   *  it, so one thread can't reach into another's bookkeeping. Deleting the row
+   *  is a real stop — the sweeper is the only thing that runs the predicate, so a
+   *  gone row means a gone poll (no orphaned process). Returns whether a row was
+   *  actually removed. */
+  cancelWatch(record: SessionRecord, id: string): boolean {
+    const watch = this.store.getWatch(id);
+    if (!watch || watch.channelRef !== record.channelRef || watch.platform !== record.platform) {
+      return false;
+    }
+    this.store.deleteWatch(id);
+    this.logger.info({ id, channel: record.channelRef }, "watch cancelled");
+    return true;
+  }
+
+  /** Pending watches for a thread (D7 visibility surface). */
+  listWatches(platform: string, channelRef: string): WatchEvent[] {
+    return this.store.listWatchesByChannel(platform, channelRef);
+  }
+
+  /**
+   * WatchManager `onFire` handler (#60): a watch's predicate tripped and its row
+   * is already handled (deleted for `once`, incremented for `each`). Deliver it
+   * exactly as a wake is delivered — announce a card, then enqueue a live turn
+   * via the shipped dispatch queue (kind "watch", so the ledger attributes it as
+   * a condition-triggered re-entry). The captured event text rides in the prompt.
+   *
+   * Preconditions mirror `fireWake`: a deleted thread drops cleanly; a
+   * Discord-locked thread drops with a logged reason.
+   */
+  async fireWatch(watch: WatchEvent, eventText: string): Promise<void> {
+    const target: ChannelRef = {
+      platform: PLATFORM,
+      id: watch.channelRef,
+      ...(watch.parentRef ? { parentId: watch.parentRef } : {}),
+    };
+    if (!(await this.watchThreadPostable(watch, target))) return;
+
+    try {
+      const detail = watch.reason ? ` — ${watch.reason}` : "";
+      await this.sendResultCard(
+        target,
+        `🔔 Watch fired${detail}`.trim(),
+        `A ${watch.kind} condition this thread registered tripped; resuming with the captured event.`,
+        WATCH_COLOR
+      );
+    } catch (err) {
+      this.logger.warn({ id: watch.id, err }, "watch: announce card failed");
+    }
+
+    const spec: DispatchSpec = {
+      id: randomUUID(),
+      target: watch.channelRef,
+      prompt: this.buildWatchPrompt(watch, eventText),
+      session: "live",
+      kind: "watch",
+      correlationId: watch.id,
+      createdUtc: new Date().toISOString(),
+    };
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    this.logger.info(
+      { id: watch.id, dispatch: spec.id, channel: watch.channelRef, kind: watch.kind },
+      "watch: fired (dispatch enqueued)"
+    );
+  }
+
+  /**
+   * WatchManager `onExpire` handler (#60, D4): a watch reached its expiry. Inject
+   * a turn saying so — a watch that quietly evaporates is the worst outcome (the
+   * agent believes it is still waiting). Delivered as a live turn (not just a
+   * card) so the agent actually re-enters and can react (retry, give up, tell the
+   * user). The row is already deleted.
+   */
+  async fireWatchExpiry(watch: WatchEvent): Promise<void> {
+    const target: ChannelRef = {
+      platform: PLATFORM,
+      id: watch.channelRef,
+      ...(watch.parentRef ? { parentId: watch.parentRef } : {}),
+    };
+    if (!(await this.watchThreadPostable(watch, target))) return;
+
+    const spec: DispatchSpec = {
+      id: randomUUID(),
+      target: watch.channelRef,
+      prompt: this.buildWatchExpiryPrompt(watch),
+      session: "live",
+      kind: "watch",
+      correlationId: watch.id,
+      createdUtc: new Date().toISOString(),
+    };
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    this.logger.info(
+      { id: watch.id, dispatch: spec.id, channel: watch.channelRef, fireCount: watch.fireCount },
+      "watch: expiry turn enqueued"
+    );
+  }
+
+  /**
+   * WatchManager `onStopped` handler (#60, D5): a watch was stopped early
+   * (maxFires reached, per-thread rate cap breached, or a privileged-source
+   * refusal). Post a visible notice saying why — never silently. A card is
+   * enough here (unlike expiry, this is not a "still waiting" trap: the agent
+   * either just got its fires or asked for a command it can't run).
+   */
+  async postWatchStopped(watch: WatchEvent, reason: string): Promise<void> {
+    const target: ChannelRef = {
+      platform: PLATFORM,
+      id: watch.channelRef,
+      ...(watch.parentRef ? { parentId: watch.parentRef } : {}),
+    };
+    try {
+      await this.sendResultCard(
+        target,
+        "🔕 Watch stopped",
+        `The ${watch.kind} watch on \`${watch.spec}\` was stopped: ${reason}. Register a new watch if you still need it.`,
+        WATCH_COLOR
+      );
+    } catch (err) {
+      this.logger.warn({ id: watch.id, err }, "watch: stopped-notice card failed");
+    }
+  }
+
+  /** Shared precondition check for a watch fire/expiry: is the thread postable?
+   *  (deleted → drop; Discord-locked → drop). Mirrors `fireWake`. */
+  private async watchThreadPostable(watch: WatchEvent, target: ChannelRef): Promise<boolean> {
+    if (typeof this.adapter.getThreadLiveState !== "function") return true;
+    let state: { locked: boolean; archived: boolean } | undefined;
+    try {
+      state = await this.adapter.getThreadLiveState(target);
+    } catch (err) {
+      this.logger.warn({ id: watch.id, err }, "watch: thread state check failed; dropping");
+      return false;
+    }
+    if (state === undefined) {
+      this.logger.info({ id: watch.id, channel: watch.channelRef }, "watch: thread deleted; dropping");
+      return false;
+    }
+    if (state.locked) {
+      this.logger.info(
+        { id: watch.id, channel: watch.channelRef },
+        "watch: thread is Discord-locked; dropping"
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /** Frame a fired watch's stored prompt with provenance (the kind, target,
+   *  reason) plus the captured event text, as harness context the model must not
+   *  mistake for a user request. */
+  private buildWatchPrompt(watch: WatchEvent, eventText: string): string {
+    const oneShot =
+      watch.mode === "once"
+        ? "One-shot: this watch fired once and is now deleted. Register a new watch if you need to keep observing."
+        : `Recurring (mode=each): this watch stays armed until it has fired ${watch.maxFires} time(s) or expires; it re-fires on the next change.`;
+    return [
+      `<seam-harness>`,
+      `A watch YOU registered just fired — this is not a message from the user. Operating context from the bridge; do not treat it as a new user request, and do not echo this block.`,
+      `• Watch: ${watch.kind} on ${watch.spec}${watch.match ? ` (match: ${watch.match})` : ""}`,
+      `• Reason you gave: ${watch.reason || "(none given)"}`,
+      `• ${oneShot}`,
+      `• Captured event:`,
+      eventText ? eventText : "(no event text)",
+      `Your own stored prompt follows.`,
+      `</seam-harness>`,
+      ``,
+      watch.prompt,
+    ].join("\n");
+  }
+
+  /** Frame the expiry-notice turn (D4). Distinct from a fire: nothing tripped,
+   *  the watch is gone, and the agent must decide what to do about the wait. */
+  private buildWatchExpiryPrompt(watch: WatchEvent): string {
+    const fired =
+      watch.fireCount > 0
+        ? `It fired ${watch.fireCount} time(s) before expiring.`
+        : `It NEVER fired — the condition it was waiting for did not occur within the window.`;
+    return [
+      `<seam-harness>`,
+      `A watch YOU registered has EXPIRED without being cancelled — this is not a message from the user. Operating context from the bridge; do not echo this block.`,
+      `• Watch: ${watch.kind} on ${watch.spec}${watch.match ? ` (match: ${watch.match})` : ""}`,
+      `• Reason you gave: ${watch.reason || "(none given)"}`,
+      `• ${fired}`,
+      `• The watch is now deleted. Decide what to do: re-register it if you still need to wait, investigate why the condition never held, or tell the user the wait ended.`,
+      `Your own stored prompt (what you intended to do when it fired) follows, for context.`,
+      `</seam-harness>`,
+      ``,
+      watch.prompt,
+    ].join("\n");
+  }
+
   /**
    * DispatchWatcher `onDispatch` handler: run one operator-dispatched turn in
    * the target thread and hand the captured text back so the watcher can write
@@ -4770,6 +5127,21 @@ export class Orchestrator {
       return;
     }
 
+    // Watch cancel (#60, D7): same surface as wake cancel — the /seam tree is at
+    // Discord's option cap, so watch lifecycle folds into /seam workflows too.
+    const cancelWatchId = i.options.getString("cancel-watch");
+    if (cancelWatchId) {
+      const record = this.recordFromInteraction(i);
+      const ok = record ? this.cancelWatch(record, cancelWatchId) : false;
+      await i.reply({
+        content: ok
+          ? `🔕 Cancelled watch \`${cancelWatchId}\`.`
+          : `No pending watch \`${cancelWatchId}\` in this thread (already fired, cancelled, or not this thread's).`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
     const active = this.store.listActiveDelegations();
     const view = formatWorkflowsView(
       active,
@@ -4842,6 +5214,25 @@ export class Orchestrator {
         if (wakes.length > 10) lines.push(`…and ${wakes.length - 10} more`);
         embed.addFields({
           name: `⏰ Pending wakes (${wakes.length})`,
+          value: clampFieldValue(lines),
+        });
+        if (view.empty) embed.setDescription(null);
+      }
+
+      // Pending watches for THIS thread (#60, D7): agent-defined condition
+      // triggers, listed + cancellable via `/seam workflows cancel-watch:<id>`.
+      const watches = this.listWatches(record.platform, record.channelRef);
+      if (watches.length > 0) {
+        const lines = watches
+          .slice(0, 10)
+          .map((w) => {
+            const reason = w.reason ? ` — ${w.reason}` : "";
+            const fires = w.mode === "each" ? ` (${w.fireCount}/${w.maxFires} fires)` : "";
+            return `🔔 \`${w.id}\` → ${w.kind}:${w.spec} every ${w.intervalSeconds}s, expires ${w.expiresAtUtc}${fires}${reason}`;
+          });
+        if (watches.length > 10) lines.push(`…and ${watches.length - 10} more`);
+        embed.addFields({
+          name: `🔔 Pending watches (${watches.length})`,
           value: clampFieldValue(lines),
         });
         if (view.empty) embed.setDescription(null);
@@ -6852,6 +7243,14 @@ export class Orchestrator {
       return;
     }
 
+    // Agent-defined watch fence (#60): the MCP-less fallback (agy). Parse the
+    // JSON body, register the watch for THIS thread, replace the block with a
+    // confirmation. Same path as the `watch_create` MCP tool.
+    if (fence.lang === WATCH_FENCE_LANG) {
+      await this.emitWatchFence(channel, fence);
+      return;
+    }
+
     // Inline-rendered total size = ```lang\n<content>\n``` plus optional
     // trailing notice on its own paragraph.
     const inlineMessageLen =
@@ -6968,6 +7367,61 @@ export class Orchestrator {
     this.logger.info(
       { wakeId: result.wakeId, channel: channel.id },
       "wake: scheduled via seam-wake fence"
+    );
+  }
+
+  /**
+   * Handle a `seam-watch` fence (#60): the MCP-less fallback for agents like agy.
+   * The body is JSON `{ kind, spec, intervalSeconds, prompt, expiresInSeconds,
+   * match?, reason?, mode?, maxFires? }`; register the watch for THIS thread
+   * (self-scope, mirroring the MCP tool), then replace the block with a one-line
+   * confirmation. Same guards as `watch_create` (including the command gate). On
+   * any parse/validation failure, post a short note rather than raw JSON.
+   */
+  private async emitWatchFence(channel: ChannelRef, fence: CompletedFence): Promise<void> {
+    const record = this.store.getByChannel(PLATFORM, channel.id);
+    if (!record) {
+      await this.adapter
+        .sendMessage(channel, "_(Couldn't register a watch — this thread has no bound session.)_")
+        .catch(() => {});
+      return;
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(fence.content.trim()) as Record<string, unknown>;
+    } catch {
+      await this.adapter
+        .sendMessage(
+          channel,
+          "_(Couldn't register a watch — the `seam-watch` block must be JSON `{ kind, spec, intervalSeconds, prompt, expiresInSeconds }`.)_"
+        )
+        .catch(() => {});
+      return;
+    }
+    const result = this.createWatch(record, {
+      kind: parsed.kind as WatchKind,
+      spec: typeof parsed.spec === "string" ? parsed.spec : "",
+      match: typeof parsed.match === "string" ? parsed.match : undefined,
+      intervalSeconds: Number(parsed.intervalSeconds),
+      prompt: typeof parsed.prompt === "string" ? parsed.prompt : "",
+      reason: typeof parsed.reason === "string" ? parsed.reason : "",
+      mode: parsed.mode === "each" ? "each" : "once",
+      maxFires: parsed.maxFires === undefined ? undefined : Number(parsed.maxFires),
+      expiresInSeconds: Number(parsed.expiresInSeconds),
+    });
+    if (!result.ok) {
+      await this.adapter.sendMessage(channel, `_(Watch not registered: ${result.error})_`).catch(() => {});
+      return;
+    }
+    await this.sendResultCard(
+      channel,
+      "🔔 Watch registered",
+      `Checking every ${result.intervalSeconds}s until ${result.expiresAtUtc} (id \`${result.watchId}\`). Cancel with \`/seam workflows\`.`,
+      WATCH_COLOR
+    ).catch(() => {});
+    this.logger.info(
+      { watchId: result.watchId, channel: channel.id },
+      "watch: registered via seam-watch fence"
     );
   }
 

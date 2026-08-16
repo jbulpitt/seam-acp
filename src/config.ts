@@ -92,6 +92,35 @@ const Schema = z.object({
     .default("false")
     .transform((v) => v === "true"),
   /**
+   * Agent-defined watches (#60): allow the privileged `command` watch source (a
+   * watch whose predicate is an agent-authored command run on an interval).
+   * Default OFF (D8) — `file` and `http` watches are always available; only the
+   * command executor is gated. Even when ON, a command watch is refused unless
+   * its EXACT command string is on WATCH_COMMAND_ALLOWLIST — an agent-supplied
+   * string is never shell-evaluated unguarded. This is the flag half of the D8
+   * gate; the allowlist is the other half.
+   */
+  WATCH_COMMAND_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  /**
+   * Comma-separated allowlist of EXACT command strings a `command` watch may run
+   * (only consulted when WATCH_COMMAND_ENABLED). Exact match, not prefix — a
+   * prefix match ("git" allowing "git; rm -rf") is the injection D8 warns about.
+   * Empty ⇒ no command is runnable even with the flag on. Commands run argv-style
+   * (split on whitespace, no shell), detached from the agent's process group.
+   */
+  WATCH_COMMAND_ALLOWLIST: z
+    .string()
+    .default("")
+    .transform((v) =>
+      v
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    ),
+  /**
    * Comma-separated list of absolute directories the `/seam attach`
    * slash command is allowed to read from. REPOS_ROOT is always
    * implicitly allowed. Defaults to empty (only REPOS_ROOT).

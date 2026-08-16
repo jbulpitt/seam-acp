@@ -101,6 +101,41 @@ export interface SeamMcpServerDeps {
   /** Cancel a pending wake owned by the calling thread (#59). Returns whether a
    *  row was removed. Undefined ⇒ wakes are unsupported on this deployment. */
   cancelWake?: (record: SessionRecord, id: string) => boolean;
+  /** Register a bridge-evaluated watch for the calling thread (#60). Returns the
+   *  new watch id + expiry, or an error string surfaced verbatim. Undefined ⇒
+   *  watches are unsupported on this deployment. */
+  createWatch?: (
+    record: SessionRecord,
+    req: {
+      kind: string;
+      spec: string;
+      match?: string;
+      intervalSeconds: number;
+      prompt: string;
+      reason?: string;
+      mode?: string;
+      maxFires?: number;
+      expiresInSeconds: number;
+    }
+  ) =>
+    | { ok: true; watchId: string; expiresAtUtc: string; intervalSeconds: number }
+    | { ok: false; error: string };
+  /** Cancel a pending watch owned by the calling thread (#60). Returns whether a
+   *  row was removed. Undefined ⇒ watches are unsupported on this deployment. */
+  cancelWatch?: (record: SessionRecord, id: string) => boolean;
+  /** List pending watches owned by the calling thread (#60, D7). Undefined ⇒
+   *  watches are unsupported on this deployment. */
+  listWatches?: (record: SessionRecord) => Array<{
+    id: string;
+    kind: string;
+    spec: string;
+    intervalSeconds: number;
+    mode: string;
+    fireCount: number;
+    maxFires: number;
+    expiresAtUtc: string;
+    reason: string;
+  }>;
   /**
    * Is the calling thread's channel locked? (#58 D2). The MUTATION tool refuses
    * outright when this is true — enforced HERE, in the tool layer, so the lock
@@ -284,6 +319,90 @@ const TOOLS = [
     },
   },
   {
+    name: "watch_create",
+    description:
+      "Register a CONDITION the bridge checks cheaply on an interval and re-enters THIS thread ONLY when it " +
+      "actually fires — instead of you waking every N minutes to check for yourself (which burns a whole turn " +
+      "each time). The bridge evaluates the predicate; you are woken with a live turn (carrying your `prompt` " +
+      "plus the captured event) only on a real event.\n" +
+      "Sources: `file` (fires when a path's existence/size/mtime changes), `http` (GET the url; fire on a " +
+      "status match via match=\"status:200\", a body regex via match=\"<regex>\", or any change by default), " +
+      "`command` (run an allowlisted command; fire on non-empty stdout — a PRIVILEGED source, often disabled). " +
+      "Default `mode:\"once\"` fires once then deletes; `mode:\"each\"` re-fires up to `maxFires`. " +
+      "`expiresInSeconds` is REQUIRED — on expiry you are told so, so a wait never silently evaporates. " +
+      "Prefer this over schedule_wake for \"wait until X\"; write predicates that also match FAILURE states, " +
+      "not just the happy path, or a crash leaves the watch silent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: {
+          type: "string",
+          enum: ["file", "http", "command"],
+          description: "What to observe: file path | http url | command (command may be disabled).",
+        },
+        spec: {
+          type: "string",
+          description: "The target: a file path, a URL, or a command string.",
+        },
+        match: {
+          type: "string",
+          description:
+            "http only. \"status:NNN\" fires on that status; any other string is a body regex. Omit for change-detection.",
+        },
+        intervalSeconds: {
+          type: "number",
+          description: "How often to check. Floored per kind (file 2s, command 10s, http 30s).",
+        },
+        prompt: {
+          type: "string",
+          description: "The prompt replayed to you when the watch fires. Write it to stand on its own.",
+        },
+        reason: {
+          type: "string",
+          description: "Short human-facing note shown when it fires (telemetry, not instructions).",
+        },
+        mode: {
+          type: "string",
+          enum: ["once", "each"],
+          description: "\"once\" (default): fire once then delete. \"each\": re-fire up to maxFires.",
+        },
+        maxFires: {
+          type: "number",
+          description: "For mode=\"each\": stop after this many fires (default 10).",
+        },
+        expiresInSeconds: {
+          type: "number",
+          description: "REQUIRED — auto-expire after this many seconds; on expiry you are notified.",
+        },
+      },
+      required: ["kind", "spec", "intervalSeconds", "prompt", "expiresInSeconds"],
+    },
+  },
+  {
+    name: "watch_cancel",
+    description:
+      "Cancel a pending watch you registered in THIS thread, by its id (as returned by watch_create). " +
+      "The row IS the poll — cancelling stops the checking entirely.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        watchId: { type: "string", description: "The watch id to cancel." },
+      },
+      required: ["watchId"],
+    },
+  },
+  {
+    name: "watch_list",
+    description:
+      "List the pending watches you have registered in THIS thread (id, kind, target, interval, mode, " +
+      "fire count, expiry) so you can review or cancel them. Read-only.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
     name: "config_describe",
     description:
       "Describe YOUR thread's effective configuration and WHY each value is what it is. " +
@@ -384,6 +503,10 @@ const INSTRUCTIONS = [
   "  the woken turn to continue a loop. This is the working substrate for \"wake me in N minutes\"; the",
   "  native ScheduleWakeup / Monitor tools do NOT function here, so use this instead.",
   "- cancel_wake(wakeId): cancel a pending wake you scheduled.",
+  "- watch_create(kind, spec, intervalSeconds, prompt, expiresInSeconds, ...): register a CONDITION the bridge",
+  "  checks cheaply and re-enters you ONLY when it fires (file/http/command source). Prefer this over a",
+  "  schedule_wake poll loop for \"wait until X\" — the bridge does the checking, so a turn is spent only on a",
+  "  real event, not on repeatedly producing \"no\". Always set expiresInSeconds; watch_list / watch_cancel manage them.",
   "",
   "Prefer handoff to a preset for well-scoped specialist work, and to a thread id when a specific",
   "teammate already holds the context. Use chain when work has a fixed multi-stage pipeline.",
@@ -536,6 +659,12 @@ export class SeamMcpServer {
           return rpcResult(id, this.toolScheduleWake(record, args));
         case "cancel_wake":
           return rpcResult(id, this.toolCancelWake(record, args));
+        case "watch_create":
+          return rpcResult(id, this.toolWatchCreate(record, args));
+        case "watch_cancel":
+          return rpcResult(id, this.toolWatchCancel(record, args));
+        case "watch_list":
+          return rpcResult(id, this.toolWatchList(record));
         case "config_describe":
           return rpcResult(id, this.toolConfigDescribe(record, args));
         case "config_propose":
@@ -747,6 +876,80 @@ export class SeamMcpServer {
     return removed
       ? textResult(`Wake ${wakeId} cancelled.`)
       : textResult(`No pending wake ${wakeId} found in this thread (already fired, cancelled, or not yours).`, true);
+  }
+
+  /** Register a bridge-evaluated watch for the calling thread (#60). Self-scope
+   *  by construction — the watch is armed for the token-resolved caller, never a
+   *  caller-supplied thread. All validation (including the command source gate,
+   *  D8) lives behind `createWatch` so the MCP and fence paths enforce it
+   *  identically. */
+  private toolWatchCreate(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): McpToolResult {
+    if (!this.deps.createWatch) {
+      return textResult("watches are not supported on this deployment.", true);
+    }
+    const kind = requireString(args, "kind");
+    const spec = requireString(args, "spec");
+    const prompt = requireString(args, "prompt");
+    const intervalSeconds = typeof args.intervalSeconds === "number" ? args.intervalSeconds : NaN;
+    const expiresInSeconds = typeof args.expiresInSeconds === "number" ? args.expiresInSeconds : NaN;
+    const result = this.deps.createWatch(caller, {
+      kind,
+      spec,
+      ...(optionalString(args, "match") ? { match: optionalString(args, "match")! } : {}),
+      intervalSeconds,
+      prompt,
+      ...(optionalString(args, "reason") ? { reason: optionalString(args, "reason")! } : {}),
+      ...(optionalString(args, "mode") ? { mode: optionalString(args, "mode")! } : {}),
+      ...(typeof args.maxFires === "number" ? { maxFires: args.maxFires } : {}),
+      expiresInSeconds,
+    });
+    if (!result.ok) {
+      return textResult(`Watch not registered: ${result.error}`, true);
+    }
+    this.logger.info(
+      { watchId: result.watchId, thread: caller.channelRef, kind, spec, expiresAt: result.expiresAtUtc },
+      "seam-mcp watch_create armed"
+    );
+    return textResult(
+      `Watch ${result.watchId} registered — the bridge will check this ${kind} condition every ` +
+        `${result.intervalSeconds}s and re-enter this thread with a live turn ONLY when it fires. ` +
+        `It auto-expires at ${result.expiresAtUtc} (you'll be told if it expires without firing).`
+    );
+  }
+
+  /** Cancel a pending watch owned by the calling thread (#60). */
+  private toolWatchCancel(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): McpToolResult {
+    if (!this.deps.cancelWatch) {
+      return textResult("watches are not supported on this deployment.", true);
+    }
+    const watchId = requireString(args, "watchId");
+    const removed = this.deps.cancelWatch(caller, watchId);
+    return removed
+      ? textResult(`Watch ${watchId} cancelled — the bridge stopped checking.`)
+      : textResult(`No pending watch ${watchId} found in this thread (already fired, cancelled, or not yours).`, true);
+  }
+
+  /** List pending watches owned by the calling thread (#60, D7). */
+  private toolWatchList(caller: SessionRecord): McpToolResult {
+    if (!this.deps.listWatches) {
+      return textResult("watches are not supported on this deployment.", true);
+    }
+    const watches = this.deps.listWatches(caller);
+    if (watches.length === 0) {
+      return textResult("No pending watches in this thread.");
+    }
+    const lines = watches.map((w) => {
+      const fires = w.mode === "each" ? ` [${w.fireCount}/${w.maxFires} fires]` : "";
+      const reason = w.reason ? ` — ${w.reason}` : "";
+      return `• ${w.id} — ${w.kind}:${w.spec} every ${w.intervalSeconds}s (${w.mode}), expires ${w.expiresAtUtc}${fires}${reason}`;
+    });
+    return textResult(`Pending watches in this thread (${watches.length}):\n${lines.join("\n")}`);
   }
 
   /**

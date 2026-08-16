@@ -246,6 +246,9 @@ describe("chain MCP tool", () => {
       "peek",
       "schedule_wake",
       "steer",
+      "watch_cancel",
+      "watch_create",
+      "watch_list",
     ]);
     const chain = body.result.tools.find((t: { name: string }) => t.name === "chain");
     expect(chain.inputSchema.properties.workers.type).toBe("array");

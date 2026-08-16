@@ -184,6 +184,14 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setDescription("Cancel a pending wake in this thread by id")
           .setRequired(false)
       )
+      // Watches (#60, D7) are agent-authored condition triggers — surfaced +
+      // cancelled here (not in the human `/seam schedule` UI), same as wakes.
+      .addStringOption((o) =>
+        o
+          .setName("cancel-watch")
+          .setDescription("Cancel a pending watch in this thread by id")
+          .setRequired(false)
+      )
   );
 
   cmd.addSubcommand((sub) =>

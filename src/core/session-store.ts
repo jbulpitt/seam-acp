@@ -23,6 +23,7 @@ import {
 } from "./types.js";
 import type { ScheduledPrompt } from "./scheduled-prompts/types.js";
 import type { WakeEvent } from "./wake/types.js";
+import type { WatchEvent } from "./watch/types.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -244,6 +245,7 @@ export class SessionStore {
     this.db.exec(ACTIVE_PROJECTS_SCHEMA);
     this.db.exec(CHAINS_SCHEMA);
     this.db.exec(WAKE_EVENTS_SCHEMA);
+    this.db.exec(WATCHES_SCHEMA);
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -1031,6 +1033,117 @@ export class SessionStore {
   deleteWake(id: string): void {
     this.db.prepare("DELETE FROM wake_events WHERE id = ?").run(id);
   }
+
+  // --- agent-defined watches (#60) ------------------------------------------
+
+  /** Insert (or replace) a watch row. ON CONFLICT keeps the id idempotent. */
+  upsertWatch(w: WatchEvent): void {
+    this.db
+      .prepare(
+        `INSERT INTO watches
+           (id, platform, channel_ref, parent_ref, kind, spec, match_expr,
+            interval_seconds, prompt, reason, mode, max_fires, fire_count,
+            last_checked_utc, last_fired_utc, last_observed, expires_at_utc,
+            created_by, correlation_id, created_utc)
+         VALUES
+           (@id, @platform, @channelRef, @parentRef, @kind, @spec, @match,
+            @intervalSeconds, @prompt, @reason, @mode, @maxFires, @fireCount,
+            @lastCheckedUtc, @lastFiredUtc, @lastObserved, @expiresAtUtc,
+            @createdBy, @correlationId, @createdUtc)
+         ON CONFLICT(id) DO UPDATE SET
+           spec             = excluded.spec,
+           match_expr       = excluded.match_expr,
+           interval_seconds = excluded.interval_seconds,
+           prompt           = excluded.prompt,
+           reason           = excluded.reason,
+           mode             = excluded.mode,
+           max_fires        = excluded.max_fires,
+           fire_count       = excluded.fire_count,
+           last_checked_utc = excluded.last_checked_utc,
+           last_fired_utc   = excluded.last_fired_utc,
+           last_observed    = excluded.last_observed,
+           expires_at_utc   = excluded.expires_at_utc`
+      )
+      .run({
+        id: w.id,
+        platform: w.platform,
+        channelRef: w.channelRef,
+        parentRef: w.parentRef,
+        kind: w.kind,
+        spec: w.spec,
+        match: w.match,
+        intervalSeconds: w.intervalSeconds,
+        prompt: w.prompt,
+        reason: w.reason,
+        mode: w.mode,
+        maxFires: w.maxFires,
+        fireCount: w.fireCount,
+        lastCheckedUtc: w.lastCheckedUtc,
+        lastFiredUtc: w.lastFiredUtc,
+        lastObserved: w.lastObserved,
+        expiresAtUtc: w.expiresAtUtc,
+        createdBy: w.createdBy,
+        correlationId: w.correlationId,
+        createdUtc: w.createdUtc,
+      });
+  }
+
+  getWatch(id: string): WatchEvent | null {
+    const row = this.db
+      .prepare<[string], WatchRow>("SELECT * FROM watches WHERE id = ?")
+      .get(id);
+    return row ? mapWatch(row) : null;
+  }
+
+  /** Every live watch, oldest first — the WatchManager sweeper's work list. */
+  listAllWatches(): WatchEvent[] {
+    return this.db
+      .prepare<[], WatchRow>("SELECT * FROM watches ORDER BY rowid ASC")
+      .all()
+      .map(mapWatch);
+  }
+
+  /** Pending watches for one thread, newest first — the D7 visibility surface. */
+  listWatchesByChannel(platform: string, channelRef: string): WatchEvent[] {
+    return this.db
+      .prepare<[string, string], WatchRow>(
+        "SELECT * FROM watches WHERE platform = ? AND channel_ref = ? ORDER BY created_utc DESC, rowid DESC"
+      )
+      .all(platform, channelRef)
+      .map(mapWatch);
+  }
+
+  /** How many watches are currently pending for a thread — the per-thread cap
+   *  (D5) reads this before arming a new one. */
+  countWatchesByChannel(platform: string, channelRef: string): number {
+    const row = this.db
+      .prepare<[string, string], { n: number }>(
+        "SELECT COUNT(*) AS n FROM watches WHERE platform = ? AND channel_ref = ?"
+      )
+      .get(platform, channelRef);
+    return row?.n ?? 0;
+  }
+
+  /** Record an evaluation: set the last-checked time and the new change-detection
+   *  snapshot (both without touching fire bookkeeping). */
+  markWatchChecked(id: string, checkedUtc: string, observed: string | null): void {
+    this.db
+      .prepare("UPDATE watches SET last_checked_utc = ?, last_observed = ? WHERE id = ?")
+      .run(checkedUtc, observed, id);
+  }
+
+  /** A non-terminal `each` fire: bump the counter and stamp the fire time. */
+  incrementWatchFire(id: string, firedUtc: string): void {
+    this.db
+      .prepare(
+        "UPDATE watches SET fire_count = fire_count + 1, last_fired_utc = ? WHERE id = ?"
+      )
+      .run(firedUtc, id);
+  }
+
+  deleteWatch(id: string): void {
+    this.db.prepare("DELETE FROM watches WHERE id = ?").run(id);
+  }
 }
 
 // --- active projects schema + row mapping (#22) -----------------------------
@@ -1241,6 +1354,80 @@ const mapWake = (r: WakeRow): WakeEvent => ({
   correlationId: r.correlation_id,
   chainDepth: r.chain_depth,
   catchupSeconds: r.catchup_seconds,
+  createdUtc: r.created_utc,
+});
+
+// --- watches schema + row mapping (#60) -------------------------------------
+
+const WATCHES_SCHEMA = `
+CREATE TABLE IF NOT EXISTS watches (
+  id               TEXT PRIMARY KEY,
+  platform         TEXT NOT NULL,
+  channel_ref      TEXT NOT NULL,
+  parent_ref       TEXT,
+  kind             TEXT NOT NULL,
+  spec             TEXT NOT NULL,
+  match_expr       TEXT,
+  interval_seconds INTEGER NOT NULL,
+  prompt           TEXT NOT NULL,
+  reason           TEXT NOT NULL,
+  mode             TEXT NOT NULL DEFAULT 'once',
+  max_fires        INTEGER NOT NULL DEFAULT 1,
+  fire_count       INTEGER NOT NULL DEFAULT 0,
+  last_checked_utc TEXT,
+  last_fired_utc   TEXT,
+  last_observed    TEXT,
+  expires_at_utc   TEXT NOT NULL,
+  created_by       TEXT NOT NULL,
+  correlation_id   TEXT,
+  created_utc      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_watch_channel ON watches(platform, channel_ref);
+`;
+
+interface WatchRow {
+  id: string;
+  platform: string;
+  channel_ref: string;
+  parent_ref: string | null;
+  kind: string;
+  spec: string;
+  match_expr: string | null;
+  interval_seconds: number;
+  prompt: string;
+  reason: string;
+  mode: string;
+  max_fires: number;
+  fire_count: number;
+  last_checked_utc: string | null;
+  last_fired_utc: string | null;
+  last_observed: string | null;
+  expires_at_utc: string;
+  created_by: string;
+  correlation_id: string | null;
+  created_utc: string;
+}
+
+const mapWatch = (r: WatchRow): WatchEvent => ({
+  id: r.id,
+  platform: r.platform,
+  channelRef: r.channel_ref,
+  parentRef: r.parent_ref,
+  kind: r.kind as WatchEvent["kind"],
+  spec: r.spec,
+  match: r.match_expr,
+  intervalSeconds: r.interval_seconds,
+  prompt: r.prompt,
+  reason: r.reason,
+  mode: r.mode as WatchEvent["mode"],
+  maxFires: r.max_fires,
+  fireCount: r.fire_count,
+  lastCheckedUtc: r.last_checked_utc,
+  lastFiredUtc: r.last_fired_utc,
+  lastObserved: r.last_observed,
+  expiresAtUtc: r.expires_at_utc,
+  createdBy: r.created_by,
+  correlationId: r.correlation_id,
   createdUtc: r.created_utc,
 });
 

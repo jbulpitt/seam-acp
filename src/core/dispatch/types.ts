@@ -38,7 +38,8 @@ export interface DispatchSpec {
    *  captured output back into this thread (report-back). */
   returnTo?: string;
   /** Ledger classification; defaults to "handoff". The report-back
-   *  re-injection sets "report_back"; a fired wake (#59) sets "wake". */
+   *  re-injection sets "report_back"; a fired wake (#59) sets "wake"; a fired
+   *  watch (#60) sets "watch". */
   kind?: DelegationKind;
   /** Wake self-renewal depth (#59). Set only on wake-kind specs so the turn
    *  knows its chain depth while it runs — a wake armed *during* this turn
@@ -85,7 +86,7 @@ export const DispatchSpecSchema = z.object({
   preset: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
-  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "peek"]).optional(),
+  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek"]).optional(),
   wakeChainDepth: z.number().int().min(0).optional(),
   chainId: z.string().min(1).optional(),
   createdUtc: z.string().optional(),

@@ -78,6 +78,8 @@ interface Harness {
   enqueued: DispatchSpec[];
   scheduledWakes: Array<{ record: SessionRecord; req: { delaySeconds: number; reason: string; prompt: string } }>;
   cancelledWakes: string[];
+  createdWatches: Array<{ record: SessionRecord; req: any }>;
+  cancelledWatches: string[];
   call: (
     method: string,
     params?: unknown,
@@ -90,12 +92,17 @@ async function makeHarness(opts?: {
   peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
   scheduleWake?: SeamMcpServerDeps["scheduleWake"];
   cancelWake?: SeamMcpServerDeps["cancelWake"];
+  createWatch?: SeamMcpServerDeps["createWatch"];
+  cancelWatch?: SeamMcpServerDeps["cancelWatch"];
+  listWatches?: SeamMcpServerDeps["listWatches"];
   isChannelLocked?: (record: SessionRecord) => boolean;
   proposeConfig?: (record: SessionRecord, input: unknown) => Promise<any>;
 }): Promise<Harness> {
   const enqueued: DispatchSpec[] = [];
   const scheduledWakes: Harness["scheduledWakes"] = [];
   const cancelledWakes: string[] = [];
+  const createdWatches: Harness["createdWatches"] = [];
+  const cancelledWatches: string[] = [];
   const server = new SeamMcpServer({
     logger: silent,
     resolveSession:
@@ -116,6 +123,38 @@ async function makeHarness(opts?: {
         cancelledWakes.push(id);
         return true;
       }),
+    createWatch:
+      opts?.createWatch ??
+      ((record, req) => {
+        createdWatches.push({ record, req });
+        return {
+          ok: true as const,
+          watchId: "watch-1",
+          expiresAtUtc: "2026-08-16T01:00:00.000Z",
+          intervalSeconds: (req.intervalSeconds as number) ?? 30,
+        };
+      }),
+    cancelWatch:
+      opts?.cancelWatch ??
+      ((_record, id) => {
+        cancelledWatches.push(id);
+        return true;
+      }),
+    listWatches:
+      opts?.listWatches ??
+      (() => [
+        {
+          id: "watch-1",
+          kind: "http",
+          spec: "https://ci/status",
+          intervalSeconds: 60,
+          mode: "once",
+          fireCount: 0,
+          maxFires: 1,
+          expiresAtUtc: "2026-08-16T01:00:00.000Z",
+          reason: "wait for CI",
+        },
+      ]),
     ...(opts?.peekThread ? { peekThread: opts.peekThread } : {}),
     ...(opts?.isChannelLocked ? { isChannelLocked: opts.isChannelLocked } : {}),
     ...(opts?.proposeConfig ? { proposeConfig: opts.proposeConfig } : {}),
@@ -137,7 +176,7 @@ async function makeHarness(opts?: {
     return { status: res.status, body: text ? JSON.parse(text) : undefined };
   };
 
-  return { server, enqueued, scheduledWakes, cancelledWakes, call };
+  return { server, enqueued, scheduledWakes, cancelledWakes, createdWatches, cancelledWatches, call };
 }
 
 describe("SeamMcpServer", () => {
@@ -174,6 +213,9 @@ describe("SeamMcpServer", () => {
       "peek",
       "schedule_wake",
       "steer",
+      "watch_cancel",
+      "watch_create",
+      "watch_list",
     ]);
     for (const t of body.result.tools) {
       expect(t.inputSchema.type).toBe("object");
@@ -300,6 +342,92 @@ describe("SeamMcpServer", () => {
     );
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0].text).toMatch(/No pending wake/);
+  });
+
+  it("watch_create routes to the caller's createWatch dep and returns the watch id (#60)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "watch_create",
+        arguments: {
+          kind: "http",
+          spec: "https://ci/status",
+          match: "status:200",
+          intervalSeconds: 60,
+          prompt: "CI finished — resume",
+          expiresInSeconds: 3600,
+        },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(body.result.content[0].text).toMatch(/watch-1/);
+    expect(h.createdWatches).toHaveLength(1);
+    // Self-scope: armed for the token-resolved caller, not a caller-supplied thread.
+    expect(h.createdWatches[0]!.record.channelRef).toBe("thread-caller");
+    expect(h.createdWatches[0]!.req.kind).toBe("http");
+  });
+
+  it("watch_create surfaces a guard rejection (e.g. command disabled) as an isError result (#60)", async () => {
+    h = await makeHarness({
+      createWatch: () => ({ ok: false as const, error: "command watches are disabled on this deployment" }),
+    });
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "watch_create",
+        arguments: { kind: "command", spec: "rm -rf /", intervalSeconds: 10, prompt: "x", expiresInSeconds: 60 },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toMatch(/disabled/);
+  });
+
+  it("watch_create requires kind/spec/prompt/interval/expiry (missing → tool error)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "watch_create", arguments: { kind: "file" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(h.createdWatches).toHaveLength(0);
+  });
+
+  it("watch_cancel routes to the caller's cancelWatch dep (#60)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "watch_cancel", arguments: { watchId: "watch-xyz" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(h.cancelledWatches).toEqual(["watch-xyz"]);
+  });
+
+  it("watch_cancel reports when nothing was removed (#60)", async () => {
+    h = await makeHarness({ cancelWatch: () => false });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "watch_cancel", arguments: { watchId: "gone" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toMatch(/No pending watch/);
+  });
+
+  it("watch_list renders the caller's pending watches (#60)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "watch_list", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(body.result.content[0].text).toMatch(/watch-1/);
+    expect(body.result.content[0].text).toMatch(/https:\/\/ci\/status/);
   });
 
   it("tools/call with a MISSING token returns a JSON-RPC error and enqueues nothing", async () => {

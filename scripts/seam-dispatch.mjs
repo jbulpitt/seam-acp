@@ -22,6 +22,7 @@
  *   --model <id>            Isolated runs only — a live turn uses the thread's model
  *   --effort <level>        Isolated runs only
  *   --cwd <path>            Working directory for the turn
+ *   --preset <name>         Run as a stateless preset worker (forces isolated; uses the preset's identity/config)
  *   --correlation <id>      Opaque id echoed into the result file
  *   --return-to <id>        On completion, auto-dispatch the captured output back into this thread
  *   --wait                  Poll for the result and print it
@@ -42,6 +43,7 @@ const FLAGS_WITH_VALUES = new Set([
   "model",
   "effort",
   "cwd",
+  "preset",
   "correlation",
   "return-to",
   "timeout",
@@ -122,6 +124,7 @@ async function main() {
     ...(args.model ? { model: args.model } : {}),
     ...(args.effort ? { effort: args.effort } : {}),
     ...(args.cwd ? { cwd: path.resolve(args.cwd) } : {}),
+    ...(args.preset ? { preset: args.preset } : {}),
     ...(args.correlation ? { correlationId: args.correlation } : {}),
     ...(args["return-to"] ? { returnTo: args["return-to"] } : {}),
     createdUtc: new Date().toISOString(),

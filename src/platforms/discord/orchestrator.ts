@@ -2216,6 +2216,20 @@ export class Orchestrator {
       cwd: spec.cwd ?? this.config.REPOS_ROOT,
     });
 
+    // Preset worker (#23): dispatch to a reusable stateless identity instead of
+    // the target thread's own session. Resolve the preset, force an isolated run
+    // under its agent/model/effort/cwd, and prepend its instructions as cold-start
+    // identity. `target` remains where output is posted for visibility.
+    const preset = spec.preset ? this.store.getPresetByName(spec.preset) : null;
+    if (spec.preset && !preset) {
+      throw new Error(`dispatch: unknown preset "${spec.preset}"`);
+    }
+    const presetProfile = preset?.agentId ? this.router.getProfile(preset.agentId) : undefined;
+    const effectiveSession = preset ? "isolated" : spec.session;
+    const effectivePrompt = preset?.instructions
+      ? `<seam-worker-identity name="${preset.name}">\n${preset.instructions}\n</seam-worker-identity>\n\n${spec.prompt}`
+      : spec.prompt;
+
     // Ledger: record the dispatch as a handoff (operator-originated, so no
     // source thread). Best-effort — a ledger write must never break a dispatch.
     try {
@@ -2224,6 +2238,7 @@ export class Orchestrator {
         kind: spec.kind ?? "handoff",
         sourceRef: null,
         targetRef: spec.target,
+        worker: preset?.name ?? null,
         promptPreview: spec.prompt,
         correlationId: spec.correlationId ?? null,
         status: "dispatched",
@@ -2232,7 +2247,7 @@ export class Orchestrator {
       this.logger.warn({ err, dispatch: spec.id }, "dispatch: ledger record failed");
     }
 
-    if (spec.session === "live" && (spec.model || spec.effort)) {
+    if (!preset && spec.session === "live" && (spec.model || spec.effort)) {
       // injectTurn's live path reuses the thread's persistent runtime, which was
       // started from the session's own config — it has no per-turn model/effort
       // knob. Say so rather than silently running on the wrong model.
@@ -2244,11 +2259,12 @@ export class Orchestrator {
 
     const run = async (): Promise<{ output: string; stopReason: string }> => {
       try { this.store.updateDelegationStatus(spec.id, "running"); } catch { /* best-effort */ }
-      const result = await this.injectTurn(record, spec.prompt, {
-        session: spec.session,
-        ...(spec.model ? { model: spec.model } : {}),
-        ...(spec.effort ? { effort: spec.effort } : {}),
-        ...(spec.cwd ? { cwd: spec.cwd } : {}),
+      const result = await this.injectTurn(record, effectivePrompt, {
+        session: effectiveSession,
+        ...(preset?.model ? { model: preset.model } : spec.model ? { model: spec.model } : {}),
+        ...(preset?.effort ? { effort: preset.effort } : spec.effort ? { effort: spec.effort } : {}),
+        ...(preset?.repoPath ? { cwd: preset.repoPath } : spec.cwd ? { cwd: spec.cwd } : {}),
+        ...(presetProfile ? { profile: presetProfile } : {}),
         outputTo: target,
         ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
         timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
@@ -2273,7 +2289,7 @@ export class Orchestrator {
       return { output: result.text, stopReason: result.stopReason ?? "" };
     };
 
-    if (spec.session === "live") {
+    if (effectiveSession === "live") {
       // Share the thread's persistent session ⇒ must not overlap a user turn.
       return this.queueOnChannel(spec.target, run);
     }

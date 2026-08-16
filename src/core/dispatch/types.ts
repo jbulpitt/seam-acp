@@ -28,6 +28,10 @@ export interface DispatchSpec {
   model?: string;
   effort?: string;
   cwd?: string;
+  /** Dispatch to a reusable stateless preset worker by name instead of the
+   *  target thread's own session — forces an isolated run under the preset's
+   *  agent/model/effort/cwd + instructions (cold-start identity). #23. */
+  preset?: string;
   correlationId?: string;
   /** When set, after this turn completes the runtime auto-dispatches the
    *  captured output back into this thread (report-back). */
@@ -67,6 +71,7 @@ export const DispatchSpecSchema = z.object({
   model: z.string().min(1).optional(),
   effort: z.string().min(1).optional(),
   cwd: z.string().min(1).optional(),
+  preset: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
   kind: z.enum(["handoff", "forward", "report_back", "scheduled", "peek"]).optional(),
@@ -99,6 +104,7 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.model ? { model: d.model } : {}),
     ...(d.effort ? { effort: d.effort } : {}),
     ...(d.cwd ? { cwd: d.cwd } : {}),
+    ...(d.preset ? { preset: d.preset } : {}),
     ...(d.correlationId ? { correlationId: d.correlationId } : {}),
     ...(d.returnTo ? { returnTo: d.returnTo } : {}),
     ...(d.kind ? { kind: d.kind } : {}),

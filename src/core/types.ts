@@ -257,6 +257,48 @@ export type LedgerPatch = Partial<
   >
 >;
 
+// --- durable multi-hop chains (#25) ----------------------------------------
+
+/** Lifecycle of a chain. Terminal states: completed | failed. */
+export type ChainStatus = "running" | "completed" | "failed";
+
+/**
+ * One durable multi-hop chain: t1 → t2 → … → origin, where each hop's OUTPUT
+ * becomes the next hop's INPUT. The runtime (not the agents) drives each hop,
+ * and this row is the single source of truth so a restart mid-chain resumes.
+ */
+export interface Chain {
+  id: string;
+  /** Workers still to dispatch, in order — each a thread id or preset name.
+   *  The hop currently in flight has already been popped off the front. */
+  hops: string[];
+  /** Final delivery thread — where the last hop's output is reported back. */
+  originRef: string;
+  /** First `PROMPT_PREVIEW_MAX` chars of the chain's initiating prompt. */
+  promptPreview: string | null;
+  status: ChainStatus;
+  /** Count of hops dispatched so far (bumped on each `advanceChain`). */
+  currentIndex: number;
+  createdUtc: string;
+  updatedUtc: string;
+}
+
+/**
+ * Caller-supplied shape for `createChain`. Only `id`, `hops` and `originRef`
+ * are required; `status` defaults to "running", `currentIndex` to 0, and the
+ * timestamps to now.
+ */
+export interface ChainCreateInput {
+  id: string;
+  hops: string[];
+  originRef: string;
+  promptPreview?: string | null;
+  status?: ChainStatus;
+  currentIndex?: number;
+  createdUtc?: string;
+  updatedUtc?: string;
+}
+
 /** Result of one agent turn (reply round-trip). */
 export interface TurnOutcome {
   success: boolean;

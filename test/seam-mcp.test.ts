@@ -137,11 +137,11 @@ describe("SeamMcpServer", () => {
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
 
-  it("tools/list advertises handoff, forward, peek", async () => {
+  it("tools/list advertises handoff, forward, peek, chain", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
-    expect(names).toEqual(["forward", "handoff", "peek"]);
+    expect(names).toEqual(["chain", "forward", "handoff", "peek"]);
     for (const t of body.result.tools) {
       expect(t.inputSchema.type).toBe("object");
     }

@@ -40,6 +40,11 @@ export interface DispatchSpec {
   /** Ledger classification; defaults to "handoff". The report-back
    *  re-injection sets "report_back". */
   kind?: DelegationKind;
+  /** Durable multi-hop chain id (#25). When set, on completion the runtime
+   *  advances the chain (pipe this hop's output into the next hop, or deliver
+   *  the final output to the chain's origin) instead of the normal `returnTo`
+   *  report-back. */
+  chainId?: string;
   createdUtc: string;
 }
 
@@ -76,6 +81,7 @@ export const DispatchSpecSchema = z.object({
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
   kind: z.enum(["handoff", "forward", "report_back", "scheduled", "peek"]).optional(),
+  chainId: z.string().min(1).optional(),
   createdUtc: z.string().optional(),
 });
 
@@ -109,7 +115,49 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.correlationId ? { correlationId: d.correlationId } : {}),
     ...(d.returnTo ? { returnTo: d.returnTo } : {}),
     ...(d.kind ? { kind: d.kind } : {}),
+    ...(d.chainId ? { chainId: d.chainId } : {}),
     createdUtc: d.createdUtc ?? new Date().toISOString(),
+  };
+}
+
+/** A Discord snowflake is a long run of digits; a preset is a human name. Used
+ *  to decide whether a chain hop names a thread (stateful, run live in it) or a
+ *  preset (stateless specialist, run isolated with output posted to `originRef`
+ *  for visibility). Mirrors the seam-MCP handoff heuristic. */
+export function hopLooksLikeThreadId(hop: string): boolean {
+  return /^\d{15,}$/.test(hop.trim());
+}
+
+/**
+ * Build the dispatch spec for one chain hop — shared by the `chain` MCP tool
+ * (hop 1) and the orchestrator's chain-advance (hops 2…N). The hop carries the
+ * `chainId` (so its completion advances the chain) and `kind: "forward"` (this
+ * hop's output is piped onward as the next hop's input). It deliberately sets no
+ * `returnTo`: the chain, not a report-back, drives delivery.
+ */
+export function buildChainHopSpec(params: {
+  id: string;
+  chainId: string;
+  /** thread id or preset name. */
+  worker: string;
+  /** This hop's input — the prior hop's output, or the chain's initial prompt. */
+  prompt: string;
+  /** Where a preset hop's output is posted for visibility. */
+  originRef: string;
+  correlationId?: string;
+  createdUtc?: string;
+}): DispatchSpec {
+  const toThread = hopLooksLikeThreadId(params.worker);
+  return {
+    id: params.id,
+    target: toThread ? params.worker : params.originRef,
+    prompt: params.prompt,
+    session: toThread ? "live" : "isolated",
+    ...(toThread ? {} : { preset: params.worker }),
+    chainId: params.chainId,
+    kind: "forward",
+    correlationId: params.correlationId ?? params.chainId,
+    createdUtc: params.createdUtc ?? new Date().toISOString(),
   };
 }
 

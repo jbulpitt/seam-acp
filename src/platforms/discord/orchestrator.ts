@@ -91,7 +91,12 @@ import {
   type InjectTurnOptions,
   type InjectTurnResult,
 } from "../../core/inject-turn.js";
-import { dispatchDirs, type DispatchSpec } from "../../core/dispatch/types.js";
+import {
+  buildChainHopSpec,
+  dispatchDirs,
+  enqueueDispatchSpec,
+  type DispatchSpec,
+} from "../../core/dispatch/types.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { ATTACH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
@@ -2277,10 +2282,18 @@ export class Orchestrator {
       await this.postDispatchOutput(target, spec, result.text, result.error);
       const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
       try { this.store.updateDelegationStatus(spec.id, ledgerStatus); } catch { /* best-effort */ }
-      // Report-back: if the caller set returnTo, deliver the result back by
-      // enqueuing a fresh dispatch into that thread (correlation-linked). The
-      // runtime owns this — the worker never had to "remember" to report.
-      if (spec.returnTo) {
+      // Chain advance (#25): a hop carrying a chainId drives the chain forward
+      // instead of a normal report-back — enqueue the next hop, or deliver the
+      // final output to the chain's origin. The chain row is the source of
+      // truth, so this survives a restart mid-chain.
+      if (spec.chainId) {
+        await this.advanceChain(spec, result.text, result.error).catch((err) =>
+          this.logger.warn({ err, dispatch: spec.id, chainId: spec.chainId }, "dispatch: chain advance failed")
+        );
+      } else if (spec.returnTo) {
+        // Report-back: if the caller set returnTo, deliver the result back by
+        // enqueuing a fresh dispatch into that thread (correlation-linked). The
+        // runtime owns this — the worker never had to "remember" to report.
         await this.enqueueReportBack(spec, result.text, result.error).catch((err) =>
           this.logger.warn({ err, dispatch: spec.id }, "dispatch: report-back enqueue failed")
         );
@@ -2342,6 +2355,100 @@ export class Orchestrator {
     await fsp.writeFile(tmp, JSON.stringify(reportSpec, null, 2), "utf8");
     await fsp.rename(tmp, final);
     this.logger.info({ reportBack: id, returnTo, correlation }, "dispatch: report-back enqueued");
+  }
+
+  /**
+   * Chain advance (#25): a dispatch carrying a `chainId` has completed. The
+   * chain row is the durable source of truth — read it and drive the chain one
+   * step forward:
+   *  - on a hop error, mark the chain failed and tell the origin;
+   *  - if hops remain, pipe THIS hop's output into the next hop as its input
+   *    (fresh dispatch, same chainId, kind="forward");
+   *  - if none remain, deliver the final output to the chain's `originRef`
+   *    (a normal report-back) and `completeChain`.
+   * Advancing happens only here, at a hop's completion, so a restart mid-hop
+   * re-runs that hop and re-reads this state — advancing exactly once.
+   */
+  private async advanceChain(spec: DispatchSpec, output: string, error?: string): Promise<void> {
+    const chainId = spec.chainId;
+    if (!chainId) return;
+    const chain = this.store.getChain(chainId);
+    if (!chain) {
+      this.logger.warn({ chainId, dispatch: spec.id }, "chain: advance for unknown chain");
+      return;
+    }
+    if (chain.status !== "running") {
+      this.logger.info({ chainId, status: chain.status }, "chain: advance on non-running chain — ignored");
+      return;
+    }
+
+    if (error) {
+      this.store.completeChain(chainId, "failed");
+      await this.enqueueChainDelivery(
+        chain.originRef,
+        chainId,
+        `The chain broke at a hop: ${error}\n\n--- partial output ---\n${output}`
+      );
+      this.logger.warn({ chainId, dispatch: spec.id, error }, "chain: hop failed; chain marked failed");
+      return;
+    }
+
+    const advanced = this.store.advanceChain(chainId);
+    if (!advanced) {
+      this.logger.warn({ chainId }, "chain: advance no-op (missing or not running)");
+      return;
+    }
+    const { nextHop } = advanced;
+    if (nextHop) {
+      // Pipe this hop's output into the next hop as its input.
+      const next = buildChainHopSpec({
+        id: randomUUID(),
+        chainId,
+        worker: nextHop,
+        prompt: output,
+        originRef: chain.originRef,
+      });
+      await enqueueDispatchSpec(this.config.DATA_DIR, next);
+      this.logger.info(
+        { chainId, dispatch: next.id, worker: nextHop, index: advanced.chain.currentIndex },
+        "chain: advanced to next hop"
+      );
+    } else {
+      // No hops remain — deliver the final output to the origin and complete.
+      await this.enqueueChainDelivery(chain.originRef, chainId, output);
+      this.store.completeChain(chainId);
+      this.logger.info({ chainId, originRef: chain.originRef }, "chain: completed; final output delivered");
+    }
+  }
+
+  /** Deliver a chain's terminal output into its origin thread as a fresh live
+   *  dispatch (correlation-linked to the chain). Deliberately carries NO
+   *  `chainId`, so this delivery does not itself try to advance a chain.
+   *  Written atomically via `enqueueDispatchSpec`. */
+  private async enqueueChainDelivery(
+    originRef: string,
+    chainId: string,
+    body: string
+  ): Promise<void> {
+    const id = randomUUID();
+    const wrapped = [
+      `<seam-chain-result chain="${chainId}">`,
+      body,
+      `</seam-chain-result>`,
+      ``,
+      `The multi-hop chain ${chainId} has finished — its final output is above.`,
+    ].join("\n");
+    const spec: DispatchSpec = {
+      id,
+      target: originRef,
+      prompt: wrapped,
+      session: "live",
+      correlationId: chainId,
+      kind: "report_back",
+      createdUtc: new Date().toISOString(),
+    };
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    this.logger.info({ chainId, originRef, delivery: id }, "chain: origin delivery enqueued");
   }
 
   /** Post a dispatch's captured output to the target thread — cards, or a file

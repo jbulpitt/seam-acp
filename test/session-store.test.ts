@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import {
   makeSessionId,
 } from "../src/core/session-store.js";
 import type { Preset, SessionRecord } from "../src/core/types.js";
+import type { ScheduledPrompt } from "../src/core/scheduled-prompts/types.js";
 
 let dir: string;
 let store: SessionStore;
@@ -243,5 +245,84 @@ describe("SessionStore project-scoped presets (#21)", () => {
     store.upsertPreset(preset({ id: "a", name: "build", projectRef: "projA" }));
     store.upsertPreset(preset({ id: "g", name: "build", projectRef: null }));
     expect(store.getPresetByName("build")?.id).toBe("g");
+  });
+});
+
+describe("SessionStore — scheduled prompts (sessionMode)", () => {
+  const schedule = (over: Partial<ScheduledPrompt> = {}): ScheduledPrompt => ({
+    id: "sch_1",
+    platform: "discord",
+    channelRef: "thread-1",
+    parentRef: "channel-1",
+    name: "nightly",
+    promptText: "run the tests",
+    cron: "0 9 * * *",
+    timezone: "America/Chicago",
+    model: null,
+    cwd: null,
+    targetChannel: null,
+    outputType: "card",
+    sessionMode: "isolated",
+    catchupSeconds: 900,
+    enabled: true,
+    attachments: [],
+    createdBy: "user-1",
+    createdUtc: new Date().toISOString(),
+    updatedUtc: new Date().toISOString(),
+    lastRunUtc: null,
+    lastStatus: null,
+    nextRunUtc: null,
+    pinnedSessionId: null,
+    ...over,
+  });
+
+  it("round-trips both session modes on insert", () => {
+    const iso = schedule({ id: "iso" });
+    const live = schedule({ id: "live", sessionMode: "live" });
+    store.upsertScheduled(iso);
+    store.upsertScheduled(live);
+    expect(store.getScheduled("iso")).toEqual(iso);
+    expect(store.getScheduled("live")).toEqual(live);
+  });
+
+  it("persists session_mode through the ON CONFLICT update path", () => {
+    const s = schedule({ id: "flip", sessionMode: "isolated" });
+    store.upsertScheduled(s);
+    expect(store.getScheduled("flip")?.sessionMode).toBe("isolated");
+    // Same id → hits ON CONFLICT DO UPDATE. If session_mode were omitted from the
+    // SET clause this edit would silently keep the old value.
+    store.upsertScheduled({ ...s, sessionMode: "live", updatedUtc: new Date(Date.now() + 1000).toISOString() });
+    expect(store.getScheduled("flip")?.sessionMode).toBe("live");
+    // …and back again.
+    store.upsertScheduled({ ...s, sessionMode: "isolated", updatedUtc: new Date(Date.now() + 2000).toISOString() });
+    expect(store.getScheduled("flip")?.sessionMode).toBe("isolated");
+  });
+
+  it("mapScheduled narrows unknown/legacy session_mode to isolated", () => {
+    store.upsertScheduled(schedule({ id: "narrow", sessionMode: "live" }));
+    // Poke raw values a live process could never write (garbage / legacy NULL from
+    // a pre-migration row) via a second connection, then confirm the read narrows.
+    const raw = new Database(path.join(dir, "test.db"));
+    const set = (v: string | null) =>
+      raw.prepare("UPDATE scheduled_prompts SET session_mode = ? WHERE id = 'narrow'").run(v);
+
+    set("garbage");
+    expect(store.getScheduled("narrow")?.sessionMode).toBe("isolated");
+    // Sanity: the one legitimate non-default value still survives the round trip.
+    set("live");
+    expect(store.getScheduled("narrow")?.sessionMode).toBe("live");
+    raw.close();
+  });
+
+  it("defaults an existing row with no session_mode column to isolated", () => {
+    // Simulate a pre-migration DB: drop the column the schema/migration adds, then
+    // reopen through SessionStore (which re-runs the defensive column-add) and read.
+    store.upsertScheduled(schedule({ id: "legacy", sessionMode: "live" }));
+    store.close();
+    const raw = new Database(path.join(dir, "test.db"));
+    raw.exec("ALTER TABLE scheduled_prompts DROP COLUMN session_mode");
+    raw.close();
+    store = new SessionStore(path.join(dir, "test.db"));
+    expect(store.getScheduled("legacy")?.sessionMode).toBe("isolated");
   });
 });

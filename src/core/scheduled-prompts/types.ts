@@ -31,8 +31,18 @@ export interface ScheduledPrompt {
   /** Channel/thread id to post output to. null = the schedule's own thread. */
   targetChannel: string | null;
   /** How to render the result. "card" = blue embed card(s); "messages" = plain
-   *  chunked text messages. The "running" announcement is always a card. */
+   *  chunked text messages. The "running" announcement is always a card.
+   *  Ignored when sessionMode === "live" (output streams into the thread). */
   outputType: "card" | "messages";
+  /** Execution mode.
+   *  "isolated" (default): each fire runs in a throwaway ACP session and posts
+   *  captured output back as cards/messages.
+   *  "live": the fire runs as a real turn inside the bound thread — sharing the
+   *  thread's persistent session, streaming like a user message, and permanently
+   *  accumulating in that session's context. In "live" mode `model`, `cwd`,
+   *  `targetChannel`, and `outputType` are meaningless and ignored at fire time
+   *  (D1); the thread's own runtime config governs the turn. */
+  sessionMode: "isolated" | "live";
   /** Missed-fire catch-up window in seconds. 0 = never catch up. Default 900. */
   catchupSeconds: number;
   enabled: boolean;
@@ -45,6 +55,8 @@ export interface ScheduledPrompt {
   /** "ok" | "skipped: locked" | "error: …" | null (never run). */
   lastStatus: string | null;
   nextRunUtc: string | null;
-  /** Reserved for a future "pin to session" mode; null in v1. */
+  /** Reserved and unused. Live mode (sessionMode === "live") binds via
+   *  `channelRef` (the durable thread id), not a raw ACP session id, so this
+   *  stays null (D8). */
   pinnedSessionId: string | null;
 }

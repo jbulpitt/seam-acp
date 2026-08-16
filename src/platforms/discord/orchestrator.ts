@@ -85,6 +85,9 @@ const SCHEDULE_PRESETS: Array<{ label: string; value: string }> = [
 import type { SessionStore } from "../../core/session-store.js";
 import { makeSessionId } from "../../core/session-store.js";
 import { SessionRouter } from "../../core/session-router.js";
+import { ConfigMutationService, type ConfigMutationInput } from "../../core/config-mutation.js";
+import { reloadChannelPresets } from "../../core/config-reload.js";
+import type { ConfigProposeOutcome } from "../../core/mcp/seam-mcp-server.js";
 import {
   isSessionRecord,
   type InjectTarget,
@@ -149,6 +152,9 @@ export class Orchestrator {
   private readonly router: SessionRouter;
   private readonly store: SessionStore;
   private readonly renderer: Renderer;
+  /** Conversational config mutation engine (#58 P2/P3). Platform-agnostic; the
+   *  orchestrator adds the Discord confirm card + apply/restart wiring. */
+  private readonly configMutation: ConfigMutationService;
 
   private activeTurns = 0;
   private restartPending = false;
@@ -176,6 +182,102 @@ export class Orchestrator {
     this.router = opts.router;
     this.store = opts.store;
     this.renderer = opts.renderer;
+
+    // #58 P2/P3: the mutation engine reuses the router's precedence resolver
+    // (describeConfig) and profiles, and hot-reloads the LIVE preset maps
+    // (config.channelPresets / config.threadPresets — the same references
+    // SessionRouter holds) after a validated Tier-C write, so a channel-preset
+    // change takes effect on the next turn with no redeploy (P0).
+    this.configMutation = new ConfigMutationService({
+      store: this.store,
+      describeConfig: (record) => this.router.describeConfig(record),
+      profiles: new Map(this.router.listProfiles().map((p) => [p.id, p])),
+      defaultModel: this.config.DEFAULT_MODEL,
+      presetsFile: this.config.CHANNEL_PRESETS_FILE,
+      tierCEnabled: this.config.SEAM_CONFIG_MUTATION_TIER_C_ENABLED,
+      reloadPresets: () =>
+        reloadChannelPresets(
+          {
+            channelPresets: this.config.channelPresets,
+            threadPresets: this.config.threadPresets,
+          },
+          this.config.CHANNEL_PRESETS_FILE,
+          this.logger
+        ),
+      logger: this.logger,
+    });
+  }
+
+  /**
+   * Propose a config mutation for the calling thread (#58 P2/P3), invoked by the
+   * seam-MCP `config_propose` tool. Validates + builds the diff (side-effect
+   * free), posts a confirm CARD into the thread, and returns as soon as the card
+   * is posted — the change is applied only when a human clicks Apply (D5). The
+   * lock is enforced in the tool layer BEFORE this is called (D2); this method
+   * never bypasses it.
+   */
+  async proposeConfig(
+    record: SessionRecord,
+    input: ConfigMutationInput
+  ): Promise<ConfigProposeOutcome> {
+    const built = this.configMutation.buildProposal(record, input);
+    if (!built.ok) return { ok: false, error: built.error };
+    const proposal = built.proposal;
+
+    // Post the confirm card into the calling thread. If the adapter can't render
+    // one, refuse rather than silently apply — the human-in-the-loop gate is the
+    // prompt-injection backstop (no auto-apply).
+    if (!this.adapter.postConfirmation) {
+      return { ok: false, error: "This platform cannot render a confirmation card, so no change can be proposed." };
+    }
+    const { decision } = await this.adapter.postConfirmation(
+      { platform: PLATFORM, id: record.channelRef },
+      {
+        title: proposal.title,
+        description: proposal.restartsSession
+          ? "Applying this restarts the session so the change takes effect."
+          : undefined,
+        fields: proposal.fields,
+        warnings: proposal.warnings,
+      }
+    );
+
+    // Apply in the background on confirmation; the tool has already returned.
+    void decision.then(async (d) => {
+      if (!d.confirmed) {
+        this.logger.info({ scope: proposal.scope, tier: proposal.tier }, "config proposal rejected/expired");
+        return;
+      }
+      try {
+        const result = proposal.apply({ id: d.userId ?? null, name: d.userName ?? null });
+        // Restart the session so model/agent/cwd/effort/Tier-C changes take
+        // effect (Trap 3) — stated on the card, so this is expected, not a bug.
+        if (proposal.restartsSession) {
+          await this.router.invalidate(record.id).catch((err) =>
+            this.logger.warn({ err, session: record.id }, "invalidate after config apply failed")
+          );
+        }
+        await this.adapter
+          .sendMessage({ platform: PLATFORM, id: record.channelRef }, `✅ ${result.message}`)
+          .catch(() => {});
+      } catch (err) {
+        this.logger.error({ err, scope: proposal.scope, tier: proposal.tier }, "config apply failed");
+        await this.adapter
+          .sendMessage(
+            { platform: PLATFORM, id: record.channelRef },
+            `⚠️ Applying the config change failed: ${(err as Error).message}`
+          )
+          .catch(() => {});
+      }
+    });
+
+    return {
+      ok: true,
+      summary: proposal.title,
+      fields: proposal.fields,
+      warnings: proposal.warnings,
+      restartsSession: proposal.restartsSession,
+    };
   }
 
   install(): void {

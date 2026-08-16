@@ -29,6 +29,7 @@ import type { DispatchSpec } from "../dispatch/types.js";
 import { frameSteerPrompt } from "../steer.js";
 import { buildChainHopSpec } from "../dispatch/types.js";
 import type { ConfigDescription } from "../session-router.js";
+import type { ConfigMutationInput } from "../config-mutation.js";
 
 /** Read-only entities visible to the calling thread (schedules + presets),
  *  returned by `config_describe` alongside the effective config. Kept as a
@@ -90,6 +91,44 @@ export interface SeamMcpServerDeps {
   /** List the read-only entities (schedules / presets) visible to the calling
    *  thread. Undefined ⇒ omit the entity section from `config_describe`. */
   listConfigEntities?: (record: SessionRecord) => ConfigEntities;
+  /**
+   * Is the calling thread's channel locked? (#58 D2). The MUTATION tool refuses
+   * outright when this is true — enforced HERE, in the tool layer, so the lock
+   * is a second entry point's own gate, not something only the slash layer
+   * checks. Undefined ⇒ treated as never-locked (deployments without presets).
+   */
+  isChannelLocked?: (record: SessionRecord) => boolean;
+  /**
+   * Propose a config mutation for the calling thread (#58 P2/P3). The platform
+   * validates + computes the diff, renders a confirm CARD, and applies only on a
+   * human click (D5) — this call returns as soon as the card is posted (or with
+   * a validation refusal). Undefined ⇒ config mutation is unsupported.
+   */
+  proposeConfig?: (
+    record: SessionRecord,
+    input: ConfigMutationInput
+  ) => Promise<ConfigProposeOutcome>;
+}
+
+/** Result of asking the platform to propose a config change. */
+export interface ConfigProposeOutcome {
+  /** True ⇒ a confirmation card was posted; false ⇒ refused (see `error`). */
+  ok: boolean;
+  /** Agent-facing refusal reason when `ok` is false. */
+  error?: string;
+  /** One-line summary of the proposed change (when `ok`). */
+  summary?: string;
+  fields?: ProposedFieldView[];
+  warnings?: string[];
+  /** True when applying will restart the session (stated so it's not a surprise). */
+  restartsSession?: boolean;
+}
+
+/** A rendered diff line for the agent's confirmation text. */
+export interface ProposedFieldView {
+  label: string;
+  before: string;
+  after: string;
 }
 
 /** A Discord snowflake is a long run of digits; a preset is a human name. Used
@@ -211,6 +250,66 @@ const TOOLS = [
           description:
             "Optional. Only \"self\" (or your own thread id) is allowed — describing another " +
             "thread's config is privileged and not available here. Defaults to your own thread.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "config_propose",
+    description:
+      "Propose a configuration change for YOUR OWN thread. This does NOT apply anything: it posts a " +
+      "confirmation card in your thread showing the exact before→after diff, and a human must click " +
+      "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, or `channelPreset`.\n" +
+      "- session: your thread's own runtime config (agent, model, effort, cwd, permission).\n" +
+      "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target).\n" +
+      "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider). " +
+      "May be disabled by the deployment; the `locked` flag can NEVER be changed.\n" +
+      "You can only ever change your OWN thread/channel — cross-thread config is not available here, and a " +
+      "locked channel refuses every change.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session: {
+          type: "object",
+          description: "Tier A — your thread's own session config.",
+          properties: {
+            agent: { type: "string", description: "Agent profile id." },
+            model: { type: "string", description: "Model id." },
+            effort: { type: "string", description: "Reasoning effort level (agent-dependent)." },
+            cwd: { type: "string", description: "Working directory." },
+            permission: {
+              type: "string",
+              enum: ["always", "ask", "deny"],
+              description: "Permission policy.",
+            },
+          },
+        },
+        preset: {
+          type: "object",
+          description: "Tier B — a preset in this thread's project scope.",
+          properties: {
+            name: { type: "string", description: "Preset name (required)." },
+            agent: { type: "string" },
+            model: { type: "string" },
+            effort: { type: "string" },
+            description: { type: "string" },
+            permission: { type: "string", enum: ["always", "ask", "deny"] },
+          },
+          required: ["name"],
+        },
+        channelPreset: {
+          type: "object",
+          description:
+            "Tier C — this channel's shared preset (channel-presets.json). Applies to every thread " +
+            "under the channel. `locked` is not settable.",
+          properties: {
+            agent: { type: "string" },
+            model: { type: "string" },
+            cwd: { type: "string" },
+            effort: { type: "string" },
+            rider: { type: "string", description: "Extra per-turn harness-preamble rule." },
+          },
         },
       },
       required: [],
@@ -380,6 +479,8 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolChain(record, args));
         case "config_describe":
           return rpcResult(id, this.toolConfigDescribe(record, args));
+        case "config_propose":
+          return rpcResult(id, await this.toolConfigPropose(record, args));
         default:
           return rpcError(id, -32602, `unknown tool: ${name}`);
       }
@@ -616,6 +717,74 @@ export class SeamMcpServer {
     }
 
     return textResult(lines.join("\n"));
+  }
+
+  /**
+   * Propose a config mutation for the calling thread (#58 P2/P3).
+   *
+   * LOCK ENFORCEMENT POINT (D2). This is the tool layer's OWN gate, deliberately
+   * re-derived here rather than inherited from the slash layer's
+   * `LOCK_EXEMPT_SUBCOMMANDS` (abort/cancel/steer). That exemption list exists
+   * because redirecting or stopping a RUNNING agent is not reconfiguration —
+   * `steer` is exempt for exactly that reason, and it is already its own separate
+   * tool here. `config_propose` is PURE reconfiguration, so it grants ZERO lock
+   * exemptions: in a locked channel it is refused outright, before any proposal
+   * is built, and the refusal cannot be talked around because the lock is read
+   * from the channel-presets file (the source of truth), never from the model's
+   * argument. The scope is the token-resolved caller (D3) — a caller cannot name
+   * another thread, so this can only ever propose changes to its OWN config.
+   */
+  private async toolConfigPropose(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.proposeConfig) {
+      return textResult("config mutation is not supported on this deployment.", true);
+    }
+    // Strictly read-only over MCP for a locked channel — no exceptions, no
+    // override tool (D2). Enforced HERE in the tool layer.
+    if (this.deps.isChannelLocked?.(caller)) {
+      this.logger.warn(
+        { session: caller.id, channel: caller.parentRef },
+        "seam-mcp config_propose refused: channel is locked"
+      );
+      return textResult(
+        `🔒 Refused: this channel is locked, so its configuration is strictly read-only over MCP. ` +
+          `This cannot be overridden by asking — unlocking is a deliberate out-of-band act ` +
+          `(edit the presets file and redeploy). No change was proposed.`,
+        true
+      );
+    }
+
+    const input: ConfigMutationInput = {};
+    if (args.session && typeof args.session === "object") {
+      input.session = args.session as ConfigMutationInput["session"];
+    }
+    if (args.preset && typeof args.preset === "object") {
+      input.preset = args.preset as ConfigMutationInput["preset"];
+    }
+    if (args.channelPreset && typeof args.channelPreset === "object") {
+      input.channelPreset = args.channelPreset as ConfigMutationInput["channelPreset"];
+    }
+
+    const outcome = await this.deps.proposeConfig(caller, input);
+    if (!outcome.ok) {
+      return textResult(outcome.error ?? "Proposal refused.", true);
+    }
+    const lines = [
+      `Proposed — a confirmation card was posted in your thread. Nothing changes until a human clicks Apply.`,
+      outcome.summary ? `\n${outcome.summary}` : "",
+    ];
+    for (const f of outcome.fields ?? []) {
+      lines.push(`  • ${f.label}: ${f.before} → ${f.after}`);
+    }
+    for (const w of outcome.warnings ?? []) {
+      lines.push(`  ⚠ ${w}`);
+    }
+    if (outcome.restartsSession) {
+      lines.push(`  (applying this will restart the session so it takes effect)`);
+    }
+    return textResult(lines.filter(Boolean).join("\n"));
   }
 }
 

@@ -1,6 +1,6 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { loadConfig, REMOTE_MAC_MODELS, CODEX_STATIC_MODELS, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
+import { loadConfig, isChannelLocked, REMOTE_MAC_MODELS, CODEX_STATIC_MODELS, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
 import { SessionStore } from "./core/session-store.js";
@@ -450,6 +450,14 @@ async function main(): Promise<void> {
           model: p.model,
         })),
       }),
+      // #58 D2: the mutation tool refuses in a locked channel — enforced in the
+      // tool layer via this predicate (read from the presets file, the source of
+      // truth), never from a model-supplied value.
+      isChannelLocked: (record) => isChannelLocked(config, record.parentRef ?? undefined),
+      // #58 P2/P3: propose-then-confirm mutation. The orchestrator validates,
+      // renders the confirm card, and applies only on a human click (D5),
+      // auditing every change (D6).
+      proposeConfig: (record, input) => orchestrator.proposeConfig(record, input),
     });
     await seamMcpServer.start();
   }

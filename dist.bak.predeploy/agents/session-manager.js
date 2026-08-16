@@ -1,0 +1,71 @@
+export function cleanTextForPreview(text) {
+    if (!text)
+        return "";
+    // Remove XML/HTML tags (like <thoughts>, <USER_REQUEST>, etc.)
+    let clean = text.replace(/<[^>]+>/g, " ");
+    // Split into lines to filter out code blocks and structural markup
+    const rawLines = clean.split(/\r?\n/);
+    const cleanLines = [];
+    for (let line of rawLines) {
+        line = line.trim();
+        if (!line)
+            continue;
+        // Skip code block fences
+        if (/^`{3,}/.test(line))
+            continue;
+        // Skip lines that look like comments
+        if (/^\s*(\/\/|#|\/\*|\*\/)/.test(line))
+            continue;
+        // Skip lines that only contain structural code/JSON symbols (braces, brackets, punctuation, quotes)
+        if (/^[{}[\],.;():\s"'+=\-*\/\\|&!%?^~<>#`@_]{3,}$/.test(line))
+            continue;
+        // Skip slash commands (e.g. /model model default)
+        if (/^\/[a-zA-Z]/.test(line))
+            continue;
+        // Skip model configuration messages (e.g. Set model to claude-opus-4-7[1m], model default, model: claude)
+        if (/^(set\s+|active\s+|current\s+)?model\s*(to\b|is\b|default\b|set\b|:)/i.test(line))
+            continue;
+        if (/^set\s+model\b/i.test(line))
+            continue;
+        // Strip markdown formatting symbols on the line
+        let cleanLine = line
+            .replace(/^#+\s+/, "") // strip headers
+            .replace(/^>\s*/, "") // strip blockquotes
+            .replace(/^([*\-+]|\d+\.)\s+/, "") // strip list bullets
+            .replace(/[`*_~]+/g, "") // strip code backticks, bold, italic, strike
+            .trim();
+        // Skip bot thoughts and programmatic outputs beginning with "I will"
+        if (/^i\s+will\b/i.test(cleanLine))
+            continue;
+        if (cleanLine.length > 0) {
+            cleanLines.push(cleanLine);
+        }
+    }
+    // Now, merge/concat short lines with the next line, or skip them
+    const finalLines = [];
+    let buffer = "";
+    for (let i = 0; i < cleanLines.length; i++) {
+        const current = cleanLines[i];
+        // If it's a very short line (e.g. < 4 characters or mostly punctuation), let's skip it or concat it
+        if (current.length < 4) {
+            continue;
+        }
+        if (buffer) {
+            buffer += " " + current;
+        }
+        else {
+            buffer = current;
+        }
+        // If the buffer is long enough or it's the last line, push it
+        if (buffer.length >= 15 || i === cleanLines.length - 1) {
+            finalLines.push(buffer);
+            buffer = "";
+        }
+    }
+    if (buffer) {
+        finalLines.push(buffer);
+    }
+    // Join the final lines with a space
+    return finalLines.join(" ").trim();
+}
+//# sourceMappingURL=session-manager.js.map

@@ -27,6 +27,7 @@ import type { Logger } from "../../lib/logger.js";
 import type { SessionRecord } from "../types.js";
 import type { DispatchSpec } from "../dispatch/types.js";
 import { frameSteerPrompt } from "../steer.js";
+import { buildChainHopSpec } from "../dispatch/types.js";
 
 /** MCP protocol version we speak. We echo the client's if it sends a newer one
  *  it thinks we support; otherwise advertise this. */
@@ -48,6 +49,16 @@ export interface SeamMcpServerDeps {
   resolveSession: (token: string | undefined) => SessionRecord | undefined;
   /** Persist a dispatch spec into the pending queue (the DispatchWatcher runs it). */
   enqueueDispatch: (spec: DispatchSpec) => Promise<void>;
+  /**
+   * Create a durable chain row and pop its first hop (#25). Returns the new
+   * chain id and the worker string of hop 1 (the caller then enqueues it).
+   * Undefined ⇒ chains are unsupported on this deployment.
+   */
+  createChain?: (input: {
+    hops: string[];
+    originRef: string;
+    promptPreview?: string | null;
+  }) => { chainId: string; firstHop: string };
   /** Read recent messages from a thread; undefined ⇒ peek is unsupported. */
   peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
 }
@@ -128,6 +139,32 @@ const TOOLS = [
       required: ["thread"],
     },
   },
+  {
+    name: "chain",
+    description:
+      "Run a durable multi-hop chain: your prompt flows through each worker in order, and EACH hop's " +
+      "output becomes the NEXT hop's input. `workers` is an ordered list of thread ids (stateful teammates) " +
+      "and/or preset names (stateless specialists). The runtime drives every hop and survives a restart " +
+      "mid-chain — you do not wait inline. The final hop's output is delivered back into `returnTo` " +
+      "(your thread by default).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workers: {
+          type: "array",
+          items: { type: "string" },
+          description: "Ordered hops — each a thread id (stateful) or preset name (stateless specialist).",
+          minItems: 1,
+        },
+        prompt: { type: "string", description: "The initial input handed to hop 1." },
+        returnTo: {
+          type: "string",
+          description: "Thread id to deliver the final output into. Defaults to YOUR thread.",
+        },
+      },
+      required: ["workers", "prompt"],
+    },
+  },
 ] as const;
 
 const INSTRUCTIONS = [
@@ -140,9 +177,12 @@ const INSTRUCTIONS = [
   "- forward(to, content): relay a message into another thread (thin handoff, no specialist framing).",
   "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
   "- peek(thread, count?): read another thread's recent messages to get context before delegating.",
+  "- chain(workers, prompt, returnTo?): pipe a prompt through an ordered list of workers where each",
+  "  hop's output feeds the next; the final output is delivered back to you. Durable across restarts.",
   "",
   "Prefer handoff to a preset for well-scoped specialist work, and to a thread id when a specific",
-  "teammate already holds the context. Correlation and delivery are handled for you.",
+  "teammate already holds the context. Use chain when work has a fixed multi-stage pipeline.",
+  "Correlation and delivery are handled for you.",
 ].join("\n");
 
 /**
@@ -285,6 +325,8 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolSteer(record, args));
         case "peek":
           return rpcResult(id, await this.toolPeek(args));
+        case "chain":
+          return rpcResult(id, await this.toolChain(record, args));
         default:
           return rpcError(id, -32602, `unknown tool: ${name}`);
       }
@@ -396,6 +438,43 @@ export class SeamMcpServer {
     );
   }
 
+  private async toolChain(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.createChain) {
+      return textResult("chains are not supported on this deployment.", true);
+    }
+    const workers = requireStringArray(args, "workers");
+    const prompt = requireString(args, "prompt");
+    const originRef = optionalString(args, "returnTo") ?? caller.channelRef;
+
+    // Create the durable chain row and pop hop 1. The runtime drives the rest:
+    // each hop's completion advances the chain (see Orchestrator.advanceChain),
+    // and the row is the source of truth so a mid-chain restart resumes.
+    const { chainId, firstHop } = this.deps.createChain({
+      hops: workers,
+      originRef,
+      promptPreview: prompt,
+    });
+    const spec = buildChainHopSpec({
+      id: randomUUID(),
+      chainId,
+      worker: firstHop,
+      prompt,
+      originRef,
+    });
+    await this.deps.enqueueDispatch(spec);
+    this.logger.info(
+      { chainId, from: caller.channelRef, hops: workers.length, firstHop, originRef },
+      "seam-mcp chain started"
+    );
+    return textResult(
+      `Started chain ${chainId} across ${workers.length} hop(s): ${workers.join(" → ")}. ` +
+        `Each hop's output feeds the next; the final result will be delivered into thread ${originRef}.`
+    );
+  }
+
   private async toolPeek(args: Record<string, unknown>): Promise<McpToolResult> {
     const thread = requireString(args, "thread");
     const rawCount = typeof args.count === "number" ? args.count : 20;
@@ -474,6 +553,17 @@ function optionalString(args: Record<string, unknown>, key: string): string | un
   if (v === undefined || v === null) return undefined;
   if (typeof v !== "string" || v.trim() === "") return undefined;
   return v;
+}
+function requireStringArray(args: Record<string, unknown>, key: string): string[] {
+  const v = args[key];
+  if (!Array.isArray(v) || v.length === 0) {
+    throw new Error(`"${key}" is required and must be a non-empty array of strings`);
+  }
+  const out = v.map((s) => (typeof s === "string" ? s.trim() : ""));
+  if (out.some((s) => s === "")) {
+    throw new Error(`"${key}" must contain only non-empty strings`);
+  }
+  return out;
 }
 
 function headerValue(h: string | string[] | undefined): string | undefined {

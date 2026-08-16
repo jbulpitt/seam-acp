@@ -1,4 +1,5 @@
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { loadConfig, REMOTE_MAC_MODELS, CODEX_STATIC_MODELS, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
@@ -403,6 +404,18 @@ async function main(): Promise<void> {
         return sid ? store.get(sid) ?? undefined : undefined;
       },
       enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+      // Durable multi-hop chains (#25): create the chain row and pop hop 1, so
+      // the `chain` tool can enqueue the first dispatch. The runtime advances
+      // the rest (Orchestrator.advanceChain).
+      createChain: ({ hops, originRef, promptPreview }) => {
+        const chainId = randomUUID();
+        store.createChain({ id: chainId, hops, originRef, promptPreview: promptPreview ?? null });
+        const advanced = store.advanceChain(chainId);
+        if (!advanced?.nextHop) {
+          throw new Error("chain requires at least one worker");
+        }
+        return { chainId, firstHop: advanced.nextHop };
+      },
       ...(adapter.fetchThreadMessages
         ? {
             peekThread: async (threadId: string, count: number) => {

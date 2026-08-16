@@ -4,6 +4,9 @@ import path from "node:path";
 import {
   defaultSessionConfig,
   type ActiveProject,
+  type Chain,
+  type ChainCreateInput,
+  type ChainStatus,
   type PermissionPolicyMode,
   type Preset,
   DELEGATION_ACTIVE_STATUSES,
@@ -232,6 +235,7 @@ export class SessionStore {
     this.db.exec(SCHEMA);
     this.db.exec(DELEGATION_SCHEMA);
     this.db.exec(ACTIVE_PROJECTS_SCHEMA);
+    this.db.exec(CHAINS_SCHEMA);
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -783,6 +787,116 @@ export class SessionStore {
       .all(sourceRef)
       .map(mapLedger);
   }
+
+  // --- durable multi-hop chains (#25) ---------------------------------------
+
+  /**
+   * Insert one chain row. `hops` is stored as the *remaining* worker list (the
+   * hop about to be dispatched should be popped with `advanceChain`). `status`
+   * defaults to "running", `currentIndex` to 0, and the timestamps to now.
+   * `promptPreview` is truncated like the ledger's. Returns the row as
+   * persisted, so the caller sees the stamped defaults.
+   */
+  createChain(input: ChainCreateInput): Chain {
+    const now = new Date().toISOString();
+    const createdUtc = input.createdUtc ?? now;
+    const chain: Chain = {
+      id: input.id,
+      hops: [...input.hops],
+      originRef: input.originRef,
+      promptPreview: truncatePreview(input.promptPreview ?? null),
+      status: input.status ?? "running",
+      currentIndex: input.currentIndex ?? 0,
+      createdUtc,
+      updatedUtc: input.updatedUtc ?? createdUtc,
+    };
+    this.db
+      .prepare(
+        `INSERT INTO chains
+           (id, hops_json, origin_ref, prompt_preview, status,
+            current_index, created_utc, updated_utc)
+         VALUES
+           (@id, @hopsJson, @originRef, @promptPreview, @status,
+            @currentIndex, @createdUtc, @updatedUtc)`
+      )
+      .run({
+        id: chain.id,
+        hopsJson: JSON.stringify(chain.hops),
+        originRef: chain.originRef,
+        promptPreview: chain.promptPreview,
+        status: chain.status,
+        currentIndex: chain.currentIndex,
+        createdUtc: chain.createdUtc,
+        updatedUtc: chain.updatedUtc,
+      });
+    return chain;
+  }
+
+  getChain(id: string): Chain | null {
+    const row = this.db
+      .prepare<[string], ChainRow>("SELECT * FROM chains WHERE id = ?")
+      .get(id);
+    return row ? mapChain(row) : null;
+  }
+
+  /**
+   * Pop the next hop to dispatch off the front of the remaining list, bump
+   * `currentIndex`, and re-stamp `updated_utc`. Returns the updated chain plus
+   * the popped worker string (`nextHop`), or `nextHop: null` when the chain is
+   * drained — the caller then delivers the final output to `originRef`. An
+   * unknown id or a chain that is no longer "running" returns `null` (a no-op),
+   * which keeps an at-least-once double-completion from advancing twice into a
+   * terminal chain. The row is the source of truth, so advancing happens only at
+   * a hop's completion — a restart mid-hop re-runs that hop and re-reads this
+   * state, advancing exactly once.
+   */
+  advanceChain(id: string): { chain: Chain; nextHop: string | null } | null {
+    const current = this.getChain(id);
+    if (!current || current.status !== "running") return null;
+    const hops = [...current.hops];
+    const nextHop = hops.length > 0 ? hops.shift()! : null;
+    const updated: Chain = {
+      ...current,
+      hops,
+      currentIndex: nextHop !== null ? current.currentIndex + 1 : current.currentIndex,
+      updatedUtc: new Date().toISOString(),
+    };
+    this.db
+      .prepare(
+        `UPDATE chains
+           SET hops_json = @hopsJson, current_index = @currentIndex,
+               updated_utc = @updatedUtc
+         WHERE id = @id`
+      )
+      .run({
+        id: updated.id,
+        hopsJson: JSON.stringify(updated.hops),
+        currentIndex: updated.currentIndex,
+        updatedUtc: updated.updatedUtc,
+      });
+    return { chain: updated, nextHop };
+  }
+
+  /** Mark a chain terminal (default "completed"), re-stamping `updated_utc`.
+   *  Unknown ids are a silent no-op. */
+  completeChain(id: string, status: Exclude<ChainStatus, "running"> = "completed"): void {
+    this.db
+      .prepare(
+        "UPDATE chains SET status = @status, updated_utc = @updatedUtc WHERE id = @id"
+      )
+      .run({ id, status, updatedUtc: new Date().toISOString() });
+  }
+
+  /** Chains still running, oldest first — the order a resume sweep wants. */
+  listActiveChains(): Chain[] {
+    return this.db
+      .prepare<[], ChainRow>(
+        `SELECT * FROM chains WHERE status = 'running'
+         ORDER BY created_utc ASC, rowid ASC`
+      )
+      .all()
+      .map(mapChain);
+  }
 }
 
 // --- active projects schema + row mapping (#22) -----------------------------
@@ -859,6 +973,55 @@ const mapLedger = (r: LedgerRow): LedgerEntry => ({
   createdUtc: r.created_utc,
   updatedUtc: r.updated_utc,
 });
+
+// --- chains schema + row mapping (#25) --------------------------------------
+
+const CHAINS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS chains (
+  id             TEXT PRIMARY KEY,
+  hops_json      TEXT NOT NULL,
+  origin_ref     TEXT NOT NULL,
+  prompt_preview TEXT,
+  status         TEXT NOT NULL,
+  current_index  INTEGER NOT NULL,
+  created_utc    TEXT NOT NULL,
+  updated_utc    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chains_status ON chains(status);
+`;
+
+interface ChainRow {
+  id: string;
+  hops_json: string;
+  origin_ref: string;
+  prompt_preview: string | null;
+  status: string;
+  current_index: number;
+  created_utc: string;
+  updated_utc: string;
+}
+
+const mapChain = (r: ChainRow): Chain => ({
+  id: r.id,
+  hops: parseHops(r.hops_json),
+  originRef: r.origin_ref,
+  promptPreview: r.prompt_preview,
+  status: r.status as ChainStatus,
+  currentIndex: r.current_index,
+  createdUtc: r.created_utc,
+  updatedUtc: r.updated_utc,
+});
+
+/** Defensive parse of the stored hops array — a corrupt row degrades to an
+ *  empty (drained) chain rather than throwing on every read. */
+function parseHops(raw: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((h): h is string => typeof h === "string") : [];
+  } catch {
+    return [];
+  }
+}
 
 /** Column whitelist for `updateDelegationStatus` — keeps the dynamic SET
  *  clause free of caller-supplied identifiers. */

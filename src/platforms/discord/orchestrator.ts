@@ -85,6 +85,11 @@ const DISPATCH_ERROR_COLOR = 0xe74c3c;
  *  file at finalize (mirrors postDispatchOutput's overflow path). */
 const DISPATCH_STREAM_DESC_MAX = 3800;
 
+/** Discord's hard per-message content ceiling. The default plain "messages"
+ *  dispatch stream grows a single message in place up to this; output that would
+ *  exceed it finalizes as fresh plain messages (or a file) instead of truncating. */
+const DISCORD_MESSAGE_MAX = 2000;
+
 /** Accent color for preset cards ("preset purple"). */
 const PRESET_COLOR = 0x9b59b6;
 
@@ -3103,26 +3108,22 @@ export class Orchestrator {
     // WHOLE captured answer — regardless, so streaming is purely additive.
     const streaming = spec.stream !== false;
     const header = this.dispatchIndicatorHeader(spec, preset ?? null);
+    // Output style: default "messages" (traditional plain assistant messages);
+    // "card" is the opt-in legacy embed path. Read defensively — a raw test/config
+    // object may not carry the zod default.
+    const style = this.config.SEAM_DISPATCH_OUTPUT_STYLE ?? "messages";
 
     const run = async (): Promise<{ output: string; stopReason: string }> => {
       try { this.store.updateDelegationStatus(spec.id, "running"); } catch { /* best-effort */ }
       const startedAt = Date.now();
 
       // START INDICATOR (unconditional): the moment the turn begins, post a slim
-      // header into the target thread showing what's running. This is the SAME
+      // indicator into the target thread showing what's running. This is the SAME
       // message that then streams — in streaming mode the worker's output flows
-      // into its description; in quiet mode it stays as the header while the body
-      // is posted below. Best-effort: a post failure must never break the turn,
-      // it just costs live visibility.
-      let panelRef: MessageRef | undefined;
-      try {
-        const startPanel = this.dispatchStreamPanel({ header, text: "", done: false, elapsedMs: 0 });
-        panelRef = this.adapter.sendPanel
-          ? await this.adapter.sendPanel(target, startPanel)
-          : await this.adapter.sendMessage(target, serializePanelText(startPanel));
-      } catch (err) {
-        this.logger.warn({ err, dispatch: spec.id }, "dispatch: start-indicator post failed");
-      }
+      // into it; in quiet mode it stays as the indicator while the body is posted
+      // below. In "messages" style it's a one-line italic plain indicator; in
+      // "card" style it's the legacy embed panel. Best-effort.
+      const panelRef = await this.postDispatchStartIndicator(target, header, style, spec);
 
       // Streaming renderer: progressively edit `panelRef` with the worker's
       // agent-text as it arrives, throttled + serialized so we never issue an
@@ -3133,10 +3134,25 @@ export class Orchestrator {
       // Terminal-render context, filled in by finalizeDispatchStream just before
       // the last (done) edit — the streaming callback is defined here, before the
       // turn's error/overflow outcome is known.
-      const streamState: { error?: string; attached: boolean } = { attached: false };
+      const streamState: { error?: string; attached: boolean; fullText?: string; overflow?: boolean } = {
+        attached: false,
+      };
       if (streaming && panelRef) {
         const ref = panelRef;
         streamPanel = new StreamingPanel(async (text, done) => {
+          // "messages" style: edit a PLAIN message (content only, no embed) so the
+          // live stream reads as a normal reply growing in place.
+          if (style === "messages") {
+            const content = done
+              ? this.dispatchStreamPlainDone(header, streamState, text)
+              : this.dispatchStreamPlainLive(header, text);
+            try {
+              await this.adapter.editMessage(ref, content);
+            } catch (err) {
+              this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream edit failed");
+            }
+            return;
+          }
           const panel = this.dispatchStreamPanel({
             header,
             text,
@@ -3195,7 +3211,7 @@ export class Orchestrator {
       // text spilled to a file only when it overflows the embed. Quiet: fall
       // back to today's capture-and-post cards below the untouched indicator.
       if (streamPanel && panelRef) {
-        await this.finalizeDispatchStream(target, spec, streamPanel, streamState, result);
+        await this.finalizeDispatchStream(target, spec, streamPanel, streamState, result, style);
       } else {
         // Partial output is still output — post whatever was captured either way.
         await this.postDispatchOutput(target, spec, result.text, result.error);
@@ -3275,32 +3291,34 @@ export class Orchestrator {
 
     const header = this.dispatchIndicatorHeader(spec, null);
     const startedAt = Date.now();
+    const style = this.config.SEAM_DISPATCH_OUTPUT_STYLE ?? "messages";
     try { this.store.updateDelegationStatus(spec.id, "running"); } catch { /* best-effort */ }
 
-    // Start indicator: post the same slim panel dispatchInjectTurn posts, so the
-    // target thread shows the compaction is underway. Best-effort.
-    let panelRef: MessageRef | undefined;
-    try {
-      const startPanel = this.dispatchStreamPanel({ header, text: "", done: false, elapsedMs: 0 });
-      panelRef = this.adapter.sendPanel
-        ? await this.adapter.sendPanel(target, startPanel)
-        : await this.adapter.sendMessage(target, serializePanelText(startPanel));
-    } catch (err) {
-      this.logger.warn({ err, dispatch: spec.id }, "compact-dispatch: start-indicator post failed");
-    }
+    // Start indicator: post the same slim indicator dispatchInjectTurn posts, so
+    // the target thread shows the compaction is underway. Best-effort.
+    const panelRef = await this.postDispatchStartIndicator(target, header, style, spec);
 
     // Finalize the indicator into its terminal (done/error) state in place, so
-    // the one panel is the whole life-cycle (mirrors finalizeDispatchStream).
+    // the one message is the whole life-cycle (mirrors finalizeDispatchStream).
+    // The compaction summary is short, so it always fits one plain message.
     const finalize = async (body: string, error?: string): Promise<void> => {
       if (!panelRef) return;
-      const panel = this.dispatchStreamPanel({
-        header,
-        text: body,
-        done: true,
-        elapsedMs: Date.now() - startedAt,
-        ...(error ? { error } : {}),
-      });
       try {
+        if (style === "messages") {
+          const doneHeader = header.replace(/^▶/, error ? "❌" : "✅");
+          const content = error
+            ? `_${doneHeader}_\n\n❌ ${error.slice(0, 1500)}`
+            : `_${doneHeader}_\n\n${body}`;
+          await this.adapter.editMessage(panelRef, content.slice(0, DISCORD_MESSAGE_MAX));
+          return;
+        }
+        const panel = this.dispatchStreamPanel({
+          header,
+          text: body,
+          done: true,
+          elapsedMs: Date.now() - startedAt,
+          ...(error ? { error } : {}),
+        });
         if (this.adapter.editPanel) await this.adapter.editPanel(panelRef, panel);
         else await this.adapter.editMessage(panelRef, serializePanelText(panel));
       } catch (err) {
@@ -3331,8 +3349,12 @@ export class Orchestrator {
       const message = (err as Error)?.message ?? String(err);
       await finalize("", message);
       if (!panelRef) {
-        // No panel to carry the error — post a standalone failure card.
-        await this.sendResultCard(target, "✨ Compaction failed", `❌ ${message.slice(0, 1500)}`, DISPATCH_ERROR_COLOR).catch(() => {});
+        // No indicator to carry the error — post a standalone failure line/card.
+        if (style === "messages") {
+          await this.adapter.sendMessage(target, `❌ ${message.slice(0, 1500)}`).catch(() => {});
+        } else {
+          await this.sendResultCard(target, "✨ Compaction failed", `❌ ${message.slice(0, 1500)}`, DISPATCH_ERROR_COLOR).catch(() => {});
+        }
       }
       try { this.store.updateDelegationStatus(spec.id, "failed"); } catch { /* best-effort */ }
       this.logger.warn({ err, dispatch: spec.id, target: spec.target }, "compact-dispatch: failed");
@@ -3485,7 +3507,30 @@ export class Orchestrator {
     error?: string
   ): Promise<void> {
     const label = spec.correlationId ? `${spec.id} · ${spec.correlationId}` : spec.id;
+    const style = this.config.SEAM_DISPATCH_OUTPUT_STYLE ?? "messages";
     try {
+      if (style === "messages") {
+        // Default: traditional plain assistant messages — like talking to the
+        // bot directly. Errors stay a short visible plain line, not a big embed.
+        if (error) {
+          await this.adapter.sendMessage(channel, `❌ ${error.slice(0, 1500)}`);
+        }
+        const body = text.trim();
+        if (!body) {
+          if (!error) await this.adapter.sendMessage(channel, "✅ Done — no output.");
+          return;
+        }
+        await this.postPlainChunks(
+          channel,
+          body,
+          label,
+          "dispatch",
+          `✅ Done — full output attached (${body.length} chars).`
+        );
+        return;
+      }
+
+      // Opt-in "card" style: today's blue "📨 Dispatch" embeds (unchanged).
       if (error) {
         await this.sendResultCard(
           channel,
@@ -3569,6 +3614,76 @@ export class Orchestrator {
     return `…${s.slice(s.length - DISPATCH_STREAM_DESC_MAX)}`;
   }
 
+  /** Post the slim start indicator for a dispatch into the target thread and
+   *  return its message ref (the message that then streams/finalizes in place).
+   *  In the default "messages" style this is a one-line italic plain indicator
+   *  (`_▶ handoff · … → preview_`); in "card" style it's the legacy embed panel.
+   *  Best-effort: a post failure must never break the turn — it just costs live
+   *  visibility, so we log and return undefined. */
+  private async postDispatchStartIndicator(
+    target: ChannelRef,
+    header: string,
+    style: "messages" | "card",
+    spec: DispatchSpec
+  ): Promise<MessageRef | undefined> {
+    try {
+      if (style === "messages") {
+        return await this.adapter.sendMessage(target, `_${header}_`);
+      }
+      const startPanel = this.dispatchStreamPanel({ header, text: "", done: false, elapsedMs: 0 });
+      return this.adapter.sendPanel
+        ? await this.adapter.sendPanel(target, startPanel)
+        : await this.adapter.sendMessage(target, serializePanelText(startPanel));
+    } catch (err) {
+      this.logger.warn({ err, dispatch: spec.id }, "dispatch: start-indicator post failed");
+      return undefined;
+    }
+  }
+
+  /** Plain "messages"-style LIVE content for a streaming dispatch: the italic
+   *  indicator header followed by the freshest tail of the streamed body, bounded
+   *  to Discord's per-message ceiling so the single message grows in place like a
+   *  normal reply. Loss is only cosmetic — the full text is finalized below. */
+  private dispatchStreamPlainLive(header: string, text: string): string {
+    const headerLine = `_${header}_`;
+    const trimmed = text.trim();
+    if (!trimmed) return `${headerLine}\n\n_starting…_`;
+    // Reserve room for the header line, the "\n\n" separator, and the leading /
+    // trailing "…" stream markers.
+    const budget = Math.max(0, DISCORD_MESSAGE_MAX - headerLine.length - 6);
+    const tail = trimmed.length <= budget ? trimmed : `…${trimmed.slice(trimmed.length - budget)}`;
+    return `${headerLine}\n\n${tail}…`.slice(0, DISCORD_MESSAGE_MAX);
+  }
+
+  /** Plain "messages"-style TERMINAL content for a streaming dispatch. Flips the
+   *  indicator glyph to ✅/❌ and, when the whole body (plus any error line) fits
+   *  in one message, renders it inline — a clean single traditional message with
+   *  no duplication. When it overflows, sets `streamState.overflow` so the caller
+   *  posts the full body below as fresh plain messages, and this message stays the
+   *  terminal indicator (never a truncated body). */
+  private dispatchStreamPlainDone(
+    header: string,
+    streamState: { error?: string; fullText?: string; overflow?: boolean },
+    bufferText: string
+  ): string {
+    const doneHeader = header.replace(/^▶/, streamState.error ? "❌" : "✅");
+    const headerLine = `_${doneHeader}_`;
+    const full = (streamState.fullText ?? bufferText).trim();
+    const errLine = streamState.error ? `❌ ${streamState.error.slice(0, 800)}` : "";
+    if (!full && !errLine) {
+      streamState.overflow = false;
+      return `${headerLine}\n\n_✅ Done — no output._`;
+    }
+    const inline = [headerLine, errLine, full].filter(Boolean).join("\n\n");
+    if (inline.length <= DISCORD_MESSAGE_MAX) {
+      streamState.overflow = false;
+      return inline;
+    }
+    // Too big for one message — the full body posts below as fresh plain messages.
+    streamState.overflow = true;
+    return [headerLine, errLine].filter(Boolean).join("\n\n") || headerLine;
+  }
+
   /** Build the streaming/indicator panel for a dispatch. `done: false` renders
    *  the live view (header + streamed tail + cursor); `done: true` renders the
    *  terminal state (✅/❌ header + final body, or an overflow note when the full
@@ -3625,13 +3740,42 @@ export class Orchestrator {
     target: ChannelRef,
     spec: DispatchSpec,
     streamPanel: StreamingPanel,
-    streamState: { error?: string; attached: boolean },
-    result: InjectTurnResult
+    streamState: { error?: string; attached: boolean; fullText?: string; overflow?: boolean },
+    result: InjectTurnResult,
+    style: "messages" | "card"
   ): Promise<void> {
     const body = (result.text ?? "").trim();
     if (result.error) streamState.error = result.error;
+    const label = spec.correlationId ? `${spec.id} · ${spec.correlationId}` : spec.id;
+
+    if (style === "messages") {
+      // Stash the authoritative full text (may include trailing text drained
+      // after the RPC resolved) so the terminal render decides inline-vs-overflow
+      // against the WHOLE answer, not just the streamed buffer.
+      streamState.fullText = result.text ?? "";
+      // The terminal render (inside the panel's SerialQueue, so it never races a
+      // pending live edit) sets streamState.overflow when the body won't fit one
+      // message.
+      await streamPanel.finalize();
+      if (streamState.overflow && body) {
+        // Continue as fresh plain messages below the indicator (or a file when it
+        // would take too many) — the "messages"-style overflow path, lossless.
+        await this.postPlainChunks(
+          target,
+          body,
+          label,
+          "dispatch",
+          `✅ Done — full output attached (${body.length} chars).`
+        ).catch((err) =>
+          this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream overflow post failed")
+        );
+      }
+      return;
+    }
+
+    // "card" style: spill an overflowing body to a file once (no duplicate card),
+    // then flip the embed panel to its done state in place.
     if (body.length > DISPATCH_STREAM_DESC_MAX) {
-      const label = spec.correlationId ? `${spec.id} · ${spec.correlationId}` : spec.id;
       try {
         await this.sendResultFile(target, label, body, "dispatch");
         streamState.attached = true;
@@ -3871,13 +4015,13 @@ export class Orchestrator {
     }
 
     if (outputType === "messages") {
-      const chunks = this.chunkString(body, 1900);
-      if (chunks.length <= 8) {
-        for (const c of chunks) await this.adapter.sendMessage(channel, c);
-      } else {
-        await this.adapter.sendMessage(channel, `⏰ **${name}** — output attached (${body.length} chars).`);
-        await this.sendResultFile(channel, name, body);
-      }
+      await this.postPlainChunks(
+        channel,
+        body,
+        name,
+        "scheduled",
+        `⏰ **${name}** — output attached (${body.length} chars).`
+      );
       return;
     }
 
@@ -3898,6 +4042,28 @@ export class Orchestrator {
     const out: string[] = [];
     for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
     return out;
+  }
+
+  /** Post `body` (assumed non-empty, already trimmed) as traditional plain
+   *  messages: chunk at 1900 chars and send each as its own `sendMessage`; if it
+   *  would take more than 8 messages, send a one-line note and attach the whole
+   *  body as a single file instead. Shared by the scheduled "messages" output and
+   *  the default plain dispatch / report-back rendering — the "messages"-style
+   *  overflow path. Reuses `chunkString` + `sendResultFile` (no bespoke chunking). */
+  private async postPlainChunks(
+    channel: ChannelRef,
+    body: string,
+    fileName: string,
+    filePrefix: string,
+    overflowNote: string
+  ): Promise<void> {
+    const chunks = this.chunkString(body, 1900);
+    if (chunks.length <= 8) {
+      for (const c of chunks) await this.adapter.sendMessage(channel, c);
+    } else {
+      await this.adapter.sendMessage(channel, overflowNote);
+      await this.sendResultFile(channel, fileName, body, filePrefix);
+    }
   }
 
   /** Split attachments into those the model reads inline (text + supported

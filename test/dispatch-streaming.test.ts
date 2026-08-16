@@ -56,6 +56,7 @@ function spyAdapter(log: string[]) {
     sendPanel: [] as Array<{ channel: ChannelRef; panel: StructuredPanel }>,
     editPanel: [] as Array<{ ref: MessageRef; panel: StructuredPanel }>,
     sendMessage: [] as Array<{ channel: ChannelRef; text: string }>,
+    editMessage: [] as Array<{ ref: MessageRef; text: string }>,
     sendFile: [] as Array<{ channel: ChannelRef; filename: string; body: string }>,
   };
   const adapter = {
@@ -70,7 +71,12 @@ function spyAdapter(log: string[]) {
     },
     async sendMessage(channel: ChannelRef, text: string): Promise<MessageRef> {
       calls.sendMessage.push({ channel, text });
+      log.push(`sendMessage:${text.slice(0, 12)}`);
       return { channel, id: `msg-txt-${calls.sendMessage.length}` };
+    },
+    async editMessage(ref: MessageRef, text: string): Promise<void> {
+      calls.editMessage.push({ ref, text });
+      log.push(`editMessage:${text.slice(0, 12)}`);
     },
     async sendFile(
       channel: ChannelRef,
@@ -88,6 +94,7 @@ function makeOrch(opts: {
   dataDir: string;
   rt: ReturnType<typeof fakeRuntime>;
   adapter: ReturnType<typeof spyAdapter>["adapter"];
+  style?: "messages" | "card";
 }): Orchestrator {
   const router = {
     listProfiles: () => [],
@@ -109,6 +116,7 @@ function makeOrch(opts: {
     DEFAULT_MODEL: "default",
     CHANNEL_PRESETS_FILE: undefined,
     SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
+    SEAM_DISPATCH_OUTPUT_STYLE: opts.style ?? "messages",
     channelPresets: {},
     threadPresets: {},
   };
@@ -143,12 +151,12 @@ afterEach(() => {
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
-describe("dispatchInjectTurn: start indicator + live streaming", () => {
+describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', () => {
   it("posts a start indicator BEFORE the turn runs", async () => {
     const log: string[] = [];
     const rt = fakeRuntime(["Hello ", "world"], log);
     const { adapter, calls } = spyAdapter(log);
-    const orch = makeOrch({ dataDir, rt, adapter });
+    const orch = makeOrch({ dataDir, rt, adapter, style: "card" });
 
     await orch.dispatchInjectTurn(baseSpec());
 
@@ -166,7 +174,7 @@ describe("dispatchInjectTurn: start indicator + live streaming", () => {
     const log: string[] = [];
     const rt = fakeRuntime(["Hello ", "world"], log);
     const { adapter, calls } = spyAdapter(log);
-    const orch = makeOrch({ dataDir, rt, adapter });
+    const orch = makeOrch({ dataDir, rt, adapter, style: "card" });
 
     const res = await orch.dispatchInjectTurn(baseSpec());
 
@@ -188,7 +196,7 @@ describe("dispatchInjectTurn: start indicator + live streaming", () => {
     const log: string[] = [];
     const rt = fakeRuntime(["Hello ", "world"], log);
     const { adapter, calls } = spyAdapter(log);
-    const orch = makeOrch({ dataDir, rt, adapter });
+    const orch = makeOrch({ dataDir, rt, adapter, style: "card" });
 
     const res = await orch.dispatchInjectTurn(baseSpec({ stream: false }));
 
@@ -206,7 +214,7 @@ describe("dispatchInjectTurn: start indicator + live streaming", () => {
     const log: string[] = [];
     const rt = fakeRuntime(["Full ", "answer ", "here"], log);
     const { adapter } = spyAdapter(log);
-    const orch = makeOrch({ dataDir, rt, adapter });
+    const orch = makeOrch({ dataDir, rt, adapter, style: "card" });
 
     await orch.dispatchInjectTurn(baseSpec({ returnTo: "thread-caller" }));
 
@@ -226,7 +234,7 @@ describe("dispatchInjectTurn: start indicator + live streaming", () => {
     const big = "x".repeat(5000); // > DISPATCH_STREAM_DESC_MAX
     const rt = fakeRuntime([big], log);
     const { adapter, calls } = spyAdapter(log);
-    const orch = makeOrch({ dataDir, rt, adapter });
+    const orch = makeOrch({ dataDir, rt, adapter, style: "card" });
 
     const res = await orch.dispatchInjectTurn(baseSpec());
 
@@ -239,5 +247,137 @@ describe("dispatchInjectTurn: start indicator + live streaming", () => {
     expect(calls.sendPanel.length).toBe(1);
     const last = calls.editPanel[calls.editPanel.length - 1]!.panel;
     expect(last.description).toContain("full output attached");
+  });
+});
+
+describe('dispatchInjectTurn: plain "messages" style (default)', () => {
+  it("posts a PLAIN start indicator and streams into a plain message — no embeds", async () => {
+    const log: string[] = [];
+    const rt = fakeRuntime(["Hello ", "world"], log);
+    const { adapter, calls } = spyAdapter(log);
+    // No style passed → default "messages".
+    const orch = makeOrch({ dataDir, rt, adapter });
+
+    const res = await orch.dispatchInjectTurn(baseSpec());
+
+    // No embed cards at all — neither the start indicator nor the stream.
+    expect(calls.sendPanel.length).toBe(0);
+    expect(calls.editPanel.length).toBe(0);
+    // The start indicator is a plain italic one-liner posted BEFORE the turn.
+    expect(calls.sendMessage.length).toBe(1);
+    expect(calls.sendMessage[0]!.text).toBe("_▶ handoff · do the thing_");
+    expect(log.indexOf("sendMessage:_▶ handoff")).toBeLessThan(log.indexOf("prompt-start"));
+    // That same message was edited in place more than once (progressive stream +
+    // terminal render) — no per-chunk storm, SerialQueue/throttle intact.
+    expect(calls.editMessage.length).toBeGreaterThan(1);
+    // The terminal edit flips to ✅ and carries the WHOLE body inline (fits one
+    // message) — a clean single traditional message, no duplicate post.
+    const last = calls.editMessage[calls.editMessage.length - 1]!.text;
+    expect(last).toMatch(/^_✅ handoff/);
+    expect(last).toContain("Hello world");
+    // Lossless capture preserved for report-back / done-file.
+    expect(res.output).toBe("Hello world");
+  });
+
+  it("stream:false runs quiet — plain indicator + plain body messages, no cards", async () => {
+    const log: string[] = [];
+    const rt = fakeRuntime(["Hello ", "world"], log);
+    const { adapter, calls } = spyAdapter(log);
+    const orch = makeOrch({ dataDir, rt, adapter });
+
+    const res = await orch.dispatchInjectTurn(baseSpec({ stream: false }));
+
+    // Never streamed (no in-place edits) and never a card.
+    expect(calls.editMessage.length).toBe(0);
+    expect(calls.sendPanel.length).toBe(0);
+    expect(calls.editPanel.length).toBe(0);
+    // Plain indicator, then the captured body as a plain message.
+    expect(calls.sendMessage.map((m) => m.text)).toEqual([
+      "_▶ handoff · do the thing_",
+      "Hello world",
+    ]);
+    expect(res.output).toBe("Hello world");
+  });
+
+  it("empty output finalizes to a short plain done line, no card", async () => {
+    const log: string[] = [];
+    const rt = fakeRuntime([], log); // worker produced nothing
+    const { adapter, calls } = spyAdapter(log);
+    const orch = makeOrch({ dataDir, rt, adapter, style: "messages" });
+
+    const res = await orch.dispatchInjectTurn(baseSpec({ stream: false }));
+
+    expect(res.output).toBe("");
+    expect(calls.sendPanel.length).toBe(0);
+    // Indicator plus a plain "no output" done line — both plain messages.
+    expect(calls.sendMessage.map((m) => m.text)).toEqual([
+      "_▶ handoff · do the thing_",
+      "✅ Done — no output.",
+    ]);
+  });
+
+  it("moderate overflow continues as additional plain messages (no file)", async () => {
+    const log: string[] = [];
+    // > one 2000-char message but ≤ 8 chunks of 1900 — spills to extra messages.
+    const big = "y".repeat(6000);
+    const rt = fakeRuntime([big], log);
+    const { adapter, calls } = spyAdapter(log);
+    const orch = makeOrch({ dataDir, rt, adapter });
+
+    const res = await orch.dispatchInjectTurn(baseSpec());
+
+    expect(res.output).toBe(big);
+    // No embeds, no file — just the plain indicator (edited to a terminal line)
+    // and the full body posted as fresh plain message chunks below it.
+    expect(calls.sendPanel.length).toBe(0);
+    expect(calls.sendFile.length).toBe(0);
+    // The overflow body was chunked at 1900 → 4 additional plain messages.
+    const bodyMsgs = calls.sendMessage.filter((m) => m.text.startsWith("y"));
+    expect(bodyMsgs.length).toBe(Math.ceil(big.length / 1900));
+    expect(bodyMsgs.map((m) => m.text).join("")).toBe(big);
+    // The streamed indicator terminal edit is just the ✅ header (body is below).
+    const last = calls.editMessage[calls.editMessage.length - 1]!.text;
+    expect(last).toMatch(/^_✅ handoff/);
+    expect(last).not.toContain("yyyy");
+  });
+
+  it("huge overflow spills to a single file, losslessly, no card", async () => {
+    const log: string[] = [];
+    const big = "z".repeat(20000); // > 8 chunks of 1900 → file
+    const rt = fakeRuntime([big], log);
+    const { adapter, calls } = spyAdapter(log);
+    const orch = makeOrch({ dataDir, rt, adapter });
+
+    const res = await orch.dispatchInjectTurn(baseSpec());
+
+    expect(res.output).toBe(big);
+    expect(calls.sendPanel.length).toBe(0);
+    // Whole body attached exactly once, losslessly.
+    expect(calls.sendFile.length).toBe(1);
+    expect(calls.sendFile[0]!.body).toBe(big);
+    // A short plain "attached" note accompanies it (not an embed).
+    expect(calls.sendMessage.some((m) => m.text.includes("full output attached"))).toBe(true);
+  });
+
+  it("report-back to a different thread: plain local render, delivery unchanged", async () => {
+    const log: string[] = [];
+    const rt = fakeRuntime(["Full ", "answer ", "here"], log);
+    const { adapter, calls } = spyAdapter(log);
+    const orch = makeOrch({ dataDir, rt, adapter });
+
+    await orch.dispatchInjectTurn(baseSpec({ returnTo: "thread-caller" }));
+
+    // Local rendering in the worker thread is plain (no embeds).
+    expect(calls.sendPanel.length).toBe(0);
+    expect(calls.editPanel.length).toBe(0);
+    // Delivery semantics unchanged: a report-back spec was still enqueued into
+    // the DIFFERENT caller thread with the WHOLE captured answer bundled.
+    const dirs = dispatchDirs(dataDir);
+    const pending = (await readdir(dirs.pending)).filter((f) => f.endsWith(".json"));
+    expect(pending.length).toBe(1);
+    const spec = JSON.parse(await readFile(path.join(dirs.pending, pending[0]!), "utf8"));
+    expect(spec.target).toBe("thread-caller");
+    expect(spec.kind).toBe("report_back");
+    expect(spec.prompt).toContain("Full answer here");
   });
 });

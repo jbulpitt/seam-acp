@@ -614,6 +614,20 @@ const Schema = z.object({
    *            session before sending their first message
    */
   NEW_THREAD_WIZARD: z.enum(["repo", "full"]).default("repo"),
+
+  /**
+   * How dispatched-turn output (handoffs, forwards, wakes, watches, chain hops,
+   * compaction) and report-back / callback delivery render in the target thread.
+   * - "messages": (default) traditional plain assistant messages — the worker's
+   *               output is streamed live into, and finalized as, ordinary
+   *               `sendMessage` chunks, exactly like talking to the bot directly.
+   *               Overflow past Discord's limit spills to a file attachment.
+   * - "card":     the legacy blue "📨 Dispatch" embed cards / streamed embed
+   *               panel. Opt-in escape hatch; behaviour unchanged from before.
+   * Does NOT affect /seam slash-command embeds, session-manager cards, config
+   * confirm cards, or the scheduled path's own per-schedule outputType.
+   */
+  SEAM_DISPATCH_OUTPUT_STYLE: z.enum(["messages", "card"]).default("messages"),
 });
 
 const PresetFieldSchema = <T extends z.ZodType>(value: T) => z.object({ value });

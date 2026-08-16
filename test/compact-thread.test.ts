@@ -184,7 +184,13 @@ describe("Orchestrator.compactThread", () => {
 
 /** A spy adapter recording panel/file posts. */
 function spyAdapter() {
-  const calls = { sendPanel: [] as StructuredPanel[], editPanel: [] as StructuredPanel[], sendFile: [] as string[] };
+  const calls = {
+    sendPanel: [] as StructuredPanel[],
+    editPanel: [] as StructuredPanel[],
+    sendMessage: [] as string[],
+    editMessage: [] as string[],
+    sendFile: [] as string[],
+  };
   const adapter = {
     async sendPanel(_c: ChannelRef, panel: StructuredPanel): Promise<MessageRef> {
       calls.sendPanel.push(panel);
@@ -192,6 +198,13 @@ function spyAdapter() {
     },
     async editPanel(_ref: MessageRef, panel: StructuredPanel): Promise<void> {
       calls.editPanel.push(panel);
+    },
+    async sendMessage(_c: ChannelRef, text: string): Promise<MessageRef> {
+      calls.sendMessage.push(text);
+      return { channel: _c, id: `msg-txt-${calls.sendMessage.length}` };
+    },
+    async editMessage(_ref: MessageRef, text: string): Promise<void> {
+      calls.editMessage.push(text);
     },
     async sendFile(_c: ChannelRef, file: { data: Buffer; filename: string }): Promise<MessageRef> {
       calls.sendFile.push(file.filename);
@@ -214,7 +227,7 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
     ...over,
   });
 
-  function makeDispatchOrch() {
+  function makeDispatchOrch(style: "messages" | "card" = "messages") {
     const { adapter, calls } = spyAdapter();
     const ledger: any[] = [];
     const statuses: string[] = [];
@@ -234,6 +247,7 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
       DEFAULT_MODEL: "default",
       CHANNEL_PRESETS_FILE: undefined,
       SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
+      SEAM_DISPATCH_OUTPUT_STYLE: style,
       channelPresets: {},
       threadPresets: {},
     };
@@ -264,8 +278,8 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
     return { orch, calls, ledger, statuses, compactArgs, injectCalled: () => injectCalled };
   }
 
-  it("routes kind:compact to compactThread (never injectTurn) and posts a result card", async () => {
-    const t = makeDispatchOrch();
+  it('routes kind:compact to compactThread (never injectTurn) and posts a result card ("card" style)', async () => {
+    const t = makeDispatchOrch("card");
     const out = await t.orch.dispatchInjectTurn(compactSpec());
 
     // The primitive ran with the target thread's record and the target channel.
@@ -277,6 +291,25 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
     // Start indicator posted, then finalized into a done card, plus the report file.
     expect(t.calls.sendPanel.length).toBeGreaterThanOrEqual(1);
     expect(t.calls.editPanel.length).toBeGreaterThanOrEqual(1);
+    expect(t.calls.sendFile.length).toBe(1);
+    expect(out.output).toContain("sess-new");
+  });
+
+  it('default "messages" style: plain indicator finalized in place, no card', async () => {
+    const t = makeDispatchOrch(); // default "messages"
+    const out = await t.orch.dispatchInjectTurn(compactSpec());
+
+    expect(t.injectCalled()).toBe(false);
+    // No embeds at all — the indicator and done state are plain messages.
+    expect(t.calls.sendPanel.length).toBe(0);
+    expect(t.calls.editPanel.length).toBe(0);
+    // Plain italic start indicator, edited in place into a ✅ done line.
+    expect(t.calls.sendMessage.length).toBe(1);
+    expect(t.calls.sendMessage[0]).toMatch(/^_▶ compact/);
+    expect(t.calls.editMessage.length).toBe(1);
+    expect(t.calls.editMessage[0]).toMatch(/^_✅ compact/);
+    expect(t.calls.editMessage[0]).toContain("sess-new");
+    // The premium report is still attached as a file.
     expect(t.calls.sendFile.length).toBe(1);
     expect(out.output).toContain("sess-new");
   });

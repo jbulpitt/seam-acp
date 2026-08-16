@@ -17,6 +17,7 @@ import { Orchestrator } from "./platforms/discord/orchestrator.js";
 import { buildGlobalMcpServers } from "./mcp.js";
 import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
 import { ScheduledPromptManager } from "./core/scheduled-prompts/manager.js";
+import { DispatchWatcher } from "./core/dispatch/watcher.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -373,6 +374,17 @@ async function main(): Promise<void> {
   orchestrator.setScheduledManager(scheduledManager);
   scheduledManager.start();
 
+  // Operator-dispatch bridge: a trusted process drops a spec into
+  // <DATA_DIR>/dispatch/pending/ and the watcher runs it as a turn in the
+  // target thread, writing the captured output to done/. Started after the
+  // adapter so a dispatch never fires before Discord can receive its output.
+  const dispatchWatcher = new DispatchWatcher({
+    dataDir: config.DATA_DIR,
+    logger: logger.child({ mod: "dispatch" }),
+    onDispatch: (spec) => orchestrator.dispatchInjectTurn(spec),
+  });
+  await dispatchWatcher.start();
+
   logger.info("seam-acp ready");
 
   // Best-effort startup notification to a configured channel.
@@ -392,6 +404,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, "shutting down");
     orchestrator.stopSentinelWatcher();
     scheduledManager.stop();
+    dispatchWatcher.stop();
     stopTunnelGist?.();
     try {
       await adapter.stop();

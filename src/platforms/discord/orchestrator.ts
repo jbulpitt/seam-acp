@@ -45,6 +45,9 @@ import { describeCron, validateCron, nextRun as cronNextRun } from "../../core/s
 
 /** Accent color for scheduled-prompt cards ("cron blue"). */
 const SCHEDULED_COLOR = 0x3498db;
+/** Operator-dispatch cards — distinct from scheduled blue so a thread's history
+ *  shows at a glance which turns came from the dispatch bridge. */
+const DISPATCH_COLOR = 0x9b59b6;
 
 const SCHEDULE_DEFAULT_TZ = "America/Chicago";
 const SCHEDULE_TIMEZONES = [
@@ -76,6 +79,7 @@ import {
   type InjectTurnOptions,
   type InjectTurnResult,
 } from "../../core/inject-turn.js";
+import type { DispatchSpec } from "../../core/dispatch/types.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { ATTACH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
@@ -309,6 +313,45 @@ export class Orchestrator {
     });
 
     await newQueue;
+  }
+
+  /**
+   * Run `task` on a channel's turn queue — the same FIFO `handleIncomingMessage`
+   * uses — so a programmatic turn can never run concurrently with a user turn on
+   * that thread. This is what makes `injectTurn(session: "live")` safe: it calls
+   * `runtime.onEvent()`, which *replaces* the handler an in-flight turn
+   * installed, so overlapping the two would silently steal the user's stream.
+   *
+   * Unlike a user message this never pre-empts what is already running: no
+   * `channelGenerations` bump, no `abortTurn`. It just waits its place in line.
+   * (The converse still holds — a user message arriving mid-dispatch aborts the
+   * dispatch, because the user is the priority interrupt.)
+   */
+  private queueOnChannel<T>(channelId: string, task: () => Promise<T>): Promise<T> {
+    const existing = this.channelQueues.get(channelId) ?? Promise.resolve();
+    const result = existing.then(async () => {
+      // Count in the restart-drain counter so a redeploy waits for us.
+      this.activeTurns++;
+      try {
+        return await task();
+      } finally {
+        this.activeTurns--;
+      }
+    });
+    // The link stored in channelQueues must never reject: the next task chains
+    // off it, and a rejected link would both skip that task and surface as an
+    // unhandled rejection. The real outcome still goes to our caller.
+    const link: Promise<void> = result.then(
+      () => undefined,
+      () => undefined
+    );
+    this.channelQueues.set(channelId, link);
+    void link.then(() => {
+      if (this.channelQueues.get(channelId) === link) {
+        this.channelQueues.delete(channelId);
+      }
+    });
+    return result;
   }
 
   private async handleIncomingMessageInner(msg: IncomingMessage): Promise<void> {
@@ -2086,6 +2129,124 @@ export class Orchestrator {
     this.scheduledManager = m;
   }
 
+  /**
+   * DispatchWatcher `onDispatch` handler: run one operator-dispatched turn in
+   * the target thread and hand the captured text back so the watcher can write
+   * it to `done/<id>.json`.
+   *
+   * Resolves ⇒ the watcher records `completed`; throws ⇒ `failed`. `injectTurn`
+   * never throws for turn-level failures (it returns `{ error }`), so we
+   * translate that into a rejection here — the watcher's contract is
+   * promise-shaped.
+   *
+   * Output goes two places: the captured text is returned to the operator via
+   * the done-file, *and* posted to the target thread so the worker's Discord
+   * shows what it was asked and what it answered. (`injectTurn`'s `outputTo`
+   * only routes agent-emitted *files*; text is captured, not streamed — the
+   * scheduled-prompt runner posts it afterwards for the same reason.)
+   */
+  async dispatchInjectTurn(spec: DispatchSpec): Promise<{ output: string; stopReason: string }> {
+    const target: ChannelRef = { platform: PLATFORM, id: spec.target };
+    const record = this.router.ensureSessionRecord({
+      platform: PLATFORM,
+      channelRef: spec.target,
+      cwd: spec.cwd ?? this.config.REPOS_ROOT,
+    });
+
+    // TODO: log to delegation_log — the delegation-ledger lane owns the schema;
+    // this is the dispatch site it should hook (spec.id, spec.target,
+    // spec.correlationId, and the result below).
+
+    if (spec.session === "live" && (spec.model || spec.effort)) {
+      // injectTurn's live path reuses the thread's persistent runtime, which was
+      // started from the session's own config — it has no per-turn model/effort
+      // knob. Say so rather than silently running on the wrong model.
+      this.logger.warn(
+        { dispatch: spec.id, target: spec.target, model: spec.model, effort: spec.effort },
+        "dispatch: model/effort ignored for session=live (thread config wins); use session=isolated to override"
+      );
+    }
+
+    const run = async (): Promise<{ output: string; stopReason: string }> => {
+      const result = await this.injectTurn(record, spec.prompt, {
+        session: spec.session,
+        ...(spec.model ? { model: spec.model } : {}),
+        ...(spec.effort ? { effort: spec.effort } : {}),
+        ...(spec.cwd ? { cwd: spec.cwd } : {}),
+        outputTo: target,
+        ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
+        timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
+        // Drain trailing text that lands after the prompt RPC resolves, so the
+        // done-file holds the whole answer rather than a truncated one.
+        awaitIdle: true,
+        logContext: { dispatch: spec.id },
+      });
+      // Partial output is still output — post whatever was captured either way.
+      await this.postDispatchOutput(target, spec, result.text, result.error);
+      if (result.error) throw new Error(result.error);
+      return { output: result.text, stopReason: result.stopReason ?? "" };
+    };
+
+    if (spec.session === "live") {
+      // Share the thread's persistent session ⇒ must not overlap a user turn.
+      return this.queueOnChannel(spec.target, run);
+    }
+    // Isolated: own throwaway runtime, so it cannot collide with the thread's
+    // live session and needn't queue. Still counted for the restart drain.
+    this.activeTurns++;
+    try {
+      return await run();
+    } finally {
+      this.activeTurns--;
+    }
+  }
+
+  /** Post a dispatch's captured output to the target thread — cards, or a file
+   *  when it's too long. Best-effort: a Discord failure must not fail the
+   *  dispatch, whose real result channel is the done-file. */
+  private async postDispatchOutput(
+    channel: ChannelRef,
+    spec: DispatchSpec,
+    text: string,
+    error?: string
+  ): Promise<void> {
+    const label = spec.correlationId ? `${spec.id} · ${spec.correlationId}` : spec.id;
+    try {
+      if (error) {
+        await this.sendResultCard(
+          channel,
+          "📨 Dispatch failed",
+          `❌ ${error.slice(0, 1500)}`,
+          0xe74c3c
+        );
+      }
+      const body = text.trim();
+      if (!body) {
+        if (!error) {
+          await this.sendResultCard(channel, "📨 Dispatch", "✅ Done — no output.", DISPATCH_COLOR);
+        }
+        return;
+      }
+      const chunks = this.chunkString(body, 3900);
+      if (chunks.length <= 3) {
+        for (let j = 0; j < chunks.length; j++) {
+          const suffix = chunks.length > 1 ? ` (${j + 1}/${chunks.length})` : "";
+          await this.sendResultCard(channel, `📨 Dispatch${suffix}`, chunks[j]!, DISPATCH_COLOR);
+        }
+      } else {
+        await this.sendResultCard(
+          channel,
+          "📨 Dispatch",
+          `✅ Done — full output attached (${body.length} chars).`,
+          DISPATCH_COLOR
+        );
+        await this.sendResultFile(channel, label, body, "dispatch");
+      }
+    } catch (err) {
+      this.logger.warn({ err, dispatch: spec.id }, "dispatch: posting output to thread failed");
+    }
+  }
+
   /** Manager `onFire` handler: run a scheduled prompt as an **isolated job** (own
    *  throwaway session, thread's repo + model + attachments) and post the output
    *  to the thread as blue cards. Owns last_run/last_status only — the manager
@@ -2335,8 +2496,13 @@ export class Orchestrator {
     else await this.adapter.sendMessage(channel, `${title}\n${description}`);
   }
 
-  private async sendResultFile(channel: ChannelRef, name: string, body: string): Promise<void> {
-    const filename = `scheduled-${name.replace(/[^\w.-]+/g, "_") || "output"}.md`;
+  private async sendResultFile(
+    channel: ChannelRef,
+    name: string,
+    body: string,
+    prefix = "scheduled"
+  ): Promise<void> {
+    const filename = `${prefix}-${name.replace(/[^\w.-]+/g, "_") || "output"}.md`;
     if (this.adapter.sendFile) {
       await this.adapter.sendFile(channel, { data: Buffer.from(body, "utf8"), filename, mimeType: "text/markdown" });
     } else {

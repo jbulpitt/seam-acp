@@ -51,6 +51,15 @@ export interface DispatchSpec {
    *  the final output to the chain's origin) instead of the normal `returnTo`
    *  report-back. */
   chainId?: string;
+  /** Live-visibility toggle. When absent or `true` (the default), the runtime
+   *  posts a start indicator into the target thread and progressively streams
+   *  the worker's agent-text into it as it runs. When `false`, the run stays
+   *  quiet — the indicator still posts, but the body is captured silently and
+   *  posted once at the end (the escape hatch for a single clean artifact).
+   *  Report-back / chain delivery of the FULL captured text is unaffected
+   *  either way — streaming is purely about live visibility in the run's own
+   *  target thread. */
+  stream?: boolean;
   createdUtc: string;
 }
 
@@ -89,6 +98,7 @@ export const DispatchSpecSchema = z.object({
   kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek"]).optional(),
   wakeChainDepth: z.number().int().min(0).optional(),
   chainId: z.string().min(1).optional(),
+  stream: z.boolean().optional(),
   createdUtc: z.string().optional(),
 });
 
@@ -124,6 +134,7 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.kind ? { kind: d.kind } : {}),
     ...(d.wakeChainDepth !== undefined ? { wakeChainDepth: d.wakeChainDepth } : {}),
     ...(d.chainId ? { chainId: d.chainId } : {}),
+    ...(d.stream !== undefined ? { stream: d.stream } : {}),
     createdUtc: d.createdUtc ?? new Date().toISOString(),
   };
 }

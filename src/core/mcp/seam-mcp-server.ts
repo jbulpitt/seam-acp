@@ -202,6 +202,13 @@ const TOOLS = [
           type: "string",
           description: "Thread id to report the result back into. Defaults to YOUR thread.",
         },
+        stream: {
+          type: "boolean",
+          description:
+            "Live-stream the worker's output into its thread as it runs, behind a start indicator (default true). " +
+            "Set false for a quiet run that posts one clean artifact at the end (the indicator still shows). " +
+            "Your report-back always gets the full result either way.",
+        },
       },
       required: ["worker", "prompt"],
     },
@@ -216,6 +223,12 @@ const TOOLS = [
       properties: {
         to: { type: "string", description: "Destination thread id." },
         content: { type: "string", description: "The message to deliver into that thread." },
+        stream: {
+          type: "boolean",
+          description:
+            "Live-stream the delivery into the destination thread as it runs, behind a start indicator " +
+            "(default true). Set false for a quiet run that posts one clean artifact at the end.",
+        },
       },
       required: ["to", "content"],
     },
@@ -690,6 +703,7 @@ export class SeamMcpServer {
     const worker = requireString(args, "worker");
     const prompt = requireString(args, "prompt");
     const returnTo = optionalString(args, "returnTo") ?? caller.channelRef;
+    const stream = optionalBool(args, "stream");
     const toThread = looksLikeThreadId(worker);
     const dispatchId = randomUUID();
 
@@ -706,6 +720,7 @@ export class SeamMcpServer {
       returnTo,
       kind: "handoff",
       correlationId: dispatchId,
+      ...(stream !== undefined ? { stream } : {}),
       createdUtc: new Date().toISOString(),
     };
     await this.deps.enqueueDispatch(spec);
@@ -725,6 +740,7 @@ export class SeamMcpServer {
   ): Promise<McpToolResult> {
     const to = requireString(args, "to");
     const content = requireString(args, "content");
+    const stream = optionalBool(args, "stream");
     const dispatchId = randomUUID();
     const spec: DispatchSpec = {
       id: dispatchId,
@@ -734,6 +750,7 @@ export class SeamMcpServer {
       returnTo: caller.channelRef,
       kind: "forward",
       correlationId: dispatchId,
+      ...(stream !== undefined ? { stream } : {}),
       createdUtc: new Date().toISOString(),
     };
     await this.deps.enqueueDispatch(spec);
@@ -1152,6 +1169,12 @@ function optionalString(args: Record<string, unknown>, key: string): string | un
   if (v === undefined || v === null) return undefined;
   if (typeof v !== "string" || v.trim() === "") return undefined;
   return v;
+}
+/** Read an optional boolean arg. Absent / non-boolean ⇒ undefined (so the
+ *  caller can apply its own default). */
+function optionalBool(args: Record<string, unknown>, key: string): boolean | undefined {
+  const v = args[key];
+  return typeof v === "boolean" ? v : undefined;
 }
 function requireStringArray(args: Record<string, unknown>, key: string): string[] {
   const v = args[key];

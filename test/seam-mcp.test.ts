@@ -274,6 +274,43 @@ describe("SeamMcpServer", () => {
     expect(spec.returnTo).toBe("thread-caller");
   });
 
+  it("handoff/forward advertise the stream option in their input schema", async () => {
+    h = await makeHarness();
+    const { body } = await h.call("tools/list");
+    const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
+    expect(byName.get("handoff").inputSchema.properties.stream.type).toBe("boolean");
+    expect(byName.get("forward").inputSchema.properties.stream.type).toBe("boolean");
+  });
+
+  it("handoff defaults stream ON (omitted from spec) and honors stream:false", async () => {
+    h = await makeHarness();
+    // Omitted → spec carries no `stream`, so the runtime default (ON) applies.
+    await h.call(
+      "tools/call",
+      { name: "handoff", arguments: { worker: "reviewer", prompt: "review" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(h.enqueued[0]!.stream).toBeUndefined();
+
+    // Explicit false → the escape hatch is plumbed straight onto the spec.
+    await h.call(
+      "tools/call",
+      { name: "handoff", arguments: { worker: "reviewer", prompt: "review", stream: false } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(h.enqueued[1]!.stream).toBe(false);
+  });
+
+  it("forward plumbs stream:false onto the spec", async () => {
+    h = await makeHarness();
+    await h.call(
+      "tools/call",
+      { name: "forward", arguments: { to: "222222222222222222", content: "relay", stream: false } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(h.enqueued[0]!.stream).toBe(false);
+  });
+
   it("steer enqueues a live dispatch of the FRAMED prompt into the target thread", async () => {
     h = await makeHarness();
     await h.call(

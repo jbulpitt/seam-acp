@@ -77,6 +77,13 @@ const WORKFLOWS_COLOR = 0x1abc9c;
 /** Operator-dispatch cards — distinct from scheduled blue so a thread's history
  *  shows at a glance which turns came from the dispatch bridge. */
 const DISPATCH_COLOR = 0x9b59b6;
+/** Error accent for a failed dispatch stream panel (matches sendResultCard). */
+const DISPATCH_ERROR_COLOR = 0xe74c3c;
+/** Max chars of streamed body shown in the live/done indicator embed. Discord
+ *  caps an embed description at 4096; we keep headroom for the "…" tail marker
+ *  and the "full output attached" note. A body larger than this spills to a
+ *  file at finalize (mirrors postDispatchOutput's overflow path). */
+const DISPATCH_STREAM_DESC_MAX = 3800;
 
 /** Accent color for preset cards ("preset purple"). */
 const PRESET_COLOR = 0x9b59b6;
@@ -137,10 +144,12 @@ import { stageAttachment, sweepStagedAttachments } from "../../agents/attachment
 import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { SerialQueue } from "../../core/serial-queue.js";
+import { StreamingPanel } from "../../core/streaming-panel.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import {
   defaultSessionConfig,
   type ActiveProject,
+  type DelegationKind,
   type PermissionPolicyMode,
   type Preset,
   type SessionConfigState,
@@ -2979,8 +2988,64 @@ export class Orchestrator {
       );
     }
 
+    // Live-visibility (this feature): default ON. When on, we post a start
+    // indicator and stream the worker's agent-text into it. `stream: false` is
+    // the escape hatch that keeps today's quiet capture-and-post (the indicator
+    // still shows). Report-back / chain delivery below use `result.text` — the
+    // WHOLE captured answer — regardless, so streaming is purely additive.
+    const streaming = spec.stream !== false;
+    const header = this.dispatchIndicatorHeader(spec, preset ?? null);
+
     const run = async (): Promise<{ output: string; stopReason: string }> => {
       try { this.store.updateDelegationStatus(spec.id, "running"); } catch { /* best-effort */ }
+      const startedAt = Date.now();
+
+      // START INDICATOR (unconditional): the moment the turn begins, post a slim
+      // header into the target thread showing what's running. This is the SAME
+      // message that then streams — in streaming mode the worker's output flows
+      // into its description; in quiet mode it stays as the header while the body
+      // is posted below. Best-effort: a post failure must never break the turn,
+      // it just costs live visibility.
+      let panelRef: MessageRef | undefined;
+      try {
+        const startPanel = this.dispatchStreamPanel({ header, text: "", done: false, elapsedMs: 0 });
+        panelRef = this.adapter.sendPanel
+          ? await this.adapter.sendPanel(target, startPanel)
+          : await this.adapter.sendMessage(target, serializePanelText(startPanel));
+      } catch (err) {
+        this.logger.warn({ err, dispatch: spec.id }, "dispatch: start-indicator post failed");
+      }
+
+      // Streaming renderer: progressively edit `panelRef` with the worker's
+      // agent-text as it arrives, throttled + serialized so we never issue an
+      // editMessage-per-token storm (StreamingPanel reuses the SerialQueue the
+      // user-turn status panel relies on). Only wired when streaming is on AND
+      // we actually have a panel to edit.
+      let streamPanel: StreamingPanel | undefined;
+      // Terminal-render context, filled in by finalizeDispatchStream just before
+      // the last (done) edit — the streaming callback is defined here, before the
+      // turn's error/overflow outcome is known.
+      const streamState: { error?: string; attached: boolean } = { attached: false };
+      if (streaming && panelRef) {
+        const ref = panelRef;
+        streamPanel = new StreamingPanel(async (text, done) => {
+          const panel = this.dispatchStreamPanel({
+            header,
+            text,
+            done,
+            elapsedMs: Date.now() - startedAt,
+            ...(done && streamState.error ? { error: streamState.error } : {}),
+            ...(done && streamState.attached ? { fullAttached: true } : {}),
+          });
+          try {
+            if (this.adapter.editPanel) await this.adapter.editPanel(ref, panel);
+            else await this.adapter.editMessage(ref, serializePanelText(panel));
+          } catch (err) {
+            this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream edit failed");
+          }
+        });
+      }
+
       // Wake turns (#59, D8): mark this thread as running a woken turn at its
       // chain depth, so a `schedule_wake` call *during* the turn nests one level
       // deeper (chain-depth cap). Cleared in the finally below.
@@ -2997,6 +3062,16 @@ export class Orchestrator {
           outputTo: target,
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
           timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
+          // Feed live agent-text into the stream panel. injectTurn still
+          // accumulates the FULL text into `result.text` in parallel, so
+          // streaming is lossless — report-back / done-file get the whole answer.
+          ...(streamPanel
+            ? {
+                onEvent: async (event) => {
+                  if (event.kind === "agent-text") streamPanel!.append(event.text);
+                },
+              }
+            : {}),
           // Drain trailing text that lands after the prompt RPC resolves, so the
           // done-file holds the whole answer rather than a truncated one.
           awaitIdle: true,
@@ -3006,8 +3081,17 @@ export class Orchestrator {
         // The turn is over — no more `schedule_wake` calls can nest under it.
         if (isWake) this.activeWakeDepth.delete(spec.target);
       }
-      // Partial output is still output — post whatever was captured either way.
-      await this.postDispatchOutput(target, spec, result.text, result.error);
+
+      // Visibility post. Streaming: finalize the panel IN PLACE (no second copy
+      // of the body) — the streamed panel becomes the done card, with the full
+      // text spilled to a file only when it overflows the embed. Quiet: fall
+      // back to today's capture-and-post cards below the untouched indicator.
+      if (streamPanel && panelRef) {
+        await this.finalizeDispatchStream(target, spec, streamPanel, streamState, result);
+      } else {
+        // Partial output is still output — post whatever was captured either way.
+        await this.postDispatchOutput(target, spec, result.text, result.error);
+      }
       const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
       try { this.store.updateDelegationStatus(spec.id, ledgerStatus); } catch { /* best-effort */ }
       // Chain advance (#25): a hop carrying a chainId drives the chain forward
@@ -3223,6 +3307,126 @@ export class Orchestrator {
     } catch (err) {
       this.logger.warn({ err, dispatch: spec.id }, "dispatch: posting output to thread failed");
     }
+  }
+
+  /** Human label for a dispatch kind, used in the start indicator. A hop
+   *  carrying a chainId reads as "chain" regardless of its kind. */
+  private dispatchKindLabel(kind: DelegationKind | undefined, chained: boolean): string {
+    if (chained) return "chain";
+    switch (kind) {
+      case "forward": return "forward";
+      case "wake": return "wake fired";
+      case "watch": return "watch fired";
+      case "report_back": return "report-back";
+      case "peek": return "peek";
+      case "scheduled": return "scheduled";
+      case "handoff":
+      default: return "handoff";
+    }
+  }
+
+  /** Collapse a prompt to a single-line preview of at most `max` chars. */
+  private previewLine(s: string, max: number): string {
+    const oneLine = s.replace(/\s+/g, " ").trim();
+    if (oneLine.length <= max) return oneLine;
+    return `${oneLine.slice(0, max - 1).trimEnd()}…`;
+  }
+
+  /** The start-indicator header line for a dispatch, e.g.
+   *  `▶ handoff · thread <id> → <preview>` or `▶ watch fired · <preview>`.
+   *  Kind-aware, with the source/caller shown when known (a preset name, or the
+   *  report-back thread that handoff/forward default to the caller). */
+  private dispatchIndicatorHeader(spec: DispatchSpec, preset: Preset | null): string {
+    const label = this.dispatchKindLabel(spec.kind, !!spec.chainId);
+    const preview = this.previewLine(spec.prompt, 70);
+    const source = preset
+      ? `preset "${preset.name}"`
+      : spec.returnTo
+        ? `thread ${spec.returnTo}`
+        : undefined;
+    return source
+      ? `▶ ${label} · ${source} → ${preview}`
+      : `▶ ${label} · ${preview}`;
+  }
+
+  /** Tail of `s` bounded to the embed budget, prefixed with an ellipsis when
+   *  truncated (we keep the freshest output visible while streaming). */
+  private tailForPanel(s: string): string {
+    if (s.length <= DISPATCH_STREAM_DESC_MAX) return s;
+    return `…${s.slice(s.length - DISPATCH_STREAM_DESC_MAX)}`;
+  }
+
+  /** Build the streaming/indicator panel for a dispatch. `done: false` renders
+   *  the live view (header + streamed tail + cursor); `done: true` renders the
+   *  terminal state (✅/❌ header + final body, or an overflow note when the full
+   *  text was spilled to a file). This one panel is posted once and edited in
+   *  place — the start indicator, the live stream, and the done card are all the
+   *  same message. */
+  private dispatchStreamPanel(opts: {
+    header: string;
+    text: string;
+    done: boolean;
+    elapsedMs: number;
+    error?: string;
+    fullAttached?: boolean;
+  }): StructuredPanel {
+    const { header, text, done, elapsedMs, error, fullAttached } = opts;
+    const elapsedSec = Math.max(0, Math.round(elapsedMs / 1000));
+    const title = !done
+      ? header
+      : error
+        ? header.replace(/^▶/, "❌")
+        : header.replace(/^▶/, "✅");
+    const trimmed = text.trim();
+    let description: string;
+    if (!done) {
+      description = trimmed ? `${this.tailForPanel(trimmed)}…` : "_starting…_";
+    } else if (error) {
+      const partial = trimmed ? `\n\n${this.tailForPanel(trimmed)}` : "";
+      description = `❌ ${error.slice(0, 800)}${partial}`;
+    } else if (!trimmed) {
+      description = "✅ Done — no output.";
+    } else if (fullAttached) {
+      description =
+        `${this.tailForPanel(trimmed)}\n\n` +
+        `_✅ Done — full output attached below (${trimmed.length} chars)._`;
+    } else {
+      description = trimmed;
+    }
+    const footer = done ? `⏱ ${elapsedSec}s` : `⏱ ${elapsedSec}s · streaming…`;
+    return {
+      color: error ? DISPATCH_ERROR_COLOR : DISPATCH_COLOR,
+      title: title.slice(0, 250),
+      description: description.slice(0, 4096),
+      fields: [],
+      footer,
+    };
+  }
+
+  /** Finalize a streamed dispatch panel IN PLACE: spill the full body to a file
+   *  when it overflows the embed (once — no duplicate card), record the terminal
+   *  error/attachment state, then issue the last serialized edit that flips the
+   *  panel to its done card. Never re-posts the whole body — that is what makes
+   *  streaming replace, not duplicate, `postDispatchOutput`. */
+  private async finalizeDispatchStream(
+    target: ChannelRef,
+    spec: DispatchSpec,
+    streamPanel: StreamingPanel,
+    streamState: { error?: string; attached: boolean },
+    result: InjectTurnResult
+  ): Promise<void> {
+    const body = (result.text ?? "").trim();
+    if (result.error) streamState.error = result.error;
+    if (body.length > DISPATCH_STREAM_DESC_MAX) {
+      const label = spec.correlationId ? `${spec.id} · ${spec.correlationId}` : spec.id;
+      try {
+        await this.sendResultFile(target, label, body, "dispatch");
+        streamState.attached = true;
+      } catch (err) {
+        this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream overflow file send failed");
+      }
+    }
+    await streamPanel.finalize();
   }
 
   /** Manager `onFire` handler: run a scheduled prompt as an **isolated job** (own

@@ -137,11 +137,11 @@ describe("SeamMcpServer", () => {
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
 
-  it("tools/list advertises handoff, forward, peek", async () => {
+  it("tools/list advertises handoff, forward, steer, peek", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
-    expect(names).toEqual(["forward", "handoff", "peek"]);
+    expect(names).toEqual(["forward", "handoff", "peek", "steer"]);
     for (const t of body.result.tools) {
       expect(t.inputSchema.type).toBe("object");
     }
@@ -197,6 +197,24 @@ describe("SeamMcpServer", () => {
     expect(spec.prompt).toBe("relay this");
     expect(spec.session).toBe("live");
     expect(spec.returnTo).toBe("thread-caller");
+  });
+
+  it("steer enqueues a live dispatch of the FRAMED prompt into the target thread", async () => {
+    h = await makeHarness();
+    await h.call(
+      "tools/call",
+      { name: "steer", arguments: { thread: "333333333333333333", prompt: "focus on the failing test first" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    const spec = h.enqueued[0]!;
+    expect(spec.kind).toBe("handoff");
+    expect(spec.target).toBe("333333333333333333");
+    expect(spec.session).toBe("live");
+    expect(spec.returnTo).toBe("thread-caller");
+    // The raw prompt is wrapped in the <seam-steer> frame, not passed verbatim.
+    expect(spec.prompt).toContain("<seam-steer>");
+    expect(spec.prompt).toContain("focus on the failing test first");
+    expect(spec.prompt).toContain("steering you mid-task");
   });
 
   it("tools/call with a MISSING token returns a JSON-RPC error and enqueues nothing", async () => {

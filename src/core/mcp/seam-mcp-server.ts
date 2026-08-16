@@ -26,6 +26,7 @@ import type { HttpHeader, McpServer } from "@agentclientprotocol/sdk";
 import type { Logger } from "../../lib/logger.js";
 import type { SessionRecord } from "../types.js";
 import type { DispatchSpec } from "../dispatch/types.js";
+import { frameSteerPrompt } from "../steer.js";
 
 /** MCP protocol version we speak. We echo the client's if it sends a newer one
  *  it thinks we support; otherwise advertise this. */
@@ -96,6 +97,21 @@ const TOOLS = [
     },
   },
   {
+    name: "steer",
+    description:
+      "Redirect a teammate mid-task. Injects a framed steering instruction into that thread's LIVE " +
+      "session (its history is preserved) so it adjusts course now. Use when a running teammate is " +
+      "heading the wrong way or you have a new constraint for it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        thread: { type: "string", description: "Target thread id to steer." },
+        prompt: { type: "string", description: "The steering instruction to inject now." },
+      },
+      required: ["thread", "prompt"],
+    },
+  },
+  {
     name: "peek",
     description:
       "Read the most recent messages from a thread WITHOUT posting anything, so you can catch up on " +
@@ -122,6 +138,7 @@ const INSTRUCTIONS = [
   "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
   "  result is dispatched back into your thread when it completes.",
   "- forward(to, content): relay a message into another thread (thin handoff, no specialist framing).",
+  "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
   "- peek(thread, count?): read another thread's recent messages to get context before delegating.",
   "",
   "Prefer handoff to a preset for well-scoped specialist work, and to a thread id when a specific",
@@ -264,6 +281,8 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolHandoff(record, args));
         case "forward":
           return rpcResult(id, await this.toolForward(record, args));
+        case "steer":
+          return rpcResult(id, await this.toolSteer(record, args));
         case "peek":
           return rpcResult(id, await this.toolPeek(args));
         default:
@@ -341,6 +360,39 @@ export class SeamMcpServer {
     return textResult(
       `Forwarded into thread ${to} (dispatch ${dispatchId}). ` +
         `Any reply will be reported back into thread ${caller.channelRef}.`
+    );
+  }
+
+  /** Steer a teammate: enqueue a LIVE dispatch into the target thread whose
+   *  prompt is the framed steer text, so it lands in that thread's own session
+   *  (history preserved). Minimal by design — unlike the `/seam steer` command
+   *  it does not preemptively cancel the target's in-flight turn; it queues
+   *  behind it on that thread. kind = "handoff". */
+  private async toolSteer(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    const thread = requireString(args, "thread");
+    const prompt = requireString(args, "prompt");
+    const dispatchId = randomUUID();
+    const spec: DispatchSpec = {
+      id: dispatchId,
+      target: thread,
+      prompt: frameSteerPrompt(prompt),
+      session: "live",
+      returnTo: caller.channelRef,
+      kind: "handoff",
+      correlationId: dispatchId,
+      createdUtc: new Date().toISOString(),
+    };
+    await this.deps.enqueueDispatch(spec);
+    this.logger.info(
+      { dispatchId, from: caller.channelRef, thread },
+      "seam-mcp steer enqueued"
+    );
+    return textResult(
+      `Steered thread ${thread} (dispatch ${dispatchId}). The instruction was ` +
+        `injected into its live session; its response is reported back into thread ${caller.channelRef}.`
     );
   }
 

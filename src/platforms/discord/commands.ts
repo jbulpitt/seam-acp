@@ -88,6 +88,24 @@ export function buildSeamCommand(): SlashCommandBuilder {
 
   cmd.addSubcommand((sub) =>
     sub
+      .setName("steer")
+      .setDescription("Redirect a node mid-task: cancel its running turn and inject a new instruction (history kept)")
+      .addStringOption((o) =>
+        o
+          .setName("thread")
+          .setDescription("Target thread id to steer")
+          .setRequired(true)
+      )
+      .addStringOption((o) =>
+        o
+          .setName("prompt")
+          .setDescription("The steering instruction to inject now")
+          .setRequired(true)
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub
       .setName("image")
       .setDescription("Generate an image (Nano Banana 2 / Pro, Imagen 4, FLUX 2)")
       .addStringOption((o) =>
@@ -377,6 +395,7 @@ export type SeamSubcommand =
   | "abort"
   | "cancel"
   | "kill"
+  | "steer"
   | "image"
   | "reset"
   | "tools"

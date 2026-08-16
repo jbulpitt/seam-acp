@@ -92,6 +92,7 @@ import {
   type InjectTurnResult,
 } from "../../core/inject-turn.js";
 import { dispatchDirs, type DispatchSpec } from "../../core/dispatch/types.js";
+import { frameSteerPrompt } from "../../core/steer.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { ATTACH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
@@ -1366,7 +1367,7 @@ export class Orchestrator {
 
   /** Subcommands still allowed in a locked channel/thread — narrow enough
    *  that a kid can unstick a hung turn without being able to touch config. */
-  private static readonly LOCK_EXEMPT_SUBCOMMANDS = new Set(["abort", "cancel"]);
+  private static readonly LOCK_EXEMPT_SUBCOMMANDS = new Set(["abort", "cancel", "steer"]);
 
   async handleSlashInteraction(
     interaction: ChatInputCommandInteraction
@@ -1417,6 +1418,8 @@ export class Orchestrator {
         return this.cmdCancel(interaction);
       case "kill":
         return this.cmdKill(interaction);
+      case "steer":
+        return this.cmdSteer(interaction);
       case "image":
         return this.cmdImage(interaction);
       case "reset":
@@ -3557,6 +3560,102 @@ export class Orchestrator {
         ? "No active sessions to kill."
         : `🔪 Force-killed ${killed} active session(s) — including this thread. Each resumes on its next message.`
     );
+  }
+
+  /** Steer a running (or idle) node: preemptively cancel its in-flight turn,
+   *  then inject a FRAMED re-prompt into that thread's LIVE session so its
+   *  history/session is preserved (no new session). Works cross-thread — the
+   *  `thread` option names the target, which may differ from where the command
+   *  was run — and on an idle node (nothing to cancel, the inject just runs).
+   *
+   *  Cancel uses the same mechanism as `/seam cancel`: a graceful ACP cancel via
+   *  `router.abortTurn(id, { force: false })`. The inject is queued on the
+   *  target's channel (`queueOnChannel`) so it takes the cancelled turn's place
+   *  in line rather than overlapping its event stream. */
+  private async cmdSteer(i: ChatInputCommandInteraction): Promise<void> {
+    const threadId = i.options.getString("thread", true).trim();
+    const prompt = i.options.getString("prompt", true);
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const record = this.router.ensureSessionRecord({
+      platform: PLATFORM,
+      channelRef: threadId,
+      cwd: this.config.REPOS_ROOT,
+    });
+    const target: ChannelRef = { platform: PLATFORM, id: threadId };
+
+    // Preemptive cancel — identical to `/seam cancel` (graceful ACP cancel).
+    const cancelOutcome = await this.router.abortTurn(record.id, { force: false });
+
+    const framed = frameSteerPrompt(prompt);
+    const result = await this.queueOnChannel(threadId, () =>
+      this.injectTurn(record, framed, {
+        session: "live",
+        outputTo: target,
+        timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
+        // Drain trailing text that lands after the prompt RPC resolves so the
+        // posted response holds the whole answer, not a truncated one.
+        awaitIdle: true,
+        logContext: { steer: record.id },
+      })
+    );
+
+    // Post the steered response into the target thread so it's visible there,
+    // then confirm to the operator (ephemerally).
+    await this.postSteerOutput(target, result.text, result.error);
+    const lead =
+      cancelOutcome === "cancelled"
+        ? "🧭 Cancelled the running turn and steered"
+        : "🧭 Steered";
+    await i.editReply(
+      result.error
+        ? `${lead} thread ${threadId}, but it did not complete cleanly: ${result.error.slice(0, 300)}`
+        : `${lead} thread ${threadId}.`
+    );
+  }
+
+  /** Post a steered node's captured response into its thread. Mirrors
+   *  `postDispatchOutput` (chunk to cards, overflow to a file) with a steer
+   *  label. Best-effort — a posting failure must not break the steer. */
+  private async postSteerOutput(
+    channel: ChannelRef,
+    text: string,
+    error?: string
+  ): Promise<void> {
+    try {
+      if (error) {
+        await this.sendResultCard(
+          channel,
+          "🧭 Steer failed",
+          `❌ ${error.slice(0, 1500)}`,
+          0xe74c3c
+        );
+      }
+      const body = text.trim();
+      if (!body) {
+        if (!error) {
+          await this.sendResultCard(channel, "🧭 Steered", "✅ Done — no output.", DISPATCH_COLOR);
+        }
+        return;
+      }
+      const chunks = this.chunkString(body, 3900);
+      if (chunks.length <= 3) {
+        for (let j = 0; j < chunks.length; j++) {
+          const suffix = chunks.length > 1 ? ` (${j + 1}/${chunks.length})` : "";
+          await this.sendResultCard(channel, `🧭 Steered${suffix}`, chunks[j]!, DISPATCH_COLOR);
+        }
+      } else {
+        await this.sendResultCard(
+          channel,
+          "🧭 Steered",
+          `✅ Done — full output attached (${body.length} chars).`,
+          DISPATCH_COLOR
+        );
+        await this.sendResultFile(channel, "steer", body, "steer");
+      }
+    } catch (err) {
+      this.logger.warn({ err, channel: channel.id }, "steer: posting output to thread failed");
+    }
   }
 
   // -----------------------------------------------------------------------

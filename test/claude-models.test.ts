@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   getClaudeContextWindow,
+  isForwardableFullModelId,
   makeClaudeProfile,
 } from "../src/agents/profiles/claude.js";
 
@@ -16,6 +17,7 @@ describe("getClaudeContextWindow", () => {
   });
 
   it("resolves exact canonical IDs to their native window", () => {
+    expect(getClaudeContextWindow("claude-opus-5")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-opus-4-8")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-opus-4-7")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-opus-4-6")).toBe(200_000);
@@ -30,6 +32,9 @@ describe("getClaudeContextWindow", () => {
     expect(getClaudeContextWindow("claude-opus-4-8-20260115")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-opus-4-6-20250101")).toBe(200_000);
     expect(getClaudeContextWindow("claude-opus-4-10")).toBe(1_000_000);
+    expect(getClaudeContextWindow("claude-opus-5-20260725")).toBe(1_000_000);
+    expect(getClaudeContextWindow("claude-opus-5-1")).toBe(1_000_000);
+    expect(getClaudeContextWindow("claude-opus-6")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-sonnet-4-5")).toBe(200_000);
     expect(getClaudeContextWindow("claude-sonnet-6")).toBe(1_000_000);
   });
@@ -39,6 +44,28 @@ describe("getClaudeContextWindow", () => {
     // [1m] must not force 1M onto a 200K model, nor is it needed for a 1M one.
     expect(getClaudeContextWindow("claude-opus-4-8[1m]")).toBe(1_000_000);
     expect(getClaudeContextWindow("claude-sonnet-4-6[1m]")).toBe(200_000);
+  });
+});
+
+describe("isForwardableFullModelId", () => {
+  it("forwards full canonical Claude IDs (so unadvertised models still work)", () => {
+    for (const id of [
+      "claude-opus-5",
+      "claude-opus-4-8",
+      "claude-fable-5",
+      "claude-sonnet-5",
+      "claude-sonnet-4-6",
+      "claude-haiku-4-5",
+      "  Claude-Opus-5  ",
+    ]) {
+      expect(isForwardableFullModelId(id)).toBe(true);
+    }
+  });
+
+  it("leaves aliases and empty values on the dynamic config-option path", () => {
+    for (const id of ["default", "sonnet", "haiku", "opus", "opus[1m]", "", undefined]) {
+      expect(isForwardableFullModelId(id)).toBe(false);
+    }
   });
 });
 

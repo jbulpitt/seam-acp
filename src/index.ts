@@ -319,6 +319,8 @@ async function main(): Promise<void> {
       ? "always"
       : config.DEFAULT_PERMISSION_POLICY,
     mcpServers,
+    channelPresets: config.channelPresets,
+    threadPresets: config.threadPresets,
   });
 
   const renderer = discordRenderer;

@@ -67,7 +67,7 @@ export async function mapAttachmentsToBlocks(
 
     try {
       if (isImageMime(mime)) {
-        if (caps?.image) {
+        if (caps?.image && MODEL_IMAGE_MIMES.has(mime)) {
           const data = await downloadBase64(a.url, fetchFn);
           blocks.push({
             type: "image",
@@ -76,7 +76,9 @@ export async function mapAttachmentsToBlocks(
           });
           continue;
         }
-        // No vision capability — send as a link so a local agent can still reference it.
+        // No vision capability, or a format the model can't decode directly
+        // (HEIC/HEIF/TIFF/BMP/SVG — see MODEL_IMAGE_MIMES) — send as a link
+        // so a local agent can still reference/convert it via its own tools.
         blocks.push(toResourceLink(a));
         continue;
       }
@@ -220,6 +222,25 @@ export function isModelInlineableAttachment(mime: string, filename: string): boo
   if (MODEL_IMAGE_MIMES.has(m)) return true;
   if (isTextLikeMime(m, filename)) return true;
   return false;
+}
+
+/** Whether an attachment should be sent inline to a *specific* agent, given the
+ *  agent's ACP-advertised image prompt capability (`promptCapabilities.image`).
+ *  A standard image is only inlineable when the agent can actually decode it as
+ *  an image block; when the agent advertises `image:false` (e.g. the Grok CLI's
+ *  `agent stdio` bridge — grok-4.5 has vision, but its ACP layer doesn't accept
+ *  image prompt blocks), an image must be staged to a file path instead, so the
+ *  caller treats it as non-inlineable and stages it. Text stays inlineable
+ *  regardless (delivered via embeddedContext). `undefined` vision (capability
+ *  not known) preserves the legacy inline behavior. */
+export function isInlineableForAgent(
+  mime: string,
+  filename: string,
+  agentHasVision?: boolean
+): boolean {
+  if (!isModelInlineableAttachment(mime, filename)) return false;
+  const isImage = (mime || "").toLowerCase().startsWith("image/");
+  return !(isImage && agentHasVision === false);
 }
 
 async function downloadBase64(

@@ -43,7 +43,20 @@ export interface AgyLs {
 export async function discoverAgyLs(opts: {
   /** Wait up to this many milliseconds before giving up. Default 30s. */
   timeoutMs?: number;
-  /** Directory to scan for `cli-*.log` files. Default `~/.gemini/antigravity-cli/log`. */
+  /**
+   * Read the LS port from THIS specific log file (a private `--log-file` path
+   * the caller passed to its own `agy` spawn). This is the deterministic,
+   * concurrency-safe path: the port comes from our own child's log, so two
+   * agy turns running at once can never latch onto each other's language
+   * server. Prefer this over `logDir`.
+   */
+  logFile?: string;
+  /**
+   * Legacy fallback: scan this directory for `cli-*.log` files and take the
+   * newest one's port. Only used when `logFile` is not given. Racy under
+   * concurrency (newest-wins can pick another turn's server) — see the
+   * `--log-file` fix in agy.ts. Default `~/.gemini/antigravity-cli/log`.
+   */
   logDir?: string;
   /** Optional AbortSignal to cancel the discovery loop. */
   signal?: AbortSignal;
@@ -57,7 +70,9 @@ export async function discoverAgyLs(opts: {
 
   while (Date.now() < deadline) {
     if (opts.signal?.aborted) throw new Error("discovery aborted");
-    const port = await readLatestHttpPort(logDir, newerThan);
+    const port = opts.logFile
+      ? await readHttpPortFromFile(opts.logFile)
+      : await readLatestHttpPort(logDir, newerThan);
     if (port !== undefined) {
       const id = await probeHealthz(port);
       if (id) return { port, instanceId: id };
@@ -65,6 +80,47 @@ export async function discoverAgyLs(opts: {
     await delay(300);
   }
   throw new Error(`agy language server did not appear within ${timeoutMs}ms`);
+}
+
+/**
+ * Wait for `agy` to report the conversation (cascade) id for a run into its
+ * private `--log-file`, and return it. Deterministic replacement for scanning
+ * the shared `conversations/` dir for the newest new file: the id is read from
+ * THIS child's own log, so concurrent agy turns can never bind onto each
+ * other's cascade.
+ *
+ * agy logs the id in two equivalent forms early in a run:
+ *   `... Created conversation <uuid>`
+ *   `... Print mode: conversation=<uuid>, sending message`
+ * Either anchor works; we match whichever appears first.
+ */
+export async function waitForAgyConversationId(opts: {
+  logFile: string;
+  /** Wait up to this many milliseconds before giving up. Default 30s. */
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}): Promise<string> {
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  const deadline = Date.now() + timeoutMs;
+  // Note the separators differ between the two forms: `Created conversation `
+  // has a trailing space, `Print mode: conversation=` an `=`. Match both.
+  const re =
+    /(?:Created conversation |Print mode: conversation=)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/;
+  while (Date.now() < deadline) {
+    if (opts.signal?.aborted) throw new Error("aborted waiting for conversation id");
+    try {
+      const raw = await fs.readFile(opts.logFile, "utf8");
+      const m = re.exec(raw);
+      if (m?.[1]) return m[1];
+    } catch {
+      /* log file not written yet — retry */
+    }
+    await delay(250);
+  }
+  throw new Error(
+    `agy did not report a conversation id within ${timeoutMs}ms ` +
+      `(is \`agy\` installed and logged in?)`,
+  );
 }
 
 /**
@@ -296,6 +352,24 @@ async function readLatestHttpPort(
     if (m?.[1]) return Number(m[1]);
   }
   return undefined;
+}
+
+/**
+ * Read the HTTP (non-TLS) Connect port from a single, known log file — the
+ * private `--log-file` path we passed to our own `agy` spawn. Unlike
+ * `readLatestHttpPort`, this never scans a shared directory, so it can't pick
+ * up another concurrent turn's server. Returns undefined until the line
+ * `... listening on random port at <N> for HTTP` has been written.
+ */
+async function readHttpPortFromFile(file: string): Promise<number | undefined> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(file, "utf8");
+  } catch {
+    return undefined;
+  }
+  const m = /port at (\d+) for HTTP$/m.exec(raw);
+  return m?.[1] ? Number(m[1]) : undefined;
 }
 
 /** Hit `/healthz` on the candidate port; return `instanceId` if OK. */

@@ -495,9 +495,17 @@ const Schema = z.object({
     .optional(),
 
   /**
-   * Optional path to a JSON file that pre-configures specific Discord parent
-   * channels with locked or default agent / model / cwd. When unset, the
-   * feature is inactive. See PresetsFileSchema below for the shape.
+   * Optional path to a JSON file that pre-configures Discord channels and
+   * threads with a default agent / model / cwd / effort / preamble rider.
+   * Shape: `{ "channels": { "<channelId>": {...} }, "threads": { "<threadId>":
+   * {...} } }`. Channel values apply to every thread under that channel;
+   * thread values override the channel's per-field (rider stacks instead of
+   * overriding). A channel entry's `locked: true` disables all /seam slash
+   * commands (except abort/cancel) for that channel and its threads. Values
+   * are re-resolved from this file on every runtime start — the file is the
+   * source of truth regardless of what's stored in the session DB. When
+   * unset, the feature is inactive. See PresetsFileSchema below for the
+   * exact shape.
    */
   CHANNEL_PRESETS_FILE: z.string().optional(),
 
@@ -521,28 +529,89 @@ const Schema = z.object({
   NEW_THREAD_WIZARD: z.enum(["repo", "full"]).default("repo"),
 });
 
-const PresetFieldSchema = <T extends z.ZodType>(value: T) =>
-  z.object({ value, locked: z.boolean().optional().default(false) });
+const PresetFieldSchema = <T extends z.ZodType>(value: T) => z.object({ value });
 
-const PresetsFileSchema = z.record(
-  z.string().regex(/^\d+$/, "preset key must be a numeric Discord channel id"),
-  z.object({
-    agent: PresetFieldSchema(z.string().min(1)).optional(),
-    model: PresetFieldSchema(z.string().min(1)).optional(),
-    cwd: PresetFieldSchema(z.string().min(1)).optional(),
-  })
-);
+const numericId = z.string().regex(/^\d+$/, "preset key must be a numeric Discord id");
 
-export type ChannelPresetField<T> = { value: T; locked: boolean };
-export type ChannelPreset = {
+// Shared value fields for both channel- and thread-level presets. These are
+// always applied at runtime (no separate per-field lock) — see
+// resolveChannelPreset. Only the channel level additionally carries `locked`,
+// which disables /seam commands entirely for that channel and every thread
+// under it (see orchestrator.ts handleSlashInteraction).
+const PresetValuesSchema = z.object({
+  agent: PresetFieldSchema(z.string().min(1)).optional(),
+  model: PresetFieldSchema(z.string().min(1)).optional(),
+  cwd: PresetFieldSchema(z.string().min(1)).optional(),
+  // Reasoning effort, e.g. "low"/"medium"/"high"/"xhigh"/"max". Silently
+  // ignored at apply time for agents whose profile doesn't support effort
+  // (AgentProfile.effort is "none"/unset, or doesn't offer this level).
+  effort: PresetFieldSchema(z.string().min(1)).optional(),
+  // Extra harness-preamble bullet injected into every turn (see
+  // withHarnessPreamble). Channel and thread riders both apply, stacked.
+  rider: PresetFieldSchema(z.string().min(1)).optional(),
+});
+
+const ChannelPresetSchema = PresetValuesSchema.extend({
+  locked: z.boolean().optional().default(false),
+});
+
+const PresetsFileSchema = z.object({
+  channels: z.record(numericId, ChannelPresetSchema).optional().default({}),
+  threads: z.record(numericId, PresetValuesSchema).optional().default({}),
+});
+
+export type ChannelPresetField<T> = { value: T };
+export type PresetValues = {
   agent?: ChannelPresetField<string>;
   model?: ChannelPresetField<string>;
   cwd?: ChannelPresetField<string>;
+  effort?: ChannelPresetField<string>;
+  rider?: ChannelPresetField<string>;
 };
+export type ChannelPreset = PresetValues & { locked: boolean };
+export type ThreadPreset = PresetValues;
 
 export type Config = z.infer<typeof Schema> & {
   channelPresets: Map<string, ChannelPreset>;
+  threadPresets: Map<string, ThreadPreset>;
 };
+
+/**
+ * Merge the channel-level and thread-level presets for a given (parentId,
+ * threadId) pair — thread values win per-field, channel values fill the
+ * rest. `rider` is the one exception: both apply, stacked (channel rider
+ * first, then thread rider), since a channel-wide rule ("only your own
+ * work") and a thread-specific rule ("this is the reading-log thread")
+ * are meant to compose rather than override each other.
+ */
+export function resolveChannelPreset(
+  config: Pick<Config, "channelPresets" | "threadPresets">,
+  parentId: string | undefined,
+  threadId: string | undefined
+): PresetValues & { riders: string[] } {
+  const chan = (parentId && config.channelPresets.get(parentId)) || undefined;
+  const thread = (threadId && config.threadPresets.get(threadId)) || undefined;
+  const riders = [chan?.rider?.value, thread?.rider?.value].filter(
+    (v): v is string => !!v
+  );
+  return {
+    agent: thread?.agent ?? chan?.agent,
+    model: thread?.model ?? chan?.model,
+    cwd: thread?.cwd ?? chan?.cwd,
+    effort: thread?.effort ?? chan?.effort,
+    riders,
+  };
+}
+
+/** Is this channel (by parent-channel id) locked — i.e. should /seam slash
+ *  commands be refused for it and every thread under it? */
+export function isChannelLocked(
+  config: Pick<Config, "channelPresets">,
+  parentId: string | undefined
+): boolean {
+  if (!parentId) return false;
+  return config.channelPresets.get(parentId)?.locked ?? false;
+}
 
 export function loadConfig(): Config {
   const parsed = Schema.safeParse(process.env);
@@ -563,13 +632,16 @@ export function loadConfig(): Config {
   }
   cfg.REPOS_ROOT = reposRoot;
 
-  const channelPresets = loadChannelPresets(cfg.CHANNEL_PRESETS_FILE);
-  return { ...cfg, channelPresets };
+  const { channelPresets, threadPresets } = loadChannelPresets(cfg.CHANNEL_PRESETS_FILE);
+  return { ...cfg, channelPresets, threadPresets };
 }
 
-function loadChannelPresets(file: string | undefined): Map<string, ChannelPreset> {
-  const out = new Map<string, ChannelPreset>();
-  if (!file) return out;
+function loadChannelPresets(
+  file: string | undefined
+): { channelPresets: Map<string, ChannelPreset>; threadPresets: Map<string, ThreadPreset> } {
+  const channelPresets = new Map<string, ChannelPreset>();
+  const threadPresets = new Map<string, ThreadPreset>();
+  if (!file) return { channelPresets, threadPresets };
   const abs = path.resolve(file);
   let raw: string;
   try {
@@ -594,15 +666,17 @@ function loadChannelPresets(file: string | undefined): Map<string, ChannelPreset
       .join("\n");
     throw new Error(`Invalid CHANNEL_PRESETS_FILE (${abs}):\n${issues}`);
   }
-  for (const [channelId, preset] of Object.entries(result.data)) {
-    if (!preset) continue;
-    const normalized: ChannelPreset = {};
-    if (preset.agent) normalized.agent = preset.agent;
-    if (preset.model) normalized.model = preset.model;
-    if (preset.cwd) normalized.cwd = { ...preset.cwd, value: path.resolve(preset.cwd.value) };
-    out.set(channelId, normalized);
+  for (const [channelId, preset] of Object.entries(result.data.channels)) {
+    const normalized: ChannelPreset = { ...preset };
+    if (preset.cwd) normalized.cwd = { value: path.resolve(preset.cwd.value) };
+    channelPresets.set(channelId, normalized);
   }
-  return out;
+  for (const [threadId, preset] of Object.entries(result.data.threads)) {
+    const normalized: ThreadPreset = { ...preset };
+    if (preset.cwd) normalized.cwd = { value: path.resolve(preset.cwd.value) };
+    threadPresets.set(threadId, normalized);
+  }
+  return { channelPresets, threadPresets };
 }
 
 /** Models from the Codex CLI's bundled catalog (models.json in openai/codex).
@@ -622,6 +696,7 @@ export const CODEX_STATIC_MODELS = [
  *  GROK_MODELS env var overrides this list when set. */
 export const GROK_STATIC_MODELS = [
   { modelId: "grok-build-0.1",                 name: "Grok Build 0.1",             contextLimit: 256_000 },
+  { modelId: "grok-4.5",                       name: "Grok 4.5",                   contextLimit: 500_000 },
   { modelId: "grok-4.3",                       name: "Grok 4.3",                   contextLimit: 1_000_000 },
   { modelId: "grok-4.20-0309-reasoning",       name: "Grok 4.20 Reasoning",        contextLimit: 1_000_000 },
   { modelId: "grok-4.20-0309-non-reasoning",   name: "Grok 4.20 Non-Reasoning",    contextLimit: 1_000_000 },

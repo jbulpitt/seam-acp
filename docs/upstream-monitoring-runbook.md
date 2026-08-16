@@ -4,7 +4,7 @@
 >
 > **Cadence**: Weekly sweep (recommended: Monday), with ad-hoc checks when a major release is announced.
 >
-> **Last updated**: 2026-07-07 (Monday sweep)
+> **Last updated**: 2026-08-16 (daily sweep)
 >
 > **⚠️ AGENT CONSTRAINT — READ-ONLY / REPORTING MODE**: Agents executing this runbook must **never** modify seam-acp source files, run `npm run redeploy`, apply patches, or make any code changes during a monitoring sweep. All code work is tracked via GitHub issues and implemented in **separate, explicitly tasked sessions**. Your job during a sweep is to **find, classify, and file or update GitHub issues** — not to implement fixes.
 
@@ -101,7 +101,7 @@ before running any procedure in this runbook:
 - Transcripts in `~/.gemini/antigravity-cli/brain/<cascadeId>/.system_generated/logs/transcript.jsonl`
 - Effort is baked into model choice (no separate knob) — picker suppressed
 - Profile source: [`agy.ts`](../src/agents/profiles/agy.ts) (1699 lines — largest profile)
-- Latest agy as of 2026-07-03 sweep: **1.0.16** (Go binary; conversation format is now `.db` SQLite as of agy 1.0.4 — `agy.ts` handles both `.db`/`.pb`)
+- Latest agy as of 2026-08-15 sweep: **1.1.13** (Go binary; conversation format is now `.db` SQLite as of agy 1.0.4 — `agy.ts` handles both `.db`/`.pb`; **critical fix in 1.1.1: `agy -p` no longer hangs in subprocess/non-TTY — resolves #29; new `--agent` flag added; request-review mode from 1.1.0 verified non-blocking via #31; 1.1.3: headless soft-deny for permission tools + MCP server hang timeouts + Linux keyring bypass for headless/PM2 hosts; 1.1.4: headless `-p` now honors full `settings.json` policies (permissions, sandbox, file access, artifact review); 1.1.5: stable user-facing model slugs accepted by `--model` + `--effort` flag for headless effort selection + `/effort` command + redesigned `/model` picker with effort gauge; 1.1.6: Custom Agents (Markdown format) + default temp dir read access in headless + deterministic customization sorting + headless print-mode real error surfacing; 1.1.7: compound-command permission prompts fix, disabled-plugin hook fix, MCP OAuth Salesforce/Atlassian fix, `/btw` parent-not-found fix, `-p` eligibility-check ordering fix; 1.1.8: `--output-format` flag in `-p` mode (`text`/`json`/`stream-json`), typed NDJSON `stream-json` event stream with stable `step_type` discriminator + `tool_info` + `subagent_info` + `cache_read_tokens`, `--json-schema` flag, compound-command allow-always rules, `copyOnSelect` setting; assessed for agy.ts integration in #42; 1.1.9: slash-command and skill expansion in `-p` mode — prompts starting with `/` are now resolved as skills/commands instead of passed verbatim; use `--disable-slash-commands` to opt out — ⚠️ may affect seam-acp if Discord users send `/`-prefixed prompts to the agy agent, assessed in #47; improved MCP server background-loading in interactive (headless still blocks); improved permission grants persistence; improved temp-dir write access; fixed stop-hook hang, PostToolUse on non-tool steps, MCP re-auth after dropped connection; **1.1.10** (2026-08-03): Business sign-in for Gemini Enterprise accounts (GE-Standard/GE-Plus) + Workforce Identity Federation sign-in + Application Default Credentials sign-in for Agent Platform; non-blocking advisory banner when same conversation open in another CLI instance (points at `/fork`); terminal sandbox now grants read-only (not writable) access to `.git`; hook ordering fix — hooks in `hooks.json` now run before built-in termination checks, so `PostInvocation` and `Stop` hooks fire correctly; `schedule` tool accepts `DurationSeconds`/`MaxIterations` as bare JSON numbers; **fix: `--model` and `--effort` flags were silently ignored in interactive and headless `-p` runs** (applied after model init — seam-acp `-p` invocations benefit from this fix); fix: bare `--effort` resolving against default model instead of selected model; fix: stopping a subagent tree now kills all descendants; fix: forced-continuation deadlock; MCP background tool marking and process leak fixes; **1.1.11** (2026-08-07): Vim editing mode, non-interactive print-mode for `/usage`, `/quota`, `/credits`, `/model`, `/effort`, `/skills`; allowlist security fix (zero-word entries no longer match everything); fixed MCP admin controls bypass at startup; **1.1.12** (2026-08-11): `disable-slash-command: true` SKILL.md frontmatter flag (hides skill from `/` menu + `/name` resolution, mitigation path for #47); `agy models/agents --output-format json/stream-json` machine-readable output (useful for catalog introspection, see #42); non-interactive print-mode for `/permissions`, `/hooks`, `/help`, `/changelog`, `/config`; fixed `--mode` ignored in headless `-p` runs; fixed startup diagnostics swallowed into log; fixed keyring timeout 1s→5s (headless/PM2 re-login fix); fixed `config.json` atomic write (crash-safe); fixed subagent going silent on parent; fixed `read_url_content` connection leak; **1.1.13** (2026-08-14): `GEMINI_API_KEY` direct auth support — set `modelProvider: "gemini"` in `settings.json`, export `GEMINI_API_KEY`, optionally `GOOGLE_GEMINI_BASE_URL` for custom endpoint — alternative auth path for headless/PM2 deployments; `/codesearch` ripgrep fallback to local search when binary blocked by endpoint security; ripgrep binaries now saved to user cache dir with SHA-256 content-addressed verification (not /tmp); **fixed trajectory truncation** destroying most of long conversation history — fixes agy conversations losing context in long Discord sessions; **fixed unbounded on-disk conversation DB growth** for sessions woken by background tasks/subagents/messages; **fixed transcript corruption** when background message arrived during context compaction — relevant for seam-acp transcript reading; fixed `define_subagent` path-traversal security vulnerability; installed and current as of 2026-08-15 sweep)
 
 ### 1.2 Anthropic — Claude Code
 
@@ -138,7 +138,8 @@ before running any procedure in this runbook:
 - CLI binary: `claude-agent-acp` (env: `CLAUDE_CLI_PATH`)
 - Config dir: `CLAUDE_CONFIG_DIR=<dir>` (default: `~/.claude`)
 - Default model: `CLAUDE_DEFAULT_MODEL` (currently `default` → latest Opus @ 1M on Max)
-- Model picker: `CLAUDE_MODELS` env var — **curated, JSONL-verified entries only**; now **bare full IDs** (e.g. `claude-opus-4-8`, `claude-fable-5`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-haiku-4-5`) plus the `default` alias. **No `[1m]` suffix** — it was retired at claude-agent-acp 0.54.1.
+- Model picker: `CLAUDE_MODELS` env var — **curated, JSONL-verified entries only**; now **bare full IDs** (e.g. `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-haiku-4-5`) plus the `default` alias. **No `[1m]` suffix** — it was retired at claude-agent-acp 0.54.1. Note: bare full IDs are PENDING live validation per account caveat (see #30, #32, #44). **`claude-opus-5`** (GA 2026-07-24, **$5/$25 MTok** — confirmed correct by Anthropic models page 2026-07-31 (Claude Code 2.1.219 release notes showing $10/$50 were incorrect), 1M ctx, adaptive thinking, effort defaults to `high`, knowledge cutoff May 2026) is now the recommended Opus model — tracked in #44. New models `claude-fable-5` (GA June 2026, $10/$50 MTok, 1M ctx, adaptive thinking always-on) tracked in #30. **`claude-opus-4-1` retired August 5, 2026** — confirmed absent from deployed config as of 2026-08-02 sweep; #38 and #11 closed. **`claude-sonnet-5`** ($2/$10 MTok — **pricing now permanent** as of 2026-08-15; previously announced increase to $3/$15 on Sept 1, 2026 cancelled; 1M ctx, adaptive thinking) tracked in #32.
+- Fast mode: `configId: "fast_mode"` via `setSessionConfigOption` is available since 0.54.0 but not yet surfaced in seam-acp (tracked in #37).
 - Model selection RPC: `setSessionConfigOption({ sessionId, configId: "model", value })` (ACP schema v1.16.0 dropped the dedicated `models` field; selection is now a `"model"` `SessionConfigSelect`). The old `unstable_setSessionModel` RPC is gone.
 - Context window: declared per-model in the `CLAUDE_CONTEXT_WINDOWS` table in `claude.ts`, resolved by `getClaudeContextWindow(modelId)` and stamped onto every picker entry's `contextLimit` (orchestrator `staticModels[].contextLimit → modelContextFloor` seed). The agent also reports the true window at runtime via ACP `UsageUpdate.size`. The `[1m]` suffix is **no longer load-bearing**.
 - Effort injection: `_meta.claudeCode.options.effort` (not `set_config_option`, not `reasoningEffort` field)
@@ -404,17 +405,17 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 ### Gather Checklist
 
 #### Google / Antigravity CLI (agy)
-- [ ] Check [Antigravity CLI releases](https://github.com/google-antigravity/antigravity-cli/releases) — last checked version: ___
+- [ ] Check [Antigravity CLI releases](https://github.com/google-antigravity/antigravity-cli/releases) — last checked version: **1.1.13** (2026-08-16 sweep; installed = latest; no new release; #47 and #42 open)
 - [ ] Check [Antigravity CLI CHANGELOG](https://github.com/google-antigravity/antigravity-cli/blob/main/CHANGELOG.md)
 - [ ] Check [Gemini API release notes](https://ai.google.dev/gemini-api/docs/changelog) (models shared with agy)
 - [ ] Scan [Google AI Blog](https://blog.google/technology/ai/) for announcements
 - [ ] Check [Google AI pricing](https://ai.google.dev/gemini-api/docs/pricing) for changes
 
 #### Anthropic / Claude Code
-- [ ] Check [Claude Code releases](https://github.com/anthropics/claude-code/releases) — last checked version: ___
+- [ ] Check [Claude Code releases](https://github.com/anthropics/claude-code/releases) — last checked version: **2.1.233** (2026-08-16 sweep; installed 2.1.222, upgrade tracked in #40; 2.1.233: todo tools removed from Opus 4.8+/Sonnet5/Fable5/Mythos5 by default (CLAUDE_CODE_ENABLE_TODO_TOOLS=1 to restore), [claude-code:unrecognized_model] stderr diagnostic, CLAUDE_CODE_TOOL_MEMORY_LIMIT env var, CLAUDE_CODE_WEBFETCH_CACHE_TTL_MS env var, Linux idle CPU fix, GitLab MR worktree support, forward_user_identity apps gateway setting; #40 updated)
 - [ ] Check [Claude Code CHANGELOG](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)
 - [ ] Check [Claude Code docs changelog](https://docs.anthropic.com/en/docs/claude-code/changelog)
-- [ ] Check [claude-agent-acp releases](https://github.com/agentclientprotocol/claude-agent-acp/releases) — last checked version: ___
+- [ ] Check [claude-agent-acp releases](https://github.com/agentclientprotocol/claude-agent-acp/releases) — last checked version: **0.69.0** (2026-08-16 sweep; installed 0.54.1, upgrade tracked in #39; 0.69.0: report changed files to AIR protocol — additive, no seam-acp code changes needed; #39 updated)
 - [ ] Check [claude-agent-acp CHANGELOG](https://github.com/agentclientprotocol/claude-agent-acp/blob/main/CHANGELOG.md)
 - [ ] Scan [Anthropic News](https://www.anthropic.com/news) for announcements
 - [ ] Check [Anthropic platform release notes](https://docs.anthropic.com/en/release-notes)
@@ -423,7 +424,7 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 - [ ] Check [Anthropic status](https://status.anthropic.com/) for ongoing incidents
 
 #### GitHub / Copilot
-- [ ] Check [Copilot CLI releases](https://github.com/github/copilot-cli/releases) — last checked version: ___
+- [ ] Check [Copilot CLI releases](https://github.com/github/copilot-cli/releases) — last checked version: **1.0.80 stable / 1.0.81-0 pre-release** (2026-08-16 sweep; installed 1.0.80 = stable; no new stable or pre-release since yesterday; #35, #46, #49, #51, #53, #54, #55 open)
 - [ ] Check [Copilot CLI CHANGELOG](https://github.com/github/copilot-cli/blob/main/CHANGELOG.md)
 - [ ] Scan [GitHub Changelog](https://github.blog/changelog/) for Copilot entries
 - [ ] Scan [GitHub Blog](https://github.blog/) for Copilot announcements
@@ -434,14 +435,15 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 - [ ] Check [GitHub Community Announcements](https://github.com/orgs/community/discussions/categories/announcements) for billing/policy updates
 
 #### Opencode / LM Studio
-- [ ] Check [opencode releases](https://github.com/anomalyco/opencode/releases) and npm [`opencode-ai`](https://registry.npmjs.org/opencode-ai/latest) — last checked version: 1.17.13 (latest 1.17.14 — see #12)
+- [ ] Check [opencode releases](https://github.com/anomalyco/opencode/releases) and npm [`opencode-ai`](https://registry.npmjs.org/opencode-ai/latest) — last checked version: **1.18.18** (2026-08-16 sweep; installed 1.15.13, upgrade tracked in #12; no new releases)
 - [ ] Check [opencode config schema](https://opencode.ai/config.json) for shape changes (esp. per-model `modalities`/capability fields)
 - [ ] Check for `opencode acp` subcommand changes or custom-provider auto-discovery
 
 #### ACP Protocol
-- [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^1.1.0`, latest: **1.2.0** (schema v1.19.0; changelog in [typescript-sdk repo](https://github.com/agentclientprotocol/typescript-sdk/releases) — upgrade tracked in #28)
+- [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^1.1.0`, installed: 1.1.0, latest: **1.3.0** (schema v1.20.0 + experimental v2.0.0-alpha.2 API; new stable v1 features: Elicitation #45, Boolean Config Options, Request Cancellation; upgrade subsumed by claude-agent-acp upgrade in #39) — last checked 2026-08-16; no new SDK releases this sweep
 - [ ] Check [ACP monorepo releases](https://github.com/agentclientprotocol/agent-client-protocol/releases) for spec/schema changes (`schema-v*` tags; no longer carries npm SDK versions)
 - [ ] Check [ACP updates page](https://agentclientprotocol.com/updates)
+- [ ] Check [ACP v2 Draft status](https://agentclientprotocol.com/protocol/v2/overview) — **v2.0.0-alpha.2 schema shipped in SDK 1.3.0 (2026-07-21); tracked in #41; monitor for RC; no seam-acp implementation until stable** | ACP v1 Elicitation stabilized 2026-07-22/24 — tracked in #45
 - [ ] Scan [ACP repo issues](https://github.com/agentclientprotocol/agent-client-protocol/issues) for breaking change discussions
 ```
 

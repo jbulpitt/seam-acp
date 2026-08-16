@@ -57,6 +57,7 @@ import type { AgentProfile } from "../agent-profile.js";
 import {
   discoverAgyLs,
   subscribeToAgyStream,
+  waitForAgyConversationId,
   type AgyStep,
 } from "../agy-stream.js";
 import { STAGING_ROOT } from "../attachment-staging.js";
@@ -64,6 +65,20 @@ import { STAGING_ROOT } from "../attachment-staging.js";
 const AGY_HOME = path.join(process.env.HOME ?? "/root", ".gemini/antigravity-cli");
 const CONVERSATION_DIR = path.join(AGY_HOME, "conversations");
 const SETTINGS_FILE = path.join(AGY_HOME, "settings.json");
+/**
+ * Where we point each spawned `agy`'s `--log-file`. Every turn (and every
+ * catalog/usage probe) gets a unique file under here so it can read back its
+ * OWN language-server port and conversation id, instead of scanning agy's
+ * shared global log dir by recency — which cross-wires concurrent turns onto
+ * each other's language server (the intermittent empty-response bug).
+ */
+const AGY_SPAWN_LOG_DIR = path.join(os.tmpdir(), "seam-agy-logs");
+
+/** Allocate a fresh private `--log-file` path and ensure its dir exists. */
+async function newSpawnLogPath(): Promise<string> {
+  await fs.mkdir(AGY_SPAWN_LOG_DIR, { recursive: true }).catch(() => {});
+  return path.join(AGY_SPAWN_LOG_DIR, `agy-${randomUUID()}.log`);
+}
 /** Legacy mapping file from before we moved this state out of agy's home dir. */
 const LEGACY_MAPPING_FILE = path.join(AGY_HOME, "seam_sessions.json");
 
@@ -695,7 +710,10 @@ class AgyAgent implements Agent {
       this.active = undefined;
     }
 
-    const before = await listConversations();
+    // Private per-turn log: agy writes its language-server port and the
+    // conversation id it binds to here, so we read them back deterministically
+    // instead of racing other concurrent turns over agy's shared global dirs.
+    const agyLogPath = await newSpawnLogPath();
     const agyStart = Date.now();
 
     const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
@@ -714,6 +732,11 @@ class AgyAgent implements Agent {
     const args = [
       ...(useStdin ? [] : ["-p", promptText]),
       ...(currentModel ? ["--model", currentModel.rawDisplayName] : []),
+      // Redirect this spawn's log to a private path we own and read back for
+      // its port + conversation id. Exclusive: agy writes nothing to its shared
+      // ~/.gemini/antigravity-cli/log dir when this is set (verified).
+      "--log-file",
+      agyLogPath,
       "--print-timeout",
       `${this.printTimeoutSeconds ?? 600}s`,
       "--dangerously-skip-permissions",
@@ -776,11 +799,16 @@ class AgyAgent implements Agent {
 
     try {
       const ls = await discoverAgyLs({
+        logFile: agyLogPath,
         timeoutMs: 90_000,
-        newerThanMs: agyStart - 1_000,
         signal: cancelAbort.signal,
       });
-      const cid = sess.cascadeId ?? (await waitForNewCascade(before, cancelAbort.signal));
+      const cid =
+        sess.cascadeId ??
+        (await waitForAgyConversationId({
+          logFile: agyLogPath,
+          signal: cancelAbort.signal,
+        }));
       if (!sess.cascadeId) {
         sess.cascadeId = cid;
         await savePersistedSession(this.mappingFile, params.sessionId, {
@@ -1016,6 +1044,14 @@ class AgyAgent implements Agent {
         }
       }
       if (this.active === runRef) this.active = undefined;
+      // Drop our private per-turn log so /tmp doesn't grow unbounded. Keep it
+      // when debugging — it's the richest post-mortem for an empty/wedged turn.
+      if (process.env.AGY_PROFILE_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.error(`[agy] retained turn log: ${agyLogPath}`);
+      } else {
+        fs.unlink(agyLogPath).catch(() => {});
+      }
     }
 
     if (exitCode !== null && exitCode !== 0) {
@@ -1507,39 +1543,6 @@ function resolveAgyBinary(): string {
   return "agy";
 }
 
-async function listConversations(): Promise<Set<string>> {
-  try {
-    const names = await fs.readdir(CONVERSATION_DIR);
-    return new Set(names);
-  } catch {
-    return new Set();
-  }
-}
-
-async function waitForNewCascade(
-  before: Set<string>,
-  signal: AbortSignal,
-): Promise<string> {
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    if (signal.aborted) throw new Error("aborted waiting for new cascade");
-    const now = await listConversations();
-    for (const name of now) {
-      // agy switched conversation files from `.pb` to `.db` (CLI update ~2026-06);
-      // match both so a fresh turn detects its new cascade and persists the id.
-      // Both extensions are 3 chars. (Sqlite sidecars end in `.db-wal`/`.db-shm`,
-      // not `.db`, so they're correctly ignored.)
-      if (!before.has(name) && (name.endsWith(".db") || name.endsWith(".pb"))) {
-        return name.slice(0, -3);
-      }
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  throw new Error(
-    "no new agy conversation appeared within 30s — is `agy` installed and logged in?",
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Model catalog
 // ---------------------------------------------------------------------------
@@ -1653,15 +1656,15 @@ export async function fetchAgyUserStatus(cliPath?: string): Promise<AgyUsage> {
     return usageCache.data;
   }
   const cli = cliPath?.trim() || resolveAgyBinary();
-  const start = Date.now();
-  const proc = spawn(cli, ["-p", "ok", "--print-timeout", "30s", "--dangerously-skip-permissions"], {
+  const logFile = await newSpawnLogPath();
+  const proc = spawn(cli, ["-p", "ok", "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], {
     cwd: "/tmp",
     stdio: ["ignore", "ignore", "ignore"],
   });
   try {
     const ls = await discoverAgyLs({
+      logFile,
       timeoutMs: 15_000,
-      newerThanMs: start - 1_000,
     });
     // /healthz comes up before the LS finishes silent-auth, so GetUserStatus
     // initially 500s with "GetCascadeModelConfigData() is nil". Retry briefly
@@ -1688,6 +1691,7 @@ export async function fetchAgyUserStatus(cliPath?: string): Promise<AgyUsage> {
     throw new Error(`GetUserStatus HTTP ${lastStatus}`);
   } finally {
     try { proc.kill(); } catch { /* already gone */ }
+    fs.unlink(logFile).catch(() => {});
   }
 }
 
@@ -1731,15 +1735,15 @@ async function fetchAgyCatalog(cli: string): Promise<AgyCatalogEntry[]> {
   // Spawn a tiny agy turn just to bring the LS up. The "ok" prompt produces
   // a few tokens of throwaway output; the cost is acceptable given the result
   // is cached for the process lifetime.
-  const start = Date.now();
-  const proc = spawn(cli, ["-p", "ok", "--print-timeout", "30s", "--dangerously-skip-permissions"], {
+  const logFile = await newSpawnLogPath();
+  const proc = spawn(cli, ["-p", "ok", "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], {
     cwd: "/tmp",
     stdio: ["ignore", "ignore", "ignore"],
   });
   try {
     const ls = await discoverAgyLs({
+      logFile,
       timeoutMs: 15_000,
-      newerThanMs: start - 1_000,
     });
     const url = `http://localhost:${ls.port}/exa.language_server_pb.LanguageServerService/GetAvailableModels`;
     // The LS answers as soon as it's discovered, but its model catalog finishes
@@ -1766,6 +1770,7 @@ async function fetchAgyCatalog(cli: string): Promise<AgyCatalogEntry[]> {
     }
   } finally {
     try { proc.kill(); } catch { /* already gone */ }
+    fs.unlink(logFile).catch(() => {});
   }
 }
 

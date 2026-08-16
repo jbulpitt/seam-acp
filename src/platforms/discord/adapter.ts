@@ -31,6 +31,8 @@ import type { Config } from "../../config.js";
 import type {
   ChatAdapter,
   ChannelRef,
+  ConfirmationCard,
+  ConfirmationDecision,
   IncomingMessage,
   MessageAttachment,
   MessageRef,
@@ -785,6 +787,85 @@ export class DiscordAdapter implements ChatAdapter {
       }
       return { outcome: { outcome: "cancelled" } };
     }
+  }
+
+  /**
+   * Post a propose-then-confirm card (#58 D5) and resolve when a human clicks
+   * Apply / Reject. The card message is sent BEFORE this returns; the returned
+   * `decision` promise settles later so the MCP tool can ack "card posted"
+   * immediately and the change is applied only on a real human confirmation.
+   * Only an allowed user can act on it, and the click carries that user's id —
+   * the audit actor (the #57 trust anchor).
+   */
+  async postConfirmation(
+    channel: ChannelRef,
+    card: ConfirmationCard,
+    opts: { timeoutMs?: number; authorizedUserIds?: ReadonlySet<string> } = {}
+  ): Promise<{ decision: Promise<ConfirmationDecision> }> {
+    const timeoutMs = opts.timeoutMs ?? 10 * 60 * 1000;
+    const allowed = opts.authorizedUserIds ?? this.config.DISCORD_ALLOWED_USER_IDS;
+    const ch = await this.fetchSendableChannel(channel.id);
+
+    const embed = new EmbedBuilder()
+      .setTitle(`🧩 ${card.title}`)
+      .setColor(0x5865f2)
+      .setFooter({ text: `Nothing changes until you click Apply · expires in ${Math.round(timeoutMs / 60000)}m.` });
+    if (card.description) embed.setDescription(card.description);
+    for (const f of card.fields.slice(0, 20)) {
+      embed.addFields({ name: f.label, value: `\`${f.before}\` → \`${f.after}\``.slice(0, 1024) });
+    }
+    if (card.warnings && card.warnings.length > 0) {
+      embed.addFields({ name: "⚠ Notes", value: card.warnings.map((w) => `• ${w}`).join("\n").slice(0, 1024) });
+    }
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("seam-cfg:apply").setLabel("Apply").setStyle(ButtonStyle.Success).setEmoji("✅"),
+      new ButtonBuilder().setCustomId("seam-cfg:reject").setLabel("Reject").setStyle(ButtonStyle.Secondary).setEmoji("✖️")
+    );
+
+    const msg = await ch.send({ embeds: [embed], components: [row] });
+
+    const decision: Promise<ConfirmationDecision> = (async () => {
+      try {
+        const interaction = await msg.awaitMessageComponent({
+          componentType: ComponentType.Button,
+          filter: (i) => {
+            if (!allowed.has(i.user.id)) {
+              i.reply({ content: "This confirmation is not available to you.", flags: MessageFlags.Ephemeral }).catch(
+                () => {}
+              );
+              return false;
+            }
+            return true;
+          },
+          time: timeoutMs,
+        });
+        const confirmed = interaction.customId === "seam-cfg:apply";
+        await msg
+          .edit({
+            embeds: [
+              embed.setFooter({
+                text: `${confirmed ? "✅ Applied" : "✖️ Rejected"} by ${interaction.user.username}.`,
+              }),
+            ],
+            components: [],
+          })
+          .catch(() => {});
+        try {
+          await interaction.deferUpdate();
+        } catch {
+          /* ignore */
+        }
+        return { confirmed, userId: interaction.user.id, userName: interaction.user.username };
+      } catch {
+        await msg
+          .edit({ embeds: [embed.setFooter({ text: "⏱️ Timed out — not applied." })], components: [] })
+          .catch(() => {});
+        return { confirmed: false };
+      }
+    })();
+
+    return { decision };
   }
 
   private async fetchSendableChannel(

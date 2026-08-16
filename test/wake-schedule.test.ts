@@ -39,11 +39,13 @@ beforeEach(() => {
   store = new SessionStore(path.join(dir, "test.db"));
   // Only store/logger are exercised by scheduleWake/cancelWake/listWakes; the
   // adapter/router/renderer/config are unused on these paths, so stub them.
+  // The constructor eagerly reads router.listProfiles() to seed the #58 P2/P3
+  // config-mutation engine, so that one method must exist on the stub.
   orch = new Orchestrator({
     logger: silent,
     config: { DATA_DIR: dir } as any,
     adapter: {} as any,
-    router: {} as any,
+    router: { listProfiles: () => [] } as any,
     store,
     renderer: {} as any,
   });

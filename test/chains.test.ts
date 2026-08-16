@@ -240,6 +240,7 @@ describe("chain MCP tool", () => {
       "cancel_wake",
       "chain",
       "config_describe",
+      "config_propose",
       "forward",
       "handoff",
       "peek",

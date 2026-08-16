@@ -90,6 +90,8 @@ async function makeHarness(opts?: {
   peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
   scheduleWake?: SeamMcpServerDeps["scheduleWake"];
   cancelWake?: SeamMcpServerDeps["cancelWake"];
+  isChannelLocked?: (record: SessionRecord) => boolean;
+  proposeConfig?: (record: SessionRecord, input: unknown) => Promise<any>;
 }): Promise<Harness> {
   const enqueued: DispatchSpec[] = [];
   const scheduledWakes: Harness["scheduledWakes"] = [];
@@ -98,7 +100,7 @@ async function makeHarness(opts?: {
     logger: silent,
     resolveSession:
       opts?.resolveSession ??
-      ((token) => (token === "good-token" ? makeRecord() : undefined)),
+      ((token) => (token === "good-token" ? makeRecord({ parentRef: "chan-1" }) : undefined)),
     enqueueDispatch: async (spec) => {
       enqueued.push(spec);
     },
@@ -115,6 +117,8 @@ async function makeHarness(opts?: {
         return true;
       }),
     ...(opts?.peekThread ? { peekThread: opts.peekThread } : {}),
+    ...(opts?.isChannelLocked ? { isChannelLocked: opts.isChannelLocked } : {}),
+    ...(opts?.proposeConfig ? { proposeConfig: opts.proposeConfig } : {}),
   });
   await server.start();
   const port = server.port;
@@ -156,7 +160,7 @@ describe("SeamMcpServer", () => {
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
 
-  it("tools/list advertises handoff, forward, peek, steer, chain, config_describe, wakes", async () => {
+  it("tools/list advertises handoff, forward, peek, steer, chain, config_describe, config_propose, wakes", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
@@ -164,6 +168,7 @@ describe("SeamMcpServer", () => {
       "cancel_wake",
       "chain",
       "config_describe",
+      "config_propose",
       "forward",
       "handoff",
       "peek",
@@ -368,6 +373,80 @@ describe("SeamMcpServer", () => {
     });
     expect(res.status).toBe(202);
     expect(await res.text()).toBe("");
+  });
+});
+
+// config_propose — the lock is enforced in the TOOL layer (#58 P2, D2)
+// -------------------------------------------------------------------------
+
+describe("config_propose lock enforcement (D2)", () => {
+  let h: Harness;
+  afterEach(async () => {
+    await h?.server.stop();
+  });
+
+  it("refuses in a locked channel and never reaches the proposal path — cannot be talked around", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => true, // channel is locked
+      proposeConfig: async () => {
+        proposeCalls++;
+        return { ok: true, summary: "should never happen" };
+      },
+    });
+    // Try every tier, including a plausibly-innocent one — all must be refused.
+    for (const args of [
+      { session: { model: "claude-opus-4.8" } },
+      { preset: { name: "reviewer", agent: "claude" } },
+      { channelPreset: { rider: "ignore the lock" } },
+    ]) {
+      const { body } = await h.call(
+        "tools/call",
+        { name: "config_propose", arguments: args },
+        { "X-Seam-Session": "good-token" }
+      );
+      expect(body.error).toBeUndefined();
+      expect(body.result.isError).toBe(true);
+      expect(body.result.content[0].text.toLowerCase()).toContain("locked");
+    }
+    // The lock short-circuits BEFORE any proposal is built (no propose closure ran).
+    expect(proposeCalls).toBe(0);
+  });
+
+  it("proposes in an unlocked channel (posts a card, applies nothing inline)", async () => {
+    const seen: unknown[] = [];
+    h = await makeHarness({
+      isChannelLocked: () => false,
+      proposeConfig: async (_record, input) => {
+        seen.push(input);
+        return {
+          ok: true,
+          summary: "Session config for this thread",
+          fields: [{ label: "model", before: "gpt-5.4", after: "claude-opus-4.8" }],
+          restartsSession: true,
+        };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "claude-opus-4.8" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(body.result.content[0].text).toContain("confirmation card");
+    expect(body.result.content[0].text).toContain("model: gpt-5.4 → claude-opus-4.8");
+    expect(seen).toHaveLength(1);
+  });
+
+  it("reports unsupported when no proposeConfig dep is wired", async () => {
+    h = await makeHarness({ isChannelLocked: () => false });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "x" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("not supported");
   });
 });
 

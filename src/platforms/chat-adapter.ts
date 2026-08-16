@@ -165,6 +165,38 @@ export interface ChatAdapter {
     req: RequestPermissionRequest,
     opts?: { timeoutMs?: number }
   ): Promise<RequestPermissionResponse>;
+
+  /**
+   * Optional: post a propose-then-confirm card (#58 D5) into a channel and
+   * resolve when a human clicks Apply / Reject (or it times out). The card is
+   * POSTED before this resolves; the returned `decision` promise settles later
+   * when the human acts, so the caller can acknowledge "card posted" immediately
+   * and apply the change in the background on confirmation.
+   */
+  postConfirmation?(
+    channel: ChannelRef,
+    card: ConfirmationCard,
+    opts?: { timeoutMs?: number; authorizedUserIds?: ReadonlySet<string> }
+  ): Promise<{ decision: Promise<ConfirmationDecision> }>;
+}
+
+/** A before→after confirmation card (#58 D5). */
+export interface ConfirmationCard {
+  title: string;
+  /** Optional lead paragraph shown above the diff. */
+  description?: string;
+  /** The diff rows, rendered as `label: before → after`. */
+  fields: ReadonlyArray<{ label: string; before: string; after: string }>;
+  /** Non-fatal cautions shown under the diff. */
+  warnings?: ReadonlyArray<string>;
+}
+
+/** Outcome of a confirmation card. */
+export interface ConfirmationDecision {
+  confirmed: boolean;
+  /** The user who clicked (undefined on timeout). */
+  userId?: string;
+  userName?: string;
 }
 
 /**

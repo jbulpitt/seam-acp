@@ -16,6 +16,8 @@ import {
   type LedgerEntry,
   type LedgerEntryInput,
   type LedgerPatch,
+  type ConfigAuditEntry,
+  type ConfigAuditInput,
   type SessionConfigState,
   type SessionRecord,
 } from "./types.js";
@@ -238,6 +240,7 @@ export class SessionStore {
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
     this.db.exec(DELEGATION_SCHEMA);
+    this.db.exec(CONFIG_AUDIT_SCHEMA);
     this.db.exec(ACTIVE_PROJECTS_SCHEMA);
     this.db.exec(CHAINS_SCHEMA);
     this.db.exec(WAKE_EVENTS_SCHEMA);
@@ -721,6 +724,47 @@ export class SessionStore {
     return row;
   }
 
+  // --- config-mutation audit (#58 P2/P3, D6) -------------------------------
+
+  /** Append one immutable config-mutation audit row (actor / scope / before /
+   *  after / correlation). Called only on a confirmed, applied change. */
+  recordConfigMutation(entry: ConfigAuditInput): ConfigAuditEntry {
+    const row: ConfigAuditEntry = {
+      id: entry.id,
+      tier: entry.tier,
+      actorId: entry.actorId ?? null,
+      actorName: entry.actorName ?? null,
+      scope: entry.scope,
+      summary: entry.summary,
+      beforeJson: entry.beforeJson,
+      afterJson: entry.afterJson,
+      correlationId: entry.correlationId ?? null,
+      appliedUtc: entry.appliedUtc ?? new Date().toISOString(),
+    };
+    this.db
+      .prepare(
+        `INSERT INTO config_audit
+           (id, tier, actor_id, actor_name, scope, summary, before_json,
+            after_json, correlation_id, applied_utc)
+         VALUES
+           (@id, @tier, @actorId, @actorName, @scope, @summary, @beforeJson,
+            @afterJson, @correlationId, @appliedUtc)`
+      )
+      .run(row);
+    return row;
+  }
+
+  /** Most-recent config-mutation audit rows, newest first. */
+  listConfigMutations(limit = 50): ConfigAuditEntry[] {
+    return this.db
+      .prepare<[number], ConfigAuditRow>(
+        `SELECT * FROM config_audit
+         ORDER BY applied_utc DESC, rowid DESC LIMIT ?`
+      )
+      .all(limit)
+      .map(mapConfigAudit);
+  }
+
   /**
    * Move a row to a new status, re-stamping `updated_utc`. `patch` may amend
    * the mutable fields in the same write — e.g. attaching the resolved
@@ -1062,6 +1106,53 @@ const mapLedger = (r: LedgerRow): LedgerEntry => ({
   status: r.status as DelegationStatus,
   createdUtc: r.created_utc,
   updatedUtc: r.updated_utc,
+});
+
+// --- conversational config-mutation audit (#58 P2/P3, D6) ------------------
+
+const CONFIG_AUDIT_SCHEMA = `
+CREATE TABLE IF NOT EXISTS config_audit (
+  id              TEXT PRIMARY KEY,
+  tier            TEXT NOT NULL,
+  actor_id        TEXT,
+  actor_name      TEXT,
+  scope           TEXT NOT NULL,
+  summary         TEXT NOT NULL,
+  before_json     TEXT NOT NULL,
+  after_json      TEXT NOT NULL,
+  correlation_id  TEXT,
+  applied_utc     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_config_audit_scope
+  ON config_audit(scope);
+CREATE INDEX IF NOT EXISTS idx_config_audit_correlation
+  ON config_audit(correlation_id);
+`;
+
+interface ConfigAuditRow {
+  id: string;
+  tier: string;
+  actor_id: string | null;
+  actor_name: string | null;
+  scope: string;
+  summary: string;
+  before_json: string;
+  after_json: string;
+  correlation_id: string | null;
+  applied_utc: string;
+}
+
+const mapConfigAudit = (r: ConfigAuditRow): ConfigAuditEntry => ({
+  id: r.id,
+  tier: r.tier,
+  actorId: r.actor_id,
+  actorName: r.actor_name,
+  scope: r.scope,
+  summary: r.summary,
+  beforeJson: r.before_json,
+  afterJson: r.after_json,
+  correlationId: r.correlation_id,
+  appliedUtc: r.applied_utc,
 });
 
 // --- chains schema + row mapping (#25) --------------------------------------

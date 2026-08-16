@@ -78,6 +78,20 @@ const Schema = z.object({
     .default("true")
     .transform((v) => v === "true"),
   /**
+   * Tier-C conversational mutation (#58 P3): allow the seam-MCP `config_propose`
+   * tool to write `data/channel-presets.json` (the calling thread's OWN channel
+   * preset — agent/model/cwd/effort/rider only). Default OFF, per D4: Tier C is
+   * the dangerous half (riders + the lock live in this file). Even when ON the
+   * tool can NEVER touch the `locked` flag or another channel (D2/P3), every
+   * write round-trips through PresetsFileSchema (D7), and a human still confirms
+   * the diff card (D5). Tier A/B mutation (session config + own presets) does not
+   * depend on this flag. `.env` mutation is out of scope permanently.
+   */
+  SEAM_CONFIG_MUTATION_TIER_C_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  /**
    * Comma-separated list of absolute directories the `/seam attach`
    * slash command is allowed to read from. REPOS_ROOT is always
    * implicitly allowed. Defaults to empty (only REPOS_ROOT).
@@ -599,7 +613,11 @@ const ChannelPresetSchema = PresetValuesSchema.extend({
   locked: z.boolean().optional().default(false),
 });
 
-const PresetsFileSchema = z.object({
+// Exported (#58 P3 / D7): the Tier-C mutation path builds a candidate presets
+// object and MUST round-trip it through this exact schema before writing the
+// file — an invalid channel-presets.json throws in loadConfig() and would fail
+// the next boot, so a bad tool call must be rejected, never persisted.
+export const PresetsFileSchema = z.object({
   channels: z.record(numericId, ChannelPresetSchema).optional().default({}),
   threads: z.record(numericId, PresetValuesSchema).optional().default({}),
 });

@@ -261,6 +261,54 @@ export type LedgerPatch = Partial<
   >
 >;
 
+// --- conversational config-mutation audit (#58 P2/P3, D6) ------------------
+
+/**
+ * One row of the config-mutation audit ledger. Every applied conversational
+ * config change (session config, a preset, or a channel-presets.json write)
+ * records who authorized it, what it touched, and the full before/after — so
+ * "who changed this, and to what?" is always answerable (D6). Follows the
+ * delegation_log pattern (#26) but is a separate table: config drift and task
+ * delegation are different questions and mixing them makes both harder to read.
+ */
+export interface ConfigAuditEntry {
+  id: string;
+  /** Config surface touched: "session" | "preset" | "channel-preset". */
+  tier: string;
+  /**
+   * The human who confirmed the change (the click carries a real, harness-
+   * stamped Discord user id — the trust anchor per #57 D4). Null only for a
+   * non-interactive apply path (none today).
+   */
+  actorId: string | null;
+  actorName: string | null;
+  /** The thread/channel the change was scoped to (never caller-supplied; D3). */
+  scope: string;
+  /** One-line human summary of the change. */
+  summary: string;
+  /** JSON snapshot of the affected values BEFORE the change. */
+  beforeJson: string;
+  /** JSON snapshot of the affected values AFTER the change. */
+  afterJson: string;
+  /** Ties the audit row to the propose→confirm turn that requested it. */
+  correlationId: string | null;
+  appliedUtc: string;
+}
+
+/** Caller-supplied shape for `recordConfigMutation`; `appliedUtc` defaults to now. */
+export interface ConfigAuditInput {
+  id: string;
+  tier: string;
+  actorId?: string | null;
+  actorName?: string | null;
+  scope: string;
+  summary: string;
+  beforeJson: string;
+  afterJson: string;
+  correlationId?: string | null;
+  appliedUtc?: string;
+}
+
 // --- durable multi-hop chains (#25) ----------------------------------------
 
 /** Lifecycle of a chain. Terminal states: completed | failed. */

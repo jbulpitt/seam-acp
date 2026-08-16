@@ -117,6 +117,94 @@ export interface StatusPanel {
   thinking?: string[];
 }
 
+// --- delegation ledger -----------------------------------------------------
+// Durable log of every programmatic turn / cross-thread handoff. Written by
+// the delegation runtime so a handoff's return path is a recorded fact rather
+// than a behavioral hope (see docs/seam-mcp-vision.md §1).
+
+/** What kind of programmatic turn a ledger row records. */
+export type DelegationKind =
+  /** Thread A hands work to thread B. */
+  | "handoff"
+  /** One thread's output piped onward as another's input. */
+  | "forward"
+  /** A completed handoff's result delivered back to its origin. */
+  | "report_back"
+  /** Scheduler-origin turn — has no source thread. */
+  | "scheduled"
+  /** Read-only cross-thread inspection. */
+  | "peek";
+
+/** Lifecycle of a ledger row. Terminal states: completed | failed | timed_out. */
+export type DelegationStatus =
+  | "dispatched"
+  | "running"
+  | "completed"
+  | "failed"
+  | "timed_out"
+  /** Deliberately set aside (e.g. awaiting human steering) — not terminal. */
+  | "parked";
+
+/** Statuses considered still in flight by `listActiveDelegations`. */
+export const DELEGATION_ACTIVE_STATUSES: readonly DelegationStatus[] = [
+  "dispatched",
+  "running",
+];
+
+/** Max stored length of `promptPreview`; the store truncates on write. */
+export const PROMPT_PREVIEW_MAX = 200;
+
+/** One row of the delegation ledger. */
+export interface LedgerEntry {
+  id: string;
+  /** Originating thread/session id. Null for scheduler-origin turns. */
+  sourceRef: string | null;
+  /** Resolved target thread/session id. Null until the target resolves. */
+  targetRef: string | null;
+  /** The handoff worker: preset name or thread alias. */
+  worker: string | null;
+  kind: DelegationKind;
+  /** First `PROMPT_PREVIEW_MAX` chars of the dispatched prompt. */
+  promptPreview: string | null;
+  /** Ties a handoff to its later report-back. */
+  correlationId: string | null;
+  status: DelegationStatus;
+  createdUtc: string;
+  updatedUtc: string;
+}
+
+/**
+ * Caller-supplied shape for `recordDelegation`. Only `id` and `kind` are
+ * required; `status` defaults to "dispatched" and the timestamps default to
+ * now, so a dispatch site writes one line and gets a complete row back.
+ */
+export interface LedgerEntryInput {
+  id: string;
+  kind: DelegationKind;
+  sourceRef?: string | null;
+  targetRef?: string | null;
+  worker?: string | null;
+  promptPreview?: string | null;
+  correlationId?: string | null;
+  /** Defaults to "dispatched". */
+  status?: DelegationStatus;
+  /** Defaults to now (ISO 8601). */
+  createdUtc?: string;
+  /** Defaults to `createdUtc`. */
+  updatedUtc?: string;
+}
+
+/**
+ * Fields `updateDelegationStatus` may amend alongside the status change.
+ * Immutable by design: `id`, `kind`, `createdUtc`.
+ */
+export type LedgerPatch = Partial<
+  Pick<
+    LedgerEntry,
+    "sourceRef" | "targetRef" | "worker" | "promptPreview" | "correlationId"
+  >
+>;
+
 /** Result of one agent turn (reply round-trip). */
 export interface TurnOutcome {
   success: boolean;

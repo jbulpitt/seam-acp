@@ -137,11 +137,11 @@ describe("SeamMcpServer", () => {
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
 
-  it("tools/list advertises handoff, forward, peek, steer, chain", async () => {
+  it("tools/list advertises handoff, forward, peek, steer, chain, config_describe", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
-    expect(names).toEqual(["chain", "forward", "handoff", "peek", "steer"]);
+    expect(names).toEqual(["chain", "config_describe", "forward", "handoff", "peek", "steer"]);
     for (const t of body.result.tools) {
       expect(t.inputSchema.type).toBe("object");
     }
@@ -303,5 +303,103 @@ describe("buildSeamMcpServerEntry", () => {
     expect(entry.name).toBe("seam-mcp");
     expect(entry.url).toBe("http://127.0.0.1:4321/mcp");
     expect(entry.headers).toEqual([{ name: "X-Seam-Session", value: "tok-abc" }]);
+  });
+});
+
+// -------------------------------------------------------------------------
+// config_describe — read-only config introspection (#58 P1)
+// -------------------------------------------------------------------------
+
+describe("config_describe", () => {
+  const description = {
+    sessionId: "discord:thread-caller",
+    channelRef: "thread-caller",
+    parentRef: "chan-1",
+    agent: { value: "claude", source: "session config" as const },
+    model: { value: "claude-opus-4.6", source: "channel preset" as const },
+    effort: { value: "high", source: "thread preset" as const },
+    cwd: { value: "/repo/x", source: "channel preset" as const },
+    permission: { value: "ask", source: "default" as const },
+    locked: true,
+  };
+
+  async function makeDescribeServer(): Promise<SeamMcpServer> {
+    const server = new SeamMcpServer({
+      logger: silent,
+      resolveSession: (token) => (token === "good-token" ? makeRecord({ parentRef: "chan-1" }) : undefined),
+      enqueueDispatch: async () => {},
+      describeConfig: () => description,
+      listConfigEntities: () => ({
+        schedules: [
+          { name: "morning", cron: "0 7 * * 1-5", timezone: "America/Chicago", enabled: true, nextRunUtc: "2026-08-17T12:00:00Z" },
+        ],
+        presets: [
+          { name: "ts-reviewer", scope: "project", agentId: "claude", model: "claude-opus-4.6" },
+        ],
+      }),
+    });
+    await server.start();
+    return server;
+  }
+
+  async function callTool(server: SeamMcpServer, args: unknown, token = "good-token") {
+    const res = await fetch(`http://127.0.0.1:${server.port}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Seam-Session": token },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "config_describe", arguments: args } }),
+    });
+    return JSON.parse(await res.text());
+  }
+
+  it("renders the effective config with which layer won", async () => {
+    const server = await makeDescribeServer();
+    try {
+      const body = await callTool(server, {});
+      expect(body.result.isError).toBeFalsy();
+      const text = body.result.content[0].text as string;
+      expect(text).toContain("claude-opus-4.6");
+      expect(text).toContain("(from channel preset)");
+      expect(text).toContain("(from thread preset)");
+      expect(text).toContain("(from session config)");
+      expect(text).toContain("(from default)");
+      expect(text).toContain("🔒");
+      // Entity listing folds in.
+      expect(text).toContain("morning");
+      expect(text).toContain("ts-reviewer");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("allows an explicit self scope (own thread id)", async () => {
+    const server = await makeDescribeServer();
+    try {
+      const body = await callTool(server, { scope: "thread-caller" });
+      expect(body.result.isError).toBeFalsy();
+      expect(body.result.content[0].text).toContain("claude-opus-4.6");
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("refuses to describe another thread (cross-thread is privileged, D3)", async () => {
+    const server = await makeDescribeServer();
+    try {
+      const body = await callTool(server, { scope: "some-other-thread" });
+      expect(body.result.isError).toBe(true);
+      expect(body.result.content[0].text).toMatch(/privileged/i);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("rejects an unknown/missing token before doing any work", async () => {
+    const server = await makeDescribeServer();
+    try {
+      const body = await callTool(server, {}, "bad-token");
+      expect(body.error.code).toBe(-32001);
+    } finally {
+      await server.stop();
+    }
   });
 });

@@ -97,6 +97,8 @@ async function makeHarness(opts?: {
   listWatches?: SeamMcpServerDeps["listWatches"];
   isChannelLocked?: (record: SessionRecord) => boolean;
   proposeConfig?: (record: SessionRecord, input: unknown) => Promise<any>;
+  /** Omit the compact dep entirely (to test the "not supported" refusal). */
+  disableCompact?: boolean;
 }): Promise<Harness> {
   const enqueued: DispatchSpec[] = [];
   const scheduledWakes: Harness["scheduledWakes"] = [];
@@ -158,6 +160,19 @@ async function makeHarness(opts?: {
     ...(opts?.peekThread ? { peekThread: opts.peekThread } : {}),
     ...(opts?.isChannelLocked ? { isChannelLocked: opts.isChannelLocked } : {}),
     ...(opts?.proposeConfig ? { proposeConfig: opts.proposeConfig } : {}),
+    // The compact tool only ENQUEUES; its dep is a presence gate. Provide a stub
+    // by default so the tool is enabled, and omit it when disableCompact is set.
+    ...(opts?.disableCompact
+      ? {}
+      : {
+          compactThread: async (record) => ({
+            newSessionId: "sess-new",
+            originalSessionId: record.acpSessionId,
+            wasActive: true,
+            reportMarkdown: "# report",
+            stats: { chunks: 3 },
+          }),
+        }),
   });
   await server.start();
   const port = server.port;
@@ -199,13 +214,14 @@ describe("SeamMcpServer", () => {
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
 
-  it("tools/list advertises handoff, forward, peek, steer, chain, config_describe, config_propose, wakes", async () => {
+  it("tools/list advertises handoff, forward, peek, steer, chain, compact, config_describe, config_propose, wakes", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
     expect(names).toEqual([
       "cancel_wake",
       "chain",
+      "compact",
       "config_describe",
       "config_propose",
       "forward",
@@ -327,6 +343,77 @@ describe("SeamMcpServer", () => {
     expect(spec.prompt).toContain("<seam-steer>");
     expect(spec.prompt).toContain("focus on the failing test first");
     expect(spec.prompt).toContain("steering you mid-task");
+  });
+
+  it("compact with no `thread` arg enqueues a kind:compact dispatch scoped to the caller", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "compact", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBeFalsy();
+    expect(h.enqueued).toHaveLength(1);
+    const spec = h.enqueued[0]!;
+    // It's a compact dispatch, NOT an inject-turn handoff.
+    expect(spec.kind).toBe("compact");
+    // Self-scoped: target defaults to the caller's own thread.
+    expect(spec.target).toBe("thread-caller");
+    // The caller is stamped as the actor (returnTo) for the ledger.
+    expect(spec.returnTo).toBe("thread-caller");
+    // Default source is session-history.
+    expect(spec.compactSource).toBe("session");
+    // Result message tells the caller it runs off-turn and posts to the thread.
+    expect(body.result.content[0].text).toMatch(/Compaction started for thread thread-caller/);
+  });
+
+  it("compact with an explicit `thread` targets that thread but keeps the caller as actor", async () => {
+    h = await makeHarness();
+    await h.call(
+      "tools/call",
+      { name: "compact", arguments: { thread: "444444444444444444" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    const spec = h.enqueued[0]!;
+    expect(spec.kind).toBe("compact");
+    expect(spec.target).toBe("444444444444444444");
+    // Actor→target is preserved: caller is the source, the named thread the target.
+    expect(spec.returnTo).toBe("thread-caller");
+  });
+
+  it("compact honors source:discord", async () => {
+    h = await makeHarness();
+    await h.call(
+      "tools/call",
+      { name: "compact", arguments: { source: "discord" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(h.enqueued[0]!.compactSource).toBe("discord");
+  });
+
+  it("compact refuses gracefully when the deployment has no compactThread dep", async () => {
+    h = await makeHarness({ disableCompact: true });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "compact", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toMatch(/not supported/);
+    // Nothing was enqueued on the refusal path.
+    expect(h.enqueued).toHaveLength(0);
+  });
+
+  it("compact rejects an unknown token with -32001 before enqueuing", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "compact", arguments: {} },
+      { "X-Seam-Session": "bad-token" }
+    );
+    expect(body.error.code).toBe(-32001);
+    expect(h.enqueued).toHaveLength(0);
   });
 
   it("schedule_wake routes to the caller's scheduleWake dep and returns the wake id (#59)", async () => {

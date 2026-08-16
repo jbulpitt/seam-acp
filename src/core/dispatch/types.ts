@@ -39,8 +39,12 @@ export interface DispatchSpec {
   returnTo?: string;
   /** Ledger classification; defaults to "handoff". The report-back
    *  re-injection sets "report_back"; a fired wake (#59) sets "wake"; a fired
-   *  watch (#60) sets "watch". */
+   *  watch (#60) sets "watch"; an agent-triggered compaction sets "compact". */
   kind?: DelegationKind;
+  /** Compact-kind specs only: which history the pipeline reads — "session"
+   *  (the raw session JSONL, the default) or "discord" (reconstructed from the
+   *  full Discord thread). Ignored for every other kind. */
+  compactSource?: "session" | "discord";
   /** Wake self-renewal depth (#59). Set only on wake-kind specs so the turn
    *  knows its chain depth while it runs — a wake armed *during* this turn
    *  inherits `wakeChainDepth + 1`, and the chain-depth cap (D8) trips past a
@@ -95,7 +99,8 @@ export const DispatchSpecSchema = z.object({
   preset: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
-  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek"]).optional(),
+  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact"]).optional(),
+  compactSource: z.enum(["session", "discord"]).optional(),
   wakeChainDepth: z.number().int().min(0).optional(),
   chainId: z.string().min(1).optional(),
   stream: z.boolean().optional(),
@@ -132,6 +137,7 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.correlationId ? { correlationId: d.correlationId } : {}),
     ...(d.returnTo ? { returnTo: d.returnTo } : {}),
     ...(d.kind ? { kind: d.kind } : {}),
+    ...(d.compactSource ? { compactSource: d.compactSource } : {}),
     ...(d.wakeChainDepth !== undefined ? { wakeChainDepth: d.wakeChainDepth } : {}),
     ...(d.chainId ? { chainId: d.chainId } : {}),
     ...(d.stream !== undefined ? { stream: d.stream } : {}),

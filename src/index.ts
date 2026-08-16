@@ -485,6 +485,11 @@ async function main(): Promise<void> {
       // renders the confirm card, and applies only on a human click (D5),
       // auditing every change (D6).
       proposeConfig: (record, input) => orchestrator.proposeConfig(record, input),
+      // Agent-callable thread compaction: the `compact` tool enqueues a
+      // kind:"compact" dispatch (non-blocking); the DispatchWatcher invokes this
+      // same primitive off-turn and posts the result into the target thread. The
+      // dep's presence gates the tool (undefined ⇒ "not supported").
+      compactThread: (record, opts) => orchestrator.compactThread(record, opts),
     });
     await seamMcpServer.start();
   }

@@ -239,6 +239,7 @@ describe("chain MCP tool", () => {
     expect(names).toEqual([
       "cancel_wake",
       "chain",
+      "compact",
       "config_describe",
       "config_propose",
       "forward",

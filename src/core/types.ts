@@ -193,7 +193,12 @@ export type DelegationKind =
    *  tell a time-triggered self-resumption from a condition-triggered one. */
   | "watch"
   /** Read-only cross-thread inspection. */
-  | "peek";
+  | "peek"
+  /** Agent-triggered thread compaction — the caller asked the runtime to run
+   *  the premium multi-agent compaction pipeline on a thread's session (its
+   *  own, or an explicit target) and rebind the thread to the seeded result.
+   *  Recorded actor→target so a cross-thread compaction is an audited fact. */
+  | "compact";
 
 /** Lifecycle of a ledger row. Terminal states: completed | failed | timed_out. */
 export type DelegationStatus =

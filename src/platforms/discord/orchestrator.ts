@@ -2371,6 +2371,109 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Reusable non-destructive compaction primitive — the single run+seed+swap
+   * flow that the session-manager buttons and the agent-callable `compact`
+   * seam-MCP capability both delegate to. Resolves profile / manager / session /
+   * cwd / channel from the `record`, runs the premium multi-agent pipeline
+   * (session-history by default; the full-Discord reconstruction when
+   * `source === "discord"`), seeds a BRAND-NEW resumable session with the
+   * assembled summary, and — only if the compacted session was the thread's
+   * active one — rebinds the thread to it (`store.upsert` + `router.invalidate`).
+   *
+   * NON-DESTRUCTIVE by construction: the original session is never mutated; a
+   * new session is seeded alongside it and the thread is repointed. The caller
+   * owns presentation (the buttons render Discord cards; the dispatch handler
+   * posts a result card) — this returns the facts, it posts nothing itself.
+   *
+   * `opts.sessionId` overrides which session to compact (the buttons compact the
+   * one the operator navigated to); omitted ⇒ the thread's own active session,
+   * which is what the self-scoped MCP path wants. Throws with a readable message
+   * when the target has no compactable session/manager, mirroring the pipeline's
+   * own "needs a raw-history reader" refusal so a caller learns why it can't run.
+   */
+  async compactThread(
+    record: SessionRecord,
+    opts?: {
+      source?: "session" | "discord";
+      sessionId?: string;
+      channel?: ChannelRef;
+      onProgress?: (m: string) => void;
+    }
+  ): Promise<{
+    newSessionId: string;
+    originalSessionId: string;
+    wasActive: boolean;
+    reportMarkdown: string;
+    stats: PremiumCompactionResult["stats"];
+  }> {
+    const source = opts?.source ?? "session";
+    const profile = this.router.getProfile(record.agentId);
+    if (!profile) {
+      throw new Error(`Agent profile "${record.agentId}" not found, so this thread has no compactable session.`);
+    }
+    const manager = profile.sessionManager;
+    if (!manager) {
+      throw new Error(
+        `Agent \`${record.agentId}\` (${profile.displayName}) does not support session management, ` +
+          `so it has no compactable session.`
+      );
+    }
+    const sessionId = opts?.sessionId ?? record.acpSessionId;
+    if (!sessionId) {
+      throw new Error("This thread has no active session to compact yet.");
+    }
+    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    const channel: ChannelRef = opts?.channel ?? { platform: record.platform, id: record.channelRef };
+    const onProgress = opts?.onProgress;
+
+    const result =
+      source === "discord"
+        ? await this.runPremiumCompactionForDiscord({
+            profile,
+            manager,
+            sessionId,
+            cwd,
+            channel,
+            ...(onProgress ? { onProgress } : {}),
+          })
+        : await this.runPremiumCompactionForSession({
+            profile,
+            manager,
+            sessionId,
+            cwd,
+            channel,
+            ...(onProgress ? { onProgress } : {}),
+          });
+
+    if (!result.assembledSeed.trim()) throw new Error("Pipeline produced an empty result.");
+
+    // Non-destructive: seed a NEW resumable session with the summary, bind the
+    // thread to it only if this WAS its active session, and leave the original
+    // intact (recoverable / deletable from the session manager).
+    const cfg = this.store.readConfig(record);
+    const newSessionId = await this.seedNewSession({
+      profile,
+      cwd,
+      ...(cfg.model ? { model: cfg.model } : {}),
+      ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+      summary: result.assembledSeed,
+    });
+    const wasActive = sessionId === record.acpSessionId;
+    if (wasActive) {
+      this.store.upsert({ ...record, acpSessionId: newSessionId, updatedUtc: new Date().toISOString() });
+      await this.router.invalidate(record.id, { clearAcpSession: false });
+    }
+
+    return {
+      newSessionId,
+      originalSessionId: sessionId,
+      wasActive,
+      reportMarkdown: this.formatPremiumReport(result, sessionId),
+      stats: result.stats,
+    };
+  }
+
   setScheduledManager(m: ScheduledPromptManager): void {
     this.scheduledManager = m;
   }
@@ -2940,6 +3043,11 @@ export class Orchestrator {
    * scheduled-prompt runner posts it afterwards for the same reason.)
    */
   async dispatchInjectTurn(spec: DispatchSpec): Promise<{ output: string; stopReason: string }> {
+    // Compact dispatches don't inject a turn — they run the compaction pipeline
+    // on the target thread and post a result card there. Same start-indicator +
+    // ledger + done-file plumbing, different body (see dispatchCompact).
+    if (spec.kind === "compact") return this.dispatchCompact(spec);
+
     const target: ChannelRef = { platform: PLATFORM, id: spec.target };
     const record = this.router.ensureSessionRecord({
       platform: PLATFORM,
@@ -3125,6 +3233,110 @@ export class Orchestrator {
       return await run();
     } finally {
       this.activeTurns--;
+    }
+  }
+
+  /**
+   * DispatchWatcher branch for `kind: "compact"` (agent-triggered compaction).
+   * Instead of injecting a turn, run the premium compaction pipeline on the
+   * target thread via `compactThread`, then post the outcome as a result card
+   * into that thread — reusing the same start-indicator panel, ledger, and
+   * done-file plumbing every other dispatch gets, so the `▶`→`✅`/`❌` life-cycle
+   * and the report-back-to-target are consistent with wake/watch.
+   *
+   * The actor is `spec.returnTo` (the caller thread the tool stamped); the target
+   * is `spec.target`. Both are recorded on the ledger so a cross-thread
+   * compaction (actor ≠ target) is an audited fact (guardrail: still allowed,
+   * but never silent). A self-scoped compaction has actor == target.
+   */
+  private async dispatchCompact(spec: DispatchSpec): Promise<{ output: string; stopReason: string }> {
+    const target: ChannelRef = { platform: PLATFORM, id: spec.target };
+    const record = this.router.ensureSessionRecord({
+      platform: PLATFORM,
+      channelRef: spec.target,
+      cwd: spec.cwd ?? this.config.REPOS_ROOT,
+    });
+    const actor = spec.returnTo ?? spec.target;
+
+    // Ledger the actor→target compaction (best-effort — never break the run).
+    try {
+      this.store.recordDelegation({
+        id: spec.id,
+        kind: "compact",
+        sourceRef: actor,
+        targetRef: spec.target,
+        promptPreview: spec.prompt,
+        correlationId: spec.correlationId ?? null,
+        status: "dispatched",
+      });
+    } catch (err) {
+      this.logger.warn({ err, dispatch: spec.id }, "compact-dispatch: ledger record failed");
+    }
+
+    const header = this.dispatchIndicatorHeader(spec, null);
+    const startedAt = Date.now();
+    try { this.store.updateDelegationStatus(spec.id, "running"); } catch { /* best-effort */ }
+
+    // Start indicator: post the same slim panel dispatchInjectTurn posts, so the
+    // target thread shows the compaction is underway. Best-effort.
+    let panelRef: MessageRef | undefined;
+    try {
+      const startPanel = this.dispatchStreamPanel({ header, text: "", done: false, elapsedMs: 0 });
+      panelRef = this.adapter.sendPanel
+        ? await this.adapter.sendPanel(target, startPanel)
+        : await this.adapter.sendMessage(target, serializePanelText(startPanel));
+    } catch (err) {
+      this.logger.warn({ err, dispatch: spec.id }, "compact-dispatch: start-indicator post failed");
+    }
+
+    // Finalize the indicator into its terminal (done/error) state in place, so
+    // the one panel is the whole life-cycle (mirrors finalizeDispatchStream).
+    const finalize = async (body: string, error?: string): Promise<void> => {
+      if (!panelRef) return;
+      const panel = this.dispatchStreamPanel({
+        header,
+        text: body,
+        done: true,
+        elapsedMs: Date.now() - startedAt,
+        ...(error ? { error } : {}),
+      });
+      try {
+        if (this.adapter.editPanel) await this.adapter.editPanel(panelRef, panel);
+        else await this.adapter.editMessage(panelRef, serializePanelText(panel));
+      } catch (err) {
+        this.logger.warn({ err, dispatch: spec.id }, "compact-dispatch: finalize edit failed");
+      }
+    };
+
+    try {
+      const res = await this.compactThread(record, {
+        ...(spec.compactSource ? { source: spec.compactSource } : {}),
+        channel: target,
+        onProgress: (m) => this.logger.debug({ dispatch: spec.id, compact: spec.target }, m),
+      });
+      const summary =
+        `✅ Compacted into a new session \`${res.newSessionId}\` via the multi-agent pipeline` +
+        `${res.wasActive ? " — this thread is now bound to it" : ""} (${res.stats.chunks} chunk(s)). ` +
+        `Original \`${res.originalSessionId}\` is preserved (review or delete it from the session manager).`;
+      await finalize(summary);
+      // Attach the full premium report for review, alongside the panel.
+      await this.sendResultFile(target, res.originalSessionId, res.reportMarkdown, "premium-compaction").catch(() => {});
+      try { this.store.updateDelegationStatus(spec.id, "completed"); } catch { /* best-effort */ }
+      this.logger.info(
+        { dispatch: spec.id, actor, target: spec.target, newSessionId: res.newSessionId, wasActive: res.wasActive },
+        "compact-dispatch: completed"
+      );
+      return { output: summary, stopReason: "compacted" };
+    } catch (err) {
+      const message = (err as Error)?.message ?? String(err);
+      await finalize("", message);
+      if (!panelRef) {
+        // No panel to carry the error — post a standalone failure card.
+        await this.sendResultCard(target, "✨ Compaction failed", `❌ ${message.slice(0, 1500)}`, DISPATCH_ERROR_COLOR).catch(() => {});
+      }
+      try { this.store.updateDelegationStatus(spec.id, "failed"); } catch { /* best-effort */ }
+      this.logger.warn({ err, dispatch: spec.id, target: spec.target }, "compact-dispatch: failed");
+      throw new Error(message);
     }
   }
 
@@ -3319,6 +3531,7 @@ export class Orchestrator {
       case "watch": return "watch fired";
       case "report_back": return "report-back";
       case "peek": return "peek";
+      case "compact": return "compact";
       case "scheduled": return "scheduled";
       case "handoff":
       default: return "handoff";
@@ -6382,37 +6595,21 @@ export class Orchestrator {
             };
 
             try {
-              const result = await this.runPremiumCompactionForSession({
-                profile,
-                manager,
+              // Delegate the run+seed+swap to the shared primitive (identical
+              // behavior, non-destructive); this handler keeps its card rendering.
+              const res = await this.compactThread(record, {
                 sessionId: session.sessionId,
-                cwd,
                 ...(channelRef ? { channel: channelRef } : {}),
                 onProgress: pushProgress,
               });
-
-              if (!result.assembledSeed.trim()) throw new Error("Pipeline produced an empty result.");
-
-              // Non-destructive: seed a NEW resumable session with the summary,
-              // bind the thread if this was its active session, preserve the original.
-              const cfg = this.store.readConfig(record);
-              const newId = await this.seedNewSession({
-                profile, cwd,
-                ...(cfg.model ? { model: cfg.model } : {}),
-                ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
-                summary: result.assembledSeed,
-              });
-              const wasActive = session.sessionId === record.acpSessionId;
-              if (wasActive) {
-                this.store.upsert({ ...record, acpSessionId: newId, updatedUtc: new Date().toISOString() });
-                await this.router.invalidate(record.id, { clearAcpSession: false });
-              }
+              const newId = res.newSessionId;
+              const wasActive = res.wasActive;
               sessions = await manager.listSessions(cwd);
               const newIndex = sessions.findIndex((s) => s.sessionId === newId);
               if (newIndex !== -1) currentIndex = newIndex;
 
               const reportPath = path.join(os.tmpdir(), `premium-compaction-${session.sessionId}.md`);
-              await fsp.writeFile(reportPath, this.formatPremiumReport(result, session.sessionId), "utf8").catch(() => {});
+              await fsp.writeFile(reportPath, res.reportMarkdown, "utf8").catch(() => {});
 
               const successEmbed = new EmbedBuilder()
                 .setTitle("✨ Premium Compaction Complete")
@@ -6422,7 +6619,7 @@ export class Orchestrator {
                   `\nOriginal \`${session.sessionId}\` is **preserved** (review or delete it from this list).`
                 )
                 .addFields(
-                  { name: "Chunks", value: String(result.stats.chunks), inline: true },
+                  { name: "Chunks", value: String(res.stats.chunks), inline: true },
                 )
                 .setColor(0x2ecc71);
 
@@ -6475,37 +6672,22 @@ export class Orchestrator {
             };
 
             try {
-              const result = await this.runPremiumCompactionForDiscord({
-                profile,
-                manager,
+              // Delegate the run+seed+swap to the shared primitive with the
+              // full-Discord source; this handler keeps its card rendering.
+              const res = await this.compactThread(record, {
+                source: "discord",
                 sessionId: session.sessionId,
-                cwd,
                 ...(channelRef ? { channel: channelRef } : {}),
                 onProgress: pushProgress,
               });
-
-              if (!result.assembledSeed.trim()) throw new Error("Pipeline produced an empty result.");
-
-              // Non-destructive: seed a NEW resumable session with the summary,
-              // bind the thread if this was its active session, preserve the original.
-              const cfg = this.store.readConfig(record);
-              const newId = await this.seedNewSession({
-                profile, cwd,
-                ...(cfg.model ? { model: cfg.model } : {}),
-                ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
-                summary: result.assembledSeed,
-              });
-              const wasActive = session.sessionId === record.acpSessionId;
-              if (wasActive) {
-                this.store.upsert({ ...record, acpSessionId: newId, updatedUtc: new Date().toISOString() });
-                await this.router.invalidate(record.id, { clearAcpSession: false });
-              }
+              const newId = res.newSessionId;
+              const wasActive = res.wasActive;
               sessions = await manager.listSessions(cwd);
               const newIndex = sessions.findIndex((s) => s.sessionId === newId);
               if (newIndex !== -1) currentIndex = newIndex;
 
               const reportPath = path.join(os.tmpdir(), `premium-compaction-discord-${session.sessionId}.md`);
-              await fsp.writeFile(reportPath, this.formatPremiumReport(result, session.sessionId), "utf8").catch(() => {});
+              await fsp.writeFile(reportPath, res.reportMarkdown, "utf8").catch(() => {});
 
               const successEmbed = new EmbedBuilder()
                 .setTitle("✨ Premium Compaction (Discord) Complete")
@@ -6515,7 +6697,7 @@ export class Orchestrator {
                   `\nOriginal \`${session.sessionId}\` is **preserved** (review or delete it from this list).`
                 )
                 .addFields(
-                  { name: "Chunks", value: String(result.stats.chunks), inline: true },
+                  { name: "Chunks", value: String(res.stats.chunks), inline: true },
                 )
                 .setColor(0x2ecc71);
 

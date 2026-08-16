@@ -153,6 +153,25 @@ export interface SeamMcpServerDeps {
     record: SessionRecord,
     input: ConfigMutationInput
   ) => Promise<ConfigProposeOutcome>;
+  /**
+   * The reusable thread-compaction primitive (run premium pipeline → seed a new
+   * session → rebind the thread if active). Its PRESENCE gates the `compact`
+   * tool — undefined ⇒ compaction is unsupported on this deployment. Delivery is
+   * non-blocking: the tool ENQUEUES a `kind:"compact"` dispatch and returns
+   * immediately; the DispatchWatcher invokes THIS SAME method (minutes later,
+   * off the caller's turn) and posts the result into the target thread. Wired in
+   * index.ts to `orchestrator.compactThread`, like `scheduleWake`/`proposeConfig`.
+   */
+  compactThread?: (
+    record: SessionRecord,
+    opts?: { source?: "session" | "discord"; onProgress?: (m: string) => void }
+  ) => Promise<{
+    newSessionId: string;
+    originalSessionId: string;
+    wasActive: boolean;
+    reportMarkdown: string;
+    stats: { chunks: number };
+  }>;
 }
 
 /** Result of asking the platform to propose a config change. */
@@ -289,6 +308,34 @@ const TOOLS = [
         },
       },
       required: ["workers", "prompt"],
+    },
+  },
+  {
+    name: "compact",
+    description:
+      "Compact a thread's conversation: run the premium multi-agent compaction pipeline over its history " +
+      "and seed a FRESH, resumable session from the assembled summary, rebinding the thread to it. " +
+      "NON-DESTRUCTIVE — the original session is preserved (recoverable / deletable from the session manager). " +
+      "Targets YOUR OWN thread by default; pass `thread` (a snowflake) to compact another teammate's thread " +
+      "(the actor→target is audited). Runs for MINUTES, so it does NOT block your turn: this returns immediately " +
+      "and the result card posts into the target thread when the pipeline finishes. Use when a thread's context " +
+      "has grown large and you want to reclaim room without losing the pinned facts / recent verbatim window. " +
+      "`source` picks the history read: \"session\" (the raw session history, default) or \"discord\" " +
+      "(reconstructed from the full Discord thread — use when the session history is thin or unavailable).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        thread: {
+          type: "string",
+          description: "Thread id (snowflake) to compact. Defaults to YOUR thread.",
+        },
+        source: {
+          type: "string",
+          enum: ["session", "discord"],
+          description: "Which history to compact: \"session\" (default) or \"discord\" (full thread reconstruction).",
+        },
+      },
+      required: [],
     },
   },
   {
@@ -520,6 +567,9 @@ const INSTRUCTIONS = [
   "  checks cheaply and re-enters you ONLY when it fires (file/http/command source). Prefer this over a",
   "  schedule_wake poll loop for \"wait until X\" — the bridge does the checking, so a turn is spent only on a",
   "  real event, not on repeatedly producing \"no\". Always set expiresInSeconds; watch_list / watch_cancel manage them.",
+  "- compact(thread?, source?): run the premium multi-agent compaction pipeline on a thread (yours by default,",
+  "  or a named teammate's) and reseed it from the summary — non-destructive (the original session is kept). It",
+  "  runs for minutes and does NOT block you: it returns at once and the result posts into the target thread.",
   "",
   "Prefer handoff to a preset for well-scoped specialist work, and to a thread id when a specific",
   "teammate already holds the context. Use chain when work has a fixed multi-stage pipeline.",
@@ -668,6 +718,8 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolPeek(args));
         case "chain":
           return rpcResult(id, await this.toolChain(record, args));
+        case "compact":
+          return rpcResult(id, await this.toolCompact(record, args));
         case "schedule_wake":
           return rpcResult(id, this.toolScheduleWake(record, args));
         case "cancel_wake":
@@ -831,6 +883,52 @@ export class SeamMcpServer {
     return textResult(
       `Started chain ${chainId} across ${workers.length} hop(s): ${workers.join(" → ")}. ` +
         `Each hop's output feeds the next; the final result will be delivered into thread ${originRef}.`
+    );
+  }
+
+  /**
+   * Trigger thread compaction (agent-callable premium compaction). Self-scoped
+   * by default — the caller is the token-resolved thread; an explicit `thread`
+   * arg targets another teammate's thread (still allowed, but the actor→target
+   * is ledgered by the dispatch handler). Delivery is NON-BLOCKING: we enqueue a
+   * `kind:"compact"` dispatch (NOT an inject-turn) carrying the caller as
+   * `returnTo` for the ledger, and return at once — the DispatchWatcher runs the
+   * pipeline and posts the result card into the target thread minutes later.
+   */
+  private async toolCompact(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.compactThread) {
+      return textResult("compaction is not supported on this deployment.", true);
+    }
+    const target = optionalString(args, "thread") ?? caller.channelRef;
+    const source = optionalString(args, "source") === "discord" ? "discord" : "session";
+    const dispatchId = randomUUID();
+    const spec: DispatchSpec = {
+      id: dispatchId,
+      target,
+      // Compact has no injected prompt; carry a readable preview so the ledger
+      // and the start indicator show what's running (schema requires non-empty).
+      prompt: `[seam-compact] compact thread ${target} (${source} history)`,
+      session: "live",
+      kind: "compact",
+      compactSource: source,
+      // The caller thread is the actor — recorded actor→target by the handler.
+      returnTo: caller.channelRef,
+      correlationId: dispatchId,
+      createdUtc: new Date().toISOString(),
+    };
+    await this.deps.enqueueDispatch(spec);
+    const self = target === caller.channelRef;
+    this.logger.info(
+      { dispatchId, actor: caller.channelRef, target, source, self },
+      "seam-mcp compact enqueued"
+    );
+    return textResult(
+      `Compaction started for thread ${target}${self ? " (your own thread)" : ""} ` +
+        `using ${source} history (dispatch ${dispatchId}). It runs for a few minutes and does not block you — ` +
+        `the result card will post into thread ${target} when it finishes.`
     );
   }
 

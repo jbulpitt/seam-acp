@@ -294,7 +294,17 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .setDescription("Manage reusable session presets")
       .addSubcommand((sub) => sub.setName("list").setDescription("List all presets"))
       .addSubcommand((sub) =>
-        sub.setName("create").setDescription("Create a new preset (opens a builder card)")
+        sub
+          .setName("create")
+          .setDescription("Create a new preset (opens a builder card)")
+          .addBooleanOption((o) =>
+            o
+              .setName("global")
+              .setDescription(
+                "Make a global preset (visible in every project). Default: scoped to this project."
+              )
+              .setRequired(false)
+          )
       )
       .addSubcommand((sub) =>
         sub

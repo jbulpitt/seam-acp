@@ -59,11 +59,18 @@ export function defaultSessionConfig(
  *
  * Every override field is nullable: `null` means "this preset does not touch
  * that setting", so applying a preset only changes the fields it specifies.
- * Presets are global — project/channel scoping is deliberately out of scope.
+ *
+ * Presets are scoped by project (#21): `projectRef` names the channel/parentRef
+ * the preset belongs to. `null` means a *global* preset — visible in every
+ * project (the legacy behavior). A project-scoped preset shadows a global one of
+ * the same name within its project. Names are unique per (name, scope), so the
+ * same short name can be reused independently across projects.
  */
 export interface Preset {
   id: string;
   name: string;
+  /** Project scope (channel/parentRef); `null` = global. See interface doc. */
+  projectRef?: string | null;
   description: string | null;
   agentId: string | null;
   model: string | null;

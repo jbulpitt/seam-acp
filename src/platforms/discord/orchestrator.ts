@@ -6589,7 +6589,7 @@ export class Orchestrator {
    * the channel itself. Mirrors the scope resolution in handleSlashInteraction.
    */
   private projectScopeId(
-    i: ChatInputCommandInteraction
+    i: ChatInputCommandInteraction | MessageComponentInteraction
   ): string | undefined {
     const ch = i.channel;
     return ch?.isThread() ? (ch.parentId ?? undefined) : i.channelId ?? undefined;
@@ -6692,23 +6692,25 @@ export class Orchestrator {
     if (p.toolsAllow?.length) parts.push(`Allow: ${p.toolsAllow.join(", ")}`);
     if (p.toolsExclude?.length) parts.push(`Exclude: ${p.toolsExclude.join(", ")}`);
     if (p.instructions) parts.push("📝 Has instructions");
+    const scope = p.projectRef ? "📁" : "🌐";
     const desc = p.description ? ` — ${p.description}` : "";
     const config = parts.length > 0 ? `\n   ${parts.join(" · ")}` : "";
-    return `⚙️ **${p.name}**${desc}${config}`;
+    return `${scope} **${p.name}**${desc}${config}`;
   }
 
-  private buildPresetListMessage(): {
+  private buildPresetListMessage(projectRef: string | null): {
     embeds: EmbedBuilder[];
     components: ActionRowBuilder<ButtonBuilder>[];
   } {
-    const presets = this.store.listPresets();
+    const presets = this.store.listPresetsForProject(projectRef);
     const embed = new EmbedBuilder()
       .setTitle("🎛️ Presets")
       .setColor(PRESET_COLOR)
       .setDescription(
-        presets.length
+        (presets.length
           ? presets.map((p) => this.presetSummaryLine(p)).join("\n\n")
-          : "_No presets yet._"
+          : "_No presets in this project yet._") +
+          "\n\n_📁 this project · 🌐 global_"
       );
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
     // Discord caps a message at 5 action rows, so only the first 5 presets get
@@ -6735,15 +6737,16 @@ export class Orchestrator {
   }
 
   private async cmdPresetList(i: ChatInputCommandInteraction): Promise<void> {
-    const presets = this.store.listPresets();
+    const projectRef = this.projectScopeId(i) ?? null;
+    const presets = this.store.listPresetsForProject(projectRef);
     if (presets.length === 0) {
       await i.reply({
-        content: "No presets yet. Create one with `/seam preset create`.",
+        content: "No presets here yet. Create one with `/seam preset create`.",
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
-    await i.reply({ ...this.buildPresetListMessage(), flags: MessageFlags.Ephemeral });
+    await i.reply({ ...this.buildPresetListMessage(projectRef), flags: MessageFlags.Ephemeral });
     const msg = await i.fetchReply();
     const collector = msg.createMessageComponentCollector({
       filter: (c) => c.user.id === i.user.id,
@@ -6797,7 +6800,7 @@ export class Orchestrator {
           await this.cmdPresetBuilder(c, preset);
         } else if (action === "del") {
           this.store.deletePreset(id);
-          await c.update(this.buildPresetListMessage());
+          await c.update(this.buildPresetListMessage(this.projectScopeId(c) ?? null));
         }
       } catch (err) {
         this.logger.warn({ err }, "preset-list button handler failed");
@@ -6806,12 +6809,16 @@ export class Orchestrator {
   }
 
   private async cmdPresetCreate(i: ChatInputCommandInteraction): Promise<void> {
-    await this.cmdPresetBuilder(i);
+    // A new preset is stamped with the current project by default; `--global`
+    // makes it a global preset visible in every project.
+    const global = i.options.getBoolean("global") ?? false;
+    const createScope = global ? null : this.projectScopeId(i) ?? null;
+    await this.cmdPresetBuilder(i, undefined, createScope);
   }
 
   private async cmdPresetEdit(i: ChatInputCommandInteraction): Promise<void> {
     const name = i.options.getString("name", true);
-    const preset = this.store.getPresetByName(name);
+    const preset = this.store.getPresetByNameScoped(name, this.projectScopeId(i) ?? null);
     if (!preset) {
       await i.reply({ content: `No preset named \`${name}\`.`, flags: MessageFlags.Ephemeral });
       return;
@@ -6825,9 +6832,16 @@ export class Orchestrator {
    */
   private async cmdPresetBuilder(
     i: ChatInputCommandInteraction | MessageComponentInteraction,
-    existing?: Preset
+    existing?: Preset,
+    createScope?: string | null
   ): Promise<void> {
     const profiles = this.router.listProfiles();
+
+    // Scope is fixed at creation: editing preserves the preset's scope, while a
+    // new preset takes `createScope` (the current project, or null for global).
+    const projectRef: string | null = existing
+      ? existing.projectRef ?? null
+      : createScope ?? null;
 
     const state: {
       name: string;
@@ -6890,6 +6904,7 @@ export class Orchestrator {
         )
         .addFields(
           { name: "🏷️ Name", value: state.name || "*(not set)*" },
+          { name: "🗂️ Scope", value: projectRef ? `<#${projectRef}>` : "🌐 Global" },
           { name: "📝 Description", value: state.description || "*(none)*" },
           { name: "🤖 Agent", value: agentDisplay, inline: true },
           { name: "🧠 Model", value: modelDisplay, inline: true },
@@ -7155,12 +7170,16 @@ export class Orchestrator {
             return;
           }
           // Names are matched case-insensitively, so guard against a collision
-          // that differs only in case.
+          // that differs only in case — but only WITHIN the same scope, so a
+          // project preset may reuse a name that exists globally or elsewhere.
           if (!existing || existing.name.toLowerCase() !== state.name.toLowerCase()) {
-            const collision = this.store.getPresetByName(state.name);
+            const found = this.store.getPresetByNameScoped(state.name, projectRef);
+            const collision = found && (found.projectRef ?? null) === projectRef;
             if (collision) {
               await c.reply({
-                content: `A preset named \`${state.name}\` already exists.`,
+                content:
+                  `A ${projectRef ? "project" : "global"} preset named ` +
+                  `\`${state.name}\` already exists.`,
                 flags: MessageFlags.Ephemeral,
               });
               return;
@@ -7170,6 +7189,7 @@ export class Orchestrator {
           const preset: Preset = {
             id: existing?.id ?? `pre_${randomUUID().slice(0, 8)}`,
             name: state.name,
+            projectRef,
             description: state.description || null,
             agentId: state.agentId,
             model: state.model,
@@ -7202,7 +7222,7 @@ export class Orchestrator {
 
   private async cmdPresetApply(i: ChatInputCommandInteraction): Promise<void> {
     const name = i.options.getString("name", true);
-    const preset = this.store.getPresetByName(name);
+    const preset = this.store.getPresetByNameScoped(name, this.projectScopeId(i) ?? null);
     if (!preset) {
       await i.reply({ content: `No preset named \`${name}\`.`, flags: MessageFlags.Ephemeral });
       return;
@@ -7349,7 +7369,7 @@ export class Orchestrator {
 
   private async cmdPresetShow(i: ChatInputCommandInteraction): Promise<void> {
     const name = i.options.getString("name", true);
-    const preset = this.store.getPresetByName(name);
+    const preset = this.store.getPresetByNameScoped(name, this.projectScopeId(i) ?? null);
     if (!preset) {
       await i.reply({ content: `No preset named \`${name}\`.`, flags: MessageFlags.Ephemeral });
       return;
@@ -7359,6 +7379,7 @@ export class Orchestrator {
       .setColor(PRESET_COLOR)
       .setDescription(preset.description || "*(no description)*")
       .addFields(
+        { name: "🗂️ Scope", value: preset.projectRef ? `<#${preset.projectRef}>` : "🌐 Global", inline: true },
         { name: "🤖 Agent", value: preset.agentId ? `\`${preset.agentId}\`` : "*(default)*", inline: true },
         { name: "🧠 Model", value: preset.model ? `\`${preset.model}\`` : "*(default)*", inline: true },
         { name: "⚡ Effort", value: preset.effort ?? "*(default)*", inline: true },
@@ -7381,7 +7402,7 @@ export class Orchestrator {
 
   private async cmdPresetDelete(i: ChatInputCommandInteraction): Promise<void> {
     const name = i.options.getString("name", true);
-    const preset = this.store.getPresetByName(name);
+    const preset = this.store.getPresetByNameScoped(name, this.projectScopeId(i) ?? null);
     if (!preset) {
       await i.reply({ content: `No preset named \`${name}\`.`, flags: MessageFlags.Ephemeral });
       return;

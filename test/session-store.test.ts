@@ -6,7 +6,7 @@ import {
   SessionStore,
   makeSessionId,
 } from "../src/core/session-store.js";
-import type { SessionRecord } from "../src/core/types.js";
+import type { Preset, SessionRecord } from "../src/core/types.js";
 
 let dir: string;
 let store: SessionStore;
@@ -136,5 +136,112 @@ describe("SessionStore active_projects (#22)", () => {
     store.upsertActiveProject({ channelRef: "chan-b", enabled: true, configJson: null, createdUtc: "2026-01-01T00:00:00Z", updatedUtc: now });
     store.upsertActiveProject({ channelRef: "chan-a", enabled: false, configJson: null, createdUtc: "2025-01-01T00:00:00Z", updatedUtc: now });
     expect(store.listActiveProjects().map((p) => p.channelRef)).toEqual(["chan-a", "chan-b"]);
+  });
+});
+
+describe("SessionStore project-scoped presets (#21)", () => {
+  const now = new Date().toISOString();
+
+  const preset = (over: Partial<Preset> & { id: string; name: string }): Preset => ({
+    projectRef: null,
+    description: null,
+    agentId: null,
+    model: null,
+    effort: null,
+    repoPath: null,
+    permission: null,
+    toolsAllow: null,
+    toolsExclude: null,
+    instructions: null,
+    createdBy: "u1",
+    createdUtc: now,
+    updatedUtc: now,
+    ...over,
+  });
+
+  it("round-trips projectRef (scoped and global)", () => {
+    store.upsertPreset(preset({ id: "p1", name: "deploy", projectRef: "projA" }));
+    store.upsertPreset(preset({ id: "p2", name: "review", projectRef: null }));
+    expect(store.getPreset("p1")?.projectRef).toBe("projA");
+    expect(store.getPreset("p2")?.projectRef).toBeNull();
+  });
+
+  it("a project preset beats a global of the same name", () => {
+    store.upsertPreset(preset({ id: "g", name: "build", projectRef: null, model: "global-model" }));
+    store.upsertPreset(preset({ id: "a", name: "build", projectRef: "projA", model: "projA-model" }));
+    const hit = store.getPresetByNameScoped("build", "projA");
+    expect(hit?.id).toBe("a");
+    expect(hit?.model).toBe("projA-model");
+  });
+
+  it("falls back to the global preset when the project has none of that name", () => {
+    store.upsertPreset(preset({ id: "g", name: "build", projectRef: null, model: "global-model" }));
+    const hit = store.getPresetByNameScoped("build", "projB");
+    expect(hit?.id).toBe("g");
+    // No project context at all → still resolves the global.
+    expect(store.getPresetByNameScoped("build", null)?.id).toBe("g");
+  });
+
+  it("returns null when neither a scoped nor a global match exists", () => {
+    store.upsertPreset(preset({ id: "a", name: "build", projectRef: "projA" }));
+    expect(store.getPresetByNameScoped("build", "projB")).toBeNull();
+    expect(store.getPresetByNameScoped("missing", "projA")).toBeNull();
+  });
+
+  it("resolves an explicit qualified `proj/name` reference", () => {
+    store.upsertPreset(preset({ id: "a", name: "build", projectRef: "projA", model: "a-model" }));
+    store.upsertPreset(preset({ id: "b", name: "build", projectRef: "projB", model: "b-model" }));
+    // From projB, reach projA's preset by qualifying the name.
+    const hit = store.getPresetByNameScoped("projA/build", "projB");
+    expect(hit?.id).toBe("a");
+    expect(hit?.model).toBe("a-model");
+  });
+
+  it("a qualified ref falls back to global when that project lacks the name", () => {
+    store.upsertPreset(preset({ id: "g", name: "build", projectRef: null }));
+    // projA has no `build`; the global one answers the qualified lookup.
+    expect(store.getPresetByNameScoped("projA/build", "projA")?.id).toBe("g");
+  });
+
+  it("two projects reuse the same short name independently", () => {
+    store.upsertPreset(preset({ id: "a", name: "ship", projectRef: "projA", model: "a-model" }));
+    store.upsertPreset(preset({ id: "b", name: "ship", projectRef: "projB", model: "b-model" }));
+    expect(store.getPresetByNameScoped("ship", "projA")?.model).toBe("a-model");
+    expect(store.getPresetByNameScoped("ship", "projB")?.model).toBe("b-model");
+  });
+
+  it("rejects a duplicate name within the same scope (unique per scope)", () => {
+    store.upsertPreset(preset({ id: "a1", name: "same", projectRef: "projA" }));
+    expect(() =>
+      store.upsertPreset(preset({ id: "a2", name: "same", projectRef: "projA" }))
+    ).toThrow();
+    // Case-insensitively, too.
+    expect(() =>
+      store.upsertPreset(preset({ id: "a3", name: "SAME", projectRef: "projA" }))
+    ).toThrow();
+  });
+
+  it("allows the same name globally and per-project side by side", () => {
+    store.upsertPreset(preset({ id: "g", name: "same", projectRef: null }));
+    expect(() =>
+      store.upsertPreset(preset({ id: "a", name: "same", projectRef: "projA" }))
+    ).not.toThrow();
+  });
+
+  it("listPresetsForProject returns project + global, scoped first", () => {
+    store.upsertPreset(preset({ id: "g", name: "build", projectRef: null }));
+    store.upsertPreset(preset({ id: "a", name: "build", projectRef: "projA" }));
+    store.upsertPreset(preset({ id: "other", name: "zeta", projectRef: "projB" }));
+    const forA = store.listPresetsForProject("projA");
+    // projB's preset is excluded; projA's `build` sorts before the global `build`.
+    expect(forA.map((p) => p.id)).toEqual(["a", "g"]);
+    // Null scope → globals only.
+    expect(store.listPresetsForProject(null).map((p) => p.id)).toEqual(["g"]);
+  });
+
+  it("getPresetByName prefers the global when a name repeats across scopes", () => {
+    store.upsertPreset(preset({ id: "a", name: "build", projectRef: "projA" }));
+    store.upsertPreset(preset({ id: "g", name: "build", projectRef: null }));
+    expect(store.getPresetByName("build")?.id).toBe("g");
   });
 });

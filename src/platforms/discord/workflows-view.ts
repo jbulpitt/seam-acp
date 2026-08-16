@@ -4,6 +4,7 @@
 // Read-only — this module never touches the store.
 
 import type { LedgerEntry, DelegationStatus } from "../../core/types.js";
+import type { AnomalySummary } from "../../core/watchdog.js";
 
 /** Rendered, embed-ready view of the ledger. */
 export interface WorkflowsView {
@@ -106,6 +107,31 @@ export function formatWorkflowsView(
     active: { count: active.length, lines: activeLines },
     recent: { count: recent.length, lines: recentLines },
   };
+}
+
+/**
+ * Render an anomaly summary (from `summarizeAnomalies`) into embed-ready lines
+ * for the additive "⚠️ Anomalies" section of `/seam workflows`. Returns `[]`
+ * when nothing is anomalous, so the caller can skip the section entirely.
+ */
+export function formatAnomalyLines(anomalies: AnomalySummary, now: Date): string[] {
+  const lines: string[] = [];
+  for (const loop of anomalies.loops) {
+    const path = loop.cycle.map((r) => shortRef(r, "?")).join("→");
+    lines.push(`🔁 loop: ${path}→…`);
+  }
+  for (const spike of anomalies.spikes) {
+    lines.push(
+      `📈 spike: ${shortRef(spike.sourceRef, "?")} · ${spike.count} dispatches`
+    );
+  }
+  for (const q of anomalies.quiet) {
+    const route = `${shortRef(q.sourceRef, "scheduler")}→${shortRef(q.targetRef, "…")}`;
+    lines.push(
+      `🕰️ quiet: \`${shortId(q.id)}\` ${route} · ${q.status} · ${formatAge(q.updatedUtc, now)}`
+    );
+  }
+  return lines;
 }
 
 /**

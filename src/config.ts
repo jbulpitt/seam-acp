@@ -641,11 +641,18 @@ export function loadConfig(): Config {
   }
   cfg.REPOS_ROOT = reposRoot;
 
-  const { channelPresets, threadPresets } = loadChannelPresets(cfg.CHANNEL_PRESETS_FILE);
+  const { channelPresets, threadPresets } = buildChannelPresetMaps(cfg.CHANNEL_PRESETS_FILE);
   return { ...cfg, channelPresets, threadPresets };
 }
 
-function loadChannelPresets(
+/**
+ * Parse + validate `CHANNEL_PRESETS_FILE` into fresh channel/thread preset maps.
+ * Throws on read / JSON / schema failure — callers that must not crash (the P0
+ * hot-reloader) catch and keep their previous good maps. Used both at boot
+ * (loadConfig) and on every hot-reload swap so the two paths validate
+ * identically (D7: single zod schema, never hand-rolled parsing).
+ */
+export function buildChannelPresetMaps(
   file: string | undefined
 ): { channelPresets: Map<string, ChannelPreset>; threadPresets: Map<string, ThreadPreset> } {
   const channelPresets = new Map<string, ChannelPreset>();

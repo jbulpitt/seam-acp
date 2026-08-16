@@ -28,6 +28,26 @@ import type { SessionRecord } from "../types.js";
 import type { DispatchSpec } from "../dispatch/types.js";
 import { frameSteerPrompt } from "../steer.js";
 import { buildChainHopSpec } from "../dispatch/types.js";
+import type { ConfigDescription } from "../session-router.js";
+
+/** Read-only entities visible to the calling thread (schedules + presets),
+ *  returned by `config_describe` alongside the effective config. Kept as a
+ *  minimal projection so the server stays decoupled from the store types. */
+export interface ConfigEntities {
+  schedules: Array<{
+    name: string;
+    cron: string;
+    timezone: string;
+    enabled: boolean;
+    nextRunUtc: string | null;
+  }>;
+  presets: Array<{
+    name: string;
+    scope: "project" | "global";
+    agentId: string | null;
+    model: string | null;
+  }>;
+}
 
 /** MCP protocol version we speak. We echo the client's if it sends a newer one
  *  it thinks we support; otherwise advertise this. */
@@ -61,6 +81,15 @@ export interface SeamMcpServerDeps {
   }) => { chainId: string; firstHop: string };
   /** Read recent messages from a thread; undefined ⇒ peek is unsupported. */
   peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
+  /**
+   * Compute the EFFECTIVE config + which layer won for the calling session
+   * (#58 P1). Undefined ⇒ config introspection is unsupported on this
+   * deployment. Read-only; scope is always the caller's own thread (D3).
+   */
+  describeConfig?: (record: SessionRecord) => ConfigDescription;
+  /** List the read-only entities (schedules / presets) visible to the calling
+   *  thread. Undefined ⇒ omit the entity section from `config_describe`. */
+  listConfigEntities?: (record: SessionRecord) => ConfigEntities;
 }
 
 /** A Discord snowflake is a long run of digits; a preset is a human name. Used
@@ -163,6 +192,28 @@ const TOOLS = [
         },
       },
       required: ["workers", "prompt"],
+    },
+  },
+  {
+    name: "config_describe",
+    description:
+      "Describe YOUR thread's effective configuration and WHY each value is what it is. " +
+      "Returns the effective agent / model / effort / cwd / permission, and for each one " +
+      "WHICH layer set it (channel preset vs thread preset vs session config vs bot default) — " +
+      "so you can answer questions like \"what model am I on?\" or \"why is my working directory wrong?\". " +
+      "Also lists the scheduled prompts and presets visible in this thread. Read-only: it changes nothing, " +
+      "and it only ever reports YOUR OWN thread (cross-thread config is a separate privileged capability).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: {
+          type: "string",
+          description:
+            "Optional. Only \"self\" (or your own thread id) is allowed — describing another " +
+            "thread's config is privileged and not available here. Defaults to your own thread.",
+        },
+      },
+      required: [],
     },
   },
 ] as const;
@@ -327,6 +378,8 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolPeek(args));
         case "chain":
           return rpcResult(id, await this.toolChain(record, args));
+        case "config_describe":
+          return rpcResult(id, this.toolConfigDescribe(record, args));
         default:
           return rpcError(id, -32602, `unknown tool: ${name}`);
       }
@@ -491,6 +544,78 @@ export class SeamMcpServer {
       .map((m) => `${m.authorIsBot ? "🤖" : "👤"} ${m.text}`)
       .join("\n");
     return textResult(`Recent messages in thread ${thread}:\n\n${rendered}`);
+  }
+
+  /**
+   * Read-only config introspection (#58 P1). Reports the calling thread's
+   * effective agent/model/effort/cwd/permission AND which layer won for each,
+   * plus the schedules/presets visible here. Self-scope only (D3): a caller may
+   * describe its OWN thread; naming another thread is refused as a privileged
+   * capability that this read-only phase does not grant. The caller is resolved
+   * from the X-Seam-Session token (never a caller-supplied id), so a thread
+   * cannot read another thread's config.
+   */
+  private toolConfigDescribe(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): McpToolResult {
+    if (!this.deps.describeConfig) {
+      return textResult("config introspection is not supported on this deployment.", true);
+    }
+    const scope = optionalString(args, "scope");
+    if (
+      scope &&
+      scope !== "self" &&
+      scope !== caller.channelRef &&
+      scope !== caller.id
+    ) {
+      return textResult(
+        `Refused: describing another thread's config is a privileged capability that is not ` +
+          `available here. You can only describe your own thread (${caller.channelRef}). ` +
+          `Requested scope: "${scope}".`,
+        true
+      );
+    }
+
+    const d = this.deps.describeConfig(caller);
+    const line = (label: string, value: string, source: string) =>
+      `• ${label.padEnd(11)} ${value}  (from ${source})`;
+    const lines = [
+      `Effective configuration for thread ${d.channelRef}${d.locked ? " 🔒 (locked — read-only over MCP)" : ""}:`,
+      line("agent:", d.agent.value, d.agent.source),
+      line("model:", d.model.value, d.model.source),
+      line("effort:", d.effort.value ?? "(none)", d.effort.source),
+      line("cwd:", d.cwd.value, d.cwd.source),
+      line("permission:", d.permission.value, d.permission.source),
+    ];
+    if (d.effortIgnoredNote) lines.push(`⚠ ${d.effortIgnoredNote}`);
+
+    const entities = this.deps.listConfigEntities?.(caller);
+    if (entities) {
+      lines.push("", `Scheduled prompts (${entities.schedules.length}):`);
+      if (entities.schedules.length === 0) {
+        lines.push("  (none)");
+      } else {
+        for (const s of entities.schedules) {
+          lines.push(
+            `  • ${s.name} — ${s.cron} ${s.timezone}` +
+              `${s.enabled ? "" : " [disabled]"}` +
+              `${s.nextRunUtc ? ` — next ${s.nextRunUtc}` : ""}`
+          );
+        }
+      }
+      lines.push("", `Presets visible here (${entities.presets.length}):`);
+      if (entities.presets.length === 0) {
+        lines.push("  (none)");
+      } else {
+        for (const p of entities.presets) {
+          const bits = [p.agentId, p.model].filter(Boolean).join(" / ");
+          lines.push(`  • ${p.name} [${p.scope}]${bits ? ` — ${bits}` : ""}`);
+        }
+      }
+    }
+
+    return textResult(lines.join("\n"));
   }
 }
 

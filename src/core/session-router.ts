@@ -33,6 +33,48 @@ export type AskUserFn = (
 ) => Promise<RequestPermissionResponse>;
 
 /**
+ * Which configuration layer supplied an effective value. Mirrors the precedence
+ * the runtime actually applies in `startRuntime`: a channel/thread preset (the
+ * presets-file source of truth) wins over the DB-backed session config, which
+ * wins over the bot-wide default. This provenance is the genuinely useful part
+ * of `config_describe` (#58 P1): it answers "why is my cwd/model wrong?" — and
+ * it is the same machinery every future mutation response needs for the
+ * silent-no-op traps (report the EFFECTIVE value + which layer won, not the
+ * value that was requested).
+ */
+export type ConfigLayer =
+  | "thread preset"
+  | "channel preset"
+  | "session config"
+  | "default";
+
+export interface ResolvedSetting<T> {
+  value: T;
+  source: ConfigLayer;
+}
+
+/** Effective, provenance-tagged configuration for one session/thread. */
+export interface ConfigDescription {
+  sessionId: string;
+  channelRef: string;
+  parentRef: string | null;
+  agent: ResolvedSetting<string>;
+  model: ResolvedSetting<string>;
+  /** `value` is null when no effort applies (agent has none / nothing set). */
+  effort: ResolvedSetting<string | null>;
+  cwd: ResolvedSetting<string>;
+  permission: ResolvedSetting<PermissionPolicyMode>;
+  /** Whether the calling channel is locked (read-only over MCP; D2). */
+  locked: boolean;
+  /**
+   * Set when a preset requested an effort level the resolved agent cannot honor
+   * (Trap 2). The preset value is silently dropped at runtime; surfacing it here
+   * keeps `config_describe` from reporting a personality the agent won't deliver.
+   */
+  effortIgnoredNote?: string;
+}
+
+/**
  * Holds one AgentRuntime per chat session id, with:
  *  - a per-session creation lock so two concurrent messages don't both spawn
  *    new agents
@@ -100,6 +142,100 @@ export class SessionRouter {
   /** Look up a registered profile by id, or undefined if not found. */
   getProfile(id: string): AgentProfile | undefined {
     return this.profileById.get(id);
+  }
+
+  /**
+   * Compute the EFFECTIVE agent/model/effort/cwd/permission for a session and,
+   * for each, which layer won (channel preset vs thread preset vs session config
+   * vs bot default). Read-only. This deliberately re-derives the exact same
+   * precedence `startRuntime` applies, so the description can never drift from
+   * what actually runs — it is the single source of truth for #58 P1's
+   * `config_describe` and for the silent-no-op traps a mutation surface needs.
+   */
+  describeConfig(record: SessionRecord): ConfigDescription {
+    const chan = record.parentRef
+      ? this.channelPresets.get(record.parentRef)
+      : undefined;
+    const thread = this.threadPresets.get(record.channelRef);
+    const cfg = this.store.readConfig(record);
+
+    // agent — preset.agent ?? record.agentId (startRuntime).
+    const agent: ResolvedSetting<string> = thread?.agent
+      ? { value: thread.agent.value, source: "thread preset" }
+      : chan?.agent
+        ? { value: chan.agent.value, source: "channel preset" }
+        : { value: record.agentId, source: "session config" };
+
+    // model — preset.model ?? cfg.model ?? defaultModel.
+    const model: ResolvedSetting<string> = thread?.model
+      ? { value: thread.model.value, source: "thread preset" }
+      : chan?.model
+        ? { value: chan.model.value, source: "channel preset" }
+        : cfg.model
+          ? { value: cfg.model, source: "session config" }
+          : { value: this.defaultModel, source: "default" };
+
+    // effort — a preset effort only wins if the RESOLVED agent supports that
+    // exact level; otherwise it is dropped and cfg.reasoningEffort applies
+    // (Trap 2). Mirrors startRuntime's `presetEffortUsable` gate exactly.
+    const profile = this.profileById.get(agent.value);
+    const presetEffort = thread?.effort ?? chan?.effort;
+    const presetEffortSource: ConfigLayer | undefined = thread?.effort
+      ? "thread preset"
+      : chan?.effort
+        ? "channel preset"
+        : undefined;
+    const presetEffortUsable = !!(
+      presetEffort?.value &&
+      profile?.effort &&
+      profile.effort.mechanism !== "none" &&
+      profile.effort.levels.includes(presetEffort.value)
+    );
+    let effort: ResolvedSetting<string | null>;
+    let effortIgnoredNote: string | undefined;
+    if (presetEffortUsable && presetEffort && presetEffortSource) {
+      effort = { value: presetEffort.value, source: presetEffortSource };
+    } else {
+      effort = cfg.reasoningEffort
+        ? { value: cfg.reasoningEffort, source: "session config" }
+        : { value: null, source: "default" };
+      if (presetEffort?.value && !presetEffortUsable) {
+        effortIgnoredNote =
+          `${presetEffortSource} sets effort "${presetEffort.value}", but agent ` +
+          `"${agent.value}" does not support that level — it is ignored; ` +
+          `effective effort is ${effort.value ? `"${effort.value}"` : "none"}.`;
+      }
+    }
+
+    // cwd — preset.cwd ?? record.repoPath ?? process.cwd().
+    const cwd: ResolvedSetting<string> = thread?.cwd
+      ? { value: thread.cwd.value, source: "thread preset" }
+      : chan?.cwd
+        ? { value: chan.cwd.value, source: "channel preset" }
+        : record.repoPath
+          ? { value: record.repoPath, source: "session config" }
+          : { value: process.cwd(), source: "default" };
+
+    // permission — resolvePermissionMode layering (session policy, then legacy
+    // auto-approve, then bot default). Presets do not carry permission.
+    const permission: ResolvedSetting<PermissionPolicyMode> = cfg.permissionPolicy
+      ? { value: cfg.permissionPolicy, source: "session config" }
+      : cfg.autoApprovePermissions === true
+        ? { value: "always", source: "session config" }
+        : { value: this.defaultPermissionMode, source: "default" };
+
+    return {
+      sessionId: record.id,
+      channelRef: record.channelRef,
+      parentRef: record.parentRef,
+      agent,
+      model,
+      effort,
+      cwd,
+      permission,
+      locked: chan?.locked ?? false,
+      ...(effortIgnoredNote ? { effortIgnoredNote } : {}),
+    };
   }
 
   /** Look up or create the SessionRecord for a given chat channel. */

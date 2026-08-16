@@ -22,6 +22,7 @@ import { DispatchWatcher } from "./core/dispatch/watcher.js";
 import { enqueueDispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
+import { watchChannelPresets } from "./core/config-reload.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -427,6 +428,28 @@ async function main(): Promise<void> {
             },
           }
         : {}),
+      // #58 P1: read-only config introspection. describeConfig re-derives the
+      // exact precedence startRuntime applies (which layer won); listConfigEntities
+      // projects the schedules/presets visible to the calling thread. Both are
+      // scoped to the token-resolved caller — no cross-thread reads.
+      describeConfig: (record) => router.describeConfig(record),
+      listConfigEntities: (record) => ({
+        schedules: store
+          .listScheduledByChannel(record.platform, record.channelRef)
+          .map((s) => ({
+            name: s.name,
+            cron: s.cron,
+            timezone: s.timezone,
+            enabled: s.enabled,
+            nextRunUtc: s.nextRunUtc,
+          })),
+        presets: store.listPresetsForProject(record.parentRef).map((p) => ({
+          name: p.name,
+          scope: p.projectRef ? ("project" as const) : ("global" as const),
+          agentId: p.agentId,
+          model: p.model,
+        })),
+      }),
     });
     await seamMcpServer.start();
   }
@@ -453,6 +476,20 @@ async function main(): Promise<void> {
   });
   await dispatchWatcher.start();
 
+  // P0 (#58): hot-reload data/channel-presets.json. The watcher mutates the
+  // SAME map objects the router and orchestrator hold (config.channelPresets /
+  // config.threadPresets), so an edit takes effect on the next turn with no
+  // redeploy. Validated + atomic — a bad edit is rejected and the prior good
+  // config is kept (see core/config-reload.ts).
+  let stopPresetsWatch: (() => void) | undefined;
+  if (config.CHANNEL_PRESETS_FILE) {
+    stopPresetsWatch = watchChannelPresets(
+      config.CHANNEL_PRESETS_FILE,
+      { channelPresets: config.channelPresets, threadPresets: config.threadPresets },
+      logger
+    );
+  }
+
   logger.info("seam-acp ready");
 
   // Best-effort startup notification to a configured channel.
@@ -473,6 +510,7 @@ async function main(): Promise<void> {
     orchestrator.stopSentinelWatcher();
     scheduledManager.stop();
     dispatchWatcher.stop();
+    stopPresetsWatch?.();
     await seamMcpServer?.stop().catch((err) =>
       logger.warn({ err }, "seam-mcp stop failed")
     );

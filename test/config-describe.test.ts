@@ -1,0 +1,166 @@
+import { describe, it, expect } from "vitest";
+import { pino } from "pino";
+import { SessionRouter } from "../src/core/session-router.js";
+import type { SessionStore } from "../src/core/session-store.js";
+import type { AgentProfile } from "../src/agents/agent-profile.js";
+import type { Logger } from "../src/lib/logger.js";
+import type { SessionRecord, SessionConfigState } from "../src/core/types.js";
+import type { ChannelPreset, ThreadPreset } from "../src/config.js";
+
+const silent = pino({ level: "silent" }) as unknown as Logger;
+
+// Stub profiles: `claude` supports effort levels; `copilot` has no effort concept.
+const profiles = [
+  { id: "claude", effort: { mechanism: "configOption", levels: ["low", "medium", "high"] } },
+  { id: "copilot", effort: { mechanism: "none", levels: [] } },
+] as unknown as AgentProfile[];
+
+/** A SessionStore stub that only implements what describeConfig reads. */
+function stubStore(): SessionStore {
+  return {
+    readConfig: (record: SessionRecord): SessionConfigState => {
+      if (!record.configJson) return {};
+      try {
+        return JSON.parse(record.configJson) as SessionConfigState;
+      } catch {
+        return {};
+      }
+    },
+  } as unknown as SessionStore;
+}
+
+function makeRouter(opts?: {
+  channelPresets?: Map<string, ChannelPreset>;
+  threadPresets?: Map<string, ThreadPreset>;
+}): SessionRouter {
+  return new SessionRouter({
+    logger: silent,
+    store: stubStore(),
+    profiles,
+    defaultAgentId: "copilot",
+    defaultModel: "gpt-5.4",
+    defaultPermissionMode: "ask",
+    channelPresets: opts?.channelPresets ?? new Map(),
+    threadPresets: opts?.threadPresets ?? new Map(),
+  });
+}
+
+function makeRecord(over: Partial<SessionRecord> = {}): SessionRecord {
+  return {
+    id: "discord:thread-1",
+    platform: "discord",
+    channelRef: "thread-1",
+    parentRef: "chan-1",
+    agentId: "copilot",
+    acpSessionId: "acp-1",
+    repoPath: "/repo/session",
+    configJson: JSON.stringify({ model: "gpt-5.4" } satisfies SessionConfigState),
+    createdUtc: "2026-01-01T00:00:00Z",
+    updatedUtc: "2026-01-01T00:00:00Z",
+    ...over,
+  };
+}
+
+describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
+  it("attributes each value to session config / default when no presets exist", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(makeRecord());
+
+    expect(d.agent).toEqual({ value: "copilot", source: "session config" });
+    expect(d.model).toEqual({ value: "gpt-5.4", source: "session config" });
+    expect(d.cwd).toEqual({ value: "/repo/session", source: "session config" });
+    // No effort set anywhere → null / default.
+    expect(d.effort).toEqual({ value: null, source: "default" });
+    // No policy in config → bot default.
+    expect(d.permission).toEqual({ value: "ask", source: "default" });
+    expect(d.locked).toBe(false);
+  });
+
+  it("model falls to bot default when neither preset nor session config sets it", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(makeRecord({ configJson: "{}" }));
+    expect(d.model).toEqual({ value: "gpt-5.4", source: "default" });
+  });
+
+  it("a channel preset wins over session config", () => {
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { model: { value: "claude-opus-4.6" }, agent: { value: "claude" }, locked: true }],
+    ]);
+    const router = makeRouter({ channelPresets });
+    const d = router.describeConfig(makeRecord());
+
+    expect(d.model).toEqual({ value: "claude-opus-4.6", source: "channel preset" });
+    expect(d.agent).toEqual({ value: "claude", source: "channel preset" });
+    expect(d.locked).toBe(true);
+  });
+
+  it("a thread preset overrides the channel preset per field", () => {
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { model: { value: "claude-opus-4.6" }, cwd: { value: "/repo/chan" }, locked: false }],
+    ]);
+    const threadPresets = new Map<string, ThreadPreset>([
+      ["thread-1", { model: { value: "claude-haiku-4.5" } }],
+    ]);
+    const router = makeRouter({ channelPresets, threadPresets });
+    const d = router.describeConfig(makeRecord());
+
+    // Thread wins model; channel still supplies cwd.
+    expect(d.model).toEqual({ value: "claude-haiku-4.5", source: "thread preset" });
+    expect(d.cwd).toEqual({ value: "/repo/chan", source: "channel preset" });
+  });
+
+  it("honors a preset effort the resolved agent supports", () => {
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { agent: { value: "claude" }, effort: { value: "high" }, locked: false }],
+    ]);
+    const router = makeRouter({ channelPresets });
+    const d = router.describeConfig(makeRecord());
+
+    expect(d.agent.value).toBe("claude");
+    expect(d.effort).toEqual({ value: "high", source: "channel preset" });
+    expect(d.effortIgnoredNote).toBeUndefined();
+  });
+
+  it("Trap 2: a preset effort the agent can't support is ignored and noted", () => {
+    // Resolved agent is copilot (mechanism "none"); the preset effort is dropped.
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { effort: { value: "high" }, locked: false }],
+    ]);
+    const router = makeRouter({ channelPresets });
+    const d = router.describeConfig(makeRecord({ agentId: "copilot" }));
+
+    expect(d.agent.value).toBe("copilot");
+    expect(d.effort).toEqual({ value: null, source: "default" });
+    expect(d.effortIgnoredNote).toMatch(/does not support/);
+  });
+
+  it("falls back to session-config effort when a preset effort is unusable", () => {
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { effort: { value: "high" }, locked: false }],
+    ]);
+    const router = makeRouter({ channelPresets });
+    const d = router.describeConfig(
+      makeRecord({
+        agentId: "copilot",
+        configJson: JSON.stringify({ model: "gpt-5.4", reasoningEffort: "medium" }),
+      })
+    );
+    expect(d.effort).toEqual({ value: "medium", source: "session config" });
+  });
+
+  it("reports the session permission policy over the default", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(
+      makeRecord({ configJson: JSON.stringify({ permissionPolicy: "always" }) })
+    );
+    expect(d.permission).toEqual({ value: "always", source: "session config" });
+  });
+
+  it("maps legacy autoApprovePermissions=true to always/session config", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(
+      makeRecord({ configJson: JSON.stringify({ autoApprovePermissions: true }) })
+    );
+    expect(d.permission).toEqual({ value: "always", source: "session config" });
+  });
+});

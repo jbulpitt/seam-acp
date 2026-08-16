@@ -248,6 +248,9 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
       CHANNEL_PRESETS_FILE: undefined,
       SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
       SEAM_DISPATCH_OUTPUT_STYLE: style,
+      // Isolate the compact branch's plain/card rendering — the additive status
+      // panel is covered separately in dispatch-status-panel.test.ts.
+      SEAM_DISPATCH_STATUS_PANEL: false,
       channelPresets: {},
       threadPresets: {},
     };

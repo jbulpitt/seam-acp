@@ -113,9 +113,16 @@ export const discordRenderer: Renderer = {
     segments.push(`🧠 ${state.effort ?? "default"} effort`);
     footerParts.push("\n" + segments.join(" • "));
 
+    // Dispatched turns carry a title prefix (the dispatch type) so the panel
+    // header reads e.g. "📨 Handoff · Working" → "📨 Handoff · Done"; normal
+    // user turns leave it unset and show just the state.
+    const title = state.titlePrefix
+      ? `${state.titlePrefix} · ${state.state}`
+      : state.state;
+
     return {
       color: COLOR_BY_STATE[state.state],
-      title: state.state,
+      title,
       fields,
       description,
       footer: footerParts.join("\n"),

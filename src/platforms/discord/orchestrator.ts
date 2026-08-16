@@ -141,7 +141,8 @@ import {
   type DispatchSpec,
 } from "../../core/dispatch/types.js";
 import { frameSteerPrompt } from "../../core/steer.js";
-import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
+import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
+import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
 import { isInlineableForAgent } from "../../agents/attachments.js";
@@ -159,6 +160,7 @@ import {
   type Preset,
   type SessionConfigState,
   type StructuredPanel,
+  type TurnState,
 } from "../../core/types.js";
 import type { DiscordAdapter } from "./adapter.js";
 
@@ -3112,18 +3114,72 @@ export class Orchestrator {
     // "card" is the opt-in legacy embed path. Read defensively — a raw test/config
     // object may not carry the zod default.
     const style = this.config.SEAM_DISPATCH_OUTPUT_STYLE ?? "messages";
+    // Status panel (this feature): default ON. Give the dispatched turn the SAME
+    // traditional live status panel a user turn gets — thinking, context-window
+    // health, model, tools, elapsed — titled with the dispatch TYPE. Orthogonal
+    // to `style` (which controls the ANSWER rendering). When on, it supersedes
+    // the slim ▶ start indicator: the panel title carries the type, so the plain
+    // answer streams below WITHOUT the ▶ header. Read defensively — a raw test
+    // config may not carry the zod default.
+    const statusPanelOn = this.config.SEAM_DISPATCH_STATUS_PANEL !== false;
 
     const run = async (): Promise<{ output: string; stopReason: string }> => {
       try { this.store.updateDelegationStatus(spec.id, "running"); } catch { /* best-effort */ }
       const startedAt = Date.now();
 
-      // START INDICATOR (unconditional): the moment the turn begins, post a slim
-      // indicator into the target thread showing what's running. This is the SAME
-      // message that then streams — in streaming mode the worker's output flows
-      // into it; in quiet mode it stays as the indicator while the body is posted
-      // below. In "messages" style it's a one-line italic plain indicator; in
-      // "card" style it's the legacy embed panel. Best-effort.
-      const panelRef = await this.postDispatchStartIndicator(target, header, style, spec);
+      // STATUS PANEL: post the traditional live panel FIRST (above the answer),
+      // driven from injectTurn's onEvent below. Resolve the panel's model/effort/
+      // cwd the same way the turn itself does — a live run inherits the thread's
+      // config; an isolated/preset run uses the preset/spec override. All the
+      // config/profile reads live inside this branch so the panel-off path stays
+      // exactly as before (no extra store/router work).
+      const statusPanel = statusPanelOn
+        ? await (async () => {
+            const cfg = this.store.readConfig(record);
+            const isolated = effectiveSession === "isolated";
+            const panelModel = isolated
+              ? (preset?.model ?? spec.model ?? cfg.model ?? this.config.DEFAULT_MODEL)
+              : (cfg.model ?? this.config.DEFAULT_MODEL);
+            const panelEffort = isolated
+              ? (preset?.effort ?? spec.effort ?? cfg.reasoningEffort)
+              : cfg.reasoningEffort;
+            const panelCwd = preset?.repoPath ?? spec.cwd ?? record.repoPath ?? this.config.REPOS_ROOT;
+            const panelProfile = presetProfile ?? this.router.getProfile(record.agentId);
+            return this.startDispatchStatusPanel(target, spec, {
+              model: panelModel,
+              ...(panelEffort ? { effort: panelEffort } : {}),
+              cwd: panelCwd,
+              ...(panelProfile ? { profile: panelProfile } : {}),
+              isolated,
+              ...(cfg.lastContextUsage
+                ? {
+                    cachedUsage: {
+                      used: cfg.lastContextUsage.used,
+                      size: cfg.lastContextUsage.size,
+                      model: cfg.lastContextUsage.model,
+                    },
+                  }
+                : {}),
+            });
+          })()
+        : undefined;
+
+      // START INDICATOR: post the slim ▶ indicator that then streams the answer.
+      // When the STATUS PANEL is on it carries the dispatch type, so we suppress
+      // the redundant ▶ header on the streamed answer (it streams as a clean
+      // plain reply below the panel); when off, keep today's ▶ indicator. In
+      // "messages" style this is a one-line italic plain message; in "card"
+      // style it's the legacy embed panel. Best-effort.
+      const showHeader = !statusPanel;
+      // Skip the start indicator entirely when the panel is on AND the run is
+      // quiet (stream:false): the panel is the header and the body posts below
+      // via postDispatchOutput — no dangling "starting…" placeholder. When
+      // streaming, we still need a message to stream the plain answer into; when
+      // the panel is off, the ▶ indicator plays its usual role.
+      const wantStartIndicator = streaming || !statusPanel;
+      const panelRef = wantStartIndicator
+        ? await this.postDispatchStartIndicator(target, header, style, spec, showHeader)
+        : undefined;
 
       // Streaming renderer: progressively edit `panelRef` with the worker's
       // agent-text as it arrives, throttled + serialized so we never issue an
@@ -3144,8 +3200,8 @@ export class Orchestrator {
           // live stream reads as a normal reply growing in place.
           if (style === "messages") {
             const content = done
-              ? this.dispatchStreamPlainDone(header, streamState, text)
-              : this.dispatchStreamPlainLive(header, text);
+              ? this.dispatchStreamPlainDone(header, streamState, text, showHeader)
+              : this.dispatchStreamPlainLive(header, text, showHeader);
             try {
               await this.adapter.editMessage(ref, content);
             } catch (err) {
@@ -3186,13 +3242,21 @@ export class Orchestrator {
           outputTo: target,
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
           timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
-          // Feed live agent-text into the stream panel. injectTurn still
-          // accumulates the FULL text into `result.text` in parallel, so
-          // streaming is lossless — report-back / done-file get the whole answer.
-          ...(streamPanel
+          // Drive both additive views from the ONE event stream:
+          //  - the plain-output StreamingPanel gets agent-text (the answer);
+          //  - the STATUS PANEL gets every event (thinking, tools, model,
+          //    context health, action/state) via the same mapping the user-turn
+          //    path uses.
+          // injectTurn still accumulates the FULL text into `result.text` in
+          // parallel, so streaming stays lossless — report-back / done-file get
+          // the whole answer regardless.
+          ...(streamPanel || statusPanel
             ? {
                 onEvent: async (event) => {
-                  if (event.kind === "agent-text") streamPanel!.append(event.text);
+                  if (streamPanel && event.kind === "agent-text") {
+                    streamPanel.append(event.text);
+                  }
+                  statusPanel?.handleEvent(event);
                 },
               }
             : {}),
@@ -3204,6 +3268,27 @@ export class Orchestrator {
       } finally {
         // The turn is over — no more `schedule_wake` calls can nest under it.
         if (isWake) this.activeWakeDepth.delete(spec.target);
+      }
+
+      // Finalize the STATUS PANEL to its terminal state. It is an INDEPENDENT
+      // message from the plain-output stream (its own throttle + SerialQueue), so
+      // it settles on its own. Carries the final context/elapsed/tools already
+      // accumulated on the TurnStatus. Best-effort — a panel edit failure never
+      // affects the answer delivery / report-back below.
+      if (statusPanel) {
+        const finalState: TurnState = result.timedOut
+          ? "Timed out"
+          : result.error
+            ? "Failed"
+            : "Done";
+        const finalAction = result.timedOut
+          ? `Timed out after ${this.config.TURN_TIMEOUT_SECONDS}s`
+          : result.error
+            ? result.error.slice(0, 200)
+            : (result.stopReason || "Completed");
+        await statusPanel.finalize(finalState, finalAction).catch((err) =>
+          this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel finalize failed")
+        );
       }
 
       // Visibility post. Streaming: finalize the panel IN PLACE (no second copy
@@ -3292,11 +3377,45 @@ export class Orchestrator {
     const header = this.dispatchIndicatorHeader(spec, null);
     const startedAt = Date.now();
     const style = this.config.SEAM_DISPATCH_OUTPUT_STYLE ?? "messages";
+    const statusPanelOn = this.config.SEAM_DISPATCH_STATUS_PANEL !== false;
     try { this.store.updateDelegationStatus(spec.id, "running"); } catch { /* best-effort */ }
 
+    // STATUS PANEL (this feature): the "🗜 Compact" panel. Compaction runs its
+    // own multi-agent pipeline rather than an injected turn, so there is no
+    // agent-event stream to drive thinking/tools/context — the panel shows the
+    // compaction lifecycle (Working → Done/Failed) with model/repo/elapsed. When
+    // on, it supersedes the ▶ header on the summary message below. All the
+    // config/profile reads stay inside this branch so the panel-off path is
+    // untouched.
+    const statusPanel = statusPanelOn
+      ? await (async () => {
+          const cfg = this.store.readConfig(record);
+          const compactProfile = this.router.getProfile(record.agentId);
+          return this.startDispatchStatusPanel(target, spec, {
+            model: cfg.model ?? this.config.DEFAULT_MODEL,
+            ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+            cwd: record.repoPath ?? this.config.REPOS_ROOT,
+            ...(compactProfile ? { profile: compactProfile } : {}),
+            isolated: false,
+            ...(cfg.lastContextUsage
+              ? {
+                  cachedUsage: {
+                    used: cfg.lastContextUsage.used,
+                    size: cfg.lastContextUsage.size,
+                    model: cfg.lastContextUsage.model,
+                  },
+                }
+              : {}),
+          });
+        })()
+      : undefined;
+    if (statusPanel) statusPanel.status.setAction("Compacting…");
+
     // Start indicator: post the same slim indicator dispatchInjectTurn posts, so
-    // the target thread shows the compaction is underway. Best-effort.
-    const panelRef = await this.postDispatchStartIndicator(target, header, style, spec);
+    // the target thread shows the compaction is underway. Suppress the ▶ header
+    // when the status panel already carries the "🗜 Compact" type. Best-effort.
+    const showHeader = !statusPanel;
+    const panelRef = await this.postDispatchStartIndicator(target, header, style, spec, showHeader);
 
     // Finalize the indicator into its terminal (done/error) state in place, so
     // the one message is the whole life-cycle (mirrors finalizeDispatchStream).
@@ -3305,10 +3424,13 @@ export class Orchestrator {
       if (!panelRef) return;
       try {
         if (style === "messages") {
+          // With the status panel on, it carries the "🗜 Compact" type + terminal
+          // state, so the summary message drops the ▶/✅/❌ header line.
           const doneHeader = header.replace(/^▶/, error ? "❌" : "✅");
+          const headerBlock = showHeader ? `_${doneHeader}_\n\n` : "";
           const content = error
-            ? `_${doneHeader}_\n\n❌ ${error.slice(0, 1500)}`
-            : `_${doneHeader}_\n\n${body}`;
+            ? `${headerBlock}❌ ${error.slice(0, 1500)}`
+            : `${headerBlock}${body}`;
           await this.adapter.editMessage(panelRef, content.slice(0, DISCORD_MESSAGE_MAX));
           return;
         }
@@ -3337,6 +3459,7 @@ export class Orchestrator {
         `${res.wasActive ? " — this thread is now bound to it" : ""} (${res.stats.chunks} chunk(s)). ` +
         `Original \`${res.originalSessionId}\` is preserved (review or delete it from the session manager).`;
       await finalize(summary);
+      await statusPanel?.finalize("Done", `Compacted (${res.stats.chunks} chunk(s))`).catch(() => {});
       // Attach the full premium report for review, alongside the panel.
       await this.sendResultFile(target, res.originalSessionId, res.reportMarkdown, "premium-compaction").catch(() => {});
       try { this.store.updateDelegationStatus(spec.id, "completed"); } catch { /* best-effort */ }
@@ -3348,6 +3471,7 @@ export class Orchestrator {
     } catch (err) {
       const message = (err as Error)?.message ?? String(err);
       await finalize("", message);
+      await statusPanel?.finalize("Failed", message.slice(0, 200)).catch(() => {});
       if (!panelRef) {
         // No indicator to carry the error — post a standalone failure line/card.
         if (style === "messages") {
@@ -3566,6 +3690,26 @@ export class Orchestrator {
     }
   }
 
+  /** Title-prefix for a dispatched turn's status panel — the dispatch TYPE with
+   *  an icon, e.g. "📨 Handoff", "⏰ Wake". The renderer appends the turn state,
+   *  so the panel header reads "📨 Handoff · Working" → "📨 Handoff · Done". A
+   *  hop carrying a chainId reads as "🔗 Chain" regardless of its kind, mirroring
+   *  {@link dispatchKindLabel}. */
+  private dispatchPanelTitle(kind: DelegationKind | undefined, chained: boolean): string {
+    if (chained) return "🔗 Chain";
+    switch (kind) {
+      case "forward": return "📤 Forward";
+      case "wake": return "⏰ Wake";
+      case "watch": return "👁 Watch";
+      case "report_back": return "🔁 Report-back";
+      case "peek": return "🔍 Peek";
+      case "compact": return "🗜 Compact";
+      case "scheduled": return "📅 Scheduled";
+      case "handoff":
+      default: return "📨 Handoff";
+    }
+  }
+
   /** Human label for a dispatch kind, used in the start indicator. A hop
    *  carrying a chainId reads as "chain" regardless of its kind. */
   private dispatchKindLabel(kind: DelegationKind | undefined, chained: boolean): string {
@@ -3624,11 +3768,18 @@ export class Orchestrator {
     target: ChannelRef,
     header: string,
     style: "messages" | "card",
-    spec: DispatchSpec
+    spec: DispatchSpec,
+    showHeader = true
   ): Promise<MessageRef | undefined> {
     try {
       if (style === "messages") {
-        return await this.adapter.sendMessage(target, `_${header}_`);
+        // When the status panel carries the dispatch type, the streamed answer
+        // omits the ▶ header — it starts as a bare "starting…" placeholder and
+        // grows into a clean plain reply below the panel.
+        return await this.adapter.sendMessage(
+          target,
+          showHeader ? `_${header}_` : "_starting…_"
+        );
       }
       const startPanel = this.dispatchStreamPanel({ header, text: "", done: false, elapsedMs: 0 });
       return this.adapter.sendPanel
@@ -3640,19 +3791,106 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Build, post, and arm the traditional live STATUS PANEL for a dispatched
+   * turn — the same {@link TurnStatus} + {@link renderStatusPanel} the user-turn
+   * path uses — titled with the dispatch TYPE. Returns the live panel (whose
+   * `handleEvent` the caller wires into `injectTurn`'s `onEvent`), or undefined
+   * when the panel is disabled or the initial post failed (best-effort: a panel
+   * failure never breaks the dispatch — it just costs visibility).
+   *
+   * Context-window health is seeded here so the panel isn't blank before the
+   * first `usage-update`: a LIVE dispatch reuses the target thread's cached
+   * session usage; an ISOLATED dispatch starts blank and fills from the fresh
+   * runtime's `usage-update` events during the turn. The authoritative per-model
+   * window floor (static models) applies to both so an agent's generic 200K
+   * default never masks the true window. Usage genuinely unavailable ⇒ the
+   * context line is simply omitted (never crashes).
+   */
+  private async startDispatchStatusPanel(
+    target: ChannelRef,
+    spec: DispatchSpec,
+    resolved: {
+      model: string;
+      effort?: string;
+      cwd: string;
+      profile?: AgentProfile;
+      isolated: boolean;
+      cachedUsage?: { used: number; size: number; model: string };
+    }
+  ): Promise<DispatchStatusPanel<MessageRef> | undefined> {
+    const repoDisplay = this.repoDisplay(resolved.cwd);
+    const modelContextFloor =
+      resolved.profile?.staticModels?.find((m) => m.modelId === resolved.model)?.contextLimit
+        ?? resolved.profile?.staticModels?.find((m) => m.modelId === resolved.profile?.defaultModel)?.contextLimit
+        ?? 0;
+    const status = new TurnStatus({
+      model: resolved.model,
+      repoDisplay,
+      ...(resolved.effort ? { effort: resolved.effort } : {}),
+      titlePrefix: this.dispatchPanelTitle(spec.kind, !!spec.chainId),
+    });
+    status.setAction("Thinking…");
+    // Seed context (live only). Invalidate on model mismatch, exactly like the
+    // user-turn seed.
+    if (!resolved.isolated && resolved.cachedUsage) {
+      const u = resolved.cachedUsage;
+      if (u.model === resolved.model && u.size > 0 && u.used > 0) {
+        status.contextUsedHighWater = u.used;
+        status.contextWindowSize = u.size;
+        status.context = formatContextUsage(u.used, u.size);
+      }
+    }
+    if (modelContextFloor > status.contextWindowSize) {
+      status.contextWindowSize = modelContextFloor;
+      if (status.contextUsedHighWater > 0) {
+        status.context = formatContextUsage(status.contextUsedHighWater, modelContextFloor);
+      }
+    }
+    const panel = new DispatchStatusPanel<MessageRef>(
+      this.renderer,
+      status,
+      {
+        post: async (text) => {
+          try {
+            return await this.adapter.sendMessage(target, text);
+          } catch (err) {
+            this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel post failed");
+            return undefined;
+          }
+        },
+        edit: async (ref, text) => {
+          try {
+            await this.adapter.editMessage(ref, text);
+          } catch (err) {
+            this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel edit failed");
+          }
+        },
+      },
+      {
+        debounceMs: STATUS_EDIT_DEBOUNCE_MS,
+        heartbeatMs: STATUS_HEARTBEAT_MS,
+        modelContextFloor,
+      }
+    );
+    await panel.start();
+    return panel.isLive ? panel : undefined;
+  }
+
   /** Plain "messages"-style LIVE content for a streaming dispatch: the italic
    *  indicator header followed by the freshest tail of the streamed body, bounded
    *  to Discord's per-message ceiling so the single message grows in place like a
    *  normal reply. Loss is only cosmetic — the full text is finalized below. */
-  private dispatchStreamPlainLive(header: string, text: string): string {
-    const headerLine = `_${header}_`;
+  private dispatchStreamPlainLive(header: string, text: string, showHeader = true): string {
+    const headerLine = showHeader ? `_${header}_` : "";
+    const prefix = headerLine ? `${headerLine}\n\n` : "";
     const trimmed = text.trim();
-    if (!trimmed) return `${headerLine}\n\n_starting…_`;
+    if (!trimmed) return showHeader ? `${prefix}_starting…_` : "_starting…_";
     // Reserve room for the header line, the "\n\n" separator, and the leading /
     // trailing "…" stream markers.
-    const budget = Math.max(0, DISCORD_MESSAGE_MAX - headerLine.length - 6);
+    const budget = Math.max(0, DISCORD_MESSAGE_MAX - prefix.length - 6);
     const tail = trimmed.length <= budget ? trimmed : `…${trimmed.slice(trimmed.length - budget)}`;
-    return `${headerLine}\n\n${tail}…`.slice(0, DISCORD_MESSAGE_MAX);
+    return `${prefix}${tail}…`.slice(0, DISCORD_MESSAGE_MAX);
   }
 
   /** Plain "messages"-style TERMINAL content for a streaming dispatch. Flips the
@@ -3664,15 +3902,21 @@ export class Orchestrator {
   private dispatchStreamPlainDone(
     header: string,
     streamState: { error?: string; fullText?: string; overflow?: boolean },
-    bufferText: string
+    bufferText: string,
+    showHeader = true
   ): string {
+    // With the status panel on (showHeader=false) the panel carries the type +
+    // ✅/❌ terminal state, so the plain answer renders WITHOUT a header line —
+    // just the body (or a short error line). Otherwise, flip the ▶ glyph to ✅/❌.
     const doneHeader = header.replace(/^▶/, streamState.error ? "❌" : "✅");
-    const headerLine = `_${doneHeader}_`;
+    const headerLine = showHeader ? `_${doneHeader}_` : "";
     const full = (streamState.fullText ?? bufferText).trim();
     const errLine = streamState.error ? `❌ ${streamState.error.slice(0, 800)}` : "";
     if (!full && !errLine) {
       streamState.overflow = false;
-      return `${headerLine}\n\n_✅ Done — no output._`;
+      return headerLine
+        ? `${headerLine}\n\n_✅ Done — no output._`
+        : "_✅ Done — no output._";
     }
     const inline = [headerLine, errLine, full].filter(Boolean).join("\n\n");
     if (inline.length <= DISCORD_MESSAGE_MAX) {
@@ -3681,7 +3925,7 @@ export class Orchestrator {
     }
     // Too big for one message — the full body posts below as fresh plain messages.
     streamState.overflow = true;
-    return [headerLine, errLine].filter(Boolean).join("\n\n") || headerLine;
+    return [headerLine, errLine].filter(Boolean).join("\n\n") || headerLine || "…";
   }
 
   /** Build the streaming/indicator panel for a dispatch. `done: false` renders
@@ -9343,16 +9587,6 @@ function usageLine(pct: number | null, label: string): string {
   const bar = pct !== null ? usageBar(pct) : "░░░░░░░░░░░░░░░░░░░░";
   const pctStr = pct !== null ? `${Math.round(pct)}%`.padStart(4) : "  — ";
   return `\`${bar}\`  ${pctStr}  ${label}`;
-}
-
-function formatContextUsage(used: number, size: number): string {
-  const pct = Math.round((used / size) * 100);
-  return `${fmtTokens(used)} / ${fmtTokens(size)} (${pct}%)`;
-}
-
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${Math.round(n / 1_000_000)}m`;
-  return `${Math.round(n / 1_000)}k`;
 }
 
 /** Hardcoded context windows for the models we use as compaction summarizers.

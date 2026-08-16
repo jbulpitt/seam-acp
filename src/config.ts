@@ -628,6 +628,25 @@ const Schema = z.object({
    * confirm cards, or the scheduled path's own per-schedule outputType.
    */
   SEAM_DISPATCH_OUTPUT_STYLE: z.enum(["messages", "card"]).default("messages"),
+
+  /**
+   * Give dispatched turns (handoffs, forwards, wakes, watches, chain hops,
+   * compaction, report-backs) the SAME traditional live STATUS PANEL that normal
+   * user turns get — thinking output, context-window health, elapsed time, model,
+   * tool calls — with the dispatch TYPE in the panel title (e.g. "📨 Handoff",
+   * "⏰ Wake"). Default ON.
+   *
+   * Orthogonal to SEAM_DISPATCH_OUTPUT_STYLE: this flag controls the *status
+   * panel* (an extra message posted above the answer), while OUTPUT_STYLE still
+   * controls how the answer itself renders (plain messages vs card). When the
+   * panel is on it supersedes the slim `▶` start indicator (the panel title
+   * carries the dispatch type); set to "false" to restore the `▶` indicator and
+   * post no panel.
+   */
+  SEAM_DISPATCH_STATUS_PANEL: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
 });
 
 const PresetFieldSchema = <T extends z.ZodType>(value: T) => z.object({ value });

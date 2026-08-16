@@ -117,6 +117,11 @@ function makeOrch(opts: {
     CHANNEL_PRESETS_FILE: undefined,
     SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
     SEAM_DISPATCH_OUTPUT_STYLE: opts.style ?? "messages",
+    // These tests exercise the PLAIN OUTPUT streaming path in isolation, so the
+    // additive status panel is off — which is also the contract that "false
+    // restores the ▶ line". Panel-on behavior is covered in
+    // dispatch-status-panel.test.ts.
+    SEAM_DISPATCH_STATUS_PANEL: false,
     channelPresets: {},
     threadPresets: {},
   };

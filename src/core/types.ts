@@ -159,6 +159,9 @@ export interface StatusPanel {
   resolvedModel?: string;
   /** Reasoning effort for this turn, if set (low|medium|high|xhigh|max). */
   effort?: string;
+  /** Optional title prefix shown before the state, e.g. a dispatch type
+   *  ("📨 Handoff", "⏰ Wake"). Unset for normal user turns. */
+  titlePrefix?: string;
   action: string;
   elapsedSeconds: number;
   /** Optional context-window line shown when token info is known. */

@@ -15,6 +15,10 @@ export interface StatusPanelInput {
   resolvedModel?: string;
   /** Reasoning effort for this turn, if set. */
   effort?: string;
+  /** Optional title prefix shown before the turn state, e.g. a dispatch type
+   *  ("📨 Handoff", "⏰ Wake"). Left unset for normal user turns so the panel
+   *  title is just the state. */
+  titlePrefix?: string;
   action: string;
   /** Optional context-window line shown when tokens are known. */
   context?: string;
@@ -40,12 +44,26 @@ export function renderStatusPanel(
     model: input.model,
     ...(input.resolvedModel ? { resolvedModel: input.resolvedModel } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
+    ...(input.titlePrefix ? { titlePrefix: input.titlePrefix } : {}),
     action: input.action,
     context: input.context,
     activity: input.activity,
     thinking: input.thinking,
   };
   return renderer.statusPanel(panel);
+}
+
+/** Format a context-window usage line, e.g. "128k / 1m (13%)". Shared by the
+ *  live user-turn panel and the dispatched-turn panel so both read identically. */
+export function formatContextUsage(used: number, size: number): string {
+  const pct = Math.round((used / size) * 100);
+  return `${fmtTokens(used)} / ${fmtTokens(size)} (${pct}%)`;
+}
+
+/** Compact a token count to a `k`/`m` suffixed string. */
+export function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${Math.round(n / 1_000_000)}m`;
+  return `${Math.round(n / 1_000)}k`;
 }
 
 /**
@@ -63,6 +81,9 @@ export class TurnStatus {
   /** Reasoning effort for this turn (low|medium|high|xhigh|max), or undefined
    *  when unset (the model's built-in default applies). */
   effort?: string;
+  /** Optional title prefix (e.g. a dispatch type "📨 Handoff"). Unset for
+   *  normal user turns. Rendered before the turn state in the panel title. */
+  titlePrefix?: string;
   repoDisplay: string;
   startedUtc: number;
   context?: string;
@@ -84,10 +105,16 @@ export class TurnStatus {
   private thinkingPending = "";
   private static readonly MAX_THINKING = 5;
 
-  constructor(opts: { model: string; repoDisplay: string; effort?: string }) {
+  constructor(opts: {
+    model: string;
+    repoDisplay: string;
+    effort?: string;
+    titlePrefix?: string;
+  }) {
     this.model = opts.model;
     this.repoDisplay = opts.repoDisplay;
     if (opts.effort) this.effort = opts.effort;
+    if (opts.titlePrefix) this.titlePrefix = opts.titlePrefix;
     this.startedUtc = Date.now();
   }
 
@@ -178,6 +205,7 @@ export class TurnStatus {
       model: this.model,
       ...(this.resolvedModel ? { resolvedModel: this.resolvedModel } : {}),
       ...(this.effort ? { effort: this.effort } : {}),
+      ...(this.titlePrefix ? { titlePrefix: this.titlePrefix } : {}),
       action: this.action,
       context: this.context,
       activity: this.activity.length ? [...this.activity] : undefined,

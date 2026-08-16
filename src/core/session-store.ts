@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS scheduled_prompts (
   cwd                TEXT,
   target_channel     TEXT,
   output_type        TEXT NOT NULL DEFAULT 'card',
+  session_mode       TEXT NOT NULL DEFAULT 'isolated',
   catchup_seconds    INTEGER NOT NULL DEFAULT 900,
   enabled            INTEGER NOT NULL DEFAULT 1,
   attachments_json   TEXT NOT NULL DEFAULT '[]',
@@ -130,6 +131,7 @@ interface ScheduledRow {
   cwd: string | null;
   target_channel: string | null;
   output_type: string;
+  session_mode: string;
   catchup_seconds: number;
   enabled: number;
   attachments_json: string;
@@ -161,6 +163,7 @@ const mapScheduled = (r: ScheduledRow): ScheduledPrompt => {
     cwd: r.cwd,
     targetChannel: r.target_channel,
     outputType: r.output_type === "messages" ? "messages" : "card",
+    sessionMode: r.session_mode === "live" ? "live" : "isolated",
     catchupSeconds: r.catchup_seconds,
     enabled: r.enabled !== 0,
     attachments,
@@ -243,6 +246,7 @@ export class SessionStore {
       "ALTER TABLE scheduled_prompts ADD COLUMN cwd TEXT",
       "ALTER TABLE scheduled_prompts ADD COLUMN target_channel TEXT",
       "ALTER TABLE scheduled_prompts ADD COLUMN output_type TEXT NOT NULL DEFAULT 'card'",
+      "ALTER TABLE scheduled_prompts ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'isolated'",
     ]) {
       try { this.db.exec(ddl); } catch { /* column exists */ }
     }
@@ -371,13 +375,15 @@ export class SessionStore {
       .prepare(
         `INSERT INTO scheduled_prompts
            (id, platform, channel_ref, parent_ref, name, prompt_text, cron,
-            timezone, model, cwd, target_channel, output_type, catchup_seconds,
+            timezone, model, cwd, target_channel, output_type, session_mode,
+            catchup_seconds,
             enabled, attachments_json, created_by,
             created_utc, updated_utc, last_run_utc, last_status, next_run_utc,
             pinned_session_id)
          VALUES
            (@id, @platform, @channelRef, @parentRef, @name, @promptText, @cron,
-            @timezone, @model, @cwd, @targetChannel, @outputType, @catchupSeconds,
+            @timezone, @model, @cwd, @targetChannel, @outputType, @sessionMode,
+            @catchupSeconds,
             @enabled, @attachmentsJson, @createdBy,
             @createdUtc, @updatedUtc, @lastRunUtc, @lastStatus, @nextRunUtc,
             @pinnedSessionId)
@@ -390,6 +396,7 @@ export class SessionStore {
            cwd              = excluded.cwd,
            target_channel   = excluded.target_channel,
            output_type      = excluded.output_type,
+           session_mode     = excluded.session_mode,
            catchup_seconds  = excluded.catchup_seconds,
            enabled          = excluded.enabled,
            attachments_json = excluded.attachments_json,
@@ -412,6 +419,7 @@ export class SessionStore {
         cwd: s.cwd,
         targetChannel: s.targetChannel,
         outputType: s.outputType,
+        sessionMode: s.sessionMode,
         catchupSeconds: s.catchupSeconds,
         enabled: s.enabled ? 1 : 0,
         attachmentsJson: JSON.stringify(s.attachments ?? []),

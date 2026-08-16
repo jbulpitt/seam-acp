@@ -21,6 +21,11 @@ export interface ScheduledPromptManagerOpts {
 
 export class ScheduledPromptManager {
   private readonly jobs = new Map<string, Cron>();
+  /** Schedule ids whose `onFire` is currently running. Guards same-schedule
+   *  overlap (D3): a fire that lands while a prior fire of the same id is still
+   *  in flight is skipped (status-stamped) rather than stacked. Covers both the
+   *  timer path and the boot catch-up path (both go through `fire`). */
+  private readonly inFlight = new Set<string>();
   private readonly store: SessionStore;
   private readonly onFire: (id: string) => Promise<void>;
   private readonly logger: Logger;
@@ -104,11 +109,21 @@ export class ScheduledPromptManager {
 
   /** Execute one fire: run the job, then refresh next_run from the armed timer. */
   private async fire(id: string): Promise<void> {
+    // D3: skip (don't stack) if a prior fire of this same schedule is still
+    // running. With live + per-channel FIFO, stacking would grow the channel
+    // queue without bound and pin the thread replaying stale fires.
+    if (this.inFlight.has(id)) {
+      this.logger.info({ id }, "scheduled prompt: still running, skipping overlap");
+      this.patchRow(id, { lastStatus: "skipped: still running" });
+      return;
+    }
+    this.inFlight.add(id);
     try {
       await this.onFire(id);
     } catch (err) {
       this.logger.error({ id, err }, "scheduled fire failed");
     } finally {
+      this.inFlight.delete(id);
       const job = this.jobs.get(id);
       if (job) this.patchRow(id, { nextRunUtc: job.nextRun()?.toISOString() ?? null });
     }

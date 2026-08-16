@@ -2532,6 +2532,14 @@ export class Orchestrator {
   async runScheduledPrompt(id: string): Promise<void> {
     const row = this.store.getScheduled(id);
     if (!row) return;
+    // Live fires run through `queueOnChannel`, which already increments
+    // `activeTurns` around the turn — incrementing here too would double-count
+    // and inflate the redeploy-drain counter while running. So only the isolated
+    // path takes the outer increment (M3).
+    if (row.sessionMode === "live") {
+      await this.runScheduledPromptInner(row);
+      return;
+    }
     // Count scheduled jobs in the restart-drain counter (activeTurns) so a
     // redeploy/sentinel waits for an in-flight job to finish instead of killing
     // its agent child mid-run.
@@ -2581,6 +2589,51 @@ export class Orchestrator {
         this.patchScheduledStatus(id, "skipped: target locked");
         return;
       }
+    }
+
+    // 1b. Live mode (M3): run as a real turn *inside* the bound thread. Synthesize
+    //     an IncomingMessage and drive it through the same FIFO + turn pipeline a
+    //     user message uses, so it streams identically — status panel, live text,
+    //     FenceStream, auto-compaction, permission prompts — for free (D-below).
+    //     No announce card (D6), no model/cwd/target/output knobs (D1): the
+    //     thread's persistent runtime governs the turn. Attachments pass straight
+    //     through unpartitioned (D7) — the inner path does its own staging.
+    if (row.sessionMode === "live") {
+      // Archived-but-unlocked threads: no announce card reopens it now (D6), but
+      // the turn's own first message (the status panel) lands in the thread and
+      // Discord auto-unarchives on a new message — so it reopens implicitly.
+      const loaded = await loadScheduledAttachments(this.config.DATA_DIR, id, row.attachments);
+      const marker = `⏰ *Scheduled: ${row.name}*`;
+      const synthetic: IncomingMessage = {
+        channel: bindingThread,
+        authorId: row.createdBy,
+        authorIsBot: false,
+        text: `${marker}\n\n${row.promptText}`,
+        ...(loaded.length ? { attachments: loaded } : {}),
+      };
+      let aborted = false;
+      try {
+        // D2: queue behind user turns / other schedules on this channel; never
+        // pre-empt. `queueOnChannel` (not `handleIncomingMessage`) — the latter
+        // would bump the generation and abort whatever is running.
+        await this.queueOnChannel(row.channelRef, async () => {
+          // D4: a user message arriving mid-turn bumps this channel's generation
+          // and force-aborts our turn. `handleIncomingMessageInner` swallows the
+          // cancellation and returns void (D5), so detect the abort by comparing
+          // the generation across the turn rather than from a return value.
+          const genAtStart = this.channelGenerations.get(row.channelRef) ?? 0;
+          await this.handleIncomingMessageInner(synthetic);
+          aborted = (this.channelGenerations.get(row.channelRef) ?? 0) > genAtStart;
+        });
+        // D4: record the abort; do NOT auto-retry (it would fight the user).
+        // D5: otherwise we can only record "ok" — the inner path owns its own
+        // turn-level error reporting and does not surface it here.
+        this.patchScheduledStatus(id, aborted ? "aborted: user turn" : "ok");
+      } catch (err) {
+        const emsg = err instanceof Error ? err.message : String(err);
+        this.patchScheduledStatus(id, `error: ${emsg.slice(0, 200)}`);
+      }
+      return;
     }
 
     // 2. Resolve the agent / model / cwd from the binding thread's record,
@@ -2840,8 +2893,10 @@ export class Orchestrator {
     const last = s.lastStatus ? ` · last: ${s.lastStatus}` : "";
     const next = s.enabled && s.nextRunUtc ? ` · next: <t:${Math.floor(Date.parse(s.nextRunUtc) / 1000)}:R>` : "";
     const files = s.attachments.length ? ` · 📎${s.attachments.length}` : "";
-    const model = s.model ? ` · 🤖${s.model}` : "";
-    return `${state} **${s.name}** \`${s.id}\`\n   ${describeCron(s.cron)} (${s.timezone})${model}${files}${next}${last}`;
+    // Model is only meaningful for isolated schedules (live uses the thread's).
+    const model = s.sessionMode !== "live" && s.model ? ` · 🤖${s.model}` : "";
+    const mode = s.sessionMode === "live" ? " · 🧠live" : "";
+    return `${state} **${s.name}** \`${s.id}\`\n   ${describeCron(s.cron)} (${s.timezone})${mode}${model}${files}${next}${last}`;
   }
 
   private async cmdScheduleList(i: ChatInputCommandInteraction): Promise<void> {
@@ -3052,6 +3107,10 @@ export class Orchestrator {
       cwd: existing?.cwd ?? null, // null = thread's repoPath
       target: existing?.targetChannel ?? null, // null = this thread
       outputType: (existing?.outputType ?? "card") as "card" | "messages",
+      // "isolated" = throwaway clean session (default); "live" = a real turn in
+      // this thread, sharing its session context (M4/D1). In live mode
+      // model/cwd/target/output are meaningless and hidden below.
+      sessionMode: (existing?.sessionMode ?? "isolated") as "isolated" | "live",
       files: pending,
     };
     // Edit mode: manage the row's stored attachments live — remove via the select
@@ -3070,22 +3129,31 @@ export class Orchestrator {
             ? editFiles.map((a) => `\`${a.filename}\``).join(", ") + " · *(remove below; add via `/seam schedule addfile`)*"
             : "*(none — add via `/seam schedule addfile`)*")
         : (state.files.length ? state.files.map((f) => `\`${f.name}\``).join(", ") : "*(none)*");
+      const isLive = state.sessionMode === "live";
       const embed = new EmbedBuilder()
         .setTitle(existing ? `✏️ Edit scheduled prompt \`${existing.id}\`` : "⏰ New scheduled prompt")
         .setColor(SCHEDULED_COLOR)
         .setDescription(
-          "This runs **on its own, on a clean session** — it won't remember this conversation. " +
-          "Write the prompt so it stands alone, and attach any files it needs (re-sent every run)."
+          isLive
+            ? "This runs **in this thread**, as a real turn on this conversation's session. " +
+              "It streams like a normal message, shares and remembers this thread's context, and " +
+              "waits its turn if the thread is busy. Attach any files it needs (re-sent every run)."
+            : "This runs **on its own, on a clean session** — it won't remember this conversation. " +
+              "Write the prompt so it stands alone, and attach any files it needs (re-sent every run)."
         )
         .addFields(
           { name: "🏷️ Name", value: state.name || "*(not set)*" },
           { name: "✏️ Prompt", value: state.promptText ? "```\n" + state.promptText.slice(0, 1000) + "\n```" : "*(not set — click ✏️ Prompt & name)*" },
           { name: "🕐 Runs", value: cronLine + (next ? `\nNext: <t:${Math.floor(next.getTime() / 1000)}:F>` : ""), inline: true },
           { name: "🌍 Timezone", value: state.timezone, inline: true },
-          { name: "🤖 Model", value: state.model ? `\`${state.model}\`` : `Session default${sessionModel ? ` (\`${sessionModel}\`)` : ""}`, inline: true },
-          { name: "📂 Working dir", value: state.cwd ? `\`${state.cwd}\`` : "*(this thread's repo)*", inline: true },
-          { name: "📮 Output to", value: state.target ? `<#${state.target}>` : "*(this thread)*", inline: true },
-          { name: "🖼️ Output as", value: state.outputType === "messages" ? "plain messages" : "status cards", inline: true },
+          { name: "🧠 Session", value: isLive ? "live (in this thread)" : "isolated (clean session)", inline: true },
+          // model/cwd/target/output are meaningless in live mode (D1) — hide them.
+          ...(isLive ? [] : [
+            { name: "🤖 Model", value: state.model ? `\`${state.model}\`` : `Session default${sessionModel ? ` (\`${sessionModel}\`)` : ""}`, inline: true },
+            { name: "📂 Working dir", value: state.cwd ? `\`${state.cwd}\`` : "*(this thread's repo)*", inline: true },
+            { name: "📮 Output to", value: state.target ? `<#${state.target}>` : "*(this thread)*", inline: true },
+            { name: "🖼️ Output as", value: state.outputType === "messages" ? "plain messages" : "status cards", inline: true },
+          ]),
           { name: "📎 Files", value: filesValue }
         );
       const cadence = new StringSelectMenuBuilder()
@@ -3096,9 +3164,14 @@ export class Orchestrator {
         .setCustomId("sched:tz")
         .setPlaceholder("🌍 Timezone")
         .addOptions(SCHEDULE_TIMEZONES.map((z) => ({ label: z, value: z, default: z === state.timezone })));
+      // Buttons row (max 5). The mode toggle takes the one previously-free slot;
+      // in live mode the now-meaningless output toggle is dropped so we stay ≤5.
       const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId("sched:prompt").setLabel("✏️ Prompt & details").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("sched:output").setLabel(state.outputType === "messages" ? "🖼️ Output: messages" : "🖼️ Output: cards").setStyle(ButtonStyle.Secondary),
+        ...(isLive ? [] : [
+          new ButtonBuilder().setCustomId("sched:output").setLabel(state.outputType === "messages" ? "🖼️ Output: messages" : "🖼️ Output: cards").setStyle(ButtonStyle.Secondary),
+        ]),
+        new ButtonBuilder().setCustomId("sched:mode").setLabel(isLive ? "🧠 Session: live" : "🧵 Session: isolated").setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId("sched:create").setLabel(existing ? "💾 Save" : "✅ Create").setStyle(ButtonStyle.Success).setDisabled(!state.cron || !state.promptText || !state.name),
         new ButtonBuilder().setCustomId("sched:cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
       );
@@ -3106,7 +3179,7 @@ export class Orchestrator {
         new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(cadence),
         new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(tz),
       ];
-      if (models.length > 0) {
+      if (models.length > 0 && !isLive) {
         const modelSelect = new StringSelectMenuBuilder()
           .setCustomId("sched:model")
           .setPlaceholder("🤖 Model")
@@ -3202,17 +3275,25 @@ export class Orchestrator {
         } else if (c.isButton() && c.customId === "sched:output") {
           state.outputType = state.outputType === "messages" ? "card" : "messages";
           await c.update(render());
+        } else if (c.isButton() && c.customId === "sched:mode") {
+          state.sessionMode = state.sessionMode === "live" ? "isolated" : "live";
+          await c.update(render());
         } else if (c.isButton() && c.customId === "sched:prompt") {
-          const modal = new ModalBuilder().setCustomId(`sched:promptmodal:${msg.id}`).setTitle("Prompt & details")
-            .addComponents(
-              new ActionRowBuilder<TextInputBuilder>().addComponents(
-                new TextInputBuilder().setCustomId("name").setLabel("Name").setStyle(TextInputStyle.Short).setRequired(true).setValue(state.name).setMaxLength(80)
-              ),
-              new ActionRowBuilder<TextInputBuilder>().addComponents(
-                new TextInputBuilder().setCustomId("prompt").setLabel("Prompt (stands on its own — no prior context)")
-                  .setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(state.promptText)
-                  .setPlaceholder("e.g. Run `npm test`, then post any failures as file:line with a one-line fix.")
-              ),
+          const modalLive = state.sessionMode === "live";
+          const modalRows: ActionRowBuilder<TextInputBuilder>[] = [
+            new ActionRowBuilder<TextInputBuilder>().addComponents(
+              new TextInputBuilder().setCustomId("name").setLabel("Name").setStyle(TextInputStyle.Short).setRequired(true).setValue(state.name).setMaxLength(80)
+            ),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(
+              new TextInputBuilder().setCustomId("prompt")
+                .setLabel(modalLive ? "Prompt (runs in this thread, with context)" : "Prompt (stands on its own — no prior context)")
+                .setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(state.promptText)
+                .setPlaceholder("e.g. Run `npm test`, then post any failures as file:line with a one-line fix.")
+            ),
+          ];
+          // Live mode ignores cwd/target (D1) — drop those inputs entirely.
+          if (!modalLive) {
+            modalRows.push(
               new ActionRowBuilder<TextInputBuilder>().addComponents(
                 new TextInputBuilder().setCustomId("cwd").setLabel("Working dir (optional)").setStyle(TextInputStyle.Short).setRequired(false).setValue(state.cwd ?? "")
                   .setPlaceholder("blank = this thread's repo; or a path under REPOS_ROOT")
@@ -3222,22 +3303,27 @@ export class Orchestrator {
                   .setPlaceholder("blank = post here; or a numeric channel/thread id")
               )
             );
+          }
+          const modal = new ModalBuilder().setCustomId(`sched:promptmodal:${msg.id}`).setTitle("Prompt & details").addComponents(...modalRows);
           await c.showModal(modal);
           const sub = await c.awaitModalSubmit({ filter: (m) => m.customId === `sched:promptmodal:${msg.id}` && m.user.id === i.user.id, time: 600_000 }).catch(() => null);
           if (sub) {
             state.name = sub.fields.getTextInputValue("name").trim();
             state.promptText = sub.fields.getTextInputValue("prompt").trim();
             const errors: string[] = [];
-            const rawCwd = sub.fields.getTextInputValue("cwd").trim();
-            if (rawCwd) {
-              try { state.cwd = resolveRepoPath(this.config.REPOS_ROOT, rawCwd); }
-              catch (e) { errors.push(`cwd: ${(e as Error).message}`); }
-            } else state.cwd = null;
-            const rawTarget = sub.fields.getTextInputValue("target").trim();
-            if (rawTarget) {
-              if (/^\d+$/.test(rawTarget)) state.target = rawTarget;
-              else errors.push("output id must be a numeric channel/thread id");
-            } else state.target = null;
+            // cwd/target only exist as modal inputs in isolated mode.
+            if (!modalLive) {
+              const rawCwd = sub.fields.getTextInputValue("cwd").trim();
+              if (rawCwd) {
+                try { state.cwd = resolveRepoPath(this.config.REPOS_ROOT, rawCwd); }
+                catch (e) { errors.push(`cwd: ${(e as Error).message}`); }
+              } else state.cwd = null;
+              const rawTarget = sub.fields.getTextInputValue("target").trim();
+              if (rawTarget) {
+                if (/^\d+$/.test(rawTarget)) state.target = rawTarget;
+                else errors.push("output id must be a numeric channel/thread id");
+              } else state.target = null;
+            }
             await sub.deferUpdate();
             await i.editReply(render());
             if (errors.length) await sub.followUp({ content: `⚠️ ${errors.join("; ")}`, flags: MessageFlags.Ephemeral });
@@ -3266,6 +3352,14 @@ export class Orchestrator {
           }
           const now = new Date().toISOString();
           const next = cronNextRun(state.cron, state.timezone);
+          const live = state.sessionMode === "live";
+          // In live mode model/cwd/target/output are meaningless (D1) — null them
+          // (output back to "card" default) so a mode flip during editing can't
+          // leave stale values behind, and isolated stays valid on flip-back.
+          const persistedModel = live ? null : state.model;
+          const persistedCwd = live ? null : state.cwd;
+          const persistedTarget = live ? null : state.target;
+          const persistedOutput: "card" | "messages" = live ? "card" : state.outputType;
           let row: ScheduledPrompt;
           if (existing) {
             // Edit: preserve id, created*, enabled, last-run. Use editFiles (the
@@ -3274,7 +3368,8 @@ export class Orchestrator {
             row = {
               ...existing,
               name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
-              model: state.model, cwd: state.cwd, targetChannel: state.target, outputType: state.outputType,
+              model: persistedModel, cwd: persistedCwd, targetChannel: persistedTarget, outputType: persistedOutput,
+              sessionMode: state.sessionMode,
               attachments: editFiles,
               updatedUtc: now, nextRunUtc: next ? next.toISOString() : null,
             };
@@ -3294,7 +3389,8 @@ export class Orchestrator {
             row = {
               id, platform: PLATFORM, channelRef: channel.id, parentRef: channel.parentId ?? null,
               name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
-              model: state.model, cwd: state.cwd, targetChannel: state.target, outputType: state.outputType,
+              model: persistedModel, cwd: persistedCwd, targetChannel: persistedTarget, outputType: persistedOutput,
+              sessionMode: state.sessionMode,
               catchupSeconds: 900, enabled: true, attachments, createdBy: i.user.id,
               createdUtc: now, updatedUtc: now, lastRunUtc: null, lastStatus: null,
               nextRunUtc: next ? next.toISOString() : null, pinnedSessionId: null,
@@ -3308,10 +3404,12 @@ export class Orchestrator {
             .setColor(0x2ecc71)
             .setDescription(
               `**${state.name}** \`${row.id}\`\nRuns ${describeCron(state.cron)} (${state.timezone})` +
-              (state.model ? `\nModel: \`${state.model}\`` : "") +
-              (state.cwd ? `\nWorking dir: \`${state.cwd}\`` : "") +
-              (state.target ? `\nOutput to: <#${state.target}>` : "") +
-              `\nOutput as: ${state.outputType === "messages" ? "plain messages" : "status cards"}` +
+              `\nSession: ${live ? "🧠 live (in this thread)" : "🧵 isolated (clean session)"}` +
+              (live ? "" :
+                (state.model ? `\nModel: \`${state.model}\`` : "") +
+                (state.cwd ? `\nWorking dir: \`${state.cwd}\`` : "") +
+                (state.target ? `\nOutput to: <#${state.target}>` : "") +
+                `\nOutput as: ${state.outputType === "messages" ? "plain messages" : "status cards"}`) +
               (next ? `\nNext run: <t:${Math.floor(next.getTime() / 1000)}:F>` : "") +
               (row.attachments.length ? `\n📎 ${row.attachments.length} file(s) attached` : "") +
               (existing && !row.enabled ? `\n\n⏸️ This schedule is currently disabled — enable it with \`/seam schedule toggle\`.` : "") +

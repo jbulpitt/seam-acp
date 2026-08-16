@@ -43,9 +43,12 @@ import {
   deleteScheduledAttachment,
 } from "../../core/scheduled-prompts/attachments.js";
 import { describeCron, validateCron, nextRun as cronNextRun } from "../../core/scheduled-prompts/cron.js";
+import { formatWorkflowsView, clampFieldValue } from "./workflows-view.js";
 
 /** Accent color for scheduled-prompt cards ("cron blue"). */
 const SCHEDULED_COLOR = 0x3498db;
+/** Accent color for the read-only delegation-ledger view ("ledger teal"). */
+const WORKFLOWS_COLOR = 0x1abc9c;
 /** Operator-dispatch cards — distinct from scheduled blue so a thread's history
  *  shows at a glance which turns came from the dispatch bridge. */
 const DISPATCH_COLOR = 0x9b59b6;
@@ -1414,6 +1417,8 @@ export class Orchestrator {
         return this.cmdConfigSet(interaction);
       case "sessions":
         return this.cmdSessions(interaction);
+      case "workflows":
+        return this.cmdWorkflows(interaction);
       case "repos":
         return this.cmdRepos(interaction);
       case "init":
@@ -3988,6 +3993,44 @@ export class Orchestrator {
       content: this.renderer.codeBlock(JSON.stringify(cfg, null, 2), "json"),
       flags: MessageFlags.Ephemeral,
     });
+  }
+
+  /** `/seam workflows` — read-only view of the delegation ledger. Renders the
+   *  still-in-flight rows and a correlation-grouped recent tail as an embed; no
+   *  writes, no schema, purely observability. */
+  private async cmdWorkflows(i: ChatInputCommandInteraction): Promise<void> {
+    const limit = i.options.getInteger("limit") ?? 20;
+    const view = formatWorkflowsView(
+      this.store.listActiveDelegations(),
+      this.store.listRecentDelegations(limit),
+      new Date()
+    );
+
+    const embed = new EmbedBuilder()
+      .setTitle("🔀 Workflows")
+      .setColor(WORKFLOWS_COLOR);
+
+    if (view.empty) {
+      embed.setDescription(
+        "No workflows yet — nothing has been dispatched to the delegation ledger."
+      );
+    } else {
+      if (view.active.count > 0) {
+        embed.addFields({
+          name: `▶️ Active (${view.active.count})`,
+          value: clampFieldValue(view.active.lines),
+        });
+      }
+      if (view.recent.count > 0) {
+        embed.addFields({
+          name: `🕑 Recent (${view.recent.count})`,
+          value: clampFieldValue(view.recent.lines),
+        });
+      }
+      embed.setFooter({ text: `showing up to ${limit} recent rows` });
+    }
+
+    await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 
   private async cmdSessions(i: ChatInputCommandInteraction): Promise<void> {

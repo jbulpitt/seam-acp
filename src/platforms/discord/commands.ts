@@ -146,6 +146,20 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   cmd.addSubcommand((sub) =>
+    sub
+      .setName("workflows")
+      .setDescription("View the delegation ledger (active + recent workflows)")
+      .addIntegerOption((o) =>
+        o
+          .setName("limit")
+          .setDescription("How many recent rows to show (default 20)")
+          .setRequired(false)
+          .setMinValue(1)
+          .setMaxValue(100)
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
     sub.setName("repos").setDescription("List repos under REPOS_ROOT")
   );
 
@@ -334,6 +348,7 @@ export type SeamSubcommand =
   | "config"
   | "config-set"
   | "sessions"
+  | "workflows"
   | "repos"
   | "init"
   | "approve"

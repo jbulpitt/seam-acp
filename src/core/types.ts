@@ -55,6 +55,31 @@ export function defaultSessionConfig(
 }
 
 /**
+ * A named, reusable bundle of session configuration.
+ *
+ * Every override field is nullable: `null` means "this preset does not touch
+ * that setting", so applying a preset only changes the fields it specifies.
+ * Presets are global — project/channel scoping is deliberately out of scope.
+ */
+export interface Preset {
+  id: string;
+  name: string;
+  description: string | null;
+  agentId: string | null;
+  model: string | null;
+  effort: string | null;
+  repoPath: string | null;
+  permission: PermissionPolicyMode | null;
+  toolsAllow: string[] | null;
+  toolsExclude: string[] | null;
+  /** Stored and round-tripped, but not yet injected into the system prompt. */
+  instructions: string | null;
+  createdBy: string;
+  createdUtc: string;
+  updatedUtc: string;
+}
+
+/**
  * Resolve the effective permission mode for a session, honoring (in order):
  *   1. The new `permissionPolicy` field
  *   2. The legacy `autoApprovePermissions` field — but only when it is `true`

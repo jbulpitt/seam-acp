@@ -151,6 +151,7 @@ import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { SerialQueue } from "../../core/serial-queue.js";
 import { StreamingPanel } from "../../core/streaming-panel.js";
+import { StreamingMessageRenderer } from "../../core/streaming-message-renderer.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
 import {
   defaultSessionConfig,
@@ -3173,42 +3174,50 @@ export class Orchestrator {
       const showHeader = !statusPanel;
       // Skip the start indicator entirely when the panel is on AND the run is
       // quiet (stream:false): the panel is the header and the body posts below
-      // via postDispatchOutput — no dangling "starting…" placeholder. When
-      // streaming, we still need a message to stream the plain answer into; when
-      // the panel is off, the ▶ indicator plays its usual role.
-      const wantStartIndicator = streaming || !statusPanel;
+      // via postDispatchOutput — no dangling "starting…" placeholder. When the
+      // panel is off, the ▶ indicator plays its usual role.
+      //
+      // "messages" style now streams the OUTPUT as fresh real messages (the flush
+      // renderer, parity with a normal turn) rather than editing one message in
+      // place, so it no longer needs a pre-posted message to stream into — the ▶
+      // header is wanted only when there's no status panel to carry the type.
+      // "card" style still edits a single panel in place, so it needs one posted.
+      const wantStartIndicator =
+        style === "messages" ? !statusPanel : streaming || !statusPanel;
       const panelRef = wantStartIndicator
         ? await this.postDispatchStartIndicator(target, header, style, spec, showHeader)
         : undefined;
 
-      // Streaming renderer: progressively edit `panelRef` with the worker's
-      // agent-text as it arrives, throttled + serialized so we never issue an
-      // editMessage-per-token storm (StreamingPanel reuses the SerialQueue the
-      // user-turn status panel relies on). Only wired when streaming is on AND
-      // we actually have a panel to edit.
+      // Streaming renderers. Two shapes, one per output style:
+      //  - "messages" (default): route the worker's agent-text through the SAME
+      //    flush renderer a normal user turn uses — incremental REAL messages at
+      //    clean paragraph/fence boundaries, linebreaks + code fences intact. Each
+      //    flush posts a fresh sendMessage; NOT a tail-capped single edit, NOT an
+      //    all-at-once end dump. The lossless full text is captured separately by
+      //    injectTurn (result.text), so report-back / done-file are unaffected.
+      //  - "card": progressively edit `panelRef` in place, throttled + serialized
+      //    (StreamingPanel) — the legacy embed path, unchanged.
       let streamPanel: StreamingPanel | undefined;
-      // Terminal-render context, filled in by finalizeDispatchStream just before
-      // the last (done) edit — the streaming callback is defined here, before the
-      // turn's error/overflow outcome is known.
+      let msgRenderer: StreamingMessageRenderer | undefined;
+      // Terminal-render context for the "card" path, filled in by
+      // finalizeDispatchStream just before the last (done) edit.
       const streamState: { error?: string; attached: boolean; fullText?: string; overflow?: boolean } = {
         attached: false,
       };
-      if (streaming && panelRef) {
+      if (streaming && style === "messages") {
+        msgRenderer = new StreamingMessageRenderer(
+          async (text) => {
+            try {
+              await this.adapter.sendMessage(target, text);
+            } catch (err) {
+              this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream message send failed");
+            }
+          },
+          { logger: this.logger }
+        );
+      } else if (streaming && panelRef) {
         const ref = panelRef;
         streamPanel = new StreamingPanel(async (text, done) => {
-          // "messages" style: edit a PLAIN message (content only, no embed) so the
-          // live stream reads as a normal reply growing in place.
-          if (style === "messages") {
-            const content = done
-              ? this.dispatchStreamPlainDone(header, streamState, text, showHeader)
-              : this.dispatchStreamPlainLive(header, text, showHeader);
-            try {
-              await this.adapter.editMessage(ref, content);
-            } catch (err) {
-              this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream edit failed");
-            }
-            return;
-          }
           const panel = this.dispatchStreamPanel({
             header,
             text,
@@ -3243,18 +3252,21 @@ export class Orchestrator {
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
           timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
           // Drive both additive views from the ONE event stream:
-          //  - the plain-output StreamingPanel gets agent-text (the answer);
+          //  - the OUTPUT renderer gets agent-text (the answer): the flush
+          //    renderer ("messages") streams it as real messages, or the
+          //    StreamingPanel ("card") edits the embed in place;
           //  - the STATUS PANEL gets every event (thinking, tools, model,
           //    context health, action/state) via the same mapping the user-turn
           //    path uses.
           // injectTurn still accumulates the FULL text into `result.text` in
           // parallel, so streaming stays lossless — report-back / done-file get
           // the whole answer regardless.
-          ...(streamPanel || statusPanel
+          ...(msgRenderer || streamPanel || statusPanel
             ? {
                 onEvent: async (event) => {
-                  if (streamPanel && event.kind === "agent-text") {
-                    streamPanel.append(event.text);
+                  if (event.kind === "agent-text") {
+                    if (msgRenderer) msgRenderer.feed(event.text);
+                    else if (streamPanel) streamPanel.append(event.text);
                   }
                   statusPanel?.handleEvent(event);
                 },
@@ -3295,8 +3307,12 @@ export class Orchestrator {
       // of the body) — the streamed panel becomes the done card, with the full
       // text spilled to a file only when it overflows the embed. Quiet: fall
       // back to today's capture-and-post cards below the untouched indicator.
-      if (streamPanel && panelRef) {
-        await this.finalizeDispatchStream(target, spec, streamPanel, streamState, result, style);
+      if (msgRenderer) {
+        // "messages" style: the OUTPUT already streamed as fresh real messages;
+        // drain the tail, surface any error / empty line, flip the ▶ indicator.
+        await this.finalizeMessagesStream(target, spec, msgRenderer, result, panelRef, header, showHeader);
+      } else if (streamPanel && panelRef) {
+        await this.finalizeDispatchStream(target, spec, streamPanel, streamState, result);
       } else {
         // Partial output is still output — post whatever was captured either way.
         await this.postDispatchOutput(target, spec, result.text, result.error);
@@ -3877,55 +3893,50 @@ export class Orchestrator {
     return panel.isLive ? panel : undefined;
   }
 
-  /** Plain "messages"-style LIVE content for a streaming dispatch: the italic
-   *  indicator header followed by the freshest tail of the streamed body, bounded
-   *  to Discord's per-message ceiling so the single message grows in place like a
-   *  normal reply. Loss is only cosmetic — the full text is finalized below. */
-  private dispatchStreamPlainLive(header: string, text: string, showHeader = true): string {
-    const headerLine = showHeader ? `_${header}_` : "";
-    const prefix = headerLine ? `${headerLine}\n\n` : "";
-    const trimmed = text.trim();
-    if (!trimmed) return showHeader ? `${prefix}_starting…_` : "_starting…_";
-    // Reserve room for the header line, the "\n\n" separator, and the leading /
-    // trailing "…" stream markers.
-    const budget = Math.max(0, DISCORD_MESSAGE_MAX - prefix.length - 6);
-    const tail = trimmed.length <= budget ? trimmed : `…${trimmed.slice(trimmed.length - budget)}`;
-    return `${prefix}${tail}…`.slice(0, DISCORD_MESSAGE_MAX);
-  }
-
-  /** Plain "messages"-style TERMINAL content for a streaming dispatch. Flips the
-   *  indicator glyph to ✅/❌ and, when the whole body (plus any error line) fits
-   *  in one message, renders it inline — a clean single traditional message with
-   *  no duplication. When it overflows, sets `streamState.overflow` so the caller
-   *  posts the full body below as fresh plain messages, and this message stays the
-   *  terminal indicator (never a truncated body). */
-  private dispatchStreamPlainDone(
+  /** Finalize a "messages"-style streamed dispatch. The OUTPUT already streamed
+   *  as fresh REAL messages via the {@link StreamingMessageRenderer} (the same
+   *  flush pipeline a normal user turn uses — incremental messages at clean
+   *  paragraph/fence boundaries, linebreaks + code fences intact), so here we only
+   *  drain the tail, surface a visible error / empty-output line, and flip the ▶
+   *  start indicator (when present — i.e. the status panel is off) to its terminal
+   *  ✅/❌ glyph in place. Display-only: the report-back / done-file capture is the
+   *  untouched `result.text`, delivered separately. */
+  private async finalizeMessagesStream(
+    target: ChannelRef,
+    spec: DispatchSpec,
+    renderer: StreamingMessageRenderer,
+    result: InjectTurnResult,
+    panelRef: MessageRef | undefined,
     header: string,
-    streamState: { error?: string; fullText?: string; overflow?: boolean },
-    bufferText: string,
-    showHeader = true
-  ): string {
-    // With the status panel on (showHeader=false) the panel carries the type +
-    // ✅/❌ terminal state, so the plain answer renders WITHOUT a header line —
-    // just the body (or a short error line). Otherwise, flip the ▶ glyph to ✅/❌.
-    const doneHeader = header.replace(/^▶/, streamState.error ? "❌" : "✅");
-    const headerLine = showHeader ? `_${doneHeader}_` : "";
-    const full = (streamState.fullText ?? bufferText).trim();
-    const errLine = streamState.error ? `❌ ${streamState.error.slice(0, 800)}` : "";
-    if (!full && !errLine) {
-      streamState.overflow = false;
-      return headerLine
-        ? `${headerLine}\n\n_✅ Done — no output._`
-        : "_✅ Done — no output._";
+    showHeader: boolean
+  ): Promise<void> {
+    // Drain every remaining buffered message (and any unclosed trailing fence).
+    await renderer.finalize();
+    // The streamed body may be partial or empty, so surface the outcome as its
+    // own visible plain line — same UX the quiet postDispatchOutput path gives.
+    if (result.error) {
+      try {
+        await this.adapter.sendMessage(target, `❌ ${result.error.slice(0, 1500)}`);
+      } catch (err) {
+        this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream error line failed");
+      }
+    } else if (renderer.sentCount === 0) {
+      try {
+        await this.adapter.sendMessage(target, "✅ Done — no output.");
+      } catch (err) {
+        this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream no-output line failed");
+      }
     }
-    const inline = [headerLine, errLine, full].filter(Boolean).join("\n\n");
-    if (inline.length <= DISCORD_MESSAGE_MAX) {
-      streamState.overflow = false;
-      return inline;
+    // Flip the ▶ start indicator to its terminal glyph in place. Only present
+    // when the status panel is off; otherwise the panel carries the ✅/❌ state.
+    if (panelRef && showHeader) {
+      const doneHeader = header.replace(/^▶/, result.error ? "❌" : "✅");
+      try {
+        await this.adapter.editMessage(panelRef, `_${doneHeader}_`);
+      } catch (err) {
+        this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream indicator finalize failed");
+      }
     }
-    // Too big for one message — the full body posts below as fresh plain messages.
-    streamState.overflow = true;
-    return [headerLine, errLine].filter(Boolean).join("\n\n") || headerLine || "…";
   }
 
   /** Build the streaming/indicator panel for a dispatch. `done: false` renders
@@ -3985,40 +3996,15 @@ export class Orchestrator {
     spec: DispatchSpec,
     streamPanel: StreamingPanel,
     streamState: { error?: string; attached: boolean; fullText?: string; overflow?: boolean },
-    result: InjectTurnResult,
-    style: "messages" | "card"
+    result: InjectTurnResult
   ): Promise<void> {
     const body = (result.text ?? "").trim();
     if (result.error) streamState.error = result.error;
     const label = spec.correlationId ? `${spec.id} · ${spec.correlationId}` : spec.id;
 
-    if (style === "messages") {
-      // Stash the authoritative full text (may include trailing text drained
-      // after the RPC resolved) so the terminal render decides inline-vs-overflow
-      // against the WHOLE answer, not just the streamed buffer.
-      streamState.fullText = result.text ?? "";
-      // The terminal render (inside the panel's SerialQueue, so it never races a
-      // pending live edit) sets streamState.overflow when the body won't fit one
-      // message.
-      await streamPanel.finalize();
-      if (streamState.overflow && body) {
-        // Continue as fresh plain messages below the indicator (or a file when it
-        // would take too many) — the "messages"-style overflow path, lossless.
-        await this.postPlainChunks(
-          target,
-          body,
-          label,
-          "dispatch",
-          `✅ Done — full output attached (${body.length} chars).`
-        ).catch((err) =>
-          this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream overflow post failed")
-        );
-      }
-      return;
-    }
-
     // "card" style: spill an overflowing body to a file once (no duplicate card),
-    // then flip the embed panel to its done state in place.
+    // then flip the embed panel to its done state in place. ("messages" style no
+    // longer reaches here — it streams as real messages via finalizeMessagesStream.)
     if (body.length > DISPATCH_STREAM_DESC_MAX) {
       try {
         await this.sendResultFile(target, label, body, "dispatch");

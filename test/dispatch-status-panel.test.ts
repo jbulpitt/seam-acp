@@ -248,7 +248,7 @@ afterEach(() => {
 });
 
 describe("dispatchInjectTurn: status panel ON (default)", () => {
-  it("posts the panel, omits the ▶ line, and streams the plain answer alongside it", async () => {
+  it("posts the panel, omits the ▶ line, and streams the plain answer as its own real message", async () => {
     const rt = fakeRuntime({
       events: [
         { kind: "agent-thought", text: "planning the edit\n" },
@@ -266,25 +266,23 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     // The status panel was posted as the FIRST message, titled with the type.
     const panelPost = calls.sendMessage[0]!;
     expect(panelPost.text).toContain("📨 Handoff");
-    // The redundant ▶ start indicator is suppressed — NO message is the ▶ line;
-    // the plain stream starts as a bare "starting…" placeholder instead.
+    // No ▶ line AND no "_starting…_" placeholder — with the flush renderer the
+    // OUTPUT posts as fresh real messages, so nothing is pre-posted to stream into.
     expect(calls.sendMessage.every((m) => !m.text.startsWith("_▶"))).toBe(true);
-    expect(calls.sendMessage[1]!.text).toBe("_starting…_");
+    expect(calls.sendMessage.some((m) => m.text === "_starting…_")).toBe(false);
 
-    // Panel and plain output are DISTINCT messages (different refs) — both live.
-    const panelRefId = panelPost.ref.id;
-    const streamRefId = calls.sendMessage[1]!.ref.id;
-    expect(panelRefId).not.toBe(streamRefId);
-
-    // The plain answer streamed into its own message and finalized with the body.
-    const streamEdits = calls.editMessage.filter((e) => e.ref.id === streamRefId);
-    expect(streamEdits.length).toBeGreaterThan(0);
-    expect(streamEdits[streamEdits.length - 1]!.text).toContain("Hello world");
-    // …and the plain answer carries NO ▶/type header (the panel owns the type).
-    expect(streamEdits[streamEdits.length - 1]!.text).not.toContain("Handoff");
+    // The plain answer is a fresh REAL message (parity with a normal turn), NOT an
+    // edit of the panel — and carries no ▶/type header (the panel owns the type).
+    const bodyMsgs = calls.sendMessage.slice(1).filter((m) => m.text === "Hello world");
+    expect(bodyMsgs.length).toBe(1);
+    expect(bodyMsgs[0]!.text).not.toContain("Handoff");
+    // The body's own message was never edited (it was posted whole, not tail-capped).
+    const bodyRefId = bodyMsgs[0]!.ref.id;
+    expect(calls.editMessage.filter((e) => e.ref.id === bodyRefId).length).toBe(0);
 
     // The panel's terminal edit shows Done + the accumulated health: thinking,
     // the context-window line, and the resolved model.
+    const panelRefId = panelPost.ref.id;
     const panelEdits = calls.editMessage.filter((e) => e.ref.id === panelRefId);
     const finalPanel = panelEdits[panelEdits.length - 1]!.text;
     expect(finalPanel).toContain("📨 Handoff · Done");
@@ -357,13 +355,18 @@ describe("dispatchInjectTurn: status panel OFF restores today's behavior", () =>
 
     const res = await orch.dispatchInjectTurn(baseSpec());
 
-    // No panel message — the first (and streaming) message is the ▶ indicator.
+    // No panel message — the first message is the ▶ indicator (the header).
     expect(calls.sendMessage.some((m) => m.text.includes("Handoff ·"))).toBe(false);
     expect(calls.sendMessage[0]!.text).toBe("_▶ handoff · do the thing_");
-    // The answer still streamed into that ▶ message and finalized with ✅.
-    const last = calls.editMessage[calls.editMessage.length - 1]!.text;
+    // The answer streamed as a fresh REAL message below the indicator…
+    expect(calls.sendMessage.some((m) => m.text === "Hello world")).toBe(true);
+    // …and the ▶ indicator flipped to ✅ in place — carrying NO body (it streamed
+    // as its own message, not tail-capped into the indicator).
+    const indicatorRefId = calls.sendMessage[0]!.ref.id;
+    const indicatorEdits = calls.editMessage.filter((e) => e.ref.id === indicatorRefId);
+    const last = indicatorEdits[indicatorEdits.length - 1]!.text;
     expect(last).toMatch(/^_✅ handoff/);
-    expect(last).toContain("Hello world");
+    expect(last).not.toContain("Hello world");
     expect(res.output).toBe("Hello world");
   });
 });

@@ -256,7 +256,7 @@ describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', 
 });
 
 describe('dispatchInjectTurn: plain "messages" style (default)', () => {
-  it("posts a PLAIN start indicator and streams into a plain message — no embeds", async () => {
+  it("posts a PLAIN start indicator and streams a short answer as ONE real message — no embeds, no tail-capped edit", async () => {
     const log: string[] = [];
     const rt = fakeRuntime(["Hello ", "world"], log);
     const { adapter, calls } = spyAdapter(log);
@@ -269,19 +269,67 @@ describe('dispatchInjectTurn: plain "messages" style (default)', () => {
     expect(calls.sendPanel.length).toBe(0);
     expect(calls.editPanel.length).toBe(0);
     // The start indicator is a plain italic one-liner posted BEFORE the turn.
-    expect(calls.sendMessage.length).toBe(1);
     expect(calls.sendMessage[0]!.text).toBe("_▶ handoff · do the thing_");
     expect(log.indexOf("sendMessage:_▶ handoff")).toBeLessThan(log.indexOf("prompt-start"));
-    // That same message was edited in place more than once (progressive stream +
-    // terminal render) — no per-chunk storm, SerialQueue/throttle intact.
-    expect(calls.editMessage.length).toBeGreaterThan(1);
-    // The terminal edit flips to ✅ and carries the WHOLE body inline (fits one
-    // message) — a clean single traditional message, no duplicate post.
-    const last = calls.editMessage[calls.editMessage.length - 1]!.text;
-    expect(last).toMatch(/^_✅ handoff/);
-    expect(last).toContain("Hello world");
+    // The ANSWER is posted as its own fresh REAL message (parity with a normal
+    // turn) — not edited into the indicator. "Hello " + "world" has no boundary,
+    // so it drains as a single message at finalize.
+    const body = calls.sendMessage.slice(1);
+    expect(body.map((m) => m.text)).toEqual(["Hello world"]);
+    // The indicator flipped to ✅ in place with a SINGLE terminal edit — no
+    // per-token editMessage storm, and the body was never a tail-capped edit.
+    expect(calls.editMessage.length).toBe(1);
+    expect(calls.editMessage[0]!.text).toBe("_✅ handoff · do the thing_");
+    expect(calls.editMessage.every((e) => !e.text.includes("Hello world"))).toBe(true);
     // Lossless capture preserved for report-back / done-file.
     expect(res.output).toBe("Hello world");
+  });
+
+  it("streams multi-paragraph output as MULTIPLE real messages at clean boundaries, linebreaks preserved", async () => {
+    const log: string[] = [];
+    // Three paragraphs, each past SOFT_MIN (800) so the paragraph boundary soft-
+    // flushes mid-stream. Each carries an internal "\n" to prove linebreaks survive.
+    const p1 = "A.\n" + "x".repeat(900);
+    const p2 = "B.\n" + "y".repeat(900);
+    const p3 = "C.";
+    const rt = fakeRuntime([`${p1}\n\n`, `${p2}\n\n`, p3], log);
+    const { adapter, calls } = spyAdapter(log);
+    const orch = makeOrch({ dataDir, rt, adapter });
+
+    const res = await orch.dispatchInjectTurn(baseSpec());
+
+    // No embeds anywhere.
+    expect(calls.sendPanel.length).toBe(0);
+    expect(calls.editPanel.length).toBe(0);
+    // Body streamed as SEVERAL fresh messages (indicator is sendMessage[0]).
+    const body = calls.sendMessage.slice(1).map((m) => m.text);
+    expect(body.length).toBeGreaterThan(1);
+    expect(body).toEqual([p1, p2, p3]);
+    // Linebreaks are intact inside each streamed message — not stripped.
+    expect(body[0]).toContain("A.\n");
+    expect(body[1]).toContain("B.\n");
+    // Nothing was tail-capped into an edit; the only edit is the ✅ indicator flip.
+    expect(calls.editMessage.length).toBe(1);
+    expect(calls.editMessage[0]!.text).toMatch(/^_✅ handoff/);
+    expect(calls.editMessage.every((e) => !e.text.includes("xxxx"))).toBe(true);
+    // Lossless full text unaffected by display chunking.
+    expect(res.output).toBe(`${p1}\n\n${p2}\n\n${p3}`);
+  });
+
+  it("keeps a code fence intact as its own message while streaming", async () => {
+    const log: string[] = [];
+    const fence = "```ts\nconst a = 1;\nconst b = 2;\n```";
+    const rt = fakeRuntime(["Here is code:\n\n", fence, "\n\nDone."], log);
+    const { adapter, calls } = spyAdapter(log);
+    const orch = makeOrch({ dataDir, rt, adapter });
+
+    const res = await orch.dispatchInjectTurn(baseSpec());
+
+    const body = calls.sendMessage.slice(1).map((m) => m.text);
+    // The fence is re-emitted verbatim as ONE message — never split across flushes.
+    expect(body).toContain("```ts\nconst a = 1;\nconst b = 2;\n```");
+    // The lossless capture still holds the whole answer including the fence.
+    expect(res.output).toBe("Here is code:\n\n```ts\nconst a = 1;\nconst b = 2;\n```\n\nDone.");
   });
 
   it("stream:false runs quiet — plain indicator + plain body messages, no cards", async () => {
@@ -321,9 +369,11 @@ describe('dispatchInjectTurn: plain "messages" style (default)', () => {
     ]);
   });
 
-  it("moderate overflow continues as additional plain messages (no file)", async () => {
+  it("long unbroken output force-drains into many real messages at the hard cap (no file, no cap)", async () => {
     const log: string[] = [];
-    // > one 2000-char message but ≤ 8 chunks of 1900 — spills to extra messages.
+    // No paragraph/line boundaries anywhere — the flush renderer force-drains at
+    // HARD_MAX (1800), exactly like a normal turn. It does NOT spill to a file or
+    // cap the streamed body.
     const big = "y".repeat(6000);
     const rt = fakeRuntime([big], log);
     const { adapter, calls } = spyAdapter(log);
@@ -332,23 +382,21 @@ describe('dispatchInjectTurn: plain "messages" style (default)', () => {
     const res = await orch.dispatchInjectTurn(baseSpec());
 
     expect(res.output).toBe(big);
-    // No embeds, no file — just the plain indicator (edited to a terminal line)
-    // and the full body posted as fresh plain message chunks below it.
+    // No embeds, no file — the whole body posted as fresh plain messages.
     expect(calls.sendPanel.length).toBe(0);
     expect(calls.sendFile.length).toBe(0);
-    // The overflow body was chunked at 1900 → 4 additional plain messages.
     const bodyMsgs = calls.sendMessage.filter((m) => m.text.startsWith("y"));
-    expect(bodyMsgs.length).toBe(Math.ceil(big.length / 1900));
-    expect(bodyMsgs.map((m) => m.text).join("")).toBe(big);
-    // The streamed indicator terminal edit is just the ✅ header (body is below).
+    expect(bodyMsgs.length).toBe(Math.ceil(big.length / 1800));
+    expect(bodyMsgs.map((m) => m.text).join("")).toBe(big); // lossless in display too
+    // The streamed indicator terminal edit is just the ✅ header (body is above/below).
     const last = calls.editMessage[calls.editMessage.length - 1]!.text;
     expect(last).toMatch(/^_✅ handoff/);
     expect(last).not.toContain("yyyy");
   });
 
-  it("huge overflow spills to a single file, losslessly, no card", async () => {
+  it("very long output keeps streaming as real messages — never a single file dump", async () => {
     const log: string[] = [];
-    const big = "z".repeat(20000); // > 8 chunks of 1900 → file
+    const big = "z".repeat(20000);
     const rt = fakeRuntime([big], log);
     const { adapter, calls } = spyAdapter(log);
     const orch = makeOrch({ dataDir, rt, adapter });
@@ -357,11 +405,12 @@ describe('dispatchInjectTurn: plain "messages" style (default)', () => {
 
     expect(res.output).toBe(big);
     expect(calls.sendPanel.length).toBe(0);
-    // Whole body attached exactly once, losslessly.
-    expect(calls.sendFile.length).toBe(1);
-    expect(calls.sendFile[0]!.body).toBe(big);
-    // A short plain "attached" note accompanies it (not an embed).
-    expect(calls.sendMessage.some((m) => m.text.includes("full output attached"))).toBe(true);
+    // The streamed body is NOT capped to a file — it posts as many real messages
+    // (a normal turn doesn't cap). Report-back/done-file capture is separate.
+    expect(calls.sendFile.length).toBe(0);
+    const bodyMsgs = calls.sendMessage.filter((m) => m.text.startsWith("z"));
+    expect(bodyMsgs.length).toBe(Math.ceil(big.length / 1800));
+    expect(bodyMsgs.map((m) => m.text).join("")).toBe(big);
   });
 
   it("report-back to a different thread: plain local render, delivery unchanged", async () => {

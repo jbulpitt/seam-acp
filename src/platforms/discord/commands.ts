@@ -271,6 +271,51 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
+  // Presets: reusable bundles of session config (agent/model/effort/repo/
+  // permission/tools/instructions). Name options are free-form strings —
+  // autocomplete is not wired yet (no autocomplete handler exists bot-wide).
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("preset")
+      .setDescription("Manage reusable session presets")
+      .addSubcommand((sub) => sub.setName("list").setDescription("List all presets"))
+      .addSubcommand((sub) =>
+        sub.setName("create").setDescription("Create a new preset (opens a builder card)")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("apply")
+          .setDescription("Apply a preset to the current thread")
+          .addStringOption((o) =>
+            o.setName("name").setDescription("Preset name").setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("delete")
+          .setDescription("Delete a preset")
+          .addStringOption((o) =>
+            o.setName("name").setDescription("Preset name").setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("show")
+          .setDescription("Show a preset's details")
+          .addStringOption((o) =>
+            o.setName("name").setDescription("Preset name").setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("edit")
+          .setDescription("Edit an existing preset (reopens the builder card)")
+          .addStringOption((o) =>
+            o.setName("name").setDescription("Preset name").setRequired(true)
+          )
+      )
+  );
+
   return cmd;
 }
 

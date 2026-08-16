@@ -20,6 +20,7 @@ import {
   type SessionRecord,
 } from "./types.js";
 import type { ScheduledPrompt } from "./scheduled-prompts/types.js";
+import type { WakeEvent } from "./wake/types.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -239,6 +240,7 @@ export class SessionStore {
     this.db.exec(DELEGATION_SCHEMA);
     this.db.exec(ACTIVE_PROJECTS_SCHEMA);
     this.db.exec(CHAINS_SCHEMA);
+    this.db.exec(WAKE_EVENTS_SCHEMA);
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -905,6 +907,86 @@ export class SessionStore {
       .all()
       .map(mapChain);
   }
+
+  // --- agent-scheduled wake events (#59) ------------------------------------
+
+  /** Insert (or replace) a wake row. Wakes are write-once in practice — the
+   *  sweeper deletes them on fire — but ON CONFLICT keeps the id idempotent. */
+  upsertWake(w: WakeEvent): void {
+    this.db
+      .prepare(
+        `INSERT INTO wake_events
+           (id, platform, channel_ref, parent_ref, fire_at_utc, prompt, reason,
+            created_by, correlation_id, chain_depth, catchup_seconds, created_utc)
+         VALUES
+           (@id, @platform, @channelRef, @parentRef, @fireAtUtc, @prompt, @reason,
+            @createdBy, @correlationId, @chainDepth, @catchupSeconds, @createdUtc)
+         ON CONFLICT(id) DO UPDATE SET
+           fire_at_utc     = excluded.fire_at_utc,
+           prompt          = excluded.prompt,
+           reason          = excluded.reason,
+           correlation_id  = excluded.correlation_id,
+           chain_depth     = excluded.chain_depth,
+           catchup_seconds = excluded.catchup_seconds`
+      )
+      .run({
+        id: w.id,
+        platform: w.platform,
+        channelRef: w.channelRef,
+        parentRef: w.parentRef,
+        fireAtUtc: w.fireAtUtc,
+        prompt: w.prompt,
+        reason: w.reason,
+        createdBy: w.createdBy,
+        correlationId: w.correlationId,
+        chainDepth: w.chainDepth,
+        catchupSeconds: w.catchupSeconds,
+        createdUtc: w.createdUtc,
+      });
+  }
+
+  getWake(id: string): WakeEvent | null {
+    const row = this.db
+      .prepare<[string], WakeRow>("SELECT * FROM wake_events WHERE id = ?")
+      .get(id);
+    return row ? mapWake(row) : null;
+  }
+
+  /** Wakes whose fire time has arrived (`fire_at_utc <= now`), soonest first —
+   *  the order the sweeper fires them. */
+  listDueWakes(nowIso: string): WakeEvent[] {
+    return this.db
+      .prepare<[string], WakeRow>(
+        "SELECT * FROM wake_events WHERE fire_at_utc <= ? ORDER BY fire_at_utc ASC, rowid ASC"
+      )
+      .all(nowIso)
+      .map(mapWake);
+  }
+
+  /** Pending wakes for one thread, soonest first — the D6 visibility surface. */
+  listWakesByChannel(platform: string, channelRef: string): WakeEvent[] {
+    return this.db
+      .prepare<[string, string], WakeRow>(
+        "SELECT * FROM wake_events WHERE platform = ? AND channel_ref = ? ORDER BY fire_at_utc ASC, rowid ASC"
+      )
+      .all(platform, channelRef)
+      .map(mapWake);
+  }
+
+  /** How many wakes are currently pending for a thread — the per-thread cap
+   *  (D8) reads this before arming a new one. */
+  countPendingWakesByChannel(platform: string, channelRef: string): number {
+    const row = this.db
+      .prepare<[string, string], { n: number }>(
+        "SELECT COUNT(*) AS n FROM wake_events WHERE platform = ? AND channel_ref = ?"
+      )
+      .get(platform, channelRef);
+    return row?.n ?? 0;
+  }
+
+  deleteWake(id: string): void {
+    this.db.prepare("DELETE FROM wake_events WHERE id = ?").run(id);
+  }
 }
 
 // --- active projects schema + row mapping (#22) -----------------------------
@@ -1018,6 +1100,57 @@ const mapChain = (r: ChainRow): Chain => ({
   currentIndex: r.current_index,
   createdUtc: r.created_utc,
   updatedUtc: r.updated_utc,
+});
+
+// --- wake events schema + row mapping (#59) ---------------------------------
+
+const WAKE_EVENTS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS wake_events (
+  id              TEXT PRIMARY KEY,
+  platform        TEXT NOT NULL,
+  channel_ref     TEXT NOT NULL,
+  parent_ref      TEXT,
+  fire_at_utc     TEXT NOT NULL,
+  prompt          TEXT NOT NULL,
+  reason          TEXT NOT NULL,
+  created_by      TEXT NOT NULL,
+  correlation_id  TEXT,
+  chain_depth     INTEGER NOT NULL DEFAULT 0,
+  catchup_seconds INTEGER NOT NULL DEFAULT 900,
+  created_utc     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wake_fire ON wake_events(fire_at_utc);
+CREATE INDEX IF NOT EXISTS idx_wake_channel ON wake_events(platform, channel_ref);
+`;
+
+interface WakeRow {
+  id: string;
+  platform: string;
+  channel_ref: string;
+  parent_ref: string | null;
+  fire_at_utc: string;
+  prompt: string;
+  reason: string;
+  created_by: string;
+  correlation_id: string | null;
+  chain_depth: number;
+  catchup_seconds: number;
+  created_utc: string;
+}
+
+const mapWake = (r: WakeRow): WakeEvent => ({
+  id: r.id,
+  platform: r.platform,
+  channelRef: r.channel_ref,
+  parentRef: r.parent_ref,
+  fireAtUtc: r.fire_at_utc,
+  prompt: r.prompt,
+  reason: r.reason,
+  createdBy: r.created_by,
+  correlationId: r.correlation_id,
+  chainDepth: r.chain_depth,
+  catchupSeconds: r.catchup_seconds,
+  createdUtc: r.created_utc,
 });
 
 /** Defensive parse of the stored hops array — a corrupt row degrades to an

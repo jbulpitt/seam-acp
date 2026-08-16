@@ -184,6 +184,10 @@ export type DelegationKind =
   | "report_back"
   /** Scheduler-origin turn — has no source thread. */
   | "scheduled"
+  /** Agent-scheduled wake (#59) — self-initiated re-entry at a chosen time.
+   *  Distinct from "scheduled" so watchdog policy can treat agent-initiated
+   *  re-entry differently from human-scheduled cron runs (D7). */
+  | "wake"
   /** Read-only cross-thread inspection. */
   | "peek";
 

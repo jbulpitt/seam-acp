@@ -18,6 +18,7 @@ import { Orchestrator } from "./platforms/discord/orchestrator.js";
 import { buildGlobalMcpServers } from "./mcp.js";
 import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
 import { ScheduledPromptManager } from "./core/scheduled-prompts/manager.js";
+import { WakeManager } from "./core/wake/manager.js";
 import { DispatchWatcher } from "./core/dispatch/watcher.js";
 import { enqueueDispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
@@ -405,6 +406,11 @@ async function main(): Promise<void> {
         return sid ? store.get(sid) ?? undefined : undefined;
       },
       enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+      // Agent-scheduled wake events (#59): arm/cancel a one-shot self-resumption
+      // for the calling thread. The orchestrator owns the loop-safety guards and
+      // the DB row; the WakeManager sweeper fires it via the dispatch queue.
+      scheduleWake: (record, req) => orchestrator.scheduleWake(record, req),
+      cancelWake: (record, id) => orchestrator.cancelWake(record, id),
       // Durable multi-hop chains (#25): create the chain row and pop hop 1, so
       // the `chain` tool can enqueue the first dispatch. The runtime advances
       // the rest (Orchestrator.advanceChain).
@@ -465,6 +471,18 @@ async function main(): Promise<void> {
   orchestrator.setScheduledManager(scheduledManager);
   scheduledManager.start();
 
+  // Agent-scheduled wake events (#59): a DB sweeper polls for due one-shot
+  // wakes and fires each via the dispatch queue (delete-before-fire, D1). No
+  // rehydrate/re-arm — restart-safe by construction (D11). Started after the
+  // adapter so a due-at-boot wake can post immediately.
+  const wakeManager = new WakeManager({
+    store,
+    logger: logger.child({ mod: "wake" }),
+    onFire: (wake) => orchestrator.fireWake(wake),
+  });
+  orchestrator.setWakeManager(wakeManager);
+  wakeManager.start();
+
   // Operator-dispatch bridge: a trusted process drops a spec into
   // <DATA_DIR>/dispatch/pending/ and the watcher runs it as a turn in the
   // target thread, writing the captured output to done/. Started after the
@@ -509,6 +527,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, "shutting down");
     orchestrator.stopSentinelWatcher();
     scheduledManager.stop();
+    wakeManager.stop();
     dispatchWatcher.stop();
     stopPresetsWatch?.();
     await seamMcpServer?.stop().catch((err) =>

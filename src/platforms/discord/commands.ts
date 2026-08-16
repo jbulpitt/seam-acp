@@ -166,7 +166,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
   cmd.addSubcommand((sub) =>
     sub
       .setName("workflows")
-      .setDescription("View the delegation ledger (active + recent workflows)")
+      .setDescription("View the delegation ledger + this thread's pending wakes (active + recent)")
       .addIntegerOption((o) =>
         o
           .setName("limit")
@@ -174,6 +174,15 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setRequired(false)
           .setMinValue(1)
           .setMaxValue(100)
+      )
+      // Wakes are agent-authored bookkeeping (#59, D4) — surfaced here, not in
+      // the human `/seam schedule` UI. This option cancels one pending wake in
+      // the current thread by id (D6: visible + cancellable).
+      .addStringOption((o) =>
+        o
+          .setName("cancel-wake")
+          .setDescription("Cancel a pending wake in this thread by id")
+          .setRequired(false)
       )
   );
 

@@ -38,8 +38,13 @@ export interface DispatchSpec {
    *  captured output back into this thread (report-back). */
   returnTo?: string;
   /** Ledger classification; defaults to "handoff". The report-back
-   *  re-injection sets "report_back". */
+   *  re-injection sets "report_back"; a fired wake (#59) sets "wake". */
   kind?: DelegationKind;
+  /** Wake self-renewal depth (#59). Set only on wake-kind specs so the turn
+   *  knows its chain depth while it runs — a wake armed *during* this turn
+   *  inherits `wakeChainDepth + 1`, and the chain-depth cap (D8) trips past a
+   *  threshold. Absent/0 for every non-wake dispatch. */
+  wakeChainDepth?: number;
   /** Durable multi-hop chain id (#25). When set, on completion the runtime
    *  advances the chain (pipe this hop's output into the next hop, or deliver
    *  the final output to the chain's origin) instead of the normal `returnTo`
@@ -80,7 +85,8 @@ export const DispatchSpecSchema = z.object({
   preset: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
-  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "peek"]).optional(),
+  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "peek"]).optional(),
+  wakeChainDepth: z.number().int().min(0).optional(),
   chainId: z.string().min(1).optional(),
   createdUtc: z.string().optional(),
 });
@@ -115,6 +121,7 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.correlationId ? { correlationId: d.correlationId } : {}),
     ...(d.returnTo ? { returnTo: d.returnTo } : {}),
     ...(d.kind ? { kind: d.kind } : {}),
+    ...(d.wakeChainDepth !== undefined ? { wakeChainDepth: d.wakeChainDepth } : {}),
     ...(d.chainId ? { chainId: d.chainId } : {}),
     createdUtc: d.createdUtc ?? new Date().toISOString(),
   };

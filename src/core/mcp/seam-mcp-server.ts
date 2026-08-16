@@ -90,6 +90,16 @@ export interface SeamMcpServerDeps {
   /** List the read-only entities (schedules / presets) visible to the calling
    *  thread. Undefined ⇒ omit the entity section from `config_describe`. */
   listConfigEntities?: (record: SessionRecord) => ConfigEntities;
+  /** Arm a one-shot wake for the calling thread (#59). Returns the new wake id
+   *  and fire time, or an error string the tool surfaces verbatim. Undefined ⇒
+   *  wakes are unsupported on this deployment. */
+  scheduleWake?: (
+    record: SessionRecord,
+    req: { delaySeconds: number; reason: string; prompt: string }
+  ) => { ok: true; wakeId: string; fireAtUtc: string } | { ok: false; error: string };
+  /** Cancel a pending wake owned by the calling thread (#59). Returns whether a
+   *  row was removed. Undefined ⇒ wakes are unsupported on this deployment. */
+  cancelWake?: (record: SessionRecord, id: string) => boolean;
 }
 
 /** A Discord snowflake is a long run of digits; a preset is a human name. Used
@@ -195,6 +205,46 @@ const TOOLS = [
     },
   },
   {
+    name: "schedule_wake",
+    description:
+      "Schedule your OWN future re-entry into THIS thread: wake yourself in `delaySeconds` seconds and " +
+      "replay `prompt` back to yourself as a live turn, with this thread's context intact. One-shot — it " +
+      "fires once and is deleted; to keep a loop going you must call this again during the woken turn " +
+      "(nothing re-arms automatically). Durable across restarts. Use for deferred follow-up: \"check back on " +
+      "that build in 20 minutes\", polling until a condition holds, or picking up work after a wait. " +
+      "`reason` is a short human-facing note shown when the wake fires (not an instruction).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        delaySeconds: {
+          type: "number",
+          description: "How many seconds from now to wake (min 60, max 604800 = 7 days).",
+        },
+        reason: {
+          type: "string",
+          description: "Short human-facing reason, shown when the wake fires (telemetry, not instructions).",
+        },
+        prompt: {
+          type: "string",
+          description: "The prompt to replay to yourself on waking. Write it to stand on its own.",
+        },
+      },
+      required: ["delaySeconds", "prompt"],
+    },
+  },
+  {
+    name: "cancel_wake",
+    description:
+      "Cancel a pending wake you scheduled in THIS thread, by its id (as returned by schedule_wake).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wakeId: { type: "string", description: "The wake id to cancel." },
+      },
+      required: ["wakeId"],
+    },
+  },
+  {
     name: "config_describe",
     description:
       "Describe YOUR thread's effective configuration and WHY each value is what it is. " +
@@ -230,6 +280,11 @@ const INSTRUCTIONS = [
   "- peek(thread, count?): read another thread's recent messages to get context before delegating.",
   "- chain(workers, prompt, returnTo?): pipe a prompt through an ordered list of workers where each",
   "  hop's output feeds the next; the final output is delivered back to you. Durable across restarts.",
+  "- schedule_wake(delaySeconds, prompt, reason?): wake YOURSELF later in this thread and replay `prompt`",
+  "  as a live turn (context intact). One-shot and durable — it fires once, then is deleted; re-arm during",
+  "  the woken turn to continue a loop. This is the working substrate for \"wake me in N minutes\"; the",
+  "  native ScheduleWakeup / Monitor tools do NOT function here, so use this instead.",
+  "- cancel_wake(wakeId): cancel a pending wake you scheduled.",
   "",
   "Prefer handoff to a preset for well-scoped specialist work, and to a thread id when a specific",
   "teammate already holds the context. Use chain when work has a fixed multi-stage pipeline.",
@@ -378,6 +433,10 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolPeek(args));
         case "chain":
           return rpcResult(id, await this.toolChain(record, args));
+        case "schedule_wake":
+          return rpcResult(id, this.toolScheduleWake(record, args));
+        case "cancel_wake":
+          return rpcResult(id, this.toolCancelWake(record, args));
         case "config_describe":
           return rpcResult(id, this.toolConfigDescribe(record, args));
         default:
@@ -544,6 +603,49 @@ export class SeamMcpServer {
       .map((m) => `${m.authorIsBot ? "🤖" : "👤"} ${m.text}`)
       .join("\n");
     return textResult(`Recent messages in thread ${thread}:\n\n${rendered}`);
+  }
+
+  /** Schedule a one-shot wake for the calling thread (#59). Self-scope by
+   *  construction — the wake is armed for the token-resolved caller, never a
+   *  caller-supplied thread. All loop-safety validation lives behind
+   *  `scheduleWake` so the MCP and fence paths enforce it identically. */
+  private toolScheduleWake(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): McpToolResult {
+    if (!this.deps.scheduleWake) {
+      return textResult("wakes are not supported on this deployment.", true);
+    }
+    const prompt = requireString(args, "prompt");
+    const reason = optionalString(args, "reason") ?? "";
+    const delaySeconds = typeof args.delaySeconds === "number" ? args.delaySeconds : NaN;
+    const result = this.deps.scheduleWake(caller, { delaySeconds, reason, prompt });
+    if (!result.ok) {
+      return textResult(`Wake not scheduled: ${result.error}`, true);
+    }
+    this.logger.info(
+      { wakeId: result.wakeId, thread: caller.channelRef, fireAtUtc: result.fireAtUtc },
+      "seam-mcp schedule_wake armed"
+    );
+    return textResult(
+      `Wake ${result.wakeId} scheduled — this thread will resume at ${result.fireAtUtc} with your prompt ` +
+        `replayed as a live turn. It fires once; call schedule_wake again during that turn to continue a loop.`
+    );
+  }
+
+  /** Cancel a pending wake owned by the calling thread (#59). */
+  private toolCancelWake(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): McpToolResult {
+    if (!this.deps.cancelWake) {
+      return textResult("wakes are not supported on this deployment.", true);
+    }
+    const wakeId = requireString(args, "wakeId");
+    const removed = this.deps.cancelWake(caller, wakeId);
+    return removed
+      ? textResult(`Wake ${wakeId} cancelled.`)
+      : textResult(`No pending wake ${wakeId} found in this thread (already fired, cancelled, or not yours).`, true);
   }
 
   /**

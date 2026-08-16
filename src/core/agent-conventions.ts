@@ -22,6 +22,13 @@
  *  lowercase (FenceStream lowercases the lang tag), collision-proof. */
 export const ATTACH_FENCE_LANG = "seam-attach";
 
+/** Reserved fenced-block info tag an agent WITHOUT the seam-MCP tools (e.g. agy)
+ *  uses to schedule a one-shot wake event (#59). The output pipeline intercepts
+ *  a fence whose lang equals this, parses its JSON body
+ *  (`{ delaySeconds, reason, prompt }`), arms the wake, and suppresses the block.
+ *  The `schedule_wake` MCP tool is sugar over the same path. */
+export const WAKE_FENCE_LANG = "seam-wake";
+
 /** A per-turn speaker stamp (issue #57). `id` is the authoritative, harness-
  *  stamped identity (not user-controlled); `name` is a user-editable convenience
  *  label that must never drive a scope/permission decision (D4). */

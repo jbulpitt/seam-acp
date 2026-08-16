@@ -236,7 +236,16 @@ describe("chain MCP tool", () => {
   it("tools/list advertises the chain tool with an array schema", async () => {
     const body = await call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
-    expect(names).toEqual(["chain", "config_describe", "forward", "handoff", "peek", "steer"]);
+    expect(names).toEqual([
+      "cancel_wake",
+      "chain",
+      "config_describe",
+      "forward",
+      "handoff",
+      "peek",
+      "schedule_wake",
+      "steer",
+    ]);
     const chain = body.result.tools.find((t: { name: string }) => t.name === "chain");
     expect(chain.inputSchema.properties.workers.type).toBe("array");
     expect(chain.inputSchema.required).toEqual(["workers", "prompt"]);

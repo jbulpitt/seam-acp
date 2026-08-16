@@ -5,6 +5,7 @@ import {
   SeamMcpServer,
   buildSeamMcpServerEntry,
   type PeekedMessage,
+  type SeamMcpServerDeps,
 } from "../src/core/mcp/seam-mcp-server.js";
 import type { Logger } from "../src/lib/logger.js";
 import type { SessionRecord } from "../src/core/types.js";
@@ -75,6 +76,8 @@ describe("SeamTokenRegistry", () => {
 interface Harness {
   server: SeamMcpServer;
   enqueued: DispatchSpec[];
+  scheduledWakes: Array<{ record: SessionRecord; req: { delaySeconds: number; reason: string; prompt: string } }>;
+  cancelledWakes: string[];
   call: (
     method: string,
     params?: unknown,
@@ -85,8 +88,12 @@ interface Harness {
 async function makeHarness(opts?: {
   resolveSession?: (token: string | undefined) => SessionRecord | undefined;
   peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
+  scheduleWake?: SeamMcpServerDeps["scheduleWake"];
+  cancelWake?: SeamMcpServerDeps["cancelWake"];
 }): Promise<Harness> {
   const enqueued: DispatchSpec[] = [];
+  const scheduledWakes: Harness["scheduledWakes"] = [];
+  const cancelledWakes: string[] = [];
   const server = new SeamMcpServer({
     logger: silent,
     resolveSession:
@@ -95,6 +102,18 @@ async function makeHarness(opts?: {
     enqueueDispatch: async (spec) => {
       enqueued.push(spec);
     },
+    scheduleWake:
+      opts?.scheduleWake ??
+      ((record, req) => {
+        scheduledWakes.push({ record, req });
+        return { ok: true as const, wakeId: "wake-1", fireAtUtc: "2026-08-16T00:20:00.000Z" };
+      }),
+    cancelWake:
+      opts?.cancelWake ??
+      ((_record, id) => {
+        cancelledWakes.push(id);
+        return true;
+      }),
     ...(opts?.peekThread ? { peekThread: opts.peekThread } : {}),
   });
   await server.start();
@@ -114,7 +133,7 @@ async function makeHarness(opts?: {
     return { status: res.status, body: text ? JSON.parse(text) : undefined };
   };
 
-  return { server, enqueued, call };
+  return { server, enqueued, scheduledWakes, cancelledWakes, call };
 }
 
 describe("SeamMcpServer", () => {
@@ -137,11 +156,20 @@ describe("SeamMcpServer", () => {
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
 
-  it("tools/list advertises handoff, forward, peek, steer, chain, config_describe", async () => {
+  it("tools/list advertises handoff, forward, peek, steer, chain, config_describe, wakes", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
-    expect(names).toEqual(["chain", "config_describe", "forward", "handoff", "peek", "steer"]);
+    expect(names).toEqual([
+      "cancel_wake",
+      "chain",
+      "config_describe",
+      "forward",
+      "handoff",
+      "peek",
+      "schedule_wake",
+      "steer",
+    ]);
     for (const t of body.result.tools) {
       expect(t.inputSchema.type).toBe("object");
     }
@@ -215,6 +243,58 @@ describe("SeamMcpServer", () => {
     expect(spec.prompt).toContain("<seam-steer>");
     expect(spec.prompt).toContain("focus on the failing test first");
     expect(spec.prompt).toContain("steering you mid-task");
+  });
+
+  it("schedule_wake routes to the caller's scheduleWake dep and returns the wake id (#59)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "schedule_wake", arguments: { delaySeconds: 1200, reason: "check build", prompt: "resume" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBeFalsy();
+    expect(h.scheduledWakes).toHaveLength(1);
+    expect(h.scheduledWakes[0]!.req).toEqual({ delaySeconds: 1200, reason: "check build", prompt: "resume" });
+    // The caller is the token-resolved session, never a caller-supplied thread.
+    expect(h.scheduledWakes[0]!.record.channelRef).toBe("thread-caller");
+    expect(body.result.content[0].text).toContain("wake-1");
+  });
+
+  it("schedule_wake surfaces a guard rejection as an isError result (#59)", async () => {
+    h = await makeHarness({
+      scheduleWake: () => ({ ok: false as const, error: "delaySeconds 5 is below the 60s floor" }),
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "schedule_wake", arguments: { delaySeconds: 5, prompt: "x" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toMatch(/below the 60s floor/);
+    expect(h.scheduledWakes).toHaveLength(0);
+  });
+
+  it("cancel_wake routes to the caller's cancelWake dep (#59)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "cancel_wake", arguments: { wakeId: "wake-xyz" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(h.cancelledWakes).toEqual(["wake-xyz"]);
+  });
+
+  it("cancel_wake reports when nothing was removed (#59)", async () => {
+    h = await makeHarness({ cancelWake: () => false });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "cancel_wake", arguments: { wakeId: "gone" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toMatch(/No pending wake/);
   });
 
   it("tools/call with a MISSING token returns a JSON-RPC error and enqueues nothing", async () => {

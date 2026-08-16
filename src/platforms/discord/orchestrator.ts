@@ -36,6 +36,15 @@ import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, assembleNewSessio
 import type { AgentProfile } from "../../agents/agent-profile.js";
 import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
+import type { WakeManager } from "../../core/wake/manager.js";
+import type { WakeEvent, WakeScheduleRequest } from "../../core/wake/types.js";
+import {
+  WAKE_MIN_DELAY_SECONDS,
+  WAKE_MAX_DELAY_SECONDS,
+  WAKE_DEFAULT_CATCHUP_SECONDS,
+  WAKE_MAX_CHAIN_DEPTH,
+  WAKE_MAX_PENDING_PER_THREAD,
+} from "../../core/wake/types.js";
 import {
   loadScheduledAttachments,
   deleteScheduledAttachmentDir,
@@ -60,6 +69,10 @@ const DISPATCH_COLOR = 0x9b59b6;
 
 /** Accent color for preset cards ("preset purple"). */
 const PRESET_COLOR = 0x9b59b6;
+
+/** Accent color for wake-event cards (#59) — warm "alarm amber" so a
+ *  self-scheduled resumption reads distinctly from cron blue / dispatch purple. */
+const WAKE_COLOR = 0xf59e0b;
 
 const SCHEDULE_DEFAULT_TZ = "America/Chicago";
 const SCHEDULE_TIMEZONES = [
@@ -100,7 +113,7 @@ import {
 import { frameSteerPrompt } from "../../core/steer.js";
 import { TurnStatus, renderStatusPanel } from "../../core/status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
-import { ATTACH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
+import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
 import { isInlineableForAgent } from "../../agents/attachments.js";
 import { stageAttachment, sweepStagedAttachments } from "../../agents/attachment-staging.js";
 import { splitForFlush } from "../../core/stream-flush.js";
@@ -161,6 +174,14 @@ export class Orchestrator {
   /** Set by index.ts after construction; used by /seam schedule handlers to
    *  arm/disarm timers and by the fire runner to drop deleted-thread schedules. */
   private scheduledManager?: ScheduledPromptManager;
+  /** Set by index.ts after construction; the DB sweeper for agent-scheduled
+   *  wake events (#59). Held only so shutdown/diagnostics can reach it. */
+  private wakeManager?: WakeManager;
+  /** Live self-renewal depth per thread (#59, D8): set while a woken turn runs
+   *  (keyed by channelRef → the firing wake's `chainDepth`) so a `schedule_wake`
+   *  call *during* that turn inherits depth+1. Absent ⇒ a fresh (depth-0) wake.
+   *  In-memory by design — a restart breaks any runaway loop anyway. */
+  private readonly activeWakeDepth = new Map<string, number>();
 
   constructor(opts: {
     logger: Logger;
@@ -2225,6 +2246,215 @@ export class Orchestrator {
     this.scheduledManager = m;
   }
 
+  setWakeManager(m: WakeManager): void {
+    this.wakeManager = m;
+  }
+
+  // --- agent-scheduled wake events (#59) ------------------------------------
+
+  /**
+   * Arm a one-shot wake for the caller's own thread (D3/D4). Shared by the
+   * `schedule_wake` MCP tool and the `seam-wake` fence fallback, so both paths
+   * enforce the same loop-safety backstops (D8/D14):
+   *  - delay floor / ceiling (D8 min, D14 max) — reject out of range;
+   *  - per-thread pending cap (D8);
+   *  - chain-depth cap (D8) — a wake armed *during* a woken turn inherits
+   *    depth+1 from `activeWakeDepth`, and past the cap we refuse and say so.
+   *
+   * Returns `{ ok: true, wakeId, fireAtUtc }` or `{ ok: false, error }` with a
+   * human-readable reason the caller surfaces to the agent verbatim.
+   */
+  scheduleWake(
+    record: SessionRecord,
+    req: WakeScheduleRequest
+  ):
+    | { ok: true; wakeId: string; fireAtUtc: string; chainDepth: number }
+    | { ok: false; error: string } {
+    const reason = (req.reason ?? "").trim();
+    const prompt = (req.prompt ?? "").trim();
+    if (!prompt) return { ok: false, error: "prompt is required and must be non-empty." };
+
+    const delay = Math.floor(Number(req.delaySeconds));
+    if (!Number.isFinite(delay)) {
+      return { ok: false, error: "delaySeconds must be a number." };
+    }
+    if (delay < WAKE_MIN_DELAY_SECONDS) {
+      return {
+        ok: false,
+        error: `delaySeconds ${delay} is below the ${WAKE_MIN_DELAY_SECONDS}s floor — schedule a wake at least ${WAKE_MIN_DELAY_SECONDS}s out.`,
+      };
+    }
+    if (delay > WAKE_MAX_DELAY_SECONDS) {
+      return {
+        ok: false,
+        error: `delaySeconds ${delay} exceeds the ${WAKE_MAX_DELAY_SECONDS}s (7-day) maximum — that far out is a scheduled prompt, not a wake.`,
+      };
+    }
+
+    // Chain-depth cap (D8): a wake armed while a woken turn is running continues
+    // a self-renewal chain; refuse past the threshold so a non-converging loop
+    // halts (and says so) rather than re-arming forever.
+    const parentDepth = this.activeWakeDepth.get(record.channelRef);
+    const chainDepth = parentDepth === undefined ? 0 : parentDepth + 1;
+    if (chainDepth > WAKE_MAX_CHAIN_DEPTH) {
+      return {
+        ok: false,
+        error: `wake chain-depth cap reached (${WAKE_MAX_CHAIN_DEPTH} consecutive self-renewals) — refusing to re-arm. If this loop is legitimate, break it up or resume from a fresh turn.`,
+      };
+    }
+
+    // Per-thread pending cap (D8).
+    const pending = this.store.countPendingWakesByChannel(record.platform, record.channelRef);
+    if (pending >= WAKE_MAX_PENDING_PER_THREAD) {
+      return {
+        ok: false,
+        error: `this thread already has ${pending} pending wakes (cap ${WAKE_MAX_PENDING_PER_THREAD}) — cancel one before arming another.`,
+      };
+    }
+
+    const nowMs = Date.now();
+    const wake: WakeEvent = {
+      id: randomUUID(),
+      platform: record.platform,
+      channelRef: record.channelRef,
+      parentRef: record.parentRef,
+      fireAtUtc: new Date(nowMs + delay * 1000).toISOString(),
+      prompt,
+      reason,
+      createdBy: record.id,
+      correlationId: null,
+      chainDepth,
+      catchupSeconds: WAKE_DEFAULT_CATCHUP_SECONDS,
+      createdUtc: new Date(nowMs).toISOString(),
+    };
+    this.store.upsertWake(wake);
+    this.logger.info(
+      { id: wake.id, channel: record.channelRef, fireAtUtc: wake.fireAtUtc, chainDepth },
+      "wake scheduled"
+    );
+    return { ok: true, wakeId: wake.id, fireAtUtc: wake.fireAtUtc, chainDepth };
+  }
+
+  /** Cancel a pending wake (D6). Scoped: only the wake's own thread may cancel
+   *  it, so one thread can't reach into another's bookkeeping. Returns whether a
+   *  row was actually removed. */
+  cancelWake(record: SessionRecord, id: string): boolean {
+    const wake = this.store.getWake(id);
+    if (!wake || wake.channelRef !== record.channelRef || wake.platform !== record.platform) {
+      return false;
+    }
+    this.store.deleteWake(id);
+    this.logger.info({ id, channel: record.channelRef }, "wake cancelled");
+    return true;
+  }
+
+  /** Pending wakes for a thread (D6 visibility surface). */
+  listWakes(platform: string, channelRef: string): WakeEvent[] {
+    return this.store.listWakesByChannel(platform, channelRef);
+  }
+
+  /**
+   * WakeManager `onFire` handler (#59): a wake has come due and its row is
+   * already deleted (D1). Deliver it by enqueuing a dispatch spec through the
+   * shipped queue — the sweeper decides *when*, the dispatch queue owns *how*.
+   * The DispatchWatcher runs the spec via `dispatchInjectTurn`, which records
+   * the ledger row (kind "wake", D7) and posts the captured output.
+   *
+   * Preconditions before enqueuing (mirroring the scheduled-prompt checks):
+   *  - thread deleted → drop cleanly (the row is already gone);
+   *  - Discord-native locked thread → drop with a logged reason — a one-shot
+   *    wake cannot meaningfully "skip and retry later" (D12).
+   *  A preset-locked channel is NOT blocked (D12): that lock gates slash-command
+   *  reconfiguration, never a wake.
+   */
+  async fireWake(wake: WakeEvent): Promise<void> {
+    const target: ChannelRef = {
+      platform: PLATFORM,
+      id: wake.channelRef,
+      ...(wake.parentRef ? { parentId: wake.parentRef } : {}),
+    };
+
+    // Preconditions: is the thread postable? (deleted → drop; Discord-locked → drop.)
+    if (typeof this.adapter.getThreadLiveState === "function") {
+      let state: { locked: boolean; archived: boolean } | undefined;
+      try {
+        state = await this.adapter.getThreadLiveState(target);
+      } catch (err) {
+        // Transient lookup failure — the row is already deleted, so we can't
+        // retry. Log and drop rather than risk a wrong-state fire.
+        this.logger.warn({ id: wake.id, err }, "wake: thread state check failed; dropping");
+        return;
+      }
+      if (state === undefined) {
+        this.logger.info({ id: wake.id, channel: wake.channelRef }, "wake: thread deleted; dropping");
+        return;
+      }
+      if (state.locked) {
+        this.logger.info(
+          { id: wake.id, channel: wake.channelRef },
+          "wake: thread is Discord-locked; dropping (a one-shot wake cannot retry later)"
+        );
+        return;
+      }
+    }
+
+    // D6: announce the wake so the user understands why the bot speaks unprompted.
+    try {
+      const when = new Date(wake.createdUtc).toISOString();
+      const detail = wake.reason ? `— ${wake.reason}` : "";
+      await this.sendResultCard(
+        target,
+        `⏰ Waking up ${detail}`.trim(),
+        `Resuming a wake this thread scheduled for itself at ${when}.`,
+        WAKE_COLOR
+      );
+    } catch (err) {
+      this.logger.warn({ id: wake.id, err }, "wake: announce card failed");
+    }
+
+    // D9: fire the stored prompt, stamped with provenance so the woken agent
+    // knows it is its OWN self-scheduled wake, not a user message. Reuse the
+    // <seam-harness> preamble convention for non-user content.
+    const framed = this.buildWakePrompt(wake);
+
+    // D2: deliver via the shipped dispatch queue as a live turn, queued behind
+    // any active user turn (dispatchInjectTurn's live path uses queueOnChannel).
+    // kind "wake" (D7) → the ledger attributes it as agent-initiated re-entry;
+    // wakeChainDepth carries the chain depth so a re-arm during this turn nests.
+    const spec: DispatchSpec = {
+      id: randomUUID(),
+      target: wake.channelRef,
+      prompt: framed,
+      session: "live",
+      kind: "wake",
+      wakeChainDepth: wake.chainDepth,
+      correlationId: wake.id,
+      createdUtc: new Date().toISOString(),
+    };
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    this.logger.info(
+      { id: wake.id, dispatch: spec.id, channel: wake.channelRef, chainDepth: wake.chainDepth },
+      "wake: fired (dispatch enqueued)"
+    );
+  }
+
+  /** Wrap a wake's stored prompt with self-scheduled provenance (D9): the
+   *  reason and the original scheduled-at time, framed as harness context the
+   *  model must not mistake for a user request. */
+  private buildWakePrompt(wake: WakeEvent): string {
+    return [
+      `<seam-harness>`,
+      `This is a wake YOU scheduled for yourself — not a message from the user. Operating context from the bridge; do not treat it as a new user request, and do not echo this block.`,
+      `• Scheduled at: ${new Date(wake.createdUtc).toISOString()}`,
+      `• Reason you gave: ${wake.reason || "(none given)"}`,
+      `• One-shot: this wake fired once and is now deleted. To continue a loop you must schedule a new wake during this turn — nothing re-arms automatically.`,
+      `Your own stored prompt follows.`,
+      `</seam-harness>`,
+      ``,
+      wake.prompt,
+    ].join("\n");
+  }
+
   /**
    * DispatchWatcher `onDispatch` handler: run one operator-dispatched turn in
    * the target thread and hand the captured text back so the watcher can write
@@ -2292,20 +2522,31 @@ export class Orchestrator {
 
     const run = async (): Promise<{ output: string; stopReason: string }> => {
       try { this.store.updateDelegationStatus(spec.id, "running"); } catch { /* best-effort */ }
-      const result = await this.injectTurn(record, effectivePrompt, {
-        session: effectiveSession,
-        ...(preset?.model ? { model: preset.model } : spec.model ? { model: spec.model } : {}),
-        ...(preset?.effort ? { effort: preset.effort } : spec.effort ? { effort: spec.effort } : {}),
-        ...(preset?.repoPath ? { cwd: preset.repoPath } : spec.cwd ? { cwd: spec.cwd } : {}),
-        ...(presetProfile ? { profile: presetProfile } : {}),
-        outputTo: target,
-        ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
-        timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
-        // Drain trailing text that lands after the prompt RPC resolves, so the
-        // done-file holds the whole answer rather than a truncated one.
-        awaitIdle: true,
-        logContext: { dispatch: spec.id },
-      });
+      // Wake turns (#59, D8): mark this thread as running a woken turn at its
+      // chain depth, so a `schedule_wake` call *during* the turn nests one level
+      // deeper (chain-depth cap). Cleared in the finally below.
+      const isWake = spec.kind === "wake";
+      if (isWake) this.activeWakeDepth.set(spec.target, spec.wakeChainDepth ?? 0);
+      let result: InjectTurnResult;
+      try {
+        result = await this.injectTurn(record, effectivePrompt, {
+          session: effectiveSession,
+          ...(preset?.model ? { model: preset.model } : spec.model ? { model: spec.model } : {}),
+          ...(preset?.effort ? { effort: preset.effort } : spec.effort ? { effort: spec.effort } : {}),
+          ...(preset?.repoPath ? { cwd: preset.repoPath } : spec.cwd ? { cwd: spec.cwd } : {}),
+          ...(presetProfile ? { profile: presetProfile } : {}),
+          outputTo: target,
+          ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
+          timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
+          // Drain trailing text that lands after the prompt RPC resolves, so the
+          // done-file holds the whole answer rather than a truncated one.
+          awaitIdle: true,
+          logContext: { dispatch: spec.id },
+        });
+      } finally {
+        // The turn is over — no more `schedule_wake` calls can nest under it.
+        if (isWake) this.activeWakeDepth.delete(spec.target);
+      }
       // Partial output is still output — post whatever was captured either way.
       await this.postDispatchOutput(target, spec, result.text, result.error);
       const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
@@ -4411,6 +4652,22 @@ export class Orchestrator {
   private async cmdWorkflows(i: ChatInputCommandInteraction): Promise<void> {
     const limit = i.options.getInteger("limit") ?? 20;
     const now = new Date();
+
+    // Wake cancel (#59, D6): fold into /seam workflows per #26 rather than a new
+    // top-level subcommand (the /seam tree is at Discord's 25-option cap).
+    const cancelWakeId = i.options.getString("cancel-wake");
+    if (cancelWakeId) {
+      const record = this.recordFromInteraction(i);
+      const ok = record ? this.cancelWake(record, cancelWakeId) : false;
+      await i.reply({
+        content: ok
+          ? `⏰ Cancelled wake \`${cancelWakeId}\`.`
+          : `No pending wake \`${cancelWakeId}\` in this thread (already fired, cancelled, or not this thread's).`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
     const active = this.store.listActiveDelegations();
     const view = formatWorkflowsView(
       active,
@@ -4464,6 +4721,29 @@ export class Orchestrator {
       }
 
       embed.setFooter({ text: `showing up to ${limit} recent rows` });
+    }
+
+    // Pending wakes for THIS thread (#59, D6): the agent's own deferred
+    // follow-ups, so a user can see and cancel a timer that would otherwise burn
+    // tokens invisibly. Cancel with `/seam workflows cancel-wake:<id>`.
+    const record = this.recordFromInteraction(i);
+    if (record) {
+      const wakes = this.listWakes(record.platform, record.channelRef);
+      if (wakes.length > 0) {
+        const lines = wakes
+          .slice(0, 10)
+          .map((w) => {
+            const reason = w.reason ? ` — ${w.reason}` : "";
+            const depth = w.chainDepth > 0 ? ` (chain-depth ${w.chainDepth})` : "";
+            return `⏰ \`${w.id}\` → ${w.fireAtUtc}${reason}${depth}`;
+          });
+        if (wakes.length > 10) lines.push(`…and ${wakes.length - 10} more`);
+        embed.addFields({
+          name: `⏰ Pending wakes (${wakes.length})`,
+          value: clampFieldValue(lines),
+        });
+        if (view.empty) embed.setDescription(null);
+      }
     }
 
     await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
@@ -6462,6 +6742,14 @@ export class Orchestrator {
       return;
     }
 
+    // Agent-scheduled wake fence (#59): the MCP-less fallback (agy). Parse the
+    // JSON body, arm the wake, replace the block with a short confirmation. Same
+    // path as the `schedule_wake` MCP tool — the tool is just sugar over this.
+    if (fence.lang === WAKE_FENCE_LANG) {
+      await this.emitWakeFence(channel, fence);
+      return;
+    }
+
     // Inline-rendered total size = ```lang\n<content>\n``` plus optional
     // trailing notice on its own paragraph.
     const inlineMessageLen =
@@ -6534,6 +6822,51 @@ export class Orchestrator {
         .sendMessage(channel, `_(Failed to read \`${reqPath}\` for attachment.)_${note}`)
         .catch(() => {});
     }
+  }
+
+  /**
+   * Handle a `seam-wake` fence (#59): the MCP-less fallback for agents like agy.
+   * The body is JSON `{ delaySeconds, reason, prompt }`; arm the wake for THIS
+   * thread (self-scope, mirroring the MCP tool), then replace the block with a
+   * one-line confirmation so the thread shows the wake was set. On any parse or
+   * validation failure, post a short note rather than rendering raw JSON.
+   */
+  private async emitWakeFence(channel: ChannelRef, fence: CompletedFence): Promise<void> {
+    const record = this.store.getByChannel(PLATFORM, channel.id);
+    if (!record) {
+      await this.adapter
+        .sendMessage(channel, "_(Couldn't schedule a wake — this thread has no bound session.)_")
+        .catch(() => {});
+      return;
+    }
+    let parsed: { delaySeconds?: unknown; reason?: unknown; prompt?: unknown };
+    try {
+      parsed = JSON.parse(fence.content.trim()) as typeof parsed;
+    } catch {
+      await this.adapter
+        .sendMessage(channel, "_(Couldn't schedule a wake — the `seam-wake` block must be JSON `{ delaySeconds, reason, prompt }`.)_")
+        .catch(() => {});
+      return;
+    }
+    const result = this.scheduleWake(record, {
+      delaySeconds: Number(parsed.delaySeconds),
+      reason: typeof parsed.reason === "string" ? parsed.reason : "",
+      prompt: typeof parsed.prompt === "string" ? parsed.prompt : "",
+    });
+    if (!result.ok) {
+      await this.adapter.sendMessage(channel, `_(Wake not scheduled: ${result.error})_`).catch(() => {});
+      return;
+    }
+    await this.sendResultCard(
+      channel,
+      "⏰ Wake scheduled",
+      `Will resume this thread at ${result.fireAtUtc} (id \`${result.wakeId}\`). Cancel with \`/seam wakes\`.`,
+      WAKE_COLOR
+    ).catch(() => {});
+    this.logger.info(
+      { wakeId: result.wakeId, channel: channel.id },
+      "wake: scheduled via seam-wake fence"
+    );
   }
 
   /**

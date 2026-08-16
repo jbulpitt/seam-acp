@@ -69,6 +69,15 @@ const Schema = z.object({
   REPOS_ROOT: z.string().min(1, "REPOS_ROOT is required"),
   DATA_DIR: z.string().default("./data"),
   /**
+   * Agent-facing seam-MCP tool surface (#24): one shared in-process HTTP MCP
+   * server whose `handoff` / `forward` / `peek` tools are injected per session
+   * with an identifying token. Default on; set to "false" to run without it.
+   */
+  SEAM_MCP_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
+  /**
    * Comma-separated list of absolute directories the `/seam attach`
    * slash command is allowed to read from. REPOS_ROOT is always
    * implicitly allowed. Defaults to empty (only REPOS_ROOT).

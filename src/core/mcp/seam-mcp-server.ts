@@ -1,0 +1,449 @@
+/**
+ * seam-MCP HTTP server — the agent-facing tool surface (#24).
+ *
+ * ONE shared in-process MCP-over-HTTP server serves every ACP session. Per
+ * session we inject an `mcpServers` entry pointing at this server and carrying
+ * an `X-Seam-Session: <token>` header (see `buildSeamMcpServerEntry` +
+ * `SeamTokenRegistry`); the server reads that header off each `tools/call`
+ * request to identify the calling thread. Transport verified end-to-end in the
+ * #17 spike: injected http config → claude-agent-acp (`type:"http"` → SDK map)
+ * → Claude SDK → outbound HTTP request with the header intact.
+ *
+ * We hand-roll the minimal JSON-RPC 2.0 subset MCP needs — `initialize`,
+ * `tools/list`, `tools/call`, and the `notifications/initialized` no-op — over
+ * `node:http`. No new npm dependency; MCP is just JSON-RPC and this is all the
+ * three tools require.
+ *
+ * The tools are intentionally thin: they resolve the caller from the token and
+ * enqueue a dispatch spec (or read a thread). The runtime's DispatchWatcher +
+ * report-back own correlation and delivery — exactly as the operator-dispatch
+ * bridge and the `<seam-*>` fence directives already do.
+ */
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
+import { randomUUID } from "node:crypto";
+import type { HttpHeader, McpServer } from "@agentclientprotocol/sdk";
+import type { Logger } from "../../lib/logger.js";
+import type { SessionRecord } from "../types.js";
+import type { DispatchSpec } from "../dispatch/types.js";
+
+/** MCP protocol version we speak. We echo the client's if it sends a newer one
+ *  it thinks we support; otherwise advertise this. */
+const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
+
+/** Header the injected mcpServers entry carries; read per request to identify
+ *  the calling session. A header (not a URL path) keeps the token out of logs. */
+export const SEAM_SESSION_HEADER = "x-seam-session";
+
+/** Recent messages from a thread, as the peek tool renders them. */
+export interface PeekedMessage {
+  authorIsBot: boolean;
+  text: string;
+}
+
+export interface SeamMcpServerDeps {
+  logger: Logger;
+  /** token → the calling session's record (or undefined if unknown/revoked). */
+  resolveSession: (token: string | undefined) => SessionRecord | undefined;
+  /** Persist a dispatch spec into the pending queue (the DispatchWatcher runs it). */
+  enqueueDispatch: (spec: DispatchSpec) => Promise<void>;
+  /** Read recent messages from a thread; undefined ⇒ peek is unsupported. */
+  peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
+}
+
+/** A Discord snowflake is a long run of digits; a preset is a human name. Used
+ *  to decide whether `worker`/`to` names a thread (stateful) or a preset. */
+function looksLikeThreadId(s: string): boolean {
+  return /^\d{15,}$/.test(s.trim());
+}
+
+const TOOLS = [
+  {
+    name: "handoff",
+    description:
+      "Hand a task to a worker and (by default) get its result reported back to you. " +
+      "`worker` is EITHER a thread id (a stateful teammate — the task runs in that thread's own session) " +
+      "OR a preset name (a stateless specialist spun up cold for this one task). " +
+      "The worker's output is delivered back into your thread automatically when it finishes — you do not wait inline.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        worker: {
+          type: "string",
+          description: "Target thread id (stateful) or preset name (stateless specialist).",
+        },
+        prompt: { type: "string", description: "The task to hand off." },
+        returnTo: {
+          type: "string",
+          description: "Thread id to report the result back into. Defaults to YOUR thread.",
+        },
+      },
+      required: ["worker", "prompt"],
+    },
+  },
+  {
+    name: "forward",
+    description:
+      "Forward a message straight into another thread — a thin handoff with no specialist framing. " +
+      "Use to relay context or nudge another teammate. The reply is reported back to you by default.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: "Destination thread id." },
+        content: { type: "string", description: "The message to deliver into that thread." },
+      },
+      required: ["to", "content"],
+    },
+  },
+  {
+    name: "peek",
+    description:
+      "Read the most recent messages from a thread WITHOUT posting anything, so you can catch up on " +
+      "another teammate's context before you hand off to or forward into them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        thread: { type: "string", description: "Thread id to read." },
+        count: {
+          type: "number",
+          description: "How many recent messages to return (default 20, max 50).",
+        },
+      },
+      required: ["thread"],
+    },
+  },
+] as const;
+
+const INSTRUCTIONS = [
+  "You are one teammate in a shared workspace of parallel agent threads. These tools let you",
+  "coordinate with the others without leaving your own turn:",
+  "",
+  "- handoff(worker, prompt, returnTo?): delegate a task. `worker` is a thread id (a stateful",
+  "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
+  "  result is dispatched back into your thread when it completes.",
+  "- forward(to, content): relay a message into another thread (thin handoff, no specialist framing).",
+  "- peek(thread, count?): read another thread's recent messages to get context before delegating.",
+  "",
+  "Prefer handoff to a preset for well-scoped specialist work, and to a thread id when a specific",
+  "teammate already holds the context. Correlation and delivery are handled for you.",
+].join("\n");
+
+/**
+ * The shared seam-MCP HTTP server. `start()` binds an ephemeral loopback port;
+ * read `.port` afterwards to build per-session injection entries.
+ */
+export class SeamMcpServer {
+  private readonly deps: SeamMcpServerDeps;
+  private readonly logger: Logger;
+  private server?: http.Server;
+  private boundPort?: number;
+
+  constructor(deps: SeamMcpServerDeps) {
+    this.deps = deps;
+    this.logger = deps.logger.child({ comp: "seam-mcp" });
+  }
+
+  /** Bind 127.0.0.1:0 (ephemeral) and start serving. Idempotent. */
+  async start(): Promise<void> {
+    if (this.server) return;
+    const server = http.createServer((req, res) => void this.handle(req, res));
+    this.server = server;
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.removeListener("error", reject);
+        this.boundPort = (server.address() as AddressInfo).port;
+        resolve();
+      });
+    });
+    this.logger.info({ port: this.boundPort }, "seam-mcp server listening");
+  }
+
+  /** The ephemeral port the server bound to (after `start()`). */
+  get port(): number {
+    if (this.boundPort === undefined) throw new Error("SeamMcpServer not started");
+    return this.boundPort;
+  }
+
+  async stop(): Promise<void> {
+    const server = this.server;
+    if (!server) return;
+    this.server = undefined;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
+  // --- HTTP / JSON-RPC plumbing -------------------------------------------
+
+  private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    if (req.method !== "POST" || (req.url ?? "").replace(/\/+$/, "") !== "/mcp") {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not found" }));
+      return;
+    }
+
+    let body: string;
+    try {
+      body = await readBody(req);
+    } catch (err) {
+      this.logger.warn({ err }, "failed to read request body");
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify(rpcError(null, -32700, "parse error")));
+      return;
+    }
+
+    let msg: JsonRpcRequest;
+    try {
+      msg = JSON.parse(body) as JsonRpcRequest;
+    } catch {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify(rpcError(null, -32700, "parse error")));
+      return;
+    }
+
+    // Notifications (no `id`) get a bare 202 with no JSON-RPC body.
+    const isNotification = msg.id === undefined || msg.id === null;
+
+    const token = headerValue(req.headers[SEAM_SESSION_HEADER]);
+    const response = await this.dispatch(msg, token);
+
+    if (isNotification) {
+      res.writeHead(202);
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(response));
+  }
+
+  private async dispatch(
+    msg: JsonRpcRequest,
+    token: string | undefined
+  ): Promise<JsonRpcResponse> {
+    const id = msg.id ?? null;
+    switch (msg.method) {
+      case "initialize":
+        return rpcResult(id, {
+          protocolVersion:
+            typeof msg.params?.protocolVersion === "string"
+              ? msg.params.protocolVersion
+              : DEFAULT_PROTOCOL_VERSION,
+          serverInfo: { name: "seam-mcp", version: "1.0.0" },
+          capabilities: { tools: {} },
+          instructions: INSTRUCTIONS,
+        });
+      case "notifications/initialized":
+      case "initialized":
+        return rpcResult(id, {});
+      case "tools/list":
+        return rpcResult(id, { tools: TOOLS });
+      case "tools/call":
+        return this.callTool(id, msg.params, token);
+      default:
+        return rpcError(id, -32601, `method not found: ${msg.method}`);
+    }
+  }
+
+  private async callTool(
+    id: JsonRpcId,
+    params: JsonRpcRequest["params"],
+    token: string | undefined
+  ): Promise<JsonRpcResponse> {
+    const record = this.deps.resolveSession(token);
+    if (!record) {
+      // Unknown/missing token — the caller cannot be identified. Fail loudly
+      // rather than guess a thread.
+      return rpcError(id, -32001, "unauthorized: unknown or missing X-Seam-Session token");
+    }
+
+    const name = typeof params?.name === "string" ? params.name : "";
+    const args = (params?.arguments ?? {}) as Record<string, unknown>;
+
+    try {
+      switch (name) {
+        case "handoff":
+          return rpcResult(id, await this.toolHandoff(record, args));
+        case "forward":
+          return rpcResult(id, await this.toolForward(record, args));
+        case "peek":
+          return rpcResult(id, await this.toolPeek(args));
+        default:
+          return rpcError(id, -32602, `unknown tool: ${name}`);
+      }
+    } catch (err) {
+      const message = (err as Error)?.message ?? String(err);
+      this.logger.warn({ err, tool: name, session: record.id }, "seam-mcp tool failed");
+      // Surface tool-level failures as an MCP error result, not a JSON-RPC
+      // protocol error, so the agent sees it as a tool that ran and failed.
+      return rpcResult(id, textResult(`Error: ${message}`, true));
+    }
+  }
+
+  // --- the three tools -----------------------------------------------------
+
+  private async toolHandoff(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    const worker = requireString(args, "worker");
+    const prompt = requireString(args, "prompt");
+    const returnTo = optionalString(args, "returnTo") ?? caller.channelRef;
+    const toThread = looksLikeThreadId(worker);
+    const dispatchId = randomUUID();
+
+    // A thread-id worker runs live in that teammate's own session; a preset name
+    // spins up a stateless specialist (dispatchInjectTurn forces isolated for
+    // presets). For a preset we default the target to the caller's own thread so
+    // the specialist's work is visible where the caller is.
+    const spec: DispatchSpec = {
+      id: dispatchId,
+      target: toThread ? worker : caller.channelRef,
+      prompt,
+      session: toThread ? "live" : "isolated",
+      ...(toThread ? {} : { preset: worker }),
+      returnTo,
+      kind: "handoff",
+      correlationId: dispatchId,
+      createdUtc: new Date().toISOString(),
+    };
+    await this.deps.enqueueDispatch(spec);
+    this.logger.info(
+      { dispatchId, from: caller.channelRef, worker, toThread, returnTo },
+      "seam-mcp handoff enqueued"
+    );
+    return textResult(
+      `Handed off to ${toThread ? `thread ${worker}` : `preset "${worker}"`} ` +
+        `(dispatch ${dispatchId}). Its result will be reported back into thread ${returnTo}.`
+    );
+  }
+
+  private async toolForward(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    const to = requireString(args, "to");
+    const content = requireString(args, "content");
+    const dispatchId = randomUUID();
+    const spec: DispatchSpec = {
+      id: dispatchId,
+      target: to,
+      prompt: content,
+      session: "live",
+      returnTo: caller.channelRef,
+      kind: "forward",
+      correlationId: dispatchId,
+      createdUtc: new Date().toISOString(),
+    };
+    await this.deps.enqueueDispatch(spec);
+    this.logger.info(
+      { dispatchId, from: caller.channelRef, to },
+      "seam-mcp forward enqueued"
+    );
+    return textResult(
+      `Forwarded into thread ${to} (dispatch ${dispatchId}). ` +
+        `Any reply will be reported back into thread ${caller.channelRef}.`
+    );
+  }
+
+  private async toolPeek(args: Record<string, unknown>): Promise<McpToolResult> {
+    const thread = requireString(args, "thread");
+    const rawCount = typeof args.count === "number" ? args.count : 20;
+    const count = Math.max(1, Math.min(50, Math.floor(rawCount)));
+    if (!this.deps.peekThread) {
+      return textResult("peek is not supported on this platform.", true);
+    }
+    const msgs = await this.deps.peekThread(thread, count);
+    if (msgs.length === 0) {
+      return textResult(`Thread ${thread} has no readable messages.`);
+    }
+    const rendered = msgs
+      .slice(-count)
+      .map((m) => `${m.authorIsBot ? "🤖" : "👤"} ${m.text}`)
+      .join("\n");
+    return textResult(`Recent messages in thread ${thread}:\n\n${rendered}`);
+  }
+}
+
+/** Build the per-session `mcpServers` entry that points a session at the shared
+ *  seam-MCP server and carries its identifying token. */
+export function buildSeamMcpServerEntry(port: number, token: string): McpServer {
+  const headers: HttpHeader[] = [{ name: "X-Seam-Session", value: token }];
+  return {
+    type: "http",
+    name: "seam-mcp",
+    url: `http://127.0.0.1:${port}/mcp`,
+    headers,
+  };
+}
+
+// --- small helpers ---------------------------------------------------------
+
+type JsonRpcId = string | number | null;
+interface JsonRpcRequest {
+  jsonrpc?: string;
+  id?: JsonRpcId;
+  method: string;
+  params?: {
+    protocolVersion?: unknown;
+    name?: unknown;
+    arguments?: unknown;
+    [k: string]: unknown;
+  };
+}
+interface JsonRpcResponse {
+  jsonrpc: "2.0";
+  id: JsonRpcId;
+  result?: unknown;
+  error?: { code: number; message: string };
+}
+interface McpToolResult {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+}
+
+function rpcResult(id: JsonRpcId, result: unknown): JsonRpcResponse {
+  return { jsonrpc: "2.0", id, result };
+}
+function rpcError(id: JsonRpcId, code: number, message: string): JsonRpcResponse {
+  return { jsonrpc: "2.0", id, error: { code, message } };
+}
+function textResult(text: string, isError = false): McpToolResult {
+  return { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) };
+}
+
+function requireString(args: Record<string, unknown>, key: string): string {
+  const v = args[key];
+  if (typeof v !== "string" || v.trim() === "") {
+    throw new Error(`"${key}" is required and must be a non-empty string`);
+  }
+  return v;
+}
+function optionalString(args: Record<string, unknown>, key: string): string | undefined {
+  const v = args[key];
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "string" || v.trim() === "") return undefined;
+  return v;
+}
+
+function headerValue(h: string | string[] | undefined): string | undefined {
+  if (Array.isArray(h)) return h[0];
+  return h;
+}
+
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (c: Buffer) => {
+      size += c.length;
+      // Guard against a runaway body — tool args are small.
+      if (size > 1_000_000) {
+        reject(new Error("request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}

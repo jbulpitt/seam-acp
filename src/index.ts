@@ -18,6 +18,9 @@ import { buildGlobalMcpServers } from "./mcp.js";
 import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
 import { ScheduledPromptManager } from "./core/scheduled-prompts/manager.js";
 import { DispatchWatcher } from "./core/dispatch/watcher.js";
+import { enqueueDispatchSpec } from "./core/dispatch/types.js";
+import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
+import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -309,6 +312,12 @@ async function main(): Promise<void> {
         })
   );
 
+  // Agent-facing seam-MCP surface (#24). The shared HTTP server binds its port
+  // later (after the adapter is up), so the router gets the token registry now
+  // and a late-bound port getter; per-session injection happens at runtime start.
+  const seamTokenRegistry = new SeamTokenRegistry();
+  let seamMcpServer: SeamMcpServer | undefined;
+
   const router = new SessionRouter({
     logger,
     store,
@@ -320,6 +329,22 @@ async function main(): Promise<void> {
       ? "always"
       : config.DEFAULT_PERMISSION_POLICY,
     mcpServers,
+    ...(config.SEAM_MCP_ENABLED
+      ? {
+          seamMcp: {
+            registry: seamTokenRegistry,
+            // `.port` throws before the server binds; treat unbound as "not yet
+            // available" so an early runtime start just skips injection.
+            getPort: () => {
+              try {
+                return seamMcpServer?.port;
+              } catch {
+                return undefined;
+              }
+            },
+          },
+        }
+      : {}),
     channelPresets: config.channelPresets,
     threadPresets: config.threadPresets,
   });
@@ -365,6 +390,34 @@ async function main(): Promise<void> {
 
   await adapter.start();
 
+  // Start the shared seam-MCP server now that the adapter exists (peek reads
+  // threads through it). Its ephemeral port feeds the router's late-bound
+  // getPort, so per-session injection works from here on. The tools only
+  // enqueue dispatch specs / read threads — the DispatchWatcher + report-back
+  // do the rest.
+  if (config.SEAM_MCP_ENABLED) {
+    seamMcpServer = new SeamMcpServer({
+      logger,
+      resolveSession: (token) => {
+        const sid = seamTokenRegistry.resolve(token);
+        return sid ? store.get(sid) ?? undefined : undefined;
+      },
+      enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+      ...(adapter.fetchThreadMessages
+        ? {
+            peekThread: async (threadId: string, count: number) => {
+              const msgs = await adapter.fetchThreadMessages!({
+                platform: "discord",
+                id: threadId,
+              });
+              return msgs.slice(-count);
+            },
+          }
+        : {}),
+    });
+    await seamMcpServer.start();
+  }
+
   // Scheduled prompts: arm timers from the DB once Discord is connected (so a
   // catch-up fire can post immediately). onFire runs the schedule as an isolated
   // job and posts output to the thread.
@@ -407,6 +460,9 @@ async function main(): Promise<void> {
     orchestrator.stopSentinelWatcher();
     scheduledManager.stop();
     dispatchWatcher.stop();
+    await seamMcpServer?.stop().catch((err) =>
+      logger.warn({ err }, "seam-mcp stop failed")
+    );
     stopTunnelGist?.();
     try {
       await adapter.stop();

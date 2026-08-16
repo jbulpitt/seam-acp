@@ -7,11 +7,25 @@ import { defaultSessionConfig, resolvePermissionMode } from "./types.js";
 import { makeSessionId } from "./session-store.js";
 import { resolveChannelPreset } from "../config.js";
 import type { ChannelPreset, ThreadPreset } from "../config.js";
+import type { SeamTokenRegistry } from "./mcp/token-registry.js";
+import { buildSeamMcpServerEntry } from "./mcp/seam-mcp-server.js";
 import type {
   McpServer,
   RequestPermissionRequest,
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
+
+/**
+ * Wiring for the per-session seam-MCP surface. The router mints a token per
+ * runtime start (mapping it to the session id) and injects an http mcpServers
+ * entry carrying that token; it revokes the token when the runtime is
+ * invalidated. `getPort` is a late-bound getter because the shared server binds
+ * its ephemeral port after the router is constructed.
+ */
+export interface SeamMcpWiring {
+  registry: SeamTokenRegistry;
+  getPort: () => number | undefined;
+}
 
 export type AskUserFn = (
   record: SessionRecord,
@@ -35,6 +49,7 @@ export class SessionRouter {
   private readonly defaultModel: string;
   private readonly defaultPermissionMode: PermissionPolicyMode;
   private readonly mcpServers: McpServer[];
+  private readonly seamMcp?: SeamMcpWiring;
   private readonly channelPresets: Map<string, ChannelPreset>;
   private readonly threadPresets: Map<string, ThreadPreset>;
   private askUser?: AskUserFn;
@@ -52,6 +67,7 @@ export class SessionRouter {
     defaultModel: string;
     defaultPermissionMode?: PermissionPolicyMode;
     mcpServers?: McpServer[];
+    seamMcp?: SeamMcpWiring;
     channelPresets?: Map<string, ChannelPreset>;
     threadPresets?: Map<string, ThreadPreset>;
   }) {
@@ -62,6 +78,7 @@ export class SessionRouter {
     this.defaultModel = opts.defaultModel;
     this.defaultPermissionMode = opts.defaultPermissionMode ?? "ask";
     this.mcpServers = opts.mcpServers ?? [];
+    this.seamMcp = opts.seamMcp;
     this.channelPresets = opts.channelPresets ?? new Map();
     this.threadPresets = opts.threadPresets ?? new Map();
   }
@@ -172,6 +189,9 @@ export class SessionRouter {
 
   /** Drop a runtime from the cache (e.g. on session/not-found). */
   async invalidate(sessionId: string, opts?: { clearAcpSession?: boolean }): Promise<void> {
+    // Revoke this session's seam-MCP token — the runtime is going away, so any
+    // outstanding token must stop resolving. A later start re-mints a fresh one.
+    this.seamMcp?.registry.revokeSession(sessionId);
     const rt = this.runtimes.get(sessionId);
     if (rt) {
       this.runtimes.delete(sessionId);
@@ -302,12 +322,33 @@ export class SessionRouter {
     const effort = presetEffortUsable ? preset.effort!.value : cfg.reasoningEffort;
     const cwd = preset.cwd?.value ?? record.repoPath ?? process.cwd();
 
+    // Per-session seam-MCP injection: mint a token for this session, map it to
+    // the record id, and append an http mcpServers entry carrying it as the
+    // X-Seam-Session header. The shared server reads that header per tool call
+    // to resolve the caller back to this thread (#24). Token is revoked in
+    // `invalidate`. A re-mint here (runtime restart) rotates the token, so any
+    // stale one stops resolving immediately.
+    let mcpServers = this.mcpServers;
+    if (this.seamMcp) {
+      const port = this.seamMcp.getPort();
+      if (port !== undefined) {
+        const token = this.seamMcp.registry.mint(record.id);
+        mcpServers = [...this.mcpServers, buildSeamMcpServerEntry(port, token)];
+      } else {
+        this.logger.warn(
+          { session: record.id },
+          "seam-mcp enabled but server port not yet available; skipping injection"
+        );
+      }
+    }
+
     const runtime = new AgentRuntime({
       profile,
       logger: this.logger.child({ session: record.id }),
-      mcpServers: this.mcpServers,
+      mcpServers,
       onDead: () => {
         this.logger.info({ sessionId: record.id }, "agent process died; evicting runtime for auto-resume");
+        this.seamMcp?.registry.revokeSession(record.id);
         this.runtimes.delete(record.id);
       },
       permissionPolicy: async (req) => {

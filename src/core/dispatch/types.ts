@@ -11,6 +11,7 @@
  */
 import { z } from "zod";
 import * as path from "node:path";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import type { DelegationKind } from "../types.js";
 
 /** How the dispatched turn acquires its ACP session — see `InjectTurnOptions`. */
@@ -127,4 +128,22 @@ export function dispatchDirs(dataDir: string): {
     running: path.join(root, "running"),
     done: path.join(root, "done"),
   };
+}
+
+/**
+ * Atomically enqueue a dispatch spec into `pending/<id>.json` (write to a
+ * dot-prefixed tmp, then rename), so the DispatchWatcher never observes a
+ * half-written file. The filename stem is the canonical id. Shared by the
+ * seam-MCP tools and `Orchestrator.enqueueReportBack`.
+ */
+export async function enqueueDispatchSpec(
+  dataDir: string,
+  spec: DispatchSpec
+): Promise<void> {
+  const dirs = dispatchDirs(dataDir);
+  await mkdir(dirs.pending, { recursive: true });
+  const tmp = path.join(dirs.pending, `.${spec.id}.json.tmp`);
+  const final = path.join(dirs.pending, `${spec.id}.json`);
+  await writeFile(tmp, `${JSON.stringify(spec, null, 2)}\n`, "utf8");
+  await rename(tmp, final);
 }

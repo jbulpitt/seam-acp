@@ -2199,9 +2199,21 @@ export class Orchestrator {
       cwd: spec.cwd ?? this.config.REPOS_ROOT,
     });
 
-    // TODO: log to delegation_log — the delegation-ledger lane owns the schema;
-    // this is the dispatch site it should hook (spec.id, spec.target,
-    // spec.correlationId, and the result below).
+    // Ledger: record the dispatch as a handoff (operator-originated, so no
+    // source thread). Best-effort — a ledger write must never break a dispatch.
+    try {
+      this.store.recordDelegation({
+        id: spec.id,
+        kind: "handoff",
+        sourceRef: null,
+        targetRef: spec.target,
+        promptPreview: spec.prompt,
+        correlationId: spec.correlationId ?? null,
+        status: "dispatched",
+      });
+    } catch (err) {
+      this.logger.warn({ err, dispatch: spec.id }, "dispatch: ledger record failed");
+    }
 
     if (spec.session === "live" && (spec.model || spec.effort)) {
       // injectTurn's live path reuses the thread's persistent runtime, which was
@@ -2214,6 +2226,7 @@ export class Orchestrator {
     }
 
     const run = async (): Promise<{ output: string; stopReason: string }> => {
+      try { this.store.updateDelegationStatus(spec.id, "running"); } catch { /* best-effort */ }
       const result = await this.injectTurn(record, spec.prompt, {
         session: spec.session,
         ...(spec.model ? { model: spec.model } : {}),
@@ -2229,6 +2242,8 @@ export class Orchestrator {
       });
       // Partial output is still output — post whatever was captured either way.
       await this.postDispatchOutput(target, spec, result.text, result.error);
+      const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
+      try { this.store.updateDelegationStatus(spec.id, ledgerStatus); } catch { /* best-effort */ }
       if (result.error) throw new Error(result.error);
       return { output: result.text, stopReason: result.stopReason ?? "" };
     };

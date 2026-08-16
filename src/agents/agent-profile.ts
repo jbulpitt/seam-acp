@@ -54,7 +54,7 @@ export interface AgentProfile {
    *  @param modelOverride — when set, the spawned process should use this model
    *  instead of the profile default. Used for non-Anthropic backends where
    *  `setModel()` (ACP config option) is rejected by the adapter. */
-  spawn(modelOverride?: string): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
+  spawn(modelOverride?: string, effortOverride?: string): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
 
   /**
    * How this agent exposes reasoning effort, if at all. Drives both the

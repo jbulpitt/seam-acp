@@ -5089,7 +5089,7 @@ export class Orchestrator {
               name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
               model: persistedModel, cwd: persistedCwd, targetChannel: persistedTarget, outputType: persistedOutput,
               sessionMode: state.sessionMode,
-              catchupSeconds: 900, enabled: true, attachments, createdBy: i.user.id,
+              catchupSeconds: 7200, enabled: true, attachments, createdBy: i.user.id,
               createdUtc: now, updatedUtc: now, lastRunUtc: null, lastStatus: null,
               nextRunUtc: next ? next.toISOString() : null, pinnedSessionId: null,
             };

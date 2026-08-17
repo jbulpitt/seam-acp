@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS scheduled_prompts (
   target_channel     TEXT,
   output_type        TEXT NOT NULL DEFAULT 'card',
   session_mode       TEXT NOT NULL DEFAULT 'isolated',
-  catchup_seconds    INTEGER NOT NULL DEFAULT 900,
+  catchup_seconds    INTEGER NOT NULL DEFAULT 7200,
   enabled            INTEGER NOT NULL DEFAULT 1,
   attachments_json   TEXT NOT NULL DEFAULT '[]',
   created_by         TEXT NOT NULL,

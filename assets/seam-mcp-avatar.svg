@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="seam-mcp">
+  <title>seam-mcp</title>
+  <rect width="256" height="256" rx="48" fill="#0D1B27"/>
+  <g transform="translate(44, 128)" fill="none" stroke="#1AA093" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M28 -48 L0 -48 L0 48 L28 48"/>
+    <line x1="52" y1="0" x2="72" y2="0"/>
+    <path d="M96 -8 L132 -32"/>
+    <path d="M96 0 L132 0"/>
+    <path d="M96 8 L132 32"/>
+    <path d="M140 -48 L168 -48 L168 48 L140 48"/>
+  </g>
+  <circle cx="128" cy="128" r="10" fill="#E8B86A"/>
+</svg>

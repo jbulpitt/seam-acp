@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 427" width="1280" height="427" role="img" aria-label="seam-mcp">
+  <title>seam-mcp</title>
+  <rect width="1280" height="427" fill="#0D1B27"/>
+  <g fill="none" stroke-linecap="round" stroke-width="14">
+    <line x1="80" y1="213" x2="164" y2="213" stroke="#1AA093"/>
+    <path d="M218 206 L392 156" stroke="#1AA093"/>
+    <path d="M218 213 L392 213" stroke="#1AA093"/>
+    <path d="M218 220 L392 270" stroke="#1AA093"/>
+  </g>
+  <circle cx="191" cy="213" r="14" fill="#E8B86A"/>
+  <text x="470" y="262" font-family="'Syne','Inter','Helvetica Neue',Arial,sans-serif" font-weight="800" font-size="120" fill="#F5F7FA" letter-spacing="-3">seam<tspan dx="28" font-family="'IBM Plex Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace" font-weight="300" font-size="60" fill="#1AA093" letter-spacing="2"><tspan fill="#E8B86A">--</tspan>mcp</tspan></text>
+</svg>

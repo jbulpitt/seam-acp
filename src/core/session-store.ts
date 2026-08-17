@@ -257,7 +257,26 @@ export class SessionStore {
     ]) {
       try { this.db.exec(ddl); } catch { /* column exists */ }
     }
+    this.migrateWakeFireOnStartup();
     this.migratePresetsScope();
+  }
+
+  /**
+   * Additive migration for boot-triggered wakes (#59 extension): the prod DB
+   * already has `wake_events` without `fire_on_startup`. Add it idempotently —
+   * a PRAGMA guard makes this a no-op once the column exists, so boot never
+   * throws on an already-migrated (or freshly-created) DB, and no data is lost.
+   */
+  private migrateWakeFireOnStartup(): void {
+    const hasColumn = this.db
+      .prepare<[], { name: string }>("PRAGMA table_info(wake_events)")
+      .all()
+      .some((c) => c.name === "fire_on_startup");
+    if (!hasColumn) {
+      this.db.exec(
+        "ALTER TABLE wake_events ADD COLUMN fire_on_startup INTEGER NOT NULL DEFAULT 0"
+      );
+    }
   }
 
   /**
@@ -963,17 +982,20 @@ export class SessionStore {
       .prepare(
         `INSERT INTO wake_events
            (id, platform, channel_ref, parent_ref, fire_at_utc, prompt, reason,
-            created_by, correlation_id, chain_depth, catchup_seconds, created_utc)
+            created_by, correlation_id, chain_depth, catchup_seconds,
+            fire_on_startup, created_utc)
          VALUES
            (@id, @platform, @channelRef, @parentRef, @fireAtUtc, @prompt, @reason,
-            @createdBy, @correlationId, @chainDepth, @catchupSeconds, @createdUtc)
+            @createdBy, @correlationId, @chainDepth, @catchupSeconds,
+            @fireOnStartup, @createdUtc)
          ON CONFLICT(id) DO UPDATE SET
            fire_at_utc     = excluded.fire_at_utc,
            prompt          = excluded.prompt,
            reason          = excluded.reason,
            correlation_id  = excluded.correlation_id,
            chain_depth     = excluded.chain_depth,
-           catchup_seconds = excluded.catchup_seconds`
+           catchup_seconds = excluded.catchup_seconds,
+           fire_on_startup = excluded.fire_on_startup`
       )
       .run({
         id: w.id,
@@ -987,6 +1009,7 @@ export class SessionStore {
         correlationId: w.correlationId,
         chainDepth: w.chainDepth,
         catchupSeconds: w.catchupSeconds,
+        fireOnStartup: w.fireOnStartup ? 1 : 0,
         createdUtc: w.createdUtc,
       });
   }
@@ -999,13 +1022,29 @@ export class SessionStore {
   }
 
   /** Wakes whose fire time has arrived (`fire_at_utc <= now`), soonest first —
-   *  the order the sweeper fires them. */
+   *  the order the sweeper fires them. Boot-triggered wakes (`fire_on_startup`)
+   *  are EXCLUDED: they wait for a process boot, not the clock, so the time
+   *  sweep must never pick them up (they'd otherwise fire immediately on their
+   *  nominal `fire_at_utc`). */
   listDueWakes(nowIso: string): WakeEvent[] {
     return this.db
       .prepare<[string], WakeRow>(
-        "SELECT * FROM wake_events WHERE fire_at_utc <= ? ORDER BY fire_at_utc ASC, rowid ASC"
+        "SELECT * FROM wake_events WHERE fire_at_utc <= ? AND fire_on_startup = 0 ORDER BY fire_at_utc ASC, rowid ASC"
       )
       .all(nowIso)
+      .map(mapWake);
+  }
+
+  /** Boot-triggered wakes (`fire_on_startup = 1`), oldest first — the set
+   *  `WakeManager.start()` fires once on the next process boot (D1 one-shot).
+   *  Independent of `fire_at_utc`: a startup wake fires on boot regardless of
+   *  how long the process was down. */
+  listStartupWakes(): WakeEvent[] {
+    return this.db
+      .prepare<[], WakeRow>(
+        "SELECT * FROM wake_events WHERE fire_on_startup = 1 ORDER BY created_utc ASC, rowid ASC"
+      )
+      .all()
       .map(mapWake);
   }
 
@@ -1321,6 +1360,7 @@ CREATE TABLE IF NOT EXISTS wake_events (
   correlation_id  TEXT,
   chain_depth     INTEGER NOT NULL DEFAULT 0,
   catchup_seconds INTEGER NOT NULL DEFAULT 900,
+  fire_on_startup INTEGER NOT NULL DEFAULT 0,
   created_utc     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wake_fire ON wake_events(fire_at_utc);
@@ -1339,6 +1379,7 @@ interface WakeRow {
   correlation_id: string | null;
   chain_depth: number;
   catchup_seconds: number;
+  fire_on_startup: number;
   created_utc: string;
 }
 
@@ -1354,6 +1395,7 @@ const mapWake = (r: WakeRow): WakeEvent => ({
   correlationId: r.correlation_id,
   chainDepth: r.chain_depth,
   catchupSeconds: r.catchup_seconds,
+  fireOnStartup: r.fire_on_startup !== 0,
   createdUtc: r.created_utc,
 });
 

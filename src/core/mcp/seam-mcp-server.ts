@@ -96,7 +96,7 @@ export interface SeamMcpServerDeps {
    *  wakes are unsupported on this deployment. */
   scheduleWake?: (
     record: SessionRecord,
-    req: { delaySeconds: number; reason: string; prompt: string }
+    req: { delaySeconds: number; reason: string; prompt: string; fireOnStartup?: boolean }
   ) => { ok: true; wakeId: string; fireAtUtc: string } | { ok: false; error: string };
   /** Cancel a pending wake owned by the calling thread (#59). Returns whether a
    *  row was removed. Undefined ⇒ wakes are unsupported on this deployment. */
@@ -346,13 +346,16 @@ const TOOLS = [
       "fires once and is deleted; to keep a loop going you must call this again during the woken turn " +
       "(nothing re-arms automatically). Durable across restarts. Use for deferred follow-up: \"check back on " +
       "that build in 20 minutes\", polling until a condition holds, or picking up work after a wait. " +
-      "`reason` is a short human-facing note shown when the wake fires (not an instruction).",
+      "`reason` is a short human-facing note shown when the wake fires (not an instruction). " +
+      "Set `onStartup: true` instead to fire on the NEXT process boot (after a restart/redeploy) rather than at " +
+      "a wall-clock time — `delaySeconds` is then ignored. Use it to resume work right after a restart. Still " +
+      "one-shot: it fires once on the next boot, then it's gone.",
     inputSchema: {
       type: "object",
       properties: {
         delaySeconds: {
           type: "number",
-          description: "How many seconds from now to wake (min 60, max 604800 = 7 days).",
+          description: "How many seconds from now to wake (min 60, max 604800 = 7 days). Ignored when onStartup is true.",
         },
         reason: {
           type: "string",
@@ -362,8 +365,12 @@ const TOOLS = [
           type: "string",
           description: "The prompt to replay to yourself on waking. Write it to stand on its own.",
         },
+        onStartup: {
+          type: "boolean",
+          description: "Fire on the next process boot instead of at a wall-clock time. When true, delaySeconds is ignored.",
+        },
       },
-      required: ["delaySeconds", "prompt"],
+      required: ["prompt"],
     },
   },
   {
@@ -963,18 +970,22 @@ export class SeamMcpServer {
     }
     const prompt = requireString(args, "prompt");
     const reason = optionalString(args, "reason") ?? "";
+    const fireOnStartup = args.onStartup === true;
     const delaySeconds = typeof args.delaySeconds === "number" ? args.delaySeconds : NaN;
-    const result = this.deps.scheduleWake(caller, { delaySeconds, reason, prompt });
+    const result = this.deps.scheduleWake(caller, { delaySeconds, reason, prompt, fireOnStartup });
     if (!result.ok) {
       return textResult(`Wake not scheduled: ${result.error}`, true);
     }
     this.logger.info(
-      { wakeId: result.wakeId, thread: caller.channelRef, fireAtUtc: result.fireAtUtc },
+      { wakeId: result.wakeId, thread: caller.channelRef, fireAtUtc: result.fireAtUtc, fireOnStartup },
       "seam-mcp schedule_wake armed"
     );
     return textResult(
-      `Wake ${result.wakeId} scheduled — this thread will resume at ${result.fireAtUtc} with your prompt ` +
-        `replayed as a live turn. It fires once; call schedule_wake again during that turn to continue a loop.`
+      fireOnStartup
+        ? `Wake ${result.wakeId} scheduled — this thread will resume on the next process boot with your prompt ` +
+            `replayed as a live turn. It fires once on startup; call schedule_wake again during that turn to continue.`
+        : `Wake ${result.wakeId} scheduled — this thread will resume at ${result.fireAtUtc} with your prompt ` +
+            `replayed as a live turn. It fires once; call schedule_wake again during that turn to continue a loop.`
     );
   }
 

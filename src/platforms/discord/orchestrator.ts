@@ -2514,21 +2514,28 @@ export class Orchestrator {
     const prompt = (req.prompt ?? "").trim();
     if (!prompt) return { ok: false, error: "prompt is required and must be non-empty." };
 
+    // Boot-triggered wake (#59 extension): fires on the next process start, not
+    // at a wall-clock time, so `delaySeconds` is ignored and the delay
+    // floor/ceiling checks don't apply. `fireAtUtc` is set to a nominal "now"
+    // sentinel below — it's excluded from the time sweep regardless.
+    const fireOnStartup = req.fireOnStartup === true;
     const delay = Math.floor(Number(req.delaySeconds));
-    if (!Number.isFinite(delay)) {
-      return { ok: false, error: "delaySeconds must be a number." };
-    }
-    if (delay < WAKE_MIN_DELAY_SECONDS) {
-      return {
-        ok: false,
-        error: `delaySeconds ${delay} is below the ${WAKE_MIN_DELAY_SECONDS}s floor — schedule a wake at least ${WAKE_MIN_DELAY_SECONDS}s out.`,
-      };
-    }
-    if (delay > WAKE_MAX_DELAY_SECONDS) {
-      return {
-        ok: false,
-        error: `delaySeconds ${delay} exceeds the ${WAKE_MAX_DELAY_SECONDS}s (7-day) maximum — that far out is a scheduled prompt, not a wake.`,
-      };
+    if (!fireOnStartup) {
+      if (!Number.isFinite(delay)) {
+        return { ok: false, error: "delaySeconds must be a number." };
+      }
+      if (delay < WAKE_MIN_DELAY_SECONDS) {
+        return {
+          ok: false,
+          error: `delaySeconds ${delay} is below the ${WAKE_MIN_DELAY_SECONDS}s floor — schedule a wake at least ${WAKE_MIN_DELAY_SECONDS}s out.`,
+        };
+      }
+      if (delay > WAKE_MAX_DELAY_SECONDS) {
+        return {
+          ok: false,
+          error: `delaySeconds ${delay} exceeds the ${WAKE_MAX_DELAY_SECONDS}s (7-day) maximum — that far out is a scheduled prompt, not a wake.`,
+        };
+      }
     }
 
     // Chain-depth cap (D8): a wake armed while a woken turn is running continues
@@ -2558,18 +2565,21 @@ export class Orchestrator {
       platform: record.platform,
       channelRef: record.channelRef,
       parentRef: record.parentRef,
-      fireAtUtc: new Date(nowMs + delay * 1000).toISOString(),
+      fireAtUtc: fireOnStartup
+        ? new Date(nowMs).toISOString()
+        : new Date(nowMs + delay * 1000).toISOString(),
       prompt,
       reason,
       createdBy: record.id,
       correlationId: null,
       chainDepth,
       catchupSeconds: WAKE_DEFAULT_CATCHUP_SECONDS,
+      fireOnStartup,
       createdUtc: new Date(nowMs).toISOString(),
     };
     this.store.upsertWake(wake);
     this.logger.info(
-      { id: wake.id, channel: record.channelRef, fireAtUtc: wake.fireAtUtc, chainDepth },
+      { id: wake.id, channel: record.channelRef, fireAtUtc: wake.fireAtUtc, chainDepth, fireOnStartup },
       "wake scheduled"
     );
     return { ok: true, wakeId: wake.id, fireAtUtc: wake.fireAtUtc, chainDepth };

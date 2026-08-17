@@ -38,6 +38,7 @@ import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manage
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import type { WakeManager } from "../../core/wake/manager.js";
 import type { WakeEvent, WakeScheduleRequest } from "../../core/wake/types.js";
+import type { InboxMessage } from "../../core/inbox/types.js";
 import {
   WAKE_MIN_DELAY_SECONDS,
   WAKE_MAX_DELAY_SECONDS,
@@ -2601,6 +2602,75 @@ export class Orchestrator {
   /** Pending wakes for a thread (D6 visibility surface). */
   listWakes(platform: string, channelRef: string): WakeEvent[] {
     return this.store.listWakesByChannel(platform, channelRef);
+  }
+
+  // --- agent inbox (#61) ----------------------------------------------------
+
+  /**
+   * Push a PULL-ONLY message into a target thread's durable inbox (#61),
+   * attributed to `caller`. This is the `send` primitive: unlike handoff/forward
+   * it NEVER enqueues a dispatch or starts a turn — the target reads the message
+   * on its next `poll_inbox`. The target's session key is `${platform}:${to}`
+   * (the same immutable routing key as wakes, `record.id`), so a message can be
+   * left for a thread even while it is idle. The ledger row (kind "inbox") is
+   * best-effort — a ledger write must never break delivery.
+   */
+  pushInbox(
+    caller: SessionRecord,
+    to: string,
+    message: string
+  ): { ok: true; queued: number } | { ok: false; error: string } {
+    const body = (message ?? "").trim();
+    if (!body) return { ok: false, error: "message is required and must be non-empty." };
+    const target = (to ?? "").trim();
+    if (!target) return { ok: false, error: "to (a target thread id) is required." };
+
+    const sessionRef = `${caller.platform}:${target}`;
+    const stored = this.store.pushInbox(sessionRef, caller.channelRef, body);
+    try {
+      this.store.recordDelegation({
+        id: stored.id,
+        kind: "inbox",
+        sourceRef: caller.channelRef,
+        targetRef: target,
+        promptPreview: body,
+        // Delivery to the inbox is complete the moment it lands — there is no
+        // in-flight turn to track (pull-only), so the row is terminal at push.
+        status: "completed",
+      });
+    } catch (err) {
+      this.logger.warn({ err, from: caller.channelRef, to: target }, "inbox: push ledger record failed");
+    }
+    const queued = this.store.countInbox(sessionRef);
+    this.logger.info({ from: caller.channelRef, to: target, queued }, "inbox: message pushed");
+    return { ok: true, queued };
+  }
+
+  /**
+   * Drain the calling thread's OWN inbox (#61): read + delete every queued
+   * message (deliver-once) and return them coalesced (oldest first). Self-scope
+   * is enforced by construction — the owner is always the token-resolved caller's
+   * `record.id`, never a caller-supplied id. Best-effort ledger row (kind
+   * "inbox") when anything was actually drained.
+   */
+  drainInbox(record: SessionRecord): InboxMessage[] {
+    const messages = this.store.drainInbox(record.id);
+    if (messages.length > 0) {
+      try {
+        this.store.recordDelegation({
+          id: randomUUID(),
+          kind: "inbox",
+          sourceRef: record.channelRef,
+          targetRef: record.channelRef,
+          promptPreview: `drained ${messages.length} inbox message(s)`,
+          status: "completed",
+        });
+      } catch (err) {
+        this.logger.warn({ err, thread: record.channelRef }, "inbox: drain ledger record failed");
+      }
+      this.logger.info({ thread: record.channelRef, count: messages.length }, "inbox: drained");
+    }
+    return messages;
   }
 
   /**

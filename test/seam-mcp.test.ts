@@ -80,6 +80,8 @@ interface Harness {
   cancelledWakes: string[];
   createdWatches: Array<{ record: SessionRecord; req: any }>;
   cancelledWatches: string[];
+  /** Per-session-ref inbox backing the send/poll_inbox stubs (session_ref → messages). */
+  inbox: Map<string, Array<{ fromRef: string | null; body: string; createdUtc: string }>>;
   call: (
     method: string,
     params?: unknown,
@@ -97,14 +99,22 @@ async function makeHarness(opts?: {
   listWatches?: SeamMcpServerDeps["listWatches"];
   isChannelLocked?: (record: SessionRecord) => boolean;
   proposeConfig?: (record: SessionRecord, input: unknown) => Promise<any>;
+  pushInbox?: SeamMcpServerDeps["pushInbox"];
+  drainInbox?: SeamMcpServerDeps["drainInbox"];
   /** Omit the compact dep entirely (to test the "not supported" refusal). */
   disableCompact?: boolean;
+  /** Omit the inbox deps entirely (to test the "not supported" refusal). */
+  disableInbox?: boolean;
 }): Promise<Harness> {
   const enqueued: DispatchSpec[] = [];
   const scheduledWakes: Harness["scheduledWakes"] = [];
   const cancelledWakes: string[] = [];
   const createdWatches: Harness["createdWatches"] = [];
   const cancelledWatches: string[] = [];
+  // In-memory inbox mirroring the store: keyed by the OWNING session ref
+  // (`${platform}:${channelRef}`). `send` pushes to the target's ref; poll_inbox
+  // drains the caller's own ref (deliver-once).
+  const inbox: Harness["inbox"] = new Map();
   const server = new SeamMcpServer({
     logger: silent,
     resolveSession:
@@ -173,6 +183,29 @@ async function makeHarness(opts?: {
             stats: { chunks: 3 },
           }),
         }),
+    // Agent inbox (#61): default stubs back a real in-memory queue so the
+    // send→poll round-trip and self-scope can be exercised end to end. Omit both
+    // deps when disableInbox is set to test the "not supported" refusal.
+    ...(opts?.disableInbox
+      ? {}
+      : {
+          pushInbox:
+            opts?.pushInbox ??
+            ((caller, to, message) => {
+              const ref = `${caller.platform}:${to}`;
+              const queue = inbox.get(ref) ?? [];
+              queue.push({ fromRef: caller.channelRef, body: message, createdUtc: "2026-08-16T00:00:00.000Z" });
+              inbox.set(ref, queue);
+              return { ok: true as const, queued: queue.length };
+            }),
+          drainInbox:
+            opts?.drainInbox ??
+            ((record) => {
+              const queue = inbox.get(record.id) ?? [];
+              inbox.delete(record.id);
+              return queue;
+            }),
+        }),
   });
   await server.start();
   const port = server.port;
@@ -191,7 +224,7 @@ async function makeHarness(opts?: {
     return { status: res.status, body: text ? JSON.parse(text) : undefined };
   };
 
-  return { server, enqueued, scheduledWakes, cancelledWakes, createdWatches, cancelledWatches, call };
+  return { server, enqueued, scheduledWakes, cancelledWakes, createdWatches, cancelledWatches, inbox, call };
 }
 
 describe("SeamMcpServer", () => {
@@ -227,7 +260,9 @@ describe("SeamMcpServer", () => {
       "forward",
       "handoff",
       "peek",
+      "poll_inbox",
       "schedule_wake",
+      "send",
       "steer",
       "watch_cancel",
       "watch_create",
@@ -629,6 +664,131 @@ describe("SeamMcpServer", () => {
     expect(body.error).toBeUndefined();
     expect(body.result.isError).toBe(true);
     expect(h.enqueued).toHaveLength(0);
+  });
+
+  // --- agent inbox: send + poll_inbox (#61) --------------------------------
+
+  it("send leaves a message the target drains via poll_inbox exactly once (#61)", async () => {
+    h = await makeHarness();
+    // Caller sends to its own thread id ("thread-caller"), then polls its inbox.
+    const send = await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "ping from a teammate" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(send.body.error).toBeUndefined();
+    expect(send.body.result.isError).toBeFalsy();
+
+    const poll1 = await h.call(
+      "tools/call",
+      { name: "poll_inbox", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(poll1.body.result.isError).toBeFalsy();
+    expect(poll1.body.result.content[0].text).toContain("ping from a teammate");
+    expect(poll1.body.result.content[0].text).toContain("thread-caller"); // attribution
+
+    // Deliver-once: a second poll finds nothing.
+    const poll2 = await h.call(
+      "tools/call",
+      { name: "poll_inbox", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(poll2.body.result.content[0].text).toBe("No new messages.");
+  });
+
+  it("send is PULL-ONLY: it does NOT enqueue a dispatch or start a turn (#61)", async () => {
+    h = await makeHarness();
+    await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "some-other-thread", message: "note for later" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    // The whole point: no dispatch is enqueued (contrast forward/handoff).
+    expect(h.enqueued).toHaveLength(0);
+    // The message is sitting in the target's inbox, waiting to be polled.
+    expect(h.inbox.get("discord:some-other-thread")).toHaveLength(1);
+  });
+
+  it("poll_inbox is self-scoped: it only returns the CALLER's own messages (#61)", async () => {
+    const owner = makeRecord({ id: "discord:owner", channelRef: "owner" });
+    const other = makeRecord({ id: "discord:other", channelRef: "other" });
+    h = await makeHarness({
+      resolveSession: (t) =>
+        t === "owner-token" ? owner : t === "other-token" ? other : undefined,
+    });
+
+    // `other` leaves a message for `owner`.
+    await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "owner", message: "for the owner only" } },
+      { "X-Seam-Session": "other-token" }
+    );
+
+    // The sender's OWN inbox is empty — it can't see what it addressed elsewhere.
+    const otherPoll = await h.call(
+      "tools/call",
+      { name: "poll_inbox", arguments: {} },
+      { "X-Seam-Session": "other-token" }
+    );
+    expect(otherPoll.body.result.content[0].text).toBe("No new messages.");
+
+    // The owner drains it.
+    const ownerPoll = await h.call(
+      "tools/call",
+      { name: "poll_inbox", arguments: {} },
+      { "X-Seam-Session": "owner-token" }
+    );
+    expect(ownerPoll.body.result.content[0].text).toContain("for the owner only");
+    expect(ownerPoll.body.result.content[0].text).toContain("other"); // from-attribution
+  });
+
+  it("poll_inbox rejects an unknown token with -32001 (#61)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "poll_inbox", arguments: {} },
+      { "X-Seam-Session": "bad-token" }
+    );
+    expect(body.error.code).toBe(-32001);
+  });
+
+  it("send rejects an unknown token with -32001 before pushing (#61)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "hi" } },
+      { "X-Seam-Session": "bad-token" }
+    );
+    expect(body.error.code).toBe(-32001);
+    expect(h.inbox.size).toBe(0);
+  });
+
+  it("send validates required args (to + message) as an isError result (#61)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+  });
+
+  it("inbox tools report unsupported when the deps are absent (#61)", async () => {
+    h = await makeHarness({ disableInbox: true });
+    const poll = await h.call(
+      "tools/call",
+      { name: "poll_inbox", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(poll.body.result.isError).toBe(true);
+    expect(poll.body.result.content[0].text).toContain("not supported");
+    const send = await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "hi" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(send.body.result.isError).toBe(true);
   });
 
   it("unknown method returns method-not-found", async () => {

@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   defaultSessionConfig,
   type ActiveProject,
@@ -24,6 +25,7 @@ import {
 import type { ScheduledPrompt } from "./scheduled-prompts/types.js";
 import type { WakeEvent } from "./wake/types.js";
 import type { WatchEvent } from "./watch/types.js";
+import { INBOX_MAX_PER_SESSION, type InboxMessage } from "./inbox/types.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -246,6 +248,7 @@ export class SessionStore {
     this.db.exec(CHAINS_SCHEMA);
     this.db.exec(WAKE_EVENTS_SCHEMA);
     this.db.exec(WATCHES_SCHEMA);
+    this.db.exec(INBOX_SCHEMA);
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -1183,6 +1186,85 @@ export class SessionStore {
   deleteWatch(id: string): void {
     this.db.prepare("DELETE FROM watches WHERE id = ?").run(id);
   }
+
+  // --- agent inbox (#61) ----------------------------------------------------
+
+  /**
+   * Push one message into a session's durable inbox and return the stored row.
+   * `sessionRef` is the OWNING session key (`record.id`, i.e. `platform:channel`
+   * — never `acpSessionId`). Enforces the per-session cap by DROP-OLDEST: after
+   * inserting, any rows beyond `INBOX_MAX_PER_SESSION` (oldest first) are pruned,
+   * so an unpolled inbox is bounded and the newest messages always survive.
+   */
+  pushInbox(sessionRef: string, fromRef: string | null, body: string): InboxMessage {
+    const row: InboxMessage = {
+      id: randomUUID(),
+      sessionRef,
+      fromRef,
+      body,
+      createdUtc: new Date().toISOString(),
+    };
+    this.db
+      .prepare(
+        `INSERT INTO inbox (id, session_ref, from_ref, body, created_utc)
+         VALUES (@id, @sessionRef, @fromRef, @body, @createdUtc)`
+      )
+      .run(row);
+    // Drop-oldest overflow: keep only the newest INBOX_MAX_PER_SESSION rows for
+    // this session. rowid is monotonic insertion order, so ORDER BY rowid DESC
+    // LIMIT -1 OFFSET N leaves the N newest and selects the rest for deletion.
+    this.db
+      .prepare(
+        `DELETE FROM inbox WHERE id IN (
+           SELECT id FROM inbox WHERE session_ref = ?
+           ORDER BY rowid DESC LIMIT -1 OFFSET ?
+         )`
+      )
+      .run(sessionRef, INBOX_MAX_PER_SESSION);
+    return row;
+  }
+
+  /**
+   * Drain a session's inbox: read every queued message (oldest first) AND delete
+   * them in one transaction, returning the coalesced list. Deliver-once — a
+   * second drain returns nothing. Self-scope is the caller's responsibility (it
+   * passes its OWN `record.id`); this never reads another session's rows.
+   */
+  drainInbox(sessionRef: string): InboxMessage[] {
+    const drain = this.db.transaction((ref: string): InboxMessage[] => {
+      const rows = this.db
+        .prepare<[string], InboxRow>(
+          "SELECT * FROM inbox WHERE session_ref = ? ORDER BY rowid ASC"
+        )
+        .all(ref)
+        .map(mapInbox);
+      if (rows.length > 0) {
+        this.db.prepare("DELETE FROM inbox WHERE session_ref = ?").run(ref);
+      }
+      return rows;
+    });
+    return drain(sessionRef);
+  }
+
+  /** Read a session's queued messages WITHOUT deleting them (oldest first). */
+  listInbox(sessionRef: string): InboxMessage[] {
+    return this.db
+      .prepare<[string], InboxRow>(
+        "SELECT * FROM inbox WHERE session_ref = ? ORDER BY rowid ASC"
+      )
+      .all(sessionRef)
+      .map(mapInbox);
+  }
+
+  /** How many messages are currently queued for a session. */
+  countInbox(sessionRef: string): number {
+    const row = this.db
+      .prepare<[string], { n: number }>(
+        "SELECT COUNT(*) AS n FROM inbox WHERE session_ref = ?"
+      )
+      .get(sessionRef);
+    return row?.n ?? 0;
+  }
 }
 
 // --- active projects schema + row mapping (#22) -----------------------------
@@ -1470,6 +1552,35 @@ const mapWatch = (r: WatchRow): WatchEvent => ({
   expiresAtUtc: r.expires_at_utc,
   createdBy: r.created_by,
   correlationId: r.correlation_id,
+  createdUtc: r.created_utc,
+});
+
+// --- agent inbox schema + row mapping (#61) ---------------------------------
+
+const INBOX_SCHEMA = `
+CREATE TABLE IF NOT EXISTS inbox (
+  id           TEXT PRIMARY KEY,
+  session_ref  TEXT NOT NULL,
+  from_ref     TEXT,
+  body         TEXT NOT NULL,
+  created_utc  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inbox_session ON inbox(session_ref);
+`;
+
+interface InboxRow {
+  id: string;
+  session_ref: string;
+  from_ref: string | null;
+  body: string;
+  created_utc: string;
+}
+
+const mapInbox = (r: InboxRow): InboxMessage => ({
+  id: r.id,
+  sessionRef: r.session_ref,
+  fromRef: r.from_ref,
+  body: r.body,
   createdUtc: r.created_utc,
 });
 

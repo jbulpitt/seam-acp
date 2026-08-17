@@ -172,6 +172,35 @@ export interface SeamMcpServerDeps {
     reportMarkdown: string;
     stats: { chunks: number };
   }>;
+  /**
+   * Agent inbox PRODUCER (#61): push a pull-only message into a TARGET thread's
+   * durable inbox, attributed to the caller. It must NOT enqueue a dispatch or
+   * start a turn — the target reads it on its next `poll_inbox`. Returns how many
+   * messages are now queued for the target, or an error string surfaced verbatim.
+   * Undefined ⇒ the inbox is unsupported on this deployment. Wired in index.ts to
+   * `orchestrator.pushInbox`, like `scheduleWake`.
+   */
+  pushInbox?: (
+    caller: SessionRecord,
+    to: string,
+    message: string
+  ) => { ok: true; queued: number } | { ok: false; error: string };
+  /**
+   * Agent inbox CONSUMER (#61): drain the calling thread's OWN inbox
+   * (deliver-once-then-delete), returning the queued messages coalesced/ordered
+   * (oldest first). Self-scope by construction — the caller is the token-resolved
+   * record, never a caller-supplied id, so a thread can never drain another's
+   * inbox. Undefined ⇒ the inbox is unsupported on this deployment.
+   */
+  drainInbox?: (record: SessionRecord) => InboxMessageView[];
+}
+
+/** One drained inbox message, as `poll_inbox` renders it. Kept as a minimal
+ *  projection so the server stays decoupled from the store's row type. */
+export interface InboxMessageView {
+  fromRef: string | null;
+  body: string;
+  createdUtc: string;
 }
 
 /** Result of asking the platform to propose a config change. */
@@ -470,6 +499,38 @@ const TOOLS = [
     },
   },
   {
+    name: "poll_inbox",
+    description:
+      "Drain YOUR OWN inbox: read and REMOVE every message other agents (or the system) have left for you " +
+      "via `send`, coalesced into one block — or \"No new messages.\" when it is empty. Deliver-once: polled " +
+      "messages are deleted, so a second poll returns nothing new. You only ever see messages addressed to " +
+      "YOU (self-scope — never another thread's inbox). Delivery is pull-only, so call this to pick up " +
+      "asynchronous notes left for you without waiting on a fresh chat turn — mid-turn, or at the start of one.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "send",
+    description:
+      "Leave a message in another thread's INBOX for that agent to read on its NEXT poll_inbox. " +
+      "PULL-ONLY delivery: this does NOT start or interrupt a turn and does NOT enqueue a dispatch — the " +
+      "message simply waits in the target's inbox until that agent polls for it. THIS IS THE KEY DIFFERENCE " +
+      "FROM forward/handoff, which both START A TURN in the target right now: use forward/handoff when you " +
+      "need the target to act immediately, and `send` when you only want to leave a note for whenever it next " +
+      "checks. `to` is the target thread id; the message is recorded as coming FROM you.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: "Target thread id whose inbox to leave the message in." },
+        message: { type: "string", description: "The message to queue for the target agent." },
+      },
+      required: ["to", "message"],
+    },
+  },
+  {
     name: "config_describe",
     description:
       "Describe YOUR thread's effective configuration and WHY each value is what it is. " +
@@ -577,6 +638,11 @@ const INSTRUCTIONS = [
   "- compact(thread?, source?): run the premium multi-agent compaction pipeline on a thread (yours by default,",
   "  or a named teammate's) and reseed it from the summary — non-destructive (the original session is kept). It",
   "  runs for minutes and does NOT block you: it returns at once and the result posts into the target thread.",
+  "- send(to, message): leave a PULL-ONLY message in another thread's inbox for its NEXT poll_inbox. Unlike",
+  "  forward/handoff (which start a turn in the target now), send does NOT start or interrupt a turn — the",
+  "  message simply waits until that agent polls. Use it to reach a teammate without forcing a new turn.",
+  "- poll_inbox(): drain YOUR OWN inbox — read and remove the messages other agents left you via send",
+  "  (deliver-once, self-scope). Call it to pick up asynchronous notes without waiting on a fresh chat turn.",
   "",
   "Prefer handoff to a preset for well-scoped specialist work, and to a thread id when a specific",
   "teammate already holds the context. Use chain when work has a fixed multi-stage pipeline.",
@@ -737,6 +803,10 @@ export class SeamMcpServer {
           return rpcResult(id, this.toolWatchCancel(record, args));
         case "watch_list":
           return rpcResult(id, this.toolWatchList(record));
+        case "poll_inbox":
+          return rpcResult(id, this.toolPollInbox(record));
+        case "send":
+          return rpcResult(id, this.toolSend(record, args));
         case "config_describe":
           return rpcResult(id, this.toolConfigDescribe(record, args));
         case "config_propose":
@@ -1076,6 +1146,65 @@ export class SeamMcpServer {
       return `• ${w.id} — ${w.kind}:${w.spec} every ${w.intervalSeconds}s (${w.mode}), expires ${w.expiresAtUtc}${fires}${reason}`;
     });
     return textResult(`Pending watches in this thread (${watches.length}):\n${lines.join("\n")}`);
+  }
+
+  /**
+   * Drain the calling thread's OWN inbox (#61). Self-scope by construction — the
+   * owner is the token-resolved caller, never a caller-supplied id, so a thread
+   * can only ever drain its own queue. Deliver-once: the store deletes the rows
+   * it returns, so a second poll yields "No new messages." Messages are coalesced
+   * into one framed block (oldest first) with each producer attributed.
+   */
+  private toolPollInbox(caller: SessionRecord): McpToolResult {
+    if (!this.deps.drainInbox) {
+      return textResult("the inbox is not supported on this deployment.", true);
+    }
+    const messages = this.deps.drainInbox(caller);
+    if (messages.length === 0) {
+      return textResult("No new messages.");
+    }
+    const framed = messages
+      .map((m, i) => `[${i + 1}] from ${m.fromRef ?? "unknown"}:\n${m.body}`)
+      .join("\n\n");
+    this.logger.info(
+      { thread: caller.channelRef, count: messages.length },
+      "seam-mcp poll_inbox drained"
+    );
+    return textResult(
+      `You have ${messages.length} new inbox message(s) (now cleared):\n\n${framed}`
+    );
+  }
+
+  /**
+   * Leave a PULL-ONLY message in a target thread's inbox (#61), attributed to the
+   * caller. Deliberately does NOT enqueue a dispatch or start a turn — that is
+   * what `forward`/`handoff` are for; `send` reaches an agent WITHOUT forcing a
+   * new turn, delivered on the target's next `poll_inbox`. The push + its ledger
+   * row live behind `pushInbox` so this stays a thin, side-effect-free-of-turns
+   * call.
+   */
+  private toolSend(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): McpToolResult {
+    if (!this.deps.pushInbox) {
+      return textResult("the inbox is not supported on this deployment.", true);
+    }
+    const to = requireString(args, "to");
+    const message = requireString(args, "message");
+    const result = this.deps.pushInbox(caller, to, message);
+    if (!result.ok) {
+      return textResult(`Message not sent: ${result.error}`, true);
+    }
+    this.logger.info(
+      { from: caller.channelRef, to, queued: result.queued },
+      "seam-mcp send queued"
+    );
+    return textResult(
+      `Left a message in thread ${to}'s inbox (from ${caller.channelRef}). It will be delivered ` +
+        `when that agent next calls poll_inbox — this did NOT start or interrupt a turn. ` +
+        `${result.queued} message(s) now queued there.`
+    );
   }
 
   /**

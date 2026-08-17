@@ -490,6 +490,12 @@ async function main(): Promise<void> {
       // same primitive off-turn and posts the result into the target thread. The
       // dep's presence gates the tool (undefined ⇒ "not supported").
       compactThread: (record, opts) => orchestrator.compactThread(record, opts),
+      // Agent inbox (#61): the PRODUCER (`send`) leaves a pull-only message in a
+      // target thread's durable inbox — no dispatch, no turn — and the CONSUMER
+      // (`poll_inbox`) drains the caller's OWN inbox. The orchestrator owns the
+      // store rows + best-effort ledger; delivery is deliver-once-then-delete.
+      pushInbox: (caller, to, message) => orchestrator.pushInbox(caller, to, message),
+      drainInbox: (record) => orchestrator.drainInbox(record),
     });
     await seamMcpServer.start();
   }

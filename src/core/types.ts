@@ -201,7 +201,12 @@ export type DelegationKind =
    *  the premium multi-agent compaction pipeline on a thread's session (its
    *  own, or an explicit target) and rebind the thread to the seeded result.
    *  Recorded actor→target so a cross-thread compaction is an audited fact. */
-  | "compact";
+  | "compact"
+  /** Agent inbox (#61) — a durable, pull-only message left in a thread's queue
+   *  (`send`) or drained from it (`poll_inbox`). Distinct from "forward"/
+   *  "handoff": an inbox message never starts or interrupts a turn, so watchdog
+   *  policy must not treat it as an in-flight delegation. */
+  | "inbox";
 
 /** Lifecycle of a ledger row. Terminal states: completed | failed | timed_out. */
 export type DelegationStatus =

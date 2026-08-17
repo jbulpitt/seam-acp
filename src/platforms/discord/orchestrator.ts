@@ -143,6 +143,7 @@ import {
   type DispatchSpec,
 } from "../../core/dispatch/types.js";
 import { frameSteerPrompt } from "../../core/steer.js";
+import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
@@ -166,6 +167,7 @@ import {
   type TurnState,
 } from "../../core/types.js";
 import type { DiscordAdapter } from "./adapter.js";
+import { resolveDiscordSpeakerName } from "./adapter.js";
 
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
@@ -453,6 +455,20 @@ export class Orchestrator {
 
   private async handleIncomingMessage(msg: IncomingMessage): Promise<void> {
     const channelId = msg.channel.id;
+
+    // #63: cooperative mid-turn reply routing (flag-gated, DARK by default). When
+    // a turn is already active on this thread and SEAM_MIDTURN_REPLY_MODE="inbox",
+    // a bare reply joins the running agent's inbox (#61) instead of force-aborting
+    // the turn — pull-only, so NO generation bump, NO abort, NO new turn. Handled
+    // before the bump/abort below precisely so it pre-empts neither. The default
+    // "abort" mode falls through to the priority-interrupt path unchanged.
+    if (
+      this.config.SEAM_MIDTURN_REPLY_MODE === "inbox" &&
+      this.channelQueues.has(channelId)
+    ) {
+      await this.routeMidTurnReplyToInbox(msg);
+      return;
+    }
 
     // Bump the generation so any previously-queued (but not-yet-started) tasks
     // for this channel know they've been superseded and should skip themselves.
@@ -2645,6 +2661,75 @@ export class Orchestrator {
     const queued = this.store.countInbox(sessionRef);
     this.logger.info({ from: caller.channelRef, to: target, queued }, "inbox: message pushed");
     return { ok: true, queued };
+  }
+
+  /**
+   * Push a HUMAN's cooperative message into `record`'s durable inbox (#63) — the
+   * human producer half of #61's `pushInbox` (whose producer is a resolved agent
+   * SessionRecord). Here `from` is a person, attributed via speaker-identity (#57)
+   * as `human:<name|id>` (built by the caller). Discord URLs are scrubbed when the
+   * target agent is `restrictDiscordAccess`, mirroring the prompt path so a
+   * network-restricted host is never handed a Discord link. Pull-only — never
+   * starts or cancels a turn; the agent reads it at its next `poll_inbox`. The
+   * ledger row (kind "inbox") is best-effort, same as the agent push above.
+   */
+  pushHumanInbox(record: SessionRecord, from: string, message: string): { queued: number } {
+    const activeProfile = this.router.getProfile(record.agentId);
+    const body = activeProfile?.restrictDiscordAccess ? scrubDiscordUrls(message) : message;
+    const stored = this.store.pushInbox(record.id, from, body);
+    try {
+      this.store.recordDelegation({
+        id: stored.id,
+        kind: "inbox",
+        sourceRef: from,
+        targetRef: record.channelRef,
+        promptPreview: body,
+        status: "completed",
+      });
+    } catch (err) {
+      this.logger.warn({ err, from, to: record.channelRef }, "inbox: human push ledger record failed");
+    }
+    const queued = this.store.countInbox(record.id);
+    this.logger.info({ from, to: record.channelRef, queued }, "inbox: human message pushed");
+    return { queued };
+  }
+
+  /**
+   * Route a bare mid-turn Discord reply into the running agent's inbox (#63,
+   * cooperative). Only reached when SEAM_MIDTURN_REPLY_MODE="inbox" AND a turn is
+   * already active on the thread. Attribution comes from speaker-identity (#57):
+   * the resolved author name, id fallback. An attachment-only reply (no text) is
+   * a no-op — there is nothing to hand the agent cooperatively. Acks with a light
+   * 💬 reaction so the human sees the message was absorbed without a chatty post.
+   */
+  private async routeMidTurnReplyToInbox(msg: IncomingMessage): Promise<void> {
+    const body = (msg.text ?? "").trim();
+    const channel = msg.channel;
+    const record = this.router.ensureSessionRecord({
+      platform: channel.platform,
+      channelRef: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+    if (!body) {
+      this.logger.debug({ channelId: channel.id, sessionId: record.id }, "mid-turn reply had no text; nothing to queue");
+      return;
+    }
+    const from = humanInboxFrom(msg.authorName, msg.authorId);
+    const { queued } = this.pushHumanInbox(record, from, body);
+    this.logger.info(
+      { channelId: channel.id, sessionId: record.id, from, queued },
+      "mid-turn reply routed to inbox (cooperative)"
+    );
+    // Light ⏳/💬 ack: react on the raw message so the human sees it landed,
+    // without a reply that would clutter the live turn. Best-effort — a failed
+    // ack must never block the (already-committed) queuing.
+    try {
+      const raw = msg.raw as Message | undefined;
+      if (raw && typeof raw.react === "function") await raw.react("💬");
+    } catch (err) {
+      this.logger.debug({ err, channelId: channel.id }, "mid-turn inbox ack reaction failed");
+    }
   }
 
   /**
@@ -5419,9 +5504,37 @@ export class Orchestrator {
    *  `router.abortTurn(id, { force: false })`. The inject is queued on the
    *  target's channel (`queueOnChannel`) so it takes the cancelled turn's place
    *  in line rather than overlapping its event stream. */
+  /**
+   * Resolve the operator's display name for a slash interaction via the same
+   * speaker-identity precedence as chat messages (#57): admin override → guild
+   * nickname → global name → username. Used to attribute a cooperative steer to
+   * the human who issued it. `i.member` may be a full GuildMember (has
+   * `displayName`) or the raw API shape (no getter) — read it defensively.
+   */
+  private interactionSpeakerName(i: ChatInputCommandInteraction): string {
+    const member = i.member;
+    const nickname =
+      member && typeof member === "object" && "displayName" in member
+        ? ((member as { displayName?: string | null }).displayName ?? null)
+        : null;
+    return resolveDiscordSpeakerName(
+      {
+        userId: i.user.id,
+        nickname,
+        globalName: i.user.globalName ?? null,
+        username: i.user.username,
+      },
+      this.config.DISCORD_USER_NAMES
+    );
+  }
+
   private async cmdSteer(i: ChatInputCommandInteraction): Promise<void> {
     const threadId = i.options.getString("thread", true).trim();
     const prompt = i.options.getString("prompt", true);
+    // #63 two-tier: `now:true` is PREEMPTIVE (cancel-and-reprompt, today's
+    // behavior); `now:false` (DEFAULT) is COOPERATIVE — push into the session's
+    // inbox (#61) with no cancel, delivered at the agent's next poll_inbox.
+    const now = i.options.getBoolean("now") ?? false;
     await i.deferReply({ flags: MessageFlags.Ephemeral });
 
     const record = this.router.ensureSessionRecord({
@@ -5430,6 +5543,20 @@ export class Orchestrator {
       cwd: this.config.REPOS_ROOT,
     });
     const target: ChannelRef = { platform: PLATFORM, id: threadId };
+
+    if (!now) {
+      // COOPERATIVE (#63 default): queue the steer into the target's inbox — no
+      // cancel, no new turn. The running (or idle) agent absorbs it on its next
+      // poll_inbox. Attributed to the operator via speaker-identity (#57).
+      const from = humanInboxFrom(this.interactionSpeakerName(i), i.user.id);
+      const { queued } = this.pushHumanInbox(record, from, prompt);
+      await i.editReply(
+        `💬 Queued your steer into thread ${threadId}'s inbox — ${queued} message(s) waiting. ` +
+          `The agent reads it at its next inbox poll; no turn was cancelled. ` +
+          `Add \`now:true\` to cancel-and-reprompt instead.`
+      );
+      return;
+    }
 
     // Preemptive cancel — identical to `/seam cancel` (graceful ACP cancel).
     const cancelOutcome = await this.router.abortTurn(record.id, { force: false });

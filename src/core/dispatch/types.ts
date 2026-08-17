@@ -64,6 +64,12 @@ export interface DispatchSpec {
    *  either way — streaming is purely about live visibility in the run's own
    *  target thread. */
   stream?: boolean;
+  /** Handoff feedback channel (#62). When true, the worker's prompt gets a
+   *  standing instruction to poll its OWN inbox at checkpoints for mid-task
+   *  steering from its delegator — a cooperative, opt-in-per-handoff channel
+   *  that never cancels or restarts the turn (contrast the preemptive `steer`
+   *  path). Absent/false → the prompt is untouched and behavior is unchanged. */
+  watchFeedback?: boolean;
   createdUtc: string;
 }
 
@@ -104,6 +110,7 @@ export const DispatchSpecSchema = z.object({
   wakeChainDepth: z.number().int().min(0).optional(),
   chainId: z.string().min(1).optional(),
   stream: z.boolean().optional(),
+  watchFeedback: z.boolean().optional(),
   createdUtc: z.string().optional(),
 });
 
@@ -141,8 +148,30 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.wakeChainDepth !== undefined ? { wakeChainDepth: d.wakeChainDepth } : {}),
     ...(d.chainId ? { chainId: d.chainId } : {}),
     ...(d.stream !== undefined ? { stream: d.stream } : {}),
+    ...(d.watchFeedback !== undefined ? { watchFeedback: d.watchFeedback } : {}),
     createdUtc: d.createdUtc ?? new Date().toISOString(),
   };
+}
+
+/** The standing instruction appended to a `watchFeedback` handoff's worker
+ *  prompt (#62). Motivates the worker to poll its OWN inbox at natural
+ *  checkpoints so its delegator can push mid-task steering it absorbs WITHOUT a
+ *  cancel or restart — the cooperative tier. Wording is kept here (one place) so
+ *  it stays tunable. */
+export const WATCH_FEEDBACK_INSTRUCTION =
+  "At natural checkpoints (before starting a major step, after finishing a tool " +
+  "batch), call `poll_inbox` to check for feedback from your delegator. If it " +
+  "returns guidance, incorporate it into your current plan before continuing — " +
+  "you do not need to restart.";
+
+/** Append the `watchFeedback` standing instruction to an already-assembled
+ *  worker prompt when the spec opts in (#62); otherwise return it verbatim.
+ *  Applied AFTER any preset-identity prepend so the polling instruction is the
+ *  final thing the worker reads. This is exactly what `dispatchInjectTurn`
+ *  composes for the dispatched prompt. */
+export function applyWatchFeedback(prompt: string, watchFeedback?: boolean): string {
+  if (!watchFeedback) return prompt;
+  return `${prompt}\n\n${WATCH_FEEDBACK_INSTRUCTION}`;
 }
 
 /** A Discord snowflake is a long run of digits; a preset is a human name. Used

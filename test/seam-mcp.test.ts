@@ -9,7 +9,11 @@ import {
 } from "../src/core/mcp/seam-mcp-server.js";
 import type { Logger } from "../src/lib/logger.js";
 import type { SessionRecord } from "../src/core/types.js";
-import type { DispatchSpec } from "../src/core/dispatch/types.js";
+import {
+  applyWatchFeedback,
+  WATCH_FEEDBACK_INSTRUCTION,
+  type DispatchSpec,
+} from "../src/core/dispatch/types.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -331,6 +335,55 @@ describe("SeamMcpServer", () => {
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("handoff").inputSchema.properties.stream.type).toBe("boolean");
     expect(byName.get("forward").inputSchema.properties.stream.type).toBe("boolean");
+  });
+
+  // --- handoff feedback channel: watchFeedback (#62) ------------------------
+
+  it("handoff advertises the watchFeedback option in its input schema (#62)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call("tools/list");
+    const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
+    // Adding an OPTION to handoff does NOT change the tool count set by #61.
+    expect(body.result.tools).toHaveLength(15);
+    expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
+  });
+
+  it("handoff with watchFeedback:true carries the flag on the spec (#62)", async () => {
+    h = await makeHarness();
+    await h.call(
+      "tools/call",
+      { name: "handoff", arguments: { worker: "reviewer", prompt: "review PR 42", watchFeedback: true } },
+      { "X-Seam-Session": "good-token" }
+    );
+    const spec = h.enqueued[0]!;
+    expect(spec.watchFeedback).toBe(true);
+  });
+
+  it("handoff without watchFeedback leaves the flag off the spec (#62)", async () => {
+    h = await makeHarness();
+    await h.call(
+      "tools/call",
+      { name: "handoff", arguments: { worker: "reviewer", prompt: "review PR 42" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    const spec = h.enqueued[0]!;
+    expect(spec.watchFeedback).toBeUndefined();
+  });
+
+  it("watchFeedback appends the poll_inbox instruction to the worker prompt dispatchInjectTurn builds (#62)", () => {
+    // `applyWatchFeedback` is exactly the composition dispatchInjectTurn runs on
+    // the dispatched prompt (after any preset-identity prepend). With the flag on,
+    // the standing instruction reaches the worker; without it, the prompt is
+    // untouched — so vanilla handoffs are unchanged.
+    const base = "<seam-worker-identity>…</seam-worker-identity>\n\ndo the task";
+    const withFlag = applyWatchFeedback(base, true);
+    expect(withFlag).toContain(base);
+    expect(withFlag).toContain(WATCH_FEEDBACK_INSTRUCTION);
+    expect(withFlag).toContain("poll_inbox");
+    expect(withFlag).toContain("you do not need to restart");
+
+    expect(applyWatchFeedback(base, false)).toBe(base);
+    expect(applyWatchFeedback(base, undefined)).toBe(base);
   });
 
   it("handoff defaults stream ON (omitted from spec) and honors stream:false", async () => {
@@ -741,6 +794,27 @@ describe("SeamMcpServer", () => {
     );
     expect(ownerPoll.body.result.content[0].text).toContain("for the owner only");
     expect(ownerPoll.body.result.content[0].text).toContain("other"); // from-attribution
+  });
+
+  it("poll_inbox frames drained messages as actionable delegator feedback (#62)", async () => {
+    h = await makeHarness();
+    // A delegator ("boss") pushes mid-task steering into the worker's inbox.
+    await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "prefer the smaller diff" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    const poll = await h.call(
+      "tools/call",
+      { name: "poll_inbox", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    const text = poll.body.result.content[0].text;
+    // Surfaces the delegator's `from` attribution as FEEDBACK...
+    expect(text).toContain("[FEEDBACK from thread-caller]:");
+    expect(text).toContain("prefer the smaller diff");
+    // ...and the standing "you do not need to restart" cooperative cue.
+    expect(text).toContain("you do not need to restart");
   });
 
   it("poll_inbox rejects an unknown token with -32001 (#61)", async () => {

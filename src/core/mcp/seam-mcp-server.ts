@@ -257,6 +257,13 @@ const TOOLS = [
             "Set false for a quiet run that posts one clean artifact at the end (the indicator still shows). " +
             "Your report-back always gets the full result either way.",
         },
+        watchFeedback: {
+          type: "boolean",
+          description:
+            "Tell the worker to watch its inbox for your mid-task steering (default false). When true, its prompt " +
+            "gets a standing instruction to call `poll_inbox` at checkpoints; you then push feedback with `send` while " +
+            "it runs and it absorbs the guidance WITHOUT cancelling or restarting its turn (cooperative, history intact).",
+        },
       },
       required: ["worker", "prompt"],
     },
@@ -833,6 +840,7 @@ export class SeamMcpServer {
     const prompt = requireString(args, "prompt");
     const returnTo = optionalString(args, "returnTo") ?? caller.channelRef;
     const stream = optionalBool(args, "stream");
+    const watchFeedback = optionalBool(args, "watchFeedback");
     const toThread = looksLikeThreadId(worker);
     const dispatchId = randomUUID();
 
@@ -850,16 +858,20 @@ export class SeamMcpServer {
       kind: "handoff",
       correlationId: dispatchId,
       ...(stream !== undefined ? { stream } : {}),
+      ...(watchFeedback ? { watchFeedback: true } : {}),
       createdUtc: new Date().toISOString(),
     };
     await this.deps.enqueueDispatch(spec);
     this.logger.info(
-      { dispatchId, from: caller.channelRef, worker, toThread, returnTo },
+      { dispatchId, from: caller.channelRef, worker, toThread, returnTo, watchFeedback },
       "seam-mcp handoff enqueued"
     );
     return textResult(
       `Handed off to ${toThread ? `thread ${worker}` : `preset "${worker}"`} ` +
-        `(dispatch ${dispatchId}). Its result will be reported back into thread ${returnTo}.`
+        `(dispatch ${dispatchId}). Its result will be reported back into thread ${returnTo}.` +
+        (watchFeedback
+          ? ` It will poll its inbox for your feedback — push mid-task steering with send(to: "${spec.target}", …).`
+          : "")
     );
   }
 
@@ -1163,15 +1175,20 @@ export class SeamMcpServer {
     if (messages.length === 0) {
       return textResult("No new messages.");
     }
+    // Frame the drained block as actionable delegator feedback (#62): each
+    // message attributed to its sender as `[FEEDBACK from <from_ref>]`, coalesced
+    // into ONE block, closed with the standing "incorporate into your current
+    // plan; you do not need to restart" cue so a watchFeedback worker knows it
+    // may absorb this mid-turn without restarting.
     const framed = messages
-      .map((m, i) => `[${i + 1}] from ${m.fromRef ?? "unknown"}:\n${m.body}`)
+      .map((m) => `[FEEDBACK from ${m.fromRef ?? "unknown"}]: ${m.body}`)
       .join("\n\n");
     this.logger.info(
       { thread: caller.channelRef, count: messages.length },
       "seam-mcp poll_inbox drained"
     );
     return textResult(
-      `You have ${messages.length} new inbox message(s) (now cleared):\n\n${framed}`
+      `${framed}\n\n— incorporate into your current plan; you do not need to restart.`
     );
   }
 

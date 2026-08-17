@@ -136,6 +136,7 @@ import {
   type InjectTurnResult,
 } from "../../core/inject-turn.js";
 import {
+  applyWatchFeedback,
   buildChainHopSpec,
   dispatchDirs,
   enqueueDispatchSpec,
@@ -3153,9 +3154,16 @@ export class Orchestrator {
     }
     const presetProfile = preset?.agentId ? this.router.getProfile(preset.agentId) : undefined;
     const effectiveSession = preset ? "isolated" : spec.session;
-    const effectivePrompt = preset?.instructions
-      ? `<seam-worker-identity name="${preset.name}">\n${preset.instructions}\n</seam-worker-identity>\n\n${spec.prompt}`
-      : spec.prompt;
+    // Handoff feedback channel (#62): when the dispatch opts into watchFeedback,
+    // append the standing poll_inbox instruction AFTER any preset-identity
+    // prepend so it is the last thing the worker reads. Opt-in — without the flag
+    // the prompt is untouched (applyWatchFeedback returns it verbatim).
+    const effectivePrompt = applyWatchFeedback(
+      preset?.instructions
+        ? `<seam-worker-identity name="${preset.name}">\n${preset.instructions}\n</seam-worker-identity>\n\n${spec.prompt}`
+        : spec.prompt,
+      spec.watchFeedback
+    );
 
     // Ledger: record the dispatch as a handoff (operator-originated, so no
     // source thread). Best-effort — a ledger write must never break a dispatch.

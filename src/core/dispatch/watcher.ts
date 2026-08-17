@@ -96,18 +96,42 @@ export class DispatchWatcher {
       this.logger.warn({ err }, "cannot read pending dir");
       return;
     }
-    const jobs: Promise<void>[] = [];
-    for (const name of names) {
-      if (!name.endsWith(".json")) continue;
-      const id = name.slice(0, -".json".length);
-      if (this.inFlight.has(id)) continue;
-      this.inFlight.add(id);
-      jobs.push(
-        this.claimAndRun(id)
-          .catch((err) => this.logger.error({ err, id }, "dispatch failed unexpectedly"))
-          .finally(() => this.inFlight.delete(id))
-      );
-    }
+    const ids = names
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => name.slice(0, -".json".length))
+      .filter((id) => !this.inFlight.has(id));
+    for (const id of ids) this.inFlight.add(id);
+
+    // Claim (rename + parse) concurrently — a race here is harmless — but collect
+    // the winners and ENQUEUE their runs in a deterministic arrival order
+    // (createdUtc, then id). Otherwise two same-target specs claimed in one tick
+    // would reach their SerialQueue in whatever order the async claim races
+    // resolve, breaking the "on-disk arrival order is the order they reach the
+    // thread" guarantee (and flaking any test that relies on it).
+    const claimed: Array<{ id: string; spec: DispatchSpec }> = [];
+    await Promise.all(
+      ids.map(async (id) => {
+        try {
+          const spec = await this.claimSpec(id);
+          if (spec) claimed.push({ id, spec });
+          else this.inFlight.delete(id); // ENOENT (lost the claim) or already finalized
+        } catch (err) {
+          this.logger.error({ err, id }, "dispatch: claim failed unexpectedly");
+          this.inFlight.delete(id);
+        }
+      })
+    );
+    claimed.sort(
+      (a, b) =>
+        (a.spec.createdUtc ?? "").localeCompare(b.spec.createdUtc ?? "") ||
+        a.id.localeCompare(b.id)
+    );
+
+    const jobs = claimed.map(({ id, spec }) =>
+      this.runSpec(id, spec)
+        .catch((err) => this.logger.error({ err, id }, "dispatch failed unexpectedly"))
+        .finally(() => this.inFlight.delete(id))
+    );
     await Promise.all(jobs);
   }
 
@@ -147,7 +171,14 @@ export class DispatchWatcher {
     }
   }
 
-  private async claimAndRun(id: string): Promise<void> {
+  /**
+   * Claim a pending spec by atomic rename into `running/`, then parse it.
+   * Returns the spec on success; `null` when the claim was lost (ENOENT — a
+   * racing tick/process won it) or the spec was unparseable (already finalized
+   * as `failed` here, since retrying could never succeed). Kept separate from
+   * {@link runSpec} so `tick` can order the runs after all claims land.
+   */
+  private async claimSpec(id: string): Promise<DispatchSpec | null> {
     const name = `${id}.json`;
     const runningPath = path.join(this.dirs.running, name);
 
@@ -156,13 +187,12 @@ export class DispatchWatcher {
     try {
       await rename(path.join(this.dirs.pending, name), runningPath);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw err;
     }
 
-    let spec: DispatchSpec;
     try {
-      spec = parseDispatchSpec(id, await readFile(runningPath, "utf8"));
+      return parseDispatchSpec(id, await readFile(runningPath, "utf8"));
     } catch (err) {
       // Unparseable specs can never succeed — retrying would spin forever, so
       // record the failure and drain the file out of the queue.
@@ -175,9 +205,14 @@ export class DispatchWatcher {
         error: message,
         finishedUtc: new Date().toISOString(),
       });
-      return;
+      return null;
     }
+  }
 
+  /** Run one claimed spec through its target's SerialQueue and record the
+   *  outcome. Invoked by `tick` in arrival order, so the synchronous
+   *  `queueFor(target).run(...)` enqueue below preserves same-target order. */
+  private async runSpec(id: string, spec: DispatchSpec): Promise<void> {
     this.logger.info(
       { id, target: spec.target, session: spec.session, correlationId: spec.correlationId },
       "dispatch: running"

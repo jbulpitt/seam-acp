@@ -220,6 +220,32 @@ describe("DispatchWatcher", () => {
     }
   });
 
+  it("serializes same-target specs in createdUtc arrival order, not id/readdir order", async () => {
+    // Regression guard for the claim-race de-flake: two specs on the SAME target
+    // claimed in one tick must reach the thread in on-disk ARRIVAL order. Here
+    // the later id ("aaa") was created FIRST — sorting by id/readdir would run it
+    // first; only sorting by createdUtc gives the correct ["zzz", "aaa"].
+    const order: string[] = [];
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async (spec) => {
+        order.push(spec.id);
+        return { output: spec.id, stopReason: "end_turn" };
+      },
+    });
+
+    await dropSpec({ id: "zzz", target: "t", createdUtc: "2026-01-01T00:00:00.000Z" });
+    await dropSpec({ id: "aaa", target: "t", createdUtc: "2026-01-01T00:00:05.000Z" });
+
+    await watcher.start();
+    watcher.stop();
+
+    expect(order).toEqual(["zzz", "aaa"]);
+    expect(await readDone("zzz")).toMatchObject({ status: "completed" });
+    expect(await readDone("aaa")).toMatchObject({ status: "completed" });
+  });
+
   it("fails an unparseable spec instead of retrying it forever", async () => {
     await mkdir(dirs.pending, { recursive: true });
     await writeFile(path.join(dirs.pending, "job-e.json"), "{ not json", "utf8");

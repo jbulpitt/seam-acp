@@ -211,7 +211,10 @@ export class AgentRuntime {
    *  updates since the last `user_message_chunk`) is the live turn. Starts true
    *  so a stream that never replays a user message (no echo) is emitted, not
    *  eaten; a replayed prior user message flips it false until the current
-   *  prompt's echo flips it back true. */
+   *  prompt's echo flips it back true. Agent content seen while this is true but
+   *  BEFORE any user echo is held in `resumePreEchoBuffer` rather than emitted
+   *  directly — it can't be classified live-vs-replay until we know whether a
+   *  boundary echo follows. */
   private resumeLiveSegment = false;
   /** Trimmed text of the in-flight first-post-resume prompt, matched against the
    *  echoed `user_message_chunk` to locate the live-turn boundary. */
@@ -219,6 +222,17 @@ export class AgentRuntime {
   /** Accumulates echoed user-message text while suppressing so a boundary split
    *  across chunks still matches the sent prompt. */
   private resumeEchoBuffer = "";
+  /** True once ANY `user_message_chunk` has been seen during the suppressed first
+   *  prompt. Its arrival proves the stream is a replay preamble, so leading agent
+   *  content (held in `resumePreEchoBuffer`) is stale history to drop. If it stays
+   *  false through the whole prompt, no boundary ever came — the fail-safe: flush
+   *  the held content so a genuinely un-echoed live turn is never eaten. */
+  private resumeSawUserEcho = false;
+  /** Suppressible updates (agent text/thought/tool) seen while `resumeLiveSegment`
+   *  is still true but no `user_message_chunk` has arrived yet — i.e. leading
+   *  content whose live-vs-replay status is not yet decidable. Dropped once a
+   *  user echo confirms a replay; flushed if the prompt ends with no echo. */
+  private resumePreEchoBuffer: SessionUpdate[] = [];
 
   /**
    * Serializes session-update processing. The ACP SDK's read loop dispatches
@@ -548,6 +562,8 @@ export class AgentRuntime {
       if (!this.replayLoadedDuringLoad) {
         this.suppressResumeReplay = true;
         this.resumeLiveSegment = true; // no replayed user echo yet ⇒ treat as live
+        this.resumeSawUserEcho = false;
+        this.resumePreEchoBuffer = [];
         this.resumeEchoBuffer = "";
         // Match the echoed user message against the sent text. An
         // attachment-only prompt has no text to match — leave suppression armed
@@ -579,11 +595,20 @@ export class AgentRuntime {
         // current suppression state (the SerialQueue can lag the prompt RPC),
         // then tear the resume gate down so the NEXT turn is never suppressed.
         await this.sessionUpdates.idle().catch(() => {});
-        if (this.suppressResumeReplay && !this.resumeLiveSegment) {
-          // Armed, but the current-prompt echo never matched a user_message
-          // boundary. `resumeLiveSegment` defaulting true means no live agent
-          // text was lost unless a replayed user echo flipped it false with no
-          // matching echo after — surface that rather than fail silently.
+        // Fail-safe: a resumed first prompt that NEVER echoed a user message is
+        // not a replay preamble at all — it's a fully-live turn whose leading
+        // agent content we optimistically held. No boundary means no history to
+        // drop, so flush the held content in arrival order rather than eat it.
+        if (!this.resumeSawUserEcho && this.resumePreEchoBuffer.length > 0) {
+          const held = this.resumePreEchoBuffer;
+          this.resumePreEchoBuffer = [];
+          for (const u of held) {
+            await this.dispatchSessionUpdate(u).catch(() => {});
+          }
+        } else if (this.suppressResumeReplay && !this.resumeLiveSegment) {
+          // Armed, saw a replayed user echo, but the current-prompt echo never
+          // matched a boundary. Any content after that failed echo was suppressed
+          // as replay — surface it rather than fail silently.
           this.logger.warn(
             {},
             "resume-replay: current-prompt echo never matched; suppression released"
@@ -591,6 +616,8 @@ export class AgentRuntime {
         }
         this.suppressResumeReplay = false;
         this.resumeLiveSegment = false;
+        this.resumeSawUserEcho = false;
+        this.resumePreEchoBuffer = [];
         this.resumeEchoBuffer = "";
         this.resumePromptText = undefined;
       }
@@ -765,15 +792,26 @@ export class AgentRuntime {
 
   /** True when the accumulated echoed user text matches the in-flight prompt —
    *  i.e. the replay stream has reached the current turn's boundary and what
-   *  follows is the live response. Lenient by trim + suffix so a boundary split
-   *  across chunks (or with leading replayed text concatenated) still matches;
-   *  the sent text is distinct enough from prior messages that this won't
-   *  false-match earlier turns. */
+   *  follows is the live response.
+   *
+   *  Robust to the ways a wrapper mangles the echo (#64): whitespace is
+   *  normalized before comparing, so a reformatted (re-wrapped, newline-collapsed)
+   *  multi-line prompt still matches; and beyond exact/suffix matching we accept a
+   *  stable PREFIX of the prompt appearing in the echo. The prefix path is what
+   *  survives a `watchFeedback` handoff, whose sent prompt has a standing
+   *  instruction appended (`applyWatchFeedback`) that the wrapper may echo back
+   *  reworded — a differing TAIL must not defeat the boundary. The prefix is long
+   *  enough (`RESUME_ECHO_MIN_PREFIX`) to stay distinctive from prior turns. */
   private resumeEchoMatchesPrompt(): boolean {
-    const want = this.resumePromptText;
+    const want = normalizeEcho(this.resumePromptText ?? "");
     if (!want) return false;
-    const got = this.resumeEchoBuffer.trim();
-    return got.length > 0 && (got === want || got.endsWith(want));
+    const got = normalizeEcho(this.resumeEchoBuffer);
+    if (!got) return false;
+    if (got === want || got.endsWith(want)) return true;
+    // Fall back to a stable leading prefix so an appended/reworded tail (or any
+    // divergence past the prompt's opening) doesn't defeat the boundary.
+    const prefix = want.slice(0, Math.min(want.length, RESUME_ECHO_PREFIX_LEN));
+    return prefix.length >= RESUME_ECHO_MIN_PREFIX && got.includes(prefix);
   }
 
   private makeClient(): Client {
@@ -819,21 +857,46 @@ export class AgentRuntime {
       }
     } else if (this.suppressResumeReplay) {
       if (update.sessionUpdate === "user_message_chunk") {
-        // A user-message boundary in the replay stream. The current prompt
-        // echoed back marks the START of the live turn; a prior (replayed) user
-        // message marks more history to drop. Re-evaluate which segment we're
-        // in on every boundary; never emit the echo itself.
+        // A user-message boundary in the replay stream. Its very arrival proves
+        // this prompt IS a replay preamble, so any leading agent content we held
+        // (before knowing that) is stale history — drop it, never emit. The
+        // current prompt echoed back marks the START of the live turn; a prior
+        // (replayed) user message marks more history to drop. Re-evaluate which
+        // segment we're in on every boundary; never emit the echo itself.
+        this.resumeSawUserEcho = true;
+        this.resumePreEchoBuffer = [];
         this.resumeEchoBuffer += textFromContent(update.content) ?? "";
         this.resumeLiveSegment = this.resumeEchoMatchesPrompt();
         return;
       }
-      if (REPLAY_SUPPRESSIBLE.has(update.sessionUpdate) && !this.resumeLiveSegment) {
-        return; // replayed agent text / thought / tool call before the boundary
+      if (REPLAY_SUPPRESSIBLE.has(update.sessionUpdate)) {
+        if (this.resumeLiveSegment) {
+          if (!this.resumeSawUserEcho) {
+            // Leading agent content on a resumed first prompt, before any user
+            // echo: not yet decidable as live or replay. Hold it — if a boundary
+            // echo follows it is replay (dropped above); if the prompt ends with
+            // no echo it is a genuinely un-echoed live turn (flushed on teardown).
+            this.resumePreEchoBuffer.push(update);
+            return;
+          }
+          // Post-boundary live content — fall through to dispatch.
+        } else {
+          return; // replayed agent text / thought / tool call before the boundary
+        }
       }
       // Live suppressible content (post-boundary) falls through to the switch;
       // usage/model/mode always fall through.
     }
 
+    await this.dispatchSessionUpdate(update);
+  }
+
+  /** Route a session update to its downstream event(s). Split out from the
+   *  resume-replay gate in `handleSessionUpdateInner` so buffered pre-echo
+   *  content can be replayed through the SAME path on the fail-safe flush (a
+   *  resumed first prompt that never echoes must still emit — see the flush in
+   *  `prompt()`'s teardown). */
+  private async dispatchSessionUpdate(update: SessionUpdate): Promise<void> {
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
         await this.handleContentBlock(update.content, "message", {
@@ -1069,6 +1132,23 @@ const REPLAY_SUPPRESSIBLE: ReadonlySet<string> = new Set([
   "tool_call",
   "tool_call_update",
 ]);
+
+/** Longest leading slice of the prompt compared against the echo in the prefix
+ *  fallback of `resumeEchoMatchesPrompt`. Comfortably longer than any appended
+ *  boilerplate's prefix reach, so the compared span stays within the operator's
+ *  own prompt text. */
+const RESUME_ECHO_PREFIX_LEN = 200;
+/** Minimum prefix length for the prefix fallback to fire. Short prompts fall back
+ *  to exact/suffix matching (already whitespace-normalized); the loose prefix
+ *  match only engages once there's enough text to be distinctive from prior
+ *  replayed turns, avoiding false boundaries. */
+const RESUME_ECHO_MIN_PREFIX = 40;
+
+/** Collapse all whitespace runs to single spaces and trim, so a prompt echoed
+ *  back re-wrapped / newline-collapsed still compares equal to what was sent. */
+function normalizeEcho(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
 
 function textFromContent(content: unknown): string | undefined {
   if (!content || typeof content !== "object") return undefined;

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { AgentRuntime, type AgentEvent } from "../src/agents/agent-runtime.js";
 import type { AgentProfile } from "../src/agents/agent-profile.js";
 import { logger } from "../src/lib/logger.js";
+import { WATCH_FEEDBACK_INSTRUCTION, applyWatchFeedback } from "../src/core/dispatch/types.js";
 
 /**
  * Drives AgentRuntime against a fake ACP connection to prove the resume-replay
@@ -163,6 +164,66 @@ describe("AgentRuntime resume-replay suppression", () => {
     h.conn.promptUpdates = [agentChunk("The live answer, "), agentChunk("emitted normally.")];
     await h.rt.prompt(PROMPT);
     expect(h.agentText()).toEqual(["The live answer, ", "emitted normally."]);
+  });
+
+  it("cold resume: replayed agent content BEFORE the first user echo is suppressed (no bloat)", async () => {
+    // #64 failure mode (b): the replay preamble LEADS with prior agent output
+    // (no user_message_chunk ahead of it). With `resumeLiveSegment` starting
+    // true, that stale history streamed through and bloated the turn. It must be
+    // treated as replay and dropped once the boundary confirms this is a replay.
+    await h.rt.loadSession({ sessionId: "s6", cwd: "/tmp" });
+    h.conn.promptUpdates = [
+      // Stale prior-turn history with NO leading user echo.
+      agentChunk("STALE: old build report from feat/inject-turn."),
+      agentChunk(" (2k chars of prior demos)"),
+      userChunk("a prior user question"),
+      agentChunk("a prior answer"),
+      userChunk(PROMPT), // boundary: current prompt echoed
+      agentChunk("The live answer."),
+    ];
+    await h.rt.prompt(PROMPT);
+    expect(h.agentText()).toEqual(["The live answer."]);
+    expect(h.agentText().join("")).not.toContain("STALE");
+    expect(h.agentText().join("")).not.toContain("prior answer");
+  });
+
+  it("cold watchFeedback resume: reformatted + appended echo still bounds the live turn", async () => {
+    // #64 core failure: a long, multi-line watchFeedback prompt (spec.prompt with
+    // the standing poll_inbox instruction appended) whose echo comes back NOT
+    // byte-identical — newlines collapsed and the appended tail reworded. The
+    // old byte-exact `endsWith` boundary never matched, so (combined with leading
+    // replayed agent content) stale history leaked AND the live turn was eaten.
+    const specPrompt = [
+      "Refactor dispatchInjectTurn so the watchFeedback instruction is appended",
+      "after the preset-identity block, and add a regression test proving the",
+      "resume-replay suppression holds on a cold handoff to a stale thread.",
+    ].join("\n");
+    // Exactly what dispatchInjectTurn composes and sends to prompt().
+    const sent = applyWatchFeedback(specPrompt, true);
+    // The wrapper echoes it reformatted: whitespace collapsed to single spaces
+    // and the appended instruction reworded ("poll_inbox" -> "the poll_inbox tool").
+    const reformattedEcho = sent
+      .replace(/\s+/g, " ")
+      .replace("poll_inbox", "the poll_inbox tool");
+
+    await h.rt.loadSession({ sessionId: "s7", cwd: "/tmp" });
+    h.conn.promptUpdates = [
+      // Leading stale agent history (feature (b)).
+      agentChunk("STALE: 2k of feat/presets-salvage build report dumped ahead."),
+      // A prior watchFeedback turn — its echo ALSO ends with the standing
+      // instruction, but it is NOT the current prompt and must not false-match.
+      userChunk(applyWatchFeedback("an earlier, unrelated handoff prompt", true)),
+      agentChunk("stale answer to the earlier handoff"),
+      // Current prompt echoed back, reformatted/appended-differently (feature (a)).
+      userChunk(reformattedEcho),
+      agentChunk("Live: refactor done, regression test added."),
+    ];
+    await h.rt.prompt(sent);
+    expect(h.agentText()).toEqual(["Live: refactor done, regression test added."]);
+    expect(h.agentText().join("")).not.toContain("STALE");
+    expect(h.agentText().join("")).not.toContain("earlier handoff");
+    // Sanity: the appended instruction really is part of the sent prompt.
+    expect(sent.endsWith(WATCH_FEEDBACK_INSTRUCTION)).toBe(true);
   });
 
   it("boundary matches even when the echo is split across chunks", async () => {

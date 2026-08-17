@@ -9,7 +9,11 @@
  * panel. For a real work turn, that live health read is vital, so this class
  * brings it back — reusing the EXACT same {@link TurnStatus} model and
  * {@link renderStatusPanel} renderer, driven from `injectTurn`'s per-event
- * stream.
+ * stream. It ships the result as a REAL {@link StructuredPanel} embed card
+ * through the caller's IO (which wires `sendPanel`/`editPanel`, falling back to
+ * `sendMessage`/`editMessage` only when the adapter lacks the embed methods) —
+ * so a dispatched panel is visually identical to a normal turn's and can never
+ * hit the plain-content 2000-char limit (DiscordAPIError 50035) on a busy turn.
  *
  * It owns exactly the two defences the user-turn panel relies on, so a burst of
  * agent events can never turn into an editMessage storm or a reordered render:
@@ -26,17 +30,20 @@
  */
 import type { AgentEvent } from "../agents/agent-runtime.js";
 import type { Renderer } from "../platforms/renderer.js";
-import { serializePanelText } from "../platforms/renderer.js";
 import { SerialQueue } from "./serial-queue.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage } from "./status-panel.js";
-import type { TurnState } from "./types.js";
+import type { StructuredPanel, TurnState } from "./types.js";
 
-/** Platform I/O for the panel message. `post` sends the initial panel and
- *  returns an opaque ref (or undefined on failure — the panel then goes inert,
- *  since it is purely additive visibility). `edit` replaces the panel body. */
+/** Platform I/O for the panel message. `post` sends the initial panel as a
+ *  REAL embed card (the same {@link StructuredPanel} the user-turn path renders)
+ *  and returns an opaque ref (or undefined on failure — the panel then goes
+ *  inert, since it is purely additive visibility). `edit` replaces the panel
+ *  card. The IO owns the `sendPanel`/`editPanel` → `sendMessage`/`editMessage`
+ *  fallback, exactly mirroring `handleIncomingMessageInner`, so this controller
+ *  never touches plain message content and can't hit the 2000-char limit. */
 export interface DispatchStatusPanelIO<TRef> {
-  post: (text: string) => Promise<TRef | undefined>;
-  edit: (ref: TRef, text: string) => Promise<void>;
+  post: (panel: StructuredPanel) => Promise<TRef | undefined>;
+  edit: (ref: TRef, panel: StructuredPanel) => Promise<void>;
 }
 
 export interface DispatchStatusPanelOptions {
@@ -93,11 +100,11 @@ export class DispatchStatusPanel<TRef = unknown> {
   async start(): Promise<boolean> {
     if (this.started) return this.isLive;
     this.started = true;
-    const text = this.renderText();
-    this.lastRendered = text;
+    const panel = this.renderPanel();
+    this.lastRendered = JSON.stringify(panel);
     this.renders += 1;
     try {
-      this.ref = await this.io.post(text);
+      this.ref = await this.io.post(panel);
     } catch {
       this.ref = undefined;
     }
@@ -198,11 +205,11 @@ export class DispatchStatusPanel<TRef = unknown> {
     await this.queue.idle();
   }
 
-  /** Serialize the current turn state to the panel's plain-text form. */
-  private renderText(): string {
-    return serializePanelText(
-      renderStatusPanel(this.renderer, this.status.toInput(), Date.now())
-    );
+  /** Render the current turn state to the SAME {@link StructuredPanel} embed
+   *  card the user-turn path builds (`renderStatusPanel`). The IO decides how to
+   *  ship it (real `sendPanel`/`editPanel` card, with a plain-text fallback). */
+  private renderPanel(): StructuredPanel {
+    return renderStatusPanel(this.renderer, this.status.toInput(), Date.now());
   }
 
   /** Throttled refresh: edit now if the debounce window has elapsed, else
@@ -230,15 +237,18 @@ export class DispatchStatusPanel<TRef = unknown> {
   }
 
   /** Render + enqueue one serialized edit. Skips a redundant edit when the
-   *  rendered text is byte-identical to the last one (unless forced/terminal). */
+   *  rendered panel is byte-identical to the last one (unless forced/terminal).
+   *  The dedupe fingerprint is `JSON.stringify(panel)` — the exact same
+   *  structural fingerprint the user-turn `refresh` uses. */
   private enqueueRender(done: boolean, force = false): Promise<void> {
     this.lastEditAt = Date.now();
-    const text = this.renderText();
-    if (!force && text === this.lastRendered) return Promise.resolve();
-    this.lastRendered = text;
+    const panel = this.renderPanel();
+    const fingerprint = JSON.stringify(panel);
+    if (!force && fingerprint === this.lastRendered) return Promise.resolve();
+    this.lastRendered = fingerprint;
     this.renders += 1;
     const ref = this.ref;
     if (ref === undefined) return Promise.resolve();
-    return this.queue.run(() => this.io.edit(ref, text));
+    return this.queue.run(() => this.io.edit(ref, panel));
   }
 }

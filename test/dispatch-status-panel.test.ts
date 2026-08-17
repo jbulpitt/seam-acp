@@ -7,6 +7,7 @@ import { Orchestrator } from "../src/platforms/discord/orchestrator.js";
 import { DispatchStatusPanel } from "../src/core/dispatch-status-panel.js";
 import { TurnStatus, formatContextUsage } from "../src/core/status-panel.js";
 import { discordRenderer } from "../src/platforms/discord/renderer.js";
+import { serializePanelText } from "../src/platforms/renderer.js";
 import type { DispatchSpec } from "../src/core/dispatch/types.js";
 import type { Logger } from "../src/lib/logger.js";
 import type { SessionRecord, StructuredPanel } from "../src/core/types.js";
@@ -20,19 +21,21 @@ const silent = pino({ level: "silent" }) as unknown as Logger;
 // ---------------------------------------------------------------------------
 
 function makeUnitPanel(titlePrefix = "📨 Handoff") {
-  const edits: string[] = [];
-  let posted: string | undefined;
+  // The controller now ships REAL StructuredPanel embed cards (never plain text),
+  // exactly like the user-turn path — so the IO receives panel objects.
+  const edits: StructuredPanel[] = [];
+  let posted: StructuredPanel | undefined;
   const status = new TurnStatus({ model: "opus", repoDisplay: "repo", titlePrefix });
   const panel = new DispatchStatusPanel<MessageRef>(
     discordRenderer,
     status,
     {
-      post: async (text) => {
-        posted = text;
+      post: async (p) => {
+        posted = p;
         return { channel: { platform: "discord", id: "t" }, id: "m1" };
       },
-      edit: async (_ref, text) => {
-        edits.push(text);
+      edit: async (_ref, p) => {
+        edits.push(p);
       },
     },
     // Debounce 0 → every refresh edits immediately; huge heartbeat so it never
@@ -79,12 +82,12 @@ describe("DispatchStatusPanel: drives TurnStatus from onEvent", () => {
   it("posts a panel titled with the dispatch type and finalizes to Done", async () => {
     const { panel, getPosted, edits } = makeUnitPanel("⏰ Wake");
     await panel.start();
-    // Initial post carries the dispatch type in the title.
-    expect(getPosted()).toContain("⏰ Wake");
+    // Initial post carries the dispatch type in the embed title.
+    expect(getPosted()?.title).toContain("⏰ Wake");
     await panel.finalize("Done", "Completed");
     const last = edits[edits.length - 1]!;
-    expect(last).toContain("⏰ Wake");
-    expect(last).toContain("Done"); // title is "⏰ Wake · Done"
+    expect(last.title).toContain("⏰ Wake");
+    expect(last.title).toContain("Done"); // title is "⏰ Wake · Done"
   });
 
   it("is inert when the initial post fails (best-effort, never throws)", async () => {
@@ -263,9 +266,14 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
 
     const res = await orch.dispatchInjectTurn(baseSpec());
 
-    // The status panel was posted as the FIRST message, titled with the type.
-    const panelPost = calls.sendMessage[0]!;
-    expect(panelPost.text).toContain("📨 Handoff");
+    // The status panel is a REAL embed card via sendPanel (the SAME path a normal
+    // turn uses), titled with the dispatch type — NOT a plain-text message.
+    expect(calls.sendPanel.length).toBe(1);
+    const panelPost = calls.sendPanel[0]!;
+    expect(panelPost.panel.title).toContain("📨 Handoff");
+    // The panel never went out as message content (that path hits the 2000-char
+    // 50035 limit); the type marker appears in NO plain sendMessage.
+    expect(calls.sendMessage.some((m) => m.text.includes("Handoff"))).toBe(false);
     // No ▶ line AND no "_starting…_" placeholder — with the flush renderer the
     // OUTPUT posts as fresh real messages, so nothing is pre-posted to stream into.
     expect(calls.sendMessage.every((m) => !m.text.startsWith("_▶"))).toBe(true);
@@ -273,22 +281,24 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
 
     // The plain answer is a fresh REAL message (parity with a normal turn), NOT an
     // edit of the panel — and carries no ▶/type header (the panel owns the type).
-    const bodyMsgs = calls.sendMessage.slice(1).filter((m) => m.text === "Hello world");
+    const bodyMsgs = calls.sendMessage.filter((m) => m.text === "Hello world");
     expect(bodyMsgs.length).toBe(1);
     expect(bodyMsgs[0]!.text).not.toContain("Handoff");
     // The body's own message was never edited (it was posted whole, not tail-capped).
     const bodyRefId = bodyMsgs[0]!.ref.id;
     expect(calls.editMessage.filter((e) => e.ref.id === bodyRefId).length).toBe(0);
 
+    // The panel is updated via editPanel (embed edits), NEVER editMessage.
+    expect(calls.editMessage.length).toBe(0);
     // The panel's terminal edit shows Done + the accumulated health: thinking,
     // the context-window line, and the resolved model.
-    const panelRefId = panelPost.ref.id;
-    const panelEdits = calls.editMessage.filter((e) => e.ref.id === panelRefId);
-    const finalPanel = panelEdits[panelEdits.length - 1]!.text;
-    expect(finalPanel).toContain("📨 Handoff · Done");
-    expect(finalPanel).toContain("planning the edit"); // thinking
-    expect(finalPanel).toContain(formatContextUsage(50_000, 200_000)); // context health
-    expect(finalPanel).toContain("claude-opus-4-8"); // model
+    expect(calls.editPanel.length).toBeGreaterThan(0);
+    const finalPanel = calls.editPanel[calls.editPanel.length - 1]!.panel;
+    expect(finalPanel.title).toContain("📨 Handoff · Done");
+    const finalText = serializePanelText(finalPanel);
+    expect(finalText).toContain("planning the edit"); // thinking
+    expect(finalText).toContain(formatContextUsage(50_000, 200_000)); // context health
+    expect(finalText).toContain("claude-opus-4-8"); // model
 
     // Lossless capture unaffected.
     expect(res.output).toBe("Hello world");
@@ -304,7 +314,7 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
       const { adapter, calls } = spyAdapter();
       const orch = makeOrch({ dataDir, rt, adapter });
       await orch.dispatchInjectTurn(baseSpec({ kind }));
-      expect(calls.sendMessage[0]!.text).toContain(marker);
+      expect(calls.sendPanel[0]!.panel.title).toContain(marker);
     }
   });
 
@@ -315,9 +325,10 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
 
     const res = await orch.dispatchInjectTurn(baseSpec({ stream: false }));
 
-    // First message is the panel; there is NO "_starting…_" placeholder and NO
-    // ▶ line — the body is posted below the panel by the quiet capture path.
-    expect(calls.sendMessage[0]!.text).toContain("📨 Handoff");
+    // The panel is a real embed card via sendPanel; there is NO "_starting…_"
+    // placeholder and NO ▶ line — the body is posted below the panel by the
+    // quiet capture path.
+    expect(calls.sendPanel[0]!.panel.title).toContain("📨 Handoff");
     expect(calls.sendMessage.some((m) => m.text === "_starting…_")).toBe(false);
     expect(calls.sendMessage.every((m) => !m.text.startsWith("_▶"))).toBe(true);
     expect(calls.sendMessage.some((m) => m.text === "Hello world")).toBe(true);
@@ -329,7 +340,7 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     const { adapter, calls } = spyAdapter();
     const orch = makeOrch({ dataDir, rt, adapter });
     await orch.dispatchInjectTurn(baseSpec({ kind: "forward", chainId: "chain-1" }));
-    expect(calls.sendMessage[0]!.text).toContain("🔗 Chain");
+    expect(calls.sendPanel[0]!.panel.title).toContain("🔗 Chain");
   });
 
   it("finalizes the panel to Timed out when the turn times out", async () => {
@@ -340,10 +351,70 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
 
     await orch.dispatchInjectTurn(baseSpec()).catch(() => {}); // times out ⇒ throws
 
-    const panelRefId = calls.sendMessage[0]!.ref.id;
-    const panelEdits = calls.editMessage.filter((e) => e.ref.id === panelRefId);
-    const finalPanel = panelEdits[panelEdits.length - 1]!.text;
-    expect(finalPanel).toContain("📨 Handoff · Timed out");
+    // The panel finalized to "Timed out" via an editPanel embed edit.
+    const finalPanel = calls.editPanel[calls.editPanel.length - 1]!.panel;
+    expect(finalPanel.title).toContain("📨 Handoff · Timed out");
+  });
+});
+
+describe("dispatchInjectTurn: status panel renders as a REAL embed card", () => {
+  it("uses sendPanel/editPanel (never editMessage) and survives a busy turn without a 50035-class content overflow", async () => {
+    // A genuinely busy turn: 25 tool events (activity log) + 5 long thinking
+    // lines. Serialized to plain message CONTENT this blows past Discord's
+    // 2000-char limit (DiscordAPIError 50035) — the exact regression. Rendered
+    // as an embed it can't: embeds carry no content limit.
+    const longThought = "x".repeat(300); // trimmed to 200 in the footer, ×5 lines
+    const events: unknown[] = [];
+    for (let i = 0; i < 25; i++) {
+      events.push({ kind: "tool-start", toolCallId: `t${i}`, title: `Read some/really/long/path/to/file-number-${i}.ts` });
+    }
+    for (let i = 0; i < 5; i++) {
+      events.push({ kind: "agent-thought", text: `${longThought}\n` });
+    }
+    events.push({ kind: "usage-update", used: 50_000, size: 200_000 });
+    const rt = fakeRuntime({ events, text: ["done"] });
+    const { adapter, calls } = spyAdapter();
+    const orch = makeOrch({ dataDir, rt, adapter });
+
+    await orch.dispatchInjectTurn(baseSpec());
+
+    // Delivered as a real embed card, edited as a real embed card.
+    expect(calls.sendPanel.length).toBe(1);
+    expect(calls.editPanel.length).toBeGreaterThan(0);
+    // The panel NEVER went through plain message content — no editMessage on it,
+    // and no sendMessage carrying the panel title. This is what kills the 50035.
+    expect(calls.editMessage.length).toBe(0);
+    expect(calls.sendMessage.some((m) => m.text.includes("Handoff"))).toBe(false);
+
+    // Proof the OLD plain-content path WOULD have overflowed: the equivalent
+    // serialized text exceeds Discord's 2000-char content ceiling.
+    const finalPanel = calls.editPanel[calls.editPanel.length - 1]!.panel;
+    expect(serializePanelText(finalPanel).length).toBeGreaterThan(2000);
+    // …yet no plain message we posted came anywhere near that ceiling.
+    for (const m of calls.sendMessage) expect(m.text.length).toBeLessThanOrEqual(2000);
+  });
+
+  it("falls back to sendMessage/editMessage(serializePanelText) only when the adapter lacks sendPanel/editPanel", async () => {
+    const rt = fakeRuntime({
+      events: [{ kind: "agent-thought", text: "planning\n" }],
+      text: ["Hello world"],
+    });
+    const { adapter, calls } = spyAdapter();
+    // Strip the embed capability so the controller must fall back — exactly what
+    // handleIncomingMessageInner does for a legacy adapter.
+    const fallbackAdapter = { ...adapter } as Record<string, unknown>;
+    delete fallbackAdapter.sendPanel;
+    delete fallbackAdapter.editPanel;
+    const orch = makeOrch({ dataDir, rt, adapter: fallbackAdapter as any });
+
+    await orch.dispatchInjectTurn(baseSpec());
+
+    // No embed calls were even possible — the panel posted as serialized text.
+    expect(calls.sendPanel.length).toBe(0);
+    expect(calls.editPanel.length).toBe(0);
+    expect(calls.sendMessage[0]!.text).toContain("📨 Handoff");
+    // The title line is the serialized panel form (**bold** header).
+    expect(calls.sendMessage[0]!.text).toContain("**📨 Handoff");
   });
 });
 

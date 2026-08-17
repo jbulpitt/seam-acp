@@ -3867,17 +3867,29 @@ export class Orchestrator {
       this.renderer,
       status,
       {
-        post: async (text) => {
+        // Ship the panel as a REAL embed card via sendPanel/editPanel — the
+        // exact path handleIncomingMessageInner uses for a normal turn — so the
+        // dispatched panel is visually identical and never touches plain message
+        // content (embeds have no 2000-char limit, killing the 50035 error).
+        // Fall back to sendMessage/editMessage(serializePanelText) ONLY when the
+        // adapter lacks sendPanel/editPanel, mirroring the normal path.
+        post: async (panel) => {
           try {
-            return await this.adapter.sendMessage(target, text);
+            return this.adapter.sendPanel
+              ? await this.adapter.sendPanel(target, panel)
+              : await this.adapter.sendMessage(target, serializePanelText(panel));
           } catch (err) {
             this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel post failed");
             return undefined;
           }
         },
-        edit: async (ref, text) => {
+        edit: async (ref, panel) => {
           try {
-            await this.adapter.editMessage(ref, text);
+            if (this.adapter.editPanel) {
+              await this.adapter.editPanel(ref, panel);
+            } else {
+              await this.adapter.editMessage(ref, serializePanelText(panel));
+            }
           } catch (err) {
             this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel edit failed");
           }

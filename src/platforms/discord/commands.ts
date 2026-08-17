@@ -89,7 +89,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
   cmd.addSubcommand((sub) =>
     sub
       .setName("steer")
-      .setDescription("Redirect a node mid-task: cancel its running turn and inject a new instruction (history kept)")
+      .setDescription("Steer a node mid-task: queue a note to its inbox, or now:true to cancel-and-reprompt (history kept)")
       .addStringOption((o) =>
         o
           .setName("thread")
@@ -101,6 +101,15 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("prompt")
           .setDescription("The steering instruction to inject now")
           .setRequired(true)
+      )
+      // #63: options are free (they don't count toward the 25 top-level cap), so
+      // the two tiers live on this one command. Default false = cooperative inbox
+      // push (#61); true = preemptive cancel-and-reprompt (the original behavior).
+      .addBooleanOption((o) =>
+        o
+          .setName("now")
+          .setDescription("Preemptive: cancel the running turn and reprompt now (default: queue to inbox, no cancel)")
+          .setRequired(false)
       )
   );
 

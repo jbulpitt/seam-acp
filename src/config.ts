@@ -349,6 +349,20 @@ const Schema = z.object({
     .transform((v) => v === "true"),
 
   /**
+   * Mid-turn reply routing (#63). Decides what a bare Discord message typed while
+   * a turn is ALREADY active on that thread does:
+   *   - "abort" (default): force-abort the running turn and start a fresh one —
+   *     today's "the user is the priority interrupt" behavior. Chosen as the
+   *     default so this ships DARK: no behavior change until an operator flips it.
+   *   - "inbox": route the message into that session's durable inbox (#61)
+   *     COOPERATIVELY — the running agent reads it at its next `poll_inbox`, no
+   *     cancel, no second turn. This is the June plan's default (option (a) in
+   *     #63); gated so it can be proven behind the flag before becoming default.
+   * The explicit `/seam steer … now:true` preemptive path is independent of this.
+   */
+  SEAM_MIDTURN_REPLY_MODE: z.enum(["abort", "inbox"]).default("abort"),
+
+  /**
    * Optional override map of Discord user id → display name, e.g.
    * "1487094572696867019:Jesse,1534937951044112505:Allie". Takes precedence over
    * the Discord nickname/global-name/username, both to guarantee a clean label

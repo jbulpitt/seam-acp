@@ -388,10 +388,10 @@ const Schema = z.object({
   /** Path to the `grok` binary. Defaults to `grok` on PATH. */
   GROK_CLI_PATH: z.string().optional(),
   /** Default model id for the Grok profile (e.g. "grok-build-0.1"). */
-  GROK_DEFAULT_MODEL: z.string().default("grok-build-0.1"),
+  GROK_DEFAULT_MODEL: z.string().default("grok-4.6"),
   GROK_MODELS: ModelsListSchema,
   /** Model used for /compact on Grok sessions. */
-  GROK_COMPACTION_MODEL: z.string().default("grok-build-0.1"),
+  GROK_COMPACTION_MODEL: z.string().default("grok-4.5"),
   /** xAI API key.  When set, enables dynamic model discovery at startup via
    *  GET https://api.x.ai/v1/models and is passed to the grok CLI process. */
   GROK_API_KEY: z.string().optional(),
@@ -840,12 +840,8 @@ export const CODEX_STATIC_MODELS = [
 /** Models for xAI Grok Build.  Context windows from docs.x.ai/developers/models.
  *  GROK_MODELS env var overrides this list when set. */
 export const GROK_STATIC_MODELS = [
-  { modelId: "grok-build-0.1",                 name: "Grok Build 0.1",             contextLimit: 256_000 },
+  { modelId: "grok-4.6",                       name: "Grok 4.6",                   contextLimit: 500_000 },
   { modelId: "grok-4.5",                       name: "Grok 4.5",                   contextLimit: 500_000 },
-  { modelId: "grok-4.3",                       name: "Grok 4.3",                   contextLimit: 1_000_000 },
-  { modelId: "grok-4.20-0309-reasoning",       name: "Grok 4.20 Reasoning",        contextLimit: 1_000_000 },
-  { modelId: "grok-4.20-0309-non-reasoning",   name: "Grok 4.20 Non-Reasoning",    contextLimit: 1_000_000 },
-  { modelId: "grok-4.20-multi-agent-0309",     name: "Grok 4.20 Multi-Agent",      contextLimit: 1_000_000 },
 ];
 
 /** Models for Z.ai (Zhipu).  ZAI_MODELS env var overrides this list when set. */

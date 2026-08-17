@@ -12,12 +12,8 @@ import type { ContextUsage, ISessionManager, SessionSummary } from "../session-m
  * doesn't include context-window fields.
  */
 const KNOWN_CONTEXT_WINDOWS: Record<string, number> = {
-  "grok-build-0.1":                     256_000,
+  "grok-4.6":                           500_000,
   "grok-4.5":                           500_000,
-  "grok-4.3":                         1_000_000,
-  "grok-4.20-0309-reasoning":         1_000_000,
-  "grok-4.20-0309-non-reasoning":     1_000_000,
-  "grok-4.20-multi-agent-0309":       1_000_000,
 };
 
 /** Friendly display label: strip date suffixes and capitalize. */
@@ -158,7 +154,7 @@ export function makeGrokProfile(opts: {
     // expose it through the spawn-args effort mechanism.
     effort: opts.effort ?? {
       mechanism: "none",
-      levels: ["low", "medium", "high"],
+      levels: ["low", "medium", "high", "xhigh"],
     },
     spawn(modelOverride?: string, effortOverride?: string) {
       const env: NodeJS.ProcessEnv = { ...process.env };

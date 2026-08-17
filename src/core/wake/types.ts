@@ -37,6 +37,11 @@ export interface WakeEvent {
   chainDepth: number;
   /** Missed-fire catch-up window in seconds (D10). 0 = never catch up. */
   catchupSeconds: number;
+  /** Fire on the next process boot instead of at a wall-clock time. When true
+   *  the wake is EXCLUDED from the time sweep (`fireAtUtc` is nominal) and fires
+   *  once during `WakeManager.start()`, then is deleted like any other wake
+   *  (D1 — one-shot; there is no fire-on-every-boot mode). */
+  fireOnStartup: boolean;
   createdUtc: string;
 }
 
@@ -47,6 +52,9 @@ export interface WakeScheduleRequest {
   delaySeconds: number;
   reason: string;
   prompt: string;
+  /** When true, arm a boot-triggered wake instead of a timed one: `delaySeconds`
+   *  is ignored and the wake fires on the next process start (D1 one-shot). */
+  fireOnStartup?: boolean;
 }
 
 // --- loop-safety backstops (D8 / D14) --------------------------------------

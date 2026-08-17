@@ -126,6 +126,42 @@ describe("Orchestrator.scheduleWake guards (#59)", () => {
     expect(store.getWake(res.wakeId)).toBeNull();
   });
 
+  // --- boot-triggered wakes (#59 extension) ---------------------------------
+
+  it("onStartup=true persists fire_on_startup and ignores delaySeconds", () => {
+    // delaySeconds far below the floor would normally reject; onStartup skips it.
+    const res = orch.scheduleWake(record(), {
+      delaySeconds: 1,
+      reason: "resume after restart",
+      prompt: "p",
+      fireOnStartup: true,
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    const row = store.getWake(res.wakeId)!;
+    expect(row.fireOnStartup).toBe(true);
+    // It's excluded from the time sweep no matter what the clock says.
+    expect(store.listDueWakes(new Date(Date.now() + 3600_000).toISOString())).toHaveLength(0);
+    expect(store.listStartupWakes().map((w) => w.id)).toEqual([res.wakeId]);
+  });
+
+  it("onStartup wakes still count toward the per-thread pending cap (D8)", () => {
+    for (let n = 0; n < WAKE_MAX_PENDING_PER_THREAD; n++) {
+      expect(
+        orch.scheduleWake(record(), { delaySeconds: 1, reason: "", prompt: "p", fireOnStartup: true }).ok
+      ).toBe(true);
+    }
+    const res = orch.scheduleWake(record(), { delaySeconds: 1, reason: "", prompt: "p", fireOnStartup: true });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.error).toMatch(/pending wakes/);
+  });
+
+  it("a normal (timed) wake is unaffected: bad delay still rejects", () => {
+    const res = orch.scheduleWake(record(), { delaySeconds: 1, reason: "", prompt: "p" });
+    expect(res.ok).toBe(false);
+  });
+
   it("listWakes returns pending wakes for the thread", () => {
     orch.scheduleWake(record(), { delaySeconds: 1200, reason: "a", prompt: "p" });
     orch.scheduleWake(record(), { delaySeconds: 2400, reason: "b", prompt: "p" });

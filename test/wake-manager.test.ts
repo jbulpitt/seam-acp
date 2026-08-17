@@ -24,6 +24,7 @@ function makeWake(over: Partial<WakeEvent> = {}): WakeEvent {
     correlationId: null,
     chainDepth: 0,
     catchupSeconds: 900,
+    fireOnStartup: false,
     createdUtc: new Date(now).toISOString(),
     ...over,
   };
@@ -37,8 +38,13 @@ function makeStore(initial: WakeEvent[]) {
   const store = {
     listDueWakes: (nowIso: string) =>
       [...rows.values()]
-        .filter((w) => w.fireAtUtc <= nowIso)
+        // Mirror the store: the time sweep excludes boot-triggered wakes.
+        .filter((w) => w.fireAtUtc <= nowIso && !w.fireOnStartup)
         .sort((a, b) => a.fireAtUtc.localeCompare(b.fireAtUtc)),
+    listStartupWakes: () =>
+      [...rows.values()]
+        .filter((w) => w.fireOnStartup)
+        .sort((a, b) => a.createdUtc.localeCompare(b.createdUtc)),
     deleteWake: (id: string) => {
       deletes.push(id);
       rows.delete(id);
@@ -106,6 +112,57 @@ describe("WakeManager sweeper (#59)", () => {
     const m = new WakeManager({ store, onFire, logger: silentLogger });
     await m.sweep();
     await m.sweep();
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("fireStartupWakes fires a boot-triggered wake, deleting it BEFORE onFire (D1)", async () => {
+    const wake = makeWake({ fireOnStartup: true });
+    const { store, deletes, rows } = makeStore([wake]);
+    const order: string[] = [];
+    const onFire = vi.fn(async (w: WakeEvent) => {
+      // The row must already be gone when onFire runs — a crash during the
+      // woken turn must not re-fire it on the next reboot (no boot-loop).
+      order.push("fire");
+      expect(rows.has(w.id)).toBe(false);
+    });
+    const m = new WakeManager({ store, onFire, logger: silentLogger });
+    await m.fireStartupWakes();
+    expect(onFire).toHaveBeenCalledTimes(1);
+    expect(deletes).toEqual(["wake-1"]);
+    expect(order).toEqual(["fire"]);
+  });
+
+  it("a startup wake never fires twice across two boots (start passes)", async () => {
+    const wake = makeWake({ fireOnStartup: true });
+    const { store } = makeStore([wake]);
+    const onFire = vi.fn(async () => {});
+    const m = new WakeManager({ store, onFire, logger: silentLogger });
+    await m.fireStartupWakes(); // boot #1
+    await m.fireStartupWakes(); // boot #2 — row is already gone
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("the time sweep never picks up a boot-triggered wake, even when overdue", async () => {
+    // Overdue by default fireAtUtc (now - 1000ms) but fire_on_startup — the
+    // sweep must leave it for the boot pass, not fire or drop it.
+    const wake = makeWake({ fireOnStartup: true });
+    const { store, deletes } = makeStore([wake]);
+    const onFire = vi.fn(async () => {});
+    const m = new WakeManager({ store, onFire, logger: silentLogger });
+    await m.sweep();
+    expect(onFire).not.toHaveBeenCalled();
+    expect(deletes).toEqual([]);
+  });
+
+  it("start() fires boot-triggered wakes once, then stops the interval", async () => {
+    const wake = makeWake({ fireOnStartup: true });
+    const { store } = makeStore([wake]);
+    const onFire = vi.fn(async () => {});
+    const m = new WakeManager({ store, onFire, logger: silentLogger, sweepMs: 10_000 });
+    m.start();
+    // start() kicks the startup pass off non-blocking; let microtasks settle.
+    await vi.waitFor(() => expect(onFire).toHaveBeenCalledTimes(1));
+    m.stop();
     expect(onFire).toHaveBeenCalledTimes(1);
   });
 

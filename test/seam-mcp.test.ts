@@ -426,10 +426,31 @@ describe("SeamMcpServer", () => {
     expect(body.error).toBeUndefined();
     expect(body.result.isError).toBeFalsy();
     expect(h.scheduledWakes).toHaveLength(1);
-    expect(h.scheduledWakes[0]!.req).toEqual({ delaySeconds: 1200, reason: "check build", prompt: "resume" });
+    expect(h.scheduledWakes[0]!.req).toEqual({
+      delaySeconds: 1200,
+      reason: "check build",
+      prompt: "resume",
+      fireOnStartup: false,
+    });
     // The caller is the token-resolved session, never a caller-supplied thread.
     expect(h.scheduledWakes[0]!.record.channelRef).toBe("thread-caller");
     expect(body.result.content[0].text).toContain("wake-1");
+  });
+
+  it("schedule_wake threads onStartup=true through to the scheduleWake dep (#59)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "schedule_wake", arguments: { onStartup: true, prompt: "resume after restart" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBeFalsy();
+    expect(h.scheduledWakes).toHaveLength(1);
+    expect(h.scheduledWakes[0]!.req.fireOnStartup).toBe(true);
+    // delaySeconds is optional when onStartup is set — arrives as NaN, ignored.
+    expect(Number.isNaN(h.scheduledWakes[0]!.req.delaySeconds)).toBe(true);
+    expect(body.result.content[0].text).toContain("next process boot");
   });
 
   it("schedule_wake surfaces a guard rejection as an isError result (#59)", async () => {

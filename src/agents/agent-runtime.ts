@@ -176,6 +176,51 @@ export class AgentRuntime {
   private eventHandler?: AgentEventHandler;
 
   /**
+   * Resume-replay suppression state.
+   *
+   * When a thread's runtime is cold and `SessionRouter` resumes it via
+   * `loadSession`, the claude-agent-acp wrapper (spawned with
+   * `--replay-user-messages`) re-emits the ENTIRE prior conversation
+   * chronologically. Depending on the wrapper version that history arrives
+   * either DURING `loadSession` (observed: replay lands inside the load call,
+   * no prompt echo) or as a PREAMBLE to the first `prompt()`, terminated by the
+   * current prompt echoed back as a `user_message_chunk`. Either way, left
+   * ungated it streams downstream as `agent-text` and bloats the first
+   * post-resume turn with stale messages (a cold handoff captured 6.6k chars of
+   * old reports before the real answer; a warm one, 214).
+   *
+   * These fields gate that history out. They are ONLY armed on the cold-resume
+   * path, so warm turns (the overwhelming common case) are untouched: with
+   * `justResumed`/`suppressResumeReplay`/`loadReplayInProgress` all false the
+   * suppression block at the top of `handleSessionUpdateInner` is skipped
+   * entirely.
+   */
+  /** True from a successful `loadSession()` until the first following `prompt()`. */
+  private justResumed = false;
+  /** True only while the `conn.loadSession()` await runs — the window in which
+   *  some wrapper versions replay history at load time. */
+  private loadReplayInProgress = false;
+  /** Sticky within one resume: replayed content was seen DURING `loadSession`
+   *  (wrapper replays at load time), so the first `prompt()` is fully live and
+   *  must NOT be gated. */
+  private replayLoadedDuringLoad = false;
+  /** True while gating the resume-replay preamble of the first post-resume
+   *  prompt. Cleared once the live turn is reached / the prompt completes. */
+  private suppressResumeReplay = false;
+  /** Within a suppressed first prompt, whether the CURRENT segment (the run of
+   *  updates since the last `user_message_chunk`) is the live turn. Starts true
+   *  so a stream that never replays a user message (no echo) is emitted, not
+   *  eaten; a replayed prior user message flips it false until the current
+   *  prompt's echo flips it back true. */
+  private resumeLiveSegment = false;
+  /** Trimmed text of the in-flight first-post-resume prompt, matched against the
+   *  echoed `user_message_chunk` to locate the live-turn boundary. */
+  private resumePromptText?: string;
+  /** Accumulates echoed user-message text while suppressing so a boundary split
+   *  across chunks still matches the sent prompt. */
+  private resumeEchoBuffer = "";
+
+  /**
    * Serializes session-update processing. The ACP SDK's read loop dispatches
    * notifications concurrently (it calls processMessage without awaiting it),
    * so a later chunk's handler can run while an earlier one is parked on an
@@ -331,6 +376,12 @@ export class AgentRuntime {
 
   /** Create a new ACP session in `cwd`. */
   async newSession(opts: NewSessionOptions): Promise<SessionInfo> {
+    // Fresh session: no history to replay, so never gate. (A prior failed
+    // loadSession may have toggled the load flags without setting justResumed;
+    // reset defensively so a fresh session can't inherit stale resume state.)
+    this.justResumed = false;
+    this.replayLoadedDuringLoad = false;
+    this.suppressResumeReplay = false;
     const conn = this.requireConnection();
     const meta: Record<string, unknown> = {
       ...(this.profile.newSessionMeta?.(opts.model, opts.effort) ?? {}),
@@ -391,12 +442,23 @@ export class AgentRuntime {
     const meta: Record<string, unknown> = {
       ...(this.profile.newSessionMeta?.(opts.model, opts.effort) ?? {}),
     };
-    const result = await conn.loadSession({
-      sessionId: opts.sessionId,
-      cwd: opts.cwd,
-      mcpServers: this.mcpServers,
-      ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
-    });
+    // Bracket the load call: any history the wrapper replays arrives while this
+    // await runs. `handleSessionUpdateInner` drops replayed content in that
+    // window and records `replayLoadedDuringLoad` so the first prompt below can
+    // tell whether it still needs to gate its own preamble.
+    this.loadReplayInProgress = true;
+    this.replayLoadedDuringLoad = false;
+    let result: import("@agentclientprotocol/sdk").LoadSessionResponse;
+    try {
+      result = await conn.loadSession({
+        sessionId: opts.sessionId,
+        cwd: opts.cwd,
+        mcpServers: this.mcpServers,
+        ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
+      });
+    } finally {
+      this.loadReplayInProgress = false;
+    }
     this.sessionCwd = opts.cwd;
     this.sessionId = opts.sessionId;
     this.sessionInfo = {
@@ -434,6 +496,10 @@ export class AgentRuntime {
     // a subprocess restart any more than the model does).
     await this.applyConfigOptionEffort(opts.effort);
 
+    // Mark the resume so the NEXT prompt gates its replay preamble (see the
+    // resume-replay fields). Scoped to exactly the first following prompt.
+    this.justResumed = true;
+
     return this.sessionInfo;
   }
 
@@ -470,6 +536,26 @@ export class AgentRuntime {
       };
     }
 
+    // Cold-resume gating: the FIRST prompt after a `loadSession` may be preceded
+    // by the wrapper replaying prior history. Arm suppression BEFORE the RPC (so
+    // it's in place when the first replayed update arrives) — but only for the
+    // wrapper variant that replays as a prompt preamble. If the replay already
+    // happened during loadSession, this prompt is fully live: do NOT gate it,
+    // else with no echo to un-gate on we'd eat the response.
+    const firstResumedPrompt = this.justResumed;
+    if (firstResumedPrompt) {
+      this.justResumed = false; // consume: only the first prompt after a resume
+      if (!this.replayLoadedDuringLoad) {
+        this.suppressResumeReplay = true;
+        this.resumeLiveSegment = true; // no replayed user echo yet ⇒ treat as live
+        this.resumeEchoBuffer = "";
+        // Match the echoed user message against the sent text. An
+        // attachment-only prompt has no text to match — leave suppression armed
+        // but harmless: `resumeLiveSegment` stays true, so nothing is eaten.
+        this.resumePromptText = text.trim() || undefined;
+      }
+    }
+
     this.promptInFlight = true;
     try {
       // Race the ACP prompt RPC against a death/dispose rejection. Storing the
@@ -488,6 +574,26 @@ export class AgentRuntime {
     } finally {
       this.promptInFlight = false;
       this.rejectInFlightPrompt = undefined;
+      if (firstResumedPrompt) {
+        // Let any updates still queued for this turn finish processing under the
+        // current suppression state (the SerialQueue can lag the prompt RPC),
+        // then tear the resume gate down so the NEXT turn is never suppressed.
+        await this.sessionUpdates.idle().catch(() => {});
+        if (this.suppressResumeReplay && !this.resumeLiveSegment) {
+          // Armed, but the current-prompt echo never matched a user_message
+          // boundary. `resumeLiveSegment` defaulting true means no live agent
+          // text was lost unless a replayed user echo flipped it false with no
+          // matching echo after — surface that rather than fail silently.
+          this.logger.warn(
+            {},
+            "resume-replay: current-prompt echo never matched; suppression released"
+          );
+        }
+        this.suppressResumeReplay = false;
+        this.resumeLiveSegment = false;
+        this.resumeEchoBuffer = "";
+        this.resumePromptText = undefined;
+      }
     }
   }
 
@@ -657,6 +763,19 @@ export class AgentRuntime {
     }
   }
 
+  /** True when the accumulated echoed user text matches the in-flight prompt —
+   *  i.e. the replay stream has reached the current turn's boundary and what
+   *  follows is the live response. Lenient by trim + suffix so a boundary split
+   *  across chunks (or with leading replayed text concatenated) still matches;
+   *  the sent text is distinct enough from prior messages that this won't
+   *  false-match earlier turns. */
+  private resumeEchoMatchesPrompt(): boolean {
+    const want = this.resumePromptText;
+    if (!want) return false;
+    const got = this.resumeEchoBuffer.trim();
+    return got.length > 0 && (got === want || got.endsWith(want));
+  }
+
   private makeClient(): Client {
     const runtime = this;
     return {
@@ -678,6 +797,43 @@ export class AgentRuntime {
   }
 
   private async handleSessionUpdateInner(update: SessionUpdate): Promise<void> {
+    // Resume-replay gate — active ONLY on the cold-resume path (both flags
+    // false on warm turns, so this is a no-op there). Runs before any `emit()`
+    // so replayed history is dropped in the runtime, not merely hidden
+    // downstream: a caller streams/flushes agent-text as it arrives and cannot
+    // un-post an already-flushed replay line. See the resume-replay fields.
+    if (this.loadReplayInProgress) {
+      // Wrapper replays history synchronously during loadSession. Everything
+      // emitted in that window is prior conversation, not a live turn.
+      if (
+        update.sessionUpdate === "agent_message_chunk" ||
+        update.sessionUpdate === "user_message_chunk"
+      ) {
+        this.replayLoadedDuringLoad = true;
+      }
+      if (
+        REPLAY_SUPPRESSIBLE.has(update.sessionUpdate) ||
+        update.sessionUpdate === "user_message_chunk"
+      ) {
+        return; // drop replayed content; usage/model/mode fall through below
+      }
+    } else if (this.suppressResumeReplay) {
+      if (update.sessionUpdate === "user_message_chunk") {
+        // A user-message boundary in the replay stream. The current prompt
+        // echoed back marks the START of the live turn; a prior (replayed) user
+        // message marks more history to drop. Re-evaluate which segment we're
+        // in on every boundary; never emit the echo itself.
+        this.resumeEchoBuffer += textFromContent(update.content) ?? "";
+        this.resumeLiveSegment = this.resumeEchoMatchesPrompt();
+        return;
+      }
+      if (REPLAY_SUPPRESSIBLE.has(update.sessionUpdate) && !this.resumeLiveSegment) {
+        return; // replayed agent text / thought / tool call before the boundary
+      }
+      // Live suppressible content (post-boundary) falls through to the switch;
+      // usage/model/mode always fall through.
+    }
+
     switch (update.sessionUpdate) {
       case "agent_message_chunk": {
         await this.handleContentBlock(update.content, "message", {
@@ -902,6 +1058,17 @@ export class AgentRuntime {
     return (modes as { currentModeId?: string }).currentModeId;
   }
 }
+
+/** Session-update kinds that carry a turn's OUTPUT (assistant text, reasoning,
+ *  tool activity) and so must be dropped while replaying resume history. Usage,
+ *  model, mode and config updates are deliberately excluded — they are state,
+ *  not turn output, and are preserved even during suppression. */
+const REPLAY_SUPPRESSIBLE: ReadonlySet<string> = new Set([
+  "agent_message_chunk",
+  "agent_thought_chunk",
+  "tool_call",
+  "tool_call_update",
+]);
 
 function textFromContent(content: unknown): string | undefined {
   if (!content || typeof content !== "object") return undefined;

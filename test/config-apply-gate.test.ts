@@ -111,3 +111,49 @@ describe("config apply gate (#71)", () => {
     expect(calls[0]?.authorizedUserIds).toBeUndefined();
   });
 });
+
+/**
+ * PROPOSE gate — the HUMAN `/seam` slash surface (#71 admin-immunity extends
+ * here too, not only the agent-facing config_propose tool). `isLockedSlashRefused`
+ * is the pure predicate `handleSlashInteraction` gates on: a config admin may run
+ * config subcommands in a locked channel; everyone else is still refused.
+ */
+describe("locked-channel slash gate admin-immunity (#71)", () => {
+  const ADMIN = "1487094572696867019";
+  const cfg = (adminIds: ReadonlySet<string> | undefined, locked: boolean) =>
+    ({
+      channelPresets: new Map(locked ? [["channel-1", { locked: true }]] : []),
+      threadPresets: new Map(),
+      SEAM_CONFIG_ADMIN_USER_IDS: adminIds,
+    }) as any;
+
+  it("refuses a non-admin config subcommand in a locked channel", () => {
+    expect(
+      Orchestrator.isLockedSlashRefused(cfg(new Set([ADMIN]), true), "channel-1", "preset", "student-9")
+    ).toBe(true);
+  });
+
+  it("allows an admin the same subcommand WITHOUT unlocking", () => {
+    expect(
+      Orchestrator.isLockedSlashRefused(cfg(new Set([ADMIN]), true), "channel-1", "preset", ADMIN)
+    ).toBe(false);
+  });
+
+  it("allows a lock-exempt subcommand (steer) for anyone", () => {
+    expect(
+      Orchestrator.isLockedSlashRefused(cfg(new Set([ADMIN]), true), "channel-1", "steer", "student-9")
+    ).toBe(false);
+  });
+
+  it("never refuses in an unlocked channel", () => {
+    expect(
+      Orchestrator.isLockedSlashRefused(cfg(new Set([ADMIN]), false), "channel-1", "preset", "student-9")
+    ).toBe(false);
+  });
+
+  it("with the admin set unset, a locked channel still refuses everyone (byte-identical to today)", () => {
+    expect(
+      Orchestrator.isLockedSlashRefused(cfg(undefined, true), "channel-1", "preset", ADMIN)
+    ).toBe(true);
+  });
+});

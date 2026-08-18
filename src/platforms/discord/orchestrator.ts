@@ -1617,6 +1617,28 @@ export class Orchestrator {
    *  that a kid can unstick a hung turn without being able to touch config. */
   private static readonly LOCK_EXEMPT_SUBCOMMANDS = new Set(["abort", "cancel", "steer"]);
 
+  /**
+   * Whether a `/seam` subcommand must be refused because the channel is locked
+   * (#58 D2). #71 admin-immunity applies HERE too, not only at the agent-facing
+   * `config_propose` tool: a config admin may change config in a locked channel
+   * WITHOUT unlocking it — otherwise routine operator work still forces the
+   * unlock/relock cycle #71 exists to remove. The invoker id is Discord-
+   * authenticated (`interaction.user.id`), so this is trustworthy regardless of
+   * SPEAKER_IDENTITY_ENABLED. `locked` itself stays unsettable through any
+   * `/seam` command, so admin immunity grants no power to flip the lock.
+   */
+  static isLockedSlashRefused(
+    config: Config,
+    scopeChannelId: string | undefined,
+    sub: string,
+    invokerUserId: string
+  ): boolean {
+    if (!isChannelLocked(config, scopeChannelId)) return false;
+    if (Orchestrator.LOCK_EXEMPT_SUBCOMMANDS.has(sub)) return false;
+    if (config.SEAM_CONFIG_ADMIN_USER_IDS?.has(invokerUserId)) return false;
+    return true;
+  }
+
   async handleSlashInteraction(
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
@@ -1630,10 +1652,7 @@ export class Orchestrator {
     // new), the scope is the channel itself.
     const ic = interaction.channel;
     const scopeChannelId = ic?.isThread() ? (ic.parentId ?? undefined) : interaction.channelId ?? undefined;
-    if (
-      isChannelLocked(this.config, scopeChannelId) &&
-      !Orchestrator.LOCK_EXEMPT_SUBCOMMANDS.has(sub)
-    ) {
+    if (Orchestrator.isLockedSlashRefused(this.config, scopeChannelId, sub, interaction.user.id)) {
       await interaction.reply({
         content: "🔒 This channel is locked — its configuration can't be changed.",
         flags: MessageFlags.Ephemeral,

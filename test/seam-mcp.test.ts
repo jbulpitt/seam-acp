@@ -98,6 +98,7 @@ interface Harness {
 async function makeHarness(opts?: {
   resolveSession?: (token: string | undefined) => SessionRecord | undefined;
   peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
+  listThreads?: SeamMcpServerDeps["listThreads"];
   scheduleWake?: SeamMcpServerDeps["scheduleWake"];
   cancelWake?: SeamMcpServerDeps["cancelWake"];
   createWatch?: SeamMcpServerDeps["createWatch"];
@@ -178,6 +179,7 @@ async function makeHarness(opts?: {
         },
       ]),
     ...(opts?.peekThread ? { peekThread: opts.peekThread } : {}),
+    ...(opts?.listThreads ? { listThreads: opts.listThreads } : {}),
     ...(opts?.isChannelLocked ? { isChannelLocked: opts.isChannelLocked } : {}),
     ...(opts?.proposeConfig ? { proposeConfig: opts.proposeConfig } : {}),
     // The compact tool only ENQUEUES; its dep is a presence gate. Provide a stub
@@ -291,6 +293,7 @@ describe("SeamMcpServer", () => {
       "schedule_wake",
       "send",
       "steer",
+      "threads",
       "watch_cancel",
       "watch_create",
       "watch_list",
@@ -366,8 +369,8 @@ describe("SeamMcpServer", () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
-    // Adding an OPTION to handoff does NOT change the tool count set by #61.
-    expect(body.result.tools).toHaveLength(15);
+    // Adding an OPTION to handoff does NOT change the tool count (#73 took it to 16).
+    expect(body.result.tools).toHaveLength(16);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -733,6 +736,111 @@ describe("SeamMcpServer", () => {
     expect(text).toContain("hi there");
   });
 
+  // --- threads: discover addressable teammate threads (#73) ----------------
+
+  it("threads lists the caller's channel siblings — self flagged, busy + status surfaced (#73)", async () => {
+    let sawRecord: SessionRecord | undefined;
+    h = await makeHarness({
+      listThreads: async (record) => {
+        sawRecord = record;
+        return [
+          {
+            id: "111111111111111111",
+            name: "✨ HIST 2300",
+            isSelf: false,
+            agent: "claude",
+            model: "opus",
+            cwd: "/repo/a",
+            busy: true,
+            status: "active",
+            lastActivityUtc: "2026-08-17T10:00:00.000Z",
+          },
+          {
+            id: "thread-caller",
+            name: "🤝 me",
+            isSelf: true,
+            agent: "claude",
+            model: "sonnet",
+            cwd: "/repo/b",
+            busy: false,
+            status: "active",
+            lastActivityUtc: "2026-08-17T09:00:00.000Z",
+          },
+          {
+            id: "222222222222222222",
+            name: "🗄️ archived one",
+            isSelf: false,
+            agent: "claude",
+            model: "haiku",
+            cwd: "/repo/c",
+            busy: false,
+            status: "archived",
+            lastActivityUtc: "2026-08-10T00:00:00.000Z",
+          },
+        ];
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "threads", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    // Self-scope: the dep is handed the token-resolved caller, not an argument.
+    expect(sawRecord?.id).toBe("discord:thread-caller");
+    const text = body.result.content[0].text;
+    // The busy teammate is addressable by its id and flagged busy (send-vs-steer).
+    expect(text).toContain("id 111111111111111111");
+    expect(text).toContain("✨ HIST 2300");
+    expect(text).toContain("busy");
+    // The caller's own thread is marked YOU so it doesn't hand off to itself.
+    expect(text).toContain("YOU");
+    // Archived-but-bound thread still appears, marked (not silently dropped).
+    expect(text).toContain("222222222222222222");
+    expect(text).toContain("archived");
+  });
+
+  it("threads refuses a scope that names another channel (self-scope, #73)", async () => {
+    h = await makeHarness({ listThreads: async () => [] });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "threads", arguments: { scope: "some-other-channel" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("Refused");
+  });
+
+  it("threads returns a plain note when the caller is not a thread under a channel (#73)", async () => {
+    // Default resolveSession record has parentRef: null unless overridden; here
+    // the caller has no parent, so there are no siblings to discover.
+    h = await makeHarness({
+      resolveSession: (token) =>
+        token === "good-token" ? makeRecord({ parentRef: null }) : undefined,
+      listThreads: async () => {
+        throw new Error("listThreads must not be called without a parent channel");
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "threads", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(body.result.content[0].text).toContain("no sibling threads");
+  });
+
+  it("threads reports not-supported when the dep is absent (#73)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "threads", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("not supported");
+  });
+
   it("bad tool args surface as an isError tool result, not a protocol error", async () => {
     h = await makeHarness();
     const { body } = await h.call(
@@ -911,8 +1019,8 @@ describe("SeamMcpServer", () => {
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
-    // Params on `send` must NOT add a tool — the set stays at 15 (#61/#62/#66).
-    expect(body.result.tools).toHaveLength(15);
+    // Params on `send` must NOT add a tool — the set stays at 16 (#61/#62/#66/#73).
+    expect(body.result.tools).toHaveLength(16);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

@@ -249,6 +249,7 @@ describe("chain MCP tool", () => {
       "schedule_wake",
       "send",
       "steer",
+      "threads",
       "watch_cancel",
       "watch_create",
       "watch_list",

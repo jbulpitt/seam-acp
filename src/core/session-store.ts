@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_platform_channel
   ON sessions(platform, channel_ref);
+CREATE INDEX IF NOT EXISTS idx_sessions_platform_parent
+  ON sessions(platform, parent_ref);
 
 CREATE TABLE IF NOT EXISTS scheduled_prompts (
   id                 TEXT PRIMARY KEY,
@@ -392,6 +394,29 @@ export class SessionStore {
         "SELECT * FROM sessions ORDER BY updated_utc DESC LIMIT ?"
       )
       .all(limit);
+    return rows.map(mapRow);
+  }
+
+  /**
+   * Every session whose thread hangs off `parentRef` in `platform`, newest
+   * activity first, capped at `limit` (#73). Filtering happens IN SQL, unlike
+   * `list(100)` which caps at the newest-100 sessions GLOBALLY: an in-memory
+   * `.filter(parentRef)` over that would silently drop a quiet-but-bound thread
+   * that has slipped past the global cap — precisely the teammate a discovery
+   * tool must still surface. This query only ever sees this one channel's
+   * threads, so recency-capping is safe. Backed by idx_sessions_platform_parent.
+   */
+  listSessionsByParent(
+    platform: string,
+    parentRef: string,
+    limit = 100
+  ): SessionRecord[] {
+    const rows = this.db
+      .prepare<[string, string, number], Row>(
+        "SELECT * FROM sessions WHERE platform = ? AND parent_ref = ? " +
+          "ORDER BY updated_utc DESC LIMIT ?"
+      )
+      .all(platform, parentRef, limit);
     return rows.map(mapRow);
   }
 

@@ -455,6 +455,53 @@ async function main(): Promise<void> {
             },
           }
         : {}),
+      // #73: discover the addressable teammate threads in the caller's OWN
+      // channel. Composes the per-channel SQL query (listSessionsByParent — NOT
+      // an in-memory filter over list(100), so a quiet-but-bound thread past the
+      // global newest-N cap still surfaces), the DERIVED busy read + config
+      // precedence from the router, and the platform's thread-name/live-state
+      // lookups. Self-scoped: the channel is record.parentRef, never an arg.
+      listThreads: async (record) => {
+        if (!record.parentRef) return [];
+        const siblings = store.listSessionsByParent(record.platform, record.parentRef);
+        return Promise.all(
+          siblings.map(async (s) => {
+            const cfg = router.describeConfig(s);
+            let name: string | null = null;
+            let status: "active" | "archived" | "gone" = "active";
+            try {
+              name =
+                (await adapter.getThreadName?.({ platform: s.platform, id: s.channelRef })) ??
+                null;
+            } catch {
+              name = null;
+            }
+            try {
+              const live = adapter.getThreadLiveState
+                ? await adapter.getThreadLiveState({ platform: s.platform, id: s.channelRef })
+                : { locked: false, archived: false };
+              // undefined ⇒ platform confirmed the thread is gone; {archived} ⇒
+              // dormant but still bound; otherwise addressable now.
+              if (live === undefined) status = "gone";
+              else if (live.archived) status = "archived";
+            } catch {
+              // Transient lookup failure — treat as active rather than hiding it.
+              status = "active";
+            }
+            return {
+              id: s.channelRef,
+              name,
+              isSelf: s.id === record.id,
+              agent: cfg.agent.value,
+              model: cfg.model.value,
+              cwd: cfg.cwd.value,
+              busy: router.isBusy(s.id),
+              status,
+              lastActivityUtc: s.updatedUtc,
+            };
+          })
+        );
+      },
       // #58 P1: read-only config introspection. describeConfig re-derives the
       // exact precedence startRuntime applies (which layer won); listConfigEntities
       // projects the schedules/presets visible to the calling thread. Both are

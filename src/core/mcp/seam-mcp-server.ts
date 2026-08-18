@@ -64,6 +64,37 @@ export interface PeekedMessage {
   text: string;
 }
 
+/** One sibling thread in the caller's channel, as the `threads` tool renders it
+ *  (#73). A minimal projection over the store record + router runtime state +
+ *  platform metadata, so the server stays decoupled from all three. Entries are
+ *  returned newest-activity first. */
+export interface ThreadEntry {
+  /** The thread id every other coordination tool takes as its first arg
+   *  (handoff/forward/steer/peek/send/…). This is the session's channelRef. */
+  id: string;
+  /** The platform thread name (e.g. "✨ HIST 2300") — how the agent picks the
+   *  right teammate. Null when the platform could not resolve it. */
+  name: string | null;
+  /** True for the CALLER'S OWN thread, so it never hands off to itself. */
+  isSelf: boolean;
+  /** The teammate's effective agent / model / cwd (as `describeConfig` resolves
+   *  them — the same precedence startRuntime applies). */
+  agent: string;
+  model: string;
+  cwd: string;
+  /** Whether a live turn is CURRENTLY running in that thread — the load-bearing
+   *  field: choose `send` (non-interrupting) over `steer`/`handoff`
+   *  (interrupting) when a teammate is busy. */
+  busy: boolean;
+  /** Liveness of the underlying thread: "active" (addressable now), "archived"
+   *  (bound but dormant — still addressable, wakes on delivery), or "gone" (the
+   *  platform confirmed it deleted — do NOT address it). Marked, never silently
+   *  dropped, so a stale id is visible rather than mysterious. */
+  status: "active" | "archived" | "gone";
+  /** ISO-8601 of the thread's last activity (the session's updated_utc). */
+  lastActivityUtc: string;
+}
+
 export interface SeamMcpServerDeps {
   logger: Logger;
   /** token → the calling session's record (or undefined if unknown/revoked). */
@@ -82,6 +113,16 @@ export interface SeamMcpServerDeps {
   }) => { chainId: string; firstHop: string };
   /** Read recent messages from a thread; undefined ⇒ peek is unsupported. */
   peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
+  /**
+   * Discover the sibling threads in the CALLER'S OWN channel (#73), newest
+   * activity first. Composed in index.ts from `listSessionsByParent` (the SQL
+   * per-channel query, so a quiet-but-bound thread is never lost to a global
+   * newest-N cap), `router.isBusy`/`describeConfig`, and the platform's
+   * thread-name / live-state lookups. Self-scoped by construction — the channel
+   * is `record.parentRef`, never a caller-supplied arg. Undefined ⇒ thread
+   * discovery is unsupported on this deployment.
+   */
+  listThreads?: (record: SessionRecord) => Promise<ThreadEntry[]>;
   /**
    * Compute the EFFECTIVE config + which layer won for the calling session
    * (#58 P1). Undefined ⇒ config introspection is unsupported on this
@@ -344,6 +385,35 @@ const TOOLS = [
         },
       },
       required: ["thread"],
+    },
+  },
+  {
+    name: "threads",
+    description:
+      "Discover the addressable teammate threads in YOUR OWN channel, newest-activity first — the way " +
+      "to TURN A TASK INTO A THREAD ID before calling any other coordination tool (handoff/forward/steer/" +
+      "peek/send/chain all take a thread id you must first obtain here). Each entry reports: `id` (pass this " +
+      "verbatim as the thread arg elsewhere), `name` (the human thread title — how you pick the right " +
+      "teammate), `isSelf` (true for YOUR OWN thread — never hand off to yourself), the teammate's " +
+      "`agent`/`model`/`cwd`, `status` (active | archived | gone), `lastActivityUtc`, and `busy`. " +
+      "`busy` IS LOAD-BEARING for choosing HOW to reach a teammate: when a thread is busy:true a live turn " +
+      "is running, so prefer `send` (PULL-ONLY — it waits in the inbox and never interrupts) unless you " +
+      "truly need to preempt, in which case use `steer` or `send(interrupt:true)`; when busy:false the " +
+      "teammate is idle, so `handoff`/`forward` (which START a turn) land cleanly. Read-only and " +
+      "self-scoped: it ALWAYS lists your own channel (resolved from your session, never an argument) and " +
+      "works even in a locked channel (metadata only, no message content). A `status:\"gone\"` entry is a " +
+      "dead thread — do not address it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: {
+          type: "string",
+          description:
+            "Optional. Only \"self\" (or your own thread/channel id) is accepted — you can only ever list " +
+            "YOUR OWN channel's threads. Naming another channel is refused. Defaults to your own channel.",
+        },
+      },
+      required: [],
     },
   },
   {
@@ -687,6 +757,10 @@ const INSTRUCTIONS = [
   "You are one teammate in a shared workspace of parallel agent threads. These tools let you",
   "coordinate with the others without leaving your own turn:",
   "",
+  "- threads(): list the teammate threads in YOUR channel (id, name, agent/model, busy, status). START",
+  "  HERE — every tool below takes a thread id, and this is the only way to discover one. `busy` tells you",
+  "  HOW to reach a teammate: busy ⇒ prefer send (pull-only, won't interrupt); idle ⇒ handoff/forward land",
+  "  a turn cleanly. The entry marked isSelf is YOUR OWN thread — never hand off to it.",
   "- handoff(worker, prompt, returnTo?): delegate a task. `worker` is a thread id (a stateful",
   "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
   "  result is dispatched back into your thread when it completes.",
@@ -858,6 +932,8 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolSteer(record, args));
         case "peek":
           return rpcResult(id, await this.toolPeek(args));
+        case "threads":
+          return rpcResult(id, await this.toolThreads(record, args));
         case "chain":
           return rpcResult(id, await this.toolChain(record, args));
         case "compact":
@@ -1099,6 +1175,77 @@ export class SeamMcpServer {
       .map((m) => `${m.authorIsBot ? "🤖" : "👤"} ${m.text}`)
       .join("\n");
     return textResult(`Recent messages in thread ${thread}:\n\n${rendered}`);
+  }
+
+  /**
+   * Discover the addressable sibling threads in the caller's OWN channel (#73).
+   * Self-scope by construction (D3, matching config_describe): the channel is
+   * `caller.parentRef` — resolved from the token-minted record, NEVER a
+   * caller-supplied arg. The optional `scope` may only echo "self" or the
+   * caller's own thread/channel id; naming another channel is refused as a
+   * cross-channel read this tool does not grant. Read-only metadata only, so it
+   * is ALLOWED in a locked channel (same posture as peek — no message content is
+   * exposed). The heavy lifting (per-channel SQL query, busy derivation, config
+   * resolution, platform name/live-state lookups) lives behind `listThreads`,
+   * wired in index.ts; this method owns scope enforcement + rendering.
+   */
+  private async toolThreads(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.listThreads) {
+      return textResult("thread discovery is not supported on this deployment.", true);
+    }
+    const scope = optionalString(args, "scope");
+    if (
+      scope &&
+      scope !== "self" &&
+      scope !== caller.channelRef &&
+      scope !== caller.id &&
+      scope !== caller.parentRef
+    ) {
+      return textResult(
+        `Refused: listing another channel's threads is a privileged capability that is not ` +
+          `available here. You can only list your own channel. Requested scope: "${scope}".`,
+        true
+      );
+    }
+    // A thread's siblings live under its parent channel. Without a parent this
+    // session is not a thread under a channel, so there are no teammates to list.
+    if (!caller.parentRef) {
+      return textResult(
+        "This session is not a thread under a channel, so it has no sibling threads to discover."
+      );
+    }
+
+    const entries = await this.deps.listThreads(caller);
+    if (entries.length === 0) {
+      return textResult("No threads found in your channel.");
+    }
+
+    const lines = [`Threads in your channel (${entries.length}, newest first):`, ""];
+    for (const t of entries) {
+      const addressable = looksLikeThreadId(t.id);
+      const name = t.name ?? "(unnamed)";
+      const flags = [
+        t.isSelf ? "YOU" : null,
+        t.busy ? "busy" : "idle",
+        t.status !== "active" ? t.status : null,
+        addressable ? null : "not addressable",
+      ].filter(Boolean);
+      const cfg = [t.agent, t.model].filter(Boolean).join(" / ");
+      lines.push(
+        `• ${name} — id ${t.id} [${flags.join(", ")}]` +
+          (cfg ? `\n    ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
+          `\n    last active ${t.lastActivityUtc}`
+      );
+    }
+    lines.push(
+      "",
+      "To reach a teammate: use its `id` above. If it is busy, prefer send (pull-only, won't interrupt); " +
+        "if idle, handoff/forward start a turn directly. Never hand off to the entry marked YOU."
+    );
+    return textResult(lines.join("\n"));
   }
 
   /** Schedule a one-shot wake for the calling thread (#59). Self-scope by

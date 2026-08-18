@@ -70,6 +70,36 @@ describe("SessionStore", () => {
     expect(list.map((s) => s.id)).toEqual(["discord:b", "discord:a"]);
   });
 
+  it("listSessionsByParent filters to one channel, newest first (#73)", () => {
+    // Two threads under channel-1, one under channel-2, on different platforms.
+    const t1: SessionRecord = { ...sample(), id: "discord:t1", channelRef: "t1", parentRef: "channel-1", updatedUtc: "2026-01-01T00:00:00Z" };
+    const t2: SessionRecord = { ...sample(), id: "discord:t2", channelRef: "t2", parentRef: "channel-1", updatedUtc: "2026-02-01T00:00:00Z" };
+    const other: SessionRecord = { ...sample(), id: "discord:o", channelRef: "o", parentRef: "channel-2", updatedUtc: "2026-03-01T00:00:00Z" };
+    const slack: SessionRecord = { ...sample(), id: "slack:s", platform: "slack", channelRef: "s", parentRef: "channel-1", updatedUtc: "2026-04-01T00:00:00Z" };
+    store.upsert(t1);
+    store.upsert(t2);
+    store.upsert(other);
+    store.upsert(slack);
+    const list = store.listSessionsByParent("discord", "channel-1");
+    // Only discord threads under channel-1, newest-updated first.
+    expect(list.map((s) => s.id)).toEqual(["discord:t2", "discord:t1"]);
+  });
+
+  it("listSessionsByParent surfaces a quiet-but-bound thread past a global newest-N cap (#73)", () => {
+    // The quiet thread under channel-1 predates 100 newer sessions in OTHER
+    // channels. A list(100)+in-memory filter would lose it; the SQL query keeps it.
+    const quiet: SessionRecord = { ...sample(), id: "discord:quiet", channelRef: "quiet", parentRef: "channel-1", updatedUtc: "2020-01-01T00:00:00Z" };
+    store.upsert(quiet);
+    for (let i = 0; i < 120; i++) {
+      store.upsert({ ...sample(), id: `discord:n${i}`, channelRef: `n${i}`, parentRef: "other-channel", updatedUtc: `2026-01-01T00:00:${String(i % 60).padStart(2, "0")}Z` });
+    }
+    // list(100) drops the quiet thread (it's not in the newest 100 globally)...
+    expect(store.list(100).some((s) => s.id === "discord:quiet")).toBe(false);
+    // ...but the per-channel query still finds it.
+    const list = store.listSessionsByParent("discord", "channel-1");
+    expect(list.map((s) => s.id)).toContain("discord:quiet");
+  });
+
   it("readConfig parses JSON, returns {} on bad data", () => {
     const r = sample();
     expect(store.readConfig(r)).toEqual({ model: "gpt-5.4" });

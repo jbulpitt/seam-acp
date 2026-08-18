@@ -425,6 +425,17 @@ export class SessionRouter {
     return this.runtimes.has(sessionId);
   }
 
+  /** Whether a live turn is CURRENTLY running for this session (#73) — a DERIVED
+   *  read over the runtime's internal `busy` flag, not new tracked state. False
+   *  when no runtime is alive (nothing can be mid-turn without one), so a
+   *  never-started or disposed thread truthfully reads idle. Companion to
+   *  `hasRuntime`, which answers the weaker "runtime alive" question; this is the
+   *  load-bearing signal `threads()` uses to steer send (pull-only) vs
+   *  steer/handoff (interrupting). */
+  isBusy(sessionId: string): boolean {
+    return this.runtimes.get(sessionId)?.busy ?? false;
+  }
+
   private async startRuntime(record: SessionRecord): Promise<AgentRuntime> {
     // Channel/thread presets are the source of truth for locked-down
     // channels: re-resolved on every runtime start (not just session

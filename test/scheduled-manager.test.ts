@@ -47,7 +47,9 @@ function makeStore(row: ScheduledPrompt) {
     getScheduled: (id: string) => (id === row.id ? { ...row } : null),
     upsertScheduled: (s: ScheduledPrompt) => {
       upserts.push(s);
+      Object.assign(row, s);
     },
+    listScheduledEnabled: () => (row.enabled ? [{ ...row }] : []),
   } as unknown as SessionStore;
   return { store, upserts };
 }
@@ -92,5 +94,35 @@ describe("ScheduledPromptManager overlap guard (D3)", () => {
     await fire(row.id); // rejects internally, guard released in finally
     await fire(row.id); // not blocked by a stuck guard
     expect(onFire).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("ScheduledPromptManager catch-up", () => {
+  it("fires once on start when nextRunUtc is in the past, even far outside catchupSeconds", async () => {
+    const row = makeRow({
+      cron: "0 9 * * *",
+      catchupSeconds: 900,
+      nextRunUtc: new Date(Date.now() - 6 * 3600 * 1000).toISOString(),
+    });
+    const { store } = makeStore(row);
+    const onFire = vi.fn(async () => {});
+    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
+    manager.start();
+    await vi.waitFor(() => expect(onFire).toHaveBeenCalledTimes(1));
+    manager.stop();
+  });
+
+  it("does not catch-up a schedule whose next run is still in the future", async () => {
+    const row = makeRow({
+      cron: "0 9 * * *",
+      nextRunUtc: new Date(Date.now() + 3600 * 1000).toISOString(),
+    });
+    const { store } = makeStore(row);
+    const onFire = vi.fn(async () => {});
+    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
+    manager.start();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(onFire).not.toHaveBeenCalled();
+    manager.stop();
   });
 });

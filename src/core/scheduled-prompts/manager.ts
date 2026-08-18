@@ -4,8 +4,9 @@
  * to an injected `onFire(id)` (the orchestrator's isolated runner). The manager
  * is the sole owner of `next_run_utc`; `onFire` only touches last_run/last_status.
  *
- * Catch-up: on boot, if a schedule's stored next-run was missed but within its
- * `catchupSeconds` window, fire it once; otherwise roll forward. Never bursts.
+ * Catch-up: on boot, if a schedule's stored next-run is in the past, fire it
+ * once, then arm forward. Never bursts. A long restart-drain must not drop a
+ * missed slot — there is no catch-up window skip.
  */
 import { Cron } from "croner";
 import type { SessionStore } from "../session-store.js";
@@ -96,15 +97,8 @@ export class ScheduledPromptManager {
     const due = Date.parse(row.nextRunUtc);
     if (isNaN(due) || due > Date.now()) return; // not missed
     const missedBySec = Math.round((Date.now() - due) / 1000);
-    if (row.catchupSeconds > 0 && missedBySec <= row.catchupSeconds) {
-      this.logger.info({ id: row.id, missedBySec }, "scheduled prompt: catch-up firing");
-      void this.fire(row.id);
-    } else {
-      this.logger.info(
-        { id: row.id, missedBySec, window: row.catchupSeconds },
-        "scheduled prompt: missed window, skipping catch-up"
-      );
-    }
+    this.logger.info({ id: row.id, missedBySec }, "scheduled prompt: catch-up firing");
+    void this.fire(row.id);
   }
 
   /** Execute one fire: run the job, then refresh next_run from the armed timer. */

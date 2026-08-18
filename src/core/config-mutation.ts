@@ -159,7 +159,7 @@ export interface ScheduleChanges {
   cwd?: string | null;
   targetChannel?: string | null;
   outputType?: "card" | "messages";
-  /** Missed-fire catch-up window in seconds. 0 = never catch up. */
+  /** Retained for compatibility. Catch-up no longer consults this window. */
   catchupSeconds?: number;
 }
 

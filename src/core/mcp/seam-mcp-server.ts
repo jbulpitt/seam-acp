@@ -913,7 +913,7 @@ const TOOLS = [
             },
             catchupSeconds: {
               type: "number",
-              description: "Missed-fire catch-up window in seconds. 0 = never catch up.",
+              description: "Retained for compatibility. A missed next-run always fires once on boot; this window is no longer consulted.",
             },
           },
           required: ["action"],

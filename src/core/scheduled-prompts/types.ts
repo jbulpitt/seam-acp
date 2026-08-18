@@ -43,7 +43,8 @@ export interface ScheduledPrompt {
    *  `targetChannel`, and `outputType` are meaningless and ignored at fire time
    *  (D1); the thread's own runtime config governs the turn. */
   sessionMode: "isolated" | "live";
-  /** Missed-fire catch-up window in seconds. 0 = never catch up. Default 900. */
+  /** Retained on the row / builder for compatibility. Catch-up no longer
+   *  consults this: a missed `nextRunUtc` always fires once on boot. */
   catchupSeconds: number;
   enabled: boolean;
   attachments: ScheduledAttachment[];

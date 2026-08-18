@@ -492,10 +492,11 @@ export class Orchestrator {
 
   private async handleRestartSentinel(): Promise<void> {
     this.restartPending = true;
-    // Stop firing NEW scheduled jobs immediately so the drain only waits for
-    // jobs already in flight (they're counted in activeTurns). Timers re-arm from
-    // the DB after the restart.
-    this.scheduledManager?.stop();
+    // Keep cron timers running through the drain. Stopping them here is what
+    // made `report-update` miss 5:25 while a restart sat pending for hours —
+    // list still showed the stale next_run, and catch-up could then skip it.
+    // Isolated scheduled fires increment activeTurns, so they extend the drain
+    // instead of being SIGTERM'd. Stop only in the last beat before pm2 restart.
 
     if (this.activeTurns > 0) {
       const turnWord = this.activeTurns === 1 ? "turn" : "turn(s)";
@@ -521,6 +522,7 @@ export class Orchestrator {
     await new Promise((resolve) => setTimeout(resolve, 2000));
 
     this.logger.info("all turns drained, executing restart");
+    this.scheduledManager?.stop();
     try {
       await fsp.unlink(this.sentinelPath());
     } catch {

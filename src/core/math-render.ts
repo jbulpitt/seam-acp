@@ -18,8 +18,8 @@ export const MATH_RENDER_TIMEOUT_MS = 2000;
 
 const DISCORD_DARK_FILL = "#dcddde";
 const FONT_SIZE_PX = 16;
-const PADDING_PX = 16;
-const RASTER_SCALE = 2;
+const PADDING_PX = 20;
+const RASTER_SCALE = 4;
 /** MathJax SVG user-units per em. Used to convert viewBox → CSS px. */
 const MATHJAX_UNITS_PER_EM = 1000;
 
@@ -79,7 +79,7 @@ async function initEngine(): Promise<Engine> {
 
 /**
  * Pin fill + concrete viewport so `currentColor` / `ex` resolve, then add
- * ~16px padding. Rasterize at 2× for mobile sharpness.
+ * ~20px padding. Rasterize at 4× for high-DPI sharpness.
  */
 function prepareSvg(svg: string): string {
   let out = svg.replace(/currentColor/gi, DISCORD_DARK_FILL);

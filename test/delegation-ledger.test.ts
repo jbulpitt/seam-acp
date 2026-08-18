@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -59,6 +60,7 @@ describe("delegation ledger", () => {
     expect(w.worker).toBeNull();
     expect(w.promptPreview).toBeNull();
     expect(w.correlationId).toBeNull();
+    expect(w.acpSessionId).toBeNull();
   });
 
   it("records a scheduler-origin turn with no source", () => {
@@ -276,6 +278,150 @@ describe("delegation ledger", () => {
     expect(() =>
       store.tryRecordReportBack(sample({ kind: "handoff" }))
     ).toThrow(/report_back/);
+  });
+
+  it("persists acpSessionId via the running-status patch", () => {
+    store.recordDelegation(sample({ id: "del-sid", correlationId: "corr-sid" }));
+    store.updateDelegationStatus("del-sid", "running", {
+      acpSessionId: "acp-isolated-99",
+    });
+    const row = store.getDelegation("del-sid");
+    expect(row).toMatchObject({
+      status: "running",
+      acpSessionId: "acp-isolated-99",
+      targetRef: "discord:thread-b",
+      correlationId: "corr-sid",
+    });
+    store.close();
+    store = new SessionStore(path.join(dir, "test.db"));
+    expect(store.getDelegation("del-sid")?.acpSessionId).toBe("acp-isolated-99");
+  });
+
+  it("adds acp_session_id to a legacy delegation_log without dropping rows or the report_back index", () => {
+    store.close();
+    const dbFile = path.join(dir, "legacy-ledger.db");
+    const raw = new Database(dbFile);
+    raw.exec(`
+      CREATE TABLE delegation_log (
+        id              TEXT PRIMARY KEY,
+        source_ref      TEXT,
+        target_ref      TEXT,
+        worker          TEXT,
+        kind            TEXT NOT NULL,
+        prompt_preview  TEXT,
+        correlation_id  TEXT,
+        status          TEXT NOT NULL,
+        created_utc     TEXT NOT NULL,
+        updated_utc     TEXT NOT NULL
+      );
+    `);
+    raw
+      .prepare(
+        `INSERT INTO delegation_log
+           (id, source_ref, target_ref, worker, kind, prompt_preview,
+            correlation_id, status, created_utc, updated_utc)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        "legacy-1",
+        "thread-a",
+        "thread-b",
+        "researcher",
+        "handoff",
+        "old work",
+        "corr-legacy",
+        "running",
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:00.000Z"
+      );
+    raw.close();
+
+    store = new SessionStore(dbFile);
+    const cols = new Database(dbFile)
+      .pragma("table_info(delegation_log)") as Array<{ name: string }>;
+    expect(cols.some((c) => c.name === "acp_session_id")).toBe(true);
+    const row = store.getDelegation("legacy-1");
+    expect(row?.status).toBe("running");
+    expect(row?.acpSessionId).toBeNull();
+    expect(row?.correlationId).toBe("corr-legacy");
+
+    store.updateDelegationStatus("legacy-1", "running", {
+      acpSessionId: "sess-migrated",
+    });
+    expect(store.getDelegation("legacy-1")?.acpSessionId).toBe("sess-migrated");
+
+    // #77 unique index still claims a report_back once on the migrated table.
+    expect(
+      store.tryRecordReportBack({
+        id: "rb-legacy",
+        kind: "report_back",
+        correlationId: "corr-legacy",
+      })
+    ).not.toBeNull();
+    expect(
+      store.tryRecordReportBack({
+        id: "rb-legacy-2",
+        kind: "report_back",
+        correlationId: "corr-legacy",
+      })
+    ).toBeNull();
+  });
+
+  it("reconcileOrphanedDelegations flips only in-flight rows to interrupted", () => {
+    const mk = (id: string, status: LedgerEntryInput["status"], extra: Partial<LedgerEntryInput> = {}) =>
+      store.recordDelegation(
+        sample({
+          id,
+          status,
+          correlationId: id,
+          acpSessionId: extra.acpSessionId ?? null,
+          createdUtc: "2026-03-01T00:00:00.000Z",
+          updatedUtc: "2026-03-01T00:00:00.000Z",
+          ...extra,
+        })
+      );
+    mk("run-1", "running", { acpSessionId: "sess-run", targetRef: "thread-w" });
+    mk("disp-1", "dispatched", { targetRef: "thread-x" });
+    mk("done-1", "completed", { acpSessionId: "sess-done" });
+    mk("fail-1", "failed");
+    mk("late-1", "timed_out");
+    mk("held-1", "parked");
+
+    const flipped = store.reconcileOrphanedDelegations("2026-03-02T12:00:00.000Z");
+    expect(flipped).toBe(2);
+
+    const run = store.getDelegation("run-1")!;
+    expect(run.status).toBe("interrupted");
+    expect(run.updatedUtc).toBe("2026-03-02T12:00:00.000Z");
+    expect(run.acpSessionId).toBe("sess-run");
+    expect(run.targetRef).toBe("thread-w");
+    expect(run.correlationId).toBe("run-1");
+
+    expect(store.getDelegation("disp-1")).toMatchObject({
+      status: "interrupted",
+      targetRef: "thread-x",
+      updatedUtc: "2026-03-02T12:00:00.000Z",
+    });
+
+    expect(store.getDelegation("done-1")).toMatchObject({
+      status: "completed",
+      acpSessionId: "sess-done",
+      updatedUtc: "2026-03-01T00:00:00.000Z",
+    });
+    expect(store.getDelegation("fail-1")?.status).toBe("failed");
+    expect(store.getDelegation("late-1")?.status).toBe("timed_out");
+    expect(store.getDelegation("held-1")?.status).toBe("parked");
+
+    // Interrupted is no longer in-flight.
+    expect(store.listActiveDelegations()).toEqual([]);
+  });
+
+  it("opening a store does not reconcile — only an explicit boot call does", () => {
+    store.recordDelegation(sample({ status: "running", acpSessionId: "keep" }));
+    store.close();
+    store = new SessionStore(path.join(dir, "test.db"));
+    expect(store.getDelegation("del-1")?.status).toBe("running");
+    expect(store.getDelegation("del-1")?.acpSessionId).toBe("keep");
   });
 
   it("the report_back claim survives a store reopen", () => {

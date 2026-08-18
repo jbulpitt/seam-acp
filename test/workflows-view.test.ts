@@ -19,6 +19,7 @@ const entry = (over: Partial<LedgerEntry> = {}): LedgerEntry => ({
   kind: "handoff",
   promptPreview: "summarize the runbook",
   correlationId: "corr-1",
+  acpSessionId: null,
   status: "running",
   createdUtc: "2026-08-16T11:58:00.000Z",
   updatedUtc: "2026-08-16T11:58:00.000Z",

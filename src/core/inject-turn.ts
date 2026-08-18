@@ -87,6 +87,14 @@ export interface InjectTurnOptions {
 
   /** Extra bindings for this turn's child logger (e.g. `{ scheduled: "run" }`). */
   logContext?: Record<string, unknown>;
+
+  /**
+   * Fired as soon as the ACP session id is known — after `newSession()` for
+   * isolated runs, or once the live runtime is acquired. Dispatch uses this
+   * to persist the id on the ledger at the `running` transition so a crash
+   * mid-turn is recoverable (#75). Must not be used for teardown.
+   */
+  onSession?: (sessionId: string) => void | Promise<void>;
 }
 
 export interface InjectTurnResult {

@@ -52,6 +52,16 @@ async function main(): Promise<void> {
   const health = startHealthServer(config.HEALTH_PORT, logger);
 
   const store = new SessionStore(path.join(config.DATA_DIR, "seam.db"));
+  // #75: crash leftovers stay `dispatched`/`running` forever unless we flip
+  // them here. Target / correlation / acp_session_id are preserved for resume.
+  // Does not delete isolated ACP sessions — #76 decides whether to reattach.
+  const orphaned = store.reconcileOrphanedDelegations();
+  if (orphaned > 0) {
+    logger.warn(
+      { count: orphaned },
+      "reconciled orphaned delegation ledger rows as interrupted"
+    );
+  }
 
   const { servers: mcpServers } = buildGlobalMcpServers(logger, {
     dataDir: config.DATA_DIR,

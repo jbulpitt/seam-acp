@@ -2099,6 +2099,15 @@ export class Orchestrator {
           ...(opts.effort ? { effort: opts.effort } : {}),
         });
         sessionId = info.sessionId;
+        // Persist the id BEFORE prompt() so a crash mid-turn is still
+        // recoverable. Dispatch writes this onto the ledger at `running`.
+        if (sessionId) {
+          try {
+            await opts.onSession?.(sessionId);
+          } catch (err) {
+            logger.warn({ err, sessionId }, "injectTurn: onSession failed");
+          }
+        }
         // Registered after newSession: the session-creation handshake emits no
         // events we want, and this matches the order the callers used.
         rt.onEvent(handler);
@@ -2155,6 +2164,14 @@ export class Orchestrator {
         });
     try {
       const rt = await this.router.getOrStartRuntime(record);
+      const liveSessionId = record.acpSessionId || rt.getSessionInfo()?.sessionId;
+      if (liveSessionId) {
+        try {
+          await opts.onSession?.(liveSessionId);
+        } catch (err) {
+          logger.warn({ err, sessionId: liveSessionId }, "injectTurn: onSession failed");
+        }
+      }
       rt.onEvent(handler);
       const outcome = await runPrompt(rt);
       if (outcome === "timeout") {
@@ -3555,7 +3572,16 @@ export class Orchestrator {
     const statusPanelOn = this.config.SEAM_DISPATCH_STATUS_PANEL !== false;
 
     const run = async (): Promise<{ output: string; stopReason: string }> => {
-      try { this.store.updateDelegationStatus(spec.id, "running"); } catch { /* best-effort */ }
+      // Isolated: do not mark `running` here — wait for newSession() so the
+      // status transition carries the ACP session id (#75). Live: the thread's
+      // session id is already on the record, so we can stamp both now.
+      if (effectiveSession === "live" && record.acpSessionId) {
+        try {
+          this.store.updateDelegationStatus(spec.id, "running", {
+            acpSessionId: record.acpSessionId,
+          });
+        } catch { /* best-effort */ }
+      }
       const startedAt = Date.now();
 
       // STATUS PANEL: post the traditional live panel FIRST (above the answer),
@@ -3687,6 +3713,16 @@ export class Orchestrator {
           outputTo: target,
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
           timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
+          // Isolated: newSession() just returned — THIS is the running
+          // transition. Write the session id now, before prompt(), so a
+          // SIGKILL still leaves a pointer on the ledger (#75).
+          onSession: (sessionId) => {
+            try {
+              this.store.updateDelegationStatus(spec.id, "running", {
+                acpSessionId: sessionId,
+              });
+            } catch { /* best-effort */ }
+          },
           // Drive both additive views from the ONE event stream:
           //  - the OUTPUT renderer gets agent-text (the answer): the flush
           //    renderer ("messages") streams it as real messages, or the

@@ -21,6 +21,7 @@ const STATUS_ICON: Record<DelegationStatus, string> = {
   failed: "❌",
   timed_out: "⏱️",
   parked: "🅿️",
+  interrupted: "⚠️",
 };
 
 /** Trailing, human-sized slice of an id (drops a `del-`/`corr-` style prefix). */

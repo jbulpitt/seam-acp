@@ -246,6 +246,7 @@ export class SessionStore {
     this.db.exec(SCHEMA);
     this.db.exec(DELEGATION_SCHEMA);
     this.migrateReportBackDedupIndex();
+    this.migrateDelegationAcpSessionId();
     this.db.exec(CONFIG_AUDIT_SCHEMA);
     this.db.exec(ACTIVE_PROJECTS_SCHEMA);
     this.db.exec(CHAINS_SCHEMA);
@@ -266,6 +267,22 @@ export class SessionStore {
     this.migrateWakeFireOnStartup();
     this.migrateInboxPriority();
     this.migratePresetsScope();
+  }
+
+  /**
+   * Additive column so a dispatch can persist the ACP session it is running
+   * in (#75). Fresh DBs get the column from CREATE TABLE; prod DBs opened
+   * after upgrade hit this PRAGMA-guarded ALTER. Idempotent: a no-op once
+   * the column exists. Does not touch the #77 report-back unique index.
+   */
+  private migrateDelegationAcpSessionId(): void {
+    const hasColumn = this.db
+      .prepare<[], { name: string }>("PRAGMA table_info(delegation_log)")
+      .all()
+      .some((c) => c.name === "acp_session_id");
+    if (!hasColumn) {
+      this.db.exec("ALTER TABLE delegation_log ADD COLUMN acp_session_id TEXT");
+    }
   }
 
   /**
@@ -799,6 +816,7 @@ export class SessionStore {
       kind: entry.kind,
       promptPreview: truncatePreview(entry.promptPreview ?? null),
       correlationId: entry.correlationId ?? null,
+      acpSessionId: entry.acpSessionId ?? null,
       status: entry.status ?? "dispatched",
       createdUtc,
       updatedUtc: entry.updatedUtc ?? createdUtc,
@@ -807,10 +825,10 @@ export class SessionStore {
       .prepare(
         `INSERT INTO delegation_log
            (id, source_ref, target_ref, worker, kind, prompt_preview,
-            correlation_id, status, created_utc, updated_utc)
+            correlation_id, acp_session_id, status, created_utc, updated_utc)
          VALUES
            (@id, @sourceRef, @targetRef, @worker, @kind, @promptPreview,
-            @correlationId, @status, @createdUtc, @updatedUtc)`
+            @correlationId, @acpSessionId, @status, @createdUtc, @updatedUtc)`
       )
       .run(row);
     return row;
@@ -887,6 +905,36 @@ export class SessionStore {
       .run(params);
   }
 
+  /** One ledger row by primary key, or null if absent. */
+  getDelegation(id: string): LedgerEntry | null {
+    const row = this.db
+      .prepare<[string], LedgerRow>(`SELECT * FROM delegation_log WHERE id = ?`)
+      .get(id);
+    return row ? mapLedger(row) : null;
+  }
+
+  /**
+   * Mark every still-in-flight ledger row as `interrupted` and stamp
+   * `updated_utc`. Called once at boot so a crash cannot leave phantom
+   * `dispatched`/`running` work that `/seam workflows` and the watchdog
+   * would treat as live. Terminal rows (completed / failed / timed_out)
+   * and deliberately-parked rows are untouched. Target, correlation, and
+   * `acp_session_id` are preserved so resume (#76) can act on them.
+   *
+   * Returns the number of rows flipped. Does not delete any ACP session.
+   */
+  reconcileOrphanedDelegations(nowUtc = new Date().toISOString()): number {
+    const placeholders = DELEGATION_ACTIVE_STATUSES.map(() => "?").join(", ");
+    const info = this.db
+      .prepare(
+        `UPDATE delegation_log
+            SET status = 'interrupted', updated_utc = ?
+          WHERE status IN (${placeholders})`
+      )
+      .run(nowUtc, ...DELEGATION_ACTIVE_STATUSES);
+    return info.changes;
+  }
+
   /**
    * The originating row for a correlation id. A correlation identifies one
    * logical delegation whose single row is mutated through its lifecycle; if
@@ -942,6 +990,7 @@ export class SessionStore {
       kind: "report_back",
       promptPreview: truncatePreview(entry.promptPreview ?? null),
       correlationId: entry.correlationId ?? null,
+      acpSessionId: entry.acpSessionId ?? null,
       status: entry.status ?? "dispatched",
       createdUtc,
       updatedUtc: entry.updatedUtc ?? createdUtc,
@@ -951,10 +1000,10 @@ export class SessionStore {
         .prepare(
           `INSERT INTO delegation_log
              (id, source_ref, target_ref, worker, kind, prompt_preview,
-              correlation_id, status, created_utc, updated_utc)
+              correlation_id, acp_session_id, status, created_utc, updated_utc)
            SELECT
              @id, @sourceRef, @targetRef, @worker, @kind, @promptPreview,
-             @correlationId, @status, @createdUtc, @updatedUtc
+             @correlationId, @acpSessionId, @status, @createdUtc, @updatedUtc
            WHERE @correlationId IS NULL OR NOT EXISTS (
              SELECT 1 FROM delegation_log
               WHERE kind = 'report_back' AND correlation_id = @correlationId
@@ -1457,6 +1506,7 @@ CREATE TABLE IF NOT EXISTS delegation_log (
   kind            TEXT NOT NULL,
   prompt_preview  TEXT,
   correlation_id  TEXT,
+  acp_session_id  TEXT,
   status          TEXT NOT NULL,
   created_utc     TEXT NOT NULL,
   updated_utc     TEXT NOT NULL
@@ -1475,6 +1525,7 @@ interface LedgerRow {
   kind: string;
   prompt_preview: string | null;
   correlation_id: string | null;
+  acp_session_id: string | null;
   status: string;
   created_utc: string;
   updated_utc: string;
@@ -1488,6 +1539,7 @@ const mapLedger = (r: LedgerRow): LedgerEntry => ({
   kind: r.kind as DelegationKind,
   promptPreview: r.prompt_preview,
   correlationId: r.correlation_id,
+  acpSessionId: r.acp_session_id ?? null,
   status: r.status as DelegationStatus,
   createdUtc: r.created_utc,
   updatedUtc: r.updated_utc,
@@ -1757,6 +1809,7 @@ const LEDGER_PATCH_COLUMNS: Record<keyof LedgerPatch, string> = {
   worker: "worker",
   promptPreview: "prompt_preview",
   correlationId: "correlation_id",
+  acpSessionId: "acp_session_id",
 };
 
 function truncatePreview(text: string | null): string | null {

@@ -211,7 +211,12 @@ export type DelegationKind =
    *  policy must not treat it as an in-flight delegation. */
   | "inbox";
 
-/** Lifecycle of a ledger row. Terminal states: completed | failed | timed_out. */
+/**
+ * Lifecycle of a ledger row.
+ * Terminal: completed | failed | timed_out.
+ * `interrupted` is the boot-reconciliation state for crash leftovers (#75) —
+ * not in-flight, not a successful/failed completion; reserved for resume (#76).
+ */
 export type DelegationStatus =
   | "dispatched"
   | "running"
@@ -219,12 +224,21 @@ export type DelegationStatus =
   | "failed"
   | "timed_out"
   /** Deliberately set aside (e.g. awaiting human steering) — not terminal. */
-  | "parked";
+  | "parked"
+  /** Crash leftover: process died while the row was still in flight. */
+  | "interrupted";
 
 /** Statuses considered still in flight by `listActiveDelegations`. */
 export const DELEGATION_ACTIVE_STATUSES: readonly DelegationStatus[] = [
   "dispatched",
   "running",
+];
+
+/** Statuses a completed turn reached — boot reconciliation must not touch these. */
+export const DELEGATION_TERMINAL_STATUSES: readonly DelegationStatus[] = [
+  "completed",
+  "failed",
+  "timed_out",
 ];
 
 /** Max stored length of `promptPreview`; the store truncates on write. */
@@ -244,6 +258,12 @@ export interface LedgerEntry {
   promptPreview: string | null;
   /** Ties a handoff to its later report-back. */
   correlationId: string | null;
+  /**
+   * ACP session the turn is/was running in. Written at the `running`
+   * transition (as soon as `newSession()` returns for isolated dispatches)
+   * so a crash mid-turn still has a pointer for resume (#75 / #76).
+   */
+  acpSessionId: string | null;
   status: DelegationStatus;
   createdUtc: string;
   updatedUtc: string;
@@ -262,6 +282,8 @@ export interface LedgerEntryInput {
   worker?: string | null;
   promptPreview?: string | null;
   correlationId?: string | null;
+  /** Defaults to null — filled in at the `running` transition. */
+  acpSessionId?: string | null;
   /** Defaults to "dispatched". */
   status?: DelegationStatus;
   /** Defaults to now (ISO 8601). */
@@ -277,7 +299,12 @@ export interface LedgerEntryInput {
 export type LedgerPatch = Partial<
   Pick<
     LedgerEntry,
-    "sourceRef" | "targetRef" | "worker" | "promptPreview" | "correlationId"
+    | "sourceRef"
+    | "targetRef"
+    | "worker"
+    | "promptPreview"
+    | "correlationId"
+    | "acpSessionId"
   >
 >;
 

@@ -118,10 +118,9 @@ export async function fetchXaiModels(
  * exposed by `initialize` are `xai.api_key` (uses $XAI_API_KEY) and
  * `cached_token` (from `grok login`).
  *
- * Reasoning effort: as of grok CLI 0.2.93+, the `grok agent` command
- * supports `--reasoning-effort <low|medium|high>` (alias `--effort`).
- * Grok 4.5 supports reasoning_effort via the API; the CLI flag maps to
- * the same parameter.  We pass effort via CLI args at spawn time.
+ * Reasoning effort: `grok agent` accepts `--reasoning-effort` (alias
+ * `--effort`). Canonical CLI levels (grok 1.0.5+): none, minimal, low,
+ * medium, high, xhigh, max. We pass it as a spawn-time CLI flag.
  */
 export function makeGrokProfile(opts: {
   /** Profile id. Defaults to "grok". */
@@ -134,8 +133,7 @@ export function makeGrokProfile(opts: {
   defaultModel: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
   threadAbbr?: string;
-  /** Override the effort descriptor. Defaults to "none" until xAI
-   *  exposes a configOption or meta path for reasoning effort. */
+  /** Override the effort descriptor. Defaults to spawnArgs + the CLI levels. */
   effort?: AgentProfile["effort"];
   /** Custom environment variables to inject into the spawned process. */
   extraEnv?: Record<string, string>;
@@ -148,13 +146,12 @@ export function makeGrokProfile(opts: {
     defaultModel: opts.defaultModel,
     staticModels: opts.staticModels,
     threadAbbr: opts.threadAbbr,
-    // Reasoning effort: grok CLI 0.2.93+ supports --reasoning-effort on
-    // `grok agent`.  Grok 4.5 supports low/medium/high; Grok 4.20 multi-agent
-    // also supports xhigh.  We pass effort via CLI flag at spawn time and
-    // expose it through the spawn-args effort mechanism.
+    // Reasoning effort: CLI flag at spawn (`--reasoning-effort`). Without
+    // mechanism "spawnArgs", SessionRouter treats grok as having no effort
+    // and silently ignores channel/thread preset pins.
     effort: opts.effort ?? {
-      mechanism: "none",
-      levels: ["low", "medium", "high", "xhigh"],
+      mechanism: "spawnArgs",
+      levels: ["low", "medium", "high", "xhigh", "max"],
     },
     spawn(modelOverride?: string, effortOverride?: string) {
       const env: NodeJS.ProcessEnv = { ...process.env };

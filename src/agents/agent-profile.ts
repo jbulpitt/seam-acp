@@ -69,11 +69,13 @@ export interface AgentProfile {
    *                     `setSessionConfigOption` (Copilot: `reasoning_effort`).
    *   - "modelBaked"  → effort is part of the model choice; no separate control
    *                     (agy ships high/med/low model variants).
+   *   - "spawnArgs"   → passed as a CLI flag at process spawn (Grok:
+   *                     `--reasoning-effort`). No ACP config option / `_meta`.
    *   - "none"        → the agent has no reasoning-effort concept.
    * Omit entirely to mean "not settable" (treated like "none").
    */
   readonly effort?: {
-    readonly mechanism: "meta" | "configOption" | "modelBaked" | "none";
+    readonly mechanism: "meta" | "configOption" | "modelBaked" | "spawnArgs" | "none";
     /** ACP config option id for mechanism "configOption" (e.g. "reasoning_effort"). */
     readonly configId?: string;
     /** Levels the picker should offer. Empty ⇒ effort is not separately settable. */

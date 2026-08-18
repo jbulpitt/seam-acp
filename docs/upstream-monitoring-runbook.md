@@ -4,7 +4,7 @@
 >
 > **Cadence**: Weekly sweep (recommended: Monday), with ad-hoc checks when a major release is announced.
 >
-> **Last updated**: 2026-08-16 (daily sweep)
+> **Last updated**: 2026-08-18 (daily sweep)
 >
 > **⚠️ AGENT CONSTRAINT — READ-ONLY / REPORTING MODE**: Agents executing this runbook must **never** modify seam-acp source files, run `npm run redeploy`, apply patches, or make any code changes during a monitoring sweep. All code work is tracked via GitHub issues and implemented in **separate, explicitly tasked sessions**. Your job during a sweep is to **find, classify, and file or update GitHub issues** — not to implement fixes.
 
@@ -405,14 +405,14 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 ### Gather Checklist
 
 #### Google / Antigravity CLI (agy)
-- [ ] Check [Antigravity CLI releases](https://github.com/google-antigravity/antigravity-cli/releases) — last checked version: **1.1.13** (2026-08-16 sweep; installed = latest; no new release; #47 and #42 open)
+- [ ] Check [Antigravity CLI releases](https://github.com/google-antigravity/antigravity-cli/releases) — last checked version: **1.1.14** (2026-08-18 sweep; installed = latest; #47 and #42 open)
 - [ ] Check [Antigravity CLI CHANGELOG](https://github.com/google-antigravity/antigravity-cli/blob/main/CHANGELOG.md)
 - [ ] Check [Gemini API release notes](https://ai.google.dev/gemini-api/docs/changelog) (models shared with agy)
 - [ ] Scan [Google AI Blog](https://blog.google/technology/ai/) for announcements
 - [ ] Check [Google AI pricing](https://ai.google.dev/gemini-api/docs/pricing) for changes
 
 #### Anthropic / Claude Code
-- [ ] Check [Claude Code releases](https://github.com/anthropics/claude-code/releases) — last checked version: **2.1.233** (2026-08-16 sweep; installed 2.1.222, upgrade tracked in #40; 2.1.233: todo tools removed from Opus 4.8+/Sonnet5/Fable5/Mythos5 by default (CLAUDE_CODE_ENABLE_TODO_TOOLS=1 to restore), [claude-code:unrecognized_model] stderr diagnostic, CLAUDE_CODE_TOOL_MEMORY_LIMIT env var, CLAUDE_CODE_WEBFETCH_CACHE_TTL_MS env var, Linux idle CPU fix, GitLab MR worktree support, forward_user_identity apps gateway setting; #40 updated)
+- [ ] Check [Claude Code releases](https://github.com/anthropics/claude-code/releases) — last checked version: **2.1.234** (2026-08-18 sweep; installed 2.1.222, upgrade tracked in #40; 2.1.234: CLAUDE_CODE_PROJECT_DIR_NAME env var, auto-continue on usage limit reset, NT-namespace path security fix, auto-mode-compaction network access fix, session-scoped permission answers fix, MCP diagnostics secret leak fix, system-reminder wrapping for between-turn notifications, /permissions mid-turn access; #40 updated)
 - [ ] Check [Claude Code CHANGELOG](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)
 - [ ] Check [Claude Code docs changelog](https://docs.anthropic.com/en/docs/claude-code/changelog)
 - [ ] Check [claude-agent-acp releases](https://github.com/agentclientprotocol/claude-agent-acp/releases) — last checked version: **0.69.0** (2026-08-16 sweep; installed 0.54.1, upgrade tracked in #39; 0.69.0: report changed files to AIR protocol — additive, no seam-acp code changes needed; #39 updated)

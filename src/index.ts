@@ -508,13 +508,26 @@ async function main(): Promise<void> {
       // scoped to the token-resolved caller — no cross-thread reads.
       describeConfig: (record) => router.describeConfig(record),
       listConfigEntities: (record) => ({
+        // #69: FULL schedule definitions (incl. promptText + id), not the thin
+        // name/cron/tz listing — so an agent can describe AND target a schedule.
         schedules: store
           .listScheduledByChannel(record.platform, record.channelRef)
           .map((s) => ({
+            id: s.id,
             name: s.name,
+            promptText: s.promptText,
             cron: s.cron,
             timezone: s.timezone,
             enabled: s.enabled,
+            sessionMode: s.sessionMode,
+            model: s.model,
+            cwd: s.cwd,
+            targetChannel: s.targetChannel,
+            outputType: s.outputType,
+            catchupSeconds: s.catchupSeconds,
+            attachments: s.attachments.map((a) => a.filename),
+            lastStatus: s.lastStatus,
+            lastRunUtc: s.lastRunUtc,
             nextRunUtc: s.nextRunUtc,
           })),
         presets: store.listPresetsForProject(record.parentRef).map((p) => ({
@@ -522,6 +535,10 @@ async function main(): Promise<void> {
           scope: p.projectRef ? ("project" as const) : ("global" as const),
           agentId: p.agentId,
           model: p.model,
+          effort: p.effort,
+          permission: p.permission,
+          cwd: p.repoPath,
+          description: p.description,
         })),
       }),
       // #58 D2: the mutation tool refuses in a locked channel — enforced in the

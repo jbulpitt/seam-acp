@@ -18,6 +18,7 @@ const TIER_ICON: Record<string, string> = {
   preset: "📦",
   "channel-preset": "📌",
   "thread-preset": "🪡",
+  schedule: "📅",
 };
 
 /** One-line summary is human text — clamp it so a wordy summary stays on its

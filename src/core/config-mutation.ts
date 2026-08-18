@@ -33,6 +33,8 @@ import { PresetsFileSchema } from "../config.js";
 import type { Logger } from "../lib/logger.js";
 import type { AgentProfile } from "../agents/agent-profile.js";
 import type { ConfigDescription } from "./session-router.js";
+import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
+import type { ScheduledPrompt } from "./scheduled-prompts/types.js";
 import type {
   ConfigAuditEntry,
   ConfigAuditInput,
@@ -43,7 +45,12 @@ import type {
 } from "./types.js";
 
 /** Config surface a single proposal touches. */
-export type ConfigMutationTier = "session" | "preset" | "channel-preset" | "thread-preset";
+export type ConfigMutationTier =
+  | "session"
+  | "preset"
+  | "channel-preset"
+  | "thread-preset"
+  | "schedule";
 
 /** Tier A — the calling thread's own session config. */
 export interface SessionConfigChanges {
@@ -96,6 +103,39 @@ export interface ThreadPresetChanges {
   rider?: string | null;
 }
 
+/** Tier D — a scheduled prompt bound to the calling thread (#69).
+ *
+ *  The cron is validated through the SAME `validateCron` the arm path uses, so a
+ *  bad expression is refused at WRITE time rather than silently never firing.
+ *  ATTACHMENTS ARE DELIBERATELY ABSENT: their bytes come from Discord uploads and
+ *  are persisted at create-time on disk (`saveScheduledAttachment`), so they
+ *  cannot be managed conversationally — everything else about a schedule can. */
+export interface ScheduleChanges {
+  /** create = new schedule; the rest target an EXISTING schedule by `id`. */
+  action: "create" | "update" | "enable" | "disable" | "delete";
+  /** Target schedule id. Required for update/enable/disable/delete; ignored on create. */
+  id?: string;
+  name?: string;
+  /** The prompt the job runs each fire. Required on create. */
+  promptText?: string;
+  /** Standard cron expression (5/6-field croner syntax). Required on create.
+   *  Translate the user's natural-language cadence into this; it is hard-
+   *  validated so a bad expression is refused before it is ever persisted. */
+  cron?: string;
+  /** IANA timezone (e.g. "America/Chicago"). Defaults to the deployment default on create. */
+  timezone?: string;
+  /** Execution mode. "isolated" (default) = throwaway session; "live" = runs in
+   *  this thread, in which case model/cwd/targetChannel/outputType are ignored. */
+  sessionMode?: "isolated" | "live";
+  /** Isolated-mode overrides. `null` clears back to the thread default. */
+  model?: string | null;
+  cwd?: string | null;
+  targetChannel?: string | null;
+  outputType?: "card" | "messages";
+  /** Missed-fire catch-up window in seconds. 0 = never catch up. */
+  catchupSeconds?: number;
+}
+
 /** A single `config_propose` request. Exactly one tier per call (D8: intent-
  *  shaped, not a table-mapped CRUD surface). */
 export interface ConfigMutationInput {
@@ -103,6 +143,7 @@ export interface ConfigMutationInput {
   preset?: PresetChanges;
   channelPreset?: ChannelPresetChanges;
   threadPreset?: ThreadPresetChanges;
+  schedule?: ScheduleChanges;
 }
 
 /** Who authorized the change — the human who clicked confirm. The click carries
@@ -154,6 +195,11 @@ export interface ConfigMutationStore {
   getPresetByNameScoped(name: string, projectRef: string | null): Preset | null;
   upsertPreset(p: Preset): void;
   recordConfigMutation(entry: ConfigAuditInput): ConfigAuditEntry;
+  // Scheduled prompts (#69) — the Tier-D surface.
+  getScheduled(id: string): ScheduledPrompt | null;
+  listScheduledByChannel(platform: string, channelRef: string): ScheduledPrompt[];
+  upsertScheduled(s: ScheduledPrompt): void;
+  deleteScheduled(id: string): void;
 }
 
 export interface ConfigMutationDeps {
@@ -168,6 +214,16 @@ export interface ConfigMutationDeps {
   tierCEnabled: boolean;
   /** Hot-reload the live preset maps after a Tier-C write (P0). */
   reloadPresets: () => { ok: boolean; error?: string };
+  /** (Re)arm the croner timer for a schedule after a Tier-D write (#69). Writing
+   *  the DB row arms NOTHING — the manager owns the timers — so create/update/
+   *  delete MUST call this or the row exists but never fires. Wired in the
+   *  orchestrator to `scheduledManager.reschedule`. */
+  reschedule: (id: string) => void;
+  /** Deployment default IANA timezone for a schedule created without one (#69). */
+  defaultTimezone: string;
+  /** Best-effort removal of a deleted schedule's on-disk attachment dir (#69).
+   *  Fire-and-forget; undefined ⇒ no attachment store to clean (e.g. tests). */
+  cleanupScheduleAttachments?: (id: string) => void;
   logger: Logger;
 }
 
@@ -193,13 +249,14 @@ export class ConfigMutationService {
       input.preset ? "preset" : null,
       input.channelPreset ? "channel-preset" : null,
       input.threadPreset ? "thread-preset" : null,
+      input.schedule ? "schedule" : null,
     ].filter((t): t is ConfigMutationTier => t !== null);
 
     if (tiers.length === 0) {
       return {
         ok: false,
         error:
-          "Nothing to change. Provide exactly one of `session`, `preset`, `channelPreset`, or `threadPreset`.",
+          "Nothing to change. Provide exactly one of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.",
       };
     }
     if (tiers.length > 1) {
@@ -207,7 +264,7 @@ export class ConfigMutationService {
         ok: false,
         error:
           "One change at a time. A proposal must touch exactly one of `session`, " +
-          "`preset`, `channelPreset`, or `threadPreset` so the confirmation is unambiguous.",
+          "`preset`, `channelPreset`, `threadPreset`, or `schedule` so the confirmation is unambiguous.",
       };
     }
 
@@ -215,6 +272,7 @@ export class ConfigMutationService {
     if (tier === "session") return this.buildSessionProposal(record, input.session!);
     if (tier === "preset") return this.buildPresetProposal(record, input.preset!);
     if (tier === "thread-preset") return this.buildThreadPresetProposal(record, input.threadPreset!);
+    if (tier === "schedule") return this.buildScheduleProposal(record, input.schedule!);
     return this.buildChannelPresetProposal(record, input.channelPreset!);
   }
 
@@ -829,6 +887,333 @@ export class ConfigMutationService {
     return { ok: true, proposal };
   }
 
+  // --- Tier D: scheduled prompt (#69) --------------------------------------
+
+  /**
+   * Validate + compute a scheduled-prompt proposal for the calling thread (#69).
+   * Writes NOTHING (D5). Every mutating branch's `apply` writes the DB row AND
+   * calls `reschedule(id)` — because writing the row arms no timer (the manager
+   * owns them), so a create/update/delete that skipped `reschedule` would list
+   * fine yet never fire (or keep firing after a delete). The cron is hard-
+   * validated through the SAME `validateCron` the arm path uses, so a bad
+   * expression is refused here at write-time rather than silently failing at
+   * arm-time. Self-scope (D3): only the caller's OWN thread's schedules are
+   * reachable — an existing row whose channelRef isn't the caller's is refused.
+   */
+  private buildScheduleProposal(
+    record: SessionRecord,
+    changes: ScheduleChanges
+  ): BuildProposalResult {
+    const action = changes.action;
+    if (!action) {
+      return {
+        ok: false,
+        error: "`schedule.action` is required: one of create, update, enable, disable, delete.",
+      };
+    }
+
+    // --- resolve + self-scope the target for every non-create action ---------
+    let existing: ScheduledPrompt | null = null;
+    if (action !== "create") {
+      const id = changes.id?.trim();
+      if (!id) {
+        return { ok: false, error: `\`schedule.id\` is required for "${action}".` };
+      }
+      existing = this.deps.store.getScheduled(id);
+      // D3 self-scope: a caller may only touch schedules bound to its OWN thread.
+      // An unknown id and another thread's id are reported identically so the
+      // tool never becomes a cross-thread existence oracle.
+      if (
+        !existing ||
+        existing.platform !== record.platform ||
+        existing.channelRef !== record.channelRef
+      ) {
+        return {
+          ok: false,
+          error: `No schedule "${id}" in this thread. List them with config_describe.`,
+        };
+      }
+    }
+
+    if (action === "delete") return this.buildScheduleDelete(record, existing!);
+    if (action === "enable" || action === "disable") {
+      return this.buildScheduleToggle(record, existing!, action === "enable");
+    }
+    return this.buildScheduleUpsert(record, changes, existing);
+  }
+
+  private buildScheduleDelete(
+    record: SessionRecord,
+    existing: ScheduledPrompt
+  ): BuildProposalResult {
+    const id = randomUUID();
+    const proposal: ConfigProposal = {
+      id,
+      tier: "schedule",
+      scope: record.channelRef,
+      title: `Delete scheduled prompt "${existing.name}"`,
+      fields: [
+        { label: "name", before: existing.name, after: "(deleted)" },
+        { label: "cadence", before: `${describeCron(existing.cron)} (${existing.timezone})`, after: "(deleted)" },
+      ],
+      warnings: existing.attachments.length
+        ? [`${existing.attachments.length} attached reference file(s) will be removed with it.`]
+        : [],
+      restartsSession: false,
+      apply: (actor) => {
+        this.deps.store.deleteScheduled(existing.id);
+        // reschedule with the row now gone disarms the timer (D: manager owns it).
+        this.deps.reschedule(existing.id);
+        this.deps.cleanupScheduleAttachments?.(existing.id);
+        const audit = this.writeAudit({
+          tier: "schedule",
+          scope: record.channelRef,
+          correlationId: id,
+          actor,
+          summary: `delete schedule "${existing.name}" (${existing.id})`,
+          before: this.scheduleSnapshot(existing),
+          after: { schedule: null },
+        });
+        return {
+          ok: true,
+          message: `Deleted scheduled prompt "${existing.name}" (${existing.id}). Its timer is disarmed.`,
+          auditId: audit.id,
+        };
+      },
+    };
+    return { ok: true, proposal };
+  }
+
+  private buildScheduleToggle(
+    record: SessionRecord,
+    existing: ScheduledPrompt,
+    enable: boolean
+  ): BuildProposalResult {
+    if (existing.enabled === enable) {
+      return {
+        ok: false,
+        error: `Schedule "${existing.name}" is already ${enable ? "enabled" : "disabled"}.`,
+      };
+    }
+    const id = randomUUID();
+    const proposal: ConfigProposal = {
+      id,
+      tier: "schedule",
+      scope: record.channelRef,
+      title: `${enable ? "Enable" : "Disable"} scheduled prompt "${existing.name}"`,
+      fields: [{ label: "enabled", before: String(existing.enabled), after: String(enable) }],
+      warnings: [],
+      restartsSession: false,
+      apply: (actor) => {
+        const updated: ScheduledPrompt = {
+          ...existing,
+          enabled: enable,
+          updatedUtc: new Date().toISOString(),
+        };
+        this.deps.store.upsertScheduled(updated);
+        // Arms (enable) or disarms (disable) the timer to match the new row.
+        this.deps.reschedule(existing.id);
+        const audit = this.writeAudit({
+          tier: "schedule",
+          scope: record.channelRef,
+          correlationId: id,
+          actor,
+          summary: `${enable ? "enable" : "disable"} schedule "${existing.name}" (${existing.id})`,
+          before: this.scheduleSnapshot(existing),
+          after: this.scheduleSnapshot(updated),
+        });
+        return {
+          ok: true,
+          message: `${enable ? "Enabled" : "Disabled"} "${existing.name}" (${existing.id}).`,
+          auditId: audit.id,
+        };
+      },
+    };
+    return { ok: true, proposal };
+  }
+
+  private buildScheduleUpsert(
+    record: SessionRecord,
+    changes: ScheduleChanges,
+    existing: ScheduledPrompt | null
+  ): BuildProposalResult {
+    const creating = existing === null;
+
+    // Resolve the effective values: provided → existing → default.
+    const name = (changes.name ?? existing?.name)?.trim();
+    if (!name) return { ok: false, error: "`schedule.name` is required to create a schedule." };
+    const promptText = (changes.promptText ?? existing?.promptText)?.trim();
+    if (!promptText) return { ok: false, error: "`schedule.promptText` is required to create a schedule." };
+
+    const cron = (changes.cron ?? existing?.cron)?.trim();
+    if (!cron) return { ok: false, error: "`schedule.cron` is required to create a schedule." };
+
+    const timezone = (changes.timezone ?? existing?.timezone ?? this.deps.defaultTimezone).trim();
+    if (!isValidTimeZone(timezone)) {
+      return {
+        ok: false,
+        error: `"${timezone}" is not a valid IANA timezone (e.g. "America/Chicago", "Europe/London").`,
+      };
+    }
+
+    // HARD REQUIREMENT (#69): validate through the SAME validateCron the arm path
+    // uses. An invalid cron fails at ARM time, not write time — so a bad row would
+    // list fine and simply never fire. Refuse it here, before persisting anything.
+    const check = validateCron(cron, timezone);
+    if (!check.ok || !check.next) {
+      return {
+        ok: false,
+        error: `Invalid schedule: ${check.error ?? "that cron has no upcoming runs"}. Nothing was written.`,
+      };
+    }
+    const nextRunDate = check.next;
+
+    const sessionMode: "isolated" | "live" =
+      changes.sessionMode ?? existing?.sessionMode ?? "isolated";
+    const live = sessionMode === "live";
+
+    // In live mode model/cwd/target/output are meaningless (D1) — null them so a
+    // mode flip can't leave stale values behind. In isolated mode, provided →
+    // existing → default. `null` explicitly clears back to the thread default.
+    const resolveNullable = (
+      provided: string | null | undefined,
+      prev: string | null
+    ): string | null => (provided === undefined ? prev : provided === null ? null : provided.trim() || null);
+
+    const model = live ? null : resolveNullable(changes.model, existing?.model ?? null);
+    const cwd = live ? null : resolveNullable(changes.cwd, existing?.cwd ?? null);
+    const targetChannel = live ? null : resolveNullable(changes.targetChannel, existing?.targetChannel ?? null);
+    const outputType: "card" | "messages" = live
+      ? "card"
+      : (changes.outputType ?? existing?.outputType ?? "card");
+    const catchupSeconds =
+      changes.catchupSeconds !== undefined
+        ? Math.max(0, Math.floor(changes.catchupSeconds))
+        : (existing?.catchupSeconds ?? 7200);
+
+    const now = new Date().toISOString();
+    const scheduleId = existing?.id ?? `sch_${randomUUID().slice(0, 8)}`;
+    const nextRunUtc = nextRunDate.toISOString();
+
+    // Build the row to persist. On update, preserve id / created* / enabled /
+    // last-run / attachments (attachments can't be managed conversationally).
+    const buildRow = (actor: MutationActor): ScheduledPrompt =>
+      existing
+        ? {
+            ...existing,
+            name,
+            promptText,
+            cron,
+            timezone,
+            sessionMode,
+            model,
+            cwd,
+            targetChannel,
+            outputType,
+            catchupSeconds,
+            updatedUtc: now,
+            nextRunUtc,
+          }
+        : {
+            id: scheduleId,
+            platform: record.platform,
+            channelRef: record.channelRef,
+            parentRef: record.parentRef,
+            name,
+            promptText,
+            cron,
+            timezone,
+            model,
+            cwd,
+            targetChannel,
+            outputType,
+            sessionMode,
+            catchupSeconds,
+            enabled: true,
+            attachments: [],
+            createdBy: actor.id ?? "seam-mcp",
+            createdUtc: now,
+            updatedUtc: now,
+            lastRunUtc: null,
+            lastStatus: null,
+            nextRunUtc,
+            pinnedSessionId: null,
+          };
+
+    // Diff for the confirm card: parsed cron + resolved next run are ALWAYS shown
+    // (#69 — the only proof the schedule means what the user said, so a timezone
+    // mistake is visible before Apply).
+    const fields: ProposedField[] = [];
+    const field = (label: string, b: string | null, a: string | null) => {
+      if ((b ?? "(unset)") !== (a ?? "(unset)")) {
+        fields.push({ label, before: b ?? "(unset)", after: a ?? "(unset)" });
+      }
+    };
+    if (creating) fields.push({ label: "name", before: "(new)", after: name });
+    else field("name", existing!.name, name);
+    field("cadence", existing ? `${describeCron(existing.cron)} [${existing.cron}]` : null, `${describeCron(cron)} [${cron}]`);
+    field("timezone", existing?.timezone ?? null, timezone);
+    // Resolved next run — echoed even when unchanged, so it's never missing.
+    fields.push({
+      label: "next run",
+      before: existing?.nextRunUtc ?? "(none)",
+      after: nextRunUtc,
+    });
+    field("prompt", existing ? clip(existing.promptText, 200) : null, clip(promptText, 200));
+    field("session", existing?.sessionMode ?? null, sessionMode);
+    if (!live) {
+      field("model", existing?.model ?? null, model);
+      field("cwd", existing?.cwd ?? null, cwd);
+      field("targetChannel", existing?.targetChannel ?? null, targetChannel);
+      field("outputType", existing?.outputType ?? null, outputType);
+    }
+
+    const warnings: string[] = [];
+    if (live && (changes.model != null || changes.cwd != null || changes.targetChannel != null || changes.outputType != null)) {
+      warnings.push("Live mode ignores model / cwd / targetChannel / outputType — the thread's own config governs the run.");
+    }
+    if (creating) {
+      warnings.push("Attachments can't be added conversationally — use `/seam schedule add-file` to attach reference files.");
+    }
+
+    const id = randomUUID();
+    const proposal: ConfigProposal = {
+      id,
+      tier: "schedule",
+      scope: record.channelRef,
+      title: `${creating ? "Create" : "Update"} scheduled prompt "${name}"`,
+      fields,
+      warnings,
+      // Applying a schedule change must NEVER restart the calling thread — it
+      // re-arms the manager's timer instead (below), leaving the session intact.
+      restartsSession: false,
+      apply: (actor) => {
+        const row = buildRow(actor);
+        this.deps.store.upsertScheduled(row);
+        // HARD REQUIREMENT (#69): arm/refresh the timer. Without this the row
+        // exists, config_describe lists it, and it never runs.
+        this.deps.reschedule(row.id);
+        const audit = this.writeAudit({
+          tier: "schedule",
+          scope: record.channelRef,
+          correlationId: id,
+          actor,
+          summary: `${creating ? "create" : "update"} schedule "${name}" (${row.id})`,
+          before: existing ? this.scheduleSnapshot(existing) : { schedule: null },
+          after: this.scheduleSnapshot(row),
+        });
+        return {
+          ok: true,
+          message:
+            `Scheduled prompt "${name}" ${creating ? "created" : "updated"} (${row.id}) and armed — ` +
+            `next run ${nextRunUtc}${row.enabled ? "" : " (currently disabled)"}.`,
+          auditId: audit.id,
+        };
+      },
+    };
+    return { ok: true, proposal };
+  }
+
   // --- helpers -------------------------------------------------------------
 
   private writeAudit(opts: {
@@ -879,4 +1264,40 @@ export class ConfigMutationService {
       description: p.description,
     };
   }
+
+  private scheduleSnapshot(s: ScheduledPrompt): Record<string, unknown> {
+    return {
+      id: s.id,
+      name: s.name,
+      promptText: s.promptText,
+      cron: s.cron,
+      timezone: s.timezone,
+      sessionMode: s.sessionMode,
+      model: s.model,
+      cwd: s.cwd,
+      targetChannel: s.targetChannel,
+      outputType: s.outputType,
+      catchupSeconds: s.catchupSeconds,
+      enabled: s.enabled,
+      nextRunUtc: s.nextRunUtc,
+    };
+  }
+}
+
+/** True if `tz` is a real IANA zone. Intl throws a RangeError for anything it
+ *  doesn't recognize, which is exactly the "must be a real IANA zone" gate. */
+function isValidTimeZone(tz: string): boolean {
+  if (!tz) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Clip a possibly-multiline string to one clamped line for a diff-card field. */
+function clip(s: string, max: number): string {
+  const flat = s.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }

@@ -287,6 +287,14 @@ export class Orchestrator {
           this.config.CHANNEL_PRESETS_FILE,
           this.logger
         ),
+      // #69 Tier D: (re)arm the manager's croner timer after a schedule write, so
+      // the row and the live timer never diverge. `scheduledManager` is set by
+      // index.ts after construction; the `?.` guards the pre-wire window.
+      reschedule: (id) => this.scheduledManager?.reschedule(id),
+      defaultTimezone: SCHEDULE_DEFAULT_TZ,
+      cleanupScheduleAttachments: (id) => {
+        void deleteScheduledAttachmentDir(this.config.DATA_DIR, id).catch(() => {});
+      },
       logger: this.logger,
     });
   }

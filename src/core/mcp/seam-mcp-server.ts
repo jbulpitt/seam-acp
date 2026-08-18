@@ -32,14 +32,34 @@ import type { ConfigDescription } from "../session-router.js";
 import type { ConfigMutationInput } from "../config-mutation.js";
 
 /** Read-only entities visible to the calling thread (schedules + presets),
- *  returned by `config_describe` alongside the effective config. Kept as a
- *  minimal projection so the server stays decoupled from the store types. */
+ *  returned by `config_describe` alongside the effective config. A FULL
+ *  projection (#69): the schedule entries carry every field an agent needs to
+ *  answer "what does my morning schedule do?" — most importantly `promptText`,
+ *  the actual content — and the `id` needed to target a `config_propose`
+ *  schedule edit. Kept as its own projection so the server stays decoupled from
+ *  the store's row types. */
 export interface ConfigEntities {
   schedules: Array<{
+    /** The stable id — the handle `config_propose {schedule:{action:"update"…}}` targets. */
+    id: string;
     name: string;
+    /** The actual prompt the job runs — the field the thin listing omitted (#69). */
+    promptText: string;
     cron: string;
     timezone: string;
     enabled: boolean;
+    /** "isolated" (throwaway session) or "live" (runs in this thread). */
+    sessionMode: "isolated" | "live";
+    /** Isolated-mode overrides (meaningless/ignored in live mode). */
+    model: string | null;
+    cwd: string | null;
+    targetChannel: string | null;
+    outputType: "card" | "messages";
+    catchupSeconds: number;
+    /** Reference files re-sent every run (names only — bytes live on disk). */
+    attachments: string[];
+    lastStatus: string | null;
+    lastRunUtc: string | null;
     nextRunUtc: string | null;
   }>;
   presets: Array<{
@@ -47,6 +67,10 @@ export interface ConfigEntities {
     scope: "project" | "global";
     agentId: string | null;
     model: string | null;
+    effort: string | null;
+    permission: string | null;
+    cwd: string | null;
+    description: string | null;
   }>;
 }
 
@@ -712,13 +736,19 @@ const TOOLS = [
     description:
       "Propose a configuration change for YOUR OWN thread. This does NOT apply anything: it posts a " +
       "confirmation card in your thread showing the exact before→after diff, and a human must click " +
-      "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, or `threadPreset`.\n" +
+      "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.\n" +
       "- session: your thread's own runtime config (agent, model, effort, cwd, permission).\n" +
       "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target).\n" +
       "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider). " +
       "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider.\n" +
       "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider). " +
-      "Applies to EVERY thread under the channel. Both may be disabled by the deployment; `locked` can NEVER be changed.\n" +
+      "Applies to EVERY thread under the channel. May be disabled by the deployment; `locked` can NEVER be changed.\n" +
+      "- schedule: create/update/enable/disable/delete a scheduled prompt for THIS thread. Translate the " +
+      "user's natural-language cadence into a standard cron expression (e.g. \"every weekday at 7am\" → " +
+      "\"0 7 * * 1-5\"); the card echoes the parsed cadence AND the resolved next run time so a timezone " +
+      "mistake is visible before Apply. An invalid cron or timezone is refused before anything is written. " +
+      "NOTE: attachments (reference files) CANNOT be managed here — their bytes come from Discord uploads " +
+      "(`/seam schedule add-file`); everything else about a schedule can.\n" +
       "You can only ever change your OWN thread/channel — cross-thread config is not available here, and a " +
       "locked channel refuses every change.",
     inputSchema: {
@@ -778,6 +808,58 @@ const TOOLS = [
             rider: { type: "string", description: "Extra per-turn harness-preamble rule." },
           },
         },
+        schedule: {
+          type: "object",
+          description:
+            "Tier D — a scheduled prompt bound to THIS thread. `create` needs name + promptText + cron; " +
+            "update/enable/disable/delete need `id` (from config_describe). Attachments are not settable here.",
+          properties: {
+            action: {
+              type: "string",
+              enum: ["create", "update", "enable", "disable", "delete"],
+              description: "Which operation to propose.",
+            },
+            id: {
+              type: "string",
+              description: "Target schedule id (required for update/enable/disable/delete; from config_describe).",
+            },
+            name: { type: "string", description: "Human name for the schedule (required on create)." },
+            promptText: { type: "string", description: "The prompt the job runs each fire (required on create)." },
+            cron: {
+              type: "string",
+              description:
+                "Standard cron expression — translate the NL cadence into this (\"every weekday at 7am\" → " +
+                "\"0 7 * * 1-5\"). Hard-validated; a bad expression is refused before persisting.",
+            },
+            timezone: {
+              type: "string",
+              description: "IANA timezone, e.g. \"America/Chicago\". Defaults to the deployment default on create.",
+            },
+            sessionMode: {
+              type: "string",
+              enum: ["isolated", "live"],
+              description:
+                "\"isolated\" (default) runs each fire in a throwaway session; \"live\" runs it as a turn in " +
+                "THIS thread (model/cwd/targetChannel/outputType are then ignored).",
+            },
+            model: { type: "string", description: "Isolated-mode model override. null = thread default." },
+            cwd: { type: "string", description: "Isolated-mode working directory. null = thread default." },
+            targetChannel: {
+              type: "string",
+              description: "Isolated-mode: channel/thread id to post output to. null = this thread.",
+            },
+            outputType: {
+              type: "string",
+              enum: ["card", "messages"],
+              description: "Isolated-mode: render results as status cards or plain messages.",
+            },
+            catchupSeconds: {
+              type: "number",
+              description: "Missed-fire catch-up window in seconds. 0 = never catch up.",
+            },
+          },
+          required: ["action"],
+        },
       },
       required: [],
     },
@@ -817,6 +899,12 @@ const INSTRUCTIONS = [
   "  message simply waits until that agent polls. Use it to reach a teammate without forcing a new turn.",
   "- poll_inbox(): drain YOUR OWN inbox — read and remove the messages other agents left you via send",
   "  (deliver-once, self-scope). Call it to pick up asynchronous notes without waiting on a fresh chat turn.",
+  "- config_describe(): report YOUR thread's effective config AND the FULL definition of every scheduled",
+  "  prompt (incl. its promptText + id) and preset visible here — the way to answer \"what does my morning",
+  "  schedule do?\" and to find the `id` a schedule edit needs.",
+  "- config_propose(schedule|session|preset|channelPreset): propose a change (a human confirms via card).",
+  "  The `schedule` branch creates/updates/enables/disables/deletes a scheduled prompt from a natural-language",
+  "  cadence — translate it to cron; the card shows the parsed cadence + resolved next run before Apply.",
   "",
   "Prefer handoff to a preset for well-scoped specialist work, and to a thread id when a specific",
   "teammate already holds the context. Use chain when work has a fixed multi-stage pipeline.",
@@ -1568,16 +1656,33 @@ export class SeamMcpServer {
 
     const entities = this.deps.listConfigEntities?.(caller);
     if (entities) {
+      // FULL schedule definitions (#69): promptText + every field, so an agent
+      // asked "what does my morning schedule do?" can actually answer, and has
+      // the `id` it needs to edit/delete via config_propose.
       lines.push("", `Scheduled prompts (${entities.schedules.length}):`);
       if (entities.schedules.length === 0) {
         lines.push("  (none)");
       } else {
         for (const s of entities.schedules) {
           lines.push(
-            `  • ${s.name} — ${s.cron} ${s.timezone}` +
-              `${s.enabled ? "" : " [disabled]"}` +
-              `${s.nextRunUtc ? ` — next ${s.nextRunUtc}` : ""}`
+            `  • ${s.name} (${s.id})${s.enabled ? "" : " [disabled]"}`,
+            `      when:   ${s.cron} ${s.timezone}${s.nextRunUtc ? ` — next ${s.nextRunUtc}` : ""}`,
+            `      mode:   ${s.sessionMode}` +
+              (s.sessionMode === "isolated"
+                ? ` · model ${s.model ?? "(thread default)"} · cwd ${s.cwd ?? "(thread default)"}` +
+                  ` · output ${s.outputType}${s.targetChannel ? ` → ${s.targetChannel}` : ""}` +
+                  ` · catch-up ${s.catchupSeconds}s`
+                : ""),
+            `      prompt: ${oneLine(s.promptText, 400)}`
           );
+          if (s.attachments.length > 0) {
+            lines.push(`      files:  ${s.attachments.join(", ")}`);
+          }
+          const ran =
+            s.lastRunUtc || s.lastStatus
+              ? `${s.lastRunUtc ?? "?"}${s.lastStatus ? ` (${s.lastStatus})` : ""}`
+              : "never run";
+          lines.push(`      last:   ${ran}`);
         }
       }
       lines.push("", `Presets visible here (${entities.presets.length}):`);
@@ -1585,8 +1690,17 @@ export class SeamMcpServer {
         lines.push("  (none)");
       } else {
         for (const p of entities.presets) {
-          const bits = [p.agentId, p.model].filter(Boolean).join(" / ");
+          const bits = [
+            p.agentId ? `agent ${p.agentId}` : null,
+            p.model ? `model ${p.model}` : null,
+            p.effort ? `effort ${p.effort}` : null,
+            p.permission ? `perm ${p.permission}` : null,
+            p.cwd ? `cwd ${p.cwd}` : null,
+          ]
+            .filter(Boolean)
+            .join(" · ");
           lines.push(`  • ${p.name} [${p.scope}]${bits ? ` — ${bits}` : ""}`);
+          if (p.description) lines.push(`      ${oneLine(p.description, 200)}`);
         }
       }
     }
@@ -1659,6 +1773,9 @@ export class SeamMcpServer {
     }
     if (args.threadPreset && typeof args.threadPreset === "object") {
       input.threadPreset = args.threadPreset as ConfigMutationInput["threadPreset"];
+    }
+    if (args.schedule && typeof args.schedule === "object") {
+      input.schedule = args.schedule as ConfigMutationInput["schedule"];
     }
 
     const outcome = await this.deps.proposeConfig(caller, input);
@@ -1735,6 +1852,13 @@ function requireString(args: Record<string, unknown>, key: string): string {
     throw new Error(`"${key}" is required and must be a non-empty string`);
   }
   return v;
+}
+/** Flatten a possibly-multiline string to a single trimmed line, clamped to
+ *  `max` chars with an ellipsis. Used to render promptText/description inline in
+ *  the config_describe listing without letting a long body blow up the output. */
+function oneLine(s: string, max: number): string {
+  const flat = s.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 function optionalString(args: Record<string, unknown>, key: string): string | undefined {
   const v = args[key];

@@ -1276,6 +1276,42 @@ describe("config_propose lock enforcement (D2)", () => {
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0].text).toContain("not supported");
   });
+
+  it("forwards a `schedule` branch to proposeConfig (#69 NL→cron write)", async () => {
+    const seen: any[] = [];
+    h = await makeHarness({
+      isChannelLocked: () => false,
+      proposeConfig: async (_record, input) => {
+        seen.push(input);
+        return {
+          ok: true,
+          summary: 'Create scheduled prompt "Standup"',
+          fields: [
+            { label: "cadence", before: "(unset)", after: "At 07:00 AM, Mon–Fri [0 7 * * 1-5]" },
+            { label: "next run", before: "(none)", after: "2026-08-17T12:00:00.000Z" },
+          ],
+          restartsSession: false,
+        };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "config_propose",
+        arguments: {
+          schedule: { action: "create", name: "Standup", promptText: "Post the standup", cron: "0 7 * * 1-5" },
+        },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    // The schedule payload reached the service unchanged.
+    expect(seen).toHaveLength(1);
+    expect(seen[0].schedule).toMatchObject({ action: "create", cron: "0 7 * * 1-5" });
+    // The card echoes the parsed cadence AND the resolved next run.
+    expect(body.result.content[0].text).toContain("cadence");
+    expect(body.result.content[0].text).toContain("next run");
+  });
 });
 
 // -------------------------------------------------------------------------
@@ -1445,10 +1481,36 @@ describe("config_describe", () => {
       describeConfig: () => description,
       listConfigEntities: () => ({
         schedules: [
-          { name: "morning", cron: "0 7 * * 1-5", timezone: "America/Chicago", enabled: true, nextRunUtc: "2026-08-17T12:00:00Z" },
+          {
+            id: "sch_morning1",
+            name: "morning",
+            promptText: "Summarize overnight PRs and post the standup",
+            cron: "0 7 * * 1-5",
+            timezone: "America/Chicago",
+            enabled: true,
+            sessionMode: "isolated",
+            model: "claude-opus-4.6",
+            cwd: null,
+            targetChannel: null,
+            outputType: "card",
+            catchupSeconds: 7200,
+            attachments: ["spec.md"],
+            lastStatus: "ok",
+            lastRunUtc: "2026-08-16T12:00:00Z",
+            nextRunUtc: "2026-08-17T12:00:00Z",
+          },
         ],
         presets: [
-          { name: "ts-reviewer", scope: "project", agentId: "claude", model: "claude-opus-4.6" },
+          {
+            name: "ts-reviewer",
+            scope: "project",
+            agentId: "claude",
+            model: "claude-opus-4.6",
+            effort: "high",
+            permission: "ask",
+            cwd: "/repo/x",
+            description: "Reviews TypeScript PRs",
+          },
         ],
       }),
     });
@@ -1477,9 +1539,15 @@ describe("config_describe", () => {
       expect(text).toContain("(from session config)");
       expect(text).toContain("(from default)");
       expect(text).toContain("🔒");
-      // Entity listing folds in.
+      // Entity listing folds in — now the FULL definition (#69): the id (needed
+      // to target an edit), the promptText (the actual content), attachments,
+      // and last-run status all render, not just name/cron/tz.
       expect(text).toContain("morning");
+      expect(text).toContain("sch_morning1");
+      expect(text).toContain("Summarize overnight PRs and post the standup");
+      expect(text).toContain("spec.md");
       expect(text).toContain("ts-reviewer");
+      expect(text).toContain("Reviews TypeScript PRs");
     } finally {
       await server.stop();
     }

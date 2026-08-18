@@ -11,6 +11,7 @@ import type { ChannelPreset, ThreadPreset } from "../src/config.js";
 import type { ConfigDescription } from "../src/core/session-router.js";
 import type { AgentProfile } from "../src/agents/agent-profile.js";
 import type { SessionRecord } from "../src/core/types.js";
+import type { ScheduledPrompt } from "../src/core/scheduled-prompts/types.js";
 import type { Logger } from "../src/lib/logger.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
@@ -66,10 +67,18 @@ function describeConfig(record: SessionRecord): ConfigDescription {
   };
 }
 
+/** Ids passed to `reschedule` (the timer-arm hook), so a test can assert the
+ *  HARD REQUIREMENT that every schedule write re-arms the manager. */
+let rescheduled: string[] = [];
+/** Ids whose on-disk attachments were cleaned up (delete path). */
+let cleanedUp: string[] = [];
+
 function makeService(over: {
   presetsFile?: string;
   tierCEnabled?: boolean;
   reloadPresets?: () => { ok: boolean; error?: string };
+  reschedule?: (id: string) => void;
+  defaultTimezone?: string;
 } = {}): ConfigMutationService {
   return new ConfigMutationService({
     store,
@@ -79,6 +88,9 @@ function makeService(over: {
     presetsFile: over.presetsFile,
     tierCEnabled: over.tierCEnabled ?? false,
     reloadPresets: over.reloadPresets ?? (() => ({ ok: true })),
+    reschedule: over.reschedule ?? ((id) => rescheduled.push(id)),
+    defaultTimezone: over.defaultTimezone ?? "America/Chicago",
+    cleanupScheduleAttachments: (id) => cleanedUp.push(id),
     logger: silent,
   });
 }
@@ -86,6 +98,8 @@ function makeService(over: {
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-cfgmut-"));
   store = new SessionStore(path.join(dir, "test.db"));
+  rescheduled = [];
+  cleanedUp = [];
 });
 afterEach(() => {
   store.close();
@@ -425,5 +439,197 @@ describe("thread-preset mutation (Tier C, #68)", () => {
     expect(built.ok).toBe(false);
     if (built.ok) return;
     expect(built.error).toContain("No effective change");
+  });
+});
+
+// -------------------------------------------------------------------------
+// Tier D — scheduled prompts: NL→cron write, validate-before-persist, re-arm
+// -------------------------------------------------------------------------
+
+describe("scheduled-prompt mutation (Tier D)", () => {
+  function seedSchedule(over: Partial<ScheduledPrompt> = {}): ScheduledPrompt {
+    const row: ScheduledPrompt = {
+      id: "sch_seed01",
+      platform: "discord",
+      channelRef: "thread-1",
+      parentRef: "chan-1",
+      name: "Morning brief",
+      promptText: "Summarize overnight PRs",
+      cron: "0 7 * * 1-5",
+      timezone: "America/Chicago",
+      model: null,
+      cwd: null,
+      targetChannel: null,
+      outputType: "card",
+      sessionMode: "isolated",
+      catchupSeconds: 7200,
+      enabled: true,
+      attachments: [],
+      createdBy: "user-jesse",
+      createdUtc: "2026-01-01T00:00:00Z",
+      updatedUtc: "2026-01-01T00:00:00Z",
+      lastRunUtc: null,
+      lastStatus: null,
+      nextRunUtc: "2026-01-02T13:00:00Z",
+      pinnedSessionId: null,
+      ...over,
+    };
+    store.upsertScheduled(row);
+    return row;
+  }
+
+  it("create: side-effect free build; apply writes the row, arms the timer, echoes next run + parsed cron (D5/#69)", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const svc = makeService();
+
+    // "every weekday at 7am" → the agent supplies the translated cron.
+    const built = svc.buildProposal(record, {
+      schedule: { action: "create", name: "Standup", promptText: "Post the standup", cron: "0 7 * * 1-5" },
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+
+    // The card echoes the parsed cadence AND the resolved next run (the proof).
+    const labels = built.proposal.fields.map((f) => f.label);
+    expect(labels).toContain("cadence");
+    expect(labels).toContain("next run");
+    const nextField = built.proposal.fields.find((f) => f.label === "next run")!;
+    expect(nextField.after).toMatch(/^\d{4}-\d{2}-\d{2}T/); // a real ISO timestamp
+
+    // Nothing written, nothing armed until a human confirms (D5).
+    expect(store.listScheduledByChannel("discord", "thread-1")).toHaveLength(0);
+    expect(rescheduled).toHaveLength(0);
+
+    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+
+    const rows = store.listScheduledByChannel("discord", "thread-1");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.cron).toBe("0 7 * * 1-5");
+    expect(rows[0]!.promptText).toBe("Post the standup");
+    expect(rows[0]!.timezone).toBe("America/Chicago"); // deployment default
+    expect(rows[0]!.nextRunUtc).not.toBeNull();
+    // HARD REQUIREMENT: the timer was (re)armed for the exact new row.
+    expect(rescheduled).toEqual([rows[0]!.id]);
+    // Audited under the schedule tier.
+    expect(store.listConfigMutations()[0]).toMatchObject({ tier: "schedule", scope: "thread-1" });
+  });
+
+  it("refuses an invalid cron BEFORE persisting — no row, no arm (#69 trap)", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const built = makeService().buildProposal(record, {
+      schedule: { action: "create", name: "Bad", promptText: "x", cron: "not a cron" },
+    });
+    expect(built.ok).toBe(false);
+    if (built.ok) return;
+    expect(built.error.toLowerCase()).toContain("invalid schedule");
+    expect(store.listScheduledByChannel("discord", "thread-1")).toHaveLength(0);
+    expect(rescheduled).toHaveLength(0);
+  });
+
+  it("refuses a non-IANA timezone", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const built = makeService().buildProposal(record, {
+      schedule: { action: "create", name: "TZ", promptText: "x", cron: "0 7 * * *", timezone: "Mars/Phobos" },
+    });
+    expect(built.ok).toBe(false);
+    if (built.ok) return;
+    expect(built.error).toContain("IANA");
+  });
+
+  it("update: recomputes next run and re-arms the timer", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const seed = seedSchedule();
+    const svc = makeService();
+
+    const built = svc.buildProposal(record, {
+      schedule: { action: "update", id: seed.id, cron: "0 9 * * 1-5" },
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+
+    const row = store.getScheduled(seed.id)!;
+    expect(row.cron).toBe("0 9 * * 1-5");
+    expect(row.promptText).toBe("Summarize overnight PRs"); // preserved
+    expect(rescheduled).toEqual([seed.id]);
+    expect(store.listConfigMutations()[0]!.summary).toContain("update schedule");
+  });
+
+  it("enable/disable flips the row and re-arms (arm on enable, disarm on disable)", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const seed = seedSchedule({ enabled: false });
+    const svc = makeService();
+
+    const built = svc.buildProposal(record, { schedule: { action: "enable", id: seed.id } });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+
+    expect(store.getScheduled(seed.id)!.enabled).toBe(true);
+    expect(rescheduled).toEqual([seed.id]);
+
+    // Enabling an already-enabled schedule is a no-op refusal.
+    const again = svc.buildProposal(record, { schedule: { action: "enable", id: seed.id } });
+    expect(again.ok).toBe(false);
+  });
+
+  it("delete: removes the row, disarms the timer (via reschedule), cleans attachments, audits", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const seed = seedSchedule();
+    const svc = makeService();
+
+    const built = svc.buildProposal(record, { schedule: { action: "delete", id: seed.id } });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+
+    expect(store.getScheduled(seed.id)).toBeNull();
+    expect(rescheduled).toEqual([seed.id]); // reschedule with row gone → disarm
+    expect(cleanedUp).toEqual([seed.id]);
+    expect(store.listConfigMutations()[0]).toMatchObject({ tier: "schedule" });
+  });
+
+  it("self-scope: refuses a schedule id bound to another thread (D3)", () => {
+    const caller = makeRecord({ id: "discord:thread-1", channelRef: "thread-1" });
+    store.upsert(caller);
+    // A schedule that lives in a DIFFERENT thread.
+    seedSchedule({ id: "sch_other", channelRef: "thread-2" });
+
+    const built = makeService().buildProposal(caller, { schedule: { action: "delete", id: "sch_other" } });
+    expect(built.ok).toBe(false);
+    if (built.ok) return;
+    expect(built.error).toContain("No schedule");
+    // Untouched — no write, no arm.
+    expect(store.getScheduled("sch_other")).not.toBeNull();
+    expect(rescheduled).toHaveLength(0);
+  });
+
+  it("live mode nulls isolated-only fields and warns they're ignored", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const svc = makeService();
+    const built = svc.buildProposal(record, {
+      schedule: {
+        action: "create",
+        name: "Live one",
+        promptText: "do it here",
+        cron: "0 7 * * *",
+        sessionMode: "live",
+        model: "claude-opus-4.8",
+      },
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.proposal.warnings.some((w) => w.includes("Live mode ignores"))).toBe(true);
+    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    const row = store.listScheduledByChannel("discord", "thread-1")[0]!;
+    expect(row.sessionMode).toBe("live");
+    expect(row.model).toBeNull();
   });
 });

@@ -51,6 +51,27 @@ pm2 logs seam-acp --lines 100   # last 100 log lines
 - `data/` — SQLite database (runtime, not committed)
 - `.env` — local environment config (not committed)
 
+## Slash command tree (`/seam`)
+
+Discord caps each command at 25 top-level options. `/seam` is 10/25: 5
+top-level subcommands + 5 groups. Future surfaces default to living
+**inside a group** (each group has its own 25 budget). Hard cutover —
+Discord has no aliases; old invocations disappear.
+
+**Top-level (5):** `cancel`, `steer`, `new`, `attach`, `workflows`
+
+**Groups (5):**
+- `config` (12): `model` `effort` `agent` `mode` `repo` `tools` `approve` `reset` `init` `show` `set` `audit`
+- `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
+- `schedule` (7), `preset` (6), `project` (3) — unchanged
+
+**Cancel options** (not new keywords):
+- `/seam cancel` — this thread, graceful
+- `/seam cancel force:true` — this thread, escalate (old `abort`)
+- `/seam cancel scope:all` — kill every active session bot-wide (old `kill`). Privileged: **not** lock-exempt, **not** participant-allowed.
+
+**Removed:** `/seam image`.
+
 ## Agent-scheduled wake events (#59)
 
 An agent can schedule its **own** one-shot future re-entry into its thread —

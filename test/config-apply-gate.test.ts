@@ -200,7 +200,7 @@ describe("locked-channel slash gate admin-immunity (#71)", () => {
 /**
  * PARTICIPANT slash gate (#74). Lives ALONGSIDE `isLockedSlashRefused` — a
  * different question. A restricted participant is refused even in an UNLOCKED
- * channel; help/abort/cancel still work. steer is lock-exempt but NOT
+ * channel; help/cancel still work. steer is lock-exempt but NOT
  * participant-allowed. Admin-who-is-also-participant is not refused.
  */
 describe("participant slash gate (#74)", () => {
@@ -223,15 +223,11 @@ describe("participant slash gate (#74)", () => {
     expect(Orchestrator.isParticipantSlashRefused(cfg(new Set([STUDENT])), "agent", STUDENT)).toBe(
       true
     );
-    expect(Orchestrator.isParticipantSlashRefused(cfg(new Set([STUDENT])), "kill", STUDENT)).toBe(
-      true
-    );
   });
 
-  it("allows a participant help / abort / cancel (NOT steer)", () => {
+  it("allows a participant help / cancel (NOT steer)", () => {
     const c = cfg(new Set([STUDENT]));
     expect(Orchestrator.isParticipantSlashRefused(c, "help", STUDENT)).toBe(false);
-    expect(Orchestrator.isParticipantSlashRefused(c, "abort", STUDENT)).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(c, "cancel", STUDENT)).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(c, "steer", STUDENT)).toBe(true);
   });
@@ -275,5 +271,79 @@ describe("participant slash gate (#74)", () => {
     } as any;
     expect(Orchestrator.isLockedSlashRefused(locked, "channel-1", "steer", STUDENT)).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(locked, "steer", STUDENT)).toBe(true);
+  });
+});
+
+/**
+ * #78: consolidating abort+kill into `cancel` options would silently widen
+ * both gates if they keyed only on the bare subcommand name. `cancel scope:all`
+ * is the old privileged `kill` and must stay refused for non-admins /
+ * participants. Plain `cancel` (and `force:true`) stays allowed (self-unstick).
+ */
+describe("option-aware cancel gates (#78)", () => {
+  const ADMIN = "1487094572696867019";
+  const STUDENT = "1534937951044112505";
+  const locked = (adminIds: ReadonlySet<string> | undefined) =>
+    ({
+      channelPresets: new Map([["channel-1", { locked: true }]]),
+      threadPresets: new Map(),
+      SEAM_CONFIG_ADMIN_USER_IDS: adminIds,
+    }) as any;
+  const participants = (participantIds: ReadonlySet<string>, adminIds?: ReadonlySet<string>) =>
+    ({
+      SEAM_PARTICIPANT_USER_IDS: participantIds,
+      SEAM_CONFIG_ADMIN_USER_IDS: adminIds,
+    }) as any;
+
+  it("isCancelScopeAll is true only for cancel + scope:all", () => {
+    expect(Orchestrator.isCancelScopeAll("cancel", { scope: "all" })).toBe(true);
+    expect(Orchestrator.isCancelScopeAll("cancel", { scope: null })).toBe(false);
+    expect(Orchestrator.isCancelScopeAll("cancel", undefined)).toBe(false);
+    expect(Orchestrator.isCancelScopeAll("steer", { scope: "all" })).toBe(false);
+  });
+
+  it("non-admin in a locked channel is refused cancel scope:all but allowed plain cancel", () => {
+    const cfg = locked(new Set([ADMIN]));
+    expect(Orchestrator.isLockedSlashRefused(cfg, "channel-1", "cancel", STUDENT)).toBe(false);
+    expect(
+      Orchestrator.isLockedSlashRefused(cfg, "channel-1", "cancel", STUDENT, { scope: null })
+    ).toBe(false);
+    // force:true is still this-thread (old abort) — stays lock-exempt
+    expect(
+      Orchestrator.isLockedSlashRefused(cfg, "channel-1", "cancel", STUDENT, { scope: undefined })
+    ).toBe(false);
+    expect(
+      Orchestrator.isLockedSlashRefused(cfg, "channel-1", "cancel", STUDENT, { scope: "all" })
+    ).toBe(true);
+  });
+
+  it("admin in a locked channel may still run cancel scope:all (admin immunity)", () => {
+    const cfg = locked(new Set([ADMIN]));
+    expect(
+      Orchestrator.isLockedSlashRefused(cfg, "channel-1", "cancel", ADMIN, { scope: "all" })
+    ).toBe(false);
+  });
+
+  it("participant is refused cancel scope:all but allowed plain cancel (and force:true)", () => {
+    const c = participants(new Set([STUDENT]));
+    expect(Orchestrator.isParticipantSlashRefused(c, "cancel", STUDENT)).toBe(false);
+    expect(Orchestrator.isParticipantSlashRefused(c, "cancel", STUDENT, { scope: null })).toBe(
+      false
+    );
+    expect(Orchestrator.isParticipantSlashRefused(c, "cancel", STUDENT, { scope: "all" })).toBe(
+      true
+    );
+    // config leaves stay refused
+    expect(Orchestrator.isParticipantSlashRefused(c, "model", STUDENT)).toBe(true);
+  });
+
+  it("participant who is also admin is not refused cancel scope:all", () => {
+    const c = participants(new Set([ADMIN, STUDENT]), new Set([ADMIN]));
+    expect(Orchestrator.isParticipantSlashRefused(c, "cancel", ADMIN, { scope: "all" })).toBe(
+      false
+    );
+    expect(Orchestrator.isParticipantSlashRefused(c, "cancel", STUDENT, { scope: "all" })).toBe(
+      true
+    );
   });
 });

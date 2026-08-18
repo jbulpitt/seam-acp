@@ -328,7 +328,7 @@ export class AgentRuntime {
       // orchestrator's `await prompt()` pending forever (the SDK doesn't
       // reliably reject pending RPCs on a hard exit): the runtime gets evicted
       // but the channel queue wedges — card stuck "working", activeTurns never
-      // decrements, no new turn starts, and `/seam abort` reports "no active
+      // decrements, no new turn starts, and `/seam cancel` reports "no active
       // turn" (the runtime is already gone). Previously only a restart cleared it.
       this.rejectInFlightPrompt?.(
         new Error(`agent process exited mid-turn (code=${code}, signal=${signal})`)

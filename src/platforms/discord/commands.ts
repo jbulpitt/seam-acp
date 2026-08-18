@@ -4,86 +4,47 @@ import {
 } from "discord.js";
 
 /**
- * `/seam` slash-command tree. Subcommands mirror the C# `cp …` text commands.
- * Models are resolved at runtime via the agent's `availableModels`, but for
- * v1 we accept a free-form string with autocomplete in a later phase.
+ * `/seam` slash-command tree (#78).
+ *
+ * Discord caps each command at 25 top-level options (subcommands + groups).
+ * The tree is 10/25: 5 top-level subcommands + 5 groups. Future surfaces
+ * default to living INSIDE a group (each group has its own 25 budget).
+ *
+ *   TOP-LEVEL (5): cancel, steer, new, attach, workflows
+ *   GROUPS (5):
+ *     config   (12) model effort agent mode repo tools approve reset init show set audit
+ *     info     (6)  whoami usage avatar help sessions repos
+ *     schedule (7)  unchanged
+ *     preset   (6)  unchanged
+ *     project  (3)  unchanged
  */
 export function buildSeamCommand(): SlashCommandBuilder {
   const cmd = new SlashCommandBuilder()
     .setName("seam")
     .setDescription("Control the seam-acp agent");
 
+  // --- top-level (5) --------------------------------------------------------
+
   cmd.addSubcommand((sub) =>
     sub
-      .setName("new")
-      .setDescription("Create a new agent thread")
-      .addStringOption((o) =>
+      .setName("cancel")
+      .setDescription("Cancel this thread's turn; force:true escalates, scope:all kills every session")
+      .addBooleanOption((o) =>
         o
-          .setName("name")
-          .setDescription("Thread name (optional)")
+          .setName("force")
+          .setDescription("Force-kill this thread's turn if it ignores the cancel (old /seam abort)")
           .setRequired(false)
       )
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub
-      .setName("repo")
-      .setDescription("Set the working repo for this thread")
+      // Options are free (they don't count toward the 25 top-level cap).
+      // `scope:all` is the old `/seam kill` — privileged, NOT lock-exempt
+      // and NOT participant-allowed. Gates inspect the resolved option.
       .addStringOption((o) =>
         o
-          .setName("path")
-          .setDescription("Path under REPOS_ROOT (or absolute)")
-          .setRequired(true)
-      )
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub
-      .setName("model")
-      .setDescription("Get or set the agent model for this thread")
-      .addStringOption((o) =>
-        o.setName("id").setDescription("Model id").setRequired(false)
-      )
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub
-      .setName("mode")
-      .setDescription("Set the agent operational mode")
-      .addStringOption((o) =>
-        o.setName("id").setDescription("Mode id").setRequired(true)
-      )
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub
-      .setName("effort")
-      .setDescription("Set reasoning effort (or run with no level to see current)")
-      .addStringOption((o) =>
-        o
-          .setName("level")
-          .setDescription("low | medium | high | xhigh | max — agent falls back if model doesn't support it")
+          .setName("scope")
+          .setDescription("Kill every active session bot-wide (old /seam kill)")
           .setRequired(false)
-          .addChoices(
-            { name: "low", value: "low" },
-            { name: "medium", value: "medium" },
-            { name: "high", value: "high" },
-            { name: "xhigh", value: "xhigh" },
-            { name: "max", value: "max" }
-          )
+          .addChoices({ name: "all", value: "all" })
       )
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub.setName("abort").setDescription("Stop the current turn — cancel, then force-kill if it's hung")
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub.setName("cancel").setDescription("Gracefully cancel the current turn (cleaner; use abort if it ignores it)")
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub.setName("kill").setDescription("Force-kill ALL active agent sessions, including this thread (each resumes on next message)")
   );
 
   cmd.addSubcommand((sub) =>
@@ -115,61 +76,28 @@ export function buildSeamCommand(): SlashCommandBuilder {
 
   cmd.addSubcommand((sub) =>
     sub
-      .setName("image")
-      .setDescription("Generate an image (Nano Banana 2 / Pro, Imagen 4, FLUX 2)")
+      .setName("new")
+      .setDescription("Create a new agent thread")
       .addStringOption((o) =>
         o
-          .setName("prompt")
-          .setDescription("Image prompt. Leave blank to type a longer one in a modal.")
+          .setName("name")
+          .setDescription("Thread name (optional)")
           .setRequired(false)
       )
   );
 
   cmd.addSubcommand((sub) =>
     sub
-      .setName("reset")
-      .setDescription(
-        "End the current ACP session for this thread; next message starts fresh"
-      )
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub
-      .setName("tools")
-      .setDescription("Set tool allow / exclude lists")
+      .setName("attach")
+      .setDescription("Upload a local file from the host machine to this channel")
       .addStringOption((o) =>
         o
-          .setName("action")
-          .setDescription("allow | exclude")
-          .setRequired(true)
-          .addChoices(
-            { name: "allow", value: "allow" },
-            { name: "exclude", value: "exclude" }
+          .setName("path")
+          .setDescription(
+            "Absolute path, or path relative to an allowed root (REPOS_ROOT / ATTACH_ROOTS)"
           )
+          .setRequired(true)
       )
-      .addStringOption((o) =>
-        o
-          .setName("list")
-          .setDescription("Comma-separated tool names (empty = clear)")
-          .setRequired(false)
-      )
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub.setName("config").setDescription("Show current session config")
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub
-      .setName("config-set")
-      .setDescription("Replace session config with a JSON blob")
-      .addStringOption((o) =>
-        o.setName("json").setDescription("Config JSON").setRequired(true)
-      )
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub.setName("sessions").setDescription("List recent sessions")
   );
 
   cmd.addSubcommand((sub) =>
@@ -203,63 +131,151 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
-  cmd.addSubcommand((sub) =>
-    sub.setName("repos").setDescription("List repos under REPOS_ROOT")
-  );
+  // --- groups (5) -----------------------------------------------------------
 
-  cmd.addSubcommand((sub) =>
-    sub
-      .setName("init")
-      .setDescription("Bind this thread as a session and show repo picker")
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub
-      .setName("approve")
-      .setDescription("Set permission policy for this thread")
-      .addStringOption((o) =>
-        o
-          .setName("policy")
-          .setDescription("always | ask | deny")
-          .setRequired(true)
-          .addChoices(
-            { name: "always (auto-approve everything)", value: "always" },
-            { name: "ask (prompt me on Discord)", value: "ask" },
-            { name: "deny (auto-deny everything)", value: "deny" }
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("config")
+      .setDescription("Session and bot configuration")
+      .addSubcommand((sub) =>
+        sub
+          .setName("model")
+          .setDescription("Get or set the agent model for this thread")
+          .addStringOption((o) =>
+            o.setName("id").setDescription("Model id").setRequired(false)
           )
       )
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub
-      .setName("agent")
-      .setDescription(
-        "Get or set the agent for this thread (resets the session when changed)"
+      .addSubcommand((sub) =>
+        sub
+          .setName("effort")
+          .setDescription("Set reasoning effort (or run with no level to see current)")
+          .addStringOption((o) =>
+            o
+              .setName("level")
+              .setDescription("low | medium | high | xhigh | max — agent falls back if model doesn't support it")
+              .setRequired(false)
+              .addChoices(
+                { name: "low", value: "low" },
+                { name: "medium", value: "medium" },
+                { name: "high", value: "high" },
+                { name: "xhigh", value: "xhigh" },
+                { name: "max", value: "max" }
+              )
+          )
       )
-      .addStringOption((o) =>
-        o
-          .setName("id")
-          .setDescription("Agent id (e.g. copilot, claude)")
-          .setRequired(false)
-      )
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub
-      .setName("attach")
-      .setDescription("Upload a local file from the host machine to this channel")
-      .addStringOption((o) =>
-        o
-          .setName("path")
+      .addSubcommand((sub) =>
+        sub
+          .setName("agent")
           .setDescription(
-            "Absolute path, or path relative to an allowed root (REPOS_ROOT / ATTACH_ROOTS)"
+            "Get or set the agent for this thread (resets the session when changed)"
           )
-          .setRequired(true)
+          .addStringOption((o) =>
+            o
+              .setName("id")
+              .setDescription("Agent id (e.g. copilot, claude)")
+              .setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("mode")
+          .setDescription("Set the agent operational mode")
+          .addStringOption((o) =>
+            o.setName("id").setDescription("Mode id").setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("repo")
+          .setDescription("Set the working repo for this thread")
+          .addStringOption((o) =>
+            o
+              .setName("path")
+              .setDescription("Path under REPOS_ROOT (or absolute)")
+              .setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("tools")
+          .setDescription("Set tool allow / exclude lists")
+          .addStringOption((o) =>
+            o
+              .setName("action")
+              .setDescription("allow | exclude")
+              .setRequired(true)
+              .addChoices(
+                { name: "allow", value: "allow" },
+                { name: "exclude", value: "exclude" }
+              )
+          )
+          .addStringOption((o) =>
+            o
+              .setName("list")
+              .setDescription("Comma-separated tool names (empty = clear)")
+              .setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("approve")
+          .setDescription("Set permission policy for this thread")
+          .addStringOption((o) =>
+            o
+              .setName("policy")
+              .setDescription("always | ask | deny")
+              .setRequired(true)
+              .addChoices(
+                { name: "always (auto-approve everything)", value: "always" },
+                { name: "ask (prompt me on Discord)", value: "ask" },
+                { name: "deny (auto-deny everything)", value: "deny" }
+              )
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("reset")
+          .setDescription(
+            "End the current ACP session for this thread; next message starts fresh"
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("init")
+          .setDescription("Bind this thread as a session and show repo picker")
+      )
+      .addSubcommand((sub) =>
+        sub.setName("show").setDescription("Show current session config")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("set")
+          .setDescription("Replace session config with a JSON blob")
+          .addStringOption((o) =>
+            o.setName("json").setDescription("Config JSON").setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("audit")
+          .setDescription("Show recent config mutations (who/what/when), newest first")
+          .addIntegerOption((o) =>
+            o
+              .setName("limit")
+              .setDescription("How many recent mutations to show (default 20)")
+              .setRequired(false)
+              .setMinValue(1)
+              .setMaxValue(100)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("entry")
+              .setDescription("Show the before→after diff for one entry id")
+              .setRequired(false)
+          )
       )
   );
 
-  // Grouped under `/seam info` to stay within Discord's 25-option-per-command
-  // cap (these are low-frequency meta commands). Routed via getSubcommandGroup.
   cmd.addSubcommandGroup((g) =>
     g
       .setName("info")
@@ -276,28 +292,11 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub.setName("help").setDescription("Show help")
       )
-      // Read surface for the config-mutation trail (#70). Lives in the `info`
-      // group — a read-only observability view like `whoami`/`usage` — because
-      // `/seam` is at Discord's 25 top-level-option cap, so a new top-level
-      // subcommand can't be added.
       .addSubcommand((sub) =>
-        sub
-          .setName("config-audit")
-          .setDescription("Show recent config mutations (who/what/when), newest first")
-          .addIntegerOption((o) =>
-            o
-              .setName("limit")
-              .setDescription("How many recent mutations to show (default 20)")
-              .setRequired(false)
-              .setMinValue(1)
-              .setMaxValue(100)
-          )
-          .addStringOption((o) =>
-            o
-              .setName("entry")
-              .setDescription("Show the before→after diff for one entry id")
-              .setRequired(false)
-          )
+        sub.setName("sessions").setDescription("List recent sessions")
+      )
+      .addSubcommand((sub) =>
+        sub.setName("repos").setDescription("List repos under REPOS_ROOT")
       )
   );
 
@@ -441,31 +440,28 @@ export function buildSeamCommand(): SlashCommandBuilder {
 
 export type SeamSubcommand =
   | "new"
-  | "repo"
-  | "model"
-  | "mode"
-  | "effort"
-  | "abort"
   | "cancel"
-  | "kill"
   | "steer"
-  | "image"
-  | "reset"
-  | "tools"
-  | "config"
-  | "config-set"
-  | "sessions"
-  | "workflows"
-  | "repos"
-  | "init"
-  | "approve"
-  | "agent"
   | "attach"
+  | "workflows"
+  | "model"
+  | "effort"
+  | "agent"
+  | "mode"
+  | "repo"
+  | "tools"
+  | "approve"
+  | "reset"
+  | "init"
+  | "show"
+  | "set"
+  | "audit"
   | "whoami"
   | "usage"
   | "avatar"
   | "help"
-  | "config-audit";
+  | "sessions"
+  | "repos";
 
 export function getSubcommand(
   i: ChatInputCommandInteraction

@@ -1,6 +1,23 @@
 import { describe, it, expect } from "vitest";
 import { buildSeamCommand } from "../src/platforms/discord/commands.js";
 
+// Discord ApplicationCommandOptionType
+const SUB_COMMAND = 1;
+const SUB_COMMAND_GROUP = 2;
+const STRING = 3;
+const BOOLEAN = 5;
+
+type Opt = {
+  name: string;
+  type: number;
+  required?: boolean;
+  options?: Opt[];
+};
+
+function built(): { options?: Opt[] } {
+  return buildSeamCommand().toJSON() as { options?: Opt[] };
+}
+
 // Regression guard: the whole feature build-out (workflows/steer/project/…) once
 // pushed /seam to 28 top-level options and Discord's 25-cap made the bot crash
 // at boot (registerSlashCommands -> validateMaxOptionsLength). tsc + unit tests
@@ -10,24 +27,121 @@ describe("/seam slash command", () => {
     expect(() => buildSeamCommand().toJSON()).not.toThrow();
   });
 
-  it("stays within Discord's 25 top-level-option cap", () => {
-    const json = buildSeamCommand().toJSON();
+  it("registers exactly 10 top-level slots (5 subcommands + 5 groups)", () => {
+    const json = built();
+    expect(json.options?.length ?? 0).toBe(10);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
+  });
+
+  it("top-level names are cancel/steer/new/attach/workflows + 5 groups", () => {
+    const names = (built().options ?? []).map((o) => o.name);
+    expect(names).toEqual([
+      "cancel",
+      "steer",
+      "new",
+      "attach",
+      "workflows",
+      "config",
+      "info",
+      "schedule",
+      "preset",
+      "project",
+    ]);
+  });
+
+  it("each group stays within Discord's 25-option-per-group cap", () => {
+    for (const opt of built().options ?? []) {
+      if (opt.type === SUB_COMMAND_GROUP) {
+        expect(opt.options?.length ?? 0, opt.name).toBeLessThanOrEqual(25);
+      }
+    }
+  });
+
+  it("config group has the 12 migrated config leaves", () => {
+    const config = built().options?.find((o) => o.name === "config");
+    expect(config?.type).toBe(SUB_COMMAND_GROUP);
+    const names = (config?.options ?? []).map((o) => o.name);
+    expect(names).toEqual([
+      "model",
+      "effort",
+      "agent",
+      "mode",
+      "repo",
+      "tools",
+      "approve",
+      "reset",
+      "init",
+      "show",
+      "set",
+      "audit",
+    ]);
+    expect(names).toHaveLength(12);
+  });
+
+  it("info group has 6 leaves (sessions/repos moved in; config-audit moved out)", () => {
+    const info = built().options?.find((o) => o.name === "info");
+    expect(info?.type).toBe(SUB_COMMAND_GROUP);
+    const names = (info?.options ?? []).map((o) => o.name);
+    expect(names).toEqual(["whoami", "usage", "avatar", "help", "sessions", "repos"]);
+    expect(names).toHaveLength(6);
+    expect(names).not.toContain("config-audit");
+  });
+
+  it("schedule/preset/project group sizes are unchanged", () => {
+    const json = built();
+    const count = (name: string) =>
+      json.options?.find((o) => o.name === name)?.options?.length ?? 0;
+    expect(count("schedule")).toBe(7);
+    expect(count("preset")).toBe(6);
+    expect(count("project")).toBe(3);
+  });
+
+  it("removed image/abort/kill and old top-level config leaves", () => {
+    const top = new Set((built().options ?? []).map((o) => o.name));
+    for (const gone of [
+      "image",
+      "abort",
+      "kill",
+      "model",
+      "effort",
+      "agent",
+      "mode",
+      "repo",
+      "tools",
+      "approve",
+      "reset",
+      "init",
+      "config-set",
+      "sessions",
+      "repos",
+    ]) {
+      expect(top.has(gone), gone).toBe(false);
+    }
+    // `config` remains, but as a GROUP not a leaf
+    expect(built().options?.find((o) => o.name === "config")?.type).toBe(SUB_COMMAND_GROUP);
   });
 
   // #63: the human-inbox two-tier lives as an OPTION on the existing `steer`
   // subcommand (options are free — they don't count toward the 25), so adding it
   // must NOT introduce a new top-level command and must leave the cap green.
   it("adds `now` as an option on `steer` — not a new top-level command", () => {
-    const json = buildSeamCommand().toJSON();
-    const steer = json.options?.find((o) => o.name === "steer") as
-      | { options?: Array<{ name: string; type: number; required?: boolean }> }
-      | undefined;
-    expect(steer).toBeTruthy();
+    const json = built();
+    const steer = json.options?.find((o) => o.name === "steer");
+    expect(steer?.type).toBe(SUB_COMMAND);
     const now = steer?.options?.find((o) => o.name === "now");
     expect(now).toBeTruthy();
-    // Boolean option type is 5; optional so the default (cooperative) path holds.
-    expect(now?.type).toBe(5);
+    expect(now?.type).toBe(BOOLEAN);
     expect(now?.required ?? false).toBe(false);
+  });
+
+  it("cancel absorbs abort+kill via force/scope options, not new keywords", () => {
+    const cancel = built().options?.find((o) => o.name === "cancel");
+    expect(cancel?.type).toBe(SUB_COMMAND);
+    const force = cancel?.options?.find((o) => o.name === "force");
+    const scope = cancel?.options?.find((o) => o.name === "scope");
+    expect(force?.type).toBe(BOOLEAN);
+    expect(force?.required ?? false).toBe(false);
+    expect(scope?.type).toBe(STRING);
+    expect(scope?.required ?? false).toBe(false);
   });
 });

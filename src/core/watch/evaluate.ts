@@ -185,7 +185,7 @@ async function evalCommand(
     let child: ReturnType<typeof spawn>;
     try {
       // `detached: true` puts the child in its OWN process group, so it does not
-      // ride the agent's group (which /seam kill reaps) — the whole point of a
+      // ride the agent's group (which `/seam cancel scope:all` reaps) — the whole point of a
       // bridge-owned watch. `shell: false` (default) means no metacharacter eval.
       child = spawn(cmd, argv, { detached: true, stdio: ["ignore", "pipe", "ignore"] });
     } catch {

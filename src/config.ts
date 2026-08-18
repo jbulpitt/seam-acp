@@ -249,13 +249,6 @@ const Schema = z.object({
     .string()
     .default("")
     .transform((v) => new Set(v.split(",").map((s) => s.trim()).filter(Boolean))),
-  /** Raw Google AI Studio API key for /seam image. Leave empty and set
-   *  GOOGLE_AI_STUDIO_API_KEY_FILE instead to read from a file. */
-  GOOGLE_AI_STUDIO_API_KEY: z.string().default(""),
-  /** Path to a file whose first non-empty line is the Google AI Studio key. */
-  GOOGLE_AI_STUDIO_API_KEY_FILE: z.string().default(""),
-  /** Black Forest Labs API key for FLUX 2 models in /seam image. */
-  BFL_API_KEY: z.string().default(""),
   /**
    * Model used to generate compaction summaries (auto + manual `/compact`).
    * Picked per-agent. Should be a high-context model with strong summarization
@@ -271,7 +264,7 @@ const Schema = z.object({
    * Same shape as COPILOT_PROFILES — register additional Claude profiles
    * each pinned to its own --config-dir (auth / settings). Format:
    *   id1:/abs/dir1,id2:/abs/dir2
-   * Each becomes an agent profile named `claude-<id>` in /seam agent.
+   * Each becomes an agent profile named `claude-<id>` in /seam config agent.
    */
   CLAUDE_PROFILES: z
     .string()
@@ -311,7 +304,7 @@ const Schema = z.object({
   /**
    * Register the OpenAI Codex agent: `@agentclientprotocol/codex-acp` — a
    * dedicated ACP adapter for the Codex CLI (`@openai/codex`). When enabled,
-   * an "OpenAI Codex" profile appears in `/seam agent`.
+   * an "OpenAI Codex" profile appears in `/seam config agent`.
    * false → not registered.
    */
   CODEX_ENABLED: z
@@ -329,7 +322,7 @@ const Schema = z.object({
   /**
    * Register the xAI Grok Build agent.  The `grok` CLI speaks ACP natively
    * via `grok agent stdio` — no separate adapter is needed.
-   * When enabled, a "Grok Build" profile appears in `/seam agent`.
+   * When enabled, a "Grok Build" profile appears in `/seam config agent`.
    * false → not registered.
    */
   GROK_ENABLED: z
@@ -648,7 +641,8 @@ const Schema = z.object({
    * {...} } }`. Channel values apply to every thread under that channel;
    * thread values override the channel's per-field (rider stacks instead of
    * overriding). A channel entry's `locked: true` disables all /seam slash
-   * commands (except abort/cancel) for that channel and its threads. Values
+   * commands (except cancel and steer) for that channel and its threads.
+   * `cancel scope:all` (bot-wide kill) is NOT exempt. Values
    * are re-resolved from this file on every runtime start — the file is the
    * source of truth regardless of what's stored in the session DB. When
    * unset, the feature is inactive. See PresetsFileSchema below for the
@@ -667,7 +661,7 @@ const Schema = z.object({
   TUNNEL_GIST_ID: z.string().optional(),
 
   /**
-   * Controls the `/seam new` and `/seam init` thread initialization flow.
+   * Controls the `/seam new` and `/seam config init` thread initialization flow.
    * - "repo":  (default) only show the repo picker
    * - "full":  after repo selection, also present an agent picker and a
    *            model picker in sequence so the user can configure the

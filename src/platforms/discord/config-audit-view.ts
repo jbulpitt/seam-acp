@@ -1,4 +1,4 @@
-// Pure formatting for the `/seam info config-audit` view (#70). Turns immutable
+// Pure formatting for the `/seam config audit` view (#70). Turns immutable
 // `config_audit` rows (SessionStore.listConfigMutations) into the strings the
 // orchestrator drops into an ephemeral embed. Kept free of discord.js so the
 // layout logic is unit-testable in isolation, mirroring `workflows-view.ts`.

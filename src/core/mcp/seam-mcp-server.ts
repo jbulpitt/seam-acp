@@ -1762,7 +1762,7 @@ export class SeamMcpServer {
    *
    * LOCK ENFORCEMENT POINT (D2). This is the tool layer's OWN gate, deliberately
    * re-derived here rather than inherited from the slash layer's
-   * `LOCK_EXEMPT_SUBCOMMANDS` (abort/cancel/steer). That exemption list exists
+   * `LOCK_EXEMPT_SUBCOMMANDS` (cancel/steer). That exemption list exists
    * because redirecting or stopping a RUNNING agent is not reconfiguration —
    * `steer` is exempt for exactly that reason, and it is already its own separate
    * tool here. `config_propose` is PURE reconfiguration, so it grants ZERO lock

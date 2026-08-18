@@ -40,7 +40,7 @@ Copy `.env.example` to `.env` and fill it in.
 | `DEFAULT_AGENT` | no | `copilot` (default), `agy`, or `claude`. Plus any `copilot-<id>` / `agy-<id>` / `claude-<id>` registered via the `*_PROFILES` vars. |
 | `DEFAULT_MODEL` | no | Default Copilot model. Applies to **all** Copilot profiles (including extras from `COPILOT_PROFILES`). e.g. `gpt-5.4`, `claude-sonnet-4.5`, `claude-opus-4.7`, `auto` |
 | `COPILOT_CLI_PATH` | no | If `copilot` is not on `PATH` |
-| `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
+| `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam config agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
 | `AGY_CLI_PATH` | no | If `agy` is not on `PATH` (checks `~/.local/bin/agy` first) |
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
@@ -49,7 +49,7 @@ Copy `.env.example` to `.env` and fill it in.
 | `TURN_TIMEOUT_SECONDS` | no | Default 900 |
 | `LOG_LEVEL` | no | `fatal` / `error` / `warn` / `info` / `debug` / `trace` |
 | `HEALTH_PORT` | no | Default 3000 — exposes `GET /health` |
-| `DEFAULT_PERMISSION_POLICY` | no | `ask` (recommended). Bot-wide default policy for new sessions. One of `always` (auto-approve), `ask` (prompt me on Discord), `deny` (auto-deny). Override per-session with `/seam approve`. |
+| `DEFAULT_PERMISSION_POLICY` | no | `ask` (recommended). Bot-wide default policy for new sessions. One of `always` (auto-approve), `ask` (prompt me on Discord), `deny` (auto-deny). Override per-session with `/seam config approve`. |
 | `DEFAULT_AUTO_APPROVE` | no | *Deprecated.* When `true`, forces the bot-wide default to `always`. Prefer `DEFAULT_PERMISSION_POLICY`. |
 
 You also need the GitHub Copilot CLI installed locally (`brew install github/gh/copilot` or `npm i -g @github/copilot`) and authenticated (`copilot auth login`). The Docker image installs and runs the CLI for you, but you still need to mount auth state or sign in inside the container.
@@ -114,24 +114,30 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | Command | What it does |
 |---|---|
 | `/seam new [name]` | Create a new public thread, bind a session to it, and post the repo picker — all in one step |
-| `/seam init` | Bind the current thread as a session and post the repo picker |
-| `/seam repo <path>` | Set the working repo (relative to `REPOS_ROOT` or absolute under it) |
-| `/seam repos` | List repos found under `REPOS_ROOT` (hidden directories are skipped) |
-| `/seam agent [id]` | With no id: posts an interactive picker of registered profiles. With id: switch directly. |
-| `/seam model [id]` | With no id: starts the agent if needed and posts a picker of advertised models. With id: set directly (live if a runtime is active). |
-| `/seam mode <id>` | Set the agent operational mode (e.g. plan / agent / autopilot) |
-| `/seam effort <low\|medium\|high>` | Set reasoning effort (model-dependent) |
-| `/seam tools <allow\|exclude> [csv]` | Tool allow / exclude list (empty list = clear) |
-| `/seam approve <always\|ask\|deny>` | Permission policy for this thread. `always` auto-approves every request; `ask` posts a Discord prompt with buttons (auto-denies after 5 min); `deny` auto-denies. |
-| `/seam abort` | Cancel the in-flight turn |
-| `/seam reset` | End the current ACP session for this thread; next message starts a fresh one |
-| `/seam config` | Show the session config JSON |
-| `/seam config-set <json>` | Replace the session config wholesale |
-| `/seam sessions` | List recent sessions across the bot |
+| `/seam cancel` | Gracefully cancel this thread's in-flight turn |
+| `/seam cancel force:true` | Escalate: cancel, then force-kill this thread's turn if it's hung (old `/seam abort`) |
+| `/seam cancel scope:all` | Force-kill every active session bot-wide (old `/seam kill`). Privileged — not lock-exempt, not participant-allowed. |
+| `/seam steer <thread> <prompt> [now]` | Steer a node mid-task (inbox by default; `now:true` cancel-and-reprompt) |
 | `/seam attach <path>` | Upload a host-side file (under `REPOS_ROOT` or `ATTACH_ROOTS`) into the channel without involving the agent |
-| `/seam whoami` | Show which account this thread's agent profile is signed in as (Copilot only — reads `<config-dir>/config.json`) |
-| `/seam avatar` | Re-push the bot avatar to Discord (force re-upload) |
-| `/seam help` | Show this list |
+| `/seam workflows` | Delegation ledger + this thread's pending wakes/watches |
+| `/seam config init` | Bind the current thread as a session and post the repo picker |
+| `/seam config repo <path>` | Set the working repo (relative to `REPOS_ROOT` or absolute under it) |
+| `/seam config agent [id]` | With no id: posts an interactive picker of registered profiles. With id: switch directly. |
+| `/seam config model [id]` | With no id: starts the agent if needed and posts a picker of advertised models. With id: set directly (live if a runtime is active). |
+| `/seam config mode <id>` | Set the agent operational mode (e.g. plan / agent / autopilot) |
+| `/seam config effort <low\|medium\|high>` | Set reasoning effort (model-dependent) |
+| `/seam config tools <allow\|exclude> [csv]` | Tool allow / exclude list (empty list = clear) |
+| `/seam config approve <always\|ask\|deny>` | Permission policy for this thread. `always` auto-approves every request; `ask` posts a Discord prompt with buttons (auto-denies after 5 min); `deny` auto-denies. |
+| `/seam config reset` | End the current ACP session for this thread; next message starts a fresh one |
+| `/seam config show` | Show the session config JSON |
+| `/seam config set <json>` | Replace the session config wholesale |
+| `/seam config audit` | Recent config mutations (who/what/when) |
+| `/seam info repos` | List repos found under `REPOS_ROOT` (hidden directories are skipped) |
+| `/seam info sessions` | List recent sessions across the bot |
+| `/seam info whoami` | Show which account this thread's agent profile is signed in as (Copilot only — reads `<config-dir>/config.json`) |
+| `/seam info avatar` | Re-push the bot avatar to Discord (force re-upload) |
+| `/seam info help` | Show this list |
+| `/seam schedule` / `preset` / `project` | Recurring prompts, reusable session presets, DB-backed channel activation |
 
 Interactive pickers use buttons for ≤15 choices (laid out across up to 3 rows of 5) and a select menu for 16–25.
 
@@ -171,7 +177,7 @@ COPILOT_PROFILES=work:/Users/me/.copilot-work,personal:/Users/me/.copilot-person
 For each entry the bot spawns `copilot --acp --config-dir <dir>`. Copilot
 keeps **all** of its state per `--config-dir` — auth tokens, MCP config,
 session history — so the two profiles are fully isolated CLIs sharing
-one binary. They show up in `/seam agent` as `copilot-work` and
+one binary. They show up in `/seam config agent` as `copilot-work` and
 `copilot-personal` alongside the default `copilot` profile.
 
 One-time setup per account on the host (or inside the container):
@@ -181,7 +187,7 @@ COPILOT_HOME=/Users/me/.copilot-work copilot login
 COPILOT_HOME=/Users/me/.copilot-personal copilot login
 ```
 
-Verify in a thread with `/seam whoami` — the bot reads
+Verify in a thread with `/seam info whoami` — the bot reads
 `<config-dir>/config.json` and reports the GitHub login.
 
 ### Multiple agy accounts
@@ -200,7 +206,7 @@ CLAUDE_PROFILES=work:/Users/me/.claude-work,personal:/Users/me/.claude-personal
 
 For each entry the bot spawns `claude-agent-acp` with
 `CLAUDE_CONFIG_DIR=<dir>` in the child env. Each dir holds its own
-auth and settings. Profiles show up in `/seam agent` as `claude-work`
+auth and settings. Profiles show up in `/seam config agent` as `claude-work`
 and `claude-personal` alongside the default `claude` profile.
 
 One-time setup per account on the host:
@@ -210,7 +216,7 @@ CLAUDE_CONFIG_DIR=/Users/me/.claude-work claude /login
 CLAUDE_CONFIG_DIR=/Users/me/.claude-personal claude /login
 ```
 
-`/seam whoami` is best-effort for Claude — it tries to read the email /
+`/seam info whoami` is best-effort for Claude — it tries to read the email /
 account from `<config-dir>/.credentials.json` (and a couple of fallbacks).
 If that fails (file format changes upstream, etc.) the command still
 reports which profile id you're on.
@@ -260,7 +266,7 @@ REMOTE_COPILOT_PROFILES=mac:wss://random.trycloudflare.com:your-secret-token
 #   then: cloudflared tunnel --url ws://localhost:9999
 ```
 
-The profile appears in `/seam agent` as `copilot-remote-mac`. Neither machine needs an open inbound port — both modes use Cloudflare Tunnel for the outbound-only connection. See **[docs/remote-agent.md](docs/remote-agent.md)** for full setup instructions.
+The profile appears in `/seam config agent` as `copilot-remote-mac`. Neither machine needs an open inbound port — both modes use Cloudflare Tunnel for the outbound-only connection. See **[docs/remote-agent.md](docs/remote-agent.md)** for full setup instructions.
 
 ### MCP servers
 

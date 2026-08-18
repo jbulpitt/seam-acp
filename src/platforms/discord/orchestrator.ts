@@ -4,16 +4,6 @@ import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type MessageComponentInteraction, type Message } from "discord.js";
-import {
-  IMAGE_MODELS,
-  getImageModelById,
-  generateImage,
-  resolveGoogleApiKey,
-  type AspectRatio,
-  type ImageModel,
-  type ReferenceImage,
-  type Resolution,
-} from "../../core/image-gen.js";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
 import {
@@ -203,6 +193,15 @@ const EFFORT_CHOICES = [
 // Discord's hard limit per message is 2000 chars; 1900 leaves headroom
 // for the optional `_(notice)_` paragraph and a tiny safety margin.
 const ORCH_INLINE_FENCE_MAX = 1900;
+
+/**
+ * Resolved slash options the lock / participant gates inspect (#78).
+ * Only `scope` changes privilege today: `cancel scope:all` is the old
+ * `/seam kill` and must not inherit cancel's exemptions.
+ */
+export type SlashGateOptions = {
+  scope?: string | null;
+};
 
 /**
  * Glues the Discord adapter, the SessionRouter, and the agent runtimes
@@ -1628,17 +1627,38 @@ export class Orchestrator {
   /** Subcommands still allowed in a locked channel/thread — narrow enough
    *  that a kid can unstick a hung turn without being able to touch config.
    *  Answers "survives a channel lock". NOT the participant allowlist
-   *  (`PARTICIPANT_ALLOWED_SUBCOMMANDS` below): this set includes `steer`. */
-  private static readonly LOCK_EXEMPT_SUBCOMMANDS = new Set(["abort", "cancel", "steer"]);
+   *  (`PARTICIPANT_ALLOWED_SUBCOMMANDS` below): this set includes `steer`.
+   *  `cancel` here is the PLAIN cancel (this thread). `cancel scope:all`
+   *  is excluded by `isCancelScopeAll` — it is the old privileged `kill`. */
+  private static readonly LOCK_EXEMPT_SUBCOMMANDS = new Set(["cancel", "steer"]);
 
   /**
    * Subcommands a restricted participant (#74) may still run. A NEW, SEPARATE
    * constant from `LOCK_EXEMPT_SUBCOMMANDS` — that one includes `steer`
    * (redirects another agent) and answers a different question (survives a
-   * channel lock). Participants get abort/cancel (self-unstick their own
-   * wedged turn) and help, but NOT steer, NOT kill, and no config.
+   * channel lock). Participants get cancel (self-unstick their own wedged
+   * turn, including `force:true`) and help, but NOT steer, NOT
+   * `cancel scope:all` (old kill), and no config.
    */
-  private static readonly PARTICIPANT_ALLOWED_SUBCOMMANDS = new Set(["help", "abort", "cancel"]);
+  private static readonly PARTICIPANT_ALLOWED_SUBCOMMANDS = new Set(["help", "cancel"]);
+
+  /**
+   * Options the slash gates inspect. Only `scope` changes privilege today:
+   * `cancel scope:all` is the old `/seam kill` (bot-wide) and must NOT
+   * inherit cancel's lock-exempt / participant-allowed status.
+   */
+  static slashGateOptions(interaction: ChatInputCommandInteraction): SlashGateOptions {
+    return { scope: interaction.options.getString("scope") };
+  }
+
+  /**
+   * Option-aware predicate: `cancel scope:all` is its own privileged
+   * action (old `/seam kill`). Plain `cancel` (default scope, any force)
+   * is NOT privileged — a student may unstick their own turn.
+   */
+  static isCancelScopeAll(sub: string, options?: SlashGateOptions): boolean {
+    return sub === "cancel" && options?.scope === "all";
+  }
 
   /**
    * Whether a `/seam` subcommand must be refused because the channel is locked
@@ -1653,15 +1673,24 @@ export class Orchestrator {
    * Lives ALONGSIDE `isParticipantSlashRefused` — a different question. A
    * participant is refused even in an UNLOCKED channel; a lock refusal is
    * about the channel, not the invoker's tier.
+   *
+   * Gates inspect RESOLVED OPTIONS, not just the bare subcommand name (#78):
+   * `cancel scope:all` is refused here even though `cancel` is lock-exempt.
    */
   static isLockedSlashRefused(
     config: Config,
     scopeChannelId: string | undefined,
     sub: string,
-    invokerUserId: string
+    invokerUserId: string,
+    options?: SlashGateOptions
   ): boolean {
     if (!isChannelLocked(config, scopeChannelId)) return false;
-    if (Orchestrator.LOCK_EXEMPT_SUBCOMMANDS.has(sub)) return false;
+    if (
+      Orchestrator.LOCK_EXEMPT_SUBCOMMANDS.has(sub) &&
+      !Orchestrator.isCancelScopeAll(sub, options)
+    ) {
+      return false;
+    }
     if (config.SEAM_CONFIG_ADMIN_USER_IDS?.has(invokerUserId)) return false;
     return true;
   }
@@ -1672,11 +1701,15 @@ export class Orchestrator {
    * LOCKED AND UNLOCKED channels. Keyed on the Discord-authenticated
    * invoker id (`interaction.user.id`), never a display name. Admin-who-is-
    * also-participant is NOT restricted (`isRestrictedParticipant`).
+   *
+   * Gates inspect RESOLVED OPTIONS, not just the bare subcommand name (#78):
+   * `cancel scope:all` is refused here even though `cancel` is allowed.
    */
   static isParticipantSlashRefused(
     config: Pick<Config, "SEAM_PARTICIPANT_USER_IDS" | "SEAM_CONFIG_ADMIN_USER_IDS">,
     sub: string,
-    invokerUserId: string
+    invokerUserId: string,
+    options?: SlashGateOptions
   ): boolean {
     if (
       !isRestrictedParticipant(
@@ -1687,7 +1720,12 @@ export class Orchestrator {
     ) {
       return false;
     }
-    if (Orchestrator.PARTICIPANT_ALLOWED_SUBCOMMANDS.has(sub)) return false;
+    if (
+      Orchestrator.PARTICIPANT_ALLOWED_SUBCOMMANDS.has(sub) &&
+      !Orchestrator.isCancelScopeAll(sub, options)
+    ) {
+      return false;
+    }
     return true;
   }
 
@@ -1695,6 +1733,7 @@ export class Orchestrator {
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
     const sub = interaction.options.getSubcommand(true);
+    const slashOpts = Orchestrator.slashGateOptions(interaction);
     // Resolve the *locked-channel* scope id. Only a real thread's parentId
     // points at the channel we key presets on — a plain (non-thread)
     // channel's `parentId` is its Discord *category*, which is never in
@@ -1709,16 +1748,17 @@ export class Orchestrator {
     //     A restricted participant is refused even in an UNLOCKED channel.
     //   - lock (#58 / #71): "is this channel locked for this invoker?"
     // Participant first so config commands get the friendly refusal (not the
-    // lock copy) regardless of lock state. help/abort/cancel pass this gate
-    // and then face the lock gate on their own terms.
-    if (Orchestrator.isParticipantSlashRefused(this.config, sub, interaction.user.id)) {
+    // lock copy) regardless of lock state. help/cancel pass this gate
+    // and then face the lock gate on their own terms. `cancel scope:all`
+    // is refused by BOTH gates (it is the old privileged `kill`).
+    if (Orchestrator.isParticipantSlashRefused(this.config, sub, interaction.user.id, slashOpts)) {
       await interaction.reply({
         content: PARTICIPANT_CONFIG_REFUSAL,
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
-    if (Orchestrator.isLockedSlashRefused(this.config, scopeChannelId, sub, interaction.user.id)) {
+    if (Orchestrator.isLockedSlashRefused(this.config, scopeChannelId, sub, interaction.user.id, slashOpts)) {
       await interaction.reply({
         content: "🔒 This channel is locked — its configuration can't be changed.",
         flags: MessageFlags.Ephemeral,
@@ -1744,61 +1784,51 @@ export class Orchestrator {
           return this.cmdAvatar(interaction);
         case "help":
           return this.cmdHelp(interaction);
-        case "config-audit":
+        case "sessions":
+          return this.cmdSessions(interaction);
+        case "repos":
+          return this.cmdRepos(interaction);
+      }
+    }
+    if (interaction.options.getSubcommandGroup(false) === "config") {
+      switch (interaction.options.getSubcommand(true)) {
+        case "model":
+          return this.cmdModel(interaction);
+        case "effort":
+          return this.cmdEffort(interaction);
+        case "agent":
+          return this.cmdAgent(interaction);
+        case "mode":
+          return this.cmdMode(interaction);
+        case "repo":
+          return this.cmdRepo(interaction);
+        case "tools":
+          return this.cmdTools(interaction);
+        case "approve":
+          return this.cmdApprove(interaction);
+        case "reset":
+          return this.cmdReset(interaction);
+        case "init":
+          return this.cmdInit(interaction);
+        case "show":
+          return this.cmdConfig(interaction);
+        case "set":
+          return this.cmdConfigSet(interaction);
+        case "audit":
           return this.cmdConfigAudit(interaction);
       }
     }
     switch (sub) {
       case "new":
         return this.cmdNew(interaction);
-      case "repo":
-        return this.cmdRepo(interaction);
-      case "model":
-        return this.cmdModel(interaction);
-      case "mode":
-        return this.cmdMode(interaction);
-      case "effort":
-        return this.cmdEffort(interaction);
-      case "abort":
-        return this.cmdAbort(interaction);
       case "cancel":
         return this.cmdCancel(interaction);
-      case "kill":
-        return this.cmdKill(interaction);
       case "steer":
         return this.cmdSteer(interaction);
-      case "image":
-        return this.cmdImage(interaction);
-      case "reset":
-        return this.cmdReset(interaction);
-      case "tools":
-        return this.cmdTools(interaction);
-      case "config":
-        return this.cmdConfig(interaction);
-      case "config-set":
-        return this.cmdConfigSet(interaction);
-      case "sessions":
-        return this.cmdSessions(interaction);
-      case "workflows":
-        return this.cmdWorkflows(interaction);
-      case "repos":
-        return this.cmdRepos(interaction);
-      case "init":
-        return this.cmdInit(interaction);
-      case "approve":
-        return this.cmdApprove(interaction);
-      case "agent":
-        return this.cmdAgent(interaction);
       case "attach":
         return this.cmdAttach(interaction);
-      case "whoami":
-        return this.cmdWhoami(interaction);
-      case "usage":
-        return this.cmdUsage(interaction);
-      case "avatar":
-        return this.cmdAvatar(interaction);
-      case "help":
-        return this.cmdHelp(interaction);
+      case "workflows":
+        return this.cmdWorkflows(interaction);
       default:
         await interaction.reply({
           content: `Unknown subcommand: ${sub}`,
@@ -3127,7 +3157,7 @@ export class Orchestrator {
     if (!prompt) return { ok: false, error: "prompt is required and must be non-empty." };
 
     // COMMAND SOURCE GATE (D8) — the load-bearing guard. A command watch is
-    // durable shell execution that escapes the /seam kill path, so it is refused
+    // durable shell execution that escapes the `/seam cancel scope:all` path, so it is refused
     // at REGISTRATION unless (a) the deployment flag is on AND (b) the exact
     // command string is on the allowlist. The flag/allowlist are read from config
     // (the source of truth), never from a model-supplied value, so this cannot be
@@ -5390,7 +5420,7 @@ export class Orchestrator {
     const thread = await this.adapter.createThread(parent, name);
 
     // Auto-init: bind a session to the new thread and post the repo
-    // picker so the user doesn't have to /seam init themselves.
+    // picker so the user doesn't have to /seam config init themselves.
     try {
       this.router.ensureSessionRecord({
         platform: thread.platform,
@@ -5403,7 +5433,7 @@ export class Orchestrator {
     } catch (err) {
       this.logger.warn({ err, threadId: thread.id }, "auto-init after /seam new failed");
       await i.editReply(
-        `Created thread <#${thread.id}>. Run \`/seam init\` there to begin.`
+        `Created thread <#${thread.id}>. Run \`/seam config init\` there to begin.`
       );
     }
   }
@@ -5494,7 +5524,7 @@ export class Orchestrator {
 
       if (models.length === 0) {
         await i.editReply(
-          `Current model: ${displayCurrent}\n_(agent did not advertise any models — pass an id manually: \`/seam model id:<name>\`.)_`
+          `Current model: ${displayCurrent}\n_(agent did not advertise any models — pass an id manually: \`/seam config model id:<name>\`.)_`
         );
         return;
       }
@@ -5610,7 +5640,7 @@ export class Orchestrator {
     if (supported.length === 0) {
       const msg =
         eff?.mechanism === "modelBaked"
-          ? `Effort for \`${record.agentId}\` is part of the **model** choice — pick a high/med/low model variant with \`/seam model\`.`
+          ? `Effort for \`${record.agentId}\` is part of the **model** choice — pick a high/med/low model variant with \`/seam config model\`.`
           : `The active agent (\`${record.agentId}\`) doesn't support a reasoning-effort setting.`;
       await i.reply({ content: msg, flags: MessageFlags.Ephemeral });
       return;
@@ -5626,7 +5656,7 @@ export class Orchestrator {
         const body =
           cfg.reasoningEffort
             ? `Reasoning effort: \`${cfg.reasoningEffort}\`.`
-            : `Reasoning effort is **unset** — the agent uses its own default. Set with \`/seam effort level:<${supported.join("|")}>\`.`;
+            : `Reasoning effort is **unset** — the agent uses its own default. Set with \`/seam config effort level:<${supported.join("|")}>\`.`;
         await i.reply({ content: body, flags: MessageFlags.Ephemeral });
         return;
       }
@@ -5691,10 +5721,18 @@ export class Orchestrator {
     }
   }
 
-  /** Graceful: ask the agent to stop the current turn (ACP cancel). Usually the
-   *  cleanest — the runtime stays alive and the session continues. A truly hung
-   *  turn may ignore it; use /seam abort to force the kill. */
+  /**
+   * Cancel this thread's turn (graceful), or escalate via options (#78):
+   *   - no opts            → today's cancel (this thread, graceful)
+   *   - `force:true`       → today's abort (this thread, escalate to force-kill)
+   *   - `scope:all`        → today's kill (killAll, bot-wide)
+   * Option bodies stay in cmdAbort / cmdKill so the handlers stay identical.
+   */
   private async cmdCancel(i: ChatInputCommandInteraction): Promise<void> {
+    const scope = i.options.getString("scope");
+    if (scope === "all") return this.cmdKill(i);
+    const force = i.options.getBoolean("force") ?? false;
+    if (force) return this.cmdAbort(i);
     const record = this.recordFromInteraction(i);
     if (!record) {
       await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
@@ -5704,7 +5742,7 @@ export class Orchestrator {
     const outcome = await this.router.abortTurn(record.id, { force: false });
     await i.editReply(
       outcome === "idle" ? "No active turn." :
-      "🟡 Cancel sent. If the turn doesn't stop shortly, use `/seam abort` to force it."
+      "🟡 Cancel sent. If the turn doesn't stop shortly, use `/seam cancel force:true` to force it."
     );
   }
 
@@ -5883,346 +5921,6 @@ export class Orchestrator {
     }
   }
 
-  // -----------------------------------------------------------------------
-  // /seam image — multi-provider image generation picker
-  // -----------------------------------------------------------------------
-
-  private imagePickers = new Map<string, ImagePickerState>();
-
-  private async cmdImage(i: ChatInputCommandInteraction): Promise<void> {
-    const channel = this.channelRefFromInteraction(i);
-    if (!channel) {
-      await i.reply({ content: "Use `/seam image` from inside a thread.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const initialPrompt = i.options.getString("prompt") ?? "";
-
-    // If no prompt was provided, open a modal so the user can paste a longer one.
-    let prompt = initialPrompt;
-    if (!prompt.trim()) {
-      const modalId = `img:prompt:${i.id}`;
-      const modal = new ModalBuilder()
-        .setCustomId(modalId)
-        .setTitle("New image prompt")
-        .addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(
-            new TextInputBuilder()
-              .setCustomId("prompt")
-              .setLabel("Describe the image")
-              .setStyle(TextInputStyle.Paragraph)
-              .setRequired(true)
-              .setMaxLength(4000)
-          )
-        );
-      await i.showModal(modal);
-      const submitted = await i.awaitModalSubmit({
-        filter: (m) => m.customId === modalId && m.user.id === i.user.id,
-        time: 300_000,
-      }).catch(() => null);
-      if (!submitted) return;
-      prompt = submitted.fields.getTextInputValue("prompt").trim();
-      if (!prompt) {
-        await submitted.reply({ content: "Empty prompt — cancelled.", flags: MessageFlags.Ephemeral });
-        return;
-      }
-      await submitted.deferReply();
-      const state = this.makePickerState(prompt);
-      await submitted.editReply(renderImagePicker(state));
-      const msg = await submitted.fetchReply();
-      this.imagePickers.set(msg.id, state);
-      this.attachImagePickerCollector(msg as Message, state);
-      return;
-    }
-
-    await i.deferReply();
-    const state = this.makePickerState(prompt);
-    await i.editReply(renderImagePicker(state));
-    const msg = await i.fetchReply();
-    this.imagePickers.set(msg.id, state);
-    this.attachImagePickerCollector(msg as Message, state);
-  }
-
-  private makePickerState(prompt: string): ImagePickerState {
-    const defaultModel =
-      getImageModelById("nano-banana-2") ?? IMAGE_MODELS[0]!;
-    return {
-      prompt,
-      modelId: defaultModel.id,
-      aspectRatio: defaultModel.aspectRatios.includes("16:9") ? "16:9" : defaultModel.aspectRatios[0]!,
-      resolution: defaultModel.resolutions.includes("1K") ? "1K" : defaultModel.resolutions[0]!,
-      count: 1,
-      references: [],
-      bflKeyAvailable: this.config.BFL_API_KEY.trim().length > 0,
-    };
-  }
-
-  private attachImagePickerCollector(msg: Message, state: ImagePickerState): void {
-    const collector = msg.createMessageComponentCollector({ time: 30 * 60_000 });
-    collector.on("collect", async (bi) => {
-      const customId = bi.customId;
-      try {
-        if (customId === "img:cancel") {
-          collector.stop("cancelled");
-          await bi.update({ content: "Cancelled.", embeds: [], components: [] });
-          return;
-        }
-        if (customId === "img:edit") {
-          const modalId = `img:edit:${bi.id}`;
-          const modal = new ModalBuilder()
-            .setCustomId(modalId)
-            .setTitle("Edit image prompt")
-            .addComponents(
-              new ActionRowBuilder<TextInputBuilder>().addComponents(
-                new TextInputBuilder()
-                  .setCustomId("prompt")
-                  .setLabel("Describe the image")
-                  .setStyle(TextInputStyle.Paragraph)
-                  .setRequired(true)
-                  .setMaxLength(4000)
-                  .setValue(state.prompt.slice(0, 4000))
-              )
-            );
-          await bi.showModal(modal);
-          const submitted = await bi.awaitModalSubmit({
-            filter: (m) => m.customId === modalId && m.user.id === bi.user.id,
-            time: 300_000,
-          }).catch(() => null);
-          if (!submitted) return;
-          state.prompt = submitted.fields.getTextInputValue("prompt").trim();
-          await submitted.deferUpdate();
-          await submitted.editReply(renderImagePicker(state));
-          return;
-        }
-        if (customId === "img:model") {
-          if (!bi.isStringSelectMenu()) return;
-          const picked = bi.values[0]!;
-          const model = getImageModelById(picked);
-          if (!model) return;
-          state.modelId = model.id;
-          if (!model.aspectRatios.includes(state.aspectRatio)) {
-            state.aspectRatio = model.aspectRatios.includes("16:9") ? "16:9" : model.aspectRatios[0]!;
-          }
-          if (!model.resolutions.includes(state.resolution)) {
-            state.resolution = model.resolutions.includes("1K") ? "1K" : model.resolutions[0]!;
-          }
-          if (state.references.length > model.maxReferenceImages) {
-            state.references = state.references.slice(0, model.maxReferenceImages);
-          }
-          if (state.count > model.maxCount) state.count = model.maxCount;
-          await bi.update(renderImagePicker(state));
-          return;
-        }
-        if (customId.startsWith("img:aspect:")) {
-          state.aspectRatio = customId.slice("img:aspect:".length) as AspectRatio;
-          await bi.update(renderImagePicker(state));
-          return;
-        }
-        if (customId === "img:aspect-select") {
-          if (!bi.isStringSelectMenu()) return;
-          state.aspectRatio = bi.values[0]! as AspectRatio;
-          await bi.update(renderImagePicker(state));
-          return;
-        }
-        if (customId.startsWith("img:count:")) {
-          state.count = parseInt(customId.slice("img:count:".length), 10) || 1;
-          await bi.update(renderImagePicker(state));
-          return;
-        }
-        if (customId.startsWith("img:res:")) {
-          state.resolution = customId.slice("img:res:".length) as Resolution;
-          await bi.update(renderImagePicker(state));
-          return;
-        }
-        if (customId === "img:refs") {
-          await this.handleImageRefsButton(bi, state);
-          return;
-        }
-        if (customId === "img:clear-refs") {
-          state.references = [];
-          await bi.update(renderImagePicker(state));
-          return;
-        }
-        if (customId === "img:generate") {
-          await this.handleImageGenerate(bi, state, msg);
-          return;
-        }
-      } catch (err) {
-        this.logger.error({ err, customId }, "image picker handler error");
-        if (!bi.replied && !bi.deferred) {
-          await bi.reply({ content: `Picker error: ${(err as Error).message}`, flags: MessageFlags.Ephemeral }).catch(() => {});
-        }
-      }
-    });
-    collector.on("end", () => {
-      this.imagePickers.delete(msg.id);
-    });
-  }
-
-  private async handleImageRefsButton(bi: MessageComponentInteraction, state: ImagePickerState): Promise<void> {
-    const model = getImageModelById(state.modelId);
-    if (!model || model.maxReferenceImages === 0) {
-      await bi.reply({ content: "This model doesn't support reference images.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const remaining = model.maxReferenceImages - state.references.length;
-    if (remaining <= 0) {
-      await bi.reply({ content: `Already at the ${model.maxReferenceImages}-ref limit.`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    await bi.reply({
-      content: `Upload up to **${remaining}** reference image${remaining === 1 ? "" : "s"} in this channel within 60 seconds. (Or send any non-image message to cancel.)`,
-      flags: MessageFlags.Ephemeral,
-    });
-
-    const channel = bi.channel;
-    if (!channel || !("createMessageCollector" in channel)) {
-      await bi.followUp({ content: "Channel doesn't support uploads.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const mCollector = channel.createMessageCollector({
-      filter: (m) => m.author.id === bi.user.id,
-      time: 60_000,
-    });
-    mCollector.on("collect", async (m) => {
-      const images = m.attachments.filter((a) =>
-        (a.contentType ?? "").startsWith("image/")
-      );
-      if (images.size === 0) {
-        mCollector.stop("done");
-        return;
-      }
-      let added = 0;
-      for (const a of images.values()) {
-        if (state.references.length >= model.maxReferenceImages) break;
-        try {
-          const res = await fetch(a.url);
-          if (!res.ok) continue;
-          const buf = Buffer.from(await res.arrayBuffer());
-          state.references.push({
-            data: buf,
-            mimeType: a.contentType ?? "image/png",
-            ...(a.name ? { filename: a.name } : {}),
-          });
-          added++;
-        } catch { /* skip */ }
-      }
-      try {
-        const picker = renderImagePicker(state);
-        await bi.message.edit(picker);
-      } catch { /* ignore */ }
-      if (added < images.size) mCollector.stop("done");
-    });
-    mCollector.on("end", () => {
-      try {
-        bi.message.edit(renderImagePicker(state)).catch(() => {});
-      } catch { /* ignore */ }
-    });
-  }
-
-  private async handleImageGenerate(
-    bi: MessageComponentInteraction,
-    state: ImagePickerState,
-    msg: Message
-  ): Promise<void> {
-    const model = getImageModelById(state.modelId);
-    if (!model) {
-      await bi.reply({ content: "Model not found.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    const googleApiKey = await resolveGoogleApiKey(
-      this.config.GOOGLE_AI_STUDIO_API_KEY,
-      this.config.GOOGLE_AI_STUDIO_API_KEY_FILE
-    );
-    const bflKey = this.config.BFL_API_KEY.trim();
-    if (model.provider === "google" && !googleApiKey) {
-      await bi.reply({ content: "Google AI Studio API key not configured.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (model.provider === "bfl" && !bflKey) {
-      await bi.reply({ content: "BFL API key not configured.", flags: MessageFlags.Ephemeral });
-      return;
-    }
-
-    await bi.update(renderImagePicker(state, { status: "generating" }));
-    const started = Date.now();
-
-    let result;
-    try {
-      result = await generateImage(
-        {
-          model,
-          prompt: state.prompt,
-          aspectRatio: state.aspectRatio,
-          resolution: state.resolution,
-          count: state.count,
-          references: state.references,
-        },
-        { googleApiKey, bflApiKey: bflKey }
-      );
-    } catch (err) {
-      this.logger.error({ err, model: model.id }, "image generation failed");
-      await bi.editReply(
-        renderImagePicker(state, {
-          status: "error",
-          errorMessage: (err as Error).message,
-        })
-      );
-      return;
-    }
-
-    // Save each to <cwd>/.seam-images/<ts>.png and post as Discord attachments.
-    const parentId = (msg.channel as { parentId?: string | null } | undefined)?.parentId ?? undefined;
-    const record = this.router.ensureSessionRecord({
-      platform: "discord",
-      channelRef: msg.channelId,
-      ...(parentId ? { parentRef: parentId } : {}),
-      cwd: this.config.REPOS_ROOT,
-    });
-    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
-    const saveDir = path.join(cwd, ".seam-images");
-    try {
-      await fsp.mkdir(saveDir, { recursive: true });
-    } catch { /* best effort */ }
-    const ts = Date.now();
-    const files: AttachmentBuilder[] = [];
-    const savedPaths: string[] = [];
-    for (let i = 0; i < result.images.length; i++) {
-      const img = result.images[i]!;
-      const ext = img.mimeType === "image/jpeg" ? "jpg" : "png";
-      const filename = `${model.id}-${ts}-${i + 1}.${ext}`;
-      const absPath = path.join(saveDir, filename);
-      try {
-        await fsp.writeFile(absPath, img.data);
-        savedPaths.push(absPath);
-      } catch (err) {
-        this.logger.warn({ err, absPath }, "failed to save generated image");
-      }
-      files.push(new AttachmentBuilder(img.data, { name: filename }));
-    }
-
-    const elapsed = ((Date.now() - started) / 1000).toFixed(1);
-    await bi.editReply(
-      renderImagePicker(state, {
-        status: "done",
-        elapsedSec: elapsed,
-        savedPaths,
-      })
-    );
-
-    // Post the generated images as a follow-up message so they don't replace
-    // the picker (the user may want to iterate).
-    try {
-      await bi.followUp({
-        content:
-          `**${model.displayName}** · ${state.aspectRatio} · ${result.images.length} image${result.images.length === 1 ? "" : "s"} · ${elapsed}s` +
-          (savedPaths.length > 0 ? `\n\`${savedPaths[0]}\`` : ""),
-        files,
-      });
-    } catch (err) {
-      this.logger.error({ err }, "failed to post generated images to thread");
-    }
-  }
-
   private async cmdReset(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
     if (!record) {
@@ -6249,12 +5947,12 @@ export class Orchestrator {
   }
 
   /**
-   * `/seam agent` — show or change the agent bound to this thread.
+   * `/seam config agent` — show or change the agent bound to this thread.
    *
    * Changing agents mid-thread is destructive: the old agent's
    * conversation history can't be replayed against a different CLI, so
    * we invalidate the live runtime and clear the stored ACP session id
-   * (same as `/seam reset`). The new agent's `defaultModel` is applied
+   * (same as `/seam config reset`). The new agent's `defaultModel` is applied
    * to the session config so the first turn uses something sensible.
    */
   private async cmdAgent(i: ChatInputCommandInteraction): Promise<void> {
@@ -6533,7 +6231,7 @@ export class Orchestrator {
     await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 
-  /** `/seam info config-audit` — read the immutable config-mutation trail (#70).
+  /** `/seam config audit` — read the immutable config-mutation trail (#70).
    *  Every applied config change already writes a `config_audit` row; this is
    *  the missing read surface. Purely observability: no writes, no schema, and
    *  intentionally slash-command-only (the trail spans every channel, so it is
@@ -6554,7 +6252,7 @@ export class Orchestrator {
         await i.reply({
           content:
             `No config-audit entry \`${entryId}\` in the last ${limit} mutations. ` +
-            `Raise \`limit\` or copy an id from \`/seam info config-audit\`.`,
+            `Raise \`limit\` or copy an id from \`/seam config audit\`.`,
           flags: MessageFlags.Ephemeral,
         });
         return;
@@ -8162,7 +7860,7 @@ export class Orchestrator {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
       await i.reply({
-        content: "Use `/seam init` inside a thread.",
+        content: "Use `/seam config init` inside a thread.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -8465,23 +8163,38 @@ export class Orchestrator {
     const lines = [
       "**seam-acp** — control the agent in this thread.",
       "",
+      "**Top-level**",
       "`/seam new [name]` — create a new agent thread",
-      "`/seam init` — bind this thread + show repo picker",
-      "`/seam repo <path>` — set working repo (under REPOS_ROOT)",
-      "`/seam repos` — list repos under REPOS_ROOT",
-      "`/seam model [id]` — get / set agent model",
-      "`/seam mode <id>` — set agent operational mode",
-      "`/seam effort <low|medium|high>` — reasoning effort",
-      "`/seam tools <allow|exclude> [list]` — tool filters",
-      "`/seam approve <always|ask|deny>` — permission policy",
-      "`/seam abort` — cancel current turn",
-      "`/seam config` — show session config JSON",
-      "`/seam config-set <json>` — replace session config",
-      "`/seam sessions` — list known sessions",
-      "`/seam attach <path>` — upload a host-side file (under REPOS_ROOT or ATTACH_ROOTS) to this channel",
-      "`/seam whoami` — show the account this thread's agent is signed in as",
-      "`/seam usage` — show usage / credits (agy only)",
-      "`/seam avatar` — re-push bot avatar to Discord",
+      "`/seam cancel` — gracefully cancel this thread's turn",
+      "`/seam cancel force:true` — escalate if the turn ignores cancel (old abort)",
+      "`/seam cancel scope:all` — force-kill every active session (old kill)",
+      "`/seam steer <thread> <prompt> [now]` — steer a node mid-task",
+      "`/seam attach <path>` — upload a host-side file (under REPOS_ROOT or ATTACH_ROOTS)",
+      "`/seam workflows` — delegation ledger + pending wakes/watches",
+      "",
+      "**`/seam config`**",
+      "`/seam config model [id]` — get / set agent model",
+      "`/seam config effort [level]` — reasoning effort",
+      "`/seam config agent [id]` — get / set agent (resets session)",
+      "`/seam config mode <id>` — set agent operational mode",
+      "`/seam config repo <path>` — set working repo (under REPOS_ROOT)",
+      "`/seam config tools <allow|exclude> [list]` — tool filters",
+      "`/seam config approve <always|ask|deny>` — permission policy",
+      "`/seam config reset` — end this thread's ACP session; next message starts fresh",
+      "`/seam config init` — bind this thread + show repo picker",
+      "`/seam config show` — show session config JSON",
+      "`/seam config set <json>` — replace session config",
+      "`/seam config audit` — recent config mutations (who/what/when)",
+      "",
+      "**`/seam info`**",
+      "`/seam info whoami` — show the account this thread's agent is signed in as",
+      "`/seam info usage` — show usage / credits (agy only)",
+      "`/seam info avatar` — re-push bot avatar to Discord",
+      "`/seam info help` — this list",
+      "`/seam info sessions` — list known sessions",
+      "`/seam info repos` — list repos under REPOS_ROOT",
+      "",
+      "**Groups** — `/seam schedule`, `/seam preset`, `/seam project`",
       "",
       "Free-form messages in a thread are sent to the agent.",
     ];
@@ -9046,7 +8759,7 @@ export class Orchestrator {
         );
         await this.adapter.sendMessage(
           channel,
-          `_Could not list models: ${(err as Error).message}. Use \`/seam model\` later._`
+          `_Could not list models: ${(err as Error).message}. Use \`/seam config model\` later._`
         );
       }
     }
@@ -10272,189 +9985,3 @@ function formatResetTime(iso: string): string {
 // Re-export for convenience.
 export type { EmbedBuilder };
 
-// -----------------------------------------------------------------------
-// /seam image picker — state + render
-// -----------------------------------------------------------------------
-
-interface ImagePickerState {
-  prompt: string;
-  modelId: string;
-  aspectRatio: AspectRatio;
-  resolution: Resolution;
-  count: number;
-  references: ReferenceImage[];
-  bflKeyAvailable: boolean;
-}
-
-interface ImagePickerRenderOpts {
-  status?: "idle" | "generating" | "done" | "error";
-  elapsedSec?: string;
-  errorMessage?: string;
-  savedPaths?: string[];
-}
-
-function renderImagePicker(
-  state: ImagePickerState,
-  opts: ImagePickerRenderOpts = {}
-): { embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] } {
-  const model = getImageModelById(state.modelId) ?? IMAGE_MODELS[0]!;
-  const status = opts.status ?? "idle";
-
-  const colorByStatus: Record<string, number> = {
-    idle: 0x5865f2,
-    generating: 0xfaa61a,
-    done: 0x57f287,
-    error: 0xed4245,
-  };
-
-  let title = "🎨 Image Generator";
-  if (status === "generating") title = "🎨 Generating…";
-  if (status === "done") title = `✅ Generated in ${opts.elapsedSec ?? "?"}s`;
-  if (status === "error") title = "❌ Generation failed";
-
-  const promptPreview =
-    state.prompt.length > 1000
-      ? state.prompt.slice(0, 997) + "…"
-      : state.prompt;
-  const embed = new EmbedBuilder()
-    .setTitle(title)
-    .setColor(colorByStatus[status]!)
-    .setDescription(`> ${promptPreview.replace(/\n/g, "\n> ")}`);
-
-  embed.addFields(
-    { name: "Model", value: `${model.displayName}`, inline: true },
-    { name: "Aspect", value: state.aspectRatio, inline: true },
-    { name: "Resolution", value: state.resolution, inline: true },
-    { name: "Count", value: `${state.count}`, inline: true }
-  );
-  if (model.maxReferenceImages > 0) {
-    embed.addFields({
-      name: "Refs",
-      value: `${state.references.length} / ${model.maxReferenceImages}`,
-      inline: true,
-    });
-  }
-  if (status === "error" && opts.errorMessage) {
-    embed.addFields({ name: "Error", value: "```\n" + opts.errorMessage.slice(0, 1000) + "\n```" });
-  }
-  if (status === "done" && opts.savedPaths && opts.savedPaths.length > 0) {
-    embed.addFields({
-      name: "Saved",
-      value: opts.savedPaths.map((p) => `\`${p}\``).join("\n").slice(0, 1024),
-    });
-  }
-
-  if (status === "generating") {
-    // Keep the picker visible but disable the controls during generation.
-    return {
-      embeds: [embed],
-      components: [
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder()
-            .setCustomId("img:noop")
-            .setLabel("Generating…")
-            .setStyle(ButtonStyle.Secondary)
-            .setDisabled(true)
-        ),
-      ],
-    };
-  }
-
-  // Model select
-  const visibleModels = IMAGE_MODELS.filter(
-    (m) => m.provider !== "bfl" || state.bflKeyAvailable
-  );
-  const modelSelect = new StringSelectMenuBuilder()
-    .setCustomId("img:model")
-    .setPlaceholder("Pick model")
-    .addOptions(
-      visibleModels.map((m) => ({
-        label: m.displayName,
-        description: m.description.slice(0, 100),
-        value: m.id,
-        default: m.id === state.modelId,
-      }))
-    );
-
-  // Aspect: button row when ≤5 ratios, select menu otherwise (Discord caps
-  // ActionRow at 5 buttons; FLUX has 6 ratios with 21:9 added).
-  const aspectRow =
-    model.aspectRatios.length <= 5
-      ? new ActionRowBuilder<ButtonBuilder>().addComponents(
-          ...model.aspectRatios.map((ar) =>
-            new ButtonBuilder()
-              .setCustomId(`img:aspect:${ar}`)
-              .setLabel(ar)
-              .setStyle(ar === state.aspectRatio ? ButtonStyle.Primary : ButtonStyle.Secondary)
-          )
-        )
-      : new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-          new StringSelectMenuBuilder()
-            .setCustomId("img:aspect-select")
-            .setPlaceholder("Aspect ratio")
-            .addOptions(
-              model.aspectRatios.map((ar) => ({
-                label: ar,
-                value: ar,
-                default: ar === state.aspectRatio,
-              }))
-            )
-        );
-
-  // Resolution row (1K / 2K / 4K — per-model)
-  const resolutionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    ...model.resolutions.map((r) =>
-      new ButtonBuilder()
-        .setCustomId(`img:res:${r}`)
-        .setLabel(r)
-        .setStyle(r === state.resolution ? ButtonStyle.Primary : ButtonStyle.Secondary)
-    )
-  );
-
-  // Count buttons (1..maxCount, capped at 4 visible)
-  const countChoices: number[] = [];
-  for (let n = 1; n <= Math.min(model.maxCount, 4); n++) countChoices.push(n);
-  const countRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    ...countChoices.map((n) =>
-      new ButtonBuilder()
-        .setCustomId(`img:count:${n}`)
-        .setLabel(`${n}`)
-        .setStyle(n === state.count ? ButtonStyle.Primary : ButtonStyle.Secondary)
-    )
-  );
-
-  // Action row (refs + edit + generate + cancel)
-  const actionButtons: ButtonBuilder[] = [];
-  if (model.maxReferenceImages > 0) {
-    actionButtons.push(
-      new ButtonBuilder()
-        .setCustomId("img:refs")
-        .setLabel(`📎 ${state.references.length}/${model.maxReferenceImages}`)
-        .setStyle(ButtonStyle.Secondary)
-    );
-    if (state.references.length > 0) {
-      actionButtons.push(
-        new ButtonBuilder()
-          .setCustomId("img:clear-refs")
-          .setLabel("🗑️")
-          .setStyle(ButtonStyle.Secondary)
-      );
-    }
-  }
-  actionButtons.push(
-    new ButtonBuilder().setCustomId("img:edit").setLabel("✍️ Edit").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("img:generate").setLabel("✨ Generate").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("img:cancel").setLabel("✖️ Cancel").setStyle(ButtonStyle.Danger)
-  );
-
-  return {
-    embeds: [embed],
-    components: [
-      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(modelSelect),
-      aspectRow,
-      resolutionRow,
-      countRow,
-      new ActionRowBuilder<ButtonBuilder>().addComponents(...actionButtons),
-    ],
-  };
-}

@@ -397,7 +397,7 @@ export class SessionRouter {
 
   /** Force-kill EVERY live runtime (and its agent process group). Returns how
    *  many were killed. Session ids are preserved so threads resume cleanly on
-   *  their next message. Used by /seam kill. */
+   *  their next message. Used by `/seam cancel scope:all`. */
   async killAll(opts?: { exceptId?: string }): Promise<number> {
     const ids = Array.from(this.runtimes.keys()).filter((id) => id !== opts?.exceptId);
     for (const id of ids) {

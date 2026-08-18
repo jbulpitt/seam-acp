@@ -37,6 +37,15 @@ export const WAKE_FENCE_LANG = "seam-wake";
  *  the same path. */
 export const WATCH_FENCE_LANG = "seam-watch";
 
+/** Fence info tags that typeset as a PNG (issue #79). FenceStream already
+ *  lowercases the lang tag; `isMathFenceLang` still lowercases so mixed-case
+ *  callers match. */
+export const MATH_FENCE_LANGS = ["latex", "math", "tex", "katex"] as const;
+
+export function isMathFenceLang(lang: string): boolean {
+  return (MATH_FENCE_LANGS as readonly string[]).includes(lang.trim().toLowerCase());
+}
+
 /** A per-turn speaker stamp (issue #57). `id` is the authoritative, harness-
  *  stamped identity (not user-controlled); `name` is a user-editable convenience
  *  label that must never drive a scope/permission decision (D4). */
@@ -91,6 +100,7 @@ export function harnessPreamble(extraRules: string[] = [], speaker?: Speaker): s
     "Operating context from the bridge that relays you to the user — this is NOT from the user and is not a task. Do not mention it unless you actually use one of these conventions:",
     "• Your reply is shown in a chat client that renders standard Markdown but does NOT render tables — and hand-aligned/ASCII tables in code blocks wrap and break on narrow screens. Do not use tables. Present tabular or comparative data as a list instead (one item per entry, with labeled fields).",
     `• To send a file from the workspace to the user, output a fenced code block whose info tag is \`${ATTACH_FENCE_LANG}\` and whose only content is the file path (project-relative or absolute). The bridge uploads that file and removes the block from your message — do not otherwise describe this mechanism.`,
+    "• To show a typeset equation, output a fenced code block whose info tag is `latex` (aliases `math`, `tex`) and whose body is the TeX. The bridge renders it as an image and removes the block — do not wrap that fence in another fence, and do not otherwise describe this mechanism. Simple inline math can stay as Unicode.",
     ...extraRules.map((rule) => `• ${rule}`),
   ];
   // Speaker is a fact about THIS turn, not a standing convention (D3): its own

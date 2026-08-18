@@ -145,4 +145,37 @@ describe("StreamingMessageRenderer (real FenceStream + splitForFlush + SerialQue
     expect(msg).toContain("z".repeat(300));
     expect(msg).toContain("size ceiling");
   });
+
+  it("with sendFile, a latex fence is posted as a PNG and not reconstructed source", async () => {
+    const { sent, send } = collector();
+    const files: Array<{ data: Buffer; filename: string; mimeType: string }> = [];
+    const sendFile = async (file: { data: Buffer; filename: string; mimeType: string }) => {
+      files.push(file);
+    };
+    const r = new StreamingMessageRenderer(send, { sendFile });
+    r.feed("Before the equation.\n\n```latex\ne^{i\\pi}+1=0\n```\n\nAfter.");
+    await r.finalize();
+
+    expect(files).toHaveLength(1);
+    expect(files[0]!.filename).toMatch(/^math-\d+\.png$/);
+    expect(files[0]!.mimeType).toBe("image/png");
+    expect(
+      files[0]!.data.subarray(0, 8).equals(
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+      )
+    ).toBe(true);
+    expect(sent.some((m) => m.includes("```latex"))).toBe(false);
+    expect(sent.some((m) => m.includes("e^{i\\pi}+1=0"))).toBe(false);
+    expect(sent.some((m) => m.includes("Before the equation."))).toBe(true);
+    expect(sent.some((m) => m.includes("After."))).toBe(true);
+  });
+
+  it("without sendFile, a latex fence is still reconstructed as source", async () => {
+    const { sent, send } = collector();
+    const r = new StreamingMessageRenderer(send);
+    r.feed("```latex\ne^{i\\pi}+1=0\n```");
+    await r.finalize();
+    const fenceMsg = sent.find((m) => m.startsWith("```latex"));
+    expect(fenceMsg).toBe("```latex\ne^{i\\pi}+1=0\n```");
+  });
 });

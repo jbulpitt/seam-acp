@@ -32,6 +32,7 @@
 import { FenceStream, type CompletedFence } from "./fence-stream.js";
 import { splitForFlush } from "./stream-flush.js";
 import { SerialQueue } from "./serial-queue.js";
+import { isMathFenceLang, renderMathPng } from "./math-render.js";
 
 /** Posts one flushed message. The renderer serializes calls so they never
  *  overlap; a rejection is the caller's to swallow (best-effort display). */
@@ -52,6 +53,10 @@ export interface StreamingMessageRendererOptions {
   now?: () => number;
   /** Optional structured logger for watchdog trips (best-effort). */
   logger?: { warn: (obj: unknown, msg?: string) => void };
+  /** Optional file upload. When set, latex/math/tex/katex fences render as
+   *  a PNG instead of reconstructed markdown. Existing callers that pass only
+   *  `send` keep today's source-fence behavior. */
+  sendFile?: (file: { data: Buffer; filename: string; mimeType: string }) => Promise<void>;
 }
 
 // Same constants the user-turn path uses in handleIncomingMessageInner.
@@ -82,6 +87,12 @@ export class StreamingMessageRenderer {
   private readonly fenceBufferCeiling: number;
   private readonly now: () => number;
   private readonly logger?: { warn: (obj: unknown, msg?: string) => void };
+  private readonly sendFile?: (file: {
+    data: Buffer;
+    filename: string;
+    mimeType: string;
+  }) => Promise<void>;
+  private mathFenceCounter = 0;
 
   constructor(
     private readonly send: SendMessage,
@@ -94,6 +105,7 @@ export class StreamingMessageRenderer {
     this.fenceBufferCeiling = opts.fenceBufferCeiling ?? DEFAULT_FENCE_BUFFER_CEILING;
     this.now = opts.now ?? Date.now;
     if (opts.logger) this.logger = opts.logger;
+    if (opts.sendFile) this.sendFile = opts.sendFile;
   }
 
   /** How many messages have been posted so far (progressive flushes + fences +
@@ -192,11 +204,49 @@ export class StreamingMessageRenderer {
   /** Reconstruct a completed fence verbatim (```lang … ```) and post it as its
    *  own message, kept intact — never split across flushes. The lossless full
    *  text lives with the caller, so we don't route huge fences to a file here (a
-   *  normal turn doesn't cap the streamed body). */
+   *  normal turn doesn't cap the streamed body). Math fences with `sendFile`
+   *  typeset to a PNG instead (still on this queue so uploads stay ordered). */
   private emitFence(fence: CompletedFence, notice?: string): Promise<void> {
-    const reconstructed = "```" + (fence.lang ?? "") + "\n" + fence.content + "\n```";
-    const text = notice ? `${reconstructed}\n${notice}` : reconstructed;
     return this.flushQueue.run(async () => {
+      if (isMathFenceLang(fence.lang) && this.sendFile) {
+        const body = fence.content.trim();
+        if (!body) {
+          this.logger?.warn(
+            { lang: fence.lang },
+            "empty math fence; emitting nothing"
+          );
+          return;
+        }
+        try {
+          const png = await renderMathPng(fence.content);
+          this.mathFenceCounter += 1;
+          await this.sendFile({
+            data: png,
+            filename: `math-${this.mathFenceCounter}.png`,
+            mimeType: "image/png",
+          });
+          this.sent += 1;
+          if (notice) {
+            await this.send(notice);
+            this.sent += 1;
+          }
+          return;
+        } catch (err) {
+          this.logger?.warn(
+            { err, lang: fence.lang },
+            "math fence render failed; emitting source"
+          );
+          const failNotice = notice
+            ? `${notice}\n_(couldn't render latex)_`
+            : "_(couldn't render latex)_";
+          const reconstructed = "```" + (fence.lang ?? "") + "\n" + fence.content + "\n```";
+          await this.send(`${reconstructed}\n${failNotice}`);
+          this.sent += 1;
+          return;
+        }
+      }
+      const reconstructed = "```" + (fence.lang ?? "") + "\n" + fence.content + "\n```";
+      const text = notice ? `${reconstructed}\n${notice}` : reconstructed;
       await this.send(text);
       this.sent += 1;
     });

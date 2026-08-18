@@ -171,7 +171,8 @@ import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
-import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, withHarnessPreamble } from "../../core/agent-conventions.js";
+import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, isMathFenceLang, withHarnessPreamble } from "../../core/agent-conventions.js";
+import { renderMathPng } from "../../core/math-render.js";
 import { isInlineableForAgent } from "../../agents/attachments.js";
 import { stageAttachment, sweepStagedAttachments } from "../../agents/attachment-staging.js";
 import { splitForFlush } from "../../core/stream-flush.js";
@@ -3793,7 +3794,18 @@ export class Orchestrator {
               this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream message send failed");
             }
           },
-          { logger: this.logger }
+          {
+            logger: this.logger,
+            sendFile: this.adapter.sendFile
+              ? async (file) => {
+                  try {
+                    await this.adapter.sendFile!(target, file);
+                  } catch (err) {
+                    this.logger.warn({ err, dispatch: spec.id }, "dispatch: stream file send failed");
+                  }
+                }
+              : undefined,
+          }
         );
       } else if (streaming && panelRef) {
         const ref = panelRef;
@@ -9004,6 +9016,13 @@ export class Orchestrator {
       return;
     }
 
+    // Typeset latex/math/tex/katex fences as a PNG (issue #79). Before the
+    // inline/attachment size fork so the source fence is never shown.
+    if (isMathFenceLang(fence.lang)) {
+      await this.emitMathFence(channel, fence, counter, opts);
+      return;
+    }
+
     // Inline-rendered total size = ```lang\n<content>\n``` plus optional
     // trailing notice on its own paragraph.
     const inlineMessageLen =
@@ -9016,6 +9035,51 @@ export class Orchestrator {
       return;
     }
     await this.emitFenceAttachment(channel, fence, counter, opts);
+  }
+
+  /**
+   * Typeset a latex/math/tex/katex fence as a PNG and upload it. Empty body
+   * emits nothing. On render failure, fail-open: post the original source
+   * fence plus a one-line italic notice (preserving any watchdog notice).
+   */
+  private async emitMathFence(
+    channel: ChannelRef,
+    fence: CompletedFence,
+    counter: number,
+    opts: { notice?: string } = {}
+  ): Promise<void> {
+    const body = fence.content.trim();
+    if (!body) {
+      this.logger.info({ lang: fence.lang }, "empty math fence; emitting nothing");
+      return;
+    }
+    if (!this.adapter.sendFile) {
+      await this.emitFenceInline(channel, fence, opts);
+      return;
+    }
+    try {
+      const png = await renderMathPng(fence.content);
+      await this.adapter.sendFile(channel, {
+        data: png,
+        filename: `math-${counter}.png`,
+        mimeType: "image/png",
+      });
+      if (opts.notice) {
+        await this.adapter.sendMessage(channel, opts.notice).catch((err) => {
+          this.logger.warn({ err }, "math fence notice send failed");
+        });
+      }
+      this.logger.info(
+        { chars: body.length, bytes: png.byteLength },
+        "math fence → rendered PNG"
+      );
+    } catch (err) {
+      this.logger.warn({ err, chars: body.length }, "math fence render failed; emitting source");
+      const notice = opts.notice
+        ? `${opts.notice}\n_(couldn't render latex)_`
+        : "_(couldn't render latex)_";
+      await this.emitFenceInline(channel, fence, { notice });
+    }
   }
 
   /**

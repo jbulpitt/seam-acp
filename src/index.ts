@@ -1,6 +1,6 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { loadConfig, isChannelLocked, REMOTE_MAC_MODELS, CODEX_STATIC_MODELS, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
+import { loadConfig, isChannelLocked, adminParticipantOverlapIds, REMOTE_MAC_MODELS, CODEX_STATIC_MODELS, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
 import { SessionStore } from "./core/session-store.js";
@@ -39,6 +39,15 @@ async function main(): Promise<void> {
     },
     "seam-acp starting"
   );
+  // #74: an id in BOTH admin and participant sets is an admin, not a restricted
+  // participant. Silently picking one is how a privilege bug hides — name them.
+  const adminParticipantOverlap = adminParticipantOverlapIds(config);
+  if (adminParticipantOverlap.length > 0) {
+    logger.warn(
+      { overlappingUserIds: adminParticipantOverlap },
+      `SEAM_CONFIG_ADMIN_USER_IDS and SEAM_PARTICIPANT_USER_IDS overlap — admin wins; these ids are NOT restricted participants: ${adminParticipantOverlap.join(", ")}`
+    );
+  }
 
   const health = startHealthServer(config.HEALTH_PORT, logger);
 
@@ -551,6 +560,7 @@ async function main(): Promise<void> {
       // id (undefined when speaker identity is off or the turn has no human
       // author), so with the flag off a locked channel keeps refusing everyone.
       configAdminUserIds: config.SEAM_CONFIG_ADMIN_USER_IDS,
+      configParticipantUserIds: config.SEAM_PARTICIPANT_USER_IDS,
       currentSpeakerId: (record) => orchestrator.currentSpeaker(record.channelRef),
       // #58 P2/P3: propose-then-confirm mutation. The orchestrator validates,
       // renders the confirm card, and applies only on a human click (D5),

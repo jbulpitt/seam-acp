@@ -106,6 +106,7 @@ async function makeHarness(opts?: {
   listWatches?: SeamMcpServerDeps["listWatches"];
   isChannelLocked?: (record: SessionRecord) => boolean;
   configAdminUserIds?: ReadonlySet<string>;
+  configParticipantUserIds?: ReadonlySet<string>;
   currentSpeakerId?: (record: SessionRecord) => string | undefined;
   proposeConfig?: (record: SessionRecord, input: unknown) => Promise<any>;
   pushInbox?: SeamMcpServerDeps["pushInbox"];
@@ -184,6 +185,9 @@ async function makeHarness(opts?: {
     ...(opts?.listThreads ? { listThreads: opts.listThreads } : {}),
     ...(opts?.isChannelLocked ? { isChannelLocked: opts.isChannelLocked } : {}),
     ...(opts?.configAdminUserIds ? { configAdminUserIds: opts.configAdminUserIds } : {}),
+    ...(opts?.configParticipantUserIds
+      ? { configParticipantUserIds: opts.configParticipantUserIds }
+      : {}),
     ...(opts?.currentSpeakerId ? { currentSpeakerId: opts.currentSpeakerId } : {}),
     ...(opts?.proposeConfig ? { proposeConfig: opts.proposeConfig } : {}),
     // The compact tool only ENQUEUES; its dep is a presence gate. Provide a stub
@@ -1446,6 +1450,140 @@ describe("config_propose lock immunity for config admins (#71)", () => {
       isChannelLocked: () => false,
       configAdminUserIds: new Set(["1487094572696867019"]),
       currentSpeakerId: () => "9999999999", // non-admin, but channel is unlocked
+      proposeConfig: async () => {
+        proposeCalls++;
+        return {
+          ok: true,
+          summary: "Session config for this thread",
+          fields: [{ label: "model", before: "gpt-5.4", after: "claude-opus-4.8" }],
+        };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "claude-opus-4.8" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(proposeCalls).toBe(1);
+  });
+});
+
+// -------------------------------------------------------------------------
+// config_propose participant refusal (#74). A restricted participant cannot
+// cause a proposal card to be built, locked OR unlocked. Admin wins overlap.
+// Unset participant set ⇒ today's behavior (the #71 unlocked-channel test
+// above still covers "non-admin speaker may propose when unlocked").
+// -------------------------------------------------------------------------
+
+describe("config_propose participant refusal (#74)", () => {
+  const ADMIN = "1487094572696867019";
+  const STUDENT = "1534937951044112505";
+  let h: Harness;
+  afterEach(async () => {
+    await h?.server.stop();
+  });
+
+  it("refuses a participant in an UNLOCKED channel (no card is built)", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => false,
+      configAdminUserIds: new Set([ADMIN]),
+      configParticipantUserIds: new Set([STUDENT]),
+      currentSpeakerId: () => STUDENT,
+      proposeConfig: async () => {
+        proposeCalls++;
+        return { ok: true, summary: "should never happen" };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "claude-opus-4.8" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("That's an admin setting");
+    expect(proposeCalls).toBe(0);
+  });
+
+  it("refuses a participant in a LOCKED channel (no card is built)", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => true,
+      configAdminUserIds: new Set([ADMIN]),
+      configParticipantUserIds: new Set([STUDENT]),
+      currentSpeakerId: () => STUDENT,
+      proposeConfig: async () => {
+        proposeCalls++;
+        return { ok: true, summary: "should never happen" };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "claude-opus-4.8" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("That's an admin setting");
+    expect(proposeCalls).toBe(0);
+  });
+
+  it("an id in BOTH admin+participant sets may propose (admin wins)", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => true,
+      configAdminUserIds: new Set([ADMIN]),
+      configParticipantUserIds: new Set([ADMIN, STUDENT]),
+      currentSpeakerId: () => ADMIN,
+      proposeConfig: async () => {
+        proposeCalls++;
+        return {
+          ok: true,
+          summary: "Session config for this thread",
+          fields: [{ label: "model", before: "gpt-5.4", after: "claude-opus-4.8" }],
+        };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "claude-opus-4.8" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(proposeCalls).toBe(1);
+  });
+
+  it("with the participant set unset, an unlocked non-admin may still propose (byte-identical to today)", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => false,
+      configAdminUserIds: new Set([ADMIN]),
+      // configParticipantUserIds omitted
+      currentSpeakerId: () => STUDENT,
+      proposeConfig: async () => {
+        proposeCalls++;
+        return {
+          ok: true,
+          summary: "Session config for this thread",
+          fields: [{ label: "model", before: "gpt-5.4", after: "claude-opus-4.8" }],
+        };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "claude-opus-4.8" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(proposeCalls).toBe(1);
+  });
+
+  it("does not refuse when speaker identity is off (no trustworthy id to key on)", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => false,
+      configParticipantUserIds: new Set([STUDENT]),
+      currentSpeakerId: () => undefined,
       proposeConfig: async () => {
         proposeCalls++;
         return {

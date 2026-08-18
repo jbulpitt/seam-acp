@@ -27,7 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Logger } from "../../lib/logger.js";
-import type { Config } from "../../config.js";
+import { mayConfigureUserIds, type Config } from "../../config.js";
 import type {
   ChatAdapter,
   ChannelRef,
@@ -803,7 +803,10 @@ export class DiscordAdapter implements ChatAdapter {
     opts: { timeoutMs?: number; authorizedUserIds?: ReadonlySet<string> } = {}
   ): Promise<{ decision: Promise<ConfirmationDecision> }> {
     const timeoutMs = opts.timeoutMs ?? 10 * 60 * 1000;
-    const allowed = opts.authorizedUserIds ?? this.config.DISCORD_ALLOWED_USER_IDS;
+    // #74: the DISCORD_ALLOWED_USER_IDS fallback must still exclude restricted
+    // participants (admin-set unset). mayConfigureUserIds returns the same
+    // DISCORD_ALLOWED_USER_IDS reference when the participant set is unset.
+    const allowed = opts.authorizedUserIds ?? mayConfigureUserIds(this.config);
     const ch = await this.fetchSendableChannel(channel.id);
 
     const embed = new EmbedBuilder()

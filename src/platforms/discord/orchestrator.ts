@@ -16,7 +16,13 @@ import {
 } from "../../core/image-gen.js";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
-import { resolveChannelPreset, isChannelLocked } from "../../config.js";
+import {
+  resolveChannelPreset,
+  isChannelLocked,
+  isRestrictedParticipant,
+  mayConfigureUserIds,
+  PARTICIPANT_CONFIG_REFUSAL,
+} from "../../config.js";
 import type { Renderer } from "../renderer.js";
 import { serializePanelText } from "../renderer.js";
 import type {
@@ -324,10 +330,16 @@ export class Orchestrator {
     }
     // #71 APPLY gate: when config admins are configured, ONLY they may click
     // Apply — in locked AND unlocked channels — instead of the whole
-    // DISCORD_ALLOWED_USER_IDS allowlist (which includes student accounts). Unset
-    // ⇒ pass nothing so postConfirmation falls back to DISCORD_ALLOWED_USER_IDS,
-    // preserving today's behavior exactly.
+    // DISCORD_ALLOWED_USER_IDS allowlist (which includes student accounts).
+    // #74: when the admin set is UNSET, still exclude restricted participants
+    // from the fallback (pass the may-configure set). Both unset ⇒ pass
+    // nothing so postConfirmation falls back exactly as today.
     const adminIds = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+    const applyAuthorized = adminIds
+      ? { authorizedUserIds: adminIds }
+      : this.config.SEAM_PARTICIPANT_USER_IDS
+        ? { authorizedUserIds: mayConfigureUserIds(this.config) }
+        : {};
     const { decision } = await this.adapter.postConfirmation(
       { platform: PLATFORM, id: record.channelRef },
       {
@@ -338,7 +350,7 @@ export class Orchestrator {
         fields: proposal.fields,
         warnings: proposal.warnings,
       },
-      adminIds ? { authorizedUserIds: adminIds } : {}
+      applyAuthorized
     );
 
     // Apply in the background on confirmation; the tool has already returned.
@@ -1614,8 +1626,19 @@ export class Orchestrator {
   // --- slash commands ---
 
   /** Subcommands still allowed in a locked channel/thread — narrow enough
-   *  that a kid can unstick a hung turn without being able to touch config. */
+   *  that a kid can unstick a hung turn without being able to touch config.
+   *  Answers "survives a channel lock". NOT the participant allowlist
+   *  (`PARTICIPANT_ALLOWED_SUBCOMMANDS` below): this set includes `steer`. */
   private static readonly LOCK_EXEMPT_SUBCOMMANDS = new Set(["abort", "cancel", "steer"]);
+
+  /**
+   * Subcommands a restricted participant (#74) may still run. A NEW, SEPARATE
+   * constant from `LOCK_EXEMPT_SUBCOMMANDS` — that one includes `steer`
+   * (redirects another agent) and answers a different question (survives a
+   * channel lock). Participants get abort/cancel (self-unstick their own
+   * wedged turn) and help, but NOT steer, NOT kill, and no config.
+   */
+  private static readonly PARTICIPANT_ALLOWED_SUBCOMMANDS = new Set(["help", "abort", "cancel"]);
 
   /**
    * Whether a `/seam` subcommand must be refused because the channel is locked
@@ -1626,6 +1649,10 @@ export class Orchestrator {
    * authenticated (`interaction.user.id`), so this is trustworthy regardless of
    * SPEAKER_IDENTITY_ENABLED. `locked` itself stays unsettable through any
    * `/seam` command, so admin immunity grants no power to flip the lock.
+   *
+   * Lives ALONGSIDE `isParticipantSlashRefused` — a different question. A
+   * participant is refused even in an UNLOCKED channel; a lock refusal is
+   * about the channel, not the invoker's tier.
    */
   static isLockedSlashRefused(
     config: Config,
@@ -1636,6 +1663,31 @@ export class Orchestrator {
     if (!isChannelLocked(config, scopeChannelId)) return false;
     if (Orchestrator.LOCK_EXEMPT_SUBCOMMANDS.has(sub)) return false;
     if (config.SEAM_CONFIG_ADMIN_USER_IDS?.has(invokerUserId)) return false;
+    return true;
+  }
+
+  /**
+   * Whether a `/seam` subcommand must be refused because the invoker is a
+   * restricted participant (#74). Independent of lock state — this fires in
+   * LOCKED AND UNLOCKED channels. Keyed on the Discord-authenticated
+   * invoker id (`interaction.user.id`), never a display name. Admin-who-is-
+   * also-participant is NOT restricted (`isRestrictedParticipant`).
+   */
+  static isParticipantSlashRefused(
+    config: Pick<Config, "SEAM_PARTICIPANT_USER_IDS" | "SEAM_CONFIG_ADMIN_USER_IDS">,
+    sub: string,
+    invokerUserId: string
+  ): boolean {
+    if (
+      !isRestrictedParticipant(
+        invokerUserId,
+        config.SEAM_PARTICIPANT_USER_IDS,
+        config.SEAM_CONFIG_ADMIN_USER_IDS
+      )
+    ) {
+      return false;
+    }
+    if (Orchestrator.PARTICIPANT_ALLOWED_SUBCOMMANDS.has(sub)) return false;
     return true;
   }
 
@@ -1652,6 +1704,20 @@ export class Orchestrator {
     // new), the scope is the channel itself.
     const ic = interaction.channel;
     const scopeChannelId = ic?.isThread() ? (ic.parentId ?? undefined) : interaction.channelId ?? undefined;
+    // Two independent gates, two different questions:
+    //   - participant (#74): "is this invoker allowed to configure at all?"
+    //     A restricted participant is refused even in an UNLOCKED channel.
+    //   - lock (#58 / #71): "is this channel locked for this invoker?"
+    // Participant first so config commands get the friendly refusal (not the
+    // lock copy) regardless of lock state. help/abort/cancel pass this gate
+    // and then face the lock gate on their own terms.
+    if (Orchestrator.isParticipantSlashRefused(this.config, sub, interaction.user.id)) {
+      await interaction.reply({
+        content: PARTICIPANT_CONFIG_REFUSAL,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     if (Orchestrator.isLockedSlashRefused(this.config, scopeChannelId, sub, interaction.user.id)) {
       await interaction.reply({
         content: "🔒 This channel is locked — its configuration can't be changed.",
@@ -5444,7 +5510,7 @@ export class Orchestrator {
           label: m.name ?? m.modelId,
           description: m.modelId,
         })),
-        authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+        authorizedUserIds: mayConfigureUserIds(this.config),
         successPanel: (pickedChoice, username) => ({
           color: 0x57f287,
           title: "✅ Model changed",
@@ -5573,7 +5639,7 @@ export class Orchestrator {
           fields: [{ name: "Current", value: `\`${current}\``, inline: true }],
         },
         choices: effortChoices,
-        authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+        authorizedUserIds: mayConfigureUserIds(this.config),
         successPanel: (pickedChoice, username) => ({
           color: 0x57f287,
           title: "✅ Effort changed",
@@ -6236,7 +6302,7 @@ export class Orchestrator {
           label: p.displayName,
           description: p.id,
         })),
-        authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+        authorizedUserIds: mayConfigureUserIds(this.config),
         successPanel: (pickedChoice, username) => ({
           color: 0x57f287,
           title: "✅ Agent changed",
@@ -8800,7 +8866,7 @@ export class Orchestrator {
         value: p,
         label: path.basename(p),
       })),
-      authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+      authorizedUserIds: mayConfigureUserIds(this.config),
       successPanel: (pickedChoice, username) => ({
         color: 0x57f287,
         title: "✅ Project selected",
@@ -8898,7 +8964,7 @@ export class Orchestrator {
           description:
             p.id === currentRecord.agentId ? `${p.id} (current)` : p.id,
         })),
-        authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+        authorizedUserIds: mayConfigureUserIds(this.config),
         successPanel: (pickedChoice, username) => ({
           color: 0x57f287,
           title: "✅ Agent changed",
@@ -8958,7 +9024,7 @@ export class Orchestrator {
               description:
                 m.modelId === current ? `${m.modelId} (current)` : m.modelId,
             })),
-            authorizedUserIds: this.config.DISCORD_ALLOWED_USER_IDS,
+            authorizedUserIds: mayConfigureUserIds(this.config),
             successPanel: (pickedChoice, username) => ({
               color: 0x57f287,
               title: "✅ Model changed",

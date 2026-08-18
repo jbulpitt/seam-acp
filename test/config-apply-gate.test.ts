@@ -34,7 +34,13 @@ const record = (over: Partial<SessionRecord> = {}): SessionRecord => ({
   ...over,
 });
 
-function makeOrch(adminIds: ReadonlySet<string> | undefined) {
+function makeOrch(
+  adminIds: ReadonlySet<string> | undefined,
+  extra?: {
+    participantIds?: ReadonlySet<string>;
+    allowedIds?: ReadonlySet<string>;
+  }
+) {
   // Capture the opts postConfirmation is called with; keep the decision pending
   // so the background apply() never runs during the test.
   const calls: Array<{ authorizedUserIds?: ReadonlySet<string> } | undefined> = [];
@@ -57,6 +63,8 @@ function makeOrch(adminIds: ReadonlySet<string> | undefined) {
       DEFAULT_MODEL: "claude-opus-4.8",
       SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
       SEAM_CONFIG_ADMIN_USER_IDS: adminIds,
+      SEAM_PARTICIPANT_USER_IDS: extra?.participantIds,
+      DISCORD_ALLOWED_USER_IDS: extra?.allowedIds ?? new Set(["1"]),
       channelPresets: new Map(),
       threadPresets: new Map(),
     } as any,
@@ -110,6 +118,37 @@ describe("config apply gate (#71)", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.authorizedUserIds).toBeUndefined();
   });
+
+  it("when admin set is unset, still excludes restricted participants from Apply", async () => {
+    const ADMIN = "1487094572696867019";
+    const STUDENT = "1534937951044112505";
+    const allowed = new Set([ADMIN, STUDENT]);
+    const { orch, calls } = makeOrch(undefined, {
+      participantIds: new Set([STUDENT]),
+      allowedIds: allowed,
+    });
+    const out = await orch.proposeConfig(record(), { session: { model: "claude-opus-4.8" } });
+    expect(out.ok).toBe(true);
+    expect(calls).toHaveLength(1);
+    const passed = calls[0]?.authorizedUserIds;
+    expect(passed).toBeDefined();
+    expect(passed?.has(STUDENT)).toBe(false);
+    expect(passed?.has(ADMIN)).toBe(true);
+  });
+
+  it("when admin set is configured, Apply stays admin-only (participants excluded even if overlapping)", async () => {
+    const ADMIN = "1487094572696867019";
+    const STUDENT = "1534937951044112505";
+    const admins = new Set([ADMIN]);
+    const { orch, calls } = makeOrch(admins, {
+      participantIds: new Set([ADMIN, STUDENT]),
+      allowedIds: new Set([ADMIN, STUDENT]),
+    });
+    const out = await orch.proposeConfig(record(), { session: { model: "claude-opus-4.8" } });
+    expect(out.ok).toBe(true);
+    expect(calls[0]?.authorizedUserIds).toBe(admins);
+    expect(calls[0]?.authorizedUserIds?.has(STUDENT)).toBe(false);
+  });
 });
 
 /**
@@ -155,5 +194,86 @@ describe("locked-channel slash gate admin-immunity (#71)", () => {
     expect(
       Orchestrator.isLockedSlashRefused(cfg(undefined, true), "channel-1", "preset", ADMIN)
     ).toBe(true);
+  });
+});
+
+/**
+ * PARTICIPANT slash gate (#74). Lives ALONGSIDE `isLockedSlashRefused` — a
+ * different question. A restricted participant is refused even in an UNLOCKED
+ * channel; help/abort/cancel still work. steer is lock-exempt but NOT
+ * participant-allowed. Admin-who-is-also-participant is not refused.
+ */
+describe("participant slash gate (#74)", () => {
+  const ADMIN = "1487094572696867019";
+  const STUDENT = "1534937951044112505";
+  const OPERATOR = "111";
+  const cfg = (participantIds: ReadonlySet<string> | undefined, adminIds?: ReadonlySet<string>) =>
+    ({
+      SEAM_PARTICIPANT_USER_IDS: participantIds,
+      SEAM_CONFIG_ADMIN_USER_IDS: adminIds,
+    }) as any;
+
+  it("refuses a participant any config subcommand in an UNLOCKED channel", () => {
+    expect(Orchestrator.isParticipantSlashRefused(cfg(new Set([STUDENT])), "model", STUDENT)).toBe(
+      true
+    );
+    expect(Orchestrator.isParticipantSlashRefused(cfg(new Set([STUDENT])), "preset", STUDENT)).toBe(
+      true
+    );
+    expect(Orchestrator.isParticipantSlashRefused(cfg(new Set([STUDENT])), "agent", STUDENT)).toBe(
+      true
+    );
+    expect(Orchestrator.isParticipantSlashRefused(cfg(new Set([STUDENT])), "kill", STUDENT)).toBe(
+      true
+    );
+  });
+
+  it("allows a participant help / abort / cancel (NOT steer)", () => {
+    const c = cfg(new Set([STUDENT]));
+    expect(Orchestrator.isParticipantSlashRefused(c, "help", STUDENT)).toBe(false);
+    expect(Orchestrator.isParticipantSlashRefused(c, "abort", STUDENT)).toBe(false);
+    expect(Orchestrator.isParticipantSlashRefused(c, "cancel", STUDENT)).toBe(false);
+    expect(Orchestrator.isParticipantSlashRefused(c, "steer", STUDENT)).toBe(true);
+  });
+
+  it("does not refuse an operator or an admin", () => {
+    const c = cfg(new Set([STUDENT]), new Set([ADMIN]));
+    expect(Orchestrator.isParticipantSlashRefused(c, "model", OPERATOR)).toBe(false);
+    expect(Orchestrator.isParticipantSlashRefused(c, "model", ADMIN)).toBe(false);
+  });
+
+  it("an id in BOTH sets resolves to admin (not refused)", () => {
+    expect(
+      Orchestrator.isParticipantSlashRefused(
+        cfg(new Set([ADMIN, STUDENT]), new Set([ADMIN])),
+        "model",
+        ADMIN
+      )
+    ).toBe(false);
+    expect(
+      Orchestrator.isParticipantSlashRefused(
+        cfg(new Set([ADMIN, STUDENT]), new Set([ADMIN])),
+        "model",
+        STUDENT
+      )
+    ).toBe(true);
+  });
+
+  it("with the participant set unset, nobody is refused (byte-identical to today)", () => {
+    expect(Orchestrator.isParticipantSlashRefused(cfg(undefined), "model", STUDENT)).toBe(false);
+    expect(Orchestrator.isParticipantSlashRefused(cfg(undefined, new Set([ADMIN])), "model", STUDENT)).toBe(
+      false
+    );
+  });
+
+  it("steer is lock-exempt but still participant-refused (the two constants must not be reused)", () => {
+    const locked = {
+      channelPresets: new Map([["channel-1", { locked: true }]]),
+      threadPresets: new Map(),
+      SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
+      SEAM_PARTICIPANT_USER_IDS: new Set([STUDENT]),
+    } as any;
+    expect(Orchestrator.isLockedSlashRefused(locked, "channel-1", "steer", STUDENT)).toBe(false);
+    expect(Orchestrator.isParticipantSlashRefused(locked, "steer", STUDENT)).toBe(true);
   });
 });

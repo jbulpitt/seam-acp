@@ -373,6 +373,28 @@ const Schema = z.object({
     }),
 
   /**
+   * Chat-only participants (#74). A RESTRICTION MARKER, not a second allowlist:
+   * each id must also appear in DISCORD_ALLOWED_USER_IDS (they can talk to
+   * agents) but they can NEVER configure anything — slash config, pickers,
+   * Apply, or config_propose. Parsed EXACTLY like SEAM_CONFIG_ADMIN_USER_IDS:
+   *   - Unset / empty / whitespace ⇒ undefined (opt-out, NOT "nobody") so
+   *     today's behavior is byte-identical until the operator seeds the list.
+   * Precedence is admin > participant > operator: an id in BOTH sets is an
+   * admin, not a restricted participant (see `isRestrictedParticipant`). The
+   * overlap is logged at boot so a privilege bug cannot hide in a silent pick.
+   */
+  SEAM_PARTICIPANT_USER_IDS: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const ids = v.split(",").map((s) => s.trim()).filter(Boolean);
+      if (ids.some((id) => !/^\d+$/.test(id))) {
+        throw new Error("SEAM_PARTICIPANT_USER_IDS must be comma-separated numeric Discord user IDs");
+      }
+      return ids.length > 0 ? (new Set(ids) as ReadonlySet<string>) : undefined;
+    }),
+
+  /**
    * Mid-turn reply routing (#63). Decides what a bare Discord message typed while
    * a turn is ALREADY active on that thread does:
    *   - "abort" (default): force-abort the running turn and start a fresh one —
@@ -737,6 +759,60 @@ export type Config = z.infer<typeof Schema> & {
   channelPresets: Map<string, ChannelPreset>;
   threadPresets: Map<string, ThreadPreset>;
 };
+
+/**
+ * Friendly participant-tier refusal (#74). Ephemeral on the slash surface;
+ * returned as the MCP tool error so the agent can relay the same copy. This is
+ * a refusal, not a lock and not a Discord permission failure.
+ */
+export const PARTICIPANT_CONFIG_REFUSAL =
+  "🔒 That's an admin setting, so I can't change it from here — ask your seam-acp admin and they can set it up for you. You can keep chatting in this thread normally.";
+
+/**
+ * THE participant check (#74). Admin > participant > operator: an id in both
+ * sets is NOT restricted. Unset participant (or admin) sets are treated as
+ * empty — `undefined` is opt-out, never "nobody".
+ */
+export function isRestrictedParticipant(
+  userId: string,
+  participantIds: ReadonlySet<string> | undefined,
+  adminIds: ReadonlySet<string> | undefined
+): boolean {
+  return Boolean(participantIds?.has(userId) && !adminIds?.has(userId));
+}
+
+/**
+ * Ids allowed to click config pickers / (when the #71 admin set is unset) the
+ * config-mutation Apply button: DISCORD_ALLOWED_USER_IDS minus restricted
+ * participants. When the participant set is unset this returns the same
+ * `DISCORD_ALLOWED_USER_IDS` reference (byte-identical to today).
+ */
+export function mayConfigureUserIds(
+  config: Pick<
+    Config,
+    "DISCORD_ALLOWED_USER_IDS" | "SEAM_PARTICIPANT_USER_IDS" | "SEAM_CONFIG_ADMIN_USER_IDS"
+  >
+): ReadonlySet<string> {
+  const allowed = config.DISCORD_ALLOWED_USER_IDS;
+  const participants = config.SEAM_PARTICIPANT_USER_IDS;
+  if (!participants) return allowed;
+  const out = new Set<string>();
+  for (const id of allowed) {
+    if (isRestrictedParticipant(id, participants, config.SEAM_CONFIG_ADMIN_USER_IDS)) continue;
+    out.add(id);
+  }
+  return out;
+}
+
+/** Ids listed in BOTH admin and participant sets — admin wins; boot must warn. */
+export function adminParticipantOverlapIds(
+  config: Pick<Config, "SEAM_CONFIG_ADMIN_USER_IDS" | "SEAM_PARTICIPANT_USER_IDS">
+): string[] {
+  const admin = config.SEAM_CONFIG_ADMIN_USER_IDS;
+  const participants = config.SEAM_PARTICIPANT_USER_IDS;
+  if (!admin || !participants) return [];
+  return [...participants].filter((id) => admin.has(id)).sort();
+}
 
 /**
  * Merge the channel-level and thread-level presets for a given (parentId,

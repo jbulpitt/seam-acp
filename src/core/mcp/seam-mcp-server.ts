@@ -30,6 +30,7 @@ import { frameSteerPrompt } from "../steer.js";
 import { buildChainHopSpec } from "../dispatch/types.js";
 import type { ConfigDescription } from "../session-router.js";
 import type { ConfigMutationInput } from "../config-mutation.js";
+import { isRestrictedParticipant, PARTICIPANT_CONFIG_REFUSAL } from "../../config.js";
 
 /** Read-only entities visible to the calling thread (schedules + presets),
  *  returned by `config_describe` alongside the effective config. A FULL
@@ -216,6 +217,13 @@ export interface SeamMcpServerDeps {
    * immutability (that refusal lives in ConfigMutationService and stays).
    */
   configAdminUserIds?: ReadonlySet<string>;
+  /**
+   * Chat-only participants (#74). The propose gate refuses a restricted
+   * participant OUTRIGHT (locked or unlocked) when the CURRENT-turn speaker
+   * id is in this set AND not in `configAdminUserIds` (admin wins). Undefined
+   * ⇒ opt-out, today's behavior: anyone who passes the lock gate may propose.
+   */
+  configParticipantUserIds?: ReadonlySet<string>;
   /**
    * The harness-stamped SPEAKER id of the caller session's CURRENT turn (#57 D4
    * trust anchor — NOT a user-editable display name). Undefined when speaker
@@ -1770,6 +1778,27 @@ export class SeamMcpServer {
   ): Promise<McpToolResult> {
     if (!this.deps.proposeConfig) {
       return textResult("config mutation is not supported on this deployment.", true);
+    }
+    // Participant gate (#74) — a DIFFERENT question from the lock. A restricted
+    // participant is refused OUTRIGHT, locked or unlocked, before any proposal
+    // is built. Keyed on the harness-stamped SPEAKER id (#57 D4), never a
+    // display name. No trustworthy id ⇒ we cannot identify a participant, so
+    // we do not refuse here (the lock gate below still never fails open).
+    // Admin-who-is-also-participant is NOT restricted (admin wins).
+    const speakerIdForTier = this.deps.currentSpeakerId?.(caller);
+    if (
+      speakerIdForTier != null &&
+      isRestrictedParticipant(
+        speakerIdForTier,
+        this.deps.configParticipantUserIds,
+        this.deps.configAdminUserIds
+      )
+    ) {
+      this.logger.warn(
+        { session: caller.id, channel: caller.parentRef, speakerId: speakerIdForTier },
+        "seam-mcp config_propose refused: speaker is a restricted participant"
+      );
+      return textResult(PARTICIPANT_CONFIG_REFUSAL, true);
     }
     // Locked channel: read-only over MCP for EVERYONE by default (D2) — with one
     // opt-in exemption (#71). A config admin (SEAM_CONFIG_ADMIN_USER_IDS) may

@@ -1633,6 +1633,7 @@ describe("config_describe", () => {
     cwd: { value: "/repo/x", source: "channel preset" as const },
     permission: { value: "ask", source: "default" as const },
     locked: true,
+    detached: { value: true, source: "thread preset" as const },
   };
 
   async function makeDescribeServer(): Promise<SeamMcpServer> {
@@ -1701,6 +1702,9 @@ describe("config_describe", () => {
       expect(text).toContain("(from session config)");
       expect(text).toContain("(from default)");
       expect(text).toContain("🔒");
+      expect(text).toContain("detached:");
+      expect(text).toContain("true");
+      expect(text).toMatch(/detached:.*true.*thread preset/s);
       // Entity listing folds in — now the FULL definition (#69): the id (needed
       // to target an edit), the promptText (the actual content), attachments,
       // and last-run status all render, not just name/cron/tz.

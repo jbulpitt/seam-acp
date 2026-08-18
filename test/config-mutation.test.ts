@@ -64,6 +64,7 @@ function describeConfig(record: SessionRecord): ConfigDescription {
       ? { value: cfg.permissionPolicy, source: "session config" }
       : { value: "ask", source: "default" },
     locked: false,
+    detached: { value: false, source: "default" },
   };
 }
 
@@ -574,6 +575,101 @@ describe("thread-preset mutation (Tier C, #68)", () => {
     expect(built.ok).toBe(false);
     if (built.ok) return;
     expect(built.error).toContain("No effective change");
+  });
+
+  it("round-trips threadPreset detached:true as a RAW boolean + writes an audit row (#80)", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({
+      threads: { [THREAD]: { rider: { value: "keep me" } } },
+    });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: true,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const built = svc.buildProposal(record, { threadPreset: { detached: true } });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.proposal.restartsSession).toBe(false);
+    expect(built.proposal.fields).toEqual([
+      { label: "detached", before: "false", after: "true" },
+    ]);
+    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(PresetsFileSchema.safeParse(raw).success).toBe(true);
+    expect(raw.threads[THREAD].detached).toBe(true);
+    expect(raw.threads[THREAD].rider.value).toBe("keep me");
+    // RAW boolean — not wrapped {value:true}.
+    expect(raw.threads[THREAD].detached).not.toEqual({ value: true });
+    expect(live.threadPresets.get(THREAD)?.detached).toBe(true);
+    expect(store.listConfigMutations()[0]).toMatchObject({
+      tier: "thread-preset",
+      scope: THREAD,
+    });
+    expect(store.listConfigMutations()[0].summary).toMatch(/detached/);
+  });
+
+  it("attach omits detached and deletes an empty thread key (#80)", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({
+      threads: { [THREAD]: { detached: true }, [SIBLING]: { rider: { value: "sibling" } } },
+    });
+    const svc = makeService({ presetsFile: file, tierCEnabled: true });
+    const built = svc.buildProposal(record, { threadPreset: { detached: false } });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    built.proposal.apply({ id: "u", name: "U" });
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.threads[THREAD]).toBeUndefined();
+    expect(raw.threads[SIBLING]).toEqual({ rider: { value: "sibling" } });
+  });
+
+  it("attach keeps a remaining rider and omits detached (#80)", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({
+      threads: { [THREAD]: { detached: true, rider: { value: "stay" } } },
+    });
+    const svc = makeService({ presetsFile: file, tierCEnabled: true });
+    const built = svc.buildProposal(record, { threadPreset: { detached: false } });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    built.proposal.apply({ id: "u", name: "U" });
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.threads[THREAD].rider.value).toBe("stay");
+    expect(raw.threads[THREAD].detached).toBeUndefined();
+  });
+
+  it("applyThreadDetached writes without a SessionRecord and is not gated by Tier C (#80 D10)", () => {
+    const file = writePresetsFile({ threads: {} });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: false, // slash path must work with conversational Tier C off
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const result = svc.applyThreadDetached({
+      threadId: THREAD,
+      parentRef: CHAN,
+      detached: true,
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.auditId).toBeTruthy();
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.threads[THREAD]).toEqual({ detached: true });
+    expect(live.threadPresets.get(THREAD)?.detached).toBe(true);
+    // Never upserted a session just to persist the flag.
+    expect(store.get(`discord:${THREAD}`)).toBeNull();
+    expect(store.listConfigMutations()).toHaveLength(1);
   });
 });
 

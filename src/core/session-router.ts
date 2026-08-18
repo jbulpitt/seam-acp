@@ -67,6 +67,12 @@ export interface ConfigDescription {
   /** Whether the calling channel is locked (read-only over MCP; D2). */
   locked: boolean;
   /**
+   * Whether this thread is detached (#80): allowlisted chat, no bot replies,
+   * no session bind. `true` is always sourced from the thread preset; `false`
+   * is the default (attached). Not a channel-level flag.
+   */
+  detached: ResolvedSetting<boolean>;
+  /**
    * Set when a preset requested an effort level the resolved agent cannot honor
    * (Trap 2). The preset value is silently dropped at runtime; surfacing it here
    * keeps `config_describe` from reporting a personality the agent won't deliver.
@@ -224,6 +230,10 @@ export class SessionRouter {
         ? { value: "always", source: "session config" }
         : { value: this.defaultPermissionMode, source: "default" };
 
+    const detached: ResolvedSetting<boolean> = thread?.detached
+      ? { value: true, source: "thread preset" }
+      : { value: false, source: "default" };
+
     return {
       sessionId: record.id,
       channelRef: record.channelRef,
@@ -234,6 +244,7 @@ export class SessionRouter {
       cwd,
       permission,
       locked: chan?.locked ?? false,
+      detached,
       ...(effortIgnoredNote ? { effortIgnoredNote } : {}),
     };
   }

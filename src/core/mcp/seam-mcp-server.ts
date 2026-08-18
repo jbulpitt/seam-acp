@@ -747,8 +747,9 @@ const TOOLS = [
       "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.\n" +
       "- session: your thread's own runtime config (agent, model, effort, cwd, permission).\n" +
       "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target).\n" +
-      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider). " +
-      "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider.\n" +
+      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/detached). " +
+      "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider. " +
+      "`detached:true` stops treating this thread as a session (no bot replies; does not delete history).\n" +
       "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider). " +
       "Applies to EVERY thread under the channel. May be disabled by the deployment; `locked` can NEVER be changed.\n" +
       "- schedule: create/update/enable/disable/delete a scheduled prompt for THIS thread. Translate the " +
@@ -835,13 +836,21 @@ const TOOLS = [
           type: "object",
           description:
             "Tier C — THIS thread's own preset (channel-presets.json `threads`). Applies to this " +
-            "thread only and overrides the channel preset per-field. `locked` is not settable.",
+            "thread only and overrides the channel preset per-field. `locked` is not settable. " +
+            "`detached` is a raw boolean (not a wrapped value): true = this thread is not a session.",
           properties: {
             agent: { type: "string" },
             model: { type: "string" },
             cwd: { type: "string" },
             effort: { type: "string" },
             rider: { type: "string", description: "Extra per-turn harness-preamble rule for this thread." },
+            detached: {
+              type: "boolean",
+              description:
+                "If true, this thread is detached: allowlisted users can chat but the bot will not " +
+                "reply and will not bind a session. false re-attaches (next message binds/resumes). " +
+                "Does not delete history. `locked` remains unsettable.",
+            },
           },
         },
         channelPreset: {
@@ -1700,6 +1709,7 @@ export class SeamMcpServer {
       line("effort:", d.effort.value ?? "(none)", d.effort.source),
       line("cwd:", d.cwd.value, d.cwd.source),
       line("permission:", d.permission.value, d.permission.source),
+      line("detached:", d.detached.value ? "true" : "false", d.detached.source),
     ];
     if (d.effortIgnoredNote) lines.push(`⚠ ${d.effortIgnoredNote}`);
 

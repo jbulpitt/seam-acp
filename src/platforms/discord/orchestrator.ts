@@ -9,6 +9,7 @@ import type { Config } from "../../config.js";
 import {
   resolveChannelPreset,
   isChannelLocked,
+  isThreadDetached,
   isRestrictedParticipant,
   mayConfigureUserIds,
   PARTICIPANT_CONFIG_REFUSAL,
@@ -644,6 +645,9 @@ export class Orchestrator {
   }
 
   private async handleIncomingMessageInner(msg: IncomingMessage): Promise<void> {
+    // #80 v1: detach is a handleMessage gate only. Schedules / wakes / watches
+    // / handoffs / steer synthesize an IncomingMessage and enter HERE, so they
+    // still run in a detached thread. Do not treat detach as a full mute.
     const channel = msg.channel;
     const record = this.router.ensureSessionRecord({
       platform: channel.platform,
@@ -1809,6 +1813,18 @@ export class Orchestrator {
     return true;
   }
 
+  /**
+   * `/seam config init` must refuse while the thread is detached (#80 D8).
+   * Do not silently clear the flag or bind. Extracted so tests can assert
+   * the gate without standing up the slash handler.
+   */
+  static isInitRefusedWhileDetached(
+    config: Pick<Config, "threadPresets">,
+    threadId: string | undefined
+  ): boolean {
+    return isThreadDetached(config, threadId);
+  }
+
   async handleSlashInteraction(
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
@@ -1890,6 +1906,8 @@ export class Orchestrator {
           return this.cmdReset(interaction);
         case "init":
           return this.cmdInit(interaction);
+        case "detach":
+          return this.cmdDetach(interaction);
         case "show":
           return this.cmdConfig(interaction);
         case "set":
@@ -8583,11 +8601,76 @@ export class Orchestrator {
     });
   }
 
+  /**
+   * `/seam config detach state:detached|attached` (#80). Marks THIS thread so
+   * it behaves like a plain Discord thread: allowlisted users can chat, the
+   * bot does not reply and does not bind a session. Persistence is a raw
+   * boolean on the thread preset (`threads.<id>.detached`). Does NOT create a
+   * session row (D10: key the write on channelId). Does NOT delete an existing
+   * session row or clear acp_session_id (D6). Not lock-exempt and not
+   * participant-allowed (D5) — admin immunity is what lets Jesse run this in
+   * a locked school channel.
+   *
+   * v1 inbound hole: schedules / wakes / watches / handoffs / steer still
+   * fire; this command only flips the message-gate flag.
+   */
+  private async cmdDetach(i: ChatInputCommandInteraction): Promise<void> {
+    if (!i.channel?.isThread()) {
+      await i.reply({
+        content: "Run this inside the thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const state = i.options.getString("state", true);
+    const detached = state === "detached";
+    const threadId = i.channelId;
+    const parentRef = i.channel.parentId ?? undefined;
+
+    // D10 route (a): persist keyed only on channelId, no ensureSessionRecord.
+    // Write + hot-reload FIRST (D7) so a racing message cannot start a new turn.
+    const result = this.configMutation.applyThreadDetached({
+      threadId,
+      parentRef,
+      detached,
+      actor: { id: i.user.id, name: i.user.displayName ?? i.user.username },
+    });
+    if (!result.ok) {
+      await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    // D7: abort any in-flight turn AFTER the flag is visible. Lookup only —
+    // never upsert a session just to cancel one that doesn't exist.
+    if (detached) {
+      const record = this.store.get(makeSessionId(PLATFORM, threadId));
+      if (record) {
+        await this.router.abortTurn(record.id, { force: true });
+      }
+    }
+
+    await i.reply({
+      content: detached
+        ? "This thread is detached — the bot will not reply here. Re-attach with `/seam config detach state:attached`."
+        : "This thread is attached — the next allowlisted message will start (or resume) a session.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   private async cmdInit(i: ChatInputCommandInteraction): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
       await i.reply({
         content: "Use `/seam config init` inside a thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    // #80 D8: refuse while detached — do not silently clear the flag or bind.
+    if (Orchestrator.isInitRefusedWhileDetached(this.config, channel.id)) {
+      await i.reply({
+        content:
+          "This thread is detached — run `/seam config detach state:attached` first.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -8909,6 +8992,7 @@ export class Orchestrator {
       "`/seam config approve <always|ask|deny>` — permission policy",
       "`/seam config reset` — end this thread's ACP session; next message starts fresh",
       "`/seam config init` — bind this thread + show repo picker",
+      "`/seam config detach <detached|attached>` — keep this thread session-less (no bot replies; does not delete history)",
       "`/seam config show` — show session config JSON",
       "`/seam config set <json>` — replace session config",
       "`/seam config audit` — recent config mutations (who/what/when)",

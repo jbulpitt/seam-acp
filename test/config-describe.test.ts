@@ -163,4 +163,19 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
     );
     expect(d.permission).toEqual({ value: "always", source: "session config" });
   });
+
+  it("reports detached:true sourced from the thread preset (#80)", () => {
+    const threadPresets = new Map<string, ThreadPreset>([
+      ["thread-1", { detached: true }],
+    ]);
+    const router = makeRouter({ threadPresets });
+    const d = router.describeConfig(makeRecord());
+    expect(d.detached).toEqual({ value: true, source: "thread preset" });
+  });
+
+  it("reports detached:false from default when the thread is attached", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(makeRecord());
+    expect(d.detached).toEqual({ value: false, source: "default" });
+  });
 });

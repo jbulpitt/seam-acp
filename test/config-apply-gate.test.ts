@@ -347,3 +347,52 @@ describe("option-aware cancel gates (#78)", () => {
     );
   });
 });
+
+/**
+ * #80: `/seam config detach` is a config subcommand. Do NOT add `detach` to
+ * LOCK_EXEMPT_SUBCOMMANDS or PARTICIPANT_ALLOWED_SUBCOMMANDS to make these
+ * pass — admin immunity is the school-channel lever; kids must not mute
+ * homework threads.
+ */
+describe("detach slash gates (#80)", () => {
+  const ADMIN = "1487094572696867019";
+  const STUDENT = "1534937951044112505";
+  const lockedSchool = {
+    channelPresets: new Map([["channel-1", { locked: true }]]),
+    threadPresets: new Map(),
+    SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
+    SEAM_PARTICIPANT_USER_IDS: new Set([STUDENT]),
+  } as any;
+  const participants = {
+    SEAM_PARTICIPANT_USER_IDS: new Set([STUDENT]),
+    SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
+  } as any;
+
+  it("isParticipantSlashRefused('detach', studentId) === true", () => {
+    expect(Orchestrator.isParticipantSlashRefused(participants, "detach", STUDENT)).toBe(true);
+  });
+
+  it("isLockedSlashRefused(locked school, 'detach', adminId) === false", () => {
+    expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "detach", ADMIN)).toBe(
+      false
+    );
+  });
+
+  it("isLockedSlashRefused(locked school, 'detach', studentId) === true", () => {
+    expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "detach", STUDENT)).toBe(
+      true
+    );
+  });
+
+  it("cmdInit refuses while the thread is detached", () => {
+    const detached = {
+      threadPresets: new Map([["thread-1", { detached: true }]]),
+    } as any;
+    expect(Orchestrator.isInitRefusedWhileDetached(detached, "thread-1")).toBe(true);
+    expect(Orchestrator.isInitRefusedWhileDetached(detached, "other-thread")).toBe(false);
+    expect(Orchestrator.isInitRefusedWhileDetached({ threadPresets: new Map() } as any, "thread-1")).toBe(
+      false
+    );
+    expect(Orchestrator.isInitRefusedWhileDetached(detached, undefined)).toBe(false);
+  });
+});

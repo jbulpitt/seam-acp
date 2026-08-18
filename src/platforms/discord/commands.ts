@@ -12,7 +12,7 @@ import {
  *
  *   TOP-LEVEL (5): cancel, steer, new, attach, workflows
  *   GROUPS (5):
- *     config   (12) model effort agent mode repo tools approve reset init show set audit
+ *     config   (13) model effort agent mode repo tools approve reset init detach show set audit
  *     info     (6)  whoami usage avatar help sessions repos
  *     schedule (7)  unchanged
  *     preset   (6)  unchanged
@@ -243,6 +243,23 @@ export function buildSeamCommand(): SlashCommandBuilder {
         sub
           .setName("init")
           .setDescription("Bind this thread as a session and show repo picker")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("detach")
+          .setDescription(
+            "Stop treating this thread as a session (no bot replies). Does not delete history."
+          )
+          .addStringOption((o) =>
+            o
+              .setName("state")
+              .setDescription("detached = no bot replies; attached = bind on next message")
+              .setRequired(true)
+              .addChoices(
+                { name: "detached", value: "detached" },
+                { name: "attached", value: "attached" }
+              )
+          )
       )
       .addSubcommand((sub) =>
         sub.setName("show").setDescription("Show current session config")

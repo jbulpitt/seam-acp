@@ -118,13 +118,16 @@ export interface ChannelPresetChanges {
  *  (#68): a channel-wide rider would leak across every sibling thread. `locked`
  *  is deliberately absent — it exists only on channel entries and can never be
  *  changed through any tool; cross-thread edits are structurally impossible
- *  because the target is always the caller's own thread (record.channelRef). */
+ *  because the target is always the caller's own thread (record.channelRef).
+ *  `detached` (#80) is a RAW boolean (not `{value:true}`): true = this thread
+ *  is not a session (no bot replies); false omits the key (re-attach). */
 export interface ThreadPresetChanges {
   agent?: string | null;
   model?: string | null;
   cwd?: string | null;
   effort?: string | null;
   rider?: string | null;
+  detached?: boolean;
 }
 
 /** Tier D — a scheduled prompt bound to the calling thread (#69).
@@ -299,6 +302,47 @@ export class ConfigMutationService {
     if (tier === "thread-preset") return this.buildThreadPresetProposal(record, input.threadPreset!);
     if (tier === "schedule") return this.buildScheduleProposal(record, input.schedule!);
     return this.buildChannelPresetProposal(record, input.channelPreset!);
+  }
+
+  /**
+   * Slash-path immediate write of `threads.<id>.detached` (#80, D10 route a).
+   * Keyed only on `threadId` — does NOT require a SessionRecord (never
+   * `ensureSessionRecord` just to persist "don't create a session"). Applies
+   * immediately (no confirm card). Not gated by
+   * `SEAM_CONFIG_MUTATION_TIER_C_ENABLED` — that flag is for conversational
+   * MCP writes; `/seam config detach` is an operator slash command.
+   *
+   * Same discipline as every other Tier-C write: PresetsFileSchema.safeParse
+   * on the full candidate, atomic temp+rename, reloadPresets, one audit row.
+   */
+  applyThreadDetached(opts: {
+    threadId: string;
+    parentRef?: string;
+    detached: boolean;
+    actor: MutationActor;
+  }): { ok: true; message: string; auditId: string } | { ok: false; error: string } {
+    const built = this.buildThreadPresetProposalFor(
+      opts.threadId,
+      opts.parentRef,
+      { detached: opts.detached },
+      { requireTierC: false }
+    );
+    if (!built.ok) {
+      // Idempotent slash: already in the requested state is a success, not a
+      // refusal — the operator asked to mark the thread, not to mutate a field.
+      if (built.error.includes("No effective change")) {
+        return {
+          ok: true,
+          message: opts.detached
+            ? "This thread is already detached."
+            : "This thread is already attached.",
+          auditId: "",
+        };
+      }
+      return built;
+    }
+    const applied = built.proposal.apply(opts.actor);
+    return { ok: true, message: applied.message, auditId: applied.auditId };
   }
 
   // --- Tier A: session config ---------------------------------------------
@@ -902,12 +946,31 @@ export class ConfigMutationService {
    *  - A thread preset OVERRIDES the channel preset per-field (resolveChannelPreset
    *    picks thread ?? channel), so any field that shadows a channel value emits a
    *    Trap-1 warning: the write persists, but the effective source is this layer.
+   *
+   * #80: `detached` is a raw boolean (not `{value:true}`). The MCP proposal
+   * path still requires a SessionRecord (the agent is already in-session).
+   * Slash `/seam config detach` goes through `applyThreadDetached`, which
+   * keys the same write on a thread id without upserting a session.
    */
   private buildThreadPresetProposal(
     record: SessionRecord,
     changes: ThreadPresetChanges
   ): BuildProposalResult {
-    if (!this.deps.tierCEnabled) {
+    return this.buildThreadPresetProposalFor(
+      record.channelRef,
+      record.parentRef ?? undefined,
+      changes
+    );
+  }
+
+  private buildThreadPresetProposalFor(
+    threadId: string,
+    parentRef: string | undefined,
+    changes: ThreadPresetChanges,
+    opts: { requireTierC?: boolean } = {}
+  ): BuildProposalResult {
+    const requireTierC = opts.requireTierC ?? true;
+    if (requireTierC && !this.deps.tierCEnabled) {
       return {
         ok: false,
         error:
@@ -924,7 +987,6 @@ export class ConfigMutationService {
     }
     // D3 + P3: the target is ALWAYS the caller's own thread. There is no
     // thread-id parameter, so a cross-thread edit is structurally impossible.
-    const threadId = record.channelRef;
     if (!threadId) {
       return {
         ok: false,
@@ -959,9 +1021,9 @@ export class ConfigMutationService {
     const threads = { ...(doc.threads ?? {}) };
     const current = { ...(threads[threadId] ?? {}) };
     // The parent channel's entry, used ONLY to detect Trap-1 shadowing below.
-    const channelEntry = record.parentRef ? doc.channels?.[record.parentRef] : undefined;
+    const channelEntry = parentRef ? doc.channels?.[parentRef] : undefined;
 
-    const keys: Array<keyof ThreadPresetChanges> = ["agent", "model", "cwd", "effort", "rider"];
+    const keys = ["agent", "model", "cwd", "effort", "rider"] as const;
     const fields: ProposedField[] = [];
     const warnings: string[] = [];
     const next: Record<string, unknown> = { ...current };
@@ -996,11 +1058,31 @@ export class ConfigMutationService {
     }
     // NB: no preserve-lock line here — thread entries carry no `locked` field.
 
+    // #80: `detached` is a RAW boolean, sibling of channel `locked` — not
+    // wrapped `{value:true}`. `true` writes the key; `false` omits it.
+    if (changes.detached !== undefined) {
+      const beforeDetached = current.detached === true;
+      const afterDetached = changes.detached === true;
+      if (beforeDetached !== afterDetached) {
+        if (afterDetached) next.detached = true;
+        else delete next.detached;
+        fields.push({
+          label: "detached",
+          before: beforeDetached ? "true" : "false",
+          after: afterDetached ? "true" : "false",
+        });
+      }
+    }
+
     if (fields.length === 0) {
       return { ok: false, error: "No effective change to this thread's preset." };
     }
 
-    threads[threadId] = next;
+    // Empty-entry cleanup: if attach (or a last-field removal) leaves `{}`,
+    // drop the thread key so the file stays tidy. A remaining rider/effort
+    // keeps the entry with `detached` omitted.
+    if (Object.keys(next).length === 0) delete threads[threadId];
+    else threads[threadId] = next;
     const candidate = { ...doc, threads };
 
     // D7: the candidate MUST pass the exact boot schema or we refuse — an invalid
@@ -1024,7 +1106,10 @@ export class ConfigMutationService {
       title: `Thread preset for this thread (${threadId})`,
       fields,
       warnings,
-      restartsSession: true,
+      // Detach is a message-gate, not a session-config change. A detached-only
+      // write must not restart/invalidate; slash abort-on-detach handles an
+      // in-flight turn separately. Mixed with rider/effort/etc. still restarts.
+      restartsSession: !fields.every((f) => f.label === "detached"),
       apply: (actor) => {
         // Serialize the FULL candidate document and swap atomically (temp+rename),
         // then hot-reload the live maps (P0) so it takes effect with no redeploy.

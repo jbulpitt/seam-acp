@@ -27,7 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Logger } from "../../lib/logger.js";
-import { mayConfigureUserIds, type Config } from "../../config.js";
+import { isThreadDetached, mayConfigureUserIds, type Config } from "../../config.js";
 import type {
   ChatAdapter,
   ChannelRef,
@@ -616,6 +616,19 @@ export class DiscordAdapter implements ChatAdapter {
     const envAllows = !allowedChannels || (!!parentId && allowedChannels.has(parentId));
     const dbAllows = !!parentId && (this.activeChannelCheck?.(parentId) ?? false);
     if (!envAllows && !dbAllows) return;
+
+    // #80: detached threads stay in a seam-enabled channel but do not bind a
+    // session and do not reply. Gate HERE — after allowlist/parent checks,
+    // BEFORE IncomingMessage / messageHandler — because handleIncomingMessage
+    // already ensureSessionRecords on the abort-in-flight path.
+    //
+    // v1 is a MESSAGE GATE only: inbound schedules / wakes / watches /
+    // handoffs / steer synthesize an IncomingMessage and still fire. Do not
+    // treat detach as a full mute.
+    if (isThreadDetached(this.config, thread.id)) {
+      this.logger.debug({ threadId: thread.id }, "skipping message in detached thread");
+      return;
+    }
 
     const text = (msg.content ?? "").trim();
     const attachments: MessageAttachment[] = msg.attachments.map((a) => ({

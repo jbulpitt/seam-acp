@@ -730,7 +730,10 @@ const numericId = z.string().regex(/^\d+$/, "preset key must be a numeric Discor
 // always applied at runtime (no separate per-field lock) — see
 // resolveChannelPreset. Only the channel level additionally carries `locked`,
 // which disables /seam commands entirely for that channel and every thread
-// under it (see orchestrator.ts handleSlashInteraction).
+// under it (see orchestrator.ts handleSlashInteraction). Thread-only flags
+// (`detached`, #80) MUST NOT live here — a channel-wide mute is a different
+// feature, and a mistaken channel-level key must not silently mute a school
+// channel.
 const PresetValuesSchema = z.object({
   agent: PresetFieldSchema(z.string().min(1)).optional(),
   model: PresetFieldSchema(z.string().min(1)).optional(),
@@ -746,6 +749,20 @@ const PresetValuesSchema = z.object({
 
 const ChannelPresetSchema = PresetValuesSchema.extend({
   locked: z.boolean().optional().default(false),
+  // Thread-only (#80). Rejected so a mistaken channel-level `detached` cannot
+  // silently mute every thread under a school channel.
+  detached: z
+    .undefined({
+      invalid_type_error:
+        "detached is a thread-only flag and cannot be set on a channel",
+    })
+    .optional(),
+});
+
+// Raw boolean on the THREAD entry — NOT wrapped `{value:true}` (that wrapper
+// is only for agent/model/cwd/effort/rider). Absent / default false = attached.
+const ThreadPresetSchema = PresetValuesSchema.extend({
+  detached: z.boolean().optional().default(false),
 });
 
 // Exported (#58 P3 / D7): the Tier-C mutation path builds a candidate presets
@@ -754,7 +771,7 @@ const ChannelPresetSchema = PresetValuesSchema.extend({
 // the next boot, so a bad tool call must be rejected, never persisted.
 export const PresetsFileSchema = z.object({
   channels: z.record(numericId, ChannelPresetSchema).optional().default({}),
-  threads: z.record(numericId, PresetValuesSchema).optional().default({}),
+  threads: z.record(numericId, ThreadPresetSchema).optional().default({}),
 });
 
 export type ChannelPresetField<T> = { value: T };
@@ -766,7 +783,7 @@ export type PresetValues = {
   rider?: ChannelPresetField<string>;
 };
 export type ChannelPreset = PresetValues & { locked: boolean };
-export type ThreadPreset = PresetValues;
+export type ThreadPreset = PresetValues & { detached?: boolean };
 
 export type Config = z.infer<typeof Schema> & {
   channelPresets: Map<string, ChannelPreset>;
@@ -862,6 +879,18 @@ export function isChannelLocked(
 ): boolean {
   if (!parentId) return false;
   return config.channelPresets.get(parentId)?.locked ?? false;
+}
+
+/** Is this thread detached (#80) — allowlisted chat, no bot replies, no
+ *  session bind? Missing threadId / missing entry / absent flag all mean
+ *  attached (false). Channel-wide detach is not a thing; this only reads
+ *  `threads.<id>.detached`. */
+export function isThreadDetached(
+  config: Pick<Config, "threadPresets">,
+  threadId: string | undefined
+): boolean {
+  if (!threadId) return false;
+  return config.threadPresets.get(threadId)?.detached ?? false;
 }
 
 export function loadConfig(): Config {

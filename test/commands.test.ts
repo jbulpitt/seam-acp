@@ -57,7 +57,7 @@ describe("/seam slash command", () => {
     }
   });
 
-  it("config group has the 12 migrated config leaves", () => {
+  it("config group has the 13 config leaves including detach", () => {
     const config = built().options?.find((o) => o.name === "config");
     expect(config?.type).toBe(SUB_COMMAND_GROUP);
     const names = (config?.options ?? []).map((o) => o.name);
@@ -71,11 +71,16 @@ describe("/seam slash command", () => {
       "approve",
       "reset",
       "init",
+      "detach",
       "show",
       "set",
       "audit",
     ]);
-    expect(names).toHaveLength(12);
+    expect(names).toHaveLength(13);
+    const detach = (config?.options ?? []).find((o) => o.name === "detach");
+    const state = detach?.options?.find((o) => o.name === "state");
+    expect(state?.type).toBe(STRING);
+    expect(state?.required).toBe(true);
   });
 
   it("info group has 6 leaves (sessions/repos moved in; config-audit moved out)", () => {

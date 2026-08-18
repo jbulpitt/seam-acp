@@ -47,6 +47,7 @@ function describeConfig(record: SessionRecord): ConfigDescription {
     cwd: { value: record.repoPath ?? "/cwd", source: "session config" },
     permission: { value: cfg.permissionPolicy ?? "ask", source: "session config" },
     locked: false,
+    detached: { value: false, source: "default" },
   };
 }
 

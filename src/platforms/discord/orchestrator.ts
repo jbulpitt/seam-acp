@@ -69,12 +69,19 @@ import {
   clampFieldValue,
   formatAnomalyLines,
 } from "./workflows-view.js";
+import {
+  formatConfigAuditView,
+  formatConfigAuditDetail,
+  findAuditEntry,
+} from "./config-audit-view.js";
 import { summarizeAnomalies } from "../../core/watchdog.js";
 
 /** Accent color for scheduled-prompt cards ("cron blue"). */
 const SCHEDULED_COLOR = 0x3498db;
 /** Accent color for the read-only delegation-ledger view ("ledger teal"). */
 const WORKFLOWS_COLOR = 0x1abc9c;
+/** Accent color for the read-only config-audit view (#70). */
+const CONFIG_AUDIT_COLOR = 0x8e44ad;
 /** Operator-dispatch cards — distinct from scheduled blue so a thread's history
  *  shows at a glance which turns came from the dispatch bridge. */
 const DISPATCH_COLOR = 0x9b59b6;
@@ -1610,6 +1617,8 @@ export class Orchestrator {
           return this.cmdAvatar(interaction);
         case "help":
           return this.cmdHelp(interaction);
+        case "config-audit":
+          return this.cmdConfigAudit(interaction);
       }
     }
     switch (sub) {
@@ -6396,6 +6405,71 @@ export class Orchestrator {
       }
     }
 
+    await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+  }
+
+  /** `/seam info config-audit` — read the immutable config-mutation trail (#70).
+   *  Every applied config change already writes a `config_audit` row; this is
+   *  the missing read surface. Purely observability: no writes, no schema, and
+   *  intentionally slash-command-only (the trail spans every channel, so it is
+   *  never exposed as a cross-thread MCP read). With `entry:<id>` it renders the
+   *  before→after diff for a single row; long rider payloads are truncated
+   *  (`config-audit-view.ts`) so they can't break the render. Ephemeral. */
+  private async cmdConfigAudit(i: ChatInputCommandInteraction): Promise<void> {
+    const limit = i.options.getInteger("limit") ?? 20;
+    const now = new Date();
+    // Pull one page; a requested detail id must resolve within it, matching the
+    // "recent tail" framing of the view (older rows aren't a lookup surface).
+    const entries = this.store.listConfigMutations(limit);
+
+    const entryId = i.options.getString("entry");
+    if (entryId) {
+      const match = findAuditEntry(entries, entryId);
+      if (!match) {
+        await i.reply({
+          content:
+            `No config-audit entry \`${entryId}\` in the last ${limit} mutations. ` +
+            `Raise \`limit\` or copy an id from \`/seam info config-audit\`.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const detail = formatConfigAuditDetail(match, now);
+      const embed = new EmbedBuilder()
+        .setTitle("📜 Config mutation")
+        .setColor(CONFIG_AUDIT_COLOR)
+        .setDescription(detail.entry.summary);
+      for (const m of detail.meta) {
+        // Same 1024 field-value clamp the confirm card uses (adapter.ts).
+        embed.addFields({ name: m.label, value: m.value.slice(0, 1024) });
+      }
+      embed.addFields(
+        { name: "before", value: this.renderer.codeBlock(detail.before, "json").slice(0, 1024) },
+        { name: "after", value: this.renderer.codeBlock(detail.after, "json").slice(0, 1024) }
+      );
+      await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    const view = formatConfigAuditView(entries, now);
+    const embed = new EmbedBuilder()
+      .setTitle("📜 Config audit")
+      .setColor(CONFIG_AUDIT_COLOR);
+    if (view.empty) {
+      embed.setDescription(
+        "No config mutations recorded yet — nothing has been applied via `config_propose`."
+      );
+    } else {
+      // `clampFieldValue` keeps the list under Discord's 1024 field cap with an
+      // `…and N more` tail (shared with `/seam workflows`).
+      embed.addFields({
+        name: `🕑 Recent (${view.lines.length})`,
+        value: clampFieldValue(view.lines),
+      });
+      embed.setFooter({
+        text: `newest first · up to ${limit} rows · inspect one with entry:<id>`,
+      });
+    }
     await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 

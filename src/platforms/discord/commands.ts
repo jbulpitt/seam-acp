@@ -276,6 +276,29 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub.setName("help").setDescription("Show help")
       )
+      // Read surface for the config-mutation trail (#70). Lives in the `info`
+      // group — a read-only observability view like `whoami`/`usage` — because
+      // `/seam` is at Discord's 25 top-level-option cap, so a new top-level
+      // subcommand can't be added.
+      .addSubcommand((sub) =>
+        sub
+          .setName("config-audit")
+          .setDescription("Show recent config mutations (who/what/when), newest first")
+          .addIntegerOption((o) =>
+            o
+              .setName("limit")
+              .setDescription("How many recent mutations to show (default 20)")
+              .setRequired(false)
+              .setMinValue(1)
+              .setMaxValue(100)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("entry")
+              .setDescription("Show the before→after diff for one entry id")
+              .setRequired(false)
+          )
+      )
   );
 
   cmd.addSubcommandGroup((g) =>
@@ -441,7 +464,8 @@ export type SeamSubcommand =
   | "whoami"
   | "usage"
   | "avatar"
-  | "help";
+  | "help"
+  | "config-audit";
 
 export function getSubcommand(
   i: ChatInputCommandInteraction

@@ -573,6 +573,10 @@ export class AgentRuntime {
     }
 
     this.promptInFlight = true;
+    // Captured so the teardown fail-safe below can tell a CLEAN completion
+    // (end_turn) from an abnormal one (cancel/abort/error). Stays undefined if
+    // the RPC rejects (dispose/child-death) — which is itself an abnormal end.
+    let outcomeStopReason: string | undefined;
     try {
       // Race the ACP prompt RPC against a death/dispose rejection. Storing the
       // reject lets the child-exit handler (and dispose) force this await to
@@ -582,6 +586,7 @@ export class AgentRuntime {
         this.rejectInFlightPrompt = reject;
         conn.prompt({ sessionId: sid, prompt }).then(resolve, reject);
       });
+      outcomeStopReason = res.stopReason;
       return {
         stopReason: res.stopReason,
         cancelled: res.stopReason === "cancelled",
@@ -598,12 +603,24 @@ export class AgentRuntime {
         // Fail-safe: a resumed first prompt that NEVER echoed a user message is
         // not a replay preamble at all — it's a fully-live turn whose leading
         // agent content we optimistically held. No boundary means no history to
-        // drop, so flush the held content in arrival order rather than eat it.
+        // drop, so flush the held content in arrival order rather than eat it —
+        // BUT ONLY when the turn ended cleanly (end_turn). An INTERRUPTED turn
+        // (#67: cancel/abort, or any error/dispose that leaves stopReason unset)
+        // is exactly a cancelled/never-echoed turn: flushing could surface stale
+        // replayed history that was held precisely because it wasn't yet decided
+        // to be live. On an abnormal teardown, DROP the buffer instead (#64).
         if (!this.resumeSawUserEcho && this.resumePreEchoBuffer.length > 0) {
           const held = this.resumePreEchoBuffer;
           this.resumePreEchoBuffer = [];
-          for (const u of held) {
-            await this.dispatchSessionUpdate(u).catch(() => {});
+          if (outcomeStopReason === "end_turn") {
+            for (const u of held) {
+              await this.dispatchSessionUpdate(u).catch(() => {});
+            }
+          } else {
+            this.logger.debug(
+              { stopReason: outcomeStopReason ?? "(none)" },
+              "resume-replay: abnormal teardown — dropped held pre-echo buffer instead of flushing"
+            );
           }
         } else if (this.suppressResumeReplay && !this.resumeLiveSegment) {
           // Armed, saw a replayed user echo, but the current-prompt echo never

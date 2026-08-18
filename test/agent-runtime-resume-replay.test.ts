@@ -42,6 +42,12 @@ const usageUpdate = (): Update => ({
 class FakeConn {
   loadUpdates: Update[] = [];
   promptUpdates: Update[] = [];
+  /** Stop reason the prompt RPC resolves with. Default clean end_turn; set to
+   *  "cancelled" (or anything non-end_turn) to model an interrupted turn (#67). */
+  promptStopReason = "end_turn";
+  /** When true, the prompt RPC feeds its updates then REJECTS — models a turn
+   *  that dies via error/dispose (also an abnormal teardown, #64). */
+  promptShouldReject = false;
   private feed: (u: Update) => Promise<void>;
 
   constructor(rt: AgentRuntime) {
@@ -57,7 +63,8 @@ class FakeConn {
   }
   async prompt() {
     for (const u of this.promptUpdates) await this.feed(u);
-    return { stopReason: "end_turn" };
+    if (this.promptShouldReject) throw new Error("simulated turn error/dispose");
+    return { stopReason: this.promptStopReason };
   }
   async cancel() {}
   async setSessionConfigOption() {}
@@ -224,6 +231,49 @@ describe("AgentRuntime resume-replay suppression", () => {
     expect(h.agentText().join("")).not.toContain("earlier handoff");
     // Sanity: the appended instruction really is part of the sent prompt.
     expect(sent.endsWith(WATCH_FEEDBACK_INSTRUCTION)).toBe(true);
+  });
+
+  // --- #64 drop-on-abnormal-teardown refinement (#67) ----------------------
+  // The held pre-echo buffer is only ever flushed on a CLEAN end_turn. An
+  // interrupted turn (cancel/abort) or an errored one is exactly a
+  // cancelled/never-echoed turn — flushing would surface stale replayed history,
+  // so the abnormal-teardown path DROPS the buffer instead.
+
+  it("cold resume ending in CANCEL drops the held pre-echo buffer (no replayed content) (#64/#67)", async () => {
+    await h.rt.loadSession({ sessionId: "s8", cwd: "/tmp" });
+    // Leading replayed agent content, NO user echo → held in the pre-echo buffer
+    // (its live-vs-replay status is undecided when the turn is cut short).
+    h.conn.promptStopReason = "cancelled";
+    h.conn.promptUpdates = [
+      agentChunk("STALE: replayed history held before any echo."),
+      agentChunk(" (more stale content)"),
+    ];
+    const outcome = await h.rt.prompt(PROMPT);
+    expect(outcome.stopReason).toBe("cancelled");
+    // Abnormal teardown ⇒ the buffer is DROPPED, not flushed.
+    expect(h.agentText()).toEqual([]);
+  });
+
+  it("cold resume whose turn ERRORS (RPC rejects) also drops the held buffer (#64/#67)", async () => {
+    await h.rt.loadSession({ sessionId: "s9", cwd: "/tmp" });
+    h.conn.promptShouldReject = true;
+    h.conn.promptUpdates = [agentChunk("STALE held content before the crash.")];
+    await expect(h.rt.prompt(PROMPT)).rejects.toBeTruthy();
+    // No stopReason ever resolved ⇒ treated as abnormal ⇒ buffer dropped.
+    expect(h.agentText()).toEqual([]);
+  });
+
+  it("cold resume ending CLEANLY (end_turn) still flushes the SAME held buffer (#64 clean path unchanged)", async () => {
+    await h.rt.loadSession({ sessionId: "s10", cwd: "/tmp" });
+    // Identical shape to the cancel case — the ONLY difference is the stop reason.
+    h.conn.promptStopReason = "end_turn";
+    h.conn.promptUpdates = [
+      agentChunk("Genuinely live answer, no echo — "),
+      agentChunk("held then flushed."),
+    ];
+    await h.rt.prompt(PROMPT);
+    // Clean completion ⇒ the fail-safe flushes, so the live answer is not lost.
+    expect(h.agentText()).toEqual(["Genuinely live answer, no echo — ", "held then flushed."]);
   });
 
   it("boundary matches even when the echo is split across chunks", async () => {

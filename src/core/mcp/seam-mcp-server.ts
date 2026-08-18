@@ -187,6 +187,28 @@ export interface SeamMcpServerDeps {
     priority?: boolean
   ) => { ok: true; queued: number } | { ok: false; error: string };
   /**
+   * Preemptive interrupt (#67): CANCEL the target thread's in-flight dispatched
+   * turn and issue `message` as a NEW directive NOW — the agent-facing twin of
+   * the `/seam steer now:true` human path. Unlike `pushInbox` (pull-only, queued)
+   * this reuses the steer-now canceller (graceful ACP cancel escalating to force
+   * when wedged), SUPPRESSES the cancelled handoff's report-back so its
+   * partial/stale output is never delivered, and re-prompts the SAME thread as a
+   * fresh turn. `fresh:false` keeps the target's session/context (it pivots off
+   * partial work); `fresh:true` resets the session first (clean slate). If the
+   * target has no active turn it degrades to immediate delivery so the directive
+   * is never silently lost. Undefined ⇒ interrupts are unsupported on this
+   * deployment. Wired in index.ts to `orchestrator.interruptRedirect`.
+   */
+  interruptRedirect?: (
+    caller: SessionRecord,
+    to: string,
+    message: string,
+    fresh: boolean
+  ) => Promise<
+    | { ok: true; cancelled: "idle" | "cancelled" | "killed"; fresh: boolean; dispatchId: string }
+    | { ok: false; error: string }
+  >;
+  /**
    * Agent inbox CONSUMER (#61): drain the calling thread's OWN inbox
    * (deliver-once-then-delete), returning the queued messages coalesced/ordered
    * (oldest first). Self-scope by construction — the caller is the token-resolved
@@ -538,7 +560,15 @@ const TOOLS = [
       "and reorient to this at its next poll\" (the target sees it FIRST, framed distinctly), versus a normal " +
       "note (priority omitted/false) it merely absorbs into its current plan. Priority is STILL pull-only and " +
       "queued — it does NOT cancel or interrupt the target's turn; it only changes how urgently the message " +
-      "reads when polled.",
+      "reads when polled. " +
+      "Set `interrupt: true` for the PREEMPTIVE tier: instead of queuing, it CANCELS the target's in-flight " +
+      "turn right now and issues `message` as a fresh directive in that same thread — use it when the target " +
+      "is actively working the wrong thing and cannot wait for its next poll. `interrupt` SUPERSEDES " +
+      "`priority`: if both are set the interrupt path is taken and `priority` is ignored (an interrupt is " +
+      "already preemptive). With `interrupt`, `fresh` chooses context: `fresh:false` (default) keeps the " +
+      "target's session so it pivots off its partial work; `fresh:true` resets the session first for a clean " +
+      "slate. The cancelled handoff delivers NO result back to whoever it was reporting to. If the target has " +
+      "no active turn, the directive is still delivered immediately (never lost).",
     inputSchema: {
       type: "object",
       properties: {
@@ -548,7 +578,22 @@ const TOOLS = [
           type: "boolean",
           description:
             "When true, flag the message urgent: the target should abandon its current plan and reorient " +
-            "to it at its next poll_inbox. Default false (a normal note). Still pull-only — never interrupts a turn.",
+            "to it at its next poll_inbox. Default false (a normal note). Still pull-only — never interrupts a " +
+            "turn. Ignored when `interrupt:true` is also set (interrupt supersedes priority).",
+        },
+        interrupt: {
+          type: "boolean",
+          description:
+            "When true, PREEMPT the target: cancel its in-flight turn now and issue `message` as a fresh " +
+            "directive in that thread, rather than queuing to its inbox. Default false. Supersedes `priority`. " +
+            "The cancelled turn's report-back is suppressed. If the target has no active turn, the directive is " +
+            "delivered immediately anyway.",
+        },
+        fresh: {
+          type: "boolean",
+          description:
+            "Only meaningful with `interrupt:true`. false (default) keeps the target's session/context so it " +
+            "pivots off its partial work; true resets the session first for a clean slate.",
         },
       },
       required: ["to", "message"],
@@ -830,7 +875,7 @@ export class SeamMcpServer {
         case "poll_inbox":
           return rpcResult(id, this.toolPollInbox(record));
         case "send":
-          return rpcResult(id, this.toolSend(record, args));
+          return rpcResult(id, await this.toolSend(record, args));
         case "config_describe":
           return rpcResult(id, this.toolConfigDescribe(record, args));
         case "config_propose":
@@ -1239,16 +1284,48 @@ export class SeamMcpServer {
    * row live behind `pushInbox` so this stays a thin, side-effect-free-of-turns
    * call.
    */
-  private toolSend(
+  private async toolSend(
     caller: SessionRecord,
     args: Record<string, unknown>
-  ): McpToolResult {
-    if (!this.deps.pushInbox) {
-      return textResult("the inbox is not supported on this deployment.", true);
-    }
+  ): Promise<McpToolResult> {
     const to = requireString(args, "to");
     const message = requireString(args, "message");
     const priority = optionalBool(args, "priority") ?? false;
+    const interrupt = optionalBool(args, "interrupt") ?? false;
+    const fresh = optionalBool(args, "fresh") ?? false;
+
+    // #67: interrupt SUPERSEDES priority (an interrupt is already preemptive).
+    // Route to the cancel-and-redirect path; the queued/priority inbox path
+    // below is untouched (#61/#66 behavior) when interrupt is off.
+    if (interrupt) {
+      if (!this.deps.interruptRedirect) {
+        return textResult("interrupt is not supported on this deployment.", true);
+      }
+      const res = await this.deps.interruptRedirect(caller, to, message, fresh);
+      if (!res.ok) {
+        return textResult(`Interrupt failed: ${res.error}`, true);
+      }
+      this.logger.info(
+        { from: caller.channelRef, to, fresh, cancelled: res.cancelled, dispatchId: res.dispatchId },
+        "seam-mcp interrupt redirected"
+      );
+      const cancelNote =
+        res.cancelled === "idle"
+          ? `The target had no active turn, so nothing was cancelled — your directive was delivered immediately anyway. `
+          : res.cancelled === "killed"
+            ? `The target's turn was wedged and had to be force-killed, then `
+            : `Cancelled the target's in-flight turn, then `;
+      return textResult(
+        `🧭 Interrupted thread ${to}. ` +
+          cancelNote +
+          `issued your directive as a fresh turn there (${res.fresh ? "session RESET — clean slate" : "session KEPT — it pivots off its partial work"}). ` +
+          `The interrupted handoff will deliver NO result back to whoever it was reporting to.`
+      );
+    }
+
+    if (!this.deps.pushInbox) {
+      return textResult("the inbox is not supported on this deployment.", true);
+    }
     const result = this.deps.pushInbox(caller, to, message, priority);
     if (!result.ok) {
       return textResult(`Message not sent: ${result.error}`, true);

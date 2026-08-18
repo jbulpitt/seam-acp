@@ -86,6 +86,8 @@ interface Harness {
   cancelledWatches: string[];
   /** Per-session-ref inbox backing the send/poll_inbox stubs (session_ref → messages). */
   inbox: Map<string, Array<{ fromRef: string | null; body: string; priority: boolean; createdUtc: string }>>;
+  /** Every interrupt (#67) routed through the interruptRedirect dep. */
+  interrupts: Array<{ caller: SessionRecord; to: string; message: string; fresh: boolean }>;
   call: (
     method: string,
     params?: unknown,
@@ -105,10 +107,13 @@ async function makeHarness(opts?: {
   proposeConfig?: (record: SessionRecord, input: unknown) => Promise<any>;
   pushInbox?: SeamMcpServerDeps["pushInbox"];
   drainInbox?: SeamMcpServerDeps["drainInbox"];
+  interruptRedirect?: SeamMcpServerDeps["interruptRedirect"];
   /** Omit the compact dep entirely (to test the "not supported" refusal). */
   disableCompact?: boolean;
   /** Omit the inbox deps entirely (to test the "not supported" refusal). */
   disableInbox?: boolean;
+  /** Omit the interrupt dep entirely (to test the "not supported" refusal). */
+  disableInterrupt?: boolean;
 }): Promise<Harness> {
   const enqueued: DispatchSpec[] = [];
   const scheduledWakes: Harness["scheduledWakes"] = [];
@@ -119,6 +124,7 @@ async function makeHarness(opts?: {
   // (`${platform}:${channelRef}`). `send` pushes to the target's ref; poll_inbox
   // drains the caller's own ref (deliver-once).
   const inbox: Harness["inbox"] = new Map();
+  const interrupts: Harness["interrupts"] = [];
   const server = new SeamMcpServer({
     logger: silent,
     resolveSession:
@@ -215,6 +221,18 @@ async function makeHarness(opts?: {
               return queue;
             }),
         }),
+    // Interrupt (#67): default stub records the call and reports a cancelled
+    // redirect. Omit when disableInterrupt is set to test the refusal.
+    ...(opts?.disableInterrupt
+      ? {}
+      : {
+          interruptRedirect:
+            opts?.interruptRedirect ??
+            (async (caller, to, message, fresh) => {
+              interrupts.push({ caller, to, message, fresh });
+              return { ok: true as const, cancelled: "cancelled" as const, fresh, dispatchId: "disp-int-1" };
+            }),
+        }),
   });
   await server.start();
   const port = server.port;
@@ -233,7 +251,7 @@ async function makeHarness(opts?: {
     return { status: res.status, body: text ? JSON.parse(text) : undefined };
   };
 
-  return { server, enqueued, scheduledWakes, cancelledWakes, createdWatches, cancelledWatches, inbox, call };
+  return { server, enqueued, scheduledWakes, cancelledWakes, createdWatches, cancelledWatches, inbox, interrupts, call };
 }
 
 describe("SeamMcpServer", () => {
@@ -886,6 +904,124 @@ describe("SeamMcpServer", () => {
     expect(text).toContain("[FEEDBACK from thread-caller]: normal-first-note");
     // ...and the priority block precedes the normal one despite arriving later.
     expect(text.indexOf("urgent-reorient")).toBeLessThan(text.indexOf("normal-first-note"));
+  });
+
+  // --- send(interrupt) — preemptive cancel-and-redirect (#67) --------------
+
+  it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call("tools/list");
+    // Params on `send` must NOT add a tool — the set stays at 15 (#61/#62/#66).
+    expect(body.result.tools).toHaveLength(15);
+    const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
+    expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
+    expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");
+  });
+
+  it("send(interrupt:true) routes to interruptRedirect — cancels + redirects, does NOT queue to the inbox (#67)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "pivot to the hotfix", interrupt: true } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBeFalsy();
+    // The interrupt dep was invoked (keep-context by default: fresh=false)...
+    expect(h.interrupts).toHaveLength(1);
+    expect(h.interrupts[0]!.to).toBe("thread-caller");
+    expect(h.interrupts[0]!.message).toBe("pivot to the hotfix");
+    expect(h.interrupts[0]!.fresh).toBe(false);
+    // ...and NOTHING was queued to the inbox (this is not a pull-only send).
+    expect(h.inbox.size).toBe(0);
+    // The result confirms cancel + redirect + no report-back for the old handoff.
+    const text = body.result.content[0].text as string;
+    expect(text).toContain("Interrupted thread thread-caller");
+    expect(text).toContain("session KEPT");
+    expect(text).toContain("NO result");
+  });
+
+  it("send(interrupt:true, fresh:true) threads fresh through and reports a session reset (#67)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "start over", interrupt: true, fresh: true } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(h.interrupts[0]!.fresh).toBe(true);
+    expect(body.result.content[0].text).toContain("session RESET");
+  });
+
+  it("send interrupt:true SUPERSEDES priority:true — interrupt path taken, inbox untouched (#67)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "send",
+        arguments: { to: "thread-caller", message: "urgent redirect", interrupt: true, priority: true },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    // Interrupt path: the redirect ran and NOTHING was queued as a priority note.
+    expect(h.interrupts).toHaveLength(1);
+    expect(h.inbox.size).toBe(0);
+  });
+
+  it("send(interrupt:true) with no active turn degrades to immediate delivery (never lost) (#67)", async () => {
+    h = await makeHarness({
+      interruptRedirect: async (_caller, _to, _message, fresh) => ({
+        ok: true as const,
+        cancelled: "idle" as const,
+        fresh,
+        dispatchId: "disp-int-2",
+      }),
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "do this next", interrupt: true } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    const text = body.result.content[0].text as string;
+    expect(text).toContain("no active turn");
+    expect(text).toContain("delivered immediately");
+  });
+
+  it("send(interrupt:true) reports unsupported when the interruptRedirect dep is absent (#67)", async () => {
+    h = await makeHarness({ disableInterrupt: true });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "x", interrupt: true } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("not supported");
+    // A refusal must not leak into the inbox path.
+    expect(h.inbox.size).toBe(0);
+  });
+
+  it("send(interrupt:false) is unchanged — still a pull-only inbox queue (#67 default)", async () => {
+    h = await makeHarness();
+    await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "some-other-thread", message: "a normal note", interrupt: false } },
+      { "X-Seam-Session": "good-token" }
+    );
+    // No interrupt fired; the message sits in the target's inbox as before.
+    expect(h.interrupts).toHaveLength(0);
+    expect(h.inbox.get("discord:some-other-thread")).toHaveLength(1);
+  });
+
+  it("send rejects an unknown token with -32001 BEFORE interrupting (#67)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "hi", interrupt: true } },
+      { "X-Seam-Session": "bad-token" }
+    );
+    expect(body.error.code).toBe(-32001);
+    expect(h.interrupts).toHaveLength(0);
   });
 
   it("poll_inbox rejects an unknown token with -32001 (#61)", async () => {

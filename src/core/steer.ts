@@ -18,3 +18,21 @@ export function frameSteerPrompt(prompt: string): string {
     `The operator is steering you mid-task — adjust to the above now.`
   );
 }
+
+/**
+ * Wrap a raw interrupt directive in the `<seam-interrupt>` frame (#67). Unlike a
+ * steer (which layers onto whatever the agent was doing), an interrupt has just
+ * PREEMPTIVELY CANCELLED the agent's in-flight turn — so the frame tells it its
+ * prior work was aborted and it must reorient. `fresh` distinguishes the two
+ * tiers: a kept session pivots off partial work; a reset session starts clean.
+ */
+export function frameInterruptPrompt(prompt: string, fresh: boolean): string {
+  return (
+    `<seam-interrupt>\n${prompt}\n</seam-interrupt>\n\n` +
+    (fresh
+      ? `A teammate interrupted you: your previous turn was cancelled and your session was reset. ` +
+        `Disregard any earlier task — start fresh on the directive above now.`
+      : `A teammate interrupted you: your previous turn was cancelled. ` +
+        `Abandon that partial work and pivot to the directive above now.`)
+  );
+}

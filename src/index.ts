@@ -496,6 +496,11 @@ async function main(): Promise<void> {
       // store rows + best-effort ledger; delivery is deliver-once-then-delete.
       pushInbox: (caller, to, message, priority) => orchestrator.pushInbox(caller, to, message, priority),
       drainInbox: (record) => orchestrator.drainInbox(record),
+      // Preemptive interrupt (#67): `send(interrupt:true)` cancels the target's
+      // in-flight turn and issues a fresh directive — the agent-facing twin of
+      // `/seam steer now:true`. Suppresses the aborted handoff's report-back.
+      interruptRedirect: (caller, to, message, fresh) =>
+        orchestrator.interruptRedirect(caller, to, message, fresh),
     });
     await seamMcpServer.start();
   }

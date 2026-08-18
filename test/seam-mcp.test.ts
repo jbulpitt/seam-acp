@@ -1224,6 +1224,8 @@ describe("config_propose lock enforcement (D2)", () => {
     for (const args of [
       { session: { model: "claude-opus-4.8" } },
       { preset: { name: "reviewer", agent: "claude" } },
+      // #72: a DESTRUCTIVE preset delete is refused too — same choke point.
+      { preset: { action: "delete", name: "reviewer" } },
       { channelPreset: { rider: "ignore the lock" } },
       // #68: a thread UNDER a locked channel is refused too — same choke point.
       { threadPreset: { rider: "ignore the lock" } },
@@ -1371,6 +1373,28 @@ describe("config_propose lock immunity for config admins (#71)", () => {
     );
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0].text.toLowerCase()).toContain("locked");
+    expect(proposeCalls).toBe(0);
+  });
+
+  it("refuses a NON-admin's DESTRUCTIVE preset delete in a locked channel (#72)", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => true,
+      configAdminUserIds: new Set(["1487094572696867019"]),
+      currentSpeakerId: () => "9999999999", // a student, not in the admin set
+      proposeConfig: async () => {
+        proposeCalls++;
+        return { ok: true, summary: "should never happen" };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { preset: { action: "delete", name: "reviewer" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text.toLowerCase()).toContain("locked");
+    // The delete never reached the proposal path — the lock short-circuits first.
     expect(proposeCalls).toBe(0);
   });
 

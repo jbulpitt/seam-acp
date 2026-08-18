@@ -201,15 +201,150 @@ describe("preset mutation (Tier B)", () => {
     expect(store.listConfigMutations()[0]!.tier).toBe("preset");
   });
 
-  it("refuses the inert `instructions` field rather than promise a no-op", () => {
+  it("allows `instructions` and persists it on the preset row (#72 un-block)", () => {
     const record = makeRecord();
     store.upsert(record);
     const built = makeService().buildProposal(record, {
-      preset: { name: "x", instructions: "be terse" } as never,
+      preset: { name: "reviewer", agent: "claude", instructions: "Be terse and adversarial." },
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    // The diff surfaces the identity change...
+    expect(built.proposal.fields.map((f) => f.label)).toContain("instructions");
+    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+    // ...and it round-trips onto the stored preset.
+    const preset = store.getPresetByNameScoped("reviewer", record.parentRef);
+    expect(preset!.instructions).toBe("Be terse and adversarial.");
+    // Audit captures the identity in after_json.
+    expect(store.listConfigMutations()[0]!.afterJson).toContain("Be terse and adversarial.");
+  });
+
+  it("sets repoPath and tool filters on a preset, and clears them with empty values", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const svc = makeService();
+    const created = svc.buildProposal(record, {
+      preset: {
+        name: "specialist",
+        agent: "claude",
+        repoPath: "/srv/proj",
+        toolsAllow: ["Read", "Grep"],
+        toolsExclude: ["Bash"],
+      },
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    created.proposal.apply({ id: "u", name: "U" });
+
+    const p = store.getPresetByNameScoped("specialist", record.parentRef)!;
+    expect(p.repoPath).toBe(path.resolve("/srv/proj"));
+    expect(p.toolsAllow).toEqual(["Read", "Grep"]);
+    expect(p.toolsExclude).toEqual(["Bash"]);
+
+    // Clear repoPath (empty string) and toolsAllow (empty array).
+    const clear = svc.buildProposal(record, {
+      preset: { name: "specialist", repoPath: "", toolsAllow: [] },
+    });
+    expect(clear.ok).toBe(true);
+    if (!clear.ok) return;
+    clear.proposal.apply({ id: "u", name: "U" });
+    const p2 = store.getPresetByNameScoped("specialist", record.parentRef)!;
+    expect(p2.repoPath).toBeNull();
+    expect(p2.toolsAllow).toBeNull();
+    expect(p2.toolsExclude).toEqual(["Bash"]); // untouched field preserved
+  });
+
+  it("deletes a preset through a confirm card, recording the full removed object in before_json (#72)", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const svc = makeService();
+    // Create one to delete.
+    const created = svc.buildProposal(record, {
+      preset: { name: "temp", agent: "claude", model: "m", instructions: "identity here" },
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    created.proposal.apply({ id: "u", name: "U" });
+    expect(store.getPresetByNameScoped("temp", record.parentRef)).not.toBeNull();
+
+    // Propose delete — side-effect free until apply.
+    const del = svc.buildProposal(record, { preset: { action: "delete", name: "temp" } });
+    expect(del.ok).toBe(true);
+    if (!del.ok) return;
+    expect(del.proposal.tier).toBe("preset");
+    expect(del.proposal.title).toContain("Delete preset");
+    // Still present before apply (D5).
+    expect(store.getPresetByNameScoped("temp", record.parentRef)).not.toBeNull();
+
+    del.proposal.apply({ id: "user-jesse", name: "Jesse" });
+
+    // Gone.
+    expect(store.getPresetByNameScoped("temp", record.parentRef)).toBeNull();
+    // Audited with the FULL removed object recoverable from before_json.
+    const audit = store.listConfigMutations()[0]!;
+    expect(audit.tier).toBe("preset");
+    expect(audit.summary).toContain("delete preset");
+    expect(audit.afterJson).toContain("null");
+    const before = JSON.parse(audit.beforeJson);
+    expect(before).toMatchObject({
+      name: "temp",
+      agentId: "claude",
+      model: "m",
+      instructions: "identity here",
+    });
+  });
+
+  it("refuses deleting a preset that does not exist in scope", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const built = makeService().buildProposal(record, {
+      preset: { action: "delete", name: "ghost" },
     });
     expect(built.ok).toBe(false);
     if (built.ok) return;
-    expect(built.error).toContain("instructions");
+    expect(built.error).toContain("No preset");
+  });
+});
+
+// -------------------------------------------------------------------------
+// Tier A — new field coverage (#72): mode + tool allow/exclude lists
+// -------------------------------------------------------------------------
+
+describe("session config new fields (Tier A, #72)", () => {
+  it("sets mode and tool lists, restarts the session, and clears them", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const svc = makeService();
+
+    const set = svc.buildProposal(record, {
+      session: { mode: "acp:plan", availableTools: ["Read"], excludedTools: ["Bash"] },
+    });
+    expect(set.ok).toBe(true);
+    if (!set.ok) return;
+    expect(set.proposal.restartsSession).toBe(true);
+    expect(set.proposal.fields.map((f) => f.label).sort()).toEqual([
+      "availableTools",
+      "excludedTools",
+      "mode",
+    ]);
+    set.proposal.apply({ id: "u", name: "U" });
+
+    const cfg = store.readConfig(store.get(record.id)!);
+    expect(cfg.mode).toBe("acp:plan");
+    expect(cfg.availableTools).toEqual(["Read"]);
+    expect(cfg.excludedTools).toEqual(["Bash"]);
+
+    // Clearing: empty string / empty array. Re-fetch the record so its configJson
+    // reflects the first apply (a real turn always reads a fresh record).
+    const fresh = store.get(record.id)!;
+    const clear = svc.buildProposal(fresh, { session: { mode: "", availableTools: [] } });
+    expect(clear.ok).toBe(true);
+    if (!clear.ok) return;
+    clear.proposal.apply({ id: "u", name: "U" });
+    const cfg2 = store.readConfig(store.get(record.id)!);
+    expect(cfg2.mode).toBeUndefined();
+    expect(cfg2.availableTools).toBeUndefined();
+    expect(cfg2.excludedTools).toEqual(["Bash"]); // untouched field preserved
   });
 });
 

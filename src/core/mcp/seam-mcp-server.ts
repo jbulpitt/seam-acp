@@ -767,18 +767,59 @@ const TOOLS = [
               enum: ["always", "ask", "deny"],
               description: "Permission policy.",
             },
+            mode: {
+              type: "string",
+              description: "ACP mode id (what `/seam mode` sets). Empty string clears it.",
+            },
+            availableTools: {
+              type: "array",
+              items: { type: "string" },
+              description: "Tool allowlist (`/seam tools allow`). Empty array = all tools allowed.",
+            },
+            excludedTools: {
+              type: "array",
+              items: { type: "string" },
+              description: "Tool blocklist (`/seam tools exclude`). Empty array = none excluded.",
+            },
           },
         },
         preset: {
           type: "object",
-          description: "Tier B — a preset in this thread's project scope.",
+          description:
+            "Tier B — a preset in this thread's project scope. Default action creates/updates; " +
+            "action:\"delete\" removes the named preset (confirm card + audit, recoverable from the trail).",
           properties: {
+            action: {
+              type: "string",
+              enum: ["upsert", "delete"],
+              description: "\"upsert\" (default) creates/updates; \"delete\" removes the named preset.",
+            },
             name: { type: "string", description: "Preset name (required)." },
             agent: { type: "string" },
             model: { type: "string" },
             effort: { type: "string" },
             description: { type: "string" },
             permission: { type: "string", enum: ["always", "ask", "deny"] },
+            repoPath: {
+              type: "string",
+              description: "Working directory for this preset worker. Empty string clears it.",
+            },
+            toolsAllow: {
+              type: "array",
+              items: { type: "string" },
+              description: "Tool allowlist for the preset worker. Empty array clears it.",
+            },
+            toolsExclude: {
+              type: "array",
+              items: { type: "string" },
+              description: "Tool blocklist for the preset worker. Empty array clears it.",
+            },
+            instructions: {
+              type: "string",
+              description:
+                "The preset worker's identity/personality — injected as a <seam-worker-identity> " +
+                "block when the preset runs as a handoff/dispatch worker. Empty string clears it.",
+            },
           },
           required: ["name"],
         },

@@ -60,19 +60,43 @@ export interface SessionConfigChanges {
   effort?: string | null;
   cwd?: string;
   permission?: PermissionPolicyMode;
+  /** ACP mode id (what `/seam mode` sets, e.g. an agent/plan/autopilot URI).
+   *  `null` clears the session-level mode override. */
+  mode?: string | null;
+  /** Tool allowlist (`/seam tools allow`). Empty array or `null` clears it back
+   *  to "all tools allowed". */
+  availableTools?: string[] | null;
+  /** Tool blocklist (`/seam tools exclude`). Empty array or `null` clears it. */
+  excludedTools?: string[] | null;
 }
 
-/** Tier B — a preset in the calling thread's project scope. */
+/** Tier B — a preset in the calling thread's project scope.
+ *
+ *  `action` selects the operation: the default (undefined) upserts (create or
+ *  update in place); `"delete"` removes the preset. Deletion is destructive, so
+ *  it goes through the IDENTICAL confirm-card + audit path as any other mutation
+ *  and records the full removed object in `before_json` (recoverable from the
+ *  audit trail). `name` is always required — it is how the preset is targeted. */
 export interface PresetChanges {
+  /** undefined/"upsert" = create-or-update; "delete" = remove the named preset. */
+  action?: "upsert" | "delete";
   name: string;
   agent?: string;
   model?: string;
   effort?: string | null;
   description?: string | null;
   permission?: PermissionPolicyMode;
-  // `instructions` is intentionally unsupported — the Preset type's own comment
-  // notes it is stored but NOT injected into the system prompt, so a tool that
-  // set it would promise a personality it cannot deliver. Refused in validate().
+  /** A preset worker's working directory — essential for a specialist that must
+   *  run in a particular repo. `null` clears it (falls back to the caller's cwd). */
+  repoPath?: string | null;
+  /** Tool allowlist for the preset worker. `null`/empty clears it. */
+  toolsAllow?: string[] | null;
+  /** Tool blocklist for the preset worker. `null`/empty clears it. */
+  toolsExclude?: string[] | null;
+  /** The preset worker's identity/personality. IS injected: orchestrator prepends
+   *  it as `<seam-worker-identity name="…">…</seam-worker-identity>` when the
+   *  preset runs as a handoff/dispatch worker (#23). `null` clears it. */
+  instructions?: string | null;
 }
 
 /** Tier C — the calling thread's OWN channel preset (channel-presets.json).
@@ -194,6 +218,7 @@ export interface ConfigMutationStore {
   upsert(record: SessionRecord): void;
   getPresetByNameScoped(name: string, projectRef: string | null): Preset | null;
   upsertPreset(p: Preset): void;
+  deletePreset(id: string): void;
   recordConfigMutation(entry: ConfigAuditInput): ConfigAuditEntry;
   // Scheduled prompts (#69) — the Tier-D surface.
   getScheduled(id: string): ScheduledPrompt | null;
@@ -387,6 +412,48 @@ export class ConfigMutationService {
       }
     }
 
+    // mode — ACP mode id (`/seam mode`). Not layered by presets, so diff directly
+    // against the stored config. `null`/"" clears the session-level override.
+    if (changes.mode !== undefined) {
+      const before = cfg.mode ?? "(none)";
+      if (changes.mode === null || changes.mode === "") {
+        delete nextCfg.mode;
+        if (before !== "(none)") fields.push({ label: "mode", before, after: "(none)" });
+      } else {
+        const m = changes.mode.trim();
+        if (!m) return { ok: false, error: "`mode` must be a non-empty string." };
+        nextCfg.mode = m;
+        if (m !== cfg.mode) fields.push({ label: "mode", before, after: m });
+      }
+    }
+
+    // tool allow/exclude lists (`/seam tools`). `null`/[] clears the list.
+    const toolListField = (
+      label: string,
+      current: string[] | undefined,
+      change: string[] | null | undefined
+    ): string[] | undefined => {
+      if (change === undefined) return current;
+      const next = change === null ? [] : change.map((t) => t.trim()).filter(Boolean);
+      const norm = (l: string[] | undefined) => (l && l.length ? [...l].sort() : []);
+      const b = norm(current);
+      const a = norm(next);
+      if (b.join(",") !== a.join(",")) {
+        fields.push({
+          label,
+          before: b.length ? b.join(", ") : "(all allowed)",
+          after: a.length ? a.join(", ") : "(all allowed)",
+        });
+      }
+      return next.length ? next : undefined;
+    };
+    if (changes.availableTools !== undefined) {
+      nextCfg.availableTools = toolListField("availableTools", cfg.availableTools, changes.availableTools);
+    }
+    if (changes.excludedTools !== undefined) {
+      nextCfg.excludedTools = toolListField("excludedTools", cfg.excludedTools, changes.excludedTools);
+    }
+
     if (fields.length === 0) {
       return {
         ok: false,
@@ -398,6 +465,9 @@ export class ConfigMutationService {
       changes.agent !== undefined ||
       changes.model !== undefined ||
       changes.cwd !== undefined ||
+      changes.mode !== undefined ||
+      changes.availableTools !== undefined ||
+      changes.excludedTools !== undefined ||
       (changes.effort !== undefined && "reasoningEffort" in nextCfg) ||
       changes.effort === null;
 
@@ -427,8 +497,18 @@ export class ConfigMutationService {
           correlationId: id,
           actor,
           summary: `session config: ${fields.map((f) => f.label).join(", ")}`,
-          before: this.effectiveSnapshot(before),
-          after: this.effectiveSnapshot(effective),
+          before: {
+            ...this.effectiveSnapshot(before),
+            mode: cfg.mode ?? null,
+            availableTools: cfg.availableTools ?? null,
+            excludedTools: cfg.excludedTools ?? null,
+          },
+          after: {
+            ...this.effectiveSnapshot(effective),
+            mode: nextCfg.mode ?? null,
+            availableTools: nextCfg.availableTools ?? null,
+            excludedTools: nextCfg.excludedTools ?? null,
+          },
         });
         const eff =
           `Applied. Effective now: model ${effective.model.value} (from ${effective.model.source}), ` +
@@ -448,15 +528,15 @@ export class ConfigMutationService {
   ): BuildProposalResult {
     const name = changes.name?.trim();
     if (!name) return { ok: false, error: "`preset.name` is required." };
-    if ("instructions" in (changes as unknown as Record<string, unknown>)) {
-      return {
-        ok: false,
-        error:
-          "`instructions` cannot be set conversationally: presets round-trip it but do " +
-          "NOT inject it into the system prompt yet, so it would change nothing. Refused " +
-          "rather than promise a personality the preset can't deliver.",
-      };
+
+    // Project scope = the calling thread's channel (#21) — never global by
+    // default (a conversationally-created preset lands where it was made).
+    const projectRef = record.parentRef;
+
+    if (changes.action === "delete") {
+      return this.buildPresetDelete(record, name, projectRef);
     }
+
     if (changes.agent !== undefined && !this.deps.profiles.has(changes.agent)) {
       return { ok: false, error: `Unknown agent "${changes.agent}".` };
     }
@@ -464,9 +544,6 @@ export class ConfigMutationService {
       return { ok: false, error: `Invalid permission "${changes.permission}".` };
     }
 
-    // Project scope = the calling thread's channel (#21) — never global by
-    // default (a conversationally-created preset lands where it was made).
-    const projectRef = record.parentRef;
     const existing = this.deps.store.getPresetByNameScoped(name, projectRef);
     const warnings: string[] = [];
     const fields: ProposedField[] = [];
@@ -486,6 +563,31 @@ export class ConfigMutationService {
           ? changes.description
           : (existing?.description ?? null);
     const nextPermission = changes.permission ?? existing?.permission ?? null;
+    const nextRepoPath =
+      changes.repoPath === null
+        ? null
+        : changes.repoPath !== undefined
+          ? (changes.repoPath.trim() ? path.resolve(changes.repoPath.trim()) : null)
+          : (existing?.repoPath ?? null);
+    // Tool lists: `null`/[] clears; otherwise trim + drop blanks. `undefined`
+    // leaves the existing list untouched.
+    const resolveToolList = (
+      change: string[] | null | undefined,
+      prev: string[] | null
+    ): string[] | null => {
+      if (change === undefined) return prev;
+      if (change === null) return null;
+      const cleaned = change.map((t) => t.trim()).filter(Boolean);
+      return cleaned.length ? cleaned : null;
+    };
+    const nextToolsAllow = resolveToolList(changes.toolsAllow, existing?.toolsAllow ?? null);
+    const nextToolsExclude = resolveToolList(changes.toolsExclude, existing?.toolsExclude ?? null);
+    const nextInstructions =
+      changes.instructions === null
+        ? null
+        : changes.instructions !== undefined
+          ? (changes.instructions.trim() || null)
+          : (existing?.instructions ?? null);
 
     if (nextEffort) {
       const profile = nextAgentId ? this.deps.profiles.get(nextAgentId) : undefined;
@@ -505,11 +607,24 @@ export class ConfigMutationService {
         fields.push({ label, before: b ?? "(unset)", after: a ?? "(unset)" });
       }
     };
+    const listStr = (l: string[] | null) => (l && l.length ? l.join(", ") : null);
     field("agent", existing?.agentId ?? null, nextAgentId);
     field("model", existing?.model ?? null, nextModel);
     field("effort", existing?.effort ?? null, nextEffort);
     field("permission", existing?.permission ?? null, nextPermission);
     field("description", existing?.description ?? null, nextDescription);
+    field("repoPath", existing?.repoPath ?? null, nextRepoPath);
+    field("toolsAllow", listStr(existing?.toolsAllow ?? null), listStr(nextToolsAllow));
+    field("toolsExclude", listStr(existing?.toolsExclude ?? null), listStr(nextToolsExclude));
+    // instructions can be long/multiline — compare the FULL value so a change past
+    // the clip point isn't hidden, but show only a clipped one-liner in the diff.
+    if ((existing?.instructions ?? null) !== nextInstructions) {
+      fields.push({
+        label: "instructions",
+        before: existing?.instructions ? clip(existing.instructions, 200) : "(unset)",
+        after: nextInstructions ? clip(nextInstructions, 200) : "(unset)",
+      });
+    }
 
     if (fields.length === 0) {
       return { ok: false, error: `Preset "${name}" already matches — nothing to change.` };
@@ -535,11 +650,11 @@ export class ConfigMutationService {
           agentId: nextAgentId,
           model: nextModel,
           effort: nextEffort,
-          repoPath: existing?.repoPath ?? null,
+          repoPath: nextRepoPath,
           permission: nextPermission,
-          toolsAllow: existing?.toolsAllow ?? null,
-          toolsExclude: existing?.toolsExclude ?? null,
-          instructions: existing?.instructions ?? null,
+          toolsAllow: nextToolsAllow,
+          toolsExclude: nextToolsExclude,
+          instructions: nextInstructions,
           createdBy: existing?.createdBy ?? (actor.id ?? "seam-mcp"),
           createdUtc: existing?.createdUtc ?? now,
           updatedUtc: now,
@@ -559,6 +674,64 @@ export class ConfigMutationService {
           message:
             `Preset "${name}" ${existing ? "updated" : "created"} in ${scopeLabel}. ` +
             `It is now usable as a handoff target in this thread.`,
+          auditId: audit.id,
+        };
+      },
+    };
+    return { ok: true, proposal };
+  }
+
+  /**
+   * Delete a project-scoped preset (#72). Self-scoped like create/update: the
+   * target is resolved by (name, caller's projectRef) — a caller can only ever
+   * remove a preset in its own project, and an unknown name is refused rather
+   * than silently succeeding. Destructive, so it reuses the IDENTICAL confirm-
+   * card + audit path as every other mutation, and records the FULL removed
+   * object in `before_json` so it is recoverable from the audit trail.
+   */
+  private buildPresetDelete(
+    record: SessionRecord,
+    name: string,
+    projectRef: string | null
+  ): BuildProposalResult {
+    const existing = this.deps.store.getPresetByNameScoped(name, projectRef);
+    const scopeLabel = projectRef ? `project ${projectRef}` : "global";
+    if (!existing) {
+      return {
+        ok: false,
+        error: `No preset "${name}" in ${scopeLabel}. List presets with config_describe.`,
+      };
+    }
+    const id = randomUUID();
+    const proposal: ConfigProposal = {
+      id,
+      tier: "preset",
+      scope: record.channelRef,
+      title: `Delete preset "${name}" (${scopeLabel})`,
+      fields: [
+        { label: "name", before: existing.name, after: "(deleted)" },
+        { label: "agent", before: existing.agentId ?? "(unset)", after: "(deleted)" },
+        { label: "model", before: existing.model ?? "(unset)", after: "(deleted)" },
+      ],
+      warnings: [
+        "Deleting a preset is permanent — any handoff that names it will fail until it is recreated.",
+      ],
+      restartsSession: false,
+      apply: (actor) => {
+        this.deps.store.deletePreset(existing.id);
+        const audit = this.writeAudit({
+          tier: "preset",
+          scope: record.channelRef,
+          correlationId: id,
+          actor,
+          summary: `delete preset "${name}" (${scopeLabel})`,
+          // Full removed object so the deletion is recoverable from the ledger.
+          before: this.presetSnapshot(existing),
+          after: { preset: null },
+        });
+        return {
+          ok: true,
+          message: `Preset "${name}" deleted from ${scopeLabel}. Its definition is preserved in the audit trail.`,
           auditId: audit.id,
         };
       },
@@ -1254,7 +1427,10 @@ export class ConfigMutationService {
   }
 
   private presetSnapshot(p: Preset): Record<string, unknown> {
+    // Full object — a preset delete records this in before_json, so it must carry
+    // every field needed to reconstruct the removed preset from the audit trail.
     return {
+      id: p.id,
       name: p.name,
       projectRef: p.projectRef ?? null,
       agentId: p.agentId,
@@ -1262,6 +1438,10 @@ export class ConfigMutationService {
       effort: p.effort,
       permission: p.permission,
       description: p.description,
+      repoPath: p.repoPath,
+      toolsAllow: p.toolsAllow,
+      toolsExclude: p.toolsExclude,
+      instructions: p.instructions,
     };
   }
 

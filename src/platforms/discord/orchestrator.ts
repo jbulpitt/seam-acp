@@ -144,6 +144,7 @@ import {
 } from "../../core/inject-turn.js";
 import {
   applyWatchFeedback,
+  applyPresetIdentity,
   buildChainHopSpec,
   dispatchDirs,
   enqueueDispatchSpec,
@@ -3387,9 +3388,7 @@ export class Orchestrator {
     // prepend so it is the last thing the worker reads. Opt-in — without the flag
     // the prompt is untouched (applyWatchFeedback returns it verbatim).
     const effectivePrompt = applyWatchFeedback(
-      preset?.instructions
-        ? `<seam-worker-identity name="${preset.name}">\n${preset.instructions}\n</seam-worker-identity>\n\n${spec.prompt}`
-        : spec.prompt,
+      applyPresetIdentity(spec.prompt, preset),
       spec.watchFeedback
     );
 
@@ -9661,7 +9660,7 @@ export class Orchestrator {
             new ActionRowBuilder<TextInputBuilder>().addComponents(
               new TextInputBuilder()
                 .setCustomId("instr")
-                .setLabel("Instructions (not yet injected)")
+                .setLabel("Instructions (worker identity)")
                 .setStyle(TextInputStyle.Paragraph)
                 .setMaxLength(4000)
                 .setValue(state.instructions ?? "")
@@ -9868,7 +9867,8 @@ export class Orchestrator {
 
     if (preset.instructions) {
       notes.push(
-        "ℹ️ Instructions are stored on the preset but not yet injected into the agent's prompt."
+        "ℹ️ Instructions are injected as the worker's `<seam-worker-identity>` when this preset " +
+          "runs as a handoff/dispatch worker."
       );
     }
 

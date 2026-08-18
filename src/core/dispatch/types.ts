@@ -175,6 +175,22 @@ export function applyWatchFeedback(prompt: string, watchFeedback?: boolean): str
   return `${prompt}\n\n${WATCH_FEEDBACK_INSTRUCTION}`;
 }
 
+/** Prepend a preset worker's identity to its cold-start prompt (#23/#72). When a
+ *  preset runs as a stateless handoff/dispatch worker it has no session history,
+ *  so its `instructions` ARE its personality — they are injected here as a
+ *  `<seam-worker-identity name="…">…</seam-worker-identity>` block ahead of the
+ *  task prompt. No instructions ⇒ the prompt is returned verbatim. Kept as a pure
+ *  function (one place) so the exact injection is unit-testable end-to-end, and
+ *  `dispatchInjectTurn` composes it with `applyWatchFeedback` (identity first,
+ *  polling instruction last). */
+export function applyPresetIdentity(
+  prompt: string,
+  preset?: { name: string; instructions: string | null } | null
+): string {
+  if (!preset?.instructions) return prompt;
+  return `<seam-worker-identity name="${preset.name}">\n${preset.instructions}\n</seam-worker-identity>\n\n${prompt}`;
+}
+
 /** A Discord snowflake is a long run of digits; a preset is a human name. Used
  *  to decide whether a chain hop names a thread (stateful, run live in it) or a
  *  preset (stateless specialist, run isolated with output posted to `originRef`

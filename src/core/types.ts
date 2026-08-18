@@ -79,7 +79,10 @@ export interface Preset {
   permission: PermissionPolicyMode | null;
   toolsAllow: string[] | null;
   toolsExclude: string[] | null;
-  /** Stored and round-tripped, but not yet injected into the system prompt. */
+  /** The preset worker's identity/personality. Injected at run time: the
+   *  orchestrator prepends it as a `<seam-worker-identity name="…">…</seam-worker-identity>`
+   *  block when the preset runs as a handoff/dispatch worker (#23), so a stateless
+   *  preset worker cold-starts with this identity. */
   instructions: string | null;
   createdBy: string;
   createdUtc: string;

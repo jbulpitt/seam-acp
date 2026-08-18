@@ -43,7 +43,7 @@ import type {
 } from "./types.js";
 
 /** Config surface a single proposal touches. */
-export type ConfigMutationTier = "session" | "preset" | "channel-preset";
+export type ConfigMutationTier = "session" | "preset" | "channel-preset" | "thread-preset";
 
 /** Tier A — the calling thread's own session config. */
 export interface SessionConfigChanges {
@@ -80,12 +80,29 @@ export interface ChannelPresetChanges {
   rider?: string | null;
 }
 
+/** Tier C — the calling thread's OWN thread preset (channel-presets.json
+ *  `threads` map, keyed on the caller's own thread id). Same fields as the
+ *  channel branch; a `null` value removes that field. A thread preset OVERRIDES
+ *  the channel preset per-field, so it is the right scope for a per-thread rider
+ *  (#68): a channel-wide rider would leak across every sibling thread. `locked`
+ *  is deliberately absent — it exists only on channel entries and can never be
+ *  changed through any tool; cross-thread edits are structurally impossible
+ *  because the target is always the caller's own thread (record.channelRef). */
+export interface ThreadPresetChanges {
+  agent?: string | null;
+  model?: string | null;
+  cwd?: string | null;
+  effort?: string | null;
+  rider?: string | null;
+}
+
 /** A single `config_propose` request. Exactly one tier per call (D8: intent-
  *  shaped, not a table-mapped CRUD surface). */
 export interface ConfigMutationInput {
   session?: SessionConfigChanges;
   preset?: PresetChanges;
   channelPreset?: ChannelPresetChanges;
+  threadPreset?: ThreadPresetChanges;
 }
 
 /** Who authorized the change — the human who clicked confirm. The click carries
@@ -175,13 +192,14 @@ export class ConfigMutationService {
       input.session ? "session" : null,
       input.preset ? "preset" : null,
       input.channelPreset ? "channel-preset" : null,
+      input.threadPreset ? "thread-preset" : null,
     ].filter((t): t is ConfigMutationTier => t !== null);
 
     if (tiers.length === 0) {
       return {
         ok: false,
         error:
-          "Nothing to change. Provide exactly one of `session`, `preset`, or `channelPreset`.",
+          "Nothing to change. Provide exactly one of `session`, `preset`, `channelPreset`, or `threadPreset`.",
       };
     }
     if (tiers.length > 1) {
@@ -189,13 +207,14 @@ export class ConfigMutationService {
         ok: false,
         error:
           "One change at a time. A proposal must touch exactly one of `session`, " +
-          "`preset`, or `channelPreset` so the confirmation is unambiguous.",
+          "`preset`, `channelPreset`, or `threadPreset` so the confirmation is unambiguous.",
       };
     }
 
     const tier = tiers[0];
     if (tier === "session") return this.buildSessionProposal(record, input.session!);
     if (tier === "preset") return this.buildPresetProposal(record, input.preset!);
+    if (tier === "thread-preset") return this.buildThreadPresetProposal(record, input.threadPreset!);
     return this.buildChannelPresetProposal(record, input.channelPreset!);
   }
 
@@ -628,6 +647,181 @@ export class ConfigMutationService {
           message:
             `Channel preset for ${channelId} updated and hot-reloaded — it takes effect on the ` +
             `next turn in every thread under this channel. The lock was left unchanged.`,
+          auditId: audit.id,
+        };
+      },
+    };
+    return { ok: true, proposal };
+  }
+
+  // --- Tier C: thread preset (channel-presets.json `threads`) --------------
+
+  /**
+   * #68: edit the CALLER'S OWN thread-level preset in the `threads` map of
+   * channel-presets.json. Structurally a sibling of the channel branch — same
+   * fields, same guardrails (flag gate, PresetsFileSchema round-trip, atomic
+   * temp+rename, hot-reload, one audit row) — but the target is ALWAYS the
+   * caller's own thread id (record.channelRef), so a cross-thread edit is
+   * impossible by construction, exactly like the channel branch's parent scope.
+   *
+   * Two deliberate divergences from the channel branch:
+   *  - `locked` lives ONLY on channel entries. A thread entry has no lock, so
+   *    the channel branch's preserve-lock line is NOT carried over here, and a
+   *    caller-supplied `locked` is refused (belt-and-suspenders, same as D2/P3).
+   *  - A thread preset OVERRIDES the channel preset per-field (resolveChannelPreset
+   *    picks thread ?? channel), so any field that shadows a channel value emits a
+   *    Trap-1 warning: the write persists, but the effective source is this layer.
+   */
+  private buildThreadPresetProposal(
+    record: SessionRecord,
+    changes: ThreadPresetChanges
+  ): BuildProposalResult {
+    if (!this.deps.tierCEnabled) {
+      return {
+        ok: false,
+        error:
+          "Thread-preset editing is disabled on this deployment " +
+          "(SEAM_CONFIG_MUTATION_TIER_C_ENABLED is off). Session config and presets are still available.",
+      };
+    }
+    const file = this.deps.presetsFile;
+    if (!file) {
+      return {
+        ok: false,
+        error: "No CHANNEL_PRESETS_FILE is configured, so there is no presets file to edit.",
+      };
+    }
+    // D3 + P3: the target is ALWAYS the caller's own thread. There is no
+    // thread-id parameter, so a cross-thread edit is structurally impossible.
+    const threadId = record.channelRef;
+    if (!threadId) {
+      return {
+        ok: false,
+        error: "This session has no thread id to scope a thread preset to.",
+      };
+    }
+    // D2/P3 belt-and-suspenders: `locked` exists only on channel entries and can
+    // never be set through any tool — refuse it here rather than silently drop it.
+    if ("locked" in (changes as unknown as Record<string, unknown>)) {
+      return {
+        ok: false,
+        error:
+          "The `locked` flag exists only on channels and cannot be set on a thread preset " +
+          "(or changed through any tool) — unlocking is a deliberate out-of-band act.",
+      };
+    }
+
+    // Read the current file as raw JSON so we preserve every OTHER thread, the
+    // channel entries, and every channel's `locked` value byte-for-byte.
+    let raw: unknown;
+    try {
+      raw = JSON.parse(fs.readFileSync(path.resolve(file), "utf8"));
+    } catch (err) {
+      // A missing/empty file is fine — start from an empty document.
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") raw = {};
+      else return { ok: false, error: `Could not read channel-presets file: ${(err as Error).message}` };
+    }
+    const doc = (raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}) as {
+      channels?: Record<string, Record<string, unknown>>;
+      threads?: Record<string, Record<string, unknown>>;
+    };
+    const threads = { ...(doc.threads ?? {}) };
+    const current = { ...(threads[threadId] ?? {}) };
+    // The parent channel's entry, used ONLY to detect Trap-1 shadowing below.
+    const channelEntry = record.parentRef ? doc.channels?.[record.parentRef] : undefined;
+
+    const keys: Array<keyof ThreadPresetChanges> = ["agent", "model", "cwd", "effort", "rider"];
+    const fields: ProposedField[] = [];
+    const warnings: string[] = [];
+    const next: Record<string, unknown> = { ...current };
+    for (const key of keys) {
+      const val = changes[key];
+      if (val === undefined) continue; // field not part of this proposal
+      const beforeVal = (current[key] as { value?: string } | undefined)?.value ?? null;
+      if (val === null || val === "") {
+        delete next[key];
+        if (beforeVal !== null) fields.push({ label: key, before: beforeVal, after: "(removed)" });
+      } else {
+        const resolved = key === "cwd" ? path.resolve(val) : val;
+        next[key] = { value: resolved };
+        if (beforeVal !== resolved) {
+          fields.push({ label: key, before: beforeVal ?? "(unset)", after: resolved });
+          // Trap 1: a thread field shadows the channel value for that field.
+          const chanVal = (channelEntry?.[key] as { value?: string } | undefined)?.value;
+          if (chanVal !== undefined && key !== "rider") {
+            warnings.push(
+              `${key} is also set by the channel preset ("${chanVal}") — the thread preset ` +
+                `overrides it, so this thread's effective ${key} will be "${resolved}" while ` +
+                `sibling threads keep the channel value.`
+            );
+          } else if (chanVal !== undefined && key === "rider") {
+            warnings.push(
+              `the channel preset also sets a rider — thread and channel riders STACK ` +
+                `(channel first, then this thread's), they do not override.`
+            );
+          }
+        }
+      }
+    }
+    // NB: no preserve-lock line here — thread entries carry no `locked` field.
+
+    if (fields.length === 0) {
+      return { ok: false, error: "No effective change to this thread's preset." };
+    }
+
+    threads[threadId] = next;
+    const candidate = { ...doc, threads };
+
+    // D7: the candidate MUST pass the exact boot schema or we refuse — an invalid
+    // channel-presets.json throws at startup and would fail the next boot.
+    const parsed = PresetsFileSchema.safeParse(candidate);
+    if (!parsed.success) {
+      const issues = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+        .join("; ");
+      return {
+        ok: false,
+        error: `Refused: the resulting channel-presets.json would be invalid (${issues}). Nothing written.`,
+      };
+    }
+
+    const id = randomUUID();
+    const proposal: ConfigProposal = {
+      id,
+      tier: "thread-preset",
+      scope: threadId,
+      title: `Thread preset for this thread (${threadId})`,
+      fields,
+      warnings,
+      restartsSession: true,
+      apply: (actor) => {
+        // Serialize the FULL candidate document and swap atomically (temp+rename),
+        // then hot-reload the live maps (P0) so it takes effect with no redeploy.
+        const abs = path.resolve(file);
+        const tmp = `${abs}.tmp-${id.slice(0, 8)}`;
+        fs.writeFileSync(tmp, `${JSON.stringify(candidate, null, 2)}\n`, "utf8");
+        fs.renameSync(tmp, abs);
+        const reload = this.deps.reloadPresets();
+        if (!reload.ok) {
+          // The written file passed PresetsFileSchema above, so a reload failure
+          // here is unexpected; log loudly. The file is written but the live map
+          // keeps the previous good config (P0 guarantees no half-applied map).
+          this.logger.error({ err: reload.error, file: abs }, "Tier-C reload failed after write");
+        }
+        const audit = this.writeAudit({
+          tier: "thread-preset",
+          scope: threadId,
+          correlationId: id,
+          actor,
+          summary: `thread ${threadId} preset: ${fields.map((f) => f.label).join(", ")}`,
+          before: { thread: current },
+          after: { thread: next },
+        });
+        return {
+          ok: true,
+          message:
+            `Thread preset for ${threadId} updated and hot-reloaded — it takes effect on the ` +
+            `next turn in THIS thread only. Sibling threads and the channel preset are unchanged.`,
           auditId: audit.id,
         };
       },

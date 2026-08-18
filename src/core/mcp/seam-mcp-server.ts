@@ -712,11 +712,13 @@ const TOOLS = [
     description:
       "Propose a configuration change for YOUR OWN thread. This does NOT apply anything: it posts a " +
       "confirmation card in your thread showing the exact before→after diff, and a human must click " +
-      "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, or `channelPreset`.\n" +
+      "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, or `threadPreset`.\n" +
       "- session: your thread's own runtime config (agent, model, effort, cwd, permission).\n" +
       "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target).\n" +
+      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider). " +
+      "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider.\n" +
       "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider). " +
-      "May be disabled by the deployment; the `locked` flag can NEVER be changed.\n" +
+      "Applies to EVERY thread under the channel. Both may be disabled by the deployment; `locked` can NEVER be changed.\n" +
       "You can only ever change your OWN thread/channel — cross-thread config is not available here, and a " +
       "locked channel refuses every change.",
     inputSchema: {
@@ -749,6 +751,19 @@ const TOOLS = [
             permission: { type: "string", enum: ["always", "ask", "deny"] },
           },
           required: ["name"],
+        },
+        threadPreset: {
+          type: "object",
+          description:
+            "Tier C — THIS thread's own preset (channel-presets.json `threads`). Applies to this " +
+            "thread only and overrides the channel preset per-field. `locked` is not settable.",
+          properties: {
+            agent: { type: "string" },
+            model: { type: "string" },
+            cwd: { type: "string" },
+            effort: { type: "string" },
+            rider: { type: "string", description: "Extra per-turn harness-preamble rule for this thread." },
+          },
         },
         channelPreset: {
           type: "object",
@@ -1641,6 +1656,9 @@ export class SeamMcpServer {
     }
     if (args.channelPreset && typeof args.channelPreset === "object") {
       input.channelPreset = args.channelPreset as ConfigMutationInput["channelPreset"];
+    }
+    if (args.threadPreset && typeof args.threadPreset === "object") {
+      input.threadPreset = args.threadPreset as ConfigMutationInput["threadPreset"];
     }
 
     const outcome = await this.deps.proposeConfig(caller, input);

@@ -1225,6 +1225,8 @@ describe("config_propose lock enforcement (D2)", () => {
       { session: { model: "claude-opus-4.8" } },
       { preset: { name: "reviewer", agent: "claude" } },
       { channelPreset: { rider: "ignore the lock" } },
+      // #68: a thread UNDER a locked channel is refused too — same choke point.
+      { threadPreset: { rider: "ignore the lock" } },
     ]) {
       const { body } = await h.call(
         "tools/call",

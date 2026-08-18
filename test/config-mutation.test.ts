@@ -286,3 +286,144 @@ describe("channel-preset mutation (Tier C)", () => {
     expect(built.error).toContain("no parent channel");
   });
 });
+
+// -------------------------------------------------------------------------
+// Tier C — thread-level presets (#68): the `threads` map, keyed on the
+// caller's OWN thread id. Same guardrails as the channel branch (flag, D7
+// schema round-trip, atomic write, hot-reload, one audit row), but a thread
+// preset overrides the channel preset and never touches `locked`.
+// -------------------------------------------------------------------------
+
+describe("thread-preset mutation (Tier C, #68)", () => {
+  function writePresetsFile(doc: unknown): string {
+    const file = path.join(dir, "channel-presets.json");
+    fs.writeFileSync(file, JSON.stringify(doc, null, 2));
+    return file;
+  }
+
+  // channel-presets keys must be numeric Discord ids (PresetsFileSchema).
+  const CHAN = "111111111111111111";
+  const THREAD = "333333333333333333";
+  const SIBLING = "444444444444444444";
+
+  it("is refused when the Tier-C flag is off", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({ threads: {} });
+    const built = makeService({ presetsFile: file, tierCEnabled: false }).buildProposal(record, {
+      threadPreset: { rider: "read-only" },
+    });
+    expect(built.ok).toBe(false);
+    if (built.ok) return;
+    expect(built.error).toContain("disabled");
+  });
+
+  it("edits ONLY the caller's own thread; channel + sibling threads stay byte-identical (D3/D7)", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({
+      channels: { [CHAN]: { model: { value: "chan-model" }, locked: false } },
+      threads: {
+        [THREAD]: { model: { value: "old-thread-model" } },
+        [SIBLING]: { rider: { value: "sibling rider — must not move" } },
+      },
+    });
+    const before = fs.readFileSync(file, "utf8");
+    const live = { channelPresets: new Map<string, ChannelPreset>(), threadPresets: new Map<string, ThreadPreset>() };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: true,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+
+    const built = svc.buildProposal(record, { threadPreset: { rider: "this student only" } });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.proposal.tier).toBe("thread-preset");
+    expect(built.proposal.scope).toBe(THREAD);
+
+    // Side-effect free until apply (D5): the file is unchanged after buildProposal.
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+
+    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(PresetsFileSchema.safeParse(raw).success).toBe(true);
+    // The caller's own thread got the new rider...
+    expect(raw.threads[THREAD].rider.value).toBe("this student only");
+    expect(raw.threads[THREAD].model.value).toBe("old-thread-model"); // untouched field preserved
+    // ...and NOTHING else moved: channel entry and the sibling thread are identical.
+    expect(raw.channels[CHAN]).toEqual({ model: { value: "chan-model" }, locked: false });
+    expect(raw.threads[SIBLING]).toEqual({ rider: { value: "sibling rider — must not move" } });
+
+    // Hot-reload observed the swap; the live thread map won.
+    expect(live.threadPresets.get(THREAD)?.rider?.value).toBe("this student only");
+    expect(live.channelPresets.get(CHAN)?.model?.value).toBe("chan-model");
+
+    expect(store.listConfigMutations()[0]).toMatchObject({ tier: "thread-preset", scope: THREAD });
+  });
+
+  it("warns when a thread field shadows a channel value (Trap 1)", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({
+      channels: { [CHAN]: { model: { value: "chan-model" } } },
+      threads: {},
+    });
+    const built = makeService({ presetsFile: file, tierCEnabled: true }).buildProposal(record, {
+      threadPreset: { model: "thread-model" },
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.proposal.warnings.join(" ")).toMatch(/overrides it|thread preset/i);
+    expect(built.proposal.warnings.join(" ")).toContain("chan-model");
+  });
+
+  it("never lets the `locked` flag be set on a thread preset (D2/P3)", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({ threads: { [THREAD]: { model: { value: "m" } } } });
+    const built = makeService({ presetsFile: file, tierCEnabled: true }).buildProposal(record, {
+      threadPreset: { locked: false } as never,
+    });
+    expect(built.ok).toBe(false);
+    if (built.ok) return;
+    expect(built.error.toLowerCase()).toContain("locked");
+  });
+
+  it("refuses an invalid candidate BEFORE any file write (D7)", () => {
+    // A non-numeric thread id makes the `threads` key fail PresetsFileSchema; the
+    // proposal must be refused and the on-disk file left byte-for-byte unchanged.
+    const record = makeRecord({ channelRef: "not-a-numeric-id", parentRef: CHAN });
+    const file = writePresetsFile({ threads: {} });
+    const before = fs.readFileSync(file, "utf8");
+    const built = makeService({ presetsFile: file, tierCEnabled: true }).buildProposal(record, {
+      threadPreset: { model: "m" },
+    });
+    expect(built.ok).toBe(false);
+    if (built.ok) return;
+    expect(built.error).toContain("invalid");
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+  });
+
+  it("removing a field with null drops it and reports (removed)", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({ threads: { [THREAD]: { rider: { value: "gone soon" } } } });
+    const built = makeService({ presetsFile: file, tierCEnabled: true }).buildProposal(record, {
+      threadPreset: { rider: null },
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.proposal.fields).toEqual([{ label: "rider", before: "gone soon", after: "(removed)" }]);
+    built.proposal.apply({ id: "u", name: "U" });
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.threads[THREAD]?.rider).toBeUndefined();
+  });
+
+  it("refuses when there is no effective change", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({ threads: { [THREAD]: { model: { value: "same" } } } });
+    const built = makeService({ presetsFile: file, tierCEnabled: true }).buildProposal(record, {
+      threadPreset: { model: "same" },
+    });
+    expect(built.ok).toBe(false);
+    if (built.ok) return;
+    expect(built.error).toContain("No effective change");
+  });
+});

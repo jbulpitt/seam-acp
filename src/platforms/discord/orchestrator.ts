@@ -64,7 +64,27 @@ import {
   formatWorkflowsView,
   clampFieldValue,
   formatAnomalyLines,
+  formatInterruptedLines,
+  type InterruptedTurnRow,
 } from "./workflows-view.js";
+import { DispatchWatcher } from "../../core/dispatch/watcher.js";
+import {
+  CONTINUE_PROMPT,
+  RESUME_ANNOUNCE,
+  TURN_RESUME_CONCURRENCY,
+  TURN_RESUME_MAX_AGE_SECONDS,
+  TURN_RESUME_STAGGER_MS,
+  abandonedNotice,
+  createResumeScheduler,
+  decideResume,
+  finishLiveTurn,
+  listAbandonedLiveTurns,
+  listLiveMarkers,
+  patchLiveMarker,
+  writeLiveMarker,
+  type LiveTurnMarker,
+  type ResumePrecondition,
+} from "../../core/dispatch/turn-resume.js";
 import {
   formatConfigAuditView,
   formatConfigAuditDetail,
@@ -256,6 +276,20 @@ export class Orchestrator {
    *  leaks into a later dispatched/scheduled turn. The config_propose lock gate
    *  reads this (via `currentSpeaker`) — the id, never a display name. */
   private readonly currentSpeakerIds = new Map<string, string>();
+  /** Set by index.ts after construction so command-layer cancel can finalize
+   *  running/pending specs without going through dispose(). */
+  private dispatchWatcher?: DispatchWatcher;
+  /** channelRef → in-flight live-turn marker id. Command-layer cancel uses
+   *  this to find the marker; dispose()/onDead must not. */
+  private readonly liveTurnByChannel = new Map<string, string>();
+  /** Stash a marker so a live-turn re-fire reuses it instead of writing a
+   *  second one (which would double-resume on the next crash). */
+  private readonly pendingLiveResume = new Map<string, LiveTurnMarker>();
+  /** Shared start-gate so N resumes stagger instead of firing at once. */
+  private readonly resumeScheduler = createResumeScheduler({
+    concurrency: TURN_RESUME_CONCURRENCY,
+    staggerMs: TURN_RESUME_STAGGER_MS,
+  });
 
   constructor(opts: {
     logger: Logger;
@@ -534,6 +568,10 @@ export class Orchestrator {
         cwd: this.config.REPOS_ROOT,
       });
       this.logger.info({ channelId, sessionId: record.id }, "new message arrived while turn active; aborting running turn");
+      // User intent: the new message replaces the running turn. Clear the
+      // marker at this layer (NOT dispose) so a crash mid-abort does not
+      // resume the turn the user just superseded.
+      await this.clearTurnMarkersForChannel(channelId, "cancelled");
       // Escalate to a force-kill if the turn ignores the graceful cancel, so a
       // hung turn can't block the new message behind it forever.
       await this.router.abortTurn(record.id, { force: true });
@@ -612,6 +650,29 @@ export class Orchestrator {
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
+
+    // #76: live-turn marker — written at START, removed at terminal state
+    // (this finally, or the command layer). Markers are written even when
+    // SEAM_TURN_RESUME_ENABLED is off (inventory + truthful ledger). Dispose
+    // / onDead / SIGTERM must NOT clear them.
+    const reuseMarker = this.pendingLiveResume.get(channel.id);
+    this.pendingLiveResume.delete(channel.id);
+    const liveMarkerId = reuseMarker?.id ?? `live-${randomUUID()}`;
+    if (!reuseMarker) {
+      await writeLiveMarker(this.config.DATA_DIR, {
+        id: liveMarkerId,
+        kind: "live",
+        channelRef: channel.id,
+        ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+        sessionRecordId: record.id,
+        ...(record.acpSessionId ? { acpSessionId: record.acpSessionId } : {}),
+        ...(msg.authorId ? { authorId: msg.authorId } : {}),
+        startedUtc: new Date().toISOString(),
+      }).catch((err) =>
+        this.logger.warn({ err, channel: channel.id }, "live-turn marker write failed")
+      );
+    }
+    this.liveTurnByChannel.set(channel.id, liveMarkerId);
 
     // A new turn owns this session's status card now — cancel any lingering
     // "settle back to Monitoring" timer left by the previous turn's background
@@ -916,6 +977,11 @@ export class Orchestrator {
 
     try {
       let activeRuntime = await this.router.getOrStartRuntime(record);
+      if (record.acpSessionId) {
+        await patchLiveMarker(this.config.DATA_DIR, liveMarkerId, {
+          acpSessionId: record.acpSessionId,
+        }).catch(() => {});
+      }
       const eventHandler = async (event: Parameters<Parameters<typeof activeRuntime.onEvent>[0]>[0]) => {
         // Note the agent launching a Monitor so the turn rests at "Monitoring"
         // rather than "Done" even before any woken activity arrives. Anchored to
@@ -1607,6 +1673,19 @@ export class Orchestrator {
       // config_propose on a later dispatched/scheduled turn (no human speaker).
       this.currentSpeakerIds.delete(record.channelRef);
       await refresh(true);
+      // #76: write the terminal state BEFORE removing the marker (writeDone
+      // ordering). Skip if the command layer already finalized it as cancelled.
+      if (this.liveTurnByChannel.get(channel.id) === liveMarkerId) {
+        this.liveTurnByChannel.delete(channel.id);
+      }
+      await finishLiveTurn(this.config.DATA_DIR, {
+        id: liveMarkerId,
+        status: "completed",
+        channelRef: channel.id,
+        finishedUtc: new Date().toISOString(),
+      }).catch((err) =>
+        this.logger.warn({ err, id: liveMarkerId }, "live-turn marker finish failed")
+      );
     }
   }
 
@@ -2093,12 +2172,23 @@ export class Orchestrator {
       try {
         rt = new AgentRuntime({ profile, logger, mcpServers: [] });
         await rt.start();
-        const info = await rt.newSession({
-          cwd,
-          ...(opts.model ? { model: opts.model } : {}),
-          ...(opts.effort ? { effort: opts.effort } : {}),
-        });
-        sessionId = info.sessionId;
+        if (opts.resumeSessionId) {
+          // #76: resume against the recorded session, never newSession().
+          await rt.loadSession({
+            sessionId: opts.resumeSessionId,
+            cwd,
+            ...(opts.model ? { model: opts.model } : {}),
+            ...(opts.effort ? { effort: opts.effort } : {}),
+          });
+          sessionId = opts.resumeSessionId;
+        } else {
+          const info = await rt.newSession({
+            cwd,
+            ...(opts.model ? { model: opts.model } : {}),
+            ...(opts.effort ? { effort: opts.effort } : {}),
+          });
+          sessionId = info.sessionId;
+        }
         // Persist the id BEFORE prompt() so a crash mid-turn is still
         // recoverable. Dispatch writes this onto the ledger at `running`.
         if (sessionId) {
@@ -2610,6 +2700,11 @@ export class Orchestrator {
    * which is what the self-scoped MCP path wants. Throws with a readable message
    * when the target has no compactable session/manager, mirroring the pipeline's
    * own "needs a raw-history reader" refusal so a caller learns why it can't run.
+   *
+   * #76 NON-GOAL: premium-compaction (and other in-memory multi-stage
+   * orchestrator work) is neither a dispatch-backed turn nor a live human
+   * turn. A restart kills it mid-pipeline and it stays dead — no marker,
+   * no resume. Named so that is a decision, not an oversight.
    */
   async compactThread(
     record: SessionRecord,
@@ -2691,6 +2786,10 @@ export class Orchestrator {
       reportMarkdown: this.formatPremiumReport(result, sessionId),
       stats: result.stats,
     };
+  }
+
+  setDispatchWatcher(watcher: DispatchWatcher): void {
+    this.dispatchWatcher = watcher;
   }
 
   setScheduledManager(m: ScheduledPromptManager): void {
@@ -3515,14 +3614,39 @@ export class Orchestrator {
     }
     const presetProfile = preset?.agentId ? this.router.getProfile(preset.agentId) : undefined;
     const effectiveSession = preset ? "isolated" : spec.session;
+    // #76: a resume is the SAME spec with two substitutions — prompt →
+    // "continue", session acquisition → loadSession(recorded id). Everything
+    // else (returnTo / correlationId / kind / chainId) rides along untouched
+    // so report-back and chain succession come free on completion.
+    const isResume = spec.resume === true;
+    const ledger = isResume ? this.store.getDelegation(spec.id) : null;
+    const resumeSessionId =
+      (ledger?.acpSessionId && ledger.acpSessionId.length > 0
+        ? ledger.acpSessionId
+        : undefined) ??
+      (record.acpSessionId && record.acpSessionId.length > 0 ? record.acpSessionId : undefined);
+    if (isResume && resumeSessionId && !record.acpSessionId) {
+      record.acpSessionId = resumeSessionId;
+    }
     // Handoff feedback channel (#62): when the dispatch opts into watchFeedback,
     // append the standing poll_inbox instruction AFTER any preset-identity
     // prepend so it is the last thing the worker reads. Opt-in — without the flag
     // the prompt is untouched (applyWatchFeedback returns it verbatim).
-    const effectivePrompt = applyWatchFeedback(
-      applyPresetIdentity(spec.prompt, preset),
-      spec.watchFeedback
-    );
+    // Resume: do NOT re-apply identity / watch-feedback — the session already
+    // has that context. Replaying them on "continue" would fight its memory.
+    const effectivePrompt = isResume
+      ? CONTINUE_PROMPT
+      : applyWatchFeedback(
+          applyPresetIdentity(spec.prompt, preset),
+          spec.watchFeedback
+        );
+    if (isResume) {
+      try {
+        await this.adapter.sendMessage?.(target, RESUME_ANNOUNCE);
+      } catch (err) {
+        this.logger.warn({ err, dispatch: spec.id }, "dispatch: resume announce failed");
+      }
+    }
 
     // Ledger: record the dispatch as a handoff (operator-originated, so no
     // source thread). Best-effort — a ledger write must never break a dispatch.
@@ -3710,6 +3834,9 @@ export class Orchestrator {
           ...(preset?.effort ? { effort: preset.effort } : spec.effort ? { effort: spec.effort } : {}),
           ...(preset?.repoPath ? { cwd: preset.repoPath } : spec.cwd ? { cwd: spec.cwd } : {}),
           ...(presetProfile ? { profile: presetProfile } : {}),
+          ...(isResume && resumeSessionId && effectiveSession === "isolated"
+            ? { resumeSessionId }
+            : {}),
           outputTo: target,
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
           timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
@@ -3829,15 +3956,19 @@ export class Orchestrator {
       return { output: result.text, stopReason: result.stopReason ?? "" };
     };
 
+    // #76: resume starts go through the stagger/concurrency gate so a dozen
+    // crash leftovers do not fire simultaneously at boot.
+    const gatedRun = isResume ? () => this.resumeScheduler.run(run) : run;
+
     if (effectiveSession === "live") {
       // Share the thread's persistent session ⇒ must not overlap a user turn.
-      return this.queueOnChannel(spec.target, run);
+      return this.queueOnChannel(spec.target, gatedRun);
     }
     // Isolated: own throwaway runtime, so it cannot collide with the thread's
     // live session and needn't queue. Still counted for the restart drain.
     this.activeTurns++;
     try {
-      return await run();
+      return await gatedRun();
     } finally {
       this.activeTurns--;
     }
@@ -5901,6 +6032,11 @@ export class Orchestrator {
       return;
     }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
+    // #76: clear markers at the COMMAND layer, where user intent is
+    // unambiguous. dispose()/invalidate() MUST leave them intact — SIGTERM
+    // also converges on dispose, and wiping there would make resume a
+    // silent no-op on every graceful reboot.
+    await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
     const outcome = await this.router.abortTurn(record.id, { force: false });
     await i.editReply(
       outcome === "idle" ? "No active turn." :
@@ -5922,6 +6058,9 @@ export class Orchestrator {
       return;
     }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
+    // #76: command-layer clear — see cmdCancel. abortTurn may invalidate →
+    // dispose; markers must already be terminal before that runs.
+    await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
     const outcome = await this.router.abortTurn(record.id, { force: true });
     await i.editReply(
       outcome === "idle" ? "No active turn." :
@@ -5937,12 +6076,375 @@ export class Orchestrator {
    *  killed session resumes cleanly on its next message. */
   private async cmdKill(i: ChatInputCommandInteraction): Promise<void> {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
+    // #76: command-layer clear of EVERY marker (killAll → invalidate →
+    // dispose). Involuntary deaths (onDead, SIGTERM) do not take this path.
+    await this.clearAllTurnMarkers("cancelled");
     const killed = await this.router.killAll();
     await i.editReply(
       killed === 0
         ? "No active sessions to kill."
         : `🔪 Force-killed ${killed} active session(s) — including this thread. Each resumes on its next message.`
     );
+  }
+
+  /**
+   * Command-layer marker clear for one thread. Writes the terminal state
+   * BEFORE removing the live marker / running spec (writeDone ordering).
+   * Must NOT be called from dispose()/invalidate()/onDead.
+   */
+  private async clearTurnMarkersForChannel(
+    channelRef: string,
+    status: "cancelled"
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const liveId = this.liveTurnByChannel.get(channelRef);
+    if (liveId) this.liveTurnByChannel.delete(channelRef);
+    const markers = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    for (const m of markers) {
+      if (m.channelRef !== channelRef && m.id !== liveId) continue;
+      await finishLiveTurn(this.config.DATA_DIR, {
+        id: m.id,
+        status,
+        channelRef: m.channelRef,
+        finishedUtc: now,
+        reason: "cancelled by operator",
+      }).catch((err) =>
+        this.logger.warn({ err, id: m.id }, "live-turn marker cancel failed")
+      );
+    }
+    await this.dispatchWatcher?.cancelRunning({ target: channelRef }).catch((err) =>
+      this.logger.warn({ err, channelRef }, "dispatch cancelRunning failed")
+    );
+  }
+
+  /** `/seam cancel scope:all` — finalize every live marker and running spec. */
+  private async clearAllTurnMarkers(status: "cancelled"): Promise<void> {
+    const now = new Date().toISOString();
+    this.liveTurnByChannel.clear();
+    const markers = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    for (const m of markers) {
+      await finishLiveTurn(this.config.DATA_DIR, {
+        id: m.id,
+        status,
+        channelRef: m.channelRef,
+        finishedUtc: now,
+        reason: "cancelled by operator (scope:all)",
+      }).catch((err) =>
+        this.logger.warn({ err, id: m.id }, "live-turn marker cancel-all failed")
+      );
+    }
+    await this.dispatchWatcher?.cancelRunning().catch((err) =>
+      this.logger.warn({ err }, "dispatch cancelRunning (all) failed")
+    );
+  }
+
+  private async checkResumePreconditions(target: ChannelRef): Promise<ResumePrecondition> {
+    if (typeof this.adapter.getThreadLiveState !== "function") return "ok";
+    try {
+      const state = await this.adapter.getThreadLiveState(target);
+      if (state === undefined) return "deleted";
+      if (state.locked) return "locked";
+      if (state.archived) return "archived";
+      return "ok";
+    } catch {
+      return "unreachable";
+    }
+  }
+
+  private async postResumeNotice(channelRef: string, text: string): Promise<void> {
+    try {
+      await this.adapter.sendMessage?.(
+        { platform: PLATFORM, id: channelRef },
+        text
+      );
+    } catch (err) {
+      this.logger.warn({ err, channelRef }, "resume notice failed");
+    }
+  }
+
+  private async abandonLiveMarker(marker: LiveTurnMarker, reason: string): Promise<void> {
+    const maxAge =
+      this.config.SEAM_TURN_RESUME_MAX_AGE_SECONDS ?? TURN_RESUME_MAX_AGE_SECONDS;
+    await finishLiveTurn(this.config.DATA_DIR, {
+      id: marker.id,
+      status: "abandoned",
+      channelRef: marker.channelRef,
+      finishedUtc: new Date().toISOString(),
+      reason,
+    });
+    if (reason !== "thread deleted") {
+      await this.postResumeNotice(marker.channelRef, abandonedNotice(reason, maxAge));
+    }
+    this.logger.info({ id: marker.id, reason, channel: marker.channelRef }, "live-turn abandoned");
+  }
+
+  private async abandonDispatchSpec(spec: { id: string; target: string }, reason: string): Promise<void> {
+    const maxAge =
+      this.config.SEAM_TURN_RESUME_MAX_AGE_SECONDS ?? TURN_RESUME_MAX_AGE_SECONDS;
+    await this.dispatchWatcher?.abandonRunning(spec.id, reason);
+    try {
+      this.store.updateDelegationStatus(spec.id, "abandoned");
+    } catch {
+      /* best-effort */
+    }
+    if (reason !== "thread deleted") {
+      await this.postResumeNotice(spec.target, abandonedNotice(reason, maxAge));
+    }
+    this.logger.info({ id: spec.id, reason, target: spec.target }, "dispatch resume abandoned");
+  }
+
+  /**
+   * Re-fire an interrupted live human turn. Copies the live branch of
+   * `runScheduledPromptInner`: synthetic IncomingMessage → queueOnChannel →
+   * handleIncomingMessageInner, abort detected via channelGenerations.
+   * Does NOT use handleIncomingMessage (would bump generation / pre-empt)
+   * and does NOT use injectTurn (captures instead of streaming).
+   */
+  private async refireLiveTurn(marker: LiveTurnMarker): Promise<void> {
+    const channel: ChannelRef = {
+      platform: PLATFORM,
+      id: marker.channelRef,
+      ...(marker.parentRef ? { parentId: marker.parentRef } : {}),
+    };
+    try {
+      await this.adapter.sendMessage?.(channel, RESUME_ANNOUNCE);
+    } catch (err) {
+      this.logger.warn({ err, id: marker.id }, "live-turn resume announce failed");
+    }
+    const synthetic: IncomingMessage = {
+      channel,
+      authorId: marker.authorId ?? "system",
+      authorIsBot: false,
+      text: CONTINUE_PROMPT,
+    };
+    this.pendingLiveResume.set(marker.channelRef, marker);
+    try {
+      await this.queueOnChannel(marker.channelRef, async () => {
+        const genAtStart = this.channelGenerations.get(marker.channelRef) ?? 0;
+        await this.handleIncomingMessageInner(synthetic);
+        const aborted =
+          (this.channelGenerations.get(marker.channelRef) ?? 0) > genAtStart;
+        if (aborted) {
+          this.logger.info({ id: marker.id }, "live-turn resume aborted by user");
+        }
+      });
+    } catch (err) {
+      this.pendingLiveResume.delete(marker.channelRef);
+      this.logger.warn({ err, id: marker.id }, "live-turn resume failed");
+    }
+  }
+
+  /**
+   * Boot recovery (#76). Markers are ALWAYS reconciled (max-age / deleted
+   * thread → abandon + notice). Auto-resume ("continue" + loadSession) is
+   * gated by SEAM_TURN_RESUME_ENABLED — default off means unconfigured ==
+   * today's behavior.
+   *
+   * SINGLE-INSTANCE ASSUMPTION: no other seam-acp process owns these turns.
+   * Two processes on one DATA_DIR would double-resume everything.
+   */
+  async recoverInterruptedTurns(): Promise<void> {
+    const enabled = this.config.SEAM_TURN_RESUME_ENABLED === true;
+    const maxAge =
+      this.config.SEAM_TURN_RESUME_MAX_AGE_SECONDS ?? TURN_RESUME_MAX_AGE_SECONDS;
+    const now = new Date();
+
+    const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    const liveJobs: Array<Promise<void>> = [];
+    for (const marker of live) {
+      const pre = await this.checkResumePreconditions({
+        platform: PLATFORM,
+        id: marker.channelRef,
+        ...(marker.parentRef ? { parentId: marker.parentRef } : {}),
+      });
+      const decision = decideResume({
+        startedUtc: marker.startedUtc,
+        maxAgeSeconds: maxAge,
+        now,
+        precondition: pre,
+        acpSessionId: marker.acpSessionId,
+      });
+      if (decision.action === "abandon") {
+        await this.abandonLiveMarker(marker, decision.reason);
+        continue;
+      }
+      if (decision.action === "skip") {
+        this.logger.info(
+          { id: marker.id, reason: decision.reason, channel: marker.channelRef },
+          "live-turn resume skipped"
+        );
+        continue;
+      }
+      if (!enabled) continue;
+      liveJobs.push(this.resumeScheduler.run(() => this.refireLiveTurn(marker)));
+    }
+
+    if (enabled && this.dispatchWatcher) {
+      const stale = await this.dispatchWatcher.listStaleRunning();
+      for (const spec of stale) {
+        const pre = await this.checkResumePreconditions({
+          platform: PLATFORM,
+          id: spec.target,
+        });
+        const ledger = this.store.getDelegation(spec.id);
+        const decided = decideResume({
+          startedUtc: spec.createdUtc,
+          maxAgeSeconds: maxAge,
+          now,
+          precondition: pre,
+          acpSessionId: ledger?.acpSessionId,
+        });
+        if (decided.action === "abandon") {
+          await this.abandonDispatchSpec(spec, decided.reason);
+          continue;
+        }
+        if (decided.action === "skip") {
+          this.logger.info(
+            { id: spec.id, reason: decided.reason, target: spec.target },
+            "dispatch resume skipped"
+          );
+          continue;
+        }
+        liveJobs.push(
+          this.resumeScheduler.run(async () => {
+            await this.dispatchWatcher!.requeueStale(spec.id);
+          })
+        );
+      }
+    }
+
+    await Promise.all(liveJobs);
+  }
+
+  /** Unified interrupted/abandoned inventory for `/seam workflows`. */
+  private async collectInterruptedRows(): Promise<InterruptedTurnRow[]> {
+    const rows: InterruptedTurnRow[] = [];
+    const seen = new Set<string>();
+    for (const e of this.store.listDelegationsByStatus(["interrupted", "abandoned"])) {
+      seen.add(e.id);
+      rows.push({
+        id: e.id,
+        source: "dispatch",
+        channelRef: e.targetRef ?? e.sourceRef ?? "",
+        correlationId: e.correlationId,
+        status: e.status === "abandoned" ? "abandoned" : "interrupted",
+        startedUtc: e.updatedUtc || e.createdUtc,
+        acpSessionId: e.acpSessionId,
+      });
+    }
+    const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    for (const m of live) {
+      if (seen.has(m.id)) continue;
+      rows.push({
+        id: m.id,
+        source: "live",
+        channelRef: m.channelRef,
+        correlationId: null,
+        status: "interrupted",
+        startedUtc: m.startedUtc,
+        acpSessionId: m.acpSessionId ?? null,
+      });
+    }
+    const abandonedLive = await listAbandonedLiveTurns(this.config.DATA_DIR).catch(
+      () => [] as Awaited<ReturnType<typeof listAbandonedLiveTurns>>
+    );
+    for (const r of abandonedLive) {
+      if (seen.has(r.id)) continue;
+      rows.push({
+        id: r.id,
+        source: "live",
+        channelRef: r.channelRef,
+        correlationId: null,
+        status: "abandoned",
+        startedUtc: r.finishedUtc,
+        acpSessionId: null,
+      });
+    }
+    return rows;
+  }
+
+  /** Operator-initiated resume from `/seam workflows` — bypasses max-age
+   *  and the auto-resume flag (the operator clicked Resume). */
+  async resumeTurnManually(id: string): Promise<string> {
+    const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    const marker = live.find((m) => m.id === id);
+    if (marker) {
+      if (!marker.acpSessionId) {
+        return `Cannot resume \`${id}\` — no recorded ACP session.`;
+      }
+      void this.resumeScheduler.run(() => this.refireLiveTurn(marker));
+      return `▶️ Resuming live turn \`${id}\` in <#${marker.channelRef}>…`;
+    }
+    const stale = (await this.dispatchWatcher?.listStaleRunning()) ?? [];
+    const spec = stale.find((s) => s.id === id);
+    if (spec) {
+      const ok = await this.dispatchWatcher!.requeueStale(spec.id);
+      return ok
+        ? `▶️ Re-queued dispatch \`${id}\` as a resume (continue + loadSession).`
+        : `Could not re-queue \`${id}\`.`;
+    }
+    const ledger = this.store.getDelegation(id);
+    if (ledger && (ledger.status === "interrupted" || ledger.status === "abandoned")) {
+      const target = ledger.targetRef;
+      if (!target || !ledger.acpSessionId) {
+        return `Cannot resume \`${id}\` — missing target or ACP session.`;
+      }
+      const resumeKind = ledger.kind === "inbox" ? "handoff" : ledger.kind;
+      await enqueueDispatchSpec(this.config.DATA_DIR, {
+        id: `${id}-resume`,
+        target,
+        prompt: CONTINUE_PROMPT,
+        session: "live",
+        resume: true,
+        kind: resumeKind,
+        ...(ledger.correlationId ? { correlationId: ledger.correlationId } : {}),
+        createdUtc: new Date().toISOString(),
+      });
+      // Point the new spec at the recorded session via a ledger row the
+      // dispatcher will look up — stamp the original's session on a
+      // running-shaped row so loadSession finds it. The new spec id is
+      // different, so copy the pointer onto a fresh dispatched row.
+      try {
+        this.store.recordDelegation({
+          id: `${id}-resume`,
+          kind: ledger.kind,
+          targetRef: target,
+          correlationId: ledger.correlationId,
+          acpSessionId: ledger.acpSessionId,
+          status: "dispatched",
+        });
+      } catch {
+        /* already exists */
+      }
+      return `▶️ Enqueued resume of \`${id}\` into the recorded session.`;
+    }
+    return `No interrupted/abandoned turn \`${id}\`.`;
+  }
+
+  async abandonTurnManually(id: string): Promise<string> {
+    const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
+    const marker = live.find((m) => m.id === id);
+    if (marker) {
+      await this.abandonLiveMarker(marker, "abandoned by operator");
+      return `🚫 Abandoned live turn \`${id}\`.`;
+    }
+    const stale = (await this.dispatchWatcher?.listStaleRunning()) ?? [];
+    const spec = stale.find((s) => s.id === id);
+    if (spec) {
+      await this.abandonDispatchSpec(spec, "abandoned by operator");
+      return `🚫 Abandoned dispatch \`${id}\`.`;
+    }
+    const ledger = this.store.getDelegation(id);
+    if (ledger && (ledger.status === "interrupted" || ledger.status === "running")) {
+      try {
+        this.store.updateDelegationStatus(id, "abandoned");
+      } catch {
+        /* best-effort */
+      }
+      await this.dispatchWatcher?.abandonRunning(id, "abandoned by operator");
+      return `🚫 Abandoned \`${id}\`.`;
+    }
+    return `No resumable turn \`${id}\`.`;
   }
 
   /** Steer a running (or idle) node: preemptively cancel its in-flight turn,
@@ -6390,7 +6892,58 @@ export class Orchestrator {
       }
     }
 
-    await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    const interrupted = await this.collectInterruptedRows();
+    const components: ActionRowBuilder<ButtonBuilder>[] = [];
+    if (interrupted.length > 0) {
+      embed.addFields({
+        name: `⚠️ Interrupted / abandoned (${interrupted.length})`,
+        value: clampFieldValue(formatInterruptedLines(interrupted, now)),
+      });
+      if (view.empty) embed.setDescription(null);
+      // Per-entry Resume / Abandon — same pattern as schedule-list cards.
+      // Zero extra command slots. First 5 rows (Discord's 5-row cap).
+      for (const row of interrupted.slice(0, 5)) {
+        components.push(
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`wf:resume:${row.id}`)
+              .setLabel(`▶️ Resume ${row.source}`.slice(0, 80))
+              .setStyle(ButtonStyle.Primary),
+            new ButtonBuilder()
+              .setCustomId(`wf:abandon:${row.id}`)
+              .setLabel("🚫 Abandon")
+              .setStyle(ButtonStyle.Danger)
+          )
+        );
+      }
+    }
+
+    await i.reply({
+      embeds: [embed],
+      ...(components.length ? { components } : {}),
+      flags: MessageFlags.Ephemeral,
+    });
+    if (components.length === 0) return;
+    const msg = await i.fetchReply();
+    const collector = msg.createMessageComponentCollector({
+      filter: (c) => c.user.id === i.user.id,
+      time: 600_000,
+    });
+    collector.on("collect", async (c) => {
+      try {
+        if (!c.isButton()) return;
+        const [, action, ...rest] = c.customId.split(":");
+        const id = rest.join(":");
+        if (!id || (action !== "resume" && action !== "abandon")) return;
+        const result =
+          action === "resume"
+            ? await this.resumeTurnManually(id)
+            : await this.abandonTurnManually(id);
+        await c.reply({ content: result, flags: MessageFlags.Ephemeral });
+      } catch (err) {
+        this.logger.warn({ err }, "workflows resume/abandon button failed");
+      }
+    });
   }
 
   /** `/seam config audit` — read the immutable config-mutation trail (#70).

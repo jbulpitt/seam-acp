@@ -414,6 +414,10 @@ describe("delegation ledger", () => {
 
     // Interrupted is no longer in-flight.
     expect(store.listActiveDelegations()).toEqual([]);
+    expect(store.listDelegationsByStatus(["interrupted"]).map((e) => e.id).sort()).toEqual([
+      "disp-1",
+      "run-1",
+    ]);
   });
 
   it("opening a store does not reconcile — only an explicit boot call does", () => {

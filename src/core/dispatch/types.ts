@@ -70,6 +70,12 @@ export interface DispatchSpec {
    *  that never cancels or restarts the turn (contrast the preemptive `steer`
    *  path). Absent/false → the prompt is untouched and behavior is unchanged. */
   watchFeedback?: boolean;
+  /**
+   * Set by recoverStale when a crash leftover is re-enqueued (#76). The
+   * dispatcher then substitutes prompt → "continue" and session acquisition
+   * → loadSession(recordedAcpSessionId) instead of replaying the brief.
+   */
+  resume?: boolean;
   createdUtc: string;
 }
 
@@ -111,6 +117,7 @@ export const DispatchSpecSchema = z.object({
   chainId: z.string().min(1).optional(),
   stream: z.boolean().optional(),
   watchFeedback: z.boolean().optional(),
+  resume: z.boolean().optional(),
   createdUtc: z.string().optional(),
 });
 
@@ -149,6 +156,7 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.chainId ? { chainId: d.chainId } : {}),
     ...(d.stream !== undefined ? { stream: d.stream } : {}),
     ...(d.watchFeedback !== undefined ? { watchFeedback: d.watchFeedback } : {}),
+    ...(d.resume !== undefined ? { resume: d.resume } : {}),
     createdUtc: d.createdUtc ?? new Date().toISOString(),
   };
 }

@@ -1053,6 +1053,19 @@ export class SessionStore {
       .map(mapLedger);
   }
 
+  /** Ledger rows in the given statuses, oldest first — resume inventory (#76). */
+  listDelegationsByStatus(statuses: readonly DelegationStatus[]): LedgerEntry[] {
+    if (statuses.length === 0) return [];
+    const placeholders = statuses.map(() => "?").join(", ");
+    return this.db
+      .prepare<string[], LedgerRow>(
+        `SELECT * FROM delegation_log WHERE status IN (${placeholders})
+         ORDER BY updated_utc ASC, rowid ASC`
+      )
+      .all(...statuses)
+      .map(mapLedger);
+  }
+
   // --- durable multi-hop chains (#25) ---------------------------------------
 
   /**

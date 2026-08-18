@@ -37,6 +37,13 @@ export interface DispatchWatcherOpts {
   onDispatch: (spec: DispatchSpec) => Promise<{ output: string; stopReason: string }>;
   /** Poll interval in ms. Default 1000. */
   pollMs?: number;
+  /**
+   * When true, crash leftovers in `running/` are marked `resume: true` and
+   * LEFT in place for the orchestrator to precondition-check + stagger-
+   * requeue. When false (default), today's recoverStale re-enqueues them
+   * unmarked — original-prompt replay, unconfigured == today's behavior.
+   */
+  resumeEnabled?: boolean;
 }
 
 export class DispatchWatcher {
@@ -44,6 +51,7 @@ export class DispatchWatcher {
   private readonly logger: Logger;
   private readonly onDispatch: DispatchWatcherOpts["onDispatch"];
   private readonly pollMs: number;
+  private readonly resumeEnabled: boolean;
 
   /** One FIFO per target thread — different targets get different queues and
    *  therefore run concurrently. */
@@ -60,6 +68,7 @@ export class DispatchWatcher {
     this.logger = opts.logger.child({ comp: "dispatch-watcher" });
     this.onDispatch = opts.onDispatch;
     this.pollMs = opts.pollMs ?? 1000;
+    this.resumeEnabled = opts.resumeEnabled === true;
   }
 
   /** Create the queue dirs, recover anything a crash left in `running/`, then
@@ -68,7 +77,13 @@ export class DispatchWatcher {
     await mkdir(this.dirs.pending, { recursive: true });
     await mkdir(this.dirs.running, { recursive: true });
     await mkdir(this.dirs.done, { recursive: true });
-    await this.recoverStale();
+    // SINGLE-INSTANCE ASSUMPTION: recovery assumes no other seam-acp process
+    // owns these specs. Two processes on one DATA_DIR would double-resume.
+    if (this.resumeEnabled) {
+      await this.markStaleInPlace();
+    } else {
+      await this.recoverStale();
+    }
     this.ready = true;
     this.timer = setInterval(() => void this.tick(), this.pollMs);
     // Don't hold the event loop open just for the poller.
@@ -172,6 +187,162 @@ export class DispatchWatcher {
   }
 
   /**
+   * Flag-on boot path: stamp `resume: true` onto crash leftovers in `running/`
+   * but do NOT move them to pending. The orchestrator lists them, applies
+   * max-age / preconditions, then {@link requeueStale}s the ones that should
+   * fire. Specs that already have a done-file are dropped (same as recoverStale).
+   */
+  private async markStaleInPlace(): Promise<void> {
+    let names: string[];
+    try {
+      names = await readdir(this.dirs.running);
+    } catch {
+      return;
+    }
+    let marked = 0;
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const id = name.slice(0, -".json".length);
+      const runningPath = path.join(this.dirs.running, name);
+      if (await exists(path.join(this.dirs.done, name))) {
+        await rm(runningPath, { force: true }).catch(() => {});
+        this.logger.info({ id }, "dispatch: dropped stale running spec (already done)");
+        continue;
+      }
+      try {
+        const spec = parseDispatchSpec(id, await readFile(runningPath, "utf8"));
+        if (spec.resume) {
+          marked++;
+          continue;
+        }
+        const tmpPath = `${runningPath}.tmp`;
+        await writeFile(tmpPath, `${JSON.stringify({ ...spec, resume: true }, null, 2)}\n`, "utf8");
+        await rename(tmpPath, runningPath);
+        marked++;
+      } catch (err) {
+        this.logger.warn({ err, id }, "dispatch: could not mark stale spec as resume");
+      }
+    }
+    if (marked > 0) {
+      this.logger.info({ marked }, "dispatch: marked stale running specs for resume");
+    }
+  }
+
+  /** Crash leftovers still sitting in `running/` with no done-file. */
+  async listStaleRunning(): Promise<DispatchSpec[]> {
+    let names: string[];
+    try {
+      names = await readdir(this.dirs.running);
+    } catch {
+      return [];
+    }
+    const out: DispatchSpec[] = [];
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const id = name.slice(0, -".json".length);
+      if (this.inFlight.has(id)) continue;
+      if (await exists(path.join(this.dirs.done, name))) continue;
+      try {
+        out.push(parseDispatchSpec(id, await readFile(path.join(this.dirs.running, name), "utf8")));
+      } catch {
+        // unparseable
+      }
+    }
+    return out;
+  }
+
+  /** Move a marked stale spec from `running/` to `pending/` so the next tick
+   *  claims it through the normal dispatch path. */
+  async requeueStale(id: string): Promise<boolean> {
+    const name = `${id}.json`;
+    const runningPath = path.join(this.dirs.running, name);
+    const pendingPath = path.join(this.dirs.pending, name);
+    if (await exists(path.join(this.dirs.done, name))) {
+      await rm(runningPath, { force: true }).catch(() => {});
+      return false;
+    }
+    try {
+      await rename(runningPath, pendingPath);
+      return true;
+    } catch (err) {
+      this.logger.warn({ err, id }, "dispatch: could not requeue resume spec");
+      return false;
+    }
+  }
+
+  /**
+   * Command-layer cancel: write a terminal done-file THEN drop the running
+   * (and any pending) spec. Same commit ordering as {@link finish}. Does NOT
+   * live in dispose() — SIGTERM must leave markers intact.
+   */
+  async cancelRunning(filter?: { target?: string }): Promise<string[]> {
+    const cancelled: string[] = [];
+    const seen = new Set<string>();
+    for (const spec of await this.listQueueSpecs(["running", "pending"])) {
+      if (filter?.target && spec.target !== filter.target) continue;
+      if (seen.has(spec.id)) continue;
+      seen.add(spec.id);
+      await this.finish(spec.id, {
+        id: spec.id,
+        status: "failed",
+        error: "cancelled by operator",
+        target: spec.target,
+        ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
+        finishedUtc: new Date().toISOString(),
+      });
+      cancelled.push(spec.id);
+    }
+    return cancelled;
+  }
+
+  /** Max-age / deleted-thread abandon: terminal write then drop the marker. */
+  async abandonRunning(id: string, reason: string): Promise<void> {
+    let target = "";
+    let correlationId: string | undefined;
+    try {
+      const spec = parseDispatchSpec(
+        id,
+        await readFile(path.join(this.dirs.running, `${id}.json`), "utf8")
+      );
+      target = spec.target;
+      correlationId = spec.correlationId;
+    } catch {
+      // still finalize so recoverStale cannot re-run it
+    }
+    await this.finish(id, {
+      id,
+      status: "failed",
+      error: `abandoned: ${reason}`,
+      target,
+      ...(correlationId ? { correlationId } : {}),
+      finishedUtc: new Date().toISOString(),
+    });
+  }
+
+  private async listQueueSpecs(subdirs: Array<"running" | "pending">): Promise<DispatchSpec[]> {
+    const out: DispatchSpec[] = [];
+    for (const sub of subdirs) {
+      const dir = this.dirs[sub];
+      let names: string[];
+      try {
+        names = await readdir(dir);
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        if (!name.endsWith(".json")) continue;
+        const id = name.slice(0, -".json".length);
+        try {
+          out.push(parseDispatchSpec(id, await readFile(path.join(dir, name), "utf8")));
+        } catch {
+          // ignore
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
    * Claim a pending spec by atomic rename into `running/`, then parse it.
    * Returns the spec on success; `null` when the claim was lost (ENOENT — a
    * racing tick/process won it) or the spec was unparseable (already finalized
@@ -263,6 +434,9 @@ export class DispatchWatcher {
       return; // leave the running-file so start() re-enqueues it
     }
     await rm(path.join(this.dirs.running, name), { force: true }).catch(() => {});
+    // Command-layer cancel may finalize a spec still sitting in pending/
+    // (a staggered resume that has not been claimed yet).
+    await rm(path.join(this.dirs.pending, name), { force: true }).catch(() => {});
   }
 
   private queueFor(target: string): SerialQueue {

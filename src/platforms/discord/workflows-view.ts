@@ -22,6 +22,7 @@ const STATUS_ICON: Record<DelegationStatus, string> = {
   timed_out: "⏱️",
   parked: "🅿️",
   interrupted: "⚠️",
+  abandoned: "🚫",
 };
 
 /** Trailing, human-sized slice of an id (drops a `del-`/`corr-` style prefix). */
@@ -140,6 +141,29 @@ export function formatAnomalyLines(anomalies: AnomalySummary, now: Date): string
  * cap. Overflow is dropped and summarised as `…and N more` rather than
  * silently truncated mid-line.
  */
+/** One interrupted/abandoned turn for the `/seam workflows` inventory (#76). */
+export interface InterruptedTurnRow {
+  id: string;
+  source: "dispatch" | "live";
+  channelRef: string;
+  correlationId: string | null;
+  status: "interrupted" | "abandoned";
+  startedUtc: string;
+  acpSessionId: string | null;
+}
+
+/** One inventory line: thread, age, correlation — what the operator needs
+ *  to decide Resume vs Abandon. */
+export function formatInterruptedLine(row: InterruptedTurnRow, now: Date): string {
+  const icon = row.status === "abandoned" ? "🚫" : "⚠️";
+  const corr = row.correlationId ? ` · corr \`${shortId(row.correlationId)}\`` : "";
+  return `${icon} \`${shortId(row.id)}\` ${row.source} · ${shortRef(row.channelRef, "?")} · ${row.status} · ${formatAge(row.startedUtc, now)}${corr}`;
+}
+
+export function formatInterruptedLines(rows: InterruptedTurnRow[], now: Date): string[] {
+  return rows.map((r) => formatInterruptedLine(r, now));
+}
+
 export function clampFieldValue(lines: string[], max = 1024): string {
   if (lines.length === 0) return "_none_";
   const out: string[] = [];

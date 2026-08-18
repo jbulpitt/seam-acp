@@ -95,6 +95,13 @@ export interface InjectTurnOptions {
    * mid-turn is recoverable (#75). Must not be used for teardown.
    */
   onSession?: (sessionId: string) => void | Promise<void>;
+
+  /**
+   * Isolated-run resume (#76): `loadSession(resumeSessionId)` instead of
+   * `newSession()`. The id is the one persisted on the ledger at the
+   * `running` transition. Absent ⇒ today's fresh session.
+   */
+  resumeSessionId?: string;
 }
 
 export interface InjectTurnResult {

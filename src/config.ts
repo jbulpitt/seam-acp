@@ -701,6 +701,25 @@ const Schema = z.object({
     .enum(["true", "false"])
     .default("true")
     .transform((v) => v === "true"),
+
+  /**
+   * Auto-resume interrupted turns after a restart (#76): inject "continue"
+   * into the same ACP session instead of replaying the original prompt.
+   * Default OFF — unconfigured == today's behavior. Markers are still
+   * written and reconciled with the flag off (interruption inventory + a
+   * truthful ledger); only the auto-resume fire is gated.
+   */
+  SEAM_TURN_RESUME_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+  /**
+   * Max age of an interrupted turn (seconds) that auto-resume will re-fire.
+   * Mirrors scheduled-prompt `catchupSeconds`. Past this window the turn is
+   * marked `abandoned` and a notice is posted rather than resumed. Manual
+   * resume from `/seam workflows` still works. Default 7200 (2h).
+   */
+  SEAM_TURN_RESUME_MAX_AGE_SECONDS: z.coerce.number().int().min(0).max(604800).default(7200),
 });
 
 const PresetFieldSchema = <T extends z.ZodType>(value: T) => z.object({ value });

@@ -323,7 +323,10 @@ export class SessionRouter {
     return promise;
   }
 
-  /** Drop a runtime from the cache (e.g. on session/not-found). */
+  /** Drop a runtime from the cache (e.g. on session/not-found).
+   *  #76: MUST NOT clear turn-resume markers. User cancel and host shutdown
+   *  both land here via dispose(); wiping markers would make resume a
+   *  silent no-op on every graceful reboot. Command layer clears them. */
   async invalidate(sessionId: string, opts?: { clearAcpSession?: boolean }): Promise<void> {
     // Revoke this session's seam-MCP token — the runtime is going away, so any
     // outstanding token must stop resolving. A later start re-mints a fresh one.
@@ -408,7 +411,9 @@ export class SessionRouter {
     return ids.length;
   }
 
-  /** Dispose all runtimes (graceful shutdown). */
+  /** Dispose all runtimes (graceful shutdown / SIGTERM).
+   *  #76: MUST NOT clear turn-resume markers — shutdown is the event
+   *  resume exists for. */
   async disposeAll(): Promise<void> {
     const all = Array.from(this.runtimes.values());
     this.runtimes.clear();
@@ -494,6 +499,9 @@ export class SessionRouter {
       logger: this.logger.child({ session: record.id }),
       mcpServers,
       onDead: () => {
+        // Involuntary death — #76: leave turn markers intact. This is an
+        // interruption, not a cancellation. Recovery reattaches on the next
+        // boot (or the next recoverInterruptedTurns pass).
         this.logger.info({ sessionId: record.id }, "agent process died; evicting runtime for auto-resume");
         this.seamMcp?.registry.revokeSession(record.id);
         this.runtimes.delete(record.id);

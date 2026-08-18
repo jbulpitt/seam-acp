@@ -7,6 +7,8 @@ import {
   shortRef,
   formatAge,
   clampFieldValue,
+  formatInterruptedLine,
+  formatInterruptedLines,
 } from "../src/platforms/discord/workflows-view.js";
 
 const NOW = new Date("2026-08-16T12:00:00.000Z");
@@ -133,6 +135,49 @@ describe("formatWorkflowsView", () => {
       NOW
     );
     expect(view.active.lines[0]).toContain("scheduler→…");
+  });
+});
+
+describe("formatInterruptedLine", () => {
+  it("renders thread, age, and correlation for Resume/Abandon inventory", () => {
+    const line = formatInterruptedLine(
+      {
+        id: "disp-abc12345",
+        source: "dispatch",
+        channelRef: "discord:thread-worker",
+        correlationId: "corr-xyz98765",
+        status: "interrupted",
+        startedUtc: "2026-08-16T11:50:00.000Z",
+        acpSessionId: "acp-1",
+      },
+      NOW
+    );
+    expect(line).toContain("⚠️");
+    expect(line).toContain("dispatch");
+    expect(line).toContain("interrupted");
+    expect(line).toContain("thread-worker");
+    expect(line).toContain("corr");
+    expect(line).toContain("10m");
+  });
+
+  it("uses the abandoned icon", () => {
+    const lines = formatInterruptedLines(
+      [
+        {
+          id: "live-1",
+          source: "live",
+          channelRef: "t",
+          correlationId: null,
+          status: "abandoned",
+          startedUtc: "2026-08-16T11:00:00.000Z",
+          acpSessionId: null,
+        },
+      ],
+      NOW
+    );
+    expect(lines[0]).toContain("🚫");
+    expect(lines[0]).toContain("abandoned");
+    expect(lines[0]).toContain("live");
   });
 });
 

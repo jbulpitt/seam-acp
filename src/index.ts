@@ -648,8 +648,20 @@ async function main(): Promise<void> {
     dataDir: config.DATA_DIR,
     logger: logger.child({ mod: "dispatch" }),
     onDispatch: (spec) => orchestrator.dispatchInjectTurn(spec),
+    // Flag-on: mark stale running specs in place (orchestrator stagger-
+    // requeues after preconditions). Flag-off: today's recoverStale replay.
+    resumeEnabled: config.SEAM_TURN_RESUME_ENABLED,
   });
+  orchestrator.setDispatchWatcher(dispatchWatcher);
   await dispatchWatcher.start();
+
+  // #76: reconcile live-turn markers (always) and auto-resume if the flag
+  // is on. SIGTERM/disposeAll above leave markers intact — this is the
+  // path that acts on them. Fire-and-forget so boot is not blocked by
+  // long resumes; the stagger gate caps concurrency.
+  void orchestrator.recoverInterruptedTurns().catch((err) =>
+    logger.warn({ err }, "turn-resume recovery failed")
+  );
 
   // P0 (#58): hot-reload data/channel-presets.json. The watcher mutates the
   // SAME map objects the router and orchestrator hold (config.channelPresets /

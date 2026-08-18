@@ -215,7 +215,9 @@ export type DelegationKind =
  * Lifecycle of a ledger row.
  * Terminal: completed | failed | timed_out.
  * `interrupted` is the boot-reconciliation state for crash leftovers (#75) —
- * not in-flight, not a successful/failed completion; reserved for resume (#76).
+ * not in-flight, not a successful/failed completion; resume (#76) acts on it.
+ * `abandoned` is a resume that was set aside (max-age, deleted thread) rather
+ * than re-fired — terminal, operator-visible, manually resumable.
  */
 export type DelegationStatus =
   | "dispatched"
@@ -226,7 +228,9 @@ export type DelegationStatus =
   /** Deliberately set aside (e.g. awaiting human steering) — not terminal. */
   | "parked"
   /** Crash leftover: process died while the row was still in flight. */
-  | "interrupted";
+  | "interrupted"
+  /** Resume declined (max-age / deleted thread) — terminal, not in-flight. */
+  | "abandoned";
 
 /** Statuses considered still in flight by `listActiveDelegations`. */
 export const DELEGATION_ACTIVE_STATUSES: readonly DelegationStatus[] = [
@@ -239,6 +243,7 @@ export const DELEGATION_TERMINAL_STATUSES: readonly DelegationStatus[] = [
   "completed",
   "failed",
   "timed_out",
+  "abandoned",
 ];
 
 /** Max stored length of `promptPreview`; the store truncates on write. */

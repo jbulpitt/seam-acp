@@ -528,6 +528,13 @@ async function main(): Promise<void> {
       // tool layer via this predicate (read from the presets file, the source of
       // truth), never from a model-supplied value.
       isChannelLocked: (record) => isChannelLocked(config, record.parentRef ?? undefined),
+      // #71: the propose gate's lock exemption — config admins (if configured)
+      // may propose in a locked channel, but ONLY when the current turn's
+      // harness-stamped speaker id is in the set. `currentSpeakerId` returns that
+      // id (undefined when speaker identity is off or the turn has no human
+      // author), so with the flag off a locked channel keeps refusing everyone.
+      configAdminUserIds: config.SEAM_CONFIG_ADMIN_USER_IDS,
+      currentSpeakerId: (record) => orchestrator.currentSpeaker(record.channelRef),
       // #58 P2/P3: propose-then-confirm mutation. The orchestrator validates,
       // renders the confirm card, and applies only on a human click (D5),
       // auditing every change (D6).

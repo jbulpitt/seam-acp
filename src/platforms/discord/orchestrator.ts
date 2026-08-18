@@ -244,6 +244,12 @@ export class Orchestrator {
    *  Both in-memory: a restart ends every live turn anyway. */
   private readonly activeLiveDispatch = new Map<string, string>();
   private readonly interruptedDispatches = new Set<string>();
+  /** channelRef → the harness-stamped speaker id of the human turn CURRENTLY
+   *  processing on that thread (#71/#57). Set at turn start when speaker identity
+   *  is on and there's an author id, cleared in the turn's finally so it never
+   *  leaks into a later dispatched/scheduled turn. The config_propose lock gate
+   *  reads this (via `currentSpeaker`) — the id, never a display name. */
+  private readonly currentSpeakerIds = new Map<string, string>();
 
   constructor(opts: {
     logger: Logger;
@@ -307,6 +313,12 @@ export class Orchestrator {
     if (!this.adapter.postConfirmation) {
       return { ok: false, error: "This platform cannot render a confirmation card, so no change can be proposed." };
     }
+    // #71 APPLY gate: when config admins are configured, ONLY they may click
+    // Apply — in locked AND unlocked channels — instead of the whole
+    // DISCORD_ALLOWED_USER_IDS allowlist (which includes student accounts). Unset
+    // ⇒ pass nothing so postConfirmation falls back to DISCORD_ALLOWED_USER_IDS,
+    // preserving today's behavior exactly.
+    const adminIds = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
     const { decision } = await this.adapter.postConfirmation(
       { platform: PLATFORM, id: record.channelRef },
       {
@@ -316,7 +328,8 @@ export class Orchestrator {
           : undefined,
         fields: proposal.fields,
         warnings: proposal.warnings,
-      }
+      },
+      adminIds ? { authorizedUserIds: adminIds } : {}
     );
 
     // Apply in the background on confirmation; the tool has already returned.
@@ -1195,6 +1208,11 @@ export class Orchestrator {
         this.config.SPEAKER_IDENTITY_ENABLED && msg.authorId
           ? { id: msg.authorId, name: msg.authorName ?? "" }
           : undefined;
+      // #71: expose the CURRENT turn's trusted speaker id to the config_propose
+      // lock gate for the duration of this turn (cleared in the finally below).
+      // Only set when we have a harness-stamped id — with speaker identity off
+      // the gate sees nothing and keeps refusing (never fail open).
+      if (speaker) this.currentSpeakerIds.set(record.channelRef, speaker.id);
       let promptText = withHarnessPreamble(msg.text, riders, speaker);
       let promptAttachments = msg.attachments;
       const activeProfile = this.router.getProfile(record.agentId);
@@ -1565,8 +1583,23 @@ export class Orchestrator {
         clearTimeout(pendingRefresh);
         pendingRefresh = undefined;
       }
+      // #71: drop the current-turn speaker id so it can never authorize a
+      // config_propose on a later dispatched/scheduled turn (no human speaker).
+      this.currentSpeakerIds.delete(record.channelRef);
       await refresh(true);
     }
+  }
+
+  /**
+   * The harness-stamped speaker id (#57 D4 trust anchor) of the human turn
+   * CURRENTLY processing on `channelRef`, or undefined when there is none
+   * (speaker identity off, or a dispatched/scheduled turn with no human author).
+   * Read by the seam-MCP config_propose lock gate (#71) — it is an id, never a
+   * user-editable display name, and must be the ONLY speaker signal that gate
+   * trusts.
+   */
+  currentSpeaker(channelRef: string): string | undefined {
+    return this.currentSpeakerIds.get(channelRef);
   }
 
   // --- slash commands ---

@@ -185,6 +185,22 @@ export interface SeamMcpServerDeps {
    */
   isChannelLocked?: (record: SessionRecord) => boolean;
   /**
+   * Config-mutation admins (#71). The propose gate consults this ONLY in a LOCKED
+   * channel: a proposal is allowed when the caller's CURRENT-turn speaker id (see
+   * `currentSpeakerId`) is in this set. Undefined ⇒ opt-out — a locked channel
+   * refuses every proposal, exactly as before. Never relaxes the `locked`
+   * immutability (that refusal lives in ConfigMutationService and stays).
+   */
+  configAdminUserIds?: ReadonlySet<string>;
+  /**
+   * The harness-stamped SPEAKER id of the caller session's CURRENT turn (#57 D4
+   * trust anchor — NOT a user-editable display name). Undefined when speaker
+   * identity is off, or the turn has no human speaker (dispatched/scheduled), so
+   * the propose gate has no trustworthy id and MUST keep refusing in a locked
+   * channel (never fail open). Undefined ⇒ treated as "no admin speaker".
+   */
+  currentSpeakerId?: (record: SessionRecord) => string | undefined;
+  /**
    * Propose a config mutation for the calling thread (#58 P2/P3). The platform
    * validates + computes the diff, renders a confirm CARD, and applies only on a
    * human click (D5) — this call returns as soon as the card is posted (or with
@@ -1585,18 +1601,34 @@ export class SeamMcpServer {
     if (!this.deps.proposeConfig) {
       return textResult("config mutation is not supported on this deployment.", true);
     }
-    // Strictly read-only over MCP for a locked channel — no exceptions, no
-    // override tool (D2). Enforced HERE in the tool layer.
+    // Locked channel: read-only over MCP for EVERYONE by default (D2) — with one
+    // opt-in exemption (#71). A config admin (SEAM_CONFIG_ADMIN_USER_IDS) may
+    // propose without unlocking, but ONLY when the CURRENT turn's harness-stamped
+    // speaker id (#57 D4 trust anchor, never a display name) is in that set. If
+    // speaker identity is off — or this is a dispatched/scheduled turn with no
+    // human speaker — `currentSpeakerId` is undefined, so we fall through to the
+    // refusal and never fail open. The `locked` flag itself remains unsettable by
+    // anyone (enforced in ConfigMutationService); this only relaxes WHO may
+    // propose OTHER config in a locked channel.
     if (this.deps.isChannelLocked?.(caller)) {
-      this.logger.warn(
-        { session: caller.id, channel: caller.parentRef },
-        "seam-mcp config_propose refused: channel is locked"
-      );
-      return textResult(
-        `🔒 Refused: this channel is locked, so its configuration is strictly read-only over MCP. ` +
-          `This cannot be overridden by asking — unlocking is a deliberate out-of-band act ` +
-          `(edit the presets file and redeploy). No change was proposed.`,
-        true
+      const speakerId = this.deps.currentSpeakerId?.(caller);
+      const isAdmin =
+        speakerId != null && (this.deps.configAdminUserIds?.has(speakerId) ?? false);
+      if (!isAdmin) {
+        this.logger.warn(
+          { session: caller.id, channel: caller.parentRef, speakerId: speakerId ?? null },
+          "seam-mcp config_propose refused: channel is locked (speaker is not a config admin)"
+        );
+        return textResult(
+          `🔒 Refused: this channel is locked, so its configuration is strictly read-only over MCP. ` +
+            `This cannot be overridden by asking — unlocking is a deliberate out-of-band act ` +
+            `(edit the presets file and redeploy). No change was proposed.`,
+          true
+        );
+      }
+      this.logger.info(
+        { session: caller.id, channel: caller.parentRef, speakerId },
+        "seam-mcp config_propose: lock-immune config admin — proceeding in locked channel"
       );
     }
 

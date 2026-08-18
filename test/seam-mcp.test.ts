@@ -105,6 +105,8 @@ async function makeHarness(opts?: {
   cancelWatch?: SeamMcpServerDeps["cancelWatch"];
   listWatches?: SeamMcpServerDeps["listWatches"];
   isChannelLocked?: (record: SessionRecord) => boolean;
+  configAdminUserIds?: ReadonlySet<string>;
+  currentSpeakerId?: (record: SessionRecord) => string | undefined;
   proposeConfig?: (record: SessionRecord, input: unknown) => Promise<any>;
   pushInbox?: SeamMcpServerDeps["pushInbox"];
   drainInbox?: SeamMcpServerDeps["drainInbox"];
@@ -181,6 +183,8 @@ async function makeHarness(opts?: {
     ...(opts?.peekThread ? { peekThread: opts.peekThread } : {}),
     ...(opts?.listThreads ? { listThreads: opts.listThreads } : {}),
     ...(opts?.isChannelLocked ? { isChannelLocked: opts.isChannelLocked } : {}),
+    ...(opts?.configAdminUserIds ? { configAdminUserIds: opts.configAdminUserIds } : {}),
+    ...(opts?.currentSpeakerId ? { currentSpeakerId: opts.currentSpeakerId } : {}),
     ...(opts?.proposeConfig ? { proposeConfig: opts.proposeConfig } : {}),
     // The compact tool only ENQUEUES; its dep is a presence gate. Provide a stub
     // by default so the tool is enabled, and omit it when disableCompact is set.
@@ -1269,6 +1273,133 @@ describe("config_propose lock enforcement (D2)", () => {
     );
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0].text).toContain("not supported");
+  });
+});
+
+// -------------------------------------------------------------------------
+// config_propose lock immunity for config admins (#71). The lock still refuses
+// everyone by default; an admin (SEAM_CONFIG_ADMIN_USER_IDS) may propose in a
+// locked channel, but ONLY when the CURRENT turn's harness-stamped speaker id
+// is in the set. Keyed to the same set as the Apply gate.
+// -------------------------------------------------------------------------
+
+describe("config_propose lock immunity for config admins (#71)", () => {
+  let h: Harness;
+  afterEach(async () => {
+    await h?.server.stop();
+  });
+
+  it("lets a config admin propose in a locked channel when the speaker id matches", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => true,
+      configAdminUserIds: new Set(["1487094572696867019"]),
+      currentSpeakerId: () => "1487094572696867019", // admin is the current speaker
+      proposeConfig: async () => {
+        proposeCalls++;
+        return {
+          ok: true,
+          summary: "Session config for this thread",
+          fields: [{ label: "model", before: "gpt-5.4", after: "claude-opus-4.8" }],
+          restartsSession: true,
+        };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "claude-opus-4.8" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(body.result.content[0].text).toContain("confirmation card");
+    expect(proposeCalls).toBe(1);
+  });
+
+  it("still refuses a NON-admin speaker in a locked channel (student cannot generate a card)", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => true,
+      configAdminUserIds: new Set(["1487094572696867019"]),
+      currentSpeakerId: () => "9999999999", // a student, not in the admin set
+      proposeConfig: async () => {
+        proposeCalls++;
+        return { ok: true, summary: "should never happen" };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "claude-opus-4.8" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text.toLowerCase()).toContain("locked");
+    expect(proposeCalls).toBe(0);
+  });
+
+  it("refuses even an admin when speaker identity is off (no trustworthy id ⇒ never fail open)", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => true,
+      configAdminUserIds: new Set(["1487094572696867019"]),
+      currentSpeakerId: () => undefined, // SPEAKER_IDENTITY_ENABLED=false → no id
+      proposeConfig: async () => {
+        proposeCalls++;
+        return { ok: true, summary: "should never happen" };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "claude-opus-4.8" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text.toLowerCase()).toContain("locked");
+    expect(proposeCalls).toBe(0);
+  });
+
+  it("with no admin set configured, a locked channel refuses everyone — byte-identical to today", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => true,
+      // configAdminUserIds omitted (unset) ; even a stamped speaker is refused.
+      currentSpeakerId: () => "1487094572696867019",
+      proposeConfig: async () => {
+        proposeCalls++;
+        return { ok: true, summary: "should never happen" };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "claude-opus-4.8" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text.toLowerCase()).toContain("locked");
+    expect(proposeCalls).toBe(0);
+  });
+
+  it("does not gate an UNLOCKED channel on the admin set (propose proceeds regardless of speaker)", async () => {
+    let proposeCalls = 0;
+    h = await makeHarness({
+      isChannelLocked: () => false,
+      configAdminUserIds: new Set(["1487094572696867019"]),
+      currentSpeakerId: () => "9999999999", // non-admin, but channel is unlocked
+      proposeConfig: async () => {
+        proposeCalls++;
+        return {
+          ok: true,
+          summary: "Session config for this thread",
+          fields: [{ label: "model", before: "gpt-5.4", after: "claude-opus-4.8" }],
+        };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "config_propose", arguments: { session: { model: "claude-opus-4.8" } } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(proposeCalls).toBe(1);
   });
 });
 

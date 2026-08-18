@@ -349,6 +349,30 @@ const Schema = z.object({
     .transform((v) => v === "true"),
 
   /**
+   * Config-mutation admins (#71). The ids that may propose/apply a config change
+   * in a LOCKED channel WITHOUT unlocking, and — locked or not — the ONLY ids
+   * allowed to click Apply on a config confirm card. Parsed EXACTLY like
+   * DISCORD_ALLOWED_USER_IDS (comma-separated numeric Discord ids), but OPTIONAL:
+   *   - Unset / empty ⇒ opt-out, today's behavior byte-for-byte: a locked channel
+   *     refuses config_propose for everyone, and Apply falls back to
+   *     DISCORD_ALLOWED_USER_IDS. Empty-string is treated as unset, NOT "nobody".
+   * The propose gate keys on the harness-stamped SPEAKER id (#57 trust anchor),
+   * so with SPEAKER_IDENTITY_ENABLED off a locked channel still refuses everyone
+   * (no trustworthy id ⇒ never fail open). This set does NOT permit changing the
+   * `locked` flag itself — that stays out-of-band for everyone.
+   */
+  SEAM_CONFIG_ADMIN_USER_IDS: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const ids = v.split(",").map((s) => s.trim()).filter(Boolean);
+      if (ids.some((id) => !/^\d+$/.test(id))) {
+        throw new Error("SEAM_CONFIG_ADMIN_USER_IDS must be comma-separated numeric Discord user IDs");
+      }
+      return ids.length > 0 ? (new Set(ids) as ReadonlySet<string>) : undefined;
+    }),
+
+  /**
    * Mid-turn reply routing (#63). Decides what a bare Discord message typed while
    * a turn is ALREADY active on that thread does:
    *   - "abort" (default): force-abort the running turn and start a fresh one —

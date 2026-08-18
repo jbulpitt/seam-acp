@@ -261,6 +261,7 @@ export class SessionStore {
       try { this.db.exec(ddl); } catch { /* column exists */ }
     }
     this.migrateWakeFireOnStartup();
+    this.migrateInboxPriority();
     this.migratePresetsScope();
   }
 
@@ -278,6 +279,25 @@ export class SessionStore {
     if (!hasColumn) {
       this.db.exec(
         "ALTER TABLE wake_events ADD COLUMN fire_on_startup INTEGER NOT NULL DEFAULT 0"
+      );
+    }
+  }
+
+  /**
+   * Additive migration for priority inbox messages (#66): the prod DB already
+   * has an `inbox` table without `priority`. Add it idempotently — a PRAGMA
+   * guard makes this a no-op once the column exists (and on a freshly-created DB
+   * whose CREATE TABLE already carries it), so boot never throws and no queued
+   * message is lost. Mirrors `migrateWakeFireOnStartup`.
+   */
+  private migrateInboxPriority(): void {
+    const hasColumn = this.db
+      .prepare<[], { name: string }>("PRAGMA table_info(inbox)")
+      .all()
+      .some((c) => c.name === "priority");
+    if (!hasColumn) {
+      this.db.exec(
+        "ALTER TABLE inbox ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
       );
     }
   }
@@ -1196,20 +1216,33 @@ export class SessionStore {
    * inserting, any rows beyond `INBOX_MAX_PER_SESSION` (oldest first) are pruned,
    * so an unpolled inbox is bounded and the newest messages always survive.
    */
-  pushInbox(sessionRef: string, fromRef: string | null, body: string): InboxMessage {
+  pushInbox(
+    sessionRef: string,
+    fromRef: string | null,
+    body: string,
+    priority = false
+  ): InboxMessage {
     const row: InboxMessage = {
       id: randomUUID(),
       sessionRef,
       fromRef,
       body,
+      priority,
       createdUtc: new Date().toISOString(),
     };
     this.db
       .prepare(
-        `INSERT INTO inbox (id, session_ref, from_ref, body, created_utc)
-         VALUES (@id, @sessionRef, @fromRef, @body, @createdUtc)`
+        `INSERT INTO inbox (id, session_ref, from_ref, body, priority, created_utc)
+         VALUES (@id, @sessionRef, @fromRef, @body, @priority, @createdUtc)`
       )
-      .run(row);
+      .run({
+        id: row.id,
+        sessionRef: row.sessionRef,
+        fromRef: row.fromRef,
+        body: row.body,
+        priority: priority ? 1 : 0,
+        createdUtc: row.createdUtc,
+      });
     // Drop-oldest overflow: keep only the newest INBOX_MAX_PER_SESSION rows for
     // this session. rowid is monotonic insertion order, so ORDER BY rowid DESC
     // LIMIT -1 OFFSET N leaves the N newest and selects the rest for deletion.
@@ -1563,6 +1596,7 @@ CREATE TABLE IF NOT EXISTS inbox (
   session_ref  TEXT NOT NULL,
   from_ref     TEXT,
   body         TEXT NOT NULL,
+  priority     INTEGER NOT NULL DEFAULT 0,
   created_utc  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_session ON inbox(session_ref);
@@ -1573,6 +1607,7 @@ interface InboxRow {
   session_ref: string;
   from_ref: string | null;
   body: string;
+  priority: number;
   created_utc: string;
 }
 
@@ -1581,6 +1616,7 @@ const mapInbox = (r: InboxRow): InboxMessage => ({
   sessionRef: r.session_ref,
   fromRef: r.from_ref,
   body: r.body,
+  priority: r.priority !== 0,
   createdUtc: r.created_utc,
 });
 

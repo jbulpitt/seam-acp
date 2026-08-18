@@ -34,6 +34,11 @@ export interface InboxMessage {
   fromRef: string | null;
   /** The message body delivered to the owner on drain. */
   body: string;
+  /** Priority steering flag (#66). When true, the message is URGENT: the owner
+   *  should ABANDON its current plan and reorient to this at its next poll (vs a
+   *  normal note it merely absorbs). Still pull-only and queued — priority does
+   *  NOT cancel or interrupt a turn (that is the separate #67 interrupt tier). */
+  priority: boolean;
   createdUtc: string;
 }
 

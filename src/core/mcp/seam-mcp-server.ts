@@ -183,7 +183,8 @@ export interface SeamMcpServerDeps {
   pushInbox?: (
     caller: SessionRecord,
     to: string,
-    message: string
+    message: string,
+    priority?: boolean
   ) => { ok: true; queued: number } | { ok: false; error: string };
   /**
    * Agent inbox CONSUMER (#61): drain the calling thread's OWN inbox
@@ -200,6 +201,9 @@ export interface SeamMcpServerDeps {
 export interface InboxMessageView {
   fromRef: string | null;
   body: string;
+  /** Priority steering flag (#66). True ⇒ `poll_inbox` renders it FIRST and
+   *  distinctly as an "abandon your current plan and reorient" item. */
+  priority: boolean;
   createdUtc: string;
 }
 
@@ -512,7 +516,9 @@ const TOOLS = [
       "via `send`, coalesced into one block — or \"No new messages.\" when it is empty. Deliver-once: polled " +
       "messages are deleted, so a second poll returns nothing new. You only ever see messages addressed to " +
       "YOU (self-scope — never another thread's inbox). Delivery is pull-only, so call this to pick up " +
-      "asynchronous notes left for you without waiting on a fresh chat turn — mid-turn, or at the start of one.",
+      "asynchronous notes left for you without waiting on a fresh chat turn — mid-turn, or at the start of one. " +
+      "Some messages are flagged PRIORITY: they are surfaced FIRST and mean you should abandon your current plan " +
+      "and reorient to them, even mid-task; ordinary notes you merely fold into your current plan.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -527,12 +533,23 @@ const TOOLS = [
       "message simply waits in the target's inbox until that agent polls for it. THIS IS THE KEY DIFFERENCE " +
       "FROM forward/handoff, which both START A TURN in the target right now: use forward/handoff when you " +
       "need the target to act immediately, and `send` when you only want to leave a note for whenever it next " +
-      "checks. `to` is the target thread id; the message is recorded as coming FROM you.",
+      "checks. `to` is the target thread id; the message is recorded as coming FROM you. " +
+      "Set `priority: true` to flag the message URGENT: it means \"the target should ABANDON its current plan " +
+      "and reorient to this at its next poll\" (the target sees it FIRST, framed distinctly), versus a normal " +
+      "note (priority omitted/false) it merely absorbs into its current plan. Priority is STILL pull-only and " +
+      "queued — it does NOT cancel or interrupt the target's turn; it only changes how urgently the message " +
+      "reads when polled.",
     inputSchema: {
       type: "object",
       properties: {
         to: { type: "string", description: "Target thread id whose inbox to leave the message in." },
         message: { type: "string", description: "The message to queue for the target agent." },
+        priority: {
+          type: "boolean",
+          description:
+            "When true, flag the message urgent: the target should abandon its current plan and reorient " +
+            "to it at its next poll_inbox. Default false (a normal note). Still pull-only — never interrupts a turn.",
+        },
       },
       required: ["to", "message"],
     },
@@ -1175,21 +1192,43 @@ export class SeamMcpServer {
     if (messages.length === 0) {
       return textResult("No new messages.");
     }
-    // Frame the drained block as actionable delegator feedback (#62): each
-    // message attributed to its sender as `[FEEDBACK from <from_ref>]`, coalesced
-    // into ONE block, closed with the standing "incorporate into your current
-    // plan; you do not need to restart" cue so a watchFeedback worker knows it
-    // may absorb this mid-turn without restarting.
-    const framed = messages
-      .map((m) => `[FEEDBACK from ${m.fromRef ?? "unknown"}]: ${m.body}`)
-      .join("\n\n");
+    // Priority steering (#66): render urgent items FIRST and DISTINCTLY. A
+    // priority message frames as an "abandon your current plan and reorient"
+    // directive; normal messages keep the cooperative `[FEEDBACK from <from>]`
+    // framing (#62) that a watchFeedback worker absorbs WITHOUT restarting. When
+    // a single drain has both, priority items lead under a clear header.
+    const priority = messages.filter((m) => m.priority);
+    const normal = messages.filter((m) => !m.priority);
+
+    const blocks: string[] = [];
+    if (priority.length > 0) {
+      const framed = priority
+        .map(
+          (m) =>
+            `[PRIORITY — abandon your current plan and reorient to this]${
+              m.fromRef ? ` (from ${m.fromRef})` : ""
+            }: ${m.body}`
+        )
+        .join("\n\n");
+      blocks.push(
+        `⚠️ PRIORITY — the following ${
+          priority.length === 1 ? "message overrides" : "messages override"
+        } your current plan; stop and reorient to ${priority.length === 1 ? "it" : "them"} now:\n\n${framed}`
+      );
+    }
+    if (normal.length > 0) {
+      const framed = normal
+        .map((m) => `[FEEDBACK from ${m.fromRef ?? "unknown"}]: ${m.body}`)
+        .join("\n\n");
+      blocks.push(
+        `${framed}\n\n— incorporate into your current plan; you do not need to restart.`
+      );
+    }
     this.logger.info(
-      { thread: caller.channelRef, count: messages.length },
+      { thread: caller.channelRef, count: messages.length, priority: priority.length },
       "seam-mcp poll_inbox drained"
     );
-    return textResult(
-      `${framed}\n\n— incorporate into your current plan; you do not need to restart.`
-    );
+    return textResult(blocks.join("\n\n"));
   }
 
   /**
@@ -1209,17 +1248,21 @@ export class SeamMcpServer {
     }
     const to = requireString(args, "to");
     const message = requireString(args, "message");
-    const result = this.deps.pushInbox(caller, to, message);
+    const priority = optionalBool(args, "priority") ?? false;
+    const result = this.deps.pushInbox(caller, to, message, priority);
     if (!result.ok) {
       return textResult(`Message not sent: ${result.error}`, true);
     }
     this.logger.info(
-      { from: caller.channelRef, to, queued: result.queued },
+      { from: caller.channelRef, to, priority, queued: result.queued },
       "seam-mcp send queued"
     );
     return textResult(
-      `Left a message in thread ${to}'s inbox (from ${caller.channelRef}). It will be delivered ` +
-        `when that agent next calls poll_inbox — this did NOT start or interrupt a turn. ` +
+      `Left a ${priority ? "PRIORITY " : ""}message in thread ${to}'s inbox (from ${caller.channelRef}). ` +
+        `It will be delivered when that agent next calls poll_inbox — this did NOT start or interrupt a turn. ` +
+        (priority
+          ? `Flagged urgent: the target is asked to abandon its current plan and reorient to it at its next poll. `
+          : ``) +
         `${result.queued} message(s) now queued there.`
     );
   }

@@ -85,7 +85,7 @@ interface Harness {
   createdWatches: Array<{ record: SessionRecord; req: any }>;
   cancelledWatches: string[];
   /** Per-session-ref inbox backing the send/poll_inbox stubs (session_ref → messages). */
-  inbox: Map<string, Array<{ fromRef: string | null; body: string; createdUtc: string }>>;
+  inbox: Map<string, Array<{ fromRef: string | null; body: string; priority: boolean; createdUtc: string }>>;
   call: (
     method: string,
     params?: unknown,
@@ -195,10 +195,15 @@ async function makeHarness(opts?: {
       : {
           pushInbox:
             opts?.pushInbox ??
-            ((caller, to, message) => {
+            ((caller, to, message, priority) => {
               const ref = `${caller.platform}:${to}`;
               const queue = inbox.get(ref) ?? [];
-              queue.push({ fromRef: caller.channelRef, body: message, createdUtc: "2026-08-16T00:00:00.000Z" });
+              queue.push({
+                fromRef: caller.channelRef,
+                body: message,
+                priority: priority ?? false,
+                createdUtc: "2026-08-16T00:00:00.000Z",
+              });
               inbox.set(ref, queue);
               return { ok: true as const, queued: queue.length };
             }),
@@ -381,6 +386,9 @@ describe("SeamMcpServer", () => {
     expect(withFlag).toContain(WATCH_FEEDBACK_INSTRUCTION);
     expect(withFlag).toContain("poll_inbox");
     expect(withFlag).toContain("you do not need to restart");
+    // #66: the standing text now also steers on PRIORITY items — stop and reorient.
+    expect(withFlag).toContain("PRIORITY");
+    expect(withFlag).toContain("reorient to it, even mid-task");
 
     expect(applyWatchFeedback(base, false)).toBe(base);
     expect(applyWatchFeedback(base, undefined)).toBe(base);
@@ -815,6 +823,69 @@ describe("SeamMcpServer", () => {
     expect(text).toContain("prefer the smaller diff");
     // ...and the standing "you do not need to restart" cooperative cue.
     expect(text).toContain("you do not need to restart");
+  });
+
+  it("send(priority:true) frames the drained message as a PRIORITY abandon-plan directive (#66)", async () => {
+    h = await makeHarness();
+    await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "drop the refactor, ship the hotfix", priority: true } },
+      { "X-Seam-Session": "good-token" }
+    );
+    const poll = await h.call(
+      "tools/call",
+      { name: "poll_inbox", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    const text = poll.body.result.content[0].text;
+    expect(text).toContain("PRIORITY — abandon your current plan and reorient to this");
+    expect(text).toContain("drop the refactor, ship the hotfix");
+    // A priority item is NOT framed as ordinary cooperative FEEDBACK.
+    expect(text).not.toContain("[FEEDBACK from");
+  });
+
+  it("send without priority keeps the ordinary [FEEDBACK …] framing (#66 default)", async () => {
+    h = await makeHarness();
+    await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "a normal note" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    const poll = await h.call(
+      "tools/call",
+      { name: "poll_inbox", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    const text = poll.body.result.content[0].text;
+    expect(text).toContain("[FEEDBACK from thread-caller]: a normal note");
+    expect(text).not.toContain("PRIORITY");
+  });
+
+  it("poll_inbox surfaces PRIORITY items FIRST when a drain mixes priority and normal (#66)", async () => {
+    h = await makeHarness();
+    // Queue a normal note BEFORE the priority one to prove ordering is by
+    // priority, not insertion order.
+    await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "normal-first-note" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    await h.call(
+      "tools/call",
+      { name: "send", arguments: { to: "thread-caller", message: "urgent-reorient", priority: true } },
+      { "X-Seam-Session": "good-token" }
+    );
+    const poll = await h.call(
+      "tools/call",
+      { name: "poll_inbox", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    const text = poll.body.result.content[0].text;
+    // Both present, priority framed distinctly...
+    expect(text).toContain("urgent-reorient");
+    expect(text).toContain("[FEEDBACK from thread-caller]: normal-first-note");
+    // ...and the priority block precedes the normal one despite arriving later.
+    expect(text.indexOf("urgent-reorient")).toBeLessThan(text.indexOf("normal-first-note"));
   });
 
   it("poll_inbox rejects an unknown token with -32001 (#61)", async () => {

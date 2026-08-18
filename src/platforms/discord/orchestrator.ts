@@ -2635,7 +2635,8 @@ export class Orchestrator {
   pushInbox(
     caller: SessionRecord,
     to: string,
-    message: string
+    message: string,
+    priority = false
   ): { ok: true; queued: number } | { ok: false; error: string } {
     const body = (message ?? "").trim();
     if (!body) return { ok: false, error: "message is required and must be non-empty." };
@@ -2643,7 +2644,7 @@ export class Orchestrator {
     if (!target) return { ok: false, error: "to (a target thread id) is required." };
 
     const sessionRef = `${caller.platform}:${target}`;
-    const stored = this.store.pushInbox(sessionRef, caller.channelRef, body);
+    const stored = this.store.pushInbox(sessionRef, caller.channelRef, body, priority);
     try {
       this.store.recordDelegation({
         id: stored.id,
@@ -2659,7 +2660,7 @@ export class Orchestrator {
       this.logger.warn({ err, from: caller.channelRef, to: target }, "inbox: push ledger record failed");
     }
     const queued = this.store.countInbox(sessionRef);
-    this.logger.info({ from: caller.channelRef, to: target, queued }, "inbox: message pushed");
+    this.logger.info({ from: caller.channelRef, to: target, priority, queued }, "inbox: message pushed");
     return { ok: true, queued };
   }
 

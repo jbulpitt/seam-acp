@@ -162,7 +162,8 @@ export const WATCH_FEEDBACK_INSTRUCTION =
   "At natural checkpoints (before starting a major step, after finishing a tool " +
   "batch), call `poll_inbox` to check for feedback from your delegator. If it " +
   "returns guidance, incorporate it into your current plan before continuing — " +
-  "you do not need to restart.";
+  "you do not need to restart. If poll_inbox returns a PRIORITY item, stop your " +
+  "current approach immediately and reorient to it, even mid-task.";
 
 /** Append the `watchFeedback` standing instruction to an already-assembled
  *  worker prompt when the spec opts in (#62); otherwise return it verbatim.

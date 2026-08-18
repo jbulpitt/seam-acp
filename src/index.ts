@@ -494,7 +494,7 @@ async function main(): Promise<void> {
       // target thread's durable inbox — no dispatch, no turn — and the CONSUMER
       // (`poll_inbox`) drains the caller's OWN inbox. The orchestrator owns the
       // store rows + best-effort ledger; delivery is deliver-once-then-delete.
-      pushInbox: (caller, to, message) => orchestrator.pushInbox(caller, to, message),
+      pushInbox: (caller, to, message, priority) => orchestrator.pushInbox(caller, to, message, priority),
       drainInbox: (record) => orchestrator.drainInbox(record),
     });
     await seamMcpServer.start();

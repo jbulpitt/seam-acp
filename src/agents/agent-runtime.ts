@@ -388,6 +388,12 @@ export class AgentRuntime {
     return this.promptCapabilities;
   }
 
+  /** Send an arbitrary ACP JSON-RPC method on the live connection (e.g. grok
+   *  `_x.ai/billing`). The session need not exist — initialize is enough. */
+  request<T = unknown>(method: string, params?: unknown): Promise<T> {
+    return this.requireConnection().request<T>(method, params);
+  }
+
   /** Create a new ACP session in `cwd`. */
   async newSession(opts: NewSessionOptions): Promise<SessionInfo> {
     // Fresh session: no history to replay, so never gate. (A prior failed

@@ -8906,9 +8906,10 @@ export class Orchestrator {
     const isCopilot =
       record.agentId === "copilot" ||
       (record.agentId.startsWith("copilot-") && !record.agentId.startsWith("copilot-remote"));
-    if (!isAgy && !isClaude && !isCopilot) {
+    const isGrok = record.agentId === "grok" || record.agentId.startsWith("grok-");
+    if (!isAgy && !isClaude && !isCopilot && !isGrok) {
       await i.editReply({
-        content: `\`/seam usage\` is only available for the \`agy\`, \`claude\`, and \`copilot\` agents. This thread uses \`${record.agentId}\`.`,
+        content: `\`/seam usage\` is only available for the \`agy\`, \`claude\`, \`copilot\`, and \`grok\` agents. This thread uses \`${record.agentId}\`.`,
       });
       return;
     }
@@ -8923,6 +8924,16 @@ export class Orchestrator {
         const { fetchClaudeUsage } = await import("../../agents/profiles/claude.js");
         const data = await fetchClaudeUsage(configDir);
         await i.editReply({ content: formatClaudeUsage(data) });
+      } else if (isGrok) {
+        const {
+          fetchGrokUsage,
+          fetchGrokUsageFromConnection,
+        } = await import("../../agents/profiles/grok.js");
+        const live = this.router.getRuntime(record.id);
+        const data = live
+          ? await fetchGrokUsageFromConnection((method, params) => live.request(method, params))
+          : await fetchGrokUsage(this.config.GROK_CLI_PATH);
+        await i.editReply({ content: formatGrokUsage(data) });
       } else {
         const { fetchCopilotUsage } = await import("../../agents/profiles/copilot.js");
         const data = await fetchCopilotUsage(configDir);
@@ -8999,7 +9010,7 @@ export class Orchestrator {
       "",
       "**`/seam info`**",
       "`/seam info whoami` — show the account this thread's agent is signed in as",
-      "`/seam info usage` — show usage / credits (agy only)",
+      "`/seam info usage` — show usage / credits (agy, claude, copilot, grok)",
       "`/seam info avatar` — re-push bot avatar to Discord",
       "`/seam info help` — this list",
       "`/seam info sessions` — list known sessions",
@@ -10793,6 +10804,25 @@ function formatCopilotUsage(
   if (quotas.length > 0) {
     lines.push("", "**Quotas**", ...quotas);
     if (d.quotaResetAt) lines.push(`Resets ${formatResetTime(d.quotaResetAt)}`);
+  }
+  return lines.join("\n");
+}
+
+function formatGrokUsage(
+  d: import("../../agents/profiles/grok.js").GrokUsageData
+): string {
+  const lines: string[] = [];
+  lines.push(`**Grok usage**${d.subscriptionTier ? ` — ${d.subscriptionTier}` : ""}`);
+  const period = d.periodType ? d.periodType : "period";
+  const reset = d.periodEnd ? ` · resets ${formatResetTime(d.periodEnd)}` : "";
+  if (d.creditUsagePercent !== null) {
+    lines.push(
+      "",
+      `**${period.charAt(0).toUpperCase() + period.slice(1)} allowance**`,
+      usageLine(d.creditUsagePercent, `used${reset}`)
+    );
+  } else {
+    lines.push("No billing data available.");
   }
   return lines.join("\n");
 }

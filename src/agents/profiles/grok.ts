@@ -178,6 +178,190 @@ export function makeGrokProfile(opts: {
   };
 }
 
+/** Custom ACP method the TUI `/usage` panel uses (leading underscore is load-bearing). */
+export const GROK_BILLING_METHOD = "_x.ai/billing";
+
+export interface GrokUsageData {
+  subscriptionTier: string | null;
+  /** 0–100 weekly (or current-period) allowance used. */
+  creditUsagePercent: number | null;
+  periodType: string | null;
+  periodStart: string | null;
+  periodEnd: string | null;
+  isUnifiedBillingUser: boolean;
+}
+
+/**
+ * Normalize the `_x.ai/billing` payload. The TUI "Usage limit" tab is
+ * `creditUsagePercent` + `subscription_tier` + the weekly period — not
+ * `_x.ai/session/usage` (that's per-session token counts).
+ */
+export function parseGrokBilling(raw: unknown): GrokUsageData {
+  const root = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const config =
+    root.config && typeof root.config === "object"
+      ? (root.config as Record<string, unknown>)
+      : {};
+  const period =
+    config.currentPeriod && typeof config.currentPeriod === "object"
+      ? (config.currentPeriod as Record<string, unknown>)
+      : {};
+  const periodTypeRaw = typeof period.type === "string" ? period.type : null;
+  const periodType = periodTypeRaw
+    ? periodTypeRaw.replace(/^USAGE_PERIOD_TYPE_/i, "").toLowerCase()
+    : null;
+  const pct = config.creditUsagePercent;
+  return {
+    subscriptionTier:
+      typeof root.subscription_tier === "string" ? root.subscription_tier : null,
+    creditUsagePercent: typeof pct === "number" && Number.isFinite(pct) ? pct : null,
+    periodType,
+    periodStart:
+      (typeof period.start === "string" && period.start) ||
+      (typeof config.billingPeriodStart === "string" && config.billingPeriodStart) ||
+      null,
+    periodEnd:
+      (typeof period.end === "string" && period.end) ||
+      (typeof config.billingPeriodEnd === "string" && config.billingPeriodEnd) ||
+      null,
+    isUnifiedBillingUser: config.isUnifiedBillingUser === true,
+  };
+}
+
+/**
+ * Ask a live grok ACP connection for the SuperGrok weekly allowance.
+ * `request` is `AgentRuntime.request` / `ClientSideConnection.request`.
+ */
+export async function fetchGrokUsageFromConnection(
+  request: (method: string, params?: unknown) => Promise<unknown>
+): Promise<GrokUsageData> {
+  const raw = await request(GROK_BILLING_METHOD, {});
+  return parseGrokBilling(raw);
+}
+
+/**
+ * Spawn a throwaway `grok agent stdio`, initialize (no session/new), call
+ * `_x.ai/billing`, and kill the process. Use when no grok runtime is warm.
+ */
+export async function fetchGrokUsage(cliPath?: string): Promise<GrokUsageData> {
+  const cli = cliPath?.trim() || "grok";
+  const child = spawn(cli, ["agent", "stdio"], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env },
+    detached: true,
+  });
+
+  let buf = "";
+  let nextId = 1;
+  const pending = new Map<
+    number,
+    { resolve: (v: unknown) => void; reject: (e: Error) => void }
+  >();
+
+  const onData = (chunk: Buffer) => {
+    buf += chunk.toString("utf8");
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      let msg: {
+        id?: number;
+        method?: string;
+        result?: unknown;
+        error?: { code?: number; message?: string };
+      };
+      try {
+        msg = JSON.parse(line) as typeof msg;
+      } catch {
+        continue;
+      }
+      if (msg.id != null && pending.has(msg.id)) {
+        const p = pending.get(msg.id)!;
+        pending.delete(msg.id);
+        if (msg.error) {
+          p.reject(
+            new Error(msg.error.message || `rpc error ${msg.error.code ?? ""}`.trim())
+          );
+        } else {
+          p.resolve(msg.result);
+        }
+      } else if (msg.method && msg.id != null && child.stdin.writable) {
+        child.stdin.write(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: { code: -32601, message: "not implemented" },
+          }) + "\n"
+        );
+      }
+    }
+  };
+  child.stdout.on("data", onData);
+
+  const call = (method: string, params: unknown, timeoutMs: number) =>
+    new Promise<unknown>((resolve, reject) => {
+      const id = nextId++;
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`grok ${method} timed out after ${timeoutMs / 1000}s`));
+      }, timeoutMs);
+      pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
+      if (!child.stdin.writable) {
+        clearTimeout(timer);
+        pending.delete(id);
+        reject(new Error("grok stdin closed"));
+        return;
+      }
+      child.stdin.write(
+        JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n"
+      );
+    });
+
+  const exit = new Promise<never>((_, reject) => {
+    child.once("error", (err) => reject(new Error(`grok spawn failed: ${err.message}`)));
+    child.once("exit", (code, signal) => {
+      reject(new Error(`grok exited before billing (code=${code}, signal=${signal})`));
+    });
+  });
+
+  try {
+    await Promise.race([
+      call(
+        "initialize",
+        {
+          protocolVersion: 1,
+          clientInfo: { name: "seam-acp", version: "0" },
+          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+        },
+        30_000
+      ),
+      exit,
+    ]);
+    const raw = await Promise.race([
+      call(GROK_BILLING_METHOD, {}, 20_000),
+      exit,
+    ]);
+    return parseGrokBilling(raw);
+  } finally {
+    child.stdout.off("data", onData);
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Grok session manager — minimal implementation for context-window display.
 // Reads chat_history.jsonl from ~/.grok/sessions/<encodedCwd>/<sessionId>/

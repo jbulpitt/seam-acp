@@ -441,6 +441,11 @@ export class SessionRouter {
     return this.runtimes.has(sessionId);
   }
 
+  /** The live runtime for this session, if one is already started. */
+  getRuntime(sessionId: string): AgentRuntime | undefined {
+    return this.runtimes.get(sessionId);
+  }
+
   /** Whether a live turn is CURRENTLY running for this session (#73) — a DERIVED
    *  read over the runtime's internal `busy` flag, not new tracked state. False
    *  when no runtime is alive (nothing can be mid-turn without one), so a

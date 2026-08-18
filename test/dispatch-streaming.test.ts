@@ -108,6 +108,8 @@ function makeOrch(opts: {
     getPresetByName: () => null,
     recordDelegation: () => {},
     updateDelegationStatus: () => {},
+    getReportBackByCorrelation: () => null,
+    tryRecordReportBack: (e: unknown) => e,
   };
   const config = {
     DATA_DIR: opts.dataDir,

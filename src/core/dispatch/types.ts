@@ -11,7 +11,7 @@
  */
 import { z } from "zod";
 import * as path from "node:path";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import type { DelegationKind } from "../types.js";
 
 /** How the dispatched turn acquires its ACP session — see `InjectTurnOptions`. */
@@ -265,4 +265,38 @@ export async function enqueueDispatchSpec(
   const final = path.join(dirs.pending, `${spec.id}.json`);
   await writeFile(tmp, `${JSON.stringify(spec, null, 2)}\n`, "utf8");
   await rename(tmp, final);
+}
+
+/**
+ * Look for an already-queued report-back spec for `correlationId` in
+ * `pending/` and `running/`. `done/` holds *results* (no `kind`), so it
+ * cannot identify a report-back — the ledger is the durable record once
+ * the spec has left the queue (#77).
+ */
+export async function findQueuedReportBackSpec(
+  dataDir: string,
+  correlationId: string
+): Promise<DispatchSpec | null> {
+  const dirs = dispatchDirs(dataDir);
+  for (const dir of [dirs.pending, dirs.running]) {
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const id = name.slice(0, -".json".length);
+      try {
+        const spec = parseDispatchSpec(id, await readFile(path.join(dir, name), "utf8"));
+        if (spec.kind === "report_back" && spec.correlationId === correlationId) {
+          return spec;
+        }
+      } catch {
+        // Unparseable / not a spec — ignore (done-shaped files, tmp leftovers).
+      }
+    }
+  }
+  return null;
 }

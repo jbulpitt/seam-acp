@@ -142,8 +142,8 @@ import {
   applyWatchFeedback,
   applyPresetIdentity,
   buildChainHopSpec,
-  dispatchDirs,
   enqueueDispatchSpec,
+  findQueuedReportBackSpec,
   type DispatchSpec,
 } from "../../core/dispatch/types.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
@@ -3959,7 +3959,14 @@ export class Orchestrator {
   /** Report-back: enqueue a fresh dispatch that delivers a completed handoff's
    *  output into its `returnTo` thread, wrapped so the receiving agent knows it
    *  is a report-back and from where. Correlation-linked; kind = report_back.
-   *  Written atomically (tmp + rename) so the watcher never reads a half-file. */
+   *  Idempotent on `correlationId` (#77): the ledger is the source of truth —
+   *  a crash between this enqueue and the watcher's done-file commit used to
+   *  re-run the worker and deliver twice. We claim the `report_back` ledger
+   *  row first so a re-run sees it and skips.
+   *
+   *  Follow-up (not this patch): moving report-back enqueue to AFTER the
+   *  done-file commit would close the window structurally, but it's a larger
+   *  watcher/orchestrator contract change. Dedup is the smaller, safer fix. */
   private async enqueueReportBack(
     spec: DispatchSpec,
     output: string,
@@ -3988,13 +3995,71 @@ export class Orchestrator {
       kind: "report_back",
       createdUtc: new Date().toISOString(),
     };
-    const dirs = dispatchDirs(this.config.DATA_DIR);
-    await fsp.mkdir(dirs.pending, { recursive: true });
-    const tmp = path.join(dirs.pending, `.${id}.json.tmp`);
-    const final = path.join(dirs.pending, `${id}.json`);
-    await fsp.writeFile(tmp, JSON.stringify(reportSpec, null, 2), "utf8");
-    await fsp.rename(tmp, final);
-    this.logger.info({ reportBack: id, returnTo, correlation }, "dispatch: report-back enqueued");
+    const enqueued = await this.claimAndEnqueueReportBack(correlation, reportSpec, {
+      sourceRef: spec.target,
+      targetRef: returnTo,
+    });
+    if (enqueued) {
+      this.logger.info({ reportBack: id, returnTo, correlation }, "dispatch: report-back enqueued");
+    }
+  }
+
+  /**
+   * Claim a `report_back` ledger row for `correlationId` and enqueue `spec`.
+   * Returns true if this call won the claim and wrote the spec, false if a
+   * report-back for this correlation already exists (ledger or pending/running).
+   * The ledger write is committed BEFORE the spec lands so a crash in the
+   * watcher window (after we return, before the done-file) still sees the claim.
+   */
+  private async claimAndEnqueueReportBack(
+    correlationId: string,
+    spec: DispatchSpec,
+    refs: { sourceRef: string | null; targetRef: string | null }
+  ): Promise<boolean> {
+    if (this.store.getReportBackByCorrelation(correlationId)) {
+      this.logger.info(
+        { correlationId, spec: spec.id },
+        "dispatch: report-back skipped — ledger already has this correlation (#77)"
+      );
+      return false;
+    }
+    const queued = await findQueuedReportBackSpec(this.config.DATA_DIR, correlationId);
+    if (queued) {
+      // Repair: a pre-#77 (or crash-between-enqueue-and-claim) spec is already
+      // on disk. Backfill the ledger so later restarts don't depend on the file.
+      this.store.tryRecordReportBack({
+        id: queued.id,
+        kind: "report_back",
+        sourceRef: refs.sourceRef,
+        targetRef: refs.targetRef,
+        promptPreview: queued.prompt,
+        correlationId,
+        status: "dispatched",
+      });
+      this.logger.info(
+        { correlationId, existing: queued.id },
+        "dispatch: report-back skipped — spec already queued (#77)"
+      );
+      return false;
+    }
+    const claimed = this.store.tryRecordReportBack({
+      id: spec.id,
+      kind: "report_back",
+      sourceRef: refs.sourceRef,
+      targetRef: refs.targetRef,
+      promptPreview: spec.prompt,
+      correlationId,
+      status: "dispatched",
+    });
+    if (!claimed) {
+      this.logger.info(
+        { correlationId, spec: spec.id },
+        "dispatch: report-back skipped — lost the atomic claim (#77)"
+      );
+      return false;
+    }
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    return true;
   }
 
   /**
@@ -4006,8 +4071,14 @@ export class Orchestrator {
    *    (fresh dispatch, same chainId, kind="forward");
    *  - if none remain, deliver the final output to the chain's `originRef`
    *    (a normal report-back) and `completeChain`.
-   * Advancing happens only here, at a hop's completion, so a restart mid-hop
-   * re-runs that hop and re-reads this state — advancing exactly once.
+   *
+   * #77: a crash between this advance and the watcher's done-file used to
+   * re-run the same hop and advance AGAIN (skip a worker, or double-deliver
+   * the origin). We claim a hop-scoped `report_back` ledger row (keyed on
+   * this spec's id — chain hops share `correlationId = chainId`, so that
+   * key alone cannot distinguish hops) BEFORE mutating the chain, so a
+   * re-run of the same hop is a no-op. The chain's origin delivery uses
+   * the same report-back claim on `chainId`.
    */
   private async advanceChain(spec: DispatchSpec, output: string, error?: string): Promise<void> {
     const chainId = spec.chainId;
@@ -4022,13 +4093,41 @@ export class Orchestrator {
       return;
     }
 
+    // Hop-scoped claim: one advance (or fail-delivery) per completing spec.
+    if (!this.claimChainHopAdvance(spec, chainId)) {
+      this.logger.info(
+        { chainId, dispatch: spec.id },
+        "chain: advance skipped — hop already claimed (#77)"
+      );
+      // Repair the inner window (claimed, then crashed before terminal
+      // enqueue/complete). Do NOT call store.advanceChain again.
+      const current = this.store.getChain(chainId);
+      if (current?.status === "running") {
+        if (error) {
+          await this.enqueueChainDelivery(
+            current.originRef,
+            chainId,
+            `The chain broke at a hop: ${error}\n\n--- partial output ---\n${output}`
+          );
+          this.store.completeChain(chainId, "failed");
+        } else if (current.hops.length === 0) {
+          await this.enqueueChainDelivery(current.originRef, chainId, output);
+          this.store.completeChain(chainId);
+        }
+      }
+      return;
+    }
+
     if (error) {
-      this.store.completeChain(chainId, "failed");
+      // Enqueue the failure delivery BEFORE marking the chain terminal, so a
+      // crash between the two still re-enters this path (chain still running)
+      // and the correlation claim on `chainId` keeps the delivery unique.
       await this.enqueueChainDelivery(
         chain.originRef,
         chainId,
         `The chain broke at a hop: ${error}\n\n--- partial output ---\n${output}`
       );
+      this.store.completeChain(chainId, "failed");
       this.logger.warn({ chainId, dispatch: spec.id, error }, "chain: hop failed; chain marked failed");
       return;
     }
@@ -4061,10 +4160,32 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Durable "this hop already advanced the chain" claim (#77). Keyed on the
+   * completing spec's id (not the chain's shared correlation) so hop N's
+   * claim cannot block hop N+1. Uses a synthetic ledger id so it does not
+   * collide with the hop's own `kind=forward` row (`id = spec.id`).
+   */
+  private claimChainHopAdvance(spec: DispatchSpec, chainId: string): boolean {
+    if (this.store.getReportBackByCorrelation(spec.id)) return false;
+    const claimed = this.store.tryRecordReportBack({
+      id: `chain_advance:${spec.id}`,
+      kind: "report_back",
+      sourceRef: chainId,
+      targetRef: spec.target,
+      worker: spec.preset ?? null,
+      promptPreview: spec.prompt,
+      correlationId: spec.id,
+      status: "completed",
+    });
+    return claimed !== null;
+  }
+
   /** Deliver a chain's terminal output into its origin thread as a fresh live
    *  dispatch (correlation-linked to the chain). Deliberately carries NO
    *  `chainId`, so this delivery does not itself try to advance a chain.
-   *  Written atomically via `enqueueDispatchSpec`. */
+   *  Written atomically via `enqueueDispatchSpec`. Idempotent on `chainId`
+   *  via the same #77 report-back claim as a normal handoff report-back. */
   private async enqueueChainDelivery(
     originRef: string,
     chainId: string,
@@ -4087,8 +4208,13 @@ export class Orchestrator {
       kind: "report_back",
       createdUtc: new Date().toISOString(),
     };
-    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
-    this.logger.info({ chainId, originRef, delivery: id }, "chain: origin delivery enqueued");
+    const enqueued = await this.claimAndEnqueueReportBack(chainId, spec, {
+      sourceRef: chainId,
+      targetRef: originRef,
+    });
+    if (enqueued) {
+      this.logger.info({ chainId, originRef, delivery: id }, "chain: origin delivery enqueued");
+    }
   }
 
   /** Post a dispatch's captured output to the target thread — cards, or a file

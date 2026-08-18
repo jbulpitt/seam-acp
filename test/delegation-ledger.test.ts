@@ -223,4 +223,82 @@ describe("delegation ledger", () => {
     expect(s2.getDelegationByCorrelation("corr-1")?.id).toBe("del-1");
     s2.close();
   });
+
+  it("tryRecordReportBack claims a correlation once and skips the second write", () => {
+    const first = store.tryRecordReportBack({
+      id: "rb-1",
+      kind: "report_back",
+      sourceRef: "thread-w",
+      targetRef: "thread-boss",
+      correlationId: "corr-dup",
+      promptPreview: "done",
+    });
+    expect(first).toMatchObject({
+      id: "rb-1",
+      kind: "report_back",
+      correlationId: "corr-dup",
+      status: "dispatched",
+    });
+    expect(store.getReportBackByCorrelation("corr-dup")?.id).toBe("rb-1");
+
+    const second = store.tryRecordReportBack({
+      id: "rb-2",
+      kind: "report_back",
+      correlationId: "corr-dup",
+    });
+    expect(second).toBeNull();
+    // Still exactly one report_back row for this correlation.
+    expect(
+      store.listRecentDelegations().filter(
+        (e) => e.kind === "report_back" && e.correlationId === "corr-dup"
+      )
+    ).toHaveLength(1);
+  });
+
+  it("getReportBackByCorrelation ignores a handoff row that shares the correlation", () => {
+    store.recordDelegation(
+      sample({ id: "handoff-1", kind: "handoff", correlationId: "shared-rb" })
+    );
+    expect(store.getReportBackByCorrelation("shared-rb")).toBeNull();
+    expect(store.getDelegationByCorrelation("shared-rb")?.id).toBe("handoff-1");
+
+    store.tryRecordReportBack({
+      id: "rb-shared",
+      kind: "report_back",
+      correlationId: "shared-rb",
+    });
+    expect(store.getReportBackByCorrelation("shared-rb")?.id).toBe("rb-shared");
+    // Originating-row lookup is still the earlier handoff.
+    expect(store.getDelegationByCorrelation("shared-rb")?.id).toBe("handoff-1");
+  });
+
+  it("tryRecordReportBack rejects a non-report_back kind", () => {
+    expect(() =>
+      store.tryRecordReportBack(sample({ kind: "handoff" }))
+    ).toThrow(/report_back/);
+  });
+
+  it("the report_back claim survives a store reopen", () => {
+    const dbPath = path.join(dir, "rb-reopen.db");
+    const s1 = new SessionStore(dbPath);
+    expect(
+      s1.tryRecordReportBack({
+        id: "rb-persist",
+        kind: "report_back",
+        correlationId: "corr-persist",
+      })
+    ).not.toBeNull();
+    s1.close();
+
+    const s2 = new SessionStore(dbPath);
+    expect(s2.getReportBackByCorrelation("corr-persist")?.id).toBe("rb-persist");
+    expect(
+      s2.tryRecordReportBack({
+        id: "rb-persist-2",
+        kind: "report_back",
+        correlationId: "corr-persist",
+      })
+    ).toBeNull();
+    s2.close();
+  });
 });

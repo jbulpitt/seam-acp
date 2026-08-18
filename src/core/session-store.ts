@@ -245,6 +245,7 @@ export class SessionStore {
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
     this.db.exec(DELEGATION_SCHEMA);
+    this.migrateReportBackDedupIndex();
     this.db.exec(CONFIG_AUDIT_SCHEMA);
     this.db.exec(ACTIVE_PROJECTS_SCHEMA);
     this.db.exec(CHAINS_SCHEMA);
@@ -265,6 +266,28 @@ export class SessionStore {
     this.migrateWakeFireOnStartup();
     this.migrateInboxPriority();
     this.migratePresetsScope();
+  }
+
+  /**
+   * Additive unique index so a correlation can have at most one `report_back`
+   * ledger row (#77). The crash window (report-back already queued, original
+   * still in `running/`) re-runs the worker; this index is the durable claim
+   * that makes the second enqueue a no-op. Partial: only `report_back` rows
+   * with a correlation are unique, so a handoff + its report-back can still
+   * share a correlation, and chain hops can still share `kind=forward`.
+   * try/catch: a pre-#77 DB that already has duplicate report-backs must not
+   * fail boot — the query-side `WHERE NOT EXISTS` still dedups new writes.
+   */
+  private migrateReportBackDedupIndex(): void {
+    try {
+      this.db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_report_back_correlation
+           ON delegation_log(correlation_id)
+           WHERE kind = 'report_back' AND correlation_id IS NOT NULL`
+      );
+    } catch {
+      /* leftover duplicates from the pre-#77 crash window */
+    }
   }
 
   /**
@@ -877,6 +900,76 @@ export class SessionStore {
       )
       .get(correlationId);
     return row ? mapLedger(row) : null;
+  }
+
+  /**
+   * The `report_back` row for a correlation, if one has been claimed.
+   * Distinct from {@link getDelegationByCorrelation}, which returns the
+   * earliest row of any kind (typically the originating handoff).
+   */
+  getReportBackByCorrelation(correlationId: string): LedgerEntry | null {
+    const row = this.db
+      .prepare<[string], LedgerRow>(
+        `SELECT * FROM delegation_log
+         WHERE kind = 'report_back' AND correlation_id = ?
+         ORDER BY created_utc ASC, rowid ASC LIMIT 1`
+      )
+      .get(correlationId);
+    return row ? mapLedger(row) : null;
+  }
+
+  /**
+   * Atomically claim a `report_back` ledger row for `entry.correlationId`.
+   * Returns the persisted row when this call wins the claim, or `null` when
+   * a report-back for that correlation already exists (the #77 crash-window
+   * dedup). The unique index + `WHERE NOT EXISTS` make the check-then-write
+   * a single SQLite statement, so a re-run after a crash sees the claim.
+   *
+   * `entry.kind` must be `"report_back"`. A missing correlation falls through
+   * to a plain insert (nothing to dedup on).
+   */
+  tryRecordReportBack(entry: LedgerEntryInput): LedgerEntry | null {
+    if (entry.kind !== "report_back") {
+      throw new Error("tryRecordReportBack requires kind=\"report_back\"");
+    }
+    const now = new Date().toISOString();
+    const createdUtc = entry.createdUtc ?? now;
+    const row: LedgerEntry = {
+      id: entry.id,
+      sourceRef: entry.sourceRef ?? null,
+      targetRef: entry.targetRef ?? null,
+      worker: entry.worker ?? null,
+      kind: "report_back",
+      promptPreview: truncatePreview(entry.promptPreview ?? null),
+      correlationId: entry.correlationId ?? null,
+      status: entry.status ?? "dispatched",
+      createdUtc,
+      updatedUtc: entry.updatedUtc ?? createdUtc,
+    };
+    try {
+      const info = this.db
+        .prepare(
+          `INSERT INTO delegation_log
+             (id, source_ref, target_ref, worker, kind, prompt_preview,
+              correlation_id, status, created_utc, updated_utc)
+           SELECT
+             @id, @sourceRef, @targetRef, @worker, @kind, @promptPreview,
+             @correlationId, @status, @createdUtc, @updatedUtc
+           WHERE @correlationId IS NULL OR NOT EXISTS (
+             SELECT 1 FROM delegation_log
+              WHERE kind = 'report_back' AND correlation_id = @correlationId
+           )`
+        )
+        .run(row);
+      if (info.changes === 0) return null;
+      return row;
+    } catch (err) {
+      // PK / unique-index collision: another writer claimed this correlation
+      // (or this id) first. Treat as "already claimed".
+      const code = (err as { code?: string }).code ?? "";
+      if (code.startsWith("SQLITE_CONSTRAINT")) return null;
+      throw err;
+    }
   }
 
   /** Rows still in flight, oldest first — the order a watchdog wants. */

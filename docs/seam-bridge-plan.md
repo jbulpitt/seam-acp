@@ -1,7 +1,19 @@
 # Seam Bridge — generalized machine-to-machine agent conduit
 
 **Status:** build-ready spec (D0–D11 locked) · **Created:** 2026-06-05 ·
-**Updated:** 2026-06-05 · **Owner:** jbulpitt · **Start at:** §9 PR0
+**Updated:** 2026-08-18 (vetted vs. current code — see **§14 Amendment**) ·
+**Owner:** jbulpitt · **Start at:** §9 PR0
+
+> **⚠️ 2026-08-18 vetting.** The spine still holds — location-as-binding, co-located
+> adapters, the command bus, keeping `makeMux`, and the PR0→PR4 sequence are all
+> intact and arguably *more* valuable now (more agents; a worker pool that could run
+> remote). But four systems built since 6/05 — **seam-MCP** (the agent-facing
+> orchestration tools), the **config-mutation admin/participant/lock tiers**
+> (#58/#71/#74), the **#78 command-tree rebuild**, and **turn-resume** (#75/#76) —
+> intersect this spec and change requirements. **Read §14 before building PR3/PR4.**
+> Body counts/anchors (agent roster, orchestrator LOC, `/seam sessions` path,
+> thread-rename caveat) have drifted; §14.0 lists the cosmetic refreshes and
+> §14.1–14.4 are the substantive changes (each written to become its own issue).
 
 Reframe the "remote agent" from a bespoke *agent type* into a generic *transport +
 command bus* so any agent (claude, copilot, agy, opencode, …) can run on any number
@@ -454,3 +466,159 @@ tests in `seam-bridge`.
   `scripts/remote-agent-bridge.mjs`, consumed in `src/agents/agent-runtime.ts`.
 - The browser-automation substrate in [integrations-research.md](./integrations-research.md)
   could run *as an agent on a bridge host* — the two roadmaps compose.
+
+---
+
+## 14. Amendment — 2026-08-18 vetting against current code
+
+The original body (§0–§13) is preserved as written on 6/05. This amendment records
+what changed in seam-acp since then and how it modifies the plan. **§14.0** is cosmetic
+(fold into PR0/PR1 with no design change). **§14.1–14.4** are substantive and each is
+scoped to become its own GitHub issue.
+
+### 14.0 — Cosmetic refreshes (no design change; fold into PR0/PR1)
+
+- **Agent roster: 4 → 6.** PR1 recasts not just claude/copilot/agy/opencode but also
+  **codex** and **grok** (registered in `index.ts`), plus the claude-vertex /
+  ollama-cloud variants. The adapter contract (§4) is unchanged; there are just more
+  implementers. `grok`'s `effort` descriptor also gained a **`spawnArgs`** mechanism
+  (CLI `--reasoning-effort` at spawn) — one more `mechanism` value the adapter's
+  `describe()` must round-trip.
+- **`orchestrator.ts` is now ~11k LOC (was 5.9k).** The §9 debt note (A1) about
+  extracting `/seam bridge`, `/seam debug`, and selection UI into their own modules is
+  no longer optional politeness — it is a **hard prerequisite** for landing the bridge
+  UI without making the file unmaintainable.
+- **Dev-loop note is stale.** The "~4 known pre-existing `thread-rename` failures,
+  ignore them" caveat is obsolete — the suite is fully green (700+ passing). Remove it.
+- **UI anchors moved by #78.** `/seam sessions` is now **`/seam info sessions`**; the
+  model/effort/agent/etc. pickers and config commands live under the new **`config`**
+  subcommand group. Any §-body reference to `/seam sessions` or a flat config command
+  should be re-anchored. `npm run patch-acp` is already retired (accurate as written).
+
+### 14.1 — Security must compose with the config-mutation tiers (#58/#71/#74)  [issue-ready; amends §6, §6.1, D7, D8]
+
+**Problem.** §6.1/D7 assume *"a single operator, no elevation gating, the same bridge
+token."* That premise is void: seam-acp now has **three tiers** — admin
+(`SEAM_CONFIG_ADMIN_USER_IDS`) > participant (`SEAM_PARTICIPANT_USER_IDS`, e.g. the
+student accounts) > operator (plain `DISCORD_ALLOWED_USER_IDS`) — enforced on **every**
+`/seam` subcommand via `isParticipantSlashRefused` + `isLockedSlashRefused`
+(orchestrator.ts). A `/seam bridge`/`/seam debug` command therefore inherits gating for
+free, but the **default gate only refuses participants** — it would still let a
+non-admin operator pair a bridge or open a dev-mode RCE tunnel.
+
+**Decisions.**
+- **D7-rev / D8-rev — admin-only, not merely non-participant.** `/seam bridge add|rotate`
+  and `/seam debug <bridge>` (dev-mode `exec`/`shell`/`writeFile`/`tailLog`) MUST require
+  the invoker's harness-stamped id ∈ `SEAM_CONFIG_ADMIN_USER_IDS`. Reuse the #71 admin
+  predicate; do **not** add these to `LOCK_EXEMPT_SUBCOMMANDS` or
+  `PARTICIPANT_ALLOWED_SUBCOMMANDS`. Result: admin-immune in locked channels, refused
+  for everyone else — the same posture `/seam config detach` (#80) landed with.
+- **Audit the control surface.** Every pair / rotate / dev-mode-enable writes a
+  `config_audit` row (#70): actor id+name, bridgeId, action. Dev-mode RCE especially
+  needs a trail now that it isn't a single-operator box.
+- **Dev-mode double-gate.** Keep `--dev` off-by-default on the bridge *and* require the
+  admin gate control-plane-side even when the flag is on. `SEAM_BRIDGE_DEV=1` alone must
+  not open the tunnel to a non-admin.
+
+**Acceptance.** A participant or non-admin operator is refused pair/rotate/debug; an
+admin succeeds; each action writes an audit row; refusals log the resolved speaker id;
+with `SPEAKER_IDENTITY_ENABLED=false` the admin gate fails closed (no bridge ops), same
+rule as #71.
+
+**Slots into:** PR3 (pairing + dev-mode) — this is a hard requirement, not a follow-up.
+
+### 14.2 — seam-MCP interplay  [issue-ready; new section, touches PR3/PR4]
+
+**Problem.** The entire agent-facing orchestration surface postdates the plan and is
+unmentioned: `handoff` / `forward` / `steer` / `dispatch` / `chain` / `send` / `poll_inbox`
+/ `interrupt` / `peek` / `threads` / `config_propose` / `schedule_wake` / `watch_*`
+(seam-mcp-server.ts). Bridged agents must interoperate with it.
+
+**Decisions / scope.**
+- **Control-plane tools compose for free — but verify the token reaches the host.** A
+  bridged agent's `handoff`/`steer`/etc. route back through seam-acp; the per-session
+  `X-Seam-Session` token is minted regardless of location. PR3 must ensure that token is
+  injected into the **remote** agent's spawn env (adapter `spawn(cwd, opts)` carries it)
+  so the remote agent can reach the seam-MCP server over the wire the same as a local one.
+- **Workers-on-bridges (the synergy worth naming).** Dispatch/handoff targets can be
+  `agentId@location` — a stateless preset worker or the 🚾 dispatch pool could run on a
+  remote host (e.g. a Mac). Decide: does a `DispatchSpec` carry a `location`, and does the
+  DispatchWatcher route a spec to a bridge adapter's `spawn` instead of a local runtime?
+- **`threads()` (#73) becomes location-aware.** It must list `agentId@location` sessions
+  with their host emoji and a `busy` derived across the bus (the runtime lives on the
+  bridge). Cross-host discovery is otherwise a dead end for delegation.
+- **Reuse config persistence.** `config_propose { threadPreset }` (#68) and `/seam config
+  detach` (#80) already write `channel-presets.json`; D10's per-thread `agentId@location`
+  binding and D11's bridge config should live in the **same** store + write path (§14.4),
+  not a parallel one.
+
+**Acceptance.** A remote-bridged session is addressable by `handoff`/`steer`/`threads`;
+a worker can be dispatched to a bridge host and reports back; the seam-MCP token resolves
+from inside a remote agent.
+
+**Slots into:** PR3 (token reach) + PR4 (location-aware dispatch/threads).
+
+### 14.3 — Turn-resume (#75/#76) × D2/D3/§10  [issue-ready; amends §10, touches §4.1, PR4]
+
+**Problem.** When the plan was written, "auto-resume on the next message" (§10) was a
+property, not a subsystem. It now is one: durable turn markers, persisted
+`acp_session_id` per dispatch (#75), boot reconciliation to an `interrupted` status, and
+an auto-resume loop that injects `"continue"` + `loadSession` (#76, flag-gated,
+staggered, max-age-bounded). A **remote-bridged** interrupted turn cannot resume until
+its bridge reconnects.
+
+**Decisions.**
+- **Resume gates on bridge availability.** A resume marker whose session is `@<bridge>`
+  must be **deferred** until that bridge's reconciliation handshake (§4.1) completes and
+  the agent is marked ready — then resumed. If the bridge never returns within the resume
+  max-age window (`SEAM_TURN_RESUME_MAX_AGE_SECONDS`), **abandon** with a notice, mirroring
+  the deleted-thread precondition already in #76.
+- **D2/D3 make the host non-negotiable.** The session's storage is pinned to the host
+  (D2) and `loadSession` runs agent-local (D3), so a resume MUST reattach on the **same**
+  bridge — never re-dispatch a `@mac` session to `@local`. #75's `acp_session_id` is the
+  pointer; the location binding (§14.4 / D10) is the host selector.
+- **Reconciliation emits a "bridge ready" event the resume loop subscribes to** (§4.1
+  already fires `event` frames — add/[reuse] a ready signal so recovery is event-driven,
+  not polled).
+
+**Acceptance.** A reboot mid-remote-turn resumes after the bridge reconnects; abandons
+past max-age with a notice; never resumes on the wrong host; a local turn's resume is
+unchanged.
+
+**Slots into:** PR4 (needs the location binding first) + a §10 rollout note.
+
+### 14.4 — Command tree + persistence reuse (#78/#68/#70/#80)  [issue-ready; amends §7, §9, D10, D11]
+
+**Problem.** The plan predates both the #78 command tree and the config-mutation /
+thread-preset / audit machinery, so it under-specifies where bridge UI and config live.
+
+**Decisions.**
+- **`/seam bridge` and `/seam debug` are subcommand GROUPS**, not top-level commands —
+  following the `config` group precedent from #78. There are ~15 free top-level slots, so
+  room is not the constraint; consistency is. (`bridge add|rotate|list|remove`;
+  `debug tail|exec|status`.)
+- **Bridge config is structured config reusing the existing pattern**, not new `REMOTE_*`
+  env parsing (the plan already wanted this in §7/`[research]`; now there is a concrete
+  home). Per-host emoji/short-name/workspace-root (D11) and the per-thread
+  `agentId@location` binding (D10) should be persisted through the **same
+  `channel-presets.json` + config-mutation + `config_audit` path** that #68/#80 write,
+  and hot-reload the same way — so `/seam config` describe/audit sees bridge/location
+  state too.
+- **The §9 A1 extraction is a hard prerequisite** (see §14.0): stand up
+  `orchestrator/bridge.ts` + `orchestrator/debug.ts` rather than growing the 11k-LOC file.
+
+**Acceptance.** `/seam bridge` + `/seam debug` register as groups within budget; bridge
+config round-trips through the presets file with a schema + audit row; a thread's
+`@location` binding is an additive nullable field defaulting to `local` (matches D10 /
+§10 rule 2); the new UI lives in its own module(s).
+
+**Slots into:** PR3 (bridge/debug groups + config) + PR4 (per-thread binding) + the §9
+debt discipline.
+
+### 14.5 — Net
+
+No rewrite: PR0 (subtract) and PR1 (adapter refactor) are unchanged and remain the right
+start. The amendments concentrate in **PR3** (security tiers 14.1, seam-MCP token 14.2,
+bridge/debug groups 14.4) and **PR4** (location-aware dispatch/threads 14.2, resume 14.3,
+per-thread binding 14.4). Recommended issue set: one per §14.1–14.4, plus a small 14.0
+"doc/anchor refresh" chore folded into PR1.

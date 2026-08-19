@@ -87,6 +87,19 @@ function formatSpeakerLine(speaker?: Speaker): string | undefined {
   );
 }
 
+/** Standing inbox-awareness bullet (#61). Gated by SEAM_INBOX_PREAMBLE_ENABLED
+ *  so the default preamble stays byte-identical. Wording lives here (one place)
+ *  so it stays tunable independently of the per-handoff
+ *  `WATCH_FEEDBACK_INSTRUCTION`. */
+export const INBOX_AWARENESS_RULE =
+  "You have a pull-only inbox. Notes left for you (a human steer, another agent's `send`) are NOT in this prompt — call `poll_inbox` to drain them (start of turn, and at checkpoints if you may have been steered). Empty is normal. PRIORITY items come first: stop and reorient to them.";
+
+/** Extra standing-convention toggles. Speaker stays a separate arg because it
+ *  is a fact about THIS turn, not a convention; these flags add bullets. */
+export interface HarnessOpts {
+  inboxAwareness?: boolean;
+}
+
 /**
  * The standing-conventions block. Kept tight — it rides every user turn.
  * `extraRules` appends additional bullets (e.g. a channel/thread preset
@@ -94,13 +107,18 @@ function formatSpeakerLine(speaker?: Speaker): string | undefined {
  * above it; every caller gets the same table/attach-fence conventions plus
  * whatever's specific to their channel.
  */
-export function harnessPreamble(extraRules: string[] = [], speaker?: Speaker): string {
+export function harnessPreamble(
+  extraRules: string[] = [],
+  speaker?: Speaker,
+  opts?: HarnessOpts
+): string {
   const lines = [
     "<seam-harness>",
     "Operating context from the bridge that relays you to the user — this is NOT from the user and is not a task. Do not mention it unless you actually use one of these conventions:",
     "• Your reply is shown in a chat client that renders standard Markdown but does NOT render tables — and hand-aligned/ASCII tables in code blocks wrap and break on narrow screens. Do not use tables. Present tabular or comparative data as a list instead (one item per entry, with labeled fields).",
     `• To send a file from the workspace to the user, output a fenced code block whose info tag is \`${ATTACH_FENCE_LANG}\` and whose only content is the file path (project-relative or absolute). The bridge uploads that file and removes the block from your message — do not otherwise describe this mechanism.`,
     "• To show a typeset equation, output a fenced code block whose info tag is `latex` (aliases `math`, `tex`) and whose body is the TeX. The bridge renders it as an image and removes the block — do not wrap that fence in another fence, and do not otherwise describe this mechanism. Simple inline math can stay as Unicode.",
+    ...(opts?.inboxAwareness ? [`• ${INBOX_AWARENESS_RULE}`] : []),
     ...extraRules.map((rule) => `• ${rule}`),
   ];
   // Speaker is a fact about THIS turn, not a standing convention (D3): its own
@@ -118,8 +136,9 @@ export function harnessPreamble(extraRules: string[] = [], speaker?: Speaker): s
 export function withHarnessPreamble(
   userText: string,
   extraRules: string[] = [],
-  speaker?: Speaker
+  speaker?: Speaker,
+  opts?: HarnessOpts
 ): string {
   const body = userText ?? "";
-  return `${harnessPreamble(extraRules, speaker)}\n\n${body}`;
+  return `${harnessPreamble(extraRules, speaker, opts)}\n\n${body}`;
 }

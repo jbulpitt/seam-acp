@@ -402,6 +402,20 @@ const Schema = z.object({
   SEAM_MIDTURN_REPLY_MODE: z.enum(["abort", "inbox"]).default("abort"),
 
   /**
+   * Inbox-awareness preamble (#61). When true, every human chat turn's
+   * `<seam-harness>` includes a standing bullet that the session has a
+   * pull-only inbox and should call `poll_inbox` to drain it. Default false
+   * ships DARK: the golden preamble stays byte-identical until an operator
+   * flips this. Dispatch / scheduled / wake / watch turns still skip the
+   * harness (they never go through `withHarnessPreamble`); the per-handoff
+   * `watchFeedback` instruction is independent.
+   */
+  SEAM_INBOX_PREAMBLE_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
+
+  /**
    * Optional override map of Discord user id → display name, e.g.
    * "1487094572696867019:Jesse,1534937951044112505:Allie". Takes precedence over
    * the Discord nickname/global-name/username, both to guarantee a clean label

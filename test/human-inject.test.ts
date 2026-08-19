@@ -248,3 +248,31 @@ describe("SEAM_MIDTURN_REPLY_MODE config (#63)", () => {
     }
   });
 });
+
+describe("SEAM_INBOX_PREAMBLE_ENABLED config (#61)", () => {
+  const baseEnv = {
+    DISCORD_BOT_TOKEN: "x",
+    DISCORD_ALLOWED_USER_IDS: "1",
+    REPOS_ROOT: os.tmpdir(),
+  };
+
+  it("defaults to false (ships dark — golden preamble unchanged)", () => {
+    const saved = process.env;
+    try {
+      process.env = { ...baseEnv } as NodeJS.ProcessEnv;
+      expect(loadConfig().SEAM_INBOX_PREAMBLE_ENABLED).toBe(false);
+    } finally {
+      process.env = saved;
+    }
+  });
+
+  it("accepts true when explicitly set", () => {
+    const saved = process.env;
+    try {
+      process.env = { ...baseEnv, SEAM_INBOX_PREAMBLE_ENABLED: "true" } as NodeJS.ProcessEnv;
+      expect(loadConfig().SEAM_INBOX_PREAMBLE_ENABLED).toBe(true);
+    } finally {
+      process.env = saved;
+    }
+  });
+});

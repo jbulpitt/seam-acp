@@ -1318,7 +1318,9 @@ export class Orchestrator {
       if (speaker) this.currentSpeakerIds.set(record.channelRef, speaker.id);
       const secretFiles = await listThreadSecrets(this.config.DATA_DIR, channel.id).catch(() => []);
       const extraRules = [...riders, ...secretHarnessRules(secretFiles)];
-      let promptText = withHarnessPreamble(msg.text, extraRules, speaker);
+      let promptText = withHarnessPreamble(msg.text, extraRules, speaker, {
+        inboxAwareness: this.config.SEAM_INBOX_PREAMBLE_ENABLED,
+      });
       let promptAttachments = msg.attachments;
       const activeProfile = this.router.getProfile(record.agentId);
       if (

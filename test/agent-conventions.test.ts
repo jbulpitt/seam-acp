@@ -4,6 +4,7 @@ import {
   withHarnessPreamble,
   sanitizeSpeakerName,
   ATTACH_FENCE_LANG,
+  INBOX_AWARENESS_RULE,
 } from "../src/core/agent-conventions.js";
 import { resolveDiscordSpeakerName } from "../src/platforms/discord/adapter.js";
 
@@ -36,6 +37,46 @@ describe("harnessPreamble — flag off / no speaker", () => {
   it("emits no speaker line when a speaker has neither a usable name nor numeric id", () => {
     const out = harnessPreamble([], { id: "not-numeric", name: "" });
     expect(out).toBe(GOLDEN_NO_SPEAKER);
+  });
+
+  it("inboxAwareness false / omitted does not mention poll_inbox", () => {
+    expect(harnessPreamble()).not.toContain("poll_inbox");
+    expect(harnessPreamble([], undefined, { inboxAwareness: false })).toBe(GOLDEN_NO_SPEAKER);
+  });
+});
+
+describe("harnessPreamble — inbox awareness", () => {
+  it("adds the standing inbox bullet when opted in", () => {
+    const out = harnessPreamble([], undefined, { inboxAwareness: true });
+    expect(out).toContain(`• ${INBOX_AWARENESS_RULE}`);
+    expect(out).toContain("poll_inbox");
+    expect(out).toContain("PRIORITY");
+  });
+
+  it("places the inbox bullet after the base conventions and before riders", () => {
+    const out = harnessPreamble(["Rider one."], undefined, { inboxAwareness: true });
+    const lines = out.split("\n");
+    const inboxIdx = lines.indexOf(`• ${INBOX_AWARENESS_RULE}`);
+    const riderIdx = lines.indexOf("• Rider one.");
+    const latexIdx = lines.findIndex((l) => l.includes("typeset equation"));
+    expect(inboxIdx).toBe(latexIdx + 1);
+    expect(riderIdx).toBe(inboxIdx + 1);
+  });
+
+  it("keeps the speaker line after the inbox bullet", () => {
+    const out = harnessPreamble([], { id: "42", name: "Jesse" }, { inboxAwareness: true });
+    const lines = out.split("\n");
+    const inboxIdx = lines.indexOf(`• ${INBOX_AWARENESS_RULE}`);
+    const speakerIdx = lines.findIndex((l) => l.startsWith("Speaker of the message that follows:"));
+    expect(inboxIdx).toBeGreaterThan(-1);
+    expect(speakerIdx).toBe(inboxIdx + 1);
+  });
+
+  it("withHarnessPreamble threads the opt-in through", () => {
+    const out = withHarnessPreamble("hello", [], undefined, { inboxAwareness: true });
+    expect(out.startsWith("<seam-harness>")).toBe(true);
+    expect(out).toContain(`• ${INBOX_AWARENESS_RULE}`);
+    expect(out.endsWith("\n\nhello")).toBe(true);
   });
 });
 

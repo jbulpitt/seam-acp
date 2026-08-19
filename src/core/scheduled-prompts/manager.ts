@@ -90,6 +90,14 @@ export class ScheduledPromptManager {
     this.jobs.clear();
   }
 
+  /** Manual invoke: same `onFire` path as the cron tick (isolated vs live,
+   *  cards vs messages, model, attachments). Does not consume a cron slot —
+   *  `next_run` is only refreshed from the armed timer if one exists. Honors
+   *  the in-flight overlap guard. Works on disabled rows. */
+  runNow(id: string): Promise<void> {
+    return this.fire(id);
+  }
+
   // --- internals ------------------------------------------------------------
 
   private catchUp(row: ScheduledPrompt): void {

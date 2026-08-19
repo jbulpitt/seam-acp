@@ -27,26 +27,27 @@ describe("/seam slash command", () => {
     expect(() => buildSeamCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 10 top-level slots (5 subcommands + 5 groups)", () => {
+  it("registers exactly 10 top-level slots (4 subcommands + 6 groups)", () => {
     const json = built();
     expect(json.options?.length ?? 0).toBe(10);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
-  it("top-level names are cancel/steer/new/attach/workflows + 5 groups", () => {
+  it("top-level names are cancel/steer/new/workflows + 6 groups (attach moved to upload)", () => {
     const names = (built().options ?? []).map((o) => o.name);
     expect(names).toEqual([
       "cancel",
       "steer",
       "new",
-      "attach",
       "workflows",
       "config",
       "info",
       "schedule",
       "preset",
       "project",
+      "upload",
     ]);
+    expect(names).not.toContain("attach");
   });
 
   it("each group stays within Discord's 25-option-per-group cap", () => {
@@ -92,13 +93,16 @@ describe("/seam slash command", () => {
     expect(names).not.toContain("config-audit");
   });
 
-  it("schedule/preset/project group sizes are unchanged", () => {
+  it("schedule/preset/project group sizes are unchanged; upload has pull/push/secret", () => {
     const json = built();
     const count = (name: string) =>
       json.options?.find((o) => o.name === name)?.options?.length ?? 0;
     expect(count("schedule")).toBe(7);
     expect(count("preset")).toBe(6);
     expect(count("project")).toBe(3);
+    const upload = json.options?.find((o) => o.name === "upload");
+    expect(upload?.type).toBe(SUB_COMMAND_GROUP);
+    expect((upload?.options ?? []).map((o) => o.name)).toEqual(["pull", "push", "secret"]);
   });
 
   it("removed image/abort/kill and old top-level config leaves", () => {
@@ -107,6 +111,7 @@ describe("/seam slash command", () => {
       "image",
       "abort",
       "kill",
+      "attach",
       "model",
       "effort",
       "agent",

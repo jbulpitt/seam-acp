@@ -10,13 +10,14 @@ import {
  * The tree is 10/25: 5 top-level subcommands + 5 groups. Future surfaces
  * default to living INSIDE a group (each group has its own 25 budget).
  *
- *   TOP-LEVEL (5): cancel, steer, new, attach, workflows
- *   GROUPS (5):
+ *   TOP-LEVEL (4): cancel, steer, new, workflows
+ *   GROUPS (6):
  *     config   (13) model effort agent mode repo tools approve reset init detach show set audit
  *     info     (6)  whoami usage avatar help sessions repos
  *     schedule (7)  unchanged
  *     preset   (6)  unchanged
  *     project  (3)  unchanged
+ *     upload   (3)  pull push secret  — admin-only; hard cutover of /seam attach
  */
 export function buildSeamCommand(): SlashCommandBuilder {
   const cmd = new SlashCommandBuilder()
@@ -88,20 +89,6 @@ export function buildSeamCommand(): SlashCommandBuilder {
 
   cmd.addSubcommand((sub) =>
     sub
-      .setName("attach")
-      .setDescription("Upload a local file from the host machine to this channel")
-      .addStringOption((o) =>
-        o
-          .setName("path")
-          .setDescription(
-            "Absolute path, or path relative to an allowed root (REPOS_ROOT / ATTACH_ROOTS)"
-          )
-          .setRequired(true)
-      )
-  );
-
-  cmd.addSubcommand((sub) =>
-    sub
       .setName("workflows")
       .setDescription("View the delegation ledger + this thread's pending wakes (active + recent)")
       .addIntegerOption((o) =>
@@ -131,7 +118,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
-  // --- groups (5) -----------------------------------------------------------
+  // --- groups (6) -----------------------------------------------------------
 
   cmd.addSubcommandGroup((g) =>
     g
@@ -452,6 +439,43 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
+  // Admin-only host file xfer. Hard cutover of top-level `/seam attach`.
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("upload")
+      .setDescription("Admin-only: pull/push host files, or pass a one-shot secret")
+      .addSubcommand((sub) =>
+        sub
+          .setName("pull")
+          .setDescription("Post a host file into this thread (zips if over Discord's size cap)")
+          .addStringOption((o) =>
+            o
+              .setName("path")
+              .setDescription("Absolute path, or relative to the bot process cwd")
+              .setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("push")
+          .setDescription("Write an uploaded Discord file to a host path")
+          .addAttachmentOption((o) =>
+            o.setName("file").setDescription("File to write on the host").setRequired(true)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("path")
+              .setDescription("Absolute dest, or relative to the bot process cwd")
+              .setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("secret")
+          .setDescription("One-shot secret for this thread (path-only; deleted after the next turn)")
+      )
+  );
+
   return cmd;
 }
 
@@ -459,8 +483,10 @@ export type SeamSubcommand =
   | "new"
   | "cancel"
   | "steer"
-  | "attach"
   | "workflows"
+  | "pull"
+  | "push"
+  | "secret"
   | "model"
   | "effort"
   | "agent"

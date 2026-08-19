@@ -182,6 +182,15 @@ import { SerialQueue } from "../../core/serial-queue.js";
 import { StreamingPanel } from "../../core/streaming-panel.js";
 import { StreamingMessageRenderer } from "../../core/streaming-message-renderer.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
+import { resolveHostPath } from "../../core/host-path.js";
+import { zipOneFile } from "../../core/zip-one.js";
+import {
+  writeThreadSecret,
+  listThreadSecrets,
+  secretHarnessRules,
+  consumeThreadSecrets,
+  sweepExpiredSecrets,
+} from "../../core/thread-secrets.js";
 import {
   defaultSessionConfig,
   type ActiveProject,
@@ -488,6 +497,7 @@ export class Orchestrator {
 
     // Clear out any stale staged attachments from prior runs (TTL backstop).
     void sweepStagedAttachments();
+    void sweepExpiredSecrets(this.config.DATA_DIR);
   }
 
   private async handleRestartSentinel(): Promise<void> {
@@ -1306,7 +1316,9 @@ export class Orchestrator {
       // Only set when we have a harness-stamped id — with speaker identity off
       // the gate sees nothing and keeps refusing (never fail open).
       if (speaker) this.currentSpeakerIds.set(record.channelRef, speaker.id);
-      let promptText = withHarnessPreamble(msg.text, riders, speaker);
+      const secretFiles = await listThreadSecrets(this.config.DATA_DIR, channel.id).catch(() => []);
+      const extraRules = [...riders, ...secretHarnessRules(secretFiles)];
+      let promptText = withHarnessPreamble(msg.text, extraRules, speaker);
       let promptAttachments = msg.attachments;
       const activeProfile = this.router.getProfile(record.agentId);
       if (
@@ -1679,6 +1691,9 @@ export class Orchestrator {
       // #71: drop the current-turn speaker id so it can never authorize a
       // config_propose on a later dispatched/scheduled turn (no human speaker).
       this.currentSpeakerIds.delete(record.channelRef);
+      await consumeThreadSecrets(this.config.DATA_DIR, channel.id).catch((err) =>
+        this.logger.warn({ err, channel: channel.id }, "secret consume failed")
+      );
       await refresh(true);
       // #76: write the terminal state BEFORE removing the marker (writeDone
       // ordering). Skip if the command layer already finalized it as cancelled.
@@ -1863,6 +1878,16 @@ export class Orchestrator {
       });
       return;
     }
+    if (interaction.options.getSubcommandGroup(false) === "upload") {
+      const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+      if (!admins?.has(interaction.user.id)) {
+        await interaction.reply({
+          content: "🔒 `/seam upload` is admin-only.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+    }
     if (interaction.options.getSubcommandGroup(false) === "schedule") {
       return this.cmdSchedule(interaction);
     }
@@ -1871,6 +1896,16 @@ export class Orchestrator {
     }
     if (interaction.options.getSubcommandGroup(false) === "project") {
       return this.cmdProject(interaction);
+    }
+    if (interaction.options.getSubcommandGroup(false) === "upload") {
+      switch (interaction.options.getSubcommand(true)) {
+        case "pull":
+          return this.cmdUploadPull(interaction);
+        case "push":
+          return this.cmdUploadPush(interaction);
+        case "secret":
+          return this.cmdUploadSecret(interaction);
+      }
     }
     if (interaction.options.getSubcommandGroup(false) === "info") {
       switch (interaction.options.getSubcommand(true)) {
@@ -1925,8 +1960,6 @@ export class Orchestrator {
         return this.cmdCancel(interaction);
       case "steer":
         return this.cmdSteer(interaction);
-      case "attach":
-        return this.cmdAttach(interaction);
       case "workflows":
         return this.cmdWorkflows(interaction);
       default:
@@ -5229,7 +5262,18 @@ export class Orchestrator {
           await c.reply({ content: "That schedule no longer exists.", flags: MessageFlags.Ephemeral });
           return;
         }
-        if (action === "edit") {
+        if (action === "run") {
+          await c.deferReply({ flags: MessageFlags.Ephemeral });
+          if (this.scheduledManager) await this.scheduledManager.runNow(id);
+          else await this.runScheduledPrompt(id);
+          const fresh = this.store.getScheduled(id);
+          const status = fresh?.lastStatus ?? "unknown";
+          await c.editReply(
+            status === "skipped: still running"
+              ? `⏸️ **${row.name}** is already running — this click was skipped.`
+              : `▶️ **${row.name}** finished — last: \`${status}\`.`
+          );
+        } else if (action === "edit") {
           collector.stop("edit");
           await this.cmdScheduleAdd(c, row); // opens the builder card in edit mode
         } else if (action === "toggle") {
@@ -5251,8 +5295,9 @@ export class Orchestrator {
   }
 
   /** `/seam schedule list` message: a summary embed plus per-schedule
-   *  Edit / Enable-Disable / Delete buttons (first 5 schedules; manage the rest
-   *  via the id-based `/seam schedule …` commands). Rebuilt after toggle/delete. */
+   *  Run / Edit / Enable-Disable / Delete buttons (first 5 schedules; manage
+   *  the rest via the id-based `/seam schedule …` commands). Rebuilt after
+   *  toggle/delete. */
   private buildScheduleListMessage(channel: ChannelRef): {
     embeds: EmbedBuilder[];
     components: ActionRowBuilder<ButtonBuilder>[];
@@ -5270,6 +5315,7 @@ export class Orchestrator {
     for (const r of rows.slice(0, 5)) {
       components.push(
         new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(`sl:run:${r.id}`).setLabel("▶️ Run now").setStyle(ButtonStyle.Success),
           new ButtonBuilder().setCustomId(`sl:edit:${r.id}`).setLabel(`✏️ ${r.name}`.slice(0, 80)).setStyle(ButtonStyle.Primary),
           new ButtonBuilder().setCustomId(`sl:toggle:${r.id}`).setLabel(r.enabled ? "⏸️ Disable" : "🟢 Enable").setStyle(ButtonStyle.Secondary),
           new ButtonBuilder().setCustomId(`sl:del:${r.id}`).setLabel("🗑️ Delete").setStyle(ButtonStyle.Danger),
@@ -8781,11 +8827,14 @@ export class Orchestrator {
     return null;
   }
 
-  private async cmdAttach(i: ChatInputCommandInteraction): Promise<void> {
+  private static readonly DISCORD_UPLOAD_MAX = 25 * 1024 * 1024;
+
+  /** `/seam upload pull` — admin-only, no root jail. Relative = process cwd. */
+  private async cmdUploadPull(i: ChatInputCommandInteraction): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
       await i.reply({
-        content: "Use `/seam attach` from inside a thread.",
+        content: "Use `/seam upload pull` from inside a thread.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -8801,51 +8850,170 @@ export class Orchestrator {
     const requested = i.options.getString("path", true);
     await i.deferReply({ flags: MessageFlags.Ephemeral });
 
-    // Resolve a relative path against THIS thread's current project (repoPath)
-    // first, then the allowed roots. Without passing preferredRoot, `/seam
-    // attach src/foo.ts` only tried REPOS_ROOT/ATTACH_ROOTS and never the active
-    // repo — so project-relative paths failed.
-    const record = this.router.ensureSessionRecord({
-      platform: channel.platform,
-      channelRef: channel.id,
-      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      cwd: this.config.REPOS_ROOT,
-    });
-    const resolved = await this.resolveAllowedHostFile(requested, {
-      preferredRoot: record.repoPath ?? null,
-    });
-    if (!resolved) {
-      await i.editReply(
-        `Could not attach \`${requested}\` — file not found (relative to the thread's repo or an allowed root), not a regular file, or outside REPOS_ROOT / ATTACH_ROOTS.`
-      );
-      return;
-    }
-
-    const MAX = 25 * 1024 * 1024;
-    if (resolved.size > MAX) {
-      await i.editReply(
-        `File too large for Discord: ${resolved.size} B (25 MB limit).`
-      );
-      return;
-    }
-
-    let data: Buffer;
+    let abs: string;
     try {
-      data = await fsp.readFile(resolved.realPath);
+      abs = resolveHostPath(requested);
     } catch (err) {
-      await i.editReply(`Read failed: ${(err as Error).message}`);
+      await i.editReply((err as Error).message);
       return;
     }
 
-    const filename = path.basename(resolved.realPath);
-    const mimeType = mimeTypeForFilename(filename);
+    let st: import("node:fs").Stats;
+    try {
+      st = await fsp.stat(abs);
+    } catch {
+      await i.editReply(`Not found: \`${abs}\``);
+      return;
+    }
+    if (!st.isFile()) {
+      await i.editReply(`Not a regular file: \`${abs}\``);
+      return;
+    }
+
+    const MAX = Orchestrator.DISCORD_UPLOAD_MAX;
+    let data: Buffer;
+    let filename = path.basename(abs);
+    let mimeType = mimeTypeForFilename(filename);
+    let zipped = false;
+    try {
+      if (st.size <= MAX) {
+        data = await fsp.readFile(abs);
+      } else {
+        data = await zipOneFile(abs);
+        zipped = true;
+        filename = `${filename}.zip`;
+        mimeType = "application/zip";
+        if (data.byteLength > MAX) {
+          await i.editReply(
+            `File is ${st.size} B and zipped size is still ${data.byteLength} B — over Discord's ${MAX} B cap.`
+          );
+          return;
+        }
+      }
+    } catch (err) {
+      await i.editReply(`Read/zip failed: ${(err as Error).message}`);
+      return;
+    }
 
     try {
       await this.adapter.sendFile(channel, { data, filename, mimeType });
-      await i.editReply(`📎 Posted \`${filename}\` (${data.byteLength} B).`);
+      await i.editReply(
+        zipped
+          ? `📎 Posted \`${filename}\` (${data.byteLength} B, zipped from ${st.size} B).`
+          : `📎 Posted \`${filename}\` (${data.byteLength} B).`
+      );
     } catch (err) {
-      this.logger.warn({ err, filename }, "/seam attach upload failed");
+      this.logger.warn({ err, filename }, "/seam upload pull failed");
       await i.editReply(`Upload failed: ${(err as Error).message}`);
+    }
+  }
+
+  /** `/seam upload push` — write a Discord attachment to a host path. */
+  private async cmdUploadPush(i: ChatInputCommandInteraction): Promise<void> {
+    const destIn = i.options.getString("path", true);
+    const file = i.options.getAttachment("file", true);
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+
+    let dest: string;
+    try {
+      dest = resolveHostPath(destIn);
+    } catch (err) {
+      await i.editReply((err as Error).message);
+      return;
+    }
+
+    let destStat: import("node:fs").Stats | null = null;
+    try {
+      destStat = await fsp.stat(dest);
+    } catch {
+      destStat = null;
+    }
+    if (destStat?.isDirectory()) {
+      await i.editReply(`Destination is a directory: \`${dest}\``);
+      return;
+    }
+    const parent = path.dirname(dest);
+    try {
+      const pst = await fsp.stat(parent);
+      if (!pst.isDirectory()) {
+        await i.editReply(`Parent is not a directory: \`${parent}\``);
+        return;
+      }
+    } catch {
+      await i.editReply(`Parent directory does not exist: \`${parent}\``);
+      return;
+    }
+
+    let bytes: Buffer;
+    try {
+      bytes = await this.downloadAttachmentBytes(file.url);
+    } catch (err) {
+      await i.editReply(`Download failed: ${(err as Error).message}`);
+      return;
+    }
+
+    try {
+      await fsp.writeFile(dest, bytes);
+    } catch (err) {
+      await i.editReply(`Write failed: ${(err as Error).message}`);
+      return;
+    }
+    await i.editReply(`Wrote \`${file.name ?? "file"}\` → \`${dest}\` (${bytes.byteLength} B).`);
+  }
+
+  /** `/seam upload secret` — modal for name+value; one-shot file, path-only. */
+  private async cmdUploadSecret(i: ChatInputCommandInteraction): Promise<void> {
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel) {
+      await i.reply({
+        content: "Use `/seam upload secret` from inside a thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const modal = new ModalBuilder()
+      .setCustomId(`upload:secret:${i.id}`)
+      .setTitle("One-shot secret")
+      .addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("name")
+            .setLabel("Name (A–Z a–z 0–9 . _ -)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(64)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("value")
+            .setLabel("Value (never posted to the channel)")
+            .setStyle(TextInputStyle.Paragraph)
+            .setRequired(true)
+        )
+      );
+    await i.showModal(modal);
+    const sub = await i
+      .awaitModalSubmit({
+        filter: (m) => m.customId === `upload:secret:${i.id}` && m.user.id === i.user.id,
+        time: 300_000,
+      })
+      .catch(() => null);
+    if (!sub) return;
+    const name = sub.fields.getTextInputValue("name");
+    const value = sub.fields.getTextInputValue("value");
+    try {
+      const written = await writeThreadSecret(this.config.DATA_DIR, channel.id, name, value);
+      await sub.reply({
+        content:
+          `🔐 Secret \`${written.name}\` stored for this thread at \`${written.absPath}\`.\n` +
+          `The next agent turn will see the path (not the value). It is deleted when that turn ends, or after 1 hour.`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } catch (err) {
+      await sub.reply({
+        content: `Could not store secret: ${(err as Error).message}`,
+        flags: MessageFlags.Ephemeral,
+      });
     }
   }
 
@@ -8992,8 +9160,12 @@ export class Orchestrator {
       "`/seam cancel force:true` — escalate if the turn ignores cancel (old abort)",
       "`/seam cancel scope:all` — force-kill every active session (old kill)",
       "`/seam steer <thread> <prompt> [now]` — steer a node mid-task",
-      "`/seam attach <path>` — upload a host-side file (under REPOS_ROOT or ATTACH_ROOTS)",
       "`/seam workflows` — delegation ledger + pending wakes/watches",
+      "",
+      "**`/seam upload`** (admin only)",
+      "`/seam upload pull <path>` — post a host file here (zips if over 25 MB)",
+      "`/seam upload push <file> <path>` — write an uploaded file to the host",
+      "`/seam upload secret` — one-shot secret for this thread (deleted after the next turn)",
       "",
       "**`/seam config`**",
       "`/seam config model [id]` — get / set agent model",
@@ -9018,7 +9190,7 @@ export class Orchestrator {
       "`/seam info sessions` — list known sessions",
       "`/seam info repos` — list repos under REPOS_ROOT",
       "",
-      "**Groups** — `/seam schedule`, `/seam preset`, `/seam project`",
+      "**Groups** — `/seam schedule`, `/seam preset`, `/seam project`, `/seam upload`",
       "",
       "Free-form messages in a thread are sent to the agent.",
     ];

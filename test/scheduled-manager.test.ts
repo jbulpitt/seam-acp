@@ -97,6 +97,19 @@ describe("ScheduledPromptManager overlap guard (D3)", () => {
   });
 });
 
+describe("ScheduledPromptManager.runNow", () => {
+  it("invokes onFire and does not require the row to be enabled", async () => {
+    const row = makeRow({ enabled: false, cron: "0 9 * * *" });
+    const { store } = makeStore(row);
+    const onFire = vi.fn(async () => {});
+    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
+    await manager.runNow(row.id);
+    expect(onFire).toHaveBeenCalledTimes(1);
+    expect(onFire).toHaveBeenCalledWith(row.id);
+    manager.stop();
+  });
+});
+
 describe("ScheduledPromptManager catch-up", () => {
   it("fires once on start when nextRunUtc is in the past, even far outside catchupSeconds", async () => {
     const row = makeRow({

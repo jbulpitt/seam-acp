@@ -53,17 +53,18 @@ pm2 logs seam-acp --lines 100   # last 100 log lines
 
 ## Slash command tree (`/seam`)
 
-Discord caps each command at 25 top-level options. `/seam` is 10/25: 5
-top-level subcommands + 5 groups. Future surfaces default to living
+Discord caps each command at 25 top-level options. `/seam` is 10/25: 4
+top-level subcommands + 6 groups. Future surfaces default to living
 **inside a group** (each group has its own 25 budget). Hard cutover —
 Discord has no aliases; old invocations disappear.
 
-**Top-level (5):** `cancel`, `steer`, `new`, `attach`, `workflows`
+**Top-level (4):** `cancel`, `steer`, `new`, `workflows`
 
-**Groups (5):**
-- `config` (12): `model` `effort` `agent` `mode` `repo` `tools` `approve` `reset` `init` `show` `set` `audit`
+**Groups (6):**
+- `config` (13): `model` `effort` `agent` `mode` `repo` `tools` `approve` `reset` `init` `detach` `show` `set` `audit`
 - `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
 - `schedule` (7), `preset` (6), `project` (3) — unchanged
+- `upload` (3): `pull` `push` `secret` — **admin-only**. Hard cutover of `/seam attach`.
 
 **Cancel options** (not new keywords):
 - `/seam cancel` — this thread, graceful

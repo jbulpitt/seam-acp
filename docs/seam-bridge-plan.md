@@ -476,7 +476,7 @@ what changed in seam-acp since then and how it modifies the plan. **§14.0** is 
 (fold into PR0/PR1 with no design change). **§14.1–14.4** are substantive and each is
 scoped to become its own GitHub issue.
 
-### 14.0 — Cosmetic refreshes (no design change; fold into PR0/PR1)
+### 14.0 — Cosmetic refreshes (no design change; fold into PR0/PR1)  → **#82**
 
 - **Agent roster: 4 → 6.** PR1 recasts not just claude/copilot/agy/opencode but also
   **codex** and **grok** (registered in `index.ts`), plus the claude-vertex /
@@ -495,7 +495,7 @@ scoped to become its own GitHub issue.
   subcommand group. Any §-body reference to `/seam sessions` or a flat config command
   should be re-anchored. `npm run patch-acp` is already retired (accurate as written).
 
-### 14.1 — Security must compose with the config-mutation tiers (#58/#71/#74)  [issue-ready; amends §6, §6.1, D7, D8]
+### 14.1 — Security must compose with the config-mutation tiers (#58/#71/#74)  → **#83**  [amends §6, §6.1, D7, D8]
 
 **Problem.** §6.1/D7 assume *"a single operator, no elevation gating, the same bridge
 token."* That premise is void: seam-acp now has **three tiers** — admin
@@ -527,7 +527,7 @@ rule as #71.
 
 **Slots into:** PR3 (pairing + dev-mode) — this is a hard requirement, not a follow-up.
 
-### 14.2 — seam-MCP interplay  [issue-ready; new section, touches PR3/PR4]
+### 14.2 — seam-MCP interplay  → **#84**  [new section, touches PR3/PR4]
 
 **Problem.** The entire agent-facing orchestration surface postdates the plan and is
 unmentioned: `handoff` / `forward` / `steer` / `dispatch` / `chain` / `send` / `poll_inbox`
@@ -558,7 +558,7 @@ from inside a remote agent.
 
 **Slots into:** PR3 (token reach) + PR4 (location-aware dispatch/threads).
 
-### 14.3 — Turn-resume (#75/#76) × D2/D3/§10  [issue-ready; amends §10, touches §4.1, PR4]
+### 14.3 — Turn-resume (#75/#76) × D2/D3/§10  → **#85**  [amends §10, touches §4.1, PR4]
 
 **Problem.** When the plan was written, "auto-resume on the next message" (§10) was a
 property, not a subsystem. It now is one: durable turn markers, persisted
@@ -587,7 +587,7 @@ unchanged.
 
 **Slots into:** PR4 (needs the location binding first) + a §10 rollout note.
 
-### 14.4 — Command tree + persistence reuse (#78/#68/#70/#80)  [issue-ready; amends §7, §9, D10, D11]
+### 14.4 — Command tree + persistence reuse (#78/#68/#70/#80)  → **#86**  [amends §7, §9, D10, D11]
 
 **Problem.** The plan predates both the #78 command tree and the config-mutation /
 thread-preset / audit machinery, so it under-specifies where bridge UI and config live.

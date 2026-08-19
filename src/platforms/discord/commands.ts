@@ -52,17 +52,20 @@ export function buildSeamCommand(): SlashCommandBuilder {
     sub
       .setName("steer")
       .setDescription("Steer a node mid-task: queue a note to its inbox, or now:true to cancel-and-reprompt (history kept)")
-      .addStringOption((o) =>
-        o
-          .setName("thread")
-          .setDescription("Target thread id (default: this thread)")
-          .setRequired(false)
-      )
+      // Discord rejects the whole /seam PUT if a required option follows an
+      // optional one (APPLICATION_COMMAND_OPTIONS_REQUIRED_INVALID). prompt
+      // must come first; thread defaults to the invoking channel in cmdSteer.
       .addStringOption((o) =>
         o
           .setName("prompt")
           .setDescription("The steering instruction to inject now")
           .setRequired(true)
+      )
+      .addStringOption((o) =>
+        o
+          .setName("thread")
+          .setDescription("Target thread id (default: this thread)")
+          .setRequired(false)
       )
       // #63: options are free (they don't count toward the 25 top-level cap), so
       // the two tiers live on this one command. Default false = cooperative inbox

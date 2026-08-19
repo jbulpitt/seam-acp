@@ -147,6 +147,37 @@ describe("/seam slash command", () => {
     expect(thread?.required ?? false).toBe(false);
   });
 
+  it("steer lists required prompt before optional thread/now (Discord option order)", () => {
+    const steer = built().options?.find((o) => o.name === "steer");
+    const names = (steer?.options ?? []).map((o) => o.name);
+    expect(names).toEqual(["prompt", "thread", "now"]);
+    expect(steer?.options?.[0]?.required).toBe(true);
+    expect(steer?.options?.[1]?.required ?? false).toBe(false);
+    expect(steer?.options?.[2]?.required ?? false).toBe(false);
+  });
+
+  it("every leaf keeps required options before optional ones", () => {
+    const failures: string[] = [];
+    const walk = (opts: Opt[] | undefined, path: string): void => {
+      if (!opts) return;
+      let seenOptional = false;
+      for (const opt of opts) {
+        if (opt.type === SUB_COMMAND || opt.type === SUB_COMMAND_GROUP) {
+          walk(opt.options, `${path}/${opt.name}`);
+          continue;
+        }
+        const required = opt.required ?? false;
+        if (required && seenOptional) {
+          failures.push(`${path}: required "${opt.name}" follows an optional option`);
+        }
+        if (!required) seenOptional = true;
+        walk(opt.options, `${path}/${opt.name}`);
+      }
+    };
+    walk(built().options, "/seam");
+    expect(failures).toEqual([]);
+  });
+
   it("cancel absorbs abort+kill via force/scope options, not new keywords", () => {
     const cancel = built().options?.find((o) => o.name === "cancel");
     expect(cancel?.type).toBe(SUB_COMMAND);

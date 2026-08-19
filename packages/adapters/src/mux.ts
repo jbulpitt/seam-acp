@@ -72,10 +72,26 @@ interface MuxMsg {
 interface SlotEntry {
   stdout: PassThrough;
   fake: FakeProcess;
-  /** ACP chunks buffered while the bridge is offline. */
+  /** ACP chunks buffered while the bridge is offline or waiting for rpc spawn. */
   stdinQueue: string[];
   killed: boolean;
+  /** When true, queue stdin even if the WS is open (rpc spawn not yet acked). */
+  holdStdin: boolean;
 }
+
+/** Optional mux.spawn() argument. Local `profile.spawn(model?, effort?)` is unchanged. */
+export interface MuxSpawnOpts {
+  /**
+   * Queue stdin (even on an open WS) until `releaseStdin(slot)`. Used so
+   * `rpc("spawn", …)` can fill `slotConfigs` before the first ACP `data` frame.
+   */
+  holdStdinUntilReady?: boolean;
+}
+
+/** Fake child returned by `mux.spawn()`. `slot` is the mux slot id. */
+export type MuxChild = ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable> & {
+  readonly slot: number;
+};
 
 type FakeProcess = EventEmitter & {
   stdin: NodeWritable;
@@ -93,8 +109,10 @@ type FakeProcess = EventEmitter & {
  * Creates a multiplexed session manager over a shared WebSocket.
  *
  * - `attach(ws)` — called whenever a new bridge WS arrives; replaces the old one.
- * - `spawn()` — allocates a slot and returns a fake ChildProcess; stdin/stdout
- *   are routed through the shared WS with slot-tagged envelopes.
+ * - `spawn(opts?)` — allocates a slot and returns a fake ChildProcess with
+ *   `.slot`; stdin/stdout are routed through the shared WS. Pass
+ *   `{ holdStdinUntilReady: true }` to queue stdin until `releaseStdin(slot)`
+ *   so `rpc("spawn")` can configure the slot before the first `data` frame.
  *
  * When the bridge is offline, stdin data is queued and flushed on reconnect.
  * Fake processes survive bridge reconnects transparently.
@@ -123,10 +141,22 @@ export function makeMux(opts: {
 
   function flushQueues() {
     for (const [slot, entry] of slots) {
-      if (!entry.killed && entry.stdinQueue.length > 0) {
+      if (!entry.killed && !entry.holdStdin && entry.stdinQueue.length > 0) {
         for (const text of entry.stdinQueue.splice(0)) {
           send({ slot, type: "data", data: text });
         }
+      }
+    }
+  }
+
+  function releaseStdin(slot: number): void {
+    const entry = slots.get(slot);
+    if (!entry) return;
+    entry.holdStdin = false;
+    if (entry.killed) return;
+    if (bridgeWs?.readyState === WebSocket.OPEN && entry.stdinQueue.length > 0) {
+      for (const text of entry.stdinQueue.splice(0)) {
+        send({ slot, type: "data", data: text });
       }
     }
   }
@@ -274,7 +304,7 @@ export function makeMux(opts: {
     });
   }
 
-  function spawn(): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable> {
+  function spawn(spawnOpts?: MuxSpawnOpts): MuxChild {
     const slot = nextSlot++;
     const stdinPT = new PassThrough();
     const stdoutPT = new PassThrough();
@@ -284,6 +314,7 @@ export function makeMux(opts: {
     let killed = false;
 
     const fake = Object.assign(emitter, {
+      slot,
       stdin: stdinPT as NodeWritable,
       stdout: stdoutPT as NodeReadable,
       stderr: stderrPT as NodeReadable,
@@ -300,21 +331,28 @@ export function makeMux(opts: {
         stdinPT.destroy();
         stdoutPT.push(null);
       },
-    }) as FakeProcess;
+    }) as FakeProcess & { slot: number };
 
-    slots.set(slot, { stdout: stdoutPT, fake, stdinQueue, killed: false });
+    slots.set(slot, {
+      stdout: stdoutPT,
+      fake,
+      stdinQueue,
+      killed: false,
+      holdStdin: spawnOpts?.holdStdinUntilReady === true,
+    });
 
     stdinPT.on("data", (chunk: Buffer) => {
-      if (killed) return;
+      const entry = slots.get(slot);
+      if (!entry || entry.killed) return;
       const text = chunk.toString("utf8");
-      if (bridgeWs?.readyState === WebSocket.OPEN) {
+      if (bridgeWs?.readyState === WebSocket.OPEN && !entry.holdStdin) {
         // Flush any previously buffered data first.
-        for (const queued of stdinQueue.splice(0)) {
+        for (const queued of entry.stdinQueue.splice(0)) {
           send({ slot, type: "data", data: queued });
         }
         send({ slot, type: "data", data: text });
       } else {
-        stdinQueue.push(text);
+        entry.stdinQueue.push(text);
       }
     });
 
@@ -337,7 +375,7 @@ export function makeMux(opts: {
       bridgeWaiters.push({ slot, timeout });
     }
 
-    return fake as unknown as ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
+    return fake as unknown as MuxChild;
   }
 
   async function sendCmd(action: string, payload: any): Promise<any> {
@@ -407,5 +445,5 @@ export function makeMux(opts: {
     return !!bridgeWs && bridgeWs.readyState === WebSocket.OPEN;
   }
 
-  return { attach, spawn, sendCmd, rpc, sendFrame, helloAck, connected };
+  return { attach, spawn, sendCmd, rpc, sendFrame, helloAck, connected, releaseStdin };
 }

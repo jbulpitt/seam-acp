@@ -8,12 +8,16 @@ import { makeSessionId } from "./session-store.js";
 import { resolveChannelPreset } from "../config.js";
 import type { ChannelPreset, ThreadPreset } from "../config.js";
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
-import { buildSeamMcpServerEntry } from "./mcp/seam-mcp-server.js";
 import type {
   McpServer,
   RequestPermissionRequest,
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
+import {
+  planSeamMcpInjection,
+  spawnRemoteSlot,
+  type MuxHandle,
+} from "./remote-spawn.js";
 
 /**
  * Wiring for the per-session seam-MCP surface. The router mints a token per
@@ -29,6 +33,28 @@ export interface SeamMcpWiring {
   getPublicUrl?: () => string | undefined;
   /** True when this session's agent process runs on a paired bridge (#84). */
   isRemoteSession?: (sessionId: string) => boolean;
+  /**
+   * Hub helper: mint X-Seam-Session + reachable (non-loopback) MCP URL.
+   * Preferred over getPublicUrl when the session is remote.
+   */
+  mcpServersForRemoteSpawn?: (sessionId: string) => McpServer | undefined;
+  /** Mux of the connected bridge this session is bound to, if any. */
+  muxForSession?: (sessionId: string) => MuxHandle | undefined;
+}
+
+/** Inputs `startRuntime` uses to construct and spawn an AgentRuntime. */
+export interface RuntimeSpawnPlan {
+  agentId: string;
+  profile: AgentProfile;
+  model: string;
+  effort?: string;
+  cwd: string;
+  mcpServers: McpServer[];
+  remote: boolean;
+  spawnChild: (
+    model?: string,
+    effort?: string
+  ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
 }
 
 export type AskUserFn = (
@@ -461,12 +487,12 @@ export class SessionRouter {
     return this.runtimes.get(sessionId)?.busy ?? false;
   }
 
-  private async startRuntime(record: SessionRecord): Promise<AgentRuntime> {
-    // Channel/thread presets are the source of truth for locked-down
-    // channels: re-resolved on every runtime start (not just session
-    // creation) so a stored record can never drift from the config file —
-    // whatever's in CHANNEL_PRESETS_FILE wins, regardless of what's in the
-    // DB. See resolveChannelPreset in config.ts.
+  /**
+   * Resolve spawn inputs for a runtime start without actually starting the
+   * agent. Tests (and later PR4) use this to inspect MCP injection + the
+   * remote spawn path. `startRuntime` is the only production caller.
+   */
+  planRuntimeSpawn(record: SessionRecord): RuntimeSpawnPlan {
     const preset = resolveChannelPreset(
       { channelPresets: this.channelPresets, threadPresets: this.threadPresets },
       record.parentRef ?? undefined,
@@ -494,35 +520,56 @@ export class SessionRouter {
     const effort = presetEffortUsable ? preset.effort!.value : cfg.reasoningEffort;
     const cwd = preset.cwd?.value ?? record.repoPath ?? process.cwd();
 
-    // Per-session seam-MCP injection: mint a token for this session, map it to
-    // the record id, and append an http mcpServers entry carrying it as the
-    // X-Seam-Session header. The shared server reads that header per tool call
-    // to resolve the caller back to this thread (#24). Token is revoked in
-    // `invalidate`. A re-mint here (runtime restart) rotates the token, so any
-    // stale one stops resolving immediately.
-    let mcpServers = this.mcpServers;
-    if (this.seamMcp) {
-      const port = this.seamMcp.getPort();
-      if (port !== undefined) {
-        const token = this.seamMcp.registry.mint(record.id);
-        const remote = this.seamMcp.isRemoteSession?.(record.id) === true;
-        const publicUrl = remote ? this.seamMcp.getPublicUrl?.() : undefined;
-        mcpServers = [
-          ...this.mcpServers,
-          buildSeamMcpServerEntry(port, token, publicUrl ? { url: publicUrl } : undefined),
-        ];
-      } else {
-        this.logger.warn(
-          { session: record.id },
-          "seam-mcp enabled but server port not yet available; skipping injection"
+    if (this.seamMcp && this.seamMcp.getPort() === undefined) {
+      this.logger.warn(
+        { session: record.id },
+        "seam-mcp enabled but server port not yet available; skipping injection"
+      );
+    }
+
+    const { mcpServers, remote } = planSeamMcpInjection({
+      sessionId: record.id,
+      globalMcpServers: this.mcpServers,
+      seamMcp: this.seamMcp,
+    });
+
+    let spawnChild: RuntimeSpawnPlan["spawnChild"] = (modelOverride, effortOverride) =>
+      profile.spawn(modelOverride, effortOverride);
+
+    if (remote) {
+      const mux = this.seamMcp?.muxForSession?.(record.id);
+      if (!mux) {
+        throw new Error(
+          `Session ${record.id} is bound to a remote bridge that is not connected`
         );
       }
+      spawnChild = (modelOverride, effortOverride) =>
+        spawnRemoteSlot(mux, {
+          mcpServers,
+          agentId,
+          model: modelOverride,
+          effort: effortOverride,
+          cwd,
+        });
     }
+
+    return { agentId, profile, model, effort, cwd, mcpServers, remote, spawnChild };
+  }
+
+  private async startRuntime(record: SessionRecord): Promise<AgentRuntime> {
+    // Channel/thread presets are the source of truth for locked-down
+    // channels: re-resolved on every runtime start (not just session
+    // creation) so a stored record can never drift from the config file —
+    // whatever's in CHANNEL_PRESETS_FILE wins, regardless of what's in the
+    // DB. See resolveChannelPreset in config.ts.
+    const plan = this.planRuntimeSpawn(record);
+    const { profile, model, effort, cwd, mcpServers } = plan;
 
     const runtime = new AgentRuntime({
       profile,
       logger: this.logger.child({ session: record.id }),
       mcpServers,
+      spawnFn: plan.spawnChild,
       onDead: () => {
         // Involuntary death — #76: leave turn markers intact. This is an
         // interruption, not a cancellation. Recovery reattaches on the next

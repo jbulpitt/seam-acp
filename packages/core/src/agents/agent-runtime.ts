@@ -149,6 +149,15 @@ export class AgentRuntime {
   private readonly permissionPolicy: PermissionPolicy;
   private readonly mcpServers: McpServer[];
   private readonly onDead?: () => void;
+  /**
+   * Optional spawn override. Remote (bridge) sessions pass a function that
+   * mux.spawn()s a slot then rpc("spawn", { slot, mcpServers, … }) before the
+   * first ACP data. Local agents omit this and keep profile.spawn(model?, effort?).
+   */
+  private readonly spawnFn?: (
+    model?: string,
+    effort?: string
+  ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
 
   private child?: ReturnType<AgentProfile["spawn"]>;
   private connection?: ClientSideConnection;
@@ -251,11 +260,20 @@ export class AgentRuntime {
     mcpServers?: McpServer[];
     /** Called when the agent process exits after a successful initialize. */
     onDead?: () => void;
+    /**
+     * Override process spawn. When set, `start()` uses this instead of
+     * `profile.spawn(model?, effort?)`. Local agents leave it unset.
+     */
+    spawnFn?: (
+      model?: string,
+      effort?: string
+    ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
   }) {
     this.profile = opts.profile;
     this.logger = opts.logger.child({ agent: opts.profile.id });
     this.mcpServers = opts.mcpServers ?? [];
     this.onDead = opts.onDead;
+    this.spawnFn = opts.spawnFn;
     this.permissionPolicy =
       opts.permissionPolicy ??
       (async (req) => {
@@ -281,7 +299,9 @@ export class AgentRuntime {
   /** Start the agent process and complete ACP `initialize`. */
   async start(): Promise<void> {
     if (this.connection) return;
-    const child = this.profile.spawn(this.modelOverride, this.effortOverride);
+    const child = this.spawnFn
+      ? await this.spawnFn(this.modelOverride, this.effortOverride)
+      : this.profile.spawn(this.modelOverride, this.effortOverride);
     this.child = child;
 
     // Capture spawn errors (ENOENT, EACCES, etc.) so they surface as a

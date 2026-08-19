@@ -145,6 +145,7 @@ export class BridgeHub {
     return conn.mux.rpc(method, params, { agentId });
   }
 
+  /** Bind a session to a bridge. Real write; PR4 (and tests) are the callers. */
   markSessionBridge(sessionId: string, bridgeId: string): void {
     this.sessionBridge.set(sessionId, bridgeId);
   }

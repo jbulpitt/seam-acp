@@ -355,6 +355,12 @@ async function main(): Promise<void> {
             },
             getPublicUrl: () => bridgeHub?.mcpUrlForRemote(),
             isRemoteSession: (sessionId) => !!bridgeHub?.sessionBridgeId(sessionId),
+            mcpServersForRemoteSpawn: (sessionId) =>
+              bridgeHub?.mcpServersForRemoteSpawn(sessionId),
+            muxForSession: (sessionId) => {
+              const id = bridgeHub?.sessionBridgeId(sessionId);
+              return id ? bridgeHub?.get(id)?.mux : undefined;
+            },
           },
         }
       : {}),

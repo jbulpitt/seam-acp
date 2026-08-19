@@ -1,5 +1,6 @@
 /** Public surface of `@seam/adapters`: AgentAdapter, profile factories, makeMux. */
 export { makeMux } from "./mux.js";
+export type { MuxSpawnOpts, MuxChild } from "./mux.js";
 export * from "./agent-profile.js";
 export * from "./session-manager.js";
 export * from "./attachment-staging.js";

@@ -11,5 +11,6 @@ describe("makeMux export from @seam/adapters", () => {
     expect(typeof mux.attach).toBe("function");
     expect(typeof mux.spawn).toBe("function");
     expect(typeof mux.sendCmd).toBe("function");
+    expect(typeof mux.releaseStdin).toBe("function");
   });
 });

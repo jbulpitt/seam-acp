@@ -239,17 +239,6 @@ const Schema = z.object({
    */
   AGY_AUTO_COMPACT_THRESHOLD: z.coerce.number().min(0).max(1).default(0.8),
   /**
-   * Comma-separated list of remote profile ids (without the `copilot-remote-`
-   * prefix) whose host has network restrictions that block Discord. For these
-   * profiles, attachments are downloaded server-side and written to the
-   * agent's filesystem via the bridge's `writeAttachment` cmd; the LLM gets a
-   * local path in the prompt instead of a Discord URL.
-   */
-  REMOTE_DISCORD_RESTRICTED_PROFILES: z
-    .string()
-    .default("")
-    .transform((v) => new Set(v.split(",").map((s) => s.trim()).filter(Boolean))),
-  /**
    * Model used to generate compaction summaries (auto + manual `/compact`).
    * Picked per-agent. Should be a high-context model with strong summarization
    * — the session's own model may be too small to fit a near-full transcript
@@ -528,88 +517,6 @@ const Schema = z.object({
    *  seam-acp adds it to opencode's `mcp` block so the agent gets Tavily's
    *  LLM-optimized search tools. e.g. `https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-…` */
   OPENCODE_TAVILY_URL: z.string().optional(),
-
-  /**
-   * Comma-separated list of remote Copilot profiles. Each entry registers an
-   * agent profile named `copilot-remote-<id>` that pipes ACP over a WebSocket
-   * to a bridge script running on the remote machine.
-   *
-   * Two modes are supported, distinguished by the format:
-   *
-   * **Server mode** (seam-acp hosts the WS server; bridge dials in):
-   *   `id:port:token`
-   *   Example: `mac:9999:mysecrettoken`
-   *   Run on the remote machine:
-   *     `node scripts/remote-agent-bridge.mjs wss://<seam-acp-host>:9999 mysecrettoken`
-   *
-   * **Client mode** (bridge hosts the WS server; seam-acp dials out):
-   *   `id:wss://url:token`   (url starts with ws:// or wss://)
-   *   Example: `mac:wss://random.trycloudflare.com:mysecrettoken`
-   *   Run on the remote machine:
-   *     `node scripts/remote-agent-bridge.mjs --server 9999 mysecrettoken`
-   *   Then expose with: `cloudflared tunnel --url ws://localhost:9999`
-   *
-   * Multiple entries are comma-separated. Token may contain colons in server
-   * mode; in client mode the token must not contain colons (it is split on the
-   * last colon after the URL).
-   */
-  REMOTE_COPILOT_PROFILES: z
-    .string()
-    .default("")
-    .transform((v) => {
-      const out: Array<
-        | { id: string; mode: "server"; wsPort: number; token: string; defaultModel?: string }
-        | { id: string; mode: "client"; wsUrl: string; token: string; defaultModel?: string }
-      > = [];
-      for (const entry of v.split(",").map((s) => s.trim()).filter(Boolean)) {
-        const first = entry.indexOf(":");
-        if (first <= 0) {
-          throw new Error(
-            `REMOTE_COPILOT_PROFILES entry must be 'id:port:token' or 'id:wsUrl:token' (got '${entry}')`
-          );
-        }
-        const id = entry.slice(0, first).trim();
-        if (!/^[a-z0-9][a-z0-9-]*$/i.test(id)) {
-          throw new Error(
-            `REMOTE_COPILOT_PROFILES id '${id}' must be alphanumeric (dashes allowed)`
-          );
-        }
-        const rest = entry.slice(first + 1);
-
-        if (rest.startsWith("ws://") || rest.startsWith("wss://")) {
-          // Client mode: id:wsUrl:token — split on last colon for token.
-          const lastColon = rest.lastIndexOf(":");
-          if (lastColon <= "wss://".length || lastColon === rest.length - 1) {
-            throw new Error(
-              `REMOTE_COPILOT_PROFILES client entry must be 'id:wsUrl:token' (got '${entry}')`
-            );
-          }
-          const wsUrl = rest.slice(0, lastColon);
-          const tokenAndModel = rest.slice(lastColon + 1);
-          const [token, defaultModel] = tokenAndModel.split("@");
-          out.push({ id, mode: "client", wsUrl, token: token!, defaultModel });
-        } else {
-          // Server mode: id:port:token — token may contain colons.
-          const second = rest.indexOf(":");
-          if (second <= 0 || second === rest.length - 1) {
-            throw new Error(
-              `REMOTE_COPILOT_PROFILES server entry must be 'id:port:token' (got '${entry}')`
-            );
-          }
-          const portStr = rest.slice(0, second).trim();
-          const tokenAndModel = rest.slice(second + 1);
-          const [token, defaultModel] = tokenAndModel.split("@");
-          const wsPort = Number(portStr);
-          if (!Number.isInteger(wsPort) || wsPort < 1 || wsPort > 65535) {
-            throw new Error(
-              `REMOTE_COPILOT_PROFILES port '${portStr}' must be a valid port number`
-            );
-          }
-          out.push({ id, mode: "server", wsPort, token: token!, defaultModel });
-        }
-      }
-      return out;
-    }),
 
   TURN_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(604800).default(900),
   LOG_LEVEL: z
@@ -1024,18 +931,4 @@ export const OLLAMA_CLOUD_STATIC_MODELS = [
   { modelId: "minimax-m3:cloud",            name: "MiniMax M3",           contextLimit: 512_000 },
   { modelId: "llama4:scout-cloud",          name: "Llama 4 Scout",        contextLimit: 512_000 },
   { modelId: "gemma4:cloud",                name: "Gemma 4",              contextLimit: 128_000 },
-];
-
-export const REMOTE_MAC_MODELS = [
-  { modelId: "claude-opus-4.6", name: "Claude Opus 4.6", contextLimit: 200_000 },
-  { modelId: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", contextLimit: 200_000 },
-  { modelId: "gpt-5.2-codex", name: "GPT-5.2-Codex", contextLimit: 400_000 },
-  { modelId: "gpt-5.3-codex", name: "GPT-5.3-Codex", contextLimit: 400_000 },
-  { modelId: "gpt-5.4", name: "GPT-5.4", contextLimit: 400_000 },
-  { modelId: "gpt-5-mini", name: "GPT-5 mini", contextLimit: 192_000 },
-  { modelId: "claude-sonnet-4.5", name: "Claude Sonnet 4.5", contextLimit: 200_000 },
-  { modelId: "claude-opus-4.5", name: "Claude Opus 4.5", contextLimit: 200_000 },
-  { modelId: "claude-haiku-4.5", name: "Claude Haiku 4.5", contextLimit: 200_000 },
-  { modelId: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet" },
-  { modelId: "gpt-3.5-turbo", name: "GPT 3.5 Turbo" }
 ];

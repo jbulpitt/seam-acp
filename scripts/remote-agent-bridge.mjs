@@ -2,27 +2,28 @@
 /**
  * remote-agent-bridge.mjs
  *
- * Run this on the machine where the agent CLI (e.g. Copilot) is installed.
- * Bridges the ACP stdio protocol between a local agent CLI and seam-acp over
- * a WebSocket connection. Supports two modes:
+ * Mux transport between a local agent CLI and seam-acp over a WebSocket.
+ * The copilot-remote profile is gone (PR0); this script remains as mux
+ * transport until the PR2/PR3 bridge rewrite. See docs/seam-bridge-plan.md.
+ *
+ * Protocol: data / kill / exit / cmd / cmd_reply, plus bridge_hello instanceId.
+ * SIGUSR2 enters drain mode. Slot manager multiplexes agent processes over one WS.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * CLIENT MODE (default): bridge dials out to seam-acp's WS server.
  * ─────────────────────────────────────────────────────────────────────────────
  *
  *   Usage:
- *     node remote-agent-bridge.mjs <ws-url> <token> [--cwd <path>] [copilot-cmd]
+ *     node remote-agent-bridge.mjs <ws-url> <token> [--cwd <path>] [agent-cmd]
  *
  *   Arguments:
  *     ws-url      seam-acp WebSocket URL, e.g. wss://tunnel.trycloudflare.com
  *                 (or ws://localhost:9999 for local testing)
- *     token       Shared secret matching REMOTE_COPILOT_PROFILES token in .env
- *     --cwd path  Local working directory to use (default: process.cwd())
- *     copilot-cmd Optional path to the copilot binary (default: "copilot")
+ *     token       Shared secret for the WS handshake
+ *     --cwd path  Local working directory for spawned agent processes
+ *                 (default: process.cwd()). ACP JSON cwd fields are not rewritten.
+ *     agent-cmd   Optional path to the agent binary (default: "copilot")
  *                 Override with COPILOT_CMD env var.
- *
- *   seam-acp .env:
- *     REMOTE_COPILOT_PROFILES=mac:9999:mysecrettoken
  *
  *   Example:
  *     node remote-agent-bridge.mjs wss://your-tunnel.trycloudflare.com mysecret --cwd /Users/you/Projects
@@ -32,10 +33,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  *
  *   Usage:
- *     node remote-agent-bridge.mjs --server <port> <token> [--cwd <path>] [copilot-cmd]
- *
- *   seam-acp .env:
- *     REMOTE_COPILOT_PROFILES=mac:wss://random.trycloudflare.com:mysecrettoken
+ *     node remote-agent-bridge.mjs --server <port> <token> [--cwd <path>] [agent-cmd]
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * Dependencies:
@@ -52,150 +50,6 @@ const copilotDir = path.join(homedir(), ".copilot");
 const dbPath = path.join(copilotDir, "session-store.db");
 const sessionStateDir = path.join(copilotDir, "session-state");
 
-// ---------------------------------------------------------------------------
-// Claude Code session helpers (used when --session-type claude)
-// Claude stores sessions as ~/.claude/projects/<cwd-slug>/<sessionId>.jsonl
-// ---------------------------------------------------------------------------
-const claudeDir = path.join(homedir(), ".claude");
-
-function claudeProjectDir(cwd) {
-  const slug = cwd.replace(/\//g, "-");
-  return path.join(claudeDir, "projects", slug);
-}
-
-/** Find the actual project directory Claude Code uses for a given cwd.
- *  Claude's slug is `cwd.replace(/\//g, "-")` but some builds normalise
- *  dots or trailing slashes differently. Scan all project dirs and return
- *  the one whose slug best matches. Falls back to the computed slug. */
-async function resolveClaudeProjectDir(cwd) {
-  const computed = claudeProjectDir(cwd);
-  try {
-    await fsp.access(computed);
-    return computed; // fast path: computed slug exists
-  } catch { /* continue to scan */ }
-
-  const projectsRoot = path.join(claudeDir, "projects");
-  let entries;
-  try {
-    entries = await fsp.readdir(projectsRoot);
-  } catch {
-    return computed; // no projects dir at all
-  }
-
-  // Normalise both sides: lowercase, dots→dashes, collapse repeated dashes.
-  const norm = (s) => s.toLowerCase().replace(/\./g, "-").replace(/-+/g, "-");
-  const cwdSlug = norm(cwd.replace(/\//g, "-"));
-  console.error(`[bridge] scanning project dirs for cwd=${cwd} (norm slug: ${cwdSlug})`);
-  console.error(`[bridge] available project dirs: ${entries.join(", ")}`);
-
-  const match = entries.find((e) => norm(e) === cwdSlug);
-  if (match) {
-    console.error(`[bridge] matched project dir: ${match}`);
-    return path.join(projectsRoot, match);
-  }
-  // No match — return computed so the caller logs the right path in the error.
-  return computed;
-}
-
-async function claudeListSessions(cwd) {
-  const projectDir = await resolveClaudeProjectDir(cwd);
-  let files;
-  try {
-    files = await fsp.readdir(projectDir);
-  } catch {
-    console.error(`[bridge] claudeListSessions: project dir not found: ${projectDir}`);
-    return [];
-  }
-  const summaries = [];
-  for (const file of files) {
-    if (!file.endsWith(".jsonl")) continue;
-    const sessionId = file.slice(0, -6);
-    const filePath = path.join(projectDir, file);
-    try {
-      const stat = await fsp.stat(filePath);
-      let createdAt = stat.birthtimeMs;
-      let lastActivityAt = stat.mtimeMs;
-      const content = await fsp.readFile(filePath, "utf8");
-      const lines = content.split("\n").filter(l => l.trim());
-      const allMessages = [];
-      for (const line of lines) {
-        try {
-          const entry = JSON.parse(line);
-          if (entry.isMeta === true || entry.isSidechain === true) continue;
-          let text = "";
-          const msgContent = entry.message?.content;
-          if (typeof msgContent === "string") {
-            text = msgContent;
-          } else if (Array.isArray(msgContent)) {
-            text = msgContent.filter(c => c.type === "text").map(c => c.text || "").join("\n");
-          }
-          const ts = entry.timestamp ? Date.parse(entry.timestamp) : undefined;
-          if (ts && !isNaN(ts)) {
-            if (allMessages.length === 0) createdAt = ts;
-            lastActivityAt = ts;
-          }
-          if (text.trim()) {
-            allMessages.push({ sender: entry.type === "user" ? "human" : "agent", text: text.trim() });
-          }
-        } catch { /* skip malformed line */ }
-      }
-      let previewLines = allMessages.length <= 16
-        ? allMessages
-        : [...allMessages.slice(0, 6), ...allMessages.slice(-10)];
-      const estimatedTokens = Math.ceil(allMessages.map(m => m.text).join("\n\n").length / 4);
-      summaries.push({ sessionId, createdAt, lastActivityAt, previewLines, estimatedTokens });
-    } catch { /* skip unreadable file */ }
-  }
-  summaries.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
-  console.error(`[bridge] claudeListSessions: found ${summaries.length} session(s)`);
-  return summaries;
-}
-
-async function claudeGetTranscript(cwd, sessionId) {
-  const filePath = path.join(await resolveClaudeProjectDir(cwd), `${sessionId}.jsonl`);
-  const content = await fsp.readFile(filePath, "utf8");
-  const lines = content.split("\n").filter(l => l.trim());
-  const out = [];
-  for (const line of lines) {
-    try {
-      const entry = JSON.parse(line);
-      if (entry.isMeta === true || entry.isSidechain === true) continue;
-      let text = "";
-      const msgContent = entry.message?.content;
-      if (typeof msgContent === "string") text = msgContent;
-      else if (Array.isArray(msgContent)) text = msgContent.filter(c => c.type === "text").map(c => c.text || "").join("\n");
-      if (text.trim()) out.push(`### ${entry.type === "user" ? "User" : "Assistant"}\n${text.trim()}`);
-    } catch { /* skip */ }
-  }
-  return out.join("\n\n");
-}
-
-async function claudeDeleteSession(cwd, sessionId) {
-  const projectDir = await resolveClaudeProjectDir(cwd);
-  const file = path.join(projectDir, `${sessionId}.jsonl`);
-  await fsp.unlink(file).catch(() => {});
-  const subDir = path.join(projectDir, sessionId);
-  await fsp.rm(subDir, { recursive: true, force: true }).catch(() => {});
-}
-
-async function claudeCompactSession(cwd, sessionId, summaryText) {
-  const projectDir = await resolveClaudeProjectDir(cwd);
-  await fsp.mkdir(projectDir, { recursive: true });
-  const newSessionId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const newFile = path.join(projectDir, `${newSessionId}.jsonl`);
-  const now = new Date().toISOString();
-  const summaryEntry = { type: "user", message: { role: "user", content: summaryText }, timestamp: now, sessionId: newSessionId, isMeta: false };
-  await fsp.writeFile(newFile, JSON.stringify(summaryEntry) + "\n");
-  return newSessionId;
-}
-
-async function claudeCloneSession(cwd, oldSessionId, newSessionId) {
-  const projectDir = await resolveClaudeProjectDir(cwd);
-  const src = path.join(projectDir, `${oldSessionId}.jsonl`);
-  const dst = path.join(projectDir, `${newSessionId}.jsonl`);
-  await fsp.copyFile(src, dst);
-}
-
 /** Write an uploaded attachment to this machine's filesystem under
  *  `<cwd>/.seam-attachments/<filename>` and return the absolute path. Used by
  *  network-restricted remote agents that can't fetch Discord CDN URLs but
@@ -209,87 +63,6 @@ async function writeAttachment(cwd, filename, base64) {
   const absPath = path.join(dir, safe);
   await fsp.writeFile(absPath, Buffer.from(base64, "base64"));
   return { path: absPath };
-}
-
-/** Match the same logic claude-agent-acp uses to decide if a model has a 1M
- *  context window. The "1m" token appears either as "opus[1m]" or as a
- *  hyphenated suffix like "claude-opus-4-7-1m" in API model ids. */
-function inferClaudeContextLimit(model) {
-  if (!model) return 200_000;
-  if (/\b1m\b/i.test(model) || /-1m\b/i.test(model)) return 1_000_000;
-  return 200_000;
-}
-
-/** Read the most recent assistant `usage` block from a Claude Code JSONL
- *  transcript. Returns zeros if no JSONL or no assistant message found.
- *  When newerThanMs is provided, skips any entry whose timestamp is older. */
-async function claudeGetUsage(cwd, sessionId, newerThanMs) {
-  const empty = { model: null, totalUsed: 0, contextLimit: 200_000 };
-  const projectDir = await resolveClaudeProjectDir(cwd);
-  let files;
-  try {
-    files = await fsp.readdir(projectDir);
-  } catch {
-    return empty;
-  }
-
-  let targetPath;
-  if (sessionId) {
-    const file = `${sessionId}.jsonl`;
-    if (files.includes(file)) targetPath = path.join(projectDir, file);
-  }
-  if (!targetPath) {
-    let newest = null;
-    let newestMtime = 0;
-    for (const f of files) {
-      if (!f.endsWith(".jsonl")) continue;
-      try {
-        const stat = await fsp.stat(path.join(projectDir, f));
-        if (stat.mtimeMs > newestMtime) {
-          newest = f;
-          newestMtime = stat.mtimeMs;
-        }
-      } catch { /* skip */ }
-    }
-    if (!newest) return empty;
-    targetPath = path.join(projectDir, newest);
-  }
-
-  let content;
-  try {
-    content = await fsp.readFile(targetPath, "utf8");
-  } catch {
-    return empty;
-  }
-  const cutoff = typeof newerThanMs === "number" ? newerThanMs : 0;
-  const lines = content.split("\n").filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i--) {
-    try {
-      const entry = JSON.parse(lines[i]);
-      if (entry.type !== "assistant" || !entry.message?.usage) continue;
-      // If a timestamp filter is set, skip entries older than the cutoff.
-      if (cutoff > 0 && entry.timestamp) {
-        const entryMs = Date.parse(entry.timestamp);
-        if (!isNaN(entryMs) && entryMs < cutoff) continue;
-      }
-      const u = entry.message.usage;
-      const model = entry.message.model ?? null;
-      const inputTokens = u.input_tokens || 0;
-      const cacheRead = u.cache_read_input_tokens || 0;
-      const cacheCreation = u.cache_creation_input_tokens || 0;
-      const outputTokens = u.output_tokens || 0;
-      return {
-        model,
-        input_tokens: inputTokens,
-        cache_read_input_tokens: cacheRead,
-        cache_creation_input_tokens: cacheCreation,
-        output_tokens: outputTokens,
-        totalUsed: inputTokens + cacheRead + cacheCreation + outputTokens,
-        contextLimit: inferClaudeContextLimit(model),
-      };
-    } catch { /* skip malformed line */ }
-  }
-  return empty;
 }
 
 function escapeSql(val) {
@@ -356,23 +129,6 @@ async function loadWs() {
     console.error("Error: 'ws' package not found. Install it with: npm install ws");
     process.exit(1);
   }
-}
-
-/**
- * Rewrites the `cwd` field in an ACP chunk when it contains an initialize or
- * create_session message. Uses simple text replacement — safe because cwd is
- * always a plain path string and the method check prevents false positives.
- */
-function rewriteCwdInChunk(text, localCwd) {
-  if (!text.includes('"initialize"') && !text.includes('"session/new"') && !text.includes('"session/resume"') && !text.includes('"session/load"')) {
-    return text;
-  }
-  const escaped = localCwd.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const rewritten = text.replace(/"cwd"\s*:\s*"[^"]*"/g, `"cwd":"${escaped}"`);
-  if (rewritten !== text) {
-    console.error(`[bridge] Rewrote cwd to: ${localCwd}`);
-  }
-  return rewritten;
 }
 
 function spawnAgent(copilotCmd, localCwd) {
@@ -468,40 +224,10 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
 
   async function handleCmd(msg) {
     const { cmdId, action } = msg;
-    // Rewrite the cwd in session-management payloads to the local path, the
-    // same way rewriteCwdInChunk handles it for ACP messages. Without this,
-    // listSessions/compactSession/etc. send the seam-acp host's path which
-    // never matches rows stored under the remote machine's localCwd.
-    const payload = msg.payload && msg.payload.cwd
-      ? { ...msg.payload, cwd: localCwd }
-      : msg.payload;
-    console.error(`[bridge] cmd: ${action} (cmdId=${cmdId}, session-type=${sessionType})`);
+    const payload = msg.payload;
+    console.error(`[bridge] cmd: ${action} (cmdId=${cmdId})`);
     try {
       let result;
-      // Route to Claude Code session handlers when --session-type claude is set.
-      if (sessionType === "claude") {
-        if (action === "listSessions") {
-          result = await claudeListSessions(payload.cwd);
-        } else if (action === "getTranscript") {
-          result = await claudeGetTranscript(payload.cwd, payload.sessionId);
-        } else if (action === "deleteSession") {
-          await claudeDeleteSession(payload.cwd, payload.sessionId);
-          result = null;
-        } else if (action === "cloneSession") {
-          await claudeCloneSession(payload.cwd, payload.oldSessionId, payload.newSessionId);
-          result = null;
-        } else if (action === "compactSession") {
-          result = await claudeCompactSession(payload.cwd, payload.sessionId, payload.summary);
-        } else if (action === "getUsage") {
-          result = await claudeGetUsage(payload.cwd, payload.sessionId, payload.newerThanMs);
-        } else if (action === "writeAttachment") {
-          result = await writeAttachment(payload.cwd, payload.filename, payload.base64);
-        } else {
-          throw new Error(`Unknown action: ${action}`);
-        }
-        wsSend({ type: "cmd_reply", cmdId, payload: result });
-        return;
-      }
       if (action === "listSessions") {
         try {
           await fsp.access(dbPath);
@@ -694,7 +420,7 @@ function makeSlotManager(copilotCmd, localCwd, WebSocket) {
     if (msg.type === "data" && msg.data !== undefined) {
       const agent = getOrSpawnSlot(msg.slot);
       if (agent && !agent.killed) {
-        agent.stdin.write(rewriteCwdInChunk(msg.data, localCwd));
+        agent.stdin.write(msg.data);
       }
     } else if (msg.type === "kill") {
       const agent = slots.get(msg.slot);
@@ -864,10 +590,8 @@ function extractFlag(flag) {
 // Extract all named flags before touching positional args.
 const cwdArg = extractFlag("--cwd");
 const gistArg = extractFlag("--gist");
-const sessionTypeArg = extractFlag("--session-type"); // "copilot" (default) or "claude"
 
 let localCwd = cwdArg ? cwdArg.replace(/^~/, homedir()) : process.cwd();
-const sessionType = sessionTypeArg ?? "claude";
 
 console.error(`[bridge] Local cwd: ${localCwd}`);
 

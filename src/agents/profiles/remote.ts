@@ -1,3 +1,7 @@
+/**
+ * Resilient multiplexed transport over a shared WebSocket.
+ * Kept for PR2 extraction; copilot-remote profiles were removed in PR0.
+ */
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcessByStdio } from "node:child_process";
@@ -5,10 +9,7 @@ import type {
   Readable as NodeReadable,
   Writable as NodeWritable,
 } from "node:stream";
-import { WebSocketServer, WebSocket } from "ws";
-import type { IncomingMessage } from "node:http";
-import type { AgentIdentity, AgentProfile } from "../agent-profile.js";
-import type { ISessionManager } from "../session-manager.js";
+import { WebSocket } from "ws";
 
 /**
  * How long spawn() will wait for a bridge connection before emitting an error
@@ -58,10 +59,6 @@ type FakeProcess = EventEmitter & {
   kill(): void;
 };
 
-function remoteDisplayName(id: string): string {
-  return `GitHub Copilot (Remote: ${id.replace(/^copilot-remote-/, "")})`;
-}
-
 // ---------------------------------------------------------------------------
 // Shared mux logic
 // ---------------------------------------------------------------------------
@@ -76,7 +73,7 @@ function remoteDisplayName(id: string): string {
  * When the bridge is offline, stdin data is queued and flushed on reconnect.
  * Fake processes survive bridge reconnects transparently.
  */
-function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
+export function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
   let bridgeWs: WebSocket | null = null;
   let lastBridgeInstanceId: string | undefined;
   let nextSlot = 0;
@@ -295,172 +292,3 @@ function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
 
   return { attach, spawn, sendCmd };
 }
-
-// ---------------------------------------------------------------------------
-// Server mode: seam-acp hosts the WebSocket server; bridge dials in.
-// ---------------------------------------------------------------------------
-
-/**
- * Creates an AgentProfile that listens for inbound WebSocket connections from a
- * bridge script running on the remote machine. The remote machine runs
- * `scripts/remote-agent-bridge.mjs <ws-url> <token>` — where `ws-url` points
- * at this server — and pipes `copilot --acp` stdio over the socket.
- *
- * A single WebSocket connection from the bridge carries all concurrent sessions
- * via slot-tagged message envelopes, so multiple Discord threads work in
- * parallel without needing multiple bridge connections.
- *
- * Use this mode when you can expose a port on the seam-acp server (directly or
- * via a Cloudflare Tunnel on the seam-acp side).
- */
-export function makeRemoteCopilotServerProfile(opts: {
-  id: string;
-  displayName?: string;
-  /** Local TCP port for the WebSocket server. */
-  wsPort: number;
-  /** Shared secret — bridge must send `Authorization: Bearer <token>`. */
-  token: string;
-  defaultModel: string;
-  staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
-  threadAbbr?: string;
-  restrictDiscordAccess?: boolean;
-  onBridgeConnect?: () => void;
-}): AgentProfile {
-  const mux = makeMux({ id: opts.id, onBridgeConnect: opts.onBridgeConnect });
-  const wss = new WebSocketServer({ port: opts.wsPort });
-
-  wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
-    const auth = req.headers["authorization"];
-    if (!auth || auth !== `Bearer ${opts.token}`) {
-      ws.close(4001, "unauthorized");
-      return;
-    }
-
-    const keepalive = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.ping();
-    }, ACTIVE_PING_INTERVAL_MS);
-    ws.once("close", () => clearInterval(keepalive));
-
-    mux.attach(ws);
-  });
-
-  return {
-    id: opts.id,
-    displayName: opts.displayName ?? remoteDisplayName(opts.id),
-    defaultModel: opts.defaultModel,
-    staticModels: opts.staticModels,
-    threadAbbr: opts.threadAbbr,
-    ...(opts.restrictDiscordAccess ? { restrictDiscordAccess: true } : {}),
-    spawn: mux.spawn.bind(mux),
-    whoami(): Promise<AgentIdentity | null> {
-      return Promise.resolve(null);
-    },
-    sessionManager: buildSessionManager(mux),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Client mode: seam-acp dials out; bridge hosts the WebSocket server.
-// ---------------------------------------------------------------------------
-
-/**
- * Creates an AgentProfile that connects outbound as a WebSocket client to a
- * bridge script running on the remote machine. The remote machine runs
- * `scripts/remote-agent-bridge.mjs --server <port> <token>` and exposes it via
- * a Cloudflare Tunnel (or any other means) so seam-acp can reach it.
- *
- * A single outbound WS connection carries all concurrent sessions via
- * slot-tagged message envelopes. Reconnects automatically on disconnect.
- *
- * Use this mode when you prefer to run `cloudflared` on the remote machine
- * rather than on the seam-acp server, and seam-acp has no open inbound ports.
- */
-export function makeRemoteCopilotClientProfile(opts: {
-  id: string;
-  displayName?: string;
-  /** WebSocket URL to connect to, e.g. `wss://random.trycloudflare.com`. */
-  wsUrl: string;
-  /** Shared secret — sent as `Authorization: Bearer <token>`. */
-  token: string;
-  defaultModel: string;
-  staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
-  threadAbbr?: string;
-  restrictDiscordAccess?: boolean;
-  onBridgeConnect?: () => void;
-}): AgentProfile {
-  const mux = makeMux({ id: opts.id, onBridgeConnect: opts.onBridgeConnect });
-
-  function connect() {
-    const ws = new WebSocket(opts.wsUrl, {
-      headers: { Authorization: `Bearer ${opts.token}` },
-    });
-
-    const keepalive = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.ping();
-    }, ACTIVE_PING_INTERVAL_MS);
-    ws.once("close", () => clearInterval(keepalive));
-
-    ws.on("open", () => {
-      mux.attach(ws);
-    });
-
-    ws.on("close", (code) => {
-      if (code !== 4001) {
-        setTimeout(connect, 5_000);
-      }
-    });
-
-    ws.on("error", () => {
-      // close event will fire after error and handle reconnect.
-    });
-  }
-
-  connect();
-
-  return {
-    id: opts.id,
-    displayName: opts.displayName ?? remoteDisplayName(opts.id),
-    defaultModel: opts.defaultModel,
-    staticModels: opts.staticModels,
-    threadAbbr: opts.threadAbbr,
-    ...(opts.restrictDiscordAccess ? { restrictDiscordAccess: true } : {}),
-    spawn: mux.spawn.bind(mux),
-    whoami(): Promise<AgentIdentity | null> {
-      return Promise.resolve(null);
-    },
-    sessionManager: buildSessionManager(mux),
-  };
-}
-
-function buildSessionManager(mux: ReturnType<typeof makeMux>): ISessionManager {
-  return {
-    async listSessions(cwd: string) {
-      return mux.sendCmd("listSessions", { cwd });
-    },
-    async cloneSession(cwd: string, oldSessionId: string, newSessionId: string) {
-      return mux.sendCmd("cloneSession", { cwd, oldSessionId, newSessionId });
-    },
-    async deleteSession(cwd: string, sessionId: string) {
-      return mux.sendCmd("deleteSession", { cwd, sessionId });
-    },
-    async getTranscript(cwd: string, sessionId: string) {
-      return mux.sendCmd("getTranscript", { cwd, sessionId });
-    },
-    async getUsage(cwd: string, sessionId?: string, newerThanMs?: number) {
-      return mux.sendCmd("getUsage", {
-        cwd,
-        ...(sessionId ? { sessionId } : {}),
-        ...(newerThanMs !== undefined ? { newerThanMs } : {}),
-      });
-    },
-    async writeAttachment(cwd: string, filename: string, base64: string) {
-      return mux.sendCmd("writeAttachment", { cwd, filename, base64 });
-    },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Back-compat alias — existing code that calls makeRemoteCopilotProfile keeps
-// working; it maps to the server mode.
-// ---------------------------------------------------------------------------
-export const makeRemoteCopilotProfile = makeRemoteCopilotServerProfile;

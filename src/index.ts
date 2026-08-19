@@ -1,6 +1,6 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { loadConfig, isChannelLocked, adminParticipantOverlapIds, REMOTE_MAC_MODELS, CODEX_STATIC_MODELS, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
+import { loadConfig, isChannelLocked, adminParticipantOverlapIds, CODEX_STATIC_MODELS, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
 import { SessionStore } from "./core/session-store.js";
@@ -11,7 +11,6 @@ import { makeAgyProfile } from "./agents/profiles/agy.js";
 import { makeOpencodeProfile, fetchLmStudioModels, syncOpencodeLmStudioConfig } from "./agents/profiles/opencode.js";
 import { makeCodexProfile } from "./agents/profiles/codex.js";
 import { makeGrokProfile, fetchXaiModels } from "./agents/profiles/grok.js";
-import { makeRemoteCopilotServerProfile, makeRemoteCopilotClientProfile } from "./agents/profiles/remote.js";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { Orchestrator } from "./platforms/discord/orchestrator.js";
@@ -309,33 +308,6 @@ async function main(): Promise<void> {
       })
     : undefined;
 
-  // Late-bound so the callback can reference `orchestrator` which isn't created yet.
-  let notifyBridgeConnect: (id: string) => void = () => {};
-
-  const remoteCopilots = config.REMOTE_COPILOT_PROFILES.map((p) =>
-    p.mode === "server"
-      ? makeRemoteCopilotServerProfile({
-          id: `copilot-remote-${p.id}`,
-          wsPort: p.wsPort,
-          token: p.token,
-          defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
-          staticModels: p.id === "mac" ? REMOTE_MAC_MODELS : config.COPILOT_MODELS,
-          threadAbbr: "🤖 💳",
-          restrictDiscordAccess: config.REMOTE_DISCORD_RESTRICTED_PROFILES.has(p.id),
-          onBridgeConnect: () => notifyBridgeConnect(`copilot-remote-${p.id}`),
-        })
-      : makeRemoteCopilotClientProfile({
-          id: `copilot-remote-${p.id}`,
-          wsUrl: p.wsUrl,
-          token: p.token,
-          defaultModel: p.defaultModel ?? config.DEFAULT_MODEL,
-          staticModels: p.id === "mac" ? REMOTE_MAC_MODELS : config.COPILOT_MODELS,
-          threadAbbr: "🤖 💳",
-          restrictDiscordAccess: config.REMOTE_DISCORD_RESTRICTED_PROFILES.has(p.id),
-          onBridgeConnect: () => notifyBridgeConnect(`copilot-remote-${p.id}`),
-        })
-  );
-
   // Agent-facing seam-MCP surface (#24). The shared HTTP server binds its port
   // later (after the adapter is up), so the router gets the token registry now
   // and a late-bound port getter; per-session injection happens at runtime start.
@@ -345,7 +317,7 @@ async function main(): Promise<void> {
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : []), ...(ollama ? [ollama] : []), ...remoteCopilots],
+    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : []), ...(ollama ? [ollama] : [])],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".
@@ -393,10 +365,6 @@ async function main(): Promise<void> {
   });
 
   orchestrator.install();
-
-  // Now that orchestrator exists, wire the bridge-connect notification callback.
-  notifyBridgeConnect = (id) =>
-    void orchestrator.postNotification(`🟢 Remote bridge connected: ${id}`);
 
   // Wire the ask-the-user callback now that both the router and the adapter
   // exist. Router calls this when a session's policy is "ask".

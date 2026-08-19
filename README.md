@@ -45,7 +45,6 @@ Copy `.env.example` to `.env` and fill it in.
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
 | `CLAUDE_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `claude-<id>` profile pinned to its own `CLAUDE_CONFIG_DIR`. See "Multiple Claude accounts" below. |
-| `REMOTE_COPILOT_PROFILES` | no | Register Copilot profiles running on remote machines via WebSocket bridge. Two formats: `id:port:token` (server mode — seam-acp hosts WS server) or `id:wss://url:token` (client mode — seam-acp dials out). See [docs/remote-agent.md](docs/remote-agent.md). |
 | `TURN_TIMEOUT_SECONDS` | no | Default 900 |
 | `LOG_LEVEL` | no | `fatal` / `error` / `warn` / `info` / `debug` / `trace` |
 | `HEALTH_PORT` | no | Default 3000 — exposes `GET /health` |
@@ -248,25 +247,9 @@ model picker, or touching effort handling must follow
 authoritative, step-by-step empirical process (pull versions → read changelogs →
 update → re-apply patch → verify against JSONL → confirm new/resumed sessions).
 
-### Remote agent profiles (Mac / off-server machine)
+### Remote agents
 
-You can run an agent CLI on a **separate machine** — one that cannot accept inbound connections — and expose it as a regular agent profile via a WebSocket bridge. Two modes are supported:
-
-- **Server mode**: seam-acp hosts the WS server (and `cloudflared`); remote machine dials in outbound.
-- **Client mode**: remote machine hosts the WS server (and `cloudflared`); seam-acp dials out.
-
-```sh
-# Server mode (.env on seam-acp):
-REMOTE_COPILOT_PROFILES=mac:9999:your-secret-token
-# Run on remote machine: node scripts/remote-agent-bridge.mjs wss://tunnel-url your-token
-
-# Client mode (.env on seam-acp):
-REMOTE_COPILOT_PROFILES=mac:wss://random.trycloudflare.com:your-secret-token
-# Run on remote machine: node scripts/remote-agent-bridge.mjs --server 9999 your-token
-#   then: cloudflared tunnel --url ws://localhost:9999
-```
-
-The profile appears in `/seam config agent` as `copilot-remote-mac`. Neither machine needs an open inbound port — both modes use Cloudflare Tunnel for the outbound-only connection. See **[docs/remote-agent.md](docs/remote-agent.md)** for full setup instructions.
+Remote agents are being rebuilt as location bindings — see [`docs/seam-bridge-plan.md`](docs/seam-bridge-plan.md).
 
 ### MCP servers
 
@@ -298,7 +281,7 @@ AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agen
 - **`src/platforms/chat-adapter.ts`** — generic chat platform interface.
 - **`src/platforms/discord/`** — discord.js v14 implementation + slash commands + repo picker.
 - **`src/agents/agent-runtime.ts`** — wraps `@agentclientprotocol/sdk` + a child process running an ACP server. Handles `initialize`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, model / mode / config option setters, and emits typed events.
-- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Sibling profiles: `agy.ts` (Google Antigravity CLI, in-process ACP bridge), `claude.ts` (Anthropic Claude Code, via the `claude-agent-acp` adapter), `opencode.ts` (LM Studio local models via opencode), and `remote.ts` (WebSocket-backed profile for agents on separate machines — see [docs/remote-agent.md](docs/remote-agent.md)). Add a new profile by writing one of these.
+- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Sibling profiles: `agy.ts` (Google Antigravity CLI, in-process ACP bridge), `claude.ts` (Anthropic Claude Code, via the `claude-agent-acp` adapter), `opencode.ts` (LM Studio local models via opencode). Add a new profile by writing one of these.
 - **`src/core/`** — pure utilities: text chunker, path safety, sqlite store, session router, status panel.
 
 ## Testing

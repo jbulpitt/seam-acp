@@ -9091,8 +9091,7 @@ export class Orchestrator {
     const isAgy = record.agentId === "agy";
     const isClaude = record.agentId === "claude" || record.agentId.startsWith("claude-");
     const isCopilot =
-      record.agentId === "copilot" ||
-      (record.agentId.startsWith("copilot-") && !record.agentId.startsWith("copilot-remote"));
+      record.agentId === "copilot" || record.agentId.startsWith("copilot-");
     const isGrok = record.agentId === "grok" || record.agentId.startsWith("grok-");
     if (!isAgy && !isClaude && !isCopilot && !isGrok) {
       await i.editReply({

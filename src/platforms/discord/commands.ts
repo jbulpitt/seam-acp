@@ -55,8 +55,8 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .addStringOption((o) =>
         o
           .setName("thread")
-          .setDescription("Target thread id to steer")
-          .setRequired(true)
+          .setDescription("Target thread id (default: this thread)")
+          .setRequired(false)
       )
       .addStringOption((o) =>
         o

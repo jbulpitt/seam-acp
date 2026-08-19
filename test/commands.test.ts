@@ -142,6 +142,9 @@ describe("/seam slash command", () => {
     expect(now).toBeTruthy();
     expect(now?.type).toBe(BOOLEAN);
     expect(now?.required ?? false).toBe(false);
+    const thread = steer?.options?.find((o) => o.name === "thread");
+    expect(thread?.type).toBe(STRING);
+    expect(thread?.required ?? false).toBe(false);
   });
 
   it("cancel absorbs abort+kill via force/scope options, not new keywords", () => {

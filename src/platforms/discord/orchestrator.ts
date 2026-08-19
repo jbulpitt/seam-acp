@@ -6560,20 +6560,35 @@ export class Orchestrator {
   }
 
   private async cmdSteer(i: ChatInputCommandInteraction): Promise<void> {
-    const threadId = i.options.getString("thread", true).trim();
+    const explicit = i.options.getString("thread")?.trim();
+    const here = this.channelRefFromInteraction(i);
+    const threadId = explicit || here?.id;
     const prompt = i.options.getString("prompt", true);
     // #63 two-tier: `now:true` is PREEMPTIVE (cancel-and-reprompt, today's
     // behavior); `now:false` (DEFAULT) is COOPERATIVE — push into the session's
     // inbox (#61) with no cancel, delivered at the agent's next poll_inbox.
     const now = i.options.getBoolean("now") ?? false;
+    if (!threadId) {
+      await i.reply({
+        content: "Pass `thread:` or run this inside a thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
 
+    const parentId = !explicit ? here?.parentId : undefined;
     const record = this.router.ensureSessionRecord({
       platform: PLATFORM,
       channelRef: threadId,
+      ...(parentId ? { parentRef: parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
-    const target: ChannelRef = { platform: PLATFORM, id: threadId };
+    const target: ChannelRef = {
+      platform: PLATFORM,
+      id: threadId,
+      ...(parentId ? { parentId } : {}),
+    };
 
     if (!now) {
       // COOPERATIVE (#63 default): queue the steer into the target's inbox — no
@@ -9159,7 +9174,7 @@ export class Orchestrator {
       "`/seam cancel` — gracefully cancel this thread's turn",
       "`/seam cancel force:true` — escalate if the turn ignores cancel (old abort)",
       "`/seam cancel scope:all` — force-kill every active session (old kill)",
-      "`/seam steer <thread> <prompt> [now]` — steer a node mid-task",
+      "`/seam steer [thread] <prompt> [now]` — steer a node (thread defaults to here)",
       "`/seam workflows` — delegation ledger + pending wakes/watches",
       "",
       "**`/seam upload`** (admin only)",

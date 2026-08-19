@@ -4,11 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { readdir, readFile } from "node:fs/promises";
 import { pino } from "pino";
-import { Orchestrator } from "../src/platforms/discord/orchestrator.js";
-import { dispatchDirs, type DispatchSpec } from "../src/core/dispatch/types.js";
-import type { Logger } from "../src/lib/logger.js";
-import type { SessionRecord, StructuredPanel } from "../src/core/types.js";
-import type { ChannelRef, MessageRef } from "../src/platforms/chat-adapter.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import type { Logger } from "../packages/core/src/lib/logger.js";
+import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
+import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 

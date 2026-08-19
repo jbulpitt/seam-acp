@@ -3,16 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { Orchestrator } from "../src/platforms/discord/orchestrator.js";
-import { SessionStore } from "../src/core/session-store.js";
-import type { Logger } from "../src/lib/logger.js";
-import type { SessionRecord } from "../src/core/types.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import type { Logger } from "../packages/core/src/lib/logger.js";
+import type { SessionRecord } from "../packages/core/src/core/types.js";
 import {
   WAKE_MIN_DELAY_SECONDS,
   WAKE_MAX_DELAY_SECONDS,
   WAKE_MAX_CHAIN_DEPTH,
   WAKE_MAX_PENDING_PER_THREAD,
-} from "../src/core/wake/types.js";
+} from "../packages/core/src/core/wake/types.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 

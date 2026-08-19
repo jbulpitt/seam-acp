@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { StreamingPanel } from "../src/core/streaming-panel.js";
+import { StreamingPanel } from "../packages/core/src/core/streaming-panel.js";
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 

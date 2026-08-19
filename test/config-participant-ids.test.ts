@@ -5,7 +5,7 @@ import {
   mayConfigureUserIds,
   adminParticipantOverlapIds,
   PARTICIPANT_CONFIG_REFUSAL,
-} from "../src/config.js";
+} from "../packages/core/src/config.js";
 
 /**
  * SEAM_PARTICIPANT_USER_IDS parsing + precedence (#74). Must parse EXACTLY like

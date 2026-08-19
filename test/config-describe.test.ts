@@ -1,11 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { pino } from "pino";
-import { SessionRouter } from "../src/core/session-router.js";
-import type { SessionStore } from "../src/core/session-store.js";
-import type { AgentProfile } from "../src/agents/agent-profile.js";
-import type { Logger } from "../src/lib/logger.js";
-import type { SessionRecord, SessionConfigState } from "../src/core/types.js";
-import type { ChannelPreset, ThreadPreset } from "../src/config.js";
+import { SessionRouter } from "../packages/core/src/core/session-router.js";
+import type { SessionStore } from "../packages/core/src/core/session-store.js";
+import type { AgentProfile } from "@seam/adapters";
+import type { Logger } from "../packages/core/src/lib/logger.js";
+import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
+import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 

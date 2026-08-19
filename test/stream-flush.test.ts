@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { splitForFlush } from "../src/core/stream-flush.js";
+import { splitForFlush } from "../packages/core/src/core/stream-flush.js";
 
 const MAX = 100;
 
@@ -104,7 +104,7 @@ describe("splitForFlush — forced", () => {
   });
 });
 
-import { findFirstUnsafeIndex } from "../src/core/stream-flush.js";
+import { findFirstUnsafeIndex } from "../packages/core/src/core/stream-flush.js";
 
 describe("findFirstUnsafeIndex", () => {
   it("returns -1 for plain prose", () => {

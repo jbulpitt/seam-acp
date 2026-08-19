@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildSeamCommand } from "../src/platforms/discord/commands.js";
+import { buildSeamCommand } from "../packages/core/src/platforms/discord/commands.js";
 
 // Discord ApplicationCommandOptionType
 const SUB_COMMAND = 1;

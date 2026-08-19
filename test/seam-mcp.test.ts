@@ -1,19 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { pino } from "pino";
-import { SeamTokenRegistry } from "../src/core/mcp/token-registry.js";
+import { SeamTokenRegistry } from "../packages/core/src/core/mcp/token-registry.js";
 import {
   SeamMcpServer,
   buildSeamMcpServerEntry,
   type PeekedMessage,
   type SeamMcpServerDeps,
-} from "../src/core/mcp/seam-mcp-server.js";
-import type { Logger } from "../src/lib/logger.js";
-import type { SessionRecord } from "../src/core/types.js";
+} from "../packages/core/src/core/mcp/seam-mcp-server.js";
+import type { Logger } from "../packages/core/src/lib/logger.js";
+import type { SessionRecord } from "../packages/core/src/core/types.js";
 import {
   applyWatchFeedback,
   WATCH_FEEDBACK_INSTRUCTION,
   type DispatchSpec,
-} from "../src/core/dispatch/types.js";
+} from "../packages/core/src/core/dispatch/types.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 

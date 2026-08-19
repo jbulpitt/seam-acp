@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { resolvePermissionMode } from "../src/core/types.js";
+import { resolvePermissionMode } from "../packages/core/src/core/types.js";
 
 describe("resolvePermissionMode", () => {
   it("uses new field when present", () => {

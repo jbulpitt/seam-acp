@@ -6,8 +6,8 @@ import {
   evaluateWatch,
   isCommandAllowed,
   type WatchCommandPolicy,
-} from "../src/core/watch/evaluate.js";
-import type { WatchEvent } from "../src/core/watch/types.js";
+} from "../packages/core/src/core/watch/evaluate.js";
+import type { WatchEvent } from "../packages/core/src/core/watch/types.js";
 
 function makeWatch(over: Partial<WatchEvent> = {}): WatchEvent {
   return {

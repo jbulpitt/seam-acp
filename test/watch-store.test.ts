@@ -2,8 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { SessionStore } from "../src/core/session-store.js";
-import type { WatchEvent } from "../src/core/watch/types.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import type { WatchEvent } from "../packages/core/src/core/watch/types.js";
 
 let dir: string;
 let store: SessionStore;

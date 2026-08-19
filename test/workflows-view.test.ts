@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import type { LedgerEntry } from "../src/core/types.js";
+import type { LedgerEntry } from "../packages/core/src/core/types.js";
 import {
   formatWorkflowsView,
   groupByCorrelation,
@@ -9,7 +9,7 @@ import {
   clampFieldValue,
   formatInterruptedLine,
   formatInterruptedLines,
-} from "../src/platforms/discord/workflows-view.js";
+} from "../packages/core/src/platforms/discord/workflows-view.js";
 
 const NOW = new Date("2026-08-16T12:00:00.000Z");
 

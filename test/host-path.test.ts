@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import path from "node:path";
-import { resolveHostPath } from "../src/core/host-path.js";
+import { resolveHostPath } from "../packages/core/src/core/host-path.js";
 
 describe("resolveHostPath", () => {
   it("uses an absolute path as-is", () => {

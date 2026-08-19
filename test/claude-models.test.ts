@@ -3,7 +3,7 @@ import {
   getClaudeContextWindow,
   isForwardableFullModelId,
   makeClaudeProfile,
-} from "../src/agents/profiles/claude.js";
+} from "@seam/adapters";
 
 describe("getClaudeContextWindow", () => {
   it("returns 200K when the model is unknown/undefined", () => {

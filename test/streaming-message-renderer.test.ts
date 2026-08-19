@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { StreamingMessageRenderer } from "../src/core/streaming-message-renderer.js";
+import { StreamingMessageRenderer } from "../packages/core/src/core/streaming-message-renderer.js";
 
 /** Collects every posted message, in order. */
 function collector() {

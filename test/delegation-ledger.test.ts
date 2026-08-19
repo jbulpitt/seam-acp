@@ -3,11 +3,11 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { SessionStore } from "../src/core/session-store.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
 import {
   PROMPT_PREVIEW_MAX,
   type LedgerEntryInput,
-} from "../src/core/types.js";
+} from "../packages/core/src/core/types.js";
 
 let dir: string;
 let store: SessionStore;

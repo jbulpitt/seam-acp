@@ -3,9 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { buildChannelPresetMaps } from "../src/config.js";
-import { reloadChannelPresets, type PresetMaps } from "../src/core/config-reload.js";
-import type { Logger } from "../src/lib/logger.js";
+import { buildChannelPresetMaps } from "../packages/core/src/config.js";
+import { reloadChannelPresets, type PresetMaps } from "../packages/core/src/core/config-reload.js";
+import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 

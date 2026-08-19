@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { chunkForDiscord } from "../src/core/text-chunker.js";
+import { chunkForDiscord } from "../packages/core/src/core/text-chunker.js";
 
 describe("chunkForDiscord", () => {
   it("returns empty for empty input", () => {

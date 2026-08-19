@@ -24,7 +24,7 @@ import {
   turnDirs,
   writeLiveMarker,
   type LiveTurnMarker,
-} from "../src/core/dispatch/turn-resume.js";
+} from "../packages/core/src/core/dispatch/turn-resume.js";
 
 let dataDir: string;
 

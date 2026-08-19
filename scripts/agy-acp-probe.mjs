@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * End-to-end smoke test for src/agents/profiles/agy.ts.
+ * End-to-end smoke test for packages/adapters/src/profiles/agy.ts.
  *
  * Drives the fake-ChildProcess returned by `makeAgyProfile().spawn()` with a
  * real `ClientSideConnection`, the same way `AgentRuntime` does. Prints each
@@ -17,7 +17,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 
 const { makeAgyProfile } = await import(
-  pathToFileURL(path.join(repoRoot, "src/agents/profiles/agy.ts")).href
+  pathToFileURL(path.join(repoRoot, "packages/adapters/src/profiles/agy.ts")).href
 );
 const acp = await import("@agentclientprotocol/sdk");
 

@@ -4,16 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import { mkdir, writeFile, readdir, readFile } from "node:fs/promises";
 import { pino } from "pino";
-import { Orchestrator } from "../src/platforms/discord/orchestrator.js";
-import { SessionStore } from "../src/core/session-store.js";
-import { DispatchWatcher } from "../src/core/dispatch/watcher.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import {
   dispatchDirs,
   findQueuedReportBackSpec,
   type DispatchSpec,
-} from "../src/core/dispatch/types.js";
-import type { Logger } from "../src/lib/logger.js";
-import type { SessionRecord } from "../src/core/types.js";
+} from "../packages/core/src/core/dispatch/types.js";
+import type { Logger } from "../packages/core/src/lib/logger.js";
+import type { SessionRecord } from "../packages/core/src/core/types.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 

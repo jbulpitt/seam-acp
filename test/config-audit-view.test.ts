@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import type { ConfigAuditEntry } from "../src/core/types.js";
+import type { ConfigAuditEntry } from "../packages/core/src/core/types.js";
 import {
   formatConfigAuditView,
   formatConfigAuditDetail,
@@ -7,7 +7,7 @@ import {
   truncatePayload,
   auditLine,
   AUDIT_PAYLOAD_MAX,
-} from "../src/platforms/discord/config-audit-view.js";
+} from "../packages/core/src/platforms/discord/config-audit-view.js";
 
 const NOW = new Date("2026-08-17T12:00:00.000Z");
 

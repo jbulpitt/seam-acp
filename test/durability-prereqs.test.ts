@@ -9,11 +9,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { SessionStore } from "../src/core/session-store.js";
-import { Orchestrator } from "../src/platforms/discord/orchestrator.js";
-import type { DispatchSpec } from "../src/core/dispatch/types.js";
-import type { Logger } from "../src/lib/logger.js";
-import type { SessionRecord } from "../src/core/types.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import type { Logger } from "../packages/core/src/lib/logger.js";
+import type { SessionRecord } from "../packages/core/src/core/types.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -52,8 +52,8 @@ function armPromptGate(): void {
   promptGate.markStarted = () => resolveStarted();
 }
 
-vi.mock("../src/agents/agent-runtime.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/agents/agent-runtime.js")>();
+vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../packages/core/src/agents/agent-runtime.js")>();
   return {
     ...actual,
     AgentRuntime: class {

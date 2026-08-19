@@ -22,8 +22,8 @@
  * into a pure function during the refactor.
  */
 import { describe, it, expect } from "vitest";
-import { FenceStream, type Segment } from "../src/core/fence-stream.js";
-import { splitForFlush } from "../src/core/stream-flush.js";
+import { FenceStream, type Segment } from "../packages/core/src/core/fence-stream.js";
+import { splitForFlush } from "../packages/core/src/core/stream-flush.js";
 
 const proseText = (segs: Segment[]) =>
   segs.map((s) => (s.kind === "prose" ? s.text : "")).join("");

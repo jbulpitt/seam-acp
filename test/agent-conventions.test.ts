@@ -5,8 +5,8 @@ import {
   sanitizeSpeakerName,
   ATTACH_FENCE_LANG,
   INBOX_AWARENESS_RULE,
-} from "../src/core/agent-conventions.js";
-import { resolveDiscordSpeakerName } from "../src/platforms/discord/adapter.js";
+} from "../packages/core/src/core/agent-conventions.js";
+import { resolveDiscordSpeakerName } from "../packages/core/src/platforms/discord/adapter.js";
 
 // The exact preamble emitted today with no speaker. This golden locks the
 // flag-off / no-speaker output byte-for-byte (issue #57 D1 rollback guarantee).

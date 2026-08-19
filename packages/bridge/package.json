@@ -1,0 +1,25 @@
+{
+  "name": "@seam/bridge",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Lean remote-agent mux host. Depends on @seam/adapters + ws only — not on Discord/orchestrator/cron.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "remote-agent-bridge": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@seam/adapters": "*",
+    "@types/ws": "^8.18.1",
+    "ws": "^8.20.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

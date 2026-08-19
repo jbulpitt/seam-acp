@@ -2,7 +2,7 @@ module.exports = {
   apps: [
     {
       name: "seam-acp",
-      script: "dist/index.js",
+      script: "packages/core/dist/index.js",
       cwd: __dirname,
       interpreter: "node",
       kill_timeout: 120000,

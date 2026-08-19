@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { cleanTextForPreview } from "../src/agents/session-manager.js";
-import { makeCopilotProfile } from "../src/agents/profiles/copilot.js";
+import { cleanTextForPreview } from "@seam/adapters";
+import { makeCopilotProfile } from "@seam/adapters";
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";

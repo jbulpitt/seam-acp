@@ -3,15 +3,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { Orchestrator } from "../src/platforms/discord/orchestrator.js";
-import { DispatchStatusPanel } from "../src/core/dispatch-status-panel.js";
-import { TurnStatus, formatContextUsage } from "../src/core/status-panel.js";
-import { discordRenderer } from "../src/platforms/discord/renderer.js";
-import { serializePanelText } from "../src/platforms/renderer.js";
-import type { DispatchSpec } from "../src/core/dispatch/types.js";
-import type { Logger } from "../src/lib/logger.js";
-import type { SessionRecord, StructuredPanel } from "../src/core/types.js";
-import type { ChannelRef, MessageRef } from "../src/platforms/chat-adapter.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { DispatchStatusPanel } from "../packages/core/src/core/dispatch-status-panel.js";
+import { TurnStatus, formatContextUsage } from "../packages/core/src/core/status-panel.js";
+import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
+import { serializePanelText } from "../packages/core/src/platforms/renderer.js";
+import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import type { Logger } from "../packages/core/src/lib/logger.js";
+import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
+import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 

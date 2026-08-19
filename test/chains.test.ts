@@ -3,14 +3,14 @@ import { pino } from "pino";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { SessionStore } from "../src/core/session-store.js";
-import { PROMPT_PREVIEW_MAX, type ChainCreateInput, type SessionRecord } from "../src/core/types.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { PROMPT_PREVIEW_MAX, type ChainCreateInput, type SessionRecord } from "../packages/core/src/core/types.js";
 import {
   SeamMcpServer,
   type PeekedMessage,
-} from "../src/core/mcp/seam-mcp-server.js";
-import type { Logger } from "../src/lib/logger.js";
-import type { DispatchSpec } from "../src/core/dispatch/types.js";
+} from "../packages/core/src/core/mcp/seam-mcp-server.js";
+import type { Logger } from "../packages/core/src/lib/logger.js";
+import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 
 let dir: string;
 let store: SessionStore;

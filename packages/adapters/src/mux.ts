@@ -1,6 +1,6 @@
 /**
  * Resilient multiplexed transport over a shared WebSocket.
- * Kept for PR2 extraction; copilot-remote profiles were removed in PR0.
+ * Extracted into @seam/adapters (PR2); copilot-remote profiles were removed in PR0.
  */
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";

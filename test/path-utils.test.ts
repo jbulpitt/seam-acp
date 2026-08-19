@@ -5,7 +5,7 @@ import {
   isWithinRoot,
   normalizeFullPath,
   resolveRepoPath,
-} from "../src/core/path-utils.js";
+} from "../packages/core/src/core/path-utils.js";
 
 const tmp = os.tmpdir();
 

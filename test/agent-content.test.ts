@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { blockToFile } from "../src/agents/agent-content.js";
+import { blockToFile } from "../packages/core/src/agents/agent-content.js";
 
 describe("blockToFile", () => {
   it("returns undefined for non-objects and unknown types", () => {

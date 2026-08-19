@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Manual smoke-test for src/agents/agy-stream.ts.
+ * Manual smoke-test for packages/adapters/src/agy-stream.ts.
  *
  * Spawns `agy -p "<prompt>"`, finds its language server, subscribes to
  * `StreamAgentStateUpdates`, and prints a compact timeline of step
@@ -19,7 +19,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
-const modUrl = pathToFileURL(path.join(repoRoot, "src/agents/agy-stream.ts")).href;
+const modUrl = pathToFileURL(path.join(repoRoot, "packages/adapters/src/agy-stream.ts")).href;
 const { discoverAgyLs, subscribeToAgyStream } = await import(modUrl);
 
 const DUMP = process.env.DUMP === "1";

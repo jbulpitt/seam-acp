@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
-import { ScheduledPromptManager } from "../src/core/scheduled-prompts/manager.js";
-import type { SessionStore } from "../src/core/session-store.js";
-import type { ScheduledPrompt } from "../src/core/scheduled-prompts/types.js";
+import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
+import type { SessionStore } from "../packages/core/src/core/session-store.js";
+import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 
 const silentLogger = {
   info() {},

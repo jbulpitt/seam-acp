@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { loadConfig } from "../src/config.js";
+import { loadConfig } from "../packages/core/src/config.js";
 
 /**
  * SEAM_CONFIG_ADMIN_USER_IDS parsing + compat (#71). It must parse EXACTLY like

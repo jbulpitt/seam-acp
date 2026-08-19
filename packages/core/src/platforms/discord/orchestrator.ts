@@ -25,12 +25,12 @@ import type {
   SessionRecord,
 } from "../chat-adapter.js";
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
-import { cleanTextForPreview, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "../../agents/session-manager.js";
+import { cleanTextForPreview, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
 import { readRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
 import { analyzeSessionCoverage, detectGaps, type TimeRange, type GapReport } from "../../core/compaction/gap-detector.js";
 import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
 import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, assembleNewSession, type PinnedFacts } from "../../core/compaction/prompts.js";
-import type { AgentProfile } from "../../agents/agent-profile.js";
+import type { AgentProfile } from "@seam/adapters";
 import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import type { WakeManager } from "../../core/wake/manager.js";
@@ -175,7 +175,7 @@ import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, isMathFenceLang, withHarnessPreamble } from "../../core/agent-conventions.js";
 import { renderMathPng } from "../../core/math-render.js";
 import { isInlineableForAgent } from "../../agents/attachments.js";
-import { stageAttachment, sweepStagedAttachments } from "../../agents/attachment-staging.js";
+import { stageAttachment, sweepStagedAttachments } from "@seam/adapters";
 import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { SerialQueue } from "../../core/serial-queue.js";
@@ -9103,25 +9103,25 @@ export class Orchestrator {
       const profile = this.router.getProfile(record.agentId);
       const configDir = profile?.configDir;
       if (isAgy) {
-        const { fetchAgyUserStatus } = await import("../../agents/profiles/agy.js");
+        const { fetchAgyUserStatus } = await import("@seam/adapters");
         const data = await fetchAgyUserStatus(this.config.AGY_CLI_PATH);
         await i.editReply({ content: formatAgyUsage(data) });
       } else if (isClaude) {
-        const { fetchClaudeUsage } = await import("../../agents/profiles/claude.js");
+        const { fetchClaudeUsage } = await import("@seam/adapters");
         const data = await fetchClaudeUsage(configDir);
         await i.editReply({ content: formatClaudeUsage(data) });
       } else if (isGrok) {
         const {
           fetchGrokUsage,
           fetchGrokUsageFromConnection,
-        } = await import("../../agents/profiles/grok.js");
+        } = await import("@seam/adapters");
         const live = this.router.getRuntime(record.id);
         const data = live
           ? await fetchGrokUsageFromConnection((method, params) => live.request(method, params))
           : await fetchGrokUsage(this.config.GROK_CLI_PATH);
         await i.editReply({ content: formatGrokUsage(data) });
       } else {
-        const { fetchCopilotUsage } = await import("../../agents/profiles/copilot.js");
+        const { fetchCopilotUsage } = await import("@seam/adapters");
         const data = await fetchCopilotUsage(configDir);
         await i.editReply({ content: formatCopilotUsage(data) });
       }
@@ -10935,7 +10935,7 @@ function fitTranscriptToWindow(
   );
 }
 
-function formatAgyUsage(d: import("../../agents/profiles/agy.js").AgyUsage): string {
+function formatAgyUsage(d: import("@seam/adapters").AgyUsage): string {
   const lines: string[] = [];
   const who = [d.name, d.email].filter(Boolean).join(" · ");
   lines.push(`**Antigravity usage**${who ? ` — ${who}` : ""}`);
@@ -10969,7 +10969,7 @@ function formatAgyUsage(d: import("../../agents/profiles/agy.js").AgyUsage): str
 }
 
 function formatCopilotUsage(
-  d: import("../../agents/profiles/copilot.js").CopilotUsageData
+  d: import("@seam/adapters").CopilotUsageData
 ): string {
   const lines: string[] = [];
   const who = [d.login, d.org ? `(${d.org})` : null].filter(Boolean).join(" ");
@@ -10977,7 +10977,7 @@ function formatCopilotUsage(
   if (d.plan) lines.push(`Plan: \`${d.plan}\``);
   const fmtQuota = (
     label: string,
-    q: import("../../agents/profiles/copilot.js").CopilotQuotaSnapshot | null
+    q: import("@seam/adapters").CopilotQuotaSnapshot | null
   ): string | null => {
     if (!q) return null;
     if (q.unlimited) return `${label}: unlimited`;
@@ -10999,7 +10999,7 @@ function formatCopilotUsage(
 }
 
 function formatGrokUsage(
-  d: import("../../agents/profiles/grok.js").GrokUsageData
+  d: import("@seam/adapters").GrokUsageData
 ): string {
   const lines: string[] = [];
   lines.push(`**Grok usage**${d.subscriptionTier ? ` — ${d.subscriptionTier}` : ""}`);
@@ -11018,7 +11018,7 @@ function formatGrokUsage(
 }
 
 function formatClaudeUsage(
-  d: import("../../agents/profiles/claude.js").ClaudeUsageData
+  d: import("@seam/adapters").ClaudeUsageData
 ): string {
   const lines: string[] = [];
   lines.push(`**Claude Code usage**${d.login ? ` — ${d.login}` : ""}`);
@@ -11028,7 +11028,7 @@ function formatClaudeUsage(
   }
   const fmtBucket = (
     label: string,
-    b: import("../../agents/profiles/claude.js").ClaudeUsageBucket | null
+    b: import("@seam/adapters").ClaudeUsageBucket | null
   ): string | null => {
     if (!b) return null;
     const reset = b.resetsAt ? ` · resets ${formatResetTime(b.resetsAt)}` : "";

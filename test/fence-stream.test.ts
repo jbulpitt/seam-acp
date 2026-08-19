@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { FenceStream, type Segment } from "../src/core/fence-stream.js";
+import { FenceStream, type Segment } from "../packages/core/src/core/fence-stream.js";
 
 const proseSegments = (segments: Segment[]): string =>
   segments

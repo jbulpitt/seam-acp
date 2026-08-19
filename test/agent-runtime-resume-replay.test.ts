@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { AgentRuntime, type AgentEvent } from "../src/agents/agent-runtime.js";
-import type { AgentProfile } from "../src/agents/agent-profile.js";
-import { logger } from "../src/lib/logger.js";
-import { WATCH_FEEDBACK_INSTRUCTION, applyWatchFeedback } from "../src/core/dispatch/types.js";
+import { AgentRuntime, type AgentEvent } from "../packages/core/src/agents/agent-runtime.js";
+import type { AgentProfile } from "@seam/adapters";
+import { logger } from "../packages/core/src/lib/logger.js";
+import { WATCH_FEEDBACK_INSTRUCTION, applyWatchFeedback } from "../packages/core/src/core/dispatch/types.js";
 
 /**
  * Drives AgentRuntime against a fake ACP connection to prove the resume-replay

@@ -3,8 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { SessionStore } from "../src/core/session-store.js";
-import { INBOX_MAX_PER_SESSION } from "../src/core/inbox/types.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { INBOX_MAX_PER_SESSION } from "../packages/core/src/core/inbox/types.js";
 
 let dir: string;
 let store: SessionStore;

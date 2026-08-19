@@ -3,17 +3,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { Orchestrator } from "../src/platforms/discord/orchestrator.js";
-import { SessionStore } from "../src/core/session-store.js";
-import type { Logger } from "../src/lib/logger.js";
-import type { SessionRecord } from "../src/core/types.js";
-import type { WatchCreateRequest } from "../src/core/watch/types.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import type { Logger } from "../packages/core/src/lib/logger.js";
+import type { SessionRecord } from "../packages/core/src/core/types.js";
+import type { WatchCreateRequest } from "../packages/core/src/core/watch/types.js";
 import {
   WATCH_MIN_INTERVAL_SECONDS,
   WATCH_MAX_INTERVAL_SECONDS,
   WATCH_MAX_EXPIRY_SECONDS,
   WATCH_MAX_PENDING_PER_THREAD,
-} from "../src/core/watch/types.js";
+} from "../packages/core/src/core/watch/types.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 

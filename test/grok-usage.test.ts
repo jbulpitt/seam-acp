@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseGrokBilling } from "../src/agents/profiles/grok.js";
+import { parseGrokBilling } from "@seam/adapters";
 
 const PROBE = {
   config: {

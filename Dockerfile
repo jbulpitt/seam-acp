@@ -7,10 +7,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json* ./
+COPY packages/adapters/package.json ./packages/adapters/
+COPY packages/core/package.json ./packages/core/
+COPY packages/bridge/package.json ./packages/bridge/
 RUN npm ci --no-audit --no-fund
 
-COPY tsconfig.json ./
-COPY src ./src
+COPY tsconfig.json tsconfig.base.json ./
+COPY packages ./packages
 RUN npm run build \
     && npm prune --omit=dev
 
@@ -33,7 +36,7 @@ RUN if [ "$INSTALL_COPILOT_CLI" = "true" ]; then \
 
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
+COPY --from=build /app/packages ./packages
 COPY package.json ./
 
 # `node` user already exists in the base image; make /data writable for it.
@@ -43,5 +46,4 @@ USER node
 VOLUME ["/data"]
 EXPOSE 3000
 
-ENTRYPOINT ["node", "dist/index.js"]
-
+ENTRYPOINT ["node", "packages/core/dist/index.js"]

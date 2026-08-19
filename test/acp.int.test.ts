@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { spawnSync } from "node:child_process";
-import { AgentRuntime } from "../src/agents/agent-runtime.js";
-import { makeCopilotProfile } from "../src/agents/profiles/copilot.js";
-import { logger } from "../src/lib/logger.js";
+import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
+import { makeCopilotProfile } from "@seam/adapters";
+import { logger } from "../packages/core/src/lib/logger.js";
 
 const copilotInstalled =
   spawnSync("which", ["copilot"], { encoding: "utf8" }).status === 0;

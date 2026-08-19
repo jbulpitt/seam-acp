@@ -1,5 +1,5 @@
 import { AgentRuntime } from "../agents/agent-runtime.js";
-import type { AgentProfile } from "../agents/agent-profile.js";
+import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore } from "./session-store.js";
 import type { SessionRecord, PermissionPolicyMode } from "./types.js";

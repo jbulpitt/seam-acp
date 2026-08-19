@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { discordRenderer } from "../src/platforms/discord/renderer.js";
+import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 
 describe("discordRenderer", () => {
   it("status panel uses the right icon and rows", () => {

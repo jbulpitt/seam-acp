@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
-import { WatchManager, type WatchManagerStore } from "../src/core/watch/manager.js";
-import type { WatchEvent, WatchEvalResult } from "../src/core/watch/types.js";
+import { WatchManager, type WatchManagerStore } from "../packages/core/src/core/watch/manager.js";
+import type { WatchEvent, WatchEvalResult } from "../packages/core/src/core/watch/types.js";
 
 const silentLogger = {
   info() {},

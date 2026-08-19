@@ -3,7 +3,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { zipOneFile } from "../src/core/zip-one.js";
+import { zipOneFile } from "../packages/core/src/core/zip-one.js";
 
 describe("zipOneFile", () => {
   it("produces a zip python can extract", async () => {

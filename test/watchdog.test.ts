@@ -1,12 +1,12 @@
 import { describe, it, expect } from "vitest";
-import type { LedgerEntry } from "../src/core/types.js";
+import type { LedgerEntry } from "../packages/core/src/core/types.js";
 import {
   detectLoops,
   detectFrequencySpikes,
   detectQuietTargets,
   summarizeAnomalies,
   hasAnomalies,
-} from "../src/core/watchdog.js";
+} from "../packages/core/src/core/watchdog.js";
 
 const NOW = new Date("2026-08-16T12:00:00.000Z");
 

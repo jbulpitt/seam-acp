@@ -3,9 +3,9 @@ import { mkdtemp, mkdir, rm, readFile, writeFile, readdir } from "node:fs/promis
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { pino } from "pino";
-import { DispatchWatcher } from "../src/core/dispatch/watcher.js";
-import { dispatchDirs, type DispatchSpec } from "../src/core/dispatch/types.js";
-import type { Logger } from "../src/lib/logger.js";
+import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
+import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 

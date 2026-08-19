@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { frameSteerPrompt } from "../src/core/steer.js";
+import { frameSteerPrompt } from "../packages/core/src/core/steer.js";
 
 describe("frameSteerPrompt", () => {
   it("wraps the prompt in a <seam-steer> fence with the operator directive", () => {

@@ -31,7 +31,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { PresetsFileSchema } from "../config.js";
 import type { Logger } from "../lib/logger.js";
-import type { AgentProfile } from "../agents/agent-profile.js";
+import type { AgentProfile } from "@seam/adapters";
 import type { ConfigDescription } from "./session-router.js";
 import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
 import type { ScheduledPrompt } from "./scheduled-prompts/types.js";

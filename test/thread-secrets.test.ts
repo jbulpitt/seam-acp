@@ -8,7 +8,7 @@ import {
   secretHarnessRules,
   consumeThreadSecrets,
   assertSecretName,
-} from "../src/core/thread-secrets.js";
+} from "../packages/core/src/core/thread-secrets.js";
 
 describe("thread secrets", () => {
   it("rejects a bad name", () => {

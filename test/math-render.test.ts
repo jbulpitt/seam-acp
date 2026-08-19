@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isMathFenceLang, renderMathPng } from "../src/core/math-render.js";
+import { isMathFenceLang, renderMathPng } from "../packages/core/src/core/math-render.js";
 
 const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 

@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import {
   discoverAgyLs,
   waitForAgyConversationId,
-} from "../src/agents/agy-stream.js";
+} from "@seam/adapters";
 
 // Regression coverage for the intermittent agy empty-response bug: two agy
 // turns running at once used to cross-wire because port + cascade discovery

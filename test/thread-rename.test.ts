@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { Orchestrator } from "../src/platforms/discord/orchestrator.js";
-import type { ChannelRef } from "../src/platforms/chat-adapter.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import type { ChannelRef } from "../packages/core/src/platforms/chat-adapter.js";
 
 describe("Orchestrator Thread Renaming Abbreviation", () => {
   it("replaces known agent abbreviations case-insensitively in brackets", async () => {

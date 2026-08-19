@@ -17,29 +17,20 @@
   "engines": {
     "node": ">=22"
   },
-  "main": "dist/index.js",
+  "workspaces": [
+    "packages/adapters",
+    "packages/core",
+    "packages/bridge"
+  ],
+  "main": "packages/core/dist/index.js",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
+    "build": "npm run build -w @seam/adapters && npm run build -w @seam/core && npm run build -w @seam/bridge",
+    "start": "node packages/core/dist/index.js",
     "redeploy": "npm install --include=dev && npm run build && node -e \"require('fs').writeFileSync('data/.restart-pending', '')\" && echo 'Build complete — restart sentinel written'",
-    "dev": "tsx watch src/index.ts",
+    "dev": "npm run build -w @seam/adapters && tsx watch packages/core/src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
-  },
-  "dependencies": {
-    "@agentclientprotocol/sdk": "^1.1.0",
-    "@resvg/resvg-js": "^2.6.2",
-    "@types/ws": "^8.18.1",
-    "better-sqlite3": "^11.7.0",
-    "croner": "^10.0.1",
-    "cronstrue": "^3.14.0",
-    "discord.js": "^14.16.3",
-    "dotenv": "^16.4.7",
-    "mathjax-full": "^3.2.1",
-    "pino": "^9.5.0",
-    "ws": "^8.20.0",
-    "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",

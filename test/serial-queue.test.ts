@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SerialQueue } from "../src/core/serial-queue.js";
+import { SerialQueue } from "../packages/core/src/core/serial-queue.js";
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 

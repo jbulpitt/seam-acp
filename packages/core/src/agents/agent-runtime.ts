@@ -12,7 +12,7 @@ import {
   type SessionNotification,
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "./agent-profile.js";
+import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { MessageAttachment } from "../platforms/chat-adapter.js";
 import {

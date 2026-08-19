@@ -14,9 +14,9 @@
  * 6.5k-line orchestrator.
  */
 
-import type { AgentProfile } from "../agents/agent-profile.js";
+import type { AgentProfile } from "@seam/adapters";
 import type { AgentEventHandler } from "../agents/agent-runtime.js";
-import type { ISessionManager } from "../agents/session-manager.js";
+import type { ISessionManager } from "@seam/adapters";
 import type { ChannelRef, MessageAttachment } from "../platforms/chat-adapter.js";
 import type { SessionRecord } from "./types.js";
 

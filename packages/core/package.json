@@ -1,0 +1,33 @@
+{
+  "name": "@seam/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.1.0",
+    "@resvg/resvg-js": "^2.6.2",
+    "@seam/adapters": "*",
+    "@types/ws": "^8.18.1",
+    "better-sqlite3": "^11.7.0",
+    "croner": "^10.0.1",
+    "cronstrue": "^3.14.0",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.7",
+    "mathjax-full": "^3.2.1",
+    "pino": "^9.5.0",
+    "ws": "^8.20.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

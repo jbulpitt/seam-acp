@@ -6,9 +6,9 @@ import path from "node:path";
 import {
   SessionStore,
   makeSessionId,
-} from "../src/core/session-store.js";
-import type { Preset, SessionRecord } from "../src/core/types.js";
-import type { ScheduledPrompt } from "../src/core/scheduled-prompts/types.js";
+} from "../packages/core/src/core/session-store.js";
+import type { Preset, SessionRecord } from "../packages/core/src/core/types.js";
+import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 
 let dir: string;
 let store: SessionStore;

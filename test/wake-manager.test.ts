@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
-import { WakeManager } from "../src/core/wake/manager.js";
-import type { SessionStore } from "../src/core/session-store.js";
-import type { WakeEvent } from "../src/core/wake/types.js";
+import { WakeManager } from "../packages/core/src/core/wake/manager.js";
+import type { SessionStore } from "../packages/core/src/core/session-store.js";
+import type { WakeEvent } from "../packages/core/src/core/wake/types.js";
 
 const silentLogger = {
   info() {},

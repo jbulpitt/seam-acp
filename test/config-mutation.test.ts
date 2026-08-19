@@ -3,16 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { SessionStore } from "../src/core/session-store.js";
-import { ConfigMutationService } from "../src/core/config-mutation.js";
-import { reloadChannelPresets } from "../src/core/config-reload.js";
-import { PresetsFileSchema } from "../src/config.js";
-import type { ChannelPreset, ThreadPreset } from "../src/config.js";
-import type { ConfigDescription } from "../src/core/session-router.js";
-import type { AgentProfile } from "../src/agents/agent-profile.js";
-import type { SessionRecord } from "../src/core/types.js";
-import type { ScheduledPrompt } from "../src/core/scheduled-prompts/types.js";
-import type { Logger } from "../src/lib/logger.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
+import { reloadChannelPresets } from "../packages/core/src/core/config-reload.js";
+import { PresetsFileSchema } from "../packages/core/src/config.js";
+import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
+import type { ConfigDescription } from "../packages/core/src/core/session-router.js";
+import type { AgentProfile } from "@seam/adapters";
+import type { SessionRecord } from "../packages/core/src/core/types.js";
+import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
+import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 

@@ -5,8 +5,8 @@ import {
   MAX_ATTACHMENTS,
   MAX_BYTES_PER_ATTACHMENT,
   MAX_INLINE_TEXT_BYTES,
-} from "../src/agents/attachments.js";
-import type { MessageAttachment } from "../src/platforms/chat-adapter.js";
+} from "../packages/core/src/agents/attachments.js";
+import type { MessageAttachment } from "../packages/core/src/platforms/chat-adapter.js";
 
 function fakeFetch(map: Record<string, { body: string | Uint8Array; ok?: boolean }>): typeof fetch {
   return (async (input: string | URL | Request) => {

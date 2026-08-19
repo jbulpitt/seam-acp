@@ -1,11 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { AGENT_ADAPTER_VERSION } from "../src/agents/agent-profile.js";
-import { makeAgyProfile } from "../src/agents/profiles/agy.js";
-import { makeClaudeProfile } from "../src/agents/profiles/claude.js";
-import { makeCodexProfile } from "../src/agents/profiles/codex.js";
-import { makeCopilotProfile } from "../src/agents/profiles/copilot.js";
-import { makeGrokProfile } from "../src/agents/profiles/grok.js";
-import { makeOpencodeProfile } from "../src/agents/profiles/opencode.js";
+import {
+  AGENT_ADAPTER_VERSION,
+  makeAgyProfile,
+  makeClaudeProfile,
+  makeCodexProfile,
+  makeCopilotProfile,
+  makeGrokProfile,
+  makeOpencodeProfile,
+} from "@seam/adapters";
 
 describe("AgentAdapter.describe()", () => {
   it("claude reports meta effort and static models (with contextLimit)", () => {

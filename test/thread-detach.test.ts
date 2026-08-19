@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { isThreadDetached, PresetsFileSchema } from "../src/config.js";
-import type { ThreadPreset } from "../src/config.js";
+import { isThreadDetached, PresetsFileSchema } from "../packages/core/src/config.js";
+import type { ThreadPreset } from "../packages/core/src/config.js";
 
 describe("isThreadDetached (#80)", () => {
   it("returns false when threadId is missing", () => {

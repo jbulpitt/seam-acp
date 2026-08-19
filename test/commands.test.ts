@@ -27,13 +27,13 @@ describe("/seam slash command", () => {
     expect(() => buildSeamCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 10 top-level slots (4 subcommands + 6 groups)", () => {
+  it("registers exactly 12 top-level slots (4 subcommands + 8 groups)", () => {
     const json = built();
-    expect(json.options?.length ?? 0).toBe(10);
+    expect(json.options?.length ?? 0).toBe(12);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
-  it("top-level names are cancel/steer/new/workflows + 6 groups (attach moved to upload)", () => {
+  it("top-level names are cancel/steer/new/workflows + 8 groups (bridge/debug added)", () => {
     const names = (built().options ?? []).map((o) => o.name);
     expect(names).toEqual([
       "cancel",
@@ -46,6 +46,8 @@ describe("/seam slash command", () => {
       "preset",
       "project",
       "upload",
+      "bridge",
+      "debug",
     ]);
     expect(names).not.toContain("attach");
   });
@@ -91,6 +93,20 @@ describe("/seam slash command", () => {
     expect(names).toEqual(["whoami", "usage", "avatar", "help", "sessions", "repos"]);
     expect(names).toHaveLength(6);
     expect(names).not.toContain("config-audit");
+  });
+
+  it("bridge group has add/rotate/list/remove; debug has tail/exec/status", () => {
+    const json = built();
+    const bridge = json.options?.find((o) => o.name === "bridge");
+    expect(bridge?.type).toBe(SUB_COMMAND_GROUP);
+    expect((bridge?.options ?? []).map((o) => o.name)).toEqual(["add", "rotate", "list", "remove"]);
+    const debug = json.options?.find((o) => o.name === "debug");
+    expect(debug?.type).toBe(SUB_COMMAND_GROUP);
+    expect((debug?.options ?? []).map((o) => o.name)).toEqual(["tail", "exec", "status"]);
+    const add = (bridge?.options ?? []).find((o) => o.name === "add");
+    const addNames = (add?.options ?? []).map((o) => o.name);
+    expect(addNames[0]).toBe("name");
+    expect(add?.options?.[0]?.required).toBe(true);
   });
 
   it("schedule/preset/project group sizes are unchanged; upload has pull/push/secret", () => {

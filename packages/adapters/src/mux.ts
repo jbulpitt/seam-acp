@@ -10,6 +10,8 @@ import type {
   Writable as NodeWritable,
 } from "node:stream";
 import { WebSocket } from "ws";
+import type { EventFrame, HelloFrame, RpcReplyFrame } from "./command-bus.js";
+import { PROTOCOL_VERSION } from "./command-bus.js";
 
 /**
  * How long spawn() will wait for a bridge connection before emitting an error
@@ -34,13 +36,37 @@ const ACTIVE_PING_INTERVAL_MS = 25_000;
 
 interface MuxMsg {
   slot?: number;
-  type: "data" | "kill" | "exit" | "cmd" | "cmd_reply";
+  type:
+    | "data"
+    | "kill"
+    | "exit"
+    | "cmd"
+    | "cmd_reply"
+    | "hello"
+    | "hello_ack"
+    | "rpc"
+    | "rpc_reply"
+    | "event"
+    | "ping"
+    | "pong"
+    | "bridge_hello";
   data?: string;
   code?: number;
   cmdId?: string;
   action?: string;
   payload?: any;
   error?: string;
+  v?: number;
+  id?: string;
+  agentId?: string;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+  ok?: boolean;
+  instanceId?: string;
+  bridgeId?: string;
+  protocolVersion?: number;
+  name?: string;
 }
 
 interface SlotEntry {
@@ -73,7 +99,13 @@ type FakeProcess = EventEmitter & {
  * When the bridge is offline, stdin data is queued and flushed on reconnect.
  * Fake processes survive bridge reconnects transparently.
  */
-export function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
+export function makeMux(opts: {
+  id: string;
+  onBridgeConnect?: () => void;
+  onHello?: (hello: HelloFrame) => void;
+  onEvent?: (event: EventFrame) => void;
+  onDisconnect?: () => void;
+}) {
   let bridgeWs: WebSocket | null = null;
   let lastBridgeInstanceId: string | undefined;
   let nextSlot = 0;
@@ -81,6 +113,7 @@ export function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
   /** Timeout handles for spawn() calls waiting for the bridge to come online. */
   const bridgeWaiters: Array<{ slot: number; timeout: ReturnType<typeof setTimeout> }> = [];
   const pendingCmds = new Map<string, { resolve: (val: any) => void; reject: (err: Error) => void }>();
+  const pendingRpcs = new Map<string, { resolve: (val: unknown) => void; reject: (err: Error) => void }>();
 
   function send(msg: MuxMsg) {
     if (bridgeWs?.readyState === WebSocket.OPEN) {
@@ -124,11 +157,12 @@ export function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
         return;
       }
 
-      // Bridge announces its instance ID on every connect. If it changed, the
-      // bridge process restarted and all its agent slots are gone — emit exit
-      // events so runtimes are evicted and re-initialized on next message.
-      if ((msg as any).type === "bridge_hello") {
-        const newId = (msg as any).instanceId as string | undefined;
+      // Bridge announces its instance ID on every connect (`hello` is the
+      // typed bus frame; `bridge_hello` remains accepted for the slot-mux
+      // eviction path). If it changed, the bridge process restarted and all
+      // its agent slots are gone — emit exit events so runtimes are evicted.
+      if (msg.type === "hello" || msg.type === "bridge_hello") {
+        const newId = msg.instanceId;
         const isNewInstance = !!(newId && lastBridgeInstanceId && newId !== lastBridgeInstanceId);
 
         if (isNewInstance) {
@@ -166,6 +200,35 @@ export function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
           }).catch(() => { /* bridge may not support listSlots — ignore */ });
         }
 
+        if (msg.type === "hello") {
+          opts.onHello?.(msg as unknown as HelloFrame);
+        }
+        return;
+      }
+
+      if (msg.type === "rpc_reply" && msg.id) {
+        const handler = pendingRpcs.get(msg.id);
+        if (handler) {
+          pendingRpcs.delete(msg.id);
+          const reply = msg as unknown as RpcReplyFrame;
+          if (!reply.ok || reply.error) {
+            handler.reject(new Error(reply.error ?? "rpc failed"));
+          } else {
+            handler.resolve(reply.result);
+          }
+        }
+        return;
+      }
+
+      if (msg.type === "event") {
+        opts.onEvent?.(msg as unknown as EventFrame);
+        return;
+      }
+
+      if (msg.type === "pong" || msg.type === "ping") {
+        if (msg.type === "ping") {
+          send({ type: "pong", v: PROTOCOL_VERSION } as MuxMsg);
+        }
         return;
       }
 
@@ -197,11 +260,17 @@ export function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
     });
 
     newWs.on("close", () => {
-      if (bridgeWs === newWs) bridgeWs = null;
+      if (bridgeWs === newWs) {
+        bridgeWs = null;
+        opts.onDisconnect?.();
+      }
     });
 
     newWs.on("error", () => {
-      if (bridgeWs === newWs) bridgeWs = null;
+      if (bridgeWs === newWs) {
+        bridgeWs = null;
+        opts.onDisconnect?.();
+      }
     });
   }
 
@@ -290,5 +359,53 @@ export function makeMux(opts: { id: string; onBridgeConnect?: () => void }) {
     });
   }
 
-  return { attach, spawn, sendCmd };
+  function sendFrame(msg: Record<string, unknown>): void {
+    send(msg as unknown as MuxMsg);
+  }
+
+  async function rpc(
+    method: string,
+    params: unknown,
+    optsRpc: { agentId?: string; timeoutMs?: number } = {}
+  ): Promise<unknown> {
+    if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
+      throw new Error(`Remote bridge is offline. Make sure the bridge is running.`);
+    }
+    const id = Math.random().toString(36).substring(2, 15);
+    const timeoutMs = optsRpc.timeoutMs ?? 30_000;
+    return new Promise((resolve, reject) => {
+      pendingRpcs.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        if (pendingRpcs.has(id)) {
+          pendingRpcs.delete(id);
+          reject(new Error(`rpc '${method}' timed out after ${timeoutMs / 1000}s`));
+        }
+      }, timeoutMs);
+      if (typeof timeout.unref === "function") timeout.unref();
+      send({
+        v: PROTOCOL_VERSION,
+        type: "rpc",
+        id,
+        method,
+        params,
+        ...(optsRpc.agentId ? { agentId: optsRpc.agentId } : {}),
+      } as MuxMsg);
+    });
+  }
+
+  function helloAck(accepted: boolean, error?: string): void {
+    send({
+      v: PROTOCOL_VERSION,
+      type: "hello_ack",
+      protocolVersion: PROTOCOL_VERSION,
+      accepted,
+      ...(error ? { error } : {}),
+    } as MuxMsg);
+  }
+
+  function connected(): boolean {
+    return !!bridgeWs && bridgeWs.readyState === WebSocket.OPEN;
+  }
+
+  return { attach, spawn, sendCmd, rpc, sendFrame, helloAck, connected };
 }

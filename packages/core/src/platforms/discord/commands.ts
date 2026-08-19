@@ -7,17 +7,19 @@ import {
  * `/seam` slash-command tree (#78).
  *
  * Discord caps each command at 25 top-level options (subcommands + groups).
- * The tree is 10/25: 5 top-level subcommands + 5 groups. Future surfaces
+ * The tree is 12/25: 4 top-level subcommands + 8 groups. Future surfaces
  * default to living INSIDE a group (each group has its own 25 budget).
  *
  *   TOP-LEVEL (4): cancel, steer, new, workflows
- *   GROUPS (6):
+ *   GROUPS (8):
  *     config   (13) model effort agent mode repo tools approve reset init detach show set audit
  *     info     (6)  whoami usage avatar help sessions repos
  *     schedule (7)  unchanged
  *     preset   (6)  unchanged
  *     project  (3)  unchanged
  *     upload   (3)  pull push secret  — admin-only; hard cutover of /seam attach
+ *     bridge   (4)  add rotate list remove  — admin-only pairing (#83/#86)
+ *     debug    (3)  tail exec status        — admin-only even when SEAM_BRIDGE_DEV (#83)
  */
 export function buildSeamCommand(): SlashCommandBuilder {
   const cmd = new SlashCommandBuilder()
@@ -121,7 +123,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
-  // --- groups (6) -----------------------------------------------------------
+  // --- groups (8) -----------------------------------------------------------
 
   cmd.addSubcommandGroup((g) =>
     g
@@ -479,6 +481,96 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("bridge")
+      .setDescription("Admin-only: pair, rotate, list, or remove remote bridges")
+      .addSubcommand((sub) =>
+        sub
+          .setName("add")
+          .setDescription("Pair a new bridge (prints a one-line bootstrap with the token once)")
+          .addStringOption((o) =>
+            o.setName("name").setDescription("Bridge name (becomes the id slug)").setRequired(true)
+          )
+          .addStringOption((o) =>
+            o.setName("emoji").setDescription("Host emoji (D11)").setRequired(false)
+          )
+          .addStringOption((o) =>
+            o.setName("short-name").setDescription("Short display name").setRequired(false)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("workspace-root")
+              .setDescription("Host workspace root this bridge exposes")
+              .setRequired(false)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("url")
+              .setDescription("Client-mode: wss URL of the bridge (omit for server-mode bootstrap)")
+              .setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("rotate")
+          .setDescription("Issue a new token for a paired bridge")
+          .addStringOption((o) =>
+            o.setName("name").setDescription("Bridge id or name").setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub.setName("list").setDescription("List paired bridges and connection status")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("remove")
+          .setDescription("Unpair a bridge")
+          .addStringOption((o) =>
+            o.setName("name").setDescription("Bridge id or name").setRequired(true)
+          )
+      )
+  );
+
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("debug")
+      .setDescription("Admin-only: tail, exec, or status a paired bridge (dev-mode on the host)")
+      .addSubcommand((sub) =>
+        sub
+          .setName("tail")
+          .setDescription("Tail a log file on the bridge host (dev-mode)")
+          .addStringOption((o) =>
+            o.setName("bridge").setDescription("Paired bridge id").setRequired(true)
+          )
+          .addStringOption((o) =>
+            o.setName("path").setDescription("Log path under the host workspace root").setRequired(false)
+          )
+          .addIntegerOption((o) =>
+            o.setName("lines").setDescription("Lines to return (default 80)").setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("exec")
+          .setDescription("Run a command on the bridge host (dev-mode)")
+          .addStringOption((o) =>
+            o.setName("bridge").setDescription("Paired bridge id").setRequired(true)
+          )
+          .addStringOption((o) =>
+            o.setName("command").setDescription("Command to run (dev-mode shell)").setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("status")
+          .setDescription("Show bridge connection, inventory, and ready state")
+          .addStringOption((o) =>
+            o.setName("bridge").setDescription("Paired bridge id (default: all)").setRequired(false)
+          )
+      )
+  );
+
   return cmd;
 }
 
@@ -507,7 +599,14 @@ export type SeamSubcommand =
   | "avatar"
   | "help"
   | "sessions"
-  | "repos";
+  | "repos"
+  | "add"
+  | "rotate"
+  | "list"
+  | "remove"
+  | "tail"
+  | "exec"
+  | "status";
 
 export function getSubcommand(
   i: ChatInputCommandInteraction

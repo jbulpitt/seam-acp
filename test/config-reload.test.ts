@@ -62,6 +62,27 @@ describe("channel-presets hot-reload (#58 P0)", () => {
     expect(live.threadPresets.get("333")?.cwd?.value).toBe(path.resolve("/tmp/new-thread"));
   });
 
+  it("hot-reloads bridge host config in place (D11 / #86)", () => {
+    const bridgeRef = live.bridgePresets;
+    writePresets(file, {
+      channels: { "111": { locked: true } },
+      threads: {},
+      bridges: {
+        mac: {
+          tokenHash: "b".repeat(64),
+          emoji: "🖥️",
+          shortName: "mac",
+          workspaceRoot: "/tmp/mac-ws",
+        },
+      },
+    });
+    const res = reloadChannelPresets(live, file, silent);
+    expect(res.ok).toBe(true);
+    expect(live.bridgePresets).toBe(bridgeRef);
+    expect(live.bridgePresets.get("mac")?.shortName).toBe("mac");
+    expect(live.bridgePresets.get("mac")?.tokenHash).toBe("b".repeat(64));
+  });
+
   it("a schema-invalid edit is rejected and the previous good config is kept", () => {
     // Non-numeric channel key violates PresetsFileSchema.
     writePresets(file, { channels: { "not-a-number": { locked: true } } });

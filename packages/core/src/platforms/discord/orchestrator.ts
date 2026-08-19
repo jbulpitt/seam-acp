@@ -92,6 +92,10 @@ import {
   findAuditEntry,
 } from "./config-audit-view.js";
 import { summarizeAnomalies } from "../../core/watchdog.js";
+import type { BridgeHub } from "../../core/bridge-hub.js";
+import { handleBridgeSlash } from "./bridge.js";
+import { handleDebugSlash } from "./debug.js";
+import { BRIDGE_ADMIN_REFUSAL, isBridgeAdminRefused } from "./admin-gate.js";
 
 /** Accent color for scheduled-prompt cards ("cron blue"). */
 const SCHEDULED_COLOR = 0x3498db;
@@ -293,6 +297,8 @@ export class Orchestrator {
   /** channelRef → in-flight live-turn marker id. Command-layer cancel uses
    *  this to find the marker; dispose()/onDead must not. */
   private readonly liveTurnByChannel = new Map<string, string>();
+  /** Set by index.ts after construction — pairing + debug + attach ferry. */
+  private bridgeHub?: BridgeHub;
   /** Stash a marker so a live-turn re-fire reuses it instead of writing a
    *  second one (which would double-resume on the next crash). */
   private readonly pendingLiveResume = new Map<string, LiveTurnMarker>();
@@ -334,6 +340,7 @@ export class Orchestrator {
           {
             channelPresets: this.config.channelPresets,
             threadPresets: this.config.threadPresets,
+            bridgePresets: this.config.bridgePresets,
           },
           this.config.CHANNEL_PRESETS_FILE,
           this.logger
@@ -1890,6 +1897,20 @@ export class Orchestrator {
         return;
       }
     }
+    const slashGroup = interaction.options.getSubcommandGroup(false);
+    if (slashGroup === "bridge" || slashGroup === "debug") {
+      if (isBridgeAdminRefused(this.config, interaction.user.id)) {
+        this.logger.warn(
+          { speakerId: interaction.user.id, group: slashGroup, sub },
+          "bridge/debug refused"
+        );
+        await interaction.reply({
+          content: BRIDGE_ADMIN_REFUSAL,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+    }
     if (interaction.options.getSubcommandGroup(false) === "schedule") {
       return this.cmdSchedule(interaction);
     }
@@ -1908,6 +1929,23 @@ export class Orchestrator {
         case "secret":
           return this.cmdUploadSecret(interaction);
       }
+    }
+    if (interaction.options.getSubcommandGroup(false) === "bridge") {
+      return handleBridgeSlash(interaction, {
+        config: this.config,
+        mutation: this.configMutation,
+        hub: this.bridgeHub,
+        logger: this.logger,
+        publicWsUrl:
+          this.bridgeHub?.publicWsUrl() ?? `ws://127.0.0.1:${this.config.HEALTH_PORT}/bridge`,
+      });
+    }
+    if (interaction.options.getSubcommandGroup(false) === "debug") {
+      return handleDebugSlash(interaction, {
+        mutation: this.configMutation,
+        hub: this.bridgeHub,
+        logger: this.logger,
+      });
     }
     if (interaction.options.getSubcommandGroup(false) === "info") {
       switch (interaction.options.getSubcommand(true)) {
@@ -2846,6 +2884,15 @@ export class Orchestrator {
 
   setDispatchWatcher(watcher: DispatchWatcher): void {
     this.dispatchWatcher = watcher;
+  }
+
+  setBridgeHub(hub: BridgeHub): void {
+    this.bridgeHub = hub;
+  }
+
+  /** Exposed so index.ts can wire BridgeHub audit writes without growing this file. */
+  getConfigMutation(): ConfigMutationService {
+    return this.configMutation;
   }
 
   setScheduledManager(m: ScheduledPromptManager): void {
@@ -9388,6 +9435,37 @@ export class Orchestrator {
     }
     const reqPath = (fence.content.split("\n").find((l) => l.trim()) ?? "").trim();
     if (!reqPath) return;
+    const record = this.store.getByChannel(PLATFORM, channel.id);
+    if (record && this.bridgeHub) {
+      try {
+        const ferried = await this.bridgeHub.readAttachmentForSession(
+          record.id,
+          opts.preferredRoot ?? record.repoPath ?? this.config.REPOS_ROOT,
+          reqPath
+        );
+        if (ferried) {
+          const MAX = 25 * 1024 * 1024;
+          if (ferried.size > MAX) {
+            await this.adapter
+              .sendMessage(channel, `_(Can't attach \`${ferried.filename}\` — ${ferried.size} B exceeds the 25 MB limit.)_${note}`)
+              .catch(() => {});
+            return;
+          }
+          await this.adapter.sendFile(channel, {
+            data: ferried.bytes,
+            filename: ferried.filename,
+            mimeType: mimeTypeForFilename(ferried.filename),
+          });
+          return;
+        }
+      } catch (err) {
+        this.logger.warn({ err, reqPath, session: record.id }, "remote seam-attach ferry failed");
+        await this.adapter
+          .sendMessage(channel, `_(couldn't read the file from the host: \`${reqPath}\`)_${note}`)
+          .catch(() => {});
+        return;
+      }
+    }
     const resolved = await this.resolveAllowedHostFile(reqPath, {
       preferredRoot: opts.preferredRoot ?? null,
     });

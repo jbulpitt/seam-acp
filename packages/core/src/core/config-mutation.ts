@@ -30,6 +30,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { PresetsFileSchema } from "../config.js";
+import { uniqueBridgeId } from "./bridge-pairing.js";
 import type { Logger } from "../lib/logger.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { ConfigDescription } from "./session-router.js";
@@ -50,7 +51,8 @@ export type ConfigMutationTier =
   | "preset"
   | "channel-preset"
   | "thread-preset"
-  | "schedule";
+  | "schedule"
+  | "bridge";
 
 /** Tier A — the calling thread's own session config. */
 export interface SessionConfigChanges {
@@ -343,6 +345,219 @@ export class ConfigMutationService {
     }
     const applied = built.proposal.apply(opts.actor);
     return { ok: true, message: applied.message, auditId: applied.auditId };
+  }
+
+  // --- Bridges (D8 / D11 / #86): slash-path writes into `bridges` ----------
+
+  applyBridgePair(opts: {
+    name: string;
+    tokenHash: string;
+    emoji?: string;
+    shortName?: string;
+    workspaceRoot?: string;
+    url?: string;
+    actor: MutationActor;
+  }): { ok: true; bridgeId: string; auditId: string } | { ok: false; error: string } {
+    const loaded = this.readPresetsDoc();
+    if (!loaded.ok) return loaded;
+    const { file, doc } = loaded;
+    const bridges = { ...(doc.bridges ?? {}) };
+    const bridgeId = uniqueBridgeId(opts.name, Object.keys(bridges));
+    const entry: Record<string, unknown> = {
+      tokenHash: opts.tokenHash,
+      createdUtc: new Date().toISOString(),
+      transport: opts.url ? "client" : "server",
+    };
+    if (opts.emoji) entry.emoji = opts.emoji;
+    if (opts.shortName) entry.shortName = opts.shortName;
+    else entry.shortName = opts.name;
+    if (opts.workspaceRoot) entry.workspaceRoot = path.resolve(opts.workspaceRoot);
+    if (opts.url) entry.url = opts.url;
+    bridges[bridgeId] = entry;
+    const written = this.writeBridgesDoc({
+      file,
+      doc,
+      bridges,
+      actor: opts.actor,
+      scope: `bridge:${bridgeId}`,
+      summary: `bridge pair ${bridgeId}`,
+      before: { bridge: null },
+      after: { bridge: { id: bridgeId, ...entry, tokenHash: "(redacted)" } },
+    });
+    if (!written.ok) return written;
+    return { ok: true, bridgeId, auditId: written.auditId };
+  }
+
+  applyBridgeRotate(opts: {
+    bridgeId: string;
+    tokenHash: string;
+    actor: MutationActor;
+  }): { ok: true; auditId: string } | { ok: false; error: string } {
+    const loaded = this.readPresetsDoc();
+    if (!loaded.ok) return loaded;
+    const { file, doc } = loaded;
+    const bridges = { ...(doc.bridges ?? {}) };
+    const current = bridges[opts.bridgeId];
+    if (!current) return { ok: false, error: `No paired bridge named "${opts.bridgeId}".` };
+    const next = { ...current, tokenHash: opts.tokenHash };
+    bridges[opts.bridgeId] = next;
+    const written = this.writeBridgesDoc({
+      file,
+      doc,
+      bridges,
+      actor: opts.actor,
+      scope: `bridge:${opts.bridgeId}`,
+      summary: `bridge rotate ${opts.bridgeId}`,
+      before: { bridge: { id: opts.bridgeId, tokenHash: "(redacted)" } },
+      after: { bridge: { id: opts.bridgeId, tokenHash: "(redacted)" } },
+    });
+    if (!written.ok) return written;
+    return { ok: true, auditId: written.auditId };
+  }
+
+  applyBridgeRemove(opts: {
+    bridgeId: string;
+    actor: MutationActor;
+  }): { ok: true; auditId: string } | { ok: false; error: string } {
+    const loaded = this.readPresetsDoc();
+    if (!loaded.ok) return loaded;
+    const { file, doc } = loaded;
+    const bridges = { ...(doc.bridges ?? {}) };
+    const current = bridges[opts.bridgeId];
+    if (!current) return { ok: false, error: `No paired bridge named "${opts.bridgeId}".` };
+    delete bridges[opts.bridgeId];
+    const written = this.writeBridgesDoc({
+      file,
+      doc,
+      bridges,
+      actor: opts.actor,
+      scope: `bridge:${opts.bridgeId}`,
+      summary: `bridge remove ${opts.bridgeId}`,
+      before: { bridge: { id: opts.bridgeId } },
+      after: { bridge: null },
+    });
+    if (!written.ok) return written;
+    return { ok: true, auditId: written.auditId };
+  }
+
+  applyBridgeHostConfig(opts: {
+    bridgeId: string;
+    emoji?: string | null;
+    shortName?: string | null;
+    workspaceRoot?: string | null;
+    actor: MutationActor;
+  }): { ok: true; auditId: string } | { ok: false; error: string } {
+    const loaded = this.readPresetsDoc();
+    if (!loaded.ok) return loaded;
+    const { file, doc } = loaded;
+    const bridges = { ...(doc.bridges ?? {}) };
+    const current = bridges[opts.bridgeId];
+    if (!current) return { ok: false, error: `No paired bridge named "${opts.bridgeId}".` };
+    const next = { ...current };
+    if (opts.emoji === null) delete next.emoji;
+    else if (opts.emoji !== undefined) next.emoji = opts.emoji;
+    if (opts.shortName === null) delete next.shortName;
+    else if (opts.shortName !== undefined) next.shortName = opts.shortName;
+    if (opts.workspaceRoot === null) delete next.workspaceRoot;
+    else if (opts.workspaceRoot !== undefined) next.workspaceRoot = path.resolve(opts.workspaceRoot);
+    bridges[opts.bridgeId] = next;
+    const written = this.writeBridgesDoc({
+      file,
+      doc,
+      bridges,
+      actor: opts.actor,
+      scope: `bridge:${opts.bridgeId}`,
+      summary: `bridge host-config ${opts.bridgeId}`,
+      before: { bridge: { id: opts.bridgeId, emoji: current.emoji, shortName: current.shortName, workspaceRoot: current.workspaceRoot } },
+      after: { bridge: { id: opts.bridgeId, emoji: next.emoji, shortName: next.shortName, workspaceRoot: next.workspaceRoot } },
+    });
+    if (!written.ok) return written;
+    return { ok: true, auditId: written.auditId };
+  }
+
+  recordBridgeAudit(opts: {
+    bridgeId: string;
+    action: string;
+    actor: MutationActor;
+    extra?: Record<string, unknown>;
+  }): ConfigAuditEntry {
+    return this.writeAudit({
+      tier: "bridge",
+      scope: `bridge:${opts.bridgeId}`,
+      correlationId: randomUUID(),
+      actor: opts.actor,
+      summary: opts.action,
+      before: {},
+      after: { bridgeId: opts.bridgeId, action: opts.action, ...(opts.extra ?? {}) },
+    });
+  }
+
+  private readPresetsDoc():
+    | { ok: true; file: string; doc: Record<string, unknown> & { channels?: Record<string, unknown>; threads?: Record<string, unknown>; bridges?: Record<string, Record<string, unknown>> } }
+    | { ok: false; error: string } {
+    const file = this.deps.presetsFile;
+    if (!file) {
+      return {
+        ok: false,
+        error: "No CHANNEL_PRESETS_FILE is configured, so there is no file to store bridge pairing.",
+      };
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(fs.readFileSync(path.resolve(file), "utf8"));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") raw = {};
+      else return { ok: false, error: `Could not read channel-presets file: ${(err as Error).message}` };
+    }
+    const doc = (raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}) as {
+      channels?: Record<string, unknown>;
+      threads?: Record<string, unknown>;
+      bridges?: Record<string, Record<string, unknown>>;
+    };
+    return { ok: true, file, doc };
+  }
+
+  private writeBridgesDoc(opts: {
+    file: string;
+    doc: Record<string, unknown>;
+    bridges: Record<string, Record<string, unknown>>;
+    actor: MutationActor;
+    scope: string;
+    summary: string;
+    before: unknown;
+    after: unknown;
+  }): { ok: true; auditId: string } | { ok: false; error: string } {
+    const candidate = { ...opts.doc, bridges: opts.bridges };
+    const parsed = PresetsFileSchema.safeParse(candidate);
+    if (!parsed.success) {
+      const issues = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+        .join("; ");
+      return {
+        ok: false,
+        error: `Refused: the resulting channel-presets.json would be invalid (${issues}). Nothing written.`,
+      };
+    }
+    const id = randomUUID();
+    const abs = path.resolve(opts.file);
+    const tmp = `${abs}.tmp-${id.slice(0, 8)}`;
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(tmp, `${JSON.stringify(candidate, null, 2)}\n`, "utf8");
+    fs.renameSync(tmp, abs);
+    const reload = this.deps.reloadPresets();
+    if (!reload.ok) {
+      this.logger.error({ err: reload.error, file: abs }, "bridge-config reload failed after write");
+    }
+    const audit = this.writeAudit({
+      tier: "bridge",
+      scope: opts.scope,
+      correlationId: id,
+      actor: opts.actor,
+      summary: opts.summary,
+      before: opts.before,
+      after: opts.after,
+    });
+    return { ok: true, auditId: audit.id };
   }
 
   // --- Tier A: session config ---------------------------------------------

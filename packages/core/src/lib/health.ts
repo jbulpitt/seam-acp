@@ -1,11 +1,26 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Logger } from "./logger.js";
 
-export function startHealthServer(port: number, logger: Logger): Server {
+export function startHealthServer(
+  port: number,
+  logger: Logger,
+  opts?: { onMcp?: (req: IncomingMessage, res: ServerResponse) => void | Promise<void> }
+): Server {
   const server = createServer((req, res) => {
-    if (req.url === "/health") {
+    const url = (req.url ?? "").split("?")[0] ?? "";
+    if (url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok", utc: new Date().toISOString() }));
+      return;
+    }
+    if ((url === "/mcp" || url === "/mcp/") && opts?.onMcp) {
+      void Promise.resolve(opts.onMcp(req, res)).catch((err) => {
+        logger.warn({ err }, "health /mcp proxy failed");
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "mcp proxy failed" }));
+        }
+      });
       return;
     }
     res.writeHead(200, { "Content-Type": "text/plain" });

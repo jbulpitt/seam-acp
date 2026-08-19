@@ -3,12 +3,12 @@
  * remote-agent-bridge (packages/bridge)
  *
  * Mux transport between a local agent CLI and seam-acp over a WebSocket.
- * The copilot-remote profile is gone (PR0). This is the PR2 TypeScript
- * port of scripts/remote-agent-bridge.mjs — same protocol, no command-bus
- * handshake, no --session-type, no rewriteCwdInChunk.
  *
- * Protocol: data / kill / exit / cmd / cmd_reply, plus bridge_hello instanceId.
- * SIGUSR2 enters drain mode. Slot manager multiplexes agent processes over one WS.
+ * Protocol: slot mux (data / kill / exit) plus the typed command bus
+ * (hello / hello_ack / rpc / rpc_reply / event). listSlots still uses
+ * cmd / cmd_reply. SIGUSR2 enters drain mode.
+ *
+ *   seam-bridge connect --server <wss-url> --id <bridgeId> --token <token> [--cwd] [--dev]
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * CLIENT MODE (default): bridge dials out to seam-acp's WS server.
@@ -48,6 +48,9 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import type { IncomingMessage } from "node:http";
 import type { RawData, WebSocket as WsSocket } from "ws";
+import { PROTOCOL_VERSION, type AgentAdapter } from "@seam/adapters";
+import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
+import { inventoryFromAdapters, loadHostAdapters } from "./inventory.js";
 
 type WsCtor = typeof import("ws").WebSocket;
 type WssCtor = typeof import("ws").WebSocketServer;
@@ -145,7 +148,35 @@ async function loadWs(): Promise<{ WebSocket: WsCtor; WebSocketServer: WssCtor }
   }
 }
 
-function spawnAgent(copilotCmd: string, localCwd: string): ChildProcess {
+function additionalMcpConfigJson(mcpServers: unknown): string | undefined {
+  if (!Array.isArray(mcpServers) || mcpServers.length === 0) return undefined;
+  const mapped: Record<string, { url: string; headers?: Record<string, string> }> = {};
+  for (const s of mcpServers) {
+    if (!s || typeof s !== "object") continue;
+    const rec = s as {
+      name?: string;
+      url?: string;
+      headers?: Array<{ name: string; value: string }>;
+    };
+    if (!rec.url || !rec.name) continue;
+    const headers: Record<string, string> = {};
+    for (const h of rec.headers ?? []) {
+      if (h?.name && typeof h.value === "string") headers[h.name] = h.value;
+    }
+    mapped[rec.name] = {
+      url: rec.url,
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    };
+  }
+  if (Object.keys(mapped).length === 0) return undefined;
+  return JSON.stringify({ mcpServers: mapped });
+}
+
+function spawnAgent(
+  copilotCmd: string,
+  localCwd: string,
+  slotCfg?: SlotSpawnConfig
+): ChildProcess {
   const ghToken = process.env.GH_TOKEN || (() => {
     try { return execSync("gh auth token", { stdio: ["pipe", "pipe", "ignore"] }).toString().trim(); }
     catch { return ""; }
@@ -156,11 +187,17 @@ function spawnAgent(copilotCmd: string, localCwd: string): ChildProcess {
     ? process.env.COPILOT_ARGS.split(" ").filter(Boolean)
     : ["--acp"];
   const cmdArgs = [...cmdParts.slice(1), ...extraArgs];
-  console.error(`[bridge] Spawning agent: ${cmd} ${cmdArgs.join(" ")} (GH_TOKEN: ${ghToken ? ghToken.slice(0, 8) + "..." : "MISSING"})`);
+  const mcpJson = additionalMcpConfigJson(slotCfg?.mcpServers);
+  if (mcpJson) {
+    cmdArgs.push("--additional-mcp-config", mcpJson);
+  }
+  const cwd = slotCfg?.cwd || localCwd;
+  const extraEnv = slotCfg?.env ?? {};
+  console.error(`[bridge] Spawning agent: ${cmd} ${cmdArgs.filter((a) => a !== mcpJson).join(" ")} (GH_TOKEN: ${ghToken ? ghToken.slice(0, 8) + "..." : "MISSING"})`);
   return spawn(cmd, cmdArgs, {
-    cwd: localCwd,
+    cwd,
     stdio: ["pipe", "pipe", "inherit"],
-    env: { ...process.env, ...(ghToken ? { GH_TOKEN: ghToken } : {}) },
+    env: { ...process.env, ...(ghToken ? { GH_TOKEN: ghToken } : {}), ...extraEnv },
   });
 }
 
@@ -187,9 +224,19 @@ function muxSend(
  * Each slot gets its own agent process, spawned lazily on first message.
  * Agents survive WS reconnects — stdout is routed to `currentWs`.
  */
-function makeSlotManager(copilotCmd: string, localCwd: string, WebSocket: WsCtor): SlotManager {
+function makeSlotManager(opts: {
+  copilotCmd: string;
+  localCwd: string;
+  workspaceRoot: string;
+  WebSocket: WsCtor;
+  bridgeId: string;
+  devMode: boolean;
+  adapters: Map<string, AgentAdapter>;
+}): SlotManager {
+  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, devMode, adapters } = opts;
   let currentWs: WsSocket | null = null;
   const slots = new Map<number, ChildProcess>();
+  const slotConfigs = new Map<number, SlotSpawnConfig>();
   let draining = false;
   const lastStdoutAt = new Map<number, number>();
 
@@ -199,7 +246,22 @@ function makeSlotManager(copilotCmd: string, localCwd: string, WebSocket: WsCtor
       // Announce our instance ID immediately. seam-acp uses this to detect a
       // bridge restart and evict its stale runtimes before sending new traffic.
       try {
-        ws.send(JSON.stringify({ type: "bridge_hello", instanceId: BRIDGE_INSTANCE_ID }));
+        const agents = inventoryFromAdapters(adapters, copilotCmd).map((a) => ({
+          ...a,
+          ready: false,
+        }));
+        ws.send(
+          JSON.stringify({
+            v: PROTOCOL_VERSION,
+            type: "hello",
+            bridgeId,
+            instanceId: BRIDGE_INSTANCE_ID,
+            protocolVersion: PROTOCOL_VERSION,
+            host: { os: process.platform, arch: process.arch },
+            agents,
+            devMode,
+          })
+        );
       } catch { /* ws may not be open yet — best effort */ }
     }
   }
@@ -212,7 +274,7 @@ function makeSlotManager(copilotCmd: string, localCwd: string, WebSocket: WsCtor
     }
 
     console.error(`[bridge] Slot ${slot}: spawning agent`);
-    const agent = spawnAgent(copilotCmd, localCwd);
+    const agent = spawnAgent(copilotCmd, localCwd, slotConfigs.get(slot));
     slots.set(slot, agent);
 
     agent.stdout?.on("data", (chunk: Buffer) => {
@@ -437,6 +499,49 @@ function makeSlotManager(copilotCmd: string, localCwd: string, WebSocket: WsCtor
     let msg: any;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
+    if (msg.type === "hello_ack") {
+      if (msg.accepted === false) {
+        console.error(`[bridge] hello rejected: ${msg.error ?? "protocol mismatch"}`);
+      } else {
+        console.error("[bridge] hello_ack accepted");
+      }
+      return;
+    }
+
+    if (msg.type === "rpc") {
+      const id = msg.id as string;
+      const method = String(msg.method ?? "");
+      void (async () => {
+        try {
+          const result = await dispatchBridgeRpc(method, msg.params, msg.agentId, {
+            adapters,
+            workspaceRoot,
+            cwd: localCwd,
+            devMode,
+            configureSlot: (slot, cfg) => {
+              slotConfigs.set(slot, cfg);
+            },
+          });
+          wsSend({ v: PROTOCOL_VERSION, type: "rpc_reply", id, ok: true, result });
+        } catch (err: any) {
+          console.error(`[bridge] rpc ${method} failed:`, err?.message ?? err);
+          wsSend({
+            v: PROTOCOL_VERSION,
+            type: "rpc_reply",
+            id,
+            ok: false,
+            error: err?.message ?? String(err),
+          });
+        }
+      })();
+      return;
+    }
+
+    if (msg.type === "ping") {
+      wsSend({ v: PROTOCOL_VERSION, type: "pong", ts: msg.ts });
+      return;
+    }
+
     if (msg.type === "data" && msg.data !== undefined) {
       const agent = getOrSpawnSlot(msg.slot);
       if (agent && !agent.killed) {
@@ -448,6 +553,7 @@ function makeSlotManager(copilotCmd: string, localCwd: string, WebSocket: WsCtor
         console.error(`[bridge] Slot ${msg.slot}: kill received — terminating agent`);
         agent.kill();
         slots.delete(msg.slot);
+        slotConfigs.delete(msg.slot);
       }
     } else if (msg.type === "cmd") {
       handleCmd(msg);
@@ -506,9 +612,24 @@ function makeSlotManager(copilotCmd: string, localCwd: string, WebSocket: WsCtor
   return { setWs, handleMessage, drain };
 }
 
-async function runClientMode(wsUrl: string, token: string, copilotCmd: string, localCwd: string) {
+async function runClientMode(
+  wsUrl: string,
+  token: string,
+  copilotCmd: string,
+  localCwd: string,
+  bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
+) {
   const { WebSocket } = await loadWs();
-  const mgr = makeSlotManager(copilotCmd, localCwd, WebSocket);
+  const adapters = loadHostAdapters(copilotCmd);
+  const mgr = makeSlotManager({
+    copilotCmd,
+    localCwd,
+    workspaceRoot: bridgeOpts.workspaceRoot,
+    WebSocket,
+    bridgeId: bridgeOpts.bridgeId,
+    devMode: bridgeOpts.devMode,
+    adapters,
+  });
   activeMgr = mgr;
 
   function connect() {
@@ -549,9 +670,24 @@ async function runClientMode(wsUrl: string, token: string, copilotCmd: string, l
   connect();
 }
 
-async function runServerMode(port: number, token: string, copilotCmd: string, localCwd: string) {
+async function runServerMode(
+  port: number,
+  token: string,
+  copilotCmd: string,
+  localCwd: string,
+  bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
+) {
   const { WebSocket, WebSocketServer } = await loadWs();
-  const mgr = makeSlotManager(copilotCmd, localCwd, WebSocket);
+  const adapters = loadHostAdapters(copilotCmd);
+  const mgr = makeSlotManager({
+    copilotCmd,
+    localCwd,
+    workspaceRoot: bridgeOpts.workspaceRoot,
+    WebSocket,
+    bridgeId: bridgeOpts.bridgeId,
+    devMode: bridgeOpts.devMode,
+    adapters,
+  });
   activeMgr = mgr;
 
   const wss = new WebSocketServer({ port });
@@ -607,13 +743,30 @@ function extractFlag(flag: string): string | null {
   return val;
 }
 
+function extractBoolFlag(flag: string): boolean {
+  const idx = rawArgs.indexOf(flag);
+  if (idx === -1) return false;
+  rawArgs.splice(idx, 1);
+  return true;
+}
+
 // Extract all named flags before touching positional args.
 const cwdArg = extractFlag("--cwd");
 const gistArg = extractFlag("--gist");
+const idArg = extractFlag("--id") ?? extractFlag("--bridge-id");
+const serverFlag = extractFlag("--server");
+const tokenFlag = extractFlag("--token");
+const devFlag = extractBoolFlag("--dev") || process.env.SEAM_BRIDGE_DEV === "1";
 
 const localCwd = cwdArg ? cwdArg.replace(/^~/, homedir()) : process.cwd();
+const workspaceRoot = localCwd;
+const bridgeId = idArg ?? "bridge";
+const bridgeOpts = { bridgeId, devMode: devFlag, workspaceRoot };
 
 console.error(`[bridge] Local cwd: ${localCwd}`);
+if (devFlag) {
+  console.error("[bridge] Dev mode ON — exec/shell/tailLog/writeFile RPC handlers registered");
+}
 
 /**
  * Resolve a WebSocket URL from a GitHub Gist.
@@ -656,46 +809,43 @@ process.on("SIGUSR2", () => {
   }
 });
 
-if (rawArgs[0] === "--server") {
-  const port = Number(rawArgs[1]);
-  const token = rawArgs[2];
-  const copilotCmd = process.env.COPILOT_CMD ?? rawArgs[3] ?? "copilot";
+function usageAndExit(): never {
+  console.error("Usage: seam-bridge connect --server <wss-url> --id <bridgeId> --token <token> [--cwd <path>] [--dev]");
+  console.error("       seam-bridge --server <port> --token <token> [--id <bridgeId>] [--cwd <path>] [--dev] [copilot-cmd]");
+  console.error("       seam-bridge [--gist <owner/gistId>] <ws-url> <token> [--id <bridgeId>] [--cwd <path>] [--dev]");
+  process.exit(1);
+}
 
-  if (!port || !token) {
-    console.error("Usage: node remote-agent-bridge.mjs --server <port> <token> [--cwd <path>] [copilot-cmd]");
-    process.exit(1);
-  }
-
-  runServerMode(port, token, copilotCmd, localCwd);
+if (rawArgs[0] === "connect") {
+  rawArgs.shift();
+  const wsUrl = serverFlag ?? rawArgs[0];
+  const token = tokenFlag ?? rawArgs[1];
+  const copilotCmd = process.env.COPILOT_CMD ?? "copilot";
+  if (!wsUrl || !token) usageAndExit();
+  runClientMode(wsUrl, token, copilotCmd, localCwd, bridgeOpts);
+} else if (rawArgs[0] === "--server" || serverFlag) {
+  const port = Number(rawArgs[0] === "--server" ? rawArgs[1] : serverFlag);
+  const token = tokenFlag ?? (rawArgs[0] === "--server" ? rawArgs[2] : rawArgs[0]);
+  const copilotCmd = process.env.COPILOT_CMD ?? (rawArgs[0] === "--server" ? rawArgs[3] : rawArgs[1]) ?? "copilot";
+  if (!port || !token) usageAndExit();
+  runServerMode(port, token, copilotCmd, localCwd, bridgeOpts);
 } else {
   // wsUrl may come from --gist flag or as a positional arg.
   const wsUrlPositional = rawArgs[0];
-  const token = rawArgs[1];
+  const token = tokenFlag ?? rawArgs[1];
   const copilotCmd = process.env.COPILOT_CMD ?? rawArgs[2] ?? "copilot";
 
-  if (!token && !gistArg) {
-    console.error("Usage: node remote-agent-bridge.mjs [--gist <owner/gistId>] <ws-url> <token> [--cwd <path>] [copilot-cmd]");
-    console.error("       node remote-agent-bridge.mjs --server <port> <token> [--cwd <path>] [copilot-cmd]");
-    process.exit(1);
-  }
+  if (!token && !gistArg) usageAndExit();
 
   if (gistArg) {
-    // When --gist is provided the positional arg order shifts: token is first.
-    const tokenFromArg = rawArgs[0];
+    const tokenFromArg = tokenFlag ?? rawArgs[0];
     const copilotCmdFromArg = process.env.COPILOT_CMD ?? rawArgs[1] ?? "copilot";
-    if (!tokenFromArg) {
-      console.error("Usage: node remote-agent-bridge.mjs --gist <owner/gistId> <token> [--cwd <path>] [copilot-cmd]");
-      process.exit(1);
-    }
+    if (!tokenFromArg) usageAndExit();
     resolveUrlFromGist(gistArg).then((wsUrl) => {
-      runClientMode(wsUrl, tokenFromArg, copilotCmdFromArg, localCwd);
+      runClientMode(wsUrl, tokenFromArg, copilotCmdFromArg, localCwd, bridgeOpts);
     });
   } else {
-    if (!wsUrlPositional || !token) {
-      console.error("Usage: node remote-agent-bridge.mjs <ws-url> <token> [--cwd <path>] [copilot-cmd]");
-      console.error("       node remote-agent-bridge.mjs --server <port> <token> [--cwd <path>] [copilot-cmd]");
-      process.exit(1);
-    }
-    runClientMode(wsUrlPositional, token, copilotCmd, localCwd);
+    if (!wsUrlPositional || !token) usageAndExit();
+    runClientMode(wsUrlPositional, token, copilotCmd, localCwd, bridgeOpts);
   }
 }

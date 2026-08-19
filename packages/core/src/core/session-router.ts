@@ -25,6 +25,10 @@ import type {
 export interface SeamMcpWiring {
   registry: SeamTokenRegistry;
   getPort: () => number | undefined;
+  /** Full MCP URL for a remote (bridge) spawn; never 127.0.0.1 when that is local-only. */
+  getPublicUrl?: () => string | undefined;
+  /** True when this session's agent process runs on a paired bridge (#84). */
+  isRemoteSession?: (sessionId: string) => boolean;
 }
 
 export type AskUserFn = (
@@ -501,7 +505,12 @@ export class SessionRouter {
       const port = this.seamMcp.getPort();
       if (port !== undefined) {
         const token = this.seamMcp.registry.mint(record.id);
-        mcpServers = [...this.mcpServers, buildSeamMcpServerEntry(port, token)];
+        const remote = this.seamMcp.isRemoteSession?.(record.id) === true;
+        const publicUrl = remote ? this.seamMcp.getPublicUrl?.() : undefined;
+        mcpServers = [
+          ...this.mcpServers,
+          buildSeamMcpServerEntry(port, token, publicUrl ? { url: publicUrl } : undefined),
+        ];
       } else {
         this.logger.warn(
           { session: record.id },

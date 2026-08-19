@@ -686,6 +686,24 @@ const ThreadPresetSchema = PresetValuesSchema.extend({
   detached: z.boolean().optional().default(false),
 });
 
+/** Per-host bridge config (D11 / #86). Token is stored as SHA-256 hex only. */
+const bridgeIdKey = z
+  .string()
+  .min(1)
+  .regex(/^[a-z0-9][a-z0-9-]{0,63}$/, "bridge id must be a slug");
+
+export const BridgeHostSchema = z.object({
+  emoji: z.string().min(1).max(16).optional(),
+  shortName: z.string().min(1).max(32).optional(),
+  workspaceRoot: z.string().min(1).optional(),
+  tokenHash: z.string().regex(/^[a-f0-9]{64}$/, "tokenHash must be sha256 hex"),
+  createdUtc: z.string().optional(),
+  transport: z.enum(["server", "client"]).optional(),
+  url: z.string().min(1).optional(),
+});
+
+export type BridgeHostConfig = z.infer<typeof BridgeHostSchema> & { id: string };
+
 // Exported (#58 P3 / D7): the Tier-C mutation path builds a candidate presets
 // object and MUST round-trip it through this exact schema before writing the
 // file — an invalid channel-presets.json throws in loadConfig() and would fail
@@ -693,6 +711,8 @@ const ThreadPresetSchema = PresetValuesSchema.extend({
 export const PresetsFileSchema = z.object({
   channels: z.record(numericId, ChannelPresetSchema).optional().default({}),
   threads: z.record(numericId, ThreadPresetSchema).optional().default({}),
+  /** D11 host config + D8 pairing hashes. No per-thread @location here (PR4). */
+  bridges: z.record(bridgeIdKey, BridgeHostSchema).optional().default({}),
 });
 
 export type ChannelPresetField<T> = { value: T };
@@ -709,6 +729,7 @@ export type ThreadPreset = PresetValues & { detached?: boolean };
 export type Config = z.infer<typeof Schema> & {
   channelPresets: Map<string, ChannelPreset>;
   threadPresets: Map<string, ThreadPreset>;
+  bridgePresets: Map<string, BridgeHostConfig>;
 };
 
 /**
@@ -833,8 +854,10 @@ export function loadConfig(): Config {
   }
   cfg.REPOS_ROOT = reposRoot;
 
-  const { channelPresets, threadPresets } = buildChannelPresetMaps(cfg.CHANNEL_PRESETS_FILE);
-  return { ...cfg, channelPresets, threadPresets };
+  const { channelPresets, threadPresets, bridgePresets } = buildChannelPresetMaps(
+    cfg.CHANNEL_PRESETS_FILE
+  );
+  return { ...cfg, channelPresets, threadPresets, bridgePresets };
 }
 
 /**
@@ -846,10 +869,15 @@ export function loadConfig(): Config {
  */
 export function buildChannelPresetMaps(
   file: string | undefined
-): { channelPresets: Map<string, ChannelPreset>; threadPresets: Map<string, ThreadPreset> } {
+): {
+  channelPresets: Map<string, ChannelPreset>;
+  threadPresets: Map<string, ThreadPreset>;
+  bridgePresets: Map<string, BridgeHostConfig>;
+} {
   const channelPresets = new Map<string, ChannelPreset>();
   const threadPresets = new Map<string, ThreadPreset>();
-  if (!file) return { channelPresets, threadPresets };
+  const bridgePresets = new Map<string, BridgeHostConfig>();
+  if (!file) return { channelPresets, threadPresets, bridgePresets };
   const abs = path.resolve(file);
   let raw: string;
   try {
@@ -884,7 +912,14 @@ export function buildChannelPresetMaps(
     if (preset.cwd) normalized.cwd = { value: path.resolve(preset.cwd.value) };
     threadPresets.set(threadId, normalized);
   }
-  return { channelPresets, threadPresets };
+  for (const [id, host] of Object.entries(result.data.bridges)) {
+    const normalized: BridgeHostConfig = { ...host, id };
+    if (host.workspaceRoot) {
+      normalized.workspaceRoot = path.resolve(host.workspaceRoot);
+    }
+    bridgePresets.set(id, normalized);
+  }
+  return { channelPresets, threadPresets, bridgePresets };
 }
 
 /** Models from the Codex CLI's bundled catalog (models.json in openai/codex).

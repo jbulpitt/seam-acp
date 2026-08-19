@@ -25,6 +25,8 @@ import { enqueueDispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
 import { watchChannelPresets } from "./core/config-reload.js";
+import { BridgeHub } from "./core/bridge-hub.js";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -48,7 +50,19 @@ async function main(): Promise<void> {
     );
   }
 
-  const health = startHealthServer(config.HEALTH_PORT, logger);
+  let mcpHttpHandle:
+    | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
+    | undefined;
+  const health = startHealthServer(config.HEALTH_PORT, logger, {
+    onMcp: (req, res) => {
+      if (!mcpHttpHandle) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "mcp not ready" }));
+        return;
+      }
+      return mcpHttpHandle(req, res);
+    },
+  });
 
   const store = new SessionStore(path.join(config.DATA_DIR, "seam.db"));
   // #75: crash leftovers stay `dispatched`/`running` forever unless we flip
@@ -313,6 +327,7 @@ async function main(): Promise<void> {
   // and a late-bound port getter; per-session injection happens at runtime start.
   const seamTokenRegistry = new SeamTokenRegistry();
   let seamMcpServer: SeamMcpServer | undefined;
+  let bridgeHub: BridgeHub | undefined;
 
   const router = new SessionRouter({
     logger,
@@ -338,6 +353,8 @@ async function main(): Promise<void> {
                 return undefined;
               }
             },
+            getPublicUrl: () => bridgeHub?.mcpUrlForRemote(),
+            isRemoteSession: (sessionId) => !!bridgeHub?.sessionBridgeId(sessionId),
           },
         }
       : {}),
@@ -365,6 +382,24 @@ async function main(): Promise<void> {
   });
 
   orchestrator.install();
+
+  bridgeHub = new BridgeHub({
+    logger,
+    config,
+    httpServer: health,
+    mutation: orchestrator.getConfigMutation(),
+    getMcpPort: () => {
+      try {
+        return seamMcpServer?.port;
+      } catch {
+        return undefined;
+      }
+    },
+    getMcpRegistry: () => seamTokenRegistry,
+    healthPort: config.HEALTH_PORT,
+    dataDir: config.DATA_DIR,
+  });
+  orchestrator.setBridgeHub(bridgeHub);
 
   // Wire the ask-the-user callback now that both the router and the adapter
   // exist. Router calls this when a session's policy is "ask".
@@ -562,6 +597,7 @@ async function main(): Promise<void> {
         orchestrator.interruptRedirect(caller, to, message, fresh),
     });
     await seamMcpServer.start();
+    mcpHttpHandle = (req, res) => seamMcpServer!.handleRequest(req, res);
   }
 
   // Scheduled prompts: arm timers from the DB once Discord is connected (so a
@@ -640,7 +676,11 @@ async function main(): Promise<void> {
   if (config.CHANNEL_PRESETS_FILE) {
     stopPresetsWatch = watchChannelPresets(
       config.CHANNEL_PRESETS_FILE,
-      { channelPresets: config.channelPresets, threadPresets: config.threadPresets },
+      {
+        channelPresets: config.channelPresets,
+        threadPresets: config.threadPresets,
+        bridgePresets: config.bridgePresets,
+      },
       logger
     );
   }

@@ -28,13 +28,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { buildChannelPresetMaps } from "../config.js";
-import type { ChannelPreset, ThreadPreset } from "../config.js";
+import type { BridgeHostConfig, ChannelPreset, ThreadPreset } from "../config.js";
 import type { Logger } from "../lib/logger.js";
 
 /** The live preset maps shared by SessionRouter and the orchestrator. */
 export interface PresetMaps {
   channelPresets: Map<string, ChannelPreset>;
   threadPresets: Map<string, ThreadPreset>;
+  bridgePresets: Map<string, BridgeHostConfig>;
 }
 
 export interface ReloadResult {
@@ -74,11 +75,16 @@ export function reloadChannelPresets(
   // per-turn read sees either the full old maps or the full new maps.
   applyInPlace(target.channelPresets, next.channelPresets);
   applyInPlace(target.threadPresets, next.threadPresets);
+  if (!target.bridgePresets) {
+    (target as PresetMaps).bridgePresets = new Map();
+  }
+  applyInPlace(target.bridgePresets, next.bridgePresets);
   logger.info(
     {
       file,
       channels: target.channelPresets.size,
       threads: target.threadPresets.size,
+      bridges: target.bridgePresets.size,
     },
     "channel-presets hot-reloaded"
   );

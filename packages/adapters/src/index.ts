@@ -4,6 +4,8 @@ export * from "./agent-profile.js";
 export * from "./session-manager.js";
 export * from "./attachment-staging.js";
 export * from "./agy-stream.js";
+export * from "./command-bus.js";
+export * from "./read-attachment.js";
 export * from "./profiles/claude.js";
 export * from "./profiles/copilot.js";
 export * from "./profiles/agy.js";

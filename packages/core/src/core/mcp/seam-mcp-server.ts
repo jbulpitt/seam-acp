@@ -1015,6 +1015,11 @@ export class SeamMcpServer {
 
   // --- HTTP / JSON-RPC plumbing -------------------------------------------
 
+  /** Public so the health server can proxy `/mcp` for remote (bridge) agents. */
+  async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    return this.handle(req, res);
+  }
+
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     if (req.method !== "POST" || (req.url ?? "").replace(/\/+$/, "") !== "/mcp") {
       res.writeHead(404, { "content-type": "application/json" });
@@ -1881,12 +1886,16 @@ export class SeamMcpServer {
 
 /** Build the per-session `mcpServers` entry that points a session at the shared
  *  seam-MCP server and carries its identifying token. */
-export function buildSeamMcpServerEntry(port: number, token: string): McpServer {
+export function buildSeamMcpServerEntry(
+  port: number,
+  token: string,
+  opts?: { url?: string }
+): McpServer {
   const headers: HttpHeader[] = [{ name: "X-Seam-Session", value: token }];
   return {
     type: "http",
     name: "seam-mcp",
-    url: `http://127.0.0.1:${port}/mcp`,
+    url: opts?.url ?? `http://127.0.0.1:${port}/mcp`,
     headers,
   };
 }

@@ -53,7 +53,7 @@ import {
   type SetSessionModeRequest,
   type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "../agent-profile.js";
+import { asLocalAdapter, type AgentProfile } from "../agent-profile.js";
 import {
   discoverAgyLs,
   subscribeToAgyStream,
@@ -212,7 +212,7 @@ export function makeAgyProfile(opts: {
   // Warm the model catalog cache in the background — first /seam model call
   // will read the cached promise instead of paying the ~5s spawn cost inline.
   void getCatalog(cli);
-  return {
+  return asLocalAdapter({
     id: "agy",
     displayName: "Antigravity",
     defaultModel,
@@ -240,7 +240,7 @@ export function makeAgyProfile(opts: {
             const seamDbPath = path.resolve(dataDir, "seam.db");
             const db = new Database(seamDbPath);
             try {
-              const rows = db.prepare("SELECT acp_session_id FROM sessions WHERE repo_path = ? AND agent_id = ?").all(cwd, 'agy') as any[];
+              const rows = db.prepare("SELECT acp_session_id FROM sessions WHERE repo_path = ? AND agent_id = ?").all(cwd, 'agy') as Array<{ acp_session_id?: string }>;
               for (const row of rows) {
                 if (row.acp_session_id) {
                   seamDbSessions.add(row.acp_session_id);
@@ -505,8 +505,8 @@ export function makeAgyProfile(opts: {
 
         return transcriptLines.join("\n\n");
       },
-    }
-  };
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------

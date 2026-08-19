@@ -3,7 +3,7 @@ import { createReadStream } from "node:fs";
 import { readdir, stat, readFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import type { AgentProfile } from "../agent-profile.js";
+import { asLocalAdapter, type AgentProfile } from "../agent-profile.js";
 import type { ContextUsage, ISessionManager, SessionSummary } from "../session-manager.js";
 
 /**
@@ -140,7 +140,7 @@ export function makeGrokProfile(opts: {
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "grok";
 
-  return {
+  return asLocalAdapter({
     id: opts.id ?? "grok",
     displayName: opts.displayName ?? "Grok Build",
     defaultModel: opts.defaultModel,
@@ -175,7 +175,7 @@ export function makeGrokProfile(opts: {
       });
     },
     sessionManager: new GrokSessionManager(),
-  };
+  });
 }
 
 /** Custom ACP method the TUI `/usage` panel uses (leading underscore is load-bearing). */

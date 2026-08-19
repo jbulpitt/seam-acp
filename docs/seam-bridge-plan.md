@@ -1,8 +1,8 @@
 # Seam Bridge — generalized machine-to-machine agent conduit
 
 **Status:** build-ready spec (D0–D11 locked) · **Created:** 2026-06-05 ·
-**Updated:** 2026-08-18 (vetted vs. current code — see **§14 Amendment**) ·
-**Owner:** jbulpitt · **Start at:** §9 PR0
+**Updated:** 2026-08-19 (PR1 folded §14.0 / #82 cosmetic anchors) ·
+**Owner:** jbulpitt · **Start at:** §9 PR1 (PR0 subtract is done)
 
 > **⚠️ 2026-08-18 vetting.** The spine still holds — location-as-binding, co-located
 > adapters, the command bus, keeping `makeMux`, and the PR0→PR4 sequence are all
@@ -11,14 +11,14 @@
 > orchestration tools), the **config-mutation admin/participant/lock tiers**
 > (#58/#71/#74), the **#78 command-tree rebuild**, and **turn-resume** (#75/#76) —
 > intersect this spec and change requirements. **Read §14 before building PR3/PR4.**
-> Body counts/anchors (agent roster, orchestrator LOC, `/seam sessions` path,
-> thread-rename caveat) have drifted; §14.0 lists the cosmetic refreshes and
-> §14.1–14.4 are the substantive changes (each written to become its own issue).
+> §14.0 cosmetic refreshes (roster 6, ~11k-LOC orchestrator, green test suite,
+> `/seam info sessions` + `config` group) are folded into the orientation / §-body
+> below. §14.1–14.4 remain the substantive changes (each its own issue).
 
 Reframe the "remote agent" from a bespoke *agent type* into a generic *transport +
-command bus* so any agent (claude, copilot, agy, opencode, …) can run on any number
-of other machines, selected as configuration rather than as separate picker
-entries.
+command bus* so any agent (claude, copilot, agy, opencode, codex, grok, …) can run
+on any number of other machines, selected as configuration rather than as separate
+picker entries.
 
 > **Legend** — `[idea]` · `[research]` · `[decided]` · `[blocked]` · `[done]`.
 
@@ -28,10 +28,12 @@ entries.
 
 Starting from empty context? Read this, then the files it names, before §0.
 
-**What seam-acp is.** A Discord bot that drives ACP coding agents (Claude Code, GitHub
-Copilot CLI, Antigravity = "agy", and opencode → LM Studio). Each Discord thread is a
-session; one user message = one ACP `session/prompt` awaited to `end_turn`. Runs under
-pm2; redeploy with `npm run redeploy` (writes a restart sentinel — the process
+**What seam-acp is.** A Discord bot that drives ACP coding agents. Roster is **6**
+agents (Claude Code, GitHub Copilot CLI, Antigravity = "agy", opencode → LM Studio,
+OpenAI Codex, xAI Grok) plus variants already registered (claude-vertex,
+ollama-cloud, zai, extra `*-<id>` profiles). Each Discord thread is a session; one
+user message = one ACP `session/prompt` awaited to `end_turn`. Runs under pm2;
+redeploy with `npm run redeploy` (writes a restart sentinel — the process
 self-restarts). Persistent state lives in `data/seam.db` (SQLite: thread→session
 mapping) plus each agent's own on-disk session store.
 
@@ -48,25 +50,31 @@ from stdout (~70-line Node script).
 | File | What it is / why |
 |---|---|
 | `AGENTS.md`, `docs/model-management-runbook.md` | repo conventions + model/effort gotchas — first |
-| `src/agents/agent-profile.ts` | the **`AgentProfile`** interface PR1 evolves into `AgentAdapter` (§4) |
-| `src/agents/agent-runtime.ts` | how a profile is consumed: `spawn()`, `newSessionMeta`, effort, `sessionManager`, `promptCapabilities` |
-| `src/agents/profiles/{claude,copilot,agy,opencode}.ts` | the four agents to recast as adapters (PR1) |
-| `src/agents/profiles/remote.ts` | current remote bridge — `makeMux` transport to **keep**, copilot-shape to **delete** |
+| `src/agents/agent-profile.ts` | **`AgentAdapter`** (§4); `AgentProfile` is a back-compat alias |
+| `src/agents/agent-runtime.ts` | how an adapter is consumed: `spawn(modelOverride?, effortOverride?)`, `newSessionMeta`, effort, `sessionManager`, `promptCapabilities` |
+| `src/agents/profiles/{claude,copilot,agy,opencode,codex,grok}.ts` | the six agents recast as adapters (PR1), plus claude-vertex / ollama-cloud / zai via the same factories |
+| `src/agents/profiles/remote.ts` | `makeMux` transport to **keep** (PR0 already deleted the copilot-remote shape) |
 | `scripts/remote-agent-bridge.mjs` | current bridge script (transport + ad-hoc cmd bus + session handlers) |
 | `src/agents/session-manager.ts` | `ISessionManager` (list/clone/delete/usage/transcript) |
-| `src/platforms/discord/orchestrator.ts` | turn lifecycle, pickers, status cards, `/seam sessions` UI |
+| `src/platforms/discord/orchestrator.ts` | turn lifecycle, pickers, status cards, `/seam info sessions` UI (~11k LOC) |
 | `src/config.ts`, `src/index.ts` | env config + profile registration/wiring |
 
-**Current `AgentProfile` (PR1's "from" state).** Members: `spawn()`, `defaultModel`,
-`staticModels`, `threadAbbr`, the `effort` descriptor, `newSessionMeta(model, effort)`,
-`whoami()`, optional `sessionManager`, `configDir`, `restrictDiscordAccess`. The adapter
-(§4) keeps all of these and adds `listWorkspaces`/`prepare`/`install`/`describe`, and
-routes `spawn`/sessions over the bus when remote.
+**`AgentAdapter` (PR1).** Same members as the old `AgentProfile` —
+`spawn(modelOverride?, effortOverride?)` (runtime path; do **not** switch to
+`spawn(cwd, opts)` here), `defaultModel`, `staticModels`, `threadAbbr`, the `effort`
+descriptor (all five mechanisms including grok's `spawnArgs`),
+`newSessionMeta(model, effort)`, `whoami()`, optional `sessionManager`, `configDir`,
+`restrictDiscordAccess` — plus `describe()` / `prepare()` / `install()` /
+`listWorkspaces()` / `usage()` / session verbs / `readAttachment`. `describe()` must
+round-trip `effort.mechanism`. Local methods are no-ops or `sessionManager`
+delegates until PR3/PR4 call them over the bus. `export type AgentProfile = AgentAdapter`.
 
-**Dev loop.** `npm run build` (tsc) · `npm test` (vitest — ~4 *known* pre-existing
-failures in `thread-rename`, ignore them) · `npm run redeploy` (build + restart
-sentinel). `.env` is gitignored (config + secrets live there). (The old
-`npm run patch-acp` step was retired at claude-agent-acp 0.54.1.)
+**Dev loop.** `npm run build` (tsc) · `npm test` (vitest — suite is fully green,
+700+ passing) · `npm run redeploy` (build + restart sentinel). `.env` is gitignored
+(config + secrets live there). (The old `npm run patch-acp` step was retired at
+claude-agent-acp 0.54.1.) Model/effort/agent pickers live under the **`config`**
+subcommand group (`/seam config model|effort|agent|…`); session re-attach is
+`/seam info sessions`.
 
 **Companion specs:** [display-naming-plan.md](./display-naming-plan.md) (emoji/short-name
 standard, consumed by D10) · [integrations-research.md](./integrations-research.md)
@@ -219,7 +227,8 @@ interface AgentAdapter {
 ```
 
 - **Local agents:** seam-acp loads the adapter in-process (today's
-  `claude.ts`/`copilot.ts`/`agy.ts`/`opencode.ts` become adapters).
+  `claude.ts`/`copilot.ts`/`agy.ts`/`opencode.ts`/`codex.ts`/`grok.ts` — plus
+  claude-vertex / ollama-cloud / zai variants of the same factories).
 - **Remote agents:** the **remote-bridge hosts the same adapter** and seam-acp
   invokes its methods via `rpc` (§5). Existing per-agent logic is **reused**, not
   duplicated — this retires the bridge's hand-rolled claude/copilot session code.
@@ -368,17 +377,19 @@ Not worth it.
 
 ## 9. Build sequence (each PR is safe + value-preserving)
 
-> **Keystone:** PR1 *ratifies* the §4 agent-adapter contract by implementing it four
-> times — producing the interface and starting the build are the same step.
+> **Keystone:** PR1 *ratifies* the §4 agent-adapter contract by implementing it for
+> every in-process agent (6 + variants) — producing the interface and starting the
+> build are the same step.
 
 - **PR0 — Subtract.** Delete the `copilot-remote` machinery (D5):
   `REMOTE_COPILOT_PROFILES`, `makeRemoteCopilot*`, the bridge `--session-type`
   branches, the `rewriteCwdInChunk`/`localCwd` hack. Nothing uses it now — pure
   cleanup.
 - **PR1 — Adapter refactor (in-place, behavior-preserving).** Recast
-  `claude/copilot/agy/opencode` as the `AgentAdapter` contract (§4), still running
-  locally in-process. App behaves identically. **No bridge yet** — lowest-risk
-  foundation; this is where the contract is ratified.
+  `claude/copilot/agy/opencode/codex/grok` (and claude-vertex / ollama-cloud / zai)
+  as the `AgentAdapter` contract (§4), still running locally in-process. App
+  behaves identically. **No bridge yet** — lowest-risk foundation; this is where
+  the contract is ratified. `describe()` must round-trip grok's `spawnArgs`.
 - **PR2 — Monorepo (D6).** Restructure into `packages/{adapters,core,bridge}`; extract
   `makeMux`/transport into the shared module; build the bridge as a lean standalone
   installable.
@@ -396,12 +407,12 @@ improves the app today — landing `resolveDisplay` to retire
 
 **Debt discipline (executed *within* the PRs above — full register:
 [tech-debt-notes.md](./tech-debt-notes.md)):**
-- **PR1:** tighten the `as any` parse-boundary types in the four profiles while you're
+- **PR1:** tighten the `as any` parse-boundary types in the profiles while you're
   rewriting them (C3).
 - **PR3/PR4:** introduce bridge config as a **structured file**, not more `REMOTE_*`-style
   env parsing — keeps `config.ts` from growing (C2); and **extract** the new
   `/seam bridge`, `/seam debug`, and selection UI into their *own* orchestrator modules
-  rather than growing the 5.9k-LOC `orchestrator.ts` (A1 — *targeted only*; a full
+  rather than growing the ~11k-LOC `orchestrator.ts` (A1 — *hard prerequisite*; a full
   decomposition is a separate project, out of scope here).
 - **Parallel:** the naming resolver (D10) retires the
   `threadAbbr`/`REPO_EMOJIS`/hand-baked-emoji sprawl.
@@ -421,8 +432,8 @@ small so each rollback is clean and single-step.
 
 **The only disruption you feel:** a redeploy restart kills an *in-flight* turn — resend
 that one message. Everything else survives: thread→session mapping (`seam.db`),
-history, and **auto-resume on the next message**. `/seam sessions` re-attach is the
-*safety net* for a rare wedged thread, not a routine step.
+history, and **auto-resume on the next message**. `/seam info sessions` re-attach is
+the *safety net* for a rare wedged thread, not a routine step.
 
 **Two hard rules → no history loss / no forced re-attach:**
 1. **PR1 preserves on-disk session formats + the `seam.db` schema** (Claude JSONL stays
@@ -434,7 +445,7 @@ history, and **auto-resume on the next message**. `/seam sessions` re-attach is 
 | PR | User-facing change | Risk |
 |---|---|---|
 | PR0 delete dead remote code | none (already unused) | ~zero |
-| PR1 adapters (in-place) | none — identical behavior | low — verify all 4 agents |
+| PR1 adapters (in-place) | none — identical behavior | low — verify all 6 agents |
 | PR2 monorepo restructure | none — build-only | low |
 | PR3 the bridge | additive (new capability) | isolated (opt-in) |
 | PR4 location binding | additive + opt-in | isolated |
@@ -476,11 +487,13 @@ what changed in seam-acp since then and how it modifies the plan. **§14.0** is 
 (fold into PR0/PR1 with no design change). **§14.1–14.4** are substantive and each is
 scoped to become its own GitHub issue.
 
-### 14.0 — Cosmetic refreshes (no design change; fold into PR0/PR1)  → **#82**
+### 14.0 — Cosmetic refreshes (no design change; fold into PR0/PR1)  → **#82**  **[folded into PR1]**
+
+Orientation + §-body anchors below match current code. Original drift notes:
 
 - **Agent roster: 4 → 6.** PR1 recasts not just claude/copilot/agy/opencode but also
   **codex** and **grok** (registered in `index.ts`), plus the claude-vertex /
-  ollama-cloud variants. The adapter contract (§4) is unchanged; there are just more
+  ollama-cloud / zai variants. The adapter contract (§4) is unchanged; there are just more
   implementers. `grok`'s `effort` descriptor also gained a **`spawnArgs`** mechanism
   (CLI `--reasoning-effort` at spawn) — one more `mechanism` value the adapter's
   `describe()` must round-trip.
@@ -489,11 +502,11 @@ scoped to become its own GitHub issue.
   no longer optional politeness — it is a **hard prerequisite** for landing the bridge
   UI without making the file unmaintainable.
 - **Dev-loop note is stale.** The "~4 known pre-existing `thread-rename` failures,
-  ignore them" caveat is obsolete — the suite is fully green (700+ passing). Remove it.
+  ignore them" caveat is obsolete — the suite is fully green (700+ passing). Removed.
 - **UI anchors moved by #78.** `/seam sessions` is now **`/seam info sessions`**; the
   model/effort/agent/etc. pickers and config commands live under the new **`config`**
-  subcommand group. Any §-body reference to `/seam sessions` or a flat config command
-  should be re-anchored. `npm run patch-acp` is already retired (accurate as written).
+  subcommand group. §-body references re-anchored. `npm run patch-acp` is already
+  retired (accurate as written).
 
 ### 14.1 — Security must compose with the config-mutation tiers (#58/#71/#74)  → **#83**  [amends §6, §6.1, D7, D8]
 

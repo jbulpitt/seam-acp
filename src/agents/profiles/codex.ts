@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import type { AgentProfile } from "../agent-profile.js";
+import { asLocalAdapter, type AgentProfile } from "../agent-profile.js";
 
 /**
  * OpenAI Codex CLI as an ACP server, via the official adapter
@@ -35,7 +35,7 @@ export function makeCodexProfile(opts: {
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "codex-acp";
 
-  return {
+  return asLocalAdapter({
     id: opts.id ?? "codex",
     displayName: opts.displayName ?? "OpenAI Codex",
     defaultModel: opts.defaultModel,
@@ -60,5 +60,5 @@ export function makeCodexProfile(opts: {
         detached: true,
       });
     },
-  };
+  });
 }

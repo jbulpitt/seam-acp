@@ -3,8 +3,30 @@ import fs, { promises as fsp } from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { McpServer } from "@agentclientprotocol/sdk";
-import type { AgentIdentity, AgentProfile } from "../agent-profile.js";
+import { asLocalAdapter, type AgentIdentity, type AgentProfile } from "../agent-profile.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
+
+interface SeamAcpSessionIdRow {
+  acp_session_id?: string | null;
+}
+
+interface CopilotSessionRow {
+  id?: string;
+  cwd?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  repository?: string | null;
+  host_type?: string | null;
+  branch?: string | null;
+  summary?: string | null;
+}
+
+interface CopilotTurnRow {
+  turn_index?: number;
+  user_message?: string | null;
+  assistant_response?: string | null;
+  timestamp?: string | number | null;
+}
 
 /**
  * GitHub Copilot CLI as an ACP server (`copilot --acp`).
@@ -47,7 +69,7 @@ export function makeCopilotProfile(opts: {
 
   let identityCache: AgentIdentity | null | undefined;
 
-  return {
+  return asLocalAdapter({
     id: opts.id ?? "copilot",
     displayName: opts.displayName ?? "GitHub Copilot",
     defaultModel: opts.defaultModel,
@@ -99,7 +121,7 @@ export function makeCopilotProfile(opts: {
               const seamDb = new Database(seamDbPath);
               try {
                 // Find all sessions in seam.db that have this repo path
-                const rows = seamDb.prepare("SELECT acp_session_id FROM sessions WHERE repo_path = ?").all(cwd) as any[];
+                const rows = seamDb.prepare("SELECT acp_session_id FROM sessions WHERE repo_path = ?").all(cwd) as SeamAcpSessionIdRow[];
                 for (const row of rows) {
                   if (row.acp_session_id) {
                     seamDbSessions.add(row.acp_session_id);
@@ -113,8 +135,8 @@ export function makeCopilotProfile(opts: {
             }
 
             // Fetch all sessions from the copilot DB.
-            const allSessions = db.prepare("SELECT * FROM sessions ORDER BY updated_at DESC").all() as any[];
-            const sessions: any[] = [];
+            const allSessions = db.prepare("SELECT * FROM sessions ORDER BY updated_at DESC").all() as CopilotSessionRow[];
+            const sessions: CopilotSessionRow[] = [];
             for (const s of allSessions) {
               const matchesCwd = s.cwd === cwd;
               const matchesSeamDb = s.id && seamDbSessions.has(s.id);
@@ -128,10 +150,11 @@ export function makeCopilotProfile(opts: {
 
             for (const sess of sessions) {
               const sessionId = sess.id;
+              if (!sessionId) continue;
               const createdAt = sess.created_at ? Date.parse(sess.created_at) : Date.now();
               const lastActivityAt = sess.updated_at ? Date.parse(sess.updated_at) : Date.now();
 
-              const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(sessionId) as any[];
+              const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(sessionId) as CopilotTurnRow[];
               
               const allMessages: Array<{ sender: "human" | "agent"; text: string }> = [];
               for (const turn of turns) {
@@ -187,7 +210,7 @@ export function makeCopilotProfile(opts: {
 
         const db = new Database(dbPath);
         try {
-          const sessionRow = db.prepare("SELECT * FROM sessions WHERE id = ?").get(oldSessionId) as any;
+          const sessionRow = db.prepare("SELECT * FROM sessions WHERE id = ?").get(oldSessionId) as CopilotSessionRow | undefined;
           if (sessionRow) {
             const nowIso = new Date().toISOString();
             db.prepare(`
@@ -205,7 +228,7 @@ export function makeCopilotProfile(opts: {
             );
           }
 
-          const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(oldSessionId) as any[];
+          const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(oldSessionId) as CopilotTurnRow[];
           const insertTurn = db.prepare(`
             INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp)
             VALUES (?, ?, ?, ?, ?)
@@ -267,7 +290,7 @@ export function makeCopilotProfile(opts: {
         const dbPath = path.join(dir, "session-store.db");
         const db = new Database(dbPath);
         try {
-          const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(sessionId) as any[];
+          const turns = db.prepare("SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC").all(sessionId) as CopilotTurnRow[];
           const transcriptLines: string[] = [];
           for (const turn of turns) {
             if (turn.user_message?.trim()) {
@@ -283,7 +306,7 @@ export function makeCopilotProfile(opts: {
         }
       }
     },
-  };
+  });
 }
 
 /**

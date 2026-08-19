@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
-import type { AgentProfile } from "../agent-profile.js";
+import { asLocalAdapter, type AgentProfile } from "../agent-profile.js";
 
 /** A discovered LM Studio model. `rawId` is the server's model id (e.g.
  *  `google/gemma-4-26b-a4b`); `modelId` is its opencode form (`<prefix>/<rawId>`).
@@ -208,8 +208,8 @@ export async function syncOpencodeLmStudioConfig(opts: {
  * colon-delimited MODELS env format.
  *
  * Minimal by design: opencode owns its own session storage, so this profile
- * doesn't implement the optional `sessionManager` (the `/seam sessions` family is
- * unavailable for it) — but the core turn flow works over ACP like any agent.
+ * doesn't implement the optional `sessionManager` (the `/seam info sessions`
+ * family is unavailable for it) — but the core turn flow works over ACP like any agent.
  */
 export function makeOpencodeProfile(opts: {
   /** Profile id. Defaults to "opencode". */
@@ -229,7 +229,7 @@ export function makeOpencodeProfile(opts: {
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "opencode";
 
-  return {
+  return asLocalAdapter({
     id: opts.id ?? "opencode",
     displayName: opts.displayName ?? "opencode",
     defaultModel: opts.defaultModel,
@@ -245,5 +245,5 @@ export function makeOpencodeProfile(opts: {
         detached: true,
       });
     },
-  };
+  });
 }

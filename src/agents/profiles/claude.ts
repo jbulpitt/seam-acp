@@ -3,7 +3,7 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import type { McpServer } from "@agentclientprotocol/sdk";
-import type { AgentIdentity, AgentProfile } from "../agent-profile.js";
+import { asLocalAdapter, type AgentIdentity, type AgentProfile } from "../agent-profile.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 
 /**
@@ -109,7 +109,7 @@ export function makeClaudeProfile(opts: {
 
   let identityCache: AgentIdentity | null | undefined;
 
-  return {
+  return asLocalAdapter({
     id: opts.id ?? "claude",
     displayName: opts.displayName ?? "Anthropic Claude",
     defaultModel: opts.defaultModel,
@@ -623,8 +623,8 @@ export function makeClaudeProfile(opts: {
 
         await fsp.writeFile(file, sanitizedLines.join("\n"), "utf8");
       }
-    }
-  };
+    },
+  });
 }
 
 export interface ClaudeUsageBucket {

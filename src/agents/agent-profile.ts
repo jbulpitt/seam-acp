@@ -1,13 +1,86 @@
 import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable as NodeReadable, Writable as NodeWritable } from "node:stream";
-import type { ISessionManager } from "./session-manager.js";
+import type { ContextUsage, ISessionManager, SessionSummary } from "./session-manager.js";
 
 /**
- * Describes how to spawn and configure an ACP-compatible coding agent.
- * Adding a new agent (Claude Code, Gemini, etc.) is a matter of writing one
- * of these and adding it to the registry.
+ * Adapter contract version advertised by in-process local agents via
+ * `describe()`. Bumped when the §4 surface itself changes (not per agent).
  */
-export interface AgentProfile {
+export const AGENT_ADAPTER_VERSION = 1;
+
+/** How an agent exposes reasoning effort. See `AgentAdapter.effort`. */
+export type EffortMechanism =
+  | "meta"
+  | "configOption"
+  | "modelBaked"
+  | "spawnArgs"
+  | "none";
+
+export interface EffortDescriptor {
+  readonly mechanism: EffortMechanism;
+  /** ACP config option id for mechanism "configOption" (e.g. "reasoning_effort"). */
+  readonly configId?: string;
+  /** Levels the picker should offer. Empty ⇒ effort is not separately settable. */
+  readonly levels: ReadonlyArray<string>;
+}
+
+export interface AdapterModel {
+  modelId: string;
+  name: string;
+  contextLimit?: number;
+}
+
+/**
+ * Snapshot returned by `AgentAdapter.describe()`. `effort.mechanism` is
+ * always present so callers can round-trip values like grok's `spawnArgs`.
+ */
+export interface AdapterDescribe {
+  version: number;
+  models: ReadonlyArray<AdapterModel>;
+  effort: EffortDescriptor;
+  promptCaps?: Record<string, unknown>;
+}
+
+/** Idempotent startup/pre-spawn hook declared by `prepare()`. */
+export interface PrepareStep {
+  id: string;
+  description?: string;
+}
+
+/**
+ * Pinned install recipe (§6). Local PR1 stubs `{ supported: false }` —
+ * `install()` must not actually install anything.
+ */
+export interface InstallRecipe {
+  supported: boolean;
+  recipeId?: string;
+  steps?: ReadonlyArray<string>;
+}
+
+export interface WorkspaceInfo {
+  id: string;
+  path: string;
+  name?: string;
+}
+
+/** Host-side file ferry payload (§4.2). Local `readAttachment` stubs `null`. */
+export interface AttachmentBytes {
+  bytes: Uint8Array;
+  filename: string;
+  size: number;
+}
+
+/**
+ * §4 agent-adapter contract, implemented in-process for PR1.
+ *
+ * SUPERSET of the pre-PR1 `AgentProfile`: every existing field and
+ * `spawn(modelOverride?, effortOverride?)` stay as the runtime path.
+ * `spawn(cwd, opts)` is a later-PR concern and is not added here.
+ *
+ * New methods are real (not comments) but are safe no-ops or
+ * `sessionManager` delegates until PR3/PR4 call them over the bus.
+ */
+export interface AgentAdapter {
   /** Stable id used in commands and DB rows ("copilot", "claude-code", …). */
   readonly id: string;
 
@@ -21,13 +94,7 @@ export interface AgentProfile {
    * Optional static list of models to use for this profile. When provided,
    * these override any models advertised dynamically by the agent via ACP.
    */
-  readonly staticModels?: ReadonlyArray<{
-    modelId: string;
-    name: string;
-    /** Context window size in tokens. Used to compute usage percentages when
-     *  the agent doesn't surface a `size` via ACP `usage_update`. */
-    contextLimit?: number;
-  }>;
+  readonly staticModels?: ReadonlyArray<AdapterModel>;
 
   /**
    * Optional short abbreviation displayed in thread names when the new-thread
@@ -61,8 +128,8 @@ export interface AgentProfile {
 
   /**
    * How this agent exposes reasoning effort, if at all. Drives both the
-   * `/seam effort` picker (which levels to offer, or whether to show it) and
-   * the application path in AgentRuntime:
+   * `/seam config effort` picker (which levels to offer, or whether to show it)
+   * and the application path in AgentRuntime:
    *   - "meta"        → folded into `session/new` `_meta` via `newSessionMeta`
    *                     (Claude: `_meta.claudeCode.options.effort`).
    *   - "configOption"→ applied after session creation via ACP
@@ -74,13 +141,7 @@ export interface AgentProfile {
    *   - "none"        → the agent has no reasoning-effort concept.
    * Omit entirely to mean "not settable" (treated like "none").
    */
-  readonly effort?: {
-    readonly mechanism: "meta" | "configOption" | "modelBaked" | "spawnArgs" | "none";
-    /** ACP config option id for mechanism "configOption" (e.g. "reasoning_effort"). */
-    readonly configId?: string;
-    /** Levels the picker should offer. Empty ⇒ effort is not separately settable. */
-    readonly levels: ReadonlyArray<string>;
-  };
+  readonly effort?: EffortDescriptor;
 
   /**
    * Optional `_meta` payload to attach to `session/new`. Lets a vendor
@@ -101,6 +162,176 @@ export interface AgentProfile {
    */
   whoami?(): Promise<AgentIdentity | null>;
   sessionManager?: ISessionManager;
+
+  /** Catalog + effort snapshot. Always includes `effort.mechanism`. */
+  describe(): AdapterDescribe;
+
+  /**
+   * Idempotent startup / pre-spawn hooks (reconciliation, §4.1). Local
+   * agents return an empty list — existing startup (e.g. opencode's
+   * LM-Studio config sync in `index.ts`) stays where it is.
+   */
+  prepare(): PrepareStep[];
+
+  /**
+   * Pinned, allow-listed install recipe (§6). Local stub: not supported;
+   * must not install anything.
+   */
+  install(): InstallRecipe;
+
+  /**
+   * Host-side workspace enumeration (§7 / D11). Local: empty — the
+   * orchestrator still scans `REPOS_ROOT` itself. Do not invent a scan.
+   */
+  listWorkspaces(): WorkspaceInfo[];
+
+  /**
+   * Side-channel usage readout. Delegates to `sessionManager.getUsage`
+   * when present; otherwise `null`.
+   */
+  usage(
+    cwd?: string,
+    sessionId?: string,
+    newerThanMs?: number
+  ): Promise<ContextUsage | null>;
+
+  /**
+   * Host → control-plane file ferry for `seam-attach` (§4.2). Local stub:
+   * `null` (the orchestrator still reads local files directly). Do not
+   * invent a new path jail here — that is PR3.
+   */
+  readAttachment(cwd: string, path: string): Promise<AttachmentBytes | null>;
+
+  /** Session verbs — delegate to `sessionManager` when present. */
+  listSessions(cwd: string): Promise<SessionSummary[]>;
+  getTranscript(cwd: string, sessionId: string): Promise<string>;
+  cloneSession(cwd: string, oldSessionId: string, newSessionId: string): Promise<void>;
+  deleteSession(cwd: string, sessionId: string): Promise<void>;
+
+  /**
+   * Stage a user-sent upload onto the agent's filesystem. Delegates to
+   * `sessionManager.writeAttachment` when present; otherwise `null`.
+   * `bytes` may be raw octets or the base64 string the session manager
+   * already accepts.
+   */
+  writeAttachment(
+    cwd: string,
+    filename: string,
+    bytes: string | Uint8Array
+  ): Promise<{ path: string } | null>;
+}
+
+/**
+ * Back-compat alias. The rest of the tree (orchestrator, runtime, router)
+ * keeps importing `AgentProfile`; it is the same type as `AgentAdapter`.
+ */
+export type AgentProfile = AgentAdapter;
+
+/** Fields a local factory already implements; `asLocalAdapter` fills the rest. */
+export type AgentProfileCore = Omit<
+  AgentAdapter,
+  | "describe"
+  | "prepare"
+  | "install"
+  | "listWorkspaces"
+  | "usage"
+  | "readAttachment"
+  | "listSessions"
+  | "getTranscript"
+  | "cloneSession"
+  | "deleteSession"
+  | "writeAttachment"
+>;
+
+/**
+ * Fill the §4 surface on an in-process profile: `describe()` snapshots
+ * models + effort (including `mechanism`), session verbs / `usage` /
+ * `writeAttachment` delegate to `sessionManager` when present, and the
+ * remaining methods are safe no-ops.
+ */
+export function asLocalAdapter(core: AgentProfileCore): AgentAdapter {
+  const adapter: AgentAdapter = {
+    ...core,
+    describe(): AdapterDescribe {
+      const models: AdapterModel[] =
+        adapter.staticModels && adapter.staticModels.length > 0
+          ? adapter.staticModels.map((m) => ({
+              modelId: m.modelId,
+              name: m.name,
+              ...(m.contextLimit != null ? { contextLimit: m.contextLimit } : {}),
+            }))
+          : [{ modelId: adapter.defaultModel, name: adapter.defaultModel }];
+      const effort: EffortDescriptor = adapter.effort
+        ? {
+            mechanism: adapter.effort.mechanism,
+            ...(adapter.effort.configId != null
+              ? { configId: adapter.effort.configId }
+              : {}),
+            levels: [...adapter.effort.levels],
+          }
+        : { mechanism: "none", levels: [] };
+      return { version: AGENT_ADAPTER_VERSION, models, effort };
+    },
+    prepare(): PrepareStep[] {
+      return [];
+    },
+    install(): InstallRecipe {
+      return { supported: false };
+    },
+    listWorkspaces(): WorkspaceInfo[] {
+      // Local: orchestrator still enumerates REPOS_ROOT. Host-side
+      // listWorkspaces is PR4/D11. Empty until then.
+      return [];
+    },
+    async usage(
+      cwd?: string,
+      sessionId?: string,
+      newerThanMs?: number
+    ): Promise<ContextUsage | null> {
+      if (!cwd) return null;
+      const getUsage = adapter.sessionManager?.getUsage;
+      if (!getUsage) return null;
+      return getUsage.call(adapter.sessionManager, cwd, sessionId, newerThanMs);
+    },
+    async readAttachment(
+      _cwd: string,
+      _path: string
+    ): Promise<AttachmentBytes | null> {
+      // Ferry is PR3. Local seam-attach still reads the file directly.
+      return null;
+    },
+    async listSessions(cwd: string): Promise<SessionSummary[]> {
+      return adapter.sessionManager?.listSessions(cwd) ?? [];
+    },
+    async getTranscript(cwd: string, sessionId: string): Promise<string> {
+      if (!adapter.sessionManager) return "";
+      return adapter.sessionManager.getTranscript(cwd, sessionId);
+    },
+    async cloneSession(
+      cwd: string,
+      oldSessionId: string,
+      newSessionId: string
+    ): Promise<void> {
+      if (!adapter.sessionManager) return;
+      await adapter.sessionManager.cloneSession(cwd, oldSessionId, newSessionId);
+    },
+    async deleteSession(cwd: string, sessionId: string): Promise<void> {
+      if (!adapter.sessionManager) return;
+      await adapter.sessionManager.deleteSession(cwd, sessionId);
+    },
+    async writeAttachment(
+      cwd: string,
+      filename: string,
+      bytes: string | Uint8Array
+    ): Promise<{ path: string } | null> {
+      const write = adapter.sessionManager?.writeAttachment;
+      if (!write) return null;
+      const base64 =
+        typeof bytes === "string" ? bytes : Buffer.from(bytes).toString("base64");
+      return write.call(adapter.sessionManager, cwd, filename, base64);
+    },
+  };
+  return adapter;
 }
 
 /** Identity of the account a profile is authenticated as. */

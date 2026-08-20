@@ -26,7 +26,10 @@ function commandExists(cmd: string): boolean {
   }
 }
 
-export function loadHostAdapters(copilotCmd: string): Map<string, AgentAdapter> {
+export function loadHostAdapters(
+  copilotCmd: string,
+  exists: (bin: string) => boolean = commandExists
+): Map<string, AgentAdapter> {
   const out = new Map<string, AgentAdapter>();
   const factories: Array<{ id: string; bin: string; make: () => AgentAdapter }> = [
     {
@@ -61,6 +64,9 @@ export function loadHostAdapters(copilotCmd: string): Map<string, AgentAdapter> 
     },
   ];
   for (const f of factories) {
+    // Skip before construct: agy's factory warms a catalog by spawning `agy`
+    // (ENOENT is an unhandled 'error' and kills the whole bridge process).
+    if (!exists(f.bin)) continue;
     try {
       out.set(f.id, f.make());
     } catch {

@@ -1661,6 +1661,8 @@ export async function fetchAgyUserStatus(cliPath?: string): Promise<AgyUsage> {
     cwd: "/tmp",
     stdio: ["ignore", "ignore", "ignore"],
   });
+  // Missing binary would otherwise emit unhandled 'error' and crash the process.
+  proc.on("error", () => {});
   try {
     const ls = await discoverAgyLs({
       logFile,
@@ -1740,6 +1742,8 @@ async function fetchAgyCatalog(cli: string): Promise<AgyCatalogEntry[]> {
     cwd: "/tmp",
     stdio: ["ignore", "ignore", "ignore"],
   });
+  // Missing binary would otherwise emit unhandled 'error' and crash the process.
+  proc.on("error", () => {});
   try {
     const ls = await discoverAgyLs({
       logFile,

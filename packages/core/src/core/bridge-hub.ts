@@ -81,6 +81,11 @@ export class BridgeHub {
   private readonly getMcpRegistry?: () => SeamTokenRegistry | undefined;
   private wss?: WebSocketServer;
   private readonly connections = new Map<string, ConnectedBridge>();
+  /** One mux per bridgeId. Reused across WS reconnects so in-flight fake
+   *  processes (AgentRuntime stdin/stdout) stay on the live socket. A new
+   *  makeMux() per connection left the old turn writing to a dead mux while
+   *  hello landed on a different one — VPS stopped sending, cancel no-op. */
+  private readonly muxes = new Map<string, ReturnType<typeof makeMux>>();
   /** In-memory session → bridge mapping. Persistence is the thread-preset `location`. */
   private readonly sessionBridge = new Map<string, string>();
   private readonly readyEvents = new EventEmitter();
@@ -148,6 +153,11 @@ export class BridgeHub {
 
   get(bridgeId: string): ConnectedBridge | undefined {
     return this.connections.get(bridgeId);
+  }
+
+  /** Mux for this bridge, including the gap after WS drop before hello. */
+  muxFor(bridgeId: string): ReturnType<typeof makeMux> | undefined {
+    return this.muxes.get(normalizeLocation(bridgeId));
   }
 
   pairedBridges(): BridgeHostConfig[] {
@@ -259,21 +269,29 @@ export class BridgeHub {
       return;
     }
 
+    const mux = this.ensureMux(paired.id);
+    mux.attach(ws);
+    this.logger.info({ bridgeId: paired.id }, "bridge websocket accepted");
+  }
+
+  private ensureMux(bridgeId: string): ReturnType<typeof makeMux> {
+    const existing = this.muxes.get(bridgeId);
+    if (existing) return existing;
     const mux = makeMux({
-      id: paired.id,
+      id: bridgeId,
       onHello: (hello) => {
-        void this.onHello(paired.id, mux, hello);
+        void this.onHello(bridgeId, mux, hello);
       },
       onDisconnect: () => {
-        const cur = this.connections.get(paired.id);
+        const cur = this.connections.get(bridgeId);
         if (cur?.mux === mux) {
-          this.connections.delete(paired.id);
-          this.logger.info({ bridgeId: paired.id }, "bridge disconnected; agents unavailable");
+          this.connections.delete(bridgeId);
+          this.logger.info({ bridgeId }, "bridge disconnected; agents unavailable");
         }
       },
     });
-    mux.attach(ws);
-    this.logger.info({ bridgeId: paired.id }, "bridge websocket accepted");
+    this.muxes.set(bridgeId, mux);
+    return mux;
   }
 
   private async onHello(

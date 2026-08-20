@@ -361,7 +361,7 @@ async function main(): Promise<void> {
               bridgeHub?.mcpServersForRemoteSpawn(sessionId),
             muxForSession: (sessionId) => {
               const id = bridgeHub?.sessionBridgeId(sessionId);
-              return id ? bridgeHub?.get(id)?.mux : undefined;
+              return id ? bridgeHub?.muxFor(id) ?? bridgeHub?.get(id)?.mux : undefined;
             },
             bindSessionLocation: (sessionId, location) => {
               bridgeHub?.markSessionBridge(sessionId, location);

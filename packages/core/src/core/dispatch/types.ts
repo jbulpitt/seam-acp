@@ -13,6 +13,7 @@ import { z } from "zod";
 import * as path from "node:path";
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import type { DelegationKind } from "../types.js";
+import { parseDispatchWorker } from "../location.js";
 
 /** How the dispatched turn acquires its ACP session — see `InjectTurnOptions`. */
 export type DispatchSessionMode = "live" | "isolated";
@@ -216,7 +217,7 @@ export function applyPresetIdentity(
  *  preset (stateless specialist, run isolated with output posted to `originRef`
  *  for visibility). Mirrors the seam-MCP handoff heuristic. */
 export function hopLooksLikeThreadId(hop: string): boolean {
-  return /^\d{15,}$/.test(hop.trim());
+  return parseDispatchWorker(hop).kind === "thread";
 }
 
 /**
@@ -225,11 +226,15 @@ export function hopLooksLikeThreadId(hop: string): boolean {
  * `chainId` (so its completion advances the chain) and `kind: "forward"` (this
  * hop's output is piped onward as the next hop's input). It deliberately sets no
  * `returnTo`: the chain, not a report-back, drives delivery.
+ *
+ * Worker parsing matches handoff: a snowflake runs live in that thread; a bare
+ * name is a local preset / agent id; `agentId@location` is the name before `@`
+ * isolated on the host after `@` (never a preset named `claude@mac`).
  */
 export function buildChainHopSpec(params: {
   id: string;
   chainId: string;
-  /** thread id or preset name. */
+  /** thread id, preset/agent name, or `agentId@location`. */
   worker: string;
   /** This hop's input — the prior hop's output, or the chain's initial prompt. */
   prompt: string;
@@ -238,13 +243,15 @@ export function buildChainHopSpec(params: {
   correlationId?: string;
   createdUtc?: string;
 }): DispatchSpec {
-  const toThread = hopLooksLikeThreadId(params.worker);
+  const parsed = parseDispatchWorker(params.worker);
+  const toThread = parsed.kind === "thread";
   return {
     id: params.id,
-    target: toThread ? params.worker : params.originRef,
+    target: toThread ? parsed.threadId : params.originRef,
     prompt: params.prompt,
     session: toThread ? "live" : "isolated",
-    ...(toThread ? {} : { preset: params.worker }),
+    ...(toThread ? {} : { preset: parsed.name }),
+    ...(parsed.kind === "named" && parsed.location ? { location: parsed.location } : {}),
     chainId: params.chainId,
     kind: "forward",
     correlationId: params.correlationId ?? params.chainId,

@@ -10,7 +10,7 @@ import {
   type PeekedMessage,
 } from "../packages/core/src/core/mcp/seam-mcp-server.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import { buildChainHopSpec, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 
 let dir: string;
 let store: SessionStore;
@@ -31,6 +31,48 @@ beforeEach(() => {
 afterEach(() => {
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// -------------------------------------------------------------------------
+// Hop spec (shared by MCP hop 1 and orchestrator hops 2…N)
+// -------------------------------------------------------------------------
+
+describe("buildChainHopSpec", () => {
+  const base = {
+    id: "hop-1",
+    chainId: "chain-1",
+    prompt: "do the thing",
+    originRef: "origin-thread",
+    createdUtc: "2026-01-01T00:00:00.000Z",
+  };
+
+  it("parses agentId@location into location, not a preset named claude@mac", () => {
+    const spec = buildChainHopSpec({ ...base, worker: "claude@mac" });
+    expect(spec.location).toBe("mac");
+    expect(spec.preset).toBe("claude");
+    expect(spec.preset).not.toBe("claude@mac");
+    expect(spec.session).toBe("isolated");
+    expect(spec.target).toBe("origin-thread");
+    expect(spec.kind).toBe("forward");
+    expect(spec.chainId).toBe("chain-1");
+    expect(spec.returnTo).toBeUndefined();
+  });
+
+  it("bare named hop stays a local preset with no location", () => {
+    const spec = buildChainHopSpec({ ...base, worker: "claude" });
+    expect(spec.preset).toBe("claude");
+    expect(spec.location).toBeUndefined();
+    expect(spec.session).toBe("isolated");
+    expect(spec.target).toBe("origin-thread");
+  });
+
+  it("thread-id hop stays live with no location", () => {
+    const spec = buildChainHopSpec({ ...base, worker: "888888888888888888" });
+    expect(spec.target).toBe("888888888888888888");
+    expect(spec.session).toBe("live");
+    expect(spec.preset).toBeUndefined();
+    expect(spec.location).toBeUndefined();
+  });
 });
 
 // -------------------------------------------------------------------------

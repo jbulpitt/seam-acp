@@ -1,6 +1,8 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { loadConfig, isChannelLocked, adminParticipantOverlapIds, CODEX_STATIC_MODELS, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
+import { loadConfig, isChannelLocked, resolveThreadLocation, adminParticipantOverlapIds, CODEX_STATIC_MODELS, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
+import { hostEmoji } from "./core/location.js";
+import { LoopbackHost } from "./core/loopback-host.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
 import { SessionStore } from "./core/session-store.js";
@@ -361,11 +363,17 @@ async function main(): Promise<void> {
               const id = bridgeHub?.sessionBridgeId(sessionId);
               return id ? bridgeHub?.get(id)?.mux : undefined;
             },
+            bindSessionLocation: (sessionId, location) => {
+              bridgeHub?.markSessionBridge(sessionId, location);
+            },
           },
         }
       : {}),
     channelPresets: config.channelPresets,
     threadPresets: config.threadPresets,
+    bindSessionLocation: (sessionId, location) => {
+      bridgeHub?.markSessionBridge(sessionId, location);
+    },
   });
 
   const renderer = discordRenderer;
@@ -406,6 +414,12 @@ async function main(): Promise<void> {
     dataDir: config.DATA_DIR,
   });
   orchestrator.setBridgeHub(bridgeHub);
+  bridgeHub.setLoopback(
+    new LoopbackHost({
+      adapters: router.listProfiles(),
+      workspaceRoot: config.REPOS_ROOT,
+    })
+  );
 
   // Wire the ask-the-user callback now that both the router and the adapter
   // exist. Router calls this when a session's policy is "ask".
@@ -516,6 +530,8 @@ async function main(): Promise<void> {
               // Transient lookup failure — treat as active rather than hiding it.
               status = "active";
             }
+            const location = resolveThreadLocation(config, s.channelRef);
+            const host = location === "local" ? undefined : config.bridgePresets.get(location);
             return {
               id: s.channelRef,
               name,
@@ -526,6 +542,8 @@ async function main(): Promise<void> {
               busy: router.isBusy(s.id),
               status,
               lastActivityUtc: s.updatedUtc,
+              location,
+              hostEmoji: hostEmoji(host, location),
             };
           })
         );

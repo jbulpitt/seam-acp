@@ -65,6 +65,7 @@ function describeConfig(record: SessionRecord): ConfigDescription {
       : { value: "ask", source: "default" },
     locked: false,
     detached: { value: false, source: "default" },
+    location: { value: "local", source: "default" },
   };
 }
 
@@ -670,6 +671,79 @@ describe("thread-preset mutation (Tier C, #68)", () => {
     // Never upserted a session just to persist the flag.
     expect(store.get(`discord:${THREAD}`)).toBeNull();
     expect(store.listConfigMutations()).toHaveLength(1);
+  });
+
+  it("round-trips threadPreset location as a RAW string + writes an audit row (#86)", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({
+      threads: { [THREAD]: { rider: { value: "keep me" } } },
+    });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: true,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const built = svc.buildProposal(record, { threadPreset: { location: "mac" } });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.proposal.restartsSession).toBe(true);
+    expect(built.proposal.fields).toEqual([
+      { label: "location", before: "local", after: "mac" },
+    ]);
+    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(PresetsFileSchema.safeParse(raw).success).toBe(true);
+    expect(raw.threads[THREAD].location).toBe("mac");
+    expect(raw.threads[THREAD].location).not.toEqual({ value: "mac" });
+    expect(raw.threads[THREAD].rider.value).toBe("keep me");
+    expect(live.threadPresets.get(THREAD)?.location).toBe("mac");
+    expect(store.listConfigMutations()[0].summary).toMatch(/location/);
+  });
+
+  it("omits location when set back to local (#86 default)", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({
+      threads: { [THREAD]: { location: "mac", rider: { value: "stay" } } },
+    });
+    const svc = makeService({ presetsFile: file, tierCEnabled: true });
+    const built = svc.buildProposal(record, { threadPreset: { location: "local" } });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    built.proposal.apply({ id: "u", name: "U" });
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.threads[THREAD].location).toBeUndefined();
+    expect(raw.threads[THREAD].rider.value).toBe("stay");
+  });
+
+  it("applyThreadLocation writes without Tier C and is idempotent for local (#86)", () => {
+    const file = writePresetsFile({ threads: {} });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: false,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const result = svc.applyThreadLocation({
+      threadId: THREAD,
+      parentRef: CHAN,
+      location: "mac",
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.auditId).toBeTruthy();
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.threads[THREAD]).toEqual({ location: "mac" });
+    expect(live.threadPresets.get(THREAD)?.location).toBe("mac");
+    expect(store.get(`discord:${THREAD}`)).toBeNull();
   });
 });
 

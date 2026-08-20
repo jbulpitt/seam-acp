@@ -15,6 +15,7 @@
  */
 
 import type { AgentProfile } from "@seam/adapters";
+import type { McpServer } from "@agentclientprotocol/sdk";
 import type { AgentEventHandler } from "../agents/agent-runtime.js";
 import type { ISessionManager } from "@seam/adapters";
 import type { ChannelRef, MessageAttachment } from "../platforms/chat-adapter.js";
@@ -102,6 +103,18 @@ export interface InjectTurnOptions {
    * `running` transition. Absent ⇒ today's fresh session.
    */
   resumeSessionId?: string;
+
+  /**
+   * Isolated remote spawn (#84 remainder). When set, `injectTurn` uses this
+   * instead of `profile.spawn` so a worker-on-bridge does not always hit
+   * the local AgentRuntime path.
+   */
+  spawnFn?: (
+    model?: string,
+    effort?: string
+  ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
+  /** MCP servers injected into an isolated remote spawn (token + reachable URL). */
+  mcpServers?: McpServer[];
 }
 
 export interface InjectTurnResult {

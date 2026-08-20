@@ -3,9 +3,11 @@
  * hello_ack + prepare() reconciliation, per-bridge mux, reachable MCP URL
  * for remote spawn (#84).
  */
+import { EventEmitter } from "node:events";
 import type { IncomingMessage, Server as HttpServer } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 import { makeMux, PROTOCOL_VERSION, type HelloFrame } from "@seam/adapters";
+import type { WorkspaceInfo } from "@seam/adapters";
 import { buildSeamMcpServerEntry } from "./mcp/seam-mcp-server.js";
 import { publicBaseFromTunnelUrl, resolveReachableMcpUrl } from "./mcp-url.js";
 import { tokenMatchesHash } from "./bridge-pairing.js";
@@ -13,6 +15,8 @@ import type { BridgeHostConfig, Config } from "../config.js";
 import type { Logger } from "../lib/logger.js";
 import type { ConfigMutationService, MutationActor } from "./config-mutation.js";
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
+import { isLocalLocation, normalizeLocation } from "./location.js";
+import type { LoopbackHost } from "./loopback-host.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -73,8 +77,10 @@ export class BridgeHub {
   private readonly getMcpRegistry?: () => SeamTokenRegistry | undefined;
   private wss?: WebSocketServer;
   private readonly connections = new Map<string, ConnectedBridge>();
-  /** In-memory session → bridge mapping (PR4 persists this). */
+  /** In-memory session → bridge mapping. Persistence is the thread-preset `location`. */
   private readonly sessionBridge = new Map<string, string>();
+  private readonly readyEvents = new EventEmitter();
+  private loopback?: LoopbackHost;
 
   constructor(opts: BridgeHubOpts) {
     this.logger = opts.logger.child({ comp: "bridge-hub" });
@@ -89,8 +95,38 @@ export class BridgeHub {
     this.logger.info({ path: "/bridge" }, "bridge websocket listening");
   }
 
+  setLoopback(loopback: LoopbackHost): void {
+    this.loopback = loopback;
+  }
+
   listConnected(): ConnectedBridge[] {
     return [...this.connections.values()];
+  }
+
+  connectedIds(): Set<string> {
+    return new Set(this.connections.keys());
+  }
+
+  /**
+   * True when a remote bridge has finished hello + prepare(), or when
+   * `location` is the local loopback (always ready).
+   */
+  isBridgeReady(bridgeId: string): boolean {
+    const id = normalizeLocation(bridgeId);
+    if (isLocalLocation(id)) return true;
+    const conn = this.connections.get(id);
+    if (!conn) return false;
+    const installed = [...conn.agents.values()].filter((a) => a.installed);
+    if (installed.length === 0) return true;
+    return installed.every((a) => a.ready);
+  }
+
+  /** Subscribe to post-reconcile "bridge ready". Returns an unsubscribe. */
+  onBridgeReady(listener: (bridgeId: string) => void): () => void {
+    this.readyEvents.on("ready", listener);
+    return () => {
+      this.readyEvents.off("ready", listener);
+    };
   }
 
   get(bridgeId: string): ConnectedBridge | undefined {
@@ -140,13 +176,27 @@ export class BridgeHub {
     params: unknown,
     agentId?: string
   ): Promise<unknown> {
-    const conn = this.connections.get(bridgeId);
-    if (!conn) throw new Error(`bridge "${bridgeId}" is not connected`);
+    const id = normalizeLocation(bridgeId);
+    if (isLocalLocation(id)) {
+      if (!this.loopback) throw new Error('loopback host is not configured');
+      return this.loopback.rpc(method, params, { agentId });
+    }
+    const conn = this.connections.get(id);
+    if (!conn) throw new Error(`bridge "${id}" is not connected`);
     return conn.mux.rpc(method, params, { agentId });
   }
 
-  /** Bind a session to a bridge. Real write; PR4 (and tests) are the callers. */
+  async listWorkspaces(location: string, agentId?: string): Promise<WorkspaceInfo[]> {
+    const result = await this.rpc(location, "listWorkspaces", {}, agentId);
+    return Array.isArray(result) ? (result as WorkspaceInfo[]) : [];
+  }
+
+  /** Bind a session to a bridge. `local` unbinds (loopback MCP as today). */
   markSessionBridge(sessionId: string, bridgeId: string): void {
+    if (isLocalLocation(bridgeId)) {
+      this.sessionBridge.delete(sessionId);
+      return;
+    }
     this.sessionBridge.set(sessionId, bridgeId);
   }
 
@@ -277,5 +327,6 @@ export class BridgeHub {
       },
       "bridge reconciled"
     );
+    this.readyEvents.emit("ready", expectedId);
   }
 }

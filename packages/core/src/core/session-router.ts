@@ -5,8 +5,9 @@ import type { SessionStore } from "./session-store.js";
 import type { SessionRecord, PermissionPolicyMode } from "./types.js";
 import { defaultSessionConfig, resolvePermissionMode } from "./types.js";
 import { makeSessionId } from "./session-store.js";
-import { resolveChannelPreset } from "../config.js";
+import { resolveChannelPreset, resolveThreadLocation } from "../config.js";
 import type { ChannelPreset, ThreadPreset } from "../config.js";
+
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
 import type {
   McpServer,
@@ -40,6 +41,11 @@ export interface SeamMcpWiring {
   mcpServersForRemoteSpawn?: (sessionId: string) => McpServer | undefined;
   /** Mux of the connected bridge this session is bound to, if any. */
   muxForSession?: (sessionId: string) => MuxHandle | undefined;
+  /**
+   * Bind `sessionId` to a remote bridge id. Called on runtime start when the
+   * thread preset's `location` is not `local`. Local stays unbound.
+   */
+  bindSessionLocation?: (sessionId: string, location: string) => void;
 }
 
 /** Inputs `startRuntime` uses to construct and spawn an AgentRuntime. */
@@ -103,6 +109,11 @@ export interface ConfigDescription {
    */
   detached: ResolvedSetting<boolean>;
   /**
+   * Host binding (D10 / #86). `local` is the default when the thread preset
+   * omits `location`. Always a ResolvedSetting so config_describe can show it.
+   */
+  location: ResolvedSetting<string>;
+  /**
    * Set when a preset requested an effort level the resolved agent cannot honor
    * (Trap 2). The preset value is silently dropped at runtime; surfacing it here
    * keeps `config_describe` from reporting a personality the agent won't deliver.
@@ -128,6 +139,7 @@ export class SessionRouter {
   private readonly defaultPermissionMode: PermissionPolicyMode;
   private readonly mcpServers: McpServer[];
   private readonly seamMcp?: SeamMcpWiring;
+  private readonly bindSessionLocationFn?: (sessionId: string, location: string) => void;
   private readonly channelPresets: Map<string, ChannelPreset>;
   private readonly threadPresets: Map<string, ThreadPreset>;
   private askUser?: AskUserFn;
@@ -146,6 +158,7 @@ export class SessionRouter {
     defaultPermissionMode?: PermissionPolicyMode;
     mcpServers?: McpServer[];
     seamMcp?: SeamMcpWiring;
+    bindSessionLocation?: (sessionId: string, location: string) => void;
     channelPresets?: Map<string, ChannelPreset>;
     threadPresets?: Map<string, ThreadPreset>;
   }) {
@@ -157,6 +170,7 @@ export class SessionRouter {
     this.defaultPermissionMode = opts.defaultPermissionMode ?? "ask";
     this.mcpServers = opts.mcpServers ?? [];
     this.seamMcp = opts.seamMcp;
+    this.bindSessionLocationFn = opts.bindSessionLocation ?? opts.seamMcp?.bindSessionLocation;
     this.channelPresets = opts.channelPresets ?? new Map();
     this.threadPresets = opts.threadPresets ?? new Map();
   }
@@ -264,6 +278,14 @@ export class SessionRouter {
       ? { value: true, source: "thread preset" }
       : { value: false, source: "default" };
 
+    const locationValue = resolveThreadLocation(
+      { threadPresets: this.threadPresets },
+      record.channelRef
+    );
+    const location: ResolvedSetting<string> = thread?.location
+      ? { value: locationValue, source: "thread preset" }
+      : { value: locationValue, source: "default" };
+
     return {
       sessionId: record.id,
       channelRef: record.channelRef,
@@ -275,6 +297,7 @@ export class SessionRouter {
       permission,
       locked: chan?.locked ?? false,
       detached,
+      location,
       ...(effortIgnoredNote ? { effortIgnoredNote } : {}),
     };
   }
@@ -493,6 +516,7 @@ export class SessionRouter {
    * remote spawn path. `startRuntime` is the only production caller.
    */
   planRuntimeSpawn(record: SessionRecord): RuntimeSpawnPlan {
+    this.bindRecordLocation(record);
     const preset = resolveChannelPreset(
       { channelPresets: this.channelPresets, threadPresets: this.threadPresets },
       record.parentRef ?? undefined,
@@ -554,6 +578,19 @@ export class SessionRouter {
     }
 
     return { agentId, profile, model, effort, cwd, mcpServers, remote, spawnChild };
+  }
+
+  /**
+   * On session start: if the thread is bound to a remote host, call
+   * `markSessionBridge` so `planRuntimeSpawn` takes the remote path.
+   * Local stays unbound (loopback MCP as today).
+   */
+  bindRecordLocation(record: SessionRecord, locationOverride?: string): string {
+    const location =
+      locationOverride ??
+      resolveThreadLocation({ threadPresets: this.threadPresets }, record.channelRef);
+    this.bindSessionLocationFn?.(record.id, location);
+    return location;
   }
 
   private async startRuntime(record: SessionRecord): Promise<AgentRuntime> {

@@ -31,6 +31,7 @@ function describeConfig(record: SessionRecord): ConfigDescription {
     permission: { value: "ask", source: "default" },
     locked: false,
     detached: { value: false, source: "default" },
+    location: { value: "local", source: "default" },
   };
 }
 

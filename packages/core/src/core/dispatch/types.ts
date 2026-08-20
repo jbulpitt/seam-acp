@@ -33,6 +33,14 @@ export interface DispatchSpec {
    *  target thread's own session — forces an isolated run under the preset's
    *  agent/model/effort/cwd + instructions (cold-start identity). #23. */
   preset?: string;
+  /**
+   * Host this worker should run on (D10 / #84). `"local"` or omitted ⇒
+   * loopback. A bridge id is passed to `markSessionBridge` before spawn.
+   * `agentId@location` as a worker target is parsed into this + `agentId`.
+   */
+  location?: string;
+  /** Isolated worker agent when the target is `agentId@location` rather than a preset. */
+  agentId?: string;
   correlationId?: string;
   /** When set, after this turn completes the runtime auto-dispatches the
    *  captured output back into this thread (report-back). */
@@ -109,6 +117,8 @@ export const DispatchSpecSchema = z.object({
   effort: z.string().min(1).optional(),
   cwd: z.string().min(1).optional(),
   preset: z.string().min(1).optional(),
+  location: z.string().min(1).optional(),
+  agentId: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
   kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact"]).optional(),
@@ -148,6 +158,8 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.effort ? { effort: d.effort } : {}),
     ...(d.cwd ? { cwd: d.cwd } : {}),
     ...(d.preset ? { preset: d.preset } : {}),
+    ...(d.location ? { location: d.location } : {}),
+    ...(d.agentId ? { agentId: d.agentId } : {}),
     ...(d.correlationId ? { correlationId: d.correlationId } : {}),
     ...(d.returnTo ? { returnTo: d.returnTo } : {}),
     ...(d.kind ? { kind: d.kind } : {}),

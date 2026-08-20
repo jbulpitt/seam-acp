@@ -31,6 +31,7 @@ import { buildChainHopSpec } from "../dispatch/types.js";
 import type { ConfigDescription } from "../session-router.js";
 import type { ConfigMutationInput } from "../config-mutation.js";
 import { isRestrictedParticipant, PARTICIPANT_CONFIG_REFUSAL } from "../../config.js";
+import { formatHostPrefixed, parseDispatchWorker } from "../location.js";
 
 /** Read-only entities visible to the calling thread (schedules + presets),
  *  returned by `config_describe` alongside the effective config. A FULL
@@ -109,8 +110,13 @@ export interface ThreadEntry {
   cwd: string;
   /** Whether a live turn is CURRENTLY running in that thread — the load-bearing
    *  field: choose `send` (non-interrupting) over `steer`/`handoff`
-   *  (interrupting) when a teammate is busy. */
+   *  (interrupting) when a teammate is busy. Derived from the control-plane
+   *  runtime even when the agent process lives on a bridge. */
   busy: boolean;
+  /** Host binding (D10). Omit ⇒ `local`. Rendered as `agentId@location`. */
+  location?: string;
+  /** Host emoji prefix (local 🏠 + each paired bridge). */
+  hostEmoji?: string;
   /** Liveness of the underlying thread: "active" (addressable now), "archived"
    *  (bound but dormant — still addressable, wakes on delivery), or "gone" (the
    *  platform confirmed it deleted — do NOT address it). Marked, never silently
@@ -443,7 +449,7 @@ const TOOLS = [
       "peek/send/chain all take a thread id you must first obtain here). Each entry reports: `id` (pass this " +
       "verbatim as the thread arg elsewhere), `name` (the human thread title — how you pick the right " +
       "teammate), `isSelf` (true for YOUR OWN thread — never hand off to yourself), the teammate's " +
-      "`agent`/`model`/`cwd`, `status` (active | archived | gone), `lastActivityUtc`, and `busy`. " +
+      "`agent`/`model`/`cwd` (agent is `agentId@location` with host emoji), `status` (active | archived | gone), `lastActivityUtc`, and `busy`. " +
       "`busy` IS LOAD-BEARING for choosing HOW to reach a teammate: when a thread is busy:true a live turn " +
       "is running, so prefer `send` (PULL-ONLY — it waits in the inbox and never interrupts) unless you " +
       "truly need to preempt, in which case use `steer` or `send(interrupt:true)`; when busy:false the " +
@@ -747,7 +753,7 @@ const TOOLS = [
       "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.\n" +
       "- session: your thread's own runtime config (agent, model, effort, cwd, permission).\n" +
       "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target).\n" +
-      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/detached). " +
+      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/detached/location). " +
       "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider. " +
       "`detached:true` stops treating this thread as a session (no bot replies; does not delete history).\n" +
       "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider). " +
@@ -850,6 +856,12 @@ const TOOLS = [
                 "If true, this thread is detached: allowlisted users can chat but the bot will not " +
                 "reply and will not bind a session. false re-attaches (next message binds/resumes). " +
                 "Does not delete history. `locked` remains unsettable.",
+            },
+            location: {
+              type: "string",
+              description:
+                "Host this thread's agent runs on: \"local\" (default) or a paired bridge id. " +
+                "Omit / empty / \"local\" ⇒ loopback. Changing location starts a fresh session on that host.",
             },
           },
         },
@@ -1161,19 +1173,21 @@ export class SeamMcpServer {
     const returnTo = optionalString(args, "returnTo") ?? caller.channelRef;
     const stream = optionalBool(args, "stream");
     const watchFeedback = optionalBool(args, "watchFeedback");
-    const toThread = looksLikeThreadId(worker);
+    const parsed = parseDispatchWorker(worker);
+    const toThread = parsed.kind === "thread";
     const dispatchId = randomUUID();
 
     // A thread-id worker runs live in that teammate's own session; a preset name
-    // spins up a stateless specialist (dispatchInjectTurn forces isolated for
-    // presets). For a preset we default the target to the caller's own thread so
-    // the specialist's work is visible where the caller is.
+    // (or `agentId@location`) spins up a stateless specialist. Isolated workers
+    // post visibility to the caller's thread. `name@location` carries the host
+    // so DispatchWatcher can bind the spawn to that bridge (#84 remainder).
     const spec: DispatchSpec = {
       id: dispatchId,
-      target: toThread ? worker : caller.channelRef,
+      target: toThread ? parsed.threadId : caller.channelRef,
       prompt,
       session: toThread ? "live" : "isolated",
-      ...(toThread ? {} : { preset: worker }),
+      ...(toThread ? {} : { preset: parsed.name }),
+      ...(parsed.kind === "named" && parsed.location ? { location: parsed.location } : {}),
       returnTo,
       kind: "handoff",
       correlationId: dispatchId,
@@ -1415,7 +1429,9 @@ export class SeamMcpServer {
         t.status !== "active" ? t.status : null,
         addressable ? null : "not addressable",
       ].filter(Boolean);
-      const cfg = [t.agent, t.model].filter(Boolean).join(" / ");
+      const loc = t.location ?? "local";
+      const agentAt = formatHostPrefixed(t.agent, loc, t.hostEmoji ?? "");
+      const cfg = [agentAt.trim(), t.model].filter(Boolean).join(" / ");
       lines.push(
         `• ${name} — id ${t.id} [${flags.join(", ")}]` +
           (cfg ? `\n    ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
@@ -1715,6 +1731,7 @@ export class SeamMcpServer {
       line("cwd:", d.cwd.value, d.cwd.source),
       line("permission:", d.permission.value, d.permission.source),
       line("detached:", d.detached.value ? "true" : "false", d.detached.source),
+      line("location:", d.location?.value ?? "local", d.location?.source ?? "default"),
     ];
     if (d.effortIgnoredNote) lines.push(`⚠ ${d.effortIgnoredNote}`);
 

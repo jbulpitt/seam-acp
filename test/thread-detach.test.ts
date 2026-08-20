@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isThreadDetached, PresetsFileSchema } from "../packages/core/src/config.js";
+import { isThreadDetached, PresetsFileSchema, resolveThreadLocation } from "../packages/core/src/config.js";
 import type { ThreadPreset } from "../packages/core/src/config.js";
 
 describe("isThreadDetached (#80)", () => {
@@ -47,6 +47,45 @@ describe("PresetsFileSchema detached (#80)", () => {
   it("rejects a CHANNEL entry with detached (must not silently mute a school channel)", () => {
     const parsed = PresetsFileSchema.safeParse({
       channels: { "111111111111111111": { locked: true, detached: true } },
+    });
+    expect(parsed.success).toBe(false);
+  });
+});
+
+describe("thread location default is local (#86 / D10)", () => {
+  it("omitted location resolves to local", () => {
+    expect(resolveThreadLocation({ threadPresets: new Map() }, undefined)).toBe("local");
+    expect(resolveThreadLocation({ threadPresets: new Map() }, "111")).toBe("local");
+    const riderOnly = new Map<string, ThreadPreset>([["111", { rider: { value: "x" } }]]);
+    expect(resolveThreadLocation({ threadPresets: riderOnly }, "111")).toBe("local");
+  });
+
+  it("reads an explicit bridge id from the thread preset", () => {
+    const presets = new Map<string, ThreadPreset>([["111", { location: "mac" }]]);
+    expect(resolveThreadLocation({ threadPresets: presets }, "111")).toBe("mac");
+  });
+
+  it("PresetsFileSchema defaults omitted location (not present on the parsed object)", () => {
+    const parsed = PresetsFileSchema.safeParse({
+      threads: { "222222222222222222": { rider: { value: "homework" } } },
+    });
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(parsed.data.threads["222222222222222222"].location).toBeUndefined();
+  });
+
+  it("accepts a thread entry with location as a RAW string", () => {
+    const parsed = PresetsFileSchema.safeParse({
+      threads: { "111111111111111111": { location: "mac" } },
+    });
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(parsed.data.threads["111111111111111111"].location).toBe("mac");
+  });
+
+  it("rejects a CHANNEL entry with location (thread-only binding)", () => {
+    const parsed = PresetsFileSchema.safeParse({
+      channels: { "111111111111111111": { location: "mac" } },
     });
     expect(parsed.success).toBe(false);
   });

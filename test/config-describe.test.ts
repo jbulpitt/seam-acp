@@ -178,4 +178,17 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
     const d = router.describeConfig(makeRecord());
     expect(d.detached).toEqual({ value: false, source: "default" });
   });
+
+  it("default location is local when the thread preset omits it (#86)", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(makeRecord());
+    expect(d.location).toEqual({ value: "local", source: "default" });
+  });
+
+  it("reports location from the thread preset (#86)", () => {
+    const threadPresets = new Map<string, ThreadPreset>([["thread-1", { location: "mac" }]]);
+    const router = makeRouter({ threadPresets });
+    const d = router.describeConfig(makeRecord());
+    expect(d.location).toEqual({ value: "mac", source: "thread preset" });
+  });
 });

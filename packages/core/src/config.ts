@@ -678,12 +678,26 @@ const ChannelPresetSchema = PresetValuesSchema.extend({
         "detached is a thread-only flag and cannot be set on a channel",
     })
     .optional(),
+  // Thread-only (D10 / #86). Rejected so a channel-wide location cannot
+  // silently pin every sibling thread to a remote host.
+  location: z
+    .undefined({
+      invalid_type_error:
+        "location is a thread-only binding and cannot be set on a channel",
+    })
+    .optional(),
 });
 
 // Raw boolean on the THREAD entry — NOT wrapped `{value:true}` (that wrapper
 // is only for agent/model/cwd/effort/rider). Absent / default false = attached.
+// `location` is a raw string (not `{value}`): omit / undefined ⇒ `local` (D10 / #86).
 const ThreadPresetSchema = PresetValuesSchema.extend({
   detached: z.boolean().optional().default(false),
+  location: z
+    .string()
+    .min(1)
+    .regex(/^[a-z0-9][a-z0-9-]{0,63}$/, "location must be a slug")
+    .optional(),
 });
 
 /** Per-host bridge config (D11 / #86). Token is stored as SHA-256 hex only. */
@@ -711,7 +725,7 @@ export type BridgeHostConfig = z.infer<typeof BridgeHostSchema> & { id: string }
 export const PresetsFileSchema = z.object({
   channels: z.record(numericId, ChannelPresetSchema).optional().default({}),
   threads: z.record(numericId, ThreadPresetSchema).optional().default({}),
-  /** D11 host config + D8 pairing hashes. No per-thread @location here (PR4). */
+  /** D11 host config + D8 pairing hashes. Per-thread @location lives on `threads`. */
   bridges: z.record(bridgeIdKey, BridgeHostSchema).optional().default({}),
 });
 
@@ -724,7 +738,7 @@ export type PresetValues = {
   rider?: ChannelPresetField<string>;
 };
 export type ChannelPreset = PresetValues & { locked: boolean };
-export type ThreadPreset = PresetValues & { detached?: boolean };
+export type ThreadPreset = PresetValues & { detached?: boolean; location?: string };
 
 export type Config = z.infer<typeof Schema> & {
   channelPresets: Map<string, ChannelPreset>;
@@ -833,6 +847,22 @@ export function isThreadDetached(
 ): boolean {
   if (!threadId) return false;
   return config.threadPresets.get(threadId)?.detached ?? false;
+}
+
+/** Per-thread host binding (D10 / #86). Omit / undefined / "" ⇒ `"local"`. */
+export function resolveThreadLocation(
+  config: Pick<Config, "threadPresets"> | { threadPresets?: Map<string, ThreadPreset> | Record<string, ThreadPreset> },
+  threadId: string | undefined
+): string {
+  if (!threadId) return "local";
+  const presets = config.threadPresets;
+  if (!presets) return "local";
+  const entry =
+    typeof (presets as Map<string, ThreadPreset>).get === "function"
+      ? (presets as Map<string, ThreadPreset>).get(threadId)
+      : (presets as Record<string, ThreadPreset>)[threadId];
+  const loc = entry?.location;
+  return loc && loc.trim().length > 0 ? loc.trim() : "local";
 }
 
 export function loadConfig(): Config {

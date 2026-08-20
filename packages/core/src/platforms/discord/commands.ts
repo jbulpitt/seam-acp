@@ -159,12 +159,12 @@ export function buildSeamCommand(): SlashCommandBuilder {
         sub
           .setName("agent")
           .setDescription(
-            "Get or set the agent for this thread (resets the session when changed)"
+            "Get or set the agent@location for this thread (resets the session when changed)"
           )
           .addStringOption((o) =>
             o
               .setName("id")
-              .setDescription("Agent id (e.g. copilot, claude)")
+              .setDescription("agent id or agentId@location (e.g. claude, claude@mac)")
               .setRequired(false)
           )
       )

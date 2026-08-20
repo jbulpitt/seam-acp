@@ -68,6 +68,8 @@ export interface LiveTurnMarker {
   acpSessionId?: string;
   authorId?: string;
   startedUtc: string;
+  /** Host this turn was running on (D10 / #85). Omit ⇒ `local`. */
+  location?: string;
 }
 
 export type LiveTurnTerminalStatus = "completed" | "failed" | "cancelled" | "abandoned";
@@ -290,6 +292,7 @@ export function parseLiveMarker(id: string, raw: string): LiveTurnMarker {
     ...(json.acpSessionId ? { acpSessionId: json.acpSessionId } : {}),
     ...(json.authorId ? { authorId: json.authorId } : {}),
     startedUtc: json.startedUtc,
+    ...(json.location ? { location: json.location } : {}),
   };
 }
 

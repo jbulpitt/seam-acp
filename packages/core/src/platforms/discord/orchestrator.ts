@@ -8,6 +8,7 @@ import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
 import {
   resolveChannelPreset,
+  resolveThreadLocation,
   isChannelLocked,
   isThreadDetached,
   isRestrictedParticipant,
@@ -96,6 +97,23 @@ import type { BridgeHub } from "../../core/bridge-hub.js";
 import { handleBridgeSlash } from "./bridge.js";
 import { handleDebugSlash } from "./debug.js";
 import { BRIDGE_ADMIN_REFUSAL, isBridgeAdminRefused } from "./admin-gate.js";
+import {
+  agentLocationPickerChoices,
+  currentAgentAtLocation,
+  currentHostPrefixedLabel,
+  parseAgentAtLocation,
+} from "./location.js";
+import {
+  bindSessionLocation,
+  isolatedBindSessionId,
+  planIsolatedRemoteSpawn,
+} from "../../core/location-bind.js";
+import { remainingMaxAgeMs, waitUntilBridgeReady } from "../../core/bridge-resume.js";
+import {
+  isLocalLocation,
+  LOCAL_LOCATION,
+  formatAgentAtLocation,
+} from "../../core/location.js";
 
 /** Accent color for scheduled-prompt cards ("cron blue"). */
 const SCHEDULED_COLOR = 0x3498db;
@@ -692,6 +710,7 @@ export class Orchestrator {
         ...(record.acpSessionId ? { acpSessionId: record.acpSessionId } : {}),
         ...(msg.authorId ? { authorId: msg.authorId } : {}),
         startedUtc: new Date().toISOString(),
+        location: resolveThreadLocation(this.config, channel.id),
       }).catch((err) =>
         this.logger.warn({ err, channel: channel.id }, "live-turn marker write failed")
       );
@@ -2264,7 +2283,12 @@ export class Orchestrator {
       let rt: AgentRuntime | undefined;
       let sessionId: string | undefined;
       try {
-        rt = new AgentRuntime({ profile, logger, mcpServers: [] });
+        rt = new AgentRuntime({
+          profile,
+          logger,
+          mcpServers: opts.mcpServers ?? [],
+          ...(opts.spawnFn ? { spawnFn: opts.spawnFn } : {}),
+        });
         await rt.start();
         if (opts.resumeSessionId) {
           // #76: resume against the recorded session, never newSession().
@@ -2888,6 +2912,71 @@ export class Orchestrator {
 
   setBridgeHub(hub: BridgeHub): void {
     this.bridgeHub = hub;
+  }
+
+  /**
+   * #85: a `@<bridge>` resume waits for that bridge's ready event (no poll).
+   * Past max-age → abandon. Local resume is unchanged. Never rebinds a
+   * remote session onto `@local`.
+   */
+  private async resumeOnSameHost(
+    marker: LiveTurnMarker,
+    maxAge: number,
+    now: Date
+  ): Promise<void> {
+    const loc =
+      marker.location ??
+      resolveThreadLocation(this.config, marker.channelRef);
+    const waited = await this.waitForResumeHost(loc, marker.startedUtc, maxAge, now);
+    if (waited === "abandon") {
+      await this.abandonLiveMarker(marker, "bridge not ready (past max-age)");
+      return;
+    }
+    if (!isLocalLocation(loc)) {
+      bindSessionLocation(this.bridgeHub, marker.sessionRecordId, loc);
+    }
+    await this.refireLiveTurn(marker);
+  }
+
+  private async waitForResumeHost(
+    location: string,
+    startedUtc: string,
+    maxAgeSeconds: number,
+    now: Date
+  ): Promise<"ok" | "abandon"> {
+    if (isLocalLocation(location)) return "ok";
+    if (!this.bridgeHub) return "abandon";
+    const deadlineMs = remainingMaxAgeMs(startedUtc, maxAgeSeconds, now);
+    const result = await waitUntilBridgeReady(this.bridgeHub, location, { deadlineMs });
+    return result === "timeout" ? "abandon" : "ok";
+  }
+
+  /** Isolated workers on a bridge: bind + remote spawn. Live runs bind in SessionRouter. */
+  private remoteDispatchSpawnOpts(opts: {
+    spec: DispatchSpec;
+    record: SessionRecord;
+    effectiveSession: "live" | "isolated";
+    workerLocation: string;
+    profile?: AgentProfile;
+    cwd: string;
+  }): Pick<InjectTurnOptions, "spawnFn" | "mcpServers"> {
+    if (opts.effectiveSession !== "isolated" || isLocalLocation(opts.workerLocation)) {
+      return {};
+    }
+    if (!this.bridgeHub) {
+      throw new Error(`dispatch ${opts.spec.id}: location "${opts.workerLocation}" needs a connected bridge`);
+    }
+    const agentId = opts.profile?.id ?? opts.record.agentId;
+    const planned = planIsolatedRemoteSpawn({
+      hub: this.bridgeHub,
+      sessionId: isolatedBindSessionId(opts.spec.id),
+      location: opts.workerLocation,
+      agentId,
+      cwd: opts.cwd,
+      ...(opts.spec.model ? { model: opts.spec.model } : {}),
+      ...(opts.spec.effort ? { effort: opts.spec.effort } : {}),
+    });
+    return { spawnFn: planned.spawnFn, mcpServers: planned.mcpServers };
   }
 
   /** Exposed so index.ts can wire BridgeHub audit writes without growing this file. */
@@ -3712,11 +3801,18 @@ export class Orchestrator {
     // under its agent/model/effort/cwd, and prepend its instructions as cold-start
     // identity. `target` remains where output is posted for visibility.
     const preset = spec.preset ? this.store.getPresetByName(spec.preset) : null;
-    if (spec.preset && !preset) {
+    const agentOverride =
+      spec.agentId ??
+      (!preset && spec.preset && this.router.getProfile(spec.preset) ? spec.preset : undefined);
+    if (spec.preset && !preset && !agentOverride) {
       throw new Error(`dispatch: unknown preset "${spec.preset}"`);
     }
-    const presetProfile = preset?.agentId ? this.router.getProfile(preset.agentId) : undefined;
-    const effectiveSession = preset ? "isolated" : spec.session;
+    const presetProfile = (preset?.agentId ? this.router.getProfile(preset.agentId) : undefined)
+      ?? (agentOverride ? this.router.getProfile(agentOverride) : undefined);
+    const effectiveSession = preset || agentOverride ? "isolated" : spec.session;
+    const threadLocation = resolveThreadLocation(this.config, spec.target);
+    const workerLocation = spec.location
+      ?? (effectiveSession === "isolated" ? LOCAL_LOCATION : threadLocation);
     // #76: a resume is the SAME spec with two substitutions — prompt →
     // "continue", session acquisition → loadSession(recorded id). Everything
     // else (returnTo / correlationId / kind / chainId) rides along untouched
@@ -3951,6 +4047,14 @@ export class Orchestrator {
           ...(isResume && resumeSessionId && effectiveSession === "isolated"
             ? { resumeSessionId }
             : {}),
+          ...this.remoteDispatchSpawnOpts({
+            spec,
+            record,
+            effectiveSession,
+            workerLocation,
+            profile: presetProfile,
+            cwd: preset?.repoPath ?? spec.cwd ?? record.repoPath ?? this.config.REPOS_ROOT,
+          }),
           outputTo: target,
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
           timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
@@ -5869,8 +5973,15 @@ export class Orchestrator {
     }
     const requested = i.options.getString("path", true);
     let resolved: string;
+    const location = resolveThreadLocation(this.config, channel.id);
     try {
-      resolved = resolveRepoPath(this.config.REPOS_ROOT, requested);
+      resolved = isLocalLocation(location)
+        ? resolveRepoPath(this.config.REPOS_ROOT, requested)
+        : requested.startsWith("/")
+          ? requested
+          : (await this.listHostWorkspacePaths(channel.id))?.find(
+              (p) => path.basename(p) === requested || p === requested
+            ) ?? requested;
     } catch (err) {
       await i.reply({
         content: `Invalid path: ${(err as Error).message}`,
@@ -6403,7 +6514,9 @@ export class Orchestrator {
         continue;
       }
       if (!enabled) continue;
-      liveJobs.push(this.resumeScheduler.run(() => this.refireLiveTurn(marker)));
+      liveJobs.push(
+        this.resumeScheduler.run(() => this.resumeOnSameHost(marker, maxAge, now))
+      );
     }
 
     if (enabled && this.dispatchWatcher) {
@@ -6434,6 +6547,20 @@ export class Orchestrator {
         }
         liveJobs.push(
           this.resumeScheduler.run(async () => {
+            const loc =
+              spec.location ?? resolveThreadLocation(this.config, spec.target);
+            const waited = await this.waitForResumeHost(loc, spec.createdUtc, maxAge, now);
+            if (waited === "abandon") {
+              await this.abandonDispatchSpec(spec, "bridge not ready (past max-age)");
+              return;
+            }
+            if (!isLocalLocation(loc)) {
+              bindSessionLocation(
+                this.bridgeHub,
+                `discord:${spec.target}`,
+                loc
+              );
+            }
             await this.dispatchWatcher!.requeueStale(spec.id);
           })
         );
@@ -6778,40 +6905,47 @@ export class Orchestrator {
     });
     const id = i.options.getString("id");
     const profiles = this.router.listProfiles();
+    const currentAt = currentAgentAtLocation(record.agentId, this.config, channel.id);
+    const currentLabel = currentHostPrefixedLabel(
+      record.agentId,
+      this.config,
+      channel.id,
+      this.config.bridgePresets
+    );
 
     if (!id) {
-      // Show interactive picker.
-      if (!this.adapter.sendChoicePicker || profiles.length === 0) {
-        const listing = profiles
-          .map((p) => `\`${p.id}\` — ${p.displayName}`)
+      const choices = agentLocationPickerChoices(profiles, {
+        bridges: this.config.bridgePresets.values(),
+        connected: this.bridgeHub?.connectedIds(),
+      }).slice(0, 25);
+      // Show interactive picker — every agentId@location, host-emoji prefixed (D10).
+      if (!this.adapter.sendChoicePicker || choices.length === 0) {
+        const listing = choices
+          .map((c) => `\`${c.value}\` — ${c.label}`)
           .join(", ");
         await i.reply({
-          content: `Current agent: \`${record.agentId}\`\nAvailable: ${listing}`,
+          content: `Current agent: \`${currentAt}\`\nAvailable: ${listing || "(none)"}`,
           flags: MessageFlags.Ephemeral,
         });
         return;
       }
       await i.reply({
-        content: `Current agent: \`${record.agentId}\`. Posting picker…`,
+        content: `Current agent: \`${currentAt}\`. Posting picker…`,
         flags: MessageFlags.Ephemeral,
       });
       const picked = await this.adapter.sendChoicePicker(channel, {
         panel: {
           color: 0x5865f2,
-          title: "🤖 Choose an agent",
-          fields: [{ name: "Current", value: `\`${record.agentId}\``, inline: true }],
+          title: "🤖 Choose an agent @ host",
+          fields: [{ name: "Current", value: currentLabel, inline: true }],
         },
-        choices: profiles.map((p) => ({
-          value: p.id,
-          label: p.displayName,
-          description: p.id,
-        })),
+        choices,
         authorizedUserIds: mayConfigureUserIds(this.config),
         successPanel: (pickedChoice, username) => ({
           color: 0x57f287,
           title: "✅ Agent changed",
           fields: [
-            { name: "Previous", value: `\`${record.agentId}\``, inline: true },
+            { name: "Previous", value: `\`${currentAt}\``, inline: true },
             { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
           ],
           footer: `Changed by ${username}`
@@ -6822,24 +6956,6 @@ export class Orchestrator {
       return;
     }
 
-    const profile = this.router.getProfile(id);
-    if (!profile) {
-      const listing = profiles
-        .map((p) => `\`${p.id}\` — ${p.displayName}`)
-        .join(", ");
-      await i.reply({
-        content: `Unknown agent \`${id}\`. Available: ${listing}`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    if (record.agentId === id) {
-      await i.reply({
-        content: `Agent is already \`${id}\`.`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
     await this.applyAgentChange(channel, record, id, i);
   }
 
@@ -6849,36 +6965,62 @@ export class Orchestrator {
     id: string,
     interaction?: ChatInputCommandInteraction
   ): Promise<void> {
-    const profile = this.router.getProfile(id);
+    const parsed = parseAgentAtLocation(id);
+    const profile = this.router.getProfile(parsed.agentId);
     if (!profile) {
-      const msg = `Unknown agent \`${id}\`.`;
+      const msg = `Unknown agent \`${parsed.agentId}\`.`;
       if (interaction) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
       else await this.adapter.sendMessage(channel, msg);
       return;
     }
-    if (record.agentId === id) {
-      const msg = `Agent is already \`${id}\`.`;
+    const currentLocation = resolveThreadLocation(this.config, channel.id);
+    const nextLocation = parsed.explicit ? parsed.location : currentLocation;
+    const sameAgent = record.agentId === parsed.agentId;
+    const sameLocation = currentLocation === nextLocation;
+    if (sameAgent && sameLocation) {
+      const msg = `Agent is already \`${formatAgentAtLocation(parsed.agentId, nextLocation)}\`.`;
       if (interaction) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
       else await this.adapter.sendMessage(channel, msg);
       return;
+    }
+    if (!sameLocation) {
+      const written = this.configMutation.applyThreadLocation({
+        threadId: channel.id,
+        ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+        location: nextLocation,
+        actor: interaction
+          ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
+          : { id: null, name: null },
+      });
+      if (!written.ok) {
+        const msg = written.error;
+        if (interaction) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
+        else await this.adapter.sendMessage(channel, msg);
+        return;
+      }
     }
     // Kill the live runtime (ends any in-flight turn) and wipe the ACP
-    // session id so the next message spawns the new agent fresh.
+    // session id so the next message spawns the new agent fresh. D2: a
+    // location change is a new host — never migrate the old session.
     await this.router.invalidate(record.id);
     const cfg = this.store.readConfig(record);
-    cfg.model = profile.defaultModel;
-    // Different agent → different context-window characteristics; cached
-    // usage no longer applies.
-    cfg.lastContextUsage = undefined;
+    if (!sameAgent) {
+      cfg.model = profile.defaultModel;
+      cfg.lastContextUsage = undefined;
+    }
     this.persistConfig(record, cfg);
     this.store.upsert({
       ...record,
-      agentId: id,
+      agentId: parsed.agentId,
       acpSessionId: "",
       updatedUtc: new Date().toISOString(),
     });
-    await this.updateThreadAbbreviation(channel, record.agentId, id);
-    const message = `🤖 Agent switched to \`${id}\` (${profile.displayName}), model \`${profile.defaultModel}\`. Next message will start a fresh session.`;
+    bindSessionLocation(this.bridgeHub, record.id, nextLocation);
+    if (!sameAgent) {
+      await this.updateThreadAbbreviation(channel, record.agentId, parsed.agentId);
+    }
+    const at = formatAgentAtLocation(parsed.agentId, nextLocation);
+    const message = `🤖 Agent switched to \`${at}\` (${profile.displayName}), model \`${cfg.model ?? profile.defaultModel}\`. Next message will start a fresh session.`;
     if (interaction) {
       await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
     } else {
@@ -8691,24 +8833,28 @@ export class Orchestrator {
   }
 
   private async cmdRepos(i: ChatInputCommandInteraction): Promise<void> {
-    const dirs = this.listRepoDirs();
+    const threadId = i.channel?.isThread() ? i.channelId : undefined;
+    const dirs = await this.listHostWorkspacePaths(threadId);
+    const location = resolveThreadLocation(this.config, threadId);
     if (!dirs) {
       await i.reply({
-        content: `REPOS_ROOT not found: \`${this.config.REPOS_ROOT}\``,
+        content: isLocalLocation(location)
+          ? `REPOS_ROOT not found: \`${this.config.REPOS_ROOT}\``
+          : `Host \`${location}\` did not report a workspace root.`,
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
     if (dirs.length === 0) {
       await i.reply({
-        content: `No repos under \`${this.config.REPOS_ROOT}\`.`,
+        content: `No workspaces on \`${location}\`.`,
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
     const lines = dirs.slice(0, 50).map((d) => `- ${path.basename(d)}`);
     await i.reply({
-      content: `**Repos**\n${this.renderer.codeBlock(lines.join("\n"))}`,
+      content: `**Repos @ ${location}**\n${this.renderer.codeBlock(lines.join("\n"))}`,
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -9233,7 +9379,7 @@ export class Orchestrator {
       "**`/seam config`**",
       "`/seam config model [id]` — get / set agent model",
       "`/seam config effort [level]` — reasoning effort",
-      "`/seam config agent [id]` — get / set agent (resets session)",
+      "`/seam config agent [id]` — get / set agent@location (resets session)",
       "`/seam config mode <id>` — set agent operational mode",
       "`/seam config repo <path>` — set working repo (under REPOS_ROOT)",
       "`/seam config tools <allow|exclude> [list]` — tool filters",
@@ -9676,18 +9822,21 @@ export class Orchestrator {
   // --- repo picker ---
 
   private async sendRepoPicker(channel: ChannelRef): Promise<void> {
-    const dirs = this.listRepoDirs();
+    const dirs = await this.listHostWorkspacePaths(channel.id);
+    const location = resolveThreadLocation(this.config, channel.id);
     if (!dirs) {
       await this.adapter.sendMessage(
         channel,
-        `❌ REPOS_ROOT not found: \`${this.config.REPOS_ROOT}\``
+        isLocalLocation(location)
+          ? `❌ REPOS_ROOT not found: \`${this.config.REPOS_ROOT}\``
+          : `❌ Host \`${location}\` did not report workspaces.`
       );
       return;
     }
     if (dirs.length === 0) {
       await this.adapter.sendMessage(
         channel,
-        `⚠️ No repos under \`${this.config.REPOS_ROOT}\`. Use \`/seam repo <path>\`.`
+        `⚠️ No repos on \`${location}\`. Use \`/seam repo <path>\`.`
       );
       return;
     }
@@ -9735,7 +9884,7 @@ export class Orchestrator {
     if (!result) return;
 
     const picked = result.value;
-    if (!isWithinRoot(picked, this.config.REPOS_ROOT)) {
+    if (isLocalLocation(location) && !isWithinRoot(picked, this.config.REPOS_ROOT)) {
       await this.adapter.sendMessage(
         channel,
         `🛡️ Repo \`${picked}\` is outside REPOS_ROOT.`
@@ -9772,6 +9921,24 @@ export class Orchestrator {
         `📌 Repo set to \`${this.repoDisplay(picked)}\`. Send a message to begin.`
       );
     }
+  }
+
+  /**
+   * D11: enumerate workspaces on the bound host. Remote → rpc listWorkspaces
+   * (absolute host paths, no cwd rewrite). Local → loopback scan of REPOS_ROOT.
+   */
+  private async listHostWorkspacePaths(threadId?: string): Promise<string[] | undefined> {
+    const location = resolveThreadLocation(this.config, threadId);
+    if (this.bridgeHub) {
+      try {
+        const ws = await this.bridgeHub.listWorkspaces(location);
+        return ws.map((w) => w.path);
+      } catch (err) {
+        this.logger.warn({ err, location }, "listWorkspaces on host failed");
+        if (!isLocalLocation(location)) return [];
+      }
+    }
+    return this.listRepoDirs();
   }
 
   private listRepoDirs(): string[] | undefined {
@@ -9813,12 +9980,10 @@ export class Orchestrator {
           title: "🤖 Choose an agent",
           fields: [{ name: "Default", value: `\`${currentRecord.agentId}\``, inline: true }],
         },
-        choices: profiles.map((p) => ({
-          value: p.id,
-          label: p.displayName,
-          description:
-            p.id === currentRecord.agentId ? `${p.id} (current)` : p.id,
-        })),
+        choices: agentLocationPickerChoices(profiles, {
+          bridges: this.config.bridgePresets.values(),
+          connected: this.bridgeHub?.connectedIds(),
+        }).slice(0, 25),
         authorizedUserIds: mayConfigureUserIds(this.config),
         successPanel: (pickedChoice, username) => ({
           color: 0x57f287,
@@ -9839,7 +10004,7 @@ export class Orchestrator {
         );
         return;
       }
-      if (picked.value !== currentRecord.agentId) {
+      if (picked.value !== currentAgentAtLocation(currentRecord.agentId, this.config, channel.id)) {
         await this.applyAgentChange(channel, currentRecord, picked.value);
         // Re-read: applyAgentChange updated agent + model in the DB.
         currentRecord = this.store.get(currentRecord.id) ?? currentRecord;

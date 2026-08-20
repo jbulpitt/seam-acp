@@ -348,6 +348,20 @@ describe("SeamMcpServer", () => {
     expect(spec.returnTo).toBe("999999999999999999");
   });
 
+  it("handoff to agentId@location carries location on the spec (#84 remainder)", async () => {
+    h = await makeHarness();
+    await h.call(
+      "tools/call",
+      { name: "handoff", arguments: { worker: "claude@mac", prompt: "run on the mac" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    const spec = h.enqueued[0]!;
+    expect(spec.session).toBe("isolated");
+    expect(spec.preset).toBe("claude");
+    expect(spec.location).toBe("mac");
+    expect(spec.target).toBe("thread-caller");
+  });
+
   it("forward enqueues a live dispatch into the target with returnTo=caller", async () => {
     h = await makeHarness();
     await h.call(
@@ -806,6 +820,35 @@ describe("SeamMcpServer", () => {
     // Archived-but-bound thread still appears, marked (not silently dropped).
     expect(text).toContain("222222222222222222");
     expect(text).toContain("archived");
+  });
+
+  it("threads lists agentId@location with host emoji (#84 remainder)", async () => {
+    h = await makeHarness({
+      listThreads: async () => [
+        {
+          id: "111111111111111111",
+          name: "mac worker",
+          isSelf: false,
+          agent: "claude",
+          model: "opus",
+          cwd: "/Users/me/proj",
+          busy: false,
+          status: "active",
+          lastActivityUtc: "2026-08-17T10:00:00.000Z",
+          location: "mac",
+          hostEmoji: "💻",
+        },
+      ],
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "threads", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    const text = body.result.content[0].text as string;
+    expect(text).toContain("claude@mac");
+    expect(text).toContain("💻");
   });
 
   it("threads refuses a scope that names another channel (self-scope, #73)", async () => {
@@ -1634,6 +1677,7 @@ describe("config_describe", () => {
     permission: { value: "ask", source: "default" as const },
     locked: true,
     detached: { value: true, source: "thread preset" as const },
+    location: { value: "local", source: "default" as const },
   };
 
   async function makeDescribeServer(): Promise<SeamMcpServer> {

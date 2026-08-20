@@ -11,7 +11,7 @@ import type { AgentAdapter } from "@seam/adapters";
 import {
   isAllowedRpcMethod,
   isDevRpcMethod,
-  readAttachmentWithinRoot,
+  invokeAdapterRpc,
   isPathWithinRoot,
   ATTACH_MAX_BYTES,
 } from "@seam/adapters";
@@ -83,96 +83,44 @@ async function dispatchAdapter(
   agentId: string | undefined,
   ctx: RpcContext
 ): Promise<unknown> {
-  const adapter = method === "spawn" ? undefined : requireAgent(ctx, agentId);
   const cwd = str(params.cwd) ?? ctx.cwd;
 
-  switch (method) {
-    case "describe":
-      return adapter!.describe();
-    case "prepare":
-      return adapter!.prepare();
-    case "install": {
-      const recipe = adapter!.install();
-      if (params.confirmed !== true) return recipe;
-      if (!recipe.supported) {
-        throw new Error("install is not supported for this agent");
-      }
-      // Adapter-declared recipe only — never run caller-supplied commands.
-      // Local stubs have no runner; a supported recipe without a runner is
-      // acknowledged but not executed as a shell.
-      return { ok: true, ran: false, recipe };
-    }
-    case "spawn": {
-      const slot = params.slot;
-      if (typeof slot !== "number") throw new Error("spawn requires numeric slot");
-      const env =
-        params.env && typeof params.env === "object" && !Array.isArray(params.env)
-          ? Object.fromEntries(
-              Object.entries(params.env as Record<string, unknown>).filter(
-                (e): e is [string, string] => typeof e[1] === "string"
-              )
+  if (method === "spawn") {
+    const slot = params.slot;
+    if (typeof slot !== "number") throw new Error("spawn requires numeric slot");
+    const env =
+      params.env && typeof params.env === "object" && !Array.isArray(params.env)
+        ? Object.fromEntries(
+            Object.entries(params.env as Record<string, unknown>).filter(
+              (e): e is [string, string] => typeof e[1] === "string"
             )
-          : undefined;
-      ctx.configureSlot?.(slot, {
-        agentId: str(params.agentId) ?? agentId,
-        cwd,
-        env,
-        mcpServers: params.mcpServers,
-        model: str(params.model),
-        effort: str(params.effort),
-      });
-      return { ok: true, slot };
-    }
-    case "listWorkspaces":
-      return adapter!.listWorkspaces();
-    case "listSessions":
-      return adapter!.listSessions(cwd);
-    case "getTranscript": {
-      const sessionId = str(params.sessionId);
-      if (!sessionId) throw new Error("sessionId required");
-      return adapter!.getTranscript(cwd, sessionId);
-    }
-    case "getUsage":
-    case "usage":
-      return adapter!.usage(cwd, str(params.sessionId), typeof params.newerThanMs === "number" ? params.newerThanMs : undefined);
-    case "cloneSession": {
-      const oldSessionId = str(params.oldSessionId);
-      const newSessionId = str(params.newSessionId);
-      if (!oldSessionId || !newSessionId) throw new Error("oldSessionId and newSessionId required");
-      await adapter!.cloneSession(cwd, oldSessionId, newSessionId);
-      return null;
-    }
-    case "deleteSession": {
-      const sessionId = str(params.sessionId);
-      if (!sessionId) throw new Error("sessionId required");
-      await adapter!.deleteSession(cwd, sessionId);
-      return null;
-    }
-    case "whoami":
-      return adapter!.whoami?.() ?? null;
-    case "writeAttachment": {
-      const filename = str(params.filename);
-      const bytes = params.bytes ?? params.base64;
-      if (!filename || bytes == null) throw new Error("filename and bytes/base64 required");
-      const payload =
-        typeof bytes === "string"
-          ? bytes
-          : Buffer.from(bytes as Uint8Array).toString("base64");
-      return adapter!.writeAttachment(cwd, filename, payload);
-    }
-    case "readAttachment": {
-      const requested = str(params.path) ?? str(params.filename);
-      if (!requested) throw new Error("path required");
-      const att = await readAttachmentWithinRoot(cwd, requested, ctx.workspaceRoot);
-      return {
-        bytesBase64: Buffer.from(att.bytes).toString("base64"),
-        filename: att.filename,
-        size: att.size,
-      };
-    }
-    default:
-      throw new Error(`unknown rpc method: ${method}`);
+          )
+        : undefined;
+    ctx.configureSlot?.(slot, {
+      agentId: str(params.agentId) ?? agentId,
+      cwd,
+      env,
+      mcpServers: params.mcpServers,
+      model: str(params.model),
+      effort: str(params.effort),
+    });
+    return { ok: true, slot };
   }
+
+  const adapter = method === "listWorkspaces" ? undefined : requireAgent(ctx, agentId);
+  if (method === "install" && adapter) {
+    const recipe = adapter.install();
+    if (params.confirmed !== true) return recipe;
+    if (!recipe.supported) {
+      throw new Error("install is not supported for this agent");
+    }
+    return { ok: true, ran: false, recipe };
+  }
+  return invokeAdapterRpc(method, params, {
+    adapter,
+    workspaceRoot: ctx.workspaceRoot,
+    cwd,
+  });
 }
 
 async function dispatchDev(

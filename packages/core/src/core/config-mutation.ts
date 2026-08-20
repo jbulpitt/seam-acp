@@ -122,7 +122,9 @@ export interface ChannelPresetChanges {
  *  changed through any tool; cross-thread edits are structurally impossible
  *  because the target is always the caller's own thread (record.channelRef).
  *  `detached` (#80) is a RAW boolean (not `{value:true}`): true = this thread
- *  is not a session (no bot replies); false omits the key (re-attach). */
+ *  is not a session (no bot replies); false omits the key (re-attach).
+ *  `location` (#86 / D10) is a RAW string (not `{value}`): omit / `"local"`
+ *  means the loopback host; a bridge id pins the thread to that host. */
 export interface ThreadPresetChanges {
   agent?: string | null;
   model?: string | null;
@@ -130,6 +132,7 @@ export interface ThreadPresetChanges {
   effort?: string | null;
   rider?: string | null;
   detached?: boolean;
+  location?: string | null;
 }
 
 /** Tier D — a scheduled prompt bound to the calling thread (#69).
@@ -338,6 +341,39 @@ export class ConfigMutationService {
           message: opts.detached
             ? "This thread is already detached."
             : "This thread is already attached.",
+          auditId: "",
+        };
+      }
+      return built;
+    }
+    const applied = built.proposal.apply(opts.actor);
+    return { ok: true, message: applied.message, auditId: applied.auditId };
+  }
+
+  /**
+   * Slash/picker immediate write of `threads.<id>.location` (D10 / #86).
+   * Same discipline as `applyThreadDetached`: not gated by conversational
+   * Tier C, PresetsFileSchema round-trip, audit row. `"local"` / empty
+   * omits the key (default). Changing location restarts the session.
+   */
+  applyThreadLocation(opts: {
+    threadId: string;
+    parentRef?: string;
+    location: string;
+    actor: MutationActor;
+  }): { ok: true; message: string; auditId: string } | { ok: false; error: string } {
+    const loc = opts.location.trim() || "local";
+    const built = this.buildThreadPresetProposalFor(
+      opts.threadId,
+      opts.parentRef,
+      { location: loc },
+      { requireTierC: false }
+    );
+    if (!built.ok) {
+      if (built.error.includes("No effective change")) {
+        return {
+          ok: true,
+          message: `This thread is already bound to \`${loc}\`.`,
           auditId: "",
         };
       }
@@ -1273,6 +1309,35 @@ export class ConfigMutationService {
     }
     // NB: no preserve-lock line here — thread entries carry no `locked` field.
 
+    // #86 / D10: `location` is a RAW string (not `{value}`). `"local"` / empty
+    // omits the key (default local). Any other slug is persisted as-is.
+    if (changes.location !== undefined) {
+      const beforeLoc =
+        typeof current.location === "string" && current.location.trim()
+          ? current.location.trim()
+          : "local";
+      const requested = changes.location;
+      const afterLoc =
+        requested === null || requested === "" || requested === "local"
+          ? "local"
+          : requested.trim();
+      if (afterLoc !== "local" && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(afterLoc)) {
+        return {
+          ok: false,
+          error: `Invalid location "${requested}". Use "local" or a paired bridge id.`,
+        };
+      }
+      if (beforeLoc !== afterLoc) {
+        if (afterLoc === "local") delete next.location;
+        else next.location = afterLoc;
+        fields.push({
+          label: "location",
+          before: beforeLoc,
+          after: afterLoc,
+        });
+      }
+    }
+
     // #80: `detached` is a RAW boolean, sibling of channel `locked` — not
     // wrapped `{value:true}`. `true` writes the key; `false` omits it.
     if (changes.detached !== undefined) {
@@ -1325,6 +1390,7 @@ export class ConfigMutationService {
       // write must not restart/invalidate; slash abort-on-detach handles an
       // in-flight turn separately. Mixed with rider/effort/etc. still restarts.
       restartsSession: !fields.every((f) => f.label === "detached"),
+      // location changes pin the session to a different host (D2) — restart.
       apply: (actor) => {
         // Serialize the FULL candidate document and swap atomically (temp+rename),
         // then hot-reload the live maps (P0) so it takes effect with no redeploy.
@@ -1723,6 +1789,9 @@ export class ConfigMutationService {
       effort: { value: d.effort.value, source: d.effort.source },
       cwd: { value: d.cwd.value, source: d.cwd.source },
       permission: { value: d.permission.value, source: d.permission.source },
+      location: d.location
+        ? { value: d.location.value, source: d.location.source }
+        : { value: "local", source: "default" },
     };
   }
 

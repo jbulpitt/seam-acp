@@ -582,6 +582,21 @@ const Schema = z.object({
   TUNNEL_GIST_ID: z.string().optional(),
 
   /**
+   * Permanent public WebSocket URL for remote-bridge bootstrap
+   * (`/seam bridge add`). Survives reboot — unlike data/tunnel-url.txt,
+   * which is overwritten by the Cloudflare *quick* tunnel every start.
+   * Example: `wss://seamacp.runbooksynthesis.com/bridge`. Empty/unset ⇒
+   * fall back to tunnel-url.txt, then `ws://127.0.0.1:$HEALTH_PORT/bridge`.
+   */
+  SEAM_BRIDGE_PUBLIC_URL: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const s = v.trim();
+      return s.length > 0 ? s : undefined;
+    }),
+
+  /**
    * Controls the `/seam new` and `/seam config init` thread initialization flow.
    * - "repo":  (default) only show the repo picker
    * - "full":  after repo selection, also present an agent picker and a

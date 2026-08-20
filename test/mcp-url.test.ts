@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { buildSeamMcpServerEntry } from "../packages/core/src/core/mcp/seam-mcp-server.js";
-import { resolveReachableMcpUrl, publicBaseFromTunnelUrl } from "../packages/core/src/core/mcp-url.js";
+import {
+  resolveReachableMcpUrl,
+  publicBaseFromTunnelUrl,
+  normalizePublicBridgeWsUrl,
+  resolvePublicBridgeWsUrl,
+  publicBaseFromBridgeWsUrl,
+} from "../packages/core/src/core/mcp-url.js";
 
 describe("reachable seam-MCP URL (#84)", () => {
   it("local spawn still uses 127.0.0.1", () => {
@@ -47,5 +53,51 @@ describe("reachable seam-MCP URL (#84)", () => {
     const url = resolveReachableMcpUrl({ port: 3000, healthPort: 3000, remote: true });
     expect(url.startsWith("http://127.0.0.1")).toBe(false);
     expect(url.endsWith("/mcp")).toBe(true);
+  });
+});
+
+describe("permanent bridge public URL", () => {
+  it("normalizes host, https, and missing /bridge", () => {
+    expect(normalizePublicBridgeWsUrl("seamacp.runbooksynthesis.com")).toBe(
+      "wss://seamacp.runbooksynthesis.com/bridge"
+    );
+    expect(normalizePublicBridgeWsUrl("https://seamacp.runbooksynthesis.com")).toBe(
+      "wss://seamacp.runbooksynthesis.com/bridge"
+    );
+    expect(normalizePublicBridgeWsUrl("wss://seamacp.runbooksynthesis.com/bridge")).toBe(
+      "wss://seamacp.runbooksynthesis.com/bridge"
+    );
+  });
+
+  it("prefers SEAM_BRIDGE_PUBLIC_URL over the quick-tunnel file", () => {
+    const url = resolvePublicBridgeWsUrl({
+      configured: "wss://seamacp.runbooksynthesis.com/bridge",
+      tunnelUrl: "wss://yamaha-airport-street-almost.trycloudflare.com",
+      healthPort: 3000,
+    });
+    expect(url).toBe("wss://seamacp.runbooksynthesis.com/bridge");
+    expect(url).not.toContain("trycloudflare");
+  });
+
+  it("falls back to tunnel-url.txt when the flag is unset", () => {
+    expect(
+      resolvePublicBridgeWsUrl({
+        configured: "",
+        tunnelUrl: "wss://abc.trycloudflare.com",
+        healthPort: 3000,
+      })
+    ).toBe("wss://abc.trycloudflare.com/bridge");
+  });
+
+  it("loopback is last resort", () => {
+    expect(
+      resolvePublicBridgeWsUrl({ configured: undefined, tunnelUrl: null, healthPort: 3000 })
+    ).toBe("ws://127.0.0.1:3000/bridge");
+  });
+
+  it("MCP origin strips /bridge so we do not produce /bridge/mcp", () => {
+    expect(publicBaseFromBridgeWsUrl("wss://seamacp.runbooksynthesis.com/bridge")).toBe(
+      "https://seamacp.runbooksynthesis.com"
+    );
   });
 });

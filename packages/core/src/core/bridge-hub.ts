@@ -9,7 +9,11 @@ import { WebSocket, WebSocketServer } from "ws";
 import { makeMux, PROTOCOL_VERSION, type HelloFrame } from "@seam/adapters";
 import type { WorkspaceInfo } from "@seam/adapters";
 import { buildSeamMcpServerEntry } from "./mcp/seam-mcp-server.js";
-import { publicBaseFromTunnelUrl, resolveReachableMcpUrl } from "./mcp-url.js";
+import {
+  publicBaseFromBridgeWsUrl,
+  resolvePublicBridgeWsUrl,
+  resolveReachableMcpUrl,
+} from "./mcp-url.js";
 import { tokenMatchesHash } from "./bridge-pairing.js";
 import type { BridgeHostConfig, Config } from "../config.js";
 import type { Logger } from "../lib/logger.js";
@@ -138,12 +142,11 @@ export class BridgeHub {
   }
 
   publicWsUrl(): string {
-    const tunnel = readTunnelUrl(this.dataDir);
-    if (tunnel) {
-      const base = tunnel.replace(/\/+$/, "");
-      return base.endsWith("/bridge") ? base : `${base}/bridge`;
-    }
-    return `ws://127.0.0.1:${this.healthPort}/bridge`;
+    return resolvePublicBridgeWsUrl({
+      configured: this.config.SEAM_BRIDGE_PUBLIC_URL,
+      tunnelUrl: readTunnelUrl(this.dataDir),
+      healthPort: this.healthPort,
+    });
   }
 
   mcpUrlForRemote(): string | undefined {
@@ -152,7 +155,7 @@ export class BridgeHub {
     return resolveReachableMcpUrl({
       port,
       healthPort: this.healthPort,
-      publicBaseUrl: publicBaseFromTunnelUrl(readTunnelUrl(this.dataDir)),
+      publicBaseUrl: publicBaseFromBridgeWsUrl(this.publicWsUrl()),
       remote: true,
     });
   }

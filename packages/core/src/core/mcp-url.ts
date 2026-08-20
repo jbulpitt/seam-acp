@@ -51,3 +51,38 @@ export function publicBaseFromTunnelUrl(tunnelUrl: string | null | undefined): s
   if (u.startsWith("https://") || u.startsWith("http://")) return u.replace(/\/+$/, "");
   return undefined;
 }
+
+const BRIDGE_PATH = "/bridge";
+
+/** Normalize a configured public URL to `ws(s)://host/bridge`. */
+export function normalizePublicBridgeWsUrl(raw: string): string {
+  let s = raw.trim();
+  if (s.startsWith("https://")) s = `wss://${s.slice("https://".length)}`;
+  else if (s.startsWith("http://")) s = `ws://${s.slice("http://".length)}`;
+  else if (!s.startsWith("ws://") && !s.startsWith("wss://")) s = `wss://${s}`;
+  s = s.replace(/\/+$/, "");
+  if (!s.endsWith(BRIDGE_PATH)) s = `${s}${BRIDGE_PATH}`;
+  return s;
+}
+
+/**
+ * Public WS URL handed to `/seam bridge add` bootstrap.
+ * Prefer a permanent `SEAM_BRIDGE_PUBLIC_URL`, then the quick-tunnel file,
+ * then loopback health (only useful on the same host).
+ */
+export function resolvePublicBridgeWsUrl(opts: {
+  configured?: string | null;
+  tunnelUrl?: string | null;
+  healthPort: number;
+}): string {
+  const configured = (opts.configured ?? "").trim();
+  if (configured) return normalizePublicBridgeWsUrl(configured);
+  const tunnel = (opts.tunnelUrl ?? "").trim();
+  if (tunnel) return normalizePublicBridgeWsUrl(tunnel);
+  return `ws://127.0.0.1:${opts.healthPort}${BRIDGE_PATH}`;
+}
+
+/** Origin used to build `https://host/mcp` from a `/bridge` WS URL. */
+export function publicBaseFromBridgeWsUrl(wsUrl: string): string | undefined {
+  return publicBaseFromTunnelUrl(wsUrl.replace(/\/bridge\/?$/, ""));
+}

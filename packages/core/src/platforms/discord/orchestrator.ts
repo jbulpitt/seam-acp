@@ -6917,6 +6917,7 @@ export class Orchestrator {
       const choices = agentLocationPickerChoices(profiles, {
         bridges: this.config.bridgePresets.values(),
         connected: this.bridgeHub?.connectedIds(),
+        agentsByHost: this.bridgeHub?.installedAgentsByHost(),
       }).slice(0, 25);
       // Show interactive picker — every agentId@location, host-emoji prefixed (D10).
       if (!this.adapter.sendChoicePicker || choices.length === 0) {
@@ -9983,6 +9984,7 @@ export class Orchestrator {
         choices: agentLocationPickerChoices(profiles, {
           bridges: this.config.bridgePresets.values(),
           connected: this.bridgeHub?.connectedIds(),
+          agentsByHost: this.bridgeHub?.installedAgentsByHost(),
         }).slice(0, 25),
         authorizedUserIds: mayConfigureUserIds(this.config),
         successPanel: (pickedChoice, username) => ({

@@ -172,11 +172,32 @@ function additionalMcpConfigJson(mcpServers: unknown): string | undefined {
   return JSON.stringify({ mcpServers: mapped });
 }
 
+function resolveSlotAdapter(
+  adapters: Map<string, AgentAdapter>,
+  slotCfg?: SlotSpawnConfig
+): AgentAdapter | undefined {
+  const id = slotCfg?.agentId;
+  if (id && adapters.has(id)) return adapters.get(id);
+  if (adapters.size === 1) return [...adapters.values()][0];
+  return undefined;
+}
+
 function spawnAgent(
+  adapters: Map<string, AgentAdapter>,
   copilotCmd: string,
   localCwd: string,
   slotCfg?: SlotSpawnConfig
 ): ChildProcess {
+  const adapter = resolveSlotAdapter(adapters, slotCfg);
+  if (adapter && adapter.id !== "copilot") {
+    console.error(
+      `[bridge] Spawning adapter ${adapter.id}` +
+        (slotCfg?.model ? ` model=${slotCfg.model}` : "") +
+        (slotCfg?.effort ? ` effort=${slotCfg.effort}` : "")
+    );
+    return adapter.spawn(slotCfg?.model, slotCfg?.effort);
+  }
+
   const ghToken = process.env.GH_TOKEN || (() => {
     try { return execSync("gh auth token", { stdio: ["pipe", "pipe", "ignore"] }).toString().trim(); }
     catch { return ""; }
@@ -274,7 +295,7 @@ function makeSlotManager(opts: {
     }
 
     console.error(`[bridge] Slot ${slot}: spawning agent`);
-    const agent = spawnAgent(copilotCmd, localCwd, slotConfigs.get(slot));
+    const agent = spawnAgent(adapters, copilotCmd, localCwd, slotConfigs.get(slot));
     slots.set(slot, agent);
 
     agent.stdout?.on("data", (chunk: Buffer) => {

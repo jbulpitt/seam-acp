@@ -215,6 +215,7 @@ describe("flattened host-prefixed picker (D10)", () => {
         { id: "grok", displayName: "Grok" },
       ],
       hosts,
+      agentsByHost: new Map([["mac", new Set(["claude", "grok"])]]),
     });
     expect(choices.map((c) => c.value)).toEqual([
       "claude@local",
@@ -229,6 +230,51 @@ describe("flattened host-prefixed picker (D10)", () => {
       location: "mac",
       explicit: true,
     });
+  });
+
+  it("remote hosts only list advertised installed agents", () => {
+    const bridges = new Map<string, BridgeHostConfig>([
+      [
+        "media-server",
+        {
+          id: "media-server",
+          emoji: "🖥️",
+          shortName: "media-server",
+          tokenHash: "b".repeat(64),
+        },
+      ],
+    ]);
+    const hosts = listHosts({
+      bridges: bridges.values(),
+      connected: new Set(["media-server"]),
+    });
+    const choices = listAgentLocationChoices({
+      profiles: [
+        { id: "claude", displayName: "Claude" },
+        { id: "copilot", displayName: "Copilot" },
+        { id: "grok", displayName: "Grok" },
+      ],
+      hosts,
+      agentsByHost: new Map([["media-server", new Set(["grok"])]]),
+    });
+    expect(choices.map((c) => c.value)).toEqual([
+      "claude@local",
+      "copilot@local",
+      "grok@local",
+      "grok@media-server",
+    ]);
+  });
+
+  it("does not invent VPS agents on a remote host with no inventory", () => {
+    const bridges = new Map<string, BridgeHostConfig>([
+      ["mac", { id: "mac", tokenHash: "c".repeat(64) }],
+    ]);
+    const hosts = listHosts({ bridges: bridges.values(), connected: new Set() });
+    const choices = listAgentLocationChoices({
+      profiles: [{ id: "claude", displayName: "Claude" }],
+      hosts,
+    });
+    expect(choices.map((c) => c.value)).toEqual(["claude@local"]);
   });
 });
 

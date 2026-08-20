@@ -111,6 +111,19 @@ export class BridgeHub {
     return new Set(this.connections.keys());
   }
 
+  /** Installed agent ids per connected bridge (hello inventory). */
+  installedAgentsByHost(): Map<string, Set<string>> {
+    const out = new Map<string, Set<string>>();
+    for (const c of this.connections.values()) {
+      const ids = new Set<string>();
+      for (const [id, info] of c.agents) {
+        if (info.installed) ids.add(id);
+      }
+      out.set(c.bridgeId, ids);
+    }
+    return out;
+  }
+
   /**
    * True when a remote bridge has finished hello + prepare(), or when
    * `location` is the local loopback (always ready).

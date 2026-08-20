@@ -104,14 +104,24 @@ export interface AgentLocationChoice {
   description: string;
 }
 
-/** Flattened picker entries: one `agentId@location` per (agent, host). */
+/** Flattened picker entries: local = every control-plane profile; remote =
+ *  only agent ids that host advertised as installed (hello inventory). */
 export function listAgentLocationChoices(opts: {
   profiles: ReadonlyArray<Pick<AgentProfile, "id" | "displayName">>;
   hosts: ReadonlyArray<HostInfo>;
+  /** bridgeId → installed agent ids. Omitted/empty for a remote host ⇒ no
+   *  remote rows for that host (do not invent VPS agents on a Mac). */
+  agentsByHost?: ReadonlyMap<string, ReadonlySet<string>>;
 }): AgentLocationChoice[] {
   const out: AgentLocationChoice[] = [];
   for (const host of opts.hosts) {
-    for (const p of opts.profiles) {
+    const remoteIds =
+      host.id === LOCAL_LOCATION ? undefined : opts.agentsByHost?.get(host.id);
+    const profiles =
+      host.id === LOCAL_LOCATION
+        ? opts.profiles
+        : opts.profiles.filter((p) => remoteIds?.has(p.id));
+    for (const p of profiles) {
       const value = formatAgentAtLocation(p.id, host.id);
       const offline = host.id !== LOCAL_LOCATION && !host.ready ? " (offline)" : "";
       out.push({

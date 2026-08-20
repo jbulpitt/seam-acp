@@ -19,6 +19,8 @@ import {
 export interface PickerHostInput {
   bridges: Iterable<BridgeHostConfig>;
   connected?: ReadonlySet<string>;
+  /** Installed agent ids per connected bridge (from hello inventory). */
+  agentsByHost?: ReadonlyMap<string, ReadonlySet<string>>;
 }
 
 export function agentLocationPickerChoices(
@@ -28,6 +30,7 @@ export function agentLocationPickerChoices(
   return listAgentLocationChoices({
     profiles,
     hosts: listHosts(hosts),
+    ...(hosts.agentsByHost ? { agentsByHost: hosts.agentsByHost } : {}),
   });
 }
 

@@ -6,7 +6,8 @@
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
-    "remote-agent-bridge": "./dist/index.js"
+    "remote-agent-bridge": "./dist/index.js",
+    "seam-bridge": "./dist/index.js"
   },
   "files": ["dist"],
   "scripts": {

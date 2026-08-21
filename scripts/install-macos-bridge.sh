@@ -72,6 +72,13 @@ git_public_url() {
   printf 'https://github.com/%s.git\n' "$REPO_SLUG"
 }
 
+is_yes() {
+  case "$1" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # Connect-line parser. Accepts the exact bootstrap from /seam bridge add,
 # a whole Discord paste, or mixed flag order. Extra words are ignored.
@@ -214,6 +221,13 @@ seam-bridge connect --server wss://seamacp.runbooksynthesis.com/bridge --id mac 
     printf 'ok   git_public_url\n'
   fi
 
+  if is_yes yes && is_yes Y && is_yes y && ! is_yes n && ! is_yes "" && ! is_yes no; then
+    printf 'ok   is_yes\n'
+  else
+    printf 'FAIL is_yes\n'
+    fails=$((fails + 1))
+  fi
+
   if [ "$fails" -ne 0 ]; then
     printf '%s self-test failure(s)\n' "$fails" >&2
     exit 1
@@ -270,42 +284,41 @@ tty_read() {
   local prompt="$1"
   local dest="$2"
   local def="${3:-}"
-  local reply=""
+  # Must not be named `reply` — confirm() also uses that, and bash `local`
+  # is dynamically scoped so eval would write THIS function's copy.
+  local line=""
   if [ -r /dev/tty ]; then
     if [ -n "$def" ]; then
       printf '%s [%s]: ' "$prompt" "$def" > /dev/tty
     else
       printf '%s ' "$prompt" > /dev/tty
     fi
-    IFS= read -r reply < /dev/tty || true
+    IFS= read -r line < /dev/tty || true
   elif [ -t 0 ]; then
     if [ -n "$def" ]; then
       printf '%s [%s]: ' "$prompt" "$def"
     else
       printf '%s ' "$prompt"
     fi
-    IFS= read -r reply || true
+    IFS= read -r line || true
   else
-    reply=""
+    line=""
   fi
-  reply=$(trim "$reply")
-  if [ -z "$reply" ]; then
-    reply=$def
+  line=$(trim "$line")
+  if [ -z "$line" ]; then
+    line=$def
   fi
-  eval "$dest=\"\$reply\""
+  eval "$dest=\"\$line\""
 }
 
 confirm() {
   local prompt="$1"
-  local reply=""
+  local ans=""
   if [ "$YES" -eq 1 ]; then
     return 0
   fi
-  tty_read "$prompt [y/N]" reply "n"
-  case "$reply" in
-    y|Y|yes|YES) return 0 ;;
-    *) return 1 ;;
-  esac
+  tty_read "$prompt [y/N]" ans "n"
+  is_yes "$ans"
 }
 
 # ---------------------------------------------------------------------------

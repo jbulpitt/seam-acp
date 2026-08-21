@@ -183,8 +183,8 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .addStringOption((o) =>
             o
               .setName("path")
-              .setDescription("Path under REPOS_ROOT (or absolute)")
-              .setRequired(true)
+              .setDescription("Path under REPOS_ROOT (or absolute). Omit to open a picker.")
+              .setRequired(false)
           )
       )
       .addSubcommand((sub) =>

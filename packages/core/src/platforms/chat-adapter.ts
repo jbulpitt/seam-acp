@@ -129,8 +129,9 @@ export interface ChatAdapter {
   /**
    * Optional: present an interactive choice picker (buttons / select menu)
    * and resolve when the user picks one. Returns null on timeout / cancel.
-   * Implementations may impose their own choice-count limits (e.g. Discord
-   * select menus cap at 25).
+   * Discord select menus cap at 25 options — implementations should paginate
+   * rather than silently dropping overflow. `allowCustom` opens a modal for a
+   * free-typed value (select menus cannot accept arbitrary input).
    */
   sendChoicePicker?(
     channel: ChannelRef,
@@ -141,6 +142,22 @@ export interface ChatAdapter {
       timeoutMs?: number;
       authorizedUserIds?: ReadonlySet<string>;
       successPanel?: (picked: { value: string; label: string }, username: string) => StructuredPanel;
+      /**
+       * When set, the picker includes a button that opens a modal for a
+       * free-typed value (e.g. a repo path that isn't in the listed folders).
+       * Discord select menus cannot accept arbitrary typed values themselves.
+       */
+      allowCustom?: {
+        buttonLabel?: string;
+        modalTitle?: string;
+        inputLabel?: string;
+        placeholder?: string;
+      };
+      /**
+       * Return an error string to reject the pick (ephemeral notice) and keep
+       * the picker open. Used to sandbox a custom-typed path before committing.
+       */
+      validate?: (value: string) => Promise<string | null | undefined> | string | null | undefined;
     }
   ): Promise<{ value: string; userId: string } | null>;
 

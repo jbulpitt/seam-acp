@@ -163,6 +163,14 @@ describe("/seam slash command", () => {
     expect(thread?.required ?? false).toBe(false);
   });
 
+  it("config repo path is optional so omitting it opens the picker", () => {
+    const config = built().options?.find((o) => o.name === "config");
+    const repo = (config?.options ?? []).find((o) => o.name === "repo");
+    const pathOpt = repo?.options?.find((o) => o.name === "path");
+    expect(pathOpt?.type).toBe(STRING);
+    expect(pathOpt?.required ?? false).toBe(false);
+  });
+
   it("steer lists required prompt before optional thread/now (Discord option order)", () => {
     const steer = built().options?.find((o) => o.name === "steer");
     const names = (steer?.options ?? []).map((o) => o.name);

@@ -599,9 +599,9 @@ const Schema = z.object({
   /**
    * Controls the `/seam new` and `/seam config init` thread initialization flow.
    * - "repo":  (default) only show the repo picker
-   * - "full":  after repo selection, also present an agent picker and a
-   *            model picker in sequence so the user can configure the
-   *            session before sending their first message
+   * - "full":  Agent → CWD → Model → Effort (effort only if the chosen agent
+   *            exposes settable levels). Agent first so the CWD list is the
+   *            bound host's workspaces.
    */
   NEW_THREAD_WIZARD: z.enum(["repo", "full"]).default("repo"),
 
@@ -1006,6 +1006,7 @@ export const OLLAMA_CLOUD_STATIC_MODELS = [
   { modelId: "deepseek-v4-pro:cloud",       name: "DeepSeek V4 Pro",      contextLimit: 1_000_000 },
   { modelId: "deepseek-v4-flash:cloud",     name: "DeepSeek V4 Flash",    contextLimit: 512_000 },
   { modelId: "deepseek-v3.2:cloud",         name: "DeepSeek V3.2",        contextLimit: 128_000 },
+  { modelId: "kimi-k3:cloud",               name: "Kimi K3",              contextLimit: 1_000_000 },
   { modelId: "kimi-k2.7-code:cloud",        name: "Kimi K2.7 Code",       contextLimit: 256_000 },
   { modelId: "kimi-k2.6:cloud",             name: "Kimi K2.6",            contextLimit: 256_000 },
   { modelId: "minimax-m3:cloud",            name: "MiniMax M3",           contextLimit: 512_000 },

@@ -28,7 +28,7 @@ describe("AgentAdapter.describe()", () => {
     ]);
   });
 
-  it("claude variants round-trip their effort override (zai / ollama-cloud = none)", () => {
+  it("claude variants round-trip their effort override (zai = none; ollama-cloud = meta)", () => {
     const zai = makeClaudeProfile({
       id: "zai",
       defaultModel: "glm-5",
@@ -37,6 +37,22 @@ describe("AgentAdapter.describe()", () => {
     expect(zai.id).toBe("zai");
     expect(zai.describe().effort.mechanism).toBe("none");
     expect(zai.describe().effort.levels).toEqual([]);
+
+    const ollamaCloud = makeClaudeProfile({
+      id: "ollama-cloud",
+      defaultModel: "kimi-k3:cloud",
+      effort: {
+        mechanism: "meta",
+        levels: ["low", "medium", "high", "max"],
+      },
+    });
+    expect(ollamaCloud.describe().effort.mechanism).toBe("meta");
+    expect(ollamaCloud.describe().effort.levels).toEqual([
+      "low",
+      "medium",
+      "high",
+      "max",
+    ]);
 
     const vertex = makeClaudeProfile({
       id: "claude-vertex",

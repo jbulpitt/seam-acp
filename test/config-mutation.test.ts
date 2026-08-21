@@ -745,6 +745,38 @@ describe("thread-preset mutation (Tier C, #68)", () => {
     expect(live.threadPresets.get(THREAD)?.location).toBe("mac");
     expect(store.get(`discord:${THREAD}`)).toBeNull();
   });
+
+  it("applyThreadOverlay pins agent/model over a locked channel preset", () => {
+    const file = writePresetsFile({
+      channels: {
+        [CHAN]: { agent: { value: "grok" }, model: { value: "grok-4.6" }, locked: true },
+      },
+      threads: {},
+    });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: false,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const result = svc.applyThreadOverlay({
+      threadId: THREAD,
+      parentRef: CHAN,
+      changes: { agent: "ollama-cloud", model: "kimi-k3:cloud" },
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.channels[CHAN].locked).toBe(true);
+    expect(raw.channels[CHAN].agent).toEqual({ value: "grok" });
+    expect(raw.threads[THREAD].agent).toEqual({ value: "ollama-cloud" });
+    expect(raw.threads[THREAD].model).toEqual({ value: "kimi-k3:cloud" });
+    expect(live.threadPresets.get(THREAD)?.agent?.value).toBe("ollama-cloud");
+  });
 });
 
 // -------------------------------------------------------------------------

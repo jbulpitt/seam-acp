@@ -14,10 +14,14 @@ import {
   ComponentType,
   EmbedBuilder,
   StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   type Message,
   type TextChannel,
   type ThreadChannel,
   type ChatInputCommandInteraction,
+  type MessageComponentInteraction,
 } from "discord.js";
 import type {
   RequestPermissionRequest,
@@ -39,6 +43,12 @@ import type {
 } from "../chat-adapter.js";
 import { buildSeamCommand } from "./commands.js";
 import { sanitizeSpeakerName } from "../../core/agent-conventions.js";
+import {
+  DISCORD_BUTTONS_PER_ROW,
+  choicePickerLayout,
+  choicePickerPageCaption,
+  sliceChoicePage,
+} from "./choice-picker.js";
 
 const PLATFORM = "discord";
 
@@ -192,10 +202,10 @@ export class DiscordAdapter implements ChatAdapter {
   }
 
   /**
-   * Show an interactive picker. Uses a button row when the choice count
-   * fits Discord's 5-button limit; otherwise falls back to a string-select
-   * menu (capped at the platform's 25-option limit). Returns null on
-   * timeout or unauthorized interaction.
+   * Show an interactive picker. Small lists are buttons; larger lists are a
+   * string-select (Discord's 25-option cap). Lists bigger than 25 paginate
+   * instead of being truncated. Optional `allowCustom` adds a modal for a
+   * free-typed value. Returns null on timeout or unauthorized interaction.
    */
   async sendChoicePicker(
     channel: ChannelRef,
@@ -206,140 +216,302 @@ export class DiscordAdapter implements ChatAdapter {
       timeoutMs?: number;
       authorizedUserIds?: ReadonlySet<string>;
       successPanel?: (picked: { value: string; label: string }, username: string) => import("../../core/types.js").StructuredPanel;
+      allowCustom?: {
+        buttonLabel?: string;
+        modalTitle?: string;
+        inputLabel?: string;
+        placeholder?: string;
+      };
+      validate?: (value: string) => Promise<string | null | undefined> | string | null | undefined;
     }
   ): Promise<{ value: string; userId: string } | null> {
     const ch = await this.fetchSendableChannel(channel.id);
     const timeoutMs = opts.timeoutMs ?? 5 * 60 * 1000;
+    const choices = opts.choices;
+    if (choices.length === 0 && !opts.allowCustom) return null;
 
-    const choices = opts.choices.slice(0, 25);
-    if (choices.length === 0) return null;
-
-    // Discord allows 5 buttons per row × 5 rows = 25 buttons total.
-    // We cap at 15 (3 rows) so the picker stays visually manageable;
-    // anything bigger drops to a single dropdown.
-    const BUTTON_LIMIT = 15;
-    const BUTTONS_PER_ROW = 5;
-    const useButtons = choices.length <= BUTTON_LIMIT;
+    const layout = choicePickerLayout({
+      choiceCount: choices.length,
+      allowCustom: Boolean(opts.allowCustom),
+    });
     const customId = `seam-pick:${Date.now()}`;
 
-    const components: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [];
-    if (useButtons) {
-      const buttons = choices.map((c, idx) =>
-        new ButtonBuilder()
-          .setCustomId(`${customId}:${idx}`)
-          .setLabel(c.label.slice(0, 80))
-          .setStyle(ButtonStyle.Secondary)
+    const panelForPage = (page: number) => {
+      if (!opts.panel) return undefined;
+      const caption = choicePickerPageCaption(choices.length, page, layout.pageSize);
+      if (!caption) return opts.panel;
+      const description = opts.panel.description
+        ? `${opts.panel.description}\n${caption}`
+        : caption;
+      return { ...opts.panel, description };
+    };
+
+    const buildEmbeds = (page: number) => {
+      const panel = panelForPage(page);
+      return panel ? [DiscordAdapter.buildEmbed(panel)] : [];
+    };
+
+    const buildComponents = (page: number) => {
+      const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [];
+      const { items, start, page: p } = sliceChoicePage(
+        choices,
+        page,
+        layout.pageSize
       );
-      for (let i = 0; i < buttons.length; i += BUTTONS_PER_ROW) {
-        components.push(
-          new ActionRowBuilder<ButtonBuilder>().addComponents(
-            buttons.slice(i, i + BUTTONS_PER_ROW)
+      if (layout.useButtons && items.length > 0) {
+        const buttons = items.map((c, idx) =>
+          new ButtonBuilder()
+            .setCustomId(`${customId}:c:${start + idx}`)
+            .setLabel(c.label.slice(0, 80))
+            .setStyle(ButtonStyle.Secondary)
+        );
+        for (let i = 0; i < buttons.length; i += DISCORD_BUTTONS_PER_ROW) {
+          rows.push(
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+              buttons.slice(i, i + DISCORD_BUTTONS_PER_ROW)
+            )
+          );
+        }
+      } else if (!layout.useButtons && items.length > 0) {
+        const select = new StringSelectMenuBuilder()
+          .setCustomId(`${customId}:s`)
+          .setPlaceholder(
+            layout.pageCount > 1
+              ? `Page ${p + 1}/${layout.pageCount} — Choose…`
+              : "Choose…"
           )
+          .addOptions(
+            items.map((c, idx) => ({
+              value: String(start + idx),
+              label: c.label.slice(0, 100),
+              ...(c.description
+                ? { description: c.description.slice(0, 100) }
+                : {}),
+            }))
+          );
+        rows.push(
+          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)
         );
       }
-    } else {
-      const select = new StringSelectMenuBuilder()
-        .setCustomId(customId)
-        .setPlaceholder("Choose…")
-        .addOptions(
-          choices.map((c, idx) => ({
-            value: String(idx),
-            label: c.label.slice(0, 100),
-            ...(c.description ? { description: c.description.slice(0, 100) } : {}),
-          }))
-        );
-      components.push(
-        new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)
-      );
-    }
 
-    const embeds = opts.panel ? [DiscordAdapter.buildEmbed(opts.panel)] : [];
+      const nav: ButtonBuilder[] = [];
+      if (layout.pageCount > 1) {
+        nav.push(
+          new ButtonBuilder()
+            .setCustomId(`${customId}:prev`)
+            .setLabel("◀ Prev")
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(p === 0),
+          new ButtonBuilder()
+            .setCustomId(`${customId}:page`)
+            .setLabel(`${p + 1} / ${layout.pageCount}`)
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(true),
+          new ButtonBuilder()
+            .setCustomId(`${customId}:next`)
+            .setLabel("Next ▶")
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(p >= layout.pageCount - 1)
+        );
+      }
+      if (opts.allowCustom) {
+        nav.push(
+          new ButtonBuilder()
+            .setCustomId(`${customId}:custom`)
+            .setLabel((opts.allowCustom.buttonLabel ?? "Custom…").slice(0, 80))
+            .setStyle(ButtonStyle.Primary)
+        );
+      }
+      if (nav.length > 0) {
+        rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(nav));
+      }
+      return rows;
+    };
+
+    const successPayload = (
+      chosen: { value: string; label: string },
+      username: string
+    ) => {
+      if (opts.successPanel) {
+        return {
+          content: opts.prompt,
+          embeds: [DiscordAdapter.buildEmbed(opts.successPanel(chosen, username))],
+          components: [],
+        };
+      }
+      if (opts.panel) {
+        const successEmbed = DiscordAdapter.buildEmbed(opts.panel).setColor(0x57f287);
+        const newDesc = opts.panel.description
+          ? `${opts.panel.description}\n\n✅ **${chosen.label}** (${username})`
+          : `✅ **${chosen.label}** (${username})`;
+        successEmbed.setDescription(newDesc.slice(0, 4096));
+        return { content: opts.prompt, embeds: [successEmbed], components: [] };
+      }
+      return {
+        content: `${opts.prompt ?? ""}\n✅ **${chosen.label}** (${username})`,
+        embeds: [],
+        components: [],
+      };
+    };
+
     const msg = await ch.send({
       content: opts.prompt,
-      embeds,
-      components,
+      embeds: buildEmbeds(0),
+      components: buildComponents(0),
     });
 
+    const filter = (i: MessageComponentInteraction) => {
+      if (opts.authorizedUserIds && !opts.authorizedUserIds.has(i.user.id)) {
+        i.reply({
+          content: "This bot is not available to you.",
+          flags: MessageFlags.Ephemeral,
+        }).catch(() => {});
+        return false;
+      }
+      return true;
+    };
+
+    const rejectPick = async (
+      interaction: { reply: (opts: object) => Promise<unknown> },
+      reason: string
+    ) => {
+      await interaction
+        .reply({
+          content: `❌ ${reason}`,
+          flags: MessageFlags.Ephemeral,
+        })
+        .catch(() => {});
+    };
+
+    let page = 0;
+    const deadline = Date.now() + timeoutMs;
     try {
-      const interaction = await msg.awaitMessageComponent({
-        filter: (i) => {
-          if (
-            opts.authorizedUserIds &&
-            !opts.authorizedUserIds.has(i.user.id)
-          ) {
-            i.reply({
-              content: "This bot is not available to you.",
-              flags: MessageFlags.Ephemeral,
-            }).catch(() => {});
-            return false;
-          }
-          return true;
-        },
-        time: timeoutMs,
-      });
+      while (true) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error("timeout");
+        const interaction = await msg.awaitMessageComponent({
+          filter,
+          time: remaining,
+        });
+        const cid = interaction.customId;
 
-      let pickedIdx: number;
-      if (interaction.componentType === ComponentType.Button) {
-        pickedIdx = Number.parseInt(
-          interaction.customId.split(":").pop() ?? "",
-          10
-        );
-      } else if (interaction.componentType === ComponentType.StringSelect) {
-        pickedIdx = Number.parseInt(interaction.values[0] ?? "", 10);
-      } else {
-        return null;
-      }
-
-      const chosen = choices[pickedIdx];
-      if (!chosen) {
-        if (opts.panel) {
-          const errEmbed = DiscordAdapter.buildEmbed(opts.panel).setColor(0xed4245);
-          errEmbed.setDescription("_Invalid choice._");
-          await msg.edit({ content: opts.prompt, embeds: [errEmbed], components: [] });
-        } else {
-          await msg.edit({ content: `${opts.prompt ?? ""}\n_Invalid choice._`, components: [] });
+        if (cid === `${customId}:prev`) {
+          page = Math.max(0, page - 1);
+          await interaction.update({
+            embeds: buildEmbeds(page),
+            components: buildComponents(page),
+          });
+          continue;
         }
-        return null;
-      }
+        if (cid === `${customId}:next`) {
+          page = Math.min(layout.pageCount - 1, page + 1);
+          await interaction.update({
+            embeds: buildEmbeds(page),
+            components: buildComponents(page),
+          });
+          continue;
+        }
+        if (cid === `${customId}:page`) {
+          await interaction.deferUpdate().catch(() => {});
+          continue;
+        }
 
-      if (opts.successPanel) {
-        const successPanel = opts.successPanel(
-          { value: chosen.value, label: chosen.label },
-          interaction.user.username
+        if (cid === `${customId}:custom` && opts.allowCustom) {
+          const modal = new ModalBuilder()
+            .setCustomId(`${customId}:modal`)
+            .setTitle((opts.allowCustom.modalTitle ?? "Custom value").slice(0, 45))
+            .addComponents(
+              new ActionRowBuilder<TextInputBuilder>().addComponents(
+                new TextInputBuilder()
+                  .setCustomId(`${customId}:input`)
+                  .setLabel((opts.allowCustom.inputLabel ?? "Value").slice(0, 45))
+                  .setStyle(TextInputStyle.Short)
+                  .setRequired(true)
+                  .setMaxLength(400)
+                  .setPlaceholder(
+                    (opts.allowCustom.placeholder ?? "Type a value").slice(0, 100)
+                  )
+              )
+            );
+          await interaction.showModal(modal);
+          const modalMs = Math.min(
+            Math.max(1_000, deadline - Date.now()),
+            5 * 60 * 1000
+          );
+          const submitted = await interaction
+            .awaitModalSubmit({
+              filter: (m) =>
+                m.customId === `${customId}:modal` &&
+                m.user.id === interaction.user.id,
+              time: modalMs,
+            })
+            .catch(() => null);
+          if (!submitted) continue;
+          const raw = submitted.fields
+            .getTextInputValue(`${customId}:input`)
+            .trim();
+          if (!raw) {
+            await rejectPick(submitted, "Value was empty — pick again or retype.");
+            continue;
+          }
+          const err = await opts.validate?.(raw);
+          if (err) {
+            await rejectPick(submitted, err);
+            continue;
+          }
+          await submitted.deferUpdate();
+          await msg.edit(
+            successPayload({ value: raw, label: raw }, submitted.user.username)
+          );
+          return { value: raw, userId: submitted.user.id };
+        }
+
+        let pickedIdx: number | undefined;
+        if (interaction.componentType === ComponentType.Button) {
+          const suffix = cid.split(":").pop() ?? "";
+          pickedIdx = Number.parseInt(suffix, 10);
+        } else if (interaction.componentType === ComponentType.StringSelect) {
+          pickedIdx = Number.parseInt(interaction.values[0] ?? "", 10);
+        }
+        if (pickedIdx === undefined || Number.isNaN(pickedIdx)) {
+          await interaction.deferUpdate().catch(() => {});
+          continue;
+        }
+        const chosen = choices[pickedIdx];
+        if (!chosen) {
+          if (opts.panel) {
+            const errEmbed = DiscordAdapter.buildEmbed(opts.panel).setColor(0xed4245);
+            errEmbed.setDescription("_Invalid choice._");
+            await interaction.update({
+              content: opts.prompt,
+              embeds: [errEmbed],
+              components: [],
+            });
+          } else {
+            await interaction.update({
+              content: `${opts.prompt ?? ""}\n_Invalid choice._`,
+              components: [],
+            });
+          }
+          return null;
+        }
+        const err = await opts.validate?.(chosen.value);
+        if (err) {
+          await rejectPick(interaction, err);
+          continue;
+        }
+        await interaction.update(
+          successPayload(
+            { value: chosen.value, label: chosen.label },
+            interaction.user.username
+          )
         );
-        const successEmbed = DiscordAdapter.buildEmbed(successPanel);
-        await msg.edit({
-          content: opts.prompt,
-          embeds: [successEmbed],
-          components: [],
-        });
-      } else if (opts.panel) {
-        const successEmbed = DiscordAdapter.buildEmbed(opts.panel).setColor(0x57f287);
-        const newDesc = opts.panel.description 
-          ? `${opts.panel.description}\n\n✅ **${chosen.label}** (${interaction.user.username})`
-          : `✅ **${chosen.label}** (${interaction.user.username})`;
-        successEmbed.setDescription(newDesc.slice(0, 4096));
-        await msg.edit({
-          content: opts.prompt,
-          embeds: [successEmbed],
-          components: [],
-        });
-      } else {
-        await msg.edit({
-          content: `${opts.prompt ?? ""}\n✅ **${chosen.label}** (${interaction.user.username})`,
-          components: [],
-        });
+        return { value: chosen.value, userId: interaction.user.id };
       }
-      try {
-        await interaction.deferUpdate();
-      } catch {
-        /* ignore */
-      }
-      return { value: chosen.value, userId: interaction.user.id };
     } catch {
       try {
         await msg.edit({
-          content: `${opts.prompt}\n⏱️ _Timed out._`,
+          content: `${opts.prompt ?? ""}\n⏱️ _Timed out._`,
           components: [],
         });
       } catch {

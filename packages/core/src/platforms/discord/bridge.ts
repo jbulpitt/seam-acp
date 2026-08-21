@@ -83,7 +83,10 @@ async function cmdAdd(
   const line = bootstrapLine(wsUrl, result.bridgeId, token);
   await i.reply({
     content:
-      `Paired **${result.bridgeId}**. Run this **once** on the host (token is not stored in plaintext and will not be shown again):\n\`\`\`\n${line}\n\`\`\``,
+      `Paired **${result.bridgeId}**. Token is shown once and is not stored in plaintext.\n\n` +
+      `Mac one-liner (installs git/node if needed, clones, starts pm2 — paste the connect line when asked):\n` +
+      `\`\`\`\ncurl -fsSL https://raw.githubusercontent.com/jbulpitt/seam-acp/main/scripts/install-macos-bridge.sh | bash\n\`\`\`\n` +
+      `Connect line:\n\`\`\`\n${line}\n\`\`\``,
     flags: MessageFlags.Ephemeral,
   });
 }
@@ -113,7 +116,9 @@ async function cmdRotate(
   const line = bootstrapLine(wsUrl, bridgeId, token);
   await i.reply({
     content:
-      `Rotated token for **${bridgeId}**. Re-bootstrap the host:\n\`\`\`\n${line}\n\`\`\``,
+      `Rotated token for **${bridgeId}**. Re-bootstrap the host. Mac (skip clone/build, paste this when asked):\n` +
+      `\`\`\`\ncurl -fsSL https://raw.githubusercontent.com/jbulpitt/seam-acp/main/scripts/install-macos-bridge.sh | bash -s -- --skip-deps\n\`\`\`\n` +
+      `Connect line:\n\`\`\`\n${line}\n\`\`\``,
     flags: MessageFlags.Ephemeral,
   });
 }

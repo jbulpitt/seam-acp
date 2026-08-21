@@ -226,8 +226,17 @@ async function main(): Promise<void> {
         staticModels: config.OLLAMA_CLOUD_MODELS ?? OLLAMA_CLOUD_STATIC_MODELS,
         configDir: path.join(process.env.HOME ?? "", ".claude-ollama-cloud"),
         threadAbbr: "🦙☁️",
-        // Open-weight models don't support Anthropic's effort mechanism.
-        effort: { mechanism: "none" as const, levels: [] },
+        // Ollama Cloud's Anthropic /v1/messages maps output_config.effort →
+        // native think levels (low|medium|high|max; xhigh→high). Empirically
+        // verified 2026-08-20 against kimi-k3:cloud: effort=low collapses
+        // thinking; omit-think on the native API matches think=max (Moonshot's
+        // K3 default). Claude Code Options.effort is the same field. Do NOT
+        // also send thinking.type=enabled — that shadows effort and forces
+        // boolean think=true.
+        effort: {
+          mechanism: "meta" as const,
+          levels: ["low", "medium", "high", "max"],
+        },
         extraEnv: {
           ANTHROPIC_BASE_URL: "https://ollama.com",
           // Ollama Cloud expects Authorization: Bearer — ANTHROPIC_AUTH_TOKEN

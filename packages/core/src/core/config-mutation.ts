@@ -356,6 +356,36 @@ export class ConfigMutationService {
    * Tier C, PresetsFileSchema round-trip, audit row. `"local"` / empty
    * omits the key (default). Changing location restarts the session.
    */
+  /**
+   * Slash/picker immediate write of thread-preset agent/model/effort/cwd.
+   * Channel presets win over session config at spawn (`planRuntimeSpawn`),
+   * so a wizard or `/seam config agent|model|effort` that only updates the
+   * session record is silently shadowed (locked school channels pin grok).
+   * A thread preset overrides the channel per-field, which is the intended
+   * per-thread overlay. Same discipline as `applyThreadLocation`.
+   */
+  applyThreadOverlay(opts: {
+    threadId: string;
+    parentRef?: string;
+    changes: ThreadPresetChanges;
+    actor: MutationActor;
+  }): { ok: true; message: string; auditId: string } | { ok: false; error: string } {
+    const built = this.buildThreadPresetProposalFor(
+      opts.threadId,
+      opts.parentRef,
+      opts.changes,
+      { requireTierC: false }
+    );
+    if (!built.ok) {
+      if (built.error.includes("No effective change")) {
+        return { ok: true, message: built.error, auditId: "" };
+      }
+      return built;
+    }
+    const applied = built.proposal.apply(opts.actor);
+    return { ok: true, message: applied.message, auditId: applied.auditId };
+  }
+
   applyThreadLocation(opts: {
     threadId: string;
     parentRef?: string;

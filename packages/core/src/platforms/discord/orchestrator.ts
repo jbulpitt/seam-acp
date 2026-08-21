@@ -5943,22 +5943,32 @@ export class Orchestrator {
     const parent: ChannelRef = { platform: PLATFORM, id: i.channelId };
     const thread = await this.adapter.createThread(parent, name);
 
-    // Auto-init: bind a session to the new thread and post the repo
-    // picker so the user doesn't have to /seam config init themselves.
+    // Auto-init: bind a session to the new thread and start the setup
+    // flow so the user doesn't have to /seam config init themselves.
+    // Reply BEFORE the pickers — Discord interaction tokens last 15 min
+    // and a full wizard (agent/cwd/model/effort) can outlive that.
     try {
-      this.router.ensureSessionRecord({
+      const record = this.router.ensureSessionRecord({
         platform: thread.platform,
         channelRef: thread.id,
         ...(thread.parentId ? { parentRef: thread.parentId } : {}),
         cwd: this.config.REPOS_ROOT,
       });
-      await this.sendRepoPicker(thread);
       await i.editReply(`Created thread <#${thread.id}> and initialized it.`);
+      if (this.config.NEW_THREAD_WIZARD === "full") {
+        await this.runSetupWizard(thread, record);
+      } else {
+        await this.sendRepoPicker(thread);
+      }
     } catch (err) {
       this.logger.warn({ err, threadId: thread.id }, "auto-init after /seam new failed");
-      await i.editReply(
-        `Created thread <#${thread.id}>. Run \`/seam config init\` there to begin.`
-      );
+      try {
+        await i.editReply(
+          `Created thread <#${thread.id}>. Run \`/seam config init\` there to begin.`
+        );
+      } catch {
+        /* already replied */
+      }
     }
   }
 
@@ -5971,39 +5981,39 @@ export class Orchestrator {
       });
       return;
     }
-    const requested = i.options.getString("path", true);
-    let resolved: string;
-    const location = resolveThreadLocation(this.config, channel.id);
-    try {
-      resolved = isLocalLocation(location)
-        ? resolveRepoPath(this.config.REPOS_ROOT, requested)
-        : requested.startsWith("/")
-          ? requested
-          : (await this.listHostWorkspacePaths(channel.id))?.find(
-              (p) => path.basename(p) === requested || p === requested
-            ) ?? requested;
-    } catch (err) {
+    const requested = i.options.getString("path");
+    if (!requested) {
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      await i.editReply("Posting repo picker…");
+      const picked = await this.promptRepoPath(channel, {
+        title: "🗂️ Choose a working repo",
+      });
+      if (!picked) {
+        await i.editReply(
+          "Timed out — run `/seam config repo` again, or pass `path:`."
+        );
+        return;
+      }
+      const applied = await this.applyPickedRepo(channel, picked);
+      if (!applied.ok) {
+        await i.editReply(`Could not set repo: ${applied.error}`);
+        return;
+      }
+      await i.editReply(
+        `Repo set to \`${this.repoDisplay(applied.record.repoPath ?? picked)}\`. Next message starts a fresh session.`
+      );
+      return;
+    }
+    const applied = await this.applyPickedRepo(channel, requested);
+    if (!applied.ok) {
       await i.reply({
-        content: `Invalid path: ${(err as Error).message}`,
+        content: `Invalid path: ${applied.error}`,
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
-    const record = this.router.ensureSessionRecord({
-      platform: channel.platform,
-      channelRef: channel.id,
-      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      cwd: this.config.REPOS_ROOT,
-    });
-    this.store.upsert({
-      ...record,
-      repoPath: resolved,
-      updatedUtc: new Date().toISOString(),
-    });
-    // Force a fresh runtime against the new cwd.
-    await this.router.invalidate(record.id);
     await i.reply({
-      content: `Repo set to \`${this.repoDisplay(resolved)}\`. Next message starts a fresh session.`,
+      content: `Repo set to \`${this.repoDisplay(applied.record.repoPath ?? requested)}\`. Next message starts a fresh session.`,
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -6066,7 +6076,7 @@ export class Orchestrator {
           title: "🧠 Choose a model",
           fields: [{ name: "Current", value: displayCurrent, inline: true }],
         },
-        choices: models.slice(0, 25).map((m) => ({
+        choices: models.map((m) => ({
           value: m.modelId,
           label: m.name ?? m.modelId,
           description: m.modelId,
@@ -6107,6 +6117,17 @@ export class Orchestrator {
     // clean rather than seeding the panel with mismatched numbers.
     cfg.lastContextUsage = undefined;
     this.persistConfig(record, cfg);
+    const overlay = this.configMutation.applyThreadOverlay({
+      threadId: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      changes: { model: id },
+      actor: interaction
+        ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
+        : { id: null, name: null },
+    });
+    if (!overlay.ok) {
+      this.logger.warn({ err: overlay.error, threadId: channel.id }, "thread model overlay write failed");
+    }
     let message: string;
     if (this.router.hasRuntime(record.id)) {
       try {
@@ -6242,6 +6263,18 @@ export class Orchestrator {
     const cfg = this.store.readConfig(record);
     cfg.reasoningEffort = level;
     this.persistConfig(record, cfg);
+    const overlay = this.configMutation.applyThreadOverlay({
+      threadId: record.channelRef,
+      ...(record.parentRef ? { parentRef: record.parentRef } : {}),
+      changes: { effort: level },
+      actor: { id: null, name: null },
+    });
+    if (!overlay.ok) {
+      this.logger.warn(
+        { err: overlay.error, threadId: record.channelRef },
+        "thread effort overlay write failed"
+      );
+    }
     // Effort is applied when the session is (re)built, per the agent's
     // mechanism: Claude via `_meta.claudeCode.options.effort` (set_config_option
     // for "effort" errors there); Copilot via the `reasoning_effort` config
@@ -6918,7 +6951,7 @@ export class Orchestrator {
         bridges: this.config.bridgePresets.values(),
         connected: this.bridgeHub?.connectedIds(),
         agentsByHost: this.bridgeHub?.installedAgentsByHost(),
-      }).slice(0, 25);
+      });
       // Show interactive picker — every agentId@location, host-emoji prefixed (D10).
       if (!this.adapter.sendChoicePicker || choices.length === 0) {
         const listing = choices
@@ -6976,7 +7009,10 @@ export class Orchestrator {
     }
     const currentLocation = resolveThreadLocation(this.config, channel.id);
     const nextLocation = parsed.explicit ? parsed.location : currentLocation;
-    const sameAgent = record.agentId === parsed.agentId;
+    // Spawn uses thread/channel preset over the session record. Compare the
+    // EFFECTIVE agent so a shadowed session write isn't treated as a no-op.
+    const effectiveAgent = this.router.describeConfig(record).agent.value;
+    const sameAgent = effectiveAgent === parsed.agentId;
     const sameLocation = currentLocation === nextLocation;
     if (sameAgent && sameLocation) {
       const msg = `Agent is already \`${formatAgentAtLocation(parsed.agentId, nextLocation)}\`.`;
@@ -7016,6 +7052,21 @@ export class Orchestrator {
       acpSessionId: "",
       updatedUtc: new Date().toISOString(),
     });
+    // Thread overlay beats a locked channel preset (school channels pin grok).
+    const overlay = this.configMutation.applyThreadOverlay({
+      threadId: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      changes: {
+        agent: parsed.agentId,
+        model: cfg.model ?? profile.defaultModel,
+      },
+      actor: interaction
+        ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
+        : { id: null, name: null },
+    });
+    if (!overlay.ok) {
+      this.logger.warn({ err: overlay.error, threadId: channel.id }, "thread agent overlay write failed");
+    }
     bindSessionLocation(this.bridgeHub, record.id, nextLocation);
     if (!sameAgent) {
       await this.updateThreadAbbreviation(channel, record.agentId, parsed.agentId);
@@ -8934,17 +8985,24 @@ export class Orchestrator {
       });
       return;
     }
-    this.router.ensureSessionRecord({
+    const record = this.router.ensureSessionRecord({
       platform: channel.platform,
       channelRef: channel.id,
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
     await i.reply({
-      content: "Session ready. Pick a repo to begin:",
+      content:
+        this.config.NEW_THREAD_WIZARD === "full"
+          ? "Session ready. Starting setup…"
+          : "Session ready. Pick a repo to begin:",
       flags: MessageFlags.Ephemeral,
     });
-    await this.sendRepoPicker(channel);
+    if (this.config.NEW_THREAD_WIZARD === "full") {
+      await this.runSetupWizard(channel, record);
+    } else {
+      await this.sendRepoPicker(channel);
+    }
   }
 
   private async cmdApprove(i: ChatInputCommandInteraction): Promise<void> {
@@ -9382,11 +9440,11 @@ export class Orchestrator {
       "`/seam config effort [level]` — reasoning effort",
       "`/seam config agent [id]` — get / set agent@location (resets session)",
       "`/seam config mode <id>` — set agent operational mode",
-      "`/seam config repo <path>` — set working repo (under REPOS_ROOT)",
+      "`/seam config repo [path]` — set working repo (picker if omitted; type a path to skip)",
       "`/seam config tools <allow|exclude> [list]` — tool filters",
       "`/seam config approve <always|ask|deny>` — permission policy",
       "`/seam config reset` — end this thread's ACP session; next message starts fresh",
-      "`/seam config init` — bind this thread + show repo picker",
+      "`/seam config init` — bind this thread + start setup (repo picker, or full wizard)",
       "`/seam config detach <detached|attached>` — keep this thread session-less (no bot replies; does not delete history)",
       "`/seam config show` — show session config JSON",
       "`/seam config set <json>` — replace session config",
@@ -9400,7 +9458,7 @@ export class Orchestrator {
       "`/seam info sessions` — list known sessions",
       "`/seam info repos` — list repos under REPOS_ROOT",
       "",
-      "**Groups** — `/seam schedule`, `/seam preset`, `/seam project`, `/seam upload`",
+      "**Groups** — `/seam schedule`, `/seam preset`, `/seam project`, `/seam upload`, `/seam bridge`",
       "",
       "Free-form messages in a thread are sent to the agent.",
     ];
@@ -9822,77 +9880,45 @@ export class Orchestrator {
 
   // --- repo picker ---
 
-  private async sendRepoPicker(channel: ChannelRef): Promise<void> {
-    const dirs = await this.listHostWorkspacePaths(channel.id);
+  /**
+   * Resolve user input to a repo path on the thread's bound host. Absolute
+   * paths pass through (caller still sandboxes with isWithinRoot on local);
+   * relative names join under REPOS_ROOT locally, or match a listed workspace
+   * by basename on a remote host.
+   */
+  private async resolveRequestedRepoPath(
+    channel: ChannelRef,
+    requested: string
+  ): Promise<string> {
     const location = resolveThreadLocation(this.config, channel.id);
-    if (!dirs) {
-      await this.adapter.sendMessage(
-        channel,
-        isLocalLocation(location)
-          ? `❌ REPOS_ROOT not found: \`${this.config.REPOS_ROOT}\``
-          : `❌ Host \`${location}\` did not report workspaces.`
-      );
-      return;
+    if (isLocalLocation(location)) {
+      return resolveRepoPath(this.config.REPOS_ROOT, requested);
     }
-    if (dirs.length === 0) {
-      await this.adapter.sendMessage(
-        channel,
-        `⚠️ No repos on \`${location}\`. Use \`/seam repo <path>\`.`
-      );
-      return;
+    if (requested.startsWith("/")) return requested;
+    return (
+      (await this.listHostWorkspacePaths(channel.id))?.find(
+        (p) => path.basename(p) === requested || p === requested
+      ) ?? requested
+    );
+  }
+
+  private async applyPickedRepo(
+    channel: ChannelRef,
+    requested: string
+  ): Promise<{ ok: true; record: SessionRecord } | { ok: false; error: string }> {
+    let resolved: string;
+    try {
+      resolved = await this.resolveRequestedRepoPath(channel, requested);
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
     }
-
-    if (!this.adapter.sendChoicePicker) {
-      // Adapter without interactive picker: list paths and let the user
-      // pick via /seam repo <path>.
-      const lines = dirs
-        .slice(0, 20)
-        .map((p) => `• ${path.basename(p)}`)
-        .join("\n");
-      await this.adapter.sendMessage(
-        channel,
-        `🗂️ **Available repos**\n${this.renderer.codeBlock(lines)}\nUse \`/seam repo <name>\`.`
-      );
-      return;
+    const location = resolveThreadLocation(this.config, channel.id);
+    if (isLocalLocation(location) && !isWithinRoot(resolved, this.config.REPOS_ROOT)) {
+      return {
+        ok: false,
+        error: `Repo \`${resolved}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`,
+      };
     }
-
-    // Discord allows up to 25 select options; cap and warn if needed.
-    const top = dirs.slice(0, 25);
-    const overflow = dirs.length - top.length;
-
-    const result = await this.adapter.sendChoicePicker(channel, {
-      panel: {
-        color: 0x5865f2,
-        title: "🗂️ Select a project to begin",
-        description: overflow > 0 ? `_(Showing first 25 of ${dirs.length} projects. Use \`/seam repo <path>\` to access the rest.)_` : undefined,
-        fields: [],
-      },
-      choices: top.map((p) => ({
-        value: p,
-        label: path.basename(p),
-      })),
-      authorizedUserIds: mayConfigureUserIds(this.config),
-      successPanel: (pickedChoice, username) => ({
-        color: 0x57f287,
-        title: "✅ Project selected",
-        fields: [
-          { name: "Project", value: `\`${pickedChoice.label}\``, inline: true },
-        ],
-        footer: `Started by ${username}`
-      }),
-    });
-
-    if (!result) return;
-
-    const picked = result.value;
-    if (isLocalLocation(location) && !isWithinRoot(picked, this.config.REPOS_ROOT)) {
-      await this.adapter.sendMessage(
-        channel,
-        `🛡️ Repo \`${picked}\` is outside REPOS_ROOT.`
-      );
-      return;
-    }
-
     const record = this.router.ensureSessionRecord({
       platform: channel.platform,
       channelRef: channel.id,
@@ -9901,27 +9927,110 @@ export class Orchestrator {
     });
     this.store.upsert({
       ...record,
-      repoPath: picked,
+      repoPath: resolved,
       updatedUtc: new Date().toISOString(),
     });
     await this.router.invalidate(record.id);
+    return { ok: true, record: this.store.get(record.id) ?? { ...record, repoPath: resolved } };
+  }
 
-    if (this.config.NEW_THREAD_WIZARD === "full") {
+  /**
+   * Interactive CWD picker for the thread's bound host. Paginates past
+   * Discord's 25-option select cap and offers a "Type a path…" modal.
+   * Returns the picked (or typed) path, or null on timeout / missing root.
+   */
+  private async promptRepoPath(
+    channel: ChannelRef,
+    opts?: { title?: string }
+  ): Promise<string | null> {
+    const dirs = await this.listHostWorkspacePaths(channel.id);
+    const location = resolveThreadLocation(this.config, channel.id);
+    if (dirs === undefined) {
       await this.adapter.sendMessage(
         channel,
-        `📌 Repo set to \`${this.repoDisplay(picked)}\`.`
+        isLocalLocation(location)
+          ? `❌ REPOS_ROOT not found: \`${this.config.REPOS_ROOT}\``
+          : `❌ Host \`${location}\` did not report workspaces.`
       );
-      // Re-read the record after repo was set.
-      const freshRecord = this.store.get(record.id) ?? record;
-      await this.runSetupWizard(channel, freshRecord);
-    } else {
-      const freshRecord = this.store.get(record.id) ?? record;
-      await this.renameThreadForSetup(channel, freshRecord);
-      await this.adapter.sendMessage(
-        channel,
-        `📌 Repo set to \`${this.repoDisplay(picked)}\`. Send a message to begin.`
-      );
+      return null;
     }
+
+    if (!this.adapter.sendChoicePicker) {
+      const lines = dirs
+        .slice(0, 20)
+        .map((p) => `• ${path.basename(p)}`)
+        .join("\n");
+      await this.adapter.sendMessage(
+        channel,
+        `🗂️ **Available repos** on \`${location}\`\n${this.renderer.codeBlock(lines)}\nUse \`/seam config repo path:<name>\`.`
+      );
+      return null;
+    }
+
+    const result = await this.adapter.sendChoicePicker(channel, {
+      panel: {
+        color: 0x5865f2,
+        title: opts?.title ?? "🗂️ Select a project",
+        description:
+          dirs.length === 0
+            ? `No listed folders on \`${location}\`. Type a custom path.`
+            : `Host: \`${location}\`. ${dirs.length} folder${dirs.length === 1 ? "" : "s"}.`,
+        fields: [],
+      },
+      choices: dirs.map((p) => ({
+        value: p,
+        label: path.basename(p),
+        description: p,
+      })),
+      authorizedUserIds: mayConfigureUserIds(this.config),
+      allowCustom: {
+        buttonLabel: "Type a path…",
+        modalTitle: "Custom repo path",
+        inputLabel: "Path",
+        placeholder: "Folder name or absolute path",
+      },
+      validate: async (value) => {
+        try {
+          const resolved = await this.resolveRequestedRepoPath(channel, value);
+          if (
+            isLocalLocation(location) &&
+            !isWithinRoot(resolved, this.config.REPOS_ROOT)
+          ) {
+            return `Path is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`;
+          }
+          return null;
+        } catch (err) {
+          return (err as Error).message;
+        }
+      },
+      successPanel: (pickedChoice, username) => ({
+        color: 0x57f287,
+        title: "✅ Project selected",
+        fields: [
+          { name: "Project", value: `\`${pickedChoice.label}\``, inline: true },
+        ],
+        footer: `Selected by ${username}`,
+      }),
+    });
+
+    return result?.value ?? null;
+  }
+
+  private async sendRepoPicker(channel: ChannelRef): Promise<void> {
+    const picked = await this.promptRepoPath(channel, {
+      title: "🗂️ Select a project to begin",
+    });
+    if (!picked) return;
+    const applied = await this.applyPickedRepo(channel, picked);
+    if (!applied.ok) {
+      await this.adapter.sendMessage(channel, `🛡️ ${applied.error}`);
+      return;
+    }
+    await this.renameThreadForSetup(channel, applied.record);
+    await this.adapter.sendMessage(
+      channel,
+      `📌 Repo set to \`${this.repoDisplay(applied.record.repoPath ?? picked)}\`. Send a message to begin.`
+    );
   }
 
   /**
@@ -9959,12 +10068,10 @@ export class Orchestrator {
   }
 
   /**
-   * Post-repo-selection setup wizard: presents an agent picker followed by a
-   * model picker. Called from `sendRepoPicker` when `NEW_THREAD_WIZARD=full`.
-   *
-   * Either picker can be skipped (only one option, user timeout, adapter
-   * lacks `sendChoicePicker`). A runtime start failure for the model picker
-   * is handled gracefully with a fallback notice.
+   * Full new-thread wizard: Agent → CWD → Model → Effort (if the agent
+   * exposes settable levels). Agent is first so the CWD list is the bound
+   * host's workspaces. Each step can be skipped (one option, timeout, or
+   * no picker); a runtime start failure for the model picker is a notice.
    */
   private async runSetupWizard(
     channel: ChannelRef,
@@ -9972,20 +10079,22 @@ export class Orchestrator {
   ): Promise<void> {
     let currentRecord = record;
 
-    // Step 1: Agent picker (skip when there's only one profile).
+    // Step 1: Agent @ host (skip when there's only one choice). Timeout
+    // keeps the default agent so CWD still lists that host.
     const profiles = this.router.listProfiles();
-    if (profiles.length > 1 && this.adapter.sendChoicePicker) {
+    const agentChoices = agentLocationPickerChoices(profiles, {
+      bridges: this.config.bridgePresets.values(),
+      connected: this.bridgeHub?.connectedIds(),
+      agentsByHost: this.bridgeHub?.installedAgentsByHost(),
+    });
+    if (agentChoices.length > 1 && this.adapter.sendChoicePicker) {
       const picked = await this.adapter.sendChoicePicker(channel, {
         panel: {
           color: 0x5865f2,
           title: "🤖 Choose an agent",
           fields: [{ name: "Default", value: `\`${currentRecord.agentId}\``, inline: true }],
         },
-        choices: agentLocationPickerChoices(profiles, {
-          bridges: this.config.bridgePresets.values(),
-          connected: this.bridgeHub?.connectedIds(),
-          agentsByHost: this.bridgeHub?.installedAgentsByHost(),
-        }).slice(0, 25),
+        choices: agentChoices,
         authorizedUserIds: mayConfigureUserIds(this.config),
         successPanel: (pickedChoice, username) => ({
           color: 0x57f287,
@@ -9997,39 +10106,48 @@ export class Orchestrator {
           footer: `Changed by ${username}`
         }),
       });
-      if (!picked) {
-        // User timed out / cancelled — rename with default agent and end wizard.
-        await this.renameThreadForSetup(channel, currentRecord);
-        await this.adapter.sendMessage(
-          channel,
-          `✅ Setup complete. Send a message to begin.`
-        );
-        return;
-      }
-      if (picked.value !== currentAgentAtLocation(currentRecord.agentId, this.config, channel.id)) {
+      if (
+        picked &&
+        picked.value !==
+          currentAgentAtLocation(currentRecord.agentId, this.config, channel.id)
+      ) {
         await this.applyAgentChange(channel, currentRecord, picked.value);
-        // Re-read: applyAgentChange updated agent + model in the DB.
         currentRecord = this.store.get(currentRecord.id) ?? currentRecord;
       }
     }
 
-    // Rename the thread now that we know the final agent.
+    // Step 2: CWD on the (now bound) host.
+    const repoPicked = await this.promptRepoPath(channel, {
+      title: "🗂️ Select a working directory",
+    });
+    if (repoPicked) {
+      const applied = await this.applyPickedRepo(channel, repoPicked);
+      if (applied.ok) {
+        currentRecord = applied.record;
+      } else {
+        await this.adapter.sendMessage(channel, `🛡️ ${applied.error}`);
+      }
+    }
+
     await this.renameThreadForSetup(channel, currentRecord);
 
-    // Step 2: Model picker
+    // Step 3: Model
     if (this.adapter.sendChoicePicker) {
       try {
         let models: ReadonlyArray<{ modelId: string; name?: string }> = [];
         const profile = this.router.getProfile(currentRecord.agentId);
-        
+
         if (profile?.staticModels && profile.staticModels.length > 0) {
           models = profile.staticModels;
         } else {
           const rt = await this.router.getOrStartRuntime(currentRecord);
           models = rt.getSessionInfo()?.availableModels ?? [];
         }
-        
-        this.logger.info({ agentId: currentRecord.agentId, modelsLength: models.length }, "Setup wizard checking models for picker");
+
+        this.logger.info(
+          { agentId: currentRecord.agentId, modelsLength: models.length },
+          "Setup wizard checking models for picker"
+        );
 
         if (models.length > 1) {
           const cfg = this.store.readConfig(currentRecord);
@@ -10040,7 +10158,7 @@ export class Orchestrator {
               title: "🧠 Choose a model",
               fields: [{ name: "Default", value: `\`${current}\``, inline: true }],
             },
-            choices: models.slice(0, 25).map((m) => ({
+            choices: models.map((m) => ({
               value: m.modelId,
               label: m.name ?? m.modelId,
               description:
@@ -10070,6 +10188,40 @@ export class Orchestrator {
           channel,
           `_Could not list models: ${(err as Error).message}. Use \`/seam config model\` later._`
         );
+      }
+    }
+
+    // Step 4: Effort, only when this agent exposes settable levels.
+    const effortProfile = this.router.getProfile(currentRecord.agentId);
+    const supported = effortProfile?.effort?.levels ?? [];
+    if (supported.length > 0 && this.adapter.sendChoicePicker) {
+      const cfg = this.store.readConfig(currentRecord);
+      const current = cfg.reasoningEffort ?? "default";
+      const effortChoices = EFFORT_CHOICES.filter((c) =>
+        supported.includes(c.value)
+      );
+      if (effortChoices.length > 0) {
+        const picked = await this.adapter.sendChoicePicker(channel, {
+          panel: {
+            color: 0x5865f2,
+            title: "⚡ Choose reasoning effort",
+            fields: [{ name: "Default", value: `\`${current}\``, inline: true }],
+          },
+          choices: effortChoices,
+          authorizedUserIds: mayConfigureUserIds(this.config),
+          successPanel: (pickedChoice, username) => ({
+            color: 0x57f287,
+            title: "✅ Effort changed",
+            fields: [
+              { name: "Default", value: `\`${current}\``, inline: true },
+              { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
+            ],
+            footer: `Changed by ${username} — applies on the next message`,
+          }),
+        });
+        if (picked && picked.value !== current) {
+          await this.applyEffortChange(currentRecord, picked.value);
+        }
       }
     }
 

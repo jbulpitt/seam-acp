@@ -96,6 +96,7 @@ function makeOrch(store: SessionStore, dataDir: string): Orchestrator {
   const router = {
     listProfiles: () => [],
     describeConfig: () => ({}),
+    reuseMcpServers: () => [],
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) =>
       record({ id: `discord:${channelRef}`, channelRef }),
     getProfile: () => ({

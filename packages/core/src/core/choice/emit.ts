@@ -13,6 +13,7 @@ import type { SessionRecord } from "../types.js";
 import {
   formatDestination,
   resolveOptionTarget,
+  wrapChoiceMultiPrompt,
   wrapChoicePrompt,
   type ChoiceCard,
   type ChoiceTarget,
@@ -93,6 +94,74 @@ export function planChoiceDispatch(input: EmitChoiceInput): EmitChoiceResult {
 
 export async function emitChoice(input: EmitChoiceInput): Promise<EmitChoiceResult> {
   const planned = planChoiceDispatch(input);
+  if (!planned.ok) return planned;
+  await input.enqueue(planned.spec);
+  return planned;
+}
+
+export interface EmitChoiceMultiInput {
+  card: ChoiceCard;
+  optionIndices: number[];
+  actor: ChoiceActor;
+  enqueue: (spec: DispatchSpec) => Promise<void>;
+  authoringSession: SessionRecord | null;
+  destLive?: "ok" | "gone" | "archived";
+  defaultModel?: string;
+  source?: "discord" | "http";
+  wrapper?: string;
+  untrustedStudentId?: string | null;
+}
+
+/** Combined multi-select emit (#94). Destination is the card defaultTarget. */
+export function planChoiceMultiDispatch(input: EmitChoiceMultiInput): EmitChoiceResult {
+  if (input.optionIndices.length === 0) {
+    return { ok: false, error: "No options selected.", consume: false };
+  }
+  const options = input.optionIndices.map((i) => input.card.options[i]);
+  if (options.some((o) => !o)) {
+    return { ok: false, error: "Unknown option.", consume: false };
+  }
+  const target = input.card.defaultTarget ?? { type: "live" };
+  const destCheck = checkDestination(target, input.destLive);
+  if (!destCheck.ok) return destCheck;
+
+  const destChannel = destinationChannel(input.card, target);
+  const session = target.type === "isolated" ? "isolated" : "live";
+  const destination = formatDestination(target);
+  const prompt = wrapChoiceMultiPrompt({
+    cardId: input.card.id,
+    optionLabels: options.map((o) => o!.label),
+    clickerName: input.actor.name || "unknown",
+    clickerId: input.actor.id,
+    authoringThread: input.card.channelRef,
+    destination,
+    payloads: options.map((o) => o!.payload ?? ""),
+    source: input.source ?? "discord",
+    ...(input.wrapper ? { wrapper: input.wrapper } : {}),
+    ...(input.untrustedStudentId ? { untrustedStudentId: input.untrustedStudentId } : {}),
+  });
+
+  const spec: DispatchSpec = {
+    id: randomUUID(),
+    target: destChannel,
+    prompt,
+    session,
+    kind: "choice",
+    correlationId: input.card.id,
+    createdUtc: new Date().toISOString(),
+  };
+  if (session === "isolated" && input.authoringSession) {
+    const cfg = safeJson(input.authoringSession.configJson);
+    if (cfg.model) spec.model = cfg.model;
+    else if (input.defaultModel) spec.model = input.defaultModel;
+    if (cfg.reasoningEffort) spec.effort = cfg.reasoningEffort;
+    if (input.authoringSession.repoPath) spec.cwd = input.authoringSession.repoPath;
+  }
+  return { ok: true, dispatchId: spec.id, spec };
+}
+
+export async function emitChoiceMulti(input: EmitChoiceMultiInput): Promise<EmitChoiceResult> {
+  const planned = planChoiceMultiDispatch(input);
   if (!planned.ok) return planned;
   await input.enqueue(planned.spec);
   return planned;

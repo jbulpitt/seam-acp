@@ -74,6 +74,50 @@ If you are not sure, leave `maxClicks` off.
 
 ---
 
+## Multi-select (several options, one Confirm)
+
+Set `select: { min?, max? }` to publish a **dropdown + Confirm** instead of
+one-click buttons. The user ticks several options, clicks Confirm, and **one
+combined prompt** is emitted. The card then shows `Selected: A, B, C` and the
+components go away.
+
+```json
+{
+  "title": "Which topics should we cover?",
+  "select": { "min": 1, "max": 3 },
+  "options": [
+    { "label": "Loops", "kind": "prompt", "payload": "Cover loops next." },
+    { "label": "Recursion", "kind": "prompt", "payload": "Cover recursion next." },
+    { "label": "Testing", "kind": "prompt", "payload": "Cover testing next." }
+  ]
+}
+```
+
+- Omitted `min` is **1**. Omitted `max` is `options.length`. Both clamp to
+  `[1, min(options.length, 25)]`. `min` must be ≤ `max`.
+- **All options must be `kind:"prompt"`.** `select` + `custom` is rejected.
+- **`select` + `maxClicks>1` is unsupported (v1)** and is rejected. Multi-select
+  is still one person, one Confirm (default `maxClicks` 1).
+- Destination is the card `defaultTarget`. Per-option `target` does not apply
+  to a combined pick.
+- Pending ticks are in-memory (reset on restart). The card itself survives
+  restart as a multi-select.
+
+Emitted body:
+
+```
+<seam-choice>
+Card <id> options "Loops, Recursion" clicked by <name> (id <snowflake>).
+Authoring thread: <channelRef>. Destination: live|isolated|thread <id>.
+</seam-choice>
+
+Selected: Loops, Recursion
+Cover loops next.
+Cover recursion next.
+```
+
+---
+
 ## JSON (full)
 
 ```json
@@ -96,6 +140,8 @@ If you are not sure, leave `maxClicks` off.
 - `title` required, ≤256. `options` 1–25 (≤24 if any option is `custom`).
 - `kind: "prompt"` requires non-empty `payload`. `kind: "custom"` ignores payload.
 - `target` omitted → `defaultTarget` → `{ "type": "live" }`.
+- `select: { min?, max? }` ⇒ multi-select dropdown + Confirm (see above). Cannot
+  combine with `custom` or `maxClicks>1` (v1).
 
 ---
 

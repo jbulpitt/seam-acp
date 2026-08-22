@@ -266,6 +266,7 @@ export class SessionStore {
     this.migrateParkedKind();
     this.db.exec(CHOICE_CARDS_SCHEMA);
     this.migrateChoiceIngest();
+    this.migrateChoiceSelect();
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -306,6 +307,28 @@ export class SessionStore {
       /* ignore */
     }
     this.db.exec(CHOICE_RESULTS_SCHEMA);
+  }
+
+  /**
+   * Additive multi-select bounds (#94). Fresh DBs get the columns from
+   * CREATE TABLE; existing DBs hit this PRAGMA-guarded ALTER. Idempotent.
+   */
+  private migrateChoiceSelect(): void {
+    const names = new Set(
+      this.db
+        .prepare<[], { name: string }>("PRAGMA table_info(choice_cards)")
+        .all()
+        .map((c) => c.name)
+    );
+    if (!names.has("select_min")) {
+      this.db.exec("ALTER TABLE choice_cards ADD COLUMN select_min INTEGER");
+    }
+    if (!names.has("select_max")) {
+      this.db.exec("ALTER TABLE choice_cards ADD COLUMN select_max INTEGER");
+    }
+    if (!names.has("last_option_indices_json")) {
+      this.db.exec("ALTER TABLE choice_cards ADD COLUMN last_option_indices_json TEXT");
+    }
   }
 
   /**
@@ -1454,14 +1477,16 @@ export class SessionStore {
             click_count, status, last_clicker_id, last_clicker_name,
             created_by, created_utc,
             ingest_token_hash, ingest_option_index, result_schema_json,
-            ingest_wrapper, ingest_cors_json)
+            ingest_wrapper, ingest_cors_json,
+            select_min, select_max, last_option_indices_json)
          VALUES
            (@id, @platform, @channelRef, @parentRef, @messageId, @title, @body,
             @maxClicks, @targetUserId, @defaultTargetJson, @optionsJson,
             @clickCount, @status, @lastClickerId, @lastClickerName,
             @createdBy, @createdUtc,
             @ingestTokenHash, @ingestOptionIndex, @resultSchemaJson,
-            @ingestWrapper, @ingestCorsJson)`
+            @ingestWrapper, @ingestCorsJson,
+            @selectMin, @selectMax, @lastOptionIndicesJson)`
       )
       .run({
         id: c.id,
@@ -1486,6 +1511,10 @@ export class SessionStore {
         resultSchemaJson: c.resultSchema == null ? null : JSON.stringify(c.resultSchema),
         ingestWrapper: c.ingestWrapper,
         ingestCorsJson: c.ingestCors == null ? null : JSON.stringify(c.ingestCors),
+        selectMin: c.select?.min ?? null,
+        selectMax: c.select?.max ?? null,
+        lastOptionIndicesJson:
+          c.lastOptionIndices == null ? null : JSON.stringify(c.lastOptionIndices),
       });
   }
 
@@ -1518,6 +1547,8 @@ export class SessionStore {
     userId: string;
     userName: string;
     optionIndex: number;
+    /** Full multi-select pick list (#94). Single-select omits this. */
+    optionIndices?: number[];
   }):
     | { ok: true; card: ChoiceCard }
     | { ok: false; reason: "missing" | "not-open" | "exhausted" | "already-clicked" } {
@@ -1550,10 +1581,18 @@ export class SessionStore {
         .prepare(
           `UPDATE choice_cards
              SET click_count = ?, status = ?, last_clicker_id = ?, last_clicker_name = ?,
-                 last_option_index = ?
+                 last_option_index = ?, last_option_indices_json = ?
            WHERE id = ?`
         )
-        .run(nextCount, status, opts.userId, opts.userName, opts.optionIndex, opts.choiceId);
+        .run(
+          nextCount,
+          status,
+          opts.userId,
+          opts.userName,
+          opts.optionIndex,
+          opts.optionIndices == null ? null : JSON.stringify(opts.optionIndices),
+          opts.choiceId
+        );
       const updated = this.db
         .prepare<[string], ChoiceRow>("SELECT * FROM choice_cards WHERE id = ?")
         .get(opts.choiceId)!;
@@ -2041,7 +2080,10 @@ CREATE TABLE IF NOT EXISTS choice_cards (
   ingest_option_index  INTEGER,
   result_schema_json   TEXT,
   ingest_wrapper       TEXT,
-  ingest_cors_json     TEXT
+  ingest_cors_json     TEXT,
+  select_min           INTEGER,
+  select_max           INTEGER,
+  last_option_indices_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_choice_cards_channel ON choice_cards(platform, channel_ref);
 CREATE INDEX IF NOT EXISTS idx_choice_cards_status ON choice_cards(status);
@@ -2093,6 +2135,9 @@ interface ChoiceRow {
   result_schema_json?: string | null;
   ingest_wrapper?: string | null;
   ingest_cors_json?: string | null;
+  select_min?: number | null;
+  select_max?: number | null;
+  last_option_indices_json?: string | null;
 }
 
 interface ChoiceResultDbRow {
@@ -2123,6 +2168,13 @@ const mapChoice = (r: ChoiceRow): ChoiceCard => ({
   lastClickerId: r.last_clicker_id,
   lastClickerName: r.last_clicker_name,
   lastOptionIndex: r.last_option_index ?? null,
+  lastOptionIndices: r.last_option_indices_json
+    ? parseJsonSafe<number[]>(r.last_option_indices_json, [])
+    : null,
+  select:
+    r.select_min != null && r.select_max != null
+      ? { min: r.select_min, max: r.select_max }
+      : undefined,
   createdBy: r.created_by,
   createdUtc: r.created_utc,
   ingestTokenHash: r.ingest_token_hash ?? null,

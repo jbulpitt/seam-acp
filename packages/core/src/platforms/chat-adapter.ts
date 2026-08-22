@@ -234,6 +234,10 @@ export interface ChoiceCardPost {
   disabled?: boolean;
   /** Single-user after pick / cancel: drop action rows instead of disabled buttons. */
   hideButtons?: boolean;
+  /** Present ⇒ multi-select dropdown + Confirm (#94), not the button layout. */
+  select?: { min: number; max: number };
+  /** Currently-picked option indices (in-memory; re-render sets default:true). */
+  pendingSelection?: ReadonlyArray<number>;
 }
 
 /** Persistent choice-card interaction (#91). */

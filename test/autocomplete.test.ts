@@ -197,6 +197,11 @@ describe("classifyDiscordInteraction — autocomplete is a parallel branch", () 
         flags({ modal: true, customId: `${CHOICE_CUSTOM_ID_PREFIX}abc:m:0` })
       )
     ).toBe("choice");
+    expect(
+      classifyDiscordInteraction(
+        flags({ button: true, customId: `${CHOICE_CUSTOM_ID_PREFIX}abc:c` })
+      )
+    ).toBe("choice");
   });
 
   it("autocomplete wins if a malformed payload claimed both (must not fall into slash)", () => {

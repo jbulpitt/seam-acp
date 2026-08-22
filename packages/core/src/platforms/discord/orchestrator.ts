@@ -241,23 +241,29 @@ import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG
 import {
   CHOICE_AUTHORING_RULE,
   CHOICE_CUSTOM_TEXT_MAX,
+  choiceCardHideButtons,
   choiceClickRefusal,
+  choiceConfirmNudge,
+  choicePendingKey,
+  choiceSelectionInRange,
+  clampChoiceSelect,
   defaultMaxClicks,
   isChoiceAuthoringRefused,
+  isChoiceMultiSelect,
   makeChoiceModalId,
   newChoiceId,
   normalizeIngress,
   parseChoiceCustomId,
   parseChoiceFence,
+  parseChoiceSelectValues,
   parseChoiceSpec,
-  choiceCardHideButtons,
   renderChoicePanel,
   resolveIngestOptionIndex,
   resolveOptionTarget,
   type ChoiceCard,
   type ChoiceSpec,
 } from "../../core/choice/types.js";
-import { emitChoice, planChoiceDispatch } from "../../core/choice/emit.js";
+import { emitChoice, emitChoiceMulti, planChoiceDispatch, planChoiceMultiDispatch } from "../../core/choice/emit.js";
 import { ChoiceResultHub, parseResultFence, extractSeamResultFromText } from "../../core/choice/result.js";
 import { mintBridgeToken, hashBridgeToken } from "../../core/bridge-pairing.js";
 import { renderMathPng } from "../../core/math-render.js";
@@ -404,6 +410,9 @@ export class Orchestrator {
    *  Always the message author id, independent of SPEAKER_IDENTITY_ENABLED.
    *  Unset for injected turns (dispatch / isolated / wake / watch). */
   private readonly currentAuthorIds = new Map<string, string>();
+  /** In-memory pending multi-select picks (#94). Keyed by `${choiceId}:${userId}`
+   *  → option indices. Reset on process restart is fine. */
+  private readonly choicePending = new Map<string, number[]>();
   /** Set by index.ts after construction so command-layer cancel can finalize
    *  running/pending specs without going through dispose(). */
   private dispatchWatcher?: DispatchWatcher;
@@ -11319,6 +11328,7 @@ export class Orchestrator {
       resultSchema: ingress?.resultSchema ?? null,
       ingestWrapper: ingress?.wrapper?.trim() ? ingress.wrapper : null,
       ingestCors: ingress?.corsOrigins ?? null,
+      ...(spec.select ? { select: clampChoiceSelect(spec.select, spec.options.length) } : {}),
     };
     this.store.insertChoiceCard(card);
     const channel: ChannelRef = {
@@ -11331,6 +11341,7 @@ export class Orchestrator {
         panel: renderChoicePanel(card),
         choiceId: card.id,
         options: card.options.map((o) => ({ label: o.label, kind: o.kind })),
+        ...(card.select ? { select: card.select } : {}),
       });
       this.store.setChoiceMessageId(card.id, ref.id);
       const ingestUrl = ingestToken && this.ingestUrl ? this.ingestUrl() : undefined;
@@ -11407,7 +11418,10 @@ export class Orchestrator {
     }
   }
 
-  private async refreshChoiceCard(card: ChoiceCard): Promise<void> {
+  private async refreshChoiceCard(
+    card: ChoiceCard,
+    opts?: { pendingSelection?: number[] }
+  ): Promise<void> {
     if (!card.messageId || !this.adapter.editChoiceCard) return;
     try {
       await this.adapter.editChoiceCard(
@@ -11418,6 +11432,8 @@ export class Orchestrator {
           options: card.options.map((o) => ({ label: o.label, kind: o.kind })),
           disabled: card.status !== "open",
           hideButtons: choiceCardHideButtons(card),
+          ...(card.select ? { select: card.select } : {}),
+          ...(opts?.pendingSelection ? { pendingSelection: opts.pendingSelection } : {}),
         }
       );
     } catch (err) {
@@ -11444,6 +11460,11 @@ export class Orchestrator {
     }
     if (auth === "closed") {
       await evt.replyEphemeral("This card is closed.");
+      return;
+    }
+
+    if (isChoiceMultiSelect(card) && card.select) {
+      await this.handleMultiSelectChoice(evt, card, parsed);
       return;
     }
 
@@ -11531,6 +11552,95 @@ export class Orchestrator {
     await this.refreshChoiceCard(fresh);
   }
 
+  /**
+   * Multi-select (#94): SELECT stores a pending pick (no emit) and re-renders
+   * the same message; CONFIRM emits one combined prompt and freezes.
+   */
+  private async handleMultiSelectChoice(
+    evt: ChoiceInteraction,
+    card: ChoiceCard,
+    parsed: { choiceId: string; optionIndex?: number; kind: "option" | "select" | "modal" | "confirm" }
+  ): Promise<void> {
+    const select = card.select!;
+    if (parsed.kind === "select") {
+      const indices = parseChoiceSelectValues(evt.values, card.options.length);
+      this.choicePending.set(choicePendingKey(card.id, evt.userId), indices);
+      await evt.deferUpdate();
+      await this.refreshChoiceCard(card, { pendingSelection: indices });
+      return;
+    }
+    if (parsed.kind !== "confirm") {
+      await evt.replyEphemeral("Unknown option.");
+      return;
+    }
+    const indices = this.choicePending.get(choicePendingKey(card.id, evt.userId)) ?? [];
+    if (!choiceSelectionInRange(indices.length, select)) {
+      await evt.replyEphemeral(choiceConfirmNudge(select));
+      return;
+    }
+    const destLive = await this.choiceTargetLive(card, card.defaultTarget ?? { type: "live" });
+    const planned = planChoiceMultiDispatch({
+      card,
+      optionIndices: indices,
+      actor: { id: evt.userId, name: evt.userName },
+      enqueue: async () => {},
+      authoringSession: this.store.getByChannel(PLATFORM, card.channelRef),
+      destLive,
+      defaultModel: this.config.DEFAULT_MODEL,
+    });
+    if (!planned.ok) {
+      await evt.replyEphemeral(planned.error);
+      return;
+    }
+    const target = card.defaultTarget ?? { type: "live" };
+    if (target.type === "thread" && target.threadId) {
+      const dest = this.store.getByChannel(PLATFORM, target.threadId);
+      if (!dest) {
+        await evt.replyEphemeral("Unknown destination thread.");
+        return;
+      }
+    }
+    await evt.deferUpdate();
+    const claimed = this.store.claimChoiceClick({
+      choiceId: card.id,
+      userId: evt.userId,
+      userName: evt.userName,
+      optionIndex: indices[0]!,
+      optionIndices: indices,
+    });
+    if (!claimed.ok) {
+      const msg =
+        claimed.reason === "already-clicked"
+          ? "You already used this card."
+          : claimed.reason === "exhausted"
+            ? "This card is already taken."
+            : "This card is closed.";
+      await evt.followUpEphemeral(msg).catch(() => {});
+      return;
+    }
+    this.choicePending.delete(choicePendingKey(card.id, evt.userId));
+    try {
+      const emitted = await emitChoiceMulti({
+        card: claimed.card,
+        optionIndices: indices,
+        actor: { id: evt.userId, name: evt.userName },
+        enqueue: (spec) => enqueueDispatchSpec(this.config.DATA_DIR, spec),
+        authoringSession: this.store.getByChannel(PLATFORM, card.channelRef),
+        destLive,
+        defaultModel: this.config.DEFAULT_MODEL,
+      });
+      if (emitted.ok) {
+        this.store.setChoiceClickDelivery(card.id, evt.userId, emitted.dispatchId);
+      } else {
+        this.logger.warn({ err: emitted.error, choiceId: card.id }, "choice: multi emit failed after claim");
+      }
+    } catch (err) {
+      this.logger.warn({ err, choiceId: card.id }, "choice: multi enqueue failed after claim");
+    }
+    const fresh = this.store.getChoiceCard(card.id) ?? claimed.card;
+    await this.refreshChoiceCard(fresh);
+  }
+
   private async planAndCheckChoice(
     card: ChoiceCard,
     optionIndex: number,
@@ -11564,7 +11674,13 @@ export class Orchestrator {
   ): Promise<"ok" | "gone" | "archived"> {
     const option = card.options[optionIndex];
     if (!option) return "gone";
-    const target = resolveOptionTarget(card, option);
+    return this.choiceTargetLive(card, resolveOptionTarget(card, option));
+  }
+
+  private async choiceTargetLive(
+    card: ChoiceCard,
+    target: { type: "live" | "isolated" | "thread"; threadId?: string }
+  ): Promise<"ok" | "gone" | "archived"> {
     const destId = target.type === "thread" && target.threadId ? target.threadId : card.channelRef;
     if (!this.adapter.getThreadLiveState) return "ok";
     try {

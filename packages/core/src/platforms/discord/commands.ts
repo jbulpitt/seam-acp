@@ -15,7 +15,7 @@ import {
  *     config   (14) model effort agent mode repo tools approve reset init detach show edit set audit
  *     info     (6)  whoami usage avatar help sessions repos
  *     schedule (7)  unchanged
- *     preset   (6)  unchanged
+ *     preset   (7)  list create apply delete show edit thread
  *     project  (3)  unchanged
  *     upload   (3)  pull push secret  — admin-only; hard cutover of /seam attach
  *     bridge   (4)  add rotate list remove  — admin-only pairing (#83/#86)
@@ -388,8 +388,9 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   // Presets: reusable bundles of session config (agent/model/effort/repo/
-  // permission/tools/instructions). Name options are free-form strings —
-  // autocomplete is not wired yet (no autocomplete handler exists bot-wide).
+  // permission/tools/instructions). `/seam preset thread` autocompletes the
+  // `preset` option via the bot-wide AutocompleteRegistry (#93). Other name
+  // options stay free-form until they register a responder.
   cmd.addSubcommandGroup((g) =>
     g
       .setName("preset")
@@ -438,6 +439,24 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setDescription("Edit an existing preset (reopens the builder card)")
           .addStringOption((o) =>
             o.setName("name").setDescription("Preset name").setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("thread")
+          .setDescription("Create a new thread from a preset")
+          .addStringOption((o) =>
+            o
+              .setName("name")
+              .setDescription("Thread name (agent emoji is prefixed automatically)")
+              .setRequired(true)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("preset")
+              .setDescription("Preset to apply to the new thread")
+              .setRequired(true)
+              .setAutocomplete(true)
           )
       )
   );

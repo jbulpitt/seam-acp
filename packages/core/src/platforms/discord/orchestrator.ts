@@ -3,7 +3,7 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type MessageComponentInteraction, type Message } from "discord.js";
+import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
 import {
@@ -107,6 +107,11 @@ import type { BridgeHub } from "../../core/bridge-hub.js";
 import { handleBridgeSlash } from "./bridge.js";
 import { handleDebugSlash } from "./debug.js";
 import { BRIDGE_ADMIN_REFUSAL, isBridgeAdminRefused } from "./admin-gate.js";
+import {
+  AutocompleteRegistry,
+  presetAutocompleteChoices,
+  safeAutocompleteRespond,
+} from "./autocomplete.js";
 import {
   agentLocationPickerChoices,
   currentAgentAtLocation,
@@ -316,6 +321,23 @@ export type SlashGateOptions = {
   scope?: string | null;
 };
 
+/** Discord thread names cap at 100 chars. */
+export const DISCORD_THREAD_NAME_MAX = 100;
+
+/**
+ * `/seam new` / `/seam preset thread` naming: prefix the user-supplied name
+ * with the agent's `threadAbbr` (emoji). No manual emoji.
+ */
+export function prefixThreadNameWithAgentEmoji(
+  name: string,
+  threadAbbr?: string | null
+): string {
+  const trimmed = name.trim() || "seam";
+  if (!threadAbbr) return trimmed.slice(0, DISCORD_THREAD_NAME_MAX);
+  if (trimmed.startsWith(threadAbbr)) return trimmed.slice(0, DISCORD_THREAD_NAME_MAX);
+  return `${threadAbbr} ${trimmed}`.slice(0, DISCORD_THREAD_NAME_MAX);
+}
+
 /**
  * Glues the Discord adapter, the SessionRouter, and the agent runtimes
  * together. Handles incoming thread messages and `/seam` slash commands.
@@ -394,6 +416,8 @@ export class Orchestrator {
   private readonly configEditor = new ConfigEditorStore();
   /** #92: declared HTTP result waiters for ingest-triggered choice turns. */
   private choiceResults?: ChoiceResultHub;
+  /** Bot-wide slash autocomplete registry (#93). Keyed by group/sub/option. */
+  private readonly autocomplete = new AutocompleteRegistry();
   /** Public POST /ingest base (no token). */
   private ingestUrl?: () => string;
   /** Stash a marker so a live-turn re-fire reuses it instead of writing a
@@ -452,6 +476,36 @@ export class Orchestrator {
       },
       logger: this.logger,
     });
+
+    this.autocomplete.register("preset", "thread", "preset", (ctx) => {
+      if (!ctx.projectScopeId) return [];
+      const presets = this.store.listPresetsForProject(ctx.projectScopeId);
+      return presetAutocompleteChoices(presets, ctx.focusedValue, ctx.projectScopeId);
+    });
+  }
+
+  /**
+   * Discord autocomplete dispatcher (#93). Looks up a registry responder and
+   * always `respond()`s — empty list on miss or error, never throws.
+   */
+  async handleAutocompleteInteraction(interaction: AutocompleteInteraction): Promise<void> {
+    await safeAutocompleteRespond(
+      (choices) => interaction.respond(choices),
+      async () => {
+        const group = interaction.options.getSubcommandGroup(false);
+        const sub = interaction.options.getSubcommand(false);
+        const focused = interaction.options.getFocused(true);
+        const responder = this.autocomplete.get(group, sub, focused.name);
+        if (!responder) return [];
+        return responder({
+          group,
+          subcommand: sub,
+          optionName: focused.name,
+          focusedValue: String(focused.value ?? ""),
+          projectScopeId: this.projectScopeId(interaction),
+        });
+      }
+    );
   }
 
   /**
@@ -6679,6 +6733,28 @@ export class Orchestrator {
     });
   }
 
+  /**
+   * Create a thread under the parent channel. Invoked inside a thread → sibling
+   * (adapter.createThread walks up). Shared by `/seam new` and `/seam preset thread`.
+   */
+  private async createChildThread(parentChannelId: string, name: string): Promise<ChannelRef> {
+    if (!this.adapter.createThread) {
+      throw new Error("This platform does not support creating threads.");
+    }
+    const parent: ChannelRef = { platform: PLATFORM, id: parentChannelId };
+    return this.adapter.createThread(parent, name);
+  }
+
+  /** Bind a session record to a just-created thread (same path as `/seam new`). */
+  private bindSessionToThread(thread: ChannelRef): SessionRecord {
+    return this.router.ensureSessionRecord({
+      platform: thread.platform,
+      channelRef: thread.id,
+      ...(thread.parentId ? { parentRef: thread.parentId } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+  }
+
   private async cmdNew(i: ChatInputCommandInteraction): Promise<void> {
     if (!this.adapter.createThread) {
       await i.reply({
@@ -6693,20 +6769,14 @@ export class Orchestrator {
       return;
     }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const parent: ChannelRef = { platform: PLATFORM, id: i.channelId };
-    const thread = await this.adapter.createThread(parent, name);
+    const thread = await this.createChildThread(i.channelId, name);
 
     // Auto-init: bind a session to the new thread and start the setup
     // flow so the user doesn't have to /seam config init themselves.
     // Reply BEFORE the pickers — Discord interaction tokens last 15 min
     // and a full wizard (agent/cwd/model/effort) can outlive that.
     try {
-      const record = this.router.ensureSessionRecord({
-        platform: thread.platform,
-        channelRef: thread.id,
-        ...(thread.parentId ? { parentRef: thread.parentId } : {}),
-        cwd: this.config.REPOS_ROOT,
-      });
+      const record = this.bindSessionToThread(thread);
       await i.editReply(`Created thread <#${thread.id}> and initialized it.`);
       if (this.config.NEW_THREAD_WIZARD === "full") {
         await this.runSetupWizard(thread, record);
@@ -12099,6 +12169,7 @@ export class Orchestrator {
       case "delete": return this.cmdPresetDelete(i);
       case "show": return this.cmdPresetShow(i);
       case "edit": return this.cmdPresetEdit(i);
+      case "thread": return this.cmdPresetThread(i);
       default:
         await i.reply({
           content: `Unknown preset subcommand: ${sub}`,
@@ -12130,7 +12201,7 @@ export class Orchestrator {
    * the channel itself. Mirrors the scope resolution in handleSlashInteraction.
    */
   private projectScopeId(
-    i: ChatInputCommandInteraction | MessageComponentInteraction
+    i: ChatInputCommandInteraction | MessageComponentInteraction | AutocompleteInteraction
   ): string | undefined {
     const ch = i.channel;
     return ch?.isThread() ? (ch.parentId ?? undefined) : i.channelId ?? undefined;
@@ -12785,6 +12856,74 @@ export class Orchestrator {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
     const summary = await this.applyPresetToSession(channel, record, preset);
     await i.editReply(`✅ Applied preset **${preset.name}**.\n${summary}`);
+  }
+
+  /**
+   * `/seam preset thread` (#93): create a NEW thread under the parent channel
+   * (sibling if invoked inside a thread — same path as `/seam new`) and bind
+   * the picked preset's full config onto that session.
+   */
+  private async cmdPresetThread(i: ChatInputCommandInteraction): Promise<void> {
+    const rawName = i.options.getString("name", true) ?? "";
+    const presetName = (i.options.getString("preset", true) ?? "").trim();
+    if (!presetName) {
+      await i.reply({
+        content: "Pick a preset from the list — that field can't be blank.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const preset = this.store.getPresetByNameScoped(
+      presetName,
+      this.projectScopeId(i) ?? null
+    );
+    if (!preset) {
+      await i.reply({
+        content:
+          `No preset named \`${presetName}\` in this project. Use \`/seam preset list\` to see what's available.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (!this.adapter.createThread) {
+      await i.reply({
+        content: "This platform does not support creating threads.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (!i.channelId) {
+      await i.reply({ content: "No channel.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const name = rawName.trim();
+    if (!name) {
+      await i.reply({
+        content: "Give the new thread a name.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    const abbr = preset.agentId
+      ? this.router.getProfile(preset.agentId)?.threadAbbr
+      : undefined;
+    const threadName = prefixThreadNameWithAgentEmoji(name, abbr);
+    try {
+      const thread = await this.createChildThread(i.channelId, threadName);
+      const record = this.bindSessionToThread(thread);
+      const summary = await this.applyPresetToSession(thread, record, preset);
+      await i.editReply(
+        `🧵 Created <#${thread.id}> from preset **${preset.name}**.\n${summary}`
+      );
+    } catch (err) {
+      this.logger.warn({ err }, "/seam preset thread failed");
+      try {
+        await i.editReply(`Could not create the thread: ${(err as Error).message}`);
+      } catch {
+        /* already replied */
+      }
+    }
   }
 
   /**

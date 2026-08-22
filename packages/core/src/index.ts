@@ -411,6 +411,9 @@ async function main(): Promise<void> {
     slashHandler: async (interaction) => {
       await orchestrator.handleSlashInteraction(interaction);
     },
+    autocompleteHandler: async (interaction) => {
+      await orchestrator.handleAutocompleteInteraction(interaction);
+    },
   });
 
   const orchestrator = new Orchestrator({

@@ -42,6 +42,12 @@ export class SeamTokenRegistry {
     return this.byToken.get(token);
   }
 
+  /** Current token for a session, if any — does not mint or rotate. Isolated
+   *  ingest reuses the authoring thread's token so a live turn keeps working. */
+  peek(sessionId: string): string | undefined {
+    return this.bySession.get(sessionId);
+  }
+
   /** Revoke whatever token is currently mapped to this session (if any). */
   revokeSession(sessionId: string): void {
     const existing = this.bySession.get(sessionId);

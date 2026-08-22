@@ -311,6 +311,34 @@ export interface SeamMcpServerDeps {
    * inbox. Undefined ⇒ the inbox is unsupported on this deployment.
    */
   drainInbox?: (record: SessionRecord) => InboxMessageView[];
+  /**
+   * Publish a frozen choice card in the calling thread (#91). Same helper as
+   * the `seam-choice` fence. Participant authors are refused; injected turns
+   * may author. Undefined ⇒ choice cards unsupported.
+   */
+  createChoice?: (
+    record: SessionRecord,
+    spec: unknown
+  ) => Promise<
+    | {
+        ok: true;
+        choiceId: string;
+        messageId: string;
+        ingestToken?: string;
+        ingestUrl?: string;
+      }
+    | { ok: false; error: string }
+  >;
+  /** Cancel an open choice card in the calling (authoring) thread (#91). */
+  cancelChoice?: (
+    record: SessionRecord,
+    choiceId: string
+  ) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Declare the HTTP body for an ingest-triggered turn (#92). First call wins. */
+  submitResult?: (
+    record: SessionRecord,
+    value: unknown
+  ) => { ok: true; dispatchId: string } | { ok: false; error: string };
 }
 
 /** One drained inbox message, as `poll_inbox` renders it. Kept as a minimal
@@ -934,6 +962,57 @@ const TOOLS = [
       required: [],
     },
   },
+  {
+    name: "create_choice",
+    description:
+      "Publish a frozen click-card in THIS thread. One click emits one prompt (live / isolated / thread snowflake). " +
+      "Participants cannot create cards. Options freeze at publish — no edit-in-place. Prefer the agent guide " +
+      "docs/agent-guides/interactive-prompts.md over this blurb.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Card title (≤256)." },
+        body: { type: "string", description: "Optional text on the card. Not emitted." },
+        maxClicks: { type: "number", description: "Total successful claims (default 1, cap 100). Always one click per user." },
+        targetUserId: { type: "string", description: "Optional Discord user id who alone may click." },
+        defaultTarget: {
+          type: "object",
+          description: 'Default destination if an option omits target. { type: "live"|"isolated"|"thread", threadId? }.',
+        },
+        options: {
+          type: "array",
+          description: '1–25 options: { label, kind: "prompt"|"custom", payload?, target? }. prompt requires payload.',
+        },
+        ingress: {
+          type: ["boolean", "object"],
+          description:
+            "If true or an object, mint an HTTP ingest token. POST /ingest with Bearer token is a custom submit. See docs/agent-guides/interactive-prompts.md.",
+        },
+      },
+      required: ["title", "options"],
+    },
+  },
+  {
+    name: "cancel_choice",
+    description:
+      "Cancel an open choice card you published in THIS thread. Participants cannot cancel. Exhausted/cancelled cards have disabled buttons.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        choiceId: { type: "string", description: "Id returned by create_choice." },
+      },
+      required: ["choiceId"],
+    },
+  },
+  {
+    name: "submit_result",
+    description:
+      "Declare the HTTP body for an ingest-triggered turn. First successful call wins. Optional resultSchema on the card is validated. See docs/agent-guides/interactive-prompts.md.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: true,
+    },
+  },
 ] as const;
 
 const INSTRUCTIONS = [
@@ -957,6 +1036,7 @@ const INSTRUCTIONS = [
   "  the woken turn to continue a loop. This is the working substrate for \"wake me in N minutes\"; the",
   "  native ScheduleWakeup / Monitor tools do NOT function here, so use this instead.",
   "- cancel_wake(wakeId): cancel a pending wake you scheduled.",
+  "- create_choice / cancel_choice / submit_result: frozen click-cards; HTTP ingest + declared JSON result. Participants cannot author. See docs/agent-guides/interactive-prompts.md.",
   "- watch_create(kind, spec, intervalSeconds, prompt, expiresInSeconds, ...): register a CONDITION the bridge",
   "  checks cheaply and re-enters you ONLY when it fires (file/http/command source). Prefer this over a",
   "  schedule_wake poll loop for \"wait until X\" — the bridge does the checking, so a turn is spent only on a",
@@ -1150,6 +1230,12 @@ export class SeamMcpServer {
           return rpcResult(id, this.toolConfigDescribe(record, args));
         case "config_propose":
           return rpcResult(id, await this.toolConfigPropose(record, args));
+        case "create_choice":
+          return rpcResult(id, await this.toolCreateChoice(record, args));
+        case "cancel_choice":
+          return rpcResult(id, await this.toolCancelChoice(record, args));
+        case "submit_result":
+          return rpcResult(id, this.toolSubmitResult(record, args));
         default:
           return rpcError(id, -32602, `unknown tool: ${name}`);
       }
@@ -1493,6 +1579,54 @@ export class SeamMcpServer {
       : textResult(`No pending wake ${wakeId} found in this thread (already fired, cancelled, or not yours).`, true);
   }
 
+  private async toolCreateChoice(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.createChoice) {
+      return textResult("choice cards are not supported on this deployment.", true);
+    }
+    const result = await this.deps.createChoice(caller, args);
+    if (!result.ok) return textResult(`Choice card not published: ${result.error}`, true);
+    this.logger.info(
+      { choiceId: result.choiceId, thread: caller.channelRef },
+      "seam-mcp create_choice published"
+    );
+    let msg = `Choice card ${result.choiceId} published (message ${result.messageId}). One click emits one prompt.`;
+    if (result.ingestToken) {
+      const url = result.ingestUrl ?? "/ingest";
+      msg += ` HTTP ingest: POST ${url} with Authorization: Bearer ${result.ingestToken} (token shown once). Declare the HTTP body with submit_result.`;
+    }
+    return textResult(msg);
+  }
+
+  private toolSubmitResult(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): McpToolResult {
+    if (!this.deps.submitResult) {
+      return textResult("submit_result is not supported on this deployment.", true);
+    }
+    const result = this.deps.submitResult(caller, args);
+    return result.ok
+      ? textResult(`Result submitted for dispatch ${result.dispatchId}.`)
+      : textResult(result.error, true);
+  }
+
+  private async toolCancelChoice(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.cancelChoice) {
+      return textResult("choice cards are not supported on this deployment.", true);
+    }
+    const choiceId = requireString(args, "choiceId");
+    const result = await this.deps.cancelChoice(caller, choiceId);
+    return result.ok
+      ? textResult(`Choice card ${choiceId} cancelled.`)
+      : textResult(result.error, true);
+  }
+
   /** Register a bridge-evaluated watch for the calling thread (#60). Self-scope
    *  by construction — the watch is armed for the token-resolved caller, never a
    *  caller-supplied thread. All validation (including the command source gate,
@@ -1733,6 +1867,12 @@ export class SeamMcpServer {
       line("detached:", d.detached.value ? "true" : "false", d.detached.source),
       line("location:", d.location?.value ?? "local", d.location?.source ?? "default"),
     ];
+    if (d.rider?.channel || d.rider?.thread) {
+      lines.push(
+        line("rider ch.:", d.rider.channel ?? "(none)", "channel preset"),
+        line("rider th.:", d.rider.thread ?? "(none)", "thread preset")
+      );
+    }
     if (d.effortIgnoredNote) lines.push(`⚠ ${d.effortIgnoredNote}`);
 
     const entities = this.deps.listConfigEntities?.(caller);

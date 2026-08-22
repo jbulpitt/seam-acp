@@ -20,6 +20,7 @@ import { buildGlobalMcpServers } from "./mcp.js";
 import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
 import { ScheduledPromptManager } from "./core/scheduled-prompts/manager.js";
 import { WakeManager } from "./core/wake/manager.js";
+import { ParkedPromptManager } from "./core/parked-prompts/manager.js";
 import { WatchManager } from "./core/watch/manager.js";
 import { evaluateWatch } from "./core/watch/evaluate.js";
 import { DispatchWatcher } from "./core/dispatch/watcher.js";
@@ -28,6 +29,12 @@ import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
 import { watchChannelPresets } from "./core/config-reload.js";
 import { BridgeHub } from "./core/bridge-hub.js";
+import { ServerStatusCard } from "./core/server-status-card.js";
+import type { BridgeAgent } from "./core/server-status.js";
+import { ChoiceResultHub } from "./core/choice/result.js";
+import { ChoiceIngest } from "./core/choice/ingest.js";
+import { publicBaseFromBridgeWsUrl, resolvePublicBridgeWsUrl } from "./core/mcp-url.js";
+import fs from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 async function main(): Promise<void> {
@@ -55,6 +62,9 @@ async function main(): Promise<void> {
   let mcpHttpHandle:
     | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
     | undefined;
+  let ingestHttpHandle:
+    | ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>)
+    | undefined;
   const health = startHealthServer(config.HEALTH_PORT, logger, {
     onMcp: (req, res) => {
       if (!mcpHttpHandle) {
@@ -63,6 +73,14 @@ async function main(): Promise<void> {
         return;
       }
       return mcpHttpHandle(req, res);
+    },
+    onIngest: (req, res) => {
+      if (!ingestHttpHandle) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "ingest not ready" }));
+        return;
+      }
+      return ingestHttpHandle(req, res);
     },
   });
 
@@ -406,6 +424,41 @@ async function main(): Promise<void> {
 
   orchestrator.install();
 
+  const choiceResults = new ChoiceResultHub({
+    store,
+    logger: logger.child({ mod: "choice-result" }),
+  });
+  orchestrator.setChoiceResults(choiceResults);
+  const ingestPublicBase = (): string => {
+    let tunnel: string | null = null;
+    try {
+      tunnel = fs.readFileSync(path.join(config.DATA_DIR, "tunnel-url.txt"), "utf8").trim() || null;
+    } catch {
+      tunnel = null;
+    }
+    const ws = resolvePublicBridgeWsUrl({
+      configured: config.SEAM_BRIDGE_PUBLIC_URL,
+      tunnelUrl: tunnel,
+      healthPort: config.HEALTH_PORT,
+    });
+    return publicBaseFromBridgeWsUrl(ws) ?? `http://127.0.0.1:${config.HEALTH_PORT}`;
+  };
+  const choiceIngest = new ChoiceIngest({
+    store,
+    results: choiceResults,
+    logger: logger.child({ mod: "ingest" }),
+    enqueue: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+    destLive: (card, optionIndex) => orchestrator.inspectChoiceDestLive(card, optionIndex),
+    authoringSession: (channelRef) => store.getByChannel("discord", channelRef),
+    publicBase: ingestPublicBase,
+    waitMs: config.SEAM_INGEST_WAIT_MS,
+    bodyMax: config.SEAM_INGEST_BODY_MAX,
+    ratePerMin: config.SEAM_INGEST_RATE_PER_MIN,
+    defaultModel: config.DEFAULT_MODEL,
+  });
+  orchestrator.setIngestUrl(() => choiceIngest.ingestUrl());
+  ingestHttpHandle = (req, res) => choiceIngest.handle(req, res);
+
   bridgeHub = new BridgeHub({
     logger,
     config,
@@ -464,6 +517,9 @@ async function main(): Promise<void> {
       // the DB row; the WakeManager sweeper fires it via the dispatch queue.
       scheduleWake: (record, req) => orchestrator.scheduleWake(record, req),
       cancelWake: (record, id) => orchestrator.cancelWake(record, id),
+      createChoice: (record, spec) => orchestrator.createChoice(record, spec),
+      cancelChoice: (record, id) => orchestrator.cancelChoice(record, id),
+      submitResult: (record, value) => orchestrator.submitChoiceResult(record, value),
       // Agent-defined watches (#60): register/cancel/list a bridge-evaluated
       // condition trigger for the calling thread. The orchestrator owns the
       // guards (including the D8 command gate) and the DB row; the WatchManager
@@ -692,6 +748,21 @@ async function main(): Promise<void> {
   orchestrator.setDispatchWatcher(dispatchWatcher);
   await dispatchWatcher.start();
 
+  // #88: parked prompts wait on onBridgeReady (no timer). Start after the
+  // dispatch watcher so a boot-time fire can enqueue immediately. Rehydrate
+  // fires any row whose host is already ready.
+  const parkedManager = new ParkedPromptManager({
+    store,
+    hub: bridgeHub!,
+    logger: logger.child({ mod: "parked" }),
+    onFire: (parked) => orchestrator.fireParked(parked),
+    // #89: a reconnect must not fire a `/seam queue` row while that thread's
+    // current turn is still running (D5/D9 — park stays cancellable).
+    isChannelBusy: (channelRef) => orchestrator.isChannelBusy(channelRef),
+  });
+  orchestrator.setParkedManager(parkedManager);
+  parkedManager.start();
+
   // #76: reconcile live-turn markers (always) and auto-resume if the flag
   // is on. SIGTERM/disposeAll above leave markers intact — this is the
   // path that acts on them. Fire-and-forget so boot is not blocked by
@@ -723,6 +794,82 @@ async function main(): Promise<void> {
   // Best-effort startup notification to a configured channel.
   void orchestrator.postNotification("✅ Seam online.");
 
+  // One editable server-status card (uptime / turns / bridges). Posts once,
+  // then edits in place — 30s tick + immediate bump on bridge connect/drop.
+  let stopStatusCard: (() => void) | undefined;
+  if (config.DISCORD_STATUS_THREAD_ID && bridgeHub) {
+    const hub = bridgeHub;
+    const statusCard = new ServerStatusCard({
+      logger,
+      adapter,
+      threadId: config.DISCORD_STATUS_THREAD_ID,
+      dataDir: config.DATA_DIR,
+      collect: () => {
+        const mem = process.memoryUsage();
+        const connected = hub.connectedIds();
+        const emojiByAgent = new Map(
+          router.listProfiles().map((p) => [p.id, p.threadAbbr] as const)
+        );
+        const bridges = [...config.bridgePresets.values()]
+          .sort((a, b) => a.id.localeCompare(b.id))
+          .map((b) => {
+            const conn = hub.get(b.id);
+            const agents: BridgeAgent[] = [];
+            if (conn) {
+              for (const [id, info] of conn.agents) {
+                if (!info.installed) continue;
+                agents.push({
+                  id,
+                  emoji: emojiByAgent.get(id),
+                  ready: info.ready,
+                });
+              }
+            }
+            return {
+              id: b.id,
+              emoji: b.emoji,
+              shortName: b.shortName,
+              connected: connected.has(b.id),
+              os: conn?.host.os,
+              arch: conn?.host.arch,
+              connectedAt: conn?.connectedAt,
+              agents,
+              devMode: conn?.devMode,
+              waiting: store.countParkedByLocation(b.id),
+            };
+          });
+        return {
+          nowUtc: Date.now(),
+          startedUtc: Date.now() - process.uptime() * 1000,
+          pid: process.pid,
+          nodeVersion: process.version,
+          memoryRssBytes: mem.rss,
+          memoryHeapUsedBytes: mem.heapUsed,
+          activeTurns: orchestrator.activeTurnCount(),
+          liveRuntimes: router.liveRuntimeCount(),
+          sessions: store.countSessions(),
+          pendingWakes: store.countPendingWakes(),
+          pendingWatches: store.listAllWatches().length,
+          scheduledJobs: store.listScheduledEnabled().length,
+          restartPending: orchestrator.isRestartPending(),
+          discordPingMs: adapter.gatewayPingMs(),
+          bridges,
+        };
+      },
+    });
+    const offReady = hub.onBridgeReady(() => statusCard.poke());
+    const offDisc = hub.onBridgeDisconnect(() => statusCard.poke());
+    orchestrator.setOnParkedChange(() => statusCard.poke());
+    stopStatusCard = () => {
+      offReady();
+      offDisc();
+      statusCard.stop();
+    };
+    void statusCard.start().catch((err) =>
+      logger.warn({ err }, "server status card failed to start")
+    );
+  }
+
   // Publish quick-tunnel URL to gist whenever it changes.
   let stopTunnelGist: (() => void) | undefined;
   if (config.TUNNEL_GIST_ID) {
@@ -736,8 +883,10 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, "shutting down");
     orchestrator.stopSentinelWatcher();
+    stopStatusCard?.();
     scheduledManager.stop();
     wakeManager.stop();
+    parkedManager.stop();
     watchManager.stop();
     dispatchWatcher.stop();
     stopPresetsWatch?.();

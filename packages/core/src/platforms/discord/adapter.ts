@@ -13,6 +13,10 @@ import {
   ButtonStyle,
   ComponentType,
   EmbedBuilder,
+  ContainerBuilder,
+  TextDisplayBuilder,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
   StringSelectMenuBuilder,
   ModalBuilder,
   TextInputBuilder,
@@ -22,6 +26,9 @@ import {
   type ThreadChannel,
   type ChatInputCommandInteraction,
   type MessageComponentInteraction,
+  type ButtonInteraction,
+  type ModalSubmitInteraction,
+  type StringSelectMenuInteraction,
 } from "discord.js";
 import type {
   RequestPermissionRequest,
@@ -35,12 +42,23 @@ import { isThreadDetached, mayConfigureUserIds, type Config } from "../../config
 import type {
   ChatAdapter,
   ChannelRef,
+  ComponentEvent,
+  ChoiceCardPost,
+  ChoiceInteraction,
   ConfirmationCard,
   ConfirmationDecision,
   IncomingMessage,
   MessageAttachment,
   MessageRef,
 } from "../chat-adapter.js";
+import type { PanelButton, StructuredPanel } from "../../core/types.js";
+import {
+  CHOICE_CUSTOM_ID_PREFIX,
+  CHOICE_CUSTOM_TEXT_MAX,
+  makeChoiceCustomId,
+  makeChoiceModalId,
+  makeChoiceSelectId,
+} from "../../core/choice/types.js";
 import { buildSeamCommand } from "./commands.js";
 import { sanitizeSpeakerName } from "../../core/agent-conventions.js";
 import {
@@ -100,6 +118,8 @@ export class DiscordAdapter implements ChatAdapter {
   private readonly slashHandler: SlashHandler;
 
   private messageHandler?: (msg: IncomingMessage) => void | Promise<void>;
+  private componentHandler?: (evt: ComponentEvent) => void | Promise<void>;
+  private choiceHandler?: (evt: ChoiceInteraction) => void | Promise<void>;
   private threadDeleteHandler?: (channelRef: string) => void | Promise<void>;
   /** DB-backed channel activation (#22): additive to the env allowlist. */
   private activeChannelCheck?: (channelRef: string) => boolean;
@@ -127,6 +147,14 @@ export class DiscordAdapter implements ChatAdapter {
     this.messageHandler = handler;
   }
 
+  onComponent(handler: (evt: ComponentEvent) => void | Promise<void>): void {
+    this.componentHandler = handler;
+  }
+
+  onChoiceInteraction(handler: (evt: ChoiceInteraction) => void | Promise<void>): void {
+    this.choiceHandler = handler;
+  }
+
   onThreadDelete(handler: (channelRef: string) => void | Promise<void>): void {
     this.threadDeleteHandler = handler;
   }
@@ -146,6 +174,13 @@ export class DiscordAdapter implements ChatAdapter {
     this.logger.info({ botUserId: this.botUserId }, "discord adapter ready");
     await this.registerSlashCommands();
     await this.applyAvatarIfNeeded();
+  }
+
+  /** Gateway heartbeat RTT in ms; undefined if the WS isn't ready. */
+  gatewayPingMs(): number | undefined {
+    const ping = this.client.ws.ping;
+    if (!Number.isFinite(ping) || ping < 0) return undefined;
+    return Math.round(ping);
   }
 
   async stop(): Promise<void> {
@@ -691,26 +726,319 @@ export class DiscordAdapter implements ChatAdapter {
 
   async sendPanel(
     channel: ChannelRef,
-    panel: import("../../core/types.js").StructuredPanel
+    panel: StructuredPanel
   ): Promise<MessageRef> {
     const ch = await this.fetchSendableChannel(channel.id);
     const embed = DiscordAdapter.buildEmbed(panel);
-    const sent = await ch.send({ embeds: [embed] });
+    const components = DiscordAdapter.buildActionRows(panel.actions);
+    const sent = await ch.send({
+      embeds: [embed],
+      ...(components.length > 0 ? { components } : {}),
+    });
     return { channel, id: sent.id };
   }
 
   async editPanel(
     message: MessageRef,
-    panel: import("../../core/types.js").StructuredPanel
+    panel: StructuredPanel
   ): Promise<void> {
     const ch = await this.fetchSendableChannel(message.channel.id);
     const msg = await ch.messages.fetch(message.id);
     const embed = DiscordAdapter.buildEmbed(panel);
-    await msg.edit({ content: "", embeds: [embed] });
+    const payload: { content: string; embeds: EmbedBuilder[]; components?: ReturnType<typeof DiscordAdapter.buildActionRows> } = {
+      content: "",
+      embeds: [embed],
+    };
+    if (panel.actions !== undefined) {
+      payload.components = DiscordAdapter.buildActionRows(panel.actions);
+    }
+    await msg.edit(payload);
+  }
+
+  async sendLayout(
+    channel: ChannelRef,
+    layout: import("../../core/types.js").StructuredLayout
+  ): Promise<MessageRef> {
+    const ch = await this.fetchSendableChannel(channel.id);
+    const sent = await ch.send({
+      flags: MessageFlags.IsComponentsV2,
+      components: [DiscordAdapter.buildContainer(layout)],
+    });
+    return { channel, id: sent.id };
+  }
+
+  async editLayout(
+    message: MessageRef,
+    layout: import("../../core/types.js").StructuredLayout
+  ): Promise<void> {
+    const ch = await this.fetchSendableChannel(message.channel.id);
+    const msg = await ch.messages.fetch(message.id);
+    await msg.edit({
+      flags: MessageFlags.IsComponentsV2,
+      components: [DiscordAdapter.buildContainer(layout)],
+    });
+  }
+
+  async deleteMessage(message: MessageRef): Promise<void> {
+    const ch = await this.fetchSendableChannel(message.channel.id);
+    const msg = await ch.messages.fetch(message.id);
+    await msg.delete();
+  }
+
+  async pinMessage(message: MessageRef): Promise<void> {
+    const ch = await this.fetchSendableChannel(message.channel.id);
+    const msg = await ch.messages.fetch(message.id);
+    if (msg.pinned) return;
+    await msg.pin();
+    // Pin emits a system "pinned a message" notice; the status thread is
+    // meant to hold only the card, so drop that extra message.
+    try {
+      const recent = await ch.messages.fetch({ limit: 5 });
+      const notice = recent.find((m) => m.type === MessageType.ChannelPinnedMessage);
+      if (notice) await notice.delete();
+    } catch (err) {
+      this.logger.warn({ err }, "failed to delete pin notice");
+    }
+  }
+
+  private static buttonStyle(style: PanelButton["style"]): ButtonStyle {
+    switch (style) {
+      case "primary":
+        return ButtonStyle.Primary;
+      case "success":
+        return ButtonStyle.Success;
+      case "danger":
+        return ButtonStyle.Danger;
+      default:
+        return ButtonStyle.Secondary;
+    }
+  }
+
+  private static buildActionRows(
+    actions: PanelButton[][] | undefined
+  ): ActionRowBuilder<ButtonBuilder>[] {
+    if (!actions || actions.length === 0) return [];
+    return actions.slice(0, 5).map((row) => {
+      const built = new ActionRowBuilder<ButtonBuilder>();
+      for (const btn of row.slice(0, 5)) {
+        const b = new ButtonBuilder()
+          .setCustomId(btn.customId.slice(0, 100))
+          .setLabel(btn.label.slice(0, 80))
+          .setStyle(DiscordAdapter.buttonStyle(btn.style));
+        if (btn.disabled) b.setDisabled(true);
+        if (btn.emoji) b.setEmoji(btn.emoji);
+        built.addComponents(b);
+      }
+      return built;
+    });
+  }
+
+  private async handlePersistentComponent(
+    interaction: ButtonInteraction | ModalSubmitInteraction
+  ): Promise<void> {
+    if (!this.componentHandler) return;
+    const isButton = interaction.isButton();
+    const isModal = interaction.isModalSubmit();
+
+    const channelId = interaction.channelId ?? "";
+    const ch = interaction.channel as { parentId?: string | null } | null;
+    const parentId = ch?.parentId ?? undefined;
+    const messageId = interaction.message?.id ?? "";
+
+    const fields: Record<string, string> = {};
+    if (isModal) {
+      try {
+        fields.rider = interaction.fields.getTextInputValue("rider");
+      } catch {
+        /* optional field */
+      }
+    }
+
+    const evt: ComponentEvent = {
+      customId: interaction.customId,
+      userId: interaction.user.id,
+      userName: interaction.user.displayName ?? interaction.user.username,
+      channel: {
+        platform: PLATFORM,
+        id: channelId,
+        ...(parentId ? { parentId } : {}),
+      },
+      messageId,
+      kind: isModal ? "modal" : "button",
+      ...(Object.keys(fields).length > 0 ? { fields } : {}),
+      replyEphemeral: async (text: string) => {
+        await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+      },
+      followUpEphemeral: async (text: string) => {
+        await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
+      },
+      deferUpdate: async () => {
+        await interaction.deferUpdate();
+      },
+      showModal: async (opts) => {
+        if (!interaction.isButton()) {
+          throw new Error("showModal is only valid on a button click");
+        }
+        const modal = new ModalBuilder()
+          .setCustomId(opts.customId.slice(0, 100))
+          .setTitle(opts.title.slice(0, 45));
+        for (const input of opts.inputs.slice(0, 5)) {
+          const ti = new TextInputBuilder()
+            .setCustomId(input.id.slice(0, 100))
+            .setLabel(input.label.slice(0, 45))
+            .setStyle(input.style === "short" ? TextInputStyle.Short : TextInputStyle.Paragraph)
+            .setRequired(input.required ?? false);
+          if (input.maxLength) ti.setMaxLength(Math.min(input.maxLength, 4000));
+          if (input.placeholder) ti.setPlaceholder(input.placeholder.slice(0, 100));
+          if (input.value) ti.setValue(input.value.slice(0, input.maxLength ?? 4000));
+          modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(ti));
+        }
+        await interaction.showModal(modal);
+      },
+    };
+    await this.componentHandler(evt);
+  }
+
+  async sendChoiceCard(channel: ChannelRef, card: ChoiceCardPost): Promise<MessageRef> {
+    const ch = await this.fetchSendableChannel(channel.id);
+    const embed = DiscordAdapter.buildEmbed(card.panel);
+    const components = DiscordAdapter.buildChoiceComponents(card);
+    const sent = await ch.send({ embeds: [embed], components });
+    return { channel, id: sent.id };
+  }
+
+  async editChoiceCard(message: MessageRef, card: ChoiceCardPost): Promise<void> {
+    const ch = await this.fetchSendableChannel(message.channel.id);
+    const msg = await ch.messages.fetch(message.id);
+    const embed = DiscordAdapter.buildEmbed(card.panel);
+    const components = DiscordAdapter.buildChoiceComponents(card);
+    await msg.edit({ content: "", embeds: [embed], components });
+  }
+
+  private static buildChoiceComponents(
+    card: ChoiceCardPost
+  ): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
+    const disabled = Boolean(card.disabled);
+    const prompts = card.options
+      .map((o, i) => ({ o, i }))
+      .filter((x) => x.o.kind === "prompt");
+    const customs = card.options
+      .map((o, i) => ({ o, i }))
+      .filter((x) => x.o.kind === "custom");
+    const layout = choicePickerLayout({
+      choiceCount: prompts.length,
+      allowCustom: customs.length > 0,
+    });
+    const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [];
+
+    if (layout.useButtons) {
+      const buttons = card.options.map((o, i) =>
+        new ButtonBuilder()
+          .setCustomId(makeChoiceCustomId(card.choiceId, i))
+          .setLabel(o.label.slice(0, 80))
+          .setStyle(o.kind === "custom" ? ButtonStyle.Primary : ButtonStyle.Secondary)
+          .setDisabled(disabled)
+      );
+      for (let i = 0; i < buttons.length; i += DISCORD_BUTTONS_PER_ROW) {
+        rows.push(
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            buttons.slice(i, i + DISCORD_BUTTONS_PER_ROW)
+          )
+        );
+      }
+    } else {
+      const select = new StringSelectMenuBuilder()
+        .setCustomId(makeChoiceSelectId(card.choiceId))
+        .setPlaceholder("Choose an option")
+        .setDisabled(disabled)
+        .addOptions(
+          prompts.map(({ o, i }) => ({
+            label: o.label.slice(0, 100),
+            value: String(i),
+          }))
+        );
+      rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select));
+      for (const { o, i } of customs) {
+        rows.push(
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId(makeChoiceCustomId(card.choiceId, i))
+              .setLabel(o.label.slice(0, 80))
+              .setStyle(ButtonStyle.Primary)
+              .setDisabled(disabled)
+          )
+        );
+      }
+    }
+    return rows.slice(0, 5);
+  }
+
+  private async handleChoiceInteraction(
+    interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
+  ): Promise<void> {
+    if (!this.choiceHandler) return;
+    const channelId = interaction.channelId ?? "";
+    const ch = interaction.channel as { parentId?: string | null } | null;
+    const parentId = ch?.parentId ?? undefined;
+    const messageId = interaction.message?.id ?? "";
+    const kind: ChoiceInteraction["kind"] = interaction.isModalSubmit()
+      ? "modal"
+      : interaction.isStringSelectMenu()
+        ? "select"
+        : "button";
+    const fields: Record<string, string> = {};
+    if (interaction.isModalSubmit()) {
+      try {
+        fields.payload = interaction.fields.getTextInputValue("payload");
+      } catch {
+        /* empty */
+      }
+    }
+    const values = interaction.isStringSelectMenu() ? [...interaction.values] : undefined;
+    const evt: ChoiceInteraction = {
+      customId: interaction.customId,
+      userId: interaction.user.id,
+      userName: interaction.user.displayName ?? interaction.user.username,
+      channel: {
+        platform: PLATFORM,
+        id: channelId,
+        ...(parentId ? { parentId } : {}),
+      },
+      messageId,
+      kind,
+      ...(values ? { values } : {}),
+      ...(Object.keys(fields).length > 0 ? { fields } : {}),
+      replyEphemeral: async (text: string) => {
+        await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+      },
+      followUpEphemeral: async (text: string) => {
+        await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
+      },
+      deferUpdate: async () => {
+        await interaction.deferUpdate();
+      },
+      showModal: async (opts) => {
+        if (!interaction.isButton() && !interaction.isStringSelectMenu()) {
+          throw new Error("showModal is only valid on a component click");
+        }
+        const modal = new ModalBuilder()
+          .setCustomId(opts.customId.slice(0, 100))
+          .setTitle(opts.title.slice(0, 45));
+        const input = new TextInputBuilder()
+          .setCustomId("payload")
+          .setLabel(opts.label.slice(0, 45))
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(Math.min(opts.maxLength ?? CHOICE_CUSTOM_TEXT_MAX, CHOICE_CUSTOM_TEXT_MAX));
+        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+        await interaction.showModal(modal);
+      },
+    };
+    await this.choiceHandler(evt);
   }
 
   private static buildEmbed(
-    panel: import("../../core/types.js").StructuredPanel
+    panel: StructuredPanel
   ): EmbedBuilder {
     const embed = new EmbedBuilder()
       .setColor(panel.color)
@@ -734,6 +1062,26 @@ export class DiscordAdapter implements ChatAdapter {
     return embed;
   }
 
+  private static buildContainer(
+    layout: import("../../core/types.js").StructuredLayout
+  ): ContainerBuilder {
+    const container = new ContainerBuilder();
+    if (layout.color != null) container.setAccentColor(layout.color);
+    for (const block of layout.blocks) {
+      if (block.kind === "separator") {
+        const spacing =
+          block.spacing === "large" ? SeparatorSpacingSize.Large : SeparatorSpacingSize.Small;
+        container.addSeparatorComponents(
+          new SeparatorBuilder().setDivider(block.divider !== false).setSpacing(spacing)
+        );
+      } else {
+        const content = block.content.trim() || "\u200B";
+        container.addTextDisplayComponents(new TextDisplayBuilder().setContent(content.slice(0, 4000)));
+      }
+    }
+    return container;
+  }
+
   // --- internals ---
 
   private wire(): void {
@@ -743,11 +1091,33 @@ export class DiscordAdapter implements ChatAdapter {
       });
     });
     this.client.on(Events.InteractionCreate, (interaction) => {
-      if (!interaction.isChatInputCommand()) return;
-      if (interaction.commandName !== "seam") return;
-      this.handleSlash(interaction).catch((err) => {
-        this.logger.error({ err }, "slash handler crashed");
-      });
+      if (interaction.isChatInputCommand()) {
+        if (interaction.commandName !== "seam") return;
+        this.handleSlash(interaction).catch((err) => {
+          this.logger.error({ err }, "slash handler crashed");
+        });
+        return;
+      }
+      if (
+        (interaction.isButton() || interaction.isModalSubmit()) &&
+        interaction.customId.startsWith("seam-cfg-edit:")
+      ) {
+        this.handlePersistentComponent(interaction).catch((err) => {
+          this.logger.error({ err }, "config-editor component handler crashed");
+        });
+        return;
+      }
+      const cid =
+        interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit()
+          ? interaction.customId
+          : "";
+      if (cid.startsWith(CHOICE_CUSTOM_ID_PREFIX)) {
+        this.handleChoiceInteraction(interaction as ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction).catch(
+          (err) => {
+            this.logger.error({ err }, "choice-card interaction handler crashed");
+          }
+        );
+      }
     });
     this.client.on(Events.ThreadDelete, (thread) => {
       void Promise.resolve(this.threadDeleteHandler?.(thread.id)).catch((err) => {

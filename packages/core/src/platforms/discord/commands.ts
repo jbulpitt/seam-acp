@@ -7,12 +7,12 @@ import {
  * `/seam` slash-command tree (#78).
  *
  * Discord caps each command at 25 top-level options (subcommands + groups).
- * The tree is 12/25: 4 top-level subcommands + 8 groups. Future surfaces
+ * The tree is 13/25: 5 top-level subcommands + 8 groups. Future surfaces
  * default to living INSIDE a group (each group has its own 25 budget).
  *
- *   TOP-LEVEL (4): cancel, steer, new, workflows
+ *   TOP-LEVEL (5): cancel, steer, new, workflows, queue
  *   GROUPS (8):
- *     config   (13) model effort agent mode repo tools approve reset init detach show set audit
+ *     config   (14) model effort agent mode repo tools approve reset init detach show edit set audit
  *     info     (6)  whoami usage avatar help sessions repos
  *     schedule (7)  unchanged
  *     preset   (6)  unchanged
@@ -26,7 +26,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
     .setName("seam")
     .setDescription("Control the seam-acp agent");
 
-  // --- top-level (5) --------------------------------------------------------
+  // --- top-level (5): cancel, steer, new, workflows, queue -----------------
 
   cmd.addSubcommand((sub) =>
     sub
@@ -120,6 +120,24 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("cancel-watch")
           .setDescription("Cancel a pending watch in this thread by id")
           .setRequired(false)
+      )
+      .addStringOption((o) =>
+        o
+          .setName("cancel-choice")
+          .setDescription("Cancel an open choice card in this thread by id")
+          .setRequired(false)
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub
+      .setName("queue")
+      .setDescription("Queue the next live turn in this thread (waits; does not abort the current one)")
+      .addStringOption((o) =>
+        o
+          .setName("prompt")
+          .setDescription("The prompt to run when the current turn ends (or now, if idle)")
+          .setRequired(true)
       )
   );
 
@@ -255,6 +273,11 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
       .addSubcommand((sub) =>
         sub.setName("show").setDescription("Show current session config")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("edit")
+          .setDescription("Open the visual thread config editor (draft, then Save/Cancel)")
       )
       .addSubcommand((sub) =>
         sub
@@ -591,7 +614,9 @@ export type SeamSubcommand =
   | "approve"
   | "reset"
   | "init"
+  | "detach"
   | "show"
+  | "edit"
   | "set"
   | "audit"
   | "whoami"

@@ -184,6 +184,12 @@ describe("locked-channel slash gate admin-immunity (#71)", () => {
     ).toBe(false);
   });
 
+  it("allows lock-exempt /seam queue for anyone (#89 D10)", () => {
+    expect(
+      Orchestrator.isLockedSlashRefused(cfg(new Set([ADMIN]), true), "channel-1", "queue", "student-9")
+    ).toBe(false);
+  });
+
   it("never refuses in an unlocked channel", () => {
     expect(
       Orchestrator.isLockedSlashRefused(cfg(new Set([ADMIN]), false), "channel-1", "preset", "student-9")
@@ -225,10 +231,11 @@ describe("participant slash gate (#74)", () => {
     );
   });
 
-  it("allows a participant help / cancel (NOT steer)", () => {
+  it("allows a participant help / cancel / queue (NOT steer)", () => {
     const c = cfg(new Set([STUDENT]));
     expect(Orchestrator.isParticipantSlashRefused(c, "help", STUDENT)).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(c, "cancel", STUDENT)).toBe(false);
+    expect(Orchestrator.isParticipantSlashRefused(c, "queue", STUDENT)).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(c, "steer", STUDENT)).toBe(true);
   });
 

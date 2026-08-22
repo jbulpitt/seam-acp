@@ -20,6 +20,8 @@ import { serializePanelText } from "../renderer.js";
 import type {
   ChatAdapter,
   ChannelRef,
+  ComponentEvent,
+  ChoiceInteraction,
   IncomingMessage,
   MessageRef,
   MessageAttachment,
@@ -36,6 +38,14 @@ import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manage
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import type { WakeManager } from "../../core/wake/manager.js";
 import type { WakeEvent, WakeScheduleRequest } from "../../core/wake/types.js";
+import type { ParkedPromptManager } from "../../core/parked-prompts/manager.js";
+import type { ParkedKind, ParkedPrompt } from "../../core/parked-prompts/types.js";
+import {
+  PARKED_ATTACH_MAX_BYTES,
+  saveParkedAttachment,
+  deleteParkedAttachmentDir,
+  loadParkedAttachmentBytes,
+} from "../../core/parked-prompts/attachments.js";
 import type { InboxMessage } from "../../core/inbox/types.js";
 import {
   WAKE_MIN_DELAY_SECONDS,
@@ -104,6 +114,29 @@ import {
   parseAgentAtLocation,
 } from "./location.js";
 import {
+  ConfigEditorStore,
+  INHERIT_VALUE,
+  RIDER_MODAL_MAX,
+  applyPickerValue,
+  authorizeDraftClick,
+  buildSavePlan,
+  currentThreadRiderText,
+  decodeRiderUpload,
+  isDirty,
+  makeCustomId,
+  parseCustomId,
+  renderCancelledHub,
+  renderExpiredHub,
+  renderHub,
+  renderSavedHub,
+  riderDownloadFilename,
+  riderTooLong,
+  snapshotFromDescribe,
+  type DraftAgentCapabilities,
+  type InheritedConfig,
+  type ThreadConfigDraft,
+} from "./config-editor.js";
+import {
   bindSessionLocation,
   isolatedBindSessionId,
   planIsolatedRemoteSpawn,
@@ -113,6 +146,8 @@ import {
   isLocalLocation,
   LOCAL_LOCATION,
   formatAgentAtLocation,
+  hostShortName,
+  listHosts,
 } from "../../core/location.js";
 
 /** Accent color for scheduled-prompt cards ("cron blue"). */
@@ -147,6 +182,9 @@ const WAKE_COLOR = 0xf59e0b;
 /** Accent color for watch cards (#60) — "signal green" so a condition-triggered
  *  re-entry reads distinctly from wake amber. */
 const WATCH_COLOR = 0x22c55e;
+
+/** Accent color for parked-prompt notices (#88). */
+const PARKED_COLOR = 0x3498db;
 
 const SCHEDULE_DEFAULT_TZ = "America/Chicago";
 const SCHEDULE_TIMEZONES = [
@@ -194,7 +232,28 @@ import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
-import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, isMathFenceLang, withHarnessPreamble } from "../../core/agent-conventions.js";
+import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, withHarnessPreamble } from "../../core/agent-conventions.js";
+import {
+  CHOICE_AUTHORING_RULE,
+  CHOICE_CUSTOM_TEXT_MAX,
+  choiceClickRefusal,
+  defaultMaxClicks,
+  isChoiceAuthoringRefused,
+  makeChoiceModalId,
+  newChoiceId,
+  normalizeIngress,
+  parseChoiceCustomId,
+  parseChoiceFence,
+  parseChoiceSpec,
+  renderChoicePanel,
+  resolveIngestOptionIndex,
+  resolveOptionTarget,
+  type ChoiceCard,
+  type ChoiceSpec,
+} from "../../core/choice/types.js";
+import { emitChoice, planChoiceDispatch } from "../../core/choice/emit.js";
+import { ChoiceResultHub, parseResultFence, extractSeamResultFromText } from "../../core/choice/result.js";
+import { mintBridgeToken, hashBridgeToken } from "../../core/bridge-pairing.js";
 import { renderMathPng } from "../../core/math-render.js";
 import { isInlineableForAgent } from "../../agents/attachments.js";
 import { stageAttachment, sweepStagedAttachments } from "@seam/adapters";
@@ -288,6 +347,15 @@ export class Orchestrator {
   /** Set by index.ts after construction; the DB sweeper for agent-defined
    *  watches (#60). Held only so shutdown/diagnostics can reach it. */
   private watchManager?: WatchManager;
+  /** Set by index.ts after construction; event-driven parked-prompt delivery (#88). */
+  private parkedManager?: ParkedPromptManager;
+  /** Status-card poke after park/cancel so `📥 N waiting` updates immediately. */
+  private onParkedChange?: () => void;
+  /**
+   * Wall-clock of the last real (msg.raw) user message per thread. A parked
+   * fire that is older than this was superseded — D2: only the latest runs.
+   */
+  private readonly lastUserMessageAt = new Map<string, number>();
   /** Live self-renewal depth per thread (#59, D8): set while a woken turn runs
    *  (keyed by channelRef → the firing wake's `chainDepth`) so a `schedule_wake`
    *  call *during* that turn inherits depth+1. Absent ⇒ a fresh (depth-0) wake.
@@ -309,6 +377,10 @@ export class Orchestrator {
    *  leaks into a later dispatched/scheduled turn. The config_propose lock gate
    *  reads this (via `currentSpeaker`) — the id, never a display name. */
   private readonly currentSpeakerIds = new Map<string, string>();
+  /** Discord author id of the CURRENT *user* turn on a thread (#91 D9).
+   *  Always the message author id, independent of SPEAKER_IDENTITY_ENABLED.
+   *  Unset for injected turns (dispatch / isolated / wake / watch). */
+  private readonly currentAuthorIds = new Map<string, string>();
   /** Set by index.ts after construction so command-layer cancel can finalize
    *  running/pending specs without going through dispose(). */
   private dispatchWatcher?: DispatchWatcher;
@@ -317,6 +389,12 @@ export class Orchestrator {
   private readonly liveTurnByChannel = new Map<string, string>();
   /** Set by index.ts after construction — pairing + debug + attach ferry. */
   private bridgeHub?: BridgeHub;
+  /** In-memory /seam config edit drafts (#90). Idle TTL 60 min. */
+  private readonly configEditor = new ConfigEditorStore();
+  /** #92: declared HTTP result waiters for ingest-triggered choice turns. */
+  private choiceResults?: ChoiceResultHub;
+  /** Public POST /ingest base (no token). */
+  private ingestUrl?: () => string;
   /** Stash a marker so a live-turn re-fire reuses it instead of writing a
    *  second one (which would double-resume on the next crash). */
   private readonly pendingLiveResume = new Map<string, LiveTurnMarker>();
@@ -462,6 +540,8 @@ export class Orchestrator {
 
   install(): void {
     this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
+    this.adapter.onComponent?.((evt) => this.handleConfigEditorComponent(evt));
+    this.adapter.onChoiceInteraction?.((evt) => this.handleChoiceCardInteraction(evt));
     this.adapter.onThreadDelete?.((channelRef) => this.handleThreadDeleted(channelRef));
     // DB-backed channel activation (#22): let the adapter's channel gate treat
     // an enabled active_projects row as allowed, additive to the env allowlist.
@@ -471,16 +551,18 @@ export class Orchestrator {
 
   /** Instant cleanup when a thread is deleted: drop its scheduled prompts and
    *  their stored attachments. (Fire-time 404 is the lazy fallback if the bot
-   *  was offline when the delete happened.) */
+   *  was offline when the delete happened.) Also drops a parked prompt (#88). */
   private async handleThreadDeleted(channelRef: string): Promise<void> {
     const rows = this.store.listScheduledByChannel(PLATFORM, channelRef);
-    if (rows.length === 0) return;
-    this.logger.info({ channelRef, count: rows.length }, "thread deleted; dropping scheduled prompts");
-    for (const row of rows) {
-      this.scheduledManager?.disarm(row.id);
-      this.store.deleteScheduled(row.id);
-      await deleteScheduledAttachmentDir(this.config.DATA_DIR, row.id).catch(() => {});
+    if (rows.length > 0) {
+      this.logger.info({ channelRef, count: rows.length }, "thread deleted; dropping scheduled prompts");
+      for (const row of rows) {
+        this.scheduledManager?.disarm(row.id);
+        this.store.deleteScheduled(row.id);
+        await deleteScheduledAttachmentDir(this.config.DATA_DIR, row.id).catch(() => {});
+      }
     }
+    await this.dropParkedForDeletedThread(channelRef);
   }
 
   async postNotification(message: string): Promise<void> {
@@ -491,6 +573,20 @@ export class Orchestrator {
     } catch (err) {
       this.logger.warn({ err }, "failed to post notification");
     }
+  }
+
+  /** In-flight turns (user + scheduled + dispatch) counted for restart drain. */
+  activeTurnCount(): number {
+    return this.activeTurns;
+  }
+
+  /** True when this thread has a turn in `channelQueues` (#89 busy gate). */
+  isChannelBusy(channelRef: string): boolean {
+    return this.channelQueues.has(channelRef);
+  }
+
+  isRestartPending(): boolean {
+    return this.restartPending;
   }
 
   private sentinelPoller: ReturnType<typeof setInterval> | null = null;
@@ -579,6 +675,10 @@ export class Orchestrator {
   private async handleIncomingMessage(msg: IncomingMessage): Promise<void> {
     const channelId = msg.channel.id;
 
+    // Config editor: next file from the editor owner becomes the draft rider.
+    // Must run before abort / park so the upload is not treated as a new turn.
+    if (await this.tryConsumeConfigEditorRiderUpload(msg)) return;
+
     // #63: cooperative mid-turn reply routing (flag-gated, DARK by default). When
     // a turn is already active on this thread and SEAM_MIDTURN_REPLY_MODE="inbox",
     // a bare reply joins the running agent's inbox (#61) instead of force-aborting
@@ -591,6 +691,17 @@ export class Orchestrator {
     ) {
       await this.routeMidTurnReplyToInbox(msg);
       return;
+    }
+
+    // #89 D9: a live (non-park) user message supersedes any parked queue item
+    // BEFORE aborting, so a turn-end fire cannot sneak the old prompt in after
+    // abort completes. Offline-bridge parks skip this — they REPLACE the row.
+    if (msg.raw && !this.wouldParkForOfflineBridge(msg)) {
+      this.lastUserMessageAt.set(channelId, Date.now());
+      await this.clearParkedForChannel(
+        channelId,
+        "🚫 Cancelled — a newer message is running instead."
+      );
     }
 
     // Bump the generation so any previously-queued (but not-yet-started) tasks
@@ -616,6 +727,11 @@ export class Orchestrator {
       await this.router.abortTurn(record.id, { force: true });
     }
 
+    // #88 D8: park BEFORE getOrStartRuntime when this thread is bound to a
+    // remote bridge that is not ready. After aborting any in-flight turn so
+    // this message replaces it. Does not hold the Discord turn open.
+    if (await this.tryParkForOfflineBridge(msg)) return;
+
     const existingQueue = this.channelQueues.get(channelId) ?? Promise.resolve();
 
     const newQueue = existingQueue.then(async () => {
@@ -632,12 +748,7 @@ export class Orchestrator {
     });
 
     this.channelQueues.set(channelId, newQueue);
-
-    void newQueue.then(() => {
-      if (this.channelQueues.get(channelId) === newQueue) {
-        this.channelQueues.delete(channelId);
-      }
-    });
+    this.releaseChannelQueue(channelId, newQueue);
 
     await newQueue;
   }
@@ -673,12 +784,22 @@ export class Orchestrator {
       () => undefined
     );
     this.channelQueues.set(channelId, link);
+    this.releaseChannelQueue(channelId, link);
+    return result;
+  }
+
+  /**
+   * Drop `link` from `channelQueues` once it is the last waiter, then try to
+   * fire a parked `/seam queue` (or leftover #88) row. #89 D7: turn-end is a
+   * fire hook alongside `onBridgeReady`.
+   */
+  private releaseChannelQueue(channelId: string, link: Promise<void>): void {
     void link.then(() => {
       if (this.channelQueues.get(channelId) === link) {
         this.channelQueues.delete(channelId);
+        void this.tryFireParked(channelId);
       }
     });
-    return result;
   }
 
   private async handleIncomingMessageInner(msg: IncomingMessage): Promise<void> {
@@ -1342,8 +1463,19 @@ export class Orchestrator {
       // Only set when we have a harness-stamped id — with speaker identity off
       // the gate sees nothing and keeps refusing (never fail open).
       if (speaker) this.currentSpeakerIds.set(record.channelRef, speaker.id);
+      if (msg.authorId) this.currentAuthorIds.set(record.channelRef, msg.authorId);
       const secretFiles = await listThreadSecrets(this.config.DATA_DIR, channel.id).catch(() => []);
       const extraRules = [...riders, ...secretHarnessRules(secretFiles)];
+      if (
+        msg.authorId &&
+        !isRestrictedParticipant(
+          msg.authorId,
+          this.config.SEAM_PARTICIPANT_USER_IDS,
+          this.config.SEAM_CONFIG_ADMIN_USER_IDS
+        )
+      ) {
+        extraRules.push(CHOICE_AUTHORING_RULE);
+      }
       let promptText = withHarnessPreamble(msg.text, extraRules, speaker, {
         inboxAwareness: this.config.SEAM_INBOX_PREAMBLE_ENABLED,
       });
@@ -1719,6 +1851,7 @@ export class Orchestrator {
       // #71: drop the current-turn speaker id so it can never authorize a
       // config_propose on a later dispatched/scheduled turn (no human speaker).
       this.currentSpeakerIds.delete(record.channelRef);
+      this.currentAuthorIds.delete(record.channelRef);
       await consumeThreadSecrets(this.config.DATA_DIR, channel.id).catch((err) =>
         this.logger.warn({ err, channel: channel.id }, "secret consume failed")
       );
@@ -1759,17 +1892,18 @@ export class Orchestrator {
    *  (`PARTICIPANT_ALLOWED_SUBCOMMANDS` below): this set includes `steer`.
    *  `cancel` here is the PLAIN cancel (this thread). `cancel scope:all`
    *  is excluded by `isCancelScopeAll` — it is the old privileged `kill`. */
-  private static readonly LOCK_EXEMPT_SUBCOMMANDS = new Set(["cancel", "steer"]);
+  private static readonly LOCK_EXEMPT_SUBCOMMANDS = new Set(["cancel", "steer", "queue"]);
 
   /**
    * Subcommands a restricted participant (#74) may still run. A NEW, SEPARATE
    * constant from `LOCK_EXEMPT_SUBCOMMANDS` — that one includes `steer`
    * (redirects another agent) and answers a different question (survives a
    * channel lock). Participants get cancel (self-unstick their own wedged
-   * turn, including `force:true`) and help, but NOT steer, NOT
-   * `cancel scope:all` (old kill), and no config.
+   * turn, including `force:true`) and help, plus `/seam queue` (their own next
+   * prompt, #89 D10), but NOT steer, NOT `cancel scope:all` (old kill), and
+   * no config.
    */
-  private static readonly PARTICIPANT_ALLOWED_SUBCOMMANDS = new Set(["help", "cancel"]);
+  private static readonly PARTICIPANT_ALLOWED_SUBCOMMANDS = new Set(["help", "cancel", "queue"]);
 
   /**
    * Options the slash gates inspect. Only `scope` changes privilege today:
@@ -2006,6 +2140,8 @@ export class Orchestrator {
           return this.cmdDetach(interaction);
         case "show":
           return this.cmdConfig(interaction);
+        case "edit":
+          return this.cmdConfigEdit(interaction);
         case "set":
           return this.cmdConfigSet(interaction);
         case "audit":
@@ -2019,6 +2155,8 @@ export class Orchestrator {
         return this.cmdCancel(interaction);
       case "steer":
         return this.cmdSteer(interaction);
+      case "queue":
+        return this.cmdQueue(interaction);
       case "workflows":
         return this.cmdWorkflows(interaction);
       default:
@@ -2914,6 +3052,30 @@ export class Orchestrator {
     this.bridgeHub = hub;
   }
 
+  setChoiceResults(hub: ChoiceResultHub): void {
+    this.choiceResults = hub;
+  }
+
+  setIngestUrl(fn: () => string): void {
+    this.ingestUrl = fn;
+  }
+
+  inspectChoiceDestLive(card: ChoiceCard, optionIndex: number): Promise<"ok" | "gone" | "archived"> {
+    return this.choiceDestLive(card, optionIndex);
+  }
+
+  submitChoiceResult(
+    record: { id: string; channelRef: string },
+    value: unknown
+  ): { ok: true; dispatchId: string } | { ok: false; error: string } {
+    if (!this.choiceResults) {
+      return { ok: false, error: "ingest results are not configured on this deployment." };
+    }
+    const fromSession = this.choiceResults.submitFromSession(record.id, value);
+    if (fromSession.ok) return fromSession;
+    return this.choiceResults.submitFromChannel(record.channelRef, value);
+  }
+
   /**
    * #85: a `@<bridge>` resume waits for that bridge's ready event (no poll).
    * Past max-age → abandon. Local resume is unchanged. Never rebinds a
@@ -2960,8 +3122,11 @@ export class Orchestrator {
     profile?: AgentProfile;
     cwd: string;
   }): Pick<InjectTurnOptions, "spawnFn" | "mcpServers"> {
-    if (opts.effectiveSession !== "isolated" || isLocalLocation(opts.workerLocation)) {
-      return {};
+    if (opts.effectiveSession !== "isolated") return {};
+    // Local isolated used to spawn with mcpServers: [] — ingest scoring then
+    // had no submit_result. Reuse the authoring thread's token (do not mint).
+    if (isLocalLocation(opts.workerLocation)) {
+      return { mcpServers: this.router.reuseMcpServers(opts.record.id) };
     }
     if (!this.bridgeHub) {
       throw new Error(`dispatch ${opts.spec.id}: location "${opts.workerLocation}" needs a connected bridge`);
@@ -2990,6 +3155,14 @@ export class Orchestrator {
 
   setWakeManager(m: WakeManager): void {
     this.wakeManager = m;
+  }
+
+  setParkedManager(m: ParkedPromptManager): void {
+    this.parkedManager = m;
+  }
+
+  setOnParkedChange(fn: () => void): void {
+    this.onParkedChange = fn;
   }
 
   // --- agent-scheduled wake events (#59) ------------------------------------
@@ -3426,6 +3599,565 @@ export class Orchestrator {
       ``,
       wake.prompt,
     ].join("\n");
+  }
+
+  // --- parked prompts (#88) -------------------------------------------------
+
+  /**
+   * Gate for #88: this user message would park because the thread is bound to
+   * a remote bridge that is not ready. Side-effect free — the D9 live-path
+   * clear uses this so it does not wipe a row we are about to replace.
+   */
+  private wouldParkForOfflineBridge(msg: IncomingMessage): boolean {
+    if (!msg.raw) return false;
+    if (!this.bridgeHub) return false;
+    const location = resolveThreadLocation(this.config, msg.channel.id);
+    if (isLocalLocation(location)) return false;
+    if (this.bridgeHub.isBridgeReady(location)) return false;
+    return true;
+  }
+
+  /**
+   * Park this user message if the thread is bound to a remote bridge that is
+   * not ready. Returns true when parked (caller must return without starting
+   * a runtime). Real Discord messages only (`msg.raw`) — synthetic
+   * schedule/wake/resume turns go through Inner and must not park here.
+   */
+  private async tryParkForOfflineBridge(msg: IncomingMessage): Promise<boolean> {
+    if (!this.wouldParkForOfflineBridge(msg)) return false;
+    const location = resolveThreadLocation(this.config, msg.channel.id);
+    await this.parkUserPrompt(msg, location);
+    // Race: the host came ready while we staged. Fire now rather than waiting
+    // for the next hello (which may be hours away).
+    if (this.bridgeHub?.isBridgeReady(location)) {
+      await this.parkedManager?.fireLocation(location);
+    }
+    return true;
+  }
+
+  private parkedHostLabel(location: string): string {
+    const host = this.config.bridgePresets?.get(location);
+    return hostShortName(host, location);
+  }
+
+  private parkedNoticeBody(opts: {
+    kind: ParkedKind;
+    location: string;
+    busy: boolean;
+    skipped: string[];
+  }): string {
+    const host = this.parkedHostLabel(opts.location);
+    const remote = !isLocalLocation(opts.location);
+    const ready = !remote || !!this.bridgeHub?.isBridgeReady(opts.location);
+    let body: string;
+    if (opts.kind === "user_queue") {
+      const when: string[] = [];
+      if (opts.busy) when.push("the current turn ends");
+      if (remote && !ready) when.push(`**${host}** reconnects`);
+      const clause =
+        when.length === 0
+          ? `when **${host}** reconnects`
+          : when.length === 1
+            ? `when ${when[0]}`
+            : `when ${when[0]}, or when ${when[1]}`;
+      body =
+        `📥 Queued — will run ${clause}. ` +
+        `Send a normal message to run now (cancels this queue).`;
+    } else {
+      body = `📥 Parked — will run when **${host}** reconnects.`;
+    }
+    if (opts.skipped.length > 0) {
+      body += `\nSkipped oversized attachment(s): ${opts.skipped.join(", ")}.`;
+    }
+    return body;
+  }
+
+  private async parkUserPrompt(msg: IncomingMessage, location: string): Promise<void> {
+    await this.parkPrompt({
+      channel: msg.channel,
+      location,
+      prompt: msg.text,
+      authorId: msg.authorId,
+      authorName: msg.authorName ?? null,
+      kind: "bridge_offline",
+      attachments: msg.attachments,
+      busy: this.channelQueues.has(msg.channel.id),
+    });
+  }
+
+  /**
+   * Shared park helper (#88 + #89): upsert one row per thread, cancel the
+   * previous notice, post a new one, stage attachments. Latest write wins.
+   */
+  private async parkPrompt(args: {
+    channel: ChannelRef;
+    location: string;
+    prompt: string;
+    authorId: string;
+    authorName: string | null;
+    kind: ParkedKind;
+    attachments?: ReadonlyArray<MessageAttachment>;
+    busy?: boolean;
+  }): Promise<ParkedPrompt> {
+    const previous = this.store.getParkedByChannel(PLATFORM, args.channel.id);
+    if (previous) {
+      await this.editParkedNotice(previous, `🚫 Cancelled — replaced by a newer parked prompt.`);
+      await deleteParkedAttachmentDir(this.config.DATA_DIR, previous.id).catch(() => {});
+      this.store.deleteParked(previous.id);
+    }
+
+    const id = randomUUID();
+    const { kept, skipped } = await this.stageParkedAttachments(id, args.attachments);
+    const body = this.parkedNoticeBody({
+      kind: args.kind,
+      location: args.location,
+      busy: args.busy === true,
+      skipped,
+    });
+    const noticeRef = await this.postParkedNotice(args.channel, body);
+
+    const row: ParkedPrompt = {
+      id,
+      platform: PLATFORM,
+      channelRef: args.channel.id,
+      parentRef: args.channel.parentId ?? null,
+      location: args.location,
+      kind: args.kind,
+      prompt: args.prompt,
+      authorId: args.authorId,
+      authorName: args.authorName,
+      noticeMessageId: noticeRef?.id ?? null,
+      attachments: kept,
+      createdUtc: new Date().toISOString(),
+    };
+    this.store.upsertParked(row);
+    this.logger.info(
+      {
+        id,
+        channel: args.channel.id,
+        location: args.location,
+        kind: args.kind,
+        replaced: !!previous,
+        files: kept.length,
+      },
+      args.kind === "user_queue"
+        ? "queued next live turn"
+        : "parked prompt while remote bridge offline"
+    );
+    this.onParkedChange?.();
+    return row;
+  }
+
+  private async stageParkedAttachments(
+    parkedId: string,
+    attachments: ReadonlyArray<MessageAttachment> | undefined
+  ): Promise<{ kept: ParkedPrompt["attachments"]; skipped: string[] }> {
+    const kept: ParkedPrompt["attachments"] = [];
+    const skipped: string[] = [];
+    if (!attachments || attachments.length === 0) return { kept, skipped };
+    for (const a of attachments) {
+      if (a.size > PARKED_ATTACH_MAX_BYTES) {
+        skipped.push(`${a.filename} (${a.size} B)`);
+        continue;
+      }
+      try {
+        const res = await fetch(a.url);
+        if (!res.ok) throw new Error(`download ${res.status} ${res.statusText}`);
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length > PARKED_ATTACH_MAX_BYTES) {
+          skipped.push(`${a.filename} (${buf.length} B)`);
+          continue;
+        }
+        const saved = await saveParkedAttachment(this.config.DATA_DIR, parkedId, {
+          filename: a.filename,
+          mime: a.contentType || "application/octet-stream",
+          bytes: buf,
+        });
+        kept.push(saved);
+      } catch (err) {
+        this.logger.warn({ err, filename: a.filename }, "parked attachment download failed; parking without file");
+        skipped.push(`${a.filename} (download failed)`);
+      }
+    }
+    return { kept, skipped };
+  }
+
+  private async postParkedNotice(channel: ChannelRef, description: string): Promise<MessageRef | undefined> {
+    try {
+      const p: StructuredPanel = {
+        color: PARKED_COLOR,
+        title: "📥 Parked",
+        description: description.slice(0, 4096),
+        fields: [],
+      };
+      if (this.adapter.sendPanel) return await this.adapter.sendPanel(channel, p);
+      return await this.adapter.sendMessage(channel, description);
+    } catch (err) {
+      this.logger.warn({ err, channel: channel.id }, "parked notice send failed");
+      return undefined;
+    }
+  }
+
+  private async editParkedNotice(parked: ParkedPrompt, text: string): Promise<void> {
+    if (!parked.noticeMessageId) return;
+    const ref: MessageRef = {
+      channel: {
+        platform: parked.platform,
+        id: parked.channelRef,
+        ...(parked.parentRef ? { parentId: parked.parentRef } : {}),
+      },
+      id: parked.noticeMessageId,
+    };
+    try {
+      const p: StructuredPanel = {
+        color: PARKED_COLOR,
+        title: text.startsWith("▶️") ? "▶️ Running" : "🚫 Cancelled",
+        description: text.slice(0, 4096),
+        fields: [],
+        actions: [],
+      };
+      if (this.adapter.editPanel) await this.adapter.editPanel(ref, p);
+      else await this.adapter.editMessage(ref, text);
+    } catch (err) {
+      this.logger.warn({ err, id: parked.id }, "parked notice edit failed");
+    }
+  }
+
+  /**
+   * ParkedPromptManager `onFire`: thread still postable, ferry staged files
+   * onto the host via `writeAttachment`, announce, then enqueue a live turn
+   * on the same host. The row is already deleted (delete-before-fire).
+   */
+  async fireParked(parked: ParkedPrompt): Promise<void> {
+    // onBridgeReady / a racy tryFireParked may reach here while a turn is
+    // still running. Put the row back (unless a newer user message already
+    // cancelled it) so D8/D9 can still drop it — do not enqueue a dispatch
+    // that those paths cannot see.
+    if (this.channelQueues.has(parked.channelRef)) {
+      this.restoreParkedIfCurrent(parked);
+      this.logger.info(
+        { id: parked.id, channel: parked.channelRef },
+        "parked: thread still busy; not firing"
+      );
+      return;
+    }
+    const target: ChannelRef = {
+      platform: PLATFORM,
+      id: parked.channelRef,
+      ...(parked.parentRef ? { parentId: parked.parentRef } : {}),
+    };
+    if (typeof this.adapter.getThreadLiveState === "function") {
+      let state: { locked: boolean; archived: boolean } | undefined;
+      try {
+        state = await this.adapter.getThreadLiveState(target);
+      } catch (err) {
+        this.logger.warn({ id: parked.id, err }, "parked: thread state check failed; dropping");
+        await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
+        this.onParkedChange?.();
+        return;
+      }
+      if (state === undefined) {
+        this.logger.info({ id: parked.id, channel: parked.channelRef }, "parked: thread deleted; dropping");
+        await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
+        this.onParkedChange?.();
+        return;
+      }
+      if (state.locked) {
+        this.logger.info({ id: parked.id, channel: parked.channelRef }, "parked: thread is Discord-locked; dropping");
+        await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
+        this.onParkedChange?.();
+        return;
+      }
+    }
+
+    if (this.parkedSupersededByNewerUser(parked)) {
+      this.logger.info(
+        { id: parked.id, channel: parked.channelRef },
+        "parked: superseded by a newer user message; dropping"
+      );
+      await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
+      this.onParkedChange?.();
+      return;
+    }
+
+    const record = this.router.ensureSessionRecord({
+      platform: PLATFORM,
+      channelRef: parked.channelRef,
+      ...(parked.parentRef ? { parentRef: parked.parentRef } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+    // Same host as park time — never fall back to @local if the thread
+    // preset moved (D4 / #85). startRuntime still re-reads the preset;
+    // this pins the in-memory session→bridge map for the inject.
+    bindSessionLocation(this.bridgeHub, record.id, parked.location);
+    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    const pathLines: string[] = [];
+    const ferryToHost = !isLocalLocation(parked.location);
+    for (const a of parked.attachments) {
+      const bytes = await loadParkedAttachmentBytes(this.config.DATA_DIR, parked.id, a);
+      if (!bytes) {
+        pathLines.push(`- \`${a.filename}\` — could not be loaded from parked storage`);
+        continue;
+      }
+      if (!ferryToHost) {
+        pathLines.push(`- \`${a.filename}\` — parked locally (not ferried)`);
+        continue;
+      }
+      try {
+        const result = (await this.bridgeHub?.rpc(
+          parked.location,
+          "writeAttachment",
+          { cwd, filename: a.filename, bytes: bytes.toString("base64") },
+          record.agentId
+        )) as { path?: string } | null | undefined;
+        const written = result?.path;
+        pathLines.push(
+          written
+            ? `- \`${a.filename}\` → \`${written}\``
+            : `- \`${a.filename}\` — host did not return a path`
+        );
+      } catch (err) {
+        this.logger.warn({ err, filename: a.filename, id: parked.id }, "parked: writeAttachment failed");
+        pathLines.push(`- \`${a.filename}\` — could not be transferred to the agent host`);
+      }
+    }
+    await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
+
+    let prompt = parked.prompt;
+    if (pathLines.length > 0) {
+      const hint =
+        `\n\n_The following file${pathLines.length === 1 ? " was" : "s were"} ` +
+        `uploaded and saved to the agent's filesystem:_\n${pathLines.join("\n")}`;
+      prompt = prompt ? `${prompt}${hint}` : hint.trimStart();
+    }
+
+    const queued = parked.kind === "user_queue";
+    const runningText = queued
+      ? "▶️ queued prompt"
+      : `▶️ Running parked prompt (host **${this.parkedHostLabel(parked.location)}** reconnected).`;
+    if (parked.noticeMessageId) {
+      await this.editParkedNotice(parked, runningText);
+    } else {
+      try {
+        await this.sendResultCard(
+          target,
+          queued ? "▶️ queued prompt" : "▶️ Running parked prompt",
+          queued
+            ? "Running the prompt that was waiting."
+            : `Host **${this.parkedHostLabel(parked.location)}** reconnected — running the prompt that was waiting.`,
+          PARKED_COLOR
+        );
+      } catch (err) {
+        this.logger.warn({ id: parked.id, err }, "parked: running-notice card failed");
+      }
+    }
+
+    if (this.parkedSupersededByNewerUser(parked)) {
+      this.logger.info(
+        { id: parked.id, channel: parked.channelRef },
+        "parked: superseded before enqueue; dropping"
+      );
+      this.onParkedChange?.();
+      return;
+    }
+    if (this.channelQueues.has(parked.channelRef)) {
+      this.restoreParkedIfCurrent(parked);
+      this.logger.info(
+        { id: parked.id, channel: parked.channelRef },
+        "parked: thread became busy before enqueue; not firing"
+      );
+      return;
+    }
+
+    const spec: DispatchSpec = {
+      id: randomUUID(),
+      target: parked.channelRef,
+      prompt,
+      session: "live",
+      kind: "parked",
+      location: parked.location,
+      correlationId: parked.id,
+      createdUtc: new Date().toISOString(),
+    };
+    await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+    this.logger.info(
+      { id: parked.id, dispatch: spec.id, channel: parked.channelRef, location: parked.location },
+      "parked: fired (dispatch enqueued)"
+    );
+    this.onParkedChange?.();
+  }
+
+  private parkedSupersededByNewerUser(parked: ParkedPrompt): boolean {
+    const lastUser = this.lastUserMessageAt.get(parked.channelRef);
+    const parkedAt = Date.parse(parked.createdUtc);
+    return (
+      lastUser !== undefined &&
+      !Number.isNaN(parkedAt) &&
+      lastUser >= parkedAt
+    );
+  }
+
+  /**
+   * Re-insert a parked row that was delete-before-fire'd but must not run
+   * yet (thread still busy). Never overwrite a newer park (D2) or revive a
+   * row D9 already cancelled.
+   */
+  private restoreParkedIfCurrent(parked: ParkedPrompt): void {
+    if (this.parkedSupersededByNewerUser(parked)) return;
+    const existing = this.store.getParkedByChannel(PLATFORM, parked.channelRef);
+    if (existing) return;
+    this.store.upsertParked(parked);
+    this.onParkedChange?.();
+  }
+
+  /**
+   * #89 D7: if this thread has a parked row and the host is ready, fire it
+   * as a live turn. No-op when the channel is still busy, the host is down
+   * (wait for `onBridgeReady`), or a newer user message already took over.
+   * Delete-before-fire — same as the manager's location sweep.
+   */
+  async tryFireParked(channelRef: string): Promise<void> {
+    if (this.channelQueues.has(channelRef)) return;
+    const parked = this.store.getParkedByChannel(PLATFORM, channelRef);
+    if (!parked) return;
+    if (this.parkedSupersededByNewerUser(parked)) {
+      await this.clearParkedForChannel(
+        channelRef,
+        "🚫 Cancelled — a newer message is running instead."
+      );
+      return;
+    }
+    if (!isLocalLocation(parked.location) && !this.bridgeHub?.isBridgeReady(parked.location)) {
+      return;
+    }
+    this.store.deleteParked(parked.id);
+    try {
+      await this.fireParked(parked);
+    } catch (err) {
+      this.logger.error({ id: parked.id, err, channel: channelRef }, "tryFireParked failed");
+    }
+  }
+
+  private parkedCancelMessage(parked: ParkedPrompt): string {
+    if (parked.kind === "user_queue") {
+      return "📥 Cancelled the queued prompt.";
+    }
+    return `📥 Cancelled the parked prompt that was waiting for **${this.parkedHostLabel(parked.location)}**.`;
+  }
+
+  private async clearParkedForChannel(
+    channelRef: string,
+    notice = "🚫 Cancelled parked prompt."
+  ): Promise<ParkedPrompt | null> {
+    const parked = this.store.deleteParkedByChannel(PLATFORM, channelRef);
+    if (!parked) return null;
+    await this.editParkedNotice(parked, notice);
+    await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
+    this.onParkedChange?.();
+    return parked;
+  }
+
+  private async clearAllParked(): Promise<ParkedPrompt[]> {
+    const rows = this.store.deleteAllParked();
+    for (const parked of rows) {
+      await this.editParkedNotice(parked, "🚫 Cancelled parked prompt.");
+      await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
+    }
+    if (rows.length > 0) this.onParkedChange?.();
+    return rows;
+  }
+
+  private async dropParkedForDeletedThread(channelRef: string): Promise<void> {
+    const parked = this.store.deleteParkedByChannel(PLATFORM, channelRef);
+    if (!parked) return;
+    await deleteParkedAttachmentDir(this.config.DATA_DIR, parked.id).catch(() => {});
+    this.onParkedChange?.();
+    this.logger.info({ channelRef, id: parked.id }, "thread deleted; dropping parked prompt");
+  }
+
+  /**
+   * `/seam queue` (#89) — park the next live turn instead of aborting.
+   * Idle + host ready → run now (no parked row left sitting). Busy or
+   * offline → park, do not abort, do not bump generation.
+   */
+  private async cmdQueue(i: ChatInputCommandInteraction): Promise<void> {
+    const prompt = (i.options.getString("prompt", true) ?? "").trim();
+    if (!prompt) {
+      await i.reply({
+        content: "Pass a `prompt:` to queue.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const channelId = record.channelRef;
+    const location = resolveThreadLocation(this.config, channelId);
+    const busy = this.channelQueues.has(channelId);
+    const ready =
+      isLocalLocation(location) || !!this.bridgeHub?.isBridgeReady(location);
+    const channel: ChannelRef = {
+      platform: PLATFORM,
+      id: channelId,
+      ...(record.parentRef ? { parentId: record.parentRef } : {}),
+    };
+
+    await i.deferReply();
+
+    if (!busy && ready) {
+      // D2/D4: a sitting #88/#89 row must not survive this run-now, or it
+      // surprise-fires when this turn ends. Stamp lastUser so an in-flight
+      // fireParked of the old row is also treated as superseded.
+      this.lastUserMessageAt.set(channelId, Date.now());
+      await this.clearParkedForChannel(
+        channelId,
+        "🚫 Cancelled — replaced by a newer parked prompt."
+      );
+      try {
+        await this.sendResultCard(
+          channel,
+          "▶️ queued prompt",
+          "Running now.",
+          PARKED_COLOR
+        );
+      } catch (err) {
+        this.logger.warn({ err, channel: channelId }, "queue: run-now notice failed");
+      }
+      const spec: DispatchSpec = {
+        id: randomUUID(),
+        target: channelId,
+        prompt,
+        session: "live",
+        kind: "parked",
+        location,
+        createdUtc: new Date().toISOString(),
+      };
+      await enqueueDispatchSpec(this.config.DATA_DIR, spec);
+      await i.editReply("▶️ Running now — nothing was in flight.");
+      return;
+    }
+
+    await this.parkPrompt({
+      channel,
+      location,
+      prompt,
+      authorId: i.user.id,
+      authorName: i.user.globalName || i.user.username || null,
+      kind: "user_queue",
+      busy,
+    });
+    const host = this.parkedHostLabel(location);
+    const wait = busy
+      ? ready
+        ? "when the current turn ends"
+        : `when the current turn ends, or when **${host}** reconnects`
+      : `when **${host}** reconnects`;
+    await i.editReply(
+      `📥 Queued — will run ${wait}. A normal message runs now and cancels this queue.`
+    );
   }
 
   // --- agent-defined watches (#60) ------------------------------------------
@@ -4036,7 +4768,14 @@ export class Orchestrator {
       // cancels); isolated/preset runs use a throwaway runtime and are unaffected.
       const isLiveDispatch = effectiveSession === "live";
       if (isLiveDispatch) this.activeLiveDispatch.set(spec.target, spec.id);
-      let result: InjectTurnResult;
+      const isChoice = spec.kind === "choice";
+      if (isChoice && this.choiceResults) {
+        // Isolated MCP is injected as the authoring thread (record.id). Bind
+        // that id or submit_result looks up an ACP uuid and misses.
+        this.choiceResults.bindSession(record.id, spec.id);
+        this.choiceResults.bindChannel(spec.target, spec.id);
+      }
+      let result: InjectTurnResult | undefined;
       try {
         result = await this.injectTurn(record, effectivePrompt, {
           session: effectiveSession,
@@ -4067,6 +4806,7 @@ export class Orchestrator {
                 acpSessionId: sessionId,
               });
             } catch { /* best-effort */ }
+            if (isChoice) this.choiceResults?.bindSession(sessionId, spec.id);
           },
           // Drive both additive views from the ONE event stream:
           //  - the OUTPUT renderer gets agent-text (the answer): the flush
@@ -4099,9 +4839,17 @@ export class Orchestrator {
         if (isWake) this.activeWakeDepth.delete(spec.target);
         // No longer interruptible — the turn has ended.
         if (isLiveDispatch) this.activeLiveDispatch.delete(spec.target);
+        if (isChoice && this.choiceResults) {
+          if (result?.text) {
+            const harvested = extractSeamResultFromText(result.text);
+            if (harvested.ok) this.choiceResults.submitFromDispatch(spec.id, harvested.value);
+          }
+          this.choiceResults.turnEnded(spec.id);
+        }
       }
+      if (!result) throw new Error("dispatch: injectTurn returned no result");
 
-      // #67: consume the interrupt flag right after the turn ends (before any
+      // #67: consume the interrupt flag right after the turn ends (before any)
       // downstream delivery), so an interrupt that cancelled THIS turn suppresses
       // its report-back / chain advance below — its partial/stale output must not
       // reach whoever it was reporting to; the interrupt already issued a fresh
@@ -4686,6 +5434,8 @@ export class Orchestrator {
       case "peek": return "🔍 Peek";
       case "compact": return "🗜 Compact";
       case "scheduled": return "📅 Scheduled";
+      case "parked": return "📥 Parked";
+      case "choice": return "🗳️ Choice";
       case "handoff":
       default: return "📨 Handoff";
     }
@@ -4703,6 +5453,8 @@ export class Orchestrator {
       case "peek": return "peek";
       case "compact": return "compact";
       case "scheduled": return "scheduled";
+      case "parked": return "parked prompt";
+      case "choice": return "choice";
       case "handoff":
       default: return "handoff";
     }
@@ -6303,6 +7055,8 @@ export class Orchestrator {
       return;
     }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
+    // #89 D8: drop the parked row BEFORE abort so turn-end fire cannot run it.
+    const parked = await this.clearParkedForChannel(record.channelRef);
     // #76: clear markers at the COMMAND layer, where user intent is
     // unambiguous. dispose()/invalidate() MUST leave them intact — SIGTERM
     // also converges on dispose, and wiping there would make resume a
@@ -6310,8 +7064,13 @@ export class Orchestrator {
     await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
     const outcome = await this.router.abortTurn(record.id, { force: false });
     await i.editReply(
-      outcome === "idle" ? "No active turn." :
-      "🟡 Cancel sent. If the turn doesn't stop shortly, use `/seam cancel force:true` to force it."
+      outcome === "idle"
+        ? parked
+          ? this.parkedCancelMessage(parked)
+          : "No active turn."
+        : `🟡 Cancel sent. If the turn doesn't stop shortly, use \`/seam cancel force:true\` to force it.${
+            parked ? " Also cancelled the queued prompt." : ""
+          }`
     );
   }
 
@@ -6325,18 +7084,29 @@ export class Orchestrator {
       return;
     }
     if (!this.router.hasRuntime(record.id)) {
-      await i.reply({ content: "No active turn.", flags: MessageFlags.Ephemeral });
+      const parked = await this.clearParkedForChannel(record.channelRef);
+      await i.reply({
+        content: parked ? this.parkedCancelMessage(parked) : "No active turn.",
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
+    // #89 D8: drop the parked row BEFORE abort so turn-end fire cannot run it.
+    const parked = await this.clearParkedForChannel(record.channelRef);
     // #76: command-layer clear — see cmdCancel. abortTurn may invalidate →
     // dispose; markers must already be terminal before that runs.
     await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
     const outcome = await this.router.abortTurn(record.id, { force: true });
+    const parkedNote = parked ? ` ${this.parkedCancelMessage(parked)}` : "";
     await i.editReply(
-      outcome === "idle" ? "No active turn." :
-      outcome === "killed" ? "🔪 Turn was hung — force-killed the agent. Your next message resumes the session." :
-      "🛑 Active turn aborted."
+      outcome === "idle"
+        ? parked
+          ? this.parkedCancelMessage(parked)
+          : "No active turn."
+        : outcome === "killed"
+          ? `🔪 Turn was hung — force-killed the agent. Your next message resumes the session.${parkedNote}`
+          : `🛑 Active turn aborted.${parkedNote}`
     );
   }
 
@@ -6347,14 +7117,22 @@ export class Orchestrator {
    *  killed session resumes cleanly on its next message. */
   private async cmdKill(i: ChatInputCommandInteraction): Promise<void> {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
+    // #89 D8: drop parked rows BEFORE killing so turn-end fire cannot run them.
+    const parked = await this.clearAllParked();
     // #76: command-layer clear of EVERY marker (killAll → invalidate →
     // dispose). Involuntary deaths (onDead, SIGTERM) do not take this path.
     await this.clearAllTurnMarkers("cancelled");
     const killed = await this.router.killAll();
+    const parkedNote =
+      parked.length === 0
+        ? ""
+        : ` Also cleared ${parked.length} parked prompt${parked.length === 1 ? "" : "s"}.`;
     await i.editReply(
       killed === 0
-        ? "No active sessions to kill."
-        : `🔪 Force-killed ${killed} active session(s) — including this thread. Each resumes on its next message.`
+        ? parked.length === 0
+          ? "No active sessions to kill."
+          : `📥 Cleared ${parked.length} parked prompt${parked.length === 1 ? "" : "s"} waiting for offline hosts.`
+        : `🔪 Force-killed ${killed} active session(s) — including this thread. Each resumes on its next message.${parkedNote}`
     );
   }
 
@@ -7094,6 +7872,555 @@ export class Orchestrator {
     });
   }
 
+  /** `/seam config edit` — visual draft-then-save hub (#90). Does not abort a live turn. */
+  private async cmdConfigEdit(i: ChatInputCommandInteraction): Promise<void> {
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel || !i.channel?.isThread()) {
+      await i.reply({
+        content: "Use `/seam config edit` inside a thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const record = this.router.ensureSessionRecord({
+      platform: channel.platform,
+      channelRef: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+    const desc = this.router.describeConfig(record);
+    const withoutThread = this.inheritedConfigFor(record);
+    const now = Date.now();
+    const draft: ThreadConfigDraft = {
+      id: randomUUID(),
+      threadId: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      userId: i.user.id,
+      createdAt: now,
+      updatedAt: now,
+      snapshot: snapshotFromDescribe(desc, withoutThread),
+      overlay: {},
+      warnings: [],
+    };
+    const evicted = this.configEditor.put(draft);
+    if (evicted?.messageId) {
+      await this.editConfigEditorCard(channel, evicted.messageId, renderExpiredHub(evicted));
+    }
+    if (!this.adapter.sendPanel) {
+      await i.reply({
+        content: "This platform cannot render the config editor card.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await i.reply({
+      content: "Opening thread config editor…",
+      flags: MessageFlags.Ephemeral,
+    });
+    const panel = renderHub(draft, {
+      effortDisabled: this.effortDisabledFor(draft),
+    });
+    const ref = await this.adapter.sendPanel(channel, panel);
+    this.configEditor.touch(draft.id, { messageId: ref.id });
+  }
+
+  private inheritedConfigFor(
+    record: ReturnType<SessionRouter["ensureSessionRecord"]>
+  ): InheritedConfig {
+    const chan = record.parentRef
+      ? this.config.channelPresets.get(record.parentRef)
+      : undefined;
+    const cfg = this.store.readConfig(record);
+    const agent = chan?.agent?.value ?? record.agentId;
+    const profile = this.router.getProfile(agent);
+    const chanEffort = chan?.effort?.value;
+    const effortUsable = !!(
+      chanEffort &&
+      profile?.effort &&
+      profile.effort.mechanism !== "none" &&
+      profile.effort.levels.includes(chanEffort)
+    );
+    const permission = (cfg.permissionPolicy ??
+      this.config.DEFAULT_PERMISSION_POLICY ??
+      "ask") as InheritedConfig["permission"];
+    return {
+      location: LOCAL_LOCATION,
+      agent,
+      model: chan?.model?.value ?? cfg.model ?? this.config.DEFAULT_MODEL,
+      effort: effortUsable ? chanEffort! : cfg.reasoningEffort ?? null,
+      cwd: chan?.cwd?.value ?? record.repoPath ?? this.config.REPOS_ROOT,
+      permission,
+      detached: false,
+    };
+  }
+
+  private effortDisabledFor(draft: ThreadConfigDraft): boolean {
+    const agentId =
+      draft.overlay.agent === undefined
+        ? draft.snapshot.agent.value
+        : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
+    const profile = this.router.getProfile(agentId);
+    const eff = profile?.effort;
+    return !eff || eff.mechanism === "none" || (eff.levels?.length ?? 0) === 0;
+  }
+
+  private capsForAgent = (agentId: string): DraftAgentCapabilities | undefined => {
+    const profile = this.router.getProfile(agentId);
+    if (!profile) return undefined;
+    return {
+      ...(profile.staticModels
+        ? { staticModels: profile.staticModels.map((m) => ({ modelId: m.modelId })) }
+        : {}),
+      ...(profile.effort
+        ? {
+            effortMechanism: profile.effort.mechanism,
+            effortLevels: [...profile.effort.levels],
+          }
+        : {}),
+    };
+  };
+
+  private async editConfigEditorCard(
+    channel: ChannelRef,
+    messageId: string,
+    panel: ReturnType<typeof renderHub>
+  ): Promise<void> {
+    if (!this.adapter.editPanel) return;
+    try {
+      await this.adapter.editPanel({ channel, id: messageId }, panel);
+    } catch (err) {
+      this.logger.warn({ err, messageId }, "config editor hub edit failed");
+    }
+  }
+
+  private async refreshConfigEditorHub(draft: ThreadConfigDraft): Promise<void> {
+    if (!draft.messageId) return;
+    const panel = renderHub(draft, { effortDisabled: this.effortDisabledFor(draft) });
+    await this.editConfigEditorCard(
+      { platform: "discord", id: draft.threadId, ...(draft.parentRef ? { parentId: draft.parentRef } : {}) },
+      draft.messageId,
+      panel
+    );
+  }
+
+  private async downloadConfigEditorRider(
+    draft: ThreadConfigDraft,
+    evt: ComponentEvent
+  ): Promise<void> {
+    const text = currentThreadRiderText(draft);
+    if (text == null || text.length === 0) {
+      await evt
+        .followUpEphemeral("No thread rider to download. Use **Upload** to set one, then Save.")
+        .catch(() => {});
+      return;
+    }
+    if (!this.adapter.sendFile) {
+      await evt.followUpEphemeral("This platform cannot send files.").catch(() => {});
+      return;
+    }
+    await this.adapter.sendFile(evt.channel, {
+      data: Buffer.from(text, "utf8"),
+      filename: riderDownloadFilename(draft.threadId),
+      mimeType: "text/markdown",
+      caption: "Thread rider (draft if you already edited). **Save** on the card to persist.",
+    });
+  }
+
+  /**
+   * If this user has a config-editor draft waiting for a rider file in this
+   * thread, consume the message (do not start/abort a turn).
+   */
+  private async tryConsumeConfigEditorRiderUpload(msg: IncomingMessage): Promise<boolean> {
+    const draft = this.configEditor.getForUserThread(msg.authorId, msg.channel.id);
+    if (!draft?.awaitingRiderUpload) return false;
+    const atts = msg.attachments ?? [];
+    if (atts.length === 0) {
+      await this.adapter
+        .sendMessage(
+          msg.channel,
+          "📎 Need a `.md` or `.txt` attachment for the rider (or click **Cancel** on the config card)."
+        )
+        .catch(() => {});
+      return true;
+    }
+    const att = atts[0]!;
+    try {
+      const res = await fetch(att.url);
+      if (!res.ok) throw new Error(`download ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      const decoded = decodeRiderUpload(buf, att.filename);
+      if (!decoded.ok) {
+        await this.adapter.sendMessage(msg.channel, `📎 ${decoded.error}`).catch(() => {});
+        return true;
+      }
+      const next = applyPickerValue(
+        { ...draft, awaitingRiderUpload: false },
+        "rider",
+        decoded.text ?? "",
+        this.capsForAgent
+      );
+      next.awaitingRiderUpload = false;
+      this.configEditor.put(next);
+      await this.refreshConfigEditorHub(next);
+      await this.adapter
+        .sendMessage(
+          msg.channel,
+          decoded.text == null
+            ? "📝 Rider upload is empty — draft will **inherit/clear** the thread rider. Click **Save** to apply."
+            : `📝 Rider loaded from \`${att.filename}\` (${decoded.text.length} chars). Click **Save** on the card to apply.`
+        )
+        .catch(() => {});
+    } catch (err) {
+      this.logger.warn({ err }, "config editor rider upload failed");
+      await this.adapter
+        .sendMessage(msg.channel, "📎 Could not read that file. Try again.")
+        .catch(() => {});
+    }
+    return true;
+  }
+
+  private async handleConfigEditorComponent(evt: ComponentEvent): Promise<void> {
+    const parsed = parseCustomId(evt.customId);
+    if (!parsed) return;
+    let draft = this.configEditor.get(parsed.draftId);
+    const auth = authorizeDraftClick(draft, evt.userId);
+    if (auth === "not-yours") {
+      await evt.replyEphemeral("This editor isn't yours.");
+      return;
+    }
+    if (auth === "expired" || !draft) {
+      try {
+        await evt.deferUpdate();
+      } catch {
+        await evt.replyEphemeral("This draft has expired.").catch(() => {});
+        return;
+      }
+      if (evt.messageId) {
+        await this.editConfigEditorCard(evt.channel, evt.messageId, {
+          color: 0x99aab5,
+          title: "🧩 Thread config",
+          fields: [],
+          footer: "draft expired",
+          actions: [],
+        });
+      }
+      return;
+    }
+
+    const action = parsed.action;
+    if (draft.awaitingRiderUpload && action !== "rider-put") {
+      this.configEditor.touch(draft.id, { awaitingRiderUpload: false });
+      draft = this.configEditor.get(draft.id) ?? draft;
+    }
+    if (action === "save") {
+      if (!isDirty(draft)) {
+        await evt.replyEphemeral("Nothing to save.");
+        return;
+      }
+      await evt.deferUpdate();
+      await this.saveConfigEditorDraft(draft, evt);
+      return;
+    }
+    if (action === "cancel") {
+      await evt.deferUpdate();
+      this.configEditor.delete(draft.id);
+      if (draft.messageId) {
+        await this.editConfigEditorCard(evt.channel, draft.messageId, renderCancelledHub(draft));
+      }
+      return;
+    }
+    if (action === "rider-get") {
+      await evt.deferUpdate();
+      await this.downloadConfigEditorRider(draft, evt);
+      return;
+    }
+    if (action === "rider-put") {
+      await evt.deferUpdate();
+      this.configEditor.touch(draft.id, { awaitingRiderUpload: true });
+      const waiting = this.configEditor.get(draft.id) ?? draft;
+      await this.refreshConfigEditorHub(waiting);
+      await evt
+        .followUpEphemeral(
+          "Attach a `.md` or `.txt` file in this thread. It becomes the **draft** thread rider (Save still required). Empty file = inherit/clear. Cancel the editor to abort."
+        )
+        .catch(() => {});
+      return;
+    }
+    if (action === "rider-save" || (evt.kind === "modal" && action === "rider-save")) {
+      await evt.deferUpdate();
+      const text = evt.fields?.rider ?? "";
+      const next = applyPickerValue(
+        draft,
+        "rider",
+        text,
+        this.capsForAgent
+      );
+      this.configEditor.put(next);
+      await this.refreshConfigEditorHub(next);
+      return;
+    }
+
+    if (action === "rider") {
+      if (riderTooLong(draft)) {
+        await evt.deferUpdate();
+        await this.pickConfigEditorField(draft, "rider", evt);
+        return;
+      }
+      const current =
+        draft.overlay.rider === undefined
+          ? draft.snapshot.rider.thread ?? ""
+          : draft.overlay.rider ?? "";
+      await evt.showModal({
+        customId: makeCustomId(draft.id, "rider-save"),
+        title: "Thread rider",
+        inputs: [
+          {
+            id: "rider",
+            label: "Thread rider (empty = inherit)",
+            style: "paragraph",
+            value: current.slice(0, RIDER_MODAL_MAX) || undefined,
+            maxLength: RIDER_MODAL_MAX,
+            required: false,
+          },
+        ],
+      });
+      return;
+    }
+
+    await evt.deferUpdate();
+    await this.pickConfigEditorField(draft, action, evt);
+  }
+
+  private async saveConfigEditorDraft(
+    draft: ThreadConfigDraft,
+    evt: ComponentEvent
+  ): Promise<void> {
+    const plan = buildSavePlan(draft);
+    const actor = { id: evt.userId, name: evt.userName };
+    const hasPreset = Object.keys(plan.threadPreset).length > 0;
+    if (hasPreset) {
+      const written = this.configMutation.applyThreadOverlay({
+        threadId: draft.threadId,
+        ...(draft.parentRef ? { parentRef: draft.parentRef } : {}),
+        changes: plan.threadPreset,
+        actor,
+      });
+      if (!written.ok) {
+        await evt.followUpEphemeral(`Could not save: ${written.error}`).catch(() => {});
+        return;
+      }
+    }
+    if (plan.permission !== undefined) {
+      const record = this.router.ensureSessionRecord({
+        platform: "discord",
+        channelRef: draft.threadId,
+        ...(draft.parentRef ? { parentRef: draft.parentRef } : {}),
+        cwd: this.config.REPOS_ROOT,
+      });
+      const cfg = this.store.readConfig(record);
+      if (plan.permission === null) {
+        delete cfg.permissionPolicy;
+      } else {
+        cfg.permissionPolicy = plan.permission;
+      }
+      delete cfg.autoApprovePermissions;
+      this.persistConfig(record, cfg);
+    }
+    // D10: do NOT abort or invalidate a live turn. Overlay applies on next spawn.
+    this.configEditor.delete(draft.id);
+    if (draft.messageId) {
+      await this.editConfigEditorCard(evt.channel, draft.messageId, renderSavedHub(draft));
+    }
+  }
+
+  private async pickConfigEditorField(
+    draft: ThreadConfigDraft,
+    action: string,
+    evt: ComponentEvent
+  ): Promise<void> {
+    const channel: ChannelRef = {
+      platform: "discord",
+      id: draft.threadId,
+      ...(draft.parentRef ? { parentId: draft.parentRef } : {}),
+    };
+    const owner = new Set([draft.userId]);
+    const inherit = {
+      value: INHERIT_VALUE,
+      label: "Inherit",
+      description: "Clear this thread's overlay",
+    };
+
+    if (!this.adapter.sendChoicePicker && action !== "rider") {
+      return;
+    }
+
+    let picked: { value: string; userId: string } | null = null;
+    const field = action as Parameters<typeof applyPickerValue>[1];
+
+    if (action === "host") {
+      const hosts = listHosts({
+        bridges: this.config.bridgePresets.values(),
+        connected: this.bridgeHub?.connectedIds(),
+      });
+      picked = await this.adapter.sendChoicePicker!(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: "🖥 Choose a host",
+          fields: [{ name: "Current", value: `\`${draft.snapshot.location.value}\``, inline: true }],
+        },
+        choices: [
+          inherit,
+          ...hosts.map((h) => ({
+            value: h.id,
+            label: `${h.emoji} ${h.shortName}`.slice(0, 80),
+            description: h.ready ? "ready" : "offline",
+          })),
+        ],
+        authorizedUserIds: owner,
+      });
+    } else if (action === "agent") {
+      const loc =
+        draft.overlay.location === undefined
+          ? draft.snapshot.location.value
+          : draft.overlay.location ?? draft.snapshot.withoutThread.location;
+      const all = agentLocationPickerChoices(this.router.listProfiles(), {
+        bridges: this.config.bridgePresets.values(),
+        connected: this.bridgeHub?.connectedIds(),
+        agentsByHost: this.bridgeHub?.installedAgentsByHost(),
+      });
+      const filtered = all.filter((c) => {
+        const at = c.value.lastIndexOf("@");
+        const host = at > 0 ? c.value.slice(at + 1) : LOCAL_LOCATION;
+        return host === loc;
+      });
+      picked = await this.adapter.sendChoicePicker!(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: "🤖 Choose an agent",
+          fields: [{ name: "Host", value: `\`${loc}\``, inline: true }],
+        },
+        choices: [inherit, ...(filtered.length > 0 ? filtered : all)],
+        authorizedUserIds: owner,
+      });
+    } else if (action === "model") {
+      const agentId =
+        draft.overlay.agent === undefined
+          ? draft.snapshot.agent.value
+          : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
+      const profile = this.router.getProfile(agentId);
+      const models = profile?.staticModels ?? [];
+      const choices = models.map((m) => ({
+        value: m.modelId,
+        label: m.name ?? m.modelId,
+        description: m.modelId,
+      }));
+      if (choices.length === 0) {
+        await this.adapter.sendMessage(
+          channel,
+          `No advertised models for \`${agentId}\` — Inherit is still available.`
+        );
+      }
+      picked = await this.adapter.sendChoicePicker!(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: "🧠 Choose a model",
+          fields: [{ name: "Agent", value: `\`${agentId}\``, inline: true }],
+        },
+        choices: [inherit, ...choices],
+        authorizedUserIds: owner,
+      });
+    } else if (action === "effort") {
+      if (this.effortDisabledFor(draft)) return;
+      const agentId =
+        draft.overlay.agent === undefined
+          ? draft.snapshot.agent.value
+          : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
+      const supported = this.router.getProfile(agentId)?.effort?.levels ?? [];
+      const effortChoices = EFFORT_CHOICES.filter((c) => supported.includes(c.value));
+      picked = await this.adapter.sendChoicePicker!(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: "🧠 Choose reasoning effort",
+          fields: [],
+        },
+        choices: [inherit, ...effortChoices],
+        authorizedUserIds: owner,
+      });
+    } else if (action === "repo") {
+      const loc =
+        draft.overlay.location === undefined
+          ? draft.snapshot.location.value
+          : draft.overlay.location ?? draft.snapshot.withoutThread.location;
+      picked = await this.promptRepoPath(channel, {
+        title: "🗂️ Choose a working repo",
+        location: loc,
+        authorizedUserIds: owner,
+        includeInherit: true,
+      }).then((value) => (value ? { value, userId: draft.userId } : null));
+    } else if (action === "approve") {
+      picked = await this.adapter.sendChoicePicker!(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: "🔐 Permission policy",
+          fields: [
+            { name: "Current", value: `\`${draft.snapshot.permission.value}\``, inline: true },
+          ],
+        },
+        choices: [
+          inherit,
+          { value: "always", label: "always", description: "Auto-approve every request" },
+          { value: "ask", label: "ask", description: "Prompt in Discord" },
+          { value: "deny", label: "deny", description: "Auto-deny every request" },
+        ],
+        authorizedUserIds: owner,
+      });
+    } else if (action === "attach") {
+      picked = await this.adapter.sendChoicePicker!(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: "📌 Thread attachment",
+          fields: [
+            {
+              name: "Current",
+              value: draft.snapshot.detached.value ? "`detached`" : "`attached`",
+              inline: true,
+            },
+          ],
+        },
+        choices: [
+          inherit,
+          { value: "attached", label: "Attached", description: "Bot replies in this thread" },
+          { value: "detached", label: "Detached", description: "No bot replies" },
+        ],
+        authorizedUserIds: owner,
+      });
+    } else if (action === "rider") {
+      picked = await this.adapter.sendChoicePicker!(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: "📝 Thread rider",
+          description:
+            "This rider is too long for a Discord modal. Use **Download** / **Upload** on the hub, or Inherit/Clear here.",
+          fields: [],
+        },
+        choices: [
+          { value: INHERIT_VALUE, label: "Inherit / Clear", description: "Remove the thread rider" },
+        ],
+        authorizedUserIds: owner,
+      });
+    } else {
+      return;
+    }
+
+    if (!picked) {
+      await this.refreshConfigEditorHub(draft);
+      return;
+    }
+    const next = applyPickerValue(draft, field, picked.value, this.capsForAgent);
+    this.configEditor.put(next);
+    await this.refreshConfigEditorHub(next);
+  }
+
   /** `/seam workflows` — read-only view of the delegation ledger. Renders the
    *  still-in-flight rows and a correlation-grouped recent tail as an embed; no
    *  writes, no schema, purely observability. */
@@ -7118,6 +8445,26 @@ export class Orchestrator {
 
     // Watch cancel (#60, D7): same surface as wake cancel — the /seam tree is at
     // Discord's option cap, so watch lifecycle folds into /seam workflows too.
+    const cancelChoiceId = i.options.getString("cancel-choice");
+    if (cancelChoiceId) {
+      const record = this.recordFromInteraction(i);
+      if (!record) {
+        await i.reply({
+          content: "Use `/seam workflows` inside a thread to cancel a choice card.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const result = await this.cancelChoice(record, cancelChoiceId, { skipAuthorGate: true });
+      await i.reply({
+        content: result.ok
+          ? `🗳️ Cancelled choice card \`${cancelChoiceId}\`.`
+          : result.error,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
     const cancelWatchId = i.options.getString("cancel-watch");
     if (cancelWatchId) {
       const record = this.recordFromInteraction(i);
@@ -7222,6 +8569,20 @@ export class Orchestrator {
         if (watches.length > 10) lines.push(`…and ${watches.length - 10} more`);
         embed.addFields({
           name: `🔔 Pending watches (${watches.length})`,
+          value: clampFieldValue(lines),
+        });
+        if (view.empty) embed.setDescription(null);
+      }
+
+      const choices = this.store.listOpenChoiceCards(record.platform, record.channelRef);
+      if (choices.length > 0) {
+        const lines = choices.slice(0, 10).map((c) => {
+          const last = c.lastClickerName ? ` · last ${c.lastClickerName}` : "";
+          return `🗳️ \`${c.id}\` ${c.title} (${c.clickCount}/${c.maxClicks})${last}`;
+        });
+        if (choices.length > 10) lines.push(`…and ${choices.length - 10} more`);
+        embed.addFields({
+          name: `🗳️ Open choice cards (${choices.length})`,
           value: clampFieldValue(lines),
         });
         if (view.empty) embed.setDescription(null);
@@ -9428,6 +10789,7 @@ export class Orchestrator {
       "`/seam cancel force:true` — escalate if the turn ignores cancel (old abort)",
       "`/seam cancel scope:all` — force-kill every active session (old kill)",
       "`/seam steer [thread] <prompt> [now]` — steer a node (thread defaults to here)",
+      "`/seam queue <prompt>` — queue the next live turn (waits; does not abort)",
       "`/seam workflows` — delegation ledger + pending wakes/watches",
       "",
       "**`/seam upload`** (admin only)",
@@ -9550,6 +10912,16 @@ export class Orchestrator {
     // confirmation. Same path as the `watch_create` MCP tool.
     if (fence.lang === WATCH_FENCE_LANG) {
       await this.emitWatchFence(channel, fence);
+      return;
+    }
+
+    if (fence.lang === CHOICE_FENCE_LANG) {
+      await this.emitChoiceFence(channel, fence);
+      return;
+    }
+
+    if (fence.lang === RESULT_FENCE_LANG) {
+      await this.emitResultFence(channel, fence);
       return;
     }
 
@@ -9756,6 +11128,383 @@ export class Orchestrator {
   }
 
   /**
+   * Discord author of the current *user* turn on a thread (#91 D9).
+   * Independent of SPEAKER_IDENTITY_ENABLED. Null for injected turns.
+   */
+  currentAuthorId(channelRef: string): string | undefined {
+    return this.currentAuthorIds.get(channelRef);
+  }
+
+  /**
+   * Publish a frozen choice card (#91). Shared by MCP `create_choice` and the
+   * `seam-choice` fence. Participant authors are refused (injected turns allowed).
+   */
+  async createChoice(
+    record: SessionRecord,
+    specInput: unknown
+  ): Promise<
+    | {
+        ok: true;
+        choiceId: string;
+        messageId: string;
+        ingestToken?: string;
+        ingestUrl?: string;
+      }
+    | { ok: false; error: string }
+  > {
+    const authorId = this.currentAuthorId(record.channelRef);
+    if (
+      isChoiceAuthoringRefused(
+        authorId,
+        this.config.SEAM_PARTICIPANT_USER_IDS,
+        this.config.SEAM_CONFIG_ADMIN_USER_IDS
+      )
+    ) {
+      return { ok: false, error: "Restricted participants cannot publish choice cards." };
+    }
+    const parsed = parseChoiceSpec(specInput);
+    if (!parsed.ok) return parsed;
+    return this.publishChoiceCard(record, parsed.spec);
+  }
+
+  async cancelChoice(
+    record: SessionRecord,
+    choiceId: string,
+    opts?: { authorId?: string | null; skipAuthorGate?: boolean }
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const authorId = opts?.skipAuthorGate
+      ? null
+      : opts?.authorId !== undefined
+        ? opts.authorId
+        : this.currentAuthorId(record.channelRef);
+    if (
+      isChoiceAuthoringRefused(
+        authorId,
+        this.config.SEAM_PARTICIPANT_USER_IDS,
+        this.config.SEAM_CONFIG_ADMIN_USER_IDS
+      )
+    ) {
+      return { ok: false, error: "Restricted participants cannot cancel choice cards." };
+    }
+    const card = this.store.getChoiceCard(choiceId);
+    if (!card || card.channelRef !== record.channelRef) {
+      return { ok: false, error: "No open choice card with that id in this thread." };
+    }
+    const cancelled = this.store.cancelChoiceCard(choiceId, record.channelRef);
+    if (!cancelled) {
+      return { ok: false, error: "That card is already closed." };
+    }
+    const updated = this.store.getChoiceCard(choiceId);
+    if (updated) await this.refreshChoiceCard(updated);
+    return { ok: true };
+  }
+
+  private async publishChoiceCard(
+    record: SessionRecord,
+    spec: ChoiceSpec
+  ): Promise<
+    | {
+        ok: true;
+        choiceId: string;
+        messageId: string;
+        ingestToken?: string;
+        ingestUrl?: string;
+      }
+    | { ok: false; error: string }
+  > {
+    if (!this.adapter.sendChoiceCard) {
+      return { ok: false, error: "This platform cannot post choice cards." };
+    }
+    const ingress = normalizeIngress(spec);
+    let ingestToken: string | undefined;
+    let ingestHash: string | null = null;
+    let ingestOptionIndex: number | null = null;
+    if (ingress) {
+      ingestToken = mintBridgeToken();
+      ingestHash = hashBridgeToken(ingestToken);
+      ingestOptionIndex = resolveIngestOptionIndex(spec.options, ingress.optionIndex);
+    }
+    const card: ChoiceCard = {
+      id: newChoiceId(),
+      platform: record.platform,
+      channelRef: record.channelRef,
+      parentRef: record.parentRef,
+      messageId: null,
+      title: spec.title,
+      body: spec.body?.trim() ? spec.body : null,
+      maxClicks: defaultMaxClicks(spec),
+      targetUserId: spec.targetUserId ?? null,
+      defaultTarget: spec.defaultTarget ?? { type: "live" },
+      options: spec.options,
+      clickCount: 0,
+      status: "open",
+      lastClickerId: null,
+      lastClickerName: null,
+      createdBy: record.id,
+      createdUtc: new Date().toISOString(),
+      ingestTokenHash: ingestHash,
+      ingestOptionIndex,
+      resultSchema: ingress?.resultSchema ?? null,
+      ingestWrapper: ingress?.wrapper?.trim() ? ingress.wrapper : null,
+      ingestCors: ingress?.corsOrigins ?? null,
+    };
+    this.store.insertChoiceCard(card);
+    const channel: ChannelRef = {
+      platform: PLATFORM,
+      id: record.channelRef,
+      ...(record.parentRef ? { parentId: record.parentRef } : {}),
+    };
+    try {
+      const ref = await this.adapter.sendChoiceCard(channel, {
+        panel: renderChoicePanel(card),
+        choiceId: card.id,
+        options: card.options.map((o) => ({ label: o.label, kind: o.kind })),
+      });
+      this.store.setChoiceMessageId(card.id, ref.id);
+      const ingestUrl = ingestToken && this.ingestUrl ? this.ingestUrl() : undefined;
+      return {
+        ok: true,
+        choiceId: card.id,
+        messageId: ref.id,
+        ...(ingestToken ? { ingestToken } : {}),
+        ...(ingestUrl ? { ingestUrl } : {}),
+      };
+    } catch (err) {
+      this.store.cancelChoiceCard(card.id, record.channelRef);
+      return { ok: false, error: `Failed to post card: ${(err as Error).message}` };
+    }
+  }
+
+  private async emitChoiceFence(channel: ChannelRef, fence: CompletedFence): Promise<void> {
+    const record = this.store.getByChannel(PLATFORM, channel.id);
+    if (!record) {
+      await this.adapter
+        .sendMessage(channel, "_(Couldn't publish a choice card — this thread has no bound session.)_")
+        .catch(() => {});
+      return;
+    }
+    const parsed = parseChoiceFence(fence.content);
+    if (!parsed.ok) {
+      await this.adapter
+        .sendMessage(channel, `_(Choice card not published: ${parsed.error})_`)
+        .catch(() => {});
+      return;
+    }
+    // Do not mint an ingest token from a fence — it would be posted in the
+    // authoring thread. HTTP ingest is minted only via create_choice so the
+    // token stays in the tool result.
+    const wantedIngress = Boolean(parsed.spec.ingress);
+    const specForPublish = wantedIngress ? { ...parsed.spec, ingress: undefined } : parsed.spec;
+    const result = await this.createChoice(record, specForPublish);
+    if (!result.ok) {
+      await this.adapter.sendMessage(channel, `_(Choice card not published: ${result.error})_`).catch(() => {});
+      return;
+    }
+    this.logger.info({ choiceId: result.choiceId, channel: channel.id }, "choice: published via seam-choice fence");
+    if (wantedIngress) {
+      await this.adapter
+        .sendMessage(
+          channel,
+          "_HTTP ingest was requested. The site token is not posted in Discord — call `create_choice` with `ingress` so the token stays in the tool result. This card was published without ingest._"
+        )
+        .catch(() => {});
+    }
+  }
+
+  private async emitResultFence(channel: ChannelRef, fence: CompletedFence): Promise<void> {
+    const parsed = parseResultFence(fence.content);
+    if (!parsed.ok) {
+      await this.adapter.sendMessage(channel, `_(seam-result ignored: ${parsed.error})_`).catch(() => {});
+      return;
+    }
+    if (!this.choiceResults) {
+      await this.adapter
+        .sendMessage(channel, "_(seam-result ignored: no ingest waiter for this turn.)_")
+        .catch(() => {});
+      return;
+    }
+    const record = this.store.getByChannel(PLATFORM, channel.id);
+    const submitted = record
+      ? this.choiceResults.submitFromSession(record.id, parsed.value)
+      : { ok: false as const, error: "no session" };
+    const result = submitted.ok
+      ? submitted
+      : this.choiceResults.submitFromChannel(channel.id, parsed.value);
+    if (!result.ok) {
+      await this.adapter.sendMessage(channel, `_(seam-result rejected: ${result.error})_`).catch(() => {});
+    }
+  }
+
+  private async refreshChoiceCard(card: ChoiceCard): Promise<void> {
+    if (!card.messageId || !this.adapter.editChoiceCard) return;
+    try {
+      await this.adapter.editChoiceCard(
+        { channel: { platform: PLATFORM, id: card.channelRef }, id: card.messageId },
+        {
+          panel: renderChoicePanel(card),
+          choiceId: card.id,
+          options: card.options.map((o) => ({ label: o.label, kind: o.kind })),
+          disabled: card.status !== "open",
+        }
+      );
+    } catch (err) {
+      this.logger.warn({ err, choiceId: card.id }, "choice: card edit failed");
+    }
+  }
+
+  private async handleChoiceCardInteraction(evt: ChoiceInteraction): Promise<void> {
+    const parsed = parseChoiceCustomId(evt.customId);
+    if (!parsed) return;
+    const card = this.store.getChoiceCard(parsed.choiceId);
+    if (!card) {
+      await evt.replyEphemeral("This card is no longer available.");
+      return;
+    }
+    const auth = choiceClickRefusal(evt.userId, card, this.config.DISCORD_ALLOWED_USER_IDS);
+    if (auth === "not-allowed") {
+      await evt.replyEphemeral("This bot is not available to you.");
+      return;
+    }
+    if (auth === "not-target") {
+      await evt.replyEphemeral("This card isn't for you.");
+      return;
+    }
+    if (auth === "closed") {
+      await evt.replyEphemeral("This card is closed.");
+      return;
+    }
+
+    let optionIndex = parsed.optionIndex;
+    if (parsed.kind === "select") {
+      const v = evt.values?.[0];
+      optionIndex = v !== undefined ? Number.parseInt(v, 10) : undefined;
+    }
+    if (optionIndex === undefined) {
+      await evt.replyEphemeral("Unknown option.");
+      return;
+    }
+    const option = card.options[optionIndex];
+    if (!option) {
+      await evt.replyEphemeral("Unknown option.");
+      return;
+    }
+
+    if (option.kind === "custom" && parsed.kind !== "modal") {
+      await evt.showModal({
+        customId: makeChoiceModalId(card.id, optionIndex),
+        title: option.label.slice(0, 45),
+        label: "Your response",
+        maxLength: CHOICE_CUSTOM_TEXT_MAX,
+      });
+      return;
+    }
+
+    const payload =
+      option.kind === "custom"
+        ? (evt.fields?.payload ?? "").slice(0, CHOICE_CUSTOM_TEXT_MAX)
+        : (option.payload ?? "");
+    if (option.kind === "custom" && !payload.trim()) {
+      await evt.replyEphemeral("Type something before submitting.");
+      return;
+    }
+
+    const destLive = await this.choiceDestLive(card, optionIndex);
+    const planned = await this.planAndCheckChoice(card, optionIndex, {
+      id: evt.userId,
+      name: evt.userName,
+    }, payload, destLive);
+    if (!planned.ok) {
+      await evt.replyEphemeral(planned.error);
+      return;
+    }
+
+    await evt.deferUpdate();
+    const claimed = this.store.claimChoiceClick({
+      choiceId: card.id,
+      userId: evt.userId,
+      userName: evt.userName,
+      optionIndex,
+    });
+    if (!claimed.ok) {
+      const msg =
+        claimed.reason === "already-clicked"
+          ? "You already used this card."
+          : claimed.reason === "exhausted"
+            ? "This card is already taken."
+            : "This card is closed.";
+      await evt.followUpEphemeral(msg).catch(() => {});
+      return;
+    }
+    try {
+      const emitted = await emitChoice({
+        card: claimed.card,
+        optionIndex,
+        actor: { id: evt.userId, name: evt.userName },
+        payload,
+        enqueue: (spec) => enqueueDispatchSpec(this.config.DATA_DIR, spec),
+        authoringSession: this.store.getByChannel(PLATFORM, card.channelRef),
+        destLive,
+        defaultModel: this.config.DEFAULT_MODEL,
+      });
+      if (emitted.ok) {
+        this.store.setChoiceClickDelivery(card.id, evt.userId, emitted.dispatchId);
+      } else {
+        this.logger.warn({ err: emitted.error, choiceId: card.id }, "choice: emit failed after claim");
+      }
+    } catch (err) {
+      this.logger.warn({ err, choiceId: card.id }, "choice: enqueue failed after claim");
+    }
+    const fresh = this.store.getChoiceCard(card.id) ?? claimed.card;
+    await this.refreshChoiceCard(fresh);
+  }
+
+  private async planAndCheckChoice(
+    card: ChoiceCard,
+    optionIndex: number,
+    actor: { id: string; name: string },
+    payload: string,
+    destLive: "ok" | "gone" | "archived"
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const planned = planChoiceDispatch({
+      card,
+      optionIndex,
+      actor,
+      payload,
+      enqueue: async () => {},
+      authoringSession: this.store.getByChannel(PLATFORM, card.channelRef),
+      destLive,
+      defaultModel: this.config.DEFAULT_MODEL,
+    });
+    if (!planned.ok) return { ok: false, error: planned.error };
+    const option = card.options[optionIndex]!;
+    const target = resolveOptionTarget(card, option);
+    if (target.type === "thread" && target.threadId) {
+      const dest = this.store.getByChannel(PLATFORM, target.threadId);
+      if (!dest) return { ok: false, error: "Unknown destination thread." };
+    }
+    return { ok: true };
+  }
+
+  private async choiceDestLive(
+    card: ChoiceCard,
+    optionIndex: number
+  ): Promise<"ok" | "gone" | "archived"> {
+    const option = card.options[optionIndex];
+    if (!option) return "gone";
+    const target = resolveOptionTarget(card, option);
+    const destId = target.type === "thread" && target.threadId ? target.threadId : card.channelRef;
+    if (!this.adapter.getThreadLiveState) return "ok";
+    try {
+      const live = await this.adapter.getThreadLiveState({ platform: PLATFORM, id: destId });
+      if (live === undefined) return "gone";
+      if (live.archived) return "archived";
+      return "ok";
+    } catch {
+      return "ok";
+    }
+  }
+
+  /**
    * Handle a `seam-watch` fence (#60): the MCP-less fallback for agents like agy.
    * The body is JSON `{ kind, spec, intervalSeconds, prompt, expiresInSeconds,
    * match?, reason?, mode?, maxFires? }`; register the watch for THIS thread
@@ -9941,10 +11690,15 @@ export class Orchestrator {
    */
   private async promptRepoPath(
     channel: ChannelRef,
-    opts?: { title?: string }
+    opts?: {
+      title?: string;
+      location?: string;
+      authorizedUserIds?: ReadonlySet<string>;
+      includeInherit?: boolean;
+    }
   ): Promise<string | null> {
-    const dirs = await this.listHostWorkspacePaths(channel.id);
-    const location = resolveThreadLocation(this.config, channel.id);
+    const location = opts?.location ?? resolveThreadLocation(this.config, channel.id);
+    const dirs = await this.listHostWorkspacePaths(channel.id, location);
     if (dirs === undefined) {
       await this.adapter.sendMessage(
         channel,
@@ -9967,6 +11721,10 @@ export class Orchestrator {
       return null;
     }
 
+    const inheritChoice = opts?.includeInherit
+      ? [{ value: INHERIT_VALUE, label: "Inherit", description: "Clear this thread's repo overlay" }]
+      : [];
+
     const result = await this.adapter.sendChoicePicker(channel, {
       panel: {
         color: 0x5865f2,
@@ -9977,12 +11735,15 @@ export class Orchestrator {
             : `Host: \`${location}\`. ${dirs.length} folder${dirs.length === 1 ? "" : "s"}.`,
         fields: [],
       },
-      choices: dirs.map((p) => ({
-        value: p,
-        label: path.basename(p),
-        description: p,
-      })),
-      authorizedUserIds: mayConfigureUserIds(this.config),
+      choices: [
+        ...inheritChoice,
+        ...dirs.map((p) => ({
+          value: p,
+          label: path.basename(p),
+          description: p,
+        })),
+      ],
+      authorizedUserIds: opts?.authorizedUserIds ?? mayConfigureUserIds(this.config),
       allowCustom: {
         buttonLabel: "Type a path…",
         modalTitle: "Custom repo path",
@@ -9990,6 +11751,7 @@ export class Orchestrator {
         placeholder: "Folder name or absolute path",
       },
       validate: async (value) => {
+        if (value === INHERIT_VALUE) return null;
         try {
           const resolved = await this.resolveRequestedRepoPath(channel, value);
           if (
@@ -10037,8 +11799,11 @@ export class Orchestrator {
    * D11: enumerate workspaces on the bound host. Remote → rpc listWorkspaces
    * (absolute host paths, no cwd rewrite). Local → loopback scan of REPOS_ROOT.
    */
-  private async listHostWorkspacePaths(threadId?: string): Promise<string[] | undefined> {
-    const location = resolveThreadLocation(this.config, threadId);
+  private async listHostWorkspacePaths(
+    threadId?: string,
+    locationOverride?: string
+  ): Promise<string[] | undefined> {
+    const location = locationOverride ?? resolveThreadLocation(this.config, threadId);
     if (this.bridgeHub) {
       try {
         const ws = await this.bridgeHub.listWorkspaces(location);

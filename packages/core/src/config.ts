@@ -523,6 +523,10 @@ const Schema = z.object({
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .default("info"),
   HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+  /** #92: how long POST /ingest waits for submit_result before 202 + poll. */
+  SEAM_INGEST_WAIT_MS: z.coerce.number().int().min(1000).max(600_000).default(90_000),
+  SEAM_INGEST_BODY_MAX: z.coerce.number().int().min(1024).max(1_048_576).default(65_536),
+  SEAM_INGEST_RATE_PER_MIN: z.coerce.number().int().min(1).max(1000).default(60),
   /**
    * Bot-wide default permission policy for new sessions.
    * - "always": auto-approve every request (yolo)
@@ -553,6 +557,16 @@ const Schema = z.object({
   DISCORD_NOTIFICATIONS_CHANNEL_ID: z
     .string()
     .regex(/^\d+$/, "DISCORD_NOTIFICATIONS_CHANNEL_ID must be a numeric Discord channel id")
+    .optional(),
+
+  /**
+   * Optional Discord thread/channel id for a single editable server-status
+   * card (uptime, turns, paired bridges). Edited in place on a 30s tick and
+   * on bridge connect/disconnect — no new messages. When unset, no card.
+   */
+  DISCORD_STATUS_THREAD_ID: z
+    .string()
+    .regex(/^\d+$/, "DISCORD_STATUS_THREAD_ID must be a numeric Discord channel id")
     .optional(),
 
   /**

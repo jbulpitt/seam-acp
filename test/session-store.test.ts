@@ -68,6 +68,7 @@ describe("SessionStore", () => {
     store.upsert(b);
     const list = store.list();
     expect(list.map((s) => s.id)).toEqual(["discord:b", "discord:a"]);
+    expect(store.countSessions()).toBe(2);
   });
 
   it("listSessionsByParent filters to one channel, newest first (#73)", () => {

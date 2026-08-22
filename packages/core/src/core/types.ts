@@ -209,7 +209,16 @@ export type DelegationKind =
    *  (`send`) or drained from it (`poll_inbox`). Distinct from "forward"/
    *  "handoff": an inbox message never starts or interrupts a turn, so watchdog
    *  policy must not treat it as an in-flight delegation. */
-  | "inbox";
+  | "inbox"
+  /** Parked user prompt (#88) — a message held while its remote bridge was
+   *  offline, now firing as a live turn on the same host. Distinct from "wake"
+   *  so watchdog policy can tell a user-originated reconnect delivery from
+   *  an agent-scheduled self-resumption. */
+  | "parked"
+  /** Frozen choice-card click (#91) — one click emitted one prompt via
+   *  emitChoice. Distinct from "wake"/"parked" so watchdog/dispatch panels
+   *  do not mis-file these. */
+  | "choice";
 
 /**
  * Lifecycle of a ledger row.
@@ -416,6 +425,17 @@ export interface TurnOutcome {
  * Slack block-kit, etc.). A text-serialization fallback is provided for
  * adapters that only support plain text.
  */
+export type PanelButtonStyle = "primary" | "secondary" | "success" | "danger";
+
+/** One classic action-row button. Discord caps 5 per row, 5 rows. */
+export interface PanelButton {
+  customId: string;
+  label: string;
+  style?: PanelButtonStyle;
+  disabled?: boolean;
+  emoji?: string;
+}
+
 export interface StructuredPanel {
   /** Sidebar / accent color as a hex number (e.g. 0x57F287 for green). */
   color: number;
@@ -429,4 +449,26 @@ export interface StructuredPanel {
   fields: Array<{ name: string; value: string; inline?: boolean }>;
   /** Footer text (e.g. "⏱ 12s elapsed"). */
   footer?: string;
+  /**
+   * Optional classic action rows (NOT Components v2). When present on send,
+   * the adapter attaches them. On edit, `[]` clears buttons; `undefined`
+   * leaves existing components alone.
+   */
+  actions?: PanelButton[][];
+}
+
+/**
+ * Discord Components v2 layout (Container + TextDisplay + Separator).
+ * Cannot mix with embeds — the whole message is this tree.
+ */
+export type LayoutSpacing = "small" | "large";
+
+export type LayoutBlock =
+  | { kind: "text"; content: string }
+  | { kind: "separator"; divider?: boolean; spacing?: LayoutSpacing };
+
+export interface StructuredLayout {
+  /** Accent bar color (Container), same meaning as {@link StructuredPanel.color}. */
+  color?: number;
+  blocks: LayoutBlock[];
 }

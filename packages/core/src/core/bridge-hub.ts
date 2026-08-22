@@ -151,6 +151,14 @@ export class BridgeHub {
     };
   }
 
+  /** Subscribe to WS drop after a successful hello. Returns an unsubscribe. */
+  onBridgeDisconnect(listener: (bridgeId: string) => void): () => void {
+    this.readyEvents.on("disconnect", listener);
+    return () => {
+      this.readyEvents.off("disconnect", listener);
+    };
+  }
+
   get(bridgeId: string): ConnectedBridge | undefined {
     return this.connections.get(bridgeId);
   }
@@ -287,6 +295,7 @@ export class BridgeHub {
         if (cur?.mux === mux) {
           this.connections.delete(bridgeId);
           this.logger.info({ bridgeId }, "bridge disconnected; agents unavailable");
+          this.readyEvents.emit("disconnect", bridgeId);
         }
       },
     });

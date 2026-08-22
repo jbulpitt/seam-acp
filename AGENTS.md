@@ -53,18 +53,23 @@ pm2 logs seam-acp --lines 100   # last 100 log lines
 
 ## Slash command tree (`/seam`)
 
-Discord caps each command at 25 top-level options. `/seam` is 10/25: 4
-top-level subcommands + 6 groups. Future surfaces default to living
+Discord caps each command at 25 top-level options. `/seam` is 13/25: 5
+top-level subcommands + 8 groups. Future surfaces default to living
 **inside a group** (each group has its own 25 budget). Hard cutover —
 Discord has no aliases; old invocations disappear.
 
-**Top-level (4):** `cancel`, `steer`, `new`, `workflows`
+**Top-level (5):** `cancel`, `steer`, `new`, `workflows`, `queue`
 
-**Groups (6):**
-- `config` (13): `model` `effort` `agent` `mode` `repo` `tools` `approve` `reset` `init` `detach` `show` `set` `audit`
+**Groups (8):**
+- `config` (14): `model` `effort` `agent` `mode` `repo` `tools` `approve` `reset` `init` `detach` `show` `edit` `set` `audit`
 - `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
 - `schedule` (7), `preset` (6), `project` (3) — unchanged
 - `upload` (3): `pull` `push` `secret` — **admin-only**. Hard cutover of `/seam attach`.
+- `bridge` (4), `debug` (3) — admin-only pairing / host debug
+
+**Queue:** `/seam queue prompt:…` parks the next live turn (does not abort).
+Idle + host ready runs now. A later bare message still interrupts and
+cancels the queued prompt. Shares the `#88` parked row.
 
 **Cancel options** (not new keywords):
 - `/seam cancel` — this thread, graceful
@@ -72,6 +77,16 @@ Discord has no aliases; old invocations disappear.
 - `/seam cancel scope:all` — kill every active session bot-wide (old `kill`). Privileged: **not** lock-exempt, **not** participant-allowed.
 
 **Removed:** `/seam image`.
+
+## Interactive prompts (#91 / #92)
+
+Frozen Discord click-cards and HTTP ingest for microsites. Canonical agent
+how-to: `docs/agent-guides/interactive-prompts.md` (raw GitHub URL is what
+course repos hang in their context library). MCP `create_choice` /
+`cancel_choice` / `submit_result`, or fences `seam-choice` / `seam-result`.
+HTTP `POST /ingest` is a custom-option submit; the site gets **declared JSON**
+from `submit_result`, not the Discord transcript. Participants click; they
+do not author.
 
 ## Agent-scheduled wake events (#59)
 

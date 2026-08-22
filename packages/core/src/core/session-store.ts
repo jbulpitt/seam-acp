@@ -25,7 +25,16 @@ import {
 import type { ScheduledPrompt } from "./scheduled-prompts/types.js";
 import type { WakeEvent } from "./wake/types.js";
 import type { WatchEvent } from "./watch/types.js";
+import type {
+  ChoiceCard,
+  ChoiceCardStatus,
+  ChoiceOption,
+  ChoiceResultRow,
+  ChoiceResultStatus,
+  ChoiceTarget,
+} from "./choice/types.js";
 import { INBOX_MAX_PER_SESSION, type InboxMessage } from "./inbox/types.js";
+import type { ParkedAttachment, ParkedPrompt } from "./parked-prompts/types.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -253,6 +262,10 @@ export class SessionStore {
     this.db.exec(WAKE_EVENTS_SCHEMA);
     this.db.exec(WATCHES_SCHEMA);
     this.db.exec(INBOX_SCHEMA);
+    this.db.exec(PARKED_PROMPTS_SCHEMA);
+    this.migrateParkedKind();
+    this.db.exec(CHOICE_CARDS_SCHEMA);
+    this.migrateChoiceIngest();
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -267,6 +280,31 @@ export class SessionStore {
     this.migrateWakeFireOnStartup();
     this.migrateInboxPriority();
     this.migratePresetsScope();
+  }
+
+  /** #92: ingest token + result waiter tables. Idempotent ALTERs. */
+  private migrateChoiceIngest(): void {
+    for (const ddl of [
+      "ALTER TABLE choice_cards ADD COLUMN ingest_token_hash TEXT",
+      "ALTER TABLE choice_cards ADD COLUMN ingest_option_index INTEGER",
+      "ALTER TABLE choice_cards ADD COLUMN result_schema_json TEXT",
+      "ALTER TABLE choice_cards ADD COLUMN ingest_wrapper TEXT",
+      "ALTER TABLE choice_cards ADD COLUMN ingest_cors_json TEXT",
+    ]) {
+      try {
+        this.db.exec(ddl);
+      } catch {
+        /* column exists */
+      }
+    }
+    try {
+      this.db.exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_choice_ingest_hash ON choice_cards(ingest_token_hash) WHERE ingest_token_hash IS NOT NULL"
+      );
+    } catch {
+      /* ignore */
+    }
+    this.db.exec(CHOICE_RESULTS_SCHEMA);
   }
 
   /**
@@ -340,6 +378,24 @@ export class SessionStore {
     if (!hasColumn) {
       this.db.exec(
         "ALTER TABLE inbox ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+      );
+    }
+  }
+
+  /**
+   * Additive column so a parked row can distinguish #88 (bridge offline) from
+   * #89 (`/seam queue` while a turn is running). Fresh DBs get it from CREATE
+   * TABLE; prod DBs opened after upgrade hit this PRAGMA-guarded ALTER.
+   * Existing rows default to `bridge_offline` (they were all #88).
+   */
+  private migrateParkedKind(): void {
+    const hasColumn = this.db
+      .prepare<[], { name: string }>("PRAGMA table_info(parked_prompts)")
+      .all()
+      .some((c) => c.name === "kind");
+    if (!hasColumn) {
+      this.db.exec(
+        "ALTER TABLE parked_prompts ADD COLUMN kind TEXT NOT NULL DEFAULT 'bridge_offline'"
       );
     }
   }
@@ -435,6 +491,12 @@ export class SessionStore {
       )
       .all(limit);
     return rows.map(mapRow);
+  }
+
+  /** Total session rows — uncapped, unlike {@link list}. */
+  countSessions(): number {
+    const row = this.db.prepare<[], { n: number }>("SELECT COUNT(*) AS n FROM sessions").get();
+    return row?.n ?? 0;
   }
 
   /**
@@ -1272,8 +1334,296 @@ export class SessionStore {
     return row?.n ?? 0;
   }
 
+  /** All pending wakes bot-wide (the server-status card). */
+  countPendingWakes(): number {
+    const row = this.db.prepare<[], { n: number }>("SELECT COUNT(*) AS n FROM wake_events").get();
+    return row?.n ?? 0;
+  }
+
   deleteWake(id: string): void {
     this.db.prepare("DELETE FROM wake_events WHERE id = ?").run(id);
+  }
+
+  // --- parked prompts (#88) -------------------------------------------------
+
+  /** Insert or replace the single parked prompt for this thread (D1). */
+  upsertParked(p: ParkedPrompt): void {
+    this.db
+      .prepare(
+        `INSERT INTO parked_prompts
+           (id, platform, channel_ref, parent_ref, location, kind, prompt,
+            author_id, author_name, notice_message_id, attachments_json, created_utc)
+         VALUES
+           (@id, @platform, @channelRef, @parentRef, @location, @kind, @prompt,
+            @authorId, @authorName, @noticeMessageId, @attachmentsJson, @createdUtc)
+         ON CONFLICT(platform, channel_ref) DO UPDATE SET
+           id                 = excluded.id,
+           parent_ref         = excluded.parent_ref,
+           location           = excluded.location,
+           kind               = excluded.kind,
+           prompt             = excluded.prompt,
+           author_id          = excluded.author_id,
+           author_name        = excluded.author_name,
+           notice_message_id  = excluded.notice_message_id,
+           attachments_json   = excluded.attachments_json,
+           created_utc        = excluded.created_utc`
+      )
+      .run({
+        id: p.id,
+        platform: p.platform,
+        channelRef: p.channelRef,
+        parentRef: p.parentRef,
+        location: p.location,
+        kind: p.kind === "user_queue" ? "user_queue" : "bridge_offline",
+        prompt: p.prompt,
+        authorId: p.authorId,
+        authorName: p.authorName,
+        noticeMessageId: p.noticeMessageId,
+        attachmentsJson: JSON.stringify(p.attachments),
+        createdUtc: p.createdUtc,
+      });
+  }
+
+  getParked(id: string): ParkedPrompt | null {
+    const row = this.db
+      .prepare<[string], ParkedRow>("SELECT * FROM parked_prompts WHERE id = ?")
+      .get(id);
+    return row ? mapParked(row) : null;
+  }
+
+  getParkedByChannel(platform: string, channelRef: string): ParkedPrompt | null {
+    const row = this.db
+      .prepare<[string, string], ParkedRow>(
+        "SELECT * FROM parked_prompts WHERE platform = ? AND channel_ref = ?"
+      )
+      .get(platform, channelRef);
+    return row ? mapParked(row) : null;
+  }
+
+  listParked(): ParkedPrompt[] {
+    return this.db
+      .prepare<[], ParkedRow>("SELECT * FROM parked_prompts ORDER BY created_utc ASC, rowid ASC")
+      .all()
+      .map(mapParked);
+  }
+
+  listParkedByLocation(location: string): ParkedPrompt[] {
+    return this.db
+      .prepare<[string], ParkedRow>(
+        "SELECT * FROM parked_prompts WHERE location = ? ORDER BY created_utc ASC, rowid ASC"
+      )
+      .all(location)
+      .map(mapParked);
+  }
+
+  countParkedByLocation(location: string): number {
+    const row = this.db
+      .prepare<[string], { n: number }>(
+        "SELECT COUNT(*) AS n FROM parked_prompts WHERE location = ?"
+      )
+      .get(location);
+    return row?.n ?? 0;
+  }
+
+  deleteParked(id: string): void {
+    this.db.prepare("DELETE FROM parked_prompts WHERE id = ?").run(id);
+  }
+
+  deleteParkedByChannel(platform: string, channelRef: string): ParkedPrompt | null {
+    const existing = this.getParkedByChannel(platform, channelRef);
+    if (!existing) return null;
+    this.deleteParked(existing.id);
+    return existing;
+  }
+
+  deleteAllParked(): ParkedPrompt[] {
+    const rows = this.listParked();
+    this.db.prepare("DELETE FROM parked_prompts").run();
+    return rows;
+  }
+
+  // --- frozen choice cards (#91) --------------------------------------------
+
+  insertChoiceCard(c: ChoiceCard): void {
+    this.db
+      .prepare(
+        `INSERT INTO choice_cards
+           (id, platform, channel_ref, parent_ref, message_id, title, body,
+            max_clicks, target_user_id, default_target_json, options_json,
+            click_count, status, last_clicker_id, last_clicker_name,
+            created_by, created_utc,
+            ingest_token_hash, ingest_option_index, result_schema_json,
+            ingest_wrapper, ingest_cors_json)
+         VALUES
+           (@id, @platform, @channelRef, @parentRef, @messageId, @title, @body,
+            @maxClicks, @targetUserId, @defaultTargetJson, @optionsJson,
+            @clickCount, @status, @lastClickerId, @lastClickerName,
+            @createdBy, @createdUtc,
+            @ingestTokenHash, @ingestOptionIndex, @resultSchemaJson,
+            @ingestWrapper, @ingestCorsJson)`
+      )
+      .run({
+        id: c.id,
+        platform: c.platform,
+        channelRef: c.channelRef,
+        parentRef: c.parentRef,
+        messageId: c.messageId,
+        title: c.title,
+        body: c.body,
+        maxClicks: c.maxClicks,
+        targetUserId: c.targetUserId,
+        defaultTargetJson: JSON.stringify(c.defaultTarget),
+        optionsJson: JSON.stringify(c.options),
+        clickCount: c.clickCount,
+        status: c.status,
+        lastClickerId: c.lastClickerId,
+        lastClickerName: c.lastClickerName,
+        createdBy: c.createdBy,
+        createdUtc: c.createdUtc,
+        ingestTokenHash: c.ingestTokenHash,
+        ingestOptionIndex: c.ingestOptionIndex,
+        resultSchemaJson: c.resultSchema == null ? null : JSON.stringify(c.resultSchema),
+        ingestWrapper: c.ingestWrapper,
+        ingestCorsJson: c.ingestCors == null ? null : JSON.stringify(c.ingestCors),
+      });
+  }
+
+  getChoiceCard(id: string): ChoiceCard | null {
+    const row = this.db
+      .prepare<[string], ChoiceRow>("SELECT * FROM choice_cards WHERE id = ?")
+      .get(id);
+    return row ? mapChoice(row) : null;
+  }
+
+  setChoiceMessageId(id: string, messageId: string): void {
+    this.db.prepare("UPDATE choice_cards SET message_id = ? WHERE id = ?").run(messageId, id);
+  }
+
+  listOpenChoiceCards(platform: string, channelRef: string): ChoiceCard[] {
+    return this.db
+      .prepare<[string, string], ChoiceRow>(
+        "SELECT * FROM choice_cards WHERE platform = ? AND channel_ref = ? AND status = 'open' ORDER BY created_utc ASC"
+      )
+      .all(platform, channelRef)
+      .map(mapChoice);
+  }
+
+  /**
+   * Atomic first claim (D10): insert (choice_id, user_id) and increment
+   * click_count, or abort. Unique PK makes double-click a loser.
+   */
+  claimChoiceClick(opts: {
+    choiceId: string;
+    userId: string;
+    userName: string;
+    optionIndex: number;
+  }):
+    | { ok: true; card: ChoiceCard }
+    | { ok: false; reason: "missing" | "not-open" | "exhausted" | "already-clicked" } {
+    const run = this.db.transaction(() => {
+      const row = this.db
+        .prepare<[string], ChoiceRow>("SELECT * FROM choice_cards WHERE id = ?")
+        .get(opts.choiceId);
+      if (!row) return { ok: false as const, reason: "missing" as const };
+      if (row.status !== "open") return { ok: false as const, reason: "not-open" as const };
+      if (row.click_count >= row.max_clicks) {
+        return { ok: false as const, reason: "exhausted" as const };
+      }
+      try {
+        this.db
+          .prepare(
+            `INSERT INTO choice_clicks (choice_id, user_id, option_index, created_utc)
+             VALUES (?, ?, ?, ?)`
+          )
+          .run(opts.choiceId, opts.userId, opts.optionIndex, new Date().toISOString());
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        if (code === "SQLITE_CONSTRAINT_PRIMARYKEY" || code === "SQLITE_CONSTRAINT_UNIQUE") {
+          return { ok: false as const, reason: "already-clicked" as const };
+        }
+        throw err;
+      }
+      const nextCount = row.click_count + 1;
+      const status: ChoiceCardStatus = nextCount >= row.max_clicks ? "exhausted" : "open";
+      this.db
+        .prepare(
+          `UPDATE choice_cards
+             SET click_count = ?, status = ?, last_clicker_id = ?, last_clicker_name = ?
+           WHERE id = ?`
+        )
+        .run(nextCount, status, opts.userId, opts.userName, opts.choiceId);
+      const updated = this.db
+        .prepare<[string], ChoiceRow>("SELECT * FROM choice_cards WHERE id = ?")
+        .get(opts.choiceId)!;
+      return { ok: true as const, card: mapChoice(updated) };
+    });
+    return run();
+  }
+
+  setChoiceClickDelivery(choiceId: string, userId: string, deliveryId: string): void {
+    this.db
+      .prepare("UPDATE choice_clicks SET delivery_id = ? WHERE choice_id = ? AND user_id = ?")
+      .run(deliveryId, choiceId, userId);
+  }
+
+  cancelChoiceCard(id: string, channelRef: string): boolean {
+    const info = this.db
+      .prepare("UPDATE choice_cards SET status = 'cancelled' WHERE id = ? AND channel_ref = ? AND status = 'open'")
+      .run(id, channelRef);
+    return info.changes > 0;
+  }
+
+  getChoiceCardByIngestHash(tokenHash: string): ChoiceCard | null {
+    const row = this.db
+      .prepare<[string], ChoiceRow>("SELECT * FROM choice_cards WHERE ingest_token_hash = ?")
+      .get(tokenHash);
+    return row ? mapChoice(row) : null;
+  }
+
+  insertChoiceResult(r: ChoiceResultRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO choice_results
+           (dispatch_id, choice_id, status, body_json, error, schema_json, created_utc, finished_utc)
+         VALUES
+           (@dispatchId, @choiceId, @status, @bodyJson, @error, @schemaJson, @createdUtc, @finishedUtc)`
+      )
+      .run({
+        dispatchId: r.dispatchId,
+        choiceId: r.choiceId,
+        status: r.status,
+        bodyJson: r.body == null ? null : JSON.stringify(r.body),
+        error: r.error,
+        schemaJson: r.schema == null ? null : JSON.stringify(r.schema),
+        createdUtc: r.createdUtc,
+        finishedUtc: r.finishedUtc,
+      });
+  }
+
+  getChoiceResult(dispatchId: string): ChoiceResultRow | null {
+    const row = this.db
+      .prepare<[string], ChoiceResultDbRow>("SELECT * FROM choice_results WHERE dispatch_id = ?")
+      .get(dispatchId);
+    return row ? mapChoiceResult(row) : null;
+  }
+
+  finishChoiceResult(
+    dispatchId: string,
+    status: ChoiceResultStatus,
+    body: unknown | null,
+    error: string | null
+  ): void {
+    const now = new Date().toISOString();
+    const existing = this.getChoiceResult(dispatchId);
+    if (!existing) return;
+    if (existing.status === "ok") return;
+    this.db
+      .prepare(
+        `UPDATE choice_results
+            SET status = ?, body_json = ?, error = ?, finished_utc = ?
+          WHERE dispatch_id = ? AND status = 'pending'`
+      )
+      .run(status, body == null ? null : JSON.stringify(body), error, now, dispatchId);
   }
 
   // --- agent-defined watches (#60) ------------------------------------------
@@ -1665,6 +2015,137 @@ CREATE INDEX IF NOT EXISTS idx_wake_fire ON wake_events(fire_at_utc);
 CREATE INDEX IF NOT EXISTS idx_wake_channel ON wake_events(platform, channel_ref);
 `;
 
+const CHOICE_CARDS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS choice_cards (
+  id                   TEXT PRIMARY KEY,
+  platform             TEXT NOT NULL,
+  channel_ref          TEXT NOT NULL,
+  parent_ref           TEXT,
+  message_id           TEXT,
+  title                TEXT NOT NULL,
+  body                 TEXT,
+  max_clicks           INTEGER NOT NULL,
+  target_user_id       TEXT,
+  default_target_json  TEXT NOT NULL,
+  options_json         TEXT NOT NULL,
+  click_count          INTEGER NOT NULL DEFAULT 0,
+  status               TEXT NOT NULL DEFAULT 'open',
+  last_clicker_id      TEXT,
+  last_clicker_name    TEXT,
+  created_by           TEXT NOT NULL,
+  created_utc          TEXT NOT NULL,
+  ingest_token_hash    TEXT,
+  ingest_option_index  INTEGER,
+  result_schema_json   TEXT,
+  ingest_wrapper       TEXT,
+  ingest_cors_json     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_choice_cards_channel ON choice_cards(platform, channel_ref);
+CREATE INDEX IF NOT EXISTS idx_choice_cards_status ON choice_cards(status);
+CREATE TABLE IF NOT EXISTS choice_clicks (
+  choice_id    TEXT NOT NULL,
+  user_id      TEXT NOT NULL,
+  option_index INTEGER NOT NULL,
+  created_utc  TEXT NOT NULL,
+  delivery_id  TEXT,
+  PRIMARY KEY (choice_id, user_id)
+);
+`;
+
+const CHOICE_RESULTS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS choice_results (
+  dispatch_id   TEXT PRIMARY KEY,
+  choice_id     TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  body_json     TEXT,
+  error         TEXT,
+  schema_json   TEXT,
+  created_utc   TEXT NOT NULL,
+  finished_utc  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_choice_results_choice ON choice_results(choice_id);
+`;
+
+interface ChoiceRow {
+  id: string;
+  platform: string;
+  channel_ref: string;
+  parent_ref: string | null;
+  message_id: string | null;
+  title: string;
+  body: string | null;
+  max_clicks: number;
+  target_user_id: string | null;
+  default_target_json: string;
+  options_json: string;
+  click_count: number;
+  status: string;
+  last_clicker_id: string | null;
+  last_clicker_name: string | null;
+  created_by: string;
+  created_utc: string;
+  ingest_token_hash?: string | null;
+  ingest_option_index?: number | null;
+  result_schema_json?: string | null;
+  ingest_wrapper?: string | null;
+  ingest_cors_json?: string | null;
+}
+
+interface ChoiceResultDbRow {
+  dispatch_id: string;
+  choice_id: string;
+  status: string;
+  body_json: string | null;
+  error: string | null;
+  schema_json: string | null;
+  created_utc: string;
+  finished_utc: string | null;
+}
+
+const mapChoice = (r: ChoiceRow): ChoiceCard => ({
+  id: r.id,
+  platform: r.platform,
+  channelRef: r.channel_ref,
+  parentRef: r.parent_ref,
+  messageId: r.message_id,
+  title: r.title,
+  body: r.body,
+  maxClicks: r.max_clicks,
+  targetUserId: r.target_user_id,
+  defaultTarget: parseJsonSafe<ChoiceTarget>(r.default_target_json, { type: "live" }),
+  options: parseJsonSafe<ChoiceOption[]>(r.options_json, []),
+  clickCount: r.click_count,
+  status: r.status as ChoiceCardStatus,
+  lastClickerId: r.last_clicker_id,
+  lastClickerName: r.last_clicker_name,
+  createdBy: r.created_by,
+  createdUtc: r.created_utc,
+  ingestTokenHash: r.ingest_token_hash ?? null,
+  ingestOptionIndex: r.ingest_option_index ?? null,
+  resultSchema: r.result_schema_json ? parseJsonSafe<unknown>(r.result_schema_json, null) : null,
+  ingestWrapper: r.ingest_wrapper ?? null,
+  ingestCors: r.ingest_cors_json ? parseJsonSafe<string[]>(r.ingest_cors_json, []) : null,
+});
+
+const mapChoiceResult = (r: ChoiceResultDbRow): ChoiceResultRow => ({
+  dispatchId: r.dispatch_id,
+  choiceId: r.choice_id,
+  status: r.status as ChoiceResultStatus,
+  body: r.body_json ? parseJsonSafe<unknown>(r.body_json, null) : null,
+  error: r.error,
+  schema: r.schema_json ? parseJsonSafe<unknown>(r.schema_json, null) : null,
+  createdUtc: r.created_utc,
+  finishedUtc: r.finished_utc,
+});
+
+function parseJsonSafe<T>(raw: string, fallback: T): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 interface WakeRow {
   id: string;
   platform: string;
@@ -1800,6 +2281,74 @@ const mapInbox = (r: InboxRow): InboxMessage => ({
   fromRef: r.from_ref,
   body: r.body,
   priority: r.priority !== 0,
+  createdUtc: r.created_utc,
+});
+
+// --- parked prompts schema + row mapping (#88) ------------------------------
+
+const PARKED_PROMPTS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS parked_prompts (
+  id                 TEXT PRIMARY KEY,
+  platform           TEXT NOT NULL,
+  channel_ref        TEXT NOT NULL,
+  parent_ref         TEXT,
+  location           TEXT NOT NULL,
+  kind               TEXT NOT NULL DEFAULT 'bridge_offline',
+  prompt             TEXT NOT NULL,
+  author_id          TEXT NOT NULL,
+  author_name        TEXT,
+  notice_message_id  TEXT,
+  attachments_json   TEXT NOT NULL DEFAULT '[]',
+  created_utc        TEXT NOT NULL,
+  UNIQUE (platform, channel_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_parked_location ON parked_prompts(location);
+`;
+
+interface ParkedRow {
+  id: string;
+  platform: string;
+  channel_ref: string;
+  parent_ref: string | null;
+  location: string;
+  kind: string;
+  prompt: string;
+  author_id: string;
+  author_name: string | null;
+  notice_message_id: string | null;
+  attachments_json: string;
+  created_utc: string;
+}
+
+function parseParkedAttachments(raw: string): ParkedAttachment[] {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (a): a is ParkedAttachment =>
+        !!a &&
+        typeof a === "object" &&
+        typeof (a as ParkedAttachment).filename === "string" &&
+        typeof (a as ParkedAttachment).mime === "string" &&
+        typeof (a as ParkedAttachment).size === "number"
+    );
+  } catch {
+    return [];
+  }
+}
+
+const mapParked = (r: ParkedRow): ParkedPrompt => ({
+  id: r.id,
+  platform: r.platform,
+  channelRef: r.channel_ref,
+  parentRef: r.parent_ref,
+  location: r.location,
+  kind: r.kind === "user_queue" ? "user_queue" : "bridge_offline",
+  prompt: r.prompt,
+  authorId: r.author_id,
+  authorName: r.author_name,
+  noticeMessageId: r.notice_message_id,
+  attachments: parseParkedAttachments(r.attachments_json),
   createdUtc: r.created_utc,
 });
 

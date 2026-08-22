@@ -79,11 +79,14 @@ describe("bridge/debug stay out of lock-exempt and participant-allowed lists", (
     SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
   } as any;
 
-  it("LOCK_EXEMPT_SUBCOMMANDS is still cancel/steer only", () => {
+  it("LOCK_EXEMPT_SUBCOMMANDS is cancel/steer/queue", () => {
     expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "cancel", STUDENT)).toBe(
       false
     );
     expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "steer", STUDENT)).toBe(
+      false
+    );
+    expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "queue", STUDENT)).toBe(
       false
     );
     expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "add", STUDENT)).toBe(true);
@@ -98,9 +101,10 @@ describe("bridge/debug stay out of lock-exempt and participant-allowed lists", (
     expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "exec", ADMIN)).toBe(false);
   });
 
-  it("PARTICIPANT_ALLOWED_SUBCOMMANDS is still help/cancel", () => {
+  it("PARTICIPANT_ALLOWED_SUBCOMMANDS is help/cancel/queue", () => {
     expect(Orchestrator.isParticipantSlashRefused(participants, "help", STUDENT)).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(participants, "cancel", STUDENT)).toBe(false);
+    expect(Orchestrator.isParticipantSlashRefused(participants, "queue", STUDENT)).toBe(false);
     expect(Orchestrator.isParticipantSlashRefused(participants, "add", STUDENT)).toBe(true);
     expect(Orchestrator.isParticipantSlashRefused(participants, "exec", STUDENT)).toBe(true);
     expect(Orchestrator.isParticipantSlashRefused(participants, "steer", STUDENT)).toBe(true);

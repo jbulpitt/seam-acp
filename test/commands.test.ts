@@ -27,19 +27,20 @@ describe("/seam slash command", () => {
     expect(() => buildSeamCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 12 top-level slots (4 subcommands + 8 groups)", () => {
+  it("registers exactly 13 top-level slots (5 subcommands + 8 groups)", () => {
     const json = built();
-    expect(json.options?.length ?? 0).toBe(12);
+    expect(json.options?.length ?? 0).toBe(13);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
-  it("top-level names are cancel/steer/new/workflows + 8 groups (bridge/debug added)", () => {
+  it("top-level names are cancel/steer/new/workflows/queue + 8 groups", () => {
     const names = (built().options ?? []).map((o) => o.name);
     expect(names).toEqual([
       "cancel",
       "steer",
       "new",
       "workflows",
+      "queue",
       "config",
       "info",
       "schedule",
@@ -60,7 +61,7 @@ describe("/seam slash command", () => {
     }
   });
 
-  it("config group has the 13 config leaves including detach", () => {
+  it("config group has the 14 config leaves including detach and edit", () => {
     const config = built().options?.find((o) => o.name === "config");
     expect(config?.type).toBe(SUB_COMMAND_GROUP);
     const names = (config?.options ?? []).map((o) => o.name);
@@ -76,10 +77,11 @@ describe("/seam slash command", () => {
       "init",
       "detach",
       "show",
+      "edit",
       "set",
       "audit",
     ]);
-    expect(names).toHaveLength(13);
+    expect(names).toHaveLength(14);
     const detach = (config?.options ?? []).find((o) => o.name === "detach");
     const state = detach?.options?.find((o) => o.name === "state");
     expect(state?.type).toBe(STRING);
@@ -169,6 +171,15 @@ describe("/seam slash command", () => {
     const pathOpt = repo?.options?.find((o) => o.name === "path");
     expect(pathOpt?.type).toBe(STRING);
     expect(pathOpt?.required ?? false).toBe(false);
+  });
+
+  it("queue is a top-level subcommand with required prompt (#89)", () => {
+    const queue = built().options?.find((o) => o.name === "queue");
+    expect(queue?.type).toBe(SUB_COMMAND);
+    const names = (queue?.options ?? []).map((o) => o.name);
+    expect(names).toEqual(["prompt"]);
+    expect(queue?.options?.[0]?.required).toBe(true);
+    expect(queue?.options?.[0]?.type).toBe(STRING);
   });
 
   it("steer lists required prompt before optional thread/now (Discord option order)", () => {

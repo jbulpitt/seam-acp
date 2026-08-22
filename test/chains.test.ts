@@ -279,11 +279,13 @@ describe("chain MCP tool", () => {
     const body = await call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
     expect(names).toEqual([
+      "cancel_choice",
       "cancel_wake",
       "chain",
       "compact",
       "config_describe",
       "config_propose",
+      "create_choice",
       "forward",
       "handoff",
       "peek",
@@ -291,6 +293,7 @@ describe("chain MCP tool", () => {
       "schedule_wake",
       "send",
       "steer",
+      "submit_result",
       "threads",
       "watch_cancel",
       "watch_create",

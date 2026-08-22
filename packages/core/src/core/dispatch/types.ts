@@ -48,7 +48,8 @@ export interface DispatchSpec {
   returnTo?: string;
   /** Ledger classification; defaults to "handoff". The report-back
    *  re-injection sets "report_back"; a fired wake (#59) sets "wake"; a fired
-   *  watch (#60) sets "watch"; an agent-triggered compaction sets "compact". */
+   *  watch (#60) sets "watch"; an agent-triggered compaction sets "compact";
+   *  a parked prompt firing after a remote-bridge reconnect (#88) sets "parked". */
   kind?: DelegationKind;
   /** Compact-kind specs only: which history the pipeline reads — "session"
    *  (the raw session JSONL, the default) or "discord" (reconstructed from the
@@ -122,7 +123,7 @@ export const DispatchSpecSchema = z.object({
   agentId: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
-  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact"]).optional(),
+  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact", "parked", "choice"]).optional(),
   compactSource: z.enum(["session", "discord"]).optional(),
   wakeChainDepth: z.number().int().min(0).optional(),
   chainId: z.string().min(1).optional(),

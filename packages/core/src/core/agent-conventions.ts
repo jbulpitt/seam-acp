@@ -37,6 +37,12 @@ export const WAKE_FENCE_LANG = "seam-wake";
  *  the same path. */
 export const WATCH_FENCE_LANG = "seam-watch";
 
+/** Reserved fenced-block info tag for a frozen choice card (#91). The output
+ *  pipeline intercepts a fence whose lang equals this, publishes the card, and
+ *  suppresses the block. The `create_choice` MCP tool is sugar over the same
+ *  path. Re-exported from `choice/types.ts` so callers can import either. */
+export { CHOICE_FENCE_LANG, RESULT_FENCE_LANG } from "./choice/types.js";
+
 /** Fence info tags that typeset as a PNG (issue #79). FenceStream already
  *  lowercases the lang tag; `isMathFenceLang` still lowercases so mixed-case
  *  callers match. */

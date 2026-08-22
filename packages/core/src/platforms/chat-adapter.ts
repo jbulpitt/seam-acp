@@ -1,4 +1,4 @@
-import type { SessionRecord, StructuredPanel } from "../core/types.js";
+import type { SessionRecord, StructuredLayout, StructuredPanel } from "../core/types.js";
 import type {
   RequestPermissionRequest,
   RequestPermissionResponse,
@@ -127,6 +127,28 @@ export interface ChatAdapter {
   editPanel?(message: MessageRef, panel: StructuredPanel): Promise<void>;
 
   /**
+   * Optional: persistent component interactions (classic buttons / modals)
+   * whose custom_id the adapter does not consume itself. Used by the thread
+   * config editor (#90) so hub buttons outlive the 15-minute slash token.
+   */
+  onComponent?(handler: (evt: ComponentEvent) => void | Promise<void>): void;
+
+  /** Optional: pin a message (status card lives as the sticky post in its thread). */
+  pinMessage?(message: MessageRef): Promise<void>;
+
+  /** Optional: delete a previously-sent message (used to migrate embed → v2). */
+  deleteMessage?(message: MessageRef): Promise<void>;
+
+  /**
+   * Optional: send a Components v2 layout (Container + separators).
+   * Cannot mix with embeds on the same message.
+   */
+  sendLayout?(channel: ChannelRef, layout: StructuredLayout): Promise<MessageRef>;
+
+  /** Optional: edit a previously-sent v2 layout message. */
+  editLayout?(message: MessageRef, layout: StructuredLayout): Promise<void>;
+
+  /**
    * Optional: present an interactive choice picker (buttons / select menu)
    * and resolve when the user picks one. Returns null on timeout / cancel.
    * Discord select menus cap at 25 options — implementations should paginate
@@ -195,6 +217,69 @@ export interface ChatAdapter {
     card: ConfirmationCard,
     opts?: { timeoutMs?: number; authorizedUserIds?: ReadonlySet<string> }
   ): Promise<{ decision: Promise<ConfirmationDecision> }>;
+
+  /** Post a frozen #91 choice card (embed + persistent classic action rows). */
+  sendChoiceCard?(channel: ChannelRef, card: ChoiceCardPost): Promise<MessageRef>;
+  /** Edit a posted choice card (counts, disable on exhaust/cancel). */
+  editChoiceCard?(message: MessageRef, card: ChoiceCardPost): Promise<void>;
+  /** Persistent `choice:` InteractionCreate handler (not a collector). */
+  onChoiceInteraction?(handler: (evt: ChoiceInteraction) => void | Promise<void>): void;
+}
+
+/** Frozen choice-card post (#91). Adapter turns this into embed + ActionRows. */
+export interface ChoiceCardPost {
+  panel: StructuredPanel;
+  choiceId: string;
+  options: ReadonlyArray<{ label: string; kind: "prompt" | "custom" }>;
+  disabled?: boolean;
+}
+
+/** Persistent choice-card interaction (#91). */
+export interface ChoiceInteraction {
+  customId: string;
+  userId: string;
+  userName: string;
+  channel: ChannelRef;
+  messageId: string;
+  kind: "button" | "select" | "modal";
+  values?: string[];
+  fields?: Record<string, string>;
+  replyEphemeral: (text: string) => Promise<void>;
+  followUpEphemeral: (text: string) => Promise<void>;
+  deferUpdate: () => Promise<void>;
+  showModal: (opts: {
+    customId: string;
+    title: string;
+    label: string;
+    maxLength?: number;
+  }) => Promise<void>;
+}
+
+/** Persistent button / modal interaction (#90). */
+export interface ComponentEvent {
+  customId: string;
+  userId: string;
+  userName: string;
+  channel: ChannelRef;
+  messageId: string;
+  kind: "button" | "modal";
+  fields?: Record<string, string>;
+  replyEphemeral: (text: string) => Promise<void>;
+  followUpEphemeral: (text: string) => Promise<void>;
+  deferUpdate: () => Promise<void>;
+  showModal: (opts: {
+    customId: string;
+    title: string;
+    inputs: Array<{
+      id: string;
+      label: string;
+      style?: "short" | "paragraph";
+      value?: string;
+      placeholder?: string;
+      maxLength?: number;
+      required?: boolean;
+    }>;
+  }) => Promise<void>;
 }
 
 /** A before→after confirmation card (#58 D5). */

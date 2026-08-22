@@ -191,4 +191,22 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
     const d = router.describeConfig(makeRecord());
     expect(d.location).toEqual({ value: "mac", source: "thread preset" });
   });
+
+  it("reports channel and thread riders separately (#90)", () => {
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { rider: { value: "channel rule" }, locked: false }],
+    ]);
+    const threadPresets = new Map<string, ThreadPreset>([
+      ["thread-1", { rider: { value: "thread rule" } }],
+    ]);
+    const router = makeRouter({ channelPresets, threadPresets });
+    const d = router.describeConfig(makeRecord());
+    expect(d.rider).toEqual({ channel: "channel rule", thread: "thread rule" });
+  });
+
+  it("omits missing rider sides (#90)", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(makeRecord());
+    expect(d.rider).toEqual({});
+  });
 });

@@ -53,6 +53,9 @@ export function planSeamMcpInjection(opts: {
   sessionId: string;
   globalMcpServers: McpServer[];
   seamMcp?: SeamMcpInjectionWiring;
+  /** Reuse an existing session token instead of rotating it (isolated ingest
+   *  while the authoring thread's live runtime is still using the old token). */
+  reuseToken?: boolean;
 }): SeamMcpInjection {
   const { sessionId, globalMcpServers, seamMcp } = opts;
   if (!seamMcp) {
@@ -68,7 +71,9 @@ export function planSeamMcpInjection(opts: {
     if (port === undefined) {
       return { mcpServers: globalMcpServers, remote: true };
     }
-    const token = seamMcp.registry.mint(sessionId);
+    const token = opts.reuseToken
+      ? (seamMcp.registry.peek(sessionId) ?? seamMcp.registry.mint(sessionId))
+      : seamMcp.registry.mint(sessionId);
     const publicUrl = seamMcp.getPublicUrl?.();
     const url = publicUrl ?? resolveReachableMcpUrl({ port, remote: true });
     return {
@@ -80,7 +85,9 @@ export function planSeamMcpInjection(opts: {
   if (port === undefined) {
     return { mcpServers: globalMcpServers, remote: false };
   }
-  const token = seamMcp.registry.mint(sessionId);
+  const token = opts.reuseToken
+    ? (seamMcp.registry.peek(sessionId) ?? seamMcp.registry.mint(sessionId))
+    : seamMcp.registry.mint(sessionId);
   return {
     mcpServers: [...globalMcpServers, buildSeamMcpServerEntry(port, token)],
     remote: false,

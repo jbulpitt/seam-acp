@@ -114,6 +114,13 @@ export interface ConfigDescription {
    */
   location: ResolvedSetting<string>;
   /**
+   * Preamble riders (#90). Channel and thread riders STACK (channel first,
+   * then thread) — they are not a single-winner overlay. `describeConfig`
+   * therefore reports both raw strings rather than a ResolvedSetting.
+   * The visual editor writes the **thread** rider only.
+   */
+  rider?: { channel?: string; thread?: string };
+  /**
    * Set when a preset requested an effort level the resolved agent cannot honor
    * (Trap 2). The preset value is silently dropped at runtime; surfacing it here
    * keeps `config_describe` from reporting a personality the agent won't deliver.
@@ -286,6 +293,11 @@ export class SessionRouter {
       ? { value: locationValue, source: "thread preset" }
       : { value: locationValue, source: "default" };
 
+    const rider: { channel?: string; thread?: string } = {
+      ...(chan?.rider?.value ? { channel: chan.rider.value } : {}),
+      ...(thread?.rider?.value ? { thread: thread.rider.value } : {}),
+    };
+
     return {
       sessionId: record.id,
       channelRef: record.channelRef,
@@ -298,6 +310,7 @@ export class SessionRouter {
       locked: chan?.locked ?? false,
       detached,
       location,
+      rider,
       ...(effortIgnoredNote ? { effortIgnoredNote } : {}),
     };
   }
@@ -494,6 +507,11 @@ export class SessionRouter {
     return this.runtimes.has(sessionId);
   }
 
+  /** Live ACP runtimes currently held in memory. */
+  liveRuntimeCount(): number {
+    return this.runtimes.size;
+  }
+
   /** The live runtime for this session, if one is already started. */
   getRuntime(sessionId: string): AgentRuntime | undefined {
     return this.runtimes.get(sessionId);
@@ -508,6 +526,19 @@ export class SessionRouter {
    *  steer/handoff (interrupting). */
   isBusy(sessionId: string): boolean {
     return this.runtimes.get(sessionId)?.busy ?? false;
+  }
+
+  /**
+   * seam-MCP servers for a throwaway isolated run, reusing the session's
+   * existing token so a concurrent live turn is not rotated off MCP.
+   */
+  reuseMcpServers(sessionId: string): McpServer[] {
+    return planSeamMcpInjection({
+      sessionId,
+      globalMcpServers: this.mcpServers,
+      seamMcp: this.seamMcp,
+      reuseToken: true,
+    }).mcpServers;
   }
 
   /**

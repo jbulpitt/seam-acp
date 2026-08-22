@@ -8,6 +8,7 @@ data/
 
 # Local docs (reports, plans, specs — not committed; tracked files unaffected)
 docs/
+!docs/agent-guides/
 .DS_Store
 
 # Playwright MCP scratch outputs

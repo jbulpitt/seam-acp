@@ -84,6 +84,7 @@ describe("SessionStore wake_events (#59)", () => {
     expect(store.countPendingWakesByChannel("discord", "thread-1")).toBe(2);
     expect(store.countPendingWakesByChannel("discord", "thread-2")).toBe(1);
     expect(store.countPendingWakesByChannel("discord", "thread-3")).toBe(0);
+    expect(store.countPendingWakes()).toBe(3);
   });
 
   it("deleteWake removes the row", () => {

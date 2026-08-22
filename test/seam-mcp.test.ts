@@ -71,6 +71,15 @@ describe("SeamTokenRegistry", () => {
     expect(reg.resolve(second)).toBe("s1");
     expect(reg.size).toBe(1);
   });
+
+  it("peek returns the current token without rotating", () => {
+    const reg = new SeamTokenRegistry();
+    expect(reg.peek("s1")).toBeUndefined();
+    const first = reg.mint("s1");
+    expect(reg.peek("s1")).toBe(first);
+    expect(reg.peek("s1")).toBe(first);
+    expect(reg.resolve(first)).toBe("s1");
+  });
 });
 
 // -------------------------------------------------------------------------
@@ -101,6 +110,8 @@ async function makeHarness(opts?: {
   listThreads?: SeamMcpServerDeps["listThreads"];
   scheduleWake?: SeamMcpServerDeps["scheduleWake"];
   cancelWake?: SeamMcpServerDeps["cancelWake"];
+  createChoice?: SeamMcpServerDeps["createChoice"];
+  cancelChoice?: SeamMcpServerDeps["cancelChoice"];
   createWatch?: SeamMcpServerDeps["createWatch"];
   cancelWatch?: SeamMcpServerDeps["cancelWatch"];
   listWatches?: SeamMcpServerDeps["listWatches"];
@@ -149,6 +160,12 @@ async function makeHarness(opts?: {
         cancelledWakes.push(id);
         return true;
       }),
+    createChoice:
+      opts?.createChoice ??
+      (async () => ({ ok: true as const, choiceId: "choice-1", messageId: "msg-1" })),
+    cancelChoice:
+      opts?.cancelChoice ??
+      (async () => ({ ok: true as const })),
     createWatch:
       opts?.createWatch ??
       ((record, req) => {
@@ -289,11 +306,13 @@ describe("SeamMcpServer", () => {
     const { body } = await h.call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
     expect(names).toEqual([
+      "cancel_choice",
       "cancel_wake",
       "chain",
       "compact",
       "config_describe",
       "config_propose",
+      "create_choice",
       "forward",
       "handoff",
       "peek",
@@ -301,6 +320,7 @@ describe("SeamMcpServer", () => {
       "schedule_wake",
       "send",
       "steer",
+      "submit_result",
       "threads",
       "watch_cancel",
       "watch_create",
@@ -391,8 +411,8 @@ describe("SeamMcpServer", () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
-    // Adding an OPTION to handoff does NOT change the tool count (#73 took it to 16).
-    expect(body.result.tools).toHaveLength(16);
+    // Adding an OPTION to handoff does NOT change the tool count (#91 took it to 18).
+    expect(body.result.tools).toHaveLength(19);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -1070,8 +1090,8 @@ describe("SeamMcpServer", () => {
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
-    // Params on `send` must NOT add a tool — the set stays at 16 (#61/#62/#66/#73).
-    expect(body.result.tools).toHaveLength(16);
+    // Params on `send` must NOT add a tool — the set stays at 18 (#61/#62/#66/#73/#91).
+    expect(body.result.tools).toHaveLength(19);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

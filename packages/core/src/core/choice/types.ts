@@ -16,7 +16,7 @@ export const CHOICE_CUSTOM_TEXT_MAX = 4000;
 
 /** Thin preamble bullet — same weight as seam-wake. Canonical how-to is the agent guide. */
 export const CHOICE_AUTHORING_RULE =
-  "To publish a frozen click-card in this thread, output a fenced block tagged `seam-choice` whose body is JSON `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?, target?}], defaultTarget?, maxClicks?, targetUserId?, ingress? }` (or call `create_choice`). One click emits one prompt. Destinations: live (this thread), isolated (throwaway session, output here), thread (snowflake, live). HTTP ingest + submit_result / seam-result: see docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel.";
+  "To publish a frozen click-card in this thread, output a fenced block tagged `seam-choice` whose body is JSON `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }` (or call `create_choice`). Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel.";
 
 /** MCP-less declared HTTP result (#92). Stripped like seam-choice. */
 export const RESULT_FENCE_LANG = "seam-result";
@@ -74,6 +74,8 @@ export interface ChoiceCard {
   status: ChoiceCardStatus;
   lastClickerId: string | null;
   lastClickerName: string | null;
+  /** Index of the last successful option. Single-user cards show this label. */
+  lastOptionIndex: number | null;
   createdBy: string;
   createdUtc: string;
   ingestTokenHash: string | null;
@@ -301,20 +303,51 @@ export function choiceClickRefusal(
   return "ok";
 }
 
+/** Default: one person, one pick (`maxClicks` 1). `targetUserId` does not change this. */
+export function isChoiceSingleUser(card: Pick<ChoiceCard, "maxClicks">): boolean {
+  return card.maxClicks <= 1;
+}
+
+export function selectedChoiceLabel(card: ChoiceCard): string | null {
+  if (card.lastOptionIndex == null) return null;
+  const opt = card.options[card.lastOptionIndex];
+  return opt?.label ?? null;
+}
+
+/** Single-user closed/cancelled cards drop action rows instead of leaving dead buttons. */
+export function choiceCardHideButtons(card: ChoiceCard): boolean {
+  return isChoiceSingleUser(card) && card.status !== "open";
+}
+
 export function renderChoicePanel(card: ChoiceCard): StructuredPanel {
-  const last = card.lastClickerName
-    ? ` · last: ${card.lastClickerName}`
-    : "";
+  const title = `🗳️ ${card.title}`.slice(0, 256);
+  const description = card.body ? card.body.slice(0, 4096) : undefined;
+  const color = card.status === "open" ? 0x5865f2 : 0x99aab5;
+  const selected = selectedChoiceLabel(card);
+  const who = card.lastClickerName;
+
+  if (isChoiceSingleUser(card)) {
+    const fields: NonNullable<StructuredPanel["fields"]> = [];
+    if (card.status === "exhausted" && selected) {
+      fields.push({
+        name: "Selected",
+        value: who ? `**${selected}** · ${who}` : `**${selected}**`,
+      });
+    } else if (card.status === "cancelled") {
+      fields.push({ name: "Status", value: "Cancelled" });
+    }
+    const footer =
+      card.status === "open" ? "Pick one" : card.status === "exhausted" ? "Done" : "Cancelled";
+    return { color, title, ...(description ? { description } : {}), fields, footer };
+  }
+
+  const last = who ? ` · last: ${who}` : "";
   const status =
-    card.status === "open"
-      ? "open"
-      : card.status === "exhausted"
-        ? "closed"
-        : "cancelled";
+    card.status === "open" ? "open" : card.status === "exhausted" ? "closed" : "cancelled";
   return {
-    color: card.status === "open" ? 0x5865f2 : 0x99aab5,
-    title: `🗳️ ${card.title}`.slice(0, 256),
-    ...(card.body ? { description: card.body.slice(0, 4096) } : {}),
+    color,
+    title,
+    ...(description ? { description } : {}),
     fields: [],
     footer: `${card.clickCount}/${card.maxClicks} · ${status}${last}`,
   };

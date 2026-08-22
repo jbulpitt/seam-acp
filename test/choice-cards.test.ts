@@ -17,6 +17,8 @@ import {
   parseChoiceFence,
   parseChoiceSpec,
   renderChoicePanel,
+  isChoiceSingleUser,
+  choiceCardHideButtons,
   wrapChoicePrompt,
   type ChoiceCard,
 } from "../packages/core/src/core/choice/types.js";
@@ -57,6 +59,7 @@ function makeCard(over: Partial<ChoiceCard> = {}): ChoiceCard {
     status: "open",
     lastClickerId: null,
     lastClickerName: null,
+    lastOptionIndex: null,
     createdBy: "discord:thread-1",
     createdUtc: "2026-08-18T00:00:00.000Z",
     ingestTokenHash: null,
@@ -375,6 +378,7 @@ describe("SessionStore atomic claim", () => {
     const card = store.getChoiceCard("c1");
     expect(card?.status).toBe("exhausted");
     expect(card?.clickCount).toBe(1);
+    expect(card?.lastOptionIndex).toBe(0);
   });
 
   it("cancel only from authoring thread", () => {
@@ -386,13 +390,46 @@ describe("SessionStore atomic claim", () => {
 });
 
 describe("renderChoicePanel", () => {
-  it("shows clicked/max and disables via status", () => {
+  it("single-user default: pick one, then show selection and hide buttons", () => {
     const open = renderChoicePanel(makeCard());
-    expect(open.title).toMatch(/Ship this/);
-    expect(open.footer).toMatch(/0\/1 · open/);
-    const closed = renderChoicePanel(makeCard({ status: "exhausted", clickCount: 1, lastClickerName: "Jesse" }));
-    expect(closed.footer).toMatch(/1\/1 · closed/);
-    expect(closed.footer).toMatch(/Jesse/);
+    expect(isChoiceSingleUser(makeCard())).toBe(true);
+    expect(open.footer).toBe("Pick one");
+    expect(choiceCardHideButtons(makeCard())).toBe(false);
+    const closed = renderChoicePanel(
+      makeCard({
+        status: "exhausted",
+        clickCount: 1,
+        lastClickerName: "Jesse",
+        lastOptionIndex: 0,
+      })
+    );
+    expect(closed.footer).toBe("Done");
+    expect(closed.fields.some((f) => /Approve/.test(f.value) && /Jesse/.test(f.value))).toBe(true);
+    expect(
+      choiceCardHideButtons(
+        makeCard({ status: "exhausted", clickCount: 1, lastOptionIndex: 0, lastClickerName: "Jesse" })
+      )
+    ).toBe(true);
+  });
+
+  it("targetUserId is still single-user", () => {
+    expect(isChoiceSingleUser(makeCard({ targetUserId: "1487", maxClicks: 1 }))).toBe(true);
+    expect(choiceCardHideButtons(makeCard({ targetUserId: "1487", maxClicks: 1, status: "exhausted" }))).toBe(
+      true
+    );
+  });
+
+  it("multi-user (maxClicks > 1) keeps count footer and does not hide buttons while open", () => {
+    const open = renderChoicePanel(makeCard({ maxClicks: 10 }));
+    expect(open.footer).toMatch(/0\/10 · open/);
+    expect(choiceCardHideButtons(makeCard({ maxClicks: 10 }))).toBe(false);
+    const closed = renderChoicePanel(
+      makeCard({ maxClicks: 10, status: "exhausted", clickCount: 10, lastClickerName: "Alaina" })
+    );
+    expect(closed.footer).toMatch(/10\/10 · closed/);
+    expect(choiceCardHideButtons(makeCard({ maxClicks: 10, status: "exhausted", clickCount: 10 }))).toBe(
+      false
+    );
   });
 });
 

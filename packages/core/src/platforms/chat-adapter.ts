@@ -220,7 +220,7 @@ export interface ChatAdapter {
 
   /** Post a frozen #91 choice card (embed + persistent classic action rows). */
   sendChoiceCard?(channel: ChannelRef, card: ChoiceCardPost): Promise<MessageRef>;
-  /** Edit a posted choice card (counts, disable on exhaust/cancel). */
+  /** Edit a posted choice card (counts; single-user hides buttons after pick). */
   editChoiceCard?(message: MessageRef, card: ChoiceCardPost): Promise<void>;
   /** Persistent `choice:` InteractionCreate handler (not a collector). */
   onChoiceInteraction?(handler: (evt: ChoiceInteraction) => void | Promise<void>): void;
@@ -232,6 +232,8 @@ export interface ChoiceCardPost {
   choiceId: string;
   options: ReadonlyArray<{ label: string; kind: "prompt" | "custom" }>;
   disabled?: boolean;
+  /** Single-user after pick / cancel: drop action rows instead of disabled buttons. */
+  hideButtons?: boolean;
 }
 
 /** Persistent choice-card interaction (#91). */

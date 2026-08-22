@@ -918,6 +918,7 @@ export class DiscordAdapter implements ChatAdapter {
   private static buildChoiceComponents(
     card: ChoiceCardPost
   ): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
+    if (card.hideButtons) return [];
     const disabled = Boolean(card.disabled);
     const prompts = card.options
       .map((o, i) => ({ o, i }))

@@ -245,6 +245,7 @@ import {
   parseChoiceCustomId,
   parseChoiceFence,
   parseChoiceSpec,
+  choiceCardHideButtons,
   renderChoicePanel,
   resolveIngestOptionIndex,
   resolveOptionTarget,
@@ -11240,6 +11241,7 @@ export class Orchestrator {
       status: "open",
       lastClickerId: null,
       lastClickerName: null,
+      lastOptionIndex: null,
       createdBy: record.id,
       createdUtc: new Date().toISOString(),
       ingestTokenHash: ingestHash,
@@ -11345,6 +11347,7 @@ export class Orchestrator {
           choiceId: card.id,
           options: card.options.map((o) => ({ label: o.label, kind: o.kind })),
           disabled: card.status !== "open",
+          hideButtons: choiceCardHideButtons(card),
         }
       );
     } catch (err) {

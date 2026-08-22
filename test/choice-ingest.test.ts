@@ -44,6 +44,7 @@ function card(over: Partial<ChoiceCard> = {}): ChoiceCard {
     status: "open",
     lastClickerId: null,
     lastClickerName: null,
+    lastOptionIndex: null,
     createdBy: "discord:thread-1",
     createdUtc: "2026-08-18T00:00:00.000Z",
     ingestTokenHash: hash,

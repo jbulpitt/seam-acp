@@ -290,6 +290,7 @@ export class SessionStore {
       "ALTER TABLE choice_cards ADD COLUMN result_schema_json TEXT",
       "ALTER TABLE choice_cards ADD COLUMN ingest_wrapper TEXT",
       "ALTER TABLE choice_cards ADD COLUMN ingest_cors_json TEXT",
+      "ALTER TABLE choice_cards ADD COLUMN last_option_index INTEGER",
     ]) {
       try {
         this.db.exec(ddl);
@@ -1548,10 +1549,11 @@ export class SessionStore {
       this.db
         .prepare(
           `UPDATE choice_cards
-             SET click_count = ?, status = ?, last_clicker_id = ?, last_clicker_name = ?
+             SET click_count = ?, status = ?, last_clicker_id = ?, last_clicker_name = ?,
+                 last_option_index = ?
            WHERE id = ?`
         )
-        .run(nextCount, status, opts.userId, opts.userName, opts.choiceId);
+        .run(nextCount, status, opts.userId, opts.userName, opts.optionIndex, opts.choiceId);
       const updated = this.db
         .prepare<[string], ChoiceRow>("SELECT * FROM choice_cards WHERE id = ?")
         .get(opts.choiceId)!;
@@ -2032,6 +2034,7 @@ CREATE TABLE IF NOT EXISTS choice_cards (
   status               TEXT NOT NULL DEFAULT 'open',
   last_clicker_id      TEXT,
   last_clicker_name    TEXT,
+  last_option_index    INTEGER,
   created_by           TEXT NOT NULL,
   created_utc          TEXT NOT NULL,
   ingest_token_hash    TEXT,
@@ -2082,6 +2085,7 @@ interface ChoiceRow {
   status: string;
   last_clicker_id: string | null;
   last_clicker_name: string | null;
+  last_option_index?: number | null;
   created_by: string;
   created_utc: string;
   ingest_token_hash?: string | null;
@@ -2118,6 +2122,7 @@ const mapChoice = (r: ChoiceRow): ChoiceCard => ({
   status: r.status as ChoiceCardStatus,
   lastClickerId: r.last_clicker_id,
   lastClickerName: r.last_clicker_name,
+  lastOptionIndex: r.last_option_index ?? null,
   createdBy: r.created_by,
   createdUtc: r.created_utc,
   ingestTokenHash: r.ingest_token_hash ?? null,

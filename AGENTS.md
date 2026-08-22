@@ -81,12 +81,12 @@ cancels the queued prompt. Shares the `#88` parked row.
 ## Interactive prompts (#91 / #92)
 
 Frozen Discord click-cards and HTTP ingest for microsites. Canonical agent
-how-to: `docs/agent-guides/interactive-prompts.md` (raw GitHub URL is what
-course repos hang in their context library). MCP `create_choice` /
-`cancel_choice` / `submit_result`, or fences `seam-choice` / `seam-result`.
-HTTP `POST /ingest` is a custom-option submit; the site gets **declared JSON**
-from `submit_result`, not the Discord transcript. Participants click; they
-do not author.
+how-to: `docs/agent-guides/interactive-prompts.md`. Default is **live in this
+thread, one person, one pick** — after they choose, the card shows the
+selection and buttons go away. `maxClicks` > 1 only for multi-user. MCP
+`create_choice` / `cancel_choice` / `submit_result`, or fences `seam-choice` /
+`seam-result`. HTTP `POST /ingest` is a custom-option submit; the site gets
+**declared JSON** from `submit_result`. Participants click; they do not author.
 
 ## Agent-scheduled wake events (#59)
 

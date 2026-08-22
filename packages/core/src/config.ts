@@ -36,6 +36,11 @@ const Schema = z.object({
    * Optional comma-separated list of parent channel IDs the bot is allowed to
    * operate in. When set, the bot only responds in threads whose parent channel
    * is in this list. When unset (default), all channels are allowed.
+   *
+   * IDs only — never resolve names. Discord Channel Obfuscation (#52) can
+   * make inaccessible channels appear as `___hidden___` on the Gateway and
+   * omits them from GET /guilds/{id}/channels. This allowlist is a static
+   * env parse; it must not enumerate the guild channel list.
    */
   DISCORD_ALLOWED_CHANNEL_IDS: z
     .string()

@@ -124,7 +124,7 @@ export const DispatchSpecSchema = z.object({
   agentId: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
-  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact", "parked", "choice"]).optional(),
+  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact", "parked", "choice", "ingest"]).optional(),
   compactSource: z.enum(["session", "discord"]).optional(),
   wakeChainDepth: z.number().int().min(0).optional(),
   chainId: z.string().min(1).optional(),

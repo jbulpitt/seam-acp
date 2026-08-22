@@ -20,6 +20,7 @@ export type RelocateSurface =
   | "session"
   | "preset"
   | "scheduled"
+  | "ingest-endpoint"
   | "channel-preset"
   | "thread-preset"
   | "dispatch"
@@ -261,6 +262,23 @@ function collectSqlHits(
             surface: "preset",
             id: row.id,
             from: row.repo_path,
+            to: next,
+            label: row.name,
+          });
+        }
+      }
+    }
+    if (tableExists(db, "ingest_endpoints")) {
+      const rows = db
+        .prepare("SELECT id, name, cwd FROM ingest_endpoints WHERE cwd IS NOT NULL AND cwd != ''")
+        .all() as Array<{ id: string; name: string; cwd: string }>;
+      for (const row of rows) {
+        const next = remapAbsPath(row.cwd, from, to);
+        if (next) {
+          hits.push({
+            surface: "ingest-endpoint",
+            id: row.id,
+            from: row.cwd,
             to: next,
             label: row.name,
           });
@@ -763,6 +781,7 @@ export function applyRelocatePlan(
       h.surface === "session" ||
       h.surface === "preset" ||
       h.surface === "scheduled" ||
+      h.surface === "ingest-endpoint" ||
       h.surface === "channel-preset" ||
       h.surface === "thread-preset" ||
       h.surface === "dispatch"
@@ -783,7 +802,7 @@ export function applyRelocatePlan(
     applied.push(moveHit);
   }
 
-  if (opts.dbPath && configHits.some((h) => h.surface === "session" || h.surface === "preset" || h.surface === "scheduled")) {
+  if (opts.dbPath && configHits.some((h) => h.surface === "session" || h.surface === "preset" || h.surface === "scheduled" || h.surface === "ingest-endpoint")) {
     const bak = `${opts.dbPath}.bak-relocate-${ts}`;
     try {
       fs.copyFileSync(opts.dbPath, bak);
@@ -816,6 +835,9 @@ export function applyRelocatePlan(
               now,
               hit.id
             );
+            applied.push(hit);
+          } else if (hit.surface === "ingest-endpoint") {
+            db.prepare("UPDATE ingest_endpoints SET cwd = ? WHERE id = ?").run(hit.to, hit.id);
             applied.push(hit);
           }
         }

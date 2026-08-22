@@ -12,6 +12,10 @@ import type { SessionRecord } from "../types.js";
 import { emitChoice, type ChoiceActor } from "./emit.js";
 import { ChoiceResultHub } from "./result.js";
 import type { ChoiceCard } from "./types.js";
+import {
+  planEndpointDispatch,
+  type IngestEndpoint,
+} from "./endpoint.js";
 
 export const INGEST_PATH = "/ingest";
 /** How long POST /ingest holds for submit_result before 202 + poll.
@@ -83,33 +87,42 @@ export class ChoiceIngest {
       json(res, 401, { error: "missing ingest token (Authorization: Bearer)" });
       return;
     }
-    const card = this.store.getChoiceCardByIngestHash(hashBridgeToken(token));
-    if (!card || !card.ingestTokenHash) {
+    const hash = hashBridgeToken(token);
+    const card = this.store.getChoiceCardByIngestHash(hash);
+    const endpoint = this.store.getIngestEndpointByTokenHash(hash);
+    if ((!card || !card.ingestTokenHash) && !endpoint) {
       json(res, 401, { error: "invalid ingest token" });
       return;
     }
-    this.cors(res, req, card.ingestCors ?? []);
+    const cors = card?.ingestCors ?? endpoint?.corsOrigins ?? [];
+    const rateKey = card?.ingestTokenHash ?? endpoint!.tokenHash;
+    this.cors(res, req, cors);
     if (req.method === "GET" && url.pathname.startsWith(`${INGEST_PATH}/jobs/`)) {
       const dispatchId = url.pathname.slice(`${INGEST_PATH}/jobs/`.length).replace(/\/+$/, "");
-      await this.handlePoll(res, card, dispatchId);
+      const ownerId = card?.id ?? endpoint!.id;
+      await this.handlePoll(res, ownerId, dispatchId);
       return;
     }
     if (req.method !== "POST" || url.pathname.replace(/\/+$/, "") !== INGEST_PATH) {
       json(res, 404, { error: "not found" });
       return;
     }
-    if (!this.rateOk(card.ingestTokenHash)) {
+    if (!this.rateOk(rateKey)) {
       json(res, 429, { error: "rate limited" });
       return;
     }
     const waitQ = url.searchParams.get("wait");
     const waitMs = waitQ === "0" ? 0 : this.waitMs;
-    await this.handlePost(req, res, card, waitMs);
+    if (endpoint) {
+      await this.handleEndpointPost(req, res, endpoint, waitMs);
+      return;
+    }
+    await this.handlePost(req, res, card!, waitMs);
   }
 
-  private async handlePoll(res: ServerResponse, card: ChoiceCard, dispatchId: string): Promise<void> {
+  private async handlePoll(res: ServerResponse, ownerId: string, dispatchId: string): Promise<void> {
     const row = this.store.getChoiceResult(dispatchId);
-    if (!row || row.choiceId !== card.id) {
+    if (!row || row.choiceId !== ownerId) {
       json(res, 404, { error: "unknown job" });
       return;
     }
@@ -228,6 +241,75 @@ export class ChoiceIngest {
       jobId: emitted.dispatchId,
       status: "pending",
       poll: `${INGEST_PATH}/jobs/${emitted.dispatchId}`,
+    });
+  }
+
+  private async handleEndpointPost(
+    req: IncomingMessage,
+    res: ServerResponse,
+    endpoint: IngestEndpoint,
+    waitMs: number
+  ): Promise<void> {
+    if (endpoint.status !== "open") {
+      json(res, 409, { error: "this endpoint is revoked" });
+      return;
+    }
+    let raw: string;
+    try {
+      raw = await readBody(req, this.bodyMax);
+    } catch {
+      json(res, 413, { error: `body exceeds ${this.bodyMax} bytes` });
+      return;
+    }
+    const parsed = parseIngestBody(raw, req.headers["content-type"]);
+    const studentId = typeof parsed.studentId === "string" ? parsed.studentId.trim().slice(0, 80) : "";
+    if (endpoint.uniqueStudent && studentId) {
+      const claimed = this.store.claimIngestStudent(endpoint.id, studentId);
+      if (!claimed.ok) {
+        json(res, 409, { error: "this student already submitted" });
+        return;
+      }
+    }
+    const payload = buildIngestPayload(parsed, endpoint.wrapper, undefined);
+    const spec = planEndpointDispatch({
+      endpoint,
+      payload,
+      ...(studentId ? { untrustedStudentId: studentId } : {}),
+      defaultModel: this.defaultModel,
+    });
+    await this.enqueue(spec);
+    const now = new Date().toISOString();
+    this.store.insertChoiceResult({
+      dispatchId: spec.id,
+      choiceId: endpoint.id,
+      status: "pending",
+      body: null,
+      error: null,
+      schema: endpoint.resultSchema,
+      createdUtc: now,
+      finishedUtc: null,
+    });
+    const pending = this.results.expect({
+      dispatchId: spec.id,
+      choiceId: endpoint.id,
+      schema: endpoint.resultSchema,
+    });
+    const timed = await withTimeout(pending, waitMs);
+    if (timed.status === "ok") {
+      json(res, 200, timed.value);
+      return;
+    }
+    if (timed.status === "ended") {
+      json(res, 504, {
+        error: timed.error ?? "no declared result",
+        jobId: spec.id,
+      });
+      return;
+    }
+    json(res, 202, {
+      jobId: spec.id,
+      status: "pending",
+      poll: `${INGEST_PATH}/jobs/${spec.id}`,
     });
   }
 

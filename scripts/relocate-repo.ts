@@ -50,7 +50,7 @@ function flag(name: string): boolean {
 
 function help(): string {
   return `Relocate a project path through seam configs (sessions, named presets,
-scheduled cwd, channel-presets.json, in-flight dispatch specs).
+scheduled cwd, ingest-endpoint cwd, channel-presets.json, in-flight dispatch specs).
 
 Usage:
   npx tsx scripts/relocate-repo.ts --from <old> --to <new> [options]

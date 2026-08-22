@@ -127,6 +127,12 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setDescription("Cancel an open choice card in this thread by id")
           .setRequired(false)
       )
+      .addStringOption((o) =>
+        o
+          .setName("cancel-ingest")
+          .setDescription("Revoke a headless ingest endpoint in this thread by id")
+          .setRequired(false)
+      )
   );
 
   cmd.addSubcommand((sub) =>

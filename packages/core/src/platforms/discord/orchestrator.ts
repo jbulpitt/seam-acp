@@ -266,6 +266,12 @@ import {
 } from "../../core/choice/types.js";
 import { emitChoice, emitChoiceMulti, planChoiceDispatch, planChoiceMultiDispatch } from "../../core/choice/emit.js";
 import { ChoiceResultHub, parseResultFence, extractSeamResultFromText } from "../../core/choice/result.js";
+import {
+  isDiscordSnowflake,
+  newIngestEndpointId,
+  parseIngestEndpointSpec,
+  type IngestEndpoint,
+} from "../../core/choice/endpoint.js";
 import { mintBridgeToken, hashBridgeToken } from "../../core/bridge-pairing.js";
 import { renderMathPng } from "../../core/math-render.js";
 import { isInlineableForAgent } from "../../agents/attachments.js";
@@ -426,6 +432,8 @@ export class Orchestrator {
   private readonly configEditor = new ConfigEditorStore();
   /** #92: declared HTTP result waiters for ingest-triggered choice turns. */
   private choiceResults?: ChoiceResultHub;
+  /** #95: synthetic session records for headless ingest jobs (dispatch id → record). */
+  private readonly ingestJobs = new Map<string, SessionRecord>();
   /** Bot-wide slash autocomplete registry (#93). Keyed by group/sub/option. */
   private readonly autocomplete = new AutocompleteRegistry();
   /** Public POST /ingest base (no token). */
@@ -4603,6 +4611,7 @@ export class Orchestrator {
     // on the target thread and post a result card there. Same start-indicator +
     // ledger + done-file plumbing, different body (see dispatchCompact).
     if (spec.kind === "compact") return this.dispatchCompact(spec);
+    if (spec.kind === "ingest") return this.dispatchIngestEndpoint(spec);
 
     const target: ChannelRef = { platform: PLATFORM, id: spec.target };
     const record = this.router.ensureSessionRecord({
@@ -5020,6 +5029,133 @@ export class Orchestrator {
       return await gatedRun();
     } finally {
       this.activeTurns--;
+    }
+  }
+
+  /**
+   * Headless ingest (#95): isolated silent scoring. No Discord posts unless
+   * `target` is a snowflake (optional notifyThread). MCP is keyed by the
+   * dispatch id, not a Discord session.
+   */
+  private async dispatchIngestEndpoint(
+    spec: DispatchSpec
+  ): Promise<{ output: string; stopReason: string }> {
+    const notifyId = isDiscordSnowflake(spec.target) ? spec.target : undefined;
+    const agentId = spec.agentId ?? this.config.DEFAULT_AGENT;
+    const profile = this.router.getProfile(agentId);
+    if (!profile) {
+      throw new Error(`dispatch ${spec.id}: unknown agent "${agentId}"`);
+    }
+    const cwd = spec.cwd ?? this.config.REPOS_ROOT;
+    const synthetic: SessionRecord = {
+      id: spec.id,
+      platform: PLATFORM,
+      channelRef: notifyId ?? spec.correlationId ?? spec.id,
+      parentRef: null,
+      agentId,
+      acpSessionId: "",
+      repoPath: cwd,
+      configJson: JSON.stringify({
+        ...(spec.model ? { model: spec.model } : {}),
+        ...(spec.effort ? { reasoningEffort: spec.effort } : {}),
+      }),
+      createdUtc: spec.createdUtc,
+      updatedUtc: spec.createdUtc,
+    };
+    this.ingestJobs.set(spec.id, synthetic);
+    try {
+      try {
+        this.store.recordDelegation({
+          id: spec.id,
+          kind: "ingest",
+          sourceRef: null,
+          targetRef: notifyId ?? null,
+          worker: null,
+          promptPreview: spec.prompt,
+          correlationId: spec.correlationId ?? null,
+          status: "dispatched",
+        });
+      } catch (err) {
+        this.logger.warn({ err, dispatch: spec.id }, "ingest: ledger record failed");
+      }
+
+      let outputTo: ChannelRef | undefined;
+      if (notifyId) {
+        const live = await this.threadLiveState(notifyId);
+        if (live === "ok") {
+          outputTo = { platform: PLATFORM, id: notifyId };
+        }
+      }
+
+      const mcpServers = this.router.mintMcpServersForSession(spec.id);
+      if (this.choiceResults) {
+        this.choiceResults.bindSession(spec.id, spec.id);
+        if (notifyId) this.choiceResults.bindChannel(notifyId, spec.id);
+      }
+
+      this.activeTurns++;
+      let result: InjectTurnResult | undefined;
+      try {
+        result = await this.injectTurn(null, spec.prompt, {
+          session: "isolated",
+          profile,
+          cwd,
+          ...(spec.model ? { model: spec.model } : {}),
+          ...(spec.effort ? { effort: spec.effort } : {}),
+          mcpServers,
+          ...(outputTo ? { outputTo } : {}),
+          ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
+          timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
+          onSession: (sessionId) => {
+            try {
+              this.store.updateDelegationStatus(spec.id, "running", { acpSessionId: sessionId });
+            } catch {
+              /* best-effort */
+            }
+            this.choiceResults?.bindSession(sessionId, spec.id);
+          },
+          awaitIdle: true,
+          logContext: { dispatch: spec.id, kind: "ingest" },
+        });
+      } finally {
+        this.activeTurns--;
+        if (this.choiceResults) {
+          if (result?.text) {
+            const harvested = extractSeamResultFromText(result.text);
+            if (harvested.ok) this.choiceResults.submitFromDispatch(spec.id, harvested.value);
+          }
+          this.choiceResults.turnEnded(spec.id);
+        }
+        this.router.revokeMcpSession(spec.id);
+      }
+      if (!result) throw new Error("ingest: injectTurn returned no result");
+      if (outputTo) {
+        await this.postDispatchOutput(outputTo, spec, result.text, result.error).catch((err) =>
+          this.logger.warn({ err, dispatch: spec.id }, "ingest: notify post failed")
+        );
+      }
+      const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
+      try {
+        this.store.updateDelegationStatus(spec.id, ledgerStatus);
+      } catch {
+        /* best-effort */
+      }
+      if (result.error) throw new Error(result.error);
+      return { output: result.text, stopReason: result.stopReason ?? "" };
+    } finally {
+      this.ingestJobs.delete(spec.id);
+    }
+  }
+
+  private async threadLiveState(threadId: string): Promise<"ok" | "gone" | "archived"> {
+    if (!this.adapter.getThreadLiveState) return "ok";
+    try {
+      const live = await this.adapter.getThreadLiveState({ platform: PLATFORM, id: threadId });
+      if (live === undefined) return "gone";
+      if (live.archived) return "archived";
+      return "ok";
+    } catch {
+      return "ok";
     }
   }
 
@@ -5519,6 +5655,7 @@ export class Orchestrator {
       case "scheduled": return "📅 Scheduled";
       case "parked": return "📥 Parked";
       case "choice": return "🗳️ Choice";
+      case "ingest": return "🌐 Ingest";
       case "handoff":
       default: return "📨 Handoff";
     }
@@ -5538,6 +5675,7 @@ export class Orchestrator {
       case "scheduled": return "scheduled";
       case "parked": return "parked prompt";
       case "choice": return "choice";
+      case "ingest": return "ingest";
       case "handoff":
       default: return "handoff";
     }
@@ -8544,6 +8682,26 @@ export class Orchestrator {
 
     // Watch cancel (#60, D7): same surface as wake cancel — the /seam tree is at
     // Discord's option cap, so watch lifecycle folds into /seam workflows too.
+    const cancelIngestId = i.options.getString("cancel-ingest");
+    if (cancelIngestId) {
+      const record = this.recordFromInteraction(i);
+      if (!record) {
+        await i.reply({
+          content: "Use `/seam workflows` inside a thread to revoke an ingest endpoint.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const result = await this.cancelIngest(record, cancelIngestId, { skipAuthorGate: true });
+      await i.reply({
+        content: result.ok
+          ? `🌐 Revoked ingest endpoint \`${cancelIngestId}\`.`
+          : result.error,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
     const cancelChoiceId = i.options.getString("cancel-choice");
     if (cancelChoiceId) {
       const record = this.recordFromInteraction(i);
@@ -8668,6 +8826,21 @@ export class Orchestrator {
         if (watches.length > 10) lines.push(`…and ${watches.length - 10} more`);
         embed.addFields({
           name: `🔔 Pending watches (${watches.length})`,
+          value: clampFieldValue(lines),
+        });
+        if (view.empty) embed.setDescription(null);
+      }
+
+      const endpoints = this.store.listOpenIngestEndpoints(record.platform, record.channelRef);
+      if (endpoints.length > 0) {
+        const lines = endpoints.slice(0, 10).map((e) => {
+          const uniq = e.uniqueStudent ? " · unique-student" : "";
+          const notify = e.notifyThread ? ` · notify ${e.notifyThread}` : "";
+          return `🌐 \`${e.id}\` ${e.name}${uniq}${notify}`;
+        });
+        if (endpoints.length > 10) lines.push(`…and ${endpoints.length - 10} more`);
+        embed.addFields({
+          name: `🌐 Ingest endpoints (${endpoints.length})`,
           value: clampFieldValue(lines),
         });
         if (view.empty) embed.setDescription(null);
@@ -11295,6 +11468,95 @@ export class Orchestrator {
     }
     const updated = this.store.getChoiceCard(choiceId);
     if (updated) await this.refreshChoiceCard(updated);
+    return { ok: true };
+  }
+
+  resolveIngestJob(sessionId: string): SessionRecord | undefined {
+    return this.ingestJobs.get(sessionId);
+  }
+
+  async createIngest(
+    record: SessionRecord,
+    specInput: unknown
+  ): Promise<
+    | { ok: true; ingestId: string; ingestToken: string; ingestUrl: string }
+    | { ok: false; error: string }
+  > {
+    const authorId = this.currentAuthorId(record.channelRef);
+    if (
+      isChoiceAuthoringRefused(
+        authorId,
+        this.config.SEAM_PARTICIPANT_USER_IDS,
+        this.config.SEAM_CONFIG_ADMIN_USER_IDS
+      )
+    ) {
+      return { ok: false, error: "Restricted participants cannot create ingest endpoints." };
+    }
+    const parsed = parseIngestEndpointSpec(specInput);
+    if (!parsed.ok) return parsed;
+    const spec = parsed.spec;
+    const cfg = this.store.readConfig(record);
+    const agentId = spec.agent ?? record.agentId ?? this.config.DEFAULT_AGENT;
+    if (!this.router.getProfile(agentId)) {
+      return { ok: false, error: `Unknown agent "${agentId}".` };
+    }
+    const ingestToken = mintBridgeToken();
+    const row: IngestEndpoint = {
+      id: newIngestEndpointId(),
+      tokenHash: hashBridgeToken(ingestToken),
+      name: spec.name,
+      cwd: spec.cwd ?? record.repoPath ?? null,
+      agentId,
+      model: spec.model ?? cfg.model ?? null,
+      effort: spec.effort ?? cfg.reasoningEffort ?? null,
+      wrapper: spec.wrapper?.trim() ? spec.wrapper : null,
+      resultSchema: spec.resultSchema ?? null,
+      corsOrigins: spec.corsOrigins ?? null,
+      uniqueStudent: spec.uniqueStudent === true,
+      notifyThread: spec.notifyThread ?? null,
+      status: "open",
+      createdBy: record.id,
+      createdUtc: new Date().toISOString(),
+      authoringChannelRef: record.channelRef,
+      authoringParentRef: record.parentRef,
+      platform: record.platform,
+    };
+    this.store.insertIngestEndpoint(row);
+    const ingestUrl = this.ingestUrl ? this.ingestUrl() : "/ingest";
+    this.logger.info(
+      { ingestId: row.id, thread: record.channelRef },
+      "ingest endpoint minted"
+    );
+    return { ok: true, ingestId: row.id, ingestToken, ingestUrl };
+  }
+
+  async cancelIngest(
+    record: SessionRecord,
+    ingestId: string,
+    opts?: { authorId?: string | null; skipAuthorGate?: boolean }
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const authorId = opts?.skipAuthorGate
+      ? null
+      : opts?.authorId !== undefined
+        ? opts.authorId
+        : this.currentAuthorId(record.channelRef);
+    if (
+      isChoiceAuthoringRefused(
+        authorId,
+        this.config.SEAM_PARTICIPANT_USER_IDS,
+        this.config.SEAM_CONFIG_ADMIN_USER_IDS
+      )
+    ) {
+      return { ok: false, error: "Restricted participants cannot revoke ingest endpoints." };
+    }
+    const ep = this.store.getIngestEndpoint(ingestId);
+    if (!ep || ep.authoringChannelRef !== record.channelRef) {
+      return { ok: false, error: "No open ingest endpoint with that id in this thread." };
+    }
+    const revoked = this.store.revokeIngestEndpoint(ingestId, record.channelRef);
+    if (!revoked) {
+      return { ok: false, error: "That endpoint is already revoked." };
+    }
     return { ok: true };
   }
 

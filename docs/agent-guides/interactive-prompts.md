@@ -254,3 +254,44 @@ microsites: `POST /ingest?wait=0` then poll.
 ### Persist
 
 No LMS store. Write attempts into the project cwd as the wrapper says.
+
+---
+
+## Headless ingest endpoints (#95)
+
+A **reusable HTTP contract** for microsites (quizzes, refine-loops) that do
+**not** need a Discord card or a thread at runtime. Same `POST /ingest` door
+and `submit_result` as card ingest. Not a hidden card.
+
+Mint with MCP `create_ingest` only (no fence — the token would leak). Token
+shown **once**. Isolated silent scoring. Retries unlimited unless
+`uniqueStudent: true`. Optional `notifyThread` copies working into a Discord
+snowflake; omitted → **no Discord posts**.
+
+```json
+{
+  "name": "hist2300-essay-check",
+  "wrapper": "Grade this. Persist under submissions/. Then submit_result matching the schema.",
+  "resultSchema": {
+    "type": "object",
+    "required": ["overallScore", "prose"],
+    "properties": {
+      "overallScore": { "type": "number" },
+      "prose": { "type": "string" }
+    }
+  },
+  "uniqueStudent": false
+}
+```
+
+Returns `{ ingestId, ingestUrl, ingestToken }`. Inject the token at build/serve
+time, not in page JS. `cancel_ingest({ ingestId })` or
+`/seam workflows cancel-ingest:<id>` revokes; in-flight jobs finish.
+
+Spawn fields (cwd, agent, model, effort) freeze at mint from the authoring
+session unless overridden. POST body does **not** choose them.
+
+`studentId` is an untrusted label. Same id may submit again unless
+`uniqueStudent`. Persist attempt history in the project cwd via the wrapper.
+
+Card ingest (#92) is unchanged.

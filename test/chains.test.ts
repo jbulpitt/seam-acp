@@ -280,12 +280,14 @@ describe("chain MCP tool", () => {
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
     expect(names).toEqual([
       "cancel_choice",
+      "cancel_ingest",
       "cancel_wake",
       "chain",
       "compact",
       "config_describe",
       "config_propose",
       "create_choice",
+      "create_ingest",
       "forward",
       "handoff",
       "peek",

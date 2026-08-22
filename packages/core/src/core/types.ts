@@ -218,7 +218,11 @@ export type DelegationKind =
   /** Frozen choice-card click (#91) — one click emitted one prompt via
    *  emitChoice. Distinct from "wake"/"parked" so watchdog/dispatch panels
    *  do not mis-file these. */
-  | "choice";
+  | "choice"
+  /** Headless HTTP ingest endpoint (#95) — isolated silent scoring turn.
+   *  Distinct from "choice" so Discord click-cards and microsite endpoints
+   *  do not share ledger/panel filing. */
+  | "ingest";
 
 /**
  * Lifecycle of a ledger row.

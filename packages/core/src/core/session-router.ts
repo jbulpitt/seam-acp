@@ -541,6 +541,20 @@ export class SessionRouter {
     }).mcpServers;
   }
 
+  /** Fresh MCP token keyed by `sessionId` (ingest jobs use the dispatch id). */
+  mintMcpServersForSession(sessionId: string): McpServer[] {
+    return planSeamMcpInjection({
+      sessionId,
+      globalMcpServers: this.mcpServers,
+      seamMcp: this.seamMcp,
+      reuseToken: false,
+    }).mcpServers;
+  }
+
+  revokeMcpSession(sessionId: string): void {
+    this.seamMcp?.registry.revokeSession(sessionId);
+  }
+
   /**
    * Resolve spawn inputs for a runtime start without actually starting the
    * agent. Tests (and later PR4) use this to inspect MCP injection + the

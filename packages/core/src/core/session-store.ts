@@ -33,6 +33,7 @@ import type {
   ChoiceResultStatus,
   ChoiceTarget,
 } from "./choice/types.js";
+import type { IngestEndpoint, IngestEndpointStatus } from "./choice/endpoint.js";
 import { INBOX_MAX_PER_SESSION, type InboxMessage } from "./inbox/types.js";
 import type { ParkedAttachment, ParkedPrompt } from "./parked-prompts/types.js";
 
@@ -267,6 +268,7 @@ export class SessionStore {
     this.db.exec(CHOICE_CARDS_SCHEMA);
     this.migrateChoiceIngest();
     this.migrateChoiceSelect();
+    this.db.exec(INGEST_ENDPOINTS_SCHEMA);
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -1621,6 +1623,102 @@ export class SessionStore {
     return row ? mapChoice(row) : null;
   }
 
+  // --- headless ingest endpoints (#95) --------------------------------------
+
+  insertIngestEndpoint(e: IngestEndpoint): void {
+    this.db
+      .prepare(
+        `INSERT INTO ingest_endpoints
+           (id, token_hash, name, cwd, agent_id, model, effort, wrapper,
+            result_schema_json, cors_json, unique_student, notify_thread,
+            status, created_by, created_utc, authoring_channel_ref,
+            authoring_parent_ref, platform)
+         VALUES
+           (@id, @tokenHash, @name, @cwd, @agentId, @model, @effort, @wrapper,
+            @resultSchemaJson, @corsJson, @uniqueStudent, @notifyThread,
+            @status, @createdBy, @createdUtc, @authoringChannelRef,
+            @authoringParentRef, @platform)`
+      )
+      .run({
+        id: e.id,
+        tokenHash: e.tokenHash,
+        name: e.name,
+        cwd: e.cwd,
+        agentId: e.agentId,
+        model: e.model,
+        effort: e.effort,
+        wrapper: e.wrapper,
+        resultSchemaJson: e.resultSchema == null ? null : JSON.stringify(e.resultSchema),
+        corsJson: e.corsOrigins == null ? null : JSON.stringify(e.corsOrigins),
+        uniqueStudent: e.uniqueStudent ? 1 : 0,
+        notifyThread: e.notifyThread,
+        status: e.status,
+        createdBy: e.createdBy,
+        createdUtc: e.createdUtc,
+        authoringChannelRef: e.authoringChannelRef,
+        authoringParentRef: e.authoringParentRef,
+        platform: e.platform,
+      });
+  }
+
+  getIngestEndpoint(id: string): IngestEndpoint | null {
+    const row = this.db
+      .prepare<[string], IngestEndpointRow>("SELECT * FROM ingest_endpoints WHERE id = ?")
+      .get(id);
+    return row ? mapIngestEndpoint(row) : null;
+  }
+
+  getIngestEndpointByTokenHash(tokenHash: string): IngestEndpoint | null {
+    const row = this.db
+      .prepare<[string], IngestEndpointRow>("SELECT * FROM ingest_endpoints WHERE token_hash = ?")
+      .get(tokenHash);
+    return row ? mapIngestEndpoint(row) : null;
+  }
+
+  listOpenIngestEndpoints(platform: string, channelRef: string): IngestEndpoint[] {
+    return this.db
+      .prepare<[string, string], IngestEndpointRow>(
+        `SELECT * FROM ingest_endpoints
+          WHERE platform = ? AND authoring_channel_ref = ? AND status = 'open'
+          ORDER BY created_utc ASC`
+      )
+      .all(platform, channelRef)
+      .map(mapIngestEndpoint);
+  }
+
+  revokeIngestEndpoint(id: string, channelRef: string): boolean {
+    const info = this.db
+      .prepare(
+        "UPDATE ingest_endpoints SET status = 'revoked' WHERE id = ? AND authoring_channel_ref = ? AND status = 'open'"
+      )
+      .run(id, channelRef);
+    return info.changes > 0;
+  }
+
+  /**
+   * One-shot exam path. Empty studentId is not claimed (anonymous retries stay
+   * allowed). Duplicate (ingest_id, student_id) → already-claimed.
+   */
+  claimIngestStudent(
+    ingestId: string,
+    studentId: string
+  ): { ok: true } | { ok: false; reason: "already-claimed" } {
+    try {
+      this.db
+        .prepare(
+          "INSERT INTO ingest_endpoint_claims (ingest_id, student_id, created_utc) VALUES (?, ?, ?)"
+        )
+        .run(ingestId, studentId, new Date().toISOString());
+      return { ok: true };
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "SQLITE_CONSTRAINT_PRIMARYKEY" || code === "SQLITE_CONSTRAINT_UNIQUE") {
+        return { ok: false, reason: "already-claimed" };
+      }
+      throw err;
+    }
+  }
+
   insertChoiceResult(r: ChoiceResultRow): void {
     this.db
       .prepare(
@@ -2111,6 +2209,36 @@ CREATE TABLE IF NOT EXISTS choice_results (
 CREATE INDEX IF NOT EXISTS idx_choice_results_choice ON choice_results(choice_id);
 `;
 
+const INGEST_ENDPOINTS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS ingest_endpoints (
+  id                     TEXT PRIMARY KEY,
+  token_hash             TEXT NOT NULL UNIQUE,
+  name                   TEXT NOT NULL,
+  cwd                    TEXT,
+  agent_id               TEXT,
+  model                  TEXT,
+  effort                 TEXT,
+  wrapper                TEXT,
+  result_schema_json     TEXT,
+  cors_json              TEXT,
+  unique_student         INTEGER NOT NULL DEFAULT 0,
+  notify_thread          TEXT,
+  status                 TEXT NOT NULL DEFAULT 'open',
+  created_by             TEXT NOT NULL,
+  created_utc            TEXT NOT NULL,
+  authoring_channel_ref  TEXT NOT NULL,
+  authoring_parent_ref   TEXT,
+  platform               TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ingest_endpoints_channel ON ingest_endpoints(platform, authoring_channel_ref, status);
+CREATE TABLE IF NOT EXISTS ingest_endpoint_claims (
+  ingest_id    TEXT NOT NULL,
+  student_id   TEXT NOT NULL,
+  created_utc  TEXT NOT NULL,
+  PRIMARY KEY (ingest_id, student_id)
+);
+`;
+
 interface ChoiceRow {
   id: string;
   platform: string;
@@ -2193,6 +2321,48 @@ const mapChoiceResult = (r: ChoiceResultDbRow): ChoiceResultRow => ({
   schema: r.schema_json ? parseJsonSafe<unknown>(r.schema_json, null) : null,
   createdUtc: r.created_utc,
   finishedUtc: r.finished_utc,
+});
+
+interface IngestEndpointRow {
+  id: string;
+  token_hash: string;
+  name: string;
+  cwd: string | null;
+  agent_id: string | null;
+  model: string | null;
+  effort: string | null;
+  wrapper: string | null;
+  result_schema_json: string | null;
+  cors_json: string | null;
+  unique_student: number;
+  notify_thread: string | null;
+  status: string;
+  created_by: string;
+  created_utc: string;
+  authoring_channel_ref: string;
+  authoring_parent_ref: string | null;
+  platform: string;
+}
+
+const mapIngestEndpoint = (r: IngestEndpointRow): IngestEndpoint => ({
+  id: r.id,
+  tokenHash: r.token_hash,
+  name: r.name,
+  cwd: r.cwd,
+  agentId: r.agent_id,
+  model: r.model,
+  effort: r.effort,
+  wrapper: r.wrapper,
+  resultSchema: r.result_schema_json ? parseJsonSafe<unknown>(r.result_schema_json, null) : null,
+  corsOrigins: r.cors_json ? parseJsonSafe<string[]>(r.cors_json, []) : null,
+  uniqueStudent: r.unique_student === 1,
+  notifyThread: r.notify_thread,
+  status: r.status as IngestEndpointStatus,
+  createdBy: r.created_by,
+  createdUtc: r.created_utc,
+  authoringChannelRef: r.authoring_channel_ref,
+  authoringParentRef: r.authoring_parent_ref,
+  platform: r.platform,
 });
 
 function parseJsonSafe<T>(raw: string, fallback: T): T {

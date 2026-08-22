@@ -339,6 +339,19 @@ export interface SeamMcpServerDeps {
     record: SessionRecord,
     value: unknown
   ) => { ok: true; dispatchId: string } | { ok: false; error: string };
+  /** Mint a headless HTTP ingest endpoint (#95). No Discord card. */
+  createIngest?: (
+    record: SessionRecord,
+    spec: unknown
+  ) => Promise<
+    | { ok: true; ingestId: string; ingestToken: string; ingestUrl: string }
+    | { ok: false; error: string }
+  >;
+  /** Revoke a headless ingest endpoint minted from this thread. */
+  cancelIngest?: (
+    record: SessionRecord,
+    ingestId: string
+  ) => Promise<{ ok: true } | { ok: false; error: string }>;
 }
 
 /** One drained inbox message, as `poll_inbox` renders it. Kept as a minimal
@@ -1019,6 +1032,39 @@ const TOOLS = [
       additionalProperties: true,
     },
   },
+  {
+    name: "create_ingest",
+    description:
+      "Mint a headless HTTP ingest endpoint (no Discord card). Token shown once. Isolated silent scoring; retries unlimited unless uniqueStudent. See docs/agent-guides/interactive-prompts.md.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Short name for /seam workflows (≤80)." },
+        wrapper: { type: "string", description: "Frozen instructions merged ahead of each POST body." },
+        resultSchema: { type: "object", description: "Optional JSON Schema for submit_result." },
+        corsOrigins: { type: "array", items: { type: "string" } },
+        uniqueStudent: { type: "boolean", description: "If true, same studentId cannot submit twice. Default false." },
+        notifyThread: { type: "string", description: "Optional Discord snowflake to copy working into. Omitted = no Discord." },
+        cwd: { type: "string", description: "Override spawn cwd. Default: this thread's repo." },
+        agent: { type: "string", description: "Override agent id. Default: this thread's agent." },
+        model: { type: "string" },
+        effort: { type: "string" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "cancel_ingest",
+    description:
+      "Revoke a headless ingest endpoint you minted in THIS thread. In-flight jobs finish; new POSTs 409.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ingestId: { type: "string", description: "Id returned by create_ingest." },
+      },
+      required: ["ingestId"],
+    },
+  },
 ] as const;
 
 const INSTRUCTIONS = [
@@ -1043,6 +1089,7 @@ const INSTRUCTIONS = [
   "  native ScheduleWakeup / Monitor tools do NOT function here, so use this instead.",
   "- cancel_wake(wakeId): cancel a pending wake you scheduled.",
   "- create_choice / cancel_choice / submit_result: frozen click-cards; HTTP ingest + declared JSON result. Participants cannot author. See docs/agent-guides/interactive-prompts.md.",
+  "- create_ingest / cancel_ingest: headless HTTP endpoint (no Discord card). Isolated silent scoring, retries unlimited. Token once. Same POST /ingest + submit_result.",
   "- watch_create(kind, spec, intervalSeconds, prompt, expiresInSeconds, ...): register a CONDITION the bridge",
   "  checks cheaply and re-enters you ONLY when it fires (file/http/command source). Prefer this over a",
   "  schedule_wake poll loop for \"wait until X\" — the bridge does the checking, so a turn is spent only on a",
@@ -1242,6 +1289,10 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolCancelChoice(record, args));
         case "submit_result":
           return rpcResult(id, this.toolSubmitResult(record, args));
+        case "create_ingest":
+          return rpcResult(id, await this.toolCreateIngest(record, args));
+        case "cancel_ingest":
+          return rpcResult(id, await this.toolCancelIngest(record, args));
         default:
           return rpcError(id, -32602, `unknown tool: ${name}`);
       }
@@ -1616,6 +1667,38 @@ export class SeamMcpServer {
     const result = this.deps.submitResult(caller, args);
     return result.ok
       ? textResult(`Result submitted for dispatch ${result.dispatchId}.`)
+      : textResult(result.error, true);
+  }
+
+  private async toolCreateIngest(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.createIngest) {
+      return textResult("ingest endpoints are not supported on this deployment.", true);
+    }
+    const result = await this.deps.createIngest(caller, args);
+    if (!result.ok) return textResult(`Ingest endpoint not created: ${result.error}`, true);
+    this.logger.info(
+      { ingestId: result.ingestId, thread: caller.channelRef },
+      "seam-mcp create_ingest minted"
+    );
+    return textResult(
+      `Ingest endpoint ${result.ingestId} minted. POST ${result.ingestUrl} with Authorization: Bearer ${result.ingestToken} (token shown once). Isolated silent scoring; declare the HTTP body with submit_result.`
+    );
+  }
+
+  private async toolCancelIngest(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.cancelIngest) {
+      return textResult("ingest endpoints are not supported on this deployment.", true);
+    }
+    const ingestId = requireString(args, "ingestId");
+    const result = await this.deps.cancelIngest(caller, ingestId);
+    return result.ok
+      ? textResult(`Ingest endpoint ${ingestId} revoked.`)
       : textResult(result.error, true);
   }
 

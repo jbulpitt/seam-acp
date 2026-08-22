@@ -512,7 +512,8 @@ async function main(): Promise<void> {
       logger,
       resolveSession: (token) => {
         const sid = seamTokenRegistry.resolve(token);
-        return sid ? store.get(sid) ?? undefined : undefined;
+        if (!sid) return undefined;
+        return store.get(sid) ?? orchestrator.resolveIngestJob(sid);
       },
       enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
       // Agent-scheduled wake events (#59): arm/cancel a one-shot self-resumption
@@ -523,6 +524,8 @@ async function main(): Promise<void> {
       createChoice: (record, spec) => orchestrator.createChoice(record, spec),
       cancelChoice: (record, id) => orchestrator.cancelChoice(record, id),
       submitResult: (record, value) => orchestrator.submitChoiceResult(record, value),
+      createIngest: (record, spec) => orchestrator.createIngest(record, spec),
+      cancelIngest: (record, id) => orchestrator.cancelIngest(record, id),
       // Agent-defined watches (#60): register/cancel/list a bridge-evaluated
       // condition trigger for the calling thread. The orchestrator owns the
       // guards (including the D8 command gate) and the DB row; the WatchManager

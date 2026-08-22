@@ -109,11 +109,13 @@ describe("collect + apply against sqlite, presets, dispatch, fs", () => {
       CREATE TABLE sessions (id TEXT PRIMARY KEY, repo_path TEXT, channel_ref TEXT, updated_utc TEXT);
       CREATE TABLE presets (id TEXT PRIMARY KEY, name TEXT, repo_path TEXT, updated_utc TEXT);
       CREATE TABLE scheduled_prompts (id TEXT PRIMARY KEY, name TEXT, cwd TEXT, updated_utc TEXT);
+      CREATE TABLE ingest_endpoints (id TEXT PRIMARY KEY, name TEXT, cwd TEXT);
     `);
     db.prepare("INSERT INTO sessions VALUES (?,?,?,?)").run("s1", from, "chan-1", "t0");
     db.prepare("INSERT INTO sessions VALUES (?,?,?,?)").run("s2", "/elsewhere", "chan-2", "t0");
     db.prepare("INSERT INTO presets VALUES (?,?,?,?)").run("p1", "worker", `${from}/app`, "t0");
     db.prepare("INSERT INTO scheduled_prompts VALUES (?,?,?,?)").run("sch1", "nightly", from, "t0");
+    db.prepare("INSERT INTO ingest_endpoints VALUES (?,?,?)").run("ie1", "quiz", from);
     db.close();
 
     const presetsPath = path.join(tmp, "channel-presets.json");
@@ -143,7 +145,7 @@ describe("collect + apply against sqlite, presets, dispatch, fs", () => {
     });
     const surfaces = plan.hits.map((h) => h.surface).sort();
     expect(surfaces).toEqual(
-      ["channel-preset", "dispatch", "fs-move", "fs-symlink", "preset", "scheduled", "session"].sort()
+      ["channel-preset", "dispatch", "fs-move", "fs-symlink", "ingest-endpoint", "preset", "scheduled", "session"].sort()
     );
 
     const result = applyRelocatePlan(plan, {
@@ -170,6 +172,9 @@ describe("collect + apply against sqlite, presets, dispatch, fs", () => {
       repo_path: `${to}/app`,
     });
     expect(after.prepare("SELECT cwd FROM scheduled_prompts WHERE id = 'sch1'").get()).toEqual({
+      cwd: to,
+    });
+    expect(after.prepare("SELECT cwd FROM ingest_endpoints WHERE id = 'ie1'").get()).toEqual({
       cwd: to,
     });
     after.close();

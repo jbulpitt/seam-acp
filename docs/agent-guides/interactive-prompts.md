@@ -189,9 +189,15 @@ Prefer `defaultTarget: { "type": "live" }` for school microsites so the course
 thread sees the working **and** MCP `submit_result` is definitely present.
 `isolated` is allowed; it reuses the authoring thread’s MCP token.
 
-If the wait exceeds `SEAM_INGEST_WAIT_MS` (default 90s), POST returns
-`202 { jobId, poll }` and the site `GET /ingest/jobs/{jobId}` with the same
-Bearer token.
+POST holds for `SEAM_INGEST_WAIT_MS` (default **5 minutes**, ceiling 30) waiting
+on `submit_result`, then returns `202 { jobId, poll }`. The site
+`GET /ingest/jobs/{jobId}` with the same Bearer until `200` or `504`.
+
+Long grading is normal — **poll is the long path**, not a fatter POST.
+Cloudflare proxied hosts (`ingest.runbooksynthesis.com`) kill idle POST at
+~100s (`524`) *before* a 5-minute wait can return, and that 524 has **no
+jobId**. For a public microsite: `POST /ingest?wait=0` (202 immediately with
+`jobId`) then poll. Direct/loopback can sit on the POST.
 
 Discord still gets whatever else you wrote (`live` / `thread` = teacher
 working). Isolated may be quiet except an optional breadcrumb.

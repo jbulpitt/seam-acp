@@ -216,6 +216,36 @@ describe("POST /ingest (#92)", () => {
     server.close();
   });
 
+  it("POST ?wait=0 returns 202 with jobId immediately", async () => {
+    const token = mintBridgeToken();
+    store.insertChoiceCard(card({ ingestTokenHash: hashBridgeToken(token) }));
+    const ingest = new ChoiceIngest({
+      store,
+      results: new ChoiceResultHub({ store, logger: silent }),
+      logger: silent,
+      enqueue: async () => {},
+      destLive: async () => "ok",
+      authoringSession: () => record(),
+      publicBase: () => "https://example.test",
+      waitMs: 60_000,
+    });
+    const server = createServer((req, res) => void ingest.handle(req, res));
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    const t0 = Date.now();
+    const res = await fetch(`http://127.0.0.1:${port}/ingest?wait=0`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ text: "essay" }),
+    });
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { jobId: string; poll: string };
+    expect(body.jobId).toBeTruthy();
+    expect(body.poll).toMatch(/^\/ingest\/jobs\//);
+    server.close();
+  });
+
   it("rejects a second submit from the same studentId", async () => {
     const token = mintBridgeToken();
     store.insertChoiceCard(card({ ingestTokenHash: hashBridgeToken(token), maxClicks: 10 }));

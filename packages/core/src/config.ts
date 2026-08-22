@@ -523,8 +523,10 @@ const Schema = z.object({
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .default("info"),
   HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
-  /** #92: how long POST /ingest waits for submit_result before 202 + poll. */
-  SEAM_INGEST_WAIT_MS: z.coerce.number().int().min(1000).max(600_000).default(90_000),
+  /** #92: how long POST /ingest waits for submit_result before 202 + poll.
+   *  Default 5 min. Ceiling 30 min. Public Cloudflare POSTs still die ~100s —
+   *  microsites should poll GET /ingest/jobs/:id (or POST ?wait=0). */
+  SEAM_INGEST_WAIT_MS: z.coerce.number().int().min(0).max(1_800_000).default(300_000),
   SEAM_INGEST_BODY_MAX: z.coerce.number().int().min(1024).max(1_048_576).default(65_536),
   SEAM_INGEST_RATE_PER_MIN: z.coerce.number().int().min(1).max(1000).default(60),
   /**

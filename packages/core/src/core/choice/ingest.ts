@@ -14,7 +14,10 @@ import { ChoiceResultHub } from "./result.js";
 import type { ChoiceCard } from "./types.js";
 
 export const INGEST_PATH = "/ingest";
-export const DEFAULT_INGEST_WAIT_MS = 90_000;
+/** How long POST /ingest holds for submit_result before 202 + poll.
+ *  5 min covers a cold isolated grok spawn; longer grading should poll
+ *  (Cloudflare proxied POST dies around 100s — use ?wait=0 then GET the job). */
+export const DEFAULT_INGEST_WAIT_MS = 300_000;
 export const DEFAULT_INGEST_BODY_MAX = 65_536;
 export const DEFAULT_INGEST_RATE_PER_MIN = 60;
 
@@ -99,7 +102,9 @@ export class ChoiceIngest {
       json(res, 429, { error: "rate limited" });
       return;
     }
-    await this.handlePost(req, res, card);
+    const waitQ = url.searchParams.get("wait");
+    const waitMs = waitQ === "0" ? 0 : this.waitMs;
+    await this.handlePost(req, res, card, waitMs);
   }
 
   private async handlePoll(res: ServerResponse, card: ChoiceCard, dispatchId: string): Promise<void> {
@@ -119,7 +124,12 @@ export class ChoiceIngest {
     json(res, 504, { error: row.error ?? "no declared result", jobId: dispatchId });
   }
 
-  private async handlePost(req: IncomingMessage, res: ServerResponse, card: ChoiceCard): Promise<void> {
+  private async handlePost(
+    req: IncomingMessage,
+    res: ServerResponse,
+    card: ChoiceCard,
+    waitMs: number
+  ): Promise<void> {
     if (card.status !== "open") {
       json(res, 409, { error: "this card is closed" });
       return;
@@ -202,7 +212,7 @@ export class ChoiceIngest {
       choiceId: card.id,
       schema: card.resultSchema,
     });
-    const timed = await withTimeout(pending, this.waitMs);
+    const timed = await withTimeout(pending, waitMs);
     if (timed.status === "ok") {
       json(res, 200, timed.value);
       return;

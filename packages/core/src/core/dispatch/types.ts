@@ -74,11 +74,12 @@ export interface DispatchSpec {
    *  either way — streaming is purely about live visibility in the run's own
    *  target thread. */
   stream?: boolean;
-  /** Handoff feedback channel (#62). When true, the worker's prompt gets a
-   *  standing instruction to poll its OWN inbox at checkpoints for mid-task
-   *  steering from its delegator — a cooperative, opt-in-per-handoff channel
-   *  that never cancels or restarts the turn (contrast the preemptive `steer`
-   *  path). Absent/false → the prompt is untouched and behavior is unchanged. */
+  /** Handoff feedback channel (#62/#65). When true, the worker's prompt gets a
+   *  standing instruction to poll its OWN inbox after each discrete step/item
+   *  (and at least every 1–2 minutes) for mid-task steering from its delegator —
+   *  a cooperative, opt-in-per-handoff channel that never cancels or restarts
+   *  the turn (contrast the preemptive `steer` path). Absent/false → the prompt
+   *  is untouched and behavior is unchanged. */
   watchFeedback?: boolean;
   /**
    * Set by recoverStale when a crash leftover is re-enqueued (#76). The
@@ -176,16 +177,19 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
 }
 
 /** The standing instruction appended to a `watchFeedback` handoff's worker
- *  prompt (#62). Motivates the worker to poll its OWN inbox at natural
- *  checkpoints so its delegator can push mid-task steering it absorbs WITHOUT a
- *  cancel or restart — the cooperative tier. Wording is kept here (one place) so
- *  it stays tunable. */
+ *  prompt (#62/#65). Motivates the worker to poll its OWN inbox after each
+ *  discrete step/item (not once at a vague "halfway" checkpoint) so its
+ *  delegator can push mid-task steering it absorbs WITHOUT a cancel or restart.
+ *  Wording is kept here (one place) so it stays tunable. */
 export const WATCH_FEEDBACK_INSTRUCTION =
-  "At natural checkpoints (before starting a major step, after finishing a tool " +
-  "batch), call `poll_inbox` to check for feedback from your delegator. If it " +
-  "returns guidance, incorporate it into your current plan before continuing — " +
-  "you do not need to restart. If poll_inbox returns a PRIORITY item, stop your " +
-  "current approach immediately and reorient to it, even mid-task.";
+  "After each discrete step or item you complete, call `poll_inbox` before " +
+  "starting the next. Also poll at the start of the turn, and at least every " +
+  "1–2 minutes of work if a step runs long. Do not poll in a tight loop or " +
+  "after every individual tiny tool call — once per completed item/step is " +
+  "enough. If poll_inbox returns guidance, incorporate it into your current " +
+  "plan before continuing — you do not need to restart. If poll_inbox returns " +
+  "a PRIORITY item, stop your current approach immediately and reorient to it, " +
+  "even mid-task.";
 
 /** Append the `watchFeedback` standing instruction to an already-assembled
  *  worker prompt when the spec opts in (#62); otherwise return it verbatim.

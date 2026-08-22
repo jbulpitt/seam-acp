@@ -410,8 +410,9 @@ const TOOLS = [
           type: "boolean",
           description:
             "Tell the worker to watch its inbox for your mid-task steering (default false). When true, its prompt " +
-            "gets a standing instruction to call `poll_inbox` at checkpoints; you then push feedback with `send` while " +
-            "it runs and it absorbs the guidance WITHOUT cancelling or restarting its turn (cooperative, history intact).",
+            "gets a standing instruction to call `poll_inbox` after each discrete step/item (and at least every 1–2 minutes); " +
+            "you then push feedback with `send` while it runs and it absorbs the guidance WITHOUT cancelling or restarting " +
+            "its turn (cooperative, history intact).",
         },
       },
       required: ["worker", "prompt"],

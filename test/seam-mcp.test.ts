@@ -452,6 +452,12 @@ describe("SeamMcpServer", () => {
     // #66: the standing text now also steers on PRIORITY items — stop and reorient.
     expect(withFlag).toContain("PRIORITY");
     expect(withFlag).toContain("reorient to it, even mid-task");
+    // #65: cadence is per-item, not a vague "natural checkpoint".
+    expect(withFlag).toContain("After each discrete step or item you complete");
+    expect(withFlag).toContain("before starting the next");
+    expect(withFlag).toContain("1–2 minutes");
+    expect(withFlag).toContain("once per completed item/step is enough");
+    expect(withFlag).not.toContain("natural checkpoints");
 
     expect(applyWatchFeedback(base, false)).toBe(base);
     expect(applyWatchFeedback(base, undefined)).toBe(base);

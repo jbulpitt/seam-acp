@@ -217,6 +217,19 @@ export function makeAgyProfile(opts: {
     displayName: "Antigravity",
     defaultModel,
     staticModels: opts.staticModels,
+    async listPickerModels() {
+      if (opts.staticModels && opts.staticModels.length > 0) {
+        return opts.staticModels;
+      }
+      const rows = await getCatalog(cli);
+      const rec = rows.filter((r) => r.recommended);
+      const rest = rows.filter((r) => !r.recommended);
+      return [...rec, ...rest].map((r) => ({
+        modelId: r.modelId,
+        name: r.displayName,
+        ...(r.maxTokens ? { contextLimit: r.maxTokens } : {}),
+      }));
+    },
     threadAbbr: opts.threadAbbr,
     // agy bakes effort into the model choice (high/med/low model variants) —
     // there is no separate reasoning-effort knob, so the picker is suppressed.

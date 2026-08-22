@@ -28,7 +28,7 @@ import type {
   SessionRecord,
 } from "../chat-adapter.js";
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
-import { cleanTextForPreview, scanWorkspaces, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
+import { cleanTextForPreview, pickerModelsForProfile, scanWorkspaces, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
 import { readRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
 import { analyzeSessionCoverage, detectGaps, type TimeRange, type GapReport } from "../../core/compaction/gap-detector.js";
 import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
@@ -12893,15 +12893,15 @@ export class Orchestrator {
       instructions: existing?.instructions ?? null,
     };
 
-    // Only statically-declared models can be offered here — the dynamic ACP
-    // model list requires a running agent, and the builder must not spawn one.
-    const getModelsForAgent = (
+    // Do not start an ACP session in this builder. staticModels first; agy
+    // (and anyone else with listPickerModels) can fill from a cached catalog.
+    const loadModels = async (
       agentId: string | null
-    ): ReadonlyArray<{ modelId: string; name: string }> => {
+    ): Promise<ReadonlyArray<{ modelId: string; name: string }>> => {
       if (!agentId) return [];
-      const profile = this.router.getProfile(agentId);
-      return (profile?.staticModels ?? []).slice(0, 24);
+      return pickerModelsForProfile(this.router.getProfile(agentId), 24);
     };
+    let models = await loadModels(state.agentId);
 
     const render = () => {
       const agentDisplay = state.agentId ? `\`${state.agentId}\`` : "*(default)*";
@@ -12954,7 +12954,6 @@ export class Orchestrator {
           }))
         );
 
-      const models = getModelsForAgent(state.agentId);
       const modelSelect = new StringSelectMenuBuilder()
         .setCustomId("preset:model")
         .setPlaceholder("🧠 Model");
@@ -12969,7 +12968,9 @@ export class Orchestrator {
         );
       } else {
         modelSelect.addOptions({
-          label: "Default (select an agent first for model list)",
+          label: state.agentId
+            ? "Default (no models advertised for this agent)"
+            : "Default (select an agent first for model list)",
           value: "__default__",
           default: true,
         });
@@ -13023,7 +13024,8 @@ export class Orchestrator {
       };
     };
 
-    await i.reply({ ...render(), flags: MessageFlags.Ephemeral });
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    await i.editReply(render());
     const msg = await i.fetchReply();
     const collector = msg.createMessageComponentCollector({
       filter: (c) => c.user.id === i.user.id,
@@ -13048,7 +13050,9 @@ export class Orchestrator {
           state.agentId = v === "__default__" ? null : v;
           // Model ids are agent-specific; a stale pick would be invalid.
           state.model = null;
-          await c.update(render());
+          await c.deferUpdate();
+          models = await loadModels(state.agentId);
+          await c.editReply(render());
         } else if (c.isStringSelectMenu() && c.customId === "preset:model") {
           const v = c.values[0]!;
           state.model = v === "__default__" ? null : v;

@@ -97,6 +97,13 @@ export interface AgentAdapter {
   readonly staticModels?: ReadonlyArray<AdapterModel>;
 
   /**
+   * Optional async model list for pickers that must not spawn an ACP session
+   * (preset builder). Prefer `staticModels` when non-empty. Agy uses this to
+   * return its cached language-server catalog.
+   */
+  listPickerModels?(): Promise<ReadonlyArray<AdapterModel>>;
+
+  /**
    * Optional short abbreviation displayed in thread names when the new-thread
    * wizard renames the thread after setup (e.g. "cp-fhr", "agy").
    */
@@ -249,6 +256,31 @@ export type AgentProfileCore = Omit<
  * `writeAttachment` delegate to `sessionManager` when present, and the
  * remaining methods are safe no-ops.
  */
+/** Models for a Discord picker that must not start an ACP session. */
+export async function pickerModelsForProfile(
+  profile:
+    | {
+        staticModels?: ReadonlyArray<AdapterModel>;
+        listPickerModels?: () => Promise<ReadonlyArray<AdapterModel>>;
+      }
+    | null
+    | undefined,
+  cap = 24
+): Promise<ReadonlyArray<AdapterModel>> {
+  if (!profile) return [];
+  if (profile.staticModels && profile.staticModels.length > 0) {
+    return profile.staticModels.slice(0, cap);
+  }
+  if (typeof profile.listPickerModels === "function") {
+    try {
+      return (await profile.listPickerModels()).slice(0, cap);
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
 export function asLocalAdapter(core: AgentProfileCore): AgentAdapter {
   const adapter: AgentAdapter = {
     ...core,

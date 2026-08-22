@@ -984,6 +984,11 @@ const TOOLS = [
           type: "array",
           description: '1–25 options: { label, kind: "prompt"|"custom", payload?, target? }. prompt requires payload.',
         },
+        select: {
+          type: "object",
+          description:
+            'Multi-select: dropdown + Confirm, one combined prompt. { min?, max? } (min default 1, max default options.length). All options must be kind:"prompt". Cannot combine with maxClicks>1 (v1).',
+        },
         ingress: {
           type: ["boolean", "object"],
           description:

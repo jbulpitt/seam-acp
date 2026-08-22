@@ -62,3 +62,51 @@ export function choicePickerPageCaption(
   const end = Math.min(total, (page + 1) * pageSize);
   return `Page ${page + 1} of ${pageCount} (${start}-${end} of ${total}).`;
 }
+
+/** Placeholder on a #94 multi-select menu. */
+export const MULTI_SELECT_PLACEHOLDER = "Select one or more…";
+
+export type MultiSelectMenuSpec = {
+  customId: string;
+  minValues: number;
+  maxValues: number;
+  placeholder: string;
+  options: Array<{ label: string; value: string; default?: boolean }>;
+  confirmCustomId: string;
+  confirmDisabled: boolean;
+  confirmLabel: string;
+};
+
+/** Pure layout for a multi-select card: one menu + Confirm (disabled until a
+ *  valid pending pick). Adapter turns this into Discord components. */
+export function describeMultiSelectMenu(opts: {
+  choiceId: string;
+  options: ReadonlyArray<{ label: string }>;
+  min: number;
+  max: number;
+  pendingSelection?: ReadonlyArray<number>;
+  disabled?: boolean;
+  makeSelectId: (choiceId: string) => string;
+  makeConfirmId: (choiceId: string) => string;
+}): MultiSelectMenuSpec {
+  const pending = new Set(opts.pendingSelection ?? []);
+  const n = opts.options.length;
+  const minValues = Math.min(Math.max(1, opts.min), Math.max(1, n));
+  const maxValues = Math.min(Math.max(minValues, opts.max), Math.max(1, n));
+  const count = pending.size;
+  const inRange = count >= minValues && count <= maxValues;
+  return {
+    customId: opts.makeSelectId(opts.choiceId),
+    minValues,
+    maxValues,
+    placeholder: MULTI_SELECT_PLACEHOLDER,
+    options: opts.options.map((o, i) => ({
+      label: o.label.slice(0, 100),
+      value: String(i),
+      ...(pending.has(i) ? { default: true as const } : {}),
+    })),
+    confirmCustomId: opts.makeConfirmId(opts.choiceId),
+    confirmDisabled: Boolean(opts.disabled) || !inRange,
+    confirmLabel: "Confirm",
+  };
+}

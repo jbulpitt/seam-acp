@@ -45,6 +45,12 @@ export interface ChoiceIngress {
   wrapper?: string;
 }
 
+/** Multi-select bounds (#94). Present on the spec ⇒ dropdown + Confirm. */
+export interface ChoiceSelect {
+  min?: number;
+  max?: number;
+}
+
 export interface ChoiceSpec {
   title: string;
   body?: string;
@@ -52,6 +58,13 @@ export interface ChoiceSpec {
   targetUserId?: string | null;
   defaultTarget?: ChoiceTarget;
   options: ChoiceOption[];
+  /**
+   * Multi-select (#94). Present ⇒ one String Select + Confirm, one combined
+   * prompt. Cannot combine with `kind:"custom"` or `maxClicks>1` (v1).
+   * Omitted min defaults to 1; omitted max defaults to `options.length`.
+   * Both clamp to `[1, min(options.length, 25)]`; min must be ≤ max.
+   */
+  select?: ChoiceSelect;
   /** When set, mint a site token and expose POST /ingest. */
   ingress?: boolean | ChoiceIngress;
 }
@@ -76,6 +89,13 @@ export interface ChoiceCard {
   lastClickerName: string | null;
   /** Index of the last successful option. Single-user cards show this label. */
   lastOptionIndex: number | null;
+  /** Full pick list after a multi-select Confirm (#94). */
+  lastOptionIndices?: number[] | null;
+  /**
+   * Resolved multi-select bounds. Present ⇒ this card is multi-select.
+   * Persisted so the card survives restart as a dropdown + Confirm.
+   */
+  select?: { min: number; max: number };
   createdBy: string;
   createdUtc: string;
   ingestTokenHash: string | null;
@@ -124,6 +144,12 @@ export const ChoiceSpecSchema = z
     targetUserId: z.string().regex(/^\d+$/).nullable().optional(),
     defaultTarget: TargetSchema.optional(),
     options: z.array(OptionSchema).min(1),
+    select: z
+      .object({
+        min: z.number().int().optional(),
+        max: z.number().int().optional(),
+      })
+      .optional(),
     ingress: z
       .union([
         z.boolean(),
@@ -155,6 +181,32 @@ export const ChoiceSpecSchema = z
         });
       }
     });
+    if (spec.select) {
+      if (hasCustom) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'select cannot be combined with kind:"custom" options (all options must be kind:"prompt")',
+        });
+      }
+      const clicks = spec.maxClicks ?? (spec.ingress ? CHOICE_MAX_CLICKS : CHOICE_DEFAULT_MAX_CLICKS);
+      if (clicks > 1) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "select + maxClicks>1 is unsupported (v1)",
+        });
+      }
+      const bounds = clampChoiceSelect(spec.select, spec.options.length);
+      if (bounds.min > bounds.max) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `select.min (${bounds.min}) must be ≤ select.max (${bounds.max})`,
+        });
+      }
+    }
+  })
+  .transform((spec) => {
+    if (!spec.select) return spec;
+    return { ...spec, select: clampChoiceSelect(spec.select, spec.options.length) };
   });
 
 export function newChoiceId(): string {
@@ -198,14 +250,21 @@ export function makeChoiceModalId(choiceId: string, optionIndex: number): string
   return `${CHOICE_CUSTOM_ID_PREFIX}${choiceId}:m:${optionIndex}`;
 }
 
+export function makeChoiceConfirmId(choiceId: string): string {
+  return `${CHOICE_CUSTOM_ID_PREFIX}${choiceId}:c`;
+}
+
 export function parseChoiceCustomId(
   customId: string
-): { choiceId: string; optionIndex?: number; kind: "option" | "select" | "modal" } | null {
+): { choiceId: string; optionIndex?: number; kind: "option" | "select" | "modal" | "confirm" } | null {
   if (!customId.startsWith(CHOICE_CUSTOM_ID_PREFIX)) return null;
   const rest = customId.slice(CHOICE_CUSTOM_ID_PREFIX.length);
   const parts = rest.split(":");
   if (parts.length === 2 && parts[1] === "s") {
     return { choiceId: parts[0]!, kind: "select" };
+  }
+  if (parts.length === 2 && parts[1] === "c") {
+    return { choiceId: parts[0]!, kind: "confirm" };
   }
   if (parts.length === 3 && parts[1] === "m") {
     const idx = Number.parseInt(parts[2]!, 10);
@@ -218,6 +277,53 @@ export function parseChoiceCustomId(
     return { choiceId: parts[0]!, optionIndex: idx, kind: "option" };
   }
   return null;
+}
+
+/** Clamp multi-select bounds to `[1, min(options.length, 25)]`. */
+export function clampChoiceSelect(
+  select: { min?: number; max?: number },
+  optionCount: number
+): { min: number; max: number } {
+  const cap = Math.min(Math.max(optionCount, 1), 25);
+  const min = Math.min(cap, Math.max(1, select.min ?? 1));
+  const max = Math.min(cap, Math.max(1, select.max ?? optionCount));
+  return { min, max };
+}
+
+export function isChoiceMultiSelect(card: { select?: { min: number; max: number } | null }): boolean {
+  return card.select != null;
+}
+
+/** In-memory pending map key: one pick-list per (card, user). */
+export function choicePendingKey(choiceId: string, userId: string): string {
+  return `${choiceId}:${userId}`;
+}
+
+export function parseChoiceSelectValues(
+  values: ReadonlyArray<string> | undefined,
+  optionCount: number
+): number[] {
+  const seen = new Set<number>();
+  const out: number[] = [];
+  for (const v of values ?? []) {
+    const n = Number.parseInt(v, 10);
+    if (!Number.isInteger(n) || n < 0 || n >= optionCount || seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  out.sort((a, b) => a - b);
+  return out;
+}
+
+export function choiceSelectionInRange(count: number, select: { min: number; max: number }): boolean {
+  return count >= select.min && count <= select.max;
+}
+
+export function choiceConfirmNudge(select: { min: number; max: number }): string {
+  if (select.min === select.max) {
+    return `Pick exactly ${select.min} option${select.min === 1 ? "" : "s"} before confirming.`;
+  }
+  return `Pick between ${select.min} and ${select.max} options before confirming.`;
 }
 
 /** D8: bridge-stamped provenance wrapping the creator payload / typed custom text. */
@@ -250,6 +356,40 @@ export function wrapChoicePrompt(opts: {
   const wrapper = (opts.wrapper ?? "").trim();
   const payload = opts.payload ?? "";
   return [...head, "", ...(wrapper ? [wrapper, ""] : []), payload].join("\n");
+}
+
+/** Combined multi-select emit (#94): labels joined in the frame; body is a
+ *  `Selected: …` header then each chosen payload on its own line. */
+export function wrapChoiceMultiPrompt(opts: {
+  cardId: string;
+  optionLabels: readonly string[];
+  clickerName: string;
+  clickerId: string;
+  authoringThread: string;
+  destination: string;
+  payloads: readonly string[];
+  source?: "discord" | "http";
+  wrapper?: string;
+  untrustedStudentId?: string | null;
+}): string {
+  const labels = opts.optionLabels.join(", ");
+  const http = opts.source === "http";
+  const who = http
+    ? `HTTP ingest (site token; not a Discord user). Actor ${opts.clickerName} (id ${opts.clickerId}). Claimed student id (untrusted): ${opts.untrustedStudentId || "(none)"}.`
+    : `clicked by ${opts.clickerName} (id ${opts.clickerId}).`;
+  const resultHint = http
+    ? `Declare the student-facing HTTP body with submit_result({...}) or a seam-result fence. That JSON is the HTTP response — not the Discord transcript.`
+    : "";
+  const head = [
+    "<seam-choice>",
+    `Card ${opts.cardId} options "${labels}" ${who}`,
+    `Authoring thread: ${opts.authoringThread}. Destination: ${opts.destination}.`,
+    resultHint,
+    "</seam-choice>",
+  ].filter((l) => l.length > 0);
+  const wrapper = (opts.wrapper ?? "").trim();
+  const body = [`Selected: ${labels}`, ...opts.payloads];
+  return [...head, "", ...(wrapper ? [wrapper, ""] : []), ...body].join("\n");
 }
 
 export function normalizeIngress(spec: ChoiceSpec): ChoiceIngress | null {
@@ -309,9 +449,17 @@ export function isChoiceSingleUser(card: Pick<ChoiceCard, "maxClicks">): boolean
 }
 
 export function selectedChoiceLabel(card: ChoiceCard): string | null {
-  if (card.lastOptionIndex == null) return null;
-  const opt = card.options[card.lastOptionIndex];
-  return opt?.label ?? null;
+  const indices =
+    card.lastOptionIndices && card.lastOptionIndices.length > 0
+      ? card.lastOptionIndices
+      : card.lastOptionIndex == null
+        ? null
+        : [card.lastOptionIndex];
+  if (!indices) return null;
+  const labels = indices
+    .map((i) => card.options[i]?.label)
+    .filter((l): l is string => Boolean(l));
+  return labels.length > 0 ? labels.join(", ") : null;
 }
 
 /** Single-user closed/cancelled cards drop action rows instead of leaving dead buttons. */
@@ -337,7 +485,13 @@ export function renderChoicePanel(card: ChoiceCard): StructuredPanel {
       fields.push({ name: "Status", value: "Cancelled" });
     }
     const footer =
-      card.status === "open" ? "Pick one" : card.status === "exhausted" ? "Done" : "Cancelled";
+      card.status === "open"
+        ? isChoiceMultiSelect(card)
+          ? "Select one or more"
+          : "Pick one"
+        : card.status === "exhausted"
+          ? "Done"
+          : "Cancelled";
     return { color, title, ...(description ? { description } : {}), fields, footer };
   }
 

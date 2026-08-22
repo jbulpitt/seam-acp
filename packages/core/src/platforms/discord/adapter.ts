@@ -57,6 +57,7 @@ import type { PanelButton, StructuredPanel } from "../../core/types.js";
 import {
   CHOICE_CUSTOM_ID_PREFIX,
   CHOICE_CUSTOM_TEXT_MAX,
+  makeChoiceConfirmId,
   makeChoiceCustomId,
   makeChoiceModalId,
   makeChoiceSelectId,
@@ -67,10 +68,106 @@ import {
   DISCORD_BUTTONS_PER_ROW,
   choicePickerLayout,
   choicePickerPageCaption,
+  describeMultiSelectMenu,
   sliceChoicePage,
 } from "./choice-picker.js";
 
 const PLATFORM = "discord";
+
+/** Build Discord action rows for a choice card. Multi-select (#94) is one
+ *  String Select + Confirm; single-select layout is unchanged. */
+export function buildChoiceCardComponents(
+  card: ChoiceCardPost
+): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
+  if (card.hideButtons) return [];
+  const disabled = Boolean(card.disabled);
+  if (card.select) {
+    const spec = describeMultiSelectMenu({
+      choiceId: card.choiceId,
+      options: card.options,
+      min: card.select.min,
+      max: card.select.max,
+      pendingSelection: card.pendingSelection,
+      disabled,
+      makeSelectId: makeChoiceSelectId,
+      makeConfirmId: makeChoiceConfirmId,
+    });
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(spec.customId)
+      .setPlaceholder(spec.placeholder)
+      .setMinValues(spec.minValues)
+      .setMaxValues(spec.maxValues)
+      .setDisabled(disabled)
+      .addOptions(
+        spec.options.map((o) => ({
+          label: o.label,
+          value: o.value,
+          ...(o.default ? { default: true } : {}),
+        }))
+      );
+    const confirm = new ButtonBuilder()
+      .setCustomId(spec.confirmCustomId)
+      .setLabel(spec.confirmLabel)
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(spec.confirmDisabled);
+    return [
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select),
+      new ActionRowBuilder<ButtonBuilder>().addComponents(confirm),
+    ];
+  }
+  const prompts = card.options
+    .map((o, i) => ({ o, i }))
+    .filter((x) => x.o.kind === "prompt");
+  const customs = card.options
+    .map((o, i) => ({ o, i }))
+    .filter((x) => x.o.kind === "custom");
+  const layout = choicePickerLayout({
+    choiceCount: prompts.length,
+    allowCustom: customs.length > 0,
+  });
+  const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [];
+
+  if (layout.useButtons) {
+    const buttons = card.options.map((o, i) =>
+      new ButtonBuilder()
+        .setCustomId(makeChoiceCustomId(card.choiceId, i))
+        .setLabel(o.label.slice(0, 80))
+        .setStyle(o.kind === "custom" ? ButtonStyle.Primary : ButtonStyle.Secondary)
+        .setDisabled(disabled)
+    );
+    for (let i = 0; i < buttons.length; i += DISCORD_BUTTONS_PER_ROW) {
+      rows.push(
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          buttons.slice(i, i + DISCORD_BUTTONS_PER_ROW)
+        )
+      );
+    }
+  } else {
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(makeChoiceSelectId(card.choiceId))
+      .setPlaceholder("Choose an option")
+      .setDisabled(disabled)
+      .addOptions(
+        prompts.map(({ o, i }) => ({
+          label: o.label.slice(0, 100),
+          value: String(i),
+        }))
+      );
+    rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select));
+    for (const { o, i } of customs) {
+      rows.push(
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(makeChoiceCustomId(card.choiceId, i))
+            .setLabel(o.label.slice(0, 80))
+            .setStyle(ButtonStyle.Primary)
+            .setDisabled(disabled)
+        )
+      );
+    }
+  }
+  return rows.slice(0, 5);
+}
 
 /**
  * Resolve a Discord author's display name per issue #57 D5:
@@ -974,60 +1071,7 @@ export class DiscordAdapter implements ChatAdapter {
   private static buildChoiceComponents(
     card: ChoiceCardPost
   ): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
-    if (card.hideButtons) return [];
-    const disabled = Boolean(card.disabled);
-    const prompts = card.options
-      .map((o, i) => ({ o, i }))
-      .filter((x) => x.o.kind === "prompt");
-    const customs = card.options
-      .map((o, i) => ({ o, i }))
-      .filter((x) => x.o.kind === "custom");
-    const layout = choicePickerLayout({
-      choiceCount: prompts.length,
-      allowCustom: customs.length > 0,
-    });
-    const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [];
-
-    if (layout.useButtons) {
-      const buttons = card.options.map((o, i) =>
-        new ButtonBuilder()
-          .setCustomId(makeChoiceCustomId(card.choiceId, i))
-          .setLabel(o.label.slice(0, 80))
-          .setStyle(o.kind === "custom" ? ButtonStyle.Primary : ButtonStyle.Secondary)
-          .setDisabled(disabled)
-      );
-      for (let i = 0; i < buttons.length; i += DISCORD_BUTTONS_PER_ROW) {
-        rows.push(
-          new ActionRowBuilder<ButtonBuilder>().addComponents(
-            buttons.slice(i, i + DISCORD_BUTTONS_PER_ROW)
-          )
-        );
-      }
-    } else {
-      const select = new StringSelectMenuBuilder()
-        .setCustomId(makeChoiceSelectId(card.choiceId))
-        .setPlaceholder("Choose an option")
-        .setDisabled(disabled)
-        .addOptions(
-          prompts.map(({ o, i }) => ({
-            label: o.label.slice(0, 100),
-            value: String(i),
-          }))
-        );
-      rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select));
-      for (const { o, i } of customs) {
-        rows.push(
-          new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder()
-              .setCustomId(makeChoiceCustomId(card.choiceId, i))
-              .setLabel(o.label.slice(0, 80))
-              .setStyle(ButtonStyle.Primary)
-              .setDisabled(disabled)
-          )
-        );
-      }
-    }
-    return rows.slice(0, 5);
+    return buildChoiceCardComponents(card);
   }
 
   private async handleChoiceInteraction(

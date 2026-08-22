@@ -21,15 +21,17 @@ import {
 } from "./remote-spawn.js";
 
 /**
- * Wiring for the per-session seam-MCP surface. The router mints a token per
- * runtime start (mapping it to the session id) and injects an http mcpServers
- * entry carrying that token; it revokes the token when the runtime is
- * invalidated. `getPort` is a late-bound getter because the shared server binds
- * its ephemeral port after the router is constructed.
+ * Wiring for the per-session seam-MCP surface. The token identifies the
+ * Discord session, not the ACP subprocess — start reuses it (reuseToken) so
+ * Grok HTTP MCP reconnects after redeploy still resolve. `getPort` is
+ * late-bound because the shared server binds after the router is constructed.
+ * Prefer `getLoopbackUrl` (health `/mcp` proxy) over the ephemeral bind port.
  */
 export interface SeamMcpWiring {
   registry: SeamTokenRegistry;
   getPort: () => number | undefined;
+  /** Stable loopback MCP URL (health `/mcp` proxy). Prefer over the ephemeral bind port. */
+  getLoopbackUrl?: () => string | undefined;
   /** Full MCP URL for a remote (bridge) spawn; never 127.0.0.1 when that is local-only. */
   getPublicUrl?: () => string | undefined;
   /** True when this session's agent process runs on a paired bridge (#84). */
@@ -405,9 +407,9 @@ export class SessionRouter {
    *  both land here via dispose(); wiping markers would make resume a
    *  silent no-op on every graceful reboot. Command layer clears them. */
   async invalidate(sessionId: string, opts?: { clearAcpSession?: boolean }): Promise<void> {
-    // Revoke this session's seam-MCP token — the runtime is going away, so any
-    // outstanding token must stop resolving. A later start re-mints a fresh one.
-    this.seamMcp?.registry.revokeSession(sessionId);
+    // Keep the seam-MCP token. It identifies the Discord session; Grok (and
+    // others) reconnect HTTP MCP with the header from session/new. A later
+    // start reuses it (reuseToken). Revoke only when the session row is gone.
     const rt = this.runtimes.get(sessionId);
     if (rt) {
       this.runtimes.delete(sessionId);
@@ -600,6 +602,10 @@ export class SessionRouter {
       sessionId: record.id,
       globalMcpServers: this.mcpServers,
       seamMcp: this.seamMcp,
+      // Reuse the Discord-session token. Rotating on every runtime start
+      // (redeploy, agent crash, invalidate) makes Grok's HTTP MCP reconnect
+      // send a header the new process no longer knows.
+      reuseToken: true,
     });
 
     let spawnChild: RuntimeSpawnPlan["spawnChild"] = (modelOverride, effortOverride) =>
@@ -656,8 +662,10 @@ export class SessionRouter {
         // Involuntary death — #76: leave turn markers intact. This is an
         // interruption, not a cancellation. Recovery reattaches on the next
         // boot (or the next recoverInterruptedTurns pass).
+        // Do NOT revoke the seam-MCP token: it names the Discord session, not
+        // the ACP subprocess. Grok's HTTP MCP client reconnects with the old
+        // header; rotating here is `-32001 unauthorized`.
         this.logger.info({ sessionId: record.id }, "agent process died; evicting runtime for auto-resume");
-        this.seamMcp?.registry.revokeSession(record.id);
         this.runtimes.delete(record.id);
       },
       permissionPolicy: async (req) => {

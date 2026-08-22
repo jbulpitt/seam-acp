@@ -1,9 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { pino } from "pino";
 import { SeamTokenRegistry } from "../packages/core/src/core/mcp/token-registry.js";
 import {
   SeamMcpServer,
   buildSeamMcpServerEntry,
+  mcpPathname,
+  sessionTokenFromRequest,
   type PeekedMessage,
   type SeamMcpServerDeps,
 } from "../packages/core/src/core/mcp/seam-mcp-server.js";
@@ -36,6 +41,37 @@ function makeRecord(over: Partial<SessionRecord> = {}): SessionRecord {
 // -------------------------------------------------------------------------
 // Token registry
 // -------------------------------------------------------------------------
+
+describe("mcpPathname", () => {
+  it("strips query and trailing slash so /mcp still matches", () => {
+    expect(mcpPathname("/mcp")).toBe("/mcp");
+    expect(mcpPathname("/mcp/")).toBe("/mcp");
+    expect(mcpPathname("/mcp?seamSession=tok")).toBe("/mcp");
+    expect(mcpPathname("/mcp/?seamSession=tok")).toBe("/mcp");
+  });
+});
+
+describe("sessionTokenFromRequest", () => {
+  it("prefers X-Seam-Session over Authorization", () => {
+    expect(
+      sessionTokenFromRequest({
+        headers: { "x-seam-session": "from-header", authorization: "Bearer from-auth" },
+        url: "/mcp?seamSession=from-query",
+      })
+    ).toBe("from-header");
+  });
+  it("falls back to Bearer then query", () => {
+    expect(
+      sessionTokenFromRequest({
+        headers: { authorization: "Bearer from-auth" },
+        url: "/mcp?seamSession=from-query",
+      })
+    ).toBe("from-auth");
+    expect(sessionTokenFromRequest({ headers: {}, url: "/mcp?seamSession=from-query" })).toBe(
+      "from-query"
+    );
+  });
+});
 
 describe("SeamTokenRegistry", () => {
   it("mints a token that resolves back to the session id", () => {
@@ -79,6 +115,35 @@ describe("SeamTokenRegistry", () => {
     expect(reg.peek("s1")).toBe(first);
     expect(reg.peek("s1")).toBe(first);
     expect(reg.resolve(first)).toBe("s1");
+  });
+
+  it("persists across a new registry instance", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-mcp-tok-"));
+    const persistPath = path.join(dir, "mcp-session-tokens.json");
+    try {
+      const a = new SeamTokenRegistry({ persistPath });
+      const token = a.mint("discord:thread-geo");
+      const b = new SeamTokenRegistry({ persistPath });
+      expect(b.resolve(token)).toBe("discord:thread-geo");
+      expect(b.peek("discord:thread-geo")).toBe(token);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("revoke persists so a later process no longer resolves the token", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-mcp-tok-"));
+    const persistPath = path.join(dir, "mcp-session-tokens.json");
+    try {
+      const a = new SeamTokenRegistry({ persistPath });
+      const token = a.mint("s1");
+      a.revokeSession("s1");
+      const b = new SeamTokenRegistry({ persistPath });
+      expect(b.resolve(token)).toBeUndefined();
+      expect(b.peek("s1")).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -580,6 +645,7 @@ describe("SeamMcpServer", () => {
       { "X-Seam-Session": "bad-token" }
     );
     expect(body.error.code).toBe(-32001);
+    expect(body.error.message).toMatch(/unknown X-Seam-Session token/);
     expect(h.enqueued).toHaveLength(0);
   });
 
@@ -750,6 +816,7 @@ describe("SeamMcpServer", () => {
     });
     expect(body.error).toBeDefined();
     expect(body.error.code).toBe(-32001);
+    expect(body.error.message).toMatch(/missing X-Seam-Session token/);
     expect(h.enqueued).toHaveLength(0);
   });
 
@@ -761,7 +828,39 @@ describe("SeamMcpServer", () => {
       { "X-Seam-Session": "bogus" }
     );
     expect(body.error.code).toBe(-32001);
+    expect(body.error.message).toMatch(/unknown X-Seam-Session token/);
     expect(h.enqueued).toHaveLength(0);
+  });
+
+  it("tools/call accepts Authorization Bearer when the custom header is absent", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "handoff", arguments: { worker: "reviewer", prompt: "x" } },
+      { Authorization: "Bearer good-token" }
+    );
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBeFalsy();
+    expect(h.enqueued).toHaveLength(1);
+  });
+
+  it("tools/call accepts ?seamSession= and does not 404 on the query string", async () => {
+    h = await makeHarness();
+    const res = await fetch(`http://127.0.0.1:${h.server.port}/mcp?seamSession=good-token`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "handoff", arguments: { worker: "reviewer", prompt: "x" } },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = JSON.parse(await res.text());
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBeFalsy();
+    expect(h.enqueued).toHaveLength(1);
   });
 
   it("peek reads recent messages via the injected peekThread", async () => {
@@ -1818,6 +1917,7 @@ describe("config_describe", () => {
     try {
       const body = await callTool(server, {}, "bad-token");
       expect(body.error.code).toBe(-32001);
+      expect(body.error.message).toMatch(/unknown X-Seam-Session token/);
     } finally {
       await server.stop();
     }

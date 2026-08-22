@@ -1171,7 +1171,7 @@ export class SeamMcpServer {
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    if (req.method !== "POST" || (req.url ?? "").replace(/\/+$/, "") !== "/mcp") {
+    if (req.method !== "POST" || mcpPathname(req.url) !== "/mcp") {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "not found" }));
       return;
@@ -1199,7 +1199,7 @@ export class SeamMcpServer {
     // Notifications (no `id`) get a bare 202 with no JSON-RPC body.
     const isNotification = msg.id === undefined || msg.id === null;
 
-    const token = headerValue(req.headers[SEAM_SESSION_HEADER]);
+    const token = sessionTokenFromRequest(req);
     const response = await this.dispatch(msg, token);
 
     if (isNotification) {
@@ -1247,8 +1247,13 @@ export class SeamMcpServer {
     const record = this.deps.resolveSession(token);
     if (!record) {
       // Unknown/missing token — the caller cannot be identified. Fail loudly
-      // rather than guess a thread.
-      return rpcError(id, -32001, "unauthorized: unknown or missing X-Seam-Session token");
+      // rather than guess a thread. Split the message so reconnect bugs
+      // (header dropped vs rotated registry) are distinguishable in agent logs.
+      const reason = token
+        ? "unauthorized: unknown X-Seam-Session token"
+        : "unauthorized: missing X-Seam-Session token";
+      this.logger.warn({ method: "tools/call", hasToken: Boolean(token) }, reason);
+      return rpcError(id, -32001, reason);
     }
 
     const name = typeof params?.name === "string" ? params.name : "";
@@ -2227,6 +2232,33 @@ function requireStringArray(args: Record<string, unknown>, key: string): string[
 function headerValue(h: string | string[] | undefined): string | undefined {
   if (Array.isArray(h)) return h[0];
   return h;
+}
+
+/** Strip query + trailing slashes so `/mcp?seamSession=` and `/mcp/` still route. */
+export function mcpPathname(url: string | undefined): string {
+  const pathOnly = (url ?? "/").split("?")[0] ?? "/";
+  const trimmed = pathOnly.replace(/\/+$/, "");
+  return trimmed === "" ? "/" : trimmed;
+}
+
+/** Header first, then Authorization Bearer, then ?seamSession= (reconnect clients that drop custom headers). */
+export function sessionTokenFromRequest(req: {
+  headers: http.IncomingHttpHeaders;
+  url?: string;
+}): string | undefined {
+  const header = headerValue(req.headers[SEAM_SESSION_HEADER])?.trim();
+  if (header) return header;
+  const auth = headerValue(req.headers.authorization)?.trim();
+  if (auth && /^bearer\s+/i.test(auth)) {
+    const t = auth.replace(/^bearer\s+/i, "").trim();
+    if (t) return t;
+  }
+  try {
+    const q = new URL(req.url ?? "/", "http://mcp.local").searchParams.get("seamSession");
+    return q?.trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {

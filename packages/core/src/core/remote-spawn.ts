@@ -20,6 +20,8 @@ export interface SeamMcpInjectionWiring {
   registry: SeamTokenRegistry;
   getPort: () => number | undefined;
   getPublicUrl?: () => string | undefined;
+  /** Stable loopback MCP URL (health `/mcp` proxy). Prefer this over the ephemeral bind port. */
+  getLoopbackUrl?: () => string | undefined;
   isRemoteSession?: (sessionId: string) => boolean;
   mcpServersForRemoteSpawn?: (sessionId: string) => ReturnType<typeof buildSeamMcpServerEntry> | undefined;
 }
@@ -88,8 +90,12 @@ export function planSeamMcpInjection(opts: {
   const token = opts.reuseToken
     ? (seamMcp.registry.peek(sessionId) ?? seamMcp.registry.mint(sessionId))
     : seamMcp.registry.mint(sessionId);
+  const loopback = seamMcp.getLoopbackUrl?.();
   return {
-    mcpServers: [...globalMcpServers, buildSeamMcpServerEntry(port, token)],
+    mcpServers: [
+      ...globalMcpServers,
+      buildSeamMcpServerEntry(port, token, loopback ? { url: loopback } : undefined),
+    ],
     remote: false,
   };
 }

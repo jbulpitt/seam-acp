@@ -199,7 +199,7 @@ export class BridgeHub {
     const port = this.getMcpPort?.();
     const registry = this.getMcpRegistry?.();
     if (port === undefined || !registry) return undefined;
-    const token = registry.mint(sessionId);
+    const token = registry.peek(sessionId) ?? registry.mint(sessionId);
     const url = this.mcpUrlForRemote();
     return buildSeamMcpServerEntry(port, token, url ? { url } : { url: resolveReachableMcpUrl({ port, healthPort: this.healthPort, remote: true }) });
   }

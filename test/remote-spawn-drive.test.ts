@@ -16,7 +16,7 @@ import type { AgentProfile } from "@seam/adapters";
 import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SeamTokenRegistry } from "../packages/core/src/core/mcp/token-registry.js";
-import { spawnRemoteSlot, type MuxHandle } from "../packages/core/src/core/remote-spawn.js";
+import { planSeamMcpInjection, spawnRemoteSlot, type MuxHandle } from "../packages/core/src/core/remote-spawn.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { Config } from "../packages/core/src/config.js";
 import type { ConfigMutationService } from "../packages/core/src/core/config-mutation.js";
@@ -216,6 +216,8 @@ describe("remote spawn drives token + reachable MCP URL (#84)", () => {
     const localSeam = seamEntry(localPlan.mcpServers);
     expect(localSeam.url).toBe("http://127.0.0.1:18765/mcp");
     expect(localSeam.headers[0]!.name).toBe("X-Seam-Session");
+    const localAgain = router.planRuntimeSpawn(localRecord);
+    expect(seamEntry(localAgain.mcpServers).headers[0]!.value).toBe(localSeam.headers[0]!.value);
 
     localPlan.spawnChild(localPlan.model, localPlan.effort);
     expect(rpcCalls).toHaveLength(1);
@@ -254,5 +256,45 @@ describe("remote spawn drives token + reachable MCP URL (#84)", () => {
     expect(frames.some((f) => f.type === "rpc" && f.method === "spawn")).toBe(true);
     const data = frames.filter((f) => f.type === "data");
     expect(data).toEqual([{ slot: child.slot, type: "data", data: "ACP-INIT" }]);
+  });
+});
+
+describe("planSeamMcpInjection token reuse + stable loopback URL", () => {
+  it("reuseToken keeps the existing token instead of rotating", () => {
+    const registry = new SeamTokenRegistry();
+    const first = registry.mint("discord:thread-geo");
+    const wiring = {
+      registry,
+      getPort: () => 18765,
+    };
+    const a = planSeamMcpInjection({
+      sessionId: "discord:thread-geo",
+      globalMcpServers: [],
+      seamMcp: wiring,
+      reuseToken: true,
+    });
+    const b = planSeamMcpInjection({
+      sessionId: "discord:thread-geo",
+      globalMcpServers: [],
+      seamMcp: wiring,
+      reuseToken: true,
+    });
+    expect(seamEntry(a.mcpServers).headers[0]!.value).toBe(first);
+    expect(seamEntry(b.mcpServers).headers[0]!.value).toBe(first);
+  });
+
+  it("prefers getLoopbackUrl over the ephemeral bind port", () => {
+    const registry = new SeamTokenRegistry();
+    const injection = planSeamMcpInjection({
+      sessionId: "discord:thread-geo",
+      globalMcpServers: [],
+      seamMcp: {
+        registry,
+        getPort: () => 18765,
+        getLoopbackUrl: () => "http://127.0.0.1:3000/mcp",
+      },
+      reuseToken: true,
+    });
+    expect(seamEntry(injection.mcpServers).url).toBe("http://127.0.0.1:3000/mcp");
   });
 });

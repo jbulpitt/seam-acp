@@ -354,7 +354,9 @@ async function main(): Promise<void> {
   // Agent-facing seam-MCP surface (#24). The shared HTTP server binds its port
   // later (after the adapter is up), so the router gets the token registry now
   // and a late-bound port getter; per-session injection happens at runtime start.
-  const seamTokenRegistry = new SeamTokenRegistry();
+  const seamTokenRegistry = new SeamTokenRegistry({
+    persistPath: path.join(config.DATA_DIR, "mcp-session-tokens.json"),
+  });
   let seamMcpServer: SeamMcpServer | undefined;
   let bridgeHub: BridgeHub | undefined;
 
@@ -382,6 +384,7 @@ async function main(): Promise<void> {
                 return undefined;
               }
             },
+            getLoopbackUrl: () => `http://127.0.0.1:${config.HEALTH_PORT}/mcp`,
             getPublicUrl: () => bridgeHub?.mcpUrlForRemote(),
             isRemoteSession: (sessionId) => !!bridgeHub?.sessionBridgeId(sessionId),
             mcpServersForRemoteSpawn: (sessionId) =>

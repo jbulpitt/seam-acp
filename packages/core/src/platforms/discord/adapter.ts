@@ -25,6 +25,7 @@ import {
   type TextChannel,
   type ThreadChannel,
   type ChatInputCommandInteraction,
+  type AutocompleteInteraction,
   type MessageComponentInteraction,
   type ButtonInteraction,
   type ModalSubmitInteraction,
@@ -99,6 +100,47 @@ export type SlashHandler = (
   interaction: ChatInputCommandInteraction
 ) => Promise<void>;
 
+export type AutocompleteHandler = (
+  interaction: AutocompleteInteraction
+) => Promise<void>;
+
+/**
+ * Classify a Discord interaction for the InteractionCreate router.
+ * Autocomplete is a first-class branch parallel to chat-input / button / modal
+ * — adding it must not steal those routes. Exported so tests can lock the
+ * dispatch table without standing up a Client.
+ */
+export type DiscordInteractionRoute =
+  | "autocomplete"
+  | "slash"
+  | "config-edit"
+  | "choice"
+  | "none";
+
+export function classifyDiscordInteraction(interaction: {
+  isAutocomplete?: () => boolean;
+  isChatInputCommand: () => boolean;
+  isButton: () => boolean;
+  isModalSubmit: () => boolean;
+  isStringSelectMenu?: () => boolean;
+  commandName?: string;
+  customId?: string;
+}): DiscordInteractionRoute {
+  if (interaction.isAutocomplete?.()) {
+    return interaction.commandName === "seam" ? "autocomplete" : "none";
+  }
+  if (interaction.isChatInputCommand()) {
+    return interaction.commandName === "seam" ? "slash" : "none";
+  }
+  const isButton = interaction.isButton();
+  const isModal = interaction.isModalSubmit();
+  const isSelect = interaction.isStringSelectMenu?.() === true;
+  const cid = isButton || isModal || isSelect ? (interaction.customId ?? "") : "";
+  if ((isButton || isModal) && cid.startsWith("seam-cfg-edit:")) return "config-edit";
+  if (cid.startsWith(CHOICE_CUSTOM_ID_PREFIX)) return "choice";
+  return "none";
+}
+
 /**
  * discord.js v14 chat adapter.
  *
@@ -116,6 +158,7 @@ export class DiscordAdapter implements ChatAdapter {
   private readonly logger: Logger;
   private readonly config: Config;
   private readonly slashHandler: SlashHandler;
+  private readonly autocompleteHandler?: AutocompleteHandler;
 
   private messageHandler?: (msg: IncomingMessage) => void | Promise<void>;
   private componentHandler?: (evt: ComponentEvent) => void | Promise<void>;
@@ -129,10 +172,12 @@ export class DiscordAdapter implements ChatAdapter {
     config: Config;
     logger: Logger;
     slashHandler: SlashHandler;
+    autocompleteHandler?: AutocompleteHandler;
   }) {
     this.config = opts.config;
     this.logger = opts.logger.child({ adapter: PLATFORM });
     this.slashHandler = opts.slashHandler;
+    this.autocompleteHandler = opts.autocompleteHandler;
     this.client = new Client({
       intents: [
         GatewayIntentBits.Guilds,
@@ -1092,32 +1137,35 @@ export class DiscordAdapter implements ChatAdapter {
       });
     });
     this.client.on(Events.InteractionCreate, (interaction) => {
-      if (interaction.isChatInputCommand()) {
-        if (interaction.commandName !== "seam") return;
-        this.handleSlash(interaction).catch((err) => {
-          this.logger.error({ err }, "slash handler crashed");
-        });
-        return;
-      }
-      if (
-        (interaction.isButton() || interaction.isModalSubmit()) &&
-        interaction.customId.startsWith("seam-cfg-edit:")
-      ) {
-        this.handlePersistentComponent(interaction).catch((err) => {
-          this.logger.error({ err }, "config-editor component handler crashed");
-        });
-        return;
-      }
-      const cid =
-        interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit()
-          ? interaction.customId
-          : "";
-      if (cid.startsWith(CHOICE_CUSTOM_ID_PREFIX)) {
-        this.handleChoiceInteraction(interaction as ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction).catch(
-          (err) => {
+      // Autocomplete is a parallel branch — checked first so it can never
+      // fall through into chat-input / button / modal routing (#93).
+      switch (classifyDiscordInteraction(interaction)) {
+        case "autocomplete":
+          this.handleAutocomplete(interaction as AutocompleteInteraction).catch((err) => {
+            this.logger.error({ err }, "autocomplete handler crashed");
+          });
+          return;
+        case "slash":
+          this.handleSlash(interaction as ChatInputCommandInteraction).catch((err) => {
+            this.logger.error({ err }, "slash handler crashed");
+          });
+          return;
+        case "config-edit":
+          this.handlePersistentComponent(
+            interaction as ButtonInteraction | ModalSubmitInteraction
+          ).catch((err) => {
+            this.logger.error({ err }, "config-editor component handler crashed");
+          });
+          return;
+        case "choice":
+          this.handleChoiceInteraction(
+            interaction as ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
+          ).catch((err) => {
             this.logger.error({ err }, "choice-card interaction handler crashed");
-          }
-        );
+          });
+          return;
+        default:
+          return;
       }
     });
     this.client.on(Events.ThreadDelete, (thread) => {
@@ -1212,6 +1260,34 @@ export class DiscordAdapter implements ChatAdapter {
       return;
     }
     await this.slashHandler(interaction);
+  }
+
+  /**
+   * Autocomplete MUST respond (even with `[]`) and MUST NOT throw — Discord
+   * otherwise leaves the focused option broken. Allowlist misses and missing
+   * handlers still `respond([])`.
+   */
+  private async handleAutocomplete(interaction: AutocompleteInteraction): Promise<void> {
+    try {
+      if (!this.config.DISCORD_ALLOWED_USER_IDS.has(interaction.user.id)) {
+        await interaction.respond([]);
+        return;
+      }
+      if (!this.autocompleteHandler) {
+        await interaction.respond([]);
+        return;
+      }
+      await this.autocompleteHandler(interaction);
+    } catch (err) {
+      this.logger.warn({ err }, "autocomplete handler failed");
+      if (!interaction.responded) {
+        try {
+          await interaction.respond([]);
+        } catch {
+          /* Discord will time the field out */
+        }
+      }
+    }
   }
 
   /** Push the PNG avatar. Resolves with true on success, false if file not found. */

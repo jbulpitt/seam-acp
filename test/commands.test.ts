@@ -11,6 +11,7 @@ type Opt = {
   name: string;
   type: number;
   required?: boolean;
+  autocomplete?: boolean;
   options?: Opt[];
 };
 
@@ -111,16 +112,38 @@ describe("/seam slash command", () => {
     expect(add?.options?.[0]?.required).toBe(true);
   });
 
-  it("schedule/preset/project group sizes are unchanged; upload has pull/push/secret", () => {
+  it("schedule/project group sizes are unchanged; preset has thread; upload has pull/push/secret", () => {
     const json = built();
     const count = (name: string) =>
       json.options?.find((o) => o.name === name)?.options?.length ?? 0;
     expect(count("schedule")).toBe(7);
-    expect(count("preset")).toBe(6);
+    expect(count("preset")).toBe(7);
     expect(count("project")).toBe(3);
     const upload = json.options?.find((o) => o.name === "upload");
     expect(upload?.type).toBe(SUB_COMMAND_GROUP);
     expect((upload?.options ?? []).map((o) => o.name)).toEqual(["pull", "push", "secret"]);
+  });
+
+  it("/seam preset thread has required name + autocompleted preset (#93)", () => {
+    const preset = built().options?.find((o) => o.name === "preset");
+    expect(preset?.type).toBe(SUB_COMMAND_GROUP);
+    const names = (preset?.options ?? []).map((o) => o.name);
+    expect(names).toEqual(["list", "create", "apply", "delete", "show", "edit", "thread"]);
+    const thread = (preset?.options ?? []).find((o) => o.name === "thread");
+    const opts = thread?.options ?? [];
+    expect(opts.map((o) => o.name)).toEqual(["name", "preset"]);
+    expect(opts[0]?.type).toBe(STRING);
+    expect(opts[0]?.required).toBe(true);
+    expect(opts[0]?.autocomplete ?? false).toBe(false);
+    expect(opts[1]?.type).toBe(STRING);
+    expect(opts[1]?.required).toBe(true);
+    expect(opts[1]?.autocomplete).toBe(true);
+    // Existing name-typed leaves stay free-form (no autocomplete).
+    for (const leaf of ["apply", "delete", "show", "edit"]) {
+      const sub = (preset?.options ?? []).find((o) => o.name === leaf);
+      const nameOpt = (sub?.options ?? []).find((o) => o.name === "name");
+      expect(nameOpt?.autocomplete ?? false, leaf).toBe(false);
+    }
   });
 
   it("removed image/abort/kill and old top-level config leaves", () => {

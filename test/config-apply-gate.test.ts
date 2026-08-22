@@ -403,3 +403,49 @@ describe("detach slash gates (#80)", () => {
     expect(Orchestrator.isInitRefusedWhileDetached(detached, undefined)).toBe(false);
   });
 });
+
+/**
+ * `/seam preset thread` (#93 D6): gates mirror `/seam preset apply` + `/seam new`.
+ * Do NOT add `thread` to LOCK_EXEMPT_SUBCOMMANDS or PARTICIPANT_ALLOWED_SUBCOMMANDS.
+ */
+describe("preset thread slash gates (#93)", () => {
+  const ADMIN = "1487094572696867019";
+  const STUDENT = "1534937951044112505";
+  const lockedSchool = {
+    channelPresets: new Map([["channel-1", { locked: true }]]),
+    threadPresets: new Map(),
+    SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
+    SEAM_PARTICIPANT_USER_IDS: new Set([STUDENT]),
+  } as any;
+  const participants = {
+    SEAM_PARTICIPANT_USER_IDS: new Set([STUDENT]),
+    SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
+  } as any;
+
+  it("restricted participant is refused (unlocked channel)", () => {
+    expect(Orchestrator.isParticipantSlashRefused(participants, "thread", STUDENT)).toBe(true);
+    expect(Orchestrator.isParticipantSlashRefused(participants, "apply", STUDENT)).toBe(true);
+    expect(Orchestrator.isParticipantSlashRefused(participants, "new", STUDENT)).toBe(true);
+  });
+
+  it("admin is not participant-refused", () => {
+    expect(Orchestrator.isParticipantSlashRefused(participants, "thread", ADMIN)).toBe(false);
+  });
+
+  it("admin OK in a locked channel (#71 immunity)", () => {
+    expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "thread", ADMIN)).toBe(
+      false
+    );
+    expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "apply", ADMIN)).toBe(
+      false
+    );
+    expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "new", ADMIN)).toBe(false);
+  });
+
+  it("non-admin refused in a locked channel", () => {
+    expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "thread", STUDENT)).toBe(
+      true
+    );
+    expect(Orchestrator.isLockedSlashRefused(lockedSchool, "channel-1", "new", STUDENT)).toBe(true);
+  });
+});

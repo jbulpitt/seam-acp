@@ -269,6 +269,7 @@ export class SessionStore {
     this.migrateChoiceIngest();
     this.migrateChoiceSelect();
     this.db.exec(INGEST_ENDPOINTS_SCHEMA);
+    this.migrateIngestEndpointPreset();
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -330,6 +331,23 @@ export class SessionStore {
     }
     if (!names.has("last_option_indices_json")) {
       this.db.exec("ALTER TABLE choice_cards ADD COLUMN last_option_indices_json TEXT");
+    }
+  }
+
+  /** #95: named preset resolved at fire. Fresh DBs get it from CREATE TABLE. */
+  private migrateIngestEndpointPreset(): void {
+    try {
+      const names = new Set(
+        this.db
+          .prepare<[], { name: string }>("PRAGMA table_info(ingest_endpoints)")
+          .all()
+          .map((c) => c.name)
+      );
+      if (!names.has("preset")) {
+        this.db.exec("ALTER TABLE ingest_endpoints ADD COLUMN preset TEXT");
+      }
+    } catch {
+      /* table missing — CREATE TABLE runs first */
     }
   }
 
@@ -1630,12 +1648,12 @@ export class SessionStore {
       .prepare(
         `INSERT INTO ingest_endpoints
            (id, token_hash, name, cwd, agent_id, model, effort, wrapper,
-            result_schema_json, cors_json, unique_student, notify_thread,
+            result_schema_json, cors_json, unique_student, notify_thread, preset,
             status, created_by, created_utc, authoring_channel_ref,
             authoring_parent_ref, platform)
          VALUES
            (@id, @tokenHash, @name, @cwd, @agentId, @model, @effort, @wrapper,
-            @resultSchemaJson, @corsJson, @uniqueStudent, @notifyThread,
+            @resultSchemaJson, @corsJson, @uniqueStudent, @notifyThread, @preset,
             @status, @createdBy, @createdUtc, @authoringChannelRef,
             @authoringParentRef, @platform)`
       )
@@ -1652,6 +1670,7 @@ export class SessionStore {
         corsJson: e.corsOrigins == null ? null : JSON.stringify(e.corsOrigins),
         uniqueStudent: e.uniqueStudent ? 1 : 0,
         notifyThread: e.notifyThread,
+        preset: e.preset,
         status: e.status,
         createdBy: e.createdBy,
         createdUtc: e.createdUtc,
@@ -2223,6 +2242,7 @@ CREATE TABLE IF NOT EXISTS ingest_endpoints (
   cors_json              TEXT,
   unique_student         INTEGER NOT NULL DEFAULT 0,
   notify_thread          TEXT,
+  preset                 TEXT,
   status                 TEXT NOT NULL DEFAULT 'open',
   created_by             TEXT NOT NULL,
   created_utc            TEXT NOT NULL,
@@ -2336,6 +2356,7 @@ interface IngestEndpointRow {
   cors_json: string | null;
   unique_student: number;
   notify_thread: string | null;
+  preset: string | null;
   status: string;
   created_by: string;
   created_utc: string;
@@ -2357,6 +2378,7 @@ const mapIngestEndpoint = (r: IngestEndpointRow): IngestEndpoint => ({
   corsOrigins: r.cors_json ? parseJsonSafe<string[]>(r.cors_json, []) : null,
   uniqueStudent: r.unique_student === 1,
   notifyThread: r.notify_thread,
+  preset: r.preset ?? null,
   status: r.status as IngestEndpointStatus,
   createdBy: r.created_by,
   createdUtc: r.created_utc,

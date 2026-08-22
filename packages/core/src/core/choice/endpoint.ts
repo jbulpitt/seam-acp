@@ -21,6 +21,8 @@ export interface IngestEndpoint {
   corsOrigins: string[] | null;
   uniqueStudent: boolean;
   notifyThread: string | null;
+  /** Named preset resolved at fire, not snapshot. Null ⇒ use frozen agent/model/cwd. */
+  preset: string | null;
   status: IngestEndpointStatus;
   createdBy: string;
   createdUtc: string;
@@ -36,28 +38,44 @@ export interface IngestEndpointSpec {
   corsOrigins?: string[];
   uniqueStudent?: boolean;
   notifyThread?: string | null;
+  /** Resolve this project preset at fire (agent/model/effort/cwd + instructions). */
+  preset?: string;
   cwd?: string;
   agent?: string;
   model?: string;
   effort?: string;
 }
 
-const EndpointSpecSchema = z.object({
-  name: z.string().trim().min(1).max(80),
-  wrapper: z.string().optional(),
-  resultSchema: z.unknown().optional(),
-  corsOrigins: z.array(z.string().min(1)).optional(),
-  uniqueStudent: z.boolean().optional(),
-  notifyThread: z
-    .string()
-    .regex(/^\d+$/)
-    .nullable()
-    .optional(),
-  cwd: z.string().min(1).optional(),
-  agent: z.string().min(1).optional(),
-  model: z.string().min(1).optional(),
-  effort: z.string().min(1).optional(),
-});
+const EndpointSpecSchema = z
+  .object({
+    name: z.string().trim().min(1).max(80),
+    wrapper: z.string().optional(),
+    resultSchema: z.unknown().optional(),
+    corsOrigins: z.array(z.string().min(1)).optional(),
+    uniqueStudent: z.boolean().optional(),
+    notifyThread: z
+      .string()
+      .regex(/^\d+$/)
+      .nullable()
+      .optional(),
+    preset: z.string().trim().min(1).max(80).optional(),
+    cwd: z.string().min(1).optional(),
+    agent: z.string().min(1).optional(),
+    model: z.string().min(1).optional(),
+    effort: z.string().min(1).optional(),
+  })
+  .superRefine((s, ctx) => {
+    if (!s.preset) return;
+    for (const key of ["agent", "model", "effort", "cwd"] as const) {
+      if (s[key]) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `preset cannot be combined with ${key} — the preset is the identity (resolved at fire)`,
+          path: [key],
+        });
+      }
+    }
+  });
 
 export function newIngestEndpointId(): string {
   return `ie_${randomBytes(9).toString("base64url")}`;
@@ -126,10 +144,11 @@ export function planEndpointDispatch(opts: {
     correlationId: e.id,
     createdUtc: new Date().toISOString(),
   };
+  if (e.preset) spec.preset = e.preset;
   if (e.cwd) spec.cwd = e.cwd;
   if (e.agentId) spec.agentId = e.agentId;
   if (e.model) spec.model = e.model;
-  else if (opts.defaultModel) spec.model = opts.defaultModel;
+  else if (!e.preset && opts.defaultModel) spec.model = opts.defaultModel;
   if (e.effort) spec.effort = e.effort;
   return spec;
 }

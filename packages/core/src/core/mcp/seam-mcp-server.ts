@@ -1035,7 +1035,7 @@ const TOOLS = [
   {
     name: "create_ingest",
     description:
-      "Mint a headless HTTP ingest endpoint (no Discord card). Token shown once. Isolated silent scoring; retries unlimited unless uniqueStudent. See docs/agent-guides/interactive-prompts.md.",
+      "Mint a headless HTTP ingest endpoint (no Discord card). Token shown once. Isolated silent scoring; retries unlimited unless uniqueStudent. preset is resolved at fire (not snapshot). See docs/agent-guides/interactive-prompts.md.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1045,10 +1045,15 @@ const TOOLS = [
         corsOrigins: { type: "array", items: { type: "string" } },
         uniqueStudent: { type: "boolean", description: "If true, same studentId cannot submit twice. Default false." },
         notifyThread: { type: "string", description: "Optional Discord snowflake to copy working into. Omitted = no Discord." },
-        cwd: { type: "string", description: "Override spawn cwd. Default: this thread's repo." },
-        agent: { type: "string", description: "Override agent id. Default: this thread's agent." },
-        model: { type: "string" },
-        effort: { type: "string" },
+        preset: {
+          type: "string",
+          description:
+            "Project preset name. Resolved at each POST (agent/model/effort/cwd + instructions). Cannot combine with agent/model/effort/cwd.",
+        },
+        cwd: { type: "string", description: "Override spawn cwd. Default: this thread's repo. Not with preset." },
+        agent: { type: "string", description: "Override agent id. Default: this thread's agent. Not with preset." },
+        model: { type: "string", description: "Not with preset." },
+        effort: { type: "string", description: "Not with preset." },
       },
       required: ["name"],
     },

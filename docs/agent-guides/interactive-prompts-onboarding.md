@@ -8,7 +8,8 @@ Canonical spec (do not fork):
 `https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/interactive-prompts.md`
 
 This is the **software / team** version (not the school / microsite one).
-Updated 2026-08-22 for multi-select (`#94`, `fd5a5e5`).
+Updated 2026-08-22 for multi-select (`#94`) and headless ingest endpoints
+(`#95`, including `preset` resolved at fire).
 
 ---
 
@@ -36,15 +37,31 @@ DEFAULT USE (do this constantly)
 WHEN YOU NEED MORE (same guide, later sections)
 - isolated = throwaway session, output still in the card thread (don't pollute this session).
 - thread = another seam snowflake, live there (e.g. send a frozen prompt to a QA thread).
-- HTTP ingest: a page or tool POSTs /ingest with the site Bearer. Mint via create_choice ingress only (fence will not mint a token). The scoring/handling turn MUST submit_result (or a seam-result fence) — that JSON is the HTTP body, not the Discord transcript. Public: https://ingest.runbooksynthesis.com/ingest — POST ?wait=0 then poll GET /ingest/jobs/{id}. Persist artifacts in this repo as the wrapper says.
+- HTTP ingest (microsite, no Discord card): MCP create_ingest. Isolated silent scoring. POST {text, studentId?} does not choose agent/model. Pin those at mint, inherit this thread, or set preset (resolved at each POST — edit the preset to change the grader without reminting). Cannot combine preset with agent/model/effort/cwd. Token once; inject at build/serve. Public: https://ingest.runbooksynthesis.com/ingest — POST ?wait=0 then poll. Declare JSON with submit_result. persist in this repo. Card-bound ingest (create_choice + ingress) still exists for Discord click-cards.
 
 After writing the library entry, confirm: file path(s), the raw guide URL is in them, and a brand-new session would use live single-user cards by default.
 ```
 
-**2. Short nudge** if they already stored an older version:
+**2. Short nudge** if they already stored an older version (cards only):
 
 ```
 Update the interactive-prompts library entry from
 https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/interactive-prompts.md
 Default is live, single-user: one pick, card shows the choice, buttons disappear. Several picks from one person: select (dropdown + Confirm → one combined prompt). maxClicks > 1 only for multi-user. Ingest is advanced. This project is software/team, not a classroom. Say which file you changed.
+```
+
+**3. Refresh snippet** for a project that already pinned the guide (cards + ingest):
+
+```
+Re-fetch and keep this canonical guide (it grew):
+https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/interactive-prompts.md
+Update the project context library overlay (do not fork the protocol). New facts:
+
+- Multi-select cards: select:{min,max} → dropdown + Confirm, one combined prompt. Still one person. No custom options, no maxClicks>1.
+- Headless ingest endpoints (#95): MCP create_ingest (no Discord card). Same POST /ingest + submit_result. Isolated silent. Retries unlimited unless uniqueStudent. POST body is only {text, studentId?} — it does not pick agent/model.
+- Who scores: create_ingest.preset (a project preset, resolved at each POST so you can tweak model/effort/instructions without reminting) OR pin agent/model/effort/cwd OR inherit the minting thread. preset cannot combine with agent/model/effort/cwd.
+- Wrapper = assignment contract (rubric, persist path, resultSchema). Preset = grader identity. Keep those separate.
+- Token shown once; inject at build/serve, not in page JS. Public host https://ingest.runbooksynthesis.com/ingest — POST ?wait=0 then poll GET /ingest/jobs/{id}. Persist attempts in THIS repo.
+
+Say which file(s) you changed. A brand-new session must see these without this message.
 ```

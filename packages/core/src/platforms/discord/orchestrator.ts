@@ -5041,23 +5041,34 @@ export class Orchestrator {
     spec: DispatchSpec
   ): Promise<{ output: string; stopReason: string }> {
     const notifyId = isDiscordSnowflake(spec.target) ? spec.target : undefined;
-    const agentId = spec.agentId ?? this.config.DEFAULT_AGENT;
+    const endpoint = spec.correlationId ? this.store.getIngestEndpoint(spec.correlationId) : null;
+    const presetName = endpoint?.preset ?? spec.preset;
+    const preset = presetName
+      ? this.store.getPresetByNameScoped(presetName, endpoint?.authoringParentRef ?? null)
+      : null;
+    if (presetName && !preset) {
+      throw new Error(`dispatch ${spec.id}: unknown preset "${presetName}"`);
+    }
+    const agentId = preset?.agentId ?? spec.agentId ?? this.config.DEFAULT_AGENT;
     const profile = this.router.getProfile(agentId);
     if (!profile) {
       throw new Error(`dispatch ${spec.id}: unknown agent "${agentId}"`);
     }
-    const cwd = spec.cwd ?? this.config.REPOS_ROOT;
+    const cwd = preset?.repoPath ?? spec.cwd ?? this.config.REPOS_ROOT;
+    const model = preset?.model ?? spec.model;
+    const effort = preset?.effort ?? spec.effort;
+    const prompt = applyPresetIdentity(spec.prompt, preset);
     const synthetic: SessionRecord = {
       id: spec.id,
       platform: PLATFORM,
       channelRef: notifyId ?? spec.correlationId ?? spec.id,
-      parentRef: null,
+      parentRef: endpoint?.authoringParentRef ?? null,
       agentId,
       acpSessionId: "",
       repoPath: cwd,
       configJson: JSON.stringify({
-        ...(spec.model ? { model: spec.model } : {}),
-        ...(spec.effort ? { reasoningEffort: spec.effort } : {}),
+        ...(model ? { model } : {}),
+        ...(effort ? { reasoningEffort: effort } : {}),
       }),
       createdUtc: spec.createdUtc,
       updatedUtc: spec.createdUtc,
@@ -5070,7 +5081,7 @@ export class Orchestrator {
           kind: "ingest",
           sourceRef: null,
           targetRef: notifyId ?? null,
-          worker: null,
+          worker: preset?.name ?? null,
           promptPreview: spec.prompt,
           correlationId: spec.correlationId ?? null,
           status: "dispatched",
@@ -5096,12 +5107,12 @@ export class Orchestrator {
       this.activeTurns++;
       let result: InjectTurnResult | undefined;
       try {
-        result = await this.injectTurn(null, spec.prompt, {
+        result = await this.injectTurn(null, prompt, {
           session: "isolated",
           profile,
           cwd,
-          ...(spec.model ? { model: spec.model } : {}),
-          ...(spec.effort ? { effort: spec.effort } : {}),
+          ...(model ? { model } : {}),
+          ...(effort ? { effort } : {}),
           mcpServers,
           ...(outputTo ? { outputTo } : {}),
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
@@ -8836,7 +8847,8 @@ export class Orchestrator {
         const lines = endpoints.slice(0, 10).map((e) => {
           const uniq = e.uniqueStudent ? " · unique-student" : "";
           const notify = e.notifyThread ? ` · notify ${e.notifyThread}` : "";
-          return `🌐 \`${e.id}\` ${e.name}${uniq}${notify}`;
+          const preset = e.preset ? ` · preset ${e.preset}` : "";
+          return `🌐 \`${e.id}\` ${e.name}${preset}${uniq}${notify}`;
         });
         if (endpoints.length > 10) lines.push(`…and ${endpoints.length - 10} more`);
         embed.addFields({
@@ -11496,8 +11508,20 @@ export class Orchestrator {
     if (!parsed.ok) return parsed;
     const spec = parsed.spec;
     const cfg = this.store.readConfig(record);
-    const agentId = spec.agent ?? record.agentId ?? this.config.DEFAULT_AGENT;
-    if (!this.router.getProfile(agentId)) {
+    let agentId: string | null = spec.agent ?? record.agentId ?? this.config.DEFAULT_AGENT;
+    let cwd: string | null = spec.cwd ?? record.repoPath ?? null;
+    let model: string | null = spec.model ?? cfg.model ?? null;
+    let effort: string | null = spec.effort ?? cfg.reasoningEffort ?? null;
+    if (spec.preset) {
+      const preset = this.store.getPresetByNameScoped(spec.preset, record.parentRef);
+      if (!preset) {
+        return { ok: false, error: `Unknown preset "${spec.preset}" in this project.` };
+      }
+      agentId = null;
+      cwd = null;
+      model = null;
+      effort = null;
+    } else if (!this.router.getProfile(agentId)) {
       return { ok: false, error: `Unknown agent "${agentId}".` };
     }
     const ingestToken = mintBridgeToken();
@@ -11505,15 +11529,16 @@ export class Orchestrator {
       id: newIngestEndpointId(),
       tokenHash: hashBridgeToken(ingestToken),
       name: spec.name,
-      cwd: spec.cwd ?? record.repoPath ?? null,
+      cwd,
       agentId,
-      model: spec.model ?? cfg.model ?? null,
-      effort: spec.effort ?? cfg.reasoningEffort ?? null,
+      model,
+      effort,
       wrapper: spec.wrapper?.trim() ? spec.wrapper : null,
       resultSchema: spec.resultSchema ?? null,
       corsOrigins: spec.corsOrigins ?? null,
       uniqueStudent: spec.uniqueStudent === true,
       notifyThread: spec.notifyThread ?? null,
+      preset: spec.preset ?? null,
       status: "open",
       createdBy: record.id,
       createdUtc: new Date().toISOString(),

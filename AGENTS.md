@@ -136,8 +136,8 @@ options and **one combined prompt** is emitted, then the card freezes showing
 `cancel_choice` / `submit_result`, or fences `seam-choice` / `seam-result`.
 HTTP `POST /ingest` is a custom-option submit; the site gets **declared JSON**
 from `submit_result`. Microsites that need **no Discord card** use MCP
-`create_ingest` (isolated silent, retries unlimited). Participants click; they
-do not author.
+`create_ingest` (isolated silent, retries unlimited; `preset` resolved at
+fire). Participants click; they do not author.
 
 ## Agent-scheduled wake events (#59)
 

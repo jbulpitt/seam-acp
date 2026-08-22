@@ -45,6 +45,7 @@ function endpoint(over: Partial<IngestEndpoint> = {}): IngestEndpoint {
     corsOrigins: null,
     uniqueStudent: false,
     notifyThread: null,
+    preset: null,
     status: "open",
     createdBy: "discord:thread-1",
     createdUtc: "2026-08-22T00:00:00.000Z",
@@ -93,6 +94,12 @@ describe("parseIngestEndpointSpec", () => {
     const r = parseIngestEndpointSpec({ name: "q", notifyThread: "not-a-id" });
     expect(r.ok).toBe(false);
   });
+  it("accepts preset and refuses combining it with agent/model", () => {
+    expect(parseIngestEndpointSpec({ name: "q", preset: "hist-grader" }).ok).toBe(true);
+    const r = parseIngestEndpointSpec({ name: "q", preset: "hist-grader", agent: "claude" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/preset cannot be combined with agent/);
+  });
 });
 
 describe("wrapEndpointPrompt", () => {
@@ -127,6 +134,15 @@ describe("planEndpointDispatch", () => {
     expect(spec.cwd).toBe("/repo");
     expect(spec.agentId).toBe("claude");
     expect(spec.prompt).toContain("hello");
+    expect(spec.preset).toBeUndefined();
+  });
+  it("carries preset name for resolve-at-fire", () => {
+    const spec = planEndpointDispatch({
+      endpoint: endpoint({ preset: "hist-grader", agentId: null, model: null, cwd: null }),
+      payload: "x",
+    });
+    expect(spec.preset).toBe("hist-grader");
+    expect(spec.agentId).toBeUndefined();
   });
   it("uses notifyThread as target when it is a snowflake", () => {
     const spec = planEndpointDispatch({
@@ -146,6 +162,10 @@ describe("ingest endpoint store", () => {
     expect(store.getIngestEndpoint(row.id)?.name).toBe("essay-check");
     expect(store.getIngestEndpointByTokenHash(row.tokenHash)?.id).toBe(row.id);
     expect(store.listOpenIngestEndpoints("discord", "thread-1")).toHaveLength(1);
+  });
+  it("round-trips a preset name", () => {
+    store.insertIngestEndpoint(endpoint({ preset: "hist-grader" }));
+    expect(store.getIngestEndpoint("ie_test1")?.preset).toBe("hist-grader");
   });
   it("revoke stops listing and lookup still finds the row as revoked", () => {
     store.insertIngestEndpoint(endpoint());

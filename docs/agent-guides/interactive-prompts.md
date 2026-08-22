@@ -271,6 +271,7 @@ snowflake; omitted → **no Discord posts**.
 ```json
 {
   "name": "hist2300-essay-check",
+  "preset": "hist-grader",
   "wrapper": "Grade this. Persist under submissions/. Then submit_result matching the schema.",
   "resultSchema": {
     "type": "object",
@@ -288,10 +289,30 @@ Returns `{ ingestId, ingestUrl, ingestToken }`. Inject the token at build/serve
 time, not in page JS. `cancel_ingest({ ingestId })` or
 `/seam workflows cancel-ingest:<id>` revokes; in-flight jobs finish.
 
-Spawn fields (cwd, agent, model, effort) freeze at mint from the authoring
-session unless overridden. POST body does **not** choose them.
+**Who runs the scoring turn** (POST never chooses this):
 
-`studentId` is an untrusted label. Same id may submit again unless
-`uniqueStudent`. Persist attempt history in the project cwd via the wrapper.
+- **`preset`** (preferred for a named grader): a project preset, **resolved at
+  each POST**. Edit the preset’s agent / model / effort / cwd / instructions
+  and the next submit uses them — no remint. Cannot combine with `agent` /
+  `model` / `effort` / `cwd`. Unknown at fire → the job fails.
+- Else pin `agent` / `model` / `effort` / `cwd` on mint.
+- Else inherit the minting thread’s agent / model / effort / cwd.
+
+The wrapper is the **assignment contract** (rubric, persist path, result
+shape). The preset is the **grader identity**. Keep rubric in `wrapper`, not
+in the preset, so you can reuse one grader across quizzes.
+
+**Real-world**
+
+- One token per microsite (or per assignment). Retries and refine-loops reuse
+  it. `uniqueStudent: true` only for a one-shot exam.
+- Two models or two personalities → two presets and/or two endpoints.
+- `studentId` is an untrusted label. Persist attempts in **this repo’s cwd**
+  as the wrapper says (`submissions/{id}/{utc}.json`). No LMS store.
+- Public host: `https://ingest.runbooksynthesis.com/ingest`. Cloudflare 524s a
+  held POST around 100s — use `POST /ingest?wait=0` then poll
+  `GET /ingest/jobs/{jobId}` with the same Bearer.
+- Do not put the Bearer in client-side JS if a tiny server or build inject can
+  hold it.
 
 Card ingest (#92) is unchanged.

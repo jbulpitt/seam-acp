@@ -16,7 +16,7 @@ export const CHOICE_CUSTOM_TEXT_MAX = 4000;
 
 /** Thin preamble bullet — same weight as seam-wake. Canonical how-to is the agent guide. */
 export const CHOICE_AUTHORING_RULE =
-  "To publish a frozen click-card in this thread, output a fenced block tagged `seam-choice` whose body is JSON `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }` (or call `create_choice`). Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel.";
+  "To publish a frozen click-card in this thread, output a fenced block tagged `seam-choice` whose body is JSON `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }` (or call `create_choice`). Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. For \"pick several of N\", add `select:{min,max}` — the card becomes a dropdown + Confirm and returns one combined prompt (all options must be prompt; not combinable with maxClicks>1). Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel.";
 
 /** MCP-less declared HTTP result (#92). Stripped like seam-choice. */
 export const RESULT_FENCE_LANG = "seam-result";

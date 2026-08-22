@@ -19,9 +19,13 @@ hand-editing runtime state.
 - **A pick from Jesse** (approve, which plan, ship vs wait): frozen click-card
   **in this thread**. MCP `create_choice` or a `seam-choice` fence. Default is
   live, one person, one pick — the card shows the selection and buttons go
-  away. Do not ask him to type "1 or 2". Protocol:
+  away. Do not ask him to type "1 or 2". **Several of N at once** ("which of
+  these should I work on?"): add `select: { min, max }` — the card becomes a
+  dropdown + Confirm and returns **one combined prompt** with just his picks;
+  don't ask him to list numbers. Protocol:
   `docs/agent-guides/interactive-prompts.md`. `maxClicks` > 1 only when several
-  people should each click. Participants click; they do not author.
+  people should each click (not combinable with `select`). Participants click;
+  they do not author.
 - **A file he should open:** `seam-attach` fence (path only), not a path in prose.
 - **Another thread in this channel:** `threads()` first. Idle → `handoff` /
   `forward`. Busy → `send` (inbox; they `poll_inbox`). Set `returnTo` to that
@@ -118,13 +122,17 @@ cancels the queued prompt. Shares the `#88` parked row.
 
 **Removed:** `/seam image`.
 
-## Interactive prompts (#91 / #92)
+## Interactive prompts (#91 / #92 / #94)
 
 Frozen Discord click-cards and HTTP ingest for microsites. **While pairing in
 this repo, a card is the check-in** — see Dogfood above. Canonical how-to:
 `docs/agent-guides/interactive-prompts.md`. Default is **live in this thread,
 one person, one pick** — after they choose, the card shows the selection and
-buttons go away. `maxClicks` > 1 only for multi-user. MCP `create_choice` /
+buttons go away. **Multi-select (#94):** set `select: { min, max }` for a
+dropdown + Confirm instead of one-click buttons — the user ticks several
+options and **one combined prompt** is emitted, then the card freezes showing
+`Selected: A, B, C`. All options must be `kind:"prompt"`; not combinable with
+`maxClicks` > 1. `maxClicks` > 1 only for multi-user. MCP `create_choice` /
 `cancel_choice` / `submit_result`, or fences `seam-choice` / `seam-result`.
 HTTP `POST /ingest` is a custom-option submit; the site gets **declared JSON**
 from `submit_result`. Participants click; they do not author.

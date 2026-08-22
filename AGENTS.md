@@ -10,6 +10,38 @@ This file contains instructions for AI agents (Copilot, Claude, Gemini, etc.) wo
 
 Your output is streamed to Discord, which does **not** support markdown tables. Avoid using tables in your responses — they render as garbled text. Use bullet lists, bold labels, or plain text instead.
 
+## Dogfood these while pairing here
+
+You are developing the bot you are running in. Use the product instead of
+prose workarounds, native ACP tools that do not fire over this bridge, or
+hand-editing runtime state.
+
+- **A pick from Jesse** (approve, which plan, ship vs wait): frozen click-card
+  **in this thread**. MCP `create_choice` or a `seam-choice` fence. Default is
+  live, one person, one pick — the card shows the selection and buttons go
+  away. Do not ask him to type "1 or 2". Protocol:
+  `docs/agent-guides/interactive-prompts.md`. `maxClicks` > 1 only when several
+  people should each click. Participants click; they do not author.
+- **A file he should open:** `seam-attach` fence (path only), not a path in prose.
+- **Another thread in this channel:** `threads()` first. Idle → `handoff` /
+  `forward`. Busy → `send` (inbox; they `poll_inbox`). Set `returnTo` to that
+  thread when he does not want a report-back here. Never hand off to `isSelf`.
+- **Wake me later:** `schedule_wake` (or `seam-wake` fence). Native
+  `ScheduleWakeup` / `Monitor` emit nothing after `end_turn` here.
+- **Wait until a condition:** `watch_create` (file / http / command). Do not
+  spin a `schedule_wake` loop that only reports "not yet".
+- **Park the next prompt without aborting this turn:** `/seam queue prompt:…`
+  (slash; does not cancel the live turn).
+- **Rename / move a project folder:** `npm run relocate-repo -- --from <old>
+  --to <new>` (dry-run), then `--apply --move --vendor`. Do not hand-edit
+  `sessions.repo_path` or `channel-presets.json` cwd. Leftover `--symlink` is
+  optional; the repo picker skips symlink dirs. Successful `--apply` writes a
+  **force** restart sentinel (SIGTERM live turns; turn-resume continues).
+  `npm run redeploy` is the drain-style restart for code changes.
+- **Git worktrees:** `wt` only — see Git worktrees below.
+
+`poll_inbox` at the start of a turn (and at checkpoints). Empty is normal.
+
 ## ⚠️ CRITICAL: Applying code changes or restarting the app
 
 **Never run `pm2 restart seam-acp` directly.** The bot is managed by PM2. A direct restart kills the process immediately — including the agent session running the command — so your reply will never be delivered to Discord.
@@ -51,6 +83,14 @@ pm2 logs seam-acp --lines 100   # last 100 log lines
 - `data/` — SQLite database (runtime, not committed)
 - `.env` — local environment config (not committed)
 
+## Git worktrees
+
+Use this host's `wt` CLI only (`~/.local/bin/wt`). Do **not** call `git worktree add` / `git worktree remove --force`, symlink `node_modules`, `npm install` a second copy to satisfy a bundler, park trees under `/tmp` or as visible `~/Projects/<name>` siblings, or invent a project-local worktree helper. This repo has no provisioner — call `wt` directly.
+
+Layout: `~/Projects/.worktrees/seam-acp/<name>/`. Bind-mount `node_modules` from the main checkout (never symlink). Teardown unmounts first — a force-remove of a still-mounted `node_modules` deletes the main install. After reboot: `wt bind-all --repo /home/ubuntu/Projects/seam-acp`.
+
+Load `~/.local/share/wt-helpers/AGENTS.md` before creating or tearing down a tree. If `wt` is missing, run `~/.local/share/wt-helpers/install.sh` then `wt doctor`.
+
 ## Slash command tree (`/seam`)
 
 Discord caps each command at 25 top-level options. `/seam` is 13/25: 5
@@ -80,13 +120,14 @@ cancels the queued prompt. Shares the `#88` parked row.
 
 ## Interactive prompts (#91 / #92)
 
-Frozen Discord click-cards and HTTP ingest for microsites. Canonical agent
-how-to: `docs/agent-guides/interactive-prompts.md`. Default is **live in this
-thread, one person, one pick** — after they choose, the card shows the
-selection and buttons go away. `maxClicks` > 1 only for multi-user. MCP
-`create_choice` / `cancel_choice` / `submit_result`, or fences `seam-choice` /
-`seam-result`. HTTP `POST /ingest` is a custom-option submit; the site gets
-**declared JSON** from `submit_result`. Participants click; they do not author.
+Frozen Discord click-cards and HTTP ingest for microsites. **While pairing in
+this repo, a card is the check-in** — see Dogfood above. Canonical how-to:
+`docs/agent-guides/interactive-prompts.md`. Default is **live in this thread,
+one person, one pick** — after they choose, the card shows the selection and
+buttons go away. `maxClicks` > 1 only for multi-user. MCP `create_choice` /
+`cancel_choice` / `submit_result`, or fences `seam-choice` / `seam-result`.
+HTTP `POST /ingest` is a custom-option submit; the site gets **declared JSON**
+from `submit_result`. Participants click; they do not author.
 
 ## Agent-scheduled wake events (#59)
 

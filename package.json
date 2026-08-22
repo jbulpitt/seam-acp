@@ -30,7 +30,8 @@
     "dev": "npm run build -w @seam/adapters && tsx watch packages/core/src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "relocate-repo": "tsx scripts/relocate-repo.ts"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",

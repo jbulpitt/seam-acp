@@ -28,7 +28,7 @@ import type {
   SessionRecord,
 } from "../chat-adapter.js";
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
-import { cleanTextForPreview, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
+import { cleanTextForPreview, scanWorkspaces, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
 import { readRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
 import { analyzeSessionCoverage, detectGaps, type TimeRange, type GapReport } from "../../core/compaction/gap-detector.js";
 import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
@@ -47,6 +47,7 @@ import {
   loadParkedAttachmentBytes,
 } from "../../core/parked-prompts/attachments.js";
 import type { InboxMessage } from "../../core/inbox/types.js";
+import { restartSentinelPath, sentinelIsForce } from "../../core/restart-sentinel.js";
 import {
   WAKE_MIN_DELAY_SECONDS,
   WAKE_MAX_DELAY_SECONDS,
@@ -655,7 +656,15 @@ export class Orchestrator {
   }
 
   private sentinelPath(): string {
-    return path.join(this.config.DATA_DIR, ".restart-pending");
+    return restartSentinelPath(this.config.DATA_DIR);
+  }
+
+  private readSentinelForce(): boolean {
+    try {
+      return sentinelIsForce(fs.readFileSync(this.sentinelPath(), "utf8"));
+    } catch {
+      return false;
+    }
   }
 
   private watchSentinel(): void {
@@ -678,13 +687,21 @@ export class Orchestrator {
 
   private async handleRestartSentinel(): Promise<void> {
     this.restartPending = true;
+    const force = this.readSentinelForce();
     // Keep cron timers running through the drain. Stopping them here is what
     // made `report-update` miss 5:25 while a restart sat pending for hours —
     // list still showed the stale next_run, and catch-up could then skip it.
     // Isolated scheduled fires increment activeTurns, so they extend the drain
     // instead of being SIGTERM'd. Stop only in the last beat before pm2 restart.
+    // `force` (relocate-repo) skips the drain so live ACP processes take
+    // SIGTERM; turn-resume continues them after boot.
 
-    if (this.activeTurns > 0) {
+    if (force) {
+      await this.postNotification(
+        "♻️ Force restart — interrupting live turns; they will resume."
+      );
+      this.logger.info({ activeTurns: this.activeTurns }, "force restart sentinel; skipping drain");
+    } else if (this.activeTurns > 0) {
       const turnWord = this.activeTurns === 1 ? "turn" : "turn(s)";
       await this.postNotification(
         `♻️ Restart requested — waiting for ${this.activeTurns} ${turnWord} to finish.`
@@ -701,13 +718,15 @@ export class Orchestrator {
       });
     }
 
-    // Give agents 2 seconds to flush their SQLite DBs and transcripts after the
-    // final JSON-RPC prompt() response is returned. Without this, the instant 
-    // SIGTERM during shutdown can interrupt the final background DB commit.
-    this.logger.info("turns drained; waiting 2s for background I/O to flush");
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    if (!force) {
+      // Give agents 2 seconds to flush their SQLite DBs and transcripts after the
+      // final JSON-RPC prompt() response is returned. Without this, the instant
+      // SIGTERM during shutdown can interrupt the final background DB commit.
+      this.logger.info("turns drained; waiting 2s for background I/O to flush");
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
 
-    this.logger.info("all turns drained, executing restart");
+    this.logger.info(force ? "force restart, executing pm2 restart" : "all turns drained, executing restart");
     this.scheduledManager?.stop();
     try {
       await fsp.unlink(this.sentinelPath());
@@ -11892,17 +11911,7 @@ export class Orchestrator {
   private listRepoDirs(): string[] | undefined {
     const root = this.config.REPOS_ROOT;
     if (!fs.existsSync(root)) return undefined;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(root, { withFileTypes: true });
-    } catch (err) {
-      this.logger.warn({ err, root }, "readdir failed");
-      return [];
-    }
-    return entries
-      .filter((e) => e.isDirectory() && !e.name.startsWith("."))
-      .map((e) => path.join(root, e.name))
-      .sort((a, b) => a.localeCompare(b));
+    return scanWorkspaces(root).map((w) => w.path);
   }
 
   /**

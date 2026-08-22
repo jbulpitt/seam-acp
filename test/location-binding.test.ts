@@ -289,6 +289,7 @@ describe("D9 loopback host + D11 workspace scan", () => {
     fs.mkdirSync(path.join(tmp, "alpha"));
     fs.mkdirSync(path.join(tmp, "beta"));
     fs.mkdirSync(path.join(tmp, ".hidden"));
+    fs.symlinkSync(path.join(tmp, "alpha"), path.join(tmp, "alias"));
     const loopback = new LoopbackHost({
       adapters: [stubProfile("claude", [])],
       workspaceRoot: tmp,

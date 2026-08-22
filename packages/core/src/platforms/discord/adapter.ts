@@ -40,6 +40,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Logger } from "../../lib/logger.js";
 import { isThreadDetached, mayConfigureUserIds, type Config } from "../../config.js";
+import { isObfuscatedChannel, visibleDiscordChannelName } from "./channel-visibility.js";
 import type {
   ChatAdapter,
   ChannelRef,
@@ -618,6 +619,12 @@ export class DiscordAdapter implements ChatAdapter {
       ch = parentCh;
     }
 
+    if (isObfuscatedChannel(ch)) {
+      throw new Error(
+        `Channel ${ch.id} is obfuscated (bot lacks VIEW_CHANNEL); cannot create a thread there`
+      );
+    }
+
     if (
       ch.type !== ChannelType.GuildText &&
       ch.type !== ChannelType.GuildAnnouncement
@@ -653,7 +660,8 @@ export class DiscordAdapter implements ChatAdapter {
     try {
       const ch = await this.client.channels.fetch(channel.id);
       if (!ch?.isThread()) return undefined;
-      return (ch as ThreadChannel).name ?? undefined;
+      // #52: never surface Discord's obfuscation sentinel as a real name.
+      return visibleDiscordChannelName(ch as ThreadChannel);
     } catch {
       return undefined;
     }
@@ -709,6 +717,9 @@ export class DiscordAdapter implements ChatAdapter {
     try {
       const ch = await this.client.channels.fetch(channel.id);
       if (!ch) return undefined; // gone
+      // Obfuscated = bot lacks VIEW_CHANNEL. Treat as locked (do not post);
+      // do not treat as deleted (would drop schedules).
+      if (isObfuscatedChannel(ch)) return { locked: true, archived: false };
       if (ch.isThread()) return { locked: ch.locked ?? false, archived: ch.archived ?? false };
       if (ch.isTextBased()) return { locked: false, archived: false }; // plain channel — always postable
       return undefined; // not a postable channel
@@ -1196,6 +1207,10 @@ export class DiscordAdapter implements ChatAdapter {
     if (!msg.channel.isThread()) return;
 
     const thread = msg.channel as ThreadChannel;
+    // #52: Gateway still delivers channels the bot cannot view, with name
+    // `___hidden___` and CHANNEL_OBFUSCATED. Do not bind a session on those.
+    if (isObfuscatedChannel(thread)) return;
+    if (thread.parent && isObfuscatedChannel(thread.parent)) return;
 
     // If parent isn't accessible / not text, ignore.
     const parentId = thread.parentId ?? undefined;
@@ -1508,6 +1523,9 @@ export class DiscordAdapter implements ChatAdapter {
   ): Promise<TextChannel | ThreadChannel> {
     const ch = await this.client.channels.fetch(channelId);
     if (!ch) throw new Error(`Channel ${channelId} not found`);
+    if (isObfuscatedChannel(ch)) {
+      throw new Error(`Channel ${channelId} is obfuscated (bot lacks VIEW_CHANNEL)`);
+    }
     if (
       ch.type === ChannelType.GuildText ||
       ch.type === ChannelType.GuildAnnouncement ||

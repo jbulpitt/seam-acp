@@ -12089,6 +12089,8 @@ export class Orchestrator {
     // the user already gave it a custom name when running /seam new.
     let current: string | undefined;
     if (this.adapter.getThreadName) {
+      // Adapter strips obfuscated `___hidden___` names (#52); undefined ≠ a
+      // custom title, so we still try the wizard rename.
       current = await this.adapter.getThreadName(channel);
       if (current !== undefined && current !== "seam") return;
     }

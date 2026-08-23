@@ -65,6 +65,8 @@ function describeConfig(record: SessionRecord): ConfigDescription {
       : { value: "ask", source: "default" },
     locked: false,
     detached: { value: false, source: "default" },
+    tts: { value: false, source: "default" },
+    ttsVoice: { value: null, source: "default" },
     location: { value: "local", source: "default" },
   };
 }
@@ -613,6 +615,34 @@ describe("thread-preset mutation (Tier C, #68)", () => {
       scope: THREAD,
     });
     expect(store.listConfigMutations()[0].summary).toMatch(/detached/);
+  });
+
+  it("round-trips threadPreset tts:true as a RAW boolean and does not restart", () => {
+    const record = makeRecord({ channelRef: THREAD, parentRef: CHAN });
+    const file = writePresetsFile({
+      threads: { [THREAD]: { rider: { value: "keep me" } } },
+    });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: true,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const built = svc.buildProposal(record, { threadPreset: { tts: true } });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.proposal.restartsSession).toBe(false);
+    expect(built.proposal.fields).toEqual([{ label: "tts", before: "false", after: "true" }]);
+    built.proposal.apply({ id: "user-jesse", name: "Jesse" });
+
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.threads[THREAD].tts).toBe(true);
+    expect(raw.threads[THREAD].tts).not.toEqual({ value: true });
+    expect(raw.threads[THREAD].rider.value).toBe("keep me");
+    expect(live.threadPresets.get(THREAD)?.tts).toBe(true);
   });
 
   it("attach omits detached and deletes an empty thread key (#80)", () => {

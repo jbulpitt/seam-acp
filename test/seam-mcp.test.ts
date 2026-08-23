@@ -1804,6 +1804,8 @@ describe("config_describe", () => {
     permission: { value: "ask", source: "default" as const },
     locked: true,
     detached: { value: true, source: "thread preset" as const },
+    tts: { value: false, source: "default" as const },
+    ttsVoice: { value: null, source: "default" as const },
     location: { value: "local", source: "default" as const },
   };
 

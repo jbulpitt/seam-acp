@@ -535,6 +535,10 @@ const Schema = z.object({
   SEAM_GEMINI_API_KEY: z.string().default(""),
   /** Gemini model id used for inbound voice-note transcription. */
   SEAM_GEMINI_STT_MODEL: z.string().min(1).default("gemini-3.7-flash"),
+  /** Gemini TTS model id used for outbound spoken replies. */
+  SEAM_GEMINI_TTS_MODEL: z.string().min(1).default("gemini-3.1-flash-tts-preview"),
+  /** Prebuilt Gemini TTS voice name (Kore, Puck, …). */
+  SEAM_GEMINI_TTS_VOICE: z.string().min(1).default("Kore"),
   /** #92: how long POST /ingest waits for submit_result before 202 + poll.
    *  Default 5 min. Ceiling 30 min. Public Cloudflare POSTs still die ~100s —
    *  microsites should poll GET /ingest/jobs/:id (or POST ?wait=0). */
@@ -729,6 +733,18 @@ const ChannelPresetSchema = PresetValuesSchema.extend({
         "location is a thread-only binding and cannot be set on a channel",
     })
     .optional(),
+  // Thread-only. Rejected so a channel-wide `tts` cannot blast spoken
+  // replies into every school thread under a parent.
+  tts: z
+    .undefined({
+      invalid_type_error: "tts is a thread-only flag and cannot be set on a channel",
+    })
+    .optional(),
+  ttsVoice: z
+    .undefined({
+      invalid_type_error: "ttsVoice is a thread-only setting and cannot be set on a channel",
+    })
+    .optional(),
 });
 
 // Raw boolean on the THREAD entry — NOT wrapped `{value:true}` (that wrapper
@@ -741,6 +757,8 @@ const ThreadPresetSchema = PresetValuesSchema.extend({
     .min(1)
     .regex(/^[a-z0-9][a-z0-9-]{0,63}$/, "location must be a slug")
     .optional(),
+  tts: z.boolean().optional().default(false),
+  ttsVoice: z.string().min(1).max(64).optional(),
 });
 
 /** Per-host bridge config (D11 / #86). Token is stored as SHA-256 hex only. */
@@ -781,7 +799,12 @@ export type PresetValues = {
   rider?: ChannelPresetField<string>;
 };
 export type ChannelPreset = PresetValues & { locked: boolean };
-export type ThreadPreset = PresetValues & { detached?: boolean; location?: string };
+export type ThreadPreset = PresetValues & {
+  detached?: boolean;
+  location?: string;
+  tts?: boolean;
+  ttsVoice?: string;
+};
 
 export type Config = z.infer<typeof Schema> & {
   channelPresets: Map<string, ChannelPreset>;
@@ -890,6 +913,25 @@ export function isThreadDetached(
 ): boolean {
   if (!threadId) return false;
   return config.threadPresets.get(threadId)?.detached ?? false;
+}
+
+/** Outbound TTS for this thread. Default off. Channel-wide TTS is not a thing. */
+export function isThreadTtsEnabled(
+  config: Pick<Config, "threadPresets">,
+  threadId: string | undefined
+): boolean {
+  if (!threadId) return false;
+  return config.threadPresets.get(threadId)?.tts === true;
+}
+
+/** Per-thread Gemini TTS voice. Unset ⇒ caller should use the env default. */
+export function resolveThreadTtsVoice(
+  config: Pick<Config, "threadPresets">,
+  threadId: string | undefined
+): string | undefined {
+  if (!threadId) return undefined;
+  const v = config.threadPresets.get(threadId)?.ttsVoice?.trim();
+  return v || undefined;
 }
 
 /** Per-thread host binding (D10 / #86). Omit / undefined / "" ⇒ `"local"`. */

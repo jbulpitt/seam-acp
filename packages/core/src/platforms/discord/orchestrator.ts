@@ -11,6 +11,8 @@ import {
   resolveThreadLocation,
   isChannelLocked,
   isThreadDetached,
+  isThreadTtsEnabled,
+  resolveThreadTtsVoice,
   isRestrictedParticipant,
   mayConfigureUserIds,
   PARTICIPANT_CONFIG_REFUSAL,
@@ -112,7 +114,13 @@ import {
   AutocompleteRegistry,
   presetAutocompleteChoices,
   safeAutocompleteRespond,
+  toAutocompleteChoices,
 } from "./autocomplete.js";
+import {
+  findGeminiTtsVoice,
+  geminiTtsVoiceChoices,
+  GEMINI_TTS_VOICE_PREVIEW_URL,
+} from "../../core/audio/gemini-tts.js";
 import {
   agentLocationPickerChoices,
   currentAgentAtLocation,
@@ -244,6 +252,7 @@ import {
   isVoiceNoteAttachment,
   withoutVoiceNotes,
 } from "../../core/audio/voice-notes.js";
+import { shouldSpeakReply, speakReplyToOgg } from "../../core/audio/voice-replies.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, withHarnessPreamble } from "../../core/agent-conventions.js";
 import {
   CHOICE_AUTHORING_RULE,
@@ -506,6 +515,9 @@ export class Orchestrator {
       const presets = this.store.listPresetsForProject(ctx.projectScopeId);
       return presetAutocompleteChoices(presets, ctx.focusedValue, ctx.projectScopeId);
     });
+    this.autocomplete.register("config", "tts", "voice", (ctx) =>
+      toAutocompleteChoices(geminiTtsVoiceChoices(ctx.focusedValue))
+    );
   }
 
   /**
@@ -1064,6 +1076,8 @@ export class Orchestrator {
 
     let textBuffer = "";
     let textSent = false;
+    let spokenProse = "";
+    let agentAudioSent = false;
     let totalAgentChars = 0;
     // Set true mid-turn (in the usage-update handler) when agy's context
     // usage crosses AGY_AUTO_COMPACT_THRESHOLD; consumed post-turn to run
@@ -1103,6 +1117,7 @@ export class Orchestrator {
         textBuffer = split.keep;
         if (split.send) {
           await this.adapter.sendMessage(channel, split.send);
+          spokenProse += split.send;
           textSent = true;
           typingDone = true;
         }
@@ -1461,6 +1476,7 @@ export class Orchestrator {
             try {
               await this.sendAgentFile(channel, event);
               textSent = true;
+              if ((event.mimeType ?? "").toLowerCase().startsWith("audio/")) agentAudioSent = true;
             } catch (err) {
               this.logger.warn(
                 { err, filename: event.filename },
@@ -1769,6 +1785,18 @@ export class Orchestrator {
         textSent = true;
       }
       await flushChunks();
+
+      const turnOk =
+        result !== "timeout" && !(result as { cancelled?: boolean }).cancelled;
+      if (turnOk) {
+        await this.maybeSpeakTurn({
+          channel,
+          threadId: channel.id,
+          prose: spokenProse,
+          alreadyHadAudio: agentAudioSent,
+        });
+      }
+
       this.logger.info(
         {
           session: record.id,
@@ -2273,6 +2301,8 @@ export class Orchestrator {
           return this.cmdInit(interaction);
         case "detach":
           return this.cmdDetach(interaction);
+        case "tts":
+          return this.cmdTts(interaction);
         case "show":
           return this.cmdConfig(interaction);
         case "edit":
@@ -10658,6 +10688,63 @@ export class Orchestrator {
     });
   }
 
+  /**
+   * `/seam config tts state:on|off`. Thread-preset raw boolean `tts`.
+   * Default off. Does not restart the session. Not participant-allowed;
+   * admin immunity lets this run in a locked school channel.
+   */
+  private async cmdTts(i: ChatInputCommandInteraction): Promise<void> {
+    if (!i.channel?.isThread()) {
+      await i.reply({
+        content: "Run this inside the thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const enabled = i.options.getString("state", true) === "on";
+    const voiceRaw = i.options.getString("voice")?.trim();
+    let voiceName: string | undefined;
+    if (voiceRaw) {
+      const known = findGeminiTtsVoice(voiceRaw);
+      if (!known) {
+        await i.reply({
+          content:
+            `Unknown voice \`${voiceRaw}\`. Pick from the autocomplete list, or preview at ${GEMINI_TTS_VOICE_PREVIEW_URL}`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      voiceName = known.name;
+    }
+    const threadId = i.channelId;
+    const parentRef = i.channel.parentId ?? undefined;
+    const result = this.configMutation.applyThreadOverlay({
+      threadId,
+      parentRef,
+      changes: {
+        tts: enabled,
+        ...(voiceName ? { ttsVoice: voiceName } : {}),
+      },
+      actor: { id: i.user.id, name: i.user.displayName ?? i.user.username },
+    });
+    if (!result.ok) {
+      await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const resolvedVoice =
+      voiceName ??
+      resolveThreadTtsVoice(this.config, threadId) ??
+      this.config.SEAM_GEMINI_TTS_VOICE;
+    const style = findGeminiTtsVoice(resolvedVoice)?.style;
+    const voiceLabel = style ? `${resolvedVoice} (${style})` : resolvedVoice;
+    await i.reply({
+      content: enabled
+        ? `TTS on — I'll attach a spoken copy of each completed reply in this thread, voice **${voiceLabel}**.\nPreview voices: ${GEMINI_TTS_VOICE_PREVIEW_URL}`
+        : `TTS off — replies stay text-only.${voiceName ? ` Saved voice **${voiceLabel}** for when you turn it back on.` : ""}\nPreview voices: ${GEMINI_TTS_VOICE_PREVIEW_URL}`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   private async cmdInit(i: ChatInputCommandInteraction): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
@@ -11138,6 +11225,7 @@ export class Orchestrator {
       "`/seam config reset` — end this thread's ACP session; next message starts fresh",
       "`/seam config init` — bind this thread + start setup (repo picker, or full wizard)",
       "`/seam config detach <detached|attached>` — keep this thread session-less (no bot replies; does not delete history)",
+      "`/seam config tts <on|off> [voice]` — speak completed replies as an ogg (default off; autocomplete voice)",
       "`/seam config show` — show session config JSON",
       "`/seam config set <json>` — replace session config",
       "`/seam config audit` — recent config mutations (who/what/when)",
@@ -11202,6 +11290,56 @@ export class Orchestrator {
       filename: event.filename,
       mimeType: event.mimeType,
     });
+  }
+
+  /**
+   * After a completed live turn, optionally attach one Gemini TTS ogg of the
+   * user-visible prose. Fail-visible on synthesis error; never fails the turn.
+   */
+  private async maybeSpeakTurn(opts: {
+    channel: ChannelRef;
+    threadId: string;
+    prose: string;
+    alreadyHadAudio: boolean;
+  }): Promise<void> {
+    const decision = shouldSpeakReply({
+      enabled: isThreadTtsEnabled(this.config, opts.threadId),
+      apiKey: this.config.SEAM_GEMINI_API_KEY,
+      prose: opts.prose,
+      alreadyHadAudio: opts.alreadyHadAudio,
+      turnOk: true,
+    });
+    if (!decision.speak) return;
+    if (!this.adapter.sendFile) return;
+    try {
+      const spoken = await speakReplyToOgg({
+        apiKey: this.config.SEAM_GEMINI_API_KEY,
+        text: decision.text,
+        model: this.config.SEAM_GEMINI_TTS_MODEL,
+        voice:
+          resolveThreadTtsVoice(this.config, opts.threadId) ??
+          this.config.SEAM_GEMINI_TTS_VOICE,
+      });
+      if (!spoken.ok) {
+        this.logger.warn({ err: spoken.error, threadId: opts.threadId }, "outbound TTS failed");
+        await this.adapter.sendMessage(
+          opts.channel,
+          `_Couldn't speak this reply:_ ${spoken.error}`
+        );
+        return;
+      }
+      await this.adapter.sendFile(opts.channel, {
+        data: Buffer.from(spoken.ogg),
+        filename: spoken.filename,
+        mimeType: spoken.mimeType,
+      });
+    } catch (err) {
+      this.logger.warn({ err, threadId: opts.threadId }, "outbound TTS threw");
+      await this.adapter.sendMessage(
+        opts.channel,
+        `_Couldn't speak this reply:_ unexpected error`
+      ).catch(() => {});
+    }
   }
 
   /**

@@ -31,6 +31,8 @@ function describeConfig(record: SessionRecord): ConfigDescription {
     permission: { value: "ask", source: "default" },
     locked: false,
     detached: { value: false, source: "default" },
+    tts: { value: false, source: "default" },
+    ttsVoice: { value: null, source: "default" },
     location: { value: "local", source: "default" },
   };
 }

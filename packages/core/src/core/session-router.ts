@@ -111,6 +111,12 @@ export interface ConfigDescription {
    */
   detached: ResolvedSetting<boolean>;
   /**
+   * Outbound TTS for this thread. Default off. Thread-preset only.
+   */
+  tts: ResolvedSetting<boolean>;
+  /** Per-thread Gemini TTS voice. `null` = env default (usually Kore). */
+  ttsVoice: ResolvedSetting<string | null>;
+  /**
    * Host binding (D10 / #86). `local` is the default when the thread preset
    * omits `location`. Always a ResolvedSetting so config_describe can show it.
    */
@@ -287,6 +293,14 @@ export class SessionRouter {
       ? { value: true, source: "thread preset" }
       : { value: false, source: "default" };
 
+    const tts: ResolvedSetting<boolean> = thread?.tts
+      ? { value: true, source: "thread preset" }
+      : { value: false, source: "default" };
+
+    const ttsVoice: ResolvedSetting<string | null> = thread?.ttsVoice
+      ? { value: thread.ttsVoice, source: "thread preset" }
+      : { value: null, source: "default" };
+
     const locationValue = resolveThreadLocation(
       { threadPresets: this.threadPresets },
       record.channelRef
@@ -311,6 +325,8 @@ export class SessionRouter {
       permission,
       locked: chan?.locked ?? false,
       detached,
+      tts,
+      ttsVoice,
       location,
       rider,
       ...(effortIgnoredNote ? { effortIgnoredNote } : {}),

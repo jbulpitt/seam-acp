@@ -795,9 +795,10 @@ const TOOLS = [
       "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.\n" +
       "- session: your thread's own runtime config (agent, model, effort, cwd, permission).\n" +
       "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target).\n" +
-      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/detached/location). " +
+      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/detached/location/tts). " +
       "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider. " +
-      "`detached:true` stops treating this thread as a session (no bot replies; does not delete history).\n" +
+      "`detached:true` stops treating this thread as a session (no bot replies; does not delete history). " +
+      "`tts:true` speaks each completed turn as an ogg attachment (default off).\n" +
       "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider). " +
       "Applies to EVERY thread under the channel. May be disabled by the deployment; `locked` can NEVER be changed.\n" +
       "- schedule: create/update/enable/disable/delete a scheduled prompt for THIS thread. Translate the " +
@@ -904,6 +905,19 @@ const TOOLS = [
               description:
                 "Host this thread's agent runs on: \"local\" (default) or a paired bridge id. " +
                 "Omit / empty / \"local\" ⇒ loopback. Changing location starts a fresh session on that host.",
+            },
+            tts: {
+              type: "boolean",
+              description:
+                "If true, after each completed turn seam synthesizes the visible reply " +
+                "with Gemini TTS and attaches an ogg. false / omit = off (the default). " +
+                "Thread-only — does not restart the session.",
+            },
+            ttsVoice: {
+              type: "string",
+              description:
+                "Gemini prebuilt TTS voice name (Kore, Puck, …). Empty string clears " +
+                "back to the env default. Preview: https://aistudio.google.com/generate-speech",
             },
           },
         },
@@ -1964,6 +1978,8 @@ export class SeamMcpServer {
       line("cwd:", d.cwd.value, d.cwd.source),
       line("permission:", d.permission.value, d.permission.source),
       line("detached:", d.detached.value ? "true" : "false", d.detached.source),
+      line("tts:", d.tts.value ? "true" : "false", d.tts.source),
+      line("tts voice:", d.ttsVoice.value ?? "(unset)", d.ttsVoice.source),
       line("location:", d.location?.value ?? "local", d.location?.source ?? "default"),
     ];
     if (d.rider?.channel || d.rider?.thread) {

@@ -12,7 +12,7 @@ import {
  *
  *   TOP-LEVEL (5): cancel, steer, new, workflows, queue
  *   GROUPS (8):
- *     config   (14) model effort agent mode repo tools approve reset init detach show edit set audit
+ *     config   (15) model effort agent mode repo tools approve reset init detach tts show edit set audit
  *     info     (6)  whoami usage avatar help sessions repos
  *     schedule (7)  unchanged
  *     preset   (7)  list create apply delete show edit thread
@@ -275,6 +275,25 @@ export function buildSeamCommand(): SlashCommandBuilder {
                 { name: "detached", value: "detached" },
                 { name: "attached", value: "attached" }
               )
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("tts")
+          .setDescription("Speak this thread's completed replies as an ogg attachment (default off)")
+          .addStringOption((o) =>
+            o
+              .setName("state")
+              .setDescription("on = attach a spoken copy after each turn; off = text only")
+              .setRequired(true)
+              .addChoices({ name: "on", value: "on" }, { name: "off", value: "off" })
+          )
+          .addStringOption((o) =>
+            o
+              .setName("voice")
+              .setDescription("Gemini TTS voice (autocomplete; preview at aistudio.google.com/generate-speech)")
+              .setRequired(false)
+              .setAutocomplete(true)
           )
       )
       .addSubcommand((sub) =>

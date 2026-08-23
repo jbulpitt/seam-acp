@@ -437,6 +437,8 @@ describe("snapshotFromDescribe keeps rider from describeConfig", () => {
       permission: setting("ask", "default"),
       locked: false,
       detached: setting(false, "default"),
+      tts: setting(false, "default"),
+      ttsVoice: setting(null, "default"),
       location: setting("local", "default"),
       rider: { channel: "ch", thread: "th" },
     };

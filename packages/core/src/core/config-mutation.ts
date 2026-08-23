@@ -124,7 +124,8 @@ export interface ChannelPresetChanges {
  *  `detached` (#80) is a RAW boolean (not `{value:true}`): true = this thread
  *  is not a session (no bot replies); false omits the key (re-attach).
  *  `location` (#86 / D10) is a RAW string (not `{value}`): omit / `"local"`
- *  means the loopback host; a bridge id pins the thread to that host. */
+ *  means the loopback host; a bridge id pins the thread to that host.
+ *  `tts` is a RAW boolean: true = speak each completed turn; false omits the key. */
 export interface ThreadPresetChanges {
   agent?: string | null;
   model?: string | null;
@@ -133,6 +134,9 @@ export interface ThreadPresetChanges {
   rider?: string | null;
   detached?: boolean;
   location?: string | null;
+  tts?: boolean;
+  /** Raw Gemini TTS voice name. `null` clears back to the env default. */
+  ttsVoice?: string | null;
 }
 
 /** Tier D — a scheduled prompt bound to the calling thread (#69).
@@ -1384,6 +1388,40 @@ export class ConfigMutationService {
       }
     }
 
+    // Outbound TTS: RAW boolean like detached. `true` writes the key; `false` omits it.
+    if (changes.tts !== undefined) {
+      const beforeTts = current.tts === true;
+      const afterTts = changes.tts === true;
+      if (beforeTts !== afterTts) {
+        if (afterTts) next.tts = true;
+        else delete next.tts;
+        fields.push({
+          label: "tts",
+          before: beforeTts ? "true" : "false",
+          after: afterTts ? "true" : "false",
+        });
+      }
+    }
+
+    if (changes.ttsVoice !== undefined) {
+      const beforeVoice =
+        typeof current.ttsVoice === "string" && current.ttsVoice.trim()
+          ? current.ttsVoice.trim()
+          : "";
+      const requested = changes.ttsVoice;
+      const afterVoice =
+        requested === null || requested === "" ? "" : requested.trim();
+      if (beforeVoice !== afterVoice) {
+        if (afterVoice) next.ttsVoice = afterVoice;
+        else delete next.ttsVoice;
+        fields.push({
+          label: "ttsVoice",
+          before: beforeVoice || "(unset)",
+          after: afterVoice || "(unset)",
+        });
+      }
+    }
+
     if (fields.length === 0) {
       return { ok: false, error: "No effective change to this thread's preset." };
     }
@@ -1419,7 +1457,9 @@ export class ConfigMutationService {
       // Detach is a message-gate, not a session-config change. A detached-only
       // write must not restart/invalidate; slash abort-on-detach handles an
       // in-flight turn separately. Mixed with rider/effort/etc. still restarts.
-      restartsSession: !fields.every((f) => f.label === "detached"),
+      restartsSession: !fields.every(
+        (f) => f.label === "detached" || f.label === "tts" || f.label === "ttsVoice"
+      ),
       // location changes pin the session to a different host (D2) — restart.
       apply: (actor) => {
         // Serialize the FULL candidate document and swap atomically (temp+rename),

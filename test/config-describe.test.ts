@@ -179,6 +179,28 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
     expect(d.detached).toEqual({ value: false, source: "default" });
   });
 
+  it("reports tts:true sourced from the thread preset", () => {
+    const threadPresets = new Map<string, ThreadPreset>([["thread-1", { tts: true }]]);
+    const router = makeRouter({ threadPresets });
+    const d = router.describeConfig(makeRecord());
+    expect(d.tts).toEqual({ value: true, source: "thread preset" });
+  });
+
+  it("reports tts:false from default", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(makeRecord());
+    expect(d.tts).toEqual({ value: false, source: "default" });
+  });
+
+  it("reports ttsVoice from the thread preset", () => {
+    const threadPresets = new Map<string, ThreadPreset>([
+      ["thread-1", { tts: true, ttsVoice: "Puck" }],
+    ]);
+    const router = makeRouter({ threadPresets });
+    const d = router.describeConfig(makeRecord());
+    expect(d.ttsVoice).toEqual({ value: "Puck", source: "thread preset" });
+  });
+
   it("default location is local when the thread preset omits it (#86)", () => {
     const router = makeRouter();
     const d = router.describeConfig(makeRecord());

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isThreadDetached, PresetsFileSchema, resolveThreadLocation } from "../packages/core/src/config.js";
+import { isThreadDetached, isThreadTtsEnabled, PresetsFileSchema, resolveThreadLocation } from "../packages/core/src/config.js";
 import type { ThreadPreset } from "../packages/core/src/config.js";
 
 describe("isThreadDetached (#80)", () => {
@@ -21,6 +21,20 @@ describe("isThreadDetached (#80)", () => {
   it("returns true when the thread preset has detached: true", () => {
     const presets = new Map<string, ThreadPreset>([["111", { detached: true }]]);
     expect(isThreadDetached({ threadPresets: presets }, "111")).toBe(true);
+  });
+});
+
+describe("isThreadTtsEnabled", () => {
+  it("defaults off", () => {
+    expect(isThreadTtsEnabled({ threadPresets: new Map() }, "111")).toBe(false);
+    const explicitFalse = new Map<string, ThreadPreset>([["111", { tts: false }]]);
+    expect(isThreadTtsEnabled({ threadPresets: explicitFalse }, "111")).toBe(false);
+  });
+
+  it("is on only when the thread preset has tts: true", () => {
+    const presets = new Map<string, ThreadPreset>([["111", { tts: true }]]);
+    expect(isThreadTtsEnabled({ threadPresets: presets }, "111")).toBe(true);
+    expect(isThreadTtsEnabled({ threadPresets: presets }, "222")).toBe(false);
   });
 });
 
@@ -49,6 +63,45 @@ describe("PresetsFileSchema detached (#80)", () => {
       channels: { "111111111111111111": { locked: true, detached: true } },
     });
     expect(parsed.success).toBe(false);
+  });
+});
+
+describe("PresetsFileSchema tts", () => {
+  it("accepts a thread entry with only {tts:true}", () => {
+    const parsed = PresetsFileSchema.safeParse({
+      threads: { "111111111111111111": { tts: true } },
+    });
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(parsed.data.threads["111111111111111111"].tts).toBe(true);
+  });
+
+  it("defaults omitted tts to false", () => {
+    const parsed = PresetsFileSchema.safeParse({
+      threads: { "222222222222222222": { rider: { value: "homework" } } },
+    });
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(parsed.data.threads["222222222222222222"].tts).toBe(false);
+  });
+
+  it("rejects a CHANNEL entry with tts (must not blast spoken replies)", () => {
+    const parsed = PresetsFileSchema.safeParse({
+      channels: { "111111111111111111": { locked: true, tts: true } },
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("accepts a thread ttsVoice and rejects it on a channel", () => {
+    const ok = PresetsFileSchema.safeParse({
+      threads: { "111111111111111111": { tts: true, ttsVoice: "Puck" } },
+    });
+    expect(ok.success).toBe(true);
+    if (ok.success) expect(ok.data.threads["111111111111111111"].ttsVoice).toBe("Puck");
+    const bad = PresetsFileSchema.safeParse({
+      channels: { "111111111111111111": { ttsVoice: "Puck" } },
+    });
+    expect(bad.success).toBe(false);
   });
 });
 

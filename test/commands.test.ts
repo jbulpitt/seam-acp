@@ -62,7 +62,7 @@ describe("/seam slash command", () => {
     }
   });
 
-  it("config group has the 14 config leaves including detach and edit", () => {
+  it("config group has the 15 config leaves including detach, tts, and edit", () => {
     const config = built().options?.find((o) => o.name === "config");
     expect(config?.type).toBe(SUB_COMMAND_GROUP);
     const names = (config?.options ?? []).map((o) => o.name);
@@ -77,16 +77,25 @@ describe("/seam slash command", () => {
       "reset",
       "init",
       "detach",
+      "tts",
       "show",
       "edit",
       "set",
       "audit",
     ]);
-    expect(names).toHaveLength(14);
+    expect(names).toHaveLength(15);
     const detach = (config?.options ?? []).find((o) => o.name === "detach");
     const state = detach?.options?.find((o) => o.name === "state");
     expect(state?.type).toBe(STRING);
     expect(state?.required).toBe(true);
+    const tts = (config?.options ?? []).find((o) => o.name === "tts");
+    const ttsState = tts?.options?.find((o) => o.name === "state");
+    expect(ttsState?.type).toBe(STRING);
+    expect(ttsState?.required).toBe(true);
+    const ttsVoice = tts?.options?.find((o) => o.name === "voice");
+    expect(ttsVoice?.type).toBe(STRING);
+    expect(ttsVoice?.required ?? false).toBe(false);
+    expect(ttsVoice?.autocomplete).toBe(true);
   });
 
   it("info group has 6 leaves (sessions/repos moved in; config-audit moved out)", () => {

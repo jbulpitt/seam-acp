@@ -14,6 +14,8 @@ docs/
 # Playwright MCP scratch outputs
 .playwright-mcp/
 *.png
+# ...but agent brand logos (status-card icons) ARE tracked
+!assets/agents/*.png
 
 # Untracked dev artifacts
 test-file.txt

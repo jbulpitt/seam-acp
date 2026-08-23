@@ -38,6 +38,8 @@ describe("Gemini TTS voices", () => {
     expect(input).toMatch(/slowly/i);
     expect(input).toMatch(/Warm, friendly/i);
     expect(input).toContain("TRANSCRIPT:\nHello there");
+    expect(input).toMatch(/name the site or page/i);
+    expect(input).toMatch(/do not read the address/i);
   });
 
   it("caches voice samples under DATA_DIR", () => {

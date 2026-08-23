@@ -207,6 +207,8 @@ function makeOrch(opts: {
     getReportBackByCorrelation: () => null,
     tryRecordReportBack: (e: unknown) => e,
     readConfig: () => opts.cfg ?? { model: "opus", reasoningEffort: "high" },
+    getByChannel: () => record(),
+    getParkedByChannel: () => null,
   };
   const config = {
     DATA_DIR: opts.dataDir,

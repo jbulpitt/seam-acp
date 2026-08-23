@@ -105,7 +105,7 @@ Discord has no aliases; old invocations disappear.
 **Top-level (5):** `cancel`, `steer`, `new`, `workflows`, `queue`
 
 **Groups (8):**
-- `config` (15): `model` `effort` `agent` `mode` `repo` `tools` `approve` `reset` `init` `detach` `tts` `show` `edit` `set` `audit`
+- `config` (16): `model` `effort` `agent` `mode` `repo` `tools` `approve` `card` `reset` `init` `detach` `tts` `show` `edit` `set` `audit`
 - `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
 - `schedule` (7), `preset` (6), `project` (3) — unchanged
 - `upload` (3): `pull` `push` `secret` — **admin-only**. Hard cutover of `/seam attach`.

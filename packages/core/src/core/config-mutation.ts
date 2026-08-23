@@ -36,13 +36,15 @@ import type { AgentProfile } from "@seam/adapters";
 import type { ConfigDescription } from "./session-router.js";
 import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
 import type { ScheduledPrompt } from "./scheduled-prompts/types.js";
-import type {
-  ConfigAuditEntry,
-  ConfigAuditInput,
-  PermissionPolicyMode,
-  Preset,
-  SessionConfigState,
-  SessionRecord,
+import {
+  parseStatusCardStyle,
+  type ConfigAuditEntry,
+  type ConfigAuditInput,
+  type PermissionPolicyMode,
+  type Preset,
+  type SessionConfigState,
+  type SessionRecord,
+  type StatusCardStyle,
 } from "./types.js";
 
 /** Config surface a single proposal touches. */
@@ -70,6 +72,8 @@ export interface SessionConfigChanges {
   availableTools?: string[] | null;
   /** Tool blocklist (`/seam tools exclude`). Empty array or `null` clears it. */
   excludedTools?: string[] | null;
+  /** Status-card layout (#96). `null` clears back to default `"full"`. */
+  statusCardStyle?: StatusCardStyle | null;
 }
 
 /** Tier B — a preset in the calling thread's project scope.
@@ -99,6 +103,8 @@ export interface PresetChanges {
    *  it as `<seam-worker-identity name="…">…</seam-worker-identity>` when the
    *  preset runs as a handoff/dispatch worker (#23). `null` clears it. */
   instructions?: string | null;
+  /** Status-card layout baked into this preset. `null` clears (preset does not pin it). */
+  statusCardStyle?: StatusCardStyle | null;
 }
 
 /** Tier C — the calling thread's OWN channel preset (channel-presets.json).
@@ -787,6 +793,27 @@ export class ConfigMutationService {
       nextCfg.excludedTools = toolListField("excludedTools", cfg.excludedTools, changes.excludedTools);
     }
 
+    if (changes.statusCardStyle !== undefined) {
+      const rawStyle = changes.statusCardStyle as unknown;
+      if (rawStyle === null || rawStyle === "") {
+        delete nextCfg.statusCardStyle;
+      } else {
+        const parsed = parseStatusCardStyle(rawStyle);
+        if (!parsed) {
+          return {
+            ok: false,
+            error: `Invalid statusCardStyle "${String(rawStyle)}". One of: full, simple.`,
+          };
+        }
+        nextCfg.statusCardStyle = parsed;
+      }
+      const beforeStyle = cfg.statusCardStyle ?? "(default)";
+      const afterStyle = nextCfg.statusCardStyle ?? "(default)";
+      if (beforeStyle !== afterStyle) {
+        fields.push({ label: "statusCardStyle", before: String(beforeStyle), after: String(afterStyle) });
+      }
+    }
+
     if (fields.length === 0) {
       return {
         ok: false,
@@ -921,6 +948,24 @@ export class ConfigMutationService {
         : changes.instructions !== undefined
           ? (changes.instructions.trim() || null)
           : (existing?.instructions ?? null);
+    let nextStatusCardStyle: StatusCardStyle | null;
+    if (changes.statusCardStyle === undefined) {
+      nextStatusCardStyle = existing?.statusCardStyle ?? null;
+    } else {
+      const rawStyle = changes.statusCardStyle as unknown;
+      if (rawStyle === null || rawStyle === "") {
+        nextStatusCardStyle = null;
+      } else {
+        const parsed = parseStatusCardStyle(rawStyle);
+        if (!parsed) {
+          return {
+            ok: false,
+            error: `Invalid statusCardStyle "${String(rawStyle)}". One of: full, simple.`,
+          };
+        }
+        nextStatusCardStyle = parsed;
+      }
+    }
 
     if (nextEffort) {
       const profile = nextAgentId ? this.deps.profiles.get(nextAgentId) : undefined;
@@ -949,6 +994,7 @@ export class ConfigMutationService {
     field("repoPath", existing?.repoPath ?? null, nextRepoPath);
     field("toolsAllow", listStr(existing?.toolsAllow ?? null), listStr(nextToolsAllow));
     field("toolsExclude", listStr(existing?.toolsExclude ?? null), listStr(nextToolsExclude));
+    field("statusCardStyle", existing?.statusCardStyle ?? null, nextStatusCardStyle);
     // instructions can be long/multiline — compare the FULL value so a change past
     // the clip point isn't hidden, but show only a clipped one-liner in the diff.
     if ((existing?.instructions ?? null) !== nextInstructions) {
@@ -988,6 +1034,7 @@ export class ConfigMutationService {
           toolsAllow: nextToolsAllow,
           toolsExclude: nextToolsExclude,
           instructions: nextInstructions,
+          statusCardStyle: nextStatusCardStyle,
           createdBy: existing?.createdBy ?? (actor.id ?? "seam-mcp"),
           createdUtc: existing?.createdUtc ?? now,
           updatedUtc: now,
@@ -1894,6 +1941,9 @@ export class ConfigMutationService {
       location: d.location
         ? { value: d.location.value, source: d.location.source }
         : { value: "local", source: "default" },
+      statusCardStyle: d.statusCardStyle
+        ? { value: d.statusCardStyle.value, source: d.statusCardStyle.source }
+        : { value: "full", source: "default" },
     };
   }
 
@@ -1913,6 +1963,7 @@ export class ConfigMutationService {
       toolsAllow: p.toolsAllow,
       toolsExclude: p.toolsExclude,
       instructions: p.instructions,
+      statusCardStyle: p.statusCardStyle ?? null,
     };
   }
 

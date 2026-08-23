@@ -1809,6 +1809,7 @@ describe("config_describe", () => {
     ttsPace: { value: "natural" as const, source: "default" as const },
     ttsStyle: { value: "neutral" as const, source: "default" as const },
     location: { value: "local", source: "default" as const },
+    statusCardStyle: { value: "full" as const, source: "default" as const },
   };
 
   async function makeDescribeServer(): Promise<SeamMcpServer> {

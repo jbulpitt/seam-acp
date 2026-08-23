@@ -10,6 +10,7 @@ import {
   type ChainStatus,
   type PermissionPolicyMode,
   type Preset,
+  parseStatusCardStyle,
   DELEGATION_ACTIVE_STATUSES,
   PROMPT_PREVIEW_MAX,
   type DelegationKind,
@@ -97,6 +98,7 @@ CREATE TABLE IF NOT EXISTS presets (
   permission    TEXT,
   tools_json    TEXT,
   instructions  TEXT,
+  status_card_style TEXT,
   created_by    TEXT NOT NULL,
   created_utc   TEXT NOT NULL,
   updated_utc   TEXT NOT NULL
@@ -207,6 +209,7 @@ interface PresetRow {
   permission: string | null;
   tools_json: string | null;
   instructions: string | null;
+  status_card_style: string | null;
   created_by: string;
   created_utc: string;
   updated_utc: string;
@@ -240,6 +243,7 @@ const mapPreset = (r: PresetRow): Preset => {
     toolsAllow,
     toolsExclude,
     instructions: r.instructions,
+    statusCardStyle: parseStatusCardStyle(r.status_card_style) ?? null,
     createdBy: r.created_by,
     createdUtc: r.created_utc,
     updatedUtc: r.updated_utc,
@@ -283,7 +287,17 @@ export class SessionStore {
     }
     this.migrateWakeFireOnStartup();
     this.migrateInboxPriority();
+    this.migratePresetStatusCardStyle();
     this.migratePresetsScope();
+  }
+
+  /** #96: additive status_card_style on presets. Null = preset does not pin it. */
+  private migratePresetStatusCardStyle(): void {
+    try {
+      this.db.exec("ALTER TABLE presets ADD COLUMN status_card_style TEXT");
+    } catch {
+      /* column already exists */
+    }
   }
 
   /** #92: ingest token + result waiter tables. Idempotent ALTERs. */
@@ -482,17 +496,18 @@ export class SessionStore {
             permission    TEXT,
             tools_json    TEXT,
             instructions  TEXT,
+            status_card_style TEXT,
             created_by    TEXT NOT NULL,
             created_utc   TEXT NOT NULL,
             updated_utc   TEXT NOT NULL
           );
           INSERT INTO presets__migrate
             (id, name, project_ref, description, agent_id, model, effort,
-             repo_path, permission, tools_json, instructions, created_by,
-             created_utc, updated_utc)
+             repo_path, permission, tools_json, instructions, status_card_style,
+             created_by, created_utc, updated_utc)
           SELECT id, name, project_ref, description, agent_id, model, effort,
-                 repo_path, permission, tools_json, instructions, created_by,
-                 created_utc, updated_utc
+                 repo_path, permission, tools_json, instructions, status_card_style,
+                 created_by, created_utc, updated_utc
           FROM presets;
           DROP TABLE presets;
           ALTER TABLE presets__migrate RENAME TO presets;
@@ -715,12 +730,12 @@ export class SessionStore {
       .prepare(
         `INSERT INTO presets
            (id, name, project_ref, description, agent_id, model, effort,
-            repo_path, permission, tools_json, instructions, created_by,
-            created_utc, updated_utc)
+            repo_path, permission, tools_json, instructions, status_card_style,
+            created_by, created_utc, updated_utc)
          VALUES
            (@id, @name, @projectRef, @description, @agentId, @model, @effort,
-            @repoPath, @permission, @toolsJson, @instructions, @createdBy,
-            @createdUtc, @updatedUtc)
+            @repoPath, @permission, @toolsJson, @instructions, @statusCardStyle,
+            @createdBy, @createdUtc, @updatedUtc)
          ON CONFLICT(id) DO UPDATE SET
            name         = excluded.name,
            project_ref  = excluded.project_ref,
@@ -732,6 +747,7 @@ export class SessionStore {
            permission   = excluded.permission,
            tools_json   = excluded.tools_json,
            instructions = excluded.instructions,
+           status_card_style = excluded.status_card_style,
            updated_utc  = excluded.updated_utc`
       )
       .run({
@@ -746,6 +762,7 @@ export class SessionStore {
         permission: p.permission,
         toolsJson,
         instructions: p.instructions,
+        statusCardStyle: p.statusCardStyle ?? null,
         createdBy: p.createdBy,
         createdUtc: p.createdUtc,
         updatedUtc: p.updatedUtc,

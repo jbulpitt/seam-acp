@@ -1,5 +1,10 @@
 import type { Renderer } from "../platforms/renderer.js";
-import type { TurnState, StatusPanel, StructuredPanel } from "./types.js";
+import type {
+  TurnState,
+  StatusPanel,
+  StatusCardStyle,
+  StructuredPanel,
+} from "./types.js";
 
 /**
  * Renders the single editable status panel that the bot keeps for each
@@ -22,10 +27,15 @@ export interface StatusPanelInput {
   action: string;
   /** Optional context-window line shown when tokens are known. */
   context?: string;
+  /** Integer percent of the context window used, when known. */
+  contextPct?: number;
   /** Recent activity (oldest → newest). */
   activity?: string[];
   /** Last few lines of model reasoning (oldest → newest). */
   thinking?: string[];
+  style?: StatusCardStyle;
+  brandFilename?: string;
+  authorName?: string;
 }
 
 export function renderStatusPanel(
@@ -47,8 +57,12 @@ export function renderStatusPanel(
     ...(input.titlePrefix ? { titlePrefix: input.titlePrefix } : {}),
     action: input.action,
     context: input.context,
+    ...(input.contextPct != null ? { contextPct: input.contextPct } : {}),
     activity: input.activity,
     thinking: input.thinking,
+    ...(input.style ? { style: input.style } : {}),
+    ...(input.brandFilename ? { brandFilename: input.brandFilename } : {}),
+    ...(input.authorName ? { authorName: input.authorName } : {}),
   };
   return renderer.statusPanel(panel);
 }
@@ -98,6 +112,12 @@ export class TurnStatus {
   contextWindowSize = 0;
   /** Rolling activity log (oldest → newest). Capped to last N entries. */
   activity: string[] = [];
+  /** `"simple"` compact layout; default `"full"`. */
+  style: StatusCardStyle = "full";
+  /** Brand logo filename for `attachment://` (set at turn start). */
+  brandFilename?: string;
+  /** Full-card author name (agent display name). */
+  authorName?: string;
   private static readonly MAX_ACTIVITY = 20;
   /** Last N complete lines of model reasoning (oldest → newest). */
   private thinkingLines: string[] = [];
@@ -110,11 +130,17 @@ export class TurnStatus {
     repoDisplay: string;
     effort?: string;
     titlePrefix?: string;
+    style?: StatusCardStyle;
+    brandFilename?: string;
+    authorName?: string;
   }) {
     this.model = opts.model;
     this.repoDisplay = opts.repoDisplay;
     if (opts.effort) this.effort = opts.effort;
     if (opts.titlePrefix) this.titlePrefix = opts.titlePrefix;
+    if (opts.style) this.style = opts.style;
+    if (opts.brandFilename) this.brandFilename = opts.brandFilename;
+    if (opts.authorName) this.authorName = opts.authorName;
     this.startedUtc = Date.now();
   }
 
@@ -198,6 +224,10 @@ export class TurnStatus {
 
   toInput(): StatusPanelInput {
     const thinking = this.thinkingWindow();
+    const contextPct =
+      this.contextWindowSize > 0
+        ? Math.round((this.contextUsedHighWater / this.contextWindowSize) * 100)
+        : undefined;
     return {
       state: this.state,
       startedUtc: this.startedUtc,
@@ -208,8 +238,12 @@ export class TurnStatus {
       ...(this.titlePrefix ? { titlePrefix: this.titlePrefix } : {}),
       action: this.action,
       context: this.context,
+      ...(contextPct != null ? { contextPct } : {}),
       activity: this.activity.length ? [...this.activity] : undefined,
       ...(thinking ? { thinking } : {}),
+      ...(this.style !== "full" ? { style: this.style } : {}),
+      ...(this.brandFilename ? { brandFilename: this.brandFilename } : {}),
+      ...(this.authorName ? { authorName: this.authorName } : {}),
     };
   }
 }

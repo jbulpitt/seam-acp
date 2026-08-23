@@ -234,6 +234,21 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
       .addSubcommand((sub) =>
         sub
+          .setName("card")
+          .setDescription("Get or set the status-card layout for this thread (full or simple)")
+          .addStringOption((o) =>
+            o
+              .setName("style")
+              .setDescription("full (default) | simple (compact, brand icon)")
+              .setRequired(false)
+              .addChoices(
+                { name: "full", value: "full" },
+                { name: "simple", value: "simple" }
+              )
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
           .setName("approve")
           .setDescription("Set permission policy for this thread")
           .addStringOption((o) =>

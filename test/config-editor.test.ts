@@ -10,6 +10,7 @@ import {
   currentThreadRiderText,
   decodeRiderUpload,
   dirtyPermission,
+  dirtyStatusCardStyle,
   dirtyThreadPresetChanges,
   isDirty,
   makeCustomId,
@@ -35,6 +36,7 @@ const WITHOUT: InheritedConfig = {
   cwd: "/repo/session",
   permission: "ask",
   detached: false,
+  statusCardStyle: "full",
 };
 
 function setting<T>(value: T, source: ConfigDescription["agent"]["source"]) {
@@ -50,6 +52,7 @@ function snapshot(over: Partial<ThreadConfigSnapshot> = {}): ThreadConfigSnapsho
     cwd: setting("/repo/session", "session config"),
     permission: setting("ask", "default"),
     detached: setting(false, "default"),
+    statusCardStyle: setting("full", "default"),
     rider: {},
     locked: false,
     withoutThread: { ...WITHOUT },
@@ -180,7 +183,7 @@ describe("hub render (#90)", () => {
       "Upload",
       "Attach",
     ]);
-    expect(panel.actions![2].map((b) => b.label)).toEqual(["Save", "Cancel"]);
+    expect(panel.actions![2].map((b) => b.label)).toEqual(["Save", "Cancel", "Card"]);
     expect(panel.actions![2][0]!.disabled).toBe(true);
   });
 
@@ -307,6 +310,31 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
       overlay: { permission: null },
     });
     expect(dirtyPermission(d)).toBeNull();
+  });
+
+  it("Card picker is on the hub and dirty style writes session config (#96)", () => {
+    const panel = renderHub(draft());
+    expect(panel.fields.find((f) => f.name === "Card")!.value).toMatch(/full/);
+    expect(panel.actions![2].find((b) => b.label === "Card")).toBeTruthy();
+    expect(panel.actions![2][0]!.label).toBe("Save");
+
+    const next = applyPickerValue(draft(), "card", "simple", caps);
+    expect(next.overlay.statusCardStyle).toBe("simple");
+    expect(dirtyStatusCardStyle(next)).toBe("simple");
+    const plan = buildSavePlan(next);
+    expect(plan.statusCardStyle).toBe("simple");
+    expect(plan.threadPreset).toEqual({});
+
+    const inherit = applyPickerValue(
+      draft({
+        snapshot: snapshot({ statusCardStyle: setting("simple", "session config") }),
+      }),
+      "card",
+      INHERIT_VALUE,
+      caps
+    );
+    expect(inherit.overlay.statusCardStyle).toBeNull();
+    expect(dirtyStatusCardStyle(inherit)).toBeNull();
   });
 
   it("Cancel is a no-op on the overlay (store delete; no mutation payload)", () => {
@@ -443,6 +471,7 @@ describe("snapshotFromDescribe keeps rider from describeConfig", () => {
       ttsStyle: setting("neutral", "default"),
       location: setting("local", "default"),
       rider: { channel: "ch", thread: "th" },
+      statusCardStyle: setting("full", "default"),
     };
     const snap = snapshotFromDescribe(d, WITHOUT);
     expect(snap.rider).toEqual({ channel: "ch", thread: "th" });

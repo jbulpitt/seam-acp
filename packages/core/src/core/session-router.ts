@@ -2,7 +2,7 @@ import { AgentRuntime } from "../agents/agent-runtime.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore } from "./session-store.js";
-import type { SessionRecord, PermissionPolicyMode } from "./types.js";
+import type { SessionRecord, PermissionPolicyMode, StatusCardStyle } from "./types.js";
 import { defaultSessionConfig, resolvePermissionMode } from "./types.js";
 import { makeSessionId } from "./session-store.js";
 import { resolveChannelPreset, resolveThreadLocation } from "../config.js";
@@ -136,6 +136,11 @@ export interface ConfigDescription {
    * keeps `config_describe` from reporting a personality the agent won't deliver.
    */
   effortIgnoredNote?: string;
+  /**
+   * Status-card layout (#96). Session JSON only (named presets copy in on apply).
+   * Default `"full"`.
+   */
+  statusCardStyle: ResolvedSetting<StatusCardStyle>;
 }
 
 /**
@@ -326,6 +331,11 @@ export class SessionRouter {
       ...(thread?.rider?.value ? { thread: thread.rider.value } : {}),
     };
 
+    const statusCardStyle: ResolvedSetting<StatusCardStyle> =
+      cfg.statusCardStyle === "simple" || cfg.statusCardStyle === "full"
+        ? { value: cfg.statusCardStyle, source: "session config" }
+        : { value: "full", source: "default" };
+
     return {
       sessionId: record.id,
       channelRef: record.channelRef,
@@ -343,6 +353,7 @@ export class SessionRouter {
       ttsStyle,
       location,
       rider,
+      statusCardStyle,
       ...(effortIgnoredNote ? { effortIgnoredNote } : {}),
     };
   }

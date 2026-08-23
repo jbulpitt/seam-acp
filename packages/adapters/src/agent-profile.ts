@@ -87,6 +87,14 @@ export interface AgentAdapter {
   /** Human-readable name. */
   readonly displayName: string;
 
+  /**
+   * Status-card brand key (#96): names the *service*, not the harness.
+   * Default resolution groups `copilot*`/`claude*` and overrides non-Anthropic
+   * Claude-harness profiles (`zai`→`z-ai`, `ollama-cloud`, `claude-vertex`→`vertex`).
+   * Set this to pin a logo that the id-based resolver would get wrong.
+   */
+  readonly brand?: string;
+
   /** Default model id this agent should use unless the session overrides it. */
   readonly defaultModel: string;
 

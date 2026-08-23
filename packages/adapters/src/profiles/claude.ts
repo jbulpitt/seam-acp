@@ -101,6 +101,11 @@ export function makeClaudeProfile(opts: {
   compactionTokenThreshold?: number;
   /** Custom environment variables to inject into the spawned process environment. */
   extraEnv?: Record<string, string>;
+  /**
+   * Status-card brand key (#96). Override for Claude-harness profiles that
+   * are not Anthropic (zai → `z-ai`, ollama-cloud, claude-vertex → `vertex`).
+   */
+  brand?: string;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "claude-agent-acp";
   const configDir = opts.configDir?.trim() || undefined;
@@ -112,6 +117,7 @@ export function makeClaudeProfile(opts: {
   return asLocalAdapter({
     id: opts.id ?? "claude",
     displayName: opts.displayName ?? "Anthropic Claude",
+    ...(opts.brand ? { brand: opts.brand } : {}),
     defaultModel: opts.defaultModel,
     // Stamp each picker entry with its canonical contextLimit so the
     // orchestrator's staticModels→modelContextFloor path (used by every other

@@ -12,15 +12,6 @@ const COLOR_BY_STATE: Record<StatusPanel["state"], number> = {
   Monitoring: 0x1abc9c, // teal — resting, background work pending
 };
 
-const ICON_BY_STATE: Record<StatusPanel["state"], string> = {
-  Done: "✅",
-  Failed: "❌",
-  "Timed out": "⏱️",
-  Waiting: "⏸️",
-  Working: "⏳",
-  Monitoring: "💤",
-};
-
 function trim(s: string, max: number): string {
   const t = (s ?? "").trim();
   return t.length <= max ? t : `${t.slice(0, max)}…`;
@@ -78,9 +69,46 @@ function toolEmoji(label: string): string {
   return "⚙️";
 }
 
+function authorIcon(state: StatusPanel): { authorIconURL?: string } {
+  if (!state.brandFilename) return {};
+  return { authorIconURL: `attachment://${state.brandFilename}` };
+}
+
+function simpleFooter(state: StatusPanel): string {
+  const parts: string[] = [];
+  const latestTool = state.activity?.[state.activity.length - 1];
+  const latestThought = state.thinking?.[state.thinking.length - 1];
+  const head: string[] = [];
+  if (latestTool) head.push(toolEmoji(latestTool));
+  if (latestThought) {
+    head.push(`💡 ${trim(latestThought.replace(/[*_`]/g, ""), 200)}`);
+  }
+  if (head.length > 0) parts.push(head.join(" "));
+  parts.push(`⏱ ${state.elapsedSeconds}s`);
+  const pct =
+    state.contextPct ??
+    (state.context ? Number((/\((\d+)%\)/.exec(state.context) ?? [])[1]) : undefined);
+  if (pct != null && Number.isFinite(pct)) parts.push(`🪟 ${pct}%`);
+  return parts.join(" • ");
+}
+
 export const discordRenderer: Renderer = {
   statusPanel(state): StructuredPanel {
-    const icon = ICON_BY_STATE[state.state];
+    const simple = state.style === "simple";
+
+    if (simple) {
+      const title = state.titlePrefix
+        ? `${state.titlePrefix} · ${state.state}`
+        : undefined;
+      return {
+        color: COLOR_BY_STATE[state.state],
+        ...(title ? { title } : {}),
+        author: state.state,
+        ...authorIcon(state),
+        fields: [],
+        footer: simpleFooter(state),
+      };
+    }
 
     // --- fields (all inline) ---
     const modelValue =
@@ -120,9 +148,14 @@ export const discordRenderer: Renderer = {
       ? `${state.titlePrefix} · ${state.state}`
       : state.state;
 
+    const authorName = state.authorName?.trim();
     return {
       color: COLOR_BY_STATE[state.state],
       title,
+      ...(authorName || state.brandFilename
+        ? { author: authorName || state.state }
+        : {}),
+      ...authorIcon(state),
       fields,
       description,
       footer: footerParts.join("\n"),

@@ -334,9 +334,15 @@ import {
   type PermissionPolicyMode,
   type Preset,
   type SessionConfigState,
+  type StatusCardStyle,
   type StructuredPanel,
   type TurnState,
 } from "../../core/types.js";
+import {
+  loadBrandAsset,
+  resolveAgentBrand,
+  withBrandAttachment,
+} from "../../core/agent-brand.js";
 import type { DiscordAdapter } from "./adapter.js";
 import { resolveDiscordSpeakerName } from "./adapter.js";
 
@@ -994,10 +1000,16 @@ export class Orchestrator {
 
     const cfg = this.store.readConfig(record);
     const repoDisplay = this.repoDisplay(record.repoPath);
+    const turnProfile = this.router.getProfile(record.agentId);
+    const brand = resolveAgentBrand(record.agentId, turnProfile?.brand);
+    const brandAsset = loadBrandAsset(brand);
     const status = new TurnStatus({
       model: cfg.model ?? this.config.DEFAULT_MODEL,
       repoDisplay,
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+      style: cfg.statusCardStyle === "simple" ? "simple" : "full",
+      ...(brandAsset ? { brandFilename: brandAsset.filename } : {}),
+      authorName: turnProfile?.displayName ?? brand,
     });
 
     // Seed the status panel with the last-known usage from the previous turn,
@@ -1011,7 +1023,6 @@ export class Orchestrator {
     // contextLimit — e.g. opencode/Ollama, discovered from /api/show). Some
     // agents report a generic default (~200K) in usage_update regardless of the
     // real window; use this as a FLOOR so the panel shows the true size.
-    const turnProfile = this.router.getProfile(record.agentId);
     // Look up the authoritative context window from static models.  When
     // claude-agent-acp is pointed at a non-Anthropic backend (Ollama Cloud,
     // Z.ai) it reports its *internal* Claude model name, not the real model.
@@ -1036,7 +1047,10 @@ export class Orchestrator {
       status.context = formatContextUsage(status.contextUsedHighWater, modelContextFloor);
     }
 
-    const initialPanel = renderStatusPanel(this.renderer, status.toInput(), Date.now());
+    const initialPanel = withBrandAttachment(
+      renderStatusPanel(this.renderer, status.toInput(), Date.now()),
+      brandAsset
+    );
     const statusMsg = this.adapter.sendPanel
       ? await this.adapter.sendPanel(channel, initialPanel)
       : await this.adapter.sendMessage(channel, serializePanelText(initialPanel));
@@ -2335,6 +2349,8 @@ export class Orchestrator {
           return this.cmdTools(interaction);
         case "approve":
           return this.cmdApprove(interaction);
+        case "card":
+          return this.cmdStatusCard(interaction);
         case "reset":
           return this.cmdReset(interaction);
         case "init":
@@ -5903,11 +5919,25 @@ export class Orchestrator {
       resolved.profile?.staticModels?.find((m) => m.modelId === resolved.model)?.contextLimit
         ?? resolved.profile?.staticModels?.find((m) => m.modelId === resolved.profile?.defaultModel)?.contextLimit
         ?? 0;
+    const destRecord =
+      typeof this.store.getByChannel === "function"
+        ? this.store.getByChannel(target.platform, target.id)
+        : null;
+    const destStyle: StatusCardStyle =
+      destRecord && this.store.readConfig(destRecord).statusCardStyle === "simple"
+        ? "simple"
+        : "full";
+    const dispatchAgentId = resolved.profile?.id ?? destRecord?.agentId ?? "";
+    const dispatchBrand = resolveAgentBrand(dispatchAgentId, resolved.profile?.brand);
+    const dispatchBrandAsset = loadBrandAsset(dispatchBrand);
     const status = new TurnStatus({
       model: resolved.model,
       repoDisplay,
       ...(resolved.effort ? { effort: resolved.effort } : {}),
       titlePrefix: this.dispatchPanelTitle(spec.kind, !!spec.chainId),
+      style: destStyle,
+      ...(dispatchBrandAsset ? { brandFilename: dispatchBrandAsset.filename } : {}),
+      authorName: resolved.profile?.displayName ?? dispatchBrand,
     });
     status.setAction("Thinking…");
     // Seed context (live only). Invalidate on model mismatch, exactly like the
@@ -5938,9 +5968,10 @@ export class Orchestrator {
         // adapter lacks sendPanel/editPanel, mirroring the normal path.
         post: async (panel) => {
           try {
+            const toSend = withBrandAttachment(panel, dispatchBrandAsset);
             return this.adapter.sendPanel
-              ? await this.adapter.sendPanel(target, panel)
-              : await this.adapter.sendMessage(target, serializePanelText(panel));
+              ? await this.adapter.sendPanel(target, toSend)
+              : await this.adapter.sendMessage(target, serializePanelText(toSend));
           } catch (err) {
             this.logger.warn({ err, dispatch: spec.id }, "dispatch: status panel post failed");
             return undefined;
@@ -8315,6 +8346,7 @@ export class Orchestrator {
       cwd: chan?.cwd?.value ?? record.repoPath ?? this.config.REPOS_ROOT,
       permission,
       detached: false,
+      statusCardStyle: "full",
     };
   }
 
@@ -8574,7 +8606,7 @@ export class Orchestrator {
         return;
       }
     }
-    if (plan.permission !== undefined) {
+    if (plan.permission !== undefined || plan.statusCardStyle !== undefined) {
       const record = this.router.ensureSessionRecord({
         platform: "discord",
         channelRef: draft.threadId,
@@ -8582,12 +8614,21 @@ export class Orchestrator {
         cwd: this.config.REPOS_ROOT,
       });
       const cfg = this.store.readConfig(record);
-      if (plan.permission === null) {
-        delete cfg.permissionPolicy;
-      } else {
-        cfg.permissionPolicy = plan.permission;
+      if (plan.permission !== undefined) {
+        if (plan.permission === null) {
+          delete cfg.permissionPolicy;
+        } else {
+          cfg.permissionPolicy = plan.permission;
+        }
+        delete cfg.autoApprovePermissions;
       }
-      delete cfg.autoApprovePermissions;
+      if (plan.statusCardStyle !== undefined) {
+        if (plan.statusCardStyle === null) {
+          delete cfg.statusCardStyle;
+        } else {
+          cfg.statusCardStyle = plan.statusCardStyle;
+        }
+      }
       this.persistConfig(record, cfg);
     }
     // D10: do NOT abort or invalidate a live turn. Overlay applies on next spawn.
@@ -8735,6 +8776,26 @@ export class Orchestrator {
           { value: "always", label: "always", description: "Auto-approve every request" },
           { value: "ask", label: "ask", description: "Prompt in Discord" },
           { value: "deny", label: "deny", description: "Auto-deny every request" },
+        ],
+        authorizedUserIds: owner,
+      });
+    } else if (action === "card") {
+      picked = await this.adapter.sendChoicePicker!(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: "🃏 Status card",
+          fields: [
+            {
+              name: "Current",
+              value: `\`${draft.snapshot.statusCardStyle.value}\``,
+              inline: true,
+            },
+          ],
+        },
+        choices: [
+          inherit,
+          { value: "full", label: "full", description: "Repo, model, action, effort, tool tags" },
+          { value: "simple", label: "simple", description: "State + brand icon + thought + elapsed" },
         ],
         authorizedUserIds: owner,
       });
@@ -11097,6 +11158,45 @@ export class Orchestrator {
     await i.reply({ content: messages[policy], flags: MessageFlags.Ephemeral });
   }
 
+  private async cmdStatusCard(i: ChatInputCommandInteraction): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const cfg = this.store.readConfig(record);
+    const current: StatusCardStyle = cfg.statusCardStyle === "simple" ? "simple" : "full";
+    const style = i.options.getString("style");
+    if (!style) {
+      await i.reply({
+        content:
+          `Status card: \`${current}\`. Set with \`/seam config card style:full|simple\`.` +
+          (current === "simple"
+            ? " Simple cards drop repo/model/action/effort and show the agent brand icon."
+            : ""),
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (style !== "full" && style !== "simple") {
+      await i.reply({
+        content: "Style must be `full` or `simple`.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (style === "full") delete cfg.statusCardStyle;
+    else cfg.statusCardStyle = "simple";
+    this.persistConfig(record, cfg);
+    await i.reply({
+      content:
+        style === "simple"
+          ? "Status card set to `simple` — compact layout with the agent brand icon. Applies on the next turn."
+          : "Status card set to `full` (default). Applies on the next turn.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   /**
    * Read a file from the host machine and post it to the channel as a
    * Discord attachment. The path must resolve under REPOS_ROOT or one
@@ -11510,6 +11610,7 @@ export class Orchestrator {
       "`/seam config repo [path]` — set working repo (picker if omitted; type a path to skip)",
       "`/seam config tools <allow|exclude> [list]` — tool filters",
       "`/seam config approve <always|ask|deny>` — permission policy",
+      "`/seam config card [full|simple]` — status-card layout (simple = compact + brand icon)",
       "`/seam config reset` — end this thread's ACP session; next message starts fresh",
       "`/seam config init` — bind this thread + start setup (repo picker, or full wizard)",
       "`/seam config detach <detached|attached>` — keep this thread session-less (no bot replies; does not delete history)",
@@ -13193,6 +13294,7 @@ export class Orchestrator {
     if (p.effort) parts.push(`Effort: ${p.effort}`);
     if (p.repoPath) parts.push(`Repo: ${this.repoDisplay(p.repoPath)}`);
     if (p.permission) parts.push(`Policy: ${p.permission}`);
+    if (p.statusCardStyle) parts.push(`Card: ${p.statusCardStyle}`);
     if (p.toolsAllow?.length) parts.push(`Allow: ${p.toolsAllow.join(", ")}`);
     if (p.toolsExclude?.length) parts.push(`Exclude: ${p.toolsExclude.join(", ")}`);
     if (p.instructions) parts.push("📝 Has instructions");
@@ -13358,6 +13460,7 @@ export class Orchestrator {
       toolsAllow: string[] | null;
       toolsExclude: string[] | null;
       instructions: string | null;
+      statusCardStyle: StatusCardStyle | null;
     } = {
       name: existing?.name ?? "",
       description: existing?.description ?? "",
@@ -13369,6 +13472,7 @@ export class Orchestrator {
       toolsAllow: existing?.toolsAllow ?? null,
       toolsExclude: existing?.toolsExclude ?? null,
       instructions: existing?.instructions ?? null,
+      statusCardStyle: existing?.statusCardStyle ?? null,
     };
 
     // Do not start an ACP session in this builder. staticModels first; agy
@@ -13389,6 +13493,7 @@ export class Orchestrator {
         ? `\`${this.repoDisplay(state.repoPath)}\``
         : "*(default)*";
       const permDisplay = state.permission ?? "*(default)*";
+      const cardDisplay = state.statusCardStyle ? `\`${state.statusCardStyle}\`` : "*(default)*";
       const toolsDisplay = (() => {
         const parts: string[] = [];
         if (state.toolsAllow?.length) parts.push(`Allow: ${state.toolsAllow.join(", ")}`);
@@ -13415,6 +13520,7 @@ export class Orchestrator {
           { name: "⚡ Effort", value: effortDisplay, inline: true },
           { name: "📂 Repo", value: repoDisplay, inline: true },
           { name: "🔒 Permission", value: permDisplay, inline: true },
+          { name: "🃏 Status card", value: cardDisplay, inline: true },
           { name: "🔧 Tools", value: toolsDisplay },
           { name: "📋 Instructions", value: instrDisplay }
         );
@@ -13467,6 +13573,25 @@ export class Orchestrator {
           }))
         );
 
+      const cardSelect = new StringSelectMenuBuilder()
+        .setCustomId("preset:card")
+        .setPlaceholder("🃏 Status card")
+        .addOptions(
+          { label: "Default (don't pin)", value: "__default__", default: state.statusCardStyle === null },
+          {
+            label: "full",
+            value: "full",
+            description: "Repo, model, action, effort, tool tags",
+            default: state.statusCardStyle === "full",
+          },
+          {
+            label: "simple",
+            value: "simple",
+            description: "Compact + brand icon",
+            default: state.statusCardStyle === "simple",
+          }
+        );
+
       const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
           .setCustomId("preset:details")
@@ -13497,6 +13622,7 @@ export class Orchestrator {
           new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(agentSelect),
           new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(modelSelect),
           new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(effortSelect),
+          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(cardSelect),
           buttons,
         ],
       };
@@ -13538,6 +13664,11 @@ export class Orchestrator {
         } else if (c.isStringSelectMenu() && c.customId === "preset:effort") {
           const v = c.values[0]!;
           state.effort = v === "__default__" ? null : v;
+          await c.update(render());
+        } else if (c.isStringSelectMenu() && c.customId === "preset:card") {
+          const v = c.values[0]!;
+          state.statusCardStyle =
+            v === "full" || v === "simple" ? v : null;
           await c.update(render());
         } else if (c.isButton() && c.customId === "preset:details") {
           const modal = new ModalBuilder()
@@ -13707,6 +13838,7 @@ export class Orchestrator {
             toolsAllow: state.toolsAllow,
             toolsExclude: state.toolsExclude,
             instructions: state.instructions,
+            statusCardStyle: state.statusCardStyle,
             createdBy: existing?.createdBy ?? i.user.id,
             createdUtc: existing?.createdUtc ?? now,
             updatedUtc: now,
@@ -13911,6 +14043,14 @@ export class Orchestrator {
       cfg.excludedTools = preset.toolsExclude;
       changes.push(`Tools exclude → ${preset.toolsExclude.join(", ")}`);
     }
+    if (preset.statusCardStyle === "full" || preset.statusCardStyle === "simple") {
+      if (preset.statusCardStyle === "full") {
+        delete cfg.statusCardStyle;
+      } else {
+        cfg.statusCardStyle = "simple";
+      }
+      changes.push(`Status card → ${preset.statusCardStyle}`);
+    }
 
     // One write for config + repo. `acp_session_id` is assigned out-of-band, so
     // re-read the authoritative value rather than trusting the in-memory record
@@ -13962,6 +14102,7 @@ export class Orchestrator {
         { name: "⚡ Effort", value: preset.effort ?? "*(default)*", inline: true },
         { name: "📂 Repo", value: preset.repoPath ? `\`${this.repoDisplay(preset.repoPath)}\`` : "*(default)*", inline: true },
         { name: "🔒 Permission", value: preset.permission ?? "*(default)*", inline: true },
+        { name: "🃏 Status card", value: preset.statusCardStyle ?? "*(default)*", inline: true },
         { name: "🔧 Tools allow", value: preset.toolsAllow?.join(", ") || "*(all)*" },
         { name: "🔧 Tools exclude", value: preset.toolsExclude?.join(", ") || "*(none)*" },
         {

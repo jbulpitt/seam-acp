@@ -40,6 +40,7 @@ describe("Gemini TTS voices", () => {
     expect(input).toContain("TRANSCRIPT:\nHello there");
     expect(input).toMatch(/name the site or page/i);
     expect(input).toMatch(/do not read the address/i);
+    expect(input).toMatch(/Paraphrase highly technical content/i);
   });
 
   it("caches voice samples under DATA_DIR", () => {

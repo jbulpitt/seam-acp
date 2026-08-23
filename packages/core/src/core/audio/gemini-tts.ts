@@ -92,7 +92,9 @@ export function buildTtsInput(text: string, pace: TtsPace = "natural", style: Tt
   return (
     `Director's notes: ${paceNote} ${styleNote} ` +
     `When the transcript contains a URL, name the site or page in a few words ` +
-    `(e.g. "a Google search", "a GitHub link") — do not read the address, path, or query string.\n` +
+    `(e.g. "a Google search", "a GitHub link") — do not read the address, path, or query string. ` +
+    `Paraphrase highly technical content (long shell commands, flags, commit hashes, file paths) ` +
+    `in a few words; do not read them token-by-token.\n` +
     `Speak this Discord reply clearly. Read only the following transcript, no commentary.\n\n` +
     `TRANSCRIPT:\n${text}`
   );

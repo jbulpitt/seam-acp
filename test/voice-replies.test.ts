@@ -8,7 +8,7 @@ import {
 } from "../packages/core/src/core/audio/gemini-tts.js";
 import { ttsSamplePath, TTS_SAMPLE_SCRIPT } from "../packages/core/src/core/audio/tts-samples.js";
 import { encodePcmToOggOpus } from "../packages/core/src/core/audio/pcm-to-opus.js";
-import { shouldSpeakReply, TTS_MAX_CHARS } from "../packages/core/src/core/audio/voice-replies.js";
+import { selectSpokenProse, shouldSpeakReply, TTS_MAX_CHARS } from "../packages/core/src/core/audio/voice-replies.js";
 
 const TTS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
 
@@ -92,6 +92,36 @@ describe("shouldSpeakReply", () => {
       speak: false,
       reason: "had-audio",
     });
+  });
+
+  it("prefers prose after the last tool when the turn had tools", () => {
+    expect(
+      selectSpokenProse({
+        all: "I'll check the logs.\n\nThe timeout was ours.",
+        afterLastTool: "The timeout was ours.",
+        sawTool: true,
+      })
+    ).toBe("The timeout was ours.");
+  });
+
+  it("uses the full turn when there were no tools", () => {
+    expect(
+      selectSpokenProse({
+        all: "TTS is on in this thread.",
+        afterLastTool: "TTS is on in this thread.",
+        sawTool: false,
+      })
+    ).toBe("TTS is on in this thread.");
+  });
+
+  it("falls back to the full turn if tools ran but no later prose", () => {
+    expect(
+      selectSpokenProse({
+        all: "I'll look that up.",
+        afterLastTool: "   ",
+        sawTool: true,
+      })
+    ).toBe("I'll look that up.");
   });
 
   it("skips cancelled or timed-out turns", () => {

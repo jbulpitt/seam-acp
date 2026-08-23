@@ -36,6 +36,20 @@ export function shouldSpeakReply(opts: {
   return { speak: true, text };
 }
 
+/**
+ * Prefer prose after the last tool call (the curated summary). Fall back to
+ * the full visible turn when there were no tools, or tools produced no follow-up.
+ */
+export function selectSpokenProse(opts: {
+  all: string;
+  afterLastTool: string;
+  sawTool: boolean;
+}): string {
+  const after = opts.afterLastTool.trim();
+  if (opts.sawTool && after) return after;
+  return opts.all.trim();
+}
+
 export type SpokenOgg =
   | { ok: true; ogg: Uint8Array; filename: string; mimeType: string }
   | { ok: false; error: string };

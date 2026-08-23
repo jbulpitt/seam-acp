@@ -273,7 +273,7 @@ import {
   isVoiceNoteAttachment,
   withoutVoiceNotes,
 } from "../../core/audio/voice-notes.js";
-import { shouldSpeakReply, speakReplyToOgg } from "../../core/audio/voice-replies.js";
+import { selectSpokenProse, shouldSpeakReply, speakReplyToOgg } from "../../core/audio/voice-replies.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, withHarnessPreamble } from "../../core/agent-conventions.js";
 import {
   CHOICE_AUTHORING_RULE,
@@ -1105,6 +1105,8 @@ export class Orchestrator {
     let textBuffer = "";
     let textSent = false;
     let spokenProse = "";
+    let spokenAfterLastTool = "";
+    let sawTool = false;
     let agentAudioSent = false;
     let totalAgentChars = 0;
     // Set true mid-turn (in the usage-update handler) when agy's context
@@ -1146,6 +1148,7 @@ export class Orchestrator {
         if (split.send) {
           await this.adapter.sendMessage(channel, split.send);
           spokenProse += split.send;
+          spokenAfterLastTool += split.send;
           textSent = true;
           typingDone = true;
         }
@@ -1477,6 +1480,11 @@ export class Orchestrator {
           }
           case "tool-start": {
             refreshTyping();
+            // Commit any "I'll look that up" narration so it is not mixed into
+            // the post-tool summary we later speak.
+            await drainBuffer(true);
+            sawTool = true;
+            spokenAfterLastTool = "";
             const label = event.title ?? event.kindLabel ?? "…";
             status.setAction(`Tool: ${label}`);
             status.pushActivity(label);
@@ -1820,7 +1828,11 @@ export class Orchestrator {
         await this.maybeSpeakTurn({
           channel,
           threadId: channel.id,
-          prose: spokenProse,
+          prose: selectSpokenProse({
+            all: spokenProse,
+            afterLastTool: spokenAfterLastTool,
+            sawTool,
+          }),
           alreadyHadAudio: agentAudioSent,
         });
       }

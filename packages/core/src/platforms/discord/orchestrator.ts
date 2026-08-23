@@ -11600,7 +11600,10 @@ export class Orchestrator {
         style: resolveThreadTtsStyle(this.config, opts.threadId),
       });
       if (!spoken.ok) {
-        this.logger.warn({ err: spoken.error, threadId: opts.threadId }, "outbound TTS failed");
+        this.logger.warn(
+          { err: spoken.error, threadId: opts.threadId, chars: decision.text.length },
+          "outbound TTS failed"
+        );
         await this.adapter.sendMessage(
           opts.channel,
           `_Couldn't speak this reply:_ ${spoken.error}`

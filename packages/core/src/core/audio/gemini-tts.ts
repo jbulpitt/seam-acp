@@ -7,7 +7,8 @@
  */
 const DEFAULT_TTS_MODEL = "gemini-3.1-flash-tts-preview";
 const DEFAULT_TTS_VOICE = "Kore";
-const TTS_TIMEOUT_MS = 90_000;
+/** Long replies (up to TTS_MAX_CHARS) can take >90s to synthesize. */
+const TTS_TIMEOUT_MS = 180_000;
 const TTS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
 
 /** Official Gemini TTS prebuilt voices (30). Preview: https://aistudio.google.com/generate-speech */

@@ -3,7 +3,7 @@
  * Uses the Developer API (SEAM_GEMINI_API_KEY), not agy/Gemini CLI SSO.
  */
 const DEFAULT_STT_MODEL = "gemini-3.7-flash";
-const STT_TIMEOUT_MS = 30_000;
+const STT_TIMEOUT_MS = 60_000;
 const STT_PROMPT =
   "Transcribe this Discord voice message verbatim. Return only the spoken words, no commentary.";
 

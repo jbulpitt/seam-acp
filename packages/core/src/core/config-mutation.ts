@@ -137,6 +137,10 @@ export interface ThreadPresetChanges {
   tts?: boolean;
   /** Raw Gemini TTS voice name. `null` clears back to the env default. */
   ttsVoice?: string | null;
+  /** `null` / `"natural"` omits the key. */
+  ttsPace?: "slow" | "natural" | "fast" | null;
+  /** `null` / `"neutral"` omits the key. */
+  ttsStyle?: "neutral" | "warm" | "clear" | null;
 }
 
 /** Tier D — a scheduled prompt bound to the calling thread (#69).
@@ -1422,6 +1426,34 @@ export class ConfigMutationService {
       }
     }
 
+    if (changes.ttsPace !== undefined) {
+      const beforePace =
+        current.ttsPace === "slow" || current.ttsPace === "fast" || current.ttsPace === "natural"
+          ? current.ttsPace
+          : "natural";
+      const requested = changes.ttsPace;
+      const afterPace = requested === null || requested === "natural" ? "natural" : requested;
+      if (beforePace !== afterPace) {
+        if (afterPace === "natural") delete next.ttsPace;
+        else next.ttsPace = afterPace;
+        fields.push({ label: "ttsPace", before: beforePace, after: afterPace });
+      }
+    }
+
+    if (changes.ttsStyle !== undefined) {
+      const beforeStyle =
+        current.ttsStyle === "warm" || current.ttsStyle === "clear" || current.ttsStyle === "neutral"
+          ? current.ttsStyle
+          : "neutral";
+      const requested = changes.ttsStyle;
+      const afterStyle = requested === null || requested === "neutral" ? "neutral" : requested;
+      if (beforeStyle !== afterStyle) {
+        if (afterStyle === "neutral") delete next.ttsStyle;
+        else next.ttsStyle = afterStyle;
+        fields.push({ label: "ttsStyle", before: beforeStyle, after: afterStyle });
+      }
+    }
+
     if (fields.length === 0) {
       return { ok: false, error: "No effective change to this thread's preset." };
     }
@@ -1457,8 +1489,8 @@ export class ConfigMutationService {
       // Detach is a message-gate, not a session-config change. A detached-only
       // write must not restart/invalidate; slash abort-on-detach handles an
       // in-flight turn separately. Mixed with rider/effort/etc. still restarts.
-      restartsSession: !fields.every(
-        (f) => f.label === "detached" || f.label === "tts" || f.label === "ttsVoice"
+      restartsSession: !fields.every((f) =>
+        ["detached", "tts", "ttsVoice", "ttsPace", "ttsStyle"].includes(f.label)
       ),
       // location changes pin the session to a different host (D2) — restart.
       apply: (actor) => {

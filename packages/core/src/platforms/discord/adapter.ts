@@ -21,6 +21,7 @@ import {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  AttachmentBuilder,
   type Message,
   type TextChannel,
   type ThreadChannel,
@@ -884,9 +885,13 @@ export class DiscordAdapter implements ChatAdapter {
     const ch = await this.fetchSendableChannel(channel.id);
     const embed = DiscordAdapter.buildEmbed(panel);
     const components = DiscordAdapter.buildActionRows(panel.actions);
+    const files = (panel.files ?? []).map(
+      (f) => new AttachmentBuilder(f.data, { name: f.filename })
+    );
     const sent = await ch.send({
       embeds: [embed],
       ...(components.length > 0 ? { components } : {}),
+      ...(files.length > 0 ? { files } : {}),
     });
     return { channel, id: sent.id };
   }
@@ -898,12 +903,22 @@ export class DiscordAdapter implements ChatAdapter {
     const ch = await this.fetchSendableChannel(message.channel.id);
     const msg = await ch.messages.fetch(message.id);
     const embed = DiscordAdapter.buildEmbed(panel);
-    const payload: { content: string; embeds: EmbedBuilder[]; components?: ReturnType<typeof DiscordAdapter.buildActionRows> } = {
+    const payload: {
+      content: string;
+      embeds: EmbedBuilder[];
+      components?: ReturnType<typeof DiscordAdapter.buildActionRows>;
+      files?: AttachmentBuilder[];
+      attachments?: [];
+    } = {
       content: "",
       embeds: [embed],
     };
     if (panel.actions !== undefined) {
       payload.components = DiscordAdapter.buildActionRows(panel.actions);
+    }
+    if (panel.files !== undefined) {
+      payload.files = panel.files.map((f) => new AttachmentBuilder(f.data, { name: f.filename }));
+      payload.attachments = [];
     }
     await msg.edit(payload);
   }

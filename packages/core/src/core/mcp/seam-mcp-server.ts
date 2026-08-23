@@ -919,6 +919,16 @@ const TOOLS = [
                 "Gemini prebuilt TTS voice name (Kore, Puck, …). Empty string clears " +
                 "back to the env default. Preview: https://aistudio.google.com/generate-speech",
             },
+            ttsPace: {
+              type: "string",
+              enum: ["slow", "natural", "fast"],
+              description: "Spoken pacing (director's note). natural / empty clears.",
+            },
+            ttsStyle: {
+              type: "string",
+              enum: ["neutral", "warm", "clear"],
+              description: "Spoken style (director's note). neutral / empty clears.",
+            },
           },
         },
         channelPreset: {
@@ -1980,6 +1990,8 @@ export class SeamMcpServer {
       line("detached:", d.detached.value ? "true" : "false", d.detached.source),
       line("tts:", d.tts.value ? "true" : "false", d.tts.source),
       line("tts voice:", d.ttsVoice.value ?? "(unset)", d.ttsVoice.source),
+      line("tts pace:", d.ttsPace.value, d.ttsPace.source),
+      line("tts style:", d.ttsStyle.value, d.ttsStyle.source),
       line("location:", d.location?.value ?? "local", d.location?.source ?? "default"),
     ];
     if (d.rider?.channel || d.rider?.thread) {

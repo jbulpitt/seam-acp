@@ -459,6 +459,12 @@ export interface StructuredPanel {
    * leaves existing components alone.
    */
   actions?: PanelButton[][];
+  /**
+   * Optional file attachments on the same message as the embed (Discord can
+   * play an ogg here; embeds themselves cannot host audio).
+   * On send: attached. On edit: `[]` clears files; `undefined` leaves them.
+   */
+  files?: Array<{ data: Buffer; filename: string }>;
 }
 
 /**

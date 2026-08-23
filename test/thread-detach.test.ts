@@ -92,6 +92,17 @@ describe("PresetsFileSchema tts", () => {
     expect(parsed.success).toBe(false);
   });
 
+  it("accepts thread ttsPace/ttsStyle and rejects them on a channel", () => {
+    const ok = PresetsFileSchema.safeParse({
+      threads: { "111111111111111111": { tts: true, ttsPace: "slow", ttsStyle: "warm" } },
+    });
+    expect(ok.success).toBe(true);
+    const badPace = PresetsFileSchema.safeParse({
+      channels: { "111111111111111111": { ttsPace: "slow" } },
+    });
+    expect(badPace.success).toBe(false);
+  });
+
   it("accepts a thread ttsVoice and rejects it on a channel", () => {
     const ok = PresetsFileSchema.safeParse({
       threads: { "111111111111111111": { tts: true, ttsVoice: "Puck" } },

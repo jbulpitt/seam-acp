@@ -1806,6 +1806,8 @@ describe("config_describe", () => {
     detached: { value: true, source: "thread preset" as const },
     tts: { value: false, source: "default" as const },
     ttsVoice: { value: null, source: "default" as const },
+    ttsPace: { value: "natural" as const, source: "default" as const },
+    ttsStyle: { value: "neutral" as const, source: "default" as const },
     location: { value: "local", source: "default" as const },
   };
 

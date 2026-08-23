@@ -91,11 +91,12 @@ describe("/seam slash command", () => {
     const tts = (config?.options ?? []).find((o) => o.name === "tts");
     const ttsState = tts?.options?.find((o) => o.name === "state");
     expect(ttsState?.type).toBe(STRING);
-    expect(ttsState?.required).toBe(true);
+    expect(ttsState?.required ?? false).toBe(false);
     const ttsVoice = tts?.options?.find((o) => o.name === "voice");
     expect(ttsVoice?.type).toBe(STRING);
     expect(ttsVoice?.required ?? false).toBe(false);
     expect(ttsVoice?.autocomplete).toBe(true);
+    expect((tts?.options ?? []).map((o) => o.name)).toEqual(["state", "voice", "pace", "style"]);
   });
 
   it("info group has 6 leaves (sessions/repos moved in; config-audit moved out)", () => {

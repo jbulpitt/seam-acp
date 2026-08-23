@@ -2,7 +2,7 @@
  * Decide whether a finished turn should get a spoken Discord attachment.
  * Default off: only threads with `tts: true` speak.
  */
-import { synthesizeSpeechWithGemini } from "./gemini-tts.js";
+import { synthesizeSpeechWithGemini, type TtsPace, type TtsStyle } from "./gemini-tts.js";
 import { encodePcmToOggOpus } from "./pcm-to-opus.js";
 
 export const TTS_MAX_CHARS = 4000;
@@ -45,6 +45,8 @@ export async function speakReplyToOgg(opts: {
   text: string;
   model?: string;
   voice?: string;
+  pace?: TtsPace;
+  style?: TtsStyle;
   fetchFn?: typeof fetch;
   ffmpegPath?: string;
 }): Promise<SpokenOgg> {
@@ -53,6 +55,8 @@ export async function speakReplyToOgg(opts: {
     text: opts.text,
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.voice ? { voice: opts.voice } : {}),
+    ...(opts.pace ? { pace: opts.pace } : {}),
+    ...(opts.style ? { style: opts.style } : {}),
     ...(opts.fetchFn ? { fetchFn: opts.fetchFn } : {}),
   });
   if (!tts.ok) return tts;

@@ -67,6 +67,8 @@ function describeConfig(record: SessionRecord): ConfigDescription {
     detached: { value: false, source: "default" },
     tts: { value: false, source: "default" },
     ttsVoice: { value: null, source: "default" },
+    ttsPace: { value: "natural", source: "default" },
+    ttsStyle: { value: "neutral", source: "default" },
     location: { value: "local", source: "default" },
   };
 }

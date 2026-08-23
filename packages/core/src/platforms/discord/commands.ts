@@ -280,12 +280,12 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub
           .setName("tts")
-          .setDescription("Speak this thread's completed replies as an ogg attachment (default off)")
+          .setDescription("TTS settings card (omit options), or set on/off/voice/pace/style now")
           .addStringOption((o) =>
             o
               .setName("state")
               .setDescription("on = attach a spoken copy after each turn; off = text only")
-              .setRequired(true)
+              .setRequired(false)
               .addChoices({ name: "on", value: "on" }, { name: "off", value: "off" })
           )
           .addStringOption((o) =>
@@ -294,6 +294,28 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .setDescription("Gemini TTS voice (autocomplete; preview at aistudio.google.com/generate-speech)")
               .setRequired(false)
               .setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("pace")
+              .setDescription("Spoken pacing (director's note)")
+              .setRequired(false)
+              .addChoices(
+                { name: "slow", value: "slow" },
+                { name: "natural", value: "natural" },
+                { name: "fast", value: "fast" }
+              )
+          )
+          .addStringOption((o) =>
+            o
+              .setName("style")
+              .setDescription("Spoken style (director's note)")
+              .setRequired(false)
+              .addChoices(
+                { name: "neutral", value: "neutral" },
+                { name: "warm", value: "warm" },
+                { name: "clear", value: "clear" }
+              )
           )
       )
       .addSubcommand((sub) =>

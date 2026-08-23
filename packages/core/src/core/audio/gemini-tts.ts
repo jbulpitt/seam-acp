@@ -63,6 +63,38 @@ export function geminiTtsVoiceChoices(prefix: string): { name: string; value: st
   return items.map((v) => ({ name: `${v.name} — ${v.style}`, value: v.name }));
 }
 
+export const TTS_PACES = ["slow", "natural", "fast"] as const;
+export type TtsPace = (typeof TTS_PACES)[number];
+export const TTS_STYLES = ["neutral", "warm", "clear"] as const;
+export type TtsStyle = (typeof TTS_STYLES)[number];
+
+export function isTtsPace(v: string): v is TtsPace {
+  return (TTS_PACES as readonly string[]).includes(v);
+}
+export function isTtsStyle(v: string): v is TtsStyle {
+  return (TTS_STYLES as readonly string[]).includes(v);
+}
+
+export function buildTtsInput(text: string, pace: TtsPace = "natural", style: TtsStyle = "neutral"): string {
+  const paceNote =
+    pace === "slow"
+      ? "Speak slowly and clearly, with unhurried pacing. Do not rush."
+      : pace === "fast"
+        ? "Speak at a brisk, energetic pace. Keep it intelligible, not breathless."
+        : "Speak at a natural conversational pace.";
+  const styleNote =
+    style === "warm"
+      ? "Warm, friendly, approachable tone."
+      : style === "clear"
+        ? "Crisp articulation, like explaining something carefully."
+        : "Neutral, even delivery. No extra character.";
+  return (
+    `Director's notes: ${paceNote} ${styleNote}\n` +
+    `Speak this Discord reply clearly. Read only the following transcript, no commentary.\n\n` +
+    `TRANSCRIPT:\n${text}`
+  );
+}
+
 export type TtsPcm = {
   pcm: Uint8Array;
   sampleRate: number;
@@ -76,6 +108,8 @@ export async function synthesizeSpeechWithGemini(opts: {
   text: string;
   model?: string;
   voice?: string;
+  pace?: TtsPace;
+  style?: TtsStyle;
   fetchFn?: typeof fetch;
 }): Promise<TtsResult> {
   const apiKey = opts.apiKey.trim();
@@ -88,7 +122,7 @@ export async function synthesizeSpeechWithGemini(opts: {
   const fetchFn = opts.fetchFn ?? fetch;
   const body = {
     model,
-    input: `Speak this Discord reply clearly. Read only the following text, no commentary:\n\n${text}`,
+    input: buildTtsInput(text, opts.pace ?? "natural", opts.style ?? "neutral"),
     response_format: { type: "audio" },
     generation_config: { speech_config: [{ voice }] },
   };

@@ -13,6 +13,8 @@ import {
   isThreadDetached,
   isThreadTtsEnabled,
   resolveThreadTtsVoice,
+  resolveThreadTtsPace,
+  resolveThreadTtsStyle,
   isRestrictedParticipant,
   mayConfigureUserIds,
   PARTICIPANT_CONFIG_REFUSAL,
@@ -120,7 +122,26 @@ import {
   findGeminiTtsVoice,
   geminiTtsVoiceChoices,
   GEMINI_TTS_VOICE_PREVIEW_URL,
+  GEMINI_TTS_VOICES,
+  isTtsPace,
+  isTtsStyle,
 } from "../../core/audio/gemini-tts.js";
+import { getOrCreateTtsSample, warmTtsSamples } from "../../core/audio/tts-samples.js";
+import {
+  TtsEditorStore,
+  authorizeTtsDraftClick,
+  cyclePace,
+  cycleStyle,
+  effectiveTts,
+  parseTtsCustomId,
+  renderTtsCancelled,
+  renderTtsHub,
+  renderTtsSaved,
+  renderTtsVoiceStep,
+  ttsDirtyChanges,
+  voiceIndexFor,
+  type TtsEditorDraft,
+} from "./tts-editor.js";
 import {
   agentLocationPickerChoices,
   currentAgentAtLocation,
@@ -445,6 +466,8 @@ export class Orchestrator {
   private bridgeHub?: BridgeHub;
   /** In-memory /seam config edit drafts (#90). Idle TTL 60 min. */
   private readonly configEditor = new ConfigEditorStore();
+  /** In-memory /seam config tts drafts. Idle TTL 60 min. */
+  private readonly ttsEditor = new TtsEditorStore();
   /** #92: declared HTTP result waiters for ingest-triggered choice turns. */
   private choiceResults?: ChoiceResultHub;
   /** #95: synthetic session records for headless ingest jobs (dispatch id → record). */
@@ -631,7 +654,10 @@ export class Orchestrator {
 
   install(): void {
     this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
-    this.adapter.onComponent?.((evt) => this.handleConfigEditorComponent(evt));
+    this.adapter.onComponent?.((evt) => {
+      void this.handleConfigEditorComponent(evt);
+      void this.handleTtsEditorComponent(evt);
+    });
     this.adapter.onChoiceInteraction?.((evt) => this.handleChoiceCardInteraction(evt));
     this.adapter.onThreadDelete?.((channelRef) => this.handleThreadDeleted(channelRef));
     // DB-backed channel activation (#22): let the adapter's channel gate treat
@@ -10689,9 +10715,8 @@ export class Orchestrator {
   }
 
   /**
-   * `/seam config tts state:on|off`. Thread-preset raw boolean `tts`.
-   * Default off. Does not restart the session. Not participant-allowed;
-   * admin immunity lets this run in a locked school channel.
+   * `/seam config tts` with no options opens the settings card.
+   * Passing state/voice/pace/style applies immediately (no card).
    */
   private async cmdTts(i: ChatInputCommandInteraction): Promise<void> {
     if (!i.channel?.isThread()) {
@@ -10701,8 +10726,15 @@ export class Orchestrator {
       });
       return;
     }
-    const enabled = i.options.getString("state", true) === "on";
+    const stateRaw = i.options.getString("state");
     const voiceRaw = i.options.getString("voice")?.trim();
+    const paceRaw = i.options.getString("pace");
+    const styleRaw = i.options.getString("style");
+    if (!stateRaw && !voiceRaw && !paceRaw && !styleRaw) {
+      await this.openTtsEditor(i);
+      return;
+    }
+
     let voiceName: string | undefined;
     if (voiceRaw) {
       const known = findGeminiTtsVoice(voiceRaw);
@@ -10716,14 +10748,24 @@ export class Orchestrator {
       }
       voiceName = known.name;
     }
+    if (paceRaw && !isTtsPace(paceRaw)) {
+      await i.reply({ content: `Unknown pace \`${paceRaw}\`.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (styleRaw && !isTtsStyle(styleRaw)) {
+      await i.reply({ content: `Unknown style \`${styleRaw}\`.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
     const threadId = i.channelId;
     const parentRef = i.channel.parentId ?? undefined;
     const result = this.configMutation.applyThreadOverlay({
       threadId,
       parentRef,
       changes: {
-        tts: enabled,
+        ...(stateRaw ? { tts: stateRaw === "on" } : {}),
         ...(voiceName ? { ttsVoice: voiceName } : {}),
+        ...(paceRaw && isTtsPace(paceRaw) ? { ttsPace: paceRaw } : {}),
+        ...(styleRaw && isTtsStyle(styleRaw) ? { ttsStyle: styleRaw } : {}),
       },
       actor: { id: i.user.id, name: i.user.displayName ?? i.user.username },
     });
@@ -10735,14 +10777,241 @@ export class Orchestrator {
       voiceName ??
       resolveThreadTtsVoice(this.config, threadId) ??
       this.config.SEAM_GEMINI_TTS_VOICE;
-    const style = findGeminiTtsVoice(resolvedVoice)?.style;
-    const voiceLabel = style ? `${resolvedVoice} (${style})` : resolvedVoice;
+    const voiceStyle = findGeminiTtsVoice(resolvedVoice)?.style;
+    const voiceLabel = voiceStyle ? `${resolvedVoice} (${voiceStyle})` : resolvedVoice;
+    const pace = resolveThreadTtsPace(this.config, threadId);
+    const style = resolveThreadTtsStyle(this.config, threadId);
+    const on = isThreadTtsEnabled(this.config, threadId);
     await i.reply({
-      content: enabled
-        ? `TTS on — I'll attach a spoken copy of each completed reply in this thread, voice **${voiceLabel}**.\nPreview voices: ${GEMINI_TTS_VOICE_PREVIEW_URL}`
-        : `TTS off — replies stay text-only.${voiceName ? ` Saved voice **${voiceLabel}** for when you turn it back on.` : ""}\nPreview voices: ${GEMINI_TTS_VOICE_PREVIEW_URL}`,
+      content:
+        `TTS **${on ? "on" : "off"}** — voice **${voiceLabel}**, pace \`${pace}\`, style \`${style}\`.\n` +
+        `Card: \`/seam config tts\` (no options). Preview: ${GEMINI_TTS_VOICE_PREVIEW_URL}`,
       flags: MessageFlags.Ephemeral,
     });
+  }
+
+  private async openTtsEditor(i: ChatInputCommandInteraction): Promise<void> {
+    const channel = this.channelRefFromInteraction(i);
+    if (!channel || !i.channel?.isThread()) return;
+    if (!this.adapter.sendPanel) {
+      await i.reply({
+        content: "This platform cannot render the TTS settings card.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const threadId = i.channelId;
+    const voice =
+      resolveThreadTtsVoice(this.config, threadId) ?? this.config.SEAM_GEMINI_TTS_VOICE;
+    const now = Date.now();
+    const draft: TtsEditorDraft = {
+      id: randomUUID(),
+      threadId,
+      ...(i.channel.parentId ? { parentRef: i.channel.parentId } : {}),
+      userId: i.user.id,
+      createdAt: now,
+      updatedAt: now,
+      snapshot: {
+        tts: isThreadTtsEnabled(this.config, threadId),
+        voice,
+        pace: resolveThreadTtsPace(this.config, threadId),
+        style: resolveThreadTtsStyle(this.config, threadId),
+      },
+      overlay: {},
+      view: "hub",
+      voiceIndex: voiceIndexFor(voice),
+    };
+    const evicted = this.ttsEditor.put(draft);
+    if (evicted?.messageId) {
+      await this.editTtsEditorCard(channel, evicted.messageId, renderTtsCancelled(evicted));
+    }
+    await i.reply({ content: "Opening TTS settings…", flags: MessageFlags.Ephemeral });
+    const ref = await this.adapter.sendPanel(channel, renderTtsHub(draft));
+    this.ttsEditor.touch(draft.id, { messageId: ref.id });
+  }
+
+  private async editTtsEditorCard(
+    channel: ChannelRef,
+    messageId: string,
+    panel: ReturnType<typeof renderTtsHub>
+  ): Promise<void> {
+    if (!this.adapter.editPanel) return;
+    try {
+      await this.adapter.editPanel({ channel, id: messageId }, panel);
+    } catch (err) {
+      this.logger.warn({ err, messageId }, "tts editor card edit failed");
+    }
+  }
+
+  private async refreshTtsEditor(draft: TtsEditorDraft, sample?: Buffer): Promise<void> {
+    if (!draft.messageId) return;
+    const channel: ChannelRef = {
+      platform: "discord",
+      id: draft.threadId,
+      ...(draft.parentRef ? { parentId: draft.parentRef } : {}),
+    };
+    const panel =
+      draft.view === "voice" ? renderTtsVoiceStep(draft) : renderTtsHub(draft);
+    if (draft.view === "voice" && sample) {
+      const idx = Math.min(Math.max(0, draft.voiceIndex), GEMINI_TTS_VOICES.length - 1);
+      const name = GEMINI_TTS_VOICES[idx]?.name ?? "voice";
+      panel.files = [{ data: sample, filename: `${name}-sample.ogg` }];
+    }
+    await this.editTtsEditorCard(channel, draft.messageId, panel);
+  }
+
+  private async loadTtsVoiceSample(draft: TtsEditorDraft): Promise<Buffer | undefined> {
+    const idx = Math.min(Math.max(0, draft.voiceIndex), GEMINI_TTS_VOICES.length - 1);
+    const voice = GEMINI_TTS_VOICES[idx];
+    if (!voice) return undefined;
+    this.ttsEditor.touch(draft.id, { sampleStatus: "loading", sampleError: undefined });
+    const loading = this.ttsEditor.get(draft.id) ?? draft;
+    await this.refreshTtsEditor(loading);
+    const sample = await getOrCreateTtsSample({
+      dataDir: this.config.DATA_DIR,
+      apiKey: this.config.SEAM_GEMINI_API_KEY,
+      voice: voice.name,
+      model: this.config.SEAM_GEMINI_TTS_MODEL,
+    });
+    if (!sample.ok) {
+      this.ttsEditor.touch(draft.id, { sampleStatus: "error", sampleError: sample.error });
+      const failed = this.ttsEditor.get(draft.id) ?? draft;
+      await this.refreshTtsEditor(failed);
+      return undefined;
+    }
+    this.ttsEditor.touch(draft.id, { sampleStatus: "ready", sampleError: undefined });
+    const ready = this.ttsEditor.get(draft.id) ?? draft;
+    await this.refreshTtsEditor(ready, sample.ogg);
+    return sample.ogg;
+  }
+
+  private async handleTtsEditorComponent(evt: ComponentEvent): Promise<void> {
+    const parsed = parseTtsCustomId(evt.customId);
+    if (!parsed) return;
+    let draft = this.ttsEditor.get(parsed.draftId);
+    const auth = authorizeTtsDraftClick(draft, evt.userId);
+    if (auth === "not-yours") {
+      await evt.replyEphemeral("This TTS card isn't yours.");
+      return;
+    }
+    if (auth === "expired" || !draft) {
+      try {
+        await evt.deferUpdate();
+      } catch {
+        await evt.replyEphemeral("This draft has expired.").catch(() => {});
+        return;
+      }
+      if (evt.messageId) {
+        await this.editTtsEditorCard(evt.channel, evt.messageId, {
+          color: 0x99aab5,
+          title: "🔊 Thread TTS",
+          fields: [],
+          footer: "draft expired",
+          files: [],
+          actions: [],
+        });
+      }
+      return;
+    }
+
+    const action = parsed.action;
+    await evt.deferUpdate();
+
+    if (action === "cancel") {
+      this.ttsEditor.delete(draft.id);
+      if (draft.messageId) {
+        await this.editTtsEditorCard(evt.channel, draft.messageId, renderTtsCancelled(draft));
+      }
+      return;
+    }
+    if (action === "save") {
+      const changes = ttsDirtyChanges(draft);
+      if (Object.keys(changes).length === 0) return;
+      const result = this.configMutation.applyThreadOverlay({
+        threadId: draft.threadId,
+        parentRef: draft.parentRef,
+        changes,
+        actor: { id: evt.userId, name: evt.userName },
+      });
+      if (!result.ok) {
+        await evt.followUpEphemeral(result.error).catch(() => {});
+        return;
+      }
+      const saved = renderTtsSaved(draft);
+      this.ttsEditor.delete(draft.id);
+      if (draft.messageId) {
+        await this.editTtsEditorCard(evt.channel, draft.messageId, saved);
+      }
+      return;
+    }
+    if (action === "toggle") {
+      const e = effectiveTts(draft);
+      draft = this.ttsEditor.touch(draft.id, { overlay: { ...draft.overlay, tts: !e.tts } }) ?? draft;
+      await this.refreshTtsEditor(draft);
+      return;
+    }
+    if (action === "pace") {
+      const e = effectiveTts(draft);
+      draft = this.ttsEditor.touch(draft.id, {
+        overlay: { ...draft.overlay, pace: cyclePace(e.pace) },
+      }) ?? draft;
+      await this.refreshTtsEditor(draft);
+      return;
+    }
+    if (action === "style") {
+      const e = effectiveTts(draft);
+      draft = this.ttsEditor.touch(draft.id, {
+        overlay: { ...draft.overlay, style: cycleStyle(e.style) },
+      }) ?? draft;
+      await this.refreshTtsEditor(draft);
+      return;
+    }
+    if (action === "voice") {
+      const e = effectiveTts(draft);
+      draft =
+        this.ttsEditor.touch(draft.id, {
+          view: "voice",
+          voiceIndex: voiceIndexFor(e.voice),
+          sampleStatus: "loading",
+        }) ?? draft;
+      warmTtsSamples({
+        dataDir: this.config.DATA_DIR,
+        apiKey: this.config.SEAM_GEMINI_API_KEY,
+        model: this.config.SEAM_GEMINI_TTS_MODEL,
+      });
+      await this.loadTtsVoiceSample(draft);
+      return;
+    }
+    if (action === "vback") {
+      draft = this.ttsEditor.touch(draft.id, { view: "hub", sampleStatus: undefined }) ?? draft;
+      await this.refreshTtsEditor(draft);
+      return;
+    }
+    if (action === "vprev" || action === "vnext") {
+      const delta = action === "vnext" ? 1 : -1;
+      const nextIdx = Math.min(
+        GEMINI_TTS_VOICES.length - 1,
+        Math.max(0, draft.voiceIndex + delta)
+      );
+      draft =
+        this.ttsEditor.touch(draft.id, {
+          voiceIndex: nextIdx,
+          sampleStatus: "loading",
+        }) ?? draft;
+      await this.loadTtsVoiceSample(draft);
+      return;
+    }
+    if (action === "vpick") {
+      const voice = GEMINI_TTS_VOICES[draft.voiceIndex];
+      if (!voice) return;
+      draft =
+        this.ttsEditor.touch(draft.id, {
+          overlay: { ...draft.overlay, voice: voice.name },
+          view: "hub",
+          sampleStatus: undefined,
+        }) ?? draft;
+      await this.refreshTtsEditor(draft);
+    }
   }
 
   private async cmdInit(i: ChatInputCommandInteraction): Promise<void> {
@@ -11225,7 +11494,8 @@ export class Orchestrator {
       "`/seam config reset` — end this thread's ACP session; next message starts fresh",
       "`/seam config init` — bind this thread + start setup (repo picker, or full wizard)",
       "`/seam config detach <detached|attached>` — keep this thread session-less (no bot replies; does not delete history)",
-      "`/seam config tts <on|off> [voice]` — speak completed replies as an ogg (default off; autocomplete voice)",
+      "`/seam config tts` — TTS settings card (toggle, voice stepper, pace, style)",
+      "`/seam config tts [on|off] [voice] [pace] [style]` — set immediately without the card",
       "`/seam config show` — show session config JSON",
       "`/seam config set <json>` — replace session config",
       "`/seam config audit` — recent config mutations (who/what/when)",
@@ -11319,6 +11589,8 @@ export class Orchestrator {
         voice:
           resolveThreadTtsVoice(this.config, opts.threadId) ??
           this.config.SEAM_GEMINI_TTS_VOICE,
+        pace: resolveThreadTtsPace(this.config, opts.threadId),
+        style: resolveThreadTtsStyle(this.config, opts.threadId),
       });
       if (!spoken.ok) {
         this.logger.warn({ err: spoken.error, threadId: opts.threadId }, "outbound TTS failed");

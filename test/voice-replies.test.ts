@@ -1,10 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
+  buildTtsInput,
   findGeminiTtsVoice,
   geminiTtsVoiceChoices,
   GEMINI_TTS_VOICES,
   synthesizeSpeechWithGemini,
 } from "../packages/core/src/core/audio/gemini-tts.js";
+import { ttsSamplePath, TTS_SAMPLE_SCRIPT } from "../packages/core/src/core/audio/tts-samples.js";
 import { encodePcmToOggOpus } from "../packages/core/src/core/audio/pcm-to-opus.js";
 import { shouldSpeakReply, TTS_MAX_CHARS } from "../packages/core/src/core/audio/voice-replies.js";
 
@@ -29,6 +31,18 @@ describe("Gemini TTS voices", () => {
     expect(geminiTtsVoiceChoices("").length).toBe(30);
     expect(geminiTtsVoiceChoices("kore")[0]).toEqual({ name: "Kore — Firm", value: "Kore" });
     expect(geminiTtsVoiceChoices("gravel").map((c) => c.value)).toEqual(["Algenib"]);
+  });
+
+  it("puts pace and style into director's notes, not the transcript", () => {
+    const input = buildTtsInput("Hello there", "slow", "warm");
+    expect(input).toMatch(/slowly/i);
+    expect(input).toMatch(/Warm, friendly/i);
+    expect(input).toContain("TRANSCRIPT:\nHello there");
+  });
+
+  it("caches voice samples under DATA_DIR", () => {
+    expect(ttsSamplePath("/data", "Kore")).toBe("/data/tts-voice-samples/Kore.ogg");
+    expect(TTS_SAMPLE_SCRIPT.length).toBeGreaterThan(20);
   });
 });
 

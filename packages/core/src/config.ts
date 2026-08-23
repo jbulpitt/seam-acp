@@ -745,6 +745,16 @@ const ChannelPresetSchema = PresetValuesSchema.extend({
       invalid_type_error: "ttsVoice is a thread-only setting and cannot be set on a channel",
     })
     .optional(),
+  ttsPace: z
+    .undefined({
+      invalid_type_error: "ttsPace is a thread-only setting and cannot be set on a channel",
+    })
+    .optional(),
+  ttsStyle: z
+    .undefined({
+      invalid_type_error: "ttsStyle is a thread-only setting and cannot be set on a channel",
+    })
+    .optional(),
 });
 
 // Raw boolean on the THREAD entry — NOT wrapped `{value:true}` (that wrapper
@@ -759,6 +769,8 @@ const ThreadPresetSchema = PresetValuesSchema.extend({
     .optional(),
   tts: z.boolean().optional().default(false),
   ttsVoice: z.string().min(1).max(64).optional(),
+  ttsPace: z.enum(["slow", "natural", "fast"]).optional(),
+  ttsStyle: z.enum(["neutral", "warm", "clear"]).optional(),
 });
 
 /** Per-host bridge config (D11 / #86). Token is stored as SHA-256 hex only. */
@@ -804,6 +816,8 @@ export type ThreadPreset = PresetValues & {
   location?: string;
   tts?: boolean;
   ttsVoice?: string;
+  ttsPace?: "slow" | "natural" | "fast";
+  ttsStyle?: "neutral" | "warm" | "clear";
 };
 
 export type Config = z.infer<typeof Schema> & {
@@ -932,6 +946,24 @@ export function resolveThreadTtsVoice(
   if (!threadId) return undefined;
   const v = config.threadPresets.get(threadId)?.ttsVoice?.trim();
   return v || undefined;
+}
+
+export function resolveThreadTtsPace(
+  config: Pick<Config, "threadPresets">,
+  threadId: string | undefined
+): "slow" | "natural" | "fast" {
+  if (!threadId) return "natural";
+  const v = config.threadPresets.get(threadId)?.ttsPace;
+  return v === "slow" || v === "fast" || v === "natural" ? v : "natural";
+}
+
+export function resolveThreadTtsStyle(
+  config: Pick<Config, "threadPresets">,
+  threadId: string | undefined
+): "neutral" | "warm" | "clear" {
+  if (!threadId) return "neutral";
+  const v = config.threadPresets.get(threadId)?.ttsStyle;
+  return v === "warm" || v === "clear" || v === "neutral" ? v : "neutral";
 }
 
 /** Per-thread host binding (D10 / #86). Omit / undefined / "" ⇒ `"local"`. */

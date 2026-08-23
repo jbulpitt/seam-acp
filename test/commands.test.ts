@@ -62,7 +62,7 @@ describe("/seam slash command", () => {
     }
   });
 
-  it("config group has the 15 config leaves including detach, tts, and edit", () => {
+  it("config group has the 16 config leaves including card, detach, tts, and edit", () => {
     const config = built().options?.find((o) => o.name === "config");
     expect(config?.type).toBe(SUB_COMMAND_GROUP);
     const names = (config?.options ?? []).map((o) => o.name);
@@ -73,6 +73,7 @@ describe("/seam slash command", () => {
       "mode",
       "repo",
       "tools",
+      "card",
       "approve",
       "reset",
       "init",
@@ -83,7 +84,7 @@ describe("/seam slash command", () => {
       "set",
       "audit",
     ]);
-    expect(names).toHaveLength(15);
+    expect(names).toHaveLength(16);
     const detach = (config?.options ?? []).find((o) => o.name === "detach");
     const state = detach?.options?.find((o) => o.name === "state");
     expect(state?.type).toBe(STRING);

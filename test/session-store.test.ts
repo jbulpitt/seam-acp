@@ -186,6 +186,7 @@ describe("SessionStore project-scoped presets (#21)", () => {
     toolsAllow: null,
     toolsExclude: null,
     instructions: null,
+    statusCardStyle: null,
     createdBy: "u1",
     createdUtc: now,
     updatedUtc: now,
@@ -276,6 +277,15 @@ describe("SessionStore project-scoped presets (#21)", () => {
     store.upsertPreset(preset({ id: "a", name: "build", projectRef: "projA" }));
     store.upsertPreset(preset({ id: "g", name: "build", projectRef: null }));
     expect(store.getPresetByName("build")?.id).toBe("g");
+  });
+
+  it("round-trips statusCardStyle (#96)", () => {
+    store.upsertPreset(preset({ id: "p1", name: "quiet", statusCardStyle: "simple" }));
+    store.upsertPreset(preset({ id: "p2", name: "loud", statusCardStyle: "full" }));
+    store.upsertPreset(preset({ id: "p3", name: "plain" }));
+    expect(store.getPreset("p1")?.statusCardStyle).toBe("simple");
+    expect(store.getPreset("p2")?.statusCardStyle).toBe("full");
+    expect(store.getPreset("p3")?.statusCardStyle).toBeNull();
   });
 });
 

@@ -70,6 +70,11 @@ function describeConfig(record: SessionRecord): ConfigDescription {
     ttsPace: { value: "natural", source: "default" },
     ttsStyle: { value: "neutral", source: "default" },
     location: { value: "local", source: "default" },
+    statusCardStyle: cfg.statusCardStyle === "simple"
+      ? { value: "simple" as const, source: "session config" }
+      : cfg.statusCardStyle === "full"
+        ? { value: "full" as const, source: "session config" }
+        : { value: "full" as const, source: "default" },
   };
 }
 
@@ -351,6 +356,54 @@ describe("session config new fields (Tier A, #72)", () => {
     expect(cfg2.mode).toBeUndefined();
     expect(cfg2.availableTools).toBeUndefined();
     expect(cfg2.excludedTools).toEqual(["Bash"]); // untouched field preserved
+  });
+});
+
+describe("statusCardStyle mutation (#96)", () => {
+  it("sets and clears session statusCardStyle without restarting", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const svc = makeService();
+    const set = svc.buildProposal(record, { session: { statusCardStyle: "simple" } });
+    expect(set.ok).toBe(true);
+    if (!set.ok) return;
+    expect(set.proposal.restartsSession).toBe(false);
+    expect(set.proposal.fields).toEqual([
+      { label: "statusCardStyle", before: "(default)", after: "simple" },
+    ]);
+    set.proposal.apply({ id: "u", name: "U" });
+    expect(store.readConfig(store.get(record.id)!).statusCardStyle).toBe("simple");
+
+    const fresh = store.get(record.id)!;
+    const clear = svc.buildProposal(fresh, { session: { statusCardStyle: null } });
+    expect(clear.ok).toBe(true);
+    if (!clear.ok) return;
+    clear.proposal.apply({ id: "u", name: "U" });
+    expect(store.readConfig(store.get(record.id)!).statusCardStyle).toBeUndefined();
+  });
+
+  it("refuses an invalid statusCardStyle", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const built = makeService().buildProposal(record, {
+      session: { statusCardStyle: "tiny" as "full" },
+    });
+    expect(built.ok).toBe(false);
+  });
+
+  it("bakes statusCardStyle into a preset", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const svc = makeService();
+    const built = svc.buildProposal(record, {
+      preset: { name: "quiet", statusCardStyle: "simple" },
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    built.proposal.apply({ id: "u", name: "U" });
+    expect(store.getPresetByNameScoped("quiet", record.parentRef)?.statusCardStyle).toBe(
+      "simple"
+    );
   });
 });
 

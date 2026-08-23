@@ -154,6 +154,7 @@ async function main(): Promise<void> {
     ? makeClaudeProfile({
         id: "claude-vertex",
         displayName: "Claude (Vertex AI)",
+        brand: "vertex",
         ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
         defaultModel: config.CLAUDE_DEFAULT_MODEL,
         staticModels: config.CLAUDE_MODELS,
@@ -220,6 +221,7 @@ async function main(): Promise<void> {
     ? makeClaudeProfile({
         id: "zai",
         displayName: "Z.ai (Zhipu GLM)",
+        brand: "z-ai",
         defaultModel: config.ZAI_DEFAULT_MODEL,
         staticModels: config.ZAI_MODELS ?? ZAI_STATIC_MODELS,
         threadAbbr: "🀄",
@@ -240,6 +242,7 @@ async function main(): Promise<void> {
     ? makeClaudeProfile({
         id: "ollama-cloud",
         displayName: "Ollama Cloud",
+        brand: "ollama-cloud",
         defaultModel: config.OLLAMA_CLOUD_DEFAULT_MODEL,
         staticModels: config.OLLAMA_CLOUD_MODELS ?? OLLAMA_CLOUD_STATIC_MODELS,
         configDir: path.join(process.env.HOME ?? "", ".claude-ollama-cloud"),
@@ -659,6 +662,7 @@ async function main(): Promise<void> {
           permission: p.permission,
           cwd: p.repoPath,
           description: p.description,
+          statusCardStyle: p.statusCardStyle,
         })),
       }),
       // #58 D2: the mutation tool refuses in a locked channel — enforced in the

@@ -3,7 +3,7 @@
  * Save plan. Persistence, pickers, and Discord interactions live in the
  * orchestrator — this module is side-effect free besides the draft map.
  */
-import type { PermissionPolicyMode, StructuredPanel } from "../../core/types.js";
+import type { PermissionPolicyMode, StatusCardStyle, StructuredPanel } from "../../core/types.js";
 import type { ThreadPresetChanges } from "../../core/config-mutation.js";
 import type {
   ConfigDescription,
@@ -25,6 +25,7 @@ export type ConfigEditorAction =
   | "effort"
   | "repo"
   | "approve"
+  | "card"
   | "rider"
   | "attach"
   | "save"
@@ -40,6 +41,7 @@ export const HUB_FIELD_ACTIONS: ReadonlyArray<Exclude<ConfigEditorAction, "save"
   "effort",
   "repo",
   "approve",
+  "card",
   "rider",
   "attach",
 ];
@@ -52,6 +54,7 @@ export interface InheritedConfig {
   cwd: string;
   permission: PermissionPolicyMode;
   detached: boolean;
+  statusCardStyle: StatusCardStyle;
 }
 
 export interface ThreadConfigSnapshot {
@@ -62,6 +65,7 @@ export interface ThreadConfigSnapshot {
   cwd: ResolvedSetting<string>;
   permission: ResolvedSetting<PermissionPolicyMode>;
   detached: ResolvedSetting<boolean>;
+  statusCardStyle: ResolvedSetting<StatusCardStyle>;
   rider: { channel?: string; thread?: string };
   locked: boolean;
   /** Values that apply if the thread overlay is removed (inherit). */
@@ -79,6 +83,7 @@ export interface DraftOverlay {
   rider?: string | null;
   detached?: boolean;
   permission?: PermissionPolicyMode | null;
+  statusCardStyle?: StatusCardStyle | null;
 }
 
 export interface ThreadConfigDraft {
@@ -146,6 +151,7 @@ export function snapshotFromDescribe(
     cwd: d.cwd,
     permission: d.permission,
     detached: d.detached,
+    statusCardStyle: d.statusCardStyle ?? { value: "full", source: "default" },
     rider: d.rider ?? {},
     locked: d.locked,
     withoutThread,
@@ -162,6 +168,7 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
   permission: PermissionPolicyMode;
   detached: boolean;
   riderThread: string | undefined;
+  statusCardStyle: StatusCardStyle;
 } {
   const s = draft.snapshot;
   const o = draft.overlay;
@@ -176,6 +183,10 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
       o.permission === undefined ? s.permission.value : o.permission ?? w.permission,
     detached: o.detached === undefined ? s.detached.value : o.detached,
     riderThread: o.rider === undefined ? s.rider.thread : o.rider ?? undefined,
+    statusCardStyle:
+      o.statusCardStyle === undefined
+        ? s.statusCardStyle.value
+        : o.statusCardStyle ?? w.statusCardStyle,
   };
 }
 
@@ -295,10 +306,25 @@ export function dirtyPermission(
   return next;
 }
 
+/** `undefined` = style not part of this save. `null` = inherit (clear session style → full). */
+export function dirtyStatusCardStyle(
+  draft: ThreadConfigDraft
+): StatusCardStyle | null | undefined {
+  if (draft.overlay.statusCardStyle === undefined) return undefined;
+  const current =
+    draft.snapshot.statusCardStyle.source === "session config"
+      ? draft.snapshot.statusCardStyle.value
+      : null;
+  const next = draft.overlay.statusCardStyle;
+  if (next === current) return undefined;
+  return next;
+}
+
 export function isDirty(draft: ThreadConfigDraft): boolean {
   return (
     Object.keys(dirtyThreadPresetChanges(draft)).length > 0 ||
-    dirtyPermission(draft) !== undefined
+    dirtyPermission(draft) !== undefined ||
+    dirtyStatusCardStyle(draft) !== undefined
   );
 }
 
@@ -421,6 +447,7 @@ export function renderHub(
         disabled: !dirty,
       },
       { customId: makeCustomId(id, "cancel"), label: "Cancel", style: "secondary" },
+      { customId: makeCustomId(id, "card"), label: "Card", style: "secondary" },
     ],
   ];
 
@@ -495,6 +522,18 @@ export function renderHub(
         value: trunc(fieldLine(attachCurrent, attachSource, attachDraft), 1024),
         inline: true,
       },
+      {
+        name: "Card",
+        value: trunc(
+          fieldLine(
+            code(s.statusCardStyle.value),
+            sourceLabel(s.statusCardStyle.source),
+            draftNoteFor(o.statusCardStyle, w.statusCardStyle)
+          ),
+          1024
+        ),
+        inline: true,
+      },
     ],
     footer: trunc(footerParts.join(" · "), 2048),
     actions,
@@ -544,6 +583,15 @@ export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
       detached: {
         value: next.detached,
         source: next.detached ? "thread preset" : "default",
+      },
+      statusCardStyle: {
+        value: next.statusCardStyle,
+        source:
+          o.statusCardStyle === undefined
+            ? s.statusCardStyle.source
+            : o.statusCardStyle === null
+              ? "default"
+              : "session config",
       },
       rider: {
         ...(s.rider.channel ? { channel: s.rider.channel } : {}),
@@ -660,6 +708,9 @@ export function applyPickerValue(
       if (inherit) overlay.detached = false;
       else overlay.detached = value === "detached";
       break;
+    case "card":
+      overlay.statusCardStyle = inherit ? null : (value as StatusCardStyle);
+      break;
     default:
       return draft;
   }
@@ -680,6 +731,7 @@ export function applyPickerValue(
 export interface ConfigEditorSavePlan {
   threadPreset: ThreadPresetChanges;
   permission?: PermissionPolicyMode | null;
+  statusCardStyle?: StatusCardStyle | null;
 }
 
 export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
@@ -688,6 +740,8 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
   };
   const perm = dirtyPermission(draft);
   if (perm !== undefined) plan.permission = perm;
+  const card = dirtyStatusCardStyle(draft);
+  if (card !== undefined) plan.statusCardStyle = card;
   return plan;
 }
 

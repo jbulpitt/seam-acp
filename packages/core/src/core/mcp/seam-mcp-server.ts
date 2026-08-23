@@ -73,6 +73,7 @@ export interface ConfigEntities {
     permission: string | null;
     cwd: string | null;
     description: string | null;
+    statusCardStyle?: string | null;
   }>;
 }
 
@@ -793,7 +794,7 @@ const TOOLS = [
       "Propose a configuration change for YOUR OWN thread. This does NOT apply anything: it posts a " +
       "confirmation card in your thread showing the exact before→after diff, and a human must click " +
       "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.\n" +
-      "- session: your thread's own runtime config (agent, model, effort, cwd, permission).\n" +
+      "- session: your thread's own runtime config (agent, model, effort, cwd, permission, statusCardStyle).\n" +
       "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target).\n" +
       "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/detached/location/tts). " +
       "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider. " +
@@ -839,6 +840,14 @@ const TOOLS = [
               items: { type: "string" },
               description: "Tool blocklist (`/seam tools exclude`). Empty array = none excluded.",
             },
+            statusCardStyle: {
+              type: "string",
+              enum: ["full", "simple"],
+              description:
+                "Per-turn status-card layout. \"full\" is the default (repo/model/action/effort). " +
+                "\"simple\" is compact (state + brand icon + latest thought + elapsed + window %). " +
+                "Empty string clears back to default full.",
+            },
           },
         },
         preset: {
@@ -877,6 +886,13 @@ const TOOLS = [
               description:
                 "The preset worker's identity/personality — injected as a <seam-worker-identity> " +
                 "block when the preset runs as a handoff/dispatch worker. Empty string clears it.",
+            },
+            statusCardStyle: {
+              type: "string",
+              enum: ["full", "simple"],
+              description:
+                "Status-card layout baked into this preset. Empty string clears it so apply " +
+                "does not touch the thread's style.",
             },
           },
           required: ["name"],
@@ -1987,6 +2003,7 @@ export class SeamMcpServer {
       line("effort:", d.effort.value ?? "(none)", d.effort.source),
       line("cwd:", d.cwd.value, d.cwd.source),
       line("permission:", d.permission.value, d.permission.source),
+      line("card style:", d.statusCardStyle?.value ?? "full", d.statusCardStyle?.source ?? "default"),
       line("detached:", d.detached.value ? "true" : "false", d.detached.source),
       line("tts:", d.tts.value ? "true" : "false", d.tts.source),
       line("tts voice:", d.ttsVoice.value ?? "(unset)", d.ttsVoice.source),
@@ -2043,6 +2060,7 @@ export class SeamMcpServer {
             p.model ? `model ${p.model}` : null,
             p.effort ? `effort ${p.effort}` : null,
             p.permission ? `perm ${p.permission}` : null,
+            p.statusCardStyle ? `card ${p.statusCardStyle}` : null,
             p.cwd ? `cwd ${p.cwd}` : null,
           ]
             .filter(Boolean)

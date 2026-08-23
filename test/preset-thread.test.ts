@@ -36,6 +36,7 @@ function preset(over: Partial<Preset> & { name: string }): Preset {
     toolsAllow: over.toolsAllow ?? null,
     toolsExclude: over.toolsExclude ?? null,
     instructions: over.instructions ?? "Be a specialist.",
+    statusCardStyle: over.statusCardStyle ?? null,
     createdBy: "admin",
     createdUtc: now,
     updatedUtc: now,
@@ -255,6 +256,21 @@ describe("/seam preset thread handler (#93)", () => {
     // First turn starts fresh against the preset (ACP binding dropped).
     expect(rec!.acpSessionId).toBe("");
     expect(router.invalidate).toHaveBeenCalled();
+  });
+
+  it("applies statusCardStyle from the preset into session config (#96)", async () => {
+    store.upsertPreset(
+      preset({ name: "quiet-card", agentId: "grok", statusCardStyle: "simple" })
+    );
+    const { orch } = makeOrch();
+    const { i } = slashI({
+      group: "preset",
+      sub: "thread",
+      strings: { name: "quiet", preset: "quiet-card" },
+    });
+    await (orch as any).cmdPresetThread(i);
+    const rec = store.get("discord:thread-new");
+    expect(store.readConfig(rec!).statusCardStyle).toBe("simple");
   });
 
   it("unknown preset at submit → friendly ephemeral refusal (no thread)", async () => {

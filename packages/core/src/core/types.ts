@@ -1,6 +1,15 @@
 /** Per-session permission policy. */
 export type PermissionPolicyMode = "always" | "ask" | "deny";
 
+/** Per-turn status-card layout (#96). Omit / unset = `"full"`. */
+export type StatusCardStyle = "full" | "simple";
+
+export const STATUS_CARD_STYLES: readonly StatusCardStyle[] = ["full", "simple"];
+
+export function parseStatusCardStyle(v: unknown): StatusCardStyle | undefined {
+  return v === "full" || v === "simple" ? v : undefined;
+}
+
 /**
  * Per-session, agent-specific settings. Stored as JSON in `sessions.config_json`.
  * Mostly mirrors the C# `SessionConfigState`, generalized for multi-agent use.
@@ -45,6 +54,11 @@ export interface SessionConfigState {
     model: string;
     atUtc: string;
   };
+  /**
+   * Status-card layout for this thread (#96). Omit = `"full"`. Stored in the
+   * session JSON blob (no DB migration). Named presets copy this in on apply.
+   */
+  statusCardStyle?: StatusCardStyle;
 }
 
 export function defaultSessionConfig(
@@ -84,6 +98,11 @@ export interface Preset {
    *  block when the preset runs as a handoff/dispatch worker (#23), so a stateless
    *  preset worker cold-starts with this identity. */
   instructions: string | null;
+  /**
+   * Status-card layout baked into this preset (#96). `null` = this preset does
+   * not touch the thread's style (apply leaves the session value alone).
+   */
+  statusCardStyle: StatusCardStyle | null;
   createdBy: string;
   createdUtc: string;
   updatedUtc: string;
@@ -169,10 +188,20 @@ export interface StatusPanel {
   elapsedSeconds: number;
   /** Optional context-window line shown when token info is known. */
   context?: string;
+  /** Integer percent of the context window used, when known. Simple cards
+   *  show this instead of the full `used / size (pct)` string. */
+  contextPct?: number;
   /** Recent tool / progress activity (oldest → newest). */
   activity?: string[];
   /** Last few lines of model reasoning (oldest → newest). */
   thinking?: string[];
+  /** `"simple"` drops repo/model/action/effort/tool-tags; default `"full"`. */
+  style?: StatusCardStyle;
+  /** Filename of the brand logo attached at card creation (`attachment://`). */
+  brandFilename?: string;
+  /** Author name for the full card (agent display name / brand). Simple cards
+   *  put the turn state in `author` instead and ignore this. */
+  authorName?: string;
 }
 
 // --- delegation ledger -----------------------------------------------------
@@ -443,10 +472,12 @@ export interface PanelButton {
 export interface StructuredPanel {
   /** Sidebar / accent color as a hex number (e.g. 0x57F287 for green). */
   color: number;
-  /** Main title line (e.g. "⏳ Working"). */
-  title: string;
-  /** Optional author line (e.g. agent display name). */
+  /** Main title line (e.g. "⏳ Working"). Omit on the simple status card. */
+  title?: string;
+  /** Optional author line (e.g. agent display name, or turn state on simple). */
   author?: string;
+  /** Discord `attachment://<filename>` (or a URL) for the author icon. */
+  authorIconURL?: string;
   /** Optional body text rendered as markdown (activity log, thinking, etc.). */
   description?: string;
   /** Key/value fields for the embed grid. */

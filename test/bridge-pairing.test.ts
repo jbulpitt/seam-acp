@@ -36,6 +36,7 @@ function describeConfig(record: SessionRecord): ConfigDescription {
     ttsPace: { value: "natural", source: "default" },
     ttsStyle: { value: "neutral", source: "default" },
     location: { value: "local", source: "default" },
+    statusCardStyle: { value: "full", source: "default" },
   };
 }
 

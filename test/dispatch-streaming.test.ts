@@ -110,6 +110,7 @@ function makeOrch(opts: {
     updateDelegationStatus: () => {},
     getReportBackByCorrelation: () => null,
     tryRecordReportBack: (e: unknown) => e,
+    getParkedByChannel: () => null,
   };
   const config = {
     DATA_DIR: opts.dataDir,

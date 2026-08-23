@@ -1162,10 +1162,15 @@ export class DiscordAdapter implements ChatAdapter {
     panel: StructuredPanel
   ): EmbedBuilder {
     const embed = new EmbedBuilder()
-      .setColor(panel.color)
-      .setTitle(panel.title);
+      .setColor(panel.color);
+    if (panel.title) {
+      embed.setTitle(panel.title);
+    }
     if (panel.author) {
-      embed.setAuthor({ name: panel.author });
+      embed.setAuthor({
+        name: panel.author,
+        ...(panel.authorIconURL ? { iconURL: panel.authorIconURL } : {}),
+      });
     }
     if (panel.description) {
       embed.setDescription(panel.description.slice(0, 4096));

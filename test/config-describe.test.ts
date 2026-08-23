@@ -231,4 +231,18 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
     const d = router.describeConfig(makeRecord());
     expect(d.rider).toEqual({});
   });
+
+  it("statusCardStyle defaults to full (#96)", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(makeRecord());
+    expect(d.statusCardStyle).toEqual({ value: "full", source: "default" });
+  });
+
+  it("statusCardStyle simple is sourced from session config (#96)", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(
+      makeRecord({ configJson: JSON.stringify({ model: "gpt-5.4", statusCardStyle: "simple" }) })
+    );
+    expect(d.statusCardStyle).toEqual({ value: "simple", source: "session config" });
+  });
 });

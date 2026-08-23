@@ -42,13 +42,16 @@ export interface Renderer {
  */
 export function serializePanelText(panel: StructuredPanel): string {
   const lines: string[] = [];
-  lines.push(`**${panel.title}**`);
-  lines.push("```text");
-  const maxKey = panel.fields.reduce((m, f) => Math.max(m, f.name.length), 0);
-  for (const f of panel.fields) {
-    lines.push(`${f.name.padEnd(maxKey)} : ${f.value}`);
+  if (panel.author) lines.push(`**${panel.author}**`);
+  if (panel.title) lines.push(`**${panel.title}**`);
+  if (panel.fields.length > 0) {
+    lines.push("```text");
+    const maxKey = panel.fields.reduce((m, f) => Math.max(m, f.name.length), 0);
+    for (const f of panel.fields) {
+      lines.push(`${f.name.padEnd(maxKey)} : ${f.value}`);
+    }
+    lines.push("```");
   }
-  lines.push("```");
   if (panel.description) {
     lines.push(panel.description);
   }

@@ -40,6 +40,16 @@ export function formatVoiceNoteBlock(
   return parts.join("\n\n");
 }
 
+export function formatHeardMessage(notes: ReadonlyArray<VoiceNoteResult>): string | null {
+  if (notes.length === 0) return null;
+  const lines = notes.map((n) => {
+    if (n.transcript) return `_Heard:_ "${n.transcript}"`;
+    const err = n.error?.trim() || "unknown error";
+    return `_Couldn't transcribe voice note:_ ${err}`;
+  });
+  return lines.join("\n");
+}
+
 export async function applyVoiceNoteTranscriptions(opts: {
   prompt: string;
   attachments: ReadonlyArray<MessageAttachment>;
@@ -48,12 +58,12 @@ export async function applyVoiceNoteTranscriptions(opts: {
   speakerLabel?: string;
   fetchFn?: typeof fetch;
   downloadFn?: (url: string) => Promise<Uint8Array>;
-}): Promise<string> {
+}): Promise<{ prompt: string; notes: VoiceNoteResult[] }> {
   const apiKey = opts.apiKey.trim();
-  if (!apiKey) return opts.prompt;
+  if (!apiKey) return { prompt: opts.prompt, notes: [] };
 
   const voice = opts.attachments.filter(isVoiceNoteAttachment);
-  if (voice.length === 0) return opts.prompt;
+  if (voice.length === 0) return { prompt: opts.prompt, notes: [] };
 
   const download = opts.downloadFn ?? defaultDownload(opts.fetchFn ?? fetch);
   const notes: VoiceNoteResult[] = [];
@@ -76,8 +86,11 @@ export async function applyVoiceNoteTranscriptions(opts: {
   }
 
   const block = formatVoiceNoteBlock(opts.speakerLabel ?? "user", notes);
-  if (!block) return opts.prompt;
-  return opts.prompt ? `${opts.prompt}\n\n${block}` : block;
+  if (!block) return { prompt: opts.prompt, notes };
+  return {
+    prompt: opts.prompt ? `${opts.prompt}\n\n${block}` : block,
+    notes,
+  };
 }
 
 function defaultDownload(fetchFn: typeof fetch): (url: string) => Promise<Uint8Array> {

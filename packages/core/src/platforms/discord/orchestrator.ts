@@ -238,7 +238,7 @@ import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
-import { applyVoiceNoteTranscriptions } from "../../core/audio/voice-notes.js";
+import { applyVoiceNoteTranscriptions, formatHeardMessage } from "../../core/audio/voice-notes.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, withHarnessPreamble } from "../../core/agent-conventions.js";
 import {
   CHOICE_AUTHORING_RULE,
@@ -1632,18 +1632,28 @@ export class Orchestrator {
         const speakerLabel =
           (msg.authorName && msg.authorName.trim()) || speaker?.name || "user";
         try {
-          promptText = await applyVoiceNoteTranscriptions({
+          const voiced = await applyVoiceNoteTranscriptions({
             prompt: promptText,
             attachments: msg.attachments,
             apiKey: this.config.SEAM_GEMINI_API_KEY,
             model: this.config.SEAM_GEMINI_STT_MODEL,
             speakerLabel,
           });
+          promptText = voiced.prompt;
+          const heard = formatHeardMessage(voiced.notes);
+          if (heard) {
+            await this.adapter.sendMessage(channel, heard).catch((err) => {
+              this.logger.warn({ err }, "failed to post voice-note Heard: line");
+            });
+          }
         } catch (err) {
           this.logger.warn({ err }, "voice-note STT threw; continuing with fail-visible note");
           const fail =
             `_Voice note from ${speakerLabel} (transcription failed: unexpected error)._`;
           promptText = promptText ? `${promptText}\n\n${fail}` : fail;
+          await this.adapter.sendMessage(channel, `_Couldn't transcribe voice note:_ unexpected error`).catch(
+            () => {}
+          );
         }
       }
 

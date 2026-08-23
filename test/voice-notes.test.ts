@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { transcribeAudioWithGemini } from "../packages/core/src/core/audio/gemini-stt.js";
 import {
   applyVoiceNoteTranscriptions,
+  formatHeardMessage,
   formatVoiceNoteBlock,
   isVoiceNoteAttachment,
 } from "../packages/core/src/core/audio/voice-notes.js";
@@ -103,7 +104,8 @@ describe("applyVoiceNoteTranscriptions", () => {
       speakerLabel: "Jesse",
       fetchFn,
     });
-    expect(out).toBe(prompt);
+    expect(out.prompt).toBe(prompt);
+    expect(out.notes).toEqual([]);
     expect(called).toBe(0);
   });
 
@@ -123,10 +125,11 @@ describe("applyVoiceNoteTranscriptions", () => {
       speakerLabel: "Jesse Bulpitt",
       fetchFn,
     });
-    expect(out.startsWith("harness preamble here")).toBe(true);
-    expect(out).toContain("Voice note from Jesse Bulpitt");
-    expect(out).toContain("Are you able to interpret this?");
-    expect(out).not.toContain("pic.png");
+    expect(out.prompt.startsWith("harness preamble here")).toBe(true);
+    expect(out.prompt).toContain("Voice note from Jesse Bulpitt");
+    expect(out.prompt).toContain("Are you able to interpret this?");
+    expect(out.prompt).not.toContain("pic.png");
+    expect(out.notes[0]?.transcript).toBe("Are you able to interpret this?");
   });
 
   it("still runs the turn with a fail-visible note when STT errors", async () => {
@@ -143,7 +146,20 @@ describe("applyVoiceNoteTranscriptions", () => {
       speakerLabel: "Jesse",
       fetchFn,
     });
-    expect(out).toContain("please transcribe");
-    expect(out).toMatch(/transcription failed: backend exploded/);
+    expect(out.prompt).toContain("please transcribe");
+    expect(out.prompt).toMatch(/transcription failed: backend exploded/);
+    expect(out.notes[0]?.error).toMatch(/backend exploded/);
+  });
+});
+
+describe("formatHeardMessage", () => {
+  it("shows the user what the model heard", () => {
+    expect(formatHeardMessage([{ filename: "v.ogg", transcript: "hello" }])).toBe(
+      '_Heard:_ "hello"'
+    );
+    expect(formatHeardMessage([{ filename: "v.ogg", error: "STT HTTP 500" }])).toBe(
+      "_Couldn't transcribe voice note:_ STT HTTP 500"
+    );
+    expect(formatHeardMessage([])).toBeNull();
   });
 });

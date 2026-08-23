@@ -53,6 +53,7 @@ describe("formatVoiceNoteBlock", () => {
     expect(text).toContain("The user (Jesse) sent a voice note");
     expect(text).toContain('"Hello there"');
     expect(text).not.toContain("voice-message.ogg");
+    expect(text).not.toContain("Original audio");
   });
 
   it("is fail-visible when STT errors", () => {
@@ -61,6 +62,16 @@ describe("formatVoiceNoteBlock", () => {
     ]);
     expect(text).toMatch(/The user \(Jesse\) sent a voice note \(transcription failed: STT HTTP 500\)/);
     expect(text).not.toContain("undefined");
+  });
+
+  it("points at Discord's CDN copy instead of a local file", () => {
+    const url = "https://cdn.discordapp.com/attachments/1/2/voice-message.ogg?ex=abc";
+    const text = formatVoiceNoteBlock("Jesse", [
+      { filename: "voice-message.ogg", transcript: "Hello there", sourceUrl: url },
+    ]);
+    expect(text).toContain('"Hello there"');
+    expect(text).toContain("Original audio (Discord CDN; signed URL, may expire)");
+    expect(text).toContain(url);
   });
 });
 
@@ -138,8 +149,10 @@ describe("applyVoiceNoteTranscriptions", () => {
     expect(out.prompt.startsWith("harness preamble here")).toBe(true);
     expect(out.prompt).toContain("The user (Jesse Bulpitt) sent a voice note");
     expect(out.prompt).toContain("Are you able to interpret this?");
+    expect(out.prompt).toContain("https://cdn.example/voice-message.ogg");
     expect(out.prompt).not.toContain("pic.png");
     expect(out.notes[0]?.transcript).toBe("Are you able to interpret this?");
+    expect(out.notes[0]?.sourceUrl).toBe("https://cdn.example/voice-message.ogg");
   });
 
   it("still runs the turn with a fail-visible note when STT errors", async () => {
@@ -158,7 +171,9 @@ describe("applyVoiceNoteTranscriptions", () => {
     });
     expect(out.prompt).toContain("please transcribe");
     expect(out.prompt).toMatch(/transcription failed: backend exploded/);
+    expect(out.prompt).toContain("https://cdn.example/voice-message.ogg");
     expect(out.notes[0]?.error).toMatch(/backend exploded/);
+    expect(out.notes[0]?.sourceUrl).toBe("https://cdn.example/voice-message.ogg");
   });
 });
 

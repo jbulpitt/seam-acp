@@ -10,6 +10,8 @@ export interface VoiceNoteResult {
   filename: string;
   transcript?: string;
   error?: string;
+  /** Discord CDN URL for the original audio. Signed; typically expires in ~24h. */
+  sourceUrl?: string;
 }
 
 const VOICE_EXTS = /\.(ogg|opus|oga|mp3|wav|m4a|webm|aac)$/i;
@@ -36,13 +38,19 @@ export function formatVoiceNoteBlock(
   if (notes.length === 0) return "";
   const who = speakerLabel.trim() || "user";
   const parts = notes.map((n) => {
-    if (n.transcript) {
-      return `_The user (${who}) sent a voice note:_ "${n.transcript}"`;
-    }
-    const err = n.error?.trim() || "unknown error";
-    return `_The user (${who}) sent a voice note (transcription failed: ${err})._`;
+    const spoken = n.transcript
+      ? `_The user (${who}) sent a voice note:_ "${n.transcript}"`
+      : `_The user (${who}) sent a voice note (transcription failed: ${n.error?.trim() || "unknown error"})._`;
+    const source = formatOriginalAudioLine(n.sourceUrl);
+    return source ? `${spoken}\n${source}` : spoken;
   });
   return parts.join("\n\n");
+}
+
+function formatOriginalAudioLine(url?: string): string | null {
+  const src = url?.trim();
+  if (!src) return null;
+  return `_Original audio (Discord CDN; signed URL, may expire):_ ${src}`;
 }
 
 export function formatHeardMessage(notes: ReadonlyArray<VoiceNoteResult>): string | null {
@@ -82,11 +90,14 @@ export async function applyVoiceNoteTranscriptions(opts: {
         ...(opts.model ? { model: opts.model } : {}),
         ...(opts.fetchFn ? { fetchFn: opts.fetchFn } : {}),
       });
-      if (result.ok) notes.push({ filename: a.filename, transcript: result.text });
-      else notes.push({ filename: a.filename, error: result.error });
+      if (result.ok) {
+        notes.push({ filename: a.filename, transcript: result.text, sourceUrl: a.url });
+      } else {
+        notes.push({ filename: a.filename, error: result.error, sourceUrl: a.url });
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "download failed";
-      notes.push({ filename: a.filename, error: msg });
+      notes.push({ filename: a.filename, error: msg, sourceUrl: a.url });
     }
   }
 

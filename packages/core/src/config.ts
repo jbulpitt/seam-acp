@@ -528,6 +528,13 @@ const Schema = z.object({
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .default("info"),
   HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+  /**
+   * Google AI Studio key for control-plane Discord voice-note STT (not agy/SSO).
+   * Empty = leave audio attachments untranscribed (current behavior).
+   */
+  SEAM_GEMINI_API_KEY: z.string().default(""),
+  /** Gemini model id used for inbound voice-note transcription. */
+  SEAM_GEMINI_STT_MODEL: z.string().min(1).default("gemini-3.7-flash"),
   /** #92: how long POST /ingest waits for submit_result before 202 + poll.
    *  Default 5 min. Ceiling 30 min. Public Cloudflare POSTs still die ~100s —
    *  microsites should poll GET /ingest/jobs/:id (or POST ?wait=0). */

@@ -238,6 +238,7 @@ import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
+import { applyVoiceNoteTranscriptions } from "../../core/audio/voice-notes.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, withHarnessPreamble } from "../../core/agent-conventions.js";
 import {
   CHOICE_AUTHORING_RULE,
@@ -1625,6 +1626,25 @@ export class Orchestrator {
         );
         if (hint) promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
         promptAttachments = inline.length > 0 ? inline : undefined;
+      }
+
+      if (msg.attachments && msg.attachments.length > 0) {
+        const speakerLabel =
+          (msg.authorName && msg.authorName.trim()) || speaker?.name || "user";
+        try {
+          promptText = await applyVoiceNoteTranscriptions({
+            prompt: promptText,
+            attachments: msg.attachments,
+            apiKey: this.config.SEAM_GEMINI_API_KEY,
+            model: this.config.SEAM_GEMINI_STT_MODEL,
+            speakerLabel,
+          });
+        } catch (err) {
+          this.logger.warn({ err }, "voice-note STT threw; continuing with fail-visible note");
+          const fail =
+            `_Voice note from ${speakerLabel} (transcription failed: unexpected error)._`;
+          promptText = promptText ? `${promptText}\n\n${fail}` : fail;
+        }
       }
 
       // One transparent retry on transient failures. Both cases fire before any

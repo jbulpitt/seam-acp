@@ -162,7 +162,7 @@ function isImageMime(mime: string): boolean {
   return mime.startsWith("image/");
 }
 
-function isAudioMime(mime: string): boolean {
+export function isAudioMime(mime: string): boolean {
   return mime.startsWith("audio/");
 }
 

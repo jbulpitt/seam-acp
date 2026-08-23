@@ -238,7 +238,12 @@ import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
-import { applyVoiceNoteTranscriptions, formatHeardMessage } from "../../core/audio/voice-notes.js";
+import {
+  applyVoiceNoteTranscriptions,
+  formatHeardMessage,
+  isVoiceNoteAttachment,
+  withoutVoiceNotes,
+} from "../../core/audio/voice-notes.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, withHarnessPreamble } from "../../core/agent-conventions.js";
 import {
   CHOICE_AUTHORING_RULE,
@@ -1585,6 +1590,7 @@ export class Orchestrator {
         const cwd = record.repoPath ?? process.cwd();
         const pathLines: string[] = [];
         for (const a of msg.attachments) {
+          if (isVoiceNoteAttachment(a)) continue;
           try {
             const res = await fetch(a.url);
             if (!res.ok) throw new Error(`download ${res.status} ${res.statusText}`);
@@ -1603,10 +1609,12 @@ export class Orchestrator {
             pathLines.push(`- \`${a.filename}\` — could not be transferred to the agent host`);
           }
         }
-        const hint =
-          `\n\n_The following file${pathLines.length === 1 ? " was" : "s were"} ` +
-          `uploaded and saved to the agent's filesystem:_\n${pathLines.join("\n")}`;
-        promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
+        if (pathLines.length > 0) {
+          const hint =
+            `\n\n_The following file${pathLines.length === 1 ? " was" : "s were"} ` +
+            `uploaded and saved to the agent's filesystem:_\n${pathLines.join("\n")}`;
+          promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
+        }
         promptAttachments = undefined; // already on disk; no ACP attachment blocks
       } else if (
         !activeProfile?.restrictDiscordAccess &&
@@ -1625,7 +1633,13 @@ export class Orchestrator {
           agentHasVision
         );
         if (hint) promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
-        promptAttachments = inline.length > 0 ? inline : undefined;
+        promptAttachments = inline.length > 0 ? withoutVoiceNotes(inline) : undefined;
+        if (promptAttachments && promptAttachments.length === 0) promptAttachments = undefined;
+      }
+
+      if (promptAttachments && promptAttachments.length > 0) {
+        promptAttachments = withoutVoiceNotes(promptAttachments);
+        if (promptAttachments.length === 0) promptAttachments = undefined;
       }
 
       if (msg.attachments && msg.attachments.length > 0) {
@@ -6311,6 +6325,8 @@ export class Orchestrator {
     const stagedLines: string[] = [];
     const batchId = randomUUID().slice(0, 8);
     for (const a of attachments) {
+      // Voice notes are transcribed into the prompt; never stage or inline audio.
+      if (isVoiceNoteAttachment(a)) continue;
       if (isInlineableForAgent(a.contentType ?? "", a.filename, agentHasVision)) {
         inline.push(a);
         continue;

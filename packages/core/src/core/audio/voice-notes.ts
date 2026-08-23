@@ -23,6 +23,12 @@ export function isVoiceNoteAttachment(a: {
   return VOICE_EXTS.test(a.filename ?? "");
 }
 
+export function withoutVoiceNotes<T extends { contentType?: string | null; filename?: string }>(
+  attachments: ReadonlyArray<T>
+): T[] {
+  return attachments.filter((a) => !isVoiceNoteAttachment(a));
+}
+
 export function formatVoiceNoteBlock(
   speakerLabel: string,
   notes: ReadonlyArray<VoiceNoteResult>
@@ -30,12 +36,11 @@ export function formatVoiceNoteBlock(
   if (notes.length === 0) return "";
   const who = speakerLabel.trim() || "user";
   const parts = notes.map((n) => {
-    const file = n.filename ? ` (\`${n.filename}\`)` : "";
     if (n.transcript) {
-      return `_Voice note from ${who}${file}:_\n"${n.transcript}"`;
+      return `_The user (${who}) sent a voice note:_ "${n.transcript}"`;
     }
     const err = n.error?.trim() || "unknown error";
-    return `_Voice note from ${who}${file} (transcription failed: ${err})._`;
+    return `_The user (${who}) sent a voice note (transcription failed: ${err})._`;
   });
   return parts.join("\n\n");
 }

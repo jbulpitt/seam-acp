@@ -5,6 +5,7 @@ import {
   formatHeardMessage,
   formatVoiceNoteBlock,
   isVoiceNoteAttachment,
+  withoutVoiceNotes,
 } from "../packages/core/src/core/audio/voice-notes.js";
 import type { MessageAttachment } from "../packages/core/src/platforms/chat-adapter.js";
 
@@ -33,6 +34,15 @@ describe("isVoiceNoteAttachment", () => {
     expect(isVoiceNoteAttachment({ contentType: null, filename: "voice-message.ogg" })).toBe(true);
     expect(isVoiceNoteAttachment({ contentType: "image/png", filename: "pic.png" })).toBe(false);
   });
+
+  it("strips voice notes from the attachment list the model would see", () => {
+    const kept = withoutVoiceNotes([
+      voice(),
+      { url: "https://cdn.example/pic.png", filename: "pic.png", contentType: "image/png", size: 10 },
+    ]);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]!.filename).toBe("pic.png");
+  });
 });
 
 describe("formatVoiceNoteBlock", () => {
@@ -40,16 +50,16 @@ describe("formatVoiceNoteBlock", () => {
     const text = formatVoiceNoteBlock("Jesse", [
       { filename: "voice-message.ogg", transcript: "Hello there" },
     ]);
-    expect(text).toContain("Voice note from Jesse");
-    expect(text).toContain("`voice-message.ogg`");
+    expect(text).toContain("The user (Jesse) sent a voice note");
     expect(text).toContain('"Hello there"');
+    expect(text).not.toContain("voice-message.ogg");
   });
 
   it("is fail-visible when STT errors", () => {
     const text = formatVoiceNoteBlock("Jesse", [
       { filename: "voice-message.ogg", error: "STT HTTP 500" },
     ]);
-    expect(text).toMatch(/transcription failed: STT HTTP 500/);
+    expect(text).toMatch(/The user \(Jesse\) sent a voice note \(transcription failed: STT HTTP 500\)/);
     expect(text).not.toContain("undefined");
   });
 });
@@ -126,7 +136,7 @@ describe("applyVoiceNoteTranscriptions", () => {
       fetchFn,
     });
     expect(out.prompt.startsWith("harness preamble here")).toBe(true);
-    expect(out.prompt).toContain("Voice note from Jesse Bulpitt");
+    expect(out.prompt).toContain("The user (Jesse Bulpitt) sent a voice note");
     expect(out.prompt).toContain("Are you able to interpret this?");
     expect(out.prompt).not.toContain("pic.png");
     expect(out.notes[0]?.transcript).toBe("Are you able to interpret this?");

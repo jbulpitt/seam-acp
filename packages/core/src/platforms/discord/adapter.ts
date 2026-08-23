@@ -235,7 +235,12 @@ export function classifyDiscordInteraction(interaction: {
   const isModal = interaction.isModalSubmit();
   const isSelect = interaction.isStringSelectMenu?.() === true;
   const cid = isButton || isModal || isSelect ? (interaction.customId ?? "") : "";
-  if ((isButton || isModal) && cid.startsWith("seam-cfg-edit:")) return "config-edit";
+  if (
+    (isButton || isModal) &&
+    (cid.startsWith("seam-cfg-edit:") || cid.startsWith("seam-tts:"))
+  ) {
+    return "config-edit";
+  }
   if (cid.startsWith(CHOICE_CUSTOM_ID_PREFIX)) return "choice";
   return "none";
 }

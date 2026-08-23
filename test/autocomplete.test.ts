@@ -181,6 +181,15 @@ describe("classifyDiscordInteraction — autocomplete is a parallel branch", () 
     ).toBe("config-edit");
   });
 
+  it("TTS settings-card buttons route to the persistent-component handler", () => {
+    expect(
+      classifyDiscordInteraction(flags({ button: true, customId: "seam-tts:draft-1:cancel" }))
+    ).toBe("config-edit");
+    expect(
+      classifyDiscordInteraction(flags({ button: true, customId: "seam-tts:draft-1:toggle" }))
+    ).toBe("config-edit");
+  });
+
   it("choice cards still route to choice", () => {
     expect(
       classifyDiscordInteraction(

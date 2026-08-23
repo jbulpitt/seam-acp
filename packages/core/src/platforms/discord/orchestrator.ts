@@ -656,7 +656,9 @@ export class Orchestrator {
     this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
     this.adapter.onComponent?.((evt) => {
       void this.handleConfigEditorComponent(evt);
-      void this.handleTtsEditorComponent(evt);
+      void this.handleTtsEditorComponent(evt).catch((err) => {
+        this.logger.warn({ err, customId: evt.customId }, "tts editor component failed");
+      });
     });
     this.adapter.onChoiceInteraction?.((evt) => this.handleChoiceCardInteraction(evt));
     this.adapter.onThreadDelete?.((channelRef) => this.handleThreadDeleted(channelRef));
@@ -10915,7 +10917,12 @@ export class Orchestrator {
     }
 
     const action = parsed.action;
-    await evt.deferUpdate();
+    try {
+      await evt.deferUpdate();
+    } catch (err) {
+      this.logger.warn({ err, customId: evt.customId }, "tts editor deferUpdate failed");
+      return;
+    }
 
     if (action === "cancel") {
       this.ttsEditor.delete(draft.id);

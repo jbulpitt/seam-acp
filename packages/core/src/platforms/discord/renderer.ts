@@ -117,7 +117,6 @@ export const discordRenderer: Renderer = {
         : trim(state.model, 40);
     const fields: StructuredPanel["fields"] = [
       { name: "Repo", value: trim(state.repoDisplay, 80), inline: true },
-      { name: "Model", value: modelValue, inline: true },
       { name: "Action", value: trim(state.action, 220), inline: true },
     ];
     // --- description: activity as inline code "tags" ---
@@ -148,13 +147,12 @@ export const discordRenderer: Renderer = {
       ? `${state.titlePrefix} · ${state.state}`
       : state.state;
 
-    const authorName = state.authorName?.trim();
     return {
       color: COLOR_BY_STATE[state.state],
       title,
-      ...(authorName || state.brandFilename
-        ? { author: authorName || state.state }
-        : {}),
+      // Author line carries the resolved model; the brand icon conveys the
+      // agent/service, and the Model field is dropped from the grid (#96 follow-up).
+      ...(modelValue ? { author: modelValue } : {}),
       ...authorIcon(state),
       fields,
       description,

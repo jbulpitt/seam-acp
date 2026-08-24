@@ -17,9 +17,10 @@ describe("discordRenderer", () => {
     const repoField = out.fields?.find(f => f.name === "Repo");
     expect(repoField?.value).toBe("myrepo");
     
-    const modelField = out.fields?.find(f => f.name === "Model");
-    expect(modelField?.value).toBe("gpt-5.4");
-    
+    // Model moved to the author line; the field is gone (#96 follow-up)
+    expect(out.fields?.find(f => f.name === "Model")).toBeUndefined();
+    expect(out.author).toBe("gpt-5.4");
+
     const actionField = out.fields?.find(f => f.name === "Action");
     expect(actionField?.value).toBe("Starting…");
 
@@ -38,9 +39,10 @@ describe("discordRenderer", () => {
       authorName: "GitHub Copilot",
     });
     expect(out.title).toBe("Working");
-    expect(out.author).toBe("GitHub Copilot");
+    expect(out.author).toBe("gpt-5.4"); // author line is the model; icon carries the agent
     expect(out.authorIconURL).toBe("attachment://copilot.png");
     expect(out.fields.find((f) => f.name === "Repo")).toBeTruthy();
+    expect(out.fields.find((f) => f.name === "Model")).toBeUndefined();
     expect(out.footer).toContain("🧠");
     expect(out.files).toBeUndefined();
   });

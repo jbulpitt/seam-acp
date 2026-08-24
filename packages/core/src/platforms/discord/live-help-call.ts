@@ -257,15 +257,33 @@ export async function runLiveHelpCall(opts: {
     return null;
   };
 
+  let loggedFirstUp = false;
+  let loggedFirstDown = false;
   const flushMix = (): void => {
     if (pendingMix.length === 0) return;
     const mixed = mixMono16(pendingMix.splice(0, pendingMix.length));
-    if (mixed.byteLength > 0) live?.sendPcm16k(mixed);
+    if (mixed.byteLength === 0) return;
+    if (!loggedFirstUp) {
+      loggedFirstUp = true;
+      opts.logger.info(
+        { bytes: mixed.byteLength, liveId: opts.row.id },
+        "live-help first pcm up to Gemini"
+      );
+    }
+    live?.sendPcm16k(mixed);
   };
 
   const subscribeUser = (userId: string): void => {
-    if (subscribed.has(userId)) return;
     if (userId === opts.client.user?.id) return;
+    const prev = connection.receiver.subscriptions.get(userId);
+    if (prev) {
+      try {
+        prev.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+    subscribed.delete(userId);
     subscribed.add(userId);
     const stream = connection.receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.Manual },
@@ -305,19 +323,21 @@ export async function runLiveHelpCall(opts: {
     }
     lastHumanAt = Date.now();
 
-    connection.receiver.speaking.on("start", (userId: string) => {
-      subscribeUser(userId);
-    });
-    for (const member of ch.members.values()) {
-      if (!member.user.bot) subscribeUser(member.id);
-    }
-
     live = await GeminiLiveSession.connect({
       apiKey: opts.apiKey,
       system: opts.row.system,
       ...(opts.row.historySummary ? { historySummary: opts.row.historySummary } : {}),
       handlers: {
-        onAudio: pushGeminiPcm,
+        onAudio: (pcm) => {
+          if (!loggedFirstDown) {
+            loggedFirstDown = true;
+            opts.logger.info(
+              { bytes: pcm.byteLength, liveId: opts.row.id },
+              "live-help first pcm down from Gemini"
+            );
+          }
+          pushGeminiPcm(pcm);
+        },
         onTranscript: opts.onTranscript,
         onInterrupted: interruptPlay,
         onGoAway: () => {
@@ -326,6 +346,13 @@ export async function runLiveHelpCall(opts: {
       },
     });
     opts.onLive();
+
+    connection.receiver.speaking.on("start", (userId: string) => {
+      subscribeUser(userId);
+    });
+    for (const id of connection.receiver.speaking.users.keys()) {
+      subscribeUser(id);
+    }
 
     const mixTimer = setInterval(flushMix, 20);
     const started = Date.now();

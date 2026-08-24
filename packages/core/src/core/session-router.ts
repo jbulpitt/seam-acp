@@ -142,11 +142,21 @@ export interface ConfigDescription {
    * a channel change applies to existing threads with no per-thread re-apply.
    */
   statusCardStyle: ResolvedSetting<StatusCardStyle>;
+  /**
+   * Random GIF thumbnail on the simple status card. Same precedence as
+   * statusCardStyle. Default `false`.
+   */
+  simpleCardGif: ResolvedSetting<boolean>;
 }
 
 /** Layout the status card should render. Always `"full"` or `"simple"`. */
 export function statusCardStyleForRender(d: ConfigDescription): StatusCardStyle {
   return d.statusCardStyle?.value === "simple" ? "simple" : "full";
+}
+
+/** Whether the simple card should show a random GIF thumbnail. */
+export function simpleCardGifForRender(d: ConfigDescription): boolean {
+  return d.simpleCardGif?.value === true;
 }
 
 /**
@@ -346,6 +356,15 @@ export class SessionRouter {
             ? { value: chan.statusCardStyle.value, source: "channel preset" }
             : { value: "full", source: "default" };
 
+    const simpleCardGif: ResolvedSetting<boolean> =
+      typeof cfg.simpleCardGif === "boolean"
+        ? { value: cfg.simpleCardGif, source: "session config" }
+        : typeof thread?.simpleCardGif?.value === "boolean"
+          ? { value: thread.simpleCardGif.value, source: "thread preset" }
+          : typeof chan?.simpleCardGif?.value === "boolean"
+            ? { value: chan.simpleCardGif.value, source: "channel preset" }
+            : { value: false, source: "default" };
+
     return {
       sessionId: record.id,
       channelRef: record.channelRef,
@@ -364,6 +383,7 @@ export class SessionRouter {
       location,
       rider,
       statusCardStyle,
+      simpleCardGif,
       ...(effortIgnoredNote ? { effortIgnoredNote } : {}),
     };
   }

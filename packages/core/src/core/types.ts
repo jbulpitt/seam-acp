@@ -10,6 +10,13 @@ export function parseStatusCardStyle(v: unknown): StatusCardStyle | undefined {
   return v === "full" || v === "simple" ? v : undefined;
 }
 
+/** Parse a simple-card GIF toggle. `true`/`"on"`/`"true"` → on; `false`/`"off"`/`"false"` → off. */
+export function parseSimpleCardGif(v: unknown): boolean | undefined {
+  if (v === true || v === "on" || v === "true") return true;
+  if (v === false || v === "off" || v === "false") return false;
+  return undefined;
+}
+
 /**
  * Per-session, agent-specific settings. Stored as JSON in `sessions.config_json`.
  * Mostly mirrors the C# `SessionConfigState`, generalized for multi-agent use.
@@ -59,6 +66,12 @@ export interface SessionConfigState {
    * session JSON blob (no DB migration). Named presets copy this in on apply.
    */
   statusCardStyle?: StatusCardStyle;
+  /**
+   * Random curated GIF in the simple status-card thumbnail. Omit = inherit
+   * (channel/thread preset, then default off). Explicit `false` turns it off
+   * even if a parent preset is on.
+   */
+  simpleCardGif?: boolean;
 }
 
 export function defaultSessionConfig(
@@ -202,6 +215,8 @@ export interface StatusPanel {
   /** Author name for the full card (agent display name / brand). Simple cards
    *  put the turn state in `author` instead and ignore this. */
   authorName?: string;
+  /** HTTPS GIF URL for the simple-card thumbnail. Unset = no thumbnail. */
+  gifUrl?: string;
 }
 
 // --- delegation ledger -----------------------------------------------------
@@ -478,6 +493,8 @@ export interface StructuredPanel {
   author?: string;
   /** Discord `attachment://<filename>` (or a URL) for the author icon. */
   authorIconURL?: string;
+  /** Discord embed thumbnail URL (simple-card GIF). */
+  thumbnailUrl?: string;
   /** Optional body text rendered as markdown (activity log, thinking, etc.). */
   description?: string;
   /** Key/value fields for the embed grid. */

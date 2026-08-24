@@ -807,14 +807,14 @@ const TOOLS = [
       "Propose a configuration change for YOUR OWN thread. This does NOT apply anything: it posts a " +
       "confirmation card in your thread showing the exact before→after diff, and a human must click " +
       "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.\n" +
-      "- session: your thread's own runtime config (agent, model, effort, cwd, permission, statusCardStyle).\n" +
+      "- session: your thread's own runtime config (agent, model, effort, cwd, permission, statusCardStyle, simpleCardGif).\n" +
       "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target).\n" +
-      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle/detached/location/tts). " +
+      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle/simpleCardGif/detached/location/tts). " +
       "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider. " +
       "`detached:true` stops treating this thread as a session (no bot replies; does not delete history). " +
       "`tts:true` speaks each completed turn as an ogg attachment (default off).\n" +
-      "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle). " +
-      "Applies to EVERY thread under the channel (statusCardStyle is inherited live at render time). May be disabled by the deployment; `locked` can NEVER be changed.\n" +
+      "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle/simpleCardGif). " +
+      "Applies to EVERY thread under the channel (statusCardStyle and simpleCardGif are inherited live at render time). May be disabled by the deployment; `locked` can NEVER be changed.\n" +
       "- schedule: create/update/enable/disable/delete a scheduled prompt for THIS thread. Translate the " +
       "user's natural-language cadence into a standard cron expression (e.g. \"every weekday at 7am\" → " +
       "\"0 7 * * 1-5\"); the card echoes the parsed cadence AND the resolved next run time so a timezone " +
@@ -860,6 +860,12 @@ const TOOLS = [
                 "Per-turn status-card layout. \"full\" is the default (repo/model/action/effort). " +
                 "\"simple\" is compact (state + brand icon + latest thought + elapsed + window %). " +
                 "Empty string clears back to default full.",
+            },
+            simpleCardGif: {
+              type: "boolean",
+              description:
+                "Random curated GIF thumbnail on the simple status card. true = on, false = off. " +
+                "Only the simple card shows it. Session overlay wins over thread/channel presets.",
             },
           },
         },
@@ -928,6 +934,11 @@ const TOOLS = [
               description:
                 "Thread-preset status-card layout. Overrides the channel preset; session `/seam config card` still wins. Empty string clears it.",
             },
+            simpleCardGif: {
+              type: "boolean",
+              description:
+                "Thread-preset simple-card GIF. Overrides the channel preset; session `/seam config gif` still wins.",
+            },
             detached: {
               type: "boolean",
               description:
@@ -982,6 +993,11 @@ const TOOLS = [
               enum: ["full", "simple"],
               description:
                 "Channel-wide status-card layout. Every thread inherits this live at render time unless it has its own overlay. Empty string clears it.",
+            },
+            simpleCardGif: {
+              type: "boolean",
+              description:
+                "Channel-wide simple-card GIF thumbnail. Inherited live unless a thread/session overlay wins.",
             },
           },
         },
@@ -2110,6 +2126,7 @@ export class SeamMcpServer {
       line("cwd:", d.cwd.value, d.cwd.source),
       line("permission:", d.permission.value, d.permission.source),
       line("card style:", d.statusCardStyle?.value ?? "full", d.statusCardStyle?.source ?? "default"),
+      line("card gif:", d.simpleCardGif?.value ? "on" : "off", d.simpleCardGif?.source ?? "default"),
       line("detached:", d.detached.value ? "true" : "false", d.detached.source),
       line("tts:", d.tts.value ? "true" : "false", d.tts.source),
       line("tts voice:", d.ttsVoice.value ?? "(unset)", d.ttsVoice.source),

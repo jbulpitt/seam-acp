@@ -244,7 +244,8 @@ const SCHEDULE_PRESETS: Array<{ label: string; value: string }> = [
 ];
 import type { SessionStore } from "../../core/session-store.js";
 import { makeSessionId } from "../../core/session-store.js";
-import { SessionRouter, statusCardStyleForRender } from "../../core/session-router.js";
+import { SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
+import type { CardGifCatalog } from "../../core/card-gifs.js";
 import { ConfigMutationService, type ConfigMutationInput } from "../../core/config-mutation.js";
 import { reloadChannelPresets } from "../../core/config-reload.js";
 import type { ConfigProposeOutcome } from "../../core/mcp/seam-mcp-server.js";
@@ -429,6 +430,8 @@ export class Orchestrator {
   private liveHelpManager?: LiveHelpManager;
   /** Set by index.ts after construction; event-driven parked-prompt delivery (#88). */
   private parkedManager?: ParkedPromptManager;
+  /** Simple-card GIF catalog. Random pick is sync; fetch is off the render path. */
+  private cardGifs?: CardGifCatalog;
   /** Status-card poke after park/cancel so `📥 N waiting` updates immediately. */
   private onParkedChange?: () => void;
   /**
@@ -1005,13 +1008,20 @@ export class Orchestrator {
     const turnProfile = this.router.getProfile(record.agentId);
     const brand = resolveAgentBrand(record.agentId, turnProfile?.brand);
     const brandAsset = loadBrandAsset(brand);
+    const described = this.router.describeConfig(record);
+    const cardStyle = statusCardStyleForRender(described);
+    const gifUrl =
+      cardStyle === "simple" && simpleCardGifForRender(described)
+        ? this.cardGifs?.randomGif() ?? undefined
+        : undefined;
     const status = new TurnStatus({
       model: cfg.model ?? this.config.DEFAULT_MODEL,
       repoDisplay,
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
-      style: statusCardStyleForRender(this.router.describeConfig(record)),
+      style: cardStyle,
       ...(brandAsset ? { brandFilename: brandAsset.filename } : {}),
       authorName: turnProfile?.displayName ?? brand,
+      ...(gifUrl ? { gifUrl } : {}),
     });
 
     // Seed the status panel with the last-known usage from the previous turn,
@@ -2374,6 +2384,8 @@ export class Orchestrator {
           return this.cmdApprove(interaction);
         case "card":
           return this.cmdStatusCard(interaction);
+        case "gif":
+          return this.cmdSimpleCardGif(interaction);
         case "reset":
           return this.cmdReset(interaction);
         case "init":
@@ -3407,6 +3419,10 @@ export class Orchestrator {
 
   setParkedManager(m: ParkedPromptManager): void {
     this.parkedManager = m;
+  }
+
+  setCardGifs(catalog: CardGifCatalog): void {
+    this.cardGifs = catalog;
   }
 
   setOnParkedChange(fn: () => void): void {
@@ -5950,9 +5966,14 @@ export class Orchestrator {
       typeof this.store.getByChannel === "function"
         ? this.store.getByChannel(target.platform, target.id)
         : null;
-    const destStyle: StatusCardStyle = destRecord
-      ? statusCardStyleForRender(this.router.describeConfig(destRecord))
+    const destDescribed = destRecord ? this.router.describeConfig(destRecord) : undefined;
+    const destStyle: StatusCardStyle = destDescribed
+      ? statusCardStyleForRender(destDescribed)
       : "full";
+    const dispatchGifUrl =
+      destStyle === "simple" && destDescribed && simpleCardGifForRender(destDescribed)
+        ? this.cardGifs?.randomGif() ?? undefined
+        : undefined;
     const dispatchAgentId = resolved.profile?.id ?? destRecord?.agentId ?? "";
     const dispatchBrand = resolveAgentBrand(dispatchAgentId, resolved.profile?.brand);
     const dispatchBrandAsset = loadBrandAsset(dispatchBrand);
@@ -5964,6 +5985,7 @@ export class Orchestrator {
       style: destStyle,
       ...(dispatchBrandAsset ? { brandFilename: dispatchBrandAsset.filename } : {}),
       authorName: resolved.profile?.displayName ?? dispatchBrand,
+      ...(dispatchGifUrl ? { gifUrl: dispatchGifUrl } : {}),
     });
     status.setAction("Thinking…");
     // Seed context (live only). Invalidate on model mismatch, exactly like the
@@ -8376,6 +8398,7 @@ export class Orchestrator {
         chan?.statusCardStyle?.value === "simple" || chan?.statusCardStyle?.value === "full"
           ? chan.statusCardStyle.value
           : "full",
+      simpleCardGif: typeof chan?.simpleCardGif?.value === "boolean" ? chan.simpleCardGif.value : false,
     };
   }
 
@@ -8654,7 +8677,7 @@ export class Orchestrator {
         return;
       }
     }
-    if (plan.permission !== undefined || plan.statusCardStyle !== undefined) {
+    if (plan.permission !== undefined || plan.statusCardStyle !== undefined || plan.simpleCardGif !== undefined) {
       const record = this.router.ensureSessionRecord({
         platform: "discord",
         channelRef: draft.threadId,
@@ -8675,6 +8698,13 @@ export class Orchestrator {
           delete cfg.statusCardStyle;
         } else {
           cfg.statusCardStyle = plan.statusCardStyle;
+        }
+      }
+      if (plan.simpleCardGif !== undefined) {
+        if (plan.simpleCardGif === null) {
+          delete cfg.simpleCardGif;
+        } else {
+          cfg.simpleCardGif = plan.simpleCardGif;
         }
       }
       this.persistConfig(record, cfg);
@@ -8860,6 +8890,44 @@ export class Orchestrator {
           {
             value: "channel:simple",
             label: "simple (channel)",
+            description: "Every thread inherits unless it overrides",
+          },
+        ],
+        authorizedUserIds: owner,
+      });
+    } else if (action === "gif") {
+      picked = await this.adapter.sendChoicePicker!(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: "🎞 Simple-card GIF",
+          fields: [
+            {
+              name: "Current",
+              value: `\`${draft.snapshot.simpleCardGif.value ? "on" : "off"}\``,
+              inline: true,
+            },
+          ],
+        },
+        choices: [
+          inherit,
+          {
+            value: "on",
+            label: "on (this thread)",
+            description: "Random GIF thumbnail on the simple card",
+          },
+          {
+            value: "off",
+            label: "off (this thread)",
+            description: "No GIF — overrides channel",
+          },
+          {
+            value: "channel:on",
+            label: "on (channel)",
+            description: "Every thread inherits unless it overrides",
+          },
+          {
+            value: "channel:off",
+            label: "off (channel)",
             description: "Every thread inherits unless it overrides",
           },
         ],
@@ -11341,6 +11409,85 @@ export class Orchestrator {
     });
   }
 
+  private async cmdSimpleCardGif(i: ChatInputCommandInteraction): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const resolved = this.router.describeConfig(record).simpleCardGif;
+    const state = i.options.getString("state");
+    const scope = (i.options.getString("scope") ?? "session") as "session" | "thread" | "channel";
+    const onLabel = resolved.value ? "on" : "off";
+    if (!state) {
+      await i.reply({
+        content:
+          `Simple-card GIF: \`${onLabel}\` (from ${resolved.source}). ` +
+          `Set with \`/seam config gif state:on|off [scope:session|thread|channel]\`. ` +
+          `Only the simple status card shows a thumbnail.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (state !== "on" && state !== "off") {
+      await i.reply({
+        content: "State must be `on` or `off`.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const on = state === "on";
+    const actor = { id: i.user.id, name: i.user.username };
+    if (scope === "channel") {
+      if (!record.parentRef) {
+        await i.reply({
+          content: "This thread has no parent channel to pin a channel-wide GIF toggle on.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const written = this.configMutation.applyChannelOverlay({
+        channelId: record.parentRef,
+        changes: { simpleCardGif: on },
+        actor,
+      });
+      if (!written.ok) {
+        await i.reply({ content: written.error, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await i.reply({
+        content:
+          `Channel simple-card GIF set to \`${state}\` — every thread in this channel inherits it unless it has its own overlay. Applies on the next turn.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (scope === "thread") {
+      const written = this.configMutation.applyThreadOverlay({
+        threadId: record.channelRef,
+        ...(record.parentRef ? { parentRef: record.parentRef } : {}),
+        changes: { simpleCardGif: on },
+        actor,
+      });
+      if (!written.ok) {
+        await i.reply({ content: written.error, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await i.reply({
+        content: `Thread-preset simple-card GIF set to \`${state}\`. Applies on the next turn.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const cfg = this.store.readConfig(record);
+    cfg.simpleCardGif = on;
+    this.persistConfig(record, cfg);
+    await i.reply({
+      content: `Simple-card GIF set to \`${state}\` for this thread (overrides channel/thread presets). Applies on the next turn.`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   /**
    * Read a file from the host machine and post it to the channel as a
    * Discord attachment. The path must resolve under REPOS_ROOT or one
@@ -11755,6 +11902,7 @@ export class Orchestrator {
       "`/seam config tools <allow|exclude> [list]` — tool filters",
       "`/seam config approve <always|ask|deny>` — permission policy",
       "`/seam config card [full|simple] [scope:session|thread|channel]` — status-card layout (channel = inherit live)",
+      "`/seam config gif [on|off] [scope:session|thread|channel]` — random GIF on the simple status card",
       "`/seam config reset` — end this thread's ACP session; next message starts fresh",
       "`/seam config init` — bind this thread + start setup (repo picker, or full wizard)",
       "`/seam config detach <detached|attached>` — keep this thread session-less (no bot replies; does not delete history)",

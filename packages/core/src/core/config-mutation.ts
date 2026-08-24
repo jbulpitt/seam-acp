@@ -37,6 +37,7 @@ import type { ConfigDescription } from "./session-router.js";
 import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
 import type { ScheduledPrompt } from "./scheduled-prompts/types.js";
 import {
+  parseSimpleCardGif,
   parseStatusCardStyle,
   type ConfigAuditEntry,
   type ConfigAuditInput,
@@ -74,6 +75,8 @@ export interface SessionConfigChanges {
   excludedTools?: string[] | null;
   /** Status-card layout (#96). `null` clears back to default `"full"`. */
   statusCardStyle?: StatusCardStyle | null;
+  /** Random GIF on the simple status card. `null` clears back to inherit. */
+  simpleCardGif?: boolean | null;
 }
 
 /** Tier B — a preset in the calling thread's project scope.
@@ -119,6 +122,8 @@ export interface ChannelPresetChanges {
   rider?: string | null;
   /** Channel-wide status-card layout. Inherited live; session/thread overlay still wins. */
   statusCardStyle?: StatusCardStyle | null;
+  /** Channel-wide simple-card GIF. Inherited live; session/thread overlay still wins. */
+  simpleCardGif?: boolean | null;
 }
 
 /** Tier C — the calling thread's OWN thread preset (channel-presets.json
@@ -142,6 +147,8 @@ export interface ThreadPresetChanges {
   rider?: string | null;
   /** Thread-preset status-card overlay. Wins over the channel preset; session still wins. */
   statusCardStyle?: StatusCardStyle | null;
+  /** Thread-preset simple-card GIF overlay. */
+  simpleCardGif?: boolean | null;
   detached?: boolean;
   location?: string | null;
   tts?: boolean;
@@ -208,6 +215,13 @@ export interface ProposedField {
   label: string;
   before: string;
   after: string;
+}
+
+function fmtOverlay(v: unknown): string {
+  if (v === true) return "on";
+  if (v === false) return "off";
+  if (v === null || v === undefined) return "(unset)";
+  return String(v);
 }
 
 export interface ConfigApplyResult {
@@ -836,6 +850,28 @@ export class ConfigMutationService {
       }
     }
 
+    if (changes.simpleCardGif !== undefined) {
+      const rawGif = changes.simpleCardGif as unknown;
+      if (rawGif === null || rawGif === "") {
+        delete nextCfg.simpleCardGif;
+      } else {
+        const parsed = parseSimpleCardGif(rawGif);
+        if (parsed === undefined) {
+          return {
+            ok: false,
+            error: `Invalid simpleCardGif "${String(rawGif)}". Use true/false (on/off).`,
+          };
+        }
+        nextCfg.simpleCardGif = parsed;
+      }
+      const beforeGif = cfg.simpleCardGif === true ? "on" : cfg.simpleCardGif === false ? "off" : "(default)";
+      const afterGif =
+        nextCfg.simpleCardGif === true ? "on" : nextCfg.simpleCardGif === false ? "off" : "(default)";
+      if (beforeGif !== afterGif) {
+        fields.push({ label: "simpleCardGif", before: beforeGif, after: afterGif });
+      }
+    }
+
     if (fields.length === 0) {
       return {
         ok: false,
@@ -1216,21 +1252,28 @@ export class ConfigMutationService {
       "effort",
       "rider",
       "statusCardStyle",
+      "simpleCardGif",
     ];
     const fields: ProposedField[] = [];
     const next: Record<string, unknown> = { ...current };
     for (const key of keys) {
       const val = changes[key];
       if (val === undefined) continue; // field not part of this proposal
-      const beforeVal = (current[key] as { value?: string } | undefined)?.value ?? null;
+      const beforeVal = (current[key] as { value?: unknown } | undefined)?.value ?? null;
       if (val === null || val === "") {
         delete next[key];
-        if (beforeVal !== null) fields.push({ label: key, before: beforeVal, after: "(removed)" });
+        if (beforeVal !== null) {
+          fields.push({ label: key, before: fmtOverlay(beforeVal), after: "(removed)" });
+        }
       } else {
-        const resolved = key === "cwd" ? path.resolve(val) : val;
+        const resolved = key === "cwd" && typeof val === "string" ? path.resolve(val) : val;
         next[key] = { value: resolved };
         if (beforeVal !== resolved) {
-          fields.push({ label: key, before: beforeVal ?? "(unset)", after: resolved });
+          fields.push({
+            label: key,
+            before: beforeVal === null ? "(unset)" : fmtOverlay(beforeVal),
+            after: fmtOverlay(resolved),
+          });
         }
       }
     }
@@ -1397,22 +1440,26 @@ export class ConfigMutationService {
     // The parent channel's entry, used ONLY to detect Trap-1 shadowing below.
     const channelEntry = parentRef ? doc.channels?.[parentRef] : undefined;
 
-    const keys = ["agent", "model", "cwd", "effort", "rider", "statusCardStyle"] as const;
+    const keys = ["agent", "model", "cwd", "effort", "rider", "statusCardStyle", "simpleCardGif"] as const;
     const fields: ProposedField[] = [];
     const warnings: string[] = [];
     const next: Record<string, unknown> = { ...current };
     for (const key of keys) {
       const val = changes[key];
       if (val === undefined) continue; // field not part of this proposal
-      const beforeVal = (current[key] as { value?: string } | undefined)?.value ?? null;
+      const beforeVal = (current[key] as { value?: unknown } | undefined)?.value ?? null;
       if (val === null || val === "") {
         delete next[key];
-        if (beforeVal !== null) fields.push({ label: key, before: beforeVal, after: "(removed)" });
+        if (beforeVal !== null) fields.push({ label: key, before: fmtOverlay(beforeVal), after: "(removed)" });
       } else {
-        const resolved = key === "cwd" ? path.resolve(val) : val;
+        const resolved = key === "cwd" && typeof val === "string" ? path.resolve(val) : val;
         next[key] = { value: resolved };
         if (beforeVal !== resolved) {
-          fields.push({ label: key, before: beforeVal ?? "(unset)", after: resolved });
+          fields.push({
+            label: key,
+            before: beforeVal === null ? "(unset)" : fmtOverlay(beforeVal),
+            after: fmtOverlay(resolved),
+          });
           // Trap 1: a thread field shadows the channel value for that field.
           const chanVal = (channelEntry?.[key] as { value?: string } | undefined)?.value;
           if (chanVal !== undefined && key !== "rider") {
@@ -1982,6 +2029,9 @@ export class ConfigMutationService {
       statusCardStyle: d.statusCardStyle
         ? { value: d.statusCardStyle.value, source: d.statusCardStyle.source }
         : { value: "full", source: "default" },
+      simpleCardGif: d.simpleCardGif
+        ? { value: d.simpleCardGif.value, source: d.simpleCardGif.source }
+        : { value: false, source: "default" },
     };
   }
 

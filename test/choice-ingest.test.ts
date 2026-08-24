@@ -10,6 +10,7 @@ import {
   ChoiceResultHub,
   validateAgainstSchema,
   extractSeamResultFromText,
+  ingestWaiterBinds,
 } from "../packages/core/src/core/choice/result.js";
 import { ChoiceIngest, parseIngestBody, buildIngestPayload } from "../packages/core/src/core/choice/ingest.js";
 import type { ChoiceCard } from "../packages/core/src/core/choice/types.js";
@@ -442,6 +443,87 @@ describe("ChoiceResultHub isolated ingest bind", () => {
     results.bindChannel("thread-1", "d-ch");
     expect(results.submitFromSession("discord:thread-1", { prose: "x" }).ok).toBe(false);
     expect(results.submitFromChannel("thread-1", { prose: "x" }).ok).toBe(true);
+  });
+
+  it("ingestWaiterBinds covers dispatch, authoring session, authoring channel, and endpoint id (silent)", () => {
+    const binds = ingestWaiterBinds({
+      dispatchId: "d-iso",
+      endpoint: {
+        id: "ie_silent",
+        createdBy: "discord:thread-1",
+        authoringChannelRef: "thread-1",
+      },
+    });
+    expect(binds.sessionIds).toEqual(["d-iso", "discord:thread-1", "ie_silent"]);
+    expect(binds.channelRefs).toEqual(["thread-1", "ie_silent"]);
+    expect(binds.channelRefs).not.toContain(undefined);
+  });
+
+  it("ingestWaiterBinds still includes notifyThread when present", () => {
+    const binds = ingestWaiterBinds({
+      dispatchId: "d-n",
+      notifyThread: "999000111222333444",
+      endpoint: {
+        id: "ie_n",
+        createdBy: "discord:thread-1",
+        authoringChannelRef: "thread-1",
+      },
+    });
+    expect(binds.channelRefs).toEqual(["999000111222333444", "thread-1", "ie_n"]);
+  });
+
+  it("after the dispatchIngestEndpoint bind set, authoring session/channel, endpoint id, and dispatch id all submit", () => {
+    const authoringChannel = "thread-1";
+    const createdBy = `discord:${authoringChannel}`;
+    const endpointId = "ie_silent";
+    const cases: Array<{
+      name: string;
+      run: (h: ChoiceResultHub, dispatchId: string) => { ok: boolean };
+    }> = [
+      {
+        name: "submitFromSession(authoring discord:channel)",
+        run: (h) => h.submitFromSession(createdBy, { prose: "x" }),
+      },
+      {
+        name: "submitFromChannel(authoringChannelRef)",
+        run: (h) => h.submitFromChannel(authoringChannel, { prose: "x" }),
+      },
+      {
+        name: "submitFromSession(endpointId)",
+        run: (h) => h.submitFromSession(endpointId, { prose: "x" }),
+      },
+      {
+        name: "submitFromChannel(endpointId) silent ingest",
+        run: (h) => h.submitFromChannel(endpointId, { prose: "x" }),
+      },
+      {
+        name: "submitFromSession(dispatchId)",
+        run: (h, id) => h.submitFromSession(id, { prose: "x" }),
+      },
+    ];
+    for (const [i, c] of cases.entries()) {
+      const dispatchId = `d-bind-${i}`;
+      const results = new ChoiceResultHub({ store, logger: silent });
+      store.insertChoiceResult({
+        dispatchId,
+        choiceId: "cid1",
+        status: "pending",
+        body: null,
+        error: null,
+        schema: null,
+        createdUtc: new Date().toISOString(),
+        finishedUtc: null,
+      });
+      results.expect({ dispatchId, choiceId: "cid1", schema: null });
+      results.bindIngestWaiter(dispatchId, {
+        endpoint: {
+          id: endpointId,
+          createdBy,
+          authoringChannelRef: authoringChannel,
+        },
+      });
+      expect(c.run(results, dispatchId).ok, c.name).toBe(true);
+    }
   });
 
   it("extractSeamResultFromText harvests an isolated transcript fence", () => {

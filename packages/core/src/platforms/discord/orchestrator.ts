@@ -3329,7 +3329,14 @@ export class Orchestrator {
     }
     const fromSession = this.choiceResults.submitFromSession(record.id, value);
     if (fromSession.ok) return fromSession;
-    return this.choiceResults.submitFromChannel(record.channelRef, value);
+    const fromChannel = this.choiceResults.submitFromChannel(record.channelRef, value);
+    if (!fromChannel.ok) {
+      this.logger.warn(
+        { recordId: record.id, channelRef: record.channelRef },
+        "submit_result: no ingest waiter for session or channel"
+      );
+    }
+    return fromChannel;
   }
 
   /**
@@ -5273,8 +5280,10 @@ export class Orchestrator {
 
       const mcpServers = this.router.mintMcpServersForSession(spec.id);
       if (this.choiceResults) {
-        this.choiceResults.bindSession(spec.id, spec.id);
-        if (notifyId) this.choiceResults.bindChannel(notifyId, spec.id);
+        this.choiceResults.bindIngestWaiter(spec.id, {
+          ...(notifyId ? { notifyThread: notifyId } : {}),
+          endpoint,
+        });
       }
 
       this.activeTurns++;

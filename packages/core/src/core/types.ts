@@ -215,7 +215,7 @@ export interface StatusPanel {
   /** Author name for the full card (agent display name / brand). Simple cards
    *  put the turn state in `author` instead and ignore this. */
   authorName?: string;
-  /** HTTPS GIF URL for the simple-card thumbnail. Unset = no thumbnail. */
+  /** HTTPS GIF URL for the simple-card main image while the turn is in progress. */
   gifUrl?: string;
 }
 
@@ -493,8 +493,8 @@ export interface StructuredPanel {
   author?: string;
   /** Discord `attachment://<filename>` (or a URL) for the author icon. */
   authorIconURL?: string;
-  /** Discord embed thumbnail URL (simple-card GIF). */
-  thumbnailUrl?: string;
+  /** Discord embed main-image URL (simple-card GIF while the turn is in progress). */
+  imageUrl?: string;
   /** Optional body text rendered as markdown (activity log, thinking, etc.). */
   description?: string;
   /** Key/value fields for the embed grid. */

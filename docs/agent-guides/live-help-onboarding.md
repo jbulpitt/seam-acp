@@ -33,7 +33,7 @@ DEFAULT USE
 - Mint with MCP create_live_help only. No seam-live fence. Required: voiceChannelId (snowflake), system (short tutor job). Optional: historySummary (a few sentences, not files), notifyThread (opt-in transcript), preset.
 - Returns { liveId }. You do not block. Hang up with cancel_live_help({ liveId }).
 - Students (Alaina/Allie) may BE in the call. They are participants — they must not mint, cancel, or pick the channel. If create_live_help is refused, stop.
-- Voice channel: look in THIS THREAD's rider (thread overlay, else channel rider) for a designated live-help / voice-channel snowflake and use that. If the rider does not name one, fall back to family-guild General 1487095870188027987. Never pass a school-* voice channel or guess from this text channel's name. Ask Jesse if unsure. Consent is Jesse's policy — default is do not start a voice session unprompted; use a frozen click-card to ask him. Put the course VC in the rider so new sessions do not silently use General.
+- Voice channel: look in THIS THREAD's rider (thread overlay, else channel rider) for a designated live-help / voice-channel snowflake and use that. If the rider does not name one, fall back to family-guild General 1487095870188027987. Put the course VC in the rider so new sessions use the right room. Ask Jesse with a frozen click-card if you are unsure whether to start a call.
 - Do not promise Discord screen share, webcam, or Go Live. Bots cannot receive those. Do not use /seam debug voice-*.
 - notifyThread omitted = no transcript posts. Set it to this thread or a staff thread if Jesse should read later.
 
@@ -45,7 +45,7 @@ After writing the library entry, confirm: file path(s), the raw guide URL is in 
 ```
 Update the course library from
 https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/live-help.md
-Voice notes and /seam config tts stay the message path. Live help is Gemini joining a VC (create_live_help). Kids may listen; they must not mint. No school-* VCs. No screen share. Say which file you changed.
+Voice notes and /seam config tts stay the message path. Live help is Gemini joining a VC (create_live_help). Kids may listen; they must not mint. Rider first for the VC snowflake. Say which file you changed.
 ```
 
 **3. Refresh snippet** after #98 merges (tools actually present):

@@ -14,7 +14,7 @@ Do not fork the protocol.
 v1 is specified in GitHub **#98**. Spike (join / capture / Live round-trip) is
 proven. **MCP `create_live_help` / `cancel_live_help` are the product.** If they
 are **not** in your tool list yet (old process), do not invent a fence and do
-not run `/seam debug voice-*` from a school thread — wait, or ask Jesse.
+not run `/seam debug voice-*` — wait, or ask Jesse.
 
 ---
 
@@ -35,7 +35,6 @@ to pipe PCM through `rt.prompt`).
       for a designated live-help / voice-channel **snowflake** for the current
       thread. That wins.
    2. Else the fallback: family-guild **General** `1487095870188027987`.
-   3. Never invent a channel from a text-channel name. Never a `school-*` VC.
 3. Mint with MCP `create_live_help` (no fence):
 
 ```json
@@ -70,7 +69,7 @@ That is enough for a lesson.
 - **Not** a `seam-live` fence. Same reason as `create_ingest`: a fence taxes
   the coaching turn and is the wrong object.
 - `/seam debug voice-ping|voice-capture|voice-live` is **admin spike** in
-  pairing. School agents must not use it.
+  pairing, not how you start a lesson.
 
 If `create_live_help` is refused, stop. Do not work around the gate.
 
@@ -89,17 +88,15 @@ worksheet photo as Live video frames is **not v1**.
 
 ---
 
-## Voice channel rules (v1)
+## Voice channel
 
-Pass an explicit snowflake. Do not guess from a text channel name.
+Pass an explicit snowflake from the rider (or the fallback below). Do not
+guess from a text channel name.
 
 - **This thread first:** if the rider names a live-help / voice-channel
   snowflake for **this thread**, use that. Thread rider beats channel rider.
 - **Fallback** if the rider is silent: family-guild General
   `1487095870188027987`.
-- **Refuse:** anything named like `school-*`, a school-named category, or an
-  obfuscated / hidden channel. Homeschool-guild “General” is **not** automatic
-  unless that snowflake is in **this thread’s rider**.
 - One Live call per VC. If the bot is already in that channel, cancel first
   or pick another VC.
 - Everyone undeafened in that VC is mixed in (v1 does not isolate one user).
@@ -134,15 +131,11 @@ report-back in the minting thread. Use that to continue the **text** lesson.
 
 ---
 
-## School / consent
+## Consent
 
 Allie and Alaina may sit in the call. They must not mint. Consent is Jesse’s
 call, not a flag in JSON. If you are unsure whether to start a voice session,
-ask Jesse with a frozen click-card in **this** thread. Default is do not
-start a school voice session unprompted.
-
-This is **not** a school-channel default. Do not auto-join because the text
-thread is `school-alaina` / `school-allie`.
+ask Jesse with a frozen click-card in **this** thread.
 
 ---
 
@@ -179,8 +172,7 @@ removes it. Do **not** copy from the spike:
   `turnComplete`; keep the WS open for the whole call
 - `automaticActivityDetection.disabled` + `activityStart`/`activityEnd` clip dump
   (debug `voice-live` only). v1 is continuous duplex with Gemini **auto-VAD**
-- Hard allowlist of General-only. Prod uses the D11 refuse-list + explicit
-  `voiceChannelId`
+- Hard allowlist of General-only. Prod takes an explicit `voiceChannelId`.
 
 No wav/pcm on disk. One session per VC (and per guild). Process restart marks
 in-flight rows ended. Spec: #98.

@@ -29,7 +29,7 @@ hand-editing runtime state.
 - **Gemini in a voice channel (live help):** MCP `create_live_help` (no fence)
   after packing `system` + optional `historySummary`. `voiceChannelId`: this
   thread’s rider first, else family-guild General. Students may *be in* the
-  VC; they must not mint. Never a `school-*` voice channel. How-to:
+  VC; they must not mint. How-to:
   `docs/agent-guides/live-help.md`. School overlays:
   `docs/agent-guides/live-help-onboarding.md`. Not TTS, not STT, not Go Live.
 - **A file he should open:** `seam-attach` fence (path only), not a path in prose.
@@ -151,10 +151,9 @@ Gemini joins a Discord **voice channel** (not TTS, not STT). Coaching agents
 mint with MCP `create_live_help` (no fence); `cancel_live_help` hangs up.
 `voiceChannelId` comes from **this thread’s rider** if it names a VC, else
 family-guild General. Students may be *in* the call; they must not mint.
-Never a `school-*` VC.
 Canonical: `docs/agent-guides/live-help.md`. School overlay paste:
-`docs/agent-guides/live-help-onboarding.md`. Tools ship with #98 — if they
-are missing, wait; do not use `/seam debug voice-*` from a course thread.
+`docs/agent-guides/live-help-onboarding.md`. Do not use `/seam debug voice-*`
+from a course thread.
 
 ## Agent-scheduled wake events (#59)
 

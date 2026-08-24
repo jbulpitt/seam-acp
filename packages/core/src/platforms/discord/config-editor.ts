@@ -26,6 +26,7 @@ export type ConfigEditorAction =
   | "repo"
   | "approve"
   | "card"
+  | "gif"
   | "rider"
   | "attach"
   | "save"
@@ -42,6 +43,7 @@ export const HUB_FIELD_ACTIONS: ReadonlyArray<Exclude<ConfigEditorAction, "save"
   "repo",
   "approve",
   "card",
+  "gif",
   "rider",
   "attach",
 ];
@@ -55,6 +57,7 @@ export interface InheritedConfig {
   permission: PermissionPolicyMode;
   detached: boolean;
   statusCardStyle: StatusCardStyle;
+  simpleCardGif: boolean;
 }
 
 export interface ThreadConfigSnapshot {
@@ -66,6 +69,7 @@ export interface ThreadConfigSnapshot {
   permission: ResolvedSetting<PermissionPolicyMode>;
   detached: ResolvedSetting<boolean>;
   statusCardStyle: ResolvedSetting<StatusCardStyle>;
+  simpleCardGif: ResolvedSetting<boolean>;
   rider: { channel?: string; thread?: string };
   locked: boolean;
   /** Values that apply if the thread overlay is removed (inherit). */
@@ -86,6 +90,8 @@ export interface DraftOverlay {
   statusCardStyle?: StatusCardStyle | null;
   /** Channel-preset card write (independent of this thread's session overlay). */
   channelStatusCardStyle?: StatusCardStyle | null;
+  simpleCardGif?: boolean | null;
+  channelSimpleCardGif?: boolean | null;
 }
 
 export interface ThreadConfigDraft {
@@ -154,6 +160,7 @@ export function snapshotFromDescribe(
     permission: d.permission,
     detached: d.detached,
     statusCardStyle: d.statusCardStyle ?? { value: "full", source: "default" },
+    simpleCardGif: d.simpleCardGif ?? { value: false, source: "default" },
     rider: d.rider ?? {},
     locked: d.locked,
     withoutThread,
@@ -171,6 +178,7 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
   detached: boolean;
   riderThread: string | undefined;
   statusCardStyle: StatusCardStyle;
+  simpleCardGif: boolean;
 } {
   const s = draft.snapshot;
   const o = draft.overlay;
@@ -186,6 +194,7 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
     detached: o.detached === undefined ? s.detached.value : o.detached,
     riderThread: o.rider === undefined ? s.rider.thread : o.rider ?? undefined,
     statusCardStyle: effectiveCardStyle(draft),
+    simpleCardGif: effectiveGif(draft),
   };
 }
 
@@ -206,6 +215,24 @@ function effectiveCardStyle(draft: ThreadConfigDraft): StatusCardStyle {
     return s.statusCardStyle.value;
   }
   return o.channelStatusCardStyle ?? s.statusCardStyle.value;
+}
+
+function effectiveGif(draft: ThreadConfigDraft): boolean {
+  const s = draft.snapshot;
+  const o = draft.overlay;
+  const w = s.withoutThread;
+  if (o.simpleCardGif != null) return o.simpleCardGif;
+  if (o.simpleCardGif === null) {
+    if (s.simpleCardGif.source === "thread preset") return s.simpleCardGif.value;
+    return o.channelSimpleCardGif ?? w.simpleCardGif;
+  }
+  if (
+    s.simpleCardGif.source === "session config" ||
+    s.simpleCardGif.source === "thread preset"
+  ) {
+    return s.simpleCardGif.value;
+  }
+  return o.channelSimpleCardGif ?? s.simpleCardGif.value;
 }
 
 export function willResetSession(draft: ThreadConfigDraft): boolean {
@@ -349,12 +376,37 @@ export function dirtyChannelStatusCardStyle(
   return next;
 }
 
+export function dirtySimpleCardGif(
+  draft: ThreadConfigDraft
+): boolean | null | undefined {
+  if (draft.overlay.simpleCardGif === undefined) return undefined;
+  const current =
+    draft.snapshot.simpleCardGif.source === "session config"
+      ? draft.snapshot.simpleCardGif.value
+      : null;
+  const next = draft.overlay.simpleCardGif;
+  if (next === current) return undefined;
+  return next;
+}
+
+export function dirtyChannelSimpleCardGif(
+  draft: ThreadConfigDraft
+): boolean | null | undefined {
+  if (draft.overlay.channelSimpleCardGif === undefined) return undefined;
+  const current = draft.snapshot.withoutThread.simpleCardGif;
+  const next = draft.overlay.channelSimpleCardGif;
+  if (next === current) return undefined;
+  return next;
+}
+
 export function isDirty(draft: ThreadConfigDraft): boolean {
   return (
     Object.keys(dirtyThreadPresetChanges(draft)).length > 0 ||
     dirtyPermission(draft) !== undefined ||
     dirtyStatusCardStyle(draft) !== undefined ||
-    dirtyChannelStatusCardStyle(draft) !== undefined
+    dirtyChannelStatusCardStyle(draft) !== undefined ||
+    dirtySimpleCardGif(draft) !== undefined ||
+    dirtyChannelSimpleCardGif(draft) !== undefined
   );
 }
 
@@ -478,6 +530,7 @@ export function renderHub(
       },
       { customId: makeCustomId(id, "cancel"), label: "Cancel", style: "secondary" },
       { customId: makeCustomId(id, "card"), label: "Card", style: "secondary" },
+      { customId: makeCustomId(id, "gif"), label: "GIF", style: "secondary" },
     ],
   ];
 
@@ -574,6 +627,34 @@ export function renderHub(
         ),
         inline: true,
       },
+      {
+        name: "GIF",
+        value: trunc(
+          fieldLine(
+            code(s.simpleCardGif.value ? "on" : "off"),
+            sourceLabel(s.simpleCardGif.source),
+            [
+              draftNoteFor(
+                o.simpleCardGif === undefined
+                  ? undefined
+                  : o.simpleCardGif === null
+                    ? null
+                    : o.simpleCardGif
+                      ? "on"
+                      : "off",
+                (o.channelSimpleCardGif ?? w.simpleCardGif) ? "on" : "off"
+              ),
+              o.channelSimpleCardGif != null
+                ? `channel will be ${code(o.channelSimpleCardGif ? "on" : "off")}`
+                : undefined,
+            ]
+              .filter(Boolean)
+              .join("\n") || undefined
+          ),
+          1024
+        ),
+        inline: true,
+      },
     ],
     footer: trunc(footerParts.join(" · "), 2048),
     actions,
@@ -628,9 +709,15 @@ export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
         value: next.statusCardStyle,
         source: cardSourceAfterSave(o, s),
       },
-      withoutThread: o.channelStatusCardStyle
-        ? { ...s.withoutThread, statusCardStyle: o.channelStatusCardStyle }
-        : s.withoutThread,
+      simpleCardGif: {
+        value: next.simpleCardGif,
+        source: gifSourceAfterSave(o, s),
+      },
+      withoutThread: {
+        ...s.withoutThread,
+        ...(o.channelStatusCardStyle ? { statusCardStyle: o.channelStatusCardStyle } : {}),
+        ...(o.channelSimpleCardGif != null ? { simpleCardGif: o.channelSimpleCardGif } : {}),
+      },
       rider: {
         ...(s.rider.channel ? { channel: s.rider.channel } : {}),
         ...(next.riderThread ? { thread: next.riderThread } : {}),
@@ -654,6 +741,23 @@ function cardSourceAfterSave(o: DraftOverlay, s: ThreadConfigSnapshot): ConfigLa
   }
   if (o.channelStatusCardStyle) return "channel preset";
   return s.statusCardStyle.source;
+}
+
+function gifSourceAfterSave(o: DraftOverlay, s: ThreadConfigSnapshot): ConfigLayer {
+  if (o.simpleCardGif != null) return "session config";
+  if (o.simpleCardGif === null) {
+    if (s.simpleCardGif.source === "thread preset") return "thread preset";
+    if (o.channelSimpleCardGif != null) return "channel preset";
+    return s.simpleCardGif.source === "session config" ? "default" : s.simpleCardGif.source;
+  }
+  if (
+    s.simpleCardGif.source === "session config" ||
+    s.simpleCardGif.source === "thread preset"
+  ) {
+    return s.simpleCardGif.source;
+  }
+  if (o.channelSimpleCardGif != null) return "channel preset";
+  return s.simpleCardGif.source;
 }
 
 export function renderSavedHub(draft: ThreadConfigDraft): StructuredPanel {
@@ -772,6 +876,15 @@ export function applyPickerValue(
         overlay.statusCardStyle = value as StatusCardStyle;
       }
       break;
+    case "gif":
+      if (inherit) {
+        overlay.simpleCardGif = null;
+      } else if (value === "channel:on" || value === "channel:off") {
+        overlay.channelSimpleCardGif = value === "channel:on";
+      } else {
+        overlay.simpleCardGif = value === "on";
+      }
+      break;
     default:
       return draft;
   }
@@ -794,6 +907,7 @@ export interface ConfigEditorSavePlan {
   channelPreset?: ChannelPresetChanges;
   permission?: PermissionPolicyMode | null;
   statusCardStyle?: StatusCardStyle | null;
+  simpleCardGif?: boolean | null;
 }
 
 export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
@@ -804,9 +918,15 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
   if (perm !== undefined) plan.permission = perm;
   const card = dirtyStatusCardStyle(draft);
   if (card !== undefined) plan.statusCardStyle = card;
+  const gif = dirtySimpleCardGif(draft);
+  if (gif !== undefined) plan.simpleCardGif = gif;
   const channelCard = dirtyChannelStatusCardStyle(draft);
-  if (channelCard !== undefined) {
-    plan.channelPreset = { statusCardStyle: channelCard };
+  const channelGif = dirtyChannelSimpleCardGif(draft);
+  if (channelCard !== undefined || channelGif !== undefined) {
+    plan.channelPreset = {
+      ...(channelCard !== undefined ? { statusCardStyle: channelCard } : {}),
+      ...(channelGif !== undefined ? { simpleCardGif: channelGif } : {}),
+    };
   }
   return plan;
 }

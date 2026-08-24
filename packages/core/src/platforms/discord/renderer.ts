@@ -105,6 +105,7 @@ export const discordRenderer: Renderer = {
         ...(title ? { title } : {}),
         author: state.state,
         ...authorIcon(state),
+        ...(state.gifUrl ? { thumbnailUrl: state.gifUrl } : {}),
         fields: [],
         footer: simpleFooter(state),
       };

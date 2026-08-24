@@ -34,6 +34,7 @@ import { ServerStatusCard } from "./core/server-status-card.js";
 import type { BridgeAgent } from "./core/server-status.js";
 import { ChoiceResultHub } from "./core/choice/result.js";
 import { ChoiceIngest } from "./core/choice/ingest.js";
+import { CardGifCatalog } from "./core/card-gifs.js";
 import { publicBaseFromBridgeWsUrl, resolvePublicBridgeWsUrl } from "./core/mcp-url.js";
 import fs from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -794,6 +795,13 @@ async function main(): Promise<void> {
   orchestrator.setParkedManager(parkedManager);
   parkedManager.start();
 
+  const cardGifs = new CardGifCatalog({
+    url: config.SIMPLE_CARD_GIF_MANIFEST_URL,
+    logger: logger.child({ mod: "card-gifs" }),
+  });
+  orchestrator.setCardGifs(cardGifs);
+  cardGifs.start();
+
   // #76: reconcile live-turn markers (always) and auto-resume if the flag
   // is on. SIGTERM/disposeAll above leave markers intact — this is the
   // path that acts on them. Fire-and-forget so boot is not blocked by
@@ -918,6 +926,7 @@ async function main(): Promise<void> {
     scheduledManager.stop();
     wakeManager.stop();
     parkedManager.stop();
+    cardGifs.stop();
     watchManager.stop();
     liveHelpManager.stopAll();
     dispatchWatcher.stop();

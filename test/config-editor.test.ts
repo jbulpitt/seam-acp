@@ -12,6 +12,8 @@ import {
   dirtyPermission,
   dirtyChannelStatusCardStyle,
   dirtyStatusCardStyle,
+  dirtySimpleCardGif,
+  dirtyChannelSimpleCardGif,
   dirtyThreadPresetChanges,
   isDirty,
   makeCustomId,
@@ -38,6 +40,7 @@ const WITHOUT: InheritedConfig = {
   permission: "ask",
   detached: false,
   statusCardStyle: "full",
+  simpleCardGif: false,
 };
 
 function setting<T>(value: T, source: ConfigDescription["agent"]["source"]) {
@@ -54,6 +57,7 @@ function snapshot(over: Partial<ThreadConfigSnapshot> = {}): ThreadConfigSnapsho
     permission: setting("ask", "default"),
     detached: setting(false, "default"),
     statusCardStyle: setting("full", "default"),
+    simpleCardGif: setting(false, "default"),
     rider: {},
     locked: false,
     withoutThread: { ...WITHOUT },
@@ -184,7 +188,7 @@ describe("hub render (#90)", () => {
       "Upload",
       "Attach",
     ]);
-    expect(panel.actions![2].map((b) => b.label)).toEqual(["Save", "Cancel", "Card"]);
+    expect(panel.actions![2].map((b) => b.label)).toEqual(["Save", "Cancel", "Card", "GIF"]);
     expect(panel.actions![2][0]!.disabled).toBe(true);
   });
 
@@ -377,6 +381,33 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
     expect(plan.channelPreset).toEqual({ statusCardStyle: "simple" });
   });
 
+  it("GIF picker writes session overlay and channel overlay like Card", () => {
+    const panel = renderHub(draft());
+    expect(panel.fields.find((f) => f.name === "GIF")!.value).toMatch(/off/);
+    expect(panel.actions![2].find((b) => b.label === "GIF")).toBeTruthy();
+
+    const next = applyPickerValue(draft(), "gif", "on", caps);
+    expect(next.overlay.simpleCardGif).toBe(true);
+    expect(dirtySimpleCardGif(next)).toBe(true);
+    expect(buildSavePlan(next).simpleCardGif).toBe(true);
+
+    const channel = applyPickerValue(draft(), "gif", "channel:on", caps);
+    expect(channel.overlay.channelSimpleCardGif).toBe(true);
+    expect(dirtyChannelSimpleCardGif(channel)).toBe(true);
+    expect(buildSavePlan(channel).channelPreset).toEqual({ simpleCardGif: true });
+
+    const inherit = applyPickerValue(
+      draft({
+        snapshot: snapshot({ simpleCardGif: setting(true, "session config") }),
+      }),
+      "gif",
+      INHERIT_VALUE,
+      caps
+    );
+    expect(inherit.overlay.simpleCardGif).toBeNull();
+    expect(buildSavePlan(inherit).simpleCardGif).toBeNull();
+  });
+
   it("Cancel is a no-op on the overlay (store delete; no mutation payload)", () => {
     const d = draft({ overlay: { model: "x" } });
     const store = new ConfigEditorStore();
@@ -478,7 +509,9 @@ describe("/seam config edit slash gates (#90 D9)", () => {
       SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
     } as any;
     expect(Orchestrator.isParticipantSlashRefused(cfg, "edit", STUDENT)).toBe(true);
+    expect(Orchestrator.isParticipantSlashRefused(cfg, "gif", STUDENT)).toBe(true);
     expect(Orchestrator.isParticipantSlashRefused(cfg, "edit", ADMIN)).toBe(false);
+    expect(Orchestrator.isParticipantSlashRefused(cfg, "gif", ADMIN)).toBe(false);
   });
 
   it("locked channel refuses non-admins; admins may open without unlocking", () => {
@@ -488,7 +521,9 @@ describe("/seam config edit slash gates (#90 D9)", () => {
       SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
     } as any;
     expect(Orchestrator.isLockedSlashRefused(locked, "channel-1", "edit", STUDENT)).toBe(true);
+    expect(Orchestrator.isLockedSlashRefused(locked, "channel-1", "gif", STUDENT)).toBe(true);
     expect(Orchestrator.isLockedSlashRefused(locked, "channel-1", "edit", ADMIN)).toBe(false);
+    expect(Orchestrator.isLockedSlashRefused(locked, "channel-1", "gif", ADMIN)).toBe(false);
   });
 });
 
@@ -512,6 +547,7 @@ describe("snapshotFromDescribe keeps rider from describeConfig", () => {
       location: setting("local", "default"),
       rider: { channel: "ch", thread: "th" },
       statusCardStyle: setting("full", "default"),
+      simpleCardGif: setting(false, "default"),
     };
     const snap = snapshotFromDescribe(d, WITHOUT);
     expect(snap.rider).toEqual({ channel: "ch", thread: "th" });

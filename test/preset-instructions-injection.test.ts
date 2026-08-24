@@ -54,6 +54,7 @@ function describeConfig(record: SessionRecord): ConfigDescription {
     ttsStyle: { value: "neutral", source: "default" },
     location: { value: "local", source: "default" },
     statusCardStyle: { value: "full", source: "default" },
+    simpleCardGif: { value: false, source: "default" },
   };
 }
 

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { pino } from "pino";
-import { SessionRouter, statusCardStyleForRender } from "../packages/core/src/core/session-router.js";
+import { SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../packages/core/src/core/session-router.js";
 import { TurnStatus } from "../packages/core/src/core/status-panel.js";
 import type { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { AgentProfile } from "@seam/adapters";
@@ -295,5 +295,59 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
     const card = new TurnStatus({ model: "m", repoDisplay: "r", style });
     expect(card.style).toBe("simple");
     expect(card.toInput().style).toBe("simple");
+  });
+
+  it("simpleCardGif defaults to false", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(makeRecord());
+    expect(d.simpleCardGif).toEqual({ value: false, source: "default" });
+    expect(simpleCardGifForRender(d)).toBe(false);
+  });
+
+  it("simpleCardGif is sourced from session config", () => {
+    const router = makeRouter();
+    const d = router.describeConfig(
+      makeRecord({ configJson: JSON.stringify({ model: "gpt-5.4", simpleCardGif: true }) })
+    );
+    expect(d.simpleCardGif).toEqual({ value: true, source: "session config" });
+    expect(simpleCardGifForRender(d)).toBe(true);
+  });
+
+  it("simpleCardGif inherits from the channel preset when session and thread omit it", () => {
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { simpleCardGif: { value: true }, locked: false }],
+    ]);
+    const router = makeRouter({ channelPresets });
+    const d = router.describeConfig(makeRecord());
+    expect(d.simpleCardGif).toEqual({ value: true, source: "channel preset" });
+    expect(simpleCardGifForRender(d)).toBe(true);
+  });
+
+  it("thread-preset simpleCardGif wins over the channel preset", () => {
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { simpleCardGif: { value: true }, locked: false }],
+    ]);
+    const threadPresets = new Map<string, ThreadPreset>([
+      ["thread-1", { simpleCardGif: { value: false } }],
+    ]);
+    const router = makeRouter({ channelPresets, threadPresets });
+    const d = router.describeConfig(makeRecord());
+    expect(d.simpleCardGif).toEqual({ value: false, source: "thread preset" });
+    expect(simpleCardGifForRender(d)).toBe(false);
+  });
+
+  it("session simpleCardGif wins over thread and channel presets", () => {
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { simpleCardGif: { value: true }, locked: false }],
+    ]);
+    const threadPresets = new Map<string, ThreadPreset>([
+      ["thread-1", { simpleCardGif: { value: true } }],
+    ]);
+    const router = makeRouter({ channelPresets, threadPresets });
+    const d = router.describeConfig(
+      makeRecord({ configJson: JSON.stringify({ model: "gpt-5.4", simpleCardGif: false }) })
+    );
+    expect(d.simpleCardGif).toEqual({ value: false, source: "session config" });
+    expect(simpleCardGifForRender(d)).toBe(false);
   });
 });

@@ -75,6 +75,9 @@ function describeConfig(record: SessionRecord): ConfigDescription {
       : cfg.statusCardStyle === "full"
         ? { value: "full" as const, source: "session config" }
         : { value: "full" as const, source: "default" },
+    simpleCardGif: typeof cfg.simpleCardGif === "boolean"
+      ? { value: cfg.simpleCardGif, source: "session config" }
+      : { value: false, source: "default" },
   };
 }
 
@@ -483,6 +486,118 @@ describe("statusCardStyle channel/thread overlay", () => {
     built.proposal.apply({ id: "u", name: "U" });
     const raw = JSON.parse(fs.readFileSync(file, "utf8"));
     expect(raw.channels[CHAN].statusCardStyle).toEqual({ value: "simple" });
+  });
+});
+
+describe("simpleCardGif mutation", () => {
+  it("sets and clears session simpleCardGif without restarting", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const svc = makeService();
+    const set = svc.buildProposal(record, { session: { simpleCardGif: true } });
+    expect(set.ok).toBe(true);
+    if (!set.ok) return;
+    expect(set.proposal.restartsSession).toBe(false);
+    expect(set.proposal.fields).toEqual([
+      { label: "simpleCardGif", before: "(default)", after: "on" },
+    ]);
+    set.proposal.apply({ id: "u", name: "U" });
+    expect(store.readConfig(store.get(record.id)!).simpleCardGif).toBe(true);
+
+    const fresh = store.get(record.id)!;
+    const clear = svc.buildProposal(fresh, { session: { simpleCardGif: null } });
+    expect(clear.ok).toBe(true);
+    if (!clear.ok) return;
+    clear.proposal.apply({ id: "u", name: "U" });
+    expect(store.readConfig(store.get(record.id)!).simpleCardGif).toBeUndefined();
+  });
+
+  it("refuses an invalid simpleCardGif", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const built = makeService().buildProposal(record, {
+      session: { simpleCardGif: "maybe" as unknown as boolean },
+    });
+    expect(built.ok).toBe(false);
+  });
+});
+
+describe("simpleCardGif channel/thread overlay", () => {
+  function writePresetsFile(doc: unknown): string {
+    const file = path.join(dir, "channel-presets.json");
+    fs.writeFileSync(file, JSON.stringify(doc, null, 2));
+    return file;
+  }
+  const CHAN = "111111111111111111";
+  const THREAD = "333333333333333333";
+
+  it("applyChannelOverlay writes simpleCardGif without the Tier-C flag", () => {
+    const file = writePresetsFile({ channels: { [CHAN]: { model: { value: "old" } } } });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: false,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const result = svc.applyChannelOverlay({
+      channelId: CHAN,
+      changes: { simpleCardGif: true },
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(PresetsFileSchema.safeParse(raw).success).toBe(true);
+    expect(raw.channels[CHAN].simpleCardGif).toEqual({ value: true });
+    expect(raw.channels[CHAN].model).toEqual({ value: "old" });
+    expect(live.channelPresets.get(CHAN)?.simpleCardGif?.value).toBe(true);
+  });
+
+  it("applyThreadOverlay writes simpleCardGif over a channel value", () => {
+    const file = writePresetsFile({
+      channels: { [CHAN]: { simpleCardGif: { value: true } } },
+      threads: {},
+    });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: false,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const result = svc.applyThreadOverlay({
+      threadId: THREAD,
+      parentRef: CHAN,
+      changes: { simpleCardGif: false },
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.channels[CHAN].simpleCardGif).toEqual({ value: true });
+    expect(raw.threads[THREAD].simpleCardGif).toEqual({ value: false });
+    expect(live.threadPresets.get(THREAD)?.simpleCardGif?.value).toBe(false);
+  });
+
+  it("Tier-C channelPreset proposal can set simpleCardGif", () => {
+    const record = makeRecord({ parentRef: CHAN });
+    const file = writePresetsFile({ channels: { [CHAN]: {} } });
+    const built = makeService({ presetsFile: file, tierCEnabled: true }).buildProposal(record, {
+      channelPreset: { simpleCardGif: true },
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.proposal.fields).toEqual([
+      { label: "simpleCardGif", before: "(unset)", after: "on" },
+    ]);
+    built.proposal.apply({ id: "u", name: "U" });
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.channels[CHAN].simpleCardGif).toEqual({ value: true });
   });
 });
 

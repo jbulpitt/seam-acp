@@ -688,6 +688,14 @@ const Schema = z.object({
    * resume from `/seam workflows` still works. Default 7200 (2h).
    */
   SEAM_TURN_RESUME_MAX_AGE_SECONDS: z.coerce.number().int().min(0).max(604800).default(7200),
+  /**
+   * HTTPS URL of the curated GIF manifest (`{ version, gifs: [url, ...] }`)
+   * used by the simple status-card thumbnail mod. Fetched at boot + ~10 min.
+   */
+  SIMPLE_CARD_GIF_MANIFEST_URL: z
+    .string()
+    .url()
+    .default("https://pub-d6ab0677dbbb4895a9db45bc6ba2ad08.r2.dev/manifest.json"),
 });
 
 const PresetFieldSchema = <T extends z.ZodType>(value: T) => z.object({ value });
@@ -716,6 +724,9 @@ const PresetValuesSchema = z.object({
   // Per-turn status-card layout. Channel value is inherited live at render
   // time; a thread preset or session `/seam config card` still wins.
   statusCardStyle: PresetFieldSchema(z.enum(["full", "simple"])).optional(),
+  // Random GIF thumbnail on the simple status card. Channel value is inherited
+  // live; a thread preset or session `/seam config gif` still wins.
+  simpleCardGif: PresetFieldSchema(z.boolean()).optional(),
 });
 
 const ChannelPresetSchema = PresetValuesSchema.extend({
@@ -813,6 +824,7 @@ export type PresetValues = {
   effort?: ChannelPresetField<string>;
   rider?: ChannelPresetField<string>;
   statusCardStyle?: ChannelPresetField<"full" | "simple">;
+  simpleCardGif?: ChannelPresetField<boolean>;
 };
 export type ChannelPreset = PresetValues & { locked: boolean };
 export type ThreadPreset = PresetValues & {

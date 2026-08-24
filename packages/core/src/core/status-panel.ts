@@ -36,6 +36,7 @@ export interface StatusPanelInput {
   style?: StatusCardStyle;
   brandFilename?: string;
   authorName?: string;
+  gifUrl?: string;
 }
 
 export function renderStatusPanel(
@@ -63,6 +64,7 @@ export function renderStatusPanel(
     ...(input.style ? { style: input.style } : {}),
     ...(input.brandFilename ? { brandFilename: input.brandFilename } : {}),
     ...(input.authorName ? { authorName: input.authorName } : {}),
+    ...(input.gifUrl ? { gifUrl: input.gifUrl } : {}),
   };
   return renderer.statusPanel(panel);
 }
@@ -118,6 +120,8 @@ export class TurnStatus {
   brandFilename?: string;
   /** Full-card author name (agent display name). */
   authorName?: string;
+  /** Simple-card GIF thumbnail, picked once at turn start. */
+  gifUrl?: string;
   private static readonly MAX_ACTIVITY = 20;
   /** Last N complete lines of model reasoning (oldest → newest). */
   private thinkingLines: string[] = [];
@@ -133,6 +137,7 @@ export class TurnStatus {
     style?: StatusCardStyle;
     brandFilename?: string;
     authorName?: string;
+    gifUrl?: string;
   }) {
     this.model = opts.model;
     this.repoDisplay = opts.repoDisplay;
@@ -141,6 +146,7 @@ export class TurnStatus {
     if (opts.style) this.style = opts.style;
     if (opts.brandFilename) this.brandFilename = opts.brandFilename;
     if (opts.authorName) this.authorName = opts.authorName;
+    if (opts.gifUrl) this.gifUrl = opts.gifUrl;
     this.startedUtc = Date.now();
   }
 
@@ -244,6 +250,7 @@ export class TurnStatus {
       ...(this.style !== "full" ? { style: this.style } : {}),
       ...(this.brandFilename ? { brandFilename: this.brandFilename } : {}),
       ...(this.authorName ? { authorName: this.authorName } : {}),
+      ...(this.gifUrl ? { gifUrl: this.gifUrl } : {}),
     };
   }
 }

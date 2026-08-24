@@ -102,6 +102,33 @@ describe("discordRenderer", () => {
     });
     expect(out.author).toBe("Failed");
     expect(out.authorIconURL).toBeUndefined();
+    expect(out.thumbnailUrl).toBeUndefined();
+  });
+
+  it("simple card sets thumbnailUrl when gifUrl is provided", () => {
+    const out = discordRenderer.statusPanel({
+      state: "Working",
+      repoDisplay: "r",
+      model: "m",
+      action: "ok",
+      elapsedSeconds: 1,
+      style: "simple",
+      gifUrl: "https://cdn.example/a.gif",
+    });
+    expect(out.thumbnailUrl).toBe("https://cdn.example/a.gif");
+  });
+
+  it("full card never sets thumbnailUrl even when gifUrl is provided", () => {
+    const out = discordRenderer.statusPanel({
+      state: "Working",
+      repoDisplay: "r",
+      model: "m",
+      action: "ok",
+      elapsedSeconds: 1,
+      gifUrl: "https://cdn.example/a.gif",
+    });
+    expect(out.thumbnailUrl).toBeUndefined();
+    expect(out.fields.find((f) => f.name === "Repo")).toBeTruthy();
   });
 
   it("info box renders title, rows, and footer", () => {

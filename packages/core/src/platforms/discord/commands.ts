@@ -12,7 +12,7 @@ import {
  *
  *   TOP-LEVEL (5): cancel, steer, new, workflows, queue
  *   GROUPS (8):
- *     config   (15) model effort agent mode repo tools approve reset init detach tts show edit set audit
+ *     config   (17) model effort agent mode repo tools card gif approve reset init detach tts show edit set audit
  *     info     (6)  whoami usage avatar help sessions repos
  *     schedule (7)  unchanged
  *     preset   (7)  list create apply delete show edit thread
@@ -250,6 +250,32 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .addChoices(
                 { name: "full", value: "full" },
                 { name: "simple", value: "simple" }
+              )
+          )
+          .addStringOption((o) =>
+            o
+              .setName("scope")
+              .setDescription("session (this thread, default) | thread preset | channel (all threads)")
+              .setRequired(false)
+              .addChoices(
+                { name: "session (this thread override)", value: "session" },
+                { name: "thread preset", value: "thread" },
+                { name: "channel (all threads inherit)", value: "channel" }
+              )
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("gif")
+          .setDescription("Random GIF thumbnail on the simple status card (on or off)")
+          .addStringOption((o) =>
+            o
+              .setName("state")
+              .setDescription("on | off")
+              .setRequired(false)
+              .addChoices(
+                { name: "on", value: "on" },
+                { name: "off", value: "off" }
               )
           )
           .addStringOption((o) =>

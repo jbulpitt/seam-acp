@@ -65,7 +65,7 @@ describe("AgentAdapter.describe()", () => {
     const d = makeCopilotProfile({ defaultModel: "gpt-5" }).describe();
     expect(d.effort.mechanism).toBe("configOption");
     expect(d.effort.configId).toBe("reasoning_effort");
-    expect(d.effort.levels).toEqual(["low", "medium", "high"]);
+    expect(d.effort.levels).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
   it("agy reports modelBaked", () => {

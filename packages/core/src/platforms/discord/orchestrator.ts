@@ -7549,7 +7549,7 @@ export class Orchestrator {
 
     // Explicit level: validate against what THIS agent supports. The slash
     // command registers the full 5-level list statically, so an agent with a
-    // narrower range (e.g. Copilot: low/medium/high) must reject xhigh/max here.
+    // narrower range (e.g. Codex: low/medium/high) must reject xhigh/max here.
     if (!supported.includes(level)) {
       await i.reply({
         content: `\`${level}\` isn't supported by \`${record.agentId}\` — choose one of: ${supportedList}.`,

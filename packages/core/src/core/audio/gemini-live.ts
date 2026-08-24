@@ -1,7 +1,9 @@
 /**
- * Production Gemini Live session (#98). Continuous duplex, auto-VAD.
+ * Production Gemini Live session (#98). Continuous duplex.
  * Do NOT put responseModalities on the setup root (close 1007).
- * Do NOT disable automaticActivityDetection (that's debug voice-live).
+ * Auto-VAD never completes a turn when Discord stops sending packets
+ * (proven in the spike). Disable it and bracket each utterance with
+ * activityStart / activityEnd from Discord speaking.
  */
 import { WebSocket } from "ws";
 import {
@@ -36,10 +38,21 @@ export function buildLiveHelpSetup(opts: {
       },
       // Seed history as context only — must not start a spoken turn.
       historyConfig: { initialHistoryInClientContent: true },
+      realtimeInputConfig: {
+        automaticActivityDetection: { disabled: true },
+      },
       inputAudioTranscription: {},
       outputAudioTranscription: {},
     },
   };
+}
+
+export function buildActivityStart(): Record<string, unknown> {
+  return { realtimeInput: { activityStart: {} } };
+}
+
+export function buildActivityEnd(): Record<string, unknown> {
+  return { realtimeInput: { activityEnd: {} } };
 }
 
 export function buildHistoryClientContent(summary: string): Record<string, unknown> {
@@ -182,22 +195,33 @@ export class GeminiLiveSession {
     return this.ws.readyState;
   }
 
+  sendActivityStart(): void {
+    this.sendJson(buildActivityStart());
+  }
+
+  sendActivityEnd(): void {
+    this.sendJson(buildActivityEnd());
+  }
+
   sendPcm16k(pcm: Buffer): void {
     if (this.closed || this.ws.readyState !== WebSocket.OPEN) return;
     if (pcm.byteLength === 0) return;
     for (let i = 0; i < pcm.byteLength; i += CHUNK_BYTES) {
       const chunk = pcm.subarray(i, i + CHUNK_BYTES);
-      this.ws.send(
-        JSON.stringify({
-          realtimeInput: {
-            audio: {
-              mimeType: "audio/pcm;rate=16000",
-              data: Buffer.from(chunk).toString("base64"),
-            },
+      this.sendJson({
+        realtimeInput: {
+          audio: {
+            mimeType: "audio/pcm;rate=16000",
+            data: Buffer.from(chunk).toString("base64"),
           },
-        })
-      );
+        },
+      });
     }
+  }
+
+  private sendJson(msg: Record<string, unknown>): void {
+    if (this.closed || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify(msg));
   }
 
   close(): void {

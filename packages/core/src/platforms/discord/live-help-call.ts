@@ -37,6 +37,9 @@ import type { Logger } from "../../lib/logger.js";
 import { isObfuscatedChannel, visibleDiscordChannelName } from "./channel-visibility.js";
 import { OPUS_SILENCE_FRAME } from "./voice-spike.js";
 
+/** Hangover after Discord speaking.end before we tell Gemini the utterance finished. */
+const ACTIVITY_END_MS = 1_200;
+
 export function pcm48kStereoTo16kMono(pcm: Buffer): Buffer {
   const stereoFrames = Math.floor(pcm.byteLength / 4);
   const outFrames = Math.floor(stereoFrames / 3);
@@ -231,7 +234,6 @@ export async function runLiveHelpCall(opts: {
   };
 
   const decodePacket = (pkt: Buffer): Buffer | null => {
-    if (pkt.compare(OPUS_SILENCE_FRAME) === 0) return null;
     for (const channels of [2, 1] as const) {
       try {
         let dec = decoderCache.get(channels);
@@ -251,7 +253,7 @@ export async function runLiveHelpCall(opts: {
         }
         return pcm;
       } catch {
-        /* try other channel count */
+        decoderCache.delete(channels);
       }
     }
     return null;
@@ -259,10 +261,60 @@ export async function runLiveHelpCall(opts: {
 
   let loggedFirstUp = false;
   let loggedFirstDown = false;
+  let inActivity = false;
+  let activityEndTimer: ReturnType<typeof setTimeout> | undefined;
+  let pktCount = 0;
+  let voicedCount = 0;
+  let silenceCount = 0;
+  let decodeFailCount = 0;
+  let bytesUp = 0;
+  let utteranceBytesUp = 0;
+
+  const beginActivity = (): void => {
+    if (activityEndTimer) {
+      clearTimeout(activityEndTimer);
+      activityEndTimer = undefined;
+    }
+    if (inActivity) return;
+    inActivity = true;
+    utteranceBytesUp = 0;
+    interruptPlay();
+    live?.sendActivityStart();
+    opts.logger.info({ liveId: opts.row.id }, "live-help activity start");
+  };
+
+  const finishActivity = (): void => {
+    activityEndTimer = undefined;
+    flushMix();
+    if (!inActivity) return;
+    live?.sendActivityEnd();
+    inActivity = false;
+    opts.logger.info(
+      {
+        liveId: opts.row.id,
+        utteranceBytesUp,
+        bytesUp,
+        pktCount,
+        voicedCount,
+        silenceCount,
+        decodeFailCount,
+      },
+      "live-help activity end"
+    );
+  };
+
+  const scheduleActivityEnd = (): void => {
+    if (activityEndTimer) clearTimeout(activityEndTimer);
+    activityEndTimer = setTimeout(finishActivity, ACTIVITY_END_MS);
+  };
+
   const flushMix = (): void => {
     if (pendingMix.length === 0) return;
     const mixed = mixMono16(pendingMix.splice(0, pendingMix.length));
     if (mixed.byteLength === 0) return;
+    beginActivity();
+    bytesUp += mixed.byteLength;
+    utteranceBytesUp += mixed.byteLength;
     if (!loggedFirstUp) {
       loggedFirstUp = true;
       opts.logger.info(
@@ -273,23 +325,71 @@ export async function runLiveHelpCall(opts: {
     live?.sendPcm16k(mixed);
   };
 
+  const onStreamGone = (userId: string): void => {
+    subscribed.delete(userId);
+    if (connection.receiver.speaking.users.has(userId)) {
+      subscribeUser(userId);
+    }
+  };
+
   const subscribeUser = (userId: string): void => {
     if (userId === opts.client.user?.id) return;
-    if (subscribed.has(userId) && connection.receiver.subscriptions.has(userId)) return;
+    const existing = connection.receiver.subscriptions.get(userId);
+    if (existing && !existing.destroyed && !existing.readableEnded) {
+      subscribed.add(userId);
+      return;
+    }
+    if (existing) {
+      try {
+        existing.destroy();
+      } catch {
+        /* ignore */
+      }
+      connection.receiver.subscriptions.delete(userId);
+    }
     subscribed.add(userId);
     const stream = connection.receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.Manual },
     });
     opts.logger.info({ userId, liveId: opts.row.id }, "live-help subscribed speaker");
+    let streamGone = false;
+    const goneOnce = (): void => {
+      if (streamGone) return;
+      streamGone = true;
+      onStreamGone(userId);
+    };
     stream.on("data", (p: Buffer) => {
+      pktCount += 1;
       if (!Buffer.isBuffer(p) || p.byteLength === 0) return;
+      if (p.compare(OPUS_SILENCE_FRAME) === 0) {
+        silenceCount += 1;
+        decodePacket(p);
+        return;
+      }
       const pcm48 = decodePacket(p);
-      if (!pcm48) return;
+      if (!pcm48) {
+        decodeFailCount += 1;
+        if (decodeFailCount === 1 || decodeFailCount % 50 === 0) {
+          opts.logger.warn(
+            { userId, liveId: opts.row.id, pktLen: p.byteLength, decodeFailCount },
+            "live-help opus decode failed"
+          );
+        }
+        return;
+      }
+      voicedCount += 1;
       lastHumanAt = Date.now();
       pendingMix.push(pcm48kStereoTo16kMono(pcm48));
     });
-    stream.once("end", () => subscribed.delete(userId));
-    stream.once("close", () => subscribed.delete(userId));
+    stream.once("end", goneOnce);
+    stream.once("close", goneOnce);
+    stream.once("error", (err: Error) => {
+      opts.logger.warn(
+        { userId, liveId: opts.row.id, err: err.message },
+        "live-help receive stream error"
+      );
+      goneOnce();
+    });
   };
 
   try {
@@ -330,20 +430,42 @@ export async function runLiveHelpCall(opts: {
           }
           pushGeminiPcm(pcm);
         },
-        onTranscript: opts.onTranscript,
+        onTranscript: (side, text) => {
+          opts.logger.info(
+            { side, chars: text.length, liveId: opts.row.id },
+            "live-help transcript"
+          );
+          opts.onTranscript(side, text);
+        },
         onInterrupted: interruptPlay,
         onGoAway: () => {
           reason = "goaway";
+        },
+        onClose: (code, closeReason) => {
+          opts.logger.warn(
+            { code, closeReason, liveId: opts.row.id },
+            "live-help gemini ws closed"
+          );
         },
       },
     });
     opts.onLive();
 
+    const botId = opts.client.user?.id;
     connection.receiver.speaking.on("start", (userId: string) => {
+      if (userId === botId) return;
       subscribeUser(userId);
+      beginActivity();
+    });
+    connection.receiver.speaking.on("end", (userId: string) => {
+      if (userId === botId) return;
+      opts.logger.info({ userId, liveId: opts.row.id }, "live-help speaking end");
+      scheduleActivityEnd();
     });
     for (const id of connection.receiver.speaking.users.keys()) {
+      if (id === botId) continue;
       subscribeUser(id);
+      beginActivity();
     }
 
     const mixTimer = setInterval(flushMix, 20);
@@ -390,10 +512,18 @@ export async function runLiveHelpCall(opts: {
       };
     });
     clearInterval(mixTimer);
-    flushMix();
+    if (activityEndTimer) {
+      clearTimeout(activityEndTimer);
+      activityEndTimer = undefined;
+    }
+    finishActivity();
   } catch (err) {
     reason = (err as Error).message || "error";
   } finally {
+    if (activityEndTimer) {
+      clearTimeout(activityEndTimer);
+      activityEndTimer = undefined;
+    }
     interruptPlay();
     try {
       player.stop(true);

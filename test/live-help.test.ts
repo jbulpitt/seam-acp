@@ -11,6 +11,8 @@ import {
 } from "../packages/core/src/core/live-help/voice-policy.js";
 import { isChoiceAuthoringRefused } from "../packages/core/src/core/choice/types.js";
 import {
+  buildActivityEnd,
+  buildActivityStart,
   buildHistoryClientContent,
   buildLiveHelpSetup,
   isLiveGoAway,
@@ -99,7 +101,9 @@ describe("live-help setup shape (D10)", () => {
     const gen = msg.setup.generationConfig as Record<string, unknown>;
     expect(gen.responseModalities).toEqual(["AUDIO"]);
     expect(msg.setup.model).toBe("models/gemini-3.1-flash-live-preview");
-    expect(msg.setup.realtimeInputConfig).toBeUndefined();
+    expect(msg.setup.realtimeInputConfig).toEqual({
+      automaticActivityDetection: { disabled: true },
+    });
     expect(msg.setup.historyConfig).toEqual({ initialHistoryInClientContent: true });
     expect(msg.setup.systemInstruction).toEqual({
       parts: [{ text: "tutor fractions" }],
@@ -124,6 +128,11 @@ describe("live-help setup shape (D10)", () => {
     expect(isLiveSetupComplete({ setupComplete: {} })).toBe(true);
     expect(isLiveInterrupted({ serverContent: { interrupted: true } })).toBe(true);
     expect(isLiveGoAway({ goAway: { timeLeft: "10s" } })).toBe(true);
+  });
+
+  it("brackets utterances with activityStart / activityEnd", () => {
+    expect(buildActivityStart()).toEqual({ realtimeInput: { activityStart: {} } });
+    expect(buildActivityEnd()).toEqual({ realtimeInput: { activityEnd: {} } });
   });
 });
 

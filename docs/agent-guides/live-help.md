@@ -24,7 +24,7 @@ You are a **coaching agent** in a text thread. You pack the lesson, then ask
 Gemini to **join a voice channel** and talk with the student live.
 
 This is **not** TTS of your last reply and **not** transcribing a voice note.
-Gemini Live hears speech in the VC and talks back. Barge-in is Gemini’s VAD.
+Gemini Live hears speech in the VC and talks back. It replies after a short pause in speech; talking over it barges in.
 Your text ACP session **stays in this thread** (parallel session — do not try
 to pipe PCM through `rt.prompt`).
 

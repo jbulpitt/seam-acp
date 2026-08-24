@@ -472,6 +472,57 @@ describe("statusCardStyle channel/thread overlay", () => {
     expect(live.threadPresets.get(THREAD)?.statusCardStyle?.value).toBe("full");
   });
 
+  it("applyChannelOverlay writes cwd without the Tier-C flag", () => {
+    const file = writePresetsFile({ channels: { [CHAN]: { model: { value: "old" } } } });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: false,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const result = svc.applyChannelOverlay({
+      channelId: CHAN,
+      changes: { cwd: "/repo/class" },
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.channels[CHAN].cwd).toEqual({ value: "/repo/class" });
+    expect(live.channelPresets.get(CHAN)?.cwd?.value).toBe("/repo/class");
+  });
+
+  it("applyThreadOverlay writes cwd over a channel value", () => {
+    const file = writePresetsFile({
+      channels: { [CHAN]: { cwd: { value: "/repo/class" } } },
+      threads: {},
+    });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: false,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const result = svc.applyThreadOverlay({
+      threadId: THREAD,
+      parentRef: CHAN,
+      changes: { cwd: "/repo/this-thread" },
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.channels[CHAN].cwd).toEqual({ value: "/repo/class" });
+    expect(raw.threads[THREAD].cwd).toEqual({ value: "/repo/this-thread" });
+    expect(live.threadPresets.get(THREAD)?.cwd?.value).toBe("/repo/this-thread");
+  });
+
   it("Tier-C channelPreset proposal can set statusCardStyle", () => {
     const record = makeRecord({ parentRef: CHAN });
     const file = writePresetsFile({ channels: { [CHAN]: {} } });

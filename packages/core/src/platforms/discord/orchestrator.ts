@@ -7168,20 +7168,27 @@ export class Orchestrator {
   }
 
   private async cmdRepo(i: ChatInputCommandInteraction): Promise<void> {
+    const record = this.recordFromInteraction(i);
     const channel = this.channelRefFromInteraction(i);
-    if (!channel) {
+    if (!record || !channel) {
       await i.reply({
-        content: "Use `/seam repo` from inside a thread.",
+        content: "Use `/seam config repo` from inside a thread.",
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
+    const scope = (i.options.getString("scope") ?? "session") as "session" | "thread" | "channel";
     const requested = i.options.getString("path");
+    const reply = async (content: string, ephemeral = true) => {
+      if (i.deferred || i.replied) await i.editReply(content);
+      else await i.reply({ content, flags: ephemeral ? MessageFlags.Ephemeral : undefined });
+    };
     if (!requested) {
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       await i.editReply("Posting repo picker…");
       const picked = await this.promptRepoPath(channel, {
         title: "🗂️ Choose a working repo",
+        includeInherit: scope !== "session",
       });
       if (!picked) {
         await i.editReply(
@@ -7189,28 +7196,120 @@ export class Orchestrator {
         );
         return;
       }
-      const applied = await this.applyPickedRepo(channel, picked);
+      const applied = await this.applyRepoAtScope(record, channel, picked, scope, {
+        id: i.user.id,
+        name: i.user.username,
+      });
       if (!applied.ok) {
         await i.editReply(`Could not set repo: ${applied.error}`);
         return;
       }
-      await i.editReply(
-        `Repo set to \`${this.repoDisplay(applied.record.repoPath ?? picked)}\`. Next message starts a fresh session.`
-      );
+      await i.editReply(applied.message);
       return;
     }
-    const applied = await this.applyPickedRepo(channel, requested);
-    if (!applied.ok) {
-      await i.reply({
-        content: `Invalid path: ${applied.error}`,
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    await i.reply({
-      content: `Repo set to \`${this.repoDisplay(applied.record.repoPath ?? requested)}\`. Next message starts a fresh session.`,
-      flags: MessageFlags.Ephemeral,
+    const applied = await this.applyRepoAtScope(record, channel, requested, scope, {
+      id: i.user.id,
+      name: i.user.username,
     });
+    if (!applied.ok) {
+      await reply(`Invalid path: ${applied.error}`);
+      return;
+    }
+    await reply(applied.message);
+  }
+
+  /**
+   * Write a resolved repo path to session / thread-preset / channel-preset.
+   * Channel scope always targets `record.parentRef` (this thread's parent).
+   * `INHERIT_VALUE` clears a thread/channel overlay.
+   */
+  private async applyRepoAtScope(
+    record: SessionRecord,
+    channel: ChannelRef,
+    requested: string,
+    scope: "session" | "thread" | "channel",
+    actor: { id: string; name: string }
+  ): Promise<{ ok: true; message: string } | { ok: false; error: string }> {
+    if (requested === INHERIT_VALUE) {
+      if (scope === "session") {
+        return { ok: false, error: "Session scope has no inherit — pass a path." };
+      }
+      if (scope === "channel") {
+        if (!record.parentRef) {
+          return { ok: false, error: "This thread has no parent channel to pin a channel-wide repo on." };
+        }
+        const written = this.configMutation.applyChannelOverlay({
+          channelId: record.parentRef,
+          changes: { cwd: null },
+          actor,
+        });
+        if (!written.ok) return written;
+        return {
+          ok: true,
+          message: "Channel repo overlay cleared — threads inherit unless they have their own overlay.",
+        };
+      }
+      const written = this.configMutation.applyThreadOverlay({
+        threadId: record.channelRef,
+        ...(record.parentRef ? { parentRef: record.parentRef } : {}),
+        changes: { cwd: null },
+        actor,
+      });
+      if (!written.ok) return written;
+      return { ok: true, message: "Thread-preset repo overlay cleared." };
+    }
+
+    let resolved: string;
+    try {
+      resolved = await this.resolveRequestedRepoPath(channel, requested);
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+    const location = resolveThreadLocation(this.config, channel.id);
+    if (isLocalLocation(location) && !isWithinRoot(resolved, this.config.REPOS_ROOT)) {
+      return {
+        ok: false,
+        error: `Repo \`${resolved}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`,
+      };
+    }
+
+    const display = this.repoDisplay(resolved);
+    if (scope === "channel") {
+      if (!record.parentRef) {
+        return { ok: false, error: "This thread has no parent channel to pin a channel-wide repo on." };
+      }
+      const written = this.configMutation.applyChannelOverlay({
+        channelId: record.parentRef,
+        changes: { cwd: resolved },
+        actor,
+      });
+      if (!written.ok) return written;
+      return {
+        ok: true,
+        message:
+          `Channel repo set to \`${display}\` — every thread in this channel inherits it unless it has its own overlay. Applies on the next turn.`,
+      };
+    }
+    if (scope === "thread") {
+      const written = this.configMutation.applyThreadOverlay({
+        threadId: record.channelRef,
+        ...(record.parentRef ? { parentRef: record.parentRef } : {}),
+        changes: { cwd: resolved },
+        actor,
+      });
+      if (!written.ok) return written;
+      return {
+        ok: true,
+        message: `Thread-preset repo set to \`${display}\`. Applies on the next turn.`,
+      };
+    }
+
+    const applied = await this.applyPickedRepo(channel, resolved);
+    if (!applied.ok) return applied;
+    return {
+      ok: true,
+      message: `Repo set to \`${this.repoDisplay(applied.record.repoPath ?? resolved)}\`. Next message starts a fresh session.`,
+    };
   }
 
   private async cmdModel(i: ChatInputCommandInteraction): Promise<void> {
@@ -11898,7 +11997,7 @@ export class Orchestrator {
       "`/seam config effort [level]` — reasoning effort",
       "`/seam config agent [id]` — get / set agent@location (resets session)",
       "`/seam config mode <id>` — set agent operational mode",
-      "`/seam config repo [path]` — set working repo (picker if omitted; type a path to skip)",
+      "`/seam config repo [path] [scope:session|thread|channel]` — working repo (picker if omitted)",
       "`/seam config tools <allow|exclude> [list]` — tool filters",
       "`/seam config approve <always|ask|deny>` — permission policy",
       "`/seam config card [full|simple] [scope:session|thread|channel]` — status-card layout (channel = inherit live)",
@@ -13820,6 +13919,7 @@ export class Orchestrator {
       return pickerModelsForProfile(this.router.getProfile(agentId), 24);
     };
     let models = await loadModels(state.agentId);
+    const repoDirs = (await this.listHostWorkspacePaths(i.channelId)) ?? [];
 
     const render = () => {
       const agentDisplay = state.agentId ? `\`${state.agentId}\`` : "*(default)*";
@@ -13909,24 +14009,51 @@ export class Orchestrator {
           }))
         );
 
-      const cardSelect = new StringSelectMenuBuilder()
-        .setCustomId("preset:card")
-        .setPlaceholder("🃏 Status card")
-        .addOptions(
-          { label: "Default (don't pin)", value: "__default__", default: state.statusCardStyle === null },
-          {
-            label: "full",
-            value: "full",
-            description: "Repo, model, action, effort, tool tags",
-            default: state.statusCardStyle === "full",
-          },
-          {
-            label: "simple",
-            value: "simple",
-            description: "Compact + brand icon",
-            default: state.statusCardStyle === "simple",
-          }
-        );
+      const repoSelect = new StringSelectMenuBuilder()
+        .setCustomId("preset:repo")
+        .setPlaceholder("📂 Repo");
+      const repoOpts: Array<{
+        label: string;
+        value: string;
+        description?: string;
+        default?: boolean;
+      }> = [
+        {
+          label: "Inherit / clear (no pin)",
+          value: "__default__",
+          description: "Don't pin a repo on this preset",
+          default: state.repoPath === null,
+        },
+      ];
+      const fit = repoDirs.filter((p) => p.length <= 100);
+      for (const p of fit.slice(0, 23)) {
+        repoOpts.push({
+          label: path.basename(p).slice(0, 100) || p.slice(0, 100),
+          value: p,
+          description: p.slice(0, 100),
+          default: p === state.repoPath,
+        });
+      }
+      if (
+        state.repoPath &&
+        state.repoPath.length <= 100 &&
+        !repoOpts.some((o) => o.value === state.repoPath)
+      ) {
+        repoOpts.splice(1, 0, {
+          label: path.basename(state.repoPath).slice(0, 100),
+          value: state.repoPath,
+          description: state.repoPath.slice(0, 100),
+          default: true,
+        });
+      }
+      if (fit.length > 23 || fit.length < repoDirs.length) {
+        repoOpts.push({
+          label: "More… (full picker)",
+          value: "__more__",
+          description: "Open the paginated repo picker",
+        });
+      }
+      repoSelect.addOptions(repoOpts);
 
       const buttons = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder()
@@ -13938,8 +14065,8 @@ export class Orchestrator {
           .setLabel("🔧 Tools")
           .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
-          .setCustomId("preset:instr")
-          .setLabel("📋 Instructions")
+          .setCustomId("preset:card")
+          .setLabel(state.statusCardStyle ? `🃏 ${state.statusCardStyle}` : "🃏 Card")
           .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
           .setCustomId("preset:save")
@@ -13958,7 +14085,7 @@ export class Orchestrator {
           new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(agentSelect),
           new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(modelSelect),
           new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(effortSelect),
-          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(cardSelect),
+          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(repoSelect),
           buttons,
         ],
       };
@@ -14001,10 +14128,38 @@ export class Orchestrator {
           const v = c.values[0]!;
           state.effort = v === "__default__" ? null : v;
           await c.update(render());
-        } else if (c.isStringSelectMenu() && c.customId === "preset:card") {
+        } else if (c.isStringSelectMenu() && c.customId === "preset:repo") {
           const v = c.values[0]!;
+          if (v === "__more__") {
+            await c.deferUpdate();
+            const channel = this.channelRefFromInteraction(c);
+            if (!channel) return;
+            const picked = await this.promptRepoPath(channel, {
+              title: "📂 Preset repo",
+              includeInherit: true,
+              authorizedUserIds: new Set([i.user.id]),
+            });
+            if (picked === INHERIT_VALUE) {
+              state.repoPath = null;
+            } else if (picked) {
+              try {
+                state.repoPath = await this.resolveRequestedRepoPath(channel, picked);
+              } catch {
+                state.repoPath = picked;
+              }
+            }
+            await i.editReply(render());
+          } else {
+            state.repoPath = v === "__default__" ? null : v;
+            await c.update(render());
+          }
+        } else if (c.isButton() && c.customId === "preset:card") {
           state.statusCardStyle =
-            v === "full" || v === "simple" ? v : null;
+            state.statusCardStyle === null
+              ? "full"
+              : state.statusCardStyle === "full"
+                ? "simple"
+                : null;
           await c.update(render());
         } else if (c.isButton() && c.customId === "preset:details") {
           const modal = new ModalBuilder()
@@ -14031,20 +14186,20 @@ export class Orchestrator {
             ),
             new ActionRowBuilder<TextInputBuilder>().addComponents(
               new TextInputBuilder()
-                .setCustomId("repo")
-                .setLabel("Repo path (blank = default)")
-                .setStyle(TextInputStyle.Short)
-                .setMaxLength(200)
-                .setValue(state.repoPath ?? "")
-                .setRequired(false)
-            ),
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder()
                 .setCustomId("permission")
                 .setLabel("Permission: always / ask / deny")
                 .setStyle(TextInputStyle.Short)
                 .setMaxLength(10)
                 .setValue(state.permission ?? "")
+                .setRequired(false)
+            ),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(
+              new TextInputBuilder()
+                .setCustomId("instr")
+                .setLabel("Instructions (worker identity)")
+                .setStyle(TextInputStyle.Paragraph)
+                .setMaxLength(4000)
+                .setValue(state.instructions ?? "")
                 .setRequired(false)
             )
           );
@@ -14056,15 +14211,6 @@ export class Orchestrator {
             });
             state.name = submit.fields.getTextInputValue("name").trim();
             state.description = submit.fields.getTextInputValue("desc").trim();
-            const repoVal = submit.fields.getTextInputValue("repo").trim();
-            state.repoPath = repoVal || null;
-            if (state.repoPath) {
-              // Store the resolved absolute path so apply-time doesn't have to
-              // re-resolve against a possibly-different REPOS_ROOT.
-              try {
-                state.repoPath = resolveRepoPath(this.config.REPOS_ROOT, state.repoPath);
-              } catch { /* unresolvable — keep the raw text so the user can fix it */ }
-            }
             const permVal = submit.fields
               .getTextInputValue("permission")
               .trim()
@@ -14073,6 +14219,8 @@ export class Orchestrator {
               permVal === "always" || permVal === "ask" || permVal === "deny"
                 ? permVal
                 : null;
+            const instrVal = submit.fields.getTextInputValue("instr").trim();
+            state.instructions = instrVal || null;
             await submit.deferUpdate();
             await i.editReply(render());
           } catch { /* modal timeout */ }

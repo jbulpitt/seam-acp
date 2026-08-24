@@ -504,9 +504,10 @@ export function buildSeamCommand(): SlashCommandBuilder {
   );
 
   // Presets: reusable bundles of session config (agent/model/effort/repo/
-  // permission/tools/instructions). `/seam preset thread` autocompletes the
-  // `preset` option via the bot-wide AutocompleteRegistry (#93). Other name
-  // options stay free-form until they register a responder.
+  // permission/tools/instructions). Existing-preset name options
+  // (`thread.preset`, `apply`/`delete`/`show`/`edit` `name`) autocomplete via
+  // the bot-wide AutocompleteRegistry (#93). `create` takes a NEW name and
+  // stays free-form.
   cmd.addSubcommandGroup((g) =>
     g
       .setName("preset")
@@ -530,7 +531,11 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("apply")
           .setDescription("Apply a preset to the current thread")
           .addStringOption((o) =>
-            o.setName("name").setDescription("Preset name").setRequired(true)
+            o
+              .setName("name")
+              .setDescription("Preset name")
+              .setRequired(true)
+              .setAutocomplete(true)
           )
       )
       .addSubcommand((sub) =>
@@ -538,7 +543,11 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("delete")
           .setDescription("Delete a preset")
           .addStringOption((o) =>
-            o.setName("name").setDescription("Preset name").setRequired(true)
+            o
+              .setName("name")
+              .setDescription("Preset name")
+              .setRequired(true)
+              .setAutocomplete(true)
           )
       )
       .addSubcommand((sub) =>
@@ -546,7 +555,11 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("show")
           .setDescription("Show a preset's details")
           .addStringOption((o) =>
-            o.setName("name").setDescription("Preset name").setRequired(true)
+            o
+              .setName("name")
+              .setDescription("Preset name")
+              .setRequired(true)
+              .setAutocomplete(true)
           )
       )
       .addSubcommand((sub) =>
@@ -554,7 +567,11 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("edit")
           .setDescription("Edit an existing preset (reopens the builder card)")
           .addStringOption((o) =>
-            o.setName("name").setDescription("Preset name").setRequired(true)
+            o
+              .setName("name")
+              .setDescription("Preset name")
+              .setRequired(true)
+              .setAutocomplete(true)
           )
       )
       .addSubcommand((sub) =>

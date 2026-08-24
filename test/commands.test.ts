@@ -172,12 +172,14 @@ describe("/seam slash command", () => {
     expect(opts[1]?.type).toBe(STRING);
     expect(opts[1]?.required).toBe(true);
     expect(opts[1]?.autocomplete).toBe(true);
-    // Existing name-typed leaves stay free-form (no autocomplete).
     for (const leaf of ["apply", "delete", "show", "edit"]) {
       const sub = (preset?.options ?? []).find((o) => o.name === leaf);
       const nameOpt = (sub?.options ?? []).find((o) => o.name === "name");
-      expect(nameOpt?.autocomplete ?? false, leaf).toBe(false);
+      expect(nameOpt?.required, leaf).toBe(true);
+      expect(nameOpt?.autocomplete, leaf).toBe(true);
     }
+    const create = (preset?.options ?? []).find((o) => o.name === "create");
+    expect((create?.options ?? []).find((o) => o.name === "name")).toBeUndefined();
   });
 
   it("removed image/abort/kill and old top-level config leaves", () => {

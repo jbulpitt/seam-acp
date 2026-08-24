@@ -28,6 +28,29 @@ describe("AutocompleteRegistry", () => {
     expect(reg.get("preset", "apply", "name")).toBeUndefined();
     expect(reg.get("preset", "thread", "name")).toBeUndefined();
   });
+
+  it("apply/delete/show/edit name share a responder; create/list stay unregistered", async () => {
+    const reg = new AutocompleteRegistry();
+    const responder = () => [{ name: "reviewer", value: "reviewer" }];
+    for (const sub of ["apply", "delete", "show", "edit"] as const) {
+      reg.register("preset", sub, "name", responder);
+    }
+    for (const sub of ["apply", "delete", "show", "edit"] as const) {
+      const hit = reg.get("preset", sub, "name");
+      expect(hit, sub).toBeTypeOf("function");
+      expect(
+        await hit!({
+          group: "preset",
+          subcommand: sub,
+          optionName: "name",
+          focusedValue: "",
+          projectScopeId: "chan-1",
+        })
+      ).toEqual([{ name: "reviewer", value: "reviewer" }]);
+    }
+    expect(reg.get("preset", "create", "name")).toBeUndefined();
+    expect(reg.get("preset", "list", "name")).toBeUndefined();
+  });
 });
 
 describe("preset autocomplete responder", () => {

@@ -413,9 +413,45 @@ describe("preset thread autocomplete (#93)", () => {
     expect(responded[0]).toEqual([]);
   });
 
+  it("apply/delete/show/edit name return the same project-scoped presets as thread", async () => {
+    store.upsertPreset(preset({ name: "reviewer", projectRef: "chan-1" }));
+    store.upsertPreset(preset({ id: "p-writer", name: "writer", projectRef: "chan-1", agentId: "claude" }));
+    store.upsertPreset(preset({ id: "p-global", name: "review-global", projectRef: null }));
+    store.upsertPreset(preset({ id: "p-other", name: "review-other", projectRef: "chan-2" }));
+    const { orch } = makeOrch();
+    const expected = ["review-global", "reviewer"];
+    for (const sub of ["apply", "delete", "show", "edit"] as const) {
+      const { i, responded } = autocompleteI({
+        group: "preset",
+        sub,
+        option: "name",
+        value: "rev",
+      });
+      await orch.handleAutocompleteInteraction(i as any);
+      expect(responded).toHaveLength(1);
+      const names = (responded[0] as Array<{ name: string }>).map((c) => c.name);
+      expect(names, sub).toEqual(expected);
+      expect(names).not.toContain("review-other");
+      expect(names).not.toContain("writer");
+    }
+  });
+
+  it("create name is not autocompleted (new name stays free-form)", async () => {
+    store.upsertPreset(preset({ name: "reviewer", projectRef: "chan-1" }));
+    const { orch } = makeOrch();
+    const { i, responded } = autocompleteI({
+      group: "preset",
+      sub: "create",
+      option: "name",
+      value: "rev",
+    });
+    await orch.handleAutocompleteInteraction(i as any);
+    expect(responded[0]).toEqual([]);
+  });
+
   it("unknown option / group → [] (does not throw)", async () => {
     const { orch } = makeOrch();
-    const { i, responded } = autocompleteI({ group: "preset", sub: "apply", option: "name", value: "x" });
+    const { i, responded } = autocompleteI({ group: "preset", sub: "apply", option: "bogus", value: "x" });
     await orch.handleAutocompleteInteraction(i as any);
     expect(responded[0]).toEqual([]);
   });

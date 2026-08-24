@@ -12,9 +12,9 @@ Pin to a tag or commit SHA if a class must not drift with `main`. Overlay only
 Do not fork the protocol.
 
 v1 is specified in GitHub **#98**. Spike (join / capture / Live round-trip) is
-proven. The MCP tools land with that PR. If `create_live_help` is **not** in
-your tool list yet, do not invent a fence and do not run `/seam debug voice-*`
-from a school thread — wait, or ask Jesse.
+proven. **MCP `create_live_help` / `cancel_live_help` are the product.** If they
+are **not** in your tool list yet (old process), do not invent a fence and do
+not run `/seam debug voice-*` from a school thread — wait, or ask Jesse.
 
 ---
 
@@ -162,15 +162,25 @@ thread is `school-alaina` / `school-allie`.
 ## Pin this in a school / course repo
 
 See `docs/agent-guides/live-help-onboarding.md` (paste-1 for a new overlay).
-After #98 ships, a brand-new school session should know: pack the lesson,
-`create_live_help` with Jesse’s VC snowflake, students join that VC, kids do
-not mint.
+A brand-new school session should know: pack the lesson, `create_live_help`
+with Jesse’s VC snowflake (rider first, else General), students join that VC,
+kids do not mint.
 
 ---
 
 ## Implementer leftovers (not for school agents)
 
-Spike commands stay until #98 ships: `/seam debug voice-ping|voice-capture|voice-live`.
-Do not copy: `responseModalities` on the setup root; named ESM `@discordjs/opus`;
-ending the Live turn on the first audio chunk; clip dump with `activityStart` /
-`activityEnd`. Production is continuous duplex + Gemini auto-VAD. Spec: #98.
+Debug `/seam debug voice-ping|voice-capture|voice-live` stays until a follow-on
+removes it. Do **not** copy from the spike:
+
+- `responseModalities` on the setup **root** (close 1007) — only in `generationConfig`
+- Named ESM import of `@discordjs/opus` — use `createRequire`
+- Resolving on the **first** Live audio chunk — drain until `generationComplete` /
+  `turnComplete`; keep the WS open for the whole call
+- `automaticActivityDetection.disabled` + `activityStart`/`activityEnd` clip dump
+  (debug `voice-live` only). v1 is continuous duplex with Gemini **auto-VAD**
+- Hard allowlist of General-only. Prod uses the D11 refuse-list + explicit
+  `voiceChannelId`
+
+No wav/pcm on disk. One session per VC (and per guild). Process restart marks
+in-flight rows ended. Spec: #98.

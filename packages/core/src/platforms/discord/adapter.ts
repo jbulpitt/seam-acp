@@ -432,6 +432,29 @@ export class DiscordAdapter implements ChatAdapter {
     return { text: `Voice live round-trip failed: ${result.reason}` };
   }
 
+  async inspectLiveHelpVoice(voiceChannelId: string) {
+    const { inspectLiveHelpVoiceChannel } = await import("./live-help-call.js");
+    return inspectLiveHelpVoiceChannel(this.client, voiceChannelId);
+  }
+
+  async runLiveHelpCall(opts: {
+    row: import("../../core/live-help/types.js").LiveHelpSession;
+    signal: AbortSignal;
+    onLive: () => void;
+    onTranscript: (side: "input" | "output", text: string) => void;
+  }): Promise<{ reason: string }> {
+    const { runLiveHelpCall } = await import("./live-help-call.js");
+    return runLiveHelpCall({
+      client: this.client,
+      apiKey: this.config.SEAM_GEMINI_API_KEY,
+      row: opts.row,
+      signal: opts.signal,
+      logger: this.logger,
+      onLive: opts.onLive,
+      onTranscript: opts.onTranscript,
+    });
+  }
+
   async stop(): Promise<void> {
     try {
       await this.client.destroy();

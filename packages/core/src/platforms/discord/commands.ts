@@ -133,6 +133,12 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setDescription("Revoke a headless ingest endpoint in this thread by id")
           .setRequired(false)
       )
+      .addStringOption((o) =>
+        o
+          .setName("cancel-live")
+          .setDescription("Hang up a live-help Gemini voice call by id")
+          .setRequired(false)
+      )
   );
 
   cmd.addSubcommand((sub) =>

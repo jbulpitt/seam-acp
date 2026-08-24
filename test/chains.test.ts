@@ -281,6 +281,7 @@ describe("chain MCP tool", () => {
     expect(names).toEqual([
       "cancel_choice",
       "cancel_ingest",
+      "cancel_live_help",
       "cancel_wake",
       "chain",
       "compact",
@@ -288,6 +289,7 @@ describe("chain MCP tool", () => {
       "config_propose",
       "create_choice",
       "create_ingest",
+      "create_live_help",
       "forward",
       "handoff",
       "peek",

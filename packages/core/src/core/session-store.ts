@@ -35,6 +35,7 @@ import type {
   ChoiceTarget,
 } from "./choice/types.js";
 import type { IngestEndpoint, IngestEndpointStatus } from "./choice/endpoint.js";
+import type { LiveHelpSession, LiveHelpStatus } from "./live-help/types.js";
 import { INBOX_MAX_PER_SESSION, type InboxMessage } from "./inbox/types.js";
 import type { ParkedAttachment, ParkedPrompt } from "./parked-prompts/types.js";
 
@@ -274,6 +275,7 @@ export class SessionStore {
     this.migrateChoiceSelect();
     this.db.exec(INGEST_ENDPOINTS_SCHEMA);
     this.migrateIngestEndpointPreset();
+    this.db.exec(LIVE_HELP_SCHEMA);
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -1735,6 +1737,138 @@ export class SessionStore {
    * One-shot exam path. Empty studentId is not claimed (anonymous retries stay
    * allowed). Duplicate (ingest_id, student_id) → already-claimed.
    */
+  insertLiveHelp(s: LiveHelpSession): void {
+    this.db
+      .prepare(
+        `INSERT INTO live_help_sessions
+           (id, voice_channel_id, guild_id, channel_name, system, history_summary,
+            notify_thread, preset, authoring_channel_ref, authoring_parent_ref,
+            platform, status, created_by, created_utc, ended_utc, end_reason)
+         VALUES
+           (@id, @voiceChannelId, @guildId, @channelName, @system, @historySummary,
+            @notifyThread, @preset, @authoringChannelRef, @authoringParentRef,
+            @platform, @status, @createdBy, @createdUtc, @endedUtc, @endReason)`
+      )
+      .run({
+        id: s.id,
+        voiceChannelId: s.voiceChannelId,
+        guildId: s.guildId,
+        channelName: s.channelName,
+        system: s.system,
+        historySummary: s.historySummary,
+        notifyThread: s.notifyThread,
+        preset: s.preset,
+        authoringChannelRef: s.authoringChannelRef,
+        authoringParentRef: s.authoringParentRef,
+        platform: s.platform,
+        status: s.status,
+        createdBy: s.createdBy,
+        createdUtc: s.createdUtc,
+        endedUtc: s.endedUtc,
+        endReason: s.endReason,
+      });
+  }
+
+  getLiveHelp(id: string): LiveHelpSession | null {
+    const row = this.db
+      .prepare<[string], LiveHelpRow>("SELECT * FROM live_help_sessions WHERE id = ?")
+      .get(id);
+    return row ? mapLiveHelp(row) : null;
+  }
+
+  getActiveLiveHelpForVoiceChannel(voiceChannelId: string): LiveHelpSession | null {
+    const row = this.db
+      .prepare<[string], LiveHelpRow>(
+        `SELECT * FROM live_help_sessions
+          WHERE voice_channel_id = ? AND status IN ('starting','live')
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(voiceChannelId);
+    return row ? mapLiveHelp(row) : null;
+  }
+
+  getActiveLiveHelpForGuild(guildId: string): LiveHelpSession | null {
+    const row = this.db
+      .prepare<[string], LiveHelpRow>(
+        `SELECT * FROM live_help_sessions
+          WHERE guild_id = ? AND status IN ('starting','live')
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(guildId);
+    return row ? mapLiveHelp(row) : null;
+  }
+
+  listLiveHelpForThread(platform: string, channelRef: string): LiveHelpSession[] {
+    return this.db
+      .prepare<[string, string], LiveHelpRow>(
+        `SELECT * FROM live_help_sessions
+          WHERE platform = ? AND authoring_channel_ref = ?
+          ORDER BY created_utc DESC LIMIT 50`
+      )
+      .all(platform, channelRef)
+      .map(mapLiveHelp);
+  }
+
+  listActiveLiveHelp(): LiveHelpSession[] {
+    return this.db
+      .prepare<[], LiveHelpRow>(
+        `SELECT * FROM live_help_sessions
+          WHERE status IN ('starting','live')
+          ORDER BY created_utc ASC`
+      )
+      .all()
+      .map(mapLiveHelp);
+  }
+
+  updateLiveHelp(
+    id: string,
+    patch: {
+      status?: LiveHelpStatus;
+      endedUtc?: string | null;
+      endReason?: string | null;
+      guildId?: string | null;
+      channelName?: string | null;
+    }
+  ): void {
+    const cur = this.getLiveHelp(id);
+    if (!cur) return;
+    const next: LiveHelpSession = {
+      ...cur,
+      ...(patch.status ? { status: patch.status } : {}),
+      ...(patch.endedUtc !== undefined ? { endedUtc: patch.endedUtc } : {}),
+      ...(patch.endReason !== undefined ? { endReason: patch.endReason } : {}),
+      ...(patch.guildId !== undefined ? { guildId: patch.guildId } : {}),
+      ...(patch.channelName !== undefined ? { channelName: patch.channelName } : {}),
+    };
+    this.db
+      .prepare(
+        `UPDATE live_help_sessions SET
+           status = @status, ended_utc = @endedUtc, end_reason = @endReason,
+           guild_id = @guildId, channel_name = @channelName
+         WHERE id = @id`
+      )
+      .run({
+        id,
+        status: next.status,
+        endedUtc: next.endedUtc,
+        endReason: next.endReason,
+        guildId: next.guildId,
+        channelName: next.channelName,
+      });
+  }
+
+  markInFlightLiveHelpEnded(reason: string): number {
+    const now = new Date().toISOString();
+    const info = this.db
+      .prepare(
+        `UPDATE live_help_sessions
+            SET status = 'ended', ended_utc = ?, end_reason = ?
+          WHERE status IN ('starting','live')`
+      )
+      .run(now, reason);
+    return info.changes;
+  }
+
   claimIngestStudent(
     ingestId: string,
     studentId: string
@@ -2275,6 +2409,68 @@ CREATE TABLE IF NOT EXISTS ingest_endpoint_claims (
   PRIMARY KEY (ingest_id, student_id)
 );
 `;
+
+const LIVE_HELP_SCHEMA = `
+CREATE TABLE IF NOT EXISTS live_help_sessions (
+  id                     TEXT PRIMARY KEY,
+  voice_channel_id       TEXT NOT NULL,
+  guild_id               TEXT,
+  channel_name           TEXT,
+  system                 TEXT NOT NULL,
+  history_summary        TEXT,
+  notify_thread          TEXT,
+  preset                 TEXT,
+  authoring_channel_ref  TEXT NOT NULL,
+  authoring_parent_ref   TEXT,
+  platform               TEXT NOT NULL,
+  status                 TEXT NOT NULL,
+  created_by             TEXT NOT NULL,
+  created_utc            TEXT NOT NULL,
+  ended_utc              TEXT,
+  end_reason             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_live_help_status ON live_help_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_live_help_vc ON live_help_sessions(voice_channel_id, status);
+CREATE INDEX IF NOT EXISTS idx_live_help_author ON live_help_sessions(platform, authoring_channel_ref, status);
+`;
+
+interface LiveHelpRow {
+  id: string;
+  voice_channel_id: string;
+  guild_id: string | null;
+  channel_name: string | null;
+  system: string;
+  history_summary: string | null;
+  notify_thread: string | null;
+  preset: string | null;
+  authoring_channel_ref: string;
+  authoring_parent_ref: string | null;
+  platform: string;
+  status: string;
+  created_by: string;
+  created_utc: string;
+  ended_utc: string | null;
+  end_reason: string | null;
+}
+
+const mapLiveHelp = (r: LiveHelpRow): LiveHelpSession => ({
+  id: r.id,
+  voiceChannelId: r.voice_channel_id,
+  guildId: r.guild_id,
+  channelName: r.channel_name,
+  system: r.system,
+  historySummary: r.history_summary,
+  notifyThread: r.notify_thread,
+  preset: r.preset,
+  authoringChannelRef: r.authoring_channel_ref,
+  authoringParentRef: r.authoring_parent_ref,
+  platform: r.platform,
+  status: r.status as LiveHelpSession["status"],
+  createdBy: r.created_by,
+  createdUtc: r.created_utc,
+  endedUtc: r.ended_utc,
+  endReason: r.end_reason,
+});
 
 interface ChoiceRow {
   id: string;

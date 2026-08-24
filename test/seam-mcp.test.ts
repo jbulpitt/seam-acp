@@ -373,6 +373,7 @@ describe("SeamMcpServer", () => {
     expect(names).toEqual([
       "cancel_choice",
       "cancel_ingest",
+      "cancel_live_help",
       "cancel_wake",
       "chain",
       "compact",
@@ -380,6 +381,7 @@ describe("SeamMcpServer", () => {
       "config_propose",
       "create_choice",
       "create_ingest",
+      "create_live_help",
       "forward",
       "handoff",
       "peek",
@@ -479,7 +481,7 @@ describe("SeamMcpServer", () => {
     const { body } = await h.call("tools/list");
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     // Adding an OPTION to handoff does NOT change the tool count (#91/#95 grew the list).
-    expect(body.result.tools).toHaveLength(21);
+    expect(body.result.tools).toHaveLength(23);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -1197,8 +1199,8 @@ describe("SeamMcpServer", () => {
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
-    // Params on `send` must NOT add a tool — the set stays at 21 (#61/#62/#66/#73/#91/#95).
-    expect(body.result.tools).toHaveLength(21);
+    // Params on `send` must NOT add a tool — the set stays at 23 (#61/#62/#66/#73/#91/#95/#98).
+    expect(body.result.tools).toHaveLength(23);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

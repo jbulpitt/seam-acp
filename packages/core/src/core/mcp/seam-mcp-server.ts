@@ -353,6 +353,19 @@ export interface SeamMcpServerDeps {
     record: SessionRecord,
     ingestId: string
   ) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Mint a Gemini Live voice-channel session (#98). Fire-and-forget. */
+  createLiveHelp?: (
+    record: SessionRecord,
+    spec: unknown
+  ) => Promise<
+    | { ok: true; liveId: string; guildId: string; channelName: string }
+    | { ok: false; error: string }
+  >;
+  /** Hang up a live-help call minted from this thread. */
+  cancelLiveHelp?: (
+    record: SessionRecord,
+    liveId: string
+  ) => { ok: true } | { ok: false; error: string };
 }
 
 /** One drained inbox message, as `poll_inbox` renders it. Kept as a minimal
@@ -1110,6 +1123,48 @@ const TOOLS = [
       required: ["ingestId"],
     },
   },
+  {
+    name: "create_live_help",
+    description:
+      "Join a Discord voice channel as Gemini Live (audio↔audio tutoring). Parallel to this text session — does not block. Restricted participants cannot mint. See docs/agent-guides/live-help.md.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        voiceChannelId: {
+          type: "string",
+          description: "Discord voice channel snowflake to join. Required.",
+        },
+        system: {
+          type: "string",
+          description: "Packed lesson / student / problem instruction for Gemini. Required.",
+        },
+        historySummary: {
+          type: "string",
+          description: "Optional short text seed (not a file library).",
+        },
+        notifyThread: {
+          type: "string",
+          description: "Optional Discord snowflake for input/output transcripts. Omitted = no transcript posts.",
+        },
+        preset: {
+          type: "string",
+          description: "Optional project preset name, stored for end-of-call report-back. Not the Live model.",
+        },
+      },
+      required: ["voiceChannelId", "system"],
+    },
+  },
+  {
+    name: "cancel_live_help",
+    description: "Hang up a live-help Gemini voice call you minted from THIS thread.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        liveId: { type: "string", description: "Id returned by create_live_help." },
+      },
+      required: ["liveId"],
+    },
+  },
 ] as const;
 
 const INSTRUCTIONS = [
@@ -1135,6 +1190,7 @@ const INSTRUCTIONS = [
   "- cancel_wake(wakeId): cancel a pending wake you scheduled.",
   "- create_choice / cancel_choice / submit_result: frozen click-cards; HTTP ingest + declared JSON result. Participants cannot author. See docs/agent-guides/interactive-prompts.md.",
   "- create_ingest / cancel_ingest: headless HTTP endpoint (no Discord card). Isolated silent scoring, retries unlimited. Token once. Same POST /ingest + submit_result.",
+  "- create_live_help / cancel_live_help: Gemini joins a Discord voice channel (audio↔audio). Parallel to this text session. Restricted participants cannot mint. See docs/agent-guides/live-help.md.",
   "- watch_create(kind, spec, intervalSeconds, prompt, expiresInSeconds, ...): register a CONDITION the bridge",
   "  checks cheaply and re-enters you ONLY when it fires (file/http/command source). Prefer this over a",
   "  schedule_wake poll loop for \"wait until X\" — the bridge does the checking, so a turn is spent only on a",
@@ -1343,6 +1399,10 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolCreateIngest(record, args));
         case "cancel_ingest":
           return rpcResult(id, await this.toolCancelIngest(record, args));
+        case "create_live_help":
+          return rpcResult(id, await this.toolCreateLiveHelp(record, args));
+        case "cancel_live_help":
+          return rpcResult(id, this.toolCancelLiveHelp(record, args));
         default:
           return rpcError(id, -32602, `unknown tool: ${name}`);
       }
@@ -1749,6 +1809,40 @@ export class SeamMcpServer {
     const result = await this.deps.cancelIngest(caller, ingestId);
     return result.ok
       ? textResult(`Ingest endpoint ${ingestId} revoked.`)
+      : textResult(result.error, true);
+  }
+
+  private async toolCreateLiveHelp(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.createLiveHelp) {
+      return textResult("live help is not supported on this deployment.", true);
+    }
+    const result = await this.deps.createLiveHelp(caller, args);
+    if (!result.ok) return textResult(`Live help not started: ${result.error}`, true);
+    this.logger.info(
+      { liveId: result.liveId, thread: caller.channelRef, vc: args.voiceChannelId },
+      "seam-mcp create_live_help minted"
+    );
+    return textResult(
+      `Live help ${result.liveId} joining **${result.channelName}** (guild ${result.guildId}). ` +
+        `This text session is undisturbed. Hang up with cancel_live_help({ liveId: "${result.liveId}" }) ` +
+        `or /seam workflows cancel-live.`
+    );
+  }
+
+  private toolCancelLiveHelp(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): McpToolResult {
+    if (!this.deps.cancelLiveHelp) {
+      return textResult("live help is not supported on this deployment.", true);
+    }
+    const liveId = requireString(args, "liveId");
+    const result = this.deps.cancelLiveHelp(caller, liveId);
+    return result.ok
+      ? textResult(`Live help ${liveId} hanging up.`)
       : textResult(result.error, true);
   }
 

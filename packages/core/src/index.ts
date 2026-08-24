@@ -22,6 +22,7 @@ import { ScheduledPromptManager } from "./core/scheduled-prompts/manager.js";
 import { WakeManager } from "./core/wake/manager.js";
 import { ParkedPromptManager } from "./core/parked-prompts/manager.js";
 import { WatchManager } from "./core/watch/manager.js";
+import { LiveHelpManager } from "./core/live-help/manager.js";
 import { evaluateWatch } from "./core/watch/evaluate.js";
 import { DispatchWatcher } from "./core/dispatch/watcher.js";
 import { enqueueDispatchSpec } from "./core/dispatch/types.js";
@@ -532,6 +533,8 @@ async function main(): Promise<void> {
       submitResult: (record, value) => orchestrator.submitChoiceResult(record, value),
       createIngest: (record, spec) => orchestrator.createIngest(record, spec),
       cancelIngest: (record, id) => orchestrator.cancelIngest(record, id),
+      createLiveHelp: (record, spec) => orchestrator.createLiveHelp(record, spec),
+      cancelLiveHelp: (record, id) => orchestrator.cancelLiveHelp(record, id),
       // Agent-defined watches (#60): register/cancel/list a bridge-evaluated
       // condition trigger for the calling thread. The orchestrator owns the
       // guards (including the D8 command gate) and the DB row; the WatchManager
@@ -746,6 +749,21 @@ async function main(): Promise<void> {
   orchestrator.setWatchManager(watchManager);
   watchManager.start();
 
+  const liveHelpManager = new LiveHelpManager({
+    store,
+    logger: logger.child({ mod: "live-help" }),
+    apiKey: () => config.SEAM_GEMINI_API_KEY,
+    host: {
+      inspectVoiceChannel: (id) => adapter.inspectLiveHelpVoice(id),
+      runCall: (opts) => adapter.runLiveHelpCall(opts),
+      notify: async (threadId, text) => {
+        await adapter.sendMessage({ platform: "discord", id: threadId }, text);
+      },
+    },
+  });
+  liveHelpManager.reconcileOnBoot();
+  orchestrator.setLiveHelpManager(liveHelpManager);
+
   // Operator-dispatch bridge: a trusted process drops a spec into
   // <DATA_DIR>/dispatch/pending/ and the watcher runs it as a turn in the
   // target thread, writing the captured output to done/. Started after the
@@ -901,6 +919,7 @@ async function main(): Promise<void> {
     wakeManager.stop();
     parkedManager.stop();
     watchManager.stop();
+    liveHelpManager.stopAll();
     dispatchWatcher.stop();
     stopPresetsWatch?.();
     await seamMcpServer?.stop().catch((err) =>

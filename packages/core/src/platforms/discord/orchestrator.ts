@@ -266,6 +266,7 @@ import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
 import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
+import { LiveHelpManager } from "../../core/live-help/manager.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import {
   applyVoiceNoteTranscriptions,
@@ -424,6 +425,8 @@ export class Orchestrator {
   /** Set by index.ts after construction; the DB sweeper for agent-defined
    *  watches (#60). Held only so shutdown/diagnostics can reach it. */
   private watchManager?: WatchManager;
+  /** Gemini Live voice-channel sessions (#98). In-memory run + durable rows. */
+  private liveHelpManager?: LiveHelpManager;
   /** Set by index.ts after construction; event-driven parked-prompt delivery (#88). */
   private parkedManager?: ParkedPromptManager;
   /** Status-card poke after park/cancel so `📥 N waiting` updates immediately. */
@@ -3396,6 +3399,10 @@ export class Orchestrator {
 
   setWakeManager(m: WakeManager): void {
     this.wakeManager = m;
+  }
+
+  setLiveHelpManager(m: LiveHelpManager): void {
+    this.liveHelpManager = m;
   }
 
   setParkedManager(m: ParkedPromptManager): void {
@@ -8890,6 +8897,26 @@ export class Orchestrator {
 
     // Watch cancel (#60, D7): same surface as wake cancel — the /seam tree is at
     // Discord's option cap, so watch lifecycle folds into /seam workflows too.
+    const cancelLiveId = i.options.getString("cancel-live");
+    if (cancelLiveId) {
+      const record = this.recordFromInteraction(i);
+      if (!record) {
+        await i.reply({
+          content: "Use `/seam workflows` inside a thread to hang up a live-help call.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const result = this.cancelLiveHelp(record, cancelLiveId, { skipAuthorGate: true });
+      await i.reply({
+        content: result.ok
+          ? `🎙️ Hanging up live help \`${cancelLiveId}\`.`
+          : result.error,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
     const cancelIngestId = i.options.getString("cancel-ingest");
     if (cancelIngestId) {
       const record = this.recordFromInteraction(i);
@@ -9034,6 +9061,21 @@ export class Orchestrator {
         if (watches.length > 10) lines.push(`…and ${watches.length - 10} more`);
         embed.addFields({
           name: `🔔 Pending watches (${watches.length})`,
+          value: clampFieldValue(lines),
+        });
+        if (view.empty) embed.setDescription(null);
+      }
+
+      const liveCalls = this.liveHelpManager?.listForThread(record.platform, record.channelRef) ?? [];
+      const liveActive = liveCalls.filter((s) => s.status === "starting" || s.status === "live");
+      if (liveActive.length > 0) {
+        const lines = liveActive.slice(0, 10).map((s) => {
+          const ch = s.channelName ? `**${s.channelName}**` : s.voiceChannelId;
+          return `🎙️ \`${s.id}\` ${ch} · ${s.status}`;
+        });
+        if (liveActive.length > 10) lines.push(`…and ${liveActive.length - 10} more`);
+        embed.addFields({
+          name: `🎙️ Live help (${liveActive.length})`,
           value: clampFieldValue(lines),
         });
         if (view.empty) embed.setDescription(null);
@@ -11615,7 +11657,7 @@ export class Orchestrator {
       "`/seam cancel scope:all` — force-kill every active session (old kill)",
       "`/seam steer [thread] <prompt> [now]` — steer a node (thread defaults to here)",
       "`/seam queue <prompt>` — queue the next live turn (waits; does not abort)",
-      "`/seam workflows` — delegation ledger + pending wakes/watches",
+      "`/seam workflows` — delegation ledger + pending wakes/watches/live-help",
       "",
       "**`/seam upload`** (admin only)",
       "`/seam upload pull <path>` — post a host file here (zips if over 25 MB)",
@@ -12080,6 +12122,50 @@ export class Orchestrator {
     const updated = this.store.getChoiceCard(choiceId);
     if (updated) await this.refreshChoiceCard(updated);
     return { ok: true };
+  }
+
+  async createLiveHelp(
+    record: SessionRecord,
+    specInput: unknown
+  ): Promise<
+    | { ok: true; liveId: string; guildId: string; channelName: string }
+    | { ok: false; error: string }
+  > {
+    const authorId = this.currentAuthorId(record.channelRef);
+    if (
+      isChoiceAuthoringRefused(
+        authorId,
+        this.config.SEAM_PARTICIPANT_USER_IDS,
+        this.config.SEAM_CONFIG_ADMIN_USER_IDS
+      )
+    ) {
+      return { ok: false, error: "Restricted participants cannot mint live-help calls." };
+    }
+    if (!this.liveHelpManager) {
+      return { ok: false, error: "Live help is not wired on this deployment." };
+    }
+    return this.liveHelpManager.mint(record, specInput, authorId ?? record.id);
+  }
+
+  cancelLiveHelp(
+    record: SessionRecord,
+    liveId: string,
+    opts?: { skipAuthorGate?: boolean }
+  ): { ok: true } | { ok: false; error: string } {
+    const authorId = opts?.skipAuthorGate ? null : this.currentAuthorId(record.channelRef);
+    if (
+      isChoiceAuthoringRefused(
+        authorId,
+        this.config.SEAM_PARTICIPANT_USER_IDS,
+        this.config.SEAM_CONFIG_ADMIN_USER_IDS
+      )
+    ) {
+      return { ok: false, error: "Restricted participants cannot hang up live-help calls." };
+    }
+    if (!this.liveHelpManager) {
+      return { ok: false, error: "Live help is not wired on this deployment." };
+    }
+    return this.liveHelpManager.cancel(liveId, { authoringChannelRef: record.channelRef });
   }
 
   resolveIngestJob(sessionId: string): SessionRecord | undefined {

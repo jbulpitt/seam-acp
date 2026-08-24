@@ -1811,7 +1811,7 @@ describe("config_describe", () => {
     ttsPace: { value: "natural" as const, source: "default" as const },
     ttsStyle: { value: "neutral" as const, source: "default" as const },
     location: { value: "local", source: "default" as const },
-    statusCardStyle: { value: "full" as const, source: "default" as const },
+    statusCardStyle: { value: "simple" as const, source: "channel preset" as const },
   };
 
   async function makeDescribeServer(): Promise<SeamMcpServer> {
@@ -1883,6 +1883,7 @@ describe("config_describe", () => {
       expect(text).toContain("detached:");
       expect(text).toContain("true");
       expect(text).toMatch(/detached:.*true.*thread preset/s);
+      expect(text).toMatch(/card style:.*simple.*channel preset/s);
       // Entity listing folds in — now the FULL definition (#69): the id (needed
       // to target an edit), the promptText (the actual content), attachments,
       // and last-run status all render, not just name/cron/tz.

@@ -241,7 +241,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub
           .setName("card")
-          .setDescription("Get or set the status-card layout for this thread (full or simple)")
+          .setDescription("Get or set the status-card layout (full or simple)")
           .addStringOption((o) =>
             o
               .setName("style")
@@ -250,6 +250,17 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .addChoices(
                 { name: "full", value: "full" },
                 { name: "simple", value: "simple" }
+              )
+          )
+          .addStringOption((o) =>
+            o
+              .setName("scope")
+              .setDescription("session (this thread, default) | thread preset | channel (all threads)")
+              .setRequired(false)
+              .addChoices(
+                { name: "session (this thread override)", value: "session" },
+                { name: "thread preset", value: "thread" },
+                { name: "channel (all threads inherit)", value: "channel" }
               )
           )
       )

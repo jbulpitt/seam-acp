@@ -407,6 +407,85 @@ describe("statusCardStyle mutation (#96)", () => {
   });
 });
 
+describe("statusCardStyle channel/thread overlay", () => {
+  function writePresetsFile(doc: unknown): string {
+    const file = path.join(dir, "channel-presets.json");
+    fs.writeFileSync(file, JSON.stringify(doc, null, 2));
+    return file;
+  }
+  const CHAN = "111111111111111111";
+  const THREAD = "333333333333333333";
+
+  it("applyChannelOverlay writes statusCardStyle without the Tier-C flag", () => {
+    const file = writePresetsFile({ channels: { [CHAN]: { model: { value: "old" } } } });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: false,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const result = svc.applyChannelOverlay({
+      channelId: CHAN,
+      changes: { statusCardStyle: "simple" },
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(PresetsFileSchema.safeParse(raw).success).toBe(true);
+    expect(raw.channels[CHAN].statusCardStyle).toEqual({ value: "simple" });
+    expect(raw.channels[CHAN].model).toEqual({ value: "old" });
+    expect(live.channelPresets.get(CHAN)?.statusCardStyle?.value).toBe("simple");
+  });
+
+  it("applyThreadOverlay writes statusCardStyle over a channel value", () => {
+    const file = writePresetsFile({
+      channels: { [CHAN]: { statusCardStyle: { value: "simple" } } },
+      threads: {},
+    });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: false,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const result = svc.applyThreadOverlay({
+      threadId: THREAD,
+      parentRef: CHAN,
+      changes: { statusCardStyle: "full" },
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.channels[CHAN].statusCardStyle).toEqual({ value: "simple" });
+    expect(raw.threads[THREAD].statusCardStyle).toEqual({ value: "full" });
+    expect(live.threadPresets.get(THREAD)?.statusCardStyle?.value).toBe("full");
+  });
+
+  it("Tier-C channelPreset proposal can set statusCardStyle", () => {
+    const record = makeRecord({ parentRef: CHAN });
+    const file = writePresetsFile({ channels: { [CHAN]: {} } });
+    const built = makeService({ presetsFile: file, tierCEnabled: true }).buildProposal(record, {
+      channelPreset: { statusCardStyle: "simple" },
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.proposal.fields).toEqual([
+      { label: "statusCardStyle", before: "(unset)", after: "simple" },
+    ]);
+    built.proposal.apply({ id: "u", name: "U" });
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.channels[CHAN].statusCardStyle).toEqual({ value: "simple" });
+  });
+});
+
 // -------------------------------------------------------------------------
 // Tier C — channel-presets.json (flag-gated, D7 validated, lock untouchable)
 // -------------------------------------------------------------------------

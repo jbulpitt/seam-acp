@@ -117,6 +117,8 @@ export interface ChannelPresetChanges {
   cwd?: string | null;
   effort?: string | null;
   rider?: string | null;
+  /** Channel-wide status-card layout. Inherited live; session/thread overlay still wins. */
+  statusCardStyle?: StatusCardStyle | null;
 }
 
 /** Tier C — the calling thread's OWN thread preset (channel-presets.json
@@ -138,6 +140,8 @@ export interface ThreadPresetChanges {
   cwd?: string | null;
   effort?: string | null;
   rider?: string | null;
+  /** Thread-preset status-card overlay. Wins over the channel preset; session still wins. */
+  statusCardStyle?: StatusCardStyle | null;
   detached?: boolean;
   location?: string | null;
   tts?: boolean;
@@ -378,6 +382,24 @@ export class ConfigMutationService {
    * A thread preset overrides the channel per-field, which is the intended
    * per-thread overlay. Same discipline as `applyThreadLocation`.
    */
+  applyChannelOverlay(opts: {
+    channelId: string;
+    changes: ChannelPresetChanges;
+    actor: MutationActor;
+  }): { ok: true; message: string; auditId: string } | { ok: false; error: string } {
+    const built = this.buildChannelPresetProposalFor(opts.channelId, opts.changes, {
+      requireTierC: false,
+    });
+    if (!built.ok) {
+      if (built.error.includes("No effective change")) {
+        return { ok: true, message: built.error, auditId: "" };
+      }
+      return built;
+    }
+    const applied = built.proposal.apply(opts.actor);
+    return { ok: true, message: applied.message, auditId: applied.auditId };
+  }
+
   applyThreadOverlay(opts: {
     threadId: string;
     parentRef?: string;
@@ -1125,7 +1147,25 @@ export class ConfigMutationService {
     record: SessionRecord,
     changes: ChannelPresetChanges
   ): BuildProposalResult {
-    if (!this.deps.tierCEnabled) {
+    const channelId = record.parentRef;
+    if (!channelId) {
+      return {
+        ok: false,
+        error:
+          "This thread has no parent channel to scope a channel preset to " +
+          "(channel presets are keyed on the parent channel id).",
+      };
+    }
+    return this.buildChannelPresetProposalFor(channelId, changes, { requireTierC: true });
+  }
+
+  private buildChannelPresetProposalFor(
+    channelId: string,
+    changes: ChannelPresetChanges,
+    opts: { requireTierC?: boolean } = {}
+  ): BuildProposalResult {
+    const requireTierC = opts.requireTierC ?? true;
+    if (requireTierC && !this.deps.tierCEnabled) {
       return {
         ok: false,
         error:
@@ -1140,17 +1180,8 @@ export class ConfigMutationService {
         error: "No CHANNEL_PRESETS_FILE is configured, so there is no channel-presets file to edit.",
       };
     }
-    // D3 + P3: the target is ALWAYS the caller's own parent channel. There is no
-    // channel-id parameter, so a cross-channel edit is structurally impossible.
-    const channelId = record.parentRef;
-    if (!channelId) {
-      return {
-        ok: false,
-        error:
-          "This thread has no parent channel to scope a channel preset to " +
-          "(channel presets are keyed on the parent channel id).",
-      };
-    }
+    // D3 + P3: the target is ALWAYS a caller-supplied parent channel (slash) or
+    // the MCP caller's own parent. There is no free-form cross-channel id on the tool.
     // D2/P3 belt-and-suspenders: the lock is NEVER editable through any tool.
     if ("locked" in (changes as unknown as Record<string, unknown>)) {
       return {
@@ -1178,7 +1209,14 @@ export class ConfigMutationService {
     const channels = { ...(doc.channels ?? {}) };
     const current = { ...(channels[channelId] ?? {}) };
 
-    const keys: Array<keyof ChannelPresetChanges> = ["agent", "model", "cwd", "effort", "rider"];
+    const keys: Array<keyof ChannelPresetChanges> = [
+      "agent",
+      "model",
+      "cwd",
+      "effort",
+      "rider",
+      "statusCardStyle",
+    ];
     const fields: ProposedField[] = [];
     const next: Record<string, unknown> = { ...current };
     for (const key of keys) {
@@ -1359,7 +1397,7 @@ export class ConfigMutationService {
     // The parent channel's entry, used ONLY to detect Trap-1 shadowing below.
     const channelEntry = parentRef ? doc.channels?.[parentRef] : undefined;
 
-    const keys = ["agent", "model", "cwd", "effort", "rider"] as const;
+    const keys = ["agent", "model", "cwd", "effort", "rider", "statusCardStyle"] as const;
     const fields: ProposedField[] = [];
     const warnings: string[] = [];
     const next: Record<string, unknown> = { ...current };

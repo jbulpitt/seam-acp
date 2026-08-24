@@ -244,7 +244,7 @@ const SCHEDULE_PRESETS: Array<{ label: string; value: string }> = [
 ];
 import type { SessionStore } from "../../core/session-store.js";
 import { makeSessionId } from "../../core/session-store.js";
-import { SessionRouter } from "../../core/session-router.js";
+import { SessionRouter, statusCardStyleForRender } from "../../core/session-router.js";
 import { ConfigMutationService, type ConfigMutationInput } from "../../core/config-mutation.js";
 import { reloadChannelPresets } from "../../core/config-reload.js";
 import type { ConfigProposeOutcome } from "../../core/mcp/seam-mcp-server.js";
@@ -1009,7 +1009,7 @@ export class Orchestrator {
       model: cfg.model ?? this.config.DEFAULT_MODEL,
       repoDisplay,
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
-      style: cfg.statusCardStyle === "simple" ? "simple" : "full",
+      style: statusCardStyleForRender(this.router.describeConfig(record)),
       ...(brandAsset ? { brandFilename: brandAsset.filename } : {}),
       authorName: turnProfile?.displayName ?? brand,
     });
@@ -5950,10 +5950,9 @@ export class Orchestrator {
       typeof this.store.getByChannel === "function"
         ? this.store.getByChannel(target.platform, target.id)
         : null;
-    const destStyle: StatusCardStyle =
-      destRecord && this.store.readConfig(destRecord).statusCardStyle === "simple"
-        ? "simple"
-        : "full";
+    const destStyle: StatusCardStyle = destRecord
+      ? statusCardStyleForRender(this.router.describeConfig(destRecord))
+      : "full";
     const dispatchAgentId = resolved.profile?.id ?? destRecord?.agentId ?? "";
     const dispatchBrand = resolveAgentBrand(dispatchAgentId, resolved.profile?.brand);
     const dispatchBrandAsset = loadBrandAsset(dispatchBrand);
@@ -8373,7 +8372,10 @@ export class Orchestrator {
       cwd: chan?.cwd?.value ?? record.repoPath ?? this.config.REPOS_ROOT,
       permission,
       detached: false,
-      statusCardStyle: "full",
+      statusCardStyle:
+        chan?.statusCardStyle?.value === "simple" || chan?.statusCardStyle?.value === "full"
+          ? chan.statusCardStyle.value
+          : "full",
     };
   }
 
@@ -8633,6 +8635,25 @@ export class Orchestrator {
         return;
       }
     }
+    if (plan.channelPreset && Object.keys(plan.channelPreset).length > 0) {
+      if (!draft.parentRef) {
+        await evt
+          .followUpEphemeral(
+            "Could not save: this thread has no parent channel to pin a channel-wide card style on."
+          )
+          .catch(() => {});
+        return;
+      }
+      const written = this.configMutation.applyChannelOverlay({
+        channelId: draft.parentRef,
+        changes: plan.channelPreset,
+        actor,
+      });
+      if (!written.ok) {
+        await evt.followUpEphemeral(`Could not save: ${written.error}`).catch(() => {});
+        return;
+      }
+    }
     if (plan.permission !== undefined || plan.statusCardStyle !== undefined) {
       const record = this.router.ensureSessionRecord({
         platform: "discord",
@@ -8821,8 +8842,26 @@ export class Orchestrator {
         },
         choices: [
           inherit,
-          { value: "full", label: "full", description: "Repo, model, action, effort, tool tags" },
-          { value: "simple", label: "simple", description: "State + brand icon + thought + elapsed" },
+          {
+            value: "full",
+            label: "full (this thread)",
+            description: "Repo, model, action, effort — overrides channel",
+          },
+          {
+            value: "simple",
+            label: "simple (this thread)",
+            description: "State + brand icon + thought — overrides channel",
+          },
+          {
+            value: "channel:full",
+            label: "full (channel)",
+            description: "Every thread inherits unless it overrides",
+          },
+          {
+            value: "channel:simple",
+            label: "simple (channel)",
+            description: "Every thread inherits unless it overrides",
+          },
         ],
         authorizedUserIds: owner,
       });
@@ -11226,14 +11265,15 @@ export class Orchestrator {
       await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const cfg = this.store.readConfig(record);
-    const current: StatusCardStyle = cfg.statusCardStyle === "simple" ? "simple" : "full";
+    const resolved = this.router.describeConfig(record).statusCardStyle;
     const style = i.options.getString("style");
+    const scope = (i.options.getString("scope") ?? "session") as "session" | "thread" | "channel";
     if (!style) {
       await i.reply({
         content:
-          `Status card: \`${current}\`. Set with \`/seam config card style:full|simple\`.` +
-          (current === "simple"
+          `Status card: \`${resolved.value}\` (from ${resolved.source}). ` +
+          `Set with \`/seam config card style:full|simple [scope:session|thread|channel]\`.` +
+          (resolved.value === "simple"
             ? " Simple cards drop repo/model/action/effort and show the agent brand icon."
             : ""),
         flags: MessageFlags.Ephemeral,
@@ -11247,14 +11287,56 @@ export class Orchestrator {
       });
       return;
     }
-    if (style === "full") delete cfg.statusCardStyle;
-    else cfg.statusCardStyle = "simple";
+    const actor = { id: i.user.id, name: i.user.username };
+    if (scope === "channel") {
+      if (!record.parentRef) {
+        await i.reply({
+          content: "This thread has no parent channel to pin a channel-wide card style on.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const written = this.configMutation.applyChannelOverlay({
+        channelId: record.parentRef,
+        changes: { statusCardStyle: style },
+        actor,
+      });
+      if (!written.ok) {
+        await i.reply({ content: written.error, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await i.reply({
+        content:
+          `Channel status card set to \`${style}\` — every thread in this channel inherits it unless it has its own overlay. Applies on the next turn.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (scope === "thread") {
+      const written = this.configMutation.applyThreadOverlay({
+        threadId: record.channelRef,
+        ...(record.parentRef ? { parentRef: record.parentRef } : {}),
+        changes: { statusCardStyle: style },
+        actor,
+      });
+      if (!written.ok) {
+        await i.reply({ content: written.error, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await i.reply({
+        content: `Thread-preset status card set to \`${style}\`. Applies on the next turn.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const cfg = this.store.readConfig(record);
+    cfg.statusCardStyle = style;
     this.persistConfig(record, cfg);
     await i.reply({
       content:
         style === "simple"
-          ? "Status card set to `simple` — compact layout with the agent brand icon. Applies on the next turn."
-          : "Status card set to `full` (default). Applies on the next turn.",
+          ? "Status card set to `simple` for this thread (overrides channel/thread presets). Applies on the next turn."
+          : "Status card set to `full` for this thread (overrides channel/thread presets). Applies on the next turn.",
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -11672,7 +11754,7 @@ export class Orchestrator {
       "`/seam config repo [path]` — set working repo (picker if omitted; type a path to skip)",
       "`/seam config tools <allow|exclude> [list]` — tool filters",
       "`/seam config approve <always|ask|deny>` — permission policy",
-      "`/seam config card [full|simple]` — status-card layout (simple = compact + brand icon)",
+      "`/seam config card [full|simple] [scope:session|thread|channel]` — status-card layout (channel = inherit live)",
       "`/seam config reset` — end this thread's ACP session; next message starts fresh",
       "`/seam config init` — bind this thread + start setup (repo picker, or full wizard)",
       "`/seam config detach <detached|attached>` — keep this thread session-less (no bot replies; does not delete history)",

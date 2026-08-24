@@ -137,10 +137,16 @@ export interface ConfigDescription {
    */
   effortIgnoredNote?: string;
   /**
-   * Status-card layout (#96). Session JSON only (named presets copy in on apply).
-   * Default `"full"`.
+   * Status-card layout (#96 / channel inherit). Session overlay wins, then
+   * thread preset, then channel preset, then `"full"`. Read at render time so
+   * a channel change applies to existing threads with no per-thread re-apply.
    */
   statusCardStyle: ResolvedSetting<StatusCardStyle>;
+}
+
+/** Layout the status card should render. Always `"full"` or `"simple"`. */
+export function statusCardStyleForRender(d: ConfigDescription): StatusCardStyle {
+  return d.statusCardStyle?.value === "simple" ? "simple" : "full";
 }
 
 /**
@@ -334,7 +340,11 @@ export class SessionRouter {
     const statusCardStyle: ResolvedSetting<StatusCardStyle> =
       cfg.statusCardStyle === "simple" || cfg.statusCardStyle === "full"
         ? { value: cfg.statusCardStyle, source: "session config" }
-        : { value: "full", source: "default" };
+        : thread?.statusCardStyle?.value === "simple" || thread?.statusCardStyle?.value === "full"
+          ? { value: thread.statusCardStyle.value, source: "thread preset" }
+          : chan?.statusCardStyle?.value === "simple" || chan?.statusCardStyle?.value === "full"
+            ? { value: chan.statusCardStyle.value, source: "channel preset" }
+            : { value: "full", source: "default" };
 
     return {
       sessionId: record.id,

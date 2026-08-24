@@ -10,6 +10,7 @@ import {
   currentThreadRiderText,
   decodeRiderUpload,
   dirtyPermission,
+  dirtyChannelStatusCardStyle,
   dirtyStatusCardStyle,
   dirtyThreadPresetChanges,
   isDirty,
@@ -335,6 +336,45 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
     );
     expect(inherit.overlay.statusCardStyle).toBeNull();
     expect(dirtyStatusCardStyle(inherit)).toBeNull();
+  });
+
+  it("Card picker can target the channel preset without writing session config", () => {
+    const next = applyPickerValue(draft(), "card", "channel:simple", caps);
+    expect(next.overlay.channelStatusCardStyle).toBe("simple");
+    expect(next.overlay.statusCardStyle).toBeUndefined();
+    expect(dirtyChannelStatusCardStyle(next)).toBe("simple");
+    expect(dirtyStatusCardStyle(next)).toBeUndefined();
+    const plan = buildSavePlan(next);
+    expect(plan.channelPreset).toEqual({ statusCardStyle: "simple" });
+    expect(plan.statusCardStyle).toBeUndefined();
+    expect(plan.threadPreset).toEqual({});
+    expect(isDirty(next)).toBe(true);
+    expect(renderHub(next).fields.find((f) => f.name === "Card")!.value).toMatch(/channel will be/);
+  });
+
+  it("channel Card pick matching inherit is not dirty", () => {
+    const next = applyPickerValue(
+      draft({
+        snapshot: snapshot({
+          withoutThread: { ...WITHOUT, statusCardStyle: "simple" },
+          statusCardStyle: setting("simple", "channel preset"),
+        }),
+      }),
+      "card",
+      "channel:simple",
+      caps
+    );
+    expect(dirtyChannelStatusCardStyle(next)).toBeUndefined();
+    expect(isDirty(next)).toBe(false);
+  });
+
+  it("session inherit does not clear a drafted channel card style", () => {
+    const channel = applyPickerValue(draft(), "card", "channel:simple", caps);
+    const inherit = applyPickerValue(channel, "card", INHERIT_VALUE, caps);
+    expect(inherit.overlay.statusCardStyle).toBeNull();
+    expect(inherit.overlay.channelStatusCardStyle).toBe("simple");
+    const plan = buildSavePlan(inherit);
+    expect(plan.channelPreset).toEqual({ statusCardStyle: "simple" });
   });
 
   it("Cancel is a no-op on the overlay (store delete; no mutation payload)", () => {

@@ -4,7 +4,7 @@
  * orchestrator — this module is side-effect free besides the draft map.
  */
 import type { PermissionPolicyMode, StatusCardStyle, StructuredPanel } from "../../core/types.js";
-import type { ThreadPresetChanges } from "../../core/config-mutation.js";
+import type { ChannelPresetChanges, ThreadPresetChanges } from "../../core/config-mutation.js";
 import type {
   ConfigDescription,
   ConfigLayer,
@@ -84,6 +84,8 @@ export interface DraftOverlay {
   detached?: boolean;
   permission?: PermissionPolicyMode | null;
   statusCardStyle?: StatusCardStyle | null;
+  /** Channel-preset card write (independent of this thread's session overlay). */
+  channelStatusCardStyle?: StatusCardStyle | null;
 }
 
 export interface ThreadConfigDraft {
@@ -183,11 +185,27 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
       o.permission === undefined ? s.permission.value : o.permission ?? w.permission,
     detached: o.detached === undefined ? s.detached.value : o.detached,
     riderThread: o.rider === undefined ? s.rider.thread : o.rider ?? undefined,
-    statusCardStyle:
-      o.statusCardStyle === undefined
-        ? s.statusCardStyle.value
-        : o.statusCardStyle ?? w.statusCardStyle,
+    statusCardStyle: effectiveCardStyle(draft),
   };
+}
+
+/** Session overlay wins; then thread/session snapshot; then channel overlay; then inherit. */
+function effectiveCardStyle(draft: ThreadConfigDraft): StatusCardStyle {
+  const s = draft.snapshot;
+  const o = draft.overlay;
+  const w = s.withoutThread;
+  if (o.statusCardStyle != null) return o.statusCardStyle;
+  if (o.statusCardStyle === null) {
+    if (s.statusCardStyle.source === "thread preset") return s.statusCardStyle.value;
+    return o.channelStatusCardStyle ?? w.statusCardStyle;
+  }
+  if (
+    s.statusCardStyle.source === "session config" ||
+    s.statusCardStyle.source === "thread preset"
+  ) {
+    return s.statusCardStyle.value;
+  }
+  return o.channelStatusCardStyle ?? s.statusCardStyle.value;
 }
 
 export function willResetSession(draft: ThreadConfigDraft): boolean {
@@ -306,7 +324,7 @@ export function dirtyPermission(
   return next;
 }
 
-/** `undefined` = style not part of this save. `null` = inherit (clear session style → full). */
+/** `undefined` = style not part of this save. `null` = inherit (clear session style). */
 export function dirtyStatusCardStyle(
   draft: ThreadConfigDraft
 ): StatusCardStyle | null | undefined {
@@ -320,11 +338,23 @@ export function dirtyStatusCardStyle(
   return next;
 }
 
+/** Channel-preset card write. `undefined` = not in this save. */
+export function dirtyChannelStatusCardStyle(
+  draft: ThreadConfigDraft
+): StatusCardStyle | null | undefined {
+  if (draft.overlay.channelStatusCardStyle === undefined) return undefined;
+  const current = draft.snapshot.withoutThread.statusCardStyle;
+  const next = draft.overlay.channelStatusCardStyle;
+  if (next === current) return undefined;
+  return next;
+}
+
 export function isDirty(draft: ThreadConfigDraft): boolean {
   return (
     Object.keys(dirtyThreadPresetChanges(draft)).length > 0 ||
     dirtyPermission(draft) !== undefined ||
-    dirtyStatusCardStyle(draft) !== undefined
+    dirtyStatusCardStyle(draft) !== undefined ||
+    dirtyChannelStatusCardStyle(draft) !== undefined
   );
 }
 
@@ -528,7 +558,17 @@ export function renderHub(
           fieldLine(
             code(s.statusCardStyle.value),
             sourceLabel(s.statusCardStyle.source),
-            draftNoteFor(o.statusCardStyle, w.statusCardStyle)
+            [
+              draftNoteFor(
+                o.statusCardStyle,
+                o.channelStatusCardStyle ?? w.statusCardStyle
+              ),
+              o.channelStatusCardStyle
+                ? `channel will be ${code(o.channelStatusCardStyle)}`
+                : undefined,
+            ]
+              .filter(Boolean)
+              .join("\n") || undefined
           ),
           1024
         ),
@@ -586,19 +626,34 @@ export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
       },
       statusCardStyle: {
         value: next.statusCardStyle,
-        source:
-          o.statusCardStyle === undefined
-            ? s.statusCardStyle.source
-            : o.statusCardStyle === null
-              ? "default"
-              : "session config",
+        source: cardSourceAfterSave(o, s),
       },
+      withoutThread: o.channelStatusCardStyle
+        ? { ...s.withoutThread, statusCardStyle: o.channelStatusCardStyle }
+        : s.withoutThread,
       rider: {
         ...(s.rider.channel ? { channel: s.rider.channel } : {}),
         ...(next.riderThread ? { thread: next.riderThread } : {}),
       },
     },
   };
+}
+
+function cardSourceAfterSave(o: DraftOverlay, s: ThreadConfigSnapshot): ConfigLayer {
+  if (o.statusCardStyle != null) return "session config";
+  if (o.statusCardStyle === null) {
+    if (s.statusCardStyle.source === "thread preset") return "thread preset";
+    if (o.channelStatusCardStyle) return "channel preset";
+    return s.statusCardStyle.source === "session config" ? "default" : s.statusCardStyle.source;
+  }
+  if (
+    s.statusCardStyle.source === "session config" ||
+    s.statusCardStyle.source === "thread preset"
+  ) {
+    return s.statusCardStyle.source;
+  }
+  if (o.channelStatusCardStyle) return "channel preset";
+  return s.statusCardStyle.source;
 }
 
 export function renderSavedHub(draft: ThreadConfigDraft): StructuredPanel {
@@ -709,7 +764,13 @@ export function applyPickerValue(
       else overlay.detached = value === "detached";
       break;
     case "card":
-      overlay.statusCardStyle = inherit ? null : (value as StatusCardStyle);
+      if (inherit) {
+        overlay.statusCardStyle = null;
+      } else if (value === "channel:full" || value === "channel:simple") {
+        overlay.channelStatusCardStyle = value === "channel:simple" ? "simple" : "full";
+      } else {
+        overlay.statusCardStyle = value as StatusCardStyle;
+      }
       break;
     default:
       return draft;
@@ -730,6 +791,7 @@ export function applyPickerValue(
 
 export interface ConfigEditorSavePlan {
   threadPreset: ThreadPresetChanges;
+  channelPreset?: ChannelPresetChanges;
   permission?: PermissionPolicyMode | null;
   statusCardStyle?: StatusCardStyle | null;
 }
@@ -742,6 +804,10 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
   if (perm !== undefined) plan.permission = perm;
   const card = dirtyStatusCardStyle(draft);
   if (card !== undefined) plan.statusCardStyle = card;
+  const channelCard = dirtyChannelStatusCardStyle(draft);
+  if (channelCard !== undefined) {
+    plan.channelPreset = { statusCardStyle: channelCard };
+  }
   return plan;
 }
 

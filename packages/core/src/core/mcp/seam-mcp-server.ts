@@ -809,12 +809,12 @@ const TOOLS = [
       "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.\n" +
       "- session: your thread's own runtime config (agent, model, effort, cwd, permission, statusCardStyle).\n" +
       "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target).\n" +
-      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/detached/location/tts). " +
+      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle/detached/location/tts). " +
       "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider. " +
       "`detached:true` stops treating this thread as a session (no bot replies; does not delete history). " +
       "`tts:true` speaks each completed turn as an ogg attachment (default off).\n" +
-      "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider). " +
-      "Applies to EVERY thread under the channel. May be disabled by the deployment; `locked` can NEVER be changed.\n" +
+      "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle). " +
+      "Applies to EVERY thread under the channel (statusCardStyle is inherited live at render time). May be disabled by the deployment; `locked` can NEVER be changed.\n" +
       "- schedule: create/update/enable/disable/delete a scheduled prompt for THIS thread. Translate the " +
       "user's natural-language cadence into a standard cron expression (e.g. \"every weekday at 7am\" → " +
       "\"0 7 * * 1-5\"); the card echoes the parsed cadence AND the resolved next run time so a timezone " +
@@ -922,6 +922,12 @@ const TOOLS = [
             cwd: { type: "string" },
             effort: { type: "string" },
             rider: { type: "string", description: "Extra per-turn harness-preamble rule for this thread." },
+            statusCardStyle: {
+              type: "string",
+              enum: ["full", "simple"],
+              description:
+                "Thread-preset status-card layout. Overrides the channel preset; session `/seam config card` still wins. Empty string clears it.",
+            },
             detached: {
               type: "boolean",
               description:
@@ -971,6 +977,12 @@ const TOOLS = [
             cwd: { type: "string" },
             effort: { type: "string" },
             rider: { type: "string", description: "Extra per-turn harness-preamble rule." },
+            statusCardStyle: {
+              type: "string",
+              enum: ["full", "simple"],
+              description:
+                "Channel-wide status-card layout. Every thread inherits this live at render time unless it has its own overlay. Empty string clears it.",
+            },
           },
         },
         schedule: {

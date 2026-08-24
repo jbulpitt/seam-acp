@@ -13,6 +13,7 @@ type Opt = {
   required?: boolean;
   autocomplete?: boolean;
   options?: Opt[];
+  choices?: { name: string; value: string }[];
 };
 
 function built(): { options?: Opt[] } {
@@ -98,6 +99,12 @@ describe("/seam slash command", () => {
     expect(ttsVoice?.required ?? false).toBe(false);
     expect(ttsVoice?.autocomplete).toBe(true);
     expect((tts?.options ?? []).map((o) => o.name)).toEqual(["state", "voice", "pace", "style"]);
+    const card = (config?.options ?? []).find((o) => o.name === "card");
+    expect((card?.options ?? []).map((o) => o.name)).toEqual(["style", "scope"]);
+    const scope = card?.options?.find((o) => o.name === "scope");
+    expect(scope?.type).toBe(STRING);
+    expect(scope?.required ?? false).toBe(false);
+    expect(scope?.choices?.map((c) => c.value)).toEqual(["session", "thread", "channel"]);
   });
 
   it("info group has 6 leaves (sessions/repos moved in; config-audit moved out)", () => {

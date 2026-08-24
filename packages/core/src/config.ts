@@ -713,6 +713,9 @@ const PresetValuesSchema = z.object({
   // Extra harness-preamble bullet injected into every turn (see
   // withHarnessPreamble). Channel and thread riders both apply, stacked.
   rider: PresetFieldSchema(z.string().min(1)).optional(),
+  // Per-turn status-card layout. Channel value is inherited live at render
+  // time; a thread preset or session `/seam config card` still wins.
+  statusCardStyle: PresetFieldSchema(z.enum(["full", "simple"])).optional(),
 });
 
 const ChannelPresetSchema = PresetValuesSchema.extend({
@@ -809,6 +812,7 @@ export type PresetValues = {
   cwd?: ChannelPresetField<string>;
   effort?: ChannelPresetField<string>;
   rider?: ChannelPresetField<string>;
+  statusCardStyle?: ChannelPresetField<"full" | "simple">;
 };
 export type ChannelPreset = PresetValues & { locked: boolean };
 export type ThreadPreset = PresetValues & {

@@ -24,7 +24,7 @@ Seam-acp live help is a KEY SKILL for this course: you pack a lesson in THIS tex
 Fetch and keep this guide (re-read it now):
 https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/live-help.md
 
-Link that URL in the library. Overlay only THIS course (which voice channel Jesse approved, whether to set notifyThread, when to ask consent). Do not fork the protocol.
+Link that URL in the library. Overlay only THIS course (put the approved voice-channel snowflake in THIS THREAD's rider so live help finds it before the default, plus notifyThread / consent). Do not fork the protocol.
 
 Persist these facts:
 
@@ -33,7 +33,7 @@ DEFAULT USE
 - Mint with MCP create_live_help only. No seam-live fence. Required: voiceChannelId (snowflake), system (short tutor job). Optional: historySummary (a few sentences, not files), notifyThread (opt-in transcript), preset.
 - Returns { liveId }. You do not block. Hang up with cancel_live_help({ liveId }).
 - Students (Alaina/Allie) may BE in the call. They are participants — they must not mint, cancel, or pick the channel. If create_live_help is refused, stop.
-- Voice channel is an explicit snowflake Jesse approved. Family-guild General is 1487095870188027987. Never pass a school-* voice channel or guess from this text channel's name. Ask Jesse if unsure. Consent is Jesse's policy — default is do not start a voice session unprompted; use a frozen click-card to ask him.
+- Voice channel: look in THIS THREAD's rider (thread overlay, else channel rider) for a designated live-help / voice-channel snowflake and use that. If the rider does not name one, fall back to family-guild General 1487095870188027987. Never pass a school-* voice channel or guess from this text channel's name. Ask Jesse if unsure. Consent is Jesse's policy — default is do not start a voice session unprompted; use a frozen click-card to ask him. Put the course VC in the rider so new sessions do not silently use General.
 - Do not promise Discord screen share, webcam, or Go Live. Bots cannot receive those. Do not use /seam debug voice-*.
 - notifyThread omitted = no transcript posts. Set it to this thread or a staff thread if Jesse should read later.
 
@@ -53,6 +53,6 @@ Voice notes and /seam config tts stay the message path. Live help is Gemini join
 ```
 Re-fetch and keep:
 https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/live-help.md
-create_live_help / cancel_live_help should now be in your MCP list. Overlay still THIS course's approved voiceChannelId. If the tool is still missing, say so — do not work around it.
+create_live_help / cancel_live_help should now be in your MCP list. Overlay still THIS course's approved voiceChannelId **in the thread rider** (checked before the General default). If the tool is still missing, say so — do not work around it.
 Say which file(s) you changed.
 ```

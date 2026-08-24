@@ -27,7 +27,8 @@ hand-editing runtime state.
   people should each click (not combinable with `select`). Participants click;
   they do not author.
 - **Gemini in a voice channel (live help):** MCP `create_live_help` (no fence)
-  after packing `system` + optional `historySummary`. Students may *be in* the
+  after packing `system` + optional `historySummary`. `voiceChannelId`: this
+  thread’s rider first, else family-guild General. Students may *be in* the
   VC; they must not mint. Never a `school-*` voice channel. How-to:
   `docs/agent-guides/live-help.md`. School overlays:
   `docs/agent-guides/live-help-onboarding.md`. Not TTS, not STT, not Go Live.
@@ -148,7 +149,9 @@ fire). Participants click; they do not author.
 
 Gemini joins a Discord **voice channel** (not TTS, not STT). Coaching agents
 mint with MCP `create_live_help` (no fence); `cancel_live_help` hangs up.
-Students may be *in* the call; they must not mint. Never a `school-*` VC.
+`voiceChannelId` comes from **this thread’s rider** if it names a VC, else
+family-guild General. Students may be *in* the call; they must not mint.
+Never a `school-*` VC.
 Canonical: `docs/agent-guides/live-help.md`. School overlay paste:
 `docs/agent-guides/live-help-onboarding.md`. Tools ship with #98 — if they
 are missing, wait; do not use `/seam debug voice-*` from a course thread.

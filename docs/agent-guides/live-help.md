@@ -29,8 +29,13 @@ Your text ACP session **stays in this thread** (parallel session — do not try
 to pipe PCM through `rt.prompt`).
 
 1. Confirm Jesse wants a voice session (consent is a **human policy**).
-2. Tell the student (or Jesse) which VC to join. v1: family-guild **General**
-   `1487095870188027987` unless Jesse names another **non-school** VC.
+2. Resolve `voiceChannelId` in this order — then tell the student (or Jesse)
+   which VC to join:
+   1. **This thread’s rider** (thread overlay, else the channel rider). Look
+      for a designated live-help / voice-channel **snowflake** for the current
+      thread. That wins.
+   2. Else the fallback: family-guild **General** `1487095870188027987`.
+   3. Never invent a channel from a text-channel name. Never a `school-*` VC.
 3. Mint with MCP `create_live_help` (no fence):
 
 ```json
@@ -88,11 +93,13 @@ worksheet photo as Live video frames is **not v1**.
 
 Pass an explicit snowflake. Do not guess from a text channel name.
 
-- **Approved spike/prod test VC:** family-guild General
+- **This thread first:** if the rider names a live-help / voice-channel
+  snowflake for **this thread**, use that. Thread rider beats channel rider.
+- **Fallback** if the rider is silent: family-guild General
   `1487095870188027987`.
 - **Refuse:** anything named like `school-*`, a school-named category, or an
   obfuscated / hidden channel. Homeschool-guild “General” is **not** automatic
-  — ask Jesse for a snowflake.
+  unless that snowflake is in **this thread’s rider**.
 - One Live call per VC. If the bot is already in that channel, cancel first
   or pick another VC.
 - Everyone undeafened in that VC is mixed in (v1 does not isolate one user).

@@ -295,6 +295,89 @@ describe("POST /ingest headless endpoint (#95)", () => {
     server.close();
   });
 
+  it("GET /ingest/jobs/{id} returns 422 JSON when the turn ends with no submit_result", async () => {
+    const token = mintBridgeToken();
+    store.insertIngestEndpoint(endpoint({ tokenHash: hashBridgeToken(token) }));
+    const specs: DispatchSpec[] = [];
+    const results = new ChoiceResultHub({ store, logger: silent });
+    const ingest = new ChoiceIngest({
+      store,
+      results,
+      logger: silent,
+      enqueue: async (s) => {
+        specs.push(s);
+      },
+      destLive: async () => "ok",
+      authoringSession: () => record(),
+      publicBase: () => "https://example.test",
+      waitMs: 60_000,
+    });
+    const server = createServer((req, res) => void ingest.handle(req, res));
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+    const post = await fetch(`http://127.0.0.1:${port}/ingest?wait=0`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text: "essay", studentId: "stu-miss" }),
+    });
+    expect(post.status).toBe(202);
+    const { jobId } = (await post.json()) as { jobId: string };
+    expect(jobId).toBeTruthy();
+    results.turnEnded(jobId);
+    const poll = await fetch(`http://127.0.0.1:${port}/ingest/jobs/${jobId}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(poll.status).toBe(422);
+    expect(await poll.json()).toEqual({
+      error: "turn ended with no submit_result / seam-result",
+      jobId,
+      status: "missing",
+    });
+    server.close();
+  });
+
+  it("POST wait-ended without submit_result is 422, not 504", async () => {
+    const token = mintBridgeToken();
+    store.insertIngestEndpoint(endpoint({ tokenHash: hashBridgeToken(token) }));
+    const specs: DispatchSpec[] = [];
+    const results = new ChoiceResultHub({ store, logger: silent });
+    const ingest = new ChoiceIngest({
+      store,
+      results,
+      logger: silent,
+      enqueue: async (s) => {
+        specs.push(s);
+      },
+      destLive: async () => "ok",
+      authoringSession: () => record(),
+      publicBase: () => "https://example.test",
+      waitMs: 2000,
+    });
+    const server = createServer((req, res) => void ingest.handle(req, res));
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    const post = fetch(`http://127.0.0.1:${port}/ingest`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ text: "essay" }),
+    });
+    const until = Date.now() + 2000;
+    while (specs.length === 0 && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(specs[0]).toBeTruthy();
+    results.turnEnded(specs[0]!.id);
+    const res = await post;
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({
+      error: "turn ended with no submit_result / seam-result",
+      jobId: specs[0]!.id,
+      status: "missing",
+    });
+    server.close();
+  });
+
   it("409s a revoked endpoint", async () => {
     const token = mintBridgeToken();
     store.insertIngestEndpoint(

@@ -310,7 +310,10 @@ import {
   parseIngestEndpointSpec,
   type IngestEndpoint,
 } from "../../core/choice/endpoint.js";
-import { refuseIsolatedClaudeModel } from "../../core/choice/ingest-model.js";
+import {
+  ingestMintStoredModel,
+  refuseIsolatedClaudeModel,
+} from "../../core/choice/ingest-model.js";
 import { mintBridgeToken, hashBridgeToken } from "../../core/bridge-pairing.js";
 import { renderMathPng } from "../../core/math-render.js";
 import { isInlineableForAgent } from "../../agents/attachments.js";
@@ -12538,7 +12541,7 @@ export class Orchestrator {
     const cfg = this.store.readConfig(record);
     let agentId: string | null = spec.agent ?? record.agentId ?? this.config.DEFAULT_AGENT;
     let cwd: string | null = spec.cwd ?? record.repoPath ?? null;
-    let model: string | null = spec.model ?? cfg.model ?? null;
+    let model: string | null = ingestMintStoredModel(spec.model);
     let effort: string | null = spec.effort ?? cfg.reasoningEffort ?? null;
     if (spec.preset) {
       const preset = this.store.getPresetByNameScoped(spec.preset, record.parentRef);

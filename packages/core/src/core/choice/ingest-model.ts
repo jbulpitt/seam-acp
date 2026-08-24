@@ -36,6 +36,16 @@ export function isolatedClaudeModelRefusal(model: string): string {
 }
 
 /**
+ * Isolated ingest stores only an explicit mint pin. Do not copy the live
+ * thread's session model — that is how an opus-5 thread refused mint when
+ * `model` was omitted. Empty/whitespace → null (ACP default at fire).
+ */
+export function ingestMintStoredModel(pinned: string | null | undefined): string | null {
+  const m = typeof pinned === "string" ? pinned.trim() : "";
+  return m.length > 0 ? m : null;
+}
+
+/**
  * When the resolved agent is Claude and a model is pinned, return an error
  * string if that model is not isolated-safe. Non-Claude agents and missing
  * model pins are not gated. Preset-backed mints skip this (fire-time).

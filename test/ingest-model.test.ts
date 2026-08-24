@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   ISOLATED_SAFE_CLAUDE_MODELS,
+  ingestMintStoredModel,
   isClaudeAgentId,
   isolatedClaudeModelRefusal,
   refuseIsolatedClaudeModel,
@@ -69,6 +70,23 @@ describe("isolatedClaudeModelRefusal", () => {
     expect(text).toMatch(/ACP advertises default\/sonnet\/haiku/);
     expect(text).toMatch(/Use "default" for latest Opus/);
     expect(text).toMatch(/this account cannot set "claude-opus-5" on isolated ingest/);
+  });
+});
+
+describe("ingestMintStoredModel", () => {
+  it("stores an explicit pin and does not inherit a session model", () => {
+    expect(ingestMintStoredModel("default")).toBe("default");
+    expect(ingestMintStoredModel("claude-opus-5")).toBe("claude-opus-5");
+    expect(ingestMintStoredModel(undefined)).toBeNull();
+    expect(ingestMintStoredModel(null)).toBeNull();
+    expect(ingestMintStoredModel("")).toBeNull();
+    expect(ingestMintStoredModel("  ")).toBeNull();
+  });
+
+  it("an omitted pin is not refused even when the live thread is opus-5", () => {
+    const stored = ingestMintStoredModel(undefined);
+    expect(refuseIsolatedClaudeModel("claude", stored)).toBeNull();
+    expect(refuseIsolatedClaudeModel("claude", ingestMintStoredModel("claude-opus-5"))).not.toBeNull();
   });
 });
 

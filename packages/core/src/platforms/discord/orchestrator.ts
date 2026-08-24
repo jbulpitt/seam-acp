@@ -310,6 +310,7 @@ import {
   parseIngestEndpointSpec,
   type IngestEndpoint,
 } from "../../core/choice/endpoint.js";
+import { refuseIsolatedClaudeModel } from "../../core/choice/ingest-model.js";
 import { mintBridgeToken, hashBridgeToken } from "../../core/bridge-pairing.js";
 import { renderMathPng } from "../../core/math-render.js";
 import { isInlineableForAgent } from "../../agents/attachments.js";
@@ -2691,6 +2692,7 @@ export class Orchestrator {
             cwd,
             ...(opts.model ? { model: opts.model } : {}),
             ...(opts.effort ? { effort: opts.effort } : {}),
+            ...(opts.strictModel ? { strictModel: true } : {}),
           });
           sessionId = opts.resumeSessionId;
         } else {
@@ -2698,6 +2700,7 @@ export class Orchestrator {
             cwd,
             ...(opts.model ? { model: opts.model } : {}),
             ...(opts.effort ? { effort: opts.effort } : {}),
+            ...(opts.strictModel ? { strictModel: true } : {}),
           });
           sessionId = info.sessionId;
         }
@@ -5286,6 +5289,7 @@ export class Orchestrator {
           cwd,
           ...(model ? { model } : {}),
           ...(effort ? { effort } : {}),
+          strictModel: true,
           mcpServers,
           ...(outputTo ? { outputTo } : {}),
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
@@ -9194,7 +9198,8 @@ export class Orchestrator {
           const uniq = e.uniqueStudent ? " · unique-student" : "";
           const notify = e.notifyThread ? ` · notify ${e.notifyThread}` : "";
           const preset = e.preset ? ` · preset ${e.preset}` : "";
-          return `🌐 \`${e.id}\` ${e.name}${preset}${uniq}${notify}`;
+          const model = e.model ? ` · ${e.model}` : "";
+          return `🌐 \`${e.id}\` ${e.name}${preset}${model}${uniq}${notify}`;
         });
         if (endpoints.length > 10) lines.push(`…and ${endpoints.length - 10} more`);
         embed.addFields({
@@ -12438,6 +12443,9 @@ export class Orchestrator {
       effort = null;
     } else if (!this.router.getProfile(agentId)) {
       return { ok: false, error: `Unknown agent "${agentId}".` };
+    } else {
+      const modelErr = refuseIsolatedClaudeModel(agentId, model);
+      if (modelErr) return { ok: false, error: modelErr };
     }
     const ingestToken = mintBridgeToken();
     const row: IngestEndpoint = {

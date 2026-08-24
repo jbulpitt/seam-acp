@@ -275,15 +275,7 @@ export async function runLiveHelpCall(opts: {
 
   const subscribeUser = (userId: string): void => {
     if (userId === opts.client.user?.id) return;
-    const prev = connection.receiver.subscriptions.get(userId);
-    if (prev) {
-      try {
-        prev.destroy();
-      } catch {
-        /* ignore */
-      }
-    }
-    subscribed.delete(userId);
+    if (subscribed.has(userId) && connection.receiver.subscriptions.has(userId)) return;
     subscribed.add(userId);
     const stream = connection.receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.Manual },

@@ -100,6 +100,7 @@ describe("live-help setup shape (D10)", () => {
     expect(gen.responseModalities).toEqual(["AUDIO"]);
     expect(msg.setup.model).toBe("models/gemini-3.1-flash-live-preview");
     expect(msg.setup.realtimeInputConfig).toBeUndefined();
+    expect(msg.setup.historyConfig).toEqual({ initialHistoryInClientContent: true });
     expect(msg.setup.systemInstruction).toEqual({
       parts: [{ text: "tutor fractions" }],
     });
@@ -111,6 +112,12 @@ describe("live-help setup shape (D10)", () => {
       turnComplete: true,
       turns: [{ role: "user", parts: [{ text: "missed 1/2 + 1/4" }] }],
     });
+  });
+
+  it("seeds history without starting a spoken turn (3.1 initialHistoryInClientContent)", () => {
+    const setup = buildLiveHelpSetup({ system: "tutor" });
+    const hist = setup.setup.historyConfig as { initialHistoryInClientContent?: boolean };
+    expect(hist.initialHistoryInClientContent).toBe(true);
   });
 
   it("parses setupComplete, interrupted, goAway", () => {

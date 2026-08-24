@@ -29,6 +29,7 @@ import { GeminiLiveSession } from "../../core/audio/gemini-live.js";
 import {
   LIVE_HELP_EMPTY_VC_IDLE_MS,
   LIVE_HELP_MAX_MS,
+  LIVE_HELP_WAIT_JOIN_MS,
   type LiveHelpSession,
 } from "../../core/live-help/types.js";
 import { checkLiveHelpVoiceChannel } from "../../core/live-help/voice-policy.js";
@@ -267,8 +268,9 @@ export async function runLiveHelpCall(opts: {
     if (userId === opts.client.user?.id) return;
     subscribed.add(userId);
     const stream = connection.receiver.subscribe(userId, {
-      end: { behavior: EndBehaviorType.AfterSilence, duration: 800 },
+      end: { behavior: EndBehaviorType.Manual },
     });
+    opts.logger.info({ userId, liveId: opts.row.id }, "live-help subscribed speaker");
     stream.on("data", (p: Buffer) => {
       if (!Buffer.isBuffer(p) || p.byteLength === 0) return;
       const pcm48 = decodePacket(p);
@@ -287,6 +289,29 @@ export async function runLiveHelpCall(opts: {
       return { reason };
     }
 
+    const joined = await waitForHumanInVc({
+      ch,
+      botId: opts.client.user?.id,
+      signal: opts.signal,
+      timeoutMs: LIVE_HELP_WAIT_JOIN_MS,
+    });
+    if (opts.signal.aborted) {
+      reason = "cancelled";
+      return { reason };
+    }
+    if (!joined) {
+      reason = "wait-join-timeout";
+      return { reason };
+    }
+    lastHumanAt = Date.now();
+
+    connection.receiver.speaking.on("start", (userId: string) => {
+      subscribeUser(userId);
+    });
+    for (const member of ch.members.values()) {
+      if (!member.user.bot) subscribeUser(member.id);
+    }
+
     live = await GeminiLiveSession.connect({
       apiKey: opts.apiKey,
       system: opts.row.system,
@@ -301,10 +326,6 @@ export async function runLiveHelpCall(opts: {
       },
     });
     opts.onLive();
-
-    connection.receiver.speaking.on("start", (userId: string) => {
-      subscribeUser(userId);
-    });
 
     const mixTimer = setInterval(flushMix, 20);
     const started = Date.now();
@@ -380,10 +401,47 @@ export async function runLiveHelpCall(opts: {
 
 function countHumans(ch: VoiceBasedChannel, botId?: string): number {
   try {
-    return ch.members.filter((m) => !m.user.bot && m.id !== botId).size;
+    const inMembers = ch.members.filter((m) => !m.user.bot && m.id !== botId).size;
+    if (inMembers > 0) return inMembers;
+    return ch.guild.voiceStates.cache.filter(
+      (vs) => vs.channelId === ch.id && vs.id !== botId && !vs.member?.user.bot
+    ).size;
   } catch {
     return 0;
   }
+}
+
+async function waitForHumanInVc(opts: {
+  ch: VoiceBasedChannel;
+  botId?: string;
+  signal: AbortSignal;
+  timeoutMs: number;
+}): Promise<boolean> {
+  if (countHumans(opts.ch, opts.botId) > 0) return true;
+  const deadline = Date.now() + opts.timeoutMs;
+  return new Promise((resolve) => {
+    const tick = (): void => {
+      if (opts.signal.aborted || countHumans(opts.ch, opts.botId) > 0) {
+        cleanup();
+        resolve(!opts.signal.aborted);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        cleanup();
+        resolve(false);
+      }
+    };
+    const iv = setInterval(tick, 400);
+    const onAbort = (): void => {
+      cleanup();
+      resolve(false);
+    };
+    opts.signal.addEventListener("abort", onAbort, { once: true });
+    const cleanup = (): void => {
+      clearInterval(iv);
+      opts.signal.removeEventListener("abort", onAbort);
+    };
+  });
 }
 
 export function liveHelpConnectionReady(connection: VoiceConnection): boolean {

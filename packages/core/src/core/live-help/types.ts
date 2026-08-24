@@ -34,5 +34,6 @@ export function newLiveHelpId(): string {
 }
 
 export const LIVE_HELP_EMPTY_VC_IDLE_MS = 45_000;
+export const LIVE_HELP_WAIT_JOIN_MS = 3 * 60_000;
 export const LIVE_HELP_MAX_MS = 9 * 60_000;
 export const LIVE_HELP_MODEL = "gemini-3.1-flash-live-preview";

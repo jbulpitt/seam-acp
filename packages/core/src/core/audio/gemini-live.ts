@@ -34,6 +34,8 @@ export function buildLiveHelpSetup(opts: {
       systemInstruction: {
         parts: [{ text: opts.system }],
       },
+      // Seed history as context only — must not start a spoken turn.
+      historyConfig: { initialHistoryInClientContent: true },
       inputAudioTranscription: {},
       outputAudioTranscription: {},
     },

@@ -72,6 +72,12 @@ export interface NewSessionOptions {
   effort?: string;
   /** Extra ACP `_meta` to merge into `session/new`. */
   meta?: Record<string, unknown>;
+  /**
+   * When true, a failed `setModel` aborts session creation instead of
+   * warning and leaving the adapter default. Isolated ingest uses this;
+   * live Discord threads must not.
+   */
+  strictModel?: boolean;
 }
 
 export interface SessionInfo {
@@ -460,6 +466,10 @@ export class AgentRuntime {
           await this.setModel(wantedModel);
           this.sessionInfo = { ...this.sessionInfo, currentModelId: wantedModel };
         } catch (err) {
+          if (opts.strictModel) {
+            const detail = err instanceof Error ? err.message : String(err);
+            throw new Error(`failed to set initial model "${wantedModel}": ${detail}`);
+          }
           this.logger.warn({ err, wantedModel }, "failed to set initial model");
         }
       }
@@ -477,6 +487,8 @@ export class AgentRuntime {
     cwd: string;
     model?: string;
     effort?: string;
+    /** Isolated ingest: fail the load instead of warning on setModel. */
+    strictModel?: boolean;
   }): Promise<SessionInfo> {
     const conn = this.requireConnection();
     const meta: Record<string, unknown> = {
@@ -527,6 +539,12 @@ export class AgentRuntime {
           await this.setModel(wantedModel);
           this.sessionInfo = { ...this.sessionInfo, currentModelId: wantedModel };
         } catch (err) {
+          if (opts.strictModel) {
+            const detail = err instanceof Error ? err.message : String(err);
+            throw new Error(
+              `failed to re-apply model "${wantedModel}" on session load: ${detail}`
+            );
+          }
           this.logger.warn({ err, wantedModel }, "failed to re-apply model on session load");
         }
       }

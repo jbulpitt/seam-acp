@@ -43,6 +43,11 @@ export interface InjectTurnOptions {
 
   /** Model for the turn. Isolated: passed to `newSession`. */
   model?: string;
+  /**
+   * Isolated ingest: if setModel fails, fail the session instead of
+   * warning and continuing on the adapter default. Live threads omit this.
+   */
+  strictModel?: boolean;
   /** Reasoning effort for the turn (agent-specific scale). */
   effort?: string;
   /** Working directory. Required for `"isolated"`; falls back to the target

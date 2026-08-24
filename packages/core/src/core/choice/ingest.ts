@@ -134,7 +134,22 @@ export class ChoiceIngest {
       json(res, 200, row.body);
       return;
     }
-    json(res, 504, { error: row.error ?? "no declared result", jobId: dispatchId });
+    // 422 not 5xx: Cloudflare replaces 504 JSON with plaintext "error code: 504".
+    this.respondNoResult(res, dispatchId, row);
+  }
+
+  /** Job finished without a declared result (`missing` / `error`). Non-5xx so proxies keep JSON. */
+  private respondNoResult(
+    res: ServerResponse,
+    dispatchId: string,
+    row?: { status: string; error: string | null } | null
+  ): void {
+    const r = row ?? this.store.getChoiceResult(dispatchId);
+    json(res, 422, {
+      error: r?.error ?? "no declared result",
+      jobId: dispatchId,
+      status: r?.status ?? "missing",
+    });
   }
 
   private async handlePost(
@@ -231,10 +246,7 @@ export class ChoiceIngest {
       return;
     }
     if (timed.status === "ended") {
-      json(res, 504, {
-        error: timed.error ?? "no declared result",
-        jobId: emitted.dispatchId,
-      });
+      this.respondNoResult(res, emitted.dispatchId);
       return;
     }
     json(res, 202, {
@@ -300,10 +312,7 @@ export class ChoiceIngest {
       return;
     }
     if (timed.status === "ended") {
-      json(res, 504, {
-        error: timed.error ?? "no declared result",
-        jobId: spec.id,
-      });
+      this.respondNoResult(res, spec.id);
       return;
     }
     json(res, 202, {

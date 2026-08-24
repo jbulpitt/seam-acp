@@ -332,7 +332,7 @@ describe("POST /ingest (#92)", () => {
     server.close();
   });
 
-  it("returns 504 when the turn ends with no submit_result, not 202 pending", async () => {
+  it("returns 422 when the turn ends with no submit_result, not 202 pending", async () => {
     const token = mintBridgeToken();
     store.insertChoiceCard(card({ ingestTokenHash: hashBridgeToken(token) }));
     const specs: DispatchSpec[] = [];
@@ -364,10 +364,20 @@ describe("POST /ingest (#92)", () => {
     expect(specs).toHaveLength(1);
     results.turnEnded(specs[0]!.id);
     const res = await post;
-    expect(res.status).toBe(504);
-    const body = (await res.json()) as { error: string; jobId: string };
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { error: string; jobId: string; status: string };
     expect(body.error).toMatch(/no submit_result|no declared result/);
     expect(body.jobId).toBe(specs[0]!.id);
+    expect(body.status).toBe("missing");
+    const poll = await fetch(`http://127.0.0.1:${port}/ingest/jobs/${specs[0]!.id}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(poll.status).toBe(422);
+    expect(await poll.json()).toEqual({
+      error: "turn ended with no submit_result / seam-result",
+      jobId: specs[0]!.id,
+      status: "missing",
+    });
     server.close();
   });
 });

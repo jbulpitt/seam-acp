@@ -74,6 +74,20 @@ function authorIcon(state: StatusPanel): { authorIconURL?: string } {
   return { authorIconURL: `attachment://${state.brandFilename}` };
 }
 
+/** Cancel maps to Failed; timeout is Timed out. Hide the GIF on all of these. */
+const TERMINAL_STATES: ReadonlySet<StatusPanel["state"]> = new Set([
+  "Done",
+  "Failed",
+  "Timed out",
+]);
+
+/** Simple-card GIF lives on the embed image only while the turn is in progress. */
+function simpleCardImageUrl(state: StatusPanel): string | undefined {
+  if (!state.gifUrl) return undefined;
+  if (TERMINAL_STATES.has(state.state)) return undefined;
+  return state.gifUrl;
+}
+
 function simpleFooter(state: StatusPanel): string {
   const parts: string[] = [];
   const latestTool = state.activity?.[state.activity.length - 1];
@@ -100,12 +114,13 @@ export const discordRenderer: Renderer = {
       const title = state.titlePrefix
         ? `${state.titlePrefix} · ${state.state}`
         : undefined;
+      const imageUrl = simpleCardImageUrl(state);
       return {
         color: COLOR_BY_STATE[state.state],
         ...(title ? { title } : {}),
         author: state.state,
         ...authorIcon(state),
-        ...(state.gifUrl ? { thumbnailUrl: state.gifUrl } : {}),
+        ...(imageUrl ? { imageUrl } : {}),
         fields: [],
         footer: simpleFooter(state),
       };

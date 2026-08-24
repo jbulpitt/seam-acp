@@ -102,10 +102,10 @@ describe("discordRenderer", () => {
     });
     expect(out.author).toBe("Failed");
     expect(out.authorIconURL).toBeUndefined();
-    expect(out.thumbnailUrl).toBeUndefined();
+    expect(out.imageUrl).toBeUndefined();
   });
 
-  it("simple card sets thumbnailUrl when gifUrl is provided", () => {
+  it("simple card sets imageUrl when gifUrl is provided and the turn is Working", () => {
     const out = discordRenderer.statusPanel({
       state: "Working",
       repoDisplay: "r",
@@ -115,10 +115,41 @@ describe("discordRenderer", () => {
       style: "simple",
       gifUrl: "https://cdn.example/a.gif",
     });
-    expect(out.thumbnailUrl).toBe("https://cdn.example/a.gif");
+    expect(out.imageUrl).toBe("https://cdn.example/a.gif");
+    expect((out as { thumbnailUrl?: string }).thumbnailUrl).toBeUndefined();
   });
 
-  it("full card never sets thumbnailUrl even when gifUrl is provided", () => {
+  it("simple card keeps imageUrl while Waiting or Monitoring", () => {
+    for (const state of ["Waiting", "Monitoring"] as const) {
+      const out = discordRenderer.statusPanel({
+        state,
+        repoDisplay: "r",
+        model: "m",
+        action: "ok",
+        elapsedSeconds: 1,
+        style: "simple",
+        gifUrl: "https://cdn.example/a.gif",
+      });
+      expect(out.imageUrl, state).toBe("https://cdn.example/a.gif");
+    }
+  });
+
+  it("simple card omits imageUrl on Done / Failed / Timed out (cancel → Failed)", () => {
+    for (const state of ["Done", "Failed", "Timed out"] as const) {
+      const out = discordRenderer.statusPanel({
+        state,
+        repoDisplay: "r",
+        model: "m",
+        action: "ok",
+        elapsedSeconds: 1,
+        style: "simple",
+        gifUrl: "https://cdn.example/a.gif",
+      });
+      expect(out.imageUrl, state).toBeUndefined();
+    }
+  });
+
+  it("full card never sets imageUrl even when gifUrl is provided", () => {
     const out = discordRenderer.statusPanel({
       state: "Working",
       repoDisplay: "r",
@@ -127,7 +158,7 @@ describe("discordRenderer", () => {
       elapsedSeconds: 1,
       gifUrl: "https://cdn.example/a.gif",
     });
-    expect(out.thumbnailUrl).toBeUndefined();
+    expect(out.imageUrl).toBeUndefined();
     expect(out.fields.find((f) => f.name === "Repo")).toBeTruthy();
   });
 

@@ -1308,8 +1308,8 @@ export class DiscordAdapter implements ChatAdapter {
     if (panel.footer) {
       embed.setFooter({ text: panel.footer.slice(0, 2048) });
     }
-    if (panel.thumbnailUrl) {
-      embed.setThumbnail(panel.thumbnailUrl);
+    if (panel.imageUrl) {
+      embed.setImage(panel.imageUrl);
     }
     return embed;
   }

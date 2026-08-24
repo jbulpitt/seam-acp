@@ -291,10 +291,14 @@ time, not in page JS. `cancel_ingest({ ingestId })` or
 
 **Who runs the scoring turn** (POST never chooses this):
 
-- **`preset`** (preferred for a named grader): a project preset, **resolved at
-  each POST**. Edit the preset’s agent / model / effort / cwd / instructions
-  and the next submit uses them — no remint. Cannot combine with `agent` /
-  `model` / `effort` / `cwd`. Unknown at fire → the job fails.
+- **`preset`** (preferred for a named grader): a project preset on the
+  **minting thread's parent channel**, then globals. **Refused at mint** if
+  the name is unknown there. **Re-resolved at each POST** (fire) so an edit
+  to the preset’s agent / model / effort / cwd / instructions applies without
+  remint. Cannot combine with `agent` / `model` / `effort` / `cwd`. Unknown
+  at fire → the job fails. Cross-channel: qualify with the parent **channel
+  snowflake**, not `#name` — e.g. `1534936932197339186/grader-collegiate`.
+  Same string at mint and fire. First `/` splits; there is no colon syntax.
 - Else pin `agent` / `model` / `effort` / `cwd` on mint.
 - Else inherit the minting thread’s agent / model / effort / cwd.
 

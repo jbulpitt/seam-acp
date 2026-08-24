@@ -1895,6 +1895,7 @@ describe("config_describe", () => {
       expect(text).toContain("spec.md");
       expect(text).toContain("ts-reviewer");
       expect(text).toContain("Reviews TypeScript PRs");
+      expect(text).toMatch(/parent channel|<channelId>/);
     } finally {
       await server.stop();
     }
@@ -1928,6 +1929,28 @@ describe("config_describe", () => {
       const body = await callTool(server, {}, "bad-token");
       expect(body.error.code).toBe(-32001);
       expect(body.error.message).toMatch(/unknown X-Seam-Session token/);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("empty preset list says they are per-channel, not that none exist", async () => {
+    const server = new SeamMcpServer({
+      logger: silent,
+      resolveSession: (token) => (token === "good-token" ? makeRecord({ parentRef: "chan-1" }) : undefined),
+      enqueueDispatch: async () => {},
+      describeConfig: () => description,
+      listConfigEntities: () => ({ schedules: [], presets: [] }),
+    });
+    await server.start();
+    try {
+      const body = await callTool(server, {});
+      expect(body.result.isError).toBeFalsy();
+      const text = body.result.content[0].text as string;
+      expect(text).toContain("Presets visible here (0):");
+      expect(text).toContain("none in this channel");
+      expect(text).toContain("<channelId>/<preset>");
+      expect(text).not.toMatch(/Presets visible here \(0\):\n {2}\(none\)/);
     } finally {
       await server.stop();
     }

@@ -86,3 +86,21 @@ export function resolvePublicBridgeWsUrl(opts: {
 export function publicBaseFromBridgeWsUrl(wsUrl: string): string | undefined {
   return publicBaseFromTunnelUrl(wsUrl.replace(/\/bridge\/?$/, ""));
 }
+
+/**
+ * Origin for minted `POST /ingest` URLs.
+ * Prefer `SEAM_INGEST_PUBLIC_URL` (trailing slash stripped). When unset,
+ * fall back to the bridge/tunnel origin, then loopback health.
+ */
+export function resolveIngestPublicBase(opts: {
+  ingestPublicUrl?: string | null;
+  bridgeWsUrl?: string | null;
+  healthPort: number;
+}): string {
+  const configured = (opts.ingestPublicUrl ?? "").trim().replace(/\/+$/, "");
+  if (configured) return configured;
+  const fromBridge = opts.bridgeWsUrl
+    ? publicBaseFromBridgeWsUrl(opts.bridgeWsUrl)
+    : undefined;
+  return fromBridge ?? `http://127.0.0.1:${opts.healthPort}`;
+}

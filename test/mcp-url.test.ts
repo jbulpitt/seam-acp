@@ -6,6 +6,7 @@ import {
   normalizePublicBridgeWsUrl,
   resolvePublicBridgeWsUrl,
   publicBaseFromBridgeWsUrl,
+  resolveIngestPublicBase,
 } from "../packages/core/src/core/mcp-url.js";
 
 describe("reachable seam-MCP URL (#84)", () => {
@@ -99,5 +100,37 @@ describe("permanent bridge public URL", () => {
     expect(publicBaseFromBridgeWsUrl("wss://seamacp.runbooksynthesis.com/bridge")).toBe(
       "https://seamacp.runbooksynthesis.com"
     );
+  });
+});
+
+describe("ingest public origin", () => {
+  it("SEAM_INGEST_PUBLIC_URL wins over the bridge URL", () => {
+    expect(
+      resolveIngestPublicBase({
+        ingestPublicUrl: "https://ingest.runbooksynthesis.com/",
+        bridgeWsUrl: "wss://seamacp.runbooksynthesis.com/bridge",
+        healthPort: 3000,
+      })
+    ).toBe("https://ingest.runbooksynthesis.com");
+  });
+
+  it("falls back to the bridge origin when ingest public URL is unset", () => {
+    expect(
+      resolveIngestPublicBase({
+        ingestPublicUrl: "",
+        bridgeWsUrl: "wss://seamacp.runbooksynthesis.com/bridge",
+        healthPort: 3000,
+      })
+    ).toBe("https://seamacp.runbooksynthesis.com");
+  });
+
+  it("loopback is last resort", () => {
+    expect(
+      resolveIngestPublicBase({
+        ingestPublicUrl: undefined,
+        bridgeWsUrl: null,
+        healthPort: 3000,
+      })
+    ).toBe("http://127.0.0.1:3000");
   });
 });

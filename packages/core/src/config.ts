@@ -546,6 +546,19 @@ const Schema = z.object({
   SEAM_INGEST_BODY_MAX: z.coerce.number().int().min(1024).max(1_048_576).default(65_536),
   SEAM_INGEST_RATE_PER_MIN: z.coerce.number().int().min(1).max(1000).default(60),
   /**
+   * Public origin for minted `POST /ingest` URLs (`create_ingest`). Pages hubs
+   * are told to use this host, not the bridge hostname. Empty/unset ⇒ derive
+   * from `SEAM_BRIDGE_PUBLIC_URL` / tunnel / loopback (local/dev). Trailing
+   * slash is stripped. Example: `https://ingest.runbooksynthesis.com`.
+   */
+  SEAM_INGEST_PUBLIC_URL: z
+    .string()
+    .default("")
+    .transform((v) => {
+      const s = v.trim().replace(/\/+$/, "");
+      return s.length > 0 ? s : undefined;
+    }),
+  /**
    * Bot-wide default permission policy for new sessions.
    * - "always": auto-approve every request (yolo)
    * - "ask": prompt the user in Discord; deny on timeout (recommended)

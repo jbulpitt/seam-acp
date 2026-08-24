@@ -2175,8 +2175,13 @@ export class SeamMcpServer {
       }
       lines.push("", `Presets visible here (${entities.presets.length}):`);
       if (entities.presets.length === 0) {
-        lines.push("  (none)");
+        lines.push(
+          "  none in this channel (presets are per-channel; a qualified name <channelId>/<preset> can target another channel's preset)."
+        );
       } else {
+        lines.push(
+          "  Names are this parent channel's; another channel's preset is <channelId>/<name> (snowflake, not #name)."
+        );
         for (const p of entities.presets) {
           const bits = [
             p.agentId ? `agent ${p.agentId}` : null,

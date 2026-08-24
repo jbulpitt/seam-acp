@@ -157,6 +157,27 @@ export class ChoiceResultHub {
     this.channelToDispatch.set(channelRef, dispatchId);
   }
 
+  /** Apply the session/channel aliases {@link ingestWaiterBinds} returns. */
+  bindIngestWaiter(
+    dispatchId: string,
+    opts: {
+      notifyThread?: string;
+      endpoint?: {
+        id?: string;
+        createdBy?: string | null;
+        authoringChannelRef?: string | null;
+      } | null;
+    }
+  ): void {
+    const { sessionIds, channelRefs } = ingestWaiterBinds({
+      dispatchId,
+      notifyThread: opts.notifyThread,
+      endpoint: opts.endpoint,
+    });
+    for (const sid of sessionIds) this.bindSession(sid, dispatchId);
+    for (const ch of channelRefs) this.bindChannel(ch, dispatchId);
+  }
+
   unbindSession(sessionId: string): void {
     this.sessionToDispatch.delete(sessionId);
   }
@@ -243,4 +264,35 @@ export function extractSeamResultFromText(
   if (!m?.[1]) return { ok: false };
   const parsed = parseResultFence(m[1]);
   return parsed.ok ? parsed : { ok: false };
+}
+
+/**
+ * Session/channel aliases `dispatchIngestEndpoint` must bind so MCP
+ * `submit_result` hits the waiter whether the token resolves to the dispatch
+ * id, the authoring Discord session, or the synthetic ingest-job record.
+ *
+ * Silent ingest (`kind:"ingest"`, no notifyThread) never posted a Discord
+ * card, so the authoring thread / endpoint id must still be bound.
+ */
+export function ingestWaiterBinds(opts: {
+  dispatchId: string;
+  notifyThread?: string;
+  endpoint?: {
+    id?: string;
+    createdBy?: string | null;
+    authoringChannelRef?: string | null;
+  } | null;
+}): { sessionIds: string[]; channelRefs: string[] } {
+  const sessionIds: string[] = [];
+  const channelRefs: string[] = [];
+  const add = (arr: string[], v: string | null | undefined) => {
+    if (v && !arr.includes(v)) arr.push(v);
+  };
+  add(sessionIds, opts.dispatchId);
+  add(sessionIds, opts.endpoint?.createdBy);
+  add(sessionIds, opts.endpoint?.id);
+  add(channelRefs, opts.notifyThread);
+  add(channelRefs, opts.endpoint?.authoringChannelRef);
+  add(channelRefs, opts.endpoint?.id);
+  return { sessionIds, channelRefs };
 }

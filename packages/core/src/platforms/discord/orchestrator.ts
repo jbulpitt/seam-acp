@@ -117,6 +117,7 @@ import {
   presetAutocompleteChoices,
   safeAutocompleteRespond,
   toAutocompleteChoices,
+  type AutocompleteResponder,
 } from "./autocomplete.js";
 import {
   findGeminiTtsVoice,
@@ -548,11 +549,15 @@ export class Orchestrator {
       logger: this.logger,
     });
 
-    this.autocomplete.register("preset", "thread", "preset", (ctx) => {
+    const presetNameResponder: AutocompleteResponder = (ctx) => {
       if (!ctx.projectScopeId) return [];
       const presets = this.store.listPresetsForProject(ctx.projectScopeId);
       return presetAutocompleteChoices(presets, ctx.focusedValue, ctx.projectScopeId);
-    });
+    };
+    this.autocomplete.register("preset", "thread", "preset", presetNameResponder);
+    for (const sub of ["apply", "delete", "show", "edit"] as const) {
+      this.autocomplete.register("preset", sub, "name", presetNameResponder);
+    }
     this.autocomplete.register("config", "tts", "voice", (ctx) =>
       toAutocompleteChoices(geminiTtsVoiceChoices(ctx.focusedValue))
     );

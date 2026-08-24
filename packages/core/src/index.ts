@@ -35,7 +35,7 @@ import type { BridgeAgent } from "./core/server-status.js";
 import { ChoiceResultHub } from "./core/choice/result.js";
 import { ChoiceIngest } from "./core/choice/ingest.js";
 import { CardGifCatalog } from "./core/card-gifs.js";
-import { publicBaseFromBridgeWsUrl, resolvePublicBridgeWsUrl } from "./core/mcp-url.js";
+import { resolveIngestPublicBase, resolvePublicBridgeWsUrl } from "./core/mcp-url.js";
 import fs from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
@@ -452,7 +452,11 @@ async function main(): Promise<void> {
       tunnelUrl: tunnel,
       healthPort: config.HEALTH_PORT,
     });
-    return publicBaseFromBridgeWsUrl(ws) ?? `http://127.0.0.1:${config.HEALTH_PORT}`;
+    return resolveIngestPublicBase({
+      ingestPublicUrl: config.SEAM_INGEST_PUBLIC_URL,
+      bridgeWsUrl: ws,
+      healthPort: config.HEALTH_PORT,
+    });
   };
   const choiceIngest = new ChoiceIngest({
     store,

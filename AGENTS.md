@@ -26,6 +26,11 @@ hand-editing runtime state.
   `docs/agent-guides/interactive-prompts.md`. `maxClicks` > 1 only when several
   people should each click (not combinable with `select`). Participants click;
   they do not author.
+- **Gemini in a voice channel (live help):** MCP `create_live_help` (no fence)
+  after packing `system` + optional `historySummary`. Students may *be in* the
+  VC; they must not mint. Never a `school-*` voice channel. How-to:
+  `docs/agent-guides/live-help.md`. School overlays:
+  `docs/agent-guides/live-help-onboarding.md`. Not TTS, not STT, not Go Live.
 - **A file he should open:** `seam-attach` fence (path only), not a path in prose.
 - **Another thread in this channel:** `threads()` first. Idle → `handoff` /
   `forward`. Busy → `send` (inbox; they `poll_inbox`). Set `returnTo` to that
@@ -138,6 +143,15 @@ HTTP `POST /ingest` is a custom-option submit; the site gets **declared JSON**
 from `submit_result`. Microsites that need **no Discord card** use MCP
 `create_ingest` (isolated silent, retries unlimited; `preset` resolved at
 fire). Participants click; they do not author.
+
+## Live help (#98)
+
+Gemini joins a Discord **voice channel** (not TTS, not STT). Coaching agents
+mint with MCP `create_live_help` (no fence); `cancel_live_help` hangs up.
+Students may be *in* the call; they must not mint. Never a `school-*` VC.
+Canonical: `docs/agent-guides/live-help.md`. School overlay paste:
+`docs/agent-guides/live-help-onboarding.md`. Tools ship with #98 — if they
+are missing, wait; do not use `/seam debug voice-*` from a course thread.
 
 ## Agent-scheduled wake events (#59)
 

@@ -216,6 +216,17 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .setDescription("Path under REPOS_ROOT (or absolute). Omit to open a picker.")
               .setRequired(false)
           )
+          .addStringOption((o) =>
+            o
+              .setName("scope")
+              .setDescription("session (this thread, default) | thread preset | channel (all threads)")
+              .setRequired(false)
+              .addChoices(
+                { name: "session (this thread override)", value: "session" },
+                { name: "thread preset", value: "thread" },
+                { name: "channel (all threads inherit)", value: "channel" }
+              )
+          )
       )
       .addSubcommand((sub) =>
         sub

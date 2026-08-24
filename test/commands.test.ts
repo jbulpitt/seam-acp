@@ -102,6 +102,12 @@ describe("/seam slash command", () => {
     expect(ttsVoice?.required ?? false).toBe(false);
     expect(ttsVoice?.autocomplete).toBe(true);
     expect((tts?.options ?? []).map((o) => o.name)).toEqual(["state", "voice", "pace", "style"]);
+    const repo = (config?.options ?? []).find((o) => o.name === "repo");
+    expect((repo?.options ?? []).map((o) => o.name)).toEqual(["path", "scope"]);
+    const repoScope = repo?.options?.find((o) => o.name === "scope");
+    expect(repoScope?.type).toBe(STRING);
+    expect(repoScope?.required ?? false).toBe(false);
+    expect(repoScope?.choices?.map((c) => c.value)).toEqual(["session", "thread", "channel"]);
     const card = (config?.options ?? []).find((o) => o.name === "card");
     expect((card?.options ?? []).map((o) => o.name)).toEqual(["style", "scope"]);
     const scope = card?.options?.find((o) => o.name === "scope");

@@ -105,9 +105,33 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
     const router = makeRouter({ channelPresets, threadPresets });
     const d = router.describeConfig(makeRecord());
 
-    // Thread wins model; channel still supplies cwd.
+    // Thread wins model. Session repoPath still wins cwd (session > thread > channel).
     expect(d.model).toEqual({ value: "claude-haiku-4.5", source: "thread preset" });
-    expect(d.cwd).toEqual({ value: "/repo/chan", source: "channel preset" });
+    expect(d.cwd).toEqual({ value: "/repo/session", source: "session config" });
+  });
+
+  it("cwd prefers session over thread and channel presets", () => {
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { cwd: { value: "/repo/chan" }, locked: false }],
+    ]);
+    const threadPresets = new Map<string, ThreadPreset>([
+      ["thread-1", { cwd: { value: "/repo/thread" } }],
+    ]);
+    const router = makeRouter({ channelPresets, threadPresets });
+    expect(router.describeConfig(makeRecord()).cwd).toEqual({
+      value: "/repo/session",
+      source: "session config",
+    });
+    expect(router.describeConfig(makeRecord({ repoPath: null })).cwd).toEqual({
+      value: "/repo/thread",
+      source: "thread preset",
+    });
+    expect(
+      router.describeConfig(makeRecord({ repoPath: null, channelRef: "other-thread" })).cwd
+    ).toEqual({
+      value: "/repo/chan",
+      source: "channel preset",
+    });
   });
 
   it("honors a preset effort the resolved agent supports", () => {

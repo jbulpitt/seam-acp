@@ -780,11 +780,6 @@ export class ConfigMutationService {
       if (nextRepoPath !== before.cwd.value) {
         fields.push({ label: "cwd", before: before.cwd.value, after: nextRepoPath });
       }
-      if (before.cwd.source === "thread preset" || before.cwd.source === "channel preset") {
-        warnings.push(
-          `cwd is currently pinned by the ${before.cwd.source} — the preset still wins.`
-        );
-      }
     }
 
     // mode — ACP mode id (`/seam mode`). Not layered by presets, so diff directly

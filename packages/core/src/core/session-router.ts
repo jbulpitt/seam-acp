@@ -295,13 +295,14 @@ export class SessionRouter {
       }
     }
 
-    // cwd — preset.cwd ?? record.repoPath ?? process.cwd().
-    const cwd: ResolvedSetting<string> = thread?.cwd
-      ? { value: thread.cwd.value, source: "thread preset" }
-      : chan?.cwd
-        ? { value: chan.cwd.value, source: "channel preset" }
-        : record.repoPath
-          ? { value: record.repoPath, source: "session config" }
+    // cwd — session overlay > thread preset > channel preset > process.cwd()
+    // (same precedence as statusCardStyle / #101).
+    const cwd: ResolvedSetting<string> = record.repoPath
+      ? { value: record.repoPath, source: "session config" }
+      : thread?.cwd
+        ? { value: thread.cwd.value, source: "thread preset" }
+        : chan?.cwd
+          ? { value: chan.cwd.value, source: "channel preset" }
           : { value: process.cwd(), source: "default" };
 
     // permission — resolvePermissionMode layering (session policy, then legacy
@@ -660,7 +661,7 @@ export class SessionRouter {
       profile.effort.mechanism !== "none" &&
       profile.effort.levels.includes(preset.effort.value);
     const effort = presetEffortUsable ? preset.effort!.value : cfg.reasoningEffort;
-    const cwd = preset.cwd?.value ?? record.repoPath ?? process.cwd();
+    const cwd = this.describeConfig(record).cwd.value;
 
     if (this.seamMcp && this.seamMcp.getPort() === undefined) {
       this.logger.warn(

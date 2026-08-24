@@ -11,6 +11,20 @@ export interface DebugSlashDeps {
   mutation: ConfigMutationService;
   hub?: BridgeHub;
   logger: Logger;
+  /** Live-help spike: join test VC, play ogg, leave. Host-side, not a bridge RPC. */
+  playSpikeOgg?: () => Promise<string>;
+  /** Live-help spike: capture the invoker's Discord Opus → 16 kHz PCM. */
+  playSpikeCapture?: (
+    userId: string,
+    hooks?: { onListening?: () => void | Promise<void> }
+  ) => Promise<{ text: string; ogg?: Buffer }>;
+  playSpikeLiveRoundTrip?: (
+    userId: string,
+    hooks?: {
+      onListening?: () => void | Promise<void>;
+      onCaptured?: (info: { durationMs: number }) => void | Promise<void>;
+    }
+  ) => Promise<{ text: string; ogg?: Buffer }>;
 }
 
 function actorOf(i: ChatInputCommandInteraction): MutationActor {
@@ -29,6 +43,12 @@ export async function handleDebugSlash(
       return cmdTail(interaction, deps);
     case "exec":
       return cmdExec(interaction, deps);
+    case "voice-ping":
+      return cmdVoicePing(interaction, deps);
+    case "voice-capture":
+      return cmdVoiceCapture(interaction, deps);
+    case "voice-live":
+      return cmdVoiceLive(interaction, deps);
     default:
       await interaction.reply({
         content: `Unknown /seam debug subcommand: ${sub}`,
@@ -138,5 +158,93 @@ async function cmdExec(
       content: `exec failed: ${(err as Error).message}`,
       flags: MessageFlags.Ephemeral,
     });
+  }
+}
+
+async function cmdVoicePing(
+  i: ChatInputCommandInteraction,
+  deps: DebugSlashDeps
+): Promise<void> {
+  if (!deps.playSpikeOgg) {
+    await i.reply({
+      content: "Voice spike is not wired on this adapter.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  deps.logger.info({ userId: i.user.id }, "debug.voice-ping");
+  try {
+    const text = await deps.playSpikeOgg();
+    await i.editReply({ content: text });
+  } catch (err) {
+    await i.editReply({ content: `voice-ping failed: ${(err as Error).message}` });
+  }
+}
+
+async function cmdVoiceCapture(
+  i: ChatInputCommandInteraction,
+  deps: DebugSlashDeps
+): Promise<void> {
+  if (!deps.playSpikeCapture) {
+    await i.reply({
+      content: "Voice capture is not wired on this adapter.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  deps.logger.info({ userId: i.user.id }, "debug.voice-capture");
+  try {
+    const result = await deps.playSpikeCapture(i.user.id, {
+      onListening: async () => {
+        await i.editReply({
+          content: "Listening in **General** — unmute and say something (45s to start, ~15s max clip).",
+        });
+      },
+    });
+    await i.editReply({
+      content: result.text,
+      ...(result.ogg
+        ? { files: [{ attachment: result.ogg, name: "capture.ogg" }] }
+        : {}),
+    });
+  } catch (err) {
+    await i.editReply({ content: `voice-capture failed: ${(err as Error).message}` });
+  }
+}
+
+async function cmdVoiceLive(
+  i: ChatInputCommandInteraction,
+  deps: DebugSlashDeps
+): Promise<void> {
+  if (!deps.playSpikeLiveRoundTrip) {
+    await i.reply({
+      content: "Voice live round-trip is not wired on this adapter.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  deps.logger.info({ userId: i.user.id }, "debug.voice-live");
+  try {
+    const result = await deps.playSpikeLiveRoundTrip(i.user.id, {
+      onListening: async () => {
+        await i.editReply({
+          content: "Listening in **General** — unmute and say something. Gemini will answer in the VC.",
+        });
+      },
+      onCaptured: async (info) => {
+        await i.editReply({
+          content: `Captured ${info.durationMs}ms. Sending to Gemini Live… stay in **General**.`,
+        });
+      },
+    });
+    await i.editReply({
+      content: result.text,
+      ...(result.ogg ? { files: [{ attachment: result.ogg, name: "live-reply.ogg" }] } : {}),
+    });
+  } catch (err) {
+    await i.editReply({ content: `voice-live failed: ${(err as Error).message}` });
   }
 }

@@ -90,18 +90,22 @@ through `rt.prompt`.
 
 Do **not** add MCP, school channels, resume, or Live tools until this works.
 
-1. Enable `GuildVoiceStates`. Add `@discordjs/voice` + opus/sodium. Join a
-   **test** VC, play a local ogg, leave.
+1. Enable `GuildVoiceStates`. Add `@discordjs/voice` + opus. Join the
+   **test** VC (family-guild **General** `1487095870188027987`), play a local
+   ogg, leave. Trigger: `/seam debug voice-ping`. Never a school VC.
 2. Capture one user’s Opus → 16 kHz PCM file (then delete; spike only).
+   Trigger: `/seam debug voice-capture` (listens for the invoker in General).
 3. 30s Gemini Live ping with the Studio key: `setup` + one text or PCM clip
    → receive 24 kHz audio back. No Discord.
 4. Round-trip: captured Discord PCM → Live → play in the test VC.
+   Trigger: `/seam debug voice-live`.
 5. **Stop.**
 
 ---
 
 ## Open questions (human)
 
-- Which test voice channel (snowflake)? Never a school VC for the spike.
+- Test voice channel: family-guild **General** `1487095870188027987`
+  (not school; school-* live in the other guild).
 - After spike: one-shot sessions vs resumable classroom block.
 - Transcript in `notifyThread`: on by default or opt-in?

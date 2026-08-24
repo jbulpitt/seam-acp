@@ -343,8 +343,7 @@ import {
   resolveAgentBrand,
   withBrandAttachment,
 } from "../../core/agent-brand.js";
-import type { DiscordAdapter } from "./adapter.js";
-import { resolveDiscordSpeakerName } from "./adapter.js";
+import { resolveDiscordSpeakerName, type DiscordAdapter } from "./adapter.js";
 
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
@@ -2315,6 +2314,27 @@ export class Orchestrator {
         mutation: this.configMutation,
         hub: this.bridgeHub,
         logger: this.logger,
+        playSpikeOgg: async () => {
+          const a = this.adapter as DiscordAdapter;
+          if (typeof a.playSpikeOgg !== "function") {
+            return "Voice spike is not available on this adapter.";
+          }
+          return a.playSpikeOgg();
+        },
+        playSpikeCapture: async (userId, hooks) => {
+          const a = this.adapter as DiscordAdapter;
+          if (typeof a.playSpikeCapture !== "function") {
+            return { text: "Voice capture is not available on this adapter." };
+          }
+          return a.playSpikeCapture(userId, hooks);
+        },
+        playSpikeLiveRoundTrip: async (userId, hooks) => {
+          const a = this.adapter as DiscordAdapter;
+          if (typeof a.playSpikeLiveRoundTrip !== "function") {
+            return { text: "Voice live round-trip is not available on this adapter." };
+          }
+          return a.playSpikeLiveRoundTrip(userId, hooks);
+        },
       });
     }
     if (interaction.options.getSubcommandGroup(false) === "info") {

@@ -109,7 +109,7 @@ Discord has no aliases; old invocations disappear.
 - `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
 - `schedule` (7), `preset` (6), `project` (3) — unchanged
 - `upload` (3): `pull` `push` `secret` — **admin-only**. Hard cutover of `/seam attach`.
-- `bridge` (4), `debug` (3) — admin-only pairing / host debug
+- `bridge` (4), `debug` (6) — admin-only pairing / host debug (`voice-ping` / `voice-capture` / `voice-live` are the live-help spike)
 
 **Queue:** `/seam queue prompt:…` parks the next live turn (does not abort).
 Idle + host ready runs now. A later bare message still interrupts and

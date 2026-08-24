@@ -19,7 +19,7 @@ import {
  *     project  (3)  unchanged
  *     upload   (3)  pull push secret  — admin-only; hard cutover of /seam attach
  *     bridge   (4)  add rotate list remove  — admin-only pairing (#83/#86)
- *     debug    (3)  tail exec status        — admin-only even when SEAM_BRIDGE_DEV (#83)
+ *     debug    (6)  tail exec status voice-ping voice-capture voice-live — admin-only even when SEAM_BRIDGE_DEV (#83)
  */
 export function buildSeamCommand(): SlashCommandBuilder {
   const cmd = new SlashCommandBuilder()
@@ -639,7 +639,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
   cmd.addSubcommandGroup((g) =>
     g
       .setName("debug")
-      .setDescription("Admin-only: tail, exec, or status a paired bridge (dev-mode on the host)")
+      .setDescription("Admin-only: tail, exec, status a paired bridge, or live-help voice spike")
       .addSubcommand((sub) =>
         sub
           .setName("tail")
@@ -672,6 +672,21 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .addStringOption((o) =>
             o.setName("bridge").setDescription("Paired bridge id (default: all)").setRequired(false)
           )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("voice-ping")
+          .setDescription("Spike: join the test General VC, play a sample, leave")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("voice-capture")
+          .setDescription("Spike: join General, capture your voice to 16 kHz PCM, leave")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("voice-live")
+          .setDescription("Spike: capture in General, Gemini Live replies in the VC")
       )
   );
 
@@ -712,7 +727,10 @@ export type SeamSubcommand =
   | "remove"
   | "tail"
   | "exec"
-  | "status";
+  | "status"
+  | "voice-ping"
+  | "voice-capture"
+  | "voice-live";
 
 export function getSubcommand(
   i: ChatInputCommandInteraction

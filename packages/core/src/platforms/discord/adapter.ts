@@ -249,7 +249,7 @@ export function classifyDiscordInteraction(interaction: {
  * discord.js v14 chat adapter.
  *
  * Responsibilities:
- *  - connect with Guild + GuildMessages + MessageContent intents
+ *  - connect with Guild + GuildMessages + MessageContent + GuildVoiceStates intents
  *  - register `/seam` slash commands (guild-scoped if DEV guild set, global otherwise)
  *  - filter incoming messages: only thread messages, only the configured owner,
  *    only when the bot is in a thread it created (parent channel match optional)
@@ -287,6 +287,7 @@ export class DiscordAdapter implements ChatAdapter {
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildVoiceStates,
       ],
       partials: [Partials.Channel, Partials.Message],
     });
@@ -330,6 +331,105 @@ export class DiscordAdapter implements ChatAdapter {
     const ping = this.client.ws.ping;
     if (!Number.isFinite(ping) || ping < 0) return undefined;
     return Math.round(ping);
+  }
+
+  /**
+   * Live-help spike step 1: join the allowlisted test VC, play Kore.ogg, leave.
+   * Uses this adapter's Client — never a second bot login.
+   */
+  async playSpikeOgg(): Promise<string> {
+    const { spikePlayOgg } = await import("./voice-spike.js");
+    this.logger.info("voice spike play start");
+    const result = await spikePlayOgg({ client: this.client });
+    if (result.ok) {
+      this.logger.info(result, "voice spike play ok");
+      return `Played Kore.ogg in **${result.channelName}** (${result.playedMs}ms), then left.`;
+    }
+    this.logger.warn(result, "voice spike play failed");
+    return `Voice spike failed: ${result.reason}`;
+  }
+
+  /**
+   * Live-help spike step 2: join the test VC undeafened, capture one
+   * speaker to 16 kHz PCM, attach a listen-back clip, delete the pcm.
+   */
+  async playSpikeCapture(
+    preferUserId: string,
+    hooks?: { onListening?: () => void | Promise<void> }
+  ): Promise<{ text: string; ogg?: Buffer }> {
+    const { spikeCapturePcm } = await import("./voice-spike.js");
+    this.logger.info({ preferUserId }, "voice spike capture start");
+    const result = await spikeCapturePcm({
+      client: this.client,
+      preferUserId,
+      ...(hooks?.onListening ? { onListening: hooks.onListening } : {}),
+    });
+    if (result.ok) {
+      this.logger.info(
+        {
+          userId: result.userId,
+          pcmBytes: result.pcmBytes,
+          durationMs: result.durationMs,
+          peakPct: result.peakPct,
+        },
+        "voice spike capture ok"
+      );
+      return {
+        text:
+          `Captured <@${result.userId}> in **${result.channelName}**: ` +
+          `${result.durationMs}ms, ${result.pcmBytes} bytes PCM 16 kHz mono, ` +
+          `peak ${result.peakPct}%. PCM file written then deleted. Clip attached.`,
+        ogg: result.ogg,
+      };
+    }
+    this.logger.warn(result, "voice spike capture failed");
+    return { text: `Voice capture failed: ${result.reason}` };
+  }
+
+  /**
+   * Live-help spike step 4: capture → Gemini Live → play in the test VC.
+   */
+  async playSpikeLiveRoundTrip(
+    preferUserId: string,
+    hooks?: {
+      onListening?: () => void | Promise<void>;
+      onCaptured?: (info: { durationMs: number }) => void | Promise<void>;
+    }
+  ): Promise<{ text: string; ogg?: Buffer }> {
+    const { spikeLiveRoundTrip } = await import("./voice-spike.js");
+    this.logger.info({ preferUserId }, "voice spike live round-trip start");
+    const result = await spikeLiveRoundTrip({
+      client: this.client,
+      preferUserId,
+      apiKey: this.config.SEAM_GEMINI_API_KEY,
+      ...(hooks?.onListening ? { onListening: hooks.onListening } : {}),
+      ...(hooks?.onCaptured ? { onCaptured: hooks.onCaptured } : {}),
+    });
+    if (result.ok) {
+      this.logger.info(
+        {
+          userId: result.userId,
+          captureMs: result.captureMs,
+          replyMs: result.replyMs,
+          playedMs: result.playedMs,
+        },
+        "voice spike live round-trip ok"
+      );
+      const heard = result.inputTranscript ? ` Heard: "${result.inputTranscript}".` : "";
+      const said = result.outputTranscript ? ` Said: "${result.outputTranscript}".` : "";
+      return {
+        text:
+          `Live round-trip in **${result.channelName}** for <@${result.userId}>: ` +
+          `captured ${result.captureMs}ms (peak ${result.capturePeakPct}%), ` +
+          `Gemini replied ${result.replyMs}ms, played ${result.playedMs}ms.` +
+          heard +
+          said +
+          ` Clip attached.`,
+        ogg: result.ogg,
+      };
+    }
+    this.logger.warn(result, "voice spike live round-trip failed");
+    return { text: `Voice live round-trip failed: ${result.reason}` };
   }
 
   async stop(): Promise<void> {

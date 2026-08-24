@@ -109,14 +109,21 @@ describe("/seam slash command", () => {
     expect(names).not.toContain("config-audit");
   });
 
-  it("bridge group has add/rotate/list/remove; debug has tail/exec/status", () => {
+  it("bridge group has add/rotate/list/remove; debug has tail/exec/status/voice-ping/voice-capture/voice-live", () => {
     const json = built();
     const bridge = json.options?.find((o) => o.name === "bridge");
     expect(bridge?.type).toBe(SUB_COMMAND_GROUP);
     expect((bridge?.options ?? []).map((o) => o.name)).toEqual(["add", "rotate", "list", "remove"]);
     const debug = json.options?.find((o) => o.name === "debug");
     expect(debug?.type).toBe(SUB_COMMAND_GROUP);
-    expect((debug?.options ?? []).map((o) => o.name)).toEqual(["tail", "exec", "status"]);
+    expect((debug?.options ?? []).map((o) => o.name)).toEqual([
+      "tail",
+      "exec",
+      "status",
+      "voice-ping",
+      "voice-capture",
+      "voice-live",
+    ]);
     const add = (bridge?.options ?? []).find((o) => o.name === "add");
     const addNames = (add?.options ?? []).map((o) => o.name);
     expect(addNames[0]).toBe("name");

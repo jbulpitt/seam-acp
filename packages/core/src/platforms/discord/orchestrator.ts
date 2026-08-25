@@ -11665,7 +11665,13 @@ export class Orchestrator {
 
   private async openTtsEditor(i: ChatInputCommandInteraction): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
-    if (!channel || !i.channel?.isThread()) return;
+    if (!channel || !i.channel?.isThread()) {
+      await i.reply({
+        content: "Run this inside the thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     if (!this.adapter.sendPanel) {
       await i.reply({
         content: "This platform cannot render the TTS settings card.",
@@ -11673,6 +11679,9 @@ export class Orchestrator {
       });
       return;
     }
+    // Acknowledge first — evicting a prior card can exceed Discord's 3s window
+    // and surfaces as "The application did not respond".
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
     const threadId = i.channelId;
     const voice =
       resolveThreadTtsVoice(this.config, threadId) ?? this.config.SEAM_GEMINI_TTS_VOICE;
@@ -11698,9 +11707,11 @@ export class Orchestrator {
     if (evicted?.messageId) {
       await this.editTtsEditorCard(channel, evicted.messageId, renderTtsCancelled(evicted));
     }
-    await i.reply({ content: "Opening TTS settings…", flags: MessageFlags.Ephemeral });
     const ref = await this.adapter.sendPanel(channel, renderTtsHub(draft));
     this.ttsEditor.touch(draft.id, { messageId: ref.id });
+    await i.editReply({
+      content: "TTS settings card posted in the thread. Host Gemini key — no Google sign-in.",
+    });
   }
 
   private async editTtsEditorCard(

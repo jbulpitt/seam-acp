@@ -158,8 +158,9 @@ import {
   applyPickerValue,
   authorizeDraftClick,
   buildSavePlan,
-  currentThreadRiderText,
+  currentRiderText,
   decodeRiderUpload,
+  editScopeOf,
   isDirty,
   makeCustomId,
   parseCustomId,
@@ -2226,6 +2227,36 @@ export class Orchestrator {
       return false;
     }
     if (config.SEAM_CONFIG_ADMIN_USER_IDS?.has(invokerUserId)) return false;
+    return true;
+  }
+
+  /**
+   * Channel-preset writes from the visual editor. More privileged than a
+   * thread overlay: restricted participants never; when
+   * `SEAM_CONFIG_ADMIN_USER_IDS` is set, only those admins; a locked channel
+   * refuses everyone except a listed config admin (same as slash).
+   */
+  static canEditChannelPreset(
+    config: Pick<
+      Config,
+      "channelPresets" | "SEAM_CONFIG_ADMIN_USER_IDS" | "SEAM_PARTICIPANT_USER_IDS"
+    >,
+    userId: string,
+    channelId: string | undefined
+  ): boolean {
+    if (!channelId) return false;
+    if (
+      isRestrictedParticipant(
+        userId,
+        config.SEAM_PARTICIPANT_USER_IDS,
+        config.SEAM_CONFIG_ADMIN_USER_IDS
+      )
+    ) {
+      return false;
+    }
+    const admins = config.SEAM_CONFIG_ADMIN_USER_IDS;
+    if (admins && admins.size > 0 && !admins.has(userId)) return false;
+    if (isChannelLocked(config, channelId) && !admins?.has(userId)) return false;
     return true;
   }
 
@@ -8526,6 +8557,9 @@ export class Orchestrator {
     });
     const desc = this.router.describeConfig(record);
     const withoutThread = this.inheritedConfigFor(record);
+    const chan = channel.parentId
+      ? this.config.channelPresets.get(channel.parentId)
+      : undefined;
     const now = Date.now();
     const draft: ThreadConfigDraft = {
       id: randomUUID(),
@@ -8534,9 +8568,18 @@ export class Orchestrator {
       userId: i.user.id,
       createdAt: now,
       updatedAt: now,
-      snapshot: snapshotFromDescribe(desc, withoutThread),
+      snapshot: {
+        ...snapshotFromDescribe(desc, withoutThread),
+        channelPins: {
+          ...(chan?.agent?.value ? { agent: chan.agent.value } : {}),
+          ...(chan?.model?.value ? { model: chan.model.value } : {}),
+          ...(chan?.cwd?.value ? { cwd: chan.cwd.value } : {}),
+          ...(chan?.effort?.value ? { effort: chan.effort.value } : {}),
+        },
+      },
       overlay: {},
       warnings: [],
+      editScope: "thread",
     };
     const evicted = this.configEditor.put(draft);
     if (evicted?.messageId) {
@@ -8555,6 +8598,11 @@ export class Orchestrator {
     });
     const panel = renderHub(draft, {
       effortDisabled: this.effortDisabledFor(draft),
+      canEditChannel: Orchestrator.canEditChannelPreset(
+        this.config,
+        i.user.id,
+        channel.parentId
+      ),
     });
     const ref = await this.adapter.sendPanel(channel, panel);
     this.configEditor.touch(draft.id, { messageId: ref.id });
@@ -8596,8 +8644,12 @@ export class Orchestrator {
   }
 
   private effortDisabledFor(draft: ThreadConfigDraft): boolean {
-    const agentId =
-      draft.overlay.agent === undefined
+    const channelScope = editScopeOf(draft) === "channel";
+    const agentId = channelScope
+      ? draft.overlay.channelAgent === undefined
+        ? draft.snapshot.channelPins?.agent ?? draft.snapshot.withoutThread.agent
+        : draft.overlay.channelAgent ?? draft.snapshot.withoutThread.agent
+      : draft.overlay.agent === undefined
         ? draft.snapshot.agent.value
         : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
     const profile = this.router.getProfile(agentId);
@@ -8636,7 +8688,14 @@ export class Orchestrator {
 
   private async refreshConfigEditorHub(draft: ThreadConfigDraft): Promise<void> {
     if (!draft.messageId) return;
-    const panel = renderHub(draft, { effortDisabled: this.effortDisabledFor(draft) });
+    const panel = renderHub(draft, {
+      effortDisabled: this.effortDisabledFor(draft),
+      canEditChannel: Orchestrator.canEditChannelPreset(
+        this.config,
+        draft.userId,
+        draft.parentRef
+      ),
+    });
     await this.editConfigEditorCard(
       { platform: "discord", id: draft.threadId, ...(draft.parentRef ? { parentId: draft.parentRef } : {}) },
       draft.messageId,
@@ -8648,10 +8707,12 @@ export class Orchestrator {
     draft: ThreadConfigDraft,
     evt: ComponentEvent
   ): Promise<void> {
-    const text = currentThreadRiderText(draft);
+    const scope = editScopeOf(draft);
+    const text = currentRiderText(draft);
+    const noun = scope === "channel" ? "channel rider" : "thread rider";
     if (text == null || text.length === 0) {
       await evt
-        .followUpEphemeral("No thread rider to download. Use **Upload** to set one, then Save.")
+        .followUpEphemeral(`No ${noun} to download. Use **Upload** to set one, then Save.`)
         .catch(() => {});
       return;
     }
@@ -8661,9 +8722,12 @@ export class Orchestrator {
     }
     await this.adapter.sendFile(evt.channel, {
       data: Buffer.from(text, "utf8"),
-      filename: riderDownloadFilename(draft.threadId),
+      filename: riderDownloadFilename(
+        scope === "channel" ? (draft.parentRef ?? draft.threadId) : draft.threadId,
+        scope
+      ),
       mimeType: "text/markdown",
-      caption: "Thread rider (draft if you already edited). **Save** on the card to persist.",
+      caption: `${scope === "channel" ? "Channel" : "Thread"} rider (draft if you already edited). **Save** on the card to persist.`,
     });
   }
 
@@ -8707,7 +8771,7 @@ export class Orchestrator {
         .sendMessage(
           msg.channel,
           decoded.text == null
-            ? "📝 Rider upload is empty — draft will **inherit/clear** the thread rider. Click **Save** to apply."
+            ? `📝 Rider upload is empty — draft will **inherit/clear** the ${editScopeOf(draft) === "channel" ? "channel" : "thread"} rider. Click **Save** to apply.`
             : `📝 Rider loaded from \`${att.filename}\` (${decoded.text.length} chars). Click **Save** on the card to apply.`
         )
         .catch(() => {});
@@ -8762,6 +8826,25 @@ export class Orchestrator {
       await this.saveConfigEditorDraft(draft, evt);
       return;
     }
+    if (action === "scope") {
+      if (
+        !Orchestrator.canEditChannelPreset(this.config, evt.userId, draft.parentRef)
+      ) {
+        await evt.replyEphemeral(
+          "Channel-preset edits need a config admin (locked channels refuse non-admins)."
+        );
+        return;
+      }
+      await evt.deferUpdate();
+      const nextScope = editScopeOf(draft) === "channel" ? "thread" : "channel";
+      this.configEditor.touch(draft.id, {
+        editScope: nextScope,
+        awaitingRiderUpload: false,
+      });
+      const next = this.configEditor.get(draft.id) ?? { ...draft, editScope: nextScope };
+      await this.refreshConfigEditorHub(next);
+      return;
+    }
     if (action === "cancel") {
       await evt.deferUpdate();
       this.configEditor.delete(draft.id);
@@ -8782,7 +8865,7 @@ export class Orchestrator {
       await this.refreshConfigEditorHub(waiting);
       await evt
         .followUpEphemeral(
-          "Attach a `.md` or `.txt` file in this thread. It becomes the **draft** thread rider (Save still required). Empty file = inherit/clear. Cancel the editor to abort."
+          `Attach a \`.md\` or \`.txt\` file in this thread. It becomes the **draft** ${editScopeOf(draft) === "channel" ? "channel" : "thread"} rider (Save still required). Empty file = inherit/clear. Cancel the editor to abort.`
         )
         .catch(() => {});
       return;
@@ -8807,17 +8890,17 @@ export class Orchestrator {
         await this.pickConfigEditorField(draft, "rider", evt);
         return;
       }
-      const current =
-        draft.overlay.rider === undefined
-          ? draft.snapshot.rider.thread ?? ""
-          : draft.overlay.rider ?? "";
+      const current = currentRiderText(draft) ?? "";
+      const channelScope = editScopeOf(draft) === "channel";
       await evt.showModal({
         customId: makeCustomId(draft.id, "rider-save"),
-        title: "Thread rider",
+        title: channelScope ? "Channel rider" : "Thread rider",
         inputs: [
           {
             id: "rider",
-            label: "Thread rider (empty = inherit)",
+            label: channelScope
+              ? "Channel rider (empty = inherit)"
+              : "Thread rider (empty = inherit)",
             style: "paragraph",
             value: current.slice(0, RIDER_MODAL_MAX) || undefined,
             maxLength: RIDER_MODAL_MAX,
@@ -8855,7 +8938,17 @@ export class Orchestrator {
       if (!draft.parentRef) {
         await evt
           .followUpEphemeral(
-            "Could not save: this thread has no parent channel to pin a channel-wide card style on."
+            "Could not save: this thread has no parent channel to pin a channel-wide setting on."
+          )
+          .catch(() => {});
+        return;
+      }
+      if (
+        !Orchestrator.canEditChannelPreset(this.config, evt.userId, draft.parentRef)
+      ) {
+        await evt
+          .followUpEphemeral(
+            "Could not save: channel-preset edits need a config admin (locked channels refuse non-admins)."
           )
           .catch(() => {});
         return;
@@ -8920,10 +9013,13 @@ export class Orchestrator {
       ...(draft.parentRef ? { parentId: draft.parentRef } : {}),
     };
     const owner = new Set([draft.userId]);
+    const channelScope = editScopeOf(draft) === "channel";
     const inherit = {
       value: INHERIT_VALUE,
       label: "Inherit",
-      description: "Clear this thread's overlay",
+      description: channelScope
+        ? "Clear the channel-preset pin"
+        : "Clear this thread's overlay",
     };
 
     if (!this.adapter.sendChoicePicker && action !== "rider") {
@@ -9054,7 +9150,7 @@ export class Orchestrator {
       picked = await this.adapter.sendChoicePicker!(channel, {
         panel: {
           color: 0x5865f2,
-          title: "🃏 Status card",
+          title: channelScope ? "🃏 Channel status card" : "🃏 Status card",
           fields: [
             {
               name: "Current",
@@ -9063,36 +9159,40 @@ export class Orchestrator {
             },
           ],
         },
-        choices: [
-          inherit,
-          {
-            value: "full",
-            label: "full (this thread)",
-            description: "Repo, model, action, effort — overrides channel",
-          },
-          {
-            value: "simple",
-            label: "simple (this thread)",
-            description: "State + brand icon + thought — overrides channel",
-          },
-          {
-            value: "channel:full",
-            label: "full (channel)",
-            description: "Every thread inherits unless it overrides",
-          },
-          {
-            value: "channel:simple",
-            label: "simple (channel)",
-            description: "Every thread inherits unless it overrides",
-          },
-        ],
+        choices: channelScope
+          ? [
+              inherit,
+              {
+                value: "full",
+                label: "full (channel)",
+                description: "Every thread inherits unless it overrides",
+              },
+              {
+                value: "simple",
+                label: "simple (channel)",
+                description: "Every thread inherits unless it overrides",
+              },
+            ]
+          : [
+              inherit,
+              {
+                value: "full",
+                label: "full (this thread)",
+                description: "Repo, model, action, effort — overrides channel",
+              },
+              {
+                value: "simple",
+                label: "simple (this thread)",
+                description: "State + brand icon + thought — overrides channel",
+              },
+            ],
         authorizedUserIds: owner,
       });
     } else if (action === "gif") {
       picked = await this.adapter.sendChoicePicker!(channel, {
         panel: {
           color: 0x5865f2,
-          title: "🎞 Simple-card GIF",
+          title: channelScope ? "🎞 Channel simple-card GIF" : "🎞 Simple-card GIF",
           fields: [
             {
               name: "Current",
@@ -9101,29 +9201,33 @@ export class Orchestrator {
             },
           ],
         },
-        choices: [
-          inherit,
-          {
-            value: "on",
-            label: "on (this thread)",
-            description: "Random GIF thumbnail on the simple card",
-          },
-          {
-            value: "off",
-            label: "off (this thread)",
-            description: "No GIF — overrides channel",
-          },
-          {
-            value: "channel:on",
-            label: "on (channel)",
-            description: "Every thread inherits unless it overrides",
-          },
-          {
-            value: "channel:off",
-            label: "off (channel)",
-            description: "Every thread inherits unless it overrides",
-          },
-        ],
+        choices: channelScope
+          ? [
+              inherit,
+              {
+                value: "on",
+                label: "on (channel)",
+                description: "Every thread inherits unless it overrides",
+              },
+              {
+                value: "off",
+                label: "off (channel)",
+                description: "Every thread inherits unless it overrides",
+              },
+            ]
+          : [
+              inherit,
+              {
+                value: "on",
+                label: "on (this thread)",
+                description: "Random GIF thumbnail on the simple card",
+              },
+              {
+                value: "off",
+                label: "off (this thread)",
+                description: "No GIF — overrides channel",
+              },
+            ],
         authorizedUserIds: owner,
       });
     } else if (action === "attach") {
@@ -9150,13 +9254,19 @@ export class Orchestrator {
       picked = await this.adapter.sendChoicePicker!(channel, {
         panel: {
           color: 0x5865f2,
-          title: "📝 Thread rider",
+          title: channelScope ? "📝 Channel rider" : "📝 Thread rider",
           description:
             "This rider is too long for a Discord modal. Use **Download** / **Upload** on the hub, or Inherit/Clear here.",
           fields: [],
         },
         choices: [
-          { value: INHERIT_VALUE, label: "Inherit / Clear", description: "Remove the thread rider" },
+          {
+            value: INHERIT_VALUE,
+            label: "Inherit / Clear",
+            description: channelScope
+              ? "Remove the channel-preset rider"
+              : "Remove the thread rider",
+          },
         ],
         authorizedUserIds: owner,
       });

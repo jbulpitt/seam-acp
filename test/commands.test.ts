@@ -175,6 +175,8 @@ describe("/seam slash command", () => {
     expect(opts[1]?.autocomplete ?? false).toBe(false);
     expect(opts[2]?.type).toBe(INTEGER);
     expect(opts[2]?.required ?? false).toBe(false);
+    expect((opts[2] as Opt & { min_value?: number }).min_value).toBe(1);
+    expect((opts[2] as Opt & { max_value?: number }).max_value).toBe(9);
     for (const leaf of ["apply", "delete", "show", "edit"]) {
       const sub = (preset?.options ?? []).find((o) => o.name === leaf);
       const nameOpt = (sub?.options ?? []).find((o) => o.name === "name");

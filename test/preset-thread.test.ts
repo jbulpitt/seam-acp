@@ -764,6 +764,37 @@ describe("/seam preset thread quantity", () => {
     expect(replies[0]?.content).toMatch(/multiple threads need a preset slug/i);
   });
 
+  it("quantity 9 with an empty channel fills 1–9 and never a 10th", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const { orch, created } = makeOrch();
+    const { i, edits } = slashI({
+      group: "preset",
+      sub: "thread",
+      strings: { preset: "reviewer" },
+      ints: { quantity: 9 },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(created).toHaveLength(9);
+    expect(created.map((c) => c.name)).toEqual(
+      [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `🌌 hist ${formatKeycap(n)}`)
+    );
+    expect(edits[0]).toMatch(/Created 9 threads from preset \*\*reviewer\*\*/);
+    expect(edits[0]).not.toMatch(/limit/);
+  });
+
+  it("quantity above 9 is clamped to 9", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const { orch, created } = makeOrch();
+    const { i } = slashI({
+      group: "preset",
+      sub: "thread",
+      strings: { preset: "reviewer" },
+      ints: { quantity: 99 },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(created).toHaveLength(9);
+  });
+
   it("quantity > 1 ignores the name option and auto-numbers", async () => {
     store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
     const { orch, created } = makeOrch();

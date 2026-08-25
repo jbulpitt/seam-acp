@@ -21,6 +21,8 @@ import {
 } from "../../config.js";
 import type { Renderer } from "../renderer.js";
 import { serializePanelText } from "../renderer.js";
+import { choicePickerPageCaption } from "./choice-picker.js";
+import { paginatePresetList, PRESET_LIST_PAGE_SIZE } from "./preset-list.js";
 import type {
   ChatAdapter,
   ChannelRef,
@@ -13835,24 +13837,33 @@ export class Orchestrator {
     return `${scope} **${p.name}**${desc}${config}`;
   }
 
-  private buildPresetListMessage(projectRef: string | null): {
+  private buildPresetListMessage(
+    projectRef: string | null,
+    page = 0
+  ): {
     embeds: EmbedBuilder[];
     components: ActionRowBuilder<ButtonBuilder>[];
   } {
     const presets = this.store.listPresetsForProject(projectRef);
+    const slice = paginatePresetList(presets, page);
+    const caption = choicePickerPageCaption(
+      presets.length,
+      slice.page,
+      PRESET_LIST_PAGE_SIZE
+    );
+    const body = slice.items.length
+      ? slice.items.map((p) => this.presetSummaryLine(p)).join("\n\n")
+      : "_No presets in this project yet._";
     const embed = new EmbedBuilder()
       .setTitle("🎛️ Presets")
       .setColor(PRESET_COLOR)
       .setDescription(
-        (presets.length
-          ? presets.map((p) => this.presetSummaryLine(p)).join("\n\n")
-          : "_No presets in this project yet._") +
-          "\n\n_📁 this project · 🌐 global_"
+        [body, caption, "_📁 this project · 🌐 global_"].filter(Boolean).join("\n\n")
       );
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
-    // Discord caps a message at 5 action rows, so only the first 5 presets get
-    // inline buttons; the embed still lists them all.
-    for (const p of presets.slice(0, 5)) {
+    // Discord caps a message at 5 action rows. Four preset rows leave room
+    // for Prev / Page X/Y / Next when there is more than one page.
+    for (const p of slice.items) {
       components.push(
         new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder()
@@ -13870,6 +13881,27 @@ export class Orchestrator {
         )
       );
     }
+    if (slice.pageCount > 1) {
+      components.push(
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`pr:page:${slice.page - 1}`)
+            .setLabel("◀ Prev")
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(slice.page === 0),
+          new ButtonBuilder()
+            .setCustomId(`pr:page:${slice.page}`)
+            .setLabel(`Page ${slice.page + 1}/${slice.pageCount}`)
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(true),
+          new ButtonBuilder()
+            .setCustomId(`pr:page:${slice.page + 1}`)
+            .setLabel("Next ▶")
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(slice.page >= slice.pageCount - 1)
+        )
+      );
+    }
     return { embeds: [embed], components };
   }
 
@@ -13883,7 +13915,11 @@ export class Orchestrator {
       });
       return;
     }
-    await i.reply({ ...this.buildPresetListMessage(projectRef), flags: MessageFlags.Ephemeral });
+    let page = 0;
+    await i.reply({
+      ...this.buildPresetListMessage(projectRef, page),
+      flags: MessageFlags.Ephemeral,
+    });
     const msg = await i.fetchReply();
     const collector = msg.createMessageComponentCollector({
       filter: (c) => c.user.id === i.user.id,
@@ -13904,6 +13940,14 @@ export class Orchestrator {
         if (!c.isButton()) return;
         const [, action, id] = c.customId.split(":");
         if (!id) return;
+        if (action === "page") {
+          const requested = Number(id);
+          if (!Number.isFinite(requested)) return;
+          const remaining = this.store.listPresetsForProject(projectRef);
+          page = paginatePresetList(remaining, requested).page;
+          await c.update(this.buildPresetListMessage(projectRef, page));
+          return;
+        }
         const preset = this.store.getPreset(id);
         if (!preset) {
           await c.reply({
@@ -13937,7 +13981,9 @@ export class Orchestrator {
           await this.cmdPresetBuilder(c, preset);
         } else if (action === "del") {
           this.store.deletePreset(id);
-          await c.update(this.buildPresetListMessage(this.projectScopeId(c) ?? null));
+          const remaining = this.store.listPresetsForProject(projectRef);
+          page = paginatePresetList(remaining, page).page;
+          await c.update(this.buildPresetListMessage(projectRef, page));
         }
       } catch (err) {
         this.logger.warn({ err }, "preset-list button handler failed");

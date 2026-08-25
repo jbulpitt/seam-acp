@@ -111,6 +111,20 @@ describe("normalizeThreadSlug", () => {
     expect(normalizeThreadSlug("has space")).toBeNull();
     expect(normalizeThreadSlug("ok_name-2")).toBe("ok_name-2");
   });
+
+  it("accepts emoji and symbol slugs (whitespace still rejected)", () => {
+    expect(normalizeThreadSlug("🎨")).toBe("🎨");
+    expect(normalizeThreadSlug("🎨art")).toBe("🎨art");
+    expect(normalizeThreadSlug(" 🚀 ")).toBe("🚀");
+    expect(normalizeThreadSlug("🎨 🖌️")).toBeNull(); // internal whitespace
+  });
+
+  it("an emoji slug round-trips through naming + matching", () => {
+    const name = buildThreadName("🪐", "🎨", 3); // "🪐 🎨 3️⃣"
+    expect(nameContainsSlug(name, "🎨")).toBe(true);
+    expect(parseSlugThreadNumber(name, "🎨")).toBe(3);
+    expect(nextThreadNumber([name], "🎨")).toBe(1);
+  });
 });
 
 describe("resolveEffectiveSlug", () => {

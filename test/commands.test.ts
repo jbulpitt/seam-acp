@@ -222,6 +222,32 @@ describe("/seam slash command", () => {
     const thread = steer?.options?.find((o) => o.name === "thread");
     expect(thread?.type).toBe(STRING);
     expect(thread?.required ?? false).toBe(false);
+    expect(thread?.autocomplete).toBe(true);
+  });
+
+  it("enables autocomplete on bounded free-form ids (not on enum addChoices)", () => {
+    const json = built();
+    const config = json.options?.find((o) => o.name === "config");
+    const cfg = (name: string) => (config?.options ?? []).find((o) => o.name === name);
+    expect(cfg("model")?.options?.find((o) => o.name === "id")?.autocomplete).toBe(true);
+    expect(cfg("agent")?.options?.find((o) => o.name === "id")?.autocomplete).toBe(true);
+    expect(cfg("mode")?.options?.find((o) => o.name === "id")?.autocomplete).toBe(true);
+    expect(cfg("repo")?.options?.find((o) => o.name === "path")?.autocomplete).toBe(true);
+    expect(cfg("effort")?.options?.find((o) => o.name === "level")?.autocomplete ?? false).toBe(false);
+    expect(cfg("repo")?.options?.find((o) => o.name === "scope")?.autocomplete ?? false).toBe(false);
+
+    const schedule = json.options?.find((o) => o.name === "schedule");
+    for (const leaf of ["remove", "toggle", "addfile", "removefile", "edit"]) {
+      const sub = (schedule?.options ?? []).find((o) => o.name === leaf);
+      expect(sub?.options?.find((o) => o.name === "id")?.autocomplete, leaf).toBe(true);
+    }
+    const removefile = (schedule?.options ?? []).find((o) => o.name === "removefile");
+    expect(removefile?.options?.find((o) => o.name === "filename")?.autocomplete).toBe(true);
+
+    const workflows = json.options?.find((o) => o.name === "workflows");
+    for (const name of ["cancel-wake", "cancel-watch", "cancel-choice", "cancel-ingest", "cancel-live"]) {
+      expect(workflows?.options?.find((o) => o.name === name)?.autocomplete, name).toBe(true);
+    }
   });
 
   it("config repo path is optional so omitting it opens the picker", () => {

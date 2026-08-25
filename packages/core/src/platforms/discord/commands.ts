@@ -553,6 +553,12 @@ export function buildSeamCommand(): SlashCommandBuilder {
               )
               .setRequired(false)
           )
+          .addStringOption((o) =>
+            o
+              .setName("slug")
+              .setDescription("Thread slug for auto-numbered names (e.g. hist)")
+              .setRequired(false)
+          )
       )
       .addSubcommand((sub) =>
         sub

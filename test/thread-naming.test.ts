@@ -9,6 +9,7 @@ import {
   nextThreadNumber,
   parseKeycapNumber,
   parseSlugThreadNumber,
+  normalizeThreadSlug,
   resolveEffectiveSlug,
 } from "../packages/core/src/platforms/discord/thread-naming.js";
 
@@ -100,6 +101,15 @@ describe("isSlugNumberedName / isEmptyOrDefaultThreadName", () => {
     expect(isEmptyOrDefaultThreadName("New Thread")).toBe(true);
     expect(isEmptyOrDefaultThreadName("👾", "👾")).toBe(true);
     expect(isEmptyOrDefaultThreadName("my lab notes", "👾")).toBe(false);
+  });
+});
+
+describe("normalizeThreadSlug", () => {
+  it("trims and rejects empty or illegal tokens", () => {
+    expect(normalizeThreadSlug(" hist ")).toBe("hist");
+    expect(normalizeThreadSlug("")).toBeNull();
+    expect(normalizeThreadSlug("has space")).toBeNull();
+    expect(normalizeThreadSlug("ok_name-2")).toBe("ok_name-2");
   });
 });
 

@@ -740,6 +740,8 @@ const PresetValuesSchema = z.object({
   // Random GIF thumbnail on the simple status card. Channel value is inherited
   // live; a thread preset or session `/seam config gif` still wins.
   simpleCardGif: PresetFieldSchema(z.boolean()).optional(),
+  // Token used to auto-number sibling threads (`[abbr] [slug] [n-keycap]`).
+  threadSlug: PresetFieldSchema(z.string().min(1).max(32)).optional(),
 });
 
 const ChannelPresetSchema = PresetValuesSchema.extend({
@@ -838,6 +840,7 @@ export type PresetValues = {
   rider?: ChannelPresetField<string>;
   statusCardStyle?: ChannelPresetField<"full" | "simple">;
   simpleCardGif?: ChannelPresetField<boolean>;
+  threadSlug?: ChannelPresetField<string>;
 };
 export type ChannelPreset = PresetValues & { locked: boolean };
 export type ThreadPreset = PresetValues & {
@@ -933,6 +936,7 @@ export function resolveChannelPreset(
     cwd: thread?.cwd ?? chan?.cwd,
     effort: thread?.effort ?? chan?.effort,
     riders,
+    threadSlug: thread?.threadSlug ?? chan?.threadSlug,
   };
 }
 

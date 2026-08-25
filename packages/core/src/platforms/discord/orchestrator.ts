@@ -291,6 +291,7 @@ import {
 } from "../../core/audio/voice-notes.js";
 import { selectSpokenProse, shouldSpeakReply, speakReplyToOgg } from "../../core/audio/voice-replies.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
+import { normalizeThreadSlug } from "./thread-naming.js";
 import {
   CHOICE_CUSTOM_TEXT_MAX,
   choiceAuthoringRules,
@@ -8813,7 +8814,16 @@ export class Orchestrator {
           ...(chan?.model?.value ? { model: chan.model.value } : {}),
           ...(chan?.cwd?.value ? { cwd: chan.cwd.value } : {}),
           ...(chan?.effort?.value ? { effort: chan.effort.value } : {}),
+          ...(chan?.threadSlug?.value ? { threadSlug: chan.threadSlug.value } : {}),
         },
+        threadSlug: (() => {
+          const th = this.config.threadPresets.get(channel.id)?.threadSlug?.value;
+          if (th) return { value: th, source: "thread preset" as const };
+          if (chan?.threadSlug?.value) {
+            return { value: chan.threadSlug.value, source: "channel preset" as const };
+          }
+          return { value: null, source: "default" as const };
+        })(),
       },
       overlay: {},
       warnings: [],
@@ -8878,6 +8888,7 @@ export class Orchestrator {
           ? chan.statusCardStyle.value
           : "full",
       simpleCardGif: typeof chan?.simpleCardGif?.value === "boolean" ? chan.simpleCardGif.value : false,
+      threadSlug: chan?.threadSlug?.value ?? null,
     };
   }
 
@@ -9119,6 +9130,44 @@ export class Orchestrator {
       );
       this.configEditor.put(next);
       await this.refreshConfigEditorHub(next);
+      return;
+    }
+
+    if (action === "slug-save" || (evt.kind === "modal" && action === "slug-save")) {
+      await evt.deferUpdate();
+      const text = evt.fields?.slug ?? "";
+      const next = applyPickerValue(draft, "slug", text, this.capsForAgent);
+      this.configEditor.put(next);
+      await this.refreshConfigEditorHub(next);
+      return;
+    }
+
+    if (action === "slug") {
+      const channelScope = editScopeOf(draft);
+      const current =
+        channelScope
+          ? (draft.overlay.channelThreadSlug === undefined
+              ? draft.snapshot.channelPins?.threadSlug ?? ""
+              : draft.overlay.channelThreadSlug ?? "")
+          : (draft.overlay.threadSlug === undefined
+              ? draft.snapshot.threadSlug.value ?? ""
+              : draft.overlay.threadSlug ?? "");
+      await evt.showModal({
+        customId: makeCustomId(draft.id, "slug-save"),
+        title: channelScope ? "Channel thread slug" : "Thread slug",
+        inputs: [
+          {
+            id: "slug",
+            label: channelScope
+              ? "Slug (empty = inherit/clear)"
+              : "Slug (empty = inherit)",
+            style: "short",
+            value: String(current).slice(0, 32) || undefined,
+            maxLength: 32,
+            required: false,
+          },
+        ],
+      });
       return;
     }
 
@@ -14174,6 +14223,7 @@ export class Orchestrator {
     if (p.model) parts.push(`Model: ${p.model}`);
     if (p.effort) parts.push(`Effort: ${p.effort}`);
     if (p.repoPath) parts.push(`Repo: ${this.repoDisplay(p.repoPath)}`);
+    if (p.threadSlug) parts.push(`Slug: ${p.threadSlug}`);
     if (p.permission) parts.push(`Policy: ${p.permission}`);
     if (p.statusCardStyle) parts.push(`Card: ${p.statusCardStyle}`);
     if (p.toolsAllow?.length) parts.push(`Allow: ${p.toolsAllow.join(", ")}`);
@@ -14344,7 +14394,8 @@ export class Orchestrator {
     // makes it a global preset visible in every project.
     const global = i.options.getBoolean("global") ?? false;
     const createScope = global ? null : this.projectScopeId(i) ?? null;
-    await this.cmdPresetBuilder(i, undefined, createScope);
+    const seedSlug = i.options.getString("slug");
+    await this.cmdPresetBuilder(i, undefined, createScope, seedSlug);
   }
 
   private async cmdPresetEdit(i: ChatInputCommandInteraction): Promise<void> {
@@ -14364,7 +14415,8 @@ export class Orchestrator {
   private async cmdPresetBuilder(
     i: ChatInputCommandInteraction | MessageComponentInteraction,
     existing?: Preset,
-    createScope?: string | null
+    createScope?: string | null,
+    seedSlug?: string | null
   ): Promise<void> {
     const profiles = this.router.listProfiles();
 
@@ -14386,6 +14438,7 @@ export class Orchestrator {
       toolsExclude: string[] | null;
       instructions: string | null;
       statusCardStyle: StatusCardStyle | null;
+      threadSlug: string | null;
     } = {
       name: existing?.name ?? "",
       description: existing?.description ?? "",
@@ -14398,6 +14451,7 @@ export class Orchestrator {
       toolsExclude: existing?.toolsExclude ?? null,
       instructions: existing?.instructions ?? null,
       statusCardStyle: existing?.statusCardStyle ?? null,
+      threadSlug: existing?.threadSlug ?? normalizeThreadSlug(seedSlug ?? "") ?? null,
     };
 
     // Do not start an ACP session in this builder. staticModels first; agy
@@ -14445,6 +14499,7 @@ export class Orchestrator {
           { name: "🧠 Model", value: modelDisplay, inline: true },
           { name: "⚡ Effort", value: effortDisplay, inline: true },
           { name: "📂 Repo", value: repoDisplay, inline: true },
+          { name: "🔤 Slug", value: state.threadSlug ? `\`${state.threadSlug}\`` : "*(none)*", inline: true },
           { name: "🔒 Permission", value: permDisplay, inline: true },
           { name: "🃏 Status card", value: cardDisplay, inline: true },
           { name: "🔧 Tools", value: toolsDisplay },
@@ -14691,6 +14746,15 @@ export class Orchestrator {
                 .setMaxLength(4000)
                 .setValue(state.instructions ?? "")
                 .setRequired(false)
+            ),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(
+              new TextInputBuilder()
+                .setCustomId("slug")
+                .setLabel("Thread slug (auto-numbered names)")
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(32)
+                .setValue(state.threadSlug ?? "")
+                .setRequired(false)
             )
           );
           await c.showModal(modal);
@@ -14701,6 +14765,7 @@ export class Orchestrator {
             });
             state.name = submit.fields.getTextInputValue("name").trim();
             state.description = submit.fields.getTextInputValue("desc").trim();
+            state.threadSlug = normalizeThreadSlug(submit.fields.getTextInputValue("slug"));
             const permVal = submit.fields
               .getTextInputValue("permission")
               .trim()
@@ -14813,6 +14878,7 @@ export class Orchestrator {
             toolsExclude: state.toolsExclude,
             instructions: state.instructions,
             statusCardStyle: state.statusCardStyle,
+            threadSlug: state.threadSlug,
             createdBy: existing?.createdBy ?? i.user.id,
             createdUtc: existing?.createdUtc ?? now,
             updatedUtc: now,
@@ -15075,6 +15141,7 @@ export class Orchestrator {
         { name: "🧠 Model", value: preset.model ? `\`${preset.model}\`` : "*(default)*", inline: true },
         { name: "⚡ Effort", value: preset.effort ?? "*(default)*", inline: true },
         { name: "📂 Repo", value: preset.repoPath ? `\`${this.repoDisplay(preset.repoPath)}\`` : "*(default)*", inline: true },
+        { name: "🔤 Slug", value: preset.threadSlug ? `\`${preset.threadSlug}\`` : "*(none)*", inline: true },
         { name: "🔒 Permission", value: preset.permission ?? "*(default)*", inline: true },
         { name: "🃏 Status card", value: preset.statusCardStyle ?? "*(default)*", inline: true },
         { name: "🔧 Tools allow", value: preset.toolsAllow?.join(", ") || "*(all)*" },

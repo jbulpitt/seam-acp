@@ -1143,10 +1143,12 @@ export class DiscordAdapter implements ChatAdapter {
 
     const fields: Record<string, string> = {};
     if (isModal) {
-      try {
-        fields.rider = interaction.fields.getTextInputValue("rider");
-      } catch {
-        /* optional field */
+      for (const id of ["rider", "slug"]) {
+        try {
+          fields[id] = interaction.fields.getTextInputValue(id);
+        } catch {
+          /* optional field */
+        }
       }
     }
 

@@ -93,6 +93,14 @@ export function isEmptyOrDefaultThreadName(
   return false;
 }
 
+/** Trim; empty → null. Rejects whitespace and over-long values. */
+export function normalizeThreadSlug(raw: string | null | undefined): string | null {
+  const t = (raw ?? "").trim();
+  if (!t) return null;
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,31}$/.test(t)) return null;
+  return t;
+}
+
 /** DB preset slug, then thread-preset, then channel-preset. */
 export function resolveEffectiveSlug(opts: {
   presetSlug?: string | null;

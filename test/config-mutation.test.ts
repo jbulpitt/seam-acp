@@ -472,6 +472,29 @@ describe("statusCardStyle channel/thread overlay", () => {
     expect(live.threadPresets.get(THREAD)?.statusCardStyle?.value).toBe("full");
   });
 
+  it("applyChannelOverlay writes threadSlug without the Tier-C flag", () => {
+    const file = writePresetsFile({ channels: { [CHAN]: { model: { value: "old" } } } });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: false,
+      reloadPresets: () => reloadChannelPresets(live, file, silent),
+    });
+    const result = svc.applyChannelOverlay({
+      channelId: CHAN,
+      changes: { threadSlug: "hist" },
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.channels[CHAN].threadSlug).toEqual({ value: "hist" });
+    expect(live.channelPresets.get(CHAN)?.threadSlug?.value).toBe("hist");
+  });
+
   it("applyChannelOverlay writes cwd without the Tier-C flag", () => {
     const file = writePresetsFile({ channels: { [CHAN]: { model: { value: "old" } } } });
     const live = {

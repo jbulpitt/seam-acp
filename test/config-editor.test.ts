@@ -44,6 +44,7 @@ const WITHOUT: InheritedConfig = {
   detached: false,
   statusCardStyle: "full",
   simpleCardGif: false,
+  threadSlug: null,
 };
 
 function setting<T>(value: T, source: ConfigDescription["agent"]["source"]) {
@@ -61,6 +62,7 @@ function snapshot(over: Partial<ThreadConfigSnapshot> = {}): ThreadConfigSnapsho
     detached: setting(false, "default"),
     statusCardStyle: setting("full", "default"),
     simpleCardGif: setting(false, "default"),
+    threadSlug: setting(null, "default"),
     rider: {},
     locked: false,
     channelPins: {},
@@ -195,7 +197,7 @@ describe("hub render (#90)", () => {
     const rider = panel.fields.find((f) => f.name === "Rider")!.value;
     expect(rider).toMatch(/\(none\)/);
     expect(panel.footer).toMatch(/applies on the next turn/);
-    expect(panel.actions).toHaveLength(3);
+    expect(panel.actions).toHaveLength(4);
     expect(panel.actions![0].map((b) => b.label)).toEqual([
       "Host",
       "Agent",
@@ -217,6 +219,8 @@ describe("hub render (#90)", () => {
       "GIF",
       "Channel",
     ]);
+    expect(panel.actions![3].map((b) => b.label)).toEqual(["Slug"]);
+    expect(panel.fields.find((f) => f.name === "Slug")!.value).toMatch(/not set/);
     expect(panel.actions![2][0]!.disabled).toBe(true);
   });
 
@@ -330,6 +334,22 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
     expect(changes.model).toBeNull();
     expect(changes.rider).toBeNull();
     expect(changes).not.toHaveProperty("agent");
+  });
+
+  it("slug picker writes thread overlay; channel scope writes channel pin", () => {
+    const next = applyPickerValue(draft(), "slug", "hist", () => undefined);
+    expect(next.overlay.threadSlug).toBe("hist");
+    expect(dirtyThreadPresetChanges(next).threadSlug).toBe("hist");
+    expect(buildSavePlan(next).threadPreset.threadSlug).toBe("hist");
+
+    const ch = applyPickerValue(
+      draft({ editScope: "channel" }),
+      "slug",
+      "lab",
+      () => undefined
+    );
+    expect(ch.overlay.channelThreadSlug).toBe("lab");
+    expect(buildSavePlan(ch).channelPreset?.threadSlug).toBe("lab");
   });
 
   it("inherit of an already-unset thread field is not dirty", () => {

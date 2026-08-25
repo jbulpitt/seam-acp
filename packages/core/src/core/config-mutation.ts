@@ -108,6 +108,8 @@ export interface PresetChanges {
   instructions?: string | null;
   /** Status-card layout baked into this preset. `null` clears (preset does not pin it). */
   statusCardStyle?: StatusCardStyle | null;
+  /** Auto-numbering slug for `/seam preset thread`. `null` clears. */
+  threadSlug?: string | null;
 }
 
 /** Tier C — the calling thread's OWN channel preset (channel-presets.json).
@@ -124,6 +126,8 @@ export interface ChannelPresetChanges {
   statusCardStyle?: StatusCardStyle | null;
   /** Channel-wide simple-card GIF. Inherited live; session/thread overlay still wins. */
   simpleCardGif?: boolean | null;
+  /** Channel-wide thread slug for auto-numbered names. */
+  threadSlug?: string | null;
 }
 
 /** Tier C — the calling thread's OWN thread preset (channel-presets.json
@@ -149,6 +153,8 @@ export interface ThreadPresetChanges {
   statusCardStyle?: StatusCardStyle | null;
   /** Thread-preset simple-card GIF overlay. */
   simpleCardGif?: boolean | null;
+  /** Thread-preset slug; overrides the channel slug for this thread. */
+  threadSlug?: string | null;
   detached?: boolean;
   location?: string | null;
   tts?: boolean;
@@ -1019,6 +1025,12 @@ export class ConfigMutationService {
         nextStatusCardStyle = parsed;
       }
     }
+    const nextThreadSlug =
+      changes.threadSlug === null
+        ? null
+        : changes.threadSlug !== undefined
+          ? (changes.threadSlug.trim() || null)
+          : (existing?.threadSlug ?? null);
 
     if (nextEffort) {
       const profile = nextAgentId ? this.deps.profiles.get(nextAgentId) : undefined;
@@ -1048,6 +1060,7 @@ export class ConfigMutationService {
     field("toolsAllow", listStr(existing?.toolsAllow ?? null), listStr(nextToolsAllow));
     field("toolsExclude", listStr(existing?.toolsExclude ?? null), listStr(nextToolsExclude));
     field("statusCardStyle", existing?.statusCardStyle ?? null, nextStatusCardStyle);
+    field("threadSlug", existing?.threadSlug ?? null, nextThreadSlug);
     // instructions can be long/multiline — compare the FULL value so a change past
     // the clip point isn't hidden, but show only a clipped one-liner in the diff.
     if ((existing?.instructions ?? null) !== nextInstructions) {
@@ -1088,6 +1101,7 @@ export class ConfigMutationService {
           toolsExclude: nextToolsExclude,
           instructions: nextInstructions,
           statusCardStyle: nextStatusCardStyle,
+          threadSlug: nextThreadSlug,
           createdBy: existing?.createdBy ?? (actor.id ?? "seam-mcp"),
           createdUtc: existing?.createdUtc ?? now,
           updatedUtc: now,
@@ -1248,6 +1262,7 @@ export class ConfigMutationService {
       "rider",
       "statusCardStyle",
       "simpleCardGif",
+      "threadSlug",
     ];
     const fields: ProposedField[] = [];
     const next: Record<string, unknown> = { ...current };
@@ -1435,7 +1450,7 @@ export class ConfigMutationService {
     // The parent channel's entry, used ONLY to detect Trap-1 shadowing below.
     const channelEntry = parentRef ? doc.channels?.[parentRef] : undefined;
 
-    const keys = ["agent", "model", "cwd", "effort", "rider", "statusCardStyle", "simpleCardGif"] as const;
+    const keys = ["agent", "model", "cwd", "effort", "rider", "statusCardStyle", "simpleCardGif", "threadSlug"] as const;
     const fields: ProposedField[] = [];
     const warnings: string[] = [];
     const next: Record<string, unknown> = { ...current };
@@ -2043,6 +2058,7 @@ export class ConfigMutationService {
       permission: p.permission,
       description: p.description,
       repoPath: p.repoPath,
+      threadSlug: p.threadSlug ?? null,
       toolsAllow: p.toolsAllow,
       toolsExclude: p.toolsExclude,
       instructions: p.instructions,

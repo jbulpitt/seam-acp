@@ -162,6 +162,8 @@ interface Harness {
   inbox: Map<string, Array<{ fromRef: string | null; body: string; priority: boolean; createdUtc: string }>>;
   /** Every interrupt (#67) routed through the interruptRedirect dep. */
   interrupts: Array<{ caller: SessionRecord; to: string; message: string; fresh: boolean }>;
+  /** Every rename_thread routed through the renameThread dep. */
+  renames: Array<{ record: SessionRecord; name: string }>;
   call: (
     method: string,
     params?: unknown,
@@ -188,8 +190,11 @@ async function makeHarness(opts?: {
   pushInbox?: SeamMcpServerDeps["pushInbox"];
   drainInbox?: SeamMcpServerDeps["drainInbox"];
   interruptRedirect?: SeamMcpServerDeps["interruptRedirect"];
+  renameThread?: SeamMcpServerDeps["renameThread"];
   /** Omit the compact dep entirely (to test the "not supported" refusal). */
   disableCompact?: boolean;
+  /** Omit the renameThread dep (to test the "not supported" refusal). */
+  disableRename?: boolean;
   /** Omit the inbox deps entirely (to test the "not supported" refusal). */
   disableInbox?: boolean;
   /** Omit the interrupt dep entirely (to test the "not supported" refusal). */
@@ -205,6 +210,7 @@ async function makeHarness(opts?: {
   // drains the caller's own ref (deliver-once).
   const inbox: Harness["inbox"] = new Map();
   const interrupts: Harness["interrupts"] = [];
+  const renames: Harness["renames"] = [];
   const server = new SeamMcpServer({
     logger: silent,
     resolveSession:
@@ -325,6 +331,16 @@ async function makeHarness(opts?: {
               return { ok: true as const, cancelled: "cancelled" as const, fresh, dispatchId: "disp-int-1" };
             }),
         }),
+    ...(opts?.disableRename
+      ? {}
+      : {
+          renameThread:
+            opts?.renameThread ??
+            (async (record, name) => {
+              renames.push({ record, name });
+              return { ok: true as const };
+            }),
+        }),
   });
   await server.start();
   const port = server.port;
@@ -343,7 +359,7 @@ async function makeHarness(opts?: {
     return { status: res.status, body: text ? JSON.parse(text) : undefined };
   };
 
-  return { server, enqueued, scheduledWakes, cancelledWakes, createdWatches, cancelledWatches, inbox, interrupts, call };
+  return { server, enqueued, scheduledWakes, cancelledWakes, createdWatches, cancelledWatches, inbox, interrupts, renames, call };
 }
 
 describe("SeamMcpServer", () => {
@@ -363,6 +379,7 @@ describe("SeamMcpServer", () => {
     expect(body.result.capabilities).toEqual({ tools: {} });
     expect(body.result.serverInfo.name).toBe("seam-mcp");
     expect(typeof body.result.instructions).toBe("string");
+    expect(body.result.instructions).toMatch(/rename_thread\(name\)/);
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
 
@@ -386,6 +403,7 @@ describe("SeamMcpServer", () => {
       "handoff",
       "peek",
       "poll_inbox",
+      "rename_thread",
       "schedule_wake",
       "send",
       "steer",
@@ -480,8 +498,8 @@ describe("SeamMcpServer", () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
-    // Adding an OPTION to handoff does NOT change the tool count (#91/#95 grew the list).
-    expect(body.result.tools).toHaveLength(23);
+    // Adding an OPTION to handoff does NOT change the tool count (`rename_thread` grew the list).
+    expect(body.result.tools).toHaveLength(24);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -711,6 +729,50 @@ describe("SeamMcpServer", () => {
     );
     expect(body.result.isError).toBeFalsy();
     expect(h.cancelledWakes).toEqual(["wake-xyz"]);
+  });
+
+  it("rename_thread routes to the caller's own thread (free-form, self-scoped)", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "rename_thread", arguments: { name: "totally custom title" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.error).toBeUndefined();
+    expect(body.result.isError).toBeFalsy();
+    expect(h.renames).toHaveLength(1);
+    expect(h.renames[0]!.record.channelRef).toBe("thread-caller");
+    expect(h.renames[0]!.name).toBe("totally custom title");
+    expect(body.result.content[0].text).toContain("totally custom title");
+  });
+
+  it("rename_thread refuses a restricted participant and does not rename", async () => {
+    const STUDENT = "1534937951044112505";
+    const ADMIN = "1487094572696867019";
+    h = await makeHarness({
+      configAdminUserIds: new Set([ADMIN]),
+      configParticipantUserIds: new Set([STUDENT]),
+      currentSpeakerId: () => STUDENT,
+    });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "rename_thread", arguments: { name: "nope" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("That's an admin setting");
+    expect(h.renames).toHaveLength(0);
+  });
+
+  it("rename_thread surfaces a missing dep as not supported", async () => {
+    h = await makeHarness({ disableRename: true });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "rename_thread", arguments: { name: "x" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toMatch(/not supported/i);
   });
 
   it("cancel_wake reports when nothing was removed (#59)", async () => {
@@ -1199,8 +1261,8 @@ describe("SeamMcpServer", () => {
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
-    // Params on `send` must NOT add a tool — the set stays at 23 (#61/#62/#66/#73/#91/#95/#98).
-    expect(body.result.tools).toHaveLength(23);
+    // Params on `send` must NOT add a tool — the set stays at 24 (`rename_thread` included).
+    expect(body.result.tools).toHaveLength(24);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

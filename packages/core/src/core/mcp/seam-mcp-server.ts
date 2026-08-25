@@ -174,6 +174,11 @@ export interface SeamMcpServerDeps {
   /** Cancel a pending wake owned by the calling thread (#59). Returns whether a
    *  row was removed. Undefined ⇒ wakes are unsupported on this deployment. */
   cancelWake?: (record: SessionRecord, id: string) => boolean;
+  /** Rename the CALLER'S OWN thread. Free-form name. Undefined ⇒ unsupported. */
+  renameThread?: (
+    record: SessionRecord,
+    name: string
+  ) => Promise<{ ok: true } | { ok: false; error: string }>;
   /** Register a bridge-evaluated watch for the calling thread (#60). Returns the
    *  new watch id + expiry, or an error string surfaced verbatim. Undefined ⇒
    *  watches are unsupported on this deployment. */
@@ -613,6 +618,23 @@ const TOOLS = [
         },
       },
       required: ["prompt"],
+    },
+  },
+  {
+    name: "rename_thread",
+    description:
+      "Rename YOUR OWN Discord thread. Free-form `name` (not slug-enforced). Self-scoped: the " +
+      "target is always the calling session's thread, never another teammate. Restricted " +
+      "participants cannot rename.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "New thread title (max 100 characters).",
+        },
+      },
+      required: ["name"],
     },
   },
   {
@@ -1216,6 +1238,7 @@ const INSTRUCTIONS = [
   "  the woken turn to continue a loop. This is the working substrate for \"wake me in N minutes\"; the",
   "  native ScheduleWakeup / Monitor tools do NOT function here, so use this instead.",
   "- cancel_wake(wakeId): cancel a pending wake you scheduled.",
+  "- rename_thread(name): rename YOUR OWN thread (free-form title). Restricted participants cannot.",
   "- create_choice / cancel_choice / submit_result: frozen click-cards; HTTP ingest + declared JSON result. Participants cannot author. See docs/agent-guides/interactive-prompts.md.",
   "- create_ingest / cancel_ingest: headless HTTP endpoint (no Discord card). Isolated silent scoring, retries unlimited. Token once. Same POST /ingest + submit_result.",
   "- create_live_help / cancel_live_help: Gemini joins a Discord voice channel (audio↔audio). Parallel to this text session. Restricted participants cannot mint. See docs/agent-guides/live-help.md.",
@@ -1401,6 +1424,8 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolCompact(record, args));
         case "schedule_wake":
           return rpcResult(id, this.toolScheduleWake(record, args));
+        case "rename_thread":
+          return rpcResult(id, await this.toolRenameThread(record, args));
         case "cancel_wake":
           return rpcResult(id, this.toolCancelWake(record, args));
         case "watch_create":
@@ -1725,6 +1750,38 @@ export class SeamMcpServer {
         "if idle, handoff/forward start a turn directly. Never hand off to the entry marked YOU."
     );
     return textResult(lines.join("\n"));
+  }
+
+  /** Rename the caller's own thread. Self-scoped; restricted participants refused. */
+  private async toolRenameThread(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.renameThread) {
+      return textResult("thread rename is not supported on this deployment.", true);
+    }
+    const speakerIdForTier = this.deps.currentSpeakerId?.(caller);
+    if (
+      speakerIdForTier != null &&
+      isRestrictedParticipant(
+        speakerIdForTier,
+        this.deps.configParticipantUserIds,
+        this.deps.configAdminUserIds
+      )
+    ) {
+      this.logger.warn(
+        { session: caller.id, channel: caller.parentRef, speakerId: speakerIdForTier },
+        "seam-mcp rename_thread refused: speaker is a restricted participant"
+      );
+      return textResult(PARTICIPANT_CONFIG_REFUSAL, true);
+    }
+    const name = requireString(args, "name").slice(0, 100);
+    const result = await this.deps.renameThread(caller, name);
+    if (!result.ok) {
+      return textResult(`Could not rename this thread: ${result.error}`, true);
+    }
+    this.logger.info({ thread: caller.channelRef, name }, "seam-mcp rename_thread");
+    return textResult(`Renamed this thread to ${name}.`);
   }
 
   /** Schedule a one-shot wake for the calling thread (#59). Self-scope by

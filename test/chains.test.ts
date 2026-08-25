@@ -294,6 +294,7 @@ describe("chain MCP tool", () => {
       "handoff",
       "peek",
       "poll_inbox",
+      "rename_thread",
       "schedule_wake",
       "send",
       "steer",

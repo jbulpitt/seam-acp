@@ -553,6 +553,12 @@ export function buildSeamCommand(): SlashCommandBuilder {
               )
               .setRequired(false)
           )
+          .addStringOption((o) =>
+            o
+              .setName("slug")
+              .setDescription("Thread slug for auto-numbered names (e.g. hist)")
+              .setRequired(false)
+          )
       )
       .addSubcommand((sub) =>
         sub
@@ -608,16 +614,24 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setDescription("Create a new thread from a preset")
           .addStringOption((o) =>
             o
-              .setName("name")
-              .setDescription("Thread name (agent emoji is prefixed automatically)")
-              .setRequired(true)
-          )
-          .addStringOption((o) =>
-            o
               .setName("preset")
               .setDescription("Preset to apply to the new thread")
               .setRequired(true)
               .setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("name")
+              .setDescription("Thread name (omit to auto-number from the slug; ignored when quantity > 1)")
+              .setRequired(false)
+          )
+          .addIntegerOption((o) =>
+            o
+              .setName("quantity")
+              .setDescription("How many threads to create (default 1, max 9)")
+              .setRequired(false)
+              .setMinValue(1)
+              .setMaxValue(9)
           )
       )
   );

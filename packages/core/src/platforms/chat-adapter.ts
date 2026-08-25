@@ -87,6 +87,13 @@ export interface ChatAdapter {
   /** Optional: rename a thread (no-op on platforms that don't support it). */
   renameThread?(channel: ChannelRef, name: string): Promise<void>;
 
+  /**
+   * Optional: add a user to a thread so it appears in their channel list.
+   * Discord: PUT /channels/{thread}/thread-members/{user}. Throws on failure
+   * so the caller can fall back to a mention.
+   */
+  addThreadMember?(thread: ChannelRef, userId: string): Promise<void>;
+
   /** Optional: return the current display name of a thread/channel. */
   getThreadName?(channel: ChannelRef): Promise<string | undefined>;
 

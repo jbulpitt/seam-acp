@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS presets (
   model         TEXT,
   effort        TEXT,
   repo_path     TEXT,
+  thread_slug   TEXT,
   permission    TEXT,
   tools_json    TEXT,
   instructions  TEXT,
@@ -207,6 +208,7 @@ interface PresetRow {
   model: string | null;
   effort: string | null;
   repo_path: string | null;
+  thread_slug: string | null;
   permission: string | null;
   tools_json: string | null;
   instructions: string | null;
@@ -240,6 +242,7 @@ const mapPreset = (r: PresetRow): Preset => {
     model: r.model,
     effort: r.effort,
     repoPath: r.repo_path,
+    threadSlug: r.thread_slug,
     permission: r.permission as PermissionPolicyMode | null,
     toolsAllow,
     toolsExclude,
@@ -291,6 +294,16 @@ export class SessionStore {
     this.migrateInboxPriority();
     this.migratePresetStatusCardStyle();
     this.migratePresetsScope();
+    this.migratePresetThreadSlug();
+  }
+
+  /** Additive thread_slug on presets for auto-numbered thread names. */
+  private migratePresetThreadSlug(): void {
+    try {
+      this.db.exec("ALTER TABLE presets ADD COLUMN thread_slug TEXT");
+    } catch {
+      /* column already exists */
+    }
   }
 
   /** #96: additive status_card_style on presets. Null = preset does not pin it. */
@@ -732,11 +745,11 @@ export class SessionStore {
       .prepare(
         `INSERT INTO presets
            (id, name, project_ref, description, agent_id, model, effort,
-            repo_path, permission, tools_json, instructions, status_card_style,
+            repo_path, thread_slug, permission, tools_json, instructions, status_card_style,
             created_by, created_utc, updated_utc)
          VALUES
            (@id, @name, @projectRef, @description, @agentId, @model, @effort,
-            @repoPath, @permission, @toolsJson, @instructions, @statusCardStyle,
+            @repoPath, @threadSlug, @permission, @toolsJson, @instructions, @statusCardStyle,
             @createdBy, @createdUtc, @updatedUtc)
          ON CONFLICT(id) DO UPDATE SET
            name         = excluded.name,
@@ -746,6 +759,7 @@ export class SessionStore {
            model        = excluded.model,
            effort       = excluded.effort,
            repo_path    = excluded.repo_path,
+           thread_slug  = excluded.thread_slug,
            permission   = excluded.permission,
            tools_json   = excluded.tools_json,
            instructions = excluded.instructions,
@@ -761,6 +775,7 @@ export class SessionStore {
         model: p.model,
         effort: p.effort,
         repoPath: p.repoPath,
+        threadSlug: p.threadSlug ?? null,
         permission: p.permission,
         toolsJson,
         instructions: p.instructions,

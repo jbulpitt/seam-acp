@@ -882,6 +882,17 @@ export class DiscordAdapter implements ChatAdapter {
     }
   }
 
+  async addThreadMember(channel: ChannelRef, userId: string): Promise<void> {
+    try {
+      const ch = await this.client.channels.fetch(channel.id);
+      if (!ch?.isThread()) return;
+      await (ch as ThreadChannel).members.add(userId);
+    } catch (err) {
+      this.logger.warn({ err, channelId: channel.id, userId }, "addThreadMember failed");
+      throw err;
+    }
+  }
+
   async getThreadName(channel: ChannelRef): Promise<string | undefined> {
     try {
       const ch = await this.client.channels.fetch(channel.id);
@@ -1143,10 +1154,12 @@ export class DiscordAdapter implements ChatAdapter {
 
     const fields: Record<string, string> = {};
     if (isModal) {
-      try {
-        fields.rider = interaction.fields.getTextInputValue("rider");
-      } catch {
-        /* optional field */
+      for (const id of ["rider", "slug"]) {
+        try {
+          fields[id] = interaction.fields.getTextInputValue(id);
+        } catch {
+          /* optional field */
+        }
       }
     }
 

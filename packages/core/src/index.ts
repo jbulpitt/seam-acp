@@ -707,6 +707,24 @@ async function main(): Promise<void> {
       // `/seam steer now:true`. Suppresses the aborted handoff's report-back.
       interruptRedirect: (caller, to, message, fresh) =>
         orchestrator.interruptRedirect(caller, to, message, fresh),
+      renameThread: async (record, name) => {
+        if (!adapter.renameThread) {
+          return { ok: false, error: "This platform cannot rename threads." };
+        }
+        try {
+          await adapter.renameThread(
+            {
+              platform: record.platform,
+              id: record.channelRef,
+              ...(record.parentRef ? { parentId: record.parentRef } : {}),
+            },
+            name
+          );
+          return { ok: true };
+        } catch (err) {
+          return { ok: false, error: (err as Error).message };
+        }
+      },
     });
     await seamMcpServer.start();
     mcpHttpHandle = (req, res) => seamMcpServer!.handleRequest(req, res);

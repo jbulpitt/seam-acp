@@ -292,6 +292,17 @@ import {
 import { selectSpokenProse, shouldSpeakReply, speakReplyToOgg } from "../../core/audio/voice-replies.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
 import {
+  THREAD_LIMIT_MESSAGE,
+  THREAD_NUMBER_MAX,
+  buildThreadName,
+  isEmptyOrDefaultThreadName,
+  isSlugNumberedName,
+  nextThreadNumber,
+  normalizeThreadSlug,
+  parseSlugThreadNumber,
+  resolveEffectiveSlug,
+} from "./thread-naming.js";
+import {
   CHOICE_CUSTOM_TEXT_MAX,
   choiceAuthoringRules,
   choiceCardHideButtons,
@@ -7471,13 +7482,38 @@ export class Orchestrator {
   /**
    * Create a thread under the parent channel. Invoked inside a thread → sibling
    * (adapter.createThread walks up). Shared by `/seam new` and `/seam preset thread`.
+   * When `addUserId` is set, add that user to the new thread so it shows in
+   * their nav; on add failure, post a bare mention as fallback (happy path is silent).
    */
-  private async createChildThread(parentChannelId: string, name: string): Promise<ChannelRef> {
+  private async createChildThread(
+    parentChannelId: string,
+    name: string,
+    addUserId?: string
+  ): Promise<ChannelRef> {
     if (!this.adapter.createThread) {
       throw new Error("This platform does not support creating threads.");
     }
     const parent: ChannelRef = { platform: PLATFORM, id: parentChannelId };
-    return this.adapter.createThread(parent, name);
+    const thread = await this.adapter.createThread(parent, name);
+    if (addUserId && this.adapter.addThreadMember) {
+      try {
+        await this.adapter.addThreadMember(thread, addUserId);
+      } catch (err) {
+        this.logger.warn(
+          { err, thread: thread.id, userId: addUserId },
+          "addThreadMember failed; falling back to mention"
+        );
+        try {
+          await this.adapter.sendMessage(thread, `<@${addUserId}>`);
+        } catch (mentionErr) {
+          this.logger.warn(
+            { err: mentionErr, thread: thread.id },
+            "thread member mention fallback failed"
+          );
+        }
+      }
+    }
+    return thread;
   }
 
   /** Bind a session record to a just-created thread (same path as `/seam new`). */
@@ -7504,7 +7540,7 @@ export class Orchestrator {
       return;
     }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const thread = await this.createChildThread(i.channelId, name);
+    const thread = await this.createChildThread(i.channelId, name, i.user.id);
 
     // Auto-init: bind a session to the new thread and start the setup
     // flow so the user doesn't have to /seam config init themselves.
@@ -8813,7 +8849,16 @@ export class Orchestrator {
           ...(chan?.model?.value ? { model: chan.model.value } : {}),
           ...(chan?.cwd?.value ? { cwd: chan.cwd.value } : {}),
           ...(chan?.effort?.value ? { effort: chan.effort.value } : {}),
+          ...(chan?.threadSlug?.value ? { threadSlug: chan.threadSlug.value } : {}),
         },
+        threadSlug: (() => {
+          const th = this.config.threadPresets.get(channel.id)?.threadSlug?.value;
+          if (th) return { value: th, source: "thread preset" as const };
+          if (chan?.threadSlug?.value) {
+            return { value: chan.threadSlug.value, source: "channel preset" as const };
+          }
+          return { value: null, source: "default" as const };
+        })(),
       },
       overlay: {},
       warnings: [],
@@ -8878,6 +8923,7 @@ export class Orchestrator {
           ? chan.statusCardStyle.value
           : "full",
       simpleCardGif: typeof chan?.simpleCardGif?.value === "boolean" ? chan.simpleCardGif.value : false,
+      threadSlug: chan?.threadSlug?.value ?? null,
     };
   }
 
@@ -9119,6 +9165,44 @@ export class Orchestrator {
       );
       this.configEditor.put(next);
       await this.refreshConfigEditorHub(next);
+      return;
+    }
+
+    if (action === "slug-save" || (evt.kind === "modal" && action === "slug-save")) {
+      await evt.deferUpdate();
+      const text = evt.fields?.slug ?? "";
+      const next = applyPickerValue(draft, "slug", text, this.capsForAgent);
+      this.configEditor.put(next);
+      await this.refreshConfigEditorHub(next);
+      return;
+    }
+
+    if (action === "slug") {
+      const channelScope = editScopeOf(draft);
+      const current =
+        channelScope
+          ? (draft.overlay.channelThreadSlug === undefined
+              ? draft.snapshot.channelPins?.threadSlug ?? ""
+              : draft.overlay.channelThreadSlug ?? "")
+          : (draft.overlay.threadSlug === undefined
+              ? draft.snapshot.threadSlug.value ?? ""
+              : draft.overlay.threadSlug ?? "");
+      await evt.showModal({
+        customId: makeCustomId(draft.id, "slug-save"),
+        title: channelScope ? "Channel thread slug" : "Thread slug",
+        inputs: [
+          {
+            id: "slug",
+            label: channelScope
+              ? "Slug (empty = inherit/clear)"
+              : "Slug (empty = inherit)",
+            style: "short",
+            value: String(current).slice(0, 32) || undefined,
+            maxLength: 32,
+            required: false,
+          },
+        ],
+      });
       return;
     }
 
@@ -13941,6 +14025,98 @@ export class Orchestrator {
     );
   }
 
+  /** DB preset slug, else this thread's overlay, else the parent channel. */
+  private effectiveThreadSlug(opts: {
+    preset?: { threadSlug?: string | null } | null;
+    threadId?: string;
+    parentId?: string;
+  }): string | undefined {
+    return resolveEffectiveSlug({
+      presetSlug: opts.preset?.threadSlug,
+      threadSlug: opts.threadId
+        ? this.config.threadPresets.get(opts.threadId)?.threadSlug?.value
+        : undefined,
+      channelSlug: opts.parentId
+        ? this.config.channelPresets.get(opts.parentId)?.threadSlug?.value
+        : undefined,
+    });
+  }
+
+  /** Names of seam-bound sibling threads (same source as MCP `threads()`). */
+  private async listSiblingThreadNames(
+    parentRef: string,
+    excludeChannelRef?: string
+  ): Promise<string[]> {
+    const siblings = this.store.listSessionsByParent(PLATFORM, parentRef);
+    const names: string[] = [];
+    for (const s of siblings) {
+      if (excludeChannelRef && s.channelRef === excludeChannelRef) continue;
+      try {
+        const name = await this.adapter.getThreadName?.({
+          platform: s.platform,
+          id: s.channelRef,
+        });
+        if (name) names.push(name);
+      } catch {
+        /* skip a failed lookup */
+      }
+    }
+    return names;
+  }
+
+  /**
+   * After applying a preset, auto-number this thread from the effective slug.
+   * Keeps an existing `[slug] [n]` number; allocates only for empty/default
+   * names; never clobbers a custom title.
+   */
+  private async maybeRenameThreadForSlug(
+    channel: ChannelRef,
+    record: SessionRecord,
+    preset: Preset
+  ): Promise<string | undefined> {
+    if (!this.adapter.renameThread) return undefined;
+    if (!channel.parentId) return undefined;
+    const slug = this.effectiveThreadSlug({
+      preset,
+      threadId: channel.id,
+      parentId: channel.parentId,
+    });
+    if (!slug) return undefined;
+    const abbr = this.router.getProfile(record.agentId)?.threadAbbr;
+    let current: string | undefined;
+    try {
+      current = await this.adapter.getThreadName?.(channel);
+    } catch {
+      current = undefined;
+    }
+    if (current && isSlugNumberedName(current, slug)) {
+      const n = parseSlugThreadNumber(current, slug);
+      if (n === null) return undefined;
+      const next = buildThreadName(abbr, slug, n);
+      if (next !== current) {
+        try {
+          await this.adapter.renameThread(channel, next);
+        } catch (err) {
+          this.logger.warn({ err }, "slug rename failed");
+        }
+      }
+      return undefined;
+    }
+    if (!isEmptyOrDefaultThreadName(current, abbr)) return undefined;
+    const siblingNames = await this.listSiblingThreadNames(channel.parentId, channel.id);
+    const n = nextThreadNumber(siblingNames, slug);
+    if (n === null) {
+      return `⚠️ Couldn't auto-name this thread — ${THREAD_LIMIT_MESSAGE}`;
+    }
+    const next = buildThreadName(abbr, slug, n);
+    try {
+      await this.adapter.renameThread(channel, next);
+    } catch (err) {
+      this.logger.warn({ err }, "slug rename failed");
+    }
+    return undefined;
+  }
+
   /**
    * Rename a thread to "<repo-basename> [<agent-abbr>]" after setup.
    * Best-effort: silently skipped if the adapter, channel, or profile doesn't
@@ -14174,6 +14350,7 @@ export class Orchestrator {
     if (p.model) parts.push(`Model: ${p.model}`);
     if (p.effort) parts.push(`Effort: ${p.effort}`);
     if (p.repoPath) parts.push(`Repo: ${this.repoDisplay(p.repoPath)}`);
+    if (p.threadSlug) parts.push(`Slug: ${p.threadSlug}`);
     if (p.permission) parts.push(`Policy: ${p.permission}`);
     if (p.statusCardStyle) parts.push(`Card: ${p.statusCardStyle}`);
     if (p.toolsAllow?.length) parts.push(`Allow: ${p.toolsAllow.join(", ")}`);
@@ -14344,7 +14521,8 @@ export class Orchestrator {
     // makes it a global preset visible in every project.
     const global = i.options.getBoolean("global") ?? false;
     const createScope = global ? null : this.projectScopeId(i) ?? null;
-    await this.cmdPresetBuilder(i, undefined, createScope);
+    const seedSlug = i.options.getString("slug");
+    await this.cmdPresetBuilder(i, undefined, createScope, seedSlug);
   }
 
   private async cmdPresetEdit(i: ChatInputCommandInteraction): Promise<void> {
@@ -14364,7 +14542,8 @@ export class Orchestrator {
   private async cmdPresetBuilder(
     i: ChatInputCommandInteraction | MessageComponentInteraction,
     existing?: Preset,
-    createScope?: string | null
+    createScope?: string | null,
+    seedSlug?: string | null
   ): Promise<void> {
     const profiles = this.router.listProfiles();
 
@@ -14386,6 +14565,7 @@ export class Orchestrator {
       toolsExclude: string[] | null;
       instructions: string | null;
       statusCardStyle: StatusCardStyle | null;
+      threadSlug: string | null;
     } = {
       name: existing?.name ?? "",
       description: existing?.description ?? "",
@@ -14398,6 +14578,7 @@ export class Orchestrator {
       toolsExclude: existing?.toolsExclude ?? null,
       instructions: existing?.instructions ?? null,
       statusCardStyle: existing?.statusCardStyle ?? null,
+      threadSlug: existing?.threadSlug ?? normalizeThreadSlug(seedSlug ?? "") ?? null,
     };
 
     // Do not start an ACP session in this builder. staticModels first; agy
@@ -14445,6 +14626,7 @@ export class Orchestrator {
           { name: "🧠 Model", value: modelDisplay, inline: true },
           { name: "⚡ Effort", value: effortDisplay, inline: true },
           { name: "📂 Repo", value: repoDisplay, inline: true },
+          { name: "🔤 Slug", value: state.threadSlug ? `\`${state.threadSlug}\`` : "*(none)*", inline: true },
           { name: "🔒 Permission", value: permDisplay, inline: true },
           { name: "🃏 Status card", value: cardDisplay, inline: true },
           { name: "🔧 Tools", value: toolsDisplay },
@@ -14691,6 +14873,15 @@ export class Orchestrator {
                 .setMaxLength(4000)
                 .setValue(state.instructions ?? "")
                 .setRequired(false)
+            ),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(
+              new TextInputBuilder()
+                .setCustomId("slug")
+                .setLabel("Thread slug (auto-numbered names)")
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(32)
+                .setValue(state.threadSlug ?? "")
+                .setRequired(false)
             )
           );
           await c.showModal(modal);
@@ -14701,6 +14892,7 @@ export class Orchestrator {
             });
             state.name = submit.fields.getTextInputValue("name").trim();
             state.description = submit.fields.getTextInputValue("desc").trim();
+            state.threadSlug = normalizeThreadSlug(submit.fields.getTextInputValue("slug"));
             const permVal = submit.fields
               .getTextInputValue("permission")
               .trim()
@@ -14813,6 +15005,7 @@ export class Orchestrator {
             toolsExclude: state.toolsExclude,
             instructions: state.instructions,
             statusCardStyle: state.statusCardStyle,
+            threadSlug: state.threadSlug,
             createdBy: existing?.createdBy ?? i.user.id,
             createdUtc: existing?.createdUtc ?? now,
             updatedUtc: now,
@@ -14861,12 +15054,13 @@ export class Orchestrator {
   }
 
   /**
-   * `/seam preset thread` (#93): create a NEW thread under the parent channel
+   * `/seam preset thread` (#93): create NEW thread(s) under the parent channel
    * (sibling if invoked inside a thread — same path as `/seam new`) and bind
-   * the picked preset's full config onto that session.
+   * the picked preset's full config onto each session. `quantity` > 1 allocates
+   * sequential slug numbers without colliding in-loop and never exceeds 9.
    */
   private async cmdPresetThread(i: ChatInputCommandInteraction): Promise<void> {
-    const rawName = i.options.getString("name", true) ?? "";
+    const rawName = i.options.getString("name") ?? "";
     const presetName = (i.options.getString("preset", true) ?? "").trim();
     if (!presetName) {
       await i.reply({
@@ -14898,34 +15092,128 @@ export class Orchestrator {
       await i.reply({ content: "No channel.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const name = rawName.trim();
-    if (!name) {
+    const quantityRaw = i.options.getInteger("quantity");
+    const quantity =
+      typeof quantityRaw === "number" && Number.isInteger(quantityRaw)
+        ? Math.min(THREAD_NUMBER_MAX, Math.max(1, quantityRaw))
+        : 1;
+    // `name` is only honored for a single spawn.
+    const name = quantity === 1 ? rawName.trim() : "";
+    const parentId =
+      i.channel && "isThread" in i.channel && typeof i.channel.isThread === "function" && i.channel.isThread()
+        ? (typeof i.channel.parentId === "string" ? i.channel.parentId : i.channelId)
+        : i.channelId;
+    // New thread has no overlay yet — DB preset slug, else the parent channel's.
+    const slug = this.effectiveThreadSlug({
+      preset,
+      parentId,
+    });
+    const abbr = preset.agentId
+      ? this.router.getProfile(preset.agentId)?.threadAbbr
+      : undefined;
+
+    if (quantity > 1 && !slug) {
+      await i.reply({
+        content: "Multiple threads need a preset slug.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const plannedNames: string[] = [];
+    if (name) {
+      plannedNames.push(prefixThreadNameWithAgentEmoji(name, abbr));
+    } else if (slug) {
+      const used = await this.listSiblingThreadNames(parentId);
+      for (let k = 0; k < quantity; k++) {
+        const n = nextThreadNumber(used, slug);
+        if (n === null) break;
+        const threadName = buildThreadName(abbr, slug, n);
+        used.push(threadName);
+        plannedNames.push(threadName);
+      }
+      if (plannedNames.length === 0) {
+        await i.reply({
+          content:
+            quantity === 1
+              ? `Couldn't create the thread — ${THREAD_LIMIT_MESSAGE}`
+              : `Created 0 of ${quantity} — the limit (9) for this kind of thread was reached.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+    } else {
       await i.reply({
         content: "Give the new thread a name.",
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
+
     await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const abbr = preset.agentId
-      ? this.router.getProfile(preset.agentId)?.threadAbbr
-      : undefined;
-    const threadName = prefixThreadNameWithAgentEmoji(name, abbr);
+    const created: ChannelRef[] = [];
+    let lastSummary = "";
     try {
-      const thread = await this.createChildThread(i.channelId, threadName);
-      const record = this.bindSessionToThread(thread);
-      const summary = await this.applyPresetToSession(thread, record, preset);
-      await i.editReply(
-        `🧵 Created <#${thread.id}> from preset **${preset.name}**.\n${summary}`
-      );
+      for (const threadName of plannedNames) {
+        const thread = await this.createChildThread(i.channelId, threadName, i.user.id);
+        const record = this.bindSessionToThread(thread);
+        lastSummary = await this.applyPresetToSession(thread, record, preset);
+        this.startPresetOpeningTurn(thread, record, preset, i.user.id);
+        created.push(thread);
+      }
+      const hitLimit = plannedNames.length < quantity;
+      if (created.length === 1 && quantity === 1) {
+        await i.editReply(
+          `🧵 Created <#${created[0]!.id}> from preset **${preset.name}**.\n${lastSummary}`
+        );
+        return;
+      }
+      const links = created.map((t) => `• <#${t.id}>`).join("\n");
+      const header = hitLimit
+        ? `🧵 Created ${created.length} of ${quantity} from preset **${preset.name}** — the limit (9) for this kind of thread was reached.`
+        : `🧵 Created ${created.length} threads from preset **${preset.name}**:`;
+      await i.editReply(links ? `${header}\n${links}` : header);
     } catch (err) {
       this.logger.warn({ err }, "/seam preset thread failed");
       try {
-        await i.editReply(`Could not create the thread: ${(err as Error).message}`);
+        const links = created.map((t) => `• <#${t.id}>`).join("\n");
+        const prefix = created.length
+          ? `Created ${created.length} of ${quantity} before failing: ${(err as Error).message}`
+          : `Could not create the thread: ${(err as Error).message}`;
+        await i.editReply(links ? `${prefix}\n${links}` : prefix);
       } catch {
         /* already replied */
       }
     }
+  }
+
+  /**
+   * After `/seam preset thread` spawn + apply: if the preset has instructions,
+   * kick off a real first turn in the NEW thread. Raw `injectTurn(session:"live")`
+   * captures text and does not stream a status card; the synthetic IncomingMessage
+   * path is the equivalent user-turn pipeline (panel, streaming, permissions).
+   * Fire-and-forget so the slash reply is not held for the whole agent turn.
+   * Not used by `/seam preset apply`.
+   */
+  private startPresetOpeningTurn(
+    thread: ChannelRef,
+    _record: SessionRecord,
+    preset: Preset,
+    authorId: string
+  ): void {
+    const prompt = (preset.instructions ?? "").trim();
+    if (!prompt) return;
+    const synthetic: IncomingMessage = {
+      channel: thread,
+      authorId,
+      authorIsBot: false,
+      text: prompt,
+    };
+    void this.queueOnChannel(thread.id, () => this.handleIncomingMessageInner(synthetic)).catch(
+      (err) => {
+        this.logger.warn({ err, thread: thread.id }, "preset thread: opening turn failed");
+      }
+    );
   }
 
   /**
@@ -15051,6 +15339,10 @@ export class Orchestrator {
     // Drop the runtime so the next message picks up every change above.
     await this.router.invalidate(record.id);
 
+    const liveAfter = this.store.get(record.id) ?? record;
+    const renameNote = await this.maybeRenameThreadForSlug(channel, liveAfter, preset);
+    if (renameNote) notes.push(renameNote);
+
     const body =
       changes.length > 0
         ? changes.map((c) => `• ${c}`).join("\n")
@@ -15075,6 +15367,7 @@ export class Orchestrator {
         { name: "🧠 Model", value: preset.model ? `\`${preset.model}\`` : "*(default)*", inline: true },
         { name: "⚡ Effort", value: preset.effort ?? "*(default)*", inline: true },
         { name: "📂 Repo", value: preset.repoPath ? `\`${this.repoDisplay(preset.repoPath)}\`` : "*(default)*", inline: true },
+        { name: "🔤 Slug", value: preset.threadSlug ? `\`${preset.threadSlug}\`` : "*(none)*", inline: true },
         { name: "🔒 Permission", value: preset.permission ?? "*(default)*", inline: true },
         { name: "🃏 Status card", value: preset.statusCardStyle ?? "*(default)*", inline: true },
         { name: "🔧 Tools allow", value: preset.toolsAllow?.join(", ") || "*(all)*" },

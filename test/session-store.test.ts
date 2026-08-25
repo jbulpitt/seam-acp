@@ -193,6 +193,13 @@ describe("SessionStore project-scoped presets (#21)", () => {
     ...over,
   });
 
+  it("round-trips threadSlug", () => {
+    store.upsertPreset(preset({ id: "p-slug", name: "hist", threadSlug: "hist" }));
+    expect(store.getPreset("p-slug")?.threadSlug).toBe("hist");
+    store.upsertPreset(preset({ id: "p-slug", name: "hist", threadSlug: null }));
+    expect(store.getPreset("p-slug")?.threadSlug).toBeNull();
+  });
+
   it("round-trips projectRef (scoped and global)", () => {
     store.upsertPreset(preset({ id: "p1", name: "deploy", projectRef: "projA" }));
     store.upsertPreset(preset({ id: "p2", name: "review", projectRef: null }));

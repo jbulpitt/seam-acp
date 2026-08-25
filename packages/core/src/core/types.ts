@@ -103,6 +103,8 @@ export interface Preset {
   model: string | null;
   effort: string | null;
   repoPath: string | null;
+  /** Auto-numbering token for `/seam preset thread` names. Null = not set. */
+  threadSlug?: string | null;
   permission: PermissionPolicyMode | null;
   toolsAllow: string[] | null;
   toolsExclude: string[] | null;

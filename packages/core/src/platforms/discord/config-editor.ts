@@ -28,11 +28,13 @@ export type ConfigEditorAction =
   | "card"
   | "gif"
   | "rider"
+  | "slug"
   | "attach"
   | "save"
   | "cancel"
   | "scope"
   | "rider-save"
+  | "slug-save"
   | "rider-get"
   | "rider-put";
 
@@ -40,7 +42,7 @@ export type ConfigEditorAction =
 export type ConfigEditorScope = "thread" | "channel";
 
 export const HUB_FIELD_ACTIONS: ReadonlyArray<
-  Exclude<ConfigEditorAction, "save" | "cancel" | "scope" | "rider-save">
+  Exclude<ConfigEditorAction, "save" | "cancel" | "scope" | "rider-save" | "slug-save">
 > = [
   "host",
   "agent",
@@ -51,6 +53,7 @@ export const HUB_FIELD_ACTIONS: ReadonlyArray<
   "card",
   "gif",
   "rider",
+  "slug",
   "attach",
 ];
 
@@ -64,6 +67,7 @@ export interface InheritedConfig {
   detached: boolean;
   statusCardStyle: StatusCardStyle;
   simpleCardGif: boolean;
+  threadSlug: string | null;
 }
 
 export interface ThreadConfigSnapshot {
@@ -76,6 +80,7 @@ export interface ThreadConfigSnapshot {
   detached: ResolvedSetting<boolean>;
   statusCardStyle: ResolvedSetting<StatusCardStyle>;
   simpleCardGif: ResolvedSetting<boolean>;
+  threadSlug: ResolvedSetting<string | null>;
   rider: { channel?: string; thread?: string };
   locked: boolean;
   /** Raw channel-preset pins (unset = that field is not on the channel entry). */
@@ -91,6 +96,7 @@ export interface ChannelPresetPins {
   model?: string;
   cwd?: string;
   effort?: string | null;
+  threadSlug?: string;
 }
 
 /** Draft overlay. `null` means inherit (remove the thread overlay / session policy). */
@@ -114,6 +120,8 @@ export interface DraftOverlay {
   channelModel?: string | null;
   channelCwd?: string | null;
   channelEffort?: string | null;
+  threadSlug?: string | null;
+  channelThreadSlug?: string | null;
 }
 
 export interface ThreadConfigDraft {
@@ -187,6 +195,7 @@ export function snapshotFromDescribe(
     detached: d.detached,
     statusCardStyle: d.statusCardStyle ?? { value: "full", source: "default" },
     simpleCardGif: d.simpleCardGif ?? { value: false, source: "default" },
+    threadSlug: { value: null, source: "default" },
     rider: d.rider ?? {},
     locked: d.locked,
     channelPins: {},
@@ -211,6 +220,7 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
   riderChannel: string | undefined;
   statusCardStyle: StatusCardStyle;
   simpleCardGif: boolean;
+  threadSlug: string | null;
 } {
   const s = draft.snapshot;
   const o = draft.overlay;
@@ -228,6 +238,10 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
     riderChannel: o.channelRider === undefined ? s.rider.channel : o.channelRider ?? undefined,
     statusCardStyle: effectiveCardStyle(draft),
     simpleCardGif: effectiveGif(draft),
+    threadSlug:
+      o.threadSlug === undefined
+        ? s.threadSlug.value
+        : o.threadSlug ?? w.threadSlug,
   };
 }
 
@@ -372,6 +386,11 @@ export function dirtyThreadPresetChanges(draft: ThreadConfigDraft): ThreadPreset
     const next = o.rider;
     if (next !== current) changes.rider = next;
   }
+  if (o.threadSlug !== undefined) {
+    const current = threadOverlayValue(s.threadSlug) ?? null;
+    const next = o.threadSlug;
+    if (next !== current) changes.threadSlug = next;
+  }
   if (o.detached !== undefined) {
     const current = s.detached.value === true;
     if (o.detached !== current) changes.detached = o.detached;
@@ -481,6 +500,13 @@ export function dirtyChannelEffort(draft: ThreadConfigDraft): string | null | un
   );
 }
 
+export function dirtyChannelThreadSlug(draft: ThreadConfigDraft): string | null | undefined {
+  return dirtyChannelPin(
+    draft.overlay.channelThreadSlug,
+    draft.snapshot.channelPins?.threadSlug ?? null
+  );
+}
+
 export function isDirty(draft: ThreadConfigDraft): boolean {
   return (
     Object.keys(dirtyThreadPresetChanges(draft)).length > 0 ||
@@ -493,7 +519,8 @@ export function isDirty(draft: ThreadConfigDraft): boolean {
     dirtyChannelAgent(draft) !== undefined ||
     dirtyChannelModel(draft) !== undefined ||
     dirtyChannelCwd(draft) !== undefined ||
-    dirtyChannelEffort(draft) !== undefined
+    dirtyChannelEffort(draft) !== undefined ||
+    dirtyChannelThreadSlug(draft) !== undefined
   );
 }
 
@@ -665,6 +692,7 @@ export function renderHub(
       },
     ],
     row2,
+    [{ customId: makeCustomId(id, "slug"), label: "Slug", style: "secondary" }],
   ];
 
   const agentLine = channelScope
@@ -699,6 +727,17 @@ export function renderHub(
         draftNoteFor(o.channelCwd, "not set")
       )
     : fieldLine(code(s.cwd.value), sourceLabel(s.cwd.source), draftNoteFor(o.cwd, w.cwd));
+  const slugLine = channelScope
+    ? fieldLine(
+        code(pins.threadSlug),
+        pins.threadSlug ? "channel" : "default",
+        draftNoteFor(o.channelThreadSlug, "not set")
+      )
+    : fieldLine(
+        code(s.threadSlug.value),
+        sourceLabel(s.threadSlug.source),
+        draftNoteFor(o.threadSlug, w.threadSlug ?? "not set")
+      );
 
   return {
     color: 0x5865f2,
@@ -731,6 +770,11 @@ export function renderHub(
       {
         name: "Repo",
         value: trunc(cwdLine, 1024),
+        inline: true,
+      },
+      {
+        name: "Slug",
+        value: trunc(slugLine, 1024),
         inline: true,
       },
       {
@@ -873,6 +917,11 @@ export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
         ...(o.channelModel ? { model: o.channelModel } : {}),
         ...(o.channelCwd ? { cwd: o.channelCwd } : {}),
         ...(o.channelEffort ? { effort: o.channelEffort } : {}),
+        ...(o.channelThreadSlug ? { threadSlug: o.channelThreadSlug } : {}),
+      },
+      threadSlug: {
+        value: next.threadSlug,
+        source: layer(o.threadSlug, s.threadSlug.source),
       },
       withoutThread: {
         ...s.withoutThread,
@@ -882,6 +931,7 @@ export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
         ...(o.channelModel ? { model: o.channelModel } : {}),
         ...(o.channelCwd ? { cwd: o.channelCwd } : {}),
         ...(o.channelEffort !== undefined ? { effort: o.channelEffort } : {}),
+        ...(o.channelThreadSlug !== undefined ? { threadSlug: o.channelThreadSlug } : {}),
       },
     },
   };
@@ -1028,6 +1078,12 @@ export function applyPickerValue(
       if (channelScope) overlay.channelCwd = inherit ? null : value;
       else overlay.cwd = inherit ? null : value;
       break;
+    case "slug": {
+      const next = inherit || value === "" ? null : value.trim() || null;
+      if (channelScope) overlay.channelThreadSlug = next;
+      else overlay.threadSlug = next;
+      break;
+    }
     case "approve":
       if (channelScope) return draft;
       overlay.permission = inherit ? null : (value as PermissionPolicyMode);
@@ -1107,6 +1163,7 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
   const channelModel = dirtyChannelModel(draft);
   const channelCwd = dirtyChannelCwd(draft);
   const channelEffort = dirtyChannelEffort(draft);
+  const channelSlug = dirtyChannelThreadSlug(draft);
   if (
     channelCard !== undefined ||
     channelGif !== undefined ||
@@ -1114,7 +1171,8 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
     channelAgent !== undefined ||
     channelModel !== undefined ||
     channelCwd !== undefined ||
-    channelEffort !== undefined
+    channelEffort !== undefined ||
+    channelSlug !== undefined
   ) {
     plan.channelPreset = {
       ...(channelCard !== undefined ? { statusCardStyle: channelCard } : {}),
@@ -1124,6 +1182,7 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
       ...(channelModel !== undefined ? { model: channelModel } : {}),
       ...(channelCwd !== undefined ? { cwd: channelCwd } : {}),
       ...(channelEffort !== undefined ? { effort: channelEffort } : {}),
+      ...(channelSlug !== undefined ? { threadSlug: channelSlug } : {}),
     };
   }
   return plan;

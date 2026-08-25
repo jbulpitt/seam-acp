@@ -368,7 +368,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .addStringOption((o) =>
             o
               .setName("voice")
-              .setDescription("Gemini TTS voice (autocomplete; preview at aistudio.google.com/generate-speech)")
+              .setDescription("Gemini TTS voice (autocomplete; in-thread sample on the TTS card)")
               .setRequired(false)
               .setAutocomplete(true)
           )

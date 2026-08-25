@@ -8,7 +8,12 @@ import {
 } from "../packages/core/src/core/audio/gemini-tts.js";
 import { ttsSamplePath, TTS_SAMPLE_SCRIPT } from "../packages/core/src/core/audio/tts-samples.js";
 import { encodePcmToOggOpus } from "../packages/core/src/core/audio/pcm-to-opus.js";
-import { selectSpokenProse, shouldSpeakReply, TTS_MAX_CHARS } from "../packages/core/src/core/audio/voice-replies.js";
+import {
+  clipSpokenText,
+  selectSpokenProse,
+  shouldSpeakReply,
+  TTS_MAX_CHARS,
+} from "../packages/core/src/core/audio/voice-replies.js";
 
 const TTS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
 
@@ -89,6 +94,14 @@ describe("shouldSpeakReply", () => {
       speak: false,
       reason: "too-long",
     });
+  });
+
+  it("clips a long reply on a sentence boundary", () => {
+    const head = `${"word ".repeat(500)}Done. `;
+    const clipped = clipSpokenText(`${head}${"x".repeat(TTS_MAX_CHARS)}`);
+    expect(clipped.clipped).toBe(true);
+    expect(clipped.text.endsWith("Done.")).toBe(true);
+    expect(clipped.text.length).toBeLessThanOrEqual(TTS_MAX_CHARS);
   });
 
   it("skips when the turn already attached audio", () => {

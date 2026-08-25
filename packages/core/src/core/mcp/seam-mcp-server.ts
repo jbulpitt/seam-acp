@@ -985,7 +985,7 @@ const TOOLS = [
               type: "string",
               description:
                 "Gemini prebuilt TTS voice name (Kore, Puck, …). Empty string clears " +
-                "back to the env default. Preview: https://aistudio.google.com/generate-speech",
+                "back to the env default. Samples play on /seam config tts Voice…",
             },
             ttsPace: {
               type: "string",

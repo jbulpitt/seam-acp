@@ -7,6 +7,21 @@ import { encodePcmToOggOpus } from "./pcm-to-opus.js";
 
 export const TTS_MAX_CHARS = 4000;
 
+/** Keep a speakable prefix when the full reply exceeds {@link TTS_MAX_CHARS}. */
+export function clipSpokenText(text: string, max = TTS_MAX_CHARS): { text: string; clipped: boolean } {
+  const t = text.trim();
+  if (t.length <= max) return { text: t, clipped: false };
+  const slice = t.slice(0, max);
+  const cut = Math.max(
+    slice.lastIndexOf("\n"),
+    slice.lastIndexOf(". "),
+    slice.lastIndexOf("! "),
+    slice.lastIndexOf("? ")
+  );
+  const out = (cut >= max * 0.5 ? slice.slice(0, cut + 1) : slice).trim();
+  return { text: out, clipped: true };
+}
+
 export type SpeakSkipReason =
   | "disabled"
   | "no-key"

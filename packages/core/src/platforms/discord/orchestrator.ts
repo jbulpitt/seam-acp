@@ -128,7 +128,6 @@ import {
 import {
   findGeminiTtsVoice,
   geminiTtsVoiceChoices,
-  GEMINI_TTS_VOICE_PREVIEW_URL,
   GEMINI_TTS_VOICES,
   isTtsPace,
   isTtsStyle,
@@ -289,7 +288,12 @@ import {
   isVoiceNoteAttachment,
   withoutVoiceNotes,
 } from "../../core/audio/voice-notes.js";
-import { selectSpokenProse, shouldSpeakReply, speakReplyToOgg } from "../../core/audio/voice-replies.js";
+import {
+  clipSpokenText,
+  selectSpokenProse,
+  shouldSpeakReply,
+  speakReplyToOgg,
+} from "../../core/audio/voice-replies.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
 import {
   THREAD_LIMIT_MESSAGE,
@@ -11610,8 +11614,7 @@ export class Orchestrator {
       const known = findGeminiTtsVoice(voiceRaw);
       if (!known) {
         await i.reply({
-          content:
-            `Unknown voice \`${voiceRaw}\`. Pick from the autocomplete list, or preview at ${GEMINI_TTS_VOICE_PREVIEW_URL}`,
+          content: `Unknown voice \`${voiceRaw}\`. Pick from the autocomplete list, or open \`/seam config tts\` and use Voice… for an in-thread sample.`,
           flags: MessageFlags.Ephemeral,
         });
         return;
@@ -11655,7 +11658,7 @@ export class Orchestrator {
     await i.reply({
       content:
         `TTS **${on ? "on" : "off"}** — voice **${voiceLabel}**, pace \`${pace}\`, style \`${style}\`.\n` +
-        `Card: \`/seam config tts\` (no options). Preview: ${GEMINI_TTS_VOICE_PREVIEW_URL}`,
+        `Host Gemini key; you do not sign into Google. Card: \`/seam config tts\` (no options).`,
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -11744,6 +11747,10 @@ export class Orchestrator {
       model: this.config.SEAM_GEMINI_TTS_MODEL,
     });
     if (!sample.ok) {
+      this.logger.warn(
+        { err: sample.error, voice: voice.name, threadId: draft.threadId },
+        "tts voice sample failed"
+      );
       this.ttsEditor.touch(draft.id, { sampleStatus: "error", sampleError: sample.error });
       const failed = this.ttsEditor.get(draft.id) ?? draft;
       await this.refreshTtsEditor(failed);
@@ -12610,15 +12617,31 @@ export class Orchestrator {
     prose: string;
     alreadyHadAudio: boolean;
   }): Promise<void> {
+    const enabled = isThreadTtsEnabled(this.config, opts.threadId);
+    const clip = clipSpokenText(opts.prose);
     const decision = shouldSpeakReply({
-      enabled: isThreadTtsEnabled(this.config, opts.threadId),
+      enabled,
       apiKey: this.config.SEAM_GEMINI_API_KEY,
-      prose: opts.prose,
+      prose: clip.text,
       alreadyHadAudio: opts.alreadyHadAudio,
       turnOk: true,
     });
-    if (!decision.speak) return;
+    if (!decision.speak) {
+      if (enabled) {
+        this.logger.info(
+          { reason: decision.reason, threadId: opts.threadId, chars: opts.prose.trim().length },
+          "tts skip"
+        );
+      }
+      return;
+    }
     if (!this.adapter.sendFile) return;
+    if (clip.clipped) {
+      this.logger.info(
+        { threadId: opts.threadId, chars: opts.prose.trim().length, spoken: decision.text.length },
+        "tts clipped long reply"
+      );
+    }
     try {
       const spoken = await speakReplyToOgg({
         apiKey: this.config.SEAM_GEMINI_API_KEY,

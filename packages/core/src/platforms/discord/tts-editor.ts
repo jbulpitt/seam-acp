@@ -6,7 +6,6 @@ import type { StructuredPanel } from "../../core/types.js";
 import type { ThreadPresetChanges } from "../../core/config-mutation.js";
 import {
   GEMINI_TTS_VOICES,
-  GEMINI_TTS_VOICE_PREVIEW_URL,
   TTS_PACES,
   TTS_STYLES,
   type TtsPace,
@@ -195,7 +194,7 @@ export function renderTtsVoiceStep(draft: TtsEditorDraft): StructuredPanel {
   return {
     color: 0x5865f2,
     title: `🔊 Voice ${idx + 1}/${GEMINI_TTS_VOICES.length} — ${voice.name}`,
-    description: `**${voice.name}** — *${voice.style}*\n${sampleLine}\nPreview library: ${GEMINI_TTS_VOICE_PREVIEW_URL}`,
+    description: `**${voice.name}** — *${voice.style}*\n${sampleLine}\nSamples play on this card (host Gemini key — no Google sign-in).`,
     fields: [
       { name: "Style", value: voice.style, inline: true },
       { name: "This thread", value: selected ? "`selected`" : "`not selected`", inline: true },

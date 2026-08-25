@@ -93,11 +93,18 @@ export function isEmptyOrDefaultThreadName(
   return false;
 }
 
-/** Trim; empty → null. Rejects whitespace and over-long values. */
+/**
+ * Trim; empty → null. Accepts letters, numbers, punctuation AND emoji/symbols —
+ * the slug is a display token, so any non-whitespace text (including emoji) is
+ * allowed. Rejects internal whitespace (the naming
+ * `[abbr] [slug] [n]` and `nameContainsSlug` matching tokenize on whitespace, so
+ * the slug must be a single whitespace-free token), and caps length at 32.
+ */
 export function normalizeThreadSlug(raw: string | null | undefined): string | null {
   const t = (raw ?? "").trim();
   if (!t) return null;
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,31}$/.test(t)) return null;
+  if (/\s/.test(t)) return null; // single whitespace-free token only
+  if (t.length > 32) return null;
   return t;
 }
 

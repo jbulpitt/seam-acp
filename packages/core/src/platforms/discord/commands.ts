@@ -622,8 +622,16 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .addStringOption((o) =>
             o
               .setName("name")
-              .setDescription("Thread name (omit to auto-number from the slug)")
+              .setDescription("Thread name (omit to auto-number from the slug; ignored when quantity > 1)")
               .setRequired(false)
+          )
+          .addIntegerOption((o) =>
+            o
+              .setName("quantity")
+              .setDescription("How many threads to create (default 1, max 9)")
+              .setRequired(false)
+              .setMinValue(1)
+              .setMaxValue(9)
           )
       )
   );

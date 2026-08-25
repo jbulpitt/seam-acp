@@ -293,6 +293,7 @@ import { selectSpokenProse, shouldSpeakReply, speakReplyToOgg } from "../../core
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
 import {
   THREAD_LIMIT_MESSAGE,
+  THREAD_NUMBER_MAX,
   buildThreadName,
   isEmptyOrDefaultThreadName,
   isSlugNumberedName,
@@ -15028,9 +15029,10 @@ export class Orchestrator {
   }
 
   /**
-   * `/seam preset thread` (#93): create a NEW thread under the parent channel
+   * `/seam preset thread` (#93): create NEW thread(s) under the parent channel
    * (sibling if invoked inside a thread — same path as `/seam new`) and bind
-   * the picked preset's full config onto that session.
+   * the picked preset's full config onto each session. `quantity` > 1 allocates
+   * sequential slug numbers without colliding in-loop and never exceeds 9.
    */
   private async cmdPresetThread(i: ChatInputCommandInteraction): Promise<void> {
     const rawName = i.options.getString("name") ?? "";
@@ -15065,7 +15067,13 @@ export class Orchestrator {
       await i.reply({ content: "No channel.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const name = rawName.trim();
+    const quantityRaw = i.options.getInteger("quantity");
+    const quantity =
+      typeof quantityRaw === "number" && Number.isInteger(quantityRaw)
+        ? Math.min(THREAD_NUMBER_MAX, Math.max(1, quantityRaw))
+        : 1;
+    // `name` is only honored for a single spawn.
+    const name = quantity === 1 ? rawName.trim() : "";
     const parentId =
       i.channel && "isThread" in i.channel && typeof i.channel.isThread === "function" && i.channel.isThread()
         ? (typeof i.channel.parentId === "string" ? i.channel.parentId : i.channelId)
@@ -15078,20 +15086,37 @@ export class Orchestrator {
     const abbr = preset.agentId
       ? this.router.getProfile(preset.agentId)?.threadAbbr
       : undefined;
-    let threadName: string;
+
+    if (quantity > 1 && !slug) {
+      await i.reply({
+        content: "Multiple threads need a preset slug.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const plannedNames: string[] = [];
     if (name) {
-      threadName = prefixThreadNameWithAgentEmoji(name, abbr);
+      plannedNames.push(prefixThreadNameWithAgentEmoji(name, abbr));
     } else if (slug) {
-      const siblingNames = await this.listSiblingThreadNames(parentId);
-      const n = nextThreadNumber(siblingNames, slug);
-      if (n === null) {
+      const used = await this.listSiblingThreadNames(parentId);
+      for (let k = 0; k < quantity; k++) {
+        const n = nextThreadNumber(used, slug);
+        if (n === null) break;
+        const threadName = buildThreadName(abbr, slug, n);
+        used.push(threadName);
+        plannedNames.push(threadName);
+      }
+      if (plannedNames.length === 0) {
         await i.reply({
-          content: `Couldn't create the thread — ${THREAD_LIMIT_MESSAGE}`,
+          content:
+            quantity === 1
+              ? `Couldn't create the thread — ${THREAD_LIMIT_MESSAGE}`
+              : `Created 0 of ${quantity} — the limit (9) for this kind of thread was reached.`,
           flags: MessageFlags.Ephemeral,
         });
         return;
       }
-      threadName = buildThreadName(abbr, slug, n);
     } else {
       await i.reply({
         content: "Give the new thread a name.",
@@ -15099,22 +15124,71 @@ export class Orchestrator {
       });
       return;
     }
+
     await i.deferReply({ flags: MessageFlags.Ephemeral });
+    const created: ChannelRef[] = [];
+    let lastSummary = "";
     try {
-      const thread = await this.createChildThread(i.channelId, threadName);
-      const record = this.bindSessionToThread(thread);
-      const summary = await this.applyPresetToSession(thread, record, preset);
-      await i.editReply(
-        `🧵 Created <#${thread.id}> from preset **${preset.name}**.\n${summary}`
-      );
+      for (const threadName of plannedNames) {
+        const thread = await this.createChildThread(i.channelId, threadName);
+        const record = this.bindSessionToThread(thread);
+        lastSummary = await this.applyPresetToSession(thread, record, preset);
+        this.startPresetOpeningTurn(thread, record, preset, i.user.id);
+        created.push(thread);
+      }
+      const hitLimit = plannedNames.length < quantity;
+      if (created.length === 1 && quantity === 1) {
+        await i.editReply(
+          `🧵 Created <#${created[0]!.id}> from preset **${preset.name}**.\n${lastSummary}`
+        );
+        return;
+      }
+      const links = created.map((t) => `• <#${t.id}>`).join("\n");
+      const header = hitLimit
+        ? `🧵 Created ${created.length} of ${quantity} from preset **${preset.name}** — the limit (9) for this kind of thread was reached.`
+        : `🧵 Created ${created.length} threads from preset **${preset.name}**:`;
+      await i.editReply(links ? `${header}\n${links}` : header);
     } catch (err) {
       this.logger.warn({ err }, "/seam preset thread failed");
       try {
-        await i.editReply(`Could not create the thread: ${(err as Error).message}`);
+        const links = created.map((t) => `• <#${t.id}>`).join("\n");
+        const prefix = created.length
+          ? `Created ${created.length} of ${quantity} before failing: ${(err as Error).message}`
+          : `Could not create the thread: ${(err as Error).message}`;
+        await i.editReply(links ? `${prefix}\n${links}` : prefix);
       } catch {
         /* already replied */
       }
     }
+  }
+
+  /**
+   * After `/seam preset thread` spawn + apply: if the preset has instructions,
+   * kick off a real first turn in the NEW thread. Raw `injectTurn(session:"live")`
+   * captures text and does not stream a status card; the synthetic IncomingMessage
+   * path is the equivalent user-turn pipeline (panel, streaming, permissions).
+   * Fire-and-forget so the slash reply is not held for the whole agent turn.
+   * Not used by `/seam preset apply`.
+   */
+  private startPresetOpeningTurn(
+    thread: ChannelRef,
+    _record: SessionRecord,
+    preset: Preset,
+    authorId: string
+  ): void {
+    const prompt = (preset.instructions ?? "").trim();
+    if (!prompt) return;
+    const synthetic: IncomingMessage = {
+      channel: thread,
+      authorId,
+      authorIsBot: false,
+      text: prompt,
+    };
+    void this.queueOnChannel(thread.id, () => this.handleIncomingMessageInner(synthetic)).catch(
+      (err) => {
+        this.logger.warn({ err, thread: thread.id }, "preset thread: opening turn failed");
+      }
+    );
   }
 
   /**

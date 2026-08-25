@@ -5,6 +5,7 @@ import { buildSeamCommand } from "../packages/core/src/platforms/discord/command
 const SUB_COMMAND = 1;
 const SUB_COMMAND_GROUP = 2;
 const STRING = 3;
+const INTEGER = 4;
 const BOOLEAN = 5;
 
 type Opt = {
@@ -165,13 +166,15 @@ describe("/seam slash command", () => {
     expect(names).toEqual(["list", "create", "apply", "delete", "show", "edit", "thread"]);
     const thread = (preset?.options ?? []).find((o) => o.name === "thread");
     const opts = thread?.options ?? [];
-    expect(opts.map((o) => o.name)).toEqual(["preset", "name"]);
+    expect(opts.map((o) => o.name)).toEqual(["preset", "name", "quantity"]);
     expect(opts[0]?.type).toBe(STRING);
     expect(opts[0]?.required).toBe(true);
     expect(opts[0]?.autocomplete).toBe(true);
     expect(opts[1]?.type).toBe(STRING);
     expect(opts[1]?.required ?? false).toBe(false);
     expect(opts[1]?.autocomplete ?? false).toBe(false);
+    expect(opts[2]?.type).toBe(INTEGER);
+    expect(opts[2]?.required ?? false).toBe(false);
     for (const leaf of ["apply", "delete", "show", "edit"]) {
       const sub = (preset?.options ?? []).find((o) => o.name === leaf);
       const nameOpt = (sub?.options ?? []).find((o) => o.name === "name");

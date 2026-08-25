@@ -291,7 +291,16 @@ import {
 } from "../../core/audio/voice-notes.js";
 import { selectSpokenProse, shouldSpeakReply, speakReplyToOgg } from "../../core/audio/voice-replies.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
-import { normalizeThreadSlug } from "./thread-naming.js";
+import {
+  THREAD_LIMIT_MESSAGE,
+  buildThreadName,
+  isEmptyOrDefaultThreadName,
+  isSlugNumberedName,
+  nextThreadNumber,
+  normalizeThreadSlug,
+  parseSlugThreadNumber,
+  resolveEffectiveSlug,
+} from "./thread-naming.js";
 import {
   CHOICE_CUSTOM_TEXT_MAX,
   choiceAuthoringRules,
@@ -13990,6 +13999,98 @@ export class Orchestrator {
     );
   }
 
+  /** DB preset slug, else this thread's overlay, else the parent channel. */
+  private effectiveThreadSlug(opts: {
+    preset?: { threadSlug?: string | null } | null;
+    threadId?: string;
+    parentId?: string;
+  }): string | undefined {
+    return resolveEffectiveSlug({
+      presetSlug: opts.preset?.threadSlug,
+      threadSlug: opts.threadId
+        ? this.config.threadPresets.get(opts.threadId)?.threadSlug?.value
+        : undefined,
+      channelSlug: opts.parentId
+        ? this.config.channelPresets.get(opts.parentId)?.threadSlug?.value
+        : undefined,
+    });
+  }
+
+  /** Names of seam-bound sibling threads (same source as MCP `threads()`). */
+  private async listSiblingThreadNames(
+    parentRef: string,
+    excludeChannelRef?: string
+  ): Promise<string[]> {
+    const siblings = this.store.listSessionsByParent(PLATFORM, parentRef);
+    const names: string[] = [];
+    for (const s of siblings) {
+      if (excludeChannelRef && s.channelRef === excludeChannelRef) continue;
+      try {
+        const name = await this.adapter.getThreadName?.({
+          platform: s.platform,
+          id: s.channelRef,
+        });
+        if (name) names.push(name);
+      } catch {
+        /* skip a failed lookup */
+      }
+    }
+    return names;
+  }
+
+  /**
+   * After applying a preset, auto-number this thread from the effective slug.
+   * Keeps an existing `[slug] [n]` number; allocates only for empty/default
+   * names; never clobbers a custom title.
+   */
+  private async maybeRenameThreadForSlug(
+    channel: ChannelRef,
+    record: SessionRecord,
+    preset: Preset
+  ): Promise<string | undefined> {
+    if (!this.adapter.renameThread) return undefined;
+    if (!channel.parentId) return undefined;
+    const slug = this.effectiveThreadSlug({
+      preset,
+      threadId: channel.id,
+      parentId: channel.parentId,
+    });
+    if (!slug) return undefined;
+    const abbr = this.router.getProfile(record.agentId)?.threadAbbr;
+    let current: string | undefined;
+    try {
+      current = await this.adapter.getThreadName?.(channel);
+    } catch {
+      current = undefined;
+    }
+    if (current && isSlugNumberedName(current, slug)) {
+      const n = parseSlugThreadNumber(current, slug);
+      if (n === null) return undefined;
+      const next = buildThreadName(abbr, slug, n);
+      if (next !== current) {
+        try {
+          await this.adapter.renameThread(channel, next);
+        } catch (err) {
+          this.logger.warn({ err }, "slug rename failed");
+        }
+      }
+      return undefined;
+    }
+    if (!isEmptyOrDefaultThreadName(current, abbr)) return undefined;
+    const siblingNames = await this.listSiblingThreadNames(channel.parentId, channel.id);
+    const n = nextThreadNumber(siblingNames, slug);
+    if (n === null) {
+      return `⚠️ Couldn't auto-name this thread — ${THREAD_LIMIT_MESSAGE}`;
+    }
+    const next = buildThreadName(abbr, slug, n);
+    try {
+      await this.adapter.renameThread(channel, next);
+    } catch (err) {
+      this.logger.warn({ err }, "slug rename failed");
+    }
+    return undefined;
+  }
+
   /**
    * Rename a thread to "<repo-basename> [<agent-abbr>]" after setup.
    * Best-effort: silently skipped if the adapter, channel, or profile doesn't
@@ -14932,7 +15033,7 @@ export class Orchestrator {
    * the picked preset's full config onto that session.
    */
   private async cmdPresetThread(i: ChatInputCommandInteraction): Promise<void> {
-    const rawName = i.options.getString("name", true) ?? "";
+    const rawName = i.options.getString("name") ?? "";
     const presetName = (i.options.getString("preset", true) ?? "").trim();
     if (!presetName) {
       await i.reply({
@@ -14965,7 +15066,33 @@ export class Orchestrator {
       return;
     }
     const name = rawName.trim();
-    if (!name) {
+    const parentId =
+      i.channel && "isThread" in i.channel && typeof i.channel.isThread === "function" && i.channel.isThread()
+        ? (typeof i.channel.parentId === "string" ? i.channel.parentId : i.channelId)
+        : i.channelId;
+    // New thread has no overlay yet — DB preset slug, else the parent channel's.
+    const slug = this.effectiveThreadSlug({
+      preset,
+      parentId,
+    });
+    const abbr = preset.agentId
+      ? this.router.getProfile(preset.agentId)?.threadAbbr
+      : undefined;
+    let threadName: string;
+    if (name) {
+      threadName = prefixThreadNameWithAgentEmoji(name, abbr);
+    } else if (slug) {
+      const siblingNames = await this.listSiblingThreadNames(parentId);
+      const n = nextThreadNumber(siblingNames, slug);
+      if (n === null) {
+        await i.reply({
+          content: `Couldn't create the thread — ${THREAD_LIMIT_MESSAGE}`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      threadName = buildThreadName(abbr, slug, n);
+    } else {
       await i.reply({
         content: "Give the new thread a name.",
         flags: MessageFlags.Ephemeral,
@@ -14973,10 +15100,6 @@ export class Orchestrator {
       return;
     }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const abbr = preset.agentId
-      ? this.router.getProfile(preset.agentId)?.threadAbbr
-      : undefined;
-    const threadName = prefixThreadNameWithAgentEmoji(name, abbr);
     try {
       const thread = await this.createChildThread(i.channelId, threadName);
       const record = this.bindSessionToThread(thread);
@@ -15116,6 +15239,10 @@ export class Orchestrator {
 
     // Drop the runtime so the next message picks up every change above.
     await this.router.invalidate(record.id);
+
+    const liveAfter = this.store.get(record.id) ?? record;
+    const renameNote = await this.maybeRenameThreadForSlug(channel, liveAfter, preset);
+    if (renameNote) notes.push(renameNote);
 
     const body =
       changes.length > 0

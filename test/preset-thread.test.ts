@@ -7,6 +7,10 @@ import { MessageFlags } from "discord.js";
 import { Orchestrator, prefixThreadNameWithAgentEmoji } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { PARTICIPANT_CONFIG_REFUSAL } from "../packages/core/src/config.js";
+import {
+  THREAD_LIMIT_MESSAGE,
+  formatKeycap,
+} from "../packages/core/src/platforms/discord/thread-naming.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { Preset, SessionRecord } from "../packages/core/src/core/types.js";
 import type { ChannelRef } from "../packages/core/src/platforms/chat-adapter.js";
@@ -32,6 +36,7 @@ function preset(over: Partial<Preset> & { name: string }): Preset {
     model: over.model ?? "grok-4",
     effort: over.effort ?? "high",
     repoPath: over.repoPath ?? "/repo/special",
+    threadSlug: over.threadSlug ?? null,
     permission: over.permission ?? "ask",
     toolsAllow: over.toolsAllow ?? null,
     toolsExclude: over.toolsExclude ?? null,
@@ -113,14 +118,34 @@ function autocompleteI(over: {
   return { i, responded };
 }
 
+function sessionRow(over: { id: string; parentRef?: string; agentId?: string }): SessionRecord {
+  return {
+    id: `discord:${over.id}`,
+    platform: "discord",
+    channelRef: over.id,
+    parentRef: over.parentRef ?? "chan-1",
+    agentId: over.agentId ?? "grok",
+    acpSessionId: "",
+    repoPath: "/repo",
+    configJson: "{}",
+    createdUtc: now,
+    updatedUtc: now,
+  };
+}
+
 function makeOrch(over?: {
   createThread?: (parent: ChannelRef, name: string) => Promise<ChannelRef>;
   participantIds?: Set<string>;
   adminIds?: Set<string>;
   locked?: boolean;
   listPresetsForProject?: SessionStore["listPresetsForProject"];
+  channelPresets?: Map<string, { locked?: boolean; threadSlug?: { value: string } }>;
+  threadPresets?: Map<string, { threadSlug?: { value: string } }>;
+  threadNames?: Map<string, string>;
 }) {
   const created: Array<{ parent: ChannelRef; name: string }> = [];
+  const renamed: Array<{ id: string; name: string }> = [];
+  const threadNames = over?.threadNames ?? new Map<string, string>();
   const router = {
     listProfiles: () => [{ id: "grok", threadAbbr: "🌌" }, { id: "copilot", threadAbbr: "🤖🛢️" }],
     describeConfig: () => ({}),
@@ -162,9 +187,11 @@ function makeOrch(over?: {
     over?.createThread ??
     (async (parent: ChannelRef, name: string): Promise<ChannelRef> => {
       created.push({ parent, name });
+      const id = "thread-new";
+      threadNames.set(id, name);
       return {
         platform: "discord",
-        id: "thread-new",
+        id,
         parentId: parent.id.startsWith("thread") ? "chan-1" : parent.id,
       };
     });
@@ -179,15 +206,20 @@ function makeOrch(over?: {
       CHANNEL_PRESETS_FILE: undefined,
       SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
       REPO_EMOJIS: new Map(),
-      channelPresets: new Map(
-        over?.locked ? [["chan-1", { locked: true }]] : []
-      ),
-      threadPresets: new Map(),
+      channelPresets:
+        over?.channelPresets ??
+        new Map(over?.locked ? [["chan-1", { locked: true }]] : []),
+      threadPresets: over?.threadPresets ?? new Map(),
       SEAM_CONFIG_ADMIN_USER_IDS: over?.adminIds ?? new Set([ADMIN]),
       SEAM_PARTICIPANT_USER_IDS: over?.participantIds,
     } as any,
     adapter: {
       createThread,
+      getThreadName: async (ch: ChannelRef) => threadNames.get(ch.id),
+      renameThread: async (ch: ChannelRef, name: string) => {
+        renamed.push({ id: ch.id, name });
+        threadNames.set(ch.id, name);
+      },
     } as any,
     router: router as any,
     store: over?.listPresetsForProject
@@ -200,7 +232,7 @@ function makeOrch(over?: {
       : store,
     renderer: {} as any,
   });
-  return { orch, created, router };
+  return { orch, created, renamed, router, threadNames };
 }
 
 beforeEach(() => {
@@ -465,5 +497,180 @@ describe("preset thread autocomplete (#93)", () => {
     const { i, responded } = autocompleteI({ value: "rev" });
     await expect(orch.handleAutocompleteInteraction(i as any)).resolves.toBeUndefined();
     expect(responded[0]).toEqual([]);
+  });
+});
+
+function seedNamedSibling(id: string, name: string, names: Map<string, string>): void {
+  store.upsert(sessionRow({ id }));
+  names.set(id, name);
+}
+
+describe("/seam preset thread auto-name from slug", () => {
+  it("omit name + preset slug → [abbr] [slug] [1️⃣]", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const { orch, created } = makeOrch();
+    const { i, edits } = slashI({
+      group: "preset",
+      sub: "thread",
+      strings: { preset: "reviewer" },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(created).toHaveLength(1);
+    expect(created[0]!.name).toBe(`🌌 hist ${formatKeycap(1)}`);
+    expect(edits[0]).toMatch(/Created <#thread-new> from preset \*\*reviewer\*\*/);
+  });
+
+  it("fills the lowest unused number among slug-matching siblings ({1,2,3,4,6} → 5)", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const names = new Map<string, string>();
+    for (const n of [1, 2, 3, 4, 6]) {
+      seedNamedSibling(`sib-${n}`, `🌌 hist ${formatKeycap(n)}`, names);
+    }
+    seedNamedSibling("other", "custom title", names);
+    const { orch, created } = makeOrch({ threadNames: names });
+    const { i } = slashI({
+      group: "preset",
+      sub: "thread",
+      strings: { preset: "reviewer" },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(created[0]!.name).toBe(`🌌 hist ${formatKeycap(5)}`);
+  });
+
+  it("9 slug-matching threads already exist → friendly limit, no create", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const names = new Map<string, string>();
+    for (let n = 1; n <= 9; n++) {
+      seedNamedSibling(`sib-${n}`, `🌌 hist ${formatKeycap(n)}`, names);
+    }
+    const { orch, created } = makeOrch({ threadNames: names });
+    const { i, replies } = slashI({
+      group: "preset",
+      sub: "thread",
+      strings: { preset: "reviewer" },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(created).toHaveLength(0);
+    expect(replies[0]?.flags).toBe(MessageFlags.Ephemeral);
+    expect(replies[0]?.content).toContain(THREAD_LIMIT_MESSAGE);
+  });
+
+  it("omit name with no slug configured → require a name, no create", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok" }));
+    const { orch, created } = makeOrch();
+    const { i, replies } = slashI({
+      group: "preset",
+      sub: "thread",
+      strings: { preset: "reviewer" },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(created).toHaveLength(0);
+    expect(replies[0]?.flags).toBe(MessageFlags.Ephemeral);
+    expect(replies[0]?.content).toMatch(/Give the new thread a name/i);
+  });
+
+  it("channel-preset slug is used when the DB preset has none", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok" }));
+    const { orch, created } = makeOrch({
+      channelPresets: new Map([["chan-1", { threadSlug: { value: "lab" } }]]),
+    });
+    const { i } = slashI({
+      group: "preset",
+      sub: "thread",
+      strings: { preset: "reviewer" },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(created[0]!.name).toBe(`🌌 lab ${formatKeycap(1)}`);
+  });
+
+  it("DB preset slug wins over the channel-preset slug", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const { orch, created } = makeOrch({
+      channelPresets: new Map([["chan-1", { threadSlug: { value: "lab" } }]]),
+    });
+    const { i } = slashI({
+      group: "preset",
+      sub: "thread",
+      strings: { preset: "reviewer" },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(created[0]!.name).toBe(`🌌 hist ${formatKeycap(1)}`);
+  });
+
+  it("explicit name still wins when a slug is set (no auto-number)", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const { orch, created, renamed } = makeOrch();
+    const { i } = slashI({
+      group: "preset",
+      sub: "thread",
+      strings: { name: "review-pr", preset: "reviewer" },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(created[0]!.name).toBe("🌌 review-pr");
+    expect(renamed).toEqual([]);
+  });
+});
+
+describe("applyPresetToSession slug rename", () => {
+  it("empty/default name allocates the next number, excluding self", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const names = new Map<string, string>([["thread-1", "seam"]]);
+    store.upsert(sessionRow({ id: "thread-1" }));
+    seedNamedSibling("sib-1", `🌌 hist ${formatKeycap(1)}`, names);
+    seedNamedSibling("sib-2", `🌌 hist ${formatKeycap(2)}`, names);
+    const { orch, renamed } = makeOrch({ threadNames: names });
+    const summary = await (orch as any).applyPresetToSession(
+      { platform: "discord", id: "thread-1", parentId: "chan-1" },
+      store.get("discord:thread-1")!,
+      store.getPresetByNameScoped("reviewer", "chan-1")!
+    );
+    expect(renamed).toEqual([{ id: "thread-1", name: `🌌 hist ${formatKeycap(3)}` }]);
+    expect(summary).not.toMatch(/limit/);
+  });
+
+  it("keeps an existing [slug] [n] (reformats abbr, does not reallocate)", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const names = new Map<string, string>([["thread-1", `hist ${formatKeycap(3)}`]]);
+    store.upsert(sessionRow({ id: "thread-1" }));
+    for (const n of [1, 2, 4]) {
+      seedNamedSibling(`sib-${n}`, `🌌 hist ${formatKeycap(n)}`, names);
+    }
+    const { orch, renamed } = makeOrch({ threadNames: names });
+    await (orch as any).applyPresetToSession(
+      { platform: "discord", id: "thread-1", parentId: "chan-1" },
+      store.get("discord:thread-1")!,
+      store.getPresetByNameScoped("reviewer", "chan-1")!
+    );
+    expect(renamed).toEqual([{ id: "thread-1", name: `🌌 hist ${formatKeycap(3)}` }]);
+  });
+
+  it("does not clobber a custom non-matching name", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const names = new Map<string, string>([["thread-1", "my custom review"]]);
+    store.upsert(sessionRow({ id: "thread-1" }));
+    const { orch, renamed } = makeOrch({ threadNames: names });
+    await (orch as any).applyPresetToSession(
+      { platform: "discord", id: "thread-1", parentId: "chan-1" },
+      store.get("discord:thread-1")!,
+      store.getPresetByNameScoped("reviewer", "chan-1")!
+    );
+    expect(renamed).toEqual([]);
+  });
+
+  it("9 siblings taken + empty name → limit note, no rename", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const names = new Map<string, string>([["thread-1", "seam"]]);
+    store.upsert(sessionRow({ id: "thread-1" }));
+    for (let n = 1; n <= 9; n++) {
+      seedNamedSibling(`sib-${n}`, `🌌 hist ${formatKeycap(n)}`, names);
+    }
+    const { orch, renamed } = makeOrch({ threadNames: names });
+    const summary = await (orch as any).applyPresetToSession(
+      { platform: "discord", id: "thread-1", parentId: "chan-1" },
+      store.get("discord:thread-1")!,
+      store.getPresetByNameScoped("reviewer", "chan-1")!
+    );
+    expect(renamed).toEqual([]);
+    expect(summary).toContain(THREAD_LIMIT_MESSAGE);
   });
 });

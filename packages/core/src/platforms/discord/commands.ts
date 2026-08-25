@@ -614,16 +614,16 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setDescription("Create a new thread from a preset")
           .addStringOption((o) =>
             o
-              .setName("name")
-              .setDescription("Thread name (agent emoji is prefixed automatically)")
-              .setRequired(true)
-          )
-          .addStringOption((o) =>
-            o
               .setName("preset")
               .setDescription("Preset to apply to the new thread")
               .setRequired(true)
               .setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("name")
+              .setDescription("Thread name (omit to auto-number from the slug)")
+              .setRequired(false)
           )
       )
   );

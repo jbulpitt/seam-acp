@@ -220,6 +220,7 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
   riderChannel: string | undefined;
   statusCardStyle: StatusCardStyle;
   simpleCardGif: boolean;
+  threadSlug: string | null;
 } {
   const s = draft.snapshot;
   const o = draft.overlay;

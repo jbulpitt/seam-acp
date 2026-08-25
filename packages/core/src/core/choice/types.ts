@@ -14,9 +14,25 @@ export const CHOICE_TITLE_MAX = 256;
 export const CHOICE_LABEL_MAX = 80;
 export const CHOICE_CUSTOM_TEXT_MAX = 4000;
 
-/** Thin preamble bullet — same weight as seam-wake. Canonical how-to is the agent guide. */
+/** Fence-only authoring bullet — live turns that run emitClosedFence. */
+export const CHOICE_FENCE_RULE =
+  "To publish a frozen click-card in this thread, output a fenced block tagged `seam-choice` whose body is JSON `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }`. Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. For \"pick several of N\", add `select:{min,max}` — the card becomes a dropdown + Confirm and returns one combined prompt (all options must be prompt; not combinable with maxClicks>1). Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel.";
+
+/** MCP-only authoring bullet — sessions that actually have seam-mcp attached. */
+export const CHOICE_MCP_RULE =
+  "To publish a frozen click-card in this thread, call `create_choice` with `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }`. Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. For \"pick several of N\", add `select:{min,max}` — the card becomes a dropdown + Confirm and returns one combined prompt (all options must be prompt; not combinable with maxClicks>1). Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel.";
+
+/** Combined fence + MCP bullet when both capabilities are on. */
 export const CHOICE_AUTHORING_RULE =
   "To publish a frozen click-card in this thread, output a fenced block tagged `seam-choice` whose body is JSON `{ title, options:[{label, kind:\"prompt\"|\"custom\", payload?}] }` (or call `create_choice`). Default is live in THIS thread, one person, one pick — after they choose, the card shows the selection and buttons go away. For \"pick several of N\", add `select:{min,max}` — the card becomes a dropdown + Confirm and returns one combined prompt (all options must be prompt; not combinable with maxClicks>1). Set maxClicks > 1 only for multi-user. Destinations live|isolated|thread and HTTP ingest: docs/agent-guides/interactive-prompts.md. Participants may click; they cannot create or cancel.";
+
+/** Capability-driven choice ads (#108). Not keyed off agentId. */
+export function choiceAuthoringRules(opts: { fence?: boolean; mcp?: boolean }): string[] {
+  if (opts.fence && opts.mcp) return [CHOICE_AUTHORING_RULE];
+  if (opts.fence) return [CHOICE_FENCE_RULE];
+  if (opts.mcp) return [CHOICE_MCP_RULE];
+  return [];
+}
 
 /** MCP-less declared HTTP result (#92). Stripped like seam-choice. */
 export const RESULT_FENCE_LANG = "seam-result";

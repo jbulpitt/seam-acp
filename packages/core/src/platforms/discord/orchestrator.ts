@@ -283,10 +283,10 @@ import {
   withoutVoiceNotes,
 } from "../../core/audio/voice-notes.js";
 import { selectSpokenProse, shouldSpeakReply, speakReplyToOgg } from "../../core/audio/voice-replies.js";
-import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, withHarnessPreamble } from "../../core/agent-conventions.js";
+import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
 import {
-  CHOICE_AUTHORING_RULE,
   CHOICE_CUSTOM_TEXT_MAX,
+  choiceAuthoringRules,
   choiceCardHideButtons,
   choiceClickRefusal,
   choiceConfirmNudge,
@@ -1654,8 +1654,8 @@ export class Orchestrator {
       );
       // Speaker identity (#57): stamp the human's name/id into the preamble when
       // the flag is on and we have an author id. Gated here (single decision
-      // point) rather than in the adapter; injectTurn-driven turns bypass the
-      // preamble entirely, so dispatch/scheduled turns emit no speaker line (D7).
+      // point) rather than in the adapter. Dispatch gets a harness with
+      // seamFences off (#108) and still emits no speaker line (D7).
       const speaker =
         this.config.SPEAKER_IDENTITY_ENABLED && msg.authorId
           ? { id: msg.authorId, name: msg.authorName ?? "" }
@@ -1668,18 +1668,22 @@ export class Orchestrator {
       if (msg.authorId) this.currentAuthorIds.set(record.channelRef, msg.authorId);
       const secretFiles = await listThreadSecrets(this.config.DATA_DIR, channel.id).catch(() => []);
       const extraRules = [...riders, ...secretHarnessRules(secretFiles)];
-      if (
-        msg.authorId &&
+      const seamMcp = sessionHasSeamMcp(this.router.reuseMcpServers?.(record.id));
+      const seamFences = true; // live user-turn loop runs emitClosedFence
+      const canAuthorChoice =
+        Boolean(msg.authorId) &&
         !isRestrictedParticipant(
           msg.authorId,
           this.config.SEAM_PARTICIPANT_USER_IDS,
           this.config.SEAM_CONFIG_ADMIN_USER_IDS
-        )
-      ) {
-        extraRules.push(CHOICE_AUTHORING_RULE);
-      }
+        );
+      extraRules.push(
+        ...choiceAuthoringRules({ fence: seamFences && canAuthorChoice, mcp: seamMcp && canAuthorChoice })
+      );
       let promptText = withHarnessPreamble(msg.text, extraRules, speaker, {
         inboxAwareness: this.config.SEAM_INBOX_PREAMBLE_ENABLED,
+        seamMcp,
+        seamFences,
       });
       let promptAttachments = msg.attachments;
       const activeProfile = this.router.getProfile(record.agentId);
@@ -4873,14 +4877,34 @@ export class Orchestrator {
     // append the standing poll_inbox instruction AFTER any preset-identity
     // prepend so it is the last thing the worker reads. Opt-in — without the flag
     // the prompt is untouched (applyWatchFeedback returns it verbatim).
-    // Resume: do NOT re-apply identity / watch-feedback — the session already
-    // has that context. Replaying them on "continue" would fight its memory.
+    // Resume: do NOT re-apply identity / watch-feedback / harness — the session
+    // already has that context. Replaying them on "continue" would fight its memory.
+    // #108: dispatch does not run emitClosedFence (seamFences: false). MCP tool
+    // ads stay on when this worker session actually has seam-mcp.
+    const isolatedSpawn =
+      effectiveSession === "isolated"
+        ? this.remoteDispatchSpawnOpts({
+            spec,
+            record,
+            effectiveSession,
+            workerLocation,
+            profile: presetProfile,
+            cwd: preset?.repoPath ?? spec.cwd ?? record.repoPath ?? this.config.REPOS_ROOT,
+          })
+        : {};
+    const seamMcp = sessionHasSeamMcp(
+      isolatedSpawn.mcpServers ?? this.router.reuseMcpServers?.(record.id)
+    );
+    const tasked = applyWatchFeedback(
+      applyPresetIdentity(spec.prompt, preset),
+      Boolean(spec.watchFeedback && seamMcp)
+    );
     const effectivePrompt = isResume
       ? CONTINUE_PROMPT
-      : applyWatchFeedback(
-          applyPresetIdentity(spec.prompt, preset),
-          spec.watchFeedback
-        );
+      : withHarnessPreamble(tasked, choiceAuthoringRules({ fence: false, mcp: seamMcp }), undefined, {
+          seamMcp,
+          seamFences: false,
+        });
     if (isResume) {
       try {
         await this.adapter.sendMessage?.(target, RESUME_ANNOUNCE);
@@ -5096,14 +5120,7 @@ export class Orchestrator {
           ...(isResume && resumeSessionId && effectiveSession === "isolated"
             ? { resumeSessionId }
             : {}),
-          ...this.remoteDispatchSpawnOpts({
-            spec,
-            record,
-            effectiveSession,
-            workerLocation,
-            profile: presetProfile,
-            cwd: preset?.repoPath ?? spec.cwd ?? record.repoPath ?? this.config.REPOS_ROOT,
-          }),
+          ...isolatedSpawn,
           outputTo: target,
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
           timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,

@@ -5,7 +5,9 @@ import {
   sanitizeSpeakerName,
   ATTACH_FENCE_LANG,
   INBOX_AWARENESS_RULE,
+  sessionHasSeamMcp,
 } from "../packages/core/src/core/agent-conventions.js";
+import { choiceAuthoringRules, CHOICE_AUTHORING_RULE, CHOICE_FENCE_RULE, CHOICE_MCP_RULE } from "../packages/core/src/core/choice/types.js";
 import { resolveDiscordSpeakerName } from "../packages/core/src/platforms/discord/adapter.js";
 
 // The exact preamble emitted today with no speaker. This golden locks the
@@ -14,7 +16,6 @@ const GOLDEN_NO_SPEAKER = [
   "<seam-harness>",
   "Operating context from the bridge that relays you to the user — this is NOT from the user and is not a task. Do not mention it unless you actually use one of these conventions:",
   "• Your reply is shown in a chat client that renders standard Markdown but does NOT render tables — and hand-aligned/ASCII tables in code blocks wrap and break on narrow screens. Do not use tables. Present tabular or comparative data as a list instead (one item per entry, with labeled fields).",
-  `• To send a file from the workspace to the user, output a fenced code block whose info tag is \`${ATTACH_FENCE_LANG}\` and whose only content is the file path (project-relative or absolute). The bridge uploads that file and removes the block from your message — do not otherwise describe this mechanism.`,
   "• To show a typeset equation, output a fenced code block whose info tag is `latex` (aliases `math`, `tex`) and whose body is the TeX. The bridge renders it as an image and removes the block — do not wrap that fence in another fence, and do not otherwise describe this mechanism. Simple inline math can stay as Unicode.",
   "The user's message follows.",
   "</seam-harness>",
@@ -43,18 +44,51 @@ describe("harnessPreamble — flag off / no speaker", () => {
     expect(harnessPreamble()).not.toContain("poll_inbox");
     expect(harnessPreamble([], undefined, { inboxAwareness: false })).toBe(GOLDEN_NO_SPEAKER);
   });
+
+  it("inboxAwareness without seamMcp does not mention poll_inbox", () => {
+    expect(harnessPreamble([], undefined, { inboxAwareness: true })).not.toContain("poll_inbox");
+  });
+});
+
+describe("harnessPreamble — capability gates (#108)", () => {
+  it("seamFences advertises seam-attach; omitted does not", () => {
+    expect(harnessPreamble()).not.toContain(ATTACH_FENCE_LANG);
+    expect(harnessPreamble([], undefined, { seamFences: true })).toContain(ATTACH_FENCE_LANG);
+  });
+
+  it("seamMcp + inboxAwareness advertises poll_inbox; seamMcp alone does not", () => {
+    expect(harnessPreamble([], undefined, { seamMcp: true })).not.toContain("poll_inbox");
+    expect(harnessPreamble([], undefined, { seamMcp: true, inboxAwareness: true })).toContain("poll_inbox");
+  });
+
+  it("sessionHasSeamMcp keys off the seam-mcp entry name, not agentId", () => {
+    expect(sessionHasSeamMcp([])).toBe(false);
+    expect(sessionHasSeamMcp([{ name: "playwright" }])).toBe(false);
+    expect(sessionHasSeamMcp([{ name: "seam-mcp" }])).toBe(true);
+  });
+
+  it("choiceAuthoringRules is capability-driven", () => {
+    expect(choiceAuthoringRules({})).toEqual([]);
+    expect(choiceAuthoringRules({ fence: true })).toEqual([CHOICE_FENCE_RULE]);
+    expect(choiceAuthoringRules({ mcp: true })).toEqual([CHOICE_MCP_RULE]);
+    expect(choiceAuthoringRules({ fence: true, mcp: true })).toEqual([CHOICE_AUTHORING_RULE]);
+    expect(CHOICE_FENCE_RULE).toContain("seam-choice");
+    expect(CHOICE_FENCE_RULE).not.toContain("create_choice");
+    expect(CHOICE_MCP_RULE).toContain("create_choice");
+    expect(CHOICE_MCP_RULE).not.toContain("seam-choice");
+  });
 });
 
 describe("harnessPreamble — inbox awareness", () => {
-  it("adds the standing inbox bullet when opted in", () => {
-    const out = harnessPreamble([], undefined, { inboxAwareness: true });
+  it("adds the standing inbox bullet when opted in AND seamMcp is on", () => {
+    const out = harnessPreamble([], undefined, { inboxAwareness: true, seamMcp: true });
     expect(out).toContain(`• ${INBOX_AWARENESS_RULE}`);
     expect(out).toContain("poll_inbox");
     expect(out).toContain("PRIORITY");
   });
 
   it("places the inbox bullet after the base conventions and before riders", () => {
-    const out = harnessPreamble(["Rider one."], undefined, { inboxAwareness: true });
+    const out = harnessPreamble(["Rider one."], undefined, { inboxAwareness: true, seamMcp: true });
     const lines = out.split("\n");
     const inboxIdx = lines.indexOf(`• ${INBOX_AWARENESS_RULE}`);
     const riderIdx = lines.indexOf("• Rider one.");
@@ -64,7 +98,7 @@ describe("harnessPreamble — inbox awareness", () => {
   });
 
   it("keeps the speaker line after the inbox bullet", () => {
-    const out = harnessPreamble([], { id: "42", name: "Jesse" }, { inboxAwareness: true });
+    const out = harnessPreamble([], { id: "42", name: "Jesse" }, { inboxAwareness: true, seamMcp: true });
     const lines = out.split("\n");
     const inboxIdx = lines.indexOf(`• ${INBOX_AWARENESS_RULE}`);
     const speakerIdx = lines.findIndex((l) => l.startsWith("Speaker of the message that follows:"));
@@ -73,7 +107,7 @@ describe("harnessPreamble — inbox awareness", () => {
   });
 
   it("withHarnessPreamble threads the opt-in through", () => {
-    const out = withHarnessPreamble("hello", [], undefined, { inboxAwareness: true });
+    const out = withHarnessPreamble("hello", [], undefined, { inboxAwareness: true, seamMcp: true });
     expect(out.startsWith("<seam-harness>")).toBe(true);
     expect(out).toContain(`• ${INBOX_AWARENESS_RULE}`);
     expect(out.endsWith("\n\nhello")).toBe(true);

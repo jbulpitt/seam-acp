@@ -9,7 +9,7 @@ import { SessionStore } from "./core/session-store.js";
 import { SessionRouter } from "./core/session-router.js";
 import { makeCopilotProfile } from "@seam/adapters";
 import { makeClaudeProfile } from "@seam/adapters";
-import { makeAgyProfile } from "@seam/adapters";
+import { makeAgyProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
 import { makeOpencodeProfile, fetchLmStudioModels, syncOpencodeLmStudioConfig } from "@seam/adapters";
 import { makeCodexProfile } from "@seam/adapters";
 import { makeGrokProfile, fetchXaiModels } from "@seam/adapters";
@@ -180,7 +180,9 @@ async function main(): Promise<void> {
     threadAbbr: "🌌",
     dataDir: config.DATA_DIR,
     printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
+    mcpServers,
   });
+  scrubStaleGlobalSeamStdio();
 
   // Optional OpenAI Codex agent via @agentclientprotocol/codex-acp.
   const codex = config.CODEX_ENABLED

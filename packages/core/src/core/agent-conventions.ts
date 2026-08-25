@@ -101,17 +101,29 @@ export const INBOX_AWARENESS_RULE =
   "You have a pull-only inbox. Notes left for you (a human steer, another agent's `send`) are NOT in this prompt — call `poll_inbox` to drain them (start of turn, and at checkpoints if you may have been steered). Empty is normal. PRIORITY items come first: stop and reorient to them.";
 
 /** Extra standing-convention toggles. Speaker stays a separate arg because it
- *  is a fact about THIS turn, not a convention; these flags add bullets. */
+ *  is a fact about THIS turn, not a convention; these flags add bullets.
+ *  Capability-driven (#108): never key off agentId. */
 export interface HarnessOpts {
   inboxAwareness?: boolean;
+  /** Session actually has seam-mcp attached (injected mcpServers includes it). */
+  seamMcp?: boolean;
+  /** This turn's output path runs emitClosedFence (live yes, dispatch no). */
+  seamFences?: boolean;
+}
+
+/** True when the injected ACP mcpServers list includes the seam-mcp HTTP entry. */
+export function sessionHasSeamMcp(
+  servers: ReadonlyArray<{ name?: string }> | null | undefined
+): boolean {
+  return (servers ?? []).some((s) => s.name === "seam-mcp");
 }
 
 /**
  * The standing-conventions block. Kept tight — it rides every user turn.
  * `extraRules` appends additional bullets (e.g. a channel/thread preset
  * rider from CHANNEL_PRESETS_FILE) — it never replaces the base rules
- * above it; every caller gets the same table/attach-fence conventions plus
- * whatever's specific to their channel.
+ * above it; every caller gets the same table convention plus whatever
+ * capabilities this turn actually has.
  */
 export function harnessPreamble(
   extraRules: string[] = [],
@@ -122,11 +134,21 @@ export function harnessPreamble(
     "<seam-harness>",
     "Operating context from the bridge that relays you to the user — this is NOT from the user and is not a task. Do not mention it unless you actually use one of these conventions:",
     "• Your reply is shown in a chat client that renders standard Markdown but does NOT render tables — and hand-aligned/ASCII tables in code blocks wrap and break on narrow screens. Do not use tables. Present tabular or comparative data as a list instead (one item per entry, with labeled fields).",
-    `• To send a file from the workspace to the user, output a fenced code block whose info tag is \`${ATTACH_FENCE_LANG}\` and whose only content is the file path (project-relative or absolute). The bridge uploads that file and removes the block from your message — do not otherwise describe this mechanism.`,
-    "• To show a typeset equation, output a fenced code block whose info tag is `latex` (aliases `math`, `tex`) and whose body is the TeX. The bridge renders it as an image and removes the block — do not wrap that fence in another fence, and do not otherwise describe this mechanism. Simple inline math can stay as Unicode.",
-    ...(opts?.inboxAwareness ? [`• ${INBOX_AWARENESS_RULE}`] : []),
-    ...extraRules.map((rule) => `• ${rule}`),
   ];
+  if (opts?.seamFences) {
+    lines.push(
+      `• To send a file from the workspace to the user, output a fenced code block whose info tag is \`${ATTACH_FENCE_LANG}\` and whose only content is the file path (project-relative or absolute). The bridge uploads that file and removes the block from your message — do not otherwise describe this mechanism.`
+    );
+  }
+  lines.push(
+    "• To show a typeset equation, output a fenced code block whose info tag is `latex` (aliases `math`, `tex`) and whose body is the TeX. The bridge renders it as an image and removes the block — do not wrap that fence in another fence, and do not otherwise describe this mechanism. Simple inline math can stay as Unicode."
+  );
+  // poll_inbox is a seam-mcp TOOL. Advertise only when both the inbox
+  // preamble flag and actual MCP attachment are on.
+  if (opts?.inboxAwareness && opts?.seamMcp) {
+    lines.push(`• ${INBOX_AWARENESS_RULE}`);
+  }
+  lines.push(...extraRules.map((rule) => `• ${rule}`));
   // Speaker is a fact about THIS turn, not a standing convention (D3): its own
   // line, after the riders, immediately before the message. Omitted entirely
   // when no speaker is supplied so the flag-off output stays byte-identical.

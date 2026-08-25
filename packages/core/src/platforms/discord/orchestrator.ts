@@ -247,6 +247,12 @@ import type { SessionStore } from "../../core/session-store.js";
 import { makeSessionId } from "../../core/session-store.js";
 import { SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
 import type { CardGifCatalog } from "../../core/card-gifs.js";
+import {
+  deleteSimpleCardGifMessage,
+  isSimpleCardGifTerminal,
+  pickSimpleCardGifUrl,
+  postSimpleCardGifMessage,
+} from "../../core/simple-card-gif.js";
 import { ConfigMutationService, type ConfigMutationInput } from "../../core/config-mutation.js";
 import { reloadChannelPresets } from "../../core/config-reload.js";
 import type { ConfigProposeOutcome } from "../../core/mcp/seam-mcp-server.js";
@@ -1019,10 +1025,11 @@ export class Orchestrator {
     const brandAsset = loadBrandAsset(brand);
     const described = this.router.describeConfig(record);
     const cardStyle = statusCardStyleForRender(described);
-    const gifUrl =
-      cardStyle === "simple" && simpleCardGifForRender(described)
-        ? this.cardGifs?.randomGif() ?? undefined
-        : undefined;
+    const gifUrl = pickSimpleCardGifUrl({
+      style: cardStyle,
+      gifOn: simpleCardGifForRender(described),
+      randomGif: () => this.cardGifs?.randomGif() ?? null,
+    });
     const status = new TurnStatus({
       model: cfg.model ?? this.config.DEFAULT_MODEL,
       repoDisplay,
@@ -1030,7 +1037,6 @@ export class Orchestrator {
       style: cardStyle,
       ...(brandAsset ? { brandFilename: brandAsset.filename } : {}),
       authorName: turnProfile?.displayName ?? brand,
-      ...(gifUrl ? { gifUrl } : {}),
     });
 
     // Seed the status panel with the last-known usage from the previous turn,
@@ -1075,6 +1081,18 @@ export class Orchestrator {
     const statusMsg = this.adapter.sendPanel
       ? await this.adapter.sendPanel(channel, initialPanel)
       : await this.adapter.sendMessage(channel, serializePanelText(initialPanel));
+    // Standalone GIF: posted once, never edited (embed edits restart the
+    // animation). Deleted on Done/Failed/Timed out. Restart mid-turn may orphan.
+    let gifMsg: MessageRef | undefined;
+    if (gifUrl) {
+      gifMsg = await postSimpleCardGifMessage({
+        url: gifUrl,
+        sendPanel: this.adapter.sendPanel
+          ? (panel) => this.adapter.sendPanel!(channel, panel)
+          : undefined,
+        sendMessage: (text) => this.adapter.sendMessage(channel, text),
+      });
+    }
 
     let lastEdit = 0;
     let lastRendered = "";
@@ -2094,6 +2112,15 @@ export class Orchestrator {
         this.logger.warn({ err, channel: channel.id }, "secret consume failed")
       );
       await refresh(true);
+      if (isSimpleCardGifTerminal(status.state)) {
+        await deleteSimpleCardGifMessage({
+          ref: gifMsg,
+          deleteMessage: this.adapter.deleteMessage
+            ? (ref) => this.adapter.deleteMessage!(ref)
+            : undefined,
+        });
+        gifMsg = undefined;
+      }
       // #76: write the terminal state BEFORE removing the marker (writeDone
       // ordering). Skip if the command layer already finalized it as cancelled.
       if (this.liveTurnByChannel.get(channel.id) === liveMarkerId) {
@@ -5991,10 +6018,11 @@ export class Orchestrator {
     const destStyle: StatusCardStyle = destDescribed
       ? statusCardStyleForRender(destDescribed)
       : "full";
-    const dispatchGifUrl =
-      destStyle === "simple" && destDescribed && simpleCardGifForRender(destDescribed)
-        ? this.cardGifs?.randomGif() ?? undefined
-        : undefined;
+    const dispatchGifUrl = pickSimpleCardGifUrl({
+      style: destStyle,
+      gifOn: destDescribed ? simpleCardGifForRender(destDescribed) : false,
+      randomGif: () => this.cardGifs?.randomGif() ?? null,
+    });
     const dispatchAgentId = resolved.profile?.id ?? destRecord?.agentId ?? "";
     const dispatchBrand = resolveAgentBrand(dispatchAgentId, resolved.profile?.brand);
     const dispatchBrandAsset = loadBrandAsset(dispatchBrand);
@@ -6006,7 +6034,6 @@ export class Orchestrator {
       style: destStyle,
       ...(dispatchBrandAsset ? { brandFilename: dispatchBrandAsset.filename } : {}),
       authorName: resolved.profile?.displayName ?? dispatchBrand,
-      ...(dispatchGifUrl ? { gifUrl: dispatchGifUrl } : {}),
     });
     status.setAction("Thinking…");
     // Seed context (live only). Invalidate on model mismatch, exactly like the
@@ -6065,7 +6092,34 @@ export class Orchestrator {
       }
     );
     await panel.start();
-    return panel.isLive ? panel : undefined;
+    if (!panel.isLive) return undefined;
+    if (dispatchGifUrl) {
+      const gifRef = await postSimpleCardGifMessage({
+        url: dispatchGifUrl,
+        sendPanel: this.adapter.sendPanel
+          ? (p) => this.adapter.sendPanel!(target, p)
+          : undefined,
+        sendMessage: (text) => this.adapter.sendMessage(target, text),
+      });
+      if (gifRef) {
+        const innerFinalize = panel.finalize.bind(panel);
+        panel.finalize = async (state, action) => {
+          try {
+            await innerFinalize(state, action);
+          } finally {
+            if (isSimpleCardGifTerminal(state)) {
+              await deleteSimpleCardGifMessage({
+                ref: gifRef,
+                deleteMessage: this.adapter.deleteMessage
+                  ? (ref) => this.adapter.deleteMessage!(ref)
+                  : undefined,
+              });
+            }
+          }
+        };
+      }
+    }
+    return panel;
   }
 
   /** Finalize a "messages"-style streamed dispatch. The OUTPUT already streamed

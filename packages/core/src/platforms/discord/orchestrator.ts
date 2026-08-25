@@ -7482,13 +7482,38 @@ export class Orchestrator {
   /**
    * Create a thread under the parent channel. Invoked inside a thread → sibling
    * (adapter.createThread walks up). Shared by `/seam new` and `/seam preset thread`.
+   * When `addUserId` is set, add that user to the new thread so it shows in
+   * their nav; on add failure, post a bare mention as fallback (happy path is silent).
    */
-  private async createChildThread(parentChannelId: string, name: string): Promise<ChannelRef> {
+  private async createChildThread(
+    parentChannelId: string,
+    name: string,
+    addUserId?: string
+  ): Promise<ChannelRef> {
     if (!this.adapter.createThread) {
       throw new Error("This platform does not support creating threads.");
     }
     const parent: ChannelRef = { platform: PLATFORM, id: parentChannelId };
-    return this.adapter.createThread(parent, name);
+    const thread = await this.adapter.createThread(parent, name);
+    if (addUserId && this.adapter.addThreadMember) {
+      try {
+        await this.adapter.addThreadMember(thread, addUserId);
+      } catch (err) {
+        this.logger.warn(
+          { err, thread: thread.id, userId: addUserId },
+          "addThreadMember failed; falling back to mention"
+        );
+        try {
+          await this.adapter.sendMessage(thread, `<@${addUserId}>`);
+        } catch (mentionErr) {
+          this.logger.warn(
+            { err: mentionErr, thread: thread.id },
+            "thread member mention fallback failed"
+          );
+        }
+      }
+    }
+    return thread;
   }
 
   /** Bind a session record to a just-created thread (same path as `/seam new`). */
@@ -7515,7 +7540,7 @@ export class Orchestrator {
       return;
     }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const thread = await this.createChildThread(i.channelId, name);
+    const thread = await this.createChildThread(i.channelId, name, i.user.id);
 
     // Auto-init: bind a session to the new thread and start the setup
     // flow so the user doesn't have to /seam config init themselves.
@@ -15130,7 +15155,7 @@ export class Orchestrator {
     let lastSummary = "";
     try {
       for (const threadName of plannedNames) {
-        const thread = await this.createChildThread(i.channelId, threadName);
+        const thread = await this.createChildThread(i.channelId, threadName, i.user.id);
         const record = this.bindSessionToThread(thread);
         lastSummary = await this.applyPresetToSession(thread, record, preset);
         this.startPresetOpeningTurn(thread, record, preset, i.user.id);

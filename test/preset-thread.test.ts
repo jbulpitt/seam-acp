@@ -144,9 +144,12 @@ function makeOrch(over?: {
   channelPresets?: Map<string, { locked?: boolean; threadSlug?: { value: string } }>;
   threadPresets?: Map<string, { threadSlug?: { value: string } }>;
   threadNames?: Map<string, string>;
+  addThreadMember?: (ch: ChannelRef, userId: string) => Promise<void>;
 }) {
   const created: Array<{ parent: ChannelRef; name: string }> = [];
   const renamed: Array<{ id: string; name: string }> = [];
+  const addedMembers: Array<{ id: string; userId: string }> = [];
+  const sent: Array<{ id: string; text: string }> = [];
   const openingTurns: Array<{ id: string; prompt: string; authorId: string }> = [];
   const threadNames = over?.threadNames ?? new Map<string, string>();
   const router = {
@@ -225,6 +228,15 @@ function makeOrch(over?: {
         renamed.push({ id: ch.id, name });
         threadNames.set(ch.id, name);
       },
+      addThreadMember:
+        over?.addThreadMember ??
+        (async (ch: ChannelRef, userId: string) => {
+          addedMembers.push({ id: ch.id, userId });
+        }),
+      sendMessage: async (ch: ChannelRef, text: string) => {
+        sent.push({ id: ch.id, text });
+        return { id: "msg-1", channel: ch };
+      },
     } as any,
     router: router as any,
     store: over?.listPresetsForProject
@@ -247,7 +259,7 @@ function makeOrch(over?: {
     if (!prompt) return;
     openingTurns.push({ id: thread.id, prompt, authorId });
   };
-  return { orch, created, renamed, router, threadNames, openingTurns };
+  return { orch, created, renamed, addedMembers, sent, router, threadNames, openingTurns };
 }
 
 beforeEach(() => {
@@ -814,5 +826,69 @@ describe("preset thread opening turn from instructions", () => {
       store.getPresetByNameScoped("reviewer", "chan-1")!
     );
     expect(openingTurns).toEqual([]);
+  });
+});
+
+describe("createChildThread adds the invoking user", () => {
+  it("adds the caller to a preset thread with no mention on success", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const { orch, addedMembers, sent } = makeOrch();
+    const { i } = slashI({
+      group: "preset",
+      sub: "thread",
+      userId: ADMIN,
+      strings: { preset: "reviewer" },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(addedMembers).toEqual([{ id: "thread-new", userId: ADMIN }]);
+    expect(sent).toEqual([]);
+  });
+
+  it("adds the caller to each thread in a quantity run", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const { orch, addedMembers, sent } = makeOrch();
+    const { i } = slashI({
+      group: "preset",
+      sub: "thread",
+      userId: ADMIN,
+      strings: { preset: "reviewer" },
+      ints: { quantity: 3 },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(addedMembers).toEqual([
+      { id: "thread-new", userId: ADMIN },
+      { id: "thread-new-2", userId: ADMIN },
+      { id: "thread-new-3", userId: ADMIN },
+    ]);
+    expect(sent).toEqual([]);
+  });
+
+  it("falls back to a bare mention only when addThreadMember fails", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    const { orch, addedMembers, sent, created } = makeOrch({
+      addThreadMember: async () => {
+        throw new Error("Missing Access");
+      },
+    });
+    const { i, edits } = slashI({
+      group: "preset",
+      sub: "thread",
+      userId: ADMIN,
+      strings: { preset: "reviewer" },
+    });
+    await (orch as any).cmdPresetThread(i);
+    expect(created).toHaveLength(1);
+    expect(addedMembers).toEqual([]);
+    expect(sent).toEqual([{ id: "thread-new", text: `<@${ADMIN}>` }]);
+    expect(edits[0]).toMatch(/Created <#thread-new>/);
+  });
+
+  it("/seam new also adds the invoking user", async () => {
+    const { orch, addedMembers, sent } = makeOrch();
+    const { i } = slashI({ group: null, sub: "new", userId: ADMIN, strings: { name: "hello" } });
+    const thread = await (orch as any).createChildThread(i.channelId, "hello", i.user.id);
+    expect(thread.id).toBe("thread-new");
+    expect(addedMembers).toEqual([{ id: "thread-new", userId: ADMIN }]);
+    expect(sent).toEqual([]);
   });
 });

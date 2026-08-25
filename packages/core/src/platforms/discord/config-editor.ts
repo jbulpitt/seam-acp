@@ -31,11 +31,17 @@ export type ConfigEditorAction =
   | "attach"
   | "save"
   | "cancel"
+  | "scope"
   | "rider-save"
   | "rider-get"
   | "rider-put";
 
-export const HUB_FIELD_ACTIONS: ReadonlyArray<Exclude<ConfigEditorAction, "save" | "cancel" | "rider-save">> = [
+/** Which overlay the hub field actions write. Default `"thread"`. */
+export type ConfigEditorScope = "thread" | "channel";
+
+export const HUB_FIELD_ACTIONS: ReadonlyArray<
+  Exclude<ConfigEditorAction, "save" | "cancel" | "scope" | "rider-save">
+> = [
   "host",
   "agent",
   "model",
@@ -72,9 +78,19 @@ export interface ThreadConfigSnapshot {
   simpleCardGif: ResolvedSetting<boolean>;
   rider: { channel?: string; thread?: string };
   locked: boolean;
+  /** Raw channel-preset pins (unset = that field is not on the channel entry). */
+  channelPins: ChannelPresetPins;
   /** Values that apply if the thread overlay is removed (inherit). */
   withoutThread: InheritedConfig;
   effortIgnoredNote?: string;
+}
+
+/** Channel-preset fields the visual editor can pin (mirrors ChannelPresetChanges). */
+export interface ChannelPresetPins {
+  agent?: string;
+  model?: string;
+  cwd?: string;
+  effort?: string | null;
 }
 
 /** Draft overlay. `null` means inherit (remove the thread overlay / session policy). */
@@ -92,6 +108,12 @@ export interface DraftOverlay {
   channelStatusCardStyle?: StatusCardStyle | null;
   simpleCardGif?: boolean | null;
   channelSimpleCardGif?: boolean | null;
+  /** Channel-preset rider. `null` clears the channel pin. */
+  channelRider?: string | null;
+  channelAgent?: string | null;
+  channelModel?: string | null;
+  channelCwd?: string | null;
+  channelEffort?: string | null;
 }
 
 export interface ThreadConfigDraft {
@@ -105,6 +127,8 @@ export interface ThreadConfigDraft {
   snapshot: ThreadConfigSnapshot;
   overlay: DraftOverlay;
   warnings: string[];
+  /** Hub field actions write the thread overlay or the channel preset. */
+  editScope?: ConfigEditorScope;
   /** Next text-file attachment from the editor owner becomes the draft rider. */
   awaitingRiderUpload?: boolean;
 }
@@ -117,6 +141,8 @@ export interface DraftAgentCapabilities {
 
 export interface HubRenderContext {
   effortDisabled?: boolean;
+  /** When false, the Thread↔Channel scope toggle is hidden. Default: shown if the draft has a parent channel. */
+  canEditChannel?: boolean;
 }
 
 export function makeCustomId(draftId: string, action: string): string {
@@ -163,9 +189,14 @@ export function snapshotFromDescribe(
     simpleCardGif: d.simpleCardGif ?? { value: false, source: "default" },
     rider: d.rider ?? {},
     locked: d.locked,
+    channelPins: {},
     withoutThread,
     ...(d.effortIgnoredNote ? { effortIgnoredNote: d.effortIgnoredNote } : {}),
   };
+}
+
+export function editScopeOf(draft: ThreadConfigDraft): ConfigEditorScope {
+  return draft.editScope === "channel" ? "channel" : "thread";
 }
 
 export function effectiveAfterDraft(draft: ThreadConfigDraft): {
@@ -177,6 +208,7 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
   permission: PermissionPolicyMode;
   detached: boolean;
   riderThread: string | undefined;
+  riderChannel: string | undefined;
   statusCardStyle: StatusCardStyle;
   simpleCardGif: boolean;
 } {
@@ -193,6 +225,7 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
       o.permission === undefined ? s.permission.value : o.permission ?? w.permission,
     detached: o.detached === undefined ? s.detached.value : o.detached,
     riderThread: o.rider === undefined ? s.rider.thread : o.rider ?? undefined,
+    riderChannel: o.channelRider === undefined ? s.rider.channel : o.channelRider ?? undefined,
     statusCardStyle: effectiveCardStyle(draft),
     simpleCardGif: effectiveGif(draft),
   };
@@ -249,9 +282,21 @@ export function currentThreadRiderText(draft: ThreadConfigDraft): string | null 
   return draft.snapshot.rider.thread ?? null;
 }
 
-export function riderDownloadFilename(threadId: string): string {
+/** Channel-preset rider the draft is editing. `null` = inherit/clear. */
+export function currentChannelRiderText(draft: ThreadConfigDraft): string | null {
+  if (draft.overlay.channelRider !== undefined) return draft.overlay.channelRider;
+  return draft.snapshot.rider.channel ?? null;
+}
+
+export function currentRiderText(draft: ThreadConfigDraft): string | null {
+  return editScopeOf(draft) === "channel"
+    ? currentChannelRiderText(draft)
+    : currentThreadRiderText(draft);
+}
+
+export function riderDownloadFilename(threadId: string, scope: ConfigEditorScope = "thread"): string {
   const slug = threadId.replace(/[^\w-]+/g, "").slice(0, 24) || "thread";
-  return `rider-${slug}.md`;
+  return scope === "channel" ? `rider-channel-${slug}.md` : `rider-${slug}.md`;
 }
 
 export function decodeRiderUpload(
@@ -280,11 +325,8 @@ export function decodeRiderUpload(
 }
 
 export function riderTooLong(draft: ThreadConfigDraft): boolean {
-  const current =
-    draft.overlay.rider === undefined
-      ? draft.snapshot.rider.thread
-      : draft.overlay.rider ?? "";
-  return (current?.length ?? 0) > RIDER_MODAL_MAX;
+  const current = currentRiderText(draft) ?? "";
+  return current.length > RIDER_MODAL_MAX;
 }
 
 function threadOverlayValue<T>(setting: ResolvedSetting<T>): T | undefined {
@@ -399,6 +441,46 @@ export function dirtyChannelSimpleCardGif(
   return next;
 }
 
+export function dirtyChannelRider(
+  draft: ThreadConfigDraft
+): string | null | undefined {
+  if (draft.overlay.channelRider === undefined) return undefined;
+  const current = draft.snapshot.rider.channel ?? null;
+  const next = draft.overlay.channelRider;
+  if (next !== current) return next;
+  return undefined;
+}
+
+function dirtyChannelPin(
+  overlay: string | null | undefined,
+  current: string | null | undefined
+): string | null | undefined {
+  if (overlay === undefined) return undefined;
+  const cur = current ?? null;
+  const next = overlay;
+  if (next !== cur) return next;
+  return undefined;
+}
+
+export function dirtyChannelAgent(draft: ThreadConfigDraft): string | null | undefined {
+  return dirtyChannelPin(draft.overlay.channelAgent, draft.snapshot.channelPins?.agent);
+}
+
+export function dirtyChannelModel(draft: ThreadConfigDraft): string | null | undefined {
+  return dirtyChannelPin(draft.overlay.channelModel, draft.snapshot.channelPins?.model);
+}
+
+export function dirtyChannelCwd(draft: ThreadConfigDraft): string | null | undefined {
+  return dirtyChannelPin(draft.overlay.channelCwd, draft.snapshot.channelPins?.cwd);
+}
+
+export function dirtyChannelEffort(draft: ThreadConfigDraft): string | null | undefined {
+  return dirtyChannelPin(
+    draft.overlay.channelEffort,
+    draft.snapshot.channelPins?.effort ?? null
+  );
+}
+
 export function isDirty(draft: ThreadConfigDraft): boolean {
   return (
     Object.keys(dirtyThreadPresetChanges(draft)).length > 0 ||
@@ -406,7 +488,12 @@ export function isDirty(draft: ThreadConfigDraft): boolean {
     dirtyStatusCardStyle(draft) !== undefined ||
     dirtyChannelStatusCardStyle(draft) !== undefined ||
     dirtySimpleCardGif(draft) !== undefined ||
-    dirtyChannelSimpleCardGif(draft) !== undefined
+    dirtyChannelSimpleCardGif(draft) !== undefined ||
+    dirtyChannelRider(draft) !== undefined ||
+    dirtyChannelAgent(draft) !== undefined ||
+    dirtyChannelModel(draft) !== undefined ||
+    dirtyChannelCwd(draft) !== undefined ||
+    dirtyChannelEffort(draft) !== undefined
   );
 }
 
@@ -459,6 +546,12 @@ export function renderHub(
   const tooLong = riderTooLong(draft);
   const effortDisabled = ctx.effortDisabled === true;
 
+  const scope = editScopeOf(draft);
+  const channelScope = scope === "channel";
+  const showScope = ctx.canEditChannel !== false && !!draft.parentRef;
+  const pins = s.channelPins ?? {};
+  const threadOnlyDisabled = channelScope;
+
   const locCurrent =
     s.location.value === "local" && s.location.source === "default"
       ? "`local` (default)"
@@ -473,11 +566,18 @@ export function renderHub(
         : "will be `attached`";
 
   const riderThread = o.rider === undefined ? s.rider.thread : o.rider ?? undefined;
-  const riderChannel = s.rider.channel;
+  const riderChannel = o.channelRider === undefined ? s.rider.channel : o.channelRider ?? undefined;
   const riderLines = [
     `channel: ${riderChannel ? code(trunc(riderChannel, 200)) : "`(none)`"}`,
     `thread: ${riderThread ? code(trunc(riderThread, 200)) : "`(none)`"}`,
   ];
+  if (o.channelRider !== undefined) {
+    riderLines.push(
+      o.channelRider === null
+        ? "will inherit (clear channel rider)"
+        : "will be new channel rider"
+    );
+  }
   if (o.rider !== undefined) {
     riderLines.push(
       o.rider === null ? "will inherit (clear thread rider)" : "will be new thread rider"
@@ -487,7 +587,14 @@ export function renderHub(
     riderLines.push("too long for modal — use Download / Upload (Clear still allowed)");
   }
   if (draft.awaitingRiderUpload) {
-    riderLines.push("waiting for a `.md` / `.txt` attachment in this thread");
+    riderLines.push(
+      channelScope
+        ? "waiting for a `.md` / `.txt` attachment (channel rider)"
+        : "waiting for a `.md` / `.txt` attachment in this thread"
+    );
+  }
+  if (channelScope) {
+    riderLines.push("scope: channel preset (Rider/Download/Upload edit the channel rider)");
   }
 
   const warningBlock =
@@ -495,15 +602,41 @@ export function renderHub(
       ? draft.warnings.map((wline) => `• ${wline}`).join("\n")
       : undefined;
 
-  const footerParts = ["applies on the next turn"];
+  const footerParts = channelScope
+    ? ["editing channel preset", "all threads inherit", "applies on the next turn"]
+    : ["applies on the next turn"];
   if (reset) footerParts.push("⚠ Saving will reset the ACP session (host/agent change)");
   if (!dirty) footerParts.push("no changes yet");
   if (s.effortIgnoredNote) footerParts.push(s.effortIgnoredNote);
+  if (s.locked && channelScope) footerParts.push("channel is locked — admin-only");
 
   const id = draft.id;
+  const row2: NonNullable<StructuredPanel["actions"]>[0] = [
+    {
+      customId: makeCustomId(id, "save"),
+      label: "Save",
+      style: "success",
+      disabled: !dirty,
+    },
+    { customId: makeCustomId(id, "cancel"), label: "Cancel", style: "secondary" },
+    { customId: makeCustomId(id, "card"), label: "Card", style: "secondary" },
+    { customId: makeCustomId(id, "gif"), label: "GIF", style: "secondary" },
+  ];
+  if (showScope) {
+    row2.push({
+      customId: makeCustomId(id, "scope"),
+      label: channelScope ? "Thread" : "Channel",
+      style: "primary",
+    });
+  }
   const actions: StructuredPanel["actions"] = [
     [
-      { customId: makeCustomId(id, "host"), label: "Host", style: "secondary" },
+      {
+        customId: makeCustomId(id, "host"),
+        label: "Host",
+        style: "secondary",
+        disabled: threadOnlyDisabled,
+      },
       { customId: makeCustomId(id, "agent"), label: "Agent", style: "secondary" },
       { customId: makeCustomId(id, "model"), label: "Model", style: "secondary" },
       {
@@ -515,28 +648,61 @@ export function renderHub(
       { customId: makeCustomId(id, "repo"), label: "Repo", style: "secondary" },
     ],
     [
-      { customId: makeCustomId(id, "approve"), label: "Approve", style: "secondary" },
+      {
+        customId: makeCustomId(id, "approve"),
+        label: "Approve",
+        style: "secondary",
+        disabled: threadOnlyDisabled,
+      },
       { customId: makeCustomId(id, "rider"), label: "Rider", style: "secondary" },
       { customId: makeCustomId(id, "rider-get"), label: "Download", style: "secondary" },
       { customId: makeCustomId(id, "rider-put"), label: "Upload", style: "secondary" },
-      { customId: makeCustomId(id, "attach"), label: "Attach", style: "secondary" },
-    ],
-    [
       {
-        customId: makeCustomId(id, "save"),
-        label: "Save",
-        style: "success",
-        disabled: !dirty,
+        customId: makeCustomId(id, "attach"),
+        label: "Attach",
+        style: "secondary",
+        disabled: threadOnlyDisabled,
       },
-      { customId: makeCustomId(id, "cancel"), label: "Cancel", style: "secondary" },
-      { customId: makeCustomId(id, "card"), label: "Card", style: "secondary" },
-      { customId: makeCustomId(id, "gif"), label: "GIF", style: "secondary" },
     ],
+    row2,
   ];
+
+  const agentLine = channelScope
+    ? fieldLine(
+        code(pins.agent),
+        pins.agent ? "channel" : "default",
+        draftNoteFor(o.channelAgent, "not set")
+      )
+    : fieldLine(code(s.agent.value), sourceLabel(s.agent.source), draftNoteFor(o.agent, w.agent));
+  const modelLine = channelScope
+    ? fieldLine(
+        code(pins.model),
+        pins.model ? "channel" : "default",
+        draftNoteFor(o.channelModel, "not set")
+      )
+    : fieldLine(code(s.model.value), sourceLabel(s.model.source), draftNoteFor(o.model, w.model));
+  const effortLine = channelScope
+    ? fieldLine(
+        pins.effort ? code(pins.effort) : "`not set`",
+        pins.effort ? "channel" : "default",
+        draftNoteFor(o.channelEffort, "not set")
+      )
+    : fieldLine(
+        s.effort.value ? code(s.effort.value) : "`not set`",
+        sourceLabel(s.effort.source),
+        draftNoteFor(o.effort, w.effort ?? "not set")
+      );
+  const cwdLine = channelScope
+    ? fieldLine(
+        code(pins.cwd),
+        pins.cwd ? "channel" : "default",
+        draftNoteFor(o.channelCwd, "not set")
+      )
+    : fieldLine(code(s.cwd.value), sourceLabel(s.cwd.source), draftNoteFor(o.cwd, w.cwd));
 
   return {
     color: 0x5865f2,
-    title: "🧩 Thread config",
+    title: channelScope ? "🧩 Channel preset" : "🧩 Thread config",
     ...(warningBlock ? { description: warningBlock } : {}),
     fields: [
       {
@@ -549,38 +715,22 @@ export function renderHub(
       },
       {
         name: "Agent",
-        value: trunc(
-          fieldLine(code(s.agent.value), sourceLabel(s.agent.source), draftNoteFor(o.agent, w.agent)),
-          1024
-        ),
+        value: trunc(agentLine, 1024),
         inline: true,
       },
       {
         name: "Model",
-        value: trunc(
-          fieldLine(code(s.model.value), sourceLabel(s.model.source), draftNoteFor(o.model, w.model)),
-          1024
-        ),
+        value: trunc(modelLine, 1024),
         inline: true,
       },
       {
         name: "Effort",
-        value: trunc(
-          fieldLine(
-            s.effort.value ? code(s.effort.value) : "`not set`",
-            sourceLabel(s.effort.source),
-            draftNoteFor(o.effort, w.effort ?? "not set")
-          ),
-          1024
-        ),
+        value: trunc(effortLine, 1024),
         inline: true,
       },
       {
         name: "Repo",
-        value: trunc(
-          fieldLine(code(s.cwd.value), sourceLabel(s.cwd.source), draftNoteFor(o.cwd, w.cwd)),
-          1024
-        ),
+        value: trunc(cwdLine, 1024),
         inline: true,
       },
       {
@@ -713,14 +863,25 @@ export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
         value: next.simpleCardGif,
         source: gifSourceAfterSave(o, s),
       },
+      rider: {
+        ...(next.riderChannel ? { channel: next.riderChannel } : {}),
+        ...(next.riderThread ? { thread: next.riderThread } : {}),
+      },
+      channelPins: {
+        ...s.channelPins,
+        ...(o.channelAgent ? { agent: o.channelAgent } : {}),
+        ...(o.channelModel ? { model: o.channelModel } : {}),
+        ...(o.channelCwd ? { cwd: o.channelCwd } : {}),
+        ...(o.channelEffort ? { effort: o.channelEffort } : {}),
+      },
       withoutThread: {
         ...s.withoutThread,
         ...(o.channelStatusCardStyle ? { statusCardStyle: o.channelStatusCardStyle } : {}),
         ...(o.channelSimpleCardGif != null ? { simpleCardGif: o.channelSimpleCardGif } : {}),
-      },
-      rider: {
-        ...(s.rider.channel ? { channel: s.rider.channel } : {}),
-        ...(next.riderThread ? { thread: next.riderThread } : {}),
+        ...(o.channelAgent ? { agent: o.channelAgent } : {}),
+        ...(o.channelModel ? { model: o.channelModel } : {}),
+        ...(o.channelCwd ? { cwd: o.channelCwd } : {}),
+        ...(o.channelEffort !== undefined ? { effort: o.channelEffort } : {}),
       },
     },
   };
@@ -830,11 +991,18 @@ export function applyPickerValue(
   let overlay: DraftOverlay = { ...draft.overlay };
   const warnings: string[] = [];
 
+  const channelScope = editScopeOf(draft) === "channel";
+
   switch (field) {
     case "host":
+      if (channelScope) return draft;
       overlay.location = inherit ? null : value;
       break;
     case "agent": {
+      if (channelScope) {
+        overlay.channelAgent = inherit ? null : value.includes("@") ? value.slice(0, value.lastIndexOf("@")) : value;
+        break;
+      }
       if (inherit) {
         overlay.agent = null;
       } else {
@@ -849,38 +1017,50 @@ export function applyPickerValue(
       break;
     }
     case "model":
-      overlay.model = inherit ? null : value;
+      if (channelScope) overlay.channelModel = inherit ? null : value;
+      else overlay.model = inherit ? null : value;
       break;
     case "effort":
-      overlay.effort = inherit ? null : value;
+      if (channelScope) overlay.channelEffort = inherit ? null : value;
+      else overlay.effort = inherit ? null : value;
       break;
     case "repo":
-      overlay.cwd = inherit ? null : value;
+      if (channelScope) overlay.channelCwd = inherit ? null : value;
+      else overlay.cwd = inherit ? null : value;
       break;
     case "approve":
+      if (channelScope) return draft;
       overlay.permission = inherit ? null : (value as PermissionPolicyMode);
       break;
     case "rider":
-      overlay.rider = inherit || value === "" ? null : value;
+      if (channelScope) overlay.channelRider = inherit || value === "" ? null : value;
+      else overlay.rider = inherit || value === "" ? null : value;
       break;
     case "attach":
+      if (channelScope) return draft;
       if (inherit) overlay.detached = false;
       else overlay.detached = value === "detached";
       break;
     case "card":
       if (inherit) {
-        overlay.statusCardStyle = null;
+        if (channelScope) overlay.channelStatusCardStyle = null;
+        else overlay.statusCardStyle = null;
       } else if (value === "channel:full" || value === "channel:simple") {
         overlay.channelStatusCardStyle = value === "channel:simple" ? "simple" : "full";
+      } else if (channelScope) {
+        overlay.channelStatusCardStyle = value as StatusCardStyle;
       } else {
         overlay.statusCardStyle = value as StatusCardStyle;
       }
       break;
     case "gif":
       if (inherit) {
-        overlay.simpleCardGif = null;
+        if (channelScope) overlay.channelSimpleCardGif = null;
+        else overlay.simpleCardGif = null;
       } else if (value === "channel:on" || value === "channel:off") {
         overlay.channelSimpleCardGif = value === "channel:on";
+      } else if (channelScope) {
+        overlay.channelSimpleCardGif = value === "on";
       } else {
         overlay.simpleCardGif = value === "on";
       }
@@ -895,8 +1075,8 @@ export function applyPickerValue(
     warnings,
     updatedAt: now,
   };
-  const agentId = effectiveAfterDraft(updated).agent;
-  if (field === "host" || field === "agent") {
+  if (!channelScope && (field === "host" || field === "agent")) {
+    const agentId = effectiveAfterDraft(updated).agent;
     return dropUnsupported(updated, capsForAgent(agentId));
   }
   return updated;
@@ -922,10 +1102,28 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
   if (gif !== undefined) plan.simpleCardGif = gif;
   const channelCard = dirtyChannelStatusCardStyle(draft);
   const channelGif = dirtyChannelSimpleCardGif(draft);
-  if (channelCard !== undefined || channelGif !== undefined) {
+  const channelRider = dirtyChannelRider(draft);
+  const channelAgent = dirtyChannelAgent(draft);
+  const channelModel = dirtyChannelModel(draft);
+  const channelCwd = dirtyChannelCwd(draft);
+  const channelEffort = dirtyChannelEffort(draft);
+  if (
+    channelCard !== undefined ||
+    channelGif !== undefined ||
+    channelRider !== undefined ||
+    channelAgent !== undefined ||
+    channelModel !== undefined ||
+    channelCwd !== undefined ||
+    channelEffort !== undefined
+  ) {
     plan.channelPreset = {
       ...(channelCard !== undefined ? { statusCardStyle: channelCard } : {}),
       ...(channelGif !== undefined ? { simpleCardGif: channelGif } : {}),
+      ...(channelRider !== undefined ? { rider: channelRider } : {}),
+      ...(channelAgent !== undefined ? { agent: channelAgent } : {}),
+      ...(channelModel !== undefined ? { model: channelModel } : {}),
+      ...(channelCwd !== undefined ? { cwd: channelCwd } : {}),
+      ...(channelEffort !== undefined ? { effort: channelEffort } : {}),
     };
   }
   return plan;

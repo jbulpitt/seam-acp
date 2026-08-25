@@ -7,8 +7,11 @@ import {
   applyPickerValue,
   authorizeDraftClick,
   buildSavePlan,
+  currentChannelRiderText,
   currentThreadRiderText,
   decodeRiderUpload,
+  dirtyChannelRider,
+  dirtyChannelAgent,
   dirtyPermission,
   dirtyChannelStatusCardStyle,
   dirtyStatusCardStyle,
@@ -60,6 +63,7 @@ function snapshot(over: Partial<ThreadConfigSnapshot> = {}): ThreadConfigSnapsho
     simpleCardGif: setting(false, "default"),
     rider: {},
     locked: false,
+    channelPins: {},
     withoutThread: { ...WITHOUT },
     ...over,
   };
@@ -112,6 +116,10 @@ describe("config editor custom_id", () => {
       draftId: "abc-uuid",
       action: "rider-get",
     });
+    expect(parseCustomId("seam-cfg-edit:abc-uuid:scope")).toEqual({
+      draftId: "abc-uuid",
+      action: "scope",
+    });
     expect(parseCustomId("seam-pick:1")).toBeNull();
   });
 });
@@ -138,6 +146,17 @@ describe("rider file download / upload", () => {
         })
       )
     ).toBeNull();
+    expect(
+      currentChannelRiderText(draft({ snapshot: snapshot({ rider: { channel: "ch pin" } }) }))
+    ).toBe("ch pin");
+    expect(
+      currentChannelRiderText(
+        draft({
+          snapshot: snapshot({ rider: { channel: "ch pin" } }),
+          overlay: { channelRider: "draft ch" },
+        })
+      )
+    ).toBe("draft ch");
   });
 
   it("decodeRiderUpload accepts utf-8 md/txt, empty means inherit, rejects binary and huge", () => {
@@ -157,6 +176,9 @@ describe("rider file download / upload", () => {
 
   it("riderDownloadFilename is a safe .md name", () => {
     expect(riderDownloadFilename("1539280857473482835")).toBe("rider-1539280857473482835.md");
+    expect(riderDownloadFilename("1539280857473482835", "channel")).toBe(
+      "rider-channel-1539280857473482835.md"
+    );
     expect(riderDownloadFilename("../../etc")).toMatch(/^rider-.*\.md$/);
     expect(riderDownloadFilename("../../etc")).not.toMatch(/\.\./);
   });
@@ -188,7 +210,13 @@ describe("hub render (#90)", () => {
       "Upload",
       "Attach",
     ]);
-    expect(panel.actions![2].map((b) => b.label)).toEqual(["Save", "Cancel", "Card", "GIF"]);
+    expect(panel.actions![2].map((b) => b.label)).toEqual([
+      "Save",
+      "Cancel",
+      "Card",
+      "GIF",
+      "Channel",
+    ]);
     expect(panel.actions![2][0]!.disabled).toBe(true);
   });
 
@@ -408,6 +436,84 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
     expect(buildSavePlan(inherit).simpleCardGif).toBeNull();
   });
 
+  it("Channel scope re-renders the hub and writes channel rider/agent on Save plan", () => {
+    const panel = renderHub(draft({ editScope: "channel" }));
+    expect(panel.title).toBe("🧩 Channel preset");
+    expect(panel.footer).toMatch(/editing channel preset/);
+    expect(panel.actions![0].find((b) => b.label === "Host")!.disabled).toBe(true);
+    expect(panel.actions![1].find((b) => b.label === "Approve")!.disabled).toBe(true);
+    expect(panel.actions![1].find((b) => b.label === "Attach")!.disabled).toBe(true);
+    expect(panel.actions![2].map((b) => b.label)).toEqual([
+      "Save",
+      "Cancel",
+      "Card",
+      "GIF",
+      "Thread",
+    ]);
+    expect(panel.fields.find((f) => f.name === "Rider")!.value).toMatch(/scope: channel preset/);
+
+    const started = draft({
+      editScope: "channel",
+      snapshot: snapshot({
+        rider: { channel: "old channel rider" },
+        channelPins: { agent: "grok" },
+      }),
+    });
+    const withRider = applyPickerValue(started, "rider", "be kind in this class", caps);
+    expect(withRider.overlay.channelRider).toBe("be kind in this class");
+    expect(withRider.overlay.rider).toBeUndefined();
+    expect(dirtyChannelRider(withRider)).toBe("be kind in this class");
+    expect(currentChannelRiderText(withRider)).toBe("be kind in this class");
+    expect(currentThreadRiderText(withRider)).toBeNull();
+
+    const withAgent = applyPickerValue(withRider, "agent", "claude", caps);
+    expect(withAgent.overlay.channelAgent).toBe("claude");
+    expect(dirtyChannelAgent(withAgent)).toBe("claude");
+    const plan = buildSavePlan(withAgent);
+    expect(plan.channelPreset).toEqual({
+      rider: "be kind in this class",
+      agent: "claude",
+    });
+    expect(plan.threadPreset).toEqual({});
+  });
+
+  it("channel rider inherit/clear is dirty when a pin exists", () => {
+    const d = applyPickerValue(
+      draft({
+        editScope: "channel",
+        snapshot: snapshot({ rider: { channel: "pin" } }),
+      }),
+      "rider",
+      INHERIT_VALUE,
+      caps
+    );
+    expect(d.overlay.channelRider).toBeNull();
+    expect(dirtyChannelRider(d)).toBeNull();
+    expect(buildSavePlan(d).channelPreset).toEqual({ rider: null });
+  });
+
+  it("channel Card/GIF in channel scope write channel overlay (not session)", () => {
+    const started = draft({ editScope: "channel" });
+    const card = applyPickerValue(started, "card", "simple", caps);
+    expect(card.overlay.channelStatusCardStyle).toBe("simple");
+    expect(card.overlay.statusCardStyle).toBeUndefined();
+    const gif = applyPickerValue(started, "gif", "on", caps);
+    expect(gif.overlay.channelSimpleCardGif).toBe(true);
+    expect(gif.overlay.simpleCardGif).toBeUndefined();
+  });
+
+  it("scope toggle is hidden when canEditChannel is false", () => {
+    const panel = renderHub(draft(), { canEditChannel: false });
+    expect(panel.actions![2].map((b) => b.label)).toEqual(["Save", "Cancel", "Card", "GIF"]);
+  });
+
+  it("host/approve/attach are no-ops in channel scope", () => {
+    const started = draft({ editScope: "channel" });
+    expect(applyPickerValue(started, "host", "mac", caps).overlay.location).toBeUndefined();
+    expect(applyPickerValue(started, "approve", "always", caps).overlay.permission).toBeUndefined();
+    expect(applyPickerValue(started, "attach", "detached", caps).overlay.detached).toBeUndefined();
+  });
+
   it("Cancel is a no-op on the overlay (store delete; no mutation payload)", () => {
     const d = draft({ overlay: { model: "x" } });
     const store = new ConfigEditorStore();
@@ -525,6 +631,37 @@ describe("/seam config edit slash gates (#90 D9)", () => {
     expect(Orchestrator.isLockedSlashRefused(locked, "channel-1", "edit", ADMIN)).toBe(false);
     expect(Orchestrator.isLockedSlashRefused(locked, "channel-1", "gif", ADMIN)).toBe(false);
   });
+
+  it("channel-preset edits: admin set + locked match slash (admin-only when listed)", () => {
+    const ADMIN = "1487094572696867019";
+    const OPERATOR = "111";
+    const STUDENT = "1534937951044112505";
+    const withAdmins = {
+      channelPresets: new Map([["channel-1", { locked: false }]]),
+      threadPresets: new Map(),
+      SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
+      SEAM_PARTICIPANT_USER_IDS: new Set([STUDENT]),
+    } as any;
+    expect(Orchestrator.canEditChannelPreset(withAdmins, ADMIN, "channel-1")).toBe(true);
+    expect(Orchestrator.canEditChannelPreset(withAdmins, OPERATOR, "channel-1")).toBe(false);
+    expect(Orchestrator.canEditChannelPreset(withAdmins, STUDENT, "channel-1")).toBe(false);
+    const locked = {
+      channelPresets: new Map([["channel-1", { locked: true }]]),
+      threadPresets: new Map(),
+      SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
+      SEAM_PARTICIPANT_USER_IDS: undefined,
+    } as any;
+    expect(Orchestrator.canEditChannelPreset(locked, ADMIN, "channel-1")).toBe(true);
+    expect(Orchestrator.canEditChannelPreset(locked, OPERATOR, "channel-1")).toBe(false);
+    const noAdminSet = {
+      channelPresets: new Map([["channel-1", { locked: false }]]),
+      threadPresets: new Map(),
+      SEAM_CONFIG_ADMIN_USER_IDS: undefined,
+      SEAM_PARTICIPANT_USER_IDS: undefined,
+    } as any;
+    expect(Orchestrator.canEditChannelPreset(noAdminSet, OPERATOR, "channel-1")).toBe(true);
+    expect(Orchestrator.canEditChannelPreset(noAdminSet, OPERATOR, undefined)).toBe(false);
+  });
 });
 
 describe("snapshotFromDescribe keeps rider from describeConfig", () => {
@@ -551,5 +688,6 @@ describe("snapshotFromDescribe keeps rider from describeConfig", () => {
     };
     const snap = snapshotFromDescribe(d, WITHOUT);
     expect(snap.rider).toEqual({ channel: "ch", thread: "th" });
+    expect(snap.channelPins).toEqual({});
   });
 });

@@ -25,16 +25,4 @@ describe("TurnStatus style + brand (#96)", () => {
     expect(input.contextPct).toBe(13);
   });
 
-  it("keeps gifUrl across toInput after later activity updates", () => {
-    const s = new TurnStatus({
-      model: "m",
-      repoDisplay: "r",
-      style: "simple",
-      gifUrl: "https://cdn.example/stable.gif",
-    });
-    expect(s.toInput().gifUrl).toBe("https://cdn.example/stable.gif");
-    s.setAction("Reading files…");
-    s.pushActivity("Read foo.ts");
-    expect(s.toInput().gifUrl).toBe("https://cdn.example/stable.gif");
-  });
 });

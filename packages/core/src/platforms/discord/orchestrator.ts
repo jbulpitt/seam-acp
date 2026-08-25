@@ -116,9 +116,13 @@ import { handleDebugSlash } from "./debug.js";
 import { BRIDGE_ADMIN_REFUSAL, isBridgeAdminRefused } from "./admin-gate.js";
 import {
   AutocompleteRegistry,
+  collectStringOptionValues,
+  DISCORD_AUTOCOMPLETE_MAX,
+  labeledAutocompleteChoices,
   presetAutocompleteChoices,
   safeAutocompleteRespond,
   toAutocompleteChoices,
+  tokenAutocompleteChoices,
   type AutocompleteResponder,
 } from "./autocomplete.js";
 import {
@@ -570,6 +574,214 @@ export class Orchestrator {
     this.autocomplete.register("config", "tts", "voice", (ctx) =>
       toAutocompleteChoices(geminiTtsVoiceChoices(ctx.focusedValue))
     );
+    this.wireSlashAutocomplete();
+  }
+
+  /**
+   * Bounded slash autocomplete responders (#slash-autocomplete). Registered
+   * next to the preset / TTS voice responders; dispatch stays in
+   * `handleAutocompleteInteraction` (never a one-off branch there).
+   */
+  private wireSlashAutocomplete(): void {
+    this.autocomplete.register("config", "agent", "id", (ctx) => {
+      try {
+        const choices = agentLocationPickerChoices(this.router.listProfiles(), {
+          bridges: this.config.bridgePresets.values(),
+          connected: this.bridgeHub?.connectedIds(),
+          agentsByHost: this.bridgeHub?.installedAgentsByHost(),
+        });
+        return labeledAutocompleteChoices(
+          choices.map((c) => ({ name: `${c.label} (${c.value})`, value: c.value })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+
+    this.autocomplete.register("config", "repo", "path", async (ctx) => {
+      try {
+        const dirs = await this.listHostWorkspacePaths(ctx.channelId);
+        if (!dirs) return [];
+        return labeledAutocompleteChoices(
+          dirs.map((p) => ({ name: path.basename(p), value: p })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+
+    this.autocomplete.register("config", "model", "id", async (ctx) => {
+      try {
+        if (!ctx.agentId) return [];
+        const profile = this.router.getProfile(ctx.agentId);
+        const models = await pickerModelsForProfile(profile, DISCORD_AUTOCOMPLETE_MAX);
+        return labeledAutocompleteChoices(
+          models.map((m) => ({
+            name: m.name && m.name !== m.modelId ? `${m.name} (${m.modelId})` : m.modelId,
+            value: m.modelId,
+          })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+
+    this.autocomplete.register("config", "mode", "id", (ctx) => {
+      try {
+        if (!ctx.sessionId) return [];
+        const rt =
+          typeof this.router.getRuntime === "function"
+            ? this.router.getRuntime(ctx.sessionId)
+            : undefined;
+        const modes = rt?.getSessionInfo()?.availableModes ?? [];
+        return labeledAutocompleteChoices(
+          modes.map((m) => ({
+            name: m.name && m.name !== m.id ? `${m.name} (${m.id})` : m.id,
+            value: m.id,
+          })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+
+    const scheduleIdResponder: AutocompleteResponder = (ctx) => {
+      try {
+        if (!ctx.channelId) return [];
+        const rows = this.store.listScheduledByChannel(PLATFORM, ctx.channelId);
+        return tokenAutocompleteChoices(
+          rows.map((r) => ({ id: r.id, label: r.name })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    };
+    for (const sub of ["remove", "toggle", "addfile", "removefile", "edit"] as const) {
+      this.autocomplete.register("schedule", sub, "id", scheduleIdResponder);
+    }
+    this.autocomplete.register("schedule", "removefile", "filename", (ctx) => {
+      try {
+        const id = ctx.optionValues?.id;
+        if (!id || !ctx.channelId) return [];
+        const row = this.store.getScheduled(id);
+        if (!row || row.channelRef !== ctx.channelId) return [];
+        return labeledAutocompleteChoices(
+          row.attachments.map((a) => ({ name: a.filename, value: a.filename })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+
+    this.autocomplete.register(null, "workflows", "cancel-wake", (ctx) => {
+      try {
+        if (!ctx.channelId) return [];
+        return tokenAutocompleteChoices(
+          this.listWakes(PLATFORM, ctx.channelId).map((w) => ({
+            id: w.id,
+            label: w.reason || w.id,
+          })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+    this.autocomplete.register(null, "workflows", "cancel-watch", (ctx) => {
+      try {
+        if (!ctx.channelId) return [];
+        return tokenAutocompleteChoices(
+          this.listWatches(PLATFORM, ctx.channelId).map((w) => ({
+            id: w.id,
+            label: w.reason || `${w.kind}:${w.spec}`,
+          })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+    this.autocomplete.register(null, "workflows", "cancel-choice", (ctx) => {
+      try {
+        if (!ctx.channelId) return [];
+        return tokenAutocompleteChoices(
+          this.store.listOpenChoiceCards(PLATFORM, ctx.channelId).map((c) => ({
+            id: c.id,
+            label: c.title,
+          })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+    this.autocomplete.register(null, "workflows", "cancel-ingest", (ctx) => {
+      try {
+        if (!ctx.channelId) return [];
+        return tokenAutocompleteChoices(
+          this.store.listOpenIngestEndpoints(PLATFORM, ctx.channelId).map((e) => ({
+            id: e.id,
+            label: e.name,
+          })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+    this.autocomplete.register(null, "workflows", "cancel-live", (ctx) => {
+      try {
+        if (!ctx.channelId) return [];
+        const rows = (this.liveHelpManager?.listForThread(PLATFORM, ctx.channelId) ?? []).filter(
+          (s) => s.status === "starting" || s.status === "live"
+        );
+        return tokenAutocompleteChoices(
+          rows.map((s) => ({
+            id: s.id,
+            label: s.channelName ? `${s.channelName} · ${s.status}` : s.status,
+          })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+
+    this.autocomplete.register(null, "steer", "thread", (ctx) => {
+      try {
+        const parent = ctx.projectScopeId ?? ctx.parentId;
+        if (!parent) return [];
+        const siblings = this.store.listSessionsByParent(PLATFORM, parent);
+        return labeledAutocompleteChoices(
+          siblings.map((s) => {
+            let agent = s.agentId;
+            try {
+              const v = this.router.describeConfig(s)?.agent?.value;
+              if (typeof v === "string" && v) agent = v;
+            } catch {
+              /* mock routers */
+            }
+            const busy =
+              typeof this.router.isBusy === "function" && this.router.isBusy(s.id)
+                ? "busy"
+                : "idle";
+            return {
+              name: `${s.channelRef} · ${agent} · ${busy}`,
+              value: s.channelRef,
+            };
+          }),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
   }
 
   /**
@@ -585,12 +797,38 @@ export class Orchestrator {
         const focused = interaction.options.getFocused(true);
         const responder = this.autocomplete.get(group, sub, focused.name);
         if (!responder) return [];
+        const channelId = interaction.channelId ?? undefined;
+        const ch = interaction.channel as
+          | { isThread?: () => boolean; parentId?: string | null }
+          | null
+          | undefined;
+        const parentId =
+          ch && typeof ch.isThread === "function" && ch.isThread()
+            ? (ch.parentId ?? undefined)
+            : undefined;
+        const session = channelId
+          ? this.store.get(makeSessionId(PLATFORM, channelId))
+          : undefined;
+        let agentId = session?.agentId;
+        if (session) {
+          try {
+            const v = this.router.describeConfig(session)?.agent?.value;
+            if (typeof v === "string" && v) agentId = v;
+          } catch {
+            /* mock routers may not implement describeConfig */
+          }
+        }
         return responder({
           group,
           subcommand: sub,
           optionName: focused.name,
           focusedValue: String(focused.value ?? ""),
           projectScopeId: this.projectScopeId(interaction),
+          channelId,
+          parentId,
+          sessionId: session?.id,
+          agentId,
+          optionValues: collectStringOptionValues(interaction.options.data ?? []),
         });
       }
     );

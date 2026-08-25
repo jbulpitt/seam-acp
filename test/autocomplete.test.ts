@@ -2,10 +2,13 @@ import { describe, it, expect } from "vitest";
 import {
   AutocompleteRegistry,
   autocompleteKey,
+  collectStringOptionValues,
   filterByPrefix,
+  labeledAutocompleteChoices,
   presetAutocompleteChoices,
   safeAutocompleteRespond,
   toAutocompleteChoices,
+  tokenAutocompleteChoices,
   DISCORD_AUTOCOMPLETE_MAX,
 } from "../packages/core/src/platforms/discord/autocomplete.js";
 import { classifyDiscordInteraction } from "../packages/core/src/platforms/discord/adapter.js";
@@ -100,6 +103,76 @@ describe("preset autocomplete responder", () => {
     expect(filterByPrefix([{ name: "pre-review" }, { name: "reviewer" }], "rev").map((p) => p.name)).toEqual([
       "reviewer",
     ]);
+  });
+
+  it("also matches a value prefix (so typing an id hits 'name (id)' rows)", () => {
+    const rows = [
+      { name: "Daily standup (sch_abc)", value: "sch_abc" },
+      { name: "Weekly (sch_zzz)", value: "sch_zzz" },
+    ];
+    expect(filterByPrefix(rows, "sch_a").map((r) => r.value)).toEqual(["sch_abc"]);
+    expect(filterByPrefix(rows, "Daily").map((r) => r.value)).toEqual(["sch_abc"]);
+  });
+});
+
+describe("tokenAutocompleteChoices / labeledAutocompleteChoices", () => {
+  it("shows label (id) and submits the id", () => {
+    const choices = tokenAutocompleteChoices(
+      [
+        { id: "sch_1", label: "Morning brief" },
+        { id: "sch_2", label: "Nightly" },
+      ],
+      "Mor"
+    );
+    expect(choices).toEqual([{ name: "Morning brief (sch_1)", value: "sch_1" }]);
+  });
+
+  it("matches the id prefix too", () => {
+    const choices = tokenAutocompleteChoices(
+      [
+        { id: "wake_aa", label: "check back" },
+        { id: "wake_bb", label: "other" },
+      ],
+      "wake_b"
+    );
+    expect(choices.map((c) => c.value)).toEqual(["wake_bb"]);
+  });
+
+  it("caps at 25", () => {
+    const many = Array.from({ length: 40 }, (_, i) => ({
+      name: `n${String(i).padStart(2, "0")}`,
+      value: `v${String(i).padStart(2, "0")}`,
+    }));
+    expect(labeledAutocompleteChoices(many, "n")).toHaveLength(DISCORD_AUTOCOMPLETE_MAX);
+  });
+});
+
+describe("collectStringOptionValues", () => {
+  it("walks nested subcommand groups for sibling string values", () => {
+    const data = [
+      {
+        name: "schedule",
+        options: [
+          {
+            name: "removefile",
+            options: [
+              { name: "id", value: "sch_1" },
+              { name: "filename", value: "notes" },
+            ],
+          },
+        ],
+      },
+    ];
+    expect(collectStringOptionValues(data)).toEqual({ id: "sch_1", filename: "notes" });
+  });
+
+  it("skips non-string values", () => {
+    expect(
+      collectStringOptionValues([
+        { name: "now", value: true },
+        { name: "thread", value: "123" },
+      ])
+    ).toEqual({ thread: "123" });
   });
 });
 

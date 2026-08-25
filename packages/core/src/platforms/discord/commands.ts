@@ -68,6 +68,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("thread")
           .setDescription("Target thread id (default: this thread)")
           .setRequired(false)
+          .setAutocomplete(true)
       )
       // #63: options are free (they don't count toward the 25 top-level cap), so
       // the two tiers live on this one command. Default false = cooperative inbox
@@ -112,6 +113,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("cancel-wake")
           .setDescription("Cancel a pending wake in this thread by id")
           .setRequired(false)
+          .setAutocomplete(true)
       )
       // Watches (#60, D7) are agent-authored condition triggers — surfaced +
       // cancelled here (not in the human `/seam schedule` UI), same as wakes.
@@ -120,24 +122,28 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("cancel-watch")
           .setDescription("Cancel a pending watch in this thread by id")
           .setRequired(false)
+          .setAutocomplete(true)
       )
       .addStringOption((o) =>
         o
           .setName("cancel-choice")
           .setDescription("Cancel an open choice card in this thread by id")
           .setRequired(false)
+          .setAutocomplete(true)
       )
       .addStringOption((o) =>
         o
           .setName("cancel-ingest")
           .setDescription("Revoke a headless ingest endpoint in this thread by id")
           .setRequired(false)
+          .setAutocomplete(true)
       )
       .addStringOption((o) =>
         o
           .setName("cancel-live")
           .setDescription("Hang up a live-help Gemini voice call by id")
           .setRequired(false)
+          .setAutocomplete(true)
       )
   );
 
@@ -164,7 +170,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("model")
           .setDescription("Get or set the agent model for this thread")
           .addStringOption((o) =>
-            o.setName("id").setDescription("Model id").setRequired(false)
+            o.setName("id").setDescription("Model id").setRequired(false).setAutocomplete(true)
           )
       )
       .addSubcommand((sub) =>
@@ -196,6 +202,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .setName("id")
               .setDescription("agent id or agentId@location (e.g. claude, claude@mac)")
               .setRequired(false)
+              .setAutocomplete(true)
           )
       )
       .addSubcommand((sub) =>
@@ -203,7 +210,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("mode")
           .setDescription("Set the agent operational mode")
           .addStringOption((o) =>
-            o.setName("id").setDescription("Mode id").setRequired(true)
+            o.setName("id").setDescription("Mode id").setRequired(true).setAutocomplete(true)
           )
       )
       .addSubcommand((sub) =>
@@ -215,6 +222,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .setName("path")
               .setDescription("Path under REPOS_ROOT (or absolute). Omit to open a picker.")
               .setRequired(false)
+              .setAutocomplete(true)
           )
           .addStringOption((o) =>
             o
@@ -473,33 +481,53 @@ export function buildSeamCommand(): SlashCommandBuilder {
         sub
           .setName("remove")
           .setDescription("Delete a scheduled prompt")
-          .addStringOption((o) => o.setName("id").setDescription("Schedule id (see /seam schedule list)").setRequired(true))
+          .addStringOption((o) =>
+            o
+              .setName("id")
+              .setDescription("Schedule id (see /seam schedule list)")
+              .setRequired(true)
+              .setAutocomplete(true)
+          )
       )
       .addSubcommand((sub) =>
         sub
           .setName("toggle")
           .setDescription("Enable or disable a scheduled prompt")
-          .addStringOption((o) => o.setName("id").setDescription("Schedule id").setRequired(true))
+          .addStringOption((o) =>
+            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
+          )
       )
       .addSubcommand((sub) =>
         sub
           .setName("addfile")
           .setDescription("Attach another reference file to a scheduled prompt")
-          .addStringOption((o) => o.setName("id").setDescription("Schedule id").setRequired(true))
+          .addStringOption((o) =>
+            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
+          )
           .addAttachmentOption((o) => o.setName("file").setDescription("File to add").setRequired(true))
       )
       .addSubcommand((sub) =>
         sub
           .setName("removefile")
           .setDescription("Remove a reference file from a scheduled prompt")
-          .addStringOption((o) => o.setName("id").setDescription("Schedule id").setRequired(true))
-          .addStringOption((o) => o.setName("filename").setDescription("Filename to remove").setRequired(true))
+          .addStringOption((o) =>
+            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("filename")
+              .setDescription("Filename to remove")
+              .setRequired(true)
+              .setAutocomplete(true)
+          )
       )
       .addSubcommand((sub) =>
         sub
           .setName("edit")
           .setDescription("Edit a scheduled prompt (reopens the builder card)")
-          .addStringOption((o) => o.setName("id").setDescription("Schedule id").setRequired(true))
+          .addStringOption((o) =>
+            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
+          )
       )
   );
 

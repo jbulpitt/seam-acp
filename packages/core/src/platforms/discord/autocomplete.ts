@@ -20,6 +20,16 @@ export type AutocompleteContext = {
   focusedValue: string;
   /** Project scope (parent channel id). Empty/undefined ⇒ no choices (D3). */
   projectScopeId: string | undefined;
+  /** Invoking channel/thread id. Thread-scoped responders need this. */
+  channelId?: string;
+  /** Parent channel id when the command ran in a thread. */
+  parentId?: string;
+  /** Bound session id (`discord:<threadId>`), if a session row exists. */
+  sessionId?: string;
+  /** Effective agent id for this thread (preset-aware). */
+  agentId?: string;
+  /** Other filled string options on this command (sibling values). */
+  optionValues?: Readonly<Record<string, string>>;
 };
 
 export type AutocompleteResponder = (
@@ -55,14 +65,17 @@ export class AutocompleteRegistry {
   }
 }
 
-/** Case-insensitive prefix match on `name`. Empty prefix ⇒ all items. */
-export function filterByPrefix<T extends { name: string }>(
+/** Case-insensitive prefix match on `name` or `value`. Empty prefix ⇒ all items. */
+export function filterByPrefix<T extends { name: string; value?: string }>(
   items: readonly T[],
   prefix: string
 ): T[] {
   const q = prefix.trim().toLowerCase();
   if (!q) return [...items];
-  return items.filter((item) => item.name.toLowerCase().startsWith(q));
+  return items.filter((item) => {
+    if (item.name.toLowerCase().startsWith(q)) return true;
+    return typeof item.value === "string" && item.value.toLowerCase().startsWith(q);
+  });
 }
 
 /**
@@ -96,6 +109,59 @@ export function presetAutocompleteChoices(
 ): AutocompleteChoice[] {
   if (!projectScopeId) return [];
   return toAutocompleteChoices(filterByPrefix(presets, prefix));
+}
+
+/**
+ * Filter + cap a `{name, value}` list. Convenience wrapper used by every
+ * new slash autocomplete responder.
+ */
+export function labeledAutocompleteChoices(
+  items: readonly { name: string; value: string }[],
+  prefix: string
+): AutocompleteChoice[] {
+  return toAutocompleteChoices(filterByPrefix(items, prefix));
+}
+
+/**
+ * Token/id picker: human label with the id in parentheses, value = id.
+ * Typing either the label prefix or the id prefix matches.
+ */
+export function tokenAutocompleteChoices(
+  tokens: readonly { id: string; label?: string }[],
+  prefix: string
+): AutocompleteChoice[] {
+  return labeledAutocompleteChoices(
+    tokens.map((t) => ({
+      name: t.label && t.label !== t.id ? `${t.label} (${t.id})` : t.id,
+      value: t.id,
+    })),
+    prefix
+  );
+}
+
+/**
+ * Flatten Discord `interaction.options.data` into name → string value.
+ * Nested subcommand / group options are walked. Non-string values skipped.
+ */
+export function collectStringOptionValues(
+  data: ReadonlyArray<{ name?: string; value?: unknown; options?: readonly unknown[] }>
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (opts: readonly unknown[] | undefined): void => {
+    if (!opts) return;
+    for (const raw of opts) {
+      const o = raw as { name?: string; value?: unknown; options?: unknown[] };
+      if (Array.isArray(o.options)) {
+        walk(o.options);
+        continue;
+      }
+      if (typeof o.name === "string" && typeof o.value === "string") {
+        out[o.name] = o.value;
+      }
+    }
+  };
+  walk(data);
+  return out;
 }
 
 /**

@@ -396,13 +396,13 @@ const Schema = z.object({
   SEAM_MIDTURN_REPLY_MODE: z.enum(["abort", "inbox"]).default("abort"),
 
   /**
-   * Inbox-awareness preamble (#61). When true, every human chat turn's
-   * `<seam-harness>` includes a standing bullet that the session has a
-   * pull-only inbox and should call `poll_inbox` to drain it. Default false
+   * Inbox-awareness preamble (#61). When true, a human chat turn's
+   * `<seam-harness>` includes a standing `poll_inbox` bullet — but only if
+   * that session actually has seam-mcp attached (#108). Default false
    * ships DARK: the golden preamble stays byte-identical until an operator
-   * flips this. Dispatch / scheduled / wake / watch turns still skip the
-   * harness (they never go through `withHarnessPreamble`); the per-handoff
-   * `watchFeedback` instruction is independent.
+   * flips this. Dispatch turns get a harness with seamFences off; the
+   * per-handoff `watchFeedback` instruction is still independent and is
+   * itself gated on seam-mcp.
    */
   SEAM_INBOX_PREAMBLE_ENABLED: z
     .enum(["true", "false"])

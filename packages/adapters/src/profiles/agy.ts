@@ -43,6 +43,7 @@ import {
   type InitializeResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
+  type McpServer,
   type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
@@ -65,6 +66,111 @@ import { STAGING_ROOT } from "../attachment-staging.js";
 const AGY_HOME = path.join(process.env.HOME ?? "/root", ".gemini/antigravity-cli");
 const CONVERSATION_DIR = path.join(AGY_HOME, "conversations");
 const SETTINGS_FILE = path.join(AGY_HOME, "settings.json");
+const REAL_GEMINI = path.join(process.env.HOME ?? "/root", ".gemini");
+const REAL_MCP_CONFIG = path.join(REAL_GEMINI, "config", "mcp_config.json");
+const STALE_SEAM_SCRIPT = "agy-mcp-server.mjs";
+
+/**
+ * Translate ACP `mcpServers` into agy 1.1.20 `mcp_config.json` shape.
+ * HTTP uses `serverUrl` + `headers` (what `agy mcp add --type http --header` writes).
+ */
+export function buildAgyMcpConfigJson(servers: McpServer[]): string {
+  const map: Record<string, unknown> = {};
+  for (const s of servers) {
+    if ("type" in s && (s.type === "http" || s.type === "sse")) {
+      const http = s as McpServer & {
+        name: string;
+        url: string;
+        headers?: Array<{ name: string; value: string }>;
+      };
+      const headers: Record<string, string> = {};
+      for (const h of http.headers ?? []) headers[h.name] = h.value;
+      map[http.name] = {
+        disabled: false,
+        serverUrl: http.url,
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      };
+    } else {
+      const stdio = s as McpServer & {
+        name: string;
+        command: string;
+        args: string[];
+        env?: Array<{ name: string; value: string }>;
+      };
+      const env: Record<string, string> = {};
+      for (const v of stdio.env ?? []) env[v.name] = v.value;
+      map[stdio.name] = {
+        command: stdio.command,
+        args: stdio.args ?? [],
+        ...(Object.keys(env).length > 0 ? { env } : {}),
+      };
+    }
+  }
+  return JSON.stringify({ mcpServers: map }, null, 2);
+}
+
+/** Drop the host's broken stdio `seam` entry that pointed at a missing script. */
+export function scrubStaleGlobalSeamStdio(configPath = REAL_MCP_CONFIG): boolean {
+  try {
+    const json = JSON.parse(fsSync.readFileSync(configPath, "utf8")) as {
+      mcpServers?: Record<string, { command?: string; args?: string[] }>;
+    };
+    const servers = json.mcpServers;
+    if (!servers) return false;
+    let changed = false;
+    for (const [name, cfg] of Object.entries(servers)) {
+      const blob = `${cfg?.command ?? ""} ${(cfg?.args ?? []).join(" ")}`;
+      if (blob.includes(STALE_SEAM_SCRIPT)) {
+        delete servers[name];
+        changed = true;
+      }
+    }
+    if (!changed) return false;
+    fsSync.writeFileSync(configPath, JSON.stringify(json, null, 2) + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Per-session HOME so each `agy -p` reads its own mcp_config.json.
+ * `~/.gemini/config/mcp_config.json` is process-global; HOME is the only
+ * isolation that `agy mcp list` honors (no --mcp-config flag). Auth and
+ * conversations stay on the real tree via symlink of `antigravity-cli`.
+ */
+export async function prepareAgyMcpHome(
+  sessionId: string,
+  servers: McpServer[],
+  realGemini = REAL_GEMINI
+): Promise<string | undefined> {
+  if (servers.length === 0) return undefined;
+  const home = path.join(os.tmpdir(), "seam-agy-homes", sessionId);
+  const gemini = path.join(home, ".gemini");
+  const cfgDir = path.join(gemini, "config");
+  await fs.mkdir(cfgDir, { recursive: true });
+  try {
+    const ents = await fs.readdir(realGemini, { withFileTypes: true });
+    for (const ent of ents) {
+      if (ent.name === "config") continue;
+      const dest = path.join(gemini, ent.name);
+      try {
+        await fs.lstat(dest);
+      } catch {
+        await fs.symlink(path.join(realGemini, ent.name), dest);
+      }
+    }
+  } catch {
+    /* no real ~/.gemini */
+  }
+  try {
+    await fs.copyFile(path.join(realGemini, "config", "config.json"), path.join(cfgDir, "config.json"));
+  } catch {
+    /* optional userSettings */
+  }
+  await fs.writeFile(path.join(cfgDir, "mcp_config.json"), `${buildAgyMcpConfigJson(servers)}\n`);
+  return home;
+}
 /**
  * Where we point each spawned `agy`'s `--log-file`. Every turn (and every
  * catalog/usage probe) gets a unique file under here so it can read back its
@@ -188,6 +294,8 @@ async function clearPersistedSession(
 export function makeAgyProfile(opts: {
   /** Override the agy binary location. Defaults to `agy` on PATH. */
   cliPath?: string;
+  /** Global managed MCP servers (playwright, …). Per-session seam-mcp arrives on newSession. */
+  mcpServers?: McpServer[];
   /**
    * Model id to advertise as the profile-level default. Per-session model
    * comes from the catalog returned by `newSession` (or whatever the user
@@ -235,7 +343,7 @@ export function makeAgyProfile(opts: {
     // there is no separate reasoning-effort knob, so the picker is suppressed.
     effort: { mechanism: "modelBaked", levels: [] },
     spawn() {
-      return makeFakeAgyProcess(cli, mappingFile, opts.printTimeoutSeconds);
+      return makeFakeAgyProcess(cli, mappingFile, opts.printTimeoutSeconds, opts.mcpServers ?? []);
     },
     sessionManager: {
       async listSessions(cwd: string): Promise<SessionSummary[]> {
@@ -528,14 +636,19 @@ export function makeAgyProfile(opts: {
 
 type FakeProc = ChildProcessByStdio<Writable, Readable, Readable>;
 
-function makeFakeAgyProcess(cli: string, mappingFile: string, printTimeoutSeconds?: number): FakeProc {
+function makeFakeAgyProcess(
+  cli: string,
+  mappingFile: string,
+  printTimeoutSeconds?: number,
+  mcpServers: McpServer[] = []
+): FakeProc {
   const fakeStdin = new PassThrough(); // client writes here; we read from it
   const fakeStdout = new PassThrough(); // we write here; client reads from it
   const fakeStderr = new PassThrough();
   const emitter = new EventEmitter();
   let killed = false;
 
-  const agent = new AgyAgent(cli, mappingFile, printTimeoutSeconds);
+  const agent = new AgyAgent(cli, mappingFile, printTimeoutSeconds, mcpServers);
 
   const stream = ndJsonStream(
     Writable.toWeb(fakeStdout),
@@ -585,6 +698,9 @@ interface AgySession {
    */
   maxStepIndex: number;
   modelId?: string;
+  mcpServers: McpServer[];
+  /** Isolated HOME for this session's mcp_config.json (undefined = inherit). */
+  mcpHome?: string;
 }
 
 interface ActiveRun {
@@ -603,6 +719,7 @@ class AgyAgent implements Agent {
     private readonly cli: string,
     private readonly mappingFile: string,
     private readonly printTimeoutSeconds?: number,
+    private readonly defaultMcpServers: McpServer[] = [],
   ) {}
 
   bind(conn: AgentSideConnection): void {
@@ -632,7 +749,9 @@ class AgyAgent implements Agent {
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     const id = randomUUID();
-    this.sessions.set(id, { cwd: params.cwd, maxStepIndex: -1 });
+    const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
+    const mcpHome = await prepareAgyMcpHome(id, mcpServers);
+    this.sessions.set(id, { cwd: params.cwd, maxStepIndex: -1, mcpServers, mcpHome });
     const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
     if (catalog.length === 0) {
       return { sessionId: id };
@@ -645,10 +764,14 @@ class AgyAgent implements Agent {
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const persisted = await loadPersistedSession(this.mappingFile, params.sessionId);
+    const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
+    const mcpHome = await prepareAgyMcpHome(params.sessionId, mcpServers);
     this.sessions.set(params.sessionId, {
       cwd: params.cwd,
       cascadeId: persisted?.cascadeId,
       maxStepIndex: persisted?.maxStepIndex ?? -1,
+      mcpServers,
+      mcpHome,
     });
     const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
     if (catalog.length === 0) {
@@ -774,6 +897,7 @@ class AgyAgent implements Agent {
     const proc = spawn(this.cli, args, {
       cwd: sess.cwd,
       stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
+      ...(sess.mcpHome ? { env: { ...process.env, HOME: sess.mcpHome } } : {}),
     });
 
     if (useStdin && proc.stdin) {

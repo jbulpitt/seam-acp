@@ -28,7 +28,7 @@ export function makeCodexProfile(opts: {
   staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
   threadAbbr?: string;
   /** Override the effort descriptor. Defaults to configOption-based
-   *  reasoning_effort (low/medium/high), matching the Copilot/OpenAI pattern. */
+   *  reasoning_effort (low/medium/high/xhigh/max/ultra), matching the OpenAI pattern. */
   effort?: AgentProfile["effort"];
   /** Custom environment variables to inject into the spawned process. */
   extraEnv?: Record<string, string>;
@@ -45,7 +45,9 @@ export function makeCodexProfile(opts: {
     effort: opts.effort ?? {
       mechanism: "configOption",
       configId: "reasoning_effort",
-      levels: ["low", "medium", "high"],
+      // codex-acp advertises six reasoning_effort levels (probed on 1.6.2);
+      // "ultra" (max reasoning + auto task delegation) is codex-only.
+      levels: ["low", "medium", "high", "xhigh", "max", "ultra"],
     },
     spawn() {
       const env: NodeJS.ProcessEnv = { ...process.env };

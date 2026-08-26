@@ -386,13 +386,14 @@ const PLATFORM = "discord";
 
 /** Reasoning-effort options for the `/seam effort` picker. Mirror of the SDK's
  *  EffortLevel type — keep in sync with commands.ts and the bundled SDK
- *  (docs/model-management-runbook.md §11). `ultra` is not in the SDK. */
+ *  (docs/model-management-runbook.md §11). `ultra` is codex-only (not in the Claude SDK). */
 const EFFORT_CHOICES = [
   { value: "low", label: "Low", description: "Fastest, least reasoning" },
   { value: "medium", label: "Medium", description: "Light reasoning" },
   { value: "high", label: "High", description: "Default for most models" },
   { value: "xhigh", label: "X-High", description: "Deeper reasoning (Opus 4.7+)" },
   { value: "max", label: "Max", description: "Maximum reasoning depth" },
+  { value: "ultra", label: "Ultra", description: "Max reasoning + auto task delegation (codex)" },
 ];
 // Maximum total size of an inline-rendered fence message
 // (```lang\n...\n``` plus optional notice). Fences whose rendered

@@ -38,6 +38,11 @@ import { CardGifCatalog } from "./core/card-gifs.js";
 import { resolveIngestPublicBase, resolvePublicBridgeWsUrl } from "./core/mcp-url.js";
 import fs from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { QuotaRegistry } from "./core/quota/quota-registry.js";
+import {
+  AgentQuotaPoller,
+  createAgentQuotaSources,
+} from "./core/quota/quota-poller.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -416,6 +421,16 @@ async function main(): Promise<void> {
     },
   });
 
+  const quotaRegistry = new QuotaRegistry();
+  const quotaPoller = new AgentQuotaPoller({
+    logger,
+    registry: quotaRegistry,
+    sources: createAgentQuotaSources(router.listProfiles(), {
+      agyCliPath: config.AGY_CLI_PATH,
+      grokCliPath: config.GROK_CLI_PATH,
+    }),
+  });
+
   const renderer = discordRenderer;
 
   const adapter: DiscordAdapter = new DiscordAdapter({
@@ -436,6 +451,7 @@ async function main(): Promise<void> {
     router,
     store,
     renderer,
+    quotaPoller,
   });
 
   orchestrator.install();
@@ -518,6 +534,9 @@ async function main(): Promise<void> {
   });
 
   await adapter.start();
+  // Seed one normalized snapshot per configured agent before MCP/card startup,
+  // then let each agent's own recent turn rate drive its recursive poll timer.
+  await quotaPoller.start();
 
   // Start the shared seam-MCP server now that the adapter exists (peek reads
   // threads through it). Its ephemeral port feeds the router's late-bound
@@ -949,6 +968,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, "shutting down");
     orchestrator.stopSentinelWatcher();
+    quotaPoller.stop();
     stopStatusCard?.();
     scheduledManager.stop();
     wakeManager.stop();

@@ -175,6 +175,7 @@ async function makeHarness(opts?: {
   resolveSession?: (token: string | undefined) => SessionRecord | undefined;
   peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
   listThreads?: SeamMcpServerDeps["listThreads"];
+  getAgentQuotas?: SeamMcpServerDeps["getAgentQuotas"];
   scheduleWake?: SeamMcpServerDeps["scheduleWake"];
   cancelWake?: SeamMcpServerDeps["cancelWake"];
   createChoice?: SeamMcpServerDeps["createChoice"];
@@ -271,6 +272,7 @@ async function makeHarness(opts?: {
       ]),
     ...(opts?.peekThread ? { peekThread: opts.peekThread } : {}),
     ...(opts?.listThreads ? { listThreads: opts.listThreads } : {}),
+    ...(opts?.getAgentQuotas ? { getAgentQuotas: opts.getAgentQuotas } : {}),
     ...(opts?.isChannelLocked ? { isChannelLocked: opts.isChannelLocked } : {}),
     ...(opts?.configAdminUserIds ? { configAdminUserIds: opts.configAdminUserIds } : {}),
     ...(opts?.configParticipantUserIds
@@ -380,6 +382,7 @@ describe("SeamMcpServer", () => {
     expect(body.result.serverInfo.name).toBe("seam-mcp");
     expect(typeof body.result.instructions).toBe("string");
     expect(body.result.instructions).toMatch(/rename_thread\(name\)/);
+    expect(body.result.instructions).toMatch(/agent_quota\(agentId\?\)/);
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
 
@@ -388,6 +391,7 @@ describe("SeamMcpServer", () => {
     const { body } = await h.call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
     expect(names).toEqual([
+      "agent_quota",
       "cancel_choice",
       "cancel_ingest",
       "cancel_live_help",
@@ -436,6 +440,58 @@ describe("SeamMcpServer", () => {
     // returnTo defaults to the caller's thread.
     expect(spec.returnTo).toBe("thread-caller");
     expect(spec.kind).toBe("handoff");
+  });
+
+  it("agent_quota returns normalized JSON for all agents or one agent", async () => {
+    const quotas = [
+      {
+        agentId: "claude",
+        displayName: "Claude",
+        ok: true,
+        plan: "max",
+        rolling: { usedPercent: 25, resetsAt: 2_000_000_000, label: "rolling" },
+        weekly: { usedPercent: 50, resetsAt: 2_000_100_000, label: "weekly" },
+        credits: null,
+        fetchedAt: 1_999_999_000,
+      },
+      {
+        agentId: "codex",
+        displayName: "Codex",
+        ok: true,
+        plan: "plus",
+        rolling: { usedPercent: 10, resetsAt: 2_000_000_000, label: "rolling" },
+        weekly: { usedPercent: 20, resetsAt: 2_000_100_000, label: "weekly" },
+        credits: null,
+        fetchedAt: 1_999_999_000,
+      },
+    ];
+    h = await makeHarness({
+      getAgentQuotas: (agentId) =>
+        agentId ? quotas.filter((quota) => quota.agentId === agentId) : quotas,
+    });
+    const all = await h.call(
+      "tools/call",
+      { name: "agent_quota", arguments: {} },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(JSON.parse(all.body.result.content[0].text)).toEqual(quotas);
+    const one = await h.call(
+      "tools/call",
+      { name: "agent_quota", arguments: { agentId: "codex" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(JSON.parse(one.body.result.content[0].text)).toEqual([quotas[1]]);
+  });
+
+  it("agent_quota reports an unknown configured agent", async () => {
+    h = await makeHarness({ getAgentQuotas: () => [] });
+    const { body } = await h.call(
+      "tools/call",
+      { name: "agent_quota", arguments: { agentId: "missing" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toMatch(/Unknown configured agent/);
   });
 
   it("handoff to a thread-id worker runs live in that thread", async () => {
@@ -498,8 +554,8 @@ describe("SeamMcpServer", () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
-    // Adding an OPTION to handoff does NOT change the tool count (`rename_thread` grew the list).
-    expect(body.result.tools).toHaveLength(24);
+    // Adding an OPTION to handoff does NOT change the tool count (`agent_quota` makes 25).
+    expect(body.result.tools).toHaveLength(25);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -1261,8 +1317,8 @@ describe("SeamMcpServer", () => {
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
-    // Params on `send` must NOT add a tool — the set stays at 24 (`rename_thread` included).
-    expect(body.result.tools).toHaveLength(24);
+    // Params on `send` must NOT add a tool — the set stays at 25 (`agent_quota` included).
+    expect(body.result.tools).toHaveLength(25);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

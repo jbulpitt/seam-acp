@@ -5476,9 +5476,10 @@ export class Orchestrator {
           }
           this.choiceResults.turnEnded(spec.id);
         }
-        const liveRuntime = effectiveSession === "live"
-          ? this.router.getRuntime(record.id)
-          : undefined;
+        const liveRuntime =
+          effectiveSession === "live" && typeof this.router.getRuntime === "function"
+            ? this.router.getRuntime(record.id)
+            : undefined;
         const quotaRequest: QuotaConnectionRequest | undefined =
           liveRuntime && (quotaAgentId === "grok" || quotaAgentId.startsWith("grok-"))
             ? (method, params) => liveRuntime.request(method, params)

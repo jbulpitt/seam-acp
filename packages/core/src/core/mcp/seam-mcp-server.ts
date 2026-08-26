@@ -32,6 +32,7 @@ import type { ConfigDescription } from "../session-router.js";
 import type { ConfigMutationInput } from "../config-mutation.js";
 import { isRestrictedParticipant, PARTICIPANT_CONFIG_REFUSAL } from "../../config.js";
 import { formatHostPrefixed, parseDispatchWorker } from "../location.js";
+import type { AgentQuota } from "../quota/agent-quota.js";
 
 /** Read-only entities visible to the calling thread (schedules + presets),
  *  returned by `config_describe` alongside the effective config. A FULL
@@ -155,6 +156,8 @@ export interface SeamMcpServerDeps {
    * discovery is unsupported on this deployment.
    */
   listThreads?: (record: SessionRecord) => Promise<ThreadEntry[]>;
+  /** Read normalized quota headroom for one configured agent or all agents. */
+  getAgentQuotas?: (agentId?: string) => AgentQuota[];
   /**
    * Compute the EFFECTIVE config + which layer won for the calling session
    * (#58 P1). Undefined ⇒ config introspection is unsupported on this
@@ -526,6 +529,23 @@ const TOOLS = [
           description:
             "Optional. Only \"self\" (or your own thread/channel id) is accepted — you can only ever list " +
             "YOUR OWN channel's threads. Naming another channel is refused. Defaults to your own channel.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "agent_quota",
+    description:
+      "Read normalized rolling and weekly quota for one configured agent or all agents. " +
+      "Orchestration models use this to pick workers with headroom and steer handoffs away " +
+      "from agents nearing a rolling or weekly cap.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agentId: {
+          type: "string",
+          description: "Optional configured agent id. Omit to return every agent.",
         },
       },
       required: [],
@@ -1225,6 +1245,8 @@ const INSTRUCTIONS = [
   "  HERE — every tool below takes a thread id, and this is the only way to discover one. `busy` tells you",
   "  HOW to reach a teammate: busy ⇒ prefer send (pull-only, won't interrupt); idle ⇒ handoff/forward land",
   "  a turn cleanly. The entry marked isSelf is YOUR OWN thread — never hand off to it.",
+  "- agent_quota(agentId?): read normalized rolling + weekly quota for one agent or all agents",
+  "  before choosing workers; steer away from agents nearing a cap.",
   "- handoff(worker, prompt, returnTo?): delegate a task. `worker` is a thread id (a stateful",
   "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
   "  result is dispatched back into your thread when it completes.",
@@ -1418,6 +1440,8 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolPeek(args));
         case "threads":
           return rpcResult(id, await this.toolThreads(record, args));
+        case "agent_quota":
+          return rpcResult(id, this.toolAgentQuota(args));
         case "chain":
           return rpcResult(id, await this.toolChain(record, args));
         case "compact":
@@ -1750,6 +1774,19 @@ export class SeamMcpServer {
         "if idle, handoff/forward start a turn directly. Never hand off to the entry marked YOU."
     );
     return textResult(lines.join("\n"));
+  }
+
+  /** Read-only, bot-wide quota registry. Available to every authenticated agent. */
+  private toolAgentQuota(args: Record<string, unknown>): McpToolResult {
+    if (!this.deps.getAgentQuotas) {
+      return textResult("Agent quota data is not supported on this deployment.", true);
+    }
+    const agentId = optionalString(args, "agentId");
+    const quotas = this.deps.getAgentQuotas(agentId);
+    if (agentId && quotas.length === 0) {
+      return textResult(`Unknown configured agent: "${agentId}".`, true);
+    }
+    return textResult(JSON.stringify(quotas, null, 2));
   }
 
   /** Rename the caller's own thread. Self-scoped; restricted participants refused. */

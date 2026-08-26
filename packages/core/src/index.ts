@@ -553,6 +553,11 @@ async function main(): Promise<void> {
         return store.get(sid) ?? orchestrator.resolveIngestJob(sid);
       },
       enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+      getAgentQuotas: (agentId) => {
+        if (!agentId) return quotaRegistry.all();
+        const quota = quotaRegistry.get(agentId);
+        return quota ? [quota] : [];
+      },
       // Agent-scheduled wake events (#59): arm/cancel a one-shot self-resumption
       // for the calling thread. The orchestrator owns the loop-safety guards and
       // the DB row; the WakeManager sweeper fires it via the dispatch queue.

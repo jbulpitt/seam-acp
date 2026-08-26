@@ -89,6 +89,7 @@ describe("Codex Session Manager", () => {
             output_tokens: 20,
             total_tokens: 120,
           },
+          last_token_usage: { total_tokens: 120 },
           model_context_window: 258400,
         },
       }),
@@ -200,6 +201,7 @@ describe("Codex Session Manager", () => {
         type: "token_count",
         info: {
           total_token_usage: { total_tokens: 50 },
+          last_token_usage: { total_tokens: 50 },
           model_context_window: 258400,
         },
       }),
@@ -209,6 +211,7 @@ describe("Codex Session Manager", () => {
           type: "token_count",
           info: {
             total_token_usage: { total_tokens: 90 },
+            last_token_usage: { total_tokens: 90 },
             model_context_window: 258400,
           },
         },

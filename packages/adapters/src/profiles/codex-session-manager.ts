@@ -1,4 +1,5 @@
-import { promises as fsp } from "node:fs";
+import { promises as fsp, createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import os from "node:os";
 import path from "node:path";
 import type {
@@ -323,11 +324,16 @@ export class CodexSessionManager implements ISessionManager {
         } else if (kind === "token_count") {
           const info = payload.info as
             | {
+                // `last_token_usage` = the most recent turn's context fill (what
+                // seam reports as "context used"). `total_token_usage` is the
+                // session CUMULATIVE total (grows unbounded across turns) — using
+                // it here inflated the count to tens of millions. Use last_.
+                last_token_usage?: { total_tokens?: number };
                 total_token_usage?: { total_tokens?: number };
                 model_context_window?: number;
               }
             | undefined;
-          const totalTokens = info?.total_token_usage?.total_tokens ?? 0;
+          const totalTokens = info?.last_token_usage?.total_tokens ?? 0;
           const contextLimit =
             typeof info?.model_context_window === "number"
               ? info.model_context_window
@@ -375,12 +381,18 @@ export class CodexSessionManager implements ISessionManager {
   private async peekMeta(
     filePath: string
   ): Promise<{ sessionId?: string; cwd?: string } | null> {
-    let fh: fsp.FileHandle | undefined;
+    // Read only the FIRST line (session_meta). Codex embeds base_instructions
+    // (~18KB) in it, so a fixed-size buffer read truncates the JSON — stream
+    // line-by-line and stop after line 1 (any size) without reading the rest.
+    const stream = createReadStream(filePath, { encoding: "utf8" });
     try {
-      fh = await fsp.open(filePath, "r");
-      const buf = Buffer.alloc(8192);
-      const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-      const first = buf.toString("utf8", 0, bytesRead).split("\n")[0];
+      const rl = createInterface({ input: stream, crlfDelay: Infinity });
+      let first: string | undefined;
+      for await (const line of rl) {
+        first = line;
+        break;
+      }
+      rl.close();
       if (!first?.trim()) return null;
       const entry = JSON.parse(first) as RolloutEntry;
       if (entry.type !== "session_meta" || !entry.payload) return null;
@@ -396,7 +408,7 @@ export class CodexSessionManager implements ISessionManager {
     } catch {
       return null;
     } finally {
-      await fh?.close().catch(() => {});
+      stream.destroy();
     }
   }
 

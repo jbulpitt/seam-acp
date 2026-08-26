@@ -180,14 +180,15 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .addStringOption((o) =>
             o
               .setName("level")
-              .setDescription("low | medium | high | xhigh | max — agent falls back if model doesn't support it")
+              .setDescription("low | medium | high | xhigh | max | ultra — agent falls back if model doesn't support it")
               .setRequired(false)
               .addChoices(
                 { name: "low", value: "low" },
                 { name: "medium", value: "medium" },
                 { name: "high", value: "high" },
                 { name: "xhigh", value: "xhigh" },
-                { name: "max", value: "max" }
+                { name: "max", value: "max" },
+                { name: "ultra", value: "ultra" }
               )
           )
       )

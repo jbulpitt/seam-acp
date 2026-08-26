@@ -12447,9 +12447,10 @@ export class Orchestrator {
     const isCopilot =
       record.agentId === "copilot" || record.agentId.startsWith("copilot-");
     const isGrok = record.agentId === "grok" || record.agentId.startsWith("grok-");
-    if (!isAgy && !isClaude && !isCopilot && !isGrok) {
+    const isCodex = record.agentId === "codex" || record.agentId.startsWith("codex-");
+    if (!isAgy && !isClaude && !isCopilot && !isGrok && !isCodex) {
       await i.editReply({
-        content: `\`/seam usage\` is only available for the \`agy\`, \`claude\`, \`copilot\`, and \`grok\` agents. This thread uses \`${record.agentId}\`.`,
+        content: `\`/seam usage\` is only available for the \`agy\`, \`claude\`, \`copilot\`, \`grok\`, and \`codex\` agents. This thread uses \`${record.agentId}\`.`,
       });
       return;
     }
@@ -12474,6 +12475,10 @@ export class Orchestrator {
           ? await fetchGrokUsageFromConnection((method, params) => live.request(method, params))
           : await fetchGrokUsage(this.config.GROK_CLI_PATH);
         await i.editReply({ content: formatGrokUsage(data) });
+      } else if (isCodex) {
+        const { fetchCodexUsage } = await import("@seam/adapters");
+        const data = await fetchCodexUsage();
+        await i.editReply({ content: formatCodexUsage(data) });
       } else {
         const { fetchCopilotUsage } = await import("@seam/adapters");
         const data = await fetchCopilotUsage(configDir);
@@ -15656,6 +15661,46 @@ function formatGrokUsage(
     );
   } else {
     lines.push("No billing data available.");
+  }
+  return lines.join("\n");
+}
+
+function formatCodexUsage(
+  d: import("@seam/adapters").CodexUsageData
+): string {
+  if (!d.ok) return `Couldn't read codex usage: ${d.error ?? "no data"}`;
+  const lines: string[] = [
+    `**OpenAI Codex usage**${d.plan ? ` — plan \`${d.plan}\`` : ""}`,
+  ];
+  const windowLabel = (min: number): string => {
+    if (min >= 9000) return "Weekly";
+    if (min >= 240 && min <= 360) return "5h";
+    if (min % 1440 === 0) return `${min / 1440}d`;
+    if (min % 60 === 0) return `${min / 60}h`;
+    return `${min}m`;
+  };
+  const fmtWin = (
+    w: import("@seam/adapters").CodexRateWindow | null
+  ): string | null => {
+    if (!w) return null;
+    const reset =
+      w.resetsAt != null
+        ? ` · resets ${formatResetTime(new Date(w.resetsAt * 1000).toISOString())}`
+        : "";
+    return usageLine(w.usedPercent, `${windowLabel(w.windowMinutes)} limit${reset}`);
+  };
+  const rows = [fmtWin(d.primary), fmtWin(d.secondary)].filter(
+    (s): s is string => s !== null
+  );
+  if (rows.length > 0) {
+    lines.push("", "**Rate limits**", ...rows);
+  } else {
+    lines.push("", "_No rate-limit data yet — run a codex turn first._");
+  }
+  if (d.credits) {
+    lines.push(
+      d.credits.unlimited ? "Credits: unlimited" : `Credits: ${d.credits.balance}`
+    );
   }
   return lines.join("\n");
 }

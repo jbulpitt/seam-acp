@@ -111,11 +111,18 @@ describe("AgentAdapter local stubs + session delegates", () => {
     await expect(grok.writeAttachment("/tmp", "x.txt", "Zg==")).resolves.toBeNull();
   });
 
-  it("usage() is null without sessionManager.getUsage (opencode, codex)", async () => {
+  it("usage() is null without sessionManager.getUsage (opencode)", async () => {
     await expect(
       makeOpencodeProfile({ defaultModel: "x" }).usage("/tmp")
     ).resolves.toBeNull();
-    await expect(makeCodexProfile({ defaultModel: "o3" }).usage("/tmp")).resolves.toBeNull();
+  });
+
+  it("codex usage() delegates to sessionManager even when the sessions dir is empty", async () => {
+    const u = await makeCodexProfile({
+      defaultModel: "o3",
+      sessionsRoot: "/tmp/seam-codex-sessions-does-not-exist",
+    }).usage("/tmp");
+    expect(u).toEqual({ model: null, totalUsed: 0, contextLimit: 0 });
   });
 
   it("session verbs no-op when there is no sessionManager", async () => {

@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
 import { asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import { CodexSessionManager } from "./codex-session-manager.js";
+
+export { CodexSessionManager, defaultCodexSessionsRoot } from "./codex-session-manager.js";
 
 /**
  * OpenAI Codex CLI as an ACP server, via the official adapter
@@ -32,6 +35,11 @@ export function makeCodexProfile(opts: {
   effort?: AgentProfile["effort"];
   /** Custom environment variables to inject into the spawned process. */
   extraEnv?: Record<string, string>;
+  /**
+   * Override the on-disk Codex rollout root (`~/.codex/sessions`). Tests pass a
+   * temp dir; production omits this and uses `$HOME/.codex/sessions`.
+   */
+  sessionsRoot?: string;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "codex-acp";
 
@@ -62,5 +70,8 @@ export function makeCodexProfile(opts: {
         detached: true,
       });
     },
+    sessionManager: new CodexSessionManager(
+      opts.sessionsRoot ? { sessionsRoot: opts.sessionsRoot } : undefined
+    ),
   });
 }

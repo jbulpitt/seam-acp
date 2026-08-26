@@ -1092,6 +1092,16 @@ export class DiscordAdapter implements ChatAdapter {
     await msg.delete();
   }
 
+  async bumpThread(channel: ChannelRef): Promise<void> {
+    const ch = await this.fetchSendableChannel(channel.id);
+    const sent = await ch.send({
+      content: "\u200B",
+      flags: MessageFlags.SuppressNotifications,
+      allowedMentions: { parse: [] },
+    });
+    await sent.delete();
+  }
+
   async pinMessage(message: MessageRef): Promise<void> {
     const ch = await this.fetchSendableChannel(message.channel.id);
     const msg = await ch.messages.fetch(message.id);

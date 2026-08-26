@@ -601,6 +601,16 @@ const Schema = z.object({
     .optional(),
 
   /**
+   * Optional Discord thread/channel id for the pinned per-agent quota card.
+   * The card is edited after quota refreshes and silently self-bumps every
+   * 20 hours so its thread stays visible in Discord navigation.
+   */
+  DISCORD_AGENT_QUOTA_THREAD_ID: z
+    .string()
+    .regex(/^\d+$/, "DISCORD_AGENT_QUOTA_THREAD_ID must be a numeric Discord channel id")
+    .optional(),
+
+  /**
    * Optional path to a JSON file that pre-configures Discord channels and
    * threads with a default agent / model / cwd / effort / preamble rider.
    * Shape: `{ "channels": { "<channelId>": {...} }, "threads": { "<threadId>":

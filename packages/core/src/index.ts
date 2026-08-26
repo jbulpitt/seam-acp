@@ -43,6 +43,7 @@ import {
   AgentQuotaPoller,
   createAgentQuotaSources,
 } from "./core/quota/quota-poller.js";
+import { AgentQuotaCard } from "./core/quota/agent-quota-card.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -879,6 +880,27 @@ async function main(): Promise<void> {
   // Best-effort startup notification to a configured channel.
   void orchestrator.postNotification("✅ Seam online.");
 
+  // One pinned quota card for every configured agent. Poller refreshes poke it;
+  // the controller edits in place and silently self-bumps its thread every 20h.
+  let stopQuotaCard: (() => void) | undefined;
+  if (config.DISCORD_AGENT_QUOTA_THREAD_ID) {
+    const quotaCard = new AgentQuotaCard({
+      logger,
+      adapter,
+      threadId: config.DISCORD_AGENT_QUOTA_THREAD_ID,
+      dataDir: config.DATA_DIR,
+      collect: () => quotaRegistry.all(),
+    });
+    quotaPoller.setOnUpdate(() => quotaCard.poke());
+    stopQuotaCard = () => {
+      quotaPoller.setOnUpdate(undefined);
+      quotaCard.stop();
+    };
+    void quotaCard.start().catch((err) =>
+      logger.warn({ err }, "agent quota card failed to start")
+    );
+  }
+
   // One editable server-status card (uptime / turns / bridges). Posts once,
   // then edits in place — 30s tick + immediate bump on bridge connect/drop.
   let stopStatusCard: (() => void) | undefined;
@@ -969,6 +991,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, "shutting down");
     orchestrator.stopSentinelWatcher();
     quotaPoller.stop();
+    stopQuotaCard?.();
     stopStatusCard?.();
     scheduledManager.stop();
     wakeManager.stop();

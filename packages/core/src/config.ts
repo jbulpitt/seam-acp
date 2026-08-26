@@ -1102,19 +1102,6 @@ export function buildChannelPresetMaps(
   return { channelPresets, threadPresets, bridgePresets };
 }
 
-/** Models from the Codex CLI's bundled catalog (models.json in openai/codex).
- *  `context_window` is the default working window; `max_context_window` is the
- *  extended limit (only gpt-5.4 supports extended context to 1M). We use
- *  `context_window` for `contextLimit` since that's the practical size.
- *  CODEX_MODELS env var overrides this list when set. */
-export const CODEX_STATIC_MODELS = [
-  { modelId: "gpt-5.5",           name: "GPT-5.5",            contextLimit: 272_000 },
-  { modelId: "gpt-5.4",           name: "GPT-5.4",            contextLimit: 272_000 },
-  { modelId: "gpt-5.4-mini",      name: "GPT-5.4 mini",       contextLimit: 272_000 },
-  { modelId: "gpt-5.3-codex",     name: "GPT-5.3-Codex",      contextLimit: 272_000 },
-  { modelId: "gpt-5.2",           name: "GPT-5.2",            contextLimit: 272_000 },
-];
-
 /** Models for xAI Grok Build.  Context windows from docs.x.ai/developers/models.
  *  GROK_MODELS env var overrides this list when set. */
 export const GROK_STATIC_MODELS = [

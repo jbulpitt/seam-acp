@@ -1,6 +1,6 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { loadConfig, isChannelLocked, resolveThreadLocation, adminParticipantOverlapIds, CODEX_STATIC_MODELS, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
+import { loadConfig, isChannelLocked, resolveThreadLocation, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { hostEmoji } from "./core/location.js";
 import { LoopbackHost } from "./core/loopback-host.js";
 import { logger } from "./lib/logger.js";
@@ -189,7 +189,10 @@ async function main(): Promise<void> {
     ? makeCodexProfile({
         ...(config.CODEX_CLI_PATH ? { cliPath: config.CODEX_CLI_PATH } : {}),
         defaultModel: config.CODEX_DEFAULT_MODEL,
-        staticModels: config.CODEX_MODELS ?? CODEX_STATIC_MODELS,
+        // No static list: codex-acp advertises its current catalog in session/new,
+        // so the picker uses that live list (always up to date). CODEX_MODELS still
+        // overrides if an operator wants to pin a custom set.
+        staticModels: config.CODEX_MODELS,
         threadAbbr: "🧬",
       })
     : undefined;

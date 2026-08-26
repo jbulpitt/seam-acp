@@ -379,6 +379,10 @@ import {
   withBrandAttachment,
 } from "../../core/agent-brand.js";
 import { resolveDiscordSpeakerName, type DiscordAdapter } from "./adapter.js";
+import type {
+  AgentQuotaPoller,
+  QuotaConnectionRequest,
+} from "../../core/quota/quota-poller.js";
 
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
@@ -439,6 +443,7 @@ export class Orchestrator {
   private readonly router: SessionRouter;
   private readonly store: SessionStore;
   private readonly renderer: Renderer;
+  private readonly quotaPoller?: AgentQuotaPoller;
   /** Conversational config mutation engine (#58 P2/P3). Platform-agnostic; the
    *  orchestrator adds the Discord confirm card + apply/restart wiring. */
   private readonly configMutation: ConfigMutationService;
@@ -537,6 +542,7 @@ export class Orchestrator {
     router: SessionRouter;
     store: SessionStore;
     renderer: Renderer;
+    quotaPoller?: AgentQuotaPoller;
   }) {
     this.logger = opts.logger.child({ comp: "orchestrator" });
     this.config = opts.config;
@@ -544,6 +550,7 @@ export class Orchestrator {
     this.router = opts.router;
     this.store = opts.store;
     this.renderer = opts.renderer;
+    this.quotaPoller = opts.quotaPoller;
 
     // #58 P2/P3: the mutation engine reuses the router's precedence resolver
     // (describeConfig) and profiles, and hot-reloads the LIVE preset maps
@@ -1233,6 +1240,7 @@ export class Orchestrator {
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
+    this.quotaPoller?.recordTurnStart(record.agentId);
 
     // #76: live-turn marker — written at START, removed at terminal state
     // (this finally, or the command layer). Markers are written even when
@@ -1592,8 +1600,13 @@ export class Orchestrator {
       return /temporarily limiting requests|rate limited/i.test(msg);
     };
 
+    let quotaRequest: QuotaConnectionRequest | undefined;
+
     try {
       let activeRuntime = await this.router.getOrStartRuntime(record);
+      if (record.agentId === "grok" || record.agentId.startsWith("grok-")) {
+        quotaRequest = (method, params) => activeRuntime.request(method, params);
+      }
       if (record.acpSessionId) {
         await patchLiveMarker(this.config.DATA_DIR, liveMarkerId, {
           acpSessionId: record.acpSessionId,
@@ -2395,6 +2408,7 @@ export class Orchestrator {
       }).catch((err) =>
         this.logger.warn({ err, id: liveMarkerId }, "live-turn marker finish failed")
       );
+      void this.quotaPoller?.turnCompleted(record.agentId, quotaRequest);
     }
   }
 
@@ -5142,6 +5156,7 @@ export class Orchestrator {
     }
     const presetProfile = (preset?.agentId ? this.router.getProfile(preset.agentId) : undefined)
       ?? (agentOverride ? this.router.getProfile(agentOverride) : undefined);
+    const quotaAgentId = presetProfile?.id ?? record.agentId;
     const effectiveSession = preset || agentOverride ? "isolated" : spec.session;
     const threadLocation = resolveThreadLocation(this.config, spec.target);
     const workerLocation = spec.location
@@ -5248,6 +5263,7 @@ export class Orchestrator {
     const statusPanelOn = this.config.SEAM_DISPATCH_STATUS_PANEL !== false;
 
     const run = async (): Promise<{ output: string; stopReason: string }> => {
+      this.quotaPoller?.recordTurnStart(quotaAgentId);
       // Isolated: do not mark `running` here — wait for newSession() so the
       // status transition carries the ACP session id (#75). Live: the thread's
       // session id is already on the record, so we can stamp both now.
@@ -5460,6 +5476,15 @@ export class Orchestrator {
           }
           this.choiceResults.turnEnded(spec.id);
         }
+        const liveRuntime =
+          effectiveSession === "live" && typeof this.router.getRuntime === "function"
+            ? this.router.getRuntime(record.id)
+            : undefined;
+        const quotaRequest: QuotaConnectionRequest | undefined =
+          liveRuntime && (quotaAgentId === "grok" || quotaAgentId.startsWith("grok-"))
+            ? (method, params) => liveRuntime.request(method, params)
+            : undefined;
+        void this.quotaPoller?.turnCompleted(quotaAgentId, quotaRequest);
       }
       if (!result) throw new Error("dispatch: injectTurn returned no result");
 
@@ -5576,6 +5601,7 @@ export class Orchestrator {
     if (!profile) {
       throw new Error(`dispatch ${spec.id}: unknown agent "${agentId}"`);
     }
+    this.quotaPoller?.recordTurnStart(agentId);
     const cwd = preset?.repoPath ?? spec.cwd ?? this.config.REPOS_ROOT;
     const model = preset?.model ?? spec.model;
     const effort = preset?.effort ?? spec.effort;
@@ -5655,6 +5681,7 @@ export class Orchestrator {
         });
       } finally {
         this.activeTurns--;
+        void this.quotaPoller?.turnCompleted(agentId);
         if (this.choiceResults) {
           if (result?.text) {
             const harvested = extractSeamResultFromText(result.text);
@@ -15755,4 +15782,3 @@ function formatResetTime(iso: string): string {
 
 // Re-export for convenience.
 export type { EmbedBuilder };
-

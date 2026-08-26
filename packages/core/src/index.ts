@@ -38,6 +38,12 @@ import { CardGifCatalog } from "./core/card-gifs.js";
 import { resolveIngestPublicBase, resolvePublicBridgeWsUrl } from "./core/mcp-url.js";
 import fs from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { QuotaRegistry } from "./core/quota/quota-registry.js";
+import {
+  AgentQuotaPoller,
+  createAgentQuotaSources,
+} from "./core/quota/quota-poller.js";
+import { AgentQuotaCard } from "./core/quota/agent-quota-card.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -416,6 +422,16 @@ async function main(): Promise<void> {
     },
   });
 
+  const quotaRegistry = new QuotaRegistry();
+  const quotaPoller = new AgentQuotaPoller({
+    logger,
+    registry: quotaRegistry,
+    sources: createAgentQuotaSources(router.listProfiles(), {
+      agyCliPath: config.AGY_CLI_PATH,
+      grokCliPath: config.GROK_CLI_PATH,
+    }),
+  });
+
   const renderer = discordRenderer;
 
   const adapter: DiscordAdapter = new DiscordAdapter({
@@ -436,6 +452,7 @@ async function main(): Promise<void> {
     router,
     store,
     renderer,
+    quotaPoller,
   });
 
   orchestrator.install();
@@ -518,6 +535,9 @@ async function main(): Promise<void> {
   });
 
   await adapter.start();
+  // Seed one normalized snapshot per configured agent before MCP/card startup,
+  // then let each agent's own recent turn rate drive its recursive poll timer.
+  await quotaPoller.start();
 
   // Start the shared seam-MCP server now that the adapter exists (peek reads
   // threads through it). Its ephemeral port feeds the router's late-bound
@@ -533,6 +553,11 @@ async function main(): Promise<void> {
         return store.get(sid) ?? orchestrator.resolveIngestJob(sid);
       },
       enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+      getAgentQuotas: (agentId) => {
+        if (!agentId) return quotaRegistry.all();
+        const quota = quotaRegistry.get(agentId);
+        return quota ? [quota] : [];
+      },
       // Agent-scheduled wake events (#59): arm/cancel a one-shot self-resumption
       // for the calling thread. The orchestrator owns the loop-safety guards and
       // the DB row; the WakeManager sweeper fires it via the dispatch queue.
@@ -860,6 +885,27 @@ async function main(): Promise<void> {
   // Best-effort startup notification to a configured channel.
   void orchestrator.postNotification("✅ Seam online.");
 
+  // One pinned quota card for every configured agent. Poller refreshes poke it;
+  // the controller edits in place and silently self-bumps its thread every 20h.
+  let stopQuotaCard: (() => void) | undefined;
+  if (config.DISCORD_AGENT_QUOTA_THREAD_ID) {
+    const quotaCard = new AgentQuotaCard({
+      logger,
+      adapter,
+      threadId: config.DISCORD_AGENT_QUOTA_THREAD_ID,
+      dataDir: config.DATA_DIR,
+      collect: () => quotaRegistry.all(),
+    });
+    quotaPoller.setOnUpdate(() => quotaCard.poke());
+    stopQuotaCard = () => {
+      quotaPoller.setOnUpdate(undefined);
+      quotaCard.stop();
+    };
+    void quotaCard.start().catch((err) =>
+      logger.warn({ err }, "agent quota card failed to start")
+    );
+  }
+
   // One editable server-status card (uptime / turns / bridges). Posts once,
   // then edits in place — 30s tick + immediate bump on bridge connect/drop.
   let stopStatusCard: (() => void) | undefined;
@@ -949,6 +995,8 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, "shutting down");
     orchestrator.stopSentinelWatcher();
+    quotaPoller.stop();
+    stopQuotaCard?.();
     stopStatusCard?.();
     scheduledManager.stop();
     wakeManager.stop();

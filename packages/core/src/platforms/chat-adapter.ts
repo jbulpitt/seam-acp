@@ -147,6 +147,12 @@ export interface ChatAdapter {
   deleteMessage?(message: MessageRef): Promise<void>;
 
   /**
+   * Optional: keep a thread present in Discord's navigation without notifying
+   * members. Implementations post a silent zero-width-space message and delete it.
+   */
+  bumpThread?(channel: ChannelRef): Promise<void>;
+
+  /**
    * Optional: send a Components v2 layout (Container + separators).
    * Cannot mix with embeds on the same message.
    */

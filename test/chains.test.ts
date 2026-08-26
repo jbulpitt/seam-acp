@@ -279,6 +279,7 @@ describe("chain MCP tool", () => {
     const body = await call("tools/list");
     const names = body.result.tools.map((t: { name: string }) => t.name).sort();
     expect(names).toEqual([
+      "agent_quota",
       "cancel_choice",
       "cancel_ingest",
       "cancel_live_help",

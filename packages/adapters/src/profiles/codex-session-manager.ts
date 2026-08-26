@@ -431,3 +431,141 @@ export class CodexSessionManager implements ISessionManager {
     return out;
   }
 }
+
+// ── Account rate limits (the CLI `/status` data), read from rollouts ──────────
+
+export interface CodexRateWindow {
+  /** 0–100 of this window consumed. */
+  usedPercent: number;
+  /** Window length in minutes (~300 = 5h, 10080 = weekly). */
+  windowMinutes: number;
+  /** Unix SECONDS when the window resets, or null. */
+  resetsAt: number | null;
+}
+
+export interface CodexUsageData {
+  ok: boolean;
+  plan: string | null;
+  primary: CodexRateWindow | null;
+  secondary: CodexRateWindow | null;
+  credits: { hasCredits: boolean; unlimited: boolean; balance: string } | null;
+  error?: string;
+}
+
+function mapCodexRateLimits(raw: unknown): CodexUsageData | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const win = (w: unknown): CodexRateWindow | null => {
+    if (!w || typeof w !== "object") return null;
+    const o = w as Record<string, unknown>;
+    return {
+      usedPercent: typeof o.used_percent === "number" ? o.used_percent : 0,
+      windowMinutes: typeof o.window_minutes === "number" ? o.window_minutes : 0,
+      resetsAt: typeof o.resets_at === "number" ? o.resets_at : null,
+    };
+  };
+  const c = r.credits as Record<string, unknown> | undefined;
+  const credits =
+    c && typeof c === "object"
+      ? {
+          hasCredits: Boolean(c.has_credits),
+          unlimited: Boolean(c.unlimited),
+          balance: String(c.balance ?? "0"),
+        }
+      : null;
+  return {
+    ok: true,
+    plan: typeof r.plan_type === "string" ? r.plan_type : null,
+    primary: win(r.primary),
+    secondary: win(r.secondary),
+    credits,
+  };
+}
+
+/** Scan one rollout for the LAST token_count carrying a `rate_limits` block. */
+async function readLastCodexRateLimits(filePath: string): Promise<CodexUsageData | null> {
+  const stream = createReadStream(filePath, { encoding: "utf8" });
+  let found: CodexUsageData | null = null;
+  try {
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of rl) {
+      // Cheap pre-filter so we only JSON.parse the relevant lines.
+      if (!line.includes("token_count") || !line.includes("rate_limits")) continue;
+      let entry: RolloutEntry;
+      try {
+        entry = JSON.parse(line) as RolloutEntry;
+      } catch {
+        continue;
+      }
+      const payload = entry.payload as
+        | { type?: string; rate_limits?: unknown }
+        | undefined;
+      if (payload?.type !== "token_count" || !payload.rate_limits) continue;
+      const mapped = mapCodexRateLimits(payload.rate_limits);
+      if (mapped) found = mapped; // keep the LAST one in the file
+    }
+    rl.close();
+  } catch {
+    /* fall through with whatever we found */
+  } finally {
+    stream.destroy();
+  }
+  return found;
+}
+
+/**
+ * Read codex's account rate limits — the same data the codex CLI `/status`
+ * shows (plan, primary/secondary windows with used% + reset, credits). Rate
+ * limits are ACCOUNT-global, so the freshest snapshot from any recent session
+ * is current: scan rollouts newest-first (by mtime) and return the first one
+ * that carries a `rate_limits` block.
+ */
+export async function fetchCodexUsage(opts?: {
+  sessionsRoot?: string;
+}): Promise<CodexUsageData> {
+  const root = opts?.sessionsRoot ?? defaultCodexSessionsRoot();
+  const empty = (error?: string): CodexUsageData => ({
+    ok: false,
+    plan: null,
+    primary: null,
+    secondary: null,
+    credits: null,
+    ...(error ? { error } : {}),
+  });
+  try {
+    const files: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      let entries;
+      try {
+        entries = await fsp.readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) await walk(p);
+        else if (e.isFile() && e.name.endsWith(".jsonl")) files.push(p);
+      }
+    };
+    await walk(root);
+
+    const withMtime: Array<{ f: string; m: number }> = [];
+    for (const f of files) {
+      try {
+        withMtime.push({ f, m: (await fsp.stat(f)).mtimeMs });
+      } catch {
+        /* skip unreadable */
+      }
+    }
+    withMtime.sort((a, b) => b.m - a.m);
+
+    // Bound the scan: the newest handful almost always has fresh limits.
+    for (const { f } of withMtime.slice(0, 25)) {
+      const usage = await readLastCodexRateLimits(f);
+      if (usage) return usage;
+    }
+    return empty("no rate-limit data in recent codex sessions");
+  } catch (err) {
+    return empty(err instanceof Error ? err.message : "codex usage read failed");
+  }
+}

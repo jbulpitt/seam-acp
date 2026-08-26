@@ -441,7 +441,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
         sub.setName("whoami").setDescription("Show which account this thread's agent is signed in as")
       )
       .addSubcommand((sub) =>
-        sub.setName("usage").setDescription("Show usage / credits for this thread's agent (agy, claude, copilot, grok)")
+        sub.setName("usage").setDescription("Show usage / credits for this thread's agent (agy, claude, copilot, grok, codex)")
       )
       .addSubcommand((sub) =>
         sub.setName("avatar").setDescription("Push the bot avatar and banner to Discord (force re-upload)")

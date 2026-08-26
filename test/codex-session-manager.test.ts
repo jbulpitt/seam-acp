@@ -5,6 +5,7 @@ import path from "node:path";
 import { makeCodexProfile } from "@seam/adapters";
 import {
   CodexSessionManager,
+  fetchCodexUsage,
   sessionIdFromRolloutFilename,
 } from "../packages/adapters/src/profiles/codex-session-manager.js";
 
@@ -254,5 +255,47 @@ describe("makeCodexProfile wires sessionManager", () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("fetchCodexUsage", () => {
+  let root: string;
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-usage-"));
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("reads plan + rate limits from the latest rollout's token_count", async () => {
+    writeRollout(root, ID_A, "/repo", [
+      rolloutLine("event_msg", {
+        type: "token_count",
+        info: {
+          last_token_usage: { total_tokens: 4000 },
+          model_context_window: 258400,
+        },
+        rate_limits: {
+          plan_type: "pro",
+          primary: { used_percent: 13, window_minutes: 10080, resets_at: 1788329130 },
+          secondary: { used_percent: 42, window_minutes: 300, resets_at: 1788300000 },
+          credits: { has_credits: false, unlimited: false, balance: "0" },
+        },
+      }),
+    ]);
+    const d = await fetchCodexUsage({ sessionsRoot: root });
+    expect(d.ok).toBe(true);
+    expect(d.plan).toBe("pro");
+    expect(d.primary).toEqual({ usedPercent: 13, windowMinutes: 10080, resetsAt: 1788329130 });
+    expect(d.secondary).toEqual({ usedPercent: 42, windowMinutes: 300, resetsAt: 1788300000 });
+    expect(d.credits).toEqual({ hasCredits: false, unlimited: false, balance: "0" });
+  });
+
+  it("returns ok:false when no rollout carries rate_limits", async () => {
+    writeRollout(root, ID_B, "/repo"); // meta only, no token_count
+    const d = await fetchCodexUsage({ sessionsRoot: root });
+    expect(d.ok).toBe(false);
+    expect(d.primary).toBeNull();
+    expect(d.error).toBeTruthy();
   });
 });

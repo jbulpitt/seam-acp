@@ -14,4 +14,5 @@ export * from "./profiles/copilot.js";
 export * from "./profiles/agy.js";
 export * from "./profiles/opencode.js";
 export * from "./profiles/codex.js";
+export * from "./profiles/codex-session-manager.js";
 export * from "./profiles/grok.js";

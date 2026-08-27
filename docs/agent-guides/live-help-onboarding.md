@@ -2,8 +2,8 @@
 
 Paste **1** into a course or school-agent repo that does **not** yet know
 Gemini-in-a-voice-channel. That agent should fetch the canonical guide, hang
-the raw URL in its own library, and overlay only that course (approved VC
-snowflake, consent).
+the raw URL in its own library, and overlay only that course (designated VC
+snowflake and transcript policy).
 
 Canonical spec (do not fork):
 `https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/live-help.md`
@@ -24,7 +24,7 @@ Seam-acp live help is a KEY SKILL for this course: you pack a lesson in THIS tex
 Fetch and keep this guide (re-read it now):
 https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/live-help.md
 
-Link that URL in the library. Overlay only THIS course (put the approved voice-channel snowflake in THIS THREAD's rider so live help finds it before the default, plus notifyThread / consent). Do not fork the protocol.
+Link that URL in the library. Overlay only THIS course (put the designated voice-channel snowflake in THIS THREAD's rider so live help finds it before the default, plus notifyThread policy). Do not fork the protocol.
 
 Persist these facts:
 
@@ -32,8 +32,8 @@ DEFAULT USE
 - Live help is NOT TTS of your last text reply and NOT transcribing a Discord voice note. Gemini hears and speaks in a voice channel. Your text session stays here (parallel).
 - Mint with MCP create_live_help only. No seam-live fence. Required: voiceChannelId (snowflake), system (short tutor job). Optional: historySummary (a few sentences, not files), notifyThread (opt-in transcript), preset.
 - Returns { liveId }. You do not block. Hang up with cancel_live_help({ liveId }).
-- Students (Alaina/Allie) may BE in the call. They are participants — they must not mint, cancel, or pick the channel. If create_live_help is refused, stop.
-- Voice channel: look in THIS THREAD's rider (thread overlay, else channel rider) for a designated live-help / voice-channel snowflake and use that. If the rider does not name one, fall back to family-guild General 1487095870188027987. Put the course VC in the rider so new sessions use the right room. Ask Jesse with a frozen click-card if you are unsure whether to start a call.
+- Students (Alaina/Allie) may request, start, and stop their own live-help session through the course agent. Their request is sufficient; do not ask Jesse/admin for separate approval.
+- Voice channel: look in THIS THREAD's rider (thread overlay, else channel rider) for a designated live-help / voice-channel snowflake and use that. If the rider does not name one, fall back to family-guild General 1487095870188027987. Put the course VC in the rider so new sessions use the right room; students do not need to choose a snowflake.
 - Do not promise Discord screen share, webcam, or Go Live. Bots cannot receive those. Do not use /seam debug voice-*.
 - notifyThread omitted = no transcript posts. Set it to this thread or a staff thread if Jesse should read later.
 
@@ -45,7 +45,7 @@ After writing the library entry, confirm: file path(s), the raw guide URL is in 
 ```
 Update the course library from
 https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/live-help.md
-Voice notes and /seam config tts stay the message path. Live help is Gemini joining a VC (create_live_help). Kids may listen; they must not mint. Rider first for the VC snowflake. Say which file you changed.
+Voice notes and /seam config tts stay the message path. Live help is Gemini joining a VC (create_live_help). Students may request and end their own session without parent/admin approval. Rider first for the VC snowflake. Say which file you changed.
 ```
 
 **3. Refresh snippet** after #98 merges (tools actually present):
@@ -53,6 +53,6 @@ Voice notes and /seam config tts stay the message path. Live help is Gemini join
 ```
 Re-fetch and keep:
 https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/live-help.md
-create_live_help / cancel_live_help should now be in your MCP list. Overlay still THIS course's approved voiceChannelId **in the thread rider** (checked before the General default). If the tool is still missing, say so — do not work around it.
+create_live_help / cancel_live_help should now be in your MCP list. Overlay still THIS course's designated voiceChannelId **in the thread rider** (checked before the General default). If the tool is still missing, say so — do not work around it.
 Say which file(s) you changed.
 ```

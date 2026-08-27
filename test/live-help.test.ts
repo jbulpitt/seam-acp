@@ -1,15 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ChannelType } from "discord.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { LiveHelpManager, type LiveHelpHost } from "../packages/core/src/core/live-help/manager.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import {
   checkLiveHelpVoiceChannel,
   parseLiveHelpMintSpec,
 } from "../packages/core/src/core/live-help/voice-policy.js";
-import { isChoiceAuthoringRefused } from "../packages/core/src/core/choice/types.js";
 import {
   buildActivityEnd,
   buildActivityStart,
@@ -31,7 +31,7 @@ import { pino } from "pino";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
-describe("live-help D11 refuse-list", () => {
+describe("live-help voice-channel validation", () => {
   it("accepts an explicit non-school guild voice snowflake", () => {
     expect(
       checkLiveHelpVoiceChannel({
@@ -53,14 +53,14 @@ describe("live-help D11 refuse-list", () => {
     ).toBe(true);
   });
 
-  it("refuses school-named channels and parents", () => {
+  it("accepts designated school/course voice channels", () => {
     expect(
       checkLiveHelpVoiceChannel({
         id: "1487095870188027987",
         name: "school-allie",
         type: ChannelType.GuildVoice,
       }).ok
-    ).toBe(false);
+    ).toBe(true);
     expect(
       checkLiveHelpVoiceChannel({
         id: "1487095870188027987",
@@ -68,7 +68,7 @@ describe("live-help D11 refuse-list", () => {
         type: ChannelType.GuildVoice,
         parentName: "school-alaina",
       }).ok
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("refuses obfuscated and non-voice", () => {
@@ -136,7 +136,7 @@ describe("live-help setup shape (D10)", () => {
   });
 });
 
-describe("live-help mint spec + participant gate", () => {
+describe("live-help mint spec + self-service authorization", () => {
   it("requires voiceChannelId + system", () => {
     expect(parseLiveHelpMintSpec({}).ok).toBe(false);
     expect(parseLiveHelpMintSpec({ voiceChannelId: "1" }).ok).toBe(false);
@@ -148,13 +148,66 @@ describe("live-help mint spec + participant gate", () => {
     ).toBe(true);
   });
 
-  it("restricted participants cannot mint; injected turns can", () => {
-    const kids = new Set(["kid-1"]);
-    const admins = new Set(["admin-1"]);
-    expect(isChoiceAuthoringRefused("kid-1", kids, admins)).toBe(true);
-    expect(isChoiceAuthoringRefused("admin-1", kids, admins)).toBe(false);
-    expect(isChoiceAuthoringRefused(null, kids, admins)).toBe(false);
-    expect(isChoiceAuthoringRefused(undefined, kids, admins)).toBe(false);
+  it("lets a restricted participant start and stop live help in their own thread", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-live-help-auth-"));
+    const store = new SessionStore(path.join(dir, "test.db"));
+    try {
+      const session: SessionRecord = {
+        id: "discord:thread-1",
+        platform: "discord",
+        channelRef: "thread-1",
+        parentRef: "course-1",
+        agentId: "grok",
+        acpSessionId: "acp",
+        repoPath: "/repo",
+        configJson: "{}",
+        createdUtc: "2026-01-01T00:00:00Z",
+        updatedUtc: "2026-01-01T00:00:00Z",
+      };
+      const mint = vi.fn(async () => ({
+        ok: true as const,
+        liveId: "lh_student",
+        guildId: "guild-1",
+        channelName: "school-allie",
+      }));
+      const cancel = vi.fn(() => ({ ok: true as const }));
+      const orch = new Orchestrator({
+        logger: silent,
+        config: {
+          DATA_DIR: dir,
+          REPOS_ROOT: dir,
+          DISCORD_ALLOWED_USER_IDS: new Set(["kid-1"]),
+          SEAM_PARTICIPANT_USER_IDS: new Set(["kid-1"]),
+          SEAM_CONFIG_ADMIN_USER_IDS: new Set(["admin-1"]),
+          channelPresets: new Map(),
+          threadPresets: new Map(),
+        } as any,
+        adapter: {} as any,
+        router: { listProfiles: () => [], describeConfig: () => ({}) } as any,
+        store,
+        renderer: {} as any,
+      });
+      orch.setLiveHelpManager({ mint, cancel } as unknown as LiveHelpManager);
+      (orch as any).currentAuthorIds.set(session.channelRef, "kid-1");
+
+      const spec = {
+        voiceChannelId: "1541262301636853832",
+        system: "Tutor the current lesson.",
+      };
+      await expect(orch.createLiveHelp(session, spec)).resolves.toMatchObject({
+        ok: true,
+        liveId: "lh_student",
+      });
+      expect(mint).toHaveBeenCalledWith(session, spec, "kid-1");
+
+      expect(orch.cancelLiveHelp(session, "lh_student")).toEqual({ ok: true });
+      expect(cancel).toHaveBeenCalledWith("lh_student", {
+        authoringChannelRef: "thread-1",
+      });
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -360,7 +413,7 @@ describe("MCP create_live_help / cancel_live_help", () => {
     await server.stop();
   });
 
-  it("surfaces a participant refusal", async () => {
+  it("surfaces a host policy refusal", async () => {
     const { SeamMcpServer } = await import("../packages/core/src/core/mcp/seam-mcp-server.js");
     const server = new SeamMcpServer({
       logger: silent,
@@ -382,7 +435,7 @@ describe("MCP create_live_help / cancel_live_help", () => {
       enqueueDispatch: async () => {},
       createLiveHelp: async () => ({
         ok: false,
-        error: "Restricted participants cannot mint live-help calls.",
+        error: "This guild already has a live-help session.",
       }),
     });
     await server.start();
@@ -403,7 +456,7 @@ describe("MCP create_live_help / cancel_live_help", () => {
       result: { content: Array<{ text: string }>; isError?: boolean };
     };
     expect(body.result.isError).toBe(true);
-    expect(body.result.content[0]!.text).toMatch(/Restricted participants/);
+    expect(body.result.content[0]!.text).toMatch(/already has a live-help session/);
     await server.stop();
   });
 });

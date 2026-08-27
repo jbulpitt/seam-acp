@@ -1,8 +1,8 @@
 /**
- * D11 refuse-list for production live-help. Explicit snowflake; no General-only
- * allowlist. School-named VCs/parents and obfuscated channels are refused.
+ * Production live-help validates an explicit Discord voice-channel snowflake.
+ * Course/school rooms are valid destinations: their configured rider chooses
+ * the room, so a name containing "school" is not an authorization boundary.
  */
-export const SCHOOL_NAME_RE = /school/i;
 /** discord.js ChannelType.GuildVoice */
 export const GUILD_VOICE_TYPE = 2;
 
@@ -29,12 +29,6 @@ export function checkLiveHelpVoiceChannel(input: {
   }
   if (input.type != null && input.type !== GUILD_VOICE_TYPE) {
     return { ok: false, reason: "refused: not a guild voice channel" };
-  }
-  if (input.name && SCHOOL_NAME_RE.test(input.name)) {
-    return { ok: false, reason: "refused: school-named voice channel" };
-  }
-  if (input.parentName && SCHOOL_NAME_RE.test(input.parentName)) {
-    return { ok: false, reason: "refused: school-named parent" };
   }
   return { ok: true, channelId: input.id };
 }

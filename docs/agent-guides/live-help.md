@@ -28,7 +28,8 @@ Gemini Live hears speech in the VC and talks back. It replies after a short paus
 Your text ACP session **stays in this thread** (parallel session — do not try
 to pipe PCM through `rt.prompt`).
 
-1. Confirm Jesse wants a voice session (consent is a **human policy**).
+1. Treat the current speaker's clear request for live help as consent. Students
+   do **not** need separate parent/admin approval to start their own session.
 2. Resolve `voiceChannelId` in this order — then tell the student (or Jesse)
    which VC to join:
    1. **This thread’s rider** (thread overlay, else the channel rider). Look
@@ -62,16 +63,19 @@ That is enough for a lesson.
 
 ## Who may mint
 
-- **You** (the course / coaching agent, or the orchestrator), when the
-  **speaker** is allowed to configure — typically Jesse.
-- **Not** Alaina or Allie. They are **participants**. They may **be in** the
-  voice channel. They must not mint, cancel, or pick the channel.
+- **You** (the course / coaching agent, or the orchestrator) may mint when an
+  allowed speaker asks for live help, including Alaina or Allie in their own
+  course threads. Live help is a self-service learning feature, not config.
+- Students may ask you to start or stop their session. Resolve the voice
+  channel from the thread/channel rider, then the documented fallback; do not
+  make them supply or choose an arbitrary snowflake.
 - **Not** a `seam-live` fence. Same reason as `create_ingest`: a fence taxes
   the coaching turn and is the wrong object.
 - `/seam debug voice-ping|voice-capture|voice-live` is **admin spike** in
   pairing, not how you start a lesson.
 
-If `create_live_help` is refused, stop. Do not work around the gate.
+If `create_live_help` is refused, report the actual host error (for example a
+busy guild or invalid channel). Do not turn it into a parent-approval request.
 
 ---
 
@@ -131,11 +135,12 @@ report-back in the minting thread. Use that to continue the **text** lesson.
 
 ---
 
-## Consent
+## Self-service and consent
 
-Allie and Alaina may sit in the call. They must not mint. Consent is Jesse’s
-call, not a flag in JSON. If you are unsure whether to start a voice session,
-ask Jesse with a frozen click-card in **this** thread.
+A clear request from the current student/speaker is consent to start that
+speaker's live-help session. Allie and Alaina may initiate and end their own
+sessions through their course agent; no separate Jesse/admin confirmation is
+required. Do not auto-join a VC when nobody requested live help.
 
 ---
 
@@ -156,8 +161,8 @@ ask Jesse with a frozen click-card in **this** thread.
 
 See `docs/agent-guides/live-help-onboarding.md` (paste-1 for a new overlay).
 A brand-new school session should know: pack the lesson, `create_live_help`
-with Jesse’s VC snowflake (rider first, else General), students join that VC,
-kids do not mint.
+with the designated VC snowflake (rider first, else General), students join that VC,
+and students may request or end their own session without parent approval.
 
 ---
 

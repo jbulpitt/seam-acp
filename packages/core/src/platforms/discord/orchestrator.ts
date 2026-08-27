@@ -9677,7 +9677,7 @@ export class Orchestrator {
         });
         return;
       }
-      const result = this.cancelLiveHelp(record, cancelLiveId, { skipAuthorGate: true });
+      const result = this.cancelLiveHelp(record, cancelLiveId);
       await i.reply({
         content: result.ok
           ? `🎙️ Hanging up live help \`${cancelLiveId}\`.`
@@ -13217,15 +13217,6 @@ export class Orchestrator {
     | { ok: false; error: string }
   > {
     const authorId = this.currentAuthorId(record.channelRef);
-    if (
-      isChoiceAuthoringRefused(
-        authorId,
-        this.config.SEAM_PARTICIPANT_USER_IDS,
-        this.config.SEAM_CONFIG_ADMIN_USER_IDS
-      )
-    ) {
-      return { ok: false, error: "Restricted participants cannot mint live-help calls." };
-    }
     if (!this.liveHelpManager) {
       return { ok: false, error: "Live help is not wired on this deployment." };
     }
@@ -13234,19 +13225,8 @@ export class Orchestrator {
 
   cancelLiveHelp(
     record: SessionRecord,
-    liveId: string,
-    opts?: { skipAuthorGate?: boolean }
+    liveId: string
   ): { ok: true } | { ok: false; error: string } {
-    const authorId = opts?.skipAuthorGate ? null : this.currentAuthorId(record.channelRef);
-    if (
-      isChoiceAuthoringRefused(
-        authorId,
-        this.config.SEAM_PARTICIPANT_USER_IDS,
-        this.config.SEAM_CONFIG_ADMIN_USER_IDS
-      )
-    ) {
-      return { ok: false, error: "Restricted participants cannot hang up live-help calls." };
-    }
     if (!this.liveHelpManager) {
       return { ok: false, error: "Live help is not wired on this deployment." };
     }

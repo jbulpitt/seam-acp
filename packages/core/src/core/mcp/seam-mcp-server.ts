@@ -1196,7 +1196,7 @@ const TOOLS = [
   {
     name: "create_live_help",
     description:
-      "Join a Discord voice channel as Gemini Live (audio↔audio tutoring). Parallel to this text session — does not block. Restricted participants cannot mint. See docs/agent-guides/live-help.md.",
+      "Join a Discord voice channel as Gemini Live (audio↔audio tutoring). Parallel to this text session — does not block. Course participants may request their own live-help session. See docs/agent-guides/live-help.md.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1263,7 +1263,7 @@ const INSTRUCTIONS = [
   "- rename_thread(name): rename YOUR OWN thread (free-form title). Restricted participants cannot.",
   "- create_choice / cancel_choice / submit_result: frozen click-cards; HTTP ingest + declared JSON result. Participants cannot author. See docs/agent-guides/interactive-prompts.md.",
   "- create_ingest / cancel_ingest: headless HTTP endpoint (no Discord card). Isolated silent scoring, retries unlimited. Token once. Same POST /ingest + submit_result.",
-  "- create_live_help / cancel_live_help: Gemini joins a Discord voice channel (audio↔audio). Parallel to this text session. Restricted participants cannot mint. See docs/agent-guides/live-help.md.",
+  "- create_live_help / cancel_live_help: Gemini joins a Discord voice channel (audio↔audio). Parallel to this text session. Course participants may start and stop their own live-help session. See docs/agent-guides/live-help.md.",
   "- watch_create(kind, spec, intervalSeconds, prompt, expiresInSeconds, ...): register a CONDITION the bridge",
   "  checks cheaply and re-enters you ONLY when it fires (file/http/command source). Prefer this over a",
   "  schedule_wake poll loop for \"wait until X\" — the bridge does the checking, so a turn is spent only on a",

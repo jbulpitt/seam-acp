@@ -343,7 +343,13 @@ export function makeAgyProfile(opts: {
     // there is no separate reasoning-effort knob, so the picker is suppressed.
     effort: { mechanism: "modelBaked", levels: [] },
     spawn() {
-      return makeFakeAgyProcess(cli, mappingFile, opts.printTimeoutSeconds, opts.mcpServers ?? []);
+      return makeFakeAgyProcess(
+        cli,
+        mappingFile,
+        defaultModel,
+        opts.printTimeoutSeconds,
+        opts.mcpServers ?? []
+      );
     },
     sessionManager: {
       async listSessions(cwd: string): Promise<SessionSummary[]> {
@@ -639,6 +645,7 @@ type FakeProc = ChildProcessByStdio<Writable, Readable, Readable>;
 function makeFakeAgyProcess(
   cli: string,
   mappingFile: string,
+  defaultModel: string,
   printTimeoutSeconds?: number,
   mcpServers: McpServer[] = []
 ): FakeProc {
@@ -648,7 +655,13 @@ function makeFakeAgyProcess(
   const emitter = new EventEmitter();
   let killed = false;
 
-  const agent = new AgyAgent(cli, mappingFile, printTimeoutSeconds, mcpServers);
+  const agent = new AgyAgent(
+    cli,
+    mappingFile,
+    defaultModel,
+    printTimeoutSeconds,
+    mcpServers
+  );
 
   const stream = ndJsonStream(
     Writable.toWeb(fakeStdout),
@@ -718,6 +731,7 @@ class AgyAgent implements Agent {
   constructor(
     private readonly cli: string,
     private readonly mappingFile: string,
+    private readonly defaultModel: string,
     private readonly printTimeoutSeconds?: number,
     private readonly defaultMcpServers: McpServer[] = [],
   ) {}
@@ -854,7 +868,22 @@ class AgyAgent implements Agent {
 
     const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
     const currentModelId = sess.modelId || readCurrentModelId(catalog);
-    const currentModel = catalog.find((m) => m.modelId === currentModelId);
+    const currentModel = resolveAgyModel(
+      catalog,
+      currentModelId,
+      this.defaultModel
+    );
+    if (
+      currentModelId &&
+      currentModel &&
+      currentModel.modelId !== currentModelId
+    ) {
+      // eslint-disable-next-line no-console
+      console.info(
+        `[agy] auto-healing invalid model ${currentModelId} -> ${currentModel.modelId} (${currentModel.rawDisplayName})`
+      );
+      sess.modelId = currentModel.modelId;
+    }
     const maxTokens = currentModel?.maxTokens ?? 1_000_000;
 
     // Linux limits each individual argv/envp string to MAX_ARG_STRLEN
@@ -1691,7 +1720,7 @@ function resolveAgyBinary(): string {
 // ~/.gemini/antigravity-cli/settings.json under the `model` key (a display
 // name like "Gemini 3.5 Flash (High)"), which agy reads on every CLI call.
 
-interface AgyCatalogEntry {
+export interface AgyCatalogEntry {
   /** API id (e.g. "gemini-3-flash-agent") — what we put in ACP `modelId`. */
   modelId: string;
   /** Cleaned-up name for the Discord picker (tier word → icon, no "(Thinking)"). */
@@ -1707,10 +1736,143 @@ interface AgyCatalogEntry {
   maxTokens: number;
 }
 
-let catalogPromise: Promise<AgyCatalogEntry[]> | null = null;
+/** Parse the authoritative model list printed after an invalid `--model`. */
+export function parseAgyAcceptedModels(output: string): Set<string> {
+  const lines = output.split(/\r?\n/);
+  const marker = lines.findIndex((line) => /Available models:/.test(line));
+  if (marker < 0) return new Set();
 
-function getCatalog(cli: string): Promise<AgyCatalogEntry[]> {
-  if (catalogPromise) return catalogPromise;
+  const accepted = new Set<string>();
+  for (const line of lines.slice(marker + 1)) {
+    if (line.trim() === "") break;
+    if (!/^\s/.test(line)) break;
+    accepted.add(line.trim());
+  }
+  return accepted;
+}
+
+/**
+ * Ask agy's own `--model` validator for its accepted display names. The
+ * deliberately invalid model exits non-zero; that exit is expected. Spawn,
+ * timeout, and oversized-output failures return an empty set and never throw.
+ */
+export async function fetchAgyAcceptedModels(cli: string): Promise<Set<string>> {
+  return new Promise((resolve) => {
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn(
+        cli,
+        [
+          "-p",
+          "ok",
+          "--model",
+          "__seam_probe_invalid__",
+          "--print-timeout",
+          "15s",
+          "--dangerously-skip-permissions",
+        ],
+        {
+          cwd: "/tmp",
+          stdio: ["ignore", "pipe", "pipe"],
+        }
+      );
+    } catch {
+      resolve(new Set());
+      return;
+    }
+
+    let output = "";
+    let settled = false;
+    const finish = (models: Set<string>): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(models);
+    };
+    const timeout = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      finish(new Set());
+    }, 15_000);
+    timeout.unref?.();
+    const capture = (chunk: Buffer | string): void => {
+      output += chunk.toString();
+      if (Buffer.byteLength(output) > 1_000_000) {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+        finish(new Set());
+      }
+    };
+    proc.stdout?.on("data", capture);
+    proc.stderr?.on("data", capture);
+    proc.once("error", () => finish(new Set()));
+    proc.once("close", () => finish(parseAgyAcceptedModels(output)));
+  });
+}
+
+let acceptedModelsPromise: Promise<Set<string>> | null = null;
+
+function getAcceptedModels(cli: string): Promise<Set<string>> {
+  if (acceptedModelsPromise) return acceptedModelsPromise;
+  const p = fetchAgyAcceptedModels(cli)
+    .then((models) => {
+      if (models.size === 0) {
+        acceptedModelsPromise = null;
+        console.warn(
+          "[agy] accepted-model probe returned no models — not caching; will retry"
+        );
+      }
+      return models;
+    })
+    .catch((err) => {
+      acceptedModelsPromise = null;
+      console.warn("[agy] accepted-model probe failed:", err);
+      return new Set<string>();
+    });
+  acceptedModelsPromise = p;
+  return acceptedModelsPromise;
+}
+
+/** Keep only LS rows the CLI validator accepts, with fail-open guards. */
+export function filterAgyCatalogByAcceptedModels(
+  rows: ReadonlyArray<AgyCatalogEntry>,
+  accepted: ReadonlySet<string>
+): AgyCatalogEntry[] {
+  if (accepted.size === 0) return [...rows];
+  const filtered = rows.filter((row) => accepted.has(row.rawDisplayName));
+  if (rows.length > 0 && filtered.length === 0) {
+    console.warn(
+      `[agy] accepted-model probe matched none of ${rows.length} catalog rows — using unfiltered catalog`
+    );
+    return [...rows];
+  }
+  return filtered;
+}
+
+/** Resolve a requested model, falling back only to entries in the live catalog. */
+export function resolveAgyModel(
+  catalog: ReadonlyArray<AgyCatalogEntry>,
+  sessionModelId?: string,
+  defaultModel?: string
+): AgyCatalogEntry | undefined {
+  return (
+    catalog.find((entry) => entry.modelId === sessionModelId) ??
+    catalog.find((entry) => entry.rawDisplayName === defaultModel) ??
+    catalog.find((entry) => entry.recommended) ??
+    catalog[0]
+  );
+}
+
+let catalogRowsPromise: Promise<AgyCatalogEntry[]> | null = null;
+
+function getCatalogRows(cli: string): Promise<AgyCatalogEntry[]> {
+  if (catalogRowsPromise) return catalogRowsPromise;
   const p = fetchAgyCatalog(cli)
     .then((rows) => {
       // Don't PIN an empty result. A cold-start LS (or any transient empty
@@ -1719,19 +1881,26 @@ function getCatalog(cli: string): Promise<AgyCatalogEntry[]> {
       // agy session — direct /seam model AND the new-thread wizard both read it.
       // Only memoize a real catalog; reset so the next caller retries.
       if (rows.length === 0) {
-        catalogPromise = null;
+        catalogRowsPromise = null;
         console.error("[agy] catalog fetch returned no usable models — not caching; will retry");
       }
       return rows;
     })
     .catch((err) => {
       // Don't pin the cache to an error — let the next caller retry.
-      catalogPromise = null;
+      catalogRowsPromise = null;
       console.error("[agy] catalog fetch failed:", err);
       return [];
     });
-  catalogPromise = p;
-  return catalogPromise;
+  catalogRowsPromise = p;
+  return catalogRowsPromise;
+}
+
+async function getCatalog(cli: string): Promise<AgyCatalogEntry[]> {
+  const rows = await getCatalogRows(cli);
+  if (rows.length === 0) return rows;
+  const accepted = await getAcceptedModels(cli);
+  return filterAgyCatalogByAcceptedModels(rows, accepted);
 }
 
 /** Snapshot of the agy CLI's "Models & Quota" data. */

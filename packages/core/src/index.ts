@@ -429,6 +429,7 @@ async function main(): Promise<void> {
     sources: createAgentQuotaSources(router.listProfiles(), {
       agyCliPath: config.AGY_CLI_PATH,
       grokCliPath: config.GROK_CLI_PATH,
+      ollamaUsageCliPath: config.OLLAMA_USAGE_CLI_PATH,
     }),
   });
 

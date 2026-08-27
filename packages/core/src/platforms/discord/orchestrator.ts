@@ -12470,14 +12470,16 @@ export class Orchestrator {
       cwd: this.config.REPOS_ROOT,
     });
     const isAgy = record.agentId === "agy";
+    const isOllamaCloud =
+      record.agentId === "ollama-cloud" || record.agentId.startsWith("ollama-cloud-");
     const isClaude = record.agentId === "claude" || record.agentId.startsWith("claude-");
     const isCopilot =
       record.agentId === "copilot" || record.agentId.startsWith("copilot-");
     const isGrok = record.agentId === "grok" || record.agentId.startsWith("grok-");
     const isCodex = record.agentId === "codex" || record.agentId.startsWith("codex-");
-    if (!isAgy && !isClaude && !isCopilot && !isGrok && !isCodex) {
+    if (!isAgy && !isOllamaCloud && !isClaude && !isCopilot && !isGrok && !isCodex) {
       await i.editReply({
-        content: `\`/seam usage\` is only available for the \`agy\`, \`claude\`, \`copilot\`, \`grok\`, and \`codex\` agents. This thread uses \`${record.agentId}\`.`,
+        content: `\`/seam usage\` is only available for the \`agy\`, \`ollama-cloud\`, \`claude\`, \`copilot\`, \`grok\`, and \`codex\` agents. This thread uses \`${record.agentId}\`.`,
       });
       return;
     }
@@ -12488,6 +12490,10 @@ export class Orchestrator {
         const { fetchAgyUserStatus } = await import("@seam/adapters");
         const data = await fetchAgyUserStatus(this.config.AGY_CLI_PATH);
         await i.editReply({ content: formatAgyUsage(data) });
+      } else if (isOllamaCloud) {
+        const { fetchOllamaCloudUsage } = await import("@seam/adapters");
+        const data = await fetchOllamaCloudUsage(this.config.OLLAMA_USAGE_CLI_PATH);
+        await i.editReply({ content: formatOllamaCloudUsage(data) });
       } else if (isClaude) {
         const { fetchClaudeUsage } = await import("@seam/adapters");
         const data = await fetchClaudeUsage(configDir);
@@ -15611,34 +15617,55 @@ function fitTranscriptToWindow(
 }
 
 function formatAgyUsage(d: import("@seam/adapters").AgyUsage): string {
-  const lines: string[] = [];
-  const who = [d.name, d.email].filter(Boolean).join(" · ");
-  lines.push(`**Antigravity usage**${who ? ` — ${who}` : ""}`);
-  const fmt = (n?: number): string =>
-    typeof n === "number" ? n.toLocaleString("en-US") : "—";
-  if (d.monthlyPromptCredits !== undefined || d.availablePromptCredits !== undefined) {
-    const avail = d.availablePromptCredits ?? 0;
-    const total = d.monthlyPromptCredits ?? 0;
-    const pct = total > 0 ? ((total - avail) / total) * 100 : 0;
-    lines.push(usageLine(pct, `Prompt credits — ${fmt(avail)} / ${fmt(total)} remaining`));
-  }
-  if (d.monthlyFlowCredits !== undefined || d.availableFlowCredits !== undefined) {
-    const avail = d.availableFlowCredits ?? 0;
-    const total = d.monthlyFlowCredits ?? 0;
-    const pct = total > 0 ? ((total - avail) / total) * 100 : 0;
-    lines.push(usageLine(pct, `Flow credits — ${fmt(avail)} / ${fmt(total)} remaining`));
-  }
-  const modelsWithQuota = d.models.filter(
-    (m) => typeof m.remainingFraction === "number" || m.resetTime,
-  );
-  if (modelsWithQuota.length > 0) {
-    lines.push("", "**Per-model quotas**");
-    for (const m of modelsWithQuota) {
-      if (typeof m.remainingFraction !== "number") continue;
-      const pct = (1 - m.remainingFraction) * 100;
-      const reset = m.resetTime ? ` · resets ${formatResetTime(m.resetTime)}` : "";
-      lines.push(usageLine(pct, `${m.label}${reset}`));
+  const lines = ["**Antigravity usage**", "", "**Models & Quota**"];
+  const windows = [
+    { window: "weekly", label: "Weekly" },
+    { window: "5h", label: "Five-Hour" },
+  ] as const;
+  for (const group of d.groups) {
+    lines.push("", `**${group.displayName}**`);
+    for (const { window, label } of windows) {
+      const bucket = group.buckets.find((candidate) => candidate.window === window);
+      if (!bucket) continue;
+      const usedPercent = (1 - bucket.remainingFraction) * 100;
+      const reset = bucket.resetTime
+        ? ` · resets ${formatResetTime(bucket.resetTime)}`
+        : "";
+      lines.push(usageLine(usedPercent, `${label}${reset}`));
     }
+  }
+  return lines.join("\n");
+}
+
+function formatOllamaCloudUsage(
+  d: import("@seam/adapters").OllamaCloudUsageData
+): string {
+  if (!d.ok) {
+    return `Couldn't read Ollama Cloud usage: ${d.error ?? "no data"}`;
+  }
+  const lines = ["**Ollama Cloud usage**", "", "**Rate limits**"];
+  const windows = [
+    { data: d.fiveHour, label: "5h" },
+    { data: d.weekly, label: "Weekly" },
+  ] as const;
+  for (const { data, label } of windows) {
+    if (!data) continue;
+    const reset = data.resetAt
+      ? ` · resets ${formatResetTime(data.resetAt)}`
+      : "";
+    lines.push(usageLine(data.pctUsed, `${label} limit${reset}`));
+  }
+  const topModels = [...(d.weekly?.models ?? [])]
+    .sort((a, b) => b.requests - a.requests)
+    .slice(0, 5);
+  if (topModels.length > 0) {
+    lines.push(
+      "",
+      "**Top models (weekly)**",
+      ...topModels.map(
+        (model) => `• \`${model.model}\` — ${model.requests.toLocaleString("en-US")} requests`
+      )
+    );
   }
   return lines.join("\n");
 }

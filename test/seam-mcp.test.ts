@@ -464,6 +464,26 @@ describe("SeamMcpServer", () => {
         credits: null,
         fetchedAt: 1_999_999_000,
       },
+      {
+        agentId: "claude-vertex",
+        displayName: "Claude Vertex",
+        ok: true,
+        plan: "vertex",
+        rolling: { usedPercent: 0, resetsAt: null, label: "unlimited" },
+        weekly: { usedPercent: 0, resetsAt: null, label: "unlimited" },
+        credits: { balance: "unlimited", unlimited: true },
+        fetchedAt: 1_999_999_000,
+      },
+      {
+        agentId: "opencode",
+        displayName: "OpenCode",
+        ok: true,
+        plan: "unlimited",
+        rolling: { usedPercent: 0, resetsAt: null, label: "unlimited" },
+        weekly: { usedPercent: 0, resetsAt: null, label: "unlimited" },
+        credits: { balance: "unlimited", unlimited: true },
+        fetchedAt: 1_999_999_000,
+      },
     ];
     h = await makeHarness({
       getAgentQuotas: (agentId) =>
@@ -474,7 +494,14 @@ describe("SeamMcpServer", () => {
       { name: "agent_quota", arguments: {} },
       { "X-Seam-Session": "good-token" }
     );
-    expect(JSON.parse(all.body.result.content[0].text)).toEqual(quotas);
+    const allQuotas = JSON.parse(all.body.result.content[0].text);
+    expect(allQuotas).toEqual(quotas);
+    expect(allQuotas.map((quota: { agentId: string }) => quota.agentId)).toEqual([
+      "claude",
+      "codex",
+      "claude-vertex",
+      "opencode",
+    ]);
     const one = await h.call(
       "tools/call",
       { name: "agent_quota", arguments: { agentId: "codex" } },

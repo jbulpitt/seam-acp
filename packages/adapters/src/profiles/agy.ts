@@ -1734,47 +1734,74 @@ function getCatalog(cli: string): Promise<AgyCatalogEntry[]> {
   return catalogPromise;
 }
 
-/**
- * Snapshot of `/usage` data scraped from the agy LS's `GetUserStatus` endpoint.
- * Captures plan tier, monthly + remaining credits (prompt and flow), and
- * per-model quota fractions with reset times.
- */
+/** Snapshot of the agy CLI's "Models & Quota" data. */
 export interface AgyUsage {
-  name?: string;
-  email?: string;
-  planName?: string;
-  teamsTier?: string;
-  monthlyPromptCredits?: number;
-  availablePromptCredits?: number;
-  monthlyFlowCredits?: number;
-  availableFlowCredits?: number;
-  models: Array<{
-    label: string;
-    remainingFraction?: number;
-    resetTime?: string;
+  description?: string;
+  groups: Array<{
+    displayName: string;
+    description?: string;
+    buckets: Array<{
+      bucketId?: string;
+      displayName: string;
+      description?: string;
+      window: "weekly" | "5h";
+      remainingFraction: number;
+      resetTime?: string;
+    }>;
   }>;
 }
 
-interface UserStatusResponse {
-  userStatus?: {
-    name?: string;
-    email?: string;
-    planStatus?: {
-      planInfo?: {
-        planName?: string;
-        teamsTier?: string;
-        monthlyPromptCredits?: number | string;
-        monthlyFlowCredits?: number | string;
-      };
-      availablePromptCredits?: number | string;
-      availableFlowCredits?: number | string;
-    };
-    cascadeModelConfigData?: {
-      clientModelConfigs?: Array<{
-        label?: string;
-        quotaInfo?: { remainingFraction?: number; resetTime?: string };
+interface UserQuotaSummaryResponse {
+  response?: {
+    groups?: Array<{
+      displayName?: string;
+      description?: string;
+      buckets?: Array<{
+        bucketId?: string;
+        displayName?: string;
+        description?: string;
+        window?: string;
+        remainingFraction?: number;
+        resetTime?: string;
       }>;
-    };
+    }>;
+    description?: string;
+  };
+}
+
+/** Parse the protobuf-JSON envelope returned by RetrieveUserQuotaSummary. */
+export function parseAgyQuotaSummary(json: UserQuotaSummaryResponse): AgyUsage {
+  const groups: AgyUsage["groups"] = [];
+  for (const rawGroup of json.response?.groups ?? []) {
+    if (!rawGroup.displayName) continue;
+    const buckets: AgyUsage["groups"][number]["buckets"] = [];
+    for (const rawBucket of rawGroup.buckets ?? []) {
+      if (
+        !rawBucket.displayName ||
+        (rawBucket.window !== "weekly" && rawBucket.window !== "5h") ||
+        typeof rawBucket.remainingFraction !== "number" ||
+        !Number.isFinite(rawBucket.remainingFraction)
+      ) {
+        continue;
+      }
+      buckets.push({
+        ...(rawBucket.bucketId ? { bucketId: rawBucket.bucketId } : {}),
+        displayName: rawBucket.displayName,
+        ...(rawBucket.description ? { description: rawBucket.description } : {}),
+        window: rawBucket.window,
+        remainingFraction: rawBucket.remainingFraction,
+        ...(rawBucket.resetTime ? { resetTime: rawBucket.resetTime } : {}),
+      });
+    }
+    groups.push({
+      displayName: rawGroup.displayName,
+      ...(rawGroup.description ? { description: rawGroup.description } : {}),
+      buckets,
+    });
+  }
+  return {
+    ...(json.response?.description ? { description: json.response.description } : {}),
+    groups,
   };
 }
 
@@ -1785,8 +1812,9 @@ let usageCache: { at: number; data: AgyUsage } | null = null;
 
 /**
  * Fetch the current user's Antigravity usage snapshot. Spawns a transient
- * `agy -p` to bring the local LS up, hits `GetUserStatus`, and parses the
- * response. Cached for {@link USAGE_CACHE_TTL_MS} after a successful call.
+ * `agy -p` to bring the local LS up, hits `RetrieveUserQuotaSummary`, and
+ * parses the response. Cached for {@link USAGE_CACHE_TTL_MS} after a successful
+ * call.
  */
 export async function fetchAgyUserStatus(cliPath?: string): Promise<AgyUsage> {
   if (usageCache && Date.now() - usageCache.at < USAGE_CACHE_TTL_MS) {
@@ -1805,21 +1833,20 @@ export async function fetchAgyUserStatus(cliPath?: string): Promise<AgyUsage> {
       logFile,
       timeoutMs: 15_000,
     });
-    // /healthz comes up before the LS finishes silent-auth, so GetUserStatus
-    // initially 500s with "GetCascadeModelConfigData() is nil". Retry briefly
-    // until auth lands (usually 1–2s).
-    const url = `http://localhost:${ls.port}/exa.language_server_pb.LanguageServerService/GetUserStatus`;
+    // /healthz comes up before the LS finishes silent-auth, so quota retrieval
+    // can initially 500. Retry briefly until auth lands (usually 1–2s).
+    const url = `http://localhost:${ls.port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`;
     const deadline = Date.now() + 10_000;
     let lastStatus = 0;
     while (Date.now() < deadline) {
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}",
+        body: JSON.stringify({}),
       });
       if (res.ok) {
-        const json = (await res.json()) as UserStatusResponse;
-        const data = parseAgyUserStatus(json);
+        const json = (await res.json()) as UserQuotaSummaryResponse;
+        const data = parseAgyQuotaSummary(json);
         usageCache = { at: Date.now(), data };
         return data;
       }
@@ -1827,47 +1854,11 @@ export async function fetchAgyUserStatus(cliPath?: string): Promise<AgyUsage> {
       if (res.status !== 500) break;
       await new Promise((r) => setTimeout(r, 400));
     }
-    throw new Error(`GetUserStatus HTTP ${lastStatus}`);
+    throw new Error(`RetrieveUserQuotaSummary HTTP ${lastStatus}`);
   } finally {
     try { proc.kill(); } catch { /* already gone */ }
     fs.unlink(logFile).catch(() => {});
   }
-}
-
-function parseAgyUserStatus(json: UserStatusResponse): AgyUsage {
-  const us = json.userStatus ?? {};
-  const ps = us.planStatus ?? {};
-  const pi = ps.planInfo ?? {};
-  const num = (v: number | string | undefined): number | undefined =>
-    typeof v === "number" ? v : typeof v === "string" && v ? Number(v) : undefined;
-  const models = (us.cascadeModelConfigData?.clientModelConfigs ?? [])
-    .filter((m) => m.label)
-    .map((m) => ({
-      label: m.label!,
-      ...(typeof m.quotaInfo?.remainingFraction === "number"
-        ? { remainingFraction: m.quotaInfo.remainingFraction }
-        : {}),
-      ...(m.quotaInfo?.resetTime ? { resetTime: m.quotaInfo.resetTime } : {}),
-    }));
-  return {
-    ...(us.name ? { name: us.name } : {}),
-    ...(us.email ? { email: us.email } : {}),
-    ...(pi.planName ? { planName: pi.planName } : {}),
-    ...(pi.teamsTier ? { teamsTier: pi.teamsTier } : {}),
-    ...(num(pi.monthlyPromptCredits) !== undefined
-      ? { monthlyPromptCredits: num(pi.monthlyPromptCredits) }
-      : {}),
-    ...(num(ps.availablePromptCredits) !== undefined
-      ? { availablePromptCredits: num(ps.availablePromptCredits) }
-      : {}),
-    ...(num(pi.monthlyFlowCredits) !== undefined
-      ? { monthlyFlowCredits: num(pi.monthlyFlowCredits) }
-      : {}),
-    ...(num(ps.availableFlowCredits) !== undefined
-      ? { availableFlowCredits: num(ps.availableFlowCredits) }
-      : {}),
-    models,
-  };
 }
 
 async function fetchAgyCatalog(cli: string): Promise<AgyCatalogEntry[]> {

@@ -703,32 +703,45 @@ export async function fetchClaudeUsage(
     if (identity?.login) result.login = identity.login;
   }
   if (accessToken) {
-    try {
-      const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "anthropic-beta": "oauth-2025-04-20",
-        },
-      });
-      if (res.ok) {
-        const body = (await res.json()) as Record<string, unknown>;
-        result.fiveHour = parseBucket(body.five_hour);
-        result.sevenDay = parseBucket(body.seven_day);
-        result.sevenDaySonnet = parseBucket(body.seven_day_sonnet);
-        result.sevenDayOpus = parseBucket(body.seven_day_opus);
-        const extra = body.extra_usage as Record<string, unknown> | null | undefined;
-        if (extra && typeof extra === "object") {
-          result.extraUsage = {
-            enabled: extra.is_enabled === true,
-            used: typeof extra.used_credits === "number" ? extra.used_credits : 0,
-            limit: typeof extra.monthly_limit === "number" ? extra.monthly_limit : 0,
-            utilization: typeof extra.utilization === "number" ? extra.utilization : 0,
-            currency: typeof extra.currency === "string" ? extra.currency : "USD",
-          };
+    const headers = {
+      Authorization: `Bearer ${accessToken}`,
+      "anthropic-beta": "oauth-2025-04-20",
+    };
+    // The OAuth usage endpoint occasionally 429s / times out; a couple of quick
+    // retries keep a single transient blip from surfacing as "quota
+    // unavailable" (the cold-start case last-known-good retention can't cover).
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+          headers,
+          signal: AbortSignal.timeout(8000),
+        });
+        if (res.ok) {
+          const body = (await res.json()) as Record<string, unknown>;
+          result.fiveHour = parseBucket(body.five_hour);
+          result.sevenDay = parseBucket(body.seven_day);
+          result.sevenDaySonnet = parseBucket(body.seven_day_sonnet);
+          result.sevenDayOpus = parseBucket(body.seven_day_opus);
+          const extra = body.extra_usage as Record<string, unknown> | null | undefined;
+          if (extra && typeof extra === "object") {
+            result.extraUsage = {
+              enabled: extra.is_enabled === true,
+              used: typeof extra.used_credits === "number" ? extra.used_credits : 0,
+              limit: typeof extra.monthly_limit === "number" ? extra.monthly_limit : 0,
+              utilization: typeof extra.utilization === "number" ? extra.utilization : 0,
+              currency: typeof extra.currency === "string" ? extra.currency : "USD",
+            };
+          }
+          break;
         }
+        // Only 429/408/5xx are worth retrying; other 4xx (auth) won't recover.
+        if (res.status !== 429 && res.status !== 408 && res.status < 500) break;
+      } catch {
+        /* network failure / timeout — retry, then fall back to credential-only data */
       }
-    } catch {
-      /* network failure — return what we have from credentials */
+      if (attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+      }
     }
   }
   return result;

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { parseAgyQuotaSummary } from "../packages/adapters/src/profiles/agy.js";
 import {
   mapAgyQuota,
   mapClaudeQuota,
@@ -89,16 +90,86 @@ describe("agent quota normalization", () => {
     expect(quota.rolling.resetsAt).toBe(now + ROLLING_WINDOW_SECONDS);
   });
 
-  it("maps Antigravity credits to credits + weekly", () => {
+  it("maps Antigravity's captured quota-summary envelope to rolling and weekly", () => {
+    const data = parseAgyQuotaSummary({
+      response: {
+        groups: [
+          {
+            displayName: "Gemini Models",
+            description: "Models within this group: Gemini Flash, Gemini Pro",
+            buckets: [
+              {
+                bucketId: "gemini-weekly",
+                displayName: "Weekly Limit Remaining",
+                window: "weekly",
+                remainingFraction: 0.98932266,
+                resetTime: "2026-09-02T05:15:05Z",
+              },
+              {
+                bucketId: "gemini-5h",
+                displayName: "Five Hour Limit Remaining",
+                window: "5h",
+                remainingFraction: 0.9949275,
+                resetTime: "2026-08-27T09:00:05Z",
+              },
+            ],
+          },
+          {
+            displayName: "Claude and GPT models",
+            buckets: [
+              {
+                bucketId: "3p-weekly",
+                displayName: "Weekly Limit Remaining",
+                window: "weekly",
+                remainingFraction: 1,
+                resetTime: "2026-09-02T20:23:47Z",
+              },
+              {
+                bucketId: "3p-5h",
+                displayName: "Five Hour Limit Remaining",
+                window: "5h",
+                remainingFraction: 1,
+                resetTime: "2026-08-27T10:37:45Z",
+              },
+            ],
+          },
+        ],
+        description: "Within each group, models share quota limits.",
+      },
+    });
+    expect(data.groups).toHaveLength(2);
+
+    const quota = mapAgyQuota(identity, data, now);
+    expect(quota.ok).toBe(true);
+    expect(quota.weekly.usedPercent).toBeCloseTo(1.067734);
+    expect(quota.weekly.resetsAt).toBe(Date.parse("2026-09-02T05:15:05Z") / 1000);
+    expect(quota.rolling.usedPercent).toBeCloseTo(0.50725);
+    expect(quota.rolling.resetsAt).toBe(Date.parse("2026-08-27T09:00:05Z") / 1000);
+    expect(quota.plan).toBeNull();
+    expect(quota.credits).toBeNull();
+  });
+
+  it("collapses each Antigravity window to the group with the least remaining", () => {
     const quota = mapAgyQuota(identity, {
-      planName: "pro",
-      monthlyPromptCredits: 1_000,
-      availablePromptCredits: 250,
-      models: [{ label: "Gemini", remainingFraction: 0.2, resetTime: "2033-05-20T03:34:00.000Z" }],
+      groups: [
+        {
+          displayName: "Weekly constrained",
+          buckets: [
+            { displayName: "Weekly", window: "weekly", remainingFraction: 0.2 },
+            { displayName: "Five hour", window: "5h", remainingFraction: 0.9 },
+          ],
+        },
+        {
+          displayName: "Rolling constrained",
+          buckets: [
+            { displayName: "Weekly", window: "weekly", remainingFraction: 0.8 },
+            { displayName: "Five hour", window: "5h", remainingFraction: 0.1 },
+          ],
+        },
+      ],
     }, now);
-    expect(quota.weekly.usedPercent).toBe(75);
-    expect(quota.credits).toEqual({ balance: "250", unlimited: false });
-    expect(quota.rolling.usedPercent).toBe(0);
+    expect(quota.weekly.usedPercent).toBe(80);
+    expect(quota.rolling.usedPercent).toBe(90);
   });
 
   it("represents fully unlimited local agents in both dimensions", () => {

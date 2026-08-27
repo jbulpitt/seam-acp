@@ -225,25 +225,25 @@ export function mapGrokQuota(
   };
 }
 
-function agyWeeklyWindow(data: AgyUsage): QuotaWindow | null {
-  const total = data.monthlyPromptCredits ?? data.monthlyFlowCredits;
-  const available = data.availablePromptCredits ?? data.availableFlowCredits;
-  const reset = data.models
-    .map((model) => unixSeconds(model.resetTime))
-    .filter((value): value is number => value !== null)
-    .sort((a, b) => a - b)[0] ?? null;
-  if (typeof total === "number" && total > 0 && typeof available === "number") {
-    return quotaWindow("weekly", ((total - available) / total) * 100, reset);
-  }
-  const modelUsed = data.models
-    .map((model) =>
-      typeof model.remainingFraction === "number"
-        ? (1 - model.remainingFraction) * 100
-        : null
-    )
-    .filter((value): value is number => value !== null);
-  if (modelUsed.length === 0) return null;
-  return quotaWindow("weekly", Math.max(...modelUsed), reset);
+function agyWindow(
+  data: AgyUsage,
+  window: "5h" | "weekly",
+  label: "rolling" | "weekly"
+): QuotaWindow | null {
+  const buckets = data.groups
+    .flatMap((group) => group.buckets)
+    .filter(
+      (bucket) => bucket.window === window && Number.isFinite(bucket.remainingFraction)
+    );
+  if (buckets.length === 0) return null;
+  const worst = buckets.reduce((lowest, bucket) =>
+    bucket.remainingFraction < lowest.remainingFraction ? bucket : lowest
+  );
+  return quotaWindow(
+    label,
+    (1 - worst.remainingFraction) * 100,
+    worst.resetTime
+  );
 }
 
 export function mapAgyQuota(
@@ -251,18 +251,16 @@ export function mapAgyQuota(
   data: AgyUsage,
   fetchedAt = Math.floor(Date.now() / 1000)
 ): AgentQuota {
-  const weekly = agyWeeklyWindow(data);
-  const available = data.availablePromptCredits ?? data.availableFlowCredits;
+  const hasBuckets = data.groups.some((group) => group.buckets.length > 0);
+  const rolling = agyWindow(data, "5h", "rolling");
+  const weekly = agyWindow(data, "weekly", "weekly");
   return {
     ...identity,
-    ok: weekly !== null,
-    ...(weekly === null ? { error: "Antigravity quota data unavailable" } : {}),
-    plan: data.planName ?? data.teamsTier ?? null,
-    ...normalizeQuotaWindows({ weekly }, fetchedAt),
-    credits:
-      typeof available === "number"
-        ? { balance: String(available), unlimited: false }
-        : null,
+    ok: hasBuckets,
+    ...(!hasBuckets ? { error: "Antigravity quota data unavailable" } : {}),
+    plan: null,
+    ...normalizeQuotaWindows({ rolling, weekly }, fetchedAt),
+    credits: null,
     fetchedAt,
   };
 }

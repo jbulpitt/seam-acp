@@ -15611,33 +15611,21 @@ function fitTranscriptToWindow(
 }
 
 function formatAgyUsage(d: import("@seam/adapters").AgyUsage): string {
-  const lines: string[] = [];
-  const who = [d.name, d.email].filter(Boolean).join(" · ");
-  lines.push(`**Antigravity usage**${who ? ` — ${who}` : ""}`);
-  const fmt = (n?: number): string =>
-    typeof n === "number" ? n.toLocaleString("en-US") : "—";
-  if (d.monthlyPromptCredits !== undefined || d.availablePromptCredits !== undefined) {
-    const avail = d.availablePromptCredits ?? 0;
-    const total = d.monthlyPromptCredits ?? 0;
-    const pct = total > 0 ? ((total - avail) / total) * 100 : 0;
-    lines.push(usageLine(pct, `Prompt credits — ${fmt(avail)} / ${fmt(total)} remaining`));
-  }
-  if (d.monthlyFlowCredits !== undefined || d.availableFlowCredits !== undefined) {
-    const avail = d.availableFlowCredits ?? 0;
-    const total = d.monthlyFlowCredits ?? 0;
-    const pct = total > 0 ? ((total - avail) / total) * 100 : 0;
-    lines.push(usageLine(pct, `Flow credits — ${fmt(avail)} / ${fmt(total)} remaining`));
-  }
-  const modelsWithQuota = d.models.filter(
-    (m) => typeof m.remainingFraction === "number" || m.resetTime,
-  );
-  if (modelsWithQuota.length > 0) {
-    lines.push("", "**Per-model quotas**");
-    for (const m of modelsWithQuota) {
-      if (typeof m.remainingFraction !== "number") continue;
-      const pct = (1 - m.remainingFraction) * 100;
-      const reset = m.resetTime ? ` · resets ${formatResetTime(m.resetTime)}` : "";
-      lines.push(usageLine(pct, `${m.label}${reset}`));
+  const lines = ["**Antigravity usage**", "", "**Models & Quota**"];
+  const windows = [
+    { window: "weekly", label: "Weekly" },
+    { window: "5h", label: "Five-Hour" },
+  ] as const;
+  for (const group of d.groups) {
+    lines.push("", `**${group.displayName}**`);
+    for (const { window, label } of windows) {
+      const bucket = group.buckets.find((candidate) => candidate.window === window);
+      if (!bucket) continue;
+      const usedPercent = (1 - bucket.remainingFraction) * 100;
+      const reset = bucket.resetTime
+        ? ` · resets ${formatResetTime(bucket.resetTime)}`
+        : "";
+      lines.push(usageLine(usedPercent, `${label}${reset}`));
     }
   }
   return lines.join("\n");

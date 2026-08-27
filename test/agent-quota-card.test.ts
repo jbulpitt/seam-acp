@@ -9,6 +9,7 @@ import {
   renderAgentQuotaLayout,
 } from "../packages/core/src/core/quota/agent-quota-card.js";
 import { mapUnlimitedQuota } from "../packages/core/src/core/quota/agent-quota.js";
+import { QuotaRegistry } from "../packages/core/src/core/quota/quota-registry.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type {
   ChannelRef,
@@ -46,6 +47,30 @@ describe("agent quota card", () => {
     expect(text).toContain("25%");
     expect(text).toContain("75%");
     expect(text).toContain("plan max · credits 12");
+  });
+
+  it("omits claude-vertex and opencode without removing them from the registry", () => {
+    const registry = new QuotaRegistry();
+    registry.set(mapUnlimitedQuota({ agentId: "claude", displayName: "Claude" }));
+    registry.set(mapUnlimitedQuota({ agentId: "claude-vertex", displayName: "Vertex" }));
+    registry.set(mapUnlimitedQuota({ agentId: "opencode", displayName: "OpenCode" }));
+    const quotas = registry.all();
+    expect(quotas.map((quota) => quota.agentId).sort()).toEqual([
+      "claude",
+      "claude-vertex",
+      "opencode",
+    ]);
+
+    const layout = renderAgentQuotaLayout(quotas);
+    const text = layout.blocks
+      .filter((block) => block.kind === "text")
+      .map((block) => block.kind === "text" ? block.content : "")
+      .join("\n");
+    expect(text).toContain("`claude`");
+    expect(text).not.toContain("claude-vertex");
+    expect(text).not.toContain("opencode");
+    expect(text).not.toContain("Vertex");
+    expect(text).not.toContain("OpenCode");
   });
 
   it("edits the pinned card and silently self-bumps only after 20 hours", async () => {

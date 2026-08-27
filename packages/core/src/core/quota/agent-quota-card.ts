@@ -9,6 +9,7 @@ const STATE_FILE = "agent-quota-card.json";
 const DEBOUNCE_MS = 500;
 const COLOR_OK = 0x57f287;
 const COLOR_WARN = 0xfaa61a;
+const HIDDEN_AGENT_IDS = new Set(["claude-vertex", "opencode"]);
 export const AGENT_QUOTA_BUMP_AFTER_MS = 20 * 60 * 60_000;
 
 interface Persisted {
@@ -56,22 +57,27 @@ function isWarning(quotas: AgentQuota[]): boolean {
   );
 }
 
+function visibleCardQuotas(quotas: AgentQuota[]): AgentQuota[] {
+  return quotas.filter((quota) => !HIDDEN_AGENT_IDS.has(quota.agentId));
+}
+
 export function renderAgentQuotaLayout(
   quotas: AgentQuota[],
   nowMs = Date.now()
 ): StructuredLayout {
-  const warn = isWarning(quotas);
+  const visibleQuotas = visibleCardQuotas(quotas);
+  const warn = isWarning(visibleQuotas);
   const blocks: LayoutBlock[] = [
     { kind: "text", content: `**${warn ? "🟡" : "🟢"} Agent quota**` },
     { kind: "text", content: `Updated <t:${Math.floor(nowMs / 1000)}:R>` },
   ];
-  if (quotas.length === 0) {
+  if (visibleQuotas.length === 0) {
     blocks.push(
       { kind: "separator", divider: true, spacing: "small" },
       { kind: "text", content: "_No configured agents._" }
     );
   } else {
-    quotas.forEach((quota, index) => {
+    visibleQuotas.forEach((quota, index) => {
       blocks.push({
         kind: "separator",
         divider: true,
@@ -90,15 +96,16 @@ export function renderAgentQuotaPanel(
   quotas: AgentQuota[],
   nowMs = Date.now()
 ): StructuredPanel {
-  const warn = isWarning(quotas);
+  const visibleQuotas = visibleCardQuotas(quotas);
+  const warn = isWarning(visibleQuotas);
   return {
     color: warn ? COLOR_WARN : COLOR_OK,
     title: `${warn ? "🟡" : "🟢"} Agent quota`,
     description: `Updated <t:${Math.floor(nowMs / 1000)}:R>`,
     fields:
-      quotas.length === 0
+      visibleQuotas.length === 0
         ? [{ name: "Agents", value: "_No configured agents._" }]
-        : quotas.slice(0, 25).map((quota) => ({
+        : visibleQuotas.slice(0, 25).map((quota) => ({
             name: `${quota.displayName} · ${quota.agentId}`.slice(0, 256),
             value: renderAgentQuotaRow(quota).slice(0, 1024),
             inline: false,

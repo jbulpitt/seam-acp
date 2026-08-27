@@ -24,6 +24,7 @@ import {
 import {
   AgentTurnWindow,
   QUOTA_MIN_REFRESH_MS,
+  QUOTA_STALE_RETENTION_MS,
   QuotaRegistry,
   quotaPollIntervalMs,
 } from "./quota-registry.js";
@@ -125,6 +126,9 @@ export class AgentQuotaPoller {
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly inFlight = new Map<string, Promise<AgentQuota | undefined>>();
   private readonly lastRefreshAt = new Map<string, number>();
+  /** When each agent last produced an `ok` snapshot (for stale retention). */
+  private readonly lastGoodAt = new Map<string, number>();
+  private readonly staleRetentionMs: number;
   private onUpdate?: (quota: AgentQuota) => void;
   private started = false;
 
@@ -133,10 +137,13 @@ export class AgentQuotaPoller {
     registry: QuotaRegistry;
     sources: AgentQuotaSource[];
     onUpdate?: (quota: AgentQuota) => void;
+    /** Keep last-known-good this long when reads return unavailable. */
+    staleRetentionMs?: number;
   }) {
     this.logger = opts.logger.child({ comp: "agent-quota" });
     this.registry = opts.registry;
     this.onUpdate = opts.onUpdate;
+    this.staleRetentionMs = opts.staleRetentionMs ?? QUOTA_STALE_RETENTION_MS;
     for (const source of opts.sources) this.sources.set(source.agentId, source);
   }
 
@@ -205,9 +212,9 @@ export class AgentQuotaPoller {
         quota = mapUnavailableQuota(source, message);
         this.logger.warn({ err, agentId }, "agent quota refresh failed");
       }
-      this.registry.set(quota);
-      this.onUpdate?.(quota);
-      return quota;
+      const { quota: effective, changed } = this.applyResult(quota);
+      if (changed) this.onUpdate?.(effective);
+      return effective;
     })();
     this.inFlight.set(agentId, task);
     try {
@@ -215,6 +222,37 @@ export class AgentQuotaPoller {
     } finally {
       this.inFlight.delete(agentId);
     }
+  }
+
+  /**
+   * Commit a freshly-fetched result, applying last-known-good retention: an
+   * `ok` snapshot always wins; an unavailable snapshot is suppressed in favour
+   * of the previous good value while it is still within the retention window,
+   * so a transient upstream blip does not flap the card to ⚠️. Returns the
+   * value that is now authoritative and whether the registry actually changed
+   * (so callers can skip a redundant card refresh on a no-op retention).
+   */
+  private applyResult(fetched: AgentQuota): {
+    quota: AgentQuota;
+    changed: boolean;
+  } {
+    const now = Date.now();
+    if (fetched.ok) {
+      this.lastGoodAt.set(fetched.agentId, now);
+      this.registry.set(fetched);
+      return { quota: fetched, changed: true };
+    }
+    const previous = this.registry.get(fetched.agentId);
+    const goodAt = this.lastGoodAt.get(fetched.agentId) ?? 0;
+    if (previous?.ok && now - goodAt < this.staleRetentionMs) {
+      this.logger.debug(
+        { agentId: fetched.agentId, error: fetched.error, ageMs: now - goodAt },
+        "quota read unavailable; retaining last-known-good value"
+      );
+      return { quota: previous, changed: false };
+    }
+    this.registry.set(fetched);
+    return { quota: fetched, changed: true };
   }
 
   private schedule(agentId: string): void {

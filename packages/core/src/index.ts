@@ -431,6 +431,7 @@ async function main(): Promise<void> {
       grokCliPath: config.GROK_CLI_PATH,
       ollamaUsageCliPath: config.OLLAMA_USAGE_CLI_PATH,
     }),
+    staleRetentionMs: config.QUOTA_STALE_RETENTION_MS,
   });
 
   const renderer = discordRenderer;

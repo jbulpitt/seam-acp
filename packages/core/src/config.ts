@@ -526,6 +526,18 @@ const Schema = z.object({
   OPENCODE_TAVILY_URL: z.string().optional(),
 
   TURN_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(604800).default(900),
+  /**
+   * How long the agent-quota poller keeps serving an agent's last-known-good
+   * snapshot when an upstream read returns "unavailable", instead of flapping
+   * the status card to ⚠️. A sustained outage past this still surfaces. 0
+   * disables retention (always show the latest read). Default 30 min.
+   */
+  QUOTA_STALE_RETENTION_MS: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(86_400_000)
+    .default(1_800_000),
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .default("info"),

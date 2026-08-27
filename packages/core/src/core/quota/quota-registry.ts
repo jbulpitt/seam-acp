@@ -3,10 +3,23 @@ import type { AgentQuota } from "./agent-quota.js";
 export const QUOTA_ACTIVITY_WINDOW_MS = 10 * 60_000;
 export const QUOTA_MIN_REFRESH_MS = 15_000;
 
+/**
+ * Default window over which the poller keeps serving the last-known-good quota
+ * when an upstream read returns "unavailable", instead of flapping the card to
+ * ⚠️. A sustained outage longer than this still surfaces honestly. Tunable via
+ * the QUOTA_STALE_RETENTION_MS env var.
+ */
+export const QUOTA_STALE_RETENTION_MS = 30 * 60_000;
+
+/**
+ * Scheduled poll cadence by recent activity. Backed off from the original
+ * 15s/30s/60s tiers to ease pressure on per-agent usage endpoints (e.g. the
+ * Anthropic OAuth usage API) that intermittently 429/blip under tight polling.
+ */
 export function quotaPollIntervalMs(turnsInLast10Minutes: number): number {
-  if (turnsInLast10Minutes >= 8) return 15_000;
-  if (turnsInLast10Minutes >= 3) return 30_000;
-  if (turnsInLast10Minutes >= 1) return 60_000;
+  if (turnsInLast10Minutes >= 8) return 30_000;
+  if (turnsInLast10Minutes >= 3) return 60_000;
+  if (turnsInLast10Minutes >= 1) return 120_000;
   return 10 * 60_000;
 }
 

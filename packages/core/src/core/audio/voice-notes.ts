@@ -3,7 +3,7 @@
  * cannot (or should not) see audio still get the spoken words.
  */
 import { isAudioMime } from "../../agents/attachments.js";
-import { transcribeAudioWithGemini } from "./gemini-stt.js";
+import { transcribeAudioWithGemini, type SttFallbackEvent } from "./gemini-stt.js";
 import type { MessageAttachment } from "../../platforms/chat-adapter.js";
 
 export interface VoiceNoteResult {
@@ -68,6 +68,8 @@ export async function applyVoiceNoteTranscriptions(opts: {
   attachments: ReadonlyArray<MessageAttachment>;
   apiKey: string;
   model?: string;
+  customVocabulary?: ReadonlyArray<string>;
+  onFallback?: (event: SttFallbackEvent) => void;
   speakerLabel?: string;
   fetchFn?: typeof fetch;
   downloadFn?: (url: string) => Promise<Uint8Array>;
@@ -88,6 +90,11 @@ export async function applyVoiceNoteTranscriptions(opts: {
         bytes,
         mimeType: a.contentType ?? "audio/ogg",
         ...(opts.model ? { model: opts.model } : {}),
+        customVocabulary: [
+          ...(opts.customVocabulary ?? []),
+          ...(opts.speakerLabel?.trim() ? [opts.speakerLabel.trim()] : []),
+        ],
+        ...(opts.onFallback ? { onFallback: opts.onFallback } : {}),
         ...(opts.fetchFn ? { fetchFn: opts.fetchFn } : {}),
       });
       if (result.ok) {

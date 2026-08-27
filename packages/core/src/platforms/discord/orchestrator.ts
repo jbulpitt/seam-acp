@@ -2034,6 +2034,10 @@ export class Orchestrator {
             attachments: msg.attachments,
             apiKey: this.config.SEAM_GEMINI_API_KEY,
             model: this.config.SEAM_GEMINI_STT_MODEL,
+            customVocabulary: this.config.SEAM_GEMINI_STT_CUSTOM_VOCABULARY,
+            onFallback: (event) => {
+              this.logger.warn(event, "voice-note STT fell back to general Gemini model");
+            },
             speakerLabel,
           });
           promptText = voiced.prompt;

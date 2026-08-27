@@ -548,7 +548,28 @@ const Schema = z.object({
    */
   SEAM_GEMINI_API_KEY: z.string().default(""),
   /** Gemini model id used for inbound voice-note transcription. */
-  SEAM_GEMINI_STT_MODEL: z.string().min(1).default("gemini-3.7-flash"),
+  SEAM_GEMINI_STT_MODEL: z.string().min(1).default("gemini-3.5-transcribe"),
+  /**
+   * Comma-separated terms that bias Gemini 3.5 Transcribe toward project,
+   * product, and proper names. Google supports up to 1,000 entries and
+   * recommends keeping the useful set near 100, so normalize and cap here.
+   */
+  SEAM_GEMINI_STT_CUSTOM_VOCABULARY: z
+    .string()
+    .default("Seam,seam-acp,Discord,Gemini,Codex,Claude,Grok,Ollama")
+    .transform((v) => {
+      const seen = new Set<string>();
+      const terms: string[] = [];
+      for (const raw of v.split(",")) {
+        const term = raw.trim();
+        const key = term.toLocaleLowerCase();
+        if (!term || seen.has(key)) continue;
+        seen.add(key);
+        terms.push(term);
+        if (terms.length === 100) break;
+      }
+      return terms;
+    }),
   /** Gemini TTS model id used for outbound spoken replies. */
   SEAM_GEMINI_TTS_MODEL: z.string().min(1).default("gemini-3.1-flash-tts-preview"),
   /** Prebuilt Gemini TTS voice name (Kore, Puck, …). */

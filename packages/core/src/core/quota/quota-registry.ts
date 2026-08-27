@@ -12,15 +12,26 @@ export const QUOTA_MIN_REFRESH_MS = 15_000;
 export const QUOTA_STALE_RETENTION_MS = 30 * 60_000;
 
 /**
- * Scheduled poll cadence by recent activity. Backed off from the original
- * 15s/30s/60s tiers to ease pressure on per-agent usage endpoints (e.g. the
- * Anthropic OAuth usage API) that intermittently 429/blip under tight polling.
+ * After a poll returns unavailable, retry this soon (rather than waiting the
+ * full activity cadence) so a transient/cold-start miss self-heals quickly —
+ * essential now that the steady-state cadence is measured in minutes. Bounded
+ * by QUOTA_FAILURE_RETRY_CAP consecutive fast retries so a genuinely-down or
+ * quota-less agent falls back to the normal cadence instead of busy-polling.
+ */
+export const QUOTA_FAILURE_RETRY_MS = 60_000;
+export const QUOTA_FAILURE_RETRY_CAP = 5;
+
+/**
+ * Scheduled poll cadence by recent activity. Quota moves slowly and the values
+ * are smoothed by last-known-good retention + fast-retry-on-failure, so these
+ * are deliberately relaxed (5m / 15m / 30m / 60m) to keep pressure off the
+ * per-agent usage endpoints (e.g. the Anthropic OAuth usage API).
  */
 export function quotaPollIntervalMs(turnsInLast10Minutes: number): number {
-  if (turnsInLast10Minutes >= 8) return 30_000;
-  if (turnsInLast10Minutes >= 3) return 60_000;
-  if (turnsInLast10Minutes >= 1) return 120_000;
-  return 10 * 60_000;
+  if (turnsInLast10Minutes >= 8) return 300_000;
+  if (turnsInLast10Minutes >= 3) return 900_000;
+  if (turnsInLast10Minutes >= 1) return 1_800_000;
+  return 3_600_000;
 }
 
 export class QuotaRegistry {

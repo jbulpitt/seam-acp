@@ -23,6 +23,8 @@ import {
 } from "./agent-quota.js";
 import {
   AgentTurnWindow,
+  QUOTA_FAILURE_RETRY_CAP,
+  QUOTA_FAILURE_RETRY_MS,
   QUOTA_MIN_REFRESH_MS,
   QUOTA_STALE_RETENTION_MS,
   QuotaRegistry,
@@ -128,6 +130,8 @@ export class AgentQuotaPoller {
   private readonly lastRefreshAt = new Map<string, number>();
   /** When each agent last produced an `ok` snapshot (for stale retention). */
   private readonly lastGoodAt = new Map<string, number>();
+  /** Consecutive surfaced-unavailable results per agent (for fast retry). */
+  private readonly consecutiveFailures = new Map<string, number>();
   private readonly staleRetentionMs: number;
   private onUpdate?: (quota: AgentQuota) => void;
   private started = false;
@@ -239,6 +243,7 @@ export class AgentQuotaPoller {
     const now = Date.now();
     if (fetched.ok) {
       this.lastGoodAt.set(fetched.agentId, now);
+      this.consecutiveFailures.set(fetched.agentId, 0);
       this.registry.set(fetched);
       return { quota: fetched, changed: true };
     }
@@ -249,8 +254,13 @@ export class AgentQuotaPoller {
         { agentId: fetched.agentId, error: fetched.error, ageMs: now - goodAt },
         "quota read unavailable; retaining last-known-good value"
       );
+      // Effective value is still good — no surfaced failure to fast-retry.
       return { quota: previous, changed: false };
     }
+    this.consecutiveFailures.set(
+      fetched.agentId,
+      (this.consecutiveFailures.get(fetched.agentId) ?? 0) + 1
+    );
     this.registry.set(fetched);
     return { quota: fetched, changed: true };
   }
@@ -259,13 +269,28 @@ export class AgentQuotaPoller {
     const existing = this.timers.get(agentId);
     if (existing) clearTimeout(existing);
     if (!this.started) return;
-    const interval = quotaPollIntervalMs(this.turnsInLast10Min(agentId));
     const timer = setTimeout(async () => {
       this.timers.delete(agentId);
       await this.refresh(agentId);
       this.schedule(agentId);
-    }, interval);
+    }, this.nextIntervalMs(agentId));
     timer.unref?.();
     this.timers.set(agentId, timer);
+  }
+
+  /**
+   * Normal activity cadence, shortened to a fast-retry interval when the agent
+   * is currently surfacing an unavailable snapshot — but only for the first few
+   * consecutive misses, so a permanently quota-less agent settles back onto the
+   * slow cadence instead of polling every minute forever.
+   */
+  private nextIntervalMs(agentId: string): number {
+    const base = quotaPollIntervalMs(this.turnsInLast10Min(agentId));
+    const current = this.registry.get(agentId);
+    const failures = this.consecutiveFailures.get(agentId) ?? 0;
+    if (current && !current.ok && failures <= QUOTA_FAILURE_RETRY_CAP) {
+      return Math.min(base, QUOTA_FAILURE_RETRY_MS);
+    }
+    return base;
   }
 }

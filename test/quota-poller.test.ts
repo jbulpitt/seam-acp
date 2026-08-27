@@ -104,3 +104,66 @@ describe("AgentQuotaPoller last-known-good retention", () => {
     expect(registry.get("claude")?.ok).toBe(false);
   });
 });
+
+describe("AgentQuotaPoller fast-retry on failure", () => {
+  afterEach(() => vi.useRealTimers());
+
+  function countingPoller(fetch: () => Promise<AgentQuota>) {
+    const registry = new QuotaRegistry();
+    const poller = new AgentQuotaPoller({
+      logger: silent,
+      registry,
+      sources: [{ ...identity, eventDriven: false, fetch }],
+      staleRetentionMs: 0,
+    });
+    return { registry, poller };
+  }
+
+  it("re-polls a failing agent at the 60s fast-retry interval, not the idle cadence", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let calls = 0;
+    const { poller } = countingPoller(async () => {
+      calls++;
+      return badQuota;
+    });
+    await poller.start(); // immediate poll → calls=1, schedules fast retry
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls).toBe(2);
+    poller.stop();
+  });
+
+  it("keeps a healthy agent on the slow idle cadence", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let calls = 0;
+    const { poller } = countingPoller(async () => {
+      calls++;
+      return okQuota;
+    });
+    await poller.start(); // calls=1, next poll is the 60m idle cadence
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls).toBe(1); // no fast retry for a healthy agent
+    poller.stop();
+  });
+
+  it("settles onto the slow cadence after the fast-retry cap", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let calls = 0;
+    const { poller } = countingPoller(async () => {
+      calls++;
+      return badQuota;
+    });
+    await poller.start(); // calls=1 (failure #1)
+    for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls).toBe(6); // five 60s fast retries while failures <= cap
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls).toBe(6); // cap exceeded → no more 60s retries
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(calls).toBe(7); // falls back to the idle cadence
+    poller.stop();
+  });
+});

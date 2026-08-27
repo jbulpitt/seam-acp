@@ -7,10 +7,10 @@ import {
  * `/seam` slash-command tree (#78).
  *
  * Discord caps each command at 25 top-level options (subcommands + groups).
- * The tree is 13/25: 5 top-level subcommands + 8 groups. Future surfaces
+ * The tree is 14/25: 6 top-level subcommands + 8 groups. Future surfaces
  * default to living INSIDE a group (each group has its own 25 budget).
  *
- *   TOP-LEVEL (5): cancel, steer, new, workflows, queue
+ *   TOP-LEVEL (6): cancel, steer, new, workflows, queue, rebuild
  *   GROUPS (8):
  *     config   (17) model effort agent mode repo tools card gif approve reset init detach tts show edit set audit
  *     info     (6)  whoami usage avatar help sessions repos
@@ -26,7 +26,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
     .setName("seam")
     .setDescription("Control the seam-acp agent");
 
-  // --- top-level (5): cancel, steer, new, workflows, queue -----------------
+  // --- top-level (6): cancel, steer, new, workflows, queue, rebuild --------
 
   cmd.addSubcommand((sub) =>
     sub
@@ -156,6 +156,24 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setName("prompt")
           .setDescription("The prompt to run when the current turn ends (or now, if idle)")
           .setRequired(true)
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub
+      .setName("rebuild")
+      .setDescription("Rebuild this session from Discord thread history, optionally changing agent/model")
+      .addStringOption((o) =>
+        o
+          .setName("agent")
+          .setDescription("Target agent id (uses its default model when model is omitted)")
+          .setRequired(false)
+      )
+      .addStringOption((o) =>
+        o
+          .setName("model")
+          .setDescription("Target model id")
+          .setRequired(false)
       )
   );
 
@@ -812,6 +830,7 @@ export type SeamSubcommand =
   | "cancel"
   | "steer"
   | "workflows"
+  | "rebuild"
   | "pull"
   | "push"
   | "secret"

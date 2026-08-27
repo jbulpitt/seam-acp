@@ -383,6 +383,10 @@ import type {
   AgentQuotaPoller,
   QuotaConnectionRequest,
 } from "../../core/quota/quota-poller.js";
+import {
+  loadThreadMigrationPlan,
+  runThreadMigrationPool,
+} from "../../core/thread-migration.js";
 
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
@@ -2756,6 +2760,8 @@ export class Orchestrator {
         return this.cmdQueue(interaction);
       case "workflows":
         return this.cmdWorkflows(interaction);
+      case "rebuild":
+        return this.cmdRebuild(interaction);
       default:
         await interaction.reply({
           content: `Unknown subcommand: ${sub}`,
@@ -9996,6 +10002,287 @@ export class Orchestrator {
     await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 
+  private async rebuildSessionFromThread(
+    channelRef: { platform: string; id: string },
+    record: SessionRecord
+  ): Promise<{ newSessionId: string; summary: string }> {
+    const profile = this.router.getProfile(record.agentId);
+    if (!profile) throw new Error(`Agent profile "${record.agentId}" not found.`);
+    const manager = profile.sessionManager;
+    if (!manager) {
+      throw new Error(
+        `Agent profile \`${record.agentId}\` (${profile.displayName}) does not support session management.`
+      );
+    }
+    if (typeof this.adapter.fetchThreadMessages !== "function") {
+      throw new Error("Chat adapter does not support fetching thread messages.");
+    }
+
+    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    let tempRuntime: AgentRuntime | undefined;
+    let transcriptFile: string | undefined;
+    try {
+      const rawMessages = await this.adapter.fetchThreadMessages(channelRef);
+      if (rawMessages.length === 0) {
+        throw new Error("No messages found in this Discord thread to reconstruct.");
+      }
+
+      const transcript = rawMessages
+        .map((m) => {
+          const role = m.authorIsBot ? "Agent" : "Human";
+          const label = !m.authorIsBot && m.authorName ? `${role} (${m.authorName})` : role;
+          return `${label}: ${m.text}`;
+        })
+        .join("\n");
+      let sanitizedTranscript = transcript
+        .split("\n")
+        .map((line) =>
+          line.length > 2000 ? line.substring(0, 2000) + " ... [Line truncated]" : line
+        )
+        .join("\n");
+
+      const compactionModel = this.compactionModelFor(record.agentId);
+      if (!compactionModel) {
+        throw new Error(`Rebuild is not supported for agent profile \`${record.agentId}\``);
+      }
+      const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
+      const rebuildAddendum =
+        "\n\nIMPORTANT: This is a full thread reconstruction from Discord history. " +
+        "The transcript below contains the ENTIRE conversation. You MUST cover " +
+        "the full conversation from start to finish in your summary. Give " +
+        "special emphasis to the most RECENT work (the last ~30% of the " +
+        "transcript) — that is the current state the user needs to resume from. " +
+        "Do NOT spend excessive detail on early/introductory messages at the " +
+        "expense of recent ones. If the analysis section is getting very long, " +
+        "abbreviate the early parts and expand on the latest work.\n";
+      const fullTemplate = promptTemplate + rebuildAddendum;
+      const templateOverhead = fullTemplate.length + "\n\nConversation Transcript:\n".length;
+      sanitizedTranscript = fitTranscriptToWindow(
+        sanitizedTranscript,
+        templateOverhead,
+        compactionWindowFor(compactionModel)
+      );
+      this.logger.info(
+        {
+          channelId: channelRef.id,
+          msgCount: rawMessages.length,
+          transcriptChars: sanitizedTranscript.length,
+          model: compactionModel,
+        },
+        "rebuild: transcript assembled"
+      );
+
+      transcriptFile = path.join(
+        cwd,
+        `.rebuild-transcript-${channelRef.id}-${Date.now()}.txt`
+      );
+      await fsp.writeFile(transcriptFile, sanitizedTranscript, "utf8");
+      const compactionPrompt =
+        `${fullTemplate}\n\n` +
+        `The conversation transcript has been saved to the file: ${transcriptFile}\n` +
+        `Read that file NOW and then produce your summary. ` +
+        `The file contains ${rawMessages.length} messages (${sanitizedTranscript.length} chars). ` +
+        `You MUST read the ENTIRE file before summarizing — do not stop partway through.`;
+
+      tempRuntime = new AgentRuntime({
+        profile,
+        logger: this.logger.child({ session: `temp-rebuild-${channelRef.id}` }),
+        mcpServers: [],
+      });
+      await tempRuntime.start();
+      await tempRuntime.newSession({
+        cwd,
+        model: compactionModel,
+        meta: { reasoningEffort: "low" },
+      });
+
+      let summaryText = "";
+      tempRuntime.onEvent((event) => {
+        if (event.kind === "agent-text") summaryText += event.text;
+      });
+      await tempRuntime.prompt(compactionPrompt);
+      if (!summaryText.trim()) {
+        throw new Error("Agent completed but returned an empty summary.");
+      }
+
+      const rbCfg = this.store.readConfig(record);
+      const newSessionId = await this.seedNewSession({
+        profile,
+        cwd,
+        ...(rbCfg.model ? { model: rbCfg.model } : {}),
+        ...(rbCfg.reasoningEffort ? { effort: rbCfg.reasoningEffort } : {}),
+        summary: summaryText,
+      });
+      await this.router.invalidate(record.id);
+      this.store.upsert({
+        ...record,
+        acpSessionId: newSessionId,
+        updatedUtc: new Date().toISOString(),
+      });
+      await this.renameThreadForSetup(channelRef, record);
+      return { newSessionId, summary: summaryText };
+    } finally {
+      if (transcriptFile) await fsp.unlink(transcriptFile).catch(() => {});
+      if (tempRuntime) {
+        const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
+        await tempRuntime.dispose().catch(() => {});
+        if (tempSessionId) {
+          await manager.deleteSession(cwd, tempSessionId).catch((err) => {
+            this.logger.warn(
+              { err, sessionId: tempSessionId },
+              "failed to clean up temporary summary session"
+            );
+          });
+        }
+      }
+    }
+  }
+
+  private async migrateThreadAgentModelAndRebuild(
+    channel: ChannelRef,
+    record: SessionRecord,
+    agentId: string,
+    model: string
+  ): Promise<{ newSessionId: string; summary: string }> {
+    const profile = this.router.getProfile(agentId);
+    if (!profile) throw new Error(`Unknown agent \`${agentId}\`.`);
+
+    await this.router.invalidate(record.id);
+    const cfg = this.store.readConfig(record);
+    cfg.model = model;
+    cfg.lastContextUsage = undefined;
+    const configJson = this.store.writeConfig(cfg);
+    this.persistConfig(record, cfg);
+    this.store.upsert({
+      ...record,
+      configJson,
+      agentId,
+      acpSessionId: "",
+      updatedUtc: new Date().toISOString(),
+    });
+    const overlay = this.configMutation.applyThreadOverlay({
+      threadId: channel.id,
+      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+      changes: { agent: agentId, model },
+      actor: { id: null, name: null },
+    });
+    if (!overlay.ok) {
+      this.logger.warn(
+        { err: overlay.error, threadId: channel.id },
+        "thread migration overlay write failed"
+      );
+    }
+    await this.updateThreadAbbreviation(channel, record.agentId, agentId);
+
+    const freshRecord = this.store.get(record.id);
+    if (!freshRecord) throw new Error(`Session record \`${record.id}\` disappeared during migration.`);
+    return this.rebuildSessionFromThread(
+      { platform: channel.platform, id: channel.id },
+      freshRecord
+    );
+  }
+
+  private async cmdRebuild(i: ChatInputCommandInteraction): Promise<void> {
+    const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+    if (admins && admins.size > 0 && !admins.has(i.user.id)) {
+      await i.reply({ content: "🔒 `/seam rebuild` is admin-only.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const channel = this.channelRefFromInteraction(i);
+    const record = channel ? this.store.getByChannel(channel.platform, channel.id) : null;
+    if (!channel || !record) {
+      await i.reply({ content: "No session record is bound to this thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    const agentOption = i.options.getString("agent");
+    const modelOption = i.options.getString("model");
+    await i.reply({ content: "🏗️ Rebuilding…", flags: MessageFlags.Ephemeral });
+    try {
+      let result: { newSessionId: string; summary: string };
+      if (agentOption !== null || modelOption !== null) {
+        const agentId = agentOption?.trim() || record.agentId;
+        const profile = this.router.getProfile(agentId);
+        if (!profile) throw new Error(`Unknown agent \`${agentId}\`.`);
+        const model = modelOption?.trim() ||
+          (agentOption !== null ? profile.defaultModel : this.store.readConfig(record).model ?? profile.defaultModel);
+        if (!model) throw new Error("Target model must be a non-empty string.");
+        result = await this.migrateThreadAgentModelAndRebuild(channel, record, agentId, model);
+      } else {
+        result = await this.rebuildSessionFromThread(channel, record);
+      }
+      const preview = result.summary.trim().slice(0, 1200);
+      await i.editReply(
+        `🏗️ Session rebuilt successfully.\nNew session: \`${result.newSessionId}\`\n\n**Summary:**\n${preview}${result.summary.trim().length > 1200 ? "…" : ""}`
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error({ err, channelId: channel.id }, "slash rebuild failed");
+      await i.editReply(`❌ Rebuild failed: ${message}`);
+    }
+  }
+
+  public async runPendingThreadMigration(): Promise<void> {
+    const sentinelPath = path.join(this.config.DATA_DIR, ".migrate-threads.json");
+    const plan = await loadThreadMigrationPlan(sentinelPath);
+    if (!plan) return;
+
+    const outcomes = await runThreadMigrationPool(
+      plan.threadIds,
+      plan.concurrency,
+      async (threadId) => {
+        const channel = { platform: PLATFORM, id: threadId };
+        try {
+          const record = this.store.getByChannel(PLATFORM, threadId);
+          if (!record) throw new Error("No Discord session record is bound to this thread.");
+          const result = await this.migrateThreadAgentModelAndRebuild(
+            {
+              ...channel,
+              ...(record.parentRef ? { parentId: record.parentRef } : {}),
+            },
+            record,
+            plan.agentId,
+            plan.model
+          );
+          this.logger.info(
+            { threadId, newSessionId: result.newSessionId },
+            "boot thread migration succeeded"
+          );
+          await this.adapter.sendMessage(
+            channel,
+            `🔧 Migrated to \`${plan.agentId}\` / \`${plan.model}\` and rebuilt from thread history. New session \`${result.newSessionId}\`.`
+          ).catch((err) =>
+            this.logger.warn({ err, threadId }, "migration result post failed")
+          );
+          return result;
+        } catch (err) {
+          const failure = err instanceof Error ? err : new Error(String(err));
+          this.logger.warn({ err: failure, threadId }, "boot thread migration failed");
+          await this.adapter.sendMessage(
+            channel,
+            `❌ Thread migration to \`${plan.agentId}\` / \`${plan.model}\` failed: ${failure.message}`
+          ).catch((postErr) =>
+            this.logger.warn({ err: postErr, threadId }, "migration failure post failed")
+          );
+          throw failure;
+        }
+      }
+    );
+
+    const succeeded = outcomes.filter((outcome) => outcome.ok).length;
+    const failed = outcomes.length - succeeded;
+
+    const donePath = path.join(this.config.DATA_DIR, ".migrate-threads.done.json");
+    await fsp.unlink(donePath).catch((err) => {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    });
+    await fsp.rename(sentinelPath, donePath);
+    this.logger.info(
+      { succeeded, failed, total: outcomes.length },
+      "boot thread migration complete"
+    );
+  }
+
   private async cmdSessions(i: ChatInputCommandInteraction): Promise<void> {
     const record = this.recordFromInteraction(i);
     if (!record) {
@@ -10500,133 +10787,12 @@ export class Orchestrator {
         });
 
         void (async () => {
-          let tempRuntime: AgentRuntime | undefined;
           try {
             const channelRef = { platform: "discord", id: i.channelId };
-            if (typeof this.adapter.fetchThreadMessages !== "function") {
-              throw new Error("Chat adapter does not support fetching thread messages.");
-            }
-
-            const rawMessages = await this.adapter.fetchThreadMessages(channelRef);
-            if (rawMessages.length === 0) {
-              throw new Error("No messages found in this Discord thread to reconstruct.");
-            }
-
-            const transcript = rawMessages.map(m => {
-              // Attribute human turns by name where present (#57 M3).
-              const role = m.authorIsBot ? "Agent" : "Human";
-              const label = !m.authorIsBot && m.authorName ? `${role} (${m.authorName})` : role;
-              return `${label}: ${m.text}`;
-            }).join("\n");
-
-            let sanitizedTranscript = transcript
-              .split("\n")
-              .map((line) => {
-                if (line.length > 2000) {
-                  return line.substring(0, 2000) + " ... [Line truncated]";
-                }
-                return line;
-              })
-              .join("\n");
-
-            const compactionModel = this.compactionModelFor(record.agentId);
-            if (!compactionModel) {
-              throw new Error(`Rebuild is not supported for agent profile \`${record.agentId}\``);
-            }
-            const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
-            // Add a rebuild-specific addendum: the compact.md template was designed
-            // for mid-session compaction. For full thread reconstruction we need the
-            // model to cover the entire conversation — especially the end.
-            const rebuildAddendum =
-              "\n\nIMPORTANT: This is a full thread reconstruction from Discord history. " +
-              "The transcript below contains the ENTIRE conversation. You MUST cover " +
-              "the full conversation from start to finish in your summary. Give " +
-              "special emphasis to the most RECENT work (the last ~30% of the " +
-              "transcript) — that is the current state the user needs to resume from. " +
-              "Do NOT spend excessive detail on early/introductory messages at the " +
-              "expense of recent ones. If the analysis section is getting very long, " +
-              "abbreviate the early parts and expand on the latest work.\n";
-            const fullTemplate = promptTemplate + rebuildAddendum;
-            const templateOverhead = fullTemplate.length + "\n\nConversation Transcript:\n".length;
-            sanitizedTranscript = fitTranscriptToWindow(
-              sanitizedTranscript,
-              templateOverhead,
-              compactionWindowFor(compactionModel)
+            const { newSessionId, summary } = await this.rebuildSessionFromThread(
+              channelRef,
+              record
             );
-            this.logger.info(
-              { channelId: i.channelId, msgCount: rawMessages.length,
-                transcriptChars: sanitizedTranscript.length, model: compactionModel },
-              "rebuild: transcript assembled",
-            );
-
-            // Write transcript to a temp file rather than inlining it in the
-            // prompt. The AGY CLI (Gemini) truncates stdin prompts larger than
-            // ~150KB, but the model can read arbitrarily large files via its
-            // file-reading tools without any truncation.
-            const transcriptFile = path.join(
-              cwd, `.rebuild-transcript-${i.channelId}-${Date.now()}.txt`,
-            );
-            await fsp.writeFile(transcriptFile, sanitizedTranscript, "utf8");
-
-            const compactionPrompt =
-              `${fullTemplate}\n\n` +
-              `The conversation transcript has been saved to the file: ${transcriptFile}\n` +
-              `Read that file NOW and then produce your summary. ` +
-              `The file contains ${rawMessages.length} messages (${sanitizedTranscript.length} chars). ` +
-              `You MUST read the ENTIRE file before summarizing — do not stop partway through.`;
-
-            tempRuntime = new AgentRuntime({
-              profile,
-              logger: this.logger.child({ session: `temp-rebuild-${i.channelId}` }),
-              mcpServers: [],
-            });
-
-            await tempRuntime.start();
-
-            await tempRuntime.newSession({
-              cwd,
-              model: compactionModel,
-              meta: { reasoningEffort: "low" },
-            });
-
-            let summaryText = "";
-            tempRuntime.onEvent((event) => {
-              if (event.kind === "agent-text") {
-                summaryText += event.text;
-              }
-            });
-
-            try {
-              const outcome = await tempRuntime.prompt(compactionPrompt);
-            } finally {
-              // Clean up the temp transcript file
-              await fsp.unlink(transcriptFile).catch(() => {});
-            }
-
-            if (!summaryText.trim()) {
-              throw new Error("Agent completed but returned an empty summary.");
-            }
-
-            // Seed a NEW resumable session with the rebuilt summary (instead of a
-            // synthetic compactSession overwrite, which won't resume).
-            const rbCfg = this.store.readConfig(record);
-            const newSessionId = await this.seedNewSession({
-              profile, cwd,
-              ...(rbCfg.model ? { model: rbCfg.model } : {}),
-              ...(rbCfg.reasoningEffort ? { effort: rbCfg.reasoningEffort } : {}),
-              summary: summaryText,
-            });
-
-            // Update active session record
-            await this.router.invalidate(record.id);
-            this.store.upsert({
-              ...record,
-              acpSessionId: newSessionId,
-              updatedUtc: new Date().toISOString(),
-            });
-
-            // Update thread name
-            await this.renameThreadForSetup(channelRef, record);
 
             // Refresh sessions list
             sessions = await manager.listSessions(cwd);
@@ -10637,7 +10803,7 @@ export class Orchestrator {
 
             const successEmbed = new EmbedBuilder()
               .setTitle("🏗️ Session Rebuilt Successfully!")
-              .setDescription(`Thread has been reconstructed from Discord history.\n\n**New Session ID:** \`${newSessionId}\`\n\n**Summary:**\n${summaryText.substring(0, 1500)}${summaryText.length > 1500 ? "..." : ""}`)
+              .setDescription(`Thread has been reconstructed from Discord history.\n\n**New Session ID:** \`${newSessionId}\`\n\n**Summary:**\n${summary.substring(0, 1500)}${summary.length > 1500 ? "..." : ""}`)
               .setColor(0x2ecc71);
 
             await btnInteraction.editReply({
@@ -10670,16 +10836,6 @@ export class Orchestrator {
               embeds: [errorEmbed],
               components: [row],
             });
-          } finally {
-            if (tempRuntime) {
-              const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
-              await tempRuntime.dispose().catch(() => {});
-              if (tempSessionId) {
-                await manager.deleteSession(cwd, tempSessionId).catch((err) => {
-                  this.logger.warn({ err, sessionId: tempSessionId }, "failed to clean up temporary summary session");
-                });
-              }
-            }
           }
         })();
       } else if (customId === "sessions:summary") {

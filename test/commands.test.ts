@@ -30,13 +30,13 @@ describe("/seam slash command", () => {
     expect(() => buildSeamCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 13 top-level slots (5 subcommands + 8 groups)", () => {
+  it("registers exactly 14 top-level slots (6 subcommands + 8 groups)", () => {
     const json = built();
-    expect(json.options?.length ?? 0).toBe(13);
+    expect(json.options?.length ?? 0).toBe(14);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
-  it("top-level names are cancel/steer/new/workflows/queue + 8 groups", () => {
+  it("top-level names include rebuild plus the existing commands and 8 groups", () => {
     const names = (built().options ?? []).map((o) => o.name);
     expect(names).toEqual([
       "cancel",
@@ -44,6 +44,7 @@ describe("/seam slash command", () => {
       "new",
       "workflows",
       "queue",
+      "rebuild",
       "config",
       "info",
       "schedule",
@@ -54,6 +55,16 @@ describe("/seam slash command", () => {
       "debug",
     ]);
     expect(names).not.toContain("attach");
+  });
+
+  it("/seam rebuild has optional agent and model strings", () => {
+    const rebuild = built().options?.find((o) => o.name === "rebuild");
+    expect(rebuild?.type).toBe(SUB_COMMAND);
+    expect((rebuild?.options ?? []).map((o) => o.name)).toEqual(["agent", "model"]);
+    for (const option of rebuild?.options ?? []) {
+      expect(option.type).toBe(STRING);
+      expect(option.required ?? false).toBe(false);
+    }
   });
 
   it("each group stays within Discord's 25-option-per-group cap", () => {

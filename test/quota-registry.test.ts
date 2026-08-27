@@ -8,13 +8,13 @@ import { mapUnlimitedQuota } from "../packages/core/src/core/quota/agent-quota.j
 
 describe("quota polling cadence", () => {
   it("selects the exact per-agent cadence tiers", () => {
-    expect(quotaPollIntervalMs(0)).toBe(10 * 60_000);
-    expect(quotaPollIntervalMs(1)).toBe(120_000);
-    expect(quotaPollIntervalMs(2)).toBe(120_000);
-    expect(quotaPollIntervalMs(3)).toBe(60_000);
-    expect(quotaPollIntervalMs(7)).toBe(60_000);
-    expect(quotaPollIntervalMs(8)).toBe(30_000);
-    expect(quotaPollIntervalMs(20)).toBe(30_000);
+    expect(quotaPollIntervalMs(0)).toBe(3_600_000);
+    expect(quotaPollIntervalMs(1)).toBe(1_800_000);
+    expect(quotaPollIntervalMs(2)).toBe(1_800_000);
+    expect(quotaPollIntervalMs(3)).toBe(900_000);
+    expect(quotaPollIntervalMs(7)).toBe(900_000);
+    expect(quotaPollIntervalMs(8)).toBe(300_000);
+    expect(quotaPollIntervalMs(20)).toBe(300_000);
   });
 
   it("counts and cools down each agent independently over ten minutes", () => {

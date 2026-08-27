@@ -5,6 +5,7 @@ import {
   fetchCopilotUsage,
   fetchGrokUsage,
   fetchGrokUsageFromConnection,
+  fetchOllamaCloudUsage,
   type AgentProfile,
 } from "@seam/adapters";
 import type { Logger } from "../../lib/logger.js";
@@ -14,6 +15,7 @@ import {
   mapCodexQuota,
   mapCopilotQuota,
   mapGrokQuota,
+  mapOllamaCloudQuota,
   mapUnavailableQuota,
   mapUnlimitedQuota,
   type AgentQuota,
@@ -39,7 +41,11 @@ export interface AgentQuotaSource extends QuotaAgentIdentity {
 
 export function createAgentQuotaSources(
   profiles: AgentProfile[],
-  opts: { agyCliPath?: string; grokCliPath?: string }
+  opts: {
+    agyCliPath?: string;
+    grokCliPath?: string;
+    ollamaUsageCliPath?: string;
+  }
 ): AgentQuotaSource[] {
   return profiles.map((profile) => {
     const identity = { agentId: profile.id, displayName: profile.displayName };
@@ -48,6 +54,17 @@ export function createAgentQuotaSources(
         ...identity,
         eventDriven: false,
         fetch: async () => mapAgyQuota(identity, await fetchAgyUserStatus(opts.agyCliPath)),
+      };
+    }
+    if (profile.id === "ollama-cloud") {
+      return {
+        ...identity,
+        eventDriven: false,
+        fetch: async () =>
+          mapOllamaCloudQuota(
+            identity,
+            await fetchOllamaCloudUsage(opts.ollamaUsageCliPath)
+          ),
       };
     }
     if (profile.id === "codex" || profile.id.startsWith("codex-")) {

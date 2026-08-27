@@ -12470,14 +12470,16 @@ export class Orchestrator {
       cwd: this.config.REPOS_ROOT,
     });
     const isAgy = record.agentId === "agy";
+    const isOllamaCloud =
+      record.agentId === "ollama-cloud" || record.agentId.startsWith("ollama-cloud-");
     const isClaude = record.agentId === "claude" || record.agentId.startsWith("claude-");
     const isCopilot =
       record.agentId === "copilot" || record.agentId.startsWith("copilot-");
     const isGrok = record.agentId === "grok" || record.agentId.startsWith("grok-");
     const isCodex = record.agentId === "codex" || record.agentId.startsWith("codex-");
-    if (!isAgy && !isClaude && !isCopilot && !isGrok && !isCodex) {
+    if (!isAgy && !isOllamaCloud && !isClaude && !isCopilot && !isGrok && !isCodex) {
       await i.editReply({
-        content: `\`/seam usage\` is only available for the \`agy\`, \`claude\`, \`copilot\`, \`grok\`, and \`codex\` agents. This thread uses \`${record.agentId}\`.`,
+        content: `\`/seam usage\` is only available for the \`agy\`, \`ollama-cloud\`, \`claude\`, \`copilot\`, \`grok\`, and \`codex\` agents. This thread uses \`${record.agentId}\`.`,
       });
       return;
     }
@@ -12488,6 +12490,10 @@ export class Orchestrator {
         const { fetchAgyUserStatus } = await import("@seam/adapters");
         const data = await fetchAgyUserStatus(this.config.AGY_CLI_PATH);
         await i.editReply({ content: formatAgyUsage(data) });
+      } else if (isOllamaCloud) {
+        const { fetchOllamaCloudUsage } = await import("@seam/adapters");
+        const data = await fetchOllamaCloudUsage(this.config.OLLAMA_USAGE_CLI_PATH);
+        await i.editReply({ content: formatOllamaCloudUsage(data) });
       } else if (isClaude) {
         const { fetchClaudeUsage } = await import("@seam/adapters");
         const data = await fetchClaudeUsage(configDir);
@@ -15627,6 +15633,39 @@ function formatAgyUsage(d: import("@seam/adapters").AgyUsage): string {
         : "";
       lines.push(usageLine(usedPercent, `${label}${reset}`));
     }
+  }
+  return lines.join("\n");
+}
+
+function formatOllamaCloudUsage(
+  d: import("@seam/adapters").OllamaCloudUsageData
+): string {
+  if (!d.ok) {
+    return `Couldn't read Ollama Cloud usage: ${d.error ?? "no data"}`;
+  }
+  const lines = ["**Ollama Cloud usage**", "", "**Rate limits**"];
+  const windows = [
+    { data: d.fiveHour, label: "5h" },
+    { data: d.weekly, label: "Weekly" },
+  ] as const;
+  for (const { data, label } of windows) {
+    if (!data) continue;
+    const reset = data.resetAt
+      ? ` · resets ${formatResetTime(data.resetAt)}`
+      : "";
+    lines.push(usageLine(data.pctUsed, `${label} limit${reset}`));
+  }
+  const topModels = [...(d.weekly?.models ?? [])]
+    .sort((a, b) => b.requests - a.requests)
+    .slice(0, 5);
+  if (topModels.length > 0) {
+    lines.push(
+      "",
+      "**Top models (weekly)**",
+      ...topModels.map(
+        (model) => `• \`${model.model}\` — ${model.requests.toLocaleString("en-US")} requests`
+      )
+    );
   }
   return lines.join("\n");
 }

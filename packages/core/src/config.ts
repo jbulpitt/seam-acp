@@ -472,6 +472,8 @@ const Schema = z.object({
     .transform((v) => v === "true"),
   /** Ollama Cloud API key (from ollama.com account settings). */
   OLLAMA_CLOUD_API_KEY: z.string().optional(),
+  /** Path to `ollama-usage`. Defaults to `ollama-usage` on PATH. */
+  OLLAMA_USAGE_CLI_PATH: z.string().optional(),
   /** Default model id for Ollama Cloud sessions. */
   OLLAMA_CLOUD_DEFAULT_MODEL: z.string().default("glm-5.2:cloud"),
   OLLAMA_CLOUD_MODELS: ModelsListSchema,

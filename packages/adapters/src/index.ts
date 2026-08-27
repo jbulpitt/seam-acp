@@ -16,3 +16,4 @@ export * from "./profiles/opencode.js";
 export * from "./profiles/codex.js";
 export * from "./profiles/codex-session-manager.js";
 export * from "./profiles/grok.js";
+export * from "./profiles/ollama-cloud.js";

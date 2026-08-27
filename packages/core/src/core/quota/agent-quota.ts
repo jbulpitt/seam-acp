@@ -6,6 +6,7 @@ import type {
   CopilotQuotaSnapshot,
   CopilotUsageData,
   GrokUsageData,
+  OllamaCloudUsageData,
 } from "@seam/adapters";
 
 export interface QuotaWindow {
@@ -260,6 +261,35 @@ export function mapAgyQuota(
     ...(!hasBuckets ? { error: "Antigravity quota data unavailable" } : {}),
     plan: null,
     ...normalizeQuotaWindows({ rolling, weekly }, fetchedAt),
+    credits: null,
+    fetchedAt,
+  };
+}
+
+export function mapOllamaCloudQuota(
+  identity: QuotaAgentIdentity,
+  data: OllamaCloudUsageData,
+  fetchedAt = Math.floor(Date.now() / 1000)
+): AgentQuota {
+  const ok = data.ok && data.fiveHour !== null && data.weekly !== null;
+  return {
+    ...identity,
+    ok,
+    ...(!ok
+      ? { error: data.error ?? "Ollama Cloud quota data unavailable" }
+      : {}),
+    plan: null,
+    ...normalizeQuotaWindows(
+      {
+        rolling: data.fiveHour
+          ? quotaWindow("rolling", data.fiveHour.pctUsed, data.fiveHour.resetAt)
+          : null,
+        weekly: data.weekly
+          ? quotaWindow("weekly", data.weekly.pctUsed, data.weekly.resetAt)
+          : null,
+      },
+      fetchedAt
+    ),
     credits: null,
     fetchedAt,
   };

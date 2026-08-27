@@ -1,16 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { parseAgyQuotaSummary } from "../packages/adapters/src/profiles/agy.js";
+import { parseOllamaCloudUsage } from "../packages/adapters/src/profiles/ollama-cloud.js";
+import type { AgentProfile } from "../packages/adapters/src/agent-profile.js";
 import {
   mapAgyQuota,
   mapClaudeQuota,
   mapCodexQuota,
   mapCopilotQuota,
   mapGrokQuota,
+  mapOllamaCloudQuota,
   mapUnlimitedQuota,
   normalizeQuotaWindows,
   ROLLING_WINDOW_SECONDS,
   WEEKLY_WINDOW_SECONDS,
 } from "../packages/core/src/core/quota/agent-quota.js";
+import { createAgentQuotaSources } from "../packages/core/src/core/quota/quota-poller.js";
 
 const identity = { agentId: "agent", displayName: "Agent" };
 const now = 2_000_000_000;
@@ -170,6 +174,55 @@ describe("agent quota normalization", () => {
     }, now);
     expect(quota.weekly.usedPercent).toBe(80);
     expect(quota.rolling.usedPercent).toBe(90);
+  });
+
+  it("maps ollama-usage JSON without inverting its used percentages", () => {
+    const data = parseOllamaCloudUsage({
+      "5h": {
+        identifier: "5h",
+        pct_used: 0.0,
+        reset_at: "2026-08-27T07:00:00+00:00",
+        models: [],
+      },
+      weekly: {
+        identifier: "weekly",
+        pct_used: 43.6,
+        reset_at: "2026-08-31T00:00:00+00:00",
+        models: [
+          { model: "kimi-k3", requests: 664 },
+          { model: "glm-5.2", requests: 272 },
+        ],
+      },
+    });
+    const quota = mapOllamaCloudQuota(identity, data, now);
+    expect(quota.ok).toBe(true);
+    expect(quota.rolling.usedPercent).toBe(0);
+    expect(quota.rolling.resetsAt).toBe(
+      Date.parse("2026-08-27T07:00:00+00:00") / 1000
+    );
+    expect(quota.weekly.usedPercent).toBe(43.6);
+    expect(quota.weekly.resetsAt).toBe(
+      Date.parse("2026-08-31T00:00:00+00:00") / 1000
+    );
+    expect(data.weekly?.models).toEqual([
+      { model: "kimi-k3", requests: 664 },
+      { model: "glm-5.2", requests: 272 },
+    ]);
+  });
+
+  it("wires ollama-cloud to a defensive CLI quota source", async () => {
+    const profile = {
+      id: "ollama-cloud",
+      displayName: "Ollama Cloud",
+    } as AgentProfile;
+    const [source] = createAgentQuotaSources([profile], {
+      ollamaUsageCliPath: "/definitely/missing/ollama-usage",
+    });
+    expect(source).toBeDefined();
+    const quota = await source!.fetch();
+    expect(quota.ok).toBe(false);
+    expect(quota.error).toMatch(/ollama-usage spawn failed/);
+    expect(quota.error).not.toMatch(/does not expose quota data/);
   });
 
   it("represents fully unlimited local agents in both dimensions", () => {

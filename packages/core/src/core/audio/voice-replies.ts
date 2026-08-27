@@ -66,8 +66,58 @@ export function selectSpokenProse(opts: {
 }
 
 export type SpokenOgg =
-  | { ok: true; ogg: Uint8Array; filename: string; mimeType: string }
+  | {
+      ok: true;
+      ogg: Uint8Array;
+      filename: string;
+      mimeType: string;
+      voiceMessage: { durationSeconds: number; waveform: string };
+    }
   | { ok: false; error: string };
+
+/**
+ * Discord voice-message metadata from signed 16-bit little-endian PCM.
+ * The waveform is a compact peak envelope (at most 256 one-byte points).
+ */
+export function voiceMessageMetadataFromPcm(
+  pcm: Uint8Array,
+  sampleRate: number,
+  channels: number
+): { durationSeconds: number; waveform: string } {
+  const bytesPerFrame = channels * 2;
+  const frames = Math.floor(pcm.byteLength / bytesPerFrame);
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0 || channels <= 0 || frames <= 0) {
+    throw new Error("invalid PCM for voice-message metadata");
+  }
+
+  const durationSeconds = frames / sampleRate;
+  const pointCount = Math.min(256, frames, Math.max(1, Math.ceil(durationSeconds * 10)));
+  const samples = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+  const peaks = new Uint16Array(pointCount);
+  let maxPeak = 0;
+
+  for (let point = 0; point < pointCount; point += 1) {
+    const startFrame = Math.floor((point * frames) / pointCount);
+    const endFrame = Math.max(startFrame + 1, Math.floor(((point + 1) * frames) / pointCount));
+    let peak = 0;
+    for (let frame = startFrame; frame < endFrame; frame += 1) {
+      for (let channel = 0; channel < channels; channel += 1) {
+        const offset = (frame * channels + channel) * 2;
+        peak = Math.max(peak, Math.abs(samples.readInt16LE(offset)));
+      }
+    }
+    peaks[point] = peak;
+    maxPeak = Math.max(maxPeak, peak);
+  }
+
+  const envelope = Buffer.alloc(pointCount);
+  if (maxPeak > 0) {
+    for (let i = 0; i < pointCount; i += 1) {
+      envelope[i] = Math.round((peaks[i]! / maxPeak) * 255);
+    }
+  }
+  return { durationSeconds, waveform: envelope.toString("base64") };
+}
 
 export async function speakReplyToOgg(opts: {
   apiKey: string;
@@ -89,6 +139,11 @@ export async function speakReplyToOgg(opts: {
     ...(opts.fetchFn ? { fetchFn: opts.fetchFn } : {}),
   });
   if (!tts.ok) return tts;
+  const voiceMessage = voiceMessageMetadataFromPcm(
+    tts.audio.pcm,
+    tts.audio.sampleRate,
+    tts.audio.channels
+  );
   const ogg = await encodePcmToOggOpus({
     pcm: tts.audio.pcm,
     sampleRate: tts.audio.sampleRate,
@@ -96,5 +151,11 @@ export async function speakReplyToOgg(opts: {
     ...(opts.ffmpegPath ? { ffmpegPath: opts.ffmpegPath } : {}),
   });
   if (!ogg.ok) return ogg;
-  return { ok: true, ogg: ogg.ogg, filename: "reply.ogg", mimeType: "audio/ogg" };
+  return {
+    ok: true,
+    ogg: ogg.ogg,
+    filename: "reply.ogg",
+    mimeType: "audio/ogg",
+    voiceMessage,
+  };
 }

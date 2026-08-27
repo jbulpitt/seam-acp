@@ -12874,6 +12874,7 @@ export class Orchestrator {
         data: Buffer.from(spoken.ogg),
         filename: spoken.filename,
         mimeType: spoken.mimeType,
+        voiceMessage: spoken.voiceMessage,
       });
     } catch (err) {
       this.logger.warn({ err, threadId: opts.threadId }, "outbound TTS threw");

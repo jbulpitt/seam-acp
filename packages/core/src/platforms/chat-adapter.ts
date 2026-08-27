@@ -78,6 +78,12 @@ export interface ChatAdapter {
       filename: string;
       mimeType: string;
       caption?: string;
+      /** Render this audio attachment as a native platform voice message. */
+      voiceMessage?: {
+        durationSeconds: number;
+        /** Base64-encoded sampled amplitude bytes. */
+        waveform: string;
+      };
     }
   ): Promise<MessageRef>;
 

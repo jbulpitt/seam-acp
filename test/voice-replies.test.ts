@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { MessageFlags } from "discord.js";
 import {
   buildTtsInput,
   findGeminiTtsVoice,
@@ -13,7 +14,9 @@ import {
   selectSpokenProse,
   shouldSpeakReply,
   TTS_MAX_CHARS,
+  voiceMessageMetadataFromPcm,
 } from "../packages/core/src/core/audio/voice-replies.js";
+import { buildDiscordFileSendPayload } from "../packages/core/src/platforms/discord/adapter.js";
 
 const TTS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
 
@@ -146,6 +149,44 @@ describe("shouldSpeakReply", () => {
       speak: false,
       reason: "not-ok",
     });
+  });
+});
+
+describe("Discord voice-message TTS", () => {
+  it("builds duration and a normalized waveform from PCM", () => {
+    const pcm = Buffer.alloc(8);
+    [-1000, 0, 2000, -3000].forEach((sample, i) => pcm.writeInt16LE(sample, i * 2));
+    const metadata = voiceMessageMetadataFromPcm(pcm, 4, 1);
+    expect(metadata.durationSeconds).toBe(1);
+    const waveform = Buffer.from(metadata.waveform, "base64");
+    expect([...waveform]).toEqual([85, 0, 170, 255]);
+  });
+
+  it("marks generated audio as a native Discord voice message", () => {
+    const payload = buildDiscordFileSendPayload({
+      data: Buffer.from("OggS"),
+      filename: "reply.ogg",
+      mimeType: "audio/ogg",
+      caption: "must not accompany a voice message",
+      voiceMessage: { durationSeconds: 1.25, waveform: "AQID" },
+    });
+    expect(payload.flags).toBe(MessageFlags.IsVoiceMessage);
+    expect("content" in payload).toBe(false);
+    expect(payload.files[0]!.duration).toBe(1.25);
+    expect(payload.files[0]!.waveform).toBe("AQID");
+  });
+
+  it("keeps ordinary file uploads as ordinary attachment messages", () => {
+    const payload = buildDiscordFileSendPayload({
+      data: Buffer.from("hello"),
+      filename: "note.txt",
+      mimeType: "text/plain",
+      caption: "Note",
+    });
+    expect(payload.flags).toBe(MessageFlags.SuppressEmbeds);
+    expect(payload.content).toBe("Note");
+    expect(payload.files[0]!.duration).toBeNull();
+    expect(payload.files[0]!.waveform).toBeNull();
   });
 });
 

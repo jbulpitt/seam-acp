@@ -31,6 +31,7 @@ import {
   type ButtonInteraction,
   type ModalSubmitInteraction,
   type StringSelectMenuInteraction,
+  type MessageCreateOptions,
 } from "discord.js";
 import type {
   RequestPermissionRequest,
@@ -72,6 +73,35 @@ import {
   describeMultiSelectMenu,
   sliceChoicePage,
 } from "./choice-picker.js";
+
+export type DiscordFileSend = {
+  data: Buffer;
+  filename: string;
+  mimeType: string;
+  caption?: string;
+  voiceMessage?: { durationSeconds: number; waveform: string };
+};
+
+/** Build the Discord payload separately so voice-message semantics stay tested. */
+export function buildDiscordFileSendPayload(file: DiscordFileSend): MessageCreateOptions {
+  const attachment = new AttachmentBuilder(file.data, { name: file.filename });
+  if (file.voiceMessage) {
+    attachment
+      .setDuration(file.voiceMessage.durationSeconds)
+      .setWaveform(file.voiceMessage.waveform);
+    return {
+      files: [attachment],
+      flags: MessageFlags.IsVoiceMessage,
+      allowedMentions: { parse: [] },
+    };
+  }
+  return {
+    ...(file.caption ? { content: file.caption } : {}),
+    files: [attachment],
+    flags: MessageFlags.SuppressEmbeds,
+    allowedMentions: { parse: [] },
+  };
+}
 
 const PLATFORM = "discord";
 
@@ -487,15 +517,10 @@ export class DiscordAdapter implements ChatAdapter {
 
   async sendFile(
     channel: ChannelRef,
-    file: { data: Buffer; filename: string; mimeType: string; caption?: string }
+    file: DiscordFileSend
   ): Promise<MessageRef> {
     const ch = await this.fetchSendableChannel(channel.id);
-    const sent = await ch.send({
-      ...(file.caption ? { content: file.caption } : {}),
-      files: [{ attachment: file.data, name: file.filename }],
-      flags: MessageFlags.SuppressEmbeds,
-      allowedMentions: { parse: [] },
-    });
+    const sent = await ch.send(buildDiscordFileSendPayload(file));
     return { channel, id: sent.id };
   }
 

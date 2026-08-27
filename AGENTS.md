@@ -103,12 +103,12 @@ Load `~/.local/share/wt-helpers/AGENTS.md` before creating or tearing down a tre
 
 ## Slash command tree (`/seam`)
 
-Discord caps each command at 25 top-level options. `/seam` is 13/25: 5
+Discord caps each command at 25 top-level options. `/seam` is 14/25: 6
 top-level subcommands + 8 groups. Future surfaces default to living
 **inside a group** (each group has its own 25 budget). Hard cutover —
 Discord has no aliases; old invocations disappear.
 
-**Top-level (5):** `cancel`, `steer`, `new`, `workflows`, `queue`
+**Top-level (6):** `cancel`, `steer`, `new`, `workflows`, `queue`, `rebuild`
 
 **Groups (8):**
 - `config` (16): `model` `effort` `agent` `mode` `repo` `tools` `approve` `card` `reset` `init` `detach` `tts` `show` `edit` `set` `audit`

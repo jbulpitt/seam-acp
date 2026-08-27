@@ -884,6 +884,12 @@ async function main(): Promise<void> {
 
   logger.info("seam-acp ready");
 
+  // Operator-controlled, one-shot batch migration. Missing sentinel is a
+  // silent no-op; malformed input is logged without taking the bot down.
+  void orchestrator.runPendingThreadMigration().catch((err) =>
+    logger.error({ err }, "pending thread migration failed")
+  );
+
   // Best-effort startup notification to a configured channel.
   void orchestrator.postNotification("✅ Seam online.");
 

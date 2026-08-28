@@ -3,6 +3,7 @@ import {
   type SpeechTextKind,
 } from "../audio/streaming-speech-segmenter.js";
 import type {
+  VoiceConsoleBindingStateConflict,
   VoiceConsoleBindingStateSyncResult,
   VoiceConsoleChunkDisposition,
   VoiceConsolePlaybackResult,
@@ -29,6 +30,7 @@ type BindingState = {
   profile: VoiceConsoleSpeechProfile;
   outputEnabled: boolean;
   generation: number;
+  stateConflict: VoiceConsoleBindingStateConflict | null;
   recentFailure: VoiceConsoleSpeechFailure | null;
   stats: VoiceConsoleSpeechStats;
   drainWaiters: Array<(stats: VoiceConsoleSpeechStats) => void>;
@@ -95,7 +97,9 @@ export class VoiceConsoleSpeechScheduler {
   private sliceAudioMs = 0;
   private running = false;
   private destroyed = false;
-  private stateChangeQueued = false;
+  private stateChangeScheduled = false;
+  private stateChangeInFlight = false;
+  private pendingStateChangeSnapshot: VoiceConsoleSpeechSchedulerSnapshot | undefined;
   private readonly pendingStateChangeReasons = new Set<VoiceConsoleSpeechStateChangeReason>();
 
   constructor(opts: VoiceConsoleSpeechSchedulerOptions) {
@@ -136,6 +140,7 @@ export class VoiceConsoleSpeechScheduler {
       profile: normalizeProfile(opts.profile),
       outputEnabled: opts.outputEnabled,
       generation,
+      stateConflict: null,
       recentFailure: null,
       stats: emptyStats(),
       drainWaiters: [],
@@ -214,18 +219,32 @@ export class VoiceConsoleSpeechScheduler {
     validateGeneration(state.generation);
     if (state.generation < binding.generation) return "stale";
     if (state.generation === binding.generation) {
+      if (binding.stateConflict) {
+        throw bindingStateConflictError(bindingId, binding.stateConflict);
+      }
       if (state.outputEnabled !== binding.outputEnabled) {
-        throw new Error(
-          `Voice Console speech binding state conflicts at generation ${state.generation}: ${bindingId}`
-        );
+        const conflict: VoiceConsoleBindingStateConflict = {
+          generation: state.generation,
+          localOutputEnabled: binding.outputEnabled,
+          receivedOutputEnabled: state.outputEnabled,
+        };
+        binding.stateConflict = conflict;
+        binding.outputEnabled = false;
+        this.clearBindingFailure(binding);
+        this.invalidateBindingWork(bindingId);
+        this.queueStateChange("binding-conflict");
+        throw bindingStateConflictError(bindingId, conflict);
       }
       return "unchanged";
     }
 
+    const clearedConflict = binding.stateConflict !== null;
     binding.outputEnabled = state.outputEnabled;
     binding.generation = state.generation;
+    binding.stateConflict = null;
     this.clearBindingFailure(binding);
     this.invalidateBindingWork(bindingId);
+    if (clearedConflict) this.queueStateChange("binding-conflict-cleared");
     this.queueStateChange("binding-synced");
     return "applied";
   }
@@ -325,6 +344,10 @@ export class VoiceConsoleSpeechScheduler {
 
   setOutputEnabled(bindingId: string, enabled: boolean): number {
     const binding = this.binding(bindingId);
+    if (binding.stateConflict) {
+      if (enabled) throw bindingStateConflictError(bindingId, binding.stateConflict);
+      return binding.generation;
+    }
     if (binding.outputEnabled === enabled) return binding.generation;
     binding.outputEnabled = enabled;
     this.clearBindingFailure(binding);
@@ -394,6 +417,7 @@ export class VoiceConsoleSpeechScheduler {
         profile: { ...binding.profile },
         queuedChunks,
         activeSources: bindingSources.length,
+        stateConflict: binding.stateConflict ? { ...binding.stateConflict } : null,
         recentFailure: binding.recentFailure ? copyFailure(binding.recentFailure) : null,
         stats: copyStats(binding.stats),
       });
@@ -803,20 +827,48 @@ export class VoiceConsoleSpeechScheduler {
   private queueStateChange(reason: VoiceConsoleSpeechStateChangeReason): void {
     if (!this.onStateChange) return;
     this.pendingStateChangeReasons.add(reason);
-    if (this.stateChangeQueued) return;
-    this.stateChangeQueued = true;
+    this.pendingStateChangeSnapshot = this.snapshot();
+    this.scheduleStateChangeDelivery();
+  }
+
+  private scheduleStateChangeDelivery(): void {
+    if (
+      !this.onStateChange ||
+      this.stateChangeInFlight ||
+      this.stateChangeScheduled ||
+      !this.pendingStateChangeSnapshot
+    ) {
+      return;
+    }
+    this.stateChangeScheduled = true;
     queueMicrotask(() => {
-      this.stateChangeQueued = false;
-      if (this.pendingStateChangeReasons.size === 0) return;
-      const reasons = [...this.pendingStateChangeReasons];
-      this.pendingStateChangeReasons.clear();
-      try {
-        const delivered = this.onStateChange?.({ reasons, snapshot: this.snapshot() });
-        if (delivered) void Promise.resolve(delivered).catch(() => {});
-      } catch {
-        // Card/status refresh is advisory and cannot own scheduler progress.
-      }
+      this.stateChangeScheduled = false;
+      this.deliverStateChange();
     });
+  }
+
+  private deliverStateChange(): void {
+    if (
+      !this.onStateChange ||
+      this.stateChangeInFlight ||
+      !this.pendingStateChangeSnapshot
+    ) {
+      return;
+    }
+    const snapshot = this.pendingStateChangeSnapshot;
+    this.pendingStateChangeSnapshot = undefined;
+    const reasons = [...this.pendingStateChangeReasons];
+    this.pendingStateChangeReasons.clear();
+    this.stateChangeInFlight = true;
+    void Promise.resolve()
+      .then(() => this.onStateChange!({ reasons, snapshot }))
+      .catch(() => {
+        // Card/status refresh is advisory and cannot own scheduler progress.
+      })
+      .then(() => {
+        this.stateChangeInFlight = false;
+        this.scheduleStateChangeDelivery();
+      });
   }
 
   private source(ref: VoiceConsoleSpeechSourceRef): SourceState {
@@ -873,6 +925,16 @@ function validateGeneration(generation: number): void {
 
 function copyFailure(failure: VoiceConsoleSpeechFailure): VoiceConsoleSpeechFailure {
   return { ...failure, source: { ...failure.source } };
+}
+
+function bindingStateConflictError(
+  bindingId: string,
+  conflict: VoiceConsoleBindingStateConflict
+): Error {
+  return new Error(
+    `Voice Console speech binding state conflicts at generation ${conflict.generation}: ${bindingId}; ` +
+    "a strictly newer authoritative generation is required"
+  );
 }
 
 function positiveInteger(value: number | undefined, fallback: number): number {

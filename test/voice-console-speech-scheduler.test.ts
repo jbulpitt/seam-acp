@@ -50,6 +50,10 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+async function flushMicrotasks(rounds = 8): Promise<void> {
+  for (let index = 0; index < rounds; index++) await Promise.resolve();
+}
+
 function setup(opts: {
   synthesize?: (request: VoiceConsoleSynthesisRequest) => Promise<VoiceConsoleSynthesisResult>;
   playback?: VoiceConsoleSpeechPlayback;
@@ -449,9 +453,335 @@ describe("VoiceConsoleSpeechScheduler authoritative durable state", () => {
     expect(scheduler.snapshot().bindings.find((binding) => binding.bindingId === "A"))
       .toMatchObject({ outputEnabled: false, generation: 900 });
   });
+
+  it("fails closed on an enabled-to-disabled equal-generation conflict during synthesis", async () => {
+    const lateSynthesis = deferred<VoiceConsoleSynthesisResult>();
+    let oldSignal: AbortSignal | undefined;
+    const requests: VoiceConsoleSynthesisRequest[] = [];
+    const played: string[] = [];
+    const scheduler = new VoiceConsoleSpeechScheduler({
+      consoleId,
+      synthesize: vi.fn(async (request) => {
+        requests.push(request);
+        if (request.chunk.text === "old-current") {
+          oldSignal = request.signal;
+          return lateSynthesis.promise;
+        }
+        return { ok: true, audio: audio(request.chunk.ordinal) };
+      }),
+      playback: {
+        play: vi.fn(async ({ chunk: item }) => {
+          played.push(item.text);
+          return { status: "played", durationMs: 1_000 };
+        }),
+        destroy: vi.fn(),
+      },
+    });
+    scheduler.registerBinding({
+      bindingId: "A",
+      profile: profileA,
+      outputEnabled: true,
+      generation: 5,
+    });
+    const a = source("A", "turn-conflict-synthesis");
+    scheduler.registerSource(a);
+    scheduler.feedSourceText(a, "This old partial prose must be discarded when durable state conflicts");
+    scheduler.enqueueChunk(chunk(a, 1, 5, "old-current"));
+    scheduler.enqueueChunk(chunk(a, 2, 5, "old-queued"));
+    const bindingDrain = scheduler.waitForBindingDrain("A");
+    await vi.waitFor(() => expect(oldSignal).toBeDefined());
+
+    expect(() => scheduler.syncBindingState("A", { outputEnabled: false, generation: 5 }))
+      .toThrow(/strictly newer authoritative generation/);
+    expect(oldSignal!.aborted).toBe(true);
+    expect(scheduler.snapshot().bindings[0]).toMatchObject({
+      outputEnabled: false,
+      generation: 5,
+      queuedChunks: 0,
+      stateConflict: {
+        generation: 5,
+        localOutputEnabled: true,
+        receivedOutputEnabled: false,
+      },
+    });
+    expect(() => scheduler.syncBindingState("A", { outputEnabled: false, generation: 5 }))
+      .toThrow(/strictly newer authoritative generation/);
+    expect(() => scheduler.syncBindingState("A", { outputEnabled: true, generation: 5 }))
+      .toThrow(/strictly newer authoritative generation/);
+    expect(() => scheduler.setOutputEnabled("A", true))
+      .toThrow(/strictly newer authoritative generation/);
+    expect(scheduler.feedSourceText(a, "Blocked prose must not accumulate or play. ")).toBe(0);
+    expect(scheduler.enqueueChunk(chunk(a, 3, 5, "blocked"))).toBe("dropped");
+
+    expect(scheduler.syncBindingState("A", { outputEnabled: true, generation: 6 }))
+      .toBe("applied");
+    expect(scheduler.snapshot().bindings[0]).toMatchObject({
+      outputEnabled: true,
+      generation: 6,
+      stateConflict: null,
+    });
+    expect(scheduler.feedSourceText(
+      a,
+      "Only this future clean sentence may play after a strictly newer authoritative generation. "
+    )).toBe(1);
+    const sourceDrain = scheduler.finishSource(a);
+    lateSynthesis.resolve({ ok: true, audio: audio(1) });
+
+    const [sourceStats, bindingStats] = await Promise.all([sourceDrain, bindingDrain]);
+    expect(requests.map((request) => request.chunk.text)).toEqual([
+      "old-current",
+      "Only this future clean sentence may play after a strictly newer authoritative generation.",
+    ]);
+    expect(played).toEqual([
+      "Only this future clean sentence may play after a strictly newer authoritative generation.",
+    ]);
+    expect(sourceStats).toMatchObject({ accepted: 3, played: 1, dropped: 3 });
+    expect(bindingStats).toMatchObject({ accepted: 3, played: 1, dropped: 3 });
+  });
+
+  it("fails closed on an equal-generation conflict during playback and keeps siblings reusable", async () => {
+    const latePlayback = deferred<{ status: "played"; durationMs: number }>();
+    let playbackSignal: AbortSignal | undefined;
+    const played: string[] = [];
+    const playback: VoiceConsoleSpeechPlayback = {
+      play: vi.fn(async (request) => {
+        if (request.chunk.text === "old-playing") {
+          playbackSignal = request.signal;
+          return latePlayback.promise;
+        }
+        played.push(request.chunk.text);
+        return { status: "played", durationMs: 1_000 };
+      }),
+      destroy: vi.fn(),
+    };
+    const scheduler = new VoiceConsoleSpeechScheduler({
+      consoleId,
+      synthesize: async ({ chunk: item }) => ({ ok: true, audio: audio(item.ordinal) }),
+      playback,
+    });
+    scheduler.registerBinding({
+      bindingId: "A",
+      profile: profileA,
+      outputEnabled: true,
+      generation: 5,
+    });
+    scheduler.registerBinding({
+      bindingId: "B",
+      profile: profileB,
+      outputEnabled: true,
+      generation: 9,
+    });
+    const a = source("A", "turn-conflict-playback");
+    const b = source("B", "turn-conflict-sibling");
+    scheduler.registerSource(a);
+    scheduler.registerSource(b);
+    scheduler.enqueueChunk(chunk(a, 1, 5, "old-playing"));
+    scheduler.enqueueChunk(chunk(a, 2, 5, "old-queued"));
+    scheduler.enqueueChunk(chunk(b, 1, 9, "sibling"));
+    const drainA = scheduler.finishSource(a);
+    const drainB = scheduler.finishSource(b);
+    await vi.waitFor(() => expect(playbackSignal).toBeDefined());
+
+    expect(() => scheduler.syncBindingState("A", { outputEnabled: false, generation: 5 }))
+      .toThrow(/strictly newer authoritative generation/);
+    expect(playbackSignal!.aborted).toBe(true);
+    await expect(drainA).resolves.toMatchObject({ accepted: 2, dropped: 2 });
+    await expect(drainB).resolves.toMatchObject({ played: 1 });
+    expect(played).toEqual(["sibling"]);
+    expect(playback.destroy).not.toHaveBeenCalled();
+
+    latePlayback.resolve({ status: "played", durationMs: 99_000 });
+    await flushMicrotasks();
+    expect(played).toEqual(["sibling"]);
+
+    expect(scheduler.syncBindingState("A", { outputEnabled: true, generation: 6 }))
+      .toBe("applied");
+    const recovered = source("A", "turn-after-playback-conflict");
+    scheduler.registerSource(recovered);
+    scheduler.enqueueChunk(chunk(recovered, 1, 6, "A-recovered"));
+    await scheduler.finishSource(recovered);
+    expect(played).toEqual(["sibling", "A-recovered"]);
+  });
+
+  it("blocks a disabled-to-enabled equal-generation conflict until a newer generation", async () => {
+    const { scheduler, played } = setup();
+    scheduler.unregisterBinding("A");
+    scheduler.registerBinding({
+      bindingId: "A",
+      profile: profileA,
+      outputEnabled: false,
+      generation: 5,
+    });
+    const a = source("A", "turn-disabled-conflict");
+    scheduler.registerSource(a);
+    expect(scheduler.feedSourceText(a, "Disabled partial prose must not be retained. ")).toBe(0);
+
+    expect(() => scheduler.syncBindingState("A", { outputEnabled: true, generation: 5 }))
+      .toThrow(/strictly newer authoritative generation/);
+    expect(() => scheduler.syncBindingState("A", { outputEnabled: true, generation: 5 }))
+      .toThrow(/strictly newer authoritative generation/);
+    expect(() => scheduler.syncBindingState("A", { outputEnabled: false, generation: 5 }))
+      .toThrow(/strictly newer authoritative generation/);
+    expect(scheduler.snapshot().bindings.find((binding) => binding.bindingId === "A"))
+      .toMatchObject({
+        outputEnabled: false,
+        generation: 5,
+        stateConflict: {
+          localOutputEnabled: false,
+          receivedOutputEnabled: true,
+        },
+      });
+    expect(scheduler.enqueueChunk(chunk(a, 1, 5, "blocked"))).toBe("dropped");
+    expect(scheduler.feedSourceText(a, "Still blocked prose must remain silent. ")).toBe(0);
+
+    expect(scheduler.syncBindingState("A", { outputEnabled: true, generation: 6 }))
+      .toBe("applied");
+    expect(scheduler.feedSourceText(
+      a,
+      "A strictly newer generation allows only this future clean sentence to reach playback. "
+    )).toBe(1);
+    await scheduler.finishSource(a);
+    expect(played).toEqual([
+      "A strictly newer generation allows only this future clean sentence to reach playback.",
+    ]);
+  });
 });
 
 describe("VoiceConsoleSpeechScheduler state changes", () => {
+  it("keeps async callbacks single-flight and coalesces a burst to the latest snapshot", async () => {
+    const gates: Array<ReturnType<typeof deferred<void>>> = [];
+    const delivered: number[] = [];
+    const snapshots: VoiceConsoleSpeechStateChange[] = [];
+    let active = 0;
+    let maxActive = 0;
+    const scheduler = new VoiceConsoleSpeechScheduler({
+      consoleId,
+      synthesize: async () => ({ ok: true, audio: audio() }),
+      playback: {
+        play: async () => ({ status: "played", durationMs: 1_000 }),
+        destroy: vi.fn(),
+      },
+      onStateChange: async (change) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        snapshots.push(change);
+        const gate = deferred<void>();
+        gates.push(gate);
+        await gate.promise;
+        delivered.push(change.snapshot.bindings[0]?.generation ?? -1);
+        active -= 1;
+      },
+    });
+    scheduler.registerBinding({
+      bindingId: "A",
+      profile: profileA,
+      outputEnabled: true,
+      generation: 0,
+    });
+    await vi.waitFor(() => expect(gates).toHaveLength(1));
+
+    for (let generation = 1; generation <= 5; generation++) {
+      expect(scheduler.syncBindingState("A", {
+        outputEnabled: generation % 2 === 0,
+        generation,
+      })).toBe("applied");
+    }
+    await flushMicrotasks();
+    expect(gates).toHaveLength(1);
+    expect(snapshots).toHaveLength(1);
+    expect(maxActive).toBe(1);
+
+    gates[0]!.resolve();
+    await vi.waitFor(() => expect(gates).toHaveLength(2));
+    expect(snapshots[1]?.snapshot.bindings[0]).toMatchObject({
+      generation: 5,
+      outputEnabled: false,
+    });
+    expect(snapshots[1]?.reasons).toEqual(["queue-changed", "binding-synced"]);
+    expect(maxActive).toBe(1);
+
+    gates[1]!.resolve();
+    await vi.waitFor(() => expect(delivered).toEqual([0, 5]));
+    expect(maxActive).toBe(1);
+    expect(delivered.at(-1)).toBe(5);
+  });
+
+  it("serializes reentrant mutation and isolates callback throw/rejection", async () => {
+    const seen: number[] = [];
+    let active = 0;
+    let maxActive = 0;
+    let call = 0;
+    let scheduler!: VoiceConsoleSpeechScheduler;
+    scheduler = new VoiceConsoleSpeechScheduler({
+      consoleId,
+      synthesize: async () => ({ ok: true, audio: audio() }),
+      playback: {
+        play: async () => ({ status: "played", durationMs: 1_000 }),
+        destroy: vi.fn(),
+      },
+      onStateChange: async (change) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        call += 1;
+        seen.push(change.snapshot.bindings[0]?.generation ?? -1);
+        if (call === 1) {
+          scheduler.syncBindingState("A", { outputEnabled: false, generation: 1 });
+          active -= 1;
+          throw new Error("synchronous callback failure");
+        }
+        active -= 1;
+        if (call === 2) return Promise.reject(new Error("async callback failure"));
+      },
+    });
+    scheduler.registerBinding({
+      bindingId: "A",
+      profile: profileA,
+      outputEnabled: true,
+      generation: 0,
+    });
+    await vi.waitFor(() => expect(seen).toEqual([0, 1]));
+    await flushMicrotasks();
+    expect(maxActive).toBe(1);
+    expect(scheduler.snapshot().bindings[0]).toMatchObject({
+      generation: 1,
+      outputEnabled: false,
+    });
+
+    const a = source("A", "turn-callback-drain");
+    scheduler.registerSource(a);
+    scheduler.cancelSource(a);
+    await expect(scheduler.waitForSourceDrain(a)).resolves.toMatchObject({ accepted: 0 });
+  });
+
+  it("delivers unregister/destroy as the latest state after a pending callback", async () => {
+    const first = deferred<void>();
+    const snapshots: VoiceConsoleSpeechStateChange[] = [];
+    const scheduler = new VoiceConsoleSpeechScheduler({
+      consoleId,
+      synthesize: async () => ({ ok: true, audio: audio() }),
+      playback: {
+        play: async () => ({ status: "played", durationMs: 1_000 }),
+        destroy: vi.fn(),
+      },
+      onStateChange: async (change) => {
+        snapshots.push(change);
+        if (snapshots.length === 1) await first.promise;
+      },
+    });
+    scheduler.registerBinding({ bindingId: "A", profile: profileA, outputEnabled: true });
+    await vi.waitFor(() => expect(snapshots).toHaveLength(1));
+    scheduler.unregisterBinding("A");
+    scheduler.destroy();
+    scheduler.destroy();
+    await flushMicrotasks();
+    expect(snapshots).toHaveLength(1);
+
+    first.resolve();
+    await vi.waitFor(() => expect(snapshots).toHaveLength(2));
+    expect(snapshots[1]?.reasons).toEqual(["binding-unregistered", "destroyed"]);
+    expect(snapshots[1]?.snapshot).toMatchObject({ destroyed: true, bindings: [] });
+  });
+
   it("reports authoritative sync and lifecycle changes without replay churn", async () => {
     const changes: VoiceConsoleSpeechStateChange[] = [];
     const scheduler = new VoiceConsoleSpeechScheduler({
@@ -469,7 +799,7 @@ describe("VoiceConsoleSpeechScheduler state changes", () => {
       outputEnabled: true,
       generation: 5,
     });
-    await Promise.resolve();
+    await vi.waitFor(() => expect(changes).toHaveLength(1));
     changes.length = 0;
 
     expect(scheduler.syncBindingState("A", { outputEnabled: false, generation: 6 }))
@@ -478,8 +808,7 @@ describe("VoiceConsoleSpeechScheduler state changes", () => {
       .toBe("unchanged");
     expect(scheduler.syncBindingState("A", { outputEnabled: true, generation: 5 }))
       .toBe("stale");
-    await Promise.resolve();
-    expect(changes).toHaveLength(1);
+    await vi.waitFor(() => expect(changes).toHaveLength(1));
     expect(changes[0]?.reasons).toEqual(["queue-changed", "binding-synced"]);
     expect(changes[0]?.snapshot.bindings[0]).toMatchObject({
       outputEnabled: false,
@@ -487,16 +816,17 @@ describe("VoiceConsoleSpeechScheduler state changes", () => {
     });
 
     const a = source("A", "turn-state-cancel");
+    const beforeCancel = changes.length;
     scheduler.registerSource(a);
     scheduler.cancelSource(a);
     await scheduler.waitForSourceDrain(a);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(changes.length).toBeGreaterThan(beforeCancel));
     expect(changes.some((change) => change.reasons.includes("source-cancelled"))).toBe(true);
 
     expect(scheduler.unregisterBinding("A")).toBe(true);
     scheduler.destroy();
     scheduler.destroy();
-    await Promise.resolve();
+    await vi.waitFor(() => expect(changes.at(-1)?.snapshot.destroyed).toBe(true));
     const terminal = changes.at(-1);
     expect(terminal?.reasons).toEqual(["binding-unregistered", "destroyed"]);
     expect(terminal?.snapshot).toMatchObject({ destroyed: true, bindings: [] });
@@ -519,7 +849,7 @@ describe("VoiceConsoleSpeechScheduler state changes", () => {
     scheduler.enqueueChunk(chunk(a, 1));
     const drained = scheduler.finishSource(a);
 
-    await Promise.resolve();
+    await vi.waitFor(() => expect(changes).not.toHaveLength(0));
     expect(changes[0]?.reasons).toEqual([
       "binding-registered",
       "source-registered",
@@ -532,13 +862,11 @@ describe("VoiceConsoleSpeechScheduler state changes", () => {
     });
 
     await drained;
-    await Promise.resolve();
-    expect(changes.some((change) =>
-      change.reasons.includes("work-started") && change.snapshot.currentPhase === "synthesis"
-    )).toBe(true);
-    expect(changes.some((change) =>
-      change.reasons.includes("work-phase-changed") && change.snapshot.currentPhase === "playback"
-    )).toBe(true);
+    await vi.waitFor(() => expect(changes.at(-1)?.snapshot.currentSource).toBeNull());
+    const reasons = changes.flatMap((change) => change.reasons);
+    expect(reasons).toContain("work-started");
+    expect(reasons).toContain("work-phase-changed");
+    expect(reasons).toContain("work-settled");
     expect(changes.at(-1)?.snapshot).toMatchObject({
       queueDepth: 0,
       currentSource: null,
@@ -570,8 +898,9 @@ describe("VoiceConsoleSpeechScheduler state changes", () => {
     await expect(scheduler.finishSource(a)).resolves.toMatchObject({ played: 1 });
     scheduler.destroy();
     scheduler.destroy();
-    await Promise.resolve();
-    await Promise.resolve();
+    await vi.waitFor(() =>
+      expect(observed.filter((change) => change.reasons.includes("destroyed"))).toHaveLength(1)
+    );
 
     expect(observed.length).toBeGreaterThan(1);
     expect(observed.filter((change) => change.reasons.includes("destroyed"))).toHaveLength(1);

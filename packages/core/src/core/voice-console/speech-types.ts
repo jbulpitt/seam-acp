@@ -55,6 +55,12 @@ export interface VoiceConsoleSpeechFailure {
 
 export type VoiceConsoleSpeechWorkPhase = "synthesis" | "playback";
 
+export interface VoiceConsoleBindingStateConflict {
+  generation: number;
+  localOutputEnabled: boolean;
+  receivedOutputEnabled: boolean;
+}
+
 export interface VoiceConsoleSpeechStats {
   accepted: number;
   played: number;
@@ -70,6 +76,8 @@ export interface VoiceConsoleSpeechBindingSnapshot {
   profile: VoiceConsoleSpeechProfile;
   queuedChunks: number;
   activeSources: number;
+  /** Runtime output is forced off until a strictly newer durable generation arrives. */
+  stateConflict: VoiceConsoleBindingStateConflict | null;
   /** Cleared by the next source, successful playback, or authoritative state sync. */
   recentFailure: VoiceConsoleSpeechFailure | null;
   stats: VoiceConsoleSpeechStats;
@@ -89,6 +97,8 @@ export type VoiceConsoleBindingStateSyncResult = "applied" | "unchanged" | "stal
 export type VoiceConsoleSpeechStateChangeReason =
   | "binding-registered"
   | "binding-synced"
+  | "binding-conflict"
+  | "binding-conflict-cleared"
   | "binding-invalidated"
   | "binding-unregistered"
   | "profile-updated"

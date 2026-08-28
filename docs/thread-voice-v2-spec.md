@@ -95,7 +95,9 @@ V2 does not include:
 
 - **Voice Console:** the guild-level active product session that owns Discord
   voice, STT, capture routing, the control card, and global speech scheduling.
-- **Control thread:** the Discord thread containing the canonical console card.
+- **Control channel:** the console voice channel's built-in text chat, using the
+  same Discord channel id as the voice connection. It contains the canonical
+  console card.
 - **Binding:** one immutable association between a console and an ACP home
   thread. A thread has at most one active binding in its guild.
 - **Binding alias:** a short unique presentation label shown on the console.
@@ -273,6 +275,11 @@ Optional parameters:
 Rules:
 
 - same V1 admin, guild, owner-in-VC, visible-channel, and self-muted checks;
+- preflight the VC chat as a hard prerequisite. The bot must have
+  `ViewChannel`, `Connect`, `SendMessages`, `EmbedLinks`, and
+  `ReadMessageHistory` in that voice channel;
+- refuse startup with the exact missing permissions when the VC chat is not
+  usable. Never fall back to an ACP thread or another text channel;
 - refuses an incompatible guild voice lease;
 - if this guild already has a console owned by the invoker, direct them to
   `/seam voice add` rather than creating another;
@@ -280,7 +287,8 @@ Rules:
 - snapshot the current thread's TTS voice, pace, and style as the binding's
   independent console profile;
 - select the first binding and enable its output;
-- post the canonical card in this thread.
+- post the canonical card in the voice channel's built-in text chat and persist
+  its message id.
 
 ### 6.2 `/seam voice add`
 
@@ -321,9 +329,7 @@ Rules:
 - explicit discard follows the V1 artifact-free boundary;
 - active/batched work already owned by a durable dispatch artifact is preserved;
 - remove the binding from input targets and output scheduling atomically;
-- if this is the control-thread binding and another binding remains, rehome the
-  canonical card to the oldest remaining accessible binding before completing
-  removal;
+- removing any binding leaves the canonical card in the VC chat;
 - removing the last binding ends the console and releases the voice lease.
 
 ### 6.4 `/seam voice configure`
@@ -350,10 +356,12 @@ Optional parameter:
 
 - `repost`, default false.
 
-With `repost:true`, create a replacement card in the current bound thread,
-atomically update the control-thread/message ids, disable the old card when
-possible, and increment the console revision. Use this when the original card
-was deleted, archived, or inaccessible.
+With `repost:true`, create a replacement card in the console VC chat,
+atomically update the card message id, disable the old card when possible, and
+increment the console revision. The command may be invoked from any active
+binding, but the replacement is always posted in the same VC chat. Use this when
+the original card was deleted. If the VC chat is inaccessible, return the
+permission error instead of relocating the card.
 
 ### 6.6 `/seam voice status`
 
@@ -396,10 +404,18 @@ Stop:
 ### 7.1 Location and identity
 
 - Exactly one canonical live card exists per console.
-- The start thread is initially the control thread.
+- It is always posted in the active voice channel's built-in text chat, whose
+  channel id is already the console's `voiceChannelId`.
+- A working VC chat is a product prerequisite. The server is expected to grant
+  intended participants `ViewChannel`, `Connect`, and `ReadMessageHistory` so
+  they can see the persistent card. This does not broaden card-control
+  authorization beyond owner/admin.
 - Other bound threads receive one compact notice with console alias/state and a
   jump link, not a second control plane.
-- `/seam voice console repost:true` can rehome the card.
+- `/seam voice console repost:true` replaces it only in that VC chat.
+- There is no thread fallback. Missing bot chat permissions refuse startup;
+  permissions revoked during a console make the console inoperable and trigger
+  the shared failure/cleanup path while preserving durable text.
 - Card authority uses immutable ids and revision, never visible labels.
 
 Custom ids use a compact shape such as:
@@ -485,7 +501,7 @@ Duplicate/retried interaction ids must be idempotent. An interaction may not
 partially update the input target set.
 
 The revision increments only for durable control-plane mutations (targets,
-fan-out, output preferences, profiles, bindings, card location/page, or
+fan-out, output preferences, profiles, bindings, card message/page, or
 lifecycle). Runtime status refreshes such as `speaking` or queue counts edit the
 card without incrementing revision, so ordinary telemetry does not constantly
 invalidate valid controls.
@@ -807,8 +823,8 @@ Add a durable console table with:
 - voice channel id;
 - owner user id and presentation name snapshot;
 - status;
-- control thread ref and parent ref;
-- control message id;
+- canonical card channel id, constrained to equal the voice channel id;
+- canonical card message id;
 - card page;
 - revision;
 - fan-out armed;
@@ -894,7 +910,8 @@ This operation is idempotent across repeated startup attempts.
 6. Reconnect Discord/STT only when the owner/VC state is safe.
 7. Recover binding dispatch artifacts.
 8. Start the dispatch watcher.
-9. Refresh or recreate the canonical card.
+9. Revalidate the VC chat permissions and refresh or recreate the canonical
+   card there. If the permissions are absent, do not start the console runtime.
 
 The watcher must not consume a Thread Voice dispatch before binding verification
 and settlement callbacks are installed.
@@ -921,11 +938,12 @@ and settlement callbacks are installed.
 ### 14.3 Card recovery
 
 - If the message exists, edit it in place to current durable state.
-- If missing in an accessible control thread, recreate once and update message
-  id/revision.
-- If the control thread is inaccessible, keep the console live and instruct the
-  owner through `/seam voice status` to run
-  `/seam voice console repost:true` from another binding.
+- If the message was deleted, recreate it once in the same VC chat and update
+  message id/revision.
+- If the bot lacks `ViewChannel`, `Connect`, `SendMessages`, `EmbedLinks`, or
+  `ReadMessageHistory`, recovery fails closed: do not reconnect capture or
+  speech, mark/end the console through the shared terminal path, preserve
+  finalized text, and release the lease.
 - Old card components become stale through revision/message validation.
 
 ### 14.4 Shutdown
@@ -1008,7 +1026,14 @@ work.
 - A fan-out commit failure is retried/recorded per binding. Successful commits
   remain successful.
 - A stale/invalid card interaction changes nothing.
-- Card edit failure does not change already committed routing state.
+- A transient card API error gets bounded retry/backoff and does not change
+  already committed routing state or card location.
+- Failure to verify/post the initial VC-chat card aborts startup before durable
+  console creation or lease acquisition. A permission race after acquisition
+  unwinds the partial runtime and lease.
+- `Missing Access`, `Missing Permissions`, deleted VC, or persistently
+  inaccessible VC chat never causes a thread fallback. During an active console,
+  fail/stop safely, preserve durable text, and release the lease.
 - TTS failure never fails the ACP turn or blocks the scheduler.
 - Output toggle races use generation checks so late synthesis cannot play.
 - Binding removal races establish the V1-style release/discard barrier before
@@ -1023,7 +1048,9 @@ work.
 ### 18.1 Console and bindings
 
 - Start creates one console, one binding, one lease, one voice connection, and
-  one canonical card.
+  one canonical card in the connected VC's built-in chat.
+- Startup preflight refuses each missing required bot permission precisely and
+  leaves no console row, binding, voice connection, or lease.
 - Add creates another binding without another Discord/STT connection.
 - Ten bindings succeed; the eleventh is refused precisely.
 - Same thread cannot be bound twice.
@@ -1033,6 +1060,10 @@ work.
 
 ### 18.2 Card authorization and durability
 
+- The canonical card's channel id always equals the console voice channel id;
+  no ACP thread is a fallback card location.
+- Every added/removed binding leaves the card in that VC chat.
+- Each bound thread's compact notice jumps to the same VC-chat card.
 - Only owner/admin component actions succeed.
 - Custom ids/values use immutable ids.
 - Stale revision and old-message interactions change nothing.
@@ -1040,6 +1071,9 @@ work.
 - Restart restores targets, fan-out state, output toggles, profiles, page, and
   card.
 - Repost safely invalidates the old card.
+- Deleted card recovery recreates it once in the same VC chat.
+- Revoked VC-chat permissions end/fail the console safely and preserve durable
+  finalized text.
 - Allowed non-admin speakers cannot mutate the card or use admin voice-console
   commands.
 
@@ -1207,6 +1241,7 @@ Every worker must read this full specification and the repository `AGENTS.md`.
 **Responsibilities:**
 
 - five-row card layout;
+- VC-chat-only location contract and permission-error presentation;
 - immutable ids/revisions;
 - selectors and confirmation views;
 - concise/paginated status presentation;
@@ -1235,6 +1270,8 @@ package; Package E owns any final adapter/generalization work.
 
 - merge/adapt Packages A–D;
 - slash lifecycle and authorization;
+- fail-closed VC-chat permission preflight before lease/session creation;
+- VC-chat card post/repost/recovery with no thread fallback;
 - config-backed speaker authorization distinct from admin control ownership;
 - actual-speaker trusted dispatch metadata and attribution;
 - component interaction transactions;
@@ -1259,6 +1296,8 @@ blockers.
 
 Required adversarial areas:
 
+- each missing VC-chat bot permission, permission revocation, card deletion,
+  and transient API failure without relocation or leaked lease/state;
 - two authorized speakers overlapping and finalizing out of order;
 - same-user SSRC/device handoff without duplicate lane or transcript;
 - authorized plus unauthorized simultaneous speech, with zero unauthorized
@@ -1302,7 +1341,9 @@ deployment/live voice.
 After all automated gates pass:
 
 1. Owner joins a throwaway VC and self-mutes.
-2. Start console in thread A; verify one connection/card and zero audio usage.
+2. Start console in thread A; verify the only canonical card is in that VC's
+   built-in chat, the bound thread contains only its compact jump notice, and
+   forwarded audio usage is zero.
 3. Add threads B and C; verify no additional connection/STT client.
 4. Stay muted for 60 seconds; forwarded duration remains zero.
 5. Select A, unmute/speak/mute; only A receives one prompt.

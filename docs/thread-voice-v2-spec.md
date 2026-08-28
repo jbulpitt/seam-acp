@@ -14,8 +14,9 @@
 
 Thread Voice V2 replaces the one-thread/one-call V1 runtime with one
 guild-scoped **Shared Voice Console**. The console owns the guild's single
-Discord voice connection, one owner capture path, one Gemini Live Transcribe
-client, one canonical Discord control card, and one global speech scheduler.
+Discord voice connection, a user-keyed capture router, lazy per-speaker Gemini
+Live Transcribe clients, one canonical Discord control card, and one global
+speech scheduler.
 
 Up to ten independent **thread bindings** attach existing ACP threads to that
 console. Each binding keeps its own durable input segments, ACP queue, agent
@@ -36,10 +37,13 @@ binding(s) selected on the card.
 
 The V1 safety and durability rules remain:
 
-- one authenticated admin owner;
-- self-mute edges define utterance boundaries;
+- one authenticated admin control owner;
+- every Discord user in `DISCORD_ALLOWED_USER_IDS` may speak through the
+  console while present in its VC;
+- each authorized speaker's self-mute edges define their utterance boundaries;
 - merely unmuting does not interrupt playback and does not dispatch anything;
-- only actual owner PCM inside an armed utterance reaches STT;
+- only actual PCM from an authorized speaker inside that speaker's armed
+  utterance reaches STT;
 - speech received while a target is busy becomes that target's durable next
   prompt and never steers or aborts the current turn;
 - text output remains authoritative when speech fails;
@@ -51,19 +55,21 @@ The V1 safety and durability rules remain:
 
 V2 must:
 
-1. Let one owner bind several Discord ACP threads to one voice channel.
-2. Let the owner choose input destinations explicitly from one persistent card.
-3. Support deliberate same-transcript fan-out without multiplying STT work.
-4. Let each binding's voice output be muted or restored independently.
-5. Use distinguishable, persistent TTS profiles instead of spoken thread labels.
-6. Serialize all bot audio while preventing one noisy binding from monopolizing
+1. Let one admin owner bind several Discord ACP threads to one voice channel.
+2. Let several Seam-authorized Discord identities speak, including overlapping
+   speakers, while preserving actual user attribution.
+3. Let the owner choose input destinations explicitly from one persistent card.
+4. Support deliberate same-transcript fan-out without multiplying STT work.
+5. Let each binding's voice output be muted or restored independently.
+6. Use distinguishable, persistent TTS profiles instead of spoken thread labels.
+7. Serialize all bot audio while preventing one noisy binding from monopolizing
    playback.
-7. Preserve independent ACP, pending-input, failure, and cancellation behavior
+8. Preserve independent ACP, pending-input, failure, and cancellation behavior
    for every binding.
-8. Recover the console, card state, bindings, and durable text safely after a
+9. Recover the console, card state, bindings, and durable text safely after a
    process restart.
-9. Upgrade an active V1 session into a one-binding console during deployment.
-10. Keep all card actions authenticated, versioned, durable, and visible.
+10. Upgrade an active V1 session into a one-binding console during deployment.
+11. Keep all card actions authenticated, versioned, durable, and visible.
 
 ## 3. Explicit non-goals
 
@@ -71,7 +77,7 @@ V2 does not include:
 
 - spoken aliases, “switch to” commands, or LLM destination inference;
 - compound spoken commands for different threads;
-- multi-owner capture, speaker diarization, or participant input;
+- physical-device identity, account-possession detection, or speaker diarization;
 - family/student self-service authorization;
 - barge-in, playback ducking, or speech-based ACP steering;
 - overlapping bot audio or multiple Discord voice connections in one guild;
@@ -95,11 +101,16 @@ V2 does not include:
 - **Binding alias:** a short unique presentation label shown on the console.
   It is never parsed from speech and never used as an authority key.
 - **Input target set:** the durable set of binding ids eligible to receive the
-  next owner utterance.
+  next authorized-speaker utterance.
 - **Input off:** an empty input target set. Audio is not forwarded to Google.
 - **Fan-out armed:** the explicit mode allowing two through five input targets.
 - **Capture snapshot:** the immutable binding-id and per-binding sequence set
-  captured at a valid owner unmute edge.
+  captured at one authorized speaker's valid unmute edge.
+- **Authorized speaker:** a Discord user id present in the console VC and in the
+  deployment's `DISCORD_ALLOWED_USER_IDS` set. This is evaluated independently
+  from console-control authorization.
+- **Speaker lane:** one user-id-keyed mute/capture/STT state machine. One user id
+  has at most one logical utterance active, regardless of physical device.
 - **Fan-out group:** one STT transcript committed as separate durable segments
   to several snapshotted bindings.
 - **VC output enabled:** a binding preference allowing future agent prose to be
@@ -119,10 +130,20 @@ revisions are authority.
 
 - V2 remains admin-only through `SEAM_CONFIG_ADMIN_USER_IDS`.
 - The authenticated Discord interaction user id becomes the immutable console
-  owner id.
+  owner/control id.
 - Only the console owner or another configured admin may operate the slash
   commands or card. A participant clicking a copied/stale component is refused.
-- Capture accepts only the owner id. All other Discord speakers are ignored.
+- Capture eligibility is the existing `DISCORD_ALLOWED_USER_IDS` set used by
+  Discord message ingress. It is checked at every unmute edge and again before
+  final commit.
+- Every allowed user currently in the console VC may speak. They do not need to
+  be a config admin and do not gain card/command authority merely by speaking.
+- Users absent from the allowlist are never subscribed, decoded, forwarded,
+  transcribed, or persisted.
+- Discord user id is the identity boundary. Several physical devices logged in
+  as the same account remain one speaker lane and one author id. Detecting who
+  physically possesses an authorized account/device is outside the threat model,
+  exactly as it is for authenticated Discord chat.
 - Every binding must be an existing ACP thread in the same guild and accessible
   to the bot.
 - One console may have at most ten active bindings.
@@ -131,21 +152,34 @@ revisions are authority.
 ### 5.2 Mute and speech safety
 
 - The owner must be in the target VC and self-muted when creating the console.
-- A self-mute-to-unmute edge only arms one utterance. It does not by itself send
+- Each authorized speaker has an independent safe-mute state machine. Their
+  self-mute-to-unmute edge only arms one utterance. It does not by itself send
   audio, interrupt playback, or create an input segment.
 - Discord `speaking`/Opus packets supply audio only after that valid edge.
 - Very short/noise-only captures remain dropped under the V1 threshold.
 - Muting ends the utterance and asks STT to finalize.
-- Owner speech during agent work or playback queues input for selected bindings;
+- Authorized speech during agent work or playback queues input for selected
+  bindings;
   it does not stop current work or audio.
-- If input targets are enabled while the owner is already unmuted, capture stays
-  disabled until a fresh mute followed by unmute. The card must say
+- If input targets are enabled while a speaker is already unmuted, that speaker's
+  capture stays disabled until a fresh mute followed by unmute. The card must say
   `Mute, then unmute to speak`.
-- Reconnect while unmuted has the same fresh-mute requirement.
+- Joining, reconnecting, or changing device/voice session while unmuted has the
+  same per-speaker fresh-mute requirement.
+- A Discord voice-state or SSRC discontinuity for the same user id rebinds that
+  user's existing lane; it does not create another identity or author. When the
+  mute state cannot be proven continuous, that lane returns to `awaiting safe
+  mute` before accepting more audio.
+- Several authorized users may have armed/capturing lanes concurrently. Their
+  PCM and transcripts are never mixed. Each final retains the Discord user id
+  that produced it.
 
 ### 5.3 Card-only routing
 
 - The card's durable input target set is the sole routing source.
+- The target set is console-global, not per speaker. Every capture snapshots the
+  selection at that speaker's own unmute edge, so two overlapping speakers can
+  legitimately retain different snapshots if the card changes between edges.
 - The console does not inspect transcript wording to choose a target.
 - Aliases are display labels only.
 - No hidden in-memory focus may diverge from the card.
@@ -156,8 +190,8 @@ revisions are authority.
 
 ### 5.4 Input modes
 
-- `Input off`: zero targets; owner PCM is dropped locally and STT receives no
-  audio.
+- `Input off`: zero targets; all participant PCM is dropped locally and STT
+  receives no audio.
 - Focused: exactly one target; the normal mode.
 - Fan-out: two through five targets while fan-out is explicitly armed.
 - The first binding created with a console is selected automatically.
@@ -172,16 +206,18 @@ revisions are authority.
 
 ### 5.5 Capture snapshot and mid-utterance changes
 
-At a valid unmute edge:
+At an authorized speaker's valid unmute edge:
 
 1. Read the console and selected bindings in one transaction.
 2. Refuse capture if the target set is empty.
 3. Revalidate that each binding is active, owned by this console, and points to
    a valid thread.
-4. Allocate one ordered sequence for every selected binding.
+4. Allocate one ordered sequence for every selected binding. Concurrent speakers
+   are ordered by the server's transaction/edge arrival order.
 5. Persist or retain a memory-only capture record containing one capture id,
-   the console revision, and `(bindingId, sequence)` assignments.
-6. Start one STT utterance and forward actual owner PCM once.
+   speaker id/name, the console revision, and `(bindingId, sequence)` assignments.
+6. Start one STT utterance in that speaker's lane and forward that speaker's
+   actual PCM once.
 
 Changing one non-empty selection to another while an utterance is active applies
 only to the next utterance. The current capture uses its snapshot.
@@ -194,6 +230,8 @@ only to the next utterance. The current capture uses its snapshot.
 - records a metadata-only dropped outcome for every allocated binding sequence;
 - requires a fresh mute/unmute before later capture.
 
+These operations apply to every currently active speaker lane.
+
 Removing a snapshotted binding before final commit drops only that binding's
 assignment. Other valid targets still commit.
 
@@ -203,7 +241,7 @@ assignment. Other valid targets still commit.
 - The owner explicitly arms it on the card.
 - The card displays `⚠️ FAN-OUT ×N` whenever several targets are selected.
 - At most five targets may be selected.
-- One capture produces one STT final and one audio-duration measurement.
+- One speaker capture produces one STT final and one audio-duration measurement.
 - Commit creates one durable segment per still-valid target with:
   - the same `captureId` and `fanoutGroupId`;
   - binding-local sequence;
@@ -264,6 +302,9 @@ Rules:
 - claim behavior follows section 5.4 and applies to the next utterance if one is
   active.
 
+Adding a binding never changes which people may speak; speaker eligibility is
+always the deployment allowlist plus current VC presence.
+
 ### 6.3 `/seam voice remove`
 
 Removes the current thread's binding.
@@ -319,6 +360,8 @@ was deleted, archived, or inaccessible.
 Shows:
 
 - console id, owner, VC, runtime, uptime, and connection state;
+- authorized speakers currently present, each speaker's safe-mute/capture state,
+  and concurrent active-lane count;
 - actual STT-forwarded audio duration;
 - selected input bindings and fan-out state;
 - every binding's alias, thread, TTS voice, input/output indicators, ACP state,
@@ -374,6 +417,9 @@ The embed shows:
 
 - title `🎛️ Shared Voice Console`;
 - owner and VC;
+- authorized speakers present and currently capturing speakers;
+- an unauthorized-listener count when other users are present, without treating
+  them as capture candidates or granting controls;
 - console state and STT-forwarded duration;
 - input state: `Off`, one alias, or `⚠️ FAN-OUT ×N`;
 - global output state and current speaking alias/voice;
@@ -413,6 +459,10 @@ Use five classic Discord action rows:
    - previous/next page when needed;
    - refresh;
    - end-console confirmation.
+
+There is no speaker selector. Presence plus `DISCORD_ALLOWED_USER_IDS`
+automatically determines capture eligibility; the card controls shared routing
+and output only.
 
 The end action requires a second explicit confirmation and never defaults to
 discarding pending text.
@@ -475,7 +525,8 @@ Input state consists only of:
 - `fanoutArmed` boolean;
 - ordered selected binding-id set;
 - console revision;
-- `awaitingSafeMute` runtime flag.
+- a runtime `speakerLanes` map keyed by Discord user id, with presence,
+  subscription, mute-safety, capture, and STT state.
 
 The selected set is empty, one id, or at most five ids. When fan-out is false,
 the durable set may contain at most one id.
@@ -494,8 +545,16 @@ There is no paused-audio state. Disabled output is dropped.
 
 ### 9.1 Shared capture path
 
-One Discord receiver/capture gate serves the console owner. One Gemini Live
-Transcribe client serves at most one logical utterance at a time.
+One Discord receiver serves the console. The capture router subscribes only to
+currently present `DISCORD_ALLOWED_USER_IDS` members and maintains one logical
+lane per Discord user id. Each active lane uses its own lazy Gemini Live
+Transcribe client/utterance chain, so concurrent speakers remain separately
+attributed without acoustic diarization.
+
+For one user id, only one logical utterance may be active. If Discord moves that
+account between SSRCs or devices, the transport rebinds the existing lane and
+applies the safe-mute rule when continuity is uncertain. It must not duplicate
+the lane, transcript, author, or forwarded-byte accounting.
 
 Reuse the V1 contracts:
 
@@ -516,15 +575,21 @@ Reuse the V1 contracts:
 Do not forward PCM when:
 
 - input target set is empty;
-- owner is self-muted;
-- no valid unmute edge armed the utterance;
-- owner is not the console owner;
-- owner disconnected or changed VCs;
+- the packet's Discord user id is not in `DISCORD_ALLOWED_USER_IDS`;
+- that authorized user is self-muted;
+- no valid unmute edge armed that user's utterance;
+- that user disconnected, changed VCs, or has an uncertain voice-state/SSRC
+  transition awaiting a safe mute cycle;
 - capture was cancelled by Input off;
 - every snapshotted binding became invalid.
 
-Keeping the WebSocket open during silence is permitted, but transmitted-byte
-telemetry—not wall-clock connection time—is the audio usage authority.
+Unauthorized users are not subscribed or decoded in the first place. A final
+allowlist check before commit protects against authorization being removed
+during an utterance.
+
+Keeping a lane's WebSocket open during silence is permitted, but
+transmitted-byte telemetry—not wall-clock connection time—is the audio usage
+authority.
 
 ### 9.3 Continuations and fan-out ordering
 
@@ -535,6 +600,11 @@ an empty prompt.
 
 Binding-local sequence allocation at the unmute edge preserves ordering even
 when two finals complete out of API order or one target is busy.
+
+This ordering spans speakers. The transaction that snapshots targets at each
+unmute edge allocates binding-local sequence numbers; a later speaker's final
+waits behind an earlier unresolved sequence. A terminal dropped/noise outcome
+unblocks the sequence without creating an empty prompt.
 
 ### 9.4 Telemetry
 
@@ -547,8 +617,14 @@ Store on the console:
 - dropped/noise count;
 - STT failure count.
 
-Do not multiply STT duration by fan-out target count. Binding diagnostics may
-reference a capture duration but billing totals live only on the console.
+These are aggregate totals across all speaker lanes. Per-speaker counters may
+be kept as metadata for diagnostics, without transcript text or audio.
+
+Do not multiply STT duration by fan-out target count. Simultaneous speakers do
+increase STT usage because each user's actual PCM is independently forwarded,
+but each byte is counted exactly once regardless of target count. Binding
+diagnostics may reference a capture duration but billing totals live only on
+the console.
 
 ## 10. Durable input and ACP dispatch
 
@@ -562,6 +638,10 @@ Add nullable fields:
 - `binding_id` or reuse the legacy session id as binding authority;
 - `capture_id`;
 - `fanout_group_id`.
+
+The segment's existing authenticated author fields store the actual authorized
+speaker id/name captured for that utterance, not the console owner. All rows in
+one fan-out group carry the same speaker identity.
 
 For non-fan-out captures, `fanout_group_id` may be null. Never store PCM, Opus,
 WAV, Ogg, base64 audio, or signed audio URLs.
@@ -586,8 +666,9 @@ binding from dispatching text if that other binding is independently idle.
 - Claim and enqueue one durable dispatch per binding.
 - Use different stable dispatch ids and the binding id as trusted Thread Voice
   metadata.
-- Verify console owner, binding, target thread, and durable batch before
-  injecting the authenticated speaker.
+- Verify console, binding, target thread, captured author, and durable batch
+  before injecting the authenticated speaker. Control ownership and prompt
+  authorship are separate authorities.
 - Echo one concise finalized transcript in every receiving thread, marked as
   fan-out when more than one target received it.
 - A failure in one binding does not roll back another binding's committed
@@ -823,6 +904,14 @@ and settlement callbacks are installed.
 - Owner present in the same VC and muted: reconnect ready.
 - Owner present but unmuted: reconnect, set `awaiting safe mute`, forward no PCM
   until mute then a later unmute.
+- Every other authorized user already present is initialized independently:
+  muted users are ready for a later unmute; unmuted users await a fresh
+  mute/unmute cycle.
+- An authorized user who joins later follows the same rule. Their departure
+  closes only their lane and never ends the console.
+- The owner still controls console lifetime. The existing owner-absence grace
+  applies even if other authorized speakers remain; V2 does not transfer
+  ownership implicitly.
 - Owner temporarily absent: use the existing 30-second grace.
 - Owner returns during grace: preserve console and bindings, still require a
   fresh safe mute cycle.
@@ -871,6 +960,9 @@ never discard durable text merely because the process exits.
 - Only finalized transcript text and metadata enter SQLite/dispatch artifacts.
 - Do not log full transcripts, PCM, file bodies, or signed media URLs.
 - Card/status presentation sanitizes aliases and owner names.
+- Discord VC membership controls who can hear the bot. Seam's speaker allowlist
+  controls whose microphone audio it processes; it does not make unauthorized
+  VC listeners unable to hear output.
 
 ### 16.2 Trusted speaker metadata
 
@@ -878,9 +970,14 @@ Internal Thread Voice dispatch metadata must verify:
 
 - console is active or the batch is a preserved post-stop artifact;
 - binding id owns the target thread;
-- author id matches durable console owner;
+- author id/name match the durable segment's captured speaker;
+- the captured speaker was in `DISCORD_ALLOWED_USER_IDS` at capture and final
+  commit;
 - batch segments belong to the binding and dispatch id;
 - non-Thread-Voice dispatch kinds cannot carry these fields.
+
+The console owner remains the control authority and is not substituted as the
+turn author. An allowed non-admin speaker receives no slash/card permissions.
 
 Speaker/current-author state exists only during the verified turn and is cleared
 in every terminal path.
@@ -889,7 +986,7 @@ in every terminal path.
 
 Structured metadata may include:
 
-- console id, binding id, guild, VC, owner id;
+- console id, binding id, guild, VC, control-owner id, and speaker id;
 - revision and selected target count;
 - fan-out group id and target count, without transcript text;
 - forwarded PCM bytes/ms;
@@ -904,8 +1001,8 @@ work.
 
 ## 17. Failure behavior
 
-- One binding failure does not terminate other bindings unless the shared
-  Discord/STT transport failed.
+- One binding or speaker-lane failure does not terminate other bindings or
+  speaker lanes unless the shared Discord transport failed.
 - STT Live failure uses unary fallback once; late losers cannot duplicate
   segments across any target.
 - A fan-out commit failure is retried/recorded per binding. Successful commits
@@ -943,13 +1040,21 @@ work.
 - Restart restores targets, fan-out state, output toggles, profiles, page, and
   card.
 - Repost safely invalidates the old card.
+- Allowed non-admin speakers cannot mutate the card or use admin voice-console
+  commands.
 
 ### 18.3 Input safety
 
 - Input off sends zero PCM and creates no transcript.
 - Unmute alone sends no PCM and interrupts nothing.
 - Enabling input while already unmuted requires mute then unmute.
-- Non-owner packets are never forwarded.
+- Packets from users absent from `DISCORD_ALLOWED_USER_IDS` are never subscribed,
+  decoded, forwarded, transcribed, or persisted.
+- Two allowed users may overlap; each produces a separately attributed STT lane
+  and durable author, with no mixed transcript.
+- The same Discord user id across SSRC/device transitions remains one lane and
+  one author, never duplicate capture.
+- Removing a speaker from the allowlist during capture prevents final commit.
 - Mid-utterance target changes apply next utterance.
 - Input off mid-utterance aborts and records terminal dropped sequences.
 - Reconnect unmuted requires a fresh safe mute cycle.
@@ -972,6 +1077,8 @@ work.
 - Typed interruption and cancel behavior remain thread-local.
 - Discard cannot race a stale in-memory release into enqueueing text.
 - Pending text survives remove/stop/restart by default.
+- Every dispatched Thread Voice prompt uses the segment's captured authorized
+  speaker, not the console control owner.
 
 ### 18.6 Speech profiles and scheduler
 
@@ -992,7 +1099,8 @@ work.
 - Active V1 session upgrades idempotently to one console/binding.
 - Missing card recreates without duplicate live cards.
 - Shared transport cleanup leaves no receiver subscriptions, players, timers,
-  WebSockets, scheduler sources, manager entries, or leases.
+  per-speaker WebSockets, speaker lanes, scheduler sources, manager entries, or
+  leases.
 - SQLite, dispatch files, logs, and `DATA_DIR` contain no raw audio.
 - Live Help student self-service remains green.
 - Voice-note STT remains Smart/custom-vocabulary.
@@ -1023,6 +1131,8 @@ Every worker must read this full specification and the repository `AGENTS.md`.
 - durable CRUD and active constraints;
 - revisioned transactional card state;
 - target snapshot and per-binding sequence allocation;
+- authenticated speaker identity on captures/segments and ordering across
+  concurrent speakers;
 - fan-out commit and independent release coordination;
 - binding remove/console stop discard barriers;
 - active V1 upgrade;
@@ -1045,11 +1155,15 @@ Every worker must read this full specification and the repository `AGENTS.md`.
 
 **Responsibilities:**
 
-- input-off and fresh-safe-mute gating;
+- user-id-keyed receiver subscriptions and capture lanes;
+- `DISCORD_ALLOWED_USER_IDS` gating at arm and final-commit boundaries;
+- same-user SSRC/device rebind without duplicate identity;
+- per-speaker input-off and fresh-safe-mute gating;
 - immutable target snapshots;
-- one STT utterance/continuation chain per capture;
+- one lazy STT client and utterance/continuation chain per active speaker lane;
 - one final fanned into binding-local results;
-- input-off mid-capture cancellation;
+- concurrent authorized-speaker isolation, including overlapping speech;
+- input-off mid-capture cancellation across every lane;
 - forwarded-byte authority and no-audio states;
 - exactly-once Live/unary arbitration across fan-out.
 
@@ -1121,6 +1235,8 @@ package; Package E owns any final adapter/generalization work.
 
 - merge/adapt Packages A–D;
 - slash lifecycle and authorization;
+- config-backed speaker authorization distinct from admin control ownership;
+- actual-speaker trusted dispatch metadata and attribution;
 - component interaction transactions;
 - per-binding ordinary turn routing;
 - card update queues;
@@ -1143,6 +1259,12 @@ blockers.
 
 Required adversarial areas:
 
+- two authorized speakers overlapping and finalizing out of order;
+- same-user SSRC/device handoff without duplicate lane or transcript;
+- authorized plus unauthorized simultaneous speech, with zero unauthorized
+  subscription/usage;
+- allowlist removal during capture and one lane failing while another succeeds;
+- Input off aborting every active speaker lane;
 - simultaneous/stale card mutations and duplicate interactions;
 - input-off race with PCM/finalization;
 - target change/remove race during capture;
@@ -1184,30 +1306,44 @@ After all automated gates pass:
 3. Add threads B and C; verify no additional connection/STT client.
 4. Stay muted for 60 seconds; forwarded duration remains zero.
 5. Select A, unmute/speak/mute; only A receives one prompt.
-6. Arm fan-out and select A+B; one utterance produces one STT final and one
+6. Join from another client using the same Discord account if Discord permits
+   that voice-state transition; verify any SSRC/device rebind remains the same
+   author and does not duplicate a lane or transcript.
+7. Have a second `DISCORD_ALLOWED_USER_IDS` member join muted. Let both allowed
+   users speak with a brief overlap; verify separate transcripts/authors and
+   binding-local order based on capture start.
+8. Have a user absent from the allowlist speak; verify zero subscription,
+   forwarded bytes, transcript, or segment for that user. Confirm they can hear
+   output only according to ordinary Discord VC permissions.
+9. Arm fan-out and select A+B; one utterance produces one STT final and one
    authenticated prompt in each target.
-7. While A and B answer, verify distinct voices and no overlapping audio.
-8. Generate long A output and short B output; verify fairness rotation only at
+10. While A and B answer, verify distinct voices and no overlapping bot audio.
+11. Generate long A output and short B output; verify fairness rotation only at
    chunk boundaries.
-9. Disable A output mid-chunk; A stops promptly, B continues, A text remains.
-10. Speak to B while its prior turn/playback is active; follow-up waits and then
+12. Disable A output mid-chunk; A stops promptly, B continues, A text remains.
+13. Speak to B while its prior turn/playback is active; follow-up waits and then
     dispatches once.
-11. Set Input off while unmuted; verify immediate capture discard and zero later
-    commit. Re-enable while still unmuted; verify no capture until mute/unmute.
-12. Remove B and verify A/C remain live.
-13. Stop console preserving pending text; verify connection/lease/card cleanup.
-14. Inspect SQLite, dispatch artifacts, logs, and `DATA_DIR` for duplicate turns,
+14. Set Input off while one or more speakers are unmuted; verify every capture
+    is discarded and no later commit occurs. Re-enable while still unmuted;
+    verify each lane needs its own mute/unmute cycle.
+15. Remove B and verify A/C remain live.
+16. Stop console preserving pending text; verify connection/lease/card cleanup.
+17. Inspect SQLite, dispatch artifacts, logs, and `DATA_DIR` for duplicate turns,
     raw audio, or leaked resources.
 
-Abort immediately on non-owner capture, unmute-only interruption, hidden routing,
-duplicate fan-out dispatch, overlapping bot audio, stale-card mutation, raw-audio
+Abort immediately on unauthorized capture, mixed/misattributed speakers,
+duplicate same-user lanes, unmute-only interruption, hidden routing, duplicate
+fan-out dispatch, overlapping bot audio, stale-card mutation, raw-audio
 persistence, or a leaked guild voice lease.
 
 ## 22. Definition of done
 
 V2 is done when one admin can operate a durable, card-controlled, multi-thread
-Voice Console in one Discord VC; explicitly focus or fan out microphone input;
-hear serialized, distinguishable, independently mutable thread responses; and
-restart, remove, cancel, or stop without duplicate turns, lost finalized text,
-hidden routing state, raw-audio persistence, or regression of Live Help/V1 text
-behavior.
+Voice Console in one Discord VC; every present Seam-allowed Discord identity can
+speak through an independently attributed lane (including concurrent speakers
+and same-identity device/SSRC transitions); the admin can explicitly focus or
+fan out microphone input; everyone can hear serialized, distinguishable,
+independently mutable thread responses; and the console can restart, remove,
+cancel, or stop without unauthorized capture, duplicate turns, lost finalized
+text, hidden routing state, raw-audio persistence, or regression of Live Help/V1
+text behavior.

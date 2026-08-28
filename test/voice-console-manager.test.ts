@@ -25,6 +25,12 @@ let host: VoiceConsoleRuntimeHost;
 let dispatch: VoiceConsoleDispatchHost;
 let manager: VoiceConsoleManager;
 
+function captureIdentity(captureId: string) {
+  const identity = store.getVoiceConsoleCaptureIdentity(captureId);
+  if (!identity) throw new Error(`missing capture identity ${captureId}`);
+  return identity;
+}
+
 function createManager(): VoiceConsoleManager {
   return new VoiceConsoleManager({
     store,
@@ -733,11 +739,12 @@ describe("VoiceConsoleManager lifecycle", () => {
         captureId: `capture-${state}-2`,
       });
       manager.commitCapture({
-        captureId: `capture-${state}-2`,
+        ...captureIdentity(`capture-${state}-2`),
         speakerId: "speaker-2",
         speakerName: "Second",
         transcript: "second survives restart",
         audioMs: 500,
+        forwardedAudioMs: 500,
         capturedEndedUtc: NOW,
         speakerAuthorized: true,
       });
@@ -792,11 +799,12 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
     });
     expect(capture?.assignments).toHaveLength(2);
     manager.commitCapture({
-      captureId: "capture-fanout",
+      ...captureIdentity("capture-fanout"),
       speakerId: "speaker-7",
       speakerName: "Actual Speaker",
       transcript: "fan this out",
       audioMs: 800,
+      forwardedAudioMs: 800,
       capturedEndedUtc: NOW,
       speakerAuthorized: true,
     });
@@ -824,7 +832,7 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
       captureId: "capture-manager-drop",
     });
     const dropped = manager.dropCapture({
-      captureId: "capture-manager-drop",
+      ...captureIdentity("capture-manager-drop"),
       reason: "input off",
       capturedEndedUtc: NOW,
       audioMs: 250,
@@ -833,14 +841,15 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
       resultSource: "live",
     });
     const late = manager.commitCapture({
-      captureId: "capture-manager-drop",
+      ...captureIdentity("capture-manager-drop"),
       speakerId: "speaker-1",
       speakerName: "Speaker",
       transcript: "late transcript",
-      audioMs: 900,
+      audioMs: 250,
+      forwardedAudioMs: 200,
       capturedEndedUtc: NOW,
       speakerAuthorized: true,
-      resultSource: "unary",
+      resultSource: "live",
     });
     expect(dropped).toMatchObject({
       duplicate: false,
@@ -863,11 +872,12 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
       captureId: "capture-after-handoff",
     });
     manager.commitCapture({
-      captureId: "capture-after-handoff",
+      ...captureIdentity("capture-after-handoff"),
       speakerId: "speaker-1",
       speakerName: "Speaker",
       transcript: "wait behind visible generic work",
       audioMs: 500,
+      forwardedAudioMs: 500,
       capturedEndedUtc: NOW,
       speakerAuthorized: true,
     });
@@ -889,11 +899,12 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
       captureId: "capture-1",
     });
     manager.commitCapture({
-      captureId: "capture-1",
+      ...captureIdentity("capture-1"),
       speakerId: "speaker-1",
       speakerName: "Speaker",
       transcript: "discard me",
       audioMs: 500,
+      forwardedAudioMs: 500,
       capturedEndedUtc: NOW,
       speakerAuthorized: true,
     });
@@ -937,11 +948,12 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
       captureId: "capture-preserve-remove",
     });
     manager.commitCapture({
-      captureId: "capture-preserve-remove",
+      ...captureIdentity("capture-preserve-remove"),
       speakerId: "speaker-1",
       speakerName: "Speaker",
       transcript: "preserve through remove",
       audioMs: 500,
+      forwardedAudioMs: 500,
       capturedEndedUtc: NOW,
       speakerAuthorized: true,
     });
@@ -972,11 +984,12 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
       captureId: "capture-preserve-stop",
     });
     manager.commitCapture({
-      captureId: "capture-preserve-stop",
+      ...captureIdentity("capture-preserve-stop"),
       speakerId: "speaker-1",
       speakerName: "Speaker",
       transcript: "preserve through stop",
       audioMs: 500,
+      forwardedAudioMs: 500,
       capturedEndedUtc: NOW,
       speakerAuthorized: true,
     });
@@ -1009,11 +1022,12 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
         captureId: `capture-owned-${artifactState}`,
       });
       manager.commitCapture({
-        captureId: `capture-owned-${artifactState}`,
+        ...captureIdentity(`capture-owned-${artifactState}`),
         speakerId: "speaker-1",
         speakerName: "Speaker",
         transcript: `owned by ${artifactState}`,
         audioMs: 500,
+        forwardedAudioMs: 500,
         capturedEndedUtc: NOW,
         speakerAuthorized: true,
       });
@@ -1074,6 +1088,29 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
       duplicate: true,
     });
     expect(host.stopBinding).toHaveBeenCalledOnce();
+    expect(
+      await manager.removeBinding("bind-b", {
+        expectedRevision: store.getVoiceConsole("tvc_1")!.revision,
+        interactionId: "remove-interaction-1",
+        reason: "owner removed binding",
+      })
+    ).toEqual({
+      ok: false,
+      error: "Interaction ID is already used by a different Voice Console action or input.",
+    });
+    expect(
+      await manager.removeBinding("bind-a", {
+        expectedRevision,
+        discardPending: true,
+        interactionId: "remove-interaction-1",
+        reason: "owner removed binding",
+      })
+    ).toEqual({
+      ok: false,
+      error: "Interaction ID is already used by a different Voice Console action or input.",
+    });
+    expect(store.getVoiceConsoleBinding("bind-b")?.status).toBe("active");
+    expect(host.stopBinding).toHaveBeenCalledOnce();
   });
 
   it("rejects a remove interaction collision without changing binding or host state", async () => {
@@ -1113,6 +1150,18 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
     expect(
       await manager.stopConsole("tvc_1", {
         expectedRevision: 1,
+        discardPending: true,
+        interactionId: "stop-interaction-1",
+        reason: "owner stopped",
+      })
+    ).toEqual({
+      ok: false,
+      error: "Interaction ID is already used by a different Voice Console action or input.",
+    });
+    expect(host.stopConsole).toHaveBeenCalledOnce();
+    expect(
+      await manager.stopConsole("tvc_1", {
+        expectedRevision: 1,
         interactionId: "stop-interaction-2",
       })
     ).toEqual({ ok: false, error: "Voice Console has already ended." });
@@ -1126,11 +1175,12 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
       captureId: "capture-dispatched-recovery",
     });
     manager.commitCapture({
-      captureId: "capture-dispatched-recovery",
+      ...captureIdentity("capture-dispatched-recovery"),
       speakerId: "speaker-1",
       speakerName: "Speaker",
       transcript: "recover stable dispatch",
       audioMs: 500,
+      forwardedAudioMs: 500,
       capturedEndedUtc: NOW,
       speakerAuthorized: true,
     });

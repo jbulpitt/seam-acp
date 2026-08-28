@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   defaultSessionConfig,
   type ActiveProject,
@@ -63,6 +63,7 @@ import {
   type VoiceConsoleBatch,
   type VoiceConsoleBindingStatus,
   type VoiceConsoleCaptureCommitResult,
+  type VoiceConsoleCaptureIdentity,
   type VoiceConsoleCaptureTerminal,
   type VoiceConsoleCaptureTerminalOutcome,
   type VoiceConsoleDropCaptureInput,
@@ -324,6 +325,7 @@ export class SessionStore {
     this.db.exec(VOICE_CONSOLE_SCHEMA);
     this.migrateVoiceConsoleV2();
     this.migrateVoiceConsoleInteractionOutcomes();
+    this.migrateVoiceConsoleCaptureIdentity();
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -403,6 +405,128 @@ export class SessionStore {
         "ALTER TABLE voice_console_mutations ADD COLUMN action TEXT NOT NULL DEFAULT 'legacy'"
       );
     }
+    if (!columns.includes("input_fingerprint")) {
+      this.db.exec("ALTER TABLE voice_console_mutations ADD COLUMN input_fingerprint TEXT");
+    }
+  }
+
+  /** Backfill capture ownership where legacy rows prove one unambiguous identity. */
+  private migrateVoiceConsoleCaptureIdentity(): void {
+    const terminalColumns = this.db
+      .prepare<[], { name: string }>("PRAGMA table_info(voice_console_capture_terminals)")
+      .all()
+      .map((row) => row.name);
+    for (const [name, ddl] of [
+      ["speaker_id", "ALTER TABLE voice_console_capture_terminals ADD COLUMN speaker_id TEXT"],
+      ["captured_started_utc", "ALTER TABLE voice_console_capture_terminals ADD COLUMN captured_started_utc TEXT"],
+      ["target_fingerprint", "ALTER TABLE voice_console_capture_terminals ADD COLUMN target_fingerprint TEXT"],
+      ["forwarded_audio_ms", "ALTER TABLE voice_console_capture_terminals ADD COLUMN forwarded_audio_ms INTEGER"],
+    ] as const) {
+      if (!terminalColumns.includes(name)) this.db.exec(ddl);
+    }
+
+    const migrate = this.db.transaction(() => {
+      const captureIds = this.db
+        .prepare<[], { capture_id: string }>(
+          `SELECT DISTINCT capture_id FROM thread_voice_segments
+            WHERE capture_id IS NOT NULL ORDER BY capture_id`
+        )
+        .all();
+      for (const { capture_id: captureId } of captureIds) {
+        const existingReservation = this.getVoiceConsoleCaptureReservation(captureId);
+        if (existingReservation) {
+          this.db
+            .prepare(
+              `UPDATE voice_console_capture_terminals
+                  SET speaker_id = COALESCE(speaker_id, ?),
+                      captured_started_utc = COALESCE(captured_started_utc, ?),
+                      target_fingerprint = COALESCE(target_fingerprint, ?)
+                WHERE capture_id = ?`
+            )
+            .run(
+              existingReservation.speaker_id,
+              existingReservation.captured_started_utc,
+              existingReservation.target_fingerprint,
+              captureId
+            );
+          this.repairLegacyVoiceConsoleCaptureTerminal(captureId);
+          continue;
+        }
+        const rows = this.voiceConsoleCaptureRows(captureId);
+        const first = rows[0];
+        if (!first) continue;
+        const identities = new Set<string>();
+        for (const row of rows) {
+          const binding = this.getVoiceConsoleBinding(row.session_id);
+          identities.add(`${binding?.consoleId ?? ""}\u0000${row.author_id}\u0000${row.captured_started_utc}`);
+        }
+        if (identities.size !== 1 || identities.has(`\u0000${first.author_id}\u0000${first.captured_started_utc}`)) {
+          this.db
+            .prepare(
+              `UPDATE thread_voice_segments SET transcript = '', state = 'capture_dropped',
+                 error = 'legacy capture identity collision', updated_utc = ?
+               WHERE capture_id = ? AND state IN ('capturing','finalizing')`
+            )
+            .run(new Date().toISOString(), captureId);
+          continue;
+        }
+        const binding = this.getVoiceConsoleBinding(first.session_id)!;
+        const targets = canonicalCaptureTargets(rows.map((row) => ({ bindingId: row.session_id, sequence: row.sequence })));
+        const fingerprint = captureTargetFingerprint(targets);
+        this.db
+          .prepare(
+            `INSERT INTO voice_console_capture_reservations
+               (capture_id, console_id, speaker_id, speaker_name, captured_started_utc,
+                fanout_group_id, target_fingerprint, created_utc)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            captureId,
+            binding.consoleId,
+            first.author_id,
+            first.author_name ?? first.author_id,
+            first.captured_started_utc,
+            first.fanout_group_id,
+            fingerprint,
+            first.created_utc
+          );
+        this.db
+          .prepare(
+            `UPDATE voice_console_capture_terminals
+                SET speaker_id = COALESCE(speaker_id, ?),
+                    captured_started_utc = COALESCE(captured_started_utc, ?),
+                    target_fingerprint = COALESCE(target_fingerprint, ?)
+              WHERE capture_id = ?`
+          )
+          .run(first.author_id, first.captured_started_utc, fingerprint, captureId);
+        this.repairLegacyVoiceConsoleCaptureTerminal(captureId);
+      }
+    });
+    migrate();
+  }
+
+  private repairLegacyVoiceConsoleCaptureTerminal(captureId: string): void {
+    const terminal = this.getVoiceConsoleCaptureTerminal(captureId);
+    if (!terminal) return;
+    const recoveryState = terminal.outcome === "failed" ? "transcribe_failed" : "capture_dropped";
+    const recoveryReason =
+      terminal.reason ??
+      (terminal.outcome === "committed"
+        ? "legacy committed capture is missing finalized transcript state"
+        : "legacy capture terminal recovered");
+    this.db
+      .prepare(
+        `UPDATE thread_voice_segments SET transcript = '', state = ?, error = ?,
+           captured_ended_utc = ?, updated_utc = ?
+         WHERE capture_id = ? AND state IN ('capturing','finalizing')`
+      )
+      .run(
+        recoveryState,
+        recoveryReason,
+        terminal.capturedEndedUtc,
+        terminal.capturedEndedUtc,
+        captureId
+      );
   }
 
   /** Additive thread_slug on presets for auto-numbered thread names. */
@@ -2430,7 +2554,13 @@ export class SessionStore {
     }
   ): VoiceConsoleMutationOutcome {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
-      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "replace-input-targets")) {
+      const fingerprint = voiceConsoleMutationFingerprint({
+        action: "replace-input-targets",
+        bindingIds: [...input.bindingIds],
+        fanoutArmed: input.fanoutArmed,
+        expectedRevision: input.expectedRevision,
+      });
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "replace-input-targets", fingerprint)) {
         return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
       }
       const console = this.getVoiceConsole(consoleId);
@@ -2452,7 +2582,7 @@ export class SessionStore {
               SET fanout_armed = ?, revision = revision + 1, updated_utc = ? WHERE id = ?`
         )
         .run(input.fanoutArmed ? 1 : 0, now, consoleId);
-      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "replace-input-targets");
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "replace-input-targets", fingerprint);
       return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
     });
     return mutate();
@@ -2468,7 +2598,12 @@ export class SessionStore {
     }
   ): VoiceConsoleMutationOutcome {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
-      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "set-output-bindings")) {
+      const fingerprint = voiceConsoleMutationFingerprint({
+        action: "set-output-bindings",
+        enabledBindingIds: [...input.enabledBindingIds].sort(),
+        expectedRevision: input.expectedRevision,
+      });
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "set-output-bindings", fingerprint)) {
         return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
       }
       const console = this.getVoiceConsole(consoleId);
@@ -2492,7 +2627,7 @@ export class SessionStore {
           .run(next ? 1 : 0, now, binding.id);
       }
       this.bumpVoiceConsoleRevision(consoleId, now);
-      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "set-output-bindings");
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "set-output-bindings", fingerprint);
       return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
     });
     return mutate();
@@ -2514,7 +2649,17 @@ export class SessionStore {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
       const binding = this.getVoiceConsoleBinding(bindingId);
       if (!binding) return mutationFailure("not-found", "Voice Console binding does not exist.");
-      if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId, "update-binding")) {
+      const fingerprint = voiceConsoleMutationFingerprint({
+        action: "update-binding",
+        bindingId,
+        expectedRevision: input.expectedRevision,
+        alias: input.alias,
+        ttsVoice: input.ttsVoice,
+        ttsPace: input.ttsPace,
+        ttsStyle: input.ttsStyle,
+        noticeMessageId: input.noticeMessageId,
+      });
+      if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId, "update-binding", fingerprint)) {
         return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, false, true) };
       }
       const console = this.getVoiceConsole(binding.consoleId);
@@ -2549,7 +2694,7 @@ export class SessionStore {
           bindingId
         );
       this.bumpVoiceConsoleRevision(binding.consoleId, now);
-      this.recordVoiceConsoleMutation(binding.consoleId, input.interactionId, now, "update-binding");
+      this.recordVoiceConsoleMutation(binding.consoleId, input.interactionId, now, "update-binding", fingerprint);
       return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, true, false) };
     });
     return mutate();
@@ -2566,7 +2711,13 @@ export class SessionStore {
     }
   ): VoiceConsoleMutationOutcome {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
-      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "update-card")) {
+      const fingerprint = voiceConsoleMutationFingerprint({
+        action: "update-card",
+        expectedRevision: input.expectedRevision,
+        cardMessageId: input.cardMessageId,
+        cardPage: input.cardPage,
+      });
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "update-card", fingerprint)) {
         return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
       }
       const console = this.getVoiceConsole(consoleId);
@@ -2584,7 +2735,7 @@ export class SessionStore {
           now,
           consoleId
         );
-      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "update-card");
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "update-card", fingerprint);
       return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
     });
     return mutate();
@@ -2646,7 +2797,7 @@ export class SessionStore {
       .map((row) => row.capture_id);
     return captureIds.flatMap((captureId) =>
       this.dropVoiceConsoleCapture({
-        captureId,
+        ...this.voiceConsoleCaptureIdentity(captureId),
         reason,
         capturedEndedUtc: recoveredUtc,
         audioMs: 0,
@@ -2658,13 +2809,26 @@ export class SessionStore {
 
   beginVoiceConsoleBindingRemoval(
     bindingId: string,
-    input: { expectedRevision: number; interactionId?: string; reason: string; updatedUtc?: string }
+    input: {
+      expectedRevision: number;
+      interactionId?: string;
+      discardPending: boolean;
+      reason: string;
+      updatedUtc?: string;
+    }
   ): VoiceConsoleMutationOutcome {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
       const binding = this.getVoiceConsoleBinding(bindingId);
       if (!binding) return mutationFailure("not-found", "Voice Console binding does not exist.");
+      const fingerprint = voiceConsoleMutationFingerprint({
+        action: "remove-binding",
+        bindingId,
+        discardPending: input.discardPending,
+        expectedRevision: input.expectedRevision,
+        reason: input.reason,
+      });
       try {
-        if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId, "remove-binding")) {
+        if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId, "remove-binding", fingerprint)) {
           return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, false, true) };
         }
       } catch {
@@ -2689,7 +2853,7 @@ export class SessionStore {
         )
         .run(now, input.reason, bindingId);
       this.bumpVoiceConsoleRevision(binding.consoleId, now);
-      this.recordVoiceConsoleMutation(binding.consoleId, input.interactionId, now, "remove-binding");
+      this.recordVoiceConsoleMutation(binding.consoleId, input.interactionId, now, "remove-binding", fingerprint);
       return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, true, false) };
     });
     return mutate();
@@ -2712,10 +2876,22 @@ export class SessionStore {
 
   beginVoiceConsoleStop(
     consoleId: string,
-    input: { expectedRevision?: number; interactionId?: string; reason: string; updatedUtc?: string }
+    input: {
+      expectedRevision?: number;
+      interactionId?: string;
+      discardPending: boolean;
+      reason: string;
+      updatedUtc?: string;
+    }
   ): VoiceConsoleMutationOutcome {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
-      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "stop-console")) {
+      const fingerprint = voiceConsoleMutationFingerprint({
+        action: "stop-console",
+        discardPending: input.discardPending,
+        expectedRevision: input.expectedRevision,
+        reason: input.reason,
+      });
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "stop-console", fingerprint)) {
         return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
       }
       const console = this.getVoiceConsole(consoleId);
@@ -2746,7 +2922,7 @@ export class SessionStore {
              updated_utc = ?, end_reason = ? WHERE id = ?`
         )
         .run(now, input.reason, consoleId);
-      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "stop-console");
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "stop-console", fingerprint);
       return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
     });
     return mutate();
@@ -2784,16 +2960,21 @@ export class SessionStore {
     captureId?: string;
   }): VoiceConsoleCaptureSnapshot | null {
     const allocate = this.db.transaction((): VoiceConsoleCaptureSnapshot | null => {
+      const captureId = input.captureId ?? newVoiceConsoleCaptureId();
+      const prior = this.getVoiceConsoleCaptureReservation(captureId);
+      if (prior) return this.replayVoiceConsoleCaptureAllocation(prior, input);
+      if (this.getVoiceConsoleCaptureTerminal(captureId)) {
+        throw new Error("Voice Console capture id is already terminal without a replayable allocation identity.");
+      }
       const console = this.getVoiceConsole(input.consoleId);
       if (!console || (console.status !== "starting" && console.status !== "ready")) return null;
-      const targets = this.listVoiceConsoleInputTargets(console.id);
-      if (targets.length === 0) return null;
+      const targetRows = this.listVoiceConsoleInputTargets(console.id);
+      if (targetRows.length === 0) return null;
       const bindings = new Map(this.listVoiceConsoleBindings(console.id).map((row) => [row.id, row]));
-      const selected = targets.map((target) => bindings.get(target.bindingId)).filter(
+      const selected = targetRows.map((target) => bindings.get(target.bindingId)).filter(
         (binding): binding is ThreadVoiceBinding => binding?.status === "active"
       );
-      if (selected.length !== targets.length) return null;
-      const captureId = input.captureId ?? newVoiceConsoleCaptureId();
+      if (selected.length !== targetRows.length) return null;
       const fanoutGroupId = selected.length > 1 ? newVoiceConsoleFanoutGroupId() : null;
       const started = input.capturedStartedUtc ?? new Date().toISOString();
       const speakerName = sanitizeVoiceConsoleSpeakerName(input.speakerName);
@@ -2823,6 +3004,24 @@ export class SessionStore {
           );
         return { bindingId: binding.id, sequence, segmentId };
       });
+      const captureTargets = canonicalCaptureTargets(assignments);
+      this.db
+        .prepare(
+          `INSERT INTO voice_console_capture_reservations
+             (capture_id, console_id, speaker_id, speaker_name, captured_started_utc,
+              fanout_group_id, target_fingerprint, created_utc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          captureId,
+          console.id,
+          input.speakerId,
+          speakerName,
+          started,
+          fanoutGroupId,
+          captureTargetFingerprint(captureTargets),
+          started
+        );
       this.db
         .prepare(
           `UPDATE voice_console_sessions SET utterance_count = utterance_count + 1,
@@ -2843,6 +3042,63 @@ export class SessionStore {
     return allocate();
   }
 
+  private getVoiceConsoleCaptureReservation(
+    captureId: string
+  ): VoiceConsoleCaptureReservationRow | null {
+    return (
+      this.db
+        .prepare<[string], VoiceConsoleCaptureReservationRow>(
+          "SELECT * FROM voice_console_capture_reservations WHERE capture_id = ?"
+        )
+        .get(captureId) ?? null
+    );
+  }
+
+  private replayVoiceConsoleCaptureAllocation(
+    reservation: VoiceConsoleCaptureReservationRow,
+    input: {
+      consoleId: string;
+      speakerId: string;
+      speakerName: string;
+      capturedStartedUtc?: string;
+      captureId?: string;
+    }
+  ): VoiceConsoleCaptureSnapshot {
+    const rows = this.voiceConsoleCaptureRows(reservation.capture_id);
+    const assignments = rows.map((row) => ({
+      bindingId: row.session_id,
+      sequence: row.sequence,
+      segmentId: row.id,
+    }));
+    const selectedBindingIds = this.listVoiceConsoleInputTargets(reservation.console_id)
+      .map((target) => target.bindingId)
+      .sort();
+    const reservedBindingIds = assignments.map((target) => target.bindingId).sort();
+    const exact =
+      reservation.console_id === input.consoleId &&
+      reservation.speaker_id === input.speakerId &&
+      reservation.speaker_name === sanitizeVoiceConsoleSpeakerName(input.speakerName) &&
+      input.capturedStartedUtc !== undefined &&
+      reservation.captured_started_utc === input.capturedStartedUtc &&
+      JSON.stringify(selectedBindingIds) === JSON.stringify(reservedBindingIds) &&
+      reservation.target_fingerprint === captureTargetFingerprint(assignments);
+    if (!exact || assignments.length === 0) {
+      throw new Error("Voice Console capture id collision: allocation identity does not match.");
+    }
+    const console = this.getVoiceConsole(reservation.console_id);
+    if (!console) throw new Error("Voice Console capture reservation references a missing console.");
+    return {
+      captureId: reservation.capture_id,
+      fanoutGroupId: reservation.fanout_group_id,
+      consoleId: reservation.console_id,
+      consoleRevision: console.revision,
+      speakerId: reservation.speaker_id,
+      speakerName: reservation.speaker_name,
+      capturedStartedUtc: reservation.captured_started_utc,
+      assignments,
+    };
+  }
+
   getVoiceConsoleCaptureTerminal(captureId: string): VoiceConsoleCaptureTerminal | null {
     const row = this.db
       .prepare<[string], VoiceConsoleCaptureTerminalRow>(
@@ -2858,16 +3114,26 @@ export class SessionStore {
    */
   finalizeVoiceConsoleCapture(final: VoiceConsoleFinalCapture): VoiceConsoleCaptureCommitResult {
     const settle = this.db.transaction((): VoiceConsoleCaptureCommitResult => {
+      const audioMs = requireNonNegativeFiniteInteger(final.audioMs, "audioMs");
+      const forwardedAudioMs = requireNonNegativeFiniteInteger(
+        final.forwardedAudioMs,
+        "forwardedAudioMs"
+      );
+      const reservation = this.requireVoiceConsoleCaptureIdentity(final);
       const prior = this.getVoiceConsoleCaptureTerminal(final.captureId);
-      if (prior) return this.buildVoiceConsoleCaptureResult(final.captureId, prior, true);
+      if (prior) {
+        this.assertVoiceConsoleTerminalReplay(prior, reservation, audioMs, forwardedAudioMs, final.resultSource);
+        return this.buildVoiceConsoleCaptureResult(final.captureId, prior, true);
+      }
       const rows = this.voiceConsoleCaptureRows(final.captureId);
       if (rows.length === 0) return this.emptyVoiceConsoleCaptureResult(final.captureId);
       const consoleId = this.voiceConsoleCaptureConsoleId(rows);
       if (!consoleId) return this.emptyVoiceConsoleCaptureResult(final.captureId);
+      if (consoleId !== reservation.console_id) {
+        throw new Error("Voice Console capture allocation console does not match its reservation.");
+      }
 
       const transcript = final.transcript.trim();
-      const audioMs = nonNegativeInteger(final.audioMs);
-      const forwardedAudioMs = nonNegativeInteger(final.forwardedAudioMs ?? final.audioMs);
       const finalSpeakerName = sanitizeVoiceConsoleSpeakerName(final.speakerName);
       const speakerMatches = rows.every(
         (row) => row.author_id === final.speakerId && (row.author_name ?? "") === finalSpeakerName
@@ -2944,6 +3210,9 @@ export class SessionStore {
       const terminal = this.insertVoiceConsoleCaptureTerminal({
         captureId: final.captureId,
         consoleId,
+        speakerId: reservation.speaker_id,
+        capturedStartedUtc: reservation.captured_started_utc,
+        targetFingerprint: reservation.target_fingerprint,
         outcome,
         reason,
         resultSource: final.resultSource ?? null,
@@ -2961,14 +3230,21 @@ export class SessionStore {
   /** First terminal winner for one capture; never mutates a prior commit/drop. */
   dropVoiceConsoleCapture(input: VoiceConsoleDropCaptureInput): VoiceConsoleCaptureCommitResult {
     const settle = this.db.transaction((): VoiceConsoleCaptureCommitResult => {
+      const audioMs = requireNonNegativeFiniteInteger(input.audioMs, "audioMs");
+      const forwardedAudioMs = requireNonNegativeFiniteInteger(
+        input.forwardedAudioMs,
+        "forwardedAudioMs"
+      );
+      const reservation = this.requireVoiceConsoleCaptureIdentity(input);
       const prior = this.getVoiceConsoleCaptureTerminal(input.captureId);
-      if (prior) return this.buildVoiceConsoleCaptureResult(input.captureId, prior, true);
+      if (prior) {
+        this.assertVoiceConsoleTerminalReplay(prior, reservation, audioMs, forwardedAudioMs, input.resultSource);
+        return this.buildVoiceConsoleCaptureResult(input.captureId, prior, true);
+      }
       const rows = this.voiceConsoleCaptureRows(input.captureId);
       if (rows.length === 0) return this.emptyVoiceConsoleCaptureResult(input.captureId);
       const consoleId = this.voiceConsoleCaptureConsoleId(rows);
       if (!consoleId) return this.emptyVoiceConsoleCaptureResult(input.captureId);
-      const audioMs = nonNegativeInteger(input.audioMs);
-      const forwardedAudioMs = nonNegativeInteger(input.forwardedAudioMs);
       const precommitted = rows.some((row) =>
         ["pending", "batched", "dispatched"].includes(row.state)
       );
@@ -3000,6 +3276,9 @@ export class SessionStore {
       const terminal = this.insertVoiceConsoleCaptureTerminal({
         captureId: input.captureId,
         consoleId,
+        speakerId: reservation.speaker_id,
+        capturedStartedUtc: reservation.captured_started_utc,
+        targetFingerprint: reservation.target_fingerprint,
         outcome,
         reason: precommitted ? null : input.reason,
         resultSource: input.resultSource ?? null,
@@ -3022,6 +3301,74 @@ export class SessionStore {
       .all(captureId);
   }
 
+  private requireVoiceConsoleCaptureIdentity(
+    identity: VoiceConsoleCaptureIdentity
+  ): VoiceConsoleCaptureReservationRow {
+    const reservation = this.getVoiceConsoleCaptureReservation(identity.captureId);
+    if (!reservation) {
+      throw new Error("Voice Console capture has no durable allocation identity.");
+    }
+    const fingerprint = captureTargetFingerprint(identity.targets);
+    if (
+      reservation.console_id !== identity.consoleId ||
+      reservation.speaker_id !== identity.speakerId ||
+      reservation.captured_started_utc !== identity.capturedStartedUtc ||
+      reservation.target_fingerprint !== fingerprint
+    ) {
+      throw new Error("Voice Console capture id collision: terminal identity does not match allocation.");
+    }
+    return reservation;
+  }
+
+  getVoiceConsoleCaptureIdentity(captureId: string): VoiceConsoleCaptureIdentity | null {
+    const reservation = this.getVoiceConsoleCaptureReservation(captureId);
+    if (!reservation) return null;
+    return {
+      captureId,
+      consoleId: reservation.console_id,
+      speakerId: reservation.speaker_id,
+      capturedStartedUtc: reservation.captured_started_utc,
+      targets: this.voiceConsoleCaptureRows(captureId).map((row) => ({
+        bindingId: row.session_id,
+        sequence: row.sequence,
+      })),
+    };
+  }
+
+  private voiceConsoleCaptureIdentity(captureId: string): VoiceConsoleCaptureIdentity {
+    const identity = this.getVoiceConsoleCaptureIdentity(captureId);
+    if (!identity) throw new Error("Voice Console capture has no durable allocation identity.");
+    return identity;
+  }
+
+  private assertVoiceConsoleTerminalReplay(
+    terminal: VoiceConsoleCaptureTerminal,
+    reservation: VoiceConsoleCaptureReservationRow,
+    audioMs: number,
+    forwardedAudioMs: number,
+    resultSource: "live" | "unary" | undefined
+  ): void {
+    if (
+      terminal.speakerId === null ||
+      terminal.capturedStartedUtc === null ||
+      terminal.targetFingerprint === null ||
+      terminal.forwardedAudioMs === null
+    ) {
+      throw new Error("Legacy Voice Console capture terminal cannot be safely replayed.");
+    }
+    if (
+      terminal.consoleId !== reservation.console_id ||
+      terminal.speakerId !== reservation.speaker_id ||
+      terminal.capturedStartedUtc !== reservation.captured_started_utc ||
+      terminal.targetFingerprint !== reservation.target_fingerprint ||
+      terminal.audioMs !== audioMs ||
+      terminal.forwardedAudioMs !== forwardedAudioMs ||
+      terminal.resultSource !== (resultSource ?? null)
+    ) {
+      throw new Error("Voice Console capture terminal replay does not match the winning identity and telemetry.");
+    }
+  }
+
   private voiceConsoleCaptureConsoleId(rows: readonly VoiceConsoleSegmentRow[]): string | null {
     let consoleId: string | null = null;
     for (const row of rows) {
@@ -3041,13 +3388,17 @@ export class SessionStore {
     this.db
       .prepare(
         `INSERT INTO voice_console_capture_terminals
-           (capture_id, console_id, outcome, reason, result_source, audio_ms, forwarded_audio_ms,
+           (capture_id, console_id, speaker_id, captured_started_utc, target_fingerprint,
+            outcome, reason, result_source, audio_ms, forwarded_audio_ms,
             captured_ended_utc, created_utc)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         terminal.captureId,
         terminal.consoleId,
+        terminal.speakerId,
+        terminal.capturedStartedUtc,
+        terminal.targetFingerprint,
         terminal.outcome,
         terminal.reason,
         terminal.resultSource,
@@ -3060,6 +3411,9 @@ export class SessionStore {
   }
 
   private incrementVoiceConsoleCaptureCounters(terminal: VoiceConsoleCaptureTerminal): void {
+    if (terminal.forwardedAudioMs === null) {
+      throw new Error("Voice Console capture terminal is missing forwarded audio telemetry.");
+    }
     this.db
       .prepare(
         `UPDATE voice_console_sessions SET
@@ -3136,7 +3490,7 @@ export class SessionStore {
       .map((row) => row.capture_id);
     return captureIds.flatMap((captureId) =>
       this.dropVoiceConsoleCapture({
-        captureId,
+        ...this.voiceConsoleCaptureIdentity(captureId),
         reason,
         capturedEndedUtc: droppedUtc,
         audioMs: 0,
@@ -3258,9 +3612,21 @@ export class SessionStore {
 
   getVoiceConsoleInteractionReplay(
     consoleId: string,
-    interactionId: string | undefined
+    interactionId: string | undefined,
+    input: { expectedRevision?: number; discardPending: boolean; reason: string }
   ): VoiceConsoleMutationOutcome | null {
-    if (!interactionId || !this.getVoiceConsoleMutation(consoleId, interactionId, "stop-console")) return null;
+    const fingerprint = voiceConsoleMutationFingerprint({
+      action: "stop-console",
+      discardPending: input.discardPending,
+      expectedRevision: input.expectedRevision,
+      reason: input.reason,
+    });
+    if (!interactionId) return null;
+    try {
+      if (!this.getVoiceConsoleMutation(consoleId, interactionId, "stop-console", fingerprint)) return null;
+    } catch {
+      return interactionCollisionFailure();
+    }
     return {
       ok: true,
       value: this.requireVoiceConsoleMutationResult(consoleId, false, true),
@@ -3450,11 +3816,11 @@ export class SessionStore {
   private getVoiceConsoleMutationRecord(
     consoleId: string,
     interactionId: string
-  ): { mutation_id: string; action: string } | null {
+  ): { mutation_id: string; action: string; input_fingerprint: string | null } | null {
     return (
       this.db
-        .prepare<[string, string], { mutation_id: string; action: string }>(
-          `SELECT mutation_id, action FROM voice_console_mutations
+        .prepare<[string, string], { mutation_id: string; action: string; input_fingerprint: string | null }>(
+          `SELECT mutation_id, action, input_fingerprint FROM voice_console_mutations
             WHERE console_id = ? AND mutation_id = ?`
         )
         .get(consoleId, interactionId) ?? null
@@ -3464,7 +3830,8 @@ export class SessionStore {
   private getVoiceConsoleMutation(
     consoleId: string,
     interactionId: string | undefined,
-    action: string
+    action: string,
+    inputFingerprint: string
   ): boolean {
     if (!interactionId) return false;
     if (this.getVoiceConsoleAddInteraction(consoleId, interactionId)) {
@@ -3472,7 +3839,7 @@ export class SessionStore {
     }
     const mutation = this.getVoiceConsoleMutationRecord(consoleId, interactionId);
     if (!mutation) return false;
-    if (mutation.action === "legacy" || mutation.action === action) return true;
+    if (mutation.action === action && mutation.input_fingerprint === inputFingerprint) return true;
     throw new Error(interactionCollisionFailure().error);
   }
 
@@ -3480,16 +3847,18 @@ export class SessionStore {
     consoleId: string,
     interactionId: string | undefined,
     createdUtc: string,
-    action: string
+    action: string,
+    inputFingerprint: string
   ): void {
     if (!interactionId) return;
     const revision = this.getVoiceConsole(consoleId)?.revision ?? 0;
     this.db
       .prepare(
         `INSERT OR IGNORE INTO voice_console_mutations
-           (console_id, mutation_id, action, revision, created_utc) VALUES (?, ?, ?, ?, ?)`
+           (console_id, mutation_id, action, input_fingerprint, revision, created_utc)
+         VALUES (?, ?, ?, ?, ?, ?)`
       )
-      .run(consoleId, interactionId, action, revision, createdUtc);
+      .run(consoleId, interactionId, action, inputFingerprint, revision, createdUtc);
   }
 
   private requireVoiceConsoleMutationResult(
@@ -4681,6 +5050,7 @@ CREATE TABLE IF NOT EXISTS voice_console_mutations (
   console_id    TEXT NOT NULL,
   mutation_id   TEXT NOT NULL,
   action        TEXT NOT NULL DEFAULT 'legacy',
+  input_fingerprint TEXT,
   revision      INTEGER NOT NULL,
   created_utc   TEXT NOT NULL,
   PRIMARY KEY (console_id, mutation_id)
@@ -4702,9 +5072,26 @@ CREATE TABLE IF NOT EXISTS voice_console_add_interactions (
   CHECK(failure_as_exception IN (0,1))
 );
 
+CREATE TABLE IF NOT EXISTS voice_console_capture_reservations (
+  capture_id            TEXT PRIMARY KEY,
+  console_id            TEXT NOT NULL,
+  speaker_id            TEXT NOT NULL,
+  speaker_name          TEXT NOT NULL,
+  captured_started_utc  TEXT NOT NULL,
+  fanout_group_id       TEXT,
+  target_fingerprint    TEXT NOT NULL,
+  created_utc           TEXT NOT NULL,
+  FOREIGN KEY(console_id) REFERENCES voice_console_sessions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_voice_console_capture_reservations_console
+  ON voice_console_capture_reservations(console_id, created_utc);
+
 CREATE TABLE IF NOT EXISTS voice_console_capture_terminals (
   capture_id            TEXT PRIMARY KEY,
   console_id            TEXT NOT NULL,
+  speaker_id            TEXT NOT NULL,
+  captured_started_utc  TEXT NOT NULL,
+  target_fingerprint    TEXT NOT NULL,
   outcome               TEXT NOT NULL,
   reason                TEXT,
   result_source         TEXT,
@@ -4764,12 +5151,26 @@ interface VoiceConsoleAddInteractionRow {
 interface VoiceConsoleCaptureTerminalRow {
   capture_id: string;
   console_id: string;
+  speaker_id: string | null;
+  captured_started_utc: string | null;
+  target_fingerprint: string | null;
   outcome: string;
   reason: string | null;
   result_source: string | null;
   audio_ms: number;
-  forwarded_audio_ms: number;
+  forwarded_audio_ms: number | null;
   captured_ended_utc: string;
+  created_utc: string;
+}
+
+interface VoiceConsoleCaptureReservationRow {
+  capture_id: string;
+  console_id: string;
+  speaker_id: string;
+  speaker_name: string;
+  captured_started_utc: string;
+  fanout_group_id: string | null;
+  target_fingerprint: string;
   created_utc: string;
 }
 
@@ -4778,6 +5179,9 @@ const mapVoiceConsoleCaptureTerminal = (
 ): VoiceConsoleCaptureTerminal => ({
   captureId: row.capture_id,
   consoleId: row.console_id,
+  speakerId: row.speaker_id,
+  capturedStartedUtc: row.captured_started_utc,
+  targetFingerprint: row.target_fingerprint,
   outcome: row.outcome as VoiceConsoleCaptureTerminalOutcome,
   reason: row.reason,
   resultSource: row.result_source as VoiceConsoleCaptureTerminal["resultSource"],
@@ -5461,6 +5865,36 @@ function truncatePreview(text: string | null): string | null {
     : text.slice(0, PROMPT_PREVIEW_MAX);
 }
 
-function nonNegativeInteger(value: number): number {
-  return Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+function requireNonNegativeFiniteInteger(value: number, field: string): number {
+  if (!Number.isFinite(value) || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Voice Console ${field} must be a non-negative finite integer.`);
+  }
+  return value;
+}
+
+function canonicalCaptureTargets(
+  targets: readonly { bindingId: string; sequence: number }[]
+): Array<{ bindingId: string; sequence: number }> {
+  const canonical = targets.map((target) => ({
+    bindingId: target.bindingId,
+    sequence: requireNonNegativeFiniteInteger(target.sequence, "capture target sequence"),
+  }));
+  canonical.sort((a, b) => a.bindingId.localeCompare(b.bindingId) || a.sequence - b.sequence);
+  const bindingIds = new Set(canonical.map((target) => target.bindingId));
+  if (bindingIds.size !== canonical.length || canonical.some((target) => !target.bindingId)) {
+    throw new Error("Voice Console capture target identity is invalid.");
+  }
+  return canonical;
+}
+
+function captureTargetFingerprint(
+  targets: readonly { bindingId: string; sequence: number }[]
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalCaptureTargets(targets)))
+    .digest("hex");
+}
+
+function voiceConsoleMutationFingerprint(input: Record<string, unknown>): string {
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }

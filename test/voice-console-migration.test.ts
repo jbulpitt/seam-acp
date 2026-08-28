@@ -70,7 +70,7 @@ describe("Voice Console V2 migration", () => {
         .prepare("PRAGMA table_info(voice_console_mutations)")
         .all()
         .map((row: any) => row.name)
-    ).toContain("action");
+    ).toEqual(expect.arrayContaining(["action", "input_fingerprint"]));
     expect(
       mutationDb
         .prepare("SELECT action FROM voice_console_mutations WHERE mutation_id = ?")
@@ -99,6 +99,13 @@ describe("Voice Console V2 migration", () => {
       ])
     );
     mutationDb.close();
+    expect(() =>
+      store.updateVoiceConsoleCard("legacy-console", {
+        expectedRevision: 1,
+        cardPage: 1,
+        interactionId: "legacy-interaction",
+      })
+    ).toThrow(/different Voice Console action or input/);
 
     const upgraded = store.upgradeActiveV1ThreadVoiceSessions(
       {

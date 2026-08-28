@@ -280,6 +280,7 @@ export class VoiceConsoleManager {
       const began = this.store.beginVoiceConsoleBindingRemoval(bindingId, {
         expectedRevision: opts.expectedRevision,
         interactionId: opts.interactionId,
+        discardPending: Boolean(opts.discardPending),
         reason,
         updatedUtc: this.now(),
       });
@@ -334,18 +335,24 @@ export class VoiceConsoleManager {
   > {
     const console = this.store.getVoiceConsole(consoleId);
     if (!console) return { ok: false, error: "Voice Console does not exist." };
-    const replay = this.store.getVoiceConsoleInteractionReplay(consoleId, opts.interactionId);
+    const reason = opts.reason ?? "console stopped";
+    const replay = this.store.getVoiceConsoleInteractionReplay(consoleId, opts.interactionId, {
+      expectedRevision: opts.expectedRevision,
+      discardPending: Boolean(opts.discardPending),
+      reason,
+    });
     if (replay?.ok) return { ok: true, discarded: 0, duplicate: true };
+    if (replay && !replay.ok) return { ok: false, error: replay.error };
     if (console.status === "ended" || console.status === "failed") {
       return { ok: false, error: "Voice Console has already ended." };
     }
     const bindings = this.store.listVoiceConsoleBindings(consoleId);
     bindings.forEach((binding) => this.releaseBlocked.add(binding.id));
-    const reason = opts.reason ?? "console stopped";
     try {
       const began = this.store.beginVoiceConsoleStop(consoleId, {
         expectedRevision: opts.expectedRevision,
         interactionId: opts.interactionId,
+        discardPending: Boolean(opts.discardPending),
         reason,
         updatedUtc: this.now(),
       });

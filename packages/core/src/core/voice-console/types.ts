@@ -197,15 +197,22 @@ export function sanitizeVoiceConsoleFailureMessage(value: string): string {
   return sanitized || "Voice Console binding add failed.";
 }
 
-export interface VoiceConsoleFinalCapture {
+export interface VoiceConsoleCaptureIdentity {
   captureId: string;
+  consoleId: string;
   speakerId: string;
+  capturedStartedUtc: string;
+  /** Canonical allocation identity; segment ids are deliberately excluded. */
+  targets: readonly { bindingId: string; sequence: number }[];
+}
+
+export interface VoiceConsoleFinalCapture extends VoiceConsoleCaptureIdentity {
   speakerName: string;
   transcript: string;
   /** STT/capture duration retained on each target segment. */
   audioMs: number;
   /** Cumulative 16 kHz mono PCM duration, counted once for this capture. */
-  forwardedAudioMs?: number;
+  forwardedAudioMs: number;
   capturedEndedUtc: string;
   /** Final capture authorization is supplied by the integration allowlist check. */
   speakerAuthorized: boolean;
@@ -222,19 +229,22 @@ export type VoiceConsoleCaptureTerminalOutcome = "committed" | "dropped" | "fail
 export interface VoiceConsoleCaptureTerminal {
   captureId: string;
   consoleId: string;
+  speakerId: string | null;
+  capturedStartedUtc: string | null;
+  /** Opaque canonical fingerprint of binding ids and reserved sequences. */
+  targetFingerprint: string | null;
   outcome: VoiceConsoleCaptureTerminalOutcome;
   reason: string | null;
   resultSource: "live" | "unary" | null;
   /** STT/capture duration retained on target segments. */
   audioMs: number;
   /** Cumulative forwarded PCM duration counted once on the console. */
-  forwardedAudioMs: number;
+  forwardedAudioMs: number | null;
   capturedEndedUtc: string;
   createdUtc: string;
 }
 
-export interface VoiceConsoleDropCaptureInput {
-  captureId: string;
+export interface VoiceConsoleDropCaptureInput extends VoiceConsoleCaptureIdentity {
   reason: string;
   capturedEndedUtc: string;
   audioMs: number;

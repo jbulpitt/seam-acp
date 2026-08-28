@@ -130,6 +130,7 @@ function fixture(opts: { inputActive?: boolean } = {}) {
         text: `${speakerId} transcript`,
         source: speakerId === "bob" ? "unary" as const : "live" as const,
       })),
+      cancelUtterance: vi.fn(),
       close: vi.fn(),
     };
     transcribers.set(speakerId, { port, sent, handlers });
@@ -238,7 +239,7 @@ describe("DiscordVoiceConsoleCaptureHost", () => {
     await f.host.destroy();
   });
 
-  it("rebinds a same-user receiver stream without a duplicate lane, client, or final", async () => {
+  it("fails safe on a same-user receiver discontinuity until a fresh mute cycle", async () => {
     const f = fixture();
     await setMuted(f, "alice", true, false);
     f.speaking.users.set("alice", 1);
@@ -247,10 +248,27 @@ describe("DiscordVoiceConsoleCaptureHost", () => {
     expect(f.receiver.subscribe).toHaveBeenCalledTimes(1);
     f.subscriptions.get("alice")!.write(Buffer.from([7]));
     await tick();
+    const firstTranscriber = f.transcribers.get("alice")!;
 
-    f.subscriptions.get("alice")!.end();
-    await tick();
+    f.subscriptions.get("alice")!.emit("end");
+    // A replacement speaking event can race ahead of the serialized durable
+    // abort, but the runtime is locally unsafe as soon as the stream ends.
     f.speaking.emit("start", "alice");
+    expect(f.receiver.subscribe).toHaveBeenCalledTimes(1);
+    await tick();
+    await f.host.idle();
+    expect(f.host.router.listLanes().filter((lane) => lane.userId === "alice")).toHaveLength(1);
+    expect(f.host.router.getLane("alice")).toMatchObject({ state: "awaiting_safe_mute" });
+    expect(f.drops).toEqual([{ speakerId: "alice", reason: "unsafe_rebind" }]);
+    expect(firstTranscriber.port.cancelUtterance).toHaveBeenCalledOnce();
+    expect(firstTranscriber.port.close).toHaveBeenCalledOnce();
+
+    // Discord may immediately advertise a replacement SSRC. It is ignored
+    // until the real self-mute state proves a fresh safe edge.
+    f.speaking.emit("start", "alice");
+    expect(f.receiver.subscribe).toHaveBeenCalledTimes(1);
+    await setMuted(f, "alice", false, true);
+    await setMuted(f, "alice", true, false);
     expect(f.receiver.subscribe).toHaveBeenCalledTimes(2);
     f.subscriptions.get("alice")!.write(Buffer.from([9]));
     await tick();
@@ -258,10 +276,11 @@ describe("DiscordVoiceConsoleCaptureHost", () => {
     await f.host.idle();
 
     expect(f.host.router.listLanes().filter((lane) => lane.userId === "alice")).toHaveLength(1);
-    expect(f.factory).toHaveBeenCalledTimes(1);
-    expect(f.transcribers.get("alice")!.sent).toEqual([7, 9]);
+    expect(f.factory).toHaveBeenCalledTimes(2);
+    expect(firstTranscriber.sent).toEqual([7]);
+    expect(f.transcribers.get("alice")!.sent).toEqual([9]);
     expect(f.commits).toEqual([
-      { speakerId: "alice", transcript: "alice transcript", forwardedBytes: 4 },
+      { speakerId: "alice", transcript: "alice transcript", forwardedBytes: 2 },
     ]);
     expect(f.persistence.commitCapture).toHaveBeenCalledOnce();
     await f.host.destroy();
@@ -287,6 +306,7 @@ describe("DiscordVoiceConsoleCaptureHost", () => {
     expect(f.persistence.commitCapture).not.toHaveBeenCalled();
     expect(f.subscriptions.size).toBe(0);
     for (const { port } of f.transcribers.values()) {
+      expect(port.cancelUtterance).toHaveBeenCalledOnce();
       expect(port.close).toHaveBeenCalledOnce();
       expect(port.finalizeUtterance).not.toHaveBeenCalled();
     }
@@ -318,6 +338,7 @@ describe("DiscordVoiceConsoleCaptureHost", () => {
     await setMuted(f, "alice", false, true);
     expect(port.finalizeUtterance).toHaveBeenCalledOnce();
     await f.host.setInputEnabled(false);
+    expect(port.cancelUtterance).toHaveBeenCalledOnce();
     expect(port.close).toHaveBeenCalledOnce();
     expect(f.drops).toEqual([{ speakerId: "alice", reason: "input_off" }]);
 

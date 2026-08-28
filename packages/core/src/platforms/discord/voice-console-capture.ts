@@ -37,6 +37,7 @@ type Receiver = VoiceConnection["receiver"];
 type ReceiveStream = ReturnType<Receiver["subscribe"]>;
 
 export interface VoiceConsoleTranscribePort extends ThreadVoiceTranscribePort {
+  cancelUtterance(): void;
   close(): void;
 }
 
@@ -99,6 +100,7 @@ type SpeakerRuntime = {
   pendingCapture?: VoiceConsoleArmedCapture;
   activeCaptureId?: string;
   subscription?: ReceiveStream;
+  transportUnsafe: boolean;
   rolloverTimer?: ReturnType<typeof setTimeout>;
   retired: boolean;
 };
@@ -126,6 +128,12 @@ class LazySpeakerTranscriber implements VoiceConsoleTranscribePort {
   async finalizeUtterance(pcm: Uint8Array): Promise<GeminiLiveTranscribeResult> {
     const instance = await this.get();
     return instance.finalizeUtterance(pcm);
+  }
+
+  cancelUtterance(): void {
+    if (this.closed) return;
+    this.instance?.cancelUtterance();
+    void this.pending?.then((instance) => instance.cancelUtterance(), () => undefined);
   }
 
   close(): void {
@@ -172,6 +180,7 @@ export class DiscordVoiceConsoleCaptureHost {
   private readonly userSerial = new Map<string, Promise<void>>();
   private readonly settlementPromises = new Set<Promise<VoiceConsoleCaptureSettlement>>();
   private readonly retirementPromises = new Set<Promise<void>>();
+  private readonly intentionallyClosedSubscriptions = new WeakSet<ReceiveStream>();
   private destroyed = false;
 
   constructor(opts: DiscordVoiceConsoleCaptureHostOptions) {
@@ -338,11 +347,22 @@ export class DiscordVoiceConsoleCaptureHost {
     const runtime = this.runtimes.get(capture.speakerId);
     if (!runtime || runtime.activeCaptureId !== capture.captureId) return;
     const sequence = runtime.gate.currentSequence;
-    if (sequence !== undefined) runtime.coordinator.abortSequence(sequence);
-    this.destroySubscription(capture.speakerId);
-    this.clearRollover(runtime);
-    runtime.transcriber.close();
-    runtime.gate.stop();
+    if (sequence !== undefined) {
+      this.runCleanup(capture.speakerId, "abort sequence", () =>
+        runtime.coordinator.abortSequence(sequence)
+      );
+    }
+    this.runCleanup(capture.speakerId, "destroy subscription", () =>
+      this.destroySubscription(capture.speakerId)
+    );
+    this.runCleanup(capture.speakerId, "clear rollover", () => this.clearRollover(runtime));
+    this.runCleanup(capture.speakerId, "cancel transcription", () =>
+      runtime.transcriber.cancelUtterance()
+    );
+    this.runCleanup(capture.speakerId, "close transcription", () =>
+      runtime.transcriber.close()
+    );
+    this.runCleanup(capture.speakerId, "stop capture gate", () => runtime.gate.stop());
     runtime.activeCaptureId = undefined;
     this.retireRuntime(capture.speakerId, reason);
   }
@@ -399,6 +419,9 @@ export class DiscordVoiceConsoleCaptureHost {
               reason: segment.state,
               audioMs: segment.audioMs,
               capturedEndedUtc: segment.capturedEndedUtc,
+              ...(runtime.sourcesBySequence.get(segment.sequence)
+                ? { source: runtime.sourcesBySequence.get(segment.sequence) }
+                : {}),
               ...(segment.error ? { error: segment.error } : {}),
             }),
             runtime,
@@ -419,6 +442,7 @@ export class DiscordVoiceConsoleCaptureHost {
       capturesBySequence: new Map(),
       sourcesBySequence: new Map(),
       nextSequence: 0,
+      transportUnsafe: false,
       retired: false,
       gate: undefined as unknown as ThreadVoiceCaptureGate,
     };
@@ -455,7 +479,12 @@ export class DiscordVoiceConsoleCaptureHost {
 
   private ensureSubscription(userId: string): void {
     const runtime = this.runtimes.get(userId);
-    if (!runtime || runtime.retired || !this.router.canSubscribe(userId)) return;
+    if (
+      !runtime ||
+      runtime.retired ||
+      runtime.transportUnsafe ||
+      !this.router.canSubscribe(userId)
+    ) return;
     const current = runtime.subscription;
     if (current && !current.destroyed && !current.readableEnded) return;
     this.destroySubscription(userId);
@@ -465,23 +494,45 @@ export class DiscordVoiceConsoleCaptureHost {
     });
     runtime.subscription = stream;
     stream.on("data", (packet: Buffer) => this.receivePacket(runtime, stream, packet));
-    const clear = (): void => {
-      if (runtime.subscription !== stream) return;
+    let terminated = false;
+    const clear = (): boolean => {
+      if (runtime.subscription !== stream) return false;
       runtime.subscription = undefined;
       runtime.decoder = this.dependencies.createDecoder(userId);
       if (this.opts.connection.receiver.subscriptions.get(userId) === stream) {
         this.opts.connection.receiver.subscriptions.delete(userId);
       }
+      return true;
+    };
+    const discontinuity = (): void => {
+      if (terminated) return;
+      terminated = true;
+      const wasCurrent = clear();
+      if (
+        !wasCurrent ||
+        this.destroyed ||
+        runtime.retired ||
+        this.intentionallyClosedSubscriptions.has(stream)
+      ) return;
+      runtime.transportUnsafe = true;
+      this.enqueueUser(userId, async () => {
+        const present = this.presence.get(userId);
+        if (!present || this.destroyed) return;
+        await this.router.rebindSpeaker({
+          ...present,
+          continuityProven: false,
+        });
+      });
     };
     stream.once("error", (error: Error) => {
       this.logger.warn(
         { error: error.message, speakerId: userId },
         "voice-console receive stream error"
       );
-      clear();
+      discontinuity();
     });
-    stream.once("close", clear);
-    stream.once("end", clear);
+    stream.once("close", discontinuity);
+    stream.once("end", discontinuity);
   }
 
   private receivePacket(runtime: SpeakerRuntime, stream: Readable, packet: Buffer): void {
@@ -522,6 +573,7 @@ export class DiscordVoiceConsoleCaptureHost {
     const stream = runtime?.subscription;
     if (runtime) runtime.subscription = undefined;
     if (stream) {
+      this.intentionallyClosedSubscriptions.add(stream);
       try {
         stream.destroy();
       } catch {
@@ -535,10 +587,10 @@ export class DiscordVoiceConsoleCaptureHost {
     const runtime = this.runtimes.get(userId);
     if (!runtime || runtime.retired) return;
     runtime.retired = true;
-    this.destroySubscription(userId);
-    this.clearRollover(runtime);
-    runtime.transcriber.close();
-    runtime.gate.stop();
+    this.runCleanup(userId, "retire subscription", () => this.destroySubscription(userId));
+    this.runCleanup(userId, "retire rollover", () => this.clearRollover(runtime));
+    this.runCleanup(userId, "retire transcription", () => runtime.transcriber.close());
+    this.runCleanup(userId, "retire capture gate", () => runtime.gate.stop());
     this.runtimes.delete(userId);
     const retirement = runtime.coordinator.idle().catch((error) => {
       this.logger.warn(
@@ -593,6 +645,17 @@ export class DiscordVoiceConsoleCaptureHost {
         if (this.userSerial.get(userId) === next) this.userSerial.delete(userId);
       });
     this.userSerial.set(userId, next);
+  }
+
+  private runCleanup(userId: string, step: string, action: () => void): void {
+    try {
+      action();
+    } catch (error) {
+      this.logger.warn(
+        { error: errorMessage(error), speakerId: userId, step },
+        "voice-console cleanup step failed"
+      );
+    }
   }
 }
 

@@ -17,6 +17,7 @@ function deferred<T>() {
 function fixture(opts: {
   allowed?: string[];
   targets?: Array<{ bindingId: string; sequence: number }>;
+  abortThrows?: boolean;
 } = {}) {
   const allowed = new Set(opts.allowed ?? ["alice", "bob"]);
   let serial = 0;
@@ -55,6 +56,7 @@ function fixture(opts: {
   const interims: string[] = [];
   const byteEvents: Array<{ bytes: number; totalBytes: number }> = [];
   const settled: string[] = [];
+  const errors: string[] = [];
   let clock = 0;
   const router = new VoiceConsoleCaptureRouter({
     persistence,
@@ -64,10 +66,14 @@ function fixture(opts: {
     callbacks: {
       onCaptureArmed: (capture) => armed.push(capture),
       onCaptureFinalize: (capture) => finalized.push(capture),
-      onCaptureAbort: (capture, reason) => aborted.push({ capture, reason }),
+      onCaptureAbort: (capture, reason) => {
+        aborted.push({ capture, reason });
+        if (opts.abortThrows) throw new Error("synchronous host abort failure");
+      },
       onInterim: (_capture, text) => interims.push(text),
       onForwardedBytes: ({ bytes, totalBytes }) => byteEvents.push({ bytes, totalBytes }),
       onSettled: (settlement) => settled.push(`${settlement.captureId}:${settlement.status}`),
+      onError: (error) => errors.push(error.message),
     },
   });
   return {
@@ -80,6 +86,7 @@ function fixture(opts: {
     interims,
     byteEvents,
     settled,
+    errors,
     snapshots,
     setTargets(next: Array<{ bindingId: string; sequence: number }>) {
       targets = next;
@@ -279,6 +286,53 @@ describe("VoiceConsoleCaptureRouter", () => {
       })
     ).resolves.toEqual({ status: "ignored", captureId: bob.captureId });
     expect(f.persistence.commitCapture).not.toHaveBeenCalled();
+  });
+
+  it("durably drops exactly once when synchronous host abort cleanup throws", async () => {
+    const f = fixture({ abortThrows: true });
+    const capture = await arm(f, "alice");
+
+    await f.router.setInputEnabled(false);
+    await f.router.setInputEnabled(false);
+    await expect(
+      f.router.settleCapture(capture.captureId, {
+        ok: true,
+        transcript: "late loser",
+        audioMs: 10,
+        capturedEndedUtc: "late",
+        source: "live",
+      })
+    ).resolves.toEqual({ status: "ignored", captureId: capture.captureId });
+
+    expect(f.persistence.dropCapture).toHaveBeenCalledOnce();
+    expect(f.persistence.dropCapture).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "input_off" })
+    );
+    expect(f.settled).toEqual([`${capture.captureId}:dropped`]);
+    expect(f.errors).toContain("synchronous host abort failure");
+  });
+
+  it("forwards a known failed transcription source to durable drop telemetry", async () => {
+    const f = fixture();
+    const capture = await arm(f, "alice");
+    await f.router.setSpeakerMuted({ userId: "alice", selfMuted: true });
+
+    await f.router.settleCapture(capture.captureId, {
+      ok: false,
+      reason: "transcribe_failed",
+      audioMs: 250,
+      capturedEndedUtc: "ended",
+      source: "unary",
+      error: "unary unavailable",
+    });
+
+    expect(f.persistence.dropCapture).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reason: "transcribe_failed",
+        source: "unary",
+        error: "unary unavailable",
+      })
+    );
   });
 
   it("rebinds one user lane without duplication and fails safe when continuity is unknown", async () => {

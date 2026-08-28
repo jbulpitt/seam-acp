@@ -28,7 +28,7 @@ export type GeminiLiveTranscribeSource = "live" | "unary";
 
 export type GeminiLiveTranscribeResult =
   | { ok: true; text: string; source: GeminiLiveTranscribeSource }
-  | { ok: false; error: string; source: "unary" };
+  | { ok: false; error: string; source: GeminiLiveTranscribeSource };
 
 export interface GeminiLiveTranscribeFinal {
   text: string;
@@ -330,6 +330,21 @@ export class GeminiLiveTranscribeClient {
       }, this.finalizationTimeoutMs);
     }
     return utterance.resultPromise;
+  }
+
+  /**
+   * Aborts the current activity without invoking the caller-buffered unary
+   * fallback. Voice Console Input-off uses this before closing the client;
+   * ordinary V1 close/failure behavior remains fallback-capable.
+   */
+  cancelUtterance(): void {
+    const utterance = this.utterance;
+    if (!utterance || utterance.completed) return;
+    this.completeUtterance(utterance, {
+      ok: false,
+      error: "live transcribe utterance cancelled",
+      source: "live",
+    });
   }
 
   close(): void {

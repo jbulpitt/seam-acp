@@ -40,6 +40,7 @@ describe("ThreadVoiceCaptureCoordinator", () => {
     };
     const onFinal = vi.fn();
     const onDropped = vi.fn();
+    const onTranscriptionSource = vi.fn();
     let clock = 0;
     const bridge = new ThreadVoiceCaptureCoordinator({
       ownerUserId: "owner",
@@ -51,6 +52,7 @@ describe("ThreadVoiceCaptureCoordinator", () => {
         onFinal,
         onDropped,
         onAudioSent: vi.fn(),
+        onTranscriptionSource,
       },
     });
 
@@ -87,6 +89,10 @@ describe("ThreadVoiceCaptureCoordinator", () => {
       [1, "first continuation"],
       [2, "next utterance"],
     ]);
+    expect(onTranscriptionSource.mock.calls).toEqual([
+      [1, "live"],
+      [2, "live"],
+    ]);
     expect(transcribe.finalizeUtterance).toHaveBeenCalledTimes(2);
   });
 
@@ -113,6 +119,7 @@ describe("ThreadVoiceCaptureCoordinator", () => {
   it("settles one failed continuation with an empty terminal exactly once", async () => {
     const onFinal = vi.fn();
     const onDropped = vi.fn();
+    const onTranscriptionSource = vi.fn();
     const transcribe: ThreadVoiceTranscribePort = {
       startUtterance: vi.fn(async () => {}),
       sendPcm16k: vi.fn(),
@@ -131,6 +138,7 @@ describe("ThreadVoiceCaptureCoordinator", () => {
         onFinal,
         onDropped,
         onAudioSent: vi.fn(),
+        onTranscriptionSource,
       },
     });
 
@@ -172,5 +180,7 @@ describe("ThreadVoiceCaptureCoordinator", () => {
       state: "transcribe_failed",
       error: expect.stringContaining("live and unary unavailable"),
     }));
+    expect(onTranscriptionSource).toHaveBeenCalledOnce();
+    expect(onTranscriptionSource).toHaveBeenCalledWith(9, "unary");
   });
 });

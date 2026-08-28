@@ -248,6 +248,64 @@ describe("GeminiLiveTranscribeClient", () => {
     }
   });
 
+  it("cancels bounded finalization without invoking unary fallback", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = socketHarness();
+      const unaryFallback = vi.fn<GeminiUnaryFallback>(async () => ({
+        ok: true,
+        text: "must not run",
+      }));
+      const onFinal = vi.fn();
+      const client = await connectClient({
+        harness,
+        unaryFallback,
+        finalizationTimeoutMs: 25,
+        handlers: { onFinal },
+      });
+      const pcm = new Uint8Array([1, 2, 3, 4]);
+      await client.startUtterance();
+      client.sendPcm16k(pcm);
+      const resultPromise = client.finalizeUtterance(pcm);
+
+      client.cancelUtterance();
+      client.close();
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(resultPromise).resolves.toEqual({
+        ok: false,
+        error: "live transcribe utterance cancelled",
+        source: "live",
+      });
+      expect(unaryFallback).not.toHaveBeenCalled();
+      expect(onFinal).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves ordinary V1 close fallback when cancellation was not requested", async () => {
+    const harness = socketHarness();
+    const unaryFallback = vi.fn<GeminiUnaryFallback>(async () => ({
+      ok: true,
+      text: "V1 recovered transcript",
+    }));
+    const client = await connectClient({ harness, unaryFallback });
+    const pcm = new Uint8Array([1, 2, 3, 4]);
+    await client.startUtterance();
+    client.sendPcm16k(pcm);
+    const resultPromise = client.finalizeUtterance(pcm);
+
+    client.close();
+
+    await expect(resultPromise).resolves.toEqual({
+      ok: true,
+      text: "V1 recovered transcript",
+      source: "unary",
+    });
+    expect(unaryFallback).toHaveBeenCalledOnce();
+  });
+
   it("falls back once when the socket closes during bounded finalization", async () => {
     const harness = socketHarness();
     const unaryFallback = vi.fn<GeminiUnaryFallback>(async () => ({

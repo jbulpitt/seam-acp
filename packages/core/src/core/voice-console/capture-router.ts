@@ -71,6 +71,7 @@ export interface VoiceConsoleCaptureDrop {
   audioMs: number;
   forwardedBytes: number;
   capturedEndedUtc: string;
+  source?: "live" | "unary";
   error?: string;
 }
 
@@ -112,6 +113,7 @@ export type VoiceConsoleCaptureOutcome =
       reason: "capture_dropped" | "transcribe_failed" | "host_failed";
       audioMs: number;
       capturedEndedUtc: string;
+      source?: "live" | "unary";
       error?: string;
     };
 
@@ -442,7 +444,8 @@ export class VoiceConsoleCaptureRouter {
         false,
         outcome.ok ? undefined : outcome.error,
         outcome.audioMs,
-        outcome.capturedEndedUtc
+        outcome.capturedEndedUtc,
+        outcome.ok ? undefined : outcome.source
       );
     }
 
@@ -554,7 +557,8 @@ export class VoiceConsoleCaptureRouter {
     notifyHost: boolean,
     error?: string,
     audioMs = 0,
-    capturedEndedUtc = this.now()
+    capturedEndedUtc = this.now(),
+    source?: "live" | "unary"
   ): Promise<VoiceConsoleCaptureSettlement> {
     if (record.settlement) return record.settlement;
     if (record.decision) {
@@ -562,20 +566,24 @@ export class VoiceConsoleCaptureRouter {
     }
     record.decision = "drop";
     const hostAbort = notifyHost
-      ? Promise.resolve(this.callbacks.onCaptureAbort(record.capture, reason)).catch((err) => {
+      ? Promise.resolve().then(() => this.callbacks.onCaptureAbort(record.capture, reason)).catch((err) => {
           this.reportError(err, "capture abort callback");
         })
       : Promise.resolve();
-    record.settlement = Promise.all([
-      hostAbort,
+    const durableDrop = Promise.resolve().then(() =>
       this.persistence.dropCapture({
         snapshot: record.capture.snapshot,
         reason,
         audioMs: nonNegativeInt(audioMs),
         forwardedBytes: record.forwardedBytes,
         capturedEndedUtc,
+        ...(source ? { source } : {}),
         ...(error ? { error } : {}),
-      }),
+      })
+    );
+    record.settlement = Promise.all([
+      hostAbort,
+      durableDrop,
     ])
       .then((): VoiceConsoleCaptureSettlement => ({
         status: "dropped",

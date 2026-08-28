@@ -16,6 +16,8 @@ export interface ThreadVoiceTranscribePort {
   startUtterance(): Promise<void>;
   sendPcm16k(pcm: Uint8Array): void;
   finalizeUtterance(pcm: Uint8Array): Promise<GeminiLiveTranscribeResult>;
+  /** V2 safety hook; V1 ports may omit it and retain close/fallback behavior. */
+  cancelUtterance?(): void;
 }
 
 export interface ThreadVoiceCaptureCoordinatorCallbacks {
@@ -208,7 +210,7 @@ export class ThreadVoiceCaptureCoordinator {
     // A queued exact-boundary marker can finish empty before its predecessor's
     // final settles. Skip a Google activity for that marker entirely.
     if (part.ended && part.ended.pcm16kMono.byteLength === 0) {
-      return this.partResult(part, { ok: false, error: "empty capture marker", source: "unary" });
+      return this.noNetworkPartResult(part);
     }
     await this.transcribe.startUtterance();
     part.started = true;
@@ -258,6 +260,20 @@ export class ThreadVoiceCaptureCoordinator {
     };
   }
 
+  private noNetworkPartResult(part: CapturePart): PartResult {
+    const end = part.ended!;
+    return {
+      ref: part.ref,
+      startedUtc: part.startedUtc,
+      endedUtc: part.endedUtc ?? this.now(),
+      durationMs: end.durationMs,
+      continuation: end.continuation,
+      usable: false,
+      text: "",
+      error: "empty capture marker",
+    };
+  }
+
   private async finalizeLogical(logical: LogicalCapture): Promise<void> {
     if (logical.finalized || logical.terminalPart === undefined) return;
     logical.finalized = true;
@@ -269,9 +285,13 @@ export class ThreadVoiceCaptureCoordinator {
     const transcript = parts.map((part) => part.text).filter(Boolean).join("\n").trim();
     const durationMs = parts.reduce((sum, part) => sum + part.durationMs, 0);
     const endedUtc = parts.at(-1)?.endedUtc ?? this.now();
+    const source = parts.some((part) => part.source === "unary")
+      ? "unary"
+      : parts.some((part) => part.source === "live")
+        ? "live"
+        : undefined;
+    if (source) this.callbacks.onTranscriptionSource?.(logical.sequence, source);
     if (transcript) {
-      const source = parts.some((part) => part.source === "unary") ? "unary" : "live";
-      this.callbacks.onTranscriptionSource?.(logical.sequence, source);
       this.callbacks.onFinal({
         sequence: logical.sequence,
         authorId: this.ownerUserId,

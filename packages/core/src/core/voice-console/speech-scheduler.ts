@@ -1,0 +1,718 @@
+import {
+  StreamingSpeechSegmenter,
+  type SpeechTextKind,
+} from "../audio/streaming-speech-segmenter.js";
+import type {
+  VoiceConsoleChunkDisposition,
+  VoiceConsolePlaybackResult,
+  VoiceConsoleSpeechBindingSnapshot,
+  VoiceConsoleSpeechChunk,
+  VoiceConsoleSpeechFailure,
+  VoiceConsoleSpeechPlayback,
+  VoiceConsoleSpeechProfile,
+  VoiceConsoleSpeechSchedulerSnapshot,
+  VoiceConsoleSpeechSourceRef,
+  VoiceConsoleSpeechStats,
+  VoiceConsoleSynthesisRequest,
+  VoiceConsoleSynthesisResult,
+} from "./speech-types.js";
+
+const DEFAULT_MAX_CHUNKS_PER_SLICE = 2;
+const DEFAULT_MAX_AUDIO_MS_PER_SLICE = 25_000;
+
+type BindingState = {
+  bindingId: string;
+  profile: VoiceConsoleSpeechProfile;
+  outputEnabled: boolean;
+  generation: number;
+  stats: VoiceConsoleSpeechStats;
+  drainWaiters: Array<(stats: VoiceConsoleSpeechStats) => void>;
+};
+
+type SourceState = {
+  ref: VoiceConsoleSpeechSourceRef;
+  segmenter: StreamingSpeechSegmenter;
+  pending: VoiceConsoleSpeechChunk[];
+  lastOrdinal: number;
+  finished: boolean;
+  cancelled: boolean;
+  warned: boolean;
+  stats: VoiceConsoleSpeechStats;
+  drainWaiters: Array<(stats: VoiceConsoleSpeechStats) => void>;
+};
+
+type CurrentWork = {
+  sourceKey: string;
+  chunk: VoiceConsoleSpeechChunk;
+  controller: AbortController;
+  phase: "synthesis" | "playback";
+  settled: boolean;
+};
+
+type WorkOutcome =
+  | { kind: "played"; durationMs: number }
+  | { kind: "failed"; phase: "synthesis" | "playback"; error: string }
+  | { kind: "dropped" };
+
+export type VoiceConsoleSpeechSchedulerOptions = {
+  consoleId: string;
+  synthesize: (request: VoiceConsoleSynthesisRequest) => Promise<VoiceConsoleSynthesisResult>;
+  playback: VoiceConsoleSpeechPlayback;
+  onFailure?: (failure: VoiceConsoleSpeechFailure) => void;
+  maxChunksPerSlice?: number;
+  maxAudioMsPerSlice?: number;
+};
+
+/**
+ * One-console speech scheduler.
+ *
+ * It owns source segmenters, one logical synthesis slot, and one injected
+ * playback path. Output-off resets source segmenters as well as queued work so
+ * re-enable can never speak a partial sentence accumulated while disabled.
+ */
+export class VoiceConsoleSpeechScheduler {
+  private readonly consoleId: string;
+  private readonly synthesize: VoiceConsoleSpeechSchedulerOptions["synthesize"];
+  private readonly playback: VoiceConsoleSpeechPlayback;
+  private readonly onFailure: (failure: VoiceConsoleSpeechFailure) => void;
+  private readonly maxChunksPerSlice: number;
+  private readonly maxAudioMsPerSlice: number;
+  private readonly bindings = new Map<string, BindingState>();
+  private readonly sources = new Map<string, SourceState>();
+  private readonly completedSources = new Map<string, VoiceConsoleSpeechStats>();
+  private sourceOrder: string[] = [];
+  private currentWork: CurrentWork | undefined;
+  private sliceSourceKey: string | undefined;
+  private sliceChunks = 0;
+  private sliceAudioMs = 0;
+  private running = false;
+  private destroyed = false;
+
+  constructor(opts: VoiceConsoleSpeechSchedulerOptions) {
+    if (!opts.consoleId.trim()) throw new Error("Voice Console speech requires a console id");
+    this.consoleId = opts.consoleId;
+    this.synthesize = opts.synthesize;
+    this.playback = opts.playback;
+    this.onFailure = opts.onFailure ?? (() => {});
+    this.maxChunksPerSlice = positiveInteger(
+      opts.maxChunksPerSlice,
+      DEFAULT_MAX_CHUNKS_PER_SLICE
+    );
+    this.maxAudioMsPerSlice = positiveInteger(
+      opts.maxAudioMsPerSlice,
+      DEFAULT_MAX_AUDIO_MS_PER_SLICE
+    );
+  }
+
+  registerBinding(opts: {
+    bindingId: string;
+    profile: VoiceConsoleSpeechProfile;
+    outputEnabled: boolean;
+    generation?: number;
+  }): void {
+    this.assertLive();
+    const bindingId = opts.bindingId.trim();
+    if (!bindingId) throw new Error("Voice Console speech requires a binding id");
+    if (this.bindings.has(bindingId)) {
+      throw new Error(`Voice Console speech binding already registered: ${bindingId}`);
+    }
+    const generation = opts.generation ?? 0;
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new Error("Voice Console speech generation must be a non-negative safe integer");
+    }
+    this.bindings.set(bindingId, {
+      bindingId,
+      profile: normalizeProfile(opts.profile),
+      outputEnabled: opts.outputEnabled,
+      generation,
+      stats: emptyStats(),
+      drainWaiters: [],
+    });
+  }
+
+  updateBindingProfile(bindingId: string, profile: VoiceConsoleSpeechProfile): void {
+    this.binding(bindingId).profile = normalizeProfile(profile);
+  }
+
+  registerSource(ref: VoiceConsoleSpeechSourceRef): void {
+    this.assertLive();
+    this.assertConsole(ref.consoleId);
+    this.binding(ref.bindingId);
+    if (!ref.turnId.trim()) throw new Error("Voice Console speech requires a turn id");
+    const key = voiceConsoleSpeechSourceKey(ref);
+    if (this.sources.has(key) || this.completedSources.has(key)) {
+      throw new Error(`Voice Console speech source already registered: ${ref.turnId}`);
+    }
+    this.sources.set(key, {
+      ref: { ...ref },
+      segmenter: new StreamingSpeechSegmenter(),
+      pending: [],
+      lastOrdinal: 0,
+      finished: false,
+      cancelled: false,
+      warned: false,
+      stats: emptyStats(),
+      drainWaiters: [],
+    });
+    this.sourceOrder.push(key);
+  }
+
+  /** Feed visible prose; returns the number of complete chunks accepted. */
+  feedSourceText(
+    ref: VoiceConsoleSpeechSourceRef,
+    text: string,
+    kind: SpeechTextKind = "prose"
+  ): number {
+    const source = this.source(ref);
+    if (source.finished || source.cancelled || !text) return 0;
+    const binding = this.binding(ref.bindingId);
+    if (!binding.outputEnabled) return 0;
+    let accepted = 0;
+    for (const chunkText of source.segmenter.feed(text, kind)) {
+      const chunk = this.nextChunk(source, chunkText, binding.generation);
+      if (this.enqueueChunkInternal(source, binding, chunk) === "accepted") accepted += 1;
+    }
+    return accepted;
+  }
+
+  enqueueChunk(chunk: VoiceConsoleSpeechChunk): VoiceConsoleChunkDisposition {
+    this.assertConsole(chunk.consoleId);
+    const source = this.source(chunk);
+    const binding = this.binding(chunk.bindingId);
+    this.validateChunkOrder(source, chunk);
+    return this.enqueueChunkInternal(source, binding, { ...chunk, text: chunk.text.trim() });
+  }
+
+  finishSource(ref: VoiceConsoleSpeechSourceRef): Promise<VoiceConsoleSpeechStats> {
+    const source = this.source(ref);
+    if (!source.finished && !source.cancelled) {
+      const binding = this.binding(ref.bindingId);
+      if (binding.outputEnabled) {
+        for (const text of source.segmenter.flush()) {
+          const chunk = this.nextChunk(source, text, binding.generation);
+          this.enqueueChunkInternal(source, binding, chunk);
+        }
+      }
+      source.finished = true;
+      this.cleanupSourceIfDrained(voiceConsoleSpeechSourceKey(ref));
+      this.notifyBindingDrain(ref.bindingId);
+      this.kick();
+    }
+    return this.waitForSourceDrain(ref);
+  }
+
+  cancelSource(ref: VoiceConsoleSpeechSourceRef): void {
+    const key = voiceConsoleSpeechSourceKey(ref);
+    const source = this.sources.get(key);
+    if (!source || source.cancelled) return;
+    source.cancelled = true;
+    source.finished = true;
+    source.segmenter = new StreamingSpeechSegmenter();
+    this.dropPending(source);
+    if (this.currentWork?.sourceKey === key) this.currentWork.controller.abort();
+    this.cleanupSourceIfDrained(key);
+    this.notifyBindingDrain(ref.bindingId);
+    this.kick();
+  }
+
+  /** Cancel current/queued speech while leaving the binding output preference unchanged. */
+  invalidateBindingSpeech(bindingId: string): number {
+    const binding = this.binding(bindingId);
+    binding.generation += 1;
+    for (const [key, source] of this.sources) {
+      if (source.ref.bindingId !== bindingId) continue;
+      source.segmenter = new StreamingSpeechSegmenter();
+      this.dropPending(source);
+      this.cleanupSourceIfDrained(key);
+    }
+    if (this.currentBindingId() === bindingId) this.currentWork?.controller.abort();
+    this.notifyBindingDrain(bindingId);
+    this.kick();
+    return binding.generation;
+  }
+
+  setOutputEnabled(bindingId: string, enabled: boolean): number {
+    const binding = this.binding(bindingId);
+    if (binding.outputEnabled === enabled) return binding.generation;
+    binding.outputEnabled = enabled;
+    if (!enabled) return this.invalidateBindingSpeech(bindingId);
+    this.kick();
+    return binding.generation;
+  }
+
+  setAllOutputs(enabled: boolean): Map<string, number> {
+    const generations = new Map<string, number>();
+    for (const bindingId of this.bindings.keys()) {
+      generations.set(bindingId, this.setOutputEnabled(bindingId, enabled));
+    }
+    return generations;
+  }
+
+  bindingGeneration(bindingId: string): number {
+    return this.binding(bindingId).generation;
+  }
+
+  waitForBindingDrain(bindingId: string): Promise<VoiceConsoleSpeechStats> {
+    const binding = this.binding(bindingId);
+    if (this.isBindingDrained(bindingId)) return Promise.resolve(copyStats(binding.stats));
+    return new Promise((resolve) => binding.drainWaiters.push(resolve));
+  }
+
+  waitForSourceDrain(ref: VoiceConsoleSpeechSourceRef): Promise<VoiceConsoleSpeechStats> {
+    const key = voiceConsoleSpeechSourceKey(ref);
+    const completed = this.completedSources.get(key);
+    if (completed) return Promise.resolve(copyStats(completed));
+    const source = this.sources.get(key);
+    if (!source) return Promise.resolve(emptyStats());
+    if (this.isSourceDrained(key)) return Promise.resolve(copyStats(source.stats));
+    return new Promise((resolve) => source.drainWaiters.push(resolve));
+  }
+
+  snapshot(): VoiceConsoleSpeechSchedulerSnapshot {
+    const bindings: VoiceConsoleSpeechBindingSnapshot[] = [];
+    let queueDepth = 0;
+    for (const binding of this.bindings.values()) {
+      const bindingSources = [...this.sources.values()].filter(
+        (source) => source.ref.bindingId === binding.bindingId
+      );
+      const queuedChunks = bindingSources.reduce((sum, source) => sum + source.pending.length, 0);
+      queueDepth += queuedChunks;
+      bindings.push({
+        bindingId: binding.bindingId,
+        outputEnabled: binding.outputEnabled,
+        generation: binding.generation,
+        profile: { ...binding.profile },
+        queuedChunks,
+        activeSources: bindingSources.length,
+        stats: copyStats(binding.stats),
+      });
+    }
+    return {
+      consoleId: this.consoleId,
+      currentSource: this.currentWork
+        ? { ...this.sources.get(this.currentWork.sourceKey)!.ref }
+        : null,
+      queueDepth,
+      bindings,
+      destroyed: this.destroyed,
+    };
+  }
+
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    const work = this.currentWork;
+    if (work) {
+      work.controller.abort();
+      if (!work.settled) {
+        this.settle(work, { kind: "dropped" });
+        work.settled = true;
+      }
+    }
+    this.currentWork = undefined;
+    for (const [key, source] of this.sources) {
+      source.cancelled = true;
+      source.finished = true;
+      this.dropPending(source);
+      this.completeSource(key, source);
+    }
+    this.sources.clear();
+    this.sourceOrder = [];
+    this.playback.destroy();
+    for (const binding of this.bindings.values()) this.resolveBindingWaiters(binding);
+  }
+
+  private nextChunk(
+    source: SourceState,
+    text: string,
+    generation: number
+  ): VoiceConsoleSpeechChunk {
+    const chunk: VoiceConsoleSpeechChunk = {
+      ...source.ref,
+      ordinal: source.lastOrdinal + 1,
+      text: text.trim(),
+      generation,
+    };
+    this.validateChunkOrder(source, chunk);
+    return chunk;
+  }
+
+  private enqueueChunkInternal(
+    source: SourceState,
+    binding: BindingState,
+    chunk: VoiceConsoleSpeechChunk
+  ): VoiceConsoleChunkDisposition {
+    if (
+      this.destroyed ||
+      source.cancelled ||
+      source.finished ||
+      !binding.outputEnabled ||
+      chunk.generation !== binding.generation ||
+      !chunk.text
+    ) {
+      this.recordSettlement(source, binding, "dropped", 0);
+      return "dropped";
+    }
+    source.pending.push(chunk);
+    source.stats.accepted += 1;
+    binding.stats.accepted += 1;
+    this.kick();
+    return "accepted";
+  }
+
+  private validateChunkOrder(source: SourceState, chunk: VoiceConsoleSpeechChunk): void {
+    if (
+      chunk.bindingId !== source.ref.bindingId ||
+      chunk.turnId !== source.ref.turnId ||
+      chunk.consoleId !== source.ref.consoleId
+    ) {
+      throw new Error("Voice Console speech chunk does not match its source");
+    }
+    if (!Number.isSafeInteger(chunk.ordinal) || chunk.ordinal <= source.lastOrdinal) {
+      throw new Error("Voice Console speech ordinals must increase within a source");
+    }
+    source.lastOrdinal = chunk.ordinal;
+  }
+
+  private kick(): void {
+    if (this.destroyed || this.running) return;
+    this.running = true;
+    queueMicrotask(() => {
+      void this.run().finally(() => {
+        this.running = false;
+        if (!this.destroyed && this.hasReadySource()) this.kick();
+      });
+    });
+  }
+
+  private async run(): Promise<void> {
+    while (!this.destroyed) {
+      const selected = this.selectSource();
+      if (!selected) return;
+      const [sourceKey, source] = selected;
+      const chunk = source.pending.shift();
+      if (!chunk) continue;
+      const work: CurrentWork = {
+        sourceKey,
+        chunk,
+        controller: new AbortController(),
+        phase: "synthesis",
+        settled: false,
+      };
+      this.currentWork = work;
+      const outcome = await this.process(work);
+      if (!work.settled) {
+        this.settle(work, outcome);
+        work.settled = true;
+      }
+      if (this.currentWork === work) this.currentWork = undefined;
+      this.cleanupSourceIfDrained(sourceKey);
+      this.notifyBindingDrain(chunk.bindingId);
+    }
+  }
+
+  private async process(work: CurrentWork): Promise<WorkOutcome> {
+    const source = this.sources.get(work.sourceKey);
+    const binding = this.bindings.get(work.chunk.bindingId);
+    if (!source || !binding || !this.isWorkValid(work, source, binding)) {
+      return { kind: "dropped" };
+    }
+
+    try {
+      const synthesis = abortable(
+        Promise.resolve(
+          this.synthesize({
+            chunk: work.chunk,
+            profile: { ...binding.profile },
+            signal: work.controller.signal,
+          })
+        ),
+        work.controller.signal
+      );
+      const synthesized = await synthesis;
+      if (synthesized.aborted) return { kind: "dropped" };
+      if (!synthesized.value.ok) {
+        return { kind: "failed", phase: "synthesis", error: synthesized.value.error };
+      }
+      if (!this.isWorkValid(work, source, binding)) return { kind: "dropped" };
+
+      work.phase = "playback";
+      const played = await this.playback.play({
+        chunk: work.chunk,
+        audio: synthesized.value.audio,
+        signal: work.controller.signal,
+      });
+      if (
+        played.status === "cancelled" ||
+        !this.isWorkValid(work, source, binding)
+      ) {
+        return { kind: "dropped" };
+      }
+      return { kind: "played", durationMs: nonNegativeDuration(played) };
+    } catch (error) {
+      if (work.controller.signal.aborted) return { kind: "dropped" };
+      return {
+        kind: "failed",
+        phase: work.phase,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private settle(work: CurrentWork, outcome: WorkOutcome): void {
+    const source = this.sources.get(work.sourceKey);
+    const binding = this.bindings.get(work.chunk.bindingId);
+    if (!source || !binding) return;
+    if (outcome.kind === "played") {
+      this.recordSettlement(source, binding, "played", outcome.durationMs);
+      this.recordFairness(work.sourceKey, outcome.durationMs);
+      return;
+    }
+    if (outcome.kind === "failed") {
+      this.recordSettlement(source, binding, "failed", 0);
+      this.recordFairness(work.sourceKey, 0);
+      if (!source.warned) {
+        source.warned = true;
+        this.onFailure({
+          source: { ...source.ref },
+          ordinal: work.chunk.ordinal,
+          phase: outcome.phase,
+          error: outcome.error,
+        });
+      }
+      return;
+    }
+    this.recordSettlement(source, binding, "dropped", 0);
+  }
+
+  private recordSettlement(
+    source: SourceState,
+    binding: BindingState,
+    kind: "played" | "failed" | "dropped",
+    durationMs: number
+  ): void {
+    source.stats[kind] += 1;
+    binding.stats[kind] += 1;
+    if (kind === "played") {
+      source.stats.playedAudioMs += durationMs;
+      binding.stats.playedAudioMs += durationMs;
+    }
+  }
+
+  private recordFairness(sourceKey: string, durationMs: number): void {
+    if (this.sliceSourceKey !== sourceKey) {
+      this.sliceSourceKey = sourceKey;
+      this.sliceChunks = 0;
+      this.sliceAudioMs = 0;
+    }
+    this.sliceChunks += 1;
+    this.sliceAudioMs += durationMs;
+  }
+
+  private selectSource(): [string, SourceState] | undefined {
+    const ready = this.sourceOrder.filter((key) => this.isSourceReady(key));
+    if (ready.length === 0) {
+      this.sliceSourceKey = undefined;
+      this.sliceChunks = 0;
+      this.sliceAudioMs = 0;
+      return undefined;
+    }
+
+    const currentReady = this.sliceSourceKey
+      ? ready.includes(this.sliceSourceKey)
+      : false;
+    let selectedKey: string;
+    if (currentReady) {
+      const anotherReady = ready.some((key) => key !== this.sliceSourceKey);
+      const quotaReached =
+        this.sliceChunks >= this.maxChunksPerSlice ||
+        this.sliceAudioMs >= this.maxAudioMsPerSlice;
+      selectedKey = anotherReady && quotaReached
+        ? this.nextReadyAfter(this.sliceSourceKey!, ready)
+        : this.sliceSourceKey!;
+    } else {
+      selectedKey = this.nextReadyAfter(this.sliceSourceKey, ready);
+    }
+
+    if (selectedKey !== this.sliceSourceKey) {
+      this.sliceSourceKey = selectedKey;
+      this.sliceChunks = 0;
+      this.sliceAudioMs = 0;
+    }
+    const source = this.sources.get(selectedKey);
+    return source ? [selectedKey, source] : undefined;
+  }
+
+  private nextReadyAfter(current: string | undefined, ready: string[]): string {
+    if (!current) return ready[0]!;
+    const start = this.sourceOrder.indexOf(current);
+    for (let offset = 1; offset <= this.sourceOrder.length; offset++) {
+      const index = (Math.max(start, -1) + offset) % this.sourceOrder.length;
+      const key = this.sourceOrder[index];
+      if (key && ready.includes(key)) return key;
+    }
+    return ready[0]!;
+  }
+
+  private hasReadySource(): boolean {
+    return this.sourceOrder.some((key) => this.isSourceReady(key));
+  }
+
+  private isSourceReady(key: string): boolean {
+    const source = this.sources.get(key);
+    if (!source || source.pending.length === 0 || source.cancelled) return false;
+    const binding = this.bindings.get(source.ref.bindingId);
+    return Boolean(binding?.outputEnabled);
+  }
+
+  private isWorkValid(
+    work: CurrentWork,
+    source: SourceState,
+    binding: BindingState
+  ): boolean {
+    return (
+      !this.destroyed &&
+      !work.controller.signal.aborted &&
+      !source.cancelled &&
+      binding.outputEnabled &&
+      binding.generation === work.chunk.generation
+    );
+  }
+
+  private dropPending(source: SourceState): void {
+    const binding = this.bindings.get(source.ref.bindingId);
+    if (!binding) {
+      source.pending = [];
+      return;
+    }
+    const dropped = source.pending.splice(0, source.pending.length).length;
+    source.stats.dropped += dropped;
+    binding.stats.dropped += dropped;
+  }
+
+  private cleanupSourceIfDrained(key: string): void {
+    const source = this.sources.get(key);
+    if (!source || !this.isSourceDrained(key)) return;
+    this.completeSource(key, source);
+    this.sources.delete(key);
+    this.sourceOrder = this.sourceOrder.filter((candidate) => candidate !== key);
+  }
+
+  private completeSource(key: string, source: SourceState): void {
+    const stats = copyStats(source.stats);
+    this.completedSources.set(key, stats);
+    const waiters = source.drainWaiters.splice(0, source.drainWaiters.length);
+    for (const resolve of waiters) resolve(copyStats(stats));
+  }
+
+  private isSourceDrained(key: string): boolean {
+    const source = this.sources.get(key);
+    if (!source || (!source.finished && !source.cancelled)) return false;
+    return source.pending.length === 0 && this.currentWork?.sourceKey !== key;
+  }
+
+  private isBindingDrained(bindingId: string): boolean {
+    if (this.destroyed) return true;
+    for (const [key, source] of this.sources) {
+      if (source.ref.bindingId !== bindingId) continue;
+      if (!this.isSourceDrained(key)) return false;
+    }
+    return this.currentBindingId() !== bindingId;
+  }
+
+  private notifyBindingDrain(bindingId: string): void {
+    const binding = this.bindings.get(bindingId);
+    if (binding && this.isBindingDrained(bindingId)) this.resolveBindingWaiters(binding);
+  }
+
+  private resolveBindingWaiters(binding: BindingState): void {
+    const stats = copyStats(binding.stats);
+    const waiters = binding.drainWaiters.splice(0, binding.drainWaiters.length);
+    for (const resolve of waiters) resolve(copyStats(stats));
+  }
+
+  private currentBindingId(): string | undefined {
+    return this.currentWork?.chunk.bindingId;
+  }
+
+  private source(ref: VoiceConsoleSpeechSourceRef): SourceState {
+    this.assertConsole(ref.consoleId);
+    const source = this.sources.get(voiceConsoleSpeechSourceKey(ref));
+    if (!source) throw new Error(`Voice Console speech source is not registered: ${ref.turnId}`);
+    return source;
+  }
+
+  private binding(bindingId: string): BindingState {
+    const binding = this.bindings.get(bindingId);
+    if (!binding) throw new Error(`Voice Console speech binding is not registered: ${bindingId}`);
+    return binding;
+  }
+
+  private assertConsole(consoleId: string): void {
+    if (consoleId !== this.consoleId) {
+      throw new Error("Voice Console speech source belongs to a different console");
+    }
+  }
+
+  private assertLive(): void {
+    if (this.destroyed) throw new Error("Voice Console speech scheduler has ended");
+  }
+}
+
+export function voiceConsoleSpeechSourceKey(ref: VoiceConsoleSpeechSourceRef): string {
+  return `${ref.bindingId}\u0000${ref.turnId}`;
+}
+
+function emptyStats(): VoiceConsoleSpeechStats {
+  return { accepted: 0, played: 0, failed: 0, dropped: 0, playedAudioMs: 0 };
+}
+
+function copyStats(stats: VoiceConsoleSpeechStats): VoiceConsoleSpeechStats {
+  return { ...stats };
+}
+
+function normalizeProfile(profile: VoiceConsoleSpeechProfile): VoiceConsoleSpeechProfile {
+  const voice = profile.voice.trim();
+  if (!voice) throw new Error("Voice Console speech profile requires a voice");
+  return { voice, pace: profile.pace, style: profile.style };
+}
+
+function positiveInteger(value: number | undefined, fallback: number): number {
+  return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value! : fallback;
+}
+
+function nonNegativeDuration(result: VoiceConsolePlaybackResult): number {
+  return Number.isFinite(result.durationMs) && result.durationMs > 0
+    ? Math.round(result.durationMs)
+    : 0;
+}
+
+async function abortable<T>(
+  promise: Promise<T>,
+  signal: AbortSignal
+): Promise<{ aborted: true } | { aborted: false; value: T }> {
+  if (signal.aborted) return { aborted: true };
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve({ aborted: true });
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve({ aborted: false, value });
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}

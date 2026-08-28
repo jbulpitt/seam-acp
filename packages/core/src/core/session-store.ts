@@ -39,6 +39,7 @@ import type { LiveHelpSession, LiveHelpStatus } from "./live-help/types.js";
 import {
   composeThreadVoicePrompt,
   newThreadVoiceDispatchId,
+  newThreadVoiceSegmentId,
   type ThreadVoiceBatch,
   type ThreadVoicePendingStats,
   type ThreadVoiceSegment,
@@ -46,6 +47,30 @@ import {
   type ThreadVoiceSession,
   type ThreadVoiceSessionStatus,
 } from "./thread-voice/types.js";
+import {
+  composeVoiceConsolePrompt,
+  assertVoiceConsoleAuthorityId,
+  newVoiceConsoleCaptureId,
+  newVoiceConsoleFanoutGroupId,
+  newVoiceConsoleId,
+  normalizeVoiceConsoleAlias,
+  sanitizeVoiceConsoleSpeakerName,
+  type AddVoiceConsoleBindingInput,
+  type CreateVoiceConsoleInput,
+  type ThreadVoiceBinding,
+  type VoiceConsoleBatch,
+  type VoiceConsoleBindingStatus,
+  type VoiceConsoleCaptureSnapshot,
+  type VoiceConsoleFinalCapture,
+  type VoiceConsoleInputTarget,
+  type VoiceConsoleMutationFailure,
+  type VoiceConsoleMutationOutcome,
+  type VoiceConsoleMutationResult,
+  type VoiceConsoleSegment,
+  type VoiceConsoleSession,
+  type VoiceConsoleStatus,
+  type VoiceConsoleUpgradeDefaults,
+} from "./voice-console/types.js";
 import { INBOX_MAX_PER_SESSION, type InboxMessage } from "./inbox/types.js";
 import type { ParkedAttachment, ParkedPrompt } from "./parked-prompts/types.js";
 
@@ -290,6 +315,8 @@ export class SessionStore {
     this.migrateIngestEndpointPreset();
     this.db.exec(LIVE_HELP_SCHEMA);
     this.db.exec(THREAD_VOICE_SCHEMA);
+    this.db.exec(VOICE_CONSOLE_SCHEMA);
+    this.migrateVoiceConsoleV2();
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -306,6 +333,57 @@ export class SessionStore {
     this.migratePresetStatusCardStyle();
     this.migratePresetsScope();
     this.migratePresetThreadSlug();
+  }
+
+  /** Additive V2 migration over the shipped V1 compatibility tables. */
+  private migrateVoiceConsoleV2(): void {
+    for (const ddl of [
+      "ALTER TABLE thread_voice_sessions ADD COLUMN console_id TEXT",
+      "ALTER TABLE thread_voice_sessions ADD COLUMN alias TEXT",
+      "ALTER TABLE thread_voice_sessions ADD COLUMN alias_normalized TEXT",
+      "ALTER TABLE thread_voice_sessions ADD COLUMN tts_voice TEXT",
+      "ALTER TABLE thread_voice_sessions ADD COLUMN tts_pace TEXT",
+      "ALTER TABLE thread_voice_sessions ADD COLUMN tts_style TEXT",
+      "ALTER TABLE thread_voice_sessions ADD COLUMN profile_updated_utc TEXT",
+      "ALTER TABLE thread_voice_sessions ADD COLUMN output_enabled INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE thread_voice_sessions ADD COLUMN output_generation INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE thread_voice_segments ADD COLUMN capture_id TEXT",
+      "ALTER TABLE thread_voice_segments ADD COLUMN fanout_group_id TEXT",
+      "ALTER TABLE thread_voice_segments ADD COLUMN author_name TEXT",
+    ]) {
+      try {
+        this.db.exec(ddl);
+      } catch {
+        /* column already exists */
+      }
+    }
+    // V1 owned the guild exclusivity on its binding row. V2 moves it to the
+    // console row while retaining a unique active home-thread binding.
+    this.db.exec("DROP INDEX IF EXISTS idx_thread_voice_active_guild");
+    this.db.exec("DROP INDEX IF EXISTS idx_thread_voice_active_thread");
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_voice_active_thread
+        ON thread_voice_sessions(platform, channel_ref)
+        WHERE status IN ('starting','ready','stopping','adding','active','removing');
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_voice_active_v1_guild
+        ON thread_voice_sessions(guild_id)
+        WHERE console_id IS NULL AND status IN ('starting','ready','stopping');
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_console_active_guild
+        ON voice_console_sessions(guild_id)
+        WHERE status IN ('starting','ready','stopping');
+      CREATE INDEX IF NOT EXISTS idx_voice_console_active_owner
+        ON voice_console_sessions(guild_id, owner_user_id, status);
+      CREATE INDEX IF NOT EXISTS idx_voice_console_active_vc
+        ON voice_console_sessions(voice_channel_id, status);
+      CREATE INDEX IF NOT EXISTS idx_thread_voice_active_console
+        ON thread_voice_sessions(console_id, status);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_voice_active_alias
+        ON thread_voice_sessions(console_id, alias_normalized)
+        WHERE console_id IS NOT NULL
+          AND status IN ('adding','active','removing');
+      CREATE INDEX IF NOT EXISTS idx_thread_voice_segments_capture
+        ON thread_voice_segments(capture_id);
+    `);
   }
 
   /** Additive thread_slug on presets for auto-numbered thread names. */
@@ -1895,6 +1973,1019 @@ export class SessionStore {
     return info.changes;
   }
 
+  // --- Voice Console V2 --------------------------------------------------
+
+  createVoiceConsole(input: CreateVoiceConsoleInput): VoiceConsoleMutationResult {
+    const create = this.db.transaction((): VoiceConsoleMutationResult => {
+      const { console, binding } = input;
+      if (binding.consoleId !== console.id) {
+        throw new Error("Voice Console binding does not belong to the console.");
+      }
+      if (console.cardChannelId !== console.voiceChannelId) {
+        throw new Error("Voice Console card channel must equal its voice channel.");
+      }
+      if (binding.guildId !== console.guildId || binding.voiceChannelId !== console.voiceChannelId) {
+        throw new Error("Voice Console binding guild/voice channel does not match its console.");
+      }
+      const normalized = normalizeBinding(binding);
+      this.insertVoiceConsoleRow(console);
+      this.insertVoiceConsoleBindingRow(normalized);
+      if (input.selectBinding !== false) {
+        this.db
+          .prepare(
+            `INSERT INTO voice_console_input_targets
+               (console_id, binding_id, ordinal, selected_utc)
+             VALUES (?, ?, 0, ?)`
+          )
+          .run(console.id, binding.id, console.createdUtc);
+      }
+      return this.requireVoiceConsoleMutationResult(console.id, true, false);
+    });
+    return create();
+  }
+
+  getVoiceConsole(id: string): VoiceConsoleSession | null {
+    const row = this.db
+      .prepare<[string], VoiceConsoleRow>("SELECT * FROM voice_console_sessions WHERE id = ?")
+      .get(id);
+    return row ? mapVoiceConsole(row) : null;
+  }
+
+  getActiveVoiceConsoleForGuild(guildId: string): VoiceConsoleSession | null {
+    const row = this.db
+      .prepare<[string], VoiceConsoleRow>(
+        `SELECT * FROM voice_console_sessions
+          WHERE guild_id = ? AND status IN ('starting','ready','stopping')
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(guildId);
+    return row ? mapVoiceConsole(row) : null;
+  }
+
+  getActiveVoiceConsoleForOwner(guildId: string, ownerUserId: string): VoiceConsoleSession | null {
+    const row = this.db
+      .prepare<[string, string], VoiceConsoleRow>(
+        `SELECT * FROM voice_console_sessions
+          WHERE guild_id = ? AND owner_user_id = ?
+            AND status IN ('starting','ready','stopping')
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(guildId, ownerUserId);
+    return row ? mapVoiceConsole(row) : null;
+  }
+
+  getActiveVoiceConsoleForVoiceChannel(voiceChannelId: string): VoiceConsoleSession | null {
+    const row = this.db
+      .prepare<[string], VoiceConsoleRow>(
+        `SELECT * FROM voice_console_sessions
+          WHERE voice_channel_id = ? AND status IN ('starting','ready','stopping')
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(voiceChannelId);
+    return row ? mapVoiceConsole(row) : null;
+  }
+
+  listActiveVoiceConsoles(): VoiceConsoleSession[] {
+    return this.db
+      .prepare<[], VoiceConsoleRow>(
+        `SELECT * FROM voice_console_sessions
+          WHERE status IN ('starting','ready','stopping') ORDER BY created_utc ASC`
+      )
+      .all()
+      .map(mapVoiceConsole);
+  }
+
+  getVoiceConsoleBinding(id: string): ThreadVoiceBinding | null {
+    const row = this.db
+      .prepare<[string], VoiceConsoleBindingRow>(
+        "SELECT * FROM thread_voice_sessions WHERE id = ? AND console_id IS NOT NULL"
+      )
+      .get(id);
+    return row ? mapVoiceConsoleBinding(row) : null;
+  }
+
+  getActiveVoiceConsoleBindingForThread(
+    platform: string,
+    channelRef: string
+  ): ThreadVoiceBinding | null {
+    const row = this.db
+      .prepare<[string, string], VoiceConsoleBindingRow>(
+        `SELECT * FROM thread_voice_sessions
+          WHERE platform = ? AND channel_ref = ? AND console_id IS NOT NULL
+            AND status IN ('adding','active','removing')
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(platform, channelRef);
+    return row ? mapVoiceConsoleBinding(row) : null;
+  }
+
+  listVoiceConsoleBindings(
+    consoleId: string,
+    opts: { includeTerminal?: boolean } = {}
+  ): ThreadVoiceBinding[] {
+    const sql = opts.includeTerminal
+      ? `SELECT * FROM thread_voice_sessions WHERE console_id = ? ORDER BY created_utc ASC, id ASC`
+      : `SELECT * FROM thread_voice_sessions WHERE console_id = ?
+           AND status IN ('adding','active','removing') ORDER BY created_utc ASC, id ASC`;
+    return this.db
+      .prepare<[string], VoiceConsoleBindingRow>(sql)
+      .all(consoleId)
+      .map(mapVoiceConsoleBinding);
+  }
+
+  listVoiceConsoleInputTargets(consoleId: string): VoiceConsoleInputTarget[] {
+    return this.db
+      .prepare<[string], VoiceConsoleInputTargetRow>(
+        `SELECT * FROM voice_console_input_targets
+          WHERE console_id = ? ORDER BY ordinal ASC`
+      )
+      .all(consoleId)
+      .map(mapVoiceConsoleInputTarget);
+  }
+
+  addVoiceConsoleBinding(input: AddVoiceConsoleBindingInput): VoiceConsoleMutationOutcome {
+    const add = this.db.transaction((): VoiceConsoleMutationOutcome => {
+      const duplicate = this.getVoiceConsoleMutation(input.binding.consoleId, input.interactionId);
+      if (duplicate) {
+        return { ok: true, value: this.requireVoiceConsoleMutationResult(input.binding.consoleId, false, true) };
+      }
+      const console = this.getVoiceConsole(input.binding.consoleId);
+      if (!console) return mutationFailure("not-found", "Voice Console does not exist.");
+      if (!isActiveConsole(console)) return mutationFailure("inactive", "Voice Console is not active.");
+      if (console.revision !== input.expectedRevision) return staleConsoleFailure();
+      if (this.listVoiceConsoleBindings(console.id).length >= 10) {
+        return mutationFailure("binding-limit", "Voice Console already has ten active bindings.");
+      }
+      const binding = normalizeBinding(input.binding);
+      if (binding.guildId !== console.guildId || binding.voiceChannelId !== console.voiceChannelId) {
+        return mutationFailure("inactive", "Binding guild/voice channel does not match its console.");
+      }
+      if (this.getActiveVoiceConsoleBindingForThread(binding.platform, binding.channelRef)) {
+        return mutationFailure("duplicate-thread", "That thread already has an active binding.");
+      }
+      const alias = this.db
+        .prepare<[string, string], { id: string }>(
+          `SELECT id FROM thread_voice_sessions WHERE console_id = ? AND alias_normalized = ?
+            AND status IN ('adding','active','removing') LIMIT 1`
+        )
+        .get(console.id, binding.aliasNormalized);
+      if (alias) return mutationFailure("duplicate-alias", "That alias is already in use.");
+      this.insertVoiceConsoleBindingRow(binding);
+      if (input.claim !== false) {
+        const current = this.listVoiceConsoleInputTargets(console.id).map((target) => target.bindingId);
+        const next = console.fanoutArmed ? [...current, binding.id] : [binding.id];
+        if (next.length > 5) {
+          throw new Error("Voice Console fan-out target limit is five.");
+        }
+        this.replaceVoiceConsoleTargetsRows(console.id, next, binding.updatedUtc);
+      }
+      this.bumpVoiceConsoleRevision(console.id, binding.updatedUtc);
+      this.recordVoiceConsoleMutation(console.id, input.interactionId, binding.updatedUtc);
+      return { ok: true, value: this.requireVoiceConsoleMutationResult(console.id, true, false) };
+    });
+    try {
+      return add();
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code?.startsWith("SQLITE_CONSTRAINT")) {
+        return mutationFailure("duplicate-thread", "Binding conflicts with active console state.");
+      }
+      throw err;
+    }
+  }
+
+  replaceVoiceConsoleInputTargets(
+    consoleId: string,
+    input: {
+      bindingIds: readonly string[];
+      fanoutArmed: boolean;
+      expectedRevision: number;
+      interactionId?: string;
+      updatedUtc?: string;
+    }
+  ): VoiceConsoleMutationOutcome {
+    const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId)) {
+        return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
+      }
+      const console = this.getVoiceConsole(consoleId);
+      if (!console) return mutationFailure("not-found", "Voice Console does not exist.");
+      if (!isActiveConsole(console)) return mutationFailure("inactive", "Voice Console is not active.");
+      if (console.revision !== input.expectedRevision) return staleConsoleFailure();
+      const ids = [...new Set(input.bindingIds)];
+      if (ids.length !== input.bindingIds.length || ids.length > 5 || (!input.fanoutArmed && ids.length > 1)) {
+        return mutationFailure("invalid-targets", "Invalid Voice Console input target selection.");
+      }
+      if (!this.areActiveBindingsOwnedByConsole(consoleId, ids)) {
+        return mutationFailure("invalid-targets", "Every input target must be an active binding in this console.");
+      }
+      const now = input.updatedUtc ?? new Date().toISOString();
+      this.replaceVoiceConsoleTargetsRows(consoleId, ids, now);
+      this.db
+        .prepare(
+          `UPDATE voice_console_sessions
+              SET fanout_armed = ?, revision = revision + 1, updated_utc = ? WHERE id = ?`
+        )
+        .run(input.fanoutArmed ? 1 : 0, now, consoleId);
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now);
+      return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
+    });
+    return mutate();
+  }
+
+  setVoiceConsoleOutputBindings(
+    consoleId: string,
+    input: {
+      enabledBindingIds: readonly string[];
+      expectedRevision: number;
+      interactionId?: string;
+      updatedUtc?: string;
+    }
+  ): VoiceConsoleMutationOutcome {
+    const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId)) {
+        return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
+      }
+      const console = this.getVoiceConsole(consoleId);
+      if (!console) return mutationFailure("not-found", "Voice Console does not exist.");
+      if (!isActiveConsole(console)) return mutationFailure("inactive", "Voice Console is not active.");
+      if (console.revision !== input.expectedRevision) return staleConsoleFailure();
+      const enabled = [...new Set(input.enabledBindingIds)];
+      if (enabled.length !== input.enabledBindingIds.length || !this.areActiveBindingsOwnedByConsole(consoleId, enabled)) {
+        return mutationFailure("invalid-targets", "Every output target must be an active binding in this console.");
+      }
+      const now = input.updatedUtc ?? new Date().toISOString();
+      const enabledSet = new Set(enabled);
+      for (const binding of this.listVoiceConsoleBindings(consoleId)) {
+        const next = enabledSet.has(binding.id);
+        if (next === binding.outputEnabled) continue;
+        this.db
+          .prepare(
+            `UPDATE thread_voice_sessions SET output_enabled = ?,
+               output_generation = output_generation + 1, updated_utc = ? WHERE id = ?`
+          )
+          .run(next ? 1 : 0, now, binding.id);
+      }
+      this.bumpVoiceConsoleRevision(consoleId, now);
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now);
+      return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
+    });
+    return mutate();
+  }
+
+  updateVoiceConsoleBinding(
+    bindingId: string,
+    input: {
+      expectedRevision: number;
+      alias?: string;
+      ttsVoice?: string;
+      ttsPace?: string | null;
+      ttsStyle?: string | null;
+      noticeMessageId?: string | null;
+      interactionId?: string;
+      updatedUtc?: string;
+    }
+  ): VoiceConsoleMutationOutcome {
+    const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
+      const binding = this.getVoiceConsoleBinding(bindingId);
+      if (!binding) return mutationFailure("not-found", "Voice Console binding does not exist.");
+      if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId)) {
+        return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, false, true) };
+      }
+      const console = this.getVoiceConsole(binding.consoleId);
+      if (!console || !isActiveConsole(console)) return mutationFailure("inactive", "Voice Console is not active.");
+      if (console.revision !== input.expectedRevision) return staleConsoleFailure();
+      const alias = input.alias === undefined ? binding.alias : validateVoiceConsoleAlias(input.alias);
+      const aliasNormalized = normalizeVoiceConsoleAlias(alias);
+      const collision = this.db
+        .prepare<[string, string, string], { id: string }>(
+          `SELECT id FROM thread_voice_sessions WHERE console_id = ? AND alias_normalized = ?
+             AND id <> ? AND status IN ('adding','active','removing') LIMIT 1`
+        )
+        .get(binding.consoleId, aliasNormalized, bindingId);
+      if (collision) return mutationFailure("duplicate-alias", "That alias is already in use.");
+      const now = input.updatedUtc ?? new Date().toISOString();
+      const profileChanged = input.ttsVoice !== undefined || input.ttsPace !== undefined || input.ttsStyle !== undefined;
+      this.db
+        .prepare(
+          `UPDATE thread_voice_sessions SET alias = ?, alias_normalized = ?, tts_voice = ?,
+             tts_pace = ?, tts_style = ?, profile_updated_utc = ?, notice_message_id = ?, updated_utc = ?
+           WHERE id = ?`
+        )
+        .run(
+          alias,
+          aliasNormalized,
+          input.ttsVoice ?? binding.ttsVoice,
+          input.ttsPace === undefined ? binding.ttsPace : input.ttsPace,
+          input.ttsStyle === undefined ? binding.ttsStyle : input.ttsStyle,
+          profileChanged ? now : binding.profileUpdatedUtc,
+          input.noticeMessageId === undefined ? binding.noticeMessageId : input.noticeMessageId,
+          now,
+          bindingId
+        );
+      this.bumpVoiceConsoleRevision(binding.consoleId, now);
+      this.recordVoiceConsoleMutation(binding.consoleId, input.interactionId, now);
+      return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, true, false) };
+    });
+    return mutate();
+  }
+
+  updateVoiceConsoleCard(
+    consoleId: string,
+    input: {
+      expectedRevision: number;
+      cardMessageId?: string | null;
+      cardPage?: number;
+      interactionId?: string;
+      updatedUtc?: string;
+    }
+  ): VoiceConsoleMutationOutcome {
+    const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId)) {
+        return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
+      }
+      const console = this.getVoiceConsole(consoleId);
+      if (!console) return mutationFailure("not-found", "Voice Console does not exist.");
+      if (console.revision !== input.expectedRevision) return staleConsoleFailure();
+      const now = input.updatedUtc ?? new Date().toISOString();
+      this.db
+        .prepare(
+          `UPDATE voice_console_sessions SET card_message_id = ?, card_page = ?,
+             revision = revision + 1, updated_utc = ? WHERE id = ?`
+        )
+        .run(
+          input.cardMessageId === undefined ? console.cardMessageId : input.cardMessageId,
+          Math.max(0, Math.trunc(input.cardPage ?? console.cardPage)),
+          now,
+          consoleId
+        );
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now);
+      return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
+    });
+    return mutate();
+  }
+
+  markVoiceConsoleReady(
+    consoleId: string,
+    updatedUtc = new Date().toISOString()
+  ): VoiceConsoleSession | null {
+    const ready = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE thread_voice_sessions SET status = 'active', updated_utc = ?
+            WHERE console_id = ? AND status = 'adding'`
+        )
+        .run(updatedUtc, consoleId);
+      this.db
+        .prepare(
+          `UPDATE voice_console_sessions SET status = 'ready', revision = revision + 1,
+             updated_utc = ?, ended_utc = NULL, end_reason = NULL
+           WHERE id = ? AND status = 'starting'`
+        )
+        .run(updatedUtc, consoleId);
+      return this.getVoiceConsole(consoleId);
+    });
+    return ready();
+  }
+
+  beginVoiceConsoleBindingRemoval(
+    bindingId: string,
+    input: { expectedRevision: number; interactionId?: string; reason: string; updatedUtc?: string }
+  ): VoiceConsoleMutationOutcome {
+    const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
+      const binding = this.getVoiceConsoleBinding(bindingId);
+      if (!binding) return mutationFailure("not-found", "Voice Console binding does not exist.");
+      if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId)) {
+        return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, false, true) };
+      }
+      const console = this.getVoiceConsole(binding.consoleId);
+      if (!console || !isActiveConsole(console)) return mutationFailure("inactive", "Voice Console is not active.");
+      if (console.revision !== input.expectedRevision) return staleConsoleFailure();
+      const now = input.updatedUtc ?? new Date().toISOString();
+      this.db.prepare("DELETE FROM voice_console_input_targets WHERE binding_id = ?").run(bindingId);
+      this.db
+        .prepare(
+          `UPDATE thread_voice_segments SET state = 'capture_dropped', transcript = '',
+             captured_ended_utc = ?, updated_utc = ?, error = ?
+           WHERE session_id = ? AND state IN ('capturing','finalizing')`
+        )
+        .run(now, now, "binding removed before capture final", bindingId);
+      this.db
+        .prepare(
+          `UPDATE thread_voice_sessions SET status = 'removing', updated_utc = ?, end_reason = ?
+            WHERE id = ? AND status IN ('adding','active')`
+        )
+        .run(now, input.reason, bindingId);
+      this.bumpVoiceConsoleRevision(binding.consoleId, now);
+      this.recordVoiceConsoleMutation(binding.consoleId, input.interactionId, now);
+      return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, true, false) };
+    });
+    return mutate();
+  }
+
+  finishVoiceConsoleBindingRemoval(
+    bindingId: string,
+    status: "ended" | "failed",
+    reason: string,
+    endedUtc = new Date().toISOString()
+  ): ThreadVoiceBinding | null {
+    this.db
+      .prepare(
+        `UPDATE thread_voice_sessions SET status = ?, updated_utc = ?, ended_utc = ?, end_reason = ?
+          WHERE id = ? AND console_id IS NOT NULL AND status IN ('adding','active','removing')`
+      )
+      .run(status, endedUtc, endedUtc, reason, bindingId);
+    return this.getVoiceConsoleBinding(bindingId);
+  }
+
+  beginVoiceConsoleStop(
+    consoleId: string,
+    input: { expectedRevision?: number; interactionId?: string; reason: string; updatedUtc?: string }
+  ): VoiceConsoleMutationOutcome {
+    const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId)) {
+        return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
+      }
+      const console = this.getVoiceConsole(consoleId);
+      if (!console) return mutationFailure("not-found", "Voice Console does not exist.");
+      if (!isActiveConsole(console)) return mutationFailure("inactive", "Voice Console is not active.");
+      if (input.expectedRevision !== undefined && console.revision !== input.expectedRevision) {
+        return staleConsoleFailure();
+      }
+      const now = input.updatedUtc ?? new Date().toISOString();
+      this.db.prepare("DELETE FROM voice_console_input_targets WHERE console_id = ?").run(consoleId);
+      this.db
+        .prepare(
+          `UPDATE thread_voice_segments SET state = 'capture_dropped', transcript = '',
+             captured_ended_utc = ?, updated_utc = ?, error = ?
+           WHERE session_id IN (SELECT id FROM thread_voice_sessions WHERE console_id = ?)
+             AND state IN ('capturing','finalizing')`
+        )
+        .run(now, now, "console stopped before capture final", consoleId);
+      this.db
+        .prepare(
+          `UPDATE thread_voice_sessions SET status = 'removing', updated_utc = ?, end_reason = ?
+            WHERE console_id = ? AND status IN ('adding','active')`
+        )
+        .run(now, input.reason, consoleId);
+      this.db
+        .prepare(
+          `UPDATE voice_console_sessions SET status = 'stopping', revision = revision + 1,
+             updated_utc = ?, end_reason = ? WHERE id = ?`
+        )
+        .run(now, input.reason, consoleId);
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now);
+      return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
+    });
+    return mutate();
+  }
+
+  finishVoiceConsoleStop(
+    consoleId: string,
+    status: "ended" | "failed",
+    reason: string,
+    endedUtc = new Date().toISOString()
+  ): VoiceConsoleSession | null {
+    const finish = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE thread_voice_sessions SET status = ?, updated_utc = ?, ended_utc = ?, end_reason = ?
+            WHERE console_id = ? AND status IN ('adding','active','removing')`
+        )
+        .run(status, endedUtc, endedUtc, reason, consoleId);
+      this.db
+        .prepare(
+          `UPDATE voice_console_sessions SET status = ?, updated_utc = ?, ended_utc = ?, end_reason = ?
+            WHERE id = ? AND status IN ('starting','ready','stopping')`
+        )
+        .run(status, endedUtc, endedUtc, reason, consoleId);
+      return this.getVoiceConsole(consoleId);
+    });
+    return finish();
+  }
+
+  allocateVoiceConsoleCapture(input: {
+    consoleId: string;
+    speakerId: string;
+    speakerName: string;
+    capturedStartedUtc?: string;
+    captureId?: string;
+  }): VoiceConsoleCaptureSnapshot | null {
+    const allocate = this.db.transaction((): VoiceConsoleCaptureSnapshot | null => {
+      const console = this.getVoiceConsole(input.consoleId);
+      if (!console || (console.status !== "starting" && console.status !== "ready")) return null;
+      const targets = this.listVoiceConsoleInputTargets(console.id);
+      if (targets.length === 0) return null;
+      const bindings = new Map(this.listVoiceConsoleBindings(console.id).map((row) => [row.id, row]));
+      const selected = targets.map((target) => bindings.get(target.bindingId)).filter(
+        (binding): binding is ThreadVoiceBinding => binding?.status === "active"
+      );
+      if (selected.length !== targets.length) return null;
+      const captureId = input.captureId ?? newVoiceConsoleCaptureId();
+      const fanoutGroupId = selected.length > 1 ? newVoiceConsoleFanoutGroupId() : null;
+      const started = input.capturedStartedUtc ?? new Date().toISOString();
+      const speakerName = sanitizeVoiceConsoleSpeakerName(input.speakerName);
+      const assignments = selected.map((binding) => {
+        const sequence = this.nextThreadVoiceSequence(binding.id);
+        const segmentId = newThreadVoiceSegmentId();
+        this.db
+          .prepare(
+            `INSERT INTO thread_voice_segments
+               (id, session_id, sequence, author_id, author_name, transcript, state, audio_ms,
+                dispatch_id, capture_id, fanout_group_id, captured_started_utc,
+                captured_ended_utc, created_utc, updated_utc, error)
+             VALUES (?, ?, ?, ?, ?, '', 'capturing', 0, NULL, ?, ?, ?, ?, ?, ?, NULL)`
+          )
+          .run(
+            segmentId,
+            binding.id,
+            sequence,
+            input.speakerId,
+            speakerName,
+            captureId,
+            fanoutGroupId,
+            started,
+            started,
+            started,
+            started
+          );
+        return { bindingId: binding.id, sequence, segmentId };
+      });
+      this.db
+        .prepare(
+          `UPDATE voice_console_sessions SET utterance_count = utterance_count + 1,
+             updated_utc = ? WHERE id = ?`
+        )
+        .run(started, console.id);
+      return {
+        captureId,
+        fanoutGroupId,
+        consoleId: console.id,
+        consoleRevision: console.revision,
+        speakerId: input.speakerId,
+        speakerName,
+        capturedStartedUtc: started,
+        assignments,
+      };
+    });
+    return allocate();
+  }
+
+  finalizeVoiceConsoleCapture(final: VoiceConsoleFinalCapture): {
+    consoleId: string | null;
+    committed: VoiceConsoleSegment[];
+    dropped: VoiceConsoleSegment[];
+    failures: Array<{ bindingId: string; error: string }>;
+  } {
+    const rows = this.db
+      .prepare<[string], VoiceConsoleSegmentRow>(
+        `SELECT * FROM thread_voice_segments WHERE capture_id = ? ORDER BY session_id, sequence`
+      )
+      .all(final.captureId);
+    const committed: VoiceConsoleSegment[] = [];
+    const dropped: VoiceConsoleSegment[] = [];
+    const failures: Array<{ bindingId: string; error: string }> = [];
+    if (rows.length === 0) return { consoleId: null, committed, dropped, failures };
+    const binding = this.getVoiceConsoleBinding(rows[0]!.session_id);
+    const consoleId = binding?.consoleId ?? null;
+    const transcript = final.transcript.trim();
+    const finalSpeakerName = sanitizeVoiceConsoleSpeakerName(final.speakerName);
+    const speakerMatches = rows.every(
+      (row) => row.author_id === final.speakerId && (row.author_name ?? "") === finalSpeakerName
+    );
+    for (const row of rows) {
+      const current = this.getVoiceConsoleSegment(row.id) ?? mapVoiceConsoleSegment(row);
+      if (current.state !== "capturing" && current.state !== "finalizing") {
+        (current.state === "pending" || current.state === "batched" || current.state === "dispatched"
+          ? committed
+          : dropped).push(current);
+        continue;
+      }
+      try {
+        const settle = this.db.transaction((): VoiceConsoleSegment => {
+          const target = this.getVoiceConsoleBinding(current.bindingId);
+          const targetValid = target?.status === "active" && target.consoleId === consoleId;
+          const accept = final.speakerAuthorized && speakerMatches && targetValid && transcript.length > 0 && !final.error;
+          const state: ThreadVoiceSegmentState = accept
+            ? "pending"
+            : final.error
+              ? "transcribe_failed"
+              : "capture_dropped";
+          const error = accept
+            ? null
+            : final.error ?? (!final.speakerAuthorized ? "speaker authorization revoked" : !speakerMatches ? "speaker identity mismatch" : !targetValid ? "binding removed before capture final" : "empty capture");
+          const activeBefore = this.db
+            .prepare<[string], { count: number }>(
+              `SELECT COUNT(*) AS count FROM thread_voice_segments
+                WHERE capture_id = ? AND state IN ('capturing','finalizing')`
+            )
+            .get(final.captureId)?.count ?? 0;
+          this.db
+            .prepare(
+              `UPDATE thread_voice_segments SET transcript = ?, state = ?, audio_ms = ?,
+                 captured_ended_utc = ?, updated_utc = ?, error = ?
+               WHERE id = ? AND state IN ('capturing','finalizing')`
+            )
+            .run(
+              accept ? transcript : "",
+              state,
+              Math.max(0, Math.trunc(final.audioMs)),
+              final.capturedEndedUtc,
+              final.capturedEndedUtc,
+              error,
+              current.id
+            );
+          if (activeBefore === 1 && consoleId) {
+            const accepted = this.db
+              .prepare<[string], { count: number }>(
+                `SELECT COUNT(*) AS count FROM thread_voice_segments
+                  WHERE capture_id = ? AND state IN ('pending','batched','dispatched')`
+              )
+              .get(final.captureId)?.count ?? 0;
+            this.db
+              .prepare(
+                `UPDATE voice_console_sessions SET
+                   live_final_count = live_final_count + ?,
+                   unary_fallback_count = unary_fallback_count + ?,
+                   dropped_count = dropped_count + ?,
+                   stt_failure_count = stt_failure_count + ?, updated_utc = ? WHERE id = ?`
+              )
+              .run(
+                final.resultSource === "live" && accepted > 0 ? 1 : 0,
+                final.resultSource === "unary" && accepted > 0 ? 1 : 0,
+                accepted === 0 ? 1 : 0,
+                final.error ? 1 : 0,
+                final.capturedEndedUtc,
+                consoleId
+              );
+          }
+          const updated = this.getVoiceConsoleSegment(current.id);
+          if (!updated) throw new Error("Voice Console capture assignment disappeared.");
+          return updated;
+        });
+        const updated = settle();
+        (updated.state === "pending" ? committed : dropped).push(updated);
+      } catch (err) {
+        failures.push({
+          bindingId: current.bindingId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return { consoleId, committed, dropped, failures };
+  }
+
+  dropActiveVoiceConsoleCaptures(
+    consoleId: string,
+    reason: string,
+    droppedUtc = new Date().toISOString()
+  ): VoiceConsoleSegment[] {
+    const drop = this.db.transaction(() => {
+      const rows = this.db
+        .prepare<[string], VoiceConsoleSegmentRow>(
+          `SELECT segment.* FROM thread_voice_segments segment
+             JOIN thread_voice_sessions binding ON binding.id = segment.session_id
+            WHERE binding.console_id = ? AND segment.state IN ('capturing','finalizing')`
+        )
+        .all(consoleId);
+      if (rows.length === 0) return [];
+      this.db
+        .prepare(
+          `UPDATE thread_voice_segments SET state = 'capture_dropped', transcript = '',
+             captured_ended_utc = ?, updated_utc = ?, error = ?
+           WHERE id IN (${rows.map(() => "?").join(",")})`
+        )
+        .run(droppedUtc, droppedUtc, reason, ...rows.map((row) => row.id));
+      const captureCount = new Set(rows.map((row) => row.capture_id).filter(Boolean)).size;
+      this.db
+        .prepare(
+          `UPDATE voice_console_sessions SET dropped_count = dropped_count + ?,
+             updated_utc = ? WHERE id = ?`
+        )
+        .run(captureCount, droppedUtc, consoleId);
+      return rows.map((row) => this.getVoiceConsoleSegment(row.id)!);
+    });
+    return drop();
+  }
+
+  getVoiceConsoleSegment(id: string): VoiceConsoleSegment | null {
+    const row = this.db
+      .prepare<[string], VoiceConsoleSegmentRow>("SELECT * FROM thread_voice_segments WHERE id = ?")
+      .get(id);
+    return row ? mapVoiceConsoleSegment(row) : null;
+  }
+
+  listVoiceConsoleSegments(bindingId: string): VoiceConsoleSegment[] {
+    return this.db
+      .prepare<[string], VoiceConsoleSegmentRow>(
+        "SELECT * FROM thread_voice_segments WHERE session_id = ? ORDER BY sequence ASC"
+      )
+      .all(bindingId)
+      .map(mapVoiceConsoleSegment);
+  }
+
+  addVoiceConsoleForwardedAudio(
+    consoleId: string,
+    bytes: number,
+    durationMs: number,
+    updatedUtc = new Date().toISOString()
+  ): VoiceConsoleSession | null {
+    this.db
+      .prepare(
+        `UPDATE voice_console_sessions SET forwarded_audio_bytes = forwarded_audio_bytes + ?,
+           forwarded_audio_ms = forwarded_audio_ms + ?, updated_utc = ? WHERE id = ?`
+      )
+      .run(Math.max(0, Math.trunc(bytes)), Math.max(0, Math.trunc(durationMs)), updatedUtc, consoleId);
+    return this.getVoiceConsole(consoleId);
+  }
+
+  claimPendingVoiceConsoleBatch(
+    bindingId: string,
+    dispatchId = newThreadVoiceDispatchId(),
+    claimedUtc = new Date().toISOString()
+  ): VoiceConsoleBatch | null {
+    const claim = this.db.transaction((): VoiceConsoleBatch | null => {
+      const binding = this.getVoiceConsoleBinding(bindingId);
+      if (!binding) return null;
+      const existing = this.db
+        .prepare<[string, string], { dispatch_id: string }>(
+          `SELECT segment.dispatch_id FROM thread_voice_segments segment
+             JOIN thread_voice_sessions binding ON binding.id = segment.session_id
+            WHERE binding.platform = ? AND binding.channel_ref = ?
+              AND segment.state = 'batched' AND segment.dispatch_id IS NOT NULL LIMIT 1`
+        )
+        .get(binding.platform, binding.channelRef);
+      if (existing) return null;
+      const unresolved = this.db
+        .prepare<[string], { sequence: number }>(
+          `SELECT MIN(sequence) AS sequence FROM thread_voice_segments
+            WHERE session_id = ? AND state IN ('capturing','finalizing')`
+        )
+        .get(bindingId)?.sequence;
+      const pending = this.db
+        .prepare<[string, number], VoiceConsoleSegmentRow>(
+          `SELECT * FROM thread_voice_segments WHERE session_id = ? AND state = 'pending'
+             AND sequence < ? ORDER BY sequence ASC`
+        )
+        .all(bindingId, unresolved ?? Number.MAX_SAFE_INTEGER);
+      if (pending.length === 0) return null;
+      const authorId = pending[0]!.author_id;
+      const authorName = pending[0]!.author_name ?? "";
+      const rows: VoiceConsoleSegmentRow[] = [];
+      for (const row of pending) {
+        if (row.author_id !== authorId || (row.author_name ?? "") !== authorName) break;
+        rows.push(row);
+      }
+      const placeholders = rows.map(() => "?").join(",");
+      this.db
+        .prepare(
+          `UPDATE thread_voice_segments SET state = 'batched', dispatch_id = ?, updated_utc = ?
+            WHERE id IN (${placeholders}) AND state = 'pending'`
+        )
+        .run(dispatchId, claimedUtc, ...rows.map((row) => row.id));
+      return this.buildVoiceConsoleBatch(
+        dispatchId,
+        binding,
+        rows.map((row) =>
+          mapVoiceConsoleSegment({ ...row, state: "batched", dispatch_id: dispatchId, updated_utc: claimedUtc })
+        )
+      );
+    });
+    return claim();
+  }
+
+  getVoiceConsoleBatch(dispatchId: string): VoiceConsoleBatch | null {
+    const rows = this.db
+      .prepare<[string], VoiceConsoleSegmentRow>(
+        "SELECT * FROM thread_voice_segments WHERE dispatch_id = ? ORDER BY sequence ASC"
+      )
+      .all(dispatchId);
+    if (rows.length === 0) return null;
+    const binding = this.getVoiceConsoleBinding(rows[0]!.session_id);
+    return binding ? this.buildVoiceConsoleBatch(dispatchId, binding, rows.map(mapVoiceConsoleSegment)) : null;
+  }
+
+  listVoiceConsoleBatchesByState(state: "batched" | "dispatched"): VoiceConsoleBatch[] {
+    return this.db
+      .prepare<[string], { dispatch_id: string }>(
+        `SELECT dispatch_id FROM thread_voice_segments segment
+           JOIN thread_voice_sessions binding ON binding.id = segment.session_id
+          WHERE segment.state = ? AND segment.dispatch_id IS NOT NULL AND binding.console_id IS NOT NULL
+          GROUP BY dispatch_id ORDER BY MIN(segment.created_utc) ASC`
+      )
+      .all(state)
+      .map(({ dispatch_id }) => this.getVoiceConsoleBatch(dispatch_id))
+      .filter((batch): batch is VoiceConsoleBatch => batch !== null);
+  }
+
+  listVoiceConsoleBindingsWithBufferedSegments(): ThreadVoiceBinding[] {
+    return this.db
+      .prepare<[], VoiceConsoleBindingRow>(
+        `SELECT DISTINCT binding.* FROM thread_voice_sessions binding
+           JOIN thread_voice_segments segment ON segment.session_id = binding.id
+          WHERE binding.console_id IS NOT NULL AND segment.state IN ('pending','batched')
+          ORDER BY binding.created_utc ASC`
+      )
+      .all()
+      .map(mapVoiceConsoleBinding);
+  }
+
+  upgradeActiveV1ThreadVoiceSessions(
+    defaults: VoiceConsoleUpgradeDefaults,
+    upgradedUtc = new Date().toISOString()
+  ): VoiceConsoleSession[] {
+    const upgrade = this.db.transaction((): VoiceConsoleSession[] => {
+      const legacy = this.db
+        .prepare<[], ThreadVoiceSessionRow>(
+          `SELECT * FROM thread_voice_sessions WHERE console_id IS NULL
+             AND status IN ('starting','ready','stopping') ORDER BY created_utc ASC`
+        )
+        .all();
+      const upgraded: VoiceConsoleSession[] = [];
+      for (const row of legacy) {
+        const existing = this.getActiveVoiceConsoleForGuild(row.guild_id);
+        if (existing) throw new Error(`Cannot upgrade V1 session ${row.id}: guild already has console ${existing.id}.`);
+        const id = newVoiceConsoleId();
+        assertVoiceConsoleAuthorityId(row.id, "Legacy Thread Voice binding id");
+        const consoleStatus: VoiceConsoleStatus = row.status === "ready" ? "ready" : row.status === "stopping" ? "stopping" : "starting";
+        const console: VoiceConsoleSession = {
+          id,
+          platform: row.platform,
+          guildId: row.guild_id,
+          voiceChannelId: row.voice_channel_id,
+          ownerUserId: row.owner_user_id,
+          ownerName: row.owner_name,
+          status: consoleStatus,
+          cardChannelId: row.voice_channel_id,
+          cardMessageId: null,
+          cardPage: 0,
+          revision: 1,
+          fanoutArmed: false,
+          forwardedAudioBytes: 0,
+          forwardedAudioMs: row.transmitted_audio_ms,
+          utteranceCount: 0,
+          liveFinalCount: 0,
+          unaryFallbackCount: 0,
+          droppedCount: 0,
+          sttFailureCount: 0,
+          createdUtc: row.created_utc,
+          updatedUtc: upgradedUtc,
+          endedUtc: null,
+          endReason: row.end_reason,
+        };
+        const alias = validateVoiceConsoleAlias(defaults.aliasFor({ channelRef: row.channel_ref }));
+        const profile = defaults.profileFor({ channelRef: row.channel_ref });
+        this.insertVoiceConsoleRow(console);
+        const bindingStatus: VoiceConsoleBindingStatus = row.status === "ready" ? "active" : row.status === "stopping" ? "removing" : "adding";
+        this.db
+          .prepare(
+            `UPDATE thread_voice_sessions SET console_id = ?, alias = ?, alias_normalized = ?,
+               tts_voice = ?, tts_pace = ?, tts_style = ?, profile_updated_utc = ?,
+               output_enabled = 1, output_generation = 0, status = ?, updated_utc = ? WHERE id = ?`
+          )
+          .run(
+            id,
+            alias,
+            normalizeVoiceConsoleAlias(alias),
+            profile.voice,
+            profile.pace,
+            profile.style,
+            upgradedUtc,
+            bindingStatus,
+            upgradedUtc,
+            row.id
+          );
+        if (bindingStatus !== "removing") {
+          this.replaceVoiceConsoleTargetsRows(id, [row.id], upgradedUtc);
+        }
+        upgraded.push(console);
+      }
+      return upgraded;
+    });
+    return upgrade();
+  }
+
+  private insertVoiceConsoleRow(console: VoiceConsoleSession): void {
+    assertVoiceConsoleAuthorityId(console.id, "Voice Console id");
+    this.db
+      .prepare(
+        `INSERT INTO voice_console_sessions
+           (id, platform, guild_id, voice_channel_id, owner_user_id, owner_name, status,
+            card_channel_id, card_message_id, card_page, revision, fanout_armed,
+            forwarded_audio_bytes, forwarded_audio_ms, utterance_count, live_final_count,
+            unary_fallback_count, dropped_count, stt_failure_count, created_utc, updated_utc,
+            ended_utc, end_reason)
+         VALUES
+           (@id, @platform, @guildId, @voiceChannelId, @ownerUserId, @ownerName, @status,
+            @cardChannelId, @cardMessageId, @cardPage, @revision, @fanoutArmed,
+            @forwardedAudioBytes, @forwardedAudioMs, @utteranceCount, @liveFinalCount,
+            @unaryFallbackCount, @droppedCount, @sttFailureCount, @createdUtc, @updatedUtc,
+            @endedUtc, @endReason)`
+      )
+      .run({ ...console, fanoutArmed: console.fanoutArmed ? 1 : 0 });
+  }
+
+  private insertVoiceConsoleBindingRow(binding: ThreadVoiceBinding): void {
+    this.db
+      .prepare(
+        `INSERT INTO thread_voice_sessions
+           (id, platform, channel_ref, parent_ref, guild_id, voice_channel_id,
+            owner_user_id, owner_name, status, notice_message_id, transmitted_audio_ms,
+            created_utc, updated_utc, ended_utc, end_reason, console_id, alias,
+            alias_normalized, tts_voice, tts_pace, tts_style, profile_updated_utc,
+            output_enabled, output_generation)
+         VALUES
+           (@id, @platform, @channelRef, @parentRef, @guildId, @voiceChannelId,
+            @ownerUserId, @ownerName, @status, @noticeMessageId, 0,
+            @createdUtc, @updatedUtc, @endedUtc, @endReason, @consoleId, @alias,
+            @aliasNormalized, @ttsVoice, @ttsPace, @ttsStyle, @profileUpdatedUtc,
+            @outputEnabled, @outputGeneration)`
+      )
+      .run({ ...binding, outputEnabled: binding.outputEnabled ? 1 : 0 });
+  }
+
+  private replaceVoiceConsoleTargetsRows(consoleId: string, ids: readonly string[], selectedUtc: string): void {
+    this.db.prepare("DELETE FROM voice_console_input_targets WHERE console_id = ?").run(consoleId);
+    const insert = this.db.prepare(
+      `INSERT INTO voice_console_input_targets (console_id, binding_id, ordinal, selected_utc)
+       VALUES (?, ?, ?, ?)`
+    );
+    ids.forEach((id, ordinal) => insert.run(consoleId, id, ordinal, selectedUtc));
+  }
+
+  private areActiveBindingsOwnedByConsole(consoleId: string, ids: readonly string[]): boolean {
+    if (ids.length === 0) return true;
+    const row = this.db
+      .prepare<unknown[], { count: number }>(
+        `SELECT COUNT(*) AS count FROM thread_voice_sessions
+          WHERE console_id = ? AND id IN (${ids.map(() => "?").join(",")}) AND status = 'active'`
+      )
+      .get(consoleId, ...ids);
+    return row?.count === ids.length;
+  }
+
+  private bumpVoiceConsoleRevision(consoleId: string, updatedUtc: string): void {
+    this.db
+      .prepare("UPDATE voice_console_sessions SET revision = revision + 1, updated_utc = ? WHERE id = ?")
+      .run(updatedUtc, consoleId);
+  }
+
+  private getVoiceConsoleMutation(consoleId: string, interactionId?: string): boolean {
+    if (!interactionId) return false;
+    return Boolean(
+      this.db
+        .prepare<[string, string], { mutation_id: string }>(
+          "SELECT mutation_id FROM voice_console_mutations WHERE console_id = ? AND mutation_id = ?"
+        )
+        .get(consoleId, interactionId)
+    );
+  }
+
+  private recordVoiceConsoleMutation(consoleId: string, interactionId: string | undefined, createdUtc: string): void {
+    if (!interactionId) return;
+    const revision = this.getVoiceConsole(consoleId)?.revision ?? 0;
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO voice_console_mutations
+           (console_id, mutation_id, revision, created_utc) VALUES (?, ?, ?, ?)`
+      )
+      .run(consoleId, interactionId, revision, createdUtc);
+  }
+
+  private requireVoiceConsoleMutationResult(
+    consoleId: string,
+    applied: boolean,
+    duplicate: boolean
+  ): VoiceConsoleMutationResult {
+    const console = this.getVoiceConsole(consoleId);
+    if (!console) throw new Error(`Voice Console \`${consoleId}\` does not exist.`);
+    return {
+      applied,
+      duplicate,
+      console,
+      bindings: this.listVoiceConsoleBindings(consoleId),
+      targets: this.listVoiceConsoleInputTargets(consoleId),
+    };
+  }
+
+  private buildVoiceConsoleBatch(
+    dispatchId: string,
+    binding: ThreadVoiceBinding,
+    segments: VoiceConsoleSegment[]
+  ): VoiceConsoleBatch {
+    const authorId = segments[0]?.authorId ?? "";
+    const authorName = segments[0]?.authorName ?? "";
+    return {
+      dispatchId,
+      console: this.getVoiceConsole(binding.consoleId),
+      binding,
+      segments,
+      prompt: composeVoiceConsolePrompt(authorId, segments),
+      authorId,
+      authorName,
+    };
+  }
+
   // --- Thread Voice -------------------------------------------------------
 
   insertThreadVoiceSession(session: ThreadVoiceSession): void {
@@ -2974,10 +4065,7 @@ CREATE TABLE IF NOT EXISTS thread_voice_sessions (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_voice_active_thread
   ON thread_voice_sessions(platform, channel_ref)
-  WHERE status IN ('starting','ready','stopping');
-CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_voice_active_guild
-  ON thread_voice_sessions(guild_id)
-  WHERE status IN ('starting','ready','stopping');
+  WHERE status IN ('starting','ready','stopping','adding','active','removing');
 CREATE INDEX IF NOT EXISTS idx_thread_voice_active_vc
   ON thread_voice_sessions(voice_channel_id, status);
 CREATE INDEX IF NOT EXISTS idx_thread_voice_active_owner
@@ -3005,6 +4093,124 @@ CREATE INDEX IF NOT EXISTS idx_thread_voice_segments_pending
 CREATE INDEX IF NOT EXISTS idx_thread_voice_segments_dispatch
   ON thread_voice_segments(dispatch_id);
 `;
+
+const VOICE_CONSOLE_SCHEMA = `
+CREATE TABLE IF NOT EXISTS voice_console_sessions (
+  id                       TEXT PRIMARY KEY,
+  platform                 TEXT NOT NULL,
+  guild_id                 TEXT NOT NULL,
+  voice_channel_id         TEXT NOT NULL,
+  owner_user_id            TEXT NOT NULL,
+  owner_name               TEXT NOT NULL,
+  status                   TEXT NOT NULL,
+  card_channel_id          TEXT NOT NULL,
+  card_message_id          TEXT,
+  card_page                INTEGER NOT NULL DEFAULT 0,
+  revision                 INTEGER NOT NULL DEFAULT 1,
+  fanout_armed             INTEGER NOT NULL DEFAULT 0,
+  forwarded_audio_bytes    INTEGER NOT NULL DEFAULT 0,
+  forwarded_audio_ms       INTEGER NOT NULL DEFAULT 0,
+  utterance_count          INTEGER NOT NULL DEFAULT 0,
+  live_final_count         INTEGER NOT NULL DEFAULT 0,
+  unary_fallback_count     INTEGER NOT NULL DEFAULT 0,
+  dropped_count            INTEGER NOT NULL DEFAULT 0,
+  stt_failure_count        INTEGER NOT NULL DEFAULT 0,
+  created_utc              TEXT NOT NULL,
+  updated_utc              TEXT NOT NULL,
+  ended_utc                TEXT,
+  end_reason               TEXT,
+  CHECK(card_channel_id = voice_channel_id),
+  CHECK(revision >= 1),
+  CHECK(card_page >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS voice_console_input_targets (
+  console_id    TEXT NOT NULL,
+  binding_id    TEXT NOT NULL,
+  ordinal       INTEGER NOT NULL,
+  selected_utc  TEXT NOT NULL,
+  PRIMARY KEY (console_id, binding_id),
+  UNIQUE(console_id, ordinal),
+  FOREIGN KEY(console_id) REFERENCES voice_console_sessions(id),
+  FOREIGN KEY(binding_id) REFERENCES thread_voice_sessions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_voice_console_targets_order
+  ON voice_console_input_targets(console_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS voice_console_mutations (
+  console_id    TEXT NOT NULL,
+  mutation_id   TEXT NOT NULL,
+  revision      INTEGER NOT NULL,
+  created_utc   TEXT NOT NULL,
+  PRIMARY KEY (console_id, mutation_id)
+);
+`;
+
+interface VoiceConsoleRow {
+  id: string;
+  platform: string;
+  guild_id: string;
+  voice_channel_id: string;
+  owner_user_id: string;
+  owner_name: string;
+  status: string;
+  card_channel_id: string;
+  card_message_id: string | null;
+  card_page: number;
+  revision: number;
+  fanout_armed: number;
+  forwarded_audio_bytes: number;
+  forwarded_audio_ms: number;
+  utterance_count: number;
+  live_final_count: number;
+  unary_fallback_count: number;
+  dropped_count: number;
+  stt_failure_count: number;
+  created_utc: string;
+  updated_utc: string;
+  ended_utc: string | null;
+  end_reason: string | null;
+}
+
+const mapVoiceConsole = (row: VoiceConsoleRow): VoiceConsoleSession => ({
+  id: row.id,
+  platform: row.platform,
+  guildId: row.guild_id,
+  voiceChannelId: row.voice_channel_id,
+  ownerUserId: row.owner_user_id,
+  ownerName: row.owner_name,
+  status: row.status as VoiceConsoleStatus,
+  cardChannelId: row.card_channel_id,
+  cardMessageId: row.card_message_id,
+  cardPage: row.card_page,
+  revision: row.revision,
+  fanoutArmed: row.fanout_armed !== 0,
+  forwardedAudioBytes: row.forwarded_audio_bytes,
+  forwardedAudioMs: row.forwarded_audio_ms,
+  utteranceCount: row.utterance_count,
+  liveFinalCount: row.live_final_count,
+  unaryFallbackCount: row.unary_fallback_count,
+  droppedCount: row.dropped_count,
+  sttFailureCount: row.stt_failure_count,
+  createdUtc: row.created_utc,
+  updatedUtc: row.updated_utc,
+  endedUtc: row.ended_utc,
+  endReason: row.end_reason,
+});
+
+interface VoiceConsoleInputTargetRow {
+  console_id: string;
+  binding_id: string;
+  ordinal: number;
+  selected_utc: string;
+}
+
+const mapVoiceConsoleInputTarget = (row: VoiceConsoleInputTargetRow): VoiceConsoleInputTarget => ({
+  consoleId: row.console_id,
+  bindingId: row.binding_id,
+  ordinal: row.ordinal,
+  selectedUtc: row.selected_utc,
+});
 
 interface ThreadVoiceSessionRow {
   id: string;
@@ -3042,6 +4248,44 @@ const mapThreadVoiceSession = (row: ThreadVoiceSessionRow): ThreadVoiceSession =
   endReason: row.end_reason,
 });
 
+interface VoiceConsoleBindingRow extends ThreadVoiceSessionRow {
+  console_id: string;
+  alias: string;
+  alias_normalized: string;
+  tts_voice: string;
+  tts_pace: string | null;
+  tts_style: string | null;
+  profile_updated_utc: string;
+  output_enabled: number;
+  output_generation: number;
+}
+
+const mapVoiceConsoleBinding = (row: VoiceConsoleBindingRow): ThreadVoiceBinding => ({
+  id: row.id,
+  consoleId: row.console_id,
+  platform: row.platform,
+  channelRef: row.channel_ref,
+  parentRef: row.parent_ref,
+  guildId: row.guild_id,
+  voiceChannelId: row.voice_channel_id,
+  ownerUserId: row.owner_user_id,
+  ownerName: row.owner_name,
+  status: row.status as VoiceConsoleBindingStatus,
+  noticeMessageId: row.notice_message_id,
+  alias: row.alias,
+  aliasNormalized: row.alias_normalized,
+  ttsVoice: row.tts_voice,
+  ttsPace: row.tts_pace,
+  ttsStyle: row.tts_style,
+  profileUpdatedUtc: row.profile_updated_utc,
+  outputEnabled: row.output_enabled !== 0,
+  outputGeneration: row.output_generation,
+  createdUtc: row.created_utc,
+  updatedUtc: row.updated_utc,
+  endedUtc: row.ended_utc,
+  endReason: row.end_reason,
+});
+
 interface ThreadVoiceSegmentRow {
   id: string;
   session_id: string;
@@ -3073,6 +4317,74 @@ const mapThreadVoiceSegment = (row: ThreadVoiceSegmentRow): ThreadVoiceSegment =
   updatedUtc: row.updated_utc,
   error: row.error,
 });
+
+interface VoiceConsoleSegmentRow extends ThreadVoiceSegmentRow {
+  capture_id: string | null;
+  fanout_group_id: string | null;
+  author_name: string | null;
+}
+
+const mapVoiceConsoleSegment = (row: VoiceConsoleSegmentRow): VoiceConsoleSegment => ({
+  id: row.id,
+  bindingId: row.session_id,
+  sequence: row.sequence,
+  captureId: row.capture_id,
+  fanoutGroupId: row.fanout_group_id,
+  authorId: row.author_id,
+  authorName: row.author_name ?? "",
+  transcript: row.transcript,
+  state: row.state as ThreadVoiceSegmentState,
+  audioMs: row.audio_ms,
+  dispatchId: row.dispatch_id,
+  capturedStartedUtc: row.captured_started_utc,
+  capturedEndedUtc: row.captured_ended_utc,
+  createdUtc: row.created_utc,
+  updatedUtc: row.updated_utc,
+  error: row.error,
+});
+
+function validateVoiceConsoleAlias(value: string): string {
+  const alias = value
+    .normalize("NFKC")
+    .replace(/[\p{Cc}\p{Cf}]/gu, "")
+    .replace(/@/g, "＠")
+    .trim()
+    .replace(/\s+/g, " ");
+  const length = [...alias].length;
+  if (length < 1 || length > 32) {
+    throw new Error("Voice Console alias must contain 1 to 32 visible characters.");
+  }
+  return alias;
+}
+
+function normalizeBinding(binding: ThreadVoiceBinding): ThreadVoiceBinding {
+  assertVoiceConsoleAuthorityId(binding.id, "Voice Console binding id");
+  assertVoiceConsoleAuthorityId(binding.consoleId, "Voice Console id");
+  const alias = validateVoiceConsoleAlias(binding.alias);
+  if (!binding.ttsVoice.trim()) throw new Error("Voice Console TTS voice must not be empty.");
+  return {
+    ...binding,
+    alias,
+    aliasNormalized: normalizeVoiceConsoleAlias(alias),
+    ttsVoice: binding.ttsVoice.trim(),
+    outputGeneration: Math.max(0, Math.trunc(binding.outputGeneration)),
+  };
+}
+
+function isActiveConsole(console: VoiceConsoleSession): boolean {
+  return console.status === "starting" || console.status === "ready" || console.status === "stopping";
+}
+
+function mutationFailure(
+  reason: VoiceConsoleMutationFailure,
+  error: string
+): VoiceConsoleMutationOutcome {
+  return { ok: false, reason, error };
+}
+
+function staleConsoleFailure(): VoiceConsoleMutationOutcome {
+  return mutationFailure("stale-revision", "Console changed; refresh.");
+}
 
 interface LiveHelpRow {
   id: string;

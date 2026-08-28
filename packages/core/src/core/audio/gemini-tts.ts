@@ -9,6 +9,8 @@ const DEFAULT_TTS_MODEL = "gemini-3.1-flash-tts-preview";
 const DEFAULT_TTS_VOICE = "Kore";
 /** Long replies (up to TTS_MAX_CHARS) can take >90s to synthesize. */
 const TTS_TIMEOUT_MS = 180_000;
+const TTS_MAX_ATTEMPTS = 3;
+const TTS_RETRY_DELAY_MS = 250;
 const TTS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
 
 /** Official Gemini TTS prebuilt voices (30). Preview: https://aistudio.google.com/generate-speech */
@@ -117,6 +119,8 @@ export async function synthesizeSpeechWithGemini(opts: {
   pace?: TtsPace;
   style?: TtsStyle;
   fetchFn?: typeof fetch;
+  /** Test hook; production uses a short exponential retry delay. */
+  retryDelayMs?: number;
 }): Promise<TtsResult> {
   const apiKey = opts.apiKey.trim();
   if (!apiKey) return { ok: false, error: "SEAM_GEMINI_API_KEY is not set" };
@@ -133,39 +137,74 @@ export async function synthesizeSpeechWithGemini(opts: {
     generation_config: { speech_config: [{ voice }] },
   };
 
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), TTS_TIMEOUT_MS);
-  try {
-    const res = await fetchFn(TTS_URL, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-goog-api-key": apiKey,
-      },
-      body: JSON.stringify(body),
-      signal: ac.signal,
-    });
-    const raw = await res.text();
-    let parsed: unknown;
+  const retryDelayMs = opts.retryDelayMs ?? TTS_RETRY_DELAY_MS;
+  for (let attempt = 1; attempt <= TTS_MAX_ATTEMPTS; attempt++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), TTS_TIMEOUT_MS);
     try {
-      parsed = JSON.parse(raw) as unknown;
-    } catch {
-      return { ok: false, error: `TTS HTTP ${res.status}: non-JSON body` };
+      const res = await fetchFn(TTS_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-goog-api-key": apiKey,
+        },
+        body: JSON.stringify(body),
+        signal: ac.signal,
+      });
+      const raw = await res.text();
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw) as unknown;
+      } catch {
+        const error = `TTS HTTP ${res.status}: non-JSON body`;
+        if (attempt < TTS_MAX_ATTEMPTS && res.status >= 500) {
+          await ttsRetryDelay(retryDelayMs, attempt);
+          continue;
+        }
+        return { ok: false, error };
+      }
+      if (!res.ok) {
+        const error = geminiErrorMessage(parsed) ?? `TTS HTTP ${res.status}`;
+        if (attempt < TTS_MAX_ATTEMPTS && isRetryableTtsFailure(res.status, error)) {
+          await ttsRetryDelay(retryDelayMs, attempt);
+          continue;
+        }
+        return { ok: false, error };
+      }
+      const audio = extractInteractionAudio(parsed);
+      if (audio) return { ok: true, audio };
+      if (attempt < TTS_MAX_ATTEMPTS) {
+        await ttsRetryDelay(retryDelayMs, attempt);
+        continue;
+      }
+      return { ok: false, error: "TTS response had no audio" };
+    } catch (err) {
+      const name = err instanceof Error ? err.name : "";
+      if (name === "AbortError") return { ok: false, error: "TTS timed out" };
+      if (attempt < TTS_MAX_ATTEMPTS) {
+        await ttsRetryDelay(retryDelayMs, attempt);
+        continue;
+      }
+      return { ok: false, error: err instanceof Error ? err.message : "TTS failed" };
+    } finally {
+      clearTimeout(timer);
     }
-    if (!res.ok) {
-      const msg = geminiErrorMessage(parsed) ?? `TTS HTTP ${res.status}`;
-      return { ok: false, error: msg };
-    }
-    const audio = extractInteractionAudio(parsed);
-    if (!audio) return { ok: false, error: "TTS response had no audio" };
-    return { ok: true, audio };
-  } catch (err) {
-    const name = err instanceof Error ? err.name : "";
-    if (name === "AbortError") return { ok: false, error: "TTS timed out" };
-    return { ok: false, error: err instanceof Error ? err.message : "TTS failed" };
-  } finally {
-    clearTimeout(timer);
   }
+  return { ok: false, error: "TTS failed" };
+}
+
+export function isRetryableTtsFailure(status: number, error: string): boolean {
+  if (status === 429 || status >= 500) return true;
+  // Observed from Gemini 3.1 Flash TTS on an otherwise valid request; replaying
+  // the exact payload succeeds. Keep this deliberately narrow so detailed 400s
+  // and policy/validation failures remain fail-fast.
+  return status === 400 && /^Request contains an invalid argument\.?$/i.test(error.trim());
+}
+
+async function ttsRetryDelay(baseMs: number, attempt: number): Promise<void> {
+  const delayMs = Math.max(0, baseMs) * attempt;
+  if (delayMs === 0) return;
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
 }
 
 function extractInteractionAudio(parsed: unknown): TtsPcm | null {

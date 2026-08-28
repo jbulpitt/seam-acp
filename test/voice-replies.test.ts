@@ -232,16 +232,64 @@ describe("synthesizeSpeechWithGemini", () => {
   });
 
   it("returns a visible error on HTTP failure", async () => {
-    const fetchFn = ttsFetch(async () =>
-      Response.json({ error: { message: "quota exceeded" } }, { status: 429 })
-    );
+    let attempts = 0;
+    const fetchFn = ttsFetch(async () => {
+      attempts += 1;
+      return Response.json({ error: { message: "quota exceeded" } }, { status: 429 });
+    });
     const result = await synthesizeSpeechWithGemini({
       apiKey: "test-key",
       text: "Hello",
       fetchFn,
+      retryDelayMs: 0,
     });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toMatch(/quota exceeded/);
+    expect(attempts).toBe(3);
+  });
+
+  it("retries the transient generic invalid-argument response", async () => {
+    let attempts = 0;
+    const pcm = Buffer.from([1, 2, 3, 4]);
+    const fetchFn = ttsFetch(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Response.json(
+          { error: { message: "Request contains an invalid argument." } },
+          { status: 400 }
+        );
+      }
+      return Response.json({
+        steps: [{ content: [{ type: "audio", data: pcm.toString("base64") }] }],
+      });
+    });
+    const result = await synthesizeSpeechWithGemini({
+      apiKey: "test-key",
+      text: "Hello",
+      fetchFn,
+      retryDelayMs: 0,
+    });
+    expect(result.ok).toBe(true);
+    expect(attempts).toBe(2);
+  });
+
+  it("does not retry a specific permanent invalid-argument response", async () => {
+    let attempts = 0;
+    const fetchFn = ttsFetch(async () => {
+      attempts += 1;
+      return Response.json(
+        { error: { message: "Invalid voice name: NotARealVoice" } },
+        { status: 400 }
+      );
+    });
+    const result = await synthesizeSpeechWithGemini({
+      apiKey: "test-key",
+      text: "Hello",
+      fetchFn,
+      retryDelayMs: 0,
+    });
+    expect(result).toEqual({ ok: false, error: "Invalid voice name: NotARealVoice" });
+    expect(attempts).toBe(1);
   });
 });
 

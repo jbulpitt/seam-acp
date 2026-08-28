@@ -12274,7 +12274,7 @@ export class Orchestrator {
     await i.reply({
       content:
         `TTS **${on ? "on" : "off"}** — voice **${voiceLabel}**, pace \`${pace}\`, style \`${style}\`.\n` +
-        `Host Gemini key; you do not sign into Google. Card: \`/seam config tts\` (no options).`,
+        `Card: \`/seam config tts\` (no options).`,
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -12326,7 +12326,7 @@ export class Orchestrator {
     const ref = await this.adapter.sendPanel(channel, renderTtsHub(draft));
     this.ttsEditor.touch(draft.id, { messageId: ref.id });
     await i.editReply({
-      content: "TTS settings card posted in the thread. Host Gemini key — no Google sign-in.",
+      content: "TTS settings card posted in the thread.",
     });
   }
 

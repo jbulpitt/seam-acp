@@ -154,16 +154,24 @@ describe("VoiceConsoleSpeechScheduler fairness", () => {
 });
 
 describe("VoiceConsoleSpeechScheduler cancellation and generations", () => {
-  it("drops a late synthesis result on output-off and immediately advances another source", async () => {
+  it("drops a late synthesis result while retaining the one-request provider slot", async () => {
     const first = deferred<VoiceConsoleSynthesisResult>();
     let firstSignal: AbortSignal | undefined;
+    let activeSynthesis = 0;
+    let maxActiveSynthesis = 0;
     const played: string[] = [];
     const synthesize = vi.fn(async (request: VoiceConsoleSynthesisRequest) => {
-      if (request.chunk.bindingId === "A") {
-        firstSignal = request.signal;
-        return first.promise;
+      activeSynthesis += 1;
+      maxActiveSynthesis = Math.max(maxActiveSynthesis, activeSynthesis);
+      try {
+        if (request.chunk.bindingId === "A") {
+          firstSignal = request.signal;
+          return await first.promise;
+        }
+        return { ok: true as const, audio: audio(2) };
+      } finally {
+        activeSynthesis -= 1;
       }
-      return { ok: true as const, audio: audio(2) };
     });
     const playback: VoiceConsoleSpeechPlayback = {
       play: vi.fn(async ({ chunk: item }) => {
@@ -185,13 +193,18 @@ describe("VoiceConsoleSpeechScheduler cancellation and generations", () => {
 
     expect(scheduler.setOutputEnabled("A", false)).toBe(1);
     expect(firstSignal!.aborted).toBe(true);
-    await drainedB;
-    await expect(drainedA).resolves.toMatchObject({ played: 0, dropped: 1 });
-    expect(played).toEqual(["B-1"]);
+    let bSettled = false;
+    void drainedB.then(() => { bSettled = true; });
+    await Promise.resolve();
+    expect(bSettled).toBe(false);
+    expect(synthesize).toHaveBeenCalledTimes(1);
+    expect(maxActiveSynthesis).toBe(1);
+    expect(played).toEqual([]);
 
     first.resolve({ ok: true, audio: audio(1) });
-    await Promise.resolve();
+    await Promise.all([drainedA, drainedB]);
     expect(played).toEqual(["B-1"]);
+    expect(maxActiveSynthesis).toBe(1);
   });
 
   it("stops current playback on output-off without disturbing the next binding", async () => {
@@ -285,9 +298,10 @@ describe("VoiceConsoleSpeechScheduler cancellation and generations", () => {
     await vi.waitFor(() => expect(signal).toBeDefined());
     scheduler.cancelSource(a);
     expect(signal!.aborted).toBe(true);
+    expect(played).toEqual([]);
+    first.resolve({ ok: true, audio: audio(1) });
     await Promise.all([drainedA, drainedB]);
     expect(played).toEqual(["B-1"]);
-    first.resolve({ ok: true, audio: audio(1) });
   });
 });
 
@@ -393,5 +407,185 @@ describe("VoiceConsoleSpeechScheduler failures, drains, and cleanup", () => {
     expect(playback.destroy).toHaveBeenCalledTimes(1);
     expect(scheduler.snapshot().destroyed).toBe(true);
     synthesis.resolve({ ok: true, audio: audio(1) });
+  });
+});
+
+describe("VoiceConsoleSpeechScheduler binding and source lifecycle", () => {
+  it("unregisters during synthesis, settles drains, and keeps sibling playback reusable", async () => {
+    const lateSynthesis = deferred<VoiceConsoleSynthesisResult>();
+    let synthesisSignal: AbortSignal | undefined;
+    const { scheduler, playback, played } = setup({
+      synthesize: vi.fn(async (request) => {
+        if (request.chunk.turnId === "turn-unregister-synthesis") {
+          synthesisSignal = request.signal;
+          return lateSynthesis.promise;
+        }
+        return { ok: true, audio: audio(2) };
+      }),
+    });
+    const a = source("A", "turn-unregister-synthesis");
+    const b = source("B", "turn-survives-synthesis");
+    scheduler.registerSource(a);
+    scheduler.registerSource(b);
+    scheduler.enqueueChunk(chunk(a, 1));
+    scheduler.enqueueChunk(chunk(b, 1));
+    const sourceDrainA = scheduler.finishSource(a);
+    const bindingDrainA = scheduler.waitForBindingDrain("A");
+    const sourceDrainB = scheduler.finishSource(b);
+    await vi.waitFor(() => expect(synthesisSignal).toBeDefined());
+
+    expect(scheduler.unregisterBinding("A")).toBe(true);
+    expect(scheduler.unregisterBinding("A")).toBe(false);
+    expect(synthesisSignal!.aborted).toBe(true);
+    await expect(sourceDrainA).resolves.toMatchObject({ accepted: 1, dropped: 1 });
+    await expect(bindingDrainA).resolves.toMatchObject({ accepted: 1, dropped: 1 });
+    expect(played).toEqual([]);
+    expect(scheduler.snapshot().bindings.map((binding) => binding.bindingId)).toEqual(["B"]);
+    expect(playback.destroy).not.toHaveBeenCalled();
+
+    scheduler.registerBinding({ bindingId: "A", profile: profileA, outputEnabled: true });
+    const reboundA = source("A", "turn-rebound");
+    scheduler.registerSource(reboundA);
+    scheduler.enqueueChunk(chunk(reboundA, 1, 0, "A-rebound"));
+    const reboundDrain = scheduler.finishSource(reboundA);
+
+    lateSynthesis.resolve({ ok: true, audio: audio(1) });
+    await expect(sourceDrainB).resolves.toMatchObject({ played: 1 });
+    await expect(reboundDrain).resolves.toMatchObject({ played: 1 });
+    expect(played).toEqual(["B-1", "A-rebound"]);
+  });
+
+  it("ignores late playback completion after unregister and advances immediately", async () => {
+    const latePlayback = deferred<{ status: "played"; durationMs: number }>();
+    let playbackSignal: AbortSignal | undefined;
+    const played: string[] = [];
+    const playback: VoiceConsoleSpeechPlayback = {
+      play: vi.fn(async (request) => {
+        if (request.chunk.bindingId === "A") {
+          playbackSignal = request.signal;
+          return latePlayback.promise;
+        }
+        played.push(request.chunk.text);
+        return { status: "played", durationMs: 1_000 };
+      }),
+      destroy: vi.fn(),
+    };
+    const { scheduler } = setup({ playback });
+    const a = source("A", "turn-unregister-playback");
+    const b = source("B", "turn-survives-playback");
+    scheduler.registerSource(a);
+    scheduler.registerSource(b);
+    scheduler.enqueueChunk(chunk(a, 1));
+    scheduler.enqueueChunk(chunk(b, 1));
+    const sourceDrainA = scheduler.finishSource(a);
+    const bindingDrainA = scheduler.waitForBindingDrain("A");
+    const sourceDrainB = scheduler.finishSource(b);
+    await vi.waitFor(() => expect(playbackSignal).toBeDefined());
+
+    expect(scheduler.unregisterBinding("A")).toBe(true);
+    expect(playbackSignal!.aborted).toBe(true);
+    await expect(sourceDrainA).resolves.toMatchObject({ accepted: 1, dropped: 1 });
+    await expect(bindingDrainA).resolves.toMatchObject({ accepted: 1, dropped: 1 });
+    await expect(sourceDrainB).resolves.toMatchObject({ played: 1 });
+    expect(played).toEqual(["B-1"]);
+    expect(playback.destroy).not.toHaveBeenCalled();
+
+    latePlayback.resolve({ status: "played", durationMs: 99_000 });
+    await Promise.resolve();
+    expect(played).toEqual(["B-1"]);
+    expect(scheduler.snapshot().bindings.map((binding) => binding.bindingId)).toEqual(["B"]);
+  });
+
+  it("forgets completed source retention explicitly and idempotently", async () => {
+    const { scheduler } = setup();
+    const a = source("A", "turn-forget");
+    scheduler.registerSource(a);
+    scheduler.enqueueChunk(chunk(a, 1));
+    await scheduler.finishSource(a);
+
+    expect(() => scheduler.registerSource(a)).toThrow("already registered");
+    expect(scheduler.forgetSource(a)).toBe(true);
+    expect(scheduler.forgetSource(a)).toBe(false);
+
+    scheduler.registerSource(a);
+    expect(scheduler.forgetSource(a)).toBe(false);
+    scheduler.cancelSource(a);
+    await expect(scheduler.waitForSourceDrain(a)).resolves.toMatchObject({ accepted: 0 });
+    expect(scheduler.forgetSource(a)).toBe(true);
+    expect(scheduler.forgetSource(a)).toBe(false);
+
+    for (let index = 0; index < 128; index++) {
+      const completed = source("A", `turn-long-lived-${index}`);
+      scheduler.registerSource(completed);
+      await scheduler.finishSource(completed);
+      expect(scheduler.forgetSource(completed)).toBe(true);
+    }
+  });
+});
+
+describe("VoiceConsoleSpeechScheduler failure isolation", () => {
+  it("records a typed playback failure, warns once, and continues later chunks", async () => {
+    const failures: unknown[] = [];
+    const played: string[] = [];
+    const playback: VoiceConsoleSpeechPlayback = {
+      play: vi.fn(async ({ chunk: item }) => {
+        if (item.ordinal === 1) {
+          return { status: "failed", durationMs: 0, error: "discord player failed" };
+        }
+        played.push(item.text);
+        return { status: "played", durationMs: 1_000 };
+      }),
+      destroy: vi.fn(),
+    };
+    const scheduler = new VoiceConsoleSpeechScheduler({
+      consoleId,
+      synthesize: async ({ chunk: item }) => ({ ok: true, audio: audio(item.ordinal) }),
+      playback,
+      onFailure: (failure) => failures.push(failure),
+    });
+    scheduler.registerBinding({ bindingId: "A", profile: profileA, outputEnabled: true });
+    const a = source("A", "turn-player-failure");
+    scheduler.registerSource(a);
+    scheduler.enqueueChunk(chunk(a, 1));
+    scheduler.enqueueChunk(chunk(a, 2));
+
+    await expect(scheduler.finishSource(a)).resolves.toMatchObject({ failed: 1, played: 1 });
+    expect(played).toEqual(["A-2"]);
+    expect(failures).toEqual([
+      expect.objectContaining({ phase: "playback", error: "discord player failed" }),
+    ]);
+  });
+
+  it("isolates a throwing warning callback so work and drains still settle", async () => {
+    const warning = vi.fn(() => {
+      throw new Error("warning channel unavailable");
+    });
+    const played: string[] = [];
+    const scheduler = new VoiceConsoleSpeechScheduler({
+      consoleId,
+      synthesize: async ({ chunk: item }) => item.ordinal === 1
+        ? { ok: false, error: "quota" }
+        : { ok: true, audio: audio(item.ordinal) },
+      playback: {
+        play: async ({ chunk: item }) => {
+          played.push(item.text);
+          return { status: "played", durationMs: 1_000 };
+        },
+        destroy: vi.fn(),
+      },
+      onFailure: warning,
+    });
+    scheduler.registerBinding({ bindingId: "A", profile: profileA, outputEnabled: true });
+    const a = source("A", "turn-warning-throws");
+    scheduler.registerSource(a);
+    scheduler.enqueueChunk(chunk(a, 1));
+    scheduler.enqueueChunk(chunk(a, 2));
+    const bindingDrain = scheduler.waitForBindingDrain("A");
+
+    await expect(scheduler.finishSource(a)).resolves.toMatchObject({ failed: 1, played: 1 });
+    await expect(bindingDrain).resolves.toMatchObject({ failed: 1, played: 1 });
+    expect(warning).toHaveBeenCalledTimes(1);
+    expect(played).toEqual(["A-2"]);
+    expect(scheduler.snapshot().currentSource).toBeNull();
   });
 });

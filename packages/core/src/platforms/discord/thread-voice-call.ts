@@ -673,6 +673,7 @@ export class ThreadVoicePlaybackQueue {
   private cycleActive = false;
   private endingStream = false;
   private destroyed = false;
+  private lastPlaybackError: string | undefined;
   private idleWaiters: Array<() => void> = [];
 
   constructor(opts: {
@@ -698,6 +699,7 @@ export class ThreadVoicePlaybackQueue {
     });
     this.player.on("error", (error) => {
       this.logger.warn({ error: error.message }, "thread-voice playback error");
+      this.lastPlaybackError ??= error.message;
       this.finishCycle();
     });
   }
@@ -711,6 +713,7 @@ export class ThreadVoicePlaybackQueue {
     if (source.byteLength % 2 !== 0) {
       throw new Error("Thread Voice playback PCM must contain whole int16 samples");
     }
+    if (this.isIdle()) this.lastPlaybackError = undefined;
     this.pcmTail = Buffer.concat([this.pcmTail, source]);
     this.encodeCompleteFrames();
     this.pump();
@@ -722,6 +725,13 @@ export class ThreadVoicePlaybackQueue {
     this.pump();
     if (this.isIdle()) return Promise.resolve();
     return new Promise((resolve) => this.idleWaiters.push(resolve));
+  }
+
+  /** Consume the most recent player error without changing V1 idle semantics. */
+  takePlaybackError(): string | undefined {
+    const error = this.lastPlaybackError;
+    this.lastPlaybackError = undefined;
+    return error;
   }
 
   /** Stop current/queued audio while keeping the player reusable for capture. */
@@ -737,6 +747,7 @@ export class ThreadVoicePlaybackQueue {
     this.stream = undefined;
     this.cycleActive = false;
     this.endingStream = false;
+    this.lastPlaybackError = undefined;
     try { this.player.stop(true); } catch { /* already idle */ }
     this.onPlaybackIdle?.();
     this.resolveIdleWaiters();
@@ -759,6 +770,7 @@ export class ThreadVoicePlaybackQueue {
     this.stream = undefined;
     this.cycleActive = false;
     this.endingStream = false;
+    this.lastPlaybackError = undefined;
     try {
       this.player.stop(true);
     } catch {

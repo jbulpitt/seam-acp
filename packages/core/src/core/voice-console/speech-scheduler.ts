@@ -130,6 +130,55 @@ export class VoiceConsoleSpeechScheduler {
     });
   }
 
+  /**
+   * Permanently remove one binding while keeping the console player and other
+   * bindings alive. Existing drain waiters receive final stats before the
+   * binding state is discarded.
+   */
+  unregisterBinding(bindingId: string): boolean {
+    const binding = this.bindings.get(bindingId);
+    if (!binding) return false;
+
+    binding.outputEnabled = false;
+    binding.generation += 1;
+    const removedSourceKeys = new Set<string>();
+    const work = this.currentBindingId() === bindingId ? this.currentWork : undefined;
+    if (work) {
+      work.controller.abort();
+      if (!work.settled) {
+        this.settle(work, { kind: "dropped" });
+        work.settled = true;
+      }
+      if (this.currentWork === work) this.currentWork = undefined;
+    }
+
+    for (const [key, source] of this.sources) {
+      if (source.ref.bindingId !== bindingId) continue;
+      source.cancelled = true;
+      source.finished = true;
+      source.segmenter = new StreamingSpeechSegmenter();
+      this.dropPending(source);
+      this.completeSource(key, source, false);
+      this.sources.delete(key);
+      removedSourceKeys.add(key);
+    }
+    this.sourceOrder = this.sourceOrder.filter((key) => !removedSourceKeys.has(key));
+    if (this.sliceSourceKey && removedSourceKeys.has(this.sliceSourceKey)) {
+      this.sliceSourceKey = undefined;
+      this.sliceChunks = 0;
+      this.sliceAudioMs = 0;
+    }
+
+    const keyPrefix = `${bindingId}\u0000`;
+    for (const key of this.completedSources.keys()) {
+      if (key.startsWith(keyPrefix)) this.completedSources.delete(key);
+    }
+    this.resolveBindingWaiters(binding);
+    this.bindings.delete(bindingId);
+    this.kick();
+    return true;
+  }
+
   updateBindingProfile(bindingId: string, profile: VoiceConsoleSpeechProfile): void {
     this.binding(bindingId).profile = normalizeProfile(profile);
   }
@@ -268,6 +317,15 @@ export class VoiceConsoleSpeechScheduler {
     return new Promise((resolve) => source.drainWaiters.push(resolve));
   }
 
+  /**
+   * Release completed-source bookkeeping after its settlement has been handed
+   * to the owner. Safe to repeat and a no-op while the source is still active.
+   */
+  forgetSource(ref: VoiceConsoleSpeechSourceRef): boolean {
+    this.assertConsole(ref.consoleId);
+    return this.completedSources.delete(voiceConsoleSpeechSourceKey(ref));
+  }
+
   snapshot(): VoiceConsoleSpeechSchedulerSnapshot {
     const bindings: VoiceConsoleSpeechBindingSnapshot[] = [];
     let queueDepth = 0;
@@ -290,7 +348,11 @@ export class VoiceConsoleSpeechScheduler {
     return {
       consoleId: this.consoleId,
       currentSource: this.currentWork
-        ? { ...this.sources.get(this.currentWork.sourceKey)!.ref }
+        ? {
+            consoleId: this.currentWork.chunk.consoleId,
+            bindingId: this.currentWork.chunk.bindingId,
+            turnId: this.currentWork.chunk.turnId,
+          }
         : null,
       queueDepth,
       bindings,
@@ -314,10 +376,11 @@ export class VoiceConsoleSpeechScheduler {
       source.cancelled = true;
       source.finished = true;
       this.dropPending(source);
-      this.completeSource(key, source);
+      this.completeSource(key, source, false);
     }
     this.sources.clear();
     this.sourceOrder = [];
+    this.completedSources.clear();
     this.playback.destroy();
     for (const binding of this.bindings.values()) this.resolveBindingWaiters(binding);
   }
@@ -419,29 +482,39 @@ export class VoiceConsoleSpeechScheduler {
     }
 
     try {
-      const synthesis = abortable(
+      // Keep the global synthesis slot until the provider promise actually
+      // settles. Abort suppresses its output, but an abort-ignoring provider
+      // must not allow a second request to overlap it.
+      const synthesized = await Promise.resolve(
+        this.synthesize({
+          chunk: work.chunk,
+          profile: { ...binding.profile },
+          signal: work.controller.signal,
+        })
+      );
+      if (work.controller.signal.aborted) return { kind: "dropped" };
+      if (!synthesized.ok) {
+        return { kind: "failed", phase: "synthesis", error: synthesized.error };
+      }
+      if (!this.isWorkValid(work, source, binding)) return { kind: "dropped" };
+
+      work.phase = "playback";
+      const playback = abortable(
         Promise.resolve(
-          this.synthesize({
+          this.playback.play({
             chunk: work.chunk,
-            profile: { ...binding.profile },
+            audio: synthesized.audio,
             signal: work.controller.signal,
           })
         ),
         work.controller.signal
       );
-      const synthesized = await synthesis;
-      if (synthesized.aborted) return { kind: "dropped" };
-      if (!synthesized.value.ok) {
-        return { kind: "failed", phase: "synthesis", error: synthesized.value.error };
+      const playbackResult = await playback;
+      if (playbackResult.aborted) return { kind: "dropped" };
+      const played = playbackResult.value;
+      if (played.status === "failed") {
+        return { kind: "failed", phase: "playback", error: played.error };
       }
-      if (!this.isWorkValid(work, source, binding)) return { kind: "dropped" };
-
-      work.phase = "playback";
-      const played = await this.playback.play({
-        chunk: work.chunk,
-        audio: synthesized.value.audio,
-        signal: work.controller.signal,
-      });
       if (
         played.status === "cancelled" ||
         !this.isWorkValid(work, source, binding)
@@ -473,12 +546,16 @@ export class VoiceConsoleSpeechScheduler {
       this.recordFairness(work.sourceKey, 0);
       if (!source.warned) {
         source.warned = true;
-        this.onFailure({
-          source: { ...source.ref },
-          ordinal: work.chunk.ordinal,
-          phase: outcome.phase,
-          error: outcome.error,
-        });
+        try {
+          this.onFailure({
+            source: { ...source.ref },
+            ordinal: work.chunk.ordinal,
+            phase: outcome.phase,
+            error: outcome.error,
+          });
+        } catch {
+          // Warning delivery is advisory and cannot own scheduler progress.
+        }
       }
       return;
     }
@@ -598,9 +675,9 @@ export class VoiceConsoleSpeechScheduler {
     this.sourceOrder = this.sourceOrder.filter((candidate) => candidate !== key);
   }
 
-  private completeSource(key: string, source: SourceState): void {
+  private completeSource(key: string, source: SourceState, retain = true): void {
     const stats = copyStats(source.stats);
-    this.completedSources.set(key, stats);
+    if (retain) this.completedSources.set(key, stats);
     const waiters = source.drainWaiters.splice(0, source.drainWaiters.length);
     for (const resolve of waiters) resolve(copyStats(stats));
   }

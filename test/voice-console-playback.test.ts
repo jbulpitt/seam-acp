@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import type { VoiceConsolePcmQueue } from "../packages/core/src/platforms/discord/voice-console-playback.js";
 import { DiscordVoiceConsolePlayback } from "../packages/core/src/platforms/discord/voice-console-playback.js";
@@ -54,6 +55,70 @@ function controlledQueue(): {
 }
 
 describe("DiscordVoiceConsolePlayback", () => {
+  it("builds its reusable player on an injected already-joined connection", () => {
+    const player = new EventEmitter() as EventEmitter & {
+      state: { status: string };
+      stop: ReturnType<typeof vi.fn>;
+    };
+    player.state = { status: "idle" };
+    player.stop = vi.fn(() => true);
+    const unsubscribe = vi.fn();
+    const connection = { subscribe: vi.fn(() => ({ unsubscribe })) };
+    const playback = new DiscordVoiceConsolePlayback({
+      connection,
+      logger: { warn: vi.fn() } as never,
+      dependencies: {
+        createPlayer: (() => player) as never,
+        createResource: ((stream: EventEmitter) => stream) as never,
+        createEncoder: () => ({
+          decode: () => Buffer.alloc(0),
+          encode: () => Buffer.from([1]),
+        }),
+      },
+    });
+
+    expect(connection.subscribe).toHaveBeenCalledTimes(1);
+    playback.destroy();
+    playback.destroy();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports an injected Discord player error instead of marking audio played", async () => {
+    const player = new EventEmitter() as EventEmitter & {
+      state: { status: string };
+      play: ReturnType<typeof vi.fn>;
+      stop: ReturnType<typeof vi.fn>;
+    };
+    player.state = { status: "idle" };
+    player.stop = vi.fn(() => true);
+    player.play = vi.fn(() => {
+      queueMicrotask(() => player.emit("error", new Error("discord player failed")));
+    });
+    const playback = new DiscordVoiceConsolePlayback({
+      connection: { subscribe: vi.fn(() => ({ unsubscribe: vi.fn() })) },
+      logger: { warn: vi.fn() } as never,
+      dependencies: {
+        createPlayer: (() => player) as never,
+        createResource: ((stream: EventEmitter) => stream) as never,
+        createEncoder: () => ({
+          decode: () => Buffer.alloc(0),
+          encode: () => Buffer.from([1]),
+        }),
+      },
+    });
+
+    await expect(playback.play({
+      chunk: chunk("A", 1),
+      audio: audio20ms(),
+      signal: new AbortController().signal,
+    })).resolves.toEqual({
+      status: "failed",
+      durationMs: 0,
+      error: "discord player failed",
+    });
+    playback.destroy();
+  });
+
   it("stops the current source promptly when playback is cancelled", async () => {
     const { queue } = controlledQueue();
     const playback = new DiscordVoiceConsolePlayback({ queue });

@@ -36,7 +36,8 @@ export interface VoiceConsolePlaybackRequest {
 
 export type VoiceConsolePlaybackResult =
   | { status: "played"; durationMs: number }
-  | { status: "cancelled"; durationMs: number };
+  | { status: "cancelled"; durationMs: number }
+  | { status: "failed"; durationMs: number; error: string };
 
 export interface VoiceConsoleSpeechPlayback {
   play(request: VoiceConsolePlaybackRequest): Promise<VoiceConsolePlaybackResult>;

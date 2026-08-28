@@ -15,8 +15,23 @@ import {
 export interface VoiceConsolePcmQueue {
   enqueue(pcm: TtsPcm): void;
   waitForIdle(): Promise<void>;
+  takePlaybackError?(): string | undefined;
   stopAndClear(): void;
   destroy(): void;
+}
+
+export type VoiceConsolePlaybackConnection = Pick<VoiceConnection, "subscribe">;
+
+/**
+ * Package E may inject Package B's shared PCM queue directly, or provide its
+ * already-joined Discord connection so this facade creates only the reusable
+ * audio player/queue. This transport never joins a voice channel itself.
+ */
+export interface DiscordVoiceConsolePlaybackOptions {
+  queue?: VoiceConsolePcmQueue;
+  connection?: VoiceConsolePlaybackConnection;
+  logger?: Logger;
+  dependencies?: PlaybackDependencies;
 }
 
 type ActivePlayback = {
@@ -35,12 +50,7 @@ export class DiscordVoiceConsolePlayback implements VoiceConsoleSpeechPlayback {
   private active: ActivePlayback | undefined;
   private destroyed = false;
 
-  constructor(opts: {
-    queue?: VoiceConsolePcmQueue;
-    connection?: Pick<VoiceConnection, "subscribe">;
-    logger?: Logger;
-    dependencies?: PlaybackDependencies;
-  }) {
+  constructor(opts: DiscordVoiceConsolePlaybackOptions) {
     if (opts.queue) {
       this.queue = opts.queue;
       return;
@@ -80,8 +90,12 @@ export class DiscordVoiceConsolePlayback implements VoiceConsoleSpeechPlayback {
       if (active.cancelled) return { status: "cancelled", durationMs: 0 };
       this.queue.enqueue(request.audio);
       await this.queue.waitForIdle();
-      return active.cancelled || this.destroyed
-        ? { status: "cancelled", durationMs: 0 }
+      if (active.cancelled || this.destroyed) {
+        return { status: "cancelled", durationMs: 0 };
+      }
+      const playbackError = this.queue.takePlaybackError?.();
+      return playbackError
+        ? { status: "failed", durationMs: 0, error: playbackError }
         : { status: "played", durationMs };
     } finally {
       request.signal.removeEventListener("abort", onAbort);

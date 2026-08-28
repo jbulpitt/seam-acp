@@ -36,6 +36,16 @@ import type {
 } from "./choice/types.js";
 import type { IngestEndpoint, IngestEndpointStatus } from "./choice/endpoint.js";
 import type { LiveHelpSession, LiveHelpStatus } from "./live-help/types.js";
+import {
+  composeThreadVoicePrompt,
+  newThreadVoiceDispatchId,
+  type ThreadVoiceBatch,
+  type ThreadVoicePendingStats,
+  type ThreadVoiceSegment,
+  type ThreadVoiceSegmentState,
+  type ThreadVoiceSession,
+  type ThreadVoiceSessionStatus,
+} from "./thread-voice/types.js";
 import { INBOX_MAX_PER_SESSION, type InboxMessage } from "./inbox/types.js";
 import type { ParkedAttachment, ParkedPrompt } from "./parked-prompts/types.js";
 
@@ -279,6 +289,7 @@ export class SessionStore {
     this.db.exec(INGEST_ENDPOINTS_SCHEMA);
     this.migrateIngestEndpointPreset();
     this.db.exec(LIVE_HELP_SCHEMA);
+    this.db.exec(THREAD_VOICE_SCHEMA);
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -1884,6 +1895,486 @@ export class SessionStore {
     return info.changes;
   }
 
+  // --- Thread Voice -------------------------------------------------------
+
+  insertThreadVoiceSession(session: ThreadVoiceSession): void {
+    this.db
+      .prepare(
+        `INSERT INTO thread_voice_sessions
+           (id, platform, channel_ref, parent_ref, guild_id, voice_channel_id,
+            owner_user_id, owner_name, status, notice_message_id,
+            transmitted_audio_ms, created_utc, updated_utc, ended_utc, end_reason)
+         VALUES
+           (@id, @platform, @channelRef, @parentRef, @guildId, @voiceChannelId,
+            @ownerUserId, @ownerName, @status, @noticeMessageId,
+            @transmittedAudioMs, @createdUtc, @updatedUtc, @endedUtc, @endReason)`
+      )
+      .run(session);
+  }
+
+  getThreadVoiceSession(id: string): ThreadVoiceSession | null {
+    const row = this.db
+      .prepare<[string], ThreadVoiceSessionRow>(
+        "SELECT * FROM thread_voice_sessions WHERE id = ?"
+      )
+      .get(id);
+    return row ? mapThreadVoiceSession(row) : null;
+  }
+
+  getActiveThreadVoiceForThread(
+    platform: string,
+    channelRef: string
+  ): ThreadVoiceSession | null {
+    const row = this.db
+      .prepare<[string, string], ThreadVoiceSessionRow>(
+        `SELECT * FROM thread_voice_sessions
+          WHERE platform = ? AND channel_ref = ?
+            AND status IN ('starting','ready','stopping')
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(platform, channelRef);
+    return row ? mapThreadVoiceSession(row) : null;
+  }
+
+  getActiveThreadVoiceForGuild(guildId: string): ThreadVoiceSession | null {
+    const row = this.db
+      .prepare<[string], ThreadVoiceSessionRow>(
+        `SELECT * FROM thread_voice_sessions
+          WHERE guild_id = ? AND status IN ('starting','ready','stopping')
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(guildId);
+    return row ? mapThreadVoiceSession(row) : null;
+  }
+
+  getActiveThreadVoiceForVoiceChannel(voiceChannelId: string): ThreadVoiceSession | null {
+    const row = this.db
+      .prepare<[string], ThreadVoiceSessionRow>(
+        `SELECT * FROM thread_voice_sessions
+          WHERE voice_channel_id = ? AND status IN ('starting','ready','stopping')
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(voiceChannelId);
+    return row ? mapThreadVoiceSession(row) : null;
+  }
+
+  getActiveThreadVoiceForOwner(
+    guildId: string,
+    ownerUserId: string
+  ): ThreadVoiceSession | null {
+    const row = this.db
+      .prepare<[string, string], ThreadVoiceSessionRow>(
+        `SELECT * FROM thread_voice_sessions
+          WHERE guild_id = ? AND owner_user_id = ?
+            AND status IN ('starting','ready','stopping')
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(guildId, ownerUserId);
+    return row ? mapThreadVoiceSession(row) : null;
+  }
+
+  listActiveThreadVoiceSessions(): ThreadVoiceSession[] {
+    return this.db
+      .prepare<[], ThreadVoiceSessionRow>(
+        `SELECT * FROM thread_voice_sessions
+          WHERE status IN ('starting','ready','stopping')
+          ORDER BY created_utc ASC`
+      )
+      .all()
+      .map(mapThreadVoiceSession);
+  }
+
+  listThreadVoiceSessionsWithBufferedSegments(): ThreadVoiceSession[] {
+    return this.db
+      .prepare<[], ThreadVoiceSessionRow>(
+        `SELECT DISTINCT tv.* FROM thread_voice_sessions tv
+           JOIN thread_voice_segments segment ON segment.session_id = tv.id
+          WHERE segment.state IN ('pending','batched')
+          ORDER BY tv.created_utc ASC`
+      )
+      .all()
+      .map(mapThreadVoiceSession);
+  }
+
+  updateThreadVoiceSession(
+    id: string,
+    patch: {
+      status?: ThreadVoiceSessionStatus;
+      noticeMessageId?: string | null;
+      transmittedAudioMs?: number;
+      updatedUtc?: string;
+      endedUtc?: string | null;
+      endReason?: string | null;
+    }
+  ): ThreadVoiceSession | null {
+    const current = this.getThreadVoiceSession(id);
+    if (!current) return null;
+    const next: ThreadVoiceSession = {
+      ...current,
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.noticeMessageId !== undefined
+        ? { noticeMessageId: patch.noticeMessageId }
+        : {}),
+      ...(patch.transmittedAudioMs !== undefined
+        ? { transmittedAudioMs: Math.max(0, Math.trunc(patch.transmittedAudioMs)) }
+        : {}),
+      updatedUtc: patch.updatedUtc ?? new Date().toISOString(),
+      ...(patch.endedUtc !== undefined ? { endedUtc: patch.endedUtc } : {}),
+      ...(patch.endReason !== undefined ? { endReason: patch.endReason } : {}),
+    };
+    this.db
+      .prepare(
+        `UPDATE thread_voice_sessions SET
+           status = @status,
+           notice_message_id = @noticeMessageId,
+           transmitted_audio_ms = @transmittedAudioMs,
+           updated_utc = @updatedUtc,
+           ended_utc = @endedUtc,
+           end_reason = @endReason
+         WHERE id = @id`
+      )
+      .run(next);
+    return next;
+  }
+
+  addThreadVoiceTransmittedAudio(
+    id: string,
+    durationMs: number,
+    updatedUtc = new Date().toISOString()
+  ): number {
+    const delta = Math.max(0, Math.trunc(durationMs));
+    if (delta === 0) return this.getThreadVoiceSession(id)?.transmittedAudioMs ?? 0;
+    this.db
+      .prepare(
+        `UPDATE thread_voice_sessions
+            SET transmitted_audio_ms = transmitted_audio_ms + ?, updated_utc = ?
+          WHERE id = ?`
+      )
+      .run(delta, updatedUtc, id);
+    return this.getThreadVoiceSession(id)?.transmittedAudioMs ?? 0;
+  }
+
+  appendThreadVoiceSegment(
+    segment: ThreadVoiceSegment
+  ): { inserted: boolean; segment: ThreadVoiceSegment } {
+    if (!Number.isInteger(segment.sequence) || segment.sequence < 1) {
+      throw new Error("Thread Voice segment sequence must be a positive integer.");
+    }
+    if (segment.state !== "pending") {
+      throw new Error("Finalized Thread Voice segments must be appended in pending state.");
+    }
+    if (!segment.transcript.trim()) {
+      throw new Error("Finalized Thread Voice transcript must not be empty.");
+    }
+    const session = this.getThreadVoiceSession(segment.sessionId);
+    if (!session) throw new Error(`Thread Voice session \`${segment.sessionId}\` does not exist.`);
+    if (segment.authorId !== session.ownerUserId) {
+      throw new Error("Thread Voice segment author does not match the durable session owner.");
+    }
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO thread_voice_segments
+             (id, session_id, sequence, author_id, transcript, state, audio_ms,
+              dispatch_id, captured_started_utc, captured_ended_utc,
+              created_utc, updated_utc, error)
+           VALUES
+             (@id, @sessionId, @sequence, @authorId, @transcript, @state, @audioMs,
+              @dispatchId, @capturedStartedUtc, @capturedEndedUtc,
+              @createdUtc, @updatedUtc, @error)`
+        )
+        .run({
+          ...segment,
+          transcript: segment.transcript.trim(),
+          audioMs: Math.max(0, Math.trunc(segment.audioMs)),
+        });
+      return {
+        inserted: true,
+        segment: {
+          ...segment,
+          transcript: segment.transcript.trim(),
+          audioMs: Math.max(0, Math.trunc(segment.audioMs)),
+        },
+      };
+    } catch (err) {
+      const existing = this.getThreadVoiceSegmentBySequence(
+        segment.sessionId,
+        segment.sequence
+      );
+      if (existing && (err as { code?: string }).code?.startsWith("SQLITE_CONSTRAINT")) {
+        return { inserted: false, segment: existing };
+      }
+      throw err;
+    }
+  }
+
+  recordDroppedThreadVoiceSegment(
+    segment: ThreadVoiceSegment
+  ): { inserted: boolean; segment: ThreadVoiceSegment } {
+    if (!Number.isInteger(segment.sequence) || segment.sequence < 1) {
+      throw new Error("Thread Voice segment sequence must be a positive integer.");
+    }
+    if (segment.state !== "capture_dropped" && segment.state !== "transcribe_failed") {
+      throw new Error("Dropped Thread Voice segment must use a failure state.");
+    }
+    const session = this.getThreadVoiceSession(segment.sessionId);
+    if (!session) throw new Error(`Thread Voice session \`${segment.sessionId}\` does not exist.`);
+    if (segment.authorId !== session.ownerUserId) {
+      throw new Error("Thread Voice segment author does not match the durable session owner.");
+    }
+    const normalized: ThreadVoiceSegment = {
+      ...segment,
+      transcript: "",
+      audioMs: Math.max(0, Math.trunc(segment.audioMs)),
+      dispatchId: null,
+    };
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO thread_voice_segments
+             (id, session_id, sequence, author_id, transcript, state, audio_ms,
+              dispatch_id, captured_started_utc, captured_ended_utc,
+              created_utc, updated_utc, error)
+           VALUES
+             (@id, @sessionId, @sequence, @authorId, @transcript, @state, @audioMs,
+              @dispatchId, @capturedStartedUtc, @capturedEndedUtc,
+              @createdUtc, @updatedUtc, @error)`
+        )
+        .run(normalized);
+      return { inserted: true, segment: normalized };
+    } catch (err) {
+      const existing = this.getThreadVoiceSegmentBySequence(
+        segment.sessionId,
+        segment.sequence
+      );
+      if (existing && (err as { code?: string }).code?.startsWith("SQLITE_CONSTRAINT")) {
+        return { inserted: false, segment: existing };
+      }
+      throw err;
+    }
+  }
+
+  getThreadVoiceSegment(id: string): ThreadVoiceSegment | null {
+    const row = this.db
+      .prepare<[string], ThreadVoiceSegmentRow>(
+        "SELECT * FROM thread_voice_segments WHERE id = ?"
+      )
+      .get(id);
+    return row ? mapThreadVoiceSegment(row) : null;
+  }
+
+  getThreadVoiceSegmentBySequence(
+    sessionId: string,
+    sequence: number
+  ): ThreadVoiceSegment | null {
+    const row = this.db
+      .prepare<[string, number], ThreadVoiceSegmentRow>(
+        "SELECT * FROM thread_voice_segments WHERE session_id = ? AND sequence = ?"
+      )
+      .get(sessionId, sequence);
+    return row ? mapThreadVoiceSegment(row) : null;
+  }
+
+  listThreadVoiceSegments(
+    sessionId: string,
+    states?: readonly ThreadVoiceSegmentState[]
+  ): ThreadVoiceSegment[] {
+    if (!states || states.length === 0) {
+      return this.db
+        .prepare<[string], ThreadVoiceSegmentRow>(
+          "SELECT * FROM thread_voice_segments WHERE session_id = ? ORDER BY sequence ASC"
+        )
+        .all(sessionId)
+        .map(mapThreadVoiceSegment);
+    }
+    const placeholders = states.map(() => "?").join(",");
+    return this.db
+      .prepare<unknown[], ThreadVoiceSegmentRow>(
+        `SELECT * FROM thread_voice_segments
+          WHERE session_id = ? AND state IN (${placeholders})
+          ORDER BY sequence ASC`
+      )
+      .all(sessionId, ...states)
+      .map(mapThreadVoiceSegment);
+  }
+
+  nextThreadVoiceSequence(sessionId: string): number {
+    const row = this.db
+      .prepare<[string], { next_sequence: number }>(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM thread_voice_segments WHERE session_id = ?"
+      )
+      .get(sessionId);
+    return row?.next_sequence ?? 1;
+  }
+
+  getThreadVoicePendingStats(
+    platform: string,
+    channelRef: string
+  ): ThreadVoicePendingStats {
+    const row = this.db
+      .prepare<
+        [string, string],
+        { segment_count: number; character_count: number; active_dispatch_id: string | null }
+      >(
+        `SELECT
+           COUNT(*) AS segment_count,
+           COALESCE(SUM(LENGTH(segment.transcript)), 0) AS character_count,
+           MAX(CASE WHEN segment.state = 'batched' THEN segment.dispatch_id END) AS active_dispatch_id
+         FROM thread_voice_segments segment
+         JOIN thread_voice_sessions tv ON tv.id = segment.session_id
+         WHERE tv.platform = ? AND tv.channel_ref = ?
+           AND segment.state IN ('pending','batched')`
+      )
+      .get(platform, channelRef);
+    return {
+      segmentCount: row?.segment_count ?? 0,
+      characterCount: row?.character_count ?? 0,
+      activeDispatchId: row?.active_dispatch_id ?? null,
+    };
+  }
+
+  hasThreadVoiceBufferedSegments(platform: string, channelRef: string): boolean {
+    return this.getThreadVoicePendingStats(platform, channelRef).segmentCount > 0;
+  }
+
+  /**
+   * Atomic pending snapshot. Rows finalized after this transaction wait for the
+   * next batch. A pre-existing batched dispatch for the same home thread blocks
+   * another claim until recovery/enqueue resolves it.
+   */
+  claimPendingThreadVoiceBatch(
+    sessionId: string,
+    dispatchId = newThreadVoiceDispatchId(),
+    claimedUtc = new Date().toISOString()
+  ): ThreadVoiceBatch | null {
+    const claim = this.db.transaction((): ThreadVoiceBatch | null => {
+      const sessionRow = this.db
+        .prepare<[string], ThreadVoiceSessionRow>(
+          "SELECT * FROM thread_voice_sessions WHERE id = ?"
+        )
+        .get(sessionId);
+      if (!sessionRow) return null;
+      const existing = this.db
+        .prepare<[string, string], { dispatch_id: string }>(
+          `SELECT segment.dispatch_id FROM thread_voice_segments segment
+             JOIN thread_voice_sessions tv ON tv.id = segment.session_id
+            WHERE tv.platform = ? AND tv.channel_ref = ?
+              AND segment.state = 'batched' AND segment.dispatch_id IS NOT NULL
+            LIMIT 1`
+        )
+        .get(sessionRow.platform, sessionRow.channel_ref);
+      if (existing) return null;
+
+      const pending = this.db
+        .prepare<[string], ThreadVoiceSegmentRow>(
+          `SELECT * FROM thread_voice_segments
+            WHERE session_id = ? AND state = 'pending'
+            ORDER BY sequence ASC`
+        )
+        .all(sessionId);
+      if (pending.length === 0) return null;
+      this.db
+        .prepare(
+          `UPDATE thread_voice_segments
+              SET state = 'batched', dispatch_id = ?, updated_utc = ?
+            WHERE session_id = ? AND state = 'pending'`
+        )
+        .run(dispatchId, claimedUtc, sessionId);
+      const session = mapThreadVoiceSession(sessionRow);
+      const segments = pending.map((row) =>
+        mapThreadVoiceSegment({
+          ...row,
+          state: "batched",
+          dispatch_id: dispatchId,
+          updated_utc: claimedUtc,
+        })
+      );
+      return {
+        dispatchId,
+        session,
+        segments,
+        prompt: composeThreadVoicePrompt(session.ownerUserId, segments),
+      };
+    });
+    return claim();
+  }
+
+  getThreadVoiceBatch(dispatchId: string): ThreadVoiceBatch | null {
+    const rows = this.db
+      .prepare<[string], ThreadVoiceSegmentRow>(
+        `SELECT * FROM thread_voice_segments
+          WHERE dispatch_id = ? ORDER BY sequence ASC`
+      )
+      .all(dispatchId);
+    if (rows.length === 0) return null;
+    const session = this.getThreadVoiceSession(rows[0]!.session_id);
+    if (!session) return null;
+    const segments = rows.map(mapThreadVoiceSegment);
+    return {
+      dispatchId,
+      session,
+      segments,
+      prompt: composeThreadVoicePrompt(session.ownerUserId, segments),
+    };
+  }
+
+  listRecoverableThreadVoiceBatches(): ThreadVoiceBatch[] {
+    return this.listThreadVoiceBatchesByState("batched");
+  }
+
+  listThreadVoiceBatchesByState(
+    state: "batched" | "dispatched"
+  ): ThreadVoiceBatch[] {
+    const ids = this.db
+      .prepare<[string], { dispatch_id: string }>(
+        `SELECT dispatch_id FROM thread_voice_segments
+          WHERE state = ? AND dispatch_id IS NOT NULL
+          GROUP BY dispatch_id ORDER BY MIN(created_utc) ASC`
+      )
+      .all(state);
+    return ids
+      .map(({ dispatch_id }) => this.getThreadVoiceBatch(dispatch_id))
+      .filter((batch): batch is ThreadVoiceBatch => batch !== null);
+  }
+
+  markThreadVoiceBatchDispatched(
+    dispatchId: string,
+    updatedUtc = new Date().toISOString()
+  ): number {
+    return this.db
+      .prepare(
+        `UPDATE thread_voice_segments SET state = 'dispatched', updated_utc = ?, error = NULL
+          WHERE dispatch_id = ? AND state = 'batched'`
+      )
+      .run(updatedUtc, dispatchId).changes;
+  }
+
+  markThreadVoiceBatchError(
+    dispatchId: string,
+    error: string,
+    updatedUtc = new Date().toISOString()
+  ): number {
+    return this.db
+      .prepare(
+        `UPDATE thread_voice_segments SET error = ?, updated_utc = ?
+          WHERE dispatch_id = ? AND state = 'batched'`
+      )
+      .run(error, updatedUtc, dispatchId).changes;
+  }
+
+  discardPendingThreadVoiceSegments(
+    sessionId: string,
+    updatedUtc = new Date().toISOString()
+  ): number {
+    return this.db
+      .prepare(
+        `UPDATE thread_voice_segments
+            SET state = 'discarded', transcript = '', updated_utc = ?, error = NULL
+          WHERE session_id = ? AND state = 'pending'`
+      )
+      .run(updatedUtc, sessionId).changes;
+  }
+
   claimIngestStudent(
     ingestId: string,
     studentId: string
@@ -2448,6 +2939,126 @@ CREATE INDEX IF NOT EXISTS idx_live_help_status ON live_help_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_live_help_vc ON live_help_sessions(voice_channel_id, status);
 CREATE INDEX IF NOT EXISTS idx_live_help_author ON live_help_sessions(platform, authoring_channel_ref, status);
 `;
+
+const THREAD_VOICE_SCHEMA = `
+CREATE TABLE IF NOT EXISTS thread_voice_sessions (
+  id                    TEXT PRIMARY KEY,
+  platform              TEXT NOT NULL,
+  channel_ref           TEXT NOT NULL,
+  parent_ref            TEXT,
+  guild_id              TEXT NOT NULL,
+  voice_channel_id      TEXT NOT NULL,
+  owner_user_id         TEXT NOT NULL,
+  owner_name            TEXT NOT NULL,
+  status                TEXT NOT NULL,
+  notice_message_id     TEXT,
+  transmitted_audio_ms  INTEGER NOT NULL DEFAULT 0,
+  created_utc           TEXT NOT NULL,
+  updated_utc           TEXT NOT NULL,
+  ended_utc             TEXT,
+  end_reason            TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_voice_active_thread
+  ON thread_voice_sessions(platform, channel_ref)
+  WHERE status IN ('starting','ready','stopping');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_voice_active_guild
+  ON thread_voice_sessions(guild_id)
+  WHERE status IN ('starting','ready','stopping');
+CREATE INDEX IF NOT EXISTS idx_thread_voice_active_vc
+  ON thread_voice_sessions(voice_channel_id, status);
+CREATE INDEX IF NOT EXISTS idx_thread_voice_active_owner
+  ON thread_voice_sessions(guild_id, owner_user_id, status);
+
+CREATE TABLE IF NOT EXISTS thread_voice_segments (
+  id                    TEXT PRIMARY KEY,
+  session_id            TEXT NOT NULL,
+  sequence              INTEGER NOT NULL,
+  author_id             TEXT NOT NULL,
+  transcript            TEXT NOT NULL,
+  state                 TEXT NOT NULL,
+  audio_ms              INTEGER NOT NULL DEFAULT 0,
+  dispatch_id           TEXT,
+  captured_started_utc  TEXT NOT NULL,
+  captured_ended_utc    TEXT NOT NULL,
+  created_utc           TEXT NOT NULL,
+  updated_utc           TEXT NOT NULL,
+  error                 TEXT,
+  UNIQUE(session_id, sequence),
+  FOREIGN KEY(session_id) REFERENCES thread_voice_sessions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_thread_voice_segments_pending
+  ON thread_voice_segments(session_id, state, sequence);
+CREATE INDEX IF NOT EXISTS idx_thread_voice_segments_dispatch
+  ON thread_voice_segments(dispatch_id);
+`;
+
+interface ThreadVoiceSessionRow {
+  id: string;
+  platform: string;
+  channel_ref: string;
+  parent_ref: string | null;
+  guild_id: string;
+  voice_channel_id: string;
+  owner_user_id: string;
+  owner_name: string;
+  status: string;
+  notice_message_id: string | null;
+  transmitted_audio_ms: number;
+  created_utc: string;
+  updated_utc: string;
+  ended_utc: string | null;
+  end_reason: string | null;
+}
+
+const mapThreadVoiceSession = (row: ThreadVoiceSessionRow): ThreadVoiceSession => ({
+  id: row.id,
+  platform: row.platform,
+  channelRef: row.channel_ref,
+  parentRef: row.parent_ref,
+  guildId: row.guild_id,
+  voiceChannelId: row.voice_channel_id,
+  ownerUserId: row.owner_user_id,
+  ownerName: row.owner_name,
+  status: row.status as ThreadVoiceSessionStatus,
+  noticeMessageId: row.notice_message_id,
+  transmittedAudioMs: row.transmitted_audio_ms,
+  createdUtc: row.created_utc,
+  updatedUtc: row.updated_utc,
+  endedUtc: row.ended_utc,
+  endReason: row.end_reason,
+});
+
+interface ThreadVoiceSegmentRow {
+  id: string;
+  session_id: string;
+  sequence: number;
+  author_id: string;
+  transcript: string;
+  state: string;
+  audio_ms: number;
+  dispatch_id: string | null;
+  captured_started_utc: string;
+  captured_ended_utc: string;
+  created_utc: string;
+  updated_utc: string;
+  error: string | null;
+}
+
+const mapThreadVoiceSegment = (row: ThreadVoiceSegmentRow): ThreadVoiceSegment => ({
+  id: row.id,
+  sessionId: row.session_id,
+  sequence: row.sequence,
+  authorId: row.author_id,
+  transcript: row.transcript,
+  state: row.state as ThreadVoiceSegmentState,
+  audioMs: row.audio_ms,
+  dispatchId: row.dispatch_id,
+  capturedStartedUtc: row.captured_started_utc,
+  capturedEndedUtc: row.captured_ended_utc,
+  createdUtc: row.created_utc,
+  updatedUtc: row.updated_utc,
+  error: row.error,
+});
 
 interface LiveHelpRow {
   id: string;

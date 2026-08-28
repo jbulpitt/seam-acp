@@ -96,6 +96,24 @@ async function flush(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+async function seedFiveSelectedBindings(): Promise<void> {
+  store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-1") });
+  for (const id of ["bind-2", "bind-3", "bind-4", "bind-5"]) {
+    const added = await manager.addBinding({
+      binding: binding(id, { status: "adding" }),
+      claim: false,
+      expectedRevision: store.getVoiceConsole("tvc_1")!.revision,
+    });
+    if (!added.ok) throw new Error(added.error);
+  }
+  const selected = store.replaceVoiceConsoleInputTargets("tvc_1", {
+    bindingIds: ["bind-1", "bind-2", "bind-3", "bind-4", "bind-5"],
+    fanoutArmed: true,
+    expectedRevision: store.getVoiceConsole("tvc_1")!.revision,
+  });
+  if (!selected.ok) throw new Error(selected.error);
+}
+
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-voice-console-manager-"));
   store = new SessionStore(path.join(dir, "test.db"));
@@ -237,6 +255,187 @@ describe("VoiceConsoleManager lifecycle", () => {
         captureId: "capture-after-failed-add",
       })?.assignments
     ).toEqual([expect.objectContaining({ bindingId: "bind-a" })]);
+  });
+
+  it("rejects a sixth claimed fan-out binding before host attach without leaking staged state", async () => {
+    await seedFiveSelectedBindings();
+    vi.mocked(host.addBinding).mockClear();
+    vi.mocked(host.stopBinding).mockClear();
+    const priorTargets = store.listVoiceConsoleInputTargets("tvc_1").map((row) => row.bindingId);
+
+    const result = await manager.addBinding({
+      binding: binding("bind-6", { status: "adding" }),
+      claim: true,
+      expectedRevision: store.getVoiceConsole("tvc_1")!.revision,
+      interactionId: "add-sixth-claimed",
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "invalid-targets",
+      error: "Voice Console fan-out target limit is five.",
+    });
+    expect(host.addBinding).not.toHaveBeenCalled();
+    expect(host.stopBinding).not.toHaveBeenCalled();
+    expect(store.getVoiceConsoleBinding("bind-6")).toBeNull();
+    expect(store.listVoiceConsoleInputTargets("tvc_1").map((row) => row.bindingId)).toEqual(
+      priorTargets
+    );
+  });
+
+  it("terminalizes and detaches once when activation throws after host attach", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    const activation = vi
+      .spyOn(store, "activateVoiceConsoleBinding")
+      .mockImplementationOnce(() => {
+        throw new Error("activation exploded");
+      });
+
+    await expect(
+      manager.addBinding({
+        binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+        claim: true,
+        expectedRevision: 1,
+      })
+    ).rejects.toThrow("activation exploded");
+
+    activation.mockRestore();
+    expect(host.stopBinding).toHaveBeenCalledOnce();
+    expect(host.stopBinding).toHaveBeenCalledWith("bind-b", "activation exploded");
+    expect(store.getVoiceConsoleBinding("bind-b")?.status).toBe("failed");
+    expect(store.listVoiceConsoleInputTargets("tvc_1").map((row) => row.bindingId)).toEqual([
+      "bind-a",
+    ]);
+  });
+
+  it("terminalizes and detaches once when activation loses a revision race", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    vi.mocked(host.addBinding).mockImplementationOnce(async () => {
+      const raced = store.replaceVoiceConsoleInputTargets("tvc_1", {
+        bindingIds: ["bind-a"],
+        fanoutArmed: false,
+        expectedRevision: 2,
+      });
+      if (!raced.ok) throw new Error(raced.error);
+      return { ok: true };
+    });
+
+    await expect(
+      manager.addBinding({
+        binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+        claim: true,
+        expectedRevision: 1,
+      })
+    ).rejects.toThrow("Console changed; refresh.");
+
+    expect(host.stopBinding).toHaveBeenCalledOnce();
+    expect(host.stopBinding).toHaveBeenCalledWith("bind-b", "Console changed; refresh.");
+    expect(store.getVoiceConsoleBinding("bind-b")?.status).toBe("failed");
+    expect(store.listVoiceConsoleInputTargets("tvc_1").map((row) => row.bindingId)).toEqual([
+      "bind-a",
+    ]);
+  });
+
+  it("terminalizes a staged binding and preserves targets when host attach throws", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    vi.mocked(host.addBinding).mockRejectedValueOnce(new Error("attach exploded"));
+
+    await expect(
+      manager.addBinding({
+        binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+        claim: true,
+        expectedRevision: 1,
+      })
+    ).rejects.toThrow("attach exploded");
+
+    expect(host.stopBinding).toHaveBeenCalledOnce();
+    expect(host.stopBinding).toHaveBeenCalledWith("bind-b", "attach exploded");
+    expect(store.getVoiceConsoleBinding("bind-b")?.status).toBe("failed");
+    expect(store.listVoiceConsoleInputTargets("tvc_1").map((row) => row.bindingId)).toEqual([
+      "bind-a",
+    ]);
+  });
+
+  it("keeps the original activation error and terminal state when detach cleanup throws", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    const activation = vi
+      .spyOn(store, "activateVoiceConsoleBinding")
+      .mockImplementationOnce(() => {
+        throw new Error("activation invariant failed");
+      });
+    vi.mocked(host.stopBinding).mockRejectedValueOnce(new Error("detach cleanup failed"));
+
+    await expect(
+      manager.addBinding({
+        binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+        claim: true,
+        expectedRevision: 1,
+      })
+    ).rejects.toThrow("activation invariant failed");
+
+    activation.mockRestore();
+    expect(host.stopBinding).toHaveBeenCalledOnce();
+    expect(store.getVoiceConsoleBinding("bind-b")?.status).toBe("failed");
+    expect(store.listVoiceConsoleInputTargets("tvc_1").map((row) => row.bindingId)).toEqual([
+      "bind-a",
+    ]);
+  });
+
+  it("falls back to direct terminalization without masking the original activation error", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    const activation = vi
+      .spyOn(store, "activateVoiceConsoleBinding")
+      .mockImplementationOnce(() => {
+        throw new Error("activation remains authoritative");
+      });
+    const terminalization = vi
+      .spyOn(store, "failStagedVoiceConsoleBinding")
+      .mockImplementationOnce(() => {
+        throw new Error("atomic cleanup failed");
+      });
+
+    await expect(
+      manager.addBinding({
+        binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+        claim: true,
+        expectedRevision: 1,
+      })
+    ).rejects.toThrow("activation remains authoritative");
+
+    activation.mockRestore();
+    terminalization.mockRestore();
+    expect(host.stopBinding).toHaveBeenCalledOnce();
+    expect(store.getVoiceConsoleBinding("bind-b")?.status).toBe("failed");
+    expect(store.listVoiceConsoleInputTargets("tvc_1").map((row) => row.bindingId)).toEqual([
+      "bind-a",
+    ]);
+  });
+
+  it("allows a sixth unclaimed binding to activate without changing five selected targets", async () => {
+    await seedFiveSelectedBindings();
+    vi.mocked(host.addBinding).mockClear();
+    vi.mocked(host.stopBinding).mockClear();
+    const priorTargets = store.listVoiceConsoleInputTargets("tvc_1").map((row) => row.bindingId);
+
+    const result = await manager.addBinding({
+      binding: binding("bind-6", { status: "adding" }),
+      claim: false,
+      expectedRevision: store.getVoiceConsole("tvc_1")!.revision,
+    });
+
+    if (!result.ok) throw new Error(result.error);
+    expect(result.value.bindings.find((row) => row.id === "bind-6")?.status).toBe("active");
+    expect(result.value.targets.map((row) => row.bindingId)).toEqual(priorTargets);
+    expect(host.addBinding).toHaveBeenCalledOnce();
+    expect(host.stopBinding).not.toHaveBeenCalled();
+    expect(
+      manager.allocateCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-1",
+        speakerName: "Speaker",
+        captureId: "capture-five-targets",
+      })?.assignments.map((assignment) => assignment.bindingId)
+    ).toEqual(priorTargets);
   });
 
   it.each(["capturing", "finalizing"] as const)(

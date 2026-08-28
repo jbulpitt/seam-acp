@@ -80,21 +80,49 @@ export class VoiceConsoleManager {
     const console = outcome.value.console;
     const binding = this.store.getVoiceConsoleBinding(input.binding.id);
     if (!binding) throw new Error("Voice Console binding disappeared after add.");
-    const attached = await this.host.addBinding(console, binding);
-    if (attached.ok) {
+    let attachAttempted = false;
+    try {
+      attachAttempted = true;
+      const attached = await this.host.addBinding(console, binding);
+      if (!attached.ok) throw new Error(attached.reason);
       const activated = this.store.activateVoiceConsoleBinding(binding.id, {
         expectedRevision: console.revision,
         claim: input.claim,
         updatedUtc: this.now(),
       });
       if (activated.ok) return activated;
-      await this.host.stopBinding(binding.id, activated.error).catch(() => undefined);
-      this.failStagedBinding(binding.id, activated.error);
       throw new Error(activated.error);
+    } catch (err) {
+      const reason = errorMessage(err);
+      const failedUtc = this.now();
+      try {
+        this.store.failStagedVoiceConsoleBinding(binding.id, reason, failedUtc);
+      } catch (cleanupErr) {
+        this.logger.error(
+          { err: cleanupErr, bindingId: binding.id },
+          "voice console staged binding terminalization failed"
+        );
+        try {
+          this.store.finishVoiceConsoleBindingRemoval(binding.id, "failed", reason, failedUtc);
+        } catch (fallbackErr) {
+          this.logger.error(
+            { err: fallbackErr, bindingId: binding.id },
+            "voice console staged binding terminalization fallback failed"
+          );
+        }
+      }
+      if (attachAttempted) {
+        try {
+          await this.host.stopBinding(binding.id, reason);
+        } catch (cleanupErr) {
+          this.logger.warn(
+            { err: cleanupErr, bindingId: binding.id },
+            "voice console binding detach cleanup failed"
+          );
+        }
+      }
+      throw new Error(reason);
     }
-
-    this.failStagedBinding(binding.id, attached.reason);
-    throw new Error(attached.reason);
   }
 
   allocateCapture(input: Parameters<SessionStore["allocateVoiceConsoleCapture"]>[0]) {
@@ -443,21 +471,6 @@ export class VoiceConsoleManager {
       }
     }
     return discarded;
-  }
-
-  private failStagedBinding(bindingId: string, reason: string): void {
-    const binding = this.store.getVoiceConsoleBinding(bindingId);
-    if (!binding || binding.status !== "adding") return;
-    const console = this.store.getVoiceConsole(binding.consoleId);
-    if (!console || console.status === "ended" || console.status === "failed") return;
-    const removal = this.store.beginVoiceConsoleBindingRemoval(bindingId, {
-      expectedRevision: console.revision,
-      reason,
-      updatedUtc: this.now(),
-    });
-    if (removal.ok) {
-      this.store.finishVoiceConsoleBindingRemoval(bindingId, "failed", reason, this.now());
-    }
   }
 
   /**

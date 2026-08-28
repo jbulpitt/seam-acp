@@ -2116,6 +2116,13 @@ export class SessionStore {
       if (this.listVoiceConsoleBindings(console.id).length >= 10) {
         return mutationFailure("binding-limit", "Voice Console already has ten active bindings.");
       }
+      if (
+        input.claim !== false &&
+        console.fanoutArmed &&
+        this.listVoiceConsoleInputTargets(console.id).length >= 5
+      ) {
+        return mutationFailure("invalid-targets", "Voice Console fan-out target limit is five.");
+      }
       const binding = normalizeBinding({ ...input.binding, status: "adding" });
       if (binding.guildId !== console.guildId || binding.voiceChannelId !== console.voiceChannelId) {
         return mutationFailure("inactive", "Binding guild/voice channel does not match its console.");
@@ -2188,6 +2195,32 @@ export class SessionStore {
       };
     });
     return activate();
+  }
+
+  /**
+   * Cleanup authority for a binding whose host attachment/activation failed.
+   * This intentionally has no caller revision precondition: the staged row
+   * must become terminal even when activation lost a revision race.
+   */
+  failStagedVoiceConsoleBinding(
+    bindingId: string,
+    reason: string,
+    failedUtc = new Date().toISOString()
+  ): ThreadVoiceBinding | null {
+    const fail = this.db.transaction((): ThreadVoiceBinding | null => {
+      const binding = this.getVoiceConsoleBinding(bindingId);
+      if (!binding || binding.status !== "adding") return binding;
+      this.db.prepare("DELETE FROM voice_console_input_targets WHERE binding_id = ?").run(bindingId);
+      const changed = this.db
+        .prepare(
+          `UPDATE thread_voice_sessions SET status = 'failed', updated_utc = ?, ended_utc = ?,
+             end_reason = ? WHERE id = ? AND console_id IS NOT NULL AND status = 'adding'`
+        )
+        .run(failedUtc, failedUtc, reason, bindingId);
+      if (changed.changes > 0) this.bumpVoiceConsoleRevision(binding.consoleId, failedUtc);
+      return this.getVoiceConsoleBinding(bindingId);
+    });
+    return fail();
   }
 
   replaceVoiceConsoleInputTargets(

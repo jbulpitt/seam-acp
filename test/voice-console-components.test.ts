@@ -388,7 +388,7 @@ describe("alias parser", () => {
       ["**Admin**", "＊＊Admin＊＊"],
       ["`code`", "｀code｀"],
       ["> quote ||spoiler||", "＞ quote ｜｜spoiler｜｜"],
-      ["[Open](https://evil.example)", "［Open］（https：／／evil.example）"],
+      ["[Open](https://evil.example)", "［Open］（https：／／evil．example）"],
       ["\\*escaped\\*", "＼＊escaped＼＊"],
       ["家族😀 **Admin**", "家族😀 ＊＊Admin＊＊"],
     ] as const;

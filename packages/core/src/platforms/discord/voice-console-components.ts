@@ -28,7 +28,7 @@ export const VOICE_CONSOLE_DISCORD_LIMITS = {
   modalFieldLabel: 45,
 } as const;
 
-const ALIAS_REPLACEMENTS = new Map<string, string>([
+const DISCORD_TEXT_REPLACEMENTS = new Map<string, string>([
   ["\\", "＼"],
   ["`", "｀"],
   ["*", "＊"],
@@ -48,6 +48,7 @@ const ALIAS_REPLACEMENTS = new Map<string, string>([
   ["!", "！"],
   [":", "："],
   ["/", "／"],
+  [".", "．"],
 ]);
 
 /**
@@ -71,18 +72,23 @@ export function truncateVoiceConsoleText(value: string, maxUnits: number): strin
 }
 
 /**
- * Presentation-safe alias text. Full-width replacements make Discord mention,
- * Markdown, spoiler, link, and escape syntax inert without hiding the input.
+ * Presentation-safe dynamic text. Full-width replacements make Discord
+ * mention, Markdown, spoiler, link, and escape syntax inert without hiding it.
  */
-export function inertVoiceConsoleAlias(input: string): string {
+export function inertVoiceConsoleText(input: string): string {
   const visible = input
     .normalize("NFKC")
     .replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u206F]/g, "")
     .replace(/\s+/g, " ")
     .trim();
   return [...visible]
-    .map((character) => ALIAS_REPLACEMENTS.get(character) ?? character)
+    .map((character) => DISCORD_TEXT_REPLACEMENTS.get(character) ?? character)
     .join("");
+}
+
+/** Backward-compatible semantic name for binding aliases. */
+export function inertVoiceConsoleAlias(input: string): string {
+  return inertVoiceConsoleText(input);
 }
 
 export const VOICE_CONSOLE_ACTIONS = [

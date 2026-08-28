@@ -14,6 +14,7 @@ import {
   renderFanoutDisarmConfirmation,
   renderVoiceConsoleBindingEditor,
   renderVoiceConsoleEndConfirmation,
+  renderVoiceConsoleMutationConfirmation,
   renderVoiceConsolePanel,
   renderVoiceConsolePermissionError,
   renderVoiceConsoleStatusPages,
@@ -27,6 +28,8 @@ import {
 } from "../packages/core/src/platforms/discord/voice-console-panel.js";
 import {
   inertVoiceConsoleAlias,
+  inertVoiceConsoleText,
+  truncateVoiceConsoleText,
   voiceConsoleVoiceIndex,
   type VoiceConsoleBindingEditorDraft,
   type VoiceConsoleComponentRow,
@@ -447,6 +450,72 @@ describe("inert alias presentation", () => {
 });
 
 describe("confirmation and profile views", () => {
+  it("makes every dynamic mutation-confirmation string inert and Discord-valid", () => {
+    const title = "Alias saved: **Admin** `inline` ```fenced``` 😀".repeat(20);
+    const summary = [
+      "Alias is [Open](https://evil.example) ||spoiler||",
+      "> blockquote",
+      "<#123456789012345678> <@123456789012345678>",
+      "<@&123456789012345678> @everyone @here",
+      "\\*escaped\\* https://evil.example",
+      "astral 😀 家族",
+    ].join("\n").repeat(40);
+    const panel = renderVoiceConsoleMutationConfirmation({
+      title,
+      summary,
+      revision: 13,
+    });
+    const built = discordPanelJson(panel);
+    const serialized = JSON.stringify(built);
+
+    expect(panel.title).toBe(truncateVoiceConsoleText(
+      inertVoiceConsoleText(title),
+      VOICE_CONSOLE_EMBED_LIMITS.title
+    ));
+    expect(panel.description).toBeDefined();
+    expect(serialized).toContain("＊＊Admin＊＊");
+    expect(serialized).toContain("｀inline｀");
+    expect(serialized).toContain("｀｀｀fenced｀｀｀");
+    expect(serialized).toContain("｜｜spoiler｜｜");
+    expect(serialized).toContain("＞ blockquote");
+    expect(serialized).toContain("＜＃123456789012345678＞");
+    expect(serialized).toContain("＜＠123456789012345678＞");
+    expect(serialized).toContain("＜＠&123456789012345678＞");
+    expect(serialized).toContain("＠everyone");
+    expect(serialized).toContain("＠here");
+    expect(serialized).toContain("＼＊escaped＼＊");
+    expect(serialized).toContain("https：／／evil．example");
+    expect(serialized).toContain("😀");
+    for (const activeSyntax of [
+      "**Admin**",
+      "`inline`",
+      "```fenced```",
+      "||spoiler||",
+      "> blockquote",
+      "[Open](https://evil.example)",
+      "https://evil.example",
+      "<#123456789012345678>",
+      "<@123456789012345678>",
+      "<@&123456789012345678>",
+      "@everyone",
+      "@here",
+      "\\*escaped\\*",
+    ]) {
+      expect(serialized).not.toContain(activeSyntax);
+    }
+    expect(built.embed.title?.length ?? 0).toBeLessThanOrEqual(
+      VOICE_CONSOLE_EMBED_LIMITS.title
+    );
+    expect(built.embed.description?.length ?? 0).toBeLessThanOrEqual(
+      VOICE_CONSOLE_EMBED_LIMITS.description
+    );
+    expect(embedTextUnits(built.embed)).toBeLessThanOrEqual(
+      VOICE_CONSOLE_EMBED_LIMITS.aggregate
+    );
+    expect(hasUnpairedSurrogate(built.embed.title ?? "")).toBe(false);
+    expect(hasUnpairedSurrogate(built.embed.description ?? "")).toBe(false);
+  });
+
   it("requires explicit end confirmation and defaults to preservation", () => {
     const panel = renderVoiceConsoleEndConfirmation({
       consoleId: "tvc_console",

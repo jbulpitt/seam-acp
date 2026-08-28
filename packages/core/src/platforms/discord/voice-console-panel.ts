@@ -13,6 +13,7 @@ import {
   buildVoicePreviewRows,
   effectiveVoiceConsoleBindingProfile,
   inertVoiceConsoleAlias,
+  inertVoiceConsoleText,
   truncateVoiceConsoleText,
   voiceConsolePreviewRequest,
   type VoiceConsoleBindingControlOption,
@@ -510,8 +511,8 @@ export function renderVoiceConsoleMutationConfirmation(input: {
 }): VoiceConsolePanelSpec {
   return constrainVoiceConsolePanel({
     color: 0x57f287,
-    title: safeText(input.title),
-    description: safeText(input.summary),
+    title: inertVoiceConsoleText(input.title),
+    description: inertVoiceConsoleText(input.summary),
     fields: [],
     footer: `Saved · revision ${input.revision}`,
     components: [],

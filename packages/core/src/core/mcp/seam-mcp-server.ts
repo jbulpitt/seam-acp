@@ -27,6 +27,7 @@ import type { Logger } from "../../lib/logger.js";
 import type { SessionRecord } from "../types.js";
 import type { DispatchSpec } from "../dispatch/types.js";
 import { frameSteerPrompt } from "../steer.js";
+import { formatLocalTime } from "../format-time.js";
 import { buildChainHopSpec } from "../dispatch/types.js";
 import type { ConfigDescription } from "../session-router.js";
 import type { ConfigMutationInput } from "../config-mutation.js";
@@ -1765,7 +1766,7 @@ export class SeamMcpServer {
       lines.push(
         `• ${name} — id ${t.id} [${flags.join(", ")}]` +
           (cfg ? `\n    ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
-          `\n    last active ${t.lastActivityUtc}`
+          `\n    last active ${formatLocalTime(t.lastActivityUtc)}`
       );
     }
     lines.push(
@@ -1848,7 +1849,7 @@ export class SeamMcpServer {
       fireOnStartup
         ? `Wake ${result.wakeId} scheduled — this thread will resume on the next process boot with your prompt ` +
             `replayed as a live turn. It fires once on startup; call schedule_wake again during that turn to continue.`
-        : `Wake ${result.wakeId} scheduled — this thread will resume at ${result.fireAtUtc} with your prompt ` +
+        : `Wake ${result.wakeId} scheduled — this thread will resume at ${formatLocalTime(result.fireAtUtc)} with your prompt ` +
             `replayed as a live turn. It fires once; call schedule_wake again during that turn to continue a loop.`
     );
   }
@@ -2020,7 +2021,7 @@ export class SeamMcpServer {
     return textResult(
       `Watch ${result.watchId} registered — the bridge will check this ${kind} condition every ` +
         `${result.intervalSeconds}s and re-enter this thread with a live turn ONLY when it fires. ` +
-        `It auto-expires at ${result.expiresAtUtc} (you'll be told if it expires without firing).`
+        `It auto-expires at ${formatLocalTime(result.expiresAtUtc)} (you'll be told if it expires without firing).`
     );
   }
 
@@ -2051,7 +2052,7 @@ export class SeamMcpServer {
     const lines = watches.map((w) => {
       const fires = w.mode === "each" ? ` [${w.fireCount}/${w.maxFires} fires]` : "";
       const reason = w.reason ? ` — ${w.reason}` : "";
-      return `• ${w.id} — ${w.kind}:${w.spec} every ${w.intervalSeconds}s (${w.mode}), expires ${w.expiresAtUtc}${fires}${reason}`;
+      return `• ${w.id} — ${w.kind}:${w.spec} every ${w.intervalSeconds}s (${w.mode}), expires ${formatLocalTime(w.expiresAtUtc)}${fires}${reason}`;
     });
     return textResult(`Pending watches in this thread (${watches.length}):\n${lines.join("\n")}`);
   }
@@ -2248,7 +2249,7 @@ export class SeamMcpServer {
         for (const s of entities.schedules) {
           lines.push(
             `  • ${s.name} (${s.id})${s.enabled ? "" : " [disabled]"}`,
-            `      when:   ${s.cron} ${s.timezone}${s.nextRunUtc ? ` — next ${s.nextRunUtc}` : ""}`,
+            `      when:   ${s.cron} ${s.timezone}${s.nextRunUtc ? ` — next ${formatLocalTime(s.nextRunUtc)}` : ""}`,
             `      mode:   ${s.sessionMode}` +
               (s.sessionMode === "isolated"
                 ? ` · model ${s.model ?? "(thread default)"} · cwd ${s.cwd ?? "(thread default)"}` +
@@ -2262,7 +2263,7 @@ export class SeamMcpServer {
           }
           const ran =
             s.lastRunUtc || s.lastStatus
-              ? `${s.lastRunUtc ?? "?"}${s.lastStatus ? ` (${s.lastStatus})` : ""}`
+              ? `${s.lastRunUtc ? formatLocalTime(s.lastRunUtc) : "?"}${s.lastStatus ? ` (${s.lastStatus})` : ""}`
               : "never run";
           lines.push(`      last:   ${ran}`);
         }

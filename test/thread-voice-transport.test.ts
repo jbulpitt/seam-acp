@@ -92,6 +92,7 @@ describe("ThreadVoiceCaptureGate", () => {
     const ends: ThreadVoiceCaptureEnd[] = [];
     const gate = new ThreadVoiceCaptureGate({
       ownerUserId: "owner",
+      allocateSequence: vi.fn(() => 4_207),
       minCaptureBytes: 2,
       maxCapturePartBytes: 1_280,
       callbacks: {
@@ -106,9 +107,9 @@ describe("ThreadVoiceCaptureGate", () => {
     gate.setSelfMuted("owner", true);
 
     expect(starts).toEqual([
-      { sequence: 1, part: 0 },
-      { sequence: 1, part: 1 },
-      { sequence: 1, part: 2 },
+      { sequence: 4_207, part: 0 },
+      { sequence: 4_207, part: 1 },
+      { sequence: 4_207, part: 2 },
     ]);
     expect(ends.map((capture) => capture.reason)).toEqual(["limit", "limit", "mute"]);
     expect(ends.map((capture) => capture.continuation)).toEqual([true, true, false]);
@@ -117,6 +118,82 @@ describe("ThreadVoiceCaptureGate", () => {
       1_280,
       640,
     ]);
+  });
+
+  it("allocates exactly once per unmute and retains that value across continuations", () => {
+    const allocateSequence = vi
+      .fn<() => number>()
+      .mockReturnValueOnce(9_001)
+      .mockReturnValueOnce(9_017);
+    const starts: ThreadVoiceCaptureRef[] = [];
+    const ends: ThreadVoiceCaptureEnd[] = [];
+    const gate = new ThreadVoiceCaptureGate({
+      ownerUserId: "owner",
+      allocateSequence,
+      minCaptureBytes: 2,
+      maxCapturePartBytes: 640,
+      callbacks: {
+        onCaptureStart: (capture) => starts.push(capture),
+        onPcm: () => {},
+        onCaptureEnd: (capture) => ends.push(capture),
+      },
+    });
+
+    gate.setSelfMuted("owner", false);
+    gate.pushPcm("owner", Buffer.alloc(1_280, 1));
+    gate.setSelfMuted("owner", true);
+    gate.setSelfMuted("owner", false);
+    gate.setSelfMuted("owner", true);
+
+    expect(allocateSequence).toHaveBeenCalledTimes(2);
+    expect(starts.map(({ sequence, part }) => ({ sequence, part }))).toEqual([
+      { sequence: 9_001, part: 0 },
+      { sequence: 9_001, part: 1 },
+      { sequence: 9_001, part: 2 },
+      { sequence: 9_017, part: 0 },
+    ]);
+    expect(ends.map(({ sequence, continuation }) => ({ sequence, continuation }))).toEqual([
+      { sequence: 9_001, continuation: true },
+      { sequence: 9_001, continuation: true },
+      { sequence: 9_001, continuation: false },
+      { sequence: 9_017, continuation: false },
+    ]);
+  });
+
+  it("emits a terminal marker when mute follows an exact part boundary", () => {
+    const ends: ThreadVoiceCaptureEnd[] = [];
+    const gate = new ThreadVoiceCaptureGate({
+      ownerUserId: "owner",
+      allocateSequence: () => 73,
+      minCaptureBytes: 2,
+      maxCapturePartBytes: 640,
+      callbacks: {
+        onCaptureStart: () => {},
+        onPcm: () => {},
+        onCaptureEnd: (capture) => ends.push(capture),
+      },
+    });
+
+    gate.setSelfMuted("owner", false);
+    gate.pushPcm("owner", Buffer.alloc(640, 1));
+    gate.setSelfMuted("owner", true);
+
+    expect(ends).toHaveLength(2);
+    expect(ends[0]).toMatchObject({
+      sequence: 73,
+      part: 0,
+      reason: "limit",
+      continuation: true,
+      usable: true,
+    });
+    expect(ends[1]).toMatchObject({
+      sequence: 73,
+      part: 1,
+      reason: "mute",
+      continuation: false,
+      usable: false,
+    });
+    expect(ends[1]!.pcm16kMono.byteLength).toBe(0);
   });
 
   it("deterministically drops an active capture on explicit stop", () => {
@@ -216,7 +293,8 @@ describe("ThreadVoicePlaybackQueue", () => {
 
     const encodedSamples: number[] = [];
     const createPlayer = vi.fn(() => player);
-    const connection = { subscribe: vi.fn(() => ({ unsubscribe: vi.fn() })) };
+    const unsubscribe = vi.fn();
+    const connection = { subscribe: vi.fn(() => ({ unsubscribe })) };
     const queue = new ThreadVoicePlaybackQueue({
       connection: connection as never,
       logger: silentLogger,
@@ -257,6 +335,8 @@ describe("ThreadVoicePlaybackQueue", () => {
     expect(encodedSamples).toEqual([111, 222, 333]);
     expect(createPlayer).toHaveBeenCalledTimes(1);
     queue.destroy();
+    queue.destroy();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 
   it("pads a final sub-frame tail before reporting idle", async () => {
@@ -316,7 +396,8 @@ describe("DiscordThreadVoiceCall lifecycle", () => {
     };
     const connection = new EventEmitter() as any;
     connection.receiver = receiver;
-    connection.subscribe = vi.fn(() => ({ unsubscribe: vi.fn() }));
+    const unsubscribe = vi.fn();
+    connection.subscribe = vi.fn(() => ({ unsubscribe }));
     connection.destroy = vi.fn();
 
     const ownerState = { channelId: voiceChannelId, selfMute: true };
@@ -403,5 +484,6 @@ describe("DiscordThreadVoiceCall lifecycle", () => {
     expect(speaking.listenerCount("end")).toBe(0);
     expect(connection.destroy).toHaveBeenCalledTimes(1);
     expect(player.stop).toHaveBeenCalledTimes(1);
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 });

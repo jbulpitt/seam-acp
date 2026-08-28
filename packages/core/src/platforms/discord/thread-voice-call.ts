@@ -93,7 +93,9 @@ export class ThreadVoiceCaptureGate {
   private readonly callbacks: ThreadVoiceCaptureCallbacks;
   private readonly minCaptureBytes: number;
   private readonly maxCapturePartBytes: number;
-  private nextSequence = 0;
+  private readonly allocateSequence: () => number;
+  private localSequence = 0;
+  private logicalSequence: number | undefined;
   private active: ThreadVoiceCaptureRef | undefined;
   private logicalUtterance = false;
   private chunks: Buffer[] = [];
@@ -103,11 +105,18 @@ export class ThreadVoiceCaptureGate {
   constructor(opts: {
     ownerUserId: string;
     callbacks: ThreadVoiceCaptureCallbacks;
+    allocateSequence?: () => number;
     minCaptureBytes?: number;
     maxCapturePartBytes?: number;
   }) {
     this.ownerUserId = opts.ownerUserId;
     this.callbacks = opts.callbacks;
+    this.allocateSequence =
+      opts.allocateSequence ??
+      (() => {
+        this.localSequence += 1;
+        return this.localSequence;
+      });
     this.minCaptureBytes = evenPositive(
       opts.minCaptureBytes,
       DEFAULT_MIN_CAPTURE_BYTES
@@ -123,14 +132,18 @@ export class ThreadVoiceCaptureGate {
   }
 
   get currentSequence(): number | undefined {
-    return this.logicalUtterance ? this.nextSequence : undefined;
+    return this.logicalUtterance ? this.logicalSequence : undefined;
   }
 
   setSelfMuted(userId: string, selfMuted: boolean): void {
     if (this.stopped || userId !== this.ownerUserId) return;
     if (!selfMuted) {
       if (this.logicalUtterance) return;
-      this.nextSequence += 1;
+      const sequence = this.allocateSequence();
+      if (!Number.isSafeInteger(sequence) || sequence < 1) {
+        throw new Error("Thread Voice sequence allocator must return a positive safe integer");
+      }
+      this.logicalSequence = sequence;
       this.logicalUtterance = true;
       this.startPart(0);
       return;
@@ -138,6 +151,7 @@ export class ThreadVoiceCaptureGate {
     if (!this.logicalUtterance) return;
     this.finishPart("mute", false);
     this.logicalUtterance = false;
+    this.logicalSequence = undefined;
   }
 
   pushPcm(userId: string, pcm16kMono: Buffer): boolean {
@@ -166,7 +180,10 @@ export class ThreadVoiceCaptureGate {
       if (this.bytes >= this.maxCapturePartBytes) {
         const part = ref.part;
         this.finishPart("limit", true);
-        if (offset < usableLength) this.startPart(part + 1);
+        // Start the successor even when this push ended exactly on the part
+        // boundary. A following mute must still emit a terminal
+        // continuation:false marker for the logical utterance.
+        this.startPart(part + 1);
       }
     }
     return true;
@@ -176,6 +193,7 @@ export class ThreadVoiceCaptureGate {
     if (this.stopped || !this.logicalUtterance) return;
     this.finishPart("disconnect", false);
     this.logicalUtterance = false;
+    this.logicalSequence = undefined;
   }
 
   /** Finalize one wall-clock-limited part and continue the same utterance. */
@@ -191,6 +209,7 @@ export class ThreadVoiceCaptureGate {
     if (this.logicalUtterance) {
       this.finishPart("stop", false, false);
       this.logicalUtterance = false;
+      this.logicalSequence = undefined;
     }
     this.stopped = true;
     this.chunks = [];
@@ -205,7 +224,10 @@ export class ThreadVoiceCaptureGate {
   }
 
   private startPart(part: number): void {
-    const ref = { sequence: this.nextSequence, part };
+    if (this.logicalSequence === undefined) {
+      throw new Error("Thread Voice cannot start a capture part without a sequence");
+    }
+    const ref = { sequence: this.logicalSequence, part };
     this.active = ref;
     this.lastPart = part;
     this.chunks = [];
@@ -248,6 +270,8 @@ export type ThreadVoiceCallOptions = {
   reconnectGraceMs?: number;
   minCaptureBytes?: number;
   maxCapturePartBytes?: number;
+  /** Package D should inject Package A's durable per-session allocator. */
+  allocateSequence?: () => number;
   /** Test seam and temporary Package D integration boundary. */
   dependencies?: ThreadVoiceCallDependencies;
 };
@@ -296,6 +320,7 @@ export class DiscordThreadVoiceCall {
     });
     this.capture = new ThreadVoiceCaptureGate({
       ownerUserId: opts.ownerUserId,
+      ...(opts.allocateSequence ? { allocateSequence: opts.allocateSequence } : {}),
       callbacks: {
         onCaptureStart: (capture) => {
           this.scheduleCaptureRollover();
@@ -632,6 +657,7 @@ export class ThreadVoicePlaybackQueue {
   private readonly player: AudioPlayer;
   private readonly encoder: OpusCodec;
   private readonly connection: Pick<VoiceConnection, "subscribe">;
+  private subscription: ReturnType<VoiceConnection["subscribe"]>;
   private readonly logger: Logger;
   private readonly onPlaybackStarted?: () => void;
   private readonly onPlaybackIdle?: () => void;
@@ -662,7 +688,7 @@ export class ThreadVoicePlaybackQueue {
     this.player = dependencies.createPlayer({
       behaviors: { noSubscriber: NoSubscriberBehavior.Play },
     });
-    this.connection.subscribe(this.player);
+    this.subscription = this.connection.subscribe(this.player);
     this.player.on("stateChange", (_oldState, newState) => {
       if (newState.status === AudioPlayerStatus.Idle) this.finishCycle();
     });
@@ -716,6 +742,12 @@ export class ThreadVoicePlaybackQueue {
     } catch {
       // Already idle.
     }
+    try {
+      this.subscription?.unsubscribe();
+    } catch {
+      // Already unsubscribed with the connection.
+    }
+    this.subscription = undefined;
     this.resolveIdleWaiters();
   }
 

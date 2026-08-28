@@ -24,7 +24,12 @@ import {
   type DiscordGatewayAdapterCreator,
   type VoiceConnection,
 } from "@discordjs/voice";
-import { ChannelType, type Client, type VoiceBasedChannel } from "discord.js";
+import {
+  ChannelType,
+  type Client,
+  type VoiceBasedChannel,
+  type VoiceState,
+} from "discord.js";
 import { GeminiLiveSession } from "../../core/audio/gemini-live.js";
 import {
   LIVE_HELP_EMPTY_VC_IDLE_MS,
@@ -39,6 +44,108 @@ import { OPUS_SILENCE_FRAME } from "./voice-spike.js";
 
 /** Hangover after Discord speaking.end before we tell Gemini the utterance finished. */
 const ACTIVITY_END_MS = 1_200;
+const SPEECH_CONFIRM_FRAMES = 8;
+const SPEECH_PREROLL_FRAMES = 15;
+const SPEECH_MIN_RMS = 400;
+const SPEECH_NOISE_MULTIPLIER = 3;
+
+export interface LiveHelpSpeechGatePush {
+  started: boolean;
+  pcm: Buffer[];
+}
+
+/**
+ * Local speech confirmation for manual Gemini activity boundaries.
+ *
+ * Discord's speaking indicator is intentionally not authoritative: it can
+ * pulse for comfort noise and while a member is muted. Unmuting merely arms
+ * this gate. Only sustained, non-trivial PCM opens an activity, at which point
+ * the short pre-roll is released so the first syllable is preserved.
+ */
+export class LiveHelpSpeechGate {
+  private muted: boolean;
+  private active = false;
+  private consecutiveSpeechFrames = 0;
+  private noiseFloorRms = 80;
+  private preRoll: Buffer[] = [];
+
+  constructor(
+    muted = true,
+    private readonly confirmFrames = SPEECH_CONFIRM_FRAMES,
+    private readonly preRollFrames = SPEECH_PREROLL_FRAMES
+  ) {
+    this.muted = muted;
+  }
+
+  get isActive(): boolean {
+    return this.active;
+  }
+
+  setMuted(muted: boolean): boolean {
+    if (this.muted === muted) return false;
+    const ended = this.active && muted;
+    this.muted = muted;
+    this.resetCapture();
+    return ended;
+  }
+
+  push(pcm16kMono: Buffer): LiveHelpSpeechGatePush {
+    if (this.muted || pcm16kMono.byteLength < 2) {
+      return { started: false, pcm: [] };
+    }
+    if (this.active) {
+      return { started: false, pcm: [pcm16kMono] };
+    }
+
+    this.preRoll.push(Buffer.from(pcm16kMono));
+    while (this.preRoll.length > this.preRollFrames) this.preRoll.shift();
+
+    const rms = pcm16Rms(pcm16kMono);
+    const threshold = Math.max(
+      SPEECH_MIN_RMS,
+      this.noiseFloorRms * SPEECH_NOISE_MULTIPLIER
+    );
+    if (rms >= threshold) {
+      this.consecutiveSpeechFrames += 1;
+    } else {
+      this.consecutiveSpeechFrames = 0;
+      // Learn only non-speech frames, slowly, and keep one loud comfort-noise
+      // packet from inflating the threshold for the next real utterance.
+      this.noiseFloorRms = Math.min(1_500, this.noiseFloorRms * 0.95 + rms * 0.05);
+    }
+
+    if (this.consecutiveSpeechFrames < this.confirmFrames) {
+      return { started: false, pcm: [] };
+    }
+    this.active = true;
+    const pcm = this.preRoll;
+    this.preRoll = [];
+    return { started: true, pcm };
+  }
+
+  endSpeaking(): boolean {
+    const ended = this.active;
+    this.resetCapture();
+    return ended;
+  }
+
+  private resetCapture(): void {
+    this.active = false;
+    this.consecutiveSpeechFrames = 0;
+    this.preRoll = [];
+  }
+}
+
+export function pcm16Rms(pcm: Buffer): number {
+  const samples = Math.floor(pcm.byteLength / 2);
+  if (samples === 0) return 0;
+  let sumSquares = 0;
+  for (let i = 0; i < samples; i++) {
+    const sample = pcm.readInt16LE(i * 2);
+    sumSquares += sample * sample;
+  }
+  return Math.sqrt(sumSquares / samples);
+}
 
 export function pcm48kStereoTo16kMono(pcm: Buffer): Buffer {
   const stereoFrames = Math.floor(pcm.byteLength / 4);
@@ -171,6 +278,7 @@ export async function runLiveHelpCall(opts: {
   let lastHumanAt = Date.now();
   const subscribed = new Set<string>();
   const pendingMix: Buffer[] = [];
+  const speechGates = new Map<string, LiveHelpSpeechGate>();
 
   const interruptPlay = (): void => {
     playQueue = [];
@@ -267,8 +375,35 @@ export async function runLiveHelpCall(opts: {
   let voicedCount = 0;
   let silenceCount = 0;
   let decodeFailCount = 0;
+  let mutedPacketCount = 0;
+  let unconfirmedPacketCount = 0;
   let bytesUp = 0;
   let utteranceBytesUp = 0;
+  let onSpeakingStart: ((userId: string) => void) | undefined;
+  let onSpeakingEnd: ((userId: string) => void) | undefined;
+  let onVoiceStateUpdate: ((oldState: VoiceState, newState: VoiceState) => void) | undefined;
+
+  const isUserMuted = (userId: string): boolean => {
+    const state = ch.guild.voiceStates.cache.get(userId);
+    return (
+      !state ||
+      state.channelId !== ch.id ||
+      state.selfMute === true ||
+      state.serverMute === true
+    );
+  };
+
+  const gateFor = (userId: string): LiveHelpSpeechGate => {
+    let gate = speechGates.get(userId);
+    if (!gate) {
+      gate = new LiveHelpSpeechGate(isUserMuted(userId));
+      speechGates.set(userId, gate);
+    }
+    return gate;
+  };
+
+  const anyConfirmedSpeaker = (): boolean =>
+    [...speechGates.values()].some((gate) => gate.isActive);
 
   const beginActivity = (): void => {
     if (activityEndTimer) {
@@ -298,6 +433,8 @@ export async function runLiveHelpCall(opts: {
         voicedCount,
         silenceCount,
         decodeFailCount,
+        mutedPacketCount,
+        unconfirmedPacketCount,
       },
       "live-help activity end"
     );
@@ -312,7 +449,6 @@ export async function runLiveHelpCall(opts: {
     if (pendingMix.length === 0) return;
     const mixed = mixMono16(pendingMix.splice(0, pendingMix.length));
     if (mixed.byteLength === 0) return;
-    beginActivity();
     bytesUp += mixed.byteLength;
     utteranceBytesUp += mixed.byteLength;
     if (!loggedFirstUp) {
@@ -361,6 +497,14 @@ export async function runLiveHelpCall(opts: {
     stream.on("data", (p: Buffer) => {
       pktCount += 1;
       if (!Buffer.isBuffer(p) || p.byteLength === 0) return;
+      const gate = gateFor(userId);
+      const muted = isUserMuted(userId);
+      const endedByMute = gate.setMuted(muted);
+      if (endedByMute && !anyConfirmedSpeaker()) scheduleActivityEnd();
+      if (muted) {
+        mutedPacketCount += 1;
+        return;
+      }
       if (p.compare(OPUS_SILENCE_FRAME) === 0) {
         silenceCount += 1;
         decodePacket(p);
@@ -377,9 +521,15 @@ export async function runLiveHelpCall(opts: {
         }
         return;
       }
+      const gated = gate.push(pcm48kStereoTo16kMono(pcm48));
+      if (gated.pcm.length === 0) {
+        unconfirmedPacketCount += 1;
+        return;
+      }
       voicedCount += 1;
       lastHumanAt = Date.now();
-      pendingMix.push(pcm48kStereoTo16kMono(pcm48));
+      if (gated.started) beginActivity();
+      pendingMix.push(...gated.pcm);
     });
     stream.once("end", goneOnce);
     stream.once("close", goneOnce);
@@ -452,20 +602,41 @@ export async function runLiveHelpCall(opts: {
     opts.onLive();
 
     const botId = opts.client.user?.id;
-    connection.receiver.speaking.on("start", (userId: string) => {
+    onSpeakingStart = (userId: string): void => {
       if (userId === botId) return;
       subscribeUser(userId);
-      beginActivity();
-    });
-    connection.receiver.speaking.on("end", (userId: string) => {
+    };
+    onSpeakingEnd = (userId: string): void => {
       if (userId === botId) return;
       opts.logger.info({ userId, liveId: opts.row.id }, "live-help speaking end");
-      scheduleActivityEnd();
-    });
+      const gate = speechGates.get(userId);
+      const ended = gate?.endSpeaking() ?? false;
+      if (ended && !anyConfirmedSpeaker()) scheduleActivityEnd();
+    };
+    onVoiceStateUpdate = (oldState: VoiceState, newState: VoiceState): void => {
+      if (newState.id === botId) return;
+      if (
+        oldState.channelId !== ch.id &&
+        newState.channelId !== ch.id &&
+        !speechGates.has(newState.id)
+      ) {
+        return;
+      }
+      const muted =
+        newState.channelId !== ch.id ||
+        newState.selfMute === true ||
+        newState.serverMute === true;
+      const ended = gateFor(newState.id).setMuted(muted);
+      // Unmute only arms the local gate. It never starts a Gemini activity or
+      // interrupts playback; confirmed PCM does that later.
+      if (ended && !anyConfirmedSpeaker()) scheduleActivityEnd();
+    };
+    connection.receiver.speaking.on("start", onSpeakingStart);
+    connection.receiver.speaking.on("end", onSpeakingEnd);
+    opts.client.on("voiceStateUpdate", onVoiceStateUpdate);
     for (const id of connection.receiver.speaking.users.keys()) {
       if (id === botId) continue;
       subscribeUser(id);
-      beginActivity();
     }
 
     const mixTimer = setInterval(flushMix, 20);
@@ -520,6 +691,9 @@ export async function runLiveHelpCall(opts: {
   } catch (err) {
     reason = (err as Error).message || "error";
   } finally {
+    if (onSpeakingStart) connection.receiver.speaking.off("start", onSpeakingStart);
+    if (onSpeakingEnd) connection.receiver.speaking.off("end", onSpeakingEnd);
+    if (onVoiceStateUpdate) opts.client.off("voiceStateUpdate", onVoiceStateUpdate);
     if (activityEndTimer) {
       clearTimeout(activityEndTimer);
       activityEndTimer = undefined;

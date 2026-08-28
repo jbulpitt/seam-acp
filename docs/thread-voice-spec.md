@@ -1,6 +1,6 @@
 # Thread Voice — implementation specification
 
-**Status:** V1 implemented and independently QA-verified on `main`; deployment pending  
+**Status:** V1 implemented, independently QA-verified, and deployed
 **Owner:** Jesse  
 **Scope:** advanced/admin user v1  
 **Product relationship:** bidirectional voice interface to an existing ACP thread; distinct from Live Help
@@ -788,12 +788,17 @@ When Jesse approves implementation:
 
 ## 19. Follow-ons after v1
 
+> **V2 authority:** [`thread-voice-v2-spec.md`](./thread-voice-v2-spec.md)
+> supersedes this early follow-on sketch. Jesse selected card-based routing only
+> on 2026-08-28. Spoken aliases, focus commands, and model-inferred routing are
+> not planned for V2.
+
 - **Shared Voice Console / multi-thread mode.** One guild-level console owns the
   Discord connection, owner capture, one Gemini transcription stream, and one
   global playback scheduler. Several independent `ThreadVoiceBinding` records
   attach home threads to that console. This is multiplexing over one VC, not
   several Discord voice connections.
-- Each binding has an immutable thread id, a short unique spoken alias, and a
+- Each binding has an immutable thread id, a short unique display alias, and a
   persistent Gemini TTS voice. Existing Gemini synthesis already accepts the
   voice per request, so responses from different threads can use distinct
   voices without changing their text-thread TTS configuration.
@@ -853,19 +858,11 @@ When Jesse approves implementation:
   audio. It may rotate among ready threads at sentence/chunk boundaries for
   fairness, preserving order within each thread. A voice switch is sufficient
   attribution; spoken labels remain an optional accessibility/debug fallback.
-- Capture is still transcribed once. A deterministic router accepts an exact
-  binding alias (`Kanoa: ...`) or a focus command (`Switch to Kanoa`), then sends
-  the finalized transcript to that binding's ordinary durable pending buffer.
-  An unprefixed utterance goes to the card's snapshotted selected target set.
-  Spoken routing commands mutate or override that same visible control-plane
-  state rather than maintaining a second invisible routing state.
-- Outside deliberately enabled card fan-out, route one utterance to exactly one
-  binding. Unknown, duplicate, or ambiguous aliases dispatch nowhere and
-  require an explicit Discord choice. Do not let an LLM silently infer an
-  executable destination. Compound instructions that contain different content
-  for several threads can be added later only with structured parsing and
-  visible confirmation; card fan-out always sends the same transcript to every
-  selected binding.
+- Capture is still transcribed once. Routing comes only from the card's
+  snapshotted selected target set. Transcript wording never mutates or overrides
+  destination state. Outside deliberately enabled card fan-out, one utterance
+  goes to exactly one selected binding; fan-out sends the same transcript to
+  every selected binding.
 - Multi-thread mode does not multiply STT usage because the owner's audio is
   transcribed once and routed locally. It can multiply ACP-agent and TTS usage
   when several bound threads produce responses.

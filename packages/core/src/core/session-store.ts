@@ -54,10 +54,12 @@ import {
   newVoiceConsoleFanoutGroupId,
   newVoiceConsoleId,
   normalizeVoiceConsoleAlias,
+  sanitizeVoiceConsoleFailureMessage,
   sanitizeVoiceConsoleSpeakerName,
   type AddVoiceConsoleBindingInput,
   type CreateVoiceConsoleInput,
   type ThreadVoiceBinding,
+  type VoiceConsoleAddInteraction,
   type VoiceConsoleBatch,
   type VoiceConsoleBindingStatus,
   type VoiceConsoleCaptureSnapshot,
@@ -317,6 +319,7 @@ export class SessionStore {
     this.db.exec(THREAD_VOICE_SCHEMA);
     this.db.exec(VOICE_CONSOLE_SCHEMA);
     this.migrateVoiceConsoleV2();
+    this.migrateVoiceConsoleInteractionOutcomes();
     // Defensive column adds for tables created by an earlier schema version
     // (no migration framework). Ignored if the column already exists.
     for (const ddl of [
@@ -384,6 +387,18 @@ export class SessionStore {
       CREATE INDEX IF NOT EXISTS idx_thread_voice_segments_capture
         ON thread_voice_segments(capture_id);
     `);
+  }
+
+  private migrateVoiceConsoleInteractionOutcomes(): void {
+    const columns = this.db
+      .prepare<[], { name: string }>("PRAGMA table_info(voice_console_mutations)")
+      .all()
+      .map((row) => row.name);
+    if (!columns.includes("action")) {
+      this.db.exec(
+        "ALTER TABLE voice_console_mutations ADD COLUMN action TEXT NOT NULL DEFAULT 'legacy'"
+      );
+    }
   }
 
   /** Additive thread_slug on presets for auto-numbered thread names. */
@@ -2103,32 +2118,96 @@ export class SessionStore {
       .map(mapVoiceConsoleInputTarget);
   }
 
+  getVoiceConsoleAddInteraction(
+    consoleId: string,
+    interactionId: string
+  ): VoiceConsoleAddInteraction | null {
+    const row = this.db
+      .prepare<[string, string], VoiceConsoleAddInteractionRow>(
+        `SELECT * FROM voice_console_add_interactions
+          WHERE console_id = ? AND interaction_id = ?`
+      )
+      .get(consoleId, interactionId);
+    return row ? mapVoiceConsoleAddInteraction(row) : null;
+  }
+
   addVoiceConsoleBinding(input: AddVoiceConsoleBindingInput): VoiceConsoleMutationOutcome {
+    const fingerprint = voiceConsoleAddFingerprint(input);
     const add = this.db.transaction((): VoiceConsoleMutationOutcome => {
-      const duplicate = this.getVoiceConsoleMutation(input.binding.consoleId, input.interactionId);
-      if (duplicate) {
-        return { ok: true, value: this.requireVoiceConsoleMutationResult(input.binding.consoleId, false, true) };
+      const consoleId = input.binding.consoleId;
+      const createdUtc = input.binding.updatedUtc;
+      if (input.interactionId) {
+        const existing = this.getVoiceConsoleAddInteraction(consoleId, input.interactionId);
+        if (existing) return this.replayVoiceConsoleAddInteraction(existing, fingerprint);
+        const generic = this.getVoiceConsoleMutationRecord(consoleId, input.interactionId);
+        if (generic) {
+          if (generic.action === "legacy") {
+            return {
+              ok: true,
+              value: this.requireVoiceConsoleMutationResult(consoleId, false, true),
+            };
+          }
+          return interactionCollisionFailure();
+        }
+        this.db
+          .prepare(
+            `INSERT INTO voice_console_add_interactions
+               (console_id, interaction_id, binding_id, input_fingerprint, status,
+                failure_code, failure_message, failure_as_exception, created_utc, updated_utc)
+             VALUES (?, ?, ?, ?, 'pending', NULL, NULL, 0, ?, ?)`
+          )
+          .run(
+            consoleId,
+            input.interactionId,
+            input.binding.id,
+            fingerprint,
+            createdUtc,
+            createdUtc
+          );
       }
-      const console = this.getVoiceConsole(input.binding.consoleId);
-      if (!console) return mutationFailure("not-found", "Voice Console does not exist.");
-      if (!isActiveConsole(console)) return mutationFailure("inactive", "Voice Console is not active.");
-      if (console.revision !== input.expectedRevision) return staleConsoleFailure();
+
+      const fail = (outcome: Extract<VoiceConsoleMutationOutcome, { ok: false }>) => {
+        this.finalizeVoiceConsoleAddInteractionFailure(
+          consoleId,
+          input.interactionId,
+          outcome.reason,
+          outcome.error,
+          false,
+          createdUtc
+        );
+        return outcome;
+      };
+      const console = this.getVoiceConsole(consoleId);
+      if (!console) return fail(mutationFailure("not-found", "Voice Console does not exist."));
+      if (!isActiveConsole(console)) {
+        return fail(mutationFailure("inactive", "Voice Console is not active."));
+      }
+      if (console.revision !== input.expectedRevision) return fail(staleConsoleFailure());
       if (this.listVoiceConsoleBindings(console.id).length >= 10) {
-        return mutationFailure("binding-limit", "Voice Console already has ten active bindings.");
+        return fail(mutationFailure("binding-limit", "Voice Console already has ten active bindings."));
       }
       if (
         input.claim !== false &&
         console.fanoutArmed &&
         this.listVoiceConsoleInputTargets(console.id).length >= 5
       ) {
-        return mutationFailure("invalid-targets", "Voice Console fan-out target limit is five.");
+        return fail(mutationFailure("invalid-targets", "Voice Console fan-out target limit is five."));
       }
-      const binding = normalizeBinding({ ...input.binding, status: "adding" });
+      let binding: ThreadVoiceBinding;
+      try {
+        binding = normalizeBinding({ ...input.binding, status: "adding" });
+      } catch (err) {
+        return fail(
+          mutationFailure("invalid-targets", sanitizeVoiceConsoleFailureMessage(errorText(err)))
+        );
+      }
       if (binding.guildId !== console.guildId || binding.voiceChannelId !== console.voiceChannelId) {
-        return mutationFailure("inactive", "Binding guild/voice channel does not match its console.");
+        return fail(
+          mutationFailure("inactive", "Binding guild/voice channel does not match its console.")
+        );
       }
       if (this.getActiveVoiceConsoleBindingForThread(binding.platform, binding.channelRef)) {
-        return mutationFailure("duplicate-thread", "That thread already has an active binding.");
+        return fail(mutationFailure("duplicate-thread", "That thread already has an active binding."));
       }
       const alias = this.db
         .prepare<[string, string], { id: string }>(
@@ -2136,10 +2215,19 @@ export class SessionStore {
             AND status IN ('adding','active','removing') LIMIT 1`
         )
         .get(console.id, binding.aliasNormalized);
-      if (alias) return mutationFailure("duplicate-alias", "That alias is already in use.");
-      this.insertVoiceConsoleBindingRow(binding);
+      if (alias) return fail(mutationFailure("duplicate-alias", "That alias is already in use."));
+      try {
+        this.insertVoiceConsoleBindingRow(binding);
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        if (code?.startsWith("SQLITE_CONSTRAINT")) {
+          return fail(
+            mutationFailure("duplicate-thread", "Binding conflicts with active console state.")
+          );
+        }
+        throw err;
+      }
       this.bumpVoiceConsoleRevision(console.id, binding.updatedUtc);
-      this.recordVoiceConsoleMutation(console.id, input.interactionId, binding.updatedUtc);
       return { ok: true, value: this.requireVoiceConsoleMutationResult(console.id, true, false) };
     });
     try {
@@ -2156,7 +2244,12 @@ export class SessionStore {
   /** Host attachment succeeds before an adding binding becomes selectable. */
   activateVoiceConsoleBinding(
     bindingId: string,
-    input: { expectedRevision: number; claim?: boolean; updatedUtc?: string }
+    input: {
+      expectedRevision: number;
+      claim?: boolean;
+      interactionId?: string;
+      updatedUtc?: string;
+    }
   ): VoiceConsoleMutationOutcome {
     const activate = this.db.transaction((): VoiceConsoleMutationOutcome => {
       const binding = this.getVoiceConsoleBinding(bindingId);
@@ -2189,6 +2282,19 @@ export class SessionStore {
         this.replaceVoiceConsoleTargetsRows(console.id, next, now);
       }
       this.bumpVoiceConsoleRevision(console.id, now);
+      if (input.interactionId) {
+        const finalized = this.db
+          .prepare(
+            `UPDATE voice_console_add_interactions
+                SET status = 'succeeded', failure_code = NULL, failure_message = NULL,
+                    failure_as_exception = 0, updated_utc = ?
+              WHERE console_id = ? AND interaction_id = ? AND binding_id = ? AND status = 'pending'`
+          )
+          .run(now, console.id, input.interactionId, bindingId);
+        if (finalized.changes !== 1) {
+          throw new Error("Voice Console add interaction is not durably pending.");
+        }
+      }
       return {
         ok: true,
         value: this.requireVoiceConsoleMutationResult(console.id, true, false),
@@ -2205,22 +2311,92 @@ export class SessionStore {
   failStagedVoiceConsoleBinding(
     bindingId: string,
     reason: string,
-    failedUtc = new Date().toISOString()
+    failedUtc = new Date().toISOString(),
+    interaction?: {
+      interactionId: string;
+      failureCode: VoiceConsoleMutationFailure;
+      failureAsException: boolean;
+    }
   ): ThreadVoiceBinding | null {
     const fail = this.db.transaction((): ThreadVoiceBinding | null => {
       const binding = this.getVoiceConsoleBinding(bindingId);
-      if (!binding || binding.status !== "adding") return binding;
-      this.db.prepare("DELETE FROM voice_console_input_targets WHERE binding_id = ?").run(bindingId);
-      const changed = this.db
-        .prepare(
-          `UPDATE thread_voice_sessions SET status = 'failed', updated_utc = ?, ended_utc = ?,
-             end_reason = ? WHERE id = ? AND console_id IS NOT NULL AND status = 'adding'`
-        )
-        .run(failedUtc, failedUtc, reason, bindingId);
-      if (changed.changes > 0) this.bumpVoiceConsoleRevision(binding.consoleId, failedUtc);
+      if (binding?.status === "adding") {
+        this.db.prepare("DELETE FROM voice_console_input_targets WHERE binding_id = ?").run(bindingId);
+        const changed = this.db
+          .prepare(
+            `UPDATE thread_voice_sessions SET status = 'failed', updated_utc = ?, ended_utc = ?,
+               end_reason = ? WHERE id = ? AND console_id IS NOT NULL AND status = 'adding'`
+          )
+          .run(failedUtc, failedUtc, reason, bindingId);
+        if (changed.changes > 0) this.bumpVoiceConsoleRevision(binding.consoleId, failedUtc);
+      }
+      if (binding && interaction) {
+        this.finalizeVoiceConsoleAddInteractionFailure(
+          binding.consoleId,
+          interaction.interactionId,
+          interaction.failureCode,
+          reason,
+          interaction.failureAsException,
+          failedUtc
+        );
+      }
       return this.getVoiceConsoleBinding(bindingId);
     });
     return fail();
+  }
+
+  finalizeVoiceConsoleAddInteractionFailure(
+    consoleId: string,
+    interactionId: string | undefined,
+    failureCode: VoiceConsoleMutationFailure,
+    failureMessage: string,
+    failureAsException: boolean,
+    failedUtc = new Date().toISOString()
+  ): VoiceConsoleAddInteraction | null {
+    if (!interactionId) return null;
+    const message = sanitizeVoiceConsoleFailureMessage(failureMessage);
+    this.db
+      .prepare(
+        `UPDATE voice_console_add_interactions
+            SET status = 'failed', failure_code = ?, failure_message = ?,
+                failure_as_exception = ?, updated_utc = ?
+          WHERE console_id = ? AND interaction_id = ? AND status = 'pending'`
+      )
+      .run(failureCode, message, failureAsException ? 1 : 0, failedUtc, consoleId, interactionId);
+    return this.getVoiceConsoleAddInteraction(consoleId, interactionId);
+  }
+
+  recoverPendingVoiceConsoleAddInteractions(
+    recoveredUtc = new Date().toISOString()
+  ): number {
+    const recover = this.db.transaction(() => {
+      const pending = this.db
+        .prepare<[], VoiceConsoleAddInteractionRow>(
+          "SELECT * FROM voice_console_add_interactions WHERE status = 'pending'"
+        )
+        .all();
+      const message = "Voice Console binding add was interrupted before completion.";
+      for (const row of pending) {
+        this.db.prepare("DELETE FROM voice_console_input_targets WHERE binding_id = ?").run(row.binding_id);
+        const changed = this.db
+          .prepare(
+            `UPDATE thread_voice_sessions SET status = 'failed', updated_utc = ?, ended_utc = ?,
+               end_reason = ? WHERE id = ? AND console_id IS NOT NULL AND status IN ('adding','active')`
+          )
+          .run(recoveredUtc, recoveredUtc, message, row.binding_id);
+        if (changed.changes > 0) this.bumpVoiceConsoleRevision(row.console_id, recoveredUtc);
+        this.finalizeVoiceConsoleAddInteractionFailure(
+          row.console_id,
+          row.interaction_id,
+          "recovered-pending",
+          message,
+          false,
+          recoveredUtc
+        );
+      }
+      return pending.length;
+    });
+    return recover();
   }
 
   replaceVoiceConsoleInputTargets(
@@ -2234,7 +2410,7 @@ export class SessionStore {
     }
   ): VoiceConsoleMutationOutcome {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
-      if (this.getVoiceConsoleMutation(consoleId, input.interactionId)) {
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "replace-input-targets")) {
         return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
       }
       const console = this.getVoiceConsole(consoleId);
@@ -2256,7 +2432,7 @@ export class SessionStore {
               SET fanout_armed = ?, revision = revision + 1, updated_utc = ? WHERE id = ?`
         )
         .run(input.fanoutArmed ? 1 : 0, now, consoleId);
-      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now);
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "replace-input-targets");
       return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
     });
     return mutate();
@@ -2272,7 +2448,7 @@ export class SessionStore {
     }
   ): VoiceConsoleMutationOutcome {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
-      if (this.getVoiceConsoleMutation(consoleId, input.interactionId)) {
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "set-output-bindings")) {
         return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
       }
       const console = this.getVoiceConsole(consoleId);
@@ -2296,7 +2472,7 @@ export class SessionStore {
           .run(next ? 1 : 0, now, binding.id);
       }
       this.bumpVoiceConsoleRevision(consoleId, now);
-      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now);
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "set-output-bindings");
       return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
     });
     return mutate();
@@ -2318,7 +2494,7 @@ export class SessionStore {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
       const binding = this.getVoiceConsoleBinding(bindingId);
       if (!binding) return mutationFailure("not-found", "Voice Console binding does not exist.");
-      if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId)) {
+      if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId, "update-binding")) {
         return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, false, true) };
       }
       const console = this.getVoiceConsole(binding.consoleId);
@@ -2353,7 +2529,7 @@ export class SessionStore {
           bindingId
         );
       this.bumpVoiceConsoleRevision(binding.consoleId, now);
-      this.recordVoiceConsoleMutation(binding.consoleId, input.interactionId, now);
+      this.recordVoiceConsoleMutation(binding.consoleId, input.interactionId, now, "update-binding");
       return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, true, false) };
     });
     return mutate();
@@ -2370,7 +2546,7 @@ export class SessionStore {
     }
   ): VoiceConsoleMutationOutcome {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
-      if (this.getVoiceConsoleMutation(consoleId, input.interactionId)) {
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "update-card")) {
         return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
       }
       const console = this.getVoiceConsole(consoleId);
@@ -2388,7 +2564,7 @@ export class SessionStore {
           now,
           consoleId
         );
-      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now);
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "update-card");
       return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
     });
     return mutate();
@@ -2485,7 +2661,7 @@ export class SessionStore {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
       const binding = this.getVoiceConsoleBinding(bindingId);
       if (!binding) return mutationFailure("not-found", "Voice Console binding does not exist.");
-      if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId)) {
+      if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId, "remove-binding")) {
         return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, false, true) };
       }
       const console = this.getVoiceConsole(binding.consoleId);
@@ -2507,7 +2683,7 @@ export class SessionStore {
         )
         .run(now, input.reason, bindingId);
       this.bumpVoiceConsoleRevision(binding.consoleId, now);
-      this.recordVoiceConsoleMutation(binding.consoleId, input.interactionId, now);
+      this.recordVoiceConsoleMutation(binding.consoleId, input.interactionId, now, "remove-binding");
       return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, true, false) };
     });
     return mutate();
@@ -2533,7 +2709,7 @@ export class SessionStore {
     input: { expectedRevision?: number; interactionId?: string; reason: string; updatedUtc?: string }
   ): VoiceConsoleMutationOutcome {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
-      if (this.getVoiceConsoleMutation(consoleId, input.interactionId)) {
+      if (this.getVoiceConsoleMutation(consoleId, input.interactionId, "stop-console")) {
         return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, false, true) };
       }
       const console = this.getVoiceConsole(consoleId);
@@ -2564,7 +2740,7 @@ export class SessionStore {
              updated_utc = ?, end_reason = ? WHERE id = ?`
         )
         .run(now, input.reason, consoleId);
-      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now);
+      this.recordVoiceConsoleMutation(consoleId, input.interactionId, now, "stop-console");
       return { ok: true, value: this.requireVoiceConsoleMutationResult(consoleId, true, false) };
     });
     return mutate();
@@ -2927,7 +3103,7 @@ export class SessionStore {
     consoleId: string,
     interactionId: string | undefined
   ): VoiceConsoleMutationOutcome | null {
-    if (!interactionId || !this.getVoiceConsoleMutation(consoleId, interactionId)) return null;
+    if (!interactionId || !this.getVoiceConsoleMutation(consoleId, interactionId, "stop-console")) return null;
     return {
       ok: true,
       value: this.requireVoiceConsoleMutationResult(consoleId, false, true),
@@ -3086,26 +3262,77 @@ export class SessionStore {
       .run(updatedUtc, consoleId);
   }
 
-  private getVoiceConsoleMutation(consoleId: string, interactionId?: string): boolean {
-    if (!interactionId) return false;
-    return Boolean(
+  private replayVoiceConsoleAddInteraction(
+    interaction: VoiceConsoleAddInteraction,
+    fingerprint: string
+  ): VoiceConsoleMutationOutcome {
+    if (interaction.inputFingerprint !== fingerprint) return interactionCollisionFailure();
+    if (interaction.status === "succeeded") {
+      return {
+        ok: true,
+        value: this.requireVoiceConsoleMutationResult(interaction.consoleId, false, true),
+      };
+    }
+    if (interaction.status === "pending") {
+      return {
+        ok: false,
+        reason: "interaction-pending",
+        error: "Voice Console binding add is already in progress.",
+        duplicate: true,
+      };
+    }
+    return {
+      ok: false,
+      reason: interaction.failureCode ?? "activation-failed",
+      error: interaction.failureMessage ?? "Voice Console binding add failed.",
+      duplicate: true,
+      replayAsException: interaction.failureAsException,
+    };
+  }
+
+  private getVoiceConsoleMutationRecord(
+    consoleId: string,
+    interactionId: string
+  ): { mutation_id: string; action: string } | null {
+    return (
       this.db
-        .prepare<[string, string], { mutation_id: string }>(
-          "SELECT mutation_id FROM voice_console_mutations WHERE console_id = ? AND mutation_id = ?"
+        .prepare<[string, string], { mutation_id: string; action: string }>(
+          `SELECT mutation_id, action FROM voice_console_mutations
+            WHERE console_id = ? AND mutation_id = ?`
         )
-        .get(consoleId, interactionId)
+        .get(consoleId, interactionId) ?? null
     );
   }
 
-  private recordVoiceConsoleMutation(consoleId: string, interactionId: string | undefined, createdUtc: string): void {
+  private getVoiceConsoleMutation(
+    consoleId: string,
+    interactionId: string | undefined,
+    action: string
+  ): boolean {
+    if (!interactionId) return false;
+    if (this.getVoiceConsoleAddInteraction(consoleId, interactionId)) {
+      throw new Error(interactionCollisionFailure().error);
+    }
+    const mutation = this.getVoiceConsoleMutationRecord(consoleId, interactionId);
+    if (!mutation) return false;
+    if (mutation.action === "legacy" || mutation.action === action) return true;
+    throw new Error(interactionCollisionFailure().error);
+  }
+
+  private recordVoiceConsoleMutation(
+    consoleId: string,
+    interactionId: string | undefined,
+    createdUtc: string,
+    action: string
+  ): void {
     if (!interactionId) return;
     const revision = this.getVoiceConsole(consoleId)?.revision ?? 0;
     this.db
       .prepare(
         `INSERT OR IGNORE INTO voice_console_mutations
-           (console_id, mutation_id, revision, created_utc) VALUES (?, ?, ?, ?)`
+           (console_id, mutation_id, action, revision, created_utc) VALUES (?, ?, ?, ?, ?)`
       )
-      .run(consoleId, interactionId, revision, createdUtc);
+      .run(consoleId, interactionId, action, revision, createdUtc);
   }
 
   private requireVoiceConsoleMutationResult(
@@ -4296,9 +4523,26 @@ CREATE INDEX IF NOT EXISTS idx_voice_console_targets_order
 CREATE TABLE IF NOT EXISTS voice_console_mutations (
   console_id    TEXT NOT NULL,
   mutation_id   TEXT NOT NULL,
+  action        TEXT NOT NULL DEFAULT 'legacy',
   revision      INTEGER NOT NULL,
   created_utc   TEXT NOT NULL,
   PRIMARY KEY (console_id, mutation_id)
+);
+
+CREATE TABLE IF NOT EXISTS voice_console_add_interactions (
+  console_id           TEXT NOT NULL,
+  interaction_id       TEXT NOT NULL,
+  binding_id           TEXT NOT NULL,
+  input_fingerprint    TEXT NOT NULL,
+  status               TEXT NOT NULL,
+  failure_code         TEXT,
+  failure_message      TEXT,
+  failure_as_exception INTEGER NOT NULL DEFAULT 0,
+  created_utc          TEXT NOT NULL,
+  updated_utc          TEXT NOT NULL,
+  PRIMARY KEY (console_id, interaction_id),
+  CHECK(status IN ('pending','succeeded','failed')),
+  CHECK(failure_as_exception IN (0,1))
 );
 `;
 
@@ -4327,6 +4571,34 @@ interface VoiceConsoleRow {
   ended_utc: string | null;
   end_reason: string | null;
 }
+
+interface VoiceConsoleAddInteractionRow {
+  console_id: string;
+  interaction_id: string;
+  binding_id: string;
+  input_fingerprint: string;
+  status: string;
+  failure_code: string | null;
+  failure_message: string | null;
+  failure_as_exception: number;
+  created_utc: string;
+  updated_utc: string;
+}
+
+const mapVoiceConsoleAddInteraction = (
+  row: VoiceConsoleAddInteractionRow
+): VoiceConsoleAddInteraction => ({
+  consoleId: row.console_id,
+  interactionId: row.interaction_id,
+  bindingId: row.binding_id,
+  inputFingerprint: row.input_fingerprint,
+  status: row.status as VoiceConsoleAddInteraction["status"],
+  failureCode: row.failure_code as VoiceConsoleAddInteraction["failureCode"],
+  failureMessage: row.failure_message,
+  failureAsException: row.failure_as_exception === 1,
+  createdUtc: row.created_utc,
+  updatedUtc: row.updated_utc,
+});
 
 const mapVoiceConsole = (row: VoiceConsoleRow): VoiceConsoleSession => ({
   id: row.id,
@@ -4534,12 +4806,48 @@ function isActiveConsole(console: VoiceConsoleSession): boolean {
 function mutationFailure(
   reason: VoiceConsoleMutationFailure,
   error: string
-): VoiceConsoleMutationOutcome {
+): Extract<VoiceConsoleMutationOutcome, { ok: false }> {
   return { ok: false, reason, error };
 }
 
-function staleConsoleFailure(): VoiceConsoleMutationOutcome {
+function staleConsoleFailure(): Extract<VoiceConsoleMutationOutcome, { ok: false }> {
   return mutationFailure("stale-revision", "Console changed; refresh.");
+}
+
+function interactionCollisionFailure(): Extract<VoiceConsoleMutationOutcome, { ok: false }> {
+  return mutationFailure(
+    "interaction-collision",
+    "Interaction ID is already used by a different Voice Console action or input."
+  );
+}
+
+function voiceConsoleAddFingerprint(input: AddVoiceConsoleBindingInput): string {
+  const binding = input.binding;
+  return JSON.stringify({
+    action: "add-binding",
+    expectedRevision: input.expectedRevision,
+    claim: input.claim !== false,
+    binding: {
+      id: binding.id,
+      consoleId: binding.consoleId,
+      platform: binding.platform,
+      channelRef: binding.channelRef,
+      parentRef: binding.parentRef,
+      guildId: binding.guildId,
+      voiceChannelId: binding.voiceChannelId,
+      ownerUserId: binding.ownerUserId,
+      ownerName: binding.ownerName,
+      alias: binding.alias,
+      ttsVoice: binding.ttsVoice,
+      ttsPace: binding.ttsPace,
+      ttsStyle: binding.ttsStyle,
+      outputEnabled: binding.outputEnabled,
+    },
+  });
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 interface LiveHelpRow {

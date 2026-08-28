@@ -151,11 +151,51 @@ export type VoiceConsoleMutationFailure =
   | "invalid-targets"
   | "binding-limit"
   | "duplicate-thread"
-  | "duplicate-alias";
+  | "duplicate-alias"
+  | "host-attach-failed"
+  | "activation-failed"
+  | "recovered-pending"
+  | "interaction-pending"
+  | "interaction-collision";
 
 export type VoiceConsoleMutationOutcome =
   | { ok: true; value: VoiceConsoleMutationResult }
-  | { ok: false; reason: VoiceConsoleMutationFailure; error: string };
+  | {
+      ok: false;
+      reason: VoiceConsoleMutationFailure;
+      error: string;
+      duplicate?: boolean;
+      /** Failed external work originally surfaced as an exception. */
+      replayAsException?: boolean;
+    };
+
+export type VoiceConsoleAddInteractionStatus = "pending" | "succeeded" | "failed";
+
+export interface VoiceConsoleAddInteraction {
+  consoleId: string;
+  interactionId: string;
+  bindingId: string;
+  inputFingerprint: string;
+  status: VoiceConsoleAddInteractionStatus;
+  failureCode: VoiceConsoleMutationFailure | null;
+  failureMessage: string | null;
+  failureAsException: boolean;
+  createdUtc: string;
+  updatedUtc: string;
+}
+
+export function sanitizeVoiceConsoleFailureMessage(value: string): string {
+  const sanitized = [...value]
+    .map((char) => {
+      const code = char.charCodeAt(0);
+      return code < 32 || code === 127 ? " " : char;
+    })
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500);
+  return sanitized || "Voice Console binding add failed.";
+}
 
 export interface VoiceConsoleFinalCapture {
   captureId: string;

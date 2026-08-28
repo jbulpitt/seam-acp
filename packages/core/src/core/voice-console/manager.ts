@@ -11,12 +11,14 @@ import type {
   VoiceConsoleDispatchRequest,
   VoiceConsoleFinalCapture,
   VoiceConsoleMutationOutcome,
+  VoiceConsoleMutationFailure,
   VoiceConsoleRemoveResult,
   VoiceConsoleRuntimeHost,
   VoiceConsoleSession,
   VoiceConsoleStartResult,
   VoiceConsoleUpgradeDefaults,
 } from "./types.js";
+import { sanitizeVoiceConsoleFailureMessage } from "./types.js";
 
 export class VoiceConsoleManager {
   private readonly store: SessionStore;
@@ -76,27 +78,46 @@ export class VoiceConsoleManager {
 
   async addBinding(input: AddVoiceConsoleBindingInput): Promise<VoiceConsoleMutationOutcome> {
     const outcome = this.store.addVoiceConsoleBinding(input);
-    if (!outcome.ok || !outcome.value.applied) return outcome;
+    if (!outcome.ok) {
+      if (outcome.replayAsException) throw new Error(outcome.error);
+      return outcome;
+    }
+    if (!outcome.value.applied) return outcome;
     const console = outcome.value.console;
     const binding = this.store.getVoiceConsoleBinding(input.binding.id);
     if (!binding) throw new Error("Voice Console binding disappeared after add.");
     let attachAttempted = false;
+    let failureCode: VoiceConsoleMutationFailure = "host-attach-failed";
     try {
       attachAttempted = true;
       const attached = await this.host.addBinding(console, binding);
       if (!attached.ok) throw new Error(attached.reason);
+      failureCode = "activation-failed";
       const activated = this.store.activateVoiceConsoleBinding(binding.id, {
         expectedRevision: console.revision,
         claim: input.claim,
+        interactionId: input.interactionId,
         updatedUtc: this.now(),
       });
       if (activated.ok) return activated;
+      failureCode = activated.reason;
       throw new Error(activated.error);
     } catch (err) {
-      const reason = errorMessage(err);
+      const reason = sanitizeVoiceConsoleFailureMessage(errorMessage(err));
       const failedUtc = this.now();
       try {
-        this.store.failStagedVoiceConsoleBinding(binding.id, reason, failedUtc);
+        this.store.failStagedVoiceConsoleBinding(
+          binding.id,
+          reason,
+          failedUtc,
+          input.interactionId
+            ? {
+                interactionId: input.interactionId,
+                failureCode,
+                failureAsException: true,
+              }
+            : undefined
+        );
       } catch (cleanupErr) {
         this.logger.error(
           { err: cleanupErr, bindingId: binding.id },
@@ -110,6 +131,21 @@ export class VoiceConsoleManager {
             "voice console staged binding terminalization fallback failed"
           );
         }
+      }
+      try {
+        this.store.finalizeVoiceConsoleAddInteractionFailure(
+          binding.consoleId,
+          input.interactionId,
+          failureCode,
+          reason,
+          true,
+          failedUtc
+        );
+      } catch (cleanupErr) {
+        this.logger.error(
+          { err: cleanupErr, bindingId: binding.id },
+          "voice console add interaction failure finalization failed"
+        );
       }
       if (attachAttempted) {
         try {
@@ -352,6 +388,7 @@ export class VoiceConsoleManager {
       "process restarted before capture finalization",
       this.now()
     );
+    this.store.recoverPendingVoiceConsoleAddInteractions(this.now());
     for (const old of legacy) {
       this.leases.release({ kind: "thread_voice", sessionId: old.id, guildId: old.guildId });
     }

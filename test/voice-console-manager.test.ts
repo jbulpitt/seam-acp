@@ -25,6 +25,17 @@ let host: VoiceConsoleRuntimeHost;
 let dispatch: VoiceConsoleDispatchHost;
 let manager: VoiceConsoleManager;
 
+function createManager(): VoiceConsoleManager {
+  return new VoiceConsoleManager({
+    store,
+    logger: silent,
+    host,
+    dispatch,
+    leases,
+    now: () => NOW,
+  });
+}
+
 function consoleRow(over: Partial<VoiceConsoleSession> = {}): VoiceConsoleSession {
   return {
     id: "tvc_1",
@@ -131,14 +142,7 @@ beforeEach(() => {
     inspectArtifact: vi.fn(async () => "missing"),
     enqueue: vi.fn(async () => {}),
   };
-  manager = new VoiceConsoleManager({
-    store,
-    logger: silent,
-    host,
-    dispatch,
-    leases,
-    now: () => NOW,
-  });
+  manager = createManager();
 });
 
 afterEach(async () => {
@@ -370,12 +374,27 @@ describe("VoiceConsoleManager lifecycle", () => {
         binding: binding("bind-b", { status: "adding", alias: "Beta" }),
         claim: true,
         expectedRevision: 1,
+        interactionId: "cleanup-stop-failed",
       })
     ).rejects.toThrow("activation invariant failed");
 
     activation.mockRestore();
+    await expect(
+      manager.addBinding({
+        binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+        claim: true,
+        expectedRevision: 1,
+        interactionId: "cleanup-stop-failed",
+      })
+    ).rejects.toThrow("activation invariant failed");
     expect(host.stopBinding).toHaveBeenCalledOnce();
+    expect(host.addBinding).toHaveBeenCalledOnce();
     expect(store.getVoiceConsoleBinding("bind-b")?.status).toBe("failed");
+    expect(store.getVoiceConsoleAddInteraction("tvc_1", "cleanup-stop-failed")).toMatchObject({
+      status: "failed",
+      failureCode: "activation-failed",
+      failureMessage: "activation invariant failed",
+    });
     expect(store.listVoiceConsoleInputTargets("tvc_1").map((row) => row.bindingId)).toEqual([
       "bind-a",
     ]);
@@ -436,6 +455,220 @@ describe("VoiceConsoleManager lifecycle", () => {
         captureId: "capture-five-targets",
       })?.assignments.map((assignment) => assignment.bindingId)
     ).toEqual(priorTargets);
+  });
+
+  it("replays a thrown host failure without repeating host add or cleanup", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    vi.mocked(host.addBinding).mockRejectedValueOnce(new Error("attach exploded"));
+    const input = {
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: true,
+      expectedRevision: 1,
+      interactionId: "same-add-thrown",
+    };
+
+    await expect(manager.addBinding(input)).rejects.toThrow("attach exploded");
+    await expect(manager.addBinding(input)).rejects.toThrow("attach exploded");
+
+    expect(host.addBinding).toHaveBeenCalledOnce();
+    expect(host.stopBinding).toHaveBeenCalledOnce();
+    expect(store.getVoiceConsoleBinding("bind-b")?.status).toBe("failed");
+    expect(store.getVoiceConsoleAddInteraction("tvc_1", "same-add-thrown")).toMatchObject({
+      status: "failed",
+      failureCode: "host-attach-failed",
+      failureMessage: "attach exploded",
+      failureAsException: true,
+    });
+  });
+
+  it("replays a structured host failure without repeating host add or cleanup", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    vi.mocked(host.addBinding).mockResolvedValueOnce({ ok: false, reason: "host refused attach" });
+    const input = {
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: true,
+      expectedRevision: 1,
+      interactionId: "same-add-structured",
+    };
+
+    await expect(manager.addBinding(input)).rejects.toThrow("host refused attach");
+    await expect(manager.addBinding(input)).rejects.toThrow("host refused attach");
+
+    expect(host.addBinding).toHaveBeenCalledOnce();
+    expect(host.stopBinding).toHaveBeenCalledOnce();
+    expect(store.getVoiceConsoleAddInteraction("tvc_1", "same-add-structured")).toMatchObject({
+      status: "failed",
+      failureCode: "host-attach-failed",
+    });
+  });
+
+  it("replays activation failure without repeating host add or cleanup", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    vi.spyOn(store, "activateVoiceConsoleBinding").mockReturnValueOnce({
+      ok: false,
+      reason: "stale-revision",
+      error: "activation lost its revision",
+    });
+    const input = {
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: true,
+      expectedRevision: 1,
+      interactionId: "same-add-activation",
+    };
+
+    await expect(manager.addBinding(input)).rejects.toThrow("activation lost its revision");
+    await expect(manager.addBinding(input)).rejects.toThrow("activation lost its revision");
+
+    expect(host.addBinding).toHaveBeenCalledOnce();
+    expect(host.stopBinding).toHaveBeenCalledOnce();
+    expect(store.getVoiceConsoleAddInteraction("tvc_1", "same-add-activation")).toMatchObject({
+      status: "failed",
+      failureCode: "stale-revision",
+      failureAsException: true,
+    });
+  });
+
+  it("replays a successful add without repeating host attachment", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    const input = {
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: true,
+      expectedRevision: 1,
+      interactionId: "same-add-success",
+    };
+
+    const first = await manager.addBinding(input);
+    const replay = await manager.addBinding(input);
+
+    expect(first.ok && first.value).toMatchObject({ applied: true, duplicate: false });
+    expect(replay.ok && replay.value).toMatchObject({ applied: false, duplicate: true });
+    expect(host.addBinding).toHaveBeenCalledOnce();
+    expect(host.stopBinding).not.toHaveBeenCalled();
+    expect(store.getVoiceConsoleAddInteraction("tvc_1", "same-add-success")?.status).toBe(
+      "succeeded"
+    );
+  });
+
+  it("fails a concurrent pending duplicate closed without double-attaching", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    const attachment = deferred<{ ok: true }>();
+    vi.mocked(host.addBinding).mockImplementationOnce(async () => attachment.promise);
+    const input = {
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: true,
+      expectedRevision: 1,
+      interactionId: "same-add-pending",
+    };
+
+    const first = manager.addBinding(input);
+    await flush();
+    expect(await manager.addBinding(input)).toEqual({
+      ok: false,
+      reason: "interaction-pending",
+      error: "Voice Console binding add is already in progress.",
+      duplicate: true,
+    });
+    expect(host.addBinding).toHaveBeenCalledOnce();
+
+    attachment.resolve({ ok: true });
+    const completed = await first;
+    expect(completed.ok && completed.value).toMatchObject({ applied: true, duplicate: false });
+    expect(host.addBinding).toHaveBeenCalledOnce();
+    expect(host.stopBinding).not.toHaveBeenCalled();
+  });
+
+  it("replays durable failed and succeeded outcomes after reopening the store", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    vi.mocked(host.addBinding).mockRejectedValueOnce(new Error("persisted attach failure"));
+    const failedInput = {
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: true,
+      expectedRevision: 1,
+      interactionId: "persisted-add-failed",
+    };
+    await expect(manager.addBinding(failedInput)).rejects.toThrow("persisted attach failure");
+    const succeededInput = {
+      binding: binding("bind-c", { status: "adding", alias: "Gamma" }),
+      claim: false,
+      expectedRevision: store.getVoiceConsole("tvc_1")!.revision,
+      interactionId: "persisted-add-succeeded",
+    };
+    const succeeded = await manager.addBinding(succeededInput);
+    if (!succeeded.ok) throw new Error(succeeded.error);
+
+    manager.shutdown();
+    store.close();
+    store = new SessionStore(path.join(dir, "test.db"));
+    manager = createManager();
+
+    await expect(manager.addBinding(failedInput)).rejects.toThrow("persisted attach failure");
+    const successReplay = await manager.addBinding(succeededInput);
+    expect(successReplay.ok && successReplay.value).toMatchObject({
+      applied: false,
+      duplicate: true,
+    });
+    expect(host.addBinding).toHaveBeenCalledTimes(2);
+    expect(host.stopBinding).toHaveBeenCalledOnce();
+  });
+
+  it("rejects interaction id collisions with a different add input or action", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    const input = {
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: false,
+      expectedRevision: 1,
+      interactionId: "colliding-add",
+    };
+    const first = await manager.addBinding(input);
+    if (!first.ok) throw new Error(first.error);
+
+    expect(await manager.addBinding({ ...input, claim: true })).toEqual({
+      ok: false,
+      reason: "interaction-collision",
+      error: "Interaction ID is already used by a different Voice Console action or input.",
+    });
+    expect(() =>
+      store.replaceVoiceConsoleInputTargets("tvc_1", {
+        bindingIds: ["bind-a"],
+        fanoutArmed: false,
+        expectedRevision: store.getVoiceConsole("tvc_1")!.revision,
+        interactionId: "colliding-add",
+      })
+    ).toThrow("Interaction ID is already used by a different Voice Console action or input.");
+    expect(host.addBinding).toHaveBeenCalledOnce();
+  });
+
+  it("recovers a stale pending add on boot and replays its durable failure", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    const input = {
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: true,
+      expectedRevision: 1,
+      interactionId: "pending-across-boot",
+    };
+    const staged = store.addVoiceConsoleBinding(input);
+    expect(staged.ok && staged.value.applied).toBe(true);
+    expect(store.getVoiceConsoleBinding("bind-b")?.status).toBe("adding");
+
+    await manager.reconcileOnBoot({
+      aliasFor: () => "unused",
+      profileFor: () => ({ voice: "Aoede", pace: null, style: null }),
+    });
+
+    expect(store.getVoiceConsoleBinding("bind-b")?.status).toBe("failed");
+    expect(store.getVoiceConsoleAddInteraction("tvc_1", "pending-across-boot")).toMatchObject({
+      status: "failed",
+      failureCode: "recovered-pending",
+      failureAsException: false,
+    });
+    expect(await manager.addBinding(input)).toEqual({
+      ok: false,
+      reason: "recovered-pending",
+      error: "Voice Console binding add was interrupted before completion.",
+      duplicate: true,
+      replayAsException: false,
+    });
+    expect(host.addBinding).not.toHaveBeenCalled();
   });
 
   it.each(["capturing", "finalizing"] as const)(

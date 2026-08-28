@@ -40,6 +40,12 @@ describe("Voice Console V2 migration", () => {
         created_utc TEXT NOT NULL, updated_utc TEXT NOT NULL, error TEXT,
         UNIQUE(session_id, sequence)
       );
+      CREATE TABLE voice_console_mutations (
+        console_id TEXT NOT NULL, mutation_id TEXT NOT NULL, revision INTEGER NOT NULL,
+        created_utc TEXT NOT NULL, PRIMARY KEY (console_id, mutation_id)
+      );
+      INSERT INTO voice_console_mutations VALUES
+        ('legacy-console','legacy-interaction',1,'2026-08-27T12:00:00.000Z');
       INSERT INTO thread_voice_sessions VALUES
         ('tv_legacy','discord','thread-1','parent-1','guild-1','vc-1',
          'owner-1','Owner','ready','notice-1',1250,
@@ -58,6 +64,25 @@ describe("Voice Console V2 migration", () => {
     expect(columns).toEqual(
       expect.arrayContaining(["console_id", "alias_normalized", "tts_voice", "output_enabled"])
     );
+    const mutationDb = new Database(dbPath, { readonly: true });
+    expect(
+      mutationDb
+        .prepare("PRAGMA table_info(voice_console_mutations)")
+        .all()
+        .map((row: any) => row.name)
+    ).toContain("action");
+    expect(
+      mutationDb
+        .prepare("SELECT action FROM voice_console_mutations WHERE mutation_id = ?")
+        .get("legacy-interaction")
+    ).toEqual({ action: "legacy" });
+    expect(
+      mutationDb
+        .prepare("PRAGMA table_info(voice_console_add_interactions)")
+        .all()
+        .map((row: any) => row.name)
+    ).toEqual(expect.arrayContaining(["input_fingerprint", "status", "failure_code"]));
+    mutationDb.close();
 
     const upgraded = store.upgradeActiveV1ThreadVoiceSessions(
       {

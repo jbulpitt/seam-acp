@@ -124,6 +124,7 @@ describe("SessionStore Voice Console state", () => {
     const activated = store.activateVoiceConsoleBinding("bind-b", {
       expectedRevision: 2,
       claim: false,
+      interactionId: "interaction-add",
     });
     if (!activated.ok) throw new Error(activated.error);
 
@@ -160,6 +161,54 @@ describe("SessionStore Voice Console state", () => {
       expectedRevision: 2,
     });
     expect(stale).toMatchObject({ ok: false, reason: "stale-revision" });
+  });
+
+  it("durably replays add validation failures and rejects cross-action interaction collisions", () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    const staleInput = {
+      binding: binding("bind-b", { alias: "Beta" }),
+      claim: true,
+      expectedRevision: 99,
+      interactionId: "failed-before-stage",
+    };
+    expect(store.addVoiceConsoleBinding(staleInput)).toEqual({
+      ok: false,
+      reason: "stale-revision",
+      error: "Console changed; refresh.",
+    });
+    expect(store.addVoiceConsoleBinding(staleInput)).toEqual({
+      ok: false,
+      reason: "stale-revision",
+      error: "Console changed; refresh.",
+      duplicate: true,
+      replayAsException: false,
+    });
+    expect(store.getVoiceConsoleBinding("bind-b")).toBeNull();
+    expect(store.getVoiceConsoleAddInteraction("tvc_1", "failed-before-stage")).toMatchObject({
+      status: "failed",
+      failureCode: "stale-revision",
+      failureAsException: false,
+    });
+
+    const generic = store.setVoiceConsoleOutputBindings("tvc_1", {
+      enabledBindingIds: ["bind-a"],
+      expectedRevision: 1,
+      interactionId: "generic-first",
+    });
+    if (!generic.ok) throw new Error(generic.error);
+    expect(
+      store.addVoiceConsoleBinding({
+        binding: binding("bind-c", { alias: "Gamma" }),
+        claim: false,
+        expectedRevision: generic.value.console.revision,
+        interactionId: "generic-first",
+      })
+    ).toEqual({
+      ok: false,
+      reason: "interaction-collision",
+      error: "Interaction ID is already used by a different Voice Console action or input.",
+    });
+    expect(store.getVoiceConsoleBinding("bind-c")).toBeNull();
   });
 
   it("keeps output preferences independent and generation-invalidated", () => {

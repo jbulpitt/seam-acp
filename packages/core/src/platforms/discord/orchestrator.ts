@@ -283,6 +283,8 @@ import {
   type DispatchSpec,
 } from "../../core/dispatch/types.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
+import { formatLocalTime } from "../../core/format-time.js";
+import { formatCoarseDuration } from "../../core/server-status.js";
 import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
@@ -2027,10 +2029,21 @@ export class Orchestrator {
       extraRules.push(
         ...choiceAuthoringRules({ fence: seamFences && canAuthorChoice, mcp: seamMcp && canAuthorChoice })
       );
+      // Per-turn time facts so the agent reasons about wall-clock/duration in
+      // the user's local zone instead of off UTC timestamps. `updatedUtc` holds
+      // the PREVIOUS turn's end (this turn upserts it later), so it is the gap
+      // since the last turn. Omit the gap on the first/only turn or a bad stamp.
+      const nowMs = Date.now();
+      const lastTurnMs = Date.parse(record.updatedUtc ?? "");
       let promptText = withHarnessPreamble(msg.text, extraRules, speaker, {
         inboxAwareness: this.config.SEAM_INBOX_PREAMBLE_ENABLED,
         seamMcp,
         seamFences,
+        localTime: formatLocalTime(nowMs),
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        ...(Number.isFinite(lastTurnMs) && nowMs - lastTurnMs > 1000
+          ? { sinceLastTurn: formatCoarseDuration(nowMs - lastTurnMs) }
+          : {}),
       });
       let promptAttachments = msg.attachments;
       const activeProfile = this.router.getProfile(record.agentId);

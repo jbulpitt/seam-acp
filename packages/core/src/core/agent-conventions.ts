@@ -109,6 +109,15 @@ export interface HarnessOpts {
   seamMcp?: boolean;
   /** This turn's output path runs emitClosedFence (live yes, dispatch no). */
   seamFences?: boolean;
+  /** Current wall-clock in the user's local zone, pre-formatted by the caller
+   *  (e.g. "Aug 28, 2026, 8:47 AM CDT"). Emitted as a per-turn fact so the
+   *  agent reasons about time-of-day from this, not a UTC timestamp. */
+  localTime?: string;
+  /** IANA zone name paired with `localTime` (e.g. "America/Chicago"). */
+  timezone?: string;
+  /** Humanized gap since the previous turn in this thread (e.g. "3h 12m"),
+   *  so "how long ago" needs no timestamp math. */
+  sinceLastTurn?: string;
 }
 
 /** True when the injected ACP mcpServers list includes the seam-mcp HTTP entry. */
@@ -154,6 +163,22 @@ export function harnessPreamble(
   // when no speaker is supplied so the flag-off output stays byte-identical.
   const speakerLine = formatSpeakerLine(speaker);
   if (speakerLine) lines.push(speakerLine);
+  // Per-turn time facts (issue: agents mis-reported wall-clock/duration off UTC).
+  // Emitted only when supplied so the flag-off output stays byte-identical.
+  const turnFacts: string[] = [];
+  if (opts?.localTime) {
+    turnFacts.push(
+      `it is currently ${opts.localTime}${opts.timezone ? ` (the user's timezone is ${opts.timezone})` : ""}`
+    );
+  }
+  if (opts?.sinceLastTurn) {
+    turnFacts.push(`${opts.sinceLastTurn} has elapsed since the previous turn in this thread`);
+  }
+  if (turnFacts.length) {
+    lines.push(
+      `Turn context: ${turnFacts.join("; ")}. Use these for any time-of-day or "how long ago" reasoning — do not infer the time from UTC timestamps.`
+    );
+  }
   lines.push("The user's message follows.");
   lines.push("</seam-harness>");
   return lines.join("\n");

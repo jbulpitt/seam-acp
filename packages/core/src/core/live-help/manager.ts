@@ -7,6 +7,7 @@ import {
   type LiveHelpStatus,
 } from "./types.js";
 import { checkLiveHelpVoiceChannel, parseLiveHelpMintSpec } from "./voice-policy.js";
+import { VoiceLeaseManager, type VoiceLease } from "../voice-lease.js";
 
 export interface LiveHelpHost {
   inspectVoiceChannel(voiceChannelId: string): Promise<
@@ -34,6 +35,7 @@ export class LiveHelpManager {
   private readonly logger: Logger;
   private readonly host: LiveHelpHost;
   private readonly apiKey: () => string;
+  private readonly leases: VoiceLeaseManager;
   private readonly running = new Map<string, AbortController>();
 
   constructor(opts: {
@@ -41,11 +43,13 @@ export class LiveHelpManager {
     logger: Logger;
     host: LiveHelpHost;
     apiKey: () => string;
+    leases: VoiceLeaseManager;
   }) {
     this.store = opts.store;
     this.logger = opts.logger.child({ comp: "live-help" });
     this.host = opts.host;
     this.apiKey = opts.apiKey;
+    this.leases = opts.leases;
   }
 
   /** Process start: in-flight rows cannot keep a voice connection. Mark ended. */
@@ -117,12 +121,24 @@ export class LiveHelpManager {
       endedUtc: null,
       endReason: null,
     };
-    this.store.insertLiveHelp(row);
+    const acquired = this.leases.acquire({
+      kind: "live_help",
+      sessionId: row.id,
+      guildId: inspected.guildId,
+      voiceChannelId: row.voiceChannelId,
+    });
+    if (!acquired.ok) return { ok: false, error: acquired.error };
+    try {
+      this.store.insertLiveHelp(row);
+    } catch (err) {
+      this.leases.release(acquired.lease);
+      throw err;
+    }
     this.logger.info(
       { liveId: row.id, vc: row.voiceChannelId, thread: record.channelRef },
       "live-help minted"
     );
-    this.startCall(row);
+    this.startCall(row, acquired.lease);
     return {
       ok: true,
       liveId: row.id,
@@ -167,12 +183,12 @@ export class LiveHelpManager {
     this.running.clear();
   }
 
-  private startCall(row: LiveHelpSession): void {
+  private startCall(row: LiveHelpSession, lease: VoiceLease): void {
     const ac = new AbortController();
     this.running.set(row.id, ac);
     const notifyBuf = { input: "", output: "" };
-    void this.host
-      .runCall({
+    void Promise.resolve()
+      .then(() => this.host.runCall({
         row,
         signal: ac.signal,
         onLive: () => {
@@ -182,7 +198,7 @@ export class LiveHelpManager {
           if (side === "input") notifyBuf.input += text;
           else notifyBuf.output += text;
         },
-      })
+      }))
       .then(async ({ reason }) => {
         const cancelled = reason === "cancelled" || ac.signal.aborted;
         const status: LiveHelpStatus = cancelled ? "cancelled" : "ended";
@@ -214,6 +230,7 @@ export class LiveHelpManager {
       })
       .finally(() => {
         this.running.delete(row.id);
+        this.leases.release(lease);
       });
   }
 }

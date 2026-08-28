@@ -7,11 +7,11 @@ import {
  * `/seam` slash-command tree (#78).
  *
  * Discord caps each command at 25 top-level options (subcommands + groups).
- * The tree is 14/25: 6 top-level subcommands + 8 groups. Future surfaces
+ * The tree is 15/25: 6 top-level subcommands + 9 groups. Future surfaces
  * default to living INSIDE a group (each group has its own 25 budget).
  *
  *   TOP-LEVEL (6): cancel, steer, new, workflows, queue, rebuild
- *   GROUPS (8):
+ *   GROUPS (9):
  *     config   (17) model effort agent mode repo tools card gif approve reset init detach tts show edit set audit
  *     info     (6)  whoami usage avatar help sessions repos
  *     schedule (7)  unchanged
@@ -20,6 +20,7 @@ import {
  *     upload   (3)  pull push secret  — admin-only; hard cutover of /seam attach
  *     bridge   (4)  add rotate list remove  — admin-only pairing (#83/#86)
  *     debug    (6)  tail exec status voice-ping voice-capture voice-live — admin-only even when SEAM_BRIDGE_DEV (#83)
+ *     voice    (3)  start stop status — Thread Voice v1, admin-only
  */
 export function buildSeamCommand(): SlashCommandBuilder {
   const cmd = new SlashCommandBuilder()
@@ -177,7 +178,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
-  // --- groups (8) -----------------------------------------------------------
+  // --- groups (9) -----------------------------------------------------------
 
   cmd.addSubcommandGroup((g) =>
     g
@@ -822,6 +823,33 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("voice")
+      .setDescription("Admin-only Thread Voice binding for this ACP thread")
+      .addSubcommand((sub) =>
+        sub
+          .setName("start")
+          .setDescription("Bind this thread to your current self-muted voice channel")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("stop")
+          .setDescription("Stop Thread Voice; finalized pending text is preserved by default")
+          .addBooleanOption((o) =>
+            o
+              .setName("discard-pending")
+              .setDescription("Delete finalized text that has not been dispatched (default false)")
+              .setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("status")
+          .setDescription("Show the Thread Voice owner, channel, runtime, usage, pending, and dispatch")
+      )
+  );
+
   return cmd;
 }
 
@@ -863,7 +891,9 @@ export type SeamSubcommand =
   | "status"
   | "voice-ping"
   | "voice-capture"
-  | "voice-live";
+  | "voice-live"
+  | "start"
+  | "stop";
 
 export function getSubcommand(
   i: ChatInputCommandInteraction

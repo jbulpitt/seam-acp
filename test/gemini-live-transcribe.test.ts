@@ -270,6 +270,36 @@ describe("GeminiLiveTranscribeClient", () => {
     client.close();
   });
 
+  it("retains the utterance for one unary fallback when reconnect setup fails at start", async () => {
+    const harness = socketHarness();
+    const unaryFallback = vi.fn<GeminiUnaryFallback>(async ({ pcm16k }) => ({
+      ok: true,
+      text: `Recovered ${pcm16k.byteLength} bytes`,
+    }));
+    const client = await connectClient({ harness, unaryFallback });
+    // Simulate a connection that became unusable between captures without a
+    // close event reaching the client. startUtterance must reserve the capture
+    // before attempting its replacement connection.
+    harness.sockets[0]!.readyState = WebSocket.CLOSED;
+    const starting = client.startUtterance();
+    const replacement = harness.sockets[1]!;
+    replacement.open();
+    replacement.emit("error", new Error("replacement setup failed"));
+    await expect(starting).resolves.toBeUndefined();
+
+    const pcm = new Uint8Array([1, 2, 3, 4, 5, 6]);
+    expect(() => client.sendPcm16k(pcm)).not.toThrow();
+    await expect(client.finalizeUtterance(pcm)).resolves.toEqual({
+      ok: true,
+      text: "Recovered 6 bytes",
+      source: "unary",
+    });
+    expect(unaryFallback).toHaveBeenCalledTimes(1);
+    expect(unaryFallback.mock.calls[0]![0].pcm16k).toEqual(pcm);
+    expect(client.forwardedBytes).toBe(0);
+    client.close();
+  });
+
   it("uses the configured unary Smart API with the same normalized vocabulary", async () => {
     const harness = socketHarness();
     const requests: Request[] = [];

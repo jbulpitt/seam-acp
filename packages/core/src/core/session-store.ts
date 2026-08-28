@@ -2375,6 +2375,20 @@ export class SessionStore {
       .run(updatedUtc, sessionId).changes;
   }
 
+  discardArtifactFreeThreadVoiceBatch(
+    sessionId: string,
+    dispatchId: string,
+    updatedUtc = new Date().toISOString()
+  ): number {
+    return this.db
+      .prepare(
+        `UPDATE thread_voice_segments
+            SET state = 'discarded', transcript = '', updated_utc = ?, error = NULL
+          WHERE session_id = ? AND dispatch_id = ? AND state = 'batched'`
+      )
+      .run(updatedUtc, sessionId, dispatchId).changes;
+  }
+
   claimIngestStudent(
     ingestId: string,
     studentId: string

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   isBridgeAdminRefused,
   isStampedConfigAdmin,
+  isThreadVoiceAdminRefused,
 } from "../packages/core/src/platforms/discord/admin-gate.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 
@@ -64,6 +65,20 @@ describe("bridge/debug admin gate (#83)", () => {
     };
     expect(isBridgeAdminRefused(cfg, ADMIN)).toBe(true);
     expect(isStampedConfigAdmin(cfg, ADMIN).reason).toBe("not-admin");
+  });
+});
+
+describe("Thread Voice v1 admin gate", () => {
+  const cfg = { SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]) } as any;
+
+  it("accepts only the authoritative Discord id in the configured admin set", () => {
+    expect(isThreadVoiceAdminRefused(cfg, ADMIN)).toBe(false);
+    expect(isThreadVoiceAdminRefused(cfg, OPERATOR)).toBe(true);
+    expect(isThreadVoiceAdminRefused(cfg, undefined)).toBe(true);
+  });
+
+  it("fails closed when no admin set is configured", () => {
+    expect(isThreadVoiceAdminRefused({ SEAM_CONFIG_ADMIN_USER_IDS: undefined } as any, ADMIN)).toBe(true);
   });
 });
 

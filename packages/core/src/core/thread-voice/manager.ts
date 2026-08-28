@@ -34,6 +34,7 @@ export interface ThreadVoiceHost {
   }): Promise<{ reason: string }>;
   speak(sessionId: string, pcm: TtsPcm): Promise<void>;
   waitForPlaybackIdle(sessionId: string): Promise<void>;
+  stopPlayback(sessionId: string): Promise<void>;
   notify(threadId: string, event: ThreadVoiceNotification): Promise<void>;
 }
 
@@ -434,9 +435,33 @@ export class ThreadVoiceManager {
       return { ok: false, error: "That Thread Voice session has already ended." };
     }
     const reason = opts.reason ?? "stopped";
-    const discarded = opts.discardPending
+    let discarded = opts.discardPending
       ? this.store.discardPendingThreadVoiceSegments(sessionId, this.now())
       : 0;
+    if (opts.discardPending) {
+      const batches = this.store
+        .listThreadVoiceBatchesByState("batched")
+        .filter((batch) => batch.session.id === sessionId);
+      for (const batch of batches) {
+        try {
+          // Explicit discard covers finalized-but-undispatched text. Once any
+          // stable artifact exists, the durable dispatch owns those rows and
+          // stop must preserve it.
+          if (await this.dispatch.inspectArtifact(batch.dispatchId) === "missing") {
+            discarded += this.store.discardArtifactFreeThreadVoiceBatch(
+              sessionId,
+              batch.dispatchId,
+              this.now()
+            );
+          }
+        } catch (err) {
+          this.logger.warn(
+            { err, threadVoiceId: sessionId, dispatchId: batch.dispatchId },
+            "thread voice discard artifact inspection failed; preserving batch"
+          );
+        }
+      }
+    }
     this.requestedStopReasons.set(sessionId, reason);
     this.store.updateThreadVoiceSession(sessionId, {
       status: "stopping",
@@ -478,6 +503,15 @@ export class ThreadVoiceManager {
 
   async speak(sessionId: string, pcm: TtsPcm): Promise<void> {
     await this.host.speak(sessionId, pcm);
+  }
+
+  /** Typed turns also gate pending release on the existing host playback queue. */
+  async waitForPlaybackIdle(sessionId: string): Promise<void> {
+    await this.host.waitForPlaybackIdle(sessionId);
+  }
+
+  async stopPlayback(sessionId: string): Promise<void> {
+    await this.host.stopPlayback(sessionId);
   }
 
   getRuntimeState(sessionId: string): ThreadVoiceRuntimeState | undefined {

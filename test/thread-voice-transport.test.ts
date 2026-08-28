@@ -375,6 +375,66 @@ describe("ThreadVoicePlaybackQueue", () => {
     expect(encodedLengths).toEqual([3_840]);
     queue.destroy();
   });
+
+  it("force-stops current and queued PCM, settles waiters, and remains reusable", async () => {
+    vi.useFakeTimers();
+    const player = new EventEmitter() as any;
+    player.state = { status: AudioPlayerStatus.Idle };
+    player.play = (resource: EventEmitter) => {
+      const old = player.state;
+      player.state = { status: AudioPlayerStatus.Playing };
+      player.emit("stateChange", old, player.state);
+      resource.once("finish", () => {
+        const playing = player.state;
+        player.state = { status: AudioPlayerStatus.Idle };
+        player.emit("stateChange", playing, player.state);
+      });
+    };
+    player.stop = vi.fn(() => {
+      const old = player.state;
+      player.state = { status: AudioPlayerStatus.Idle };
+      player.emit("stateChange", old, player.state);
+      return true;
+    });
+    const encodedSamples: number[] = [];
+    const queue = new ThreadVoicePlaybackQueue({
+      connection: { subscribe: () => ({}) } as never,
+      logger: silentLogger,
+      dependencies: {
+        createPlayer: (() => player) as never,
+        createResource: ((stream: EventEmitter) => stream) as never,
+        createEncoder: () => ({
+          decode: () => Buffer.alloc(0),
+          encode: (pcm: Buffer) => {
+            encodedSamples.push(pcm.readInt16LE(0));
+            return Buffer.from([encodedSamples.length]);
+          },
+        }),
+      },
+    });
+
+    const interrupted = Buffer.alloc(960 * 2);
+    interrupted.writeInt16LE(101, 0);
+    interrupted.writeInt16LE(202, 960);
+    queue.enqueue({ pcm: interrupted, sampleRate: 24_000, channels: 1 });
+    const waiting = queue.waitForIdle();
+    await vi.advanceTimersByTimeAsync(1);
+    queue.stopAndClear();
+    await expect(waiting).resolves.toBeUndefined();
+    const countAfterStop = encodedSamples.length;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(encodedSamples).toHaveLength(countAfterStop);
+
+    const later = Buffer.alloc(960);
+    later.writeInt16LE(303, 0);
+    queue.enqueue({ pcm: later, sampleRate: 24_000, channels: 1 });
+    const reused = queue.waitForIdle();
+    await vi.advanceTimersByTimeAsync(30);
+    await reused;
+    expect(encodedSamples.at(-1)).toBe(303);
+    expect(player.stop).toHaveBeenCalled();
+    queue.destroy();
+  });
 });
 
 describe("DiscordThreadVoiceCall lifecycle", () => {

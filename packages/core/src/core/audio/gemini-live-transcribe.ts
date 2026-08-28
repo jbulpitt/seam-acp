@@ -248,15 +248,23 @@ export class GeminiLiveTranscribeClient {
   async startUtterance(): Promise<void> {
     if (this.stopped) throw new Error("live transcribe client is closed");
     if (this.utterance) throw new Error("a live transcribe utterance is already active");
-    const connection = await this.ensureConnection();
     const utterance: ActiveUtterance = {
       phase: "capturing",
       finalParts: [],
       completed: false,
     };
+    // Reserve the logical utterance before touching the network. Reconnect or
+    // setup can fail after Discord has already begun buffering PCM; retaining
+    // this object makes sendPcm a safe no-op and lets finalizeUtterance run the
+    // caller-buffered unary Smart fallback exactly once.
     this.utterance = utterance;
-    if (!this.sendJson(connection, buildGeminiTranscribeActivityStart())) {
-      utterance.liveFailure = "failed to send activityStart";
+    try {
+      const connection = await this.ensureConnection();
+      if (!this.sendJson(connection, buildGeminiTranscribeActivityStart())) {
+        utterance.liveFailure = "failed to send activityStart";
+      }
+    } catch (err) {
+      utterance.liveFailure = `live transcribe connection failed: ${errorMessage(err)}`;
     }
   }
 

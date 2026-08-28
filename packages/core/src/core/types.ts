@@ -266,7 +266,10 @@ export type DelegationKind =
   /** Headless HTTP ingest endpoint (#95) — isolated silent scoring turn.
    *  Distinct from "choice" so Discord click-cards and microsite endpoints
    *  do not share ledger/panel filing. */
-  | "ingest";
+  | "ingest"
+  /** Durable user-authored input produced only by authenticated Thread Voice
+   *  capture. Trusted speaker metadata is verified against its durable batch. */
+  | "thread_voice";
 
 /**
  * Lifecycle of a ledger row.

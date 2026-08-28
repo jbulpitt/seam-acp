@@ -23,9 +23,11 @@ import { WakeManager } from "./core/wake/manager.js";
 import { ParkedPromptManager } from "./core/parked-prompts/manager.js";
 import { WatchManager } from "./core/watch/manager.js";
 import { LiveHelpManager } from "./core/live-help/manager.js";
+import { ThreadVoiceManager } from "./core/thread-voice/manager.js";
+import { VoiceLeaseManager } from "./core/voice-lease.js";
 import { evaluateWatch } from "./core/watch/evaluate.js";
 import { DispatchWatcher } from "./core/dispatch/watcher.js";
-import { enqueueDispatchSpec } from "./core/dispatch/types.js";
+import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
 import { watchChannelPresets } from "./core/config-reload.js";
@@ -804,10 +806,12 @@ async function main(): Promise<void> {
   orchestrator.setWatchManager(watchManager);
   watchManager.start();
 
+  const voiceLeases = new VoiceLeaseManager();
   const liveHelpManager = new LiveHelpManager({
     store,
     logger: logger.child({ mod: "live-help" }),
     apiKey: () => config.SEAM_GEMINI_API_KEY,
+    leases: voiceLeases,
     host: {
       inspectVoiceChannel: (id) => adapter.inspectLiveHelpVoice(id),
       runCall: (opts) => adapter.runLiveHelpCall(opts),
@@ -816,7 +820,6 @@ async function main(): Promise<void> {
       },
     },
   });
-  liveHelpManager.reconcileOnBoot();
   orchestrator.setLiveHelpManager(liveHelpManager);
 
   // Operator-dispatch bridge: a trusted process drops a spec into
@@ -832,6 +835,55 @@ async function main(): Promise<void> {
     resumeEnabled: config.SEAM_TURN_RESUME_ENABLED,
   });
   orchestrator.setDispatchWatcher(dispatchWatcher);
+
+  const threadVoiceManager = new ThreadVoiceManager({
+    store,
+    logger: logger.child({ mod: "thread-voice" }),
+    leases: voiceLeases,
+    host: {
+      inspectOwnerVoiceState: (userId, guildId) =>
+        adapter.inspectThreadVoiceOwner(userId, guildId),
+      runSession: (opts) => adapter.runThreadVoiceSession(opts),
+      speak: (sessionId, pcm) => adapter.speakThreadVoice(sessionId, pcm),
+      waitForPlaybackIdle: (sessionId) =>
+        adapter.waitForThreadVoicePlaybackIdle(sessionId),
+      stopPlayback: (sessionId) => adapter.stopThreadVoicePlayback(sessionId),
+      notify: (threadId, event) => orchestrator.notifyThreadVoice(threadId, event),
+    },
+    dispatch: {
+      isHomeThreadBusy: (session) => orchestrator.isChannelBusy(session.channelRef),
+      inspectArtifact: async (id) => {
+        const dirs = dispatchDirs(config.DATA_DIR);
+        if (fs.existsSync(path.join(dirs.done, `${id}.json`))) return "done";
+        if (fs.existsSync(path.join(dirs.running, `${id}.json`))) return "running";
+        if (fs.existsSync(path.join(dirs.pending, `${id}.json`))) return "pending";
+        return "missing";
+      },
+      enqueue: async (request) => {
+        const spec: DispatchSpec = {
+          id: request.id,
+          target: request.target,
+          prompt: request.prompt,
+          session: "live",
+          kind: "thread_voice",
+          authorId: request.authorId,
+          authorName: request.authorName,
+          threadVoiceSessionId: request.threadVoiceSessionId,
+          createdUtc: request.createdUtc,
+        };
+        await enqueueDispatchSpec(config.DATA_DIR, spec);
+      },
+    },
+  });
+  orchestrator.setThreadVoiceManager(threadVoiceManager);
+  // Reconcile both durable products before either can claim a boot lease.
+  // Live Help v1 cannot reconnect, so its in-flight rows end first; eligible
+  // muted Thread Voice rows may then reacquire and reconnect.
+  liveHelpManager.reconcileOnBoot();
+  await threadVoiceManager.reconcileOnBoot();
+  await threadVoiceManager.recoverDispatches();
+  // Only now may durable specs run: Thread Voice verification, settlement,
+  // lease reconciliation, and recovery bookkeeping are all installed first.
   await dispatchWatcher.start();
 
   // #88: parked prompts wait on onBridgeReady (no timer). Start after the
@@ -1011,7 +1063,9 @@ async function main(): Promise<void> {
     parkedManager.stop();
     cardGifs.stop();
     watchManager.stop();
+    threadVoiceManager.shutdown();
     liveHelpManager.stopAll();
+    voiceLeases.releaseAll();
     dispatchWatcher.stop();
     stopPresetsWatch?.();
     await seamMcpServer?.stop().catch((err) =>

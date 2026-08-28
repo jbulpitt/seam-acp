@@ -2,8 +2,8 @@
  * Discord media transport for Thread Voice.
  *
  * This module deliberately owns no durable/session policy and writes no audio
- * to disk. Its callbacks are a temporary Package C boundary until the Package
- * A/B manager and Transcribe Live interfaces are integrated.
+ * to disk. Package D adapts these capture callbacks to Package A/B in
+ * `thread-voice-host.ts`.
  */
 import { createRequire } from "node:module";
 import { PassThrough } from "node:stream";
@@ -270,7 +270,7 @@ export type ThreadVoiceCallOptions = {
   reconnectGraceMs?: number;
   minCaptureBytes?: number;
   maxCapturePartBytes?: number;
-  /** Package D should inject Package A's durable per-session allocator. */
+  /** Production injects Package A's durable per-session allocator. */
   allocateSequence?: () => number;
   /** Test seam and temporary Package D integration boundary. */
   dependencies?: ThreadVoiceCallDependencies;
@@ -407,6 +407,10 @@ export class DiscordThreadVoiceCall {
 
   waitForPlaybackIdle(): Promise<void> {
     return this.playback.waitForIdle();
+  }
+
+  stopPlayback(): void {
+    this.playback.stopAndClear();
   }
 
   async destroy(reason = "ended"): Promise<void> {
@@ -718,6 +722,24 @@ export class ThreadVoicePlaybackQueue {
     this.pump();
     if (this.isIdle()) return Promise.resolve();
     return new Promise((resolve) => this.idleWaiters.push(resolve));
+  }
+
+  /** Stop current/queued audio while keeping the player reusable for capture. */
+  stopAndClear(): void {
+    if (this.destroyed) return;
+    this.packets.splice(0, this.packets.length);
+    this.pcmTail = Buffer.alloc(0);
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+    try { this.stream?.destroy(); } catch { /* already closed */ }
+    this.stream = undefined;
+    this.cycleActive = false;
+    this.endingStream = false;
+    try { this.player.stop(true); } catch { /* already idle */ }
+    this.onPlaybackIdle?.();
+    this.resolveIdleWaiters();
   }
 
   destroy(): void {

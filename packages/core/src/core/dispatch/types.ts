@@ -51,6 +51,11 @@ export interface DispatchSpec {
    *  watch (#60) sets "watch"; an agent-triggered compaction sets "compact";
    *  a parked prompt firing after a remote-bridge reconnect (#88) sets "parked". */
   kind?: DelegationKind;
+  /** Trusted human attribution. These three fields are an all-or-nothing tuple
+   *  accepted only for the internal `thread_voice` kind. */
+  authorId?: string;
+  authorName?: string;
+  threadVoiceSessionId?: string;
   /** Compact-kind specs only: which history the pipeline reads — "session"
    *  (the raw session JSONL, the default) or "discord" (reconstructed from the
    *  full Discord thread). Ignored for every other kind. */
@@ -124,7 +129,10 @@ export const DispatchSpecSchema = z.object({
   agentId: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
-  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact", "parked", "choice", "ingest"]).optional(),
+  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact", "parked", "choice", "ingest", "thread_voice"]).optional(),
+  authorId: z.string().min(1).optional(),
+  authorName: z.string().min(1).optional(),
+  threadVoiceSessionId: z.string().min(1).optional(),
   compactSource: z.enum(["session", "discord"]).optional(),
   wakeChainDepth: z.number().int().min(0).optional(),
   chainId: z.string().min(1).optional(),
@@ -132,6 +140,30 @@ export const DispatchSpecSchema = z.object({
   watchFeedback: z.boolean().optional(),
   resume: z.boolean().optional(),
   createdUtc: z.string().optional(),
+}).superRefine((value, ctx) => {
+  const trusted = [value.authorId, value.authorName, value.threadVoiceSessionId];
+  if (value.kind === "thread_voice") {
+    if (trusted.some((field) => !field)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["threadVoiceSessionId"],
+        message: "thread_voice requires authorId, authorName, and threadVoiceSessionId",
+      });
+    }
+    if (value.session !== "live") {
+      ctx.addIssue({
+        code: "custom",
+        path: ["session"],
+        message: "thread_voice dispatches must use the live session",
+      });
+    }
+  } else if (trusted.some((field) => field !== undefined)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["authorId"],
+      message: "trusted speaker metadata is accepted only for kind thread_voice",
+    });
+  }
 });
 
 /** Parse + validate a spec file body. Throws with a readable message on
@@ -166,6 +198,9 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.correlationId ? { correlationId: d.correlationId } : {}),
     ...(d.returnTo ? { returnTo: d.returnTo } : {}),
     ...(d.kind ? { kind: d.kind } : {}),
+    ...(d.authorId ? { authorId: d.authorId } : {}),
+    ...(d.authorName ? { authorName: d.authorName } : {}),
+    ...(d.threadVoiceSessionId ? { threadVoiceSessionId: d.threadVoiceSessionId } : {}),
     ...(d.compactSource ? { compactSource: d.compactSource } : {}),
     ...(d.wakeChainDepth !== undefined ? { wakeChainDepth: d.wakeChainDepth } : {}),
     ...(d.chainId ? { chainId: d.chainId } : {}),

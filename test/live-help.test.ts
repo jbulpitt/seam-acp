@@ -27,6 +27,7 @@ import {
 } from "../packages/core/src/platforms/discord/live-help-call.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { VoiceLeaseManager } from "../packages/core/src/core/voice-lease.js";
 import { pino } from "pino";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
@@ -268,7 +269,7 @@ describe("LiveHelpManager one-session-per-VC + restart", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  function mgr(over?: Partial<LiveHelpHost>): LiveHelpManager {
+  function mgr(over?: Partial<LiveHelpHost>, leases = new VoiceLeaseManager()): LiveHelpManager {
     const host: LiveHelpHost = {
       inspectVoiceChannel: async () => ({
         ok: true,
@@ -293,8 +294,29 @@ describe("LiveHelpManager one-session-per-VC + restart", () => {
       logger: silent,
       host,
       apiKey: () => "test-key",
+      leases,
     });
   }
+
+  it("names a shared Thread Voice lease conflict without changing Live Help authorization", async () => {
+    const leases = new VoiceLeaseManager();
+    leases.acquire({
+      kind: "thread_voice",
+      sessionId: "tv-active",
+      guildId: "guild-1",
+      voiceChannelId: "vc-thread-voice",
+    });
+    const result = await mgr(undefined, leases).mint(
+      record(),
+      { voiceChannelId: "1487095870188027987", system: "tutor" },
+      "student-self-service"
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain("thread_voice session `tv-active`");
+      expect(result.error).not.toMatch(/parent|approval|authoriz/i);
+    }
+  });
 
   it("refuses a second mint on a busy VC", async () => {
     const m = mgr();

@@ -92,6 +92,7 @@ beforeEach(() => {
     }),
     speak: vi.fn(async () => {}),
     waitForPlaybackIdle: vi.fn(async () => {}),
+    stopPlayback: vi.fn(async () => {}),
     notify: vi.fn(async () => {}),
   };
   dispatch = {
@@ -195,6 +196,58 @@ describe("ThreadVoiceManager lifecycle", () => {
     expect(store.getThreadVoiceSession(started.session.id)?.status).toBe("ended");
     expect(leases.get("guild-1")).toBeUndefined();
   });
+
+  it("discard also removes a claimed batch only while it has no dispatch artifact", async () => {
+    busy = true;
+    const started = await manager.start(startRequest);
+    if (!started.ok) throw new Error(started.error);
+    manager.commitFinalSegment(started.session.id, {
+      sequence: 1,
+      authorId: "user-1",
+      transcript: "claimed but not enqueued",
+      audioMs: 800,
+      capturedStartedUtc: "start",
+      capturedEndedUtc: "end",
+    });
+    store.claimPendingThreadVoiceBatch(started.session.id, "tvd_artifact_free");
+
+    const stopped = await manager.stop(started.session.id, { discardPending: true });
+    expect(stopped).toEqual({ ok: true, discarded: 1 });
+    expect(store.getThreadVoiceBatch("tvd_artifact_free")?.segments[0]).toMatchObject({
+      state: "discarded",
+      transcript: "",
+    });
+    expect(store.listThreadVoiceSegments(started.session.id)[0]).toMatchObject({
+      state: "discarded",
+      transcript: "",
+    });
+  });
+
+  it.each(["pending", "running", "done"] as const)(
+    "preserves a claimed batch once its %s dispatch artifact exists",
+    async (artifactState) => {
+      busy = true;
+      const started = await manager.start(startRequest);
+      if (!started.ok) throw new Error(started.error);
+      manager.commitFinalSegment(started.session.id, {
+        sequence: 1,
+        authorId: "user-1",
+        transcript: "durably owned",
+        audioMs: 800,
+        capturedStartedUtc: "start",
+        capturedEndedUtc: "end",
+      });
+      store.claimPendingThreadVoiceBatch(started.session.id, "tvd_owned");
+      artifacts.set("tvd_owned", artifactState);
+
+      const stopped = await manager.stop(started.session.id, { discardPending: true });
+      expect(stopped).toEqual({ ok: true, discarded: 0 });
+      expect(store.getThreadVoiceBatch("tvd_owned")?.segments[0]).toMatchObject({
+        state: "batched",
+        transcript: "durably owned",
+      });
+    }
+  );
 });
 
 describe("ThreadVoiceManager durable release and recovery", () => {

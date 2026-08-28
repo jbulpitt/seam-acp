@@ -113,7 +113,12 @@ import { summarizeAnomalies } from "../../core/watchdog.js";
 import type { BridgeHub } from "../../core/bridge-hub.js";
 import { handleBridgeSlash } from "./bridge.js";
 import { handleDebugSlash } from "./debug.js";
-import { BRIDGE_ADMIN_REFUSAL, isBridgeAdminRefused } from "./admin-gate.js";
+import {
+  BRIDGE_ADMIN_REFUSAL,
+  THREAD_VOICE_ADMIN_REFUSAL,
+  isBridgeAdminRefused,
+  isThreadVoiceAdminRefused,
+} from "./admin-gate.js";
 import {
   AutocompleteRegistry,
   collectStringOptionValues,
@@ -131,6 +136,7 @@ import {
   GEMINI_TTS_VOICES,
   isTtsPace,
   isTtsStyle,
+  synthesizeSpeechWithGemini,
 } from "../../core/audio/gemini-tts.js";
 import { getOrCreateTtsSample, warmTtsSamples } from "../../core/audio/tts-samples.js";
 import {
@@ -281,6 +287,16 @@ import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
 import { LiveHelpManager } from "../../core/live-help/manager.js";
+import type { ThreadVoiceManager } from "../../core/thread-voice/manager.js";
+import type {
+  ThreadVoiceNotification,
+  ThreadVoiceRuntimeState,
+} from "../../core/thread-voice/types.js";
+import { threadVoiceTranscriptMessages } from "./thread-voice-panel.js";
+import {
+  ThreadVoiceSpeechPipeline,
+  shouldAttachCompletedTurnVoice,
+} from "./thread-voice-speech.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import {
   applyVoiceNoteTranscriptions,
@@ -294,7 +310,7 @@ import {
   shouldSpeakReply,
   speakReplyToOgg,
 } from "../../core/audio/voice-replies.js";
-import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
+import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, sanitizeSpeakerName, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
 import {
   THREAD_LIMIT_MESSAGE,
   THREAD_NUMBER_MAX,
@@ -471,6 +487,15 @@ export class Orchestrator {
   private watchManager?: WatchManager;
   /** Gemini Live voice-channel sessions (#98). In-memory run + durable rows. */
   private liveHelpManager?: LiveHelpManager;
+  /** Explicit voice binding for authenticated speech → ordinary thread turns. */
+  private threadVoiceManager?: ThreadVoiceManager;
+  private readonly threadVoicePanels = new Map<string, MessageRef>();
+  private readonly threadVoicePanelState = new Map<string, ThreadVoiceRuntimeState>();
+  private readonly threadVoiceInterims = new Map<string, string>();
+  private readonly threadVoicePanelUpdatedAt = new Map<string, number>();
+  private readonly threadVoicePanelTimers = new Map<string, NodeJS.Timeout>();
+  private readonly threadVoicePanelQueues = new Map<string, Promise<void>>();
+  private readonly threadVoiceSpeechByChannel = new Map<string, ThreadVoiceSpeechPipeline>();
   /** Set by index.ts after construction; event-driven parked-prompt delivery (#88). */
   private parkedManager?: ParkedPromptManager;
   /** Simple-card GIF catalog. Random pick is sync; fetch is off the render path. */
@@ -1228,6 +1253,13 @@ export class Orchestrator {
     void link.then(() => {
       if (this.channelQueues.get(channelId) === link) {
         this.channelQueues.delete(channelId);
+        if (this.threadVoiceManager) {
+          for (const session of this.store.listThreadVoiceSessionsWithBufferedSegments()) {
+            if (session.platform === PLATFORM && session.channelRef === channelId) {
+              void this.threadVoiceManager.releaseIfIdle(session.id);
+            }
+          }
+        }
         void this.tryFireParked(channelId);
       }
     });
@@ -1245,6 +1277,46 @@ export class Orchestrator {
       cwd: this.config.REPOS_ROOT,
     });
     this.quotaPoller?.recordTurnStart(record.agentId);
+
+    const threadVoiceOutput = this.threadVoiceManager
+      ? this.store.getActiveThreadVoiceForThread(PLATFORM, channel.id)
+      : null;
+    let threadVoiceSpeechWarningPosted = false;
+    const threadVoiceSpeech = threadVoiceOutput && this.threadVoiceManager
+      ? new ThreadVoiceSpeechPipeline({
+          synthesize: (text) => synthesizeSpeechWithGemini({
+            apiKey: this.config.SEAM_GEMINI_API_KEY,
+            text,
+            model: this.config.SEAM_GEMINI_TTS_MODEL,
+            voice:
+              resolveThreadTtsVoice(this.config, channel.id)
+              ?? this.config.SEAM_GEMINI_TTS_VOICE,
+            pace: resolveThreadTtsPace(this.config, channel.id),
+            style: resolveThreadTtsStyle(this.config, channel.id),
+          }),
+          speak: (pcm) => this.threadVoiceManager!.speak(threadVoiceOutput.id, pcm),
+          waitForPlaybackIdle: () =>
+            this.threadVoiceManager!.waitForPlaybackIdle(threadVoiceOutput.id),
+          onFailure: (error, text) => {
+            this.logger.warn(
+              { threadVoiceId: threadVoiceOutput.id, error, chars: text.length },
+              "thread voice progressive TTS chunk failed"
+            );
+            if (!threadVoiceSpeechWarningPosted) {
+              threadVoiceSpeechWarningPosted = true;
+              void this.adapter.sendMessage(
+                channel,
+                `_Thread Voice couldn't speak part of this reply:_ ${error.slice(0, 160)}`
+              ).catch(() => {});
+            }
+          },
+        })
+      : undefined;
+    if (threadVoiceOutput) {
+      this.threadVoiceSpeechByChannel.set(channel.id, threadVoiceSpeech!);
+      this.threadVoicePanelState.set(threadVoiceOutput.id, "agent_working");
+      void this.enqueueThreadVoicePanel(threadVoiceOutput.id);
+    }
 
     // #76: live-turn marker — written at START, removed at terminal state
     // (this finally, or the command layer). Markers are written even when
@@ -1749,6 +1821,7 @@ export class Orchestrator {
             for (const seg of fenceResult.segments) {
               if (seg.kind === "prose") {
                 if (seg.text) {
+                  threadVoiceSpeech?.feed(seg.text);
                   textBuffer += seg.text;
                   maybeFlush();
                   armIdleFlush();
@@ -2125,7 +2198,10 @@ export class Orchestrator {
       const tail = fenceStream.flush();
       for (const seg of tail.segments) {
         if (seg.kind === "prose") {
-          if (seg.text) textBuffer += seg.text;
+          if (seg.text) {
+            threadVoiceSpeech?.feed(seg.text);
+            textBuffer += seg.text;
+          }
         } else if (seg.kind === "fence-open") {
           // Shouldn't appear in flush output, but handle defensively.
           await drainBuffer(true, true);
@@ -2159,7 +2235,14 @@ export class Orchestrator {
 
       const turnOk =
         result !== "timeout" && !(result as { cancelled?: boolean }).cancelled;
-      if (turnOk) {
+      if (threadVoiceSpeech) {
+        const speech = await threadVoiceSpeech.flushAndDrain();
+        this.logger.info(
+          { threadVoiceId: threadVoiceOutput!.id, ...speech },
+          "thread voice progressive speech drained"
+        );
+      }
+      if (turnOk && shouldAttachCompletedTurnVoice(Boolean(threadVoiceOutput))) {
         await this.maybeSpeakTurn({
           channel,
           threadId: channel.id,
@@ -2317,6 +2400,7 @@ export class Orchestrator {
       this.logger.error({ err, session: record.id }, "turn failed");
       cancelFlushTimer();
       await flushChunks();
+      await threadVoiceSpeech?.flushAndDrain();
       // If the agent reports that the session is gone (e.g. bridge restarted
       // with a fresh agent process), evict the dead runtime so the next message
       // triggers a clean newSession rather than repeatedly failing.
@@ -2377,6 +2461,17 @@ export class Orchestrator {
       status.setState("Failed");
       status.setAction(this.renderer.trimShort(isSessionGoneError(err) ? "Session lost — please resend your message." : errMsg, 120));
     } finally {
+      await threadVoiceSpeech?.flushAndDrain();
+      if (threadVoiceOutput) {
+        if (this.threadVoiceSpeechByChannel.get(channel.id) === threadVoiceSpeech) {
+          this.threadVoiceSpeechByChannel.delete(channel.id);
+        }
+        this.threadVoicePanelState.set(
+          threadVoiceOutput.id,
+          this.threadVoiceManager?.getRuntimeState(threadVoiceOutput.id) ?? "ready"
+        );
+        void this.enqueueThreadVoicePanel(threadVoiceOutput.id);
+      }
       // The main turn is fully finalized: any further generative activity on
       // this runtime is an agent-initiated woken turn (handled in eventHandler),
       // not the in-turn backlog already drained above.
@@ -2586,6 +2681,7 @@ export class Orchestrator {
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
     const sub = interaction.options.getSubcommand(true);
+    const slashGroup = interaction.options.getSubcommandGroup(false);
     const slashOpts = Orchestrator.slashGateOptions(interaction);
     // Resolve the *locked-channel* scope id. Only a real thread's parentId
     // points at the channel we key presets on — a plain (non-thread)
@@ -2628,7 +2724,6 @@ export class Orchestrator {
         return;
       }
     }
-    const slashGroup = interaction.options.getSubcommandGroup(false);
     if (slashGroup === "bridge" || slashGroup === "debug") {
       if (isBridgeAdminRefused(this.config, interaction.user.id)) {
         this.logger.warn(
@@ -2641,6 +2736,16 @@ export class Orchestrator {
         });
         return;
       }
+    }
+    if (slashGroup === "voice") {
+      if (isThreadVoiceAdminRefused(this.config, interaction.user.id)) {
+        await interaction.reply({
+          content: THREAD_VOICE_ADMIN_REFUSAL,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      return this.cmdThreadVoice(interaction);
     }
     if (interaction.options.getSubcommandGroup(false) === "schedule") {
       return this.cmdSchedule(interaction);
@@ -3777,6 +3882,128 @@ export class Orchestrator {
     this.liveHelpManager = m;
   }
 
+  setThreadVoiceManager(m: ThreadVoiceManager): void {
+    this.threadVoiceManager = m;
+  }
+
+  async notifyThreadVoice(
+    threadId: string,
+    event: ThreadVoiceNotification
+  ): Promise<void> {
+    if (event.kind === "state") this.threadVoicePanelState.set(event.sessionId, event.state);
+    if (event.kind === "interim") this.threadVoiceInterims.set(event.sessionId, event.text);
+    if (event.kind === "final" || event.kind === "ended" || event.kind === "failed") {
+      this.threadVoiceInterims.delete(event.sessionId);
+    }
+    if (event.kind === "ended") this.threadVoicePanelState.set(event.sessionId, "ended");
+    if (event.kind === "failed") this.threadVoicePanelState.set(event.sessionId, "failed");
+
+    if (event.kind === "final") {
+      const row = this.store.getThreadVoiceSession(event.sessionId);
+      if (row) {
+        if (
+          this.isChannelBusy(row.channelRef)
+          || this.threadVoiceManager?.getActiveDispatchId(row)
+        ) {
+          this.threadVoicePanelState.set(event.sessionId, "queued");
+        }
+        const channel = {
+          platform: PLATFORM,
+          id: threadId,
+          ...(row.parentRef ? { parentId: row.parentRef } : {}),
+        };
+        for (const message of threadVoiceTranscriptMessages(row.ownerName, event.segment.transcript)) {
+          await this.adapter.sendMessage(channel, message);
+        }
+      }
+    }
+
+    const urgent = event.kind === "final" || event.kind === "ended" || event.kind === "failed";
+    const since = Date.now() - (this.threadVoicePanelUpdatedAt.get(event.sessionId) ?? 0);
+    if (!urgent && since < 1_000) {
+      if (!this.threadVoicePanelTimers.has(event.sessionId)) {
+        const timer = setTimeout(() => {
+          this.threadVoicePanelTimers.delete(event.sessionId);
+          void this.enqueueThreadVoicePanel(event.sessionId);
+        }, 1_000 - since);
+        this.threadVoicePanelTimers.set(event.sessionId, timer);
+      }
+      return;
+    }
+    const timer = this.threadVoicePanelTimers.get(event.sessionId);
+    if (timer) clearTimeout(timer);
+    this.threadVoicePanelTimers.delete(event.sessionId);
+    await this.enqueueThreadVoicePanel(event.sessionId);
+  }
+
+  private enqueueThreadVoicePanel(sessionId: string): Promise<void> {
+    const prior = this.threadVoicePanelQueues.get(sessionId) ?? Promise.resolve();
+    const run = prior.then(() => this.renderThreadVoicePanel(sessionId));
+    const safe = run.catch((err) => {
+      this.logger.warn({ err, threadVoiceId: sessionId }, "thread voice panel update failed");
+    });
+    this.threadVoicePanelQueues.set(sessionId, safe);
+    void safe.finally(() => {
+      if (this.threadVoicePanelQueues.get(sessionId) === safe) {
+        this.threadVoicePanelQueues.delete(sessionId);
+      }
+    });
+    return run;
+  }
+
+  private async renderThreadVoicePanel(sessionId: string): Promise<void> {
+    const row = this.store.getThreadVoiceSession(sessionId);
+    if (!row) return;
+    const pending = this.store.getThreadVoicePendingStats(row.platform, row.channelRef);
+    const state = this.threadVoicePanelState.get(sessionId)
+      ?? this.threadVoiceManager?.getRuntimeState(sessionId)
+      ?? (row.status === "ended" ? "ended" : row.status === "failed" ? "failed" : "starting");
+    const interim = this.threadVoiceInterims.get(sessionId)?.trim();
+    const panel: StructuredPanel = {
+      color: state === "failed" ? 0xe74c3c : state === "ended" ? 0x95a5a6 : 0x5865f2,
+      title: "🎧 Thread Voice",
+      description: state === "starting"
+        ? "Starting explicit owner-only capture. Final transcripts are visible and become normal prompts in this thread."
+        : undefined,
+      fields: [
+        { name: "State", value: threadVoiceStateLabel(state), inline: true },
+        { name: "Owner", value: `<@${row.ownerUserId}>`, inline: true },
+        { name: "Voice channel", value: `<#${row.voiceChannelId}>`, inline: true },
+        { name: "Transmitted audio", value: formatVoiceDuration(row.transmittedAudioMs), inline: true },
+        { name: "Pending", value: `${pending.segmentCount} segment${pending.segmentCount === 1 ? "" : "s"} · ${pending.characterCount} chars`, inline: true },
+        { name: "Dispatch", value: pending.activeDispatchId ? `\`${pending.activeDispatchId}\`` : "None", inline: true },
+        ...(interim ? [{ name: "Interim (not dispatched)", value: interim.slice(0, 1_000) }] : []),
+      ],
+      footer: `Session ${row.id}`,
+    };
+    const channel: ChannelRef = {
+      platform: PLATFORM,
+      id: row.channelRef,
+      ...(row.parentRef ? { parentId: row.parentRef } : {}),
+    };
+    let ref = this.threadVoicePanels.get(sessionId)
+      ?? (row.noticeMessageId ? { channel, id: row.noticeMessageId } : undefined);
+    if (ref) {
+      try {
+        if (this.adapter.editPanel) await this.adapter.editPanel(ref, panel);
+        else await this.adapter.editMessage(ref, serializePanelText(panel));
+      } catch {
+        ref = undefined;
+      }
+    }
+    if (!ref) {
+      ref = this.adapter.sendPanel
+        ? await this.adapter.sendPanel(channel, panel)
+        : await this.adapter.sendMessage(channel, serializePanelText(panel));
+      this.store.updateThreadVoiceSession(sessionId, {
+        noticeMessageId: ref.id,
+        updatedUtc: new Date().toISOString(),
+      });
+    }
+    this.threadVoicePanels.set(sessionId, ref);
+    this.threadVoicePanelUpdatedAt.set(sessionId, Date.now());
+  }
+
   setParkedManager(m: ParkedPromptManager): void {
     this.parkedManager = m;
   }
@@ -4704,6 +4931,95 @@ export class Orchestrator {
    * Idle + host ready → run now (no parked row left sitting). Busy or
    * offline → park, do not abort, do not bump generation.
    */
+  private async cmdThreadVoice(i: ChatInputCommandInteraction): Promise<void> {
+    if (!this.threadVoiceManager) {
+      await i.reply({ content: "Thread Voice is not wired on this deployment.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const record = this.recordFromInteraction(i);
+    if (!record || !i.channel?.isThread() || !i.guildId) {
+      await i.reply({ content: "Use `/seam voice` inside a Discord thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const sub = i.options.getSubcommand(true);
+    const active = this.store.getActiveThreadVoiceForThread(PLATFORM, record.channelRef);
+    if (sub === "start") {
+      if (!this.config.SEAM_GEMINI_API_KEY.trim()) {
+        await i.reply({
+          content: "Thread Voice requires `SEAM_GEMINI_API_KEY` on this deployment.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      const result = await this.threadVoiceManager.start({
+        platform: PLATFORM,
+        channelRef: record.channelRef,
+        parentRef: record.parentRef,
+        guildId: i.guildId,
+        ownerUserId: i.user.id,
+        ownerName: sanitizeSpeakerName(i.member && "displayName" in i.member
+          ? String(i.member.displayName)
+          : i.user.globalName ?? i.user.username),
+      });
+      if (!result.ok) {
+        await i.editReply(result.error);
+        return;
+      }
+      await i.editReply(
+        `🎧 Thread Voice \`${result.session.id}\` is starting in <#${result.session.voiceChannelId}>. ` +
+        "Only your unmuted audio is captured. Final transcripts are posted visibly here and become normal authenticated prompts."
+      );
+      return;
+    }
+    if (!active) {
+      await i.reply({ content: "No active Thread Voice session is bound to this thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (sub === "stop") {
+      const isAdmin = this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(i.user.id) ?? false;
+      if (active.ownerUserId !== i.user.id && !isAdmin) {
+        await i.reply({ content: "Only the Thread Voice owner or an admin can stop this session.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      const discardPending = i.options.getBoolean("discard-pending") ?? false;
+      this.threadVoiceSpeechByChannel.get(record.channelRef)?.cancel();
+      const result = await this.threadVoiceManager.stop(active.id, {
+        discardPending,
+        reason: `stopped by ${i.user.id}`,
+      });
+      await i.editReply(result.ok
+        ? `🛑 Thread Voice stopped.${discardPending ? ` Discarded ${result.discarded} pending segment${result.discarded === 1 ? "" : "s"}.` : " Finalized pending text was preserved."}`
+        : result.error);
+      return;
+    }
+    if (sub === "status") {
+      const pending = this.store.getThreadVoicePendingStats(PLATFORM, record.channelRef);
+      const runtime: ThreadVoiceRuntimeState = pending.activeDispatchId
+        ? "agent_working"
+        : pending.segmentCount > 0 && this.isChannelBusy(record.channelRef)
+          ? "queued"
+          : this.threadVoiceManager.getRuntimeState(active.id)
+            ?? (active.status === "starting" ? "starting" : "ready");
+      await i.reply({
+        content: [
+          `🎧 **Thread Voice** \`${active.id}\``,
+          `Owner: <@${active.ownerUserId}>`,
+          `Voice channel: <#${active.voiceChannelId}>`,
+          `Runtime: **${threadVoiceStateLabel(runtime)}**`,
+          `Transmitted audio: ${formatVoiceDuration(active.transmittedAudioMs)}`,
+          `Current utterance: ${runtime === "capturing" ? "capturing" : runtime === "transcribing" ? "transcribing" : "none"}`,
+          `Pending: ${pending.segmentCount} segment${pending.segmentCount === 1 ? "" : "s"}, ${pending.characterCount} chars`,
+          `Dispatch: ${pending.activeDispatchId ? `\`${pending.activeDispatchId}\`` : "none"}`,
+        ].join("\n"),
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await i.reply({ content: `Unknown voice command: ${sub}`, flags: MessageFlags.Ephemeral });
+  }
+
   private async cmdQueue(i: ChatInputCommandInteraction): Promise<void> {
     const prompt = (i.options.getString("prompt", true) ?? "").trim();
     if (!prompt) {
@@ -4716,6 +5032,13 @@ export class Orchestrator {
     const record = this.recordFromInteraction(i);
     if (!record) {
       await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (this.store.hasThreadVoiceBufferedSegments(PLATFORM, record.channelRef)) {
+      await i.reply({
+        content: "Thread Voice already has buffered or batched text for this thread. Wait for it to dispatch, or stop with `discard-pending:true`, before using `/seam queue`.",
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     }
     const channelId = record.channelRef;
@@ -5145,6 +5468,7 @@ export class Orchestrator {
     // ledger + done-file plumbing, different body (see dispatchCompact).
     if (spec.kind === "compact") return this.dispatchCompact(spec);
     if (spec.kind === "ingest") return this.dispatchIngestEndpoint(spec);
+    if (spec.kind === "thread_voice") return this.dispatchThreadVoice(spec);
 
     const target: ChannelRef = { platform: PLATFORM, id: spec.target };
     const record = this.router.ensureSessionRecord({
@@ -5586,6 +5910,88 @@ export class Orchestrator {
       return await gatedRun();
     } finally {
       this.activeTurns--;
+    }
+  }
+
+  /**
+   * Verified Thread Voice input deliberately enters the ordinary user-turn
+   * pipeline. This is the single shared prompt builder: riders, harness speaker,
+   * permissions, MCP servers, streaming text, live markers, and typed-message
+   * interruption behavior therefore stay identical to a real Discord message.
+   * `queueOnChannel` is the non-preemptive entry point — no generation bump and
+   * no abort while a prior turn/playback owns the thread.
+   */
+  private async dispatchThreadVoice(
+    spec: DispatchSpec
+  ): Promise<{ output: string; stopReason: string }> {
+    if (!this.threadVoiceManager) throw new Error("Thread Voice manager is not wired");
+    if (!spec.authorId || !spec.authorName || !spec.threadVoiceSessionId) {
+      throw new Error("thread_voice dispatch is missing trusted speaker metadata");
+    }
+    const batch = this.store.getThreadVoiceBatch(spec.id);
+    if (
+      !batch ||
+      batch.session.id !== spec.threadVoiceSessionId ||
+      batch.session.channelRef !== spec.target ||
+      batch.session.ownerUserId !== spec.authorId ||
+      batch.session.ownerName !== spec.authorName ||
+      batch.prompt !== spec.prompt ||
+      batch.segments.some(
+        (segment) => segment.dispatchId !== spec.id || segment.authorId !== spec.authorId
+      )
+    ) {
+      throw new Error("thread_voice dispatch metadata does not match its durable batch owner");
+    }
+
+    const record = this.router.ensureSessionRecord({
+      platform: PLATFORM,
+      channelRef: spec.target,
+      ...(batch.session.parentRef ? { parentRef: batch.session.parentRef } : {}),
+      cwd: this.config.REPOS_ROOT,
+    });
+    try {
+      this.store.recordDelegation({
+        id: spec.id,
+        kind: "thread_voice",
+        sourceRef: null,
+        targetRef: spec.target,
+        worker: null,
+        promptPreview: spec.prompt,
+        correlationId: batch.session.id,
+        status: "dispatched",
+      });
+    } catch (err) {
+      this.logger.warn({ err, dispatch: spec.id }, "thread voice ledger record failed");
+    }
+
+    const synthetic: IncomingMessage = {
+      channel: {
+        platform: PLATFORM,
+        id: spec.target,
+        ...(batch.session.parentRef ? { parentId: batch.session.parentRef } : {}),
+      },
+      authorId: spec.authorId,
+      authorName: spec.authorName,
+      authorIsBot: false,
+      text: spec.prompt,
+    };
+    try {
+      try {
+        this.store.updateDelegationStatus(spec.id, "running", {
+          ...(record.acpSessionId ? { acpSessionId: record.acpSessionId } : {}),
+        });
+      } catch { /* best effort */ }
+      await this.queueOnChannel(spec.target, () => this.handleIncomingMessageInner(synthetic));
+      try { this.store.updateDelegationStatus(spec.id, "completed"); } catch { /* best effort */ }
+      return { output: "", stopReason: "end_turn" };
+    } catch (err) {
+      try { this.store.updateDelegationStatus(spec.id, "failed"); } catch { /* best effort */ }
+      throw err;
+    } finally {
+      await this.threadVoiceManager.markDispatchSettled(
+        spec.threadVoiceSessionId,
+        spec.id
+      );
     }
   }
 
@@ -8066,6 +8472,13 @@ export class Orchestrator {
       await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
+    const activeVoice = this.store.getActiveThreadVoiceForThread(PLATFORM, record.channelRef);
+    this.threadVoiceSpeechByChannel.get(record.channelRef)?.cancel();
+    if (activeVoice && this.threadVoiceManager) {
+      await this.threadVoiceManager.stopPlayback(activeVoice.id).catch((err) =>
+        this.logger.warn({ err, threadVoiceId: activeVoice.id }, "force cancel playback stop failed")
+      );
+    }
     if (!this.router.hasRuntime(record.id)) {
       const parked = await this.clearParkedForChannel(record.channelRef);
       await i.reply({
@@ -8100,6 +8513,8 @@ export class Orchestrator {
    *  killed session resumes cleanly on its next message. */
   private async cmdKill(i: ChatInputCommandInteraction): Promise<void> {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
+    for (const pipeline of this.threadVoiceSpeechByChannel.values()) pipeline.cancel();
+    await this.threadVoiceManager?.stopAll("global cancel");
     // #89 D8: drop parked rows BEFORE killing so turn-end fire cannot run them.
     const parked = await this.clearAllParked();
     // #76: command-layer clear of EVERY marker (killAll → invalidate →
@@ -15946,6 +16361,28 @@ function formatResetTime(iso: string): string {
   if (secs < 3600) return `in ${Math.round(secs / 60)}m`;
   if (secs < 86400) return `in ${Math.round(secs / 3600)}h`;
   return `in ${Math.round(secs / 86400)}d`;
+}
+
+function threadVoiceStateLabel(state: ThreadVoiceRuntimeState): string {
+  switch (state) {
+    case "starting": return "Starting";
+    case "ready": return "Muted / ready";
+    case "capturing": return "Capturing";
+    case "transcribing": return "Transcribing";
+    case "queued": return "Queued";
+    case "agent_working": return "Agent working";
+    case "speaking": return "Speaking";
+    case "stopping": return "Stopping";
+    case "ended": return "Ended";
+    case "failed": return "Failed";
+  }
+}
+
+function formatVoiceDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1_000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }
 
 // Re-export for convenience.

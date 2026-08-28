@@ -104,19 +104,20 @@ Load `~/.local/share/wt-helpers/AGENTS.md` before creating or tearing down a tre
 
 ## Slash command tree (`/seam`)
 
-Discord caps each command at 25 top-level options. `/seam` is 14/25: 6
-top-level subcommands + 8 groups. Future surfaces default to living
+Discord caps each command at 25 top-level options. `/seam` is 15/25: 6
+top-level subcommands + 9 groups. Future surfaces default to living
 **inside a group** (each group has its own 25 budget). Hard cutover —
 Discord has no aliases; old invocations disappear.
 
 **Top-level (6):** `cancel`, `steer`, `new`, `workflows`, `queue`, `rebuild`
 
-**Groups (8):**
-- `config` (16): `model` `effort` `agent` `mode` `repo` `tools` `approve` `card` `reset` `init` `detach` `tts` `show` `edit` `set` `audit`
+**Groups (9):**
+- `config` (17): `model` `effort` `agent` `mode` `repo` `tools` `card` `gif` `approve` `reset` `init` `detach` `tts` `show` `edit` `set` `audit`
 - `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
 - `schedule` (7), `preset` (6), `project` (3) — unchanged
 - `upload` (3): `pull` `push` `secret` — **admin-only**. Hard cutover of `/seam attach`.
 - `bridge` (4), `debug` (6) — admin-only pairing / host debug (`voice-ping` / `voice-capture` / `voice-live` are the live-help spike)
+- `voice` (3): `start` `stop` `status` — **admin-only** serialized Thread Voice v1.
 
 **Queue:** `/seam queue prompt:…` parks the next live turn (does not abort).
 Idle + host ready runs now. A later bare message still interrupts and
@@ -156,6 +157,22 @@ through the course agent; do not ask a parent/admin for approval.
 Canonical: `docs/agent-guides/live-help.md`. School overlay paste:
 `docs/agent-guides/live-help-onboarding.md`. Do not use `/seam debug voice-*`
 from a course thread.
+
+## Thread Voice v1
+
+One admin can bind one Discord thread to their current voice channel with
+`/seam voice start`. The owner must be self-muted when starting; only their
+unmuted audio is captured after consent. Final transcripts are echoed visibly
+and dispatched as that authenticated Discord user through the thread's normal
+turn queue. `/seam voice status` reports the durable session, capture/runtime,
+forwarded audio, pending text, and active dispatch. `/seam voice stop` preserves
+finalized pending text by default; `discard-pending:true` discards text only
+while no durable dispatch artifact owns it. Canonical operator notes:
+`docs/agent-guides/thread-voice.md`.
+
+Thread Voice and Live Help share one guild voice lease. A conflict should name
+the active product/session; it is never an authorization or parent-approval
+failure. Live Help remains student self-service through course agents.
 
 ## Agent-scheduled wake events (#59)
 

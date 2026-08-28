@@ -73,6 +73,15 @@ import {
   describeMultiSelectMenu,
   sliceChoicePage,
 } from "./choice-picker.js";
+import {
+  GeminiLiveTranscribeClient,
+} from "../../core/audio/gemini-live-transcribe.js";
+import type {
+  ThreadVoiceHost,
+} from "../../core/thread-voice/manager.js";
+import type { TtsPcm } from "../../core/thread-voice/types.js";
+import { DiscordThreadVoiceCall } from "./thread-voice-call.js";
+import { ThreadVoiceCaptureCoordinator } from "./thread-voice-host.js";
 
 export type DiscordFileSend = {
   data: Buffer;
@@ -301,6 +310,10 @@ export class DiscordAdapter implements ChatAdapter {
   /** DB-backed channel activation (#22): additive to the env allowlist. */
   private activeChannelCheck?: (channelRef: string) => boolean;
   private botUserId?: string;
+  private readonly threadVoiceCalls = new Map<
+    string,
+    { call: DiscordThreadVoiceCall; transcribe: GeminiLiveTranscribeClient }
+  >();
 
   constructor(opts: {
     config: Config;
@@ -465,6 +478,111 @@ export class DiscordAdapter implements ChatAdapter {
   async inspectLiveHelpVoice(voiceChannelId: string) {
     const { inspectLiveHelpVoiceChannel } = await import("./live-help-call.js");
     return inspectLiveHelpVoiceChannel(this.client, voiceChannelId);
+  }
+
+  async inspectThreadVoiceOwner(
+    userId: string,
+    guildId: string
+  ): ReturnType<ThreadVoiceHost["inspectOwnerVoiceState"]> {
+    const guild = await this.client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) return { ok: false, reason: "This thread's guild is not available to Seam." };
+    await guild.members.fetch(userId).catch(() => null);
+    const voice = guild.voiceStates.cache.get(userId);
+    if (!voice?.channelId) {
+      return { ok: false, reason: "Join a voice channel in this thread's guild before starting Thread Voice." };
+    }
+    const channel = voice.channel ?? await guild.channels.fetch(voice.channelId).catch(() => null);
+    if (!channel?.isVoiceBased()) {
+      return { ok: false, reason: "Your current voice channel is not available to Seam." };
+    }
+    const visible = !isObfuscatedChannel(channel) &&
+      !(channel.parent && isObfuscatedChannel(channel.parent));
+    return {
+      ok: true,
+      guildId: guild.id,
+      voiceChannelId: channel.id,
+      channelName: visibleDiscordChannelName(channel) ?? null,
+      selfMuted: voice.selfMute === true,
+      visible,
+    };
+  }
+
+  async runThreadVoiceSession(
+    opts: Parameters<ThreadVoiceHost["runSession"]>[0]
+  ): Promise<{ reason: string }> {
+    let coordinator!: ThreadVoiceCaptureCoordinator;
+    const transcribe = await GeminiLiveTranscribeClient.connect({
+      apiKey: this.config.SEAM_GEMINI_API_KEY,
+      unaryModel: this.config.SEAM_GEMINI_STT_MODEL,
+      customVocabulary: this.config.SEAM_GEMINI_STT_CUSTOM_VOCABULARY,
+      handlers: {
+        onInterim: (text) => coordinator?.onInterim(text),
+        onForwardedBytes: ({ bytes }) => coordinator?.onForwardedBytes(bytes),
+        onSessionEvent: (event) => {
+          this.logger.info(
+            { threadVoiceId: opts.row.id, event },
+            "thread-voice transcribe session event"
+          );
+        },
+      },
+    });
+    coordinator = new ThreadVoiceCaptureCoordinator({
+      ownerUserId: opts.row.ownerUserId,
+      transcribe,
+      logger: this.logger,
+      callbacks: {
+        onInterim: opts.onInterim,
+        onFinal: opts.onFinal,
+        onDropped: opts.onDropped,
+        onAudioSent: opts.onAudioSent,
+        onTranscribing: () => opts.onState("transcribing"),
+      },
+    });
+
+    let call: DiscordThreadVoiceCall | undefined;
+    try {
+      call = await DiscordThreadVoiceCall.connect({
+        client: this.client,
+        guildId: opts.row.guildId,
+        voiceChannelId: opts.row.voiceChannelId,
+        ownerUserId: opts.row.ownerUserId,
+        signal: opts.signal,
+        logger: this.logger,
+        allocateSequence: opts.nextSequence,
+        callbacks: {
+          onCaptureStart: (capture) => coordinator.onCaptureStart(capture),
+          onPcm: (chunk) => coordinator.onPcm(chunk),
+          onCaptureEnd: (capture) => coordinator.onCaptureEnd(capture),
+          onState: (state) => {
+            if (state === "capturing") opts.onState("capturing");
+            else if (state === "playback-started") opts.onState("speaking");
+            else if (state === "ready" || state === "playback-idle") opts.onState("ready");
+          },
+        },
+      });
+      this.threadVoiceCalls.set(opts.row.id, { call, transcribe });
+      const result = await call.done;
+      await coordinator.idle();
+      return result;
+    } finally {
+      this.threadVoiceCalls.delete(opts.row.id);
+      transcribe.close();
+      if (call) await call.destroy("ended").catch(() => {});
+    }
+  }
+
+  async speakThreadVoice(sessionId: string, pcm: TtsPcm): Promise<void> {
+    const active = this.threadVoiceCalls.get(sessionId);
+    if (!active) throw new Error("Thread Voice session is not connected");
+    active.call.enqueueTtsPcm(pcm);
+  }
+
+  async waitForThreadVoicePlaybackIdle(sessionId: string): Promise<void> {
+    await this.threadVoiceCalls.get(sessionId)?.call.waitForPlaybackIdle();
+  }
+
+  async stopThreadVoicePlayback(sessionId: string): Promise<void> {
+    this.threadVoiceCalls.get(sessionId)?.call.stopPlayback();
   }
 
   async runLiveHelpCall(opts: {

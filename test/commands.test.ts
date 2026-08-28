@@ -30,13 +30,13 @@ describe("/seam slash command", () => {
     expect(() => buildSeamCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 14 top-level slots (6 subcommands + 8 groups)", () => {
+  it("registers exactly 15 top-level slots (6 subcommands + 9 groups)", () => {
     const json = built();
-    expect(json.options?.length ?? 0).toBe(14);
+    expect(json.options?.length ?? 0).toBe(15);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
-  it("top-level names include rebuild plus the existing commands and 8 groups", () => {
+  it("top-level names include rebuild plus the existing commands and 9 groups", () => {
     const names = (built().options ?? []).map((o) => o.name);
     expect(names).toEqual([
       "cancel",
@@ -53,8 +53,19 @@ describe("/seam slash command", () => {
       "upload",
       "bridge",
       "debug",
+      "voice",
     ]);
     expect(names).not.toContain("attach");
+  });
+
+  it("voice group has start, stop with discard-pending, and status", () => {
+    const voice = built().options?.find((o) => o.name === "voice");
+    expect(voice?.type).toBe(SUB_COMMAND_GROUP);
+    expect((voice?.options ?? []).map((o) => o.name)).toEqual(["start", "stop", "status"]);
+    const stop = voice?.options?.find((o) => o.name === "stop");
+    const discard = stop?.options?.find((o) => o.name === "discard-pending");
+    expect(discard?.type).toBe(BOOLEAN);
+    expect(discard?.required ?? false).toBe(false);
   });
 
   it("/seam rebuild has optional agent and model strings", () => {

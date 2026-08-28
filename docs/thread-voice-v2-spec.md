@@ -203,8 +203,11 @@ revisions are authority.
 - The add command exposes `claim:false` for adding without changing targets.
 - Any visible agent prose produced in an active bound thread is eligible for VC
   speech when that binding's output is enabled, whether the turn began from
-  voice input, a typed message, a wake, or another trusted dispatch. Hidden or
-  silent turns remain silent.
+  voice input, a typed message, a wake, a scheduled/watch turn, a generic
+  dispatch, or a handoff/report-back. Hidden or silent turns remain silent.
+- This rule applies even when a dispatch path bypasses the ordinary Discord
+  incoming-message handler. All visible renderers must publish agent-text into
+  one shared binding speech hook; handler choice must not determine audibility.
 
 ### 5.5 Capture snapshot and mid-utterance changes
 
@@ -736,8 +739,16 @@ the V1 rules:
 - exclude code fences, tool output, directives, and hidden protocol text.
 
 This includes ordinary typed, voice-authored, wake, and trusted injected turns
-that use the thread's visible response path. It does not make isolated/silent
-work audible.
+that use the thread's visible response path, plus generic dispatch and
+handoff/report-back turns whose output is visibly streamed or posted into the
+bound thread. It does not make isolated/silent work audible.
+
+Package E must centralize a binding-aware `visible agent text -> speech source`
+hook and invoke it from both the ordinary user-turn renderer and every generic
+dispatch renderer. Status panels, dispatch headers, progress indicators,
+report-back harness metadata, tool output, and duplicated terminal reposts are
+not agent prose and must not be spoken. One visible text event is accepted by
+the scheduler at most once.
 
 The segmenter emits ordered source chunks:
 
@@ -795,6 +806,11 @@ binding. It does not change input state.
 ACP completion does not settle a binding's voice turn until all chunks that
 were accepted while output was enabled have played, failed, or been explicitly
 dropped by a toggle/cancel.
+
+The same drain boundary applies to generic dispatch and handoff/report-back
+speech. Pending microphone input for that binding cannot release merely because
+the injected ACP/dispatch turn completed while its visible speech is still
+queued or playing.
 
 Once that binding settles, its next pending voice batch may release even if
 other bindings still have agent or speech work.
@@ -1127,6 +1143,12 @@ work.
 - Binding settlement waits for its own accepted speech drain, not unrelated
   sources.
 - Native completed-turn voice messages remain suppressed while bound.
+- A visible generic dispatch or handoff/report-back response in a bound thread
+  is spoken exactly once through that binding's profile and global scheduler.
+- Dispatch headers/status panels/tool output are not spoken, and a quiet or
+  hidden dispatch remains silent.
+- Pending voice input waits for visible generic-dispatch speech to drain just as
+  it does for an ordinary turn.
 
 ### 18.7 Recovery, privacy, and regression
 
@@ -1274,6 +1296,8 @@ package; Package E owns any final adapter/generalization work.
 - VC-chat card post/repost/recovery with no thread fallback;
 - config-backed speaker authorization distinct from admin control ownership;
 - actual-speaker trusted dispatch metadata and attribution;
+- one shared binding speech hook used by ordinary and generic-dispatch renderers,
+  including handoff/report-back, wake, scheduled, and watch turns;
 - component interaction transactions;
 - per-binding ordinary turn routing;
 - card update queues;
@@ -1298,6 +1322,9 @@ Required adversarial areas:
 
 - each missing VC-chat bot permission, permission revocation, card deletion,
   and transient API failure without relocation or leaked lease/state;
+- visible generic dispatch/report-back speech, exactly-once renderer feeding,
+  exclusion of headers/panels/tools, output-off silence, and playback-drain
+  gating before pending voice release;
 - two authorized speakers overlapping and finalizing out of order;
 - same-user SSRC/device handoff without duplicate lane or transcript;
 - authorized plus unauthorized simultaneous speech, with zero unauthorized

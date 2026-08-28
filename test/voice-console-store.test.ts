@@ -112,6 +112,27 @@ describe("SessionStore Voice Console state", () => {
     ).toThrow();
   });
 
+  it("keeps transitional bindings out of the strict active thread lookup", () => {
+    store.createVoiceConsole({
+      console: consoleRow({ status: "starting" }),
+      binding: binding("bind-a", { status: "adding" }),
+    });
+    expect(store.getActiveVoiceConsoleBindingForThread("discord", "thread-bind-a")).toBeNull();
+    expect(store.getNonTerminalVoiceConsoleBindingForThread("discord", "thread-bind-a")?.status)
+      .toBe("adding");
+    store.markVoiceConsoleReady("tvc_1", NOW);
+    expect(store.getActiveVoiceConsoleBindingForThread("discord", "thread-bind-a")?.status)
+      .toBe("active");
+    const removing = store.beginVoiceConsoleBindingRemoval("bind-a", {
+      expectedRevision: store.getVoiceConsole("tvc_1")!.revision,
+      reason: "remove",
+    });
+    expect(removing.ok).toBe(true);
+    expect(store.getActiveVoiceConsoleBindingForThread("discord", "thread-bind-a")).toBeNull();
+    expect(store.getNonTerminalVoiceConsoleBindingForThread("discord", "thread-bind-a")?.status)
+      .toBe("removing");
+  });
+
   it("applies target state and revision once per interaction id", () => {
     store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
     const added = store.addVoiceConsoleBinding({
@@ -323,6 +344,7 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
     });
     expect(result.committed.map((row) => row.bindingId)).toEqual(["bind-a"]);
     expect(result.dropped.map((row) => row.bindingId)).toEqual(["bind-b"]);
+    expect(result.dropped[0]?.audioMs).toBe(900);
     expect(result.committed[0]?.fanoutGroupId).toBe(capture?.fanoutGroupId);
   });
 
@@ -360,5 +382,200 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
       speakerAuthorized: false,
     });
     expect(store.getVoiceConsole("tvc_1")?.droppedCount).toBe(1);
+  });
+
+  it("accounts one fan-out capture duration once and replays the winning commit after reopen", () => {
+    const added = store.addVoiceConsoleBinding({
+      binding: binding("bind-b", { alias: "Beta" }),
+      claim: false,
+      expectedRevision: 1,
+    });
+    if (!added.ok) throw new Error(added.error);
+    const activated = store.activateVoiceConsoleBinding("bind-b", {
+      expectedRevision: added.value.console.revision,
+      claim: false,
+    });
+    if (!activated.ok) throw new Error(activated.error);
+    const targets = store.replaceVoiceConsoleInputTargets("tvc_1", {
+      bindingIds: ["bind-a", "bind-b"],
+      fanoutArmed: true,
+      expectedRevision: activated.value.console.revision,
+    });
+    if (!targets.ok) throw new Error(targets.error);
+    store.allocateVoiceConsoleCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      captureId: "capture-accounted-once",
+    });
+
+    const first = store.finalizeVoiceConsoleCapture({
+      captureId: "capture-accounted-once",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      transcript: "the winning text",
+      audioMs: 875,
+      capturedEndedUtc: "2026-08-28T12:04:00.000Z",
+      speakerAuthorized: true,
+      resultSource: "live",
+      forwardedAudioMs: 625,
+    });
+    expect(first).toMatchObject({
+      duplicate: false,
+      terminal: {
+        outcome: "committed",
+        audioMs: 875,
+        forwardedAudioMs: 625,
+        resultSource: "live",
+      },
+    });
+    expect(first.committed).toHaveLength(2);
+    expect(store.getVoiceConsole("tvc_1")).toMatchObject({
+      forwardedAudioBytes: 0,
+      forwardedAudioMs: 625,
+      liveFinalCount: 1,
+    });
+
+    const lateDrop = store.dropVoiceConsoleCapture({
+      captureId: "capture-accounted-once",
+      reason: "late input-off",
+      capturedEndedUtc: "2026-08-28T12:04:01.000Z",
+      audioMs: 9999,
+      forwardedAudioMs: 9999,
+      outcome: "dropped",
+      resultSource: "unary",
+    });
+    expect(lateDrop).toMatchObject({
+      duplicate: true,
+      terminal: { outcome: "committed", audioMs: 875, forwardedAudioMs: 625, resultSource: "live" },
+    });
+
+    const dbPath = path.join(dir, "test.db");
+    store.close();
+    store = new SessionStore(dbPath);
+    const replay = store.finalizeVoiceConsoleCapture({
+      captureId: "capture-accounted-once",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      transcript: "must not replace the winner",
+      audioMs: 5000,
+      capturedEndedUtc: "2026-08-28T12:04:02.000Z",
+      speakerAuthorized: true,
+      resultSource: "unary",
+      forwardedAudioMs: 5000,
+    });
+    expect(replay.duplicate).toBe(true);
+    expect(replay.committed.map((row) => row.transcript)).toEqual([
+      "the winning text",
+      "the winning text",
+    ]);
+    expect(store.getVoiceConsole("tvc_1")).toMatchObject({
+      forwardedAudioMs: 625,
+      liveFinalCount: 1,
+      unaryFallbackCount: 0,
+    });
+  });
+
+  it("drops exactly one capture and prevents a late commit from changing the winner", () => {
+    store.allocateVoiceConsoleCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      captureId: "capture-failed",
+    });
+    store.allocateVoiceConsoleCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-2",
+      speakerName: "Other",
+      captureId: "capture-still-live",
+    });
+    const dropped = store.dropVoiceConsoleCapture({
+      captureId: "capture-failed",
+      reason: "live and unary transcription failed",
+      capturedEndedUtc: "2026-08-28T12:05:00.000Z",
+      audioMs: 420,
+      forwardedAudioMs: 300,
+      outcome: "failed",
+      resultSource: "unary",
+    });
+    expect(dropped).toMatchObject({
+      duplicate: false,
+      terminal: {
+        outcome: "failed",
+        reason: "live and unary transcription failed",
+        resultSource: "unary",
+        audioMs: 420,
+        forwardedAudioMs: 300,
+      },
+    });
+    expect(dropped.dropped[0]).toMatchObject({
+      state: "transcribe_failed",
+      transcript: "",
+      error: "live and unary transcription failed",
+    });
+    expect(store.listVoiceConsoleSegments("bind-a").find((row) => row.captureId === "capture-still-live")?.state)
+      .toBe("capturing");
+
+    const lateCommit = store.finalizeVoiceConsoleCapture({
+      captureId: "capture-failed",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      transcript: "too late",
+      audioMs: 999,
+      capturedEndedUtc: "2026-08-28T12:05:01.000Z",
+      speakerAuthorized: true,
+      resultSource: "live",
+      forwardedAudioMs: 999,
+    });
+    expect(lateCommit).toMatchObject({ duplicate: true, terminal: { outcome: "failed", audioMs: 420 } });
+    expect(lateCommit.committed).toEqual([]);
+    expect(store.getVoiceConsole("tvc_1")).toMatchObject({
+      forwardedAudioMs: 300,
+      droppedCount: 1,
+      sttFailureCount: 1,
+    });
+  });
+
+  it("keeps a benign drop distinct from an STT failure and replays it exactly", () => {
+    store.allocateVoiceConsoleCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      captureId: "capture-input-off",
+    });
+    const first = store.dropVoiceConsoleCapture({
+      captureId: "capture-input-off",
+      reason: "input off",
+      capturedEndedUtc: "2026-08-28T12:06:00.000Z",
+      audioMs: 120,
+      forwardedAudioMs: 80,
+      outcome: "dropped",
+      resultSource: "live",
+    });
+    const replay = store.dropVoiceConsoleCapture({
+      captureId: "capture-input-off",
+      reason: "different retry",
+      capturedEndedUtc: "2026-08-28T12:06:01.000Z",
+      audioMs: 999,
+      forwardedAudioMs: 999,
+      outcome: "failed",
+      resultSource: "unary",
+    });
+    expect(first.terminal).toMatchObject({ outcome: "dropped", reason: "input off", resultSource: "live" });
+    expect(replay).toMatchObject({
+      duplicate: true,
+      terminal: {
+        outcome: "dropped",
+        reason: "input off",
+        resultSource: "live",
+        audioMs: 120,
+        forwardedAudioMs: 80,
+      },
+    });
+    expect(store.getVoiceConsole("tvc_1")).toMatchObject({
+      forwardedAudioMs: 80,
+      droppedCount: 1,
+      sttFailureCount: 0,
+    });
   });
 });

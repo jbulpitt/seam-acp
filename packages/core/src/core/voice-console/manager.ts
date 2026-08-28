@@ -9,6 +9,7 @@ import type {
   VoiceConsoleCaptureCommitResult,
   VoiceConsoleDispatchHost,
   VoiceConsoleDispatchRequest,
+  VoiceConsoleDropCaptureInput,
   VoiceConsoleFinalCapture,
   VoiceConsoleMutationOutcome,
   VoiceConsoleMutationFailure,
@@ -170,12 +171,14 @@ export class VoiceConsoleManager {
     for (const segment of [...result.committed, ...result.dropped]) {
       void this.releaseIfIdle(segment.bindingId);
     }
-    return {
-      captureId: final.captureId,
-      committed: result.committed,
-      dropped: result.dropped,
-      failures: result.failures,
-    };
+    return result;
+  }
+
+  /** Terminalize exactly one logical capture without inventing transcript text. */
+  dropCapture(input: VoiceConsoleDropCaptureInput): VoiceConsoleCaptureCommitResult {
+    const result = this.store.dropVoiceConsoleCapture(input);
+    for (const segment of result.dropped) void this.releaseIfIdle(segment.bindingId);
+    return result;
   }
 
   /** Input-off safety path: durable terminal outcomes unblock every sequence. */
@@ -281,6 +284,14 @@ export class VoiceConsoleManager {
         updatedUtc: this.now(),
       });
       if (!began.ok) return { ok: false, error: began.error };
+      if (!began.value.applied) {
+        return {
+          ok: true,
+          discarded: 0,
+          consoleEnded: began.value.bindings.length === 0,
+          duplicate: true,
+        };
+      }
       await this.host.stopBinding(bindingId, reason);
       await this.releaseRuns.get(bindingId);
       const discarded = opts.discardPending
@@ -414,6 +425,14 @@ export class VoiceConsoleManager {
         result.reconciled++;
       } catch (err) {
         const message = errorMessage(err);
+        try {
+          await this.host.stopConsole(console.id, message);
+        } catch (cleanupErr) {
+          this.logger.warn(
+            { err: cleanupErr, consoleId: console.id },
+            "voice console boot reconciliation cleanup failed"
+          );
+        }
         this.store.finishVoiceConsoleStop(console.id, "failed", message, this.now());
         this.leases.release(acquired.lease);
         result.failures++;

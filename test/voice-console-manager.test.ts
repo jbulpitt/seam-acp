@@ -208,6 +208,46 @@ describe("VoiceConsoleManager lifecycle", () => {
     );
   });
 
+  it.each(["structured", "thrown"] as const)(
+    "cleans a partially-created boot runtime when reconciliation returns %s failure",
+    async (failureKind) => {
+      store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+      vi.mocked(host.reconcileConsole).mockImplementationOnce(async () => {
+        if (failureKind === "thrown") throw new Error("partial runtime failed");
+        return { ok: false, reason: "partial runtime failed" };
+      });
+      const result = await manager.reconcileOnBoot({
+        aliasFor: () => "unused",
+        profileFor: () => ({ voice: "Aoede", pace: null, style: null }),
+      });
+      expect(result).toMatchObject({ reconciled: 0, failures: 1 });
+      expect(host.stopConsole).toHaveBeenCalledOnce();
+      expect(host.stopConsole).toHaveBeenCalledWith("tvc_1", "partial runtime failed");
+      expect(store.getVoiceConsole("tvc_1")).toMatchObject({
+        status: "failed",
+        endReason: "partial runtime failed",
+      });
+      expect(leases.get("guild-1")).toBeUndefined();
+    }
+  );
+
+  it("still terminalizes and releases boot state when partial-runtime cleanup throws", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    vi.mocked(host.reconcileConsole).mockRejectedValueOnce(new Error("primary reconcile failure"));
+    vi.mocked(host.stopConsole).mockRejectedValueOnce(new Error("cleanup failure"));
+    const result = await manager.reconcileOnBoot({
+      aliasFor: () => "unused",
+      profileFor: () => ({ voice: "Aoede", pace: null, style: null }),
+    });
+    expect(result).toMatchObject({ reconciled: 0, failures: 1 });
+    expect(host.stopConsole).toHaveBeenCalledOnce();
+    expect(store.getVoiceConsole("tvc_1")).toMatchObject({
+      status: "failed",
+      endReason: "primary reconcile failure",
+    });
+    expect(leases.get("guild-1")).toBeUndefined();
+  });
+
   it("activates a hosted binding before claiming it and returns capture-ready state", async () => {
     store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
     vi.mocked(host.addBinding).mockImplementationOnce(async (_console, added) => {
@@ -776,6 +816,44 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
     );
   });
 
+  it("exposes a capture-scoped terminal drop that cannot be replaced by a late commit", () => {
+    manager.allocateCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      captureId: "capture-manager-drop",
+    });
+    const dropped = manager.dropCapture({
+      captureId: "capture-manager-drop",
+      reason: "input off",
+      capturedEndedUtc: NOW,
+      audioMs: 250,
+      forwardedAudioMs: 200,
+      outcome: "dropped",
+      resultSource: "live",
+    });
+    const late = manager.commitCapture({
+      captureId: "capture-manager-drop",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      transcript: "late transcript",
+      audioMs: 900,
+      capturedEndedUtc: NOW,
+      speakerAuthorized: true,
+      resultSource: "unary",
+    });
+    expect(dropped).toMatchObject({
+      duplicate: false,
+      terminal: { outcome: "dropped", reason: "input off", audioMs: 250, forwardedAudioMs: 200 },
+    });
+    expect(late).toMatchObject({
+      duplicate: true,
+      terminal: { outcome: "dropped", reason: "input off", audioMs: 250, forwardedAudioMs: 200 },
+    });
+    expect(late.committed).toEqual([]);
+    expect(store.getVoiceConsole("tvc_1")?.forwardedAudioMs).toBe(200);
+  });
+
   it("releases pending voice after an origin-agnostic visible binding turn settles", async () => {
     vi.mocked(dispatch.isBindingBusy).mockResolvedValue(true);
     manager.allocateCapture({
@@ -962,6 +1040,61 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
       });
     }
   );
+
+  it("replays a durable binding removal after reopen without repeating host teardown", async () => {
+    const added = await manager.addBinding({
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: false,
+      expectedRevision: 1,
+    });
+    if (!added.ok) throw new Error(added.error);
+    const expectedRevision = added.value.console.revision;
+    const first = await manager.removeBinding("bind-a", {
+      expectedRevision,
+      interactionId: "remove-interaction-1",
+      reason: "owner removed binding",
+    });
+    expect(first).toEqual({ ok: true, discarded: 0, consoleEnded: false });
+    expect(host.stopBinding).toHaveBeenCalledOnce();
+
+    manager.shutdown();
+    const dbPath = path.join(dir, "test.db");
+    store.close();
+    store = new SessionStore(dbPath);
+    manager = createManager();
+    const replay = await manager.removeBinding("bind-a", {
+      expectedRevision,
+      interactionId: "remove-interaction-1",
+      reason: "owner removed binding",
+    });
+    expect(replay).toEqual({
+      ok: true,
+      discarded: 0,
+      consoleEnded: false,
+      duplicate: true,
+    });
+    expect(host.stopBinding).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a remove interaction collision without changing binding or host state", async () => {
+    const selected = store.replaceVoiceConsoleInputTargets("tvc_1", {
+      bindingIds: ["bind-a"],
+      fanoutArmed: true,
+      expectedRevision: 1,
+      interactionId: "collision-interaction",
+    });
+    if (!selected.ok) throw new Error(selected.error);
+    const result = await manager.removeBinding("bind-a", {
+      expectedRevision: selected.value.console.revision,
+      interactionId: "collision-interaction",
+    });
+    expect(result).toEqual({
+      ok: false,
+      error: "Interaction ID is already used by a different Voice Console action or input.",
+    });
+    expect(store.getVoiceConsoleBinding("bind-a")?.status).toBe("active");
+    expect(host.stopBinding).not.toHaveBeenCalled();
+  });
 
   it("replays the exact stop interaction idempotently without stopping the host twice", async () => {
     const first = await manager.stopConsole("tvc_1", {

@@ -62,6 +62,10 @@ import {
   type VoiceConsoleAddInteraction,
   type VoiceConsoleBatch,
   type VoiceConsoleBindingStatus,
+  type VoiceConsoleCaptureCommitResult,
+  type VoiceConsoleCaptureTerminal,
+  type VoiceConsoleCaptureTerminalOutcome,
+  type VoiceConsoleDropCaptureInput,
   type VoiceConsoleCaptureSnapshot,
   type VoiceConsoleFinalCapture,
   type VoiceConsoleInputTarget,
@@ -2087,6 +2091,22 @@ export class SessionStore {
       .prepare<[string, string], VoiceConsoleBindingRow>(
         `SELECT * FROM thread_voice_sessions
           WHERE platform = ? AND channel_ref = ? AND console_id IS NOT NULL
+            AND status = 'active'
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(platform, channelRef);
+    return row ? mapVoiceConsoleBinding(row) : null;
+  }
+
+  /** Constraint/lifecycle lookup; callers needing capture/control use the strict active API above. */
+  getNonTerminalVoiceConsoleBindingForThread(
+    platform: string,
+    channelRef: string
+  ): ThreadVoiceBinding | null {
+    const row = this.db
+      .prepare<[string, string], VoiceConsoleBindingRow>(
+        `SELECT * FROM thread_voice_sessions
+          WHERE platform = ? AND channel_ref = ? AND console_id IS NOT NULL
             AND status IN ('adding','active','removing')
           ORDER BY created_utc DESC LIMIT 1`
       )
@@ -2206,7 +2226,7 @@ export class SessionStore {
           mutationFailure("inactive", "Binding guild/voice channel does not match its console.")
         );
       }
-      if (this.getActiveVoiceConsoleBindingForThread(binding.platform, binding.channelRef)) {
+      if (this.getNonTerminalVoiceConsoleBindingForThread(binding.platform, binding.channelRef)) {
         return fail(mutationFailure("duplicate-thread", "That thread already has an active binding."));
       }
       const alias = this.db
@@ -2614,44 +2634,26 @@ export class SessionStore {
     reason: string,
     recoveredUtc = new Date().toISOString()
   ): VoiceConsoleSegment[] {
-    const recover = this.db.transaction(() => {
-      const rows = this.db
-        .prepare<[], VoiceConsoleSegmentRow>(
-          `SELECT segment.* FROM thread_voice_segments segment
-             JOIN thread_voice_sessions binding ON binding.id = segment.session_id
-            WHERE binding.console_id IS NOT NULL
-              AND segment.state IN ('capturing','finalizing')
-            ORDER BY segment.created_utc ASC, segment.id ASC`
-        )
-        .all();
-      if (rows.length === 0) return [];
-      this.db
-        .prepare(
-          `UPDATE thread_voice_segments SET state = 'capture_dropped', transcript = '',
-             captured_ended_utc = ?, updated_utc = ?, error = ?
-           WHERE id IN (${rows.map(() => "?").join(",")})
-             AND state IN ('capturing','finalizing')`
-        )
-        .run(recoveredUtc, recoveredUtc, reason, ...rows.map((row) => row.id));
-      const capturesByConsole = new Map<string, Set<string>>();
-      for (const row of rows) {
-        const binding = this.getVoiceConsoleBinding(row.session_id);
-        if (!binding || !row.capture_id) continue;
-        const captures = capturesByConsole.get(binding.consoleId) ?? new Set<string>();
-        captures.add(row.capture_id);
-        capturesByConsole.set(binding.consoleId, captures);
-      }
-      for (const [consoleId, captures] of capturesByConsole) {
-        this.db
-          .prepare(
-            `UPDATE voice_console_sessions SET dropped_count = dropped_count + ?,
-               updated_utc = ? WHERE id = ?`
-          )
-          .run(captures.size, recoveredUtc, consoleId);
-      }
-      return rows.map((row) => this.getVoiceConsoleSegment(row.id)!);
-    });
-    return recover();
+    const captureIds = this.db
+      .prepare<[], { capture_id: string }>(
+        `SELECT DISTINCT segment.capture_id FROM thread_voice_segments segment
+           JOIN thread_voice_sessions binding ON binding.id = segment.session_id
+          WHERE binding.console_id IS NOT NULL AND segment.capture_id IS NOT NULL
+            AND segment.state IN ('capturing','finalizing')
+          ORDER BY segment.capture_id ASC`
+      )
+      .all()
+      .map((row) => row.capture_id);
+    return captureIds.flatMap((captureId) =>
+      this.dropVoiceConsoleCapture({
+        captureId,
+        reason,
+        capturedEndedUtc: recoveredUtc,
+        audioMs: 0,
+        forwardedAudioMs: 0,
+        outcome: "dropped",
+      }).dropped
+    );
   }
 
   beginVoiceConsoleBindingRemoval(
@@ -2661,8 +2663,12 @@ export class SessionStore {
     const mutate = this.db.transaction((): VoiceConsoleMutationOutcome => {
       const binding = this.getVoiceConsoleBinding(bindingId);
       if (!binding) return mutationFailure("not-found", "Voice Console binding does not exist.");
-      if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId, "remove-binding")) {
-        return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, false, true) };
+      try {
+        if (this.getVoiceConsoleMutation(binding.consoleId, input.interactionId, "remove-binding")) {
+          return { ok: true, value: this.requireVoiceConsoleMutationResult(binding.consoleId, false, true) };
+        }
+      } catch {
+        return interactionCollisionFailure();
       }
       const console = this.getVoiceConsole(binding.consoleId);
       if (!console || !isActiveConsole(console)) return mutationFailure("inactive", "Voice Console is not active.");
@@ -2837,108 +2843,280 @@ export class SessionStore {
     return allocate();
   }
 
-  finalizeVoiceConsoleCapture(final: VoiceConsoleFinalCapture): {
-    consoleId: string | null;
-    committed: VoiceConsoleSegment[];
-    dropped: VoiceConsoleSegment[];
-    failures: Array<{ bindingId: string; error: string }>;
-  } {
-    const rows = this.db
-      .prepare<[string], VoiceConsoleSegmentRow>(
-        `SELECT * FROM thread_voice_segments WHERE capture_id = ? ORDER BY session_id, sequence`
+  getVoiceConsoleCaptureTerminal(captureId: string): VoiceConsoleCaptureTerminal | null {
+    const row = this.db
+      .prepare<[string], VoiceConsoleCaptureTerminalRow>(
+        "SELECT * FROM voice_console_capture_terminals WHERE capture_id = ?"
       )
-      .all(final.captureId);
+      .get(captureId);
+    return row ? mapVoiceConsoleCaptureTerminal(row) : null;
+  }
+
+  /**
+   * Atomically settles every fan-out reservation and the capture-level usage
+   * counters. A stable capture id has one durable winner across retries/reopen.
+   */
+  finalizeVoiceConsoleCapture(final: VoiceConsoleFinalCapture): VoiceConsoleCaptureCommitResult {
+    const settle = this.db.transaction((): VoiceConsoleCaptureCommitResult => {
+      const prior = this.getVoiceConsoleCaptureTerminal(final.captureId);
+      if (prior) return this.buildVoiceConsoleCaptureResult(final.captureId, prior, true);
+      const rows = this.voiceConsoleCaptureRows(final.captureId);
+      if (rows.length === 0) return this.emptyVoiceConsoleCaptureResult(final.captureId);
+      const consoleId = this.voiceConsoleCaptureConsoleId(rows);
+      if (!consoleId) return this.emptyVoiceConsoleCaptureResult(final.captureId);
+
+      const transcript = final.transcript.trim();
+      const audioMs = nonNegativeInteger(final.audioMs);
+      const forwardedAudioMs = nonNegativeInteger(final.forwardedAudioMs ?? final.audioMs);
+      const finalSpeakerName = sanitizeVoiceConsoleSpeakerName(final.speakerName);
+      const speakerMatches = rows.every(
+        (row) => row.author_id === final.speakerId && (row.author_name ?? "") === finalSpeakerName
+      );
+      for (const row of rows) {
+        if (row.state !== "capturing" && row.state !== "finalizing") continue;
+        const target = this.getVoiceConsoleBinding(row.session_id);
+        const targetValid = target?.status === "active" && target.consoleId === consoleId;
+        const accept =
+          final.speakerAuthorized &&
+          speakerMatches &&
+          targetValid &&
+          transcript.length > 0 &&
+          !final.error;
+        const state: ThreadVoiceSegmentState = accept
+          ? "pending"
+          : final.error
+            ? "transcribe_failed"
+            : "capture_dropped";
+        const error = accept
+          ? null
+          : final.error ??
+            (!final.speakerAuthorized
+              ? "speaker authorization revoked"
+              : !speakerMatches
+                ? "speaker identity mismatch"
+                : !targetValid
+                  ? "binding removed before capture final"
+                  : "empty capture");
+        this.db
+          .prepare(
+            `UPDATE thread_voice_segments SET transcript = ?, state = ?, audio_ms = ?,
+               captured_ended_utc = ?, updated_utc = ?, error = ?
+             WHERE id = ? AND state IN ('capturing','finalizing')`
+          )
+          .run(
+            accept ? transcript : "",
+            state,
+            audioMs,
+            final.capturedEndedUtc,
+            final.capturedEndedUtc,
+            error,
+            row.id
+          );
+      }
+      // Removal/stop may have already terminalized one reservation while other
+      // fan-out targets continued. Preserve that decision but attach the one
+      // final capture-duration measurement to every reservation.
+      this.db
+        .prepare(
+          `UPDATE thread_voice_segments SET audio_ms = ?, captured_ended_utc = ?, updated_utc = ?
+            WHERE capture_id = ? AND state IN ('capture_dropped','transcribe_failed')`
+        )
+        .run(audioMs, final.capturedEndedUtc, final.capturedEndedUtc, final.captureId);
+
+      const accepted = this.voiceConsoleCaptureRows(final.captureId).some((row) =>
+        ["pending", "batched", "dispatched"].includes(row.state)
+      );
+      const outcome: VoiceConsoleCaptureTerminalOutcome = accepted
+        ? "committed"
+        : final.error
+          ? "failed"
+          : "dropped";
+      const reason = accepted
+        ? null
+        : final.error ??
+          (!final.speakerAuthorized
+            ? "speaker authorization revoked"
+            : !speakerMatches
+              ? "speaker identity mismatch"
+              : transcript.length === 0
+                ? "empty capture"
+                : "capture targets unavailable");
+      const terminal = this.insertVoiceConsoleCaptureTerminal({
+        captureId: final.captureId,
+        consoleId,
+        outcome,
+        reason,
+        resultSource: final.resultSource ?? null,
+        audioMs,
+        forwardedAudioMs,
+        capturedEndedUtc: final.capturedEndedUtc,
+        createdUtc: final.capturedEndedUtc,
+      });
+      this.incrementVoiceConsoleCaptureCounters(terminal);
+      return this.buildVoiceConsoleCaptureResult(final.captureId, terminal, false);
+    });
+    return settle();
+  }
+
+  /** First terminal winner for one capture; never mutates a prior commit/drop. */
+  dropVoiceConsoleCapture(input: VoiceConsoleDropCaptureInput): VoiceConsoleCaptureCommitResult {
+    const settle = this.db.transaction((): VoiceConsoleCaptureCommitResult => {
+      const prior = this.getVoiceConsoleCaptureTerminal(input.captureId);
+      if (prior) return this.buildVoiceConsoleCaptureResult(input.captureId, prior, true);
+      const rows = this.voiceConsoleCaptureRows(input.captureId);
+      if (rows.length === 0) return this.emptyVoiceConsoleCaptureResult(input.captureId);
+      const consoleId = this.voiceConsoleCaptureConsoleId(rows);
+      if (!consoleId) return this.emptyVoiceConsoleCaptureResult(input.captureId);
+      const audioMs = nonNegativeInteger(input.audioMs);
+      const forwardedAudioMs = nonNegativeInteger(input.forwardedAudioMs);
+      const precommitted = rows.some((row) =>
+        ["pending", "batched", "dispatched"].includes(row.state)
+      );
+      const outcome: VoiceConsoleCaptureTerminalOutcome = precommitted
+        ? "committed"
+        : input.outcome ?? "dropped";
+      if (!precommitted) {
+        this.db
+          .prepare(
+            `UPDATE thread_voice_segments SET transcript = '', state = ?, audio_ms = ?,
+               captured_ended_utc = ?, updated_utc = ?, error = ?
+             WHERE capture_id = ? AND state IN ('capturing','finalizing')`
+          )
+          .run(
+            outcome === "failed" ? "transcribe_failed" : "capture_dropped",
+            audioMs,
+            input.capturedEndedUtc,
+            input.capturedEndedUtc,
+            input.reason,
+            input.captureId
+          );
+        this.db
+          .prepare(
+            `UPDATE thread_voice_segments SET audio_ms = ?, captured_ended_utc = ?, updated_utc = ?
+              WHERE capture_id = ? AND state IN ('capture_dropped','transcribe_failed')`
+          )
+          .run(audioMs, input.capturedEndedUtc, input.capturedEndedUtc, input.captureId);
+      }
+      const terminal = this.insertVoiceConsoleCaptureTerminal({
+        captureId: input.captureId,
+        consoleId,
+        outcome,
+        reason: precommitted ? null : input.reason,
+        resultSource: input.resultSource ?? null,
+        audioMs,
+        forwardedAudioMs,
+        capturedEndedUtc: input.capturedEndedUtc,
+        createdUtc: input.capturedEndedUtc,
+      });
+      this.incrementVoiceConsoleCaptureCounters(terminal);
+      return this.buildVoiceConsoleCaptureResult(input.captureId, terminal, false);
+    });
+    return settle();
+  }
+
+  private voiceConsoleCaptureRows(captureId: string): VoiceConsoleSegmentRow[] {
+    return this.db
+      .prepare<[string], VoiceConsoleSegmentRow>(
+        "SELECT * FROM thread_voice_segments WHERE capture_id = ? ORDER BY session_id, sequence"
+      )
+      .all(captureId);
+  }
+
+  private voiceConsoleCaptureConsoleId(rows: readonly VoiceConsoleSegmentRow[]): string | null {
+    let consoleId: string | null = null;
+    for (const row of rows) {
+      const binding = this.getVoiceConsoleBinding(row.session_id);
+      if (!binding) return null;
+      if (consoleId !== null && consoleId !== binding.consoleId) {
+        throw new Error("Voice Console capture spans more than one console.");
+      }
+      consoleId = binding.consoleId;
+    }
+    return consoleId;
+  }
+
+  private insertVoiceConsoleCaptureTerminal(
+    terminal: VoiceConsoleCaptureTerminal
+  ): VoiceConsoleCaptureTerminal {
+    this.db
+      .prepare(
+        `INSERT INTO voice_console_capture_terminals
+           (capture_id, console_id, outcome, reason, result_source, audio_ms, forwarded_audio_ms,
+            captured_ended_utc, created_utc)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        terminal.captureId,
+        terminal.consoleId,
+        terminal.outcome,
+        terminal.reason,
+        terminal.resultSource,
+        terminal.audioMs,
+        terminal.forwardedAudioMs,
+        terminal.capturedEndedUtc,
+        terminal.createdUtc
+      );
+    return terminal;
+  }
+
+  private incrementVoiceConsoleCaptureCounters(terminal: VoiceConsoleCaptureTerminal): void {
+    this.db
+      .prepare(
+        `UPDATE voice_console_sessions SET
+           forwarded_audio_ms = forwarded_audio_ms + ?,
+           live_final_count = live_final_count + ?,
+           unary_fallback_count = unary_fallback_count + ?,
+           dropped_count = dropped_count + ?,
+           stt_failure_count = stt_failure_count + ?,
+           updated_utc = ? WHERE id = ?`
+      )
+      .run(
+        terminal.forwardedAudioMs,
+        terminal.outcome === "committed" && terminal.resultSource === "live" ? 1 : 0,
+        terminal.outcome === "committed" && terminal.resultSource === "unary" ? 1 : 0,
+        terminal.outcome === "committed" ? 0 : 1,
+        terminal.outcome === "failed" ? 1 : 0,
+        terminal.capturedEndedUtc,
+        terminal.consoleId
+      );
+  }
+
+  private emptyVoiceConsoleCaptureResult(captureId: string): VoiceConsoleCaptureCommitResult {
+    return {
+      captureId,
+      terminal: null,
+      duplicate: false,
+      committed: [],
+      dropped: [],
+      failures: [],
+    };
+  }
+
+  private buildVoiceConsoleCaptureResult(
+    captureId: string,
+    terminal: VoiceConsoleCaptureTerminal,
+    duplicate: boolean
+  ): VoiceConsoleCaptureCommitResult {
     const committed: VoiceConsoleSegment[] = [];
     const dropped: VoiceConsoleSegment[] = [];
     const failures: Array<{ bindingId: string; error: string }> = [];
-    if (rows.length === 0) return { consoleId: null, committed, dropped, failures };
-    const binding = this.getVoiceConsoleBinding(rows[0]!.session_id);
-    const consoleId = binding?.consoleId ?? null;
-    const transcript = final.transcript.trim();
-    const finalSpeakerName = sanitizeVoiceConsoleSpeakerName(final.speakerName);
-    const speakerMatches = rows.every(
-      (row) => row.author_id === final.speakerId && (row.author_name ?? "") === finalSpeakerName
-    );
-    for (const row of rows) {
-      const current = this.getVoiceConsoleSegment(row.id) ?? mapVoiceConsoleSegment(row);
-      if (current.state !== "capturing" && current.state !== "finalizing") {
-        (current.state === "pending" || current.state === "batched" || current.state === "dispatched"
-          ? committed
-          : dropped).push(current);
-        continue;
-      }
-      try {
-        const settle = this.db.transaction((): VoiceConsoleSegment => {
-          const target = this.getVoiceConsoleBinding(current.bindingId);
-          const targetValid = target?.status === "active" && target.consoleId === consoleId;
-          const accept = final.speakerAuthorized && speakerMatches && targetValid && transcript.length > 0 && !final.error;
-          const state: ThreadVoiceSegmentState = accept
-            ? "pending"
-            : final.error
-              ? "transcribe_failed"
-              : "capture_dropped";
-          const error = accept
-            ? null
-            : final.error ?? (!final.speakerAuthorized ? "speaker authorization revoked" : !speakerMatches ? "speaker identity mismatch" : !targetValid ? "binding removed before capture final" : "empty capture");
-          const activeBefore = this.db
-            .prepare<[string], { count: number }>(
-              `SELECT COUNT(*) AS count FROM thread_voice_segments
-                WHERE capture_id = ? AND state IN ('capturing','finalizing')`
-            )
-            .get(final.captureId)?.count ?? 0;
-          this.db
-            .prepare(
-              `UPDATE thread_voice_segments SET transcript = ?, state = ?, audio_ms = ?,
-                 captured_ended_utc = ?, updated_utc = ?, error = ?
-               WHERE id = ? AND state IN ('capturing','finalizing')`
-            )
-            .run(
-              accept ? transcript : "",
-              state,
-              Math.max(0, Math.trunc(final.audioMs)),
-              final.capturedEndedUtc,
-              final.capturedEndedUtc,
-              error,
-              current.id
-            );
-          if (activeBefore === 1 && consoleId) {
-            const accepted = this.db
-              .prepare<[string], { count: number }>(
-                `SELECT COUNT(*) AS count FROM thread_voice_segments
-                  WHERE capture_id = ? AND state IN ('pending','batched','dispatched')`
-              )
-              .get(final.captureId)?.count ?? 0;
-            this.db
-              .prepare(
-                `UPDATE voice_console_sessions SET
-                   live_final_count = live_final_count + ?,
-                   unary_fallback_count = unary_fallback_count + ?,
-                   dropped_count = dropped_count + ?,
-                   stt_failure_count = stt_failure_count + ?, updated_utc = ? WHERE id = ?`
-              )
-              .run(
-                final.resultSource === "live" && accepted > 0 ? 1 : 0,
-                final.resultSource === "unary" && accepted > 0 ? 1 : 0,
-                accepted === 0 ? 1 : 0,
-                final.error ? 1 : 0,
-                final.capturedEndedUtc,
-                consoleId
-              );
-          }
-          const updated = this.getVoiceConsoleSegment(current.id);
-          if (!updated) throw new Error("Voice Console capture assignment disappeared.");
-          return updated;
-        });
-        const updated = settle();
-        (updated.state === "pending" ? committed : dropped).push(updated);
-      } catch (err) {
+    for (const row of this.voiceConsoleCaptureRows(captureId)) {
+      const segment = mapVoiceConsoleSegment(row);
+      if (
+        ["pending", "batched", "dispatched"].includes(segment.state) ||
+        (segment.state === "discarded" && terminal.outcome === "committed")
+      ) {
+        committed.push(segment);
+      } else if (["capture_dropped", "transcribe_failed", "discarded"].includes(segment.state)) {
+        dropped.push(segment);
+      } else {
         failures.push({
-          bindingId: current.bindingId,
-          error: err instanceof Error ? err.message : String(err),
+          bindingId: segment.bindingId,
+          error: `capture terminal ${terminal.outcome} left segment in ${segment.state}`,
         });
       }
     }
-    return { consoleId, committed, dropped, failures };
+    return { captureId, terminal, duplicate, committed, dropped, failures };
   }
 
   dropActiveVoiceConsoleCaptures(
@@ -2946,32 +3124,26 @@ export class SessionStore {
     reason: string,
     droppedUtc = new Date().toISOString()
   ): VoiceConsoleSegment[] {
-    const drop = this.db.transaction(() => {
-      const rows = this.db
-        .prepare<[string], VoiceConsoleSegmentRow>(
-          `SELECT segment.* FROM thread_voice_segments segment
-             JOIN thread_voice_sessions binding ON binding.id = segment.session_id
-            WHERE binding.console_id = ? AND segment.state IN ('capturing','finalizing')`
-        )
-        .all(consoleId);
-      if (rows.length === 0) return [];
-      this.db
-        .prepare(
-          `UPDATE thread_voice_segments SET state = 'capture_dropped', transcript = '',
-             captured_ended_utc = ?, updated_utc = ?, error = ?
-           WHERE id IN (${rows.map(() => "?").join(",")})`
-        )
-        .run(droppedUtc, droppedUtc, reason, ...rows.map((row) => row.id));
-      const captureCount = new Set(rows.map((row) => row.capture_id).filter(Boolean)).size;
-      this.db
-        .prepare(
-          `UPDATE voice_console_sessions SET dropped_count = dropped_count + ?,
-             updated_utc = ? WHERE id = ?`
-        )
-        .run(captureCount, droppedUtc, consoleId);
-      return rows.map((row) => this.getVoiceConsoleSegment(row.id)!);
-    });
-    return drop();
+    const captureIds = this.db
+      .prepare<[string], { capture_id: string }>(
+        `SELECT DISTINCT segment.capture_id FROM thread_voice_segments segment
+           JOIN thread_voice_sessions binding ON binding.id = segment.session_id
+          WHERE binding.console_id = ? AND segment.capture_id IS NOT NULL
+            AND segment.state IN ('capturing','finalizing')
+          ORDER BY segment.capture_id ASC`
+      )
+      .all(consoleId)
+      .map((row) => row.capture_id);
+    return captureIds.flatMap((captureId) =>
+      this.dropVoiceConsoleCapture({
+        captureId,
+        reason,
+        capturedEndedUtc: droppedUtc,
+        audioMs: 0,
+        forwardedAudioMs: 0,
+        outcome: "dropped",
+      }).dropped
+    );
   }
 
   getVoiceConsoleSegment(id: string): VoiceConsoleSegment | null {
@@ -2988,21 +3160,6 @@ export class SessionStore {
       )
       .all(bindingId)
       .map(mapVoiceConsoleSegment);
-  }
-
-  addVoiceConsoleForwardedAudio(
-    consoleId: string,
-    bytes: number,
-    durationMs: number,
-    updatedUtc = new Date().toISOString()
-  ): VoiceConsoleSession | null {
-    this.db
-      .prepare(
-        `UPDATE voice_console_sessions SET forwarded_audio_bytes = forwarded_audio_bytes + ?,
-           forwarded_audio_ms = forwarded_audio_ms + ?, updated_utc = ? WHERE id = ?`
-      )
-      .run(Math.max(0, Math.trunc(bytes)), Math.max(0, Math.trunc(durationMs)), updatedUtc, consoleId);
-    return this.getVoiceConsole(consoleId);
   }
 
   claimPendingVoiceConsoleBatch(
@@ -4544,6 +4701,25 @@ CREATE TABLE IF NOT EXISTS voice_console_add_interactions (
   CHECK(status IN ('pending','succeeded','failed')),
   CHECK(failure_as_exception IN (0,1))
 );
+
+CREATE TABLE IF NOT EXISTS voice_console_capture_terminals (
+  capture_id            TEXT PRIMARY KEY,
+  console_id            TEXT NOT NULL,
+  outcome               TEXT NOT NULL,
+  reason                TEXT,
+  result_source         TEXT,
+  audio_ms              INTEGER NOT NULL,
+  forwarded_audio_ms    INTEGER NOT NULL,
+  captured_ended_utc    TEXT NOT NULL,
+  created_utc           TEXT NOT NULL,
+  FOREIGN KEY(console_id) REFERENCES voice_console_sessions(id),
+  CHECK(outcome IN ('committed','dropped','failed')),
+  CHECK(result_source IS NULL OR result_source IN ('live','unary')),
+  CHECK(audio_ms >= 0),
+  CHECK(forwarded_audio_ms >= 0)
+);
+CREATE INDEX IF NOT EXISTS idx_voice_console_capture_terminals_console
+  ON voice_console_capture_terminals(console_id, created_utc);
 `;
 
 interface VoiceConsoleRow {
@@ -4584,6 +4760,32 @@ interface VoiceConsoleAddInteractionRow {
   created_utc: string;
   updated_utc: string;
 }
+
+interface VoiceConsoleCaptureTerminalRow {
+  capture_id: string;
+  console_id: string;
+  outcome: string;
+  reason: string | null;
+  result_source: string | null;
+  audio_ms: number;
+  forwarded_audio_ms: number;
+  captured_ended_utc: string;
+  created_utc: string;
+}
+
+const mapVoiceConsoleCaptureTerminal = (
+  row: VoiceConsoleCaptureTerminalRow
+): VoiceConsoleCaptureTerminal => ({
+  captureId: row.capture_id,
+  consoleId: row.console_id,
+  outcome: row.outcome as VoiceConsoleCaptureTerminalOutcome,
+  reason: row.reason,
+  resultSource: row.result_source as VoiceConsoleCaptureTerminal["resultSource"],
+  audioMs: row.audio_ms,
+  forwardedAudioMs: row.forwarded_audio_ms,
+  capturedEndedUtc: row.captured_ended_utc,
+  createdUtc: row.created_utc,
+});
 
 const mapVoiceConsoleAddInteraction = (
   row: VoiceConsoleAddInteractionRow
@@ -5257,4 +5459,8 @@ function truncatePreview(text: string | null): string | null {
   return text.length <= PROMPT_PREVIEW_MAX
     ? text
     : text.slice(0, PROMPT_PREVIEW_MAX);
+}
+
+function nonNegativeInteger(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
 }

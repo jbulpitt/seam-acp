@@ -202,7 +202,10 @@ export interface VoiceConsoleFinalCapture {
   speakerId: string;
   speakerName: string;
   transcript: string;
+  /** STT/capture duration retained on each target segment. */
   audioMs: number;
+  /** Cumulative 16 kHz mono PCM duration, counted once for this capture. */
+  forwardedAudioMs?: number;
   capturedEndedUtc: string;
   /** Final capture authorization is supplied by the integration allowlist check. */
   speakerAuthorized: boolean;
@@ -210,8 +213,41 @@ export interface VoiceConsoleFinalCapture {
   error?: string;
 }
 
+export type VoiceConsoleCaptureTerminalOutcome = "committed" | "dropped" | "failed";
+
+/**
+ * One durable winner for a logical capture. The row is keyed by captureId, so
+ * fan-out targets share one accounting boundary and retries can only replay it.
+ */
+export interface VoiceConsoleCaptureTerminal {
+  captureId: string;
+  consoleId: string;
+  outcome: VoiceConsoleCaptureTerminalOutcome;
+  reason: string | null;
+  resultSource: "live" | "unary" | null;
+  /** STT/capture duration retained on target segments. */
+  audioMs: number;
+  /** Cumulative forwarded PCM duration counted once on the console. */
+  forwardedAudioMs: number;
+  capturedEndedUtc: string;
+  createdUtc: string;
+}
+
+export interface VoiceConsoleDropCaptureInput {
+  captureId: string;
+  reason: string;
+  capturedEndedUtc: string;
+  audioMs: number;
+  forwardedAudioMs: number;
+  /** Distinguishes ordinary safety/noise drops from STT/host failures. */
+  outcome?: "dropped" | "failed";
+  resultSource?: "live" | "unary";
+}
+
 export interface VoiceConsoleCaptureCommitResult {
   captureId: string;
+  terminal: VoiceConsoleCaptureTerminal | null;
+  duplicate: boolean;
   committed: VoiceConsoleSegment[];
   dropped: VoiceConsoleSegment[];
   failures: Array<{ bindingId: string; error: string }>;
@@ -266,7 +302,7 @@ export type VoiceConsoleStartResult =
   | { ok: false; error: string };
 
 export type VoiceConsoleRemoveResult =
-  | { ok: true; discarded: number; consoleEnded: boolean }
+  | { ok: true; discarded: number; consoleEnded: boolean; duplicate?: true }
   | { ok: false; error: string };
 
 export interface VoiceConsoleUpgradeDefaults {

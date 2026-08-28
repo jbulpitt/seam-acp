@@ -82,6 +82,22 @@ describe("Voice Console V2 migration", () => {
         .all()
         .map((row: any) => row.name)
     ).toEqual(expect.arrayContaining(["input_fingerprint", "status", "failure_code"]));
+    expect(
+      mutationDb
+        .prepare("PRAGMA table_info(voice_console_capture_terminals)")
+        .all()
+        .map((row: any) => row.name)
+    ).toEqual(
+      expect.arrayContaining([
+        "capture_id",
+        "console_id",
+        "outcome",
+        "reason",
+        "result_source",
+        "audio_ms",
+        "forwarded_audio_ms",
+      ])
+    );
     mutationDb.close();
 
     const upgraded = store.upgradeActiveV1ThreadVoiceSessions(

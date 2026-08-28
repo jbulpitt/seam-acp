@@ -24,6 +24,8 @@ export interface ThreadVoiceCaptureCoordinatorCallbacks {
   onDropped: (segment: DroppedVoiceSegment) => void;
   onAudioSent: (durationMs: number) => void;
   onTranscribing?: (sequence: number) => void;
+  /** Additive V2 hook; unary wins if any continuation part required it. */
+  onTranscriptionSource?: (sequence: number, source: "live" | "unary") => void;
 }
 
 type CapturePart = {
@@ -46,6 +48,7 @@ type PartResult = {
   continuation: boolean;
   usable: boolean;
   text: string;
+  source?: "live" | "unary";
   error?: string;
 };
 
@@ -75,6 +78,7 @@ export class ThreadVoiceCaptureCoordinator {
   private readonly now: () => string;
   private readonly parts = new Map<string, CapturePart>();
   private readonly logical = new Map<number, LogicalCapture>();
+  private readonly abortedSequences = new Set<number>();
   private serial = Promise.resolve();
   private activePart?: CapturePart;
   private forwardedByteRemainder = 0;
@@ -168,6 +172,17 @@ export class ThreadVoiceCaptureCoordinator {
     if (sequence !== undefined && text.trim()) this.callbacks.onInterim(sequence, text);
   }
 
+  /**
+   * Additive V2 reuse hook: discard one logical sequence without starting a
+   * queued Google activity or invoking unary fallback after its capture gate
+   * supplies the terminal end marker. Existing V1 callers never use this.
+   */
+  abortSequence(sequence: number): void {
+    if (Number.isSafeInteger(sequence) && sequence > 0) {
+      this.abortedSequences.add(sequence);
+    }
+  }
+
   /** Package B telemetry: bytes actually accepted by the open Google socket. */
   onForwardedBytes(bytes: number): void {
     if (!Number.isFinite(bytes) || bytes <= 0) return;
@@ -187,6 +202,9 @@ export class ThreadVoiceCaptureCoordinator {
   }
 
   private async processPart(part: CapturePart): Promise<PartResult> {
+    if (part.ended && this.abortedSequences.has(part.ref.sequence)) {
+      return this.abortedPartResult(part);
+    }
     // A queued exact-boundary marker can finish empty before its predecessor's
     // final settles. Skip a Google activity for that marker entirely.
     if (part.ended && part.ended.pcm16kMono.byteLength === 0) {
@@ -197,6 +215,9 @@ export class ThreadVoiceCaptureCoordinator {
     this.activePart = part;
     for (const pcm of part.chunks.splice(0)) this.transcribe.sendPcm16k(pcm);
     await part.endPromise;
+    if (this.abortedSequences.has(part.ref.sequence)) {
+      return this.abortedPartResult(part);
+    }
     this.callbacks.onTranscribing?.(part.ref.sequence);
     const end = part.ended!;
     let result: GeminiLiveTranscribeResult;
@@ -218,7 +239,22 @@ export class ThreadVoiceCaptureCoordinator {
       continuation: end.continuation,
       usable: end.usable,
       text: result.ok && end.usable ? result.text.trim() : "",
+      source: result.source,
       ...(!result.ok ? { error: result.error } : {}),
+    };
+  }
+
+  private abortedPartResult(part: CapturePart): PartResult {
+    const end = part.ended!;
+    return {
+      ref: part.ref,
+      startedUtc: part.startedUtc,
+      endedUtc: part.endedUtc ?? this.now(),
+      durationMs: end.durationMs,
+      continuation: end.continuation,
+      usable: false,
+      text: "",
+      error: "capture aborted",
     };
   }
 
@@ -234,6 +270,8 @@ export class ThreadVoiceCaptureCoordinator {
     const durationMs = parts.reduce((sum, part) => sum + part.durationMs, 0);
     const endedUtc = parts.at(-1)?.endedUtc ?? this.now();
     if (transcript) {
+      const source = parts.some((part) => part.source === "unary") ? "unary" : "live";
+      this.callbacks.onTranscriptionSource?.(logical.sequence, source);
       this.callbacks.onFinal({
         sequence: logical.sequence,
         authorId: this.ownerUserId,
@@ -266,6 +304,7 @@ export class ThreadVoiceCaptureCoordinator {
       "thread-voice logical capture settled"
     );
     this.logical.delete(logical.sequence);
+    this.abortedSequences.delete(logical.sequence);
     for (const part of parts) this.parts.delete(partKey(part.ref));
   }
 }

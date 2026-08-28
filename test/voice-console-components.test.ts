@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  StringSelectMenuBuilder,
+} from "discord.js";
+import {
   VOICE_CONSOLE_CUSTOM_ID_MAX,
+  VOICE_CONSOLE_DISCORD_LIMITS,
   buildBindingEditorRows,
   buildDuplicateVoiceConfirmationRows,
   buildEndConsoleConfirmationRows,
@@ -11,16 +18,83 @@ import {
   cycleVoiceConsolePace,
   cycleVoiceConsoleStyle,
   effectiveVoiceConsoleBindingProfile,
+  inertVoiceConsoleAlias,
   isVoiceConsoleBindingEditorDirty,
   makeVoiceConsoleCustomId,
   parseVoiceConsoleAlias,
   parseVoiceConsoleCustomId,
   parseVoiceConsoleInteraction,
+  truncateVoiceConsoleText,
   voiceConsolePreviewRequest,
   voiceConsoleVoiceIndex,
   type VoiceConsoleBindingControlOption,
   type VoiceConsoleBindingEditorDraft,
+  type VoiceConsoleComponentRow,
 } from "../packages/core/src/platforms/discord/voice-console-components.js";
+
+function discordComponentJson(rows: ReadonlyArray<VoiceConsoleComponentRow>): unknown[] {
+  return rows.map((row) => {
+    const first = row.components[0];
+    if (first?.kind === "select") {
+      const built = new ActionRowBuilder<StringSelectMenuBuilder>();
+      for (const component of row.components) {
+        if (component.kind !== "select") throw new Error("mixed component row");
+        built.addComponents(
+          new StringSelectMenuBuilder()
+            .setCustomId(component.customId)
+            .setPlaceholder(component.placeholder)
+            .setMinValues(component.minValues)
+            .setMaxValues(component.maxValues)
+            .setDisabled(component.disabled ?? false)
+            .addOptions(component.options.map((option) => ({
+              label: option.label,
+              value: option.value,
+              ...(option.description !== undefined
+                ? { description: option.description }
+                : {}),
+              ...(option.default !== undefined ? { default: option.default } : {}),
+            })))
+        );
+      }
+      return built.toJSON();
+    }
+    const built = new ActionRowBuilder<ButtonBuilder>();
+    for (const component of row.components) {
+      if (component.kind !== "button") throw new Error("mixed component row");
+      built.addComponents(
+        new ButtonBuilder()
+          .setCustomId(component.customId)
+          .setLabel(component.label)
+          .setStyle(buttonStyle(component.style))
+          .setDisabled(component.disabled ?? false)
+      );
+    }
+    return built.toJSON();
+  });
+}
+
+function buttonStyle(style: "primary" | "secondary" | "success" | "danger"): ButtonStyle {
+  switch (style) {
+    case "primary": return ButtonStyle.Primary;
+    case "success": return ButtonStyle.Success;
+    case "danger": return ButtonStyle.Danger;
+    case "secondary": return ButtonStyle.Secondary;
+  }
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function binding(index: number, over: Partial<VoiceConsoleBindingControlOption> = {}): VoiceConsoleBindingControlOption {
   return {
@@ -186,6 +260,56 @@ describe("canonical five-row component layout", () => {
       pageCount: 3,
     })).toThrow(/at most ten/);
   });
+
+  it("keeps astral-heavy component strings inside Discord UTF-16 limits", () => {
+    const astral = "😀".repeat(120);
+    const bindings = Array.from({ length: 10 }, (_, index) => binding(index, {
+      alias: `${astral}${index}`,
+      voice: astral,
+      threadId: astral,
+    }));
+    const rows = buildVoiceConsoleComponentRows({
+      consoleId: "tvc_console",
+      revision: 10,
+      fanoutArmed: true,
+      selectedBindingIds: ["tvb_0", "tvb_1"],
+      bindings,
+      page: 0,
+      pageCount: 2,
+    });
+    const editorRows = buildBindingEditorRows(editor({
+      snapshot: { alias: astral, voice: astral, pace: "natural", style: "neutral" },
+    }));
+
+    for (const component of [...rows, ...editorRows].flatMap((row) => row.components)) {
+      if (component.kind === "button") {
+        expect(component.label.length).toBeLessThanOrEqual(
+          VOICE_CONSOLE_DISCORD_LIMITS.buttonLabel
+        );
+        expect(hasUnpairedSurrogate(component.label)).toBe(false);
+        continue;
+      }
+      expect(component.placeholder.length).toBeLessThanOrEqual(
+        VOICE_CONSOLE_DISCORD_LIMITS.selectPlaceholder
+      );
+      expect(hasUnpairedSurrogate(component.placeholder)).toBe(false);
+      for (const option of component.options) {
+        expect(option.label.length).toBeLessThanOrEqual(
+          VOICE_CONSOLE_DISCORD_LIMITS.selectOptionLabel
+        );
+        expect(option.description?.length ?? 0).toBeLessThanOrEqual(
+          VOICE_CONSOLE_DISCORD_LIMITS.selectOptionDescription
+        );
+        expect(hasUnpairedSurrogate(option.label)).toBe(false);
+        expect(hasUnpairedSurrogate(option.description ?? "")).toBe(false);
+      }
+    }
+
+    expect(() => discordComponentJson(rows)).not.toThrow();
+    expect(() => discordComponentJson(editorRows)).not.toThrow();
+    expect(truncateVoiceConsoleText("😀😀", 3)).toBe("😀…");
+    expect(hasUnpairedSurrogate(truncateVoiceConsoleText("A😀B", 3))).toBe(false);
+  });
 });
 
 describe("confirmation and binding-editor components", () => {
@@ -249,10 +373,29 @@ describe("alias parser", () => {
   it("removes controls, neutralizes mentions, collapses whitespace, and produces a uniqueness key", () => {
     expect(parseVoiceConsoleAlias("  Kanoa\n<@123>  ")).toEqual({
       ok: true,
-      alias: "Kanoa<＠123>",
-      normalized: "kanoa<＠123>",
+      alias: "Kanoa＜＠123＞",
+      normalized: "kanoa＜＠123＞",
     });
     expect(parseVoiceConsoleAlias("@everyone")).toMatchObject({ ok: true, alias: "＠everyone" });
+  });
+
+  it("neutralizes mention, Markdown, code, spoiler, link, and escape syntax", () => {
+    const cases = [
+      ["<#123456789012345678>", "＜＃123456789012345678＞"],
+      ["<@123456789012345678>", "＜＠123456789012345678＞"],
+      ["<@&123456789012345678>", "＜＠&123456789012345678＞"],
+      ["@everyone @here", "＠everyone ＠here"],
+      ["**Admin**", "＊＊Admin＊＊"],
+      ["`code`", "｀code｀"],
+      ["> quote ||spoiler||", "＞ quote ｜｜spoiler｜｜"],
+      ["[Open](https://evil.example)", "［Open］（https：／／evil.example）"],
+      ["\\*escaped\\*", "＼＊escaped＼＊"],
+      ["家族😀 **Admin**", "家族😀 ＊＊Admin＊＊"],
+    ] as const;
+    for (const [raw, expected] of cases) {
+      expect(inertVoiceConsoleAlias(raw)).toBe(expected);
+      expect(parseVoiceConsoleAlias(raw)).toMatchObject({ ok: true, alias: expected });
+    }
   });
 
   it("enforces 1–32 visible characters", () => {

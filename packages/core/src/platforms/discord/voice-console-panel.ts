@@ -12,6 +12,8 @@ import {
   buildVoiceConsoleComponentRows,
   buildVoicePreviewRows,
   effectiveVoiceConsoleBindingProfile,
+  inertVoiceConsoleAlias,
+  truncateVoiceConsoleText,
   voiceConsolePreviewRequest,
   type VoiceConsoleBindingControlOption,
   type VoiceConsoleBindingEditorDraft,
@@ -19,6 +21,15 @@ import {
 } from "./voice-console-components.js";
 
 export const VOICE_CONSOLE_BINDINGS_PER_PAGE = 5;
+export const VOICE_CONSOLE_EMBED_LIMITS = {
+  title: 256,
+  description: 4_096,
+  fieldName: 256,
+  fieldValue: 1_024,
+  footer: 2_048,
+  aggregate: 6_000,
+  fields: 25,
+} as const;
 export const VOICE_CONSOLE_REQUIRED_PERMISSIONS = [
   "ViewChannel",
   "Connect",
@@ -182,7 +193,7 @@ export function renderVoiceConsolePermissionError(input: {
   missing: ReadonlyArray<VoiceConsoleRequiredPermission>;
 }): VoiceConsolePanelSpec {
   const failure = voiceConsolePermissionError(input);
-  return {
+  return constrainVoiceConsolePanel({
     color: 0xed4245,
     title: "🎛️ Shared Voice Console unavailable",
     description: failure.message,
@@ -192,7 +203,7 @@ export function renderVoiceConsolePermissionError(input: {
     ],
     footer: "Startup refused before console creation or lease acquisition.",
     components: [],
-  };
+  });
 }
 
 export function paginateVoiceConsoleBindings<T>(
@@ -267,7 +278,7 @@ export function renderVoiceConsolePanel(state: VoiceConsolePanelState): VoiceCon
     pageCount: page.pageCount,
     ...(!active ? { disabled: true as const } : {}),
   });
-  return {
+  return constrainVoiceConsolePanel({
     color: panelColor(state.lifecycle),
     title: "🎛️ Shared Voice Console",
     ...(fanoutWarning ? { description: fanoutWarning } : {}),
@@ -276,7 +287,7 @@ export function renderVoiceConsolePanel(state: VoiceConsolePanelState): VoiceCon
       `Page ${page.page + 1}/${page.pageCount} · revision ${state.revision} · ` +
       `updated ${state.lastUpdatedUtc}`,
     components,
-  };
+  });
 }
 
 /** Ephemeral slash status; pages retain all shared diagnostics plus five bindings. */
@@ -303,14 +314,14 @@ export function renderVoiceConsoleStatusPages(
         ).join("\n")
       : "None present";
     const bindingFields = page.bindings.map((binding) => ({
-      name: `${selected.has(binding.bindingId) ? "🎯" : "○"} ${safeText(binding.alias)}`,
+      name: `${selected.has(binding.bindingId) ? "🎯" : "○"} ${safeAlias(binding.alias)}`,
       value:
         `<#${binding.threadId}> · \`${safeText(binding.voice)}\` / ` +
         `\`${safeText(binding.pace)}\` / \`${safeText(binding.style)}\`\n` +
         `ACP ${safeText(binding.acpState)} · ${binding.pendingSegments} pending ` +
         `(${binding.pendingCharacters} chars) · ${speechStateLabel(binding.speechState)}`,
     }));
-    return {
+    return constrainVoiceConsolePanel({
       color: panelColor(state.lifecycle),
       title: `🎛️ Shared Voice Console status · ${page.page + 1}/${page.pageCount}`,
       fields: [
@@ -346,7 +357,7 @@ export function renderVoiceConsoleStatusPages(
         {
           name: "Scheduler",
           value: state.schedulerSource
-            ? `${safeText(state.schedulerSource.alias)} / \`${safeText(state.schedulerSource.voice)}\` · queue ${state.schedulerQueueDepth}`
+            ? `${safeAlias(state.schedulerSource.alias)} / \`${safeText(state.schedulerSource.voice)}\` · queue ${state.schedulerQueueDepth}`
             : `Idle · queue ${state.schedulerQueueDepth}`,
           inline: true,
         },
@@ -368,7 +379,7 @@ export function renderVoiceConsoleStatusPages(
         `Shared STT usage is not multiplied by fan-out; ACP/TTS work may be. ` +
         `Updated ${state.lastUpdatedUtc}.`,
       components: [],
-    };
+    });
   });
 }
 
@@ -379,7 +390,7 @@ export function renderVoiceConsoleEndConfirmation(input: {
   pendingSegments: number;
   allowDiscard?: boolean;
 }): VoiceConsolePanelSpec {
-  return {
+  return constrainVoiceConsolePanel({
     color: 0xed4245,
     title: "End Shared Voice Console?",
     description:
@@ -392,7 +403,7 @@ export function renderVoiceConsoleEndConfirmation(input: {
     }],
     footer: "No action is taken until an explicit confirmation is clicked.",
     components: buildEndConsoleConfirmationRows(input),
-  };
+  });
 }
 
 export function renderFanoutDisarmConfirmation(input: {
@@ -400,18 +411,18 @@ export function renderFanoutDisarmConfirmation(input: {
   revision: number;
   selectedBindings: ReadonlyArray<VoiceConsoleBindingPresentation>;
 }): VoiceConsolePanelSpec {
-  return {
+  return constrainVoiceConsolePanel({
     color: 0xfee75c,
     title: "Keep which input target?",
     description:
       "Fan-out remains armed and the current target set remains unchanged until one binding is chosen or this view is cancelled.",
     fields: [{
       name: "Currently selected",
-      value: input.selectedBindings.map((binding) => safeText(binding.alias)).join(" · "),
+      value: input.selectedBindings.map((binding) => safeAlias(binding.alias)).join(" · "),
     }],
     footer: `revision ${input.revision}`,
     components: buildFanoutDisarmConfirmationRows(input),
-  };
+  });
 }
 
 export function renderVoiceConsoleBindingEditor(input: {
@@ -420,26 +431,26 @@ export function renderVoiceConsoleBindingEditor(input: {
 }): VoiceConsolePanelSpec {
   const current = effectiveVoiceConsoleBindingProfile(input.draft);
   const duplicate = input.duplicateVoiceAliases ?? [];
-  return {
+  return constrainVoiceConsolePanel({
     color: 0x5865f2,
-    title: `🎛️ Configure ${safeText(current.alias)}`,
+    title: `🎛️ Configure ${safeAlias(current.alias)}`,
     description:
       "Console-local settings only. This does not change the thread's ordinary `/seam config tts` profile.",
     fields: [
-      { name: "Alias", value: safeText(current.alias), inline: true },
+      { name: "Alias", value: safeAlias(current.alias), inline: true },
       { name: "Voice", value: `\`${safeText(current.voice)}\``, inline: true },
       { name: "Pace", value: `\`${safeText(current.pace)}\``, inline: true },
       { name: "Style", value: `\`${safeText(current.style)}\``, inline: true },
       ...(duplicate.length > 0
         ? [{
             name: "⚠️ Duplicate voice",
-            value: `Also used by ${duplicate.map((alias) => safeText(alias)).join(", ")}. Saving requires confirmation.`,
+            value: `Also used by ${duplicate.map((alias) => safeAlias(alias)).join(", ")}. Saving requires confirmation.`,
           }]
         : []),
     ],
     footer: `Binding ${input.draft.bindingId} · revision ${input.draft.revision}`,
     components: buildBindingEditorRows(input.draft),
-  };
+  });
 }
 
 export function renderVoiceConsoleVoicePreview(input: {
@@ -459,19 +470,19 @@ export function renderVoiceConsoleVoicePreview(input: {
       : input.sampleStatus === "error"
         ? `Preview failed: ${safeText(input.sampleError ?? "unknown error")}`
         : "Choose Play preview to hear this voice.";
-  return {
+  return constrainVoiceConsolePanel({
     color: 0x5865f2,
     title: `🔊 Voice ${index + 1}/${GEMINI_TTS_VOICES.length} · ${voice.name}`,
     description: `**${voice.name}** — *${voice.style}*\n${status}`,
     fields: [{
       name: "Binding",
-      value: safeText(effectiveVoiceConsoleBindingProfile(input.draft).alias),
+      value: safeAlias(effectiveVoiceConsoleBindingProfile(input.draft).alias),
       inline: true,
     }],
     footer: `Preview only · revision ${input.draft.revision}`,
     components: buildVoicePreviewRows(input.draft),
     previewRequest: voiceConsolePreviewRequest(input.draft),
-  };
+  });
 }
 
 export function renderDuplicateVoiceConfirmation(input: {
@@ -479,17 +490,17 @@ export function renderDuplicateVoiceConfirmation(input: {
   duplicateAliases: ReadonlyArray<string>;
 }): VoiceConsolePanelSpec {
   const current = effectiveVoiceConsoleBindingProfile(input.draft);
-  return {
+  return constrainVoiceConsolePanel({
     color: 0xfee75c,
     title: "Use a duplicate console voice?",
     description:
       `\`${safeText(current.voice)}\` is already used by ` +
-      `${input.duplicateAliases.map((alias) => safeText(alias)).join(", ")}. ` +
+      `${input.duplicateAliases.map((alias) => safeAlias(alias)).join(", ")}. ` +
       "Different voices are the normal source-identification mechanism.",
     fields: [],
     footer: "The binding profile is unchanged until confirmed.",
     components: buildDuplicateVoiceConfirmationRows(input.draft),
-  };
+  });
 }
 
 export function renderVoiceConsoleMutationConfirmation(input: {
@@ -497,14 +508,14 @@ export function renderVoiceConsoleMutationConfirmation(input: {
   summary: string;
   revision: number;
 }): VoiceConsolePanelSpec {
-  return {
+  return constrainVoiceConsolePanel({
     color: 0x57f287,
     title: safeText(input.title),
     description: safeText(input.summary),
     fields: [],
     footer: `Saved · revision ${input.revision}`,
     components: [],
-  };
+  });
 }
 
 function inputStateLabel(
@@ -514,7 +525,7 @@ function inputStateLabel(
   if (selected.size === 0) return "**Off**\nMute, then unmute after selecting input.";
   if (selected.size > 1) return `**⚠️ FAN-OUT ×${selected.size}**`;
   const binding = state.bindings.find((candidate) => selected.has(candidate.bindingId));
-  return binding ? `**${safeText(binding.alias)}**` : "**Unavailable target**";
+  return binding ? `**${safeAlias(binding.alias)}**` : "**Unavailable target**";
 }
 
 function outputStateLabel(
@@ -528,7 +539,7 @@ function outputStateLabel(
       ? "**All on**"
       : `**${enabled}/${bindings.length} enabled**`;
   return current
-    ? `${state}\nSpeaking ${safeText(current.alias)} / \`${safeText(current.voice)}\``
+    ? `${state}\nSpeaking ${safeAlias(current.alias)} / \`${safeText(current.voice)}\``
     : state;
 }
 
@@ -563,7 +574,7 @@ function bindingLine(
     ? `${binding.pendingSegments} pending`
     : "no pending";
   return (
-    `${input}${output} **${safeText(binding.alias)}** <#${binding.threadId}> · ` +
+    `${input}${output} **${safeAlias(binding.alias)}** <#${binding.threadId}> · ` +
     `\`${safeText(binding.voice)}\` · ACP ${safeText(binding.acpState)} · ` +
     `${pending} · ${speechStateLabel(binding.speechState)}`
   );
@@ -631,7 +642,121 @@ function safeText(value: string): string {
     .trim();
 }
 
+function safeAlias(value: string): string {
+  return inertVoiceConsoleAlias(value) || "Unnamed binding";
+}
+
 function limit(value: string, max: number): string {
-  const chars = [...value];
-  return chars.length <= max ? value : `${chars.slice(0, Math.max(1, max - 1)).join("")}…`;
+  return truncateVoiceConsoleText(value, max);
+}
+
+/**
+ * Enforce both Discord's per-property limits and its 6,000-unit aggregate
+ * embed budget. The fair cap keeps every field usable on worst-case status
+ * pages instead of consuming the budget on the first oversized value.
+ */
+export function constrainVoiceConsolePanel(
+  spec: VoiceConsolePanelSpec
+): VoiceConsolePanelSpec {
+  const fields = spec.fields
+    .slice(0, VOICE_CONSOLE_EMBED_LIMITS.fields)
+    .map((field) => ({
+      ...field,
+      name: requiredEmbedText(field.name, VOICE_CONSOLE_EMBED_LIMITS.fieldName),
+      value: requiredEmbedText(field.value, VOICE_CONSOLE_EMBED_LIMITS.fieldValue),
+    }));
+  const constrained: VoiceConsolePanelSpec = {
+    color: spec.color,
+    title: requiredEmbedText(spec.title, VOICE_CONSOLE_EMBED_LIMITS.title),
+    ...(spec.description
+      ? {
+          description: truncateVoiceConsoleText(
+            spec.description,
+            VOICE_CONSOLE_EMBED_LIMITS.description
+          ),
+        }
+      : {}),
+    fields,
+    ...(spec.footer
+      ? {
+          footer: truncateVoiceConsoleText(
+            spec.footer,
+            VOICE_CONSOLE_EMBED_LIMITS.footer
+          ),
+        }
+      : {}),
+    components: spec.components,
+    ...(spec.previewRequest ? { previewRequest: spec.previewRequest } : {}),
+  };
+
+  const parts: Array<{
+    value: string;
+    minimum: number;
+    assign: (value: string) => void;
+  }> = [
+    {
+      value: constrained.title,
+      minimum: 1,
+      assign: (value) => { constrained.title = value; },
+    },
+  ];
+  if (constrained.description !== undefined) {
+    parts.push({
+      value: constrained.description,
+      minimum: 0,
+      assign: (value) => {
+        if (value) constrained.description = value;
+        else delete constrained.description;
+      },
+    });
+  }
+  for (const field of constrained.fields) {
+    parts.push(
+      {
+        value: field.name,
+        minimum: 1,
+        assign: (value) => { field.name = value || "\u200B"; },
+      },
+      {
+        value: field.value,
+        minimum: 1,
+        assign: (value) => { field.value = value || "\u200B"; },
+      }
+    );
+  }
+  if (constrained.footer !== undefined) {
+    parts.push({
+      value: constrained.footer,
+      minimum: 0,
+      assign: (value) => {
+        if (value) constrained.footer = value;
+        else delete constrained.footer;
+      },
+    });
+  }
+
+  if (parts.reduce((sum, part) => sum + part.value.length, 0) <= VOICE_CONSOLE_EMBED_LIMITS.aggregate) {
+    return constrained;
+  }
+
+  let low = 0;
+  let high = Math.max(...parts.map((part) => part.value.length));
+  while (low < high) {
+    const candidate = Math.ceil((low + high) / 2);
+    const total = parts.reduce(
+      (sum, part) => sum + Math.min(part.value.length, Math.max(part.minimum, candidate)),
+      0
+    );
+    if (total <= VOICE_CONSOLE_EMBED_LIMITS.aggregate) low = candidate;
+    else high = candidate - 1;
+  }
+  for (const part of parts) {
+    const target = Math.min(part.value.length, Math.max(part.minimum, low));
+    part.assign(truncateVoiceConsoleText(part.value, target));
+  }
+  return constrained;
+}
+
+function requiredEmbedText(value: string, maxUnits: number): string {
+  return truncateVoiceConsoleText(value, maxUnits) || "\u200B";
 }

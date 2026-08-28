@@ -18,6 +18,73 @@ export const VOICE_CONSOLE_CUSTOM_ID_MAX = 100;
 export const VOICE_CONSOLE_BINDING_LIMIT = 10;
 export const VOICE_CONSOLE_FANOUT_LIMIT = 5;
 
+/** Discord measures these limits in JavaScript UTF-16 code units. */
+export const VOICE_CONSOLE_DISCORD_LIMITS = {
+  selectOptionLabel: 100,
+  selectOptionDescription: 100,
+  selectPlaceholder: 150,
+  buttonLabel: 80,
+  modalTitle: 45,
+  modalFieldLabel: 45,
+} as const;
+
+const ALIAS_REPLACEMENTS = new Map<string, string>([
+  ["\\", "＼"],
+  ["`", "｀"],
+  ["*", "＊"],
+  ["_", "＿"],
+  ["~", "～"],
+  ["|", "｜"],
+  ["[", "［"],
+  ["]", "］"],
+  ["(", "（"],
+  [")", "）"],
+  ["<", "＜"],
+  [">", "＞"],
+  ["@", "＠"],
+  ["#", "＃"],
+  ["+", "＋"],
+  ["-", "－"],
+  ["!", "！"],
+  [":", "："],
+  ["/", "／"],
+]);
+
+/**
+ * Truncate by UTF-16 units, matching Discord, without leaving half of a
+ * surrogate pair at the cut. A single-unit ellipsis makes truncation visible.
+ */
+export function truncateVoiceConsoleText(value: string, maxUnits: number): string {
+  const max = Math.max(0, Math.trunc(maxUnits));
+  if (value.length <= max) return value;
+  if (max === 0) return "";
+  const suffix = "…";
+  let end = Math.max(0, max - suffix.length);
+  if (
+    end > 0 &&
+    isHighSurrogate(value.charCodeAt(end - 1)) &&
+    isLowSurrogate(value.charCodeAt(end))
+  ) {
+    end -= 1;
+  }
+  return `${value.slice(0, end)}${suffix}`;
+}
+
+/**
+ * Presentation-safe alias text. Full-width replacements make Discord mention,
+ * Markdown, spoiler, link, and escape syntax inert without hiding the input.
+ */
+export function inertVoiceConsoleAlias(input: string): string {
+  const visible = input
+    .normalize("NFKC")
+    .replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u206F]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return [...visible]
+    .map((character) => ALIAS_REPLACEMENTS.get(character) ?? character)
+    .join("");
+}
+
 export const VOICE_CONSOLE_ACTIONS = [
   "input",
   "output",
@@ -362,7 +429,13 @@ export function buildVoiceConsoleComponentRows(
     button(state, "end", "End console…", "danger", disabled)
   );
 
-  return [inputRow, outputRow, configureRow, safetyRow, { components: navigation }];
+  return constrainComponentRows([
+    inputRow,
+    outputRow,
+    configureRow,
+    safetyRow,
+    { components: navigation },
+  ]);
 }
 
 export function buildEndConsoleConfirmationRows(opts: {
@@ -378,7 +451,7 @@ export function buildEndConsoleConfirmationRows(opts: {
     buttons.push(simpleButton(state, "end-discard", "End and discard eligible pending", "danger"));
   }
   buttons.push(simpleButton(state, "end-cancel", "Cancel", "secondary"));
-  return [{ components: buttons }];
+  return constrainComponentRows([{ components: buttons }]);
 }
 
 export function buildFanoutDisarmConfirmationRows(opts: {
@@ -389,7 +462,7 @@ export function buildFanoutDisarmConfirmationRows(opts: {
   if (opts.selectedBindings.length < 2) {
     throw new Error("fan-out disarm confirmation requires several selected bindings");
   }
-  return [
+  return constrainComponentRows([
     {
       components: [{
         kind: "select",
@@ -403,7 +476,7 @@ export function buildFanoutDisarmConfirmationRows(opts: {
     {
       components: [simpleButton(opts, "fanout-cancel", "Cancel", "secondary")],
     },
-  ];
+  ]);
 }
 
 export function effectiveVoiceConsoleBindingProfile(
@@ -449,10 +522,15 @@ export function buildBindingEditorRows(
 ): VoiceConsoleComponentRow[] {
   const current = effectiveVoiceConsoleBindingProfile(draft);
   const base = editorIdBase(draft);
-  return [
+  return constrainComponentRows([
     {
       components: [
-        editorButton(base, "edit-alias", `Alias: ${truncate(current.alias, 40)}`, "secondary"),
+        editorButton(
+          base,
+          "edit-alias",
+          `Alias: ${truncate(inertVoiceConsoleAlias(current.alias), 40)}`,
+          "secondary"
+        ),
         editorButton(base, "edit-voice", `Voice: ${current.voice}`, "secondary"),
       ],
     },
@@ -474,7 +552,7 @@ export function buildBindingEditorRows(
         editorButton(base, "edit-cancel", "Cancel", "secondary"),
       ],
     },
-  ];
+  ]);
 }
 
 export function buildVoicePreviewRows(
@@ -484,7 +562,7 @@ export function buildVoicePreviewRows(
   const voice = GEMINI_TTS_VOICES[index]!;
   const current = effectiveVoiceConsoleBindingProfile(draft);
   const base = editorIdBase(draft);
-  return [
+  return constrainComponentRows([
     {
       components: [
         editorButton(base, "voice-prev", "◀ Previous", "secondary", index === 0),
@@ -510,19 +588,19 @@ export function buildVoicePreviewRows(
         editorButton(base, "voice-back", "Back", "secondary"),
       ],
     },
-  ];
+  ]);
 }
 
 export function buildDuplicateVoiceConfirmationRows(
   draft: VoiceConsoleBindingEditorDraft
 ): VoiceConsoleComponentRow[] {
   const base = editorIdBase(draft);
-  return [{
+  return constrainComponentRows([{
     components: [
       editorButton(base, "duplicate-confirm", "Use duplicate voice", "danger"),
       editorButton(base, "duplicate-cancel", "Choose another voice", "secondary"),
     ],
-  }];
+  }]);
 }
 
 export function buildVoiceConsoleAliasModal(
@@ -535,12 +613,18 @@ export function buildVoiceConsoleAliasModal(
       "alias-save",
       draft.bindingId
     ),
-    title: "Edit binding alias",
+    title: truncateVoiceConsoleText(
+      "Edit binding alias",
+      VOICE_CONSOLE_DISCORD_LIMITS.modalTitle
+    ),
     fields: [{
       customId: "alias",
-      label: "Alias (unique in this console)",
+      label: truncateVoiceConsoleText(
+        "Alias (unique in this console)",
+        VOICE_CONSOLE_DISCORD_LIMITS.modalFieldLabel
+      ),
       style: "short",
-      value: effectiveVoiceConsoleBindingProfile(draft).alias,
+      value: inertVoiceConsoleAlias(effectiveVoiceConsoleBindingProfile(draft).alias),
       minLength: 1,
       maxLength: 32,
       required: true,
@@ -552,14 +636,9 @@ export type VoiceConsoleAliasResult =
   | { ok: true; alias: string; normalized: string }
   | { ok: false; error: "Alias must contain 1–32 visible characters." };
 
-/** Remove controls and neutralize Discord mention syntax before persistence/display. */
+/** Remove controls and neutralize Discord mention/Markdown syntax before persistence/display. */
 export function parseVoiceConsoleAlias(input: string): VoiceConsoleAliasResult {
-  const visible = input
-    .normalize("NFKC")
-    .replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u206F]/g, "")
-    .replace(/@/g, "＠")
-    .replace(/\s+/g, " ")
-    .trim();
+  const visible = inertVoiceConsoleAlias(input);
   const characters = [...visible];
   if (characters.length < 1 || characters.length > 32) {
     return { ok: false, error: "Alias must contain 1–32 visible characters." };
@@ -630,22 +709,20 @@ function validateControlState(state: VoiceConsoleControlState): void {
 
 function bindingOption(binding: VoiceConsoleBindingControlOption): VoiceConsoleSelectOption {
   return {
-    label: truncate(safeLabel(binding.alias), 100),
+    label: truncateVoiceConsoleText(
+      inertVoiceConsoleAlias(binding.alias) || "Unnamed binding",
+      VOICE_CONSOLE_DISCORD_LIMITS.selectOptionLabel
+    ),
     value: binding.bindingId,
-    description: truncate(`${binding.voice} · thread ${binding.threadId}`, 100),
+    description: truncateVoiceConsoleText(
+      `${binding.voice} · thread ${binding.threadId}`,
+      VOICE_CONSOLE_DISCORD_LIMITS.selectOptionDescription
+    ),
   };
 }
 
-function safeLabel(value: string): string {
-  return value
-    .replace(/[\u0000-\u001F\u007F-\u009F]/g, "")
-    .replace(/@/g, "＠")
-    .trim() || "Unnamed binding";
-}
-
 function truncate(value: string, max: number): string {
-  const chars = [...value];
-  return chars.length <= max ? value : `${chars.slice(0, Math.max(1, max - 1)).join("")}…`;
+  return truncateVoiceConsoleText(value, max);
 }
 
 function button(
@@ -668,7 +745,7 @@ function simpleButton(
   return {
     kind: "button",
     customId: makeVoiceConsoleCustomId(state.consoleId, state.revision, action),
-    label,
+    label: truncateVoiceConsoleText(label, VOICE_CONSOLE_DISCORD_LIMITS.buttonLabel),
     style,
     ...(disabled ? { disabled: true as const } : {}),
   };
@@ -701,7 +778,7 @@ function editorButton(
       action,
       state.bindingId
     ),
-    label,
+    label: truncateVoiceConsoleText(label, VOICE_CONSOLE_DISCORD_LIMITS.buttonLabel),
     style,
     ...(disabled ? { disabled: true as const } : {}),
   };
@@ -719,4 +796,52 @@ function disabledPlaceholderRow(
 function clampVoiceIndex(index: number): number {
   if (!Number.isFinite(index)) return 0;
   return Math.min(Math.max(0, Math.trunc(index)), GEMINI_TTS_VOICES.length - 1);
+}
+
+function constrainComponentRows(
+  rows: ReadonlyArray<VoiceConsoleComponentRow>
+): VoiceConsoleComponentRow[] {
+  return rows.slice(0, 5).map((row) => ({
+    components: row.components.slice(0, 5).map((component) => {
+      if (component.kind === "button") {
+        return {
+          ...component,
+          label: truncateVoiceConsoleText(
+            component.label,
+            VOICE_CONSOLE_DISCORD_LIMITS.buttonLabel
+          ),
+        };
+      }
+      return {
+        ...component,
+        placeholder: truncateVoiceConsoleText(
+          component.placeholder,
+          VOICE_CONSOLE_DISCORD_LIMITS.selectPlaceholder
+        ),
+        options: component.options.slice(0, 25).map((option) => ({
+          ...option,
+          label: truncateVoiceConsoleText(
+            option.label,
+            VOICE_CONSOLE_DISCORD_LIMITS.selectOptionLabel
+          ),
+          ...(option.description !== undefined
+            ? {
+                description: truncateVoiceConsoleText(
+                  option.description,
+                  VOICE_CONSOLE_DISCORD_LIMITS.selectOptionDescription
+                ),
+              }
+            : {}),
+        })),
+      };
+    }),
+  }));
+}
+
+function isHighSurrogate(unit: number): boolean {
+  return unit >= 0xd800 && unit <= 0xdbff;
+}
+
+function isLowSurrogate(unit: number): boolean {
+  return unit >= 0xdc00 && unit <= 0xdfff;
 }

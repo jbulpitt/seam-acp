@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+  StringSelectMenuBuilder,
+} from "discord.js";
+import {
+  VOICE_CONSOLE_EMBED_LIMITS,
   VOICE_CONSOLE_REQUIRED_PERMISSIONS,
   paginateVoiceConsoleBindings,
   renderDuplicateVoiceConfirmation,
@@ -15,11 +23,102 @@ import {
   type VoiceConsoleBindingPresentation,
   type VoiceConsoleDiagnosticState,
   type VoiceConsolePanelState,
+  type VoiceConsolePanelSpec,
 } from "../packages/core/src/platforms/discord/voice-console-panel.js";
 import {
+  inertVoiceConsoleAlias,
   voiceConsoleVoiceIndex,
   type VoiceConsoleBindingEditorDraft,
+  type VoiceConsoleComponentRow,
 } from "../packages/core/src/platforms/discord/voice-console-components.js";
+
+function discordPanelJson(panel: VoiceConsolePanelSpec) {
+  const embed = new EmbedBuilder().setColor(panel.color).setTitle(panel.title);
+  if (panel.description !== undefined) embed.setDescription(panel.description);
+  if (panel.fields.length > 0) {
+    embed.addFields(panel.fields.map((field) => ({
+      name: field.name,
+      value: field.value,
+      ...(field.inline !== undefined ? { inline: field.inline } : {}),
+    })));
+  }
+  if (panel.footer !== undefined) embed.setFooter({ text: panel.footer });
+  return {
+    embed: embed.toJSON(),
+    components: discordComponentJson(panel.components),
+  };
+}
+
+function discordComponentJson(rows: ReadonlyArray<VoiceConsoleComponentRow>): unknown[] {
+  return rows.map((row) => {
+    const first = row.components[0];
+    if (first?.kind === "select") {
+      const built = new ActionRowBuilder<StringSelectMenuBuilder>();
+      for (const component of row.components) {
+        if (component.kind !== "select") throw new Error("mixed component row");
+        built.addComponents(
+          new StringSelectMenuBuilder()
+            .setCustomId(component.customId)
+            .setPlaceholder(component.placeholder)
+            .setMinValues(component.minValues)
+            .setMaxValues(component.maxValues)
+            .setDisabled(component.disabled ?? false)
+            .addOptions(component.options.map((option) => ({
+              label: option.label,
+              value: option.value,
+              ...(option.description !== undefined
+                ? { description: option.description }
+                : {}),
+              ...(option.default !== undefined ? { default: option.default } : {}),
+            })))
+        );
+      }
+      return built.toJSON();
+    }
+    const built = new ActionRowBuilder<ButtonBuilder>();
+    for (const component of row.components) {
+      if (component.kind !== "button") throw new Error("mixed component row");
+      built.addComponents(
+        new ButtonBuilder()
+          .setCustomId(component.customId)
+          .setLabel(component.label)
+          .setStyle(buttonStyle(component.style))
+          .setDisabled(component.disabled ?? false)
+      );
+    }
+    return built.toJSON();
+  });
+}
+
+function buttonStyle(style: "primary" | "secondary" | "success" | "danger"): ButtonStyle {
+  switch (style) {
+    case "primary": return ButtonStyle.Primary;
+    case "success": return ButtonStyle.Success;
+    case "danger": return ButtonStyle.Danger;
+    case "secondary": return ButtonStyle.Secondary;
+  }
+}
+
+function embedTextUnits(embed: ReturnType<EmbedBuilder["toJSON"]>): number {
+  return (embed.title?.length ?? 0) +
+    (embed.description?.length ?? 0) +
+    (embed.fields ?? []).reduce((sum, field) => sum + field.name.length + field.value.length, 0) +
+    (embed.footer?.text.length ?? 0);
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function binding(index: number, over: Partial<VoiceConsoleBindingPresentation> = {}): VoiceConsoleBindingPresentation {
   return {
@@ -206,6 +305,144 @@ describe("paginated diagnostic status", () => {
     expect(pages[0]!.fields.some((field) => field.name.includes("Thread 0"))).toBe(true);
     expect(pages[0]!.fields.some((field) => field.name.includes("Thread 5"))).toBe(false);
     expect(pages[1]!.fields.some((field) => field.name.includes("Thread 5"))).toBe(true);
+  });
+
+  it("fits worst-case five-binding pages inside every Discord embed limit", () => {
+    const astral = "😀".repeat(3_000);
+    const bindings = Array.from({ length: 10 }, (_, index) => binding(index, {
+      alias: `${astral}${index}`,
+      voice: astral,
+      pace: astral,
+      style: astral,
+      acpState: astral,
+    }));
+    const hostile = state({
+      runtimeState: astral,
+      connectionState: astral,
+      bindings,
+      currentSpeaking: { alias: astral, voice: astral },
+      lastUpdatedUtc: astral,
+    });
+    const diagnostic: VoiceConsoleDiagnosticState = {
+      ...hostile,
+      uptimeMs: 3_661_000,
+      transmittedAudioBytes: 4_000_000,
+      activeLaneCount: 2,
+      schedulerQueueDepth: 99,
+      schedulerSource: { alias: astral, voice: astral },
+      leaseHolder: { kind: astral, sessionId: astral },
+      cardJumpUrl: `https://discord.com/${astral}`,
+    };
+    const panels = [
+      renderVoiceConsolePanel(hostile),
+      ...renderVoiceConsoleStatusPages(diagnostic),
+    ];
+
+    for (const panel of panels) {
+      const built = discordPanelJson(panel);
+      expect(built.embed.title?.length ?? 0).toBeLessThanOrEqual(
+        VOICE_CONSOLE_EMBED_LIMITS.title
+      );
+      expect(built.embed.description?.length ?? 0).toBeLessThanOrEqual(
+        VOICE_CONSOLE_EMBED_LIMITS.description
+      );
+      expect(built.embed.footer?.text.length ?? 0).toBeLessThanOrEqual(
+        VOICE_CONSOLE_EMBED_LIMITS.footer
+      );
+      for (const field of built.embed.fields ?? []) {
+        expect(field.name.length).toBeLessThanOrEqual(VOICE_CONSOLE_EMBED_LIMITS.fieldName);
+        expect(field.value.length).toBeLessThanOrEqual(VOICE_CONSOLE_EMBED_LIMITS.fieldValue);
+      }
+      expect(embedTextUnits(built.embed)).toBeLessThanOrEqual(
+        VOICE_CONSOLE_EMBED_LIMITS.aggregate
+      );
+      const strings = [
+        built.embed.title ?? "",
+        built.embed.description ?? "",
+        built.embed.footer?.text ?? "",
+        ...(built.embed.fields ?? []).flatMap((field) => [field.name, field.value]),
+      ];
+      expect(strings.some(hasUnpairedSurrogate)).toBe(false);
+    }
+  });
+});
+
+describe("inert alias presentation", () => {
+  it("neutralizes spoofing and Markdown across every card/editor alias surface", () => {
+    const aliases = [
+      "<#123456789012345678>",
+      "**Admin**",
+      "`code`",
+      "[Open](https://evil.example)",
+      "<@123456789012345678>",
+      "<@&123456789012345678>",
+      "@everyone",
+      "@here",
+      "> quote",
+      "||spoiler|| 家族😀",
+    ];
+    const bindings = aliases.map((alias, index) => binding(index, { alias }));
+    const shared = state({
+      bindings,
+      page: 0,
+      currentSpeaking: { alias: aliases[3]!, voice: "Kore" },
+    });
+    const diagnostic: VoiceConsoleDiagnosticState = {
+      ...shared,
+      uptimeMs: 1,
+      transmittedAudioBytes: 1,
+      activeLaneCount: 0,
+      schedulerQueueDepth: 0,
+      schedulerSource: { alias: aliases[5]!, voice: "Kore" },
+      leaseHolder: { kind: "thread_voice", sessionId: "tvc_console" },
+      cardJumpUrl: null,
+    };
+    const hostileDraft: VoiceConsoleBindingEditorDraft = {
+      ...editor(),
+      snapshot: {
+        alias: aliases[3]!,
+        voice: "Kore",
+        pace: "natural",
+        style: "neutral",
+      },
+    };
+    const rendered = [
+      renderVoiceConsolePanel(shared),
+      renderVoiceConsolePanel({ ...shared, page: 1 }),
+      ...renderVoiceConsoleStatusPages(diagnostic),
+      renderVoiceConsoleBindingEditor({
+        draft: hostileDraft,
+        duplicateVoiceAliases: aliases,
+      }),
+      renderVoiceConsoleVoicePreview({ draft: hostileDraft }),
+      renderDuplicateVoiceConfirmation({ draft: hostileDraft, duplicateAliases: aliases }),
+      renderFanoutDisarmConfirmation({
+        consoleId: "tvc_console",
+        revision: 12,
+        selectedBindings: bindings.slice(0, 2),
+      }),
+    ];
+    for (const panel of rendered) discordPanelJson(panel);
+    const serialized = JSON.stringify(rendered);
+
+    for (const alias of aliases) {
+      expect(serialized).toContain(inertVoiceConsoleAlias(alias));
+    }
+    for (const activeSyntax of [
+      "<#123456789012345678>",
+      "<@123456789012345678>",
+      "<@&123456789012345678>",
+      "@everyone",
+      "@here",
+      "**Admin**",
+      "`code`",
+      "[Open](https://evil.example)",
+      "https://evil.example",
+      "> quote",
+      "||spoiler||",
+    ]) {
+      expect(serialized).not.toContain(activeSyntax);
+    }
   });
 });
 

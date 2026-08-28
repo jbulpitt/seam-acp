@@ -23,13 +23,15 @@ describe("thread_voice dispatch schema", () => {
       kind: "thread_voice",
       authorId: "user-1",
       authorName: "Jesse",
-      threadVoiceSessionId: "tv-1",
+      voiceConsoleId: "tvc-1",
+      voiceConsoleBindingId: "tvb-1",
     }))).toMatchObject({
       id: "tvd-1",
       kind: "thread_voice",
       authorId: "user-1",
       authorName: "Jesse",
-      threadVoiceSessionId: "tv-1",
+      voiceConsoleId: "tvc-1",
+      voiceConsoleBindingId: "tvb-1",
       session: "live",
     });
   });
@@ -37,15 +39,25 @@ describe("thread_voice dispatch schema", () => {
   it("rejects missing trusted fields and isolated Thread Voice runs", () => {
     expect(() => parseDispatchSpec("bad-1", JSON.stringify({
       ...base, kind: "thread_voice", authorId: "user-1",
-    }))).toThrow(/requires authorId, authorName, and threadVoiceSessionId/);
+    }))).toThrow(/requires authorId\/authorName plus either voiceConsoleId\/voiceConsoleBindingId/);
     expect(() => parseDispatchSpec("bad-2", JSON.stringify({
       ...base,
       session: "isolated",
       kind: "thread_voice",
       authorId: "user-1",
       authorName: "Jesse",
-      threadVoiceSessionId: "tv-1",
+      voiceConsoleId: "tvc-1",
+      voiceConsoleBindingId: "tvb-1",
     }))).toThrow(/must use the live session/);
+    expect(() => parseDispatchSpec("bad-3", JSON.stringify({
+      ...base,
+      kind: "thread_voice",
+      authorId: "user-1",
+      authorName: "Jesse",
+      voiceConsoleId: "tvc-1",
+      voiceConsoleBindingId: "tvb-1",
+      threadVoiceSessionId: "tv-legacy",
+    }))).toThrow(/either V2 console\/binding ids or a legacy session id, not both/);
   });
 
   it("rejects speaker metadata on arbitrary dispatch kinds", () => {
@@ -66,39 +78,81 @@ describe("trusted Thread Voice dispatch boundary", () => {
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-thread-voice-dispatch-"));
     store = new SessionStore(path.join(dir, "test.db"));
-    store.insertThreadVoiceSession({
-      id: "tv_trusted",
+    store.createVoiceConsole({
+      console: {
+        id: "tvc_trusted",
+        platform: "discord",
+        guildId: "guild-1",
+        voiceChannelId: "vc-1",
+        ownerUserId: "admin-1",
+        ownerName: "Admin",
+        status: "ready",
+        cardChannelId: "vc-1",
+        cardMessageId: "card-1",
+        cardPage: 0,
+        revision: 1,
+        fanoutArmed: false,
+        forwardedAudioBytes: 0,
+        forwardedAudioMs: 0,
+        utteranceCount: 0,
+        liveFinalCount: 0,
+        unaryFallbackCount: 0,
+        droppedCount: 0,
+        sttFailureCount: 0,
+        createdUtc: base.createdUtc,
+        updatedUtc: base.createdUtc,
+        endedUtc: null,
+        endReason: null,
+      },
+      binding: {
+      id: "tvb_trusted",
+      consoleId: "tvc_trusted",
       platform: "discord",
       channelRef: "thread-1",
       parentRef: "channel-1",
       guildId: "guild-1",
       voiceChannelId: "vc-1",
-      ownerUserId: "user-1",
-      ownerName: "Jesse",
-      status: "ready",
+      ownerUserId: "admin-1",
+      ownerName: "Admin",
+      status: "active",
       noticeMessageId: null,
-      transmittedAudioMs: 0,
+      alias: "Trusted",
+      aliasNormalized: "trusted",
+      ttsVoice: "Kore",
+      ttsPace: "natural",
+      ttsStyle: "neutral",
+      profileUpdatedUtc: base.createdUtc,
+      outputEnabled: true,
+      outputGeneration: 0,
       createdUtc: base.createdUtc,
       updatedUtc: base.createdUtc,
       endedUtc: null,
       endReason: null,
+      },
+      selectBinding: true,
     });
-    store.appendThreadVoiceSegment({
-      id: "tvs_trusted",
-      sessionId: "tv_trusted",
-      sequence: 1,
-      authorId: "user-1",
-      transcript: "voice prompt",
-      state: "pending",
-      audioMs: 200,
-      dispatchId: null,
+    const capture = store.allocateVoiceConsoleCapture({
+      consoleId: "tvc_trusted",
+      captureId: "capture-1",
+      speakerId: "user-1",
+      speakerName: "Jesse",
       capturedStartedUtc: "start",
+    })!;
+    store.finalizeVoiceConsoleCapture({
+      captureId: capture.captureId,
+      consoleId: capture.consoleId,
+      speakerId: "user-1",
+      capturedStartedUtc: capture.capturedStartedUtc,
+      targets: capture.assignments.map(({ bindingId, sequence }) => ({ bindingId, sequence })),
+      speakerName: "Jesse",
+      transcript: "voice prompt",
+      audioMs: 200,
       capturedEndedUtc: "end",
-      createdUtc: base.createdUtc,
-      updatedUtc: base.createdUtc,
-      error: null,
+      speakerAuthorized: true,
+      resultSource: "live",
+      forwardedAudioMs: 100,
     });
-    batchPrompt = store.claimPendingThreadVoiceBatch("tv_trusted", "tvd-1")!.prompt;
+    batchPrompt = store.claimPendingVoiceConsoleBatch("tvb_trusted", "tvd-1")!.prompt;
     abortTurn = vi.fn(async () => "cancelled");
     const router = {
       listProfiles: () => [],
@@ -132,9 +186,12 @@ describe("trusted Thread Voice dispatch boundary", () => {
       renderer: {} as any,
     });
     markDispatchSettled = vi.fn(async () => {});
-    orch.setThreadVoiceManager({
+    orch.setVoiceConsoleManager({
       markDispatchSettled,
       releaseIfIdle: vi.fn(async () => false),
+    } as any, {
+      hasActiveBinding: () => false,
+      markBindingActivitySettled: vi.fn(async () => {}),
     } as any);
   });
 
@@ -151,7 +208,8 @@ describe("trusted Thread Voice dispatch boundary", () => {
       kind: "thread_voice",
       authorId: "user-1",
       authorName: "Jesse",
-      threadVoiceSessionId: "tv_trusted",
+      voiceConsoleId: "tvc_trusted",
+      voiceConsoleBindingId: "tvb_trusted",
       ...over,
     };
   }
@@ -161,7 +219,7 @@ describe("trusted Thread Voice dispatch boundary", () => {
     (orch as any).handleIncomingMessageInner = inner;
 
     await expect(orch.dispatchInjectTurn(trusted({ authorName: "Mallory" }))).rejects.toThrow(
-      /does not match its durable batch owner/
+      /does not match its durable console batch/
     );
 
     expect(inner).not.toHaveBeenCalled();
@@ -205,6 +263,6 @@ describe("trusted Thread Voice dispatch boundary", () => {
     await expect(voiceTurn).resolves.toEqual({ output: "", stopReason: "end_turn" });
     await typedTurn;
     expect(seen.map((message) => message.text)).toEqual([batchPrompt, "typed correction"]);
-    expect(markDispatchSettled).toHaveBeenCalledWith("tv_trusted", "tvd-1");
+    expect(markDispatchSettled).toHaveBeenCalledWith("tvb_trusted", "tvd-1");
   });
 });

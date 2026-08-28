@@ -20,7 +20,7 @@ import {
  *     upload   (3)  pull push secret  — admin-only; hard cutover of /seam attach
  *     bridge   (4)  add rotate list remove  — admin-only pairing (#83/#86)
  *     debug    (6)  tail exec status voice-ping voice-capture voice-live — admin-only even when SEAM_BRIDGE_DEV (#83)
- *     voice    (3)  start stop status — Thread Voice v1, admin-only
+ *     voice    (7)  start add remove configure console status stop — Voice Console V2, admin-only
  */
 export function buildSeamCommand(): SlashCommandBuilder {
   const cmd = new SlashCommandBuilder()
@@ -826,27 +826,84 @@ export function buildSeamCommand(): SlashCommandBuilder {
   cmd.addSubcommandGroup((g) =>
     g
       .setName("voice")
-      .setDescription("Admin-only Thread Voice binding for this ACP thread")
+      .setDescription("Admin-only Shared Voice Console")
       .addSubcommand((sub) =>
         sub
           .setName("start")
-          .setDescription("Bind this thread to your current self-muted voice channel")
+          .setDescription("Create a console in your current self-muted voice channel")
+          .addStringOption((o) =>
+            o.setName("alias").setDescription("Presentation alias for this thread binding").setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("add")
+          .setDescription("Add this thread to your active console")
+          .addStringOption((o) =>
+            o.setName("alias").setDescription("Presentation alias for this thread binding").setRequired(false)
+          )
+          .addBooleanOption((o) =>
+            o.setName("claim").setDescription("Select this binding for the next utterance (default true)").setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("remove")
+          .setDescription("Remove this thread binding; finalized text is preserved by default")
+          .addBooleanOption((o) =>
+            o.setName("discard-pending").setDescription("Discard artifact-free finalized text").setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("configure")
+          .setDescription("Configure this binding's console-local alias and speech profile")
+          .addStringOption((o) =>
+            o.setName("alias").setDescription("Unique presentation alias").setRequired(false)
+          )
+          .addStringOption((o) =>
+            o.setName("voice").setDescription("Gemini TTS voice").setRequired(false).setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o.setName("pace").setDescription("Speech pace").setRequired(false)
+              .addChoices(
+                { name: "slow", value: "slow" },
+                { name: "natural", value: "natural" },
+                { name: "fast", value: "fast" }
+              )
+          )
+          .addStringOption((o) =>
+            o.setName("style").setDescription("Speech style").setRequired(false)
+              .addChoices(
+                { name: "neutral", value: "neutral" },
+                { name: "warm", value: "warm" },
+                { name: "clear", value: "clear" }
+              )
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("console")
+          .setDescription("Show or repost the canonical VC-chat control card")
+          .addBooleanOption((o) =>
+            o.setName("repost").setDescription("Replace the canonical card in the same VC chat").setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("status")
+          .setDescription("Show console, speaker, binding, scheduler, lease, and usage diagnostics")
       )
       .addSubcommand((sub) =>
         sub
           .setName("stop")
-          .setDescription("Stop Thread Voice; finalized pending text is preserved by default")
+          .setDescription("Stop the console; finalized pending text is preserved by default")
           .addBooleanOption((o) =>
             o
               .setName("discard-pending")
               .setDescription("Delete finalized text that has not been dispatched (default false)")
               .setRequired(false)
           )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("status")
-          .setDescription("Show the Thread Voice owner, channel, runtime, usage, pending, and dispatch")
       )
   );
 

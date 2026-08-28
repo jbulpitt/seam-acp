@@ -22,6 +22,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
   AttachmentBuilder,
+  PermissionFlagsBits,
   type Message,
   type TextChannel,
   type ThreadChannel,
@@ -32,7 +33,17 @@ import {
   type ModalSubmitInteraction,
   type StringSelectMenuInteraction,
   type MessageCreateOptions,
+  type VoiceBasedChannel,
+  type VoiceState,
 } from "discord.js";
+import {
+  VoiceConnectionStatus,
+  entersState,
+  getVoiceConnection,
+  joinVoiceChannel,
+  type DiscordGatewayAdapterCreator,
+  type VoiceConnection,
+} from "@discordjs/voice";
 import type {
   RequestPermissionRequest,
   RequestPermissionResponse,
@@ -82,6 +93,24 @@ import type {
 import type { TtsPcm } from "../../core/thread-voice/types.js";
 import { DiscordThreadVoiceCall } from "./thread-voice-call.js";
 import { ThreadVoiceCaptureCoordinator } from "./thread-voice-host.js";
+import {
+  DiscordVoiceConsoleCaptureHost,
+  type VoiceConsoleCaptureHostDependencies,
+  type VoiceConsoleInitialSpeaker,
+} from "./voice-console-capture.js";
+import type {
+  VoiceConsoleCapturePersistencePort,
+  VoiceConsoleCaptureRouterCallbacks,
+} from "../../core/voice-console/capture-router.js";
+import { DiscordVoiceConsolePlayback } from "./voice-console-playback.js";
+import type {
+  VoiceConsoleComponentRow,
+  VoiceConsoleModalSpec,
+} from "./voice-console-components.js";
+import type {
+  VoiceConsolePanelSpec,
+  VoiceConsoleRequiredPermission,
+} from "./voice-console-panel.js";
 
 export type DiscordFileSend = {
   data: Buffer;
@@ -90,6 +119,45 @@ export type DiscordFileSend = {
   caption?: string;
   voiceMessage?: { durationSeconds: number; waveform: string };
 };
+
+export interface VoiceConsoleStartInspection {
+  ok: true;
+  guildId: string;
+  voiceChannelId: string;
+  channelName: string | null;
+  selfMuted: boolean;
+  visible: boolean;
+  missingPermissions: VoiceConsoleRequiredPermission[];
+  initialSpeakers: VoiceConsoleInitialSpeaker[];
+}
+
+export type VoiceConsoleStartInspectionResult =
+  | VoiceConsoleStartInspection
+  | { ok: false; reason: string };
+
+export interface DiscordVoiceConsoleTransport {
+  connection: VoiceConnection;
+  captureHost: DiscordVoiceConsoleCaptureHost;
+  playback: DiscordVoiceConsolePlayback;
+  destroyConnection: () => void;
+}
+
+export interface CreateDiscordVoiceConsoleTransportOptions {
+  consoleId: string;
+  guildId: string;
+  voiceChannelId: string;
+  initialSpeakers: ReadonlyArray<VoiceConsoleInitialSpeaker>;
+  persistence: VoiceConsoleCapturePersistencePort;
+  isAllowedUser: (userId: string) => boolean;
+  inputActive: boolean;
+  callbacks?: Pick<
+    VoiceConsoleCaptureRouterCallbacks,
+    "onCaptureFinalizing" | "onInterim" | "onForwardedBytes" | "onSettled" | "onError"
+  > & {
+    onConnectionLost?: (reason: string) => void;
+  };
+  captureDependencies?: VoiceConsoleCaptureHostDependencies;
+}
 
 /** Build the Discord payload separately so voice-message semantics stay tested. */
 export function buildDiscordFileSendPayload(file: DiscordFileSend): MessageCreateOptions {
@@ -275,8 +343,10 @@ export function classifyDiscordInteraction(interaction: {
   const isSelect = interaction.isStringSelectMenu?.() === true;
   const cid = isButton || isModal || isSelect ? (interaction.customId ?? "") : "";
   if (
-    (isButton || isModal) &&
-    (cid.startsWith("seam-cfg-edit:") || cid.startsWith("seam-tts:"))
+    (isButton || isModal || isSelect) &&
+    (cid.startsWith("seam-cfg-edit:") ||
+      cid.startsWith("seam-tts:") ||
+      cid.startsWith("tvc:"))
   ) {
     return "config-edit";
   }
@@ -505,6 +575,229 @@ export class DiscordAdapter implements ChatAdapter {
       selfMuted: voice.selfMute === true,
       visible,
     };
+  }
+
+  /**
+   * Fail-closed Shared Voice Console preflight. The voice channel id is also
+   * the only permitted canonical-card channel id; callers must not substitute
+   * the invoking ACP thread when any permission is missing.
+   */
+  async inspectVoiceConsoleStart(
+    userId: string,
+    guildId: string
+  ): Promise<VoiceConsoleStartInspectionResult> {
+    const guild = await this.client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) return { ok: false, reason: "This thread's guild is not available to Seam." };
+    const [, fetchedMe] = await Promise.all([
+      guild.members.fetch(userId).catch(() => null),
+      guild.members.fetchMe().catch(() => null),
+    ]);
+    const voice = guild.voiceStates.cache.get(userId);
+    if (!voice?.channelId) {
+      return { ok: false, reason: "Join a voice channel in this thread's guild before starting Voice Console." };
+    }
+    const fetched = voice.channel ?? await guild.channels.fetch(voice.channelId).catch(() => null);
+    if (!fetched?.isVoiceBased()) {
+      return { ok: false, reason: "Your current voice channel is not available to Seam." };
+    }
+    const channel = fetched as VoiceBasedChannel;
+    const permissions = fetchedMe ? channel.permissionsFor(fetchedMe) : null;
+    const required: Array<[VoiceConsoleRequiredPermission, bigint]> = [
+      ["ViewChannel", PermissionFlagsBits.ViewChannel],
+      ["Connect", PermissionFlagsBits.Connect],
+      ["SendMessages", PermissionFlagsBits.SendMessages],
+      ["EmbedLinks", PermissionFlagsBits.EmbedLinks],
+      ["ReadMessageHistory", PermissionFlagsBits.ReadMessageHistory],
+    ];
+    const missingPermissions = required
+      .filter(([, bit]) => !permissions?.has(bit))
+      .map(([name]) => name);
+    const visible = !isObfuscatedChannel(channel) &&
+      !(channel.parent && isObfuscatedChannel(channel.parent));
+    const initialSpeakers: VoiceConsoleInitialSpeaker[] = [];
+    for (const member of channel.members.values()) {
+      if (member.user.bot) continue;
+      const state = guild.voiceStates.cache.get(member.id);
+      initialSpeakers.push({
+        userId: member.id,
+        speakerName: sanitizeSpeakerName(member.displayName),
+        selfMuted: state?.selfMute === true,
+        sessionId: state?.sessionId ?? null,
+      });
+    }
+    return {
+      ok: true,
+      guildId: guild.id,
+      voiceChannelId: channel.id,
+      channelName: visibleDiscordChannelName(channel) ?? null,
+      selfMuted: voice.selfMute === true,
+      visible,
+      missingPermissions,
+      initialSpeakers,
+    };
+  }
+
+  /** Revalidate the canonical VC-chat permissions during boot/card recovery. */
+  async inspectVoiceConsoleChannel(
+    voiceChannelId: string
+  ): Promise<
+    | {
+        ok: true;
+        guildId: string;
+        missingPermissions: VoiceConsoleRequiredPermission[];
+        initialSpeakers: VoiceConsoleInitialSpeaker[];
+      }
+    | { ok: false; reason: string }
+  > {
+    const fetched = await this.client.channels.fetch(voiceChannelId).catch(() => null);
+    if (!fetched?.isVoiceBased()) {
+      return { ok: false, reason: "Voice Console channel is unavailable." };
+    }
+    const channel = fetched as VoiceBasedChannel;
+    const fetchedMe = await channel.guild.members.fetchMe().catch(() => null);
+    const permissions = fetchedMe ? channel.permissionsFor(fetchedMe) : null;
+    const required: Array<[VoiceConsoleRequiredPermission, bigint]> = [
+      ["ViewChannel", PermissionFlagsBits.ViewChannel],
+      ["Connect", PermissionFlagsBits.Connect],
+      ["SendMessages", PermissionFlagsBits.SendMessages],
+      ["EmbedLinks", PermissionFlagsBits.EmbedLinks],
+      ["ReadMessageHistory", PermissionFlagsBits.ReadMessageHistory],
+    ];
+    const initialSpeakers: VoiceConsoleInitialSpeaker[] = [];
+    for (const member of channel.members.values()) {
+      if (member.user.bot) continue;
+      const state = channel.guild.voiceStates.cache.get(member.id);
+      initialSpeakers.push({
+        userId: member.id,
+        speakerName: sanitizeSpeakerName(member.displayName),
+        selfMuted: state?.selfMute === true,
+        sessionId: state?.sessionId ?? null,
+      });
+    }
+    return {
+      ok: true,
+      guildId: channel.guild.id,
+      missingPermissions: required
+        .filter(([, bit]) => !permissions?.has(bit))
+        .map(([name]) => name),
+      initialSpeakers,
+    };
+  }
+
+  /** Observe owner membership only; the controller owns the grace timer. */
+  watchVoiceConsoleOwnerPresence(
+    voiceChannelId: string,
+    ownerUserId: string,
+    onPresence: (present: boolean) => void
+  ): () => void {
+    const listener = (oldState: VoiceState, newState: VoiceState): void => {
+      if (newState.id !== ownerUserId) return;
+      const wasPresent = oldState.channelId === voiceChannelId;
+      const isPresent = newState.channelId === voiceChannelId;
+      if (wasPresent !== isPresent) onPresence(isPresent);
+    };
+    this.client.on("voiceStateUpdate", listener);
+    return () => this.client.off("voiceStateUpdate", listener);
+  }
+
+  /**
+   * Create exactly one Discord connection and pass the identical object to B
+   * capture and C playback. Neither borrowed consumer destroys the connection.
+   */
+  async createVoiceConsoleTransport(
+    opts: CreateDiscordVoiceConsoleTransportOptions
+  ): Promise<DiscordVoiceConsoleTransport> {
+    const fetched = await this.client.channels.fetch(opts.voiceChannelId).catch(() => null);
+    if (!fetched?.isVoiceBased() || fetched.guild.id !== opts.guildId) {
+      throw new Error("Voice Console channel is unavailable or belongs to another guild.");
+    }
+    if (getVoiceConnection(opts.guildId)) {
+      throw new Error("Discord already has a voice connection in this guild.");
+    }
+    const channel = fetched as VoiceBasedChannel;
+    const connection = joinVoiceChannel({
+      channelId: channel.id,
+      guildId: channel.guild.id,
+      adapterCreator: channel.guild.voiceAdapterCreator as DiscordGatewayAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+    });
+    let captureHost: DiscordVoiceConsoleCaptureHost | undefined;
+    let playback: DiscordVoiceConsolePlayback | undefined;
+    let intentionalDestroy = false;
+    let disconnectEpoch = 0;
+    const connectionStateListener = (
+      _oldState: { status: string },
+      newState: { status: string }
+    ): void => {
+      if (intentionalDestroy) return;
+      if (newState.status === VoiceConnectionStatus.Destroyed) {
+        opts.callbacks?.onConnectionLost?.("Discord voice connection was destroyed");
+        return;
+      }
+      if (newState.status !== VoiceConnectionStatus.Disconnected) return;
+      const epoch = ++disconnectEpoch;
+      void entersState(connection, VoiceConnectionStatus.Ready, 5_000).catch(() => {
+        if (!intentionalDestroy && disconnectEpoch === epoch) {
+          opts.callbacks?.onConnectionLost?.("Discord voice connection did not recover");
+        }
+      });
+    };
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      connection.on("stateChange", connectionStateListener);
+      captureHost = new DiscordVoiceConsoleCaptureHost({
+        client: this.client,
+        connection,
+        voiceChannelId: opts.voiceChannelId,
+        initialSpeakers: opts.initialSpeakers,
+        persistence: opts.persistence,
+        isAllowedUser: opts.isAllowedUser,
+        inputActive: opts.inputActive,
+        logger: this.logger,
+        createTranscriber: async ({ speakerId, handlers }) =>
+          GeminiLiveTranscribeClient.connect({
+            apiKey: this.config.SEAM_GEMINI_API_KEY,
+            unaryModel: this.config.SEAM_GEMINI_STT_MODEL,
+            customVocabulary: this.config.SEAM_GEMINI_STT_CUSTOM_VOCABULARY,
+            handlers: {
+              onInterim: handlers.onInterim,
+              onForwardedBytes: ({ bytes }) => handlers.onForwardedBytes(bytes),
+              onSessionEvent: (event) => {
+                this.logger.info(
+                  { consoleId: opts.consoleId, speakerId, event },
+                  "voice-console transcribe session event"
+                );
+              },
+            },
+          }),
+        ...(opts.callbacks ? { callbacks: opts.callbacks } : {}),
+        ...(opts.captureDependencies ? { dependencies: opts.captureDependencies } : {}),
+      });
+      playback = new DiscordVoiceConsolePlayback({ connection, logger: this.logger });
+      if (captureHost.sharedConnection !== connection) {
+        throw new Error("Voice Console capture did not retain the shared connection.");
+      }
+      return {
+        connection,
+        captureHost,
+        playback,
+        destroyConnection: () => {
+          intentionalDestroy = true;
+          disconnectEpoch++;
+          connection.off("stateChange", connectionStateListener);
+          if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
+        },
+      };
+    } catch (err) {
+      intentionalDestroy = true;
+      disconnectEpoch++;
+      connection.off("stateChange", connectionStateListener);
+      playback?.destroy();
+      await captureHost?.destroy().catch(() => undefined);
+      if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
+      throw err;
+    }
   }
 
   async runThreadVoiceSession(
@@ -1178,6 +1471,46 @@ export class DiscordAdapter implements ChatAdapter {
     return { channel, id: sent.id };
   }
 
+  async sendVoiceConsolePanel(
+    voiceChannelId: string,
+    panel: VoiceConsolePanelSpec
+  ): Promise<MessageRef> {
+    const channel: ChannelRef = { platform: PLATFORM, id: voiceChannelId };
+    const ch = await this.fetchSendableChannel(voiceChannelId);
+    const sent = await ch.send({
+      embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+      components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
+      allowedMentions: { parse: [] },
+    });
+    return { channel, id: sent.id };
+  }
+
+  async editVoiceConsolePanel(
+    message: MessageRef,
+    panel: VoiceConsolePanelSpec
+  ): Promise<void> {
+    const ch = await this.fetchSendableChannel(message.channel.id);
+    const msg = await ch.messages.fetch(message.id);
+    await msg.edit({
+      content: "",
+      embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+      components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
+      allowedMentions: { parse: [] },
+    });
+  }
+
+  async voiceConsoleMessageExists(voiceChannelId: string, messageId: string): Promise<boolean> {
+    try {
+      const ch = await this.fetchSendableChannel(voiceChannelId);
+      await ch.messages.fetch(messageId);
+      return true;
+    } catch (err) {
+      const code = (err as { code?: number }).code;
+      if (code === 10008 || code === 10003) return false;
+      throw err;
+    }
+  }
+
   async editPanel(
     message: MessageRef,
     panel: StructuredPanel
@@ -1293,12 +1626,79 @@ export class DiscordAdapter implements ChatAdapter {
     });
   }
 
+  static buildVoiceConsoleEmbed(panel: VoiceConsolePanelSpec): EmbedBuilder {
+    const embed = new EmbedBuilder().setColor(panel.color).setTitle(panel.title);
+    if (panel.description !== undefined) embed.setDescription(panel.description);
+    if (panel.fields.length > 0) {
+      embed.addFields(panel.fields.map((field) => ({
+        name: field.name,
+        value: field.value,
+        ...(field.inline !== undefined ? { inline: field.inline } : {}),
+      })));
+    }
+    if (panel.footer !== undefined) embed.setFooter({ text: panel.footer });
+    return embed;
+  }
+
+  static buildVoiceConsoleRows(
+    rows: ReadonlyArray<VoiceConsoleComponentRow>
+  ): Array<ActionRowBuilder<ButtonBuilder> | ActionRowBuilder<StringSelectMenuBuilder>> {
+    return rows.map((row) => {
+      const first = row.components[0];
+      if (first?.kind === "select") {
+        const built = new ActionRowBuilder<StringSelectMenuBuilder>();
+        for (const component of row.components) {
+          if (component.kind !== "select") throw new Error("Voice Console component row is mixed");
+          built.addComponents(
+            new StringSelectMenuBuilder()
+              .setCustomId(component.customId)
+              .setPlaceholder(component.placeholder)
+              .setMinValues(component.minValues)
+              .setMaxValues(component.maxValues)
+              .setDisabled(component.disabled ?? false)
+              .addOptions(component.options.map((option) => ({
+                label: option.label,
+                value: option.value,
+                ...(option.description !== undefined ? { description: option.description } : {}),
+                ...(option.default !== undefined ? { default: option.default } : {}),
+              })))
+          );
+        }
+        return built;
+      }
+      const built = new ActionRowBuilder<ButtonBuilder>();
+      for (const component of row.components) {
+        if (component.kind !== "button") throw new Error("Voice Console component row is mixed");
+        built.addComponents(
+          new ButtonBuilder()
+            .setCustomId(component.customId)
+            .setLabel(component.label)
+            .setStyle(DiscordAdapter.voiceConsoleButtonStyle(component.style))
+            .setDisabled(component.disabled ?? false)
+        );
+      }
+      return built;
+    });
+  }
+
+  private static voiceConsoleButtonStyle(
+    style: "primary" | "secondary" | "success" | "danger"
+  ): ButtonStyle {
+    switch (style) {
+      case "primary": return ButtonStyle.Primary;
+      case "success": return ButtonStyle.Success;
+      case "danger": return ButtonStyle.Danger;
+      case "secondary": return ButtonStyle.Secondary;
+    }
+  }
+
   private async handlePersistentComponent(
-    interaction: ButtonInteraction | ModalSubmitInteraction
+    interaction: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
   ): Promise<void> {
     if (!this.componentHandler) return;
     const isButton = interaction.isButton();
     const isModal = interaction.isModalSubmit();
+    const isSelect = interaction.isStringSelectMenu();
 
     const channelId = interaction.channelId ?? "";
     const ch = interaction.channel as { parentId?: string | null } | null;
@@ -1307,7 +1707,7 @@ export class DiscordAdapter implements ChatAdapter {
 
     const fields: Record<string, string> = {};
     if (isModal) {
-      for (const id of ["rider", "slug"]) {
+      for (const [id] of interaction.fields.fields) {
         try {
           fields[id] = interaction.fields.getTextInputValue(id);
         } catch {
@@ -1317,6 +1717,7 @@ export class DiscordAdapter implements ChatAdapter {
     }
 
     const evt: ComponentEvent = {
+      interactionId: interaction.id,
       customId: interaction.customId,
       userId: interaction.user.id,
       userName: interaction.user.displayName ?? interaction.user.username,
@@ -1326,7 +1727,8 @@ export class DiscordAdapter implements ChatAdapter {
         ...(parentId ? { parentId } : {}),
       },
       messageId,
-      kind: isModal ? "modal" : "button",
+      kind: isModal ? "modal" : isSelect ? "select" : "button",
+      ...(isSelect ? { values: [...interaction.values] } : {}),
       ...(Object.keys(fields).length > 0 ? { fields } : {}),
       replyEphemeral: async (text: string) => {
         await interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
@@ -1334,12 +1736,42 @@ export class DiscordAdapter implements ChatAdapter {
       followUpEphemeral: async (text: string) => {
         await interaction.followUp({ content: text, flags: MessageFlags.Ephemeral });
       },
+      editReplyEphemeral: async (text: string) => {
+        await interaction.editReply({ content: text });
+      },
+      replyEphemeralView: async (view) => {
+        await interaction.reply({
+          embeds: view.embeds as EmbedBuilder[],
+          ...(view.components
+            ? { components: view.components as ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] }
+            : {}),
+          flags: MessageFlags.Ephemeral,
+        });
+        return (await interaction.fetchReply()).id;
+      },
+      updateEphemeralView: async (view) => {
+        if (interaction.isModalSubmit()) throw new Error("modal submit cannot update a component view");
+        const payload = {
+          embeds: view.embeds as EmbedBuilder[],
+          ...(view.components
+            ? { components: view.components as ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] }
+            : {}),
+        };
+        if (interaction.deferred || interaction.replied) await interaction.editReply(payload);
+        else await interaction.update(payload);
+      },
+      followUpEphemeralFile: async (file) => {
+        await interaction.followUp({
+          files: [new AttachmentBuilder(file.data, { name: file.filename })],
+          flags: MessageFlags.Ephemeral,
+        });
+      },
       deferUpdate: async () => {
         await interaction.deferUpdate();
       },
       showModal: async (opts) => {
-        if (!interaction.isButton()) {
-          throw new Error("showModal is only valid on a button click");
+        if (!interaction.isButton() && !interaction.isStringSelectMenu()) {
+          throw new Error("showModal is only valid on a message component interaction");
         }
         const modal = new ModalBuilder()
           .setCustomId(opts.customId.slice(0, 100))
@@ -1524,7 +1956,7 @@ export class DiscordAdapter implements ChatAdapter {
           return;
         case "config-edit":
           this.handlePersistentComponent(
-            interaction as ButtonInteraction | ModalSubmitInteraction
+            interaction as ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
           ).catch((err) => {
             this.logger.error({ err }, "config-editor component handler crashed");
           });

@@ -117,7 +117,7 @@ Discord has no aliases; old invocations disappear.
 - `schedule` (7), `preset` (6), `project` (3) — unchanged
 - `upload` (3): `pull` `push` `secret` — **admin-only**. Hard cutover of `/seam attach`.
 - `bridge` (4), `debug` (6) — admin-only pairing / host debug (`voice-ping` / `voice-capture` / `voice-live` are the live-help spike)
-- `voice` (3): `start` `stop` `status` — **admin-only** serialized Thread Voice v1.
+- `voice` (7): `start` `add` `remove` `configure` `console` `status` `stop` — **admin-only** Shared Voice Console V2.
 
 **Queue:** `/seam queue prompt:…` parks the next live turn (does not abort).
 Idle + host ready runs now. A later bare message still interrupts and
@@ -158,17 +158,18 @@ Canonical: `docs/agent-guides/live-help.md`. School overlay paste:
 `docs/agent-guides/live-help-onboarding.md`. Do not use `/seam debug voice-*`
 from a course thread.
 
-## Thread Voice v1
+## Thread Voice V2
 
-One admin can bind one Discord thread to their current voice channel with
-`/seam voice start`. The owner must be self-muted when starting; only their
-unmuted audio is captured after consent. Final transcripts are echoed visibly
-and dispatched as that authenticated Discord user through the thread's normal
-turn queue. `/seam voice status` reports the durable session, capture/runtime,
-forwarded audio, pending text, and active dispatch. `/seam voice stop` preserves
-finalized pending text by default; `discard-pending:true` discards text only
-while no durable dispatch artifact owns it. Canonical operator notes:
-`docs/agent-guides/thread-voice.md`.
+One admin owns one guild-scoped Shared Voice Console in their current self-muted
+voice channel. `/seam voice start` creates its first thread binding; `add`,
+`remove`, and `configure` manage up to ten aliased bindings. The canonical
+five-row card exists only in the voice channel's built-in chat. The owner/admin
+selects one input binding or explicitly arms fan-out; allowlisted speakers are
+captured automatically while present, and final
+transcripts retain the actual speaker identity and enter each thread's normal
+turn queue. Every visible bound-thread response shares one fair VC speech
+scheduler, while per-binding output may be disabled. `stop` preserves finalized
+text by default. Canonical operator notes: `docs/agent-guides/thread-voice.md`.
 
 Thread Voice and Live Help share one guild voice lease. A conflict should name
 the active product/session; it is never an authorization or parent-approval

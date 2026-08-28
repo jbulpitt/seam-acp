@@ -1,6 +1,6 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { loadConfig, isChannelLocked, resolveThreadLocation, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
+import { loadConfig, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
 import { hostEmoji } from "./core/location.js";
 import { LoopbackHost } from "./core/loopback-host.js";
 import { logger } from "./lib/logger.js";
@@ -23,7 +23,12 @@ import { WakeManager } from "./core/wake/manager.js";
 import { ParkedPromptManager } from "./core/parked-prompts/manager.js";
 import { WatchManager } from "./core/watch/manager.js";
 import { LiveHelpManager } from "./core/live-help/manager.js";
-import { ThreadVoiceManager } from "./core/thread-voice/manager.js";
+import { VoiceConsoleManager } from "./core/voice-console/manager.js";
+import { VoiceConsoleController } from "./platforms/discord/voice-console-controller.js";
+import {
+  inertVoiceConsoleText,
+  truncateVoiceConsoleText,
+} from "./platforms/discord/voice-console-components.js";
 import { VoiceLeaseManager } from "./core/voice-lease.js";
 import { evaluateWatch } from "./core/watch/evaluate.js";
 import { DispatchWatcher } from "./core/dispatch/watcher.js";
@@ -771,7 +776,6 @@ async function main(): Promise<void> {
     onFire: (id) => orchestrator.runScheduledPrompt(id),
   });
   orchestrator.setScheduledManager(scheduledManager);
-  scheduledManager.start();
 
   // Agent-scheduled wake events (#59): a DB sweeper polls for due one-shot
   // wakes and fires each via the dispatch queue (delete-before-fire, D1). No
@@ -783,7 +787,6 @@ async function main(): Promise<void> {
     onFire: (wake) => orchestrator.fireWake(wake),
   });
   orchestrator.setWakeManager(wakeManager);
-  wakeManager.start();
 
   // Agent-defined watches (#60): a DB sweeper polls each watch's predicate on
   // its interval and fires a turn via the dispatch queue ONLY when a condition
@@ -804,7 +807,6 @@ async function main(): Promise<void> {
     onStopped: (watch, reason) => orchestrator.postWatchStopped(watch, reason),
   });
   orchestrator.setWatchManager(watchManager);
-  watchManager.start();
 
   const voiceLeases = new VoiceLeaseManager();
   const liveHelpManager = new LiveHelpManager({
@@ -836,28 +838,50 @@ async function main(): Promise<void> {
   });
   orchestrator.setDispatchWatcher(dispatchWatcher);
 
-  const threadVoiceManager = new ThreadVoiceManager({
+  const voiceConsoleController = new VoiceConsoleController({
     store,
-    logger: logger.child({ mod: "thread-voice" }),
+    adapter,
+    logger: logger.child({ mod: "voice-console" }),
+    apiKey: () => config.SEAM_GEMINI_API_KEY,
+    ttsModel: () => config.SEAM_GEMINI_TTS_MODEL,
+    isAllowedUser: (userId) => config.DISCORD_ALLOWED_USER_IDS.has(userId),
+    isBindingBusy: (channelRef) => orchestrator.isChannelBusy(channelRef),
+  });
+  const voiceConsoleManager = new VoiceConsoleManager({
+    store,
+    logger: logger.child({ mod: "voice-console" }),
     leases: voiceLeases,
-    host: {
-      inspectOwnerVoiceState: (userId, guildId) =>
-        adapter.inspectThreadVoiceOwner(userId, guildId),
-      runSession: (opts) => adapter.runThreadVoiceSession(opts),
-      speak: (sessionId, pcm) => adapter.speakThreadVoice(sessionId, pcm),
-      waitForPlaybackIdle: (sessionId) =>
-        adapter.waitForThreadVoicePlaybackIdle(sessionId),
-      stopPlayback: (sessionId) => adapter.stopThreadVoicePlayback(sessionId),
-      notify: (threadId, event) => orchestrator.notifyThreadVoice(threadId, event),
-    },
+    host: voiceConsoleController,
     dispatch: {
-      isHomeThreadBusy: (session) => orchestrator.isChannelBusy(session.channelRef),
+      isBindingBusy: (binding) => orchestrator.isChannelBusy(binding.channelRef),
       inspectArtifact: async (id) => {
         const dirs = dispatchDirs(config.DATA_DIR);
         if (fs.existsSync(path.join(dirs.done, `${id}.json`))) return "done";
         if (fs.existsSync(path.join(dirs.running, `${id}.json`))) return "running";
         if (fs.existsSync(path.join(dirs.pending, `${id}.json`))) return "pending";
         return "missing";
+      },
+      quarantineArtifact: async ({ dispatchId, bindingId, captureIds, reason }) => {
+        const terminalized = await dispatchWatcher.quarantineArtifact(dispatchId, reason);
+        if (terminalized.inFlight) {
+          const binding = store.getVoiceConsoleBinding(bindingId);
+          if (binding) {
+            await orchestrator.quarantineThreadVoiceDispatch(binding.channelRef, dispatchId);
+          }
+        }
+        const binding = store.getVoiceConsoleBinding(bindingId);
+        if (!binding) return;
+        const safeReason = truncateVoiceConsoleText(inertVoiceConsoleText(reason), 600);
+        await adapter.sendMessage(
+          {
+            platform: "discord",
+            id: binding.channelRef,
+            ...(binding.parentRef ? { parentId: binding.parentRef } : {}),
+          },
+          `⚠️ Voice Console blocked quarantined artifact \`${dispatchId}\` ` +
+            `(${captureIds.length} capture${captureIds.length === 1 ? "" : "s"}). ` +
+            `No transcript text was dispatched.${safeReason ? ` Reason: ${safeReason}` : ""}`
+        );
       },
       enqueue: async (request) => {
         const spec: DispatchSpec = {
@@ -868,23 +892,37 @@ async function main(): Promise<void> {
           kind: "thread_voice",
           authorId: request.authorId,
           authorName: request.authorName,
-          threadVoiceSessionId: request.threadVoiceSessionId,
+          voiceConsoleId: request.consoleId,
+          voiceConsoleBindingId: request.bindingId,
           createdUtc: request.createdUtc,
         };
         await enqueueDispatchSpec(config.DATA_DIR, spec);
       },
     },
   });
-  orchestrator.setThreadVoiceManager(threadVoiceManager);
+  voiceConsoleController.setManager(voiceConsoleManager);
+  orchestrator.setVoiceConsoleManager(voiceConsoleManager, voiceConsoleController);
   // Reconcile both durable products before either can claim a boot lease.
   // Live Help v1 cannot reconnect, so its in-flight rows end first; eligible
   // muted Thread Voice rows may then reacquire and reconnect.
   liveHelpManager.reconcileOnBoot();
-  await threadVoiceManager.reconcileOnBoot();
-  await threadVoiceManager.recoverDispatches();
+  await voiceConsoleManager.reconcileOnBoot({
+    aliasFor: ({ channelRef }) => `Thread ${channelRef.slice(-6)}`,
+    profileFor: ({ channelRef }) => ({
+      voice: resolveThreadTtsVoice(config, channelRef) ?? config.SEAM_GEMINI_TTS_VOICE,
+      pace: resolveThreadTtsPace(config, channelRef) ?? "natural",
+      style: resolveThreadTtsStyle(config, channelRef) ?? "neutral",
+    }),
+  });
   // Only now may durable specs run: Thread Voice verification, settlement,
   // lease reconciliation, and recovery bookkeeping are all installed first.
   await dispatchWatcher.start();
+  // Boot-time sweepers can emit visible turns/specs immediately. Start them
+  // only after Voice Console recovery and the shared visible-speech hook are
+  // installed, so a due schedule/wake/watch cannot bypass binding speech.
+  scheduledManager.start();
+  wakeManager.start();
+  watchManager.start();
 
   // #88: parked prompts wait on onBridgeReady (no timer). Start after the
   // dispatch watcher so a boot-time fire can enqueue immediately. Rehydrate
@@ -1063,10 +1101,10 @@ async function main(): Promise<void> {
     parkedManager.stop();
     cardGifs.stop();
     watchManager.stop();
-    threadVoiceManager.shutdown();
-    liveHelpManager.stopAll();
-    voiceLeases.releaseAll();
     dispatchWatcher.stop();
+    await voiceConsoleController.shutdownAll();
+    voiceConsoleManager.shutdown();
+    liveHelpManager.stopAll();
     stopPresetsWatch?.();
     await seamMcpServer?.stop().catch((err) =>
       logger.warn({ err }, "seam-mcp stop failed")

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -95,6 +95,7 @@ function makeOrch(opts: {
   rt: ReturnType<typeof fakeRuntime>;
   adapter: ReturnType<typeof spyAdapter>["adapter"];
   style?: "messages" | "card";
+  voiceConsole?: any;
 }): Orchestrator {
   const router = {
     listProfiles: () => [],
@@ -128,7 +129,7 @@ function makeOrch(opts: {
     channelPresets: {},
     threadPresets: {},
   };
-  return new Orchestrator({
+  const orchestrator = new Orchestrator({
     logger: silent,
     config: config as any,
     adapter: opts.adapter as any,
@@ -136,6 +137,8 @@ function makeOrch(opts: {
     store: store as any,
     renderer: {} as any,
   });
+  if (opts.voiceConsole) orchestrator.setVoiceConsoleController(opts.voiceConsole);
+  return orchestrator;
 }
 
 function baseSpec(over: Partial<DispatchSpec> = {}): DispatchSpec {
@@ -160,6 +163,58 @@ afterEach(() => {
 });
 
 describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', () => {
+  it("publishes visible generic-dispatch prose exactly once and awaits source-local drain", async () => {
+    const log: string[] = [];
+    const rt = fakeRuntime(["First visible sentence. ", "Second visible sentence."], log);
+    const { adapter } = spyAdapter(log);
+    let releaseDrain!: () => void;
+    const drain = new Promise<void>((resolve) => { releaseDrain = resolve; });
+    const voiceConsole = {
+      hasActiveBinding: () => true,
+      beginVisibleTurn: vi.fn(() => ({ consoleId: "c", bindingId: "b", turnId: "dispatch:disp-1" })),
+      acceptVisibleAgentText: vi.fn(),
+      finishVisibleTurn: vi.fn(async () => drain),
+      cancelVisibleTurn: vi.fn(async () => {}),
+      markBindingActivitySettled: vi.fn(async () => {}),
+    };
+    const orch = makeOrch({ dataDir, rt, adapter, style: "card", voiceConsole });
+
+    let settled = false;
+    const turn = orch.dispatchInjectTurn(baseSpec()).then((result) => {
+      settled = true;
+      return result;
+    });
+    await vi.waitFor(() => expect(voiceConsole.finishVisibleTurn).toHaveBeenCalledOnce());
+    expect(settled).toBe(false);
+    expect(voiceConsole.beginVisibleTurn).toHaveBeenCalledWith("thread-w", "dispatch:disp-1");
+    expect(voiceConsole.acceptVisibleAgentText.mock.calls).toEqual([
+      [expect.any(Object), 1, "First visible sentence. "],
+      [expect.any(Object), 2, "Second visible sentence."],
+    ]);
+    releaseDrain();
+    await expect(turn).resolves.toMatchObject({ output: "First visible sentence. Second visible sentence." });
+    expect(voiceConsole.markBindingActivitySettled).toHaveBeenCalledWith("thread-w");
+  });
+
+  it("keeps quiet/non-streamed dispatch completely out of the VC speech hook", async () => {
+    const log: string[] = [];
+    const rt = fakeRuntime(["Captured but intentionally quiet."], log);
+    const { adapter } = spyAdapter(log);
+    const voiceConsole = {
+      hasActiveBinding: () => true,
+      beginVisibleTurn: vi.fn(),
+      acceptVisibleAgentText: vi.fn(),
+      finishVisibleTurn: vi.fn(async () => {}),
+      cancelVisibleTurn: vi.fn(async () => {}),
+      markBindingActivitySettled: vi.fn(async () => {}),
+    };
+    const orch = makeOrch({ dataDir, rt, adapter, style: "card", voiceConsole });
+    await orch.dispatchInjectTurn(baseSpec({ stream: false }));
+    expect(voiceConsole.beginVisibleTurn).not.toHaveBeenCalled();
+    expect(voiceConsole.acceptVisibleAgentText).not.toHaveBeenCalled();
+    expect(voiceConsole.finishVisibleTurn).not.toHaveBeenCalled();
+  });
+
   it("posts a start indicator BEFORE the turn runs", async () => {
     const log: string[] = [];
     const rt = fakeRuntime(["Hello ", "world"], log);
@@ -255,6 +310,60 @@ describe('dispatchInjectTurn: start indicator + live streaming ("card" style)', 
     expect(calls.sendPanel.length).toBe(1);
     const last = calls.editPanel[calls.editPanel.length - 1]!.panel;
     expect(last.description).toContain("full output attached");
+  });
+});
+
+describe("scheduled visible output speech", () => {
+  it("speaks the non-streamed agent body once and gates binding settlement on source drain", async () => {
+    const log: string[] = [];
+    const rt = fakeRuntime([], log);
+    const { adapter, calls } = spyAdapter(log);
+    let releaseDrain!: () => void;
+    const drain = new Promise<void>((resolve) => { releaseDrain = resolve; });
+    const handle = { consoleId: "c", bindingId: "b", turnId: "scheduled:schedule-1:now" };
+    const voiceConsole = {
+      hasActiveBinding: () => true,
+      beginVisibleTurn: vi.fn(() => handle),
+      acceptVisibleAgentText: vi.fn(),
+      finishVisibleTurn: vi.fn(async () => drain),
+      cancelVisibleTurn: vi.fn(async () => {}),
+      markBindingActivitySettled: vi.fn(async () => {}),
+    };
+    const orch = makeOrch({ dataDir, rt, adapter, voiceConsole });
+    const post = (orch as unknown as {
+      postScheduledVisibleResult(
+        target: ChannelRef,
+        scheduleId: string,
+        name: string,
+        text: string,
+        outputType: "card" | "messages"
+      ): Promise<void>;
+    }).postScheduledVisibleResult(
+      { platform: "discord", id: "thread-w" },
+      "schedule-1",
+      "Daily summary",
+      "One visible scheduled sentence.",
+      "messages"
+    );
+
+    await vi.waitFor(() => expect(voiceConsole.finishVisibleTurn).toHaveBeenCalledOnce());
+    expect(calls.sendMessage.map((entry) => entry.text)).toEqual([
+      "One visible scheduled sentence.",
+    ]);
+    expect(voiceConsole.beginVisibleTurn).toHaveBeenCalledWith(
+      "thread-w",
+      expect.stringMatching(/^scheduled:schedule-1:/)
+    );
+    expect(voiceConsole.acceptVisibleAgentText).toHaveBeenCalledWith(
+      handle,
+      1,
+      "One visible scheduled sentence."
+    );
+    expect(voiceConsole.markBindingActivitySettled).not.toHaveBeenCalled();
+
+    releaseDrain();
+    await post;
+    expect(voiceConsole.markBindingActivitySettled).toHaveBeenCalledWith("thread-w");
   });
 });
 

@@ -526,42 +526,45 @@ function cancelIx() {
   };
 }
 
-describe("Thread Voice cancel coexistence", () => {
-  it("plain cancel aborts ACP gracefully without stopping playback or deleting buffered voice", async () => {
+describe("Voice Console cancel coexistence", () => {
+  it("plain cancel aborts ACP gracefully without cancelling VC speech or deleting buffered voice", async () => {
     insertBufferedVoice();
     const abortTurn = vi.fn(async () => "cancelled");
     const { orch } = makeOrch({ ready: true, abortTurn, hasRuntime: () => true });
-    const cancelSpeech = vi.fn();
-    const stopPlayback = vi.fn(async () => {});
-    (orch as any).threadVoiceSpeechByChannel.set("thread-1", { cancel: cancelSpeech });
-    orch.setThreadVoiceManager({ stopPlayback } as any);
+    const cancelBindingSpeech = vi.fn(async () => {});
+    orch.setVoiceConsoleManager({} as any, { cancelBindingSpeech } as any);
 
     await (orch as any).cmdCancel(cancelIx());
 
     expect(abortTurn).toHaveBeenCalledWith("discord:thread-1", { force: false });
-    expect(cancelSpeech).not.toHaveBeenCalled();
-    expect(stopPlayback).not.toHaveBeenCalled();
+    expect(cancelBindingSpeech).not.toHaveBeenCalled();
     expect(store.listThreadVoiceSegments("tv_cancel_guard")[0]).toMatchObject({
       state: "pending",
       transcript: "must survive ACP cancellation",
     });
   });
 
-  it("force cancel stops playback but preserves capture session and buffered voice", async () => {
+  it("force cancel stops binding-local speech but preserves capture state and buffered voice", async () => {
     insertBufferedVoice();
     const abortTurn = vi.fn(async () => "cancelled");
     const { orch } = makeOrch({ ready: true, abortTurn, hasRuntime: () => true });
-    const cancelSpeech = vi.fn();
-    const stopPlayback = vi.fn(async () => {});
-    const stop = vi.fn();
-    (orch as any).threadVoiceSpeechByChannel.set("thread-1", { cancel: cancelSpeech });
-    orch.setThreadVoiceManager({ stopPlayback, stop } as any);
+    const cancelVisibleTurn = vi.fn(async () => {});
+    const cancelBindingSpeech = vi.fn(async () => {});
+    const stopAllForGlobalCancel = vi.fn(async () => {});
+    (orch as any).voiceConsoleSpeechByChannel.set("thread-1", {
+      consoleId: "console-1", bindingId: "binding-1", turnId: "turn-1",
+    });
+    orch.setVoiceConsoleManager({} as any, {
+      cancelVisibleTurn,
+      cancelBindingSpeech,
+      stopAllForGlobalCancel,
+    } as any);
 
     await (orch as any).cmdAbort(cancelIx());
 
-    expect(cancelSpeech).toHaveBeenCalledOnce();
-    expect(stopPlayback).toHaveBeenCalledWith("tv_cancel_guard");
-    expect(stop).not.toHaveBeenCalled();
+    expect(cancelVisibleTurn).toHaveBeenCalledOnce();
+    expect(cancelBindingSpeech).toHaveBeenCalledWith("thread-1");
+    expect(stopAllForGlobalCancel).not.toHaveBeenCalled();
     expect(abortTurn).toHaveBeenCalledWith("discord:thread-1", { force: true });
     expect(store.listThreadVoiceSegments("tv_cancel_guard")[0]).toMatchObject({
       state: "pending",
@@ -569,18 +572,23 @@ describe("Thread Voice cancel coexistence", () => {
     });
   });
 
-  it("scope-all stops every Thread Voice session without discarding its durable text", async () => {
+  it("scope-all tears down every Voice Console without discarding durable text", async () => {
     insertBufferedVoice();
     const { orch, killAll } = makeOrch({ ready: true });
-    const cancelSpeech = vi.fn();
-    const stopAll = vi.fn(async () => {});
-    (orch as any).threadVoiceSpeechByChannel.set("thread-1", { cancel: cancelSpeech });
-    orch.setThreadVoiceManager({ stopAll } as any);
+    const cancelVisibleTurn = vi.fn(async () => {});
+    const stopAllForGlobalCancel = vi.fn(async () => {});
+    (orch as any).voiceConsoleSpeechByChannel.set("thread-1", {
+      consoleId: "console-1", bindingId: "binding-1", turnId: "turn-1",
+    });
+    orch.setVoiceConsoleManager({} as any, {
+      cancelVisibleTurn,
+      stopAllForGlobalCancel,
+    } as any);
 
     await (orch as any).cmdKill(cancelIx());
 
-    expect(cancelSpeech).toHaveBeenCalledOnce();
-    expect(stopAll).toHaveBeenCalledWith("global cancel");
+    expect(cancelVisibleTurn).toHaveBeenCalledOnce();
+    expect(stopAllForGlobalCancel).toHaveBeenCalledWith("global cancel");
     expect(killAll).toHaveBeenCalledOnce();
     expect(store.listThreadVoiceSegments("tv_cancel_guard")[0]).toMatchObject({
       state: "pending",

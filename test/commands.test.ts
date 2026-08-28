@@ -58,10 +58,12 @@ describe("/seam slash command", () => {
     expect(names).not.toContain("attach");
   });
 
-  it("voice group has start, stop with discard-pending, and status", () => {
+  it("voice group exposes the seven-command V2 hard cutover", () => {
     const voice = built().options?.find((o) => o.name === "voice");
     expect(voice?.type).toBe(SUB_COMMAND_GROUP);
-    expect((voice?.options ?? []).map((o) => o.name)).toEqual(["start", "stop", "status"]);
+    expect((voice?.options ?? []).map((o) => o.name)).toEqual([
+      "start", "add", "remove", "configure", "console", "status", "stop",
+    ]);
     const stop = voice?.options?.find((o) => o.name === "stop");
     const discard = stop?.options?.find((o) => o.name === "discard-pending");
     expect(discard?.type).toBe(BOOLEAN);

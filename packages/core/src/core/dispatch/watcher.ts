@@ -60,6 +60,10 @@ export class DispatchWatcher {
    *  spec that's mid-flight (the rename claim also guards this, but only until
    *  the file lands in `running/`). */
   private readonly inFlight = new Set<string>();
+  /** Artifacts terminalized by the Voice Console quarantine path. A claimed
+   *  callback may still be waiting in its target queue (or cancelling); this
+   *  fence prevents it from starting or overwriting the quarantine result. */
+  private readonly quarantined = new Set<string>();
   private timer?: NodeJS.Timeout;
   private ready = false;
 
@@ -145,7 +149,10 @@ export class DispatchWatcher {
     const jobs = claimed.map(({ id, spec }) =>
       this.runSpec(id, spec)
         .catch((err) => this.logger.error({ err, id }, "dispatch failed unexpectedly"))
-        .finally(() => this.inFlight.delete(id))
+        .finally(() => {
+          this.inFlight.delete(id);
+          this.quarantined.delete(id);
+        })
     );
     await Promise.all(jobs);
   }
@@ -319,6 +326,72 @@ export class DispatchWatcher {
     });
   }
 
+  /**
+   * Fail closed for a Voice Console artifact whose durable capture identity was
+   * quarantined. This is deliberately id-scoped: unlike command cancellation it
+   * cannot affect another dispatch in the same thread.
+   *
+   * An existing done-file is already terminal and is preserved byte-for-byte.
+   * Pending/running artifacts receive a failed result before their queue marker
+   * is removed. `inFlight` tells Package E whether an already-claimed callback
+   * also needs its exact ACP turn fenced/cancelled.
+   */
+  async quarantineArtifact(
+    id: string,
+    reason: string
+  ): Promise<{ state: "missing" | "done" | "terminalized"; inFlight: boolean }> {
+    const name = `${id}.json`;
+    const donePath = path.join(this.dirs.done, name);
+    const runningPath = path.join(this.dirs.running, name);
+    const pendingPath = path.join(this.dirs.pending, name);
+    // Fence first, before filesystem awaits give a polling tick a chance to
+    // claim and enter the callback.
+    this.quarantined.add(id);
+
+    if (await exists(donePath)) {
+      await rm(runningPath, { force: true }).catch(() => {});
+      await rm(pendingPath, { force: true }).catch(() => {});
+      const inFlight = this.inFlight.has(id);
+      if (!inFlight) this.quarantined.delete(id);
+      return { state: "done", inFlight };
+    }
+
+    let target = "";
+    let correlationId: string | undefined;
+    let found = false;
+    for (const artifactPath of [runningPath, pendingPath]) {
+      try {
+        const spec = parseDispatchSpec(id, await readFile(artifactPath, "utf8"));
+        target = spec.target;
+        correlationId = spec.correlationId;
+        found = true;
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") found = true;
+      }
+    }
+    const inFlight = this.inFlight.has(id);
+    if (!found && !inFlight) {
+      this.quarantined.delete(id);
+      return { state: "missing", inFlight: false };
+    }
+
+    await mkdir(this.dirs.done, { recursive: true });
+    await this.finish(id, {
+      id,
+      status: "failed",
+      error: `quarantined: ${reason}`,
+      target,
+      ...(correlationId ? { correlationId } : {}),
+      finishedUtc: new Date().toISOString(),
+    });
+    if (!(await exists(donePath))) {
+      throw new Error(`dispatch ${id}: quarantine result was not durable`);
+    }
+    if (!inFlight) this.quarantined.delete(id);
+    return { state: "terminalized", inFlight };
+  }
+
   private async listQueueSpecs(subdirs: Array<"running" | "pending">): Promise<DispatchSpec[]> {
     const out: DispatchSpec[] = [];
     for (const sub of subdirs) {
@@ -390,6 +463,10 @@ export class DispatchWatcher {
     );
 
     await this.queueFor(spec.target).run(async () => {
+      if (this.quarantined.has(id)) {
+        this.logger.warn({ id, target: spec.target }, "dispatch: quarantined before execution");
+        return;
+      }
       const base = {
         id,
         target: spec.target,
@@ -397,6 +474,7 @@ export class DispatchWatcher {
       };
       try {
         const { output, stopReason } = await this.onDispatch(spec);
+        if (this.quarantined.has(id)) return;
         await this.finish(id, {
           ...base,
           status: "completed",
@@ -406,6 +484,7 @@ export class DispatchWatcher {
         });
         this.logger.info({ id, target: spec.target, chars: output.length }, "dispatch: completed");
       } catch (err) {
+        if (this.quarantined.has(id)) return;
         const message = (err as Error)?.message ?? String(err);
         await this.finish(id, {
           ...base,

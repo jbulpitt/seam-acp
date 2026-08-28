@@ -255,6 +255,19 @@ const SCHEDULE_PRESETS: Array<{ label: string; value: string }> = [
   { label: "Every 15 minutes", value: "*/15 * * * *" },
   { label: "Custom cron…", value: "__custom__" },
 ];
+const VOICE_CONSOLE_EDITOR_ACTIONS: ReadonlySet<string> = new Set([
+  "edit-alias", "edit-voice", "edit-pace", "edit-style", "edit-save", "edit-cancel",
+  "voice-prev", "voice-next", "voice-preview", "voice-use", "voice-back",
+  "duplicate-confirm", "duplicate-cancel", "alias-save",
+]);
+/** These actions delegate stale-versus-exact-replay resolution to Package A's
+ * durable interaction ledger. Presentation-only actions still reject stale
+ * revisions before opening or editing an ephemeral view. */
+const VOICE_CONSOLE_DURABLE_ACTIONS: ReadonlySet<string> = new Set([
+  "input", "output", "input-off", "fanout-arm", "fanout-disarm",
+  "output-all-on", "output-all-off", "page-prev", "page-next",
+  "fanout-keep", "edit-save", "duplicate-confirm", "end-preserve", "end-discard",
+]);
 import type { SessionStore } from "../../core/session-store.js";
 import { makeSessionId } from "../../core/session-store.js";
 import { SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
@@ -289,16 +302,33 @@ import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
 import { LiveHelpManager } from "../../core/live-help/manager.js";
-import type { ThreadVoiceManager } from "../../core/thread-voice/manager.js";
-import type {
-  ThreadVoiceNotification,
-  ThreadVoiceRuntimeState,
-} from "../../core/thread-voice/types.js";
-import { threadVoiceTranscriptMessages } from "./thread-voice-panel.js";
+import type { VoiceConsoleManager } from "../../core/voice-console/manager.js";
+import type { VoiceConsoleController } from "./voice-console-controller.js";
 import {
-  ThreadVoiceSpeechPipeline,
   shouldAttachCompletedTurnVoice,
 } from "./thread-voice-speech.js";
+import {
+  buildVoiceConsoleAliasModal,
+  cycleVoiceConsolePace,
+  cycleVoiceConsoleStyle,
+  effectiveVoiceConsoleBindingProfile,
+  inertVoiceConsoleAlias,
+  parseVoiceConsoleAlias,
+  parseVoiceConsoleInteraction,
+  voiceConsolePreviewRequest,
+  voiceConsoleVoiceIndex,
+  type VoiceConsoleBindingEditorDraft,
+} from "./voice-console-components.js";
+import {
+  renderDuplicateVoiceConfirmation,
+  renderFanoutDisarmConfirmation,
+  renderVoiceConsoleBindingEditor,
+  renderVoiceConsoleEndConfirmation,
+  renderVoiceConsoleMutationConfirmation,
+  renderVoiceConsoleVoicePreview,
+  type VoiceConsolePanelSpec,
+} from "./voice-console-panel.js";
+import { DiscordAdapter } from "./adapter.js";
 import { isWithinRoot, resolveRepoPath } from "../../core/path-utils.js";
 import {
   applyVoiceNoteTranscriptions,
@@ -396,7 +426,7 @@ import {
   resolveAgentBrand,
   withBrandAttachment,
 } from "../../core/agent-brand.js";
-import { resolveDiscordSpeakerName, type DiscordAdapter } from "./adapter.js";
+import { resolveDiscordSpeakerName } from "./adapter.js";
 import type {
   AgentQuotaPoller,
   QuotaConnectionRequest,
@@ -436,6 +466,26 @@ const ORCH_INLINE_FENCE_MAX = 1900;
 export type SlashGateOptions = {
   scope?: string | null;
 };
+
+export interface VoiceConsoleVisibleTurnHandle {
+  consoleId: string;
+  bindingId: string;
+  turnId: string;
+}
+
+/** Package E runtime facade; all renderer paths converge on this contract. */
+export interface VoiceConsoleOrchestratorPort {
+  beginVisibleTurn(channelRef: string, turnId: string): VoiceConsoleVisibleTurnHandle | null;
+  acceptVisibleAgentText(
+    handle: VoiceConsoleVisibleTurnHandle,
+    ordinal: number,
+    text: string
+  ): void;
+  finishVisibleTurn(handle: VoiceConsoleVisibleTurnHandle): Promise<void>;
+  cancelVisibleTurn(handle: VoiceConsoleVisibleTurnHandle): Promise<void>;
+  hasActiveBinding(channelRef: string): boolean;
+  markBindingActivitySettled(channelRef: string): Promise<void>;
+}
 
 /** Discord thread names cap at 100 chars. */
 export const DISCORD_THREAD_NAME_MAX = 100;
@@ -490,14 +540,18 @@ export class Orchestrator {
   /** Gemini Live voice-channel sessions (#98). In-memory run + durable rows. */
   private liveHelpManager?: LiveHelpManager;
   /** Explicit voice binding for authenticated speech → ordinary thread turns. */
-  private threadVoiceManager?: ThreadVoiceManager;
-  private readonly threadVoicePanels = new Map<string, MessageRef>();
-  private readonly threadVoicePanelState = new Map<string, ThreadVoiceRuntimeState>();
-  private readonly threadVoiceInterims = new Map<string, string>();
-  private readonly threadVoicePanelUpdatedAt = new Map<string, number>();
-  private readonly threadVoicePanelTimers = new Map<string, NodeJS.Timeout>();
-  private readonly threadVoicePanelQueues = new Map<string, Promise<void>>();
-  private readonly threadVoiceSpeechByChannel = new Map<string, ThreadVoiceSpeechPipeline>();
+  private voiceConsoleManager?: VoiceConsoleManager;
+  private voiceConsoleControl?: VoiceConsoleController;
+  private voiceConsole?: VoiceConsoleOrchestratorPort;
+  private readonly voiceConsoleSpeechByChannel = new Map<string, VoiceConsoleVisibleTurnHandle>();
+  private readonly voiceConsoleEphemeralViews = new Map<string, {
+    consoleId: string;
+    revision: number;
+    userId: string;
+    actions: ReadonlySet<string>;
+    subjectId?: string;
+  }>();
+  private readonly voiceConsoleEditorDrafts = new Map<string, VoiceConsoleBindingEditorDraft>();
   /** Set by index.ts after construction; event-driven parked-prompt delivery (#88). */
   private parkedManager?: ParkedPromptManager;
   /** Simple-card GIF catalog. Random pick is sync; fetch is off the render path. */
@@ -523,6 +577,10 @@ export class Orchestrator {
    *  branch consumes it so the aborted handoff delivers no partial/stale result.
    *  Both in-memory: a restart ends every live turn anyway. */
   private readonly activeLiveDispatch = new Map<string, string>();
+  /** Exact Voice Console artifact currently inside the ordinary user-turn
+   *  pipeline, plus ids fenced by Package A's durable quarantine recovery. */
+  private readonly activeThreadVoiceDispatch = new Map<string, string>();
+  private readonly quarantinedThreadVoiceDispatches = new Set<string>();
   private readonly interruptedDispatches = new Set<string>();
   /** channelRef → the harness-stamped speaker id of the human turn CURRENTLY
    *  processing on that thread (#71/#57). Set at turn start when speaker identity
@@ -626,6 +684,9 @@ export class Orchestrator {
       this.autocomplete.register("preset", sub, "name", presetNameResponder);
     }
     this.autocomplete.register("config", "tts", "voice", (ctx) =>
+      toAutocompleteChoices(geminiTtsVoiceChoices(ctx.focusedValue))
+    );
+    this.autocomplete.register("voice", "configure", "voice", (ctx) =>
       toAutocompleteChoices(geminiTtsVoiceChoices(ctx.focusedValue))
     );
     this.wireSlashAutocomplete();
@@ -980,6 +1041,12 @@ export class Orchestrator {
       void this.handleTtsEditorComponent(evt).catch((err) => {
         this.logger.warn({ err, customId: evt.customId }, "tts editor component failed");
       });
+      void this.handleVoiceConsoleComponent(evt).catch((err) => {
+        this.logger.warn({ err, customId: evt.customId }, "voice console component failed");
+        void evt.replyEphemeral(
+          `Voice Console action failed: ${err instanceof Error ? err.message : String(err)}`
+        ).catch(() => evt.followUpEphemeral("Voice Console action failed.").catch(() => {}));
+      });
     });
     this.adapter.onChoiceInteraction?.((evt) => this.handleChoiceCardInteraction(evt));
     this.adapter.onThreadDelete?.((channelRef) => this.handleThreadDeleted(channelRef));
@@ -1255,13 +1322,9 @@ export class Orchestrator {
     void link.then(() => {
       if (this.channelQueues.get(channelId) === link) {
         this.channelQueues.delete(channelId);
-        if (this.threadVoiceManager) {
-          for (const session of this.store.listThreadVoiceSessionsWithBufferedSegments()) {
-            if (session.platform === PLATFORM && session.channelRef === channelId) {
-              void this.threadVoiceManager.releaseIfIdle(session.id);
-            }
-          }
-        }
+        void this.voiceConsole?.markBindingActivitySettled(channelId).catch((err) =>
+          this.logger.warn({ err, channelId }, "voice console post-turn settlement failed")
+        );
         void this.tryFireParked(channelId);
       }
     });
@@ -1280,45 +1343,9 @@ export class Orchestrator {
     });
     this.quotaPoller?.recordTurnStart(record.agentId);
 
-    const threadVoiceOutput = this.threadVoiceManager
-      ? this.store.getActiveThreadVoiceForThread(PLATFORM, channel.id)
-      : null;
-    let threadVoiceSpeechWarningPosted = false;
-    const threadVoiceSpeech = threadVoiceOutput && this.threadVoiceManager
-      ? new ThreadVoiceSpeechPipeline({
-          synthesize: (text) => synthesizeSpeechWithGemini({
-            apiKey: this.config.SEAM_GEMINI_API_KEY,
-            text,
-            model: this.config.SEAM_GEMINI_TTS_MODEL,
-            voice:
-              resolveThreadTtsVoice(this.config, channel.id)
-              ?? this.config.SEAM_GEMINI_TTS_VOICE,
-            pace: resolveThreadTtsPace(this.config, channel.id),
-            style: resolveThreadTtsStyle(this.config, channel.id),
-          }),
-          speak: (pcm) => this.threadVoiceManager!.speak(threadVoiceOutput.id, pcm),
-          waitForPlaybackIdle: () =>
-            this.threadVoiceManager!.waitForPlaybackIdle(threadVoiceOutput.id),
-          onFailure: (error, text) => {
-            this.logger.warn(
-              { threadVoiceId: threadVoiceOutput.id, error, chars: text.length },
-              "thread voice progressive TTS chunk failed"
-            );
-            if (!threadVoiceSpeechWarningPosted) {
-              threadVoiceSpeechWarningPosted = true;
-              void this.adapter.sendMessage(
-                channel,
-                `_Thread Voice couldn't speak part of this reply:_ ${error.slice(0, 160)}`
-              ).catch(() => {});
-            }
-          },
-        })
-      : undefined;
-    if (threadVoiceOutput) {
-      this.threadVoiceSpeechByChannel.set(channel.id, threadVoiceSpeech!);
-      this.threadVoicePanelState.set(threadVoiceOutput.id, "agent_working");
-      void this.enqueueThreadVoicePanel(threadVoiceOutput.id);
-    }
+    const voiceConsoleBound = this.voiceConsole?.hasActiveBinding(channel.id) ?? false;
+    let voiceConsoleSpeech: VoiceConsoleVisibleTurnHandle | null = null;
+    let voiceConsoleEventOrdinal = 0;
 
     // #76: live-turn marker — written at START, removed at terminal state
     // (this finally, or the command layer). Markers are written even when
@@ -1343,6 +1370,8 @@ export class Orchestrator {
       );
     }
     this.liveTurnByChannel.set(channel.id, liveMarkerId);
+    voiceConsoleSpeech = this.voiceConsole?.beginVisibleTurn(channel.id, liveMarkerId) ?? null;
+    if (voiceConsoleSpeech) this.voiceConsoleSpeechByChannel.set(channel.id, voiceConsoleSpeech);
 
     // A new turn owns this session's status card now — cancel any lingering
     // "settle back to Monitoring" timer left by the previous turn's background
@@ -1815,6 +1844,13 @@ export class Orchestrator {
               }
             }
             totalAgentChars += event.text.length;
+            if (voiceConsoleSpeech) {
+              this.voiceConsole?.acceptVisibleAgentText(
+                voiceConsoleSpeech,
+                ++voiceConsoleEventOrdinal,
+                event.text
+              );
+            }
             // Run text through the fence extractor and process each
             // ordered segment. Prose flows into the chat pipeline;
             // fence-open forces a flush of preceding prose; fence-close
@@ -1823,7 +1859,6 @@ export class Orchestrator {
             for (const seg of fenceResult.segments) {
               if (seg.kind === "prose") {
                 if (seg.text) {
-                  threadVoiceSpeech?.feed(seg.text);
                   textBuffer += seg.text;
                   maybeFlush();
                   armIdleFlush();
@@ -2212,7 +2247,6 @@ export class Orchestrator {
       for (const seg of tail.segments) {
         if (seg.kind === "prose") {
           if (seg.text) {
-            threadVoiceSpeech?.feed(seg.text);
             textBuffer += seg.text;
           }
         } else if (seg.kind === "fence-open") {
@@ -2248,14 +2282,7 @@ export class Orchestrator {
 
       const turnOk =
         result !== "timeout" && !(result as { cancelled?: boolean }).cancelled;
-      if (threadVoiceSpeech) {
-        const speech = await threadVoiceSpeech.flushAndDrain();
-        this.logger.info(
-          { threadVoiceId: threadVoiceOutput!.id, ...speech },
-          "thread voice progressive speech drained"
-        );
-      }
-      if (turnOk && shouldAttachCompletedTurnVoice(Boolean(threadVoiceOutput))) {
+      if (turnOk && shouldAttachCompletedTurnVoice(voiceConsoleBound)) {
         await this.maybeSpeakTurn({
           channel,
           threadId: channel.id,
@@ -2413,7 +2440,6 @@ export class Orchestrator {
       this.logger.error({ err, session: record.id }, "turn failed");
       cancelFlushTimer();
       await flushChunks();
-      await threadVoiceSpeech?.flushAndDrain();
       // If the agent reports that the session is gone (e.g. bridge restarted
       // with a fresh agent process), evict the dead runtime so the next message
       // triggers a clean newSession rather than repeatedly failing.
@@ -2474,16 +2500,16 @@ export class Orchestrator {
       status.setState("Failed");
       status.setAction(this.renderer.trimShort(isSessionGoneError(err) ? "Session lost — please resend your message." : errMsg, 120));
     } finally {
-      await threadVoiceSpeech?.flushAndDrain();
-      if (threadVoiceOutput) {
-        if (this.threadVoiceSpeechByChannel.get(channel.id) === threadVoiceSpeech) {
-          this.threadVoiceSpeechByChannel.delete(channel.id);
-        }
-        this.threadVoicePanelState.set(
-          threadVoiceOutput.id,
-          this.threadVoiceManager?.getRuntimeState(threadVoiceOutput.id) ?? "ready"
+      if (voiceConsoleSpeech) {
+        await this.voiceConsole?.finishVisibleTurn(voiceConsoleSpeech).catch((err) =>
+          this.logger.warn(
+            { err, bindingId: voiceConsoleSpeech?.bindingId, turnId: voiceConsoleSpeech?.turnId },
+            "voice console visible speech settlement failed"
+          )
         );
-        void this.enqueueThreadVoicePanel(threadVoiceOutput.id);
+        if (this.voiceConsoleSpeechByChannel.get(channel.id) === voiceConsoleSpeech) {
+          this.voiceConsoleSpeechByChannel.delete(channel.id);
+        }
       }
       // The main turn is fully finalized: any further generative activity on
       // this runtime is an agent-initiated woken turn (handled in eventHandler),
@@ -3895,126 +3921,17 @@ export class Orchestrator {
     this.liveHelpManager = m;
   }
 
-  setThreadVoiceManager(m: ThreadVoiceManager): void {
-    this.threadVoiceManager = m;
+  setVoiceConsoleController(controller: VoiceConsoleOrchestratorPort): void {
+    this.voiceConsole = controller;
   }
 
-  async notifyThreadVoice(
-    threadId: string,
-    event: ThreadVoiceNotification
-  ): Promise<void> {
-    if (event.kind === "state") this.threadVoicePanelState.set(event.sessionId, event.state);
-    if (event.kind === "interim") this.threadVoiceInterims.set(event.sessionId, event.text);
-    if (event.kind === "final" || event.kind === "ended" || event.kind === "failed") {
-      this.threadVoiceInterims.delete(event.sessionId);
-    }
-    if (event.kind === "ended") this.threadVoicePanelState.set(event.sessionId, "ended");
-    if (event.kind === "failed") this.threadVoicePanelState.set(event.sessionId, "failed");
-
-    if (event.kind === "final") {
-      const row = this.store.getThreadVoiceSession(event.sessionId);
-      if (row) {
-        if (
-          this.isChannelBusy(row.channelRef)
-          || this.threadVoiceManager?.getActiveDispatchId(row)
-        ) {
-          this.threadVoicePanelState.set(event.sessionId, "queued");
-        }
-        const channel = {
-          platform: PLATFORM,
-          id: threadId,
-          ...(row.parentRef ? { parentId: row.parentRef } : {}),
-        };
-        for (const message of threadVoiceTranscriptMessages(row.ownerName, event.segment.transcript)) {
-          await this.adapter.sendMessage(channel, message);
-        }
-      }
-    }
-
-    const urgent = event.kind === "final" || event.kind === "ended" || event.kind === "failed";
-    const since = Date.now() - (this.threadVoicePanelUpdatedAt.get(event.sessionId) ?? 0);
-    if (!urgent && since < 1_000) {
-      if (!this.threadVoicePanelTimers.has(event.sessionId)) {
-        const timer = setTimeout(() => {
-          this.threadVoicePanelTimers.delete(event.sessionId);
-          void this.enqueueThreadVoicePanel(event.sessionId);
-        }, 1_000 - since);
-        this.threadVoicePanelTimers.set(event.sessionId, timer);
-      }
-      return;
-    }
-    const timer = this.threadVoicePanelTimers.get(event.sessionId);
-    if (timer) clearTimeout(timer);
-    this.threadVoicePanelTimers.delete(event.sessionId);
-    await this.enqueueThreadVoicePanel(event.sessionId);
-  }
-
-  private enqueueThreadVoicePanel(sessionId: string): Promise<void> {
-    const prior = this.threadVoicePanelQueues.get(sessionId) ?? Promise.resolve();
-    const run = prior.then(() => this.renderThreadVoicePanel(sessionId));
-    const safe = run.catch((err) => {
-      this.logger.warn({ err, threadVoiceId: sessionId }, "thread voice panel update failed");
-    });
-    this.threadVoicePanelQueues.set(sessionId, safe);
-    void safe.finally(() => {
-      if (this.threadVoicePanelQueues.get(sessionId) === safe) {
-        this.threadVoicePanelQueues.delete(sessionId);
-      }
-    });
-    return run;
-  }
-
-  private async renderThreadVoicePanel(sessionId: string): Promise<void> {
-    const row = this.store.getThreadVoiceSession(sessionId);
-    if (!row) return;
-    const pending = this.store.getThreadVoicePendingStats(row.platform, row.channelRef);
-    const state = this.threadVoicePanelState.get(sessionId)
-      ?? this.threadVoiceManager?.getRuntimeState(sessionId)
-      ?? (row.status === "ended" ? "ended" : row.status === "failed" ? "failed" : "starting");
-    const interim = this.threadVoiceInterims.get(sessionId)?.trim();
-    const panel: StructuredPanel = {
-      color: state === "failed" ? 0xe74c3c : state === "ended" ? 0x95a5a6 : 0x5865f2,
-      title: "🎧 Thread Voice",
-      description: state === "starting"
-        ? "Starting explicit owner-only capture. Final transcripts are visible and become normal prompts in this thread."
-        : undefined,
-      fields: [
-        { name: "State", value: threadVoiceStateLabel(state), inline: true },
-        { name: "Owner", value: `<@${row.ownerUserId}>`, inline: true },
-        { name: "Voice channel", value: `<#${row.voiceChannelId}>`, inline: true },
-        { name: "Transmitted audio", value: formatVoiceDuration(row.transmittedAudioMs), inline: true },
-        { name: "Pending", value: `${pending.segmentCount} segment${pending.segmentCount === 1 ? "" : "s"} · ${pending.characterCount} chars`, inline: true },
-        { name: "Dispatch", value: pending.activeDispatchId ? `\`${pending.activeDispatchId}\`` : "None", inline: true },
-        ...(interim ? [{ name: "Interim (not dispatched)", value: interim.slice(0, 1_000) }] : []),
-      ],
-      footer: `Session ${row.id}`,
-    };
-    const channel: ChannelRef = {
-      platform: PLATFORM,
-      id: row.channelRef,
-      ...(row.parentRef ? { parentId: row.parentRef } : {}),
-    };
-    let ref = this.threadVoicePanels.get(sessionId)
-      ?? (row.noticeMessageId ? { channel, id: row.noticeMessageId } : undefined);
-    if (ref) {
-      try {
-        if (this.adapter.editPanel) await this.adapter.editPanel(ref, panel);
-        else await this.adapter.editMessage(ref, serializePanelText(panel));
-      } catch {
-        ref = undefined;
-      }
-    }
-    if (!ref) {
-      ref = this.adapter.sendPanel
-        ? await this.adapter.sendPanel(channel, panel)
-        : await this.adapter.sendMessage(channel, serializePanelText(panel));
-      this.store.updateThreadVoiceSession(sessionId, {
-        noticeMessageId: ref.id,
-        updatedUtc: new Date().toISOString(),
-      });
-    }
-    this.threadVoicePanels.set(sessionId, ref);
-    this.threadVoicePanelUpdatedAt.set(sessionId, Date.now());
+  setVoiceConsoleManager(
+    manager: VoiceConsoleManager,
+    controller: VoiceConsoleController
+  ): void {
+    this.voiceConsoleManager = manager;
+    this.voiceConsoleControl = controller;
+    this.voiceConsole = controller;
   }
 
   setParkedManager(m: ParkedPromptManager): void {
@@ -4944,9 +4861,457 @@ export class Orchestrator {
    * Idle + host ready → run now (no parked row left sitting). Busy or
    * offline → park, do not abort, do not bump generation.
    */
+  private async handleVoiceConsoleComponent(evt: ComponentEvent): Promise<void> {
+    if (!evt.customId.startsWith("tvc:")) return;
+    const parsed = parseVoiceConsoleInteraction({
+      customId: evt.customId,
+      ...(evt.values ? { values: evt.values } : {}),
+    });
+    if (!parsed.ok) {
+      await evt.replyEphemeral("This Voice Console control is malformed or incomplete.");
+      return;
+    }
+    const console = this.store.getVoiceConsole(parsed.id.consoleId);
+    if (!console || console.status === "ended" || console.status === "failed") {
+      await evt.replyEphemeral("This Voice Console is no longer active.");
+      return;
+    }
+    const isAdmin = this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(evt.userId) ?? false;
+    if (evt.userId !== console.ownerUserId && !isAdmin) {
+      await evt.replyEphemeral("Only the Voice Console owner or a Seam admin can use these controls.");
+      return;
+    }
+    if (evt.channel.id !== console.voiceChannelId) {
+      await evt.replyEphemeral("Voice Console controls work only in the connected voice channel's built-in chat.");
+      return;
+    }
+    const action = parsed.id.action;
+    const ephemeral = this.voiceConsoleEphemeralViews.get(evt.messageId);
+    const validEphemeral = ephemeral?.consoleId === console.id &&
+      ephemeral.revision === parsed.id.revision &&
+      ephemeral.userId === evt.userId &&
+      ephemeral.actions.has(action) &&
+      (!ephemeral.subjectId || ephemeral.subjectId === parsed.id.subjectId);
+    if (evt.messageId !== console.cardMessageId && !validEphemeral) {
+      await evt.replyEphemeral("That Voice Console card was replaced. Use the current canonical card.");
+      return;
+    }
+    const bindings = this.store.listVoiceConsoleBindings(console.id);
+    const currentTargets = this.store.listVoiceConsoleInputTargets(console.id).map((row) => row.bindingId);
+    const delegatesRevisionToLedger = VOICE_CONSOLE_DURABLE_ACTIONS.has(action) &&
+      !(action === "fanout-disarm" && currentTargets.length > 1);
+    if (parsed.id.revision !== console.revision && !delegatesRevisionToLedger) {
+      await evt.replyEphemeral("That Voice Console control is stale. The canonical card has been refreshed.");
+      await this.voiceConsoleControl?.refreshCard(console.id, true);
+      return;
+    }
+    if (!this.voiceConsoleControl || !this.voiceConsoleManager) {
+      await evt.replyEphemeral("Voice Console is unavailable on this deployment.");
+      return;
+    }
+
+    if (action === "configure" && parsed.bindingIds.length === 1) {
+      const bindingId = parsed.bindingIds[0]!;
+      const binding = bindings.find((row) => row.id === bindingId);
+      if (!binding) {
+        await evt.replyEphemeral("That binding is no longer active.");
+        return;
+      }
+      const draft: VoiceConsoleBindingEditorDraft = {
+        consoleId: console.id,
+        revision: console.revision,
+        bindingId: binding.id,
+        snapshot: {
+          alias: binding.alias,
+          voice: binding.ttsVoice,
+          pace: isTtsPace(binding.ttsPace ?? "") ? binding.ttsPace as never : "natural",
+          style: isTtsStyle(binding.ttsStyle ?? "") ? binding.ttsStyle as never : "neutral",
+        },
+        overlay: {},
+        voiceIndex: voiceConsoleVoiceIndex(binding.ttsVoice),
+      };
+      this.voiceConsoleEditorDrafts.set(editorDraftKey(evt.userId, binding.id), draft);
+      const panel = renderVoiceConsoleBindingEditor({ draft });
+      const messageId = await evt.replyEphemeralView({
+        embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+        components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
+      });
+      this.voiceConsoleEphemeralViews.set(messageId, {
+        consoleId: console.id,
+        revision: console.revision,
+        userId: evt.userId,
+        actions: VOICE_CONSOLE_EDITOR_ACTIONS,
+        subjectId: binding.id,
+      });
+      return;
+    }
+
+    if (action === "edit-alias" && parsed.id.subjectId) {
+      const draft = this.voiceConsoleEditorDrafts.get(editorDraftKey(evt.userId, parsed.id.subjectId));
+      if (!draft) {
+        await evt.replyEphemeral("That Voice Console editor expired. Open it again from the canonical card.");
+        return;
+      }
+      const modal = buildVoiceConsoleAliasModal(draft);
+      await evt.showModal({
+        customId: modal.customId,
+        title: modal.title,
+        inputs: modal.fields.map((field) => ({
+          id: field.customId,
+          label: field.label,
+          style: field.style,
+          value: field.value,
+          maxLength: field.maxLength,
+          required: field.required,
+        })),
+      });
+      return;
+    }
+
+    if (action === "alias-save" && parsed.id.subjectId) {
+      const alias = parseVoiceConsoleAlias(evt.fields?.alias ?? "");
+      if (!alias.ok) {
+        await evt.replyEphemeral(alias.error);
+        return;
+      }
+      const key = editorDraftKey(evt.userId, parsed.id.subjectId);
+      const draft = this.voiceConsoleEditorDrafts.get(key);
+      if (!draft) {
+        await evt.replyEphemeral("That Voice Console editor expired. Open it again from the canonical card.");
+        return;
+      }
+      draft.overlay.alias = alias.alias;
+      const panel = renderVoiceConsoleBindingEditor({ draft });
+      const messageId = await evt.replyEphemeralView({
+        embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+        components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
+      });
+      this.voiceConsoleEphemeralViews.set(messageId, {
+        consoleId: console.id,
+        revision: console.revision,
+        userId: evt.userId,
+        actions: VOICE_CONSOLE_EDITOR_ACTIONS,
+        subjectId: draft.bindingId,
+      });
+      return;
+    }
+
+    if (parsed.id.subjectId && VOICE_CONSOLE_EDITOR_ACTIONS.has(action)) {
+      const key = editorDraftKey(evt.userId, parsed.id.subjectId);
+      const draft = this.voiceConsoleEditorDrafts.get(key);
+      if (!draft) {
+        await evt.replyEphemeral("That Voice Console editor expired. Open it again from the canonical card.");
+        return;
+      }
+      if (action === "edit-cancel") {
+        this.voiceConsoleEditorDrafts.delete(key);
+        this.voiceConsoleEphemeralViews.delete(evt.messageId);
+        await evt.updateEphemeralView({
+          embeds: [DiscordAdapter.buildVoiceConsoleEmbed(renderVoiceConsoleMutationConfirmation({
+            title: "Voice Console edit cancelled",
+            summary: "The binding profile was not changed.",
+            revision: console.revision,
+          }))],
+          components: [],
+        });
+        return;
+      }
+      if (action === "edit-pace") {
+        const current = effectiveVoiceConsoleBindingProfile(draft);
+        draft.overlay.pace = cycleVoiceConsolePace(current.pace);
+      }
+      if (action === "edit-style") {
+        const current = effectiveVoiceConsoleBindingProfile(draft);
+        draft.overlay.style = cycleVoiceConsoleStyle(current.style);
+      }
+      if (action === "voice-prev") draft.voiceIndex = Math.max(0, draft.voiceIndex - 1);
+      if (action === "voice-next") {
+        draft.voiceIndex = Math.min(GEMINI_TTS_VOICES.length - 1, draft.voiceIndex + 1);
+      }
+      if (action === "voice-use") {
+        draft.overlay.voice = GEMINI_TTS_VOICES[draft.voiceIndex]!.name;
+      }
+      if (action === "duplicate-cancel") {
+        const current = effectiveVoiceConsoleBindingProfile(draft);
+        draft.voiceIndex = voiceConsoleVoiceIndex(current.voice);
+        const panel = renderVoiceConsoleVoicePreview({ draft });
+        await evt.updateEphemeralView({
+          embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+          components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
+        });
+        return;
+      }
+      if (action === "voice-preview") {
+        const loading = renderVoiceConsoleVoicePreview({ draft, sampleStatus: "loading" });
+        await evt.updateEphemeralView({
+          embeds: [DiscordAdapter.buildVoiceConsoleEmbed(loading)],
+          components: DiscordAdapter.buildVoiceConsoleRows(loading.components),
+        });
+        const preview = voiceConsolePreviewRequest(draft);
+        const sample = await getOrCreateTtsSample({
+          dataDir: this.config.DATA_DIR,
+          apiKey: this.config.SEAM_GEMINI_API_KEY,
+          model: this.config.SEAM_GEMINI_TTS_MODEL,
+          voice: preview.voice,
+        });
+        if (sample.ok) {
+          await evt.followUpEphemeralFile({
+            data: sample.ogg,
+            filename: preview.attachmentName,
+            mimeType: "audio/ogg",
+          });
+        } else {
+          await evt.followUpEphemeral(`Preview failed: ${sample.error}`);
+        }
+        return;
+      }
+      if (action === "edit-voice" || action === "voice-prev" || action === "voice-next") {
+        const panel = renderVoiceConsoleVoicePreview({ draft });
+        await evt.updateEphemeralView({
+          embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+          components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
+        });
+        return;
+      }
+      if (action === "voice-back" || action === "voice-use" || action === "edit-pace" || action === "edit-style") {
+        const panel = renderVoiceConsoleBindingEditor({ draft });
+        await evt.updateEphemeralView({
+          embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+          components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
+        });
+        return;
+      }
+      if (action === "edit-save" || action === "duplicate-confirm") {
+        const profile = effectiveVoiceConsoleBindingProfile(draft);
+        const duplicateAliases = bindings
+          .filter((binding) => binding.id !== draft.bindingId && binding.ttsVoice === profile.voice)
+          .map((binding) => binding.alias);
+        if (duplicateAliases.length > 0 && action !== "duplicate-confirm") {
+          const panel = renderDuplicateVoiceConfirmation({ draft, duplicateAliases });
+          await evt.updateEphemeralView({
+            embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+            components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
+          });
+          return;
+        }
+        await evt.deferUpdate();
+        const result = await this.voiceConsoleControl.updateBindingProfile(draft.bindingId, {
+          expectedRevision: parsed.id.revision,
+          alias: profile.alias,
+          voice: profile.voice,
+          pace: profile.pace,
+          style: profile.style,
+          interactionId: evt.interactionId,
+        });
+        if (!result.ok) {
+          await evt.followUpEphemeral(result.error);
+          return;
+        }
+        this.retainVoiceConsoleReplayState(evt.messageId, [action], key);
+        const panel = renderVoiceConsoleMutationConfirmation({
+          title: `Binding saved: ${profile.alias}`,
+          summary: `${profile.voice} · ${profile.pace} · ${profile.style}`,
+          revision: result.value.console.revision,
+        });
+        await evt.updateEphemeralView({
+          embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+          components: [],
+        });
+        return;
+      }
+    }
+
+    if (action === "input") {
+      if (!console.fanoutArmed && parsed.bindingIds.length > 1) {
+        await evt.replyEphemeral("Arm fan-out before selecting more than one input binding.");
+        return;
+      }
+      await evt.deferUpdate();
+      const result = await this.voiceConsoleControl.setInputTargets(
+        console.id,
+        parsed.bindingIds,
+        console.fanoutArmed,
+        parsed.id.revision,
+        evt.interactionId
+      );
+      if (!result.ok) await evt.followUpEphemeral(result.error);
+      return;
+    }
+    if (action === "output") {
+      await evt.deferUpdate();
+      const result = await this.voiceConsoleControl.setOutputBindings(
+        console.id,
+        parsed.bindingIds,
+        parsed.id.revision,
+        evt.interactionId
+      );
+      if (!result.ok) await evt.followUpEphemeral(result.error);
+      return;
+    }
+    if (action === "input-off") {
+      await evt.deferUpdate();
+      const runtimeResult = await this.voiceConsoleControl.setInputTargets(
+        console.id, [], false, parsed.id.revision, evt.interactionId
+      );
+      if (!runtimeResult.ok) await evt.followUpEphemeral(runtimeResult.error);
+      return;
+    }
+    if (action === "fanout-arm") {
+      await evt.deferUpdate();
+      const result = await this.voiceConsoleControl.setInputTargets(
+        console.id, currentTargets, true, parsed.id.revision, evt.interactionId
+      );
+      if (!result.ok) await evt.followUpEphemeral(result.error);
+      return;
+    }
+    if (action === "fanout-disarm") {
+      if (currentTargets.length > 1) {
+        const selected = bindings.filter((binding) => currentTargets.includes(binding.id)).map((binding) => {
+          const pending = this.store.getThreadVoicePendingStats(binding.platform, binding.channelRef);
+          return {
+            bindingId: binding.id,
+            alias: binding.alias,
+            threadId: binding.channelRef,
+            voice: binding.ttsVoice,
+            outputEnabled: binding.outputEnabled,
+            pace: binding.ttsPace ?? "natural",
+            style: binding.ttsStyle ?? "neutral",
+            acpState: this.isChannelBusy(binding.channelRef) ? "working" : "idle",
+            pendingSegments: pending.segmentCount,
+            pendingCharacters: pending.characterCount,
+            speechState: binding.outputEnabled ? "idle" as const : "disabled" as const,
+          };
+        });
+        const panel = renderFanoutDisarmConfirmation({
+          consoleId: console.id,
+          revision: console.revision,
+          selectedBindings: selected,
+        });
+        const messageId = await evt.replyEphemeralView({
+          embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+          components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
+        });
+        this.voiceConsoleEphemeralViews.set(messageId, {
+          consoleId: console.id,
+          revision: console.revision,
+          userId: evt.userId,
+          actions: new Set(["fanout-keep", "fanout-cancel"]),
+        });
+        return;
+      }
+      await evt.deferUpdate();
+      const result = await this.voiceConsoleControl.setInputTargets(
+        console.id, currentTargets, false, parsed.id.revision, evt.interactionId
+      );
+      if (!result.ok) await evt.followUpEphemeral(result.error);
+      return;
+    }
+    if (action === "output-all-on" || action === "output-all-off") {
+      await evt.deferUpdate();
+      const result = await this.voiceConsoleControl.setOutputBindings(
+        console.id,
+        action === "output-all-on" ? bindings.map((row) => row.id) : [],
+        parsed.id.revision,
+        evt.interactionId
+      );
+      if (!result.ok) await evt.followUpEphemeral(result.error);
+      return;
+    }
+    if (action === "page-prev" || action === "page-next") {
+      await evt.deferUpdate();
+      const result = this.store.updateVoiceConsoleCard(console.id, {
+        expectedRevision: parsed.id.revision,
+        cardPage: Math.max(0, console.cardPage + (action === "page-next" ? 1 : -1)),
+        interactionId: evt.interactionId,
+      });
+      if (result.ok && result.value.applied) await this.voiceConsoleControl.refreshCard(console.id, true);
+      if (!result.ok) await evt.followUpEphemeral(result.error);
+      return;
+    }
+    if (action === "refresh") {
+      await evt.deferUpdate();
+      await this.voiceConsoleControl.refreshCard(console.id, true);
+      return;
+    }
+    if (action === "fanout-keep") {
+      if (parsed.bindingIds.length !== 1 || !currentTargets.includes(parsed.bindingIds[0]!)) {
+        await evt.replyEphemeral("Choose one of the input targets shown in this confirmation.");
+        return;
+      }
+      await evt.deferUpdate();
+      const result = await this.voiceConsoleControl.setInputTargets(
+        console.id, parsed.bindingIds, false, parsed.id.revision, evt.interactionId
+      );
+      if (result.ok) this.retainVoiceConsoleReplayState(evt.messageId, [action]);
+      if (!result.ok) await evt.followUpEphemeral(result.error);
+      return;
+    }
+    if (action === "fanout-cancel" || action === "end-cancel") {
+      this.voiceConsoleEphemeralViews.delete(evt.messageId);
+      await evt.deferUpdate();
+      return;
+    }
+    if (action === "end") {
+      const pendingSegments = bindings.reduce((sum, binding) =>
+        sum + this.store.getThreadVoicePendingStats(binding.platform, binding.channelRef).segmentCount, 0
+      );
+      const panel = renderVoiceConsoleEndConfirmation({
+        consoleId: console.id,
+        revision: console.revision,
+        bindingCount: bindings.length,
+        pendingSegments,
+        allowDiscard: pendingSegments > 0,
+      });
+      const messageId = await evt.replyEphemeralView({
+        embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+        components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
+      });
+      this.voiceConsoleEphemeralViews.set(messageId, {
+        consoleId: console.id,
+        revision: console.revision,
+        userId: evt.userId,
+        actions: new Set(["end-preserve", "end-discard", "end-cancel"]),
+      });
+      return;
+    }
+    if (action === "end-preserve" || action === "end-discard") {
+      await evt.deferUpdate();
+      const result = await this.voiceConsoleManager.stopConsole(console.id, {
+        expectedRevision: parsed.id.revision,
+        discardPending: action === "end-discard",
+        interactionId: evt.interactionId,
+        reason: `ended from canonical card by ${evt.userId}`,
+      });
+      if (result.ok) this.retainVoiceConsoleReplayState(evt.messageId, [action]);
+      else await evt.followUpEphemeral(result.error);
+      await this.voiceConsoleControl.refreshCard(console.id, true).catch(() => undefined);
+      return;
+    }
+    await evt.replyEphemeral("That Voice Console action is not available in this view.");
+  }
+
+  /** Keep just enough authenticated ephemeral state for Discord to redeliver
+   * the same durable interaction. A different interaction still reaches the
+   * SQLite revision/fingerprint checks and cannot mutate stale state. */
+  private retainVoiceConsoleReplayState(
+    messageId: string,
+    actions: readonly string[],
+    draftKey?: string
+  ): void {
+    const view = this.voiceConsoleEphemeralViews.get(messageId);
+    if (view) view.actions = new Set(actions);
+    const timer = setTimeout(() => {
+      if (this.voiceConsoleEphemeralViews.get(messageId) === view) {
+        this.voiceConsoleEphemeralViews.delete(messageId);
+      }
+      if (draftKey) this.voiceConsoleEditorDrafts.delete(draftKey);
+    }, 15 * 60_000);
+    timer.unref?.();
+  }
+
   private async cmdThreadVoice(i: ChatInputCommandInteraction): Promise<void> {
-    if (!this.threadVoiceManager) {
-      await i.reply({ content: "Thread Voice is not wired on this deployment.", flags: MessageFlags.Ephemeral });
+    if (!this.voiceConsoleManager || !this.voiceConsoleControl) {
+      await i.reply({ content: "Voice Console is not wired on this deployment.", flags: MessageFlags.Ephemeral });
       return;
     }
     const record = this.recordFromInteraction(i);
@@ -4955,79 +5320,221 @@ export class Orchestrator {
       return;
     }
     const sub = i.options.getSubcommand(true);
-    const active = this.store.getActiveThreadVoiceForThread(PLATFORM, record.channelRef);
+    const binding = this.store.getActiveVoiceConsoleBindingForThread(PLATFORM, record.channelRef);
+    const owned = this.store.getActiveVoiceConsoleForOwner(i.guildId, i.user.id);
+    // This slash group is already admin-gated. A configured admin may operate
+    // the guild's one shared console even when they are not its immutable owner.
+    const controllable = owned ?? this.store.getActiveVoiceConsoleForGuild(i.guildId);
+    const active = binding ? this.store.getVoiceConsole(binding.consoleId) : controllable;
     if (sub === "start") {
       if (!this.config.SEAM_GEMINI_API_KEY.trim()) {
         await i.reply({
-          content: "Thread Voice requires `SEAM_GEMINI_API_KEY` on this deployment.",
+          content: "Voice Console requires `SEAM_GEMINI_API_KEY` on this deployment.",
           flags: MessageFlags.Ephemeral,
         });
         return;
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
-      const result = await this.threadVoiceManager.start({
+      const requestedAlias = i.options.getString("alias")?.trim();
+      const threadName = await this.adapter.getThreadName?.({
         platform: PLATFORM,
+        id: record.channelRef,
+        ...(record.parentRef ? { parentId: record.parentRef } : {}),
+      }).catch(() => undefined);
+      const result = await this.voiceConsoleControl.start({
+        guildId: i.guildId,
         channelRef: record.channelRef,
         parentRef: record.parentRef,
-        guildId: i.guildId,
         ownerUserId: i.user.id,
         ownerName: sanitizeSpeakerName(i.member && "displayName" in i.member
           ? String(i.member.displayName)
           : i.user.globalName ?? i.user.username),
+        alias: requestedAlias || threadName?.slice(0, 32) || `Thread ${record.channelRef.slice(-6)}`,
+        ttsVoice: resolveThreadTtsVoice(this.config, record.channelRef) ?? this.config.SEAM_GEMINI_TTS_VOICE,
+        ttsPace: resolveThreadTtsPace(this.config, record.channelRef) ?? "natural",
+        ttsStyle: resolveThreadTtsStyle(this.config, record.channelRef) ?? "neutral",
       });
       if (!result.ok) {
         await i.editReply(result.error);
         return;
       }
       await i.editReply(
-        `🎧 Thread Voice \`${result.session.id}\` is starting in <#${result.session.voiceChannelId}>. ` +
-        "Only your unmuted audio is captured. Final transcripts are posted visibly here and become normal authenticated prompts."
+        `🎛️ Voice Console \`${result.console.id}\` is active in <#${result.console.voiceChannelId}>. ` +
+        "Its canonical controls are in that voice channel's built-in chat."
       );
       return;
     }
-    if (!active) {
-      await i.reply({ content: "No active Thread Voice session is bound to this thread.", flags: MessageFlags.Ephemeral });
+
+    if (sub === "add") {
+      if (!controllable) {
+        await i.reply({ content: "Start your Voice Console before adding another thread.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (binding) {
+        await i.reply({ content: "This thread is already bound to an active Voice Console.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      const requestedAlias = i.options.getString("alias")?.trim();
+      const threadName = await this.adapter.getThreadName?.({
+        platform: PLATFORM,
+        id: record.channelRef,
+        ...(record.parentRef ? { parentId: record.parentRef } : {}),
+      }).catch(() => undefined);
+      const result = await this.voiceConsoleControl.addBindingCommand({
+        consoleId: controllable.id,
+        channelRef: record.channelRef,
+        parentRef: record.parentRef,
+        alias: requestedAlias || threadName?.slice(0, 32) || `Thread ${record.channelRef.slice(-6)}`,
+        claim: i.options.getBoolean("claim") ?? true,
+        ttsVoice: resolveThreadTtsVoice(this.config, record.channelRef) ?? this.config.SEAM_GEMINI_TTS_VOICE,
+        ttsPace: resolveThreadTtsPace(this.config, record.channelRef) ?? "natural",
+        ttsStyle: resolveThreadTtsStyle(this.config, record.channelRef) ?? "neutral",
+      });
+      await i.editReply(result.ok
+        ? `✅ Added this thread to Voice Console \`${controllable.id}\`.`
+        : result.error);
       return;
     }
-    if (sub === "stop") {
-      const isAdmin = this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(i.user.id) ?? false;
-      if (active.ownerUserId !== i.user.id && !isAdmin) {
-        await i.reply({ content: "Only the Thread Voice owner or an admin can stop this session.", flags: MessageFlags.Ephemeral });
+
+    if (!active) {
+      await i.reply({ content: "No active Voice Console applies to this thread or owner.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (sub === "remove") {
+      if (!binding) {
+        await i.reply({ content: "This thread has no active Voice Console binding.", flags: MessageFlags.Ephemeral });
         return;
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       const discardPending = i.options.getBoolean("discard-pending") ?? false;
-      this.threadVoiceSpeechByChannel.get(record.channelRef)?.cancel();
-      const result = await this.threadVoiceManager.stop(active.id, {
+      const result = await this.voiceConsoleManager.removeBinding(binding.id, {
+        expectedRevision: active.revision,
+        discardPending,
+        reason: `removed by ${i.user.id}`,
+      });
+      await i.editReply(result.ok
+        ? `🗑️ Binding removed.${discardPending ? ` Discarded ${result.discarded} artifact-free segment${result.discarded === 1 ? "" : "s"}.` : " Finalized pending text was preserved."}`
+        : result.error);
+      return;
+    }
+
+    if (sub === "configure") {
+      if (!binding) {
+        await i.reply({ content: "This thread has no active Voice Console binding.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const alias = i.options.getString("alias")?.trim();
+      const voice = i.options.getString("voice")?.trim();
+      const pace = i.options.getString("pace")?.trim();
+      const style = i.options.getString("style")?.trim();
+      if (!alias && !voice && !pace && !style) {
+        const draft: VoiceConsoleBindingEditorDraft = {
+          consoleId: active.id,
+          revision: active.revision,
+          bindingId: binding.id,
+          snapshot: {
+            alias: binding.alias,
+            voice: binding.ttsVoice,
+            pace: isTtsPace(binding.ttsPace ?? "") ? binding.ttsPace as never : "natural",
+            style: isTtsStyle(binding.ttsStyle ?? "") ? binding.ttsStyle as never : "neutral",
+          },
+          overlay: {},
+          voiceIndex: voiceConsoleVoiceIndex(binding.ttsVoice),
+        };
+        this.voiceConsoleEditorDrafts.set(editorDraftKey(i.user.id, binding.id), draft);
+        const panel = renderVoiceConsoleBindingEditor({ draft });
+        await i.reply({
+          embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+          components: DiscordAdapter.buildVoiceConsoleRows(panel.components),
+          flags: MessageFlags.Ephemeral,
+        });
+        const message = await i.fetchReply();
+        this.voiceConsoleEphemeralViews.set(message.id, {
+          consoleId: active.id,
+          revision: active.revision,
+          userId: i.user.id,
+          actions: VOICE_CONSOLE_EDITOR_ACTIONS,
+          subjectId: binding.id,
+        });
+        return;
+      }
+      if (voice && !findGeminiTtsVoice(voice)) {
+        await i.reply({ content: "Choose a voice from the Gemini TTS catalog.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (voice) {
+        const duplicateAliases = this.store.listVoiceConsoleBindings(active.id)
+          .filter((candidate) => candidate.id !== binding.id && candidate.ttsVoice === voice)
+          .map((candidate) => inertVoiceConsoleAlias(candidate.alias));
+        if (duplicateAliases.length > 0) {
+          await i.reply({
+            content:
+              `That voice is already used by ${duplicateAliases.join(", ")}. ` +
+              "Run `/seam voice configure` with no options and confirm the duplicate in the editor.",
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+      }
+      if (pace && !isTtsPace(pace) || style && !isTtsStyle(style)) {
+        await i.reply({ content: "Invalid Voice Console pace or style.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const result = await this.voiceConsoleControl.updateBindingProfile(binding.id, {
+        expectedRevision: active.revision,
+        ...(alias ? { alias } : {}),
+        ...(voice ? { voice } : {}),
+        ...(pace && isTtsPace(pace) ? { pace } : {}),
+        ...(style && isTtsStyle(style) ? { style } : {}),
+      });
+      await i.reply({
+        content: result.ok ? "✅ Voice Console binding profile updated." : result.error,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (sub === "console") {
+      if (i.options.getBoolean("repost") ?? false) {
+        await i.deferReply({ flags: MessageFlags.Ephemeral });
+        const posted = await this.voiceConsoleControl.repostCard(active.id);
+        await i.editReply(`✅ Reposted the canonical card in <#${posted.channel.id}>.`);
+      } else {
+        await i.reply({
+          content: active.cardMessageId
+            ? `Canonical card: https://discord.com/channels/${active.guildId}/${active.voiceChannelId}/${active.cardMessageId}`
+            : "The canonical card is missing; use `repost:true`.",
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+      return;
+    }
+
+    if (sub === "stop") {
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      const discardPending = i.options.getBoolean("discard-pending") ?? false;
+      const result = await this.voiceConsoleManager.stopConsole(active.id, {
+        expectedRevision: active.revision,
         discardPending,
         reason: `stopped by ${i.user.id}`,
       });
+      await this.voiceConsoleControl.refreshCard(active.id, true).catch(() => undefined);
       await i.editReply(result.ok
-        ? `🛑 Thread Voice stopped.${discardPending ? ` Discarded ${result.discarded} pending segment${result.discarded === 1 ? "" : "s"}.` : " Finalized pending text was preserved."}`
+        ? `🛑 Voice Console stopped.${discardPending ? ` Discarded ${result.discarded} pending segment${result.discarded === 1 ? "" : "s"}.` : " Finalized pending text was preserved."}`
         : result.error);
       return;
     }
     if (sub === "status") {
-      const pending = this.store.getThreadVoicePendingStats(PLATFORM, record.channelRef);
-      const runtime: ThreadVoiceRuntimeState = pending.activeDispatchId
-        ? "agent_working"
-        : pending.segmentCount > 0 && this.isChannelBusy(record.channelRef)
-          ? "queued"
-          : this.threadVoiceManager.getRuntimeState(active.id)
-            ?? (active.status === "starting" ? "starting" : "ready");
+      const pages = this.voiceConsoleControl.statusPages(active.id);
       await i.reply({
-        content: [
-          `🎧 **Thread Voice** \`${active.id}\``,
-          `Owner: <@${active.ownerUserId}>`,
-          `Voice channel: <#${active.voiceChannelId}>`,
-          `Runtime: **${threadVoiceStateLabel(runtime)}**`,
-          `Transmitted audio: ${formatVoiceDuration(active.transmittedAudioMs)}`,
-          `Current utterance: ${runtime === "capturing" ? "capturing" : runtime === "transcribing" ? "transcribing" : "none"}`,
-          `Pending: ${pending.segmentCount} segment${pending.segmentCount === 1 ? "" : "s"}, ${pending.characterCount} chars`,
-          `Dispatch: ${pending.activeDispatchId ? `\`${pending.activeDispatchId}\`` : "none"}`,
-        ].join("\n"),
+        embeds: [voiceConsoleEmbed(pages[0]!)],
         flags: MessageFlags.Ephemeral,
       });
+      for (const page of pages.slice(1)) {
+        await i.followUp({ embeds: [voiceConsoleEmbed(page)], flags: MessageFlags.Ephemeral });
+      }
       return;
     }
     await i.reply({ content: `Unknown voice command: ${sub}`, flags: MessageFlags.Ephemeral });
@@ -5759,6 +6266,11 @@ export class Orchestrator {
         this.choiceResults.bindSession(record.id, spec.id);
         this.choiceResults.bindChannel(spec.target, spec.id);
       }
+      const dispatchSpeech = streaming
+        ? this.voiceConsole?.beginVisibleTurn(spec.target, `dispatch:${spec.id}`) ?? null
+        : null;
+      let dispatchSpeechOrdinal = 0;
+      if (dispatchSpeech) this.voiceConsoleSpeechByChannel.set(spec.target, dispatchSpeech);
       let result: InjectTurnResult | undefined;
       try {
         result = await this.injectTurn(record, effectivePrompt, {
@@ -5795,10 +6307,17 @@ export class Orchestrator {
           // injectTurn still accumulates the FULL text into `result.text` in
           // parallel, so streaming stays lossless — report-back / done-file get
           // the whole answer regardless.
-          ...(msgRenderer || streamPanel || statusPanel
+          ...(msgRenderer || streamPanel || statusPanel || dispatchSpeech
             ? {
                 onEvent: async (event) => {
                   if (event.kind === "agent-text") {
+                    if (dispatchSpeech) {
+                      this.voiceConsole?.acceptVisibleAgentText(
+                        dispatchSpeech,
+                        ++dispatchSpeechOrdinal,
+                        event.text
+                      );
+                    }
                     if (msgRenderer) msgRenderer.feed(event.text);
                     else if (streamPanel) streamPanel.append(event.text);
                   }
@@ -5832,6 +6351,25 @@ export class Orchestrator {
             ? (method, params) => liveRuntime.request(method, params)
             : undefined;
         void this.quotaPoller?.turnCompleted(quotaAgentId, quotaRequest);
+        if (dispatchSpeech) {
+          await this.voiceConsole?.finishVisibleTurn(dispatchSpeech).catch((err) =>
+            this.logger.warn(
+              { err, bindingId: dispatchSpeech.bindingId, dispatch: spec.id },
+              "voice console dispatch speech settlement failed"
+            )
+          );
+          if (this.voiceConsoleSpeechByChannel.get(spec.target) === dispatchSpeech) {
+            this.voiceConsoleSpeechByChannel.delete(spec.target);
+          }
+          if (!isLiveDispatch) {
+            await this.voiceConsole?.markBindingActivitySettled(spec.target).catch((err) =>
+              this.logger.warn(
+                { err, bindingId: dispatchSpeech.bindingId, dispatch: spec.id },
+                "isolated dispatch Voice Console binding settlement failed"
+              )
+            );
+          }
+        }
       }
       if (!result) throw new Error("dispatch: injectTurn returned no result");
 
@@ -5937,29 +6475,41 @@ export class Orchestrator {
   private async dispatchThreadVoice(
     spec: DispatchSpec
   ): Promise<{ output: string; stopReason: string }> {
-    if (!this.threadVoiceManager) throw new Error("Thread Voice manager is not wired");
-    if (!spec.authorId || !spec.authorName || !spec.threadVoiceSessionId) {
+    if (!this.voiceConsoleManager) throw new Error("Voice Console manager is not wired");
+    if (
+      !spec.authorId ||
+      !spec.authorName ||
+      (!spec.voiceConsoleBindingId && !spec.threadVoiceSessionId)
+    ) {
       throw new Error("thread_voice dispatch is missing trusted speaker metadata");
     }
-    const batch = this.store.getThreadVoiceBatch(spec.id);
+    const batch = this.store.getVoiceConsoleBatch(spec.id);
+    const bindingId = spec.voiceConsoleBindingId ?? spec.threadVoiceSessionId!;
+    const consoleId = spec.voiceConsoleId ?? batch?.binding.consoleId;
     if (
       !batch ||
-      batch.session.id !== spec.threadVoiceSessionId ||
-      batch.session.channelRef !== spec.target ||
-      batch.session.ownerUserId !== spec.authorId ||
-      batch.session.ownerName !== spec.authorName ||
+      !batch.console ||
+      batch.console.id !== consoleId ||
+      batch.binding.id !== bindingId ||
+      batch.binding.consoleId !== consoleId ||
+      batch.binding.channelRef !== spec.target ||
+      batch.authorId !== spec.authorId ||
+      batch.authorName !== spec.authorName ||
       batch.prompt !== spec.prompt ||
       batch.segments.some(
-        (segment) => segment.dispatchId !== spec.id || segment.authorId !== spec.authorId
+        (segment) => segment.dispatchId !== spec.id ||
+          segment.bindingId !== bindingId ||
+          segment.authorId !== spec.authorId ||
+          segment.authorName !== spec.authorName
       )
     ) {
-      throw new Error("thread_voice dispatch metadata does not match its durable batch owner");
+      throw new Error("thread_voice dispatch metadata does not match its durable console batch");
     }
 
     const record = this.router.ensureSessionRecord({
       platform: PLATFORM,
       channelRef: spec.target,
-      ...(batch.session.parentRef ? { parentRef: batch.session.parentRef } : {}),
+      ...(batch.binding.parentRef ? { parentRef: batch.binding.parentRef } : {}),
       cwd: this.config.REPOS_ROOT,
     });
     try {
@@ -5970,7 +6520,7 @@ export class Orchestrator {
         targetRef: spec.target,
         worker: null,
         promptPreview: spec.prompt,
-        correlationId: batch.session.id,
+        correlationId: batch.console.id,
         status: "dispatched",
       });
     } catch (err) {
@@ -5981,7 +6531,7 @@ export class Orchestrator {
       channel: {
         platform: PLATFORM,
         id: spec.target,
-        ...(batch.session.parentRef ? { parentId: batch.session.parentRef } : {}),
+        ...(batch.binding.parentRef ? { parentId: batch.binding.parentRef } : {}),
       },
       authorId: spec.authorId,
       authorName: spec.authorName,
@@ -5989,23 +6539,51 @@ export class Orchestrator {
       text: spec.prompt,
     };
     try {
+      if (this.quarantinedThreadVoiceDispatches.has(spec.id)) {
+        throw new Error("thread_voice dispatch was quarantined before execution");
+      }
       try {
         this.store.updateDelegationStatus(spec.id, "running", {
           ...(record.acpSessionId ? { acpSessionId: record.acpSessionId } : {}),
         });
       } catch { /* best effort */ }
-      await this.queueOnChannel(spec.target, () => this.handleIncomingMessageInner(synthetic));
+      await this.queueOnChannel(spec.target, async () => {
+        if (this.quarantinedThreadVoiceDispatches.has(spec.id)) {
+          throw new Error("thread_voice dispatch was quarantined while queued");
+        }
+        this.activeThreadVoiceDispatch.set(spec.target, spec.id);
+        try {
+          await this.handleIncomingMessageInner(synthetic);
+        } finally {
+          if (this.activeThreadVoiceDispatch.get(spec.target) === spec.id) {
+            this.activeThreadVoiceDispatch.delete(spec.target);
+          }
+        }
+      });
       try { this.store.updateDelegationStatus(spec.id, "completed"); } catch { /* best effort */ }
       return { output: "", stopReason: "end_turn" };
     } catch (err) {
       try { this.store.updateDelegationStatus(spec.id, "failed"); } catch { /* best effort */ }
       throw err;
     } finally {
-      await this.threadVoiceManager.markDispatchSettled(
-        spec.threadVoiceSessionId,
+      this.quarantinedThreadVoiceDispatches.delete(spec.id);
+      await this.voiceConsoleManager.markDispatchSettled(
+        bindingId,
         spec.id
       );
     }
+  }
+
+  /** Fence one verified Thread Voice artifact without disturbing unrelated
+   *  typed or dispatched work in the same channel. Called only when the
+   *  DispatchWatcher reports that this exact id was already claimed. */
+  async quarantineThreadVoiceDispatch(target: string, dispatchId: string): Promise<void> {
+    this.quarantinedThreadVoiceDispatches.add(dispatchId);
+    if (this.activeThreadVoiceDispatch.get(target) !== dispatchId) return;
+    const speech = this.voiceConsoleSpeechByChannel.get(target);
+    if (speech) await this.voiceConsole?.cancelVisibleTurn(speech);
+    const record = this.store.getByChannel(PLATFORM, target);
+    if (record) await this.router.abortTurn(record.id, { force: true });
   }
 
   /**
@@ -7179,7 +7757,40 @@ export class Orchestrator {
       await this.sendResultCard(target, `⏰ ${row.name} — failed`, `❌ ${result.error.slice(0, 1500)}`, 0xe74c3c);
     } else {
       this.patchScheduledStatus(id, "ok");
-      await this.postScheduledResult(target, row.name, result.text, row.outputType);
+      await this.postScheduledVisibleResult(target, id, row.name, result.text, row.outputType);
+    }
+  }
+
+  /** Non-streamed scheduled output still participates in the one shared
+   * visible-prose speech boundary. Schedule chrome and failures stay silent. */
+  private async postScheduledVisibleResult(
+    target: ChannelRef,
+    scheduleId: string,
+    name: string,
+    text: string,
+    outputType: "card" | "messages"
+  ): Promise<void> {
+    const speech = text.trim()
+      ? this.voiceConsole?.beginVisibleTurn(target.id, `scheduled:${scheduleId}:${Date.now()}`) ?? null
+      : null;
+    if (speech) this.voiceConsole?.acceptVisibleAgentText(speech, 1, text);
+    try {
+      await this.postScheduledResult(target, name, text, outputType);
+    } finally {
+      if (speech) {
+        await this.voiceConsole?.finishVisibleTurn(speech).catch((err) =>
+          this.logger.warn(
+            { err, bindingId: speech.bindingId, turnId: speech.turnId },
+            "scheduled Voice Console speech drain failed"
+          )
+        );
+      }
+      await this.voiceConsole?.markBindingActivitySettled(target.id).catch((err) =>
+        this.logger.warn(
+          { err, channelRef: target.id, scheduleId },
+          "scheduled Voice Console binding settlement failed"
+        )
+      );
     }
   }
 
@@ -8485,13 +9096,11 @@ export class Orchestrator {
       await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const activeVoice = this.store.getActiveThreadVoiceForThread(PLATFORM, record.channelRef);
-    this.threadVoiceSpeechByChannel.get(record.channelRef)?.cancel();
-    if (activeVoice && this.threadVoiceManager) {
-      await this.threadVoiceManager.stopPlayback(activeVoice.id).catch((err) =>
-        this.logger.warn({ err, threadVoiceId: activeVoice.id }, "force cancel playback stop failed")
-      );
-    }
+    const consoleSpeech = this.voiceConsoleSpeechByChannel.get(record.channelRef);
+    if (consoleSpeech) await this.voiceConsole?.cancelVisibleTurn(consoleSpeech);
+    await this.voiceConsoleControl?.cancelBindingSpeech(record.channelRef).catch((err) =>
+      this.logger.warn({ err, channelRef: record.channelRef }, "force cancel binding speech failed")
+    );
     if (!this.router.hasRuntime(record.id)) {
       const parked = await this.clearParkedForChannel(record.channelRef);
       await i.reply({
@@ -8526,8 +9135,12 @@ export class Orchestrator {
    *  killed session resumes cleanly on its next message. */
   private async cmdKill(i: ChatInputCommandInteraction): Promise<void> {
     await i.deferReply({ flags: MessageFlags.Ephemeral });
-    for (const pipeline of this.threadVoiceSpeechByChannel.values()) pipeline.cancel();
-    await this.threadVoiceManager?.stopAll("global cancel");
+    await Promise.all(
+      [...this.voiceConsoleSpeechByChannel.values()].map((handle) =>
+        this.voiceConsole?.cancelVisibleTurn(handle)
+      )
+    );
+    await this.voiceConsoleControl?.stopAllForGlobalCancel("global cancel");
     // #89 D8: drop parked rows BEFORE killing so turn-end fire cannot run them.
     const parked = await this.clearAllParked();
     // #76: command-layer clear of EVERY marker (killAll → invalidate →
@@ -16376,19 +16989,22 @@ function formatResetTime(iso: string): string {
   return `in ${Math.round(secs / 86400)}d`;
 }
 
-function threadVoiceStateLabel(state: ThreadVoiceRuntimeState): string {
-  switch (state) {
-    case "starting": return "Starting";
-    case "ready": return "Muted / ready";
-    case "capturing": return "Capturing";
-    case "transcribing": return "Transcribing";
-    case "queued": return "Queued";
-    case "agent_working": return "Agent working";
-    case "speaking": return "Speaking";
-    case "stopping": return "Stopping";
-    case "ended": return "Ended";
-    case "failed": return "Failed";
-  }
+function voiceConsoleEmbed(panel: VoiceConsolePanelSpec): EmbedBuilder {
+  const embed = new EmbedBuilder()
+    .setColor(panel.color)
+    .setTitle(panel.title)
+    .addFields(panel.fields.map((field) => ({
+      name: field.name,
+      value: field.value,
+      inline: field.inline ?? false,
+    })));
+  if (panel.description) embed.setDescription(panel.description);
+  if (panel.footer) embed.setFooter({ text: panel.footer });
+  return embed;
+}
+
+function editorDraftKey(userId: string, bindingId: string): string {
+  return `${userId}\u0000${bindingId}`;
 }
 
 function formatVoiceDuration(ms: number): string {

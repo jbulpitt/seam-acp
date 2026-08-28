@@ -55,6 +55,11 @@ export interface DispatchSpec {
    *  accepted only for the internal `thread_voice` kind. */
   authorId?: string;
   authorName?: string;
+  /** V2 console authority; optional only for recoverable legacy V1 artifacts. */
+  voiceConsoleId?: string;
+  /** V2 immutable binding authority. */
+  voiceConsoleBindingId?: string;
+  /** V1 session id or V2 binding id. */
   threadVoiceSessionId?: string;
   /** Compact-kind specs only: which history the pipeline reads — "session"
    *  (the raw session JSONL, the default) or "discord" (reconstructed from the
@@ -132,6 +137,8 @@ export const DispatchSpecSchema = z.object({
   kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact", "parked", "choice", "ingest", "thread_voice"]).optional(),
   authorId: z.string().min(1).optional(),
   authorName: z.string().min(1).optional(),
+  voiceConsoleId: z.string().min(1).optional(),
+  voiceConsoleBindingId: z.string().min(1).optional(),
   threadVoiceSessionId: z.string().min(1).optional(),
   compactSource: z.enum(["session", "discord"]).optional(),
   wakeChainDepth: z.number().int().min(0).optional(),
@@ -141,13 +148,33 @@ export const DispatchSpecSchema = z.object({
   resume: z.boolean().optional(),
   createdUtc: z.string().optional(),
 }).superRefine((value, ctx) => {
-  const trusted = [value.authorId, value.authorName, value.threadVoiceSessionId];
+  const trusted = [
+    value.authorId,
+    value.authorName,
+    value.voiceConsoleId,
+    value.voiceConsoleBindingId,
+    value.threadVoiceSessionId,
+  ];
   if (value.kind === "thread_voice") {
-    if (trusted.some((field) => !field)) {
+    const hasV2Authority =
+      value.voiceConsoleId !== undefined || value.voiceConsoleBindingId !== undefined;
+    const hasLegacyAuthority = value.threadVoiceSessionId !== undefined;
+    const missingAuthority = hasV2Authority
+      ? !value.authorId || !value.authorName || !value.voiceConsoleId || !value.voiceConsoleBindingId
+      : !value.authorId || !value.authorName || !value.threadVoiceSessionId;
+    if (missingAuthority) {
+      ctx.addIssue({
+        code: "custom",
+        path: [hasV2Authority ? "voiceConsoleBindingId" : "threadVoiceSessionId"],
+        message:
+          "thread_voice requires authorId/authorName plus either voiceConsoleId/voiceConsoleBindingId or legacy threadVoiceSessionId",
+      });
+    }
+    if (hasV2Authority && hasLegacyAuthority) {
       ctx.addIssue({
         code: "custom",
         path: ["threadVoiceSessionId"],
-        message: "thread_voice requires authorId, authorName, and threadVoiceSessionId",
+        message: "thread_voice authority must use either V2 console/binding ids or a legacy session id, not both",
       });
     }
     if (value.session !== "live") {
@@ -200,6 +227,8 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.kind ? { kind: d.kind } : {}),
     ...(d.authorId ? { authorId: d.authorId } : {}),
     ...(d.authorName ? { authorName: d.authorName } : {}),
+    ...(d.voiceConsoleId ? { voiceConsoleId: d.voiceConsoleId } : {}),
+    ...(d.voiceConsoleBindingId ? { voiceConsoleBindingId: d.voiceConsoleBindingId } : {}),
     ...(d.threadVoiceSessionId ? { threadVoiceSessionId: d.threadVoiceSessionId } : {}),
     ...(d.compactSource ? { compactSource: d.compactSource } : {}),
     ...(d.wakeChainDepth !== undefined ? { wakeChainDepth: d.wakeChainDepth } : {}),

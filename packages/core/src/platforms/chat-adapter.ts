@@ -282,15 +282,33 @@ export interface ChoiceInteraction {
 
 /** Persistent button / modal interaction (#90). */
 export interface ComponentEvent {
+  /** Stable Discord interaction id used for durable idempotency. */
+  interactionId: string;
   customId: string;
   userId: string;
   userName: string;
   channel: ChannelRef;
   messageId: string;
-  kind: "button" | "modal";
+  kind: "button" | "select" | "modal";
+  values?: string[];
   fields?: Record<string, string>;
   replyEphemeral: (text: string) => Promise<void>;
   followUpEphemeral: (text: string) => Promise<void>;
+  editReplyEphemeral: (text: string) => Promise<void>;
+  /** Platform-native ephemeral rich view; returns the created message id. */
+  replyEphemeralView: (view: {
+    embeds: unknown[];
+    components?: unknown[];
+  }) => Promise<string>;
+  updateEphemeralView: (view: {
+    embeds: unknown[];
+    components?: unknown[];
+  }) => Promise<void>;
+  followUpEphemeralFile: (file: {
+    data: Buffer;
+    filename: string;
+    mimeType: string;
+  }) => Promise<void>;
   deferUpdate: () => Promise<void>;
   showModal: (opts: {
     customId: string;

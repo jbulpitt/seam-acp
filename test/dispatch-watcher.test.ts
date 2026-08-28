@@ -40,6 +40,83 @@ async function readDone(id: string): Promise<Record<string, unknown>> {
 }
 
 describe("DispatchWatcher", () => {
+  it("terminalizes exactly one quarantined artifact and preserves an existing done result", async () => {
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async () => ({ output: "must not run", stopReason: "end_turn" }),
+    });
+    await dropSpec({
+      id: "voice-quarantine",
+      kind: "thread_voice",
+      target: "thread-voice",
+      authorId: "speaker-1",
+      authorName: "Speaker",
+      voiceConsoleId: "console-1",
+      voiceConsoleBindingId: "binding-1",
+    });
+    await mkdir(dirs.done, { recursive: true });
+
+    await expect(watcher.quarantineArtifact("voice-quarantine", "capture identity changed"))
+      .resolves.toEqual({ state: "terminalized", inFlight: false });
+    expect(await readDone("voice-quarantine")).toMatchObject({
+      id: "voice-quarantine",
+      status: "failed",
+      target: "thread-voice",
+      error: "quarantined: capture identity changed",
+    });
+    expect(await readdir(dirs.pending)).toEqual([]);
+
+    const before = await readFile(path.join(dirs.done, "voice-quarantine.json"), "utf8");
+    await expect(watcher.quarantineArtifact("voice-quarantine", "different retry reason"))
+      .resolves.toEqual({ state: "done", inFlight: false });
+    expect(await readFile(path.join(dirs.done, "voice-quarantine.json"), "utf8")).toBe(before);
+  });
+
+  it("fences a claimed quarantined artifact before its callback can execute", async () => {
+    let callbackCalls = 0;
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async (spec) => {
+        callbackCalls++;
+        if (spec.id === "first") await firstGate;
+        return { output: spec.id, stopReason: "end_turn" };
+      },
+    });
+    await dropSpec({ id: "first", target: "same-thread", createdUtc: "2026-01-01T00:00:00.000Z" });
+    await dropSpec({
+      id: "voice-claimed",
+      kind: "thread_voice",
+      target: "same-thread",
+      createdUtc: "2026-01-01T00:00:01.000Z",
+      authorId: "speaker-1",
+      authorName: "Speaker",
+      voiceConsoleId: "console-1",
+      voiceConsoleBindingId: "binding-1",
+    });
+
+    const started = watcher.start();
+    await vi_waitFor(async () =>
+      readdir(dirs.running)
+        .then((names) => names.includes("voice-claimed.json"))
+        .catch(() => false)
+    );
+    await expect(watcher.quarantineArtifact("voice-claimed", "invalid fan-out"))
+      .resolves.toEqual({ state: "terminalized", inFlight: true });
+    releaseFirst();
+    await started;
+    watcher.stop();
+
+    expect(callbackCalls).toBe(1);
+    expect(await readDone("voice-claimed")).toMatchObject({
+      status: "failed",
+      error: "quarantined: invalid fan-out",
+    });
+  });
+
   it("moves a pending spec through running to done with the callback's output", async () => {
     const seen: DispatchSpec[] = [];
     const watcher = new DispatchWatcher({
@@ -292,10 +369,10 @@ describe("DispatchWatcher", () => {
 
 /** Poll until `cond` holds or we give up — small helper so the concurrency test
  *  doesn't depend on arbitrary sleeps. */
-async function vi_waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
+async function vi_waitFor(cond: () => boolean | Promise<boolean>, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (cond()) return;
+    if (await cond()) return;
     await new Promise((r) => setTimeout(r, 5));
   }
   throw new Error("waitFor: condition never became true");

@@ -109,4 +109,68 @@ describe("ThreadVoiceCaptureCoordinator", () => {
     bridge.onForwardedBytes(33);
     expect(onAudioSent).toHaveBeenCalledWith(2);
   });
+
+  it("settles one failed continuation with an empty terminal exactly once", async () => {
+    const onFinal = vi.fn();
+    const onDropped = vi.fn();
+    const transcribe: ThreadVoiceTranscribePort = {
+      startUtterance: vi.fn(async () => {}),
+      sendPcm16k: vi.fn(),
+      finalizeUtterance: vi.fn(async () => ({
+        ok: false as const,
+        error: "live and unary unavailable",
+        source: "unary" as const,
+      })),
+    };
+    const bridge = new ThreadVoiceCaptureCoordinator({
+      ownerUserId: "owner",
+      transcribe,
+      logger: silent,
+      callbacks: {
+        onInterim: vi.fn(),
+        onFinal,
+        onDropped,
+        onAudioSent: vi.fn(),
+      },
+    });
+
+    bridge.onCaptureStart({ sequence: 9, part: 0 });
+    bridge.onPcm({
+      sequence: 9,
+      part: 0,
+      pcm16kMono: Buffer.from([1, 0]),
+      durationMs: 1,
+    });
+    bridge.onCaptureEnd({
+      sequence: 9,
+      part: 0,
+      pcm16kMono: Buffer.alloc(8_000),
+      durationMs: 250,
+      reason: "limit",
+      continuation: true,
+      usable: true,
+    });
+    bridge.onCaptureStart({ sequence: 9, part: 1 });
+    bridge.onCaptureEnd({
+      sequence: 9,
+      part: 1,
+      pcm16kMono: Buffer.alloc(0),
+      durationMs: 0,
+      reason: "mute",
+      continuation: false,
+      usable: false,
+    });
+
+    await bridge.idle();
+    await bridge.idle();
+    expect(transcribe.startUtterance).toHaveBeenCalledOnce();
+    expect(transcribe.finalizeUtterance).toHaveBeenCalledOnce();
+    expect(onFinal).not.toHaveBeenCalled();
+    expect(onDropped).toHaveBeenCalledOnce();
+    expect(onDropped).toHaveBeenCalledWith(expect.objectContaining({
+      sequence: 9,
+      state: "transcribe_failed",
+      error: expect.stringContaining("live and unary unavailable"),
+    }));
+  });
 });

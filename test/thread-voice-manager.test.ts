@@ -65,6 +65,12 @@ async function flush(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-thread-voice-manager-"));
   store = new SessionStore(path.join(dir, "test.db"));
@@ -248,6 +254,67 @@ describe("ThreadVoiceManager lifecycle", () => {
       });
     }
   );
+
+  it("does not enqueue a stale in-memory batch after concurrent explicit discard", async () => {
+    const firstInspection = deferred<"missing">();
+    vi.mocked(dispatch.inspectArtifact)
+      .mockImplementationOnce(() => firstInspection.promise)
+      .mockResolvedValue("missing");
+    const started = await manager.start(startRequest);
+    if (!started.ok) throw new Error(started.error);
+
+    manager.commitFinalSegment(started.session.id, {
+      sequence: 1,
+      authorId: "user-1",
+      transcript: "must not escape after discard",
+      audioMs: 800,
+      capturedStartedUtc: "start",
+      capturedEndedUtc: "end",
+    });
+    await vi.waitFor(() => expect(dispatch.inspectArtifact).toHaveBeenCalledTimes(1));
+
+    const stopping = manager.stop(started.session.id, { discardPending: true });
+    firstInspection.resolve("missing");
+    await expect(stopping).resolves.toEqual({ ok: true, discarded: 1 });
+    expect(store.getThreadVoiceBatch(
+      store.listThreadVoiceSegments(started.session.id)[0]!.dispatchId!
+    )?.segments[0]).toMatchObject({ state: "discarded", transcript: "" });
+
+    await flush();
+    expect(dispatch.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("includes a final committed by capture shutdown in explicit discard", async () => {
+    vi.mocked(host.runSession).mockImplementationOnce(async (opts) => {
+      runOpts = opts;
+      return new Promise<{ reason: string }>((resolve) => {
+        opts.signal.addEventListener("abort", () => {
+          opts.onFinal({
+            sequence: 1,
+            authorId: "user-1",
+            transcript: "finalized during abort",
+            audioMs: 800,
+            capturedStartedUtc: "start",
+            capturedEndedUtc: "end",
+          });
+          resolve({ reason: "cancelled" });
+        }, { once: true });
+      });
+    });
+    const started = await manager.start(startRequest);
+    if (!started.ok) throw new Error(started.error);
+
+    await expect(manager.stop(started.session.id, { discardPending: true })).resolves.toEqual({
+      ok: true,
+      discarded: 1,
+    });
+
+    expect(store.listThreadVoiceSegments(started.session.id)[0]).toMatchObject({
+      state: "discarded",
+      transcript: "",
+    });
+    expect(dispatch.enqueue).not.toHaveBeenCalled();
+  });
 });
 
 describe("ThreadVoiceManager durable release and recovery", () => {

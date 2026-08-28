@@ -75,6 +75,8 @@ export class ThreadVoiceManager {
   private readonly releaseRuns = new Map<string, Promise<boolean>>();
   /** Coalesce callbacks without losing a final that lands during an idle check. */
   private readonly releaseRequested = new Set<string>();
+  /** Explicit discard is a barrier against both new and already-running release passes. */
+  private readonly discardRequested = new Set<string>();
   /** Cleared only by markDispatchSettled, after ACP + speech playback drain. */
   private readonly activeDispatchByThread = new Map<string, string>();
   private readonly requestedStopReasons = new Map<string, string>();
@@ -359,14 +361,18 @@ export class ThreadVoiceManager {
   }
 
   private async releaseIfIdleInner(sessionId: string): Promise<boolean> {
+    if (this.discardRequested.has(sessionId)) return false;
     const session = this.store.getThreadVoiceSession(sessionId);
     if (!session) return false;
     const key = threadKey(session);
     if (this.activeDispatchByThread.has(key)) return false;
     if (await this.dispatch.isHomeThreadBusy(session)) return false;
+    if (this.discardRequested.has(sessionId)) return false;
     await this.host.waitForPlaybackIdle(sessionId);
+    if (this.discardRequested.has(sessionId)) return false;
     if (this.activeDispatchByThread.has(key)) return false;
     if (await this.dispatch.isHomeThreadBusy(session)) return false;
+    if (this.discardRequested.has(sessionId)) return false;
 
     // A later API final must never leapfrog an earlier capture that is still
     // finalizing. A newer active capture does not block already-finalized text.
@@ -385,6 +391,9 @@ export class ThreadVoiceManager {
     if (!batch) return false;
     try {
       const artifact = await this.dispatch.inspectArtifact(batch.dispatchId);
+      // stop(discardPending) may have linearized while artifact inspection was
+      // in flight. Leave the claimed rows durable for stop's final discard.
+      if (this.discardRequested.has(sessionId)) return false;
       if (artifact === "missing") {
         await this.dispatch.enqueue(this.toDispatchRequest(batch));
       }
@@ -435,50 +444,59 @@ export class ThreadVoiceManager {
       return { ok: false, error: "That Thread Voice session has already ended." };
     }
     const reason = opts.reason ?? "stopped";
-    let discarded = opts.discardPending
-      ? this.store.discardPendingThreadVoiceSegments(sessionId, this.now())
-      : 0;
-    if (opts.discardPending) {
-      const batches = this.store
-        .listThreadVoiceBatchesByState("batched")
-        .filter((batch) => batch.session.id === sessionId);
-      for (const batch of batches) {
-        try {
-          // Explicit discard covers finalized-but-undispatched text. Once any
-          // stable artifact exists, the durable dispatch owns those rows and
-          // stop must preserve it.
-          if (await this.dispatch.inspectArtifact(batch.dispatchId) === "missing") {
-            discarded += this.store.discardArtifactFreeThreadVoiceBatch(
-              sessionId,
-              batch.dispatchId,
-              this.now()
+    const discardPending = opts.discardPending === true;
+    if (discardPending) this.discardRequested.add(sessionId);
+    try {
+      this.requestedStopReasons.set(sessionId, reason);
+      this.store.updateThreadVoiceSession(sessionId, {
+        status: "stopping",
+        updatedUtc: this.now(),
+        endReason: reason,
+      });
+      this.setRuntimeState(session, "stopping");
+      const running = this.running.get(sessionId);
+      if (running) {
+        running.abort.abort();
+        await running.done;
+      } else {
+        this.finishPersistedSession(sessionId, "ended", reason);
+        this.releaseLease(session);
+        if (!discardPending) void this.releaseIfIdle(sessionId);
+      }
+
+      let discarded = 0;
+      if (discardPending) {
+        // A release may already own a claimed batch in memory. Wait for it to
+        // observe the barrier before making the final durable discard. Waiting
+        // until capture shutdown also includes finals committed during abort.
+        await this.releaseRuns.get(sessionId);
+        discarded += this.store.discardPendingThreadVoiceSegments(sessionId, this.now());
+        const batches = this.store
+          .listThreadVoiceBatchesByState("batched")
+          .filter((batch) => batch.session.id === sessionId);
+        for (const batch of batches) {
+          try {
+            // Once any stable artifact exists, the durable dispatch owns these
+            // rows and explicit stop must preserve it.
+            if (await this.dispatch.inspectArtifact(batch.dispatchId) === "missing") {
+              discarded += this.store.discardArtifactFreeThreadVoiceBatch(
+                sessionId,
+                batch.dispatchId,
+                this.now()
+              );
+            }
+          } catch (err) {
+            this.logger.warn(
+              { err, threadVoiceId: sessionId, dispatchId: batch.dispatchId },
+              "thread voice discard artifact inspection failed; preserving batch"
             );
           }
-        } catch (err) {
-          this.logger.warn(
-            { err, threadVoiceId: sessionId, dispatchId: batch.dispatchId },
-            "thread voice discard artifact inspection failed; preserving batch"
-          );
         }
       }
+      return { ok: true, discarded };
+    } finally {
+      if (discardPending) this.discardRequested.delete(sessionId);
     }
-    this.requestedStopReasons.set(sessionId, reason);
-    this.store.updateThreadVoiceSession(sessionId, {
-      status: "stopping",
-      updatedUtc: this.now(),
-      endReason: reason,
-    });
-    this.setRuntimeState(session, "stopping");
-    const running = this.running.get(sessionId);
-    if (running) {
-      running.abort.abort();
-      await running.done;
-    } else {
-      this.finishPersistedSession(sessionId, "ended", reason);
-      this.releaseLease(session);
-      if (!opts.discardPending) void this.releaseIfIdle(sessionId);
-    }
-    return { ok: true, discarded };
   }
 
   async stopAll(reason = "global stop"): Promise<void> {

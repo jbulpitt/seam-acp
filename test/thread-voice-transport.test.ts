@@ -64,6 +64,40 @@ describe("ThreadVoiceCaptureGate", () => {
     expect(ends[0]!.pcm16kMono.byteLength).toBe(640);
   });
 
+  it("coalesces duplicate mute edges and rejects packets after the terminal edge", () => {
+    const starts: ThreadVoiceCaptureRef[] = [];
+    const ends: ThreadVoiceCaptureEnd[] = [];
+    const pcm: number[] = [];
+    const gate = new ThreadVoiceCaptureGate({
+      ownerUserId: "owner",
+      minCaptureBytes: 2,
+      callbacks: {
+        onCaptureStart: (capture) => starts.push(capture),
+        onPcm: (chunk) => pcm.push(chunk.sequence),
+        onCaptureEnd: (capture) => ends.push(capture),
+      },
+    });
+
+    gate.setSelfMuted("owner", false);
+    gate.setSelfMuted("owner", false);
+    expect(gate.pushPcm("owner", Buffer.alloc(640, 1))).toBe(true);
+    gate.setSelfMuted("owner", true);
+    expect(gate.pushPcm("owner", Buffer.alloc(640, 2))).toBe(false);
+    gate.setSelfMuted("owner", true);
+
+    gate.setSelfMuted("owner", false);
+    gate.setSelfMuted("owner", true);
+
+    expect(starts).toEqual([
+      { sequence: 1, part: 0 },
+      { sequence: 2, part: 0 },
+    ]);
+    expect(pcm).toEqual([1]);
+    expect(ends).toHaveLength(2);
+    expect(ends.map((capture) => capture.reason)).toEqual(["mute", "mute"]);
+    expect(ends.map((capture) => capture.sequence)).toEqual([1, 2]);
+  });
+
   it("assigns capture order at unmute and marks sub-250ms captures unusable", () => {
     const starts: ThreadVoiceCaptureRef[] = [];
     const ends: ThreadVoiceCaptureEnd[] = [];
@@ -545,5 +579,95 @@ describe("DiscordThreadVoiceCall lifecycle", () => {
     expect(connection.destroy).toHaveBeenCalledTimes(1);
     expect(player.stop).toHaveBeenCalledTimes(1);
     expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("honors reconnect grace and requires a fresh muted edge before recapture", async () => {
+    vi.useFakeTimers();
+    try {
+      const ownerUserId = "owner";
+      const voiceChannelId = "voice";
+      const guildId = "guild";
+      const speaking = new EventEmitter() as EventEmitter & { users: Map<string, number> };
+      speaking.users = new Map();
+      const receiver = {
+        speaking,
+        subscriptions: new Map(),
+        subscribe: vi.fn(() => new PassThrough({ objectMode: true })),
+      };
+      const connection = new EventEmitter() as any;
+      connection.receiver = receiver;
+      connection.subscribe = vi.fn(() => ({ unsubscribe: vi.fn() }));
+      connection.destroy = vi.fn();
+      const channel = {
+        id: voiceChannelId,
+        isVoiceBased: () => true,
+        guild: {
+          id: guildId,
+          voiceAdapterCreator: {},
+          voiceStates: {
+            cache: new Map([[ownerUserId, { channelId: voiceChannelId, selfMute: true }]]),
+          },
+        },
+      };
+      const client = new EventEmitter() as any;
+      client.channels = { fetch: vi.fn(async () => channel) };
+      const player = new EventEmitter() as any;
+      player.state = { status: AudioPlayerStatus.Idle };
+      player.play = vi.fn();
+      player.stop = vi.fn(() => true);
+      const captureStarts = vi.fn();
+      const states: string[] = [];
+      const call = await DiscordThreadVoiceCall.connect({
+        client,
+        guildId,
+        voiceChannelId,
+        ownerUserId,
+        signal: new AbortController().signal,
+        logger: silentLogger,
+        reconnectGraceMs: 30_000,
+        callbacks: {
+          onCaptureStart: captureStarts,
+          onPcm: vi.fn(),
+          onCaptureEnd: vi.fn(),
+          onState: (state) => states.push(state),
+        },
+        dependencies: {
+          getExistingVoiceConnection: () => undefined,
+          join: () => connection,
+          waitUntilReady: async () => {},
+          playback: {
+            createPlayer: (() => player) as never,
+            createResource: ((stream: EventEmitter) => stream) as never,
+            createEncoder: () => ({
+              decode: () => Buffer.alloc(0),
+              encode: () => Buffer.from([1]),
+            }),
+          },
+        },
+      });
+
+      const hereMuted = { id: ownerUserId, channelId: voiceChannelId, selfMute: true };
+      const awayMuted = { id: ownerUserId, channelId: null, selfMute: true };
+      const hereUnmuted = { id: ownerUserId, channelId: voiceChannelId, selfMute: false };
+      client.emit("voiceStateUpdate", hereMuted, awayMuted);
+      await vi.advanceTimersByTimeAsync(29_999);
+      let ended = false;
+      void call.done.then(() => { ended = true; });
+      await Promise.resolve();
+      expect(ended).toBe(false);
+
+      client.emit("voiceStateUpdate", awayMuted, hereUnmuted);
+      client.emit("voiceStateUpdate", hereUnmuted, hereMuted);
+      client.emit("voiceStateUpdate", hereMuted, hereUnmuted);
+      expect(captureStarts).toHaveBeenCalledTimes(1);
+
+      client.emit("voiceStateUpdate", hereUnmuted, awayMuted);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(call.done).resolves.toEqual({ reason: "owner-reconnect-timeout" });
+      expect(states).toContain("reconnecting");
+      expect(connection.destroy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

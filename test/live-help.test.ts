@@ -298,6 +298,44 @@ describe("LiveHelpManager one-session-per-VC + restart", () => {
     });
   }
 
+  it("arbitrates concurrent mints atomically through the shared guild lease", async () => {
+    let releaseInspection!: () => void;
+    const inspectionGate = new Promise<void>((resolve) => { releaseInspection = resolve; });
+    const inspectVoiceChannel = vi.fn(async () => {
+      await inspectionGate;
+      return {
+        ok: true as const,
+        guildId: "guild-1",
+        channelName: "General",
+        type: 2,
+        obfuscated: false,
+      };
+    });
+    const m = mgr({ inspectVoiceChannel });
+    const first = m.mint(
+      record(),
+      { voiceChannelId: "1487095870188027987", system: "tutor one" },
+      "student-one"
+    );
+    const second = m.mint(
+      record(),
+      { voiceChannelId: "1487095870188027987", system: "tutor two" },
+      "student-two"
+    );
+    await vi.waitFor(() => expect(inspectVoiceChannel).toHaveBeenCalledTimes(2));
+    releaseInspection();
+
+    const results = await Promise.all([first, second]);
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    const refused = results.find((result) => !result.ok);
+    expect(refused).toMatchObject({ ok: false });
+    if (refused && !refused.ok) {
+      expect(refused.error).toMatch(/already has a live-help|leased by live_help session/);
+    }
+    const active = results.find((result) => result.ok);
+    if (active?.ok) m.cancel(active.liveId);
+  });
+
   it("names a shared Thread Voice lease conflict without changing Live Help authorization", async () => {
     const leases = new VoiceLeaseManager();
     leases.acquire({

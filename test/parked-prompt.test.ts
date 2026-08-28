@@ -480,7 +480,165 @@ function queueIx(prompt: string, over: Record<string, unknown> = {}) {
   };
 }
 
+function insertBufferedVoice(): void {
+  store.insertThreadVoiceSession({
+    id: "tv_cancel_guard",
+    platform: "discord",
+    channelRef: "thread-1",
+    parentRef: "channel-1",
+    guildId: "guild-1",
+    voiceChannelId: "vc-1",
+    ownerUserId: "user-1",
+    ownerName: "Jesse",
+    status: "ready",
+    noticeMessageId: null,
+    transmittedAudioMs: 0,
+    createdUtc: "2026-08-27T12:00:00.000Z",
+    updatedUtc: "2026-08-27T12:00:00.000Z",
+    endedUtc: null,
+    endReason: null,
+  });
+  store.appendThreadVoiceSegment({
+    id: "tvs_cancel_guard",
+    sessionId: "tv_cancel_guard",
+    sequence: 1,
+    authorId: "user-1",
+    transcript: "must survive ACP cancellation",
+    state: "pending",
+    audioMs: 200,
+    dispatchId: null,
+    capturedStartedUtc: "start",
+    capturedEndedUtc: "end",
+    createdUtc: "2026-08-27T12:00:00.000Z",
+    updatedUtc: "2026-08-27T12:00:00.000Z",
+    error: null,
+  });
+}
+
+function cancelIx() {
+  return {
+    options: { getString: () => null, getBoolean: () => false },
+    deferReply: async () => {},
+    editReply: async () => {},
+    reply: async () => {},
+    channelId: "thread-1",
+    channel: { parentId: "channel-1" },
+  };
+}
+
+describe("Thread Voice cancel coexistence", () => {
+  it("plain cancel aborts ACP gracefully without stopping playback or deleting buffered voice", async () => {
+    insertBufferedVoice();
+    const abortTurn = vi.fn(async () => "cancelled");
+    const { orch } = makeOrch({ ready: true, abortTurn, hasRuntime: () => true });
+    const cancelSpeech = vi.fn();
+    const stopPlayback = vi.fn(async () => {});
+    (orch as any).threadVoiceSpeechByChannel.set("thread-1", { cancel: cancelSpeech });
+    orch.setThreadVoiceManager({ stopPlayback } as any);
+
+    await (orch as any).cmdCancel(cancelIx());
+
+    expect(abortTurn).toHaveBeenCalledWith("discord:thread-1", { force: false });
+    expect(cancelSpeech).not.toHaveBeenCalled();
+    expect(stopPlayback).not.toHaveBeenCalled();
+    expect(store.listThreadVoiceSegments("tv_cancel_guard")[0]).toMatchObject({
+      state: "pending",
+      transcript: "must survive ACP cancellation",
+    });
+  });
+
+  it("force cancel stops playback but preserves capture session and buffered voice", async () => {
+    insertBufferedVoice();
+    const abortTurn = vi.fn(async () => "cancelled");
+    const { orch } = makeOrch({ ready: true, abortTurn, hasRuntime: () => true });
+    const cancelSpeech = vi.fn();
+    const stopPlayback = vi.fn(async () => {});
+    const stop = vi.fn();
+    (orch as any).threadVoiceSpeechByChannel.set("thread-1", { cancel: cancelSpeech });
+    orch.setThreadVoiceManager({ stopPlayback, stop } as any);
+
+    await (orch as any).cmdAbort(cancelIx());
+
+    expect(cancelSpeech).toHaveBeenCalledOnce();
+    expect(stopPlayback).toHaveBeenCalledWith("tv_cancel_guard");
+    expect(stop).not.toHaveBeenCalled();
+    expect(abortTurn).toHaveBeenCalledWith("discord:thread-1", { force: true });
+    expect(store.listThreadVoiceSegments("tv_cancel_guard")[0]).toMatchObject({
+      state: "pending",
+      transcript: "must survive ACP cancellation",
+    });
+  });
+
+  it("scope-all stops every Thread Voice session without discarding its durable text", async () => {
+    insertBufferedVoice();
+    const { orch, killAll } = makeOrch({ ready: true });
+    const cancelSpeech = vi.fn();
+    const stopAll = vi.fn(async () => {});
+    (orch as any).threadVoiceSpeechByChannel.set("thread-1", { cancel: cancelSpeech });
+    orch.setThreadVoiceManager({ stopAll } as any);
+
+    await (orch as any).cmdKill(cancelIx());
+
+    expect(cancelSpeech).toHaveBeenCalledOnce();
+    expect(stopAll).toHaveBeenCalledWith("global cancel");
+    expect(killAll).toHaveBeenCalledOnce();
+    expect(store.listThreadVoiceSegments("tv_cancel_guard")[0]).toMatchObject({
+      state: "pending",
+      transcript: "must survive ACP cancellation",
+    });
+  });
+});
+
 describe("/seam queue (#89)", () => {
+  it.each(["pending", "batched"] as const)(
+    "refuses to create a parallel parked prompt while Thread Voice text is %s",
+    async (state) => {
+      store.insertThreadVoiceSession({
+        id: "tv_queue_guard",
+        platform: "discord",
+        channelRef: "thread-1",
+        parentRef: "channel-1",
+        guildId: "guild-1",
+        voiceChannelId: "vc-1",
+        ownerUserId: "user-1",
+        ownerName: "Jesse",
+        status: "ready",
+        noticeMessageId: null,
+        transmittedAudioMs: 0,
+        createdUtc: "2026-08-27T12:00:00.000Z",
+        updatedUtc: "2026-08-27T12:00:00.000Z",
+        endedUtc: null,
+        endReason: null,
+      });
+      store.appendThreadVoiceSegment({
+        id: "tvs_queue_guard",
+        sessionId: "tv_queue_guard",
+        sequence: 1,
+        authorId: "user-1",
+        transcript: "already owned by Thread Voice",
+        state: "pending",
+        audioMs: 200,
+        dispatchId: null,
+        capturedStartedUtc: "start",
+        capturedEndedUtc: "end",
+        createdUtc: "2026-08-27T12:00:00.000Z",
+        updatedUtc: "2026-08-27T12:00:00.000Z",
+        error: null,
+      });
+      if (state === "batched") {
+        store.claimPendingThreadVoiceBatch("tv_queue_guard", "tvd_queue_guard");
+      }
+      const { orch } = makeOrch({ ready: true });
+      const q = queueIx("must not become a parallel prompt");
+
+      await (orch as any).cmdQueue(q.ix);
+
+      expect(q.reply).toMatch(/Thread Voice already has buffered or batched text/);
+      expect(store.getParkedByChannel("discord", "thread-1")).toBeNull();
+      expect(fs.existsSync(dispatchDirs(dir).pending)).toBe(false);
+    }
+  );
+
   it("mid-turn queue parks and does not abort the running turn", async () => {
     const abortTurn = vi.fn(async () => "cancelled");
     const { orch, sent } = makeOrch({ ready: true, abortTurn, hasRuntime: () => true });

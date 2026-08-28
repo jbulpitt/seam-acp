@@ -62,6 +62,35 @@ describe("ThreadVoiceSpeechPipeline", () => {
     expect(spoken).toEqual([2]);
   });
 
+  it("cancels in-flight synthesis and suppresses every queued playback chunk", async () => {
+    const firstSynthesis = deferred<{
+      ok: true;
+      audio: { pcm: Uint8Array; sampleRate: number; channels: number };
+    }>();
+    const synthesize = vi.fn(() => firstSynthesis.promise);
+    const speak = vi.fn(async () => {});
+    const waitForPlaybackIdle = vi.fn(async () => {});
+    const pipeline = new ThreadVoiceSpeechPipeline({
+      synthesize,
+      speak,
+      waitForPlaybackIdle,
+    });
+    pipeline.feed("This first sentence is deliberately long enough to begin synthesis before force cancellation. ");
+    pipeline.feed("This second sentence is deliberately long enough to be queued behind the first one. ");
+    await vi.waitFor(() => expect(synthesize).toHaveBeenCalledOnce());
+
+    pipeline.cancel();
+    firstSynthesis.resolve({
+      ok: true,
+      audio: { pcm: new Uint8Array([1]), sampleRate: 24_000, channels: 1 },
+    });
+
+    await expect(pipeline.flushAndDrain()).resolves.toEqual({ chunks: 2, played: 0 });
+    expect(synthesize).toHaveBeenCalledOnce();
+    expect(speak).not.toHaveBeenCalled();
+    expect(waitForPlaybackIdle).toHaveBeenCalledOnce();
+  });
+
   it("shares one terminal settlement across success, catch, and finally callers", async () => {
     const playback = deferred<void>();
     const waitForPlaybackIdle = vi.fn(() => playback.promise);

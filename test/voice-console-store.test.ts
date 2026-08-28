@@ -121,18 +121,23 @@ describe("SessionStore Voice Console state", () => {
       interactionId: "interaction-add",
     });
     expect(added.ok && added.value.console.revision).toBe(2);
+    const activated = store.activateVoiceConsoleBinding("bind-b", {
+      expectedRevision: 2,
+      claim: false,
+    });
+    if (!activated.ok) throw new Error(activated.error);
 
     const changed = store.replaceVoiceConsoleInputTargets("tvc_1", {
       bindingIds: ["bind-a", "bind-b"],
       fanoutArmed: true,
-      expectedRevision: 2,
+      expectedRevision: 3,
       interactionId: "interaction-targets",
       updatedUtc: "2026-08-28T12:01:00.000Z",
     });
     expect(changed.ok && changed.value).toMatchObject({
       applied: true,
       duplicate: false,
-      console: { revision: 3, fanoutArmed: true },
+      console: { revision: 4, fanoutArmed: true },
     });
     expect(changed.ok && changed.value.targets.map((row) => row.bindingId)).toEqual([
       "bind-a",
@@ -148,7 +153,7 @@ describe("SessionStore Voice Console state", () => {
     expect(duplicate.ok && duplicate.value).toMatchObject({
       applied: false,
       duplicate: true,
-      console: { revision: 3, fanoutArmed: true },
+      console: { revision: 4, fanoutArmed: true },
     });
     const stale = store.setVoiceConsoleOutputBindings("tvc_1", {
       enabledBindingIds: [],
@@ -233,10 +238,15 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
       expectedRevision: 1,
     });
     if (!added.ok) throw new Error(added.error);
+    const activated = store.activateVoiceConsoleBinding("bind-b", {
+      expectedRevision: added.value.console.revision,
+      claim: false,
+    });
+    if (!activated.ok) throw new Error(activated.error);
     const targets = store.replaceVoiceConsoleInputTargets("tvc_1", {
       bindingIds: ["bind-a", "bind-b"],
       fanoutArmed: true,
-      expectedRevision: added.value.console.revision,
+      expectedRevision: activated.value.console.revision,
     });
     if (!targets.ok) throw new Error(targets.error);
     const capture = store.allocateVoiceConsoleCapture({

@@ -81,16 +81,19 @@ export class VoiceConsoleManager {
     const binding = this.store.getVoiceConsoleBinding(input.binding.id);
     if (!binding) throw new Error("Voice Console binding disappeared after add.");
     const attached = await this.host.addBinding(console, binding);
-    if (attached.ok) return outcome;
-
-    const removal = this.store.beginVoiceConsoleBindingRemoval(binding.id, {
-      expectedRevision: console.revision,
-      reason: attached.reason,
-      updatedUtc: this.now(),
-    });
-    if (removal.ok) {
-      this.store.finishVoiceConsoleBindingRemoval(binding.id, "failed", attached.reason, this.now());
+    if (attached.ok) {
+      const activated = this.store.activateVoiceConsoleBinding(binding.id, {
+        expectedRevision: console.revision,
+        claim: input.claim,
+        updatedUtc: this.now(),
+      });
+      if (activated.ok) return activated;
+      await this.host.stopBinding(binding.id, activated.error).catch(() => undefined);
+      this.failStagedBinding(binding.id, activated.error);
+      throw new Error(activated.error);
     }
+
+    this.failStagedBinding(binding.id, attached.reason);
     throw new Error(attached.reason);
   }
 
@@ -218,7 +221,7 @@ export class VoiceConsoleManager {
       await this.releaseRuns.get(bindingId);
       const discarded = opts.discardPending
         ? await this.discardArtifactFreeBindingText(bindingId)
-        : 0;
+        : await this.preparePreservedBindingText(bindingId).then(() => 0);
       this.store.finishVoiceConsoleBindingRemoval(bindingId, "ended", reason, this.now());
       const remaining = this.store.listVoiceConsoleBindings(binding.consoleId);
       const consoleEnded = remaining.length === 0;
@@ -231,13 +234,14 @@ export class VoiceConsoleManager {
           });
         }
       }
+      this.releaseBlocked.delete(bindingId);
+      if (!opts.discardPending) await this.releaseIfIdle(bindingId);
       return { ok: true, discarded, consoleEnded };
     } catch (err) {
       this.store.finishVoiceConsoleBindingRemoval(bindingId, "failed", errorMessage(err), this.now());
       return { ok: false, error: errorMessage(err) };
     } finally {
       this.releaseBlocked.delete(bindingId);
-      if (!opts.discardPending) void this.releaseIfIdle(bindingId);
     }
   }
 
@@ -249,9 +253,14 @@ export class VoiceConsoleManager {
       interactionId?: string;
       reason?: string;
     } = {}
-  ): Promise<{ ok: true; discarded: number } | { ok: false; error: string }> {
+  ): Promise<
+    | { ok: true; discarded: number; duplicate?: true }
+    | { ok: false; error: string }
+  > {
     const console = this.store.getVoiceConsole(consoleId);
     if (!console) return { ok: false, error: "Voice Console does not exist." };
+    const replay = this.store.getVoiceConsoleInteractionReplay(consoleId, opts.interactionId);
+    if (replay?.ok) return { ok: true, discarded: 0, duplicate: true };
     if (console.status === "ended" || console.status === "failed") {
       return { ok: false, error: "Voice Console has already ended." };
     }
@@ -273,9 +282,17 @@ export class VoiceConsoleManager {
         for (const binding of bindings) {
           discarded += await this.discardArtifactFreeBindingText(binding.id);
         }
+      } else {
+        for (const binding of bindings) {
+          await this.preparePreservedBindingText(binding.id);
+        }
       }
       this.store.finishVoiceConsoleStop(consoleId, "ended", reason, this.now());
       this.releaseConsoleLease(console);
+      bindings.forEach((binding) => this.releaseBlocked.delete(binding.id));
+      if (!opts.discardPending) {
+        await Promise.all(bindings.map((binding) => this.releaseIfIdle(binding.id)));
+      }
       return { ok: true, discarded };
     } catch (err) {
       const message = errorMessage(err);
@@ -284,7 +301,6 @@ export class VoiceConsoleManager {
       return { ok: false, error: message };
     } finally {
       bindings.forEach((binding) => this.releaseBlocked.delete(binding.id));
-      if (!opts.discardPending) bindings.forEach((binding) => void this.releaseIfIdle(binding.id));
     }
   }
 
@@ -304,6 +320,10 @@ export class VoiceConsoleManager {
     const legacy = this.store.listActiveThreadVoiceSessions();
     const upgraded = this.store.upgradeActiveV1ThreadVoiceSessions(defaults, this.now());
     result.upgraded = upgraded.length;
+    this.store.recoverUnfinishedVoiceConsoleCaptures(
+      "process restarted before capture finalization",
+      this.now()
+    );
     for (const old of legacy) {
       this.leases.release({ kind: "thread_voice", sessionId: old.id, guildId: old.guildId });
     }
@@ -368,12 +388,22 @@ export class VoiceConsoleManager {
       if (reconciled.has(batch.dispatchId)) continue;
       try {
         const artifact = await this.dispatch.inspectArtifact(batch.dispatchId);
-        if (artifact === "pending" || artifact === "running") {
+        if (artifact === "missing") {
+          await this.dispatch.enqueue(this.toDispatchRequest(batch));
+          this.activeDispatchByBinding.set(batch.binding.id, batch.dispatchId);
+          enqueued++;
+        } else if (artifact === "pending" || artifact === "running") {
           this.activeDispatchByBinding.set(batch.binding.id, batch.dispatchId);
           found++;
+        } else {
+          found++;
         }
-      } catch {
+      } catch (err) {
         failures++;
+        this.logger.warn(
+          { err, bindingId: batch.binding.id, dispatchId: batch.dispatchId },
+          "voice console dispatched-artifact recovery failed"
+        );
       }
     }
     for (const binding of this.store.listVoiceConsoleBindingsWithBufferedSegments()) {
@@ -413,6 +443,53 @@ export class VoiceConsoleManager {
       }
     }
     return discarded;
+  }
+
+  private failStagedBinding(bindingId: string, reason: string): void {
+    const binding = this.store.getVoiceConsoleBinding(bindingId);
+    if (!binding || binding.status !== "adding") return;
+    const console = this.store.getVoiceConsole(binding.consoleId);
+    if (!console || console.status === "ended" || console.status === "failed") return;
+    const removal = this.store.beginVoiceConsoleBindingRemoval(bindingId, {
+      expectedRevision: console.revision,
+      reason,
+      updatedUtc: this.now(),
+    });
+    if (removal.ok) {
+      this.store.finishVoiceConsoleBindingRemoval(bindingId, "failed", reason, this.now());
+    }
+  }
+
+  /**
+   * A preserve teardown may overtake a release after it has claimed rows but
+   * before it creates an artifact. Requeue only missing-artifact claims; once
+   * any artifact exists it owns the stable batch and must never be duplicated.
+   */
+  private async preparePreservedBindingText(bindingId: string): Promise<void> {
+    for (const batch of this.store
+      .listVoiceConsoleBatchesByState("batched")
+      .filter((candidate) => candidate.binding.id === bindingId)) {
+      try {
+        const artifact = await this.dispatch.inspectArtifact(batch.dispatchId);
+        if (artifact === "missing") {
+          this.store.requeueArtifactFreeVoiceConsoleBatch(
+            bindingId,
+            batch.dispatchId,
+            this.now()
+          );
+          continue;
+        }
+        this.store.markThreadVoiceBatchDispatched(batch.dispatchId, this.now());
+        if (artifact === "pending" || artifact === "running") {
+          this.activeDispatchByBinding.set(bindingId, batch.dispatchId);
+        }
+      } catch (err) {
+        this.logger.warn(
+          { err, bindingId, dispatchId: batch.dispatchId },
+          "voice console preserve artifact inspection failed; retaining claimed batch"
+        );
+      }
+    }
   }
 
   private acquireConsoleLease(console: VoiceConsoleSession) {

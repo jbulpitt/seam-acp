@@ -185,6 +185,113 @@ describe("VoiceConsoleManager lifecycle", () => {
       [expect.objectContaining({ id: "tv_legacy", status: "active" })]
     );
   });
+
+  it("activates a hosted binding before claiming it and returns capture-ready state", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    vi.mocked(host.addBinding).mockImplementationOnce(async (_console, added) => {
+      expect(added.status).toBe("adding");
+      expect(store.listVoiceConsoleInputTargets("tvc_1").map((row) => row.bindingId)).toEqual([
+        "bind-a",
+      ]);
+      return { ok: true };
+    });
+    const result = await manager.addBinding({
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: true,
+      expectedRevision: 1,
+      interactionId: "add-bind-b",
+    });
+    if (!result.ok) throw new Error(result.error);
+    expect(result.value.bindings.find((row) => row.id === "bind-b")?.status).toBe("active");
+    expect(result.value.targets.map((row) => row.bindingId)).toEqual(["bind-b"]);
+    expect(
+      manager.allocateCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-1",
+        speakerName: "Speaker",
+        captureId: "capture-new-binding",
+      })?.assignments
+    ).toEqual([expect.objectContaining({ bindingId: "bind-b", sequence: 1 })]);
+  });
+
+  it("restores the prior input target when host attachment fails after default claim", async () => {
+    store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+    vi.mocked(host.addBinding).mockResolvedValueOnce({ ok: false, reason: "attach failed" });
+    await expect(
+      manager.addBinding({
+        binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+        claim: true,
+        expectedRevision: 1,
+        interactionId: "add-bind-b-failed",
+      })
+    ).rejects.toThrow("attach failed");
+    expect(store.listVoiceConsoleInputTargets("tvc_1").map((row) => row.bindingId)).toEqual([
+      "bind-a",
+    ]);
+    expect(store.getVoiceConsoleBinding("bind-b")?.status).toBe("failed");
+    expect(
+      manager.allocateCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-1",
+        speakerName: "Speaker",
+        captureId: "capture-after-failed-add",
+      })?.assignments
+    ).toEqual([expect.objectContaining({ bindingId: "bind-a" })]);
+  });
+
+  it.each(["capturing", "finalizing"] as const)(
+    "terminalizes a pre-crash %s reservation once so the next sequence can release",
+    async (state) => {
+      store.createVoiceConsole({ console: consoleRow(), binding: binding("bind-a") });
+      const first = manager.allocateCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-1",
+        speakerName: "First",
+        captureId: `capture-${state}-1`,
+      });
+      if (state === "finalizing") {
+        (store as SessionStore & {
+          markVoiceConsoleCaptureFinalizing(captureId: string, updatedUtc?: string): number;
+        }).markVoiceConsoleCaptureFinalizing(first!.captureId, NOW);
+      }
+      manager.allocateCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-2",
+        speakerName: "Second",
+        captureId: `capture-${state}-2`,
+      });
+      manager.commitCapture({
+        captureId: `capture-${state}-2`,
+        speakerId: "speaker-2",
+        speakerName: "Second",
+        transcript: "second survives restart",
+        audioMs: 500,
+        capturedEndedUtc: NOW,
+        speakerAuthorized: true,
+      });
+      vi.mocked(dispatch.isBindingBusy).mockResolvedValue(true);
+      await manager.reconcileOnBoot({
+        aliasFor: () => "unused",
+        profileFor: () => ({ voice: "Aoede", pace: null, style: null }),
+      });
+      await flush();
+      await manager.reconcileOnBoot({
+        aliasFor: () => "unused",
+        profileFor: () => ({ voice: "Aoede", pace: null, style: null }),
+      });
+      expect(store.listVoiceConsoleSegments("bind-a")[0]).toMatchObject({
+        state: "capture_dropped",
+        transcript: "",
+        error: "process restarted before capture finalization",
+      });
+      expect(store.getVoiceConsole("tvc_1")?.droppedCount).toBe(1);
+      vi.mocked(dispatch.isBindingBusy).mockResolvedValue(false);
+      expect(await manager.releaseIfIdle("bind-a")).toBe(true);
+      expect(dispatch.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ authorId: "speaker-2", prompt: expect.stringContaining("second survives") })
+      );
+    }
+  );
 });
 
 describe("VoiceConsoleManager dispatch and barriers", () => {
@@ -193,8 +300,8 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
   });
 
   it("fans out one actual speaker into independent authenticated dispatches", async () => {
-    const added = store.addVoiceConsoleBinding({
-      binding: binding("bind-b", { alias: "Beta" }),
+    const added = await manager.addBinding({
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
       claim: false,
       expectedRevision: 1,
     });
@@ -305,5 +412,183 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
     });
     expect(store.getVoiceConsole("tvc_1")?.status).toBe("ended");
     expect(leases.get("guild-1")).toBeUndefined();
+  });
+
+  it("requeues an artifact-free claimed batch across preserve removal and enqueues once", async () => {
+    await manager.addBinding({
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: false,
+      expectedRevision: 1,
+    });
+    manager.allocateCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      captureId: "capture-preserve-remove",
+    });
+    manager.commitCapture({
+      captureId: "capture-preserve-remove",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      transcript: "preserve through remove",
+      audioMs: 500,
+      capturedEndedUtc: NOW,
+      speakerAuthorized: true,
+    });
+    const inspection = deferred<"missing">();
+    vi.mocked(dispatch.inspectArtifact)
+      .mockImplementationOnce(async () => inspection.promise)
+      .mockResolvedValue("missing");
+    const releasing = manager.releaseIfIdle("bind-a");
+    await flush();
+    const removing = manager.removeBinding("bind-a", {
+      expectedRevision: store.getVoiceConsole("tvc_1")!.revision,
+      discardPending: false,
+      reason: "preserve removal",
+    });
+    await flush();
+    inspection.resolve("missing");
+    await releasing;
+    expect(await removing).toEqual({ ok: true, discarded: 0, consoleEnded: false });
+    expect(dispatch.enqueue).toHaveBeenCalledTimes(1);
+    expect(store.listVoiceConsoleSegments("bind-a")[0]).toMatchObject({ state: "dispatched" });
+  });
+
+  it("requeues an artifact-free claimed batch across preserve stop and enqueues once", async () => {
+    manager.allocateCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      captureId: "capture-preserve-stop",
+    });
+    manager.commitCapture({
+      captureId: "capture-preserve-stop",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      transcript: "preserve through stop",
+      audioMs: 500,
+      capturedEndedUtc: NOW,
+      speakerAuthorized: true,
+    });
+    const inspection = deferred<"missing">();
+    vi.mocked(dispatch.inspectArtifact)
+      .mockImplementationOnce(async () => inspection.promise)
+      .mockResolvedValue("missing");
+    const releasing = manager.releaseIfIdle("bind-a");
+    await flush();
+    const stopping = manager.stopConsole("tvc_1", {
+      expectedRevision: 1,
+      discardPending: false,
+      reason: "preserve stop",
+    });
+    await flush();
+    inspection.resolve("missing");
+    await releasing;
+    expect(await stopping).toEqual({ ok: true, discarded: 0 });
+    expect(dispatch.enqueue).toHaveBeenCalledTimes(1);
+    expect(store.listVoiceConsoleSegments("bind-a")[0]).toMatchObject({ state: "dispatched" });
+  });
+
+  it.each(["pending", "running", "done"] as const)(
+    "preserve stop retains a %s artifact without replacement enqueue",
+    async (artifactState) => {
+      manager.allocateCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-1",
+        speakerName: "Speaker",
+        captureId: `capture-owned-${artifactState}`,
+      });
+      manager.commitCapture({
+        captureId: `capture-owned-${artifactState}`,
+        speakerId: "speaker-1",
+        speakerName: "Speaker",
+        transcript: `owned by ${artifactState}`,
+        audioMs: 500,
+        capturedEndedUtc: NOW,
+        speakerAuthorized: true,
+      });
+      const inspection = deferred<typeof artifactState>();
+      vi.mocked(dispatch.inspectArtifact)
+        .mockImplementationOnce(async () => inspection.promise)
+        .mockResolvedValue(artifactState);
+      const releasing = manager.releaseIfIdle("bind-a");
+      await flush();
+      const stopping = manager.stopConsole("tvc_1", {
+        expectedRevision: 1,
+        discardPending: false,
+        reason: `preserve ${artifactState}`,
+      });
+      await flush();
+      inspection.resolve(artifactState);
+      await releasing;
+      expect(await stopping).toEqual({ ok: true, discarded: 0 });
+      expect(dispatch.enqueue).not.toHaveBeenCalled();
+      expect(store.listVoiceConsoleSegments("bind-a")[0]).toMatchObject({
+        state: "dispatched",
+        dispatchId: expect.stringMatching(/^tvd_/),
+        transcript: `owned by ${artifactState}`,
+      });
+    }
+  );
+
+  it("replays the exact stop interaction idempotently without stopping the host twice", async () => {
+    const first = await manager.stopConsole("tvc_1", {
+      expectedRevision: 1,
+      interactionId: "stop-interaction-1",
+      reason: "owner stopped",
+    });
+    expect(first).toEqual({ ok: true, discarded: 0 });
+    const replay = await manager.stopConsole("tvc_1", {
+      expectedRevision: 1,
+      interactionId: "stop-interaction-1",
+      reason: "owner stopped",
+    });
+    expect(replay).toEqual({ ok: true, discarded: 0, duplicate: true });
+    expect(host.stopConsole).toHaveBeenCalledOnce();
+    expect(
+      await manager.stopConsole("tvc_1", {
+        expectedRevision: 1,
+        interactionId: "stop-interaction-2",
+      })
+    ).toEqual({ ok: false, error: "Voice Console has already ended." });
+  });
+
+  it("re-enqueues a missing dispatched artifact once and recognizes existing artifacts", async () => {
+    manager.allocateCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      captureId: "capture-dispatched-recovery",
+    });
+    manager.commitCapture({
+      captureId: "capture-dispatched-recovery",
+      speakerId: "speaker-1",
+      speakerName: "Speaker",
+      transcript: "recover stable dispatch",
+      audioMs: 500,
+      capturedEndedUtc: NOW,
+      speakerAuthorized: true,
+    });
+    const batch = store.claimPendingVoiceConsoleBatch("bind-a", "dispatch-stable");
+    expect(batch).not.toBeNull();
+    store.markThreadVoiceBatchDispatched("dispatch-stable", NOW);
+    let artifact: "missing" | "pending" | "done" = "missing";
+    vi.mocked(dispatch.inspectArtifact).mockImplementation(async () => artifact);
+    vi.mocked(dispatch.enqueue).mockImplementation(async () => {
+      artifact = "pending";
+    });
+
+    expect(await manager.recoverDispatches()).toEqual({ enqueued: 1, found: 0, failures: 0 });
+    expect(dispatch.enqueue).toHaveBeenCalledOnce();
+    manager.shutdown();
+    manager = new VoiceConsoleManager({ store, logger: silent, host, dispatch, leases, now: () => NOW });
+    expect(await manager.recoverDispatches()).toEqual({ enqueued: 0, found: 1, failures: 0 });
+    expect(dispatch.enqueue).toHaveBeenCalledOnce();
+
+    artifact = "done";
+    manager.shutdown();
+    manager = new VoiceConsoleManager({ store, logger: silent, host, dispatch, leases, now: () => NOW });
+    expect(await manager.recoverDispatches()).toEqual({ enqueued: 0, found: 1, failures: 0 });
+    expect(dispatch.enqueue).toHaveBeenCalledOnce();
   });
 });

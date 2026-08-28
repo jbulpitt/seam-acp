@@ -2116,7 +2116,7 @@ export class SessionStore {
       if (this.listVoiceConsoleBindings(console.id).length >= 10) {
         return mutationFailure("binding-limit", "Voice Console already has ten active bindings.");
       }
-      const binding = normalizeBinding(input.binding);
+      const binding = normalizeBinding({ ...input.binding, status: "adding" });
       if (binding.guildId !== console.guildId || binding.voiceChannelId !== console.voiceChannelId) {
         return mutationFailure("inactive", "Binding guild/voice channel does not match its console.");
       }
@@ -2131,14 +2131,6 @@ export class SessionStore {
         .get(console.id, binding.aliasNormalized);
       if (alias) return mutationFailure("duplicate-alias", "That alias is already in use.");
       this.insertVoiceConsoleBindingRow(binding);
-      if (input.claim !== false) {
-        const current = this.listVoiceConsoleInputTargets(console.id).map((target) => target.bindingId);
-        const next = console.fanoutArmed ? [...current, binding.id] : [binding.id];
-        if (next.length > 5) {
-          throw new Error("Voice Console fan-out target limit is five.");
-        }
-        this.replaceVoiceConsoleTargetsRows(console.id, next, binding.updatedUtc);
-      }
       this.bumpVoiceConsoleRevision(console.id, binding.updatedUtc);
       this.recordVoiceConsoleMutation(console.id, input.interactionId, binding.updatedUtc);
       return { ok: true, value: this.requireVoiceConsoleMutationResult(console.id, true, false) };
@@ -2152,6 +2144,50 @@ export class SessionStore {
       }
       throw err;
     }
+  }
+
+  /** Host attachment succeeds before an adding binding becomes selectable. */
+  activateVoiceConsoleBinding(
+    bindingId: string,
+    input: { expectedRevision: number; claim?: boolean; updatedUtc?: string }
+  ): VoiceConsoleMutationOutcome {
+    const activate = this.db.transaction((): VoiceConsoleMutationOutcome => {
+      const binding = this.getVoiceConsoleBinding(bindingId);
+      if (!binding) return mutationFailure("not-found", "Voice Console binding does not exist.");
+      const console = this.getVoiceConsole(binding.consoleId);
+      if (!console || !isActiveConsole(console)) {
+        return mutationFailure("inactive", "Voice Console is not active.");
+      }
+      if (console.revision !== input.expectedRevision) return staleConsoleFailure();
+      if (binding.status === "active") {
+        return {
+          ok: true,
+          value: this.requireVoiceConsoleMutationResult(binding.consoleId, false, true),
+        };
+      }
+      if (binding.status !== "adding") {
+        return mutationFailure("inactive", "Voice Console binding is not awaiting activation.");
+      }
+      const now = input.updatedUtc ?? new Date().toISOString();
+      this.db
+        .prepare(
+          `UPDATE thread_voice_sessions SET status = 'active', updated_utc = ?
+            WHERE id = ? AND status = 'adding'`
+        )
+        .run(now, bindingId);
+      if (input.claim !== false) {
+        const current = this.listVoiceConsoleInputTargets(console.id).map((target) => target.bindingId);
+        const next = console.fanoutArmed ? [...current, bindingId] : [bindingId];
+        if (next.length > 5) throw new Error("Voice Console fan-out target limit is five.");
+        this.replaceVoiceConsoleTargetsRows(console.id, next, now);
+      }
+      this.bumpVoiceConsoleRevision(console.id, now);
+      return {
+        ok: true,
+        value: this.requireVoiceConsoleMutationResult(console.id, true, false),
+      };
+    });
+    return activate();
   }
 
   replaceVoiceConsoleInputTargets(
@@ -2346,6 +2382,67 @@ export class SessionStore {
       return this.getVoiceConsole(consoleId);
     });
     return ready();
+  }
+
+  /** Capture host marks activity-end before awaiting its final transcript. */
+  markVoiceConsoleCaptureFinalizing(
+    captureId: string,
+    updatedUtc = new Date().toISOString()
+  ): number {
+    return this.db
+      .prepare(
+        `UPDATE thread_voice_segments SET state = 'finalizing', updated_utc = ?
+          WHERE capture_id = ? AND state = 'capturing'`
+      )
+      .run(updatedUtc, captureId).changes;
+  }
+
+  /**
+   * No STT process survives a boot. Terminal metadata-only rows unblock later
+   * binding sequences; selecting only unfinished states makes this idempotent.
+   */
+  recoverUnfinishedVoiceConsoleCaptures(
+    reason: string,
+    recoveredUtc = new Date().toISOString()
+  ): VoiceConsoleSegment[] {
+    const recover = this.db.transaction(() => {
+      const rows = this.db
+        .prepare<[], VoiceConsoleSegmentRow>(
+          `SELECT segment.* FROM thread_voice_segments segment
+             JOIN thread_voice_sessions binding ON binding.id = segment.session_id
+            WHERE binding.console_id IS NOT NULL
+              AND segment.state IN ('capturing','finalizing')
+            ORDER BY segment.created_utc ASC, segment.id ASC`
+        )
+        .all();
+      if (rows.length === 0) return [];
+      this.db
+        .prepare(
+          `UPDATE thread_voice_segments SET state = 'capture_dropped', transcript = '',
+             captured_ended_utc = ?, updated_utc = ?, error = ?
+           WHERE id IN (${rows.map(() => "?").join(",")})
+             AND state IN ('capturing','finalizing')`
+        )
+        .run(recoveredUtc, recoveredUtc, reason, ...rows.map((row) => row.id));
+      const capturesByConsole = new Map<string, Set<string>>();
+      for (const row of rows) {
+        const binding = this.getVoiceConsoleBinding(row.session_id);
+        if (!binding || !row.capture_id) continue;
+        const captures = capturesByConsole.get(binding.consoleId) ?? new Set<string>();
+        captures.add(row.capture_id);
+        capturesByConsole.set(binding.consoleId, captures);
+      }
+      for (const [consoleId, captures] of capturesByConsole) {
+        this.db
+          .prepare(
+            `UPDATE voice_console_sessions SET dropped_count = dropped_count + ?,
+               updated_utc = ? WHERE id = ?`
+          )
+          .run(captures.size, recoveredUtc, consoleId);
+      }
+      return rows.map((row) => this.getVoiceConsoleSegment(row.id)!);
+    });
+    return recover();
   }
 
   beginVoiceConsoleBindingRemoval(
@@ -2776,6 +2873,32 @@ export class SessionStore {
       .all(state)
       .map(({ dispatch_id }) => this.getVoiceConsoleBatch(dispatch_id))
       .filter((batch): batch is VoiceConsoleBatch => batch !== null);
+  }
+
+  /** An artifact-free in-memory claim may be safely made releasable again. */
+  requeueArtifactFreeVoiceConsoleBatch(
+    bindingId: string,
+    dispatchId: string,
+    updatedUtc = new Date().toISOString()
+  ): number {
+    return this.db
+      .prepare(
+        `UPDATE thread_voice_segments SET state = 'pending', dispatch_id = NULL,
+           updated_utc = ?, error = NULL
+         WHERE session_id = ? AND dispatch_id = ? AND state = 'batched'`
+      )
+      .run(updatedUtc, bindingId, dispatchId).changes;
+  }
+
+  getVoiceConsoleInteractionReplay(
+    consoleId: string,
+    interactionId: string | undefined
+  ): VoiceConsoleMutationOutcome | null {
+    if (!interactionId || !this.getVoiceConsoleMutation(consoleId, interactionId)) return null;
+    return {
+      ok: true,
+      value: this.requireVoiceConsoleMutationResult(consoleId, false, true),
+    };
   }
 
   listVoiceConsoleBindingsWithBufferedSegments(): ThreadVoiceBinding[] {

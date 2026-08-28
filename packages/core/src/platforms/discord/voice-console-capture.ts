@@ -77,7 +77,7 @@ export interface DiscordVoiceConsoleCaptureHostOptions {
   inputActive?: boolean;
   callbacks?: Pick<
     VoiceConsoleCaptureRouterCallbacks,
-    "onInterim" | "onForwardedBytes" | "onSettled" | "onError"
+    "onCaptureFinalizing" | "onInterim" | "onForwardedBytes" | "onSettled" | "onError"
   >;
   minCaptureBytes?: number;
   maxCapturePartBytes?: number;
@@ -198,6 +198,9 @@ export class DiscordVoiceConsoleCaptureHost {
       callbacks: {
         onCaptureArmed: (capture) => this.armCapture(capture),
         onCaptureFinalize: (capture) => this.finalizeCapture(capture),
+        ...(opts.callbacks?.onCaptureFinalizing
+          ? { onCaptureFinalizing: opts.callbacks.onCaptureFinalizing }
+          : {}),
         onCaptureAbort: (capture, reason) => this.abortCapture(capture, reason),
         ...(opts.callbacks?.onInterim ? { onInterim: opts.callbacks.onInterim } : {}),
         ...(opts.callbacks?.onForwardedBytes

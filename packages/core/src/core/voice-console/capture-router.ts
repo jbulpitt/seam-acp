@@ -57,19 +57,29 @@ export interface VoiceConsoleBindingCommitResult {
 }
 
 export interface VoiceConsoleCaptureCommit {
+  /** Stable idempotency key repeated outside the immutable snapshot for adapters. */
+  captureId: string;
   snapshot: VoiceConsoleCaptureSnapshot;
   transcript: string;
   audioMs: number;
+  /** Cumulative PCM accepted by Gemini for this speaker capture, never fan-out multiplied. */
   forwardedBytes: number;
+  /** Integer duration derived from the cumulative 16 kHz mono s16 PCM bytes. */
+  forwardedAudioMs: number;
   capturedEndedUtc: string;
   source: "live" | "unary";
 }
 
 export interface VoiceConsoleCaptureDrop {
+  /** Stable idempotency key repeated outside the immutable snapshot for adapters. */
+  captureId: string;
   snapshot: VoiceConsoleCaptureSnapshot;
   reason: VoiceConsoleCaptureDropReason;
   audioMs: number;
+  /** Cumulative PCM accepted by Gemini for this speaker capture, never fan-out multiplied. */
   forwardedBytes: number;
+  /** Integer duration derived from the cumulative 16 kHz mono s16 PCM bytes. */
+  forwardedAudioMs: number;
   capturedEndedUtc: string;
   source?: "live" | "unary";
   error?: string;
@@ -139,6 +149,8 @@ export interface VoiceConsoleSpeakerLaneSnapshot {
 export interface VoiceConsoleCaptureRouterCallbacks {
   onCaptureArmed: (capture: VoiceConsoleArmedCapture) => void | Promise<void>;
   onCaptureFinalize: (capture: VoiceConsoleArmedCapture) => void | Promise<void>;
+  /** Observer fired once when the logical capture enters bounded finalization. */
+  onCaptureFinalizing?: (capture: VoiceConsoleArmedCapture) => void;
   onCaptureAbort: (
     capture: VoiceConsoleArmedCapture,
     reason: VoiceConsoleCaptureDropReason
@@ -172,6 +184,7 @@ type CaptureRecord = {
 
 const MAX_CAPTURE_TARGETS = 5;
 const SETTLED_CAPTURE_CACHE = 512;
+const PCM16K_MONO_S16_BYTES_PER_MS = 32;
 
 export class VoiceConsoleCaptureRouter {
   private readonly persistence: VoiceConsoleCapturePersistencePort;
@@ -325,6 +338,7 @@ export class VoiceConsoleCaptureRouter {
         const record = this.captures.get(lane.captureId);
         if (!record || record.decision) return;
         lane.state = "finalizing";
+        this.safeCallback(() => this.callbacks.onCaptureFinalizing?.(record.capture));
         try {
           await this.callbacks.onCaptureFinalize(record.capture);
         } catch (err) {
@@ -450,12 +464,15 @@ export class VoiceConsoleCaptureRouter {
     }
 
     record.decision = "commit";
+    const forwardedBytes = record.forwardedBytes;
     record.settlement = this.persistence
       .commitCapture({
+        captureId,
         snapshot: record.capture.snapshot,
         transcript,
         audioMs: nonNegativeInt(outcome.audioMs),
-        forwardedBytes: record.forwardedBytes,
+        forwardedBytes,
+        forwardedAudioMs: forwardedPcmDurationMs(forwardedBytes),
         capturedEndedUtc: outcome.capturedEndedUtc,
         source: outcome.source,
       })
@@ -572,10 +589,12 @@ export class VoiceConsoleCaptureRouter {
       : Promise.resolve();
     const durableDrop = Promise.resolve().then(() =>
       this.persistence.dropCapture({
+        captureId: record.capture.captureId,
         snapshot: record.capture.snapshot,
         reason,
         audioMs: nonNegativeInt(audioMs),
         forwardedBytes: record.forwardedBytes,
+        forwardedAudioMs: forwardedPcmDurationMs(record.forwardedBytes),
         capturedEndedUtc,
         ...(source ? { source } : {}),
         ...(error ? { error } : {}),
@@ -605,10 +624,12 @@ export class VoiceConsoleCaptureRouter {
     error?: string
   ): Promise<void> {
     await this.persistence.dropCapture({
+      captureId: snapshot.captureId,
       snapshot,
       reason,
       audioMs: 0,
       forwardedBytes: 0,
+      forwardedAudioMs: 0,
       capturedEndedUtc: this.now(),
       ...(error ? { error } : {}),
     });
@@ -676,6 +697,10 @@ export class VoiceConsoleCaptureRouter {
       // Error reporting cannot change capture safety.
     }
   }
+}
+
+function forwardedPcmDurationMs(bytes: number): number {
+  return Math.floor(nonNegativeInt(bytes) / PCM16K_MONO_S16_BYTES_PER_MS);
 }
 
 function freezeSnapshot(

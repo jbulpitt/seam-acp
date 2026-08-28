@@ -18,6 +18,7 @@ function fixture(opts: {
   allowed?: string[];
   targets?: Array<{ bindingId: string; sequence: number }>;
   abortThrows?: boolean;
+  finalizingThrows?: boolean;
 } = {}) {
   const allowed = new Set(opts.allowed ?? ["alice", "bob"]);
   let serial = 0;
@@ -51,6 +52,7 @@ function fixture(opts: {
     dropCapture: vi.fn(async () => {}),
   };
   const armed: VoiceConsoleArmedCapture[] = [];
+  const finalizing: VoiceConsoleArmedCapture[] = [];
   const finalized: VoiceConsoleArmedCapture[] = [];
   const aborted: Array<{ capture: VoiceConsoleArmedCapture; reason: string }> = [];
   const interims: string[] = [];
@@ -65,6 +67,10 @@ function fixture(opts: {
     now: () => `t-${++clock}`,
     callbacks: {
       onCaptureArmed: (capture) => armed.push(capture),
+      onCaptureFinalizing: (capture) => {
+        finalizing.push(capture);
+        if (opts.finalizingThrows) throw new Error("finalizing observer failure");
+      },
       onCaptureFinalize: (capture) => finalized.push(capture),
       onCaptureAbort: (capture, reason) => {
         aborted.push({ capture, reason });
@@ -81,6 +87,7 @@ function fixture(opts: {
     persistence,
     allowed,
     armed,
+    finalizing,
     finalized,
     aborted,
     interims,
@@ -171,8 +178,10 @@ describe("VoiceConsoleCaptureRouter", () => {
     expect(f.persistence.commitCapture).toHaveBeenCalledOnce();
     expect(f.persistence.commitCapture).toHaveBeenCalledWith(
       expect.objectContaining({
+        captureId: capture.captureId,
         transcript: "one shared transcript",
         forwardedBytes: 3_200,
+        forwardedAudioMs: 100,
         snapshot: expect.objectContaining({
           targets: [
             { bindingId: "binding-a", sequence: 11 },
@@ -182,6 +191,37 @@ describe("VoiceConsoleCaptureRouter", () => {
       })
     );
     expect(f.byteEvents).toEqual([{ bytes: 3_200, totalBytes: 3_200 }]);
+    expect(f.finalizing).toEqual([capture]);
+    expect(f.finalized).toEqual([capture]);
+  });
+
+  it("fires finalizing exactly once and isolates observer failure from commit", async () => {
+    const f = fixture({ finalizingThrows: true });
+    const capture = await arm(f, "alice", "Alice");
+    f.router.recordForwardedBytes("alice", 4_800);
+
+    await f.router.setSpeakerMuted({ userId: "alice", selfMuted: true });
+    await f.router.setSpeakerMuted({ userId: "alice", selfMuted: true });
+    await f.router.settleCapture(capture.captureId, {
+      ok: true,
+      transcript: "still commits",
+      audioMs: 200,
+      capturedEndedUtc: "ended",
+      source: "live",
+    });
+
+    expect(f.finalizing).toEqual([capture]);
+    expect(f.finalized).toEqual([capture]);
+    expect(f.errors).toContain("finalizing observer failure");
+    expect(f.persistence.commitCapture).toHaveBeenCalledOnce();
+    expect(f.persistence.commitCapture).toHaveBeenCalledWith(
+      expect.objectContaining({
+        captureId: capture.captureId,
+        forwardedBytes: 4_800,
+        forwardedAudioMs: 150,
+        source: "live",
+      })
+    );
   });
 
   it("isolates overlapping allowed speakers and permits out-of-order finals", async () => {
@@ -241,7 +281,10 @@ describe("VoiceConsoleCaptureRouter", () => {
     expect(f.persistence.commitCapture).not.toHaveBeenCalled();
     expect(f.persistence.dropCapture).toHaveBeenCalledWith(
       expect.objectContaining({
+        captureId: capture.captureId,
         reason: "speaker_unauthorized",
+        forwardedBytes: 0,
+        forwardedAudioMs: 0,
         error: expect.stringContaining("DISCORD_ALLOWED_USER_IDS"),
       })
     );
@@ -265,6 +308,26 @@ describe("VoiceConsoleCaptureRouter", () => {
       [bob.captureId, "input_off"],
     ]);
     expect(f.persistence.dropCapture).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(f.persistence.dropCapture).mock.calls.map(([input]) => ({
+      captureId: input.captureId,
+      forwardedBytes: input.forwardedBytes,
+      forwardedAudioMs: input.forwardedAudioMs,
+      reason: input.reason,
+    }))).toEqual([
+      {
+        captureId: alice.captureId,
+        forwardedBytes: 640,
+        forwardedAudioMs: 20,
+        reason: "input_off",
+      },
+      {
+        captureId: bob.captureId,
+        forwardedBytes: 960,
+        forwardedAudioMs: 30,
+        reason: "input_off",
+      },
+    ]);
+    expect(f.finalizing).toHaveLength(0);
     expect(f.router.forwardedBytes).toBe(1_600);
     expect(f.router.canForward("alice")).toBe(false);
     await expect(
@@ -315,6 +378,7 @@ describe("VoiceConsoleCaptureRouter", () => {
   it("forwards a known failed transcription source to durable drop telemetry", async () => {
     const f = fixture();
     const capture = await arm(f, "alice");
+    f.router.recordForwardedBytes("alice", 8_000);
     await f.router.setSpeakerMuted({ userId: "alice", selfMuted: true });
 
     await f.router.settleCapture(capture.captureId, {
@@ -328,7 +392,10 @@ describe("VoiceConsoleCaptureRouter", () => {
 
     expect(f.persistence.dropCapture).toHaveBeenCalledWith(
       expect.objectContaining({
+        captureId: capture.captureId,
         reason: "transcribe_failed",
+        forwardedBytes: 8_000,
+        forwardedAudioMs: 250,
         source: "unary",
         error: "unary unavailable",
       })
@@ -392,6 +459,13 @@ describe("VoiceConsoleCaptureRouter", () => {
     });
     expect(duplicate).toBe(first);
     expect(f.persistence.commitCapture).toHaveBeenCalledOnce();
+    expect(f.persistence.commitCapture).toHaveBeenCalledWith(
+      expect.objectContaining({
+        captureId: capture.captureId,
+        forwardedBytes: 0,
+        forwardedAudioMs: 0,
+      })
+    );
     pending.resolve([{ bindingId: "binding-a", sequence: 1, status: "committed" }]);
     await expect(first).resolves.toMatchObject({ status: "committed" });
     expect(f.persistence.commitCapture).toHaveBeenCalledOnce();

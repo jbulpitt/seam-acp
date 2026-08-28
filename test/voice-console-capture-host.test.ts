@@ -4,6 +4,8 @@ import pino from "pino";
 import { describe, expect, it, vi } from "vitest";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type {
+  VoiceConsoleCaptureCommit,
+  VoiceConsoleCaptureDrop,
   VoiceConsoleCapturePersistencePort,
   VoiceConsoleCaptureSnapshotDraft,
 } from "../packages/core/src/core/voice-console/capture-router.js";
@@ -48,7 +50,11 @@ function voiceState(
   };
 }
 
-function fixture(opts: { inputActive?: boolean } = {}) {
+function fixture(opts: {
+  inputActive?: boolean;
+  maxCapturePartBytes?: number;
+  finalizingThrows?: boolean;
+} = {}) {
   const voiceChannelId = "voice-1";
   const allowed = new Set(["alice", "bob"]);
   const client = new EventEmitter() as EventEmitter & {
@@ -77,6 +83,8 @@ function fixture(opts: { inputActive?: boolean } = {}) {
   let sequence = 0;
   const commits: Array<{ speakerId: string; transcript: string; forwardedBytes: number }> = [];
   const drops: Array<{ speakerId: string; reason: string }> = [];
+  const terminalCommits: VoiceConsoleCaptureCommit[] = [];
+  const terminalDrops: VoiceConsoleCaptureDrop[] = [];
   const persistence: VoiceConsoleCapturePersistencePort = {
     snapshotCapture: vi.fn(async ({ speakerId, speakerName, capturedStartedUtc }) => {
       captureSerial += 1;
@@ -93,6 +101,7 @@ function fixture(opts: { inputActive?: boolean } = {}) {
       return snapshot;
     }),
     commitCapture: vi.fn(async (input) => {
+      terminalCommits.push(input);
       commits.push({
         speakerId: input.snapshot.speakerId,
         transcript: input.transcript,
@@ -105,6 +114,7 @@ function fixture(opts: { inputActive?: boolean } = {}) {
       }));
     }),
     dropCapture: vi.fn(async (input) => {
+      terminalDrops.push(input);
       drops.push({ speakerId: input.snapshot.speakerId, reason: input.reason });
     }),
   };
@@ -136,6 +146,8 @@ function fixture(opts: { inputActive?: boolean } = {}) {
     transcribers.set(speakerId, { port, sent, handlers });
     return port;
   });
+  const finalizing: string[] = [];
+  const callbackErrors: string[] = [];
 
   const host = new DiscordVoiceConsoleCaptureHost({
     client: client as never,
@@ -151,8 +163,15 @@ function fixture(opts: { inputActive?: boolean } = {}) {
     createTranscriber: factory,
     logger: silent,
     inputActive: opts.inputActive ?? true,
+    callbacks: {
+      onCaptureFinalizing: (capture) => {
+        finalizing.push(capture.captureId);
+        if (opts.finalizingThrows) throw new Error("host finalizing observer failure");
+      },
+      onError: (error) => callbackErrors.push(error.message),
+    },
     minCaptureBytes: 2,
-    maxCapturePartBytes: 32_000,
+    maxCapturePartBytes: opts.maxCapturePartBytes ?? 32_000,
     now: (() => {
       let clock = 0;
       return () => `t-${++clock}`;
@@ -185,6 +204,10 @@ function fixture(opts: { inputActive?: boolean } = {}) {
     factory,
     commits,
     drops,
+    terminalCommits,
+    terminalDrops,
+    finalizing,
+    callbackErrors,
     voiceChannelId,
   };
 }
@@ -236,6 +259,74 @@ describe("DiscordVoiceConsoleCaptureHost", () => {
       { speakerId: "bob", transcript: "bob transcript", forwardedBytes: 2 },
     ]);
     expect(f.host.router.forwardedBytes).toBe(4);
+    expect(f.finalizing).toEqual(["capture-1", "capture-2"]);
+    expect(f.terminalCommits.map((input) => ({
+      captureId: input.captureId,
+      forwardedBytes: input.forwardedBytes,
+      forwardedAudioMs: input.forwardedAudioMs,
+      source: input.source,
+      targetCount: input.snapshot.targets.length,
+    }))).toEqual([
+      {
+        captureId: "capture-1",
+        forwardedBytes: 2,
+        forwardedAudioMs: 0,
+        source: "live",
+        targetCount: 1,
+      },
+      {
+        captureId: "capture-2",
+        forwardedBytes: 2,
+        forwardedAudioMs: 0,
+        source: "unary",
+        targetCount: 1,
+      },
+    ]);
+    await f.host.destroy();
+  });
+
+  it("marks one logical exact-boundary continuation finalizing once", async () => {
+    const f = fixture({ maxCapturePartBytes: 2 });
+    await setMuted(f, "alice", true, false);
+    f.speaking.users.set("alice", 1);
+    f.speaking.emit("start", "alice");
+    f.subscriptions.get("alice")!.write(Buffer.from([13]));
+    await tick();
+
+    await setMuted(f, "alice", false, true);
+    await setMuted(f, "alice", false, true);
+    await f.host.idle();
+
+    expect(f.finalizing).toEqual(["capture-1"]);
+    // The transport may close the exact-boundary empty continuation through a
+    // second Live activity, but both parts still settle one logical capture.
+    expect(f.transcribers.get("alice")!.port.finalizeUtterance).toHaveBeenCalledTimes(2);
+    expect(f.persistence.commitCapture).toHaveBeenCalledOnce();
+    expect(f.terminalCommits[0]).toMatchObject({
+      captureId: "capture-1",
+      forwardedBytes: 2,
+      forwardedAudioMs: 0,
+      source: "live",
+    });
+    expect(f.terminalCommits[0]).not.toHaveProperty("pcm");
+    await f.host.destroy();
+  });
+
+  it("isolates a finalizing observer failure without blocking STT or commit", async () => {
+    const f = fixture({ finalizingThrows: true });
+    await setMuted(f, "alice", true, false);
+    f.speaking.users.set("alice", 1);
+    f.speaking.emit("start", "alice");
+    f.subscriptions.get("alice")!.write(Buffer.from([8]));
+    await tick();
+
+    await setMuted(f, "alice", false, true);
+    await f.host.idle();
+
+    expect(f.finalizing).toEqual(["capture-1"]);
+    expect(f.callbackErrors).toContain("host finalizing observer failure");
+    expect(f.transcribers.get("alice")!.port.finalizeUtterance).toHaveBeenCalledOnce();
+    expect(f.persistence.commitCapture).toHaveBeenCalledOnce();
     await f.host.destroy();
   });
 
@@ -304,7 +395,30 @@ describe("DiscordVoiceConsoleCaptureHost", () => {
       { speakerId: "bob", reason: "input_off" },
     ]);
     expect(f.persistence.commitCapture).not.toHaveBeenCalled();
+    expect(f.finalizing).toHaveLength(0);
     expect(f.subscriptions.size).toBe(0);
+    expect(f.terminalDrops.map((input) => ({
+      captureId: input.captureId,
+      reason: input.reason,
+      forwardedBytes: input.forwardedBytes,
+      forwardedAudioMs: input.forwardedAudioMs,
+      source: input.source,
+    }))).toEqual([
+      {
+        captureId: "capture-1",
+        reason: "input_off",
+        forwardedBytes: 2,
+        forwardedAudioMs: 0,
+        source: undefined,
+      },
+      {
+        captureId: "capture-2",
+        reason: "input_off",
+        forwardedBytes: 2,
+        forwardedAudioMs: 0,
+        source: undefined,
+      },
+    ]);
     for (const { port } of f.transcribers.values()) {
       expect(port.cancelUtterance).toHaveBeenCalledOnce();
       expect(port.close).toHaveBeenCalledOnce();
@@ -337,6 +451,7 @@ describe("DiscordVoiceConsoleCaptureHost", () => {
 
     await setMuted(f, "alice", false, true);
     expect(port.finalizeUtterance).toHaveBeenCalledOnce();
+    expect(f.finalizing).toEqual(["capture-1"]);
     await f.host.setInputEnabled(false);
     expect(port.cancelUtterance).toHaveBeenCalledOnce();
     expect(port.close).toHaveBeenCalledOnce();
@@ -362,6 +477,7 @@ describe("DiscordVoiceConsoleCaptureHost", () => {
     expect(f.host.router.listLanes().filter((lane) => lane.userId === "alice")).toHaveLength(1);
     expect(f.host.router.getLane("alice")).toMatchObject({ state: "awaiting_safe_mute" });
     expect(f.drops).toContainEqual({ speakerId: "alice", reason: "unsafe_rebind" });
+    expect(f.finalizing).toHaveLength(0);
     await expect(
       f.host.router.settleCapture(firstCapture!, {
         ok: true,

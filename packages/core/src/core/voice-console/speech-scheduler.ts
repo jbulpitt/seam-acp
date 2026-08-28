@@ -3,6 +3,7 @@ import {
   type SpeechTextKind,
 } from "../audio/streaming-speech-segmenter.js";
 import type {
+  VoiceConsoleBindingStateSyncResult,
   VoiceConsoleChunkDisposition,
   VoiceConsolePlaybackResult,
   VoiceConsoleSpeechBindingSnapshot,
@@ -11,6 +12,8 @@ import type {
   VoiceConsoleSpeechPlayback,
   VoiceConsoleSpeechProfile,
   VoiceConsoleSpeechSchedulerSnapshot,
+  VoiceConsoleSpeechStateChange,
+  VoiceConsoleSpeechStateChangeReason,
   VoiceConsoleSpeechSourceRef,
   VoiceConsoleSpeechStats,
   VoiceConsoleSynthesisRequest,
@@ -19,12 +22,14 @@ import type {
 
 const DEFAULT_MAX_CHUNKS_PER_SLICE = 2;
 const DEFAULT_MAX_AUDIO_MS_PER_SLICE = 25_000;
+const MAX_RECENT_FAILURE_ERROR_CHARS = 500;
 
 type BindingState = {
   bindingId: string;
   profile: VoiceConsoleSpeechProfile;
   outputEnabled: boolean;
   generation: number;
+  recentFailure: VoiceConsoleSpeechFailure | null;
   stats: VoiceConsoleSpeechStats;
   drainWaiters: Array<(stats: VoiceConsoleSpeechStats) => void>;
 };
@@ -59,6 +64,8 @@ export type VoiceConsoleSpeechSchedulerOptions = {
   synthesize: (request: VoiceConsoleSynthesisRequest) => Promise<VoiceConsoleSynthesisResult>;
   playback: VoiceConsoleSpeechPlayback;
   onFailure?: (failure: VoiceConsoleSpeechFailure) => void;
+  /** Advisory, coalesced state delivery for serialized card/status refreshes. */
+  onStateChange?: (change: VoiceConsoleSpeechStateChange) => void | Promise<void>;
   maxChunksPerSlice?: number;
   maxAudioMsPerSlice?: number;
 };
@@ -75,6 +82,7 @@ export class VoiceConsoleSpeechScheduler {
   private readonly synthesize: VoiceConsoleSpeechSchedulerOptions["synthesize"];
   private readonly playback: VoiceConsoleSpeechPlayback;
   private readonly onFailure: (failure: VoiceConsoleSpeechFailure) => void;
+  private readonly onStateChange?: VoiceConsoleSpeechSchedulerOptions["onStateChange"];
   private readonly maxChunksPerSlice: number;
   private readonly maxAudioMsPerSlice: number;
   private readonly bindings = new Map<string, BindingState>();
@@ -87,6 +95,8 @@ export class VoiceConsoleSpeechScheduler {
   private sliceAudioMs = 0;
   private running = false;
   private destroyed = false;
+  private stateChangeQueued = false;
+  private readonly pendingStateChangeReasons = new Set<VoiceConsoleSpeechStateChangeReason>();
 
   constructor(opts: VoiceConsoleSpeechSchedulerOptions) {
     if (!opts.consoleId.trim()) throw new Error("Voice Console speech requires a console id");
@@ -94,6 +104,7 @@ export class VoiceConsoleSpeechScheduler {
     this.synthesize = opts.synthesize;
     this.playback = opts.playback;
     this.onFailure = opts.onFailure ?? (() => {});
+    this.onStateChange = opts.onStateChange;
     this.maxChunksPerSlice = positiveInteger(
       opts.maxChunksPerSlice,
       DEFAULT_MAX_CHUNKS_PER_SLICE
@@ -125,9 +136,11 @@ export class VoiceConsoleSpeechScheduler {
       profile: normalizeProfile(opts.profile),
       outputEnabled: opts.outputEnabled,
       generation,
+      recentFailure: null,
       stats: emptyStats(),
       drainWaiters: [],
     });
+    this.queueStateChange("binding-registered");
   }
 
   /**
@@ -140,7 +153,6 @@ export class VoiceConsoleSpeechScheduler {
     if (!binding) return false;
 
     binding.outputEnabled = false;
-    binding.generation += 1;
     const removedSourceKeys = new Set<string>();
     const work = this.currentBindingId() === bindingId ? this.currentWork : undefined;
     if (work) {
@@ -176,11 +188,46 @@ export class VoiceConsoleSpeechScheduler {
     this.resolveBindingWaiters(binding);
     this.bindings.delete(bindingId);
     this.kick();
+    this.queueStateChange("binding-unregistered");
     return true;
   }
 
   updateBindingProfile(bindingId: string, profile: VoiceConsoleSpeechProfile): void {
-    this.binding(bindingId).profile = normalizeProfile(profile);
+    const binding = this.binding(bindingId);
+    const normalized = normalizeProfile(profile);
+    if (sameProfile(binding.profile, normalized)) return;
+    binding.profile = normalized;
+    this.queueStateChange("profile-updated");
+  }
+
+  /**
+   * Apply Package A's authoritative durable output state without inventing a
+   * local generation. A newer generation is an invalidation boundary even when
+   * the enabled value is unchanged. Rollback is ignored; an equal-generation
+   * conflict fails closed because neither side can safely win.
+   */
+  syncBindingState(
+    bindingId: string,
+    state: { outputEnabled: boolean; generation: number }
+  ): VoiceConsoleBindingStateSyncResult {
+    const binding = this.binding(bindingId);
+    validateGeneration(state.generation);
+    if (state.generation < binding.generation) return "stale";
+    if (state.generation === binding.generation) {
+      if (state.outputEnabled !== binding.outputEnabled) {
+        throw new Error(
+          `Voice Console speech binding state conflicts at generation ${state.generation}: ${bindingId}`
+        );
+      }
+      return "unchanged";
+    }
+
+    binding.outputEnabled = state.outputEnabled;
+    binding.generation = state.generation;
+    this.clearBindingFailure(binding);
+    this.invalidateBindingWork(bindingId);
+    this.queueStateChange("binding-synced");
+    return "applied";
   }
 
   registerSource(ref: VoiceConsoleSpeechSourceRef): void {
@@ -204,6 +251,8 @@ export class VoiceConsoleSpeechScheduler {
       drainWaiters: [],
     });
     this.sourceOrder.push(key);
+    this.clearBindingFailure(this.binding(ref.bindingId));
+    this.queueStateChange("source-registered");
   }
 
   /** Feed visible prose; returns the number of complete chunks accepted. */
@@ -262,21 +311,15 @@ export class VoiceConsoleSpeechScheduler {
     this.cleanupSourceIfDrained(key);
     this.notifyBindingDrain(ref.bindingId);
     this.kick();
+    this.queueStateChange("source-cancelled");
   }
 
-  /** Cancel current/queued speech while leaving the binding output preference unchanged. */
+  /** Cancel current/queued speech without changing authoritative durable state. */
   invalidateBindingSpeech(bindingId: string): number {
     const binding = this.binding(bindingId);
-    binding.generation += 1;
-    for (const [key, source] of this.sources) {
-      if (source.ref.bindingId !== bindingId) continue;
-      source.segmenter = new StreamingSpeechSegmenter();
-      this.dropPending(source);
-      this.cleanupSourceIfDrained(key);
-    }
-    if (this.currentBindingId() === bindingId) this.currentWork?.controller.abort();
-    this.notifyBindingDrain(bindingId);
-    this.kick();
+    this.clearBindingFailure(binding);
+    this.invalidateBindingWork(bindingId);
+    this.queueStateChange("binding-invalidated");
     return binding.generation;
   }
 
@@ -284,8 +327,17 @@ export class VoiceConsoleSpeechScheduler {
     const binding = this.binding(bindingId);
     if (binding.outputEnabled === enabled) return binding.generation;
     binding.outputEnabled = enabled;
-    if (!enabled) return this.invalidateBindingSpeech(bindingId);
+    this.clearBindingFailure(binding);
+    if (!enabled) {
+      // Backward-convenience API: authoritative integrations use
+      // syncBindingState() and supply the exact durable generation.
+      binding.generation += 1;
+      this.invalidateBindingWork(bindingId);
+      this.queueStateChange("binding-synced");
+      return binding.generation;
+    }
     this.kick();
+    this.queueStateChange("binding-synced");
     return binding.generation;
   }
 
@@ -342,6 +394,7 @@ export class VoiceConsoleSpeechScheduler {
         profile: { ...binding.profile },
         queuedChunks,
         activeSources: bindingSources.length,
+        recentFailure: binding.recentFailure ? copyFailure(binding.recentFailure) : null,
         stats: copyStats(binding.stats),
       });
     }
@@ -354,6 +407,7 @@ export class VoiceConsoleSpeechScheduler {
             turnId: this.currentWork.chunk.turnId,
           }
         : null,
+      currentPhase: this.currentWork?.phase ?? null,
       queueDepth,
       bindings,
       destroyed: this.destroyed,
@@ -383,6 +437,7 @@ export class VoiceConsoleSpeechScheduler {
     this.completedSources.clear();
     this.playback.destroy();
     for (const binding of this.bindings.values()) this.resolveBindingWaiters(binding);
+    this.queueStateChange("destroyed");
   }
 
   private nextChunk(
@@ -419,6 +474,7 @@ export class VoiceConsoleSpeechScheduler {
     source.pending.push(chunk);
     source.stats.accepted += 1;
     binding.stats.accepted += 1;
+    this.queueStateChange("queue-changed");
     this.kick();
     return "accepted";
   }
@@ -463,6 +519,7 @@ export class VoiceConsoleSpeechScheduler {
         settled: false,
       };
       this.currentWork = work;
+      this.queueStateChange("work-started");
       const outcome = await this.process(work);
       if (!work.settled) {
         this.settle(work, outcome);
@@ -471,6 +528,7 @@ export class VoiceConsoleSpeechScheduler {
       if (this.currentWork === work) this.currentWork = undefined;
       this.cleanupSourceIfDrained(sourceKey);
       this.notifyBindingDrain(chunk.bindingId);
+      this.queueStateChange("work-settled");
     }
   }
 
@@ -499,6 +557,7 @@ export class VoiceConsoleSpeechScheduler {
       if (!this.isWorkValid(work, source, binding)) return { kind: "dropped" };
 
       work.phase = "playback";
+      this.queueStateChange("work-phase-changed");
       const playback = abortable(
         Promise.resolve(
           this.playback.play({
@@ -538,11 +597,19 @@ export class VoiceConsoleSpeechScheduler {
     if (!source || !binding) return;
     if (outcome.kind === "played") {
       this.recordSettlement(source, binding, "played", outcome.durationMs);
+      this.clearBindingFailure(binding);
       this.recordFairness(work.sourceKey, outcome.durationMs);
       return;
     }
     if (outcome.kind === "failed") {
       this.recordSettlement(source, binding, "failed", 0);
+      binding.recentFailure = {
+        source: { ...source.ref },
+        ordinal: work.chunk.ordinal,
+        phase: outcome.phase,
+        error: outcome.error.slice(0, MAX_RECENT_FAILURE_ERROR_CHARS),
+      };
+      this.queueStateChange("failure");
       this.recordFairness(work.sourceKey, 0);
       if (!source.warned) {
         source.warned = true;
@@ -574,6 +641,7 @@ export class VoiceConsoleSpeechScheduler {
       source.stats.playedAudioMs += durationMs;
       binding.stats.playedAudioMs += durationMs;
     }
+    this.queueStateChange("queue-changed");
   }
 
   private recordFairness(sourceKey: string, durationMs: number): void {
@@ -673,6 +741,7 @@ export class VoiceConsoleSpeechScheduler {
     this.completeSource(key, source);
     this.sources.delete(key);
     this.sourceOrder = this.sourceOrder.filter((candidate) => candidate !== key);
+    this.queueStateChange("source-settled");
   }
 
   private completeSource(key: string, source: SourceState, retain = true): void {
@@ -710,6 +779,44 @@ export class VoiceConsoleSpeechScheduler {
 
   private currentBindingId(): string | undefined {
     return this.currentWork?.chunk.bindingId;
+  }
+
+  private invalidateBindingWork(bindingId: string): void {
+    for (const [key, source] of this.sources) {
+      if (source.ref.bindingId !== bindingId) continue;
+      source.segmenter = new StreamingSpeechSegmenter();
+      this.dropPending(source);
+      this.cleanupSourceIfDrained(key);
+    }
+    if (this.currentBindingId() === bindingId) this.currentWork?.controller.abort();
+    this.notifyBindingDrain(bindingId);
+    this.kick();
+    this.queueStateChange("queue-changed");
+  }
+
+  private clearBindingFailure(binding: BindingState): void {
+    if (!binding.recentFailure) return;
+    binding.recentFailure = null;
+    this.queueStateChange("recovered");
+  }
+
+  private queueStateChange(reason: VoiceConsoleSpeechStateChangeReason): void {
+    if (!this.onStateChange) return;
+    this.pendingStateChangeReasons.add(reason);
+    if (this.stateChangeQueued) return;
+    this.stateChangeQueued = true;
+    queueMicrotask(() => {
+      this.stateChangeQueued = false;
+      if (this.pendingStateChangeReasons.size === 0) return;
+      const reasons = [...this.pendingStateChangeReasons];
+      this.pendingStateChangeReasons.clear();
+      try {
+        const delivered = this.onStateChange?.({ reasons, snapshot: this.snapshot() });
+        if (delivered) void Promise.resolve(delivered).catch(() => {});
+      } catch {
+        // Card/status refresh is advisory and cannot own scheduler progress.
+      }
+    });
   }
 
   private source(ref: VoiceConsoleSpeechSourceRef): SourceState {
@@ -752,6 +859,20 @@ function normalizeProfile(profile: VoiceConsoleSpeechProfile): VoiceConsoleSpeec
   const voice = profile.voice.trim();
   if (!voice) throw new Error("Voice Console speech profile requires a voice");
   return { voice, pace: profile.pace, style: profile.style };
+}
+
+function sameProfile(a: VoiceConsoleSpeechProfile, b: VoiceConsoleSpeechProfile): boolean {
+  return a.voice === b.voice && a.pace === b.pace && a.style === b.style;
+}
+
+function validateGeneration(generation: number): void {
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new Error("Voice Console speech generation must be a non-negative safe integer");
+  }
+}
+
+function copyFailure(failure: VoiceConsoleSpeechFailure): VoiceConsoleSpeechFailure {
+  return { ...failure, source: { ...failure.source } };
 }
 
 function positiveInteger(value: number | undefined, fallback: number): number {

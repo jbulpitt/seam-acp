@@ -53,6 +53,8 @@ export interface VoiceConsoleSpeechFailure {
   error: string;
 }
 
+export type VoiceConsoleSpeechWorkPhase = "synthesis" | "playback";
+
 export interface VoiceConsoleSpeechStats {
   accepted: number;
   played: number;
@@ -68,15 +70,43 @@ export interface VoiceConsoleSpeechBindingSnapshot {
   profile: VoiceConsoleSpeechProfile;
   queuedChunks: number;
   activeSources: number;
+  /** Cleared by the next source, successful playback, or authoritative state sync. */
+  recentFailure: VoiceConsoleSpeechFailure | null;
   stats: VoiceConsoleSpeechStats;
 }
 
 export interface VoiceConsoleSpeechSchedulerSnapshot {
   consoleId: string;
   currentSource: VoiceConsoleSpeechSourceRef | null;
+  currentPhase: VoiceConsoleSpeechWorkPhase | null;
   queueDepth: number;
   bindings: VoiceConsoleSpeechBindingSnapshot[];
   destroyed: boolean;
+}
+
+export type VoiceConsoleBindingStateSyncResult = "applied" | "unchanged" | "stale";
+
+export type VoiceConsoleSpeechStateChangeReason =
+  | "binding-registered"
+  | "binding-synced"
+  | "binding-invalidated"
+  | "binding-unregistered"
+  | "profile-updated"
+  | "source-registered"
+  | "source-cancelled"
+  | "source-settled"
+  | "queue-changed"
+  | "work-started"
+  | "work-phase-changed"
+  | "work-settled"
+  | "failure"
+  | "recovered"
+  | "destroyed";
+
+export interface VoiceConsoleSpeechStateChange {
+  /** Multiple synchronous mutations are coalesced into one callback. */
+  reasons: VoiceConsoleSpeechStateChangeReason[];
+  snapshot: VoiceConsoleSpeechSchedulerSnapshot;
 }
 
 export type VoiceConsoleChunkDisposition = "accepted" | "dropped";

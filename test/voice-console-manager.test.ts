@@ -146,6 +146,7 @@ beforeEach(() => {
   dispatch = {
     isBindingBusy: vi.fn(async () => false),
     inspectArtifact: vi.fn(async () => "missing"),
+    quarantineArtifact: vi.fn(async () => {}),
     enqueue: vi.fn(async () => {}),
   };
   manager = createManager();
@@ -1205,5 +1206,245 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
     manager = new VoiceConsoleManager({ store, logger: silent, host, dispatch, leases, now: () => NOW });
     expect(await manager.recoverDispatches()).toEqual({ enqueued: 0, found: 1, failures: 0 });
     expect(dispatch.enqueue).toHaveBeenCalledOnce();
+  });
+
+  it("linearizes quarantine while a claimed batch is awaiting artifact inspection", async () => {
+    manager.allocateCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-bad",
+      speakerName: "Bad attribution",
+      captureId: "capture-quarantine-race",
+      capturedStartedUtc: NOW,
+    });
+    manager.commitCapture({
+      ...captureIdentity("capture-quarantine-race"),
+      speakerName: "Bad attribution",
+      transcript: "must never enqueue",
+      audioMs: 100,
+      forwardedAudioMs: 50,
+      capturedEndedUtc: NOW,
+      speakerAuthorized: true,
+      resultSource: "live",
+    });
+    const inspection = deferred<"missing">();
+    vi.mocked(dispatch.inspectArtifact).mockImplementationOnce(async () => inspection.promise);
+    const releasing = manager.releaseIfIdle("bind-a");
+    await flush();
+    expect(store.listVoiceConsoleSegments("bind-a")[0]).toMatchObject({
+      state: "batched",
+      transcript: "must never enqueue",
+    });
+    store.quarantineVoiceConsoleCapture("capture-quarantine-race", "identity changed", NOW);
+    expect(store.getVoiceConsoleBatch(store.listVoiceConsoleSegments("bind-a")[0]!.dispatchId!)).toBeNull();
+    inspection.resolve("missing");
+
+    expect(await releasing).toBe(false);
+    expect(dispatch.enqueue).not.toHaveBeenCalled();
+    expect(store.listVoiceConsoleSegments("bind-a")[0]).toMatchObject({
+      state: "capture_dropped",
+      transcript: "",
+      error: expect.stringContaining("invalid legacy capture identity"),
+    });
+    expect(store.listVoiceConsoleQuarantinedDispatches()).toEqual([]);
+  });
+
+  it("terminalizes an artifact-free quarantined batch without creating an artifact", async () => {
+    manager.allocateCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-bad",
+      speakerName: "Bad attribution",
+      captureId: "capture-quarantine-missing",
+      capturedStartedUtc: NOW,
+    });
+    manager.commitCapture({
+      ...captureIdentity("capture-quarantine-missing"),
+      speakerName: "Bad attribution",
+      transcript: "artifact free",
+      audioMs: 100,
+      forwardedAudioMs: 50,
+      capturedEndedUtc: NOW,
+      speakerAuthorized: true,
+    });
+    expect(store.claimPendingVoiceConsoleBatch("bind-a", "dispatch-quarantine-missing")).not.toBeNull();
+    store.quarantineVoiceConsoleCapture("capture-quarantine-missing", "invalid target", NOW);
+    vi.mocked(dispatch.inspectArtifact).mockResolvedValue("missing");
+
+    expect(await manager.recoverQuarantinedDispatches()).toEqual({
+      resolved: 1,
+      blocked: 0,
+      failures: 0,
+    });
+    expect(dispatch.enqueue).not.toHaveBeenCalled();
+    expect(dispatch.quarantineArtifact).not.toHaveBeenCalled();
+    expect(store.listVoiceConsoleSegments("bind-a")[0]).toMatchObject({
+      state: "capture_dropped",
+      transcript: "",
+    });
+    expect(store.listVoiceConsoleQuarantinedDispatches({ includeReconciled: true })).toEqual([
+      expect.objectContaining({
+        dispatchId: "dispatch-quarantine-missing",
+        artifactState: "missing",
+        reconciledUtc: NOW,
+      }),
+    ]);
+    expect(await manager.recoverDispatches()).toEqual({ enqueued: 0, found: 0, failures: 0 });
+
+    manager.shutdown();
+    store.close();
+    store = new SessionStore(path.join(dir, "test.db"));
+    manager = createManager();
+    expect(store.getVoiceConsoleBatch("dispatch-quarantine-missing")).toBeNull();
+    expect(store.getThreadVoiceBatch("dispatch-quarantine-missing")).toBeNull();
+    expect(await manager.recoverQuarantinedDispatches()).toEqual({
+      resolved: 0,
+      blocked: 0,
+      failures: 0,
+    });
+    expect(store.listVoiceConsoleQuarantinedDispatches({ includeReconciled: true })).toEqual([
+      expect.objectContaining({
+        dispatchId: "dispatch-quarantine-missing",
+        artifactState: "missing",
+        reconciledUtc: NOW,
+      }),
+    ]);
+  });
+
+  it.each(["pending", "running", "done"] as const)(
+    "routes a quarantined %s artifact only through Package E terminalization",
+    async (artifactState) => {
+      const captureId = `capture-quarantine-${artifactState}`;
+      manager.allocateCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-bad",
+        speakerName: "Bad attribution",
+        captureId,
+        capturedStartedUtc: NOW,
+      });
+      manager.commitCapture({
+        ...captureIdentity(captureId),
+        speakerName: "Bad attribution",
+        transcript: `owned ${artifactState}`,
+        audioMs: 100,
+        forwardedAudioMs: 50,
+        capturedEndedUtc: NOW,
+        speakerAuthorized: true,
+      });
+      expect(store.claimPendingVoiceConsoleBatch("bind-a", `dispatch-${artifactState}`)).not.toBeNull();
+      if (artifactState !== "pending") {
+        store.markThreadVoiceBatchDispatched(`dispatch-${artifactState}`, NOW);
+      }
+      store.quarantineVoiceConsoleCapture(captureId, "invalid speaker identity", NOW);
+      vi.mocked(dispatch.inspectArtifact).mockResolvedValue(artifactState);
+
+      expect(await manager.recoverQuarantinedDispatches()).toEqual({
+        resolved: 1,
+        blocked: 0,
+        failures: 0,
+      });
+      expect(dispatch.enqueue).not.toHaveBeenCalled();
+      expect(dispatch.quarantineArtifact).toHaveBeenCalledWith({
+        dispatchId: `dispatch-${artifactState}`,
+        bindingId: "bind-a",
+        captureIds: [captureId],
+        artifactState,
+        reason: expect.stringContaining("invalid legacy capture identity"),
+      });
+      expect(store.listVoiceConsoleSegments("bind-a")[0]).toMatchObject({
+        state: "capture_dropped",
+        transcript: "",
+      });
+    }
+  );
+
+  it("quarantines every artifact in a fan-out without releasing either transcript", async () => {
+    const added = await manager.addBinding({
+      binding: binding("bind-b", { status: "adding", alias: "Beta" }),
+      claim: false,
+      expectedRevision: 1,
+    });
+    if (!added.ok) throw new Error(added.error);
+    const selected = store.replaceVoiceConsoleInputTargets("tvc_1", {
+      bindingIds: ["bind-a", "bind-b"],
+      fanoutArmed: true,
+      expectedRevision: added.value.console.revision,
+    });
+    if (!selected.ok) throw new Error(selected.error);
+    manager.allocateCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-bad",
+      speakerName: "Bad attribution",
+      captureId: "capture-quarantine-fanout",
+      capturedStartedUtc: NOW,
+    });
+    manager.commitCapture({
+      ...captureIdentity("capture-quarantine-fanout"),
+      speakerName: "Bad attribution",
+      transcript: "must not reach either target",
+      audioMs: 100,
+      forwardedAudioMs: 50,
+      capturedEndedUtc: NOW,
+      speakerAuthorized: true,
+    });
+    expect(store.claimPendingVoiceConsoleBatch("bind-a", "dispatch-fanout-a")).not.toBeNull();
+    expect(store.claimPendingVoiceConsoleBatch("bind-b", "dispatch-fanout-b")).not.toBeNull();
+    store.quarantineVoiceConsoleCapture("capture-quarantine-fanout", "invalid fan-out", NOW);
+    vi.mocked(dispatch.inspectArtifact).mockResolvedValue("running");
+
+    expect(await manager.recoverQuarantinedDispatches()).toEqual({
+      resolved: 2,
+      blocked: 0,
+      failures: 0,
+    });
+    expect(dispatch.enqueue).not.toHaveBeenCalled();
+    expect(dispatch.quarantineArtifact).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(dispatch.quarantineArtifact).mock.calls.map(([input]) => input.dispatchId)).toEqual([
+      "dispatch-fanout-a",
+      "dispatch-fanout-b",
+    ]);
+    for (const bindingId of ["bind-a", "bind-b"]) {
+      expect(store.listVoiceConsoleSegments(bindingId)[0]).toMatchObject({
+        state: "capture_dropped",
+        transcript: "",
+      });
+    }
+  });
+
+  it("keeps an owned quarantined artifact blocked when Package E cancellation is unavailable", async () => {
+    manager.allocateCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-bad",
+      speakerName: "Bad attribution",
+      captureId: "capture-quarantine-blocked",
+      capturedStartedUtc: NOW,
+    });
+    manager.commitCapture({
+      ...captureIdentity("capture-quarantine-blocked"),
+      speakerName: "Bad attribution",
+      transcript: "blocked artifact text",
+      audioMs: 100,
+      forwardedAudioMs: 50,
+      capturedEndedUtc: NOW,
+      speakerAuthorized: true,
+    });
+    expect(store.claimPendingVoiceConsoleBatch("bind-a", "dispatch-quarantine-blocked")).not.toBeNull();
+    store.quarantineVoiceConsoleCapture("capture-quarantine-blocked", "invalid identity", NOW);
+    vi.mocked(dispatch.inspectArtifact).mockResolvedValue("pending");
+    dispatch.quarantineArtifact = undefined;
+
+    expect(await manager.recoverQuarantinedDispatches()).toEqual({
+      resolved: 0,
+      blocked: 1,
+      failures: 0,
+    });
+    expect(dispatch.enqueue).not.toHaveBeenCalled();
+    expect(store.listVoiceConsoleQuarantinedDispatches()).toEqual([
+      expect.objectContaining({
+        dispatchId: "dispatch-quarantine-blocked",
+        artifactState: "pending",
+        captureIds: ["capture-quarantine-blocked"],
+      }),
+    ]);
+    expect(store.getVoiceConsoleBatch("dispatch-quarantine-blocked")).toBeNull();
+    expect(store.claimPendingVoiceConsoleBatch("bind-a", "escape-dispatch")).toBeNull();
   });
 });

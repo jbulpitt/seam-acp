@@ -274,6 +274,16 @@ export interface VoiceConsoleDispatchRequest {
   createdUtc: string;
 }
 
+export interface VoiceConsoleQuarantinedDispatch {
+  dispatchId: string;
+  bindingId: string;
+  captureIds: string[];
+  reason: string;
+  artifactState: "unknown" | ThreadVoiceDispatchArtifactState;
+  quarantinedUtc: string;
+  reconciledUtc: string | null;
+}
+
 export interface VoiceConsoleDispatchHost {
   /**
    * True for any binding-local ACP/channel work, regardless of origin: typed,
@@ -281,6 +291,17 @@ export interface VoiceConsoleDispatchHost {
    */
   isBindingBusy(binding: ThreadVoiceBinding): boolean | Promise<boolean>;
   inspectArtifact(dispatchId: string): Promise<ThreadVoiceDispatchArtifactState>;
+  /**
+   * Package E idempotently cancels/terminalizes the durable artifact and emits
+   * operator notice. A throw leaves the quarantine open for boot recovery.
+   */
+  quarantineArtifact?(input: {
+    dispatchId: string;
+    bindingId: string;
+    captureIds: readonly string[];
+    artifactState: Exclude<ThreadVoiceDispatchArtifactState, "missing">;
+    reason: string;
+  }): Promise<void>;
   enqueue(request: VoiceConsoleDispatchRequest): Promise<void>;
 }
 

@@ -12,6 +12,7 @@ import type {
   VoiceConsoleDropCaptureInput,
   VoiceConsoleFinalCapture,
   VoiceConsoleMutationOutcome,
+  VoiceConsoleQuarantinedDispatch,
   VoiceConsoleMutationFailure,
   VoiceConsoleRemoveResult,
   VoiceConsoleRuntimeHost,
@@ -217,9 +218,26 @@ export class VoiceConsoleManager {
     if (!batch) return false;
     try {
       const artifact = await this.dispatch.inspectArtifact(batch.dispatchId);
+      const quarantine = this.store
+        .listVoiceConsoleQuarantinedDispatches()
+        .find((entry) => entry.dispatchId === batch.dispatchId);
+      if (quarantine) {
+        await this.reconcileQuarantinedDispatch(quarantine, artifact);
+        return false;
+      }
       // Removal/stop can linearize while artifact inspection is awaiting I/O.
       if (this.releaseBlocked.has(bindingId)) return false;
       if (artifact === "missing") await this.dispatch.enqueue(this.toDispatchRequest(batch));
+      const quarantineAfterEnqueue = this.store
+        .listVoiceConsoleQuarantinedDispatches()
+        .find((entry) => entry.dispatchId === batch.dispatchId);
+      if (quarantineAfterEnqueue) {
+        await this.reconcileQuarantinedDispatch(
+          quarantineAfterEnqueue,
+          await this.dispatch.inspectArtifact(batch.dispatchId)
+        );
+        return false;
+      }
       this.store.markThreadVoiceBatchDispatched(batch.dispatchId, this.now());
       if (artifact !== "done") this.activeDispatchByBinding.set(bindingId, batch.dispatchId);
       this.logger.info(
@@ -457,6 +475,9 @@ export class VoiceConsoleManager {
     let enqueued = 0;
     let found = 0;
     let failures = 0;
+    const quarantine = await this.recoverQuarantinedDispatches();
+    found += quarantine.resolved;
+    failures += quarantine.failures + quarantine.blocked;
     const reconciled = new Set<string>();
     for (const batch of this.store.listVoiceConsoleBatchesByState("batched")) {
       reconciled.add(batch.dispatchId);
@@ -501,6 +522,61 @@ export class VoiceConsoleManager {
       if (!this.activeDispatchByBinding.has(binding.id)) void this.releaseIfIdle(binding.id);
     }
     return { enqueued, found, failures };
+  }
+
+  async recoverQuarantinedDispatches(): Promise<{
+    resolved: number;
+    blocked: number;
+    failures: number;
+  }> {
+    let resolved = 0;
+    let blocked = 0;
+    let failures = 0;
+    for (const entry of this.store.listVoiceConsoleQuarantinedDispatches()) {
+      try {
+        const artifact = await this.dispatch.inspectArtifact(entry.dispatchId);
+        const didResolve = await this.reconcileQuarantinedDispatch(entry, artifact);
+        if (didResolve) resolved++;
+        else blocked++;
+      } catch (err) {
+        failures++;
+        this.logger.error(
+          { err, dispatchId: entry.dispatchId, captureIds: entry.captureIds },
+          "voice console quarantined artifact recovery failed"
+        );
+      }
+    }
+    return { resolved, blocked, failures };
+  }
+
+  private async reconcileQuarantinedDispatch(
+    entry: VoiceConsoleQuarantinedDispatch,
+    artifactState: "missing" | "pending" | "running" | "done"
+  ): Promise<boolean> {
+    this.store.recordVoiceConsoleQuarantinedArtifactState(entry.dispatchId, artifactState);
+    if (artifactState !== "missing") {
+      if (!this.dispatch.quarantineArtifact) {
+        this.logger.error(
+          { dispatchId: entry.dispatchId, artifactState, captureIds: entry.captureIds },
+          "voice console quarantined artifact requires Package E cancellation/notice"
+        );
+        return false;
+      }
+      await this.dispatch.quarantineArtifact({
+        dispatchId: entry.dispatchId,
+        bindingId: entry.bindingId,
+        captureIds: entry.captureIds,
+        artifactState,
+        reason: entry.reason,
+      });
+    }
+    this.store.finalizeVoiceConsoleQuarantinedDispatch(
+      entry.dispatchId,
+      artifactState,
+      this.now()
+    );
+    this.activeDispatchByBinding.delete(entry.bindingId);
+    return true;
   }
 
   getActiveDispatchId(bindingId: string): string | undefined {

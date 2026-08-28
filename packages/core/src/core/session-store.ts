@@ -73,6 +73,7 @@ import {
   type VoiceConsoleMutationFailure,
   type VoiceConsoleMutationOutcome,
   type VoiceConsoleMutationResult,
+  type VoiceConsoleQuarantinedDispatch,
   type VoiceConsoleSegment,
   type VoiceConsoleSession,
   type VoiceConsoleStatus,
@@ -460,6 +461,14 @@ export class SessionStore {
   }
 
   private migrateVoiceConsoleCaptureIdentityOne(captureId: string): void {
+    if (this.isVoiceConsoleCaptureQuarantined(captureId)) {
+      this.applyVoiceConsoleCaptureQuarantine(
+        captureId,
+        "capture id was previously quarantined",
+        new Date().toISOString()
+      );
+      return;
+    }
     assertVoiceConsoleAuthorityId(captureId, "Voice Console capture id");
     const rows = this.voiceConsoleCaptureRows(captureId);
     const terminal = this.getVoiceConsoleCaptureTerminal(captureId);
@@ -599,7 +608,25 @@ export class SessionStore {
   }
 
   private invalidateLegacyVoiceConsoleCapture(captureId: string, detail: string): void {
-    const recoveredUtc = new Date().toISOString();
+    this.applyVoiceConsoleCaptureQuarantine(captureId, detail, new Date().toISOString());
+  }
+
+  quarantineVoiceConsoleCapture(
+    captureId: string,
+    detail: string,
+    quarantinedUtc = new Date().toISOString()
+  ): { captureId: string; reason: string; dispatchIds: string[] } {
+    const quarantine = this.db.transaction(() =>
+      this.applyVoiceConsoleCaptureQuarantine(captureId, detail, quarantinedUtc)
+    );
+    return quarantine();
+  }
+
+  private applyVoiceConsoleCaptureQuarantine(
+    captureId: string,
+    detail: string,
+    quarantinedUtc: string
+  ): { captureId: string; reason: string; dispatchIds: string[] } {
     const reason = sanitizeVoiceConsoleAuditReason(
       detail.startsWith("invalid legacy capture identity:")
         ? detail
@@ -610,20 +637,55 @@ export class SessionStore {
         `INSERT OR IGNORE INTO voice_console_invalid_captures
            (capture_id, reason, recovered_utc) VALUES (?, ?, ?)`
       )
-      .run(captureId, reason, recoveredUtc);
+      .run(captureId, reason, quarantinedUtc);
+    const durableReason = this.db
+      .prepare<[string], { reason: string }>(
+        "SELECT reason FROM voice_console_invalid_captures WHERE capture_id = ?"
+      )
+      .get(captureId)?.reason ?? reason;
     this.db
       .prepare(
         `UPDATE voice_console_capture_reservations
             SET identity_valid = 0, invalid_reason = ? WHERE capture_id = ?`
       )
-      .run(reason, captureId);
+      .run(durableReason, captureId);
+    const claimed = this.db
+      .prepare<[string], { dispatch_id: string; session_id: string }>(
+        `SELECT DISTINCT dispatch_id, session_id FROM thread_voice_segments
+          WHERE capture_id = ? AND dispatch_id IS NOT NULL
+            AND state IN ('batched','dispatched')`
+      )
+      .all(captureId);
+    const insertDispatch = this.db.prepare(
+      `INSERT OR IGNORE INTO voice_console_quarantined_dispatches
+         (dispatch_id, capture_id, binding_id, reason, artifact_state,
+          quarantined_utc, reconciled_utc)
+       VALUES (?, ?, ?, ?, 'unknown', ?, NULL)`
+    );
+    for (const row of claimed) {
+      insertDispatch.run(
+        row.dispatch_id,
+        captureId,
+        row.session_id,
+        durableReason,
+        quarantinedUtc
+      );
+    }
     this.db
       .prepare(
         `UPDATE thread_voice_segments SET transcript = '', state = 'capture_dropped',
            error = ?, updated_utc = ?
-         WHERE capture_id = ? AND state IN ('capturing','finalizing')`
+         WHERE capture_id = ? AND (
+           state IN ('capturing','finalizing','pending')
+           OR (state IN ('batched','dispatched') AND dispatch_id IS NULL)
+         )`
       )
-      .run(reason, recoveredUtc, captureId);
+      .run(durableReason, quarantinedUtc, captureId);
+    return {
+      captureId,
+      reason: durableReason,
+      dispatchIds: [...new Set(claimed.map((row) => row.dispatch_id))],
+    };
   }
 
   private repairLegacyVoiceConsoleCaptureTerminal(captureId: string): void {
@@ -2893,7 +2955,11 @@ export class SessionStore {
     return this.db
       .prepare(
         `UPDATE thread_voice_segments SET state = 'finalizing', updated_utc = ?
-          WHERE capture_id = ? AND state = 'capturing'`
+          WHERE capture_id = ? AND state = 'capturing'
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_invalid_captures invalid
+               WHERE invalid.capture_id = thread_voice_segments.capture_id
+            )`
       )
       .run(updatedUtc, captureId).changes;
   }
@@ -2912,6 +2978,10 @@ export class SessionStore {
            JOIN thread_voice_sessions binding ON binding.id = segment.session_id
           WHERE binding.console_id IS NOT NULL AND segment.capture_id IS NOT NULL
             AND segment.state IN ('capturing','finalizing')
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_invalid_captures invalid
+               WHERE invalid.capture_id = segment.capture_id
+            )
           ORDER BY segment.capture_id ASC`
       )
       .all()
@@ -3082,6 +3152,10 @@ export class SessionStore {
   }): VoiceConsoleCaptureSnapshot | null {
     const allocate = this.db.transaction((): VoiceConsoleCaptureSnapshot | null => {
       const captureId = input.captureId ?? newVoiceConsoleCaptureId();
+      assertVoiceConsoleAuthorityId(captureId, "Voice Console capture id");
+      if (this.isVoiceConsoleCaptureQuarantined(captureId)) {
+        throw new Error("Voice Console capture id is permanently quarantined.");
+      }
       const prior = this.getVoiceConsoleCaptureReservation(captureId);
       if (prior) return this.replayVoiceConsoleCaptureAllocation(prior, input);
       if (this.getVoiceConsoleCaptureTerminal(captureId)) {
@@ -3632,6 +3706,10 @@ export class SessionStore {
            JOIN thread_voice_sessions binding ON binding.id = segment.session_id
           WHERE binding.console_id = ? AND segment.capture_id IS NOT NULL
             AND segment.state IN ('capturing','finalizing')
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_invalid_captures invalid
+               WHERE invalid.capture_id = segment.capture_id
+            )
           ORDER BY segment.capture_id ASC`
       )
       .all(consoleId)
@@ -3664,6 +3742,100 @@ export class SessionStore {
       .map(mapVoiceConsoleSegment);
   }
 
+  isVoiceConsoleCaptureQuarantined(captureId: string): boolean {
+    return Boolean(
+      this.db
+        .prepare<[string], { found: number }>(
+          "SELECT 1 AS found FROM voice_console_invalid_captures WHERE capture_id = ?"
+        )
+        .get(captureId)
+    );
+  }
+
+  isVoiceConsoleDispatchQuarantined(dispatchId: string): boolean {
+    return Boolean(
+      this.db
+        .prepare<[string], { found: number }>(
+          `SELECT 1 AS found FROM voice_console_quarantined_dispatches
+            WHERE dispatch_id = ? AND reconciled_utc IS NULL LIMIT 1`
+        )
+        .get(dispatchId)
+    );
+  }
+
+  listVoiceConsoleQuarantinedDispatches(
+    options: { includeReconciled?: boolean } = {}
+  ): VoiceConsoleQuarantinedDispatch[] {
+    const rows = this.db
+      .prepare<[number], VoiceConsoleQuarantinedDispatchRow>(
+        `SELECT * FROM voice_console_quarantined_dispatches
+          WHERE (? = 1 OR reconciled_utc IS NULL)
+          ORDER BY quarantined_utc, dispatch_id, capture_id`
+      )
+      .all(options.includeReconciled ? 1 : 0);
+    const grouped = new Map<string, VoiceConsoleQuarantinedDispatch>();
+    for (const row of rows) {
+      const existing = grouped.get(row.dispatch_id);
+      if (existing) {
+        existing.captureIds.push(row.capture_id);
+        continue;
+      }
+      grouped.set(row.dispatch_id, {
+        dispatchId: row.dispatch_id,
+        bindingId: row.binding_id,
+        captureIds: [row.capture_id],
+        reason: row.reason,
+        artifactState: row.artifact_state as VoiceConsoleQuarantinedDispatch["artifactState"],
+        quarantinedUtc: row.quarantined_utc,
+        reconciledUtc: row.reconciled_utc,
+      });
+    }
+    return [...grouped.values()];
+  }
+
+  recordVoiceConsoleQuarantinedArtifactState(
+    dispatchId: string,
+    artifactState: "missing" | "pending" | "running" | "done"
+  ): number {
+    return this.db
+      .prepare(
+        `UPDATE voice_console_quarantined_dispatches SET artifact_state = ?
+          WHERE dispatch_id = ? AND reconciled_utc IS NULL`
+      )
+      .run(artifactState, dispatchId).changes;
+  }
+
+  finalizeVoiceConsoleQuarantinedDispatch(
+    dispatchId: string,
+    artifactState: "missing" | "pending" | "running" | "done",
+    reconciledUtc = new Date().toISOString()
+  ): number {
+    const finalize = this.db.transaction(() => {
+      const reason = this.db
+        .prepare<[string], { reason: string }>(
+          `SELECT reason FROM voice_console_quarantined_dispatches
+            WHERE dispatch_id = ? AND reconciled_utc IS NULL LIMIT 1`
+        )
+        .get(dispatchId)?.reason;
+      if (!reason) return 0;
+      const changed = this.db
+        .prepare(
+          `UPDATE thread_voice_segments SET transcript = '', state = 'capture_dropped',
+             error = ?, updated_utc = ? WHERE dispatch_id = ?`
+        )
+        .run(reason, reconciledUtc, dispatchId).changes;
+      this.db
+        .prepare(
+          `UPDATE voice_console_quarantined_dispatches
+              SET artifact_state = ?, reconciled_utc = ?
+            WHERE dispatch_id = ? AND reconciled_utc IS NULL`
+        )
+        .run(artifactState, reconciledUtc, dispatchId);
+      return changed;
+    });
+    return finalize();
+  }
+
   claimPendingVoiceConsoleBatch(
     bindingId: string,
     dispatchId = newThreadVoiceDispatchId(),
@@ -3677,20 +3849,48 @@ export class SessionStore {
           `SELECT segment.dispatch_id FROM thread_voice_segments segment
              JOIN thread_voice_sessions binding ON binding.id = segment.session_id
             WHERE binding.platform = ? AND binding.channel_ref = ?
-              AND segment.state = 'batched' AND segment.dispatch_id IS NOT NULL LIMIT 1`
+              AND segment.state = 'batched' AND segment.dispatch_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM voice_console_invalid_captures invalid
+                 WHERE invalid.capture_id = segment.capture_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+                 WHERE quarantine.dispatch_id = segment.dispatch_id
+                   AND quarantine.reconciled_utc IS NULL
+              )
+            LIMIT 1`
         )
         .get(binding.platform, binding.channelRef);
       if (existing) return null;
+      if (
+        this.db
+          .prepare<[string], { found: number }>(
+            `SELECT 1 AS found FROM voice_console_quarantined_dispatches quarantine
+              JOIN thread_voice_segments segment ON segment.dispatch_id = quarantine.dispatch_id
+             WHERE segment.session_id = ? AND quarantine.reconciled_utc IS NULL LIMIT 1`
+          )
+          .get(bindingId)
+      ) return null;
       const unresolved = this.db
         .prepare<[string], { sequence: number }>(
-          `SELECT MIN(sequence) AS sequence FROM thread_voice_segments
-            WHERE session_id = ? AND state IN ('capturing','finalizing')`
+          `SELECT MIN(sequence) AS sequence FROM thread_voice_segments segment
+            WHERE session_id = ? AND state IN ('capturing','finalizing')
+              AND NOT EXISTS (
+                SELECT 1 FROM voice_console_invalid_captures invalid
+                 WHERE invalid.capture_id = segment.capture_id
+              )`
         )
         .get(bindingId)?.sequence;
       const pending = this.db
         .prepare<[string, number], VoiceConsoleSegmentRow>(
-          `SELECT * FROM thread_voice_segments WHERE session_id = ? AND state = 'pending'
-             AND sequence < ? ORDER BY sequence ASC`
+          `SELECT * FROM thread_voice_segments segment
+            WHERE session_id = ? AND state = 'pending' AND sequence < ?
+              AND NOT EXISTS (
+                SELECT 1 FROM voice_console_invalid_captures invalid
+                 WHERE invalid.capture_id = segment.capture_id
+              )
+            ORDER BY sequence ASC`
         )
         .all(bindingId, unresolved ?? Number.MAX_SAFE_INTEGER);
       if (pending.length === 0) return null;
@@ -3705,7 +3905,11 @@ export class SessionStore {
       this.db
         .prepare(
           `UPDATE thread_voice_segments SET state = 'batched', dispatch_id = ?, updated_utc = ?
-            WHERE id IN (${placeholders}) AND state = 'pending'`
+            WHERE id IN (${placeholders}) AND state = 'pending'
+              AND NOT EXISTS (
+                SELECT 1 FROM voice_console_invalid_captures invalid
+                 WHERE invalid.capture_id = thread_voice_segments.capture_id
+              )`
         )
         .run(dispatchId, claimedUtc, ...rows.map((row) => row.id));
       return this.buildVoiceConsoleBatch(
@@ -3722,7 +3926,16 @@ export class SessionStore {
   getVoiceConsoleBatch(dispatchId: string): VoiceConsoleBatch | null {
     const rows = this.db
       .prepare<[string], VoiceConsoleSegmentRow>(
-        "SELECT * FROM thread_voice_segments WHERE dispatch_id = ? ORDER BY sequence ASC"
+        `SELECT * FROM thread_voice_segments segment WHERE dispatch_id = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM voice_console_invalid_captures invalid
+             WHERE invalid.capture_id = segment.capture_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+             WHERE quarantine.dispatch_id = segment.dispatch_id
+          )
+          ORDER BY sequence ASC`
       )
       .all(dispatchId);
     if (rows.length === 0) return null;
@@ -3736,6 +3949,14 @@ export class SessionStore {
         `SELECT dispatch_id FROM thread_voice_segments segment
            JOIN thread_voice_sessions binding ON binding.id = segment.session_id
           WHERE segment.state = ? AND segment.dispatch_id IS NOT NULL AND binding.console_id IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_invalid_captures invalid
+               WHERE invalid.capture_id = segment.capture_id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+               WHERE quarantine.dispatch_id = segment.dispatch_id
+            )
           GROUP BY dispatch_id ORDER BY MIN(segment.created_utc) ASC`
       )
       .all(state)
@@ -3753,7 +3974,16 @@ export class SessionStore {
       .prepare(
         `UPDATE thread_voice_segments SET state = 'pending', dispatch_id = NULL,
            updated_utc = ?, error = NULL
-         WHERE session_id = ? AND dispatch_id = ? AND state = 'batched'`
+         WHERE session_id = ? AND dispatch_id = ? AND state = 'batched'
+           AND NOT EXISTS (
+             SELECT 1 FROM voice_console_invalid_captures invalid
+              WHERE invalid.capture_id = thread_voice_segments.capture_id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+              WHERE quarantine.dispatch_id = thread_voice_segments.dispatch_id
+                AND quarantine.reconciled_utc IS NULL
+           )`
       )
       .run(updatedUtc, bindingId, dispatchId).changes;
   }
@@ -3787,6 +4017,14 @@ export class SessionStore {
         `SELECT DISTINCT binding.* FROM thread_voice_sessions binding
            JOIN thread_voice_segments segment ON segment.session_id = binding.id
           WHERE binding.console_id IS NOT NULL AND segment.state IN ('pending','batched')
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_invalid_captures invalid
+               WHERE invalid.capture_id = segment.capture_id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+               WHERE quarantine.dispatch_id = segment.dispatch_id
+            )
           ORDER BY binding.created_utc ASC`
       )
       .all()
@@ -4138,6 +4376,14 @@ export class SessionStore {
         `SELECT DISTINCT tv.* FROM thread_voice_sessions tv
            JOIN thread_voice_segments segment ON segment.session_id = tv.id
           WHERE segment.state IN ('pending','batched')
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_invalid_captures invalid
+               WHERE invalid.capture_id = segment.capture_id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+               WHERE quarantine.dispatch_id = segment.dispatch_id
+            )
           ORDER BY tv.created_utc ASC`
       )
       .all()
@@ -4371,7 +4617,16 @@ export class SessionStore {
          FROM thread_voice_segments segment
          JOIN thread_voice_sessions tv ON tv.id = segment.session_id
          WHERE tv.platform = ? AND tv.channel_ref = ?
-           AND segment.state IN ('pending','batched')`
+           AND segment.state IN ('pending','batched')
+           AND NOT EXISTS (
+             SELECT 1 FROM voice_console_invalid_captures invalid
+              WHERE invalid.capture_id = segment.capture_id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+              WHERE quarantine.dispatch_id = segment.dispatch_id
+                AND quarantine.reconciled_utc IS NULL
+           )`
       )
       .get(platform, channelRef);
     return {
@@ -4408,15 +4663,37 @@ export class SessionStore {
              JOIN thread_voice_sessions tv ON tv.id = segment.session_id
             WHERE tv.platform = ? AND tv.channel_ref = ?
               AND segment.state = 'batched' AND segment.dispatch_id IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM voice_console_invalid_captures invalid
+                 WHERE invalid.capture_id = segment.capture_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+                 WHERE quarantine.dispatch_id = segment.dispatch_id
+                   AND quarantine.reconciled_utc IS NULL
+              )
             LIMIT 1`
         )
         .get(sessionRow.platform, sessionRow.channel_ref);
       if (existing) return null;
+      if (
+        this.db
+          .prepare<[string], { found: number }>(
+            `SELECT 1 AS found FROM voice_console_quarantined_dispatches quarantine
+              JOIN thread_voice_segments segment ON segment.dispatch_id = quarantine.dispatch_id
+             WHERE segment.session_id = ? AND quarantine.reconciled_utc IS NULL LIMIT 1`
+          )
+          .get(sessionId)
+      ) return null;
 
       const pending = this.db
         .prepare<[string], ThreadVoiceSegmentRow>(
-          `SELECT * FROM thread_voice_segments
+          `SELECT * FROM thread_voice_segments segment
             WHERE session_id = ? AND state = 'pending'
+              AND NOT EXISTS (
+                SELECT 1 FROM voice_console_invalid_captures invalid
+                 WHERE invalid.capture_id = segment.capture_id
+              )
             ORDER BY sequence ASC`
         )
         .all(sessionId);
@@ -4425,7 +4702,11 @@ export class SessionStore {
         .prepare(
           `UPDATE thread_voice_segments
               SET state = 'batched', dispatch_id = ?, updated_utc = ?
-            WHERE session_id = ? AND state = 'pending'`
+            WHERE session_id = ? AND state = 'pending'
+              AND NOT EXISTS (
+                SELECT 1 FROM voice_console_invalid_captures invalid
+                 WHERE invalid.capture_id = thread_voice_segments.capture_id
+              )`
         )
         .run(dispatchId, claimedUtc, sessionId);
       const session = mapThreadVoiceSession(sessionRow);
@@ -4450,8 +4731,17 @@ export class SessionStore {
   getThreadVoiceBatch(dispatchId: string): ThreadVoiceBatch | null {
     const rows = this.db
       .prepare<[string], ThreadVoiceSegmentRow>(
-        `SELECT * FROM thread_voice_segments
-          WHERE dispatch_id = ? ORDER BY sequence ASC`
+        `SELECT * FROM thread_voice_segments segment
+          WHERE dispatch_id = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_invalid_captures invalid
+               WHERE invalid.capture_id = segment.capture_id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+               WHERE quarantine.dispatch_id = segment.dispatch_id
+            )
+          ORDER BY sequence ASC`
       )
       .all(dispatchId);
     if (rows.length === 0) return null;
@@ -4475,8 +4765,16 @@ export class SessionStore {
   ): ThreadVoiceBatch[] {
     const ids = this.db
       .prepare<[string], { dispatch_id: string }>(
-        `SELECT dispatch_id FROM thread_voice_segments
+        `SELECT dispatch_id FROM thread_voice_segments segment
           WHERE state = ? AND dispatch_id IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_invalid_captures invalid
+               WHERE invalid.capture_id = segment.capture_id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+               WHERE quarantine.dispatch_id = segment.dispatch_id
+            )
           GROUP BY dispatch_id ORDER BY MIN(created_utc) ASC`
       )
       .all(state);
@@ -4492,7 +4790,12 @@ export class SessionStore {
     return this.db
       .prepare(
         `UPDATE thread_voice_segments SET state = 'dispatched', updated_utc = ?, error = NULL
-          WHERE dispatch_id = ? AND state = 'batched'`
+          WHERE dispatch_id = ? AND state = 'batched'
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+               WHERE quarantine.dispatch_id = thread_voice_segments.dispatch_id
+                 AND quarantine.reconciled_utc IS NULL
+            )`
       )
       .run(updatedUtc, dispatchId).changes;
   }
@@ -4505,7 +4808,12 @@ export class SessionStore {
     return this.db
       .prepare(
         `UPDATE thread_voice_segments SET error = ?, updated_utc = ?
-          WHERE dispatch_id = ? AND state = 'batched'`
+          WHERE dispatch_id = ? AND state = 'batched'
+            AND NOT EXISTS (
+              SELECT 1 FROM voice_console_quarantined_dispatches quarantine
+               WHERE quarantine.dispatch_id = thread_voice_segments.dispatch_id
+                 AND quarantine.reconciled_utc IS NULL
+            )`
       )
       .run(error, updatedUtc, dispatchId).changes;
   }
@@ -5256,6 +5564,20 @@ CREATE TABLE IF NOT EXISTS voice_console_invalid_captures (
   recovered_utc TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS voice_console_quarantined_dispatches (
+  dispatch_id      TEXT NOT NULL,
+  capture_id       TEXT NOT NULL,
+  binding_id       TEXT NOT NULL,
+  reason           TEXT NOT NULL,
+  artifact_state   TEXT NOT NULL DEFAULT 'unknown',
+  quarantined_utc  TEXT NOT NULL,
+  reconciled_utc   TEXT,
+  PRIMARY KEY(dispatch_id, capture_id),
+  CHECK(artifact_state IN ('unknown','missing','pending','running','done'))
+);
+CREATE INDEX IF NOT EXISTS idx_voice_console_quarantined_dispatches_open
+  ON voice_console_quarantined_dispatches(reconciled_utc, dispatch_id);
+
 CREATE TABLE IF NOT EXISTS voice_console_capture_terminals (
   capture_id            TEXT PRIMARY KEY,
   console_id            TEXT NOT NULL,
@@ -5352,6 +5674,16 @@ interface VoiceConsoleCaptureTargetRow {
   target_ordinal: number;
   binding_id: string;
   sequence: number;
+}
+
+interface VoiceConsoleQuarantinedDispatchRow {
+  dispatch_id: string;
+  capture_id: string;
+  binding_id: string;
+  reason: string;
+  artifact_state: string;
+  quarantined_utc: string;
+  reconciled_utc: string | null;
 }
 
 const mapVoiceConsoleCaptureTerminal = (

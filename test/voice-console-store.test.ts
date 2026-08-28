@@ -1115,4 +1115,153 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
       sttFailureCount: 0,
     });
   });
+
+  it("quarantines committed fan-out text before claim while valid neighbors still dispatch", () => {
+    const added = store.addVoiceConsoleBinding({
+      binding: binding("bind-b", { alias: "Beta" }),
+      claim: false,
+      expectedRevision: 1,
+    });
+    if (!added.ok) throw new Error(added.error);
+    const active = store.activateVoiceConsoleBinding("bind-b", {
+      expectedRevision: added.value.console.revision,
+      claim: false,
+    });
+    if (!active.ok) throw new Error(active.error);
+    const selected = store.replaceVoiceConsoleInputTargets("tvc_1", {
+      bindingIds: ["bind-a", "bind-b"],
+      fanoutArmed: true,
+      expectedRevision: active.value.console.revision,
+    });
+    if (!selected.ok) throw new Error(selected.error);
+    for (const [captureId, speakerId, transcript] of [
+      ["capture-corrupt-pending", "speaker-bad", "never dispatch this"],
+      ["capture-valid-neighbor", "speaker-good", "dispatch only this"],
+    ] as const) {
+      store.allocateVoiceConsoleCapture({
+        consoleId: "tvc_1",
+        speakerId,
+        speakerName: speakerId,
+        captureId,
+        capturedStartedUtc: captureId.endsWith("pending")
+          ? "2026-08-28T12:01:00.000Z"
+          : "2026-08-28T12:01:01.000Z",
+      });
+      store.finalizeVoiceConsoleCapture({
+        ...captureIdentity(captureId),
+        speakerName: speakerId,
+        transcript,
+        audioMs: 100,
+        forwardedAudioMs: 50,
+        capturedEndedUtc: NOW,
+        speakerAuthorized: true,
+        resultSource: "live",
+      });
+    }
+    const dbPath = path.join(dir, "test.db");
+    store.close();
+    const raw = new Database(dbPath);
+    raw.prepare("UPDATE voice_console_capture_reservations SET target_fingerprint = ? WHERE capture_id = ?")
+      .run("corrupt", "capture-corrupt-pending");
+    raw.close();
+    store = new SessionStore(dbPath);
+    store.close();
+    store = new SessionStore(dbPath);
+
+    for (const bindingId of ["bind-a", "bind-b"]) {
+      const invalid = store
+        .listVoiceConsoleSegments(bindingId)
+        .find((segment) => segment.captureId === "capture-corrupt-pending");
+      expect(invalid).toMatchObject({
+        state: "capture_dropped",
+        transcript: "",
+        error: expect.stringContaining("invalid legacy capture identity"),
+      });
+      const batch = store.claimPendingVoiceConsoleBatch(bindingId, `dispatch-${bindingId}`);
+      expect(batch?.prompt).toContain("dispatch only this");
+      expect(batch?.prompt).not.toContain("never dispatch this");
+    }
+    expect(store.claimPendingThreadVoiceBatch("bind-a", "generic-escape")).toBeNull();
+  });
+
+  it("permanently fences audited and malformed capture ids without blocking valid B ids", async () => {
+    store.quarantineVoiceConsoleCapture("capture-audit-only", "audit-only collision", NOW);
+    expect(() =>
+      store.allocateVoiceConsoleCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-a",
+        speakerName: "A",
+        captureId: "capture-audit-only",
+        capturedStartedUtc: NOW,
+      })
+    ).toThrow(/permanently quarantined/);
+    expect(() =>
+      store.allocateVoiceConsoleCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-a",
+        speakerName: "A",
+        captureId: "bad:capture",
+        capturedStartedUtc: NOW,
+      })
+    ).toThrow(/colon-free/);
+    expect(
+      store.allocateVoiceConsoleCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-a",
+        speakerName: "A",
+        captureId: "tvcap_ApprovedB708f8d2",
+        capturedStartedUtc: NOW,
+      })
+    ).not.toBeNull();
+
+    const raced = await Promise.allSettled([
+      Promise.resolve().then(() =>
+        store.quarantineVoiceConsoleCapture("capture-quarantine-wins", "race", NOW)
+      ),
+      Promise.resolve().then(() =>
+        store.allocateVoiceConsoleCapture({
+          consoleId: "tvc_1",
+          speakerId: "speaker-race",
+          speakerName: "Race",
+          captureId: "capture-quarantine-wins",
+          capturedStartedUtc: NOW,
+        })
+      ),
+    ]);
+    expect(raced[0]?.status).toBe("fulfilled");
+    expect(raced[1]).toMatchObject({ status: "rejected", reason: expect.objectContaining({ message: expect.stringContaining("permanently quarantined") }) });
+
+    store.allocateVoiceConsoleCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-race",
+      speakerName: "Race",
+      captureId: "capture-allocation-wins",
+      capturedStartedUtc: "2026-08-28T12:02:00.000Z",
+    });
+    store.quarantineVoiceConsoleCapture("capture-allocation-wins", "race loser", NOW);
+    expect(() =>
+      store.allocateVoiceConsoleCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-race",
+        speakerName: "Race",
+        captureId: "capture-allocation-wins",
+        capturedStartedUtc: "2026-08-28T12:02:00.000Z",
+      })
+    ).toThrow(/permanently quarantined/);
+
+    const dbPath = path.join(dir, "test.db");
+    store.close();
+    store = new SessionStore(dbPath);
+    expect(store.isVoiceConsoleCaptureQuarantined("capture-audit-only")).toBe(true);
+    expect(store.isVoiceConsoleCaptureQuarantined("capture-allocation-wins")).toBe(true);
+    expect(() =>
+      store.allocateVoiceConsoleCapture({
+        consoleId: "tvc_1",
+        speakerId: "speaker-a",
+        speakerName: "A",
+        captureId: "capture-audit-only",
+        capturedStartedUtc: NOW,
+      })
+    ).toThrow(/permanently quarantined/);
+  });
 });

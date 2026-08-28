@@ -98,6 +98,20 @@ describe("Voice Console V2 migration", () => {
         "forwarded_audio_ms",
       ])
     );
+    expect(
+      mutationDb
+        .prepare("PRAGMA table_info(voice_console_capture_reservations)")
+        .all()
+        .map((row: any) => row.name)
+    ).toEqual(
+      expect.arrayContaining(["identity_version", "identity_valid", "invalid_reason"])
+    );
+    expect(
+      mutationDb
+        .prepare("PRAGMA table_info(voice_console_capture_targets)")
+        .all()
+        .map((row: any) => row.name)
+    ).toEqual(["capture_id", "target_ordinal", "binding_id", "sequence"]);
     mutationDb.close();
     expect(() =>
       store.updateVoiceConsoleCard("legacy-console", {

@@ -410,7 +410,7 @@ export class SessionStore {
     }
   }
 
-  /** Backfill capture ownership where legacy rows prove one unambiguous identity. */
+  /** Backfill ordered capture ownership while quarantining malformed legacy groups. */
   private migrateVoiceConsoleCaptureIdentity(): void {
     const terminalColumns = this.db
       .prepare<[], { name: string }>("PRAGMA table_info(voice_console_capture_terminals)")
@@ -420,89 +420,210 @@ export class SessionStore {
       ["speaker_id", "ALTER TABLE voice_console_capture_terminals ADD COLUMN speaker_id TEXT"],
       ["captured_started_utc", "ALTER TABLE voice_console_capture_terminals ADD COLUMN captured_started_utc TEXT"],
       ["target_fingerprint", "ALTER TABLE voice_console_capture_terminals ADD COLUMN target_fingerprint TEXT"],
-      ["forwarded_audio_ms", "ALTER TABLE voice_console_capture_terminals ADD COLUMN forwarded_audio_ms INTEGER"],
+      ["forwarded_audio_ms", "ALTER TABLE voice_console_capture_terminals ADD COLUMN forwarded_audio_ms REAL"],
     ] as const) {
       if (!terminalColumns.includes(name)) this.db.exec(ddl);
+    }
+    const reservationColumns = this.db
+      .prepare<[], { name: string }>("PRAGMA table_info(voice_console_capture_reservations)")
+      .all()
+      .map((row) => row.name);
+    for (const [name, ddl] of [
+      ["identity_version", "ALTER TABLE voice_console_capture_reservations ADD COLUMN identity_version INTEGER NOT NULL DEFAULT 1"],
+      ["identity_valid", "ALTER TABLE voice_console_capture_reservations ADD COLUMN identity_valid INTEGER NOT NULL DEFAULT 1"],
+      ["invalid_reason", "ALTER TABLE voice_console_capture_reservations ADD COLUMN invalid_reason TEXT"],
+    ] as const) {
+      if (!reservationColumns.includes(name)) this.db.exec(ddl);
     }
 
     const migrate = this.db.transaction(() => {
       const captureIds = this.db
         .prepare<[], { capture_id: string }>(
-          `SELECT DISTINCT capture_id FROM thread_voice_segments
-            WHERE capture_id IS NOT NULL ORDER BY capture_id`
+          `SELECT capture_id FROM thread_voice_segments WHERE capture_id IS NOT NULL
+           UNION SELECT capture_id FROM voice_console_capture_reservations
+           UNION SELECT capture_id FROM voice_console_capture_terminals
+           ORDER BY capture_id`
         )
         .all();
       for (const { capture_id: captureId } of captureIds) {
-        const existingReservation = this.getVoiceConsoleCaptureReservation(captureId);
-        if (existingReservation) {
-          this.db
-            .prepare(
-              `UPDATE voice_console_capture_terminals
-                  SET speaker_id = COALESCE(speaker_id, ?),
-                      captured_started_utc = COALESCE(captured_started_utc, ?),
-                      target_fingerprint = COALESCE(target_fingerprint, ?)
-                WHERE capture_id = ?`
-            )
-            .run(
-              existingReservation.speaker_id,
-              existingReservation.captured_started_utc,
-              existingReservation.target_fingerprint,
-              captureId
-            );
-          this.repairLegacyVoiceConsoleCaptureTerminal(captureId);
-          continue;
-        }
-        const rows = this.voiceConsoleCaptureRows(captureId);
-        const first = rows[0];
-        if (!first) continue;
-        const identities = new Set<string>();
-        for (const row of rows) {
-          const binding = this.getVoiceConsoleBinding(row.session_id);
-          identities.add(`${binding?.consoleId ?? ""}\u0000${row.author_id}\u0000${row.captured_started_utc}`);
-        }
-        if (identities.size !== 1 || identities.has(`\u0000${first.author_id}\u0000${first.captured_started_utc}`)) {
-          this.db
-            .prepare(
-              `UPDATE thread_voice_segments SET transcript = '', state = 'capture_dropped',
-                 error = 'legacy capture identity collision', updated_utc = ?
-               WHERE capture_id = ? AND state IN ('capturing','finalizing')`
-            )
-            .run(new Date().toISOString(), captureId);
-          continue;
-        }
-        const binding = this.getVoiceConsoleBinding(first.session_id)!;
-        const targets = canonicalCaptureTargets(rows.map((row) => ({ bindingId: row.session_id, sequence: row.sequence })));
-        const fingerprint = captureTargetFingerprint(targets);
-        this.db
-          .prepare(
-            `INSERT INTO voice_console_capture_reservations
-               (capture_id, console_id, speaker_id, speaker_name, captured_started_utc,
-                fanout_group_id, target_fingerprint, created_utc)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-          )
-          .run(
+        try {
+          this.migrateVoiceConsoleCaptureIdentityOne(captureId);
+        } catch (err) {
+          this.invalidateLegacyVoiceConsoleCapture(
             captureId,
-            binding.consoleId,
-            first.author_id,
-            first.author_name ?? first.author_id,
-            first.captured_started_utc,
-            first.fanout_group_id,
-            fingerprint,
-            first.created_utc
+            err instanceof Error ? err.message : String(err)
           );
-        this.db
-          .prepare(
-            `UPDATE voice_console_capture_terminals
-                SET speaker_id = COALESCE(speaker_id, ?),
-                    captured_started_utc = COALESCE(captured_started_utc, ?),
-                    target_fingerprint = COALESCE(target_fingerprint, ?)
-              WHERE capture_id = ?`
-          )
-          .run(first.author_id, first.captured_started_utc, fingerprint, captureId);
-        this.repairLegacyVoiceConsoleCaptureTerminal(captureId);
+        }
       }
     });
     migrate();
+  }
+
+  private migrateVoiceConsoleCaptureIdentityOne(captureId: string): void {
+    assertVoiceConsoleAuthorityId(captureId, "Voice Console capture id");
+    const rows = this.voiceConsoleCaptureRows(captureId);
+    const terminal = this.getVoiceConsoleCaptureTerminal(captureId);
+    const existing = this.getVoiceConsoleCaptureReservation(captureId);
+    if (existing?.identity_valid === 0) {
+      this.invalidateLegacyVoiceConsoleCapture(
+        captureId,
+        existing.invalid_reason ?? "capture identity was previously quarantined"
+      );
+      return;
+    }
+    const explicit = this.listVoiceConsoleCaptureTargets(captureId);
+    if (rows.length === 0) {
+      if (!existing || !terminal || explicit.length === 0) {
+        throw new Error("capture identity has no reservation rows");
+      }
+      const ordinalsValid = explicit.every((target, ordinal) => target.target_ordinal === ordinal);
+      const ordered = orderedCaptureTargets(
+        explicit.map((target) => ({ bindingId: target.binding_id, sequence: target.sequence }))
+      );
+      if (!ordinalsValid) throw new Error("capture ordered target identity is malformed");
+      const fingerprint = captureTargetFingerprint(ordered);
+      if (existing.identity_version >= 2 && existing.target_fingerprint !== fingerprint) {
+        throw new Error("capture target fingerprint conflicts with ordered identity");
+      }
+      this.db
+        .prepare(
+          `UPDATE voice_console_capture_reservations
+              SET target_fingerprint = ?, identity_version = 2, identity_valid = 1,
+                  invalid_reason = NULL WHERE capture_id = ?`
+        )
+        .run(fingerprint, captureId);
+      this.db
+        .prepare(
+          `UPDATE voice_console_capture_terminals
+              SET speaker_id = COALESCE(speaker_id, ?),
+                  captured_started_utc = COALESCE(captured_started_utc, ?),
+                  target_fingerprint = ? WHERE capture_id = ?`
+        )
+        .run(existing.speaker_id, existing.captured_started_utc, fingerprint, captureId);
+      this.repairLegacyVoiceConsoleCaptureTerminal(captureId);
+      return;
+    }
+
+    const first = rows[0]!;
+    const binding = this.getVoiceConsoleBinding(first.session_id);
+    if (!binding) throw new Error("capture target binding is missing");
+    const identityKey = `${binding.consoleId}\u0000${first.author_id}\u0000${first.captured_started_utc}`;
+    const fanoutIds = new Set(rows.map((row) => row.fanout_group_id ?? ""));
+    if (fanoutIds.size !== 1) throw new Error("capture fan-out identity is inconsistent");
+    for (const row of rows) {
+      assertVoiceConsoleAuthorityId(row.session_id, "Voice Console capture binding id");
+      const targetBinding = this.getVoiceConsoleBinding(row.session_id);
+      if (!targetBinding) throw new Error("capture target binding is missing");
+      const rowIdentity = `${targetBinding.consoleId}\u0000${row.author_id}\u0000${row.captured_started_utc}`;
+      if (rowIdentity !== identityKey) throw new Error("capture speaker or console identity is inconsistent");
+    }
+    const derived = orderedCaptureTargets(
+      rows.map((row) => ({ bindingId: row.session_id, sequence: row.sequence }))
+    );
+
+    let ordered = explicit.map((target) => ({
+      bindingId: target.binding_id,
+      sequence: target.sequence,
+    }));
+    const needsTargetBackfill = explicit.length === 0;
+    if (explicit.length === 0) {
+      if (existing && existing.identity_version >= 2) {
+        throw new Error("capture ordered target identity is missing");
+      }
+      ordered = derived;
+    } else {
+      const ordinalsValid = explicit.every((target, ordinal) => target.target_ordinal === ordinal);
+      const derivedKeys = new Set(derived.map(captureTargetKey));
+      const explicitKeys = new Set(orderedCaptureTargets(ordered).map(captureTargetKey));
+      if (
+        !ordinalsValid ||
+        explicit.length !== derived.length ||
+        explicitKeys.size !== derivedKeys.size ||
+        [...explicitKeys].some((key) => !derivedKeys.has(key))
+      ) {
+        throw new Error("capture ordered target identity conflicts with reservation rows");
+      }
+    }
+    ordered = orderedCaptureTargets(ordered);
+    const fingerprint = captureTargetFingerprint(ordered);
+
+    if (existing) {
+      if (
+        existing.console_id !== binding.consoleId ||
+        existing.speaker_id !== first.author_id ||
+        existing.captured_started_utc !== first.captured_started_utc
+      ) {
+        throw new Error("capture reservation identity conflicts with reservation rows");
+      }
+      if (existing.identity_version >= 2 && existing.target_fingerprint !== fingerprint) {
+        throw new Error("capture target fingerprint conflicts with ordered identity");
+      }
+      this.db
+        .prepare(
+          `UPDATE voice_console_capture_reservations
+              SET target_fingerprint = ?, identity_version = 2, identity_valid = 1,
+                  invalid_reason = NULL WHERE capture_id = ?`
+        )
+        .run(fingerprint, captureId);
+    } else {
+      this.db
+        .prepare(
+          `INSERT INTO voice_console_capture_reservations
+             (capture_id, console_id, speaker_id, speaker_name, captured_started_utc,
+              fanout_group_id, target_fingerprint, identity_version, identity_valid,
+              invalid_reason, created_utc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 2, 1, NULL, ?)`
+        )
+        .run(
+          captureId,
+          binding.consoleId,
+          first.author_id,
+          first.author_name ?? first.author_id,
+          first.captured_started_utc,
+          first.fanout_group_id,
+          fingerprint,
+          first.created_utc
+        );
+    }
+    if (needsTargetBackfill) this.insertVoiceConsoleCaptureTargets(captureId, ordered);
+    this.db
+      .prepare(
+        `UPDATE voice_console_capture_terminals
+            SET speaker_id = COALESCE(speaker_id, ?),
+                captured_started_utc = COALESCE(captured_started_utc, ?),
+                target_fingerprint = ?
+          WHERE capture_id = ?`
+      )
+      .run(first.author_id, first.captured_started_utc, fingerprint, captureId);
+    this.repairLegacyVoiceConsoleCaptureTerminal(captureId);
+  }
+
+  private invalidateLegacyVoiceConsoleCapture(captureId: string, detail: string): void {
+    const recoveredUtc = new Date().toISOString();
+    const reason = sanitizeVoiceConsoleAuditReason(
+      detail.startsWith("invalid legacy capture identity:")
+        ? detail
+        : `invalid legacy capture identity: ${detail}`
+    );
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO voice_console_invalid_captures
+           (capture_id, reason, recovered_utc) VALUES (?, ?, ?)`
+      )
+      .run(captureId, reason, recoveredUtc);
+    this.db
+      .prepare(
+        `UPDATE voice_console_capture_reservations
+            SET identity_valid = 0, invalid_reason = ? WHERE capture_id = ?`
+      )
+      .run(reason, captureId);
+    this.db
+      .prepare(
+        `UPDATE thread_voice_segments SET transcript = '', state = 'capture_dropped',
+           error = ?, updated_utc = ?
+         WHERE capture_id = ? AND state IN ('capturing','finalizing')`
+      )
+      .run(reason, recoveredUtc, captureId);
   }
 
   private repairLegacyVoiceConsoleCaptureTerminal(captureId: string): void {
@@ -3004,13 +3125,14 @@ export class SessionStore {
           );
         return { bindingId: binding.id, sequence, segmentId };
       });
-      const captureTargets = canonicalCaptureTargets(assignments);
+      const captureTargets = orderedCaptureTargets(assignments);
       this.db
         .prepare(
           `INSERT INTO voice_console_capture_reservations
              (capture_id, console_id, speaker_id, speaker_name, captured_started_utc,
-              fanout_group_id, target_fingerprint, created_utc)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+              fanout_group_id, target_fingerprint, identity_version, identity_valid,
+              invalid_reason, created_utc)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 2, 1, NULL, ?)`
         )
         .run(
           captureId,
@@ -3022,6 +3144,7 @@ export class SessionStore {
           captureTargetFingerprint(captureTargets),
           started
         );
+      this.insertVoiceConsoleCaptureTargets(captureId, captureTargets);
       this.db
         .prepare(
           `UPDATE voice_console_sessions SET utterance_count = utterance_count + 1,
@@ -3054,6 +3177,28 @@ export class SessionStore {
     );
   }
 
+  private listVoiceConsoleCaptureTargets(captureId: string): VoiceConsoleCaptureTargetRow[] {
+    return this.db
+      .prepare<[string], VoiceConsoleCaptureTargetRow>(
+        `SELECT * FROM voice_console_capture_targets
+          WHERE capture_id = ? ORDER BY target_ordinal ASC`
+      )
+      .all(captureId);
+  }
+
+  private insertVoiceConsoleCaptureTargets(
+    captureId: string,
+    targets: readonly { bindingId: string; sequence: number }[]
+  ): void {
+    const insert = this.db.prepare(
+      `INSERT INTO voice_console_capture_targets
+         (capture_id, target_ordinal, binding_id, sequence) VALUES (?, ?, ?, ?)`
+    );
+    orderedCaptureTargets(targets).forEach((target, ordinal) =>
+      insert.run(captureId, ordinal, target.bindingId, target.sequence)
+    );
+  }
+
   private replayVoiceConsoleCaptureAllocation(
     reservation: VoiceConsoleCaptureReservationRow,
     input: {
@@ -3065,16 +3210,19 @@ export class SessionStore {
     }
   ): VoiceConsoleCaptureSnapshot {
     const rows = this.voiceConsoleCaptureRows(reservation.capture_id);
-    const assignments = rows.map((row) => ({
-      bindingId: row.session_id,
-      sequence: row.sequence,
-      segmentId: row.id,
-    }));
+    const byTarget = new Map(rows.map((row) => [captureTargetKey({ bindingId: row.session_id, sequence: row.sequence }), row]));
+    const targetIdentity = this.listVoiceConsoleCaptureTargets(reservation.capture_id);
+    const assignments = targetIdentity.map((target) => {
+      const row = byTarget.get(captureTargetKey({ bindingId: target.binding_id, sequence: target.sequence }));
+      if (!row) throw new Error("Voice Console capture ordered target is missing its reservation row.");
+      return { bindingId: target.binding_id, sequence: target.sequence, segmentId: row.id };
+    });
     const selectedBindingIds = this.listVoiceConsoleInputTargets(reservation.console_id)
-      .map((target) => target.bindingId)
-      .sort();
-    const reservedBindingIds = assignments.map((target) => target.bindingId).sort();
+      .map((target) => target.bindingId);
+    const reservedBindingIds = assignments.map((target) => target.bindingId);
     const exact =
+      reservation.identity_valid === 1 &&
+      reservation.identity_version >= 2 &&
       reservation.console_id === input.consoleId &&
       reservation.speaker_id === input.speakerId &&
       reservation.speaker_name === sanitizeVoiceConsoleSpeakerName(input.speakerName) &&
@@ -3114,15 +3262,15 @@ export class SessionStore {
    */
   finalizeVoiceConsoleCapture(final: VoiceConsoleFinalCapture): VoiceConsoleCaptureCommitResult {
     const settle = this.db.transaction((): VoiceConsoleCaptureCommitResult => {
-      const audioMs = requireNonNegativeFiniteInteger(final.audioMs, "audioMs");
-      const forwardedAudioMs = requireNonNegativeFiniteInteger(
+      const audioMs = requireNonNegativeFiniteNumber(final.audioMs, "audioMs");
+      const forwardedAudioMs = requireNonNegativeFiniteNumber(
         final.forwardedAudioMs,
         "forwardedAudioMs"
       );
       const reservation = this.requireVoiceConsoleCaptureIdentity(final);
       const prior = this.getVoiceConsoleCaptureTerminal(final.captureId);
       if (prior) {
-        this.assertVoiceConsoleTerminalReplay(prior, reservation, audioMs, forwardedAudioMs, final.resultSource);
+        this.assertVoiceConsoleTerminalIdentity(prior, reservation);
         return this.buildVoiceConsoleCaptureResult(final.captureId, prior, true);
       }
       const rows = this.voiceConsoleCaptureRows(final.captureId);
@@ -3230,15 +3378,15 @@ export class SessionStore {
   /** First terminal winner for one capture; never mutates a prior commit/drop. */
   dropVoiceConsoleCapture(input: VoiceConsoleDropCaptureInput): VoiceConsoleCaptureCommitResult {
     const settle = this.db.transaction((): VoiceConsoleCaptureCommitResult => {
-      const audioMs = requireNonNegativeFiniteInteger(input.audioMs, "audioMs");
-      const forwardedAudioMs = requireNonNegativeFiniteInteger(
+      const audioMs = requireNonNegativeFiniteNumber(input.audioMs, "audioMs");
+      const forwardedAudioMs = requireNonNegativeFiniteNumber(
         input.forwardedAudioMs,
         "forwardedAudioMs"
       );
       const reservation = this.requireVoiceConsoleCaptureIdentity(input);
       const prior = this.getVoiceConsoleCaptureTerminal(input.captureId);
       if (prior) {
-        this.assertVoiceConsoleTerminalReplay(prior, reservation, audioMs, forwardedAudioMs, input.resultSource);
+        this.assertVoiceConsoleTerminalIdentity(prior, reservation);
         return this.buildVoiceConsoleCaptureResult(input.captureId, prior, true);
       }
       const rows = this.voiceConsoleCaptureRows(input.captureId);
@@ -3309,11 +3457,18 @@ export class SessionStore {
       throw new Error("Voice Console capture has no durable allocation identity.");
     }
     const fingerprint = captureTargetFingerprint(identity.targets);
+    const persistedTargets = this.listVoiceConsoleCaptureTargets(identity.captureId).map((target) => ({
+      bindingId: target.binding_id,
+      sequence: target.sequence,
+    }));
     if (
+      reservation.identity_valid !== 1 ||
+      reservation.identity_version < 2 ||
       reservation.console_id !== identity.consoleId ||
       reservation.speaker_id !== identity.speakerId ||
       reservation.captured_started_utc !== identity.capturedStartedUtc ||
-      reservation.target_fingerprint !== fingerprint
+      reservation.target_fingerprint !== fingerprint ||
+      JSON.stringify(orderedCaptureTargets(identity.targets)) !== JSON.stringify(persistedTargets)
     ) {
       throw new Error("Voice Console capture id collision: terminal identity does not match allocation.");
     }
@@ -3322,15 +3477,15 @@ export class SessionStore {
 
   getVoiceConsoleCaptureIdentity(captureId: string): VoiceConsoleCaptureIdentity | null {
     const reservation = this.getVoiceConsoleCaptureReservation(captureId);
-    if (!reservation) return null;
+    if (!reservation || reservation.identity_valid !== 1 || reservation.identity_version < 2) return null;
     return {
       captureId,
       consoleId: reservation.console_id,
       speakerId: reservation.speaker_id,
       capturedStartedUtc: reservation.captured_started_utc,
-      targets: this.voiceConsoleCaptureRows(captureId).map((row) => ({
-        bindingId: row.session_id,
-        sequence: row.sequence,
+      targets: this.listVoiceConsoleCaptureTargets(captureId).map((target) => ({
+        bindingId: target.binding_id,
+        sequence: target.sequence,
       })),
     };
   }
@@ -3341,18 +3496,14 @@ export class SessionStore {
     return identity;
   }
 
-  private assertVoiceConsoleTerminalReplay(
+  private assertVoiceConsoleTerminalIdentity(
     terminal: VoiceConsoleCaptureTerminal,
-    reservation: VoiceConsoleCaptureReservationRow,
-    audioMs: number,
-    forwardedAudioMs: number,
-    resultSource: "live" | "unary" | undefined
+    reservation: VoiceConsoleCaptureReservationRow
   ): void {
     if (
       terminal.speakerId === null ||
       terminal.capturedStartedUtc === null ||
-      terminal.targetFingerprint === null ||
-      terminal.forwardedAudioMs === null
+      terminal.targetFingerprint === null
     ) {
       throw new Error("Legacy Voice Console capture terminal cannot be safely replayed.");
     }
@@ -3360,12 +3511,9 @@ export class SessionStore {
       terminal.consoleId !== reservation.console_id ||
       terminal.speakerId !== reservation.speaker_id ||
       terminal.capturedStartedUtc !== reservation.captured_started_utc ||
-      terminal.targetFingerprint !== reservation.target_fingerprint ||
-      terminal.audioMs !== audioMs ||
-      terminal.forwardedAudioMs !== forwardedAudioMs ||
-      terminal.resultSource !== (resultSource ?? null)
+      terminal.targetFingerprint !== reservation.target_fingerprint
     ) {
-      throw new Error("Voice Console capture terminal replay does not match the winning identity and telemetry.");
+      throw new Error("Voice Console capture terminal does not match the winning allocation identity.");
     }
   }
 
@@ -5018,7 +5166,7 @@ CREATE TABLE IF NOT EXISTS voice_console_sessions (
   revision                 INTEGER NOT NULL DEFAULT 1,
   fanout_armed             INTEGER NOT NULL DEFAULT 0,
   forwarded_audio_bytes    INTEGER NOT NULL DEFAULT 0,
-  forwarded_audio_ms       INTEGER NOT NULL DEFAULT 0,
+  forwarded_audio_ms       REAL NOT NULL DEFAULT 0,
   utterance_count          INTEGER NOT NULL DEFAULT 0,
   live_final_count         INTEGER NOT NULL DEFAULT 0,
   unary_fallback_count     INTEGER NOT NULL DEFAULT 0,
@@ -5080,11 +5228,33 @@ CREATE TABLE IF NOT EXISTS voice_console_capture_reservations (
   captured_started_utc  TEXT NOT NULL,
   fanout_group_id       TEXT,
   target_fingerprint    TEXT NOT NULL,
+  identity_version      INTEGER NOT NULL DEFAULT 2,
+  identity_valid        INTEGER NOT NULL DEFAULT 1,
+  invalid_reason        TEXT,
   created_utc           TEXT NOT NULL,
-  FOREIGN KEY(console_id) REFERENCES voice_console_sessions(id)
+  FOREIGN KEY(console_id) REFERENCES voice_console_sessions(id),
+  CHECK(identity_valid IN (0,1))
 );
 CREATE INDEX IF NOT EXISTS idx_voice_console_capture_reservations_console
   ON voice_console_capture_reservations(console_id, created_utc);
+
+CREATE TABLE IF NOT EXISTS voice_console_capture_targets (
+  capture_id      TEXT NOT NULL,
+  target_ordinal  INTEGER NOT NULL,
+  binding_id      TEXT NOT NULL,
+  sequence        INTEGER NOT NULL,
+  PRIMARY KEY(capture_id, target_ordinal),
+  UNIQUE(capture_id, binding_id),
+  FOREIGN KEY(capture_id) REFERENCES voice_console_capture_reservations(capture_id),
+  CHECK(target_ordinal >= 0),
+  CHECK(sequence >= 1)
+);
+
+CREATE TABLE IF NOT EXISTS voice_console_invalid_captures (
+  capture_id     TEXT PRIMARY KEY,
+  reason         TEXT NOT NULL,
+  recovered_utc TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS voice_console_capture_terminals (
   capture_id            TEXT PRIMARY KEY,
@@ -5096,7 +5266,7 @@ CREATE TABLE IF NOT EXISTS voice_console_capture_terminals (
   reason                TEXT,
   result_source         TEXT,
   audio_ms              INTEGER NOT NULL,
-  forwarded_audio_ms    INTEGER NOT NULL,
+  forwarded_audio_ms    REAL NOT NULL,
   captured_ended_utc    TEXT NOT NULL,
   created_utc           TEXT NOT NULL,
   FOREIGN KEY(console_id) REFERENCES voice_console_sessions(id),
@@ -5171,7 +5341,17 @@ interface VoiceConsoleCaptureReservationRow {
   captured_started_utc: string;
   fanout_group_id: string | null;
   target_fingerprint: string;
+  identity_version: number;
+  identity_valid: number;
+  invalid_reason: string | null;
   created_utc: string;
+}
+
+interface VoiceConsoleCaptureTargetRow {
+  capture_id: string;
+  target_ordinal: number;
+  binding_id: string;
+  sequence: number;
 }
 
 const mapVoiceConsoleCaptureTerminal = (
@@ -5865,34 +6045,60 @@ function truncatePreview(text: string | null): string | null {
     : text.slice(0, PROMPT_PREVIEW_MAX);
 }
 
-function requireNonNegativeFiniteInteger(value: number, field: string): number {
-  if (!Number.isFinite(value) || !Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`Voice Console ${field} must be a non-negative finite integer.`);
+function requireNonNegativeFiniteNumber(value: number, field: string): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`Voice Console ${field} must be a non-negative finite number.`);
   }
   return value;
 }
 
-function canonicalCaptureTargets(
+function requirePositiveSafeInteger(value: number, field: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`Voice Console ${field} must be a positive safe integer.`);
+  }
+  return value;
+}
+
+function orderedCaptureTargets(
   targets: readonly { bindingId: string; sequence: number }[]
 ): Array<{ bindingId: string; sequence: number }> {
-  const canonical = targets.map((target) => ({
-    bindingId: target.bindingId,
-    sequence: requireNonNegativeFiniteInteger(target.sequence, "capture target sequence"),
-  }));
-  canonical.sort((a, b) => a.bindingId.localeCompare(b.bindingId) || a.sequence - b.sequence);
-  const bindingIds = new Set(canonical.map((target) => target.bindingId));
-  if (bindingIds.size !== canonical.length || canonical.some((target) => !target.bindingId)) {
+  const ordered = targets.map((target) => {
+    assertVoiceConsoleAuthorityId(target.bindingId, "Voice Console capture binding id");
+    return {
+      bindingId: target.bindingId,
+      sequence: requirePositiveSafeInteger(target.sequence, "capture target sequence"),
+    };
+  });
+  const bindingIds = new Set(ordered.map((target) => target.bindingId));
+  if (bindingIds.size !== ordered.length) {
     throw new Error("Voice Console capture target identity is invalid.");
   }
-  return canonical;
+  return ordered;
+}
+
+function captureTargetKey(target: { bindingId: string; sequence: number }): string {
+  return JSON.stringify([target.bindingId, target.sequence]);
 }
 
 function captureTargetFingerprint(
   targets: readonly { bindingId: string; sequence: number }[]
 ): string {
+  const ordered = orderedCaptureTargets(targets).map((target, ordinal) => ({
+    ordinal,
+    bindingId: target.bindingId,
+    sequence: target.sequence,
+  }));
   return createHash("sha256")
-    .update(JSON.stringify(canonicalCaptureTargets(targets)))
+    .update(JSON.stringify(ordered))
     .digest("hex");
+}
+
+function sanitizeVoiceConsoleAuditReason(value: string): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500) || "invalid legacy capture identity";
 }
 
 function voiceConsoleMutationFingerprint(input: Record<string, unknown>): string {

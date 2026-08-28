@@ -845,11 +845,11 @@ describe("VoiceConsoleManager dispatch and barriers", () => {
       speakerId: "speaker-1",
       speakerName: "Speaker",
       transcript: "late transcript",
-      audioMs: 250,
-      forwardedAudioMs: 200,
+      audioMs: 900,
+      forwardedAudioMs: 900.5,
       capturedEndedUtc: NOW,
       speakerAuthorized: true,
-      resultSource: "live",
+      resultSource: "unary",
     });
     expect(dropped).toMatchObject({
       duplicate: false,

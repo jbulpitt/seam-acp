@@ -401,7 +401,82 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
     expect(store.listVoiceConsoleSegments("bind-a")[0]?.state).toBe("capturing");
   });
 
-  it("requires valid forwarded telemetry before terminalization and matches it on replay", () => {
+  it("preserves target order and rejects reversed allocation and terminal identities", () => {
+    const added = store.addVoiceConsoleBinding({
+      binding: binding("bind-b", { alias: "Beta" }),
+      claim: false,
+      expectedRevision: 1,
+    });
+    if (!added.ok) throw new Error(added.error);
+    const active = store.activateVoiceConsoleBinding("bind-b", {
+      expectedRevision: added.value.console.revision,
+      claim: false,
+    });
+    if (!active.ok) throw new Error(active.error);
+    const selected = store.replaceVoiceConsoleInputTargets("tvc_1", {
+      bindingIds: ["bind-a", "bind-b"],
+      fanoutArmed: true,
+      expectedRevision: active.value.console.revision,
+    });
+    if (!selected.ok) throw new Error(selected.error);
+    const input = {
+      consoleId: "tvc_1",
+      speakerId: "speaker-a",
+      speakerName: "A",
+      captureId: "capture-ordered-targets",
+      capturedStartedUtc: "2026-08-28T12:01:00.000Z",
+    };
+    const capture = store.allocateVoiceConsoleCapture(input)!;
+    expect(capture.assignments.map((target) => target.bindingId)).toEqual(["bind-a", "bind-b"]);
+    expect(captureIdentity(capture.captureId).targets.map((target) => target.bindingId)).toEqual([
+      "bind-a",
+      "bind-b",
+    ]);
+
+    const reversed = store.replaceVoiceConsoleInputTargets("tvc_1", {
+      bindingIds: ["bind-b", "bind-a"],
+      fanoutArmed: true,
+      expectedRevision: selected.value.console.revision,
+    });
+    if (!reversed.ok) throw new Error(reversed.error);
+    expect(() => store.allocateVoiceConsoleCapture(input)).toThrow(/allocation identity/);
+    expect(() =>
+      store.finalizeVoiceConsoleCapture({
+        ...captureIdentity(capture.captureId),
+        targets: [...captureIdentity(capture.captureId).targets].reverse(),
+        speakerName: "A",
+        transcript: "wrong order",
+        audioMs: 100,
+        forwardedAudioMs: 100,
+        capturedEndedUtc: NOW,
+        speakerAuthorized: true,
+      })
+    ).toThrow(/terminal identity/);
+    expect(store.getVoiceConsoleCaptureTerminal(capture.captureId)).toBeNull();
+    store.finalizeVoiceConsoleCapture({
+      ...captureIdentity(capture.captureId),
+      speakerName: "A",
+      transcript: "ordered winner",
+      audioMs: 100,
+      forwardedAudioMs: 50.5,
+      capturedEndedUtc: NOW,
+      speakerAuthorized: true,
+      resultSource: "live",
+    });
+    expect(() =>
+      store.dropVoiceConsoleCapture({
+        ...captureIdentity(capture.captureId),
+        targets: [...captureIdentity(capture.captureId).targets].reverse(),
+        reason: "identity mismatch after winner",
+        capturedEndedUtc: NOW,
+        audioMs: 999,
+        forwardedAudioMs: 999,
+      })
+    ).toThrow(/terminal identity/);
+    expect(store.getVoiceConsole("tvc_1")?.forwardedAudioMs).toBe(50.5);
+  });
+
+  it("requires valid forwarded telemetry for the winner and ignores valid loser differences", () => {
     store.allocateVoiceConsoleCapture({
       consoleId: "tvc_1",
       speakerId: "speaker-a",
@@ -426,10 +501,88 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
     expect(store.getVoiceConsoleCaptureTerminal("capture-telemetry")).toBeNull();
     expect(store.listVoiceConsoleSegments("bind-a")[0]?.state).toBe("capturing");
     store.finalizeVoiceConsoleCapture({ ...base, forwardedAudioMs: 75 });
-    expect(() =>
-      store.finalizeVoiceConsoleCapture({ ...base, forwardedAudioMs: 76 })
-    ).toThrow(/telemetry/);
+    expect(store.finalizeVoiceConsoleCapture({ ...base, forwardedAudioMs: 76 })).toMatchObject({
+      duplicate: true,
+      terminal: { forwardedAudioMs: 75 },
+    });
     expect(store.getVoiceConsole("tvc_1")?.forwardedAudioMs).toBe(75);
+  });
+
+  it("arbitrates opposite terminal attempts once and preserves fractional forwarded duration", async () => {
+    store.allocateVoiceConsoleCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-a",
+      speakerName: "A",
+      captureId: "capture-fractional-winner",
+      capturedStartedUtc: "2026-08-28T12:01:00.000Z",
+    });
+    const identity = captureIdentity("capture-fractional-winner");
+    const [committed, lateDrop] = await Promise.all([
+      Promise.resolve().then(() =>
+        store.finalizeVoiceConsoleCapture({
+          ...identity,
+          speakerName: "A",
+          transcript: "unary winner",
+          audioMs: 101.25,
+          forwardedAudioMs: 12.75,
+          capturedEndedUtc: NOW,
+          speakerAuthorized: true,
+          resultSource: "unary",
+        })
+      ),
+      Promise.resolve().then(() =>
+        store.dropVoiceConsoleCapture({
+          ...identity,
+          reason: "late live failure",
+          capturedEndedUtc: "2026-08-28T12:02:00.000Z",
+          audioMs: 999.5,
+          forwardedAudioMs: 888.125,
+          outcome: "failed",
+          resultSource: "live",
+        })
+      ),
+    ]);
+    expect(committed).toMatchObject({
+      duplicate: false,
+      terminal: { outcome: "committed", forwardedAudioMs: 12.75, resultSource: "unary" },
+    });
+    expect(lateDrop).toMatchObject({
+      duplicate: true,
+      terminal: { outcome: "committed", forwardedAudioMs: 12.75, resultSource: "unary" },
+    });
+    expect(store.getVoiceConsole("tvc_1")).toMatchObject({
+      forwardedAudioMs: 12.75,
+      unaryFallbackCount: 1,
+      liveFinalCount: 0,
+      droppedCount: 0,
+    });
+
+    const dbPath = path.join(dir, "test.db");
+    store.close();
+    store = new SessionStore(dbPath);
+    expect(
+      store.dropVoiceConsoleCapture({
+        ...captureIdentity("capture-fractional-winner"),
+        reason: "different reopened loser",
+        capturedEndedUtc: "2026-08-28T12:03:00.000Z",
+        audioMs: 1,
+        forwardedAudioMs: 0,
+        outcome: "dropped",
+      })
+    ).toMatchObject({
+      duplicate: true,
+      terminal: { outcome: "committed", forwardedAudioMs: 12.75 },
+    });
+    const inspect = new Database(dbPath, { readonly: true });
+    expect(
+      inspect.prepare("SELECT typeof(forwarded_audio_ms) AS kind, forwarded_audio_ms AS value FROM voice_console_sessions WHERE id = ?")
+        .get("tvc_1")
+    ).toEqual({ kind: "real", value: 12.75 });
+    expect(
+      inspect.prepare("SELECT typeof(forwarded_audio_ms) AS kind, forwarded_audio_ms AS value FROM voice_console_capture_terminals WHERE capture_id = ?")
+        .get("capture-fractional-winner")
+    ).toEqual({ kind: "real", value: 12.75 });
+    inspect.close();
   });
 
   it("terminalizes a legacy capture-id collision across speakers during reopen", () => {
@@ -450,6 +603,8 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
     const dbPath = path.join(dir, "test.db");
     store.close();
     const raw = new Database(dbPath);
+    raw.prepare("DELETE FROM voice_console_capture_targets WHERE capture_id IN (?, ?)")
+      .run("legacy-collision-a", "legacy-collision-b");
     raw.prepare("DELETE FROM voice_console_capture_reservations WHERE capture_id IN (?, ?)")
       .run("legacy-collision-a", "legacy-collision-b");
     raw.prepare("UPDATE thread_voice_segments SET capture_id = ? WHERE capture_id = ?")
@@ -462,6 +617,160 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
       expect.objectContaining({ captureId: "legacy-collision-a", state: "capture_dropped", transcript: "" }),
     ]);
     expect(store.getVoiceConsoleCaptureIdentity("legacy-collision-a")).toBeNull();
+  });
+
+  it("quarantines malformed legacy capture shapes without aborting or repeating recovery", () => {
+    const added = store.addVoiceConsoleBinding({
+      binding: binding("bind-b", { alias: "Beta" }),
+      claim: false,
+      expectedRevision: 1,
+    });
+    if (!added.ok) throw new Error(added.error);
+    const active = store.activateVoiceConsoleBinding("bind-b", {
+      expectedRevision: added.value.console.revision,
+      claim: false,
+    });
+    if (!active.ok) throw new Error(active.error);
+    const selected = store.replaceVoiceConsoleInputTargets("tvc_1", {
+      bindingIds: ["bind-a", "bind-b"],
+      fanoutArmed: true,
+      expectedRevision: active.value.console.revision,
+    });
+    if (!selected.ok) throw new Error(selected.error);
+    const ids = [
+      "legacy-valid",
+      "legacy-partial",
+      "legacy-order",
+      "legacy-missing",
+      "legacy-malformed",
+      "legacy-duplicate-a",
+      "legacy-duplicate-b",
+    ];
+    ids.forEach((captureId, index) => {
+      store.allocateVoiceConsoleCapture({
+        consoleId: "tvc_1",
+        speakerId: `speaker-${index}`,
+        speakerName: `Speaker ${index}`,
+        captureId,
+        capturedStartedUtc: `2026-08-28T12:01:0${index}.000Z`,
+      });
+    });
+
+    const dbPath = path.join(dir, "test.db");
+    store.close();
+    const raw = new Database(dbPath);
+    raw.pragma("foreign_keys = OFF");
+    raw.prepare("DELETE FROM voice_console_capture_targets WHERE capture_id = ? AND target_ordinal = 1")
+      .run("legacy-partial");
+    raw.prepare("UPDATE voice_console_capture_targets SET target_ordinal = 99 WHERE capture_id = ? AND target_ordinal = 0")
+      .run("legacy-order");
+    raw.prepare("UPDATE voice_console_capture_targets SET target_ordinal = 0 WHERE capture_id = ? AND target_ordinal = 1")
+      .run("legacy-order");
+    raw.prepare("UPDATE voice_console_capture_targets SET target_ordinal = 1 WHERE capture_id = ? AND target_ordinal = 99")
+      .run("legacy-order");
+    raw.prepare("DELETE FROM thread_voice_segments WHERE capture_id = ?").run("legacy-missing");
+    raw.prepare("DELETE FROM voice_console_capture_targets WHERE capture_id = ?").run("legacy-malformed");
+    raw.prepare("DELETE FROM voice_console_capture_reservations WHERE capture_id = ?").run("legacy-malformed");
+    raw.prepare("UPDATE thread_voice_segments SET capture_id = ? WHERE capture_id = ?")
+      .run("bad:capture", "legacy-malformed");
+    raw.prepare("DELETE FROM voice_console_capture_targets WHERE capture_id IN (?, ?)")
+      .run("legacy-duplicate-a", "legacy-duplicate-b");
+    raw.prepare("DELETE FROM voice_console_capture_reservations WHERE capture_id IN (?, ?)")
+      .run("legacy-duplicate-a", "legacy-duplicate-b");
+    raw.prepare("UPDATE thread_voice_segments SET capture_id = ? WHERE capture_id = ?")
+      .run("legacy-duplicate-a", "legacy-duplicate-b");
+    raw.close();
+
+    store = new SessionStore(dbPath);
+    expect(captureIdentity("legacy-valid").targets.map((target) => target.bindingId)).toEqual([
+      "bind-a",
+      "bind-b",
+    ]);
+    for (const captureId of [
+      "legacy-partial",
+      "legacy-order",
+      "legacy-missing",
+      "bad:capture",
+      "legacy-duplicate-a",
+    ]) {
+      expect(store.getVoiceConsoleCaptureIdentity(captureId)).toBeNull();
+    }
+    const invalidSegments = ["legacy-partial", "legacy-order", "bad:capture", "legacy-duplicate-a"];
+    for (const captureId of invalidSegments) {
+      expect(
+        [...store.listVoiceConsoleSegments("bind-a"), ...store.listVoiceConsoleSegments("bind-b")]
+          .filter((segment) => segment.captureId === captureId)
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ state: "capture_dropped", transcript: "", error: expect.stringContaining("invalid legacy capture identity") }),
+        ])
+      );
+    }
+    expect(store.recoverUnfinishedVoiceConsoleCaptures("boot recovery", NOW)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ captureId: "legacy-valid", state: "capture_dropped" })])
+    );
+
+    store.close();
+    store = new SessionStore(dbPath);
+    const audit = new Database(dbPath, { readonly: true });
+    const invalidRows = audit
+      .prepare("SELECT capture_id, reason FROM voice_console_invalid_captures ORDER BY capture_id")
+      .all() as Array<{ capture_id: string; reason: string }>;
+    expect(invalidRows).toHaveLength(5);
+    expect(invalidRows.every((row) => row.reason.includes("invalid legacy capture identity"))).toBe(true);
+    expect(
+      audit.prepare("SELECT COUNT(*) AS count FROM thread_voice_segments WHERE state IN ('capturing','finalizing')")
+        .get()
+    ).toEqual({ count: 0 });
+    audit.close();
+  });
+
+  it("assigns one deterministic legacy order and enforces it after migration", () => {
+    const added = store.addVoiceConsoleBinding({
+      binding: binding("bind-b", { alias: "Beta" }),
+      claim: false,
+      expectedRevision: 1,
+    });
+    if (!added.ok) throw new Error(added.error);
+    const active = store.activateVoiceConsoleBinding("bind-b", {
+      expectedRevision: added.value.console.revision,
+      claim: false,
+    });
+    if (!active.ok) throw new Error(active.error);
+    const selected = store.replaceVoiceConsoleInputTargets("tvc_1", {
+      bindingIds: ["bind-b", "bind-a"],
+      fanoutArmed: true,
+      expectedRevision: active.value.console.revision,
+    });
+    if (!selected.ok) throw new Error(selected.error);
+    store.allocateVoiceConsoleCapture({
+      consoleId: "tvc_1",
+      speakerId: "speaker-a",
+      speakerName: "A",
+      captureId: "legacy-unordered",
+      capturedStartedUtc: "2026-08-28T12:01:00.000Z",
+    });
+    const dbPath = path.join(dir, "test.db");
+    store.close();
+    const raw = new Database(dbPath);
+    raw.prepare("DELETE FROM voice_console_capture_targets WHERE capture_id = ?").run("legacy-unordered");
+    raw.prepare("UPDATE voice_console_capture_reservations SET identity_version = 1 WHERE capture_id = ?")
+      .run("legacy-unordered");
+    raw.close();
+    store = new SessionStore(dbPath);
+
+    const identity = captureIdentity("legacy-unordered");
+    expect(identity.targets.map((target) => target.bindingId)).toEqual(["bind-a", "bind-b"]);
+    expect(() =>
+      store.dropVoiceConsoleCapture({
+        ...identity,
+        targets: [...identity.targets].reverse(),
+        reason: "wrong migrated order",
+        capturedEndedUtc: NOW,
+        audioMs: 0,
+        forwardedAudioMs: 0,
+      })
+    ).toThrow(/terminal identity/);
   });
 
   it("migrates a legacy terminal without fabricating forwarded telemetry or transcript data", () => {
@@ -499,7 +808,7 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
       transcript: "",
       error: "old input off",
     });
-    expect(() =>
+    expect(
       store.dropVoiceConsoleCapture({
         ...captureIdentity("legacy-terminal"),
         reason: "retry",
@@ -508,7 +817,7 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
         forwardedAudioMs: 10,
         resultSource: "live",
       })
-    ).toThrow(/Legacy Voice Console capture terminal/);
+    ).toMatchObject({ duplicate: true, terminal: { forwardedAudioMs: null } });
     expect(store.getVoiceConsole("tvc_1")?.forwardedAudioMs).toBe(0);
 
     const inspect = new Database(dbPath, { readonly: true });
@@ -517,6 +826,11 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
       .all()
       .map((row: any) => row.name);
     expect(reservationColumns).not.toEqual(expect.arrayContaining(["transcript", "audio", "bytes"]));
+    const targetColumns = inspect
+      .prepare("PRAGMA table_info(voice_console_capture_targets)")
+      .all()
+      .map((row: any) => row.name);
+    expect(targetColumns).toEqual(["capture_id", "target_ordinal", "binding_id", "sequence"]);
     inspect.close();
   });
 
@@ -663,10 +977,10 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
       ...captureIdentity("capture-accounted-once"),
       reason: "late input-off",
       capturedEndedUtc: "2026-08-28T12:04:01.000Z",
-      audioMs: 875,
-      forwardedAudioMs: 625,
+      audioMs: 9999,
+      forwardedAudioMs: 9999.75,
       outcome: "dropped",
-      resultSource: "live",
+      resultSource: "unary",
     });
     expect(lateDrop).toMatchObject({
       duplicate: true,
@@ -681,11 +995,11 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
       speakerId: "speaker-1",
       speakerName: "Speaker",
       transcript: "must not replace the winner",
-      audioMs: 875,
+      audioMs: 5000,
       capturedEndedUtc: "2026-08-28T12:04:02.000Z",
       speakerAuthorized: true,
-      resultSource: "live",
-      forwardedAudioMs: 625,
+      resultSource: "unary",
+      forwardedAudioMs: 5000.5,
     });
     expect(replay.duplicate).toBe(true);
     expect(replay.committed.map((row) => row.transcript)).toEqual([
@@ -744,11 +1058,11 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
       speakerId: "speaker-1",
       speakerName: "Speaker",
       transcript: "too late",
-      audioMs: 420,
+      audioMs: 999,
       capturedEndedUtc: "2026-08-28T12:05:01.000Z",
       speakerAuthorized: true,
-      resultSource: "unary",
-      forwardedAudioMs: 300,
+      resultSource: "live",
+      forwardedAudioMs: 999.25,
     });
     expect(lateCommit).toMatchObject({ duplicate: true, terminal: { outcome: "failed", audioMs: 420 } });
     expect(lateCommit.committed).toEqual([]);
@@ -779,10 +1093,10 @@ describe("SessionStore Voice Console capture authority and ordering", () => {
       ...captureIdentity("capture-input-off"),
       reason: "different retry",
       capturedEndedUtc: "2026-08-28T12:06:01.000Z",
-      audioMs: 120,
-      forwardedAudioMs: 80,
+      audioMs: 999,
+      forwardedAudioMs: 999.5,
       outcome: "failed",
-      resultSource: "live",
+      resultSource: "unary",
     });
     expect(first.terminal).toMatchObject({ outcome: "dropped", reason: "input off", resultSource: "live" });
     expect(replay).toMatchObject({

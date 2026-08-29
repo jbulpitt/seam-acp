@@ -3,7 +3,12 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import type { McpServer } from "@agentclientprotocol/sdk";
-import { asLocalAdapter, type AgentIdentity, type AgentProfile } from "../agent-profile.js";
+import {
+  asLocalAdapter,
+  type AdapterModel,
+  type AgentIdentity,
+  type AgentProfile,
+} from "../agent-profile.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 
 /**
@@ -68,7 +73,7 @@ export function makeClaudeProfile(opts: {
    * adapter's default (~/.claude) is used.
    */
   configDir?: string;
-  staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  staticModels?: ReadonlyArray<AdapterModel>;
   threadAbbr?: string;
   /** Default model id for sessions on this profile (e.g. "claude-sonnet-4.5"). */
   defaultModel: string;

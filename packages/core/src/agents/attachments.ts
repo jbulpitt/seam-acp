@@ -29,6 +29,31 @@ export interface AttachmentMapOptions {
   maxAttachments?: number;
 }
 
+export type ModelVisionMode = "native" | "tool" | "none";
+
+export interface ModelVisionRouting {
+  /** Value passed to the existing ACP attachment mapper. False forces staging. */
+  agentHasVision?: boolean;
+  /** True when a staged image should explicitly direct the agent to inspect_image. */
+  viaTool: boolean;
+}
+
+/**
+ * Resolve model perception separately from the ACP transport capability.
+ * A Claude-compatible harness can advertise image blocks even when the model
+ * behind it is text-only; `tool`/`none` must therefore force staging before the
+ * attachment reaches AgentRuntime. Native models still respect an explicitly
+ * image-incapable ACP bridge. Unannotated models preserve the legacy behavior.
+ */
+export function resolveModelVisionRouting(
+  transportHasVision: boolean | undefined,
+  visionMode: ModelVisionMode | undefined
+): ModelVisionRouting {
+  if (visionMode === "tool") return { agentHasVision: false, viaTool: true };
+  if (visionMode === "none") return { agentHasVision: false, viaTool: false };
+  return { agentHasVision: transportHasVision, viaTool: false };
+}
+
 /**
  * Map a list of platform attachments to ACP `ContentBlock`s, picking the
  * richest representation each agent capability allows and falling back to

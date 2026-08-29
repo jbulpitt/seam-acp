@@ -10,6 +10,10 @@ import {
 } from "@seam/adapters";
 
 describe("AgentAdapter.describe()", () => {
+  it("uses the current adapter contract version", () => {
+    expect(AGENT_ADAPTER_VERSION).toBe(2);
+  });
+
   it("claude reports meta effort and static models (with contextLimit)", () => {
     const profile = makeClaudeProfile({
       defaultModel: "default",

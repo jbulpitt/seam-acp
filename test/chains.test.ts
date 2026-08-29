@@ -293,6 +293,7 @@ describe("chain MCP tool", () => {
       "create_live_help",
       "forward",
       "handoff",
+      "inspect_image",
       "peek",
       "poll_inbox",
       "rename_thread",

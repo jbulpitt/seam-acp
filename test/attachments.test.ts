@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   mapAttachmentsToBlocks,
   isInlineableForAgent,
+  resolveModelVisionRouting,
   MAX_ATTACHMENTS,
   MAX_BYTES_PER_ATTACHMENT,
   MAX_INLINE_TEXT_BYTES,
@@ -58,6 +59,49 @@ describe("isInlineableForAgent", () => {
     expect(isInlineableForAgent("application/pdf", "doc.pdf", true)).toBe(false);
     expect(isInlineableForAgent("image/heic", "page.heic", true)).toBe(false);
     expect(isInlineableForAgent("image/heic", "page.heic", false)).toBe(false);
+  });
+});
+
+describe("resolveModelVisionRouting", () => {
+  it("forces tool-mediated and no-vision models onto the staging path", () => {
+    expect(resolveModelVisionRouting(true, "tool")).toEqual({
+      agentHasVision: false,
+      viaTool: true,
+    });
+    expect(resolveModelVisionRouting(undefined, "tool")).toEqual({
+      agentHasVision: false,
+      viaTool: true,
+    });
+    expect(resolveModelVisionRouting(true, "none")).toEqual({
+      agentHasVision: false,
+      viaTool: false,
+    });
+  });
+
+  it("keeps native models constrained by the ACP transport capability", () => {
+    expect(resolveModelVisionRouting(true, "native")).toEqual({
+      agentHasVision: true,
+      viaTool: false,
+    });
+    expect(resolveModelVisionRouting(false, "native")).toEqual({
+      agentHasVision: false,
+      viaTool: false,
+    });
+    expect(resolveModelVisionRouting(undefined, "native")).toEqual({
+      agentHasVision: undefined,
+      viaTool: false,
+    });
+  });
+
+  it("preserves legacy ACP routing for unannotated models", () => {
+    expect(resolveModelVisionRouting(true, undefined)).toEqual({
+      agentHasVision: true,
+      viaTool: false,
+    });
+    expect(resolveModelVisionRouting(undefined, undefined)).toEqual({
+      agentHasVision: undefined,
+      viaTool: false,
+    });
   });
 });
 

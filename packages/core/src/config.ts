@@ -477,6 +477,9 @@ const Schema = z.object({
   /** Default model id for Ollama Cloud sessions. */
   OLLAMA_CLOUD_DEFAULT_MODEL: z.string().default("glm-5.2:cloud"),
   OLLAMA_CLOUD_MODELS: ModelsListSchema,
+  /** Native direct-Cloud API model used by the image inspector. Unlike the
+   *  local Ollama proxy selector, https://ollama.com/api/chat omits `:cloud`. */
+  OLLAMA_CLOUD_VISION_MODEL: z.string().default("glm-5.3-flash"),
   /** Model used for /compact on Ollama Cloud sessions. */
   OLLAMA_CLOUD_COMPACTION_MODEL: z.string().default("glm-5.2:cloud"),
 
@@ -1166,7 +1169,8 @@ export const ZAI_STATIC_MODELS = [
 /** Models for Ollama Cloud.  OLLAMA_CLOUD_MODELS env var overrides this list when set.
  *  These are the primary cloud-hosted open-weight models available on ollama.com. */
 export const OLLAMA_CLOUD_STATIC_MODELS = [
-  { modelId: "glm-5.3:cloud",               name: "GLM 5.3",              contextLimit: 1_000_000 },
+  { modelId: "glm-5.3:cloud",               name: "GLM 5.3",              contextLimit: 1_000_000, visionMode: "tool" as const },
+  { modelId: "glm-5.3-flash:cloud",         name: "GLM 5.3 Flash",        contextLimit: 1_000_000, visionMode: "native" as const },
   { modelId: "glm-5.2:cloud",               name: "GLM 5.2",              contextLimit: 976_000 },
   { modelId: "glm-5.1:cloud",               name: "GLM 5.1",              contextLimit: 976_000 },
   { modelId: "qwen3-coder:cloud",           name: "Qwen3 Coder",          contextLimit: 256_000 },

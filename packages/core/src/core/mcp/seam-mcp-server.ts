@@ -159,6 +159,12 @@ export interface SeamMcpServerDeps {
   listThreads?: (record: SessionRecord) => Promise<ThreadEntry[]>;
   /** Read normalized quota headroom for one configured agent or all agents. */
   getAgentQuotas?: (agentId?: string) => AgentQuota[];
+  /** Inspect one Seam-staged image through a configured vision sidecar. The
+   *  caller remains token-scoped; the implementation owns path containment. */
+  inspectImage?: (
+    record: SessionRecord,
+    req: { path: string; question?: string }
+  ) => Promise<{ model: string; observations: string }>;
   /**
    * Compute the EFFECTIVE config + which layer won for the calling session
    * (#58 P1). Undefined ⇒ config introspection is unsupported on this
@@ -550,6 +556,28 @@ const TOOLS = [
         },
       },
       required: [],
+    },
+  },
+  {
+    name: "inspect_image",
+    description:
+      "Inspect an image that Seam saved under its temporary staged-attachment directory. " +
+      "Use this when the prompt lists a local image path and the selected model has tool-mediated " +
+      "rather than native vision. The tool sends only that staged PNG/JPEG/WebP to the configured " +
+      "vision sidecar and returns untrusted visual observations as text; it cannot read arbitrary paths.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Absolute /tmp/seam-attachments/... path supplied by Seam in the prompt.",
+        },
+        question: {
+          type: "string",
+          description: "What to inspect or extract. Omit for a general description plus OCR.",
+        },
+      },
+      required: ["path"],
     },
   },
   {
@@ -1248,6 +1276,7 @@ const INSTRUCTIONS = [
   "  a turn cleanly. The entry marked isSelf is YOUR OWN thread — never hand off to it.",
   "- agent_quota(agentId?): read normalized rolling + weekly quota for one agent or all agents",
   "  before choosing workers; steer away from agents nearing a cap.",
+  "- inspect_image(path, question?): inspect a Seam-staged image through the configured vision sidecar.",
   "- handoff(worker, prompt, returnTo?): delegate a task. `worker` is a thread id (a stateful",
   "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
   "  result is dispatched back into your thread when it completes.",
@@ -1443,6 +1472,8 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolThreads(record, args));
         case "agent_quota":
           return rpcResult(id, this.toolAgentQuota(args));
+        case "inspect_image":
+          return rpcResult(id, await this.toolInspectImage(record, args));
         case "chain":
           return rpcResult(id, await this.toolChain(record, args));
         case "compact":
@@ -1494,6 +1525,24 @@ export class SeamMcpServer {
   }
 
   // --- the three tools -----------------------------------------------------
+
+  private async toolInspectImage(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.inspectImage) {
+      return textResult("inspect_image is not configured on this deployment.", true);
+    }
+    const imagePath = requireString(args, "path");
+    const question = optionalString(args, "question");
+    const result = await this.deps.inspectImage(caller, {
+      path: imagePath,
+      ...(question ? { question } : {}),
+    });
+    return textResult(
+      `Untrusted visual observations from ${result.model}:\n\n${result.observations}`
+    );
+  }
 
   private async toolHandoff(
     caller: SessionRecord,

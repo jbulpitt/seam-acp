@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -176,6 +176,7 @@ async function makeHarness(opts?: {
   peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
   listThreads?: SeamMcpServerDeps["listThreads"];
   getAgentQuotas?: SeamMcpServerDeps["getAgentQuotas"];
+  inspectImage?: SeamMcpServerDeps["inspectImage"];
   scheduleWake?: SeamMcpServerDeps["scheduleWake"];
   cancelWake?: SeamMcpServerDeps["cancelWake"];
   createChoice?: SeamMcpServerDeps["createChoice"];
@@ -273,6 +274,7 @@ async function makeHarness(opts?: {
     ...(opts?.peekThread ? { peekThread: opts.peekThread } : {}),
     ...(opts?.listThreads ? { listThreads: opts.listThreads } : {}),
     ...(opts?.getAgentQuotas ? { getAgentQuotas: opts.getAgentQuotas } : {}),
+    ...(opts?.inspectImage ? { inspectImage: opts.inspectImage } : {}),
     ...(opts?.isChannelLocked ? { isChannelLocked: opts.isChannelLocked } : {}),
     ...(opts?.configAdminUserIds ? { configAdminUserIds: opts.configAdminUserIds } : {}),
     ...(opts?.configParticipantUserIds
@@ -405,6 +407,7 @@ describe("SeamMcpServer", () => {
       "create_live_help",
       "forward",
       "handoff",
+      "inspect_image",
       "peek",
       "poll_inbox",
       "rename_thread",
@@ -420,6 +423,40 @@ describe("SeamMcpServer", () => {
     for (const t of body.result.tools) {
       expect(t.inputSchema.type).toBe("object");
     }
+  });
+
+  it("inspect_image returns sidecar observations and preserves caller scope", async () => {
+    const inspectImage = vi.fn(async (record: SessionRecord, req: { path: string; question?: string }) => ({
+      model: "glm-5.3-flash",
+      observations: `${record.channelRef}: ${req.question ?? "general"}`,
+    }));
+    h = await makeHarness({ inspectImage });
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "inspect_image",
+        arguments: { path: "/tmp/seam-attachments/a/screen.png", question: "read it" },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(body.result.content[0].text).toContain("Untrusted visual observations");
+    expect(body.result.content[0].text).toContain("thread-caller: read it");
+    expect(inspectImage).toHaveBeenCalledWith(
+      expect.objectContaining({ channelRef: "thread-caller" }),
+      { path: "/tmp/seam-attachments/a/screen.png", question: "read it" }
+    );
+  });
+
+  it("inspect_image fails as a tool result when the sidecar is not configured", async () => {
+    h = await makeHarness();
+    const { body } = await h.call(
+      "tools/call",
+      { name: "inspect_image", arguments: { path: "/tmp/seam-attachments/a/screen.png" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("not configured");
   });
 
   it("tools/call with a valid token resolves the caller and enqueues a handoff", async () => {
@@ -581,8 +618,9 @@ describe("SeamMcpServer", () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
-    // Adding an OPTION to handoff does NOT change the tool count (`agent_quota` makes 25).
-    expect(body.result.tools).toHaveLength(25);
+    // Adding an OPTION to handoff does NOT change the tool count; inspect_image
+    // is the standalone capability that brings the catalog to 26.
+    expect(body.result.tools).toHaveLength(26);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -1344,8 +1382,9 @@ describe("SeamMcpServer", () => {
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
-    // Params on `send` must NOT add a tool — the set stays at 25 (`agent_quota` included).
-    expect(body.result.tools).toHaveLength(25);
+    // Params on `send` must NOT add a tool — the set stays at 26 after the
+    // standalone inspect_image capability was added.
+    expect(body.result.tools).toHaveLength(26);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

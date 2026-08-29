@@ -7,6 +7,16 @@ describe("Ollama Cloud model catalog", () => {
       modelId: "glm-5.3:cloud",
       name: "GLM 5.3",
       contextLimit: 1_000_000,
+      visionMode: "tool",
+    });
+  });
+
+  it("offers GLM 5.3 Flash as the native-vision alternative", () => {
+    expect(OLLAMA_CLOUD_STATIC_MODELS[1]).toEqual({
+      modelId: "glm-5.3-flash:cloud",
+      name: "GLM 5.3 Flash",
+      contextLimit: 1_000_000,
+      visionMode: "native",
     });
   });
 });

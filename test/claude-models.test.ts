@@ -74,17 +74,23 @@ describe("makeClaudeProfile staticModels", () => {
     const profile = makeClaudeProfile({
       defaultModel: "default",
       staticModels: [
-        { modelId: "default", name: "Opus latest" },
+        { modelId: "default", name: "Opus latest", visionMode: "tool" },
         { modelId: "claude-opus-4-6", name: "Opus 4.6" },
         { modelId: "claude-fable-5", name: "Fable 5" },
         { modelId: "claude-sonnet-4-6", name: "Sonnet 4.6" },
       ],
     });
     expect(profile.staticModels).toEqual([
-      { modelId: "default", name: "Opus latest", contextLimit: 1_000_000 },
+      {
+        modelId: "default",
+        name: "Opus latest",
+        contextLimit: 1_000_000,
+        visionMode: "tool",
+      },
       { modelId: "claude-opus-4-6", name: "Opus 4.6", contextLimit: 200_000 },
       { modelId: "claude-fable-5", name: "Fable 5", contextLimit: 1_000_000 },
       { modelId: "claude-sonnet-4-6", name: "Sonnet 4.6", contextLimit: 200_000 },
     ]);
+    expect(profile.describe().models[0]?.visionMode).toBe("tool");
   });
 });

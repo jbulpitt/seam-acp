@@ -393,8 +393,16 @@ import {
 } from "../../core/choice/ingest-model.js";
 import { mintBridgeToken, hashBridgeToken } from "../../core/bridge-pairing.js";
 import { renderMathPng } from "../../core/math-render.js";
-import { isInlineableForAgent } from "../../agents/attachments.js";
+import {
+  isInlineableForAgent,
+  MAX_BYTES_PER_ATTACHMENT,
+  resolveModelVisionRouting,
+} from "../../agents/attachments.js";
 import { stageAttachment, sweepStagedAttachments } from "@seam/adapters";
+import {
+  authorizeStagedImage,
+  stagedAttachmentOwnerKey,
+} from "../../core/vision/ollama-image-inspector.js";
 import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { SerialQueue } from "../../core/serial-queue.js";
@@ -1391,11 +1399,11 @@ export class Orchestrator {
     let turnFinalized = false;
 
     const cfg = this.store.readConfig(record);
-    const repoDisplay = this.repoDisplay(record.repoPath);
-    const turnProfile = this.router.getProfile(record.agentId);
-    const brand = resolveAgentBrand(record.agentId, turnProfile?.brand);
-    const brandAsset = loadBrandAsset(brand);
     const described = this.router.describeConfig(record);
+    const repoDisplay = this.repoDisplay(record.repoPath);
+    const turnProfile = this.router.getProfile(described.agent.value);
+    const brand = resolveAgentBrand(described.agent.value, turnProfile?.brand);
+    const brandAsset = loadBrandAsset(brand);
     const cardStyle = statusCardStyleForRender(described);
     const gifUrl = pickSimpleCardGifUrl({
       style: cardStyle,
@@ -1403,7 +1411,7 @@ export class Orchestrator {
       randomGif: () => this.cardGifs?.randomGif() ?? null,
     });
     const status = new TurnStatus({
-      model: cfg.model ?? this.config.DEFAULT_MODEL,
+      model: described.model.value,
       repoDisplay,
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
       style: cardStyle,
@@ -1417,7 +1425,7 @@ export class Orchestrator {
     // different model). Any staleness is corrected by the post-turn
     // side-channel read.
     const cachedUsage = cfg.lastContextUsage;
-    const activeModel = cfg.model ?? this.config.DEFAULT_MODEL;
+    const activeModel = described.model.value;
     // Authoritative per-model window when seam-acp knows it (staticModels
     // contextLimit — e.g. opencode/Ollama, discovered from /api/show). Some
     // agents report a generic default (~200K) in usage_update regardless of the
@@ -2081,7 +2089,7 @@ export class Orchestrator {
           : {}),
       });
       let promptAttachments = msg.attachments;
-      const activeProfile = this.router.getProfile(record.agentId);
+      const activeProfile = this.router.getProfile(described.agent.value);
       if (
         activeProfile?.restrictDiscordAccess &&
         msg.attachments &&
@@ -2131,10 +2139,19 @@ export class Orchestrator {
         // inlineable when the agent advertises image prompt capability — for a
         // no-vision ACP bridge (e.g. Grok) they're staged to disk instead so its
         // own tools can read them, rather than becoming a bytes-less link.
-        const agentHasVision = activeRuntime.getPromptCapabilities()?.image;
+        const selectedModel = described.model.value;
+        const visionMode = activeProfile?.staticModels?.find(
+          (entry) => entry.modelId === selectedModel
+        )?.visionMode;
+        const visionRouting = resolveModelVisionRouting(
+          activeRuntime.getPromptCapabilities()?.image,
+          visionMode
+        );
         const { inline, hint } = await this.partitionAndStageAttachments(
           msg.attachments,
-          agentHasVision
+          visionRouting.agentHasVision,
+          visionRouting.viaTool,
+          record.id
         );
         if (hint) promptText = promptText ? `${promptText}${hint}` : hint.trimStart();
         promptAttachments = inline.length > 0 ? withoutVoiceNotes(inline) : undefined;
@@ -7737,9 +7754,19 @@ export class Orchestrator {
     //    to a path the agent reads with its tools — same handling as a live turn,
     //    so scheduled jobs aren't limited to text/image attachments.
     const loaded = await loadScheduledAttachments(this.config.DATA_DIR, id, row.attachments);
+    const scheduledModel = model ?? profile.defaultModel;
+    const scheduledVision = resolveModelVisionRouting(
+      undefined,
+      profile.staticModels?.find((entry) => entry.modelId === scheduledModel)?.visionMode
+    );
     const { inline, hint } = profile.restrictDiscordAccess
       ? { inline: loaded, hint: null as string | null }
-      : await this.partitionAndStageAttachments(loaded);
+      : await this.partitionAndStageAttachments(
+          loaded,
+          scheduledVision.agentHasVision,
+          scheduledVision.viaTool,
+          record.id
+        );
     const result = await this.runIsolatedScheduledJob({
       profile,
       record,
@@ -7819,6 +7846,10 @@ export class Orchestrator {
       ...(effort ? { effort } : {}),
       outputTo: channel,
       attachments,
+      // Scheduled isolated turns belong to the authoring session. Reuse its
+      // token-scoped Seam-MCP server so tool-mediated vision can inspect only
+      // that session's staged files; never mint or rotate a second token.
+      mcpServers: this.router.reuseMcpServers(record.id),
       timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
       // Drain trailing SerialQueue text before returning, so a scheduled job's
       // output isn't truncated (compaction already drains; #19 preserved the old
@@ -7913,12 +7944,18 @@ export class Orchestrator {
    *  inline as before. */
   private async partitionAndStageAttachments(
     attachments: ReadonlyArray<MessageAttachment>,
-    agentHasVision?: boolean
+    agentHasVision?: boolean,
+    toolVision = false,
+    stagingOwnerId?: string
   ): Promise<{ inline: MessageAttachment[]; hint: string | null }> {
     const STAGE_MAX = 100 * 1024 * 1024; // don't fill /tmp with huge files
     const inline: MessageAttachment[] = [];
     const stagedLines: string[] = [];
-    const batchId = randomUUID().slice(0, 8);
+    const randomBatch = randomUUID().slice(0, 8);
+    const batchId =
+      toolVision && stagingOwnerId
+        ? `${stagedAttachmentOwnerKey(stagingOwnerId)}-${randomBatch}`
+        : randomBatch;
     for (const a of attachments) {
       // Voice notes are transcribed into the prompt; never stage or inline audio.
       if (isVoiceNoteAttachment(a)) continue;
@@ -7926,7 +7963,12 @@ export class Orchestrator {
         inline.push(a);
         continue;
       }
-      if (a.size > STAGE_MAX) {
+      const toolImage =
+        toolVision &&
+        ((a.contentType ?? "").toLowerCase().startsWith("image/") ||
+          /\.(?:png|jpe?g|webp)$/i.test(a.filename));
+      const maxBytes = toolImage ? MAX_BYTES_PER_ATTACHMENT : STAGE_MAX;
+      if (a.size > maxBytes) {
         stagedLines.push(`- \`${a.filename}\` — too large to stage (${a.size} B)`);
         continue;
       }
@@ -7934,7 +7976,14 @@ export class Orchestrator {
         const res = await fetch(a.url);
         if (!res.ok) throw new Error(`download ${res.status} ${res.statusText}`);
         const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length > maxBytes) {
+          stagedLines.push(`- \`${a.filename}\` — too large to stage (${buf.length} B)`);
+          continue;
+        }
         const dest = await stageAttachment(a.filename, buf, batchId);
+        if (toolImage && stagingOwnerId) {
+          await authorizeStagedImage(stagingOwnerId, dest, buf);
+        }
         stagedLines.push(`- \`${a.filename}\` → \`${dest}\``);
       } catch (err) {
         this.logger.warn({ err, filename: a.filename }, "failed to stage attachment");
@@ -7944,10 +7993,13 @@ export class Orchestrator {
     if (stagedLines.length === 0) return { inline, hint: null };
     void sweepStagedAttachments();
     const one = stagedLines.length === 1;
+    const action = toolVision
+      ? "call `inspect_image` for staged PNG/JPEG/WebP images and use file tools for other files"
+      : `read ${one ? "it" : "them"} with your file tools`;
     const hint =
       `\n\n_The following file${one ? " was" : "s were"} saved to a temporary directory ` +
-      `(auto-cleaned after ~48h) — read ${one ? "it" : "them"} with your file tools, and copy ` +
-      `into the workspace anything you need to keep:_\n${stagedLines.join("\n")}`;
+      `(auto-cleaned after ~48h) — ${action}, and copy into the workspace anything you need to keep:_\n` +
+      stagedLines.join("\n");
     return { inline, hint };
   }
 
@@ -16771,6 +16823,7 @@ const COMPACTION_MODEL_WINDOWS: Record<string, number> = {
   "glm-5.2": 1_000_000,
   "qwen3-coder:480b-cloud": 256_000,
   "glm-5.3:cloud": 1_000_000,
+  "glm-5.3-flash:cloud": 1_000_000,
   "glm-5.2:cloud": 976_000,
 };
 

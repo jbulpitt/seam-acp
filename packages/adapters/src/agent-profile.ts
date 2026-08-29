@@ -7,7 +7,7 @@ import type { ContextUsage, ISessionManager, SessionSummary } from "./session-ma
  * Adapter contract version advertised by in-process local agents via
  * `describe()`. Bumped when the §4 surface itself changes (not per agent).
  */
-export const AGENT_ADAPTER_VERSION = 1;
+export const AGENT_ADAPTER_VERSION = 2;
 
 /** How an agent exposes reasoning effort. See `AgentAdapter.effort`. */
 export type EffortMechanism =
@@ -29,6 +29,11 @@ export interface AdapterModel {
   modelId: string;
   name: string;
   contextLimit?: number;
+  /** How Seam should make image attachments available to this model.
+   *  `native` sends ACP image blocks when the transport supports them;
+   *  `tool` stages images for an inspection tool; `none` stages without
+   *  claiming a vision capability. Omitted preserves legacy ACP discovery. */
+  visionMode?: "native" | "tool" | "none";
 }
 
 /**
@@ -318,6 +323,7 @@ export function asLocalAdapter(core: AgentProfileCore): AgentAdapter {
               modelId: m.modelId,
               name: m.name,
               ...(m.contextLimit != null ? { contextLimit: m.contextLimit } : {}),
+              ...(m.visionMode != null ? { visionMode: m.visionMode } : {}),
             }))
           : [{ modelId: adapter.defaultModel, name: adapter.defaultModel }];
       const effort: EffortDescriptor = adapter.effort

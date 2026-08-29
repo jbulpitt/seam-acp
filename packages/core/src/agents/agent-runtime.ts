@@ -437,7 +437,7 @@ export class AgentRuntime {
     const result = await Promise.race([
       conn.newSession({
         cwd: opts.cwd,
-        mcpServers: this.mcpServers,
+        mcpServers: this.profile.mcpServersAtSpawn ? [] : this.mcpServers,
         ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
       }),
       withTimeout<never>(
@@ -505,7 +505,7 @@ export class AgentRuntime {
       result = await conn.loadSession({
         sessionId: opts.sessionId,
         cwd: opts.cwd,
-        mcpServers: this.mcpServers,
+        mcpServers: this.profile.mcpServersAtSpawn ? [] : this.mcpServers,
         ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
       });
     } finally {

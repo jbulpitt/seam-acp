@@ -76,6 +76,7 @@ export function makeCopilotProfile(opts: {
     staticModels: opts.staticModels,
     threadAbbr: opts.threadAbbr,
     configDir,
+    mcpServersAtSpawn: true,
     // Copilot exposes reasoning effort as an ACP config option (verified via
     // `copilot --acp` v1.0.80: configOptions[id=reasoning_effort],
     // low|medium|high|xhigh|max, default medium).

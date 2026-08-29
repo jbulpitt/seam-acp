@@ -153,6 +153,14 @@ export interface AgentAdapter {
   ): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
 
   /**
+   * This adapter consumes `mcpServers` when its process is spawned, so the
+   * runtime must not send the same named servers again in ACP `session/new`
+   * or `session/load`. Copilot needs this because duplicate names are rejected
+   * during resume and can leave a restored session without callable tools.
+   */
+  readonly mcpServersAtSpawn?: boolean;
+
+  /**
    * How this agent exposes reasoning effort, if at all. Drives both the
    * `/seam config effort` picker (which levels to offer, or whether to show it)
    * and the application path in AgentRuntime:

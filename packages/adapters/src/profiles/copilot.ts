@@ -470,8 +470,17 @@ export function buildCopilotMcpConfigJson(servers: McpServer[]): string | undefi
     // is the bare stdio variant (no type). We pass through the same
     // shape Copilot's mcp-config.json uses.
     if ("type" in s && (s.type === "http" || s.type === "sse")) {
-      const { name, ...rest } = s as McpServer & { name: string };
-      map[name] = rest;
+      const remote = s as McpServer & {
+        name: string;
+        headers?: Array<{ name: string; value: string }>;
+      };
+      const { name, headers, ...rest } = remote;
+      const headerMap: Record<string, string> = {};
+      for (const header of headers ?? []) headerMap[header.name] = header.value;
+      map[name] = {
+        ...rest,
+        ...(Object.keys(headerMap).length > 0 ? { headers: headerMap } : {}),
+      };
     } else {
       // Stdio
       const stdio = s as McpServer & {

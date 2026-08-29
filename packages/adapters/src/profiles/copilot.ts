@@ -480,6 +480,11 @@ export function buildCopilotMcpConfigJson(servers: McpServer[]): string | undefi
       for (const header of headers ?? []) headerMap[header.name] = header.value;
       map[name] = {
         ...rest,
+        // Copilot CLI 1.0.80/1.0.81 can drop the namespace when replaying a
+        // deferred MCP function_call, permanently wedging the resumed session
+        // with a 400. Keep Seam's coordination tools eager; other MCP servers
+        // retain Copilot's normal tool-search behavior.
+        ...(name === "seam-mcp" ? { deferTools: "never" } : {}),
         ...(Object.keys(headerMap).length > 0 ? { headers: headerMap } : {}),
       };
     } else {

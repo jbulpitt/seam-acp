@@ -28,10 +28,15 @@ describe("Copilot per-runtime MCP configuration", () => {
 
     expect(merged.map((server) => server.name)).toEqual(["playwright", "seam-mcp"]);
     const json = JSON.parse(buildCopilotMcpConfigJson(merged)!) as {
-      mcpServers: Record<string, { headers?: Record<string, string> }>;
+      mcpServers: Record<
+        string,
+        { headers?: Record<string, string>; deferTools?: string }
+      >;
     };
     expect(json.mcpServers["seam-mcp"]?.headers).toEqual({
       "X-Seam-Session": "current-token",
     });
+    expect(json.mcpServers["seam-mcp"]?.deferTools).toBe("never");
+    expect(json.mcpServers.playwright?.deferTools).toBeUndefined();
   });
 });

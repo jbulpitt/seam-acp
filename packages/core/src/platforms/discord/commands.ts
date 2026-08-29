@@ -32,11 +32,11 @@ export function buildSeamCommand(): SlashCommandBuilder {
   cmd.addSubcommand((sub) =>
     sub
       .setName("cancel")
-      .setDescription("Cancel this thread's turn; force:true escalates, scope:all kills every session")
+      .setDescription("Cancel this turn; force escalates, scope:all stops all sessions")
       .addBooleanOption((o) =>
         o
           .setName("force")
-          .setDescription("Force-kill this thread's turn if it ignores the cancel (old /seam abort)")
+          .setDescription("Force-stop this turn if graceful cancel fails")
           .setRequired(false)
       )
       // Options are free (they don't count toward the 25 top-level cap).
@@ -45,7 +45,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .addStringOption((o) =>
         o
           .setName("scope")
-          .setDescription("Kill every active session bot-wide (old /seam kill)")
+          .setDescription("Stop every active session")
           .setRequired(false)
           .addChoices({ name: "all", value: "all" })
       )
@@ -826,43 +826,43 @@ export function buildSeamCommand(): SlashCommandBuilder {
   cmd.addSubcommandGroup((g) =>
     g
       .setName("voice")
-      .setDescription("Admin-only Shared Voice Console")
+      .setDescription("Shared Voice Console (admin)")
       .addSubcommand((sub) =>
         sub
           .setName("start")
-          .setDescription("Create a console in your current self-muted voice channel")
+          .setDescription("Start a console in your self-muted VC")
           .addStringOption((o) =>
-            o.setName("alias").setDescription("Presentation alias for this thread binding").setRequired(false)
+            o.setName("alias").setDescription("Binding alias").setRequired(false)
           )
       )
       .addSubcommand((sub) =>
         sub
           .setName("add")
-          .setDescription("Add this thread to your active console")
+          .setDescription("Add this thread to the console")
           .addStringOption((o) =>
-            o.setName("alias").setDescription("Presentation alias for this thread binding").setRequired(false)
+            o.setName("alias").setDescription("Binding alias").setRequired(false)
           )
           .addBooleanOption((o) =>
-            o.setName("claim").setDescription("Select this binding for the next utterance (default true)").setRequired(false)
+            o.setName("claim").setDescription("Select it for input (default true)").setRequired(false)
           )
       )
       .addSubcommand((sub) =>
         sub
           .setName("remove")
-          .setDescription("Remove this thread binding; finalized text is preserved by default")
+          .setDescription("Remove this binding; preserve finalized text")
           .addBooleanOption((o) =>
-            o.setName("discard-pending").setDescription("Discard artifact-free finalized text").setRequired(false)
+            o.setName("discard-pending").setDescription("Discard unowned finalized text").setRequired(false)
           )
       )
       .addSubcommand((sub) =>
         sub
           .setName("configure")
-          .setDescription("Configure this binding's console-local alias and speech profile")
+          .setDescription("Set alias and speech profile for this binding")
           .addStringOption((o) =>
-            o.setName("alias").setDescription("Unique presentation alias").setRequired(false)
+            o.setName("alias").setDescription("Unique alias").setRequired(false)
           )
           .addStringOption((o) =>
-            o.setName("voice").setDescription("Gemini TTS voice").setRequired(false).setAutocomplete(true)
+            o.setName("voice").setDescription("TTS voice").setRequired(false).setAutocomplete(true)
           )
           .addStringOption((o) =>
             o.setName("pace").setDescription("Speech pace").setRequired(false)
@@ -884,24 +884,24 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub
           .setName("console")
-          .setDescription("Show or repost the canonical VC-chat control card")
+          .setDescription("Show or repost the VC control card")
           .addBooleanOption((o) =>
-            o.setName("repost").setDescription("Replace the canonical card in the same VC chat").setRequired(false)
+            o.setName("repost").setDescription("Replace the card in VC chat").setRequired(false)
           )
       )
       .addSubcommand((sub) =>
         sub
           .setName("status")
-          .setDescription("Show console, speaker, binding, scheduler, lease, and usage diagnostics")
+          .setDescription("Show console diagnostics")
       )
       .addSubcommand((sub) =>
         sub
           .setName("stop")
-          .setDescription("Stop the console; finalized pending text is preserved by default")
+          .setDescription("Stop console; preserve finalized text")
           .addBooleanOption((o) =>
             o
               .setName("discard-pending")
-              .setDescription("Delete finalized text that has not been dispatched (default false)")
+              .setDescription("Delete undispatched finalized text")
               .setRequired(false)
           )
       )

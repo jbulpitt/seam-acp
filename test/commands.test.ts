@@ -21,6 +21,15 @@ function built(): { options?: Opt[] } {
   return buildSeamCommand().toJSON() as { options?: Opt[] };
 }
 
+function commandStringSize(value: unknown): number {
+  if (typeof value === "string") return value.length;
+  if (Array.isArray(value)) return value.reduce((sum, item) => sum + commandStringSize(item), 0);
+  if (value && typeof value === "object") {
+    return Object.values(value).reduce<number>((sum, item) => sum + commandStringSize(item), 0);
+  }
+  return 0;
+}
+
 // Regression guard: the whole feature build-out (workflows/steer/project/…) once
 // pushed /seam to 28 top-level options and Discord's 25-cap made the bot crash
 // at boot (registerSlashCommands -> validateMaxOptionsLength). tsc + unit tests
@@ -34,6 +43,10 @@ describe("/seam slash command", () => {
     const json = built();
     expect(json.options?.length ?? 0).toBe(15);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
+  });
+
+  it("stays below Discord's 8,000-character application-command limit", () => {
+    expect(commandStringSize(buildSeamCommand().toJSON())).toBeLessThanOrEqual(7_900);
   });
 
   it("top-level names include rebuild plus the existing commands and 9 groups", () => {

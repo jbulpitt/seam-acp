@@ -13,6 +13,7 @@
     "@agentclientprotocol/sdk": "^1.1.0",
     "@discordjs/opus": "^0.10.0",
     "@discordjs/voice": "^0.19.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@resvg/resvg-js": "^2.6.2",
     "@seam/adapters": "*",
     "@types/ws": "^8.18.1",

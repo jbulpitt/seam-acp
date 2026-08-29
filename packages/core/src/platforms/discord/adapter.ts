@@ -26,6 +26,7 @@ import {
   type Message,
   type TextChannel,
   type ThreadChannel,
+  type VoiceChannel,
   type ChatInputCommandInteraction,
   type AutocompleteInteraction,
   type MessageComponentInteraction,
@@ -300,6 +301,21 @@ export function resolveDiscordSpeakerName(
     author.username ??
     "";
   return sanitizeSpeakerName(raw);
+}
+
+/** Discord voice channels expose a built-in text chat and are valid message
+ * destinations. Keep this explicit instead of relying on isTextBased(), which
+ * would also admit DM channel shapes that this guild-scoped adapter does not
+ * support. */
+export function isSendableDiscordChannelType(type: ChannelType): boolean {
+  return (
+    type === ChannelType.GuildText ||
+    type === ChannelType.GuildAnnouncement ||
+    type === ChannelType.GuildVoice ||
+    type === ChannelType.PublicThread ||
+    type === ChannelType.PrivateThread ||
+    type === ChannelType.AnnouncementThread
+  );
 }
 
 export type SlashHandler = (
@@ -2067,7 +2083,21 @@ export class DiscordAdapter implements ChatAdapter {
       });
       return;
     }
-    await this.slashHandler(interaction);
+    try {
+      await this.slashHandler(interaction);
+    } catch (err) {
+      this.logger.error({ err }, "slash handler crashed");
+      const content = "That command failed unexpectedly. Please retry; if it repeats, check the bot logs.";
+      try {
+        if (interaction.deferred || interaction.replied) {
+          await interaction.editReply({ content });
+        } else {
+          await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+        }
+      } catch (replyErr) {
+        this.logger.warn({ err: replyErr }, "failed to report slash command error");
+      }
+    }
   }
 
   /**
@@ -2313,22 +2343,16 @@ export class DiscordAdapter implements ChatAdapter {
 
   private async fetchSendableChannel(
     channelId: string
-  ): Promise<TextChannel | ThreadChannel> {
+  ): Promise<TextChannel | ThreadChannel | VoiceChannel> {
     const ch = await this.client.channels.fetch(channelId);
     if (!ch) throw new Error(`Channel ${channelId} not found`);
     if (isObfuscatedChannel(ch)) {
       throw new Error(`Channel ${channelId} is obfuscated (bot lacks VIEW_CHANNEL)`);
     }
-    if (
-      ch.type === ChannelType.GuildText ||
-      ch.type === ChannelType.GuildAnnouncement ||
-      ch.type === ChannelType.PublicThread ||
-      ch.type === ChannelType.PrivateThread ||
-      ch.type === ChannelType.AnnouncementThread
-    ) {
-      return ch as TextChannel | ThreadChannel;
+    if (isSendableDiscordChannelType(ch.type)) {
+      return ch as TextChannel | ThreadChannel | VoiceChannel;
     }
-    throw new Error(`Channel ${channelId} is not text/thread (${ch.type})`);
+    throw new Error(`Channel ${channelId} is not a supported message channel (${ch.type})`);
   }
 
   private async registerSlashCommands(): Promise<void> {

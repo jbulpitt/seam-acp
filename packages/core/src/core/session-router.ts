@@ -186,6 +186,13 @@ export class SessionRouter {
   private readonly creationLocks = new Map<string, Promise<AgentRuntime>>();
   private readonly lastStartFailure = new Map<string, number>();
   private readonly startFailureCooldownMs = 30_000;
+  /** A retiring runtime stays here until its process tree is fully gone. New
+   * turns wait on this barrier before respawning the same durable session. */
+  private readonly retirements = new Map<string, Promise<void>>();
+  private readonly runtimeIdleTtlMs: number;
+  private readonly runtimeIdleSweepMs: number;
+  private idleReaperTimer?: ReturnType<typeof setInterval>;
+  private idleSweepInFlight = false;
 
   constructor(opts: {
     logger: Logger;
@@ -199,6 +206,10 @@ export class SessionRouter {
     bindSessionLocation?: (sessionId: string, location: string) => void;
     channelPresets?: Map<string, ChannelPreset>;
     threadPresets?: Map<string, ThreadPreset>;
+    /** 0 disables warm-runtime retirement. Production supplies the configured
+     * TTL; tests and embedders remain opt-in. */
+    runtimeIdleTtlMs?: number;
+    runtimeIdleSweepMs?: number;
   }) {
     this.logger = opts.logger.child({ comp: "session-router" });
     this.store = opts.store;
@@ -211,6 +222,31 @@ export class SessionRouter {
     this.bindSessionLocationFn = opts.bindSessionLocation ?? opts.seamMcp?.bindSessionLocation;
     this.channelPresets = opts.channelPresets ?? new Map();
     this.threadPresets = opts.threadPresets ?? new Map();
+    this.runtimeIdleTtlMs = Math.max(0, opts.runtimeIdleTtlMs ?? 0);
+    this.runtimeIdleSweepMs = Math.max(
+      1_000,
+      opts.runtimeIdleSweepMs ?? Math.min(300_000, Math.max(30_000, Math.floor(this.runtimeIdleTtlMs / 4)))
+    );
+  }
+
+  /** Start the unref'd warm-runtime reaper. Durable session rows and ACP ids
+   * are never touched; only idle process trees are retired. */
+  startIdleReaper(): void {
+    if (this.runtimeIdleTtlMs <= 0 || this.idleReaperTimer) return;
+    this.idleReaperTimer = setInterval(
+      () => void this.sweepIdleRuntimes(),
+      this.runtimeIdleSweepMs
+    );
+    this.idleReaperTimer.unref?.();
+    this.logger.info(
+      { ttlMs: this.runtimeIdleTtlMs, sweepMs: this.runtimeIdleSweepMs },
+      "idle runtime reaper started"
+    );
+  }
+
+  stopIdleReaper(): void {
+    if (this.idleReaperTimer) clearInterval(this.idleReaperTimer);
+    this.idleReaperTimer = undefined;
   }
 
   /**
@@ -441,8 +477,17 @@ export class SessionRouter {
    * lock and the post-failure cooldown.
    */
   async getOrStartRuntime(record: SessionRecord): Promise<AgentRuntime> {
+    const retiring = this.retirements.get(record.id);
+    if (retiring) {
+      await retiring;
+      return this.getOrStartRuntime(record);
+    }
+
     const cached = this.runtimes.get(record.id);
-    if (cached) return cached;
+    if (cached) {
+      cached.markActivity();
+      return cached;
+    }
 
     const inflight = this.creationLocks.get(record.id);
     if (inflight) return inflight;
@@ -482,14 +527,12 @@ export class SessionRouter {
     // Keep the seam-MCP token. It identifies the Discord session; Grok (and
     // others) reconnect HTTP MCP with the header from session/new. A later
     // start reuses it (reuseToken). Revoke only when the session row is gone.
+    const retiring = this.retirements.get(sessionId);
+    if (retiring) await retiring;
+
     const rt = this.runtimes.get(sessionId);
     if (rt) {
-      this.runtimes.delete(sessionId);
-      try {
-        await rt.dispose();
-      } catch (err) {
-        this.logger.warn({ err, sessionId }, "dispose during invalidate failed");
-      }
+      await this.retireRuntime(sessionId, rt, "invalidate");
     }
     if (opts?.clearAcpSession) {
       const record = this.store.get(sessionId);
@@ -566,15 +609,49 @@ export class SessionRouter {
    *  #76: MUST NOT clear turn-resume markers — shutdown is the event
    *  resume exists for. */
   async disposeAll(): Promise<void> {
-    const all = Array.from(this.runtimes.values());
-    this.runtimes.clear();
-    await Promise.all(
-      all.map((rt) =>
-        rt.dispose().catch((err) => {
-          this.logger.warn({ err }, "dispose failed during shutdown");
+    this.stopIdleReaper();
+    const pending = [...this.retirements.values()];
+    for (const [sessionId, rt] of [...this.runtimes]) {
+      pending.push(this.retireRuntime(sessionId, rt, "shutdown"));
+    }
+    await Promise.all(pending);
+  }
+
+  /** Retire up to eight expired warm runtimes in one pass. Busy prompts are
+   * never touched. Exposed for deterministic tests and diagnostics. */
+  async sweepIdleRuntimes(nowMs = Date.now()): Promise<number> {
+    if (this.runtimeIdleTtlMs <= 0 || this.idleSweepInFlight) return 0;
+    this.idleSweepInFlight = true;
+    try {
+      const candidates: Array<[string, AgentRuntime]> = [];
+      for (const [sessionId, rt] of this.runtimes) {
+        if (candidates.length >= 8) break;
+        if (rt.busy) continue;
+        if (nowMs - rt.lastActivityAtMs < this.runtimeIdleTtlMs) continue;
+        candidates.push([sessionId, rt]);
+      }
+      if (candidates.length === 0) return 0;
+
+      await Promise.all(
+        candidates.map(async ([sessionId, rt]) => {
+          // Recheck immediately before the synchronous cache removal. No await
+          // occurs between this guard and retireRuntime's ownership claim.
+          if (this.runtimes.get(sessionId) !== rt || rt.busy) return;
+          if (nowMs - rt.lastActivityAtMs < this.runtimeIdleTtlMs) return;
+          await this.retireRuntime(sessionId, rt, "idle_ttl");
         })
-      )
-    );
+      );
+      const reaped = candidates.filter(([sessionId]) => !this.runtimes.has(sessionId)).length;
+      if (reaped > 0) {
+        this.logger.info(
+          { reaped, ttlMs: this.runtimeIdleTtlMs, remaining: this.runtimes.size },
+          "idle runtimes reaped"
+        );
+      }
+      return reaped;
+    } finally {
+      this.idleSweepInFlight = false;
+    }
   }
 
   hasRuntime(sessionId: string): boolean {
@@ -831,5 +908,32 @@ export class SessionRouter {
       updatedUtc: new Date().toISOString(),
     });
     return runtime;
+  }
+
+  private retireRuntime(
+    sessionId: string,
+    rt: AgentRuntime,
+    reason: "idle_ttl" | "invalidate" | "shutdown"
+  ): Promise<void> {
+    const existing = this.retirements.get(sessionId);
+    if (existing) return existing;
+    if (this.runtimes.get(sessionId) !== rt) return Promise.resolve();
+
+    // Claim retirement synchronously before dispose yields. getOrStartRuntime
+    // sees the barrier and cannot overlap a new process with the old one.
+    this.runtimes.delete(sessionId);
+    let retirement!: Promise<void>;
+    retirement = rt
+      .dispose()
+      .catch((err) => {
+        this.logger.warn({ err, sessionId, reason }, "runtime retirement failed");
+      })
+      .finally(() => {
+        if (this.retirements.get(sessionId) === retirement) {
+          this.retirements.delete(sessionId);
+        }
+      });
+    this.retirements.set(sessionId, retirement);
+    return retirement;
   }
 }

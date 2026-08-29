@@ -172,6 +172,9 @@ export class AgentRuntime {
   /** True while a `session/prompt` is awaiting a response — lets the abort path
    *  tell whether a graceful cancel actually ended the turn before escalating. */
   private promptInFlight = false;
+  /** Last meaningful runtime activity. The session router uses this only to
+   * retire warm, idle processes; it is not durable conversation state. */
+  private lastActivityMs = Date.now();
   /** Reject fn for the in-flight `conn.prompt()` promise while a turn runs. Lets
    *  us force that await to settle the instant the child exits or the runtime is
    *  disposed — the SDK does not reliably reject pending RPCs on an abnormal
@@ -616,6 +619,7 @@ export class AgentRuntime {
       }
     }
 
+    this.touchActivity();
     this.promptInFlight = true;
     // Captured so the teardown fail-safe below can tell a CLEAN completion
     // (end_turn) from an abnormal one (cancel/abort/error). Stays undefined if
@@ -638,6 +642,7 @@ export class AgentRuntime {
       };
     } finally {
       this.promptInFlight = false;
+      this.touchActivity();
       this.rejectInFlightPrompt = undefined;
       if (firstResumedPrompt) {
         // Let any updates still queued for this turn finish processing under the
@@ -688,6 +693,17 @@ export class AgentRuntime {
   /** Whether a prompt is currently in flight (turn running). */
   get busy(): boolean {
     return this.promptInFlight;
+  }
+
+  /** Monotonic-enough wall-clock marker for the idle-runtime reaper. */
+  get lastActivityAtMs(): number {
+    return this.lastActivityMs;
+  }
+
+  /** Mark the runtime as claimed by an incoming turn before prompt() starts.
+   * This closes the narrow getOrStartRuntime → prompt race with idle reaping. */
+  markActivity(): void {
+    this.touchActivity();
   }
 
   /** Wait for all asynchronous session updates to be processed. */
@@ -843,12 +859,17 @@ export class AgentRuntime {
   }
 
   private async emit(event: AgentEvent): Promise<void> {
+    this.touchActivity();
     if (!this.eventHandler) return;
     try {
       await this.eventHandler(event);
     } catch (err) {
       this.logger.error({ err, event }, "event handler failed");
     }
+  }
+
+  private touchActivity(): void {
+    this.lastActivityMs = Date.now();
   }
 
   /** True when the accumulated echoed user text matches the in-flight prompt —

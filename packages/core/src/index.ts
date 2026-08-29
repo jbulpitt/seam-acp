@@ -428,7 +428,9 @@ async function main(): Promise<void> {
     bindSessionLocation: (sessionId, location) => {
       bridgeHub?.markSessionBridge(sessionId, location);
     },
+    runtimeIdleTtlMs: config.RUNTIME_IDLE_TTL_SECONDS * 1000,
   });
+  router.startIdleReaper();
 
   const quotaRegistry = new QuotaRegistry();
   const quotaPoller = new AgentQuotaPoller({

@@ -528,6 +528,9 @@ const Schema = z.object({
   OPENCODE_TAVILY_URL: z.string().optional(),
 
   TURN_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(604800).default(900),
+  /** Retire warm, idle ACP process trees after this many seconds while keeping
+   * the durable session binding resumable. 0 disables. Default 2 hours. */
+  RUNTIME_IDLE_TTL_SECONDS: z.coerce.number().int().min(0).max(604800).default(7200),
   /**
    * How long the agent-quota poller keeps serving an agent's last-known-good
    * snapshot when an upstream read returns "unavailable", instead of flapping

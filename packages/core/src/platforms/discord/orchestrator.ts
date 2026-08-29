@@ -16770,6 +16770,7 @@ const COMPACTION_MODEL_WINDOWS: Record<string, number> = {
   "Claude Opus 4.6 (Thinking)": 250_000,
   "glm-5.2": 1_000_000,
   "qwen3-coder:480b-cloud": 256_000,
+  "glm-5.3:cloud": 1_000_000,
   "glm-5.2:cloud": 976_000,
 };
 

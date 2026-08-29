@@ -1166,6 +1166,7 @@ export const ZAI_STATIC_MODELS = [
 /** Models for Ollama Cloud.  OLLAMA_CLOUD_MODELS env var overrides this list when set.
  *  These are the primary cloud-hosted open-weight models available on ollama.com. */
 export const OLLAMA_CLOUD_STATIC_MODELS = [
+  { modelId: "glm-5.3:cloud",               name: "GLM 5.3",              contextLimit: 1_000_000 },
   { modelId: "glm-5.2:cloud",               name: "GLM 5.2",              contextLimit: 976_000 },
   { modelId: "glm-5.1:cloud",               name: "GLM 5.1",              contextLimit: 976_000 },
   { modelId: "qwen3-coder:cloud",           name: "Qwen3 Coder",          contextLimit: 256_000 },

@@ -195,12 +195,17 @@ describe("session config mutation (Tier A)", () => {
 // -------------------------------------------------------------------------
 
 describe("preset mutation (Tier B)", () => {
-  it("creates a project-scoped preset only on apply", () => {
+  it("creates a project-scoped preset with an auto-numbering slug only on apply", () => {
     const record = makeRecord();
     store.upsert(record);
     const svc = makeService();
     const built = svc.buildProposal(record, {
-      preset: { name: "reviewer", agent: "claude", model: "claude-opus-4.8" },
+      preset: {
+        name: "reviewer",
+        agent: "claude",
+        model: "claude-opus-4.8",
+        threadSlug: "review",
+      },
     });
     expect(built.ok).toBe(true);
     if (!built.ok) return;
@@ -212,7 +217,14 @@ describe("preset mutation (Tier B)", () => {
     expect(preset).not.toBeNull();
     expect(preset!.agentId).toBe("claude");
     expect(preset!.projectRef).toBe("chan-1");
+    expect(preset!.threadSlug).toBe("review");
+    expect(built.proposal.fields).toContainEqual({
+      label: "threadSlug",
+      before: "(unset)",
+      after: "review",
+    });
     expect(store.listConfigMutations()[0]!.tier).toBe("preset");
+    expect(store.listConfigMutations()[0]!.afterJson).toContain('"threadSlug":"review"');
   });
 
   it("allows `instructions` and persists it on the preset row (#72 un-block)", () => {

@@ -423,6 +423,18 @@ describe("SeamMcpServer", () => {
     for (const t of body.result.tools) {
       expect(t.inputSchema.type).toBe("object");
     }
+    const configPropose = body.result.tools.find(
+      (t: { name: string }) => t.name === "config_propose"
+    );
+    expect(configPropose.inputSchema.properties.preset.properties.threadSlug).toMatchObject({
+      type: "string",
+    });
+    expect(configPropose.inputSchema.properties.threadPreset.properties.threadSlug).toMatchObject({
+      type: "string",
+    });
+    expect(configPropose.inputSchema.properties.channelPreset.properties.threadSlug).toMatchObject({
+      type: "string",
+    });
   });
 
   it("inspect_image returns sidecar observations and preserves caller scope", async () => {
@@ -1637,6 +1649,37 @@ describe("config_propose lock enforcement (D2)", () => {
     );
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0].text).toContain("not supported");
+  });
+
+  it("forwards a preset threadSlug to the proposal service", async () => {
+    const seen: unknown[] = [];
+    h = await makeHarness({
+      isChannelLocked: () => false,
+      proposeConfig: async (_record, input) => {
+        seen.push(input);
+        return {
+          ok: true,
+          summary: 'Create preset "orch-opus"',
+          fields: [{ label: "threadSlug", before: "(unset)", after: "orch" }],
+          restartsSession: false,
+        };
+      },
+    });
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "config_propose",
+        arguments: {
+          preset: { name: "orch-opus", agent: "claude", threadSlug: "orch" },
+        },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBeFalsy();
+    expect(seen).toEqual([
+      { preset: { name: "orch-opus", agent: "claude", threadSlug: "orch" } },
+    ]);
+    expect(body.result.content[0].text).toContain("threadSlug: (unset) → orch");
   });
 
   it("forwards a `schedule` branch to proposeConfig (#69 NL→cron write)", async () => {

@@ -879,12 +879,12 @@ const TOOLS = [
       "confirmation card in your thread showing the exact before→after diff, and a human must click " +
       "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.\n" +
       "- session: your thread's own runtime config (agent, model, effort, cwd, permission, statusCardStyle, simpleCardGif).\n" +
-      "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target).\n" +
-      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle/simpleCardGif/detached/location/tts). " +
+      "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target; threadSlug enables auto-numbered `/seam preset thread` names).\n" +
+      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle/simpleCardGif/threadSlug/detached/location/tts). " +
       "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider. " +
       "`detached:true` stops treating this thread as a session (no bot replies; does not delete history). " +
       "`tts:true` speaks each completed turn as an ogg attachment (default off).\n" +
-      "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle/simpleCardGif). " +
+      "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle/simpleCardGif/threadSlug). " +
       "Applies to EVERY thread under the channel (statusCardStyle and simpleCardGif are inherited live at render time). May be disabled by the deployment; `locked` can NEVER be changed.\n" +
       "- schedule: create/update/enable/disable/delete a scheduled prompt for THIS thread. Translate the " +
       "user's natural-language cadence into a standard cron expression (e.g. \"every weekday at 7am\" → " +
@@ -984,6 +984,12 @@ const TOOLS = [
                 "Status-card layout baked into this preset. Empty string clears it so apply " +
                 "does not touch the thread's style.",
             },
+            threadSlug: {
+              type: "string",
+              description:
+                "Slug for auto-numbered `/seam preset thread` names (for example `orch`). " +
+                "Empty string clears it. Supply this when the preset should create threads without an explicit name.",
+            },
           },
           required: ["name"],
         },
@@ -1009,6 +1015,11 @@ const TOOLS = [
               type: "boolean",
               description:
                 "Thread-preset simple-card GIF. Overrides the channel preset; session `/seam config gif` still wins.",
+            },
+            threadSlug: {
+              type: "string",
+              description:
+                "Thread-specific auto-numbering slug. Overrides the channel slug. Empty string clears it.",
             },
             detached: {
               type: "boolean",
@@ -1069,6 +1080,11 @@ const TOOLS = [
               type: "boolean",
               description:
                 "Channel-wide simple-card GIF thumbnail. Inherited live unless a thread/session overlay wins.",
+            },
+            threadSlug: {
+              type: "string",
+              description:
+                "Channel-wide fallback slug for auto-numbered `/seam preset thread` names. Empty string clears it.",
             },
           },
         },

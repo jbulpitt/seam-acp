@@ -364,7 +364,8 @@ describe("confirmation and binding-editor components", () => {
       attachmentName: "voice-preview-kore.ogg",
     });
     expect(buildDuplicateVoiceConfirmationRows(draft)[0]!.components).toHaveLength(2);
-    expect(cycleVoiceConsolePace("fast")).toBe("slow");
+    expect(cycleVoiceConsolePace("fast")).toBe("faster");
+    expect(cycleVoiceConsolePace("faster")).toBe("slow");
     expect(cycleVoiceConsoleStyle("clear")).toBe("neutral");
   });
 });

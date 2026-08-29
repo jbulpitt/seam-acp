@@ -35,7 +35,8 @@ describe("tts editor", () => {
 
   it("cycles pace and style", () => {
     expect(cyclePace("slow")).toBe("natural");
-    expect(cyclePace("fast")).toBe("slow");
+    expect(cyclePace("fast")).toBe("faster");
+    expect(cyclePace("faster")).toBe("slow");
     expect(cycleStyle("neutral")).toBe("warm");
     expect(cycleStyle("clear")).toBe("neutral");
   });

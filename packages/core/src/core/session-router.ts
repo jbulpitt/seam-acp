@@ -681,7 +681,7 @@ export class SessionRouter {
     });
 
     let spawnChild: RuntimeSpawnPlan["spawnChild"] = (modelOverride, effortOverride) =>
-      profile.spawn(modelOverride, effortOverride);
+      profile.spawn(modelOverride, effortOverride, mcpServers);
 
     if (remote) {
       const mux = this.seamMcp?.muxForSession?.(record.id);

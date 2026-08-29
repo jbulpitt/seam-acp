@@ -307,7 +307,7 @@ export class AgentRuntime {
     if (this.connection) return;
     const child = this.spawnFn
       ? await this.spawnFn(this.modelOverride, this.effortOverride)
-      : this.profile.spawn(this.modelOverride, this.effortOverride);
+      : this.profile.spawn(this.modelOverride, this.effortOverride, this.mcpServers);
     this.child = child;
 
     // Capture spawn errors (ENOENT, EACCES, etc.) so they surface as a

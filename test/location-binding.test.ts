@@ -36,8 +36,8 @@ function stubProfile(id: string, spawnCalls: unknown[]): AgentProfile {
   return {
     id,
     displayName: id,
-    spawn(model?: string, effort?: string) {
-      spawnCalls.push({ model, effort });
+    spawn(model?: string, effort?: string, mcpServers = []) {
+      spawnCalls.push({ model, effort, mcpServers });
       const stdin = new PassThrough();
       const stdout = new PassThrough();
       const stderr = new PassThrough();
@@ -172,6 +172,14 @@ describe("markSessionBridge is called on start when location is a bridge id (#84
     expect(marked).toEqual([{ sessionId: "discord:thread-1", location: "local" }]);
     plan.spawnChild(plan.model, plan.effort);
     expect(localSpawnCalls).toHaveLength(1);
+    expect(localSpawnCalls[0]).toMatchObject({
+      mcpServers: [
+        expect.objectContaining({
+          name: "seam-mcp",
+          type: "http",
+        }),
+      ],
+    });
   });
 });
 

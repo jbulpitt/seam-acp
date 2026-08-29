@@ -64,7 +64,7 @@ export function makeCopilotProfile(opts: {
   threadAbbr?: string;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "copilot";
-  const additionalMcpJson = buildCopilotMcpConfigJson(opts.mcpServers ?? []);
+  const globalMcpServers = opts.mcpServers ?? [];
   const configDir = opts.configDir?.trim() || undefined;
 
   let identityCache: AgentIdentity | null | undefined;
@@ -85,8 +85,14 @@ export function makeCopilotProfile(opts: {
       configId: "reasoning_effort",
       levels: ["low", "medium", "high", "xhigh", "max"],
     },
-    spawn() {
+    spawn(_modelOverride?: string, _effortOverride?: string, sessionMcpServers?: McpServer[]) {
       const args = ["--acp"];
+      // Copilot ignores ACP session/new + session/load `mcpServers`. Supply the
+      // runtime-specific seam-MCP URL/token when the ACP *process* starts so a
+      // resumed session after redeploy retains its coordination tools.
+      const additionalMcpJson = buildCopilotMcpConfigJson(
+        mergeCopilotMcpServers(globalMcpServers, sessionMcpServers ?? [])
+      );
       if (additionalMcpJson) {
         args.push("--additional-mcp-config", additionalMcpJson);
       }
@@ -445,7 +451,17 @@ function parseQuota(raw: unknown): CopilotQuotaSnapshot | null {
  * `{mcpServers: {name: {...}}}` JSON. Returns undefined when the list
  * is empty so we don't pass an empty `--additional-mcp-config` flag.
  */
-function buildCopilotMcpConfigJson(servers: McpServer[]): string | undefined {
+export function mergeCopilotMcpServers(
+  globalServers: readonly McpServer[],
+  sessionServers: readonly McpServer[]
+): McpServer[] {
+  const byName = new Map<string, McpServer>();
+  for (const server of globalServers) byName.set(server.name, server);
+  for (const server of sessionServers) byName.set(server.name, server);
+  return [...byName.values()];
+}
+
+export function buildCopilotMcpConfigJson(servers: McpServer[]): string | undefined {
   if (servers.length === 0) return undefined;
 
   const map: Record<string, unknown> = {};

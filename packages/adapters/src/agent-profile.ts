@@ -1,5 +1,6 @@
 import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable as NodeReadable, Writable as NodeWritable } from "node:stream";
+import type { McpServer } from "@agentclientprotocol/sdk";
 import type { ContextUsage, ISessionManager, SessionSummary } from "./session-manager.js";
 
 /**
@@ -139,7 +140,17 @@ export interface AgentAdapter {
    *  @param effortOverride — when set, the spawned process should use this
    *  reasoning effort level. Used for agents that accept effort via CLI flags
    *  (e.g. Grok `--reasoning-effort`). */
-  spawn(modelOverride?: string, effortOverride?: string): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
+  spawn(
+    modelOverride?: string,
+    effortOverride?: string,
+    /**
+     * Per-runtime MCP servers. Most ACP agents consume these from
+     * `session/new` / `session/load` and can ignore this argument. Copilot CLI
+     * does not: it must receive them at process spawn via
+     * `--additional-mcp-config`, otherwise a resumed process loses seam-MCP.
+     */
+    mcpServers?: McpServer[]
+  ): ChildProcessByStdio<NodeWritable, NodeReadable, NodeReadable>;
 
   /**
    * How this agent exposes reasoning effort, if at all. Drives both the

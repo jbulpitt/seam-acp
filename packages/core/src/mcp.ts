@@ -2,16 +2,11 @@
  * Global MCP server configuration applied to every ACP session.
  *
  * Servers are gated by env vars so the bot still runs cleanly on a host
- * that doesn't have their dependencies installed. Today only Playwright
- * is wired up; new servers should follow the same pattern.
- *
- * Discovery / debugging tip: the agent must be able to resolve the
- * server's `command` on its PATH. For npx-based servers we assume Node
- * is available; for binaries we assume the user has them installed.
+ * that doesn't provide them. Playwright is a single loopback HTTP service;
+ * every local agent session receives the same endpoint while the MCP server
+ * keeps each client's browser context isolated.
  */
 
-import fs from "node:fs";
-import path from "node:path";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { Logger } from "./lib/logger.js";
 
@@ -21,34 +16,22 @@ export interface McpServersResult {
 
 export function buildGlobalMcpServers(
   logger: Logger,
-  opts: { dataDir: string }
+  _opts: { dataDir: string }
 ): McpServersResult {
   const servers: McpServer[] = [];
 
   if (parseBool(process.env.MCP_PLAYWRIGHT_ENABLED)) {
-    // Pin Playwright's outputs to a known scratch dir under DATA_DIR so
-    // they don't pollute whatever repo the session happens to be in.
-    const scratch = path.resolve(opts.dataDir, "agent-scratch", "playwright");
-    fs.mkdirSync(scratch, { recursive: true });
+    const url = process.env.MCP_PLAYWRIGHT_URL?.trim() || "http://localhost:8766/mcp";
 
     servers.push({
       name: "playwright",
-      command: "npx",
-      args: [
-        "-y",
-        "@playwright/mcp@latest",
-        "--isolated",
-        "--headless",
-        "--image-responses",
-        "allow",
-        "--output-dir",
-        scratch,
-      ],
-      env: [],
+      type: "http",
+      url,
+      headers: [],
     });
     logger.info(
-      { outputDir: scratch },
-      "MCP enabled: playwright (browser automation + screenshots)"
+      { url },
+      "MCP enabled: shared playwright (browser automation + screenshots)"
     );
   }
 

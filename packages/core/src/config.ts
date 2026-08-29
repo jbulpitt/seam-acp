@@ -845,7 +845,7 @@ const ThreadPresetSchema = PresetValuesSchema.extend({
     .optional(),
   tts: z.boolean().optional().default(false),
   ttsVoice: z.string().min(1).max(64).optional(),
-  ttsPace: z.enum(["slow", "natural", "fast"]).optional(),
+  ttsPace: z.enum(["slow", "natural", "fast", "faster"]).optional(),
   ttsStyle: z.enum(["neutral", "warm", "clear"]).optional(),
 });
 
@@ -895,7 +895,7 @@ export type ThreadPreset = PresetValues & {
   location?: string;
   tts?: boolean;
   ttsVoice?: string;
-  ttsPace?: "slow" | "natural" | "fast";
+  ttsPace?: "slow" | "natural" | "fast" | "faster";
   ttsStyle?: "neutral" | "warm" | "clear";
 };
 
@@ -1031,10 +1031,10 @@ export function resolveThreadTtsVoice(
 export function resolveThreadTtsPace(
   config: Pick<Config, "threadPresets">,
   threadId: string | undefined
-): "slow" | "natural" | "fast" {
+): "slow" | "natural" | "fast" | "faster" {
   if (!threadId) return "natural";
   const v = config.threadPresets.get(threadId)?.ttsPace;
-  return v === "slow" || v === "fast" || v === "natural" ? v : "natural";
+  return v === "slow" || v === "fast" || v === "faster" || v === "natural" ? v : "natural";
 }
 
 export function resolveThreadTtsStyle(

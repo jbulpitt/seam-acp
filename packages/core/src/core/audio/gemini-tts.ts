@@ -66,7 +66,7 @@ export function geminiTtsVoiceChoices(prefix: string): { name: string; value: st
   return items.map((v) => ({ name: `${v.name} — ${v.style}`, value: v.name }));
 }
 
-export const TTS_PACES = ["slow", "natural", "fast"] as const;
+export const TTS_PACES = ["slow", "natural", "fast", "faster"] as const;
 export type TtsPace = (typeof TTS_PACES)[number];
 export const TTS_STYLES = ["neutral", "warm", "clear"] as const;
 export type TtsStyle = (typeof TTS_STYLES)[number];
@@ -82,9 +82,11 @@ export function buildTtsInput(text: string, pace: TtsPace = "natural", style: Tt
   const paceNote =
     pace === "slow"
       ? "Speak slowly and clearly, with unhurried pacing. Do not rush."
-      : pace === "fast"
-        ? "Speak at a brisk, energetic pace. Keep it intelligible, not breathless."
-        : "Speak at a natural conversational pace.";
+      : pace === "faster"
+        ? "Speak very fast — rapid, high-tempo delivery, noticeably quicker than brisk. Compress the pauses but keep every word crisp and intelligible; do not slur or drop words."
+        : pace === "fast"
+          ? "Speak at a brisk, energetic pace. Keep it intelligible, not breathless."
+          : "Speak at a natural conversational pace.";
   const styleNote =
     style === "warm"
       ? "Warm, friendly, approachable tone."

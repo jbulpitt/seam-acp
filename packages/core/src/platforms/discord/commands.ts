@@ -400,7 +400,8 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .addChoices(
                 { name: "slow", value: "slow" },
                 { name: "natural", value: "natural" },
-                { name: "fast", value: "fast" }
+                { name: "fast", value: "fast" },
+                { name: "faster", value: "faster" }
               )
           )
           .addStringOption((o) =>
@@ -869,7 +870,8 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .addChoices(
                 { name: "slow", value: "slow" },
                 { name: "natural", value: "natural" },
-                { name: "fast", value: "fast" }
+                { name: "fast", value: "fast" },
+                { name: "faster", value: "faster" }
               )
           )
           .addStringOption((o) =>

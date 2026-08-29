@@ -161,7 +161,7 @@ export interface ThreadPresetChanges {
   /** Raw Gemini TTS voice name. `null` clears back to the env default. */
   ttsVoice?: string | null;
   /** `null` / `"natural"` omits the key. */
-  ttsPace?: "slow" | "natural" | "fast" | null;
+  ttsPace?: "slow" | "natural" | "fast" | "faster" | null;
   /** `null` / `"neutral"` omits the key. */
   ttsStyle?: "neutral" | "warm" | "clear" | null;
 }
@@ -1570,7 +1570,7 @@ export class ConfigMutationService {
 
     if (changes.ttsPace !== undefined) {
       const beforePace =
-        current.ttsPace === "slow" || current.ttsPace === "fast" || current.ttsPace === "natural"
+        current.ttsPace === "slow" || current.ttsPace === "fast" || current.ttsPace === "faster" || current.ttsPace === "natural"
           ? current.ttsPace
           : "natural";
       const requested = changes.ttsPace;

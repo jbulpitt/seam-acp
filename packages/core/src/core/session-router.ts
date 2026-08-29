@@ -116,7 +116,7 @@ export interface ConfigDescription {
   tts: ResolvedSetting<boolean>;
   /** Per-thread Gemini TTS voice. `null` = env default (usually Kore). */
   ttsVoice: ResolvedSetting<string | null>;
-  ttsPace: ResolvedSetting<"slow" | "natural" | "fast">;
+  ttsPace: ResolvedSetting<"slow" | "natural" | "fast" | "faster">;
   ttsStyle: ResolvedSetting<"neutral" | "warm" | "clear">;
   /**
    * Host binding (D10 / #86). `local` is the default when the thread preset
@@ -325,8 +325,8 @@ export class SessionRouter {
       ? { value: thread.ttsVoice, source: "thread preset" }
       : { value: null, source: "default" };
 
-    const ttsPace: ResolvedSetting<"slow" | "natural" | "fast"> =
-      thread?.ttsPace === "slow" || thread?.ttsPace === "fast"
+    const ttsPace: ResolvedSetting<"slow" | "natural" | "fast" | "faster"> =
+      thread?.ttsPace === "slow" || thread?.ttsPace === "fast" || thread?.ttsPace === "faster"
         ? { value: thread.ttsPace, source: "thread preset" }
         : { value: "natural", source: "default" };
 

@@ -1049,7 +1049,7 @@ const TOOLS = [
             },
             ttsPace: {
               type: "string",
-              enum: ["slow", "natural", "fast"],
+              enum: ["slow", "natural", "fast", "faster"],
               description: "Spoken pacing (director's note). natural / empty clears.",
             },
             ttsStyle: {

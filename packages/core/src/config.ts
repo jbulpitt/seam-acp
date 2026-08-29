@@ -294,6 +294,8 @@ const Schema = z.object({
   /** Cosmetic model id reported by the Antigravity profile. */
   AGY_DEFAULT_MODEL: z.string().default("antigravity"),
   AGY_MODELS: ModelsListSchema,
+  /** Sandboxed Agy model used by the tool-mediated image inspector. */
+  AGY_VISION_MODEL: z.string().default("gemini-3.7-flash-high"),
 
   /**
    * Register the OpenAI Codex agent: `@agentclientprotocol/codex-acp` — a
@@ -477,9 +479,6 @@ const Schema = z.object({
   /** Default model id for Ollama Cloud sessions. */
   OLLAMA_CLOUD_DEFAULT_MODEL: z.string().default("glm-5.2:cloud"),
   OLLAMA_CLOUD_MODELS: ModelsListSchema,
-  /** Native direct-Cloud API model used by the image inspector. Unlike the
-   *  local Ollama proxy selector, https://ollama.com/api/chat omits `:cloud`. */
-  OLLAMA_CLOUD_VISION_MODEL: z.string().default("glm-5.3-flash"),
   /** Model used for /compact on Ollama Cloud sessions. */
   OLLAMA_CLOUD_COMPACTION_MODEL: z.string().default("glm-5.2:cloud"),
 

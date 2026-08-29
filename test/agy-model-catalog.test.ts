@@ -1,10 +1,40 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  agyExecutionPolicyArgs,
   filterAgyCatalogByAcceptedModels,
   parseAgyAcceptedModels,
   resolveAgyModel,
   type AgyCatalogEntry,
 } from "../packages/adapters/src/profiles/agy.js";
+
+describe("agyExecutionPolicyArgs", () => {
+  it("keeps normal chat compatibility with the shared staging directory", () => {
+    const args = agyExecutionPolicyArgs("/workspace", {
+      sandbox: false,
+      exposeGlobalStaging: true,
+      persistModelSelection: true,
+    });
+    expect(args).toContain("--dangerously-skip-permissions");
+    expect(args).not.toContain("--sandbox");
+    expect(args).toContain("/workspace");
+    expect(args.filter((arg) => arg === "--add-dir")).toHaveLength(2);
+  });
+
+  it("confines the vision sidecar to its private sandbox cwd", () => {
+    expect(
+      agyExecutionPolicyArgs("/private/image", {
+        sandbox: true,
+        exposeGlobalStaging: false,
+        persistModelSelection: false,
+      })
+    ).toEqual([
+      "--sandbox",
+      "--dangerously-skip-permissions",
+      "--add-dir",
+      "/private/image",
+    ]);
+  });
+});
 
 const ACCEPTED_MODELS = [
   "Gemini 3.7 Flash (High)",

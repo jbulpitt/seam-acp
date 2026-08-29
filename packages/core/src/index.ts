@@ -35,7 +35,7 @@ import { DispatchWatcher } from "./core/dispatch/watcher.js";
 import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
-import { createOllamaImageInspector } from "./core/vision/ollama-image-inspector.js";
+import { createAgyImageInspector } from "./core/vision/agy-image-inspector.js";
 import { watchChannelPresets } from "./core/config-reload.js";
 import { BridgeHub } from "./core/bridge-hub.js";
 import { ServerStatusCard } from "./core/server-status-card.js";
@@ -555,13 +555,11 @@ async function main(): Promise<void> {
   // enqueue dispatch specs / read threads — the DispatchWatcher + report-back
   // do the rest.
   if (config.SEAM_MCP_ENABLED) {
-    const ollamaImageInspector =
-      config.OLLAMA_CLOUD_ENABLED && config.OLLAMA_CLOUD_API_KEY
-        ? createOllamaImageInspector({
-            apiKey: config.OLLAMA_CLOUD_API_KEY,
-            model: config.OLLAMA_CLOUD_VISION_MODEL,
-          })
-        : undefined;
+    const agyImageInspector = createAgyImageInspector({
+      model: config.AGY_VISION_MODEL,
+      logger,
+      ...(config.AGY_CLI_PATH ? { cliPath: config.AGY_CLI_PATH } : {}),
+    });
     seamMcpServer = new SeamMcpServer({
       logger,
       resolveSession: (token) => {
@@ -575,21 +573,17 @@ async function main(): Promise<void> {
         const quota = quotaRegistry.get(agentId);
         return quota ? [quota] : [];
       },
-      ...(ollamaImageInspector
-        ? {
-            inspectImage: (record, req) => {
-              const effective = router.describeConfig(record);
-              const effectiveProfile = router.getProfile(effective.agent.value);
-              const visionMode = effectiveProfile?.staticModels?.find(
-                (entry) => entry.modelId === effective.model.value
-              )?.visionMode;
-              if (effective.agent.value !== "ollama-cloud" || visionMode !== "tool") {
-                throw new Error("inspect_image is only available to Ollama Cloud sessions");
-              }
-              return ollamaImageInspector({ ...req, ownerId: record.id });
-            },
-          }
-        : {}),
+      inspectImage: (record, req) => {
+        const effective = router.describeConfig(record);
+        const effectiveProfile = router.getProfile(effective.agent.value);
+        const visionMode = effectiveProfile?.staticModels?.find(
+          (entry) => entry.modelId === effective.model.value
+        )?.visionMode;
+        if (effective.agent.value !== "ollama-cloud" || visionMode !== "tool") {
+          throw new Error("inspect_image is only available to tool-vision sessions");
+        }
+        return agyImageInspector({ ...req, ownerId: record.id });
+      },
       // Agent-scheduled wake events (#59): arm/cancel a one-shot self-resumption
       // for the calling thread. The orchestrator owns the loop-safety guards and
       // the DB row; the WakeManager sweeper fires it via the dispatch queue.

@@ -66,7 +66,7 @@ export function createOllamaImageInspector(
       throw new Error(`question exceeds ${MAX_QUESTION_CHARS} characters`);
     }
 
-    const image = await readSafeStagedImage(req.path, stagingRoot, req.ownerId);
+    const image = await readAuthorizedStagedImage(req.path, stagingRoot, req.ownerId);
     const response = await fetchFn(endpoint, {
       method: "POST",
       headers: {
@@ -139,7 +139,7 @@ export async function authorizeStagedImage(
   });
 }
 
-async function readSafeStagedImage(
+export async function readAuthorizedStagedImage(
   candidate: string,
   stagingRoot: string,
   ownerId: string

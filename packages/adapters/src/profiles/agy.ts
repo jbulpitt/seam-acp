@@ -311,6 +311,15 @@ export function makeAgyProfile(opts: {
   staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
   threadAbbr?: string;
   printTimeoutSeconds?: number;
+  /** Run terminal tools inside agy's sandbox. Intended for tightly scoped
+   *  one-shot helpers that consume untrusted content. */
+  sandbox?: boolean;
+  /** Expose Seam's shared attachment staging root. Defaults true for normal
+   *  chat sessions; isolated helpers should copy inputs into their own cwd. */
+  exposeGlobalStaging?: boolean;
+  /** Persist model picks into agy's process-global settings file. Defaults
+   *  true for normal interactive sessions; isolated helpers must disable it. */
+  persistModelSelection?: boolean;
 } = {}): AgentProfile {
   const cli = opts.cliPath?.trim() || resolveAgyBinary();
   const defaultModel = opts.defaultModel ?? "antigravity";
@@ -348,7 +357,12 @@ export function makeAgyProfile(opts: {
         mappingFile,
         defaultModel,
         opts.printTimeoutSeconds,
-        opts.mcpServers ?? []
+        opts.mcpServers ?? [],
+        {
+          sandbox: opts.sandbox ?? false,
+          exposeGlobalStaging: opts.exposeGlobalStaging ?? true,
+          persistModelSelection: opts.persistModelSelection ?? true,
+        }
       );
     },
     sessionManager: {
@@ -647,7 +661,8 @@ function makeFakeAgyProcess(
   mappingFile: string,
   defaultModel: string,
   printTimeoutSeconds?: number,
-  mcpServers: McpServer[] = []
+  mcpServers: McpServer[] = [],
+  execution: AgyExecutionPolicy = DEFAULT_AGY_EXECUTION_POLICY
 ): FakeProc {
   const fakeStdin = new PassThrough(); // client writes here; we read from it
   const fakeStdout = new PassThrough(); // we write here; client reads from it
@@ -660,7 +675,8 @@ function makeFakeAgyProcess(
     mappingFile,
     defaultModel,
     printTimeoutSeconds,
-    mcpServers
+    mcpServers,
+    execution
   );
 
   const stream = ndJsonStream(
@@ -723,6 +739,32 @@ interface ActiveRun {
   userCancelled?: boolean;
 }
 
+export interface AgyExecutionPolicy {
+  sandbox: boolean;
+  exposeGlobalStaging: boolean;
+  persistModelSelection: boolean;
+}
+
+const DEFAULT_AGY_EXECUTION_POLICY: AgyExecutionPolicy = {
+  sandbox: false,
+  exposeGlobalStaging: true,
+  persistModelSelection: true,
+};
+
+/** Pure argv fragment so isolation policy remains directly regression-testable. */
+export function agyExecutionPolicyArgs(
+  cwd: string,
+  policy: AgyExecutionPolicy
+): string[] {
+  return [
+    ...(policy.sandbox ? ["--sandbox"] : []),
+    "--dangerously-skip-permissions",
+    "--add-dir",
+    cwd,
+    ...(policy.exposeGlobalStaging ? ["--add-dir", STAGING_ROOT] : []),
+  ];
+}
+
 class AgyAgent implements Agent {
   private conn?: AgentSideConnection;
   private readonly sessions = new Map<string, AgySession>();
@@ -734,6 +776,7 @@ class AgyAgent implements Agent {
     private readonly defaultModel: string,
     private readonly printTimeoutSeconds?: number,
     private readonly defaultMcpServers: McpServer[] = [],
+    private readonly execution: AgyExecutionPolicy = DEFAULT_AGY_EXECUTION_POLICY,
   ) {}
 
   bind(conn: AgentSideConnection): void {
@@ -820,7 +863,7 @@ class AgyAgent implements Agent {
     // at every CLI invocation. Since we spawn a fresh `agy -p` per prompt,
     // editing that file takes effect on the next turn.
     const entry = catalog.find((e) => e.modelId === modelId);
-    if (entry) {
+    if (entry && this.execution.persistModelSelection) {
       try {
         let json: Record<string, unknown> = {};
         try {
@@ -904,16 +947,10 @@ class AgyAgent implements Agent {
       agyLogPath,
       "--print-timeout",
       `${this.printTimeoutSeconds ?? 600}s`,
-      "--dangerously-skip-permissions",
-      // agy ignores the process cwd for its "workspace" — that's controlled
-      // separately via --add-dir. Without this, file tools default to $HOME
-      // and report "no active workspace set".
-      "--add-dir",
-      sess.cwd,
-      // Also expose the attachment staging dir so agy can read files we staged
-      // there (PDFs/binaries we reference by path in the prompt text).
-      "--add-dir",
-      STAGING_ROOT,
+      // agy ignores the process cwd for its "workspace" — execution policy
+      // supplies --add-dir and optionally the shared staging root. Sandboxed
+      // one-shot helpers deliberately expose only their private cwd.
+      ...agyExecutionPolicyArgs(sess.cwd, this.execution),
     ];
     if (sess.cascadeId) {
       args.push("--conversation", sess.cascadeId);

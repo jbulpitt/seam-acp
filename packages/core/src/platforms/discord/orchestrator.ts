@@ -16419,11 +16419,13 @@ export class Orchestrator {
       ? this.router.getProfile(preset.agentId)?.threadAbbr
       : undefined;
 
+    // Discord requires an initial acknowledgement within three seconds. Auto-
+    // naming may need to inspect many sibling threads, so acknowledge before
+    // that I/O instead of letting large projects intermittently expire here.
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+
     if (quantity > 1 && !slug) {
-      await i.reply({
-        content: "Multiple threads need a preset slug.",
-        flags: MessageFlags.Ephemeral,
-      });
+      await i.editReply("Multiple threads need a preset slug.");
       return;
     }
 
@@ -16440,24 +16442,18 @@ export class Orchestrator {
         plannedNames.push(threadName);
       }
       if (plannedNames.length === 0) {
-        await i.reply({
-          content:
-            quantity === 1
-              ? `Couldn't create the thread — ${THREAD_LIMIT_MESSAGE}`
-              : `Created 0 of ${quantity} — the limit (9) for this kind of thread was reached.`,
-          flags: MessageFlags.Ephemeral,
-        });
+        await i.editReply(
+          quantity === 1
+            ? `Couldn't create the thread — ${THREAD_LIMIT_MESSAGE}`
+            : `Created 0 of ${quantity} — the limit (9) for this kind of thread was reached.`
+        );
         return;
       }
     } else {
-      await i.reply({
-        content: "Give the new thread a name.",
-        flags: MessageFlags.Ephemeral,
-      });
+      await i.editReply("Give the new thread a name.");
       return;
     }
 
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
     const created: ChannelRef[] = [];
     let lastSummary = "";
     try {

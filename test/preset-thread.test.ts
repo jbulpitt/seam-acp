@@ -144,6 +144,7 @@ function makeOrch(over?: {
   channelPresets?: Map<string, { locked?: boolean; threadSlug?: { value: string } }>;
   threadPresets?: Map<string, { threadSlug?: { value: string } }>;
   threadNames?: Map<string, string>;
+  getThreadName?: (ch: ChannelRef) => Promise<string | undefined>;
   addThreadMember?: (ch: ChannelRef, userId: string) => Promise<void>;
 }) {
   const created: Array<{ parent: ChannelRef; name: string }> = [];
@@ -223,7 +224,7 @@ function makeOrch(over?: {
     } as any,
     adapter: {
       createThread,
-      getThreadName: async (ch: ChannelRef) => threadNames.get(ch.id),
+      getThreadName: over?.getThreadName ?? (async (ch: ChannelRef) => threadNames.get(ch.id)),
       renameThread: async (ch: ChannelRef, name: string) => {
         renamed.push({ id: ch.id, name });
         threadNames.set(ch.id, name);
@@ -571,29 +572,49 @@ describe("/seam preset thread auto-name from slug", () => {
       seedNamedSibling(`sib-${n}`, `🌌 hist ${formatKeycap(n)}`, names);
     }
     const { orch, created } = makeOrch({ threadNames: names });
-    const { i, replies } = slashI({
+    const { i, edits } = slashI({
       group: "preset",
       sub: "thread",
       strings: { preset: "reviewer" },
     });
     await (orch as any).cmdPresetThread(i);
     expect(created).toHaveLength(0);
-    expect(replies[0]?.flags).toBe(MessageFlags.Ephemeral);
-    expect(replies[0]?.content).toContain(THREAD_LIMIT_MESSAGE);
+    expect(edits[0]).toContain(THREAD_LIMIT_MESSAGE);
   });
 
   it("omit name with no slug configured → require a name, no create", async () => {
     store.upsertPreset(preset({ name: "reviewer", agentId: "grok" }));
     const { orch, created } = makeOrch();
-    const { i, replies } = slashI({
+    const { i, edits } = slashI({
       group: "preset",
       sub: "thread",
       strings: { preset: "reviewer" },
     });
     await (orch as any).cmdPresetThread(i);
     expect(created).toHaveLength(0);
-    expect(replies[0]?.flags).toBe(MessageFlags.Ephemeral);
-    expect(replies[0]?.content).toMatch(/Give the new thread a name/i);
+    expect(edits[0]).toMatch(/Give the new thread a name/i);
+  });
+
+  it("acknowledges Discord before a slow sibling-name scan", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok", threadSlug: "hist" }));
+    store.upsert(sessionRow({ id: "slow-sibling" }));
+    let releaseLookup!: (name: string | undefined) => void;
+    const lookup = new Promise<string | undefined>((resolve) => {
+      releaseLookup = resolve;
+    });
+    const getThreadName = vi.fn(async () => lookup);
+    const { orch } = makeOrch({ getThreadName });
+    const { i } = slashI({
+      group: "preset",
+      sub: "thread",
+      strings: { preset: "reviewer" },
+    });
+
+    const run = (orch as any).cmdPresetThread(i);
+    await vi.waitFor(() => expect(getThreadName).toHaveBeenCalledOnce());
+    expect(i.deferReply).toHaveBeenCalledOnce();
+    releaseLookup(undefined);
+    await run;
   });
 
   it("channel-preset slug is used when the DB preset has none", async () => {
@@ -752,7 +773,7 @@ describe("/seam preset thread quantity", () => {
   it("quantity > 1 with no slug refuses before creating", async () => {
     store.upsertPreset(preset({ name: "reviewer", agentId: "grok" }));
     const { orch, created } = makeOrch();
-    const { i, replies } = slashI({
+    const { i, edits } = slashI({
       group: "preset",
       sub: "thread",
       strings: { preset: "reviewer", name: "ignored" },
@@ -760,8 +781,7 @@ describe("/seam preset thread quantity", () => {
     });
     await (orch as any).cmdPresetThread(i);
     expect(created).toHaveLength(0);
-    expect(replies[0]?.flags).toBe(MessageFlags.Ephemeral);
-    expect(replies[0]?.content).toMatch(/multiple threads need a preset slug/i);
+    expect(edits[0]).toMatch(/multiple threads need a preset slug/i);
   });
 
   it("quantity 9 with an empty channel fills 1–9 and never a 10th", async () => {

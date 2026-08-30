@@ -1050,6 +1050,40 @@ describe("VoiceConsoleSpeechScheduler state changes", () => {
 });
 
 describe("VoiceConsoleSpeechScheduler failures, drains, and cleanup", () => {
+  it("still speaks the final flushed sentence after a middle synthesis failure", async () => {
+    const attempted: string[] = [];
+    const played: string[] = [];
+    const { scheduler, failures } = setup({
+      synthesize: vi.fn(async ({ chunk: item }) => {
+        attempted.push(item.text);
+        return item.ordinal === 2
+          ? { ok: false as const, error: "transient provider response" }
+          : { ok: true as const, audio: audio(item.ordinal) };
+      }),
+      playback: {
+        play: vi.fn(async ({ chunk: item }) => {
+          played.push(item.text);
+          return { status: "played" as const, durationMs: 1_000 };
+        }),
+        destroy: vi.fn(),
+      },
+    });
+    const a = source("A", "turn-with-final-tail");
+    scheduler.registerSource(a);
+    scheduler.feedSourceText(
+      a,
+      "Opening sentence. This middle sentence is deliberately long enough to become a separate speech chunk and fail. Final bullet stays buffered"
+    );
+
+    await expect(scheduler.finishSource(a)).resolves.toMatchObject({
+      failed: 1,
+      played: 2,
+    });
+    expect(attempted.at(-1)).toBe("Final bullet stays buffered");
+    expect(played.at(-1)).toBe("Final bullet stays buffered");
+    expect(failures).toHaveLength(1);
+  });
+
   it("warns once per source turn, continues after synthesis/playback failures, and cannot stall", async () => {
     const failures: unknown[] = [];
     const played: string[] = [];

@@ -82,6 +82,7 @@ export function isTtsStyle(v: string): v is TtsStyle {
 }
 
 export function buildTtsInput(text: string, pace: TtsPace = "natural", style: TtsStyle = "neutral"): string {
+  const transcript = sanitizeTtsTranscript(text);
   const paceNote =
     pace === "slow"
       ? "Speak slowly and clearly, with unhurried pacing. Do not rush."
@@ -109,8 +110,28 @@ export function buildTtsInput(text: string, pace: TtsPace = "natural", style: Tt
     `"about 1.2 million" or "about 3.14"). ` +
     `Slash commands: say the words without the leading slash (e.g. "seam config tts").\n` +
     `Speak this Discord reply clearly. Read only the following transcript, no commentary.\n\n` +
-    `TRANSCRIPT:\n${text}`
+    `TRANSCRIPT:\n${transcript}`
   );
+}
+
+/**
+ * Remove terminal/control framing that can survive an agent stream while
+ * remaining invisible in Discord. The visible Markdown pass happens earlier;
+ * this is the final provider-boundary guard for split escape sequences and
+ * Unicode direction/zero-width controls.
+ */
+export function sanitizeTtsTranscript(text: string): string {
+  return text
+    // OSC (terminal title/link) and CSI (colour/cursor) escape sequences.
+    .replace(/\u001B\](?:[^\u0007\u001B]|\u001B(?!\\))*(?:\u0007|\u001B\\)/g, "")
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "")
+    // Preserve ordinary whitespace, but never send other C0/C1 controls.
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, " ")
+    // Invisible formatting can alter how adjacent text is interpreted.
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, "")
+    .replace(/\r\n?/g, "\n")
+    .normalize("NFC")
+    .trim();
 }
 
 export type TtsPcm = {
@@ -797,7 +818,10 @@ export function isRetryableTtsFailure(status: number, error: string): boolean {
   // Observed from Gemini 3.1 Flash TTS on an otherwise valid request; replaying
   // the exact payload succeeds. Keep this deliberately narrow so detailed 400s
   // and policy/validation failures remain fail-fast.
-  return status === 400 && /^Request contains an invalid argument\.?$/i.test(error.trim());
+  if (status !== 400) return false;
+  const detail = error.trim();
+  return /^Request contains an invalid argument\.?$/i.test(detail) ||
+    detail === "TTS HTTP 400: non-JSON body";
 }
 
 async function ttsRetryDelay(

@@ -5,6 +5,7 @@ import {
   findGeminiTtsVoice,
   geminiTtsVoiceChoices,
   GEMINI_TTS_VOICES,
+  sanitizeTtsTranscript,
   streamSpeechWithGemini,
   synthesizeSpeechWithGemini,
 } from "../packages/core/src/core/audio/gemini-tts.js";
@@ -94,6 +95,16 @@ describe("Gemini TTS voices", () => {
     expect(input).toMatch(/about 1\.2 million/i);
     expect(input).toMatch(/about 3\.14/i);
     expect(input).toMatch(/without the leading slash/i);
+  });
+
+  it("removes invisible terminal and Unicode controls at the provider boundary", () => {
+    const dirty =
+      "\u001b[31mVisible\u001b[0m\u0000 text\u200b stays\n" +
+      "\u001b]8;;https://example.com\u0007linked\u001b]8;;\u0007";
+    expect(sanitizeTtsTranscript(dirty)).toBe("Visible  text stays\nlinked");
+    const input = buildTtsInput(dirty);
+    expect(input).toContain("TRANSCRIPT:\nVisible  text stays\nlinked");
+    expect(input).not.toMatch(/[\u0000\u001b\u200b]/);
   });
 
   it("caches voice samples under DATA_DIR", () => {
@@ -340,6 +351,30 @@ describe("synthesizeSpeechWithGemini", () => {
 });
 
 describe("streamSpeechWithGemini", () => {
+  it("retries a gateway-style non-JSON HTTP 400 before any audio is accepted", async () => {
+    let attempts = 0;
+    const accepted: Buffer[] = [];
+    const result = await streamSpeechWithGemini({
+      apiKey: "test-key",
+      text: "Retry the transient edge response",
+      retryDelayMs: 0,
+      unaryFallback: false,
+      fetchFn: ttsFetch(async () => {
+        attempts += 1;
+        if (attempts === 1) return new Response("upstream edge rejected request", { status: 400 });
+        return new Response(Buffer.concat([
+          Buffer.from(audioDelta([1, 2])),
+          Buffer.from(completedEvent()),
+          Buffer.from(doneEvent()),
+        ]));
+      }),
+      onAudioDelta: async (audio) => accepted.push(Buffer.from(audio.pcm)),
+    });
+    expect(result).toEqual({ ok: true, streamed: true, audioDeltas: 1 });
+    expect(attempts).toBe(2);
+    expect(accepted).toEqual([Buffer.from([1, 2])]);
+  });
+
   it("parses one-byte CRLF SSE with comments, multiline data, unknown events, completion, and [DONE]", async () => {
     const pcm = Buffer.from([1, 2, 3, 4]);
     const raw = [

@@ -7,6 +7,7 @@ import { defaultSessionConfig, resolvePermissionMode } from "./types.js";
 import { makeSessionId } from "./session-store.js";
 import { resolveChannelPreset, resolveThreadLocation } from "../config.js";
 import type { ChannelPreset, ThreadPreset } from "../config.js";
+import { buildProjectMcpServers } from "../mcp.js";
 
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
 import type {
@@ -747,7 +748,7 @@ export class SessionRouter {
       );
     }
 
-    const { mcpServers, remote } = planSeamMcpInjection({
+    const { mcpServers: injectedMcpServers, remote } = planSeamMcpInjection({
       sessionId: record.id,
       globalMcpServers: this.mcpServers,
       seamMcp: this.seamMcp,
@@ -756,6 +757,18 @@ export class SessionRouter {
       // send a header the new process no longer knows.
       reuseToken: true,
     });
+    // Bridge the session cwd's project .mcp.json into the per-session list so
+    // non-claude agents (codex/grok/agy/copilot) see the same project MCP
+    // servers claude-agent-acp auto-reads from cwd. Scoped to cwd, so a server
+    // in one repo's .mcp.json never leaks to another.
+    const mcpServers = [
+      ...injectedMcpServers,
+      ...buildProjectMcpServers(
+        cwd,
+        this.logger,
+        new Set(injectedMcpServers.map((s) => s.name))
+      ),
+    ];
 
     let spawnChild: RuntimeSpawnPlan["spawnChild"] = (modelOverride, effortOverride) =>
       profile.spawn(modelOverride, effortOverride, mcpServers);

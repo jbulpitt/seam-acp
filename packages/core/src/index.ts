@@ -12,6 +12,7 @@ import { makeClaudeProfile } from "@seam/adapters";
 import { makeAgyProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
 import { makeOpencodeProfile, fetchLmStudioModels, syncOpencodeLmStudioConfig } from "@seam/adapters";
 import { makeCodexProfile } from "@seam/adapters";
+import { buildOllamaCodexCatalog } from "./agents/ollama-codex-catalog.js";
 import { makeGrokProfile, fetchXaiModels } from "@seam/adapters";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
@@ -274,10 +275,24 @@ async function main(): Promise<void> {
   const ollamaCloudCodexHome = path.join(process.env.HOME ?? "", ".codex-ollama-cloud");
   if (config.OLLAMA_CLOUD_ENABLED && config.OLLAMA_CLOUD_API_KEY) {
     fs.mkdirSync(ollamaCloudCodexHome, { recursive: true });
+    // Per-model catalog (context windows + system prompt) for the curated model
+    // list, so codex uses each model's real context window instead of falling
+    // back to capped unknown-model metadata. See ollama-codex-catalog.ts.
+    const ollamaCatalogPath = path.join(ollamaCloudCodexHome, "models.json");
+    fs.writeFileSync(
+      ollamaCatalogPath,
+      JSON.stringify(
+        buildOllamaCodexCatalog(config.OLLAMA_CLOUD_MODELS ?? OLLAMA_CLOUD_STATIC_MODELS),
+        null,
+        2,
+      ),
+      "utf8",
+    );
     fs.writeFileSync(
       path.join(ollamaCloudCodexHome, "config.toml"),
       [
         'model_provider = "ollama-cloud"',
+        `model_catalog_json = ${JSON.stringify(ollamaCatalogPath)}`,
         "",
         "[model_providers.ollama-cloud]",
         'name = "Ollama Cloud"',

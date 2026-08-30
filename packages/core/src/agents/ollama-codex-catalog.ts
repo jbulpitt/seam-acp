@@ -71,7 +71,10 @@ export function buildOllamaCodexCatalog(
         auto_compact_token_limit: null,
         comp_hash: "3000",
         reasoning_summary_format: "experimental",
-        default_reasoning_summary: "none",
+        // "auto" (not "none") so codex surfaces the model's reasoning to the
+        // status card; "none" (from DeepSeek's example) suppressed the thinking
+        // these open-weight models stream.
+        default_reasoning_summary: "auto",
         display_name: m.name,
         description: `${m.name} on Ollama Cloud`,
         default_reasoning_level: "high",

@@ -50,6 +50,32 @@ type ActivePlayback = {
 const STREAM_HIGH_WATER_MS = 2_000;
 const STREAM_LOW_WATER_MS = 1_000;
 const STREAM_ENQUEUE_SLICE_MS = 200;
+const TURN_END_TONE_SAMPLE_RATE = 24_000;
+const TURN_END_TONE_DURATION_MS = 180;
+// A pure tone is perceived more strongly than speech at the same peak. Eight
+// percent full-scale keeps this marker around half the subjective speech level.
+const TURN_END_TONE_GAIN = 0.08;
+
+/** Short, soft descending chime generated locally; no TTS request is involved. */
+export function createTurnEndIndicatorPcm(): TtsPcm {
+  const samples = Math.round(TURN_END_TONE_SAMPLE_RATE * TURN_END_TONE_DURATION_MS / 1_000);
+  const pcm = new Uint8Array(samples * 2);
+  const view = new DataView(pcm.buffer);
+  const fadeSamples = Math.round(TURN_END_TONE_SAMPLE_RATE * 0.02);
+  const split = Math.round(samples * 0.48);
+  for (let index = 0; index < samples; index++) {
+    const frequency = index < split ? 880 : 660;
+    const fadeIn = Math.min(1, index / fadeSamples);
+    const fadeOut = Math.min(1, (samples - 1 - index) / fadeSamples);
+    const envelope = Math.max(0, Math.min(fadeIn, fadeOut));
+    const sample = Math.round(
+      32_767 * TURN_END_TONE_GAIN * envelope *
+      Math.sin((2 * Math.PI * frequency * index) / TURN_END_TONE_SAMPLE_RATE)
+    );
+    view.setInt16(index * 2, sample, true);
+  }
+  return { pcm, sampleRate: TURN_END_TONE_SAMPLE_RATE, channels: 1 };
+}
 
 /**
  * Source-aware facade over one reusable Discord PCM/Opus player.
@@ -116,6 +142,12 @@ export class DiscordVoiceConsolePlayback implements VoiceConsoleSpeechPlayback {
       request.signal.removeEventListener("abort", onAbort);
       if (this.active === active) this.active = undefined;
     }
+  }
+
+  playEndIndicator(
+    request: Omit<VoiceConsolePlaybackRequest, "audio">
+  ): Promise<VoiceConsolePlaybackResult> {
+    return this.play({ ...request, audio: createTurnEndIndicatorPcm() });
   }
 
   beginStream(

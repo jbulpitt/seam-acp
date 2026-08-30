@@ -382,6 +382,7 @@ describe("ThreadVoicePlaybackQueue", () => {
       const oldState = player.state;
       player.state = { status: AudioPlayerStatus.Playing };
       player.emit("stateChange", oldState, player.state);
+      (resource as EventEmitter & { resume?: () => void }).resume?.();
       resource.once("finish", () => {
         const playing = player.state;
         player.state = { status: AudioPlayerStatus.Idle };
@@ -407,6 +408,12 @@ describe("ThreadVoicePlaybackQueue", () => {
     });
 
     queue.beginStreaming();
+    const prebuffer = Buffer.alloc(960 * 24);
+    prebuffer.writeInt16LE(111, 0);
+    queue.enqueue({ pcm: prebuffer, sampleRate: 24_000, channels: 1 });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(player.play).not.toHaveBeenCalled();
+
     const first = Buffer.alloc(960);
     first.writeInt16LE(111, 0);
     queue.enqueue({ pcm: first, sampleRate: 24_000, channels: 1 });
@@ -429,15 +436,18 @@ describe("ThreadVoicePlaybackQueue", () => {
     const capacity = queue.waitForBufferedAudioBelow(0).then(() => { belowCapacity = true; });
     await vi.advanceTimersByTimeAsync(20);
     expect(belowCapacity).toBe(false);
-    await vi.advanceTimersByTimeAsync(60);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(belowCapacity).toBe(true);
     await capacity;
-    expect(encodedSamples).toEqual([111, 222, 333, 444]);
-    expect(queue.consumedAudioMs()).toBe(80);
+    expect(encodedSamples).toHaveLength(28);
+    expect(encodedSamples.slice(-3)).toEqual([222, 333, 444]);
+    expect(queue.consumedAudioMs()).toBe(560);
     expect(player.play).toHaveBeenCalledTimes(1);
 
     queue.endStreaming();
     const idle = queue.waitForIdle();
     await vi.advanceTimersByTimeAsync(30);
+    expect(player.state.status).toBe(AudioPlayerStatus.Idle);
     await idle;
     expect(player.state.status).toBe(AudioPlayerStatus.Idle);
     queue.destroy();

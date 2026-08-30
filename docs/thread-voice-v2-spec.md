@@ -777,11 +777,16 @@ The segmenter emits ordered source chunks:
   documented 24 kHz mono PCM stream. Audio-delta metadata is optional; when
   present it must remain consistent with that contract and prior deltas. Reject
   URI-backed, compressed, incomplete, or conflicting audio before playback.
-- Begin playback when the first validated 24 kHz mono L16 delta arrives; do not
-  wait for interaction completion or response EOF.
+- Deterministically replace long identifiers, hashes, UUIDs, large integers,
+  version-like numeric runs, and long decimals before provider submission.
+  Preserve only simple numbers. Director notes must forbid reconstruction,
+  rounding, substitution, or invention of removed values.
+- Begin playback after 500 ms of validated 24 kHz mono L16 audio is buffered,
+  or at provider completion for a shorter response. Do not wait for response
+  EOF once that reserve exists.
 - Keep the Discord producer open between network deltas, preserve partial PCM
-  samples/Opus frames, and apply bounded audio buffering with producer
-  backpressure.
+  samples/Opus frames, write a 500 ms packet reserve ahead of Discord's 20 ms
+  playback clock, and apply bounded audio buffering with producer backpressure.
 - Never retry a synthesis request after any audio delta has been accepted by
   playback. Unary synthesis is permitted only after a clean streaming response
   completed with no accepted audio, so fallback cannot duplicate speech.
@@ -831,6 +836,11 @@ binding. It does not change input state.
 ACP completion does not settle a binding's voice turn until all chunks that
 were accepted while output was enabled have played, failed, or been explicitly
 dropped by a toggle/cancel.
+
+After the last accepted chunk settles, play one locally generated, non-verbal
+end marker before resolving the source drain. It is a short soft tone at roughly
+half speech loudness, does not invoke TTS, does not count as a fairness chunk,
+and is suppressed on output-off or source cancellation.
 
 The same drain boundary applies to generic dispatch and handoff/report-back
 speech. Pending microphone input for that binding cannot release merely because

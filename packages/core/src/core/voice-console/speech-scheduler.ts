@@ -44,12 +44,14 @@ type SourceState = {
   lastOrdinal: number;
   finished: boolean;
   cancelled: boolean;
+  endIndicatorPending: boolean;
   warned: boolean;
   stats: VoiceConsoleSpeechStats;
   drainWaiters: Array<(stats: VoiceConsoleSpeechStats) => void>;
 };
 
 type CurrentWork = {
+  kind: "speech" | "end-indicator";
   sourceKey: string;
   chunk: VoiceConsoleSpeechChunk;
   controller: AbortController;
@@ -266,6 +268,7 @@ export class VoiceConsoleSpeechScheduler {
       lastOrdinal: 0,
       finished: false,
       cancelled: false,
+      endIndicatorPending: false,
       warned: false,
       stats: emptyStats(),
       drainWaiters: [],
@@ -312,6 +315,8 @@ export class VoiceConsoleSpeechScheduler {
         }
       }
       source.finished = true;
+      source.endIndicatorPending =
+        binding.outputEnabled && source.stats.accepted > 0;
       this.cleanupSourceIfDrained(voiceConsoleSpeechSourceKey(ref));
       this.notifyBindingDrain(ref.bindingId);
       this.kick();
@@ -325,6 +330,7 @@ export class VoiceConsoleSpeechScheduler {
     if (!source || source.cancelled) return;
     source.cancelled = true;
     source.finished = true;
+    source.endIndicatorPending = false;
     source.segmenter = new StreamingSpeechSegmenter();
     this.dropPending(source);
     if (this.currentWork?.sourceKey === key) this.currentWork.controller.abort();
@@ -535,8 +541,36 @@ export class VoiceConsoleSpeechScheduler {
       if (!selected) return;
       const [sourceKey, source] = selected;
       const chunk = source.pending.shift();
-      if (!chunk) continue;
+      if (!chunk) {
+        if (!source.endIndicatorPending) continue;
+        const binding = this.bindings.get(source.ref.bindingId);
+        source.endIndicatorPending = false;
+        if (!binding) continue;
+        const work: CurrentWork = {
+          kind: "end-indicator",
+          sourceKey,
+          chunk: {
+            ...source.ref,
+            ordinal: source.lastOrdinal + 1,
+            text: "",
+            generation: binding.generation,
+          },
+          controller: new AbortController(),
+          phase: "playback",
+          // Indicators never affect chunk settlement or fairness statistics.
+          settled: true,
+        };
+        this.currentWork = work;
+        this.queueStateChange("work-started");
+        await this.processEndIndicator(work);
+        if (this.currentWork === work) this.currentWork = undefined;
+        this.cleanupSourceIfDrained(sourceKey);
+        this.notifyBindingDrain(source.ref.bindingId);
+        this.queueStateChange("work-settled");
+        continue;
+      }
       const work: CurrentWork = {
+        kind: "speech",
         sourceKey,
         chunk,
         controller: new AbortController(),
@@ -668,6 +702,28 @@ export class VoiceConsoleSpeechScheduler {
     }
   }
 
+  private async processEndIndicator(work: CurrentWork): Promise<void> {
+    const source = this.sources.get(work.sourceKey);
+    const binding = this.bindings.get(work.chunk.bindingId);
+    if (
+      !source ||
+      !binding ||
+      !this.playback.playEndIndicator ||
+      !this.isWorkValid(work, source, binding)
+    ) {
+      return;
+    }
+    try {
+      await this.playback.playEndIndicator({
+        chunk: work.chunk,
+        signal: work.controller.signal,
+      });
+    } catch {
+      // The local end marker is advisory. It cannot turn successful text or
+      // speech into a visible failure, or stall another source.
+    }
+  }
+
   private playbackOutcome(
     work: CurrentWork,
     source: SourceState,
@@ -769,10 +825,14 @@ export class VoiceConsoleSpeechScheduler {
     let selectedKey: string;
     if (currentReady) {
       const anotherReady = ready.some((key) => key !== this.sliceSourceKey);
+      const currentSource = this.sources.get(this.sliceSourceKey!);
+      const finishingCurrent = Boolean(
+        currentSource?.endIndicatorPending && currentSource.pending.length === 0
+      );
       const quotaReached =
         this.sliceChunks >= this.maxChunksPerSlice ||
         this.sliceAudioMs >= this.maxAudioMsPerSlice;
-      selectedKey = anotherReady && quotaReached
+      selectedKey = anotherReady && quotaReached && !finishingCurrent
         ? this.nextReadyAfter(this.sliceSourceKey!, ready)
         : this.sliceSourceKey!;
     } else {
@@ -805,7 +865,11 @@ export class VoiceConsoleSpeechScheduler {
 
   private isSourceReady(key: string): boolean {
     const source = this.sources.get(key);
-    if (!source || source.pending.length === 0 || source.cancelled) return false;
+    if (
+      !source ||
+      (source.pending.length === 0 && !source.endIndicatorPending) ||
+      source.cancelled
+    ) return false;
     const binding = this.bindings.get(source.ref.bindingId);
     return Boolean(binding?.outputEnabled);
   }
@@ -825,6 +889,7 @@ export class VoiceConsoleSpeechScheduler {
   }
 
   private dropPending(source: SourceState): void {
+    source.endIndicatorPending = false;
     const binding = this.bindings.get(source.ref.bindingId);
     if (!binding) {
       source.pending = [];
@@ -854,7 +919,8 @@ export class VoiceConsoleSpeechScheduler {
   private isSourceDrained(key: string): boolean {
     const source = this.sources.get(key);
     if (!source || (!source.finished && !source.cancelled)) return false;
-    return source.pending.length === 0 && this.currentWork?.sourceKey !== key;
+    return !source.endIndicatorPending &&
+      source.pending.length === 0 && this.currentWork?.sourceKey !== key;
   }
 
   private isBindingDrained(bindingId: string): boolean {

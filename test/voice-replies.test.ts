@@ -89,11 +89,9 @@ describe("Gemini TTS voices", () => {
     expect(input).toMatch(/name the site or page/i);
     expect(input).toMatch(/do not read the address/i);
     expect(input).toMatch(/Paraphrase highly technical content/i);
-    expect(input).toMatch(/Never read long identifiers, UUIDs, opaque IDs, tokens, or hashes character-by-character/i);
-    expect(input).toMatch(/adding only a short distinguishing prefix/i);
-    expect(input).toMatch(/Simplify large numbers and long decimals/i);
-    expect(input).toMatch(/about 1\.2 million/i);
-    expect(input).toMatch(/about 3\.14/i);
+    expect(input).toMatch(/already been replaced with plain labels/i);
+    expect(input).toMatch(/Never reconstruct, guess, approximate, substitute, or invent/i);
+    expect(input).toMatch(/Only pronounce the simple numbers that remain/i);
     expect(input).toMatch(/without the leading slash/i);
   });
 
@@ -105,6 +103,22 @@ describe("Gemini TTS voices", () => {
     const input = buildTtsInput(dirty);
     expect(input).toContain("TRANSCRIPT:\nVisible  text stays\nlinked");
     expect(input).not.toMatch(/[\u0000\u001b\u200b]/);
+  });
+
+  it("deterministically removes opaque IDs and complex numbers before TTS", () => {
+    const transcript = sanitizeTtsTranscript(
+      "PID 3058646, restart 50. Running commit: 71f4d21. " +
+      "Request ID 330be873-7834-4eb4-aac8-2a894dc6badb. " +
+      "Passed 1,772 tests at 99.12345 percent on 2026-08-30; retry 3 in 24 seconds."
+    );
+    expect(transcript).toBe(
+      "the process ID, restart 50. Running the commit hash. " +
+      "the request identifier. Passed a large number tests at a precise decimal value percent on a date; " +
+      "retry 3 in 24 seconds."
+    );
+    expect(buildTtsInput(transcript)).not.toMatch(
+      /3058646|71f4d21|330be873|1,772|99\.12345|2026/
+    );
   });
 
   it("caches voice samples under DATA_DIR", () => {

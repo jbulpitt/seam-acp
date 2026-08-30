@@ -44,6 +44,10 @@ export type VoiceConsolePlaybackResult =
 
 export interface VoiceConsoleSpeechPlayback {
   play(request: VoiceConsolePlaybackRequest): Promise<VoiceConsolePlaybackResult>;
+  /** Optional local, non-verbal marker played once after a completed source. */
+  playEndIndicator?(
+    request: Omit<VoiceConsolePlaybackRequest, "audio">
+  ): Promise<VoiceConsolePlaybackResult>;
   /** Optional only for compatibility with unary test/legacy playback adapters. */
   beginStream?(request: Omit<VoiceConsolePlaybackRequest, "audio">): VoiceConsolePlaybackStream;
   /** Best-effort current airtime for cancellation races that settle before play(). */

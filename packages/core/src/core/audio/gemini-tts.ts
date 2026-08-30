@@ -102,12 +102,9 @@ export function buildTtsInput(text: string, pace: TtsPace = "natural", style: Tt
     `When the transcript contains a URL, name the site or page in a few words ` +
     `(e.g. "a Google search", "a GitHub link") — do not read the address, path, or query string. ` +
     `Paraphrase highly technical content (long shell commands, flags, file paths) in a few words. ` +
-    `Never read long identifiers, UUIDs, opaque IDs, tokens, or hashes character-by-character; ` +
-    `say what the value represents (for example, "the session ID" or "the commit hash"), ` +
-    `adding only a short distinguishing prefix when it is genuinely useful. ` +
-    `Simplify large numbers and long decimals for natural speech unless exact precision is essential: ` +
-    `round them and use words such as thousand, million, or billion (for example, say ` +
-    `"about 1.2 million" or "about 3.14"). ` +
+    `Opaque identifiers, hashes, and complex numeric values have already been replaced with plain labels. ` +
+    `Read those labels exactly. Never reconstruct, guess, approximate, substitute, or invent an omitted value. ` +
+    `Only pronounce the simple numbers that remain in the transcript, without changing them. ` +
     `Slash commands: say the words without the leading slash (e.g. "seam config tts").\n` +
     `Speak this Discord reply clearly. Read only the following transcript, no commentary.\n\n` +
     `TRANSCRIPT:\n${transcript}`
@@ -121,7 +118,7 @@ export function buildTtsInput(text: string, pace: TtsPace = "natural", style: Tt
  * Unicode direction/zero-width controls.
  */
 export function sanitizeTtsTranscript(text: string): string {
-  return text
+  const controlsRemoved = text
     // OSC (terminal title/link) and CSI (colour/cursor) escape sequences.
     .replace(/\u001B\](?:[^\u0007\u001B]|\u001B(?!\\))*(?:\u0007|\u001B\\)/g, "")
     .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "")
@@ -130,8 +127,36 @@ export function sanitizeTtsTranscript(text: string): string {
     // Invisible formatting can alter how adjacent text is interpreted.
     .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, "")
     .replace(/\r\n?/g, "\n")
-    .normalize("NFC")
-    .trim();
+    .normalize("NFC");
+
+  return simplifyOpaqueSpeechValues(controlsRemoved).trim();
+}
+
+/**
+ * Remove values that generative speech can mispronounce or silently mutate.
+ * The replacement is deterministic and happens before the provider sees the
+ * transcript, so director notes never have to ask the model to interpret raw
+ * hashes, IDs, or complex numbers.
+ */
+export function simplifyOpaqueSpeechValues(text: string): string {
+  return text
+    // Contextual labels preserve what the value represents without exposing it.
+    .replace(/\b(?:PID|process\s+ID)\s*(?:[:=#]\s*)?[A-Za-z0-9][A-Za-z0-9_-]{5,}\b/gi, "the process ID")
+    .replace(/\b(?:commit(?:\s+hash)?|revision)\s*(?:[:=#]\s*)?[0-9a-f]{7,64}\b/gi, "the commit hash")
+    .replace(/\b(session|turn|binding|console|request|trace|dispatch|job)\s+(?:ID|identifier)\s*(?:[:=#]\s*)?[A-Za-z0-9][A-Za-z0-9_-]{5,}\b/gi, (_match, kind: string) => `the ${kind.toLowerCase()} identifier`)
+    // UUIDs and mixed opaque tokens without a useful nearby label.
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, "an identifier")
+    .replace(/\b(?=[A-Za-z0-9_-]{12,}\b)(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9][A-Za-z0-9_-]*\b/g, "an identifier")
+    .replace(/\b(?=[0-9a-f]{7,64}\b)(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]+\b/gi, "a hash")
+    // Keep only simple numeric forms. Complex values become semantic labels;
+    // the TTS model is never invited to round or invent an approximation.
+    .replace(/\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b/g, "a date")
+    .replace(/\b\d{2,}(?:[-/:]\d{2,})+\b/g, "a numeric value")
+    .replace(/\bv?\d+(?:\.\d+){2,}\b/gi, "a version number")
+    .replace(/\b\d+(?:\.\d+)?[eE][+-]?\d+\b/g, "a scientific value")
+    .replace(/\b\d+\.\d{3,}\b/g, "a precise decimal value")
+    .replace(/\b\d{1,3}(?:,\d{3})+\b/g, "a large number")
+    .replace(/\b\d{4,}\b/g, "a large number");
 }
 
 export type TtsPcm = {

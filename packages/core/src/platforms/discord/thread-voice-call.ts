@@ -661,6 +661,12 @@ const DEFAULT_PLAYBACK_DEPENDENCIES: PlaybackDependencies = {
 // Discord's default (5 missed 20ms frames) tears a resource down after ~100ms;
 // 10,000 frames keeps the one persistent resource alive beyond that deadline.
 const STREAMING_MAX_MISSED_FRAMES = 10_000;
+// Buffer half a second before opening a streamed Discord resource. Provider
+// deltas arrive in bursts and Discord consumes one Opus packet every 20 ms;
+// keeping this reserve prevents ordinary network/timer jitter from becoming
+// audible silence while preserving sub-second first-audio latency.
+const STREAMING_PREBUFFER_MS = 500;
+const STREAMING_PREBUFFER_FRAMES = STREAMING_PREBUFFER_MS / OPUS_FRAME_MS;
 
 /** Ordered 24 kHz mono PCM -> Discord Opus queue with a reusable player. */
 export class ThreadVoicePlaybackQueue {
@@ -676,6 +682,7 @@ export class ThreadVoicePlaybackQueue {
   private pcmTail = Buffer.alloc(0);
   private stream: PassThrough | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private streamBufferedFrames = 0;
   private cycleActive = false;
   private endingStream = false;
   private streamingProducerOpen = false;
@@ -750,7 +757,7 @@ export class ThreadVoicePlaybackQueue {
     this.streamingProducerOpen = false;
     this.flushPcmTail();
     this.pump();
-    if (this.cycleActive && !this.timer) this.writeNextPacket();
+    if (this.cycleActive && !this.timer) this.schedulePlaybackTick();
     if (this.isIdle()) {
       this.onPlaybackIdle?.();
       this.resolveIdleWaiters();
@@ -759,7 +766,7 @@ export class ThreadVoicePlaybackQueue {
   }
 
   bufferedAudioMs(): number {
-    return this.packets.length * OPUS_FRAME_MS +
+    return (this.packets.length + this.streamBufferedFrames) * OPUS_FRAME_MS +
       (this.pcmTail.byteLength / (24_000 * 2)) * 1_000;
   }
 
@@ -803,6 +810,7 @@ export class ThreadVoicePlaybackQueue {
     }
     try { this.stream?.destroy(); } catch { /* already closed */ }
     this.stream = undefined;
+    this.streamBufferedFrames = 0;
     this.cycleActive = false;
     this.endingStream = false;
     this.lastPlaybackError = undefined;
@@ -827,6 +835,7 @@ export class ThreadVoicePlaybackQueue {
       // Already closed.
     }
     this.stream = undefined;
+    this.streamBufferedFrames = 0;
     this.cycleActive = false;
     this.endingStream = false;
     this.streamingProducerOpen = false;
@@ -865,38 +874,75 @@ export class ThreadVoicePlaybackQueue {
   private pump(): void {
     if (this.destroyed) return;
     if (this.cycleActive) {
-      if (!this.timer && !this.endingStream && this.packets.length > 0) {
-        this.writeNextPacket();
+      this.fillStreamReserve();
+      if (!this.timer && !this.endingStream && this.streamBufferedFrames > 0) {
+        this.schedulePlaybackTick();
       }
       return;
     }
     if (this.packets.length === 0) return;
+    if (
+      this.streamingProducerOpen &&
+      this.packets.length * OPUS_FRAME_MS < STREAMING_PREBUFFER_MS
+    ) {
+      return;
+    }
     this.cycleActive = true;
     this.endingStream = false;
     const stream = new PassThrough({ objectMode: true });
     this.stream = stream;
     const resource = this.createResource(stream, { inputType: StreamType.Opus });
+    this.fillStreamReserve();
     this.player.play(resource);
     this.onPlaybackStarted?.();
-    this.writeNextPacket();
+    this.schedulePlaybackTick();
   }
 
-  private writeNextPacket(): void {
-    if (this.destroyed || !this.cycleActive) return;
-    const packet = this.packets.shift();
-    if (packet) {
+  /** Keep a bounded packet reserve inside the stream Discord consumes. */
+  private fillStreamReserve(): void {
+    while (
+      this.cycleActive &&
+      this.streamBufferedFrames < STREAMING_PREBUFFER_FRAMES &&
+      this.packets.length > 0
+    ) {
+      const packet = this.packets.shift()!;
       if (!this.stream?.destroyed) {
         this.stream?.write(packet);
-        this.consumedAudioMsTotal += OPUS_FRAME_MS;
+        this.streamBufferedFrames += 1;
       }
-      this.resolveCapacityWaiters();
-      this.timer = setTimeout(() => {
-        this.timer = undefined;
-        this.writeNextPacket();
-      }, OPUS_FRAME_MS);
+    }
+    this.resolveCapacityWaiters();
+  }
+
+  /**
+   * Mirror Discord's 20 ms packet clock so the reserve and consumed-airtime
+   * counters stay accurate. Frames are written ahead; this timer no longer
+   * sits on the critical path for each packet reaching Discord.
+   */
+  private schedulePlaybackTick(): void {
+    if (this.destroyed || !this.cycleActive || this.timer) return;
+    if (this.streamBufferedFrames === 0) {
+      if (this.streamingProducerOpen) return;
+      this.endCurrentStream();
       return;
     }
-    if (this.streamingProducerOpen) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      if (this.destroyed || !this.cycleActive) return;
+      if (this.streamBufferedFrames > 0) {
+        this.streamBufferedFrames -= 1;
+        this.consumedAudioMsTotal += OPUS_FRAME_MS;
+      }
+      this.fillStreamReserve();
+      if (this.streamBufferedFrames > 0) {
+        this.schedulePlaybackTick();
+      } else if (!this.streamingProducerOpen) {
+        this.endCurrentStream();
+      }
+    }, OPUS_FRAME_MS);
+  }
+
+  private endCurrentStream(): void {
     if (this.endingStream) return;
     this.endingStream = true;
     try {
@@ -915,6 +961,7 @@ export class ThreadVoicePlaybackQueue {
     this.cycleActive = false;
     this.endingStream = false;
     this.stream = undefined;
+    this.streamBufferedFrames = 0;
     if (this.packets.length > 0) {
       this.pump();
       return;

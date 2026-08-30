@@ -70,12 +70,18 @@ dispatch speaks nothing, and terminal aggregates are never spoken twice.
 The global scheduler makes sequential Gemini TTS sentence/chunk requests,
 shares one 24 kHz mono player, preserves source-local order, and rotates fairly
 between ready sources. A clean first sentence releases immediately, including
-short sentences. Gemini Interactions audio deltas begin playing before response
-EOF; buffering is bounded and cancellation/output-generation changes discard
-late or queued deltas. A request is never retried after playback accepts audio,
+short sentences. Streaming audio begins before response EOF after a 500 ms
+jitter prebuffer; buffering is bounded and cancellation/output-generation
+changes discard late or queued deltas. The packet reserve is written ahead of
+Discord's playback clock so ordinary provider/timer jitter does not become
+audible silence. A request is never retried after playback accepts audio,
 and unary fallback is allowed only when a clean stream completed without audio.
 Provider-wide and stalled-read watchdogs fail a wedged stream closed. Audio
 already heard before a failed or cancelled chunk still counts toward fairness.
+Before synthesis, long IDs/hashes and complex numeric forms are deterministically
+replaced with semantic labels; Gemini is never asked to guess or round their
+values. A short, locally generated soft tone marks the end of each completed
+spoken turn without another provider request.
 Text remains successful if TTS fails. Native completed-turn voice-message TTS
 is suppressed for every active binding, including while that binding's VC
 output is off.

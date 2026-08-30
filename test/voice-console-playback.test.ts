@@ -1,7 +1,10 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import type { VoiceConsolePcmQueue } from "../packages/core/src/platforms/discord/voice-console-playback.js";
-import { DiscordVoiceConsolePlayback } from "../packages/core/src/platforms/discord/voice-console-playback.js";
+import {
+  createTurnEndIndicatorPcm,
+  DiscordVoiceConsolePlayback,
+} from "../packages/core/src/platforms/discord/voice-console-playback.js";
 import type { VoiceConsoleSpeechChunk } from "../packages/core/src/core/voice-console/speech-types.js";
 
 function deferred<T>() {
@@ -55,6 +58,23 @@ function controlledQueue(): {
 }
 
 describe("DiscordVoiceConsolePlayback", () => {
+  it("generates a short, soft non-verbal end indicator", () => {
+    const tone = createTurnEndIndicatorPcm();
+    expect(tone.sampleRate).toBe(24_000);
+    expect(tone.channels).toBe(1);
+    expect(tone.pcm.byteLength).toBe(8_640);
+    const samples = new Int16Array(
+      tone.pcm.buffer,
+      tone.pcm.byteOffset,
+      tone.pcm.byteLength / 2
+    );
+    const peak = Math.max(...samples.map(Math.abs));
+    expect(peak).toBeGreaterThan(1_500);
+    expect(peak).toBeLessThan(3_000);
+    expect(samples[0]).toBe(0);
+    expect(samples.at(-1)).toBe(0);
+  });
+
   it("keeps one producer open, preserves delta order, and drains only after EOF", async () => {
     const idle = deferred<void>();
     const calls: string[] = [];
@@ -248,7 +268,7 @@ describe("DiscordVoiceConsolePlayback", () => {
       signal: new AbortController().signal,
     })).resolves.toEqual({
       status: "failed",
-      durationMs: 20,
+      durationMs: 0,
       error: "discord player failed",
     });
     playback.destroy();

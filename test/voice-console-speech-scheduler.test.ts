@@ -83,6 +83,42 @@ function setup(opts: {
 }
 
 describe("VoiceConsoleSpeechScheduler fairness", () => {
+  it("plays one local end indicator after the source's final speech chunk", async () => {
+    const events: string[] = [];
+    const releaseIndicator = deferred<void>();
+    const playback: VoiceConsoleSpeechPlayback = {
+      play: vi.fn(async ({ chunk: item }) => {
+        events.push(item.text);
+        return { status: "played" as const, durationMs: 1_000 };
+      }),
+      playEndIndicator: vi.fn(async () => {
+        events.push("<end>");
+        await releaseIndicator.promise;
+        return { status: "played" as const, durationMs: 180 };
+      }),
+      destroy: vi.fn(),
+    };
+    const { scheduler } = setup({ playback });
+    const a = source("A", "turn-with-end-indicator");
+    scheduler.registerSource(a);
+    scheduler.enqueueChunk(chunk(a, 1, 0, "First sentence."));
+    scheduler.enqueueChunk(chunk(a, 2, 0, "Last sentence."));
+    const drained = scheduler.finishSource(a);
+
+    await vi.waitFor(() => expect(events).toEqual([
+      "First sentence.",
+      "Last sentence.",
+      "<end>",
+    ]));
+    let settled = false;
+    void drained.then(() => { settled = true; });
+    await flushMicrotasks();
+    expect(settled).toBe(false);
+    releaseIndicator.resolve();
+    await expect(drained).resolves.toMatchObject({ accepted: 2, played: 2 });
+    expect(playback.playEndIndicator).toHaveBeenCalledTimes(1);
+  });
+
   it("starts incremental PCM playback before the synthesis response reaches EOF", async () => {
     const eof = deferred<VoiceConsoleSynthesisResult>();
     const pcmOrder: number[] = [];

@@ -237,9 +237,11 @@ describe("synthesizeSpeechWithGemini", () => {
       expect(req.headers.get("x-goog-api-key")).toBe("test-key");
       const body = (await req.json()) as {
         model: string;
+        store: boolean;
         generation_config: { speech_config: Array<{ voice: string }> };
       };
       expect(body.model).toBe("gemini-3.1-flash-tts-preview");
+      expect(body.store).toBe(false);
       expect(body.generation_config.speech_config[0]?.voice).toBe("Kore");
       return Response.json({
         steps: [

@@ -25,6 +25,7 @@ export class StreamingSpeechSegmenter {
   private readonly targetChars: number;
   private readonly forceChars: number;
   private prose = "";
+  private firstChunkReleased = false;
   private finished = false;
 
   constructor(opts: StreamingSpeechSegmenterOptions = {}) {
@@ -69,20 +70,28 @@ export class StreamingSpeechSegmenter {
       if (!this.prose) break;
 
       const paragraph = paragraphBoundary(this.prose);
-      // A complete sentence is immediately useful speech, even when it is
-      // shorter than the forced-chunk minimum. Holding it until turn EOF adds
-      // avoidable latency and defeats progressive playback.
-      const sentence = firstSentenceBoundary(this.prose);
+      // Release exactly the first complete sentence immediately. Subsequent
+      // chunks retain the established minimum so short sentences coalesce
+      // instead of multiplying provider requests and fairness rotations.
+      const sentence = this.firstChunkReleased
+        ? firstSentenceBoundaryAtOrAfter(this.prose, this.minChars)
+        : firstSentenceBoundary(this.prose);
       if (paragraph !== undefined && (sentence === undefined || paragraph.end <= sentence)) {
         const spoken = speechWhitespace(this.prose.slice(0, paragraph.start));
         this.prose = this.prose.slice(paragraph.end);
-        if (spoken) out.push(spoken);
+        if (spoken) {
+          out.push(spoken);
+          this.firstChunkReleased = true;
+        }
         continue;
       }
       if (sentence !== undefined) {
         const spoken = speechWhitespace(this.prose.slice(0, sentence));
         this.prose = this.prose.slice(sentence);
-        if (spoken) out.push(spoken);
+        if (spoken) {
+          out.push(spoken);
+          this.firstChunkReleased = true;
+        }
         continue;
       }
 
@@ -90,14 +99,20 @@ export class StreamingSpeechSegmenter {
         const cut = safestForcedBoundary(this.prose, this.minChars, this.forceChars);
         const spoken = speechWhitespace(this.prose.slice(0, cut));
         this.prose = this.prose.slice(cut);
-        if (spoken) out.push(spoken);
+        if (spoken) {
+          out.push(spoken);
+          this.firstChunkReleased = true;
+        }
         continue;
       }
 
       if (final) {
         const spoken = speechWhitespace(this.prose);
         this.prose = "";
-        if (spoken) out.push(spoken);
+        if (spoken) {
+          out.push(spoken);
+          this.firstChunkReleased = true;
+        }
       }
       break;
     }
@@ -140,6 +155,15 @@ function firstSentenceBoundary(text: string): number | undefined {
   const re = /[.!?](?:["')\]]*)\s+/g;
   const match = re.exec(text);
   return match ? match.index + match[0].trimEnd().length : undefined;
+}
+
+function firstSentenceBoundaryAtOrAfter(text: string, minimum: number): number | undefined {
+  const re = /[.!?](?:["')\]]*)\s+/g;
+  for (let match = re.exec(text); match; match = re.exec(text)) {
+    const end = match.index + match[0].trimEnd().length;
+    if (end >= minimum) return end;
+  }
+  return undefined;
 }
 
 function safestForcedBoundary(text: string, minimum: number, maximum: number): number {

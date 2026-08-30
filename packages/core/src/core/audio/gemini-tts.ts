@@ -146,6 +146,7 @@ export async function synthesizeSpeechWithGemini(opts: {
     input: buildTtsInput(text, opts.pace ?? "natural", opts.style ?? "neutral"),
     response_format: { type: "audio" },
     generation_config: { speech_config: [{ voice }] },
+    store: false,
   };
 
   const retryDelayMs = opts.retryDelayMs ?? TTS_RETRY_DELAY_MS;

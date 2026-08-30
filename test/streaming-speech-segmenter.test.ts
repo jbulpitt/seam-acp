@@ -8,6 +8,12 @@ describe("StreamingSpeechSegmenter", () => {
     expect(segmenter.flush()).toEqual(["The unfinished tail"]);
   });
 
+  it("uses the sub-minimum sentence fast path only once", () => {
+    const segmenter = new StreamingSpeechSegmenter();
+    expect(segmenter.feed("One. Two. Three. unfinished tail")).toEqual(["One."]);
+    expect(segmenter.flush()).toEqual(["Two. Three. unfinished tail"]);
+  });
+
   it("emits arrival-ordered sentences near the target size", () => {
     const segmenter = new StreamingSpeechSegmenter();
     expect(segmenter.feed("This first thought is deliberately long enough to reach the minimum speech chunk size, ")).toEqual([]);

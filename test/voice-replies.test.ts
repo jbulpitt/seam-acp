@@ -397,6 +397,53 @@ describe("streamSpeechWithGemini", () => {
     expect(accepted).toEqual([pcm]);
   });
 
+  it("preserves safe structured Vertex diagnostics without exposing the request", async () => {
+    let attempts = 0;
+    const result = await streamSpeechWithGemini({
+      provider: "vertex",
+      vertexProjectId: "test-project",
+      vertexLocation: "global",
+      accessToken: "secret-adc-token",
+      apiKey: "",
+      text: "Private speech text that must not enter diagnostics",
+      model: "gemini-3.1-flash-tts-preview",
+      retryDelayMs: 0,
+      unaryFallback: false,
+      fetchFn: ttsFetch(async () => {
+        attempts += 1;
+        return Response.json({
+          error: {
+            code: 400,
+            status: "INVALID_ARGUMENT",
+            message: "Request contains an invalid argument.",
+            details: [{
+              "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+              reason: "MODEL_VALIDATION_FAILED",
+              domain: "aiplatform.googleapis.com",
+            }],
+          },
+        }, {
+          status: 400,
+          headers: { "x-goog-request-id": "vertex-request-123" },
+        });
+      }),
+      onAudioDelta: async () => undefined,
+    });
+    expect(attempts).toBe(3);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected Vertex TTS failure");
+    expect(result.error).toContain("Request contains an invalid argument.");
+    expect(result.error).toContain("http=400");
+    expect(result.error).toContain("code=400");
+    expect(result.error).toContain("status=INVALID_ARGUMENT");
+    expect(result.error).toContain("reason=MODEL_VALIDATION_FAILED");
+    expect(result.error).toContain("request=vertex-request-123");
+    expect(result.error).toContain("attempt=3");
+    expect(result.error).toMatch(/fingerprint=[a-f0-9]{12}/);
+    expect(result.error).not.toContain("Private speech text");
+    expect(result.error).not.toContain("secret-adc-token");
+  });
+
   it("retries a gateway-style non-JSON HTTP 400 before any audio is accepted", async () => {
     let attempts = 0;
     const accepted: Buffer[] = [];
@@ -635,7 +682,9 @@ describe("streamSpeechWithGemini", () => {
       unaryFallback: false,
       onAudioDelta: async () => {},
     });
-    expect(failed).toEqual({ ok: false, error: "Invalid voice name" });
+    expect(failed.ok).toBe(false);
+    if (failed.ok) throw new Error("expected permanent TTS failure");
+    expect(failed.error).toBe("Invalid voice name [http=400]");
     expect(JSON.stringify(failed)).not.toContain("super-secret-key");
     expect(JSON.stringify(failed)).not.toContain("private transcript");
     expect(attempts).toBe(1);

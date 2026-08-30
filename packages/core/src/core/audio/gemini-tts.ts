@@ -1,4 +1,5 @@
 /** Control-plane Gemini text-to-speech for Discord voice replies. */
+import { createHash } from "node:crypto";
 import {
   requireVertexConfig,
   resolveSpeechAccessToken,
@@ -422,6 +423,7 @@ async function synthesizeSpeechWithVertex(opts: Parameters<typeof synthesizeSpee
   const model = opts.model?.trim() || DEFAULT_TTS_MODEL;
   const voice = opts.voice?.trim() || DEFAULT_TTS_VOICE;
   const body = buildVertexTtsBody(text, voice, opts.pace ?? "natural", opts.style ?? "neutral");
+  const requestFingerprint = ttsRequestFingerprint("vertex", model, "generateContent", body);
   const controller = new AbortController();
   const onAbort = (): void => controller.abort();
   opts.signal?.addEventListener("abort", onAbort, { once: true });
@@ -436,7 +438,12 @@ async function synthesizeSpeechWithVertex(opts: Parameters<typeof synthesizeSpee
       fetchFn: opts.fetchFn ?? fetch,
       signal: controller.signal,
     });
-    if (!response.ok) return { ok: false, error: await interactionHttpError(response) };
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: await interactionHttpError(response, { attempt: 1, requestFingerprint }),
+      };
+    }
     const parsed = await response.json() as unknown;
     const audio = extractVertexAudio(parsed);
     return audio ? { ok: true, audio } : { ok: false, error: "TTS response had no audio" };
@@ -456,6 +463,7 @@ async function streamSpeechWithVertex(opts: Parameters<typeof streamSpeechWithGe
   const model = opts.model?.trim() || DEFAULT_TTS_MODEL;
   const voice = opts.voice?.trim() || DEFAULT_TTS_VOICE;
   const body = buildVertexTtsBody(text, voice, opts.pace ?? "natural", opts.style ?? "neutral");
+  const requestFingerprint = ttsRequestFingerprint("vertex", model, "streamGenerateContent", body);
   const retryDelayMs = opts.retryDelayMs ?? TTS_RETRY_DELAY_MS;
   for (let attempt = 1; attempt <= TTS_MAX_ATTEMPTS; attempt++) {
     if (opts.signal?.aborted) return { ok: false, error: "TTS cancelled" };
@@ -477,7 +485,7 @@ async function streamSpeechWithVertex(opts: Parameters<typeof streamSpeechWithGe
         signal: controller.signal,
       });
       if (!response.ok) {
-        const error = await interactionHttpError(response);
+        const error = await interactionHttpError(response, { attempt, requestFingerprint });
         if (attempt < TTS_MAX_ATTEMPTS && isRetryableTtsFailure(response.status, error)) {
           if (!await ttsRetryDelay(retryDelayMs, attempt, opts.signal)) return { ok: false, error: "TTS cancelled" };
           continue;
@@ -1059,14 +1067,78 @@ function isKnownInteractionEvent(value: string): boolean {
     value === "interaction.cancelled" || value === "error";
 }
 
-async function interactionHttpError(response: Response): Promise<string> {
+type TtsHttpErrorContext = {
+  attempt?: number;
+  requestFingerprint?: string;
+};
+
+function ttsRequestFingerprint(
+  provider: "vertex" | "developer",
+  model: string,
+  method: string,
+  body: unknown
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ provider, model, method, body }))
+    .digest("hex")
+    .slice(0, 12);
+}
+
+async function interactionHttpError(
+  response: Response,
+  context: TtsHttpErrorContext = {}
+): Promise<string> {
   const raw = await readResponsePrefix(response, TTS_MAX_ERROR_BODY_BYTES);
+  let parsed: unknown;
+  let base: string;
   try {
-    const parsed = JSON.parse(raw) as unknown;
-    return geminiErrorMessage(parsed) ?? `TTS HTTP ${response.status}`;
+    parsed = JSON.parse(raw) as unknown;
+    base = geminiErrorMessage(parsed) ?? `TTS HTTP ${response.status}`;
   } catch {
-    return `TTS HTTP ${response.status}: non-JSON body`;
+    base = `TTS HTTP ${response.status}: non-JSON body`;
   }
+  return appendTtsHttpDiagnostics(base, response, parsed, context);
+}
+
+function appendTtsHttpDiagnostics(
+  base: string,
+  response: Response,
+  parsed: unknown,
+  context: TtsHttpErrorContext
+): string {
+  const fields = [`http=${response.status}`];
+  const error = parsed && typeof parsed === "object"
+    ? (parsed as { error?: unknown }).error
+    : undefined;
+  if (error && typeof error === "object") {
+    const structured = error as { code?: unknown; status?: unknown; details?: unknown };
+    if (typeof structured.code === "number" && Number.isFinite(structured.code)) {
+      fields.push(`code=${structured.code}`);
+    }
+    const status = safeDiagnosticToken(structured.status);
+    if (status) fields.push(`status=${status}`);
+    if (Array.isArray(structured.details)) {
+      const reasons = structured.details
+        .map((detail) => detail && typeof detail === "object"
+          ? safeDiagnosticToken((detail as { reason?: unknown }).reason)
+          : undefined)
+        .filter((reason): reason is string => Boolean(reason))
+        .slice(0, 3);
+      if (reasons.length) fields.push(`reason=${reasons.join(",")}`);
+    }
+  }
+  const requestId = ["x-request-id", "x-goog-request-id", "x-guploader-uploadid"]
+    .map((name) => safeDiagnosticToken(response.headers.get(name)))
+    .find((value): value is string => Boolean(value));
+  if (requestId) fields.push(`request=${requestId}`);
+  if (context.attempt !== undefined) fields.push(`attempt=${context.attempt}`);
+  if (context.requestFingerprint) fields.push(`fingerprint=${context.requestFingerprint}`);
+  return `${base} [${fields.join("; ")}]`.slice(0, 500);
+}
+
+function safeDiagnosticToken(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  return value.trim().replace(/[^A-Za-z0-9._:/-]/g, "_").slice(0, 100);
 }
 
 async function readResponsePrefix(response: Response, maxBytes: number): Promise<string> {
@@ -1105,8 +1177,8 @@ export function isRetryableTtsFailure(status: number, error: string): boolean {
   // and policy/validation failures remain fail-fast.
   if (status !== 400) return false;
   const detail = error.trim();
-  return /^Request contains an invalid argument\.?$/i.test(detail) ||
-    detail === "TTS HTTP 400: non-JSON body";
+  return /^Request contains an invalid argument\.?(?:\s+\[|$)/i.test(detail) ||
+    /^TTS HTTP 400: non-JSON body(?:\s+\[|$)/.test(detail);
 }
 
 async function ttsRetryDelay(

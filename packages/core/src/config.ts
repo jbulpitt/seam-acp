@@ -488,10 +488,10 @@ const Schema = z.object({
    */
   OLLAMA_CLOUD_CODEX_BASE_URL: z.string().default("http://127.0.0.1:11436/v1"),
   /** Default model id for Ollama Cloud sessions. */
-  OLLAMA_CLOUD_DEFAULT_MODEL: z.string().default("glm-5.2:cloud"),
+  OLLAMA_CLOUD_DEFAULT_MODEL: z.string().default("glm-5.3:cloud"),
   OLLAMA_CLOUD_MODELS: ModelsListSchema,
   /** Model used for /compact on Ollama Cloud sessions. */
-  OLLAMA_CLOUD_COMPACTION_MODEL: z.string().default("glm-5.2:cloud"),
+  OLLAMA_CLOUD_COMPACTION_MODEL: z.string().default("glm-5.3:cloud"),
 
   /**
    * Register the "LM Studio 🦙" agent: opencode (sst/opencode, `opencode acp`) —
@@ -1194,17 +1194,11 @@ export const ZAI_STATIC_MODELS = [
 export const OLLAMA_CLOUD_STATIC_MODELS = [
   { modelId: "glm-5.3:cloud",               name: "GLM 5.3",              contextLimit: 1_000_000, visionMode: "tool" as const },
   { modelId: "glm-5.3-flash:cloud",         name: "GLM 5.3 Flash",        contextLimit: 1_000_000, visionMode: "native" as const },
-  { modelId: "glm-5.2:cloud",               name: "GLM 5.2",              contextLimit: 976_000 },
-  { modelId: "glm-5.1:cloud",               name: "GLM 5.1",              contextLimit: 976_000 },
   { modelId: "qwen3-coder:cloud",           name: "Qwen3 Coder",          contextLimit: 256_000 },
   { modelId: "qwen3.6:cloud",               name: "Qwen3.6",              contextLimit: 256_000 },
   { modelId: "deepseek-v4-pro:cloud",       name: "DeepSeek V4 Pro",      contextLimit: 1_000_000 },
   { modelId: "deepseek-v4-flash:cloud",     name: "DeepSeek V4 Flash",    contextLimit: 512_000 },
-  { modelId: "deepseek-v3.2:cloud",         name: "DeepSeek V3.2",        contextLimit: 128_000 },
   { modelId: "kimi-k3:cloud",               name: "Kimi K3",              contextLimit: 1_000_000 },
-  { modelId: "kimi-k2.7-code:cloud",        name: "Kimi K2.7 Code",       contextLimit: 256_000 },
-  { modelId: "kimi-k2.6:cloud",             name: "Kimi K2.6",            contextLimit: 256_000 },
   { modelId: "minimax-m3:cloud",            name: "MiniMax M3",           contextLimit: 512_000 },
-  { modelId: "llama4:scout-cloud",          name: "Llama 4 Scout",        contextLimit: 512_000 },
   { modelId: "gemma4:cloud",                name: "Gemma 4",              contextLimit: 128_000 },
 ];

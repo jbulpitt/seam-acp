@@ -412,12 +412,15 @@ export class VoiceConsoleController
     if (runtime.ownerGrace) clearTimeout(runtime.ownerGrace);
     if (runtime.cardTimer) clearTimeout(runtime.cardTimer);
     runtime.stopOwnerWatch?.();
-    await runtime.cardQueue.catch(() => undefined);
+    // A cosmetic Discord card edit can be slow or permanently rejected. It
+    // must never keep capture/playback or the bot's VC connection alive after
+    // the durable stop has begun.
+    void runtime.cardQueue.catch(() => undefined);
+    runtime.scheduler.destroy();
+    runtime.transport.destroyConnection();
     await runtime.transport.captureHost.destroy().catch((err) =>
       this.logger.warn({ err, consoleId }, "voice console capture shutdown failed")
     );
-    runtime.scheduler.destroy();
-    runtime.transport.destroyConnection();
   }
 
   async waitForBindingSpeechIdle(bindingId: string): Promise<void> {

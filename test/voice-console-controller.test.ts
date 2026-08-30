@@ -55,6 +55,7 @@ describe("VoiceConsoleController startup transaction", () => {
       play: vi.fn(async () => ({ status: "played" as const, durationMs: 0 })),
       destroy: vi.fn(),
     };
+    const destroyConnection = vi.fn();
     const adapter = {
       inspectVoiceConsoleStart: vi.fn(async () => ({
         ok: true as const,
@@ -94,7 +95,7 @@ describe("VoiceConsoleController startup transaction", () => {
           connection: { state: { status: "ready" } },
           captureHost,
           playback,
-          destroyConnection: vi.fn(),
+          destroyConnection,
         };
       }),
       sendMessage: vi.fn(async () => ({
@@ -133,6 +134,7 @@ describe("VoiceConsoleController startup transaction", () => {
       events,
       captureHost,
       playback,
+      destroyConnection,
       getCapturePersistence: () => capturePersistence,
       loseConnection: (reason = "connection lost") => onConnectionLost?.(reason),
     };
@@ -300,6 +302,24 @@ describe("VoiceConsoleController startup transaction", () => {
     });
 
     await controller.shutdownAll();
+    manager.shutdown();
+  });
+
+  it("disconnects immediately even when a canonical-card edit never settles", async () => {
+    const { adapter, controller, manager, captureHost, destroyConnection } = setup();
+    const started = await controller.start(request);
+    if (!started.ok) throw new Error(started.error);
+    adapter.editVoiceConsolePanel.mockImplementation(() => new Promise<void>(() => {}));
+    void controller.refreshCard(started.console.id, true);
+    await vi.waitFor(() => expect(adapter.editVoiceConsolePanel).toHaveBeenCalled());
+
+    await expect(manager.stopConsole(started.console.id, {
+      expectedRevision: started.console.revision,
+      reason: "owner stopped",
+    })).resolves.toEqual({ ok: true, discarded: 0 });
+    expect(destroyConnection).toHaveBeenCalledOnce();
+    expect(captureHost.destroy).toHaveBeenCalledOnce();
+    expect(store.getVoiceConsole(started.console.id)).toMatchObject({ status: "ended" });
     manager.shutdown();
   });
 

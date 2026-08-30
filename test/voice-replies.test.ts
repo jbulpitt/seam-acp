@@ -351,6 +351,38 @@ describe("synthesizeSpeechWithGemini", () => {
 });
 
 describe("streamSpeechWithGemini", () => {
+  it("streams Vertex L16 SSE with ADC bearer auth", async () => {
+    const pcm = Buffer.from([1, 2, 3, 4]);
+    const accepted: Buffer[] = [];
+    const fetchFn = ttsFetch(async (req) => {
+      expect(req.url).toContain("aiplatform.googleapis.com/v1beta1/projects/test-project/locations/global/");
+      expect(req.url).toContain(":streamGenerateContent?alt=sse");
+      expect(req.headers.get("authorization")).toBe("Bearer adc-token");
+      expect(req.headers.get("x-goog-user-project")).toBe("test-project");
+      const body = await req.json() as { generation_config: { response_modalities: string[] } };
+      expect(body.generation_config.response_modalities).toEqual(["AUDIO"]);
+      return new Response(
+        `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ inlineData: { mimeType: "audio/l16; rate=24000; channels=1", data: pcm.toString("base64") } }] } }] })}\n\n` +
+        `data: ${JSON.stringify({ candidates: [{ finishReason: "STOP" }] })}\n\n`,
+        { headers: { "content-type": "text/event-stream" } }
+      );
+    });
+    const result = await streamSpeechWithGemini({
+      provider: "vertex",
+      vertexProjectId: "test-project",
+      vertexLocation: "global",
+      accessToken: "adc-token",
+      apiKey: "",
+      text: "Hello from Vertex",
+      model: "gemini-3.1-flash-tts-preview",
+      unaryFallback: false,
+      fetchFn,
+      onAudioDelta: (audio) => accepted.push(Buffer.from(audio.pcm)),
+    });
+    expect(result).toEqual({ ok: true, streamed: true, audioDeltas: 1 });
+    expect(accepted).toEqual([pcm]);
+  });
+
   it("retries a gateway-style non-JSON HTTP 400 before any audio is accepted", async () => {
     let attempts = 0;
     const accepted: Buffer[] = [];

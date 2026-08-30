@@ -80,6 +80,16 @@ Text remains successful if TTS fails. Native completed-turn voice-message TTS
 is suppressed for every active binding, including while that binding's VC
 output is off.
 
+### Speech provider
+
+`SEAM_GEMINI_SPEECH_PROVIDER` selects the transport for Thread Voice TTS,
+Live Transcribe, unary STT fallback, and ordinary Discord voice-note STT.
+`developer` uses `SEAM_GEMINI_API_KEY`; `vertex` uses Application Default
+Credentials plus `SEAM_GEMINI_VERTEX_PROJECT_ID` and the global Vertex
+endpoint. Live Help remains a separate Studio Live feature and continues to
+use the API key. Switching the provider does not change the capture,
+cancellation, fairness, or text-fallback contracts.
+
 ## Lease, recovery, and shutdown
 
 Thread Voice and Live Help share one guild voice lease. A conflict names the

@@ -1,7 +1,10 @@
-/**
- * Control-plane Gemini speech-to-text for Discord voice notes.
- * Uses the Developer API (SEAM_GEMINI_API_KEY), not agy/Gemini CLI SSO.
- */
+/** Control-plane Gemini speech-to-text for Discord voice notes. */
+import {
+  requireVertexConfig,
+  resolveSpeechAccessToken,
+  vertexModelUrl,
+  type GeminiSpeechAuth,
+} from "./google-speech-provider.js";
 const DEFAULT_STT_MODEL = "gemini-3.5-transcribe";
 const FALLBACK_STT_MODEL = "gemini-3.7-flash";
 const STT_TIMEOUT_MS = 60_000;
@@ -17,15 +20,18 @@ export interface SttFallbackEvent {
 }
 
 export async function transcribeAudioWithGemini(opts: {
-  apiKey: string;
+  apiKey?: string;
   bytes: Uint8Array;
   mimeType: string;
   model?: string;
   customVocabulary?: ReadonlyArray<string>;
   onFallback?: (event: SttFallbackEvent) => void;
   fetchFn?: typeof fetch;
-}): Promise<SttResult> {
-  const apiKey = opts.apiKey.trim();
+} & GeminiSpeechAuth): Promise<SttResult> {
+  if ((opts.provider ?? "developer") === "vertex") {
+    return transcribeWithVertex(opts);
+  }
+  const apiKey = opts.apiKey?.trim() ?? "";
   if (!apiKey) return { ok: false, error: "SEAM_GEMINI_API_KEY is not set" };
   if (opts.bytes.byteLength === 0) return { ok: false, error: "empty audio" };
 
@@ -73,6 +79,82 @@ export async function transcribeAudioWithGemini(opts: {
     model,
     fetchFn,
   });
+}
+
+async function transcribeWithVertex(opts: {
+  bytes: Uint8Array;
+  mimeType: string;
+  model?: string;
+  customVocabulary?: ReadonlyArray<string>;
+  fetchFn?: typeof fetch;
+} & GeminiSpeechAuth): Promise<SttResult> {
+  if (opts.bytes.byteLength === 0) return { ok: false, error: "empty audio" };
+  let vertex: { projectId: string; location: string };
+  let token: string;
+  try {
+    vertex = requireVertexConfig(opts);
+    token = await resolveSpeechAccessToken(opts.accessToken);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Vertex authentication failed" };
+  }
+  const model = opts.model?.trim() || "gemini-3.5-transcribe-preview";
+  const vocabulary = normalizeCustomVocabulary(opts.customVocabulary ?? []);
+  const audioTranscriptionConfig: Record<string, unknown> = {
+    languageCodes: [],
+    mode: "SMART",
+    ...(vocabulary.length ? { customVocabulary: vocabulary } : {}),
+  };
+  const body = {
+    contents: [{
+      role: "user",
+      parts: [{
+        inlineData: {
+          mimeType: normalizeAudioMime(opts.mimeType),
+          data: Buffer.from(opts.bytes).toString("base64"),
+        },
+      }],
+    }],
+    generationConfig: { audioTranscriptionConfig },
+  };
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), STT_TIMEOUT_MS);
+  try {
+    const response = await (opts.fetchFn ?? fetch)(vertexModelUrl({
+      ...vertex,
+      model,
+      method: "generateContent",
+    }), {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        "x-goog-user-project": vertex.projectId,
+      },
+      body: JSON.stringify(body),
+      signal: ac.signal,
+    });
+    const raw = await response.text();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      return { ok: false, error: `STT HTTP ${response.status}: non-JSON body` };
+    }
+    if (!response.ok) {
+      return { ok: false, error: geminiErrorMessage(parsed) ?? `STT HTTP ${response.status}` };
+    }
+    const text = extractGenerateContentText(parsed).trim();
+    return text ? { ok: true, text } : { ok: false, error: "empty transcript" };
+  } catch (err) {
+    const name = err instanceof Error ? err.name : "";
+    return { ok: false, error: name === "AbortError" ? "STT timed out" : errorText(err, "STT failed") };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function errorText(err: unknown, fallback: string): string {
+  return err instanceof Error ? err.message : fallback;
 }
 
 function isDedicatedTranscribeModel(model: string): boolean {

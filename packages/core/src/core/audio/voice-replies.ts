@@ -3,6 +3,7 @@
  * Default off: only threads with `tts: true` speak.
  */
 import { synthesizeSpeechWithGemini, type TtsPace, type TtsStyle } from "./gemini-tts.js";
+import type { GeminiSpeechAuth } from "./google-speech-provider.js";
 import { encodePcmToOggOpus } from "./pcm-to-opus.js";
 
 export const TTS_MAX_CHARS = 4000;
@@ -37,6 +38,7 @@ export type SpeakDecision =
 export function shouldSpeakReply(opts: {
   enabled: boolean;
   apiKey: string;
+  provider?: "developer" | "vertex";
   prose: string;
   alreadyHadAudio: boolean;
   turnOk: boolean;
@@ -44,7 +46,9 @@ export function shouldSpeakReply(opts: {
   if (!opts.enabled) return { speak: false, reason: "disabled" };
   if (!opts.turnOk) return { speak: false, reason: "not-ok" };
   if (opts.alreadyHadAudio) return { speak: false, reason: "had-audio" };
-  if (!opts.apiKey.trim()) return { speak: false, reason: "no-key" };
+  if ((opts.provider ?? "developer") === "developer" && !opts.apiKey.trim()) {
+    return { speak: false, reason: "no-key" };
+  }
   const text = opts.prose.trim();
   if (!text) return { speak: false, reason: "empty" };
   if (text.length > TTS_MAX_CHARS) return { speak: false, reason: "too-long" };
@@ -120,7 +124,6 @@ export function voiceMessageMetadataFromPcm(
 }
 
 export async function speakReplyToOgg(opts: {
-  apiKey: string;
   text: string;
   model?: string;
   voice?: string;
@@ -128,9 +131,13 @@ export async function speakReplyToOgg(opts: {
   style?: TtsStyle;
   fetchFn?: typeof fetch;
   ffmpegPath?: string;
-}): Promise<SpokenOgg> {
+} & GeminiSpeechAuth): Promise<SpokenOgg> {
   const tts = await synthesizeSpeechWithGemini({
+    provider: opts.provider,
     apiKey: opts.apiKey,
+    vertexProjectId: opts.vertexProjectId,
+    vertexLocation: opts.vertexLocation,
+    accessToken: opts.accessToken,
     text: opts.text,
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.voice ? { voice: opts.voice } : {}),

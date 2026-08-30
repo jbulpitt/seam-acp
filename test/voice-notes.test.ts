@@ -81,6 +81,32 @@ describe("formatVoiceNoteBlock", () => {
 });
 
 describe("transcribeAudioWithGemini", () => {
+  it("uses Vertex ADC bearer auth and the dedicated transcription model", async () => {
+    const fetchFn = geminiFetch(async (req) => {
+      expect(req.url).toContain("aiplatform.googleapis.com/v1beta1/projects/test-project/locations/global/");
+      expect(req.url).toContain("gemini-3.5-transcribe-preview:generateContent");
+      expect(req.headers.get("authorization")).toBe("Bearer adc-token");
+      expect(req.headers.get("x-goog-user-project")).toBe("test-project");
+      const body = await req.json() as {
+        contents: Array<{ parts: Array<{ inlineData: { mimeType: string } }> }>;
+        generationConfig: { audioTranscriptionConfig: { mode: string } };
+      };
+      expect(body.contents[0]!.parts[0]!.inlineData.mimeType).toBe("audio/ogg");
+      expect(body.generationConfig.audioTranscriptionConfig.mode).toBe("SMART");
+      return Response.json({ candidates: [{ content: { parts: [{ text: "vertex transcript" }] } }] });
+    });
+    await expect(transcribeAudioWithGemini({
+      provider: "vertex",
+      vertexProjectId: "test-project",
+      vertexLocation: "global",
+      accessToken: "adc-token",
+      model: "gemini-3.5-transcribe-preview",
+      bytes: new Uint8Array([1, 2]),
+      mimeType: "audio/ogg",
+      fetchFn,
+    })).resolves.toEqual({ ok: true, text: "vertex transcript" });
+  });
+
   it("extracts spoken words from the legacy generateContent fallback model", async () => {
     const fetchFn = geminiFetch(async (req) => {
       expect(req.url).toBe(GEMINI_URL);

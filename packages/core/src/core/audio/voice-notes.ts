@@ -4,6 +4,7 @@
  */
 import { isAudioMime } from "../../agents/attachments.js";
 import { transcribeAudioWithGemini, type SttFallbackEvent } from "./gemini-stt.js";
+import type { GeminiSpeechAuth } from "./google-speech-provider.js";
 import type { MessageAttachment } from "../../platforms/chat-adapter.js";
 
 export interface VoiceNoteResult {
@@ -66,16 +67,15 @@ export function formatHeardMessage(notes: ReadonlyArray<VoiceNoteResult>): strin
 export async function applyVoiceNoteTranscriptions(opts: {
   prompt: string;
   attachments: ReadonlyArray<MessageAttachment>;
-  apiKey: string;
   model?: string;
   customVocabulary?: ReadonlyArray<string>;
   onFallback?: (event: SttFallbackEvent) => void;
   speakerLabel?: string;
   fetchFn?: typeof fetch;
   downloadFn?: (url: string) => Promise<Uint8Array>;
-}): Promise<{ prompt: string; notes: VoiceNoteResult[] }> {
-  const apiKey = opts.apiKey.trim();
-  if (!apiKey) return { prompt: opts.prompt, notes: [] };
+} & GeminiSpeechAuth): Promise<{ prompt: string; notes: VoiceNoteResult[] }> {
+  const apiKey = opts.apiKey?.trim() ?? "";
+  if ((opts.provider ?? "developer") === "developer" && !apiKey) return { prompt: opts.prompt, notes: [] };
 
   const voice = opts.attachments.filter(isVoiceNoteAttachment);
   if (voice.length === 0) return { prompt: opts.prompt, notes: [] };
@@ -86,7 +86,11 @@ export async function applyVoiceNoteTranscriptions(opts: {
     try {
       const bytes = await download(a.url);
       const result = await transcribeAudioWithGemini({
+        provider: opts.provider,
         apiKey,
+        vertexProjectId: opts.vertexProjectId,
+        vertexLocation: opts.vertexLocation,
+        accessToken: opts.accessToken,
         bytes,
         mimeType: a.contentType ?? "audio/ogg",
         ...(opts.model ? { model: opts.model } : {}),

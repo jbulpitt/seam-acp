@@ -1,10 +1,10 @@
-/**
- * Control-plane Gemini text-to-speech for Discord voice replies.
- * Uses the Developer API (SEAM_GEMINI_API_KEY), not agy/Gemini CLI SSO.
- *
- * Studio Interactions returns raw L16 PCM (24 kHz mono). Encoding to Opus
- * is a separate step so this helper stays fetch-mockable.
- */
+/** Control-plane Gemini text-to-speech for Discord voice replies. */
+import {
+  requireVertexConfig,
+  resolveSpeechAccessToken,
+  vertexModelUrl,
+  type GeminiSpeechAuth,
+} from "./google-speech-provider.js";
 const DEFAULT_TTS_MODEL = "gemini-3.1-flash-tts-preview";
 const DEFAULT_TTS_VOICE = "Kore";
 /** Long replies (up to TTS_MAX_CHARS) can take >90s to synthesize. */
@@ -148,7 +148,7 @@ export type StreamingTtsResult =
   | { ok: false; error: string };
 
 export async function synthesizeSpeechWithGemini(opts: {
-  apiKey: string;
+  apiKey?: string;
   text: string;
   model?: string;
   voice?: string;
@@ -158,8 +158,11 @@ export async function synthesizeSpeechWithGemini(opts: {
   signal?: AbortSignal;
   /** Test hook; production uses a short exponential retry delay. */
   retryDelayMs?: number;
-}): Promise<TtsResult> {
-  const apiKey = opts.apiKey.trim();
+} & GeminiSpeechAuth): Promise<TtsResult> {
+  if ((opts.provider ?? "developer") === "vertex") {
+    return synthesizeSpeechWithVertex(opts);
+  }
+  const apiKey = opts.apiKey?.trim() ?? "";
   if (!apiKey) return { ok: false, error: "SEAM_GEMINI_API_KEY is not set" };
   const text = opts.text.trim();
   if (!text) return { ok: false, error: "empty text" };
@@ -255,7 +258,7 @@ export async function synthesizeSpeechWithGemini(opts: {
  * no audio at all.
  */
 export async function streamSpeechWithGemini(opts: {
-  apiKey: string;
+  apiKey?: string;
   text: string;
   onAudioDelta: (audio: TtsPcm) => void | Promise<void>;
   signal?: AbortSignal;
@@ -272,8 +275,11 @@ export async function streamSpeechWithGemini(opts: {
   overallTimeoutMs?: number;
   /** Test hook; production aborts a provider body read after 20s without bytes. */
   idleReadTimeoutMs?: number;
-}): Promise<StreamingTtsResult> {
-  const apiKey = opts.apiKey.trim();
+} & GeminiSpeechAuth): Promise<StreamingTtsResult> {
+  if ((opts.provider ?? "developer") === "vertex") {
+    return streamSpeechWithVertex(opts);
+  }
+  const apiKey = opts.apiKey?.trim() ?? "";
   if (!apiKey) return { ok: false, error: "SEAM_GEMINI_API_KEY is not set" };
   const text = opts.text.trim();
   if (!text) return { ok: false, error: "empty text" };
@@ -339,6 +345,251 @@ export async function streamSpeechWithGemini(opts: {
     }
   }
   return { ok: false, error: "TTS failed" };
+}
+
+function buildVertexTtsBody(text: string, voice: string, pace: TtsPace, style: TtsStyle): object {
+  return {
+    contents: {
+      role: "user",
+      parts: [{ text: buildTtsInput(text, pace, style) }],
+    },
+    generation_config: {
+      response_modalities: ["AUDIO"],
+      speech_config: {
+        language_code: "en-US",
+        voice_config: { prebuilt_voice_config: { voice_name: voice } },
+      },
+    },
+  };
+}
+
+async function vertexTtsRequest(opts: GeminiSpeechAuth & {
+  model: string;
+  method: "generateContent" | "streamGenerateContent";
+  sse?: boolean;
+  body: object;
+  fetchFn: typeof fetch;
+  signal: AbortSignal;
+}): Promise<Response> {
+  const vertex = requireVertexConfig(opts);
+  const token = await resolveSpeechAccessToken(opts.accessToken);
+  return opts.fetchFn(vertexModelUrl({
+    ...vertex,
+    model: opts.model,
+    method: opts.method,
+    sse: opts.sse,
+  }), {
+    method: "POST",
+    headers: {
+      accept: opts.sse ? "text/event-stream" : "application/json",
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "x-goog-user-project": vertex.projectId,
+    },
+    body: JSON.stringify(opts.body),
+    signal: opts.signal,
+  });
+}
+
+async function synthesizeSpeechWithVertex(opts: Parameters<typeof synthesizeSpeechWithGemini>[0]): Promise<TtsResult> {
+  const text = opts.text.trim();
+  if (!text) return { ok: false, error: "empty text" };
+  const model = opts.model?.trim() || DEFAULT_TTS_MODEL;
+  const voice = opts.voice?.trim() || DEFAULT_TTS_VOICE;
+  const body = buildVertexTtsBody(text, voice, opts.pace ?? "natural", opts.style ?? "neutral");
+  const controller = new AbortController();
+  const onAbort = (): void => controller.abort();
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
+  if (opts.signal?.aborted) controller.abort();
+  const timer = setTimeout(() => controller.abort(), TTS_TIMEOUT_MS);
+  try {
+    const response = await vertexTtsRequest({
+      ...opts,
+      model,
+      method: "generateContent",
+      body,
+      fetchFn: opts.fetchFn ?? fetch,
+      signal: controller.signal,
+    });
+    if (!response.ok) return { ok: false, error: await interactionHttpError(response) };
+    const parsed = await response.json() as unknown;
+    const audio = extractVertexAudio(parsed);
+    return audio ? { ok: true, audio } : { ok: false, error: "TTS response had no audio" };
+  } catch (err) {
+    if (opts.signal?.aborted) return { ok: false, error: "TTS cancelled" };
+    return { ok: false, error: controller.signal.aborted ? "TTS timed out" : safeTtsError(err) };
+  } finally {
+    clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+async function streamSpeechWithVertex(opts: Parameters<typeof streamSpeechWithGemini>[0]): Promise<StreamingTtsResult> {
+  const text = opts.text.trim();
+  if (!text) return { ok: false, error: "empty text" };
+  if (opts.signal?.aborted) return { ok: false, error: "TTS cancelled" };
+  const model = opts.model?.trim() || DEFAULT_TTS_MODEL;
+  const voice = opts.voice?.trim() || DEFAULT_TTS_VOICE;
+  const body = buildVertexTtsBody(text, voice, opts.pace ?? "natural", opts.style ?? "neutral");
+  const retryDelayMs = opts.retryDelayMs ?? TTS_RETRY_DELAY_MS;
+  for (let attempt = 1; attempt <= TTS_MAX_ATTEMPTS; attempt++) {
+    if (opts.signal?.aborted) return { ok: false, error: "TTS cancelled" };
+    const controller = new AbortController();
+    const onAbort = (): void => controller.abort();
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    if (opts.signal?.aborted) controller.abort();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, opts.overallTimeoutMs ?? TTS_TIMEOUT_MS);
+    let accepted = false;
+    try {
+      const response = await vertexTtsRequest({
+        ...opts,
+        model,
+        method: "streamGenerateContent",
+        sse: true,
+        body,
+        fetchFn: opts.fetchFn ?? fetch,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const error = await interactionHttpError(response);
+        if (attempt < TTS_MAX_ATTEMPTS && isRetryableTtsFailure(response.status, error)) {
+          if (!await ttsRetryDelay(retryDelayMs, attempt, opts.signal)) return { ok: false, error: "TTS cancelled" };
+          continue;
+        }
+        return { ok: false, error };
+      }
+      if (!response.body) throw new Error("TTS stream response had no body");
+      const count = await consumeVertexAudioSse(response.body, async (audio) => {
+        if (controller.signal.aborted) throw abortError("TTS provider request aborted");
+        accepted = true;
+        await waitForConsumerOrAbort(opts.onAudioDelta(audio), controller.signal);
+      }, {
+        idleReadTimeoutMs: opts.idleReadTimeoutMs ?? TTS_STREAM_IDLE_TIMEOUT_MS,
+        abort: () => controller.abort(),
+      });
+      if (count > 0) return { ok: true, streamed: true, audioDeltas: count };
+      if (opts.unaryFallback !== false) {
+        const fallback = await synthesizeSpeechWithVertex(opts);
+        return fallback.ok ? { ok: true, streamed: false, audio: fallback.audio } : fallback;
+      }
+      return { ok: false, error: "TTS stream completed without audio" };
+    } catch (err) {
+      if (opts.signal?.aborted) return { ok: false, error: "TTS cancelled" };
+      const error = err instanceof TtsIdleReadTimeoutError
+        ? "TTS stream idle read timed out"
+        : timedOut ? "TTS timed out" : safeTtsError(err);
+      if (accepted || err instanceof TtsProtocolError || attempt === TTS_MAX_ATTEMPTS) return { ok: false, error };
+      if (!await ttsRetryDelay(retryDelayMs, attempt, opts.signal)) return { ok: false, error: "TTS cancelled" };
+    } finally {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+    }
+  }
+  return { ok: false, error: "TTS failed" };
+}
+
+async function consumeVertexAudioSse(
+  body: ReadableStream<Uint8Array>,
+  onAudioDelta: (audio: TtsPcm) => Promise<void>,
+  watchdog: { idleReadTimeoutMs: number; abort: () => void }
+): Promise<number> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  let dataLines: string[] = [];
+  let audioDeltas = 0;
+  let finished = false;
+  const dispatch = async (): Promise<void> => {
+    if (!dataLines.length) return;
+    const data = dataLines.join("\n");
+    dataLines = [];
+    if (data === "[DONE]") return;
+    let parsed: unknown;
+    try { parsed = JSON.parse(data) as unknown; }
+    catch { throw new TtsProtocolError("TTS stream contained malformed JSON"); }
+    const error = geminiErrorMessage(parsed);
+    if (error) throw new TtsProtocolError(error);
+    const deltas = extractVertexAudioParts(parsed);
+    for (const audio of deltas) {
+      audioDeltas++;
+      await onAudioDelta(audio);
+    }
+    const candidates = (parsed as { candidates?: unknown })?.candidates;
+    if (Array.isArray(candidates)) {
+      for (const candidate of candidates) {
+        const reason = (candidate as { finishReason?: unknown; finish_reason?: unknown }).finishReason ??
+          (candidate as { finish_reason?: unknown }).finish_reason;
+        if (typeof reason === "string") {
+          if (reason !== "STOP") throw new TtsProtocolError(`TTS stream ended with ${reason}`);
+          finished = true;
+        }
+      }
+    }
+  };
+  try {
+    while (true) {
+      const { value, done } = await readWithIdleWatchdog(reader, watchdog.idleReadTimeoutMs, watchdog.abort);
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      if (buffered.length > TTS_MAX_SSE_EVENT_CHARS) throw new TtsProtocolError("TTS stream event exceeded size limit");
+      let index: number;
+      while ((index = buffered.indexOf("\n")) >= 0) {
+        let line = buffered.slice(0, index);
+        buffered = buffered.slice(index + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (!line) { await dispatch(); continue; }
+        if (line.startsWith(":")) continue;
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+      }
+    }
+    buffered += decoder.decode();
+    if (buffered.startsWith("data:")) dataLines.push(buffered.slice(5).replace(/^ /, ""));
+    await dispatch();
+  } finally {
+    reader.releaseLock();
+  }
+  if (!finished) throw new TtsProtocolError("TTS stream ended before STOP");
+  return audioDeltas;
+}
+
+function extractVertexAudioParts(parsed: unknown): TtsPcm[] {
+  if (!parsed || typeof parsed !== "object") return [];
+  const candidates = (parsed as { candidates?: unknown }).candidates;
+  if (!Array.isArray(candidates)) return [];
+  const out: TtsPcm[] = [];
+  for (const candidate of candidates) {
+    const parts = (candidate as { content?: { parts?: unknown } }).content?.parts;
+    if (!Array.isArray(parts)) continue;
+    for (const part of parts) {
+      const inline = (part as { inlineData?: { data?: unknown; mimeType?: unknown }; inline_data?: { data?: unknown; mime_type?: unknown } }).inlineData ??
+        (part as { inline_data?: { data?: unknown; mime_type?: unknown } }).inline_data;
+      if (!inline || typeof inline.data !== "string") continue;
+      const mime = (inline as { mimeType?: unknown }).mimeType ??
+        (inline as { mime_type?: unknown }).mime_type;
+      if (typeof mime !== "string") {
+        throw new TtsProtocolError("TTS stream returned unsupported audio format");
+      }
+      const format = parseStableL16Mime(mime);
+      if (!format || (format.sampleRate ?? 24_000) !== 24_000 || (format.channels ?? 1) !== 1) {
+        throw new TtsProtocolError("TTS stream returned unsupported audio format");
+      }
+      const pcm = decodeCanonicalBase64(inline.data);
+      if (pcm.byteLength % 2) throw new TtsProtocolError("TTS stream ended with a partial PCM sample");
+      out.push({ pcm, sampleRate: 24_000, channels: 1 });
+    }
+  }
+  return out;
+}
+
+function extractVertexAudio(parsed: unknown): TtsPcm | null {
+  const parts = extractVertexAudioParts(parsed);
+  if (!parts.length) return null;
+  return {
+    pcm: Buffer.concat(parts.map((part) => Buffer.from(part.pcm))),
+    sampleRate: 24_000,
+    channels: 1,
+  };
 }
 
 type StreamAttemptResult =
@@ -766,6 +1017,15 @@ function isStrictBase64(value: string): boolean {
     !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
   ) return false;
   return Buffer.from(value, "base64").toString("base64") === value;
+}
+
+function decodeCanonicalBase64(value: string): Uint8Array {
+  if (!isStrictBase64(value)) {
+    throw new TtsProtocolError("TTS stream contained invalid base64 audio");
+  }
+  const decoded = Buffer.from(value, "base64");
+  if (!decoded.byteLength) throw new TtsProtocolError("TTS stream contained empty audio");
+  return decoded;
 }
 
 function isKnownInteractionEvent(value: string): boolean {

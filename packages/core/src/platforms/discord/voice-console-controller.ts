@@ -115,6 +115,9 @@ export class VoiceConsoleController
   private readonly adapter: DiscordAdapter;
   private readonly logger: Logger;
   private readonly apiKey: () => string;
+  private readonly speechProvider: () => "developer" | "vertex";
+  private readonly vertexProjectId: () => string;
+  private readonly vertexLocation: () => string;
   private readonly ttsModel: () => string;
   private readonly isAllowedUser: (userId: string) => boolean;
   private readonly isBindingBusy: (channelRef: string) => boolean;
@@ -129,6 +132,9 @@ export class VoiceConsoleController
     adapter: DiscordAdapter;
     logger: Logger;
     apiKey: () => string;
+    speechProvider: () => "developer" | "vertex";
+    vertexProjectId: () => string;
+    vertexLocation: () => string;
     ttsModel: () => string;
     isAllowedUser: (userId: string) => boolean;
     isBindingBusy: (channelRef: string) => boolean;
@@ -138,6 +144,9 @@ export class VoiceConsoleController
     this.adapter = opts.adapter;
     this.logger = opts.logger.child({ comp: "voice-console-controller" });
     this.apiKey = opts.apiKey;
+    this.speechProvider = opts.speechProvider;
+    this.vertexProjectId = opts.vertexProjectId;
+    this.vertexLocation = opts.vertexLocation;
     this.ttsModel = opts.ttsModel;
     this.isAllowedUser = opts.isAllowedUser;
     this.isBindingBusy = opts.isBindingBusy;
@@ -737,7 +746,10 @@ export class VoiceConsoleController
         consoleId: console.id,
         playback: transport.playback,
         synthesize: async ({ chunk, profile, signal, onAudioDelta }) => streamSpeechWithGemini({
+          provider: this.speechProvider(),
           apiKey: this.apiKey(),
+          vertexProjectId: this.vertexProjectId(),
+          vertexLocation: this.vertexLocation(),
           model: this.ttsModel(),
           text: chunk.text,
           voice: profile.voice,

@@ -95,6 +95,18 @@ function audioMessages(socket: MockWebSocket): Array<Record<string, unknown>> {
 }
 
 describe("Gemini Live Transcribe setup", () => {
+  it("builds the fully qualified Vertex Live Transcribe model resource", () => {
+    const message = buildGeminiLiveTranscribeSetup({
+      provider: "vertex",
+      vertexProjectId: "test-project",
+      vertexLocation: "global",
+      model: "gemini-3.5-transcribe-live-preview",
+    });
+    expect(message.setup.model).toBe(
+      "projects/test-project/locations/global/publishers/google/models/gemini-3.5-transcribe-live-preview"
+    );
+  });
+
   it("builds the documented Text, Smart, manual-VAD setup with voice-note vocabulary rules", () => {
     expect(
       buildGeminiLiveTranscribeSetup({

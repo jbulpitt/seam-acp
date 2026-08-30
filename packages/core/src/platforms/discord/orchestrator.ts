@@ -2170,8 +2170,13 @@ export class Orchestrator {
           const voiced = await applyVoiceNoteTranscriptions({
             prompt: promptText,
             attachments: msg.attachments,
+            provider: this.config.SEAM_GEMINI_SPEECH_PROVIDER,
             apiKey: this.config.SEAM_GEMINI_API_KEY,
-            model: this.config.SEAM_GEMINI_STT_MODEL,
+            vertexProjectId: this.config.SEAM_GEMINI_VERTEX_PROJECT_ID,
+            vertexLocation: this.config.SEAM_GEMINI_VERTEX_LOCATION,
+            model: this.config.SEAM_GEMINI_SPEECH_PROVIDER === "vertex"
+              ? this.config.SEAM_GEMINI_VERTEX_STT_MODEL
+              : this.config.SEAM_GEMINI_STT_MODEL,
             customVocabulary: this.config.SEAM_GEMINI_STT_CUSTOM_VOCABULARY,
             onFallback: (event) => {
               this.logger.warn(event, "voice-note STT fell back to general Gemini model");
@@ -5067,7 +5072,10 @@ export class Orchestrator {
         const preview = voiceConsolePreviewRequest(draft);
         const sample = await getOrCreateTtsSample({
           dataDir: this.config.DATA_DIR,
+          provider: this.config.SEAM_GEMINI_SPEECH_PROVIDER,
           apiKey: this.config.SEAM_GEMINI_API_KEY,
+          vertexProjectId: this.config.SEAM_GEMINI_VERTEX_PROJECT_ID,
+          vertexLocation: this.config.SEAM_GEMINI_VERTEX_LOCATION,
           model: this.config.SEAM_GEMINI_TTS_MODEL,
           voice: preview.voice,
         });
@@ -5344,9 +5352,12 @@ export class Orchestrator {
     const controllable = owned ?? this.store.getActiveVoiceConsoleForGuild(i.guildId);
     const active = binding ? this.store.getVoiceConsole(binding.consoleId) : controllable;
     if (sub === "start") {
-      if (!this.config.SEAM_GEMINI_API_KEY.trim()) {
+      if (
+        this.config.SEAM_GEMINI_SPEECH_PROVIDER === "developer" &&
+        !this.config.SEAM_GEMINI_API_KEY.trim()
+      ) {
         await i.reply({
-          content: "Voice Console requires `SEAM_GEMINI_API_KEY` on this deployment.",
+          content: "Voice Console requires its configured Gemini speech credentials.",
           flags: MessageFlags.Ephemeral,
         });
         return;
@@ -13034,7 +13045,10 @@ export class Orchestrator {
     await this.refreshTtsEditor(loading);
     const sample = await getOrCreateTtsSample({
       dataDir: this.config.DATA_DIR,
+      provider: this.config.SEAM_GEMINI_SPEECH_PROVIDER,
       apiKey: this.config.SEAM_GEMINI_API_KEY,
+      vertexProjectId: this.config.SEAM_GEMINI_VERTEX_PROJECT_ID,
+      vertexLocation: this.config.SEAM_GEMINI_VERTEX_LOCATION,
       voice: voice.name,
       model: this.config.SEAM_GEMINI_TTS_MODEL,
     });
@@ -13150,7 +13164,10 @@ export class Orchestrator {
         }) ?? draft;
       warmTtsSamples({
         dataDir: this.config.DATA_DIR,
+        provider: this.config.SEAM_GEMINI_SPEECH_PROVIDER,
         apiKey: this.config.SEAM_GEMINI_API_KEY,
+        vertexProjectId: this.config.SEAM_GEMINI_VERTEX_PROJECT_ID,
+        vertexLocation: this.config.SEAM_GEMINI_VERTEX_LOCATION,
         model: this.config.SEAM_GEMINI_TTS_MODEL,
       });
       await this.loadTtsVoiceSample(draft);
@@ -13924,6 +13941,7 @@ export class Orchestrator {
     const clip = clipSpokenText(opts.prose);
     const decision = shouldSpeakReply({
       enabled,
+      provider: this.config.SEAM_GEMINI_SPEECH_PROVIDER,
       apiKey: this.config.SEAM_GEMINI_API_KEY,
       prose: clip.text,
       alreadyHadAudio: opts.alreadyHadAudio,
@@ -13947,7 +13965,10 @@ export class Orchestrator {
     }
     try {
       const spoken = await speakReplyToOgg({
+        provider: this.config.SEAM_GEMINI_SPEECH_PROVIDER,
         apiKey: this.config.SEAM_GEMINI_API_KEY,
+        vertexProjectId: this.config.SEAM_GEMINI_VERTEX_PROJECT_ID,
+        vertexLocation: this.config.SEAM_GEMINI_VERTEX_LOCATION,
         text: decision.text,
         model: this.config.SEAM_GEMINI_TTS_MODEL,
         voice:

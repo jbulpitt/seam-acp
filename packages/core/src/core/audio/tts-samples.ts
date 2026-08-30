@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { GEMINI_TTS_VOICES } from "./gemini-tts.js";
 import { speakReplyToOgg } from "./voice-replies.js";
+import type { GeminiSpeechAuth } from "./google-speech-provider.js";
 
 export const TTS_SAMPLE_SCRIPT =
   "Hello. This is a short sample so you can hear this voice. The wording is the same for every option.";
@@ -21,11 +22,10 @@ export type SampleResult =
 
 export async function getOrCreateTtsSample(opts: {
   dataDir: string;
-  apiKey: string;
   voice: string;
   model?: string;
   fetchFn?: typeof fetch;
-}): Promise<SampleResult> {
+} & GeminiSpeechAuth): Promise<SampleResult> {
   const dest = ttsSamplePath(opts.dataDir, opts.voice);
   try {
     if (fs.existsSync(dest)) {
@@ -36,7 +36,11 @@ export async function getOrCreateTtsSample(opts: {
     /* fall through to regenerate */
   }
   const spoken = await speakReplyToOgg({
+    provider: opts.provider,
     apiKey: opts.apiKey,
+    vertexProjectId: opts.vertexProjectId,
+    vertexLocation: opts.vertexLocation,
+    accessToken: opts.accessToken,
     text: TTS_SAMPLE_SCRIPT,
     voice: opts.voice,
     pace: "natural",
@@ -58,10 +62,9 @@ export async function getOrCreateTtsSample(opts: {
 /** Fire-and-forget fill of remaining voices. Does not throw. */
 export function warmTtsSamples(opts: {
   dataDir: string;
-  apiKey: string;
   model?: string;
   concurrency?: number;
-}): void {
+} & GeminiSpeechAuth): void {
   const pending = GEMINI_TTS_VOICES.map((v) => v.name).filter((name) => {
     try {
       return !fs.existsSync(ttsSamplePath(opts.dataDir, name));
@@ -79,7 +82,11 @@ export function warmTtsSamples(opts: {
       try {
         await getOrCreateTtsSample({
           dataDir: opts.dataDir,
+          provider: opts.provider,
           apiKey: opts.apiKey,
+          vertexProjectId: opts.vertexProjectId,
+          vertexLocation: opts.vertexLocation,
+          accessToken: opts.accessToken,
           voice,
           ...(opts.model ? { model: opts.model } : {}),
         });

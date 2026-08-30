@@ -773,8 +773,14 @@ export class DiscordAdapter implements ChatAdapter {
         logger: this.logger,
         createTranscriber: async ({ speakerId, handlers }) =>
           GeminiLiveTranscribeClient.connect({
+            provider: this.config.SEAM_GEMINI_SPEECH_PROVIDER,
             apiKey: this.config.SEAM_GEMINI_API_KEY,
-            unaryModel: this.config.SEAM_GEMINI_STT_MODEL,
+            vertexProjectId: this.config.SEAM_GEMINI_VERTEX_PROJECT_ID,
+            vertexLocation: this.config.SEAM_GEMINI_VERTEX_LOCATION,
+            liveModel: this.config.SEAM_GEMINI_VERTEX_LIVE_STT_MODEL,
+            unaryModel: this.config.SEAM_GEMINI_SPEECH_PROVIDER === "vertex"
+              ? this.config.SEAM_GEMINI_VERTEX_STT_MODEL
+              : this.config.SEAM_GEMINI_STT_MODEL,
             customVocabulary: this.config.SEAM_GEMINI_STT_CUSTOM_VOCABULARY,
             handlers: {
               onInterim: handlers.onInterim,
@@ -821,8 +827,14 @@ export class DiscordAdapter implements ChatAdapter {
   ): Promise<{ reason: string }> {
     let coordinator!: ThreadVoiceCaptureCoordinator;
     const transcribe = await GeminiLiveTranscribeClient.connect({
+      provider: this.config.SEAM_GEMINI_SPEECH_PROVIDER,
       apiKey: this.config.SEAM_GEMINI_API_KEY,
-      unaryModel: this.config.SEAM_GEMINI_STT_MODEL,
+      vertexProjectId: this.config.SEAM_GEMINI_VERTEX_PROJECT_ID,
+      vertexLocation: this.config.SEAM_GEMINI_VERTEX_LOCATION,
+      liveModel: this.config.SEAM_GEMINI_VERTEX_LIVE_STT_MODEL,
+      unaryModel: this.config.SEAM_GEMINI_SPEECH_PROVIDER === "vertex"
+        ? this.config.SEAM_GEMINI_VERTEX_STT_MODEL
+        : this.config.SEAM_GEMINI_STT_MODEL,
       customVocabulary: this.config.SEAM_GEMINI_STT_CUSTOM_VOCABULARY,
       handlers: {
         onInterim: (text) => coordinator?.onInterim(text),

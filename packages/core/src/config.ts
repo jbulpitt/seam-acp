@@ -554,8 +554,18 @@ const Schema = z.object({
    * Empty = leave audio attachments untranscribed (current behavior).
    */
   SEAM_GEMINI_API_KEY: z.string().default(""),
+  /** Speech transport only. Live Help continues to use the Studio API key. */
+  SEAM_GEMINI_SPEECH_PROVIDER: z.enum(["developer", "vertex"]).default("developer"),
+  /** Vertex/Agent Platform project used when the speech provider is vertex. */
+  SEAM_GEMINI_VERTEX_PROJECT_ID: z.string().default(""),
+  /** Gemini speech models currently use the Vertex global endpoint. */
+  SEAM_GEMINI_VERTEX_LOCATION: z.string().min(1).default("global"),
   /** Gemini model id used for inbound voice-note transcription. */
   SEAM_GEMINI_STT_MODEL: z.string().min(1).default("gemini-3.5-transcribe"),
+  /** Vertex model id for unary/voice-note transcription. */
+  SEAM_GEMINI_VERTEX_STT_MODEL: z.string().min(1).default("gemini-3.5-transcribe-preview"),
+  /** Vertex model id for the Thread Voice bidirectional session. */
+  SEAM_GEMINI_VERTEX_LIVE_STT_MODEL: z.string().min(1).default("gemini-3.5-transcribe-live-preview"),
   /**
    * Comma-separated terms that bias Gemini 3.5 Transcribe toward project,
    * product, and proper names. Google supports up to 1,000 entries and

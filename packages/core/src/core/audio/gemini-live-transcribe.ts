@@ -8,6 +8,14 @@
 import { WebSocket } from "ws";
 import { liveWsUrl, parseLiveWsData, serverContentOf } from "./gemini-live-spike.js";
 import {
+  requireVertexConfig,
+  resolveSpeechAccessToken,
+  vertexLiveWsUrl,
+  vertexModelResource,
+  type GeminiSpeechAuth,
+  type GeminiSpeechProvider,
+} from "./google-speech-provider.js";
+import {
   normalizeCustomVocabulary,
   transcribeAudioWithGemini,
   type SttResult,
@@ -15,6 +23,8 @@ import {
 
 export const GEMINI_LIVE_TRANSCRIBE_MODEL = "gemini-3.5-transcribe-live";
 export const GEMINI_UNARY_TRANSCRIBE_MODEL = "gemini-3.5-transcribe";
+export const VERTEX_LIVE_TRANSCRIBE_MODEL = "gemini-3.5-transcribe-live-preview";
+export const VERTEX_UNARY_TRANSCRIBE_MODEL = "gemini-3.5-transcribe-preview";
 export const GEMINI_PCM16K_MIME = "audio/pcm;rate=16000";
 
 const DEFAULT_SETUP_TIMEOUT_MS = 12_000;
@@ -57,7 +67,7 @@ export interface GeminiLiveTranscribeHandlers {
 }
 
 export interface GeminiUnaryFallbackInput {
-  apiKey: string;
+  apiKey?: string;
   model: string;
   pcm16k: Uint8Array;
   customVocabulary: ReadonlyArray<string>;
@@ -68,12 +78,17 @@ export type GeminiUnaryFallback = (
 ) => Promise<SttResult>;
 
 export interface GeminiLiveTranscribeOptions {
-  apiKey: string;
+  apiKey?: string;
+  provider?: GeminiSpeechProvider;
+  vertexProjectId?: string;
+  vertexLocation?: string;
+  accessToken?: string | (() => string | Promise<string>);
+  liveModel?: string;
   unaryModel?: string;
   customVocabulary?: ReadonlyArray<string>;
   handlers?: GeminiLiveTranscribeHandlers;
   /** Test seam and optional host override. */
-  webSocketFactory?: (url: string) => WebSocket;
+  webSocketFactory?: (url: string, options?: { headers?: Record<string, string> }) => WebSocket;
   /** Test seam; production defaults to existing Smart voice-note STT. */
   unaryFallback?: GeminiUnaryFallback;
   /** Passed only to the default unary fallback. */
@@ -85,11 +100,24 @@ export interface GeminiLiveTranscribeOptions {
 
 export function buildGeminiLiveTranscribeSetup(opts: {
   customVocabulary?: ReadonlyArray<string>;
+  provider?: GeminiSpeechProvider;
+  vertexProjectId?: string;
+  vertexLocation?: string;
+  model?: string;
 } = {}): { setup: Record<string, unknown> } {
   const customVocabulary = normalizeCustomVocabulary(opts.customVocabulary ?? []);
+  const provider = opts.provider ?? "developer";
+  const model = opts.model?.trim() || (provider === "vertex" ? VERTEX_LIVE_TRANSCRIBE_MODEL : GEMINI_LIVE_TRANSCRIBE_MODEL);
+  const modelResource = provider === "vertex"
+    ? vertexModelResource({
+        projectId: opts.vertexProjectId?.trim() || "",
+        location: opts.vertexLocation?.trim() || "global",
+        model,
+      })
+    : `models/${model}`;
   return {
     setup: {
-      model: `models/${GEMINI_LIVE_TRANSCRIBE_MODEL}`,
+      model: modelResource,
       generationConfig: {
         responseModalities: ["TEXT"],
       },
@@ -188,10 +216,15 @@ function joinFinalParts(parts: ReadonlyArray<string>): string {
  */
 export class GeminiLiveTranscribeClient {
   private readonly apiKey: string;
+  private readonly provider: GeminiSpeechProvider;
+  private readonly vertexProjectId: string;
+  private readonly vertexLocation: string;
+  private readonly accessToken?: string | (() => string | Promise<string>);
+  private readonly liveModel: string;
   private readonly unaryModel: string;
   private readonly customVocabulary: string[];
   private readonly handlers: GeminiLiveTranscribeHandlers;
-  private readonly webSocketFactory: (url: string) => WebSocket;
+  private readonly webSocketFactory: (url: string, options?: { headers?: Record<string, string> }) => WebSocket;
   private readonly unaryFallback: GeminiUnaryFallback;
   private readonly setupTimeoutMs: number;
   private readonly finalizationTimeoutMs: number;
@@ -206,11 +239,16 @@ export class GeminiLiveTranscribeClient {
   private totalForwardedBytes = 0;
 
   private constructor(opts: GeminiLiveTranscribeOptions) {
-    this.apiKey = opts.apiKey.trim();
-    this.unaryModel = opts.unaryModel?.trim() || GEMINI_UNARY_TRANSCRIBE_MODEL;
+    this.apiKey = opts.apiKey?.trim() ?? "";
+    this.provider = opts.provider ?? "developer";
+    this.vertexProjectId = opts.vertexProjectId?.trim() ?? "";
+    this.vertexLocation = opts.vertexLocation?.trim() || "global";
+    this.accessToken = opts.accessToken;
+    this.liveModel = opts.liveModel?.trim() || (this.provider === "vertex" ? VERTEX_LIVE_TRANSCRIBE_MODEL : GEMINI_LIVE_TRANSCRIBE_MODEL);
+    this.unaryModel = opts.unaryModel?.trim() || (this.provider === "vertex" ? VERTEX_UNARY_TRANSCRIBE_MODEL : GEMINI_UNARY_TRANSCRIBE_MODEL);
     this.customVocabulary = normalizeCustomVocabulary(opts.customVocabulary ?? []);
     this.handlers = opts.handlers ?? {};
-    this.webSocketFactory = opts.webSocketFactory ?? ((url) => new WebSocket(url));
+    this.webSocketFactory = opts.webSocketFactory ?? ((url, options) => new WebSocket(url, options));
     this.setupTimeoutMs = opts.setupTimeoutMs ?? DEFAULT_SETUP_TIMEOUT_MS;
     this.finalizationTimeoutMs =
       opts.finalizationTimeoutMs ?? DEFAULT_FINALIZATION_TIMEOUT_MS;
@@ -219,7 +257,11 @@ export class GeminiLiveTranscribeClient {
       opts.unaryFallback ??
       ((input) =>
         transcribeAudioWithGemini({
+          provider: this.provider,
           apiKey: input.apiKey,
+          vertexProjectId: this.vertexProjectId,
+          vertexLocation: this.vertexLocation,
+          accessToken: this.accessToken,
           bytes: input.pcm16k,
           mimeType: GEMINI_PCM16K_MIME,
           model: input.model,
@@ -231,7 +273,8 @@ export class GeminiLiveTranscribeClient {
   static async connect(
     opts: GeminiLiveTranscribeOptions
   ): Promise<GeminiLiveTranscribeClient> {
-    if (!opts.apiKey.trim()) throw new Error("no SEAM_GEMINI_API_KEY");
+    if ((opts.provider ?? "developer") === "vertex") requireVertexConfig(opts);
+    else if (!opts.apiKey?.trim()) throw new Error("no SEAM_GEMINI_API_KEY");
     const client = new GeminiLiveTranscribeClient(opts);
     await client.ensureConnection();
     return client;
@@ -384,7 +427,24 @@ export class GeminiLiveTranscribeClient {
   }
 
   private openConnection(): Promise<LiveConnection> {
-    const ws = this.webSocketFactory(liveWsUrl(this.apiKey));
+    if (this.provider !== "vertex") {
+      return this.openConnectionWithAuth(liveWsUrl(this.apiKey));
+    }
+    return resolveSpeechAccessToken(this.accessToken).then((token) =>
+      this.openConnectionWithAuth(vertexLiveWsUrl(), {
+        headers: {
+          authorization: `Bearer ${token}`,
+          "x-goog-user-project": this.vertexProjectId,
+        },
+      })
+    );
+  }
+
+  private openConnectionWithAuth(
+    url: string,
+    options?: { headers?: Record<string, string> }
+  ): Promise<LiveConnection> {
+    const ws = this.webSocketFactory(url, options);
     const connection: LiveConnection = { ws, intentionalClose: false };
 
     return new Promise((resolve, reject) => {
@@ -413,7 +473,13 @@ export class GeminiLiveTranscribeClient {
         if (
           !this.sendJson(
             connection,
-            buildGeminiLiveTranscribeSetup({ customVocabulary: this.customVocabulary })
+            buildGeminiLiveTranscribeSetup({
+              customVocabulary: this.customVocabulary,
+              provider: this.provider,
+              vertexProjectId: this.vertexProjectId,
+              vertexLocation: this.vertexLocation,
+              model: this.liveModel,
+            })
           )
         ) {
           fail(new Error("failed to send live transcribe setup"));

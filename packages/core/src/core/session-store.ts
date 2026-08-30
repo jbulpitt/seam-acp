@@ -2381,6 +2381,18 @@ export class SessionStore {
       .map(mapVoiceConsole);
   }
 
+  listTerminalVoiceConsoleCardsForVoiceChannel(voiceChannelId: string): VoiceConsoleSession[] {
+    return this.db
+      .prepare<[string], VoiceConsoleRow>(
+        `SELECT * FROM voice_console_sessions
+          WHERE voice_channel_id = ? AND status IN ('ended','failed')
+            AND card_message_id IS NOT NULL
+          ORDER BY created_utc ASC`
+      )
+      .all(voiceChannelId)
+      .map(mapVoiceConsole);
+  }
+
   getVoiceConsoleBinding(id: string): ThreadVoiceBinding | null {
     const row = this.db
       .prepare<[string], VoiceConsoleBindingRow>(

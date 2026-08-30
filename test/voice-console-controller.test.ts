@@ -84,6 +84,7 @@ describe("VoiceConsoleController startup transaction", () => {
         return { channel: { platform: "discord", id: "vc-1" }, id: "card-1" };
       }),
       editVoiceConsolePanel: vi.fn(async () => { events.push("card-edit"); }),
+      deleteMessage: vi.fn(async () => { events.push("card-delete"); }),
       voiceConsoleMessageExists: vi.fn(async () => true),
       createVoiceConsoleTransport: vi.fn(async (opts: any) => {
         events.push("transport-create");
@@ -320,6 +321,41 @@ describe("VoiceConsoleController startup transaction", () => {
     expect(destroyConnection).toHaveBeenCalledOnce();
     expect(captureHost.destroy).toHaveBeenCalledOnce();
     expect(store.getVoiceConsole(started.console.id)).toMatchObject({ status: "ended" });
+    manager.shutdown();
+  });
+
+  it("deletes ended cards and retries failed cleanup before posting the next console", async () => {
+    const { adapter, controller, manager, events } = setup();
+    const first = await controller.start(request);
+    if (!first.ok) throw new Error(first.error);
+    adapter.deleteMessage.mockRejectedValueOnce(Object.assign(new Error("transient delete failure"), {
+      code: 500,
+    }));
+    await expect(manager.stopConsole(first.console.id, {
+      expectedRevision: first.console.revision,
+      reason: "owner stopped",
+    })).resolves.toEqual({ ok: true, discarded: 0 });
+    expect(store.getVoiceConsole(first.console.id)?.cardMessageId).toBe("card-1");
+
+    events.length = 0;
+    adapter.sendVoiceConsolePanel.mockImplementationOnce(async () => {
+      events.push("card-post");
+      return {
+        channel: { platform: "discord", id: "vc-1" },
+        id: "card-2",
+      };
+    });
+    const second = await controller.start({ ...request, channelRef: "thread-2", alias: "Two" });
+    if (!second.ok) throw new Error(second.error);
+    expect(events.indexOf("card-delete")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("card-delete")).toBeLessThan(events.indexOf("card-post"));
+    expect(adapter.deleteMessage).toHaveBeenLastCalledWith({
+      channel: { platform: "discord", id: "vc-1" },
+      id: "card-1",
+    });
+    expect(store.getVoiceConsole(first.console.id)?.cardMessageId).toBeNull();
+
+    await controller.shutdownAll();
     manager.shutdown();
   });
 

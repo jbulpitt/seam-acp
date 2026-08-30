@@ -29,6 +29,10 @@ of `DISCORD_ALLOWED_USER_IDS`.
 - Run `/seam voice status` for paginated capture, speaker, binding, ACP,
   scheduler, lease, STT, and card diagnostics.
 - Run `/seam voice stop discard-pending:false` to stop the whole console.
+  Ending the console deletes its canonical VC-chat card after disconnecting.
+  Starting a new console first removes terminal cards left in that voice
+  channel by any earlier failed cleanup. Process restarts preserve active cards
+  for normal boot recovery.
 
 ## Canonical card
 

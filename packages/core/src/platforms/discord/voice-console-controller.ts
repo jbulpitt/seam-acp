@@ -190,6 +190,7 @@ export class VoiceConsoleController
           : `Voice Console ${occupied.id} already owns this guild voice lease.`,
       };
     }
+    await this.cleanupTerminalCards(inspection.voiceChannelId);
 
     const now = new Date().toISOString();
     const consoleId = newVoiceConsoleId();
@@ -405,22 +406,27 @@ export class VoiceConsoleController
     await this.refreshCard(binding.consoleId, true);
   }
 
-  async stopConsole(consoleId: string, _reason: string): Promise<void> {
+  async stopConsole(consoleId: string, reason: string): Promise<void> {
+    const console = this.store.getVoiceConsole(consoleId);
     const runtime = this.runtimes.get(consoleId);
-    if (!runtime) return;
-    this.runtimes.delete(consoleId);
-    if (runtime.ownerGrace) clearTimeout(runtime.ownerGrace);
-    if (runtime.cardTimer) clearTimeout(runtime.cardTimer);
-    runtime.stopOwnerWatch?.();
-    // A cosmetic Discord card edit can be slow or permanently rejected. It
-    // must never keep capture/playback or the bot's VC connection alive after
-    // the durable stop has begun.
-    void runtime.cardQueue.catch(() => undefined);
-    runtime.scheduler.destroy();
-    runtime.transport.destroyConnection();
-    await runtime.transport.captureHost.destroy().catch((err) =>
-      this.logger.warn({ err, consoleId }, "voice console capture shutdown failed")
-    );
+    if (runtime) {
+      this.runtimes.delete(consoleId);
+      if (runtime.ownerGrace) clearTimeout(runtime.ownerGrace);
+      if (runtime.cardTimer) clearTimeout(runtime.cardTimer);
+      runtime.stopOwnerWatch?.();
+      // A cosmetic Discord card edit can be slow or permanently rejected. It
+      // must never keep capture/playback or the bot's VC connection alive after
+      // the durable stop has begun.
+      void runtime.cardQueue.catch(() => undefined);
+      runtime.scheduler.destroy();
+      runtime.transport.destroyConnection();
+      await runtime.transport.captureHost.destroy().catch((err) =>
+        this.logger.warn({ err, consoleId }, "voice console capture shutdown failed")
+      );
+    }
+    // Process shutdown preserves the active canonical card for boot recovery.
+    // A real session end removes it so terminal cards do not accumulate.
+    if (reason !== "shutdown" && console) await this.deleteCanonicalCard(console, "console stop");
   }
 
   async waitForBindingSpeechIdle(bindingId: string): Promise<void> {
@@ -1039,6 +1045,41 @@ export class VoiceConsoleController
       });
     } finally {
       this.cardFailures.delete(consoleId);
+    }
+  }
+
+  private async cleanupTerminalCards(voiceChannelId: string): Promise<void> {
+    for (const console of this.store.listTerminalVoiceConsoleCardsForVoiceChannel(voiceChannelId)) {
+      await this.deleteCanonicalCard(console, "startup stale-card cleanup");
+    }
+  }
+
+  private async deleteCanonicalCard(console: VoiceConsoleSession, context: string): Promise<void> {
+    if (!console.cardMessageId) return;
+    const ref: MessageRef = {
+      channel: { platform: "discord", id: console.voiceChannelId },
+      id: console.cardMessageId,
+    };
+    try {
+      await this.adapter.deleteMessage(ref);
+    } catch (err) {
+      const code = err && typeof err === "object" ? (err as { code?: unknown }).code : undefined;
+      if (code !== 10008 && code !== 10003) {
+        this.logger.warn({ err, consoleId: console.id, context }, "Voice Console card deletion failed");
+        return;
+      }
+    }
+    const fresh = this.store.getVoiceConsole(console.id);
+    if (!fresh || fresh.cardMessageId !== console.cardMessageId) return;
+    const cleared = this.store.updateVoiceConsoleCard(console.id, {
+      expectedRevision: fresh.revision,
+      cardMessageId: null,
+    });
+    if (!cleared.ok) {
+      this.logger.warn(
+        { consoleId: console.id, context, error: cleared.error },
+        "Voice Console deleted-card pointer cleanup failed"
+      );
     }
   }
 

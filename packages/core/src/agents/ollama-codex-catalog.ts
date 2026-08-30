@@ -88,7 +88,13 @@ export function buildOllamaCodexCatalog(
         upgrade: null,
         priority: i + 1,
         experimental_supported_tools: [],
-        supports_search_tool: true,
+        // MUST be false for a non-OpenAI provider. With true (+ tool_mode null),
+        // codex registers MCP tools as ToolExposure::Deferred behind `tool_search`
+        // — but Ollama's Responses API can't service tool_search, so seam-mcp
+        // tools (inspect_image, handoff, poll_inbox, …) become invisible and even
+        // the tool_search escape hatch aborts. false → ToolExposure::Direct, so
+        // MCP tools appear inline and are directly callable. See openai/codex#36382.
+        supports_search_tool: false,
         default_service_tier: null,
         supports_reasoning_summaries: true,
         base_instructions: OLLAMA_CODEX_BASE_INSTRUCTIONS,

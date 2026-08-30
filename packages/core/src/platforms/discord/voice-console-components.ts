@@ -375,7 +375,7 @@ export function buildVoiceConsoleComponentRows(
           disabled,
         }],
       }
-    : disabledPlaceholderRow(state, "No input bindings");
+    : disabledPlaceholderRow(state, "input", "No input bindings");
 
   const outputRow: VoiceConsoleComponentRow = options.length > 0
     ? {
@@ -392,7 +392,7 @@ export function buildVoiceConsoleComponentRows(
           disabled,
         }],
       }
-    : disabledPlaceholderRow(state, "No output bindings");
+    : disabledPlaceholderRow(state, "output", "No output bindings");
 
   const configureRow: VoiceConsoleComponentRow = options.length > 0
     ? {
@@ -406,7 +406,7 @@ export function buildVoiceConsoleComponentRows(
           disabled,
         }],
       }
-    : disabledPlaceholderRow(state, "No binding to configure");
+    : disabledPlaceholderRow(state, "configure", "No binding to configure");
 
   const safetyRow: VoiceConsoleComponentRow = {
     components: [
@@ -792,10 +792,11 @@ function editorButton(
 
 function disabledPlaceholderRow(
   state: Pick<VoiceConsoleControlState, "consoleId" | "revision">,
+  action: "input" | "output" | "configure",
   label: string
 ): VoiceConsoleComponentRow {
   return {
-    components: [simpleButton(state, "refresh", label, "secondary", true)],
+    components: [simpleButton(state, action, label, "secondary", true)],
   };
 }
 

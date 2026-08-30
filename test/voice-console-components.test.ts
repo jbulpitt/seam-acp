@@ -240,6 +240,27 @@ describe("canonical five-row component layout", () => {
     expect(rows[3]!.components[0]).toMatchObject({ label: "Input off", disabled: true });
   });
 
+  it("uses unique custom ids when an ended console has no bindings", () => {
+    const rows = buildVoiceConsoleComponentRows({
+      consoleId: "tvc_console",
+      revision: 11,
+      fanoutArmed: false,
+      selectedBindingIds: [],
+      bindings: [],
+      page: 0,
+      pageCount: 1,
+      disabled: true,
+    });
+    const customIds = rows.flatMap((row) => row.components.map((component) => component.customId));
+    expect(new Set(customIds).size).toBe(customIds.length);
+    expect(customIds.slice(0, 3)).toEqual([
+      "tvc:tvc_console:11:input",
+      "tvc:tvc_console:11:output",
+      "tvc:tvc_console:11:configure",
+    ]);
+    expect(() => discordComponentJson(rows)).not.toThrow();
+  });
+
   it("refuses inconsistent or over-cap durable render state", () => {
     expect(() => buildVoiceConsoleComponentRows({
       consoleId: "tvc_console",

@@ -463,10 +463,12 @@ const Schema = z.object({
   ZAI_COMPACTION_MODEL: z.string().default("glm-5.2"),
 
   /**
-   * Register the Ollama Cloud agent — Claude Code (claude-agent-acp) pointed
-   * at Ollama's Anthropic-compatible endpoint (https://ollama.com).
-   * Uses open-weight models hosted on Ollama's cloud infrastructure.
-   * Only registered when OLLAMA_CLOUD_ENABLED and OLLAMA_CLOUD_API_KEY are set.
+   * Register the Ollama Cloud agent — OpenAI Codex (codex-acp) pointed at
+   * Ollama's OpenAI-compatible endpoint (https://ollama.com/v1) via a dedicated
+   * CODEX_HOME whose config.toml declares an "ollama-cloud" model_provider
+   * (wire_api = "responses"). Uses open-weight models hosted on Ollama's cloud
+   * infrastructure. Only registered when OLLAMA_CLOUD_ENABLED and
+   * OLLAMA_CLOUD_API_KEY are set.
    */
   OLLAMA_CLOUD_ENABLED: z
     .enum(["true", "false"])

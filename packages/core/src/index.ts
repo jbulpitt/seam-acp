@@ -255,43 +255,61 @@ async function main(): Promise<void> {
       })
     : undefined;
 
-  // Optional Ollama Cloud agent: Claude Code (claude-agent-acp) pointed at
-  // Ollama's Anthropic-compatible endpoint.  Runs open-weight models
-  // (qwen3-coder 480B, deepseek-v3.1 671B, etc.) on Ollama's cloud GPUs.
+  // Optional Ollama Cloud agent: OpenAI Codex (codex-acp) pointed at Ollama's
+  // OpenAI-compatible endpoint (https://ollama.com/v1) via a dedicated CODEX_HOME
+  // whose config.toml declares an "ollama-cloud" model_provider. This gives the
+  // agent codex's picker, reasoning_effort tiers, session management, and usage —
+  // cleaner than the prior claude-agent-acp-over-Anthropic-compat shim.
+  //   - wire_api MUST be "responses": codex 0.149 dropped "chat", and Ollama's
+  //     /v1/responses (non-stateful) is sufficient for codex.
+  //   - The provider's env_key supplies the key, so NO OpenAI login is needed in
+  //     this CODEX_HOME (verified: codex exec ran a turn against ollama-cloud with
+  //     an empty home).
+  //   - Brand ("ollama-cloud") is derived from the agent id in agent-brand.ts and
+  //     the quota card scrapes ollama.com — both unaffected by the backend swap.
+  //   - Existing threads self-heal: their stale claude acp_session_id fails
+  //     session/load and SessionRouter falls through to a fresh codex session;
+  //     :cloud-suffixed model pins still resolve on the OpenAI endpoint.
   // Only registered when OLLAMA_CLOUD_ENABLED and OLLAMA_CLOUD_API_KEY are set.
+  const ollamaCloudCodexHome = path.join(process.env.HOME ?? "", ".codex-ollama-cloud");
+  if (config.OLLAMA_CLOUD_ENABLED && config.OLLAMA_CLOUD_API_KEY) {
+    fs.mkdirSync(ollamaCloudCodexHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(ollamaCloudCodexHome, "config.toml"),
+      [
+        'model_provider = "ollama-cloud"',
+        "",
+        "[model_providers.ollama-cloud]",
+        'name = "Ollama Cloud"',
+        'base_url = "https://ollama.com/v1"',
+        'env_key = "OLLAMA_CLOUD_API_KEY"',
+        'wire_api = "responses"',
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+  }
   const ollamaCloud = config.OLLAMA_CLOUD_ENABLED && config.OLLAMA_CLOUD_API_KEY
-    ? makeClaudeProfile({
+    ? makeCodexProfile({
         id: "ollama-cloud",
         displayName: "Ollama Cloud",
-        brand: "ollama-cloud",
         defaultModel: config.OLLAMA_CLOUD_DEFAULT_MODEL,
         staticModels: config.OLLAMA_CLOUD_MODELS ?? OLLAMA_CLOUD_STATIC_MODELS,
-        configDir: path.join(process.env.HOME ?? "", ".claude-ollama-cloud"),
         threadAbbr: "🦙☁️",
-        // Ollama Cloud's Anthropic /v1/messages maps output_config.effort →
-        // native think levels (low|medium|high|max; xhigh→high). Empirically
-        // verified 2026-08-20 against kimi-k3:cloud: effort=low collapses
-        // thinking; omit-think on the native API matches think=max (Moonshot's
-        // K3 default). Claude Code Options.effort is the same field. Do NOT
-        // also send thinking.type=enabled — that shadows effort and forces
-        // boolean think=true.
+        // Restrict to reasoning_effort values codex-acp advertises AND Ollama's
+        // OpenAI endpoint accepts, so every offered tier works on both sides.
+        // (codex also advertises xhigh/ultra; Ollama also accepts medium/none —
+        // low/high/max is the safe intersection.)
         effort: {
-          mechanism: "meta" as const,
-          levels: ["low", "medium", "high", "max"],
+          mechanism: "configOption",
+          configId: "reasoning_effort",
+          levels: ["low", "high", "max"],
         },
         extraEnv: {
-          ANTHROPIC_BASE_URL: "https://ollama.com",
-          // Ollama Cloud expects Authorization: Bearer — ANTHROPIC_AUTH_TOKEN
-          // sends the key as a Bearer token; ANTHROPIC_API_KEY would send it
-          // via x-api-key which Ollama rejects (401).
-          ANTHROPIC_AUTH_TOKEN: config.OLLAMA_CLOUD_API_KEY,
-          // Remap claude-agent-acp's internal model aliases so it doesn't try
-          // to resolve "claude-sonnet-5" etc. against Ollama's endpoint.
-          ANTHROPIC_DEFAULT_SONNET_MODEL: config.OLLAMA_CLOUD_DEFAULT_MODEL,
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: config.OLLAMA_CLOUD_DEFAULT_MODEL,
-          ANTHROPIC_DEFAULT_OPUS_MODEL: config.OLLAMA_CLOUD_DEFAULT_MODEL,
-          ANTHROPIC_MODEL: config.OLLAMA_CLOUD_DEFAULT_MODEL,
+          CODEX_HOME: ollamaCloudCodexHome,
+          OLLAMA_CLOUD_API_KEY: config.OLLAMA_CLOUD_API_KEY,
         },
+        sessionsRoot: path.join(ollamaCloudCodexHome, "sessions"),
       })
     : undefined;
 

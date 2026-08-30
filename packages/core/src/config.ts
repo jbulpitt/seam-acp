@@ -478,6 +478,15 @@ const Schema = z.object({
   OLLAMA_CLOUD_API_KEY: z.string().optional(),
   /** Path to `ollama-usage`. Defaults to `ollama-usage` on PATH. */
   OLLAMA_USAGE_CLI_PATH: z.string().optional(),
+  /**
+   * Base URL codex uses for the Ollama Cloud provider. Defaults to the local
+   * codex-universal-proxy (chat-completion adaptor), which flattens codex's
+   * namespace-wrapped MCP tools into plain function tools so the seam-mcp tools
+   * work: codex 0.117+ wraps MCP tools in a `type:"namespace"` that Ollama's
+   * OpenAI-compat endpoint silently drops (openai/codex#23186). Point straight
+   * at https://ollama.com/v1 only if MCP tools aren't needed for these models.
+   */
+  OLLAMA_CLOUD_CODEX_BASE_URL: z.string().default("http://127.0.0.1:11436/v1"),
   /** Default model id for Ollama Cloud sessions. */
   OLLAMA_CLOUD_DEFAULT_MODEL: z.string().default("glm-5.2:cloud"),
   OLLAMA_CLOUD_MODELS: ModelsListSchema,

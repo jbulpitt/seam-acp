@@ -296,7 +296,7 @@ async function main(): Promise<void> {
         "",
         "[model_providers.ollama-cloud]",
         'name = "Ollama Cloud"',
-        'base_url = "https://ollama.com/v1"',
+        `base_url = ${JSON.stringify(config.OLLAMA_CLOUD_CODEX_BASE_URL)}`,
         'env_key = "OLLAMA_CLOUD_API_KEY"',
         'wire_api = "responses"',
         "",

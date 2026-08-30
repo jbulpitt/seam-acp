@@ -152,15 +152,15 @@ function paragraphBoundary(text: string): { start: number; end: number } | undef
 }
 
 function firstSentenceBoundary(text: string): number | undefined {
-  const re = /[.!?](?:["')\]]*)\s+/g;
+  const re = /[.!?](?:["')\]]*)(?=\s|$)/g;
   const match = re.exec(text);
-  return match ? match.index + match[0].trimEnd().length : undefined;
+  return match ? match.index + match[0].length : undefined;
 }
 
 function firstSentenceBoundaryAtOrAfter(text: string, minimum: number): number | undefined {
-  const re = /[.!?](?:["')\]]*)\s+/g;
+  const re = /[.!?](?:["')\]]*)(?=\s|$)/g;
   for (let match = re.exec(text); match; match = re.exec(text)) {
-    const end = match.index + match[0].trimEnd().length;
+    const end = match.index + match[0].length;
     if (end >= minimum) return end;
   }
   return undefined;

@@ -100,8 +100,13 @@ export function buildTtsInput(text: string, pace: TtsPace = "natural", style: Tt
     `Director's notes: ${paceNote} ${styleNote} ` +
     `When the transcript contains a URL, name the site or page in a few words ` +
     `(e.g. "a Google search", "a GitHub link") — do not read the address, path, or query string. ` +
-    `Paraphrase highly technical content (long shell commands, flags, commit hashes, file paths) ` +
-    `in a few words; do not read them token-by-token. ` +
+    `Paraphrase highly technical content (long shell commands, flags, file paths) in a few words. ` +
+    `Never read long identifiers, UUIDs, opaque IDs, tokens, or hashes character-by-character; ` +
+    `say what the value represents (for example, "the session ID" or "the commit hash"), ` +
+    `adding only a short distinguishing prefix when it is genuinely useful. ` +
+    `Simplify large numbers and long decimals for natural speech unless exact precision is essential: ` +
+    `round them and use words such as thousand, million, or billion (for example, say ` +
+    `"about 1.2 million" or "about 3.14"). ` +
     `Slash commands: say the words without the leading slash (e.g. "seam config tts").\n` +
     `Speak this Discord reply clearly. Read only the following transcript, no commentary.\n\n` +
     `TRANSCRIPT:\n${text}`

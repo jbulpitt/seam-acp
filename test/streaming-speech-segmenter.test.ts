@@ -8,6 +8,22 @@ describe("StreamingSpeechSegmenter", () => {
     expect(segmenter.flush()).toEqual(["The unfinished tail"]);
   });
 
+  it("releases a visible sentence whose punctuation ends the current text event", () => {
+    const segmenter = new StreamingSpeechSegmenter();
+    expect(segmenter.feed("This sentence is already visibly complete.")).toEqual([
+      "This sentence is already visibly complete.",
+    ]);
+    expect(segmenter.flush()).toEqual([]);
+  });
+
+  it("releases a later minimum-sized sentence at an event-ending punctuation mark", () => {
+    const segmenter = new StreamingSpeechSegmenter({ minChars: 20 });
+    expect(segmenter.feed("First.")).toEqual(["First."]);
+    expect(segmenter.feed(" This later sentence is complete.")).toEqual([
+      "This later sentence is complete.",
+    ]);
+  });
+
   it("uses the sub-minimum sentence fast path only once", () => {
     const segmenter = new StreamingSpeechSegmenter();
     expect(segmenter.feed("One. Two. Three. unfinished tail")).toEqual(["One."]);

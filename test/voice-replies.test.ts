@@ -88,6 +88,11 @@ describe("Gemini TTS voices", () => {
     expect(input).toMatch(/name the site or page/i);
     expect(input).toMatch(/do not read the address/i);
     expect(input).toMatch(/Paraphrase highly technical content/i);
+    expect(input).toMatch(/Never read long identifiers, UUIDs, opaque IDs, tokens, or hashes character-by-character/i);
+    expect(input).toMatch(/adding only a short distinguishing prefix/i);
+    expect(input).toMatch(/Simplify large numbers and long decimals/i);
+    expect(input).toMatch(/about 1\.2 million/i);
+    expect(input).toMatch(/about 3\.14/i);
     expect(input).toMatch(/without the leading slash/i);
   });
 

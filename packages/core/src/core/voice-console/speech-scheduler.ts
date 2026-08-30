@@ -6,6 +6,7 @@ import type {
   VoiceConsoleBindingStateConflict,
   VoiceConsoleBindingStateSyncResult,
   VoiceConsoleChunkDisposition,
+  VoiceConsolePlaybackStream,
   VoiceConsolePlaybackResult,
   VoiceConsoleSpeechBindingSnapshot,
   VoiceConsoleSpeechChunk,
@@ -58,8 +59,8 @@ type CurrentWork = {
 
 type WorkOutcome =
   | { kind: "played"; durationMs: number }
-  | { kind: "failed"; phase: "synthesis" | "playback"; error: string }
-  | { kind: "dropped" };
+  | { kind: "failed"; phase: "synthesis" | "playback"; error: string; durationMs?: number }
+  | { kind: "dropped"; durationMs?: number };
 
 export type VoiceConsoleSpeechSchedulerOptions = {
   consoleId: string;
@@ -563,6 +564,8 @@ export class VoiceConsoleSpeechScheduler {
       return { kind: "dropped" };
     }
 
+    let streamingPlayback: VoiceConsolePlaybackStream | undefined;
+    let streamedAudioAccepted = false;
     try {
       // Keep the global synthesis slot until the provider promise actually
       // settles. Abort suppresses its output, but an abort-ignoring provider
@@ -572,13 +575,63 @@ export class VoiceConsoleSpeechScheduler {
           chunk: work.chunk,
           profile: { ...binding.profile },
           signal: work.controller.signal,
+          onAudioDelta: async (audio) => {
+            if (!this.isWorkValid(work, source, binding)) throw abortError();
+            if (!this.playback.beginStream) {
+              throw new Error("Voice Console playback does not support streaming audio");
+            }
+            streamingPlayback ??= this.playback.beginStream({
+              chunk: work.chunk,
+              signal: work.controller.signal,
+            });
+            streamedAudioAccepted = true;
+            work.phase = "playback";
+            this.queueStateChange("work-phase-changed");
+            await streamingPlayback.enqueue(audio);
+          },
         })
       );
-      if (work.controller.signal.aborted) return { kind: "dropped" };
-      if (!synthesized.ok) {
-        return { kind: "failed", phase: "synthesis", error: synthesized.error };
+      if (work.controller.signal.aborted) {
+        streamingPlayback?.cancel();
+        const stopped = await streamingPlayback?.finish();
+        return { kind: "dropped", durationMs: playbackDuration(stopped) };
       }
-      if (!this.isWorkValid(work, source, binding)) return { kind: "dropped" };
+      if (!synthesized.ok) {
+        const stopped = streamingPlayback ? await streamingPlayback.finish() : undefined;
+        return {
+          kind: "failed",
+          phase: "synthesis",
+          error: synthesized.error,
+          durationMs: playbackDuration(stopped),
+        };
+      }
+      if (!this.isWorkValid(work, source, binding)) {
+        streamingPlayback?.cancel();
+        const stopped = await streamingPlayback?.finish();
+        return { kind: "dropped", durationMs: playbackDuration(stopped) };
+      }
+
+      if ("streamed" in synthesized && synthesized.streamed) {
+        if (!streamingPlayback || !streamedAudioAccepted) {
+          return {
+            kind: "failed",
+            phase: "synthesis",
+            error: "Voice Console TTS stream completed without accepted audio",
+          };
+        }
+        const played = await streamingPlayback.finish();
+        return this.playbackOutcome(work, source, binding, played);
+      }
+
+      // Defensive provider fence: if a provider emitted deltas and also returns
+      // unary audio, never replay the chunk. The accepted stream owns playback.
+      if (streamingPlayback) {
+        const played = await streamingPlayback.finish();
+        return this.playbackOutcome(work, source, binding, played);
+      }
+      if (!("audio" in synthesized)) {
+        return { kind: "failed", phase: "synthesis", error: "TTS response had no audio" };
+      }
 
       work.phase = "playback";
       this.queueStateChange("work-phase-changed");
@@ -593,26 +646,46 @@ export class VoiceConsoleSpeechScheduler {
         work.controller.signal
       );
       const playbackResult = await playback;
-      if (playbackResult.aborted) return { kind: "dropped" };
-      const played = playbackResult.value;
-      if (played.status === "failed") {
-        return { kind: "failed", phase: "playback", error: played.error };
+      if (playbackResult.aborted) {
+        return {
+          kind: "dropped",
+          durationMs: this.playback.currentConsumedAudioMs?.() ?? 0,
+        };
       }
-      if (
-        played.status === "cancelled" ||
-        !this.isWorkValid(work, source, binding)
-      ) {
-        return { kind: "dropped" };
-      }
-      return { kind: "played", durationMs: nonNegativeDuration(played) };
+      return this.playbackOutcome(work, source, binding, playbackResult.value);
     } catch (error) {
-      if (work.controller.signal.aborted) return { kind: "dropped" };
+      streamingPlayback?.cancel();
+      const stopped = await streamingPlayback?.finish().catch(() => undefined);
+      if (work.controller.signal.aborted) {
+        return { kind: "dropped", durationMs: playbackDuration(stopped) };
+      }
       return {
         kind: "failed",
         phase: work.phase,
         error: error instanceof Error ? error.message : String(error),
+        durationMs: playbackDuration(stopped),
       };
     }
+  }
+
+  private playbackOutcome(
+    work: CurrentWork,
+    source: SourceState,
+    binding: BindingState,
+    played: VoiceConsolePlaybackResult
+  ): WorkOutcome {
+    if (played.status === "failed") {
+      return {
+        kind: "failed",
+        phase: "playback",
+        error: played.error,
+        durationMs: nonNegativeDuration(played),
+      };
+    }
+    if (played.status === "cancelled" || !this.isWorkValid(work, source, binding)) {
+      return { kind: "dropped", durationMs: nonNegativeDuration(played) };
+    }
+    return { kind: "played", durationMs: nonNegativeDuration(played) };
   }
 
   private settle(work: CurrentWork, outcome: WorkOutcome): void {
@@ -634,7 +707,7 @@ export class VoiceConsoleSpeechScheduler {
         error: outcome.error.slice(0, MAX_RECENT_FAILURE_ERROR_CHARS),
       };
       this.queueStateChange("failure");
-      this.recordFairness(work.sourceKey, 0);
+      this.recordFairness(work.sourceKey, outcome.durationMs ?? 0);
       if (!source.warned) {
         source.warned = true;
         try {
@@ -651,6 +724,9 @@ export class VoiceConsoleSpeechScheduler {
       return;
     }
     this.recordSettlement(source, binding, "dropped", 0);
+    if ((outcome.durationMs ?? 0) > 0) {
+      this.recordFairness(work.sourceKey, outcome.durationMs ?? 0);
+    }
   }
 
   private recordSettlement(
@@ -945,6 +1021,16 @@ function nonNegativeDuration(result: VoiceConsolePlaybackResult): number {
   return Number.isFinite(result.durationMs) && result.durationMs > 0
     ? Math.round(result.durationMs)
     : 0;
+}
+
+function playbackDuration(result: VoiceConsolePlaybackResult | undefined): number {
+  return result ? nonNegativeDuration(result) : 0;
+}
+
+function abortError(): Error {
+  const error = new Error("Voice Console speech work was cancelled");
+  error.name = "AbortError";
+  return error;
 }
 
 async function abortable<T>(

@@ -69,7 +69,10 @@ export class StreamingSpeechSegmenter {
       if (!this.prose) break;
 
       const paragraph = paragraphBoundary(this.prose);
-      const sentence = firstSentenceBoundaryAtOrAfter(this.prose, this.minChars);
+      // A complete sentence is immediately useful speech, even when it is
+      // shorter than the forced-chunk minimum. Holding it until turn EOF adds
+      // avoidable latency and defeats progressive playback.
+      const sentence = firstSentenceBoundary(this.prose);
       if (paragraph !== undefined && (sentence === undefined || paragraph.end <= sentence)) {
         const spoken = speechWhitespace(this.prose.slice(0, paragraph.start));
         this.prose = this.prose.slice(paragraph.end);
@@ -133,13 +136,10 @@ function paragraphBoundary(text: string): { start: number; end: number } | undef
   return { start: match.index, end: match.index + match[0].length };
 }
 
-function firstSentenceBoundaryAtOrAfter(text: string, minimum: number): number | undefined {
+function firstSentenceBoundary(text: string): number | undefined {
   const re = /[.!?](?:["')\]]*)\s+/g;
-  for (let match = re.exec(text); match; match = re.exec(text)) {
-    const end = match.index + match[0].trimEnd().length;
-    if (end >= minimum) return end;
-  }
-  return undefined;
+  const match = re.exec(text);
+  return match ? match.index + match[0].trimEnd().length : undefined;
 }
 
 function safestForcedBoundary(text: string, minimum: number, maximum: number): number {

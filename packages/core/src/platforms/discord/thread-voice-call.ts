@@ -656,6 +656,12 @@ const DEFAULT_PLAYBACK_DEPENDENCIES: PlaybackDependencies = {
   createEncoder: () => new OpusEncoder(48_000, 2),
 };
 
+// Keepalive SSE bytes can reset the read-idle watchdog without carrying audio,
+// so an audio-delta gap can last until the 180s overall provider deadline.
+// Discord's default (5 missed 20ms frames) tears a resource down after ~100ms;
+// 10,000 frames keeps the one persistent resource alive beyond that deadline.
+const STREAMING_MAX_MISSED_FRAMES = 10_000;
+
 /** Ordered 24 kHz mono PCM -> Discord Opus queue with a reusable player. */
 export class ThreadVoicePlaybackQueue {
   private readonly player: AudioPlayer;
@@ -672,9 +678,12 @@ export class ThreadVoicePlaybackQueue {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private cycleActive = false;
   private endingStream = false;
+  private streamingProducerOpen = false;
   private destroyed = false;
   private lastPlaybackError: string | undefined;
+  private consumedAudioMsTotal = 0;
   private idleWaiters: Array<() => void> = [];
+  private capacityWaiters: Array<{ maxBufferedMs: number; resolve: () => void }> = [];
 
   constructor(opts: {
     connection: Pick<VoiceConnection, "subscribe">;
@@ -691,7 +700,10 @@ export class ThreadVoicePlaybackQueue {
     this.createResource = dependencies.createResource;
     this.encoder = dependencies.createEncoder();
     this.player = dependencies.createPlayer({
-      behaviors: { noSubscriber: NoSubscriberBehavior.Play },
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Play,
+        maxMissedFrames: STREAMING_MAX_MISSED_FRAMES,
+      },
     });
     this.subscription = this.connection.subscribe(this.player);
     this.player.on("stateChange", (_oldState, newState) => {
@@ -719,6 +731,51 @@ export class ThreadVoicePlaybackQueue {
     this.pump();
   }
 
+  /** Keep one Discord resource open while network TTS deltas arrive. */
+  beginStreaming(): void {
+    if (this.destroyed) throw new Error("Thread Voice playback queue has ended");
+    if (this.streamingProducerOpen) {
+      throw new Error("Thread Voice playback already has a streaming producer");
+    }
+    if (!this.isIdle()) {
+      throw new Error("Thread Voice playback must be idle before streaming begins");
+    }
+    this.lastPlaybackError = undefined;
+    this.streamingProducerOpen = true;
+  }
+
+  /** Flush the final partial Opus frame and allow the resource to become idle. */
+  endStreaming(): void {
+    if (!this.streamingProducerOpen) return;
+    this.streamingProducerOpen = false;
+    this.flushPcmTail();
+    this.pump();
+    if (this.cycleActive && !this.timer) this.writeNextPacket();
+    if (this.isIdle()) {
+      this.onPlaybackIdle?.();
+      this.resolveIdleWaiters();
+    }
+    this.resolveCapacityWaiters();
+  }
+
+  bufferedAudioMs(): number {
+    return this.packets.length * OPUS_FRAME_MS +
+      (this.pcmTail.byteLength / (24_000 * 2)) * 1_000;
+  }
+
+  consumedAudioMs(): number {
+    return this.consumedAudioMsTotal;
+  }
+
+  waitForBufferedAudioBelow(maxBufferedMs: number): Promise<void> {
+    if (this.destroyed || this.bufferedAudioMs() <= maxBufferedMs) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.capacityWaiters.push({ maxBufferedMs, resolve });
+    });
+  }
+
   waitForIdle(): Promise<void> {
     if (this.destroyed) return Promise.resolve();
     this.flushPcmTail();
@@ -737,6 +794,7 @@ export class ThreadVoicePlaybackQueue {
   /** Stop current/queued audio while keeping the player reusable for capture. */
   stopAndClear(): void {
     if (this.destroyed) return;
+    this.streamingProducerOpen = false;
     this.packets.splice(0, this.packets.length);
     this.pcmTail = Buffer.alloc(0);
     if (this.timer) {
@@ -751,6 +809,7 @@ export class ThreadVoicePlaybackQueue {
     try { this.player.stop(true); } catch { /* already idle */ }
     this.onPlaybackIdle?.();
     this.resolveIdleWaiters();
+    this.resolveCapacityWaiters(true);
   }
 
   destroy(): void {
@@ -770,6 +829,7 @@ export class ThreadVoicePlaybackQueue {
     this.stream = undefined;
     this.cycleActive = false;
     this.endingStream = false;
+    this.streamingProducerOpen = false;
     this.lastPlaybackError = undefined;
     try {
       this.player.stop(true);
@@ -783,6 +843,7 @@ export class ThreadVoicePlaybackQueue {
     }
     this.subscription = undefined;
     this.resolveIdleWaiters();
+    this.resolveCapacityWaiters(true);
   }
 
   private encodeCompleteFrames(): void {
@@ -802,7 +863,14 @@ export class ThreadVoicePlaybackQueue {
   }
 
   private pump(): void {
-    if (this.destroyed || this.cycleActive || this.packets.length === 0) return;
+    if (this.destroyed) return;
+    if (this.cycleActive) {
+      if (!this.timer && !this.endingStream && this.packets.length > 0) {
+        this.writeNextPacket();
+      }
+      return;
+    }
+    if (this.packets.length === 0) return;
     this.cycleActive = true;
     this.endingStream = false;
     const stream = new PassThrough({ objectMode: true });
@@ -817,13 +885,18 @@ export class ThreadVoicePlaybackQueue {
     if (this.destroyed || !this.cycleActive) return;
     const packet = this.packets.shift();
     if (packet) {
-      if (!this.stream?.destroyed) this.stream?.write(packet);
+      if (!this.stream?.destroyed) {
+        this.stream?.write(packet);
+        this.consumedAudioMsTotal += OPUS_FRAME_MS;
+      }
+      this.resolveCapacityWaiters();
       this.timer = setTimeout(() => {
         this.timer = undefined;
         this.writeNextPacket();
       }, OPUS_FRAME_MS);
       return;
     }
+    if (this.streamingProducerOpen) return;
     if (this.endingStream) return;
     this.endingStream = true;
     try {
@@ -846,19 +919,32 @@ export class ThreadVoicePlaybackQueue {
       this.pump();
       return;
     }
-    if (this.pcmTail.byteLength === 0) {
+    if (this.pcmTail.byteLength === 0 && !this.streamingProducerOpen) {
       this.onPlaybackIdle?.();
       this.resolveIdleWaiters();
     }
+    this.resolveCapacityWaiters();
   }
 
   private isIdle(): boolean {
-    return !this.cycleActive && this.packets.length === 0 && this.pcmTail.byteLength === 0;
+    return !this.streamingProducerOpen && !this.cycleActive &&
+      this.packets.length === 0 && this.pcmTail.byteLength === 0;
   }
 
   private resolveIdleWaiters(): void {
     const waiters = this.idleWaiters.splice(0, this.idleWaiters.length);
     for (const resolve of waiters) resolve();
+  }
+
+  private resolveCapacityWaiters(force = false): void {
+    const bufferedMs = this.bufferedAudioMs();
+    const ready = this.capacityWaiters.filter(
+      (waiter) => force || bufferedMs <= waiter.maxBufferedMs
+    );
+    this.capacityWaiters = this.capacityWaiters.filter(
+      (waiter) => !ready.includes(waiter)
+    );
+    for (const waiter of ready) waiter.resolve();
   }
 }
 

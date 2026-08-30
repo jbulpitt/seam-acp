@@ -55,6 +55,141 @@ function controlledQueue(): {
 }
 
 describe("DiscordVoiceConsolePlayback", () => {
+  it("keeps one producer open, preserves delta order, and drains only after EOF", async () => {
+    const idle = deferred<void>();
+    const calls: string[] = [];
+    const queue: VoiceConsolePcmQueue = {
+      beginStreaming: vi.fn(() => { calls.push("begin"); }),
+      enqueue: vi.fn((pcm) => { calls.push(`pcm:${pcm.pcm[0]}`); }),
+      endStreaming: vi.fn(() => { calls.push("end"); }),
+      waitForIdle: vi.fn(() => idle.promise),
+      stopAndClear: vi.fn(() => idle.resolve()),
+      destroy: vi.fn(() => idle.resolve()),
+    };
+    const playback = new DiscordVoiceConsolePlayback({ queue });
+    const stream = playback.beginStream({
+      chunk: chunk("A", 1),
+      signal: new AbortController().signal,
+    });
+    await stream.enqueue({ ...audio20ms(), pcm: new Uint8Array([1, 0]) });
+    await stream.enqueue({ ...audio20ms(), pcm: new Uint8Array([2, 0]) });
+    expect(calls).toEqual(["begin", "pcm:1", "pcm:2"]);
+
+    const finished = stream.finish();
+    expect(calls).toEqual(["begin", "pcm:1", "pcm:2", "end"]);
+    let settled = false;
+    void finished.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    idle.resolve();
+    await expect(finished).resolves.toEqual({
+      status: "played",
+      durationMs: 1 / 12,
+    });
+    expect(playback.currentSource()).toBeNull();
+  });
+
+  it("backpressures a streaming producer above the bounded audio high-water mark", async () => {
+    const capacity = deferred<void>();
+    const queue: VoiceConsolePcmQueue = {
+      beginStreaming: vi.fn(),
+      enqueue: vi.fn(),
+      endStreaming: vi.fn(),
+      bufferedAudioMs: vi.fn(() => 2_500),
+      waitForBufferedAudioBelow: vi.fn(() => capacity.promise),
+      waitForIdle: vi.fn(async () => {}),
+      stopAndClear: vi.fn(() => capacity.resolve()),
+      destroy: vi.fn(() => capacity.resolve()),
+    };
+    const playback = new DiscordVoiceConsolePlayback({ queue });
+    const stream = playback.beginStream({
+      chunk: chunk("A", 1),
+      signal: new AbortController().signal,
+    });
+    let accepted = false;
+    const enqueue = stream.enqueue(audio20ms()).then(() => { accepted = true; });
+    await vi.waitFor(() => expect(queue.waitForBufferedAudioBelow).toHaveBeenCalledWith(1_000));
+    expect(accepted).toBe(false);
+    capacity.resolve();
+    await enqueue;
+    await stream.finish();
+  });
+
+  it("slices a large provider delta before enqueue so backpressure stays bounded", async () => {
+    let bufferedMs = 0;
+    const waits: number[] = [];
+    const queue: VoiceConsolePcmQueue = {
+      beginStreaming: vi.fn(),
+      enqueue: vi.fn((audio) => {
+        bufferedMs += (audio.pcm.byteLength / (audio.sampleRate * audio.channels * 2)) * 1_000;
+      }),
+      endStreaming: vi.fn(),
+      bufferedAudioMs: vi.fn(() => bufferedMs),
+      waitForBufferedAudioBelow: vi.fn(async (limit) => {
+        waits.push(limit);
+        bufferedMs = 0;
+      }),
+      waitForIdle: vi.fn(async () => {}),
+      stopAndClear: vi.fn(),
+      destroy: vi.fn(),
+    };
+    const playback = new DiscordVoiceConsolePlayback({ queue });
+    const stream = playback.beginStream({
+      chunk: chunk("A", 1),
+      signal: new AbortController().signal,
+    });
+    await stream.enqueue({
+      pcm: new Uint8Array(24_000 * 2 * 5),
+      sampleRate: 24_000,
+      channels: 1,
+    });
+    const enqueued = vi.mocked(queue.enqueue).mock.calls.map(([audio]) => audio.pcm.byteLength);
+    expect(enqueued).toHaveLength(25);
+    expect(Math.max(...enqueued)).toBe(9_600);
+    expect(waits).toEqual([1_000, 1_000]);
+    await expect(stream.finish()).resolves.toEqual({ status: "played", durationMs: 5_000 });
+  });
+
+  it("cancels promptly while a streaming enqueue is blocked on backpressure", async () => {
+    const capacity = deferred<void>();
+    let consumedMs = 0;
+    const queue: VoiceConsolePcmQueue = {
+      beginStreaming: vi.fn(),
+      enqueue: vi.fn(() => { consumedMs = 20; }),
+      endStreaming: vi.fn(),
+      bufferedAudioMs: vi.fn(() => 2_500),
+      consumedAudioMs: vi.fn(() => consumedMs),
+      waitForBufferedAudioBelow: vi.fn(() => capacity.promise),
+      waitForIdle: vi.fn(async () => {}),
+      stopAndClear: vi.fn(() => capacity.resolve()),
+      destroy: vi.fn(() => capacity.resolve()),
+    };
+    const playback = new DiscordVoiceConsolePlayback({ queue });
+    const controller = new AbortController();
+    const stream = playback.beginStream({ chunk: chunk("A", 1), signal: controller.signal });
+    const enqueue = stream.enqueue(audio20ms());
+    await vi.waitFor(() => expect(queue.waitForBufferedAudioBelow).toHaveBeenCalledOnce());
+    controller.abort();
+    await expect(enqueue).rejects.toMatchObject({ name: "AbortError" });
+    await expect(stream.finish()).resolves.toEqual({ status: "cancelled", durationMs: 20 });
+    expect(queue.stopAndClear).toHaveBeenCalledOnce();
+  });
+
+  it("cancels incremental playback and clears accepted deltas exactly once", async () => {
+    const { queue } = controlledQueue();
+    queue.beginStreaming = vi.fn();
+    queue.endStreaming = vi.fn();
+    const playback = new DiscordVoiceConsolePlayback({ queue });
+    const controller = new AbortController();
+    const stream = playback.beginStream({ chunk: chunk("A", 1), signal: controller.signal });
+    await stream.enqueue(audio20ms());
+    controller.abort();
+    controller.abort();
+    await expect(stream.finish()).resolves.toEqual({ status: "cancelled", durationMs: 0 });
+    expect(queue.stopAndClear).toHaveBeenCalledTimes(1);
+    expect(playback.currentSource()).toBeNull();
+  });
+
   it("builds its reusable player on an injected already-joined connection", () => {
     const player = new EventEmitter() as EventEmitter & {
       state: { status: string };
@@ -113,7 +248,7 @@ describe("DiscordVoiceConsolePlayback", () => {
       signal: new AbortController().signal,
     })).resolves.toEqual({
       status: "failed",
-      durationMs: 0,
+      durationMs: 20,
       error: "discord player failed",
     });
     playback.destroy();

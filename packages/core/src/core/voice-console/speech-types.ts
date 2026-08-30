@@ -22,10 +22,13 @@ export interface VoiceConsoleSynthesisRequest {
   chunk: VoiceConsoleSpeechChunk;
   profile: VoiceConsoleSpeechProfile;
   signal: AbortSignal;
+  /** Awaited per provider delta; playback applies bounded backpressure here. */
+  onAudioDelta: (audio: TtsPcm) => Promise<void>;
 }
 
 export type VoiceConsoleSynthesisResult =
   | { ok: true; audio: TtsPcm }
+  | { ok: true; streamed: true; audioDeltas: number }
   | { ok: false; error: string };
 
 export interface VoiceConsolePlaybackRequest {
@@ -41,7 +44,17 @@ export type VoiceConsolePlaybackResult =
 
 export interface VoiceConsoleSpeechPlayback {
   play(request: VoiceConsolePlaybackRequest): Promise<VoiceConsolePlaybackResult>;
+  /** Optional only for compatibility with unary test/legacy playback adapters. */
+  beginStream?(request: Omit<VoiceConsolePlaybackRequest, "audio">): VoiceConsolePlaybackStream;
+  /** Best-effort current airtime for cancellation races that settle before play(). */
+  currentConsumedAudioMs?(): number;
   destroy(): void;
+}
+
+export interface VoiceConsolePlaybackStream {
+  enqueue(audio: TtsPcm): Promise<void>;
+  finish(): Promise<VoiceConsolePlaybackResult>;
+  cancel(): void;
 }
 
 export type VoiceConsoleSpeechFailurePhase = "synthesis" | "playback";

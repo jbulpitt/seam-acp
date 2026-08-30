@@ -373,6 +373,76 @@ describe("ThreadVoicePlaybackQueue", () => {
     expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps one Discord resource open across streamed producer gaps with bounded drain", async () => {
+    vi.useFakeTimers();
+    const player = new EventEmitter() as any;
+    player.state = { status: AudioPlayerStatus.Idle };
+    player.stop = () => true;
+    player.play = vi.fn((resource: EventEmitter) => {
+      const oldState = player.state;
+      player.state = { status: AudioPlayerStatus.Playing };
+      player.emit("stateChange", oldState, player.state);
+      resource.once("finish", () => {
+        const playing = player.state;
+        player.state = { status: AudioPlayerStatus.Idle };
+        player.emit("stateChange", playing, player.state);
+      });
+    });
+    const createPlayer = vi.fn(() => player);
+    const encodedSamples: number[] = [];
+    const queue = new ThreadVoicePlaybackQueue({
+      connection: { subscribe: () => ({}) } as never,
+      logger: silentLogger,
+      dependencies: {
+        createPlayer: createPlayer as never,
+        createResource: ((stream: EventEmitter) => stream) as never,
+        createEncoder: () => ({
+          decode: () => Buffer.alloc(0),
+          encode: (pcm: Buffer) => {
+            encodedSamples.push(pcm.readInt16LE(0));
+            return Buffer.from([encodedSamples.length]);
+          },
+        }),
+      },
+    });
+
+    queue.beginStreaming();
+    const first = Buffer.alloc(960);
+    first.writeInt16LE(111, 0);
+    queue.enqueue({ pcm: first, sampleRate: 24_000, channels: 1 });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(createPlayer).toHaveBeenCalledWith({
+      behaviors: {
+        noSubscriber: "play",
+        maxMissedFrames: 10_000,
+      },
+    });
+    expect(player.play).toHaveBeenCalledTimes(1);
+    expect(player.state.status).toBe(AudioPlayerStatus.Playing);
+
+    const second = Buffer.alloc(960 * 3);
+    second.writeInt16LE(222, 0);
+    second.writeInt16LE(333, 960);
+    second.writeInt16LE(444, 1_920);
+    queue.enqueue({ pcm: second, sampleRate: 24_000, channels: 1 });
+    let belowCapacity = false;
+    const capacity = queue.waitForBufferedAudioBelow(0).then(() => { belowCapacity = true; });
+    await vi.advanceTimersByTimeAsync(20);
+    expect(belowCapacity).toBe(false);
+    await vi.advanceTimersByTimeAsync(60);
+    await capacity;
+    expect(encodedSamples).toEqual([111, 222, 333, 444]);
+    expect(queue.consumedAudioMs()).toBe(80);
+    expect(player.play).toHaveBeenCalledTimes(1);
+
+    queue.endStreaming();
+    const idle = queue.waitForIdle();
+    await vi.advanceTimersByTimeAsync(30);
+    await idle;
+    expect(player.state.status).toBe(AudioPlayerStatus.Idle);
+    queue.destroy();
+  });
+
   it("pads a final sub-frame tail before reporting idle", async () => {
     vi.useFakeTimers();
     const player = new EventEmitter() as any;

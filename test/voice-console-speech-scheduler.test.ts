@@ -83,6 +83,41 @@ function setup(opts: {
 }
 
 describe("VoiceConsoleSpeechScheduler fairness", () => {
+  it("starts incremental PCM playback before the synthesis response reaches EOF", async () => {
+    const eof = deferred<VoiceConsoleSynthesisResult>();
+    const pcmOrder: number[] = [];
+    let finishCalled = false;
+    const playback: VoiceConsoleSpeechPlayback = {
+      play: vi.fn(async () => ({ status: "played", durationMs: 1_000 })),
+      beginStream: vi.fn(() => ({
+        enqueue: vi.fn(async (pcm) => { pcmOrder.push(pcm.pcm[0]!); }),
+        finish: vi.fn(async () => {
+          finishCalled = true;
+          return { status: "played" as const, durationMs: 40 };
+        }),
+        cancel: vi.fn(),
+      })),
+      destroy: vi.fn(),
+    };
+    const synthesize = vi.fn(async (request: VoiceConsoleSynthesisRequest) => {
+      await request.onAudioDelta(audio(1));
+      await request.onAudioDelta(audio(2));
+      return eof.promise;
+    });
+    const { scheduler } = setup({ synthesize, playback });
+    const a = source("A", "turn-streaming-eof");
+    scheduler.registerSource(a);
+    scheduler.enqueueChunk(chunk(a, 1));
+    const drained = scheduler.finishSource(a);
+
+    await vi.waitFor(() => expect(pcmOrder).toEqual([1, 2]));
+    expect(finishCalled).toBe(false);
+    expect(playback.play).not.toHaveBeenCalled();
+    eof.resolve({ ok: true, streamed: true, audioDeltas: 2 });
+    await expect(drained).resolves.toMatchObject({ played: 1, failed: 0, dropped: 0 });
+    expect(finishCalled).toBe(true);
+  });
+
   it("uses one synthesis slot, preserves source order, and rotates after two chunks", async () => {
     let activeSynthesis = 0;
     let maxActiveSynthesis = 0;
@@ -146,6 +181,36 @@ describe("VoiceConsoleSpeechScheduler fairness", () => {
     expect(played).toEqual(["A-1", "B-1", "A-2"]);
   });
 
+  it.each(["failed", "cancelled"] as const)(
+    "charges midstream %s airtime to the current fairness slice",
+    async (terminalStatus) => {
+      const attempted: string[] = [];
+      const playback: VoiceConsoleSpeechPlayback = {
+        play: vi.fn(async ({ chunk: item }) => {
+          attempted.push(item.text);
+          if (item.text === "A-1") {
+            return terminalStatus === "failed"
+              ? { status: "failed" as const, durationMs: 26_000, error: "midstream player error" }
+              : { status: "cancelled" as const, durationMs: 26_000 };
+          }
+          return { status: "played" as const, durationMs: 1_000 };
+        }),
+        destroy: vi.fn(),
+      };
+      const { scheduler } = setup({ playback });
+      const a = source("A", `turn-fair-${terminalStatus}`);
+      const b = source("B", `turn-fair-peer-${terminalStatus}`);
+      scheduler.registerSource(a);
+      scheduler.registerSource(b);
+      scheduler.enqueueChunk(chunk(a, 1));
+      scheduler.enqueueChunk(chunk(a, 2));
+      scheduler.enqueueChunk(chunk(b, 1));
+
+      await Promise.all([scheduler.finishSource(a), scheduler.finishSource(b)]);
+      expect(attempted).toEqual(["A-1", "B-1", "A-2"]);
+    }
+  );
+
   it("does not rotate away when no competing source is ready", async () => {
     const { scheduler, played } = setup();
     const a = source("A");
@@ -159,6 +224,48 @@ describe("VoiceConsoleSpeechScheduler fairness", () => {
 });
 
 describe("VoiceConsoleSpeechScheduler cancellation and generations", () => {
+  it("fences late streaming deltas when output generation is cancelled", async () => {
+    let synthesisSignal: AbortSignal | undefined;
+    const streamCancel = vi.fn();
+    const streamedPcm: number[] = [];
+    const playback: VoiceConsoleSpeechPlayback = {
+      play: vi.fn(async () => ({ status: "played", durationMs: 1_000 })),
+      beginStream: vi.fn(({ signal }) => ({
+        enqueue: vi.fn(async (pcm) => { streamedPcm.push(pcm.pcm[0]!); }),
+        finish: vi.fn(async () => ({
+          status: signal.aborted ? "cancelled" as const : "played" as const,
+          durationMs: 0,
+        })),
+        cancel: streamCancel,
+      })),
+      destroy: vi.fn(),
+    };
+    const synthesize = vi.fn(async (request: VoiceConsoleSynthesisRequest) => {
+      synthesisSignal = request.signal;
+      await request.onAudioDelta(audio(7));
+      return new Promise<VoiceConsoleSynthesisResult>((resolve) => {
+        request.signal.addEventListener(
+          "abort",
+          () => resolve({ ok: false, error: "TTS cancelled" }),
+          { once: true }
+        );
+      });
+    });
+    const { scheduler, failures } = setup({ synthesize, playback });
+    const a = source("A", "turn-stream-cancel");
+    scheduler.registerSource(a);
+    scheduler.enqueueChunk(chunk(a, 1));
+    const drained = scheduler.finishSource(a);
+    await vi.waitFor(() => expect(streamedPcm).toEqual([7]));
+
+    expect(scheduler.setOutputEnabled("A", false)).toBe(1);
+    expect(synthesisSignal?.aborted).toBe(true);
+    await expect(drained).resolves.toMatchObject({ played: 0, failed: 0, dropped: 1 });
+    expect(streamCancel).toHaveBeenCalledOnce();
+    expect(streamedPcm).toEqual([7]);
+    expect(failures).toEqual([]);
+  });
+
   it("drops a late synthesis result while retaining the one-request provider slot", async () => {
     const first = deferred<VoiceConsoleSynthesisResult>();
     let firstSignal: AbortSignal | undefined;

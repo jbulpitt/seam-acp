@@ -3,6 +3,7 @@ import type { TtsPcm } from "../../core/audio/gemini-tts.js";
 import type {
   VoiceConsolePlaybackRequest,
   VoiceConsolePlaybackResult,
+  VoiceConsolePlaybackStream,
   VoiceConsoleSpeechPlayback,
   VoiceConsoleSpeechSourceRef,
 } from "../../core/voice-console/speech-types.js";
@@ -14,6 +15,12 @@ import {
 
 export interface VoiceConsolePcmQueue {
   enqueue(pcm: TtsPcm): void;
+  beginStreaming?(): void;
+  endStreaming?(): void;
+  bufferedAudioMs?(): number;
+  /** Monotonic PCM-equivalent airtime written to the Discord resource. */
+  consumedAudioMs?(): number;
+  waitForBufferedAudioBelow?(maxBufferedMs: number): Promise<void>;
   waitForIdle(): Promise<void>;
   takePlaybackError?(): string | undefined;
   stopAndClear(): void;
@@ -37,7 +44,12 @@ export interface DiscordVoiceConsolePlaybackOptions {
 type ActivePlayback = {
   source: VoiceConsoleSpeechSourceRef;
   cancelled: boolean;
+  consumedAtStart: number;
 };
+
+const STREAM_HIGH_WATER_MS = 2_000;
+const STREAM_LOW_WATER_MS = 1_000;
+const STREAM_ENQUEUE_SLICE_MS = 200;
 
 /**
  * Source-aware facade over one reusable Discord PCM/Opus player.
@@ -70,6 +82,7 @@ export class DiscordVoiceConsolePlayback implements VoiceConsoleSpeechPlayback {
     if (this.active) throw new Error("Voice Console playback already has an active chunk");
     if (request.signal.aborted) return { status: "cancelled", durationMs: 0 };
     const durationMs = pcmDurationMs(request.audio);
+    const consumedAtStart = this.queue.consumedAudioMs?.() ?? 0;
     const active: ActivePlayback = {
       source: {
         consoleId: request.chunk.consoleId,
@@ -77,6 +90,7 @@ export class DiscordVoiceConsolePlayback implements VoiceConsoleSpeechPlayback {
         turnId: request.chunk.turnId,
       },
       cancelled: false,
+      consumedAtStart,
     };
     this.active = active;
     const onAbort = (): void => {
@@ -90,21 +104,123 @@ export class DiscordVoiceConsolePlayback implements VoiceConsoleSpeechPlayback {
       if (active.cancelled) return { status: "cancelled", durationMs: 0 };
       this.queue.enqueue(request.audio);
       await this.queue.waitForIdle();
+      const consumedMs = consumedSince(this.queue, consumedAtStart);
       if (active.cancelled || this.destroyed) {
-        return { status: "cancelled", durationMs: 0 };
+        return { status: "cancelled", durationMs: consumedMs };
       }
       const playbackError = this.queue.takePlaybackError?.();
       return playbackError
-        ? { status: "failed", durationMs: 0, error: playbackError }
-        : { status: "played", durationMs };
+        ? { status: "failed", durationMs: consumedMs, error: playbackError }
+        : { status: "played", durationMs: consumedMs || durationMs };
     } finally {
       request.signal.removeEventListener("abort", onAbort);
       if (this.active === active) this.active = undefined;
     }
   }
 
+  beginStream(
+    request: Omit<VoiceConsolePlaybackRequest, "audio">
+  ): VoiceConsolePlaybackStream {
+    if (this.destroyed) return cancelledStream();
+    if (this.active) throw new Error("Voice Console playback already has an active chunk");
+    const consumedAtStart = this.queue.consumedAudioMs?.() ?? 0;
+    const active: ActivePlayback = {
+      source: {
+        consoleId: request.chunk.consoleId,
+        bindingId: request.chunk.bindingId,
+        turnId: request.chunk.turnId,
+      },
+      cancelled: request.signal.aborted,
+      consumedAtStart,
+    };
+    this.active = active;
+    let durationMs = 0;
+    let finished: Promise<VoiceConsolePlaybackResult> | undefined;
+    const onAbort = (): void => {
+      if (this.active !== active || active.cancelled) return;
+      active.cancelled = true;
+      this.queue.stopAndClear();
+    };
+    request.signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      if (active.cancelled) this.queue.stopAndClear();
+      else this.queue.beginStreaming?.();
+    } catch (error) {
+      request.signal.removeEventListener("abort", onAbort);
+      if (this.active === active) this.active = undefined;
+      throw error;
+    }
+
+    const finish = (): Promise<VoiceConsolePlaybackResult> => {
+      finished ??= (async () => {
+        try {
+          if (active.cancelled || this.destroyed) {
+            return {
+              status: "cancelled",
+              durationMs: consumedSince(this.queue, consumedAtStart),
+            };
+          }
+          this.queue.endStreaming?.();
+          await this.queue.waitForIdle();
+          if (active.cancelled || this.destroyed) {
+            return {
+              status: "cancelled",
+              durationMs: consumedSince(this.queue, consumedAtStart),
+            };
+          }
+          const playbackError = this.queue.takePlaybackError?.();
+          const consumedMs = consumedSince(this.queue, consumedAtStart);
+          return playbackError
+            ? { status: "failed", durationMs: consumedMs, error: playbackError }
+            : { status: "played", durationMs: consumedMs || durationMs };
+        } finally {
+          request.signal.removeEventListener("abort", onAbort);
+          if (this.active === active) this.active = undefined;
+        }
+      })();
+      return finished;
+    };
+
+    return {
+      enqueue: async (audio) => {
+        if (active.cancelled || this.destroyed || request.signal.aborted) {
+          throw abortError();
+        }
+        const totalDurationMs = pcmDurationMs(audio);
+        const sliceBytes = Math.max(
+          2,
+          Math.floor(audio.sampleRate * audio.channels * 2 * (STREAM_ENQUEUE_SLICE_MS / 1_000))
+        );
+        for (let offset = 0; offset < audio.pcm.byteLength; offset += sliceBytes) {
+          if (active.cancelled || this.destroyed || request.signal.aborted) {
+            throw abortError();
+          }
+          const pcm = audio.pcm.subarray(offset, Math.min(offset + sliceBytes, audio.pcm.byteLength));
+          this.queue.enqueue({ pcm, sampleRate: audio.sampleRate, channels: audio.channels });
+          if (
+            this.queue.bufferedAudioMs &&
+            this.queue.waitForBufferedAudioBelow &&
+            this.queue.bufferedAudioMs() > STREAM_HIGH_WATER_MS
+          ) {
+            await this.queue.waitForBufferedAudioBelow(STREAM_LOW_WATER_MS);
+          }
+          if (active.cancelled || this.destroyed || request.signal.aborted) {
+            throw abortError();
+          }
+        }
+        durationMs += totalDurationMs;
+      },
+      finish,
+      cancel: onAbort,
+    };
+  }
+
   currentSource(): VoiceConsoleSpeechSourceRef | null {
     return this.active ? { ...this.active.source } : null;
+  }
+
+  currentConsumedAudioMs(): number {
+    return this.active ? consumedSince(this.queue, this.active.consumedAtStart) : 0;
   }
 
   destroy(): void {
@@ -116,11 +232,30 @@ export class DiscordVoiceConsolePlayback implements VoiceConsoleSpeechPlayback {
   }
 }
 
+function cancelledStream(): VoiceConsolePlaybackStream {
+  return {
+    enqueue: async () => { throw abortError(); },
+    finish: async () => ({ status: "cancelled", durationMs: 0 }),
+    cancel: () => {},
+  };
+}
+
+function abortError(): Error {
+  const error = new Error("Voice Console streaming playback cancelled");
+  error.name = "AbortError";
+  return error;
+}
+
 function pcmDurationMs(pcm: TtsPcm): number {
   if (pcm.sampleRate <= 0 || pcm.channels <= 0 || pcm.pcm.byteLength % 2 !== 0) {
     throw new Error("Voice Console playback received invalid int16 PCM metadata");
   }
-  return Math.round(
-    (pcm.pcm.byteLength / (pcm.sampleRate * pcm.channels * 2)) * 1_000
-  );
+  return (pcm.pcm.byteLength / (pcm.sampleRate * pcm.channels * 2)) * 1_000;
+}
+
+function consumedSince(queue: VoiceConsolePcmQueue, baselineMs: number): number {
+  const total = queue.consumedAudioMs?.();
+  return typeof total === "number" && Number.isFinite(total) && total >= baselineMs
+    ? total - baselineMs
+    : 0;
 }

@@ -25,7 +25,7 @@ import {
   GEMINI_TTS_VOICES,
   isTtsPace,
   isTtsStyle,
-  synthesizeSpeechWithGemini,
+  streamSpeechWithGemini,
   type TtsPace,
   type TtsStyle,
 } from "../../core/audio/gemini-tts.js";
@@ -736,13 +736,15 @@ export class VoiceConsoleController
       scheduler = new VoiceConsoleSpeechScheduler({
         consoleId: console.id,
         playback: transport.playback,
-        synthesize: async ({ chunk, profile }) => synthesizeSpeechWithGemini({
+        synthesize: async ({ chunk, profile, signal, onAudioDelta }) => streamSpeechWithGemini({
           apiKey: this.apiKey(),
           model: this.ttsModel(),
           text: chunk.text,
           voice: profile.voice,
           pace: profile.pace,
           style: profile.style,
+          signal,
+          onAudioDelta,
         }),
         onFailure: (failure) => {
           this.logger.warn({ consoleId: console.id, failure }, "voice console speech source failed");

@@ -84,7 +84,6 @@ V2 does not include:
 - persistent raw audio, recording, archives, or downloads;
 - screen share, webcam, Discord Go Live, or image frames;
 - replacing Gemini Live Help;
-- byte-streaming a single Gemini TTS request;
 - automatic VC joining from a passive config flag;
 - changing a thread's ordinary `/seam config tts` settings;
 - more than ten bindings or more than five simultaneous fan-out targets;
@@ -733,7 +732,8 @@ Every voice-enabled binding/ACP turn owns a streaming speech segmenter using
 the V1 rules:
 
 - paragraph boundary may release;
-- sentence boundary at/after the minimum target may release;
+- the first clean sentence boundary releases immediately, even below the old
+  minimum target, so a short first sentence is not held until turn completion;
 - force near the maximum safe length;
 - flush the final tail;
 - exclude code fences, tool output, directives, and hidden protocol text.
@@ -764,7 +764,29 @@ The segmenter emits ordered source chunks:
 - Use binding-local voice/pace/style per synthesis request.
 - Keep one Gemini TTS request in flight globally in V2.
 - Synthesize just in time rather than pre-synthesizing an unbounded backlog.
-- Begin playback as soon as the first chosen chunk completes synthesis.
+- Request `gemini-3.1-flash-tts-preview` from the Interactions endpoint with
+  `stream:true`, `store:false`, `Api-Revision: 2026-05-20`, and SSE response
+  negotiation.
+- Parse ordered `step.delta` audio events incrementally without logging event
+  bodies, prompts, API keys, or base64 audio.
+- The SSE parser accepts arbitrary byte fragmentation, CRLF, comments,
+  multiline `data:`, unknown event types, explicit completion, and `[DONE]`;
+  it fails closed on malformed/truncated events, explicit provider failure, or
+  a response that reaches EOF without completion.
+- Request the provider's canonical audio response and accept the model's
+  documented 24 kHz mono PCM stream. Audio-delta metadata is optional; when
+  present it must remain consistent with that contract and prior deltas. Reject
+  URI-backed, compressed, incomplete, or conflicting audio before playback.
+- Begin playback when the first validated 24 kHz mono L16 delta arrives; do not
+  wait for interaction completion or response EOF.
+- Keep the Discord producer open between network deltas, preserve partial PCM
+  samples/Opus frames, and apply bounded audio buffering with producer
+  backpressure.
+- Never retry a synthesis request after any audio delta has been accepted by
+  playback. Unary synthesis is permitted only after a clean streaming response
+  completed with no accepted audio, so fallback cannot duplicate speech.
+- Enforce both a whole-provider deadline and a network read-idle watchdog;
+  cancellation also interrupts a producer blocked by playback backpressure.
 
 ### 12.3 Fairness
 
@@ -779,6 +801,8 @@ boundary. If none is ready, continue the current source.
 
 Never interrupt a chunk merely to satisfy fairness. A voice change identifies
 the new source. Source aliases remain visible on the card.
+Any airtime already consumed before a chunk fails or is cancelled still counts
+toward that source's 25-second fairness slice.
 
 ### 12.4 Output toggle behavior
 
@@ -792,7 +816,8 @@ Disabling one binding's output:
 - does not abort ACP, hide text, change input targets, or discard voice input.
 
 Already submitted TTS work may still cost money. Do not submit new work while
-disabled.
+disabled. Cancellation closes the streaming response, clears buffered/current
+PCM for that source generation, and fences every late delta.
 
 Output disabled is drop, not pause. Re-enabling speaks only future complete
 chunks. If re-enabled during a streaming turn, resume at the next clean chunk
@@ -1247,6 +1272,8 @@ Every worker must read this full specification and the repository `AGENTS.md`.
 - prompt stop/drop/re-enable semantics;
 - per-binding drain promises;
 - reusable player and idempotent teardown.
+- incremental Interactions audio-delta parsing, bounded playback backpressure,
+  and the no-retry-after-accepted-audio fence.
 
 **Do not edit:** orchestrator, commands, SessionStore.
 

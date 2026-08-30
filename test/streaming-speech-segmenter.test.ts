@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest";
 import { StreamingSpeechSegmenter } from "../packages/core/src/core/audio/streaming-speech-segmenter.js";
 
 describe("StreamingSpeechSegmenter", () => {
+  it("releases the first complete short sentence without waiting for turn EOF", () => {
+    const segmenter = new StreamingSpeechSegmenter();
+    expect(segmenter.feed("Ready now. The unfinished tail")).toEqual(["Ready now."]);
+    expect(segmenter.flush()).toEqual(["The unfinished tail"]);
+  });
+
   it("emits arrival-ordered sentences near the target size", () => {
     const segmenter = new StreamingSpeechSegmenter();
     expect(segmenter.feed("This first thought is deliberately long enough to reach the minimum speech chunk size, ")).toEqual([]);

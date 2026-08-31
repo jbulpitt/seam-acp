@@ -43,11 +43,30 @@ export function renderAgentQuotaRow(quota: AgentQuota): string {
       : "",
   ].filter(Boolean);
   const warning = quota.ok ? "" : ` ⚠️ ${quota.error ?? "quota unavailable"}`;
+  // Per-agent freshness: quota reads are polled on an activity-scaled cadence
+  // (idle agents as slow as hourly), so each row stamps its own snapshot time —
+  // the card-level header only reflects the last *render*, not each agent's fetch.
+  const meta = [
+    details.join(" · ") || "plan/credits unavailable",
+    `updated <t:${quota.fetchedAt}:R>`,
+  ].join(" · ");
   return [
     `${quotaLine("rolling", quota.rolling)}`,
     `${quotaLine("weekly", quota.weekly)}`,
-    `${details.join(" · ") || "plan/credits unavailable"}${warning}`,
+    `${meta}${warning}`,
   ].join("\n");
+}
+
+/**
+ * Timestamp (unix seconds) for the card-level header: the OLDEST per-agent
+ * snapshot among visible agents, so the header states the card's worst-case
+ * staleness honestly instead of re-claiming "just now" on every re-render.
+ */
+function oldestFetchedAt(quotas: AgentQuota[], nowMs: number): number {
+  const stamps = quotas
+    .map((quota) => quota.fetchedAt)
+    .filter((stamp): stamp is number => Number.isFinite(stamp));
+  return stamps.length ? Math.min(...stamps) : Math.floor(nowMs / 1000);
 }
 
 function isWarning(quotas: AgentQuota[]): boolean {
@@ -69,7 +88,10 @@ export function renderAgentQuotaLayout(
   const warn = isWarning(visibleQuotas);
   const blocks: LayoutBlock[] = [
     { kind: "text", content: `**${warn ? "🟡" : "🟢"} Agent quota**` },
-    { kind: "text", content: `Updated <t:${Math.floor(nowMs / 1000)}:R>` },
+    {
+      kind: "text",
+      content: `Oldest reading <t:${oldestFetchedAt(visibleQuotas, nowMs)}:R> · per-agent times below`,
+    },
   ];
   if (visibleQuotas.length === 0) {
     blocks.push(
@@ -101,7 +123,7 @@ export function renderAgentQuotaPanel(
   return {
     color: warn ? COLOR_WARN : COLOR_OK,
     title: `${warn ? "🟡" : "🟢"} Agent quota`,
-    description: `Updated <t:${Math.floor(nowMs / 1000)}:R>`,
+    description: `Oldest reading <t:${oldestFetchedAt(visibleQuotas, nowMs)}:R> · per-agent times below`,
     fields:
       visibleQuotas.length === 0
         ? [{ name: "Agents", value: "_No configured agents._" }]

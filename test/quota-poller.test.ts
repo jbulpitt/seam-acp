@@ -167,3 +167,48 @@ describe("AgentQuotaPoller fast-retry on failure", () => {
     poller.stop();
   });
 });
+
+describe("AgentQuotaPoller activity cadence (no timer starvation)", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("keeps refreshing a heavily-used agent instead of starving the timer", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let calls = 0;
+    const registry = new QuotaRegistry();
+    const poller = new AgentQuotaPoller({
+      logger: silent,
+      registry,
+      sources: [
+        {
+          ...identity,
+          eventDriven: false,
+          fetch: async () => {
+            calls++;
+            return okQuota;
+          },
+        },
+      ],
+      staleRetentionMs: 0,
+    });
+    await poller.start(); // calls=1, idle 60m timer armed
+    expect(calls).toBe(1);
+
+    // Ramp to the busy (5-min) tier: 8 turns inside the first 10 minutes.
+    for (let i = 0; i < 8; i++) poller.recordTurnStart("claude", 0);
+
+    // Sustained heavy use: a turn every 60s — well under the 5-min cadence. The
+    // old schedule() re-armed the timer on every turn, so it never fired and
+    // calls stayed at 1 (the "heavily used → dormant" bug). It must now refresh
+    // on the accelerated cadence despite the constant activity.
+    for (let m = 1; m <= 12; m++) {
+      await vi.advanceTimersByTimeAsync(60_000);
+      poller.recordTurnStart("claude", m * 60_000);
+    }
+    poller.stop();
+
+    // ~12 minutes at a 5-min cadence → at least two load-driven refreshes on top
+    // of the initial one. (Buggy behaviour: exactly 1.)
+    expect(calls).toBeGreaterThanOrEqual(3);
+  });
+});

@@ -126,6 +126,9 @@ export class AgentQuotaPoller {
   private readonly sources = new Map<string, AgentQuotaSource>();
   private readonly activity = new AgentTurnWindow();
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Absolute ms each pending timer is scheduled to fire, so activity can only
+   *  pull a refresh sooner — never push it out (which would starve the timer). */
+  private readonly timerFireAt = new Map<string, number>();
   private readonly inFlight = new Map<string, Promise<AgentQuota | undefined>>();
   private readonly lastRefreshAt = new Map<string, number>();
   /** When each agent last produced an `ok` snapshot (for stale retention). */
@@ -164,6 +167,7 @@ export class AgentQuotaPoller {
     this.started = false;
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    this.timerFireAt.clear();
   }
 
   setOnUpdate(onUpdate: ((quota: AgentQuota) => void) | undefined): void {
@@ -172,7 +176,17 @@ export class AgentQuotaPoller {
 
   recordTurnStart(agentId: string, startedAtMs = Date.now()): void {
     this.activity.record(agentId, startedAtMs);
-    if (this.started && this.sources.has(agentId)) this.schedule(agentId);
+    if (!this.started || !this.sources.has(agentId)) return;
+    // Picking an agent back up after a lull: if its snapshot is already older
+    // than the (freshly activity-scaled) cadence, refresh now instead of waiting
+    // out the pending timer. refresh() self-throttles (QUOTA_MIN_REFRESH_MS) and
+    // dedupes in-flight, so a burst of turns can't hammer the upstream endpoint —
+    // steady-state rate stays the intended cadence, just aligned to real use.
+    const lastAt = this.lastRefreshAt.get(agentId) ?? 0;
+    if (startedAtMs - lastAt >= this.nextIntervalMs(agentId)) {
+      void this.refresh(agentId);
+    }
+    this.schedule(agentId);
   }
 
   turnsInLast10Min(agentId: string, nowMs = Date.now()): number {
@@ -266,16 +280,27 @@ export class AgentQuotaPoller {
   }
 
   private schedule(agentId: string): void {
-    const existing = this.timers.get(agentId);
-    if (existing) clearTimeout(existing);
     if (!this.started) return;
+    const interval = this.nextIntervalMs(agentId);
+    const fireAt = Date.now() + interval;
+    const existing = this.timers.get(agentId);
+    const existingFireAt = this.timerFireAt.get(agentId);
+    // Never push a pending refresh further out. schedule() is called on every
+    // turn start, so unconditionally re-arming here starves the timer: a heavily
+    // used agent (turns arriving faster than the interval) would keep resetting
+    // its own countdown and never refresh. Only (re)arm when nothing is pending
+    // or the new cadence fires sooner (activity ramped up → accelerate).
+    if (existing && existingFireAt != null && fireAt >= existingFireAt) return;
+    if (existing) clearTimeout(existing);
     const timer = setTimeout(async () => {
       this.timers.delete(agentId);
+      this.timerFireAt.delete(agentId);
       await this.refresh(agentId);
       this.schedule(agentId);
-    }, this.nextIntervalMs(agentId));
+    }, interval);
     timer.unref?.();
     this.timers.set(agentId, timer);
+    this.timerFireAt.set(agentId, fireAt);
   }
 
   /**

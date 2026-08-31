@@ -524,6 +524,9 @@ export class Orchestrator {
   private readonly store: SessionStore;
   private readonly renderer: Renderer;
   private readonly quotaPoller?: AgentQuotaPoller;
+  /** Debounce for the quota-card "Refresh" button: the force-refresh bypasses
+   *  the cadence floor, so guard against click-mashing hammering the endpoints. */
+  private lastQuotaRefreshClickAt = 0;
   /** Conversational config mutation engine (#58 P2/P3). Platform-agnostic; the
    *  orchestrator adds the Discord confirm card + apply/restart wiring. */
   private readonly configMutation: ConfigMutationService;
@@ -1054,6 +1057,9 @@ export class Orchestrator {
         void evt.replyEphemeral(
           `Voice Console action failed: ${err instanceof Error ? err.message : String(err)}`
         ).catch(() => evt.followUpEphemeral("Voice Console action failed.").catch(() => {}));
+      });
+      void this.handleQuotaCardComponent(evt).catch((err) => {
+        this.logger.warn({ err, customId: evt.customId }, "quota card component failed");
       });
     });
     this.adapter.onChoiceInteraction?.((evt) => this.handleChoiceCardInteraction(evt));
@@ -4883,6 +4889,21 @@ export class Orchestrator {
    * Idle + host ready → run now (no parked row left sitting). Busy or
    * offline → park, do not abort, do not bump generation.
    */
+  /**
+   * "Refresh" button on the agent-quota card: force-refresh every agent now.
+   * Ack first (Discord expires the interaction after 3s), debounce mashing, then
+   * refresh — the card re-renders itself via quotaPoller.setOnUpdate → poke().
+   */
+  private async handleQuotaCardComponent(evt: ComponentEvent): Promise<void> {
+    if (!evt.customId.startsWith("seam-quota:")) return;
+    await evt.deferUpdate().catch(() => {});
+    if (!this.quotaPoller) return;
+    const now = Date.now();
+    if (now - this.lastQuotaRefreshClickAt < 10_000) return;
+    this.lastQuotaRefreshClickAt = now;
+    await this.quotaPoller.refreshAll(true);
+  }
+
   private async handleVoiceConsoleComponent(evt: ComponentEvent): Promise<void> {
     if (!evt.customId.startsWith("tvc:")) return;
     const parsed = parseVoiceConsoleInteraction({

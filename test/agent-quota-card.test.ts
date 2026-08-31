@@ -6,6 +6,7 @@ import { pino } from "pino";
 import {
   AGENT_QUOTA_BUMP_AFTER_MS,
   AgentQuotaCard,
+  QUOTA_REFRESH_CUSTOM_ID,
   renderAgentQuotaLayout,
 } from "../packages/core/src/core/quota/agent-quota-card.js";
 import { mapUnlimitedQuota } from "../packages/core/src/core/quota/agent-quota.js";
@@ -47,6 +48,17 @@ describe("agent quota card", () => {
     expect(text).toContain("25%");
     expect(text).toContain("75%");
     expect(text).toContain("plan max · credits 12");
+  });
+
+  it("attaches a manual refresh button routed to the quota component handler", () => {
+    const layout = renderAgentQuotaLayout([
+      mapUnlimitedQuota({ agentId: "claude", displayName: "Claude" }),
+    ]);
+    const buttons = (layout.actions ?? []).flat();
+    expect(buttons.map((b) => b.customId)).toContain(QUOTA_REFRESH_CUSTOM_ID);
+    // Must carry the "seam-quota:" prefix so the adapter classifier routes the
+    // click to the component handler (not a dead button).
+    expect(QUOTA_REFRESH_CUSTOM_ID.startsWith("seam-quota:")).toBe(true);
   });
 
   it("omits claude-vertex and opencode without removing them from the registry", () => {

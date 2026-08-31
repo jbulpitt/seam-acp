@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Logger } from "../../lib/logger.js";
 import type { ChatAdapter, MessageRef } from "../../platforms/chat-adapter.js";
-import type { LayoutBlock, StructuredLayout, StructuredPanel } from "../types.js";
+import type { LayoutBlock, PanelButton, StructuredLayout, StructuredPanel } from "../types.js";
 import type { AgentQuota, QuotaWindow } from "./agent-quota.js";
 
 const STATE_FILE = "agent-quota-card.json";
@@ -11,6 +11,13 @@ const COLOR_OK = 0x57f287;
 const COLOR_WARN = 0xfaa61a;
 const HIDDEN_AGENT_IDS = new Set(["claude-vertex", "opencode"]);
 export const AGENT_QUOTA_BUMP_AFTER_MS = 20 * 60 * 60_000;
+
+/** Custom id for the manual "Refresh" button; routed to the orchestrator's
+ *  quota-card component handler, which force-refreshes every agent now. */
+export const QUOTA_REFRESH_CUSTOM_ID = "seam-quota:refresh";
+const REFRESH_ACTIONS: PanelButton[][] = [
+  [{ customId: QUOTA_REFRESH_CUSTOM_ID, label: "Refresh", style: "secondary", emoji: "🔄" }],
+];
 
 interface Persisted {
   threadId: string;
@@ -111,7 +118,7 @@ export function renderAgentQuotaLayout(
       });
     });
   }
-  return { color: warn ? COLOR_WARN : COLOR_OK, blocks };
+  return { color: warn ? COLOR_WARN : COLOR_OK, blocks, actions: REFRESH_ACTIONS };
 }
 
 export function renderAgentQuotaPanel(
@@ -132,6 +139,7 @@ export function renderAgentQuotaPanel(
             value: renderAgentQuotaRow(quota).slice(0, 1024),
             inline: false,
           })),
+    actions: REFRESH_ACTIONS,
   };
 }
 

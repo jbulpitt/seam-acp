@@ -362,7 +362,8 @@ export function classifyDiscordInteraction(interaction: {
     (isButton || isModal || isSelect) &&
     (cid.startsWith("seam-cfg-edit:") ||
       cid.startsWith("seam-tts:") ||
-      cid.startsWith("tvc:"))
+      cid.startsWith("tvc:") ||
+      cid.startsWith("seam-quota:"))
   ) {
     return "config-edit";
   }
@@ -1573,7 +1574,10 @@ export class DiscordAdapter implements ChatAdapter {
     const ch = await this.fetchSendableChannel(channel.id);
     const sent = await ch.send({
       flags: MessageFlags.IsComponentsV2,
-      components: [DiscordAdapter.buildContainer(layout)],
+      components: [
+        DiscordAdapter.buildContainer(layout),
+        ...DiscordAdapter.buildActionRows(layout.actions),
+      ],
     });
     return { channel, id: sent.id };
   }
@@ -1586,7 +1590,10 @@ export class DiscordAdapter implements ChatAdapter {
     const msg = await ch.messages.fetch(message.id);
     await msg.edit({
       flags: MessageFlags.IsComponentsV2,
-      components: [DiscordAdapter.buildContainer(layout)],
+      components: [
+        DiscordAdapter.buildContainer(layout),
+        ...DiscordAdapter.buildActionRows(layout.actions),
+      ],
     });
   }
 

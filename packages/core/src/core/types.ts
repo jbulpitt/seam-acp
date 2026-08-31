@@ -532,4 +532,10 @@ export interface StructuredLayout {
   /** Accent bar color (Container), same meaning as {@link StructuredPanel.color}. */
   color?: number;
   blocks: LayoutBlock[];
+  /**
+   * Optional classic action rows attached as sibling components below the v2
+   * container (both are valid top-level Components-v2 message components). On
+   * send/edit the adapter attaches them; omit for a button-less layout.
+   */
+  actions?: PanelButton[][];
 }

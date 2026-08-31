@@ -204,6 +204,18 @@ export class AgentQuotaPoller {
     return quota;
   }
 
+  /**
+   * Force-refresh every source now — the manual "Refresh" button on the quota
+   * card. `force` bypasses the QUOTA_MIN_REFRESH_MS cadence floor; refresh()
+   * still dedupes an already-in-flight fetch per agent, and each fresh `ok`
+   * snapshot fires onUpdate so the card re-renders with new timestamps.
+   */
+  async refreshAll(force = false): Promise<void> {
+    await Promise.all(
+      [...this.sources.keys()].map((agentId) => this.refresh(agentId, undefined, force))
+    );
+  }
+
   async refresh(
     agentId: string,
     request?: QuotaConnectionRequest,

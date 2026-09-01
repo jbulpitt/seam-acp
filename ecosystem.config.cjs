@@ -1,4 +1,20 @@
 const path = require("node:path");
+const fs = require("node:fs");
+
+/** Read one KEY=value from seam's .env at config-eval time. pm2's `env_file`
+ *  loading proved unreliable for the broker app, but the inline `env` object
+ *  always applies — so keys the broker needs are injected through this. */
+function envFromDotenv(name) {
+  try {
+    const line = fs
+      .readFileSync(path.join(__dirname, ".env"), "utf8")
+      .split(/\r?\n/)
+      .find((l) => l.startsWith(name + "="));
+    return line ? line.slice(name.length + 1).trim() : "";
+  } catch {
+    return "";
+  }
+}
 
 module.exports = {
   apps: [
@@ -56,6 +72,28 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         PATH: process.env.PATH,
+      },
+    },
+    {
+      // Shared Artificial Analysis MCP (LLM benchmarks/pricing) exposed on a
+      // loopback port so every agent backend gets it via buildGlobalMcpServers —
+      // same broker pattern as homeschool-google-multi. AA_API_KEY comes from
+      // seam's .env (env_file) and is inherited by the spawned AA server.
+      name: "artificial-analysis-mcp",
+      script: path.join(__dirname, "packages/core/dist/shared-mcp/stdio-tool-broker-cli.js"),
+      cwd: __dirname,
+      interpreter: "node",
+      restart_delay: 3000,
+      max_restarts: 10,
+      env_file: ".env",
+      env: {
+        NODE_ENV: "production",
+        PATH: process.env.PATH,
+        AA_API_KEY: envFromDotenv("AA_API_KEY"),
+        SHARED_MCP_NAME: "artificial-analysis",
+        SHARED_MCP_COMMAND: "/home/ubuntu/.nvm/versions/node/v22.22.2/bin/artificial-analysis-mcp",
+        SHARED_MCP_ARGS_JSON: "[]",
+        SHARED_MCP_PORT: "8767",
       },
     },
   ],

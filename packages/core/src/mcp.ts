@@ -37,6 +37,15 @@ export function buildGlobalMcpServers(
     );
   }
 
+  if (process.env.AA_API_KEY?.trim()) {
+    const url = process.env.AA_MCP_URL?.trim() || "http://127.0.0.1:8767/mcp";
+    servers.push({ name: "artificial-analysis", type: "http", url, headers: [] });
+    logger.info(
+      { url },
+      "MCP enabled: shared artificial-analysis (LLM benchmarks + pricing)"
+    );
+  }
+
   return { servers };
 }
 

@@ -21,6 +21,7 @@ export class ModelValueManager {
   private readonly options: ModelValueManagerOptions;
   private job?: Cron;
   private inFlight?: Promise<void>;
+  private onUpdate?: () => void;
 
   constructor(options: ModelValueManagerOptions) {
     this.options = options;
@@ -43,6 +44,11 @@ export class ModelValueManager {
   stop(): void {
     this.job?.stop();
     this.job = undefined;
+  }
+
+  /** Notify render-only consumers strictly after a new snapshot is durable. */
+  setOnUpdate(onUpdate: (() => void) | undefined): void {
+    this.onUpdate = onUpdate;
   }
 
   refresh(): Promise<void> {
@@ -100,6 +106,11 @@ export class ModelValueManager {
         );
       }
       this.options.store.saveSnapshot(snapshot.rows);
+      try {
+        this.onUpdate?.();
+      } catch (err) {
+        this.options.logger.warn({ err }, "model value ranking update callback failed");
+      }
       this.options.logger.info(
         {
           fetchedAt,

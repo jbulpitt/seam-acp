@@ -56,6 +56,7 @@ import {
 import { AgentQuotaCard } from "./core/quota/agent-quota-card.js";
 import { ModelValueStore } from "./core/model-value/store.js";
 import { ModelValueManager } from "./core/model-value/manager.js";
+import { ModelValueRankingsCard } from "./core/model-value/rankings-card.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -1086,6 +1087,28 @@ async function main(): Promise<void> {
     );
   }
 
+  // One pinned, cache-only model-value card. A successful #130 persistence
+  // pokes it immediately; start() also renders the latest durable snapshot on
+  // boot without fetching or recomputing ranking data.
+  let stopRankingsCard: (() => void) | undefined;
+  if (config.DISCORD_RANKINGS_THREAD_ID) {
+    const rankingsCard = new ModelValueRankingsCard({
+      logger,
+      adapter,
+      threadId: config.DISCORD_RANKINGS_THREAD_ID,
+      dataDir: config.DATA_DIR,
+      collect: () => modelValueStore.getLatestRows(),
+    });
+    modelValueManager.setOnUpdate(() => rankingsCard.poke());
+    stopRankingsCard = () => {
+      modelValueManager.setOnUpdate(undefined);
+      rankingsCard.stop();
+    };
+    void rankingsCard.start().catch((err) =>
+      logger.warn({ err }, "model value rankings card failed to start")
+    );
+  }
+
   // One editable server-status card (uptime / turns / bridges). Posts once,
   // then edits in place — 30s tick + immediate bump on bridge connect/drop.
   let stopStatusCard: (() => void) | undefined;
@@ -1178,6 +1201,7 @@ async function main(): Promise<void> {
     quotaPoller.stop();
     modelValueManager.stop();
     stopQuotaCard?.();
+    stopRankingsCard?.();
     stopStatusCard?.();
     scheduledManager.stop();
     wakeManager.stop();

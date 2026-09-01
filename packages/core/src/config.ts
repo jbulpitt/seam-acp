@@ -677,6 +677,16 @@ const Schema = z.object({
     .optional(),
 
   /**
+   * Optional Discord thread/channel id for the pinned model-value rankings
+   * card. The card reads only the latest durable #130 snapshot, edits in place
+   * after successful refreshes, and silently self-bumps its thread.
+   */
+  DISCORD_RANKINGS_THREAD_ID: z
+    .string()
+    .regex(/^\d+$/, "DISCORD_RANKINGS_THREAD_ID must be a numeric Discord channel id")
+    .optional(),
+
+  /**
    * Optional path to a JSON file that pre-configures Discord channels and
    * threads with a default agent / model / cwd / effort / preamble rider.
    * Shape: `{ "channels": { "<channelId>": {...} }, "threads": { "<threadId>":

@@ -37,6 +37,19 @@ hand-editing runtime state.
 - **Another thread in this channel:** `threads()` first. Idle → `handoff` /
   `forward`. Busy → `send` (inbox; they `poll_inbox`). Set `returnTo` to that
   thread when he does not want a report-back here. Never hand off to `isSelf`.
+- **Reconfigure or reset another thread's session** (not just message it):
+  `configure_thread(thread, { agent?, model?, effort? })` changes its agent /
+  model / effort and reports what actually reset (agent switch always resets;
+  model switch resets on codex/ollama, not claude; effort never does);
+  `reset_thread_session(thread)` clears its context but keeps the model. Same
+  in-channel scope as `handoff`.
+- **Pick a model by cost or capability:** `model_value_rankings({ tier?, benchmark? })`
+  ranks the Copilot catalog by value (AA benchmark ÷ Copilot token cost) within
+  flagship / balanced / flash tiers; `model_metadata_query` / `model_metadata_get`
+  give provider-agnostic benchmarks, pricing, context, and modality for any
+  agent's models. Cache-backed, instant. Check an agent's headroom first with
+  `agent_quota({ agentId })`. Detail:
+  `docs/agent-guides/model-intelligence-and-thread-control.md`.
 - **Wake me later:** `schedule_wake` (or `seam-wake` fence). Native
   `ScheduleWakeup` / `Monitor` emit nothing after `end_turn` here.
 - **Wait until a condition:** `watch_create` (file / http / command). Do not

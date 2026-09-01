@@ -6,9 +6,13 @@ dist
 data/
 *.log
 
-# Local docs (reports, plans, specs — not committed; tracked files unaffected)
-docs/
+# Local docs (reports, plans, specs — not committed; tracked files unaffected).
+# Explicit exceptions keep new canonical agent entry points visible to Git.
+docs/*
 !docs/agent-guides/
+docs/agent-guides/*
+!docs/agent-guides/README.md
+!docs/agent-guides/interactive-ingest.md
 .DS_Store
 
 # Playwright MCP scratch outputs

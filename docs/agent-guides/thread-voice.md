@@ -37,10 +37,8 @@ of `DISCORD_ALLOWED_USER_IDS`.
 ## Canonical card
 
 The five-row card controls input selection, output selection, binding profile,
-pagination/refresh, and console end. Custom IDs contain immutable console and
-binding IDs plus the durable revision. Only the owner/admin may mutate it;
-copied, stale, replaced-message, wrong-channel, and duplicate interactions are
-refused or replayed idempotently.
+pagination/refresh, and console end. Only the owner/admin may mutate it; stale,
+copied, or replaced controls are refused.
 
 Input off aborts active speaker captures and allocates no new sequences. More
 than one selected input requires the explicit fan-out arm. Output off cancels
@@ -59,56 +57,23 @@ re-enable applies only to future visible text.
 - Busy bindings accumulate without aborting, steering, or generation bumps.
   Release waits for the channel turn and that binding's accepted VC speech to
   drain. `/seam queue` refuses while finalized/batched voice text exists.
-- Trusted `thread_voice` dispatch metadata is verified against the durable
-  console, binding, batch, and actual speaker. External dispatch producers
-  cannot mint those fields.
 
 ## Visible response speech
 
-Every visible bound-thread agent turn uses one shared speech hook, including
-typed turns, Thread Voice, wake/scheduled/watch turns, handoff/report-back, and
-generic visible dispatch. Only visible prose is spoken; status text, headers,
-tools, directives, harness text, and fences are excluded. Quiet/non-streamed
-dispatch speaks nothing, and terminal aggregates are never spoken twice.
+Every visible bound-thread turn can be spoken, including typed turns, Thread
+Voice, wake/scheduled/watch turns, and handoff/report-back. Only visible prose
+is spoken; status text, tool output, directives, harness text, fences, and quiet
+dispatch are excluded.
 
-The global scheduler makes sequential Gemini TTS sentence/chunk requests,
-shares one 24 kHz mono player, preserves source-local order, and rotates fairly
-between ready sources. A clean first sentence releases immediately, including
-short sentences. Streaming audio begins before response EOF after a 500 ms
-jitter prebuffer; buffering is bounded and cancellation/output-generation
-changes discard late or queued deltas. The packet reserve is written ahead of
-Discord's playback clock so ordinary provider/timer jitter does not become
-audible silence. A request is never retried after playback accepts audio,
-and unary fallback is allowed only when a clean stream completed without audio.
-Provider-wide and stalled-read watchdogs fail a wedged stream closed. Audio
-already heard before a failed or cancelled chunk still counts toward fairness.
-Before synthesis, long IDs/hashes and complex numeric forms are deterministically
-replaced with semantic labels; Gemini is never asked to guess or round their
-values. A short, locally generated soft tone marks the end of each completed
-spoken turn without another provider request.
-Text remains successful if TTS fails. Native completed-turn voice-message TTS
-is suppressed for every active binding, including while that binding's VC
-output is off.
-
-### Speech provider
-
-`SEAM_GEMINI_SPEECH_PROVIDER` selects the transport for Thread Voice TTS,
-Live Transcribe, unary STT fallback, and ordinary Discord voice-note STT.
-`developer` uses `SEAM_GEMINI_API_KEY`; `vertex` uses Application Default
-Credentials plus `SEAM_GEMINI_VERTEX_PROJECT_ID` and the global Vertex
-endpoint. Live Help remains a separate Studio Live feature and continues to
-use the API key. Switching the provider does not change the capture,
-cancellation, fairness, or text-fallback contracts.
+All bindings share one fair speech queue while preserving each source's order.
+Output-off cancels that binding's queued/current speech and applies until
+re-enabled. Text delivery remains successful if speech synthesis fails. Native
+voice-message TTS is suppressed while a binding belongs to an active console.
 
 ## Lease, recovery, and shutdown
 
-Thread Voice and Live Help share one guild voice lease. A conflict names the
-active product and durable session; it is not an authorization or parent-
-approval failure.
-
-Boot order is store migration, Live Help lease reconciliation, Voice Console
-manager/runtime construction, V1 upgrade, console/card/artifact recovery, then
-dispatch watcher start. A V1 session becomes a one-binding console while its
-binding ID, pending text, and profile are preserved. Missing VC-chat permission
-fails closed. Shutdown drains/removes capture, scheduler/player, the single
-Discord connection, and the lease without deleting transcripts.
+Thread Voice and Live Help share one guild voice lease. A conflict should name
+the active product/session; it is not an authorization or parent-approval
+failure. Process recovery preserves active consoles and pending finalized text.
+Missing VC-chat permission fails closed. Normal stop/shutdown disconnects and
+releases the lease without deleting finalized transcripts by default.

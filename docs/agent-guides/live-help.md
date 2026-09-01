@@ -163,21 +163,3 @@ See `docs/agent-guides/live-help-onboarding.md` (paste-1 for a new overlay).
 A brand-new school session should know: pack the lesson, `create_live_help`
 with the designated VC snowflake (rider first, else General), students join that VC,
 and students may request or end their own session without parent approval.
-
----
-
-## Implementer leftovers (not for school agents)
-
-Debug `/seam debug voice-ping|voice-capture|voice-live` stays until a follow-on
-removes it. Do **not** copy from the spike:
-
-- `responseModalities` on the setup **root** (close 1007) — only in `generationConfig`
-- Named ESM import of `@discordjs/opus` — use `createRequire`
-- Resolving on the **first** Live audio chunk — drain until `generationComplete` /
-  `turnComplete`; keep the WS open for the whole call
-- `automaticActivityDetection.disabled` + `activityStart`/`activityEnd` clip dump
-  (debug `voice-live` only). v1 is continuous duplex with Gemini **auto-VAD**
-- Hard allowlist of General-only. Prod takes an explicit `voiceChannelId`.
-
-No wav/pcm on disk. One session per VC (and per guild). Process restart marks
-in-flight rows ended. Spec: #98.

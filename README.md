@@ -9,6 +9,10 @@ A bridge between chat platforms (Discord today, Slack tomorrow) and ACP-compatib
 
 > **Status:** v0 — Discord + GitHub Copilot is the proven path. A Gemini ACP profile ships in the box; the multi-platform / multi-agent abstractions are designed in from day one.
 
+> **Using Seam as an agent?** Start with the lean
+> [Seam agent primer and guide index](docs/agent-guides/README.md). This README
+> is for installing and operating the bridge.
+
 ## What it does
 
 - Run a chat bot on a server / home lab / VM.

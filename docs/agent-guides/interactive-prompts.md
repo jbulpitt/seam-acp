@@ -19,8 +19,8 @@ Reject, pick a plan, pick a topic. Someone clicks; **this thread** gets one
 prompt; the card **shows what they picked and the buttons go away**.
 
 That is the default. Use it constantly for student feedback and for
-build-workflow check-ins. Cross-thread routing, isolated runs, and HTTP
-ingest are later in this file — skip them until you need them.
+build-workflow check-ins. Cross-thread routing and isolated runs are later in
+this file; HTTP submissions have a separate guide. Skip them until needed.
 
 Publish with MCP `create_choice` or a `seam-choice` fence (stripped from
 chat; the card is a follow-up in **this** thread):
@@ -66,7 +66,7 @@ card closes visually.
 - Class / several teammates each pick: `maxClicks` > 1 (cap 100).
 
 **Use multi-user only when several people should each submit a distinct
-click** — a class quiz, a stand-up vote, HTTP ingest for many students.
+click** — for example a class quiz or stand-up vote.
 Then buttons **stay** until the cap; footer is `clicked/max`. One click per
 Discord user even then.
 
@@ -180,143 +180,12 @@ Authoring thread: <channelRef>. Destination: live|isolated|thread <id>.
 
 ---
 
-## HTTP ingest (microsites)
+## HTTP ingest is a separate workflow
 
-Same frozen table. A microsite `POST /ingest` is a **custom-option submit**.
-The HTTP body is **not** the Discord transcript. The scoring turn must
-**declare** a result.
+If a microsite or service must submit work over HTTP, continue with the
+canonical guide:
 
-This is multi-user by default: when `ingress` is set and `maxClicks` is
-omitted, the cap is 100.
+`https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/interactive-ingest.md`
 
-### Publish with ingress
-
-```json
-{
-  "title": "Essay check",
-  "maxClicks": 100,
-  "defaultTarget": { "type": "live" },
-  "options": [
-    { "label": "Submit…", "kind": "custom", "target": { "type": "live" } }
-  ],
-  "ingress": {
-    "optionIndex": 0,
-    "wrapper": "Grade this essay against the rubric. Persist the attempt under submissions/. Then submit_result matching the schema.",
-    "resultSchema": {
-      "type": "object",
-      "required": ["overallScore", "prose"],
-      "properties": {
-        "overallScore": { "type": "number" },
-        "improvementFactor": { "type": "string" },
-        "prose": { "type": "string" }
-      }
-    },
-    "corsOrigins": ["https://course.example.edu"]
-  }
-}
-```
-
-`create_choice` returns `ingestUrl` + `ingestToken` **once**. Do not put the
-token in a public page if you can inject at build/serve time. `ingress: true`
-uses defaults (first custom option, no schema).
-
-A `seam-choice` fence does **not** mint an ingest token. Use MCP
-`create_choice` for HTTP ingest.
-
-### POST
-
-```
-POST {ingestUrl}
-Authorization: Bearer {ingestToken}
-Content-Type: application/json
-
-{ "text": "student essay…", "studentId": "optional-untrusted-label" }
-```
-
-Also `application/x-www-form-urlencoded`. `studentId` is untrusted. Same id
-cannot submit twice. Prefer `live` so the course thread sees the working.
-
-Public host: `https://ingest.runbooksynthesis.com/ingest`.
-
-### Declared result (required)
-
-Call `submit_result({ overallScore: 3, prose: "…" })` before you stop, or a
-`seam-result` fence. First success wins. Schema mismatch is refused in-turn.
-
-Turn ends with no result → HTTP error. **No transcript fallback.**
-
-POST holds `SEAM_INGEST_WAIT_MS` (default **5 minutes**, ceiling 30) then
-`202 { jobId, poll }`. `GET /ingest/jobs/{jobId}` with the same Bearer.
-
-Cloudflare kills held POST at ~100s (`524`) with **no jobId**. Public
-microsites: `POST /ingest?wait=0` then poll.
-
-### Persist
-
-No LMS store. Write attempts into the project cwd as the wrapper says.
-
----
-
-## Headless ingest endpoints (#95)
-
-A **reusable HTTP contract** for microsites (quizzes, refine-loops) that do
-**not** need a Discord card or a thread at runtime. Same `POST /ingest` door
-and `submit_result` as card ingest. Not a hidden card.
-
-Mint with MCP `create_ingest` only (no fence — the token would leak). Token
-shown **once**. Isolated silent scoring. Retries unlimited unless
-`uniqueStudent: true`. Optional `notifyThread` copies working into a Discord
-snowflake; omitted → **no Discord posts**.
-
-```json
-{
-  "name": "hist2300-essay-check",
-  "preset": "hist-grader",
-  "wrapper": "Grade this. Persist under submissions/. Then submit_result matching the schema.",
-  "resultSchema": {
-    "type": "object",
-    "required": ["overallScore", "prose"],
-    "properties": {
-      "overallScore": { "type": "number" },
-      "prose": { "type": "string" }
-    }
-  },
-  "uniqueStudent": false
-}
-```
-
-Returns `{ ingestId, ingestUrl, ingestToken }`. Inject the token at build/serve
-time, not in page JS. `cancel_ingest({ ingestId })` or
-`/seam workflows cancel-ingest:<id>` revokes; in-flight jobs finish.
-
-**Who runs the scoring turn** (POST never chooses this):
-
-- **`preset`** (preferred for a named grader): a project preset on the
-  **minting thread's parent channel**, then globals. **Refused at mint** if
-  the name is unknown there. **Re-resolved at each POST** (fire) so an edit
-  to the preset’s agent / model / effort / cwd / instructions applies without
-  remint. Cannot combine with `agent` / `model` / `effort` / `cwd`. Unknown
-  at fire → the job fails. Cross-channel: qualify with the parent **channel
-  snowflake**, not `#name` — e.g. `1534936932197339186/grader-collegiate`.
-  Same string at mint and fire. First `/` splits; there is no colon syntax.
-- Else pin `agent` / `model` / `effort` / `cwd` on mint.
-- Else inherit the minting thread’s agent / model / effort / cwd.
-
-The wrapper is the **assignment contract** (rubric, persist path, result
-shape). The preset is the **grader identity**. Keep rubric in `wrapper`, not
-in the preset, so you can reuse one grader across quizzes.
-
-**Real-world**
-
-- One token per microsite (or per assignment). Retries and refine-loops reuse
-  it. `uniqueStudent: true` only for a one-shot exam.
-- Two models or two personalities → two presets and/or two endpoints.
-- `studentId` is an untrusted label. Persist attempts in **this repo’s cwd**
-  as the wrapper says (`submissions/{id}/{utc}.json`). No LMS store.
-- Public host: `https://ingest.runbooksynthesis.com/ingest`. Cloudflare 524s a
-  held POST around 100s — use `POST /ingest?wait=0` then poll
-  `GET /ingest/jobs/{jobId}` with the same Bearer.
-- Do not put the Bearer in client-side JS if a tiny server or build inject can
-  hold it.
-
-Card ingest (#92) is unchanged.
+It covers both a choice card with an ingest token and a reusable headless
+endpoint. Do not load that protocol for an ordinary in-thread decision.

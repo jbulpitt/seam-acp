@@ -1,15 +1,15 @@
-# Model intelligence & cross-thread control — agent primer
+# Models & cross-thread session control
 
-_Shipped 2026-09-01. Audience: agents working in any seam-managed project. These
-are seam-MCP tools — call them the same way you call `handoff` / `threads` /
-`poll_inbox`. Everything here is available in every channel, no per-project setup._
+Canonical guide for agents choosing models or reconfiguring another Seam thread.
+These seam-MCP tools are available in every channel with no per-project setup.
+The metadata and thread controls are provider-agnostic; the clearly marked
+`model_value_rankings` tool is Copilot-specific.
 
-> **Copilot-inclusive variant.** This primer includes `model_value_rankings`,
-> which is **Copilot-only** (it joins GitHub Copilot's per-token pricing). If your
-> project's agents aren't on Copilot, use the provider-agnostic version instead:
-> `model-metadata-and-thread-control.md`.
+Consuming projects pin this raw URL:
 
-There are two new capability families:
+`https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/model-intelligence-and-thread-control.md`
+
+There are two capability families:
 
 1. **Model intelligence data** — cached, fast, read-only lookups of model
    benchmarks, pricing, and cost-efficiency ("value") rankings.

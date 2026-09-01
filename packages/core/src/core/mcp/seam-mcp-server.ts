@@ -34,6 +34,11 @@ import type { ConfigMutationInput } from "../config-mutation.js";
 import { isRestrictedParticipant, PARTICIPANT_CONFIG_REFUSAL } from "../../config.js";
 import { formatHostPrefixed, parseDispatchWorker } from "../location.js";
 import type { AgentQuota } from "../quota/agent-quota.js";
+import type {
+  ConfigureThreadInput,
+  ConfigureThreadOutcome,
+  ResetThreadSessionOutcome,
+} from "../thread-session-control.js";
 
 /** Read-only entities visible to the calling thread (schedules + presets),
  *  returned by `config_describe` alongside the effective config. A FULL
@@ -157,6 +162,18 @@ export interface SeamMcpServerDeps {
    * discovery is unsupported on this deployment.
    */
   listThreads?: (record: SessionRecord) => Promise<ThreadEntry[]>;
+  /** Resolve one target thread. The tool independently enforces same-channel scope. */
+  resolveThread?: (threadId: string) => SessionRecord | null | undefined;
+  /** Apply an already-addressed cross-thread session configuration (#129). */
+  configureThread?: (
+    caller: SessionRecord,
+    target: SessionRecord,
+    input: ConfigureThreadInput
+  ) => Promise<ConfigureThreadOutcome>;
+  /** Forge a fresh session for an already-addressed target thread (#129). */
+  resetThreadSession?: (
+    target: SessionRecord
+  ) => Promise<ResetThreadSessionOutcome>;
   /** Read normalized quota headroom for one configured agent or all agents. */
   getAgentQuotas?: (agentId?: string) => AgentQuota[];
   /** Inspect one Seam-staged image through a configured vision sidecar. The
@@ -539,6 +556,41 @@ const TOOLS = [
         },
       },
       required: [],
+    },
+  },
+  {
+    name: "configure_thread",
+    description:
+      "Change a teammate thread's agent, model, and/or reasoning effort within YOUR channel. " +
+      "An agent switch ALWAYS creates a fresh session and drops that thread's conversation context. " +
+      "Model switches reset only on session-pinned backends (codex and ollama-cloud); live-config " +
+      "backends such as Claude preserve context. Effort never resets the session and is validated " +
+      "against the target runtime's live reasoning_effort values; unsupported values fall back to auto.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        thread: { type: "string", description: "Target thread id from threads()." },
+        agent: { type: "string", description: "Optional registered agent profile id." },
+        model: { type: "string", description: "Optional model id advertised by the target agent." },
+        effort: {
+          type: "string",
+          description: "Optional live-advertised reasoning effort, or auto to clear the override.",
+        },
+      },
+      required: ["thread"],
+    },
+  },
+  {
+    name: "reset_thread_session",
+    description:
+      "Forge a fresh ACP session for a teammate thread in YOUR channel while keeping its current " +
+      "agent and model. This deliberately drops that thread's conversation context and returns the new session id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        thread: { type: "string", description: "Target thread id from threads()." },
+      },
+      required: ["thread"],
     },
   },
   {
@@ -1298,6 +1350,8 @@ const INSTRUCTIONS = [
   "  result is dispatched back into your thread when it completes.",
   "- forward(to, content): relay a message into another thread (thin handoff, no specialist framing).",
   "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
+  "- configure_thread(thread, agent?, model?, effort?): reconfigure a teammate in YOUR channel; agent switches reset context.",
+  "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
   "- peek(thread, count?): read another thread's recent messages to get context before delegating.",
   "- chain(workers, prompt, returnTo?): pipe a prompt through an ordered list of workers where each",
   "  hop's output feeds the next; the final output is delivered back to you. Durable across restarts.",
@@ -1486,6 +1540,10 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolPeek(args));
         case "threads":
           return rpcResult(id, await this.toolThreads(record, args));
+        case "configure_thread":
+          return rpcResult(id, await this.toolConfigureThread(record, args));
+        case "reset_thread_session":
+          return rpcResult(id, await this.toolResetThreadSession(record, args));
         case "agent_quota":
           return rpcResult(id, this.toolAgentQuota(args));
         case "inspect_image":
@@ -1558,6 +1616,59 @@ export class SeamMcpServer {
     return textResult(
       `Untrusted visual observations from ${result.model}:\n\n${result.observations}`
     );
+  }
+
+  private async toolConfigureThread(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.configureThread || !this.deps.resolveThread) {
+      return textResult("cross-thread configuration is not supported on this deployment.", true);
+    }
+    const target = this.resolveSameChannelTarget(caller, requireString(args, "thread"));
+    if (!target.ok) return textResult(target.error, true);
+    const input: ConfigureThreadInput = {
+      ...(optionalString(args, "agent") ? { agent: optionalString(args, "agent") } : {}),
+      ...(optionalString(args, "model") ? { model: optionalString(args, "model") } : {}),
+      ...(typeof args.effort === "string" ? { effort: args.effort } : {}),
+    };
+    const outcome = await this.deps.configureThread(caller, target.record, input);
+    return textResult(JSON.stringify(outcome, null, 2), !outcome.ok);
+  }
+
+  private async toolResetThreadSession(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.resetThreadSession || !this.deps.resolveThread) {
+      return textResult("cross-thread session reset is not supported on this deployment.", true);
+    }
+    const target = this.resolveSameChannelTarget(caller, requireString(args, "thread"));
+    if (!target.ok) return textResult(target.error, true);
+    const outcome = await this.deps.resetThreadSession(target.record);
+    return textResult(JSON.stringify(outcome, null, 2), !outcome.ok);
+  }
+
+  private resolveSameChannelTarget(
+    caller: SessionRecord,
+    threadId: string
+  ): { ok: true; record: SessionRecord } | { ok: false; error: string } {
+    const target = this.deps.resolveThread?.(threadId);
+    const self = target?.id === caller.id && target.channelRef === caller.channelRef;
+    const sibling = Boolean(
+      target && caller.parentRef && target.parentRef === caller.parentRef && target.platform === caller.platform
+    );
+    if (!target || (!self && !sibling)) {
+      this.logger.warn(
+        { caller: caller.channelRef, callerParent: caller.parentRef, target: threadId },
+        "seam-mcp cross-thread control refused outside caller channel"
+      );
+      return {
+        ok: false,
+        error: `Refused: thread ${threadId} is not a session in your channel.`,
+      };
+    }
+    return { ok: true, record: target };
   }
 
   private async toolHandoff(

@@ -10,6 +10,7 @@ import {
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionNotification,
+  type SessionConfigOption,
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
 import type { AgentProfile } from "@seam/adapters";
@@ -169,6 +170,8 @@ export class AgentRuntime {
   private connection?: ClientSideConnection;
   private sessionId?: string;
   private sessionInfo?: SessionInfo;
+  /** Latest full config-option snapshot advertised by session/new/load/update. */
+  private sessionConfigOptions: ReadonlyArray<SessionConfigOption> = [];
   /** True while a `session/prompt` is awaiting a response — lets the abort path
    *  tell whether a graceful cancel actually ended the turn before escalating. */
   private promptInFlight = false;
@@ -452,6 +455,7 @@ export class AgentRuntime {
 
     this.sessionCwd = opts.cwd;
     this.sessionId = result.sessionId;
+    this.sessionConfigOptions = result.configOptions ?? [];
     this.sessionInfo = this.buildSessionInfo(result);
 
     // Apply model override after session creation if requested and supported.
@@ -516,6 +520,7 @@ export class AgentRuntime {
     }
     this.sessionCwd = opts.cwd;
     this.sessionId = opts.sessionId;
+    this.sessionConfigOptions = result.configOptions ?? [];
     this.sessionInfo = {
       sessionId: opts.sessionId,
       availableModels: this.toAvailableModels(result.configOptions),
@@ -566,6 +571,13 @@ export class AgentRuntime {
 
   getSessionInfo(): SessionInfo | undefined {
     return this.sessionInfo;
+  }
+
+  /** Live values for one ACP select option, including model-dependent effort. */
+  getConfigSelectValues(configId: string): ReadonlyArray<string> {
+    const option = this.sessionConfigOptions.find((candidate) => candidate.id === configId);
+    if (!option || option.type !== "select") return [];
+    return flattenConfigSelectOptions(option.options).map((candidate) => candidate.value);
   }
 
   async prompt(
@@ -737,19 +749,20 @@ export class AgentRuntime {
   ): Promise<void> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
-    if (typeof value === "boolean") {
-      await conn.setSessionConfigOption({
+    const result = typeof value === "boolean"
+      ? await conn.setSessionConfigOption({
         sessionId: sid,
         configId,
         type: "boolean",
         value,
-      });
-    } else {
-      await conn.setSessionConfigOption({
+      })
+      : await conn.setSessionConfigOption({
         sessionId: sid,
         configId,
         value,
       });
+    if (result?.configOptions) {
+      this.sessionConfigOptions = result.configOptions;
     }
   }
 
@@ -843,6 +856,7 @@ export class AgentRuntime {
     this.connection = undefined;
     this.sessionId = undefined;
     this.sessionInfo = undefined;
+    this.sessionConfigOptions = [];
     this.child = undefined;
   }
 
@@ -1023,6 +1037,9 @@ export class AgentRuntime {
         // Track current model if present in the new options.
         const opts = (update as unknown as { configOptions?: unknown })
           .configOptions;
+        if (Array.isArray(opts)) {
+          this.sessionConfigOptions = opts as SessionConfigOption[];
+        }
         const currentModel = extractCurrentModel(opts);
         if (currentModel && this.sessionInfo) {
           this.sessionInfo = {

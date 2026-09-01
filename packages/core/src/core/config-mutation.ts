@@ -237,6 +237,34 @@ export interface ConfigApplyResult {
   auditId: string;
 }
 
+export interface AppliedSessionConfig extends ConfigApplyResult {
+  fields: ProposedField[];
+  warnings: string[];
+}
+
+export interface SessionResetDecision {
+  sessionReset: boolean;
+  resetReason?: "agent-switch" | "model-switch";
+}
+
+/** Backend reset semantics for cross-thread session control (#129). */
+export function detectSessionReset(input: {
+  previousAgentId: string;
+  nextAgentId: string;
+  modelChanged: boolean;
+}): SessionResetDecision {
+  if (input.previousAgentId !== input.nextAgentId) {
+    return { sessionReset: true, resetReason: "agent-switch" };
+  }
+  if (
+    input.modelChanged &&
+    (input.nextAgentId === "codex" || input.nextAgentId === "ollama-cloud")
+  ) {
+    return { sessionReset: true, resetReason: "model-switch" };
+  }
+  return { sessionReset: false };
+}
+
 /** A validated, human-readable proposal. Nothing has been written yet — calling
  *  `apply` is the only thing that mutates state (D5). */
 export interface ConfigProposal {
@@ -345,6 +373,30 @@ export class ConfigMutationService {
     if (tier === "thread-preset") return this.buildThreadPresetProposal(record, input.threadPreset!);
     if (tier === "schedule") return this.buildScheduleProposal(record, input.schedule!);
     return this.buildChannelPresetProposal(record, input.channelPreset!);
+  }
+
+  /**
+   * Immediate Tier-A apply used only after an outer trusted addressing layer
+   * has resolved the target SessionRecord. The engine still receives no thread
+   * id and therefore retains its ordinary self-scope invariant.
+   */
+  applySessionConfig(
+    record: SessionRecord,
+    changes: SessionConfigChanges,
+    actor: MutationActor,
+    opts: { effortValues?: ReadonlyArray<string> } = {}
+  ): { ok: true; result: AppliedSessionConfig } | { ok: false; error: string } {
+    const built = this.buildSessionProposal(record, changes, opts);
+    if (!built.ok) return built;
+    const applied = built.proposal.apply(actor);
+    return {
+      ok: true,
+      result: {
+        ...applied,
+        fields: built.proposal.fields,
+        warnings: built.proposal.warnings,
+      },
+    };
   }
 
   /**
@@ -686,7 +738,8 @@ export class ConfigMutationService {
 
   private buildSessionProposal(
     record: SessionRecord,
-    changes: SessionConfigChanges
+    changes: SessionConfigChanges,
+    opts: { effortValues?: ReadonlyArray<string> } = {}
   ): BuildProposalResult {
     const before = this.deps.describeConfig(record);
     const fields: ProposedField[] = [];
@@ -741,10 +794,13 @@ export class ConfigMutationService {
       } else {
         const level = changes.effort;
         const profile = this.deps.profiles.get(nextAgentId);
-        const usable =
-          profile?.effort &&
-          profile.effort.mechanism !== "none" &&
-          profile.effort.levels.includes(level);
+        const usable = opts.effortValues
+          ? opts.effortValues.includes(level)
+          : Boolean(
+              profile?.effort &&
+              profile.effort.mechanism !== "none" &&
+              profile.effort.levels.includes(level)
+            );
         if (!usable) {
           warnings.push(
             `agent "${nextAgentId}" does not support effort "${level}" — it will be ` +

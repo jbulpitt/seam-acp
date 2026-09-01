@@ -175,6 +175,9 @@ async function makeHarness(opts?: {
   resolveSession?: (token: string | undefined) => SessionRecord | undefined;
   peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
   listThreads?: SeamMcpServerDeps["listThreads"];
+  resolveThread?: SeamMcpServerDeps["resolveThread"];
+  configureThread?: SeamMcpServerDeps["configureThread"];
+  resetThreadSession?: SeamMcpServerDeps["resetThreadSession"];
   getAgentQuotas?: SeamMcpServerDeps["getAgentQuotas"];
   inspectImage?: SeamMcpServerDeps["inspectImage"];
   scheduleWake?: SeamMcpServerDeps["scheduleWake"];
@@ -273,6 +276,9 @@ async function makeHarness(opts?: {
       ]),
     ...(opts?.peekThread ? { peekThread: opts.peekThread } : {}),
     ...(opts?.listThreads ? { listThreads: opts.listThreads } : {}),
+    ...(opts?.resolveThread ? { resolveThread: opts.resolveThread } : {}),
+    ...(opts?.configureThread ? { configureThread: opts.configureThread } : {}),
+    ...(opts?.resetThreadSession ? { resetThreadSession: opts.resetThreadSession } : {}),
     ...(opts?.getAgentQuotas ? { getAgentQuotas: opts.getAgentQuotas } : {}),
     ...(opts?.inspectImage ? { inspectImage: opts.inspectImage } : {}),
     ...(opts?.isChannelLocked ? { isChannelLocked: opts.isChannelLocked } : {}),
@@ -402,6 +408,7 @@ describe("SeamMcpServer", () => {
       "compact",
       "config_describe",
       "config_propose",
+      "configure_thread",
       "create_choice",
       "create_ingest",
       "create_live_help",
@@ -411,6 +418,7 @@ describe("SeamMcpServer", () => {
       "peek",
       "poll_inbox",
       "rename_thread",
+      "reset_thread_session",
       "schedule_wake",
       "send",
       "steer",
@@ -435,6 +443,83 @@ describe("SeamMcpServer", () => {
     expect(configPropose.inputSchema.properties.channelPreset.properties.threadSlug).toMatchObject({
       type: "string",
     });
+  });
+
+  it("configure_thread permits a sibling in the caller's channel and passes flat changes", async () => {
+    const target = makeRecord({
+      id: "discord:thread-target",
+      channelRef: "thread-target",
+      parentRef: "chan-1",
+    });
+    const configureThread = vi.fn(async () => ({
+      ok: true as const,
+      applied: { model: "claude-new", effort: "high" },
+      sessionReset: false,
+      warnings: [],
+    }));
+    h = await makeHarness({
+      resolveThread: (id) => id === target.channelRef ? target : undefined,
+      configureThread,
+      resetThreadSession: async () => ({
+        ok: true,
+        sessionReset: true,
+        newSessionId: "fresh",
+        agent: "claude",
+        model: "claude-new",
+      }),
+    });
+
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "configure_thread",
+        arguments: { thread: "thread-target", model: "claude-new", effort: "high" },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBeFalsy();
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({
+      ok: true,
+      sessionReset: false,
+    });
+    expect(configureThread).toHaveBeenCalledWith(
+      expect.objectContaining({ channelRef: "thread-caller", parentRef: "chan-1" }),
+      target,
+      { model: "claude-new", effort: "high" }
+    );
+  });
+
+  it("cross-thread control refuses a session outside the caller's channel before mutation", async () => {
+    const outside = makeRecord({
+      id: "discord:thread-outside",
+      channelRef: "thread-outside",
+      parentRef: "chan-2",
+    });
+    const configureThread = vi.fn();
+    const resetThreadSession = vi.fn();
+    h = await makeHarness({
+      resolveThread: (id) => id === outside.channelRef ? outside : undefined,
+      configureThread,
+      resetThreadSession,
+    });
+
+    for (const name of ["configure_thread", "reset_thread_session"]) {
+      const { body } = await h.call(
+        "tools/call",
+        {
+          name,
+          arguments: name === "configure_thread"
+            ? { thread: outside.channelRef, model: "claude-new" }
+            : { thread: outside.channelRef },
+        },
+        { "X-Seam-Session": "good-token" }
+      );
+      expect(body.result.isError).toBe(true);
+      expect(body.result.content[0].text).toContain("not a session in your channel");
+    }
+    expect(configureThread).not.toHaveBeenCalled();
+    expect(resetThreadSession).not.toHaveBeenCalled();
   });
 
   it("inspect_image returns sidecar observations and preserves caller scope", async () => {
@@ -631,8 +716,8 @@ describe("SeamMcpServer", () => {
     const { body } = await h.call("tools/list");
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     // Adding an OPTION to handoff does NOT change the tool count; inspect_image
-    // is the standalone capability that brings the catalog to 26.
-    expect(body.result.tools).toHaveLength(26);
+    // plus the standalone capabilities bring the catalog to 28.
+    expect(body.result.tools).toHaveLength(28);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -1394,9 +1479,8 @@ describe("SeamMcpServer", () => {
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
-    // Params on `send` must NOT add a tool — the set stays at 26 after the
-    // standalone inspect_image capability was added.
-    expect(body.result.tools).toHaveLength(26);
+    // Params on `send` must NOT add a tool — the set stays at 28.
+    expect(body.result.tools).toHaveLength(28);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

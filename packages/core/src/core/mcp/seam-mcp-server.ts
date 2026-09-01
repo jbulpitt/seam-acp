@@ -645,7 +645,7 @@ const TOOLS = [
     name: "model_metadata_query",
     description:
       "Query cached model metadata across configured agents. Supports provider, creator, availability, " +
-      "modality, context, benchmark, price, release, name, coverage, sorting, and limit filters. " +
+      "context, benchmark, price, release, name, coverage, sorting, and limit filters. " +
       "This tool never performs live network or CLI work.",
     inputSchema: {
       type: "object",
@@ -656,7 +656,6 @@ const TOOLS = [
             provider: { type: "string", description: "Exact provider name, case-insensitive." },
             creator: { type: "string", description: "Exact creator name or slug, case-insensitive." },
             agent: { type: "string", description: "Configured agent profile id." },
-            modality: { type: "string", enum: ["text", "vision"] },
             minContextWindow: { type: "number", minimum: 0 },
             benchmark: {
               type: "object",
@@ -2106,6 +2105,9 @@ export class SeamMcpServer {
       return textResult("Model metadata is not supported on this deployment.", true);
     }
     const filters = optionalRecord(args, "filters") as ModelMetadataQuery["filters"];
+    if (filters && Object.prototype.hasOwnProperty.call(filters, "modality")) {
+      throw new Error("modality is host-scoped; use the selected agent's visionMode");
+    }
     const sort = optionalRecord(args, "sort") as ModelMetadataQuery["sort"];
     const limitValue = args.limit;
     if (limitValue !== undefined && typeof limitValue !== "number") {

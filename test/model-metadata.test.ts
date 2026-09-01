@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import {
   ArtificialAnalysisMetadataSource,
   parseAaModels,
@@ -18,10 +19,14 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function tempStore(): ModelMetadataStore {
+function tempDbPath(): string {
   const dir = mkdtempSync(path.join(tmpdir(), "seam-model-metadata-"));
   tempDirs.push(dir);
-  return new ModelMetadataStore(path.join(dir, "seam.db"));
+  return path.join(dir, "seam.db");
+}
+
+function tempStore(): ModelMetadataStore {
+  return new ModelMetadataStore(tempDbPath());
 }
 
 const aaPayload = {
@@ -169,10 +174,10 @@ describe("model metadata source and catalog", () => {
     expect(snapshot.rows.find((row) => row.id === "gpt-5.6-sol")).toMatchObject({
       agents: ["codex", "copilot"],
       context_window: 1_000_000,
-      modalities: ["text", "vision"],
       provider: "OpenAI",
       slug: "gpt-5-6-sol",
     });
+    expect(snapshot.rows.find((row) => row.id === "gpt-5.6-sol")).not.toHaveProperty("modalities");
     expect(snapshot.rows.find((row) => row.id === "local-future-model")).toMatchObject({
       slug: null,
       provider: null,
@@ -243,7 +248,6 @@ describe("model metadata durable cache", () => {
     expect(store.query({ filters: { provider: "openai" } }).count).toBe(3);
     expect(store.query({ filters: { creator: "openai" } }).count).toBe(3);
     expect(store.query({ filters: { agent: "codex" } }).models.map((row) => row.id)).toEqual(["gpt-5.6-sol"]);
-    expect(store.query({ filters: { modality: "vision" } }).models.map((row) => row.id)).toEqual(["gpt-5.6-sol"]);
     expect(store.query({ filters: { minContextWindow: 600_000 } }).models.map((row) => row.id)).toEqual(["gpt-5.6-sol"]);
     expect(store.query({ filters: { benchmark: { min: 55 } } }).models.map((row) => row.id)).toEqual(["gpt-5.6-sol"]);
     expect(store.query({ filters: { benchmark: { name: "coding_index", min: 70 } } }).models.map((row) => row.id)).toEqual(["gpt-5.6-sol", "gpt-5.6-terra"]);
@@ -256,7 +260,63 @@ describe("model metadata durable cache", () => {
     expect(store.query({ sort: { field: "contextWindow" } }).models.slice(0, 3).map((row) => row.id)).toEqual(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
     expect(store.query({ sort: { field: "releaseDate" } }).models.slice(0, 3).map((row) => row.id)).toEqual(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
     expect(() => store.query({ limit: 0 })).toThrow(/limit/);
+    expect(() => store.query({ filters: { modality: "vision" } } as any)).toThrow(/visionMode/);
     store.close();
+  });
+
+  it("migrates a legacy modality column without losing the cached snapshot", () => {
+    const dbPath = tempDbPath();
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE model_metadata (
+        model_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        aliases_json TEXT NOT NULL,
+        aa_slug TEXT,
+        source_id TEXT,
+        source_name TEXT,
+        provider TEXT,
+        creator_json TEXT,
+        agents_json TEXT NOT NULL,
+        agent_models_json TEXT NOT NULL,
+        modalities_json TEXT NOT NULL,
+        context_window INTEGER,
+        intelligence_index REAL,
+        benchmarks_json TEXT NOT NULL,
+        pricing_json TEXT,
+        released_at TEXT,
+        source TEXT NOT NULL,
+        fetched_at TEXT NOT NULL
+      );
+      INSERT INTO model_metadata VALUES (
+        'legacy-model', 'Legacy Model', '["legacy-alias"]', 'legacy-slug',
+        'source-id', 'Source Model', 'Provider',
+        '{"id":"creator","name":"Creator","slug":"creator"}',
+        '["copilot"]',
+        '[{"agent":"copilot","id":"legacy-alias","name":"Legacy Model"}]',
+        '["text","vision"]', 123456, 42, '{"coding_index":77}',
+        '{"input_per_million":1,"output_per_million":2,"blended_per_million":1.25}',
+        '2026-01-02', 'artificial-analysis', '2026-09-01T12:00:00.000Z'
+      );
+    `);
+    legacy.close();
+
+    const store = new ModelMetadataStore(dbPath);
+    expect(store.get("legacy-alias").model).toMatchObject({
+      id: "legacy-model",
+      slug: "legacy-slug",
+      context_window: 123456,
+      intelligence_index: 42,
+      benchmarks: { coding_index: 77 },
+    });
+    expect(store.get("legacy-model").model).not.toHaveProperty("modalities");
+    store.close();
+
+    const migrated = new Database(dbPath, { readonly: true });
+    const columns = migrated.prepare("PRAGMA table_info(model_metadata)").all() as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).not.toContain("modalities_json");
+    expect(migrated.prepare("SELECT COUNT(*) AS count FROM model_metadata").get()).toEqual({ count: 1 });
+    migrated.close();
   });
 
   it("preserves the prior cache on source parse/fetch and coverage failures", async () => {
@@ -373,17 +433,24 @@ describe("model metadata MCP cache-only accessors", () => {
       queryModelMetadata: (options) => store.query(options),
     });
     await server.start();
-    const call = async (name: string, args: Record<string, unknown>) => {
+    const rpc = async (method: string, params: Record<string, unknown>) => {
       const response = await fetch(`http://127.0.0.1:${server.port}/mcp`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-seam-session": "ok" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
       });
       return response.json() as Promise<any>;
     };
+    const call = (name: string, args: Record<string, unknown>) =>
+      rpc("tools/call", { name, arguments: args });
     try {
+      const listed = await rpc("tools/list", {});
+      const queryTool = listed.result.tools.find((tool: any) => tool.name === "model_metadata_query");
+      expect(queryTool.inputSchema.properties.filters.properties).not.toHaveProperty("modality");
+
       const get = await call("model_metadata_get", { idOrSlug: "gpt-5-6-sol" });
       expect(get.result.structuredContent.model.id).toBe("gpt-5.6-sol");
+      expect(get.result.structuredContent.model).not.toHaveProperty("modalities");
       expect(JSON.parse(get.result.content[0].text)).toEqual(get.result.structuredContent);
       const query = await call("model_metadata_query", {
         filters: { agent: "copilot", hasBenchmark: true },
@@ -391,7 +458,12 @@ describe("model metadata MCP cache-only accessors", () => {
         limit: 1,
       });
       expect(query.result.structuredContent.models.map((row: any) => row.id)).toEqual(["gpt-5.6-sol"]);
+      expect(query.result.structuredContent.models[0]).not.toHaveProperty("modalities");
       expect(JSON.parse(query.result.content[0].text)).toEqual(query.result.structuredContent);
+
+      const rejected = await call("model_metadata_query", { filters: { modality: "vision" } });
+      expect(rejected.result).toMatchObject({ isError: true });
+      expect(rejected.result.content[0].text).toMatch(/visionMode/);
     } finally {
       await server.stop();
       store.close();

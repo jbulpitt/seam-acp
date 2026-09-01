@@ -46,7 +46,7 @@ hand-editing runtime state.
 - **Pick a model by cost or capability:** `model_value_rankings({ tier?, benchmark? })`
   ranks the Copilot catalog by value (AA benchmark ÷ Copilot token cost) within
   flagship / balanced / flash tiers; `model_metadata_query` / `model_metadata_get`
-  give provider-agnostic benchmarks, pricing, context, and modality for any
+  give provider-agnostic benchmarks, pricing, and context for any
   agent's models. Cache-backed, instant. Check an agent's headroom first with
   `agent_quota({ agentId })`. Detail:
   `docs/agent-guides/model-intelligence-and-thread-control.md`.

@@ -5,7 +5,6 @@ import type {
   CachedAgentModel,
   MetadataSourceModel,
   ModelMetadata,
-  ModelModality,
 } from "./types.js";
 
 export async function collectAgentModelCatalog(
@@ -66,8 +65,6 @@ export function buildModelMetadataSnapshot(input: {
     const contextWindows = availability.flatMap((row) =>
       row.contextWindow === null ? [] : [row.contextWindow]
     );
-    const modalities = new Set<ModelModality>(["text"]);
-    if (availability.some((row) => row.vision === true)) modalities.add("vision");
     const agentModels: CachedAgentModel[] = availability
       .map((row) => ({ agent: row.agentId, id: row.modelId, name: row.name }))
       .sort((a, b) => a.agent.localeCompare(b.agent) || a.id.localeCompare(b.id));
@@ -83,7 +80,6 @@ export function buildModelMetadataSnapshot(input: {
       creator: source?.creator ?? null,
       agents: [...new Set(availability.map((row) => row.agentId))].sort(),
       agent_models: agentModels,
-      modalities: [...modalities],
       context_window: contextWindows.length > 0 ? Math.max(...contextWindows) : null,
       intelligence_index: source?.intelligenceIndex ?? null,
       benchmarks: source?.benchmarks ?? {},

@@ -10,68 +10,16 @@ import {
   type SessionConfigSelectOptions,
   type SessionConfigSelectGroup,
 } from "@agentclientprotocol/sdk";
-import type { AaModel, CopilotModelMetadata, CopilotPricing } from "./types.js";
-
-export const AA_MODELS_URL = "https://artificialanalysis.ai/api/v2/data/llms/models";
+import type { CopilotModelMetadata, CopilotPricing } from "./types.js";
+export {
+  AA_MODELS_URL,
+  fetchAaModels,
+  parseAaModels,
+} from "../model-metadata/artificial-analysis.js";
 export const COPILOT_PRICING_URL =
   "https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing.md";
 
 type FetchLike = typeof fetch;
-
-function finiteNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-export function parseAaModels(payload: unknown): AaModel[] {
-  if (!payload || typeof payload !== "object" || !Array.isArray((payload as { data?: unknown }).data)) {
-    throw new Error("Artificial Analysis response is missing the data array");
-  }
-  const rows: AaModel[] = [];
-  for (const raw of (payload as { data: unknown[] }).data) {
-    if (!raw || typeof raw !== "object") continue;
-    const row = raw as Record<string, unknown>;
-    if (typeof row.id !== "string" || typeof row.name !== "string" || typeof row.slug !== "string") {
-      continue;
-    }
-    const evaluations =
-      row.evaluations && typeof row.evaluations === "object"
-        ? (row.evaluations as Record<string, unknown>)
-        : {};
-    const benchmarks: Record<string, number> = {};
-    for (const [key, value] of Object.entries(evaluations)) {
-      const numeric = finiteNumber(value);
-      if (numeric !== null) benchmarks[key] = numeric;
-    }
-    const intelligenceIndex =
-      finiteNumber(evaluations.artificial_analysis_intelligence_index) ??
-      finiteNumber(evaluations.intelligence_index);
-    if (intelligenceIndex !== null) {
-      benchmarks.artificial_analysis_intelligence_index = intelligenceIndex;
-    }
-    rows.push({
-      id: row.id,
-      name: row.name,
-      slug: row.slug,
-      intelligenceIndex,
-      benchmarks,
-    });
-  }
-  if (rows.length === 0) throw new Error("Artificial Analysis response contained no usable models");
-  return rows;
-}
-
-export async function fetchAaModels(
-  apiKey: string,
-  fetchImpl: FetchLike = fetch
-): Promise<AaModel[]> {
-  if (!apiKey.trim()) throw new Error("AA_API_KEY is not configured");
-  const response = await fetchImpl(AA_MODELS_URL, {
-    headers: { "x-api-key": apiKey },
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) throw new Error(`Artificial Analysis request failed: HTTP ${response.status}`);
-  return parseAaModels(await response.json());
-}
 
 function markdownCells(line: string): string[] {
   const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");

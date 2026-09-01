@@ -2,13 +2,7 @@ export const DEFAULT_MODEL_VALUE_BENCHMARK = "artificial_analysis_intelligence_i
 
 export type ModelValueTier = "flagship" | "balanced" | "flash";
 
-export interface AaModel {
-  id: string;
-  name: string;
-  slug: string;
-  intelligenceIndex: number | null;
-  benchmarks: Record<string, number>;
-}
+export type { MetadataSourceModel as AaModel } from "../model-metadata/types.js";
 
 export interface CopilotModelMetadata {
   modelId: string;

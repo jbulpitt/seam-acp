@@ -295,6 +295,8 @@ describe("chain MCP tool", () => {
       "forward",
       "handoff",
       "inspect_image",
+      "model_metadata_get",
+      "model_metadata_query",
       "model_value_rankings",
       "peek",
       "poll_inbox",

@@ -56,6 +56,10 @@ import {
 import { AgentQuotaCard } from "./core/quota/agent-quota-card.js";
 import { ModelValueStore } from "./core/model-value/store.js";
 import { ModelValueManager } from "./core/model-value/manager.js";
+import { ModelMetadataStore } from "./core/model-metadata/store.js";
+import { ModelMetadataManager } from "./core/model-metadata/manager.js";
+import { collectAgentModelCatalog } from "./core/model-metadata/catalog.js";
+import { ArtificialAnalysisMetadataSource } from "./core/model-metadata/artificial-analysis.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -110,14 +114,8 @@ async function main(): Promise<void> {
     inputTokens: config.MODEL_VALUE_STD_INPUT_TOKENS,
     outputTokens: config.MODEL_VALUE_STD_OUTPUT_TOKENS,
   });
-  const modelValueManager = new ModelValueManager({
-    store: modelValueStore,
-    logger: logger.child({ mod: "model-value" }),
-    aaApiKey: config.AA_API_KEY,
-    inputTokens: config.MODEL_VALUE_STD_INPUT_TOKENS,
-    outputTokens: config.MODEL_VALUE_STD_OUTPUT_TOKENS,
-    ...(config.COPILOT_CLI_PATH ? { copilotCliPath: config.COPILOT_CLI_PATH } : {}),
-  });
+  const modelMetadataStore = new ModelMetadataStore(seamDbPath);
+  const artificialAnalysis = new ArtificialAnalysisMetadataSource(config.AA_API_KEY);
   // #75: crash leftovers stay `dispatched`/`running` forever unless we flip
   // them here. Target / correlation / acp_session_id are preserved for resume.
   // Does not delete isolated ACP sessions — #76 decides whether to reattach.
@@ -481,6 +479,25 @@ async function main(): Promise<void> {
   });
   router.startIdleReaper();
 
+  // #130 and #134 intentionally share one AA source and the same 12-hour
+  // cadence. Their back-to-back refreshes therefore share each in-flight HTTP
+  // request while retaining independent atomic caches and failure handling.
+  const modelMetadataManager = new ModelMetadataManager({
+    store: modelMetadataStore,
+    logger: logger.child({ mod: "model-metadata" }),
+    source: artificialAnalysis,
+    getCatalog: () => collectAgentModelCatalog(router.listProfiles()),
+  });
+  const modelValueManager = new ModelValueManager({
+    store: modelValueStore,
+    logger: logger.child({ mod: "model-value" }),
+    aaApiKey: config.AA_API_KEY,
+    inputTokens: config.MODEL_VALUE_STD_INPUT_TOKENS,
+    outputTokens: config.MODEL_VALUE_STD_OUTPUT_TOKENS,
+    fetchAa: () => artificialAnalysis.fetch(),
+    ...(config.COPILOT_CLI_PATH ? { copilotCliPath: config.COPILOT_CLI_PATH } : {}),
+  });
+
   const quotaRegistry = new QuotaRegistry();
   const quotaPoller = new AgentQuotaPoller({
     logger,
@@ -599,6 +616,7 @@ async function main(): Promise<void> {
   // Seed one normalized snapshot per configured agent before MCP/card startup,
   // then let each agent's own recent turn rate drive its recursive poll timer.
   await quotaPoller.start();
+  modelMetadataManager.start();
   modelValueManager.start();
 
   // Start the shared seam-MCP server now that the adapter exists (peek reads
@@ -635,6 +653,8 @@ async function main(): Promise<void> {
         return quota ? [quota] : [];
       },
       getModelValueRankings: (options) => modelValueStore.getRankings(options),
+      getModelMetadata: (idOrSlug) => modelMetadataStore.get(idOrSlug),
+      queryModelMetadata: (options) => modelMetadataStore.query(options),
       inspectImage: (record, req) => {
         const effective = router.describeConfig(record);
         const effectiveProfile = router.getProfile(effective.agent.value);
@@ -1176,6 +1196,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, "shutting down");
     orchestrator.stopSentinelWatcher();
     quotaPoller.stop();
+    modelMetadataManager.stop();
     modelValueManager.stop();
     stopQuotaCard?.();
     stopStatusCard?.();
@@ -1202,6 +1223,11 @@ async function main(): Promise<void> {
       await router.disposeAll();
     } catch (err) {
       logger.warn({ err }, "router disposeAll failed");
+    }
+    try {
+      modelMetadataStore.close();
+    } catch {
+      /* ignore */
     }
     try {
       modelValueStore.close();

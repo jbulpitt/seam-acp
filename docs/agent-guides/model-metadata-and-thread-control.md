@@ -13,7 +13,7 @@ setup. Everything here is provider-agnostic._
 Two capability families:
 
 1. **Model metadata** — cached, fast, read-only lookups of model benchmarks,
-   pricing, and capabilities across every agent.
+   pricing, and context across every agent.
 2. **Cross-thread session control** — reconfigure or reset *another* thread's
    agent / model / reasoning effort from your own thread.
 
@@ -30,19 +30,20 @@ benchmark/pricing; tolerate nulls.
 ### `model_metadata_query({ filters?, sort?, limit? })`
 Query cached metadata for models across **all** configured agents (claude, codex,
 grok, agy, copilot, ollama-cloud, opencode…).
-- `filters`: `provider`, `creator`, `agent` (which agent can run it), `modality`
-  (`text`|`vision`), `minContextWindow`, `benchmark {name?, min}`,
+- `filters`: `provider`, `creator`, `agent` (which agent can run it),
+  `minContextWindow`, `benchmark {name?, min}`,
   `maxPrice {input?, output?}` ($/Mtok), `releasedAfter` (YYYY-MM-DD),
   `nameContains`, `hasBenchmark`.
 - `sort`: `{ field: benchmark|price|inputPrice|outputPrice|contextWindow|releaseDate|name, direction, benchmark? }`.
 - `limit`: 1–100.
 - Each model: `id`, `name`, `aliases`, `provider`, `creator`, `agents` +
-  `agent_models` (the id each agent uses for it), `modalities`, `context_window`,
+  `agent_models` (the id each agent uses for it), `context_window`,
   `intelligence_index`, full `benchmarks` map (coding index, GPQA, HLE, SciCode,
   terminalbench, τ-bench, …), `pricing`, `released_at`.
 
 Use it for "which models score ≥ 75 on coding under $10/Mtok output", "what can
-`agent=grok` run", "newest 1M-context vision models", etc.
+`agent=grok` run", "newest 1M-context models", etc. Usable input modality is
+host-scoped; consult the selected agent's catalog/runtime `visionMode` instead.
 
 ### `model_metadata_get(idOrSlug)`
 The same rich record for a single model by id or slug. Use when you already know

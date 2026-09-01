@@ -1,7 +1,5 @@
 export const DEFAULT_METADATA_BENCHMARK = "artificial_analysis_intelligence_index";
 
-export type ModelModality = "text" | "vision";
-
 export interface ModelCreator {
   id: string;
   name: string;
@@ -57,7 +55,6 @@ export interface ModelMetadata {
   creator: ModelCreator | null;
   agents: string[];
   agent_models: CachedAgentModel[];
-  modalities: ModelModality[];
   context_window: number | null;
   intelligence_index: number | null;
   benchmarks: Record<string, number>;
@@ -75,7 +72,6 @@ export interface ModelMetadataFilters {
   provider?: string;
   creator?: string;
   agent?: string;
-  modality?: ModelModality;
   minContextWindow?: number;
   benchmark?: { name?: string; min: number };
   maxPrice?: { input?: number; output?: number };

@@ -8,7 +8,6 @@ import {
   type ModelMetadataQuery,
   type ModelMetadataQueryResult,
   type ModelMetadataSort,
-  type ModelModality,
   type ModelPricing,
 } from "./types.js";
 
@@ -23,7 +22,6 @@ interface DbRow {
   creator_json: string | null;
   agents_json: string;
   agent_models_json: string;
-  modalities_json: string;
   context_window: number | null;
   intelligence_index: number | null;
   benchmarks_json: string;
@@ -51,7 +49,6 @@ export class ModelMetadataStore {
         creator_json TEXT,
         agents_json TEXT NOT NULL,
         agent_models_json TEXT NOT NULL,
-        modalities_json TEXT NOT NULL,
         context_window INTEGER,
         intelligence_index REAL,
         benchmarks_json TEXT NOT NULL,
@@ -60,11 +57,61 @@ export class ModelMetadataStore {
         source TEXT NOT NULL,
         fetched_at TEXT NOT NULL
       );
+    `);
+    this.dropLegacyModalitiesColumn();
+    this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_model_metadata_aa_slug
         ON model_metadata(aa_slug) WHERE aa_slug IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_model_metadata_fetched_at
         ON model_metadata(fetched_at DESC);
     `);
+  }
+
+  /** #139: modality is host-scoped, so remove the legacy cache column without
+   * discarding a valid snapshot from an already-deployed database. */
+  private dropLegacyModalitiesColumn(): void {
+    const columns = this.db
+      .prepare<[], { name: string }>("PRAGMA table_info(model_metadata)")
+      .all();
+    if (!columns.some((column) => column.name === "modalities_json")) return;
+
+    this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE model_metadata__without_modalities (
+          model_id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          aliases_json TEXT NOT NULL,
+          aa_slug TEXT,
+          source_id TEXT,
+          source_name TEXT,
+          provider TEXT,
+          creator_json TEXT,
+          agents_json TEXT NOT NULL,
+          agent_models_json TEXT NOT NULL,
+          context_window INTEGER,
+          intelligence_index REAL,
+          benchmarks_json TEXT NOT NULL,
+          pricing_json TEXT,
+          released_at TEXT,
+          source TEXT NOT NULL,
+          fetched_at TEXT NOT NULL
+        );
+        INSERT INTO model_metadata__without_modalities (
+          model_id, name, aliases_json, aa_slug, source_id, source_name, provider,
+          creator_json, agents_json, agent_models_json, context_window,
+          intelligence_index, benchmarks_json, pricing_json, released_at, source,
+          fetched_at
+        )
+        SELECT
+          model_id, name, aliases_json, aa_slug, source_id, source_name, provider,
+          creator_json, agents_json, agent_models_json, context_window,
+          intelligence_index, benchmarks_json, pricing_json, released_at, source,
+          fetched_at
+        FROM model_metadata;
+        DROP TABLE model_metadata;
+        ALTER TABLE model_metadata__without_modalities RENAME TO model_metadata;
+      `);
+    })();
   }
 
   replaceSnapshot(rows: ModelMetadata[]): void {
@@ -79,12 +126,12 @@ export class ModelMetadataStore {
     const insert = this.db.prepare(`
       INSERT INTO model_metadata (
         model_id, name, aliases_json, aa_slug, source_id, source_name, provider,
-        creator_json, agents_json, agent_models_json, modalities_json,
+        creator_json, agents_json, agent_models_json,
         context_window, intelligence_index, benchmarks_json, pricing_json,
         released_at, source, fetched_at
       ) VALUES (
         @model_id, @name, @aliases_json, @aa_slug, @source_id, @source_name, @provider,
-        @creator_json, @agents_json, @agent_models_json, @modalities_json,
+        @creator_json, @agents_json, @agent_models_json,
         @context_window, @intelligence_index, @benchmarks_json, @pricing_json,
         @released_at, @source, @fetched_at
       )
@@ -103,7 +150,6 @@ export class ModelMetadataStore {
           creator_json: row.creator ? JSON.stringify(row.creator) : null,
           agents_json: JSON.stringify(row.agents),
           agent_models_json: JSON.stringify(row.agent_models),
-          modalities_json: JSON.stringify(row.modalities),
           context_window: row.context_window,
           intelligence_index: row.intelligence_index,
           benchmarks_json: JSON.stringify(row.benchmarks),
@@ -146,7 +192,6 @@ export class ModelMetadataStore {
       );
     }
     if (filters.agent) rows = rows.filter((row) => row.agents.includes(filters.agent!));
-    if (filters.modality) rows = rows.filter((row) => row.modalities.includes(filters.modality!));
     if (filters.minContextWindow !== undefined) {
       rows = rows.filter(
         (row) => row.context_window !== null && row.context_window >= filters.minContextWindow!
@@ -250,8 +295,8 @@ function validateQuery(input: ModelMetadataQuery): void {
   if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 100)) {
     throw new Error("limit must be an integer from 1 to 100");
   }
-  if (filters.modality && !["text", "vision"].includes(filters.modality)) {
-    throw new Error(`unknown modality: ${filters.modality}`);
+  if (Object.prototype.hasOwnProperty.call(filters, "modality")) {
+    throw new Error("modality is not model metadata; use the selected agent's visionMode");
   }
   if (filters.minContextWindow !== undefined && (!Number.isFinite(filters.minContextWindow) || filters.minContextWindow < 0)) {
     throw new Error("minContextWindow must be a non-negative number");
@@ -287,7 +332,6 @@ function fromDbRow(row: DbRow): ModelMetadata {
     creator: parseObject<ModelCreator>(row.creator_json),
     agents: parseStringArray(row.agents_json),
     agent_models: parseArray<CachedAgentModel>(row.agent_models_json),
-    modalities: parseArray<ModelModality>(row.modalities_json).filter((value) => value === "text" || value === "vision"),
     context_window: row.context_window,
     intelligence_index: row.intelligence_index,
     benchmarks: parseNumberMap(row.benchmarks_json),

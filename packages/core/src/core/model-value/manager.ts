@@ -2,6 +2,7 @@ import { Cron } from "croner";
 import type { Logger } from "../../lib/logger.js";
 import { buildModelValueSnapshot } from "./ranking.js";
 import { fetchAaModels, fetchCopilotModelMetadata, fetchCopilotPricing } from "./sources.js";
+import { MODEL_METADATA_REFRESH_CRON } from "../model-metadata/artificial-analysis.js";
 import type { ModelValueStore } from "./store.js";
 import type { AaModel, CopilotModelMetadata, CopilotPricing } from "./types.js";
 
@@ -28,7 +29,7 @@ export class ModelValueManager {
 
   start(): void {
     if (this.job) return;
-    this.job = new Cron("0 */12 * * *", { timezone: "UTC", name: "model-value-ranking" }, () => {
+    this.job = new Cron(MODEL_METADATA_REFRESH_CRON, { timezone: "UTC", name: "model-value-ranking" }, () => {
       void this.refresh();
     });
     // Warm asynchronously: MCP remains cache-only and can serve the previous

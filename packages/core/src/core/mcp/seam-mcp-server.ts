@@ -40,6 +40,11 @@ import type {
   ResetThreadSessionOutcome,
 } from "../thread-session-control.js";
 import type { ModelValueRankingsResult } from "../model-value/types.js";
+import type {
+  ModelMetadataGetResult,
+  ModelMetadataQuery,
+  ModelMetadataQueryResult,
+} from "../model-metadata/types.js";
 
 /** Read-only entities visible to the calling thread (schedules + presets),
  *  returned by `config_describe` alongside the effective config. A FULL
@@ -182,6 +187,10 @@ export interface SeamMcpServerDeps {
     tier?: string;
     benchmark?: string;
   }) => ModelValueRankingsResult;
+  /** Read one model from the durable metadata cache. Never performs live I/O. */
+  getModelMetadata?: (idOrSlug: string) => ModelMetadataGetResult;
+  /** Query the durable metadata cache. Never performs live I/O. */
+  queryModelMetadata?: (options: ModelMetadataQuery) => ModelMetadataQueryResult;
   /** Inspect one Seam-staged image through a configured vision sidecar. The
    *  caller remains token-scoped; the implementation owns path containment. */
   inspectImage?: (
@@ -612,6 +621,79 @@ const TOOLS = [
           type: "string",
           description: "Optional configured agent id. Omit to return every agent.",
         },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "model_metadata_get",
+    description:
+      "Read one model's cached provider metadata by its canonical id, configured agent id, or " +
+      "Artificial Analysis slug. Returns null when absent. This tool never performs live network or CLI work.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        idOrSlug: {
+          type: "string",
+          description: "Canonical model id, agent-specific model id, or cached provider slug.",
+        },
+      },
+      required: ["idOrSlug"],
+    },
+  },
+  {
+    name: "model_metadata_query",
+    description:
+      "Query cached model metadata across configured agents. Supports provider, creator, availability, " +
+      "modality, context, benchmark, price, release, name, coverage, sorting, and limit filters. " +
+      "This tool never performs live network or CLI work.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        filters: {
+          type: "object",
+          properties: {
+            provider: { type: "string", description: "Exact provider name, case-insensitive." },
+            creator: { type: "string", description: "Exact creator name or slug, case-insensitive." },
+            agent: { type: "string", description: "Configured agent profile id." },
+            modality: { type: "string", enum: ["text", "vision"] },
+            minContextWindow: { type: "number", minimum: 0 },
+            benchmark: {
+              type: "object",
+              properties: {
+                name: {
+                  type: "string",
+                  description: "AA evaluation key; omitted means Intelligence Index.",
+                },
+                min: { type: "number", minimum: 0 },
+              },
+              required: ["min"],
+            },
+            maxPrice: {
+              type: "object",
+              properties: {
+                input: { type: "number", minimum: 0, description: "Maximum input $/Mtok." },
+                output: { type: "number", minimum: 0, description: "Maximum output $/Mtok." },
+              },
+            },
+            releasedAfter: { type: "string", description: "Exclusive YYYY-MM-DD lower bound." },
+            nameContains: { type: "string", description: "Case-insensitive id/name/slug substring." },
+            hasBenchmark: { type: "boolean", description: "True excludes uncovered models; false selects them." },
+          },
+        },
+        sort: {
+          type: "object",
+          properties: {
+            field: {
+              type: "string",
+              enum: ["benchmark", "price", "inputPrice", "outputPrice", "contextWindow", "releaseDate", "name"],
+            },
+            direction: { type: "string", enum: ["asc", "desc"] },
+            benchmark: { type: "string", description: "AA evaluation key when field is benchmark." },
+          },
+          required: ["field"],
+        },
+        limit: { type: "number", minimum: 1, maximum: 100 },
       },
       required: [],
     },
@@ -1373,6 +1455,8 @@ const INSTRUCTIONS = [
   "  a turn cleanly. The entry marked isSelf is YOUR OWN thread — never hand off to it.",
   "- agent_quota(agentId?): read normalized rolling + weekly quota for one agent or all agents",
   "  before choosing workers; steer away from agents nearing a cap.",
+  "- model_metadata_get(idOrSlug): read one model's cached metadata by id or provider slug.",
+  "- model_metadata_query(filters?, sort?, limit?): query cached metadata across configured agents.",
   "- model_value_rankings(tier?, benchmark?): read cached Copilot value rankings by capability tier;",
   "  valid effort tiers are metadata only, and the default benchmark is the AA Intelligence Index.",
   "- inspect_image(path, question?): inspect a Seam-staged image through the configured vision sidecar.",
@@ -1577,6 +1661,10 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolResetThreadSession(record, args));
         case "agent_quota":
           return rpcResult(id, this.toolAgentQuota(args));
+        case "model_metadata_get":
+          return rpcResult(id, this.toolModelMetadataGet(args));
+        case "model_metadata_query":
+          return rpcResult(id, this.toolModelMetadataQuery(args));
         case "model_value_rankings":
           return rpcResult(id, this.toolModelValueRankings(args));
         case "inspect_image":
@@ -1997,6 +2085,41 @@ export class SeamMcpServer {
       return textResult(`Unknown configured agent: "${agentId}".`, true);
     }
     return textResult(JSON.stringify(quotas, null, 2));
+  }
+
+  /** Fast cache-only one-model metadata lookup. */
+  private toolModelMetadataGet(args: Record<string, unknown>): McpToolResult {
+    if (!this.deps.getModelMetadata) {
+      return textResult("Model metadata is not supported on this deployment.", true);
+    }
+    const result = this.deps.getModelMetadata(requireString(args, "idOrSlug"));
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      structuredContent: result,
+    };
+  }
+
+  /** Fast cache-only model metadata query. The refresh source is deliberately
+   * absent from SeamMcpServerDeps, making live I/O impossible on this path. */
+  private toolModelMetadataQuery(args: Record<string, unknown>): McpToolResult {
+    if (!this.deps.queryModelMetadata) {
+      return textResult("Model metadata is not supported on this deployment.", true);
+    }
+    const filters = optionalRecord(args, "filters") as ModelMetadataQuery["filters"];
+    const sort = optionalRecord(args, "sort") as ModelMetadataQuery["sort"];
+    const limitValue = args.limit;
+    if (limitValue !== undefined && typeof limitValue !== "number") {
+      throw new Error('"limit" must be a number');
+    }
+    const result = this.deps.queryModelMetadata({
+      ...(filters ? { filters } : {}),
+      ...(sort ? { sort } : {}),
+      ...(typeof limitValue === "number" ? { limit: limitValue } : {}),
+    });
+    return {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      structuredContent: result,
+    };
   }
 
   /** Fast, cache-only model ranking. Structured data is primary; the matching
@@ -2707,6 +2830,17 @@ function optionalString(args: Record<string, unknown>, key: string): string | un
   if (v === undefined || v === null) return undefined;
   if (typeof v !== "string" || v.trim() === "") return undefined;
   return v;
+}
+function optionalRecord(
+  args: Record<string, unknown>,
+  key: string
+): Record<string, unknown> | undefined {
+  const value = args[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`"${key}" must be an object`);
+  }
+  return value as Record<string, unknown>;
 }
 /** Read an optional boolean arg. Absent / non-boolean ⇒ undefined (so the
  *  caller can apply its own default). */

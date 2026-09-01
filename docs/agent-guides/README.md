@@ -38,8 +38,8 @@ The useful mental model is:
 - A **thread worker** is a stateful teammate with its existing context.
 - A **preset worker** is a fresh, stateless specialist configured for one job.
 - Many Seam actions are asynchronous. A handoff, chain, wake, watch, compaction,
-  or live-help call returns promptly; Seam delivers the later result or event.
-  Do not block or poll merely to keep your turn alive.
+  self-migration, or live-help call returns promptly; Seam delivers the later
+  result or event. Do not block or poll merely to keep your turn alive.
 
 Repository-level `AGENTS.md` instructions and the live `<seam-harness>` preamble
 still govern the current thread. This primer does not replace them.
@@ -98,6 +98,10 @@ Use this as a map, not as a substitute for each tool's live schema.
 - Change another thread's agent/model/effort: `configure_thread`.
 - Clear another thread's context but keep its agent/model:
   `reset_thread_session`.
+- Move this thread to a different agent/model and continue from an explicit
+  handoff manifest: `migrate_self`. It stages until the current turn ends and
+  always starts a fresh replacement session; at least the agent or model must
+  actually change.
 - Reclaim context while preserving the old session: `compact`.
 - Rename this thread: `rename_thread`.
 
@@ -133,8 +137,8 @@ Load only what the task needs:
   [Interactive prompts][interactive-prompts].
 - A microsite or service submitting work over HTTP →
   [HTTP ingest][interactive-ingest].
-- Model selection or another thread's agent/model/effort/context →
-  [Models and cross-thread control][model-intelligence].
+- Model selection, another thread's runtime, or migrating your own thread →
+  [Models and session control][model-intelligence].
 - Gemini voice tutoring or conversational live audio → [Live Help][live-help].
 - Admin operation of the multi-thread Shared Voice Console →
   [Thread Voice V2][thread-voice].

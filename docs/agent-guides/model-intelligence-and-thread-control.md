@@ -67,12 +67,12 @@ know the model and just want its numbers.
 
 ---
 
-## 2. Cross-thread session control
+## 2. Session control
 
-These mutate **another thread's** live session, scoped to your own channel — the
-same trust boundary as `steer` / `handoff` (any agent in the channel may call
-them; the target must be a thread in your channel). They compose naturally with
-the data tools: read `model_value_rankings`, then apply the winner.
+There are two scopes. `configure_thread` and `reset_thread_session` target
+**another thread** in your channel, using the same trust boundary as `steer` and
+`handoff`. `migrate_self` targets only the calling thread. They compose with the
+data tools: inspect the candidates first, then apply the selected runtime.
 
 ### `configure_thread(thread, { agent?, model?, effort? })`
 Change a target thread's agent, model, and/or reasoning effort (at least one
@@ -96,6 +96,8 @@ its model.
 ### `migrate_self({ agent?, model?, effort?, manifest })`
 Migrate **your calling thread itself** to a different agent and/or model. It
 takes no thread id: the seam session token is the sole target authority.
+- At least one of `agent` or `model` must actually change. `effort` may accompany
+  the migration but cannot be the only change.
 - Supply a required free-form `manifest` containing current state, decisions,
   references, and next work. It is delivered as the **first prompt on the new
   session**, preserving intentional continuity without copying old context.

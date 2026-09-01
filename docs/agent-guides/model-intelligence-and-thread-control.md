@@ -91,9 +91,6 @@ its model.
 
 ## Related, FYI
 
-- A pinned **model value-rankings card** renders the current rankings in a
-  dedicated thread, refreshed on the same 12h cadence — the human-readable view
-  of `model_value_rankings`.
 - The Artificial Analysis benchmark data is also exposed as its own MCP server
   (`artificial-analysis`) for direct model lookups, but for cost-aware decisions
   prefer `model_value_rankings` (it joins in Copilot pricing).
@@ -106,5 +103,5 @@ its model.
 - **Freshness** — data is a cache snapshot (≤12h old); `fetched_at` is on every
   response if you need to reason about staleness.
 
-_Provenance: seam-acp issues #130 (value ranking), #131 (card), #132 (cross-thread
-control), #134 (metadata cache); drain-safety fix #137. Merged 2026-09-01._
+_Provenance: seam-acp issues #130 (value ranking), #132 (cross-thread control),
+#134 (metadata cache); drain-safety fix #137. Merged 2026-09-01._

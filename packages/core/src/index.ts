@@ -53,6 +53,8 @@ import {
   createAgentQuotaSources,
 } from "./core/quota/quota-poller.js";
 import { AgentQuotaCard } from "./core/quota/agent-quota-card.js";
+import { ModelValueStore } from "./core/model-value/store.js";
+import { ModelValueManager } from "./core/model-value/manager.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -101,7 +103,20 @@ async function main(): Promise<void> {
     },
   });
 
-  const store = new SessionStore(path.join(config.DATA_DIR, "seam.db"));
+  const seamDbPath = path.join(config.DATA_DIR, "seam.db");
+  const store = new SessionStore(seamDbPath);
+  const modelValueStore = new ModelValueStore(seamDbPath, {
+    inputTokens: config.MODEL_VALUE_STD_INPUT_TOKENS,
+    outputTokens: config.MODEL_VALUE_STD_OUTPUT_TOKENS,
+  });
+  const modelValueManager = new ModelValueManager({
+    store: modelValueStore,
+    logger: logger.child({ mod: "model-value" }),
+    aaApiKey: config.AA_API_KEY,
+    inputTokens: config.MODEL_VALUE_STD_INPUT_TOKENS,
+    outputTokens: config.MODEL_VALUE_STD_OUTPUT_TOKENS,
+    ...(config.COPILOT_CLI_PATH ? { copilotCliPath: config.COPILOT_CLI_PATH } : {}),
+  });
   // #75: crash leftovers stay `dispatched`/`running` forever unless we flip
   // them here. Target / correlation / acp_session_id are preserved for resume.
   // Does not delete isolated ACP sessions — #76 decides whether to reattach.
@@ -583,6 +598,7 @@ async function main(): Promise<void> {
   // Seed one normalized snapshot per configured agent before MCP/card startup,
   // then let each agent's own recent turn rate drive its recursive poll timer.
   await quotaPoller.start();
+  modelValueManager.start();
 
   // Start the shared seam-MCP server now that the adapter exists (peek reads
   // threads through it). Its ephemeral port feeds the router's late-bound
@@ -608,6 +624,7 @@ async function main(): Promise<void> {
         const quota = quotaRegistry.get(agentId);
         return quota ? [quota] : [];
       },
+      getModelValueRankings: (options) => modelValueStore.getRankings(options),
       inspectImage: (record, req) => {
         const effective = router.describeConfig(record);
         const effectiveProfile = router.getProfile(effective.agent.value);
@@ -1149,6 +1166,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, "shutting down");
     orchestrator.stopSentinelWatcher();
     quotaPoller.stop();
+    modelValueManager.stop();
     stopQuotaCard?.();
     stopStatusCard?.();
     scheduledManager.stop();
@@ -1174,6 +1192,11 @@ async function main(): Promise<void> {
       await router.disposeAll();
     } catch (err) {
       logger.warn({ err }, "router disposeAll failed");
+    }
+    try {
+      modelValueStore.close();
+    } catch {
+      /* ignore */
     }
     try {
       store.close();

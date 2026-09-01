@@ -40,6 +40,9 @@ Copy `.env.example` to `.env` and fill it in.
 | `DEFAULT_AGENT` | no | `copilot` (default), `agy`, or `claude`. Plus any `copilot-<id>` / `agy-<id>` / `claude-<id>` registered via the `*_PROFILES` vars. |
 | `DEFAULT_MODEL` | no | Default Copilot model. Applies to **all** Copilot profiles (including extras from `COPILOT_PROFILES`). e.g. `gpt-5.4`, `claude-sonnet-4.5`, `claude-opus-4.7`, `auto` |
 | `COPILOT_CLI_PATH` | no | If `copilot` is not on `PATH` |
+| `AA_API_KEY` | no | Artificial Analysis Data API key. Required for the 12-hour Copilot model-value snapshot refresh; the prior snapshot remains available when absent. |
+| `MODEL_VALUE_STD_INPUT_TOKENS` | no | Fixed input-token count for model-value cost comparisons. Default `8000`. |
+| `MODEL_VALUE_STD_OUTPUT_TOKENS` | no | Fixed output-token count for model-value cost comparisons. Default `2000`. |
 | `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam config agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
 | `AGY_CLI_PATH` | no | If `agy` is not on `PATH` (checks `~/.local/bin/agy` first) |
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |

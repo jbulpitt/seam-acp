@@ -408,6 +408,7 @@ describe("SeamMcpServer", () => {
       "forward",
       "handoff",
       "inspect_image",
+      "model_value_rankings",
       "peek",
       "poll_inbox",
       "rename_thread",
@@ -631,8 +632,9 @@ describe("SeamMcpServer", () => {
     const { body } = await h.call("tools/list");
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     // Adding an OPTION to handoff does NOT change the tool count; inspect_image
-    // is the standalone capability that brings the catalog to 26.
-    expect(body.result.tools).toHaveLength(26);
+    // was the standalone capability that brought the catalog to 26; the
+    // cache-backed model_value_rankings method brings it to 27.
+    expect(body.result.tools).toHaveLength(27);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -1394,9 +1396,9 @@ describe("SeamMcpServer", () => {
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
-    // Params on `send` must NOT add a tool — the set stays at 26 after the
-    // standalone inspect_image capability was added.
-    expect(body.result.tools).toHaveLength(26);
+    // Params on `send` must NOT add a tool — the set stays at 27 after the
+    // standalone model_value_rankings capability was added.
+    expect(body.result.tools).toHaveLength(27);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

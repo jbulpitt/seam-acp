@@ -34,6 +34,7 @@ import type { ConfigMutationInput } from "../config-mutation.js";
 import { isRestrictedParticipant, PARTICIPANT_CONFIG_REFUSAL } from "../../config.js";
 import { formatHostPrefixed, parseDispatchWorker } from "../location.js";
 import type { AgentQuota } from "../quota/agent-quota.js";
+import type { ModelValueRankingsResult } from "../model-value/types.js";
 
 /** Read-only entities visible to the calling thread (schedules + presets),
  *  returned by `config_describe` alongside the effective config. A FULL
@@ -159,6 +160,11 @@ export interface SeamMcpServerDeps {
   listThreads?: (record: SessionRecord) => Promise<ThreadEntry[]>;
   /** Read normalized quota headroom for one configured agent or all agents. */
   getAgentQuotas?: (agentId?: string) => AgentQuota[];
+  /** Read the latest durable Copilot value snapshot. Never performs live I/O. */
+  getModelValueRankings?: (options: {
+    tier?: string;
+    benchmark?: string;
+  }) => ModelValueRankingsResult;
   /** Inspect one Seam-staged image through a configured vision sidecar. The
    *  caller remains token-scoped; the implementation owns path containment. */
   inspectImage?: (
@@ -553,6 +559,29 @@ const TOOLS = [
         agentId: {
           type: "string",
           description: "Optional configured agent id. Omit to return every agent.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "model_value_rankings",
+    description:
+      "Read the latest cached Copilot model value ranking (Artificial Analysis benchmark divided by " +
+      "the fixed standard task's Copilot token cost). Results are ranked by value within capability " +
+      "tiers. This tool never performs live network or CLI work.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tier: {
+          type: "string",
+          enum: ["flagship", "balanced", "flash"],
+          description: "Optional capability tier filter.",
+        },
+        benchmark: {
+          type: "string",
+          description:
+            "Optional Artificial Analysis evaluations field to rank by. Defaults to the Intelligence Index rollup.",
         },
       },
       required: [],
@@ -1292,6 +1321,8 @@ const INSTRUCTIONS = [
   "  a turn cleanly. The entry marked isSelf is YOUR OWN thread — never hand off to it.",
   "- agent_quota(agentId?): read normalized rolling + weekly quota for one agent or all agents",
   "  before choosing workers; steer away from agents nearing a cap.",
+  "- model_value_rankings(tier?, benchmark?): read cached Copilot value rankings by capability tier;",
+  "  valid effort tiers are metadata only, and the default benchmark is the AA Intelligence Index.",
   "- inspect_image(path, question?): inspect a Seam-staged image through the configured vision sidecar.",
   "- handoff(worker, prompt, returnTo?): delegate a task. `worker` is a thread id (a stateful",
   "  teammate) or a preset name (a fresh stateless specialist). You do NOT block — the worker's",
@@ -1488,6 +1519,8 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolThreads(record, args));
         case "agent_quota":
           return rpcResult(id, this.toolAgentQuota(args));
+        case "model_value_rankings":
+          return rpcResult(id, this.toolModelValueRankings(args));
         case "inspect_image":
           return rpcResult(id, await this.toolInspectImage(record, args));
         case "chain":
@@ -1853,6 +1886,24 @@ export class SeamMcpServer {
       return textResult(`Unknown configured agent: "${agentId}".`, true);
     }
     return textResult(JSON.stringify(quotas, null, 2));
+  }
+
+  /** Fast, cache-only model ranking. Structured data is primary; the matching
+   * JSON text block preserves compatibility with clients that ignore it. */
+  private toolModelValueRankings(args: Record<string, unknown>): McpToolResult {
+    if (!this.deps.getModelValueRankings) {
+      return textResult("Model value ranking data is not supported on this deployment.", true);
+    }
+    const tier = optionalString(args, "tier");
+    const benchmark = optionalString(args, "benchmark");
+    const rankings = this.deps.getModelValueRankings({
+      ...(tier ? { tier } : {}),
+      ...(benchmark ? { benchmark } : {}),
+    });
+    return {
+      content: [{ type: "text", text: JSON.stringify(rankings, null, 2) }],
+      structuredContent: rankings,
+    };
   }
 
   /** Rename the caller's own thread. Self-scoped; restricted participants refused. */
@@ -2513,6 +2564,7 @@ interface JsonRpcResponse {
 interface McpToolResult {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
+  structuredContent?: object;
 }
 
 function rpcResult(id: JsonRpcId, result: unknown): JsonRpcResponse {

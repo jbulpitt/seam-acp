@@ -1491,6 +1491,26 @@ export class SessionStore {
   }
 
   /**
+   * Terminalize only `running` rows whose last heartbeat predates `cutoffUtc`.
+   * This runs before the boot orphan pass (so fresh crash leftovers remain
+   * resumable as `interrupted`) and periodically while the process is live.
+   * Metadata and ACP session ids are retained for operator audit.
+   */
+  abandonStaleRunningDelegations(
+    cutoffUtc: string,
+    nowUtc = new Date().toISOString()
+  ): number {
+    const info = this.db
+      .prepare(
+        `UPDATE delegation_log
+            SET status = 'abandoned', updated_utc = ?
+          WHERE status = 'running' AND updated_utc < ?`
+      )
+      .run(nowUtc, cutoffUtc);
+    return info.changes;
+  }
+
+  /**
    * The originating row for a correlation id. A correlation identifies one
    * logical delegation whose single row is mutated through its lifecycle; if
    * rows ever share one, the earliest-created wins so the answer is stable.

@@ -245,6 +245,46 @@ describe("DispatchWatcher", () => {
     expect(await readdir(dirs.running)).toEqual([]);
   });
 
+  it.each([false, true])(
+    "terminalizes a stale artifact whose durable ledger forbids recovery (resume=%s)",
+    async (resumeEnabled) => {
+      await mkdir(dirs.running, { recursive: true });
+      await mkdir(dirs.pending, { recursive: true });
+      await writeFile(
+        path.join(dirs.running, "job-abandoned.json"),
+        JSON.stringify({
+          target: "thread-1",
+          prompt: "must not replay",
+          session: "live",
+        }),
+        "utf8"
+      );
+      let calls = 0;
+      const watcher = new DispatchWatcher({
+        dataDir,
+        logger: silent,
+        resumeEnabled,
+        mayRecover: (id) => id !== "job-abandoned",
+        onDispatch: async () => {
+          calls++;
+          return { output: "wrong", stopReason: "end_turn" };
+        },
+      });
+
+      await watcher.start();
+      watcher.stop();
+
+      expect(calls).toBe(0);
+      expect(await readDone("job-abandoned")).toMatchObject({
+        id: "job-abandoned",
+        status: "failed",
+        error: "abandoned: durable delegation ledger is terminal",
+      });
+      expect(await readdir(dirs.running)).toEqual([]);
+      expect(await readdir(dirs.pending)).toEqual([]);
+    }
+  );
+
   it("runs different targets concurrently but serializes the same target", async () => {
     const order: string[] = [];
     let active = 0;

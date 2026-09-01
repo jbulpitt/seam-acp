@@ -44,6 +44,8 @@ export interface DispatchWatcherOpts {
    * unmarked — original-prompt replay, unconfigured == today's behavior.
    */
   resumeEnabled?: boolean;
+  /** Durable ledger gate: false means recovery must terminalize, never replay. */
+  mayRecover?: (id: string) => boolean;
 }
 
 export class DispatchWatcher {
@@ -52,6 +54,7 @@ export class DispatchWatcher {
   private readonly onDispatch: DispatchWatcherOpts["onDispatch"];
   private readonly pollMs: number;
   private readonly resumeEnabled: boolean;
+  private readonly mayRecover: (id: string) => boolean;
 
   /** One FIFO per target thread — different targets get different queues and
    *  therefore run concurrently. */
@@ -73,6 +76,7 @@ export class DispatchWatcher {
     this.onDispatch = opts.onDispatch;
     this.pollMs = opts.pollMs ?? 1000;
     this.resumeEnabled = opts.resumeEnabled === true;
+    this.mayRecover = opts.mayRecover ?? (() => true);
   }
 
   /** Create the queue dirs, recover anything a crash left in `running/`, then
@@ -181,6 +185,11 @@ export class DispatchWatcher {
         this.logger.info({ id }, "dispatch: dropped stale running spec (already done)");
         continue;
       }
+      if (!this.mayRecover(id)) {
+        await this.abandonRunning(id, "durable delegation ledger is terminal");
+        this.logger.warn({ id }, "dispatch: terminalized stale spec blocked by ledger");
+        continue;
+      }
       try {
         await rename(runningPath, path.join(this.dirs.pending, name));
         requeued++;
@@ -214,6 +223,11 @@ export class DispatchWatcher {
       if (await exists(path.join(this.dirs.done, name))) {
         await rm(runningPath, { force: true }).catch(() => {});
         this.logger.info({ id }, "dispatch: dropped stale running spec (already done)");
+        continue;
+      }
+      if (!this.mayRecover(id)) {
+        await this.abandonRunning(id, "durable delegation ledger is terminal");
+        this.logger.warn({ id }, "dispatch: terminalized stale resume blocked by ledger");
         continue;
       }
       try {

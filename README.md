@@ -49,6 +49,7 @@ Copy `.env.example` to `.env` and fill it in.
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
 | `CLAUDE_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `claude-<id>` profile pinned to its own `CLAUDE_CONFIG_DIR`. See "Multiple Claude accounts" below. |
 | `TURN_TIMEOUT_SECONDS` | no | Default 900 |
+| `RESTART_DRAIN_TIMEOUT_MS` | no | Maximum graceful redeploy drain before force restart. Default 300000 (5 minutes). |
 | `LOG_LEVEL` | no | `fatal` / `error` / `warn` / `info` / `debug` / `trace` |
 | `HEALTH_PORT` | no | Default 3000 — exposes `GET /health` |
 | `DEFAULT_PERMISSION_POLICY` | no | `ask` (recommended). Bot-wide default policy for new sessions. One of `always` (auto-approve), `ask` (prompt me on Discord), `deny` (auto-deny). Override per-session with `/seam config approve`. |

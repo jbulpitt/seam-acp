@@ -53,7 +53,17 @@ import {
   loadParkedAttachmentBytes,
 } from "../../core/parked-prompts/attachments.js";
 import type { InboxMessage } from "../../core/inbox/types.js";
-import { restartSentinelPath, sentinelIsForce } from "../../core/restart-sentinel.js";
+import {
+  restartSeamAcpProcess,
+  restartSentinelPath,
+  sentinelIsForce,
+  waitForRestartDrain,
+} from "../../core/restart-sentinel.js";
+import {
+  settleWithTurnWatchdog,
+  turnWatchdogTimeoutMs,
+  TurnWatchdogTimeoutError,
+} from "../../core/turn-watchdog.js";
 import {
   WAKE_MIN_DELAY_SECONDS,
   WAKE_MAX_DELAY_SECONDS,
@@ -524,6 +534,8 @@ export class Orchestrator {
   private readonly store: SessionStore;
   private readonly renderer: Renderer;
   private readonly quotaPoller?: AgentQuotaPoller;
+  /** Injected only by deterministic restart tests; production uses detached PM2. */
+  private readonly restartProcess: () => Promise<void>;
   /** Debounce for the quota-card "Refresh" button: the force-refresh bypasses
    *  the cadence floor, so guard against click-mashing hammering the endpoints. */
   private lastQuotaRefreshClickAt = 0;
@@ -643,6 +655,7 @@ export class Orchestrator {
     store: SessionStore;
     renderer: Renderer;
     quotaPoller?: AgentQuotaPoller;
+    restartProcess?: () => Promise<void>;
   }) {
     this.logger = opts.logger.child({ comp: "orchestrator" });
     this.config = opts.config;
@@ -651,6 +664,7 @@ export class Orchestrator {
     this.store = opts.store;
     this.renderer = opts.renderer;
     this.quotaPoller = opts.quotaPoller;
+    this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
 
     // #58 P2/P3: the mutation engine reuses the router's precedence resolver
     // (describeConfig) and profiles, and hot-reloads the LIVE preset maps
@@ -1153,6 +1167,8 @@ export class Orchestrator {
   private async handleRestartSentinel(): Promise<void> {
     this.restartPending = true;
     const force = this.readSentinelForce();
+    let forceShutdown = force;
+    const drainTimeoutMs = this.config.RESTART_DRAIN_TIMEOUT_MS ?? 300_000;
     // Keep cron timers running through the drain. Stopping them here is what
     // made `report-update` miss 5:25 while a restart sat pending for hours —
     // list still showed the stale next_run, and catch-up could then skip it.
@@ -1162,28 +1178,38 @@ export class Orchestrator {
     // SIGTERM; turn-resume continues them after boot.
 
     if (force) {
-      await this.postNotification(
+      void this.postNotification(
         "♻️ Force restart — interrupting live turns; they will resume."
       );
       this.logger.info({ activeTurns: this.activeTurns }, "force restart sentinel; skipping drain");
     } else if (this.activeTurns > 0) {
       const turnWord = this.activeTurns === 1 ? "turn" : "turn(s)";
-      await this.postNotification(
+      void this.postNotification(
         `♻️ Restart requested — waiting for ${this.activeTurns} ${turnWord} to finish.`
       );
       this.logger.info({ activeTurns: this.activeTurns }, "restart pending, draining turns");
 
-      await new Promise<void>((resolve) => {
-        const check = setInterval(() => {
-          if (this.activeTurns === 0) {
-            clearInterval(check);
-            resolve();
-          }
-        }, 500);
-      });
+      const drain = await waitForRestartDrain(
+        () => this.activeTurns,
+        drainTimeoutMs
+      );
+      if (!drain.drained) {
+        forceShutdown = true;
+        void this.postNotification(
+          `♻️ Restart drain timed out with ${drain.activeTurns} active turn(s) — ` +
+            "interrupting them now; they will resume."
+        );
+        this.logger.warn(
+          {
+            activeTurns: drain.activeTurns,
+            timeoutMs: drainTimeoutMs,
+          },
+          "restart drain timed out; continuing through force restart path"
+        );
+      }
     }
 
-    if (!force) {
+    if (!forceShutdown) {
       // Give agents 2 seconds to flush their SQLite DBs and transcripts after the
       // final JSON-RPC prompt() response is returned. Without this, the instant
       // SIGTERM during shutdown can interrupt the final background DB commit.
@@ -1191,7 +1217,11 @@ export class Orchestrator {
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
 
-    this.logger.info(force ? "force restart, executing pm2 restart" : "all turns drained, executing restart");
+    this.logger.info(
+      forceShutdown
+        ? "force restart, executing pm2 restart"
+        : "all turns drained, executing restart"
+    );
     this.scheduledManager?.stop();
     try {
       await fsp.unlink(this.sentinelPath());
@@ -1199,14 +1229,9 @@ export class Orchestrator {
       // ignore if already gone
     }
 
-    // Spawn pm2 restart in a detached process so this process can be killed
-    // without interrupting the restart command mid-flight.
-    const { spawn } = await import("node:child_process");
-    const child = spawn("pm2", ["restart", "seam-acp"], {
-      detached: true,
-      stdio: "ignore",
-    });
-    child.unref();
+    // Graceful, explicit force, and drain-timeout all converge on this exact
+    // detached PM2 path. PM2 sends SIGTERM; #76 turn-resume owns continuation.
+    await this.restartProcess();
   }
 
   // --- message turn ---
@@ -1310,7 +1335,22 @@ export class Orchestrator {
       // Count in the restart-drain counter so a redeploy waits for us.
       this.activeTurns++;
       try {
-        return await task();
+        const timeoutMs = turnWatchdogTimeoutMs(
+          this.config.TURN_TIMEOUT_SECONDS ?? 900
+        );
+        return await settleWithTurnWatchdog(task, {
+          timeoutMs,
+          label: `channel turn ${channelId}`,
+        });
+      } catch (err) {
+        if (err instanceof TurnWatchdogTimeoutError) {
+          this.logger.error(
+            { err, channelId, timeoutMs: err.timeoutMs },
+            "channel turn watchdog expired; releasing activeTurns and force-aborting runtime"
+          );
+          this.abortWatchdogTurn(channelId);
+        }
+        throw err;
       } finally {
         this.activeTurns--;
       }
@@ -1325,6 +1365,27 @@ export class Orchestrator {
     this.channelQueues.set(channelId, link);
     this.releaseChannelQueue(channelId, link);
     return result;
+  }
+
+  /** Best-effort cancellation after the watchdog has already settled the queue. */
+  private abortWatchdogTurn(channelId: string): void {
+    const maybeStore = this.store as SessionStore & {
+      getByChannel?: (platform: string, channelRef: string) => SessionRecord | null;
+    };
+    const maybeRouter = this.router as SessionRouter & {
+      abortTurn?: (
+        sessionId: string,
+        opts: { force: boolean }
+      ) => Promise<"idle" | "cancelled" | "killed">;
+    };
+    const record = maybeStore.getByChannel?.(PLATFORM, channelId);
+    if (!record || !maybeRouter.abortTurn) return;
+    void maybeRouter.abortTurn(record.id, { force: true }).catch((err) =>
+      this.logger.warn(
+        { err, channelId, sessionId: record.id },
+        "channel turn watchdog abort failed"
+      )
+    );
   }
 
   /**
@@ -6507,7 +6568,20 @@ export class Orchestrator {
     // live session and needn't queue. Still counted for the restart drain.
     this.activeTurns++;
     try {
-      return await gatedRun();
+      return await settleWithTurnWatchdog(gatedRun, {
+        timeoutMs: turnWatchdogTimeoutMs(
+          this.config.TURN_TIMEOUT_SECONDS ?? 900
+        ),
+        label: `isolated dispatch ${spec.id}`,
+      });
+    } catch (err) {
+      if (err instanceof TurnWatchdogTimeoutError) {
+        this.logger.error(
+          { err, dispatch: spec.id, target: spec.target, timeoutMs: err.timeoutMs },
+          "isolated dispatch watchdog expired; releasing activeTurns"
+        );
+      }
+      throw err;
     } finally {
       this.activeTurns--;
     }

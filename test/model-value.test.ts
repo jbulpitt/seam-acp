@@ -192,6 +192,37 @@ describe("model value sources and ranking", () => {
 });
 
 describe("model value refresh and MCP cache surface", () => {
+  it("notifies render consumers only after a successful snapshot is durable", async () => {
+    const store = tempStore();
+    const logger = {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    } as any;
+    const onUpdate = vi.fn(() => {
+      expect(store.getRankings().fetched_at).not.toBeNull();
+    });
+    const manager = new ModelValueManager({
+      store,
+      logger,
+      aaApiKey: "test",
+      inputTokens: 8000,
+      outputTokens: 2000,
+      fetchAa: async () => parseAaModels(aaPayload),
+      fetchPricing: async () => parseCopilotPricingMarkdown(pricingMarkdown),
+      fetchCopilot: async () => [{
+        modelId: "gpt-5.6-sol",
+        displayName: "GPT-5.6 Sol",
+        validEffortTiers: ["low", "high"],
+        priceCategory: "medium",
+      }],
+    });
+    manager.setOnUpdate(onUpdate);
+    await manager.refresh();
+    expect(onUpdate).toHaveBeenCalledOnce();
+    store.close();
+  });
+
   it("keeps a prior snapshot when a source parse/fetch fails", async () => {
     const store = tempStore();
     store.saveSnapshot(fixtureSnapshot().rows);
@@ -212,12 +243,15 @@ describe("model value refresh and MCP cache surface", () => {
       },
       fetchCopilot: async () => [],
     });
+    const onUpdate = vi.fn();
+    manager.setOnUpdate(onUpdate);
     await manager.refresh();
     expect(store.getRankings().fetched_at).toBe("2026-09-01T12:00:00.000Z");
     expect(logger.error).toHaveBeenCalledWith(
       expect.any(Object),
       "model value ranking refresh failed; keeping prior snapshot"
     );
+    expect(onUpdate).not.toHaveBeenCalled();
     store.close();
   });
 

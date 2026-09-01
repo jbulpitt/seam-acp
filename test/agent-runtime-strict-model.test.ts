@@ -26,9 +26,11 @@ function makeLogger() {
 class FakeConn {
   setModelShouldReject = false;
   setModelCalls = 0;
+  initialConfigOptions: unknown = null;
+  nextConfigOptions: unknown = null;
 
   async newSession() {
-    return { sessionId: "fresh-session", configOptions: null, modes: null };
+    return { sessionId: "fresh-session", configOptions: this.initialConfigOptions, modes: null };
   }
   async loadSession(params: { sessionId: string }) {
     return { sessionId: params.sessionId, configOptions: null, modes: null };
@@ -43,6 +45,7 @@ class FakeConn {
     if (this.setModelShouldReject) {
       throw new Error("Invalid value for config option model: claude-opus-5");
     }
+    return { configOptions: this.nextConfigOptions };
   }
 }
 
@@ -98,5 +101,31 @@ describe("AgentRuntime strictModel", () => {
     expect(info.sessionId).toBe("fresh-session");
     expect(info.currentModelId).toBe("default");
     expect(conn.setModelCalls).toBe(1);
+  });
+
+  it("tracks live select values from session creation and config-option updates", async () => {
+    const { rt, conn } = makeRuntime();
+    const option = (values: string[]) => ({
+      id: "reasoning_effort",
+      name: "Reasoning effort",
+      category: "thought_level",
+      type: "select",
+      currentValue: values[0],
+      options: values.map((value) => ({ name: value, value })),
+    });
+    conn.initialConfigOptions = [option(["low", "high"])];
+    conn.nextConfigOptions = [option(["none", "low", "high", "xhigh", "max"])];
+
+    await rt.newSession({ cwd: "/tmp" });
+    expect(rt.getConfigSelectValues("reasoning_effort")).toEqual(["low", "high"]);
+
+    await rt.setConfigOption("reasoning_effort", "high");
+    expect(rt.getConfigSelectValues("reasoning_effort")).toEqual([
+      "none",
+      "low",
+      "high",
+      "xhigh",
+      "max",
+    ]);
   });
 });

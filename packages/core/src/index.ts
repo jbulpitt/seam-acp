@@ -36,6 +36,7 @@ import { DispatchWatcher } from "./core/dispatch/watcher.js";
 import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
+import { ThreadSessionControlService } from "./core/thread-session-control.js";
 import { createAgyImageInspector } from "./core/vision/agy-image-inspector.js";
 import { watchChannelPresets } from "./core/config-reload.js";
 import { BridgeHub } from "./core/bridge-hub.js";
@@ -595,6 +596,11 @@ async function main(): Promise<void> {
       logger,
       ...(config.AGY_CLI_PATH ? { cliPath: config.AGY_CLI_PATH } : {}),
     });
+    const threadSessionControl = new ThreadSessionControlService({
+      store,
+      router,
+      mutation: orchestrator.getConfigMutation(),
+    });
     seamMcpServer = new SeamMcpServer({
       logger,
       resolveSession: (token) => {
@@ -603,6 +609,10 @@ async function main(): Promise<void> {
         return store.get(sid) ?? orchestrator.resolveIngestJob(sid);
       },
       enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
+      resolveThread: (threadId) => store.getByChannel("discord", threadId),
+      configureThread: (caller, target, input) =>
+        threadSessionControl.configure(caller, target, input),
+      resetThreadSession: (target) => threadSessionControl.reset(target),
       getAgentQuotas: (agentId) => {
         if (!agentId) return quotaRegistry.all();
         const quota = quotaRegistry.get(agentId);

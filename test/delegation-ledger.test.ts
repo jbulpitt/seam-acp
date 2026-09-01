@@ -428,6 +428,55 @@ describe("delegation ledger", () => {
     expect(store.getDelegation("del-1")?.acpSessionId).toBe("keep");
   });
 
+  it("abandons only stale running rows and is idempotent", () => {
+    store.recordDelegation(sample({
+      id: "stale-run",
+      correlationId: "stale-run",
+      status: "running",
+      acpSessionId: "acp-stale",
+      updatedUtc: "2026-03-01T10:00:00.000Z",
+    }));
+    store.recordDelegation(sample({
+      id: "fresh-run",
+      correlationId: "fresh-run",
+      status: "running",
+      updatedUtc: "2026-03-01T11:30:00.000Z",
+    }));
+    store.recordDelegation(sample({
+      id: "old-dispatched",
+      correlationId: "old-dispatched",
+      status: "dispatched",
+      updatedUtc: "2026-03-01T10:00:00.000Z",
+    }));
+    store.recordDelegation(sample({
+      id: "old-completed",
+      correlationId: "old-completed",
+      status: "completed",
+      updatedUtc: "2026-03-01T10:00:00.000Z",
+    }));
+
+    expect(
+      store.abandonStaleRunningDelegations(
+        "2026-03-01T11:00:00.000Z",
+        "2026-03-01T12:00:00.000Z"
+      )
+    ).toBe(1);
+    expect(store.getDelegation("stale-run")).toMatchObject({
+      status: "abandoned",
+      acpSessionId: "acp-stale",
+      updatedUtc: "2026-03-01T12:00:00.000Z",
+    });
+    expect(store.getDelegation("fresh-run")?.status).toBe("running");
+    expect(store.getDelegation("old-dispatched")?.status).toBe("dispatched");
+    expect(store.getDelegation("old-completed")?.status).toBe("completed");
+    expect(
+      store.abandonStaleRunningDelegations(
+        "2026-03-01T11:00:00.000Z",
+        "2026-03-01T12:01:00.000Z"
+      )
+    ).toBe(0);
+  });
+
   it("the report_back claim survives a store reopen", () => {
     const dbPath = path.join(dir, "rb-reopen.db");
     const s1 = new SessionStore(dbPath);

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +7,7 @@ import {
   writeForceRestartSentinel,
   restartSentinelPath,
   RESTART_SENTINEL_FORCE_BODY,
+  waitForRestartDrain,
 } from "../packages/core/src/core/restart-sentinel.js";
 
 describe("sentinelIsForce", () => {
@@ -34,5 +35,26 @@ describe("writeForceRestartSentinel", () => {
     expect(written).toBe(restartSentinelPath(tmp));
     expect(fs.readFileSync(written, "utf8")).toBe(RESTART_SENTINEL_FORCE_BODY);
     expect(sentinelIsForce(fs.readFileSync(written, "utf8"))).toBe(true);
+  });
+});
+
+describe("waitForRestartDrain", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("reports a drain before the deadline", async () => {
+    vi.useFakeTimers();
+    let active = 1;
+    const waiting = waitForRestartDrain(() => active, 1_000, 100);
+    await vi.advanceTimersByTimeAsync(400);
+    active = 0;
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(waiting).resolves.toEqual({ drained: true, activeTurns: 0 });
+  });
+
+  it("reports the still-active snapshot at the deadline", async () => {
+    vi.useFakeTimers();
+    const waiting = waitForRestartDrain(() => 3, 1_000, 100);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(waiting).resolves.toEqual({ drained: false, activeTurns: 3 });
   });
 });

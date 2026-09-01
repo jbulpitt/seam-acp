@@ -6,6 +6,8 @@ import { LoopbackHost } from "./core/loopback-host.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
 import { SessionStore } from "./core/session-store.js";
+import { DelegationReconciler } from "./core/delegation-reconciler.js";
+import { DELEGATION_TERMINAL_STATUSES } from "./core/types.js";
 import { SessionRouter } from "./core/session-router.js";
 import { makeCopilotProfile } from "@seam/adapters";
 import { makeClaudeProfile } from "@seam/adapters";
@@ -117,6 +119,15 @@ async function main(): Promise<void> {
   });
   const modelMetadataStore = new ModelMetadataStore(seamDbPath);
   const artificialAnalysis = new ArtificialAnalysisMetadataSource(config.AA_API_KEY);
+  // #137: old `running` rows are not resumable work — terminalize them before
+  // the ordinary #75 boot pass converts fresh crash leftovers to `interrupted`.
+  // The same cutoff is swept periodically so a hung live process self-cleans.
+  const delegationReconciler = new DelegationReconciler({
+    store,
+    logger,
+    maxAgeMs: config.SEAM_TURN_RESUME_MAX_AGE_SECONDS * 1000,
+  });
+  delegationReconciler.reconcile();
   // #75: crash leftovers stay `dispatched`/`running` forever unless we flip
   // them here. Target / correlation / acp_session_id are preserved for resume.
   // Does not delete isolated ACP sessions — #76 decides whether to reattach.
@@ -127,6 +138,7 @@ async function main(): Promise<void> {
       "reconciled orphaned delegation ledger rows as interrupted"
     );
   }
+  delegationReconciler.start();
 
   const { servers: mcpServers } = buildGlobalMcpServers(logger, {
     dataDir: config.DATA_DIR,
@@ -935,6 +947,12 @@ async function main(): Promise<void> {
     // Flag-on: mark stale running specs in place (orchestrator stagger-
     // requeues after preconditions). Flag-off: today's recoverStale replay.
     resumeEnabled: config.SEAM_TURN_RESUME_ENABLED,
+    // A stale ledger row terminalized by #137 must never be resurrected by the
+    // filesystem at-least-once recovery path, regardless of resume flag.
+    mayRecover: (id) => {
+      const row = store.getDelegation(id);
+      return !row || !DELEGATION_TERMINAL_STATUSES.includes(row.status);
+    },
   });
   orchestrator.setDispatchWatcher(dispatchWatcher);
 
@@ -1218,6 +1236,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, "shutting down");
     orchestrator.stopSentinelWatcher();
+    delegationReconciler.stop();
     quotaPoller.stop();
     modelMetadataManager.stop();
     modelValueManager.stop();

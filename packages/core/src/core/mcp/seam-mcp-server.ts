@@ -37,6 +37,8 @@ import type { AgentQuota } from "../quota/agent-quota.js";
 import type {
   ConfigureThreadInput,
   ConfigureThreadOutcome,
+  MigrateSelfInput,
+  PrepareSelfMigrationOutcome,
   ResetThreadSessionOutcome,
 } from "../thread-session-control.js";
 import type { ModelValueRankingsResult } from "../model-value/types.js";
@@ -180,6 +182,11 @@ export interface SeamMcpServerDeps {
   resetThreadSession?: (
     target: SessionRecord
   ) => Promise<ResetThreadSessionOutcome>;
+  /** Validate a self migration before the durable post-turn dispatch is staged. */
+  prepareSelfMigration?: (
+    caller: SessionRecord,
+    input: MigrateSelfInput
+  ) => Promise<PrepareSelfMigrationOutcome>;
   /** Read normalized quota headroom for one configured agent or all agents. */
   getAgentQuotas?: (agentId?: string) => AgentQuota[];
   /** Read the latest durable Copilot value snapshot. Never performs live I/O. */
@@ -606,6 +613,32 @@ const TOOLS = [
         thread: { type: "string", description: "Target thread id from threads()." },
       },
       required: ["thread"],
+    },
+  },
+  {
+    name: "migrate_self",
+    description:
+      "Migrate THIS thread (yourself) onto a different agent/model, carrying a manifest prompt " +
+      "that seeds the new session so your work continues. Switching agent/model resets the session — " +
+      "the manifest is how continuity survives. Invoke it for any reason (a better model for the next " +
+      "phase, quota, cost, availability); this method does not judge the reason. On failure the thread " +
+      "stays on its current agent/model. The switch is staged until your current turn completes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: { type: "string", description: "Optional registered target agent profile id." },
+        model: { type: "string", description: "Optional model id advertised by the target agent." },
+        effort: {
+          type: "string",
+          description: "Optional target-runtime reasoning effort, or auto to clear the override.",
+        },
+        manifest: {
+          type: "string",
+          description:
+            "Required free-form continuation prompt: current state, decisions, references, and next work.",
+        },
+      },
+      required: ["manifest"],
     },
   },
   {
@@ -1466,6 +1499,7 @@ const INSTRUCTIONS = [
   "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
   "- configure_thread(thread, agent?, model?, effort?): reconfigure a teammate in YOUR channel; agent switches reset context.",
   "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
+  "- migrate_self(agent?, model?, effort?, manifest): migrate YOUR OWN thread after this turn ends; the manifest is the replacement session's first prompt. Purpose-agnostic and rollback-safe.",
   "- peek(thread, count?): read another thread's recent messages to get context before delegating.",
   "- chain(workers, prompt, returnTo?): pipe a prompt through an ordered list of workers where each",
   "  hop's output feeds the next; the final output is delivered back to you. Durable across restarts.",
@@ -1658,6 +1692,8 @@ export class SeamMcpServer {
           return rpcResult(id, await this.toolConfigureThread(record, args));
         case "reset_thread_session":
           return rpcResult(id, await this.toolResetThreadSession(record, args));
+        case "migrate_self":
+          return rpcResult(id, await this.toolMigrateSelf(record, args));
         case "agent_quota":
           return rpcResult(id, this.toolAgentQuota(args));
         case "model_metadata_get":
@@ -1767,6 +1803,62 @@ export class SeamMcpServer {
     if (!target.ok) return textResult(target.error, true);
     const outcome = await this.deps.resetThreadSession(target.record);
     return textResult(JSON.stringify(outcome, null, 2), !outcome.ok);
+  }
+
+  private async toolMigrateSelf(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.prepareSelfMigration) {
+      return textResult("self migration is not supported on this deployment.", true);
+    }
+    if (args.thread !== undefined) {
+      return textResult(
+        "Refused: migrate_self always targets the calling thread; it does not accept a thread argument.",
+        true
+      );
+    }
+    const manifest = requireString(args, "manifest");
+    const input: MigrateSelfInput = {
+      manifest,
+      ...(optionalString(args, "agent") ? { agent: optionalString(args, "agent") } : {}),
+      ...(optionalString(args, "model") ? { model: optionalString(args, "model") } : {}),
+      ...(typeof args.effort === "string" ? { effort: args.effort } : {}),
+    };
+    const prepared = await this.deps.prepareSelfMigration(caller, input);
+    if (!prepared.ok) return textResult(prepared.error, true);
+
+    const dispatchId = randomUUID();
+    const spec: DispatchSpec = {
+      id: dispatchId,
+      target: caller.channelRef,
+      prompt: manifest,
+      session: "live",
+      kind: "migrate_self",
+      migration: prepared.migration,
+      correlationId: dispatchId,
+      createdUtc: new Date().toISOString(),
+    };
+    await this.deps.enqueueDispatch(spec);
+    this.logger.info(
+      {
+        dispatchId,
+        thread: caller.channelRef,
+        agent: prepared.migration.agent,
+        model: prepared.migration.model,
+      },
+      "seam-mcp self migration staged"
+    );
+    return textResult(JSON.stringify({
+      ok: true,
+      staged: true,
+      dispatchId,
+      agent: prepared.migration.agent,
+      model: prepared.migration.model,
+      ...(prepared.migration.effort ? { effort: prepared.migration.effort } : {}),
+      message:
+        "Migration is staged. Finish this turn normally; the replacement session will receive the manifest first.",
+    }, null, 2));
   }
 
   private resolveSameChannelTarget(

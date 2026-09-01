@@ -648,6 +648,9 @@ async function main(): Promise<void> {
       router,
       mutation: orchestrator.getConfigMutation(),
     });
+    orchestrator.setSelfMigrationHandler((target, prepared) =>
+      threadSessionControl.executeSelfMigration(target, prepared)
+    );
     seamMcpServer = new SeamMcpServer({
       logger,
       resolveSession: (token) => {
@@ -660,6 +663,8 @@ async function main(): Promise<void> {
       configureThread: (caller, target, input) =>
         threadSessionControl.configure(caller, target, input),
       resetThreadSession: (target) => threadSessionControl.reset(target),
+      prepareSelfMigration: (caller, input) =>
+        threadSessionControl.prepareSelfMigration(caller, input),
       getAgentQuotas: (agentId) => {
         if (!agentId) return quotaRegistry.all();
         const quota = quotaRegistry.get(agentId);

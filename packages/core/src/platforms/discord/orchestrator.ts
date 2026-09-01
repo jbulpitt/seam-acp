@@ -289,6 +289,10 @@ import {
   postSimpleCardGifMessage,
 } from "../../core/simple-card-gif.js";
 import { ConfigMutationService, type ConfigMutationInput } from "../../core/config-mutation.js";
+import type {
+  ExecuteSelfMigrationOutcome,
+  PreparedSelfMigration,
+} from "../../core/thread-session-control.js";
 import { reloadChannelPresets } from "../../core/config-reload.js";
 import type { ConfigProposeOutcome } from "../../core/mcp/seam-mcp-server.js";
 import {
@@ -577,6 +581,11 @@ export class Orchestrator {
   private readonly voiceConsoleEditorDrafts = new Map<string, VoiceConsoleBindingEditorDraft>();
   /** Set by index.ts after construction; event-driven parked-prompt delivery (#88). */
   private parkedManager?: ParkedPromptManager;
+  /** Post-turn activator for durable migrate_self dispatches (#141). */
+  private selfMigrationHandler?: (
+    target: SessionRecord,
+    prepared: PreparedSelfMigration
+  ) => Promise<ExecuteSelfMigrationOutcome>;
   /** Simple-card GIF catalog. Random pick is sync; fetch is off the render path. */
   private cardGifs?: CardGifCatalog;
   /** Status-card poke after park/cancel so `📥 N waiting` updates immediately. */
@@ -4027,6 +4036,15 @@ export class Orchestrator {
     this.parkedManager = m;
   }
 
+  setSelfMigrationHandler(
+    handler: (
+      target: SessionRecord,
+      prepared: PreparedSelfMigration
+    ) => Promise<ExecuteSelfMigrationOutcome>
+  ): void {
+    this.selfMigrationHandler = handler;
+  }
+
   setCardGifs(catalog: CardGifCatalog): void {
     this.cardGifs = catalog;
   }
@@ -6101,7 +6119,7 @@ export class Orchestrator {
     if (spec.kind === "thread_voice") return this.dispatchThreadVoice(spec);
 
     const target: ChannelRef = { platform: PLATFORM, id: spec.target };
-    const record = this.router.ensureSessionRecord({
+    let record = this.router.ensureSessionRecord({
       platform: PLATFORM,
       channelRef: spec.target,
       cwd: spec.cwd ?? this.config.REPOS_ROOT,
@@ -6120,7 +6138,7 @@ export class Orchestrator {
     }
     const presetProfile = (preset?.agentId ? this.router.getProfile(preset.agentId) : undefined)
       ?? (agentOverride ? this.router.getProfile(agentOverride) : undefined);
-    const quotaAgentId = presetProfile?.id ?? record.agentId;
+    let quotaAgentId = presetProfile?.id ?? record.agentId;
     const effectiveSession = preset || agentOverride ? "isolated" : spec.session;
     const threadLocation = resolveThreadLocation(this.config, spec.target);
     const workerLocation = spec.location
@@ -6227,6 +6245,34 @@ export class Orchestrator {
     const statusPanelOn = this.config.SEAM_DISPATCH_STATUS_PANEL !== false;
 
     const run = async (): Promise<{ output: string; stopReason: string }> => {
+      if (spec.kind === "migrate_self") {
+        if (!spec.migration || !this.selfMigrationHandler) {
+          throw new Error("dispatch: self migration is not wired");
+        }
+        let migrated: ExecuteSelfMigrationOutcome;
+        try {
+          migrated = await this.selfMigrationHandler(record, spec.migration);
+        } catch (err) {
+          migrated = { ok: false, error: err instanceof Error ? err.message : String(err) };
+        }
+        if (!migrated.ok) {
+          await this.adapter.sendMessage(
+            target,
+            `⚠️ Migration failed; continuing on the prior agent/model. ${migrated.error}`
+          ).catch((err) =>
+            this.logger.warn({ err, dispatch: spec.id }, "self migration failure notice failed")
+          );
+          throw new Error(migrated.error);
+        }
+        record = migrated.record;
+        quotaAgentId = migrated.agent;
+        await this.adapter.sendMessage(
+          target,
+          `🔀 Migrated to ${migrated.agent} / ${migrated.model} — continuing`
+        ).catch((err) =>
+          this.logger.warn({ err, dispatch: spec.id }, "self migration notice failed")
+        );
+      }
       this.quotaPoller?.recordTurnStart(quotaAgentId);
       // Isolated: do not mark `running` here — wait for newSession() so the
       // status transition carries the ACP session id (#75). Live: the thread's
@@ -7349,6 +7395,7 @@ export class Orchestrator {
       case "parked": return "📥 Parked";
       case "choice": return "🗳️ Choice";
       case "ingest": return "🌐 Ingest";
+      case "migrate_self": return "🔀 Migration";
       case "handoff":
       default: return "📨 Handoff";
     }
@@ -7369,6 +7416,7 @@ export class Orchestrator {
       case "parked": return "parked prompt";
       case "choice": return "choice";
       case "ingest": return "ingest";
+      case "migrate_self": return "self migration";
       case "handoff":
       default: return "handoff";
     }

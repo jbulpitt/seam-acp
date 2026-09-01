@@ -13,8 +13,8 @@ There are two capability families:
 
 1. **Model intelligence data** — cached, fast, read-only lookups of model
    benchmarks, pricing, and cost-efficiency ("value") rankings.
-2. **Cross-thread session control** — reconfigure or reset *another* thread's
-   agent / model / reasoning effort from your own thread.
+2. **Session control** — reconfigure/reset another thread, or migrate your own
+   thread to a fresh agent/model with an explicit continuation manifest.
 
 ---
 
@@ -93,6 +93,21 @@ Start a fresh session on a thread, keeping its current agent + model. Clears
 conversation context. Use to recover a wedged/confused thread without changing
 its model.
 
+### `migrate_self({ agent?, model?, effort?, manifest })`
+Migrate **your calling thread itself** to a different agent and/or model. It
+takes no thread id: the seam session token is the sole target authority.
+- Supply a required free-form `manifest` containing current state, decisions,
+  references, and next work. It is delivered as the **first prompt on the new
+  session**, preserving intentional continuity without copying old context.
+- The tool stages while your current turn is active. The invoking turn ends
+  normally; the channel FIFO then performs the reset, posts a neutral switch
+  notice, and starts the manifest on the replacement runtime.
+- The mechanism is purpose-agnostic. It does not consult quota, rankings,
+  pricing, governance, or admin policy; use the intelligence tools yourself if
+  those facts matter to your decision.
+- Target validation happens before staging. Replacement startup failure rolls
+  durable state back to the prior agent/model/ACP session.
+
 ---
 
 ## Related, FYI
@@ -110,4 +125,4 @@ its model.
   response if you need to reason about staleness.
 
 _Provenance: seam-acp issues #130 (value ranking), #132 (cross-thread control),
-#134 (metadata cache); drain-safety fix #137. Merged 2026-09-01._
+#134 (metadata cache), #141 (self migration); drain-safety fix #137._

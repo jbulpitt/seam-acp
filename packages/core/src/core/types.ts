@@ -267,6 +267,8 @@ export type DelegationKind =
    *  Distinct from "choice" so Discord click-cards and microsite endpoints
    *  do not share ledger/panel filing. */
   | "ingest"
+  /** Self-directed agent/model reset whose manifest seeds the replacement session. */
+  | "migrate_self"
   /** Durable user-authored input produced only by authenticated Thread Voice
    *  capture. Trusted speaker metadata is verified against its durable batch. */
   | "thread_voice";

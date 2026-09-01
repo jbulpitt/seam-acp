@@ -524,7 +524,10 @@ export class SessionRouter {
    *  #76: MUST NOT clear turn-resume markers. User cancel and host shutdown
    *  both land here via dispose(); wiping markers would make resume a
    *  silent no-op on every graceful reboot. Command layer clears them. */
-  async invalidate(sessionId: string, opts?: { clearAcpSession?: boolean }): Promise<void> {
+  async invalidate(
+    sessionId: string,
+    opts?: { clearAcpSession?: boolean; clearStartFailure?: boolean }
+  ): Promise<void> {
     // Keep the seam-MCP token. It identifies the Discord session; Grok (and
     // others) reconnect HTTP MCP with the header from session/new. A later
     // start reuses it (reuseToken). Revoke only when the session row is gone.
@@ -557,6 +560,9 @@ export class SessionRouter {
           this.logger.info({ sessionId }, "cleared stored acp session id");
         }
       }
+    }
+    if (opts?.clearStartFailure) {
+      this.lastStartFailure.delete(sessionId);
     }
   }
 
@@ -865,62 +871,74 @@ export class SessionRouter {
     // For agents that accept reasoning effort via CLI flags (e.g. Grok
     // --reasoning-effort), pass it at spawn time.
     runtime.effortOverride = effort;
-    await runtime.start();
+    try {
+      await runtime.start();
 
-    if (record.acpSessionId) {
-      // Resume with a couple short retries. Right after a redeploy the agent
-      // subprocess can still be spinning up when the first message lands, so
-      // the first loadSession can fail transiently — and falling straight
-      // through to newSession would overwrite the (good) acpSessionId and
-      // detach the thread from its conversation. A brief escalating backoff
-      // lets the agent finish starting before we give up.
-      const RESUME_ATTEMPTS = 3;
-      const RESUME_RETRY_MS = 400;
-      for (let attempt = 1; attempt <= RESUME_ATTEMPTS; attempt++) {
-        try {
-          await runtime.loadSession({
-            sessionId: record.acpSessionId,
-            cwd,
-            model,
-            ...(effort ? { effort } : {}),
-          });
-          this.logger.debug(
-            { sessionId: record.id, acpSessionId: record.acpSessionId, attempt },
-            "resumed acp session"
-          );
-          return runtime;
-        } catch (err) {
-          const lastAttempt = attempt === RESUME_ATTEMPTS;
-          this.logger.warn(
-            { err, sessionId: record.id, attempt, lastAttempt },
-            lastAttempt
-              ? "session/load failed after retries, creating new session"
-              : "session/load failed; retrying after short delay"
-          );
-          if (!lastAttempt) {
-            await new Promise((r) => setTimeout(r, RESUME_RETRY_MS * attempt));
+      if (record.acpSessionId) {
+        // Resume with a couple short retries. Right after a redeploy the agent
+        // subprocess can still be spinning up when the first message lands, so
+        // the first loadSession can fail transiently — and falling straight
+        // through to newSession would overwrite the (good) acpSessionId and
+        // detach the thread from its conversation. A brief escalating backoff
+        // lets the agent finish starting before we give up.
+        const RESUME_ATTEMPTS = 3;
+        const RESUME_RETRY_MS = 400;
+        for (let attempt = 1; attempt <= RESUME_ATTEMPTS; attempt++) {
+          try {
+            await runtime.loadSession({
+              sessionId: record.acpSessionId,
+              cwd,
+              model,
+              ...(effort ? { effort } : {}),
+            });
+            this.logger.debug(
+              { sessionId: record.id, acpSessionId: record.acpSessionId, attempt },
+              "resumed acp session"
+            );
+            return runtime;
+          } catch (err) {
+            const lastAttempt = attempt === RESUME_ATTEMPTS;
+            this.logger.warn(
+              { err, sessionId: record.id, attempt, lastAttempt },
+              lastAttempt
+                ? "session/load failed after retries, creating new session"
+                : "session/load failed; retrying after short delay"
+            );
+            if (!lastAttempt) {
+              await new Promise((r) => setTimeout(r, RESUME_RETRY_MS * attempt));
+            }
           }
         }
       }
-    }
 
-    const info = await runtime.newSession({
-      cwd,
-      model,
-      ...(effort ? { effort } : {}),
-    });
-    // Persist the new ACP session id so we can resume on restart. Also sync the
-    // caller's in-memory record: getOrStartRuntime receives the same record the
-    // orchestrator reuses for the rest of the turn, and if it kept the empty
-    // placeholder, a later config write (persistConfig spreads `...record`)
-    // would upsert "" back over this id — silently unbinding the thread so the
-    // NEXT restart resumes nothing and the user has to re-attach.
-    record.acpSessionId = info.sessionId;
-    this.store.upsert({
-      ...record,
-      updatedUtc: new Date().toISOString(),
-    });
-    return runtime;
+      const info = await runtime.newSession({
+        cwd,
+        model,
+        ...(effort ? { effort } : {}),
+      });
+      // Persist the new ACP session id so we can resume on restart. Also sync the
+      // caller's in-memory record: getOrStartRuntime receives the same record the
+      // orchestrator reuses for the rest of the turn, and if it kept the empty
+      // placeholder, a later config write (persistConfig spreads `...record`)
+      // would upsert "" back over this id — silently unbinding the thread so the
+      // NEXT restart resumes nothing and the user has to re-attach.
+      record.acpSessionId = info.sessionId;
+      this.store.upsert({
+        ...record,
+        updatedUtc: new Date().toISOString(),
+      });
+      return runtime;
+    } catch (err) {
+      // A failed replacement must not leak an untracked child: getOrStartRuntime
+      // caches only successful starts, so invalidate() cannot see this runtime.
+      await runtime.dispose().catch((disposeErr) =>
+        this.logger.warn(
+          { err: disposeErr, sessionId: record.id },
+          "failed to dispose runtime after session start failure"
+        )
+      );
+      throw err;
+    }
   }
 
   private retireRuntime(

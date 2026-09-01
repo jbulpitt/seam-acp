@@ -43,6 +43,12 @@ hand-editing runtime state.
   model switch resets on codex/ollama, not claude; effort never does);
   `reset_thread_session(thread)` clears its context but keeps the model. Same
   in-channel scope as `handoff`.
+- **Migrate your own thread to a new brain and keep working:**
+  `migrate_self({ agent?, model?, effort?, manifest })` stages an agent/model
+  switch until your current turn ends, then seeds the fresh session with your
+  free-form continuation manifest as its first prompt. It is self-only and
+  purpose-agnostic; use it for capability, cost, availability, quota, or any
+  other reason you decide. At least one of agent/model must actually change.
 - **Pick a model by cost or capability:** `model_value_rankings({ tier?, benchmark? })`
   ranks the Copilot catalog by value (AA benchmark ÷ Copilot token cost) within
   flagship / balanced / flash tiers; `model_metadata_query` / `model_metadata_get`

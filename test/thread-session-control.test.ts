@@ -78,6 +78,7 @@ function harness(opts: {
   target?: SessionRecord;
   efforts?: string[];
   profiles?: AgentProfile[];
+  failFreshStart?: boolean;
 } = {}) {
   const target = opts.target ?? record();
   const caller = record({ id: "discord:caller", channelRef: "caller", acpSessionId: "caller-acp" });
@@ -91,6 +92,7 @@ function harness(opts: {
   const records = new Map<string, SessionRecord>([[target.id, target], [caller.id, caller]]);
   const runtimes: SessionControlRuntime[] = [];
   const invalidated: string[] = [];
+  const invalidationOptions: Array<{ clearStartFailure?: boolean } | undefined> = [];
   const mutations: SessionConfigChanges[] = [];
   let nextSession = 1;
 
@@ -103,9 +105,15 @@ function harness(opts: {
     router: {
       describeConfig: (value) => description(records.get(value.id) ?? value, defaults),
       getProfile: (id) => byProfile.get(id),
-      invalidate: async (id) => { invalidated.push(id); },
+      invalidate: async (id, invalidateOpts) => {
+        invalidated.push(id);
+        invalidationOptions.push(invalidateOpts);
+      },
       getOrStartRuntime: async (value) => {
         const current = records.get(value.id) ?? value;
+        if (opts.failFreshStart && !current.acpSessionId) {
+          throw new Error("replacement unavailable");
+        }
         const cfg = JSON.parse(current.configJson || "{}") as SessionConfigState;
         const sessionId = current.acpSessionId || `session-new-${nextSession++}`;
         if (!current.acpSessionId) records.set(current.id, { ...current, acpSessionId: sessionId });
@@ -160,6 +168,7 @@ function harness(opts: {
     records,
     runtimes,
     invalidated,
+    invalidationOptions,
     mutations,
     service: new ThreadSessionControlService(deps),
   };
@@ -267,5 +276,105 @@ describe("ThreadSessionControlService", () => {
     });
     expect(h.invalidated).toEqual([h.target.id]);
     expect(h.mutations).toEqual([]);
+  });
+
+  it("prepares and activates a self migration as a fresh session", async () => {
+    const h = harness();
+    const prepared = await h.service.prepareSelfMigration(h.target, {
+      agent: "codex",
+      model: "gpt-new",
+      effort: "high",
+      manifest: "Continue from the completed parser and run the remaining tests.",
+    });
+
+    expect(prepared).toEqual({
+      ok: true,
+      migration: {
+        agent: "codex",
+        model: "gpt-new",
+        effort: "high",
+        previousAgent: "claude",
+        previousModel: "claude-old",
+        previousSessionId: "session-old",
+      },
+    });
+    if (!prepared.ok) throw new Error(prepared.error);
+
+    const executed = await h.service.executeSelfMigration(h.target, prepared.migration);
+    expect(executed).toMatchObject({
+      ok: true,
+      agent: "codex",
+      model: "gpt-new",
+      effort: "high",
+      newSessionId: "session-new-1",
+      record: {
+        agentId: "codex",
+        acpSessionId: "session-new-1",
+      },
+    });
+    expect(h.invalidated).toEqual([h.target.id]);
+    expect(h.mutations).toEqual([
+      { agent: "codex", model: "gpt-new", effort: null },
+      { effort: "high" },
+    ]);
+    expect(h.runtimes[0]!.optionCalls).toEqual([["reasoning_effort", "high"]]);
+  });
+
+  it("always forges a fresh session for migrate_self, including a Claude model switch", async () => {
+    const h = harness();
+    const prepared = await h.service.prepareSelfMigration(h.target, {
+      model: "claude-new",
+      manifest: "Continue on the replacement model.",
+    });
+    if (!prepared.ok) throw new Error(prepared.error);
+
+    const result = await h.service.executeSelfMigration(h.target, prepared.migration);
+
+    expect(result).toMatchObject({
+      ok: true,
+      agent: "claude",
+      model: "claude-new",
+      newSessionId: "session-new-1",
+    });
+    expect(h.invalidated).toEqual([h.target.id]);
+    expect(h.records.get(h.target.id)?.acpSessionId).toBe("session-new-1");
+  });
+
+  it("restores the prior agent, model, and ACP session when replacement start fails", async () => {
+    const h = harness({ failFreshStart: true });
+    const prepared = await h.service.prepareSelfMigration(h.target, {
+      agent: "codex",
+      model: "gpt-new",
+      manifest: "Continue safely.",
+    });
+    if (!prepared.ok) throw new Error(prepared.error);
+
+    const result = await h.service.executeSelfMigration(h.target, prepared.migration);
+
+    expect(result).toEqual({ ok: false, error: "replacement unavailable" });
+    expect(h.records.get(h.target.id)).toEqual(h.target);
+    expect(h.invalidated).toEqual([h.target.id, h.target.id]);
+    expect(h.invalidationOptions[1]).toEqual({ clearStartFailure: true });
+  });
+
+  it("rejects no-op and stale self migrations before changing state", async () => {
+    const h = harness();
+    await expect(h.service.prepareSelfMigration(h.target, {
+      model: "claude-old",
+      manifest: "Continue.",
+    })).resolves.toMatchObject({ ok: false, error: expect.stringContaining("already matches") });
+
+    const prepared = await h.service.prepareSelfMigration(h.target, {
+      model: "claude-new",
+      manifest: "Continue.",
+    });
+    if (!prepared.ok) throw new Error(prepared.error);
+    h.records.set(h.target.id, { ...h.target, acpSessionId: "newer-session" });
+    await expect(h.service.executeSelfMigration(h.target, prepared.migration)).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringContaining("changed after migration was staged"),
+    });
+    expect(h.mutations).toEqual([]);
+    expect(h.invalidated).toEqual([]);
   });
 });

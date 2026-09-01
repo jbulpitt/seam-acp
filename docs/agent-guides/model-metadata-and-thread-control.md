@@ -14,8 +14,8 @@ Two capability families:
 
 1. **Model metadata** — cached, fast, read-only lookups of model benchmarks,
    pricing, and context across every agent.
-2. **Cross-thread session control** — reconfigure or reset *another* thread's
-   agent / model / reasoning effort from your own thread.
+2. **Session control** — reconfigure/reset another thread, or migrate your own
+   thread to a fresh agent/model with an explicit continuation manifest.
 
 ---
 
@@ -75,6 +75,24 @@ Start a fresh session on a thread, keeping its current agent + model. Clears
 conversation context. Use to recover a wedged/confused thread without changing
 its model.
 
+### `migrate_self({ agent?, model?, effort?, manifest })`
+Migrate **your calling thread itself** to a different agent and/or model. This
+is deliberately not cross-thread: it takes no thread id and resolves its target
+only from your seam session token.
+- `manifest` is required free-form continuation context: completed work,
+  decisions, references, and the precise next action. It becomes the **first
+  turn on the replacement session**.
+- The operation is staged while your current turn is live. Finish that turn
+  normally; only after it releases the thread does Seam reset the runtime,
+  apply the target agent/model/effort, post a factual migration notice, and run
+  the manifest.
+- It is purpose-agnostic. Capability, cost, availability, and quota are all
+  possible reasons, but the tool checks none of them and applies no governance
+  policy.
+- Invalid targets are refused before staging. If replacement startup fails,
+  Seam restores the prior agent/model and ACP session instead of leaving an
+  empty replacement behind.
+
 ---
 
 ## Gotchas
@@ -85,5 +103,5 @@ its model.
 - **Pricing** here is the model's list/API pricing as reported by Artificial
   Analysis (provider-agnostic), not any single provider's billing.
 
-_Provenance: seam-acp issues #132 (cross-thread control), #134 (metadata cache);
-drain-safety fix #137. Merged 2026-09-01._
+_Provenance: seam-acp issues #132 (cross-thread control), #134 (metadata cache),
+#141 (self migration); drain-safety fix #137._

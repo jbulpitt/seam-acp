@@ -178,6 +178,7 @@ async function makeHarness(opts?: {
   resolveThread?: SeamMcpServerDeps["resolveThread"];
   configureThread?: SeamMcpServerDeps["configureThread"];
   resetThreadSession?: SeamMcpServerDeps["resetThreadSession"];
+  prepareSelfMigration?: SeamMcpServerDeps["prepareSelfMigration"];
   getAgentQuotas?: SeamMcpServerDeps["getAgentQuotas"];
   inspectImage?: SeamMcpServerDeps["inspectImage"];
   scheduleWake?: SeamMcpServerDeps["scheduleWake"];
@@ -279,6 +280,7 @@ async function makeHarness(opts?: {
     ...(opts?.resolveThread ? { resolveThread: opts.resolveThread } : {}),
     ...(opts?.configureThread ? { configureThread: opts.configureThread } : {}),
     ...(opts?.resetThreadSession ? { resetThreadSession: opts.resetThreadSession } : {}),
+    ...(opts?.prepareSelfMigration ? { prepareSelfMigration: opts.prepareSelfMigration } : {}),
     ...(opts?.getAgentQuotas ? { getAgentQuotas: opts.getAgentQuotas } : {}),
     ...(opts?.inspectImage ? { inspectImage: opts.inspectImage } : {}),
     ...(opts?.isChannelLocked ? { isChannelLocked: opts.isChannelLocked } : {}),
@@ -391,6 +393,7 @@ describe("SeamMcpServer", () => {
     expect(typeof body.result.instructions).toBe("string");
     expect(body.result.instructions).toMatch(/rename_thread\(name\)/);
     expect(body.result.instructions).toMatch(/agent_quota\(agentId\?\)/);
+    expect(body.result.instructions).toMatch(/migrate_self\(agent\?, model\?, effort\?, manifest\)/);
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
 
@@ -415,6 +418,7 @@ describe("SeamMcpServer", () => {
       "forward",
       "handoff",
       "inspect_image",
+      "migrate_self",
       "model_metadata_get",
       "model_metadata_query",
       "model_value_rankings",
@@ -523,6 +527,110 @@ describe("SeamMcpServer", () => {
     }
     expect(configureThread).not.toHaveBeenCalled();
     expect(resetThreadSession).not.toHaveBeenCalled();
+  });
+
+  it("migrate_self stages a manifest only for the token-resolved calling thread", async () => {
+    const prepareSelfMigration = vi.fn(async () => ({
+      ok: true as const,
+      migration: {
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        effort: "high",
+        previousAgent: "claude",
+        previousModel: "default",
+        previousSessionId: "acp-1",
+      },
+    }));
+    h = await makeHarness({ prepareSelfMigration });
+
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "migrate_self",
+        arguments: {
+          agent: "codex",
+          model: "gpt-5.6-sol",
+          effort: "high",
+          manifest: "State is complete through parsing. Run verification next.",
+        },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBeFalsy();
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({
+      ok: true,
+      staged: true,
+      agent: "codex",
+      model: "gpt-5.6-sol",
+    });
+    expect(prepareSelfMigration).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "discord:thread-caller", channelRef: "thread-caller" }),
+      {
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        effort: "high",
+        manifest: "State is complete through parsing. Run verification next.",
+      }
+    );
+    expect(h.enqueued).toHaveLength(1);
+    expect(h.enqueued[0]).toMatchObject({
+      target: "thread-caller",
+      session: "live",
+      kind: "migrate_self",
+      prompt: "State is complete through parsing. Run verification next.",
+      migration: {
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        previousAgent: "claude",
+        previousModel: "default",
+        previousSessionId: "acp-1",
+      },
+    });
+  });
+
+  it("migrate_self refuses caller-supplied thread addressing before preflight", async () => {
+    const prepareSelfMigration = vi.fn();
+    h = await makeHarness({ prepareSelfMigration });
+
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "migrate_self",
+        arguments: {
+          thread: "thread-target",
+          model: "gpt-5.6-sol",
+          manifest: "Continue.",
+        },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("always targets the calling thread");
+    expect(prepareSelfMigration).not.toHaveBeenCalled();
+    expect(h.enqueued).toEqual([]);
+  });
+
+  it("migrate_self reports invalid targets without staging a dispatch", async () => {
+    const prepareSelfMigration = vi.fn(async () => ({
+      ok: false as const,
+      error: "Model not advertised by the target agent.",
+    }));
+    h = await makeHarness({ prepareSelfMigration });
+
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "migrate_self",
+        arguments: { model: "not-real", manifest: "Continue." },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("not advertised");
+    expect(h.enqueued).toEqual([]);
   });
 
   it("inspect_image returns sidecar observations and preserves caller scope", async () => {
@@ -720,8 +828,8 @@ describe("SeamMcpServer", () => {
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     // Adding an OPTION to handoff does NOT change the tool count; inspect_image
     // plus the standalone capabilities — inspect_image, model metadata (2),
-    // model_value_rankings, configure_thread, reset_thread_session — bring the catalog to 31.
-    expect(body.result.tools).toHaveLength(31);
+    // model_value_rankings, configure_thread, reset_thread_session, migrate_self — bring the catalog to 32.
+    expect(body.result.tools).toHaveLength(32);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -1483,8 +1591,8 @@ describe("SeamMcpServer", () => {
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
-    // Params on `send` must NOT add a tool — the set stays at 31.
-    expect(body.result.tools).toHaveLength(31);
+    // Params on `send` must NOT add a tool — the set stays at 32.
+    expect(body.result.tools).toHaveLength(32);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

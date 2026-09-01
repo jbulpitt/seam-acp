@@ -15,6 +15,15 @@ import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import type { DelegationKind } from "../types.js";
 import { parseDispatchWorker } from "../location.js";
 
+export interface SelfMigrationDispatchTarget {
+  agent: string;
+  model: string;
+  effort?: string;
+  previousAgent: string;
+  previousModel: string;
+  previousSessionId: string;
+}
+
 /** How the dispatched turn acquires its ACP session — see `InjectTurnOptions`. */
 export type DispatchSessionMode = "live" | "isolated";
 
@@ -51,6 +60,8 @@ export interface DispatchSpec {
    *  watch (#60) sets "watch"; an agent-triggered compaction sets "compact";
    *  a parked prompt firing after a remote-bridge reconnect (#88) sets "parked". */
   kind?: DelegationKind;
+  /** Internal-only target snapshot for a self-directed post-turn migration. */
+  migration?: SelfMigrationDispatchTarget;
   /** Trusted human attribution. These three fields are an all-or-nothing tuple
    *  accepted only for the internal `thread_voice` kind. */
   authorId?: string;
@@ -134,7 +145,15 @@ export const DispatchSpecSchema = z.object({
   agentId: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
-  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact", "parked", "choice", "ingest", "thread_voice"]).optional(),
+  kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact", "parked", "choice", "ingest", "migrate_self", "thread_voice"]).optional(),
+  migration: z.object({
+    agent: z.string().min(1),
+    model: z.string().min(1),
+    effort: z.string().min(1).optional(),
+    previousAgent: z.string().min(1),
+    previousModel: z.string().min(1),
+    previousSessionId: z.string(),
+  }).optional(),
   authorId: z.string().min(1).optional(),
   authorName: z.string().min(1).optional(),
   voiceConsoleId: z.string().min(1).optional(),
@@ -148,6 +167,28 @@ export const DispatchSpecSchema = z.object({
   resume: z.boolean().optional(),
   createdUtc: z.string().optional(),
 }).superRefine((value, ctx) => {
+  if (value.kind === "migrate_self") {
+    if (!value.migration) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["migration"],
+        message: "migrate_self requires a validated migration target snapshot",
+      });
+    }
+    if (value.session !== "live") {
+      ctx.addIssue({
+        code: "custom",
+        path: ["session"],
+        message: "migrate_self dispatches must use the live session",
+      });
+    }
+  } else if (value.migration !== undefined) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["migration"],
+      message: "migration target metadata is accepted only for kind migrate_self",
+    });
+  }
   const trusted = [
     value.authorId,
     value.authorName,
@@ -225,6 +266,7 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.correlationId ? { correlationId: d.correlationId } : {}),
     ...(d.returnTo ? { returnTo: d.returnTo } : {}),
     ...(d.kind ? { kind: d.kind } : {}),
+    ...(d.migration ? { migration: d.migration } : {}),
     ...(d.authorId ? { authorId: d.authorId } : {}),
     ...(d.authorName ? { authorName: d.authorName } : {}),
     ...(d.voiceConsoleId ? { voiceConsoleId: d.voiceConsoleId } : {}),

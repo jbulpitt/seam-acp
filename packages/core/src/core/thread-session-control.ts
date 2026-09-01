@@ -13,6 +13,36 @@ export interface ConfigureThreadInput {
   effort?: string;
 }
 
+export interface MigrateSelfInput extends ConfigureThreadInput {
+  manifest: string;
+}
+
+/** Durable, validated target carried by the post-turn dispatch. */
+export interface PreparedSelfMigration {
+  agent: string;
+  model: string;
+  effort?: string;
+  previousAgent: string;
+  previousModel: string;
+  previousSessionId: string;
+}
+
+export type PrepareSelfMigrationOutcome =
+  | { ok: true; migration: PreparedSelfMigration }
+  | { ok: false; error: string };
+
+export type ExecuteSelfMigrationOutcome =
+  | {
+      ok: true;
+      record: SessionRecord;
+      agent: string;
+      model: string;
+      effort: string;
+      newSessionId: string;
+      warnings: string[];
+    }
+  | { ok: false; error: string };
+
 export interface ConfigureThreadSuccess {
   ok: true;
   applied: { agent?: string; model?: string; effort?: string };
@@ -58,7 +88,10 @@ export interface ThreadSessionControlDeps {
     describeConfig(record: SessionRecord): ConfigDescription;
     getProfile(agentId: string): AgentProfile | undefined;
     getOrStartRuntime(record: SessionRecord): Promise<SessionControlRuntime>;
-    invalidate(sessionId: string): Promise<void>;
+    invalidate(
+      sessionId: string,
+      opts?: { clearAcpSession?: boolean; clearStartFailure?: boolean }
+    ): Promise<void>;
   };
   mutation: SessionConfigMutation;
 }
@@ -70,6 +103,174 @@ export interface ThreadSessionControlDeps {
  */
 export class ThreadSessionControlService {
   constructor(private readonly deps: ThreadSessionControlDeps) {}
+
+  /**
+   * Validate a self-migration without mutating the caller's live session. The
+   * returned target is embedded in a durable dispatch that executes only after
+   * the current turn releases the channel FIFO.
+   */
+  async prepareSelfMigration(
+    target: SessionRecord,
+    input: MigrateSelfInput
+  ): Promise<PrepareSelfMigrationOutcome> {
+    if (input.agent === undefined && input.model === undefined) {
+      return { ok: false, error: "Provide at least one of `agent` or `model`." };
+    }
+    if (!input.manifest.trim()) {
+      return { ok: false, error: "`manifest` must be a non-empty string." };
+    }
+
+    const before = this.deps.router.describeConfig(target);
+    const requestedAgent = input.agent?.trim();
+    if (input.agent !== undefined && !requestedAgent) {
+      return { ok: false, error: "`agent` must be a non-empty string." };
+    }
+    const nextAgent = requestedAgent ?? before.agent.value;
+    const profile = this.deps.router.getProfile(nextAgent);
+    if (!profile) return { ok: false, error: `Unknown agent "${nextAgent}".` };
+
+    const agentChanged = nextAgent !== before.agent.value;
+    const requestedModel = input.model?.trim();
+    if (input.model !== undefined && !requestedModel) {
+      return { ok: false, error: "`model` must be a non-empty string." };
+    }
+    const nextModel = requestedModel ?? (agentChanged ? profile.defaultModel : before.model.value);
+    if (!agentChanged && nextModel === before.model.value) {
+      return {
+        ok: false,
+        error: "Migration requires a different agent or model; the requested target already matches.",
+      };
+    }
+
+    const models = await this.advertisedModels(profile, target, agentChanged);
+    if (models.length === 0) {
+      return {
+        ok: false,
+        error: `Agent "${nextAgent}" did not advertise a model catalog; refusing an unvalidated model.`,
+      };
+    }
+    if (!models.includes(nextModel)) {
+      return {
+        ok: false,
+        error: `Model "${nextModel}" is not advertised by "${nextAgent}". Valid models: ${models.join(", ")}.`,
+      };
+    }
+
+    const requestedEffort = normalizeEffort(input.effort);
+    if (input.effort !== undefined && !requestedEffort) {
+      return { ok: false, error: "`effort` must be a non-empty string or `auto`." };
+    }
+
+    return {
+      ok: true,
+      migration: {
+        agent: nextAgent,
+        model: nextModel,
+        ...(requestedEffort ? { effort: requestedEffort } : {}),
+        previousAgent: before.agent.value,
+        previousModel: before.model.value,
+        previousSessionId: target.acpSessionId,
+      },
+    };
+  }
+
+  /**
+   * Activate a prepared migration after the invoking turn has ended. Any
+   * replacement-session or live effort failure restores the exact prior
+   * durable record (including its ACP session id) before returning.
+   */
+  async executeSelfMigration(
+    target: SessionRecord,
+    prepared: PreparedSelfMigration
+  ): Promise<ExecuteSelfMigrationOutcome> {
+    const current = this.deps.store.get(target.id);
+    if (!current) return { ok: false, error: "Calling session disappeared before migration." };
+    const before = this.deps.router.describeConfig(current);
+    if (
+      before.agent.value !== prepared.previousAgent ||
+      before.model.value !== prepared.previousModel ||
+      current.acpSessionId !== prepared.previousSessionId
+    ) {
+      return {
+        ok: false,
+        error: "Calling session changed after migration was staged; refusing to overwrite newer state.",
+      };
+    }
+
+    const snapshot: SessionRecord = { ...current };
+    const stored = this.deps.store.readConfig(current);
+    const desiredEffort = prepared.effort === "auto"
+      ? undefined
+      : prepared.effort ?? normalizeStoredEffort(stored.reasoningEffort);
+    const warnings: string[] = [];
+
+    try {
+      const staged = this.deps.mutation.applySessionConfig(
+        current,
+        {
+          ...(prepared.agent !== before.agent.value ? { agent: prepared.agent } : {}),
+          model: prepared.model,
+          effort: null,
+        },
+        { id: null, name: `seam-mcp:self:${current.channelRef}` }
+      );
+      if (!staged.ok) return staged;
+      warnings.push(...staged.result.warnings);
+
+      const effective = this.deps.router.describeConfig(
+        this.deps.store.get(current.id) ?? current
+      );
+      if (effective.agent.value !== prepared.agent || effective.model.value !== prepared.model) {
+        throw new Error(
+          `Target is shadowed by configuration: effective ${effective.agent.value}/${effective.model.value}.`
+        );
+      }
+
+      const forged = await this.forgeFreshSession(current.id);
+      const effortValues = forged.runtime.getConfigSelectValues("reasoning_effort");
+      let appliedEffort = "auto";
+      if (desiredEffort && effortValues.includes(desiredEffort)) {
+        await forged.runtime.setConfigOption("reasoning_effort", desiredEffort);
+        const effortApplied = this.deps.mutation.applySessionConfig(
+          forged.record,
+          { effort: desiredEffort },
+          { id: null, name: `seam-mcp:self:${current.channelRef}` },
+          { effortValues }
+        );
+        if (!effortApplied.ok) throw new Error(effortApplied.error);
+        warnings.push(...effortApplied.result.warnings);
+        appliedEffort = desiredEffort;
+      } else if (desiredEffort) {
+        warnings.push(
+          `Effort "${desiredEffort}" is not advertised for ${prepared.agent}/${prepared.model}; ` +
+            `using auto. Valid values: ${effortValues.length ? effortValues.join(", ") : "none"}.`
+        );
+      }
+
+      const info = forged.runtime.getSessionInfo();
+      if (!info?.sessionId) throw new Error("Fresh runtime did not report a session id.");
+      const fresh = this.deps.store.get(current.id);
+      if (!fresh) throw new Error("Calling session disappeared after migration.");
+      return {
+        ok: true,
+        record: fresh,
+        agent: prepared.agent,
+        model: prepared.model,
+        effort: appliedEffort,
+        newSessionId: info.sessionId,
+        warnings,
+      };
+    } catch (err) {
+      // A candidate runtime may already exist. Retire it before restoring the
+      // old durable session so no process can keep writing stale target state.
+      await this.deps.router.invalidate(current.id, { clearStartFailure: true }).catch(() => {});
+      this.deps.store.upsert(snapshot);
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
 
   async configure(
     caller: SessionRecord,

@@ -4,6 +4,11 @@ _Shipped 2026-09-01. Audience: agents working in any seam-managed project. These
 are seam-MCP tools — call them the same way you call `handoff` / `threads` /
 `poll_inbox`. Everything here is available in every channel, no per-project setup._
 
+> **Copilot-inclusive variant.** This primer includes `model_value_rankings`,
+> which is **Copilot-only** (it joins GitHub Copilot's per-token pricing). If your
+> project's agents aren't on Copilot, use the provider-agnostic version instead:
+> `model-metadata-and-thread-control.md`.
+
 There are two new capability families:
 
 1. **Model intelligence data** — cached, fast, read-only lookups of model

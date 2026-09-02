@@ -274,6 +274,72 @@ describe("ThreadNamer lifecycle", () => {
     expect(renames.at(-1)).toEqual(["fresh", "👾🌞🛠️2️⃣ fresh"]);
   });
 
+  it("fully rebuilds bare and curated bases from each resolved role", async () => {
+    const bare = record("bare");
+    const curated = record("curated");
+    const records = [bare, curated];
+    const names = { bare: "bare", curated: "pronoa-lead" };
+    const values: Record<string, Parameters<typeof description>[1]> = {
+      bare: { role: "worker" },
+      curated: { agent: "claude", model: "opus", role: "orchestrator" },
+    };
+    const { namer, renames } = harness(records, values, names);
+
+    const bareResult = await namer.applyThreadName(bare, { roleName: true });
+    const curatedResult = await namer.applyThreadName(curated, {
+      roleName: true,
+      migrateLegacy: true,
+    });
+
+    expect(bareResult).toMatchObject({
+      status: "rebuilt",
+      name: "🤖🌞🛠️1️⃣ worker",
+      prefix: "🤖🌞🛠️1️⃣",
+    });
+    expect(curatedResult).toMatchObject({
+      status: "rebuilt",
+      name: "👾🎼🪄1️⃣ orchestrator",
+      prefix: "👾🎼🪄1️⃣",
+    });
+    expect(renames).toEqual([
+      ["bare", "🤖🌞🛠️1️⃣ worker"],
+      ["curated", "👾🎼🪄1️⃣ orchestrator"],
+    ]);
+  });
+
+  it("leaves a roleless thread completely untouched in role-name mode", async () => {
+    const roleless = record("roleless");
+    roleless.namePrefix = "🤖🌞";
+    const names = { roleless: "🤖🌞 curated-base" };
+    const { namer, renames } = harness([roleless], { roleless: {} }, names);
+
+    const result = await namer.applyThreadName(roleless, { roleName: true });
+
+    expect(result.status).toBe("roleless");
+    expect(names.roleless).toBe("🤖🌞 curated-base");
+    expect(roleless.namePrefix).toBe("🤖🌞");
+    expect(renames).toEqual([]);
+  });
+
+  it("preserves the rebuilt role base on a subsequent normal naming pass", async () => {
+    const rec = record("worker");
+    const names = { worker: "old custom base" };
+    const values: Record<string, Parameters<typeof description>[1]> = {
+      worker: { role: "worker" },
+    };
+    const { namer, renames } = harness([rec], values, names);
+    await namer.applyThreadName(rec, { roleName: true });
+    values.worker!.agent = "claude";
+
+    const result = await namer.applyThreadName(rec);
+
+    expect(result).toMatchObject({ status: "renamed", name: "👾🌞🛠️1️⃣ worker" });
+    expect(renames).toEqual([
+      ["worker", "🤖🌞🛠️1️⃣ worker"],
+      ["worker", "👾🌞🛠️1️⃣ worker"],
+    ]);
+  });
+
   it("leaves legacy and mismatched managed names untouched on normal passes", async () => {
     const legacy = record("legacy");
     const edited = record("edited"); edited.namePrefix = "🤖🌞";
@@ -470,5 +536,53 @@ describe("ThreadNamer lifecycle", () => {
       "🤖🌞🛠️5️⃣ thread-9",
     ]);
     expect(records.slice(3, 7).every((rec) => rec.namePrefix === null)).toBe(true);
+  });
+
+  it("rebuilds all roled channel threads while skipping roleless, opted-out, and gone", async () => {
+    const worker = record("worker", "2026-01-01T00:00:00.000Z");
+    const orchestrator = record("orchestrator", "2026-01-02T00:00:00.000Z");
+    const roleless = record("roleless", "2026-01-03T00:00:00.000Z");
+    const opted = record("opted", "2026-01-04T00:00:00.000Z");
+    const gone = record("gone", "2026-01-05T00:00:00.000Z");
+    gone.namePrefix = "🤖🌞🛠️9️⃣";
+    const names = {
+      worker: "legacy worker base",
+      orchestrator: "pronoa-lead",
+      roleless: "keep this base",
+      opted: "leave opted out",
+    };
+    const values: Record<string, Parameters<typeof description>[1]> = {
+      worker: { role: "worker" },
+      orchestrator: { agent: "claude", model: "opus", role: "orchestrator" },
+      roleless: {},
+      opted: { role: "worker", disabled: true },
+      gone: { role: "worker" },
+    };
+    const { namer } = harness(
+      [worker, orchestrator, roleless, opted, gone],
+      values,
+      names,
+      { gone: "gone" }
+    );
+
+    const result = await namer.recompactChannel("discord", "parent", {
+      roleName: true,
+      migrateLegacy: true,
+    });
+
+    expect(result.map((item) => item.status)).toEqual([
+      "rebuilt",
+      "rebuilt",
+      "roleless",
+      "opted_out",
+      "gone",
+    ]);
+    expect(names).toEqual({
+      worker: "🤖🌞🛠️1️⃣ worker",
+      orchestrator: "👾🎼🪄1️⃣ orchestrator",
+      roleless: "keep this base",
+      opted: "leave opted out",
+    });
+    expect(gone.namePrefix).toBeNull();
   });
 });

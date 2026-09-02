@@ -16,6 +16,12 @@ describe("/seam config rename and namer surfaces", () => {
         expect.objectContaining({ name: "channel", value: "channel" }),
       ]));
     expect(rename?.options?.find((option) => option.name === "migrate-legacy")?.type).toBe(5);
+    expect(rename?.options?.map((option) => option.name)).toEqual([
+      "scope",
+      "migrate-legacy",
+      "role-name",
+    ]);
+    expect(rename?.options?.find((option) => option.name === "role-name")?.type).toBe(5);
     expect(namer).toBeDefined();
   });
 
@@ -88,6 +94,7 @@ describe("/seam config rename and namer surfaces", () => {
       events.push("recompact");
       expect(deferReply).toHaveBeenCalledOnce();
       return [
+        { status: "rebuilt" },
         { status: "renamed" },
         { status: "unchanged" },
         { status: "unmanaged" },
@@ -107,7 +114,7 @@ describe("/seam config rename and namer surfaces", () => {
     const interaction = {
       options: {
         getString: () => "channel",
-        getBoolean: () => false,
+        getBoolean: (name: string) => name === "role-name",
       },
       reply,
       deferReply,
@@ -118,8 +125,12 @@ describe("/seam config rename and namer surfaces", () => {
 
     expect(events).toEqual(["defer", "recompact", "edit"]);
     expect(reply).not.toHaveBeenCalled();
+    expect(recompactChannel).toHaveBeenCalledWith("discord", "channel-456", {
+      migrateLegacy: false,
+      roleName: true,
+    });
     expect(editReply).toHaveBeenCalledWith({
-      content: "Recomputed 5 channel thread(s): 1 renamed, 1 unchanged, 1 left untouched, 1 gone, 1 failed.",
+      content: "Recomputed 6 channel thread(s): 1 rebuilt, 1 renamed, 1 unchanged, 1 left untouched, 1 gone, 1 failed.",
     });
   });
 
@@ -131,7 +142,7 @@ describe("/seam config rename and namer surfaces", () => {
     const applyThreadName = vi.fn(async () => {
       events.push("rename");
       expect(deferReply).toHaveBeenCalledOnce();
-      return { status: "renamed", name: "🤖 fixed" };
+      return { status: "rebuilt", name: "🤖 worker" };
     });
     const mock = {
       recordFromInteraction: () => ({
@@ -156,6 +167,10 @@ describe("/seam config rename and namer surfaces", () => {
 
     expect(events).toEqual(["defer", "rename", "edit"]);
     expect(reply).not.toHaveBeenCalled();
-    expect(editReply).toHaveBeenCalledWith({ content: "Renamed to 🤖 fixed." });
+    expect(applyThreadName).toHaveBeenCalledWith(expect.any(Object), {
+      migrateLegacy: true,
+      roleName: true,
+    });
+    expect(editReply).toHaveBeenCalledWith({ content: "Rebuilt as 🤖 worker." });
   });
 });

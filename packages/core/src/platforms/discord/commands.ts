@@ -476,11 +476,11 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub
           .setName("rename")
-          .setDescription("Refresh/migrate names")
+          .setDescription("Rename")
           .addStringOption((o) =>
             o
               .setName("scope")
-              .setDescription("Rename scope")
+              .setDescription("Scope")
               .setRequired(false)
               .addChoices(
                 { name: "thread", value: "thread" },
@@ -490,7 +490,13 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .addBooleanOption((o) =>
             o
               .setName("migrate-legacy")
-              .setDescription("Migrate legacy prefix")
+              .setDescription("Legacy")
+              .setRequired(false)
+          )
+          .addBooleanOption((o) =>
+            o
+              .setName("role-name")
+              .setDescription("Use role as base")
               .setRequired(false)
           )
       )

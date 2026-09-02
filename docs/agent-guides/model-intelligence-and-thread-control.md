@@ -9,11 +9,13 @@ Consuming projects pin this raw URL:
 
 `https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/model-intelligence-and-thread-control.md`
 
-There are two capability families:
+There are three capability families:
 
 1. **Model intelligence data** — cached, fast, read-only lookups of model
    benchmarks, pricing, and cost-efficiency ("value") rankings.
-2. **Session control** — reconfigure/reset another thread, or migrate your own
+2. **Conversation lookup** — live text search and ordered context windows over
+   your thread and sibling threads in the same channel.
+3. **Session control** — reconfigure/reset another thread, or migrate your own
    thread to a fresh agent/model with an explicit continuation manifest.
 
 ---
@@ -67,7 +69,40 @@ know the model and just want its numbers.
 
 ---
 
-## 2. Session control
+## 2. Conversation lookup (read-only, live Discord fetch)
+
+These tools read Discord on demand; they do not use a persisted message index.
+They are scoped to the calling thread's channel, matching `threads()` and the
+cross-thread control boundary. A named thread outside that channel is refused.
+
+### `search_messages(query, { threads?, author?, since?, limit? })`
+Search human and bot conversation text and return stable `messageId` anchors.
+
+- Omit `threads` to search your own thread, pass an array of sibling thread ids,
+  or pass `"channel"` to search every bound thread in the channel.
+- `author` accepts `human`, `bot`, or an exact Discord author id. `since`
+  accepts an ISO timestamp or a relative window such as `30m`, `2h`, or `7d`.
+- Status/choice/UI cards and pure status lines are excluded from search.
+  Consecutive streamed bot fragments collapse into one logical hit.
+- `truncated: true` means the requested hit limit or bounded live-fetch page
+  budget was reached; narrow the threads, `since`, or query before assuming the
+  result is exhaustive.
+
+### `read_messages(thread, { around?, before?, after?, limit? })`
+Read one chronological message window (up to 100 rows). Omit anchors for the
+latest messages, or use exactly one message-id anchor. `around` is the normal
+follow-up to a `search_messages` hit. This context path is intentionally
+unfiltered: human messages, bot messages, attachments, and cards are included;
+`isCard` marks UI/status rows.
+
+### `peek(thread, count?)`
+The compact latest-N presentation remains public for quick catch-up. It is now
+an alias over `read_messages(thread, { limit: count })`, so all three methods
+share the same fetch, ordering, cursor, and rate-limit behavior.
+
+---
+
+## 3. Session control
 
 There are two scopes. `configure_thread` and `reset_thread_session` target
 **another thread** in your channel, using the same trust boundary as `steer` and
@@ -127,4 +162,5 @@ takes no thread id: the seam session token is the sole target authority.
   response if you need to reason about staleness.
 
 _Provenance: seam-acp issues #130 (value ranking), #132 (cross-thread control),
-#134 (metadata cache), #141 (self migration); drain-safety fix #137._
+#134 (metadata cache), #141 (self migration), #143 (message search/read);
+drain-safety fix #137._

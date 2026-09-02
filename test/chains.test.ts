@@ -7,7 +7,6 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { PROMPT_PREVIEW_MAX, type ChainCreateInput, type SessionRecord } from "../packages/core/src/core/types.js";
 import {
   SeamMcpServer,
-  type PeekedMessage,
 } from "../packages/core/src/core/mcp/seam-mcp-server.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { buildChainHopSpec, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
@@ -265,7 +264,6 @@ describe("chain MCP tool", () => {
         const advanced = store.advanceChain("chain-fixed");
         return { chainId: "chain-fixed", firstHop: advanced!.nextHop! };
       },
-      peekThread: async (): Promise<PeekedMessage[]> => [],
     });
     await server.start();
     port = server.port;
@@ -301,9 +299,11 @@ describe("chain MCP tool", () => {
       "model_value_rankings",
       "peek",
       "poll_inbox",
+      "read_messages",
       "rename_thread",
       "reset_thread_session",
       "schedule_wake",
+      "search_messages",
       "send",
       "steer",
       "submit_result",

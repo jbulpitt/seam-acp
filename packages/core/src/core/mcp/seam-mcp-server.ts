@@ -12,7 +12,7 @@
  * We hand-roll the minimal JSON-RPC 2.0 subset MCP needs — `initialize`,
  * `tools/list`, `tools/call`, and the `notifications/initialized` no-op — over
  * `node:http`. No new npm dependency; MCP is just JSON-RPC and this is all the
- * three tools require.
+ * tool catalog requires.
  *
  * The tools are intentionally thin: they resolve the caller from the token and
  * enqueue a dispatch spec (or read a thread). The runtime's DispatchWatcher +
@@ -47,6 +47,14 @@ import type {
   ModelMetadataQuery,
   ModelMetadataQueryResult,
 } from "../model-metadata/types.js";
+import {
+  parseSince,
+  type ReadMessagesInput,
+  type ReadMessagesResult,
+  type SearchMessagesInput,
+  type SearchMessagesResult,
+  type SearchThread,
+} from "../message-reader.js";
 
 /** Read-only entities visible to the calling thread (schedules + presets),
  *  returned by `config_describe` alongside the effective config. A FULL
@@ -100,7 +108,7 @@ const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
  *  the calling session. A header (not a URL path) keeps the token out of logs. */
 export const SEAM_SESSION_HEADER = "x-seam-session";
 
-/** Recent messages from a thread, as the peek tool renders them. */
+/** Legacy public projection retained for source compatibility with embedders. */
 export interface PeekedMessage {
   authorIsBot: boolean;
   text: string;
@@ -158,8 +166,10 @@ export interface SeamMcpServerDeps {
     originRef: string;
     promptPreview?: string | null;
   }) => { chainId: string; firstHop: string };
-  /** Read recent messages from a thread; undefined ⇒ peek is unsupported. */
-  peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
+  /** Shared cursor reader used by both read_messages and the public peek alias. */
+  readMessages?: (threadId: string, input: ReadMessagesInput) => Promise<ReadMessagesResult>;
+  /** Swappable search backend (live Discord walk in v1; future FTS may replace it). */
+  searchMessages?: (input: SearchMessagesInput) => Promise<SearchMessagesResult>;
   /**
    * Discover the sibling threads in the CALLER'S OWN channel (#73), newest
    * activity first. Composed in index.ts from `listSessionsByParent` (the SQL
@@ -538,7 +548,8 @@ const TOOLS = [
     name: "peek",
     description:
       "Read the most recent messages from a thread WITHOUT posting anything, so you can catch up on " +
-      "another teammate's context before you hand off to or forward into them.",
+      "another teammate's context before you hand off to or forward into them. This is the compact " +
+      "alias for read_messages(thread, {limit: count}).",
     inputSchema: {
       type: "object",
       properties: {
@@ -547,6 +558,55 @@ const TOOLS = [
           type: "number",
           description: "How many recent messages to return (default 20, max 50).",
         },
+      },
+      required: ["thread"],
+    },
+  },
+  {
+    name: "search_messages",
+    description:
+      "Search live human and agent conversation text in YOUR thread or sibling threads in the same " +
+      "channel. UI/status cards are excluded and consecutive streamed bot fragments collapse into one hit. " +
+      "Returns stable messageId anchors for read_messages; never searches another channel.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Case-insensitive text substring to find." },
+        threads: {
+          oneOf: [
+            { type: "string", enum: ["channel"] },
+            { type: "array", items: { type: "string" }, minItems: 1 },
+          ],
+          description:
+            "Omit for YOUR thread, use channel for all sibling threads, or pass same-channel thread ids.",
+        },
+        author: {
+          type: "string",
+          description: "Optional author id, human, or bot.",
+        },
+        since: {
+          type: "string",
+          description: "Optional ISO timestamp or relative window such as 30m, 2h, or 7d.",
+        },
+        limit: { type: "number", description: "Maximum hits (default 25, max 100)." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "read_messages",
+    description:
+      "Read an ordered, unfiltered message window from YOUR thread or a sibling in the same channel. " +
+      "Includes human messages, bot messages, and UI cards; isCard identifies card/noise rows. Use around " +
+      "with a search_messages hit for surrounding context.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        thread: { type: "string", description: "Same-channel thread id from threads()." },
+        around: { type: "string", description: "Message id to center the window around." },
+        before: { type: "string", description: "Read messages before this message id." },
+        after: { type: "string", description: "Read messages after this message id." },
+        limit: { type: "number", description: "Window size (default 20, max 100)." },
       },
       required: ["thread"],
     },
@@ -1500,7 +1560,9 @@ const INSTRUCTIONS = [
   "- configure_thread(thread, agent?, model?, effort?): reconfigure a teammate in YOUR channel; agent switches reset context.",
   "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
   "- migrate_self(agent?, model?, effort?, manifest): migrate YOUR OWN thread after this turn ends; the manifest is the replacement session's first prompt. Purpose-agnostic and rollback-safe.",
-  "- peek(thread, count?): read another thread's recent messages to get context before delegating.",
+  "- search_messages(query, threads?, author?, since?, limit?): search live conversation text in your thread or same-channel siblings.",
+  "- read_messages(thread, around?/before?/after?, limit?): read an unfiltered same-channel message window; use around on a search hit.",
+  "- peek(thread, count?): compact alias for read_messages latest-N, for quick context before delegating.",
   "- chain(workers, prompt, returnTo?): pipe a prompt through an ordered list of workers where each",
   "  hop's output feeds the next; the final output is delivered back to you. Durable across restarts.",
   "- schedule_wake(delaySeconds, prompt, reason?): wake YOURSELF later in this thread and replay `prompt`",
@@ -1685,7 +1747,11 @@ export class SeamMcpServer {
         case "steer":
           return rpcResult(id, await this.toolSteer(record, args));
         case "peek":
-          return rpcResult(id, await this.toolPeek(args));
+          return rpcResult(id, await this.toolPeek(record, args));
+        case "search_messages":
+          return rpcResult(id, await this.toolSearchMessages(record, args));
+        case "read_messages":
+          return rpcResult(id, await this.toolReadMessages(record, args));
         case "threads":
           return rpcResult(id, await this.toolThreads(record, args));
         case "configure_thread":
@@ -2074,22 +2140,110 @@ export class SeamMcpServer {
     );
   }
 
-  private async toolPeek(args: Record<string, unknown>): Promise<McpToolResult> {
+  private async toolPeek(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
     const thread = requireString(args, "thread");
     const rawCount = typeof args.count === "number" ? args.count : 20;
     const count = Math.max(1, Math.min(50, Math.floor(rawCount)));
-    if (!this.deps.peekThread) {
+    if (!this.deps.readMessages || !this.deps.resolveThread) {
       return textResult("peek is not supported on this platform.", true);
     }
-    const msgs = await this.deps.peekThread(thread, count);
-    if (msgs.length === 0) {
+    const target = this.resolveSameChannelTarget(caller, thread);
+    if (!target.ok) return textResult(target.error, true);
+    const result = await this.deps.readMessages(thread, { limit: count });
+    if (result.messages.length === 0) {
       return textResult(`Thread ${thread} has no readable messages.`);
     }
-    const rendered = msgs
+    const rendered = result.messages
       .slice(-count)
-      .map((m) => `${m.authorIsBot ? "🤖" : "👤"} ${m.text}`)
+      .map((message) => `${message.authorType === "bot" ? "🤖" : "👤"} ${message.content || "[card]"}`)
       .join("\n");
     return textResult(`Recent messages in thread ${thread}:\n\n${rendered}`);
+  }
+
+  private async toolReadMessages(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.readMessages || !this.deps.resolveThread) {
+      return textResult("read_messages is not supported on this platform.", true);
+    }
+    const thread = requireString(args, "thread");
+    const target = this.resolveSameChannelTarget(caller, thread);
+    if (!target.ok) return textResult(target.error, true);
+    const input: ReadMessagesInput = {
+      ...(optionalString(args, "around") ? { around: optionalString(args, "around") } : {}),
+      ...(optionalString(args, "before") ? { before: optionalString(args, "before") } : {}),
+      ...(optionalString(args, "after") ? { after: optionalString(args, "after") } : {}),
+      ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
+    };
+    const result = await this.deps.readMessages(thread, input);
+    return textResult(JSON.stringify(result, null, 2));
+  }
+
+  private async toolSearchMessages(
+    caller: SessionRecord,
+    args: Record<string, unknown>
+  ): Promise<McpToolResult> {
+    if (!this.deps.searchMessages || !this.deps.resolveThread) {
+      return textResult("search_messages is not supported on this platform.", true);
+    }
+    const targets = await this.resolveSearchThreads(caller, args.threads);
+    if (!targets.ok) return textResult(targets.error, true);
+    const since = optionalString(args, "since");
+    const input: SearchMessagesInput = {
+      query: requireString(args, "query"),
+      threads: targets.threads,
+      ...(optionalString(args, "author") ? { author: optionalString(args, "author") } : {}),
+      ...(since ? { sinceMs: parseSince(since) } : {}),
+      ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
+    };
+    const result = await this.deps.searchMessages(input);
+    return textResult(JSON.stringify(result, null, 2));
+  }
+
+  private async resolveSearchThreads(
+    caller: SessionRecord,
+    requested: unknown
+  ): Promise<{ ok: true; threads: SearchThread[] } | { ok: false; error: string }> {
+    const entries = this.deps.listThreads ? await this.deps.listThreads(caller) : [];
+    const names = new Map(entries.map((entry) => [entry.id, entry.name]));
+    if (requested === undefined) {
+      return { ok: true, threads: [{ id: caller.channelRef, name: names.get(caller.channelRef) ?? null }] };
+    }
+    if (requested === "channel") {
+      if (!this.deps.listThreads) {
+        return { ok: false, error: "search_messages channel scope is not supported on this deployment." };
+      }
+      return {
+        ok: true,
+        threads: entries
+          .filter((entry) => entry.status !== "gone")
+          .map((entry) => ({ id: entry.id, name: entry.name })),
+      };
+    }
+    if (!Array.isArray(requested) || requested.length === 0) {
+      return { ok: false, error: "threads must be channel or a non-empty array of thread ids." };
+    }
+    const threads: SearchThread[] = [];
+    const seen = new Set<string>();
+    for (const value of requested) {
+      if (typeof value !== "string" || !value.trim()) {
+        return { ok: false, error: "threads must contain only non-empty thread ids." };
+      }
+      const target = this.resolveSameChannelTarget(caller, value.trim());
+      if (!target.ok) return target;
+      if (!seen.has(target.record.channelRef)) {
+        seen.add(target.record.channelRef);
+        threads.push({
+          id: target.record.channelRef,
+          name: names.get(target.record.channelRef) ?? null,
+        });
+      }
+    }
+    return { ok: true, threads };
   }
 
   /**

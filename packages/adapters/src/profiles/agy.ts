@@ -309,7 +309,6 @@ export function makeAgyProfile(opts: {
    */
   dataDir?: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
-  threadAbbr?: string;
   printTimeoutSeconds?: number;
   /** Run terminal tools inside agy's sandbox. Intended for tightly scoped
    *  one-shot helpers that consume untrusted content. */
@@ -347,7 +346,6 @@ export function makeAgyProfile(opts: {
         ...(r.maxTokens ? { contextLimit: r.maxTokens } : {}),
       }));
     },
-    threadAbbr: opts.threadAbbr,
     // agy bakes effort into the model choice (high/med/low model variants) —
     // there is no separate reasoning-effort knob, so the picker is suppressed.
     effort: { mechanism: "modelBaked", levels: [] },

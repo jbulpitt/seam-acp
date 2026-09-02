@@ -92,6 +92,8 @@ export interface ConfigEntities {
     scope: "project" | "global";
     agentId: string | null;
     model: string | null;
+    role: string | null;
+    disableThreadPrefix: boolean | null;
     effort: string | null;
     permission: string | null;
     cwd: string | null;
@@ -644,7 +646,7 @@ const TOOLS = [
   {
     name: "configure_thread",
     description:
-      "Change a teammate thread's agent, model, and/or reasoning effort within YOUR channel. " +
+      "Change a teammate thread's agent, model, reasoning effort, naming role, and/or automatic-naming opt-out within YOUR channel. " +
       "An agent switch ALWAYS creates a fresh session and drops that thread's conversation context. " +
       "Model switches reset only on session-pinned backends (codex and ollama-cloud); live-config " +
       "backends such as Claude preserve context. Effort never resets the ACP session: config-option " +
@@ -660,6 +662,14 @@ const TOOLS = [
         effort: {
           type: "string",
           description: "Optional live-advertised reasoning effort, or auto to clear the override.",
+        },
+        role: {
+          type: "string",
+          description: "Optional free-form naming role. Empty or auto clears the session role.",
+        },
+        disableThreadPrefix: {
+          type: "boolean",
+          description: "Optional thread-local naming opt-out. True disables automatic naming; false re-enables it.",
         },
       },
       required: ["thread"],
@@ -930,7 +940,8 @@ const TOOLS = [
   {
     name: "rename_thread",
     description:
-      "Rename YOUR OWN Discord thread. Free-form `name` (not slug-enforced). Self-scoped: the " +
+      "Rename YOUR OWN Discord thread base. Managed prefixes are recomputed around it; unmanaged " +
+      "legacy/hand-edited threads remain unmanaged. Self-scoped: the " +
       "target is always the calling session's thread, never another teammate. Restricted " +
       "participants cannot rename.",
     inputSchema: {
@@ -1136,13 +1147,13 @@ const TOOLS = [
       "Propose a configuration change for YOUR OWN thread. This does NOT apply anything: it posts a " +
       "confirmation card in your thread showing the exact before→after diff, and a human must click " +
       "Apply before it takes effect. Provide EXACTLY ONE of `session`, `preset`, `channelPreset`, `threadPreset`, or `schedule`.\n" +
-      "- session: your thread's own runtime config (agent, model, effort, cwd, permission, statusCardStyle, simpleCardGif).\n" +
-      "- preset: create/update a reusable specialist preset in this thread's project (usable as a handoff target; threadSlug enables auto-numbered `/seam preset thread` names).\n" +
-      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle/simpleCardGif/threadSlug/detached/location/tts). " +
+      "- session: your thread's own runtime config (agent, model, effort, role, cwd, permission, statusCardStyle, simpleCardGif, disableThreadPrefix).\n" +
+      "- preset: create/update a reusable specialist preset in this thread's project (including an optional role copied on apply).\n" +
+      "- threadPreset: THIS thread's own preset in channel-presets.json (agent/model/role/cwd/effort/rider/statusCardStyle/simpleCardGif/disableThreadPrefix/detached/location/tts). " +
       "Applies to this thread ONLY and overrides the channel preset — the right scope for a per-thread rider. " +
       "`detached:true` stops treating this thread as a session (no bot replies; does not delete history). " +
       "`tts:true` speaks each completed turn as an ogg attachment (default off).\n" +
-      "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/cwd/effort/rider/statusCardStyle/simpleCardGif/threadSlug). " +
+      "- channelPreset: this channel's shared preset in channel-presets.json (agent/model/role/cwd/effort/rider/statusCardStyle/simpleCardGif/disableThreadPrefix). " +
       "Applies to EVERY thread under the channel (statusCardStyle and simpleCardGif are inherited live at render time). May be disabled by the deployment; `locked` can NEVER be changed.\n" +
       "- schedule: create/update/enable/disable/delete a scheduled prompt for THIS thread. Translate the " +
       "user's natural-language cadence into a standard cron expression (e.g. \"every weekday at 7am\" → " +
@@ -1161,6 +1172,11 @@ const TOOLS = [
           properties: {
             agent: { type: "string", description: "Agent profile id." },
             model: { type: "string", description: "Model id." },
+            role: { type: "string", description: "Free-form naming role. Empty or auto clears it." },
+            disableThreadPrefix: {
+              type: "boolean",
+              description: "true leaves this thread's name completely untouched; false clears the session opt-out.",
+            },
             effort: { type: "string", description: "Reasoning effort level (agent-dependent)." },
             cwd: { type: "string", description: "Working directory." },
             permission: {
@@ -1212,6 +1228,8 @@ const TOOLS = [
             name: { type: "string", description: "Preset name (required)." },
             agent: { type: "string" },
             model: { type: "string" },
+            role: { type: "string", description: "Role copied into the thread config on apply." },
+            disableThreadPrefix: { type: "boolean", description: "Naming opt-out copied on apply." },
             effort: { type: "string" },
             description: { type: "string" },
             permission: { type: "string", enum: ["always", "ask", "deny"] },
@@ -1242,12 +1260,6 @@ const TOOLS = [
                 "Status-card layout baked into this preset. Empty string clears it so apply " +
                 "does not touch the thread's style.",
             },
-            threadSlug: {
-              type: "string",
-              description:
-                "Slug for auto-numbered `/seam preset thread` names (for example `orch`). " +
-                "Empty string clears it. Supply this when the preset should create threads without an explicit name.",
-            },
           },
           required: ["name"],
         },
@@ -1260,6 +1272,11 @@ const TOOLS = [
           properties: {
             agent: { type: "string" },
             model: { type: "string" },
+            role: { type: "string", description: "Free-form naming role. Empty or auto clears." },
+            disableThreadPrefix: {
+              type: "boolean",
+              description: "true opts this thread out of all automatic naming; false clears the opt-out.",
+            },
             cwd: { type: "string" },
             effort: { type: "string" },
             rider: { type: "string", description: "Extra per-turn harness-preamble rule for this thread." },
@@ -1273,11 +1290,6 @@ const TOOLS = [
               type: "boolean",
               description:
                 "Thread-preset simple-card GIF. Overrides the channel preset; session `/seam config gif` still wins.",
-            },
-            threadSlug: {
-              type: "string",
-              description:
-                "Thread-specific auto-numbering slug. Overrides the channel slug. Empty string clears it.",
             },
             detached: {
               type: "boolean",
@@ -1325,6 +1337,11 @@ const TOOLS = [
           properties: {
             agent: { type: "string" },
             model: { type: "string" },
+            role: { type: "string", description: "Channel-wide fallback naming role. Empty or auto clears." },
+            disableThreadPrefix: {
+              type: "boolean",
+              description: "true opts every thread in this channel out of automatic naming; false clears this channel flag.",
+            },
             cwd: { type: "string" },
             effort: { type: "string" },
             rider: { type: "string", description: "Extra per-turn harness-preamble rule." },
@@ -1338,11 +1355,6 @@ const TOOLS = [
               type: "boolean",
               description:
                 "Channel-wide simple-card GIF thumbnail. Inherited live unless a thread/session overlay wins.",
-            },
-            threadSlug: {
-              type: "string",
-              description:
-                "Channel-wide fallback slug for auto-numbered `/seam preset thread` names. Empty string clears it.",
             },
           },
         },
@@ -1560,7 +1572,7 @@ const INSTRUCTIONS = [
   "  result is dispatched back into your thread when it completes.",
   "- forward(to, content): relay a message into another thread (thin handoff, no specialist framing).",
   "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
-  "- configure_thread(thread, agent?, model?, effort?): reconfigure a teammate in YOUR channel; returns exact changed/no-change identity, posts a target confirmation card, and agent switches reset context.",
+  "- configure_thread(thread, agent?, model?, effort?, role?, disableThreadPrefix?): reconfigure a teammate in YOUR channel; returns exact changed/no-change identity, posts a target confirmation card, and agent switches reset context.",
   "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
   "- migrate_self(agent?, model?, effort?, manifest): migrate YOUR OWN thread after this turn ends; the manifest is the replacement session's first prompt. Purpose-agnostic and rollback-safe.",
   "- search_messages(query, threads?, author?, since?, limit?): search live conversation text in your thread or same-channel siblings.",
@@ -1856,6 +1868,10 @@ export class SeamMcpServer {
       ...(optionalString(args, "agent") ? { agent: optionalString(args, "agent") } : {}),
       ...(optionalString(args, "model") ? { model: optionalString(args, "model") } : {}),
       ...(typeof args.effort === "string" ? { effort: args.effort } : {}),
+      ...(typeof args.role === "string" ? { role: args.role } : {}),
+      ...(typeof args.disableThreadPrefix === "boolean"
+        ? { disableThreadPrefix: args.disableThreadPrefix }
+        : {}),
     };
     const outcome = await this.deps.configureThread(caller, target.record, input);
     if (!outcome.ok) return textResult(outcome.error, true);
@@ -1868,8 +1884,13 @@ export class SeamMcpServer {
         : "runtime kept";
     const presentation = [
       outcome.confirmationPosted === false ? "confirmation card could not be posted" : null,
-      outcome.threadIdentityUpdated === false && outcome.changes.agent.changed
-        ? "thread icon/name could not be updated"
+      outcome.threadIdentityUpdated === false && (
+        outcome.changes.agent.changed ||
+        outcome.changes.model.changed ||
+        outcome.changes.role.changed ||
+        outcome.changes.disableThreadPrefix.changed
+      )
+        ? "thread prefix could not be updated"
         : null,
     ].filter(Boolean);
     return textResult([
@@ -1877,6 +1898,8 @@ export class SeamMcpServer {
       `• Agent: ${outcome.applied.agent} (${status(outcome.changes.agent)})`,
       `• Model: ${outcome.applied.model} (${status(outcome.changes.model)})`,
       `• Effort: ${outcome.applied.effort} (${status(outcome.changes.effort)})`,
+      `• Role: ${outcome.applied.role} (${status(outcome.changes.role)})`,
+      `• Auto-name: ${outcome.applied.disableThreadPrefix ? "disabled" : "enabled"} (${status(outcome.changes.disableThreadPrefix)})`,
       `• Runtime: ${runtime}`,
       ...(presentation.length ? [`• Presentation: ${presentation.join("; ")}`] : []),
       ...outcome.warnings.map((warning) => `⚠️ ${warning}`),
@@ -2839,11 +2862,13 @@ export class SeamMcpServer {
       `Effective configuration for thread ${d.channelRef}${d.locked ? " 🔒 (locked — read-only over MCP)" : ""}:`,
       line("agent:", d.agent.value, d.agent.source),
       line("model:", d.model.value, d.model.source),
+      line("role:", d.role?.value ?? "(none)", d.role?.source ?? "default"),
       line("effort:", d.effort.value ?? "(none)", d.effort.source),
       line("cwd:", d.cwd.value, d.cwd.source),
       line("permission:", d.permission.value, d.permission.source),
       line("card style:", d.statusCardStyle?.value ?? "full", d.statusCardStyle?.source ?? "default"),
       line("card gif:", d.simpleCardGif?.value ? "on" : "off", d.simpleCardGif?.source ?? "default"),
+      line("auto-name:", d.disableThreadPrefix?.value ? "disabled" : "enabled", d.disableThreadPrefix?.source ?? "default"),
       line("detached:", d.detached.value ? "true" : "false", d.detached.source),
       line("tts:", d.tts.value ? "true" : "false", d.tts.source),
       line("tts voice:", d.ttsVoice.value ?? "(unset)", d.ttsVoice.source),
@@ -2904,6 +2929,8 @@ export class SeamMcpServer {
             p.agentId ? `agent ${p.agentId}` : null,
             p.model ? `model ${p.model}` : null,
             p.effort ? `effort ${p.effort}` : null,
+            p.role ? `role ${p.role}` : null,
+            p.disableThreadPrefix ? "auto-name disabled" : null,
             p.permission ? `perm ${p.permission}` : null,
             p.statusCardStyle ? `card ${p.statusCardStyle}` : null,
             p.cwd ? `cwd ${p.cwd}` : null,

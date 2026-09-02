@@ -222,7 +222,6 @@ export function makeOpencodeProfile(opts: {
   defaultModel: string;
   /** Picker models (incl. optional `contextLimit` for the usage display). */
   staticModels?: AgentProfile["staticModels"];
-  threadAbbr?: string;
   /** Effort descriptor. Local models have no reasoning-effort knob → defaults to
    *  {mechanism:"none",levels:[]} so `/seam effort` reports it's unsettable. */
   effort?: AgentProfile["effort"];
@@ -234,7 +233,6 @@ export function makeOpencodeProfile(opts: {
     displayName: opts.displayName ?? "opencode",
     defaultModel: opts.defaultModel,
     staticModels: opts.staticModels,
-    threadAbbr: opts.threadAbbr,
     effort: opts.effort ?? { mechanism: "none", levels: [] },
     spawn() {
       // `detached: true` makes the child a process-group leader so AgentRuntime's

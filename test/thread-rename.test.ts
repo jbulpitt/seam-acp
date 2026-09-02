@@ -1,171 +1,81 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { buildSeamCommand } from "../packages/core/src/platforms/discord/commands.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
-import type { ChannelRef } from "../packages/core/src/platforms/chat-adapter.js";
 
-describe("Orchestrator Thread Renaming Abbreviation", () => {
-  it("replaces known agent abbreviations case-insensitively in brackets", async () => {
-    let renamedTo: string | null = null;
-    let threadName = "seam-acp [agy]";
+describe("/seam config rename and namer surfaces", () => {
+  it("publishes thread/channel rename, explicit legacy migration, and namer editor", () => {
+    const command = buildSeamCommand().toJSON();
+    const config = command.options?.find((option) => option.name === "config");
+    const rename = config?.options?.find((option) => option.name === "rename");
+    const namer = config?.options?.find((option) => option.name === "namer");
 
-    const mockOrchestrator = {
-      adapter: {
-        getThreadName: async (ch: ChannelRef) => threadName,
-        renameThread: async (ch: ChannelRef, name: string) => {
-          renamedTo = name;
-        },
-      },
-      router: {
-        getProfile: (id: string) => {
-          if (id === "copilot") return { threadAbbr: "cp-jp" };
-          return { threadAbbr: "agy" };
-        },
-        listProfiles: () => [
-          { threadAbbr: "agy" },
-          { threadAbbr: "cp-jp" },
-          { threadAbbr: "cc" }
-        ],
-      },
-      logger: {
-        info: () => {},
-        warn: () => {},
-      },
-      // Bind actual implementation
-      updateThreadAbbreviation: Orchestrator.prototype["updateThreadAbbreviation"],
-    };
-
-    const channel: ChannelRef = {
-      platform: "discord",
-      id: "thread-123",
-      parentId: "channel-456",
-    };
-
-    // Act
-    await mockOrchestrator.updateThreadAbbreviation(channel, "agy", "copilot");
-
-    // Assert
-    expect(renamedTo).toBe("seam-acp [cp-jp]");
+    expect(rename).toBeDefined();
+    expect(rename?.options?.find((option) => option.name === "scope")?.choices)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "thread", value: "thread" }),
+        expect.objectContaining({ name: "channel", value: "channel" }),
+      ]));
+    expect(rename?.options?.find((option) => option.name === "migrate-legacy")?.type).toBe(5);
+    expect(namer).toBeDefined();
   });
 
-  it("handles case-insensitive replacement", async () => {
-    let renamedTo: string | null = null;
-    let threadName = "my-project [AGY]";
-
-    const mockOrchestrator = {
-      adapter: {
-        getThreadName: async (ch: ChannelRef) => threadName,
-        renameThread: async (ch: ChannelRef, name: string) => {
-          renamedTo = name;
-        },
-      },
-      router: {
-        getProfile: (id: string) => ({ threadAbbr: "cp-jp" }),
-        listProfiles: () => [
-          { threadAbbr: "agy" },
-          { threadAbbr: "cp-jp" }
-        ],
-      },
-      logger: {
-        info: () => {},
-        warn: () => {},
-      },
-      updateThreadAbbreviation: Orchestrator.prototype["updateThreadAbbreviation"],
-    };
-
-    const channel: ChannelRef = {
+  it("shows naming state without reapplying after core configure already ran the funnel", async () => {
+    const target = {
+      id: "discord:thread-123",
       platform: "discord",
-      id: "thread-123",
-      parentId: "channel-456",
+      channelRef: "thread-123",
+      parentRef: "channel-456",
     };
-
-    await mockOrchestrator.updateThreadAbbreviation(channel, "agy", "copilot");
-    expect(renamedTo).toBe("my-project [cp-jp]");
-  });
-
-  it("stamps the target abbreviation when a custom name has no known icon", async () => {
-    let renamedTo: string | null = null;
-    const threadName = "my-project-without-bracket";
-
-    const mockOrchestrator = {
+    const applyThreadName = vi.fn(async () => ({ status: "renamed" }));
+    let posted: any;
+    const mock = {
+      store: { get: () => target },
+      applyThreadName,
       adapter: {
-        getThreadName: async (ch: ChannelRef) => threadName,
-        renameThread: async (ch: ChannelRef, name: string) => {
-          renamedTo = name;
-        },
-      },
-      router: {
-        getProfile: (id: string) => ({ threadAbbr: "cp-jp" }),
-        listProfiles: () => [
-          { threadAbbr: "agy" },
-          { threadAbbr: "cp-jp" }
-        ],
-      },
-      logger: {
-        info: () => {},
-        warn: () => {},
-      },
-      updateThreadAbbreviation: Orchestrator.prototype["updateThreadAbbreviation"],
-    };
-
-    const channel: ChannelRef = {
-      platform: "discord",
-      id: "thread-123",
-      parentId: "channel-456",
-    };
-
-    await mockOrchestrator.updateThreadAbbreviation(channel, "agy", "copilot");
-    expect(renamedTo).toBe("cp-jp my-project-without-bracket");
-  });
-
-  it("posts an exact visual confirmation card and refreshes the agent identity", async () => {
-    let renamedTo: string | null = null;
-    let posted: any = null;
-    const mockOrchestrator = {
-      adapter: {
-        getThreadName: async () => "agy project",
-        renameThread: async (_ch: ChannelRef, name: string) => { renamedTo = name; },
-        sendPanel: async (_ch: ChannelRef, panel: any) => {
+        sendPanel: async (_channel: unknown, panel: unknown) => {
           posted = panel;
           return { id: "card-1", channelId: "thread-123" };
         },
       },
       router: {
-        getProfile: (id: string) => ({
-          id,
-          displayName: id === "claude" ? "Claude" : id,
-          threadAbbr: id === "claude" ? "cc" : "agy",
-        }),
-        listProfiles: () => [{ threadAbbr: "agy" }, { threadAbbr: "cc" }],
+        getProfile: () => ({ id: "claude", displayName: "Claude" }),
       },
-      logger: { info: () => {}, warn: () => {} },
-      updateThreadAbbreviation: Orchestrator.prototype["updateThreadAbbreviation"],
-      presentThreadConfigurationChange:
-        Orchestrator.prototype.presentThreadConfigurationChange,
+      logger: { warn: () => {} },
+      presentThreadConfigurationChange: Orchestrator.prototype.presentThreadConfigurationChange,
     } as any;
 
-    const result = await mockOrchestrator.presentThreadConfigurationChange(
+    const result = await mock.presentThreadConfigurationChange(
       { channelRef: "caller" },
-      { platform: "discord", channelRef: "thread-123", parentRef: "channel-456" },
+      target,
       {
         ok: true,
-        applied: { agent: "claude", model: "default", effort: "high" },
+        applied: {
+          agent: "claude",
+          model: "claude-opus-5",
+          effort: "high",
+          role: "orch",
+          disableThreadPrefix: false,
+        },
         changes: {
           agent: { before: "agy", after: "claude", changed: true },
-          model: { before: "gemini", after: "default", changed: true },
+          model: { before: "gemini", after: "claude-opus-5", changed: true },
           effort: { before: "high", after: "high", changed: false },
+          role: { before: "auto", after: "orch", changed: true },
+          disableThreadPrefix: { before: "enabled", after: "enabled", changed: false },
         },
         sessionReset: true,
         resetReason: "agent-switch",
         runtimeReloaded: false,
+        threadIdentityUpdated: true,
         warnings: [],
       }
     );
 
     expect(result).toMatchObject({ confirmationPosted: true, threadIdentityUpdated: true });
-    expect(renamedTo).toBe("cc project");
-    expect(posted.title).toBe("✅ Thread configuration confirmed");
+    expect(applyThreadName).not.toHaveBeenCalled();
     expect(posted.fields).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "Agent", value: expect.stringContaining("Changed from") }),
-      expect.objectContaining({ name: "Effort", value: expect.stringContaining("no change") }),
+      expect.objectContaining({ name: "Role", value: expect.stringContaining("orch") }),
     ]));
   });
 });

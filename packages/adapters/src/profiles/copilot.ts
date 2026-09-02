@@ -61,7 +61,6 @@ export function makeCopilotProfile(opts: {
    */
   configDir?: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
-  threadAbbr?: string;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "copilot";
   const globalMcpServers = opts.mcpServers ?? [];
@@ -74,7 +73,6 @@ export function makeCopilotProfile(opts: {
     displayName: opts.displayName ?? "GitHub Copilot",
     defaultModel: opts.defaultModel,
     staticModels: opts.staticModels,
-    threadAbbr: opts.threadAbbr,
     configDir,
     mcpServersAtSpawn: true,
     // Copilot exposes reasoning effort as an ACP config option (verified via

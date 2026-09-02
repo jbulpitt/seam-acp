@@ -29,7 +29,6 @@ export function makeCodexProfile(opts: {
   /** Default model id for sessions on this profile (e.g. "o3"). */
   defaultModel: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
-  threadAbbr?: string;
   /** Override the effort descriptor. Defaults to configOption-based
    *  reasoning_effort (low/medium/high/xhigh/max/ultra), matching the OpenAI pattern. */
   effort?: AgentProfile["effort"];
@@ -48,7 +47,6 @@ export function makeCodexProfile(opts: {
     displayName: opts.displayName ?? "OpenAI Codex",
     defaultModel: opts.defaultModel,
     staticModels: opts.staticModels,
-    threadAbbr: opts.threadAbbr,
     // Codex uses the same configOption effort mechanism as Copilot (both OpenAI).
     effort: opts.effort ?? {
       mechanism: "configOption",

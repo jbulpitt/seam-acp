@@ -227,6 +227,28 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
       .addSubcommand((sub) =>
         sub
+          .setName("role")
+          .setDescription("Set naming role")
+          .addStringOption((o) =>
+            o
+              .setName("value")
+              .setDescription("Role; auto clears")
+              .setRequired(false)
+          )
+          .addStringOption((o) =>
+            o
+              .setName("scope")
+              .setDescription("Save scope")
+              .setRequired(false)
+              .addChoices(
+                { name: "session", value: "session" },
+                { name: "thread", value: "thread" },
+                { name: "channel", value: "channel" }
+              )
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
           .setName("mode")
           .setDescription("Set the agent operational mode")
           .addStringOption((o) =>
@@ -451,6 +473,32 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .setRequired(false)
           )
       )
+      .addSubcommand((sub) =>
+        sub
+          .setName("rename")
+          .setDescription("Refresh/migrate names")
+          .addStringOption((o) =>
+            o
+              .setName("scope")
+              .setDescription("Rename scope")
+              .setRequired(false)
+              .addChoices(
+                { name: "thread", value: "thread" },
+                { name: "channel", value: "channel" }
+              )
+          )
+          .addBooleanOption((o) =>
+            o
+              .setName("migrate-legacy")
+              .setDescription("Migrate legacy prefix")
+              .setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("namer")
+          .setDescription("Edit naming rules")
+      )
   );
 
   cmd.addSubcommandGroup((g) =>
@@ -576,8 +624,8 @@ export function buildSeamCommand(): SlashCommandBuilder {
           )
           .addStringOption((o) =>
             o
-              .setName("slug")
-              .setDescription("Thread slug for auto-numbered names (e.g. hist)")
+              .setName("role")
+              .setDescription("Role on apply")
               .setRequired(false)
           )
       )
@@ -643,16 +691,15 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .addStringOption((o) =>
             o
               .setName("name")
-              .setDescription("Thread name (omit to auto-number from the slug; ignored when quantity > 1)")
+              .setDescription("Base name")
               .setRequired(false)
           )
           .addIntegerOption((o) =>
             o
               .setName("quantity")
-              .setDescription("How many threads to create (default 1, max 9)")
+              .setDescription("Thread count")
               .setRequired(false)
               .setMinValue(1)
-              .setMaxValue(9)
           )
       )
   );

@@ -1,146 +1,306 @@
-import { describe, it, expect } from "vitest";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { describe, expect, it } from "vitest";
+import type { ConfigDescription } from "../packages/core/src/core/session-router.js";
+import type { SessionRecord } from "../packages/core/src/core/types.js";
 import {
-  THREAD_LIMIT_MESSAGE,
-  buildThreadName,
-  formatKeycap,
-  isEmptyOrDefaultThreadName,
-  isSlugNumberedName,
-  nameContainsSlug,
-  nextThreadNumber,
-  parseKeycapNumber,
-  parseSlugThreadNumber,
-  normalizeThreadSlug,
-  resolveEffectiveSlug,
-} from "../packages/core/src/platforms/discord/thread-naming.js";
+  DEFAULT_THREAD_NAMER_CONFIG,
+  ThreadNamer,
+  ThreadNamerConfigStore,
+  computeThreadPrefix,
+  formatThreadOrdinal,
+  joinThreadName,
+  lowestUnusedThreadOrdinal,
+  parseThreadOrdinal,
+  parseThreadOrdinalSuffix,
+  parseThreadNamerRules,
+  formatThreadNamerRules,
+  stripLegacyThreadPrefix,
+  stripStoredThreadPrefix,
+  type ThreadNamerConfig,
+} from "../packages/core/src/platforms/discord/thread-namer.js";
 
-const k = (n: number) => formatKeycap(n);
+const config = DEFAULT_THREAD_NAMER_CONFIG;
 
-describe("formatKeycap / parseKeycapNumber", () => {
-  it("formats 1–9 as digit + VS16 + enclosing keycap", () => {
-    expect(k(1)).toBe("1\uFE0F\u20E3");
-    expect(k(9)).toBe("9\uFE0F\u20E3");
-    expect(k(5)).toHaveLength(3);
+function record(id: string, createdUtc = "2026-01-01T00:00:00.000Z"): SessionRecord {
+  return {
+    id: `discord:${id}`,
+    platform: "discord",
+    channelRef: id,
+    parentRef: "parent",
+    agentId: "copilot",
+    acpSessionId: "",
+    repoPath: null,
+    configJson: "{}",
+    namePrefix: null,
+    createdUtc,
+    updatedUtc: createdUtc,
+  };
+}
+
+function description(
+  rec: SessionRecord,
+  values: { agent?: string; model?: string; role?: string | null; disabled?: boolean } = {}
+): ConfigDescription {
+  return {
+    sessionId: rec.id,
+    channelRef: rec.channelRef,
+    parentRef: rec.parentRef,
+    agent: { value: values.agent ?? "copilot", source: "session config" },
+    model: { value: values.model ?? "gpt-5.6-sol", source: "session config" },
+    role: { value: values.role ?? null, source: "session config" },
+    effort: { value: null, source: "default" },
+    cwd: { value: "/tmp", source: "default" },
+    permission: { value: "ask", source: "default" },
+    locked: false,
+    detached: { value: false, source: "default" },
+    tts: { value: false, source: "default" },
+    ttsVoice: { value: null, source: "default" },
+    ttsPace: { value: "natural", source: "default" },
+    ttsStyle: { value: "neutral", source: "default" },
+    location: { value: "local", source: "default" },
+    rider: {},
+    statusCardStyle: { value: "full", source: "default" },
+    simpleCardGif: { value: false, source: "default" },
+    disableThreadPrefix: {
+      value: values.disabled ?? false,
+      source: values.disabled ? "thread preset" : "default",
+    },
+  };
+}
+
+describe("computeThreadPrefix", () => {
+  it("uses ordered substring matches and the specific model suffix before gpt", () => {
+    expect(computeThreadPrefix({
+      agentSlug: "claude-vertex",
+      modelSlug: "gpt-5.6-sol",
+      role: "orchestrator",
+      enumNumber: 1,
+      config,
+    })).toEqual({
+      prefix: "💠🌞🪄1️⃣",
+      slots: { agent: "💠", model: "🌞", role: "🪄", enumeration: "1️⃣" },
+    });
   });
 
-  it("rejects 0, 10, and non-integers", () => {
-    expect(() => formatKeycap(0)).toThrow(/1–9/);
-    expect(() => formatKeycap(10)).toThrow(/1–9/);
-    expect(() => formatKeycap(1.5)).toThrow(/1–9/);
+  it("honors first-match order and an optional model agent qualifier", () => {
+    const qualified: ThreadNamerConfig = {
+      agents: [],
+      roles: [],
+      models: [
+        { match: "shared", agent: "claude", replacement: "C" },
+        { match: "shared", replacement: "G" },
+      ],
+    };
+    expect(computeThreadPrefix({ agentSlug: "claude", modelSlug: "shared-v1", config: qualified }).prefix).toBe("C");
+    expect(computeThreadPrefix({ agentSlug: "copilot", modelSlug: "shared-v1", config: qualified }).prefix).toBe("G");
   });
 
-  it("parses the first 1–9 keycap and ignores 🔟 / bare digits", () => {
-    expect(parseKeycapNumber(`hist ${k(3)}`)).toBe(3);
-    expect(parseKeycapNumber("hist 3")).toBeNull();
-    expect(parseKeycapNumber("hist 🔟")).toBeNull();
-    expect(parseKeycapNumber(`a ${k(1)} b ${k(8)}`)).toBe(1);
-  });
-});
-
-describe("nameContainsSlug", () => {
-  it("matches a whitespace token case-insensitively", () => {
-    expect(nameContainsSlug(`👾 Hist ${k(1)}`, "hist")).toBe(true);
-    expect(nameContainsSlug(`👾 HIST ${k(1)}`, "hist")).toBe(true);
-    expect(nameContainsSlug("history lesson", "hist")).toBe(false);
-    expect(nameContainsSlug("review-pr", "hist")).toBe(false);
-    expect(nameContainsSlug("  ", "hist")).toBe(false);
-    expect(nameContainsSlug("hist 1", "")).toBe(false);
-  });
-});
-
-describe("nextThreadNumber", () => {
-  it("returns 1 on empty", () => {
-    expect(nextThreadNumber([], "hist")).toBe(1);
+  it("omits unmatched slots, enumeration without a role slot, and a leading space", () => {
+    expect(computeThreadPrefix({
+      agentSlug: "unknown",
+      modelSlug: "unknown",
+      role: "worker",
+      enumNumber: 7,
+      config,
+    }).prefix).toBe("🛠️7️⃣");
+    expect(computeThreadPrefix({
+      agentSlug: "unknown",
+      modelSlug: "unknown",
+      role: "unknown",
+      enumNumber: 1,
+      config,
+    }).prefix).toBe("");
+    expect(joinThreadName("", "base")).toBe("base");
   });
 
-  it("fills the lowest gap among slug-matching names", () => {
-    const names = [1, 2, 3, 4, 6].map((n) => `👾 hist ${k(n)}`);
-    expect(nextThreadNumber(names, "hist")).toBe(5);
-  });
-
-  it("returns null when 1–9 are all taken", () => {
-    const names = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `hist ${k(n)}`);
-    expect(nextThreadNumber(names, "hist")).toBeNull();
-  });
-
-  it("ignores non-matching names and unnumbered slug mentions", () => {
-    const names = [
-      `👾 other ${k(1)}`,
-      "custom title",
-      `👾 hist ${k(2)}`,
-      "just hist without a keycap",
-    ];
-    expect(nextThreadNumber(names, "hist")).toBe(1);
-  });
-
-  it("is case-insensitive on the slug token", () => {
-    expect(nextThreadNumber([`👾 HIST ${k(1)}`], "hist")).toBe(2);
-  });
-});
-
-describe("buildThreadName", () => {
-  it("is [abbr] [slug] [n-emoji]", () => {
-    expect(buildThreadName("👾", "hist", 3)).toBe(`👾 hist ${k(3)}`);
-  });
-
-  it("omits an empty abbr", () => {
-    expect(buildThreadName("", "hist", 1)).toBe(`hist ${k(1)}`);
-    expect(buildThreadName(null, "hist", 1)).toBe(`hist ${k(1)}`);
-  });
-});
-
-describe("isSlugNumberedName / isEmptyOrDefaultThreadName", () => {
-  it("detects a valid numbered slug name", () => {
-    expect(isSlugNumberedName(`👾 hist ${k(4)}`, "hist")).toBe(true);
-    expect(isSlugNumberedName("my custom name", "hist")).toBe(false);
-  });
-
-  it("treats empty, seam, and New Thread as default", () => {
-    expect(isEmptyOrDefaultThreadName(undefined)).toBe(true);
-    expect(isEmptyOrDefaultThreadName("")).toBe(true);
-    expect(isEmptyOrDefaultThreadName("seam")).toBe(true);
-    expect(isEmptyOrDefaultThreadName("New Thread")).toBe(true);
-    expect(isEmptyOrDefaultThreadName("👾", "👾")).toBe(true);
-    expect(isEmptyOrDefaultThreadName("my lab notes", "👾")).toBe(false);
-  });
-});
-
-describe("normalizeThreadSlug", () => {
-  it("trims and rejects empty or illegal tokens", () => {
-    expect(normalizeThreadSlug(" hist ")).toBe("hist");
-    expect(normalizeThreadSlug("")).toBeNull();
-    expect(normalizeThreadSlug("has space")).toBeNull();
-    expect(normalizeThreadSlug("ok_name-2")).toBe("ok_name-2");
-  });
-
-  it("accepts emoji and symbol slugs (whitespace still rejected)", () => {
-    expect(normalizeThreadSlug("🎨")).toBe("🎨");
-    expect(normalizeThreadSlug("🎨art")).toBe("🎨art");
-    expect(normalizeThreadSlug(" 🚀 ")).toBe("🚀");
-    expect(normalizeThreadSlug("🎨 🖌️")).toBeNull(); // internal whitespace
-  });
-
-  it("an emoji slug round-trips through naming + matching", () => {
-    const name = buildThreadName("🪐", "🎨", 3); // "🪐 🎨 3️⃣"
-    expect(nameContainsSlug(name, "🎨")).toBe(true);
-    expect(parseSlugThreadNumber(name, "🎨")).toBe(3);
-    expect(nextThreadNumber([name], "🎨")).toBe(1);
+  it("preserves a compound emoji replacement exactly", () => {
+    const compound: ThreadNamerConfig = {
+      agents: [], models: [], roles: [{ match: "qa", replacement: "🕵🏻‍♀️" }],
+    };
+    expect(computeThreadPrefix({ role: "qa", enumNumber: 1, config: compound }).prefix)
+      .toBe("🕵🏻‍♀️1️⃣");
   });
 });
 
-describe("resolveEffectiveSlug", () => {
-  it("prefers DB preset, then thread, then channel", () => {
-    expect(
-      resolveEffectiveSlug({ presetSlug: "db", threadSlug: "th", channelSlug: "ch" })
-    ).toBe("db");
-    expect(resolveEffectiveSlug({ threadSlug: "th", channelSlug: "ch" })).toBe("th");
-    expect(resolveEffectiveSlug({ channelSlug: "ch" })).toBe("ch");
-    expect(resolveEffectiveSlug({})).toBeUndefined();
-    expect(resolveEffectiveSlug({ presetSlug: "  " })).toBeUndefined();
+describe("thread ordinal", () => {
+  it("renders 1–9, the special ten glyph, and concatenated keycaps above ten", () => {
+    expect(formatThreadOrdinal(1)).toBe("1️⃣");
+    expect(formatThreadOrdinal(9)).toBe("9️⃣");
+    expect(formatThreadOrdinal(10)).toBe("🔟");
+    expect(formatThreadOrdinal(11)).toBe("1️⃣1️⃣");
+    expect(formatThreadOrdinal(20)).toBe("2️⃣0️⃣");
+    expect(parseThreadOrdinal("🔟")).toBe(10);
+    expect(parseThreadOrdinal("1️⃣1️⃣")).toBe(11);
+    expect(parseThreadOrdinalSuffix("🤖🛠️1️⃣2️⃣")).toBe(12);
+  });
+
+  it("uses the lowest gap without an upper cap", () => {
+    expect(lowestUnusedThreadOrdinal([1, 2, 4, 10, 11])).toBe(3);
+    expect(lowestUnusedThreadOrdinal(Array.from({ length: 25 }, (_, i) => i + 1))).toBe(26);
+    expect(() => formatThreadOrdinal(0)).toThrow(/positive/);
   });
 });
 
-describe("THREAD_LIMIT_MESSAGE", () => {
-  it("is the friendly 9-cap copy", () => {
-    expect(THREAD_LIMIT_MESSAGE).toMatch(/limit \(9\)/);
+describe("prefix boundaries", () => {
+  it("strips a stored prefix only at the exact front boundary", () => {
+    expect(stripStoredThreadPrefix("🤖🌞 base", "🤖🌞")).toBe("base");
+    expect(stripStoredThreadPrefix("🤖🌞", "🤖🌞")).toBe("");
+    expect(stripStoredThreadPrefix("hand 🤖🌞 base", "🤖🌞")).toBeNull();
+    expect(stripStoredThreadPrefix("base", "")).toBe("base");
+  });
+
+  it("heuristically strips only a leading configured glyph/keycap run", () => {
+    expect(stripLegacyThreadPrefix("👾📜🕵🏻‍♀️1️⃣ old title", {
+      agents: [{ match: "claude", replacement: "👾" }],
+      models: [{ match: "sonnet", replacement: "📜" }],
+      roles: [{ match: "qa", replacement: "🕵🏻‍♀️" }],
+    })).toBe("old title");
+    expect(stripLegacyThreadPrefix("ordinary 👾 title", config)).toBe("ordinary 👾 title");
+  });
+});
+
+describe("ThreadNamerConfigStore", () => {
+  it("starts with seeds, writes atomically, and protects the last valid snapshot", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "seam-namer-"));
+    const file = path.join(dir, "thread-namer.json");
+    const store = new ThreadNamerConfigStore(file);
+    expect(store.get().agents[0]).toEqual({ match: "copilot", replacement: "🤖" });
+    const next = { agents: [{ match: "a", replacement: "A" }], models: [], roles: [] };
+    store.save(next);
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(next);
+    expect(() => store.save({ ...next, agents: [{ match: "", replacement: "A" }] }))
+      .toThrow();
+    expect(store.get()).toEqual(next);
+  });
+});
+
+describe("namer card rule grammar", () => {
+  it("parses comments, colon-bearing matches, first equals, and model qualifiers", () => {
+    const parsed = parseThreadNamerRules(
+      "# ordered\nsonnet=📜\n:cloud=🦙\ndefault=💫 @copilot\nvalue=a=b",
+      "model"
+    );
+    expect(parsed).toEqual([
+      { match: "sonnet", replacement: "📜" },
+      { match: ":cloud", replacement: "🦙" },
+      { match: "default", replacement: "💫", agent: "copilot" },
+      { match: "value", replacement: "a=b" },
+    ]);
+    expect(formatThreadNamerRules(parsed, "model")).toContain("default=💫 @copilot");
+  });
+
+  it("reports exact offending lines and rejects qualifiers outside models", () => {
+    expect(() => parseThreadNamerRules("ok=✅\nmissing", "agent")).toThrow("Line 2");
+    expect(() => parseThreadNamerRules("=✅", "role")).toThrow("Line 1: match");
+    expect(() => parseThreadNamerRules("qa=", "role")).toThrow("Line 1: replacement");
+    expect(() => parseThreadNamerRules("qa=🧪 @copilot", "role")).toThrow("Line 1: @agent");
+  });
+});
+
+describe("ThreadNamer lifecycle", () => {
+  function harness(records: SessionRecord[], values: Record<string, Parameters<typeof description>[1]>, names: Record<string, string>) {
+    const renames: Array<[string, string]> = [];
+    const namer = new ThreadNamer({
+      getConfig: () => config,
+      describeConfig: (rec) => description(rec, values[rec.channelRef]),
+      listSessionsByParent: () => records,
+      getThreadName: async (id) => names[id] ?? null,
+      renameThread: async (id, name) => { renames.push([id, name]); names[id] = name; },
+      setNamePrefix: (id, prefix) => {
+        const rec = records.find((candidate) => candidate.id === id);
+        if (rec) rec.namePrefix = prefix;
+      },
+    });
+    return { namer, renames };
+  }
+
+  it("manages fresh create, preserves stable gaps, and recomputes exact prefixes", async () => {
+    const first = record("one"); first.namePrefix = "🤖🌞🛠️1️⃣";
+    const third = record("three"); third.namePrefix = "🤖🌞🛠️3️⃣";
+    const fresh = record("fresh");
+    const records = [first, third, fresh];
+    const names = { one: "🤖🌞🛠️1️⃣ one", three: "🤖🌞🛠️3️⃣ three", fresh: "fresh" };
+    const values: Record<string, Parameters<typeof description>[1]> = {
+      one: { role: "worker" }, three: { role: "worker" }, fresh: { role: "worker" },
+    };
+    const { namer, renames } = harness(records, values, names);
+    await namer.applyThreadName(fresh, { fresh: true });
+    expect(renames).toEqual([["fresh", "🤖🌞🛠️2️⃣ fresh"]]);
+    values.fresh!.agent = "claude";
+    await namer.applyThreadName(fresh);
+    expect(renames.at(-1)).toEqual(["fresh", "👾🌞🛠️2️⃣ fresh"]);
+  });
+
+  it("leaves legacy and mismatched managed names untouched on normal passes", async () => {
+    const legacy = record("legacy");
+    const edited = record("edited"); edited.namePrefix = "🤖🌞";
+    const records = [legacy, edited];
+    const { namer, renames } = harness(records, {}, { legacy: "legacy", edited: "hand edit" });
+    expect((await namer.applyThreadName(legacy)).status).toBe("unmanaged");
+    expect((await namer.applyThreadName(edited)).status).toBe("unmanaged");
+    expect(renames).toEqual([]);
+  });
+
+  it("migrates legacy only explicitly and short-circuits either opt-out", async () => {
+    const legacy = record("legacy");
+    const opted = record("opted");
+    const records = [legacy, opted];
+    const { namer, renames } = harness(
+      records,
+      { legacy: { agent: "claude", model: "sonnet", role: "qa" }, opted: { disabled: true, role: "worker" } },
+      { legacy: "🤖🪢🛠️4️⃣ base", opted: "leave me" }
+    );
+    await namer.applyThreadName(legacy, { migrateLegacy: true });
+    expect(renames[0]).toEqual(["legacy", "👾📜🧪1️⃣ base"]);
+    expect((await namer.applyThreadName(opted, { fresh: true })).status).toBe("opted_out");
+    expect(renames).toHaveLength(1);
+  });
+
+  it("recompacts each role group independently by creation order", async () => {
+    const newer = record("newer", "2026-01-02T00:00:00.000Z"); newer.namePrefix = "🤖🌞🛠️8️⃣";
+    const oldest = record("oldest", "2026-01-01T00:00:00.000Z"); oldest.namePrefix = "🤖🌞🛠️4️⃣";
+    const qa = record("qa", "2026-01-03T00:00:00.000Z"); qa.namePrefix = "🤖🌞🧪7️⃣";
+    const records = [newer, oldest, qa];
+    const { namer } = harness(
+      records,
+      { newer: { role: "worker" }, oldest: { role: "worker" }, qa: { role: "qa" } },
+      { newer: "🤖🌞🛠️8️⃣ newer", oldest: "🤖🌞🛠️4️⃣ oldest", qa: "🤖🌞🧪7️⃣ qa" }
+    );
+    const result = await namer.recompactChannel("discord", "parent");
+    expect(result.map((item) => item.name)).toEqual([
+      "🤖🌞🛠️1️⃣ oldest",
+      "🤖🌞🛠️2️⃣ newer",
+      "🤖🌞🧪1️⃣ qa",
+    ]);
+  });
+
+  it("does not let opted-out or unmanaged threads consume recompaction ordinals", async () => {
+    const opted = record("opted", "2026-01-01T00:00:00.000Z");
+    const legacy = record("legacy", "2026-01-02T00:00:00.000Z");
+    const managed = record("managed", "2026-01-03T00:00:00.000Z");
+    managed.namePrefix = "🤖🌞🛠️7️⃣";
+    const records = [managed, legacy, opted];
+    const { namer } = harness(
+      records,
+      {
+        opted: { role: "worker", disabled: true },
+        legacy: { role: "worker" },
+        managed: { role: "worker" },
+      },
+      {
+        opted: "leave opted out",
+        legacy: "legacy remains unmanaged",
+        managed: "🤖🌞🛠️7️⃣ managed",
+      }
+    );
+
+    const result = await namer.recompactChannel("discord", "parent");
+    expect(result.map((item) => [item.status, item.name])).toEqual([
+      ["opted_out", undefined],
+      ["unmanaged", undefined],
+      ["renamed", "🤖🌞🛠️1️⃣ managed"],
+    ]);
   });
 });

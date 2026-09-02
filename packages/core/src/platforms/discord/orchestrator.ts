@@ -359,16 +359,14 @@ import {
 } from "../../core/audio/voice-replies.js";
 import { ATTACH_FENCE_LANG, WAKE_FENCE_LANG, WATCH_FENCE_LANG, CHOICE_FENCE_LANG, RESULT_FENCE_LANG, isMathFenceLang, sanitizeSpeakerName, sessionHasSeamMcp, withHarnessPreamble } from "../../core/agent-conventions.js";
 import {
-  THREAD_LIMIT_MESSAGE,
-  THREAD_NUMBER_MAX,
-  buildThreadName,
-  isEmptyOrDefaultThreadName,
-  isSlugNumberedName,
-  nextThreadNumber,
-  normalizeThreadSlug,
-  parseSlugThreadNumber,
-  resolveEffectiveSlug,
-} from "./thread-naming.js";
+  ThreadNamer,
+  ThreadNamerConfigStore,
+  type ApplyThreadNameOptions,
+  type ApplyThreadNameResult,
+  stripStoredThreadPrefix,
+  formatThreadNamerRules,
+  parseThreadNamerRules,
+} from "./thread-namer.js";
 import {
   CHOICE_CUSTOM_TEXT_MAX,
   choiceAuthoringRules,
@@ -535,23 +533,6 @@ export interface VoiceConsoleOrchestratorPort {
   markBindingActivitySettled(channelRef: string): Promise<void>;
 }
 
-/** Discord thread names cap at 100 chars. */
-export const DISCORD_THREAD_NAME_MAX = 100;
-
-/**
- * `/seam new` / `/seam preset thread` naming: prefix the user-supplied name
- * with the agent's `threadAbbr` (emoji). No manual emoji.
- */
-export function prefixThreadNameWithAgentEmoji(
-  name: string,
-  threadAbbr?: string | null
-): string {
-  const trimmed = name.trim() || "seam";
-  if (!threadAbbr) return trimmed.slice(0, DISCORD_THREAD_NAME_MAX);
-  if (trimmed.startsWith(threadAbbr)) return trimmed.slice(0, DISCORD_THREAD_NAME_MAX);
-  return `${threadAbbr} ${trimmed}`.slice(0, DISCORD_THREAD_NAME_MAX);
-}
-
 /**
  * Glues the Discord adapter, the SessionRouter, and the agent runtimes
  * together. Handles incoming thread messages and `/seam` slash commands.
@@ -572,6 +553,8 @@ export class Orchestrator {
   /** Conversational config mutation engine (#58 P2/P3). Platform-agnostic; the
    *  orchestrator adds the Discord confirm card + apply/restart wiring. */
   private readonly configMutation: ConfigMutationService;
+  private readonly threadNamerConfig: ThreadNamerConfigStore;
+  private readonly threadNamer: ThreadNamer;
 
   private activeTurns = 0;
   private restartPending = false;
@@ -700,6 +683,22 @@ export class Orchestrator {
     this.renderer = opts.renderer;
     this.quotaPoller = opts.quotaPoller;
     this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
+    this.threadNamerConfig = new ThreadNamerConfigStore(
+      path.join(this.config.DATA_DIR, "thread-namer.json")
+    );
+    this.threadNamer = new ThreadNamer({
+      getConfig: () => this.threadNamerConfig.get(),
+      describeConfig: (record) => this.router.describeConfig(record),
+      listSessionsByParent: (platform, parentRef) =>
+        this.store.listSessionsByParentInCreationOrder(platform, parentRef),
+      getThreadName: async (threadId) =>
+        (await this.adapter.getThreadName?.({ platform: PLATFORM, id: threadId })) ?? null,
+      renameThread: async (threadId, name) => {
+        if (!this.adapter.renameThread) return;
+        await this.adapter.renameThread({ platform: PLATFORM, id: threadId }, name);
+      },
+      setNamePrefix: (sessionId, prefix) => this.store.setNamePrefix(sessionId, prefix),
+    });
 
     // #58 P2/P3: the mutation engine reuses the router's precedence resolver
     // (describeConfig) and profiles, and hot-reloads the LIVE preset maps
@@ -750,6 +749,28 @@ export class Orchestrator {
       toAutocompleteChoices(geminiTtsVoiceChoices(ctx.focusedValue))
     );
     this.wireSlashAutocomplete();
+  }
+
+  /** Single public naming funnel used by local commands and cross-thread control. */
+  async applyThreadName(
+    record: SessionRecord,
+    options: ApplyThreadNameOptions = {}
+  ): Promise<ApplyThreadNameResult> {
+    try {
+      return await this.threadNamer.applyThreadName(record, options);
+    } catch (err) {
+      this.logger.warn({ err, threadId: record.channelRef }, "thread namer apply failed");
+      return { status: "unchanged" };
+    }
+  }
+
+  async renameThreadBase(record: SessionRecord, base: string): Promise<ApplyThreadNameResult> {
+    try {
+      return await this.threadNamer.renameBase(record, base);
+    } catch (err) {
+      this.logger.warn({ err, threadId: record.channelRef }, "thread namer rename failed");
+      return { status: "unchanged" };
+    }
   }
 
   /**
@@ -1070,6 +1091,12 @@ export class Orchestrator {
           await this.router.invalidate(record.id).catch((err) =>
             this.logger.warn({ err, session: record.id }, "invalidate after config apply failed")
           );
+        }
+        const namingRecord = this.store.get(record.id) ?? record;
+        if (proposal.tier === "channel-preset" && namingRecord.parentRef) {
+          await this.threadNamer.recompactChannel(PLATFORM, namingRecord.parentRef);
+        } else if (proposal.tier === "session" || proposal.tier === "thread-preset") {
+          await this.applyThreadName(namingRecord);
         }
         await this.adapter
           .sendMessage({ platform: PLATFORM, id: record.channelRef }, `✅ ${result.message}`)
@@ -2999,6 +3026,8 @@ export class Orchestrator {
           return this.cmdEffort(interaction);
         case "agent":
           return this.cmdAgent(interaction);
+        case "role":
+          return this.cmdRole(interaction);
         case "mode":
           return this.cmdMode(interaction);
         case "repo":
@@ -3027,6 +3056,10 @@ export class Orchestrator {
           return this.cmdConfigSet(interaction);
         case "audit":
           return this.cmdConfigAudit(interaction);
+        case "rename":
+          return this.cmdThreadRename(interaction);
+        case "namer":
+          return this.cmdNamerEditor(interaction);
       }
     }
     switch (sub) {
@@ -4044,7 +4077,7 @@ export class Orchestrator {
   /**
    * Make a cross-thread MCP set visible in the target thread. This is
    * deliberately a platform concern: the core service owns the mutation;
-   * Discord owns the confirmation card and thread-name identity icon.
+   * Discord owns the confirmation card and data-driven thread-name prefix.
    */
   async presentThreadConfigurationChange(
     caller: SessionRecord,
@@ -4056,16 +4089,11 @@ export class Orchestrator {
       id: target.channelRef,
       ...(target.parentRef ? { parentId: target.parentRef } : {}),
     };
-    let threadIdentityUpdated = !outcome.changes.agent.changed;
+    const threadIdentityUpdated = outcome.threadIdentityUpdated !== false;
     const presentationWarnings: string[] = [];
 
-    if (outcome.changes.agent.changed) {
-      threadIdentityUpdated = await this.updateThreadAbbreviation(
-        channel,
-        outcome.changes.agent.before,
-        outcome.changes.agent.after
-      );
-      if (!threadIdentityUpdated) presentationWarnings.push("thread identity icon/name was not updated");
+    if (!threadIdentityUpdated) {
+      presentationWarnings.push("thread name was left untouched because its exact stored prefix boundary is unavailable");
     }
 
     const displayField = (field: { before: string; after: string; changed: boolean }) =>
@@ -4089,6 +4117,8 @@ export class Orchestrator {
         { name: "Agent", value: displayField(outcome.changes.agent), inline: true },
         { name: "Model", value: displayField(outcome.changes.model), inline: true },
         { name: "Effort", value: displayField(outcome.changes.effort), inline: true },
+        { name: "Role", value: displayField(outcome.changes.role), inline: true },
+        { name: "Auto-name", value: displayField(outcome.changes.disableThreadPrefix), inline: true },
         { name: "Runtime", value: runtime },
       ],
       ...(outcome.warnings.length
@@ -8939,6 +8969,7 @@ export class Orchestrator {
     // and a full wizard (agent/cwd/model/effort) can outlive that.
     try {
       const record = this.bindSessionToThread(thread);
+      await this.applyThreadName(record, { fresh: true });
       await i.editReply(`Created thread <#${thread.id}> and initialized it.`);
       if (this.config.NEW_THREAD_WIZARD === "full") {
         await this.runSetupWizard(thread, record);
@@ -9190,6 +9221,7 @@ export class Orchestrator {
     const cfg = this.store.readConfig(record);
     const current = cfg.model ?? this.config.DEFAULT_MODEL;
     if (id === current) {
+      await this.applyThreadName(this.store.get(record.id) ?? record);
       const message = `🧠 Model already set to \`${id}\` (no change).`;
       if (interaction) {
         await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
@@ -9232,6 +9264,7 @@ export class Orchestrator {
     } else {
       message = `🧠 Model will be \`${id}\` on the next turn.`;
     }
+    await this.applyThreadName(this.store.get(record.id) ?? record);
     if (interaction) {
       await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
     } else {
@@ -9258,6 +9291,227 @@ export class Orchestrator {
       }
     }
     await i.reply({ content: `Mode set to \`${id}\`.`, flags: MessageFlags.Ephemeral });
+  }
+
+  private async cmdRole(i: ChatInputCommandInteraction): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const raw = i.options.getString("value");
+    if (raw === null) {
+      const current = this.router.describeConfig(record).role;
+      await i.reply({
+        content: `Role: ${current.value ? `\`${current.value}\`` : "*(none)*"} (from ${current.source}).`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const role = raw.trim() && raw.trim().toLowerCase() !== "auto" ? raw.trim() : null;
+    const scope = (i.options.getString("scope") ?? "session") as "session" | "thread" | "channel";
+    const actor = { id: i.user.id, name: i.user.displayName ?? i.user.username };
+    if (scope === "channel") {
+      if (!record.parentRef) {
+        await i.reply({ content: "This thread has no parent channel.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (!Orchestrator.canEditChannelPreset(this.config, i.user.id, record.parentRef)) {
+        await i.reply({ content: "Channel-preset edits require a config admin.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const result = this.configMutation.applyChannelOverlay({
+        channelId: record.parentRef,
+        changes: { role },
+        actor,
+      });
+      if (!result.ok) {
+        await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await this.threadNamer.recompactChannel(PLATFORM, record.parentRef);
+    } else if (scope === "thread") {
+      const result = this.configMutation.applyThreadOverlay({
+        threadId: record.channelRef,
+        ...(record.parentRef ? { parentRef: record.parentRef } : {}),
+        changes: { role },
+        actor,
+      });
+      if (!result.ok) {
+        await i.reply({ content: result.error, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await this.applyThreadName(this.store.get(record.id) ?? record);
+    } else {
+      const cfg = this.store.readConfig(record);
+      if (role) cfg.role = role;
+      else delete cfg.role;
+      this.persistConfig(record, cfg);
+      await this.applyThreadName(this.store.get(record.id) ?? record);
+    }
+    const effective = this.router.describeConfig(this.store.get(record.id) ?? record).role;
+    await i.reply({
+      content: `Role ${role ? `set to \`${role}\`` : "cleared"}. Effective: ${effective.value ?? "none"} (from ${effective.source}).`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  private async cmdThreadRename(i: ChatInputCommandInteraction): Promise<void> {
+    const record = this.recordFromInteraction(i);
+    if (!record) {
+      await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const scope = i.options.getString("scope") ?? "thread";
+    const migrateLegacy = i.options.getBoolean("migrate-legacy") ?? false;
+    if (scope === "channel") {
+      if (!record.parentRef) {
+        await i.reply({ content: "This thread has no parent channel.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const results = await this.threadNamer.recompactChannel(PLATFORM, record.parentRef, { migrateLegacy });
+      const renamed = results.filter((result) => result.status === "renamed").length;
+      const skipped = results.filter((result) => result.status === "unmanaged" || result.status === "opted_out").length;
+      await i.reply({
+        content: `Recomputed ${results.length} channel thread(s): ${renamed} renamed, ${skipped} left untouched.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const result = await this.applyThreadName(record, { migrateLegacy });
+    const detail = result.status === "unmanaged"
+      ? "Name left untouched because its exact stored prefix boundary is unavailable. Use migrate-legacy:true for explicit cleanup."
+      : result.status === "opted_out"
+        ? "Name left untouched because automatic naming is disabled."
+        : result.status === "renamed"
+          ? `Renamed to ${result.name}.`
+          : "Name already matches.";
+    await i.reply({ content: detail, flags: MessageFlags.Ephemeral });
+  }
+
+  private async cmdNamerEditor(i: ChatInputCommandInteraction): Promise<void> {
+    const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+    if (admins && !admins.has(i.user.id)) {
+      await i.reply({
+        content: "The global thread-namer tables require a config admin.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const render = (error?: string) => {
+      const current = this.threadNamerConfig.get();
+      const preview = (text: string) => this.renderer.codeBlock(text || "(none)").slice(0, 1024);
+      return {
+        embeds: [
+          new EmbedBuilder()
+            .setTitle("🏷️ Thread namer")
+            .setColor(error ? 0xed4245 : 0x5865f2)
+            .setDescription(
+              error
+                ? `❌ ${error}\n\nNothing was saved.`
+                : "Ordered substring rules. First match wins; blank lines and `#` comments are ignored."
+            )
+            .addFields(
+              { name: "Agents", value: preview(formatThreadNamerRules(current.agents, "agent")) },
+              { name: "Models", value: preview(formatThreadNamerRules(current.models, "model")) },
+              { name: "Roles", value: preview(formatThreadNamerRules(current.roles, "role")) }
+            ),
+        ],
+        components: [
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId("namer:edit")
+              .setLabel("Edit match tables")
+              .setStyle(ButtonStyle.Primary)
+          ),
+        ],
+      };
+    };
+
+    await i.reply({ ...render(), flags: MessageFlags.Ephemeral });
+    const msg = await i.fetchReply();
+    const collector = msg.createMessageComponentCollector({
+      filter: (component) => component.user.id === i.user.id && component.customId === "namer:edit",
+      time: 600_000,
+    });
+    collector.on("collect", async (component) => {
+      if (!component.isButton()) return;
+      const current = this.threadNamerConfig.get();
+      const modal = new ModalBuilder().setCustomId("namer:save").setTitle("Thread namer rules");
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("agents")
+            .setLabel("Agent rules: match=emoji")
+            .setStyle(TextInputStyle.Paragraph)
+            .setMaxLength(4000)
+            .setValue(formatThreadNamerRules(current.agents, "agent"))
+            .setRequired(false)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("models")
+            .setLabel("Model rules: match=emoji @agent")
+            .setStyle(TextInputStyle.Paragraph)
+            .setMaxLength(4000)
+            .setValue(formatThreadNamerRules(current.models, "model"))
+            .setRequired(false)
+        ),
+        new ActionRowBuilder<TextInputBuilder>().addComponents(
+          new TextInputBuilder()
+            .setCustomId("roles")
+            .setLabel("Role rules: match=emoji")
+            .setStyle(TextInputStyle.Paragraph)
+            .setMaxLength(4000)
+            .setValue(formatThreadNamerRules(current.roles, "role"))
+            .setRequired(false)
+        )
+      );
+      await component.showModal(modal);
+      try {
+        const submit = await component.awaitModalSubmit({
+          time: 300_000,
+          filter: (candidate) => candidate.customId === "namer:save" && candidate.user.id === i.user.id,
+        });
+        try {
+          this.threadNamerConfig.save({
+            agents: parseThreadNamerRules(
+              submit.fields.getTextInputValue("agents"),
+              "agent"
+            ),
+            models: parseThreadNamerRules(
+              submit.fields.getTextInputValue("models"),
+              "model"
+            ),
+            roles: parseThreadNamerRules(
+              submit.fields.getTextInputValue("roles"),
+              "role"
+            ),
+          });
+          await submit.deferUpdate();
+          await this.refreshAllManagedThreadNames();
+          await i.editReply(render());
+        } catch (err) {
+          await submit.deferUpdate().catch(() => {});
+          await i.editReply(render(err instanceof Error ? err.message : String(err)));
+        }
+      } catch {
+        /* modal timeout */
+      }
+    });
+  }
+
+  private async refreshAllManagedThreadNames(): Promise<void> {
+    const records = this.store.list(this.store.countSessions());
+    const parents = new Set(
+      records.filter((record) => record.parentRef).map((record) => record.parentRef!)
+    );
+    for (const parent of parents) {
+      await this.threadNamer.recompactChannel(PLATFORM, parent);
+    }
+    for (const record of records.filter((candidate) => !candidate.parentRef)) {
+      await this.applyThreadName(record);
+    }
   }
 
   private async cmdEffort(i: ChatInputCommandInteraction): Promise<void> {
@@ -9370,6 +9624,7 @@ export class Orchestrator {
     if (this.router.hasRuntime(record.id)) {
       await this.router.invalidate(record.id, { clearAcpSession: false });
     }
+    await this.applyThreadName(this.store.get(record.id) ?? record);
   }
 
   /**
@@ -10029,6 +10284,7 @@ export class Orchestrator {
       acpSessionId: "",
       updatedUtc: new Date().toISOString(),
     });
+    await this.applyThreadName(this.store.get(record.id) ?? record);
     await i.reply({
       content:
         "Session reset. Your next message will start a fresh ACP session (history is gone, but config is kept).",
@@ -10139,6 +10395,7 @@ export class Orchestrator {
     const sameAgent = effectiveAgent === parsed.agentId;
     const sameLocation = currentLocation === nextLocation;
     if (sameAgent && sameLocation) {
+      await this.applyThreadName(this.store.get(record.id) ?? record);
       const msg = `Agent is already \`${formatAgentAtLocation(parsed.agentId, nextLocation)}\`.`;
       if (interaction) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
       else await this.adapter.sendMessage(channel, msg);
@@ -10192,9 +10449,8 @@ export class Orchestrator {
       this.logger.warn({ err: overlay.error, threadId: channel.id }, "thread agent overlay write failed");
     }
     bindSessionLocation(this.bridgeHub, record.id, nextLocation);
-    if (!sameAgent) {
-      await this.updateThreadAbbreviation(channel, record.agentId, parsed.agentId);
-    }
+    const renamedRecord = this.store.get(record.id) ?? { ...record, agentId: parsed.agentId };
+    await this.applyThreadName(renamedRecord);
     const at = formatAgentAtLocation(parsed.agentId, nextLocation);
     const message = `🤖 Agent switched to \`${at}\` (${profile.displayName}), model \`${cfg.model ?? profile.defaultModel}\`. Next message will start a fresh session.`;
     if (interaction) {
@@ -10254,16 +10510,9 @@ export class Orchestrator {
           ...(chan?.model?.value ? { model: chan.model.value } : {}),
           ...(chan?.cwd?.value ? { cwd: chan.cwd.value } : {}),
           ...(chan?.effort?.value ? { effort: chan.effort.value } : {}),
-          ...(chan?.threadSlug?.value ? { threadSlug: chan.threadSlug.value } : {}),
+          ...(chan?.role?.value ? { role: chan.role.value } : {}),
+          ...(chan?.disableThreadPrefix?.value === true ? { disableThreadPrefix: true } : {}),
         },
-        threadSlug: (() => {
-          const th = this.config.threadPresets.get(channel.id)?.threadSlug?.value;
-          if (th) return { value: th, source: "thread preset" as const };
-          if (chan?.threadSlug?.value) {
-            return { value: chan.threadSlug.value, source: "channel preset" as const };
-          }
-          return { value: null, source: "default" as const };
-        })(),
       },
       overlay: {},
       warnings: [],
@@ -10328,7 +10577,8 @@ export class Orchestrator {
           ? chan.statusCardStyle.value
           : "full",
       simpleCardGif: typeof chan?.simpleCardGif?.value === "boolean" ? chan.simpleCardGif.value : false,
-      threadSlug: chan?.threadSlug?.value ?? null,
+      role: chan?.role?.value ?? null,
+      disableThreadPrefix: chan?.disableThreadPrefix?.value === true,
     };
   }
 
@@ -10573,37 +10823,37 @@ export class Orchestrator {
       return;
     }
 
-    if (action === "slug-save" || (evt.kind === "modal" && action === "slug-save")) {
+    if (action === "role-save" || (evt.kind === "modal" && action === "role-save")) {
       await evt.deferUpdate();
-      const text = evt.fields?.slug ?? "";
-      const next = applyPickerValue(draft, "slug", text, this.capsForAgent);
+      const text = evt.fields?.role ?? "";
+      const next = applyPickerValue(draft, "role", text, this.capsForAgent);
       this.configEditor.put(next);
       await this.refreshConfigEditorHub(next);
       return;
     }
 
-    if (action === "slug") {
+    if (action === "role") {
       const channelScope = editScopeOf(draft);
       const current =
         channelScope
-          ? (draft.overlay.channelThreadSlug === undefined
-              ? draft.snapshot.channelPins?.threadSlug ?? ""
-              : draft.overlay.channelThreadSlug ?? "")
-          : (draft.overlay.threadSlug === undefined
-              ? draft.snapshot.threadSlug.value ?? ""
-              : draft.overlay.threadSlug ?? "");
+          ? (draft.overlay.channelRole === undefined
+              ? draft.snapshot.channelPins?.role ?? ""
+              : draft.overlay.channelRole ?? "")
+          : (draft.overlay.role === undefined
+              ? draft.snapshot.role.value ?? ""
+              : draft.overlay.role ?? "");
       await evt.showModal({
-        customId: makeCustomId(draft.id, "slug-save"),
-        title: channelScope ? "Channel thread slug" : "Thread slug",
+        customId: makeCustomId(draft.id, "role-save"),
+        title: channelScope ? "Channel role" : "Thread role",
         inputs: [
           {
-            id: "slug",
+            id: "role",
             label: channelScope
-              ? "Slug (empty = inherit/clear)"
-              : "Slug (empty = inherit)",
+              ? "Role (empty/auto = inherit)"
+              : "Role (empty/auto = inherit)",
             style: "short",
-            value: String(current).slice(0, 32) || undefined,
-            maxLength: 32,
+            value: String(current).slice(0, 64) || undefined,
+            maxLength: 64,
             required: false,
           },
         ],
@@ -10721,6 +10971,14 @@ export class Orchestrator {
         }
       }
       this.persistConfig(record, cfg);
+    }
+    const namingRecord = this.store.getByChannel(PLATFORM, draft.threadId);
+    if (plan.channelPreset && draft.parentRef) {
+      await this.threadNamer.recompactChannel(PLATFORM, draft.parentRef).catch((err) =>
+        this.logger.warn({ err, parentRef: draft.parentRef }, "thread namer: channel editor apply failed")
+      );
+    } else if (namingRecord) {
+      await this.applyThreadName(namingRecord);
     }
     // D10: do NOT abort or invalidate a live turn. Overlay applies on next spawn.
     this.configEditor.delete(draft.id);
@@ -10955,6 +11213,23 @@ export class Orchestrator {
                 description: "No GIF — overrides channel",
               },
             ],
+        authorizedUserIds: owner,
+      });
+    } else if (action === "prefix") {
+      picked = await this.adapter.sendChoicePicker!(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: channelScope ? "🏷️ Channel automatic naming" : "🏷️ Thread automatic naming",
+          fields: [{
+            name: "Current",
+            value: draft.snapshot.disableThreadPrefix.value ? "`disabled`" : "`enabled`",
+            inline: true,
+          }],
+        },
+        choices: [
+          { value: "enabled", label: "Enabled", description: "Allow managed thread prefixes" },
+          { value: "disabled", label: "Disabled", description: "Leave thread names completely untouched" },
+        ],
         authorizedUserIds: owner,
       });
     } else if (action === "attach") {
@@ -11486,7 +11761,7 @@ export class Orchestrator {
         acpSessionId: newSessionId,
         updatedUtc: new Date().toISOString(),
       });
-      await this.renameThreadForSetup(channelRef, record);
+      await this.applyThreadName(this.store.get(record.id) ?? record);
       return { newSessionId, summary: summaryText };
     } finally {
       if (transcriptFile) await fsp.unlink(transcriptFile).catch(() => {});
@@ -11539,7 +11814,7 @@ export class Orchestrator {
         "thread migration overlay write failed"
       );
     }
-    await this.updateThreadAbbreviation(channel, record.agentId, agentId);
+    await this.applyThreadName(this.store.get(record.id) ?? { ...record, agentId });
 
     const freshRecord = this.store.get(record.id);
     if (!freshRecord) throw new Error(`Session record \`${record.id}\` disappeared during migration.`);
@@ -12910,7 +13185,7 @@ export class Orchestrator {
                 id: record.channelRef,
                 parentId: record.parentRef || undefined,
               };
-              await this.updateThreadAbbreviation(channel, record.agentId, targetAgentId);
+              await this.applyThreadName(this.store.get(record.id) ?? record);
 
               const successEmbed = new EmbedBuilder()
                 .setTitle("🎉 Session Migrated Successfully!")
@@ -13020,6 +13295,7 @@ export class Orchestrator {
     else if (action === "exclude") cfg.excludedTools = list;
     this.persistConfig(record, cfg);
     await this.router.invalidate(record.id);
+    await this.applyThreadName(this.store.get(record.id) ?? record);
     await i.reply({
       content: `Tool ${action} list: ${list.length === 0 ? "(cleared)" : "`" + list.join(", ") + "`"}. Next turn starts a fresh runtime.`,
       flags: MessageFlags.Ephemeral,
@@ -15605,197 +15881,22 @@ export class Orchestrator {
     );
   }
 
-  /** DB preset slug, else this thread's overlay, else the parent channel. */
-  private effectiveThreadSlug(opts: {
-    preset?: { threadSlug?: string | null } | null;
-    threadId?: string;
-    parentId?: string;
-  }): string | undefined {
-    return resolveEffectiveSlug({
-      presetSlug: opts.preset?.threadSlug,
-      threadSlug: opts.threadId
-        ? this.config.threadPresets.get(opts.threadId)?.threadSlug?.value
-        : undefined,
-      channelSlug: opts.parentId
-        ? this.config.channelPresets.get(opts.parentId)?.threadSlug?.value
-        : undefined,
-    });
-  }
-
-  /** Names of seam-bound sibling threads (same source as MCP `threads()`). */
-  private async listSiblingThreadNames(
-    parentRef: string,
-    excludeChannelRef?: string
-  ): Promise<string[]> {
-    const siblings = this.store.listSessionsByParent(PLATFORM, parentRef);
-    const names: string[] = [];
-    for (const s of siblings) {
-      if (excludeChannelRef && s.channelRef === excludeChannelRef) continue;
-      try {
-        const name = await this.adapter.getThreadName?.({
-          platform: s.platform,
-          id: s.channelRef,
-        });
-        if (name) names.push(name);
-      } catch {
-        /* skip a failed lookup */
-      }
-    }
-    return names;
-  }
-
-  /**
-   * After applying a preset, auto-number this thread from the effective slug.
-   * Keeps an existing `[slug] [n]` number; allocates only for empty/default
-   * names; never clobbers a custom title.
-   */
-  private async maybeRenameThreadForSlug(
-    channel: ChannelRef,
-    record: SessionRecord,
-    preset: Preset
-  ): Promise<string | undefined> {
-    if (!this.adapter.renameThread) return undefined;
-    if (!channel.parentId) return undefined;
-    const slug = this.effectiveThreadSlug({
-      preset,
-      threadId: channel.id,
-      parentId: channel.parentId,
-    });
-    if (!slug) return undefined;
-    const abbr = this.router.getProfile(record.agentId)?.threadAbbr;
-    let current: string | undefined;
-    try {
-      current = await this.adapter.getThreadName?.(channel);
-    } catch {
-      current = undefined;
-    }
-    if (current && isSlugNumberedName(current, slug)) {
-      const n = parseSlugThreadNumber(current, slug);
-      if (n === null) return undefined;
-      const next = buildThreadName(abbr, slug, n);
-      if (next !== current) {
-        try {
-          await this.adapter.renameThread(channel, next);
-        } catch (err) {
-          this.logger.warn({ err }, "slug rename failed");
-        }
-      }
-      return undefined;
-    }
-    if (!isEmptyOrDefaultThreadName(current, abbr)) return undefined;
-    const siblingNames = await this.listSiblingThreadNames(channel.parentId, channel.id);
-    const n = nextThreadNumber(siblingNames, slug);
-    if (n === null) {
-      return `⚠️ Couldn't auto-name this thread — ${THREAD_LIMIT_MESSAGE}`;
-    }
-    const next = buildThreadName(abbr, slug, n);
-    try {
-      await this.adapter.renameThread(channel, next);
-    } catch (err) {
-      this.logger.warn({ err }, "slug rename failed");
-    }
-    return undefined;
-  }
-
-  /**
-   * Rename a thread to "<repo-basename> [<agent-abbr>]" after setup.
-   * Best-effort: silently skipped if the adapter, channel, or profile doesn't
-   * support it.
-   */
+  /** Replace the untouched `seam` base after the setup repo is known. */
   private async renameThreadForSetup(
     channel: ChannelRef,
     record: SessionRecord
   ): Promise<void> {
-    if (!this.adapter.renameThread) return;
-    if (!channel.parentId) return; // not a thread
+    if (!this.adapter.renameThread || !this.adapter.getThreadName || !channel.parentId) return;
     const repoPath = record.repoPath;
     if (!repoPath) return;
-    const profile = this.router.getProfile(record.agentId);
-    const abbr = profile?.threadAbbr;
-    if (!abbr) return;
-    // Only rename if the thread still has the default "seam" name; skip if
-    // the user already gave it a custom name when running /seam new.
-    let current: string | undefined;
-    if (this.adapter.getThreadName) {
-      // Adapter strips obfuscated `___hidden___` names (#52); undefined ≠ a
-      // custom title, so we still try the wizard rename.
-      current = await this.adapter.getThreadName(channel);
-      if (current !== undefined && current !== "seam") return;
-    }
-    const repoDisplayStr = this.repoDisplay(repoPath);
-    const newName = `${repoDisplayStr} ${abbr}`;
-    this.logger.info({ channelId: channel.id, oldName: current, newName }, "Renaming thread");
     try {
-      await this.adapter.renameThread(channel, newName);
+      const current = await this.adapter.getThreadName(channel);
+      if (current === undefined || record.namePrefix === null || record.namePrefix === undefined) return;
+      const base = stripStoredThreadPrefix(current, record.namePrefix);
+      if (base?.toLowerCase() !== "seam") return;
+      await this.renameThreadBase(record, this.repoDisplay(repoPath));
     } catch (err) {
-      this.logger.warn({ err }, "wizard: renameThread failed");
-    }
-  }
-
-  /**
-   * Update the thread name abbreviation when migrating or switching agents.
-   * Replaces any known agent abbreviations in brackets (e.g. [agy]) with the new target agent's abbreviation.
-   */
-  private async updateThreadAbbreviation(
-    channel: ChannelRef,
-    oldAgentId: string,
-    newAgentId: string
-  ): Promise<boolean> {
-    if (!this.adapter.getThreadName || !this.adapter.renameThread || !channel.parentId) {
-      return false;
-    }
-    try {
-      const currentName = await this.adapter.getThreadName(channel);
-      if (!currentName) return false;
-
-      const targetProfile = this.router.getProfile(newAgentId);
-      const targetAbbr = targetProfile?.threadAbbr;
-      if (!targetAbbr) return false;
-      if (currentName.startsWith(targetAbbr)) return true;
-
-      const allAbbrs = this.router.listProfiles()
-        .map((p) => p.threadAbbr)
-        .filter((abbr): abbr is string => typeof abbr === "string" && abbr.length > 0)
-        .filter((abbr) => abbr.toLowerCase() !== targetAbbr.toLowerCase());
-
-      let newName = currentName;
-      let replaced = false;
-
-      for (const abbr of allAbbrs) {
-        // Case-insensitive replace so a thread named "… [AGY]" still matches the
-        // "agy" abbreviation. Escape the abbr for the RegExp; a single .replace
-        // pass also avoids the old indexOf-loop's infinite loop when a target
-        // abbreviation contains the one being replaced.
-        const re = new RegExp(abbr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
-        const next = newName.replace(re, targetAbbr);
-        if (next !== newName) {
-          newName = next;
-          replaced = true;
-        }
-      }
-
-      // A custom thread may not carry any known previous abbreviation. Stamp
-      // the new identity instead of silently leaving it iconless.
-      if (!replaced) {
-        newName = prefixThreadNameWithAgentEmoji(currentName, targetAbbr);
-        replaced = newName !== currentName;
-      }
-
-      if (replaced && newName !== currentName) {
-        await this.adapter.renameThread(channel, newName);
-        this.logger.info(
-          { channelId: channel.id, oldName: currentName, newName },
-          "Updated thread name abbreviation on agent transition"
-        );
-        return true;
-      }
-      return currentName.startsWith(targetAbbr);
-    } catch (err) {
-      this.logger.warn(
-        { err, channelId: channel.id },
-        "Failed to update thread name abbreviation"
-      );
-      return false;
+      this.logger.warn({ err, channelId: channel.id }, "wizard: thread naming failed");
     }
   }
 
@@ -15941,7 +16042,8 @@ export class Orchestrator {
     if (p.model) parts.push(`Model: ${p.model}`);
     if (p.effort) parts.push(`Effort: ${p.effort}`);
     if (p.repoPath) parts.push(`Repo: ${this.repoDisplay(p.repoPath)}`);
-    if (p.threadSlug) parts.push(`Slug: ${p.threadSlug}`);
+    if (p.role) parts.push(`Role: ${p.role}`);
+    if (p.disableThreadPrefix) parts.push("Auto-name: disabled");
     if (p.permission) parts.push(`Policy: ${p.permission}`);
     if (p.statusCardStyle) parts.push(`Card: ${p.statusCardStyle}`);
     if (p.toolsAllow?.length) parts.push(`Allow: ${p.toolsAllow.join(", ")}`);
@@ -16112,8 +16214,8 @@ export class Orchestrator {
     // makes it a global preset visible in every project.
     const global = i.options.getBoolean("global") ?? false;
     const createScope = global ? null : this.projectScopeId(i) ?? null;
-    const seedSlug = i.options.getString("slug");
-    await this.cmdPresetBuilder(i, undefined, createScope, seedSlug);
+    const seedRole = i.options.getString("role");
+    await this.cmdPresetBuilder(i, undefined, createScope, seedRole);
   }
 
   private async cmdPresetEdit(i: ChatInputCommandInteraction): Promise<void> {
@@ -16134,7 +16236,7 @@ export class Orchestrator {
     i: ChatInputCommandInteraction | MessageComponentInteraction,
     existing?: Preset,
     createScope?: string | null,
-    seedSlug?: string | null
+    seedRole?: string | null
   ): Promise<void> {
     const profiles = this.router.listProfiles();
 
@@ -16156,7 +16258,8 @@ export class Orchestrator {
       toolsExclude: string[] | null;
       instructions: string | null;
       statusCardStyle: StatusCardStyle | null;
-      threadSlug: string | null;
+      role: string | null;
+      disableThreadPrefix: boolean | null;
     } = {
       name: existing?.name ?? "",
       description: existing?.description ?? "",
@@ -16169,7 +16272,8 @@ export class Orchestrator {
       toolsExclude: existing?.toolsExclude ?? null,
       instructions: existing?.instructions ?? null,
       statusCardStyle: existing?.statusCardStyle ?? null,
-      threadSlug: existing?.threadSlug ?? normalizeThreadSlug(seedSlug ?? "") ?? null,
+      role: existing?.role ?? (seedRole?.trim() || null),
+      disableThreadPrefix: existing?.disableThreadPrefix ?? null,
     };
 
     // Do not start an ACP session in this builder. staticModels first; agy
@@ -16217,7 +16321,8 @@ export class Orchestrator {
           { name: "🧠 Model", value: modelDisplay, inline: true },
           { name: "⚡ Effort", value: effortDisplay, inline: true },
           { name: "📂 Repo", value: repoDisplay, inline: true },
-          { name: "🔤 Slug", value: state.threadSlug ? `\`${state.threadSlug}\`` : "*(none)*", inline: true },
+          { name: "🎭 Role", value: state.role ? `\`${state.role}\`` : "*(none)*", inline: true },
+          { name: "🏷️ Auto-name", value: state.disableThreadPrefix ? "disabled" : "enabled", inline: true },
           { name: "🔒 Permission", value: permDisplay, inline: true },
           { name: "🃏 Status card", value: cardDisplay, inline: true },
           { name: "🔧 Tools", value: toolsDisplay },
@@ -16332,14 +16437,14 @@ export class Orchestrator {
           .setLabel(state.statusCardStyle ? `🃏 ${state.statusCardStyle}` : "🃏 Card")
           .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
+          .setCustomId("preset:naming")
+          .setLabel("🏷️ Naming")
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
           .setCustomId("preset:save")
           .setLabel(existing ? "💾 Save" : "✅ Create")
           .setStyle(ButtonStyle.Success)
           .setDisabled(!state.name),
-        new ButtonBuilder()
-          .setCustomId("preset:cancel")
-          .setLabel("Cancel")
-          .setStyle(ButtonStyle.Secondary)
       );
 
       return {
@@ -16465,15 +16570,6 @@ export class Orchestrator {
                 .setValue(state.instructions ?? "")
                 .setRequired(false)
             ),
-            new ActionRowBuilder<TextInputBuilder>().addComponents(
-              new TextInputBuilder()
-                .setCustomId("slug")
-                .setLabel("Thread slug (auto-numbered names)")
-                .setStyle(TextInputStyle.Short)
-                .setMaxLength(32)
-                .setValue(state.threadSlug ?? "")
-                .setRequired(false)
-            )
           );
           await c.showModal(modal);
           try {
@@ -16483,7 +16579,6 @@ export class Orchestrator {
             });
             state.name = submit.fields.getTextInputValue("name").trim();
             state.description = submit.fields.getTextInputValue("desc").trim();
-            state.threadSlug = normalizeThreadSlug(submit.fields.getTextInputValue("slug"));
             const permVal = submit.fields
               .getTextInputValue("permission")
               .trim()
@@ -16494,6 +16589,47 @@ export class Orchestrator {
                 : null;
             const instrVal = submit.fields.getTextInputValue("instr").trim();
             state.instructions = instrVal || null;
+            await submit.deferUpdate();
+            await i.editReply(render());
+          } catch { /* modal timeout */ }
+        } else if (c.isButton() && c.customId === "preset:naming") {
+          const modal = new ModalBuilder()
+            .setCustomId("preset:naming-modal")
+            .setTitle("Preset naming");
+          modal.addComponents(
+            new ActionRowBuilder<TextInputBuilder>().addComponents(
+              new TextInputBuilder()
+                .setCustomId("role")
+                .setLabel("Role (empty / auto = none)")
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(64)
+                .setValue(state.role ?? "")
+                .setRequired(false)
+            ),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(
+              new TextInputBuilder()
+                .setCustomId("disable")
+                .setLabel("Disable auto-name? yes / no")
+                .setStyle(TextInputStyle.Short)
+                .setMaxLength(3)
+                .setValue(state.disableThreadPrefix ? "yes" : "no")
+                .setRequired(false)
+            )
+          );
+          await c.showModal(modal);
+          try {
+            const submit = await c.awaitModalSubmit({
+              time: 300_000,
+              filter: (m) => m.customId === "preset:naming-modal",
+            });
+            const rawRole = submit.fields.getTextInputValue("role").trim();
+            state.role = !rawRole || rawRole.toLowerCase() === "auto" ? null : rawRole;
+            const rawDisable = submit.fields.getTextInputValue("disable").trim().toLowerCase();
+            state.disableThreadPrefix = rawDisable === "yes" || rawDisable === "true"
+              ? true
+              : rawDisable === "no" || rawDisable === "false" || rawDisable === ""
+                ? null
+                : state.disableThreadPrefix;
             await submit.deferUpdate();
             await i.editReply(render());
           } catch { /* modal timeout */ }
@@ -16596,7 +16732,8 @@ export class Orchestrator {
             toolsExclude: state.toolsExclude,
             instructions: state.instructions,
             statusCardStyle: state.statusCardStyle,
-            threadSlug: state.threadSlug,
+            role: state.role,
+            disableThreadPrefix: state.disableThreadPrefix,
             createdBy: existing?.createdBy ?? i.user.id,
             createdUtc: existing?.createdUtc ?? now,
             updatedUtc: now,
@@ -16648,7 +16785,7 @@ export class Orchestrator {
    * `/seam preset thread` (#93): create NEW thread(s) under the parent channel
    * (sibling if invoked inside a thread — same path as `/seam new`) and bind
    * the picked preset's full config onto each session. `quantity` > 1 allocates
-   * sequential slug numbers without colliding in-loop and never exceeds 9.
+   * stable role-group numbers without colliding in-loop.
    */
   private async cmdPresetThread(i: ChatInputCommandInteraction): Promise<void> {
     const rawName = i.options.getString("name") ?? "";
@@ -16686,7 +16823,7 @@ export class Orchestrator {
     const quantityRaw = i.options.getInteger("quantity");
     const quantity =
       typeof quantityRaw === "number" && Number.isInteger(quantityRaw)
-        ? Math.min(THREAD_NUMBER_MAX, Math.max(1, quantityRaw))
+        ? Math.max(1, quantityRaw)
         : 1;
     // `name` is only honored for a single spawn.
     const name = quantity === 1 ? rawName.trim() : "";
@@ -16694,61 +16831,30 @@ export class Orchestrator {
       i.channel && "isThread" in i.channel && typeof i.channel.isThread === "function" && i.channel.isThread()
         ? (typeof i.channel.parentId === "string" ? i.channel.parentId : i.channelId)
         : i.channelId;
-    // New thread has no overlay yet — DB preset slug, else the parent channel's.
-    const slug = this.effectiveThreadSlug({
-      preset,
-      parentId,
-    });
-    const abbr = preset.agentId
-      ? this.router.getProfile(preset.agentId)?.threadAbbr
-      : undefined;
+    const effectiveRole = preset.role ?? this.config.channelPresets.get(parentId)?.role?.value ?? null;
 
     // Discord requires an initial acknowledgement within three seconds. Auto-
     // naming may need to inspect many sibling threads, so acknowledge before
     // that I/O instead of letting large projects intermittently expire here.
     await i.deferReply({ flags: MessageFlags.Ephemeral });
 
-    if (quantity > 1 && !slug) {
-      await i.editReply("Multiple threads need a preset slug.");
+    if (quantity > 1 && !effectiveRole) {
+      await i.editReply("Multiple threads need a role so their prefixes can be enumerated.");
       return;
     }
 
-    const plannedNames: string[] = [];
-    if (name) {
-      plannedNames.push(prefixThreadNameWithAgentEmoji(name, abbr));
-    } else if (slug) {
-      const used = await this.listSiblingThreadNames(parentId);
-      for (let k = 0; k < quantity; k++) {
-        const n = nextThreadNumber(used, slug);
-        if (n === null) break;
-        const threadName = buildThreadName(abbr, slug, n);
-        used.push(threadName);
-        plannedNames.push(threadName);
-      }
-      if (plannedNames.length === 0) {
-        await i.editReply(
-          quantity === 1
-            ? `Couldn't create the thread — ${THREAD_LIMIT_MESSAGE}`
-            : `Created 0 of ${quantity} — the limit (9) for this kind of thread was reached.`
-        );
-        return;
-      }
-    } else {
-      await i.editReply("Give the new thread a name.");
-      return;
-    }
+    const baseName = name || preset.name || "seam";
 
     const created: ChannelRef[] = [];
     let lastSummary = "";
     try {
-      for (const threadName of plannedNames) {
-        const thread = await this.createChildThread(i.channelId, threadName, i.user.id);
+      for (let index = 0; index < quantity; index += 1) {
+        const thread = await this.createChildThread(i.channelId, baseName, i.user.id);
         const record = this.bindSessionToThread(thread);
-        lastSummary = await this.applyPresetToSession(thread, record, preset);
+        lastSummary = await this.applyPresetToSession(thread, record, preset, { fresh: true });
         this.startPresetOpeningTurn(thread, record, preset, i.user.id);
         created.push(thread);
       }
-      const hitLimit = plannedNames.length < quantity;
       if (created.length === 1 && quantity === 1) {
         await i.editReply(
           `🧵 Created <#${created[0]!.id}> from preset **${preset.name}**.\n${lastSummary}`
@@ -16756,9 +16862,7 @@ export class Orchestrator {
         return;
       }
       const links = created.map((t) => `• <#${t.id}>`).join("\n");
-      const header = hitLimit
-        ? `🧵 Created ${created.length} of ${quantity} from preset **${preset.name}** — the limit (9) for this kind of thread was reached.`
-        : `🧵 Created ${created.length} threads from preset **${preset.name}**:`;
+      const header = `🧵 Created ${created.length} threads from preset **${preset.name}**:`;
       await i.editReply(links ? `${header}\n${links}` : header);
     } catch (err) {
       this.logger.warn({ err }, "/seam preset thread failed");
@@ -16816,7 +16920,8 @@ export class Orchestrator {
   private async applyPresetToSession(
     channel: ChannelRef,
     record: SessionRecord,
-    preset: Preset
+    preset: Preset,
+    options: { fresh?: boolean } = {}
   ): Promise<string> {
     const changes: string[] = [];
     const notes: string[] = [];
@@ -16829,7 +16934,6 @@ export class Orchestrator {
       if (!profile) {
         notes.push(`⚠️ Unknown agent \`${preset.agentId}\` — agent left unchanged.`);
       } else {
-        const previousAgentId = record.agentId;
         await this.router.invalidate(record.id);
         const cfg = this.store.readConfig(record);
         cfg.model = profile.defaultModel;
@@ -16843,7 +16947,6 @@ export class Orchestrator {
           updatedUtc: new Date().toISOString(),
         });
         record = this.store.get(record.id) ?? record;
-        await this.updateThreadAbbreviation(channel, previousAgentId, preset.agentId);
         changes.push(`Agent → \`${preset.agentId}\` (model \`${profile.defaultModel}\`)`);
       }
     }
@@ -16876,6 +16979,16 @@ export class Orchestrator {
           `⚠️ Effort \`${preset.effort}\` skipped — \`${record.agentId}\` has no settable reasoning effort.`
         );
       }
+    }
+
+    if (preset.role) {
+      cfg.role = preset.role;
+      changes.push(`Role → \`${preset.role}\``);
+    }
+    if (preset.disableThreadPrefix !== null) {
+      if (preset.disableThreadPrefix) cfg.disableThreadPrefix = true;
+      else delete cfg.disableThreadPrefix;
+      changes.push(`Auto-name → ${preset.disableThreadPrefix ? "disabled" : "enabled"}`);
     }
 
     if (preset.permission) {
@@ -16927,8 +17040,7 @@ export class Orchestrator {
     await this.router.invalidate(record.id);
 
     const liveAfter = this.store.get(record.id) ?? record;
-    const renameNote = await this.maybeRenameThreadForSlug(channel, liveAfter, preset);
-    if (renameNote) notes.push(renameNote);
+    await this.applyThreadName(liveAfter, { fresh: options.fresh === true });
 
     const body =
       changes.length > 0
@@ -16954,7 +17066,8 @@ export class Orchestrator {
         { name: "🧠 Model", value: preset.model ? `\`${preset.model}\`` : "*(default)*", inline: true },
         { name: "⚡ Effort", value: preset.effort ?? "*(default)*", inline: true },
         { name: "📂 Repo", value: preset.repoPath ? `\`${this.repoDisplay(preset.repoPath)}\`` : "*(default)*", inline: true },
-        { name: "🔤 Slug", value: preset.threadSlug ? `\`${preset.threadSlug}\`` : "*(none)*", inline: true },
+        { name: "🎭 Role", value: preset.role ? `\`${preset.role}\`` : "*(none)*", inline: true },
+        { name: "🏷️ Auto-name", value: preset.disableThreadPrefix ? "disabled" : "enabled", inline: true },
         { name: "🔒 Permission", value: preset.permission ?? "*(default)*", inline: true },
         { name: "🃏 Status card", value: preset.statusCardStyle ?? "*(default)*", inline: true },
         { name: "🔧 Tools allow", value: preset.toolsAllow?.join(", ") || "*(all)*" },

@@ -74,7 +74,6 @@ export function makeClaudeProfile(opts: {
    */
   configDir?: string;
   staticModels?: ReadonlyArray<AdapterModel>;
-  threadAbbr?: string;
   /** Default model id for sessions on this profile (e.g. "claude-sonnet-4.5"). */
   defaultModel: string;
   /**
@@ -130,7 +129,6 @@ export function makeClaudeProfile(opts: {
     staticModels: opts.staticModels
       ? withClaudeContextLimits(opts.staticModels)
       : undefined,
-    threadAbbr: opts.threadAbbr,
     configDir,
     // Effort is applied via `_meta.claudeCode.options.effort` in newSessionMeta.
     // Overridable for non-Anthropic backends (e.g. Ollama → mechanism "none").

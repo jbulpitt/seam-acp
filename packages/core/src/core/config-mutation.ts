@@ -61,6 +61,10 @@ export type ConfigMutationTier =
 export interface SessionConfigChanges {
   agent?: string;
   model?: string;
+  /** Free-form naming role; null/empty/auto clears it. */
+  role?: string | null;
+  /** Thread-local automatic naming opt-out; null/false clears it. */
+  disableThreadPrefix?: boolean | null;
   /** `null` clears the session-level effort override. */
   effort?: string | null;
   cwd?: string;
@@ -92,6 +96,8 @@ export interface PresetChanges {
   name: string;
   agent?: string;
   model?: string;
+  role?: string | null;
+  disableThreadPrefix?: boolean | null;
   effort?: string | null;
   description?: string | null;
   permission?: PermissionPolicyMode;
@@ -108,8 +114,6 @@ export interface PresetChanges {
   instructions?: string | null;
   /** Status-card layout baked into this preset. `null` clears (preset does not pin it). */
   statusCardStyle?: StatusCardStyle | null;
-  /** Auto-numbering slug for `/seam preset thread`. `null` clears. */
-  threadSlug?: string | null;
 }
 
 /** Tier C — the calling thread's OWN channel preset (channel-presets.json).
@@ -119,6 +123,8 @@ export interface PresetChanges {
 export interface ChannelPresetChanges {
   agent?: string | null;
   model?: string | null;
+  role?: string | null;
+  disableThreadPrefix?: boolean | null;
   cwd?: string | null;
   effort?: string | null;
   rider?: string | null;
@@ -126,8 +132,6 @@ export interface ChannelPresetChanges {
   statusCardStyle?: StatusCardStyle | null;
   /** Channel-wide simple-card GIF. Inherited live; session/thread overlay still wins. */
   simpleCardGif?: boolean | null;
-  /** Channel-wide thread slug for auto-numbered names. */
-  threadSlug?: string | null;
 }
 
 /** Tier C — the calling thread's OWN thread preset (channel-presets.json
@@ -146,6 +150,8 @@ export interface ChannelPresetChanges {
 export interface ThreadPresetChanges {
   agent?: string | null;
   model?: string | null;
+  role?: string | null;
+  disableThreadPrefix?: boolean | null;
   cwd?: string | null;
   effort?: string | null;
   rider?: string | null;
@@ -153,8 +159,6 @@ export interface ThreadPresetChanges {
   statusCardStyle?: StatusCardStyle | null;
   /** Thread-preset simple-card GIF overlay. */
   simpleCardGif?: boolean | null;
-  /** Thread-preset slug; overrides the channel slug for this thread. */
-  threadSlug?: string | null;
   detached?: boolean;
   location?: string | null;
   tts?: boolean;
@@ -786,6 +790,31 @@ export class ConfigMutationService {
       }
     }
 
+    if (changes.role !== undefined) {
+      const requested = changes.role?.trim() ?? "";
+      const nextRole = !requested || requested.toLowerCase() === "auto" ? null : requested;
+      const beforeRole = typeof cfg.role === "string" && cfg.role.trim() ? cfg.role.trim() : null;
+      if (nextRole) nextCfg.role = nextRole;
+      else delete nextCfg.role;
+      if (beforeRole !== nextRole) {
+        fields.push({ label: "role", before: beforeRole ?? "(none)", after: nextRole ?? "(none)" });
+      }
+    }
+
+    if (changes.disableThreadPrefix !== undefined) {
+      const nextDisabled = changes.disableThreadPrefix === true;
+      const beforeDisabled = cfg.disableThreadPrefix === true;
+      if (nextDisabled) nextCfg.disableThreadPrefix = true;
+      else delete nextCfg.disableThreadPrefix;
+      if (beforeDisabled !== nextDisabled) {
+        fields.push({
+          label: "disableThreadPrefix",
+          before: beforeDisabled ? "on" : "off",
+          after: nextDisabled ? "on" : "off",
+        });
+      }
+    }
+
     // effort — validate against the RESOLVED agent (Trap 2).
     if (changes.effort !== undefined) {
       if (changes.effort === null || changes.effort === "") {
@@ -988,7 +1017,8 @@ export class ConfigMutationService {
         const eff =
           `Applied. Effective now: model ${effective.model.value} (from ${effective.model.source}), ` +
           `agent ${effective.agent.value} (from ${effective.agent.source}), ` +
-          `effort ${effective.effort.value ?? "none"} (from ${effective.effort.source}).`;
+          `effort ${effective.effort.value ?? "none"} (from ${effective.effort.source}), ` +
+          `role ${effective.role.value ?? "none"} (from ${effective.role.source}).`;
         return { ok: true, message: eff, auditId: audit.id };
       },
     };
@@ -1081,12 +1111,17 @@ export class ConfigMutationService {
         nextStatusCardStyle = parsed;
       }
     }
-    const nextThreadSlug =
-      changes.threadSlug === null
+    const requestedRole = changes.role?.trim();
+    const nextRole = changes.role === undefined
+      ? (existing?.role ?? null)
+      : !requestedRole || requestedRole.toLowerCase() === "auto"
         ? null
-        : changes.threadSlug !== undefined
-          ? (changes.threadSlug.trim() || null)
-          : (existing?.threadSlug ?? null);
+        : requestedRole;
+    const nextDisableThreadPrefix = changes.disableThreadPrefix === undefined
+      ? (existing?.disableThreadPrefix ?? null)
+      : changes.disableThreadPrefix === null
+        ? null
+        : changes.disableThreadPrefix;
 
     if (nextEffort) {
       const profile = nextAgentId ? this.deps.profiles.get(nextAgentId) : undefined;
@@ -1116,7 +1151,14 @@ export class ConfigMutationService {
     field("toolsAllow", listStr(existing?.toolsAllow ?? null), listStr(nextToolsAllow));
     field("toolsExclude", listStr(existing?.toolsExclude ?? null), listStr(nextToolsExclude));
     field("statusCardStyle", existing?.statusCardStyle ?? null, nextStatusCardStyle);
-    field("threadSlug", existing?.threadSlug ?? null, nextThreadSlug);
+    field("role", existing?.role ?? null, nextRole);
+    field(
+      "disableThreadPrefix",
+      existing?.disableThreadPrefix === null || existing?.disableThreadPrefix === undefined
+        ? null
+        : String(existing.disableThreadPrefix),
+      nextDisableThreadPrefix === null ? null : String(nextDisableThreadPrefix)
+    );
     // instructions can be long/multiline — compare the FULL value so a change past
     // the clip point isn't hidden, but show only a clipped one-liner in the diff.
     if ((existing?.instructions ?? null) !== nextInstructions) {
@@ -1157,7 +1199,8 @@ export class ConfigMutationService {
           toolsExclude: nextToolsExclude,
           instructions: nextInstructions,
           statusCardStyle: nextStatusCardStyle,
-          threadSlug: nextThreadSlug,
+          role: nextRole,
+          disableThreadPrefix: nextDisableThreadPrefix,
           createdBy: existing?.createdBy ?? (actor.id ?? "seam-mcp"),
           createdUtc: existing?.createdUtc ?? now,
           updatedUtc: now,
@@ -1313,12 +1356,13 @@ export class ConfigMutationService {
     const keys: Array<keyof ChannelPresetChanges> = [
       "agent",
       "model",
+      "role",
+      "disableThreadPrefix",
       "cwd",
       "effort",
       "rider",
       "statusCardStyle",
       "simpleCardGif",
-      "threadSlug",
     ];
     const fields: ProposedField[] = [];
     const next: Record<string, unknown> = { ...current };
@@ -1326,13 +1370,19 @@ export class ConfigMutationService {
       const val = changes[key];
       if (val === undefined) continue; // field not part of this proposal
       const beforeVal = (current[key] as { value?: unknown } | undefined)?.value ?? null;
-      if (val === null || val === "") {
+      const clearsRole = key === "role" && typeof val === "string" && val.trim().toLowerCase() === "auto";
+      const clearsOptOut = key === "disableThreadPrefix" && val === false;
+      if (val === null || val === "" || clearsRole || clearsOptOut) {
         delete next[key];
         if (beforeVal !== null) {
           fields.push({ label: key, before: fmtOverlay(beforeVal), after: "(removed)" });
         }
       } else {
-        const resolved = key === "cwd" && typeof val === "string" ? path.resolve(val) : val;
+        const resolved = key === "cwd" && typeof val === "string"
+          ? path.resolve(val)
+          : key === "role" && typeof val === "string"
+            ? val.trim()
+            : val;
         next[key] = { value: resolved };
         if (beforeVal !== resolved) {
           fields.push({
@@ -1506,7 +1556,10 @@ export class ConfigMutationService {
     // The parent channel's entry, used ONLY to detect Trap-1 shadowing below.
     const channelEntry = parentRef ? doc.channels?.[parentRef] : undefined;
 
-    const keys = ["agent", "model", "cwd", "effort", "rider", "statusCardStyle", "simpleCardGif", "threadSlug"] as const;
+    const keys = [
+      "agent", "model", "role", "disableThreadPrefix", "cwd", "effort", "rider",
+      "statusCardStyle", "simpleCardGif",
+    ] as const;
     const fields: ProposedField[] = [];
     const warnings: string[] = [];
     const next: Record<string, unknown> = { ...current };
@@ -1514,11 +1567,17 @@ export class ConfigMutationService {
       const val = changes[key];
       if (val === undefined) continue; // field not part of this proposal
       const beforeVal = (current[key] as { value?: unknown } | undefined)?.value ?? null;
-      if (val === null || val === "") {
+      const clearsRole = key === "role" && typeof val === "string" && val.trim().toLowerCase() === "auto";
+      const clearsOptOut = key === "disableThreadPrefix" && val === false;
+      if (val === null || val === "" || clearsRole || clearsOptOut) {
         delete next[key];
         if (beforeVal !== null) fields.push({ label: key, before: fmtOverlay(beforeVal), after: "(removed)" });
       } else {
-        const resolved = key === "cwd" && typeof val === "string" ? path.resolve(val) : val;
+        const resolved = key === "cwd" && typeof val === "string"
+          ? path.resolve(val)
+          : key === "role" && typeof val === "string"
+            ? val.trim()
+            : val;
         next[key] = { value: resolved };
         if (beforeVal !== resolved) {
           fields.push({
@@ -2086,6 +2145,9 @@ export class ConfigMutationService {
     return {
       agent: { value: d.agent.value, source: d.agent.source },
       model: { value: d.model.value, source: d.model.source },
+      role: d.role
+        ? { value: d.role.value, source: d.role.source }
+        : { value: null, source: "default" },
       effort: { value: d.effort.value, source: d.effort.source },
       cwd: { value: d.cwd.value, source: d.cwd.source },
       permission: { value: d.permission.value, source: d.permission.source },
@@ -2097,6 +2159,9 @@ export class ConfigMutationService {
         : { value: "full", source: "default" },
       simpleCardGif: d.simpleCardGif
         ? { value: d.simpleCardGif.value, source: d.simpleCardGif.source }
+        : { value: false, source: "default" },
+      disableThreadPrefix: d.disableThreadPrefix
+        ? { value: d.disableThreadPrefix.value, source: d.disableThreadPrefix.source }
         : { value: false, source: "default" },
     };
   }
@@ -2110,11 +2175,12 @@ export class ConfigMutationService {
       projectRef: p.projectRef ?? null,
       agentId: p.agentId,
       model: p.model,
+      role: p.role ?? null,
+      disableThreadPrefix: p.disableThreadPrefix ?? null,
       effort: p.effort,
       permission: p.permission,
       description: p.description,
       repoPath: p.repoPath,
-      threadSlug: p.threadSlug ?? null,
       toolsAllow: p.toolsAllow,
       toolsExclude: p.toolsExclude,
       instructions: p.instructions,

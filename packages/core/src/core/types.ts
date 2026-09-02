@@ -22,6 +22,10 @@ export function parseSimpleCardGif(v: unknown): boolean | undefined {
  * Mostly mirrors the C# `SessionConfigState`, generalized for multi-agent use.
  */
 export interface SessionConfigState {
+  /** Free-form thread role used by the data-driven thread namer. */
+  role?: string;
+  /** Thread-local opt-out from all automatic prefix naming. */
+  disableThreadPrefix?: boolean;
   /** ACP model id (e.g. "gpt-5.4", "claude-sonnet-4.5", "auto"). */
   model?: string;
   /** ACP mode id (e.g. agent / plan / autopilot URI). */
@@ -103,8 +107,10 @@ export interface Preset {
   model: string | null;
   effort: string | null;
   repoPath: string | null;
-  /** Auto-numbering token for `/seam preset thread` names. Null = not set. */
-  threadSlug?: string | null;
+  /** Free-form role copied into session config when this preset is applied. */
+  role: string | null;
+  /** Optional naming opt-out copied into session config on apply. */
+  disableThreadPrefix: boolean | null;
   permission: PermissionPolicyMode | null;
   toolsAllow: string[] | null;
   toolsExclude: string[] | null;
@@ -173,6 +179,8 @@ export interface SessionRecord {
   acpSessionId: string;
   repoPath: string | null;
   configJson: string;
+  /** Exact visible prefix last applied by the thread namer; null = unmanaged. */
+  namePrefix?: string | null;
   createdUtc: string;
   updatedUtc: string;
 }

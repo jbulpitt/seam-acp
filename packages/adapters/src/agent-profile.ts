@@ -118,12 +118,6 @@ export interface AgentAdapter {
   listPickerModels?(): Promise<ReadonlyArray<AdapterModel>>;
 
   /**
-   * Optional short abbreviation displayed in thread names when the new-thread
-   * wizard renames the thread after setup (e.g. "cp-fhr", "agy").
-   */
-  readonly threadAbbr?: string;
-
-  /**
    * If true, the agent's host has network restrictions that block Discord
    * (CDN URLs, etc.). When true, attachments are downloaded server-side and
    * written to the agent's filesystem via `sessionManager.writeAttachment`;

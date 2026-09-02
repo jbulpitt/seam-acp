@@ -24,6 +24,7 @@ const sample = (): SessionRecord => ({
   configJson: JSON.stringify({ model: "gpt-5.4" }),
   createdUtc: new Date().toISOString(),
   updatedUtc: new Date().toISOString(),
+  namePrefix: null,
 });
 
 beforeEach(() => {
@@ -187,17 +188,21 @@ describe("SessionStore project-scoped presets (#21)", () => {
     toolsExclude: null,
     instructions: null,
     statusCardStyle: null,
+    role: null,
+    disableThreadPrefix: null,
     createdBy: "u1",
     createdUtc: now,
     updatedUtc: now,
     ...over,
   });
 
-  it("round-trips threadSlug", () => {
-    store.upsertPreset(preset({ id: "p-slug", name: "hist", threadSlug: "hist" }));
-    expect(store.getPreset("p-slug")?.threadSlug).toBe("hist");
-    store.upsertPreset(preset({ id: "p-slug", name: "hist", threadSlug: null }));
-    expect(store.getPreset("p-slug")?.threadSlug).toBeNull();
+  it("round-trips role and auto-name opt-out", () => {
+    store.upsertPreset(preset({ id: "p-role", name: "hist", role: "analyst", disableThreadPrefix: true }));
+    expect(store.getPreset("p-role")?.role).toBe("analyst");
+    expect(store.getPreset("p-role")?.disableThreadPrefix).toBe(true);
+    store.upsertPreset(preset({ id: "p-role", name: "hist", role: null, disableThreadPrefix: null }));
+    expect(store.getPreset("p-role")?.role).toBeNull();
+    expect(store.getPreset("p-role")?.disableThreadPrefix).toBeNull();
   });
 
   it("round-trips projectRef (scoped and global)", () => {

@@ -330,6 +330,7 @@ export interface ThreadNamerDeps {
   getThreadName: (threadId: string) => Promise<string | null>;
   renameThread: (threadId: string, name: string) => Promise<void>;
   setNamePrefix: (sessionId: string, prefix: string | null) => void;
+  logger: { warn(obj: unknown, msg?: string): void };
 }
 
 export interface ApplyThreadNameOptions {
@@ -346,6 +347,10 @@ export interface ApplyThreadNameResult {
   name?: string;
   prefix?: string;
 }
+
+export type RecompactThreadNameResult =
+  | ApplyThreadNameResult
+  | { status: "failed" };
 
 export class ThreadNamer {
   constructor(private readonly deps: ThreadNamerDeps) {}
@@ -445,24 +450,32 @@ export class ThreadNamer {
     platform: string,
     parentRef: string,
     options: { migrateLegacy?: boolean } = {}
-  ): Promise<ApplyThreadNameResult[]> {
+  ): Promise<RecompactThreadNameResult[]> {
     const records = this.deps
       .listSessionsByParent(platform, parentRef)
       .sort((a, b) => a.createdUtc.localeCompare(b.createdUtc) || a.id.localeCompare(b.id));
     const counters = new Map<string, number>();
-    const results: ApplyThreadNameResult[] = [];
+    const results: RecompactThreadNameResult[] = [];
     for (const record of records) {
       const description = this.deps.describeConfig(record);
       const roleSlot = firstMatch(description.role.value, this.deps.getConfig().roles);
       const ordinal = roleSlot ? (counters.get(roleSlot) ?? 0) + 1 : undefined;
-      const result = await this.applyThreadName(record, {
-        migrateLegacy: options.migrateLegacy,
-        ...(ordinal ? { ordinal } : {}),
-      });
-      if (roleSlot && result.status !== "unmanaged" && result.status !== "opted_out") {
-        counters.set(roleSlot, ordinal!);
+      try {
+        const result = await this.applyThreadName(record, {
+          migrateLegacy: options.migrateLegacy,
+          ...(ordinal ? { ordinal } : {}),
+        });
+        if (roleSlot && result.status !== "unmanaged" && result.status !== "opted_out") {
+          counters.set(roleSlot, ordinal!);
+        }
+        results.push(result);
+      } catch (err) {
+        this.deps.logger.warn(
+          { err, platform, parentRef, threadId: record.channelRef },
+          "thread name recompaction failed"
+        );
+        results.push({ status: "failed" });
       }
-      results.push(result);
     }
     return results;
   }

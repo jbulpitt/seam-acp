@@ -91,6 +91,7 @@ describe("/seam config rename and namer surfaces", () => {
         { status: "renamed" },
         { status: "unchanged" },
         { status: "unmanaged" },
+        { status: "gone" },
         { status: "failed" },
       ];
     });
@@ -118,7 +119,7 @@ describe("/seam config rename and namer surfaces", () => {
     expect(events).toEqual(["defer", "recompact", "edit"]);
     expect(reply).not.toHaveBeenCalled();
     expect(editReply).toHaveBeenCalledWith({
-      content: "Recomputed 4 channel thread(s): 1 renamed, 1 unchanged, 1 left untouched, 1 failed.",
+      content: "Recomputed 5 channel thread(s): 1 renamed, 1 unchanged, 1 left untouched, 1 gone, 1 failed.",
     });
   });
 

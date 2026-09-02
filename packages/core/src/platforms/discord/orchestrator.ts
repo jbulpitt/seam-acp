@@ -694,6 +694,12 @@ export class Orchestrator {
         this.store.listSessionsByParentInCreationOrder(platform, parentRef),
       getThreadName: async (threadId) =>
         (await this.adapter.getThreadName?.({ platform: PLATFORM, id: threadId })) ?? null,
+      getThreadLiveState: async (threadId) => {
+        if (!this.adapter.getThreadLiveState) {
+          throw new Error("thread liveness check is unavailable");
+        }
+        return this.adapter.getThreadLiveState({ platform: PLATFORM, id: threadId });
+      },
       renameThread: async (threadId, name) => {
         if (!this.adapter.renameThread) return;
         await this.adapter.renameThread({ platform: PLATFORM, id: threadId }, name);
@@ -9376,9 +9382,10 @@ export class Orchestrator {
       const renamed = results.filter((result) => result.status === "renamed").length;
       const unchanged = results.filter((result) => result.status === "unchanged").length;
       const skipped = results.filter((result) => result.status === "unmanaged" || result.status === "opted_out").length;
+      const gone = results.filter((result) => result.status === "gone").length;
       const failed = results.filter((result) => result.status === "failed").length;
       await i.editReply({
-        content: `Recomputed ${results.length} channel thread(s): ${renamed} renamed, ${unchanged} unchanged, ${skipped} left untouched, ${failed} failed.`,
+        content: `Recomputed ${results.length} channel thread(s): ${renamed} renamed, ${unchanged} unchanged, ${skipped} left untouched, ${gone} gone, ${failed} failed.`,
       });
       return;
     }

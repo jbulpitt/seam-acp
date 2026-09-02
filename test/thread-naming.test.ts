@@ -227,14 +227,26 @@ describe("namer card rule grammar", () => {
 });
 
 describe("ThreadNamer lifecycle", () => {
-  function harness(records: SessionRecord[], values: Record<string, Parameters<typeof description>[1]>, names: Record<string, string>) {
+  function harness(
+    records: SessionRecord[],
+    values: Record<string, Parameters<typeof description>[1]>,
+    names: Record<string, string>,
+    liveness: Record<string, "alive" | "gone" | "reject"> = {}
+  ) {
     const renames: Array<[string, string]> = [];
     const warnings: Array<{ obj: unknown; msg?: string }> = [];
+    const liveChecks: string[] = [];
     const namer = new ThreadNamer({
       getConfig: () => config,
       describeConfig: (rec) => description(rec, values[rec.channelRef]),
       listSessionsByParent: () => records,
       getThreadName: async (id) => names[id] ?? null,
+      getThreadLiveState: async (id) => {
+        liveChecks.push(id);
+        if (liveness[id] === "gone") return undefined;
+        if (liveness[id] === "reject") throw new Error("liveness unavailable");
+        return { locked: false, archived: false };
+      },
       renameThread: async (id, name) => { renames.push([id, name]); names[id] = name; },
       setNamePrefix: (id, prefix) => {
         const rec = records.find((candidate) => candidate.id === id);
@@ -242,7 +254,7 @@ describe("ThreadNamer lifecycle", () => {
       },
       logger: { warn: (obj, msg) => warnings.push({ obj, ...(msg ? { msg } : {}) }) },
     });
-    return { namer, renames, warnings };
+    return { namer, renames, warnings, liveChecks };
   }
 
   it("manages fresh create, preserves stable gaps, and recomputes exact prefixes", async () => {
@@ -350,6 +362,7 @@ describe("ThreadNamer lifecycle", () => {
       describeConfig: (rec) => description(rec, { role: "worker" }),
       listSessionsByParent: () => records,
       getThreadName: async (id) => names[id as keyof typeof names] ?? null,
+      getThreadLiveState: async () => ({ locked: false, archived: false }),
       renameThread: async (id, name) => {
         if (id === "failed") throw new Error("Discord rate limit");
         renames.push([id, name]);
@@ -373,5 +386,89 @@ describe("ThreadNamer lifecycle", () => {
         msg: "thread name recompaction failed",
       },
     ]);
+  });
+
+  it("reclaims a confirmed-gone middle ordinal and clears its stored prefix", async () => {
+    const first = record("first", "2026-01-01T00:00:00.000Z");
+    first.namePrefix = "🤖🌞🛠️1️⃣";
+    const gone = record("gone", "2026-01-02T00:00:00.000Z");
+    gone.namePrefix = "🤖🌞🛠️2️⃣";
+    const last = record("last", "2026-01-03T00:00:00.000Z");
+    last.namePrefix = "🤖🌞🛠️3️⃣";
+    const names = {
+      first: "🤖🌞🛠️1️⃣ first",
+      last: "🤖🌞🛠️3️⃣ last",
+    };
+    const { namer, liveChecks } = harness(
+      [first, gone, last],
+      { first: { role: "worker" }, gone: { role: "worker" }, last: { role: "worker" } },
+      names,
+      { gone: "gone" }
+    );
+
+    const result = await namer.recompactChannel("discord", "parent");
+
+    expect(result.map((item) => item.status)).toEqual(["unchanged", "gone", "renamed"]);
+    expect(names.last).toBe("🤖🌞🛠️2️⃣ last");
+    expect(gone.namePrefix).toBeNull();
+    expect(liveChecks).toEqual(["gone"]);
+  });
+
+  it("keeps an ordinal reserved when liveness cannot be checked", async () => {
+    const uncertain = record("uncertain", "2026-01-01T00:00:00.000Z");
+    uncertain.namePrefix = "🤖🌞🛠️1️⃣";
+    const next = record("next", "2026-01-02T00:00:00.000Z");
+    next.namePrefix = "🤖🌞🛠️2️⃣";
+    const names = { next: "🤖🌞🛠️2️⃣ next" };
+    const { namer } = harness(
+      [uncertain, next],
+      { uncertain: { role: "worker" }, next: { role: "worker" } },
+      names,
+      { uncertain: "reject" }
+    );
+
+    const result = await namer.recompactChannel("discord", "parent");
+
+    expect(result.map((item) => item.status)).toEqual(["unchanged", "unchanged"]);
+    expect(uncertain.namePrefix).toBe("🤖🌞🛠️1️⃣");
+    expect(next.namePrefix).toBe("🤖🌞🛠️2️⃣");
+    expect(names.next).toBe("🤖🌞🛠️2️⃣ next");
+  });
+
+  it("compacts three live, four gone, then two live threads to 1 through 5", async () => {
+    const records = Array.from({ length: 9 }, (_, index) => {
+      const ordinal = index + 1;
+      const rec = record(`thread-${ordinal}`, `2026-01-${String(ordinal).padStart(2, "0")}T00:00:00.000Z`);
+      rec.namePrefix = `🤖🌞🛠️${formatThreadOrdinal(ordinal)}`;
+      return rec;
+    });
+    const liveOrdinals = [1, 2, 3, 8, 9];
+    const names = Object.fromEntries(liveOrdinals.map((ordinal) => [
+      `thread-${ordinal}`,
+      `🤖🌞🛠️${formatThreadOrdinal(ordinal)} thread-${ordinal}`,
+    ]));
+    const liveness = Object.fromEntries(
+      [4, 5, 6, 7].map((ordinal) => [`thread-${ordinal}`, "gone" as const])
+    );
+    const values = Object.fromEntries(
+      records.map((rec) => [rec.channelRef, { role: "worker" }])
+    );
+    const { namer } = harness(records, values, names, liveness);
+
+    const result = await namer.recompactChannel("discord", "parent");
+
+    expect(result.map((item) => item.status)).toEqual([
+      "unchanged", "unchanged", "unchanged",
+      "gone", "gone", "gone", "gone",
+      "renamed", "renamed",
+    ]);
+    expect(liveOrdinals.map((ordinal) => names[`thread-${ordinal}`])).toEqual([
+      "🤖🌞🛠️1️⃣ thread-1",
+      "🤖🌞🛠️2️⃣ thread-2",
+      "🤖🌞🛠️3️⃣ thread-3",
+      "🤖🌞🛠️4️⃣ thread-8",
+      "🤖🌞🛠️5️⃣ thread-9",
+    ]);
+    expect(records.slice(3, 7).every((rec) => rec.namePrefix === null)).toBe(true);
   });
 });

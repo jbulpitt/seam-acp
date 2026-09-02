@@ -151,13 +151,20 @@ describe("prefix boundaries", () => {
     expect(stripStoredThreadPrefix("base", "")).toBe("base");
   });
 
-  it("heuristically strips only a leading configured glyph/keycap run", () => {
-    expect(stripLegacyThreadPrefix("👾📜🕵🏻‍♀️1️⃣ old title", {
-      agents: [{ match: "claude", replacement: "👾" }],
-      models: [{ match: "sonnet", replacement: "📜" }],
-      roles: [{ match: "qa", replacement: "🕵🏻‍♀️" }],
-    })).toBe("old title");
+  it("strips any leading emoji cluster only during explicit legacy cleanup", () => {
+    expect(stripLegacyThreadPrefix("🧬🚾4️⃣", config)).toBe("");
+    expect(stripLegacyThreadPrefix("🧬🕵🏻‍♀️1️⃣", config)).toBe("");
+    expect(stripLegacyThreadPrefix("🤖 👨‍💻☁️ server", config)).toBe("server");
+    expect(stripLegacyThreadPrefix("👾🪄 orchestrator", config)).toBe("orchestrator");
+    expect(stripLegacyThreadPrefix("🌌 automation 🔃", config)).toBe("automation 🔃");
+    expect(stripLegacyThreadPrefix("🧬🌞🛠️4️⃣ 🚾4️⃣", config)).toBe("");
     expect(stripLegacyThreadPrefix("ordinary 👾 title", config)).toBe("ordinary 👾 title");
+    expect(stripLegacyThreadPrefix("BOT worker", {
+      agents: [{ match: "bot", replacement: "BOT" }],
+      models: [],
+      roles: [],
+    })).toBe("worker");
+    expect(joinThreadName("🤖🌞🛠️4️⃣", "")).toBe("🤖🌞🛠️4️⃣");
   });
 });
 

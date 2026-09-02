@@ -286,33 +286,35 @@ function configuredTokens(config: ThreadNamerConfig): string[] {
     .sort((a, b) => b.length - a.length);
 }
 
-/** Explicit legacy migration only: strip a leading run of configured glyphs/keycaps. */
+const LEGACY_EMOJI_CLUSTER = /^(?:[0-9#*]\uFE0F?\u20E3|\p{Extended_Pictographic}|\p{Regional_Indicator})[\uFE0E\uFE0F\u{1F3FB}-\u{1F3FF}]*(?:\u200D(?:[0-9#*]\uFE0F?\u20E3|\p{Extended_Pictographic}|\p{Regional_Indicator})[\uFE0E\uFE0F\u{1F3FB}-\u{1F3FF}]*)*/u;
+
+/** Explicit legacy migration only: strip a leading run of configured tokens or emoji. */
 export function stripLegacyThreadPrefix(name: string, config: ThreadNamerConfig): string {
   const tokens = configuredTokens(config);
   let offset = 0;
-  let consumed = false;
+  let consumedPrefix = false;
   while (offset < name.length) {
     const rest = name.slice(offset);
     const replacement = tokens.find((token) => rest.startsWith(token));
     if (replacement) {
       offset += replacement.length;
-      consumed = true;
+      consumedPrefix = true;
       continue;
     }
-    if (rest.startsWith("🔟")) {
-      offset += "🔟".length;
-      consumed = true;
+    const emoji = rest.match(LEGACY_EMOJI_CLUSTER)?.[0];
+    if (emoji) {
+      offset += emoji.length;
+      consumedPrefix = true;
       continue;
     }
-    const keycap = rest.match(/^[0-9]\uFE0F\u20E3/u)?.[0];
-    if (keycap) {
-      offset += keycap.length;
-      consumed = true;
+    const whitespace = rest.match(/^\s+/u)?.[0];
+    if (whitespace) {
+      offset += whitespace.length;
       continue;
     }
     break;
   }
-  return consumed ? name.slice(offset).trimStart() : name;
+  return consumedPrefix ? name.slice(offset).trimStart() : name;
 }
 
 export function joinThreadName(prefix: string, base: string): string {

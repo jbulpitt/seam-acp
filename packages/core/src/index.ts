@@ -63,6 +63,7 @@ import { ModelMetadataManager } from "./core/model-metadata/manager.js";
 import { collectAgentModelCatalog } from "./core/model-metadata/catalog.js";
 import { ArtificialAnalysisMetadataSource } from "./core/model-metadata/artificial-analysis.js";
 import { ModelValueRankingsCard } from "./core/model-value/rankings-card.js";
+import { LiveMessageSearch, MessageReader } from "./core/message-reader.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -638,6 +639,13 @@ async function main(): Promise<void> {
   // enqueue dispatch specs / read threads — the DispatchWatcher + report-back
   // do the rest.
   if (config.SEAM_MCP_ENABLED) {
+    const messageReader = adapter.fetchMessagePage
+      ? new MessageReader(
+          { fetchMessagePage: (threadId, request) => adapter.fetchMessagePage(threadId, request) },
+          { logger }
+        )
+      : undefined;
+    const messageSearch = messageReader ? new LiveMessageSearch(messageReader) : undefined;
     const agyImageInspector = createAgyImageInspector({
       model: config.AGY_VISION_MODEL,
       logger,
@@ -665,6 +673,12 @@ async function main(): Promise<void> {
       resetThreadSession: (target) => threadSessionControl.reset(target),
       prepareSelfMigration: (caller, input) =>
         threadSessionControl.prepareSelfMigration(caller, input),
+      ...(messageReader
+        ? {
+            readMessages: (threadId, input) => messageReader.readMessages(threadId, input),
+            searchMessages: (input) => messageSearch!.search(input),
+          }
+        : {}),
       getAgentQuotas: (agentId) => {
         if (!agentId) return quotaRegistry.all();
         const quota = quotaRegistry.get(agentId);
@@ -727,17 +741,6 @@ async function main(): Promise<void> {
         }
         return { chainId, firstHop: advanced.nextHop };
       },
-      ...(adapter.fetchThreadMessages
-        ? {
-            peekThread: async (threadId: string, count: number) => {
-              const msgs = await adapter.fetchThreadMessages!({
-                platform: "discord",
-                id: threadId,
-              });
-              return msgs.slice(-count);
-            },
-          }
-        : {}),
       // #73: discover the addressable teammate threads in the caller's OWN
       // channel. Composes the per-channel SQL query (listSessionsByParent — NOT
       // an in-memory filter over list(100), so a quiet-but-bound thread past the

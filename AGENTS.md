@@ -37,6 +37,12 @@ hand-editing runtime state.
 - **Another thread in this channel:** `threads()` first. Idle → `handoff` /
   `forward`. Busy → `send` (inbox; they `poll_inbox`). Set `returnTo` to that
   thread when he does not want a report-back here. Never hand off to `isSelf`.
+- **Find or read prior conversation:** `search_messages` searches your thread,
+  selected siblings, or all threads in this channel and returns message-id
+  anchors; `read_messages` loads latest / around / before / after context,
+  including cards. Those two live reads never cross channels. `peek(thread,
+  count?)` shares their reader but retains cross-channel recent-N reach by raw
+  Discord thread id, including threads without a Seam session.
 - **Reconfigure or reset another thread's session** (not just message it):
   `configure_thread(thread, { agent?, model?, effort? })` changes its agent /
   model / effort and reports what actually reset (agent switch always resets;

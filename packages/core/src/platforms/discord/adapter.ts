@@ -76,6 +76,7 @@ import {
   makeChoiceModalId,
   makeChoiceSelectId,
 } from "../../core/choice/types.js";
+import type { MessagePageItem, MessagePageRequest } from "../../core/message-reader.js";
 import { buildSeamCommand } from "./commands.js";
 import { sanitizeSpeakerName } from "../../core/agent-conventions.js";
 import {
@@ -1411,6 +1412,54 @@ export class DiscordAdapter implements ChatAdapter {
     }
     
     return messages.reverse();
+  }
+
+  async fetchMessagePage(
+    threadId: string,
+    request: MessagePageRequest
+  ): Promise<MessagePageItem[]> {
+    const ch = await this.fetchSendableChannel(threadId);
+    if (!ch.isThread()) throw new Error("Channel is not a thread.");
+    const options: {
+      limit: number;
+      around?: string;
+      before?: string;
+      after?: string;
+    } = {
+      limit: Math.max(1, Math.min(100, Math.floor(request.limit))),
+      ...(request.around ? { around: request.around } : {}),
+      ...(request.before ? { before: request.before } : {}),
+      ...(request.after ? { after: request.after } : {}),
+    };
+    const chunk = await ch.messages.fetch(options);
+    const messages: MessagePageItem[] = [];
+    for (const msg of chunk.values()) {
+      if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) continue;
+      const attachmentNames = msg.attachments.map((attachment) => attachment.name);
+      const embedText = msg.embeds
+        .flatMap((embed) => [
+          embed.author?.name,
+          embed.title,
+          embed.description,
+          ...embed.fields.flatMap((field) => [field.name, field.value]),
+          embed.footer?.text,
+        ])
+        .filter((value): value is string => Boolean(value))
+        .join("\n")
+        .trim();
+      messages.push({
+        messageId: msg.id,
+        timestampMs: msg.createdTimestamp,
+        authorId: msg.author.id,
+        authorName: this.resolveAuthorName(msg),
+        authorType: msg.author.bot ? "bot" : "human",
+        content: msg.content?.trim() || embedText,
+        attachmentNames,
+        hasEmbeds: msg.embeds.length > 0,
+        hasComponents: msg.components.length > 0,
+      });
+    }
+    return messages;
   }
 
   async getThreadLiveState(

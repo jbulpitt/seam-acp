@@ -9,7 +9,6 @@ import {
   buildSeamMcpServerEntry,
   mcpPathname,
   sessionTokenFromRequest,
-  type PeekedMessage,
   type SeamMcpServerDeps,
 } from "../packages/core/src/core/mcp/seam-mcp-server.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -173,7 +172,8 @@ interface Harness {
 
 async function makeHarness(opts?: {
   resolveSession?: (token: string | undefined) => SessionRecord | undefined;
-  peekThread?: (threadId: string, count: number) => Promise<PeekedMessage[]>;
+  readMessages?: SeamMcpServerDeps["readMessages"];
+  searchMessages?: SeamMcpServerDeps["searchMessages"];
   listThreads?: SeamMcpServerDeps["listThreads"];
   resolveThread?: SeamMcpServerDeps["resolveThread"];
   configureThread?: SeamMcpServerDeps["configureThread"];
@@ -275,7 +275,8 @@ async function makeHarness(opts?: {
           reason: "wait for CI",
         },
       ]),
-    ...(opts?.peekThread ? { peekThread: opts.peekThread } : {}),
+    ...(opts?.readMessages ? { readMessages: opts.readMessages } : {}),
+    ...(opts?.searchMessages ? { searchMessages: opts.searchMessages } : {}),
     ...(opts?.listThreads ? { listThreads: opts.listThreads } : {}),
     ...(opts?.resolveThread ? { resolveThread: opts.resolveThread } : {}),
     ...(opts?.configureThread ? { configureThread: opts.configureThread } : {}),
@@ -424,9 +425,11 @@ describe("SeamMcpServer", () => {
       "model_value_rankings",
       "peek",
       "poll_inbox",
+      "read_messages",
       "rename_thread",
       "reset_thread_session",
       "schedule_wake",
+      "search_messages",
       "send",
       "steer",
       "submit_result",
@@ -828,8 +831,8 @@ describe("SeamMcpServer", () => {
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     // Adding an OPTION to handoff does NOT change the tool count; inspect_image
     // plus the standalone capabilities — inspect_image, model metadata (2),
-    // model_value_rankings, configure_thread, reset_thread_session, migrate_self — bring the catalog to 32.
-    expect(body.result.tools).toHaveLength(32);
+    // model_value_rankings, thread controls, and message search/read bring the catalog to 34.
+    expect(body.result.tools).toHaveLength(34);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -1257,16 +1260,35 @@ describe("SeamMcpServer", () => {
     expect(h.enqueued).toHaveLength(1);
   });
 
-  it("peek reads recent messages via the injected peekThread", async () => {
+  it("peek keeps latest-N parity with the shared read_messages dependency", async () => {
+    const readMessages = vi.fn(async (threadId: string, input: { limit?: number }) => ({
+      threadId,
+      truncated: false,
+      messages: [
+        {
+          messageId: "1",
+          timestamp: "2026-08-01T00:00:00.000Z",
+          author: "Jesse",
+          authorId: "human",
+          authorType: "human" as const,
+          content: "hello",
+          isCard: false,
+          attachments: [],
+        },
+        {
+          messageId: "2",
+          timestamp: "2026-08-01T00:00:01.000Z",
+          author: "Seam",
+          authorId: "bot",
+          authorType: "bot" as const,
+          content: "hi there",
+          isCard: false,
+          attachments: [],
+        },
+      ],
+    }));
     h = await makeHarness({
-      peekThread: async (threadId, count) => {
-        expect(threadId).toBe("thread-x");
-        expect(count).toBe(5);
-        return [
-          { authorIsBot: false, text: "hello" },
-          { authorIsBot: true, text: "hi there" },
-        ];
-      },
+      readMessages,
     });
     const { body } = await h.call(
       "tools/call",
@@ -1277,6 +1299,159 @@ describe("SeamMcpServer", () => {
     const text = body.result.content[0].text;
     expect(text).toContain("hello");
     expect(text).toContain("hi there");
+    expect(readMessages).toHaveBeenCalledWith("thread-x", { limit: 5 });
+  });
+
+  it("read_messages passes an around window through after same-channel authorization", async () => {
+    const target = makeRecord({
+      id: "discord:thread-target",
+      channelRef: "thread-target",
+      parentRef: "chan-1",
+    });
+    const readMessages = vi.fn(async (threadId: string) => ({
+      threadId,
+      truncated: false,
+      messages: [],
+    }));
+    h = await makeHarness({
+      resolveThread: (id) => id === target.channelRef ? target : undefined,
+      readMessages,
+    });
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "read_messages",
+        arguments: { thread: "thread-target", around: "message-hit", limit: 75 },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBeFalsy();
+    expect(readMessages).toHaveBeenCalledWith("thread-target", {
+      around: "message-hit",
+      limit: 75,
+    });
+  });
+
+  it("search_messages resolves channel and named-thread scopes without crossing channels", async () => {
+    const sibling = makeRecord({
+      id: "discord:thread-sibling",
+      channelRef: "thread-sibling",
+      parentRef: "chan-1",
+    });
+    const outside = makeRecord({
+      id: "discord:thread-outside",
+      channelRef: "thread-outside",
+      parentRef: "chan-2",
+    });
+    const searchMessages = vi.fn(async (input) => ({
+      query: input.query,
+      hits: [],
+      truncated: false,
+      pagesFetched: 1,
+    }));
+    h = await makeHarness({
+      resolveThread: (id) => id === sibling.channelRef ? sibling : id === outside.channelRef ? outside : undefined,
+      listThreads: async () => [
+        {
+          id: "thread-caller",
+          name: "Caller",
+          isSelf: true,
+          agent: "claude",
+          model: "default",
+          cwd: "/repo",
+          busy: false,
+          status: "active",
+          lastActivityUtc: "2026-08-01T00:00:00.000Z",
+        },
+        {
+          id: "thread-sibling",
+          name: "Sibling",
+          isSelf: false,
+          agent: "codex",
+          model: "gpt",
+          cwd: "/repo",
+          busy: false,
+          status: "active",
+          lastActivityUtc: "2026-08-01T00:00:00.000Z",
+        },
+      ],
+      searchMessages,
+    });
+
+    const channel = await h.call(
+      "tools/call",
+      { name: "search_messages", arguments: { query: "needle", threads: "channel" } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(channel.body.result.isError).toBeFalsy();
+    expect(searchMessages).toHaveBeenLastCalledWith(expect.objectContaining({
+      threads: [
+        { id: "thread-caller", name: "Caller" },
+        { id: "thread-sibling", name: "Sibling" },
+      ],
+    }));
+
+    const refused = await h.call(
+      "tools/call",
+      { name: "search_messages", arguments: { query: "needle", threads: ["thread-outside"] } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(refused.body.result.isError).toBe(true);
+    expect(refused.body.result.content[0].text).toContain("not a session in your channel");
+    expect(searchMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("read_messages rejects an outside-channel thread before fetching content", async () => {
+    const outside = makeRecord({
+      id: "discord:thread-outside",
+      channelRef: "thread-outside",
+      parentRef: "chan-2",
+    });
+    const readMessages = vi.fn();
+    h = await makeHarness({
+      resolveThread: (id) => id === outside.channelRef ? outside : undefined,
+      readMessages,
+    });
+
+    const { body } = await h.call(
+      "tools/call",
+      { name: "read_messages", arguments: { thread: outside.channelRef } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("not a session in your channel");
+    expect(readMessages).not.toHaveBeenCalled();
+  });
+
+  it("peek reads an outside-channel unmanaged thread without resolving a Seam session", async () => {
+    const resolveThread = vi.fn(() => undefined);
+    const readMessages = vi.fn(async (threadId: string) => ({
+      threadId,
+      truncated: false,
+      messages: [{
+        messageId: "outside-1",
+        timestamp: "2026-08-01T00:00:00.000Z",
+        author: "Outside teammate",
+        authorId: "bot-outside",
+        authorType: "bot" as const,
+        content: "cross-channel context",
+        isCard: false,
+        attachments: [],
+      }],
+    }));
+    h = await makeHarness({ resolveThread, readMessages });
+
+    const { body } = await h.call(
+      "tools/call",
+      { name: "peek", arguments: { thread: "outside-unmanaged-thread", count: 7 } },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBeFalsy();
+    expect(body.result.content[0].text).toContain("cross-channel context");
+    expect(readMessages).toHaveBeenCalledWith("outside-unmanaged-thread", { limit: 7 });
+    expect(resolveThread).not.toHaveBeenCalled();
   });
 
   // --- threads: discover addressable teammate threads (#73) ----------------
@@ -1591,8 +1766,8 @@ describe("SeamMcpServer", () => {
   it("send advertises interrupt + fresh in its input schema without changing the tool count (#67)", async () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
-    // Params on `send` must NOT add a tool — the set stays at 32.
-    expect(body.result.tools).toHaveLength(32);
+    // Params on `send` must NOT add a tool — the set stays at 34.
+    expect(body.result.tools).toHaveLength(34);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

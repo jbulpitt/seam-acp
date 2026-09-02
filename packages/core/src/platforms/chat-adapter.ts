@@ -3,6 +3,7 @@ import type {
   RequestPermissionRequest,
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
+import type { MessagePageItem, MessagePageRequest } from "../core/message-reader.js";
 
 /** Reference to a channel or thread on a chat platform. */
 export interface ChannelRef {
@@ -107,6 +108,9 @@ export interface ChatAdapter {
   fetchThreadMessages?(
     channel: ChannelRef
   ): Promise<Array<{ authorIsBot: boolean; text: string; authorName?: string }>>;
+
+  /** Optional: one cursor-addressed page of raw conversational messages. */
+  fetchMessagePage?(threadId: string, request: MessagePageRequest): Promise<MessagePageItem[]>;
 
   /** Optional: register a handler called when a thread is deleted (channelRef =
    *  the thread id). Used by scheduled prompts for instant cleanup. */

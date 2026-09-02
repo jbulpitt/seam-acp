@@ -78,4 +78,83 @@ describe("/seam config rename and namer surfaces", () => {
       expect.objectContaining({ name: "Role", value: expect.stringContaining("orch") }),
     ]));
   });
+
+  it("defers channel recompaction before work and edits a failure-aware summary", async () => {
+    const events: string[] = [];
+    const reply = vi.fn(async () => { events.push("reply"); });
+    const deferReply = vi.fn(async () => { events.push("defer"); });
+    const editReply = vi.fn(async () => { events.push("edit"); });
+    const recompactChannel = vi.fn(async () => {
+      events.push("recompact");
+      expect(deferReply).toHaveBeenCalledOnce();
+      return [
+        { status: "renamed" },
+        { status: "unchanged" },
+        { status: "unmanaged" },
+        { status: "failed" },
+      ];
+    });
+    const mock = {
+      recordFromInteraction: () => ({
+        id: "discord:thread-123",
+        platform: "discord",
+        channelRef: "thread-123",
+        parentRef: "channel-456",
+      }),
+      threadNamer: { recompactChannel },
+    } as any;
+    const interaction = {
+      options: {
+        getString: () => "channel",
+        getBoolean: () => false,
+      },
+      reply,
+      deferReply,
+      editReply,
+    } as any;
+
+    await (Orchestrator.prototype as any).cmdThreadRename.call(mock, interaction);
+
+    expect(events).toEqual(["defer", "recompact", "edit"]);
+    expect(reply).not.toHaveBeenCalled();
+    expect(editReply).toHaveBeenCalledWith({
+      content: "Recomputed 4 channel thread(s): 1 renamed, 1 unchanged, 1 left untouched, 1 failed.",
+    });
+  });
+
+  it("defers the single-thread rename and edits instead of replying twice", async () => {
+    const events: string[] = [];
+    const reply = vi.fn(async () => { events.push("reply"); });
+    const deferReply = vi.fn(async () => { events.push("defer"); });
+    const editReply = vi.fn(async () => { events.push("edit"); });
+    const applyThreadName = vi.fn(async () => {
+      events.push("rename");
+      expect(deferReply).toHaveBeenCalledOnce();
+      return { status: "renamed", name: "🤖 fixed" };
+    });
+    const mock = {
+      recordFromInteraction: () => ({
+        id: "discord:thread-123",
+        platform: "discord",
+        channelRef: "thread-123",
+        parentRef: "channel-456",
+      }),
+      applyThreadName,
+    } as any;
+    const interaction = {
+      options: {
+        getString: () => "thread",
+        getBoolean: () => true,
+      },
+      reply,
+      deferReply,
+      editReply,
+    } as any;
+
+    await (Orchestrator.prototype as any).cmdThreadRename.call(mock, interaction);
+
+    expect(events).toEqual(["defer", "rename", "edit"]);
+    expect(reply).not.toHaveBeenCalled();
+    expect(editReply).toHaveBeenCalledWith({ content: "Renamed to 🤖 fixed." });
+  });
 });

@@ -699,6 +699,7 @@ export class Orchestrator {
         await this.adapter.renameThread({ platform: PLATFORM, id: threadId }, name);
       },
       setNamePrefix: (sessionId, prefix) => this.store.setNamePrefix(sessionId, prefix),
+      logger: this.logger,
     });
 
     // #58 P2/P3: the mutation engine reuses the router's precedence resolver
@@ -9370,15 +9371,18 @@ export class Orchestrator {
         await i.reply({ content: "This thread has no parent channel.", flags: MessageFlags.Ephemeral });
         return;
       }
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
       const results = await this.threadNamer.recompactChannel(PLATFORM, record.parentRef, { migrateLegacy });
       const renamed = results.filter((result) => result.status === "renamed").length;
+      const unchanged = results.filter((result) => result.status === "unchanged").length;
       const skipped = results.filter((result) => result.status === "unmanaged" || result.status === "opted_out").length;
-      await i.reply({
-        content: `Recomputed ${results.length} channel thread(s): ${renamed} renamed, ${skipped} left untouched.`,
-        flags: MessageFlags.Ephemeral,
+      const failed = results.filter((result) => result.status === "failed").length;
+      await i.editReply({
+        content: `Recomputed ${results.length} channel thread(s): ${renamed} renamed, ${unchanged} unchanged, ${skipped} left untouched, ${failed} failed.`,
       });
       return;
     }
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
     const result = await this.applyThreadName(record, { migrateLegacy });
     const detail = result.status === "unmanaged"
       ? "Name left untouched because its exact stored prefix boundary is unavailable. Use migrate-legacy:true for explicit cleanup."
@@ -9387,7 +9391,7 @@ export class Orchestrator {
         : result.status === "renamed"
           ? `Renamed to ${result.name}.`
           : "Name already matches.";
-    await i.reply({ content: detail, flags: MessageFlags.Ephemeral });
+    await i.editReply({ content: detail });
   }
 
   private async cmdNamerEditor(i: ChatInputCommandInteraction): Promise<void> {

@@ -157,6 +157,7 @@ describe("prefix boundaries", () => {
     expect(stripLegacyThreadPrefix("🤖 👨‍💻☁️ server", config)).toBe("server");
     expect(stripLegacyThreadPrefix("👾🪄 orchestrator", config)).toBe("orchestrator");
     expect(stripLegacyThreadPrefix("🌌 automation 🔃", config)).toBe("automation 🔃");
+    expect(stripLegacyThreadPrefix("🧬 release 🚀", config)).toBe("release 🚀");
     expect(stripLegacyThreadPrefix("🧬🌞🛠️4️⃣ 🚾4️⃣", config)).toBe("");
     expect(stripLegacyThreadPrefix("ordinary 👾 title", config)).toBe("ordinary 👾 title");
     expect(stripLegacyThreadPrefix("BOT worker", {
@@ -228,6 +229,7 @@ describe("namer card rule grammar", () => {
 describe("ThreadNamer lifecycle", () => {
   function harness(records: SessionRecord[], values: Record<string, Parameters<typeof description>[1]>, names: Record<string, string>) {
     const renames: Array<[string, string]> = [];
+    const warnings: Array<{ obj: unknown; msg?: string }> = [];
     const namer = new ThreadNamer({
       getConfig: () => config,
       describeConfig: (rec) => description(rec, values[rec.channelRef]),
@@ -238,8 +240,9 @@ describe("ThreadNamer lifecycle", () => {
         const rec = records.find((candidate) => candidate.id === id);
         if (rec) rec.namePrefix = prefix;
       },
+      logger: { warn: (obj, msg) => warnings.push({ obj, ...(msg ? { msg } : {}) }) },
     });
-    return { namer, renames };
+    return { namer, renames, warnings };
   }
 
   it("manages fresh create, preserves stable gaps, and recomputes exact prefixes", async () => {
@@ -327,6 +330,48 @@ describe("ThreadNamer lifecycle", () => {
       ["opted_out", undefined],
       ["unmanaged", undefined],
       ["renamed", "🤖🌞🛠️1️⃣ managed"],
+    ]);
+  });
+
+  it("continues recompaction after one thread rename fails and reports the error", async () => {
+    const failed = record("failed", "2026-01-01T00:00:00.000Z");
+    failed.namePrefix = "🤖🌞🛠️7️⃣";
+    const next = record("next", "2026-01-02T00:00:00.000Z");
+    next.namePrefix = "🤖🌞🛠️8️⃣";
+    const records = [failed, next];
+    const warnings: Array<{ obj: unknown; msg?: string }> = [];
+    const renames: Array<[string, string]> = [];
+    const names = {
+      failed: "🤖🌞🛠️7️⃣ failed",
+      next: "🤖🌞🛠️8️⃣ next",
+    };
+    const namer = new ThreadNamer({
+      getConfig: () => config,
+      describeConfig: (rec) => description(rec, { role: "worker" }),
+      listSessionsByParent: () => records,
+      getThreadName: async (id) => names[id as keyof typeof names] ?? null,
+      renameThread: async (id, name) => {
+        if (id === "failed") throw new Error("Discord rate limit");
+        renames.push([id, name]);
+      },
+      setNamePrefix: () => {},
+      logger: { warn: (obj, msg) => warnings.push({ obj, ...(msg ? { msg } : {}) }) },
+    });
+
+    const result = await namer.recompactChannel("discord", "parent");
+
+    expect(result.map((item) => item.status)).toEqual(["failed", "renamed"]);
+    expect(renames).toEqual([["next", "🤖🌞🛠️1️⃣ next"]]);
+    expect(warnings).toEqual([
+      {
+        obj: {
+          err: expect.any(Error),
+          platform: "discord",
+          parentRef: "parent",
+          threadId: "failed",
+        },
+        msg: "thread name recompaction failed",
+      },
     ]);
   });
 });

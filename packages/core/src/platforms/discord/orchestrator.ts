@@ -684,7 +684,8 @@ export class Orchestrator {
     this.quotaPoller = opts.quotaPoller;
     this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
     this.threadNamerConfig = new ThreadNamerConfigStore(
-      path.join(this.config.DATA_DIR, "thread-namer.json")
+      path.join(this.config.DATA_DIR, "thread-namer.json"),
+      this.logger
     );
     this.threadNamer = new ThreadNamer({
       getConfig: () => this.threadNamerConfig.get(),

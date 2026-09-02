@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -173,6 +173,25 @@ describe("ThreadNamerConfigStore", () => {
     expect(() => store.save({ ...next, agents: [{ match: "", replacement: "A" }] }))
       .toThrow();
     expect(store.get()).toEqual(next);
+  });
+
+  it("falls back to defaults on a malformed boot file while explicit reload stays strict", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "seam-namer-invalid-"));
+    const file = path.join(dir, "thread-namer.json");
+    writeFileSync(file, "{ malformed", "utf8");
+    const warnings: Array<{ obj: unknown; msg?: string }> = [];
+
+    const store = new ThreadNamerConfigStore(file, {
+      warn: (obj, msg) => warnings.push({ obj, ...(msg ? { msg } : {}) }),
+    });
+
+    expect(store.get()).toEqual(DEFAULT_THREAD_NAMER_CONFIG);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      obj: { file, err: expect.any(Error) },
+      msg: "thread namer config load failed; using defaults",
+    });
+    expect(() => store.reload()).toThrow();
   });
 });
 

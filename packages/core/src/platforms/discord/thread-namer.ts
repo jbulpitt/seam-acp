@@ -84,6 +84,10 @@ export const ThreadNamerConfigSchema = z.object({
   roles: z.array(MatchRuleSchema).max(100),
 });
 
+export interface ThreadNamerConfigLogger {
+  warn(obj: unknown, msg?: string): void;
+}
+
 /** Parse the namer card's exact `match=replacement @agent` line grammar. */
 export function parseThreadNamerRules(
   text: string,
@@ -140,9 +144,21 @@ function cloneConfig(config: ThreadNamerConfig): ThreadNamerConfig {
 export class ThreadNamerConfigStore {
   private config: ThreadNamerConfig;
 
-  constructor(readonly file: string) {
+  constructor(
+    readonly file: string,
+    private readonly logger?: ThreadNamerConfigLogger
+  ) {
     this.config = cloneConfig(DEFAULT_THREAD_NAMER_CONFIG);
-    if (fs.existsSync(file)) this.reload();
+    if (fs.existsSync(file)) {
+      try {
+        this.reload();
+      } catch (err) {
+        this.logger?.warn(
+          { err, file },
+          "thread namer config load failed; using defaults"
+        );
+      }
+    }
   }
 
   get(): ThreadNamerConfig {

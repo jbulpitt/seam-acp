@@ -185,6 +185,11 @@ export interface SeamMcpServerDeps {
   listThreads?: (record: SessionRecord) => Promise<ThreadEntry[]>;
   /** Resolve one target thread. The tool independently enforces same-channel scope. */
   resolveThread?: (threadId: string) => SessionRecord | null | undefined;
+  /** Authoritative platform existence check for an addressed thread. Undefined
+   *  means confirmed gone; rejection means the platform could not be checked. */
+  getThreadLiveState?: (
+    threadId: string
+  ) => Promise<{ locked: boolean; archived: boolean } | undefined>;
   /** Apply an already-addressed cross-thread session configuration (#129). */
   configureThread?: (
     caller: SessionRecord,
@@ -1864,6 +1869,8 @@ export class SeamMcpServer {
     }
     const target = this.resolveSameChannelTarget(caller, requireString(args, "thread"));
     if (!target.ok) return textResult(target.error, true);
+    const liveError = await this.threadLiveError(target.record.channelRef);
+    if (liveError) return textResult(liveError, true);
     const input: ConfigureThreadInput = {
       ...(optionalString(args, "agent") ? { agent: optionalString(args, "agent") } : {}),
       ...(optionalString(args, "model") ? { model: optionalString(args, "model") } : {}),
@@ -1915,6 +1922,8 @@ export class SeamMcpServer {
     }
     const target = this.resolveSameChannelTarget(caller, requireString(args, "thread"));
     if (!target.ok) return textResult(target.error, true);
+    const liveError = await this.threadLiveError(target.record.channelRef);
+    if (liveError) return textResult(liveError, true);
     const outcome = await this.deps.resetThreadSession(target.record);
     return textResult(JSON.stringify(outcome, null, 2), !outcome.ok);
   }
@@ -1997,6 +2006,22 @@ export class SeamMcpServer {
     return { ok: true, record: target };
   }
 
+  /** Fail closed before mutating or dispatching to a dead/stale thread record.
+   *  The session store deliberately retains deleted threads for roster history,
+   *  so existence must come from the platform rather than resolveThread(). */
+  private async threadLiveError(threadId: string): Promise<string | undefined> {
+    if (!this.deps.getThreadLiveState) return undefined;
+    try {
+      const state = await this.deps.getThreadLiveState(threadId);
+      return state === undefined
+        ? `Refused: thread ${threadId} no longer exists on Discord.`
+        : undefined;
+    } catch (err) {
+      this.logger.warn({ err, thread: threadId }, "seam-mcp target live-state check failed");
+      return `Refused: could not verify that thread ${threadId} still exists; no action was taken.`;
+    }
+  }
+
   private async toolHandoff(
     caller: SessionRecord,
     args: Record<string, unknown>
@@ -2008,6 +2033,10 @@ export class SeamMcpServer {
     const watchFeedback = optionalBool(args, "watchFeedback");
     const parsed = parseDispatchWorker(worker);
     const toThread = parsed.kind === "thread";
+    if (toThread) {
+      const liveError = await this.threadLiveError(parsed.threadId);
+      if (liveError) return textResult(liveError, true);
+    }
     const dispatchId = randomUUID();
 
     // A thread-id worker runs live in that teammate's own session; a preset name

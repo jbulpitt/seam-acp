@@ -176,6 +176,7 @@ async function makeHarness(opts?: {
   searchMessages?: SeamMcpServerDeps["searchMessages"];
   listThreads?: SeamMcpServerDeps["listThreads"];
   resolveThread?: SeamMcpServerDeps["resolveThread"];
+  getThreadLiveState?: SeamMcpServerDeps["getThreadLiveState"];
   configureThread?: SeamMcpServerDeps["configureThread"];
   resetThreadSession?: SeamMcpServerDeps["resetThreadSession"];
   prepareSelfMigration?: SeamMcpServerDeps["prepareSelfMigration"];
@@ -279,6 +280,7 @@ async function makeHarness(opts?: {
     ...(opts?.searchMessages ? { searchMessages: opts.searchMessages } : {}),
     ...(opts?.listThreads ? { listThreads: opts.listThreads } : {}),
     ...(opts?.resolveThread ? { resolveThread: opts.resolveThread } : {}),
+    ...(opts?.getThreadLiveState ? { getThreadLiveState: opts.getThreadLiveState } : {}),
     ...(opts?.configureThread ? { configureThread: opts.configureThread } : {}),
     ...(opts?.resetThreadSession ? { resetThreadSession: opts.resetThreadSession } : {}),
     ...(opts?.prepareSelfMigration ? { prepareSelfMigration: opts.prepareSelfMigration } : {}),
@@ -563,6 +565,42 @@ describe("SeamMcpServer", () => {
     }
     expect(configureThread).not.toHaveBeenCalled();
     expect(resetThreadSession).not.toHaveBeenCalled();
+  });
+
+  it("refuses configuration, reset, and handoff when Discord confirms the thread is gone", async () => {
+    const target = makeRecord({
+      id: "discord:1543324943146553364",
+      channelRef: "1543324943146553364",
+      parentRef: "chan-1",
+    });
+    const configureThread = vi.fn();
+    const resetThreadSession = vi.fn();
+    const getThreadLiveState = vi.fn(async () => undefined);
+    h = await makeHarness({
+      resolveThread: (id) => id === target.channelRef ? target : undefined,
+      getThreadLiveState,
+      configureThread,
+      resetThreadSession,
+    });
+
+    for (const [name, args] of [
+      ["configure_thread", { thread: target.channelRef, role: "worker" }],
+      ["reset_thread_session", { thread: target.channelRef }],
+      ["handoff", { worker: target.channelRef, prompt: "do work" }],
+    ] as const) {
+      const { body } = await h.call(
+        "tools/call",
+        { name, arguments: args },
+        { "X-Seam-Session": "good-token" }
+      );
+      expect(body.result.isError).toBe(true);
+      expect(body.result.content[0].text).toContain("no longer exists on Discord");
+    }
+
+    expect(getThreadLiveState).toHaveBeenCalledTimes(3);
+    expect(configureThread).not.toHaveBeenCalled();
+    expect(resetThreadSession).not.toHaveBeenCalled();
+    expect(h.enqueued).toHaveLength(0);
   });
 
   it("migrate_self stages a manifest only for the token-resolved calling thread", async () => {

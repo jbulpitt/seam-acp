@@ -1466,7 +1466,12 @@ export class DiscordAdapter implements ChatAdapter {
     channel: ChannelRef
   ): Promise<{ locked: boolean; archived: boolean } | undefined> {
     try {
-      const ch = await this.client.channels.fetch(channel.id);
+      // This method is the authoritative existence check for threads(). A
+      // cache-first fetch can return a ThreadChannel after its Discord thread
+      // was deleted while the gateway event was missed, leaving a dead session
+      // looking addressable indefinitely. Force REST so Unknown Channel is
+      // observed even when Discord.js still holds a stale cache entry.
+      const ch = await this.client.channels.fetch(channel.id, { force: true });
       if (!ch) return undefined; // gone
       // Obfuscated = bot lacks VIEW_CHANNEL. Treat as locked (do not post);
       // do not treat as deleted (would drop schedules).

@@ -73,4 +73,23 @@ describe("DiscordAdapter.fetchMessagePage", () => {
       }),
     ]);
   });
+
+  it("forces the platform lookup when checking whether a thread still exists", async () => {
+    const logger = { child: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    logger.child.mockReturnValue(logger);
+    const adapter = new DiscordAdapter({
+      config: {
+        DISCORD_ALLOWED_USER_IDS: new Set(["human"]),
+        DISCORD_USER_NAMES: new Map(),
+      } as any,
+      logger: logger as any,
+    });
+    const fetch = vi.fn(async () => null);
+    (adapter as any).client.channels.fetch = fetch;
+
+    await expect(
+      adapter.getThreadLiveState({ platform: "discord", id: "deleted-thread" })
+    ).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledWith("deleted-thread", { force: true });
+  });
 });

@@ -660,6 +660,8 @@ async function main(): Promise<void> {
       },
       enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
       resolveThread: (threadId) => store.getByChannel("discord", threadId),
+      getThreadLiveState: (threadId) =>
+        adapter.getThreadLiveState({ platform: "discord", id: threadId }),
       configureThread: async (caller, target, input) => {
         const outcome = await threadSessionControl.configure(caller, target, input);
         if (!outcome.ok) return outcome;

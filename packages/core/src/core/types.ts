@@ -200,7 +200,7 @@ export interface StatusPanel {
   state: TurnState;
   repoDisplay: string;
   model: string;
-  /** Resolved API model id (e.g. "claude-opus-4-8[1m]"), if different from model alias. */
+  /** Resolved API model id (e.g. "claude-opus-4-8"), if different from model alias. */
   resolvedModel?: string;
   /** Reasoning effort for this turn, if set (low|medium|high|xhigh|max). */
   effort?: string;

@@ -16,7 +16,7 @@ export interface StatusPanelInput {
   startedUtc: number;
   repoDisplay: string;
   model: string;
-  /** Resolved API model id (e.g. "claude-opus-4-8[1m]"), if different from model alias. */
+  /** Resolved API model id (e.g. "claude-opus-4-8"), if different from model alias. */
   resolvedModel?: string;
   /** Reasoning effort for this turn, if set. */
   effort?: string;
@@ -89,7 +89,7 @@ export class TurnStatus {
   state: TurnState = "Working";
   action = "Starting…";
   model: string;
-  /** Resolved API model id returned by getUsage (e.g. "claude-opus-4-8[1m]").
+  /** Resolved API model id returned by getUsage (e.g. "claude-opus-4-8").
    *  Set after the turn completes; cleared on each new TurnStatus instance. */
   resolvedModel?: string;
   /** Reasoning effort for this turn (low|medium|high|xhigh|max), or undefined

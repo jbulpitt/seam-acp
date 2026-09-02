@@ -1,7 +1,11 @@
 import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 const acp = await import("@agentclientprotocol/sdk");
-for (const model of ["sonnet", "opus", "opus[1m]", "haiku"]) {
+for (const model of [
+  "claude-fable-5-1",
+  "claude-opus-5",
+  "claude-sonnet-5",
+]) {
   const proc = spawn("claude-agent-acp", [], {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, MAX_THINKING_TOKENS: "16000", ANTHROPIC_MODEL: model },

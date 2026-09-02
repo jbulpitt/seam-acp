@@ -238,13 +238,13 @@ Key variables are defined and validated in `src/config.ts`. Notable ones:
 
 After changing `.env`, run `npm run redeploy` to rebuild and restart.
 
-## ⚠️ CRITICAL: Claude model & effort selection is a minefield
+## ⚠️ CRITICAL: Claude model & effort selection requires verification
 
-The `claude-agent-acp` wrapper resolves model strings **inconsistently and
-silently wrong** (e.g. the alias `opus[1m]` resolves to *Sonnet*; the full ID
-`claude-sonnet-4-6[1m]` silently gives a 200K window). Months of work once ran
-on the wrong model because of this. **Do not trust model aliases, labels, or a
-model's self-report.** Before changing anything about Claude models or effort:
+Older `claude-agent-acp` releases resolved some aliases and full IDs
+inconsistently, and months of work once ran on the wrong model. The current
+picker avoids those historical variants, but **do not trust model aliases,
+labels, or a model's self-report.** Before changing anything about Claude models
+or effort:
 
 **READ `docs/model-management-runbook.md` first.** It is the authoritative,
 empirical process. Key non-negotiables from it:
@@ -260,8 +260,9 @@ empirical process. Key non-negotiables from it:
   the Seam Claude profile forwards canonical IDs through `ANTHROPIC_MODEL`.
   Every picker entry was JSONL-verified on 2026-09-02; `default` resolves to
   Claude Opus 5 with a 1M window.
-- **The `CLAUDE_MODELS` picker in `.env`** contains only JSONL-verified entries.
-  Don't add a model without running the §4 probe in the runbook.
+- **The `CLAUDE_MODELS` picker in `.env`** contains only JSONL-verified,
+  native-1M entries. Don't add a model without running the §4 probe in the
+  runbook.
 - **No `[1m]` suffix** — each model's native context window is declared in the
   `CLAUDE_CONTEXT_WINDOWS` table (`packages/adapters/src/profiles/claude.ts`), which drives
   the compaction threshold; the agent also reports the true window at runtime via

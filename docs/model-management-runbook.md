@@ -78,11 +78,8 @@ model's native window comes from the `CLAUDE_CONTEXT_WINDOWS` table in
 | `claude-opus-5` | claude-opus-5 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
 | `claude-opus-4-8` | claude-opus-4-8 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
 | `claude-opus-4-7` | claude-opus-4-7 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
-| `claude-opus-4-6` | claude-opus-4-6 | 200K | full ID (`ANTHROPIC_MODEL` + exact-match) |
 | `claude-fable-5` | claude-fable-5 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
 | `claude-sonnet-5` | claude-sonnet-5 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
-| `claude-sonnet-4-6` | claude-sonnet-4-6 | 200K | full ID (`ANTHROPIC_MODEL` + exact-match) |
-| `claude-haiku-4-5` | claude-haiku-4-5-20251001 | 200K | full ID (`ANTHROPIC_MODEL` + exact-match) |
 
 **Account caveat (covered, but keep testing):** a raw 0.73.0 wrapper session on
 this account still rejects some full IDs that are absent from its advertised
@@ -95,17 +92,16 @@ mechanism. Do not remove the forwarding merely because `default` works.
 `opus`, `best` → resolve to a non-Opus family. Do not add aliases that fuzzy-match.
 
 Two non-obvious truths this table encodes:
-1. **The `[1m]` suffix is retired and is NOT load-bearing.** Model IDs are bare;
+1. **The `[1m]` suffix is not part of Seam.** Model IDs are bare;
    the JSONL model id (`claude-opus-4-8`) matches what you passed. Each model's
    native window is declared in the `CLAUDE_CONTEXT_WINDOWS` table in `claude.ts`,
    resolved by `getClaudeContextWindow(modelId)` and stamped onto every picker
    entry (`contextLimit`) by `withClaudeContextLimits` — so the orchestrator's
    `staticModels[].contextLimit → modelContextFloor` path seeds the window on
-   turn 1, and the agent's runtime `UsageUpdate.size` refines it. (`getClaudeContextWindow`
-   still strips any residual legacy `[1m]` for safety, but nothing relies on it.)
-2. **Fable 5.1, Opus 5/4.7/4.8, Fable 5, and Sonnet 5 are 1M; Opus 4.6, Sonnet 4.6, and Haiku are
-   200K** — the window is a property of the model, declared in the table, not of a
-   string suffix.
+   turn 1, and the agent's runtime `UsageUpdate.size` refines it.
+2. **Every model admitted to this picker has a native 1M window.** Legacy 200K
+   choices were removed on 2026-09-02, so the picker does not need window
+   variants or window labels.
 
 ---
 
@@ -139,8 +135,8 @@ Two independent things must both be right:
    table via `getClaudeContextWindow()` in `packages/adapters/src/profiles/claude.ts`.
 
 A model can run correctly but get a wrong compaction threshold if its window is
-missing from `CLAUDE_CONTEXT_WINDOWS` (falls through to the family heuristic or
-the 200K default). Check both.
+missing from `CLAUDE_CONTEXT_WINDOWS` (falls through to the conservative 200K
+default). Check both.
 
 ---
 
@@ -282,11 +278,8 @@ const MODELS = [
   "claude-opus-5",
   "claude-opus-4-8",
   "claude-opus-4-7",
-  "claude-opus-4-6",
   "claude-fable-5",
   "claude-sonnet-5",
-  "claude-sonnet-4-6",
-  "claude-haiku-4-5",
 ];
 
 async function probe(modelId) {
@@ -357,9 +350,9 @@ timeout 300 node /tmp/probe-models.mjs 2>/dev/null
    caveat in §5 for the fix.
 2. `API model` matches the model you intended (e.g. `default` → `claude-opus-5`,
    NOT a different family).
-3. `window` matches the label you plan to show (1M vs 200K), AND `getClaudeContextWindow`
+3. `window` matches the expected model capability, AND `getClaudeContextWindow`
    returns the same value for that ID (§6). A 1M model whose ID is missing from
-   `CLAUDE_CONTEXT_WINDOWS` (and not caught by the family heuristic) would seed a
+   `CLAUDE_CONTEXT_WINDOWS` would seed a
    200K compaction threshold.
 4. `sizes` shows the expected window; a 1M model typically shows `200000,1000000`
    (the agent's runtime `UsageUpdate.size` overwriting the 200K default — see §4a).
@@ -379,7 +372,7 @@ To get the real window independent of the wrapper, ask the **raw Claude Code
 CLI**, which computes the window from genuine model metadata:
 
 ```bash
-for m in claude-opus-4-6 claude-opus-4-8 claude-sonnet-4-6 claude-sonnet-5; do
+for m in claude-fable-5-1 claude-opus-5 claude-opus-4-8 claude-opus-4-7 claude-fable-5 claude-sonnet-5; do
   echo "=== $m ==="
   timeout 40 claude --model "$m" -p "/context" 2>/dev/null | grep -iE "Model:|Tokens:"
 done
@@ -387,8 +380,7 @@ done
 
 `/context` prints e.g. `**Tokens:** 23.6k / 200k (12%)` — the denominator is the
 authoritative window. **A window claim is only proven when the raw CLI `/context`
-agrees with it.** (Empirically: bare `claude-opus-4-6` = 200K, `claude-opus-4-8`
-= 1M in the raw CLI.)
+agrees with it.**
 
 **Known traps to re-confirm every time:**
 - `opus`, `best` → fuzzy-resolve to a **different family**. Never put an alias
@@ -396,8 +388,7 @@ agrees with it.** (Empirically: bare `claude-opus-4-6` = 200K, `claude-opus-4-8`
 - **Raw un-advertised full IDs may be REJECTED** by `setSessionConfigOption`.
   The Seam profile's `ANTHROPIC_MODEL` forwarding is required for the full-ID
   picker rows and must be active in the probe.
-- A 1M model whose window is **missing from `CLAUDE_CONTEXT_WINDOWS`** (and not
-  matched by the family heuristic in `claudeContextWindowFamily`) makes seam-acp
+- A 1M model whose window is **missing from `CLAUDE_CONTEXT_WINDOWS`** makes seam-acp
   compute a **200K compaction threshold** → premature compaction. Add it to the
   table (§6). The `[1m]` suffix is retired and does NOT influence this — the table
   is the single source of truth.
@@ -415,9 +406,8 @@ Rules (enforced by §4 evidence, not by intuition):
 - **Bare full IDs only — no `[1m]` suffix.** The suffix is retired; window is a
   property of the model, declared in `CLAUDE_CONTEXT_WINDOWS` (§6), not the string.
   Current picker: `claude-fable-5-1`, `claude-opus-5`, `claude-opus-4-8`,
-  `claude-opus-4-7`, `claude-opus-4-6`, `claude-fable-5`, `claude-sonnet-5`,
-  `claude-sonnet-4-6`, `claude-haiku-4-5`,
-  plus the `default` alias.
+  `claude-opus-4-7`, `claude-fable-5`, and `claude-sonnet-5`, plus the
+  `default` alias.
 - **One entry per model.** No trap variants, no redundant pairs.
 - **`default`** → the auto-rolling "latest Opus @ 1M" entry (Max tier); the proven
   path (always advertised).
@@ -425,10 +415,9 @@ Rules (enforced by §4 evidence, not by intuition):
   un-advertised full ID. Seam's profile forwards canonical full IDs through
   `ANTHROPIC_MODEL`; §4 must exercise that path and confirm both JSONL model and
   context window before a new row is admitted.
-- **Aliases** (`sonnet`, `haiku`) may be used for auto-roll where advertised; do
-  NOT add a fuzzy-matching alias like `opus`/`best`.
-- Label format: `Name • <window> 🪟` (+ `⭐` for the recommended default). The
-  window in the label MUST match the §4-verified / `CLAUDE_CONTEXT_WINDOWS` window.
+- Do not add fuzzy-matching aliases like `opus`/`best`.
+- Label format: `Name` (+ `⭐` for the recommended default). All admitted models
+  are native 1M, so context-window labels are intentionally omitted.
 
 After editing `.env`, **re-run §4** for every entry you added or changed. Then
 update the compaction table if needed (§6) and deploy:
@@ -453,10 +442,9 @@ reports the true window at runtime via `UsageUpdate.size`, which refines the
 display once a turn completes — but the compaction threshold is computed up front
 from this table, so the table must be right.)
 
-The window is resolved by an **exact-match table** (`CLAUDE_CONTEXT_WINDOWS`) with
-a family-heuristic fallback (`claudeContextWindowFamily`) and a `default` → 1M
-special case. `[1m]` is no longer meaningful (it's stripped for legacy safety
-only). For **every** model in `CLAUDE_MODELS`, confirm `getClaudeContextWindow`
+The window is resolved by an **exact-match table** (`CLAUDE_CONTEXT_WINDOWS`) and
+a `default` → 1M special case. Unknown models conservatively fall back to 200K.
+For **every** model in `CLAUDE_MODELS`, confirm `getClaudeContextWindow`
 returns the same window §4 proved — call the real exported function so the check
 can't drift from the implementation:
 
@@ -464,15 +452,14 @@ can't drift from the implementation:
 node -e '
 require("tsx/cjs");
 const { getClaudeContextWindow } = require("./packages/adapters/src/profiles/claude.ts");
-for (const m of ["default","claude-fable-5-1","claude-opus-5","claude-opus-4-8","claude-opus-4-7","claude-opus-4-6","claude-fable-5","claude-sonnet-5","claude-sonnet-4-6","claude-haiku-4-5"]) {
+for (const m of ["default","claude-fable-5-1","claude-opus-5","claude-opus-4-8","claude-opus-4-7","claude-fable-5","claude-sonnet-5"]) {
   console.log(m.padEnd(24), "→ compaction window:", getClaudeContextWindow(m));
 }
 ' 2>/dev/null || echo "(no tsx loader? import from the built dist/ instead, or read CLAUDE_CONTEXT_WINDOWS directly)"
 ```
 
 Each line must equal the §4 `window`. If a 1M model shows 200K here, **add it to
-the `CLAUDE_CONTEXT_WINDOWS` table** in `claude.ts` (or extend
-`claudeContextWindowFamily` for a whole new family), rebuild, and re-run.
+the `CLAUDE_CONTEXT_WINDOWS` table** in `claude.ts`, rebuild, and re-run.
 
 ---
 
@@ -554,10 +541,8 @@ target):
 node -e '
 const D=require("./node_modules/better-sqlite3");
 const db=new D("./data/seam.db");
-// Stale/removed values to sweep. The `[1m]`-suffixed IDs are legacy: they no
-// longer appear in the picker, so any session still carrying one should migrate
-// to its bare equivalent (or to `default`, the always-advertised proven path).
-const broken=["opus","opus[1m]","best","claude-opus-4-8[1m]","claude-opus-4-7[1m]","claude-opus-4-6[1m]","claude-sonnet-4-6[1m]","claude-sonnet-5[1m]","claude-fable-5[1m]"];
+// Removed picker values should migrate to the always-advertised proven path.
+const broken=["opus","best","claude-opus-4-6","claude-sonnet-4-6","claude-haiku-4-5"];
 const target="default";
 let n=0;
 for(const r of db.prepare("SELECT id,config_json FROM sessions WHERE agent_id LIKE ?").all("%claude%")){

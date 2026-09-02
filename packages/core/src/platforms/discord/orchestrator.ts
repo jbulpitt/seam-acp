@@ -2545,8 +2545,8 @@ export class Orchestrator {
             const computedSize = modelEntry?.contextLimit ?? usage?.contextLimit ?? 0;
             // `used` may legitimately drop (post-compaction), so we bypass its
             // ceiling. But the window must never shrink: getUsage can return a
-            // stale 200K default when the JSONL model id (which has [1m]
-            // stripped, e.g. "claude-opus-4-8") doesn't reveal the real window.
+            // stale 200K default when the bridge has not yet reported the
+            // selected model's real window.
             // Trust the larger of the computed value and what the live stream /
             // cache already established for this turn.
             const size = Math.max(status.contextWindowSize, computedSize);
@@ -2554,7 +2554,7 @@ export class Orchestrator {
               status.contextUsedHighWater = usage.totalUsed;
               status.contextWindowSize = size;
               status.context = formatContextUsage(usage.totalUsed, size);
-              // Record the resolved model id (e.g. "claude-opus-4-8[1m]") so
+              // Record the resolved model id (e.g. "claude-opus-4-8") so
               // the status card can display the actual model alongside the alias.
               if (usage.model) {
                 status.resolvedModel = usage.model;
@@ -3478,8 +3478,8 @@ export class Orchestrator {
   }
 
   /** Build a premium-compaction `runAgent`: each call spawns a FRESH throwaway
-   *  AgentRuntime (model "default" → real Opus @ 1M; the "opus[1m]" alias
-   *  mis-resolves) in cwd /tmp so the analysis sessions never pollute the real
+   *  AgentRuntime (model "default" → real Opus @ 1M) in cwd /tmp so the
+   *  analysis sessions never pollute the real
    *  project's session list, collects the agent's text, and tears down +
    *  deletes the temp session. Fresh-per-call is required: the pipeline fans out
    *  ~16 concurrent calls, and a shared session would accumulate context and
@@ -17214,7 +17214,6 @@ function usageLine(pct: number | null, label: string): string {
  *  BEFORE spawning the temp runtime that would learn it from usage_update. */
 const COMPACTION_MODEL_WINDOWS: Record<string, number> = {
   default: 1_000_000, // resolves to latest Opus @ 1M on this account
-  "opus[1m]": 1_000_000,
   "gpt-5.5": 400_000,
   "Gemini 3.1 Pro (High)": 1_000_000,
   "Claude Opus 4.6 (Thinking)": 250_000,

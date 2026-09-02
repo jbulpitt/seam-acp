@@ -160,7 +160,7 @@ export function makeClaudeProfile(opts: {
         env.ANTHROPIC_DEFAULT_OPUS_MODEL = modelOverride;
       } else if (modelOverride && isForwardableFullModelId(modelOverride)) {
         // Direct Anthropic backend: this account's claude-agent-acp advertises
-        // only a fixed alias set (default/sonnet/haiku/opus[1m]/…). A full
+        // only a fixed alias set. A full
         // canonical ID that isn't advertised (e.g. a model that shipped after
         // this CLI version) is REJECTED by setSessionConfigOption("model", …)
         // with "Invalid value for config option model", and the session
@@ -832,34 +832,22 @@ function pickStringField(
  *  staticModels `contextLimit` the orchestrator uses to seed the display window.
  *
  *  Since claude-agent-acp ≥0.42 resolves full canonical IDs correctly and 1.x
- *  reports the true window at runtime (ACP UsageUpdate.size), model IDs no
- *  longer carry a `[1m]` suffix — each model just declares its native window
- *  here, and the agent-reported size refines this seed once a turn completes. */
-const CLAUDE_CONTEXT_WINDOWS: Record<string, number> = {
+ *  reports the true window at runtime (ACP UsageUpdate.size), picker IDs carry
+ *  no context-selection variant — each model declares its native window here,
+ *  and the agent-reported size refines this seed once a turn completes. */
+const CLAUDE_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
   "claude-fable-5-1": 1_000_000,
   "claude-opus-5": 1_000_000,
   "claude-opus-4-8": 1_000_000,
   "claude-opus-4-7": 1_000_000,
-  "claude-opus-4-6": 200_000,
   "claude-fable-5": 1_000_000,
   "claude-sonnet-5": 1_000_000,
-  "claude-sonnet-4-6": 200_000,
-  "claude-haiku-4-5": 200_000,
 };
-
-/** Family fallback for ids not in the exact table (dated ids, future point
- *  releases): Opus 4.7+ and Opus 5+, Sonnet 5+, and Fable/Mythos 5+ are 1M;
- *  Opus 4.6 and older, Sonnet 4.6 and older, and Haiku are 200K. */
-function claudeContextWindowFamily(id: string): number {
-  if (/opus-(?:4[.-](?:[7-9]|\d{2,})|[5-9]|\d{2,})\b/.test(id)) return 1_000_000;
-  if (/(?:sonnet|fable|mythos)-(?:[5-9]|\d{2,})\b/.test(id)) return 1_000_000;
-  return 200_000;
-}
 
 /** Whether a model id should be force-forwarded to the direct Anthropic backend
  *  via `ANTHROPIC_MODEL` at spawn time (see `spawn()`). True for full canonical
- *  Claude IDs (`claude-<family>-<version>`, e.g. `claude-opus-5`,
- *  `claude-sonnet-4-6`), which an older claude-agent-acp may not advertise and
+ *  Claude IDs (`claude-<family>-<version>`, e.g. `claude-opus-5`), which
+ *  claude-agent-acp may not advertise and
  *  would therefore REJECT via `set_config_option` — forwarding makes them
  *  reachable + selected with no CLI upgrade. False for aliases (`default`,
  *  `sonnet`, `haiku`, `opus`, …) and empty values: those resolve through the
@@ -877,10 +865,9 @@ export function getClaudeContextWindow(modelId?: string): number {
   if (!modelId) return 200_000;
   // `default` resolves to the latest Opus on Max/Team-Premium → 1M. (On lower
   // tiers it is Sonnet 200K; revisit if this bot ever runs on a non-Max account.)
-  const id = modelId.trim().toLowerCase().replace(/\[1m\]$/, "");
+  const id = modelId.trim().toLowerCase();
   if (id === "default") return 1_000_000;
-  if (/\b1m\b/.test(id)) return 1_000_000; // tolerate any residual legacy suffix
-  return CLAUDE_CONTEXT_WINDOWS[id] ?? claudeContextWindowFamily(id);
+  return CLAUDE_CONTEXT_WINDOWS[id] ?? 200_000;
 }
 
 /** Stamp each picker entry with its canonical contextLimit so the orchestrator's

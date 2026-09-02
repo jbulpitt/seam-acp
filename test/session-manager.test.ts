@@ -14,7 +14,7 @@ describe("cleanTextForPreview", () => {
   });
 
   it("filters out model configuration messages", () => {
-    const text = "Set model to claude-opus-4-7[1m]\nAnother message here.";
+    const text = "Set model to claude-opus-4-7\nAnother message here.";
     const result = cleanTextForPreview(text);
     expect(result).toBe("Another message here.");
   });
@@ -133,4 +133,3 @@ describe("Copilot Session Manager", () => {
     ]);
   });
 });
-

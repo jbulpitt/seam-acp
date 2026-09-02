@@ -228,19 +228,18 @@ account from `<config-dir>/.credentials.json` (and a couple of fallbacks).
 If that fails (file format changes upstream, etc.) the command still
 reports which profile id you're on.
 
-#### ⚠️ Claude model selection & the `claude-agent-acp` resolver
+#### ⚠️ Claude model verification
 
-Claude model handling has a sharp edge: the `claude-agent-acp` wrapper resolves
-model strings **inconsistently** — some aliases and full IDs silently resolve to
-the wrong model or the wrong context window. For example, the alias `opus[1m]`
-resolves to *Sonnet*, and the full ID `claude-sonnet-4-6[1m]` silently gives a
-200K window instead of 1M.
+Older `claude-agent-acp` releases resolved some aliases and full IDs to the
+wrong model or context window. The current integration avoids that historical
+surface by exposing only verified, native-context canonical IDs.
 
 Because of this:
 
 - The `CLAUDE_MODELS` picker in `.env` contains only **empirically verified**
   entries (each one checked against JSONL ground truth, not the model's
-  self-report). Don't add a model without verifying it.
+  self-report). It contains only native-1M models and does not expose context
+  variants. Don't add a model without verifying it.
 - On the current `claude-agent-acp` 0.73.0 / ACP SDK 1.4.0 stack, no local patch is needed:
   model selection goes through `setSessionConfigOption`, which exact-matches full
   canonical `claude-*` IDs against the advertised list before the fuzzy resolver.

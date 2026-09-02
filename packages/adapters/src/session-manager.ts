@@ -79,7 +79,7 @@ export function cleanTextForPreview(text: string): string {
     // Skip slash commands (e.g. /model model default)
     if (/^\/[a-zA-Z]/.test(line)) continue;
 
-    // Skip model configuration messages (e.g. Set model to claude-opus-4-7[1m], model default, model: claude)
+    // Skip model configuration messages (e.g. Set model to claude-opus-4-7, model default, model: claude)
     if (/^(set\s+|active\s+|current\s+)?model\s*(to\b|is\b|default\b|set\b|:)/i.test(line)) continue;
     if (/^set\s+model\b/i.test(line)) continue;
 
@@ -130,4 +130,3 @@ export function cleanTextForPreview(text: string): string {
   // Join the final lines with a space
   return finalLines.join(" ").trim();
 }
-

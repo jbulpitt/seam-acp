@@ -101,7 +101,7 @@ describe("/seam slash command", () => {
     }
   });
 
-  it("config group has the 17 config leaves including card, gif, detach, tts, and edit", () => {
+  it("config group has the 20 config leaves including role, rename, and namer", () => {
     const config = built().options?.find((o) => o.name === "config");
     expect(config?.type).toBe(SUB_COMMAND_GROUP);
     const names = (config?.options ?? []).map((o) => o.name);
@@ -109,6 +109,7 @@ describe("/seam slash command", () => {
       "model",
       "effort",
       "agent",
+      "role",
       "mode",
       "repo",
       "tools",
@@ -123,8 +124,10 @@ describe("/seam slash command", () => {
       "edit",
       "set",
       "audit",
+      "rename",
+      "namer",
     ]);
-    expect(names).toHaveLength(17);
+    expect(names).toHaveLength(20);
     const gif = (config?.options ?? []).find((o) => o.name === "gif");
     expect(gif?.options?.find((o) => o.name === "state")?.required ?? false).toBe(false);
     const detach = (config?.options ?? []).find((o) => o.name === "detach");
@@ -213,7 +216,7 @@ describe("/seam slash command", () => {
     expect(opts[2]?.type).toBe(INTEGER);
     expect(opts[2]?.required ?? false).toBe(false);
     expect((opts[2] as Opt & { min_value?: number }).min_value).toBe(1);
-    expect((opts[2] as Opt & { max_value?: number }).max_value).toBe(9);
+    expect((opts[2] as Opt & { max_value?: number }).max_value).toBeUndefined();
     for (const leaf of ["apply", "delete", "show", "edit"]) {
       const sub = (preset?.options ?? []).find((o) => o.name === leaf);
       const nameOpt = (sub?.options ?? []).find((o) => o.name === "name");

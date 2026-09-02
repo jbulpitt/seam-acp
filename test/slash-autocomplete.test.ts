@@ -82,7 +82,6 @@ function makeOrch(over?: {
   const grokProfile = {
     id: "grok",
     displayName: "Grok",
-    threadAbbr: "🌌",
     defaultModel: "grok-4",
     staticModels: [
       { modelId: "grok-4.6", name: "Grok 4.6" },
@@ -93,7 +92,6 @@ function makeOrch(over?: {
   const copilotProfile = {
     id: "copilot",
     displayName: "Copilot",
-    threadAbbr: "🤖🛢️",
     defaultModel: "gpt-5",
     staticModels: [{ modelId: "gpt-5", name: "GPT-5" }],
     effort: { levels: [] },

@@ -54,6 +54,9 @@ function describeConfig(record: SessionRecord): ConfigDescription {
     model: cfg.model
       ? { value: cfg.model, source: "session config" }
       : { value: "default-model", source: "default" },
+    role: cfg.role
+      ? { value: cfg.role, source: "session config" }
+      : { value: null, source: "default" },
     effort: cfg.reasoningEffort
       ? { value: cfg.reasoningEffort, source: "session config" }
       : { value: null, source: "default" },
@@ -77,6 +80,9 @@ function describeConfig(record: SessionRecord): ConfigDescription {
         : { value: "full" as const, source: "default" },
     simpleCardGif: typeof cfg.simpleCardGif === "boolean"
       ? { value: cfg.simpleCardGif, source: "session config" }
+      : { value: false, source: "default" },
+    disableThreadPrefix: cfg.disableThreadPrefix === true
+      ? { value: true, source: "session config" }
       : { value: false, source: "default" },
   };
 }
@@ -195,7 +201,7 @@ describe("session config mutation (Tier A)", () => {
 // -------------------------------------------------------------------------
 
 describe("preset mutation (Tier B)", () => {
-  it("creates a project-scoped preset with an auto-numbering slug only on apply", () => {
+  it("creates a project-scoped preset with a naming role only on apply", () => {
     const record = makeRecord();
     store.upsert(record);
     const svc = makeService();
@@ -204,7 +210,7 @@ describe("preset mutation (Tier B)", () => {
         name: "reviewer",
         agent: "claude",
         model: "claude-opus-4.8",
-        threadSlug: "review",
+        role: "review",
       },
     });
     expect(built.ok).toBe(true);
@@ -217,14 +223,14 @@ describe("preset mutation (Tier B)", () => {
     expect(preset).not.toBeNull();
     expect(preset!.agentId).toBe("claude");
     expect(preset!.projectRef).toBe("chan-1");
-    expect(preset!.threadSlug).toBe("review");
+    expect(preset!.role).toBe("review");
     expect(built.proposal.fields).toContainEqual({
-      label: "threadSlug",
+      label: "role",
       before: "(unset)",
       after: "review",
     });
     expect(store.listConfigMutations()[0]!.tier).toBe("preset");
-    expect(store.listConfigMutations()[0]!.afterJson).toContain('"threadSlug":"review"');
+    expect(store.listConfigMutations()[0]!.afterJson).toContain('"role":"review"');
   });
 
   it("allows `instructions` and persists it on the preset row (#72 un-block)", () => {
@@ -484,7 +490,7 @@ describe("statusCardStyle channel/thread overlay", () => {
     expect(live.threadPresets.get(THREAD)?.statusCardStyle?.value).toBe("full");
   });
 
-  it("applyChannelOverlay writes threadSlug without the Tier-C flag", () => {
+  it("applyChannelOverlay writes role without the Tier-C flag", () => {
     const file = writePresetsFile({ channels: { [CHAN]: { model: { value: "old" } } } });
     const live = {
       channelPresets: new Map<string, ChannelPreset>(),
@@ -497,14 +503,14 @@ describe("statusCardStyle channel/thread overlay", () => {
     });
     const result = svc.applyChannelOverlay({
       channelId: CHAN,
-      changes: { threadSlug: "hist" },
+      changes: { role: "analyst" },
       actor: { id: "user-jesse", name: "Jesse" },
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-    expect(raw.channels[CHAN].threadSlug).toEqual({ value: "hist" });
-    expect(live.channelPresets.get(CHAN)?.threadSlug?.value).toBe("hist");
+    expect(raw.channels[CHAN].role).toEqual({ value: "analyst" });
+    expect(live.channelPresets.get(CHAN)?.role?.value).toBe("analyst");
   });
 
   it("applyChannelOverlay writes cwd without the Tier-C flag", () => {

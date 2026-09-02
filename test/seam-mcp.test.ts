@@ -444,14 +444,24 @@ describe("SeamMcpServer", () => {
     const configPropose = body.result.tools.find(
       (t: { name: string }) => t.name === "config_propose"
     );
-    expect(configPropose.inputSchema.properties.preset.properties.threadSlug).toMatchObject({
+    expect(configPropose.inputSchema.properties.preset.properties.role).toMatchObject({
       type: "string",
     });
-    expect(configPropose.inputSchema.properties.threadPreset.properties.threadSlug).toMatchObject({
+    expect(configPropose.inputSchema.properties.threadPreset.properties.role).toMatchObject({
       type: "string",
     });
-    expect(configPropose.inputSchema.properties.channelPreset.properties.threadSlug).toMatchObject({
+    expect(configPropose.inputSchema.properties.channelPreset.properties.role).toMatchObject({
       type: "string",
+    });
+    expect(configPropose.inputSchema.properties.preset.properties.disableThreadPrefix).toMatchObject({
+      type: "boolean",
+    });
+    const configureThread = body.result.tools.find(
+      (t: { name: string }) => t.name === "configure_thread"
+    );
+    expect(configureThread.inputSchema.properties.role).toMatchObject({ type: "string" });
+    expect(configureThread.inputSchema.properties.disableThreadPrefix).toMatchObject({
+      type: "boolean",
     });
   });
 
@@ -463,11 +473,19 @@ describe("SeamMcpServer", () => {
     });
     const configureThread = vi.fn(async () => ({
       ok: true as const,
-      applied: { agent: "claude", model: "claude-new", effort: "high" },
+      applied: {
+        agent: "claude",
+        model: "claude-new",
+        effort: "high",
+        role: "analyst",
+        disableThreadPrefix: true,
+      },
       changes: {
         agent: { before: "claude", after: "claude", changed: false },
         model: { before: "claude-old", after: "claude-new", changed: true },
         effort: { before: "auto", after: "high", changed: true },
+        role: { before: "auto", after: "analyst", changed: true },
+        disableThreadPrefix: { before: "enabled", after: "disabled", changed: true },
       },
       sessionReset: false,
       runtimeReloaded: true,
@@ -489,7 +507,13 @@ describe("SeamMcpServer", () => {
       "tools/call",
       {
         name: "configure_thread",
-        arguments: { thread: "thread-target", model: "claude-new", effort: "high" },
+        arguments: {
+          thread: "thread-target",
+          model: "claude-new",
+          effort: "high",
+          role: "analyst",
+          disableThreadPrefix: true,
+        },
       },
       { "X-Seam-Session": "good-token" }
     );
@@ -499,11 +523,13 @@ describe("SeamMcpServer", () => {
     expect(body.result.content[0].text).toContain("Agent: claude (no change)");
     expect(body.result.content[0].text).toContain("Model: claude-new (changed from claude-old)");
     expect(body.result.content[0].text).toContain("Effort: high (changed from auto)");
+    expect(body.result.content[0].text).toContain("Role: analyst (changed from auto)");
+    expect(body.result.content[0].text).toContain("Auto-name: disabled (changed from enabled)");
     expect(body.result.content[0].text).toContain("runtime reloaded; ACP session/context preserved");
     expect(configureThread).toHaveBeenCalledWith(
       expect.objectContaining({ channelRef: "thread-caller", parentRef: "chan-1" }),
       target,
-      { model: "claude-new", effort: "high" }
+      { model: "claude-new", effort: "high", role: "analyst", disableThreadPrefix: true }
     );
   });
 
@@ -2029,7 +2055,7 @@ describe("config_propose lock enforcement (D2)", () => {
     expect(body.result.content[0].text).toContain("not supported");
   });
 
-  it("forwards a preset threadSlug to the proposal service", async () => {
+  it("forwards preset role and naming opt-out to the proposal service", async () => {
     const seen: unknown[] = [];
     h = await makeHarness({
       isChannelLocked: () => false,
@@ -2038,7 +2064,7 @@ describe("config_propose lock enforcement (D2)", () => {
         return {
           ok: true,
           summary: 'Create preset "orch-opus"',
-          fields: [{ label: "threadSlug", before: "(unset)", after: "orch" }],
+          fields: [{ label: "role", before: "(unset)", after: "orch" }],
           restartsSession: false,
         };
       },
@@ -2048,16 +2074,16 @@ describe("config_propose lock enforcement (D2)", () => {
       {
         name: "config_propose",
         arguments: {
-          preset: { name: "orch-opus", agent: "claude", threadSlug: "orch" },
+          preset: { name: "orch-opus", agent: "claude", role: "orch", disableThreadPrefix: true },
         },
       },
       { "X-Seam-Session": "good-token" }
     );
     expect(body.result.isError).toBeFalsy();
     expect(seen).toEqual([
-      { preset: { name: "orch-opus", agent: "claude", threadSlug: "orch" } },
+      { preset: { name: "orch-opus", agent: "claude", role: "orch", disableThreadPrefix: true } },
     ]);
-    expect(body.result.content[0].text).toContain("threadSlug: (unset) → orch");
+    expect(body.result.content[0].text).toContain("role: (unset) → orch");
   });
 
   it("forwards a `schedule` branch to proposeConfig (#69 NL→cron write)", async () => {
@@ -2406,6 +2432,7 @@ describe("config_describe", () => {
     parentRef: "chan-1",
     agent: { value: "claude", source: "session config" as const },
     model: { value: "claude-opus-4.6", source: "channel preset" as const },
+    role: { value: "orchestrator", source: "session config" as const },
     effort: { value: "high", source: "thread preset" as const },
     cwd: { value: "/repo/x", source: "channel preset" as const },
     permission: { value: "ask", source: "default" as const },
@@ -2418,6 +2445,7 @@ describe("config_describe", () => {
     location: { value: "local", source: "default" as const },
     statusCardStyle: { value: "simple" as const, source: "channel preset" as const },
     simpleCardGif: { value: true as const, source: "channel preset" as const },
+    disableThreadPrefix: { value: false as const, source: "default" as const },
   };
 
   async function makeDescribeServer(): Promise<SeamMcpServer> {
@@ -2454,6 +2482,8 @@ describe("config_describe", () => {
             agentId: "claude",
             model: "claude-opus-4.6",
             effort: "high",
+            role: "orchestrator",
+            disableThreadPrefix: null,
             permission: "ask",
             cwd: "/repo/x",
             description: "Reviews TypeScript PRs",

@@ -10,6 +10,7 @@ import {
   currentChannelRiderText,
   currentThreadRiderText,
   decodeRiderUpload,
+  draftAfterSave,
   dirtyChannelRider,
   dirtyChannelAgent,
   dirtyPermission,
@@ -44,7 +45,8 @@ const WITHOUT: InheritedConfig = {
   detached: false,
   statusCardStyle: "full",
   simpleCardGif: false,
-  threadSlug: null,
+  role: null,
+  disableThreadPrefix: false,
 };
 
 function setting<T>(value: T, source: ConfigDescription["agent"]["source"]) {
@@ -62,7 +64,8 @@ function snapshot(over: Partial<ThreadConfigSnapshot> = {}): ThreadConfigSnapsho
     detached: setting(false, "default"),
     statusCardStyle: setting("full", "default"),
     simpleCardGif: setting(false, "default"),
-    threadSlug: setting(null, "default"),
+    role: setting(null, "default"),
+    disableThreadPrefix: setting(false, "default"),
     rider: {},
     locked: false,
     channelPins: {},
@@ -219,8 +222,9 @@ describe("hub render (#90)", () => {
       "GIF",
       "Channel",
     ]);
-    expect(panel.actions![3].map((b) => b.label)).toEqual(["Slug"]);
-    expect(panel.fields.find((f) => f.name === "Slug")!.value).toMatch(/not set/);
+    expect(panel.actions![3].map((b) => b.label)).toEqual(["Role", "Auto-name"]);
+    expect(panel.fields.find((f) => f.name === "Role")!.value).toMatch(/not set/);
+    expect(panel.fields.find((f) => f.name === "Auto-name")!.value).toMatch(/enabled/);
     expect(panel.actions![2][0]!.disabled).toBe(true);
   });
 
@@ -336,20 +340,39 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
     expect(changes).not.toHaveProperty("agent");
   });
 
-  it("slug picker writes thread overlay; channel scope writes channel pin", () => {
-    const next = applyPickerValue(draft(), "slug", "hist", () => undefined);
-    expect(next.overlay.threadSlug).toBe("hist");
-    expect(dirtyThreadPresetChanges(next).threadSlug).toBe("hist");
-    expect(buildSavePlan(next).threadPreset.threadSlug).toBe("hist");
+  it("role picker writes thread overlay; channel scope writes channel pin", () => {
+    const next = applyPickerValue(draft(), "role", "analyst", () => undefined);
+    expect(next.overlay.role).toBe("analyst");
+    expect(dirtyThreadPresetChanges(next).role).toBe("analyst");
+    expect(buildSavePlan(next).threadPreset.role).toBe("analyst");
 
     const ch = applyPickerValue(
       draft({ editScope: "channel" }),
-      "slug",
-      "lab",
+      "role",
+      "qa",
       () => undefined
     );
-    expect(ch.overlay.channelThreadSlug).toBe("lab");
-    expect(buildSavePlan(ch).channelPreset?.threadSlug).toBe("lab");
+    expect(ch.overlay.channelRole).toBe("qa");
+    expect(buildSavePlan(ch).channelPreset?.role).toBe("qa");
+  });
+
+  it("saved channel cards reflect cleared role and re-enabled automatic naming", () => {
+    const saved = draftAfterSave(draft({
+      editScope: "channel",
+      snapshot: snapshot({
+        channelPins: { role: "qa", disableThreadPrefix: true },
+        withoutThread: { ...WITHOUT, role: "qa", disableThreadPrefix: true },
+      }),
+      overlay: { channelRole: null, channelDisableThreadPrefix: false },
+    }));
+
+    expect(saved.snapshot.channelPins.role).toBeUndefined();
+    expect(saved.snapshot.channelPins.disableThreadPrefix).toBeUndefined();
+    expect(saved.snapshot.withoutThread.role).toBeNull();
+    expect(saved.snapshot.withoutThread.disableThreadPrefix).toBe(false);
+    const panel = renderHub(saved);
+    expect(panel.fields.find((field) => field.name === "Role")!.value).toMatch(/not set/);
+    expect(panel.fields.find((field) => field.name === "Auto-name")!.value).toMatch(/enabled/);
   });
 
   it("inherit of an already-unset thread field is not dirty", () => {

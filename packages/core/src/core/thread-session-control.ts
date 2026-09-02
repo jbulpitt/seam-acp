@@ -11,9 +11,13 @@ export interface ConfigureThreadInput {
   agent?: string;
   model?: string;
   effort?: string;
+  /** Free-form naming role; empty/auto clears the session override. */
+  role?: string;
+  /** Thread-local automatic naming opt-out. False re-enables future exact passes. */
+  disableThreadPrefix?: boolean;
 }
 
-export interface MigrateSelfInput extends ConfigureThreadInput {
+export interface MigrateSelfInput extends Omit<ConfigureThreadInput, "role"> {
   manifest: string;
 }
 
@@ -66,6 +70,9 @@ export interface ThreadConfigurationIdentity {
   model: string;
   /** Explicit level, or `auto` when no override is active. */
   effort: string;
+  /** Effective naming role, or `auto` when no role is active. */
+  role: string;
+  disableThreadPrefix: boolean;
 }
 
 export interface ThreadConfigurationFieldChange {
@@ -78,6 +85,8 @@ export interface ThreadConfigurationChanges {
   agent: ThreadConfigurationFieldChange;
   model: ThreadConfigurationFieldChange;
   effort: ThreadConfigurationFieldChange;
+  role: ThreadConfigurationFieldChange;
+  disableThreadPrefix: ThreadConfigurationFieldChange;
 }
 
 export type ConfigureThreadOutcome =
@@ -130,10 +139,14 @@ export interface ThreadSessionControlDeps {
         agent?: string | null;
         model?: string | null;
         effort?: string | null;
+        role?: string | null;
+        disableThreadPrefix?: boolean | null;
       };
       actor: { id: string | null; name: string | null };
     }): { ok: true; message: string; auditId: string } | { ok: false; error: string };
   };
+  /** Single naming funnel, injected by the Discord integration layer. */
+  applyThreadName?: (record: SessionRecord) => Promise<unknown>;
 }
 
 /**
@@ -291,6 +304,7 @@ export class ThreadSessionControlService {
       if (!info?.sessionId) throw new Error("Fresh runtime did not report a session id.");
       const fresh = this.deps.store.get(current.id);
       if (!fresh) throw new Error("Calling session disappeared after migration.");
+      await this.deps.applyThreadName?.(fresh);
       return {
         ok: true,
         record: fresh,
@@ -317,8 +331,8 @@ export class ThreadSessionControlService {
     target: SessionRecord,
     input: ConfigureThreadInput
   ): Promise<ConfigureThreadOutcome> {
-    const supplied = input.agent !== undefined || input.model !== undefined || input.effort !== undefined;
-    if (!supplied) return { ok: false, error: "Provide at least one of agent, model, or effort." };
+    const supplied = input.agent !== undefined || input.model !== undefined || input.effort !== undefined || input.role !== undefined || input.disableThreadPrefix !== undefined;
+    if (!supplied) return { ok: false, error: "Provide at least one of agent, model, effort, role, or disableThreadPrefix." };
 
     const before = this.deps.router.describeConfig(target);
     const previousAgentId = before.agent.value;
@@ -363,6 +377,15 @@ export class ThreadSessionControlService {
     let desiredEffort = requestedEffort === "auto"
       ? undefined
       : requestedEffort ?? normalizeStoredEffort(before.effort.value ?? undefined);
+    const requestedRole = input.role?.trim();
+    const nextRole = input.role === undefined
+      ? undefined
+      : !requestedRole || requestedRole.toLowerCase() === "auto"
+        ? null
+        : requestedRole;
+    const nextDisableThreadPrefix = input.disableThreadPrefix
+      ?? before.disableThreadPrefix?.value
+      ?? false;
     const reset = detectSessionReset({ previousAgentId, nextAgentId, modelChanged });
     const warnings: string[] = [];
     const effortTouched = input.effort !== undefined || modelChanged || agentChanged;
@@ -384,6 +407,8 @@ export class ThreadSessionControlService {
       agent: nextAgentId,
       model: nextModel,
       effort: desiredEffort ?? "auto",
+      role: input.role === undefined ? before.role.value ?? "auto" : nextRole ?? "auto",
+      disableThreadPrefix: nextDisableThreadPrefix,
     };
     const plannedChanges = diffIdentity(beforeIdentity, plannedIdentity);
 
@@ -392,14 +417,18 @@ export class ThreadSessionControlService {
     if (
       !plannedChanges.agent.changed &&
       !plannedChanges.model.changed &&
-      !plannedChanges.effort.changed
+      !plannedChanges.effort.changed &&
+      !plannedChanges.role.changed &&
+      !plannedChanges.disableThreadPrefix.changed
     ) {
+      const threadIdentityUpdated = await this.applyNaming(target);
       return {
         ok: true,
         applied: beforeIdentity,
         changes: plannedChanges,
         sessionReset: false,
         runtimeReloaded: false,
+        threadIdentityUpdated,
         warnings,
       };
     }
@@ -411,10 +440,34 @@ export class ThreadSessionControlService {
         ...(agentChanged ? { agent: nextAgentId } : {}),
         ...(modelChanged || agentChanged ? { model: nextModel } : {}),
         ...(effortTouched ? { effort: desiredEffort ?? null } : {}),
+        ...(input.role !== undefined ? { role: nextRole } : {}),
+        ...(input.disableThreadPrefix !== undefined
+          ? { disableThreadPrefix: input.disableThreadPrefix }
+          : {}),
       },
       actor
     );
     if (!persisted.ok) return persisted;
+
+    const onlyNaming = (input.role !== undefined || input.disableThreadPrefix !== undefined)
+      && input.agent === undefined
+      && input.model === undefined
+      && input.effort === undefined;
+    if (onlyNaming) {
+      const current = this.deps.store.get(target.id);
+      if (!current) return { ok: false, error: "Target session disappeared after configuration." };
+      const threadIdentityUpdated = await this.applyNaming(current);
+      const effectiveIdentity = identityFromDescription(this.deps.router.describeConfig(current));
+      return {
+        ok: true,
+        applied: effectiveIdentity,
+        changes: diffIdentity(beforeIdentity, effectiveIdentity),
+        sessionReset: false,
+        runtimeReloaded: false,
+        threadIdentityUpdated,
+        warnings,
+      };
+    }
 
     let runtime: SessionControlRuntime;
     let runtimeReloaded = false;
@@ -476,6 +529,7 @@ export class ThreadSessionControlService {
 
     const current = this.deps.store.get(target.id);
     if (!current) return { ok: false, error: "Target session disappeared after configuration." };
+    const threadIdentityUpdated = await this.applyNaming(current);
     const effectiveIdentity = identityFromDescription(this.deps.router.describeConfig(current));
     const changes = diffIdentity(beforeIdentity, effectiveIdentity);
     return {
@@ -488,6 +542,7 @@ export class ThreadSessionControlService {
         ? { newSessionId: newSessionId ?? runtime.getSessionInfo()!.sessionId }
         : {}),
       runtimeReloaded,
+      threadIdentityUpdated,
       warnings,
     };
   }
@@ -499,7 +554,13 @@ export class ThreadSessionControlService {
    */
   private applyTargetIdentity(
     target: SessionRecord,
-    changes: { agent?: string; model?: string; effort?: string | null },
+    changes: {
+      agent?: string;
+      model?: string;
+      effort?: string | null;
+      role?: string | null;
+      disableThreadPrefix?: boolean;
+    },
     actor: { id: string | null; name: string | null }
   ): { ok: true } | { ok: false; error: string } {
     const overlay = this.deps.mutation.applyThreadOverlay({
@@ -512,6 +573,10 @@ export class ThreadSessionControlService {
         // effort pin while telling the router to use the backend default.
         ...(changes.effort !== undefined
           ? { effort: changes.effort === null ? "auto" : changes.effort }
+          : {}),
+        ...(changes.role !== undefined ? { role: changes.role } : {}),
+        ...(changes.disableThreadPrefix !== undefined
+          ? { disableThreadPrefix: changes.disableThreadPrefix }
           : {}),
       },
       actor,
@@ -528,6 +593,14 @@ export class ThreadSessionControlService {
       if (changes.effort === null) delete cfg.reasoningEffort;
       else cfg.reasoningEffort = changes.effort;
     }
+    if (changes.role !== undefined) {
+      if (changes.role === null) delete cfg.role;
+      else cfg.role = changes.role;
+    }
+    if (changes.disableThreadPrefix !== undefined) {
+      if (changes.disableThreadPrefix) cfg.disableThreadPrefix = true;
+      else delete cfg.disableThreadPrefix;
+    }
     this.deps.store.upsert({
       ...current,
       ...(changes.agent !== undefined ? { agentId: changes.agent } : {}),
@@ -542,6 +615,7 @@ export class ThreadSessionControlService {
     const forged = await this.forgeFreshSession(target.id);
     const sessionId = forged.runtime.getSessionInfo()?.sessionId;
     if (!sessionId) return { ok: false, error: "Fresh runtime did not report a session id." };
+    await this.deps.applyThreadName?.(forged.record);
     return {
       ok: true,
       sessionReset: true,
@@ -582,6 +656,16 @@ export class ThreadSessionControlService {
     const runtime = await this.deps.router.getOrStartRuntime(fresh);
     return { record: fresh, runtime };
   }
+
+  private async applyNaming(record: SessionRecord): Promise<boolean> {
+    const result = await this.deps.applyThreadName?.(record);
+    return !(
+      result &&
+      typeof result === "object" &&
+      "status" in result &&
+      (result as { status?: unknown }).status === "unmanaged"
+    );
+  }
 }
 
 function normalizeEffort(value: string | undefined): string | undefined {
@@ -599,6 +683,8 @@ function identityFromDescription(value: ConfigDescription): ThreadConfigurationI
     agent: value.agent.value,
     model: value.model.value,
     effort: value.effort.value ?? "auto",
+    role: value.role?.value ?? "auto",
+    disableThreadPrefix: value.disableThreadPrefix?.value ?? false,
   };
 }
 
@@ -615,5 +701,10 @@ function diffIdentity(
     agent: field(before.agent, after.agent),
     model: field(before.model, after.model),
     effort: field(before.effort, after.effort),
+    role: field(before.role, after.role),
+    disableThreadPrefix: field(
+      before.disableThreadPrefix ? "disabled" : "enabled",
+      after.disableThreadPrefix ? "disabled" : "enabled"
+    ),
   };
 }

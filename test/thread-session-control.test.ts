@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AgentProfile } from "@seam/adapters";
 import {
   detectSessionReset,
@@ -51,6 +51,11 @@ function description(value: SessionRecord, defaults: Map<string, string>): Confi
       source: cfg.model ? "session config" : "default",
     },
     effort: { value: cfg.reasoningEffort ?? null, source: "session config" },
+    role: { value: cfg.role ?? null, source: cfg.role ? "session config" : "default" },
+    disableThreadPrefix: {
+      value: cfg.disableThreadPrefix === true,
+      source: cfg.disableThreadPrefix === true ? "session config" : "default",
+    },
   } as ConfigDescription;
 }
 
@@ -97,7 +102,14 @@ function harness(opts: {
   const invalidated: string[] = [];
   const invalidationOptions: Array<{ clearStartFailure?: boolean } | undefined> = [];
   const mutations: SessionConfigChanges[] = [];
-  const overlays: Array<{ agent?: string | null; model?: string | null; effort?: string | null }> = [];
+  const overlays: Array<{
+    agent?: string | null;
+    model?: string | null;
+    effort?: string | null;
+    role?: string | null;
+    disableThreadPrefix?: boolean | null;
+  }> = [];
+  const applyThreadName = vi.fn(async () => ({}));
   let nextSession = 1;
 
   const deps: ThreadSessionControlDeps = {
@@ -152,6 +164,10 @@ function harness(opts: {
           if (changes.effort === null) delete cfg.reasoningEffort;
           else cfg.reasoningEffort = changes.effort;
         }
+        if (changes.role !== undefined) {
+          if (changes.role === null) delete cfg.role;
+          else cfg.role = changes.role;
+        }
         records.set(value.id, {
           ...current,
           ...(changes.agent ? { agentId: changes.agent } : {}),
@@ -169,6 +185,7 @@ function harness(opts: {
         };
       },
     },
+    applyThreadName,
   };
 
   return {
@@ -180,6 +197,7 @@ function harness(opts: {
     invalidationOptions,
     mutations,
     overlays,
+    applyThreadName,
     service: new ThreadSessionControlService(deps),
   };
 }
@@ -285,19 +303,65 @@ describe("ThreadSessionControlService", () => {
 
     expect(result).toEqual({
       ok: true,
-      applied: { agent: "claude", model: "claude-old", effort: "low" },
+      applied: {
+        agent: "claude",
+        model: "claude-old",
+        effort: "low",
+        role: "auto",
+        disableThreadPrefix: false,
+      },
       changes: {
         agent: { before: "claude", after: "claude", changed: false },
         model: { before: "claude-old", after: "claude-old", changed: false },
         effort: { before: "low", after: "low", changed: false },
+        role: { before: "auto", after: "auto", changed: false },
+        disableThreadPrefix: { before: "enabled", after: "enabled", changed: false },
       },
       sessionReset: false,
       runtimeReloaded: false,
+      threadIdentityUpdated: true,
       warnings: [],
     });
     expect(h.invalidated).toEqual([]);
     expect(h.runtimes).toEqual([]);
     expect(h.overlays).toEqual([]);
+    expect(h.applyThreadName).toHaveBeenCalledOnce();
+  });
+
+  it("changes role without starting or resetting the runtime and invokes naming once", async () => {
+    const h = harness();
+    const result = await h.service.configure(h.caller, h.target, { role: "analyst" });
+
+    expect(result).toMatchObject({
+      ok: true,
+      applied: { agent: "claude", model: "claude-old", effort: "low", role: "analyst" },
+      changes: { role: { before: "auto", after: "analyst", changed: true } },
+      sessionReset: false,
+      runtimeReloaded: false,
+    });
+    expect(h.overlays).toEqual([{ role: "analyst" }]);
+    expect(h.runtimes).toEqual([]);
+    expect(h.applyThreadName).toHaveBeenCalledOnce();
+  });
+
+  it("toggles the naming opt-out without touching sibling runtime state", async () => {
+    const h = harness();
+    const result = await h.service.configure(h.caller, h.target, {
+      disableThreadPrefix: true,
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      applied: { disableThreadPrefix: true },
+      changes: {
+        disableThreadPrefix: { before: "enabled", after: "disabled", changed: true },
+      },
+      sessionReset: false,
+      runtimeReloaded: false,
+    });
+    expect(h.overlays).toEqual([{ disableThreadPrefix: true }]);
+    expect(h.runtimes).toEqual([]);
+    expect(h.applyThreadName).toHaveBeenCalledOnce();
   });
 
   it("reset forges a new session while preserving effective agent and model", async () => {
@@ -313,6 +377,7 @@ describe("ThreadSessionControlService", () => {
     });
     expect(h.invalidated).toEqual([h.target.id]);
     expect(h.mutations).toEqual([]);
+    expect(h.applyThreadName).toHaveBeenCalledOnce();
   });
 
   it("prepares and activates a self migration as a fresh session", async () => {
@@ -355,6 +420,7 @@ describe("ThreadSessionControlService", () => {
       { effort: "high" },
     ]);
     expect(h.runtimes[0]!.optionCalls).toEqual([["reasoning_effort", "high"]]);
+    expect(h.applyThreadName).toHaveBeenCalledOnce();
   });
 
   it("always forges a fresh session for migrate_self, including a Claude model switch", async () => {

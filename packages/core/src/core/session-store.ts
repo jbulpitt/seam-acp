@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   acp_session_id  TEXT NOT NULL,
   repo_path       TEXT,
   config_json     TEXT NOT NULL,
+  name_prefix     TEXT,
   created_utc     TEXT NOT NULL,
   updated_utc     TEXT NOT NULL
 );
@@ -139,7 +140,8 @@ CREATE TABLE IF NOT EXISTS presets (
   model         TEXT,
   effort        TEXT,
   repo_path     TEXT,
-  thread_slug   TEXT,
+  role          TEXT,
+  disable_thread_prefix INTEGER,
   permission    TEXT,
   tools_json    TEXT,
   instructions  TEXT,
@@ -162,6 +164,7 @@ interface Row {
   acp_session_id: string;
   repo_path: string | null;
   config_json: string;
+  name_prefix: string | null;
   created_utc: string;
   updated_utc: string;
 }
@@ -175,6 +178,7 @@ const mapRow = (r: Row): SessionRecord => ({
   acpSessionId: r.acp_session_id,
   repoPath: r.repo_path,
   configJson: r.config_json,
+  namePrefix: r.name_prefix,
   createdUtc: r.created_utc,
   updatedUtc: r.updated_utc,
 });
@@ -251,7 +255,8 @@ interface PresetRow {
   model: string | null;
   effort: string | null;
   repo_path: string | null;
-  thread_slug: string | null;
+  role: string | null;
+  disable_thread_prefix: number | null;
   permission: string | null;
   tools_json: string | null;
   instructions: string | null;
@@ -285,7 +290,9 @@ const mapPreset = (r: PresetRow): Preset => {
     model: r.model,
     effort: r.effort,
     repoPath: r.repo_path,
-    threadSlug: r.thread_slug,
+    role: r.role,
+    disableThreadPrefix:
+      r.disable_thread_prefix === null ? null : r.disable_thread_prefix !== 0,
     permission: r.permission as PermissionPolicyMode | null,
     toolsAllow,
     toolsExclude,
@@ -342,7 +349,8 @@ export class SessionStore {
     this.migrateInboxPriority();
     this.migratePresetStatusCardStyle();
     this.migratePresetsScope();
-    this.migratePresetThreadSlug();
+    this.migratePresetRole();
+    try { this.db.exec("ALTER TABLE sessions ADD COLUMN name_prefix TEXT"); } catch { /* exists */ }
   }
 
   /** Additive V2 migration over the shipped V1 compatibility tables. */
@@ -712,12 +720,17 @@ export class SessionStore {
       );
   }
 
-  /** Additive thread_slug on presets for auto-numbered thread names. */
-  private migratePresetThreadSlug(): void {
-    try {
-      this.db.exec("ALTER TABLE presets ADD COLUMN thread_slug TEXT");
-    } catch {
-      /* column already exists */
+  /** #145: role + naming opt-out. Legacy thread_slug is deliberately ignored. */
+  private migratePresetRole(): void {
+    for (const ddl of [
+      "ALTER TABLE presets ADD COLUMN role TEXT",
+      "ALTER TABLE presets ADD COLUMN disable_thread_prefix INTEGER",
+    ]) {
+      try {
+        this.db.exec(ddl);
+      } catch {
+        /* column already exists */
+      }
     }
   }
 
@@ -1011,15 +1024,29 @@ export class SessionStore {
     return rows.map(mapRow);
   }
 
+  /** All channel siblings in durable creation order for #145 recompaction. */
+  listSessionsByParentInCreationOrder(
+    platform: string,
+    parentRef: string
+  ): SessionRecord[] {
+    return this.db
+      .prepare<[string, string], Row>(
+        "SELECT * FROM sessions WHERE platform = ? AND parent_ref = ? " +
+          "ORDER BY created_utc ASC, id ASC"
+      )
+      .all(platform, parentRef)
+      .map(mapRow);
+  }
+
   upsert(record: SessionRecord): void {
     this.db
       .prepare(
         `INSERT INTO sessions
            (id, platform, channel_ref, parent_ref, agent_id, acp_session_id,
-            repo_path, config_json, created_utc, updated_utc)
+            repo_path, config_json, name_prefix, created_utc, updated_utc)
          VALUES
            (@id, @platform, @channelRef, @parentRef, @agentId, @acpSessionId,
-            @repoPath, @configJson, @createdUtc, @updatedUtc)
+            @repoPath, @configJson, @namePrefix, @createdUtc, @updatedUtc)
          ON CONFLICT(id) DO UPDATE SET
            platform        = excluded.platform,
            channel_ref     = excluded.channel_ref,
@@ -1028,9 +1055,16 @@ export class SessionStore {
            acp_session_id  = excluded.acp_session_id,
            repo_path       = excluded.repo_path,
            config_json     = excluded.config_json,
+           name_prefix     = excluded.name_prefix,
            updated_utc     = excluded.updated_utc`
       )
-      .run(record);
+      .run({ ...record, namePrefix: record.namePrefix ?? null });
+  }
+
+  setNamePrefix(id: string, prefix: string | null): void {
+    this.db
+      .prepare("UPDATE sessions SET name_prefix = ?, updated_utc = ? WHERE id = ?")
+      .run(prefix, new Date().toISOString(), id);
   }
 
   // --- scheduled prompts ----------------------------------------------------
@@ -1160,11 +1194,11 @@ export class SessionStore {
       .prepare(
         `INSERT INTO presets
            (id, name, project_ref, description, agent_id, model, effort,
-            repo_path, thread_slug, permission, tools_json, instructions, status_card_style,
+            repo_path, role, disable_thread_prefix, permission, tools_json, instructions, status_card_style,
             created_by, created_utc, updated_utc)
          VALUES
            (@id, @name, @projectRef, @description, @agentId, @model, @effort,
-            @repoPath, @threadSlug, @permission, @toolsJson, @instructions, @statusCardStyle,
+            @repoPath, @role, @disableThreadPrefix, @permission, @toolsJson, @instructions, @statusCardStyle,
             @createdBy, @createdUtc, @updatedUtc)
          ON CONFLICT(id) DO UPDATE SET
            name         = excluded.name,
@@ -1174,7 +1208,8 @@ export class SessionStore {
            model        = excluded.model,
            effort       = excluded.effort,
            repo_path    = excluded.repo_path,
-           thread_slug  = excluded.thread_slug,
+           role         = excluded.role,
+           disable_thread_prefix = excluded.disable_thread_prefix,
            permission   = excluded.permission,
            tools_json   = excluded.tools_json,
            instructions = excluded.instructions,
@@ -1190,7 +1225,9 @@ export class SessionStore {
         model: p.model,
         effort: p.effort,
         repoPath: p.repoPath,
-        threadSlug: p.threadSlug ?? null,
+        role: p.role ?? null,
+        disableThreadPrefix:
+          p.disableThreadPrefix === null ? null : p.disableThreadPrefix ? 1 : 0,
         permission: p.permission,
         toolsJson,
         instructions: p.instructions,

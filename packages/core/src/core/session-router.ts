@@ -99,6 +99,8 @@ export interface ConfigDescription {
   parentRef: string | null;
   agent: ResolvedSetting<string>;
   model: ResolvedSetting<string>;
+  /** Free-form naming role; null means slot 3 and enumeration are absent. */
+  role: ResolvedSetting<string | null>;
   /** `value` is null when no effort applies (agent has none / nothing set). */
   effort: ResolvedSetting<string | null>;
   cwd: ResolvedSetting<string>;
@@ -148,6 +150,8 @@ export interface ConfigDescription {
    * statusCardStyle. Default `false`.
    */
   simpleCardGif: ResolvedSetting<boolean>;
+  /** OR-composed session/thread/channel opt-out from automatic thread naming. */
+  disableThreadPrefix: ResolvedSetting<boolean>;
 }
 
 /** Layout the status card should render. Always `"full"` or `"simple"`. */
@@ -300,6 +304,17 @@ export class SessionRouter {
           ? { value: cfg.model, source: "session config" }
           : { value: this.defaultModel, source: "default" };
 
+    const sessionRole = normalizeRole(cfg.role);
+    const threadRole = normalizeRole(thread?.role?.value);
+    const channelRole = normalizeRole(chan?.role?.value);
+    const role: ResolvedSetting<string | null> = sessionRole
+      ? { value: sessionRole, source: "session config" }
+      : threadRole
+        ? { value: threadRole, source: "thread preset" }
+        : channelRole
+          ? { value: channelRole, source: "channel preset" }
+          : { value: null, source: "default" };
+
     // effort — a preset effort only wins if the RESOLVED agent supports that
     // exact level; otherwise it is dropped and cfg.reasoningEffort applies
     // (Trap 2). Mirrors startRuntime's `presetEffortUsable` gate exactly.
@@ -410,12 +425,21 @@ export class SessionRouter {
             ? { value: chan.simpleCardGif.value, source: "channel preset" }
             : { value: false, source: "default" };
 
+    const disableThreadPrefix: ResolvedSetting<boolean> = cfg.disableThreadPrefix === true
+      ? { value: true, source: "session config" }
+      : thread?.disableThreadPrefix?.value === true
+        ? { value: true, source: "thread preset" }
+        : chan?.disableThreadPrefix?.value === true
+          ? { value: true, source: "channel preset" }
+          : { value: false, source: "default" };
+
     return {
       sessionId: record.id,
       channelRef: record.channelRef,
       parentRef: record.parentRef,
       agent,
       model,
+      role,
       effort,
       cwd,
       permission,
@@ -429,6 +453,7 @@ export class SessionRouter {
       rider,
       statusCardStyle,
       simpleCardGif,
+      disableThreadPrefix,
       ...(effortIgnoredNote ? { effortIgnoredNote } : {}),
     };
   }
@@ -980,4 +1005,10 @@ export class SessionRouter {
     this.retirements.set(sessionId, retirement);
     return retirement;
   }
+}
+
+export function normalizeRole(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const role = value.trim();
+  return !role || role.toLowerCase() === "auto" ? null : role;
 }

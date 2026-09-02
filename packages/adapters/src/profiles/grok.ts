@@ -132,7 +132,6 @@ export function makeGrokProfile(opts: {
   /** Default model id for sessions (e.g. "grok-build-0.1"). */
   defaultModel: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
-  threadAbbr?: string;
   /** Override the effort descriptor. Defaults to spawnArgs + the CLI levels. */
   effort?: AgentProfile["effort"];
   /** Custom environment variables to inject into the spawned process. */
@@ -145,7 +144,6 @@ export function makeGrokProfile(opts: {
     displayName: opts.displayName ?? "Grok Build",
     defaultModel: opts.defaultModel,
     staticModels: opts.staticModels,
-    threadAbbr: opts.threadAbbr,
     // Reasoning effort: CLI flag at spawn (`--reasoning-effort`). Without
     // mechanism "spawnArgs", SessionRouter treats grok as having no effort
     // and silently ignores channel/thread preset pins.

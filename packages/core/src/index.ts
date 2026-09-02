@@ -19,6 +19,7 @@ import { makeGrokProfile, fetchXaiModels } from "@seam/adapters";
 import { discordRenderer } from "./platforms/discord/renderer.js";
 import { DiscordAdapter } from "./platforms/discord/adapter.js";
 import { Orchestrator } from "./platforms/discord/orchestrator.js";
+import { DEFAULT_THREAD_NAMER_CONFIG } from "./platforms/discord/thread-namer.js";
 import { buildGlobalMcpServers } from "./mcp.js";
 import { startTunnelGistPublisher } from "./lib/tunnel-gist.js";
 import { ScheduledPromptManager } from "./core/scheduled-prompts/manager.js";
@@ -149,7 +150,6 @@ async function main(): Promise<void> {
     ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
     defaultModel: config.DEFAULT_MODEL,
     staticModels: config.COPILOT_MODELS,
-    threadAbbr: "🤖🛢️",
     mcpServers,
   });
 
@@ -161,7 +161,6 @@ async function main(): Promise<void> {
       ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
       defaultModel: config.DEFAULT_MODEL,
       staticModels: config.COPILOT_MODELS,
-      threadAbbr: p.id === "jbulpitt" ? "🤖 👨‍💻" : "🤖",
       mcpServers,
     })
   );
@@ -170,7 +169,6 @@ async function main(): Promise<void> {
     ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
     defaultModel: config.CLAUDE_DEFAULT_MODEL,
     staticModels: config.CLAUDE_MODELS,
-    threadAbbr: "👾",
     maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
     thinkingDisplay: config.CLAUDE_THINKING_DISPLAY,
     compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
@@ -203,7 +201,6 @@ async function main(): Promise<void> {
         ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
         defaultModel: config.CLAUDE_DEFAULT_MODEL,
         staticModels: config.CLAUDE_MODELS,
-        threadAbbr: "👾☁️",
         maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
         thinkingDisplay: config.CLAUDE_THINKING_DISPLAY,
         compactionTokenThreshold: config.CLAUDE_COMPACTION_TOKEN_THRESHOLD,
@@ -220,7 +217,6 @@ async function main(): Promise<void> {
     ...(config.AGY_CLI_PATH ? { cliPath: config.AGY_CLI_PATH } : {}),
     defaultModel: config.AGY_DEFAULT_MODEL,
     staticModels: config.AGY_MODELS,
-    threadAbbr: "🌌",
     dataDir: config.DATA_DIR,
     printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
     mcpServers,
@@ -236,7 +232,6 @@ async function main(): Promise<void> {
         // so the picker uses that live list (always up to date). CODEX_MODELS still
         // overrides if an operator wants to pin a custom set.
         staticModels: config.CODEX_MODELS,
-        threadAbbr: "🧬",
       })
     : undefined;
 
@@ -259,7 +254,6 @@ async function main(): Promise<void> {
         ...(config.GROK_CLI_PATH ? { cliPath: config.GROK_CLI_PATH } : {}),
         defaultModel: config.GROK_DEFAULT_MODEL,
         staticModels: config.GROK_MODELS ?? grokModels ?? GROK_STATIC_MODELS,
-        threadAbbr: "🪐",
         ...(config.GROK_API_KEY ? { extraEnv: { XAI_API_KEY: config.GROK_API_KEY } } : {}),
       })
     : undefined;
@@ -274,7 +268,6 @@ async function main(): Promise<void> {
         brand: "z-ai",
         defaultModel: config.ZAI_DEFAULT_MODEL,
         staticModels: config.ZAI_MODELS ?? ZAI_STATIC_MODELS,
-        threadAbbr: "🀄",
         // GLM models don't support Anthropic's effort mechanism.
         effort: { mechanism: "none" as const, levels: [] },
         extraEnv: {
@@ -338,7 +331,6 @@ async function main(): Promise<void> {
         displayName: "Ollama Cloud",
         defaultModel: config.OLLAMA_CLOUD_DEFAULT_MODEL,
         staticModels: config.OLLAMA_CLOUD_MODELS ?? OLLAMA_CLOUD_STATIC_MODELS,
-        threadAbbr: "🦙☁️",
         // Restrict to reasoning_effort values codex-acp advertises AND Ollama's
         // OpenAI endpoint accepts, so every offered tier works on both sides.
         // (codex also advertises xhigh/ultra; Ollama also accepts medium/none —
@@ -429,7 +421,6 @@ async function main(): Promise<void> {
     ? makeOpencodeProfile({
         id: "opencode",
         displayName: "LM Studio 🔮",
-        threadAbbr: "🔮",
         ...(config.OPENCODE_CLI_PATH ? { cliPath: config.OPENCODE_CLI_PATH } : {}),
         defaultModel: opencodeDefaultModel,
         ...(opencodeModels && opencodeModels.length > 0 ? { staticModels: opencodeModels } : {}),
@@ -655,6 +646,7 @@ async function main(): Promise<void> {
       store,
       router,
       mutation: orchestrator.getConfigMutation(),
+      applyThreadName: (record) => orchestrator.applyThreadName(record),
     });
     orchestrator.setSelfMigrationHandler((target, prepared) =>
       threadSessionControl.executeSelfMigration(target, prepared)
@@ -841,6 +833,8 @@ async function main(): Promise<void> {
           scope: p.projectRef ? ("project" as const) : ("global" as const),
           agentId: p.agentId,
           model: p.model,
+          role: p.role,
+          disableThreadPrefix: p.disableThreadPrefix,
           effort: p.effort,
           permission: p.permission,
           cwd: p.repoPath,
@@ -885,14 +879,7 @@ async function main(): Promise<void> {
           return { ok: false, error: "This platform cannot rename threads." };
         }
         try {
-          await adapter.renameThread(
-            {
-              platform: record.platform,
-              id: record.channelRef,
-              ...(record.parentRef ? { parentId: record.parentRef } : {}),
-            },
-            name
-          );
+          await orchestrator.renameThreadBase(record, name);
           return { ok: true };
         } catch (err) {
           return { ok: false, error: (err as Error).message };
@@ -1185,7 +1172,12 @@ async function main(): Promise<void> {
         const mem = process.memoryUsage();
         const connected = hub.connectedIds();
         const emojiByAgent = new Map(
-          router.listProfiles().map((p) => [p.id, p.threadAbbr] as const)
+          router.listProfiles().map((p) => [
+            p.id,
+            DEFAULT_THREAD_NAMER_CONFIG.agents.find((rule) =>
+              p.id.toLowerCase().includes(rule.match.toLowerCase())
+            )?.replacement,
+          ] as const)
         );
         const bridges = [...config.bridgePresets.values()]
           .sort((a, b) => a.id.localeCompare(b.id))

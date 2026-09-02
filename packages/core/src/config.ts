@@ -820,6 +820,7 @@ const numericId = z.string().regex(/^\d+$/, "preset key must be a numeric Discor
 const PresetValuesSchema = z.object({
   agent: PresetFieldSchema(z.string().min(1)).optional(),
   model: PresetFieldSchema(z.string().min(1)).optional(),
+  role: PresetFieldSchema(z.string().min(1).max(64)).optional(),
   cwd: PresetFieldSchema(z.string().min(1)).optional(),
   // Reasoning effort, e.g. "low"/"medium"/"high"/"xhigh"/"max". Silently
   // ignored at apply time for agents whose profile doesn't support effort
@@ -834,8 +835,8 @@ const PresetValuesSchema = z.object({
   // Random GIF thumbnail on the simple status card. Channel value is inherited
   // live; a thread preset or session `/seam config gif` still wins.
   simpleCardGif: PresetFieldSchema(z.boolean()).optional(),
-  // Token used to auto-number sibling threads (`[abbr] [slug] [n-keycap]`).
-  threadSlug: PresetFieldSchema(z.string().min(1).max(32)).optional(),
+  // Either channel or thread true means the namer leaves the thread untouched.
+  disableThreadPrefix: PresetFieldSchema(z.boolean()).optional(),
 });
 
 const ChannelPresetSchema = PresetValuesSchema.extend({
@@ -929,12 +930,13 @@ export type ChannelPresetField<T> = { value: T };
 export type PresetValues = {
   agent?: ChannelPresetField<string>;
   model?: ChannelPresetField<string>;
+  role?: ChannelPresetField<string>;
   cwd?: ChannelPresetField<string>;
   effort?: ChannelPresetField<string>;
   rider?: ChannelPresetField<string>;
   statusCardStyle?: ChannelPresetField<"full" | "simple">;
   simpleCardGif?: ChannelPresetField<boolean>;
-  threadSlug?: ChannelPresetField<string>;
+  disableThreadPrefix?: ChannelPresetField<boolean>;
 };
 export type ChannelPreset = PresetValues & { locked: boolean };
 export type ThreadPreset = PresetValues & {
@@ -1027,11 +1029,28 @@ export function resolveChannelPreset(
   return {
     agent: thread?.agent ?? chan?.agent,
     model: thread?.model ?? chan?.model,
+    role: thread?.role ?? chan?.role,
     cwd: thread?.cwd ?? chan?.cwd,
     effort: thread?.effort ?? chan?.effort,
     riders,
-    threadSlug: thread?.threadSlug ?? chan?.threadSlug,
+    disableThreadPrefix:
+      thread?.disableThreadPrefix?.value === true || chan?.disableThreadPrefix?.value === true
+        ? { value: true }
+        : undefined,
   };
+}
+
+/** Channel and thread opt-outs compose with OR semantics; neither can override
+ * the other back to enabled. Session-local opt-out is resolved by the router. */
+export function isThreadPrefixDisabled(
+  config: Pick<Config, "channelPresets" | "threadPresets">,
+  parentId: string | undefined,
+  threadId: string | undefined
+): boolean {
+  return Boolean(
+    (parentId && config.channelPresets.get(parentId)?.disableThreadPrefix?.value === true) ||
+    (threadId && config.threadPresets.get(threadId)?.disableThreadPrefix?.value === true)
+  );
 }
 
 /** Is this channel (by parent-channel id) locked — i.e. should /seam slash

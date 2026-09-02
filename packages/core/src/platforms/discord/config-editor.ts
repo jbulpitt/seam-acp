@@ -28,13 +28,14 @@ export type ConfigEditorAction =
   | "card"
   | "gif"
   | "rider"
-  | "slug"
+  | "role"
+  | "prefix"
   | "attach"
   | "save"
   | "cancel"
   | "scope"
   | "rider-save"
-  | "slug-save"
+  | "role-save"
   | "rider-get"
   | "rider-put";
 
@@ -42,7 +43,7 @@ export type ConfigEditorAction =
 export type ConfigEditorScope = "thread" | "channel";
 
 export const HUB_FIELD_ACTIONS: ReadonlyArray<
-  Exclude<ConfigEditorAction, "save" | "cancel" | "scope" | "rider-save" | "slug-save">
+  Exclude<ConfigEditorAction, "save" | "cancel" | "scope" | "rider-save" | "role-save">
 > = [
   "host",
   "agent",
@@ -53,7 +54,8 @@ export const HUB_FIELD_ACTIONS: ReadonlyArray<
   "card",
   "gif",
   "rider",
-  "slug",
+  "role",
+  "prefix",
   "attach",
 ];
 
@@ -67,7 +69,8 @@ export interface InheritedConfig {
   detached: boolean;
   statusCardStyle: StatusCardStyle;
   simpleCardGif: boolean;
-  threadSlug: string | null;
+  role: string | null;
+  disableThreadPrefix: boolean;
 }
 
 export interface ThreadConfigSnapshot {
@@ -80,7 +83,8 @@ export interface ThreadConfigSnapshot {
   detached: ResolvedSetting<boolean>;
   statusCardStyle: ResolvedSetting<StatusCardStyle>;
   simpleCardGif: ResolvedSetting<boolean>;
-  threadSlug: ResolvedSetting<string | null>;
+  role: ResolvedSetting<string | null>;
+  disableThreadPrefix: ResolvedSetting<boolean>;
   rider: { channel?: string; thread?: string };
   locked: boolean;
   /** Raw channel-preset pins (unset = that field is not on the channel entry). */
@@ -96,7 +100,8 @@ export interface ChannelPresetPins {
   model?: string;
   cwd?: string;
   effort?: string | null;
-  threadSlug?: string;
+  role?: string;
+  disableThreadPrefix?: boolean;
 }
 
 /** Draft overlay. `null` means inherit (remove the thread overlay / session policy). */
@@ -120,8 +125,10 @@ export interface DraftOverlay {
   channelModel?: string | null;
   channelCwd?: string | null;
   channelEffort?: string | null;
-  threadSlug?: string | null;
-  channelThreadSlug?: string | null;
+  role?: string | null;
+  channelRole?: string | null;
+  disableThreadPrefix?: boolean | null;
+  channelDisableThreadPrefix?: boolean | null;
 }
 
 export interface ThreadConfigDraft {
@@ -195,7 +202,8 @@ export function snapshotFromDescribe(
     detached: d.detached,
     statusCardStyle: d.statusCardStyle ?? { value: "full", source: "default" },
     simpleCardGif: d.simpleCardGif ?? { value: false, source: "default" },
-    threadSlug: { value: null, source: "default" },
+    role: d.role ?? { value: null, source: "default" },
+    disableThreadPrefix: d.disableThreadPrefix ?? { value: false, source: "default" },
     rider: d.rider ?? {},
     locked: d.locked,
     channelPins: {},
@@ -220,7 +228,8 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
   riderChannel: string | undefined;
   statusCardStyle: StatusCardStyle;
   simpleCardGif: boolean;
-  threadSlug: string | null;
+  role: string | null;
+  disableThreadPrefix: boolean;
 } {
   const s = draft.snapshot;
   const o = draft.overlay;
@@ -238,10 +247,14 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
     riderChannel: o.channelRider === undefined ? s.rider.channel : o.channelRider ?? undefined,
     statusCardStyle: effectiveCardStyle(draft),
     simpleCardGif: effectiveGif(draft),
-    threadSlug:
-      o.threadSlug === undefined
-        ? s.threadSlug.value
-        : o.threadSlug ?? w.threadSlug,
+    role:
+      o.role === undefined
+        ? s.role?.value ?? null
+        : o.role ?? w.role ?? null,
+    disableThreadPrefix:
+      o.disableThreadPrefix === undefined
+        ? s.disableThreadPrefix?.value ?? false
+        : o.disableThreadPrefix === true || (w.disableThreadPrefix ?? false),
   };
 }
 
@@ -386,10 +399,15 @@ export function dirtyThreadPresetChanges(draft: ThreadConfigDraft): ThreadPreset
     const next = o.rider;
     if (next !== current) changes.rider = next;
   }
-  if (o.threadSlug !== undefined) {
-    const current = threadOverlayValue(s.threadSlug) ?? null;
-    const next = o.threadSlug;
-    if (next !== current) changes.threadSlug = next;
+  if (o.role !== undefined) {
+    const current = threadOverlayValue(s.role) ?? null;
+    const next = o.role;
+    if (next !== current) changes.role = next;
+  }
+  if (o.disableThreadPrefix !== undefined) {
+    const current = threadOverlayValue(s.disableThreadPrefix) === true;
+    const next = o.disableThreadPrefix === true;
+    if (next !== current) changes.disableThreadPrefix = next;
   }
   if (o.detached !== undefined) {
     const current = s.detached.value === true;
@@ -500,11 +518,20 @@ export function dirtyChannelEffort(draft: ThreadConfigDraft): string | null | un
   );
 }
 
-export function dirtyChannelThreadSlug(draft: ThreadConfigDraft): string | null | undefined {
+export function dirtyChannelRole(draft: ThreadConfigDraft): string | null | undefined {
   return dirtyChannelPin(
-    draft.overlay.channelThreadSlug,
-    draft.snapshot.channelPins?.threadSlug ?? null
+    draft.overlay.channelRole,
+    draft.snapshot.channelPins?.role ?? null
   );
+}
+
+export function dirtyChannelDisableThreadPrefix(
+  draft: ThreadConfigDraft
+): boolean | null | undefined {
+  if (draft.overlay.channelDisableThreadPrefix === undefined) return undefined;
+  const current = draft.snapshot.channelPins?.disableThreadPrefix === true;
+  const next = draft.overlay.channelDisableThreadPrefix === true;
+  return current === next ? undefined : next;
 }
 
 export function isDirty(draft: ThreadConfigDraft): boolean {
@@ -520,7 +547,8 @@ export function isDirty(draft: ThreadConfigDraft): boolean {
     dirtyChannelModel(draft) !== undefined ||
     dirtyChannelCwd(draft) !== undefined ||
     dirtyChannelEffort(draft) !== undefined ||
-    dirtyChannelThreadSlug(draft) !== undefined
+    dirtyChannelRole(draft) !== undefined ||
+    dirtyChannelDisableThreadPrefix(draft) !== undefined
   );
 }
 
@@ -692,7 +720,10 @@ export function renderHub(
       },
     ],
     row2,
-    [{ customId: makeCustomId(id, "slug"), label: "Slug", style: "secondary" }],
+    [
+      { customId: makeCustomId(id, "role"), label: "Role", style: "secondary" },
+      { customId: makeCustomId(id, "prefix"), label: "Auto-name", style: "secondary" },
+    ],
   ];
 
   const agentLine = channelScope
@@ -727,16 +758,36 @@ export function renderHub(
         draftNoteFor(o.channelCwd, "not set")
       )
     : fieldLine(code(s.cwd.value), sourceLabel(s.cwd.source), draftNoteFor(o.cwd, w.cwd));
-  const slugLine = channelScope
+  const roleLine = channelScope
     ? fieldLine(
-        code(pins.threadSlug),
-        pins.threadSlug ? "channel" : "default",
-        draftNoteFor(o.channelThreadSlug, "not set")
+        code(pins.role),
+        pins.role ? "channel" : "default",
+        draftNoteFor(o.channelRole, "not set")
       )
     : fieldLine(
-        code(s.threadSlug.value),
-        sourceLabel(s.threadSlug.source),
-        draftNoteFor(o.threadSlug, w.threadSlug ?? "not set")
+        code(s.role.value),
+        sourceLabel(s.role.source),
+        draftNoteFor(o.role, w.role ?? "not set")
+      );
+  const prefixDisabled = channelScope
+    ? (o.channelDisableThreadPrefix === undefined
+        ? pins.disableThreadPrefix === true
+        : o.channelDisableThreadPrefix === true)
+    : effectiveAfterDraft(draft).disableThreadPrefix;
+  const prefixLine = channelScope
+    ? fieldLine(
+        code(prefixDisabled ? "disabled" : "enabled"),
+        pins.disableThreadPrefix ? "channel" : "default",
+        o.channelDisableThreadPrefix === undefined
+          ? undefined
+          : `will be ${code(prefixDisabled ? "disabled" : "enabled")}`
+      )
+    : fieldLine(
+        code(prefixDisabled ? "disabled" : "enabled"),
+        sourceLabel(s.disableThreadPrefix.source),
+        o.disableThreadPrefix === undefined
+          ? undefined
+          : `will be ${code(prefixDisabled ? "disabled" : "enabled")}`
       );
 
   return {
@@ -773,8 +824,13 @@ export function renderHub(
         inline: true,
       },
       {
-        name: "Slug",
-        value: trunc(slugLine, 1024),
+        name: "Role",
+        value: trunc(roleLine, 1024),
+        inline: true,
+      },
+      {
+        name: "Auto-name",
+        value: trunc(prefixLine, 1024),
         inline: true,
       },
       {
@@ -889,6 +945,13 @@ export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
       location: { value: next.location, source: layer(o.location, s.location.source) },
       agent: { value: next.agent, source: layer(o.agent, s.agent.source) },
       model: { value: next.model, source: layer(o.model, s.model.source) },
+      role: { value: next.role, source: layer(o.role, s.role.source) },
+      disableThreadPrefix: {
+        value: next.disableThreadPrefix,
+        source: next.disableThreadPrefix
+          ? (o.disableThreadPrefix === true ? "thread preset" : s.disableThreadPrefix.source)
+          : "default",
+      },
       effort: { value: next.effort, source: layer(o.effort, s.effort.source) },
       cwd: { value: next.cwd, source: layer(o.cwd, s.cwd.source) },
       permission: {
@@ -917,11 +980,10 @@ export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
         ...(o.channelModel ? { model: o.channelModel } : {}),
         ...(o.channelCwd ? { cwd: o.channelCwd } : {}),
         ...(o.channelEffort ? { effort: o.channelEffort } : {}),
-        ...(o.channelThreadSlug ? { threadSlug: o.channelThreadSlug } : {}),
-      },
-      threadSlug: {
-        value: next.threadSlug,
-        source: layer(o.threadSlug, s.threadSlug.source),
+        ...(o.channelRole !== undefined ? { role: o.channelRole ?? undefined } : {}),
+        ...(o.channelDisableThreadPrefix !== undefined
+          ? { disableThreadPrefix: o.channelDisableThreadPrefix === true ? true : undefined }
+          : {}),
       },
       withoutThread: {
         ...s.withoutThread,
@@ -931,7 +993,10 @@ export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
         ...(o.channelModel ? { model: o.channelModel } : {}),
         ...(o.channelCwd ? { cwd: o.channelCwd } : {}),
         ...(o.channelEffort !== undefined ? { effort: o.channelEffort } : {}),
-        ...(o.channelThreadSlug !== undefined ? { threadSlug: o.channelThreadSlug } : {}),
+        ...(o.channelRole !== undefined ? { role: o.channelRole } : {}),
+        ...(o.channelDisableThreadPrefix !== undefined
+          ? { disableThreadPrefix: o.channelDisableThreadPrefix === true }
+          : {}),
       },
     },
   };
@@ -1078,10 +1143,16 @@ export function applyPickerValue(
       if (channelScope) overlay.channelCwd = inherit ? null : value;
       else overlay.cwd = inherit ? null : value;
       break;
-    case "slug": {
+    case "role": {
       const next = inherit || value === "" ? null : value.trim() || null;
-      if (channelScope) overlay.channelThreadSlug = next;
-      else overlay.threadSlug = next;
+      if (channelScope) overlay.channelRole = next;
+      else overlay.role = next;
+      break;
+    }
+    case "prefix": {
+      const disabled = value === "disabled";
+      if (channelScope) overlay.channelDisableThreadPrefix = disabled;
+      else overlay.disableThreadPrefix = disabled;
       break;
     }
     case "approve":
@@ -1163,7 +1234,8 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
   const channelModel = dirtyChannelModel(draft);
   const channelCwd = dirtyChannelCwd(draft);
   const channelEffort = dirtyChannelEffort(draft);
-  const channelSlug = dirtyChannelThreadSlug(draft);
+  const channelRole = dirtyChannelRole(draft);
+  const channelDisableThreadPrefix = dirtyChannelDisableThreadPrefix(draft);
   if (
     channelCard !== undefined ||
     channelGif !== undefined ||
@@ -1172,7 +1244,8 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
     channelModel !== undefined ||
     channelCwd !== undefined ||
     channelEffort !== undefined ||
-    channelSlug !== undefined
+    channelRole !== undefined ||
+    channelDisableThreadPrefix !== undefined
   ) {
     plan.channelPreset = {
       ...(channelCard !== undefined ? { statusCardStyle: channelCard } : {}),
@@ -1182,7 +1255,10 @@ export function buildSavePlan(draft: ThreadConfigDraft): ConfigEditorSavePlan {
       ...(channelModel !== undefined ? { model: channelModel } : {}),
       ...(channelCwd !== undefined ? { cwd: channelCwd } : {}),
       ...(channelEffort !== undefined ? { effort: channelEffort } : {}),
-      ...(channelSlug !== undefined ? { threadSlug: channelSlug } : {}),
+      ...(channelRole !== undefined ? { role: channelRole } : {}),
+      ...(channelDisableThreadPrefix !== undefined
+        ? { disableThreadPrefix: channelDisableThreadPrefix }
+        : {}),
     };
   }
   return plan;

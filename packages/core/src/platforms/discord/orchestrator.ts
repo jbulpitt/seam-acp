@@ -9372,32 +9372,44 @@ export class Orchestrator {
     }
     const scope = i.options.getString("scope") ?? "thread";
     const migrateLegacy = i.options.getBoolean("migrate-legacy") ?? false;
+    const roleName = i.options.getBoolean("role-name") ?? false;
     if (scope === "channel") {
       if (!record.parentRef) {
         await i.reply({ content: "This thread has no parent channel.", flags: MessageFlags.Ephemeral });
         return;
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
-      const results = await this.threadNamer.recompactChannel(PLATFORM, record.parentRef, { migrateLegacy });
+      const results = await this.threadNamer.recompactChannel(PLATFORM, record.parentRef, {
+        migrateLegacy,
+        roleName,
+      });
+      const rebuilt = results.filter((result) => result.status === "rebuilt").length;
       const renamed = results.filter((result) => result.status === "renamed").length;
       const unchanged = results.filter((result) => result.status === "unchanged").length;
-      const skipped = results.filter((result) => result.status === "unmanaged" || result.status === "opted_out").length;
+      const skipped = results.filter(
+        (result) =>
+          result.status === "unmanaged" ||
+          result.status === "roleless" ||
+          result.status === "opted_out"
+      ).length;
       const gone = results.filter((result) => result.status === "gone").length;
       const failed = results.filter((result) => result.status === "failed").length;
       await i.editReply({
-        content: `Recomputed ${results.length} channel thread(s): ${renamed} renamed, ${unchanged} unchanged, ${skipped} left untouched, ${gone} gone, ${failed} failed.`,
+        content: `Recomputed ${results.length} channel thread(s): ${rebuilt} rebuilt, ${renamed} renamed, ${unchanged} unchanged, ${skipped} left untouched, ${gone} gone, ${failed} failed.`,
       });
       return;
     }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
-    const result = await this.applyThreadName(record, { migrateLegacy });
+    const result = await this.applyThreadName(record, { migrateLegacy, roleName });
     const detail = result.status === "unmanaged"
       ? "Name left untouched because its exact stored prefix boundary is unavailable. Use migrate-legacy:true for explicit cleanup."
-      : result.status === "opted_out"
-        ? "Name left untouched because automatic naming is disabled."
-        : result.status === "renamed"
-          ? `Renamed to ${result.name}.`
-          : "Name already matches.";
+      : result.status === "roleless"
+        ? "Name left untouched because this thread has no resolved role."
+        : result.status === "opted_out"
+          ? "Name left untouched because automatic naming is disabled."
+          : result.status === "renamed" || result.status === "rebuilt"
+            ? `${result.status === "rebuilt" ? "Rebuilt" : "Renamed"} as ${result.name}.`
+            : "Name already matches.";
     await i.editReply({ content: detail });
   }
 

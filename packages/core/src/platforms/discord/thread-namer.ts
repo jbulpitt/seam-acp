@@ -344,10 +344,19 @@ export interface ApplyThreadNameOptions {
   migrateLegacy?: boolean;
   /** Used by channel recompaction to force the creation-order ordinal. */
   ordinal?: number;
+  /** Explicitly discard the old base and rebuild it from the resolved role. */
+  roleName?: boolean;
 }
 
 export interface ApplyThreadNameResult {
-  status: "renamed" | "unchanged" | "unmanaged" | "opted_out" | "gone";
+  status:
+    | "renamed"
+    | "rebuilt"
+    | "unchanged"
+    | "unmanaged"
+    | "roleless"
+    | "opted_out"
+    | "gone";
   name?: string;
   prefix?: string;
 }
@@ -380,8 +389,12 @@ export class ThreadNamer {
       return { status: "unchanged" };
     }
 
+    const resolvedRole = description.role.value?.trim() || null;
     let base: string;
-    if (options.fresh) {
+    if (options.roleName) {
+      if (!resolvedRole) return { status: "roleless" };
+      base = resolvedRole;
+    } else if (options.fresh) {
       base = current;
     } else if (options.migrateLegacy) {
       base = stripLegacyThreadPrefix(current, this.deps.getConfig());
@@ -410,7 +423,7 @@ export class ThreadNamer {
     this.deps.setNamePrefix(record.id, computed.prefix);
     record.namePrefix = computed.prefix;
     return {
-      status: nextName === current ? "unchanged" : "renamed",
+      status: nextName === current ? "unchanged" : options.roleName ? "rebuilt" : "renamed",
       name: nextName,
       prefix: computed.prefix,
     };
@@ -465,7 +478,7 @@ export class ThreadNamer {
   async recompactChannel(
     platform: string,
     parentRef: string,
-    options: { migrateLegacy?: boolean } = {}
+    options: { migrateLegacy?: boolean; roleName?: boolean } = {}
   ): Promise<RecompactThreadNameResult[]> {
     const records = this.deps
       .listSessionsByParent(platform, parentRef)
@@ -479,6 +492,7 @@ export class ThreadNamer {
       try {
         const result = await this.applyThreadName(record, {
           migrateLegacy: options.migrateLegacy,
+          roleName: options.roleName,
           ...(ordinal ? { ordinal } : {}),
         });
         if (

@@ -328,6 +328,10 @@ export interface ThreadNamerDeps {
   describeConfig: (record: SessionRecord) => ConfigDescription;
   listSessionsByParent: (platform: string, parentRef: string) => SessionRecord[];
   getThreadName: (threadId: string) => Promise<string | null>;
+  /** Resolves undefined only when the platform confirms the thread is gone. */
+  getThreadLiveState: (
+    threadId: string
+  ) => Promise<{ locked: boolean; archived: boolean } | undefined>;
   renameThread: (threadId: string, name: string) => Promise<void>;
   setNamePrefix: (sessionId: string, prefix: string | null) => void;
   logger: { warn(obj: unknown, msg?: string): void };
@@ -343,7 +347,7 @@ export interface ApplyThreadNameOptions {
 }
 
 export interface ApplyThreadNameResult {
-  status: "renamed" | "unchanged" | "unmanaged" | "opted_out";
+  status: "renamed" | "unchanged" | "unmanaged" | "opted_out" | "gone";
   name?: string;
   prefix?: string;
 }
@@ -362,7 +366,19 @@ export class ThreadNamer {
     const description = this.deps.describeConfig(record);
     if (description.disableThreadPrefix.value) return { status: "opted_out" };
     const current = await this.deps.getThreadName(record.channelRef);
-    if (current === null) return { status: "unchanged" };
+    if (current === null) {
+      try {
+        const live = await this.deps.getThreadLiveState(record.channelRef);
+        if (live === undefined) {
+          this.deps.setNamePrefix(record.id, null);
+          record.namePrefix = null;
+          return { status: "gone" };
+        }
+      } catch {
+        // A failed liveness check cannot prove deletion. Keep the ordinal reserved.
+      }
+      return { status: "unchanged" };
+    }
 
     let base: string;
     if (options.fresh) {
@@ -465,7 +481,12 @@ export class ThreadNamer {
           migrateLegacy: options.migrateLegacy,
           ...(ordinal ? { ordinal } : {}),
         });
-        if (roleSlot && result.status !== "unmanaged" && result.status !== "opted_out") {
+        if (
+          roleSlot &&
+          result.status !== "unmanaged" &&
+          result.status !== "opted_out" &&
+          result.status !== "gone"
+        ) {
           counters.set(roleSlot, ordinal!);
         }
         results.push(result);

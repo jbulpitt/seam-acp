@@ -119,8 +119,8 @@ export interface PeekedMessage {
  *  platform metadata, so the server stays decoupled from all three. Entries are
  *  returned newest-activity first. */
 export interface ThreadEntry {
-  /** The thread id every other coordination tool takes as its first arg
-   *  (handoff/forward/steer/peek/send/…). This is the session's channelRef. */
+  /** The thread id same-channel coordination tools take as their first arg
+   *  (handoff/forward/steer/send/…). This is the session's channelRef. */
   id: string;
   /** The platform thread name (e.g. "✨ HIST 2300") — how the agent picks the
    *  right teammate. Null when the platform could not resolve it. */
@@ -166,7 +166,7 @@ export interface SeamMcpServerDeps {
     originRef: string;
     promptPreview?: string | null;
   }) => { chainId: string; firstHop: string };
-  /** Shared cursor reader used by both read_messages and the public peek alias. */
+  /** Shared cursor reader used by same-channel read_messages and cross-channel peek. */
   readMessages?: (threadId: string, input: ReadMessagesInput) => Promise<ReadMessagesResult>;
   /** Swappable search backend (live Discord walk in v1; future FTS may replace it). */
   searchMessages?: (input: SearchMessagesInput) => Promise<SearchMessagesResult>;
@@ -547,9 +547,9 @@ const TOOLS = [
   {
     name: "peek",
     description:
-      "Read the most recent messages from a thread WITHOUT posting anything, so you can catch up on " +
-      "another teammate's context before you hand off to or forward into them. This is the compact " +
-      "alias for read_messages(thread, {limit: count}).",
+      "Read the most recent messages from ANY Discord thread id WITHOUT posting anything, including " +
+      "threads outside your channel or without a Seam session. Peek shares the live reader with " +
+      "read_messages but deliberately retains its original cross-channel recent-N reach.",
     inputSchema: {
       type: "object",
       properties: {
@@ -616,7 +616,7 @@ const TOOLS = [
     description:
       "Discover the addressable teammate threads in YOUR OWN channel, newest-activity first — the way " +
       "to TURN A TASK INTO A THREAD ID before calling any other coordination tool (handoff/forward/steer/" +
-      "peek/send/chain all take a thread id you must first obtain here). Each entry reports: `id` (pass this " +
+      "send/chain all take a thread id you must first obtain here). Each entry reports: `id` (pass this " +
       "verbatim as the thread arg elsewhere), `name` (the human thread title — how you pick the right " +
       "teammate), `isSelf` (true for YOUR OWN thread — never hand off to yourself), the teammate's " +
       "`agent`/`model`/`cwd` (agent is `agentId@location` with host emoji), `status` (active | archived | gone), `lastActivityUtc`, and `busy`. " +
@@ -1542,7 +1542,7 @@ const INSTRUCTIONS = [
   "coordinate with the others without leaving your own turn:",
   "",
   "- threads(): list the teammate threads in YOUR channel (id, name, agent/model, busy, status). START",
-  "  HERE — every tool below takes a thread id, and this is the only way to discover one. `busy` tells you",
+  "  HERE for same-channel coordination; `busy` tells you",
   "  HOW to reach a teammate: busy ⇒ prefer send (pull-only, won't interrupt); idle ⇒ handoff/forward land",
   "  a turn cleanly. The entry marked isSelf is YOUR OWN thread — never hand off to it.",
   "- agent_quota(agentId?): read normalized rolling + weekly quota for one agent or all agents",
@@ -1562,7 +1562,7 @@ const INSTRUCTIONS = [
   "- migrate_self(agent?, model?, effort?, manifest): migrate YOUR OWN thread after this turn ends; the manifest is the replacement session's first prompt. Purpose-agnostic and rollback-safe.",
   "- search_messages(query, threads?, author?, since?, limit?): search live conversation text in your thread or same-channel siblings.",
   "- read_messages(thread, around?/before?/after?, limit?): read an unfiltered same-channel message window; use around on a search hit.",
-  "- peek(thread, count?): compact alias for read_messages latest-N, for quick context before delegating.",
+  "- peek(thread, count?): cross-channel recent-N read by raw Discord thread id; shares the reader but does not require a Seam session.",
   "- chain(workers, prompt, returnTo?): pipe a prompt through an ordered list of workers where each",
   "  hop's output feeds the next; the final output is delivered back to you. Durable across restarts.",
   "- schedule_wake(delaySeconds, prompt, reason?): wake YOURSELF later in this thread and replay `prompt`",
@@ -1747,7 +1747,7 @@ export class SeamMcpServer {
         case "steer":
           return rpcResult(id, await this.toolSteer(record, args));
         case "peek":
-          return rpcResult(id, await this.toolPeek(record, args));
+          return rpcResult(id, await this.toolPeek(args));
         case "search_messages":
           return rpcResult(id, await this.toolSearchMessages(record, args));
         case "read_messages":
@@ -2140,18 +2140,13 @@ export class SeamMcpServer {
     );
   }
 
-  private async toolPeek(
-    caller: SessionRecord,
-    args: Record<string, unknown>
-  ): Promise<McpToolResult> {
+  private async toolPeek(args: Record<string, unknown>): Promise<McpToolResult> {
     const thread = requireString(args, "thread");
     const rawCount = typeof args.count === "number" ? args.count : 20;
     const count = Math.max(1, Math.min(50, Math.floor(rawCount)));
-    if (!this.deps.readMessages || !this.deps.resolveThread) {
+    if (!this.deps.readMessages) {
       return textResult("peek is not supported on this platform.", true);
     }
-    const target = this.resolveSameChannelTarget(caller, thread);
-    if (!target.ok) return textResult(target.error, true);
     const result = await this.deps.readMessages(thread, { limit: count });
     if (result.messages.length === 0) {
       return textResult(`Thread ${thread} has no readable messages.`);

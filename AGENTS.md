@@ -40,8 +40,9 @@ hand-editing runtime state.
 - **Find or read prior conversation:** `search_messages` searches your thread,
   selected siblings, or all threads in this channel and returns message-id
   anchors; `read_messages` loads latest / around / before / after context,
-  including cards. Both are live Discord reads and never cross channels.
-  `peek(thread, count?)` remains the compact latest-N alias over the same reader.
+  including cards. Those two live reads never cross channels. `peek(thread,
+  count?)` shares their reader but retains cross-channel recent-N reach by raw
+  Discord thread id, including threads without a Seam session.
 - **Reconfigure or reset another thread's session** (not just message it):
   `configure_thread(thread, { agent?, model?, effort? })` changes its agent /
   model / effort and reports what actually reset (agent switch always resets;

@@ -72,8 +72,10 @@ know the model and just want its numbers.
 ## 2. Conversation lookup (read-only, live Discord fetch)
 
 These tools read Discord on demand; they do not use a persisted message index.
-They are scoped to the calling thread's channel, matching `threads()` and the
-cross-thread control boundary. A named thread outside that channel is refused.
+`search_messages` and `read_messages` are scoped to the calling thread's
+channel, matching `threads()` and the cross-thread control boundary. A named
+thread outside that channel is refused. `peek` deliberately retains its older,
+broader cross-channel recent-N reach.
 
 ### `search_messages(query, { threads?, author?, since?, limit? })`
 Search human and bot conversation text and return stable `messageId` anchors.
@@ -96,9 +98,11 @@ unfiltered: human messages, bot messages, attachments, and cards are included;
 `isCard` marks UI/status rows.
 
 ### `peek(thread, count?)`
-The compact latest-N presentation remains public for quick catch-up. It is now
-an alias over `read_messages(thread, { limit: count })`, so all three methods
-share the same fetch, ordering, cursor, and rate-limit behavior.
+The compact latest-N presentation remains public for quick catch-up. It shares
+the live fetch, ordering, and rate-limit reader with `read_messages`, but accepts
+any raw Discord thread id—including an outside-channel thread with no Seam
+session. It is not subject to the same-channel scope of the cursor-addressed
+`read_messages` and `search_messages` tools.
 
 ---
 

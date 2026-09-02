@@ -1260,12 +1260,7 @@ describe("SeamMcpServer", () => {
     expect(h.enqueued).toHaveLength(1);
   });
 
-  it("peek is a latest-N alias over the same read_messages dependency", async () => {
-    const target = makeRecord({
-      id: "discord:thread-x",
-      channelRef: "thread-x",
-      parentRef: "chan-1",
-    });
+  it("peek keeps latest-N parity with the shared read_messages dependency", async () => {
     const readMessages = vi.fn(async (threadId: string, input: { limit?: number }) => ({
       threadId,
       truncated: false,
@@ -1293,7 +1288,6 @@ describe("SeamMcpServer", () => {
       ],
     }));
     h = await makeHarness({
-      resolveThread: (id) => id === target.channelRef ? target : undefined,
       readMessages,
     });
     const { body } = await h.call(
@@ -1408,7 +1402,7 @@ describe("SeamMcpServer", () => {
     expect(searchMessages).toHaveBeenCalledTimes(1);
   });
 
-  it("read_messages and peek reject an outside-channel thread before fetching content", async () => {
+  it("read_messages rejects an outside-channel thread before fetching content", async () => {
     const outside = makeRecord({
       id: "discord:thread-outside",
       channelRef: "thread-outside",
@@ -1420,16 +1414,44 @@ describe("SeamMcpServer", () => {
       readMessages,
     });
 
-    for (const name of ["read_messages", "peek"]) {
-      const { body } = await h.call(
-        "tools/call",
-        { name, arguments: { thread: outside.channelRef } },
-        { "X-Seam-Session": "good-token" }
-      );
-      expect(body.result.isError).toBe(true);
-      expect(body.result.content[0].text).toContain("not a session in your channel");
-    }
+    const { body } = await h.call(
+      "tools/call",
+      { name: "read_messages", arguments: { thread: outside.channelRef } },
+      { "X-Seam-Session": "good-token" }
+    );
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("not a session in your channel");
     expect(readMessages).not.toHaveBeenCalled();
+  });
+
+  it("peek reads an outside-channel unmanaged thread without resolving a Seam session", async () => {
+    const resolveThread = vi.fn(() => undefined);
+    const readMessages = vi.fn(async (threadId: string) => ({
+      threadId,
+      truncated: false,
+      messages: [{
+        messageId: "outside-1",
+        timestamp: "2026-08-01T00:00:00.000Z",
+        author: "Outside teammate",
+        authorId: "bot-outside",
+        authorType: "bot" as const,
+        content: "cross-channel context",
+        isCard: false,
+        attachments: [],
+      }],
+    }));
+    h = await makeHarness({ resolveThread, readMessages });
+
+    const { body } = await h.call(
+      "tools/call",
+      { name: "peek", arguments: { thread: "outside-unmanaged-thread", count: 7 } },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBeFalsy();
+    expect(body.result.content[0].text).toContain("cross-channel context");
+    expect(readMessages).toHaveBeenCalledWith("outside-unmanaged-thread", { limit: 7 });
+    expect(resolveThread).not.toHaveBeenCalled();
   });
 
   // --- threads: discover addressable teammate threads (#73) ----------------

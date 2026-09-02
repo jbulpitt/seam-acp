@@ -10,6 +10,9 @@ export interface ModelAlias {
 /** Explicit joins only: vendor naming drift must surface as an unmatched row,
  * never as a fuzzy match to another SKU. Shared by #130 and #134. */
 export const MODEL_METADATA_ALIASES: Readonly<Record<string, ModelAlias>> = {
+  "claude-fable-5-1": {
+    aaSlugPrefixes: ["claude-fable-5-1"], pricingNames: ["Claude Fable 5.1"],
+  },
   "claude-sonnet-5": { aaSlugPrefixes: ["claude-sonnet-5"], pricingNames: ["Claude Sonnet 5"] },
   "claude-opus-5": { aaSlugPrefixes: ["claude-opus-5"], pricingNames: ["Claude Opus 5"] },
   "claude-opus-4.8": {

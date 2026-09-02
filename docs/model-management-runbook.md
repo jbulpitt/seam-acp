@@ -74,6 +74,7 @@ model's native window comes from the `CLAUDE_CONTEXT_WINDOWS` table in
 | Picker value | Resolves to (JSONL) | Window | Mechanism |
 |---|---|---|---|
 | `default` ⭐ | claude-opus-5 (auto-rolls) | 1M | alias (Max → latest Opus) |
+| `claude-fable-5-1` | claude-fable-5-1 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
 | `claude-opus-5` | claude-opus-5 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
 | `claude-opus-4-8` | claude-opus-4-8 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
 | `claude-opus-4-7` | claude-opus-4-7 | 1M | full ID (`ANTHROPIC_MODEL` + exact-match) |
@@ -102,7 +103,7 @@ Two non-obvious truths this table encodes:
    `staticModels[].contextLimit → modelContextFloor` path seeds the window on
    turn 1, and the agent's runtime `UsageUpdate.size` refines it. (`getClaudeContextWindow`
    still strips any residual legacy `[1m]` for safety, but nothing relies on it.)
-2. **Opus 5/4.7/4.8/Fable-5/Sonnet-5 are 1M; Opus 4.6, Sonnet 4.6, and Haiku are
+2. **Fable 5.1, Opus 5/4.7/4.8, Fable 5, and Sonnet 5 are 1M; Opus 4.6, Sonnet 4.6, and Haiku are
    200K** — the window is a property of the model, declared in the table, not of a
    string suffix.
 
@@ -277,6 +278,7 @@ import path from "node:path";
 // Edit this list to whatever you need to verify (bare full IDs — no `[1m]`):
 const MODELS = [
   "default",
+  "claude-fable-5-1",
   "claude-opus-5",
   "claude-opus-4-8",
   "claude-opus-4-7",
@@ -412,8 +414,9 @@ The picker is `CLAUDE_MODELS` in `.env`, comma-separated `modelId:Label` pairs.
 Rules (enforced by §4 evidence, not by intuition):
 - **Bare full IDs only — no `[1m]` suffix.** The suffix is retired; window is a
   property of the model, declared in `CLAUDE_CONTEXT_WINDOWS` (§6), not the string.
-  Current picker: `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`,
-  `claude-fable-5`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-haiku-4-5`,
+  Current picker: `claude-fable-5-1`, `claude-opus-5`, `claude-opus-4-8`,
+  `claude-opus-4-7`, `claude-opus-4-6`, `claude-fable-5`, `claude-sonnet-5`,
+  `claude-sonnet-4-6`, `claude-haiku-4-5`,
   plus the `default` alias.
 - **One entry per model.** No trap variants, no redundant pairs.
 - **`default`** → the auto-rolling "latest Opus @ 1M" entry (Max tier); the proven
@@ -461,7 +464,7 @@ can't drift from the implementation:
 node -e '
 require("tsx/cjs");
 const { getClaudeContextWindow } = require("./packages/adapters/src/profiles/claude.ts");
-for (const m of ["default","claude-opus-5","claude-opus-4-8","claude-opus-4-7","claude-opus-4-6","claude-fable-5","claude-sonnet-5","claude-sonnet-4-6","claude-haiku-4-5"]) {
+for (const m of ["default","claude-fable-5-1","claude-opus-5","claude-opus-4-8","claude-opus-4-7","claude-opus-4-6","claude-fable-5","claude-sonnet-5","claude-sonnet-4-6","claude-haiku-4-5"]) {
   console.log(m.padEnd(24), "→ compaction window:", getClaudeContextWindow(m));
 }
 ' 2>/dev/null || echo "(no tsx loader? import from the built dist/ instead, or read CLAUDE_CONTEXT_WINDOWS directly)"

@@ -836,6 +836,7 @@ function pickStringField(
  *  longer carry a `[1m]` suffix — each model just declares its native window
  *  here, and the agent-reported size refines this seed once a turn completes. */
 const CLAUDE_CONTEXT_WINDOWS: Record<string, number> = {
+  "claude-fable-5-1": 1_000_000,
   "claude-opus-5": 1_000_000,
   "claude-opus-4-8": 1_000_000,
   "claude-opus-4-7": 1_000_000,

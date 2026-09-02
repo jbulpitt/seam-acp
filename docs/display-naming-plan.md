@@ -1,7 +1,14 @@
 # Display naming — emoji + short-name standard for renderable entities
 
-**Status:** brainstorm → plan · **Created:** 2026-06-05 · **Updated:** 2026-06-05 ·
-**Owner:** jbulpitt
+**Status:** SUPERSEDED — historical record only · **Created:** 2026-06-05 ·
+**Updated:** 2026-09-02 · **Owner:** jbulpitt
+
+> Superseded by the data-driven thread namer shipped in #145/#146. Thread name
+> prefixes are now computed from configurable agent/model/role symbol tables
+> plus a role-local ordinal, and `AgentProfile.threadAbbr` no longer exists.
+> See `packages/core/src/platforms/discord/thread-namer.ts` and the
+> "Reading a thread name" section of `docs/agent-guides/model-intelligence-and-thread-control.md`.
+> Do not implement from this document.
 
 Every named entity the UI shows (agent, model, host/bridge, workspace/cwd, effort, …)
 needs a compact **display identity** — emoji and/or short text — or the Discord UI

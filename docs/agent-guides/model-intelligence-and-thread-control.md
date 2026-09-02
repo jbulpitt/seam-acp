@@ -15,8 +15,9 @@ There are three capability families:
    benchmarks, pricing, and cost-efficiency ("value") rankings.
 2. **Conversation lookup** — live text search and ordered context windows over
    your thread and sibling threads in the same channel.
-3. **Session control** — reconfigure/reset another thread, or migrate your own
-   thread to a fresh agent/model with an explicit continuation manifest.
+3. **Session control and identity** — reconfigure/reset another thread (agent,
+   model, effort, role), or migrate your own thread to a fresh agent/model with
+   an explicit continuation manifest.
 
 ---
 
@@ -113,17 +114,19 @@ There are two scopes. `configure_thread` and `reset_thread_session` target
 `handoff`. `migrate_self` targets only the calling thread. They compose with the
 data tools: inspect the candidates first, then apply the selected runtime.
 
-### `configure_thread(thread, { agent?, model?, effort? })`
-Change a target thread's agent, model, and/or reasoning effort (at least one
-field required).
+### `configure_thread(thread, { agent?, model?, effort?, role?, disableThreadPrefix? })`
+Change a target thread's agent, model, reasoning effort, naming role, and/or
+naming opt-out (at least one field required).
 - **The result is exact, including no-ops.** Agent, model, and effort are always
   returned as the effective post-set identity; each field says whether it
   changed and names its previous value when it did. The target thread receives
   the same information in a visual confirmation card.
-- **The thread identity follows the setting.** Agent changes refresh the agent
-  abbreviation/icon in the thread name. `threads()` also stamps every entry
-  with effective agent/model/effort, so a coordinator can verify the target
-  without waking it.
+- **The thread identity follows the setting.** A managed thread's name carries a
+  short symbol prefix derived from its identity, so changing agent, model, or
+  role updates that prefix automatically — you never rename a thread by hand to
+  keep it accurate. `threads()` also stamps every entry with effective
+  agent/model/effort, so a coordinator can verify the target without waking it.
+  See "Reading a thread name" below.
 - **Reset is reported, not assumed.** Switching **agent** always starts a fresh
   session (context lost). Switching **model** resets on backends that pin the
   model at session start (codex, ollama-cloud) but not on those that switch live
@@ -140,6 +143,38 @@ field required).
   overlay, so a channel preset cannot leave the runtime or `threads()` display
   on the old agent/model/effort. A compact authoritative identity stamp is also
   injected into the target's subsequent turns.
+- **`role` is a free-form label, not an enum.** It says what a thread is *for*
+  (`worker`, `qa`, `orchestrator`, `analyst`, `planner`, …) and is a first-class
+  configuration dimension alongside agent/model/effort. It never changes the
+  runtime: it identifies the thread, drives the role symbol in its name, and
+  groups the thread for enumeration. Pass an empty string or `auto` to clear it.
+  Set it when you create or repurpose a teammate so coordinators can tell your
+  workers, reviewers, and planners apart without opening them.
+- **`disableThreadPrefix` opts a thread out of managed naming.** When true, Seam
+  stops maintaining that thread's name prefix and leaves its title alone.
+  Uncommon — use it only for a thread whose title a human curates deliberately.
+
+### Reading a thread name
+
+Thread names are meaningful, not decorative. A managed thread's title is a
+compact symbol prefix followed by its base name:
+
+`[agent][model][role][n] base name`
+
+- **agent** — which backend runs it (👾 Claude, 🧬 Codex, 🌌 Agy, 🤖 Copilot, …).
+- **model** — the model family or variant currently selected.
+- **role** — what the thread is for, from its `role` setting (🛠️ worker,
+  🧪 qa, 🪄 orchestrator, 🔬 analyst, …).
+- **n** — an enumeration keycap separating threads that share a role in the same
+  channel (1️⃣, 2️⃣, … 🔟 and beyond).
+
+Any slot may be absent; a thread with no role has no role symbol and no number.
+Seam maintains the prefix itself whenever a thread's identity changes, so you
+can read a `threads()` listing and know each teammate's backend and purpose at a
+glance. Treat the *grammar* as stable and the specific glyphs as host
+configuration that can change. `threads()` remains the authoritative source for
+effective agent/model/effort, and a thread's `id` is the only thing you should
+ever address — never parse or match on its name.
 
 ### `reset_thread_session(thread)`
 Start a fresh session on a thread, keeping its current agent + model. Clears
@@ -180,5 +215,5 @@ takes no thread id: the seam session token is the sole target authority.
   response if you need to reason about staleness.
 
 _Provenance: seam-acp issues #130 (value ranking), #132 (cross-thread control),
-#134 (metadata cache), #141 (self migration), #143 (message search/read);
-drain-safety fix #137._
+#134 (metadata cache), #141 (self migration), #143 (message search/read),
+#145 (thread role + identity naming); drain-safety fix #137._

@@ -14,8 +14,8 @@ teach the operating model and the choices between tools.
 **ACP (Agent Client Protocol)** is the session protocol Seam uses to talk to
 agent CLIs. **seam-acp** is the bridge between Discord and those ACP-compatible
 agents. A Discord thread is normally one persistent agent workspace: it has an
-agent, model, reasoning effort, repository/cwd, configuration, and resumable
-conversation. Messages, attachments, streamed output, approvals, and session
+agent, model, reasoning effort, role, repository/cwd, configuration, and
+resumable conversation. Messages, attachments, streamed output, approvals, and session
 lifecycle cross that bridge.
 
 **seam-MCP** is the agent-facing control surface supplied inside that session.
@@ -37,6 +37,10 @@ The useful mental model is:
   tools normally cannot reach beyond it.
 - A **thread worker** is a stateful teammate with its existing context.
 - A **preset worker** is a fresh, stateless specialist configured for one job.
+- A thread's **role** records what it is for (`worker`, `qa`, `orchestrator`,
+  `analyst`, …). It is configuration, not behavior. Role, agent, and model are
+  what a thread's name prefix encodes, so a `threads()` listing is readable at a
+  glance — but always address a teammate by `id`, never by name.
 - Many Seam actions are asynchronous. A handoff, chain, wake, watch, compaction,
   self-migration, or live-help call returns promptly; Seam delivers the later
   result or event. Do not block or poll merely to keep your turn alive.
@@ -78,7 +82,11 @@ Use this as a map, not as a substitute for each tool's live schema.
 ### Inspect and choose
 
 - Team and context: `threads`, `peek`, `poll_inbox`. `threads` stamps each
-  teammate's effective agent/model/effort identity.
+  teammate's effective agent/model/effort identity; its name prefix also encodes
+  agent, model, and role.
+- Prior conversation in this channel: `search_messages` finds text and returns
+  message-id anchors; `read_messages` loads the window around a hit. `peek` is
+  the quick latest-N read and is the one read that reaches outside this channel.
 - Current configuration, visible presets, and scheduled prompts:
   `config_describe`.
 - Agent capacity before delegation: `agent_quota`.
@@ -96,10 +104,11 @@ Use this as a map, not as a substitute for each tool's live schema.
 
 ### Manage thread sessions
 
-- Change another thread's agent/model/effort: `configure_thread`. The response
-  reports every effective field, explicitly marks no-ops, refreshes the target
-  thread's agent icon, and posts a confirmation card there. Claude/meta effort
-  reloads the runtime while preserving its ACP session and context.
+- Change another thread's agent/model/effort/role: `configure_thread`. The
+  response reports every effective field, explicitly marks no-ops, updates the
+  target thread's name prefix to match its new identity, and posts a
+  confirmation card there. Claude/meta effort reloads the runtime while
+  preserving its ACP session and context.
 - Clear another thread's context but keep its agent/model:
   `reset_thread_session`.
 - Move this thread to a different agent/model and continue from an explicit

@@ -44,11 +44,17 @@ hand-editing runtime state.
   count?)` shares their reader but retains cross-channel recent-N reach by raw
   Discord thread id, including threads without a Seam session.
 - **Reconfigure or reset another thread's session** (not just message it):
-  `configure_thread(thread, { agent?, model?, effort? })` changes its agent /
-  model / effort and reports what actually reset (agent switch always resets;
-  model switch resets on codex/ollama, not claude; effort never does);
-  `reset_thread_session(thread)` clears its context but keeps the model. Same
-  in-channel scope as `handoff`.
+  `configure_thread(thread, { agent?, model?, effort?, role?, disableThreadPrefix? })`
+  changes its agent / model / effort / naming role and reports what actually
+  reset (agent switch always resets; model switch resets on codex/ollama, not
+  claude; effort never does); `reset_thread_session(thread)` clears its context
+  but keeps the model. Same in-channel scope as `handoff`.
+- **`role` is what a thread is for, not how it runs:** a free-form label
+  (`worker`, `qa`, `orchestrator`, …) that is a first-class config dimension
+  beside agent/model/effort. It drives the role symbol in the thread name and
+  groups threads for enumeration. Thread names are maintained by Seam from
+  agent + model + role + ordinal — **do not hand-rename a thread to fix its
+  prefix**; set the identity and the name follows.
 - **Migrate your own thread to a new brain and keep working:**
   `migrate_self({ agent?, model?, effort?, manifest })` stages an agent/model
   switch until your current turn ends, then seeds the fresh session with your
@@ -137,7 +143,10 @@ Discord has no aliases; old invocations disappear.
 **Top-level (6):** `cancel`, `steer`, `new`, `workflows`, `queue`, `rebuild`
 
 **Groups (9):**
-- `config` (17): `model` `effort` `agent` `mode` `repo` `tools` `card` `gif` `approve` `reset` `init` `detach` `tts` `show` `edit` `set` `audit`
+- `config` (20): `model` `effort` `agent` `role` `mode` `repo` `tools` `card` `gif` `approve` `reset` `init` `detach` `tts` `show` `edit` `set` `audit` `rename` `namer`
+  - `role` sets a thread's naming role; `rename` refreshes/migrates names
+    (`migrate-legacy:true` for old hand-typed prefixes); `namer` edits the
+    agent/model/role symbol tables.
 - `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
 - `schedule` (7), `preset` (6), `project` (3) — unchanged
 - `upload` (3): `pull` `push` `secret` — **admin-only**. Hard cutover of `/seam attach`.

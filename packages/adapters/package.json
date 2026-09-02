@@ -18,7 +18,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.1.0",
+    "@agentclientprotocol/sdk": "^1.4.0",
     "@types/ws": "^8.18.1",
     "better-sqlite3": "^11.7.0",
     "ws": "^8.20.0"

@@ -33,6 +33,9 @@ function profile(id: string, defaultModel: string, models: string[]): AgentProfi
     id,
     defaultModel,
     staticModels: models.map((modelId) => ({ modelId, name: modelId })),
+    effort: id === "claude"
+      ? { mechanism: "meta", levels: ["low", "high"] }
+      : { mechanism: "configOption", configId: "reasoning_effort", levels: ["low", "high"] },
   } as AgentProfile;
 }
 
@@ -94,12 +97,14 @@ function harness(opts: {
   const invalidated: string[] = [];
   const invalidationOptions: Array<{ clearStartFailure?: boolean } | undefined> = [];
   const mutations: SessionConfigChanges[] = [];
+  const overlays: Array<{ agent?: string | null; model?: string | null; effort?: string | null }> = [];
   let nextSession = 1;
 
   const deps: ThreadSessionControlDeps = {
     store: {
       get: (id) => records.get(id),
       readConfig: (value) => JSON.parse(value.configJson || "{}") as SessionConfigState,
+      writeConfig: (value) => JSON.stringify(value),
       upsert: (value) => { records.set(value.id, value); },
     },
     router: {
@@ -131,6 +136,10 @@ function harness(opts: {
       },
     },
     mutation: {
+      applyThreadOverlay: ({ changes }) => {
+        overlays.push(changes);
+        return { ok: true, message: "updated", auditId: "audit-overlay-1" };
+      },
       applySessionConfig: (value, changes) => {
         mutations.push(changes);
         const current = records.get(value.id) ?? value;
@@ -170,6 +179,7 @@ function harness(opts: {
     invalidated,
     invalidationOptions,
     mutations,
+    overlays,
     service: new ThreadSessionControlService(deps),
   };
 }
@@ -194,7 +204,7 @@ describe("detectSessionReset", () => {
 });
 
 describe("ThreadSessionControlService", () => {
-  it("changes a Claude model live and applies only a live-advertised effort", async () => {
+  it("changes a Claude model and reloads the runtime so meta effort takes effect", async () => {
     const h = harness();
     const result = await h.service.configure(h.caller, h.target, {
       model: "claude-new",
@@ -203,13 +213,15 @@ describe("ThreadSessionControlService", () => {
 
     expect(result).toMatchObject({
       ok: true,
-      applied: { model: "claude-new", effort: "high" },
+      applied: { agent: "claude", model: "claude-new", effort: "high" },
       sessionReset: false,
+      runtimeReloaded: true,
     });
-    expect(h.invalidated).toEqual([]);
-    expect(h.runtimes[0]!.modelCalls).toEqual(["claude-new"]);
-    expect(h.runtimes[0]!.optionCalls).toEqual([["reasoning_effort", "high"]]);
-    expect(h.mutations).toEqual([{ model: "claude-new", effort: "high" }]);
+    expect(h.invalidated).toEqual([h.target.id]);
+    expect(h.invalidationOptions).toEqual([{ clearAcpSession: false }]);
+    expect(h.runtimes[0]!.modelCalls).toEqual([]);
+    expect(h.runtimes[0]!.optionCalls).toEqual([]);
+    expect(h.overlays).toEqual([{ model: "claude-new", effort: "high" }]);
   });
 
   it("forges a fresh Codex session on model change", async () => {
@@ -227,12 +239,10 @@ describe("ThreadSessionControlService", () => {
       sessionReset: true,
       resetReason: "model-switch",
       newSessionId: "session-new-1",
+      runtimeReloaded: false,
     });
     expect(h.invalidated).toEqual([h.target.id]);
-    expect(h.mutations).toEqual([
-      { model: "gpt-new", effort: null },
-      { effort: "low" },
-    ]);
+    expect(h.overlays).toEqual([{ model: "gpt-new", effort: "low" }]);
   });
 
   it("falls back to auto without sending an unsupported effort", async () => {
@@ -241,12 +251,13 @@ describe("ThreadSessionControlService", () => {
 
     expect(result).toMatchObject({
       ok: true,
-      applied: { effort: "auto" },
+      applied: { agent: "claude", model: "claude-old", effort: "auto" },
       sessionReset: false,
+      runtimeReloaded: true,
     });
     expect(result.ok && result.warnings.join(" ")).toContain("using auto");
     expect(h.runtimes[0]!.optionCalls).toEqual([]);
-    expect(h.mutations).toEqual([{ effort: null }]);
+    expect(h.overlays).toEqual([{ effort: "auto" }]);
   });
 
   it("agent switches always reset and default the model to the new profile", async () => {
@@ -259,8 +270,34 @@ describe("ThreadSessionControlService", () => {
       sessionReset: true,
       resetReason: "agent-switch",
       newSessionId: "session-new-1",
+      runtimeReloaded: false,
     });
-    expect(h.mutations[0]).toEqual({ agent: "codex", model: "gpt-old", effort: null });
+    expect(h.overlays[0]).toEqual({ agent: "codex", model: "gpt-old", effort: "low" });
+  });
+
+  it("returns an exact no-change identity without touching the runtime", async () => {
+    const h = harness();
+    const result = await h.service.configure(h.caller, h.target, {
+      agent: "claude",
+      model: "claude-old",
+      effort: "low",
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      applied: { agent: "claude", model: "claude-old", effort: "low" },
+      changes: {
+        agent: { before: "claude", after: "claude", changed: false },
+        model: { before: "claude-old", after: "claude-old", changed: false },
+        effort: { before: "low", after: "low", changed: false },
+      },
+      sessionReset: false,
+      runtimeReloaded: false,
+      warnings: [],
+    });
+    expect(h.invalidated).toEqual([]);
+    expect(h.runtimes).toEqual([]);
+    expect(h.overlays).toEqual([]);
   });
 
   it("reset forges a new session while preserving effective agent and model", async () => {

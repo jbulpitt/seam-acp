@@ -668,8 +668,23 @@ async function main(): Promise<void> {
       },
       enqueueDispatch: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
       resolveThread: (threadId) => store.getByChannel("discord", threadId),
-      configureThread: (caller, target, input) =>
-        threadSessionControl.configure(caller, target, input),
+      configureThread: async (caller, target, input) => {
+        const outcome = await threadSessionControl.configure(caller, target, input);
+        if (!outcome.ok) return outcome;
+        const presentation = await orchestrator.presentThreadConfigurationChange(
+          caller,
+          target,
+          outcome
+        );
+        return {
+          ...outcome,
+          confirmationPosted: presentation.confirmationPosted,
+          threadIdentityUpdated: presentation.threadIdentityUpdated,
+          warnings: presentation.warning
+            ? [...outcome.warnings, presentation.warning]
+            : outcome.warnings,
+        };
+      },
       resetThreadSession: (target) => threadSessionControl.reset(target),
       prepareSelfMigration: (caller, input) =>
         threadSessionControl.prepareSelfMigration(caller, input),
@@ -782,6 +797,7 @@ async function main(): Promise<void> {
               isSelf: s.id === record.id,
               agent: cfg.agent.value,
               model: cfg.model.value,
+              effort: cfg.effort.value,
               cwd: cfg.cwd.value,
               busy: router.isBusy(s.id),
               status,

@@ -146,6 +146,20 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
     expect(d.effortIgnoredNote).toBeUndefined();
   });
 
+  it("lets a thread-level auto sentinel neutralize a channel effort pin", () => {
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { agent: { value: "claude" }, effort: { value: "high" }, locked: false }],
+    ]);
+    const threadPresets = new Map<string, ThreadPreset>([
+      ["thread-1", { effort: { value: "auto" } }],
+    ]);
+    const router = makeRouter({ channelPresets, threadPresets });
+    const d = router.describeConfig(makeRecord());
+
+    expect(d.effort).toEqual({ value: null, source: "thread preset" });
+    expect(d.effortIgnoredNote).toBeUndefined();
+  });
+
   it("Trap 2: a preset effort the agent can't support is ignored and noted", () => {
     // Resolved agent is copilot (mechanism "none"); the preset effort is dropped.
     const channelPresets = new Map<string, ChannelPreset>([

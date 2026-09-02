@@ -10,7 +10,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.1.0",
+    "@agentclientprotocol/sdk": "^1.4.0",
     "@discordjs/opus": "^0.10.0",
     "@discordjs/voice": "^0.19.2",
     "@modelcontextprotocol/sdk": "^1.29.0",

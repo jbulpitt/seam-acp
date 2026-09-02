@@ -127,10 +127,11 @@ export interface ThreadEntry {
   name: string | null;
   /** True for the CALLER'S OWN thread, so it never hands off to itself. */
   isSelf: boolean;
-  /** The teammate's effective agent / model / cwd (as `describeConfig` resolves
+  /** The teammate's effective agent / model / effort / cwd (as `describeConfig` resolves
    *  them — the same precedence startRuntime applies). */
   agent: string;
   model: string;
+  effort: string | null;
   cwd: string;
   /** Whether a live turn is CURRENTLY running in that thread — the load-bearing
    *  field: choose `send` (non-interrupting) over `steer`/`handoff`
@@ -646,8 +647,10 @@ const TOOLS = [
       "Change a teammate thread's agent, model, and/or reasoning effort within YOUR channel. " +
       "An agent switch ALWAYS creates a fresh session and drops that thread's conversation context. " +
       "Model switches reset only on session-pinned backends (codex and ollama-cloud); live-config " +
-      "backends such as Claude preserve context. Effort never resets the session and is validated " +
-      "against the target runtime's live reasoning_effort values; unsupported values fall back to auto.",
+      "backends such as Claude preserve context. Effort never resets the ACP session: config-option " +
+      "agents update live, while meta/spawn-argument agents (including Claude) reload their runtime " +
+      "with context preserved. The result and target-thread confirmation card report the exact " +
+      "effective agent/model/effort, marking every unchanged field explicitly.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1541,7 +1544,7 @@ const INSTRUCTIONS = [
   "You are one teammate in a shared workspace of parallel agent threads. These tools let you",
   "coordinate with the others without leaving your own turn:",
   "",
-  "- threads(): list the teammate threads in YOUR channel (id, name, agent/model, busy, status). START",
+  "- threads(): list the teammate threads in YOUR channel (id, name, agent/model/effort identity, busy, status). START",
   "  HERE for same-channel coordination; `busy` tells you",
   "  HOW to reach a teammate: busy ⇒ prefer send (pull-only, won't interrupt); idle ⇒ handoff/forward land",
   "  a turn cleanly. The entry marked isSelf is YOUR OWN thread — never hand off to it.",
@@ -1557,7 +1560,7 @@ const INSTRUCTIONS = [
   "  result is dispatched back into your thread when it completes.",
   "- forward(to, content): relay a message into another thread (thin handoff, no specialist framing).",
   "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
-  "- configure_thread(thread, agent?, model?, effort?): reconfigure a teammate in YOUR channel; agent switches reset context.",
+  "- configure_thread(thread, agent?, model?, effort?): reconfigure a teammate in YOUR channel; returns exact changed/no-change identity, posts a target confirmation card, and agent switches reset context.",
   "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
   "- migrate_self(agent?, model?, effort?, manifest): migrate YOUR OWN thread after this turn ends; the manifest is the replacement session's first prompt. Purpose-agnostic and rollback-safe.",
   "- search_messages(query, threads?, author?, since?, limit?): search live conversation text in your thread or same-channel siblings.",
@@ -1855,7 +1858,29 @@ export class SeamMcpServer {
       ...(typeof args.effort === "string" ? { effort: args.effort } : {}),
     };
     const outcome = await this.deps.configureThread(caller, target.record, input);
-    return textResult(JSON.stringify(outcome, null, 2), !outcome.ok);
+    if (!outcome.ok) return textResult(outcome.error, true);
+    const status = (field: { before: string; after: string; changed: boolean }) =>
+      field.changed ? `changed from ${field.before}` : "no change";
+    const runtime = outcome.sessionReset
+      ? `fresh ACP session${outcome.resetReason ? ` (${outcome.resetReason})` : ""}`
+      : outcome.runtimeReloaded
+        ? "runtime reloaded; ACP session/context preserved"
+        : "runtime kept";
+    const presentation = [
+      outcome.confirmationPosted === false ? "confirmation card could not be posted" : null,
+      outcome.threadIdentityUpdated === false && outcome.changes.agent.changed
+        ? "thread icon/name could not be updated"
+        : null,
+    ].filter(Boolean);
+    return textResult([
+      `✅ Thread ${target.record.channelRef} configuration confirmed:`,
+      `• Agent: ${outcome.applied.agent} (${status(outcome.changes.agent)})`,
+      `• Model: ${outcome.applied.model} (${status(outcome.changes.model)})`,
+      `• Effort: ${outcome.applied.effort} (${status(outcome.changes.effort)})`,
+      `• Runtime: ${runtime}`,
+      ...(presentation.length ? [`• Presentation: ${presentation.join("; ")}`] : []),
+      ...outcome.warnings.map((warning) => `⚠️ ${warning}`),
+    ].join("\n"));
   }
 
   private async toolResetThreadSession(
@@ -2299,10 +2324,14 @@ export class SeamMcpServer {
       ].filter(Boolean);
       const loc = t.location ?? "local";
       const agentAt = formatHostPrefixed(t.agent, loc, t.hostEmoji ?? "");
-      const cfg = [agentAt.trim(), t.model].filter(Boolean).join(" / ");
+      const cfg = [
+        agentAt.trim(),
+        t.model,
+        `effort ${t.effort ?? "auto"}`,
+      ].filter(Boolean).join(" / ");
       lines.push(
         `• ${name} — id ${t.id} [${flags.join(", ")}]` +
-          (cfg ? `\n    ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
+          (cfg ? `\n    identity: ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
           `\n    last active ${formatLocalTime(t.lastActivityUtc)}`
       );
     }

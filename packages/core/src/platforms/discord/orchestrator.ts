@@ -290,6 +290,7 @@ import {
 } from "../../core/simple-card-gif.js";
 import { ConfigMutationService, type ConfigMutationInput } from "../../core/config-mutation.js";
 import type {
+  ConfigureThreadSuccess,
   ExecuteSelfMigrationOutcome,
   PreparedSelfMigration,
 } from "../../core/thread-session-control.js";
@@ -444,6 +445,7 @@ import {
   type TurnState,
 } from "../../core/types.js";
 import {
+  brandIconUrl,
   loadBrandAsset,
   resolveAgentBrand,
   withBrandAttachment,
@@ -473,6 +475,30 @@ const EFFORT_CHOICES = [
   { value: "max", label: "Max", description: "Maximum reasoning depth" },
   { value: "ultra", label: "Ultra", description: "Max reasoning + auto task delegation (codex)" },
 ];
+
+export function modelSelectionConfirmationPanel(
+  current: string,
+  picked: string,
+  username: string
+): StructuredPanel {
+  if (picked === current) {
+    return {
+      color: 0x57f287,
+      title: "✅ Model confirmed",
+      fields: [{ name: "Model", value: `\`${current}\` *(no change)*`, inline: true }],
+      footer: `Confirmed by ${username}`,
+    };
+  }
+  return {
+    color: 0x57f287,
+    title: "✅ Model changed",
+    fields: [
+      { name: "Previous", value: `\`${current}\``, inline: true },
+      { name: "New", value: `\`${picked}\``, inline: true },
+    ],
+    footer: `Changed by ${username}`,
+  };
+}
 // Maximum total size of an inline-rendered fence message
 // (```lang\n...\n``` plus optional notice). Fences whose rendered
 // inline form would exceed this are uploaded as attachments instead.
@@ -1489,7 +1515,7 @@ export class Orchestrator {
     const status = new TurnStatus({
       model: described.model.value,
       repoDisplay,
-      ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+      ...(described.effort.value ? { effort: described.effort.value } : {}),
       style: cardStyle,
       ...(brandAsset ? { brandFilename: brandAsset.filename } : {}),
       authorName: turnProfile?.displayName ?? brand,
@@ -2136,6 +2162,14 @@ export class Orchestrator {
       if (msg.authorId) this.currentAuthorIds.set(record.channelRef, msg.authorId);
       const secretFiles = await listThreadSecrets(this.config.DATA_DIR, channel.id).catch(() => []);
       const extraRules = [...riders, ...secretHarnessRules(secretFiles)];
+      // Compact, authoritative identity stamp. It makes a runtime immediately
+      // aware of a cross-thread MCP reconfiguration without requiring it to
+      // infer its own backend from stale conversation history.
+      extraRules.push(
+        `Runtime identity for this thread: agent=${described.agent.value}; ` +
+          `model=${described.model.value}; effort=${described.effort.value ?? "auto"}. ` +
+          `Treat this stamp as authoritative for the current turn.`
+      );
       const seamMcp = sessionHasSeamMcp(this.router.reuseMcpServers?.(record.id));
       const seamFences = true; // live user-turn loop runs emitClosedFence
       const canAuthorChoice =
@@ -4005,6 +4039,85 @@ export class Orchestrator {
   /** Exposed so index.ts can wire BridgeHub audit writes without growing this file. */
   getConfigMutation(): ConfigMutationService {
     return this.configMutation;
+  }
+
+  /**
+   * Make a cross-thread MCP set visible in the target thread. This is
+   * deliberately a platform concern: the core service owns the mutation;
+   * Discord owns the confirmation card and thread-name identity icon.
+   */
+  async presentThreadConfigurationChange(
+    caller: SessionRecord,
+    target: SessionRecord,
+    outcome: ConfigureThreadSuccess
+  ): Promise<{ confirmationPosted: boolean; threadIdentityUpdated: boolean; warning?: string }> {
+    const channel: ChannelRef = {
+      platform: target.platform,
+      id: target.channelRef,
+      ...(target.parentRef ? { parentId: target.parentRef } : {}),
+    };
+    let threadIdentityUpdated = !outcome.changes.agent.changed;
+    const presentationWarnings: string[] = [];
+
+    if (outcome.changes.agent.changed) {
+      threadIdentityUpdated = await this.updateThreadAbbreviation(
+        channel,
+        outcome.changes.agent.before,
+        outcome.changes.agent.after
+      );
+      if (!threadIdentityUpdated) presentationWarnings.push("thread identity icon/name was not updated");
+    }
+
+    const displayField = (field: { before: string; after: string; changed: boolean }) =>
+      field.changed
+        ? `\`${field.after}\`\nChanged from \`${field.before}\``
+        : `\`${field.after}\` *(no change)*`;
+    const runtime = outcome.sessionReset
+      ? `Fresh ACP session${outcome.resetReason ? ` — ${outcome.resetReason}` : ""}`
+      : outcome.runtimeReloaded
+        ? "Runtime reloaded; ACP session and context preserved"
+        : "Runtime kept";
+    const profile = this.router.getProfile(outcome.applied.agent);
+    const brand = resolveAgentBrand(outcome.applied.agent, profile?.brand);
+    const brandAsset = loadBrandAsset(brand);
+    const panel: StructuredPanel = {
+      color: 0x57f287,
+      title: "✅ Thread configuration confirmed",
+      author: profile?.displayName ?? outcome.applied.agent,
+      ...(brandAsset ? { authorIconURL: brandIconUrl(brandAsset.filename) } : {}),
+      fields: [
+        { name: "Agent", value: displayField(outcome.changes.agent), inline: true },
+        { name: "Model", value: displayField(outcome.changes.model), inline: true },
+        { name: "Effort", value: displayField(outcome.changes.effort), inline: true },
+        { name: "Runtime", value: runtime },
+      ],
+      ...(outcome.warnings.length
+        ? { description: outcome.warnings.map((warning) => `⚠️ ${warning}`).join("\n") }
+        : {}),
+      footer: `Set via Seam MCP from thread ${caller.channelRef}`,
+    };
+
+    let confirmationPosted = false;
+    if (this.adapter.sendPanel) {
+      try {
+        await this.adapter.sendPanel(channel, withBrandAttachment(panel, brandAsset));
+        confirmationPosted = true;
+      } catch (err) {
+        presentationWarnings.push("confirmation card could not be posted");
+        this.logger.warn(
+          { err, threadId: target.channelRef },
+          "cross-thread config confirmation card failed"
+        );
+      }
+    } else {
+      presentationWarnings.push("platform cannot render a confirmation card");
+    }
+
+    return {
+      confirmationPosted,
+      threadIdentityUpdated,
+      ...(presentationWarnings.length ? { warning: presentationWarnings.join("; ") } : {}),
+    };
   }
 
   setScheduledManager(m: ScheduledPromptManager): void {
@@ -9053,15 +9166,8 @@ export class Orchestrator {
           description: m.modelId,
         })),
         authorizedUserIds: mayConfigureUserIds(this.config),
-        successPanel: (pickedChoice, username) => ({
-          color: 0x57f287,
-          title: "✅ Model changed",
-          fields: [
-            { name: "Previous", value: `\`${current}\``, inline: true },
-            { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
-          ],
-          footer: `Changed by ${username}`
-        }),
+        successPanel: (pickedChoice, username) =>
+          modelSelectionConfirmationPanel(current, pickedChoice.value, username),
       });
       if (!picked) return;
       await this.applyModelChange(channel, record, picked.value);
@@ -9082,6 +9188,16 @@ export class Orchestrator {
     interaction?: ChatInputCommandInteraction
   ): Promise<void> {
     const cfg = this.store.readConfig(record);
+    const current = cfg.model ?? this.config.DEFAULT_MODEL;
+    if (id === current) {
+      const message = `🧠 Model already set to \`${id}\` (no change).`;
+      if (interaction) {
+        await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
+      } else {
+        await this.adapter.sendMessage(channel, message);
+      }
+      return;
+    }
     cfg.model = id;
     // The cached usage was measured under the prior model; window/used both
     // belong to a different model now. Invalidate so the next turn starts
@@ -15430,15 +15546,8 @@ export class Orchestrator {
                 m.modelId === current ? `${m.modelId} (current)` : m.modelId,
             })),
             authorizedUserIds: mayConfigureUserIds(this.config),
-            successPanel: (pickedChoice, username) => ({
-              color: 0x57f287,
-              title: "✅ Model changed",
-              fields: [
-                { name: "Default", value: `\`${current}\``, inline: true },
-                { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
-              ],
-              footer: `Changed by ${username}`
-            }),
+            successPanel: (pickedChoice, username) =>
+              modelSelectionConfirmationPanel(current, pickedChoice.value, username),
           });
           if (picked && picked.value !== current) {
             await this.applyModelChange(channel, currentRecord, picked.value);
@@ -15631,17 +15740,18 @@ export class Orchestrator {
     channel: ChannelRef,
     oldAgentId: string,
     newAgentId: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (!this.adapter.getThreadName || !this.adapter.renameThread || !channel.parentId) {
-      return;
+      return false;
     }
     try {
       const currentName = await this.adapter.getThreadName(channel);
-      if (!currentName) return;
+      if (!currentName) return false;
 
       const targetProfile = this.router.getProfile(newAgentId);
       const targetAbbr = targetProfile?.threadAbbr;
-      if (!targetAbbr) return;
+      if (!targetAbbr) return false;
+      if (currentName.startsWith(targetAbbr)) return true;
 
       const allAbbrs = this.router.listProfiles()
         .map((p) => p.threadAbbr)
@@ -15664,18 +15774,28 @@ export class Orchestrator {
         }
       }
 
+      // A custom thread may not carry any known previous abbreviation. Stamp
+      // the new identity instead of silently leaving it iconless.
+      if (!replaced) {
+        newName = prefixThreadNameWithAgentEmoji(currentName, targetAbbr);
+        replaced = newName !== currentName;
+      }
+
       if (replaced && newName !== currentName) {
         await this.adapter.renameThread(channel, newName);
         this.logger.info(
           { channelId: channel.id, oldName: currentName, newName },
           "Updated thread name abbreviation on agent transition"
         );
+        return true;
       }
+      return currentName.startsWith(targetAbbr);
     } catch (err) {
       this.logger.warn(
         { err, channelId: channel.id },
         "Failed to update thread name abbreviation"
       );
+      return false;
     }
   }
 

@@ -241,10 +241,10 @@ Because of this:
 - The `CLAUDE_MODELS` picker in `.env` contains only **empirically verified**
   entries (each one checked against JSONL ground truth, not the model's
   self-report). Don't add a model without verifying it.
-- As of `claude-agent-acp` 0.54.1 (ACP SDK 1.1.0) no local patch is needed:
+- On the current `claude-agent-acp` 0.73.0 / ACP SDK 1.4.0 stack, no local patch is needed:
   model selection goes through `setSessionConfigOption`, which exact-matches full
   canonical `claude-*` IDs against the advertised list before the fuzzy resolver.
-  Native context windows are declared in `src/agents/profiles/claude.ts`
+  Native context windows are declared in `packages/adapters/src/profiles/claude.ts`
   (`CLAUDE_CONTEXT_WINDOWS`) — no `[1m]` suffix.
 - The status card shows the **resolved** API model id and the current reasoning
   effort on every turn, so a wrong-model regression is visible immediately.
@@ -253,7 +253,7 @@ Because of this:
 model picker, or touching effort handling must follow
 [`docs/model-management-runbook.md`](docs/model-management-runbook.md)** — the
 authoritative, step-by-step empirical process (pull versions → read changelogs →
-update → re-apply patch → verify against JSONL → confirm new/resumed sessions).
+update → verify the pristine install → verify against JSONL → confirm new/resumed sessions).
 
 ### Remote agents
 

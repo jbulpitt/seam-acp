@@ -77,7 +77,8 @@ Use this as a map, not as a substitute for each tool's live schema.
 
 ### Inspect and choose
 
-- Team and context: `threads`, `peek`, `poll_inbox`.
+- Team and context: `threads`, `peek`, `poll_inbox`. `threads` stamps each
+  teammate's effective agent/model/effort identity.
 - Current configuration, visible presets, and scheduled prompts:
   `config_describe`.
 - Agent capacity before delegation: `agent_quota`.
@@ -95,7 +96,10 @@ Use this as a map, not as a substitute for each tool's live schema.
 
 ### Manage thread sessions
 
-- Change another thread's agent/model/effort: `configure_thread`.
+- Change another thread's agent/model/effort: `configure_thread`. The response
+  reports every effective field, explicitly marks no-ops, refreshes the target
+  thread's agent icon, and posts a confirmation card there. Claude/meta effort
+  reloads the runtime while preserving its ACP session and context.
 - Clear another thread's context but keep its agent/model:
   `reset_thread_session`.
 - Move this thread to a different agent/model and continue from an explicit

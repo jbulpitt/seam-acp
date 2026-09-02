@@ -200,10 +200,11 @@ export function makeClaudeProfile(opts: {
 
       // Reasoning effort is injected via _meta.claudeCode.options.effort, which
       // claude-agent-acp spreads straight into the SDK query Options.effort.
-      // This is the ONLY path that reliably applies effort: set_config_option
-      // for "effort" errors, and the wrapper never reads `reasoningEffort`.
-      // Verified: the SDK validates the value (rejects garbage, accepts
-      // low|medium|high|xhigh|max). Omitting it leaves the model default.
+      // Seam uses this path for both new and resumed sessions. The 0.73.0
+      // wrapper also exposes an ACP effort config option, but the query option
+      // keeps stored thread configuration independent of wrapper UI state.
+      // Verify applied values from the assistant JSONL entry's top-level
+      // `effort` field; session/new no longer rejects arbitrary strings.
       if (effort && effort !== "default") {
         options.effort = effort;
       }

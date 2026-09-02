@@ -45,11 +45,39 @@ export type ExecuteSelfMigrationOutcome =
 
 export interface ConfigureThreadSuccess {
   ok: true;
-  applied: { agent?: string; model?: string; effort?: string };
+  /** Exact effective identity after the operation. Never a partial/vague diff. */
+  applied: ThreadConfigurationIdentity;
+  /** Exact before/after status for every identity field, including no-ops. */
+  changes: ThreadConfigurationChanges;
   sessionReset: boolean;
   resetReason?: "agent-switch" | "model-switch";
   newSessionId?: string;
+  /** The ACP session survived, but its process was reloaded to apply spawn/meta effort. */
+  runtimeReloaded: boolean;
+  /** Filled by the platform presentation hook after the core mutation succeeds. */
+  confirmationPosted?: boolean;
+  /** Filled by the platform presentation hook when an agent icon/name update was attempted. */
+  threadIdentityUpdated?: boolean;
   warnings: string[];
+}
+
+export interface ThreadConfigurationIdentity {
+  agent: string;
+  model: string;
+  /** Explicit level, or `auto` when no override is active. */
+  effort: string;
+}
+
+export interface ThreadConfigurationFieldChange {
+  before: string;
+  after: string;
+  changed: boolean;
+}
+
+export interface ThreadConfigurationChanges {
+  agent: ThreadConfigurationFieldChange;
+  model: ThreadConfigurationFieldChange;
+  effort: ThreadConfigurationFieldChange;
 }
 
 export type ConfigureThreadOutcome =
@@ -82,6 +110,7 @@ export interface ThreadSessionControlDeps {
   store: {
     get(id: string): SessionRecord | null | undefined;
     readConfig(record: SessionRecord): SessionConfigState;
+    writeConfig(config: SessionConfigState): string;
     upsert(record: SessionRecord): void;
   };
   router: {
@@ -93,7 +122,18 @@ export interface ThreadSessionControlDeps {
       opts?: { clearAcpSession?: boolean; clearStartFailure?: boolean }
     ): Promise<void>;
   };
-  mutation: SessionConfigMutation;
+  mutation: SessionConfigMutation & {
+    applyThreadOverlay(opts: {
+      threadId: string;
+      parentRef?: string;
+      changes: {
+        agent?: string | null;
+        model?: string | null;
+        effort?: string | null;
+      };
+      actor: { id: string | null; name: string | null };
+    }): { ok: true; message: string; auditId: string } | { ok: false; error: string };
+  };
 }
 
 /**
@@ -314,101 +354,187 @@ export class ThreadSessionControlService {
       }
     }
 
-    const stored = this.deps.store.readConfig(target);
     const requestedEffort = normalizeEffort(input.effort);
     if (input.effort !== undefined && !requestedEffort) {
       return { ok: false, error: "`effort` must be a non-empty string or `auto`." };
     }
-    const desiredEffort = requestedEffort === "auto"
+    const effortMechanism = profile.effort?.mechanism ?? "none";
+    const staticEffortValues = profile.effort?.levels ?? [];
+    let desiredEffort = requestedEffort === "auto"
       ? undefined
-      : requestedEffort ?? normalizeStoredEffort(stored.reasoningEffort);
+      : requestedEffort ?? normalizeStoredEffort(before.effort.value ?? undefined);
     const reset = detectSessionReset({ previousAgentId, nextAgentId, modelChanged });
     const warnings: string[] = [];
-    let runtime: SessionControlRuntime;
-    let freshTarget = target;
+    const effortTouched = input.effort !== undefined || modelChanged || agentChanged;
+    if (
+      desiredEffort &&
+      (effortMechanism === "none" ||
+        effortMechanism === "modelBaked" ||
+        !staticEffortValues.includes(desiredEffort))
+    ) {
+      warnings.push(
+        `Effort "${desiredEffort}" is not supported for ${nextAgentId}/${nextModel}; ` +
+          `using auto. Valid values: ${staticEffortValues.length ? staticEffortValues.join(", ") : "none"}.`
+      );
+      desiredEffort = undefined;
+    }
 
-    if (reset.sessionReset) {
-      // Start the replacement session at backend defaults. Only after session/new
-      // exposes the target model's live effort values may we send an effort.
-      const staged: SessionConfigChanges = {
+    const beforeIdentity = identityFromDescription(before);
+    const plannedIdentity: ThreadConfigurationIdentity = {
+      agent: nextAgentId,
+      model: nextModel,
+      effort: desiredEffort ?? "auto",
+    };
+    const plannedChanges = diffIdentity(beforeIdentity, plannedIdentity);
+
+    // A successful set is still useful when it is a no-op: return the complete
+    // identity with explicit `(no change)` state and do not perturb the runtime.
+    if (
+      !plannedChanges.agent.changed &&
+      !plannedChanges.model.changed &&
+      !plannedChanges.effort.changed
+    ) {
+      return {
+        ok: true,
+        applied: beforeIdentity,
+        changes: plannedChanges,
+        sessionReset: false,
+        runtimeReloaded: false,
+        warnings,
+      };
+    }
+
+    const actor = { id: null, name: `seam-mcp:${caller.channelRef}` };
+    const persisted = this.applyTargetIdentity(
+      target,
+      {
         ...(agentChanged ? { agent: nextAgentId } : {}),
         ...(modelChanged || agentChanged ? { model: nextModel } : {}),
-        effort: null,
-      };
-      const applied = this.deps.mutation.applySessionConfig(
-        target,
-        staged,
-        { id: null, name: `seam-mcp:${caller.channelRef}` }
-      );
-      if (!applied.ok) return applied;
-      warnings.push(...applied.result.warnings);
+        ...(effortTouched ? { effort: desiredEffort ?? null } : {}),
+      },
+      actor
+    );
+    if (!persisted.ok) return persisted;
+
+    let runtime: SessionControlRuntime;
+    let runtimeReloaded = false;
+    let newSessionId: string | undefined;
+
+    if (reset.sessionReset) {
       const forged = await this.forgeFreshSession(target.id);
-      freshTarget = forged.record;
       runtime = forged.runtime;
+      newSessionId = runtime.getSessionInfo()?.sessionId;
+    } else if (
+      plannedChanges.effort.changed &&
+      (effortMechanism === "meta" ||
+        effortMechanism === "spawnArgs" ||
+        desiredEffort === undefined)
+    ) {
+      // Meta/spawn effort is consumed while creating or loading the runtime,
+      // not via set_config_option. `auto` likewise requires a reload to remove
+      // a previously-live config option. Preserve the ACP session and context.
+      await this.deps.router.invalidate(target.id, { clearAcpSession: false });
+      const current = this.deps.store.get(target.id);
+      if (!current) return { ok: false, error: "Target session disappeared while reloading effort." };
+      runtime = await this.deps.router.getOrStartRuntime(current);
+      runtimeReloaded = true;
     } else {
-      runtime = await this.deps.router.getOrStartRuntime(target);
+      const current = this.deps.store.get(target.id) ?? target;
+      runtime = await this.deps.router.getOrStartRuntime(current);
       if (modelChanged) await runtime.setModel(nextModel);
     }
 
-    const effortTouched = input.effort !== undefined || modelChanged || agentChanged;
-    const effortValues = runtime.getConfigSelectValues("reasoning_effort");
-    let appliedEffort: string | undefined;
-    let persistedEffort: string | null | undefined;
-    if (effortTouched) {
-      if (desiredEffort && effortValues.includes(desiredEffort)) {
-        await runtime.setConfigOption("reasoning_effort", desiredEffort);
-        appliedEffort = desiredEffort;
-        persistedEffort = desiredEffort;
-      } else {
-        appliedEffort = "auto";
-        persistedEffort = null;
-        if (desiredEffort) {
-          warnings.push(
-            `Effort "${desiredEffort}" is not advertised for ${nextAgentId}/${nextModel}; ` +
-              `using auto. Valid values: ${effortValues.length ? effortValues.join(", ") : "none"}.`
-          );
+    // Config-option agents may advertise a model-dependent subset. Validate
+    // against the live session before claiming success. Claude never enters
+    // this branch: its effort is `_meta` and was applied by the reload above.
+    if (effortTouched && desiredEffort && effortMechanism === "configOption") {
+      const configId = profile.effort?.configId ?? "reasoning_effort";
+      const liveValues = runtime.getConfigSelectValues(configId);
+      if (liveValues.includes(desiredEffort)) {
+        if (!reset.sessionReset || plannedChanges.effort.changed) {
+          await runtime.setConfigOption(configId, desiredEffort);
         }
+      } else {
+        warnings.push(
+          `Effort "${desiredEffort}" is not advertised by the live ${nextAgentId}/${nextModel} session; ` +
+            `using auto. Valid values: ${liveValues.length ? liveValues.join(", ") : "none"}.`
+        );
+        desiredEffort = undefined;
+        const cleared = this.applyTargetIdentity(
+          this.deps.store.get(target.id) ?? target,
+          { effort: null },
+          actor
+        );
+        if (!cleared.ok) return cleared;
+        await this.deps.router.invalidate(target.id, { clearAcpSession: false });
+        const current = this.deps.store.get(target.id);
+        if (!current) return { ok: false, error: "Target session disappeared while clearing effort." };
+        runtime = await this.deps.router.getOrStartRuntime(current);
+        runtimeReloaded = true;
       }
     }
 
-    if (!reset.sessionReset) {
-      const changes: SessionConfigChanges = {
-        ...(agentChanged ? { agent: nextAgentId } : {}),
-        ...(modelChanged ? { model: nextModel } : {}),
-        ...(persistedEffort !== undefined ? { effort: persistedEffort } : {}),
-      };
-      const applied = this.deps.mutation.applySessionConfig(
-        target,
-        changes,
-        { id: null, name: `seam-mcp:${caller.channelRef}` },
-        { effortValues }
-      );
-      if (!applied.ok) return applied;
-      warnings.push(...applied.result.warnings);
-    } else if (persistedEffort !== undefined && persistedEffort !== null) {
-      const applied = this.deps.mutation.applySessionConfig(
-        freshTarget,
-        { effort: persistedEffort },
-        { id: null, name: `seam-mcp:${caller.channelRef}` },
-        { effortValues }
-      );
-      if (!applied.ok) return applied;
-      warnings.push(...applied.result.warnings);
-    }
-
-    const info = runtime.getSessionInfo();
+    const current = this.deps.store.get(target.id);
+    if (!current) return { ok: false, error: "Target session disappeared after configuration." };
+    const effectiveIdentity = identityFromDescription(this.deps.router.describeConfig(current));
+    const changes = diffIdentity(beforeIdentity, effectiveIdentity);
     return {
       ok: true,
-      applied: {
-        ...(agentChanged ? { agent: nextAgentId } : {}),
-        ...(modelChanged || agentChanged ? { model: nextModel } : {}),
-        ...(effortTouched && appliedEffort ? { effort: appliedEffort } : {}),
-      },
+      applied: effectiveIdentity,
+      changes,
       sessionReset: reset.sessionReset,
       ...(reset.resetReason ? { resetReason: reset.resetReason } : {}),
-      ...(reset.sessionReset && info?.sessionId ? { newSessionId: info.sessionId } : {}),
+      ...(reset.sessionReset && (newSessionId ?? runtime.getSessionInfo()?.sessionId)
+        ? { newSessionId: newSessionId ?? runtime.getSessionInfo()!.sessionId }
+        : {}),
+      runtimeReloaded,
       warnings,
     };
+  }
+
+  /**
+   * Make a cross-thread set authoritative at the thread layer (so channel and
+   * thread presets cannot silently shadow it), then mirror it into the session
+   * record so legacy capability/status reads remain honest.
+   */
+  private applyTargetIdentity(
+    target: SessionRecord,
+    changes: { agent?: string; model?: string; effort?: string | null },
+    actor: { id: string | null; name: string | null }
+  ): { ok: true } | { ok: false; error: string } {
+    const overlay = this.deps.mutation.applyThreadOverlay({
+      threadId: target.channelRef,
+      ...(target.parentRef ? { parentRef: target.parentRef } : {}),
+      changes: {
+        ...(changes.agent !== undefined ? { agent: changes.agent } : {}),
+        ...(changes.model !== undefined ? { model: changes.model } : {}),
+        // `auto` is an explicit thread-level sentinel: it shadows a channel
+        // effort pin while telling the router to use the backend default.
+        ...(changes.effort !== undefined
+          ? { effort: changes.effort === null ? "auto" : changes.effort }
+          : {}),
+      },
+      actor,
+    });
+    if (!overlay.ok) return overlay;
+
+    const current = this.deps.store.get(target.id) ?? target;
+    const cfg = this.deps.store.readConfig(current);
+    if (changes.model !== undefined) {
+      cfg.model = changes.model;
+      cfg.lastContextUsage = undefined;
+    }
+    if (changes.effort !== undefined) {
+      if (changes.effort === null) delete cfg.reasoningEffort;
+      else cfg.reasoningEffort = changes.effort;
+    }
+    this.deps.store.upsert({
+      ...current,
+      ...(changes.agent !== undefined ? { agentId: changes.agent } : {}),
+      configJson: this.deps.store.writeConfig(cfg),
+      updatedUtc: new Date().toISOString(),
+    });
+    return { ok: true };
   }
 
   async reset(target: SessionRecord): Promise<ResetThreadSessionOutcome> {
@@ -466,4 +592,28 @@ function normalizeEffort(value: string | undefined): string | undefined {
 
 function normalizeStoredEffort(value: string | undefined): string | undefined {
   return !value || value === "default" || value === "auto" ? undefined : value;
+}
+
+function identityFromDescription(value: ConfigDescription): ThreadConfigurationIdentity {
+  return {
+    agent: value.agent.value,
+    model: value.model.value,
+    effort: value.effort.value ?? "auto",
+  };
+}
+
+function diffIdentity(
+  before: ThreadConfigurationIdentity,
+  after: ThreadConfigurationIdentity
+): ThreadConfigurationChanges {
+  const field = (from: string, to: string): ThreadConfigurationFieldChange => ({
+    before: from,
+    after: to,
+    changed: from !== to,
+  });
+  return {
+    agent: field(before.agent, after.agent),
+    model: field(before.model, after.model),
+    effort: field(before.effort, after.effort),
+  };
 }

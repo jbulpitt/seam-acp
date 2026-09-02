@@ -310,21 +310,28 @@ export class SessionRouter {
       : chan?.effort
         ? "channel preset"
         : undefined;
+    const presetEffortAuto = presetEffort?.value === "auto";
     const presetEffortUsable = !!(
       presetEffort?.value &&
+      !presetEffortAuto &&
       profile?.effort &&
       profile.effort.mechanism !== "none" &&
       profile.effort.levels.includes(presetEffort.value)
     );
     let effort: ResolvedSetting<string | null>;
     let effortIgnoredNote: string | undefined;
-    if (presetEffortUsable && presetEffort && presetEffortSource) {
+    if (presetEffortAuto && presetEffortSource) {
+      // `auto` is an explicit per-thread neutralizer used by cross-thread
+      // control. It shadows a channel effort pin while leaving the backend at
+      // its own default.
+      effort = { value: null, source: presetEffortSource };
+    } else if (presetEffortUsable && presetEffort && presetEffortSource) {
       effort = { value: presetEffort.value, source: presetEffortSource };
     } else {
       effort = cfg.reasoningEffort
         ? { value: cfg.reasoningEffort, source: "session config" }
         : { value: null, source: "default" };
-      if (presetEffort?.value && !presetEffortUsable) {
+      if (presetEffort?.value && !presetEffortAuto && !presetEffortUsable) {
         effortIgnoredNote =
           `${presetEffortSource} sets effort "${presetEffort.value}", but agent ` +
           `"${agent.value}" does not support that level — it is ignored; ` +
@@ -739,12 +746,18 @@ export class SessionRouter {
     // e.g. a channel preset might set "medium" but the locked agent has no
     // effort concept at all, in which case we silently fall back instead of
     // erroring.
+    const presetEffortAuto = preset.effort?.value === "auto";
     const presetEffortUsable =
       preset.effort?.value &&
+      !presetEffortAuto &&
       profile.effort &&
       profile.effort.mechanism !== "none" &&
       profile.effort.levels.includes(preset.effort.value);
-    const effort = presetEffortUsable ? preset.effort!.value : cfg.reasoningEffort;
+    const effort = presetEffortAuto
+      ? undefined
+      : presetEffortUsable
+        ? preset.effort!.value
+        : cfg.reasoningEffort;
     const cwd = this.describeConfig(record).cwd.value;
 
     if (this.seamMcp && this.seamMcp.getPort() === undefined) {

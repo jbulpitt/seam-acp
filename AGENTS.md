@@ -251,24 +251,25 @@ empirical process. Key non-negotiables from it:
 
 - **Verify against JSONL ground truth** (`entry.message.model`), never by asking
   the model what it is — self-reports are unreliable.
-- **No local patch as of claude-agent-acp 0.54.1** (ACP SDK 1.1.0): model
+- **No local patch on claude-agent-acp 0.73.0** (ACP SDK 1.4.0): model
   selection moved to `setSessionConfigOption`, which exact-matches full canonical
   `claude-*` IDs against the agent's advertised list *before* the fuzzy resolver,
   so full IDs resolve to themselves. `scripts/patch-claude-agent-acp.mjs` is
   retired (its anchor `unstable_setSessionModel` no longer exists). **Caveat on
-  this account**: the SDK advertises only `default/sonnet/haiku`, so an
-  un-advertised full ID can be *rejected* (`Invalid value for config option
-  model`) — `default` → latest Opus is the proven path; explicit
-  Opus/Fable/Sonnet-5 entries are pending live validation.
+  this account**: a raw wrapper session can reject an un-advertised full ID, so
+  the Seam Claude profile forwards canonical IDs through `ANTHROPIC_MODEL`.
+  Every picker entry was JSONL-verified on 2026-09-02; `default` resolves to
+  Claude Opus 5 with a 1M window.
 - **The `CLAUDE_MODELS` picker in `.env`** contains only JSONL-verified entries.
   Don't add a model without running the §4 probe in the runbook.
 - **No `[1m]` suffix** — each model's native context window is declared in the
-  `CLAUDE_CONTEXT_WINDOWS` table (`src/agents/profiles/claude.ts`), which drives
+  `CLAUDE_CONTEXT_WINDOWS` table (`packages/adapters/src/profiles/claude.ts`), which drives
   the compaction threshold; the agent also reports the true window at runtime via
   ACP `UsageUpdate.size`. (Getting the window wrong makes a 1M model compact at 200K.)
-- **Effort** is injected via `_meta.claudeCode.options.effort` (runbook §11),
-  NOT `set_config_option` (which errors). Valid levels are bounded by the
-  bundled SDK's `EffortLevel` type (`ultra` is not available).
+- **Effort** is injected via `_meta.claudeCode.options.effort` (runbook §11).
+  Verify the applied value in the assistant JSONL entry's top-level `effort`
+  field. Valid levels are bounded by the bundled SDK's `EffortLevel` type
+  (`ultra` is not available).
 - The status card shows the **resolved** model + effort every turn — that is the
   standing regression alarm. If it ever shows the wrong model, stop and consult
   the runbook.

@@ -138,24 +138,24 @@ before running any procedure in this runbook:
 - CLI binary: `claude-agent-acp` (env: `CLAUDE_CLI_PATH`)
 - Config dir: `CLAUDE_CONFIG_DIR=<dir>` (default: `~/.claude`)
 - Default model: `CLAUDE_DEFAULT_MODEL` (currently `default` → latest Opus @ 1M on Max)
-- Model picker: `CLAUDE_MODELS` env var — **curated, JSONL-verified entries only**; now **bare full IDs** (e.g. `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-haiku-4-5`) plus the `default` alias. **No `[1m]` suffix** — it was retired at claude-agent-acp 0.54.1. Note: bare full IDs are PENDING live validation per account caveat (see #30, #32, #44). **`claude-opus-5`** (GA 2026-07-24, **$5/$25 MTok** — confirmed correct by Anthropic models page 2026-07-31 (Claude Code 2.1.219 release notes showing $10/$50 were incorrect), 1M ctx, adaptive thinking, effort defaults to `high`, knowledge cutoff May 2026) is now the recommended Opus model — tracked in #44. New models `claude-fable-5` (GA June 2026, $10/$50 MTok, 1M ctx, adaptive thinking always-on) tracked in #30. **`claude-opus-4-1` retired August 5, 2026** — confirmed absent from deployed config as of 2026-08-02 sweep; #38 and #11 closed. **`claude-sonnet-5`** ($2/$10 MTok — **pricing now permanent** as of 2026-08-15; previously announced increase to $3/$15 on Sept 1, 2026 cancelled; 1M ctx, adaptive thinking) tracked in #32.
+- Model picker: `CLAUDE_MODELS` env var — **curated, JSONL-verified entries only**; now **bare full IDs** (e.g. `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-haiku-4-5`) plus the `default` alias. **No `[1m]` suffix** — it was retired at claude-agent-acp 0.54.1. All picker rows were live-verified on 2026-09-02 through Seam's `ANTHROPIC_MODEL` forwarding; `default` resolves to `claude-opus-5` at 1M. **`claude-opus-5`** (GA 2026-07-24, **$5/$25 MTok** — confirmed correct by Anthropic models page 2026-07-31 (Claude Code 2.1.219 release notes showing $10/$50 were incorrect), 1M ctx, adaptive thinking, effort defaults to `high`, knowledge cutoff May 2026) is now the recommended Opus model. New models `claude-fable-5` (GA June 2026, $10/$50 MTok, 1M ctx, adaptive thinking always-on) tracked in #30. **`claude-opus-4-1` retired August 5, 2026** — confirmed absent from deployed config as of 2026-08-02 sweep; #38 and #11 closed. **`claude-sonnet-5`** ($2/$10 MTok — **pricing now permanent** as of 2026-08-15; previously announced increase to $3/$15 on Sept 1, 2026 cancelled; 1M ctx, adaptive thinking) tracked in #32.
 - Fast mode: `configId: "fast_mode"` via `setSessionConfigOption` is available since 0.54.0 but not yet surfaced in seam-acp (tracked in #37).
 - Model selection RPC: `setSessionConfigOption({ sessionId, configId: "model", value })` (ACP schema v1.16.0 dropped the dedicated `models` field; selection is now a `"model"` `SessionConfigSelect`). The old `unstable_setSessionModel` RPC is gone.
 - Context window: declared per-model in the `CLAUDE_CONTEXT_WINDOWS` table in `claude.ts`, resolved by `getClaudeContextWindow(modelId)` and stamped onto every picker entry's `contextLimit` (orchestrator `staticModels[].contextLimit → modelContextFloor` seed). The agent also reports the true window at runtime via ACP `UsageUpdate.size`. The `[1m]` suffix is **no longer load-bearing**.
-- Effort injection: `_meta.claudeCode.options.effort` (not `set_config_option`, not `reasoningEffort` field)
+- Effort injection: `_meta.claudeCode.options.effort`; verify the applied value in JSONL's top-level `effort` field
 - Valid effort levels: `low`, `medium`, `high`, `xhigh`, `max` (bounded by bundled SDK's `EffortLevel` type; `ultra` NOT available)
 - Adaptive thinking (Opus 4.6+): `_meta.claudeCode.options.thinking = { type: "adaptive", display: "summarized" | "omitted" }`
 - Identity: reads `~/.claude/.credentials.json` or `~/.claude/credentials.json`
 - Usage: `https://api.anthropic.com/api/oauth/usage` with `anthropic-beta: oauth-2025-04-20` header
 - Session storage: JSONL files at `~/.claude/projects/<slug>/<sessionId>.jsonl`
-- **Account caveat (live warning)**: this account's Claude Code SDK advertises only `default/sonnet/sonnet[1m]/haiku` in `availableModels`. Since 0.54.1's `setSessionConfigOption` requires the value to be advertised-or-resolvable, an un-advertised full ID can be REJECTED (`Invalid value for config option model`). `default` → latest Opus @ 1M is the proven path; the explicit full-ID picker entries added 2026-07-01 are PENDING live validation.
+- **Account caveat**: a raw wrapper session can reject un-advertised full IDs. Seam forwards canonical IDs through `ANTHROPIC_MODEL`; preserve this path and re-run the JSONL matrix after upgrades.
 - **No patch script.** The former `scripts/patch-claude-agent-acp.mjs` (`npm run patch-acp`) was **retired and deleted** at 0.54.1 — the resolver now exact-matches advertised full IDs before fuzzy-matching, so the bypass is unnecessary; its anchor no longer exists.
-- Profile source: [`claude.ts`](../src/agents/profiles/claude.ts)
+- Profile source: [`claude.ts`](../packages/adapters/src/profiles/claude.ts)
 - Update process: [`model-management-runbook.md`](model-management-runbook.md) (authoritative)
 
-> **✅ PATCH RETIRED — we now run the upgrade, unpatched.** As of 2026-07-01 we
-> run `claude-agent-acp` **0.54.1** with **ACP SDK 1.1.0** (`package.json` pins
-> `@agentclientprotocol/sdk` `^1.1.0`). The former local resolver patch
+> **✅ PATCH RETIRED — we run unpatched.** As of 2026-09-02 we
+> run `claude-agent-acp` **0.73.0** with **ACP SDK 1.4.0** (workspace manifests pin
+> `@agentclientprotocol/sdk` `^1.4.0`). The former local resolver patch
 > (`scripts/patch-claude-agent-acp.mjs` / `npm run patch-acp`) has been **deleted**.
 > Any older instruction to "run `patch-acp`" or "re-apply the patch after a global
 > update" is now WRONG. Why it's gone: ACP schema v1.16.0 removed the dedicated
@@ -169,14 +169,10 @@ before running any procedure in this runbook:
 > v0.42.0's "prevent cross-family matching"). The `[1m]` suffix is likewise retired
 > (bare full IDs now; window comes from `CLAUDE_CONTEXT_WINDOWS` in `claude.ts`).
 >
-> **Live warning still open (account caveat):** this account's SDK advertises only
-> `default/sonnet/sonnet[1m]/haiku`; because 0.54.1 requires the config value to be
-> advertised-or-resolvable, an **un-advertised full ID can be REJECTED** with
-> `Invalid value for config option model`. `default` → latest Opus @ 1M is the
-> proven path; the explicit full-ID picker entries added 2026-07-01 are PENDING
-> live validation (probe per [`model-management-runbook.md`](model-management-runbook.md)
-> §4). If a full ID is rejected, forward it via `ANTHROPIC_MODEL` in the
-> `claude.ts` spawn env, or re-derive a fresh patch against 0.54.1.
+> **Account caveat (covered):** a raw wrapper session can still reject an
+> un-advertised full ID. Seam forwards canonical IDs via `ANTHROPIC_MODEL`, and
+> the complete picker matrix passed JSONL + raw `/context` verification on
+> 2026-09-02. Keep that forwarding and re-run the probe after every upgrade.
 >
 > Note: old `AcpClient`/`ClientSideConnection` were deprecated since SDK 0.27.0 and
 > may be removed in a future major (see MIGRATION_0.26_0.27.md) — track on future
@@ -415,7 +411,7 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 - [ ] Check [Claude Code releases](https://github.com/anthropics/claude-code/releases) — last checked version: **2.1.250** (2026-08-28 sweep; installed 2.1.247; 2.1.250: bug fixes; 2.1.248: `--restricted` mode, `experimental.cacheTtl`, prompt-cache miss fixes on OAuth refresh and resume, token refresh lock handling, hook error logging, Workflow token optimization; #40 updated)
 - [ ] Check [Claude Code CHANGELOG](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)
 - [ ] Check [Claude Code docs changelog](https://docs.anthropic.com/en/docs/claude-code/changelog)
-- [ ] Check [claude-agent-acp releases](https://github.com/agentclientprotocol/claude-agent-acp/releases) — last checked version: **0.70.0** (2026-08-26 sweep; installed 0.54.1, upgrade tracked in #39; no new releases since 2026-08-18)
+- [ ] Check [claude-agent-acp releases](https://github.com/agentclientprotocol/claude-agent-acp/releases) — last checked version: **0.73.0** (2026-09-02; installed 0.73.0 and validated via #39)
 - [ ] Check [claude-agent-acp CHANGELOG](https://github.com/agentclientprotocol/claude-agent-acp/blob/main/CHANGELOG.md)
 - [ ] Scan [Anthropic News](https://www.anthropic.com/news) for announcements
 - [ ] Check [Anthropic platform release notes](https://docs.anthropic.com/en/release-notes)
@@ -485,10 +481,10 @@ Every finding should be analyzed from three angles:
 | **Session storage?** | Does this change session file formats, paths, or storage mechanisms? |
 
 **Key files to consider**:
-- Agent profiles: `src/agents/profiles/{copilot,claude,agy,opencode,remote}.ts` (`gemini.ts` has been removed)
-- Runtime: `src/agents/agent-runtime.ts`
-- Config: `src/config.ts`
-- Claude model/context config: `src/agents/profiles/claude.ts` (`CLAUDE_CONTEXT_WINDOWS`, `getClaudeContextWindow`) — replaces the retired `scripts/patch-claude-agent-acp.mjs`
+- Agent profiles: `packages/adapters/src/profiles/{copilot,claude,agy,opencode,remote}.ts` (`gemini.ts` has been removed)
+- Runtime: `packages/core/src/agents/agent-runtime.ts`
+- Config: `packages/core/src/config.ts`
+- Claude model/context config: `packages/adapters/src/profiles/claude.ts` (`CLAUDE_CONTEXT_WINDOWS`, `getClaudeContextWindow`) — replaces the retired `scripts/patch-claude-agent-acp.mjs`
 - Model management: `docs/model-management-runbook.md`
 - Session management: `src/agents/session-manager.ts`
 

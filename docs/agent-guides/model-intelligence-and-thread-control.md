@@ -116,16 +116,30 @@ data tools: inspect the candidates first, then apply the selected runtime.
 ### `configure_thread(thread, { agent?, model?, effort? })`
 Change a target thread's agent, model, and/or reasoning effort (at least one
 field required).
+- **The result is exact, including no-ops.** Agent, model, and effort are always
+  returned as the effective post-set identity; each field says whether it
+  changed and names its previous value when it did. The target thread receives
+  the same information in a visual confirmation card.
+- **The thread identity follows the setting.** Agent changes refresh the agent
+  abbreviation/icon in the thread name. `threads()` also stamps every entry
+  with effective agent/model/effort, so a coordinator can verify the target
+  without waking it.
 - **Reset is reported, not assumed.** Switching **agent** always starts a fresh
   session (context lost). Switching **model** resets on backends that pin the
   model at session start (codex, ollama-cloud) but not on those that switch live
-  (claude). Switching **effort** never resets. The tool returns what actually
-  happened (`sessionReset` + reason) per backend — read it.
+  (claude). Switching **effort** never resets the ACP session. Config-option
+  agents update live; metadata/spawn-argument agents such as Claude reload the
+  runtime process with their ACP session and conversation context preserved.
+  The result distinguishes `sessionReset` from `runtimeReloaded`.
 - **Effort is validated per model.** Valid tiers differ by model
   (`minimal < low < medium < high < xhigh < max`); pass `auto` to let the backend
   pick its default. An unsupported value is refused or coerced to `auto`, never
   silently sent. (Get a model's valid tiers from `valid_effort_tiers` in
   `model_value_rankings`, or the metadata tools.)
+- **Preset shadowing is prevented.** The set is persisted as a per-thread
+  overlay, so a channel preset cannot leave the runtime or `threads()` display
+  on the old agent/model/effort. A compact authoritative identity stamp is also
+  injected into the target's subsequent turns.
 
 ### `reset_thread_session(thread)`
 Start a fresh session on a thread, keeping its current agent + model. Clears

@@ -463,8 +463,14 @@ describe("SeamMcpServer", () => {
     });
     const configureThread = vi.fn(async () => ({
       ok: true as const,
-      applied: { model: "claude-new", effort: "high" },
+      applied: { agent: "claude", model: "claude-new", effort: "high" },
+      changes: {
+        agent: { before: "claude", after: "claude", changed: false },
+        model: { before: "claude-old", after: "claude-new", changed: true },
+        effort: { before: "auto", after: "high", changed: true },
+      },
       sessionReset: false,
+      runtimeReloaded: true,
       warnings: [],
     }));
     h = await makeHarness({
@@ -489,10 +495,11 @@ describe("SeamMcpServer", () => {
     );
 
     expect(body.result.isError).toBeFalsy();
-    expect(JSON.parse(body.result.content[0].text)).toMatchObject({
-      ok: true,
-      sessionReset: false,
-    });
+    expect(body.result.content[0].text).toContain("Thread thread-target configuration confirmed");
+    expect(body.result.content[0].text).toContain("Agent: claude (no change)");
+    expect(body.result.content[0].text).toContain("Model: claude-new (changed from claude-old)");
+    expect(body.result.content[0].text).toContain("Effort: high (changed from auto)");
+    expect(body.result.content[0].text).toContain("runtime reloaded; ACP session/context preserved");
     expect(configureThread).toHaveBeenCalledWith(
       expect.objectContaining({ channelRef: "thread-caller", parentRef: "chan-1" }),
       target,

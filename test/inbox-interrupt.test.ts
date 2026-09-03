@@ -5,7 +5,12 @@ import path from "node:path";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
-import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import {
+  DispatchTurnError,
+  dispatchDirs,
+  type DispatchSpec,
+} from "../packages/core/src/core/dispatch/types.js";
+import { completionRoute } from "../packages/core/src/core/dispatch/done-reconcile.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 
@@ -219,6 +224,95 @@ describe("dispatchInjectTurn report-back suppression on interrupt (#67)", () => 
     expect(redirect).toBeTruthy();
     expect(redirect!.target).toBe("thread-worker");
     expect(redirect!.returnTo).toBe("thread-interrupter");
+  });
+
+  /**
+   * #174 × #67. The suppression decision lives only in memory, but the
+   * done-file that survives the process copies the spec's `returnTo`/`chainId`
+   * unconditionally. If the ledger write then fails (the shutdown race #174 is
+   * about), boot replay reads that routing and delivers the report-back the
+   * interrupt deliberately withheld — the stale answer landing after the
+   * directive that replaced it. So the error that carries the turn into the
+   * done-file has to carry the suppression too.
+   */
+  it("marks an interrupted completion as suppressed when the ledger write fails", async () => {
+    const { orch } = makeOrch();
+    (orch as any).enqueueReportBack = vi.fn(async () => {});
+    (orch as any).injectTurn = async () => {
+      await orch.interruptRedirect(
+        caller({ id: "discord:thread-interrupter", channelRef: "thread-interrupter" }),
+        "thread-worker",
+        "drop it — do the hotfix",
+        false
+      );
+      return { text: "partial, stale work", error: undefined, stopReason: "cancelled" };
+    };
+    // The store closes underneath the completion — the exact #174 failure.
+    (orch as any).store.updateDelegationStatus = () => {
+      throw new TypeError("The database connection is not open");
+    };
+
+    const spec: DispatchSpec = {
+      id: "disp-suppressed",
+      target: "thread-worker",
+      prompt: "the original handoff task",
+      session: "live",
+      returnTo: "thread-boss",
+      kind: "handoff",
+      correlationId: "corr-suppressed",
+      createdUtc: new Date().toISOString(),
+    };
+    const err = await orch.dispatchInjectTurn(spec).then(
+      () => null,
+      (e: unknown) => e as DispatchTurnError
+    );
+    expect(err).toBeInstanceOf(DispatchTurnError);
+    expect(err!.completionPending).toBe(true); // row left non-terminal…
+    expect(err!.suppressedOnward).toBe(true); // …but nothing is owed onward
+    // And the routing that reaches the done-file is now inert.
+    expect(
+      completionRoute(
+        { returnTo: spec.returnTo, kind: "handoff", suppressedOnward: err!.suppressedOnward },
+        { status: "running", kind: "handoff" }
+      )
+    ).toEqual({ action: "terminalize" });
+  });
+
+  it("does NOT mark a plain completion failure as suppressed (negative control)", async () => {
+    const { orch } = makeOrch();
+    (orch as any).enqueueReportBack = async () => {
+      throw new TypeError("The database connection is not open");
+    };
+    (orch as any).injectTurn = async () => ({
+      text: "clean result",
+      error: undefined,
+      stopReason: "end_turn",
+    });
+
+    const spec: DispatchSpec = {
+      id: "disp-owed",
+      target: "thread-worker",
+      prompt: "a normal handoff",
+      session: "live",
+      returnTo: "thread-boss",
+      kind: "handoff",
+      correlationId: "corr-owed",
+      createdUtc: new Date().toISOString(),
+    };
+    const err = await orch.dispatchInjectTurn(spec).then(
+      () => null,
+      (e: unknown) => e as DispatchTurnError
+    );
+    expect(err).toBeInstanceOf(DispatchTurnError);
+    expect(err!.completionPending).toBe(true);
+    expect(err!.suppressedOnward).toBe(false);
+    // Nothing was interrupted, so the report-back is still owed and replayed.
+    expect(
+      completionRoute(
+        { returnTo: spec.returnTo, kind: "handoff", suppressedOnward: err!.suppressedOnward },
+        { status: "running", kind: "handoff" }
+      )
+    ).toEqual({ action: "report_back", returnTo: "thread-boss" });
   });
 
   it("a normal (un-interrupted) handoff still reports back to its returnTo (no regression)", async () => {

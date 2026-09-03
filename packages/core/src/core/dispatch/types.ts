@@ -135,7 +135,14 @@ export class DispatchTurnError extends Error {
     readonly stopReason = "",
     readonly workerStatus: "completed" | "failed" | "timed_out" = "failed",
     readonly workerError?: string,
-    readonly completionPending = false
+    readonly completionPending = false,
+    /**
+     * #67: this turn was preemptively cancelled, so the live path delivered
+     * NOTHING onward on purpose. Carried here because the done-file still
+     * records the spec's `returnTo`/`chainId`, and boot replay would otherwise
+     * read that routing as an undelivered report-back and send it.
+     */
+    readonly suppressedOnward = false
   ) {
     super(message);
     this.name = "DispatchTurnError";
@@ -188,6 +195,16 @@ export interface DispatchResult {
   kind?: DelegationKind;
   /** `spec.prompt` (clamped) — the originating ask, for the report-back card. */
   originPrompt?: string;
+  /**
+   * #67 × #174: the live path deliberately delivered nothing onward because an
+   * interrupt cancelled this turn and already issued a replacement directive.
+   *
+   * Without this the routing above is indistinguishable from an undelivered
+   * completion, so boot replay would enqueue exactly the report-back (or chain
+   * advance) the interrupt suppressed — the stale answer arriving after the
+   * directive that replaced it.
+   */
+  suppressedOnward?: boolean;
 }
 
 /**

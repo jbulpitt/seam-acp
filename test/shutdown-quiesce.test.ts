@@ -1424,6 +1424,147 @@ describe("#174 an unrouted completion is judged by its KIND", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 7a. An interrupt-suppressed completion owes nothing onward (#67 × #174)
+// ---------------------------------------------------------------------------
+
+/**
+ * The live path suppresses ALL onward delivery when an interrupt cancelled the
+ * turn (#67) — the interrupt has already issued a replacement directive. That
+ * decision lives only in memory, while the done-file copies the spec's
+ * `returnTo`/`chainId` unconditionally. So a completion whose ledger write lost
+ * the shutdown race is, on disk, indistinguishable from one that never
+ * delivered — and boot replay would send exactly the stale answer #67 withheld,
+ * arriving after the directive that superseded it.
+ */
+describe("#174 a completion the interrupt suppressed is never re-delivered", () => {
+  const suppressingDispatch = (suppressed: boolean) => async () => {
+    throw new DispatchTurnError(
+      "ledger write failed",
+      "STALE PARTIAL",
+      "cancelled",
+      "completed",
+      undefined,
+      true,
+      suppressed
+    );
+  };
+
+  it("carries the suppression from the dispatch error into the done-file", async () => {
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: suppressingDispatch(true),
+    });
+    await dropSpec({ id: "sup", kind: "handoff", returnTo: "parent-thread", chainId: "chain-9" });
+    await watcher.start();
+    await vi.waitFor(async () => {
+      const result = JSON.parse(await readFile(path.join(dirs.done, "sup.json"), "utf8"));
+      // The routing is still recorded — it has to be, for every OTHER file —
+      // which is precisely why the suppression has to be recorded beside it.
+      expect(result).toMatchObject({
+        suppressedOnward: true,
+        returnTo: "parent-thread",
+        chainId: "chain-9",
+        completionError: "ledger write failed",
+      });
+    });
+    watcher.stop();
+  });
+
+  it("omits the flag when nothing was suppressed (negative control)", async () => {
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: suppressingDispatch(false),
+    });
+    await dropSpec({ id: "owed", kind: "handoff", returnTo: "parent-thread" });
+    await watcher.start();
+    await vi.waitFor(async () => {
+      const result = JSON.parse(await readFile(path.join(dirs.done, "owed.json"), "utf8"));
+      expect(result.completionError).toBe("ledger write failed");
+      expect(result.suppressedOnward).toBeUndefined();
+    });
+    watcher.stop();
+  });
+
+  it("terminalizes rather than routing, even carrying BOTH returnTo and chainId", () => {
+    const row = { status: "running", kind: "handoff" };
+    const file = { returnTo: "parent-thread", chainId: "chain-9", kind: "handoff" };
+    expect(completionRoute({ ...file, suppressedOnward: true } as never, row)).toEqual({
+      action: "terminalize",
+    });
+    // Negative controls: the SAME file without the flag is real, owed work.
+    expect(completionRoute({ ...file, suppressedOnward: false } as never, row)).toEqual({
+      action: "chain",
+      chainId: "chain-9",
+    });
+    expect(completionRoute({ returnTo: "parent-thread", kind: "handoff" } as never, row)).toEqual({
+      action: "report_back",
+      returnTo: "parent-thread",
+    });
+  });
+
+  it("reconciles the row but enqueues nothing for a suppressed done-file", async () => {
+    const ledger = makeLedger();
+    ledger.rows.set("w-sup", { id: "w-sup", kind: "handoff", status: "running" });
+    const host = makeReplayHost(ledger);
+    await writeDone("w-sup", {
+      id: "w-sup",
+      target: "worker-thread",
+      status: "failed",
+      output: "STALE PARTIAL",
+      workerStatus: "completed",
+      correlationId: "corr-sup",
+      returnTo: "parent-thread",
+      kind: "handoff",
+      suppressedOnward: true,
+      finishedUtc: "2026-09-03T00:00:00.000Z",
+    });
+
+    const summary = await reconcileCompletedDoneFiles({
+      dataDir,
+      logger: silent,
+      getDelegation: (id) => ledger.getDelegation(id),
+      replay: (r, route) => host.replayCompletedDispatch(r as never, route),
+    });
+
+    expect(summary.reconciled).toBe(1);
+    expect(await pendingReportBacks()).toHaveLength(0); // the stale answer stays put
+    expect(ledger.rows.get("w-sup")!.status).toBe("completed"); // row still repaired
+  });
+
+  it("and the identical done-file WITHOUT the flag still delivers (negative control)", async () => {
+    const ledger = makeLedger();
+    ledger.rows.set("w-owed", { id: "w-owed", kind: "handoff", status: "running" });
+    const host = makeReplayHost(ledger);
+    await writeDone("w-owed", {
+      id: "w-owed",
+      target: "worker-thread",
+      status: "failed",
+      output: "THE ANSWER",
+      workerStatus: "completed",
+      correlationId: "corr-owed",
+      returnTo: "parent-thread",
+      kind: "handoff",
+      finishedUtc: "2026-09-03T00:00:00.000Z",
+    });
+
+    const summary = await reconcileCompletedDoneFiles({
+      dataDir,
+      logger: silent,
+      getDelegation: (id) => ledger.getDelegation(id),
+      replay: (r, route) => host.replayCompletedDispatch(r as never, route),
+    });
+
+    expect(summary.reconciled).toBe(1);
+    const queued = await pendingReportBacks();
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ target: "parent-thread", correlationId: "corr-owed" });
+    expect(ledger.rows.get("w-owed")!.status).toBe("completed");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 7b. `returnTo` is not a delivery address on every kind (ROOT-LATEST-8)
 // ---------------------------------------------------------------------------
 

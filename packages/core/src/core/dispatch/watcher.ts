@@ -597,6 +597,10 @@ export class DispatchWatcher {
         const workerStatus = err instanceof DispatchTurnError ? err.workerStatus : undefined;
         const workerError = err instanceof DispatchTurnError ? err.workerError : undefined;
         const completionPending = err instanceof DispatchTurnError && err.completionPending;
+        // #67: `base` carries the spec's routing unconditionally, so a turn
+        // whose onward delivery was deliberately suppressed has to say so —
+        // otherwise boot replay reads that routing as work still owed.
+        const suppressedOnward = err instanceof DispatchTurnError && err.suppressedOnward;
         await this.finish(id, {
           ...base,
           status: "failed",
@@ -605,6 +609,7 @@ export class DispatchWatcher {
           ...(workerStatus ? { workerStatus } : {}),
           ...(workerError ? { workerError } : {}),
           ...(completionPending ? { completionError: message } : {}),
+          ...(suppressedOnward ? { suppressedOnward: true } : {}),
           ...(stopReason ? { stopReason } : {}),
           finishedUtc: new Date().toISOString(),
         });

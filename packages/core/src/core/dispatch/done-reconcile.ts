@@ -107,7 +107,7 @@ export interface DoneReconcileSummary {
  * irrelevant here — it decides WHAT the replay does, not WHETHER it is owed.
  */
 export function needsCompletionReplay(
-  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind">,
+  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind" | "suppressedOnward">,
   row: { status: string; kind?: string; correlationId?: string | null } | null
 ): boolean {
   return completionRoute(result, row).action !== "skip";
@@ -120,6 +120,7 @@ export function needsCompletionReplay(
  * This MUST mirror the live dispatch contract, because replay is standing in
  * for a completion that the live path would otherwise have done:
  *
+ *   - an interrupt-suppressed completion (#67) owes only the ledger row;
  *   - self-delivering kinds (compact / ingest / thread_voice) already posted
  *     their own result; they owe only the ledger row;
  *   - a chainId advances the chain;
@@ -134,11 +135,19 @@ export function needsCompletionReplay(
  * which is the pre-existing behaviour and recoverable, unlike deletion.
  */
 export function completionRoute(
-  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind">,
+  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind" | "suppressedOnward">,
   row: { status: string; kind?: string; correlationId?: string | null } | null
 ): CompletionRoute {
   if (!row) return { action: "skip", reason: "unknown-row" };
   if (TERMINAL_STATUSES.has(row.status)) return { action: "skip", reason: "terminal" };
+
+  // #67: the live path already decided this completion owes nothing onward
+  // because an interrupt cancelled the turn and issued a replacement directive
+  // in its place. The routing below is still on the file — it is copied from
+  // the spec unconditionally — so this check has to come FIRST, or replay
+  // delivers the stale answer after the directive that superseded it. Only the
+  // ledger row is owed.
+  if (result.suppressedOnward) return { action: "terminalize" };
 
   // The done-file's own kind wins; the ledger row is the fallback for files
   // written before `kind` was carried.

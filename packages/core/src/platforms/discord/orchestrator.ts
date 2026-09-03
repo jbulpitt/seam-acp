@@ -7468,13 +7468,20 @@ export class Orchestrator {
         // Preserve the worker's output in done/ while leaving its ledger row
         // non-terminal. Boot completion replay can then finish the durable side
         // effect without paying for or rerunning the agent turn.
+        //
+        // `wasInterrupted` rides along: on that branch the only thing this try
+        // block did was the ledger write, so a throw here means the row is
+        // non-terminal AND nothing is owed onward. Without the flag the
+        // done-file's `returnTo`/`chainId` would send boot replay to deliver
+        // the very report-back #67 suppressed.
         throw new DispatchTurnError(
           (err as Error)?.message ?? String(err),
           result.text,
           result.stopReason ?? "",
           result.timedOut ? "timed_out" : result.error ? "failed" : "completed",
           result.error,
-          true
+          true,
+          wasInterrupted
         );
       }
       if (result.error) {
@@ -7483,7 +7490,9 @@ export class Orchestrator {
           result.text,
           result.stopReason ?? "",
           "failed",
-          result.error
+          result.error,
+          false,
+          wasInterrupted
         );
       }
       return { output: result.text, stopReason: result.stopReason ?? "" };

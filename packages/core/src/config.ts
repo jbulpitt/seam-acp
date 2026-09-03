@@ -735,15 +735,6 @@ const Schema = z.object({
     }),
 
   /**
-   * Controls the `/seam new` and `/seam config init` thread initialization flow.
-   * - "repo":  (default) only show the repo picker
-   * - "full":  Agent → CWD → Model → Effort (effort only if the chosen agent
-   *            exposes settable levels). Agent first so the CWD list is the
-   *            bound host's workspaces.
-   */
-  NEW_THREAD_WIZARD: z.enum(["repo", "full"]).default("repo"),
-
-  /**
    * How dispatched-turn output (handoffs, forwards, wakes, watches, chain hops,
    * compaction) and report-back / callback delivery render in the target thread.
    * - "messages": (default) traditional plain assistant messages — the worker's

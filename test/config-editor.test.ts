@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import {
   ConfigEditorStore,
+  HUB_FIELD_ACTIONS,
   INHERIT_VALUE,
   RIDER_FILE_MAX_BYTES,
   applyPickerValue,
@@ -11,6 +12,7 @@ import {
   currentThreadRiderText,
   decodeRiderUpload,
   draftAfterSave,
+  effectiveAgentAtLocation,
   dirtyChannelRider,
   dirtyChannelAgent,
   dirtyPermission,
@@ -202,7 +204,6 @@ describe("hub render (#90)", () => {
     expect(panel.footer).toMatch(/applies on the next turn/);
     expect(panel.actions).toHaveLength(4);
     expect(panel.actions![0].map((b) => b.label)).toEqual([
-      "Host",
       "Agent",
       "Model",
       "Effort",
@@ -483,7 +484,8 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
     const panel = renderHub(draft({ editScope: "channel" }));
     expect(panel.title).toBe("🧩 Channel preset");
     expect(panel.footer).toMatch(/editing channel preset/);
-    expect(panel.actions![0].find((b) => b.label === "Host")!.disabled).toBe(true);
+    expect(panel.actions![0].find((b) => b.label === "Host")).toBeUndefined();
+    expect(panel.fields.find((f) => f.name === "Host")!.value).toMatch(/per-thread/);
     expect(panel.actions![1].find((b) => b.label === "Approve")!.disabled).toBe(true);
     expect(panel.actions![1].find((b) => b.label === "Attach")!.disabled).toBe(true);
     expect(panel.actions![2].map((b) => b.label)).toEqual([
@@ -550,9 +552,11 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
     expect(panel.actions![2].map((b) => b.label)).toEqual(["Save", "Cancel", "Card", "GIF"]);
   });
 
-  it("host/approve/attach are no-ops in channel scope", () => {
+  it("approve/attach are no-ops in channel scope; agent never pins a location", () => {
     const started = draft({ editScope: "channel" });
-    expect(applyPickerValue(started, "host", "mac", caps).overlay.location).toBeUndefined();
+    const chanAgent = applyPickerValue(started, "agent", "claude@mac", caps);
+    expect(chanAgent.overlay.channelAgent).toBe("claude");
+    expect(chanAgent.overlay.location).toBeUndefined();
     expect(applyPickerValue(started, "approve", "always", caps).overlay.permission).toBeUndefined();
     expect(applyPickerValue(started, "attach", "detached", caps).overlay.detached).toBeUndefined();
   });
@@ -594,7 +598,7 @@ describe("host/agent change drops unsupported model/effort (D13)", () => {
     expect(next.warnings.join(" ")).toMatch(/Model dropped/);
   });
 
-  it("host change with the same capable agent keeps a supported effort", () => {
+  it("moving the same capable agent to another host keeps a supported effort", () => {
     const started = draft({
       snapshot: snapshot({
         agent: setting("claude", "session config"),
@@ -604,7 +608,7 @@ describe("host/agent change drops unsupported model/effort (D13)", () => {
       }),
       overlay: { effort: "high" },
     });
-    const next = applyPickerValue(started, "host", "mac", () => claudeCaps);
+    const next = applyPickerValue(started, "agent", "claude@mac", () => claudeCaps);
     expect(next.overlay.effort).toBe("high");
     expect(next.overlay.location).toBe("mac");
   });
@@ -618,6 +622,79 @@ describe("host/agent change drops unsupported model/effort (D13)", () => {
   it("Inherit sentinel writes null", () => {
     const next = applyPickerValue(draft(), "model", INHERIT_VALUE, caps);
     expect(next.overlay.model).toBeNull();
+  });
+});
+
+describe("agent id is the only host control (#156)", () => {
+  const remote = () =>
+    draft({
+      snapshot: snapshot({
+        agent: setting("claude", "thread preset"),
+        location: setting("mac", "thread preset"),
+      }),
+    });
+
+  it("the hub exposes no Host button — Host is a read-only field", () => {
+    const panel = renderHub(remote());
+    const buttons = panel.actions!.flat().map((b) => b.label);
+    expect(buttons).not.toContain("Host");
+    expect(buttons).toContain("Agent");
+    expect(HUB_FIELD_ACTIONS).not.toContain("host" as never);
+    const host = panel.fields.find((f) => f.name === "Host")!.value;
+    expect(host).toMatch(/from agent/);
+    expect(host).toMatch(/mac/);
+  });
+
+  it("the Agent field renders the addressable agent@host id", () => {
+    const panel = renderHub(remote());
+    expect(panel.fields.find((f) => f.name === "Agent")!.value).toMatch(/claude@mac/);
+  });
+
+  it("a drafted agent move reports one will-be note carrying the host", () => {
+    const next = applyPickerValue(remote(), "agent", "copilot@local", caps);
+    const panel = renderHub(next);
+    expect(panel.fields.find((f) => f.name === "Agent")!.value).toMatch(
+      /will be `copilot@local`/
+    );
+    expect(panel.fields.find((f) => f.name === "Host")!.value).toMatch(/will be `local`/);
+    expect(effectiveAgentAtLocation(next)).toBe("copilot@local");
+  });
+
+  it("inheriting the agent inherits its host — no orphaned host pin", () => {
+    const next = applyPickerValue(remote(), "agent", INHERIT_VALUE, caps);
+    expect(next.overlay.agent).toBeNull();
+    expect(next.overlay.location).toBeNull();
+    expect(effectiveAgentAtLocation(next)).toBe(`${WITHOUT.agent}@${WITHOUT.location}`);
+    expect(dirtyThreadPresetChanges(next)).toEqual({ agent: null, location: null });
+  });
+
+  it("a bare agent id lands on local rather than stranding the old host", () => {
+    const next = applyPickerValue(remote(), "agent", "copilot", caps);
+    expect(next.overlay.agent).toBe("copilot");
+    expect(next.overlay.location).toBeNull();
+    expect(effectiveAgentAtLocation(next)).toBe("copilot@local");
+  });
+
+  it("no picker action can write a location without an agent", () => {
+    for (const action of HUB_FIELD_ACTIONS) {
+      if (action === "agent") continue;
+      const next = applyPickerValue(remote(), action, "mac", caps);
+      expect(next.overlay.location, action).toBeUndefined();
+    }
+  });
+
+  it("saving an agent move writes agent and location together", () => {
+    const next = applyPickerValue(remote(), "agent", "copilot@local", caps);
+    const plan = buildSavePlan(next);
+    expect(plan.threadPreset.agent).toBe("copilot");
+    // "local" is the default host, so the thread pin is cleared, not set to it.
+    expect(plan.threadPreset.location).toBeNull();
+
+    const toRemote = applyPickerValue(draft(), "agent", "claude@mac", caps);
+    expect(buildSavePlan(toRemote).threadPreset).toMatchObject({
+      agent: "claude",
+      location: "mac",
+    });
   });
 });
 

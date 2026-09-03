@@ -85,7 +85,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
   cmd.addSubcommand((sub) =>
     sub
       .setName("new")
-      .setDescription("Create a new agent thread")
+      .setDescription("Create a new agent thread + config card")
       .addStringOption((o) =>
         o
           .setName("name")
@@ -377,7 +377,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub
           .setName("init")
-          .setDescription("Bind this thread as a session and show repo picker")
+          .setDescription("Bind this thread + open the config card")
       )
       .addSubcommand((sub) =>
         sub

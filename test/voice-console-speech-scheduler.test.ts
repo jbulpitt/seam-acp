@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { VoiceConsoleSpeechScheduler } from "../packages/core/src/core/voice-console/speech-scheduler.js";
+import {
+  VOICE_CONSOLE_KEY_DELIMITER,
+  voiceConsoleSpeechBindingKeyPrefix,
+  voiceConsoleSpeechSourceKey,
+} from "../packages/core/src/core/voice-console/speech-types.js";
 import type {
   VoiceConsolePlaybackRequest,
   VoiceConsoleSpeechChunk,
@@ -1401,5 +1406,138 @@ describe("VoiceConsoleSpeechScheduler failure isolation", () => {
     expect(warning).toHaveBeenCalledTimes(1);
     expect(played).toEqual(["A-2"]);
     expect(scheduler.snapshot().currentSource).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #171 — composite-key separator invariant.
+//
+// Source keys are `<bindingId><delimiter><turnId>` in a process-local Map. The
+// delimiter is never persisted, logged or rendered, but it IS load-bearing:
+// without it `b1` prefix-matches `b10` on unregister, and the tuples (12,3) and
+// (1,23) collide. The suite previously used only "A"/"B", so neither could be
+// caught. These lock the invariant and the boundary that guarantees it.
+// ---------------------------------------------------------------------------
+
+describe("VoiceConsoleSpeechScheduler composite-key invariant (#171)", () => {
+  /** Drive one source to completion so it lands in the completed-source map. */
+  async function completeSource(
+    scheduler: VoiceConsoleSpeechScheduler,
+    ref: VoiceConsoleSpeechSourceRef
+  ): Promise<void> {
+    scheduler.registerSource(ref);
+    scheduler.enqueueChunk(chunk(ref, 1, 0, `${ref.bindingId} speaks.`));
+    await scheduler.finishSource(ref);
+  }
+
+  it("unregistering `b1` does not remove `b10` completed-source stats", async () => {
+    // The regression the old ids could never express: "b1" is a strict prefix
+    // of "b10", so a delimiter-less scan would sweep both.
+    const { scheduler } = setup();
+    scheduler.registerBinding({ bindingId: "b1", profile: profileA, outputEnabled: true });
+    scheduler.registerBinding({ bindingId: "b10", profile: profileB, outputEnabled: true });
+
+    const short = source("b1", "turn-1");
+    const long = source("b10", "turn-1");
+    await completeSource(scheduler, short);
+    await completeSource(scheduler, long);
+
+    // Both are settled and retained before the unregister.
+    expect((await scheduler.waitForSourceDrain(short)).played).toBe(1);
+    expect((await scheduler.waitForSourceDrain(long)).played).toBe(1);
+
+    expect(scheduler.unregisterBinding("b1")).toBe(true);
+
+    // `b10` is untouched: its completed entry is still there to be released.
+    expect((await scheduler.waitForSourceDrain(long)).played).toBe(1);
+    expect(scheduler.forgetSource(long)).toBe(true);
+    // ...while `b1`'s own entry was correctly swept by the unregister.
+    expect(scheduler.forgetSource(short)).toBe(false);
+  });
+
+  it("keeps sibling bindings whose ids share a prefix independently addressable", async () => {
+    const { scheduler } = setup();
+    for (const id of ["b1", "b10", "b100"]) {
+      scheduler.registerBinding({ bindingId: id, profile: profileA, outputEnabled: true });
+    }
+    const refs = ["b1", "b10", "b100"].map((id) => source(id, "t"));
+    for (const ref of refs) await completeSource(scheduler, ref);
+
+    scheduler.unregisterBinding("b10");
+
+    expect(scheduler.forgetSource(refs[0]!)).toBe(true); // b1 survives
+    expect(scheduler.forgetSource(refs[1]!)).toBe(false); // b10 swept
+    expect(scheduler.forgetSource(refs[2]!)).toBe(true); // b100 survives
+  });
+
+  it("keeps composite tuples distinct where a naive concatenation would collide", () => {
+    // ("12","3") and ("1","23") concatenate to the same string without a
+    // delimiter; with one they must stay distinct.
+    const a = voiceConsoleSpeechSourceKey({ consoleId, bindingId: "12", turnId: "3" });
+    const b = voiceConsoleSpeechSourceKey({ consoleId, bindingId: "1", turnId: "23" });
+    expect(a).not.toBe(b);
+    expect(new Set([a, b]).size).toBe(2);
+    expect(`${"12"}${"3"}`).toBe(`${"1"}${"23"}`); // the collision being prevented
+
+    // The prefix helper must agree with the key format it scans.
+    expect(a.startsWith(voiceConsoleSpeechBindingKeyPrefix("12"))).toBe(true);
+    expect(a.startsWith(voiceConsoleSpeechBindingKeyPrefix("1"))).toBe(false);
+    expect(voiceConsoleSpeechBindingKeyPrefix("b1")).toBe(`b1${VOICE_CONSOLE_KEY_DELIMITER}`);
+  });
+
+  it("rejects a delimiter-bearing or otherwise invalid binding id at registration", () => {
+    const { scheduler } = setup();
+    const invalid = [
+      `b1${VOICE_CONSOLE_KEY_DELIMITER}x`, // smuggles the delimiter itself
+      "has:colon",
+      "has space",
+      "has/slash",
+      "x".repeat(49),
+    ];
+    for (const bindingId of invalid) {
+      expect(() =>
+        scheduler.registerBinding({ bindingId, profile: profileA, outputEnabled: true }),
+        JSON.stringify(bindingId)
+      ).toThrow(/must be 1-48 colon-free characters/);
+    }
+    // Empty is still caught by the pre-existing non-empty guard.
+    expect(() =>
+      scheduler.registerBinding({ bindingId: "   ", profile: profileA, outputEnabled: true })
+    ).toThrow(/requires a binding id/);
+  });
+
+  it("rejects an invalid binding id on registerSource with the binding-id error", () => {
+    const { scheduler } = setup();
+    // Reported as a malformed id, not as "binding is not registered".
+    expect(() =>
+      scheduler.registerSource(source(`A${VOICE_CONSOLE_KEY_DELIMITER}B`, "turn-1"))
+    ).toThrow(/binding id must be 1-48 colon-free characters/);
+  });
+
+  it("still accepts the colon-bearing turn ids production actually mints", async () => {
+    // Compatibility guard: turn ids are the LAST key component and legitimately
+    // carry colons (`dispatch:<id>`, `scheduled:<id>:<ts>`). Constraining them
+    // the way binding ids are constrained would break real traffic.
+    const { scheduler } = setup();
+    for (const turnId of [
+      "dispatch:abc-123",
+      "scheduled:sched-7:1788412552000",
+      "1416352869042716794", // a Discord message id (live-marker turns)
+    ]) {
+      const ref = source("A", turnId);
+      await expect(completeSource(scheduler, ref)).resolves.toBeUndefined();
+      expect((await scheduler.waitForSourceDrain(ref)).played).toBe(1);
+    }
+  });
+
+  it("keeps two colon-bearing turn ids on one binding distinct", async () => {
+    const { scheduler } = setup();
+    const first = source("A", "scheduled:job:1");
+    const second = source("A", "scheduled:job:2");
+    await completeSource(scheduler, first);
+    await completeSource(scheduler, second);
+    expect(voiceConsoleSpeechSourceKey(first)).not.toBe(voiceConsoleSpeechSourceKey(second));
+    expect(scheduler.forgetSource(first)).toBe(true);
+    expect(scheduler.forgetSource(second)).toBe(true);
   });
 });

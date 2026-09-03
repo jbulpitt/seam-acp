@@ -2,6 +2,11 @@ import {
   StreamingSpeechSegmenter,
   type SpeechTextKind,
 } from "../audio/streaming-speech-segmenter.js";
+import { assertVoiceConsoleAuthorityId } from "./types.js";
+import {
+  voiceConsoleSpeechBindingKeyPrefix,
+  voiceConsoleSpeechSourceKey,
+} from "./speech-types.js";
 import type {
   VoiceConsoleBindingStateConflict,
   VoiceConsoleBindingStateSyncResult,
@@ -131,6 +136,11 @@ export class VoiceConsoleSpeechScheduler {
     this.assertLive();
     const bindingId = opts.bindingId.trim();
     if (!bindingId) throw new Error("Voice Console speech requires a binding id");
+    // #171: composite source keys are `<bindingId><delimiter><turnId>`, so the
+    // key space is only unambiguous while binding ids exclude the delimiter.
+    // Callers already pass authority ids; enforce it here so the invariant is
+    // guaranteed at the boundary rather than assumed from upstream.
+    assertVoiceConsoleAuthorityId(bindingId, "Voice Console speech binding id");
     if (this.bindings.has(bindingId)) {
       throw new Error(`Voice Console speech binding already registered: ${bindingId}`);
     }
@@ -189,7 +199,7 @@ export class VoiceConsoleSpeechScheduler {
       this.sliceAudioMs = 0;
     }
 
-    const keyPrefix = `${bindingId}\u0000`;
+    const keyPrefix = voiceConsoleSpeechBindingKeyPrefix(bindingId);
     for (const key of this.completedSources.keys()) {
       if (key.startsWith(keyPrefix)) this.completedSources.delete(key);
     }
@@ -255,7 +265,13 @@ export class VoiceConsoleSpeechScheduler {
   registerSource(ref: VoiceConsoleSpeechSourceRef): void {
     this.assertLive();
     this.assertConsole(ref.consoleId);
+    // Same #171 invariant, checked before the binding lookup so an ill-formed id
+    // reports the actual problem instead of "binding is not registered".
+    assertVoiceConsoleAuthorityId(ref.bindingId, "Voice Console speech binding id");
     this.binding(ref.bindingId);
+    // Turn ids are intentionally unconstrained beyond non-empty: real ones carry
+    // colons (`dispatch:<id>`, `scheduled:<id>:<ts>`). They are the LAST key
+    // component, so they cannot make the key ambiguous.
     if (!ref.turnId.trim()) throw new Error("Voice Console speech requires a turn id");
     const key = voiceConsoleSpeechSourceKey(ref);
     if (this.sources.has(key) || this.completedSources.has(key)) {
@@ -1035,10 +1051,6 @@ export class VoiceConsoleSpeechScheduler {
   private assertLive(): void {
     if (this.destroyed) throw new Error("Voice Console speech scheduler has ended");
   }
-}
-
-export function voiceConsoleSpeechSourceKey(ref: VoiceConsoleSpeechSourceRef): string {
-  return `${ref.bindingId}\u0000${ref.turnId}`;
 }
 
 function emptyStats(): VoiceConsoleSpeechStats {

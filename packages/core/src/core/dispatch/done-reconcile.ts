@@ -25,24 +25,68 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "../../lib/logger.js";
+import { DELEGATION_TERMINAL_STATUSES } from "../types.js";
 import { dispatchDirs } from "./types.js";
 import type { DispatchResult } from "./types.js";
 
-/** Ledger statuses that mean the completion side effects already ran. */
-const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
-  "completed",
-  "failed",
-  "abandoned",
-  "cancelled",
+/**
+ * Ledger statuses that mean the completion side effects already ran.
+ *
+ * The canonical list, NOT a local copy. The copy this replaced listed
+ * "cancelled" — which is not a `DelegationStatus` at all — and omitted
+ * `timed_out`, so a timed-out row with a done-file read as non-terminal and got
+ * replayed. `parked` is deliberately absent here too (it means "set aside",
+ * not "finished"), which matches how `index.ts` decides recoverability.
+ */
+const TERMINAL_STATUSES: ReadonlySet<string> = new Set<string>(DELEGATION_TERMINAL_STATUSES);
+
+/**
+ * Kinds whose dispatch is an EARLY-RETURN branch of `dispatchInjectTurn` with
+ * its own delivery (a result card, an HTTP response, a voice reply). They never
+ * take the generic report-back path, so replay must not either — and critically,
+ * `compact` puts the ACTOR thread in `returnTo`, so a routing-only replay would
+ * post a report-back to a thread that never asked for one.
+ */
+const SELF_DELIVERING_KINDS: ReadonlySet<string> = new Set([
+  "compact",
+  "ingest",
+  "thread_voice",
 ]);
+
+/**
+ * Kinds that legitimately finish with NO onward delivery. Seeing one with no
+ * routing is not evidence of a lost report-back, so terminalizing is safe.
+ */
+const NO_ONWARD_KINDS: ReadonlySet<string> = new Set([
+  "report_back",
+  "wake",
+  "watch",
+  "scheduled",
+  "peek",
+  "parked",
+  "choice",
+  "inbox",
+  "migrate_self",
+]);
+
+/** What replay owes a finished dispatch. */
+export type CompletionRoute =
+  /** Advance the chain, then terminalize. */
+  | { action: "chain"; chainId: string }
+  /** Enqueue the report-back, then terminalize. */
+  | { action: "report_back"; returnTo: string }
+  /** Nothing onward; just fix the row. */
+  | { action: "terminalize" }
+  /** Leave the row alone — see `reason`. */
+  | { action: "skip"; reason: "terminal" | "unknown-row" | "delivery-unprovable" };
 
 export interface DoneReconcileDeps {
   dataDir: string;
   logger: Logger;
   /** Ledger row lookup — `null` when the id is unknown. */
-  getDelegation: (id: string) => { status: string } | null;
+  getDelegation: (id: string) => { status: string; kind?: string; correlationId?: string | null } | null;
   /** Replay the completion side effects for one finished dispatch. */
-  replay: (result: DispatchResult) => Promise<void>;
+  replay: (result: DispatchResult, route: CompletionRoute) => Promise<void>;
 }
 
 export interface DoneReconcileSummary {
@@ -50,6 +94,8 @@ export interface DoneReconcileSummary {
   reconciled: number;
   skippedTerminal: number;
   skippedUnknown: number;
+  /** Legacy done-files whose delivery cannot be proven — deliberately left. */
+  skippedUnprovable: number;
   failed: number;
 }
 
@@ -61,16 +107,55 @@ export interface DoneReconcileSummary {
  * irrelevant here — it decides WHAT the replay does, not WHETHER it is owed.
  */
 export function needsCompletionReplay(
-  _result: Pick<DispatchResult, "returnTo" | "chainId">,
-  row: { status: string } | null
+  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind">,
+  row: { status: string; kind?: string; correlationId?: string | null } | null
 ): boolean {
-  if (!row) return false;
-  // Onward routing is NOT part of this decision. A done-file proves the work
-  // finished; a non-terminal row for it is wrong regardless of whether anything
-  // had to be delivered onward. An unrouted completion (a wake, a watch, a
-  // report_back, a plain handoff with no returnTo) left `interrupted` is the
-  // same corruption — `/seam workflows` offers a paid rerun of finished work.
-  return !TERMINAL_STATUSES.has(row.status);
+  return completionRoute(result, row).action !== "skip";
+}
+
+/**
+ * Decide what a finished dispatch is owed. Pure, so the contract is testable
+ * without a filesystem or a store.
+ *
+ * This MUST mirror the live dispatch contract, because replay is standing in
+ * for a completion that the live path would otherwise have done:
+ *
+ *   - self-delivering kinds (compact / ingest / thread_voice) already posted
+ *     their own result; they owe only the ledger row;
+ *   - a chainId advances the chain;
+ *   - otherwise a returnTo enqueues the report-back;
+ *   - a kind that never delivers onward owes only the ledger row.
+ *
+ * A legacy `forward` needs no guesswork: by contract its `correlationId` IS its
+ * chain id, so the chain advance is reconstructed straight off the ledger row.
+ *
+ * The remaining case is the dangerous one. A done-file with no routing and a
+ * DELIVERY-BEARING kind — in practice a plain `handoff` — is a legacy file
+ * written before #174 carried routing. It cannot prove its report-back was ever
+ * enqueued, and terminalizing it would strand the answer permanently and
+ * silently. So it is left non-terminal: `/seam workflows` may offer a rerun,
+ * which is the pre-existing behaviour and recoverable, unlike deletion.
+ */
+export function completionRoute(
+  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind">,
+  row: { status: string; kind?: string; correlationId?: string | null } | null
+): CompletionRoute {
+  if (!row) return { action: "skip", reason: "unknown-row" };
+  if (TERMINAL_STATUSES.has(row.status)) return { action: "skip", reason: "terminal" };
+
+  // The done-file's own kind wins; the ledger row is the fallback for files
+  // written before `kind` was carried.
+  const kind = result.kind ?? row.kind;
+
+  if (kind && SELF_DELIVERING_KINDS.has(kind)) return { action: "terminalize" };
+  // A forward's correlationId is its chain id by contract, so a legacy forward
+  // recovers its chain advance from the row rather than being written off.
+  const chainId =
+    result.chainId ?? (kind === "forward" ? (row.correlationId ?? undefined) : undefined);
+  if (chainId) return { action: "chain", chainId };
+  if (result.returnTo) return { action: "report_back", returnTo: result.returnTo };
+  if (kind && NO_ONWARD_KINDS.has(kind)) return { action: "terminalize" };
+  return { action: "skip", reason: "delivery-unprovable" };
 }
 
 /**
@@ -91,6 +176,7 @@ export async function reconcileCompletedDoneFiles(
     reconciled: 0,
     skippedTerminal: 0,
     skippedUnknown: 0,
+    skippedUnprovable: 0,
     failed: 0,
   };
 
@@ -114,7 +200,7 @@ export async function reconcileCompletedDoneFiles(
     }
     summary.scanned++;
 
-    let row: { status: string } | null;
+    let row: { status: string; kind?: string; correlationId?: string | null } | null;
     try {
       row = deps.getDelegation(result.id);
     } catch (err) {
@@ -122,17 +208,23 @@ export async function reconcileCompletedDoneFiles(
       summary.failed++;
       continue;
     }
-    if (!row) {
-      summary.skippedUnknown++;
-      continue;
-    }
-    if (!needsCompletionReplay(result, row)) {
-      summary.skippedTerminal++;
+
+    const route = completionRoute(result, row);
+    if (route.action === "skip") {
+      if (route.reason === "unknown-row") summary.skippedUnknown++;
+      else if (route.reason === "terminal") summary.skippedTerminal++;
+      else {
+        summary.skippedUnprovable++;
+        deps.logger.warn(
+          { id: result.id, kind: result.kind ?? row?.kind, status: row?.status },
+          "done-reconcile: cannot prove onward delivery; leaving row non-terminal"
+        );
+      }
       continue;
     }
 
     try {
-      await deps.replay(result);
+      await deps.replay(result, route);
       summary.reconciled++;
     } catch (err) {
       deps.logger.warn(

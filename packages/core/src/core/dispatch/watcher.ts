@@ -568,7 +568,10 @@ export class DispatchWatcher {
         ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
         // #174: carry the routing forward so a completion whose ledger side
         // effects were lost to a shutdown race can be replayed at boot from
-        // the done-file alone, without rerunning the worker.
+        // the done-file alone, without rerunning the worker. `kind` rides
+        // along because `returnTo` is not self-describing: on a compact spec
+        // it is the ACTOR, not a report-back address.
+        ...(spec.kind ? { kind: spec.kind } : {}),
         ...(spec.returnTo ? { returnTo: spec.returnTo } : {}),
         ...(spec.chainId ? { chainId: spec.chainId } : {}),
         ...(spec.prompt

@@ -147,11 +147,24 @@ export interface DispatchResult {
    * run (shutdown race), boot reconciliation has to replay them from here, so
    * the file must carry the *routing* the spec knew and the result does not.
    *
-   * All optional: a done-file written before #174 simply does not reconcile,
-   * which is correct — those dispatches are long since terminal or abandoned.
+   * All optional, and a done-file written before #174 carries none of them.
+   * Such a file is NOT ignored — an earlier version of this comment claimed it
+   * was, which stopped being true once reconciliation started reading the
+   * ledger. It is judged by the ledger row's `kind` instead: kinds that owe
+   * nothing onward terminalize, a `forward` recovers its chain from
+   * `correlationId`, and a plain `handoff` whose `returnTo` is unrecoverable is
+   * left non-terminal rather than silently marked done. See `completionRoute`.
    */
   returnTo?: string;
   chainId?: string;
+  /**
+   * The spec's kind, because `returnTo` alone does NOT identify a delivery
+   * route. `kind: "compact"` stamps the ACTOR thread into `returnTo` and is an
+   * early-return branch of `dispatchInjectTurn` with its own result card — a
+   * replay that saw only `returnTo` would post it a report-back it never had.
+   * `ingest` and `thread_voice` are likewise self-delivering.
+   */
+  kind?: DelegationKind;
   /** `spec.prompt` (clamped) — the originating ask, for the report-back card. */
   originPrompt?: string;
 }

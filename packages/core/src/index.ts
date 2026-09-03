@@ -991,9 +991,9 @@ async function main(): Promise<void> {
       dataDir: config.DATA_DIR,
       logger,
       getDelegation: (id) => store.getDelegation(id),
-      replay: (result) => orchestrator.replayCompletedDispatch(result),
+      replay: (result, route) => orchestrator.replayCompletedDispatch(result, route),
     });
-    if (repaired.reconciled > 0 || repaired.failed > 0) {
+    if (repaired.reconciled > 0 || repaired.failed > 0 || repaired.skippedUnprovable > 0) {
       logger.warn(repaired, "reconciled completed dispatches whose ledger row was non-terminal");
     }
   } catch (err) {

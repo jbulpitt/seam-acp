@@ -339,6 +339,7 @@ import {
   findQueuedReportBackSpec,
   type DispatchSpec,
 } from "../../core/dispatch/types.js";
+import type { CompletionRoute } from "../../core/dispatch/done-reconcile.js";
 import { promptExcerpt } from "../../core/prompt-excerpt.js";
 import { buildSeamHelpPages } from "./help-text.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
@@ -1061,6 +1062,10 @@ export class Orchestrator {
     await safeAutocompleteRespond(
       (choices) => interaction.respond(choices),
       async () => {
+        // #174: responders read presets, threads and config from the store.
+        // An empty list is the graceful shutdown answer — Discord shows no
+        // suggestions rather than an error, and nothing touches the store.
+        if (this.admissionClosed) return [];
         const group = interaction.options.getSubcommandGroup(false);
         const sub = interaction.options.getSubcommand(false);
         const focused = interaction.options.getFocused(true);
@@ -1197,6 +1202,18 @@ export class Orchestrator {
   install(): void {
     this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
     this.adapter.onComponent?.((evt) => {
+      // #174: one gate for every component handler (config editor, TTS editor,
+      // Voice Console, quota card) and, below, for choice cards. They all do
+      // store-backed work that no drain tracks. `handlePersistentComponent`
+      // reaches these through `componentHandler`, so gating the wrapper covers
+      // it too.
+      if (this.admissionClosed) {
+        this.logger.info({ customId: evt.customId }, "component refused; shutting down");
+        void evt
+          .replyEphemeral("♻️ Restarting — that action was not taken. Try again in a moment.")
+          .catch(() => {});
+        return;
+      }
       void this.handleConfigEditorComponent(evt);
       void this.handleTtsEditorComponent(evt).catch((err) => {
         this.logger.warn({ err, customId: evt.customId }, "tts editor component failed");
@@ -1211,7 +1228,15 @@ export class Orchestrator {
         this.logger.warn({ err, customId: evt.customId }, "quota card component failed");
       });
     });
-    this.adapter.onChoiceInteraction?.((evt) => this.handleChoiceCardInteraction(evt));
+    this.adapter.onChoiceInteraction?.((evt) => {
+      if (this.admissionClosed) {
+        this.logger.info({ customId: evt.customId }, "choice click refused; shutting down");
+        return evt
+          .replyEphemeral("♻️ Restarting — your pick was not recorded. Try again in a moment.")
+          .catch(() => {});
+      }
+      return this.handleChoiceCardInteraction(evt);
+    });
     this.adapter.onThreadDelete?.((channelRef) => this.handleThreadDeleted(channelRef));
     // DB-backed channel activation (#22): let the adapter's channel gate treat
     // an enabled active_projects row as allowed, additive to the env allowlist.
@@ -1224,6 +1249,14 @@ export class Orchestrator {
    *  happened.) Also drops a parked prompt (#88). Any pre-#158 bytes under
    *  `data/scheduled-attachments/` are deliberately left alone. */
   private async handleThreadDeleted(channelRef: string): Promise<void> {
+    // #174: skip during shutdown. This is pure cleanup with an existing lazy
+    // fallback — a fire against a deleted thread 404s and drops the row then —
+    // so deferring to the next boot costs nothing, while running it here would
+    // put untracked store writes in the window where the store closes.
+    if (this.admissionClosed) {
+      this.logger.info({ channelRef }, "thread-delete cleanup deferred; shutting down");
+      return;
+    }
     const rows = this.store.listScheduledByChannel(PLATFORM, channelRef);
     if (rows.length > 0) {
       this.logger.info({ channelRef, count: rows.length }, "thread deleted; dropping scheduled prompts");
@@ -1535,12 +1568,14 @@ export class Orchestrator {
    *            cron early is what made `report-update` miss 5:25.
    *   OPEN     `refireLiveTurn` — boot-time resume, never runs during shutdown.
    *
-   * Slash commands, component clicks and thread-delete are NOT gated wholesale
-   * and do not need to be: none of them count a turn on their own, and they
-   * arrive over the gateway, which `adapter.stop()` closes BEFORE `store.close()`
-   * — so they cannot reach a closed store either. A choice-card click during
-   * shutdown persists its dispatch spec to `pending/` and lands on the next
-   * boot, which is strictly better than refusing it.
+   * Every OTHER Discord ingress is gated too, at its own entry point:
+   * `handleSlashInteraction`, `handleAutocompleteInteraction`, the `onComponent`
+   * and `onChoiceInteraction` wrappers, and thread-delete. An earlier revision
+   * of this comment argued they were safe because `adapter.stop()` runs before
+   * `store.close()`. That was wrong: `adapter.stop()` closes the gateway but
+   * does NOT await handlers already in flight, and none of that work is tracked
+   * by any drain — so a handler admitted after the snapshot can still be
+   * mid-await when the store closes.
    */
   private queueOnChannel<T>(channelId: string, task: () => Promise<T>): Promise<T> {
     const existing = this.channelQueues.get(channelId) ?? Promise.resolve();
@@ -1671,7 +1706,20 @@ export class Orchestrator {
     );
   }
 
-  /** True once shutdown has closed admission — read by the intake gates. */
+  /**
+   * True once shutdown has closed admission — the single bound every ingress
+   * checks at handler ENTRY.
+   *
+   * Entry is the only safe place. `adapter.stop()` stops future events but does
+   * not cancel a handler already admitted before it, and none of that work sits
+   * in a drain set — so a handler that got past the door can resume after
+   * `store.close()`. Checking here, before any await, is what makes that
+   * impossible.
+   *
+   * Applied uniformly, INCLUDING read-only commands: classifying which ones are
+   * "safe" would be a per-command judgement that rots the moment a command
+   * grows a store read.
+   */
   get admissionClosed(): boolean {
     return this.intakeStopped;
   }
@@ -1747,20 +1795,30 @@ export class Orchestrator {
    */
   private async settleAllWork(onStageError: (err: unknown) => void): Promise<void> {
     for (;;) {
-      try {
-        await this.dispatchWatcher?.drain();
-        await Promise.allSettled([...this.channelQueues.values()]);
-        await Promise.allSettled([...this.activeTurnSettles]);
-        await this.settleTrackedContinuations();
-      } catch (err) {
-        // A throwing stage must NOT abort the barrier. It used to: the
-        // rejection propagated out, `runBoundedDrain` swallowed it, and the
-        // phase reported a clean drain having skipped every stage after the
-        // one that threw. The work is still outstanding, so record it and go
-        // round again — the caller's deadline is what ends this, and if the
-        // failure is persistent the phase correctly reports `timedOut`.
-        onStageError(err);
-      }
+      // Per-stage capture, so one throwing stage cannot skip the others. A
+      // single try around all four looked like it handled failure but did not:
+      // a stage-1 throw jumped past the queue, turn and continuation waits
+      // entirely, and if it threw on every pass they never ran at all.
+      let stageFailed = false;
+      const stage = async (run: () => Promise<unknown>): Promise<void> => {
+        try {
+          await run();
+        } catch (err) {
+          stageFailed = true;
+          onStageError(err);
+        }
+      };
+      await stage(async () => this.dispatchWatcher?.drain());
+      await stage(() => Promise.allSettled([...this.channelQueues.values()]));
+      await stage(() => Promise.allSettled([...this.activeTurnSettles]));
+      await stage(() => this.settleTrackedContinuations());
+
+      // Every stage got its chance; now stop. Looping on a failing stage would
+      // spin the CPU until the deadline for no benefit — a stage that threw
+      // cannot prove quiescence, so the phase reports `barrierFailed` and
+      // shutdown proceeds bounded, exactly as it does on a timeout. Honest
+      // even when the other stages drained fine: we still cannot say "drained".
+      if (stageFailed) return;
       // Yield once so work those settlements just registered is visible before
       // we decide we are finished.
       await new Promise((resolve) => setImmediate(resolve));
@@ -3269,6 +3327,21 @@ export class Orchestrator {
   async handleSlashInteraction(
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
+    // #174: refuse BEFORE any store access. Gateway events keep arriving until
+    // `adapter.stop()`, and `adapter.stop()` does NOT await handlers already
+    // running — so a slash command admitted after the quiesce snapshot can be
+    // mid-await over the store when `store.close()` lands. Nothing here is
+    // tracked by the drain, so the only safe answer is not to start.
+    if (this.admissionClosed) {
+      this.logger.info({ user: interaction.user?.id }, "slash refused; shutting down");
+      await interaction
+        .reply({
+          content: "♻️ Restarting — that command was not run. Try again in a moment.",
+          flags: MessageFlags.Ephemeral,
+        })
+        .catch(() => {});
+      return;
+    }
     const sub = interaction.options.getSubcommand(true);
     const slashGroup = interaction.options.getSubcommandGroup(false);
     const slashOpts = Orchestrator.slashGateOptions(interaction);
@@ -7874,7 +7947,7 @@ export class Orchestrator {
     returnTo?: string;
     chainId?: string;
     originPrompt?: string;
-  }): Promise<void> {
+  }, route: CompletionRoute): Promise<void> {
     const text = result.output ?? "";
     // Rebuild only the fields the onward paths actually read.
     const spec: DispatchSpec = {
@@ -7902,12 +7975,17 @@ export class Orchestrator {
     //                         DB-first claim sees its own ledger row and
     //                         returns false, so no double delivery
     //   after terminalize   → row terminal → skipped, correctly
-    // Unrouted completions (a wake, a watch, a report_back, a handoff with no
-    // returnTo) have no onward step — they go straight to terminal below. The
-    // row is still wrong until they do.
-    if (result.chainId) {
+    // The ROUTE decides, not the presence of a field. `returnTo` is not a
+    // delivery address on every kind — a compact spec stamps the ACTOR there,
+    // and compact/ingest/thread_voice already delivered their own results — so
+    // inferring "returnTo ⇒ report-back" here would invent a delivery the live
+    // path never performs. Kinds that genuinely finish with nothing onward
+    // (wake, watch, report_back, …) route to `terminalize` and fall straight
+    // through. Anything whose delivery cannot be PROVEN never reaches this
+    // method; `completionRoute` skips it and leaves the row non-terminal.
+    if (route.action === "chain") {
       await this.advanceChain(spec, text, result.error);
-    } else if (result.returnTo) {
+    } else if (route.action === "report_back") {
       await this.enqueueReportBack(spec, text, result.error);
     }
 

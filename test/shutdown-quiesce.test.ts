@@ -23,8 +23,10 @@ import {
 import {
   reconcileCompletedDoneFiles,
   needsCompletionReplay,
+  completionRoute,
 } from "../packages/core/src/core/dispatch/done-reconcile.js";
 import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import { DELEGATION_TERMINAL_STATUSES } from "../packages/core/src/core/types.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
@@ -150,7 +152,13 @@ describe("#174 DispatchWatcher.drain", () => {
       logger: silent,
       onDispatch: async () => ({ output: "the answer", stopReason: "end_turn" }),
     });
-    await dropSpec({ id: "rb", target: "worker", returnTo: "parent", correlationId: "c1" });
+    await dropSpec({
+      id: "rb",
+      target: "worker",
+      kind: "handoff",
+      returnTo: "parent",
+      correlationId: "c1",
+    });
     await watcher.start();
     await watcher.drain();
     const done = JSON.parse(await readFile(path.join(dirs.done, "rb.json"), "utf8"));
@@ -161,12 +169,64 @@ describe("#174 DispatchWatcher.drain", () => {
       correlationId: "c1",
       originPrompt: "do the thing",
     });
+    // `kind` must ride along: without it a replay cannot tell a handoff's
+    // report-back address from a compact's actor.
+    expect(done.kind).toBe("handoff");
+  });
+
+  it("carries the KIND of a self-delivering spec, so replay can refuse it", async () => {
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async () => ({ output: "compacted", stopReason: "end_turn" }),
+    });
+    // A compact spec stamps the ACTOR into returnTo.
+    await dropSpec({ id: "cmp", target: "thread-target", kind: "compact", returnTo: "thread-actor" });
+    await watcher.start();
+    await watcher.drain();
+    const done = JSON.parse(await readFile(path.join(dirs.done, "cmp.json"), "utf8"));
+    expect(done.kind).toBe("compact");
+    // …and that is exactly what stops the replay delivering to the actor.
+    expect(completionRoute(done, { status: "interrupted", kind: "compact" })).toEqual({
+      action: "terminalize",
+    });
   });
 });
 
 // ---------------------------------------------------------------------------
 // 2. Bounded quiesce — two phases, explicit timeout semantics
 // ---------------------------------------------------------------------------
+
+/**
+ * Captures what shutdown reported. The returned outcome and the log are two
+ * separate claims: a barrier that failed could still be logging
+ * "quiesce phase complete", which is what an operator actually reads.
+ */
+function makeCapturingLogger() {
+  const entries: Array<{ level: string; msg: string; data: Record<string, unknown> }> = [];
+  const at =
+    (level: string) =>
+    (data?: unknown, msg?: unknown) => {
+      entries.push({
+        level,
+        msg: String(msg ?? ""),
+        data: (typeof data === "object" && data ? data : {}) as Record<string, unknown>,
+      });
+    };
+  const logger: Record<string, unknown> = {
+    info: at("info"),
+    warn: at("warn"),
+    error: at("error"),
+    debug: at("debug"),
+  };
+  logger.child = () => logger;
+  return {
+    logger: logger as unknown as Logger,
+    entries,
+    msgs: () => entries.map((e) => e.msg),
+    find: (re: RegExp) => entries.find((e) => re.test(e.msg)),
+  };
+}
 
 /**
  * Minimal orchestrator stand-in exercising the real shutdown methods.
@@ -192,6 +252,7 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     quiesce(o?: { timeoutMs?: number }): Promise<{ timedOut: boolean; continuations: number }>;
     drainAfterDispose(o?: { timeoutMs?: number }): Promise<{ timedOut: boolean }>;
     trackContinuation(p: Promise<void>): void;
+    settleTrackedContinuations(): Promise<void>;
     beginTurn(): () => void;
     runScheduledPrompt(id: string): Promise<void>;
     pendingContinuations: Set<Promise<void>>;
@@ -241,7 +302,9 @@ describe("#174 bounded quiesce", () => {
    */
   it("a PERSISTENTLY failing stage is never reported as drained", async () => {
     let drainCalls = 0;
+    const log = makeCapturingLogger();
     const host = makeQuiesceHost({
+      logger: log.logger,
       dispatchWatcher: {
         stop() {},
         inFlightCount: 1, // work really is outstanding
@@ -252,22 +315,35 @@ describe("#174 bounded quiesce", () => {
       },
     });
 
-    let settled = false;
-    const phase = host.quiesce({ timeoutMs: 150 }).then((r) => ((settled = true), r));
-    await flush();
-    expect(settled).toBe(false); // did NOT short-circuit to success
+    // Generous deadline on purpose: if the barrier only stopped because the
+    // clock ran out, this test would still pass with a spin. It must stop on
+    // its own, well inside the timeout.
+    const started = Date.now();
+    const phase = host.quiesce({ timeoutMs: 30_000 });
 
     const outcome = await phase;
+    expect(Date.now() - started).toBeLessThan(5_000); // returned, did not wait out 30s
     expect(outcome.drained).toBe(false);
     expect(outcome.barrierFailed).toBe(true);
-    expect(outcome.timedOut).toBe(true); // the deadline is what ended it
-    expect(drainCalls).toBeGreaterThan(1); // it kept retrying, not gave up
+    // NOT a retry storm: the stage is attempted once per pass and the barrier
+    // gives up after that pass rather than spinning until the deadline.
+    expect(drainCalls).toBe(1);
+    expect(outcome.timedOut).toBe(false); // it reported failure, not a timeout
+
+    // What the operator READS must not contradict that.
+    expect(log.msgs()).not.toContain("quiesce phase complete");
+    expect(log.find(/barrier stage failed/)).toBeDefined();
+    const final = log.find(/quiesce barrier failed/);
+    expect(final?.level).toBe("warn");
+    expect(final?.data).toMatchObject({ barrierFailed: true, drained: false });
   });
 
   it("a TRANSIENT stage failure still runs the other stages", async () => {
     let drainCalls = 0;
     const late = deferred();
+    const log = makeCapturingLogger();
     const host = makeQuiesceHost({
+      logger: log.logger,
       dispatchWatcher: {
         stop() {},
         inFlightCount: 0,
@@ -284,21 +360,36 @@ describe("#174 bounded quiesce", () => {
     let settled = false;
     const phase = host.quiesce({ timeoutMs: 5000 }).then((r) => ((settled = true), r));
     await flush();
-    expect(settled).toBe(false); // still waiting on the later stages
+    // THE POINT: stage 1 threw, yet the barrier is still here, blocked on the
+    // turn/continuation stages. The old single-try version jumped straight
+    // past them.
+    expect(settled).toBe(false);
 
     endTurn();
     late.resolve();
     const outcome = await phase;
-    expect(outcome.timedOut).toBe(false); // it recovered and finished
-    expect(outcome.barrierFailed).toBe(true); // but the failure is not hidden
+    expect(drainCalls).toBe(1); // one attempt, no storm
+    expect(outcome.timedOut).toBe(false);
+    expect(outcome.barrierFailed).toBe(true); // the failure is not hidden
     expect(outcome.drained).toBe(false); // so it is NOT called a clean drain
     expect(host.activeTurns).toBe(0);
     expect(host.pendingContinuations.size).toBe(0);
+
+    // Recovered, but still not announced as a clean phase.
+    expect(log.msgs()).not.toContain("quiesce phase complete");
+    const final = log.find(/quiesce barrier failed/);
+    expect(final?.level).toBe("warn");
+    expect(final?.data).toMatchObject({ barrierFailed: true, drained: false, timedOut: false });
   });
 
   it("a clean phase is the only thing that reports drained", async () => {
-    const outcome = await makeQuiesceHost().quiesce({ timeoutMs: 5000 });
+    const log = makeCapturingLogger();
+    const outcome = await makeQuiesceHost({ logger: log.logger }).quiesce({ timeoutMs: 5000 });
     expect(outcome).toMatchObject({ drained: true, timedOut: false, barrierFailed: false });
+    const done = log.find(/quiesce phase complete/);
+    expect(done?.level).toBe("info");
+    expect(done?.data).toMatchObject({ drained: true });
+    expect(log.find(/failed|timed out/)).toBeUndefined();
   });
 
   it("post-dispose drain awaits continuations REGISTERED BY disposal", async () => {
@@ -385,8 +476,23 @@ function makeReplayHost(ledger: ReturnType<typeof makeLedger>, over: Record<stri
     ...over,
   };
   return self as unknown as {
-    replayCompletedDispatch(r: Record<string, unknown>): Promise<void>;
+    replayCompletedDispatch(r: Record<string, unknown>, route: unknown): Promise<void>;
   };
+}
+
+/**
+ * Replay through the REAL routing decision rather than a route the test picked.
+ * Using `completionRoute` here is deliberate: it keeps every replay test honest
+ * about the contract instead of letting them assume "returnTo means deliver".
+ */
+async function replayVia(
+  host: { replayCompletedDispatch(r: Record<string, unknown>, route: unknown): Promise<void> },
+  result: Record<string, unknown>,
+  row: { status: string; kind?: string } = { status: "interrupted" }
+): Promise<void> {
+  const route = completionRoute(result as never, row);
+  if (route.action === "skip") throw new Error(`route was skip: ${route.reason}`);
+  await host.replayCompletedDispatch(result, route);
 }
 
 const completedWorker = {
@@ -433,7 +539,7 @@ describe("#174 replay ordering is crash-safe", () => {
         },
       }),
     });
-    await host.replayCompletedDispatch(completedWorker);
+    await replayVia(host, completedWorker);
     expect(order).toEqual(["claim", "terminalize"]);
     expect(ledger.rows.get("w1")!.status).toBe("completed");
     const specs = await pendingReportBacks();
@@ -458,14 +564,14 @@ describe("#174 replay ordering is crash-safe", () => {
         },
       }),
     });
-    await expect(host.replayCompletedDispatch(completedWorker)).rejects.toThrow(/died/);
+    await expect(replayVia(host, completedWorker)).rejects.toThrow(/died/);
     // Row stayed non-terminal — that is what brings the next boot back here.
     expect(ledger.rows.get("w1")!.status).toBe("interrupted");
     expect(await pendingReportBacks()).toHaveLength(1);
 
     // Next boot replays. Must NOT deliver twice, must finish terminalizing.
     crash = false;
-    await host.replayCompletedDispatch(completedWorker);
+    await replayVia(host, completedWorker);
     expect(await pendingReportBacks()).toHaveLength(1); // still exactly one
     expect(ledger.rows.get("w1")!.status).toBe("completed");
   });
@@ -486,12 +592,12 @@ describe("#174 replay ordering is crash-safe", () => {
         },
       }),
     });
-    await expect(host.replayCompletedDispatch(completedWorker)).rejects.toThrow(/store closed/);
+    await expect(replayVia(host, completedWorker)).rejects.toThrow(/store closed/);
     expect(ledger.rows.get("w1")!.status).toBe("interrupted");
     expect(await pendingReportBacks()).toHaveLength(0);
 
     crash = false;
-    await host.replayCompletedDispatch(completedWorker);
+    await replayVia(host, completedWorker);
     expect(await pendingReportBacks()).toHaveLength(1);
     expect(ledger.rows.get("w1")!.status).toBe("completed");
   });
@@ -519,13 +625,13 @@ describe("#174 replay ordering is crash-safe", () => {
       }),
     });
     await expect(
-      host.replayCompletedDispatch({ ...completedWorker, id: "w2", returnTo: undefined, chainId: "chain-1" })
+      replayVia(host, { ...completedWorker, id: "w2", returnTo: undefined, chainId: "chain-1" })
     ).rejects.toThrow(/advance failed/);
     expect(order).toEqual(["advance"]); // never terminalized
     expect(ledger.rows.get("w2")!.status).toBe("running");
 
     crash = false;
-    await host.replayCompletedDispatch({ ...completedWorker, id: "w2", returnTo: undefined, chainId: "chain-1" });
+    await replayVia(host, { ...completedWorker, id: "w2", returnTo: undefined, chainId: "chain-1" });
     expect(order).toEqual(["advance", "advance", "terminalize"]);
     expect(ledger.rows.get("w2")!.status).toBe("completed");
   });
@@ -534,9 +640,9 @@ describe("#174 replay ordering is crash-safe", () => {
     const ledger = makeLedger();
     ledger.rows.set("w1", { id: "w1", kind: "handoff", status: "interrupted" });
     const host = makeReplayHost(ledger);
-    await host.replayCompletedDispatch(completedWorker);
-    await host.replayCompletedDispatch(completedWorker);
-    await host.replayCompletedDispatch(completedWorker);
+    await replayVia(host, completedWorker);
+    await replayVia(host, completedWorker);
+    await replayVia(host, completedWorker);
     expect(await pendingReportBacks()).toHaveLength(1);
     const rbRows = [...ledger.rows.values()].filter((r) => r.kind === "report_back");
     expect(rbRows).toHaveLength(1);
@@ -573,22 +679,49 @@ describe("#174 boot done-file reconciliation", () => {
     expect(onDispatch).not.toHaveBeenCalled(); // the worker is never re-executed
   });
 
-  it("treats interrupted as replayable but completed/failed/abandoned as done", async () => {
-    expect(needsCompletionReplay({ returnTo: "p" }, { status: "interrupted" })).toBe(true);
-    expect(needsCompletionReplay({ returnTo: "p" }, { status: "running" })).toBe(true);
-    expect(needsCompletionReplay({ returnTo: "p" }, { status: "dispatched" })).toBe(true);
-    for (const status of ["completed", "failed", "abandoned", "cancelled"]) {
+  it("uses the CANONICAL terminal statuses, so timed_out is not replayed", async () => {
+    // The local copy this replaced listed "cancelled" — not a DelegationStatus
+    // at all, so that case never fired — and omitted `timed_out`, which meant a
+    // timed-out row with a done-file read as unfinished and got replayed.
+    for (const status of ["interrupted", "running", "dispatched"]) {
+      expect(needsCompletionReplay({ returnTo: "p" }, { status })).toBe(true);
+    }
+    for (const status of DELEGATION_TERMINAL_STATUSES) {
       expect(needsCompletionReplay({ returnTo: "p" }, { status })).toBe(false);
     }
+    // Named explicitly: this is the regression, and it must not depend on the
+    // constant's contents happening to be right.
+    expect(needsCompletionReplay({ returnTo: "p" }, { status: "timed_out" })).toBe(false);
+    // `parked` means "set aside", not "finished", so it stays replayable —
+    // matching how index.ts decides recoverability.
+    expect(needsCompletionReplay({ returnTo: "p" }, { status: "parked" })).toBe(true);
   });
 
-  it("STILL reconciles a done-file with no onward routing (review blocker 3)", async () => {
-    // An earlier revision skipped these without reading the ledger. That left
-    // completed wake/watch/report_back/unrouted-handoff rows `interrupted`, so
-    // `/seam workflows` offered a paid rerun of finished work. Routing decides
-    // what replay DOES, never whether it is owed.
+  it("reconstructs a legacy forward's chain from its correlationId", async () => {
+    // By contract a forward's correlationId IS its chain id, so a pre-#174
+    // done-file with no routing still advances its chain instead of being
+    // written off as unprovable.
+    expect(
+      completionRoute({} as never, {
+        status: "interrupted",
+        kind: "forward",
+        correlationId: "chain-7",
+      })
+    ).toEqual({ action: "chain", chainId: "chain-7" });
+    // Only a forward with no correlationId at all is unprovable.
+    expect(completionRoute({} as never, { status: "interrupted", kind: "forward" })).toEqual({
+      action: "skip",
+      reason: "delivery-unprovable",
+    });
+  });
+
+  it("STILL reconciles an unrouted done-file whose KIND proves nothing is owed", async () => {
+    // An earlier revision skipped these without reading the ledger, leaving
+    // completed wake/watch/report_back rows `interrupted` so `/seam workflows`
+    // offered a paid rerun of finished work. The kind is what makes it safe:
+    // a wake owes no onward delivery, so terminalizing loses nothing.
     await writeDone("d2", { id: "d2", target: "t", status: "completed", finishedUtc: "x" });
-    const getDelegation = vi.fn(() => ({ status: "interrupted" }));
+    const getDelegation = vi.fn(() => ({ status: "interrupted", kind: "wake" }));
     const summary = await reconcileCompletedDoneFiles({
       dataDir, logger: silent, getDelegation, replay: async () => {},
     });
@@ -649,6 +782,17 @@ describe("#174 boot done-file reconciliation", () => {
 // ---------------------------------------------------------------------------
 // 5. Intake gates (review blockers 1 & 2)
 // ---------------------------------------------------------------------------
+
+/**
+ * An orchestrator shell for the ingress gates, built on the real prototype so
+ * `admissionClosed` is the REAL getter over the REAL `intakeStopped` field —
+ * a hand-set `admissionClosed: true` would let the gate be faked.
+ */
+function makeIngressHost<T>(over: Record<string, unknown>): T {
+  const self = Object.create(Orchestrator.prototype) as Record<string, unknown>;
+  Object.assign(self, { logger: silent, intakeStopped: true, ...over });
+  return self as unknown as T;
+}
 
 describe("#174 admission gates", () => {
   it("refuses a message that arrives after the phase-1 snapshot, without touching the store", async () => {
@@ -766,6 +910,114 @@ describe("#174 admission gates", () => {
     await make(false).cmdSteer(interaction);
     expect(abortTurn).toHaveBeenCalledOnce();
     expect(queueOnChannel).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * Every OTHER Discord ingress. These do not open turns, which is why an
+   * earlier revision left them open — but they do store-backed work that no
+   * drain tracks, and `adapter.stop()` closes the gateway WITHOUT awaiting
+   * handlers already running. So a handler admitted after the snapshot can
+   * still be mid-await when `store.close()` lands.
+   */
+  it("refuses a slash command before it can touch the store", async () => {
+    const reply = vi.fn(async () => {});
+    const self = makeIngressHost<{ handleSlashInteraction(i: unknown): Promise<void> }>({
+      store: new Proxy({}, { get() { throw new Error("store touched by a refused slash"); } }),
+    });
+
+    await self.handleSlashInteraction({
+      user: { id: "u1" },
+      reply,
+      // Any read of these would mean the gate ran too late.
+      options: {
+        getSubcommand: () => {
+          throw new Error("parsed the command after intake closed");
+        },
+        getSubcommandGroup: () => {
+          throw new Error("parsed the command after intake closed");
+        },
+      },
+    });
+    expect(String(reply.mock.calls[0]![0].content)).toMatch(/Restarting/i);
+    expect(String(reply.mock.calls[0]![0].content)).toMatch(/again/i);
+  });
+
+  it("answers autocomplete with an empty list instead of reading the store", async () => {
+    const respond = vi.fn(async () => {});
+    const lookup = vi.fn(() => undefined);
+    // NOT a throwing stub: `safeAutocompleteRespond` catches and answers []
+    // anyway, so a throw here would pass with or without the gate. The real
+    // assertion is that the responder is never even looked up.
+    const self = makeIngressHost<{ handleAutocompleteInteraction(i: unknown): Promise<void> }>({
+      autocomplete: { get: lookup },
+    });
+
+    await self.handleAutocompleteInteraction({
+      respond,
+      options: {
+        getSubcommandGroup: () => null,
+        getSubcommand: () => null,
+        getFocused: () => ({ name: "x", value: "" }),
+      },
+    });
+    expect(respond).toHaveBeenCalledWith([]);
+    expect(lookup).not.toHaveBeenCalled(); // never reached the store-backed path
+  });
+
+  it("refuses a component click without dispatching to any handler", () => {
+    const replyEphemeral = vi.fn(async () => {});
+    const onComponent = vi.fn();
+    const self = makeIngressHost<{ install(): void }>({
+      adapter: { onMessage: () => {}, onComponent, setActiveChannelCheck: () => {} },
+      store: {},
+      watchSentinel: () => {},
+      // Any of these running would mean the wrapper gate did not short-circuit.
+      handleConfigEditorComponent: () => {
+        throw new Error("dispatched a component after intake closed");
+      },
+    });
+
+    self.install();
+    const wrapper = onComponent.mock.calls[0]![0] as (e: unknown) => void;
+    wrapper({ customId: "cfg:x", replyEphemeral });
+    expect(replyEphemeral).toHaveBeenCalledOnce();
+    expect(String(replyEphemeral.mock.calls[0]![0])).toMatch(/Restarting/i);
+  });
+
+  it("refuses a choice-card click without recording it", async () => {
+    const replyEphemeral = vi.fn(async () => {});
+    const onChoiceInteraction = vi.fn();
+    const self = makeIngressHost<{ install(): void }>({
+      adapter: {
+        onMessage: () => {},
+        onChoiceInteraction,
+        setActiveChannelCheck: () => {},
+      },
+      store: {},
+      watchSentinel: () => {},
+      handleChoiceCardInteraction: () => {
+        throw new Error("handled a choice click after intake closed");
+      },
+    });
+
+    self.install();
+    const wrapper = onChoiceInteraction.mock.calls[0]![0] as (e: unknown) => Promise<void>;
+    await wrapper({ customId: "choice:x:0", replyEphemeral });
+    expect(replyEphemeral).toHaveBeenCalledOnce();
+    // Honest wording: the click was NOT recorded, so the user must click again.
+    expect(String(replyEphemeral.mock.calls[0]![0])).toMatch(/Restarting/i);
+    expect(String(replyEphemeral.mock.calls[0]![0])).toMatch(/again/i);
+  });
+
+  it("defers thread-delete cleanup rather than writing during shutdown", async () => {
+    const listScheduledByChannel = vi.fn(() => [{ id: "s1" }]);
+    const self = makeIngressHost<{ handleThreadDeleted(ref: string): Promise<void> }>({
+      store: { listScheduledByChannel },
+    });
+
+    await self.handleThreadDeleted("t-gone");
+    // Lazy fallback owns it: a fire against a deleted thread 404s and drops it.
+    expect(listScheduledByChannel).not.toHaveBeenCalled();
   });
 
   it("stopIntake does NOT stop the scheduled manager (preserves the cron-drain fix)", () => {
@@ -968,9 +1220,9 @@ describe("#174 tick pre-claim race", () => {
 // 7. Unrouted completions (review blocker 3)
 // ---------------------------------------------------------------------------
 
-describe("#174 unrouted completions are still reconciled", () => {
-  it.each(["wake", "watch", "report_back", "handoff-without-returnTo"])(
-    "terminalizes a completed %s done-file with no onward routing",
+describe("#174 an unrouted completion is judged by its KIND", () => {
+  it.each(["wake", "watch", "report_back", "scheduled", "peek", "parked", "choice"])(
+    "terminalizes a completed %s done-file that owes nothing onward",
     async (kind) => {
       await writeDone(`u-${kind}`, {
         id: `u-${kind}`,
@@ -978,17 +1230,18 @@ describe("#174 unrouted completions are still reconciled", () => {
         status: "completed",
         output: "finished",
         finishedUtc: "2026-09-03T00:00:00.000Z",
+        kind,
         // deliberately no returnTo / chainId
       });
       const replay = vi.fn(async () => {});
       const summary = await reconcileCompletedDoneFiles({
         dataDir,
         logger: silent,
-        getDelegation: () => ({ status: "interrupted" }),
+        getDelegation: () => ({ status: "interrupted", kind }),
         replay,
       });
       expect(summary.reconciled).toBe(1);
-      expect(replay).toHaveBeenCalledOnce();
+      expect(replay.mock.calls[0]![1]).toEqual({ action: "terminalize" });
     }
   );
 
@@ -997,27 +1250,111 @@ describe("#174 unrouted completions are still reconciled", () => {
     ledger.rows.set("u1", { id: "u1", kind: "wake", status: "running" });
     const advanceChain = vi.fn(async () => {});
     const host = makeReplayHost(ledger, { advanceChain });
-    await host.replayCompletedDispatch({
-      id: "u1",
-      target: "t",
-      status: "completed",
-      output: "already done",
-    });
+    await replayVia(
+      host,
+      { id: "u1", target: "t", status: "completed", output: "already done", kind: "wake" },
+      { status: "running", kind: "wake" }
+    );
     expect(ledger.rows.get("u1")!.status).toBe("completed");
     expect(advanceChain).not.toHaveBeenCalled();
     expect(await pendingReportBacks()).toHaveLength(0); // nothing to deliver
   });
-
-  it("routing decides WHAT replay does, never WHETHER it is owed", () => {
-    expect(needsCompletionReplay({}, { status: "interrupted" })).toBe(true);
-    expect(needsCompletionReplay({}, { status: "running" })).toBe(true);
-    expect(needsCompletionReplay({}, { status: "completed" })).toBe(false);
-  });
 });
 
 // ---------------------------------------------------------------------------
-// 8. Honest recovery contract after a bounded timeout (QA note)
+// 7b. `returnTo` is not a delivery address on every kind (ROOT-LATEST-8)
 // ---------------------------------------------------------------------------
+
+describe("#174 replay matches the LIVE dispatch contract, not just the fields", () => {
+  /**
+   * `dispatchCompact` reads `spec.returnTo` as the ACTOR — the thread that
+   * asked for the compaction — and posts its own result card. It is an
+   * early-return branch of `dispatchInjectTurn` and never touches the generic
+   * report-back path. A replay that inferred "returnTo ⇒ report-back" would
+   * invent a delivery the live path never performs, into a thread that only
+   * ever ASKED for the work.
+   */
+  it("a compact completion does NOT enqueue a report-back to its actor", async () => {
+    const ledger = makeLedger();
+    ledger.rows.set("c1", { id: "c1", kind: "compact", status: "running" });
+    const host = makeReplayHost(ledger);
+    const result = {
+      id: "c1",
+      target: "thread-target",
+      status: "completed",
+      output: "compacted",
+      kind: "compact",
+      returnTo: "thread-actor", // the ACTOR, not a report-back address
+    };
+
+    expect(completionRoute(result as never, { status: "running", kind: "compact" })).toEqual({
+      action: "terminalize",
+    });
+    await replayVia(host, result, { status: "running", kind: "compact" });
+
+    expect(await pendingReportBacks()).toHaveLength(0); // the whole point
+    expect(ledger.rows.get("c1")!.status).toBe("completed"); // still repaired
+  });
+
+  it.each(["ingest", "thread_voice"])(
+    "a %s completion delivers its own result and owes nothing onward",
+    async (kind) => {
+      const route = completionRoute(
+        { kind, returnTo: "somewhere" } as never,
+        { status: "interrupted", kind }
+      );
+      expect(route).toEqual({ action: "terminalize" });
+    }
+  );
+
+  it("a LEGACY handoff with no routing is left alone, not silently terminalized", async () => {
+    // Written before #174 carried routing: it cannot prove its report-back was
+    // ever enqueued. Terminalizing would strand the answer permanently and
+    // silently; leaving it non-terminal is merely a rerun offer, which is the
+    // pre-existing behaviour and recoverable.
+    await writeDone("legacy-h", {
+      id: "legacy-h",
+      target: "t",
+      status: "completed",
+      output: "the answer",
+      finishedUtc: "x",
+      // no kind, no returnTo, no chainId — a pre-#174 file
+    });
+    const replay = vi.fn(async () => {});
+    const summary = await reconcileCompletedDoneFiles({
+      dataDir,
+      logger: silent,
+      getDelegation: () => ({ status: "interrupted", kind: "handoff" }),
+      replay,
+    });
+    expect(replay).not.toHaveBeenCalled();
+    expect(summary.reconciled).toBe(0);
+    expect(summary.skippedUnprovable).toBe(1);
+  });
+
+  it("a forward WITH a correlationId is provable; without one it is not", () => {
+    expect(
+      completionRoute({ kind: "forward" } as never, {
+        status: "interrupted",
+        kind: "forward",
+        correlationId: "chain-9",
+      })
+    ).toEqual({ action: "chain", chainId: "chain-9" });
+    expect(
+      completionRoute({ kind: "forward" } as never, { status: "interrupted", kind: "forward" })
+    ).toEqual({ action: "skip", reason: "delivery-unprovable" });
+  });
+
+  it("routing decides WHAT replay does — and, when unprovable, WHETHER", () => {
+    // The earlier blanket rule ("a done-file always proves completion") was
+    // right for kinds that owe nothing and wrong for a handoff that may still
+    // owe a delivery.
+    expect(needsCompletionReplay({ kind: "wake" }, { status: "interrupted" })).toBe(true);
+    expect(needsCompletionReplay({ returnTo: "p" }, { status: "running" })).toBe(true);
+    expect(needsCompletionReplay({ kind: "wake" }, { status: "completed" })).toBe(false);
+    expect(needsCompletionReplay({ kind: "handoff" }, { status: "interrupted" })).toBe(false);
+  });
+});
 
 describe("#174 recovery contract is bounded and honest", () => {
   it("only done-file-backed completion is recoverable after a drain timeout", async () => {
@@ -1142,7 +1479,7 @@ describe("#174 real shutdown sequence keeps adapter and store live", () => {
       onDispatch: async () => {
         await turnGate.promise; // still running when shutdown begins
         // Completion does DB-first report-back work + an adapter post.
-        await replayHost.replayCompletedDispatch({
+        await replayVia(replayHost, {
           id: "w-live",
           target: "worker",
           status: "completed",
@@ -1253,7 +1590,7 @@ describe("#174 post-dispose drain covers an ISOLATED dispatch", () => {
         try {
           await kill.promise;
           await completion.promise;
-          await replayHost.replayCompletedDispatch({
+          await replayVia(replayHost, {
             id: "w-iso",
             target: "worker",
             status: "completed",
@@ -1318,6 +1655,88 @@ describe("#174 post-dispose drain covers an ISOLATED dispatch", () => {
     await flush();
     expect(store.violations).toEqual([]);
     expect(adapter.violations).toEqual([]);
+  });
+
+  it("NEGATIVE CONTROL: a phase 2 without the watcher drain closes onto live work", async () => {
+    // Same scenario, but phase 2 is the OLD barrier — channel queues and
+    // continuations only. Proves this test can detect the regression it guards
+    // rather than relying on the mutation harness to notice.
+    const store = makeClosableStore();
+    const adapter = makeStoppableAdapter();
+    store.rows.set("w-iso2", { id: "w-iso2", kind: "handoff", status: "running" });
+
+    const kill = deferred();
+    const host = makeQuiesceHost();
+    const replayHost = makeReplayHost(store as never);
+
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async () => {
+        const endTurn = host.beginTurn();
+        try {
+          await kill.promise;
+          // Disposal released the agent; the DB-first completion runs now, and
+          // it spans real I/O the way the live path does.
+          await new Promise((r) => setTimeout(r, 5));
+          await replayVia(replayHost, {
+            id: "w-iso2",
+            target: "worker",
+            status: "completed",
+            output: "THE ANSWER",
+            correlationId: "corr-iso2",
+            returnTo: "parent",
+          });
+          return { output: "THE ANSWER", stopReason: "end_turn" };
+        } finally {
+          endTurn();
+        }
+      },
+    });
+    await dropSpec({
+      id: "w-iso2",
+      target: "worker",
+      kind: "handoff",
+      session: "isolated",
+      returnTo: "parent",
+      correlationId: "corr-iso2",
+    });
+    void watcher.start();
+    await vi.waitFor(() => expect(watcher.inFlightCount).toBe(1));
+    host.dispatchWatcher = watcher;
+
+    await host.quiesce({ timeoutMs: 100 }); // phase 1 times out on the wedged turn
+    kill.resolve(); // router.disposeAll() releases it
+
+    // The rejected phase-2 design: no watcher drain, no turn barrier.
+    const narrow = (
+      host as unknown as {
+        runBoundedDrain(
+          phase: string,
+          ms: number,
+          barrier: (onErr: (e: unknown) => void) => Promise<void>
+        ): Promise<{ timedOut: boolean }>;
+      }
+    ).runBoundedDrain.bind(host);
+    await narrow("post-dispose", 5000, async () => {
+      await Promise.allSettled([...host.channelQueues.values()]);
+      await host.settleTrackedContinuations();
+    });
+
+    await adapter.stop();
+    store.close();
+    await flush();
+
+    // It returned while the dispatch was still completing, so the completion
+    // landed on a closed store — the original #174 failure, one phase later.
+    expect(store.violations.length).toBeGreaterThan(0);
+    // And the damage is worse than a missing side effect: the store error
+    // propagates out of the completion, so the watcher records the dispatch as
+    // FAILED even though the agent had produced the answer.
+    const done = JSON.parse(await readFile(path.join(dirs.done, "w-iso2.json"), "utf8"));
+    expect(done.status).toBe("failed");
+    expect(done.output).toBeUndefined();
+    expect(await pendingReportBacks()).toHaveLength(0); // nothing delivered
   });
 
   it("phase 2 also holds for an isolated turn with no watcher entry at all", async () => {

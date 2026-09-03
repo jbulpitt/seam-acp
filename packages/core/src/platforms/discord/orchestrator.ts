@@ -67,6 +67,7 @@ import {
   restartSeamAcpProcess,
   restartSentinelPath,
   sentinelIsForce,
+  stageRestartSentinel,
   waitForRestartDrain,
 } from "../../core/restart-sentinel.js";
 import {
@@ -297,6 +298,7 @@ const VOICE_CONSOLE_DURABLE_ACTIONS: ReadonlySet<string> = new Set([
 ]);
 import type { SessionStore } from "../../core/session-store.js";
 import { makeSessionId } from "../../core/session-store.js";
+import type { InboundAdmission } from "../../core/inbound-admission/types.js";
 import { SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
 import {
   FAST_MODE_COST_WARNING,
@@ -504,6 +506,36 @@ const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
 
+export type ChannelQueueState = "idle" | "runtime_busy" | "queued" | "wedged";
+
+export interface ChannelQueueHealth {
+  state: ChannelQueueState;
+  epoch: number;
+  queued: number;
+  ageMs: number;
+  runtimeBusy: boolean;
+}
+
+interface ChannelQueueFence {
+  channelId: string;
+  epoch: number;
+}
+
+interface ChannelQueueMeta {
+  epoch: number;
+  queued: number;
+  admittedAtMs: number;
+  lastProgressAtMs: number;
+  runtimeIdleSinceMs?: number;
+}
+
+export class ChannelQueueFencedError extends Error {
+  constructor(readonly channelId: string, readonly epoch: number) {
+    super(`channel queue ${channelId} epoch ${epoch} was fenced`);
+    this.name = "ChannelQueueFencedError";
+  }
+}
+
 /**
  * Default ceiling for the pre-close quiesce barrier (#174). Long enough for a
  * report-back enqueue and a card repaint to land, short enough that a wedged
@@ -650,6 +682,10 @@ export class Orchestrator {
   private readonly pendingContinuations = new Set<Promise<void>>();
   private readonly channelQueues = new Map<string, Promise<void>>();
   private readonly channelGenerations = new Map<string, number>();
+  /** Recovery replaces a channel tail by advancing this epoch. Every old
+   * callback/output path checks its captured epoch before observable work. */
+  private channelQueueEpochs = new Map<string, number>();
+  private channelQueueMeta = new Map<string, ChannelQueueMeta>();
   /** Per-session timers that settle a woken "Working" card back to "Monitoring"
    *  after background activity goes quiet. Display-only; cleared when a new turn
    *  takes over the session's status card. */
@@ -1044,13 +1080,34 @@ export class Orchestrator {
             } catch {
               /* mock routers */
             }
+            const queue = this.inspectChannelQueue(s.channelRef);
             const busy =
-              typeof this.router.isBusy === "function" && this.router.isBusy(s.id)
-                ? "busy"
-                : "idle";
+              queue.state === "idle"
+                ? "idle"
+                : queue.state === "runtime_busy"
+                  ? "busy"
+                  : queue.state;
             return {
               name: `${s.channelRef} · ${agent} · ${busy}`,
               value: s.channelRef,
+            };
+          }),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+    this.autocomplete.register(null, "recover", "thread", (ctx) => {
+      try {
+        const parent = ctx.projectScopeId ?? ctx.parentId;
+        if (!parent) return [];
+        return labeledAutocompleteChoices(
+          this.store.listSessionsByParent(PLATFORM, parent).map((record) => {
+            const health = this.inspectChannelQueue(record.channelRef);
+            return {
+              name: `${record.channelRef} · ${health.state} · epoch ${health.epoch}`,
+              value: record.channelRef,
             };
           }),
           ctx.focusedValue
@@ -1410,9 +1467,85 @@ export class Orchestrator {
     return this.activeTurns + this.inboundWork.size;
   }
 
-  /** True when this thread has a turn in `channelQueues` (#89 busy gate). */
+  /** True when this thread has admitted work, including a tail whose runtime
+   * has gone idle while its renderer/finalizer remains wedged (#180). */
   isChannelBusy(channelRef: string): boolean {
-    return this.channelQueues.has(channelRef);
+    if (this.channelQueues.has(channelRef)) return true;
+    const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
+    return listInbound ? listInbound.call(this.store, channelRef).length > 0 : false;
+  }
+
+  private queueEpoch(channelRef: string): number {
+    this.channelQueueEpochs ??= new Map<string, number>();
+    return this.channelQueueEpochs.get(channelRef) ?? 0;
+  }
+
+  private queueFenceCurrent(fence: ChannelQueueFence | undefined): boolean {
+    return !fence || this.queueEpoch(fence.channelId) === fence.epoch;
+  }
+
+  private assertQueueFence(fence: ChannelQueueFence | undefined): void {
+    if (fence && !this.queueFenceCurrent(fence)) {
+      throw new ChannelQueueFencedError(fence.channelId, fence.epoch);
+    }
+  }
+
+  /** Read-only truth used by MCP status, cancel copy, and admin recovery. */
+  inspectChannelQueue(channelRef: string, nowMs = Date.now()): ChannelQueueHealth {
+    this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
+    const record = this.store.getByChannel(PLATFORM, channelRef);
+    const runtimeBusy = record ? this.router.isBusy(record.id) : false;
+    const meta = this.channelQueueMeta.get(channelRef);
+    const listInbound = (this.store as Partial<SessionStore>).listInboundNonterminal;
+    const durable = listInbound ? listInbound.call(this.store, channelRef) : [];
+    if (!meta && !runtimeBusy && durable.length === 0) {
+      return {
+        state: "idle",
+        epoch: this.queueEpoch(channelRef),
+        queued: 0,
+        ageMs: 0,
+        runtimeBusy: false,
+      };
+    }
+    if (meta) {
+      if (runtimeBusy) meta.runtimeIdleSinceMs = undefined;
+      else meta.runtimeIdleSinceMs ??= nowMs;
+    }
+    const durableSince = durable.length > 0 ? Date.parse(durable[0]!.updatedUtc) : Number.NaN;
+    const ageMs = meta?.runtimeIdleSinceMs !== undefined
+      ? Math.max(0, nowMs - meta.runtimeIdleSinceMs)
+      : Number.isFinite(durableSince)
+        ? Math.max(0, nowMs - durableSince)
+        : 0;
+    const graceMs = (this.config.CHANNEL_QUEUE_WEDGE_GRACE_SECONDS ?? 30) * 1000;
+    const state: ChannelQueueState = runtimeBusy
+      ? "runtime_busy"
+      : (meta || durable.length > 0) && ageMs >= graceMs
+        ? "wedged"
+        : "queued";
+    return {
+      state,
+      epoch: meta?.epoch ?? this.queueEpoch(channelRef),
+      queued: Math.max(meta?.queued ?? 0, durable.length),
+      ageMs,
+      runtimeBusy,
+    };
+  }
+
+  /** Detach the abandoned tail immediately. Old promises remain tracked by
+   * #174's turn/continuation sets, but can no longer mutate this generation. */
+  private advanceChannelQueueEpoch(channelRef: string): number {
+    this.channelQueueEpochs ??= new Map<string, number>();
+    this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
+    const next = this.queueEpoch(channelRef) + 1;
+    this.channelQueueEpochs.set(channelRef, next);
+    this.channelQueues.delete(channelRef);
+    this.channelQueueMeta.delete(channelRef);
+    this.channelGenerations.set(
+      channelRef,
+      (this.channelGenerations.get(channelRef) ?? 0) + 1
+    );
+    return next;
   }
 
   isRestartPending(): boolean {
@@ -1586,6 +1719,43 @@ export class Orchestrator {
       );
     }
 
+    // Make a real Discord prompt durable BEFORE it waits on an in-memory tail.
+    // Synthetic turns intentionally have no messageId and keep using their
+    // existing durable owner (dispatch/wake/schedule/parked).
+    let admissionId: string | undefined;
+    let record: SessionRecord | undefined;
+    if (msg.messageId && !this.wouldParkForOfflineBridge(msg)) {
+      if (!/^\d+$/.test(msg.messageId)) {
+        throw new Error("invalid Discord message id");
+      }
+      record = this.router.ensureSessionRecord({
+        platform: msg.channel.platform,
+        channelRef: channelId,
+        ...(msg.channel.parentId ? { parentRef: msg.channel.parentId } : {}),
+        cwd: this.config.REPOS_ROOT,
+      });
+      const admitted = this.store.admitInbound({
+        messageId: msg.messageId,
+        platform: msg.channel.platform,
+        channelRef: channelId,
+        parentRef: msg.channel.parentId ?? null,
+        sessionRecordId: record.id,
+        authorId: msg.authorId,
+        authorName: msg.authorName ?? null,
+        text: msg.text,
+        attachments: msg.attachments ?? [],
+        createdUtc: new Date().toISOString(),
+      });
+      if (!admitted) {
+        this.logger.info(
+          { channelId, messageId: msg.messageId },
+          "duplicate inbound message ignored"
+        );
+        return;
+      }
+      admissionId = msg.messageId;
+    }
+
     // Bump the generation so any previously-queued (but not-yet-started) tasks
     // for this channel know they've been superseded and should skip themselves.
     const myGen = (this.channelGenerations.get(channelId) ?? 0) + 1;
@@ -1593,7 +1763,7 @@ export class Orchestrator {
 
     if (this.channelQueues.has(channelId)) {
       const channel = msg.channel;
-      const record = this.router.ensureSessionRecord({
+      record ??= this.router.ensureSessionRecord({
         platform: channel.platform,
         channelRef: channel.id,
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
@@ -1614,25 +1784,27 @@ export class Orchestrator {
     // this message replaces it. Does not hold the Discord turn open.
     if (await this.tryParkForOfflineBridge(msg)) return;
 
-    const existingQueue = this.channelQueues.get(channelId) ?? Promise.resolve();
-
-    const newQueue = existingQueue.then(async () => {
+    await this.queueOnChannel(channelId, async (fence) => {
       // A newer message arrived after us — skip this turn entirely.
       if ((this.channelGenerations.get(channelId) ?? 0) > myGen) return;
-      const endTurn = this.beginTurn();
+      if (
+        admissionId &&
+        !this.store.claimInbound(admissionId, fence.epoch, new Date().toISOString())
+      ) {
+        return;
+      }
       try {
-        await this.handleIncomingMessageInner(msg);
+        await this.handleIncomingMessageInner(msg, fence);
       } catch (err) {
-        this.logger.error({ err, channelId }, "error in handleIncomingMessageInner");
+        if (!(err instanceof ChannelQueueFencedError)) {
+          this.logger.error({ err, channelId }, "error in handleIncomingMessageInner");
+        }
       } finally {
-        endTurn();
+        if (admissionId && this.queueFenceCurrent(fence)) {
+          this.store.completeInbound(admissionId, fence.epoch, new Date().toISOString());
+        }
       }
     });
-
-    this.channelQueues.set(channelId, newQueue);
-    this.releaseChannelQueue(channelId, newQueue);
-
-    await newQueue;
   }
 
   /**
@@ -1675,19 +1847,43 @@ export class Orchestrator {
    * the restart drain's fifteen minutes, with the store fully alive; refusing
    * `/seam cancel` there takes away the only lever that ends a wedged turn.
    */
-  private queueOnChannel<T>(channelId: string, task: () => Promise<T>): Promise<T> {
-    const existing = this.channelQueues.get(channelId) ?? Promise.resolve();
+  private queueOnChannel<T>(
+    channelId: string,
+    task: (fence: ChannelQueueFence) => Promise<T>
+  ): Promise<T> {
+    this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
+    const epoch = this.queueEpoch(channelId);
+    const existingMeta = this.channelQueueMeta.get(channelId);
+    const existing =
+      !existingMeta || existingMeta.epoch === epoch
+        ? this.channelQueues.get(channelId) ?? Promise.resolve()
+        : Promise.resolve();
+    const now = Date.now();
+    const meta: ChannelQueueMeta =
+      existingMeta?.epoch === epoch
+        ? { ...existingMeta, queued: existingMeta.queued + 1 }
+        : { epoch, queued: 1, admittedAtMs: now, lastProgressAtMs: now };
+    this.channelQueueMeta.set(channelId, meta);
+    const fence = { channelId, epoch };
     const result = existing.then(async () => {
+      this.assertQueueFence(fence);
+      const activeMeta = this.channelQueueMeta.get(channelId);
+      if (activeMeta?.epoch === epoch) {
+        activeMeta.lastProgressAtMs = Date.now();
+        activeMeta.runtimeIdleSinceMs = undefined;
+      }
       // Counted for the restart drain, and awaited by the shutdown barrier.
       const endTurn = this.beginTurn();
       try {
         const timeoutMs = turnWatchdogTimeoutMs(
           this.config.TURN_TIMEOUT_SECONDS ?? 900
         );
-        return await settleWithTurnWatchdog(task, {
+        const value = await settleWithTurnWatchdog(() => task(fence), {
           timeoutMs,
           label: `channel turn ${channelId}`,
         });
+        this.assertQueueFence(fence);
+        return value;
       } catch (err) {
         if (err instanceof TurnWatchdogTimeoutError) {
           this.logger.error(
@@ -1698,6 +1894,11 @@ export class Orchestrator {
         }
         throw err;
       } finally {
+        const currentMeta = this.channelQueueMeta.get(channelId);
+        if (currentMeta?.epoch === epoch) {
+          currentMeta.queued = Math.max(0, currentMeta.queued - 1);
+          currentMeta.lastProgressAtMs = Date.now();
+        }
         endTurn();
       }
     });
@@ -1711,6 +1912,121 @@ export class Orchestrator {
     this.channelQueues.set(channelId, link);
     this.releaseChannelQueue(channelId, link);
     return result;
+  }
+
+  private inboundMessage(row: InboundAdmission): IncomingMessage {
+    return {
+      messageId: row.messageId,
+      channel: {
+        platform: row.platform,
+        id: row.channelRef,
+        ...(row.parentRef ? { parentId: row.parentRef } : {}),
+      },
+      authorId: row.authorId,
+      ...(row.authorName ? { authorName: row.authorName } : {}),
+      authorIsBot: false,
+      text: row.text,
+      ...(row.attachments.length > 0 ? { attachments: row.attachments } : {}),
+    };
+  }
+
+  /** Enqueue an already-durable row without passing back through duplicate
+   * admission. Used at boot and by localized recovery. */
+  private startRecoveredInbound(row: InboundAdmission): void {
+    const myGen = (this.channelGenerations.get(row.channelRef) ?? 0) + 1;
+    this.channelGenerations.set(row.channelRef, myGen);
+    const msg = this.inboundMessage(row);
+    void this.queueOnChannel(row.channelRef, async (fence) => {
+      if ((this.channelGenerations.get(row.channelRef) ?? 0) > myGen) return;
+      if (!this.store.claimInbound(row.messageId, fence.epoch, new Date().toISOString())) return;
+      try {
+        await this.handleIncomingMessageInner(msg, fence);
+      } finally {
+        if (this.queueFenceCurrent(fence)) {
+          this.store.completeInbound(row.messageId, fence.epoch, new Date().toISOString());
+        }
+      }
+    }).catch((err) => {
+      if (!(err instanceof ChannelQueueFencedError)) {
+        this.logger.error(
+          { err, channelRef: row.channelRef, messageId: row.messageId },
+          "recovered inbound turn failed"
+        );
+      }
+    });
+  }
+
+  /**
+   * Fence and repair exactly one thread. Auto mode only acts on a proven
+   * runtime-idle wedge; force is the explicit operator override.
+   */
+  async recoverChannel(
+    channelRef: string,
+    mode: "auto" | "force",
+    actor?: { id: string; name: string }
+  ): Promise<{ ok: boolean; message: string; before: ChannelQueueHealth; epoch: number }> {
+    const before = this.inspectChannelQueue(channelRef);
+    const currentEpoch = this.queueEpoch(channelRef);
+    if (mode === "auto" && before.state !== "wedged") {
+      return {
+        ok: false,
+        before,
+        epoch: currentEpoch,
+        message:
+          before.state === "runtime_busy"
+            ? "Refused: this thread has a healthy active runtime. Use force only after verifying it is stuck."
+            : before.state === "queued"
+              ? "Refused: queued work is still inside the recovery grace period."
+              : "Nothing is queued for this thread.",
+      };
+    }
+
+    const record = this.store.getByChannel(PLATFORM, channelRef);
+    if (!record) {
+      return { ok: false, before, epoch: currentEpoch, message: "No session is bound to that thread." };
+    }
+
+    // Fence first. Any await below may let the abandoned promise wake up, but
+    // it can no longer emit, mutate the session, or terminalize recovered work.
+    const epoch = this.advanceChannelQueueEpoch(channelRef);
+    await this.clearTurnMarkersForChannel(channelRef, "cancelled", {
+      preserveDispatch: true,
+    });
+    await this.router.abortTurn(record.id, { force: true });
+    await this.router.invalidate(record.id, { clearAcpSession: false }).catch(() => {});
+    const dispatches = (await this.dispatchWatcher?.recoverTarget(channelRef)) ?? [];
+    const inbound = this.store.recoverInboundChannel(channelRef, new Date().toISOString());
+    if (inbound) this.startRecoveredInbound(inbound);
+    void this.dispatchWatcher?.tick().catch((err) =>
+      this.logger.warn({ err, channelRef }, "recovered dispatch tick failed")
+    );
+
+    const detail = {
+      mode,
+      channelRef,
+      oldEpoch: currentEpoch,
+      newEpoch: epoch,
+      inboundMessageId: inbound?.messageId ?? null,
+      dispatches,
+      priorState: before.state,
+    };
+    this.store.recordConfigMutation({
+      id: `queue-recovery-${randomUUID()}`,
+      tier: "operator",
+      actorId: actor?.id ?? null,
+      actorName: actor?.name ?? null,
+      scope: `thread:${channelRef}`,
+      summary: `Recovered channel queue (${mode})`,
+      beforeJson: JSON.stringify(before),
+      afterJson: JSON.stringify(detail),
+    });
+    this.logger.warn(detail, "channel queue recovered by operator");
+    return {
+      ok: true,
+      before,
+      epoch,
+      message: `Recovered <#${channelRef}> at queue epoch ${epoch}; ${inbound ? "restarted its durable message" : "no inbound message was pending"}; ${dispatches.length} dispatch artifact(s) re-queued.`,
+    };
   }
 
   /** Best-effort cancellation after the watchdog has already settled the queue. */
@@ -1747,6 +2063,11 @@ export class Orchestrator {
     const settled = link.then(async () => {
       if (this.channelQueues.get(channelId) !== link) return;
       this.channelQueues.delete(channelId);
+      this.channelQueueMeta ??= new Map<string, ChannelQueueMeta>();
+      const meta = this.channelQueueMeta.get(channelId);
+      if (meta && meta.epoch === this.queueEpoch(channelId)) {
+        this.channelQueueMeta.delete(channelId);
+      }
       await this.voiceConsole
         ?.markBindingActivitySettled(channelId)
         .catch((err) =>
@@ -2114,7 +2435,11 @@ export class Orchestrator {
     return state;
   }
 
-  private async handleIncomingMessageInner(msg: IncomingMessage): Promise<void> {
+  private async handleIncomingMessageInner(
+    msg: IncomingMessage,
+    queueFence?: ChannelQueueFence
+  ): Promise<void> {
+    this.assertQueueFence(queueFence);
     // #80 v1: detach is a handleMessage gate only. Schedules / wakes / watches
     // / handoffs / steer synthesize an IncomingMessage and enter HERE, so they
     // still run in a detached thread. Do not treat detach as a full mute.
@@ -2234,9 +2559,11 @@ export class Orchestrator {
       renderStatusPanel(this.renderer, status.toInput(), Date.now()),
       brandAsset
     );
+    this.assertQueueFence(queueFence);
     const statusMsg = this.adapter.sendPanel
       ? await this.adapter.sendPanel(channel, initialPanel)
       : await this.adapter.sendMessage(channel, serializePanelText(initialPanel));
+    this.assertQueueFence(queueFence);
     // Standalone GIF: posted once, never edited (embed edits restart the
     // animation). Deleted on Done/Failed/Timed out. Restart mid-turn may orphan.
     let gifMsg: MessageRef | undefined;
@@ -2254,6 +2581,7 @@ export class Orchestrator {
     let lastRendered = "";
     let pendingRefresh: NodeJS.Timeout | undefined;
     const refresh = async (force = false) => {
+      if (!this.queueFenceCurrent(queueFence)) return;
       const now = Date.now();
       if (!force && now - lastEdit < STATUS_EDIT_DEBOUNCE_MS) {
         if (!pendingRefresh) {
@@ -2302,6 +2630,7 @@ export class Orchestrator {
     let lastTypingSentAt = 0;
     let typingDone = false;
     const refreshTyping = (): void => {
+      if (!this.queueFenceCurrent(queueFence)) return;
       if (typingDone) return;
       const now = Date.now();
       if (now - lastTypingSentAt < TYPING_INTERVAL_MS) return;
@@ -2345,6 +2674,7 @@ export class Orchestrator {
     const HARD_MAX = 1800;
     const SOFT_MIN = 800;
     const drainBufferInner = async (force: boolean, allowUnsafeCut = false) => {
+      this.assertQueueFence(queueFence);
       while (textBuffer) {
         const split = splitForFlush(textBuffer, {
           maxLen: HARD_MAX,
@@ -2355,7 +2685,9 @@ export class Orchestrator {
         if (!split) return;
         textBuffer = split.keep;
         if (split.send) {
+          this.assertQueueFence(queueFence);
           await this.adapter.sendMessage(channel, split.send);
+          this.assertQueueFence(queueFence);
           spokenProse += split.send;
           spokenAfterLastTool += split.send;
           textSent = true;
@@ -2439,6 +2771,7 @@ export class Orchestrator {
     const WHITESPACE_RUN_THRESHOLD = 30;
     let whitespaceRun = 0;
     const noteRetry = async () => {
+      this.assertQueueFence(queueFence);
       if (postedRetryNotice) return;
       postedRetryNotice = true;
       // Flush whatever we already buffered from the failed attempt first.
@@ -2495,6 +2828,7 @@ export class Orchestrator {
 
     try {
       let activeRuntime = await this.router.getOrStartRuntime(record);
+      this.assertQueueFence(queueFence);
       // #37: report what the LIVE session resolved Fast to, never what was
       // requested — the runtime only records `on` once the session accepted it.
       const fastState = describeFastModeOutcome(activeRuntime.getFastModeOutcome());
@@ -2508,6 +2842,7 @@ export class Orchestrator {
         }).catch(() => {});
       }
       const eventHandler = async (event: Parameters<Parameters<typeof activeRuntime.onEvent>[0]>[0]) => {
+        if (!this.queueFenceCurrent(queueFence)) return;
         // Note the agent launching a Monitor so the turn rests at "Monitoring"
         // rather than "Done" even before any woken activity arrives. Anchored to
         // the title start to avoid matching ordinary tools that merely mention
@@ -2997,17 +3332,22 @@ export class Orchestrator {
       //     getOrStartRuntime will wait up to 44s for the bridge to reconnect.
       let result: PromptOutcome | "timeout";
       try {
+        this.assertQueueFence(queueFence);
         result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
+        this.assertQueueFence(queueFence);
       } catch (promptErr) {
+        this.assertQueueFence(queueFence);
         if (isSessionGoneError(promptErr)) {
           this.logger.warn({ session: record.id }, "session-gone on prompt; invalidating and retrying with new session");
           await this.router.invalidate(record.id, { clearAcpSession: true });
+          this.assertQueueFence(queueFence);
           activeRuntime = await this.router.getOrStartRuntime(record);
           activeRuntime.onEvent(eventHandler);
           result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
         } else if (isConnectionClosedError(promptErr)) {
           this.logger.warn({ session: record.id }, "connection closed mid-turn; waiting for reconnect and retrying");
           await this.router.invalidate(record.id, { clearAcpSession: false });
+          this.assertQueueFence(queueFence);
           activeRuntime = await this.router.getOrStartRuntime(record);
           activeRuntime.onEvent(eventHandler);
           result = await raceWithTimeout(activeRuntime.prompt(promptText, promptAttachments), timeoutMs);
@@ -3049,6 +3389,7 @@ export class Orchestrator {
         ]);
       }
 
+      this.assertQueueFence(queueFence);
       cancelFlushTimer();
       // Drain the fence extractor: any final segments enter the chat
       // pipeline; an unclosed fence is emitted with a notice rather
@@ -3247,6 +3588,13 @@ export class Orchestrator {
         }
       }
     } catch (err) {
+      if (!this.queueFenceCurrent(queueFence)) {
+        this.logger.info(
+          { channel: channel.id, epoch: queueFence?.epoch },
+          "discarding late work from fenced channel queue"
+        );
+        return;
+      }
       this.logger.error({ err, session: record.id }, "turn failed");
       cancelFlushTimer();
       await flushChunks();
@@ -3310,6 +3658,19 @@ export class Orchestrator {
       status.setState("Failed");
       status.setAction(this.renderer.trimShort(isSessionGoneError(err) ? "Session lost — please resend your message." : errMsg, 120));
     } finally {
+      if (!this.queueFenceCurrent(queueFence)) {
+        turnFinalized = true;
+        clearInterval(heartbeat);
+        cancelFlushTimer();
+        if (pendingRefresh) clearTimeout(pendingRefresh);
+        if (voiceConsoleSpeech) {
+          await this.voiceConsole?.cancelVisibleTurn(voiceConsoleSpeech).catch(() => {});
+          if (this.voiceConsoleSpeechByChannel.get(channel.id) === voiceConsoleSpeech) {
+            this.voiceConsoleSpeechByChannel.delete(channel.id);
+          }
+        }
+        return;
+      }
       if (voiceConsoleSpeech) {
         await this.voiceConsole?.finishVisibleTurn(voiceConsoleSpeech).catch((err) =>
           this.logger.warn(
@@ -3637,6 +3998,7 @@ export class Orchestrator {
       }
     }
     if (interaction.options.getSubcommandGroup(false) === "bridge") {
+      if (sub === "restart") return this.cmdBridgeRestart(interaction);
       return handleBridgeSlash(interaction, {
         config: this.config,
         mutation: this.configMutation,
@@ -3754,6 +4116,8 @@ export class Orchestrator {
         return this.cmdWorkflows(interaction);
       case "rebuild":
         return this.cmdRebuild(interaction);
+      case "recover":
+        return this.cmdRecover(interaction);
       default:
         await interaction.reply({
           content: `Unknown subcommand: ${sub}`,
@@ -7195,7 +7559,8 @@ export class Orchestrator {
     // config may not carry the zod default.
     const statusPanelOn = this.config.SEAM_DISPATCH_STATUS_PANEL !== false;
 
-    const run = async (): Promise<{ output: string; stopReason: string }> => {
+    const run = async (queueFence?: ChannelQueueFence): Promise<{ output: string; stopReason: string }> => {
+      this.assertQueueFence(queueFence);
       if (spec.kind === "migrate_self") {
         if (!spec.migration || !this.selfMigrationHandler) {
           throw new Error("dispatch: self migration is not wired");
@@ -7270,7 +7635,7 @@ export class Orchestrator {
                     },
                   }
                 : {}),
-            });
+            }, queueFence);
           })()
         : undefined;
 
@@ -7294,8 +7659,9 @@ export class Orchestrator {
       const wantStartIndicator =
         style === "messages" ? !statusPanel : streaming || !statusPanel;
       const panelRef = wantStartIndicator
-        ? await this.postDispatchStartIndicator(target, header, style, spec, showHeader)
+        ? await this.postDispatchStartIndicator(target, header, style, spec, showHeader, queueFence)
         : undefined;
+      this.assertQueueFence(queueFence);
 
       // Streaming renderers. Two shapes, one per output style:
       //  - "messages" (default): route the worker's agent-text through the SAME
@@ -7316,6 +7682,7 @@ export class Orchestrator {
       if (streaming && style === "messages") {
         msgRenderer = new StreamingMessageRenderer(
           async (text) => {
+            if (!this.queueFenceCurrent(queueFence)) return;
             try {
               await this.adapter.sendMessage(target, text);
             } catch (err) {
@@ -7326,6 +7693,7 @@ export class Orchestrator {
             logger: this.logger,
             sendFile: this.adapter.sendFile
               ? async (file) => {
+                  if (!this.queueFenceCurrent(queueFence)) return;
                   try {
                     await this.adapter.sendFile!(target, file);
                   } catch (err) {
@@ -7338,6 +7706,7 @@ export class Orchestrator {
       } else if (streaming && panelRef) {
         const ref = panelRef;
         streamPanel = new StreamingPanel(async (text, done) => {
+          if (!this.queueFenceCurrent(queueFence)) return;
           const panel = this.dispatchStreamPanel({
             header,
             text,
@@ -7397,6 +7766,7 @@ export class Orchestrator {
           // transition. Write the session id now, before prompt(), so a
           // SIGKILL still leaves a pointer on the ledger (#75).
           onSession: (sessionId) => {
+            if (!this.queueFenceCurrent(queueFence)) return;
             try {
               this.store.updateDelegationStatus(spec.id, "running", {
                 acpSessionId: sessionId,
@@ -7417,6 +7787,7 @@ export class Orchestrator {
           ...(msgRenderer || streamPanel || statusPanel || dispatchSpeech
             ? {
                 onEvent: async (event) => {
+                  if (!this.queueFenceCurrent(queueFence)) return;
                   if (event.kind === "agent-text") {
                     if (dispatchSpeech) {
                       this.voiceConsole?.acceptVisibleAgentText(
@@ -7437,11 +7808,14 @@ export class Orchestrator {
           awaitIdle: true,
           logContext: { dispatch: spec.id },
         });
+        this.assertQueueFence(queueFence);
       } finally {
         // The turn is over — no more `schedule_wake` calls can nest under it.
         if (isWake) this.activeWakeDepth.delete(spec.target);
         // No longer interruptible — the turn has ended.
-        if (isLiveDispatch) this.activeLiveDispatch.delete(spec.target);
+        if (isLiveDispatch && this.activeLiveDispatch.get(spec.target) === spec.id) {
+          this.activeLiveDispatch.delete(spec.target);
+        }
         if (isChoice && this.choiceResults) {
           if (result?.text) {
             const harvested = extractSeamResultFromText(result.text);
@@ -7458,7 +7832,12 @@ export class Orchestrator {
             ? (method, params) => liveRuntime.request(method, params)
             : undefined;
         void this.quotaPoller?.turnCompleted(quotaAgentId, quotaRequest);
-        if (dispatchSpeech) {
+        if (dispatchSpeech && !this.queueFenceCurrent(queueFence)) {
+          await this.voiceConsole?.cancelVisibleTurn(dispatchSpeech).catch(() => {});
+          if (this.voiceConsoleSpeechByChannel.get(spec.target) === dispatchSpeech) {
+            this.voiceConsoleSpeechByChannel.delete(spec.target);
+          }
+        } else if (dispatchSpeech) {
           await this.voiceConsole?.finishVisibleTurn(dispatchSpeech).catch((err) =>
             this.logger.warn(
               { err, bindingId: dispatchSpeech.bindingId, dispatch: spec.id },
@@ -7478,6 +7857,7 @@ export class Orchestrator {
           }
         }
       }
+      this.assertQueueFence(queueFence);
       if (!result) throw new Error("dispatch: injectTurn returned no result");
 
       // #67: consume the interrupt flag right after the turn ends (before any)
@@ -7582,7 +7962,8 @@ export class Orchestrator {
 
     // #76: resume starts go through the stagger/concurrency gate so a dozen
     // crash leftovers do not fire simultaneously at boot.
-    const gatedRun = isResume ? () => this.resumeScheduler.run(run) : run;
+    const gatedRun = (queueFence?: ChannelQueueFence) =>
+      isResume ? this.resumeScheduler.run(() => run(queueFence)) : run(queueFence);
 
     if (effectiveSession === "live") {
       // Share the thread's persistent session ⇒ must not overlap a user turn.
@@ -7695,13 +8076,13 @@ export class Orchestrator {
           ...(record.acpSessionId ? { acpSessionId: record.acpSessionId } : {}),
         });
       } catch { /* best effort */ }
-      await this.queueOnChannel(spec.target, async () => {
+      await this.queueOnChannel(spec.target, async (fence) => {
         if (this.quarantinedThreadVoiceDispatches.has(spec.id)) {
           throw new Error("thread_voice dispatch was quarantined while queued");
         }
         this.activeThreadVoiceDispatch.set(spec.target, spec.id);
         try {
-          await this.handleIncomingMessageInner(synthetic);
+          await this.handleIncomingMessageInner(synthetic, fence);
         } finally {
           if (this.activeThreadVoiceDispatch.get(spec.target) === spec.id) {
             this.activeThreadVoiceDispatch.delete(spec.target);
@@ -8587,8 +8968,10 @@ export class Orchestrator {
     header: string,
     style: "messages" | "card",
     spec: DispatchSpec,
-    showHeader = true
+    showHeader = true,
+    queueFence?: ChannelQueueFence
   ): Promise<MessageRef | undefined> {
+    if (!this.queueFenceCurrent(queueFence)) return undefined;
     try {
       if (style === "messages") {
         // When the status panel carries the dispatch type, the streamed answer
@@ -8635,8 +9018,10 @@ export class Orchestrator {
       profile?: AgentProfile;
       isolated: boolean;
       cachedUsage?: { used: number; size: number; model: string };
-    }
+    },
+    queueFence?: ChannelQueueFence
   ): Promise<DispatchStatusPanel<MessageRef> | undefined> {
+    if (!this.queueFenceCurrent(queueFence)) return undefined;
     const repoDisplay = this.repoDisplay(resolved.cwd);
     const modelContextFloor =
       resolved.profile?.staticModels?.find((m) => m.modelId === resolved.model)?.contextLimit
@@ -8697,6 +9082,7 @@ export class Orchestrator {
         // Fall back to sendMessage/editMessage(serializePanelText) ONLY when the
         // adapter lacks sendPanel/editPanel, mirroring the normal path.
         post: async (panel) => {
+          if (!this.queueFenceCurrent(queueFence)) return undefined;
           try {
             const toSend = withBrandAttachment(panel, dispatchBrandAsset);
             return this.adapter.sendPanel
@@ -8708,6 +9094,7 @@ export class Orchestrator {
           }
         },
         edit: async (ref, panel) => {
+          if (!this.queueFenceCurrent(queueFence)) return;
           try {
             if (this.adapter.editPanel) {
               await this.adapter.editPanel(ref, panel);
@@ -8959,13 +9346,13 @@ export class Orchestrator {
         // D2: queue behind user turns / other schedules on this channel; never
         // pre-empt. `queueOnChannel` (not `handleIncomingMessage`) — the latter
         // would bump the generation and abort whatever is running.
-        await this.queueOnChannel(row.channelRef, async () => {
+        await this.queueOnChannel(row.channelRef, async (fence) => {
           // D4: a user message arriving mid-turn bumps this channel's generation
           // and force-aborts our turn. `handleIncomingMessageInner` swallows the
           // cancellation and returns void (D5), so detect the abort by comparing
           // the generation across the turn rather than from a return value.
           const genAtStart = this.channelGenerations.get(row.channelRef) ?? 0;
-          await this.handleIncomingMessageInner(synthetic);
+          await this.handleIncomingMessageInner(synthetic, fence);
           aborted = (this.channelGenerations.get(row.channelRef) ?? 0) > genAtStart;
         });
         // D4: record the abort; do NOT auto-retry (it would fight the user).
@@ -10727,6 +11114,65 @@ export class Orchestrator {
     await this.applyThreadName(this.store.get(record.id) ?? record);
   }
 
+  private async cmdRecover(i: ChatInputCommandInteraction): Promise<void> {
+    if (!this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(i.user.id)) {
+      await i.reply({
+        content: "🔒 `/seamadmin recover` is config-admin-only.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const thread = i.options.getString("thread", true);
+    if (!/^\d+$/.test(thread)) {
+      await i.reply({ content: "Thread must be a Discord thread id.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const mode = i.options.getString("mode") === "force" ? "force" : "auto";
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    const result = await this.recoverChannel(thread, mode, {
+      id: i.user.id,
+      name: this.interactionSpeakerName(i),
+    });
+    await i.editReply(`${result.ok ? "🛠️" : "ℹ️"} ${result.message}`);
+  }
+
+  private async cmdBridgeRestart(i: ChatInputCommandInteraction): Promise<void> {
+    const mode = i.options.getString("mode", true) === "force" ? "force" : "drain";
+    const confirmed = i.options.getBoolean("confirm") === true;
+    if (mode === "force" && !confirmed) {
+      await i.reply({
+        content: "Force restart interrupts every live turn. Run it again with `confirm:true`.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const staged = stageRestartSentinel(this.config.DATA_DIR, mode);
+    if (!staged.staged) {
+      await i.reply({
+        content: "A restart request is already pending; its mode was left unchanged.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    this.store.recordConfigMutation({
+      id: `restart-${randomUUID()}`,
+      tier: "operator",
+      actorId: i.user.id,
+      actorName: this.interactionSpeakerName(i),
+      scope: "bot",
+      summary: `Staged ${mode} restart`,
+      beforeJson: JSON.stringify({ pending: false }),
+      afterJson: JSON.stringify({ pending: true, mode }),
+    });
+    await i.reply({
+      content:
+        mode === "force"
+          ? "♻️ Force restart staged. The sentinel path will preserve interrupted-turn recovery."
+          : "♻️ Drain restart staged. New work intake will close before the #174 drain snapshot.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   /**
    * Cancel this thread's turn (graceful), or escalate via options (#78):
    *   - no opts            → today's cancel (this thread, graceful)
@@ -10753,11 +11199,16 @@ export class Orchestrator {
     // silent no-op on every graceful reboot.
     await this.clearTurnMarkersForChannel(record.channelRef, "cancelled");
     const outcome = await this.router.abortTurn(record.id, { force: false });
+    const queue = this.inspectChannelQueue(record.channelRef);
     await i.editReply(
       outcome === "idle"
         ? parked
           ? this.parkedCancelMessage(parked)
-          : "No active turn."
+          : queue.state === "wedged"
+            ? `No ACP turn is active, but the channel queue is wedged with ${queue.queued} durable item(s). An admin can run \`/seamadmin recover thread:${record.channelRef} mode:auto\`.`
+            : queue.state === "queued"
+              ? `No ACP turn is active, but ${queue.queued} durable item(s) remain queued. Nothing was discarded.`
+              : "No active turn."
         : `🟡 Cancel sent. If the turn doesn't stop shortly, use \`/seam cancel force:true\` to force it.${
             parked ? " Also cancelled the queued prompt." : ""
           }`
@@ -10780,8 +11231,15 @@ export class Orchestrator {
     );
     if (!this.router.hasRuntime(record.id)) {
       const parked = await this.clearParkedForChannel(record.channelRef);
+      const queue = this.inspectChannelQueue(record.channelRef);
       await i.reply({
-        content: parked ? this.parkedCancelMessage(parked) : "No active turn.",
+        content: parked
+          ? this.parkedCancelMessage(parked)
+          : queue.state === "wedged"
+            ? `No ACP runtime is active, but the channel queue is wedged with ${queue.queued} durable item(s). Force-cancel cannot discard them; use \`/seamadmin recover thread:${record.channelRef} mode:auto\`.`
+            : queue.state === "queued"
+              ? `No ACP runtime is active; ${queue.queued} durable item(s) remain queued.`
+              : "No active turn.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -10844,7 +11302,8 @@ export class Orchestrator {
    */
   private async clearTurnMarkersForChannel(
     channelRef: string,
-    status: "cancelled"
+    status: "cancelled",
+    opts?: { preserveDispatch?: boolean }
   ): Promise<void> {
     const now = new Date().toISOString();
     const liveId = this.liveTurnByChannel.get(channelRef);
@@ -10862,9 +11321,17 @@ export class Orchestrator {
         this.logger.warn({ err, id: m.id }, "live-turn marker cancel failed")
       );
     }
-    await this.dispatchWatcher?.cancelRunning({ target: channelRef }).catch((err) =>
-      this.logger.warn({ err, channelRef }, "dispatch cancelRunning failed")
-    );
+    if (!opts?.preserveDispatch) {
+      const activeDispatchId = this.activeLiveDispatch.get(channelRef);
+      // Always make the watcher call so marker finalization ordering stays
+      // observable/testable, but use an impossible exact id when no dispatch is
+      // active. Pending recovery artifacts are never selected by target.
+      await this.dispatchWatcher
+        ?.cancelRunning({ id: activeDispatchId ?? "__no-active-dispatch__" })
+        .catch((err) =>
+          this.logger.warn({ err, channelRef, activeDispatchId }, "dispatch cancelRunning failed")
+        );
+    }
   }
 
   /** `/seam cancel scope:all` — finalize every live marker and running spec. */
@@ -10969,9 +11436,9 @@ export class Orchestrator {
     };
     this.pendingLiveResume.set(marker.channelRef, marker);
     try {
-      await this.queueOnChannel(marker.channelRef, async () => {
+      await this.queueOnChannel(marker.channelRef, async (fence) => {
         const genAtStart = this.channelGenerations.get(marker.channelRef) ?? 0;
-        await this.handleIncomingMessageInner(synthetic);
+        await this.handleIncomingMessageInner(synthetic, fence);
         const aborted =
           (this.channelGenerations.get(marker.channelRef) ?? 0) > genAtStart;
         if (aborted) {
@@ -10998,6 +11465,33 @@ export class Orchestrator {
     const maxAge =
       this.config.SEAM_TURN_RESUME_MAX_AGE_SECONDS ?? TURN_RESUME_MAX_AGE_SECONDS;
     const now = new Date();
+
+    // #180: the durable Discord-message ledger owns any prompt that had not
+    // reached a terminal state. Reconcile it before #76 markers so one crash
+    // cannot schedule both an original-prompt replay and a `continue` replay.
+    const recoverAllInbound = (this.store as Partial<SessionStore>).recoverAllInbound;
+    const recoveredInbound = recoverAllInbound
+      ? recoverAllInbound.call(this.store, now.toISOString())
+      : [];
+    if (recoveredInbound.length > 0) {
+      const channels = new Set(recoveredInbound.map((row) => row.channelRef));
+      const existingMarkers = await listLiveMarkers(this.config.DATA_DIR).catch(
+        () => [] as LiveTurnMarker[]
+      );
+      for (const marker of existingMarkers) {
+        if (!channels.has(marker.channelRef)) continue;
+        await finishLiveTurn(this.config.DATA_DIR, {
+          id: marker.id,
+          status: "cancelled",
+          channelRef: marker.channelRef,
+          finishedUtc: now.toISOString(),
+          reason: "reconciled by durable inbound admission",
+        }).catch((err) =>
+          this.logger.warn({ err, id: marker.id }, "inbound recovery marker reconcile failed")
+        );
+      }
+      for (const row of recoveredInbound) this.startRecoveredInbound(row);
+    }
 
     const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
     const liveJobs: Array<Promise<void>> = [];
@@ -18194,7 +18688,7 @@ export class Orchestrator {
       authorIsBot: false,
       text: prompt,
     };
-    void this.queueOnChannel(thread.id, () => this.handleIncomingMessageInner(synthetic)).catch(
+    void this.queueOnChannel(thread.id, (fence) => this.handleIncomingMessageInner(synthetic, fence)).catch(
       (err) => {
         this.logger.warn({ err, thread: thread.id }, "preset thread: opening turn failed");
       }

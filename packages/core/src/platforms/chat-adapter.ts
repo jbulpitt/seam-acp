@@ -34,6 +34,9 @@ export interface MessageAttachment {
 
 /** Incoming user message, normalized across platforms. */
 export interface IncomingMessage {
+  /** Stable platform message id. Real Discord user messages always provide it;
+   * synthetic turns omit it and therefore do not enter the inbound ledger. */
+  messageId?: string;
   channel: ChannelRef;
   authorId: string;
   /** Resolved, sanitized display name of the author (issue #57). Optional so

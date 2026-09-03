@@ -76,11 +76,15 @@ export class DispatchWatcher {
   /** Ids claimed by this process, so an overlapping poll tick can't pick up a
    *  spec that's mid-flight (the rename claim also guards this, but only until
    *  the file lands in `running/`). */
-  private readonly inFlight = new Set<string>();
+  private readonly inFlight = new Map<string, symbol>();
   /** Artifacts terminalized by the Voice Console quarantine path. A claimed
    *  callback may still be waiting in its target queue (or cancelling); this
    *  fence prevents it from starting or overwriting the quarantine result. */
   private readonly quarantined = new Set<string>();
+  /** Local recovery swaps both this generation and the SerialQueue instance.
+   * A late callback from the old generation is observation-only: it may settle,
+   * but it cannot write done or remove the re-queued running artifact. */
+  private readonly targetEpochs = new Map<string, number>();
   private timer?: NodeJS.Timeout;
   private ready = false;
   /**
@@ -204,7 +208,8 @@ export class DispatchWatcher {
       .filter((name) => name.endsWith(".json"))
       .map((name) => name.slice(0, -".json".length))
       .filter((id) => !this.inFlight.has(id));
-    for (const id of ids) this.inFlight.add(id);
+    const claims = ids.map((id) => ({ id, token: Symbol(id) }));
+    for (const { id, token } of claims) this.inFlight.set(id, token);
 
     // Claim (rename + parse) concurrently — a race here is harmless — but collect
     // the winners and ENQUEUE their runs in a deterministic arrival order
@@ -212,16 +217,16 @@ export class DispatchWatcher {
     // would reach their SerialQueue in whatever order the async claim races
     // resolve, breaking the "on-disk arrival order is the order they reach the
     // thread" guarantee (and flaking any test that relies on it).
-    const claimed: Array<{ id: string; spec: DispatchSpec }> = [];
+    const claimed: Array<{ id: string; spec: DispatchSpec; token: symbol }> = [];
     await Promise.all(
-      ids.map(async (id) => {
+      claims.map(async ({ id, token }) => {
         try {
           const spec = await this.claimSpec(id);
-          if (spec) claimed.push({ id, spec });
-          else this.inFlight.delete(id); // ENOENT (lost the claim) or already finalized
+          if (spec) claimed.push({ id, spec, token });
+          else if (this.inFlight.get(id) === token) this.inFlight.delete(id);
         } catch (err) {
           this.logger.error({ err, id }, "dispatch: claim failed unexpectedly");
-          this.inFlight.delete(id);
+          if (this.inFlight.get(id) === token) this.inFlight.delete(id);
         }
       })
     );
@@ -231,11 +236,11 @@ export class DispatchWatcher {
         a.id.localeCompare(b.id)
     );
 
-    const jobs = claimed.map(({ id, spec }) =>
-      this.runSpec(id, spec)
+    const jobs = claimed.map(({ id, spec, token }) =>
+      this.runSpec(id, spec, this.targetEpoch(spec.target))
         .catch((err) => this.logger.error({ err, id }, "dispatch failed unexpectedly"))
         .finally(() => {
-          this.inFlight.delete(id);
+          if (this.inFlight.get(id) === token) this.inFlight.delete(id);
           this.quarantined.delete(id);
         })
     );
@@ -373,15 +378,50 @@ export class DispatchWatcher {
   }
 
   /**
+   * Localized queue repair. Move every artifact for one target back to pending,
+   * relinquish this process's old ownership token, and replace that target's
+   * in-memory FIFO. The old callback is fenced by target epoch checks in
+   * runSpec, so its late resolution cannot produce a done-file.
+   */
+  async recoverTarget(target: string): Promise<string[]> {
+    const next = this.targetEpoch(target) + 1;
+    this.targetEpochs.set(target, next);
+    this.queues.set(target, new SerialQueue());
+    const specs = await this.listQueueSpecs(["running", "pending"]);
+    const recovered: string[] = [];
+    for (const spec of specs) {
+      if (spec.target !== target || recovered.includes(spec.id)) continue;
+      const name = `${spec.id}.json`;
+      if (await exists(path.join(this.dirs.done, name))) continue;
+      const runningPath = path.join(this.dirs.running, name);
+      const pendingPath = path.join(this.dirs.pending, name);
+      if (await exists(runningPath)) {
+        try {
+          await rename(runningPath, pendingPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+            this.logger.warn({ err, id: spec.id, target }, "dispatch: local recovery requeue failed");
+            continue;
+          }
+        }
+      }
+      this.inFlight.delete(spec.id);
+      recovered.push(spec.id);
+    }
+    return recovered;
+  }
+
+  /**
    * Command-layer cancel: write a terminal done-file THEN drop the running
    * (and any pending) spec. Same commit ordering as {@link finish}. Does NOT
    * live in dispose() — SIGTERM must leave markers intact.
    */
-  async cancelRunning(filter?: { target?: string }): Promise<string[]> {
+  async cancelRunning(filter?: { target?: string; id?: string }): Promise<string[]> {
     const cancelled: string[] = [];
     const seen = new Set<string>();
     for (const spec of await this.listQueueSpecs(["running", "pending"])) {
       if (filter?.target && spec.target !== filter.target) continue;
+      if (filter?.id && spec.id !== filter.id) continue;
       if (seen.has(spec.id)) continue;
       seen.add(spec.id);
       await this.finish(spec.id, {
@@ -551,13 +591,14 @@ export class DispatchWatcher {
   /** Run one claimed spec through its target's SerialQueue and record the
    *  outcome. Invoked by `tick` in arrival order, so the synchronous
    *  `queueFor(target).run(...)` enqueue below preserves same-target order. */
-  private async runSpec(id: string, spec: DispatchSpec): Promise<void> {
+  private async runSpec(id: string, spec: DispatchSpec, targetEpoch: number): Promise<void> {
     this.logger.info(
       { id, target: spec.target, session: spec.session, correlationId: spec.correlationId },
       "dispatch: running"
     );
 
     await this.queueFor(spec.target).run(async () => {
+      if (this.targetEpoch(spec.target) !== targetEpoch) return;
       if (this.quarantined.has(id)) {
         this.logger.warn({ id, target: spec.target }, "dispatch: quarantined before execution");
         return;
@@ -580,6 +621,7 @@ export class DispatchWatcher {
       };
       try {
         const { output, stopReason } = await this.onDispatch(spec);
+        if (this.targetEpoch(spec.target) !== targetEpoch) return;
         if (this.quarantined.has(id)) return;
         await this.finish(id, {
           ...base,
@@ -590,6 +632,7 @@ export class DispatchWatcher {
         });
         this.logger.info({ id, target: spec.target, chars: output.length }, "dispatch: completed");
       } catch (err) {
+        if (this.targetEpoch(spec.target) !== targetEpoch) return;
         if (this.quarantined.has(id)) return;
         const message = (err as Error)?.message ?? String(err);
         const partial = err instanceof DispatchTurnError ? err.output : undefined;
@@ -646,6 +689,10 @@ export class DispatchWatcher {
       this.queues.set(target, q);
     }
     return q;
+  }
+
+  private targetEpoch(target: string): number {
+    return this.targetEpochs.get(target) ?? 0;
   }
 }
 

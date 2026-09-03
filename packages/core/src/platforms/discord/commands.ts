@@ -31,11 +31,11 @@ export const SEAM_ADMIN_COMMAND_NAME = "seamadmin";
  *     config (18) model effort agent role mode repo tools card gif approve
  *                 reset init detach tts show edit set audit
  *
- *   /seamadmin  (8 slots)  operator surface — ManageGuild + guild-only
- *     rebuild
+ *   /seamadmin  (9 slots)  operator surface — ManageGuild + guild-only
+ *     rebuild · recover
  *     project  (3)  new list remove
  *     upload   (3)  pull push secret
- *     bridge   (4)  add rotate list remove
+ *     bridge   (5)  add rotate list remove restart
  *     schedule (5)  add list remove toggle edit — no attachments (#158)
  *     debug    (6)  tail exec status voice-ping voice-capture voice-live
  *     voice    (7)  start add remove configure console status stop
@@ -629,7 +629,7 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
     // Guild-only. setDMPermission is deprecated; setContexts is the replacement.
     .setContexts(InteractionContextType.Guild);
 
-  // --- top-level (1): rebuild ------------------------------------------------
+  // --- top-level (2): rebuild, recover ---------------------------------------
 
   cmd.addSubcommand((sub) =>
     sub
@@ -646,6 +646,25 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           .setName("model")
           .setDescription("Target model id")
           .setRequired(false)
+      )
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub
+      .setName("recover")
+      .setDescription("Diagnose and repair one channel queue without restarting the bot")
+      .addStringOption((o) =>
+        o.setName("thread").setDescription("Thread id to recover").setRequired(true).setAutocomplete(true)
+      )
+      .addStringOption((o) =>
+        o
+          .setName("mode")
+          .setDescription("auto refuses healthy work; force invalidates it")
+          .setRequired(false)
+          .addChoices(
+            { name: "auto", value: "auto" },
+            { name: "force", value: "force" }
+          )
       )
   );
 
@@ -804,6 +823,27 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
           .setDescription("Unpair a bridge")
           .addStringOption((o) =>
             o.setName("name").setDescription("Bridge id or name").setRequired(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("restart")
+          .setDescription("Stage a safe bot restart (drain, or explicitly confirmed force)")
+          .addStringOption((o) =>
+            o
+              .setName("mode")
+              .setDescription("Restart mode")
+              .setRequired(true)
+              .addChoices(
+                { name: "drain", value: "drain" },
+                { name: "force", value: "force" }
+              )
+          )
+          .addBooleanOption((o) =>
+            o
+              .setName("confirm")
+              .setDescription("Required true for force mode")
+              .setRequired(false)
           )
       )
   );
@@ -1011,6 +1051,8 @@ export type SeamSubcommand =
   | "steer"
   | "workflows"
   | "rebuild"
+  | "recover"
+  | "restart"
   | "pull"
   | "push"
   | "secret"

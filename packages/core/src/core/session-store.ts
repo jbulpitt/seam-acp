@@ -81,6 +81,10 @@ import {
 } from "./voice-console/types.js";
 import { INBOX_MAX_PER_SESSION, type InboxMessage } from "./inbox/types.js";
 import type { ParkedAttachment, ParkedPrompt } from "./parked-prompts/types.js";
+import type {
+  InboundAdmission,
+  NewInboundAdmission,
+} from "./inbound-admission/types.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -352,6 +356,7 @@ export class SessionStore {
     this.db.exec(WATCHES_SCHEMA);
     this.db.exec(INBOX_SCHEMA);
     this.db.exec(PARKED_PROMPTS_SCHEMA);
+    this.db.exec(INBOUND_ADMISSIONS_SCHEMA);
     this.migrateParkedKind();
     this.db.exec(CHOICE_CARDS_SCHEMA);
     this.migrateChoiceIngest();
@@ -2093,6 +2098,148 @@ export class SessionStore {
     const rows = this.listParked();
     this.db.prepare("DELETE FROM parked_prompts").run();
     return rows;
+  }
+
+  // --- durable inbound admissions (#180) ----------------------------------
+
+  /** Admit a real platform message exactly once. False means its id already
+   * exists in any state and the gateway redelivery must not enqueue it again. */
+  admitInbound(input: NewInboundAdmission): boolean {
+    const admit = this.db.transaction(() => {
+      const result = this.db
+        .prepare(
+          `INSERT OR IGNORE INTO inbound_admissions
+             (message_id, platform, channel_ref, parent_ref, session_record_id,
+              author_id, author_name, prompt, attachments_json, state,
+              queue_epoch, created_utc, updated_utc)
+           VALUES
+             (@messageId, @platform, @channelRef, @parentRef, @sessionRecordId,
+              @authorId, @authorName, @text, @attachmentsJson, 'pending',
+              NULL, @createdUtc, @createdUtc)`
+        )
+        .run({
+          ...input,
+          parentRef: input.parentRef ?? null,
+          authorName: input.authorName ?? null,
+          attachmentsJson: JSON.stringify(input.attachments ?? []),
+        });
+      if (result.changes !== 1) return false;
+      // A normal Discord message is a priority replacement, not FIFO. Make
+      // that intent durable in the same commit as the new admission so boot
+      // recovery cannot resurrect the turn it superseded.
+      this.db
+        .prepare(
+          `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?
+           WHERE channel_ref = ? AND message_id <> ?
+             AND state IN ('pending','running')`
+        )
+        .run(input.createdUtc, input.channelRef, input.messageId);
+      return true;
+    });
+    return admit();
+  }
+
+  getInbound(messageId: string): InboundAdmission | null {
+    const row = this.db
+      .prepare<[string], InboundAdmissionRow>(
+        "SELECT * FROM inbound_admissions WHERE message_id = ?"
+      )
+      .get(messageId);
+    return row ? mapInboundAdmission(row) : null;
+  }
+
+  listInboundNonterminal(channelRef?: string): InboundAdmission[] {
+    const rows = channelRef
+      ? this.db
+          .prepare<[string], InboundAdmissionRow>(
+            `SELECT * FROM inbound_admissions
+             WHERE channel_ref = ? AND state IN ('pending','running')
+             ORDER BY created_utc ASC, rowid ASC`
+          )
+          .all(channelRef)
+      : this.db
+          .prepare<[], InboundAdmissionRow>(
+            `SELECT * FROM inbound_admissions
+             WHERE state IN ('pending','running')
+             ORDER BY created_utc ASC, rowid ASC`
+          )
+          .all();
+    return rows.map(mapInboundAdmission);
+  }
+
+  claimInbound(messageId: string, queueEpoch: number, updatedUtc: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE inbound_admissions
+         SET state = 'running', queue_epoch = ?, updated_utc = ?
+         WHERE message_id = ? AND state = 'pending'`
+      )
+      .run(queueEpoch, updatedUtc, messageId);
+    return result.changes === 1;
+  }
+
+  /** Epoch is part of the ownership claim. A late promise from an invalidated
+   * queue cannot terminalize the row after recovery has re-claimed it. */
+  completeInbound(messageId: string, queueEpoch: number, updatedUtc: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE inbound_admissions
+         SET state = 'completed', updated_utc = ?
+         WHERE message_id = ? AND state = 'running' AND queue_epoch = ?`
+      )
+      .run(updatedUtc, messageId, queueEpoch);
+    return result.changes === 1;
+  }
+
+  /**
+   * Reconcile one thread after a crash or an operator fence. Ordinary user
+   * messages are replacement semantics, so only the newest nonterminal row is
+   * recoverable; older rows are durably superseded in the same transaction.
+   */
+  recoverInboundChannel(channelRef: string, updatedUtc: string): InboundAdmission | null {
+    const recover = this.db.transaction(() => {
+      const rows = this.db
+        .prepare<[string], InboundAdmissionRow>(
+          `SELECT * FROM inbound_admissions
+           WHERE channel_ref = ? AND state IN ('pending','running')
+           ORDER BY created_utc ASC, rowid ASC`
+        )
+        .all(channelRef);
+      const newest = rows.at(-1);
+      if (!newest) return null;
+      this.db
+        .prepare(
+          `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?
+           WHERE channel_ref = ? AND state IN ('pending','running') AND message_id <> ?`
+        )
+        .run(updatedUtc, channelRef, newest.message_id);
+      this.db
+        .prepare(
+          `UPDATE inbound_admissions SET state = 'pending', queue_epoch = NULL, updated_utc = ?
+           WHERE message_id = ? AND state IN ('pending','running')`
+        )
+        .run(updatedUtc, newest.message_id);
+      return mapInboundAdmission({
+        ...newest,
+        state: "pending",
+        queue_epoch: null,
+        updated_utc: updatedUtc,
+      });
+    });
+    return recover();
+  }
+
+  /** Boot reconciliation grouped by channel. */
+  recoverAllInbound(updatedUtc: string): InboundAdmission[] {
+    const channels = this.db
+      .prepare<[], { channel_ref: string }>(
+        `SELECT DISTINCT channel_ref FROM inbound_admissions
+         WHERE state IN ('pending','running') ORDER BY channel_ref`
+      )
+      .all();
+    return channels
+      .map(({ channel_ref }) => this.recoverInboundChannel(channel_ref, updatedUtc))
+      .filter((row): row is InboundAdmission => row !== null);
   }
 
   // --- frozen choice cards (#91) --------------------------------------------
@@ -6518,6 +6665,81 @@ const mapParked = (r: ParkedRow): ParkedPrompt => ({
   noticeMessageId: r.notice_message_id,
   attachments: parseParkedAttachments(r.attachments_json),
   createdUtc: r.created_utc,
+});
+
+// --- durable inbound admission schema + row mapping (#180) -----------------
+
+const INBOUND_ADMISSIONS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS inbound_admissions (
+  message_id        TEXT PRIMARY KEY,
+  platform          TEXT NOT NULL,
+  channel_ref       TEXT NOT NULL,
+  parent_ref        TEXT,
+  session_record_id TEXT NOT NULL,
+  author_id         TEXT NOT NULL,
+  author_name       TEXT,
+  prompt            TEXT NOT NULL,
+  attachments_json  TEXT NOT NULL DEFAULT '[]',
+  state             TEXT NOT NULL CHECK (state IN ('pending','running','completed')),
+  queue_epoch       INTEGER,
+  created_utc       TEXT NOT NULL,
+  updated_utc       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inbound_channel_state
+  ON inbound_admissions(channel_ref, state, created_utc);
+`;
+
+interface InboundAdmissionRow {
+  message_id: string;
+  platform: string;
+  channel_ref: string;
+  parent_ref: string | null;
+  session_record_id: string;
+  author_id: string;
+  author_name: string | null;
+  prompt: string;
+  attachments_json: string;
+  state: "pending" | "running" | "completed";
+  queue_epoch: number | null;
+  created_utc: string;
+  updated_utc: string;
+}
+
+function parseInboundAttachments(raw: string): InboundAdmission["attachments"] {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((value): value is InboundAdmission["attachments"][number] => {
+      if (!value || typeof value !== "object") return false;
+      const item = value as Record<string, unknown>;
+      return (
+        typeof item.url === "string" &&
+        typeof item.filename === "string" &&
+        (typeof item.contentType === "string" || item.contentType === null) &&
+        typeof item.size === "number" &&
+        Number.isSafeInteger(item.size) &&
+        item.size >= 0
+      );
+    });
+  } catch {
+    return [];
+  }
+}
+
+const mapInboundAdmission = (r: InboundAdmissionRow): InboundAdmission => ({
+  messageId: r.message_id,
+  platform: r.platform,
+  channelRef: r.channel_ref,
+  parentRef: r.parent_ref,
+  sessionRecordId: r.session_record_id,
+  authorId: r.author_id,
+  authorName: r.author_name,
+  text: r.prompt,
+  attachments: parseInboundAttachments(r.attachments_json),
+  state: r.state,
+  queueEpoch: r.queue_epoch,
+  createdUtc: r.created_utc,
+  updatedUtc: r.updated_utc,
 });
 
 /** Defensive parse of the stored hops array — a corrupt row degrades to an

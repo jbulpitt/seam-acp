@@ -2169,6 +2169,7 @@ export class DiscordAdapter implements ChatAdapter {
     };
 
     const incoming: IncomingMessage = {
+      messageId: msg.id,
       channel,
       authorId: msg.author.id,
       authorName: this.resolveAuthorName(msg),

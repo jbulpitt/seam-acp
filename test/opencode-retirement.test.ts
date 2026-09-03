@@ -132,8 +132,10 @@ describe("#12 opencode surface removed", () => {
   });
 
   it("still boots when a deployment's .env carries the retired OPENCODE_* keys", () => {
-    // The production .env kept all nine keys after retirement. Zod strips unknown
-    // keys, so they must be inert: not a boot failure, and not a silent re-enable.
+    // The schema retired nine recognized keys; the live deployment's .env sets
+    // eight of them (it never set OPENCODE_CONFIG_PATH). All nine are exercised
+    // here — the superset — because Zod strips unknown keys, so every one of
+    // them must be inert: not a boot failure, and not a silent re-enable.
     baseEnv({
       OPENCODE_ENABLED: "true",
       OPENCODE_CLI_PATH: "/usr/local/bin/opencode",
@@ -148,6 +150,54 @@ describe("#12 opencode surface removed", () => {
     const cfg = loadConfig() as unknown as Record<string, unknown>;
     expect(Object.keys(cfg).filter((k) => k.startsWith("OPENCODE_"))).toEqual([]);
     expect(cfg.REPOS_ROOT).toBe(repoRoot);
+  });
+
+  // A legacy DEFAULT_AGENT is the one env value that must NOT be quietly
+  // stripped or accepted: it is stamped onto every new session record, so
+  // accepting it would mint broken threads that only fail on their first turn.
+  it("refuses to boot when DEFAULT_AGENT names the retired agent", () => {
+    baseEnv({ DEFAULT_AGENT: "opencode" });
+    expect(() => loadConfig()).toThrow(/DEFAULT_AGENT="opencode"/);
+    expect(() => loadConfig()).toThrow(/retired/i);
+  });
+
+  it("the DEFAULT_AGENT refusal names a supported replacement and does not substitute one", () => {
+    baseEnv({ DEFAULT_AGENT: "opencode" });
+    let message = "";
+    try {
+      loadConfig();
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain("Set DEFAULT_AGENT to a supported agent");
+    expect(message).toContain("will not substitute one for you");
+    expect(message).toContain("copilot");
+    // Boot-time wording must not borrow the per-thread language: nothing is
+    // bound to a thread yet.
+    expect(message).not.toContain("/seam config agent");
+    // It must fail, not fall back: no config object is produced at all.
+    expect(() => loadConfig()).toThrow();
+  });
+
+  it("refuses a retired DEFAULT_AGENT even alongside the legacy OPENCODE_* keys", () => {
+    // The exact legacy shape: OPENCODE_ENABLED=true plus a retired default.
+    baseEnv({ DEFAULT_AGENT: "opencode", OPENCODE_ENABLED: "true" });
+    expect(() => loadConfig()).toThrow(/retired/i);
+  });
+
+  it("still accepts every supported DEFAULT_AGENT", () => {
+    for (const agent of ["copilot", "claude", "codex", "grok", "agy", "ollama-cloud"]) {
+      baseEnv({ DEFAULT_AGENT: agent });
+      expect(loadConfig().DEFAULT_AGENT, agent).toBe(agent);
+    }
+  });
+
+  it("leaves an unrecognized DEFAULT_AGENT alone (only RETIRED ids are refused here)", () => {
+    // Boot-time validation is deliberately narrow: it knows the retirement
+    // table, not the runtime roster (which depends on which agents are enabled).
+    // A typo still reaches the router's generic unknown-agent error.
+    baseEnv({ DEFAULT_AGENT: "cluade" });
+    expect(loadConfig().DEFAULT_AGENT).toBe("cluade");
   });
 });
 
@@ -171,7 +221,17 @@ describe("#12 retired-agent migration", () => {
     const msg = retiredAgentMessage("opencode")!;
     expect(msg).toContain("retired");
     expect(msg).toContain("/seam config agent");
-    expect(msg).toContain("keeps its history");
+  });
+
+  it("does not promise the agent keeps its context across the switch", () => {
+    // Switching agents always forges a fresh ACP session. The Discord thread and
+    // its messages survive; the agent's working context does not. Saying "keeps
+    // its history" would be read as the latter.
+    const msg = retiredAgentMessage("opencode")!;
+    expect(msg).not.toMatch(/keeps its history/i);
+    expect(msg).toContain("fresh session");
+    expect(msg).toMatch(/Discord thread and its\s+messages stay/);
+    expect(msg).toMatch(/context is not carried over/);
   });
 
   it("fails a persisted opencode session with the retirement message, not a bare unknown-agent error", () => {

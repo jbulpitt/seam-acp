@@ -3,6 +3,7 @@ dotenv.config({ override: true });
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { retiredAgentConfigMessage } from "./core/retired-agents.js";
 
 const ModelsListSchema = z
   .string()
@@ -1097,6 +1098,21 @@ export function loadConfig(): Config {
     );
   }
   cfg.REPOS_ROOT = reposRoot;
+
+  // #12: DEFAULT_AGENT naming a RETIRED agent is a configuration error, refused
+  // here rather than at the first turn. This is the bot-wide default, so every
+  // thread created under it would be stamped with an agent that can never spawn
+  // — `ensureSessionRecord` writes `defaultAgentId` into the row, and the
+  // failure would only surface later, per-thread, as a turn error. Fail at boot
+  // instead, and never silently substitute another agent: which agent replaces
+  // a retired default is the operator's decision, not ours.
+  const retiredDefault = retiredAgentConfigMessage("DEFAULT_AGENT", cfg.DEFAULT_AGENT);
+  if (retiredDefault) {
+    throw new Error(
+      `Invalid configuration: ${retiredDefault}\n` +
+        `Supported agents include copilot, claude, codex, grok, agy.`
+    );
+  }
 
   const { channelPresets, threadPresets, bridgePresets } = buildChannelPresetMaps(
     cfg.CHANNEL_PRESETS_FILE

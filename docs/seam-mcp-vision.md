@@ -208,8 +208,11 @@ with the wake mechanics.
 
 **5.2 Interface: layer MCP *and* fence — don't choose.**
 Per [durable-jobs §6](./durable-jobs-plan.md), MCP tools reach Claude + Codex +
-Copilot but **not agy** (no MCP). The fence-directive / file-spec / prompt-inject
-path is universal.
+Copilot. (This originally read "**not agy** (no MCP)" — stale since #109, which
+fixed the adapter's dropped `params.mcpServers` and gave agy a per-session MCP
+config; agy calling `threads()` on a dispatched turn was verified live.) The
+fence-directive / file-spec / prompt-inject path remains the universal fallback
+for any agent that still has no MCP.
 → **Recommendation:** seam-MCP is the runtime; **MCP tools are the rich interface**
 (typed args + return values → the report-back guarantee), and the **fence-directive
 survives as a universal compat input** into the *same* runtime for non-MCP agents.

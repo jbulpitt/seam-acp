@@ -40,9 +40,27 @@ export function retiredAgent(agentId: string): RetiredAgent | undefined {
 }
 
 /**
+ * Config-time explanation for a *setting* that names a retired agent, or null
+ * when it is not retired. Distinct from `retiredAgentMessage`: nothing is bound
+ * to a thread yet at boot, so this deliberately carries none of the per-session
+ * "switch this thread" language.
+ */
+export function retiredAgentConfigMessage(setting: string, agentId: string): string | null {
+  const retired = retiredAgent(agentId);
+  if (!retired) return null;
+  return (
+    `${setting}="${agentId}" names a retired agent (${retired.displayName}): ${retired.reason}. ` +
+    `Set ${setting} to a supported agent — seam-acp will not substitute one for you.`
+  );
+}
+
+/**
  * Operator-facing explanation for a session still bound to a retired agent, or
  * null when `agentId` is not retired. Names the fix, because the failure is
- * only actionable if the reader knows a thread's agent is a one-command change.
+ * only actionable if the reader knows a thread's agent is a one-command change
+ * — and names its cost, because switching agents always forges a fresh ACP
+ * session. The Discord thread and its messages survive; the agent's working
+ * context does not.
  */
 export function retiredAgentMessage(agentId: string): string | null {
   const retired = retiredAgent(agentId);
@@ -50,6 +68,8 @@ export function retiredAgentMessage(agentId: string): string | null {
   return (
     `Agent "${agentId}" (${retired.displayName}) is retired: ${retired.reason}. ` +
     `This thread is still bound to it, so it cannot start a turn. ` +
-    `Pick a supported agent with \`/seam config agent\` — the thread keeps its history.`
+    `Pick a supported agent with \`/seam config agent\`. The Discord thread and its ` +
+    `messages stay, but switching agents starts a fresh session — the previous ` +
+    `conversation context is not carried over.`
   );
 }

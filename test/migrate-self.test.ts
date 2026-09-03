@@ -88,6 +88,10 @@ function harness(dir: string) {
   const store = {
     getPresetByName: () => null,
     recordDelegation: () => {},
+    // #170: dispatchInjectTurn now looks the spec up by exact id before
+    // recording, so a pre-claimed report-back is not re-inserted. These
+    // specs are never pre-ledgered, so the lookup finds nothing.
+    getDelegation: () => null,
     updateDelegationStatus: () => {},
     getReportBackByCorrelation: () => null,
     tryRecordReportBack: (value: unknown) => value,

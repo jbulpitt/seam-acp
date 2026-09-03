@@ -164,15 +164,40 @@ export function settleFastMode(input: {
   agentId: string;
   model: string;
   advertised?: ReadonlyArray<string>;
-}): { ok: true } | { ok: false; refusal: string } {
+}): FastModeSettlement {
   if (input.outcome?.applied === true) return { ok: true };
+  // Rolling the flag back is not enough when we never OBSERVED the session
+  // land on `off`: an accepted-but-unechoed enable may genuinely have put the
+  // live session into Fast, which would keep billing while the UI reads off.
+  // Only a positively observed `applied: false` proves otherwise; `null`
+  // (undetermined) and a missing outcome do not. The session in question was
+  // just forged and holds no user context, so discarding it costs nothing.
+  const observedOff = input.outcome?.applied === false;
+  const refusal =
+    input.outcome?.error ??
+    fastModeUnsupportedRefusal(input.agentId, input.model, input.advertised ?? []);
   return {
     ok: false,
-    refusal:
-      input.outcome?.error ??
-      fastModeUnsupportedRefusal(input.agentId, input.model, input.advertised ?? []),
+    retireSession: !observedOff,
+    refusal: observedOff
+      ? refusal
+      : `${refusal} The replacement session was discarded because it could not be ` +
+        `confirmed Fast-free; the next turn starts a clean one with Fast off.`,
   };
 }
+
+export type FastModeSettlement =
+  | { ok: true }
+  | {
+      ok: false;
+      refusal: string;
+      /**
+       * True when the just-created session must ALSO be retired, because we
+       * could not observe it landing on `off` and it may therefore be serving
+       * (and billing) Fast despite the persisted flag now reading false.
+       */
+      retireSession: boolean;
+    };
 
 /**
  * Whether a pending change needs a FRESH session before Fast can be trusted.

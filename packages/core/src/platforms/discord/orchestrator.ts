@@ -11354,6 +11354,7 @@ export class Orchestrator {
     // model with Fast already on would otherwise leave `fastMode: true`
     // persisted against a session that never offered it.
     let fastRefusal: string | undefined;
+    let retireUnverifiedSession = false;
     const fastNeedsFreshSession = fastModeWillResetSession(draft);
     if (fastNeedsFreshSession) {
       const bound = this.store.getByChannel(PLATFORM, draft.threadId);
@@ -11375,7 +11376,10 @@ export class Orchestrator {
               model: described.model.value,
               advertised: runtime.getConfigSelectValues(FAST_MODE_CONFIG_ID),
             });
-            if (!settled.ok) fastRefusal = settled.refusal;
+            if (!settled.ok) {
+              fastRefusal = settled.refusal;
+              retireUnverifiedSession = settled.retireSession;
+            }
           } catch (err) {
             fastRefusal =
               `Fast mode could not be verified — the replacement session failed to start: ` +
@@ -11399,6 +11403,19 @@ export class Orchestrator {
               );
             }
             draft = { ...draft, overlay: { ...draft.overlay, fastMode: false } };
+            if (retireUnverifiedSession) {
+              // Never observed landing on `off`, so this session may actually be
+              // serving (and billing) Fast. Throw it away — it was just forged
+              // and holds no user context; the next turn starts clean.
+              await this.router
+                .invalidate(bound.id, { clearAcpSession: true, clearStartFailure: true })
+                .catch((err) =>
+                  this.logger.warn(
+                    { err, threadId: draft.threadId },
+                    "could not retire unverified fast-mode session"
+                  )
+                );
+            }
           }
         }
       }

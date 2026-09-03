@@ -828,6 +828,8 @@ function record(over: Partial<SessionRecord> = {}): SessionRecord {
 function ctrlHarness(opts: {
   /** Whether the freshly forged session advertises `fast`. */
   freshAdvertisesFast?: boolean;
+  /** Force the runtime's reported applied-state (null = undetermined). */
+  appliedOverride?: boolean | null;
   /** Thread-preset fastMode before the call. */
   fastMode?: boolean;
   agents?: Array<{ id: string; models: string[]; fast: boolean }>;
@@ -901,12 +903,13 @@ function ctrlHarness(opts: {
           }),
           getConfigSelectValues: (id) =>
             id === FAST_MODE_CONFIG_ID && canFast ? [FAST_MODE_ON, FAST_MODE_OFF] : [],
-          getFastModeOutcome: () =>
-            fastPreset
-              ? canFast
-                ? { requested: true, applied: true }
-                : { requested: true, applied: false }
-              : { requested: false, applied: false },
+          getFastModeOutcome: () => {
+            if (!fastPreset) return { requested: false, applied: false };
+            if (opts.appliedOverride !== undefined) {
+              return { requested: true, applied: opts.appliedOverride };
+            }
+            return { requested: true, applied: canFast };
+          },
           setModel: async () => {},
           setConfigOption: async () => {},
         };
@@ -1085,6 +1088,8 @@ describe("#37 configure_thread", () => {
 function saveHarness(opts: {
   /** Whether the replacement session advertises `fast`. */
   freshAdvertisesFast?: boolean;
+  /** Force the runtime's reported applied-state (null = undetermined). */
+  appliedOverride?: boolean | null;
   /** Persisted thread-preset fastMode before the save. */
   fastMode?: boolean;
   model?: string;
@@ -1129,12 +1134,13 @@ function saveHarness(opts: {
         started.push("start");
         rec.acpSessionId = "acp-fresh";
         return {
-          getFastModeOutcome: () =>
-            fastPreset
-              ? advertises
-                ? { requested: true, applied: true }
-                : { requested: true, applied: false }
-              : { requested: false, applied: false },
+          getFastModeOutcome: () => {
+            if (!fastPreset) return { requested: false, applied: false };
+            if (opts.appliedOverride !== undefined) {
+              return { requested: true, applied: opts.appliedOverride };
+            }
+            return { requested: true, applied: advertises };
+          },
           getConfigSelectValues: (id: string) =>
             id === FAST_MODE_CONFIG_ID && advertises ? [FAST_MODE_ON, FAST_MODE_OFF] : [],
         };
@@ -1276,5 +1282,85 @@ describe("#37 — /seam config edit Save transaction", () => {
     expect(h.invalidated).toHaveLength(1);
     expect(h.started).toEqual([]);
     expect(h.ephemerals).toEqual([]);
+  });
+});
+
+// --------------------------------------------------------------------------
+// An UNVERIFIABLE enable may actually be billing (#37).
+//
+// Rolling the persisted flag back is not enough: if we never observed the
+// session land on `off`, it may genuinely be serving Fast while the UI reads
+// off. The just-forged session holds no user context, so it is discarded.
+// --------------------------------------------------------------------------
+
+describe("#37 — an unverifiable enable retires the session it may have enabled", () => {
+  it("settleFastMode only skips retirement when `off` was positively observed", () => {
+    const at = (applied: boolean | null | undefined) =>
+      settleFastMode({
+        outcome: applied === undefined ? undefined : { requested: true, applied },
+        agentId: "claude",
+        model: "claude-opus-5",
+      });
+    expect(at(true)).toEqual({ ok: true });
+    // Observed off ⇒ the session demonstrably is not Fast; keep it.
+    const off = at(false);
+    expect(off.ok).toBe(false);
+    if (!off.ok) {
+      expect(off.retireSession).toBe(false);
+      expect(off.refusal).not.toMatch(/discarded/);
+    }
+    // Undetermined, or no outcome at all ⇒ it might be Fast; discard it.
+    for (const unknown of [null, undefined] as const) {
+      const r = at(unknown);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.retireSession, String(unknown)).toBe(true);
+        expect(r.refusal).toMatch(/discarded because it could not be confirmed Fast-free/);
+      }
+    }
+  });
+
+  it("configure_thread rolls back AND discards the unverified session", async () => {
+    const h = ctrlHarness({ appliedOverride: null });
+    const res = await h.service.configure(h.caller, h.target, { fastMode: true });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.applied.fastMode).toBe(false);
+    expect(h.fastPresetNow()).toBe(false);
+    // Forge + retire ⇒ two invalidations of the same session.
+    expect(h.invalidated.filter((id) => id === h.target.id)).toHaveLength(2);
+    // A discarded session id must not be advertised back to the caller.
+    expect(res.newSessionId).toBeUndefined();
+    expect(res.warnings.join(" ")).toMatch(/discarded because it could not be confirmed Fast-free/);
+  });
+
+  it("configure_thread keeps the session when `off` was actually observed", async () => {
+    const h = ctrlHarness({ freshAdvertisesFast: false });
+    const res = await h.service.configure(h.caller, h.target, { fastMode: true });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(h.fastPresetNow()).toBe(false);
+    // Only the forge — no second retirement, because the session is known off.
+    expect(h.invalidated.filter((id) => id === h.target.id)).toHaveLength(1);
+    expect(res.newSessionId).toBeDefined();
+    expect(res.warnings.join(" ")).not.toMatch(/discarded/);
+  });
+
+  it("the config-edit Save path rolls back AND discards it too", async () => {
+    const h = saveHarness({ appliedOverride: null });
+    await h.run(applyPickerValue(draft(), "fast", FAST_MODE_ON, caps));
+    expect(h.overlays).toContainEqual({ fastMode: false });
+    expect(h.fastPresetNow()).toBe(false);
+    expect(h.invalidated).toHaveLength(2);
+    expect(h.invalidated[1]).toMatchObject({ opts: { clearAcpSession: true } });
+    expect(h.ephemerals.join(" ")).toMatch(/discarded because it could not be confirmed Fast-free/);
+  });
+
+  it("the config-edit Save path keeps an observably-off session", async () => {
+    const h = saveHarness({ freshAdvertisesFast: false });
+    await h.run(applyPickerValue(draft(), "fast", FAST_MODE_ON, caps));
+    expect(h.fastPresetNow()).toBe(false);
+    expect(h.invalidated).toHaveLength(1);
+    expect(h.ephemerals.join(" ")).not.toMatch(/discarded/);
   });
 });

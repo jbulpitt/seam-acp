@@ -719,6 +719,14 @@ session that already has history:
 - **Off is silent on the wire.** A thread that never asked for Fast issues no
   `set_config_option` at all; `off` is written explicitly only when a session
   came up `on`.
+- **An unverifiable enable is discarded, not assumed off.** `applied` is read
+  back from the echoed `configOptions` (a resolved RPC is not proof — upstream
+  carries a `fast_mode_disabled_reason` for toggles that snap back). If the
+  response echoes nothing, the state is `null` (undetermined), **not** `off`:
+  the session may genuinely be serving and billing Fast. Both mutation surfaces
+  then roll the flag back *and* retire that just-forged session, so the next
+  turn starts clean with Fast off. Only a positively observed `off` keeps the
+  session. Nothing may claim a session is Fast-free without observing it.
 
 ### 12.4 Where it lives
 

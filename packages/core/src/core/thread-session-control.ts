@@ -531,6 +531,9 @@ export class ThreadSessionControlService {
     let runtime: SessionControlRuntime;
     let runtimeReloaded = false;
     let newSessionId: string | undefined;
+    // Set when an unverifiable Fast enable forced us to throw the replacement
+    // session away — the reported session id would otherwise be a dead id.
+    let retiredUnverifiedSession = false;
 
     if (reset.sessionReset) {
       const forged = await this.forgeFreshSession(target.id);
@@ -611,8 +614,17 @@ export class ThreadSessionControlService {
         );
         if (!reverted.ok) return reverted;
         nextFastMode = false;
-        // No second reset: the session simply is not Fast. Resetting again
-        // would drop context twice to reach the state we already have.
+        if (settled.retireSession) {
+          // We never OBSERVED this session land on `off`, so it may actually be
+          // serving Fast and billing while the flag now reads false. Discard
+          // it: it was just forged, holds no user context, and the next turn
+          // starts clean with Fast off. Claiming it "is not Fast" without
+          // observing that is the exact false confirmation this feature bans.
+          await this.deps.router
+            .invalidate(target.id, { clearAcpSession: true })
+            .catch(() => {});
+          retiredUnverifiedSession = true;
+        }
       } else {
         warnings.push(FAST_MODE_COST_WARNING);
       }
@@ -629,7 +641,9 @@ export class ThreadSessionControlService {
       changes,
       sessionReset: reset.sessionReset,
       ...(reset.resetReason ? { resetReason: reset.resetReason } : {}),
-      ...(reset.sessionReset && (newSessionId ?? runtime.getSessionInfo()?.sessionId)
+      ...(reset.sessionReset &&
+      !retiredUnverifiedSession &&
+      (newSessionId ?? runtime.getSessionInfo()?.sessionId)
         ? { newSessionId: newSessionId ?? runtime.getSessionInfo()!.sessionId }
         : {}),
       runtimeReloaded,

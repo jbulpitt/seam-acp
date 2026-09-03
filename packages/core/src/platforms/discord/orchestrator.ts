@@ -513,6 +513,15 @@ export interface QuiesceOutcome {
   phase: "pre-dispose" | "post-dispose";
   /** True when the deadline won — outstanding work is left to boot repair. */
   timedOut: boolean;
+  /**
+   * True when a barrier stage threw. Reported separately from `timedOut`
+   * because the two mean different things and NEITHER means "drained": a
+   * swallowed rejection used to come back as `timedOut: false`, which reads as
+   * a clean drain and is the most dangerous thing this type could say.
+   */
+  barrierFailed: boolean;
+  /** The only positive signal: every stage ran and everything was quiet. */
+  drained: boolean;
   activeTurns: number;
   inFlight: number;
   continuations: number;
@@ -1682,8 +1691,8 @@ export class Orchestrator {
    * reconciliation is what makes giving up safe.
    */
   async quiesce(opts: { timeoutMs?: number } = {}): Promise<QuiesceOutcome> {
-    return this.runBoundedDrain("pre-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, () =>
-      this.settleAllWork()
+    return this.runBoundedDrain("pre-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, (onErr) =>
+      this.settleAllWork(onErr)
     );
   }
 
@@ -1707,8 +1716,8 @@ export class Orchestrator {
    * one phase later.
    */
   async drainAfterDispose(opts: { timeoutMs?: number } = {}): Promise<QuiesceOutcome> {
-    return this.runBoundedDrain("post-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, () =>
-      this.settleAllWork()
+    return this.runBoundedDrain("post-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, (onErr) =>
+      this.settleAllWork(onErr)
     );
   }
 
@@ -1736,12 +1745,22 @@ export class Orchestrator {
    * still running, which is the failure it exists to prevent. Termination comes
    * from outside: intake is closed, and `runBoundedDrain` races a deadline.
    */
-  private async settleAllWork(): Promise<void> {
+  private async settleAllWork(onStageError: (err: unknown) => void): Promise<void> {
     for (;;) {
-      await this.dispatchWatcher?.drain();
-      await Promise.allSettled([...this.channelQueues.values()]);
-      await Promise.allSettled([...this.activeTurnSettles]);
-      await this.settleTrackedContinuations();
+      try {
+        await this.dispatchWatcher?.drain();
+        await Promise.allSettled([...this.channelQueues.values()]);
+        await Promise.allSettled([...this.activeTurnSettles]);
+        await this.settleTrackedContinuations();
+      } catch (err) {
+        // A throwing stage must NOT abort the barrier. It used to: the
+        // rejection propagated out, `runBoundedDrain` swallowed it, and the
+        // phase reported a clean drain having skipped every stage after the
+        // one that threw. The work is still outstanding, so record it and go
+        // round again — the caller's deadline is what ends this, and if the
+        // failure is persistent the phase correctly reports `timedOut`.
+        onStageError(err);
+      }
       // Yield once so work those settlements just registered is visible before
       // we decide we are finished.
       await new Promise((resolve) => setImmediate(resolve));
@@ -1783,11 +1802,12 @@ export class Orchestrator {
   private async runBoundedDrain(
     phase: "pre-dispose" | "post-dispose",
     timeoutMs: number,
-    barrier: () => Promise<void>
+    barrier: (onStageError: (err: unknown) => void) => Promise<void>
   ): Promise<QuiesceOutcome> {
     this.stopIntake();
     let timer: NodeJS.Timeout | undefined;
     let timedOut = false;
+    let barrierFailed = false;
     const deadline = new Promise<void>((resolve) => {
       timer = setTimeout(() => {
         timedOut = true;
@@ -1796,11 +1816,15 @@ export class Orchestrator {
       timer.unref?.();
     });
 
-    // Never let a barrier rejection escape as an unhandled rejection during
-    // shutdown; a failed drain is a timeout-equivalent, not a crash.
-    const running = barrier().catch((err) => {
-      this.logger.warn({ err, phase }, "quiesce barrier failed");
-    });
+    // A stage failure is recorded, never fatal, and never silently successful.
+    const noteFailure = (err: unknown) => {
+      barrierFailed = true;
+      this.logger.warn({ err, phase }, "quiesce barrier stage failed");
+    };
+    // The barrier itself throwing (rather than one of its stages) is the same
+    // story: do not let it escape as an unhandled rejection during shutdown,
+    // and do not let the swallow turn into a report of a clean drain.
+    const running = barrier(noteFailure).catch(noteFailure);
 
     await Promise.race([running, deadline]);
     if (timer) clearTimeout(timer);
@@ -1808,6 +1832,8 @@ export class Orchestrator {
     const state: QuiesceOutcome = {
       phase,
       timedOut,
+      barrierFailed,
+      drained: !timedOut && !barrierFailed,
       activeTurns: this.activeTurns,
       inFlight: this.dispatchWatcher?.inFlightCount ?? 0,
       continuations: this.pendingContinuations.size,
@@ -1816,6 +1842,11 @@ export class Orchestrator {
       this.logger.warn(
         { ...state, timeoutMs },
         "quiesce timed out; proceeding — outstanding completions reconcile at boot"
+      );
+    } else if (barrierFailed) {
+      this.logger.warn(
+        { ...state, timeoutMs },
+        "quiesce barrier failed; proceeding — outstanding completions reconcile at boot"
       );
     } else {
       this.logger.info(state, "quiesce phase complete");

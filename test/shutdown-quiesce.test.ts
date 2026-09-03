@@ -233,17 +233,72 @@ describe("#174 bounded quiesce", () => {
     expect(out.continuations).toBe(1); // surfaced, not silently dropped
   });
 
-  it("a barrier that throws is a timeout-equivalent, not a crash", async () => {
+  /**
+   * A barrier stage that throws used to be swallowed and reported as
+   * `timedOut: false` — indistinguishable from a clean drain, and reached by
+   * SKIPPING every stage after the one that threw. `resolves.toBeDefined()`
+   * asserted none of that; these do.
+   */
+  it("a PERSISTENTLY failing stage is never reported as drained", async () => {
+    let drainCalls = 0;
+    const host = makeQuiesceHost({
+      dispatchWatcher: {
+        stop() {},
+        inFlightCount: 1, // work really is outstanding
+        drain: async () => {
+          drainCalls++;
+          throw new Error("drain exploded");
+        },
+      },
+    });
+
+    let settled = false;
+    const phase = host.quiesce({ timeoutMs: 150 }).then((r) => ((settled = true), r));
+    await flush();
+    expect(settled).toBe(false); // did NOT short-circuit to success
+
+    const outcome = await phase;
+    expect(outcome.drained).toBe(false);
+    expect(outcome.barrierFailed).toBe(true);
+    expect(outcome.timedOut).toBe(true); // the deadline is what ended it
+    expect(drainCalls).toBeGreaterThan(1); // it kept retrying, not gave up
+  });
+
+  it("a TRANSIENT stage failure still runs the other stages", async () => {
+    let drainCalls = 0;
+    const late = deferred();
     const host = makeQuiesceHost({
       dispatchWatcher: {
         stop() {},
         inFlightCount: 0,
         drain: async () => {
-          throw new Error("drain exploded");
+          if (++drainCalls === 1) throw new Error("drain hiccup");
         },
       },
     });
-    await expect(host.quiesce({ timeoutMs: 200 })).resolves.toBeDefined();
+    // Registered BEFORE the barrier starts: the old code threw out of stage 1
+    // and never reached the turn/continuation stages at all.
+    const endTurn = host.beginTurn();
+    host.trackContinuation(late.promise);
+
+    let settled = false;
+    const phase = host.quiesce({ timeoutMs: 5000 }).then((r) => ((settled = true), r));
+    await flush();
+    expect(settled).toBe(false); // still waiting on the later stages
+
+    endTurn();
+    late.resolve();
+    const outcome = await phase;
+    expect(outcome.timedOut).toBe(false); // it recovered and finished
+    expect(outcome.barrierFailed).toBe(true); // but the failure is not hidden
+    expect(outcome.drained).toBe(false); // so it is NOT called a clean drain
+    expect(host.activeTurns).toBe(0);
+    expect(host.pendingContinuations.size).toBe(0);
+  });
+
+  it("a clean phase is the only thing that reports drained", async () => {
+    const outcome = await makeQuiesceHost().quiesce({ timeoutMs: 5000 });
+    expect(outcome).toMatchObject({ drained: true, timedOut: false, barrierFailed: false });
   });
 
   it("post-dispose drain awaits continuations REGISTERED BY disposal", async () => {

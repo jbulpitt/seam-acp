@@ -306,15 +306,23 @@ import {
   applyWatchFeedback,
   applyPresetIdentity,
   buildChainHopSpec,
+  dispatchOriginRefs,
   enqueueDispatchSpec,
   findQueuedReportBackSpec,
   type DispatchSpec,
 } from "../../core/dispatch/types.js";
+import { promptExcerpt } from "../../core/prompt-excerpt.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
 import { formatLocalTime } from "../../core/format-time.js";
 import { formatCoarseDuration } from "../../core/server-status.js";
 import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
-import { TurnStatus, renderStatusPanel, formatContextUsage, fmtTokens } from "../../core/status-panel.js";
+import {
+  TurnStatus,
+  renderStatusPanel,
+  formatContextUsage,
+  fmtTokens,
+  hasOrigin,
+} from "../../core/status-panel.js";
 import { DispatchStatusPanel } from "../../core/dispatch-status-panel.js";
 import { LiveHelpManager } from "../../core/live-help/manager.js";
 import type { VoiceConsoleManager } from "../../core/voice-console/manager.js";
@@ -435,6 +443,7 @@ import {
   defaultSessionConfig,
   type ActiveProject,
   type DelegationKind,
+  type PanelOrigin,
   type PermissionPolicyMode,
   type Preset,
   type SessionConfigState,
@@ -4753,7 +4762,7 @@ export class Orchestrator {
       busy: args.busy === true,
       skipped,
     });
-    const noticeRef = await this.postParkedNotice(args.channel, body);
+    const noticeRef = await this.postParkedNotice(args.channel, body, args.prompt);
 
     const row: ParkedPrompt = {
       id,
@@ -4821,22 +4830,35 @@ export class Orchestrator {
     return { kept, skipped };
   }
 
-  private async postParkedNotice(channel: ChannelRef, description: string): Promise<MessageRef | undefined> {
+  /** #154: the card carries the queued PROMPT, so a parked/queued item is
+   *  identifiable from the card alone rather than only from its timing. */
+  private async postParkedNotice(
+    channel: ChannelRef,
+    description: string,
+    prompt: string
+  ): Promise<MessageRef | undefined> {
     try {
+      const fields = this.promptField(prompt);
       const p: StructuredPanel = {
         color: PARKED_COLOR,
         title: "📥 Parked",
-        description: description.slice(0, 4096),
-        fields: [],
+        description,
+        fields,
       };
       if (this.adapter.sendPanel) return await this.adapter.sendPanel(channel, p);
-      return await this.adapter.sendMessage(channel, description);
+      const excerpt = fields[0]?.value;
+      return await this.adapter.sendMessage(
+        channel,
+        excerpt ? `${description}\n> ${excerpt}` : description
+      );
     } catch (err) {
       this.logger.warn({ err, channel: channel.id }, "parked notice send failed");
       return undefined;
     }
   }
 
+  /** Lifecycle edits keep the prompt visible (#154) — a card that becomes
+   *  "▶️ Running" or "🚫 Cancelled" should still say WHICH prompt it was. */
   private async editParkedNotice(parked: ParkedPrompt, text: string): Promise<void> {
     if (!parked.noticeMessageId) return;
     const ref: MessageRef = {
@@ -4848,11 +4870,12 @@ export class Orchestrator {
       id: parked.noticeMessageId,
     };
     try {
+      const fields = this.promptField(parked.prompt);
       const p: StructuredPanel = {
         color: PARKED_COLOR,
         title: text.startsWith("▶️") ? "▶️ Running" : "🚫 Cancelled",
-        description: text.slice(0, 4096),
-        fields: [],
+        description: text,
+        fields,
         actions: [],
       };
       if (this.adapter.editPanel) await this.adapter.editPanel(ref, p);
@@ -5867,7 +5890,9 @@ export class Orchestrator {
           channel,
           "▶️ queued prompt",
           "Running now.",
-          PARKED_COLOR
+          PARKED_COLOR,
+          // #154: identifiable from the card alone.
+          this.promptField(prompt)
         );
       } catch (err) {
         this.logger.warn({ err, channel: channelId }, "queue: run-now notice failed");
@@ -7235,6 +7260,11 @@ export class Orchestrator {
       session: "live",
       correlationId: correlation,
       kind: "report_back",
+      // #153: the report-back card names the WORKER thread it came from, and
+      // excerpts the ORIGINAL ask — its own `prompt` is the worker's wrapped
+      // output, which would show the answer where the question belongs.
+      originThreadRef: spec.target,
+      originPrompt: spec.prompt,
       createdUtc: new Date().toISOString(),
     };
     const enqueued = await this.claimAndEnqueueReportBack(correlation, reportSpec, {
@@ -7441,6 +7471,10 @@ export class Orchestrator {
       ``,
       `The multi-hop chain ${chainId} has finished — its final output is above.`,
     ].join("\n");
+    // #153: this delivery's own prompt is the chain's wrapped RESULT, so carry
+    // the chain's original ask for the card's Prompt field. A chain has many
+    // hops and no single source thread, so no originThreadRef.
+    const chainPrompt = this.store.getChain?.(chainId)?.promptPreview;
     const spec: DispatchSpec = {
       id,
       target: originRef,
@@ -7448,6 +7482,7 @@ export class Orchestrator {
       session: "live",
       correlationId: chainId,
       kind: "report_back",
+      ...(chainPrompt ? { originPrompt: chainPrompt } : {}),
       createdUtc: new Date().toISOString(),
     };
     const enqueued = await this.claimAndEnqueueReportBack(chainId, spec, {
@@ -7573,11 +7608,80 @@ export class Orchestrator {
     }
   }
 
-  /** Collapse a prompt to a single-line preview of at most `max` chars. */
+  /** Collapse a prompt to a single-line preview of at most `max` characters,
+   *  using the ONE shared excerpt convention (#153) — word boundary, never
+   *  mid-grapheme. No word cap here: the char cap is the whole budget. */
   private previewLine(s: string, max: number): string {
-    const oneLine = s.replace(/\s+/g, " ").trim();
-    if (oneLine.length <= max) return oneLine;
-    return `${oneLine.slice(0, max - 1).trimEnd()}…`;
+    return promptExcerpt(s, { words: 0, chars: max });
+  }
+
+  /**
+   * The one "what is this, exactly" field every non-status observability card
+   * carries — the queued-prompt card (#154) and the slash-steer card (#155).
+   * Uses the same excerpt convention as the dispatched-turn panel (#153) so a
+   * prompt reads identically wherever you meet it. An empty prompt yields no
+   * field rather than an empty one.
+   */
+  private promptField(
+    prompt: string,
+    name = "Prompt"
+  ): StructuredPanel["fields"] {
+    const excerpt = promptExcerpt(prompt);
+    return excerpt ? [{ name, value: excerpt, inline: false }] : [];
+  }
+
+  /**
+   * Provenance for a dispatched turn's status card (#153): what the work is,
+   * and where it came from.
+   *
+   * Everything redundant is dropped rather than rendered:
+   *   - the source thread, when it IS the thread this card is posted in (an
+   *     isolated preset worker runs in its delegator's own thread);
+   *   - the source channel, when it matches this thread's channel — the common
+   *     case, and pure noise on the card.
+   *
+   * Best-effort by construction: an unresolvable name is simply omitted, never
+   * an error and never a raw snowflake.
+   */
+  private async resolveDispatchOrigin(
+    spec: DispatchSpec,
+    target: ChannelRef
+  ): Promise<PanelOrigin | undefined> {
+    const refs = dispatchOriginRefs(spec);
+    const origin: PanelOrigin = {};
+    const excerpt = promptExcerpt(refs.prompt);
+    if (excerpt) origin.promptExcerpt = excerpt;
+
+    if (refs.threadRef && refs.threadRef !== target.id) {
+      const name = await this.adapter
+        .getThreadName?.({ platform: PLATFORM, id: refs.threadRef })
+        .catch(() => undefined);
+      if (name) origin.threadName = name;
+      const sourceParent = this.channelOfThread({ platform: PLATFORM, id: refs.threadRef });
+      if (sourceParent && sourceParent !== this.channelOfThread(target)) {
+        const channelName = await this.adapter
+          .getChannelName?.(sourceParent)
+          .catch(() => undefined);
+        if (channelName) origin.channelName = channelName;
+      }
+    }
+    return hasOrigin(origin) ? origin : undefined;
+  }
+
+  /**
+   * The channel a thread lives in: the ref's own `parentId` when the caller had
+   * it, else the session record's `parentRef`.
+   *
+   * Load-bearing for the "omit redundant same-channel labels" rule (#153) — a
+   * dispatch target is built from a bare thread id and carries no `parentId`,
+   * so without this fallback every cross-thread card would compare against
+   * `undefined`, decide the channels differ, and print exactly the noise the
+   * issue asks us to drop.
+   */
+  private channelOfThread(ref: ChannelRef): string | undefined {
+    if (ref.parentId) return ref.parentId;
+    if (typeof this.store.getByChannel !== "function") return undefined;
+    return this.store.getByChannel(PLATFORM, ref.id)?.parentRef ?? undefined;
   }
 
   /** The start-indicator header line for a dispatch, e.g.
@@ -7686,11 +7790,13 @@ export class Orchestrator {
     const dispatchAgentId = resolved.profile?.id ?? destRecord?.agentId ?? "";
     const dispatchBrand = resolveAgentBrand(dispatchAgentId, resolved.profile?.brand);
     const dispatchBrandAsset = loadBrandAsset(dispatchBrand);
+    const origin = await this.resolveDispatchOrigin(spec, target);
     const status = new TurnStatus({
       model: resolved.model,
       repoDisplay,
       ...(resolved.effort ? { effort: resolved.effort } : {}),
       titlePrefix: this.dispatchPanelTitle(spec.kind, !!spec.chainId),
+      ...(origin ? { origin } : {}),
       style: destStyle,
       ...(dispatchBrandAsset ? { brandFilename: dispatchBrandAsset.filename } : {}),
       authorName: resolved.profile?.displayName ?? dispatchBrand,
@@ -8308,10 +8414,22 @@ export class Orchestrator {
     return { inline, hint };
   }
 
-  private async sendResultCard(channel: ChannelRef, title: string, description: string, color: number): Promise<void> {
-    const p: StructuredPanel = { color, title, description: description.slice(0, 4096), fields: [] };
+  private async sendResultCard(
+    channel: ChannelRef,
+    title: string,
+    description: string,
+    color: number,
+    fields: StructuredPanel["fields"] = []
+  ): Promise<void> {
+    const p: StructuredPanel = { color, title, description, fields };
     if (this.adapter.sendPanel) await this.adapter.sendPanel(channel, p);
-    else await this.adapter.sendMessage(channel, `${title}\n${description}`);
+    else {
+      const rows = fields.map((f) => `${f.name}: ${f.value}`).join("\n");
+      await this.adapter.sendMessage(
+        channel,
+        rows ? `${title}\n${description}\n${rows}` : `${title}\n${description}`
+      );
+    }
   }
 
   private async sendResultFile(
@@ -10226,12 +10344,22 @@ export class Orchestrator {
       ...(parentId ? { parentId } : {}),
     };
 
+    const operator = this.interactionSpeakerName(i);
+    const source = here;
+
     if (!now) {
       // COOPERATIVE (#63 default): queue the steer into the target's inbox — no
       // cancel, no new turn. The running (or idle) agent absorbs it on its next
       // poll_inbox. Attributed to the operator via speaker-identity (#57).
-      const from = humanInboxFrom(this.interactionSpeakerName(i), i.user.id);
+      const from = humanInboxFrom(operator, i.user.id);
       const { queued } = this.pushHumanInbox(record, from, prompt);
+      await this.postSteerCard({
+        target,
+        prompt,
+        mode: "inbox",
+        operator,
+        ...(source ? { source } : {}),
+      });
       await i.editReply(
         `💬 Queued your steer into thread ${threadId}'s inbox — ${queued} message(s) waiting. ` +
           `The agent reads it at its next inbox poll; no turn was cancelled. ` +
@@ -10242,6 +10370,17 @@ export class Orchestrator {
 
     // Preemptive cancel — identical to `/seam cancel` (graceful ACP cancel).
     const cancelOutcome = await this.router.abortTurn(record.id, { force: false });
+
+    // #155: the durable record goes up BEFORE the turn runs, so the thread
+    // shows what was sent even if the steered turn then fails or times out.
+    await this.postSteerCard({
+      target,
+      prompt,
+      mode: "now",
+      operator,
+      cancelled: cancelOutcome === "cancelled",
+      ...(source ? { source } : {}),
+    });
 
     const framed = frameSteerPrompt(prompt);
     const result = await this.queueOnChannel(threadId, () =>
@@ -10268,6 +10407,62 @@ export class Orchestrator {
         ? `${lead} thread ${threadId}, but it did not complete cleanly: ${result.error.slice(0, 300)}`
         : `${lead} thread ${threadId}.`
     );
+  }
+
+  /**
+   * #155: a slash steer leaves a DURABLE card in the steered thread saying
+   * what was sent. Until now the instruction reached the agent and then
+   * existed nowhere visible — the thread showed a response to a prompt nobody
+   * could see.
+   *
+   * Provenance follows the same rules as a dispatched turn's card (#153): the
+   * operator is always named; the source thread appears only when the steer
+   * came from a DIFFERENT thread, and the source channel only when that
+   * thread also sits in a different channel. Best-effort — a posting failure
+   * must never break the steer itself.
+   */
+  private async postSteerCard(opts: {
+    target: ChannelRef;
+    prompt: string;
+    mode: "inbox" | "now";
+    operator: string;
+    /** `now` mode only: whether a running turn was actually cancelled. */
+    cancelled?: boolean;
+    /** Where the slash command was invoked, when known. */
+    source?: ChannelRef;
+  }): Promise<void> {
+    try {
+      const from: string[] = [opts.operator];
+      const source = opts.source;
+      if (source && source.id !== opts.target.id) {
+        const threadName = await this.adapter
+          .getThreadName?.({ platform: PLATFORM, id: source.id })
+          .catch(() => undefined);
+        if (threadName) from.push(threadName);
+        const sourceParent = this.channelOfThread(source);
+        if (sourceParent && sourceParent !== this.channelOfThread(opts.target)) {
+          const channelName = await this.adapter
+            .getChannelName?.(sourceParent)
+            .catch(() => undefined);
+          if (channelName) from.push(`#${channelName}`);
+        }
+      }
+      const fields: StructuredPanel["fields"] = [
+        { name: "From", value: from.join(" · "), inline: true },
+        ...this.promptField(opts.prompt, "Steer"),
+      ];
+      const title =
+        opts.mode === "now" ? "🧭 Steer · cancel & reprompt" : "🧭 Steer · queued to inbox";
+      const description =
+        opts.mode === "now"
+          ? opts.cancelled
+            ? "Cancelled the running turn and injected this into the live session."
+            : "Nothing was running; injected this into the live session."
+          : "Delivered to the agent's inbox — absorbed at its next poll. No turn was cancelled.";
+      await this.sendResultCard(opts.target, title, description, DISPATCH_COLOR, fields);
+    } catch (err) {
+      this.logger.warn({ err, channel: opts.target.id }, "steer: durable card post failed");
+    }
   }
 
   /** Post a steered node's captured response into its thread. Mirrors

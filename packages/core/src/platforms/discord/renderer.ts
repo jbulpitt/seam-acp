@@ -1,4 +1,6 @@
+import { formatOriginSource, hasOrigin } from "../../core/status-panel.js";
 import { chunkForDiscord } from "../../core/text-chunker.js";
+import { promptExcerpt } from "../../core/prompt-excerpt.js";
 import type { StatusPanel, StructuredPanel } from "../../core/types.js";
 import type { KV, Renderer } from "../renderer.js";
 
@@ -69,6 +71,40 @@ function toolEmoji(label: string): string {
   return "⚙️";
 }
 
+/** Simple cards stay compact, so provenance gets a much tighter excerpt than
+ *  the full card's field. Same convention, smaller budget. */
+const SIMPLE_ORIGIN_WORDS = 24;
+const SIMPLE_ORIGIN_CHARS = 160;
+
+/** Provenance for a dispatched turn (#153), as full-card embed fields:
+ *  `From` (who/where) inline beside Repo/Action, then a full-width `Prompt`.
+ *  Each part is already omitted upstream when it would be redundant. */
+function originFields(state: StatusPanel): StructuredPanel["fields"] {
+  if (!hasOrigin(state.origin)) return [];
+  const fields: StructuredPanel["fields"] = [];
+  const source = formatOriginSource(state.origin);
+  if (source) fields.push({ name: "From", value: source, inline: true });
+  if (state.origin.promptExcerpt) {
+    fields.push({ name: "Prompt", value: state.origin.promptExcerpt, inline: false });
+  }
+  return fields;
+}
+
+/** The same provenance squeezed onto a simple card, which has no field grid:
+ *  `💬 <excerpt>` over `↩ <thread · #channel>`. */
+function originDescription(state: StatusPanel): string | undefined {
+  if (!hasOrigin(state.origin)) return undefined;
+  const lines: string[] = [];
+  const excerpt = promptExcerpt(state.origin.promptExcerpt, {
+    words: SIMPLE_ORIGIN_WORDS,
+    chars: SIMPLE_ORIGIN_CHARS,
+  });
+  if (excerpt) lines.push(`💬 ${excerpt}`);
+  const source = formatOriginSource(state.origin);
+  if (source) lines.push(`↩ ${source}`);
+  return lines.length > 0 ? lines.join("\n") : undefined;
+}
+
 function authorIcon(state: StatusPanel): { authorIconURL?: string } {
   if (!state.brandFilename) return {};
   return { authorIconURL: `attachment://${state.brandFilename}` };
@@ -100,12 +136,14 @@ export const discordRenderer: Renderer = {
       const title = state.titlePrefix
         ? `${state.titlePrefix} · ${state.state}`
         : undefined;
+      const description = originDescription(state);
       return {
         color: COLOR_BY_STATE[state.state],
         ...(title ? { title } : {}),
         author: state.state,
         ...authorIcon(state),
         fields: [],
+        ...(description ? { description } : {}),
         footer: simpleFooter(state),
       };
     }
@@ -118,6 +156,9 @@ export const discordRenderer: Renderer = {
     const fields: StructuredPanel["fields"] = [
       { name: "Repo", value: trim(state.repoDisplay, 80), inline: true },
       { name: "Action", value: trim(state.action, 220), inline: true },
+      // Dispatched turns say what the work is and where it came from (#153);
+      // a normal user turn has no origin and this adds nothing.
+      ...originFields(state),
     ];
     // --- description: activity as inline code "tags" ---
     let description: string | undefined;

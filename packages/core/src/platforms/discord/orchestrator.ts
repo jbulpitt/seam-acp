@@ -1985,17 +1985,26 @@ export class Orchestrator {
       return { ok: false, before, epoch: currentEpoch, message: "No session is bound to that thread." };
     }
 
-    // Fence and reconcile the filesystem owner FIRST. Advancing the channel
-    // epoch or aborting the runtime can release dispatchInjectTurn's old queue
-    // promise; the watcher must already reject that late terminal write or it
-    // can replace the sole running artifact with a done-file before requeue.
-    const dispatches = (await this.dispatchWatcher?.recoverTarget(channelRef)) ?? [];
-    const epoch = this.advanceChannelQueueEpoch(channelRef);
-    await this.clearTurnMarkersForChannel(channelRef, "cancelled", {
-      preserveDispatch: true,
-    });
-    await this.router.abortTurn(record.id, { force: true });
-    await this.router.invalidate(record.id, { clearAcpSession: false }).catch(() => {});
+    // Fence SYNCHRONOUSLY before the first recovery await. Keep that fence
+    // armed through filesystem reconciliation and runtime abort/invalidation,
+    // so neither a claim in the read→rename window nor a recovered tick can
+    // enter the old channel generation.
+    const dispatchFence = this.dispatchWatcher?.fenceTarget(channelRef);
+    let dispatches: string[] = [];
+    let epoch: number;
+    try {
+      dispatches = dispatchFence
+        ? await this.dispatchWatcher!.recoverTarget(dispatchFence)
+        : [];
+      epoch = this.advanceChannelQueueEpoch(channelRef);
+      await this.clearTurnMarkersForChannel(channelRef, "cancelled", {
+        preserveDispatch: true,
+      });
+      await this.router.abortTurn(record.id, { force: true });
+      await this.router.invalidate(record.id, { clearAcpSession: false }).catch(() => {});
+    } finally {
+      if (dispatchFence) this.dispatchWatcher?.releaseTargetFence(dispatchFence);
+    }
     const inbound = this.store.recoverInboundChannel(channelRef, new Date().toISOString());
     if (inbound) this.startRecoveredInbound(inbound);
     void this.dispatchWatcher?.tick().catch((err) =>

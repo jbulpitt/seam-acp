@@ -29,6 +29,8 @@ import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispa
 import { DELEGATION_TERMINAL_STATUSES } from "../packages/core/src/core/types.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { startHealthServer } from "../packages/core/src/lib/health.js";
+import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -1876,5 +1878,196 @@ describe("#174 an ingest job stays registered through its durable tail", () => {
     expect(out.output).toBe("scored");
     expect(turnsAtLedgerWrite).toBe(1); // released only after the tail
     expect(host.activeTurns).toBe(0); // and released for certain
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12. HTTP ingress: /mcp and /ingest (ROOT-LATEST-7 / -7b)
+// ---------------------------------------------------------------------------
+
+describe("#174 HTTP ingress closes admission before the snapshot", () => {
+  /** POST to a real listening server and return status + body. */
+  async function post(port: number, path: string, body = "{}"): Promise<{ status: number; body: string }> {
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+    return { status: res.status, body: await res.text() };
+  }
+  const listeningPort = (s: { address(): unknown }) =>
+    (s.address() as { port: number }).port;
+
+  it("refuses /mcp and /ingest but keeps answering /health", async () => {
+    const health = startHealthServer(0, silent, {
+      onMcp: async (_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: "mcp" }));
+      },
+      onIngest: async (_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: "ingest" }));
+      },
+    });
+    await vi.waitFor(() => expect(health.address()).toBeTruthy());
+    const port = listeningPort(health);
+    try {
+      expect((await post(port, "/mcp")).status).toBe(200);
+      expect((await post(port, "/ingest")).status).toBe(200);
+
+      health.closeIngress();
+
+      const mcp = await post(port, "/mcp");
+      expect(mcp.status).toBe(503);
+      expect(mcp.body).toMatch(/restarting/i);
+      expect((await post(port, "/ingest")).status).toBe(503);
+      // Monitoring still needs a truthful answer while we drain.
+      const h = await fetch(`http://127.0.0.1:${port}/health`);
+      expect(h.status).toBe(200);
+    } finally {
+      health.close();
+    }
+  });
+
+  it("drains a request admitted just before closure, then reports it drained", async () => {
+    const gate = deferred();
+    let finished = false;
+    const health = startHealthServer(0, silent, {
+      onIngest: async (_req, res) => {
+        await gate.promise; // still writing to the store when shutdown starts
+        finished = true;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("{}");
+      },
+    });
+    await vi.waitFor(() => expect(health.address()).toBeTruthy());
+    const port = listeningPort(health);
+    try {
+      const inflight = post(port, "/ingest");
+      await vi.waitFor(() => expect(health.listening).toBe(true));
+      await flush();
+
+      health.closeIngress();
+      let drained: { drained: boolean; outstanding: number } | undefined;
+      const drain = health.drainIngress(5000).then((r) => (drained = r));
+      await flush();
+      // THE POINT: `close()` alone could not see this — the handler promise is
+      // fire-and-forget — so the drain must be what holds shutdown open.
+      expect(drained).toBeUndefined();
+      expect(finished).toBe(false);
+
+      gate.resolve();
+      await drain;
+      expect(drained).toEqual({ drained: true, outstanding: 0 });
+      expect(finished).toBe(true);
+      await inflight;
+    } finally {
+      health.close();
+    }
+  });
+
+  it("gives up on a wedged request instead of stalling shutdown", async () => {
+    const health = startHealthServer(0, silent, {
+      onIngest: () => new Promise<void>(() => {}), // never settles
+    });
+    await vi.waitFor(() => expect(health.address()).toBeTruthy());
+    const port = listeningPort(health);
+    try {
+      void post(port, "/ingest").catch(() => {});
+      await vi.waitFor(async () => {
+        await flush();
+        expect((await health.drainIngress(1)).outstanding).toBe(1);
+      });
+      const started = Date.now();
+      const result = await health.drainIngress(120);
+      expect(result).toEqual({ drained: false, outstanding: 1 });
+      expect(Date.now() - started).toBeLessThan(3000); // bounded, not hung
+    } finally {
+      health.close();
+    }
+  });
+});
+
+describe("#174 seam-mcp shares one gate across both entry points", () => {
+  function makeMcpHost(over: Record<string, unknown> = {}) {
+    const self = Object.create(SeamMcpServer.prototype) as Record<string, unknown>;
+    Object.assign(self, {
+      logger: silent,
+      admissionOpen: true,
+      inFlight: new Set<Promise<void>>(),
+      ...over,
+    });
+    return self as unknown as SeamMcpServer & {
+      handle(req: unknown, res: unknown): Promise<void>;
+      inFlight: Set<Promise<void>>;
+    };
+  }
+  const fakeRes = () => {
+    const out = { status: 0, body: "", headersSent: false };
+    return {
+      out,
+      writeHead(status: number) {
+        out.status = status;
+        out.headersSent = true;
+      },
+      end(body?: string) {
+        out.body = body ?? "";
+      },
+    };
+  };
+
+  it("refuses a tool call once admission is closed, before reading the body", async () => {
+    let bodyRead = false;
+    const server = makeMcpHost({
+      handleAdmitted: async () => {
+        bodyRead = true;
+      },
+    });
+    server.closeAdmission();
+    expect(server.admissionClosed).toBe(true);
+
+    const res = fakeRes();
+    // `handleRequest` is the health-proxy entry; it delegates to the same
+    // private `handle` the direct listener uses, so one gate covers both.
+    await server.handleRequest({ method: "POST", url: "/mcp" } as never, res as never);
+    expect(res.out.status).toBe(503);
+    expect(res.out.body).toMatch(/restarting/i);
+    expect(bodyRead).toBe(false); // nothing the call would do ever started
+  });
+
+  it("tracks an admitted call so drainRequests can wait for it", async () => {
+    const gate = deferred();
+    let finished = false;
+    const server = makeMcpHost({
+      handleAdmitted: async () => {
+        await gate.promise;
+        finished = true;
+      },
+    });
+
+    const call = server.handleRequest({ method: "POST", url: "/mcp" } as never, fakeRes() as never);
+    expect(server.inFlightCount).toBe(1);
+
+    server.closeAdmission(); // admitted calls keep running
+    let drained: { drained: boolean } | undefined;
+    const drain = server.drainRequests(5000).then((r) => (drained = r));
+    await flush();
+    expect(drained).toBeUndefined();
+    expect(finished).toBe(false);
+
+    gate.resolve();
+    await call;
+    await drain;
+    expect(drained).toEqual({ drained: true, outstanding: 0 });
+    expect(server.inFlightCount).toBe(0);
+  });
+
+  it("bounds the drain rather than waiting on a wedged tool call", async () => {
+    const server = makeMcpHost({ handleAdmitted: () => new Promise<void>(() => {}) });
+    void server.handleRequest({ method: "POST", url: "/mcp" } as never, fakeRes() as never);
+    server.closeAdmission();
+    const started = Date.now();
+    expect(await server.drainRequests(120)).toEqual({ drained: false, outstanding: 1 });
+    expect(Date.now() - started).toBeLessThan(3000);
   });
 });

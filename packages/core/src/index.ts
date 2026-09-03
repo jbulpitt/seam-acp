@@ -1217,6 +1217,25 @@ async function main(): Promise<void> {
     parkedManager.stop();
     cardGifs.stop();
     watchManager.stop();
+    // #174 HTTP ingress closes FIRST, and synchronously. `/mcp` and `/ingest`
+    // reach tools that write the ledger and enqueue dispatch specs, and both
+    // stayed open across the whole phase-1 quiesce — so a call arriving after
+    // the snapshot could still be writing when the store closed. Admission is
+    // shut without awaiting anything, then the calls ALREADY admitted are
+    // drained (bounded) while the store is still open, so their durable work
+    // lands. Anything they enqueue afterwards is left in `pending/` by the
+    // closed watcher intake and delivered on the next boot.
+    seamMcpServer?.closeAdmission();
+    health.closeIngress();
+    const httpDrain = config.SHUTDOWN_QUIESCE_TIMEOUT_MS;
+    await Promise.all([
+      seamMcpServer
+        ?.drainRequests(httpDrain)
+        .catch((err) => logger.warn({ err }, "seam-mcp request drain failed")),
+      health
+        .drainIngress(httpDrain)
+        .catch((err) => logger.warn({ err }, "health ingress drain failed")),
+    ]);
     // #174 phase 1: quiesce BEFORE anything is torn down. `dispatchWatcher.stop()`
     // only closes intake; `quiesce()` is the barrier that waits for claimed
     // dispatches, active channel turns, and post-turn continuations to settle
@@ -1231,7 +1250,11 @@ async function main(): Promise<void> {
     voiceConsoleManager.shutdown();
     liveHelpManager.stopAll();
     stopPresetsWatch?.();
-    await seamMcpServer?.stop().catch((err) =>
+    // Connection close only — admission and request draining already happened
+    // above. Bounded: `server.close()` waits on open connections, so awaiting
+    // it unbounded here would stall shutdown exactly when a hung tool call was
+    // what caused the quiesce timeout.
+    await seamMcpServer?.stop({ timeoutMs: 5000 }).catch((err) =>
       logger.warn({ err }, "seam-mcp stop failed")
     );
     stopTunnelGist?.();

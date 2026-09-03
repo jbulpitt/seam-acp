@@ -30,6 +30,17 @@ import { DELEGATION_TERMINAL_STATUSES } from "../packages/core/src/core/types.js
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { startHealthServer } from "../packages/core/src/lib/health.js";
+import {
+  startShutdownBudget,
+  runBoundedStep,
+  safeToCloseResources,
+  undrainedStages,
+  shutdownFitsHostBudget,
+  HOST_SIGKILL_BUDGET_MS,
+  SHUTDOWN_BUDGET_MS,
+  SHUTDOWN_EXIT_FALLBACK_MS,
+  SHUTDOWN_OVERHEAD_ALLOWANCE_MS,
+} from "../packages/core/src/lib/shutdown-budget.js";
 import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
 import net from "node:net";
 
@@ -974,7 +985,7 @@ describe("#174 admission gates", () => {
     expect(lookup).not.toHaveBeenCalled(); // never reached the store-backed path
   });
 
-  it("refuses a component click without dispatching to any handler", () => {
+  it("refuses a component click without dispatching to any handler", async () => {
     const replyEphemeral = vi.fn(async () => {});
     const onComponent = vi.fn();
     const self = makeIngressHost<{ install(): void }>({
@@ -988,8 +999,12 @@ describe("#174 admission gates", () => {
     });
 
     self.install();
-    const wrapper = onComponent.mock.calls[0]![0] as (e: unknown) => void;
-    wrapper({ customId: "cfg:x", replyEphemeral });
+    // Awaited, not called bare: the refusal now runs inside the promise chain
+    // (so a SYNCHRONOUS throw from `refuse` is caught too), which costs it one
+    // microtask. The wrapper returns that promise precisely so callers — the
+    // adapter included — can wait for it.
+    const wrapper = onComponent.mock.calls[0]![0] as (e: unknown) => Promise<void>;
+    await wrapper({ customId: "cfg:x", replyEphemeral });
     expect(replyEphemeral).toHaveBeenCalledOnce();
     expect(String(replyEphemeral.mock.calls[0]![0])).toMatch(/Restarting/i);
   });
@@ -2230,5 +2245,963 @@ describe("#174 the component wrapper AWAITS its handlers, not just gates them", 
     expect((await phase1).drained).toBe(true);
     expect(finished).toBe(true);
     expect(host.inboundWork.size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 14. One shared budget for the whole shutdown (review blocker 5)
+// ---------------------------------------------------------------------------
+
+describe("#174 shutdown is bounded as a WHOLE, not just per stage", () => {
+  /** A budget on a hand-cranked clock, so the arithmetic is exact. */
+  function fakeBudget(totalMs: number) {
+    let now = 0;
+    const budget = startShutdownBudget(totalMs, () => now);
+    /** Spend a stage that uses its entire allowance. */
+    const spend = (capMs: number): number => {
+      const ms = budget.forStage(capMs);
+      now += ms;
+      return ms;
+    };
+    return { budget, spend, elapsed: () => now };
+  }
+
+  it("hands a stage its own ceiling while the budget is ample", () => {
+    const { budget } = fakeBudget(20_000);
+    expect(budget.forStage(5_000)).toBe(5_000);
+    expect(budget.remaining()).toBe(20_000);
+    expect(budget.expired()).toBe(false);
+  });
+
+  it("caps a stage at what is LEFT, never at its own ceiling", () => {
+    const { budget, spend } = fakeBudget(12_000);
+    expect(spend(10_000)).toBe(10_000);
+    // The next stage would like 10s; only 2s of budget survives.
+    expect(budget.forStage(10_000)).toBe(2_000);
+  });
+
+  it("the four drain stages cannot sum past the budget", () => {
+    // The exact sequence index.ts runs: http drain, pre-dispose quiesce,
+    // seam-mcp stop, post-dispose drain — each asking for its full ceiling.
+    const { budget, spend, elapsed } = fakeBudget(SHUTDOWN_BUDGET_MS);
+    const stages = [spend(10_000), spend(10_000), spend(5_000), spend(10_000)];
+    expect(stages.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(SHUTDOWN_BUDGET_MS);
+    expect(elapsed()).toBeLessThanOrEqual(SHUTDOWN_BUDGET_MS);
+    expect(budget.expired()).toBe(true);
+    // And a stage asked for after expiry gives up instantly rather than
+    // starting a fresh timeout on a process that is already out of time.
+    expect(budget.forStage(10_000)).toBe(0);
+  });
+
+  it("NEGATIVE CONTROL: the same four ceilings sequentially overrun the host", () => {
+    // What the code did before: a fresh timeout per stage, so the ceilings add
+    // up. 35s is past SIGKILL — the process is killed mid-teardown, which is
+    // the failure mode all of #174 exists to prevent.
+    const sequential = 10_000 + 10_000 + 5_000 + 10_000;
+    expect(sequential).toBe(35_000);
+    expect(sequential).toBeGreaterThan(HOST_SIGKILL_BUDGET_MS);
+    // The shared budget clamps that same demand to something that fits.
+    expect(SHUTDOWN_BUDGET_MS).toBeLessThan(sequential);
+  });
+
+  it("worst case — budget + exit fallback + overhead — stays under SIGKILL", () => {
+    const worstCase =
+      SHUTDOWN_BUDGET_MS + SHUTDOWN_EXIT_FALLBACK_MS + SHUTDOWN_OVERHEAD_ALLOWANCE_MS;
+    expect(worstCase).toBeLessThan(HOST_SIGKILL_BUDGET_MS);
+    // Real margin, not a tie: the earlier 25s budget left exactly 0ms once the
+    // 5s fallback was counted, which is not a contract, it is a coincidence.
+    expect(HOST_SIGKILL_BUDGET_MS - worstCase).toBeGreaterThanOrEqual(3_000);
+    expect(shutdownFitsHostBudget()).toBe(true);
+  });
+
+  it("a zero budget degrades to giving up immediately, not to waiting forever", () => {
+    const { budget } = fakeBudget(0);
+    expect(budget.forStage(10_000)).toBe(0);
+    expect(budget.expired()).toBe(true);
+  });
+
+  it("never returns a negative allowance once the clock has run past the budget", () => {
+    let now = 0;
+    const budget = startShutdownBudget(1_000, () => now);
+    now = 9_999; // a stage badly overran its slice
+    expect(budget.remaining()).toBe(0);
+    expect(budget.forStage(5_000)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 15. Teardown is conditional on EVERY drain (review blocker 2)
+// ---------------------------------------------------------------------------
+
+describe("#174 nothing is explicitly closed while callbacks may still resume", () => {
+  /** Every stage index.ts records a verdict for, in the order it runs them. */
+  const ALL_STAGES = [
+    "seam-mcp-ingress",
+    "health-ingress",
+    "pre-dispose-quiesce",
+    "voice-console-shutdown",
+    "router-dispose",
+    "post-dispose-drain",
+  ] as const;
+  const allDrained = () => ALL_STAGES.map((stage) => ({ stage, drained: true }));
+
+  it("closes only when every stage drained", () => {
+    expect(safeToCloseResources(allDrained())).toBe(true);
+    expect(undrainedStages(allDrained())).toEqual([]);
+  });
+
+  it.each(ALL_STAGES)("refuses to close when %s did not drain", (failing) => {
+    const verdicts = allDrained().map((v) =>
+      v.stage === failing ? { ...v, drained: false } : v
+    );
+    expect(safeToCloseResources(verdicts)).toBe(false);
+    // The operator is told WHICH stage held it open, not just that it did.
+    expect(undrainedStages(verdicts)).toEqual([failing]);
+  });
+
+  it("names EVERY stage that failed, not just the first", () => {
+    const verdicts = allDrained().map((v) =>
+      v.stage === "health-ingress" || v.stage === "router-dispose"
+        ? { ...v, drained: false }
+        : v
+    );
+    expect(undrainedStages(verdicts)).toEqual(["health-ingress", "router-dispose"]);
+  });
+
+  it("an empty verdict list is not treated as proof of a clean drain by accident", () => {
+    // Vacuously true — which is only safe because index.ts pushes a verdict for
+    // every stage before this is consulted. Pinned so a lost `push` is visible
+    // as a behaviour change here rather than as a silent early close.
+    expect(safeToCloseResources([])).toBe(true);
+    expect(ALL_STAGES).toHaveLength(6);
+  });
+
+  /**
+   * The blocker, end to end, against the REAL health server.
+   *
+   * A request is admitted, the drain deadline expires while it is still
+   * running, and only then does it resume into its store and adapter work. A
+   * timed-out drain is exactly the case where the old code closed anyway.
+   */
+  async function resumeAfterDeadline(opts: { honourVerdicts: boolean }) {
+    const store = makeClosableStore();
+    const adapter = makeStoppableAdapter();
+    const gate = deferred();
+    let resumed = false;
+    const health = startHealthServer(0, silent, {
+      onIngest: async (_req, res) => {
+        await gate.promise; // still running when the deadline expires
+        store.getDelegation("late-ingest"); // must not hit a closed handle
+        await adapter.sendMessage(); // nor a stopped adapter
+        resumed = true;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end("{}");
+      },
+    });
+    await vi.waitFor(() => expect(health.address()).toBeTruthy());
+    const port = (health.address() as { port: number }).port;
+    const inflight = fetch(`http://127.0.0.1:${port}/ingest`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+
+    // Admitted and tracked before admission closes.
+    await vi.waitFor(async () => {
+      await flush();
+      expect((await health.drainIngress(1)).outstanding).toBe(1);
+    });
+    health.closeIngress();
+
+    // The drain gives up — bounded, as it must be.
+    const drain = await health.drainIngress(120);
+    expect(drain).toEqual({ drained: false, outstanding: 1 });
+
+    const verdicts = [
+      { stage: "seam-mcp-ingress", drained: true },
+      { stage: "health-ingress", drained: drain.drained },
+      { stage: "pre-dispose-quiesce", drained: true },
+      { stage: "post-dispose-drain", drained: true },
+    ];
+    // The production predicate decides, not the test.
+    if (!opts.honourVerdicts || safeToCloseResources(verdicts)) {
+      await adapter.stop();
+      store.close();
+    }
+
+    gate.resolve();
+    const response = await inflight;
+    await vi.waitFor(() => expect(health.listening).toBe(true));
+    await flush();
+    health.close();
+    return { store, adapter, verdicts, resumed: () => resumed, status: response.status };
+  }
+
+  it("a request that resumes after its deadline never sees a closed store or adapter", async () => {
+    const { store, adapter, verdicts, resumed, status } = await resumeAfterDeadline({
+      honourVerdicts: true,
+    });
+
+    expect(safeToCloseResources(verdicts)).toBe(false);
+    expect(undrainedStages(verdicts)).toEqual(["health-ingress"]);
+    // Nothing was explicitly torn down under it…
+    expect(store.closed).toBe(false);
+    expect(adapter.stopped).toBe(false);
+    // …so the late work completed cleanly and the caller got its answer.
+    expect(store.violations).toEqual([]);
+    expect(adapter.violations).toEqual([]);
+    expect(resumed()).toBe(true);
+    expect(status).toBe(200);
+  });
+
+  it("NEGATIVE CONTROL: closing anyway corrupts the very work the drain missed", async () => {
+    // Proves the test can detect the regression rather than trusting the rule.
+    const { store, adapter, resumed, status } = await resumeAfterDeadline({
+      honourVerdicts: false,
+    });
+
+    expect(store.closed).toBe(true);
+    expect(store.violations).toContain("getDelegation");
+    // The damage is not a missing side effect: the store error propagates out
+    // of the handler, so the request that had been admitted fails outright.
+    expect(resumed()).toBe(false);
+    expect(status).toBe(500);
+    expect(adapter.stopped).toBe(true);
+  });
+
+  it("a clean shutdown still closes everything — the rule is not 'never close'", async () => {
+    const store = makeClosableStore();
+    const adapter = makeStoppableAdapter();
+    const verdicts = [
+      { stage: "seam-mcp-ingress", drained: true },
+      { stage: "health-ingress", drained: true },
+      { stage: "pre-dispose-quiesce", drained: true },
+      { stage: "post-dispose-drain", drained: true },
+    ];
+    if (safeToCloseResources(verdicts)) {
+      await adapter.stop();
+      store.close();
+    }
+    expect(store.closed).toBe(true);
+    expect(adapter.stopped).toBe(true);
+    expect(undrainedStages(verdicts)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 16. Tracking must not swallow, and must not miss a sync throw (blockers 3+4)
+// ---------------------------------------------------------------------------
+
+describe("#174 runInbound tracks without swallowing", () => {
+  it("an admitted handler's failure still rejects to the adapter boundary", async () => {
+    const log = makeCapturingLogger();
+    const host = makeQuiesceHost({ logger: log.logger, intakeStopped: false });
+
+    await expect(host.runInbound("slash", async () => {
+      throw new Error("handler boom");
+    })).rejects.toThrow(/handler boom/);
+
+    // Still logged with its ingress label, and still fully untracked after.
+    expect(log.find(/inbound handler failed/)).toBeDefined();
+    expect(host.inboundWork.size).toBe(0);
+  });
+
+  it("a SYNCHRONOUS throw is tracked too, and still rejects", async () => {
+    const host = makeQuiesceHost({ intakeStopped: false });
+    let trackedDuring = -1;
+
+    const running = host.runInbound("component", () => {
+      trackedDuring = host.inboundWork.size;
+      throw new Error("sync boom");
+    });
+    await expect(running).rejects.toThrow(/sync boom/);
+    // The old shape called `run()` OUTSIDE the chain, so a sync throw escaped
+    // before anything was registered — the drain never knew it existed.
+    // Now the handler is already IN the tracking set by the time it runs, which
+    // closes the window where it could throw while invisible to the barrier.
+    expect(trackedDuring).toBe(1);
+    expect(host.inboundWork.size).toBe(0); // and removed once it settles
+  });
+
+  it("a failing handler is still drained, not left in the tracking set", async () => {
+    const host = makeQuiesceHost({ intakeStopped: false });
+    const gate = deferred();
+    const running = host
+      .runInbound("slash", async () => {
+        await gate.promise;
+        throw new Error("late boom");
+      })
+      .catch(() => "rejected");
+
+    await flush();
+    expect(host.inboundWork.size).toBe(1); // the barrier can see it
+
+    let drained = false;
+    const phase1 = host.quiesce({ timeoutMs: 5000 }).then((r) => ((drained = true), r));
+    await flush();
+    expect(drained).toBe(false); // and is genuinely held by it
+
+    gate.resolve();
+    expect((await phase1).drained).toBe(true); // a handler FAILING is not a barrier failure
+    expect(await running).toBe("rejected");
+    expect(host.inboundWork.size).toBe(0);
+  });
+
+  it("a refusal that throws SYNCHRONOUSLY is still silent", async () => {
+    const host = makeQuiesceHost({ intakeStopped: true });
+    const run = vi.fn(async () => {});
+
+    // `Promise.resolve(refuse())` would have let this escape the `.catch`,
+    // turning a deliberately silent refusal into a rejected inbound.
+    await expect(
+      host.runInbound("choice", run, () => {
+        throw new Error("interaction already acknowledged");
+      })
+    ).resolves.toBeUndefined();
+    expect(run).not.toHaveBeenCalled();
+    expect(host.inboundWork.size).toBe(0); // a refusal is never tracked
+  });
+
+  it("a refusal that rejects ASYNCHRONOUSLY is likewise silent", async () => {
+    const host = makeQuiesceHost({ intakeStopped: true });
+    await expect(
+      host.runInbound("choice", async () => {}, async () => {
+        throw new Error("transport gone");
+      })
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("#174 the component aggregate reports every handler's failure", () => {
+  /** Build the real `install()` wrapper with all four handlers controllable. */
+  function componentHost(over: Record<string, unknown>) {
+    const log = makeCapturingLogger();
+    const onComponent = vi.fn();
+    const host = makeQuiesceHost({
+      logger: log.logger,
+      intakeStopped: false,
+      adapter: { onMessage: () => {}, onComponent, setActiveChannelCheck: () => {} },
+      store: {},
+      watchSentinel: () => {},
+      handleConfigEditorComponent: async () => {},
+      handleTtsEditorComponent: async () => {},
+      handleVoiceConsoleComponent: async () => {},
+      handleQuotaCardComponent: async () => {},
+      ...over,
+    }) as unknown as ReturnType<typeof makeQuiesceHost> & { install(): void };
+    host.install();
+    const wrapper = onComponent.mock.calls[0]![0] as (e: unknown) => Promise<void>;
+    return { host, log, wrapper };
+  }
+  const evt = { customId: "cfg:x", replyEphemeral: async () => {}, followUpEphemeral: async () => {} };
+
+  it("logs a CONFIG EDITOR failure instead of discarding it", async () => {
+    // The one handler with no catch of its own: `allSettled` dropped its
+    // rejection, so a failed config edit was indistinguishable from a
+    // successful one in the log.
+    const { log, wrapper } = componentHost({
+      handleConfigEditorComponent: async () => {
+        throw new Error("config write failed");
+      },
+    });
+
+    await wrapper(evt);
+    const entry = log.find(/component handler failed/);
+    expect(entry?.level).toBe("warn");
+    expect(entry?.data).toMatchObject({ handler: "config editor" });
+    expect(String((entry?.data as { err?: Error }).err)).toMatch(/config write failed/);
+  });
+
+  it("names the handler that failed, so the log points at one of four", async () => {
+    const { log, wrapper } = componentHost({
+      handleQuotaCardComponent: async () => {
+        throw new Error("quota boom");
+      },
+    });
+    await wrapper(evt);
+    expect(log.find(/component handler failed/)?.data).toMatchObject({
+      handler: "quota card",
+      customId: "cfg:x",
+    });
+  });
+
+  it("catches a handler that throws SYNCHRONOUSLY", async () => {
+    const { log, wrapper } = componentHost({
+      handleTtsEditorComponent: () => {
+        throw new Error("sync tts boom");
+      },
+    });
+    await wrapper(evt);
+    expect(log.find(/component handler failed/)?.data).toMatchObject({ handler: "tts editor" });
+  });
+
+  it("one failing handler does not stop the other three", async () => {
+    const ran: string[] = [];
+    const { wrapper } = componentHost({
+      handleConfigEditorComponent: async () => {
+        throw new Error("config boom");
+      },
+      handleTtsEditorComponent: async () => void ran.push("tts"),
+      handleVoiceConsoleComponent: async () => void ran.push("voice"),
+      handleQuotaCardComponent: async () => void ran.push("quota"),
+    });
+
+    await wrapper(evt);
+    expect(ran.sort()).toEqual(["quota", "tts", "voice"]);
+  });
+
+  it("reports a RECOVERY that itself fails, instead of swallowing it", async () => {
+    // The Voice Console handler is the one with a user-facing recovery, so it
+    // can fail twice: the action, then the apology. The old code ended that
+    // chain in `.catch(() => {})` — the action failed, the user was never told,
+    // and the second failure was logged nowhere.
+    const { log, wrapper } = componentHost({
+      handleVoiceConsoleComponent: async () => {
+        throw new Error("voice boom");
+      },
+    });
+
+    await wrapper({
+      customId: "vc:x",
+      replyEphemeral: async () => {
+        throw new Error("reply failed");
+      },
+      followUpEphemeral: async () => {
+        throw new Error("follow-up failed");
+      },
+    });
+    // Both are reported: the original action, and the fact that we could not
+    // even tell the user about it.
+    expect(log.find(/voice console component failed/)).toBeDefined();
+    const outer = log.find(/component handler failed/);
+    expect(outer?.data).toMatchObject({ handler: "voice console" });
+    expect(String((outer?.data as { err?: Error }).err)).toMatch(/follow-up failed/);
+  });
+
+  it("a recovery that SUCCEEDS is not reported as a handler failure", async () => {
+    const replyEphemeral = vi.fn(async () => {});
+    const { log, wrapper } = componentHost({
+      handleVoiceConsoleComponent: async () => {
+        throw new Error("voice boom");
+      },
+    });
+
+    await wrapper({ customId: "vc:x", replyEphemeral, followUpEphemeral: async () => {} });
+    expect(replyEphemeral).toHaveBeenCalledOnce();
+    expect(String(replyEphemeral.mock.calls[0]![0])).toMatch(/voice boom/);
+    expect(log.find(/voice console component failed/)).toBeDefined(); // still logged
+    expect(log.find(/component handler failed/)).toBeUndefined(); // but recovered
+  });
+
+  it("the wrapper's promise is what the adapter boundary awaits", async () => {
+    // Returned rather than `void`-ed, so `handlePersistentComponent` — and the
+    // event boundary that logs a crash — can actually see it settle.
+    const gate = deferred();
+    let finished = false;
+    const { wrapper } = componentHost({
+      handleQuotaCardComponent: async () => {
+        await gate.promise;
+        finished = true;
+      },
+    });
+
+    const running = wrapper(evt);
+    expect(running).toBeInstanceOf(Promise);
+    await flush();
+    expect(finished).toBe(false);
+    gate.resolve();
+    await running;
+    expect(finished).toBe(true);
+  });
+});
+
+describe("#174 the health server survives a handler that throws synchronously", () => {
+  it("answers 500 and stays tracked instead of taking the process down", async () => {
+    // `Promise.resolve(handler(req, res))` invoked the handler OUTSIDE the
+    // chain: a sync throw escaped into the `createServer` callback — an
+    // uncaught exception — AND left the request untracked, so the drain could
+    // not see it and the client hung until timeout.
+    const health = startHealthServer(0, silent, {
+      onIngest: () => {
+        throw new Error("sync handler boom");
+      },
+    });
+    await vi.waitFor(() => expect(health.address()).toBeTruthy());
+    const port = (health.address() as { port: number }).port;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/ingest`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(res.status).toBe(500);
+      expect(await res.text()).toMatch(/failed/i);
+      // It went through the tracked path, so the drain accounts for it.
+      expect(await health.drainIngress(1000)).toEqual({ drained: true, outstanding: 0 });
+    } finally {
+      health.close();
+    }
+  });
+
+  it("still drains an async handler that rejects", async () => {
+    const health = startHealthServer(0, silent, {
+      onMcp: async () => {
+        throw new Error("async handler boom");
+      },
+    });
+    await vi.waitFor(() => expect(health.address()).toBeTruthy());
+    const port = (health.address() as { port: number }).port;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/mcp`, { method: "POST", body: "{}" });
+      expect(res.status).toBe(500);
+      expect(await health.drainIngress(1000)).toEqual({ drained: true, outstanding: 0 });
+    } finally {
+      health.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 17. A reconstructed route must actually be USED (legacy forward chain)
+// ---------------------------------------------------------------------------
+
+/**
+ * `completionRoute` can reconstruct routing a legacy done-file never carried:
+ * a pre-#174 `forward` recovers its chain id from the ledger row's
+ * correlationId. That reconstruction is worthless unless the replay reads it —
+ * and it did not. It rebuilt the spec from `result.chainId`, which for a legacy
+ * file is `undefined`, so `advanceChain` hit its own `if (!chainId) return`
+ * guard, did nothing, and the row was terminalized regardless: the chain
+ * stopped dead with no next hop and no final delivery, and the terminal row
+ * meant the next boot skipped the done-file entirely.
+ *
+ * These tests deliberately assert the ENQUEUED SPEC, not that a stub was
+ * called: classifying the route correctly is exactly what the broken version
+ * already did.
+ */
+function makeChainStore() {
+  const ledger = makeLedger();
+  const chains = new Map<
+    string,
+    {
+      id: string;
+      status: string;
+      hops: string[];
+      currentIndex: number;
+      originRef: string;
+      promptPreview?: string;
+    }
+  >();
+  return {
+    ...ledger,
+    rows: ledger.rows,
+    chains,
+    getChain: (id: string) => chains.get(id) ?? null,
+    /** Mirrors SessionStore.advanceChain: pop one hop, bump only when one was popped. */
+    advanceChain(id: string) {
+      const current = chains.get(id);
+      if (!current || current.status !== "running") return null;
+      const hops = [...current.hops];
+      const nextHop = hops.length > 0 ? hops.shift()! : null;
+      current.hops = hops;
+      if (nextHop !== null) current.currentIndex += 1;
+      return { chain: { ...current }, nextHop };
+    },
+    completeChain(id: string, status = "completed") {
+      const c = chains.get(id);
+      if (c) c.status = status;
+    },
+  };
+}
+
+/** A replay host wired to the REAL chain machinery, not an `advanceChain` stub. */
+function makeChainReplayHost(store: ReturnType<typeof makeChainStore>) {
+  const self: Record<string, unknown> = {
+    logger: silent,
+    config: { DATA_DIR: dataDir },
+    store,
+    replayCompletedDispatch: Orchestrator.prototype["replayCompletedDispatch" as never],
+    enqueueReportBack: Orchestrator.prototype["enqueueReportBack" as never],
+    claimAndEnqueueReportBack: Orchestrator.prototype["claimAndEnqueueReportBack" as never],
+    advanceChain: Orchestrator.prototype["advanceChain" as never],
+    claimChainHopAdvance: Orchestrator.prototype["claimChainHopAdvance" as never],
+    enqueueChainDelivery: Orchestrator.prototype["enqueueChainDelivery" as never],
+  };
+  return self as unknown as {
+    replayCompletedDispatch(r: Record<string, unknown>, route: unknown): Promise<void>;
+  };
+}
+
+/** Every spec currently sitting in `pending/`. */
+async function pendingSpecs(): Promise<Record<string, unknown>[]> {
+  const names = await readdir(dirs.pending);
+  return Promise.all(
+    names.map(async (n) => JSON.parse(await readFile(path.join(dirs.pending, n), "utf8")))
+  );
+}
+
+describe("#174 a legacy forward's reconstructed chain is actually advanced", () => {
+  it("enqueues the NEXT HOP, not just a correctly-classified route", async () => {
+    const store = makeChainStore();
+    // A pre-#174 done-file: no `kind`, no `chainId`, no `returnTo`.
+    const legacyDone = {
+      id: "legacy-fwd",
+      target: "worker-a",
+      status: "completed" as const,
+      output: "HOP ONE OUTPUT",
+    };
+    expect(legacyDone).not.toHaveProperty("chainId"); // the whole premise
+
+    // The row carries the only surviving evidence: correlationId IS the chain.
+    store.rows.set("legacy-fwd", {
+      id: "legacy-fwd",
+      kind: "forward",
+      status: "interrupted",
+      correlationId: "chain-legacy",
+    });
+    store.chains.set("chain-legacy", {
+      id: "chain-legacy",
+      status: "running",
+      hops: ["worker-b"], // one hop still to run
+      currentIndex: 0,
+      originRef: "origin-thread",
+      promptPreview: "the original chain ask",
+    });
+
+    const row = { status: "interrupted", kind: "forward", correlationId: "chain-legacy" };
+    const route = completionRoute(legacyDone as never, row);
+    // Routing alone was never the bug — this passed before the fix too.
+    expect(route).toEqual({ action: "chain", chainId: "chain-legacy" });
+
+    await makeChainReplayHost(store).replayCompletedDispatch(legacyDone, route);
+
+    // THE ASSERTION THAT FAILED BEFORE: the next hop is really on disk.
+    // A named (preset) hop runs isolated and posts into the chain's origin, so
+    // the worker name is on `preset` and `target` is the origin thread.
+    const hop = (await pendingSpecs()).find((s) => s.preset === "worker-b");
+    expect(hop).toBeDefined();
+    expect(hop).toMatchObject({
+      preset: "worker-b",
+      target: "origin-thread",
+      session: "isolated",
+      kind: "forward",
+      chainId: "chain-legacy",
+      prompt: "HOP ONE OUTPUT", // this hop's output piped into the next
+    });
+    // The chain really moved, and is still running.
+    expect(store.chains.get("chain-legacy")).toMatchObject({
+      status: "running",
+      hops: [],
+      currentIndex: 1,
+    });
+    // And only now is the worker row terminal.
+    expect(store.rows.get("legacy-fwd")!.status).toBe("completed");
+  });
+
+  it("delivers the FINAL output to the origin when no hops remain", async () => {
+    const store = makeChainStore();
+    const legacyDone = {
+      id: "legacy-last",
+      target: "worker-z",
+      status: "completed" as const,
+      output: "THE FINAL ANSWER",
+    };
+    store.rows.set("legacy-last", {
+      id: "legacy-last",
+      kind: "forward",
+      status: "interrupted",
+      correlationId: "chain-final",
+    });
+    store.chains.set("chain-final", {
+      id: "chain-final",
+      status: "running",
+      hops: [], // last hop just finished
+      currentIndex: 2,
+      originRef: "origin-thread",
+      promptPreview: "the original chain ask",
+    });
+
+    const route = completionRoute(legacyDone as never, {
+      status: "interrupted",
+      kind: "forward",
+      correlationId: "chain-final",
+    });
+    await makeChainReplayHost(store).replayCompletedDispatch(legacyDone, route);
+
+    const delivery = (await pendingSpecs()).find((s) => s.target === "origin-thread");
+    expect(delivery).toBeDefined();
+    expect(delivery).toMatchObject({ kind: "report_back", correlationId: "chain-final" });
+    expect(String(delivery!.prompt)).toContain("THE FINAL ANSWER");
+    expect(String(delivery!.prompt)).toContain('<seam-chain-result chain="chain-final">');
+    expect(store.chains.get("chain-final")!.status).toBe("completed");
+    expect(store.rows.get("legacy-last")!.status).toBe("completed");
+  });
+
+  it("NEGATIVE CONTROL: a route whose chainId is dropped advances nothing", async () => {
+    // Reproduces the old spec-building rule — take the chain id from the
+    // done-file only — against the SAME scenario, to prove these tests would
+    // actually catch a revert rather than passing either way.
+    const store = makeChainStore();
+    store.rows.set("legacy-drop", {
+      id: "legacy-drop",
+      kind: "forward",
+      status: "interrupted",
+      correlationId: "chain-drop",
+    });
+    store.chains.set("chain-drop", {
+      id: "chain-drop",
+      status: "running",
+      hops: ["worker-b"],
+      currentIndex: 0,
+      originRef: "origin-thread",
+    });
+
+    await makeChainReplayHost(store).replayCompletedDispatch(
+      { id: "legacy-drop", target: "worker-a", status: "completed", output: "HOP ONE OUTPUT" },
+      // The route the OLD code effectively acted on: classified as a chain, but
+      // with no id to carry into the spec.
+      { action: "chain", chainId: undefined } as never
+    );
+
+    expect(await pendingSpecs()).toHaveLength(0); // no hop, no delivery…
+    expect(store.chains.get("chain-drop")).toMatchObject({ hops: ["worker-b"], currentIndex: 0 });
+    // …yet the row went terminal anyway, so the next boot never comes back.
+    // That combination is the silent loss.
+    expect(store.rows.get("legacy-drop")!.status).toBe("completed");
+  });
+
+  it("a MODERN forward that carries its own chainId is unaffected", async () => {
+    const store = makeChainStore();
+    store.rows.set("modern-fwd", { id: "modern-fwd", kind: "forward", status: "running" });
+    store.chains.set("chain-modern", {
+      id: "chain-modern",
+      status: "running",
+      hops: ["worker-c"],
+      currentIndex: 0,
+      originRef: "origin-thread",
+    });
+    const done = {
+      id: "modern-fwd",
+      target: "worker-a",
+      status: "completed" as const,
+      output: "MODERN OUTPUT",
+      kind: "forward",
+      chainId: "chain-modern",
+    };
+
+    const route = completionRoute(done as never, { status: "running", kind: "forward" });
+    expect(route).toEqual({ action: "chain", chainId: "chain-modern" });
+    await makeChainReplayHost(store).replayCompletedDispatch(done, route);
+
+    const hop = (await pendingSpecs()).find((s) => s.preset === "worker-c");
+    expect(hop).toMatchObject({
+      preset: "worker-c",
+      chainId: "chain-modern",
+      prompt: "MODERN OUTPUT",
+    });
+  });
+
+  it("replaying the same legacy forward twice advances the chain once", async () => {
+    // The reconstructed id must not defeat the #77 hop claim: idempotence is
+    // what makes boot reconciliation safe to run on every start.
+    const store = makeChainStore();
+    store.rows.set("legacy-idem", {
+      id: "legacy-idem",
+      kind: "forward",
+      status: "interrupted",
+      correlationId: "chain-idem",
+    });
+    store.chains.set("chain-idem", {
+      id: "chain-idem",
+      status: "running",
+      hops: ["worker-b"],
+      currentIndex: 0,
+      originRef: "origin-thread",
+    });
+    const done = {
+      id: "legacy-idem",
+      target: "worker-a",
+      status: "completed" as const,
+      output: "HOP ONE OUTPUT",
+    };
+    const row = { status: "interrupted", kind: "forward", correlationId: "chain-idem" };
+    const host = makeChainReplayHost(store);
+
+    await host.replayCompletedDispatch(done, completionRoute(done as never, row));
+    await host.replayCompletedDispatch(done, completionRoute(done as never, row));
+
+    expect((await pendingSpecs()).filter((s) => s.preset === "worker-b")).toHaveLength(1);
+    expect(store.chains.get("chain-idem")).toMatchObject({ hops: [], currentIndex: 1 });
+  });
+
+  it("a report_back route's address likewise comes from the ROUTE", async () => {
+    // Same class of bug, other branch: the route is authoritative for the
+    // onward address, so the two can never disagree.
+    const store = makeChainStore();
+    store.rows.set("rb-route", { id: "rb-route", kind: "handoff", status: "interrupted" });
+    const done = {
+      id: "rb-route",
+      target: "worker",
+      status: "completed" as const,
+      output: "THE ANSWER",
+      correlationId: "corr-route",
+      returnTo: "parent-thread",
+      originPrompt: "the ask",
+    };
+    const route = completionRoute(done as never, { status: "interrupted", kind: "handoff" });
+    expect(route).toEqual({ action: "report_back", returnTo: "parent-thread" });
+
+    await makeChainReplayHost(store).replayCompletedDispatch(done, route);
+    const specs = await pendingSpecs();
+    expect(specs.filter((s) => s.kind === "report_back")).toHaveLength(1);
+    expect(String(specs[0]!.prompt)).toContain("THE ANSWER");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 18. A bounded teardown step reports whether it actually FINISHED
+// ---------------------------------------------------------------------------
+
+describe("#174 a bounded step's verdict is what gates the closes", () => {
+  it("reports true only when the work really completed", async () => {
+    let ran = false;
+    expect(
+      await runBoundedStep({
+        label: "quick",
+        timeoutMs: 5000,
+        work: async () => {
+          ran = true;
+        },
+      })
+    ).toBe(true);
+    expect(ran).toBe(true);
+  });
+
+  it("reports FALSE on a timeout, and the abandoned work keeps running", async () => {
+    // The distinction that matters: the step did not finish, so whatever it was
+    // doing is still coming. Reporting `true` here is what let the old code
+    // close a store underneath a disposal that had not finished.
+    const gate = deferred();
+    let finishedLate = false;
+    const onTimeout = vi.fn();
+
+    const started = Date.now();
+    const verdict = await runBoundedStep({
+      label: "wedged dispose",
+      timeoutMs: 60,
+      onTimeout,
+      work: async () => {
+        await gate.promise;
+        finishedLate = true;
+      },
+    });
+
+    expect(verdict).toBe(false);
+    expect(Date.now() - started).toBeLessThan(3000); // bounded, not hung
+    expect(onTimeout).toHaveBeenCalledWith("wedged dispose", 60);
+    expect(finishedLate).toBe(false); // still outstanding at the decision point
+
+    // Abandoned, not cancelled — it really does resume afterwards.
+    gate.resolve();
+    await flush();
+    expect(finishedLate).toBe(true);
+  });
+
+  it("reports FALSE when the work rejects, and never rethrows", async () => {
+    const onError = vi.fn();
+    await expect(
+      runBoundedStep({
+        label: "boom",
+        timeoutMs: 5000,
+        onError,
+        work: async () => {
+          throw new Error("dispose exploded");
+        },
+      })
+    ).resolves.toBe(false);
+    expect(String(onError.mock.calls[0]![1])).toMatch(/dispose exploded/);
+  });
+
+  it("reports FALSE on a SYNCHRONOUS throw too", async () => {
+    const onError = vi.fn();
+    await expect(
+      runBoundedStep({
+        label: "sync boom",
+        timeoutMs: 5000,
+        onError,
+        work: () => {
+          throw new Error("sync dispose boom");
+        },
+      })
+    ).resolves.toBe(false);
+    expect(onError).toHaveBeenCalledOnce();
+  });
+
+  it("a zero timeout gives up instead of running the step to completion", async () => {
+    // What an exhausted budget hands the last stages.
+    let ran = false;
+    expect(
+      await runBoundedStep({
+        label: "out of budget",
+        timeoutMs: 0,
+        work: async () => {
+          await new Promise((r) => setTimeout(r, 10));
+          ran = true;
+        },
+      })
+    ).toBe(false);
+    expect(ran).toBe(false);
+  });
+
+  /**
+   * The gate the review asked for: `adapter.stop()` timing out must not be
+   * followed by closing the stores. It cannot be waved through as "the adapter
+   * touches nothing" — `setActiveChannelCheck` calls `store.isChannelActive()`
+   * on every inbound event, BEFORE the admission gate can refuse it, so a
+   * gateway that did not really stop still reads the store on the next message.
+   */
+  it("a gateway that did not stop still reads the store, so the stores stay open", async () => {
+    const store = makeClosableStore();
+    const gate = deferred();
+    // The adapter's channel gate — the one store read admission does not cover.
+    const isChannelActive = () => {
+      store.getDelegation("channel-gate");
+      return true;
+    };
+    const adapterStopped = await runBoundedStep({
+      label: "adapter stop",
+      timeoutMs: 60,
+      work: () => gate.promise, // a gateway that will not shut down in time
+    });
+    expect(adapterStopped).toBe(false);
+
+    // The production rule: the adapter's own verdict gates the store closes.
+    if (adapterStopped) store.close();
+
+    // A message arrives after the abandoned stop, as it can on a live gateway.
+    expect(() => isChannelActive()).not.toThrow();
+    expect(store.violations).toEqual([]);
+    expect(store.closed).toBe(false);
+    gate.resolve();
+  });
+
+  it("NEGATIVE CONTROL: closing after an abandoned adapter stop breaks that read", async () => {
+    const store = makeClosableStore();
+    const gate = deferred();
+    const isChannelActive = () => {
+      store.getDelegation("channel-gate");
+      return true;
+    };
+    const adapterStopped = await runBoundedStep({
+      label: "adapter stop",
+      timeoutMs: 60,
+      work: () => gate.promise,
+    });
+
+    store.close(); // ignoring the verdict — the rejected behaviour
+    expect(() => isChannelActive()).toThrow(/database connection is not open/);
+    expect(store.violations).toContain("getDelegation");
+    expect(adapterStopped).toBe(false);
+    gate.resolve();
   });
 });

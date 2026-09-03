@@ -40,7 +40,13 @@ export function startHealthServer(
     req: IncomingMessage,
     res: ServerResponse
   ): void => {
-    const done = Promise.resolve(handler(req, res))
+    // `Promise.resolve(handler(req, res))` would invoke the handler OUTSIDE the
+    // promise chain: a SYNCHRONOUS throw escapes `track()` into the
+    // `createServer` callback — an uncaught exception that also leaves the
+    // request untracked, so the drain cannot see it and the client never gets a
+    // response. Calling it inside `.then` puts both cases on the same path.
+    const done = Promise.resolve()
+      .then(() => handler(req, res))
       .catch((err) => {
         logger.warn({ err }, `health ${label} failed`);
         if (!res.headersSent) {

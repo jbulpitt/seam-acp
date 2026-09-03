@@ -1219,26 +1219,45 @@ export class Orchestrator {
       // puts them in `inboundWork`, which the shutdown barrier drains.
       // `handlePersistentComponent` reaches these through `componentHandler`,
       // so this wrapper covers it too.
-      void this.runInbound(
+      // Returned, not `void`-ed: `handlePersistentComponent` awaits this and
+      // its event boundary logs a crash, so a failure that gets past the
+      // per-handler catches below is still reported rather than becoming an
+      // unhandled rejection.
+      return this.runInbound(
         "component",
         async () => {
-          await Promise.allSettled([
-            this.handleConfigEditorComponent(evt),
-            this.handleTtsEditorComponent(evt).catch((err) => {
-              this.logger.warn({ err, customId: evt.customId }, "tts editor component failed");
-            }),
-            this.handleVoiceConsoleComponent(evt).catch((err) => {
-              this.logger.warn({ err, customId: evt.customId }, "voice console component failed");
-              return evt
-                .replyEphemeral(
-                  `Voice Console action failed: ${err instanceof Error ? err.message : String(err)}`
-                )
-                .catch(() => evt.followUpEphemeral("Voice Console action failed.").catch(() => {}));
-            }),
-            this.handleQuotaCardComponent(evt).catch((err) => {
-              this.logger.warn({ err, customId: evt.customId }, "quota card component failed");
-            }),
-          ]);
+          // Named handlers, each with ONE catch that cannot be bypassed.
+          //
+          // This was `Promise.allSettled` over four bare calls, and the config
+          // editor had no catch of its own — so its rejection went into the
+          // settled array and was never read. A failed config edit logged
+          // exactly nothing and read as a success. `allSettled` is the wrong
+          // tool for "must not be discarded": it makes discarding the default.
+          //
+          // `Promise.all` is safe here precisely BECAUSE every element catches:
+          // nothing can reject, so nothing can short-circuit the wait, and the
+          // tracked promise still covers all four (the guarantee section 13
+          // tests). Anything that somehow escapes rejects `runInbound`, which
+          // logs it and hands it to the adapter boundary.
+          const handlers: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
+            ["config editor", () => this.handleConfigEditorComponent(evt)],
+            ["tts editor", () => this.handleTtsEditorComponent(evt)],
+            ["voice console", () => this.runVoiceConsoleComponent(evt)],
+            ["quota card", () => this.handleQuotaCardComponent(evt)],
+          ];
+          await Promise.all(
+            handlers.map(([handler, run]) =>
+              // `.then(run)` so a SYNCHRONOUS throw is caught as well.
+              Promise.resolve()
+                .then(run)
+                .catch((err) => {
+                  this.logger.warn(
+                    { err, customId: evt.customId, handler },
+                    "component handler failed"
+                  );
+                })
+            )
+          );
         },
         async () => {
           await evt
@@ -1263,6 +1282,28 @@ export class Orchestrator {
     // an enabled active_projects row as allowed, additive to the env allowlist.
     this.adapter.setActiveChannelCheck?.((ref) => this.store.isChannelActive(ref));
     this.watchSentinel();
+  }
+
+  /**
+   * The Voice Console component handler plus its user-facing recovery — the
+   * only one of the four that tells the user, falling back to a follow-up when
+   * the interaction was already acknowledged.
+   *
+   * If BOTH posts fail this rethrows, so the aggregate's per-handler catch
+   * reports it. The old trailing `.catch(() => {})` swallowed exactly that
+   * case: the action failed, the user was never told, and nothing was logged.
+   */
+  private async runVoiceConsoleComponent(evt: ComponentEvent): Promise<void> {
+    try {
+      await this.handleVoiceConsoleComponent(evt);
+    } catch (err) {
+      this.logger.warn({ err, customId: evt.customId }, "voice console component failed");
+      await evt
+        .replyEphemeral(
+          `Voice Console action failed: ${err instanceof Error ? err.message : String(err)}`
+        )
+        .catch(() => evt.followUpEphemeral("Voice Console action failed."));
+    }
   }
 
   /** Instant cleanup when a thread is deleted: drop its scheduled prompts.
@@ -1724,6 +1765,11 @@ export class Orchestrator {
    *
    * `refuse` runs instead of the handler and is deliberately not tracked — it
    * must touch nothing but the transport.
+   *
+   * Tracking is NOT an error boundary. Every caller is reached from an adapter
+   * event handler that already catches and logs ("… handler crashed"), so a
+   * failure has to keep reaching it; swallowing it here would turn a crashed
+   * command into a silent no-op that looks like it worked.
    */
   private async runInbound(
     label: string,
@@ -1732,10 +1778,19 @@ export class Orchestrator {
   ): Promise<void> {
     if (this.admissionClosed) {
       this.logger.info({ ingress: label }, "inbound refused; shutting down");
-      await Promise.resolve(refuse?.()).catch(() => {});
+      // `.then(() => refuse?.())` rather than `Promise.resolve(refuse?.())`:
+      // the latter calls `refuse` outside the chain, so a SYNCHRONOUS throw
+      // (an already-acknowledged interaction, a dead transport) escapes the
+      // `.catch` and propagates out of a refusal that is meant to be silent.
+      await Promise.resolve()
+        .then(() => refuse?.())
+        .catch(() => {});
       return;
     }
-    const tracked = run()
+    // Same reasoning for `run`: a synchronous throw must land inside the
+    // tracked promise, not escape before anything has been registered.
+    const running = Promise.resolve().then(run);
+    const tracked = running
       .catch((err) => {
         this.logger.warn({ err, ingress: label }, "inbound handler failed");
       })
@@ -1743,7 +1798,11 @@ export class Orchestrator {
         this.inboundWork.delete(tracked);
       });
     this.inboundWork.add(tracked);
+    // Wait on the SWALLOWED copy so the drain bookkeeping always completes,
+    // then hand back the original — settled by now, so this re-raises the
+    // failure to the adapter boundary instead of reporting a clean run.
     await tracked;
+    return running;
   }
 
   /**
@@ -8023,6 +8082,18 @@ export class Orchestrator {
     originPrompt?: string;
   }, route: CompletionRoute): Promise<void> {
     const text = result.output ?? "";
+    // The ROUTE is authoritative for the onward address, not the done-file.
+    //
+    // `completionRoute` can RECONSTRUCT routing a legacy file never carried: a
+    // pre-#174 `forward` recovers its chain id from the ledger row's
+    // correlationId, which is its chain id by contract. Rebuilding the spec
+    // from `result` alone silently discarded that — `spec.chainId` stayed
+    // undefined, `advanceChain` returned at its own `if (!chainId)` guard, and
+    // then the row was terminalized anyway. The chain stopped dead at that hop
+    // with no next dispatch and no final delivery, and because the row WAS
+    // terminalized, the next boot skipped the done-file: unrecoverable, silent.
+    const routedChainId = route.action === "chain" ? route.chainId : result.chainId;
+    const routedReturnTo = route.action === "report_back" ? route.returnTo : result.returnTo;
     // Rebuild only the fields the onward paths actually read.
     const spec: DispatchSpec = {
       id: result.id,
@@ -8031,8 +8102,8 @@ export class Orchestrator {
       session: "live",
       createdUtc: new Date().toISOString(),
       ...(result.correlationId ? { correlationId: result.correlationId } : {}),
-      ...(result.returnTo ? { returnTo: result.returnTo } : {}),
-      ...(result.chainId ? { chainId: result.chainId } : {}),
+      ...(routedReturnTo ? { returnTo: routedReturnTo } : {}),
+      ...(routedChainId ? { chainId: routedChainId } : {}),
     };
 
     // ORDER IS LOAD-BEARING. The onward side effect must be durably claimed

@@ -69,6 +69,7 @@ export class WatchManager {
   private readonly sweepMs: number;
   private timer?: ReturnType<typeof setInterval>;
   private sweeping = false;
+  private readonly activeSweeps = new Set<Promise<void>>();
   /** Rolling per-thread fire timestamps (ms) for the hourly rate cap (D5). In
    *  memory — a rate *backstop*, not durable accounting; a restart resets it. */
   private readonly fireHistory = new Map<string, number[]>();
@@ -95,12 +96,28 @@ export class WatchManager {
     this.timer = undefined;
   }
 
+  async drain(): Promise<void> {
+    while (this.activeSweeps.size > 0) {
+      await Promise.allSettled([...this.activeSweeps]);
+    }
+  }
+
   /** One sweep: expire, evaluate, and fire every watch whose predicate trips.
    *  Resolves when all watches picked up by this sweep have been handled — the
    *  property that makes the sweeper testable without real timers. */
-  async sweep(): Promise<void> {
-    if (this.sweeping) return;
+  sweep(): Promise<void> {
+    if (this.sweeping) return Promise.resolve();
     this.sweeping = true;
+    const running = this.sweepInner();
+    const tracked = running.finally(() => {
+      this.sweeping = false;
+      this.activeSweeps.delete(tracked);
+    });
+    this.activeSweeps.add(tracked);
+    return tracked;
+  }
+
+  private async sweepInner(): Promise<void> {
     try {
       const now = Date.now();
       const nowIso = new Date(now).toISOString();
@@ -113,8 +130,6 @@ export class WatchManager {
       }
     } catch (err) {
       this.logger.warn({ err }, "watch sweep failed");
-    } finally {
-      this.sweeping = false;
     }
   }
 

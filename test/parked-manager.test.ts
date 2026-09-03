@@ -61,6 +61,27 @@ function makeHub(opts: { ready: Set<string>; emit?: (fn: (id: string) => void) =
 }
 
 describe("ParkedPromptManager (#88)", () => {
+  it("drain waits for a fire admitted before stop", async () => {
+    const { store } = makeStore([makeParked()]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const m = new ParkedPromptManager({
+      store,
+      hub: makeHub({ ready: new Set(["mac"]) }),
+      onFire: async () => gate,
+      logger: silentLogger,
+    });
+    const fire = m.fireLocation("mac");
+    m.stop();
+    let drained = false;
+    const drain = m.drain().then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    release();
+    await Promise.all([fire, drain]);
+    expect(drained).toBe(true);
+  });
+
   it("deletes the row before onFire (no double delivery)", async () => {
     const parked = makeParked();
     const { store, rows, deletes } = makeStore([parked]);

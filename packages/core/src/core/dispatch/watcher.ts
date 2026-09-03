@@ -24,7 +24,10 @@ import * as path from "node:path";
 import { SerialQueue } from "../serial-queue.js";
 import type { Logger } from "../../lib/logger.js";
 import type { DispatchResult, DispatchSpec } from "./types.js";
-import { dispatchDirs, parseDispatchSpec } from "./types.js";
+import { DispatchTurnError, dispatchDirs, parseDispatchSpec } from "./types.js";
+
+/** Clamp on the originating prompt copied into a done-file (#174). */
+export const DONE_ORIGIN_PROMPT_MAX = 4000;
 
 export interface DispatchWatcherOpts {
   /** `config.DATA_DIR` — the queue lives at `<dataDir>/dispatch/`. */
@@ -46,6 +49,16 @@ export interface DispatchWatcherOpts {
   resumeEnabled?: boolean;
   /** Durable ledger gate: false means recovery must terminalize, never replay. */
   mayRecover?: (id: string) => boolean;
+  /**
+   * Directory-listing seam. Defaults to `fs.readdir`.
+   *
+   * #174: `tickInner` checks `ready`, then AWAITS this call before claiming
+   * anything — that await IS the pre-claim race window. Tests inject a gated
+   * listing to park a tick precisely inside it; there is no other way to hold a
+   * tick there deterministically, and a timing-based approximation would pass
+   * against the buggy code.
+   */
+  readDir?: (dir: string) => Promise<string[]>;
 }
 
 export class DispatchWatcher {
@@ -55,6 +68,7 @@ export class DispatchWatcher {
   private readonly pollMs: number;
   private readonly resumeEnabled: boolean;
   private readonly mayRecover: (id: string) => boolean;
+  private readonly readDir: (dir: string) => Promise<string[]>;
 
   /** One FIFO per target thread — different targets get different queues and
    *  therefore run concurrently. */
@@ -69,6 +83,13 @@ export class DispatchWatcher {
   private readonly quarantined = new Set<string>();
   private timer?: NodeJS.Timeout;
   private ready = false;
+  /**
+   * #174: in-progress `tick()` calls. A tick checks `ready`, then AWAITS
+   * `readdir` — so `stop()` can land in that gap and `drain()` would see empty
+   * queues and return while the tick goes on to claim and run a spec against
+   * dependencies that are being torn down. Draining must await these too.
+   */
+  private readonly activeTicks = new Set<Promise<void>>();
 
   constructor(opts: DispatchWatcherOpts) {
     this.dirs = dispatchDirs(opts.dataDir);
@@ -77,6 +98,7 @@ export class DispatchWatcher {
     this.pollMs = opts.pollMs ?? 1000;
     this.resumeEnabled = opts.resumeEnabled === true;
     this.mayRecover = opts.mayRecover ?? (() => true);
+    this.readDir = opts.readDir ?? readdir;
   }
 
   /** Create the queue dirs, recover anything a crash left in `running/`, then
@@ -99,10 +121,55 @@ export class DispatchWatcher {
     await this.tick();
   }
 
+  /**
+   * Stop INTAKE. This closes the claim door — no further tick claims a spec —
+   * but says nothing about work already claimed.
+   *
+   * #174: `stop()` was previously treated as "drained" by the shutdown path,
+   * which is what let `store.close()` land on top of an in-flight dispatch.
+   * Anything left in `pending/` after this is simply delivered on the next
+   * boot, so stopping intake early is lossless.
+   */
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     this.ready = false;
+  }
+
+  /** True while any claimed spec is still running. */
+  get inFlightCount(): number {
+    return this.inFlight.size;
+  }
+
+  /**
+   * Resolve once every CLAIMED spec has finished and its done-file is written.
+   *
+   * This is the real barrier `stop()` is not. A spec's report-back and chain
+   * advance are awaited inside its per-target `SerialQueue` task, so draining
+   * the queues drains those side effects too — while the store is still open.
+   *
+   * Runs to an ACTUAL fixpoint: it keeps settling queues until nothing is in
+   * flight and no new queue appeared, because a completing task can enqueue
+   * onto a different target. It deliberately has no internal pass cap — a
+   * fixed cap would let it return "drained" with work still running, which is
+   * the failure it exists to prevent. Termination is guaranteed from outside:
+   * `stop()` closes intake, and the caller races this against a bounded
+   * timeout (`Orchestrator.quiesce`). Never call it without both.
+   */
+  async drain(): Promise<void> {
+    for (;;) {
+      // Ticks FIRST: an in-progress tick has not created its queue entries
+      // yet, so draining queues before it would miss the work it is about to
+      // claim. This is the pre-claim race.
+      await Promise.allSettled([...this.activeTicks]);
+      const queues = [...this.queues.values()];
+      await Promise.allSettled(queues.map((q) => q.idle()));
+      // Yield so a just-settled task can register its follow-on work before
+      // we decide we are done.
+      await new Promise((resolve) => setImmediate(resolve));
+      const grew = this.queues.size !== queues.length;
+      if (this.inFlight.size === 0 && this.activeTicks.size === 0 && !grew) return;
+    }
   }
 
   /**
@@ -112,13 +179,27 @@ export class DispatchWatcher {
    */
   async tick(): Promise<void> {
     if (!this.ready) return;
+    const run = this.tickInner();
+    const tracked = run.finally(() => {
+      this.activeTicks.delete(tracked);
+    });
+    this.activeTicks.add(tracked);
+    await tracked;
+  }
+
+  private async tickInner(): Promise<void> {
     let names: string[];
     try {
-      names = await readdir(this.dirs.pending);
+      names = await this.readDir(this.dirs.pending);
     } catch (err) {
       this.logger.warn({ err }, "cannot read pending dir");
       return;
     }
+    // #174: re-check admission AFTER the await. Intake may have closed while
+    // this tick was reading the directory; claiming now would start work the
+    // shutdown barrier has already decided it is not waiting for. The specs
+    // stay in `pending/` and are delivered on the next boot.
+    if (!this.ready) return;
     const ids = names
       .filter((name) => name.endsWith(".json"))
       .map((name) => name.slice(0, -".json".length))
@@ -171,7 +252,7 @@ export class DispatchWatcher {
   private async recoverStale(): Promise<void> {
     let names: string[];
     try {
-      names = await readdir(this.dirs.running);
+      names = await this.readDir(this.dirs.running);
     } catch {
       return;
     }
@@ -211,7 +292,7 @@ export class DispatchWatcher {
   private async markStaleInPlace(): Promise<void> {
     let names: string[];
     try {
-      names = await readdir(this.dirs.running);
+      names = await this.readDir(this.dirs.running);
     } catch {
       return;
     }
@@ -253,7 +334,7 @@ export class DispatchWatcher {
   async listStaleRunning(): Promise<DispatchSpec[]> {
     let names: string[];
     try {
-      names = await readdir(this.dirs.running);
+      names = await this.readDir(this.dirs.running);
     } catch {
       return [];
     }
@@ -412,7 +493,7 @@ export class DispatchWatcher {
       const dir = this.dirs[sub];
       let names: string[];
       try {
-        names = await readdir(dir);
+        names = await this.readDir(dir);
       } catch {
         continue;
       }
@@ -485,6 +566,17 @@ export class DispatchWatcher {
         id,
         target: spec.target,
         ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
+        // #174: carry the routing forward so a completion whose ledger side
+        // effects were lost to a shutdown race can be replayed at boot from
+        // the done-file alone, without rerunning the worker. `kind` rides
+        // along because `returnTo` is not self-describing: on a compact spec
+        // it is the ACTOR, not a report-back address.
+        ...(spec.kind ? { kind: spec.kind } : {}),
+        ...(spec.returnTo ? { returnTo: spec.returnTo } : {}),
+        ...(spec.chainId ? { chainId: spec.chainId } : {}),
+        ...(spec.prompt
+          ? { originPrompt: spec.prompt.slice(0, DONE_ORIGIN_PROMPT_MAX) }
+          : {}),
       };
       try {
         const { output, stopReason } = await this.onDispatch(spec);
@@ -500,10 +592,25 @@ export class DispatchWatcher {
       } catch (err) {
         if (this.quarantined.has(id)) return;
         const message = (err as Error)?.message ?? String(err);
+        const partial = err instanceof DispatchTurnError ? err.output : undefined;
+        const stopReason = err instanceof DispatchTurnError ? err.stopReason : undefined;
+        const workerStatus = err instanceof DispatchTurnError ? err.workerStatus : undefined;
+        const workerError = err instanceof DispatchTurnError ? err.workerError : undefined;
+        const completionPending = err instanceof DispatchTurnError && err.completionPending;
+        // #67: `base` carries the spec's routing unconditionally, so a turn
+        // whose onward delivery was deliberately suppressed has to say so —
+        // otherwise boot replay reads that routing as work still owed.
+        const suppressedOnward = err instanceof DispatchTurnError && err.suppressedOnward;
         await this.finish(id, {
           ...base,
           status: "failed",
+          ...(partial ? { output: partial } : {}),
           error: message,
+          ...(workerStatus ? { workerStatus } : {}),
+          ...(workerError ? { workerError } : {}),
+          ...(completionPending ? { completionError: message } : {}),
+          ...(suppressedOnward ? { suppressedOnward: true } : {}),
+          ...(stopReason ? { stopReason } : {}),
           finishedUtc: new Date().toISOString(),
         });
         this.logger.warn({ id, target: spec.target, err }, "dispatch: failed");

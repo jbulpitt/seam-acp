@@ -28,6 +28,7 @@ export class ScheduledPromptManager {
    *  in flight is skipped (status-stamped) rather than stacked. Covers both the
    *  timer path and the boot catch-up path (both go through `fire`). */
   private readonly inFlight = new Set<string>();
+  private readonly activeFires = new Set<Promise<void>>();
   private readonly store: SessionStore;
   private readonly onFire: (id: string) => Promise<void>;
   private readonly logger: Logger;
@@ -119,6 +120,12 @@ export class ScheduledPromptManager {
     this.jobs.clear();
   }
 
+  async drain(): Promise<void> {
+    while (this.activeFires.size > 0) {
+      await Promise.allSettled([...this.activeFires]);
+    }
+  }
+
   /** Manual invoke: same `onFire` path as the cron tick (isolated vs live,
    *  cards vs messages, model). Does not consume a cron slot — `next_run` is
    *  only refreshed from the armed timer if one exists. Honors the in-flight
@@ -140,7 +147,14 @@ export class ScheduledPromptManager {
   }
 
   /** Execute one fire: run the job, then refresh next_run from the armed timer. */
-  private async fire(id: string): Promise<void> {
+  private fire(id: string): Promise<void> {
+    const running = this.fireInner(id);
+    const tracked = running.finally(() => this.activeFires.delete(tracked));
+    this.activeFires.add(tracked);
+    return tracked;
+  }
+
+  private async fireInner(id: string): Promise<void> {
     // #158: last line of defence. `armFromRow` never arms a quarantined row, but
     // catch-up and manual "Run now" reach `fire` directly — refuse there too so
     // there is exactly one answer for a legacy attachment-bearing schedule.

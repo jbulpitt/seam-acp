@@ -334,11 +334,14 @@ import {
   applyWatchFeedback,
   applyPresetIdentity,
   buildChainHopSpec,
+  DispatchTurnError,
+  dispatchArtifactState,
   dispatchOriginRefs,
   enqueueDispatchSpec,
   findQueuedReportBackSpec,
   type DispatchSpec,
 } from "../../core/dispatch/types.js";
+import type { CompletionRoute } from "../../core/dispatch/done-reconcile.js";
 import { promptExcerpt } from "../../core/prompt-excerpt.js";
 import { buildSeamHelpPages } from "./help-text.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
@@ -501,6 +504,32 @@ const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
 
+/**
+ * Default ceiling for the pre-close quiesce barrier (#174). Long enough for a
+ * report-back enqueue and a card repaint to land, short enough that a wedged
+ * agent cannot stall a restart — pm2 is already waiting on us at this point.
+ */
+const QUIESCE_TIMEOUT_MS = 10_000;
+
+/** Result of one bounded shutdown drain phase (#174). */
+export interface QuiesceOutcome {
+  phase: "pre-dispose" | "post-dispose";
+  /** True when the deadline won — outstanding work is left to boot repair. */
+  timedOut: boolean;
+  /**
+   * True when a barrier stage threw. Reported separately from `timedOut`
+   * because the two mean different things and NEITHER means "drained": a
+   * swallowed rejection used to come back as `timedOut: false`, which reads as
+   * a clean drain and is the most dangerous thing this type could say.
+   */
+  barrierFailed: boolean;
+  /** The only positive signal: every stage ran and everything was quiet. */
+  drained: boolean;
+  activeTurns: number;
+  inFlight: number;
+  continuations: number;
+}
+
 /** Reasoning-effort options for the `/seam effort` picker. Mirror of the SDK's
  *  EffortLevel type — keep in sync with commands.ts and the bundled SDK
  *  (docs/model-management-runbook.md §11). `ultra` is codex-only (not in the Claude SDK). */
@@ -595,8 +624,30 @@ export class Orchestrator {
   private readonly threadNamerConfig: ThreadNamerConfigStore;
   private readonly threadNamer: ThreadNamer;
 
-  private activeTurns = 0;
+  /**
+   * #174: one settle-promise per in-flight turn.
+   *
+   * This replaced a bare `activeTurns` counter. A counter can only be POLLED,
+   * and the shutdown barrier needs to WAIT — an isolated turn (isolated
+   * dispatch, isolated scheduled fire) appears in no other collection the
+   * barrier watches, so the counter was the only evidence it existed. Holding
+   * a promise per turn makes that wait exact instead of a spin, and makes the
+   * count a derived value that cannot drift from reality.
+   */
+  private readonly activeTurnSettles = new Set<Promise<void>>();
   private restartPending = false;
+  /** #174: set once WORK intake is closed, so `stopIntake()` is idempotent. */
+  private intakeStopped = false;
+  /**
+   * #174: set once SHUTDOWN closes the Discord transport. Strictly stronger
+   * than `intakeStopped` and deliberately separate — see `closeAdmission()`.
+   */
+  private gatewayClosed = false;
+  /**
+   * #174: post-turn continuations that run after `activeTurns--` and are
+   * therefore invisible to the restart drain. `quiesce()` awaits these.
+   */
+  private readonly pendingContinuations = new Set<Promise<void>>();
   private readonly channelQueues = new Map<string, Promise<void>>();
   private readonly channelGenerations = new Map<string, number>();
   /** Per-session timers that settle a woken "Working" card back to "Monitoring"
@@ -1015,6 +1066,20 @@ export class Orchestrator {
    * always `respond()`s — empty list on miss or error, never throws.
    */
   async handleAutocompleteInteraction(interaction: AutocompleteInteraction): Promise<void> {
+    // Refusal answers with no suggestions — Discord shows an empty list rather
+    // than an error, and nothing reads the store.
+    return this.runInbound(
+      "autocomplete",
+      () => this.handleAutocompleteInteractionInner(interaction),
+      async () => {
+        await interaction.respond([]).catch(() => {});
+      }
+    );
+  }
+
+  private async handleAutocompleteInteractionInner(
+    interaction: AutocompleteInteraction
+  ): Promise<void> {
     await safeAutocompleteRespond(
       (choices) => interaction.respond(choices),
       async () => {
@@ -1152,23 +1217,84 @@ export class Orchestrator {
   }
 
   install(): void {
-    this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
+    this.adapter.onMessage((msg) =>
+      this.runInbound(
+        "message",
+        () => this.handleIncomingMessage(msg),
+        async () => {
+          await this.adapter.sendMessage?.(
+            { platform: PLATFORM, id: msg.channel.id },
+            "♻️ Restarting — I did not take this message. Please send it again in a moment."
+          );
+        }
+      )
+    );
     this.adapter.onComponent?.((evt) => {
-      void this.handleConfigEditorComponent(evt);
-      void this.handleTtsEditorComponent(evt).catch((err) => {
-        this.logger.warn({ err, customId: evt.customId }, "tts editor component failed");
-      });
-      void this.handleVoiceConsoleComponent(evt).catch((err) => {
-        this.logger.warn({ err, customId: evt.customId }, "voice console component failed");
-        void evt.replyEphemeral(
-          `Voice Console action failed: ${err instanceof Error ? err.message : String(err)}`
-        ).catch(() => evt.followUpEphemeral("Voice Console action failed.").catch(() => {}));
-      });
-      void this.handleQuotaCardComponent(evt).catch((err) => {
-        this.logger.warn({ err, customId: evt.customId }, "quota card component failed");
-      });
+      // #174: one gate AND one tracking point for every component handler
+      // (config editor, TTS editor, Voice Console, quota card). They all do
+      // store-backed work, and each was previously fire-and-forget — `void`
+      // with no handle — so nothing could wait for them. Awaiting them here
+      // puts them in `inboundWork`, which the shutdown barrier drains.
+      // `handlePersistentComponent` reaches these through `componentHandler`,
+      // so this wrapper covers it too.
+      // Returned, not `void`-ed: `handlePersistentComponent` awaits this and
+      // its event boundary logs a crash, so a failure that gets past the
+      // per-handler catches below is still reported rather than becoming an
+      // unhandled rejection.
+      return this.runInbound(
+        "component",
+        async () => {
+          // Named handlers, each with ONE catch that cannot be bypassed.
+          //
+          // This was `Promise.allSettled` over four bare calls, and the config
+          // editor had no catch of its own — so its rejection went into the
+          // settled array and was never read. A failed config edit logged
+          // exactly nothing and read as a success. `allSettled` is the wrong
+          // tool for "must not be discarded": it makes discarding the default.
+          //
+          // `Promise.all` is safe here precisely BECAUSE every element catches:
+          // nothing can reject, so nothing can short-circuit the wait, and the
+          // tracked promise still covers all four (the guarantee section 13
+          // tests). Anything that somehow escapes rejects `runInbound`, which
+          // logs it and hands it to the adapter boundary.
+          const handlers: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
+            ["config editor", () => this.handleConfigEditorComponent(evt)],
+            ["tts editor", () => this.handleTtsEditorComponent(evt)],
+            ["voice console", () => this.runVoiceConsoleComponent(evt)],
+            ["quota card", () => this.handleQuotaCardComponent(evt)],
+          ];
+          await Promise.all(
+            handlers.map(([handler, run]) =>
+              // `.then(run)` so a SYNCHRONOUS throw is caught as well.
+              Promise.resolve()
+                .then(run)
+                .catch((err) => {
+                  this.logger.warn(
+                    { err, customId: evt.customId, handler },
+                    "component handler failed"
+                  );
+                })
+            )
+          );
+        },
+        async () => {
+          await evt
+            .replyEphemeral("♻️ Restarting — that action was not taken. Try again in a moment.")
+            .catch(() => {});
+        }
+      );
     });
-    this.adapter.onChoiceInteraction?.((evt) => this.handleChoiceCardInteraction(evt));
+    this.adapter.onChoiceInteraction?.((evt) =>
+      this.runInbound(
+        "choice",
+        () => this.handleChoiceCardInteraction(evt),
+        async () => {
+          await evt
+            .replyEphemeral("♻️ Restarting — your pick was not recorded. Try again in a moment.")
+            .catch(() => {});
+        }
+      )
+    );
     this.adapter.onThreadDelete?.((channelRef) => this.handleThreadDeleted(channelRef));
     // DB-backed channel activation (#22): let the adapter's channel gate treat
     // an enabled active_projects row as allowed, additive to the env allowlist.
@@ -1176,11 +1302,42 @@ export class Orchestrator {
     this.watchSentinel();
   }
 
+  /**
+   * The Voice Console component handler plus its user-facing recovery — the
+   * only one of the four that tells the user, falling back to a follow-up when
+   * the interaction was already acknowledged.
+   *
+   * If BOTH posts fail this rethrows, so the aggregate's per-handler catch
+   * reports it. The old trailing `.catch(() => {})` swallowed exactly that
+   * case: the action failed, the user was never told, and nothing was logged.
+   */
+  private async runVoiceConsoleComponent(evt: ComponentEvent): Promise<void> {
+    try {
+      await this.handleVoiceConsoleComponent(evt);
+    } catch (err) {
+      this.logger.warn({ err, customId: evt.customId }, "voice console component failed");
+      await evt
+        .replyEphemeral(
+          `Voice Console action failed: ${err instanceof Error ? err.message : String(err)}`
+        )
+        .catch(() => evt.followUpEphemeral("Voice Console action failed."));
+    }
+  }
+
   /** Instant cleanup when a thread is deleted: drop its scheduled prompts.
    *  (Fire-time 404 is the lazy fallback if the bot was offline when the delete
    *  happened.) Also drops a parked prompt (#88). Any pre-#158 bytes under
    *  `data/scheduled-attachments/` are deliberately left alone. */
+  /**
+   * #174: skipped during shutdown — pure cleanup with an existing lazy
+   * fallback (a fire against a deleted thread 404s and drops the row then), so
+   * deferring to the next boot costs nothing. Tracked when it does run.
+   */
   private async handleThreadDeleted(channelRef: string): Promise<void> {
+    return this.runInbound("thread-delete", () => this.handleThreadDeletedInner(channelRef));
+  }
+
+  private async handleThreadDeletedInner(channelRef: string): Promise<void> {
     const rows = this.store.listScheduledByChannel(PLATFORM, channelRef);
     if (rows.length > 0) {
       this.logger.info({ channelRef, count: rows.length }, "thread deleted; dropping scheduled prompts");
@@ -1202,9 +1359,55 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * In-flight turns (user + scheduled + dispatch), derived from the tracked
+   * set so the count and the thing shutdown awaits can never disagree.
+   */
+  private get activeTurns(): number {
+    return this.activeTurnSettles.size;
+  }
+
+  /**
+   * Register an in-flight turn; the returned release MUST be called from a
+   * `finally`. Every turn — queued or isolated — goes through here, which is
+   * what lets `settleAllWork()` await turn completion directly instead of
+   * watching a number and hoping.
+   */
+  private beginTurn(): () => void {
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => (settle = resolve));
+    this.activeTurnSettles.add(settled);
+    return () => {
+      // Idempotent: a double release must not drop a later turn's promise.
+      if (!this.activeTurnSettles.delete(settled)) return;
+      settle();
+    };
+  }
+
   /** In-flight turns (user + scheduled + dispatch) counted for restart drain. */
   activeTurnCount(): number {
     return this.activeTurns;
+  }
+
+  /**
+   * What the restart-sentinel drain waits on: turns PLUS admitted gateway
+   * handlers.
+   *
+   * `activeTurns` alone is a turn's-eye view, and a message becomes a turn only
+   * once its channel FIFO reaches it. Everything before that — the pre-queue
+   * body (which writes the store: parked clear, turn markers, abort) and the
+   * wait for its place in line — counts as zero. So a message admitted while
+   * the channel is idle can leave the drain sampling 0, skipping the wait
+   * entirely, and start a full agent turn on the far side of it.
+   *
+   * `inboundWork` spans exactly that window: `handleIncomingMessage` is entered
+   * through `runInbound` and awaits its own queue link, so one entry covers
+   * admission through the last `endTurn()`. Counting both makes an admitted
+   * message extend the drain the same way a due cron fire does. The drain is
+   * still bounded by `RESTART_DRAIN_TIMEOUT_MS`, which force-restarts.
+   */
+  private get outstandingRestartWork(): number {
+    return this.activeTurns + this.inboundWork.size;
   }
 
   /** True when this thread has a turn in `channelQueues` (#89 busy gate). */
@@ -1260,7 +1463,7 @@ export class Orchestrator {
     this.restartPending = true;
     const force = this.readSentinelForce();
     let forceShutdown = force;
-    const drainTimeoutMs = this.config.RESTART_DRAIN_TIMEOUT_MS ?? 300_000;
+    const drainTimeoutMs = this.config.RESTART_DRAIN_TIMEOUT_MS ?? 900_000;
     // Keep cron timers running through the drain. Stopping them here is what
     // made `report-update` miss 5:25 while a restart sat pending for hours —
     // list still showed the stale next_run, and catch-up could then skip it.
@@ -1269,31 +1472,49 @@ export class Orchestrator {
     // `force` (relocate-repo) skips the drain so live ACP processes take
     // SIGTERM; turn-resume continues them after boot.
 
+    // #174: close the WORK intake door BEFORE sampling activeTurns. Previously
+    // the dispatch watcher kept claiming specs throughout the drain and the 2s
+    // flush wait, so the counter could reach zero while fresh work was already
+    // being admitted behind it. Unclaimed specs stay in `pending/` and are
+    // delivered on the next boot, so this loses nothing.
+    //
+    // NOT `closeAdmission()`. The wait below can last `RESTART_DRAIN_TIMEOUT_MS`
+    // (15 min) with the store and the gateway fully alive, and refusing Discord
+    // ingress for that whole window would take `/seam cancel` away — the one
+    // lever that ends the wedged turn this drain is waiting on.
+    this.stopIntake();
+
     if (force) {
       void this.postNotification(
         "♻️ Force restart — interrupting live turns; they will resume."
       );
       this.logger.info({ activeTurns: this.activeTurns }, "force restart sentinel; skipping drain");
-    } else if (this.activeTurns > 0) {
-      const turnWord = this.activeTurns === 1 ? "turn" : "turn(s)";
+    } else if (this.outstandingRestartWork > 0) {
+      const outstanding = this.outstandingRestartWork;
+      const word = outstanding === 1 ? "item" : "items";
       void this.postNotification(
-        `♻️ Restart requested — waiting for ${this.activeTurns} ${turnWord} to finish.`
+        `♻️ Restart requested — waiting for ${outstanding} in-flight ${word} to finish.`
       );
-      this.logger.info({ activeTurns: this.activeTurns }, "restart pending, draining turns");
+      this.logger.info(
+        { activeTurns: this.activeTurns, inboundWork: this.inboundWork.size },
+        "restart pending, draining turns and admitted handlers"
+      );
 
       const drain = await waitForRestartDrain(
-        () => this.activeTurns,
+        () => this.outstandingRestartWork,
         drainTimeoutMs
       );
       if (!drain.drained) {
         forceShutdown = true;
         void this.postNotification(
-          `♻️ Restart drain timed out with ${drain.activeTurns} active turn(s) — ` +
+          `♻️ Restart drain timed out with ${drain.activeTurns} in-flight item(s) — ` +
             "interrupting them now; they will resume."
         );
         this.logger.warn(
           {
-            activeTurns: drain.activeTurns,
+            outstanding: drain.activeTurns,
+            activeTurns: this.activeTurns,
+            inboundWork: this.inboundWork.size,
             timeoutMs: drainTimeoutMs,
           },
           "restart drain timed out; continuing through force restart path"
@@ -1314,6 +1535,11 @@ export class Orchestrator {
         ? "force restart, executing pm2 restart"
         : "all turns drained, executing restart"
     );
+    // Dispatch/user/parked admission closed before the drain sample above.
+    // The SCHEDULED manager is stopped only here, in the last beat before pm2
+    // restart, preserving the deliberate "keep cron timers running through the
+    // drain" behaviour a due fire depends on.
+    this.stopIntake();
     this.scheduledManager?.stop();
     try {
       await fsp.unlink(this.sentinelPath());
@@ -1393,13 +1619,13 @@ export class Orchestrator {
     const newQueue = existingQueue.then(async () => {
       // A newer message arrived after us — skip this turn entirely.
       if ((this.channelGenerations.get(channelId) ?? 0) > myGen) return;
-      this.activeTurns++;
+      const endTurn = this.beginTurn();
       try {
         await this.handleIncomingMessageInner(msg);
       } catch (err) {
         this.logger.error({ err, channelId }, "error in handleIncomingMessageInner");
       } finally {
-        this.activeTurns--;
+        endTurn();
       }
     });
 
@@ -1420,12 +1646,40 @@ export class Orchestrator {
    * `channelGenerations` bump, no `abortTurn`. It just waits its place in line.
    * (The converse still holds — a user message arriving mid-dispatch aborts the
    * dispatch, because the user is the priority interrupt.)
+   *
+   * #174 admission is stated here because this is the only place a channel turn
+   * is counted. The gate itself lives at the CALLERS, because they do not all
+   * want the same answer:
+   *
+   *   intake   `tryFireParked`, `startPresetOpeningTurn`, `cmdSteer now:true`
+   *            — they open an interactive NEW turn without going through
+   *            `handleIncomingMessage`, so they check `intakeStopped` and are
+   *            already closed for the whole restart drain.
+   *   intake   dispatch (`dispatchInjectTurn`) — upstream, by watcher intake:
+   *            unclaimed specs stay in `pending/` for the next boot.
+   *   OPEN     `runScheduledPrompt` — deliberate. A cron fire coming due mid
+   *            -drain must be able to start and EXTEND the drain; stopping
+   *            cron early is what made `report-update` miss 5:25.
+   *   OPEN     `refireLiveTurn` — boot-time resume, never runs during shutdown.
+   *
+   * Every Discord ingress — `handleIncomingMessage`, `handleSlashInteraction`,
+   * `handleAutocompleteInteraction`, the `onComponent` and `onChoiceInteraction`
+   * wrappers, thread-delete — is gated on the STRICTER `admissionClosed`, which
+   * only SIGTERM sets. An earlier revision of this comment argued they were safe
+   * because `adapter.stop()` runs before `store.close()`. That was wrong:
+   * `adapter.stop()` closes the gateway but does NOT await handlers already in
+   * flight, and none of that work is tracked by any drain — so a handler
+   * admitted after the snapshot can still be mid-await when the store closes.
+   *
+   * They are NOT gated on `intakeStopped`, because that door is also open for
+   * the restart drain's fifteen minutes, with the store fully alive; refusing
+   * `/seam cancel` there takes away the only lever that ends a wedged turn.
    */
   private queueOnChannel<T>(channelId: string, task: () => Promise<T>): Promise<T> {
     const existing = this.channelQueues.get(channelId) ?? Promise.resolve();
     const result = existing.then(async () => {
-      // Count in the restart-drain counter so a redeploy waits for us.
-      this.activeTurns++;
+      // Counted for the restart drain, and awaited by the shutdown barrier.
+      const endTurn = this.beginTurn();
       try {
         const timeoutMs = turnWatchdogTimeoutMs(
           this.config.TURN_TIMEOUT_SECONDS ?? 900
@@ -1438,13 +1692,13 @@ export class Orchestrator {
         if (err instanceof TurnWatchdogTimeoutError) {
           this.logger.error(
             { err, channelId, timeoutMs: err.timeoutMs },
-            "channel turn watchdog expired; releasing activeTurns and force-aborting runtime"
+            "channel turn watchdog expired; releasing the turn and force-aborting runtime"
           );
           this.abortWatchdogTurn(channelId);
         }
         throw err;
       } finally {
-        this.activeTurns--;
+        endTurn();
       }
     });
     // The link stored in channelQueues must never reject: the next task chains
@@ -1486,15 +1740,378 @@ export class Orchestrator {
    * fire hook alongside `onBridgeReady`.
    */
   private releaseChannelQueue(channelId: string, link: Promise<void>): void {
-    void link.then(() => {
-      if (this.channelQueues.get(channelId) === link) {
-        this.channelQueues.delete(channelId);
-        void this.voiceConsole?.markBindingActivitySettled(channelId).catch((err) =>
+    // #174: this continuation runs strictly AFTER `activeTurns--`, so the
+    // restart drain structurally cannot see it — that is how a post-turn
+    // settlement ended up touching a closed store on an otherwise clean
+    // drain. Track it so `quiesce()` has something to await.
+    const settled = link.then(async () => {
+      if (this.channelQueues.get(channelId) !== link) return;
+      this.channelQueues.delete(channelId);
+      await this.voiceConsole
+        ?.markBindingActivitySettled(channelId)
+        .catch((err) =>
           this.logger.warn({ err, channelId }, "voice console post-turn settlement failed")
         );
-        void this.tryFireParked(channelId);
-      }
+      await this.tryFireParked(channelId).catch((err) =>
+        this.logger.warn({ err, channelId }, "post-turn parked fire failed")
+      );
     });
+    this.trackContinuation(settled);
+  }
+
+  /**
+   * Register a fire-and-forget post-turn continuation so shutdown can await it.
+   *
+   * The set is self-clearing: each promise removes itself on settle, so a long
+   * -running process does not accumulate references. Failures are already
+   * handled inside the continuations, so this only ever observes completion.
+   */
+  private trackContinuation(p: Promise<void>): void {
+    const tracked = p.catch(() => undefined).finally(() => {
+      this.pendingContinuations.delete(tracked);
+    });
+    this.pendingContinuations.add(tracked);
+  }
+
+  /** How many post-turn continuations are still outstanding. */
+  get pendingContinuationCount(): number {
+    return this.pendingContinuations.size;
+  }
+
+  /**
+   * Gateway handlers admitted but not yet finished (#174).
+   *
+   * Gating ingress at entry stops NEW work; it does nothing for a handler
+   * admitted a millisecond before the gate closed. That handler is in no
+   * channel queue, counts as no turn, and registers no continuation — so
+   * without this it is invisible to the barrier and can be mid-await over the
+   * store when `store.close()` lands.
+   */
+  private readonly inboundWork = new Set<Promise<void>>();
+
+  /** How many admitted gateway handlers are still running. */
+  get inboundWorkCount(): number {
+    return this.inboundWork.size;
+  }
+
+  /**
+   * The one wrapper every store-backed Discord ingress goes through: refuse
+   * when admission is closed, otherwise TRACK until it finishes.
+   *
+   * `refuse` runs instead of the handler and is deliberately not tracked — it
+   * must touch nothing but the transport.
+   *
+   * Tracking is NOT an error boundary. Every caller is reached from an adapter
+   * event handler that already catches and logs ("… handler crashed"), so a
+   * failure has to keep reaching it; swallowing it here would turn a crashed
+   * command into a silent no-op that looks like it worked.
+   */
+  private async runInbound(
+    label: string,
+    run: () => Promise<void>,
+    refuse?: () => Promise<void> | void
+  ): Promise<void> {
+    if (this.admissionClosed) {
+      this.logger.info({ ingress: label }, "inbound refused; shutting down");
+      // `.then(() => refuse?.())` rather than `Promise.resolve(refuse?.())`:
+      // the latter calls `refuse` outside the chain, so a SYNCHRONOUS throw
+      // (an already-acknowledged interaction, a dead transport) escapes the
+      // `.catch` and propagates out of a refusal that is meant to be silent.
+      await Promise.resolve()
+        .then(() => refuse?.())
+        .catch(() => {});
+      return;
+    }
+    // Same reasoning for `run`: a synchronous throw must land inside the
+    // tracked promise, not escape before anything has been registered.
+    const running = Promise.resolve().then(run);
+    const tracked = running
+      .catch((err) => {
+        this.logger.warn({ err, ingress: label }, "inbound handler failed");
+      })
+      .finally(() => {
+        this.inboundWork.delete(tracked);
+      });
+    this.inboundWork.add(tracked);
+    // Wait on the SWALLOWED copy so the drain bookkeeping always completes,
+    // then hand back the original — settled by now, so this re-raises the
+    // failure to the adapter boundary instead of reporting a clean run.
+    await tracked;
+    return running;
+  }
+
+  /**
+   * Close the WORK intake door: no new dispatch is claimed, no parked prompt
+   * fires, no preset opening turn or preemptive steer starts. Anything still in
+   * `dispatch/pending/` stays there and is delivered on the next boot, so
+   * stopping intake early is lossless.
+   *
+   * #174: this must run BEFORE the restart drain samples `activeTurns`, or the
+   * watcher keeps claiming specs into the very window the drain is trying to
+   * empty — observed on 2026-09-02, where a fresh dispatch started during the
+   * post-drain flush wait and was still running when the store closed.
+   *
+   * Deliberately does NOT touch the Discord transport. The restart drain holds
+   * this door shut for up to `RESTART_DRAIN_TIMEOUT_MS` while the store and the
+   * gateway are fully alive, and the bot has to stay answerable during it —
+   * `closeAdmission()` is the shutdown-only lever that refuses ingress.
+   */
+  stopIntake(): void {
+    if (this.intakeStopped) return;
+    this.intakeStopped = true;
+    this.dispatchWatcher?.stop();
+    // NOT `scheduledManager.stop()`. Cron timers deliberately keep running
+    // through the drain — stopping them here is what made `report-update` miss
+    // 5:25 while a restart sat pending, because `list` still showed the stale
+    // next_run and catch-up then skipped it. Isolated scheduled fires increment
+    // `activeTurns`, so a due schedule EXTENDS the drain rather than being lost.
+    // The scheduled manager is stopped in the last beat before pm2 restart.
+    this.logger.info(
+      { activeTurns: this.activeTurns, inFlight: this.dispatchWatcher?.inFlightCount ?? 0 },
+      "intake stopped; no new dispatch, parked fire, preset opener or preemptive steer will be admitted"
+    );
+  }
+
+  /**
+   * Close the Discord transport as well — every gateway handler refuses from
+   * here on. Implies `stopIntake()`.
+   *
+   * SHUTDOWN ONLY. This is deliberately a second, stricter lever rather than
+   * part of `stopIntake()`, because the two doors answer different questions
+   * and are open for wildly different lengths of time:
+   *
+   *   `stopIntake()`    "do not start new WORK." The restart-sentinel drain
+   *                     calls it and then waits up to `RESTART_DRAIN_TIMEOUT_MS`
+   *                     (15 min) with the store and the gateway fully alive.
+   *   `closeAdmission()` "the store is about to close." Only true once SIGTERM
+   *                     has been received; the window is seconds.
+   *
+   * Collapsing them refused every slash command, message, component click and
+   * choice-card pick for the WHOLE drain — including `/seam cancel`, the one
+   * lever that ends a wedged turn and lets the restart proceed. The operator
+   * was told "Restarting — that command was not run" by the very restart they
+   * were trying to unblock, for up to fifteen minutes.
+   */
+  closeAdmission(): void {
+    this.stopIntake();
+    if (this.gatewayClosed) return;
+    this.gatewayClosed = true;
+    this.logger.info(
+      { inboundWork: this.inboundWork.size },
+      "gateway admission closed; Discord ingress refused"
+    );
+  }
+
+  /**
+   * True once SHUTDOWN has closed gateway admission — the single bound every
+   * Discord ingress checks at handler ENTRY.
+   *
+   * Entry is the only safe place. `adapter.stop()` stops future events but does
+   * not cancel a handler already admitted before it, and none of that work sits
+   * in a drain set — so a handler that got past the door can resume after
+   * `store.close()`. Checking here, before any await, is what makes that
+   * impossible.
+   *
+   * Applied uniformly, INCLUDING read-only commands: classifying which ones are
+   * "safe" would be a per-command judgement that rots the moment a command
+   * grows a store read. That uniformity is affordable precisely BECAUSE this is
+   * scoped to the seconds after SIGTERM — see `closeAdmission()`.
+   */
+  get admissionClosed(): boolean {
+    return this.gatewayClosed;
+  }
+
+  /**
+   * Bounded pre-close barrier (#174).
+   *
+   * Resolves when every claimed dispatch, active channel turn, and tracked
+   * post-turn continuation has settled — while the adapter and store are still
+   * usable, so their DB-first completion work (ledger status, report-back
+   * claim, chain advance) actually lands.
+   *
+   * ALWAYS bounded. A hung agent must not be able to block a restart; that is
+   * what `RESTART_DRAIN_TIMEOUT_MS` exists to prevent, and a force restart is
+   * an explicit instruction to stop waiting. On timeout this returns
+   * `timedOut: true` and shutdown proceeds — the boot-time done-file
+   * reconciliation is what makes giving up safe.
+   */
+  async quiesce(opts: { timeoutMs?: number } = {}): Promise<QuiesceOutcome> {
+    return this.runBoundedDrain("pre-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, (onErr) =>
+      this.settleAllWork(onErr)
+    );
+  }
+
+  /**
+   * Phase two of shutdown (#174), run AFTER `router.disposeAll()`.
+   *
+   * Disposal is not passive: killing an agent rejects its in-flight turn, and
+   * those rejections run cleanup that settles cards, releases queues, and
+   * registers fresh post-turn continuations. A single `setImmediate` yield is
+   * not a barrier for that — the work can span multiple awaits and I/O.
+   *
+   * It waits for exactly what phase 1 waits for, deliberately: phase 1 may have
+   * TIMED OUT, and `disposeAll()` is then the thing that forces those wedged
+   * turns to finish. A phase-2 barrier that watched less than phase 1 would be
+   * blind to precisely the work disposal just released. That is not
+   * hypothetical — an ISOLATED dispatch has no channel queue and no tracked
+   * continuation (see `dispatchInjectTurn`; it is counted in `activeTurns` and
+   * lives in the watcher's own queue), so a phase 2 built from
+   * `channelQueues` + continuations alone would return with the done-file
+   * unwritten and close the store on top of it. That is the original #174 race,
+   * one phase later.
+   */
+  async drainAfterDispose(opts: { timeoutMs?: number } = {}): Promise<QuiesceOutcome> {
+    return this.runBoundedDrain("post-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, (onErr) =>
+      this.settleAllWork(onErr)
+    );
+  }
+
+  /**
+   * The single definition of "no work is outstanding", shared by both shutdown
+   * phases so they can never drift apart.
+   *
+   * Four kinds of outstanding work, and they are not nested:
+   *   - claimed dispatches — the watcher's per-target queues; their report-back
+   *     and chain advance are awaited inside the queue task, so this covers
+   *     those side effects too;
+   *   - channel FIFOs — user turns and `session: "live"` dispatches;
+   *   - registered turns (`beginTurn`) — the ONLY thing that sees an ISOLATED
+   *     turn: an isolated dispatch, an isolated scheduled fire, or an ingest
+   *     job has no channel queue and no continuation. `runScheduledPrompt`
+   *     is the sharpest case — after `scheduledManager.stop()` an already
+   *     running fire is referenced by nothing else, and its `finally` still has
+   *     a schedule-status patch to write;
+   *   - tracked post-turn continuations — the fire-and-forget work that runs
+   *     after a turn is released and is therefore invisible to the turn set.
+   *
+   * Runs to a real fixpoint over all four: settling one can create another (a
+   * finishing dispatch enqueues a report-back; a queue release fires a parked
+   * prompt). No internal cap — a cap would let this report "drained" with work
+   * still running, which is the failure it exists to prevent. Termination comes
+   * from outside: intake is closed, and `runBoundedDrain` races a deadline.
+   */
+  private async settleAllWork(onStageError: (err: unknown) => void): Promise<void> {
+    for (;;) {
+      // Per-stage capture, so one throwing stage cannot skip the others. A
+      // single try around all four looked like it handled failure but did not:
+      // a stage-1 throw jumped past the queue, turn and continuation waits
+      // entirely, and if it threw on every pass they never ran at all.
+      let stageFailed = false;
+      const stage = async (run: () => Promise<unknown>): Promise<void> => {
+        try {
+          await run();
+        } catch (err) {
+          stageFailed = true;
+          onStageError(err);
+        }
+      };
+      await stage(async () => this.dispatchWatcher?.drain());
+      await stage(() => Promise.allSettled([...this.channelQueues.values()]));
+      await stage(() => Promise.allSettled([...this.activeTurnSettles]));
+      await stage(() => Promise.allSettled([...this.inboundWork]));
+      await stage(() => this.settleTrackedContinuations());
+
+      // Every stage got its chance; now stop. Looping on a failing stage would
+      // spin the CPU until the deadline for no benefit — a stage that threw
+      // cannot prove quiescence, so the phase reports `barrierFailed` and
+      // shutdown proceeds bounded, exactly as it does on a timeout. Honest
+      // even when the other stages drained fine: we still cannot say "drained".
+      if (stageFailed) return;
+      // Yield once so work those settlements just registered is visible before
+      // we decide we are finished.
+      await new Promise((resolve) => setImmediate(resolve));
+      // Deliberately NOT `channelQueues.size === 0`: an emptied queue is
+      // deleted by a continuation, so requiring it here would make map
+      // bookkeeping a termination condition. The queue PROMISES are awaited
+      // above, and a queue that admits a late turn re-arms this loop through
+      // that turn's registration.
+      if (
+        this.activeTurnSettles.size === 0 &&
+        this.pendingContinuations.size === 0 &&
+        this.inboundWork.size === 0 &&
+        (this.dispatchWatcher?.inFlightCount ?? 0) === 0
+      ) {
+        return;
+      }
+    }
+  }
+
+  /**
+   * Await tracked continuations to a fixpoint: a settling continuation may
+   * register another (a queue release firing a parked prompt), so one pass
+   * over the set is not enough. Bounded by the caller's deadline, never
+   * internally — an internal cap would report "drained" while work runs.
+   */
+  private async settleTrackedContinuations(): Promise<void> {
+    while (this.pendingContinuations.size > 0) {
+      await Promise.allSettled([...this.pendingContinuations]);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /**
+   * Race `barrier` against a bounded deadline and report which won.
+   *
+   * The timeout is the ONLY thing that terminates a drain — the barriers
+   * themselves run to a true fixpoint on purpose, so they can never claim to
+   * be finished while work is outstanding. Callers must always pass a bound.
+   */
+  private async runBoundedDrain(
+    phase: "pre-dispose" | "post-dispose",
+    timeoutMs: number,
+    barrier: (onStageError: (err: unknown) => void) => Promise<void>
+  ): Promise<QuiesceOutcome> {
+    // Both drains are shutdown-only, so this closes the gateway too — a
+    // handler admitted after the snapshot is work the barrier is not waiting
+    // for and the store is about to close underneath.
+    this.closeAdmission();
+    let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    let barrierFailed = false;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        resolve();
+      }, timeoutMs);
+      timer.unref?.();
+    });
+
+    // A stage failure is recorded, never fatal, and never silently successful.
+    const noteFailure = (err: unknown) => {
+      barrierFailed = true;
+      this.logger.warn({ err, phase }, "quiesce barrier stage failed");
+    };
+    // The barrier itself throwing (rather than one of its stages) is the same
+    // story: do not let it escape as an unhandled rejection during shutdown,
+    // and do not let the swallow turn into a report of a clean drain.
+    const running = barrier(noteFailure).catch(noteFailure);
+
+    await Promise.race([running, deadline]);
+    if (timer) clearTimeout(timer);
+
+    const state: QuiesceOutcome = {
+      phase,
+      timedOut,
+      barrierFailed,
+      drained: !timedOut && !barrierFailed,
+      activeTurns: this.activeTurns,
+      inFlight: this.dispatchWatcher?.inFlightCount ?? 0,
+      continuations: this.pendingContinuations.size,
+    };
+    if (timedOut) {
+      this.logger.warn(
+        { ...state, timeoutMs },
+        "quiesce timed out; proceeding — outstanding completions reconcile at boot"
+      );
+    } else if (barrierFailed) {
+      this.logger.warn(
+        { ...state, timeoutMs },
+        "quiesce barrier failed; proceeding — outstanding completions reconcile at boot"
+      );
+    } else {
+      this.logger.info(state, "quiesce phase complete");
+    }
+    return state;
   }
 
   private async handleIncomingMessageInner(msg: IncomingMessage): Promise<void> {
@@ -2909,7 +3526,28 @@ export class Orchestrator {
     return isThreadDetached(config, threadId);
   }
 
-  async handleSlashInteraction(
+  /**
+   * #174: gate + track. Refusing keeps NEW commands out; tracking is what
+   * covers the one admitted a millisecond earlier, which is otherwise in no
+   * queue, no turn and no continuation — invisible to the barrier, and free to
+   * be mid-await over the store when it closes.
+   */
+  async handleSlashInteraction(interaction: ChatInputCommandInteraction): Promise<void> {
+    return this.runInbound(
+      "slash",
+      () => this.handleSlashInteractionInner(interaction),
+      async () => {
+        await interaction
+          .reply({
+            content: "♻️ Restarting — that command was not run. Try again in a moment.",
+            flags: MessageFlags.Ephemeral,
+          })
+          .catch(() => {});
+      }
+    );
+  }
+
+  private async handleSlashInteractionInner(
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
     const sub = interaction.options.getSubcommand(true);
@@ -5105,6 +5743,15 @@ export class Orchestrator {
    */
   async tryFireParked(channelRef: string): Promise<void> {
     if (this.channelQueues.has(channelRef)) return;
+    // #174: once admission is closed, RETAIN the parked row instead of
+    // deleting it and starting a turn. Firing here would admit a brand-new
+    // channel turn after the quiesce snapshot; deleting without firing would
+    // lose the user's parked prompt outright. Leaving it parked means the next
+    // boot fires it.
+    if (this.intakeStopped) {
+      this.logger.info({ channelRef }, "parked fire deferred to next boot; shutting down");
+      return;
+    }
     const parked = this.store.getParkedByChannel(PLATFORM, channelRef);
     if (!parked) return;
     if (this.parkedSupersededByNewerUser(parked)) {
@@ -6876,33 +7523,60 @@ export class Orchestrator {
         // Partial output is still output — post whatever was captured either way.
         await this.postDispatchOutput(target, spec, result.text, result.error);
       }
-      const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
-      try { this.store.updateDelegationStatus(spec.id, ledgerStatus); } catch { /* best-effort */ }
-      // Chain advance (#25): a hop carrying a chainId drives the chain forward
-      // instead of a normal report-back — enqueue the next hop, or deliver the
-      // final output to the chain's origin. The chain row is the source of
-      // truth, so this survives a restart mid-chain.
-      if (wasInterrupted) {
-        // #67: this turn was preemptively cancelled by an interrupt. Deliver
-        // NOTHING onward — no report-back, no chain advance — the interrupt has
-        // already issued a fresh directive into this same thread in its place.
-        this.logger.info(
-          { dispatch: spec.id, target: spec.target, correlationId: spec.correlationId },
-          "dispatch: onward delivery suppressed — turn was interrupted (#67)"
-        );
-      } else if (spec.chainId) {
-        await this.advanceChain(spec, result.text, result.error).catch((err) =>
-          this.logger.warn({ err, dispatch: spec.id, chainId: spec.chainId }, "dispatch: chain advance failed")
-        );
-      } else if (spec.returnTo) {
-        // Report-back: if the caller set returnTo, deliver the result back by
-        // enqueuing a fresh dispatch into that thread (correlation-linked). The
-        // runtime owns this — the worker never had to "remember" to report.
-        await this.enqueueReportBack(spec, result.text, result.error).catch((err) =>
-          this.logger.warn({ err, dispatch: spec.id }, "dispatch: report-back enqueue failed")
+      try {
+        // Chain advance (#25): a hop carrying a chainId drives the chain forward
+        // instead of a normal report-back — enqueue the next hop, or deliver the
+        // final output to the chain's origin.
+        if (wasInterrupted) {
+          // #67: this turn was preemptively cancelled by an interrupt. Deliver
+          // NOTHING onward — no report-back, no chain advance — the interrupt has
+          // already issued a fresh directive into this same thread in its place.
+          this.logger.info(
+            { dispatch: spec.id, target: spec.target, correlationId: spec.correlationId },
+            "dispatch: onward delivery suppressed — turn was interrupted (#67)"
+          );
+        } else if (spec.chainId) {
+          await this.advanceChain(spec, result.text, result.error);
+        } else if (spec.returnTo) {
+          // Report-back: if the caller set returnTo, deliver the result back by
+          // enqueuing a fresh dispatch into that thread (correlation-linked). The
+          // runtime owns this — the worker never had to "remember" to report.
+          await this.enqueueReportBack(spec, result.text, result.error);
+        }
+        // Only terminalize after the onward action is durable.
+        const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
+        this.store.updateDelegationStatus(spec.id, ledgerStatus);
+      } catch (err) {
+        // Preserve the worker's output in done/ while leaving its ledger row
+        // non-terminal. Boot completion replay can then finish the durable side
+        // effect without paying for or rerunning the agent turn.
+        //
+        // `wasInterrupted` rides along: on that branch the only thing this try
+        // block did was the ledger write, so a throw here means the row is
+        // non-terminal AND nothing is owed onward. Without the flag the
+        // done-file's `returnTo`/`chainId` would send boot replay to deliver
+        // the very report-back #67 suppressed.
+        throw new DispatchTurnError(
+          (err as Error)?.message ?? String(err),
+          result.text,
+          result.stopReason ?? "",
+          result.timedOut ? "timed_out" : result.error ? "failed" : "completed",
+          result.error,
+          true,
+          wasInterrupted
         );
       }
-      if (result.error) throw new Error(result.error);
+      if (result.error) {
+        throw new DispatchTurnError(
+          result.error,
+          result.text,
+          result.stopReason ?? "",
+          "failed",
+          result.error,
+          false,
+          wasInterrupted
+        );
+      }
       return { output: result.text, stopReason: result.stopReason ?? "" };
     };
 
@@ -6915,8 +7589,9 @@ export class Orchestrator {
       return this.queueOnChannel(spec.target, gatedRun);
     }
     // Isolated: own throwaway runtime, so it cannot collide with the thread's
-    // live session and needn't queue. Still counted for the restart drain.
-    this.activeTurns++;
+    // live session and needn't queue. It therefore appears in NO channel queue
+    // — `beginTurn` is the only thing that makes it visible to shutdown.
+    const endTurn = this.beginTurn();
     try {
       return await settleWithTurnWatchdog(gatedRun, {
         timeoutMs: turnWatchdogTimeoutMs(
@@ -6928,12 +7603,12 @@ export class Orchestrator {
       if (err instanceof TurnWatchdogTimeoutError) {
         this.logger.error(
           { err, dispatch: spec.id, target: spec.target, timeoutMs: err.timeoutMs },
-          "isolated dispatch watchdog expired; releasing activeTurns"
+          "isolated dispatch watchdog expired; releasing the turn"
         );
       }
       throw err;
     } finally {
-      this.activeTurns--;
+      endTurn();
     }
   }
 
@@ -7102,6 +7777,11 @@ export class Orchestrator {
       updatedUtc: spec.createdUtc,
     };
     this.ingestJobs.set(spec.id, synthetic);
+    // #174: registered around the WHOLE body, not just `injectTurn`. The turn's
+    // durable tail — the output post and the ledger status write below — runs
+    // after the agent is done, and releasing before it would hide exactly that
+    // work from the shutdown barrier.
+    const endTurn = this.beginTurn();
     try {
       try {
         this.store.recordDelegation({
@@ -7134,7 +7814,6 @@ export class Orchestrator {
         });
       }
 
-      this.activeTurns++;
       let result: InjectTurnResult | undefined;
       try {
         result = await this.injectTurn(null, prompt, {
@@ -7160,7 +7839,6 @@ export class Orchestrator {
           logContext: { dispatch: spec.id, kind: "ingest" },
         });
       } finally {
-        this.activeTurns--;
         void this.quotaPoller?.turnCompleted(agentId);
         if (this.choiceResults) {
           if (result?.text) {
@@ -7187,6 +7865,7 @@ export class Orchestrator {
       return { output: result.text, stopReason: result.stopReason ?? "" };
     } finally {
       this.ingestJobs.delete(spec.id);
+      endTurn();
     }
   }
 
@@ -7406,8 +8085,8 @@ export class Orchestrator {
 
   /**
    * Claim a `report_back` ledger row for `correlationId` and enqueue `spec`.
-   * Returns true if this call won the claim and wrote the spec, false if a
-   * report-back for this correlation already exists (ledger or pending/running).
+   * Returns true if this call wrote/repaired the spec, false if a durable
+   * artifact (or a terminal delivery row) already proves no write is needed.
    * The ledger write is committed BEFORE the spec lands so a crash in the
    * watcher window (after we return, before the done-file) still sees the claim.
    */
@@ -7416,10 +8095,35 @@ export class Orchestrator {
     spec: DispatchSpec,
     refs: { sourceRef: string | null; targetRef: string | null }
   ): Promise<boolean> {
-    if (this.store.getReportBackByCorrelation(correlationId)) {
+    const existingClaim = this.store.getReportBackByCorrelation(correlationId);
+    if (existingClaim) {
+      const artifact = await dispatchArtifactState(this.config.DATA_DIR, existingClaim.id);
+      if (artifact) {
+        this.logger.info(
+          { correlationId, spec: existingClaim.id, artifact },
+          "dispatch: report-back already has a durable artifact (#77)"
+        );
+        return false;
+      }
+      if (!["completed", "failed", "timed_out"].includes(existingClaim.status)) {
+        // The DB claim is the durable outbox key. A crash can land after that
+        // commit but before the pending file rename; reconstruct the complete
+        // spec from the parent's done output and reuse the claimed id.
+        await enqueueDispatchSpec(this.config.DATA_DIR, {
+          ...spec,
+          id: existingClaim.id,
+          createdUtc: existingClaim.createdUtc,
+        });
+        this.store.updateDelegationStatus(existingClaim.id, "dispatched");
+        this.logger.warn(
+          { correlationId, spec: existingClaim.id },
+          "dispatch: repaired report-back claim with missing queue artifact"
+        );
+        return true;
+      }
       this.logger.info(
-        { correlationId, spec: spec.id },
-        "dispatch: report-back skipped — ledger already has this correlation (#77)"
+        { correlationId, spec: existingClaim.id, status: existingClaim.status },
+        "dispatch: report-back already delivered (#77)"
       );
       return false;
     }
@@ -7480,105 +8184,140 @@ export class Orchestrator {
    * re-run of the same hop is a no-op. The chain's origin delivery uses
    * the same report-back claim on `chainId`.
    */
+  /**
+   * Replay the DURABLE completion actions for a dispatch whose done-file exists
+   * but whose ledger row never went terminal (#174).
+   *
+   * The worker is NOT rerun — its output comes from the done-file. Only the
+   * three side effects the store owns are replayed, in the same order and
+   * through the same DB-first entry points the live path uses, so the
+   * report-back claim stays atomic and dedup is unchanged.
+   *
+   * Safe to call repeatedly: `claimAndEnqueueReportBack` refuses a correlation
+   * that already has a ledger row, and `advanceChain` refuses a chain that is
+   * not `running`.
+   */
+  async replayCompletedDispatch(result: {
+    id: string;
+    target: string;
+    status: "completed" | "failed";
+    output?: string;
+    error?: string;
+    correlationId?: string;
+    returnTo?: string;
+    chainId?: string;
+    originPrompt?: string;
+    workerStatus?: "completed" | "failed" | "timed_out";
+    workerError?: string;
+    completionError?: string;
+  }, route: CompletionRoute): Promise<void> {
+    const text = result.output ?? "";
+    const workerError = result.workerError ?? (result.completionError ? undefined : result.error);
+    // The ROUTE is authoritative for the onward address, not the done-file.
+    //
+    // Keeping the route authoritative prevents a classifier/replay mismatch:
+    // chain routes must carry their explicit chain id and report-back routes
+    // their explicit destination. Legacy delivery-bearing files that lack both
+    // are skipped before reaching this method rather than routed by guesswork.
+    const routedChainId = route.action === "chain" ? route.chainId : result.chainId;
+    const routedReturnTo = route.action === "report_back" ? route.returnTo : result.returnTo;
+    // Rebuild only the fields the onward paths actually read.
+    const spec: DispatchSpec = {
+      id: result.id,
+      target: result.target,
+      prompt: result.originPrompt ?? "",
+      session: "live",
+      createdUtc: new Date().toISOString(),
+      ...(result.correlationId ? { correlationId: result.correlationId } : {}),
+      ...(routedReturnTo ? { returnTo: routedReturnTo } : {}),
+      ...(routedChainId ? { chainId: routedChainId } : {}),
+    };
+
+    // ORDER IS LOAD-BEARING. The onward side effect must be durably claimed
+    // BEFORE the worker row goes terminal, because the non-terminal row is the
+    // only thing that brings us back here after a crash.
+    //
+    // Terminalizing first would recreate the exact bug this repairs: a crash
+    // between the two steps leaves a terminal row with no report-back, the
+    // next boot skips the done-file, and the answer is lost permanently.
+    //
+    // Crash-safety of this order:
+    //   before onward       → row non-terminal, done-file present → replayed
+    //   between the two     → row non-terminal → replayed; the report-back's
+    //                         DB-first claim sees its own ledger row and
+    //                         returns false, so no double delivery
+    //   after terminalize   → row terminal → skipped, correctly
+    // The ROUTE decides, not the presence of a field. `returnTo` is not a
+    // delivery address on every kind — a compact spec stamps the ACTOR there,
+    // and compact/ingest/thread_voice already delivered their own results — so
+    // inferring "returnTo ⇒ report-back" here would invent a delivery the live
+    // path never performs. Kinds that genuinely finish with nothing onward
+    // (wake, watch, report_back, …) route to `terminalize` and fall straight
+    // through. Anything whose delivery cannot be PROVEN never reaches this
+    // method; `completionRoute` skips it and leaves the row non-terminal.
+    if (route.action === "chain") {
+      await this.advanceChain(spec, text, workerError);
+    } else if (route.action === "report_back") {
+      await this.enqueueReportBack(spec, text, workerError);
+    }
+
+    // Only now is the completion fully recorded. A throw above propagates to
+    // the caller, which logs and leaves the row non-terminal for the next boot
+    // — retrying is safe, dropping it is not.
+    const ledgerStatus = result.workerStatus ?? (result.status === "completed" ? "completed" : "failed");
+    this.store.updateDelegationStatus(result.id, ledgerStatus);
+  }
+
   private async advanceChain(spec: DispatchSpec, output: string, error?: string): Promise<void> {
     const chainId = spec.chainId;
     if (!chainId) return;
     const chain = this.store.getChain(chainId);
     if (!chain) {
       this.logger.warn({ chainId, dispatch: spec.id }, "chain: advance for unknown chain");
-      return;
+      throw new Error(`chain ${chainId} not found for completed dispatch ${spec.id}`);
     }
     if (chain.status !== "running") {
       this.logger.info({ chainId, status: chain.status }, "chain: advance on non-running chain — ignored");
-      return;
+      return; // A prior replay already completed the chain.
     }
 
-    // Hop-scoped claim: one advance (or fail-delivery) per completing spec.
-    if (!this.claimChainHopAdvance(spec, chainId)) {
-      this.logger.info(
-        { chainId, dispatch: spec.id },
-        "chain: advance skipped — hop already claimed (#77)"
-      );
-      // Repair the inner window (claimed, then crashed before terminal
-      // enqueue/complete). Do NOT call store.advanceChain again.
-      const current = this.store.getChain(chainId);
-      if (current?.status === "running") {
-        if (error) {
-          await this.enqueueChainDelivery(
-            current.originRef,
-            chainId,
-            `The chain broke at a hop: ${error}\n\n--- partial output ---\n${output}`
-          );
-          this.store.completeChain(chainId, "failed");
-        } else if (current.hops.length === 0) {
-          await this.enqueueChainDelivery(current.originRef, chainId, output);
-          this.store.completeChain(chainId);
-        }
-      }
-      return;
-    }
-
-    if (error) {
-      // Enqueue the failure delivery BEFORE marking the chain terminal, so a
-      // crash between the two still re-enters this path (chain still running)
-      // and the correlation claim on `chainId` keeps the delivery unique.
-      await this.enqueueChainDelivery(
-        chain.originRef,
-        chainId,
-        `The chain broke at a hop: ${error}\n\n--- partial output ---\n${output}`
-      );
-      this.store.completeChain(chainId, "failed");
-      this.logger.warn({ chainId, dispatch: spec.id, error }, "chain: hop failed; chain marked failed");
-      return;
-    }
-
-    const advanced = this.store.advanceChain(chainId);
-    if (!advanced) {
-      this.logger.warn({ chainId }, "chain: advance no-op (missing or not running)");
-      return;
-    }
-    const { nextHop } = advanced;
-    if (nextHop) {
-      // Pipe this hop's output into the next hop as its input.
-      const next = buildChainHopSpec({
-        id: randomUUID(),
-        chainId,
-        worker: nextHop,
-        prompt: output,
-        originRef: chain.originRef,
-      });
-      await enqueueDispatchSpec(this.config.DATA_DIR, next);
-      this.logger.info(
-        { chainId, dispatch: next.id, worker: nextHop, index: advanced.chain.currentIndex },
-        "chain: advanced to next hop"
-      );
-    } else {
-      // No hops remain — deliver the final output to the origin and complete.
-      await this.enqueueChainDelivery(chain.originRef, chainId, output);
-      this.store.completeChain(chainId);
-      this.logger.info({ chainId, originRef: chain.originRef }, "chain: completed; final output delivered");
-    }
-  }
-
-  /**
-   * Durable "this hop already advanced the chain" claim (#77). Keyed on the
-   * completing spec's id (not the chain's shared correlation) so hop N's
-   * claim cannot block hop N+1. Uses a synthetic ledger id so it does not
-   * collide with the hop's own `kind=forward` row (`id = spec.id`).
-   */
-  private claimChainHopAdvance(spec: DispatchSpec, chainId: string): boolean {
-    if (this.store.getReportBackByCorrelation(spec.id)) return false;
-    const claimed = this.store.tryRecordReportBack({
-      id: `chain_advance:${spec.id}`,
-      kind: "report_back",
-      sourceRef: chainId,
-      targetRef: spec.target,
-      worker: spec.preset ?? null,
+    // The plan row and chain pop commit in ONE SQLite transaction. Its stored
+    // child id/worker are the authority on replay; never infer phase from the
+    // mutated remaining-hop list.
+    const plan = this.store.planChainHopCompletion({
+      dispatchId: spec.id,
+      chainId,
+      failed: Boolean(error),
       promptPreview: spec.prompt,
-      correlationId: spec.id,
-      status: "completed",
     });
-    return claimed !== null;
+    if (!plan) throw new Error(`chain ${chainId} could not durably plan completion ${spec.id}`);
+
+    if (plan.nextHop) {
+      const next = buildChainHopSpec({
+        id: plan.dispatchId,
+        chainId,
+        worker: plan.nextHop,
+        prompt: output,
+        originRef: plan.originRef,
+      });
+      const artifact = await dispatchArtifactState(this.config.DATA_DIR, plan.dispatchId);
+      if (!artifact) await enqueueDispatchSpec(this.config.DATA_DIR, next);
+      this.logger.info(
+        { chainId, dispatch: next.id, worker: plan.nextHop, repaired: !plan.created },
+        "chain: next hop durably queued"
+      );
+      return;
+    }
+
+    const body = error
+      ? `The chain broke at a hop: ${error}\n\n--- partial output ---\n${output}`
+      : output;
+    await this.enqueueChainDelivery(plan.originRef, chainId, body, plan.dispatchId);
+    this.store.completeChain(chainId, error ? "failed" : "completed");
+    this.logger.info(
+      { chainId, originRef: plan.originRef, failed: Boolean(error) },
+      "chain: terminal delivery durably queued"
+    );
   }
 
   /** Deliver a chain's terminal output into its origin thread as a fresh live
@@ -7589,9 +8328,10 @@ export class Orchestrator {
   private async enqueueChainDelivery(
     originRef: string,
     chainId: string,
-    body: string
+    body: string,
+    deliveryId: string = randomUUID()
   ): Promise<void> {
-    const id = randomUUID();
+    const id = deliveryId;
     const wrapped = [
       `<seam-chain-result chain="${chainId}">`,
       body,
@@ -8146,22 +8886,14 @@ export class Orchestrator {
   async runScheduledPrompt(id: string): Promise<void> {
     const row = this.store.getScheduled(id);
     if (!row) return;
-    // Live fires run through `queueOnChannel`, which already increments
-    // `activeTurns` around the turn — incrementing here too would double-count
-    // and inflate the redeploy-drain counter while running. So only the isolated
-    // path takes the outer increment (M3).
-    if (row.sessionMode === "live") {
-      await this.runScheduledPromptInner(row);
-      return;
-    }
-    // Count scheduled jobs in the restart-drain counter (activeTurns) so a
-    // redeploy/sentinel waits for an in-flight job to finish instead of killing
-    // its agent child mid-run.
-    this.activeTurns++;
+    // Register before the first asynchronous precondition check. Live mode is
+    // also counted by queueOnChannel once admitted there, but this outer token
+    // covers the otherwise invisible interval before queue registration.
+    const endTurn = this.beginTurn();
     try {
       await this.runScheduledPromptInner(row);
     } finally {
-      this.activeTurns--;
+      endTurn();
     }
   }
 
@@ -10572,6 +11304,18 @@ export class Orchestrator {
         `💬 Queued your steer into thread ${threadId}'s inbox — ${queued} message(s) waiting. ` +
           `The agent reads it at its next inbox poll; no turn was cancelled. ` +
           `Add \`now:true\` to cancel-and-reprompt instead.`
+      );
+      return;
+    }
+
+    // #174: `now:true` is the one steer mode that OPENS a turn (the cooperative
+    // path above only writes to the inbox), and it does so outside the
+    // `handleIncomingMessage` gate. Refuse it once admission is closed rather
+    // than cancelling a live turn and starting a replacement the drain has
+    // already stopped waiting for. Told plainly, so the operator can resend.
+    if (this.intakeStopped) {
+      await i.editReply(
+        "♻️ Restarting — the steer was not sent and nothing was cancelled. Try again in a moment."
       );
       return;
     }
@@ -17435,6 +18179,15 @@ export class Orchestrator {
   ): void {
     const prompt = (preset.instructions ?? "").trim();
     if (!prompt) return;
+    // #174: this opens a brand-new channel turn WITHOUT going through
+    // `handleIncomingMessage`, so it needs its own admission check — otherwise
+    // a `/seam preset thread` landing during the drain starts a turn after the
+    // quiesce snapshot. The thread and its applied preset are already durable;
+    // only the opening turn is skipped, and the user can prompt it after boot.
+    if (this.intakeStopped) {
+      this.logger.info({ thread: thread.id }, "preset opening turn skipped; shutting down");
+      return;
+    }
     const synthetic: IncomingMessage = {
       channel: thread,
       authorId,

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -191,6 +191,7 @@ function makeOrch(opts: {
   panel?: boolean;
   timeoutSeconds?: number;
   cfg?: Record<string, unknown>;
+  storeOverrides?: Record<string, unknown>;
 }): Orchestrator {
   const router = {
     listProfiles: () => [],
@@ -210,9 +211,13 @@ function makeOrch(opts: {
     updateDelegationStatus: () => {},
     getReportBackByCorrelation: () => null,
     tryRecordReportBack: (e: unknown) => e,
+    // Visual-only chain tests do not exercise chain progression; model an
+    // already-completed chain so dispatch completion is a no-op.
+    getChain: () => ({ status: "completed" }),
     readConfig: () => opts.cfg ?? { model: "opus", reasoningEffort: "high" },
     getByChannel: () => record(),
     getParkedByChannel: () => null,
+    ...opts.storeOverrides,
   };
   const config = {
     DATA_DIR: opts.dataDir,
@@ -349,6 +354,51 @@ describe("dispatchInjectTurn: status panel ON (default)", () => {
     const orch = makeOrch({ dataDir, rt, adapter });
     await orch.dispatchInjectTurn(baseSpec({ kind: "forward", chainId: "chain-1" }));
     expect(calls.sendPanel[0]!.panel.title).toContain("🔗 Chain");
+  });
+
+  it("durably claims onward delivery before terminalizing the live worker", async () => {
+    const order: string[] = [];
+    const rt = fakeRuntime({ text: ["answer"] });
+    const { adapter } = spyAdapter();
+    const orch = makeOrch({
+      dataDir,
+      rt,
+      adapter,
+      storeOverrides: {
+        tryRecordReportBack: (entry: Record<string, unknown>) => {
+          order.push("claim");
+          return { ...entry, createdUtc: new Date().toISOString() };
+        },
+        updateDelegationStatus: (_id: string, status: string) => {
+          if (status !== "running") order.push("terminalize");
+        },
+      },
+    });
+
+    await orch.dispatchInjectTurn(baseSpec({ returnTo: "origin-thread" }));
+    expect(order).toEqual(["claim", "terminalize"]);
+  });
+
+  it("keeps the live worker non-terminal and preserves output when onward durability fails", async () => {
+    const update = vi.fn();
+    const rt = fakeRuntime({ text: ["answer worth keeping"] });
+    const { adapter } = spyAdapter();
+    const orch = makeOrch({
+      dataDir,
+      rt,
+      adapter,
+      storeOverrides: {
+        tryRecordReportBack: () => { throw new Error("store closed before claim"); },
+        updateDelegationStatus: update,
+      },
+    });
+
+    const failure = await orch
+      .dispatchInjectTurn(baseSpec({ returnTo: "origin-thread" }))
+      .catch((err) => err as Error & { output?: string });
+    expect(failure.message).toMatch(/store closed before claim/);
+    expect(failure.output).toBe("answer worth keeping");
+    expect(update.mock.calls.map((call) => call[1])).toEqual(["running", "running"]);
   });
 
   it("finalizes the panel to Timed out when the turn times out", async () => {

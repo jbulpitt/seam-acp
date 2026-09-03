@@ -54,6 +54,23 @@ function makeStore(initial: WakeEvent[]) {
 }
 
 describe("WakeManager sweeper (#59)", () => {
+  it("drain waits for an already-admitted sweep", async () => {
+    const { store } = makeStore([makeWake()]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const m = new WakeManager({ store, onFire: async () => gate, logger: silentLogger });
+    const sweep = m.sweep();
+    await vi.waitFor(() => expect((m as any).activePasses.size).toBe(1));
+    m.stop();
+    let drained = false;
+    const drain = m.drain().then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    release();
+    await Promise.all([sweep, drain]);
+    expect(drained).toBe(true);
+  });
+
   it("fires a due wake and deletes it before firing (D1)", async () => {
     const wake = makeWake();
     const { store, deletes, rows } = makeStore([wake]);

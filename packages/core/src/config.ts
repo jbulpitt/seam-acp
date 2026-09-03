@@ -512,7 +512,21 @@ const Schema = z.object({
     .int()
     .min(100)
     .max(3_600_000)
-    .default(300_000),
+    .default(900_000),
+  /**
+   * #174: ceiling on the pre-close quiesce barrier — how long shutdown waits
+   * for claimed dispatches, active channel turns and post-turn continuations
+   * to settle while the adapter and store are still open. ALWAYS bounded: a
+   * wedged agent must not be able to stall a restart. Anything still
+   * outstanding on expiry is repaired by boot done-file reconciliation, so
+   * raising this trades restart latency for fewer boot repairs, not safety.
+   */
+  SHUTDOWN_QUIESCE_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(120_000)
+    .default(10_000),
   /** Retire warm, idle ACP process trees after this many seconds while keeping
    * the durable session binding resumable. 0 disables. Default 2 hours. */
   RUNTIME_IDLE_TTL_SECONDS: z.coerce.number().int().min(0).max(604800).default(7200),

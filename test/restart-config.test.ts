@@ -19,9 +19,9 @@ describe("RESTART_DRAIN_TIMEOUT_MS", () => {
     } as NodeJS.ProcessEnv;
   }
 
-  it("defaults to five minutes", () => {
+  it("defaults to fifteen minutes", () => {
     baseEnv(undefined);
-    expect(loadConfig().RESTART_DRAIN_TIMEOUT_MS).toBe(300_000);
+    expect(loadConfig().RESTART_DRAIN_TIMEOUT_MS).toBe(900_000);
   });
 
   it("accepts an operator override", () => {

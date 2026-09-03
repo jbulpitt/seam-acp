@@ -404,7 +404,34 @@ describe("LiveHelpManager one-session-per-VC + restart", () => {
     const n = m.reconcileOnBoot();
     expect(n).toBeGreaterThanOrEqual(1);
     expect(store.getLiveHelp(first.liveId)?.status).toBe("ended");
-    m.stopAll();
+    await m.stopAll();
+  });
+
+  it("stopAll waits for the aborted call's DB/notification cleanup tail", async () => {
+    let release!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => { release = resolve; });
+    const m = mgr({
+      runCall: async ({ signal }) =>
+        new Promise((resolve) => {
+          signal.addEventListener("abort", () => {
+            void cleanupGate.then(() => resolve({ reason: "cancelled" }));
+          });
+        }),
+    });
+    const minted = await m.mint(
+      record(),
+      { voiceChannelId: "1487095870188027987", system: "tutor" },
+      "coach"
+    );
+    expect(minted.ok).toBe(true);
+    let stopped = false;
+    const stop = m.stopAll().then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    release();
+    await stop;
+    expect(stopped).toBe(true);
+    if (minted.ok) expect(store.getLiveHelp(minted.liveId)?.status).toBe("cancelled");
   });
 
   it("stores preset without requiring it", async () => {

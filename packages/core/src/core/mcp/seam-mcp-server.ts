@@ -1649,6 +1649,17 @@ export class SeamMcpServer {
   private readonly logger: Logger;
   private server?: http.Server;
   private boundPort?: number;
+  /**
+   * #174 shutdown admission. Tools here mutate the store and enqueue dispatch
+   * specs, and MCP was left open across the whole phase-1 quiesce — so a tool
+   * call arriving after the snapshot could write to a store that was about to
+   * close. Both entry points (`start()`'s own listener and `handleRequest`
+   * from the health proxy) funnel through `handle()`, so ONE gate there covers
+   * both by construction.
+   */
+  private admissionOpen = true;
+  /** Calls admitted before the gate closed, so shutdown can wait for them. */
+  private readonly inFlight = new Set<Promise<void>>();
 
   constructor(deps: SeamMcpServerDeps) {
     this.deps = deps;
@@ -1677,11 +1688,71 @@ export class SeamMcpServer {
     return this.boundPort;
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Synchronously refuse NEW tool calls. Separate from `stop()` on purpose:
+   * closing admission must happen before the quiesce snapshot, while awaiting
+   * connection close must not — see `stop()`.
+   */
+  closeAdmission(): void {
+    if (!this.admissionOpen) return;
+    this.admissionOpen = false;
+    this.logger.info({ inFlight: this.inFlight.size }, "seam-mcp admission closed");
+  }
+
+  /** True once shutdown has refused new tool calls. */
+  get admissionClosed(): boolean {
+    return !this.admissionOpen;
+  }
+
+  /** How many admitted tool calls are still running. */
+  get inFlightCount(): number {
+    return this.inFlight.size;
+  }
+
+  /**
+   * Await tool calls admitted before `closeAdmission()`, bounded. Runs while
+   * the store is still open, which is the entire point: an admitted call's
+   * ledger write and dispatch enqueue must land.
+   */
+  async drainRequests(timeoutMs: number): Promise<{ drained: boolean; outstanding: number }> {
+    if (this.inFlight.size === 0) return { drained: true, outstanding: 0 };
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+      timer.unref?.();
+    });
+    await Promise.race([Promise.allSettled([...this.inFlight]), deadline]);
+    if (timer) clearTimeout(timer);
+    const outstanding = this.inFlight.size;
+    if (outstanding > 0) {
+      this.logger.warn({ outstanding, timeoutMs }, "seam-mcp request drain timed out");
+    }
+    return { drained: outstanding === 0, outstanding };
+  }
+
+  /**
+   * Close the listener. BOUNDED: `server.close()` waits for every open
+   * connection to end, so an unbounded await here could stall shutdown
+   * indefinitely — precisely when a hung tool call is what caused the quiesce
+   * timeout in the first place. Past the deadline the process exits anyway and
+   * the socket dies with it.
+   */
+  async stop(opts: { timeoutMs?: number } = {}): Promise<void> {
+    this.closeAdmission();
     const server = this.server;
     if (!server) return;
     this.server = undefined;
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    let timer: NodeJS.Timeout | undefined;
+    const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        this.logger.warn({ timeoutMs: opts.timeoutMs }, "seam-mcp close timed out; abandoning");
+        resolve();
+      }, opts.timeoutMs ?? 5000);
+      timer.unref?.();
+    });
+    await Promise.race([closed, deadline]);
+    if (timer) clearTimeout(timer);
   }
 
   // --- HTTP / JSON-RPC plumbing -------------------------------------------
@@ -1692,6 +1763,24 @@ export class SeamMcpServer {
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // #174: refuse before reading the body, so nothing this call would do can
+    // start. Shared by the direct listener and the health `/mcp` proxy.
+    if (!this.admissionOpen) {
+      res.writeHead(503, { "content-type": "application/json", "retry-after": "30" });
+      res.end(JSON.stringify(rpcError(null, -32000, "seam-acp is restarting; retry shortly")));
+      return;
+    }
+    const tracked = this.handleAdmitted(req, res).finally(() => {
+      this.inFlight.delete(tracked);
+    });
+    this.inFlight.add(tracked);
+    return tracked;
+  }
+
+  private async handleAdmitted(
+    req: http.IncomingMessage,
+    res: http.ServerResponse
+  ): Promise<void> {
     if (req.method !== "POST" || mcpPathname(req.url) !== "/mcp") {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "not found" }));

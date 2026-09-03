@@ -45,6 +45,7 @@ export class WakeManager {
   private timer?: ReturnType<typeof setInterval>;
   /** Reentrancy guard: a slow sweep must not overlap the next interval tick. */
   private sweeping = false;
+  private readonly activePasses = new Set<Promise<void>>();
 
   constructor(opts: WakeManagerOpts) {
     this.store = opts.store;
@@ -76,7 +77,11 @@ export class WakeManager {
    * One-shot: fired, then gone. Unlike the sweep, no catch-up/drop check — a
    * startup wake fires on the next boot however long the process was down.
    */
-  async fireStartupWakes(): Promise<void> {
+  fireStartupWakes(): Promise<void> {
+    return this.trackPass(() => this.fireStartupWakesInner());
+  }
+
+  private async fireStartupWakesInner(): Promise<void> {
     try {
       const startup = this.store.listStartupWakes();
       for (const wake of startup) {
@@ -109,14 +114,26 @@ export class WakeManager {
     this.timer = undefined;
   }
 
+  async drain(): Promise<void> {
+    while (this.activePasses.size > 0) {
+      await Promise.allSettled([...this.activePasses]);
+    }
+  }
+
   /**
    * One sweep: fire (or drop) every wake whose time has come. Resolves when all
    * due rows picked up by this sweep have been handled — which is what makes the
    * sweeper testable without real timers.
    */
-  async sweep(): Promise<void> {
-    if (this.sweeping) return;
+  sweep(): Promise<void> {
+    if (this.sweeping) return Promise.resolve();
     this.sweeping = true;
+    return this.trackPass(() => this.sweepInner()).finally(() => {
+      this.sweeping = false;
+    });
+  }
+
+  private async sweepInner(): Promise<void> {
     try {
       const now = Date.now();
       const due = this.store.listDueWakes(new Date(now).toISOString());
@@ -143,8 +160,13 @@ export class WakeManager {
       }
     } catch (err) {
       this.logger.warn({ err }, "wake sweep failed");
-    } finally {
-      this.sweeping = false;
     }
+  }
+
+  private trackPass(run: () => Promise<void>): Promise<void> {
+    const running = Promise.resolve().then(run);
+    const tracked = running.finally(() => this.activePasses.delete(tracked));
+    this.activePasses.add(tracked);
+    return tracked;
   }
 }

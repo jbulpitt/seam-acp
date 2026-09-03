@@ -5,6 +5,15 @@ import { hostEmoji } from "./core/location.js";
 import { LoopbackHost } from "./core/loopback-host.js";
 import { logger } from "./lib/logger.js";
 import { startHealthServer } from "./lib/health.js";
+import {
+  startShutdownBudget,
+  runBoundedStep,
+  safeToCloseResources,
+  undrainedStages,
+  SHUTDOWN_BUDGET_MS,
+  SHUTDOWN_EXIT_FALLBACK_MS,
+  type DrainVerdict,
+} from "./lib/shutdown-budget.js";
 import { SessionStore } from "./core/session-store.js";
 import { DelegationReconciler } from "./core/delegation-reconciler.js";
 import { DELEGATION_TERMINAL_STATUSES } from "./core/types.js";
@@ -35,6 +44,7 @@ import {
 import { VoiceLeaseManager } from "./core/voice-lease.js";
 import { evaluateWatch } from "./core/watch/evaluate.js";
 import { DispatchWatcher } from "./core/dispatch/watcher.js";
+import { reconcileCompletedDoneFiles } from "./core/dispatch/done-reconcile.js";
 import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
@@ -120,27 +130,6 @@ async function main(): Promise<void> {
   });
   const modelMetadataStore = new ModelMetadataStore(seamDbPath);
   const artificialAnalysis = new ArtificialAnalysisMetadataSource(config.AA_API_KEY);
-  // #137: old `running` rows are not resumable work — terminalize them before
-  // the ordinary #75 boot pass converts fresh crash leftovers to `interrupted`.
-  // The same cutoff is swept periodically so a hung live process self-cleans.
-  const delegationReconciler = new DelegationReconciler({
-    store,
-    logger,
-    maxAgeMs: config.SEAM_TURN_RESUME_MAX_AGE_SECONDS * 1000,
-  });
-  delegationReconciler.reconcile();
-  // #75: crash leftovers stay `dispatched`/`running` forever unless we flip
-  // them here. Target / correlation / acp_session_id are preserved for resume.
-  // Does not delete isolated ACP sessions — #76 decides whether to reattach.
-  const orphaned = store.reconcileOrphanedDelegations();
-  if (orphaned > 0) {
-    logger.warn(
-      { count: orphaned },
-      "reconciled orphaned delegation ledger rows as interrupted"
-    );
-  }
-  delegationReconciler.start();
-
   const { servers: mcpServers } = buildGlobalMcpServers(logger, {
     dataDir: config.DATA_DIR,
   });
@@ -974,6 +963,46 @@ async function main(): Promise<void> {
       style: resolveThreadTtsStyle(config, channelRef) ?? "neutral",
     }),
   });
+  // #174: repair completions whose output reached `done/` but whose DB-first
+  // side effects (ledger status, report-back, chain advance) were lost to a
+  // shutdown race. Runs BEFORE the watcher starts, so a report-back this
+  // enqueues is picked up by the very first tick. The worker is never
+  // re-executed; its output is read off disk.
+  //
+  // This deliberately runs BEFORE the #137 stale and #75 orphan passes below.
+  // A done-backed row is a completed turn awaiting side effects, not stale
+  // work to abandon or interrupted work to resume.
+  try {
+    const repaired = await reconcileCompletedDoneFiles({
+      dataDir: config.DATA_DIR,
+      logger,
+      getDelegation: (id) => store.getDelegation(id),
+      replay: (result, route) => orchestrator.replayCompletedDispatch(result, route),
+    });
+    if (repaired.reconciled > 0 || repaired.failed > 0 || repaired.skippedUnprovable > 0) {
+      logger.warn(repaired, "reconciled completed dispatches whose ledger row was non-terminal");
+    }
+  } catch (err) {
+    logger.warn({ err }, "done-file completion reconciliation failed");
+  }
+  // Only after done-backed completions have replayed may stale/orphan logic
+  // terminalize remaining rows. Reversing this order destroys the evidence:
+  // an old running row with a valid done-file becomes `abandoned`, and the
+  // completion scan then (correctly) skips it as terminal.
+  const delegationReconciler = new DelegationReconciler({
+    store,
+    logger,
+    maxAgeMs: config.SEAM_TURN_RESUME_MAX_AGE_SECONDS * 1000,
+  });
+  delegationReconciler.reconcile();
+  const orphaned = store.reconcileOrphanedDelegations();
+  if (orphaned > 0) {
+    logger.warn(
+      { count: orphaned },
+      "reconciled orphaned delegation ledger rows as interrupted"
+    );
+  }
+  delegationReconciler.start();
   // Only now may durable specs run: Thread Voice verification, settlement,
   // lease reconciliation, and recovery bookkeeping are all installed first.
   await dispatchWatcher.start();
@@ -1179,6 +1208,36 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, "shutting down");
+    // #174: every bounded stage below draws from ONE budget. Per-stage ceilings
+    // bound each stage but never their sum — 10+10+5+10 sequential is 35s, past
+    // the ~30s a host allows before SIGKILL, and being killed mid-teardown is
+    // the exact outcome this issue exists to prevent. Draining from a shared
+    // budget makes the total an invariant: 20s of bounded stages plus the 5s
+    // process-exit fallback plus untimed overhead stays under the strictest
+    // host's 30s, no matter how `SHUTDOWN_QUIESCE_TIMEOUT_MS` is tuned — see
+    // `shutdownFitsHostBudget()`.
+    const budget = startShutdownBudget(SHUTDOWN_BUDGET_MS);
+    /**
+     * Run one teardown step against what is left of the budget. Never throws;
+     * returns whether it actually FINISHED. A step that timed out or threw may
+     * still have work resuming behind it, so callers that are about to close a
+     * shared handle have to be able to see the difference.
+     */
+    const bounded = (
+      label: string,
+      capMs: number,
+      work: () => Promise<unknown>
+    ): Promise<boolean> =>
+      runBoundedStep({
+        label,
+        timeoutMs: budget.forStage(capMs),
+        work,
+        onError: (l, err) => logger.warn({ err, label: l }, "shutdown step failed"),
+        onTimeout: (l, timeoutMs) =>
+          logger.warn({ label: l, timeoutMs }, "shutdown step exceeded its budget; proceeding"),
+      });
+    /** What every bounded DRAIN reported — teardown below is conditional on it. */
+    const verdicts: DrainVerdict[] = [];
     orchestrator.stopSentinelWatcher();
     delegationReconciler.stop();
     quotaPoller.stop();
@@ -1192,42 +1251,191 @@ async function main(): Promise<void> {
     parkedManager.stop();
     cardGifs.stop();
     watchManager.stop();
-    dispatchWatcher.stop();
-    await voiceConsoleController.shutdownAll();
+    // #174 HTTP ingress closes FIRST, and synchronously. `/mcp` and `/ingest`
+    // reach tools that write the ledger and enqueue dispatch specs, and both
+    // stayed open across the whole phase-1 quiesce — so a call arriving after
+    // the snapshot could still be writing when the store closed. Admission is
+    // shut without awaiting anything, then the calls ALREADY admitted are
+    // drained (bounded) while the store is still open, so their durable work
+    // lands. Anything they enqueue afterwards is left in `pending/` by the
+    // closed watcher intake and delivered on the next boot.
+    //
+    // Discord admission closes in the SAME synchronous beat, and for the same
+    // reason. `quiesce()` calls `closeAdmission()` too, but that is on the far
+    // side of the HTTP drain await below — a window of up to the full drain
+    // budget in which a slash command, component click or message could still
+    // be admitted and start store-backed work that nothing has yet begun
+    // draining. All three gates shut before the first await, so there is no
+    // such window.
+    //
+    // `closeAdmission()`, not `stopIntake()`: this is the only place that is
+    // allowed to refuse the Discord transport, because it is the only place
+    // where the store really is about to close. The restart-sentinel drain uses
+    // `stopIntake()` and keeps the control surface (`/seam cancel`) reachable.
+    seamMcpServer?.closeAdmission();
+    health.closeIngress();
+    orchestrator.closeAdmission();
+    const httpDrain = budget.forStage(config.SHUTDOWN_QUIESCE_TIMEOUT_MS);
+    const [mcpDrained, healthDrained] = await Promise.all([
+      seamMcpServer
+        ? seamMcpServer.drainRequests(httpDrain).then(
+            (r) => r.drained,
+            (err) => {
+              logger.warn({ err }, "seam-mcp request drain failed");
+              return false;
+            }
+          )
+        : Promise.resolve(true),
+      health.drainIngress(httpDrain).then(
+        (r) => r.drained,
+        (err) => {
+          logger.warn({ err }, "health ingress drain failed");
+          return false;
+        }
+      ),
+    ]);
+    verdicts.push({ stage: "seam-mcp-ingress", drained: mcpDrained });
+    verdicts.push({ stage: "health-ingress", drained: healthDrained });
+    // Drain manager callbacks only after already-admitted HTTP work has
+    // finished. An admitted run-now request can enter a manager after the
+    // synchronous stop() calls above; draining first would miss that late
+    // callback and permit it to reach the store during teardown.
+    verdicts.push({
+      stage: "manager-callbacks",
+      drained: await bounded("manager callbacks", config.SHUTDOWN_QUIESCE_TIMEOUT_MS, async () => {
+        await Promise.all([
+          scheduledManager.drain(),
+          wakeManager.drain(),
+          watchManager.drain(),
+          parkedManager.drain(),
+        ]);
+      }),
+    });
+    // #174 phase 1: quiesce BEFORE anything is torn down. `dispatchWatcher.stop()`
+    // only closes intake; `quiesce()` is the barrier that waits for claimed
+    // dispatches, active channel turns, and post-turn continuations to settle
+    // — while the adapter and store are still usable, so their DB-first
+    // completion work (ledger status, report-back claim, chain advance)
+    // actually lands. Bounded: a wedged agent cannot stall the restart, and
+    // anything left over is repaired by boot done-file reconciliation.
+    const quiesceDrained = await orchestrator
+      .quiesce({ timeoutMs: budget.forStage(config.SHUTDOWN_QUIESCE_TIMEOUT_MS) })
+      .then(
+        (outcome) => outcome.drained,
+        (err) => {
+          logger.warn({ err }, "quiesce failed");
+          return false;
+        }
+      );
+    verdicts.push({ stage: "pre-dispose-quiesce", drained: quiesceDrained });
+    // Voice console teardown settles bindings and posts closing state, so an
+    // unfinished one is late work that reaches the store and the adapter.
+    verdicts.push({
+      stage: "voice-console-shutdown",
+      drained: await bounded("voice console shutdown", 5000, () =>
+        voiceConsoleController.shutdownAll()
+      ),
+    });
     voiceConsoleManager.shutdown();
-    liveHelpManager.stopAll();
+    verdicts.push({
+      stage: "live-help-shutdown",
+      drained: await bounded("live help shutdown", 5000, () => liveHelpManager.stopAll()),
+    });
     stopPresetsWatch?.();
-    await seamMcpServer?.stop().catch((err) =>
-      logger.warn({ err }, "seam-mcp stop failed")
-    );
+    // Connection close only — admission and request draining already happened
+    // above. Bounded: `server.close()` waits on open connections, so awaiting
+    // it unbounded here would stall shutdown exactly when a hung tool call was
+    // what caused the quiesce timeout.
+    // Deliberately NOT a verdict: this is the listener close, and admission was
+    // shut and drained long before it. A socket lingering past the deadline can
+    // no longer start work — `handle()` refuses with 503 — so it cannot reach
+    // the store, and the process exit closes it regardless.
+    await bounded("seam-mcp stop", 5000, async () => {
+      await seamMcpServer?.stop({ timeoutMs: budget.forStage(5000) });
+    });
     stopTunnelGist?.();
-    try {
-      await adapter.stop();
-    } catch (err) {
-      logger.warn({ err }, "adapter stop failed");
+    // #174 phase 2: dispose runtimes while the adapter and store are STILL
+    // usable. Disposal kills agent processes, which rejects any in-flight turn;
+    // those rejections run cleanup that posts to Discord and writes to the
+    // store. Stopping the adapter first (the old order) guaranteed that
+    // cleanup hit a dead adapter.
+    // A disposal that did not finish is the sharpest case of all: killing an
+    // agent REJECTS its in-flight turn, and that rejection runs cleanup which
+    // posts to Discord and writes the ledger. If disposal is still going, that
+    // cleanup is still coming.
+    verdicts.push({
+      stage: "router-dispose",
+      drained: await bounded("router disposeAll", 10_000, () => router.disposeAll()),
+    });
+    // #174 phase 3: disposal SPAWNS work — rejection handlers register fresh
+    // post-turn continuations. A single setImmediate is not a barrier for
+    // that, so drain the tracked set again, bounded, before the transport and
+    // store go away. Anything still outstanding when this expires is exactly
+    // what boot done-file reconciliation repairs.
+    const postDisposeDrained = await orchestrator
+      .drainAfterDispose({ timeoutMs: budget.forStage(config.SHUTDOWN_QUIESCE_TIMEOUT_MS) })
+      .then(
+        (outcome) => outcome.drained,
+        (err) => {
+          logger.warn({ err }, "post-dispose drain failed");
+          return false;
+        }
+      );
+    verdicts.push({ stage: "post-dispose-drain", drained: postDisposeDrained });
+
+    // #174: close the adapter and the SQLite handles ONLY when every drain
+    // above proved nothing can still be running. A stage that timed out or
+    // whose barrier failed has left work that can RESUME — an admitted `/mcp`
+    // call past its deadline, a turn the quiesce gave up on — and that work
+    // reaches for exactly these handles. Closing underneath it does not save
+    // the side effect; it turns a late write into a thrown
+    // `TypeError: The database connection is not open`, which the dispatch
+    // path records as a FAILED run with the agent's answer discarded (see the
+    // negative control in test/shutdown-quiesce.test.ts). Leaking a file
+    // descriptor and a gateway socket for the last moments of a process that
+    // is already exiting is the cheaper mistake, and the bounded
+    // `process.exit` below reclaims both regardless.
+    if (safeToCloseResources(verdicts)) {
+      // The adapter goes first, and its OWN success gates the stores. The
+      // channel gate installed by `setActiveChannelCheck` calls
+      // `store.isChannelActive()` on every inbound Discord event, and it runs
+      // BEFORE the admission gate can refuse anything — so a gateway that did
+      // not really stop still reaches the store on the next message. Closing
+      // the stores after an unfinished `adapter.stop()` would be exactly the
+      // race this issue is about, on the one path admission does not cover.
+      if (await bounded("adapter stop", 5000, () => adapter.stop())) {
+        try {
+          modelMetadataStore.close();
+        } catch {
+          /* ignore */
+        }
+        try {
+          modelValueStore.close();
+        } catch {
+          /* ignore */
+        }
+        try {
+          store.close();
+        } catch {
+          /* ignore */
+        }
+      } else {
+        logger.warn(
+          { remainingBudgetMs: budget.remaining() },
+          "adapter did not stop cleanly; leaving the stores open — its channel gate reads them outside the admission gate"
+        );
+      }
+    } else {
+      logger.warn(
+        { undrained: undrainedStages(verdicts), remainingBudgetMs: budget.remaining() },
+        "shutdown did not fully drain; leaving the adapter and stores open so late work cannot hit a closed handle — process exit releases them"
+      );
     }
-    try {
-      await router.disposeAll();
-    } catch (err) {
-      logger.warn({ err }, "router disposeAll failed");
-    }
-    try {
-      modelMetadataStore.close();
-    } catch {
-      /* ignore */
-    }
-    try {
-      modelValueStore.close();
-    } catch {
-      /* ignore */
-    }
-    try {
-      store.close();
-    } catch {
-      /* ignore */
-    }
+    // The listener close is bounded by this fallback, not awaited: `close()`
+    // does not call back while a connection is open, and the budget above is
+    // sized so this 5s tail still lands inside the host's ~30s allowance.
     health.close(() => process.exit(0));
-    setTimeout(() => process.exit(1), 5000).unref();
+    setTimeout(() => process.exit(1), SHUTDOWN_EXIT_FALLBACK_MS).unref();
   };
 
   process.on("SIGINT", () => void shutdown("SIGINT"));

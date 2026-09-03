@@ -40,6 +40,7 @@ export class ParkedPromptManager {
   private readonly isChannelBusy?: (channelRef: string) => boolean;
   private offReady?: () => void;
   private readonly firing = new Set<string>();
+  private readonly activeFires = new Set<Promise<void>>();
 
   constructor(opts: ParkedPromptManagerOpts) {
     this.store = opts.store;
@@ -60,6 +61,12 @@ export class ParkedPromptManager {
   stop(): void {
     this.offReady?.();
     this.offReady = undefined;
+  }
+
+  async drain(): Promise<void> {
+    while (this.activeFires.size > 0) {
+      await Promise.allSettled([...this.activeFires]);
+    }
   }
 
   /**
@@ -83,9 +90,19 @@ export class ParkedPromptManager {
    * (ready-flap: hello then immediate disconnect). Serialized per location so
    * a double ready event cannot double-deliver.
    */
-  async fireLocation(location: string): Promise<void> {
-    if (this.firing.has(location)) return;
+  fireLocation(location: string): Promise<void> {
+    if (this.firing.has(location)) return Promise.resolve();
     this.firing.add(location);
+    const running = this.fireLocationInner(location);
+    const tracked = running.finally(() => {
+      this.firing.delete(location);
+      this.activeFires.delete(tracked);
+    });
+    this.activeFires.add(tracked);
+    return tracked;
+  }
+
+  private async fireLocationInner(location: string): Promise<void> {
     try {
       if (!this.hub.isBridgeReady(location)) return;
       const rows = this.store.listParkedByLocation(location);
@@ -106,8 +123,6 @@ export class ParkedPromptManager {
       }
     } catch (err) {
       this.logger.warn({ err, location }, "parked-prompt fireLocation failed");
-    } finally {
-      this.firing.delete(location);
     }
   }
 }

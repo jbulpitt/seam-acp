@@ -11,7 +11,7 @@
  */
 import { z } from "zod";
 import * as path from "node:path";
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import type { DelegationKind } from "../types.js";
 import { parseDispatchWorker } from "../location.js";
 
@@ -127,6 +127,28 @@ export interface DispatchSpec {
   createdUtc: string;
 }
 
+/** A failed worker turn can still have useful partial output. */
+export class DispatchTurnError extends Error {
+  constructor(
+    message: string,
+    readonly output: string,
+    readonly stopReason = "",
+    readonly workerStatus: "completed" | "failed" | "timed_out" = "failed",
+    readonly workerError?: string,
+    readonly completionPending = false,
+    /**
+     * #67: this turn was preemptively cancelled, so the live path delivered
+     * NOTHING onward on purpose. Carried here because the done-file still
+     * records the spec's `returnTo`/`chainId`, and boot replay would otherwise
+     * read that routing as an undelivered report-back and send it.
+     */
+    readonly suppressedOnward = false
+  ) {
+    super(message);
+    this.name = "DispatchTurnError";
+  }
+}
+
 /** `done/<id>.json`. Written exactly once per spec, atomically. */
 export interface DispatchResult {
   id: string;
@@ -137,9 +159,52 @@ export interface DispatchResult {
   output?: string;
   /** Failure reason. Absent on success. */
   error?: string;
+  /** The agent turn's outcome when completion delivery failed afterwards. */
+  workerStatus?: "completed" | "failed" | "timed_out";
+  /** The agent's own error, kept distinct from a completion-delivery failure. */
+  workerError?: string;
+  /** A durable side effect failed after the agent turn and must be replayed. */
+  completionError?: string;
   target: string;
   correlationId?: string;
   finishedUtc: string;
+  /**
+   * #174 replay fields. The done-file is the only durable record that survives
+   * the process, but completion has side effects the ledger owns — a
+   * report-back enqueue and a chain advance. If the store closes before those
+   * run (shutdown race), boot reconciliation has to replay them from here, so
+   * the file must carry the *routing* the spec knew and the result does not.
+   *
+   * All optional, and a done-file written before #174 carries none of them.
+   * Such a file is NOT ignored — an earlier version of this comment claimed it
+   * was, which stopped being true once reconciliation started reading the
+   * ledger. It is judged by the ledger row's `kind` instead: kinds that owe
+   * nothing onward terminalize, while delivery-bearing kinds without an
+   * explicit `returnTo` or `chainId` stay non-terminal rather than being routed
+   * by guesswork. See `completionRoute`.
+   */
+  returnTo?: string;
+  chainId?: string;
+  /**
+   * The spec's kind, because `returnTo` alone does NOT identify a delivery
+   * route. `kind: "compact"` stamps the ACTOR thread into `returnTo` and is an
+   * early-return branch of `dispatchInjectTurn` with its own result card — a
+   * replay that saw only `returnTo` would post it a report-back it never had.
+   * `ingest` and `thread_voice` are likewise self-delivering.
+   */
+  kind?: DelegationKind;
+  /** `spec.prompt` (clamped) — the originating ask, for the report-back card. */
+  originPrompt?: string;
+  /**
+   * #67 × #174: the live path deliberately delivered nothing onward because an
+   * interrupt cancelled this turn and already issued a replacement directive.
+   *
+   * Without this the routing above is indistinguishable from an undelivered
+   * completion, so boot replay would enqueue exactly the report-back (or chain
+   * advance) the interrupt suppressed — the stale answer arriving after the
+   * directive that replaced it.
+   */
+  suppressedOnward?: boolean;
 }
 
 /**
@@ -443,6 +508,27 @@ export async function enqueueDispatchSpec(
   const final = path.join(dirs.pending, `${spec.id}.json`);
   await writeFile(tmp, `${JSON.stringify(spec, null, 2)}\n`, "utf8");
   await rename(tmp, final);
+}
+
+/** Locate the durable artifact for one exact dispatch id. */
+export async function dispatchArtifactState(
+  dataDir: string,
+  id: string
+): Promise<"pending" | "running" | "done" | null> {
+  const dirs = dispatchDirs(dataDir);
+  for (const [state, dir] of [
+    ["pending", dirs.pending],
+    ["running", dirs.running],
+    ["done", dirs.done],
+  ] as const) {
+    try {
+      await access(path.join(dir, `${id}.json`));
+      return state;
+    } catch {
+      // Try the next durable location.
+    }
+  }
+  return null;
 }
 
 /**

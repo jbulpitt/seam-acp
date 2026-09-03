@@ -94,6 +94,25 @@ function makeManager(
 }
 
 describe("WatchManager sweeper (#60)", () => {
+  it("drain waits for an already-admitted evaluation", async () => {
+    const { store } = makeStore([makeWatch()]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const m = makeManager(store, async () => {
+      await gate;
+      return { fired: false, eventText: "", observed: "x" };
+    });
+    const sweep = m.sweep();
+    m.stop();
+    let drained = false;
+    const drain = m.drain().then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    release();
+    await Promise.all([sweep, drain]);
+    expect(drained).toBe(true);
+  });
+
   it("evaluates and fires via onFire, carrying the captured event text", async () => {
     const { store } = makeStore([makeWatch()]);
     const onFire = vi.fn(async () => {});

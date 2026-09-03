@@ -55,6 +55,28 @@ function makeStore(row: ScheduledPrompt) {
 }
 
 describe("ScheduledPromptManager overlap guard (D3)", () => {
+  it("drain waits for a fire admitted before stop", async () => {
+    const row = makeRow();
+    const { store } = makeStore(row);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const manager = new ScheduledPromptManager({
+      store,
+      onFire: async () => gate,
+      logger: silentLogger,
+    });
+    const fire = (manager as unknown as { fire(id: string): Promise<void> }).fire.bind(manager);
+    const running = fire(row.id);
+    manager.stop();
+    let drained = false;
+    const drain = manager.drain().then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    release();
+    await Promise.all([running, drain]);
+    expect(drained).toBe(true);
+  });
+
   it("skips a second fire while the first is still running and stamps lastStatus", async () => {
     const row = makeRow();
     const { store, upserts } = makeStore(row);

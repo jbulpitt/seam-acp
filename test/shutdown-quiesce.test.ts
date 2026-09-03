@@ -244,6 +244,7 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     logger: silent,
     intakeStopped: false,
     activeTurnSettles: new Set<Promise<void>>(),
+    inboundWork: new Set<Promise<void>>(),
     pendingContinuations: new Set<Promise<void>>(),
     channelQueues: new Map<string, Promise<void>>(),
     dispatchWatcher: undefined,
@@ -259,6 +260,12 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     runScheduledPrompt(id: string): Promise<void>;
     pendingContinuations: Set<Promise<void>>;
     activeTurnSettles: Set<Promise<void>>;
+    inboundWork: Set<Promise<void>>;
+    runInbound(
+      label: string,
+      run: () => Promise<void>,
+      refuse?: () => Promise<void> | void
+    ): Promise<void>;
     channelQueues: Map<string, Promise<void>>;
     intakeStopped: boolean;
     readonly activeTurns: number;
@@ -2069,5 +2076,89 @@ describe("#174 seam-mcp shares one gate across both entry points", () => {
     const started = Date.now();
     expect(await server.drainRequests(120)).toEqual({ drained: false, outstanding: 1 });
     expect(Date.now() - started).toBeLessThan(3000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 13. Ingress admitted just BEFORE closure is tracked, not just gated
+// ---------------------------------------------------------------------------
+
+describe("#174 an admitted gateway handler is part of quiescence", () => {
+  /**
+   * Gating stops the NEXT handler. It does nothing for the one admitted a
+   * millisecond earlier — that handler sits in no channel queue, counts as no
+   * turn and registers no continuation, so before `inboundWork` existed the
+   * barrier could not see it and `store.close()` could land on top of it.
+   */
+  it("phase 1 waits for a slash command admitted before the gate closed", async () => {
+    const store = makeClosableStore();
+    const work = deferred();
+    let wrote = false;
+    const host = makeQuiesceHost();
+
+    // Admitted while intake is still open.
+    const running = host.runInbound("slash", async () => {
+      await work.promise;
+      store.getDelegation("anything"); // the store touch that must land early
+      wrote = true;
+    });
+    await flush();
+    expect(host.inboundWork.size).toBe(1);
+    // Invisible to every other collection the barrier watches.
+    expect(host.channelQueues.size).toBe(0);
+    expect(host.activeTurns).toBe(0);
+    expect(host.pendingContinuations.size).toBe(0);
+
+    let drained = false;
+    const phase1 = host.quiesce({ timeoutMs: 5000 }).then((r) => ((drained = true), r));
+    await flush();
+    expect(drained).toBe(false); // held open by the admitted handler
+    expect(wrote).toBe(false);
+
+    work.resolve();
+    expect((await phase1).drained).toBe(true);
+    await running;
+    expect(wrote).toBe(true);
+
+    store.close();
+    await flush();
+    expect(store.violations).toEqual([]); // it finished while the store was open
+  });
+
+  it("refuses the NEXT handler without tracking or touching anything", async () => {
+    const host = makeQuiesceHost();
+    const refuse = vi.fn(async () => {});
+    const run = vi.fn(async () => {});
+
+    await host.quiesce({ timeoutMs: 1000 }); // closes admission
+    await host.runInbound("slash", run, refuse);
+
+    expect(run).not.toHaveBeenCalled();
+    expect(refuse).toHaveBeenCalledOnce();
+    expect(host.inboundWork.size).toBe(0); // a refusal is not tracked work
+  });
+
+  it("NEGATIVE CONTROL: an untracked handler reaches a closed store", async () => {
+    // The pre-fix shape: the handler runs fire-and-forget, so the barrier has
+    // nothing to wait on and teardown happens underneath it.
+    const store = makeClosableStore();
+    const work = deferred();
+    const host = makeQuiesceHost();
+
+    const untracked = (async () => {
+      await work.promise;
+      try {
+        store.getDelegation("anything");
+      } catch {
+        /* recorded as a violation */
+      }
+    })();
+
+    expect((await host.quiesce({ timeoutMs: 1000 })).drained).toBe(true); // saw nothing
+    store.close();
+    work.resolve();
+    await untracked;
+    await flush();
+    expect(store.violations).toContain("getDelegation");
   });
 });

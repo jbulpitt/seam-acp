@@ -1059,13 +1059,23 @@ export class Orchestrator {
    * always `respond()`s — empty list on miss or error, never throws.
    */
   async handleAutocompleteInteraction(interaction: AutocompleteInteraction): Promise<void> {
+    // Refusal answers with no suggestions — Discord shows an empty list rather
+    // than an error, and nothing reads the store.
+    return this.runInbound(
+      "autocomplete",
+      () => this.handleAutocompleteInteractionInner(interaction),
+      async () => {
+        await interaction.respond([]).catch(() => {});
+      }
+    );
+  }
+
+  private async handleAutocompleteInteractionInner(
+    interaction: AutocompleteInteraction
+  ): Promise<void> {
     await safeAutocompleteRespond(
       (choices) => interaction.respond(choices),
       async () => {
-        // #174: responders read presets, threads and config from the store.
-        // An empty list is the graceful shutdown answer — Discord shows no
-        // suggestions rather than an error, and nothing touches the store.
-        if (this.admissionClosed) return [];
         const group = interaction.options.getSubcommandGroup(false);
         const sub = interaction.options.getSubcommand(false);
         const focused = interaction.options.getFocused(true);
@@ -1202,41 +1212,52 @@ export class Orchestrator {
   install(): void {
     this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
     this.adapter.onComponent?.((evt) => {
-      // #174: one gate for every component handler (config editor, TTS editor,
-      // Voice Console, quota card) and, below, for choice cards. They all do
-      // store-backed work that no drain tracks. `handlePersistentComponent`
-      // reaches these through `componentHandler`, so gating the wrapper covers
-      // it too.
-      if (this.admissionClosed) {
-        this.logger.info({ customId: evt.customId }, "component refused; shutting down");
-        void evt
-          .replyEphemeral("♻️ Restarting — that action was not taken. Try again in a moment.")
-          .catch(() => {});
-        return;
-      }
-      void this.handleConfigEditorComponent(evt);
-      void this.handleTtsEditorComponent(evt).catch((err) => {
-        this.logger.warn({ err, customId: evt.customId }, "tts editor component failed");
-      });
-      void this.handleVoiceConsoleComponent(evt).catch((err) => {
-        this.logger.warn({ err, customId: evt.customId }, "voice console component failed");
-        void evt.replyEphemeral(
-          `Voice Console action failed: ${err instanceof Error ? err.message : String(err)}`
-        ).catch(() => evt.followUpEphemeral("Voice Console action failed.").catch(() => {}));
-      });
-      void this.handleQuotaCardComponent(evt).catch((err) => {
-        this.logger.warn({ err, customId: evt.customId }, "quota card component failed");
-      });
+      // #174: one gate AND one tracking point for every component handler
+      // (config editor, TTS editor, Voice Console, quota card). They all do
+      // store-backed work, and each was previously fire-and-forget — `void`
+      // with no handle — so nothing could wait for them. Awaiting them here
+      // puts them in `inboundWork`, which the shutdown barrier drains.
+      // `handlePersistentComponent` reaches these through `componentHandler`,
+      // so this wrapper covers it too.
+      void this.runInbound(
+        "component",
+        async () => {
+          await Promise.allSettled([
+            this.handleConfigEditorComponent(evt),
+            this.handleTtsEditorComponent(evt).catch((err) => {
+              this.logger.warn({ err, customId: evt.customId }, "tts editor component failed");
+            }),
+            this.handleVoiceConsoleComponent(evt).catch((err) => {
+              this.logger.warn({ err, customId: evt.customId }, "voice console component failed");
+              return evt
+                .replyEphemeral(
+                  `Voice Console action failed: ${err instanceof Error ? err.message : String(err)}`
+                )
+                .catch(() => evt.followUpEphemeral("Voice Console action failed.").catch(() => {}));
+            }),
+            this.handleQuotaCardComponent(evt).catch((err) => {
+              this.logger.warn({ err, customId: evt.customId }, "quota card component failed");
+            }),
+          ]);
+        },
+        async () => {
+          await evt
+            .replyEphemeral("♻️ Restarting — that action was not taken. Try again in a moment.")
+            .catch(() => {});
+        }
+      );
     });
-    this.adapter.onChoiceInteraction?.((evt) => {
-      if (this.admissionClosed) {
-        this.logger.info({ customId: evt.customId }, "choice click refused; shutting down");
-        return evt
-          .replyEphemeral("♻️ Restarting — your pick was not recorded. Try again in a moment.")
-          .catch(() => {});
-      }
-      return this.handleChoiceCardInteraction(evt);
-    });
+    this.adapter.onChoiceInteraction?.((evt) =>
+      this.runInbound(
+        "choice",
+        () => this.handleChoiceCardInteraction(evt),
+        async () => {
+          await evt
+            .replyEphemeral("♻️ Restarting — your pick was not recorded. Try again in a moment.")
+            .catch(() => {});
+        }
+      )
+    );
     this.adapter.onThreadDelete?.((channelRef) => this.handleThreadDeleted(channelRef));
     // DB-backed channel activation (#22): let the adapter's channel gate treat
     // an enabled active_projects row as allowed, additive to the env allowlist.
@@ -1248,15 +1269,16 @@ export class Orchestrator {
    *  (Fire-time 404 is the lazy fallback if the bot was offline when the delete
    *  happened.) Also drops a parked prompt (#88). Any pre-#158 bytes under
    *  `data/scheduled-attachments/` are deliberately left alone. */
+  /**
+   * #174: skipped during shutdown — pure cleanup with an existing lazy
+   * fallback (a fire against a deleted thread 404s and drops the row then), so
+   * deferring to the next boot costs nothing. Tracked when it does run.
+   */
   private async handleThreadDeleted(channelRef: string): Promise<void> {
-    // #174: skip during shutdown. This is pure cleanup with an existing lazy
-    // fallback — a fire against a deleted thread 404s and drops the row then —
-    // so deferring to the next boot costs nothing, while running it here would
-    // put untracked store writes in the window where the store closes.
-    if (this.admissionClosed) {
-      this.logger.info({ channelRef }, "thread-delete cleanup deferred; shutting down");
-      return;
-    }
+    return this.runInbound("thread-delete", () => this.handleThreadDeletedInner(channelRef));
+  }
+
+  private async handleThreadDeletedInner(channelRef: string): Promise<void> {
     const rows = this.store.listScheduledByChannel(PLATFORM, channelRef);
     if (rows.length > 0) {
       this.logger.info({ channelRef, count: rows.length }, "thread deleted; dropping scheduled prompts");
@@ -1681,6 +1703,50 @@ export class Orchestrator {
   }
 
   /**
+   * Gateway handlers admitted but not yet finished (#174).
+   *
+   * Gating ingress at entry stops NEW work; it does nothing for a handler
+   * admitted a millisecond before the gate closed. That handler is in no
+   * channel queue, counts as no turn, and registers no continuation — so
+   * without this it is invisible to the barrier and can be mid-await over the
+   * store when `store.close()` lands.
+   */
+  private readonly inboundWork = new Set<Promise<void>>();
+
+  /** How many admitted gateway handlers are still running. */
+  get inboundWorkCount(): number {
+    return this.inboundWork.size;
+  }
+
+  /**
+   * The one wrapper every store-backed Discord ingress goes through: refuse
+   * when admission is closed, otherwise TRACK until it finishes.
+   *
+   * `refuse` runs instead of the handler and is deliberately not tracked — it
+   * must touch nothing but the transport.
+   */
+  private async runInbound(
+    label: string,
+    run: () => Promise<void>,
+    refuse?: () => Promise<void> | void
+  ): Promise<void> {
+    if (this.admissionClosed) {
+      this.logger.info({ ingress: label }, "inbound refused; shutting down");
+      await Promise.resolve(refuse?.()).catch(() => {});
+      return;
+    }
+    const tracked = run()
+      .catch((err) => {
+        this.logger.warn({ err, ingress: label }, "inbound handler failed");
+      })
+      .finally(() => {
+        this.inboundWork.delete(tracked);
+      });
+    this.inboundWork.add(tracked);
+    await tracked;
+  }
+
+  /**
    * Close the intake door: no new dispatch is claimed and no scheduled prompt
    * fires. Anything still in `dispatch/pending/` stays there and is delivered
    * on the next boot, so stopping intake early is lossless.
@@ -1811,6 +1877,7 @@ export class Orchestrator {
       await stage(async () => this.dispatchWatcher?.drain());
       await stage(() => Promise.allSettled([...this.channelQueues.values()]));
       await stage(() => Promise.allSettled([...this.activeTurnSettles]));
+      await stage(() => Promise.allSettled([...this.inboundWork]));
       await stage(() => this.settleTrackedContinuations());
 
       // Every stage got its chance; now stop. Looping on a failing stage would
@@ -1830,6 +1897,7 @@ export class Orchestrator {
       if (
         this.activeTurnSettles.size === 0 &&
         this.pendingContinuations.size === 0 &&
+        this.inboundWork.size === 0 &&
         (this.dispatchWatcher?.inFlightCount ?? 0) === 0
       ) {
         return;
@@ -3324,24 +3392,30 @@ export class Orchestrator {
     return isThreadDetached(config, threadId);
   }
 
-  async handleSlashInteraction(
+  /**
+   * #174: gate + track. Refusing keeps NEW commands out; tracking is what
+   * covers the one admitted a millisecond earlier, which is otherwise in no
+   * queue, no turn and no continuation — invisible to the barrier, and free to
+   * be mid-await over the store when it closes.
+   */
+  async handleSlashInteraction(interaction: ChatInputCommandInteraction): Promise<void> {
+    return this.runInbound(
+      "slash",
+      () => this.handleSlashInteractionInner(interaction),
+      async () => {
+        await interaction
+          .reply({
+            content: "♻️ Restarting — that command was not run. Try again in a moment.",
+            flags: MessageFlags.Ephemeral,
+          })
+          .catch(() => {});
+      }
+    );
+  }
+
+  private async handleSlashInteractionInner(
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
-    // #174: refuse BEFORE any store access. Gateway events keep arriving until
-    // `adapter.stop()`, and `adapter.stop()` does NOT await handlers already
-    // running — so a slash command admitted after the quiesce snapshot can be
-    // mid-await over the store when `store.close()` lands. Nothing here is
-    // tracked by the drain, so the only safe answer is not to start.
-    if (this.admissionClosed) {
-      this.logger.info({ user: interaction.user?.id }, "slash refused; shutting down");
-      await interaction
-        .reply({
-          content: "♻️ Restarting — that command was not run. Try again in a moment.",
-          flags: MessageFlags.Ephemeral,
-        })
-        .catch(() => {});
-      return;
-    }
     const sub = interaction.options.getSubcommand(true);
     const slashGroup = interaction.options.getSubcommandGroup(false);
     const slashOpts = Orchestrator.slashGateOptions(interaction);

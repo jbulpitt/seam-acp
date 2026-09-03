@@ -72,6 +72,13 @@ export class DispatchWatcher {
   private readonly quarantined = new Set<string>();
   private timer?: NodeJS.Timeout;
   private ready = false;
+  /**
+   * #174: in-progress `tick()` calls. A tick checks `ready`, then AWAITS
+   * `readdir` — so `stop()` can land in that gap and `drain()` would see empty
+   * queues and return while the tick goes on to claim and run a spec against
+   * dependencies that are being torn down. Draining must await these too.
+   */
+  private readonly activeTicks = new Set<Promise<void>>();
 
   constructor(opts: DispatchWatcherOpts) {
     this.dirs = dispatchDirs(opts.dataDir);
@@ -139,13 +146,17 @@ export class DispatchWatcher {
    */
   async drain(): Promise<void> {
     for (;;) {
+      // Ticks FIRST: an in-progress tick has not created its queue entries
+      // yet, so draining queues before it would miss the work it is about to
+      // claim. This is the pre-claim race.
+      await Promise.allSettled([...this.activeTicks]);
       const queues = [...this.queues.values()];
       await Promise.allSettled(queues.map((q) => q.idle()));
       // Yield so a just-settled task can register its follow-on work before
       // we decide we are done.
       await new Promise((resolve) => setImmediate(resolve));
       const grew = this.queues.size !== queues.length;
-      if (this.inFlight.size === 0 && !grew) return;
+      if (this.inFlight.size === 0 && this.activeTicks.size === 0 && !grew) return;
     }
   }
 
@@ -156,6 +167,15 @@ export class DispatchWatcher {
    */
   async tick(): Promise<void> {
     if (!this.ready) return;
+    const run = this.tickInner();
+    const tracked = run.finally(() => {
+      this.activeTicks.delete(tracked);
+    });
+    this.activeTicks.add(tracked);
+    await tracked;
+  }
+
+  private async tickInner(): Promise<void> {
     let names: string[];
     try {
       names = await readdir(this.dirs.pending);
@@ -163,6 +183,11 @@ export class DispatchWatcher {
       this.logger.warn({ err }, "cannot read pending dir");
       return;
     }
+    // #174: re-check admission AFTER the await. Intake may have closed while
+    // this tick was reading the directory; claiming now would start work the
+    // shutdown barrier has already decided it is not waiting for. The specs
+    // stay in `pending/` and are delivered on the next boot.
+    if (!this.ready) return;
     const ids = names
       .filter((name) => name.endsWith(".json"))
       .map((name) => name.slice(0, -".json".length))

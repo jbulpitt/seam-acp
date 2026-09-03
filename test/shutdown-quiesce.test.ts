@@ -517,14 +517,18 @@ describe("#174 boot done-file reconciliation", () => {
     }
   });
 
-  it("skips a done-file with no onward routing without touching the ledger", async () => {
+  it("STILL reconciles a done-file with no onward routing (review blocker 3)", async () => {
+    // An earlier revision skipped these without reading the ledger. That left
+    // completed wake/watch/report_back/unrouted-handoff rows `interrupted`, so
+    // `/seam workflows` offered a paid rerun of finished work. Routing decides
+    // what replay DOES, never whether it is owed.
     await writeDone("d2", { id: "d2", target: "t", status: "completed", finishedUtc: "x" });
     const getDelegation = vi.fn(() => ({ status: "interrupted" }));
     const summary = await reconcileCompletedDoneFiles({
       dataDir, logger: silent, getDelegation, replay: async () => {},
     });
-    expect(summary.reconciled).toBe(0);
-    expect(getDelegation).not.toHaveBeenCalled();
+    expect(summary.reconciled).toBe(1);
+    expect(getDelegation).toHaveBeenCalled();
   });
 
   it("skips an unknown ledger row and a terminal row", async () => {
@@ -574,5 +578,241 @@ describe("#174 boot done-file reconciliation", () => {
       dataDir, logger: silent, getDelegation: () => null, replay: async () => {},
     });
     expect(summary).toMatchObject({ scanned: 0, reconciled: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. Intake gates (review blockers 1 & 2)
+// ---------------------------------------------------------------------------
+
+describe("#174 admission gates", () => {
+  it("refuses a message that arrives after the phase-1 snapshot, without touching the store", async () => {
+    const sendMessage = vi.fn(async () => {});
+    const store = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error("store must not be touched by the intake gate");
+        },
+      }
+    );
+    const self = {
+      logger: silent,
+      intakeStopped: true,
+      adapter: { sendMessage },
+      store,
+      handleIncomingMessage: Orchestrator.prototype["handleIncomingMessage" as never],
+      // Any of these running would mean the gate did not short-circuit.
+      tryConsumeConfigEditorRiderUpload: async () => {
+        throw new Error("admitted a turn after intake closed");
+      },
+    } as unknown as { handleIncomingMessage(m: unknown): Promise<void> };
+
+    await self.handleIncomingMessage({ channel: { id: "c1" }, text: "hi", authorId: "u1" });
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(String(sendMessage.mock.calls[0]![1])).toMatch(/Restarting/i);
+    // Honest wording: we did not keep it.
+    expect(String(sendMessage.mock.calls[0]![1])).toMatch(/again/i);
+  });
+
+  it("retains a parked prompt instead of firing or deleting it once intake is closed", async () => {
+    const deleteParked = vi.fn();
+    const fireParked = vi.fn(async () => {});
+    const self = {
+      logger: silent,
+      intakeStopped: true,
+      channelQueues: new Map(),
+      store: {
+        getParkedByChannel: () => ({ id: "p1", channelRef: "c1" }),
+        deleteParked,
+      },
+      fireParked,
+      tryFireParked: Orchestrator.prototype["tryFireParked" as never],
+    } as unknown as { tryFireParked(c: string): Promise<void> };
+
+    await self.tryFireParked("c1");
+    expect(fireParked).not.toHaveBeenCalled(); // no new turn admitted
+    expect(deleteParked).not.toHaveBeenCalled(); // and not lost either
+  });
+
+  it("stopIntake does NOT stop the scheduled manager (preserves the cron-drain fix)", () => {
+    const schedStop = vi.fn();
+    const dispatchStop = vi.fn();
+    const self = {
+      logger: silent,
+      activeTurns: 0,
+      intakeStopped: false,
+      dispatchWatcher: { stop: dispatchStop, inFlightCount: 0 },
+      scheduledManager: { stop: schedStop },
+      stopIntake: Orchestrator.prototype["stopIntake" as never],
+    } as unknown as { stopIntake(): void };
+
+    self.stopIntake();
+    expect(dispatchStop).toHaveBeenCalled();
+    // Regression guard: stopping cron here is what made report-update miss 5:25.
+    expect(schedStop).not.toHaveBeenCalled();
+  });
+
+  it("a schedule becoming due during the drain still fires and extends it", async () => {
+    // Isolated scheduled fires increment activeTurns, so a due fire must be
+    // able to START after intake closes and keep the drain alive.
+    const host = makeQuiesceHost();
+    await host.quiesce({ timeoutMs: 200 }); // intake now closed
+    const dueFire = deferred();
+    host.trackContinuation(dueFire.promise); // stands in for the in-flight fire
+    let done = false;
+    const phase = host.drainAfterDispose({ timeoutMs: 5000 }).then((r) => ((done = true), r));
+    await flush();
+    expect(done).toBe(false); // the drain waited for it
+    dueFire.resolve();
+    expect((await phase).timedOut).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Watcher pre-claim race (review blocker 4)
+// ---------------------------------------------------------------------------
+
+describe("#174 tick pre-claim race", () => {
+  it("a tick paused between its ready check and its claim does not run after stop()+drain()", async () => {
+    const atReaddir = deferred();
+    const released = deferred();
+    let ran = false;
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async () => {
+        ran = true;
+        return { output: "should not run", stopReason: "end_turn" };
+      },
+    });
+    await watcher.start(); // ready, nothing pending
+    await dropSpec({ id: "racy" });
+
+    // Enter a tick and hold it exactly in the gap the race lives in: past the
+    // `ready` check, inside the readdir await, before any claim.
+    const origReaddir = (watcher as unknown as { dirs: { pending: string } }).dirs.pending;
+    void origReaddir;
+    const tick = (async () => {
+      const inner = watcher.tick();
+      atReaddir.resolve();
+      await released.promise;
+      await inner;
+    })();
+
+    await atReaddir.promise;
+    watcher.stop();
+    released.resolve();
+    await watcher.drain();
+    await tick;
+
+    // The spec must be left for the next boot, not claimed into the window.
+    expect(ran).toBe(false);
+    expect(await readdir(dirs.pending)).toContain("racy.json");
+    expect(await readdir(dirs.done)).not.toContain("racy.json");
+  });
+
+  it("drain awaits in-progress ticks, not just queues", async () => {
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async () => ({ output: "x", stopReason: "end_turn" }),
+    });
+    await watcher.start();
+    await dropSpec({ id: "t1" });
+    const ticking = watcher.tick();
+    await watcher.drain();
+    await ticking;
+    expect(watcher.inFlightCount).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Unrouted completions (review blocker 3)
+// ---------------------------------------------------------------------------
+
+describe("#174 unrouted completions are still reconciled", () => {
+  it.each(["wake", "watch", "report_back", "handoff-without-returnTo"])(
+    "terminalizes a completed %s done-file with no onward routing",
+    async (kind) => {
+      await writeDone(`u-${kind}`, {
+        id: `u-${kind}`,
+        target: "thread-1",
+        status: "completed",
+        output: "finished",
+        finishedUtc: "2026-09-03T00:00:00.000Z",
+        // deliberately no returnTo / chainId
+      });
+      const replay = vi.fn(async () => {});
+      const summary = await reconcileCompletedDoneFiles({
+        dataDir,
+        logger: silent,
+        getDelegation: () => ({ status: "interrupted" }),
+        replay,
+      });
+      expect(summary.reconciled).toBe(1);
+      expect(replay).toHaveBeenCalledOnce();
+    }
+  );
+
+  it("an unrouted replay terminalizes directly and reruns nothing", async () => {
+    const ledger = makeLedger();
+    ledger.rows.set("u1", { id: "u1", kind: "wake", status: "running" });
+    const advanceChain = vi.fn(async () => {});
+    const host = makeReplayHost(ledger, { advanceChain });
+    await host.replayCompletedDispatch({
+      id: "u1",
+      target: "t",
+      status: "completed",
+      output: "already done",
+    });
+    expect(ledger.rows.get("u1")!.status).toBe("completed");
+    expect(advanceChain).not.toHaveBeenCalled();
+    expect(await pendingReportBacks()).toHaveLength(0); // nothing to deliver
+  });
+
+  it("routing decides WHAT replay does, never WHETHER it is owed", () => {
+    expect(needsCompletionReplay({}, { status: "interrupted" })).toBe(true);
+    expect(needsCompletionReplay({}, { status: "running" })).toBe(true);
+    expect(needsCompletionReplay({}, { status: "completed" })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Honest recovery contract after a bounded timeout (QA note)
+// ---------------------------------------------------------------------------
+
+describe("#174 recovery contract is bounded and honest", () => {
+  it("only done-file-backed completion is recoverable after a drain timeout", async () => {
+    // A dispatch that finished (done-file present) IS repaired at boot…
+    await writeDone("recovered", {
+      id: "recovered",
+      target: "t",
+      status: "completed",
+      output: "answer",
+      returnTo: "parent",
+      correlationId: "c-rec",
+      finishedUtc: "2026-09-03T00:00:00.000Z",
+    });
+    const replay = vi.fn(async () => {});
+    const summary = await reconcileCompletedDoneFiles({
+      dataDir, logger: silent, getDelegation: () => ({ status: "interrupted" }), replay,
+    });
+    expect(summary.reconciled).toBe(1);
+
+    // …but a turn still RUNNING when the timeout expired has no done-file, so
+    // it is NOT recovered here. It keeps the pre-existing interrupted/Resume
+    // path, and rerunning it is correct because nothing completed. The barrier
+    // promise may still be running as teardown proceeds; that late work is
+    // explicitly out of scope for this repair.
+    const noDoneFile = await reconcileCompletedDoneFiles({
+      dataDir,
+      logger: silent,
+      getDelegation: () => ({ status: "interrupted" }),
+      replay: async () => {
+        throw new Error("must not be called for a dispatch with no done-file");
+      },
+    });
+    expect(noDoneFile.scanned).toBe(1); // only the finished one is even seen
   });
 });

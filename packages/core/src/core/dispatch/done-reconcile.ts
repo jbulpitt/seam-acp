@@ -57,17 +57,20 @@ export interface DoneReconcileSummary {
  * True when `result` still has completion work owed to it.
  *
  * Split out so the predicate is testable without a filesystem: a done-file is
- * reconcilable only if it carries #174 routing (older files cannot be replayed)
- * AND its ledger row exists and is non-terminal.
+ * reconcilable when its ledger row exists and is non-terminal. Routing is
+ * irrelevant here — it decides WHAT the replay does, not WHETHER it is owed.
  */
 export function needsCompletionReplay(
-  result: Pick<DispatchResult, "returnTo" | "chainId">,
+  _result: Pick<DispatchResult, "returnTo" | "chainId">,
   row: { status: string } | null
 ): boolean {
   if (!row) return false;
-  if (TERMINAL_STATUSES.has(row.status)) return false;
-  // Nothing to deliver: no report-back destination and no chain to advance.
-  return Boolean(result.returnTo || result.chainId);
+  // Onward routing is NOT part of this decision. A done-file proves the work
+  // finished; a non-terminal row for it is wrong regardless of whether anything
+  // had to be delivered onward. An unrouted completion (a wake, a watch, a
+  // report_back, a plain handoff with no returnTo) left `interrupted` is the
+  // same corruption — `/seam workflows` offers a paid rerun of finished work.
+  return !TERMINAL_STATUSES.has(row.status);
 }
 
 /**
@@ -110,13 +113,6 @@ export async function reconcileCompletedDoneFiles(
       continue; // unparseable / partially-written — ignore
     }
     summary.scanned++;
-
-    // Cheap check first: a file with no routing can never need replay, so we
-    // never touch the ledger for the overwhelming majority of done-files.
-    if (!result.returnTo && !result.chainId) {
-      summary.skippedTerminal++;
-      continue;
-    }
 
     let row: { status: string } | null;
     try {

@@ -1345,9 +1345,12 @@ export class Orchestrator {
         ? "force restart, executing pm2 restart"
         : "all turns drained, executing restart"
     );
-    // Intake (dispatch + scheduled) was already stopped above, before the
-    // drain sample; this stays as a no-op safety net for the force path.
+    // Dispatch/user/parked admission closed before the drain sample above.
+    // The SCHEDULED manager is stopped only here, in the last beat before pm2
+    // restart, preserving the deliberate "keep cron timers running through the
+    // drain" behaviour a due fire depends on.
     this.stopIntake();
+    this.scheduledManager?.stop();
     try {
       await fsp.unlink(this.sentinelPath());
     } catch {
@@ -1363,6 +1366,26 @@ export class Orchestrator {
 
   private async handleIncomingMessage(msg: IncomingMessage): Promise<void> {
     const channelId = msg.channel.id;
+
+    // #174: close user admission SYNCHRONOUSLY, before any await and before
+    // any store access. Discord events keep arriving until `adapter.stop()`,
+    // which runs after the quiesce snapshot — so without this gate a message
+    // can open a brand-new channel turn while shutdown is already draining,
+    // and that turn's continuations land on a closed store.
+    //
+    // Deliberately says "resend": the message is NOT persisted here (touching
+    // the store is exactly what this gate exists to avoid), so promising to
+    // pick it up later would be a lie.
+    if (this.intakeStopped) {
+      this.logger.info({ channelId }, "message refused; shutting down");
+      await this.adapter
+        .sendMessage?.(
+          { platform: PLATFORM, id: channelId },
+          "♻️ Restarting — I did not take this message. Please send it again in a moment."
+        )
+        .catch(() => {});
+      return;
+    }
 
     // Config editor: next file from the editor owner becomes the draft rider.
     // Must run before abort / park so the upload is not treated as a new turn.
@@ -1531,7 +1554,9 @@ export class Orchestrator {
         .catch((err) =>
           this.logger.warn({ err, channelId }, "voice console post-turn settlement failed")
         );
-      await this.tryFireParked(channelId).catch?.(() => {});
+      await this.tryFireParked(channelId).catch((err) =>
+        this.logger.warn({ err, channelId }, "post-turn parked fire failed")
+      );
     });
     this.trackContinuation(settled);
   }
@@ -1569,11 +1594,21 @@ export class Orchestrator {
     if (this.intakeStopped) return;
     this.intakeStopped = true;
     this.dispatchWatcher?.stop();
-    this.scheduledManager?.stop();
+    // NOT `scheduledManager.stop()`. Cron timers deliberately keep running
+    // through the drain — stopping them here is what made `report-update` miss
+    // 5:25 while a restart sat pending, because `list` still showed the stale
+    // next_run and catch-up then skipped it. Isolated scheduled fires increment
+    // `activeTurns`, so a due schedule EXTENDS the drain rather than being lost.
+    // The scheduled manager is stopped in the last beat before pm2 restart.
     this.logger.info(
       { activeTurns: this.activeTurns, inFlight: this.dispatchWatcher?.inFlightCount ?? 0 },
-      "intake stopped; no new dispatches or scheduled fires will be claimed"
+      "intake stopped; no new dispatch, user turn, or parked fire will be admitted"
     );
+  }
+
+  /** True once shutdown has closed admission — read by the intake gates. */
+  get admissionClosed(): boolean {
+    return this.intakeStopped;
   }
 
   /**
@@ -5297,6 +5332,15 @@ export class Orchestrator {
    */
   async tryFireParked(channelRef: string): Promise<void> {
     if (this.channelQueues.has(channelRef)) return;
+    // #174: once admission is closed, RETAIN the parked row instead of
+    // deleting it and starting a turn. Firing here would admit a brand-new
+    // channel turn after the quiesce snapshot; deleting without firing would
+    // lose the user's parked prompt outright. Leaving it parked means the next
+    // boot fires it.
+    if (this.intakeStopped) {
+      this.logger.info({ channelRef }, "parked fire deferred to next boot; shutting down");
+      return;
+    }
     const parked = this.store.getParkedByChannel(PLATFORM, channelRef);
     if (!parked) return;
     if (this.parkedSupersededByNewerUser(parked)) {
@@ -7723,6 +7767,9 @@ export class Orchestrator {
     //                         DB-first claim sees its own ledger row and
     //                         returns false, so no double delivery
     //   after terminalize   → row terminal → skipped, correctly
+    // Unrouted completions (a wake, a watch, a report_back, a handoff with no
+    // returnTo) have no onward step — they go straight to terminal below. The
+    // row is still wrong until they do.
     if (result.chainId) {
       await this.advanceChain(spec, text, result.error);
     } else if (result.returnTo) {

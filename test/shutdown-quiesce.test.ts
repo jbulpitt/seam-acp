@@ -168,33 +168,37 @@ describe("#174 DispatchWatcher.drain", () => {
 // 2. Bounded quiesce — two phases, explicit timeout semantics
 // ---------------------------------------------------------------------------
 
-/** Minimal orchestrator stand-in exercising the real quiesce methods. */
+/**
+ * Minimal orchestrator stand-in exercising the real shutdown methods.
+ *
+ * Built on `Orchestrator.prototype` rather than by cherry-picking methods, so
+ * `activeTurns` — now a DERIVED getter over the tracked turn set — reads the
+ * same way it does in production. A host that carried its own `activeTurns`
+ * number could be moved by a test to a value the barrier could never see.
+ */
 function makeQuiesceHost(over: Record<string, unknown> = {}) {
-  const self: Record<string, unknown> = {
+  const self = Object.create(Orchestrator.prototype) as Record<string, unknown>;
+  Object.assign(self, {
     logger: silent,
-    activeTurns: 0,
     intakeStopped: false,
+    activeTurnSettles: new Set<Promise<void>>(),
     pendingContinuations: new Set<Promise<void>>(),
     channelQueues: new Map<string, Promise<void>>(),
     dispatchWatcher: undefined,
     scheduledManager: undefined,
-    stopIntake: Orchestrator.prototype["stopIntake" as never],
-    quiesce: Orchestrator.prototype["quiesce" as never],
-    drainAfterDispose: Orchestrator.prototype["drainAfterDispose" as never],
-    settleAllWork: Orchestrator.prototype["settleAllWork" as never],
-    settleTrackedContinuations: Orchestrator.prototype["settleTrackedContinuations" as never],
-    runBoundedDrain: Orchestrator.prototype["runBoundedDrain" as never],
-    trackContinuation: Orchestrator.prototype["trackContinuation" as never],
     ...over,
-  };
+  });
   return self as unknown as {
     quiesce(o?: { timeoutMs?: number }): Promise<{ timedOut: boolean; continuations: number }>;
     drainAfterDispose(o?: { timeoutMs?: number }): Promise<{ timedOut: boolean }>;
     trackContinuation(p: Promise<void>): void;
+    beginTurn(): () => void;
+    runScheduledPrompt(id: string): Promise<void>;
     pendingContinuations: Set<Promise<void>>;
+    activeTurnSettles: Set<Promise<void>>;
     channelQueues: Map<string, Promise<void>>;
     intakeStopped: boolean;
-    activeTurns: number;
+    readonly activeTurns: number;
     dispatchWatcher?: DispatchWatcher;
   };
 }
@@ -743,25 +747,19 @@ describe("#174 admission gates", () => {
     try {
       const order: string[] = [];
       await writeFile(path.join(dataDir, ".restart-pending"), "", "utf8"); // graceful
-      const self = {
-        logger: silent,
+      const self = makeQuiesceHost({
         config: { DATA_DIR: dataDir, RESTART_DRAIN_TIMEOUT_MS: 60_000 },
-        activeTurns: 1, // a user turn is mid-flight when the sentinel lands
-        intakeStopped: false,
         restartPending: false,
         dispatchWatcher: { stop: () => order.push("dispatch-intake"), inFlightCount: 0 },
         scheduledManager: { stop: () => order.push("cron") },
         postNotification: async () => {},
         restartProcess: async () => void order.push("pm2-restart"),
-        stopIntake: Orchestrator.prototype["stopIntake" as never],
-        sentinelPath: Orchestrator.prototype["sentinelPath" as never],
-        readSentinelForce: Orchestrator.prototype["readSentinelForce" as never],
-        handleRestartSentinel: Orchestrator.prototype["handleRestartSentinel" as never],
-      } as unknown as {
+      }) as unknown as ReturnType<typeof makeQuiesceHost> & {
         handleRestartSentinel(): Promise<void>;
-        activeTurns: number;
-        intakeStopped: boolean;
       };
+      // A real user turn is mid-flight when the sentinel lands — registered
+      // through the primitive the drain actually reads, not a hand-set number.
+      const endUserTurn = self.beginTurn();
 
       const done = self.handleRestartSentinel();
       await vi.advanceTimersByTimeAsync(0);
@@ -774,12 +772,14 @@ describe("#174 admission gates", () => {
       // even as the original user turn finishes.
       await vi.advanceTimersByTimeAsync(1500);
       expect(order).not.toContain("cron");
-      self.activeTurns = 2; // due fire starts
-      self.activeTurns = 1; // user turn ends; the fire is still running
+      const endDueFire = self.beginTurn(); // a schedule comes due and fires
+      endUserTurn(); // the original user turn ends; the fire is still running
+      expect(self.activeTurns).toBe(1);
       await vi.advanceTimersByTimeAsync(1500);
       expect(order).not.toContain("pm2-restart"); // the fire extended the drain
 
-      self.activeTurns = 0; // the scheduled fire finishes
+      endDueFire(); // the scheduled fire finishes
+      expect(self.activeTurns).toBe(0);
       await vi.advanceTimersByTimeAsync(500); // drain poll notices
       expect(order).not.toContain("pm2-restart"); // still in the 2s flush wait
       await vi.advanceTimersByTimeAsync(2000);
@@ -1012,6 +1012,7 @@ function makeClosableStore() {
   const violations: string[] = [];
   let closed = false;
   const ledger = makeLedger();
+  const scheduled = new Map<string, Record<string, unknown>>();
   const guard = (name: string) => {
     if (closed) {
       violations.push(name);
@@ -1025,6 +1026,12 @@ function makeClosableStore() {
     },
     close() {
       closed = true;
+    },
+    scheduled,
+    getScheduled: (id: string) => (guard("getScheduled"), scheduled.get(id)),
+    patchScheduled: (id: string, patch: Record<string, unknown>) => {
+      guard("patchScheduled");
+      scheduled.set(id, { ...scheduled.get(id), ...patch });
     },
     getDelegation: (id: string) => (guard("getDelegation"), ledger.getDelegation(id)),
     updateDelegationStatus: (id: string, s: string) => (
@@ -1185,8 +1192,9 @@ describe("#174 post-dispose drain covers an ISOLATED dispatch", () => {
       dataDir,
       logger: silent,
       onDispatch: async () => {
-        // Mirrors the isolated branch of `dispatchInjectTurn`: counted, unqueued.
-        host.activeTurns++;
+        // Mirrors the isolated branch of `dispatchInjectTurn`: registered
+        // through the real primitive, and in no queue.
+        const endTurn = host.beginTurn();
         try {
           await kill.promise;
           await completion.promise;
@@ -1201,7 +1209,7 @@ describe("#174 post-dispose drain covers an ISOLATED dispatch", () => {
           await adapter.sendMessage();
           return { output: "THE ANSWER", stopReason: "end_turn" };
         } finally {
-          host.activeTurns--;
+          endTurn();
         }
       },
     });
@@ -1261,14 +1269,138 @@ describe("#174 post-dispose drain covers an ISOLATED dispatch", () => {
     // An isolated SCHEDULED fire: no channel queue, no continuation, and no
     // dispatch spec either — `activeTurns` is the only evidence it exists.
     const host = makeQuiesceHost();
-    host.activeTurns = 1;
+    const endTurn = host.beginTurn();
+    expect(host.activeTurns).toBe(1);
 
     let drained = false;
     const phase2 = host.drainAfterDispose({ timeoutMs: 5000 }).then((r) => ((drained = true), r));
     await flush();
     expect(drained).toBe(false);
 
-    host.activeTurns = 0;
+    endTurn();
     expect((await phase2).timedOut).toBe(false);
+    expect(host.activeTurns).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. The isolated scheduled fire — visible to nothing but the turn set
+// ---------------------------------------------------------------------------
+
+describe("#174 an in-flight isolated scheduled fire holds both phases", () => {
+  /**
+   * The sharpest version of the isolated-turn problem.
+   *
+   * `runScheduledPrompt` registers an isolated fire and then runs it: no
+   * channel queue, no tracked continuation, no dispatch spec. Once
+   * `scheduledManager.stop()` has run, the manager no longer refers to it
+   * either — the registered turn is the ONLY evidence it is still running. Its
+   * tail (the schedule-status patch) needs an open store, so a barrier that
+   * cannot see it lets `store.close()` land underneath.
+   *
+   * The fire's internals are stubbed on purpose: what is under test is the
+   * wrapper's registration and the barrier, not the scheduled turn itself.
+   */
+  it("phase 1 waits for it and its status patch, and nothing closes early", async () => {
+    const store = makeClosableStore();
+    store.scheduled.set("s-1", { id: "s-1", sessionMode: "isolated" });
+    const fire = deferred();
+    let patched = false;
+    const host = makeQuiesceHost({
+      store,
+      scheduledManager: { stop: () => {} },
+      runScheduledPromptInner: async () => {
+        await fire.promise;
+        store.patchScheduled("s-1", { lastStatus: "ok" }); // the tail
+        patched = true;
+      },
+    });
+
+    const running = host.runScheduledPrompt("s-1");
+    await flush();
+    expect(host.activeTurns).toBe(1);
+    // Nothing else in the process refers to this turn.
+    expect(host.channelQueues.size).toBe(0);
+    expect(host.pendingContinuations.size).toBe(0);
+
+    let drained = false;
+    const phase1 = host.quiesce({ timeoutMs: 5000 }).then((r) => ((drained = true), r));
+    await flush();
+    expect(drained).toBe(false);
+    expect(patched).toBe(false);
+
+    fire.resolve();
+    expect((await phase1).timedOut).toBe(false);
+    await running;
+    expect(patched).toBe(true); // landed while the store was open
+
+    // Phase 2 has nothing left, and teardown touches nothing already closed.
+    expect((await host.drainAfterDispose({ timeoutMs: 5000 })).timedOut).toBe(false);
+    store.close();
+    await flush();
+    expect(store.violations).toEqual([]);
+  });
+
+  it("a live scheduled fire is NOT double-counted (it is already queued)", async () => {
+    // Regression guard on the primitive itself: the live path goes through
+    // `queueOnChannel`, which registers the turn; registering again here would
+    // inflate the drain and keep it alive after the turn had finished.
+    const store = makeClosableStore();
+    store.scheduled.set("s-live", { id: "s-live", sessionMode: "live" });
+    const fire = deferred();
+    const host = makeQuiesceHost({
+      store,
+      runScheduledPromptInner: async () => {
+        expect(host.activeTurns).toBe(0); // no OUTER registration for live
+        await fire.promise;
+      },
+    });
+
+    const running = host.runScheduledPrompt("s-live");
+    await flush();
+    expect(host.activeTurns).toBe(0);
+    fire.resolve();
+    await running;
+  });
+});
+
+describe("#174 an ingest job stays registered through its durable tail", () => {
+  /**
+   * `dispatchIngestEndpoint` released its turn in the `finally` around
+   * `injectTurn`, then went on to post the output and write the ledger status.
+   * That tail is durable work performed by a turn nothing was counting — the
+   * same shape as the post-turn continuation bug, one method over.
+   */
+  it("is still counted when its ledger status is written", async () => {
+    let turnsAtLedgerWrite = -1;
+    const host = makeQuiesceHost({
+      config: { DEFAULT_AGENT: "a", REPOS_ROOT: "/tmp", TURN_TIMEOUT_SECONDS: 900 },
+      ingestJobs: new Map(),
+      router: {
+        getProfile: () => ({ id: "a" }),
+        mintMcpServersForSession: () => ({}),
+        revokeMcpSession: () => {},
+      },
+      store: {
+        recordDelegation: () => {},
+        updateDelegationStatus: () => {
+          turnsAtLedgerWrite = host.activeTurns;
+        },
+      },
+      injectTurn: async () => ({ text: "scored" }),
+    }) as unknown as ReturnType<typeof makeQuiesceHost> & {
+      dispatchIngestEndpoint(s: Record<string, unknown>): Promise<{ output: string }>;
+    };
+
+    const out = await host.dispatchIngestEndpoint({
+      id: "ing-1",
+      target: "not-a-snowflake", // no notify thread, so no adapter post
+      prompt: "score this",
+      createdUtc: new Date().toISOString(),
+    });
+
+    expect(out.output).toBe("scored");
+    expect(turnsAtLedgerWrite).toBe(1); // released only after the tail
+    expect(host.activeTurns).toBe(0); // and released for certain
   });
 });

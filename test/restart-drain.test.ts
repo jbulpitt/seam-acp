@@ -88,7 +88,10 @@ describe("restart drain and active-turn watchdog", () => {
       hangNotification: true,
     });
     fs.writeFileSync(restartSentinelPath(dir), "", "utf8");
-    (orchestrator as any).activeTurns = 2;
+    // Two turns registered and never released — a genuine leak, not a number
+    // set on the side. `activeTurns` is derived from the registrations.
+    (orchestrator as any).beginTurn();
+    (orchestrator as any).beginTurn();
 
     const restarting = (orchestrator as any).handleRestartSentinel() as Promise<void>;
     await vi.advanceTimersByTimeAsync(999);
@@ -105,7 +108,7 @@ describe("restart drain and active-turn watchdog", () => {
   it("preserves the explicit force sentinel as an immediate no-drain restart", async () => {
     const { orchestrator, restartProcess } = makeOrchestrator(dir, { drainMs: 5_000 });
     fs.writeFileSync(restartSentinelPath(dir), "force\n", "utf8");
-    (orchestrator as any).activeTurns = 7;
+    for (let i = 0; i < 7; i++) (orchestrator as any).beginTurn(); // held open
 
     await (orchestrator as any).handleRestartSentinel();
 
@@ -116,11 +119,11 @@ describe("restart drain and active-turn watchdog", () => {
   it("preserves graceful drain and the background-I/O flush when turns finish before timeout", async () => {
     const { orchestrator, restartProcess } = makeOrchestrator(dir, { drainMs: 5_000 });
     fs.writeFileSync(restartSentinelPath(dir), "", "utf8");
-    (orchestrator as any).activeTurns = 1;
+    const endTurn = (orchestrator as any).beginTurn() as () => void;
     const restarting = (orchestrator as any).handleRestartSentinel() as Promise<void>;
 
     await vi.advanceTimersByTimeAsync(400);
-    (orchestrator as any).activeTurns = 0;
+    endTurn();
     await vi.advanceTimersByTimeAsync(100);
     expect(restartProcess).not.toHaveBeenCalled();
 

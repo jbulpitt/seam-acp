@@ -508,14 +508,6 @@ const PLATFORM = "discord";
  */
 const QUIESCE_TIMEOUT_MS = 10_000;
 
-/**
- * Re-check interval for the one kind of outstanding work with no promise to
- * await: `activeTurns`, which is how an ISOLATED turn (dispatch or scheduled
- * fire) is counted. Short enough not to add meaningful latency to a clean
- * shutdown, long enough not to spin — and always bounded by the phase deadline.
- */
-const QUIESCE_POLL_MS = 25;
-
 /** Result of one bounded shutdown drain phase (#174). */
 export interface QuiesceOutcome {
   phase: "pre-dispose" | "post-dispose";
@@ -620,7 +612,17 @@ export class Orchestrator {
   private readonly threadNamerConfig: ThreadNamerConfigStore;
   private readonly threadNamer: ThreadNamer;
 
-  private activeTurns = 0;
+  /**
+   * #174: one settle-promise per in-flight turn.
+   *
+   * This replaced a bare `activeTurns` counter. A counter can only be POLLED,
+   * and the shutdown barrier needs to WAIT — an isolated turn (isolated
+   * dispatch, isolated scheduled fire) appears in no other collection the
+   * barrier watches, so the counter was the only evidence it existed. Holding
+   * a promise per turn makes that wait exact instead of a spin, and makes the
+   * count a derived value that cannot drift from reality.
+   */
+  private readonly activeTurnSettles = new Set<Promise<void>>();
   private restartPending = false;
   /** #174: set once intake is closed, so `stopIntake()` is idempotent. */
   private intakeStopped = false;
@@ -1234,6 +1236,31 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * In-flight turns (user + scheduled + dispatch), derived from the tracked
+   * set so the count and the thing shutdown awaits can never disagree.
+   */
+  private get activeTurns(): number {
+    return this.activeTurnSettles.size;
+  }
+
+  /**
+   * Register an in-flight turn; the returned release MUST be called from a
+   * `finally`. Every turn — queued or isolated — goes through here, which is
+   * what lets `settleAllWork()` await turn completion directly instead of
+   * watching a number and hoping.
+   */
+  private beginTurn(): () => void {
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => (settle = resolve));
+    this.activeTurnSettles.add(settled);
+    return () => {
+      // Idempotent: a double release must not drop a later turn's promise.
+      if (!this.activeTurnSettles.delete(settled)) return;
+      settle();
+    };
+  }
+
   /** In-flight turns (user + scheduled + dispatch) counted for restart drain. */
   activeTurnCount(): number {
     return this.activeTurns;
@@ -1457,13 +1484,13 @@ export class Orchestrator {
     const newQueue = existingQueue.then(async () => {
       // A newer message arrived after us — skip this turn entirely.
       if ((this.channelGenerations.get(channelId) ?? 0) > myGen) return;
-      this.activeTurns++;
+      const endTurn = this.beginTurn();
       try {
         await this.handleIncomingMessageInner(msg);
       } catch (err) {
         this.logger.error({ err, channelId }, "error in handleIncomingMessageInner");
       } finally {
-        this.activeTurns--;
+        endTurn();
       }
     });
 
@@ -1509,8 +1536,8 @@ export class Orchestrator {
   private queueOnChannel<T>(channelId: string, task: () => Promise<T>): Promise<T> {
     const existing = this.channelQueues.get(channelId) ?? Promise.resolve();
     const result = existing.then(async () => {
-      // Count in the restart-drain counter so a redeploy waits for us.
-      this.activeTurns++;
+      // Counted for the restart drain, and awaited by the shutdown barrier.
+      const endTurn = this.beginTurn();
       try {
         const timeoutMs = turnWatchdogTimeoutMs(
           this.config.TURN_TIMEOUT_SECONDS ?? 900
@@ -1523,13 +1550,13 @@ export class Orchestrator {
         if (err instanceof TurnWatchdogTimeoutError) {
           this.logger.error(
             { err, channelId, timeoutMs: err.timeoutMs },
-            "channel turn watchdog expired; releasing activeTurns and force-aborting runtime"
+            "channel turn watchdog expired; releasing the turn and force-aborting runtime"
           );
           this.abortWatchdogTurn(channelId);
         }
         throw err;
       } finally {
-        this.activeTurns--;
+        endTurn();
       }
     });
     // The link stored in channelQueues must never reject: the next task chains
@@ -1694,12 +1721,14 @@ export class Orchestrator {
    *     and chain advance are awaited inside the queue task, so this covers
    *     those side effects too;
    *   - channel FIFOs — user turns and `session: "live"` dispatches;
+   *   - registered turns (`beginTurn`) — the ONLY thing that sees an ISOLATED
+   *     turn: an isolated dispatch, an isolated scheduled fire, or an ingest
+   *     job has no channel queue and no continuation. `runScheduledPrompt`
+   *     is the sharpest case — after `scheduledManager.stop()` an already
+   *     running fire is referenced by nothing else, and its `finally` still has
+   *     a schedule-status patch to write;
    *   - tracked post-turn continuations — the fire-and-forget work that runs
-   *     after `activeTurns--` and is therefore invisible to a counter check;
-   *   - `activeTurns` itself — the ONLY thing that sees an isolated turn
-   *     (isolated dispatch, isolated scheduled fire), which has neither a
-   *     channel queue nor a continuation to await. There is no promise to hold,
-   *     so it is polled.
+   *     after a turn is released and is therefore invisible to the turn set.
    *
    * Runs to a real fixpoint over all four: settling one can create another (a
    * finishing dispatch enqueues a report-back; a queue release fires a parked
@@ -1711,15 +1740,23 @@ export class Orchestrator {
     for (;;) {
       await this.dispatchWatcher?.drain();
       await Promise.allSettled([...this.channelQueues.values()]);
+      await Promise.allSettled([...this.activeTurnSettles]);
       await this.settleTrackedContinuations();
+      // Yield once so work those settlements just registered is visible before
+      // we decide we are finished.
+      await new Promise((resolve) => setImmediate(resolve));
+      // Deliberately NOT `channelQueues.size === 0`: an emptied queue is
+      // deleted by a continuation, so requiring it here would make map
+      // bookkeeping a termination condition. The queue PROMISES are awaited
+      // above, and a queue that admits a late turn re-arms this loop through
+      // that turn's registration.
       if (
-        this.activeTurns === 0 &&
+        this.activeTurnSettles.size === 0 &&
         this.pendingContinuations.size === 0 &&
         (this.dispatchWatcher?.inFlightCount ?? 0) === 0
       ) {
         return;
       }
-      await new Promise((resolve) => setTimeout(resolve, QUIESCE_POLL_MS));
     }
   }
 
@@ -7213,8 +7250,9 @@ export class Orchestrator {
       return this.queueOnChannel(spec.target, gatedRun);
     }
     // Isolated: own throwaway runtime, so it cannot collide with the thread's
-    // live session and needn't queue. Still counted for the restart drain.
-    this.activeTurns++;
+    // live session and needn't queue. It therefore appears in NO channel queue
+    // — `beginTurn` is the only thing that makes it visible to shutdown.
+    const endTurn = this.beginTurn();
     try {
       return await settleWithTurnWatchdog(gatedRun, {
         timeoutMs: turnWatchdogTimeoutMs(
@@ -7226,12 +7264,12 @@ export class Orchestrator {
       if (err instanceof TurnWatchdogTimeoutError) {
         this.logger.error(
           { err, dispatch: spec.id, target: spec.target, timeoutMs: err.timeoutMs },
-          "isolated dispatch watchdog expired; releasing activeTurns"
+          "isolated dispatch watchdog expired; releasing the turn"
         );
       }
       throw err;
     } finally {
-      this.activeTurns--;
+      endTurn();
     }
   }
 
@@ -7400,6 +7438,11 @@ export class Orchestrator {
       updatedUtc: spec.createdUtc,
     };
     this.ingestJobs.set(spec.id, synthetic);
+    // #174: registered around the WHOLE body, not just `injectTurn`. The turn's
+    // durable tail — the output post and the ledger status write below — runs
+    // after the agent is done, and releasing before it would hide exactly that
+    // work from the shutdown barrier.
+    const endTurn = this.beginTurn();
     try {
       try {
         this.store.recordDelegation({
@@ -7432,7 +7475,6 @@ export class Orchestrator {
         });
       }
 
-      this.activeTurns++;
       let result: InjectTurnResult | undefined;
       try {
         result = await this.injectTurn(null, prompt, {
@@ -7458,7 +7500,6 @@ export class Orchestrator {
           logContext: { dispatch: spec.id, kind: "ingest" },
         });
       } finally {
-        this.activeTurns--;
         void this.quotaPoller?.turnCompleted(agentId);
         if (this.choiceResults) {
           if (result?.text) {
@@ -7485,6 +7526,7 @@ export class Orchestrator {
       return { output: result.text, stopReason: result.stopReason ?? "" };
     } finally {
       this.ingestJobs.delete(spec.id);
+      endTurn();
     }
   }
 
@@ -8519,14 +8561,16 @@ export class Orchestrator {
       await this.runScheduledPromptInner(row);
       return;
     }
-    // Count scheduled jobs in the restart-drain counter (activeTurns) so a
-    // redeploy/sentinel waits for an in-flight job to finish instead of killing
-    // its agent child mid-run.
-    this.activeTurns++;
+    // Count isolated scheduled jobs so a redeploy/sentinel waits for an
+    // in-flight job instead of killing its agent child mid-run. Like an
+    // isolated dispatch this has no channel queue and no tracked continuation,
+    // so this registration is the ONLY thing holding shutdown open while its
+    // cleanup (status patch, output post) is still running.
+    const endTurn = this.beginTurn();
     try {
       await this.runScheduledPromptInner(row);
     } finally {
-      this.activeTurns--;
+      endTurn();
     }
   }
 

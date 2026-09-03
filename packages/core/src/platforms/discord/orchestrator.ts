@@ -22,6 +22,16 @@ import {
 import type { Renderer } from "../renderer.js";
 import { serializePanelText } from "../renderer.js";
 import { choicePickerPageCaption } from "./choice-picker.js";
+import {
+  paginateSchedules,
+  parseScheduleListCustomId,
+  requestedSchedulePage,
+  scheduleListDescription,
+  scheduleNavState,
+  schedulePageCaption,
+  schedulePageCustomId,
+  scheduleRunOutcome,
+} from "./schedule-list-view.js";
 import { paginatePresetList, PRESET_LIST_PAGE_SIZE } from "./preset-list.js";
 import type {
   ChatAdapter,
@@ -8646,7 +8656,17 @@ export class Orchestrator {
       await i.reply({ content: "No scheduled prompts for this thread. Create one with `/seam schedule add`.", flags: MessageFlags.Ephemeral });
       return;
     }
-    await i.reply({ ...this.buildScheduleListMessage(channel), flags: MessageFlags.Ephemeral });
+    // #152: the page the card is currently showing. Every rebuild threads it
+    // back through `buildScheduleListMessage`, which re-clamps it against the
+    // live row count and returns where it actually landed — so a delete that
+    // empties the last page walks the operator back rather than stranding them.
+    let page = 0;
+    const rebuild = (requested: number = page) => {
+      const built = this.buildScheduleListMessage(channel, requested);
+      page = built.page;
+      return { embeds: built.embeds, components: built.components };
+    };
+    await i.reply({ ...rebuild(), flags: MessageFlags.Ephemeral });
     const msg = await i.fetchReply();
     const collector = msg.createMessageComponentCollector({
       filter: (c) => c.user.id === i.user.id,
@@ -8660,12 +8680,25 @@ export class Orchestrator {
     collector.on("collect", async (c) => {
       try {
         if (!c.isButton()) return;
-        const [, action, id] = c.customId.split(":");
+        // #152: a page click rides the same `sl:<action>:<arg>` grammar, so it
+        // MUST be answered before `arg` is looked up as a schedule id —
+        // otherwise "sl:page:1" falls into the unknown-schedule branch and the
+        // operator is told their schedule no longer exists. Paging is
+        // read-only, so the card stays repeatable.
+        const wantedPage = requestedSchedulePage(c.customId);
+        if (wantedPage !== null) {
+          await c.deferUpdate();
+          await lifecycle.refresh(rebuild(wantedPage));
+          return;
+        }
+        const parsed = parseScheduleListCustomId(c.customId);
+        const action = parsed?.action;
+        const id = parsed?.arg;
         const row = id ? this.store.getScheduled(id) : undefined;
         if (!row || !id || row.channelRef !== channel.id) {
           await c.reply({ content: "That schedule no longer exists.", flags: MessageFlags.Ephemeral });
           // Repeatable: rebuild from the store so the vanished row's controls go.
-          await lifecycle.refresh(this.buildScheduleListMessage(channel));
+          await lifecycle.refresh(rebuild());
           return;
         }
         if (action === "run") {
@@ -8673,14 +8706,17 @@ export class Orchestrator {
           if (this.scheduledManager) await this.scheduledManager.runNow(id);
           else await this.runScheduledPrompt(id);
           const fresh = this.store.getScheduled(id);
-          const status = fresh?.lastStatus ?? "unknown";
+          // #163 follow-up: a quarantined schedule is refused at the fire
+          // boundary and never runs, so "finished" would be a plain lie.
           await c.editReply(
-            status === "skipped: still running"
-              ? `⏸️ **${row.name}** is already running — this click was skipped.`
-              : `▶️ **${row.name}** finished — last: \`${status}\`.`
+            scheduleRunOutcome({
+              name: row.name,
+              status: fresh?.lastStatus,
+              quarantined: !!legacyAttachmentQuarantine(fresh ?? row),
+            })
           );
           // Run is repeatable; rebuild so the card shows the new last-status.
-          await lifecycle.refresh(this.buildScheduleListMessage(channel));
+          await lifecycle.refresh(rebuild());
         } else if (action === "edit") {
           // Freeze the listing BEFORE the builder opens, or the user is left
           // holding two live-looking cards for one schedule. The collector is
@@ -8704,11 +8740,19 @@ export class Orchestrator {
           this.store.upsertScheduled(updated);
           if (updated.enabled) this.scheduledManager?.armFromRow(updated);
           else this.scheduledManager?.disarm(id);
-          await c.update(this.buildScheduleListMessage(channel));
+          // Ack the click, then rebuild through the lifecycle so a settled card
+          // can never regain controls. Both stay on the current page; a toggle
+          // does not change the row count, so the clamp is a no-op here.
+          await c.deferUpdate();
+          await lifecycle.refresh(rebuild());
         } else if (action === "del") {
           this.scheduledManager?.disarm(id);
           this.store.deleteScheduled(id);
-          await c.update(this.buildScheduleListMessage(channel));
+          // Re-clamp: deleting the last row on the last page shrinks pageCount,
+          // so `rebuild()` resolves the now-out-of-range page down to the new
+          // last one instead of painting an empty page with a live Prev.
+          await c.deferUpdate();
+          await lifecycle.refresh(rebuild());
         }
       } catch (err) {
         this.logger.warn({ err }, "schedule-list button handler failed");
@@ -8716,25 +8760,41 @@ export class Orchestrator {
     });
   }
 
-  /** `/seam schedule list` message: a summary embed plus per-schedule
-   *  Run / Edit / Enable-Disable / Delete buttons (first 5 schedules; manage
-   *  the rest via the id-based `/seam schedule …` commands). Rebuilt after
-   *  toggle/delete. */
-  private buildScheduleListMessage(channel: ChannelRef): {
+  /**
+   * `/seam schedule list` message: one PAGE of schedules (#152).
+   *
+   * Before pagination this described every schedule but gave controls to only
+   * the first five — so a long list both risked Discord's 4096-char embed cap
+   * and advertised rows the operator could not act on. Now the description
+   * carries only the current page and every described row on it has its own
+   * action row: four rows plus one nav row is exactly Discord's five-row cap.
+   *
+   * `page` is a REQUEST, not a fact. It is clamped against the live row count,
+   * and the resolved page is returned so the caller can thread it back through
+   * the next refresh — which is what re-clamps the view after a delete empties
+   * the last page.
+   */
+  private buildScheduleListMessage(
+    channel: ChannelRef,
+    page = 0
+  ): {
     embeds: EmbedBuilder[];
     components: ActionRowBuilder<ButtonBuilder>[];
+    page: number;
   } {
     const rows = this.store.listScheduledByChannel(PLATFORM, channel.id);
+    const slice = paginateSchedules(rows, page);
     const embed = new EmbedBuilder()
       .setTitle("⏰ Scheduled prompts")
       .setColor(SCHEDULED_COLOR)
       .setDescription(
-        rows.length
-          ? rows.map((r) => this.scheduleSummaryLine(r)).join("\n\n")
-          : "_No scheduled prompts for this thread._"
+        scheduleListDescription(
+          slice.items.map((r) => this.scheduleSummaryLine(r)),
+          schedulePageCaption(slice)
+        )
       );
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
-    for (const r of rows.slice(0, 5)) {
+    for (const r of slice.items) {
       components.push(
         new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder().setCustomId(`sl:run:${r.id}`).setLabel("▶️ Run now").setStyle(ButtonStyle.Success),
@@ -8744,7 +8804,29 @@ export class Orchestrator {
         )
       );
     }
-    return { embeds: [embed], components };
+    const nav = scheduleNavState(slice.page, slice.pageCount);
+    if (nav.show) {
+      components.push(
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(schedulePageCustomId(nav.prevPage))
+            .setLabel("◀ Prev")
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(nav.prevDisabled),
+          new ButtonBuilder()
+            .setCustomId(schedulePageCustomId(slice.page))
+            .setLabel(nav.label)
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(true),
+          new ButtonBuilder()
+            .setCustomId(schedulePageCustomId(nav.nextPage))
+            .setLabel("Next ▶")
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(nav.nextDisabled),
+        )
+      );
+    }
+    return { embeds: [embed], components, page: slice.page };
   }
 
   private async cmdScheduleRemove(i: ChatInputCommandInteraction): Promise<void> {

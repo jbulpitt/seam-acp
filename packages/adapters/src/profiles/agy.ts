@@ -763,6 +763,66 @@ export function agyExecutionPolicyArgs(
   ];
 }
 
+/**
+ * Opt out of agy's print-mode slash-command and skill expansion (agy >= 1.1.9,
+ * issue #47). Without it, a prompt whose FIRST token is one of agy's own
+ * commands (`/agents /changelog /config /credits /effort /help /hooks /model
+ * /permissions /skills /usage`) or an installed skill name is resolved by the
+ * CLI instead of reaching the model. Verified on 1.1.25: `agy -p "/skills do
+ * X"` exits 2 with `Error: /skills takes no arguments` and never starts a turn,
+ * and the stdin path fails identically — the whole turn is swallowed.
+ *
+ * Normal Discord chat turns are already immune because `withHarnessPreamble`
+ * prepends `<seam-harness>` to every message, so the first token is never the
+ * user's. This flag closes the paths that bypass the preamble — `injectTurn`
+ * callers (seam-mcp `handoff`/`forward`/`send`, cron and wake deliveries) hand
+ * their text straight through. Applied to EVERY print-mode spawn so the
+ * invariant holds by construction rather than by remembering which prompt
+ * strings happen to be literals today.
+ *
+ * Read-only for anything that does not begin with `/`: verified byte-identical
+ * output with and without the flag on the `--model` validator probe.
+ */
+export const AGY_NO_SLASH_EXPANSION = "--disable-slash-commands";
+
+/**
+ * Pure argv for one print-mode turn, so the flag set stays directly
+ * regression-testable (same rationale as {@link agyExecutionPolicyArgs}).
+ *
+ * `useStdin` selects between the two prompt-delivery paths. They differ only in
+ * whether the prompt rides `-p <text>` or the child's stdin; every other flag —
+ * including {@link AGY_NO_SLASH_EXPANSION} — is shared, because agy expands
+ * slash commands on both.
+ */
+export function buildAgyPromptArgs(opts: {
+  promptText: string;
+  useStdin: boolean;
+  modelDisplayName?: string;
+  logFile: string;
+  printTimeoutSeconds: number;
+  cwd: string;
+  execution: AgyExecutionPolicy;
+  cascadeId?: string;
+}): string[] {
+  return [
+    ...(opts.useStdin ? [] : ["-p", opts.promptText]),
+    AGY_NO_SLASH_EXPANSION,
+    ...(opts.modelDisplayName ? ["--model", opts.modelDisplayName] : []),
+    // Redirect this spawn's log to a private path we own and read back for
+    // its port + conversation id. Exclusive: agy writes nothing to its shared
+    // ~/.gemini/antigravity-cli/log dir when this is set (verified).
+    "--log-file",
+    opts.logFile,
+    "--print-timeout",
+    `${opts.printTimeoutSeconds}s`,
+    // agy ignores the process cwd for its "workspace" — execution policy
+    // supplies --add-dir and optionally the shared staging root. Sandboxed
+    // one-shot helpers deliberately expose only their private cwd.
+    ...agyExecutionPolicyArgs(opts.cwd, opts.execution),
+    ...(opts.cascadeId ? ["--conversation", opts.cascadeId] : []),
+  ];
+}
+
 class AgyAgent implements Agent {
   private conn?: AgentSideConnection;
   private readonly sessions = new Map<string, AgySession>();
@@ -935,24 +995,16 @@ class AgyAgent implements Agent {
     const MAX_ARG_STRLEN = 120_000; // ~8KB headroom under the 131,072 kernel limit
     const useStdin = Buffer.byteLength(promptText, "utf8") > MAX_ARG_STRLEN;
 
-    const args = [
-      ...(useStdin ? [] : ["-p", promptText]),
-      ...(currentModel ? ["--model", currentModel.rawDisplayName] : []),
-      // Redirect this spawn's log to a private path we own and read back for
-      // its port + conversation id. Exclusive: agy writes nothing to its shared
-      // ~/.gemini/antigravity-cli/log dir when this is set (verified).
-      "--log-file",
-      agyLogPath,
-      "--print-timeout",
-      `${this.printTimeoutSeconds ?? 600}s`,
-      // agy ignores the process cwd for its "workspace" — execution policy
-      // supplies --add-dir and optionally the shared staging root. Sandboxed
-      // one-shot helpers deliberately expose only their private cwd.
-      ...agyExecutionPolicyArgs(sess.cwd, this.execution),
-    ];
-    if (sess.cascadeId) {
-      args.push("--conversation", sess.cascadeId);
-    }
+    const args = buildAgyPromptArgs({
+      promptText,
+      useStdin,
+      ...(currentModel ? { modelDisplayName: currentModel.rawDisplayName } : {}),
+      logFile: agyLogPath,
+      printTimeoutSeconds: this.printTimeoutSeconds ?? 600,
+      cwd: sess.cwd,
+      execution: this.execution,
+      ...(sess.cascadeId ? { cascadeId: sess.cascadeId } : {}),
+    });
 
     if (process.env.AGY_PROFILE_DEBUG) {
       // eslint-disable-next-line no-console
@@ -1800,6 +1852,7 @@ export async function fetchAgyAcceptedModels(cli: string): Promise<Set<string>> 
         [
           "-p",
           "ok",
+          AGY_NO_SLASH_EXPANSION,
           "--model",
           "__seam_probe_invalid__",
           "--print-timeout",
@@ -2026,7 +2079,7 @@ export async function fetchAgyUserStatus(cliPath?: string): Promise<AgyUsage> {
   }
   const cli = cliPath?.trim() || resolveAgyBinary();
   const logFile = await newSpawnLogPath();
-  const proc = spawn(cli, ["-p", "ok", "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], {
+  const proc = spawn(cli, ["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], {
     cwd: "/tmp",
     stdio: ["ignore", "ignore", "ignore"],
   });
@@ -2070,7 +2123,7 @@ async function fetchAgyCatalog(cli: string): Promise<AgyCatalogEntry[]> {
   // a few tokens of throwaway output; the cost is acceptable given the result
   // is cached for the process lifetime.
   const logFile = await newSpawnLogPath();
-  const proc = spawn(cli, ["-p", "ok", "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], {
+  const proc = spawn(cli, ["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], {
     cwd: "/tmp",
     stdio: ["ignore", "ignore", "ignore"],
   });

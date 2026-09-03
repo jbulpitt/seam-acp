@@ -37,6 +37,7 @@ export class LiveHelpManager {
   private readonly apiKey: () => string;
   private readonly leases: VoiceLeaseManager;
   private readonly running = new Map<string, AbortController>();
+  private readonly completions = new Map<string, Promise<void>>();
 
   constructor(opts: {
     store: SessionStore;
@@ -178,16 +179,16 @@ export class LiveHelpManager {
     return this.store.listActiveLiveHelp();
   }
 
-  stopAll(): void {
+  async stopAll(): Promise<void> {
     for (const ac of this.running.values()) ac.abort();
-    this.running.clear();
+    await Promise.allSettled([...this.completions.values()]);
   }
 
   private startCall(row: LiveHelpSession, lease: VoiceLease): void {
     const ac = new AbortController();
     this.running.set(row.id, ac);
     const notifyBuf = { input: "", output: "" };
-    void Promise.resolve()
+    const completion = Promise.resolve()
       .then(() => this.host.runCall({
         row,
         signal: ac.signal,
@@ -230,7 +231,14 @@ export class LiveHelpManager {
       })
       .finally(() => {
         this.running.delete(row.id);
+        this.completions.delete(row.id);
         this.leases.release(lease);
+      })
+      .catch((err) => {
+        // The completion is retained for shutdown draining, so it must never
+        // become an unhandled rejection if even the error-settlement tail fails.
+        this.logger.error({ err, liveId: row.id }, "live-help cleanup failed");
       });
+    this.completions.set(row.id, completion);
   }
 }

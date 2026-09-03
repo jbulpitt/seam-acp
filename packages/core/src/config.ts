@@ -512,7 +512,7 @@ const Schema = z.object({
     .int()
     .min(100)
     .max(3_600_000)
-    .default(300_000),
+    .default(900_000),
   /**
    * #174: ceiling on the pre-close quiesce barrier — how long shutdown waits
    * for claimed dispatches, active channel turns and post-turn continuations

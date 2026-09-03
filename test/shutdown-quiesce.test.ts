@@ -25,7 +25,11 @@ import {
   needsCompletionReplay,
   completionRoute,
 } from "../packages/core/src/core/dispatch/done-reconcile.js";
-import { dispatchDirs, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import {
+  DispatchTurnError,
+  dispatchDirs,
+  type DispatchSpec,
+} from "../packages/core/src/core/dispatch/types.js";
 import { DELEGATION_TERMINAL_STATUSES } from "../packages/core/src/core/types.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -42,6 +46,7 @@ import {
   SHUTDOWN_OVERHEAD_ALLOWANCE_MS,
 } from "../packages/core/src/lib/shutdown-budget.js";
 import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
+import { SessionStore } from "../packages/core/src/core/session-store.js";
 import net from "node:net";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
@@ -91,6 +96,36 @@ const deferred = () => {
 // ---------------------------------------------------------------------------
 
 describe("#174 DispatchWatcher.drain", () => {
+  it("writes partial worker output into a failed done-file", async () => {
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async () => {
+        throw new DispatchTurnError(
+          "onward enqueue failed",
+          "USEFUL PARTIAL",
+          "end_turn",
+          "completed",
+          undefined,
+          true
+        );
+      },
+    });
+    await dropSpec({ id: "partial" });
+    await watcher.start();
+    await vi.waitFor(async () => {
+      const result = JSON.parse(await readFile(path.join(dirs.done, "partial.json"), "utf8"));
+      expect(result).toMatchObject({
+        status: "failed",
+        error: "onward enqueue failed",
+        workerStatus: "completed",
+        completionError: "onward enqueue failed",
+        output: "USEFUL PARTIAL",
+      });
+    });
+    watcher.stop();
+  });
+
   it("stop() closes intake but does NOT mean drained", async () => {
     const gate = deferred();
     const watcher = new DispatchWatcher({
@@ -461,7 +496,15 @@ describe("#174 bounded quiesce", () => {
 
 /** In-memory ledger with the real DB-first report-back claim semantics. */
 function makeLedger() {
-  const rows = new Map<string, { id: string; kind: string; status: string; correlationId?: string }>();
+  const rows = new Map<string, {
+    id: string;
+    kind: string;
+    status: string;
+    correlationId?: string;
+    targetRef?: string | null;
+    worker?: string | null;
+    createdUtc?: string;
+  }>();
   return {
     rows,
     getDelegation: (id: string) => rows.get(id) ?? null,
@@ -475,10 +518,24 @@ function makeLedger() {
       }
       return null;
     },
-    tryRecordReportBack(entry: { id: string; correlationId?: string }) {
+    tryRecordReportBack(entry: {
+      id: string;
+      correlationId?: string;
+      targetRef?: string | null;
+      worker?: string | null;
+      status?: string;
+    }) {
       // Atomic claim: first writer for a correlation wins, as in SQLite.
       if (entry.correlationId && this.getReportBackByCorrelation(entry.correlationId)) return null;
-      const row = { id: entry.id, kind: "report_back", status: "dispatched", correlationId: entry.correlationId };
+      const row = {
+        id: entry.id,
+        kind: "report_back",
+        status: entry.status ?? "dispatched",
+        correlationId: entry.correlationId,
+        targetRef: entry.targetRef ?? null,
+        worker: entry.worker ?? null,
+        createdUtc: new Date().toISOString(),
+      };
       rows.set(entry.id, row);
       return row;
     },
@@ -568,6 +625,26 @@ describe("#174 replay ordering is crash-safe", () => {
     expect(String(specs[0]!.prompt)).toContain("THE ANSWER");
   });
 
+  it("does not misreport a completion-delivery failure as an agent failure", async () => {
+    const ledger = makeLedger();
+    ledger.rows.set("w1", { id: "w1", kind: "handoff", status: "interrupted" });
+    const host = makeReplayHost(ledger);
+
+    await replayVia(host, {
+      ...completedWorker,
+      status: "failed",
+      error: "disk unavailable while enqueueing onward work",
+      completionError: "disk unavailable while enqueueing onward work",
+      workerStatus: "completed",
+    });
+
+    expect(ledger.rows.get("w1")!.status).toBe("completed");
+    const specs = await pendingReportBacks();
+    expect(specs).toHaveLength(1);
+    expect(String(specs[0]!.prompt)).toContain("THE ANSWER");
+    expect(String(specs[0]!.prompt)).not.toContain("disk unavailable");
+  });
+
   it("CRASH between enqueue and terminalize: delivery survives, no duplicate", async () => {
     const ledger = makeLedger();
     ledger.rows.set("w1", { id: "w1", kind: "handoff", status: "interrupted" });
@@ -623,6 +700,33 @@ describe("#174 replay ordering is crash-safe", () => {
     expect(ledger.rows.get("w1")!.status).toBe("completed");
   });
 
+  it("CRASH after report-back claim but before enqueue repairs the exact claimed id", async () => {
+    const ledger = makeLedger();
+    ledger.rows.set("w1", { id: "w1", kind: "handoff", status: "interrupted" });
+    ledger.rows.set("claimed-rb", {
+      id: "claimed-rb",
+      kind: "report_back",
+      status: "dispatched",
+      correlationId: "corr-1",
+      targetRef: "parent-thread",
+      createdUtc: new Date().toISOString(),
+    });
+    const host = makeReplayHost(ledger);
+
+    await replayVia(host, completedWorker);
+
+    expect(await readdir(dirs.pending)).toEqual(["claimed-rb.json"]);
+    const repaired = JSON.parse(await readFile(path.join(dirs.pending, "claimed-rb.json"), "utf8"));
+    expect(repaired).toMatchObject({
+      id: "claimed-rb",
+      kind: "report_back",
+      correlationId: "corr-1",
+      target: "parent-thread",
+    });
+    expect(String(repaired.prompt)).toContain("THE ANSWER");
+    expect(ledger.rows.get("w1")!.status).toBe("completed");
+  });
+
   it("chain advance is likewise durable before terminalize", async () => {
     const ledger = makeLedger();
     ledger.rows.set("w2", { id: "w2", kind: "forward", status: "running" });
@@ -675,6 +779,32 @@ describe("#174 replay ordering is crash-safe", () => {
 // ---------------------------------------------------------------------------
 
 describe("#174 boot done-file reconciliation", () => {
+  it("runs done-file replay before stale/orphan terminalization", async () => {
+    const source = await readFile(
+      path.join(process.cwd(), "packages/core/src/index.ts"),
+      "utf8"
+    );
+    const done = source.indexOf("const repaired = await reconcileCompletedDoneFiles");
+    const stale = source.indexOf("delegationReconciler.reconcile();");
+    const orphan = source.indexOf("store.reconcileOrphanedDelegations();");
+    expect(done).toBeGreaterThan(0);
+    expect(stale).toBeGreaterThan(done);
+    expect(orphan).toBeGreaterThan(done);
+  });
+
+  it("drains admitted HTTP work before the manager callbacks it can start", async () => {
+    const source = await readFile(
+      path.join(process.cwd(), "packages/core/src/index.ts"),
+      "utf8"
+    );
+    const http = source.indexOf("seamMcpServer.drainRequests(httpDrain)");
+    const manager = source.indexOf('stage: "manager-callbacks"');
+    const quiesce = source.indexOf('stage: "pre-dispose-quiesce"');
+    expect(http).toBeGreaterThan(0);
+    expect(manager).toBeGreaterThan(http);
+    expect(quiesce).toBeGreaterThan(manager);
+  });
+
   const base = {
     target: "worker",
     status: "completed",
@@ -825,19 +955,27 @@ describe("#174 admission gates", () => {
         },
       }
     );
-    const self = {
+    const self = makeIngressHost<{
+      runInbound(label: string, run: () => Promise<void>, refuse: () => Promise<void>): Promise<void>;
+      handleIncomingMessage(m: unknown): Promise<void>;
+    }>({
       logger: silent,
-      intakeStopped: true,
+      inboundWork: new Set(),
       adapter: { sendMessage },
       store,
+      runInbound: Orchestrator.prototype["runInbound" as never],
       handleIncomingMessage: Orchestrator.prototype["handleIncomingMessage" as never],
       // Any of these running would mean the gate did not short-circuit.
       tryConsumeConfigEditorRiderUpload: async () => {
         throw new Error("admitted a turn after intake closed");
       },
-    } as unknown as { handleIncomingMessage(m: unknown): Promise<void> };
+    });
 
-    await self.handleIncomingMessage({ channel: { id: "c1" }, text: "hi", authorId: "u1" });
+    await self.runInbound(
+      "message",
+      () => self.handleIncomingMessage({ channel: { id: "c1" }, text: "hi", authorId: "u1" }),
+      async () => { await sendMessage({ platform: "discord", id: "c1" }, "Restarting — send it again."); }
+    );
     expect(sendMessage).toHaveBeenCalledOnce();
     expect(String(sendMessage.mock.calls[0]![1])).toMatch(/Restarting/i);
     // Honest wording: we did not keep it.
@@ -1839,26 +1977,24 @@ describe("#174 an in-flight isolated scheduled fire holds both phases", () => {
     expect(store.violations).toEqual([]);
   });
 
-  it("a live scheduled fire is NOT double-counted (it is already queued)", async () => {
-    // Regression guard on the primitive itself: the live path goes through
-    // `queueOnChannel`, which registers the turn; registering again here would
-    // inflate the drain and keep it alive after the turn had finished.
+  it("a live scheduled fire is registered before its pre-queue awaits", async () => {
     const store = makeClosableStore();
     store.scheduled.set("s-live", { id: "s-live", sessionMode: "live" });
     const fire = deferred();
     const host = makeQuiesceHost({
       store,
       runScheduledPromptInner: async () => {
-        expect(host.activeTurns).toBe(0); // no OUTER registration for live
+        expect(host.activeTurns).toBe(1);
         await fire.promise;
       },
     });
 
     const running = host.runScheduledPrompt("s-live");
     await flush();
-    expect(host.activeTurns).toBe(0);
+    expect(host.activeTurns).toBe(1);
     fire.resolve();
     await running;
+    expect(host.activeTurns).toBe(0);
   });
 });
 
@@ -2280,8 +2416,9 @@ describe("#174 shutdown is bounded as a WHOLE, not just per stage", () => {
   });
 
   it("the four drain stages cannot sum past the budget", () => {
-    // The exact sequence index.ts runs: http drain, pre-dispose quiesce,
-    // seam-mcp stop, post-dispose drain — each asking for its full ceiling.
+    // Representative sequential stages from index.ts, each asking for its
+    // full ceiling. The shared budget keeps added stages from extending the
+    // process beyond the host kill window.
     const { budget, spend, elapsed } = fakeBudget(SHUTDOWN_BUDGET_MS);
     const stages = [spend(10_000), spend(10_000), spend(5_000), spend(10_000)];
     expect(stages.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(SHUTDOWN_BUDGET_MS);
@@ -2337,8 +2474,10 @@ describe("#174 nothing is explicitly closed while callbacks may still resume", (
   const ALL_STAGES = [
     "seam-mcp-ingress",
     "health-ingress",
+    "manager-callbacks",
     "pre-dispose-quiesce",
     "voice-console-shutdown",
+    "live-help-shutdown",
     "router-dispose",
     "post-dispose-drain",
   ] as const;
@@ -2372,7 +2511,7 @@ describe("#174 nothing is explicitly closed while callbacks may still resume", (
     // every stage before this is consulted. Pinned so a lost `push` is visible
     // as a behaviour change here rather than as a silent early close.
     expect(safeToCloseResources([])).toBe(true);
-    expect(ALL_STAGES).toHaveLength(6);
+    expect(ALL_STAGES).toHaveLength(8);
   });
 
   /**
@@ -2806,6 +2945,38 @@ function makeChainStore() {
       const c = chains.get(id);
       if (c) c.status = status;
     },
+    planChainHopCompletion(input: {
+      dispatchId: string;
+      chainId: string;
+      failed: boolean;
+      promptPreview?: string | null;
+    }) {
+      const existing = ledger.getReportBackByCorrelation(input.dispatchId);
+      const chain = chains.get(input.chainId);
+      if (existing) {
+        if (!existing.targetRef || !chain) return null;
+        return {
+          dispatchId: existing.targetRef,
+          nextHop: existing.worker ?? null,
+          originRef: chain.originRef,
+          created: false,
+        };
+      }
+      if (!chain || chain.status !== "running") return null;
+      const nextHop = input.failed ? null : (chain.hops[0] ?? null);
+      const dispatchId = nextHop
+        ? `chain_hop:${input.dispatchId}`
+        : `chain_delivery:${input.dispatchId}`;
+      ledger.tryRecordReportBack({
+        id: `chain_advance:${input.dispatchId}`,
+        correlationId: input.dispatchId,
+        targetRef: dispatchId,
+        worker: nextHop,
+        status: "completed",
+      });
+      if (nextHop) this.advanceChain(input.chainId);
+      return { dispatchId, nextHop, originRef: chain.originRef, created: true };
+    },
   };
 }
 
@@ -2819,7 +2990,6 @@ function makeChainReplayHost(store: ReturnType<typeof makeChainStore>) {
     enqueueReportBack: Orchestrator.prototype["enqueueReportBack" as never],
     claimAndEnqueueReportBack: Orchestrator.prototype["claimAndEnqueueReportBack" as never],
     advanceChain: Orchestrator.prototype["advanceChain" as never],
-    claimChainHopAdvance: Orchestrator.prototype["claimChainHopAdvance" as never],
     enqueueChainDelivery: Orchestrator.prototype["enqueueChainDelivery" as never],
   };
   return self as unknown as {
@@ -3031,6 +3201,77 @@ describe("#174 a routed forward is actually delivered or advanced", () => {
     expect(store.chains.get("chain-idem")).toMatchObject({ hops: [], currentIndex: 1 });
   });
 
+  it("repairs a crash after atomic chain plan/pop but before child enqueue", async () => {
+    const store = makeChainStore();
+    store.rows.set("parent-hop", { id: "parent-hop", kind: "forward", status: "interrupted" });
+    store.chains.set("chain-crash", {
+      id: "chain-crash",
+      status: "running",
+      hops: ["worker-b"],
+      currentIndex: 0,
+      originRef: "origin",
+    });
+    const plan = store.planChainHopCompletion({
+      dispatchId: "parent-hop",
+      chainId: "chain-crash",
+      failed: false,
+    });
+    expect(plan).toMatchObject({ dispatchId: "chain_hop:parent-hop", nextHop: "worker-b" });
+    expect(store.chains.get("chain-crash")).toMatchObject({ hops: [], currentIndex: 1 });
+    expect(await readdir(dirs.pending)).toEqual([]);
+
+    await makeChainReplayHost(store).replayCompletedDispatch(
+      {
+        id: "parent-hop",
+        target: "worker-a",
+        status: "completed",
+        output: "NEXT INPUT",
+        chainId: "chain-crash",
+      },
+      { action: "chain", chainId: "chain-crash" }
+    );
+    expect(await readdir(dirs.pending)).toEqual(["chain_hop:parent-hop.json"]);
+    expect(store.chains.get("chain-crash")).toMatchObject({ status: "running", currentIndex: 1 });
+  });
+
+  it("does not mistake a popped final worker for terminal delivery on replay", async () => {
+    const store = makeChainStore();
+    store.rows.set("parent-hop", { id: "parent-hop", kind: "forward", status: "interrupted" });
+    store.chains.set("chain-last", {
+      id: "chain-last",
+      status: "running",
+      hops: ["last-worker"],
+      currentIndex: 0,
+      originRef: "origin",
+    });
+    store.planChainHopCompletion({
+      dispatchId: "parent-hop",
+      chainId: "chain-last",
+      failed: false,
+    });
+
+    await makeChainReplayHost(store).replayCompletedDispatch(
+      {
+        id: "parent-hop",
+        target: "worker-a",
+        status: "completed",
+        output: "FOR LAST WORKER",
+        chainId: "chain-last",
+      },
+      { action: "chain", chainId: "chain-last" }
+    );
+    const specs = await pendingSpecs();
+    expect(specs).toHaveLength(1);
+    expect(specs[0]).toMatchObject({
+      id: "chain_hop:parent-hop",
+      target: "origin",
+      preset: "last-worker",
+      chainId: "chain-last",
+    });
+    expect(String(specs[0]!.prompt)).not.toContain("seam-chain-result");
+    expect(store.chains.get("chain-last")!.status).toBe("running");
+  });
+
   it("a modern plain forward routes to its report-back address", async () => {
     // Same class of bug, other branch: the route is authoritative for the
     // onward address, so the two can never disagree.
@@ -3053,6 +3294,47 @@ describe("#174 a routed forward is actually delivered or advanced", () => {
     const specs = await pendingSpecs();
     expect(specs.filter((s) => s.kind === "report_back")).toHaveLength(1);
     expect(String(specs[0]!.prompt)).toContain("THE ANSWER");
+  });
+});
+
+describe("#174 atomic chain completion plan", () => {
+  it("commits the claim and hop pop together, then replays the same child id", () => {
+    const store = new SessionStore(path.join(dataDir, "chain-plan.db"));
+    try {
+      store.createChain({
+        id: "chain-db",
+        hops: ["worker-b"],
+        originRef: "origin",
+      });
+      const first = store.planChainHopCompletion({
+        dispatchId: "parent-db",
+        chainId: "chain-db",
+        failed: false,
+        promptPreview: "ask",
+      });
+      const replay = store.planChainHopCompletion({
+        dispatchId: "parent-db",
+        chainId: "chain-db",
+        failed: false,
+        promptPreview: "ask",
+      });
+
+      expect(first).toEqual({
+        dispatchId: "chain_hop:parent-db",
+        nextHop: "worker-b",
+        originRef: "origin",
+        created: true,
+      });
+      expect(replay).toEqual({ ...first, created: false });
+      expect(store.getChain("chain-db")).toMatchObject({ hops: [], currentIndex: 1 });
+      expect(store.getReportBackByCorrelation("parent-db")).toMatchObject({
+        id: "chain_advance:parent-db",
+        targetRef: "chain_hop:parent-db",
+        worker: "worker-b",
+      });
+    } finally {
+      store.close();
+    }
   });
 });
 

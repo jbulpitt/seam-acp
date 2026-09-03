@@ -334,6 +334,8 @@ import {
   applyWatchFeedback,
   applyPresetIdentity,
   buildChainHopSpec,
+  DispatchTurnError,
+  dispatchArtifactState,
   dispatchOriginRefs,
   enqueueDispatchSpec,
   findQueuedReportBackSpec,
@@ -1210,7 +1212,18 @@ export class Orchestrator {
   }
 
   install(): void {
-    this.adapter.onMessage((msg) => this.handleIncomingMessage(msg));
+    this.adapter.onMessage((msg) =>
+      this.runInbound(
+        "message",
+        () => this.handleIncomingMessage(msg),
+        async () => {
+          await this.adapter.sendMessage?.(
+            { platform: PLATFORM, id: msg.channel.id },
+            "♻️ Restarting — I did not take this message. Please send it again in a moment."
+          );
+        }
+      )
+    );
     this.adapter.onComponent?.((evt) => {
       // #174: one gate AND one tracking point for every component handler
       // (config editor, TTS editor, Voice Console, quota card). They all do
@@ -1424,7 +1437,7 @@ export class Orchestrator {
     this.restartPending = true;
     const force = this.readSentinelForce();
     let forceShutdown = force;
-    const drainTimeoutMs = this.config.RESTART_DRAIN_TIMEOUT_MS ?? 300_000;
+    const drainTimeoutMs = this.config.RESTART_DRAIN_TIMEOUT_MS ?? 900_000;
     // Keep cron timers running through the drain. Stopping them here is what
     // made `report-update` miss 5:25 while a restart sat pending for hours —
     // list still showed the stale next_run, and catch-up could then skip it.
@@ -1506,26 +1519,6 @@ export class Orchestrator {
 
   private async handleIncomingMessage(msg: IncomingMessage): Promise<void> {
     const channelId = msg.channel.id;
-
-    // #174: close user admission SYNCHRONOUSLY, before any await and before
-    // any store access. Discord events keep arriving until `adapter.stop()`,
-    // which runs after the quiesce snapshot — so without this gate a message
-    // can open a brand-new channel turn while shutdown is already draining,
-    // and that turn's continuations land on a closed store.
-    //
-    // Deliberately says "resend": the message is NOT persisted here (touching
-    // the store is exactly what this gate exists to avoid), so promising to
-    // pick it up later would be a lie.
-    if (this.intakeStopped) {
-      this.logger.info({ channelId }, "message refused; shutting down");
-      await this.adapter
-        .sendMessage?.(
-          { platform: PLATFORM, id: channelId },
-          "♻️ Restarting — I did not take this message. Please send it again in a moment."
-        )
-        .catch(() => {});
-      return;
-    }
 
     // Config editor: next file from the editor owner becomes the draft rider.
     // Must run before abort / park so the upload is not treated as a new turn.
@@ -7448,33 +7441,51 @@ export class Orchestrator {
         // Partial output is still output — post whatever was captured either way.
         await this.postDispatchOutput(target, spec, result.text, result.error);
       }
-      const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
-      try { this.store.updateDelegationStatus(spec.id, ledgerStatus); } catch { /* best-effort */ }
-      // Chain advance (#25): a hop carrying a chainId drives the chain forward
-      // instead of a normal report-back — enqueue the next hop, or deliver the
-      // final output to the chain's origin. The chain row is the source of
-      // truth, so this survives a restart mid-chain.
-      if (wasInterrupted) {
-        // #67: this turn was preemptively cancelled by an interrupt. Deliver
-        // NOTHING onward — no report-back, no chain advance — the interrupt has
-        // already issued a fresh directive into this same thread in its place.
-        this.logger.info(
-          { dispatch: spec.id, target: spec.target, correlationId: spec.correlationId },
-          "dispatch: onward delivery suppressed — turn was interrupted (#67)"
-        );
-      } else if (spec.chainId) {
-        await this.advanceChain(spec, result.text, result.error).catch((err) =>
-          this.logger.warn({ err, dispatch: spec.id, chainId: spec.chainId }, "dispatch: chain advance failed")
-        );
-      } else if (spec.returnTo) {
-        // Report-back: if the caller set returnTo, deliver the result back by
-        // enqueuing a fresh dispatch into that thread (correlation-linked). The
-        // runtime owns this — the worker never had to "remember" to report.
-        await this.enqueueReportBack(spec, result.text, result.error).catch((err) =>
-          this.logger.warn({ err, dispatch: spec.id }, "dispatch: report-back enqueue failed")
+      try {
+        // Chain advance (#25): a hop carrying a chainId drives the chain forward
+        // instead of a normal report-back — enqueue the next hop, or deliver the
+        // final output to the chain's origin.
+        if (wasInterrupted) {
+          // #67: this turn was preemptively cancelled by an interrupt. Deliver
+          // NOTHING onward — no report-back, no chain advance — the interrupt has
+          // already issued a fresh directive into this same thread in its place.
+          this.logger.info(
+            { dispatch: spec.id, target: spec.target, correlationId: spec.correlationId },
+            "dispatch: onward delivery suppressed — turn was interrupted (#67)"
+          );
+        } else if (spec.chainId) {
+          await this.advanceChain(spec, result.text, result.error);
+        } else if (spec.returnTo) {
+          // Report-back: if the caller set returnTo, deliver the result back by
+          // enqueuing a fresh dispatch into that thread (correlation-linked). The
+          // runtime owns this — the worker never had to "remember" to report.
+          await this.enqueueReportBack(spec, result.text, result.error);
+        }
+        // Only terminalize after the onward action is durable.
+        const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
+        this.store.updateDelegationStatus(spec.id, ledgerStatus);
+      } catch (err) {
+        // Preserve the worker's output in done/ while leaving its ledger row
+        // non-terminal. Boot completion replay can then finish the durable side
+        // effect without paying for or rerunning the agent turn.
+        throw new DispatchTurnError(
+          (err as Error)?.message ?? String(err),
+          result.text,
+          result.stopReason ?? "",
+          result.timedOut ? "timed_out" : result.error ? "failed" : "completed",
+          result.error,
+          true
         );
       }
-      if (result.error) throw new Error(result.error);
+      if (result.error) {
+        throw new DispatchTurnError(
+          result.error,
+          result.text,
+          result.stopReason ?? "",
+          "failed",
+          result.error
+        );
+      }
       return { output: result.text, stopReason: result.stopReason ?? "" };
     };
 
@@ -7983,8 +7994,8 @@ export class Orchestrator {
 
   /**
    * Claim a `report_back` ledger row for `correlationId` and enqueue `spec`.
-   * Returns true if this call won the claim and wrote the spec, false if a
-   * report-back for this correlation already exists (ledger or pending/running).
+   * Returns true if this call wrote/repaired the spec, false if a durable
+   * artifact (or a terminal delivery row) already proves no write is needed.
    * The ledger write is committed BEFORE the spec lands so a crash in the
    * watcher window (after we return, before the done-file) still sees the claim.
    */
@@ -7993,10 +8004,35 @@ export class Orchestrator {
     spec: DispatchSpec,
     refs: { sourceRef: string | null; targetRef: string | null }
   ): Promise<boolean> {
-    if (this.store.getReportBackByCorrelation(correlationId)) {
+    const existingClaim = this.store.getReportBackByCorrelation(correlationId);
+    if (existingClaim) {
+      const artifact = await dispatchArtifactState(this.config.DATA_DIR, existingClaim.id);
+      if (artifact) {
+        this.logger.info(
+          { correlationId, spec: existingClaim.id, artifact },
+          "dispatch: report-back already has a durable artifact (#77)"
+        );
+        return false;
+      }
+      if (!["completed", "failed", "timed_out"].includes(existingClaim.status)) {
+        // The DB claim is the durable outbox key. A crash can land after that
+        // commit but before the pending file rename; reconstruct the complete
+        // spec from the parent's done output and reuse the claimed id.
+        await enqueueDispatchSpec(this.config.DATA_DIR, {
+          ...spec,
+          id: existingClaim.id,
+          createdUtc: existingClaim.createdUtc,
+        });
+        this.store.updateDelegationStatus(existingClaim.id, "dispatched");
+        this.logger.warn(
+          { correlationId, spec: existingClaim.id },
+          "dispatch: repaired report-back claim with missing queue artifact"
+        );
+        return true;
+      }
       this.logger.info(
-        { correlationId, spec: spec.id },
-        "dispatch: report-back skipped — ledger already has this correlation (#77)"
+        { correlationId, spec: existingClaim.id, status: existingClaim.status },
+        "dispatch: report-back already delivered (#77)"
       );
       return false;
     }
@@ -8080,8 +8116,12 @@ export class Orchestrator {
     returnTo?: string;
     chainId?: string;
     originPrompt?: string;
+    workerStatus?: "completed" | "failed" | "timed_out";
+    workerError?: string;
+    completionError?: string;
   }, route: CompletionRoute): Promise<void> {
     const text = result.output ?? "";
+    const workerError = result.workerError ?? (result.completionError ? undefined : result.error);
     // The ROUTE is authoritative for the onward address, not the done-file.
     //
     // Keeping the route authoritative prevents a classifier/replay mismatch:
@@ -8125,15 +8165,15 @@ export class Orchestrator {
     // through. Anything whose delivery cannot be PROVEN never reaches this
     // method; `completionRoute` skips it and leaves the row non-terminal.
     if (route.action === "chain") {
-      await this.advanceChain(spec, text, result.error);
+      await this.advanceChain(spec, text, workerError);
     } else if (route.action === "report_back") {
-      await this.enqueueReportBack(spec, text, result.error);
+      await this.enqueueReportBack(spec, text, workerError);
     }
 
     // Only now is the completion fully recorded. A throw above propagates to
     // the caller, which logs and leaves the row non-terminal for the next boot
     // — retrying is safe, dropping it is not.
-    const ledgerStatus = result.status === "completed" ? "completed" : "failed";
+    const ledgerStatus = result.workerStatus ?? (result.status === "completed" ? "completed" : "failed");
     this.store.updateDelegationStatus(result.id, ledgerStatus);
   }
 
@@ -8143,99 +8183,50 @@ export class Orchestrator {
     const chain = this.store.getChain(chainId);
     if (!chain) {
       this.logger.warn({ chainId, dispatch: spec.id }, "chain: advance for unknown chain");
-      return;
+      throw new Error(`chain ${chainId} not found for completed dispatch ${spec.id}`);
     }
     if (chain.status !== "running") {
       this.logger.info({ chainId, status: chain.status }, "chain: advance on non-running chain — ignored");
-      return;
+      return; // A prior replay already completed the chain.
     }
 
-    // Hop-scoped claim: one advance (or fail-delivery) per completing spec.
-    if (!this.claimChainHopAdvance(spec, chainId)) {
-      this.logger.info(
-        { chainId, dispatch: spec.id },
-        "chain: advance skipped — hop already claimed (#77)"
-      );
-      // Repair the inner window (claimed, then crashed before terminal
-      // enqueue/complete). Do NOT call store.advanceChain again.
-      const current = this.store.getChain(chainId);
-      if (current?.status === "running") {
-        if (error) {
-          await this.enqueueChainDelivery(
-            current.originRef,
-            chainId,
-            `The chain broke at a hop: ${error}\n\n--- partial output ---\n${output}`
-          );
-          this.store.completeChain(chainId, "failed");
-        } else if (current.hops.length === 0) {
-          await this.enqueueChainDelivery(current.originRef, chainId, output);
-          this.store.completeChain(chainId);
-        }
-      }
-      return;
-    }
-
-    if (error) {
-      // Enqueue the failure delivery BEFORE marking the chain terminal, so a
-      // crash between the two still re-enters this path (chain still running)
-      // and the correlation claim on `chainId` keeps the delivery unique.
-      await this.enqueueChainDelivery(
-        chain.originRef,
-        chainId,
-        `The chain broke at a hop: ${error}\n\n--- partial output ---\n${output}`
-      );
-      this.store.completeChain(chainId, "failed");
-      this.logger.warn({ chainId, dispatch: spec.id, error }, "chain: hop failed; chain marked failed");
-      return;
-    }
-
-    const advanced = this.store.advanceChain(chainId);
-    if (!advanced) {
-      this.logger.warn({ chainId }, "chain: advance no-op (missing or not running)");
-      return;
-    }
-    const { nextHop } = advanced;
-    if (nextHop) {
-      // Pipe this hop's output into the next hop as its input.
-      const next = buildChainHopSpec({
-        id: randomUUID(),
-        chainId,
-        worker: nextHop,
-        prompt: output,
-        originRef: chain.originRef,
-      });
-      await enqueueDispatchSpec(this.config.DATA_DIR, next);
-      this.logger.info(
-        { chainId, dispatch: next.id, worker: nextHop, index: advanced.chain.currentIndex },
-        "chain: advanced to next hop"
-      );
-    } else {
-      // No hops remain — deliver the final output to the origin and complete.
-      await this.enqueueChainDelivery(chain.originRef, chainId, output);
-      this.store.completeChain(chainId);
-      this.logger.info({ chainId, originRef: chain.originRef }, "chain: completed; final output delivered");
-    }
-  }
-
-  /**
-   * Durable "this hop already advanced the chain" claim (#77). Keyed on the
-   * completing spec's id (not the chain's shared correlation) so hop N's
-   * claim cannot block hop N+1. Uses a synthetic ledger id so it does not
-   * collide with the hop's own `kind=forward` row (`id = spec.id`).
-   */
-  private claimChainHopAdvance(spec: DispatchSpec, chainId: string): boolean {
-    if (this.store.getReportBackByCorrelation(spec.id)) return false;
-    const claimed = this.store.tryRecordReportBack({
-      id: `chain_advance:${spec.id}`,
-      kind: "report_back",
-      sourceRef: chainId,
-      targetRef: spec.target,
-      worker: spec.preset ?? null,
+    // The plan row and chain pop commit in ONE SQLite transaction. Its stored
+    // child id/worker are the authority on replay; never infer phase from the
+    // mutated remaining-hop list.
+    const plan = this.store.planChainHopCompletion({
+      dispatchId: spec.id,
+      chainId,
+      failed: Boolean(error),
       promptPreview: spec.prompt,
-      correlationId: spec.id,
-      status: "completed",
     });
-    return claimed !== null;
+    if (!plan) throw new Error(`chain ${chainId} could not durably plan completion ${spec.id}`);
+
+    if (plan.nextHop) {
+      const next = buildChainHopSpec({
+        id: plan.dispatchId,
+        chainId,
+        worker: plan.nextHop,
+        prompt: output,
+        originRef: plan.originRef,
+      });
+      const artifact = await dispatchArtifactState(this.config.DATA_DIR, plan.dispatchId);
+      if (!artifact) await enqueueDispatchSpec(this.config.DATA_DIR, next);
+      this.logger.info(
+        { chainId, dispatch: next.id, worker: plan.nextHop, repaired: !plan.created },
+        "chain: next hop durably queued"
+      );
+      return;
+    }
+
+    const body = error
+      ? `The chain broke at a hop: ${error}\n\n--- partial output ---\n${output}`
+      : output;
+    await this.enqueueChainDelivery(plan.originRef, chainId, body, plan.dispatchId);
+    this.store.completeChain(chainId, error ? "failed" : "completed");
+    this.logger.info(
+      { chainId, originRef: plan.originRef, failed: Boolean(error) },
+      "chain: terminal delivery durably queued"
+    );
   }
 
   /** Deliver a chain's terminal output into its origin thread as a fresh live
@@ -8246,9 +8237,10 @@ export class Orchestrator {
   private async enqueueChainDelivery(
     originRef: string,
     chainId: string,
-    body: string
+    body: string,
+    deliveryId: string = randomUUID()
   ): Promise<void> {
-    const id = randomUUID();
+    const id = deliveryId;
     const wrapped = [
       `<seam-chain-result chain="${chainId}">`,
       body,
@@ -8803,19 +8795,9 @@ export class Orchestrator {
   async runScheduledPrompt(id: string): Promise<void> {
     const row = this.store.getScheduled(id);
     if (!row) return;
-    // Live fires run through `queueOnChannel`, which already registers the
-    // turn — registering here too would double-count it and hold the drain open
-    // after the turn had finished. So only the isolated path takes the outer
-    // registration (M3).
-    if (row.sessionMode === "live") {
-      await this.runScheduledPromptInner(row);
-      return;
-    }
-    // Count isolated scheduled jobs so a redeploy/sentinel waits for an
-    // in-flight job instead of killing its agent child mid-run. Like an
-    // isolated dispatch this has no channel queue and no tracked continuation,
-    // so this registration is the ONLY thing holding shutdown open while its
-    // cleanup (status patch, output post) is still running.
+    // Register before the first asynchronous precondition check. Live mode is
+    // also counted by queueOnChannel once admitted there, but this outer token
+    // covers the otherwise invisible interval before queue registration.
     const endTurn = this.beginTurn();
     try {
       await this.runScheduledPromptInner(row);

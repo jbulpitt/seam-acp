@@ -11,7 +11,7 @@
  */
 import { z } from "zod";
 import * as path from "node:path";
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import type { DelegationKind } from "../types.js";
 import { parseDispatchWorker } from "../location.js";
 
@@ -127,6 +127,21 @@ export interface DispatchSpec {
   createdUtc: string;
 }
 
+/** A failed worker turn can still have useful partial output. */
+export class DispatchTurnError extends Error {
+  constructor(
+    message: string,
+    readonly output: string,
+    readonly stopReason = "",
+    readonly workerStatus: "completed" | "failed" | "timed_out" = "failed",
+    readonly workerError?: string,
+    readonly completionPending = false
+  ) {
+    super(message);
+    this.name = "DispatchTurnError";
+  }
+}
+
 /** `done/<id>.json`. Written exactly once per spec, atomically. */
 export interface DispatchResult {
   id: string;
@@ -137,6 +152,12 @@ export interface DispatchResult {
   output?: string;
   /** Failure reason. Absent on success. */
   error?: string;
+  /** The agent turn's outcome when completion delivery failed afterwards. */
+  workerStatus?: "completed" | "failed" | "timed_out";
+  /** The agent's own error, kept distinct from a completion-delivery failure. */
+  workerError?: string;
+  /** A durable side effect failed after the agent turn and must be replayed. */
+  completionError?: string;
   target: string;
   correlationId?: string;
   finishedUtc: string;
@@ -470,6 +491,27 @@ export async function enqueueDispatchSpec(
   const final = path.join(dirs.pending, `${spec.id}.json`);
   await writeFile(tmp, `${JSON.stringify(spec, null, 2)}\n`, "utf8");
   await rename(tmp, final);
+}
+
+/** Locate the durable artifact for one exact dispatch id. */
+export async function dispatchArtifactState(
+  dataDir: string,
+  id: string
+): Promise<"pending" | "running" | "done" | null> {
+  const dirs = dispatchDirs(dataDir);
+  for (const [state, dir] of [
+    ["pending", dirs.pending],
+    ["running", dirs.running],
+    ["done", dirs.done],
+  ] as const) {
+    try {
+      await access(path.join(dir, `${id}.json`));
+      return state;
+    } catch {
+      // Try the next durable location.
+    }
+  }
+  return null;
 }
 
 /**

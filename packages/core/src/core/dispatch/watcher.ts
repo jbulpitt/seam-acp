@@ -24,7 +24,7 @@ import * as path from "node:path";
 import { SerialQueue } from "../serial-queue.js";
 import type { Logger } from "../../lib/logger.js";
 import type { DispatchResult, DispatchSpec } from "./types.js";
-import { dispatchDirs, parseDispatchSpec } from "./types.js";
+import { DispatchTurnError, dispatchDirs, parseDispatchSpec } from "./types.js";
 
 /** Clamp on the originating prompt copied into a done-file (#174). */
 export const DONE_ORIGIN_PROMPT_MAX = 4000;
@@ -592,10 +592,20 @@ export class DispatchWatcher {
       } catch (err) {
         if (this.quarantined.has(id)) return;
         const message = (err as Error)?.message ?? String(err);
+        const partial = err instanceof DispatchTurnError ? err.output : undefined;
+        const stopReason = err instanceof DispatchTurnError ? err.stopReason : undefined;
+        const workerStatus = err instanceof DispatchTurnError ? err.workerStatus : undefined;
+        const workerError = err instanceof DispatchTurnError ? err.workerError : undefined;
+        const completionPending = err instanceof DispatchTurnError && err.completionPending;
         await this.finish(id, {
           ...base,
           status: "failed",
+          ...(partial ? { output: partial } : {}),
           error: message,
+          ...(workerStatus ? { workerStatus } : {}),
+          ...(workerError ? { workerError } : {}),
+          ...(completionPending ? { completionError: message } : {}),
+          ...(stopReason ? { stopReason } : {}),
           finishedUtc: new Date().toISOString(),
         });
         this.logger.warn({ id, target: spec.target, err }, "dispatch: failed");

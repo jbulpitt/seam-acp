@@ -1786,6 +1786,59 @@ export class SessionStore {
     return { chain: updated, nextHop };
   }
 
+  /**
+   * Atomically plan one completed chain hop and, when applicable, pop the next
+   * worker. The synthetic report_back row is a durable outbox plan:
+   * `targetRef` stores the deterministic child dispatch id and `worker` stores
+   * the next worker (null means terminal delivery). Replays read this row
+   * instead of inferring progress from the already-mutated chain.
+   */
+  planChainHopCompletion(input: {
+    dispatchId: string;
+    chainId: string;
+    failed: boolean;
+    promptPreview?: string | null;
+  }): { dispatchId: string; nextHop: string | null; originRef: string; created: boolean } | null {
+    const run = this.db.transaction(() => {
+      const existing = this.getReportBackByCorrelation(input.dispatchId);
+      const chain = this.getChain(input.chainId);
+      if (existing) {
+        if (!existing.targetRef || !chain) return null;
+        return {
+          dispatchId: existing.targetRef,
+          nextHop: existing.worker,
+          originRef: chain.originRef,
+          created: false,
+        };
+      }
+      if (!chain || chain.status !== "running") return null;
+
+      const nextHop = input.failed ? null : (chain.hops[0] ?? null);
+      const dispatchId = nextHop
+        ? `chain_hop:${input.dispatchId}`
+        : `chain_delivery:${input.dispatchId}`;
+      const claim = this.tryRecordReportBack({
+        id: `chain_advance:${input.dispatchId}`,
+        kind: "report_back",
+        sourceRef: input.chainId,
+        targetRef: dispatchId,
+        worker: nextHop,
+        promptPreview: input.promptPreview ?? null,
+        correlationId: input.dispatchId,
+        status: "completed",
+      });
+      if (!claim) return null;
+      if (nextHop) {
+        const advanced = this.advanceChain(input.chainId);
+        if (!advanced || advanced.nextHop !== nextHop) {
+          throw new Error(`chain ${input.chainId} changed while planning ${input.dispatchId}`);
+        }
+      }
+      return { dispatchId, nextHop, originRef: chain.originRef, created: true };
+    });
+    return run();
+  }
+
   /** Mark a chain terminal (default "completed"), re-stamping `updated_utc`.
    *  Unknown ids are a silent no-op. */
   completeChain(id: string, status: Exclude<ChainStatus, "running"> = "completed"): void {

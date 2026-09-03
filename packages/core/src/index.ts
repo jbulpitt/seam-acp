@@ -130,27 +130,6 @@ async function main(): Promise<void> {
   });
   const modelMetadataStore = new ModelMetadataStore(seamDbPath);
   const artificialAnalysis = new ArtificialAnalysisMetadataSource(config.AA_API_KEY);
-  // #137: old `running` rows are not resumable work — terminalize them before
-  // the ordinary #75 boot pass converts fresh crash leftovers to `interrupted`.
-  // The same cutoff is swept periodically so a hung live process self-cleans.
-  const delegationReconciler = new DelegationReconciler({
-    store,
-    logger,
-    maxAgeMs: config.SEAM_TURN_RESUME_MAX_AGE_SECONDS * 1000,
-  });
-  delegationReconciler.reconcile();
-  // #75: crash leftovers stay `dispatched`/`running` forever unless we flip
-  // them here. Target / correlation / acp_session_id are preserved for resume.
-  // Does not delete isolated ACP sessions — #76 decides whether to reattach.
-  const orphaned = store.reconcileOrphanedDelegations();
-  if (orphaned > 0) {
-    logger.warn(
-      { count: orphaned },
-      "reconciled orphaned delegation ledger rows as interrupted"
-    );
-  }
-  delegationReconciler.start();
-
   const { servers: mcpServers } = buildGlobalMcpServers(logger, {
     dataDir: config.DATA_DIR,
   });
@@ -990,11 +969,9 @@ async function main(): Promise<void> {
   // enqueues is picked up by the very first tick. The worker is never
   // re-executed; its output is read off disk.
   //
-  // The #75 orphan pass has already run far above, so these rows arrive here
-  // as `interrupted` — which this treats as NON-terminal on purpose. An
-  // `interrupted` row that has a done-file did not fail; its completion was
-  // simply never recorded, and that is precisely the state to repair. Rows
-  // with no done-file keep the existing interrupted/Resume behaviour.
+  // This deliberately runs BEFORE the #137 stale and #75 orphan passes below.
+  // A done-backed row is a completed turn awaiting side effects, not stale
+  // work to abandon or interrupted work to resume.
   try {
     const repaired = await reconcileCompletedDoneFiles({
       dataDir: config.DATA_DIR,
@@ -1008,6 +985,24 @@ async function main(): Promise<void> {
   } catch (err) {
     logger.warn({ err }, "done-file completion reconciliation failed");
   }
+  // Only after done-backed completions have replayed may stale/orphan logic
+  // terminalize remaining rows. Reversing this order destroys the evidence:
+  // an old running row with a valid done-file becomes `abandoned`, and the
+  // completion scan then (correctly) skips it as terminal.
+  const delegationReconciler = new DelegationReconciler({
+    store,
+    logger,
+    maxAgeMs: config.SEAM_TURN_RESUME_MAX_AGE_SECONDS * 1000,
+  });
+  delegationReconciler.reconcile();
+  const orphaned = store.reconcileOrphanedDelegations();
+  if (orphaned > 0) {
+    logger.warn(
+      { count: orphaned },
+      "reconciled orphaned delegation ledger rows as interrupted"
+    );
+  }
+  delegationReconciler.start();
   // Only now may durable specs run: Thread Voice verification, settlement,
   // lease reconciliation, and recovery bookkeeping are all installed first.
   await dispatchWatcher.start();
@@ -1295,6 +1290,21 @@ async function main(): Promise<void> {
     ]);
     verdicts.push({ stage: "seam-mcp-ingress", drained: mcpDrained });
     verdicts.push({ stage: "health-ingress", drained: healthDrained });
+    // Drain manager callbacks only after already-admitted HTTP work has
+    // finished. An admitted run-now request can enter a manager after the
+    // synchronous stop() calls above; draining first would miss that late
+    // callback and permit it to reach the store during teardown.
+    verdicts.push({
+      stage: "manager-callbacks",
+      drained: await bounded("manager callbacks", config.SHUTDOWN_QUIESCE_TIMEOUT_MS, async () => {
+        await Promise.all([
+          scheduledManager.drain(),
+          wakeManager.drain(),
+          watchManager.drain(),
+          parkedManager.drain(),
+        ]);
+      }),
+    });
     // #174 phase 1: quiesce BEFORE anything is torn down. `dispatchWatcher.stop()`
     // only closes intake; `quiesce()` is the barrier that waits for claimed
     // dispatches, active channel turns, and post-turn continuations to settle
@@ -1321,7 +1331,10 @@ async function main(): Promise<void> {
       ),
     });
     voiceConsoleManager.shutdown();
-    liveHelpManager.stopAll();
+    verdicts.push({
+      stage: "live-help-shutdown",
+      drained: await bounded("live help shutdown", 5000, () => liveHelpManager.stopAll()),
+    });
     stopPresetsWatch?.();
     // Connection close only — admission and request draining already happened
     // above. Bounded: `server.close()` waits on open connections, so awaiting

@@ -9,7 +9,7 @@ const STATE_FILE = "agent-quota-card.json";
 const DEBOUNCE_MS = 500;
 const COLOR_OK = 0x57f287;
 const COLOR_WARN = 0xfaa61a;
-const HIDDEN_AGENT_IDS = new Set(["claude-vertex", "opencode"]);
+const HIDDEN_AGENT_IDS = new Set(["claude-vertex"]);
 export const AGENT_QUOTA_BUMP_AFTER_MS = 20 * 60 * 60_000;
 
 /** Custom id for the manual "Refresh" button; routed to the orchestrator's

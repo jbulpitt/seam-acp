@@ -8,6 +8,7 @@ import { makeSessionId } from "./session-store.js";
 import { resolveChannelPreset, resolveThreadLocation } from "../config.js";
 import type { ChannelPreset, ThreadPreset } from "../config.js";
 import { buildProjectMcpServers } from "../mcp.js";
+import { retiredAgentMessage } from "./retired-agents.js";
 
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
 import type {
@@ -761,8 +762,11 @@ export class SessionRouter {
     const agentId = preset.agent?.value ?? record.agentId;
     const profile = this.profileById.get(agentId);
     if (!profile) {
+      // #12: a retired agent gets a message that names the retirement and the
+      // fix. We deliberately do NOT substitute the default agent — that would
+      // silently run this thread's prompts on a model nobody chose.
       throw new Error(
-        `Unknown agent profile "${agentId}" for session ${record.id}`
+        retiredAgentMessage(agentId) ?? `Unknown agent profile "${agentId}" for session ${record.id}`
       );
     }
     const cfg = this.store.readConfig(record);

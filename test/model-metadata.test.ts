@@ -112,7 +112,7 @@ const catalog: AgentModelAvailability[] = [
     vision: null,
   },
   {
-    agentId: "opencode",
+    agentId: "grok",
     modelId: "local-future-model",
     name: "Local Future Model",
     contextWindow: null,
@@ -184,7 +184,7 @@ describe("model metadata source and catalog", () => {
       intelligence_index: null,
       pricing: null,
       benchmarks: {},
-      agents: ["opencode"],
+      agents: ["grok"],
     });
     expect(snapshot.unmatchedModels).toEqual(["local-future-model"]);
   });

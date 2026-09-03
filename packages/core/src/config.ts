@@ -497,50 +497,11 @@ const Schema = z.object({
   /** Model used for /compact on Ollama Cloud sessions. */
   OLLAMA_CLOUD_COMPACTION_MODEL: z.string().default("glm-5.3:cloud"),
 
-  /**
-   * Register the "LM Studio 🦙" agent: opencode (sst/opencode, `opencode acp`) —
-   * a provider-agnostic ACP agent pointed at a local/remote LM Studio via
-   * opencode's own config (~/.config/opencode/opencode.json: an
-   * @ai-sdk/openai-compatible provider with the LM Studio /v1 baseURL + bearer
-   * token). ACP-native + local-model-native, no Anthropic translation proxy.
-   * false → not registered.
-   */
-  OPENCODE_ENABLED: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((v) => v === "true"),
-  /** Path to the opencode binary. Defaults to `opencode` on PATH. */
-  OPENCODE_CLI_PATH: z.string().optional(),
-  /** Default opencode model id (opencode form, e.g.
-   *  "lmstudio-remote/google/gemma-4-26b-a4b"). */
-  OPENCODE_DEFAULT_MODEL: z.string().default("lmstudio-remote/google/gemma-4-26b-a4b"),
-  /** Root URL of the LM Studio server. Used both to DISCOVER the live model list
-   *  (`/api/v0/models`) at startup — so the picker isn't hardcoded — and as the
-   *  opencode provider baseURL (`<url>/v1`). Unset → no discovery / sync (only the
-   *  default model is usable). e.g. "https://llm.jessebulpitt.com". */
-  OPENCODE_LMSTUDIO_URL: z.string().optional(),
-  /** Bearer token for the LM Studio endpoint (it requires auth behind the
-   *  tunnel). Used for discovery and written into the opencode provider config. */
-  OPENCODE_LMSTUDIO_API_KEY: z.string().default(""),
-  /** opencode provider name — the key under `provider` in opencode's config, and
-   *  the prefix on each discovered model id. Must NOT collide with a models.dev
-   *  built-in provider (e.g. `lmstudio`), or opencode uses that curated list
-   *  instead of the live one — hence `lmstudio-remote`. */
-  OPENCODE_MODEL_PREFIX: z.string().default("lmstudio-remote"),
-  /** Path to opencode's global config that seam-acp keeps the provider block in
-   *  sync in. Defaults to `${XDG_CONFIG_HOME:-~/.config}/opencode/opencode.json`. */
-  OPENCODE_CONFIG_PATH: z.string().optional(),
-  /** Add a free, no-API-key DuckDuckGo web-search MCP (`@oevortex/ddg_search`, run
-   *  via `npx -y`) to the opencode agent's config, so local models get a search tool
-   *  (opencode ships `webfetch` but no search). false → not added. */
-  OPENCODE_DDG_SEARCH: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((v) => v === "true"),
-  /** Tavily hosted MCP URL (the API key is a query param) for web search. When set,
-   *  seam-acp adds it to opencode's `mcp` block so the agent gets Tavily's
-   *  LLM-optimized search tools. e.g. `https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-…` */
-  OPENCODE_TAVILY_URL: z.string().optional(),
+  // #12: the opencode / LM Studio agent was RETIRED. Its OPENCODE_* keys are
+  // gone from this schema. Zod's default object behaviour strips unknown env
+  // vars, so a deployment whose .env still sets them boots unchanged — the
+  // leftovers are inert, not an error. See core/retired-agents.ts.
+
 
   TURN_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(604800).default(900),
   /** Maximum graceful restart drain. On expiry the existing force-restart path

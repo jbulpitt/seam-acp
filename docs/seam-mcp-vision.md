@@ -36,7 +36,7 @@ single-process, single-model, opaque, and ephemeral. seam-MCP's "sub-agents" are
 Discord threads:
 
 - **Heterogeneous** — any agent/model per node (Claude, Sonnet, Gemini/agy,
-  local via opencode, Copilot).
+  Codex, Grok, Copilot).
 - **Observable** — every worker is a thread you read live; no black box.
 - **Steerable** — you can post into any node mid-run (validated: a message during
   a `Monitoring` node is absorbed without losing the node's task).
@@ -86,7 +86,7 @@ needs both as modes of the same `injectTurn`.
 ## 3. The layering & the boundary contract (the decision that matters)
 
 ```
-        agents (Claude / opencode / Copilot / agy …)
+        agents (Claude / Codex / Copilot / agy …)
               │  call MCP tools   │  emit fence-directives (universal fallback)
               ▼                   ▼
         ┌─────────────────────────────────────────────┐
@@ -207,7 +207,7 @@ calls. This is the single highest-leverage decision and the one most entangled
 with the wake mechanics.
 
 **5.2 Interface: layer MCP *and* fence — don't choose.**
-Per [durable-jobs §6](./durable-jobs-plan.md), MCP tools reach Claude + opencode +
+Per [durable-jobs §6](./durable-jobs-plan.md), MCP tools reach Claude + Codex +
 Copilot but **not agy** (no MCP). The fence-directive / file-spec / prompt-inject
 path is universal.
 → **Recommendation:** seam-MCP is the runtime; **MCP tools are the rich interface**

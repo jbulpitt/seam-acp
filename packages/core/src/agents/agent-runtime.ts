@@ -460,10 +460,10 @@ export class AgentRuntime {
 
     // Apply model override after session creation if requested and supported.
     const wantedModel = opts.model ?? this.profile.defaultModel;
-    // Do NOT require `currentModelId` here: opencode's session/new (and loadSession)
-    // returns no `models`, so currentModelId is undefined — gating on it skipped
-    // set_model entirely and left opencode on its built-in default (`big-pickle`,
-    // no vision). `wantedModel !== undefined` is true, so we (re)apply; if it
+    // Do NOT require `currentModelId` here: some ACP agents' session/new (and
+    // loadSession) returns no `models`, so currentModelId is undefined — gating
+    // on it would skip set_model entirely and leave the agent on its own built-in
+    // default. `wantedModel !== undefined` is true, so we (re)apply; if it
     // already matches the reported current model we still skip the redundant call.
     if (wantedModel && wantedModel !== this.sessionInfo.currentModelId) {
       const isExplicit = opts.model !== undefined;
@@ -534,10 +534,10 @@ export class AgentRuntime {
     // to whatever is in settings.json (typically the default model, not the
     // per-session override the user selected).
     const wantedModel = opts.model ?? this.profile.defaultModel;
-    // Do NOT require `currentModelId` here: opencode's session/new (and loadSession)
-    // returns no `models`, so currentModelId is undefined — gating on it skipped
-    // set_model entirely and left opencode on its built-in default (`big-pickle`,
-    // no vision). `wantedModel !== undefined` is true, so we (re)apply; if it
+    // Do NOT require `currentModelId` here: some ACP agents' session/new (and
+    // loadSession) returns no `models`, so currentModelId is undefined — gating
+    // on it would skip set_model entirely and leave the agent on its own built-in
+    // default. `wantedModel !== undefined` is true, so we (re)apply; if it
     // already matches the reported current model we still skip the redundant call.
     if (wantedModel && wantedModel !== this.sessionInfo.currentModelId) {
       const isExplicit = opts.model !== undefined;
@@ -1180,8 +1180,8 @@ export class AgentRuntime {
       | undefined
   ): ReadonlyArray<AvailableModel> {
     // Profile-declared static models win: they carry the picker labels and
-    // contextLimit the agent doesn't advertise (Claude/Copilot pickers,
-    // opencode discovery).
+    // contextLimit the agent doesn't advertise (e.g. the Claude/Copilot
+    // pickers).
     if (this.profile.staticModels && this.profile.staticModels.length > 0) {
       return this.profile.staticModels;
     }

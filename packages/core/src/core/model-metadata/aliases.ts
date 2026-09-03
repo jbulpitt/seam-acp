@@ -93,11 +93,6 @@ export const MODEL_METADATA_ALIASES: Readonly<Record<string, ModelAlias>> = {
   "deepseek-v4-pro": { aaSlugPrefixes: ["deepseek-v4-pro"], pricingNames: [], modelIds: ["deepseek-v4-pro:cloud"] },
   "deepseek-v4-flash": { aaSlugPrefixes: ["deepseek-v4-flash"], pricingNames: [], modelIds: ["deepseek-v4-flash:cloud"] },
   "minimax-m3": { aaSlugPrefixes: ["minimax-m3"], pricingNames: [], modelIds: ["minimax-m3:cloud"] },
-  "gemma-4-26b-a4b": {
-    aaSlugPrefixes: ["gemma-4-26b-a4b"],
-    pricingNames: [],
-    modelIds: ["lmstudio-remote/google/gemma-4-26b-a4b"],
-  },
   "raptor-mini": { aaSlugPrefixes: [], pricingNames: ["Raptor mini"] },
   "mai-code-1.1-flash": { aaSlugPrefixes: [], pricingNames: ["MAI-Code 1.1 Flash"] },
   "mai-code-1-flash-picker": { aaSlugPrefixes: [], pricingNames: ["MAI-Code 1 Flash"] },

@@ -12,7 +12,6 @@ import { SessionRouter } from "./core/session-router.js";
 import { makeCopilotProfile } from "@seam/adapters";
 import { makeClaudeProfile } from "@seam/adapters";
 import { makeAgyProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
-import { makeOpencodeProfile, fetchLmStudioModels, syncOpencodeLmStudioConfig } from "@seam/adapters";
 import { makeCodexProfile } from "@seam/adapters";
 import { buildOllamaCodexCatalog } from "./agents/ollama-codex-catalog.js";
 import { makeGrokProfile, fetchXaiModels } from "@seam/adapters";
@@ -348,84 +347,6 @@ async function main(): Promise<void> {
       })
     : undefined;
 
-  // Optional "LM Studio 🦙" agent: opencode (sst/opencode) over ACP, pointed at a
-  // local/remote LM Studio via opencode's own config. Provider-agnostic, so it
-  // drives local models natively — no Anthropic proxy. The model list is
-  // discovered live from LM Studio's /api/v0/models at startup (no hardcoding),
-  // and seam-acp writes the matching `models` block into opencode's config —
-  // opencode does NOT auto-discover custom providers, so the declared list must
-  // track what the server serves. Only registered when OPENCODE_ENABLED.
-  let opencodeModels: Array<{ modelId: string; name: string; contextLimit?: number }> | undefined;
-  let opencodeDefaultModel = config.OPENCODE_DEFAULT_MODEL;
-  if (config.OPENCODE_ENABLED && config.OPENCODE_LMSTUDIO_URL) {
-    const discovered = await fetchLmStudioModels(
-      config.OPENCODE_LMSTUDIO_URL,
-      config.OPENCODE_LMSTUDIO_API_KEY || undefined,
-      config.OPENCODE_MODEL_PREFIX,
-    ).catch((err) => {
-      logger.warn({ err }, "opencode: LM Studio model discovery failed; picker empty until reachable");
-      return [];
-    });
-    if (discovered.length > 0) {
-      const opencodeConfigPath =
-        config.OPENCODE_CONFIG_PATH ||
-        path.join(
-          process.env.XDG_CONFIG_HOME || path.join(process.env.HOME ?? "", ".config"),
-          "opencode",
-          "opencode.json",
-        );
-      // Pick a real, loaded default so opencode never falls back to its built-in
-      // `big-pickle` (no vision): the configured default if it's actually loaded,
-      // else the first discovered model.
-      opencodeDefaultModel =
-        discovered.find((m) => m.modelId === config.OPENCODE_DEFAULT_MODEL)?.modelId ??
-        discovered[0]!.modelId;
-      // Web-search MCP(s) for the agent. seam-acp manages these keys, reconciling on
-      // each sync (disabling a source removes its entry).
-      const opencodeMcp: Record<string, unknown> = {};
-      if (config.OPENCODE_DDG_SEARCH) {
-        opencodeMcp["ddg-search"] = {
-          type: "local",
-          command: ["npx", "-y", "@oevortex/ddg_search"],
-          enabled: true,
-          timeout: 20000,
-        };
-      }
-      if (config.OPENCODE_TAVILY_URL) {
-        opencodeMcp["tavily"] = { type: "remote", url: config.OPENCODE_TAVILY_URL, enabled: true };
-      }
-      await syncOpencodeLmStudioConfig({
-        configPath: opencodeConfigPath,
-        providerKey: config.OPENCODE_MODEL_PREFIX,
-        baseURL: config.OPENCODE_LMSTUDIO_URL.replace(/\/+$/, "") + "/v1",
-        ...(config.OPENCODE_LMSTUDIO_API_KEY ? { apiKey: config.OPENCODE_LMSTUDIO_API_KEY } : {}),
-        defaultModel: opencodeDefaultModel,
-        mcp: opencodeMcp,
-        mcpManagedKeys: ["ddg-search", "tavily"],
-        models: discovered.map((m) => ({
-          rawId: m.rawId,
-          ...(m.attachment ? { attachment: true } : {}),
-          ...(m.toolCall ? { toolCall: true } : {}),
-          ...(m.reasoning ? { reasoning: true } : {}),
-        })),
-      }).catch((err) => logger.warn({ err }, "opencode: config sync failed"));
-      opencodeModels = discovered.map(({ modelId, name, contextLimit }) => ({
-        modelId,
-        name,
-        ...(contextLimit ? { contextLimit } : {}),
-      }));
-    }
-    logger.info({ count: discovered.length }, "opencode: discovered LM Studio models");
-  }
-  const ollama = config.OPENCODE_ENABLED
-    ? makeOpencodeProfile({
-        id: "opencode",
-        displayName: "LM Studio 🔮",
-        ...(config.OPENCODE_CLI_PATH ? { cliPath: config.OPENCODE_CLI_PATH } : {}),
-        defaultModel: opencodeDefaultModel,
-        ...(opencodeModels && opencodeModels.length > 0 ? { staticModels: opencodeModels } : {}),
-      })
-    : undefined;
 
   // Agent-facing seam-MCP surface (#24). The shared HTTP server binds its port
   // later (after the adapter is up), so the router gets the token registry now
@@ -439,7 +360,7 @@ async function main(): Promise<void> {
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : []), ...(ollama ? [ollama] : [])],
+    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])],
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".

@@ -1551,7 +1551,7 @@ export class Orchestrator {
     const cachedUsage = cfg.lastContextUsage;
     const activeModel = described.model.value;
     // Authoritative per-model window when seam-acp knows it (staticModels
-    // contextLimit — e.g. opencode/Ollama, discovered from /api/show). Some
+    // contextLimit — e.g. Ollama, discovered from /api/show). Some
     // agents report a generic default (~200K) in usage_update regardless of the
     // real window; use this as a FLOOR so the panel shows the true size.
     // Look up the authoritative context window from static models.  When
@@ -2123,7 +2123,7 @@ export class Orchestrator {
             // authoritative); it never legitimately shrinks (compaction changes
             // `used`, not `size`; model switches clear the cache between turns).
             // `modelContextFloor` overrides an agent's generic default (e.g.
-            // opencode reporting 200K for a 256K gemma model).
+            // an agent reporting 200K for a model with a 256K window).
             const size = Math.max(event.size, modelContextFloor, status.contextWindowSize);
             status.contextWindowSize = size;
             status.context = formatContextUsage(used, size);

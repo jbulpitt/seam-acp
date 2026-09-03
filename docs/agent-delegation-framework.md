@@ -27,7 +27,7 @@ harness for fully automated, cross-agent, cross-model workflows.
 ## 1. Why this matters
 
 **Cost and model routing.** Each Discord thread can run a different agent profile (Claude
-Opus, Sonnet, a local model via LM Studio, Gemini, Copilot). Delegation lets you route
+Opus, Sonnet, Codex, Grok, Ollama Cloud, Copilot). Delegation lets you route
 cheap work (triage, formatting, boilerplate) to cheap models and expensive work (complex
 reasoning, large refactors) to capable ones — automatically, within a single workflow.
 

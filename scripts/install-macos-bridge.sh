@@ -405,7 +405,6 @@ investigate() {
   info "  claude-agent-acp:$(agent_path claude-agent-acp)"
   info "  copilot:         $(agent_path copilot)"
   info "  agy:             $(agent_path agy)"
-  info "  opencode:        $(agent_path opencode)"
   info "  codex-acp:       $(agent_path codex-acp)"
 }
 

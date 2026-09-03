@@ -1,7 +1,7 @@
 /**
  * Agent-instructions layer: standing conventions seam-acp teaches the agent on
  * every user turn. This is the shared place to add operating rules the agent
- * must follow regardless of which backend it is (Claude, opencode, agy, remote);
+ * must follow regardless of which backend it is (Claude, codex, agy, remote);
  * each new convention is one bullet here.
  *
  * Delivery is a per-turn preamble prepended to the user's message (see

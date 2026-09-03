@@ -201,8 +201,8 @@ export interface AgentAdapter {
 
   /**
    * Idempotent startup / pre-spawn hooks (reconciliation, §4.1). Local
-   * agents return an empty list — existing startup (e.g. opencode's
-   * LM-Studio config sync in `index.ts`) stays where it is.
+   * agents return an empty list — whatever startup work they need stays
+   * where it already lives in `index.ts`.
    */
   prepare(): PrepareStep[];
 

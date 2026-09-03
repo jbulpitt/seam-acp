@@ -1,13 +1,28 @@
 import { describe, it, expect } from "vitest";
+import { spawn } from "node:child_process";
 import {
   AGENT_ADAPTER_VERSION,
+  asLocalAdapter,
   makeAgyProfile,
   makeClaudeProfile,
   makeCodexProfile,
   makeCopilotProfile,
   makeGrokProfile,
-  makeOpencodeProfile,
 } from "@seam/adapters";
+
+/** A bare local adapter: no sessionManager, no effort, no staticModels.
+ *  #12 retired opencode, which used to be the stand-in for this shape — but the
+ *  contract it exercised (asLocalAdapter's defaults) is generic, so build the
+ *  minimal profile directly rather than borrowing whichever agent happens to
+ *  lack a session manager. */
+const bareProfile = (defaultModel: string) =>
+  asLocalAdapter({
+    id: "bare",
+    displayName: "bare",
+    defaultModel,
+    effort: { mechanism: "none", levels: [] },
+    spawn: () => spawn("true", [], { stdio: ["pipe", "pipe", "pipe"] }),
+  });
 
 describe("AgentAdapter.describe()", () => {
   it("uses the current adapter contract version", () => {
@@ -78,12 +93,10 @@ describe("AgentAdapter.describe()", () => {
     expect(d.effort.levels).toEqual([]);
   });
 
-  it("opencode reports none by default and falls back to defaultModel", () => {
-    const d = makeOpencodeProfile({ defaultModel: "lmstudio-remote/gemma" }).describe();
+  it("a bare local adapter reports none and falls back to defaultModel", () => {
+    const d = bareProfile("some-model").describe();
     expect(d.effort.mechanism).toBe("none");
-    expect(d.models).toEqual([
-      { modelId: "lmstudio-remote/gemma", name: "lmstudio-remote/gemma" },
-    ]);
+    expect(d.models).toEqual([{ modelId: "some-model", name: "some-model" }]);
   });
 
   it("codex reports configOption + reasoning_effort", () => {
@@ -115,10 +128,8 @@ describe("AgentAdapter local stubs + session delegates", () => {
     await expect(grok.writeAttachment("/tmp", "x.txt", "Zg==")).resolves.toBeNull();
   });
 
-  it("usage() is null without sessionManager.getUsage (opencode)", async () => {
-    await expect(
-      makeOpencodeProfile({ defaultModel: "x" }).usage("/tmp")
-    ).resolves.toBeNull();
+  it("usage() is null without sessionManager.getUsage", async () => {
+    await expect(bareProfile("x").usage("/tmp")).resolves.toBeNull();
   });
 
   it("codex usage() delegates to sessionManager even when the sessions dir is empty", async () => {
@@ -130,7 +141,7 @@ describe("AgentAdapter local stubs + session delegates", () => {
   });
 
   it("session verbs no-op when there is no sessionManager", async () => {
-    const p = makeOpencodeProfile({ defaultModel: "x" });
+    const p = bareProfile("x");
     await expect(p.listSessions("/tmp")).resolves.toEqual([]);
     await expect(p.getTranscript("/tmp", "s")).resolves.toBe("");
     await expect(p.cloneSession("/tmp", "a", "b")).resolves.toBeUndefined();

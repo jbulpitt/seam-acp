@@ -794,8 +794,8 @@ describe("SeamMcpServer", () => {
         fetchedAt: 1_999_999_000,
       },
       {
-        agentId: "opencode",
-        displayName: "OpenCode",
+        agentId: "grok",
+        displayName: "Grok",
         ok: true,
         plan: "unlimited",
         rolling: { usedPercent: 0, resetsAt: null, label: "unlimited" },
@@ -819,7 +819,7 @@ describe("SeamMcpServer", () => {
       "claude",
       "codex",
       "claude-vertex",
-      "opencode",
+      "grok",
     ]);
     const one = await h.call(
       "tools/call",

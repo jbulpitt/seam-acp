@@ -289,7 +289,7 @@ AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agen
 - **`src/platforms/chat-adapter.ts`** — generic chat platform interface.
 - **`src/platforms/discord/`** — discord.js v14 implementation + slash commands + repo picker.
 - **`src/agents/agent-runtime.ts`** — wraps `@agentclientprotocol/sdk` + a child process running an ACP server. Handles `initialize`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, model / mode / config option setters, and emits typed events.
-- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Sibling profiles: `agy.ts` (Google Antigravity CLI, in-process ACP bridge), `claude.ts` (Anthropic Claude Code, via the `claude-agent-acp` adapter), `opencode.ts` (LM Studio local models via opencode). Add a new profile by writing one of these.
+- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Sibling profiles: `agy.ts` (Google Antigravity CLI, in-process ACP bridge), `claude.ts` (Anthropic Claude Code, via the `claude-agent-acp` adapter), `codex.ts` (OpenAI Codex via `codex-acp`). Add a new profile by writing one of these.
 - **`src/core/`** — pure utilities: text chunker, path safety, sqlite store, session router, status panel.
 
 ## Testing

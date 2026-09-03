@@ -151,9 +151,9 @@ export interface DispatchResult {
    * Such a file is NOT ignored — an earlier version of this comment claimed it
    * was, which stopped being true once reconciliation started reading the
    * ledger. It is judged by the ledger row's `kind` instead: kinds that owe
-   * nothing onward terminalize, a `forward` recovers its chain from
-   * `correlationId`, and a plain `handoff` whose `returnTo` is unrecoverable is
-   * left non-terminal rather than silently marked done. See `completionRoute`.
+   * nothing onward terminalize, while delivery-bearing kinds without an
+   * explicit `returnTo` or `chainId` stay non-terminal rather than being routed
+   * by guesswork. See `completionRoute`.
    */
   returnTo?: string;
   chainId?: string;

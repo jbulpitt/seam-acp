@@ -718,18 +718,17 @@ describe("#174 boot done-file reconciliation", () => {
     expect(needsCompletionReplay({ returnTo: "p" }, { status: "parked" })).toBe(true);
   });
 
-  it("reconstructs a legacy forward's chain from its correlationId", async () => {
-    // By contract a forward's correlationId IS its chain id, so a pre-#174
-    // done-file with no routing still advances its chain instead of being
-    // written off as unprovable.
+  it("does not guess a legacy forward's route from correlationId", async () => {
+    // `kind: forward` is shared by plain forwards and chain hops. A plain
+    // forward uses its dispatch id as correlationId, so that field alone does
+    // not prove a chain and must never be used to terminalize the row.
     expect(
       completionRoute({} as never, {
         status: "interrupted",
         kind: "forward",
         correlationId: "chain-7",
       })
-    ).toEqual({ action: "chain", chainId: "chain-7" });
-    // Only a forward with no correlationId at all is unprovable.
+    ).toEqual({ action: "skip", reason: "delivery-unprovable" });
     expect(completionRoute({} as never, { status: "interrupted", kind: "forward" })).toEqual({
       action: "skip",
       reason: "delivery-unprovable",
@@ -1332,7 +1331,7 @@ describe("#174 replay matches the LIVE dispatch contract, not just the fields", 
     }
   );
 
-  it("a LEGACY handoff with no routing is left alone, not silently terminalized", async () => {
+  it("a LEGACY forward with no routing is left alone, not silently terminalized", async () => {
     // Written before #174 carried routing: it cannot prove its report-back was
     // ever enqueued. Terminalizing would strand the answer permanently and
     // silently; leaving it non-terminal is merely a rerun offer, which is the
@@ -1349,7 +1348,7 @@ describe("#174 replay matches the LIVE dispatch contract, not just the fields", 
     const summary = await reconcileCompletedDoneFiles({
       dataDir,
       logger: silent,
-      getDelegation: () => ({ status: "interrupted", kind: "handoff" }),
+      getDelegation: () => ({ status: "interrupted", kind: "forward", correlationId: "legacy-h" }),
       replay,
     });
     expect(replay).not.toHaveBeenCalled();
@@ -1357,14 +1356,14 @@ describe("#174 replay matches the LIVE dispatch contract, not just the fields", 
     expect(summary.skippedUnprovable).toBe(1);
   });
 
-  it("a forward WITH a correlationId is provable; without one it is not", () => {
+  it("a forward's correlationId does not prove whether it is a chain hop", () => {
     expect(
       completionRoute({ kind: "forward" } as never, {
         status: "interrupted",
         kind: "forward",
         correlationId: "chain-9",
       })
-    ).toEqual({ action: "chain", chainId: "chain-9" });
+    ).toEqual({ action: "skip", reason: "delivery-unprovable" });
     expect(
       completionRoute({ kind: "forward" } as never, { status: "interrupted", kind: "forward" })
     ).toEqual({ action: "skip", reason: "delivery-unprovable" });
@@ -2762,18 +2761,14 @@ describe("#174 the health server survives a handler that throws synchronously", 
 });
 
 // ---------------------------------------------------------------------------
-// 17. A reconstructed route must actually be USED (legacy forward chain)
+// 17. An explicit route must actually be used
 // ---------------------------------------------------------------------------
 
 /**
- * `completionRoute` can reconstruct routing a legacy done-file never carried:
- * a pre-#174 `forward` recovers its chain id from the ledger row's
- * correlationId. That reconstruction is worthless unless the replay reads it —
- * and it did not. It rebuilt the spec from `result.chainId`, which for a legacy
- * file is `undefined`, so `advanceChain` hit its own `if (!chainId) return`
- * guard, did nothing, and the row was terminalized regardless: the chain
- * stopped dead with no next hop and no final delivery, and the terminal row
- * meant the next boot skipped the done-file entirely.
+ * `completionRoute` accepts only routing carried explicitly in the done-file.
+ * Replay must then use the route's address rather than independently infer one,
+ * or a future classifier change could again terminalize a row without sending
+ * its report-back or advancing its chain.
  *
  * These tests deliberately assert the ENQUEUED SPEC, not that a stub was
  * called: classifying the route correctly is exactly what the broken version
@@ -2840,19 +2835,18 @@ async function pendingSpecs(): Promise<Record<string, unknown>[]> {
   );
 }
 
-describe("#174 a legacy forward's reconstructed chain is actually advanced", () => {
-  it("enqueues the NEXT HOP, not just a correctly-classified route", async () => {
+describe("#174 a routed forward is actually delivered or advanced", () => {
+  it("a modern chain hop enqueues the NEXT HOP", async () => {
     const store = makeChainStore();
-    // A pre-#174 done-file: no `kind`, no `chainId`, no `returnTo`.
-    const legacyDone = {
+    const chainDone = {
       id: "legacy-fwd",
       target: "worker-a",
       status: "completed" as const,
       output: "HOP ONE OUTPUT",
+      kind: "forward" as const,
+      chainId: "chain-legacy",
     };
-    expect(legacyDone).not.toHaveProperty("chainId"); // the whole premise
 
-    // The row carries the only surviving evidence: correlationId IS the chain.
     store.rows.set("legacy-fwd", {
       id: "legacy-fwd",
       kind: "forward",
@@ -2869,11 +2863,10 @@ describe("#174 a legacy forward's reconstructed chain is actually advanced", () 
     });
 
     const row = { status: "interrupted", kind: "forward", correlationId: "chain-legacy" };
-    const route = completionRoute(legacyDone as never, row);
-    // Routing alone was never the bug — this passed before the fix too.
+    const route = completionRoute(chainDone as never, row);
     expect(route).toEqual({ action: "chain", chainId: "chain-legacy" });
 
-    await makeChainReplayHost(store).replayCompletedDispatch(legacyDone, route);
+    await makeChainReplayHost(store).replayCompletedDispatch(chainDone, route);
 
     // THE ASSERTION THAT FAILED BEFORE: the next hop is really on disk.
     // A named (preset) hop runs isolated and posts into the chain's origin, so
@@ -2898,13 +2891,15 @@ describe("#174 a legacy forward's reconstructed chain is actually advanced", () 
     expect(store.rows.get("legacy-fwd")!.status).toBe("completed");
   });
 
-  it("delivers the FINAL output to the origin when no hops remain", async () => {
+  it("a modern final chain hop delivers output to the origin", async () => {
     const store = makeChainStore();
-    const legacyDone = {
+    const chainDone = {
       id: "legacy-last",
       target: "worker-z",
       status: "completed" as const,
       output: "THE FINAL ANSWER",
+      kind: "forward" as const,
+      chainId: "chain-final",
     };
     store.rows.set("legacy-last", {
       id: "legacy-last",
@@ -2921,12 +2916,12 @@ describe("#174 a legacy forward's reconstructed chain is actually advanced", () 
       promptPreview: "the original chain ask",
     });
 
-    const route = completionRoute(legacyDone as never, {
+    const route = completionRoute(chainDone as never, {
       status: "interrupted",
       kind: "forward",
       correlationId: "chain-final",
     });
-    await makeChainReplayHost(store).replayCompletedDispatch(legacyDone, route);
+    await makeChainReplayHost(store).replayCompletedDispatch(chainDone, route);
 
     const delivery = (await pendingSpecs()).find((s) => s.target === "origin-thread");
     expect(delivery).toBeDefined();
@@ -3001,8 +2996,8 @@ describe("#174 a legacy forward's reconstructed chain is actually advanced", () 
     });
   });
 
-  it("replaying the same legacy forward twice advances the chain once", async () => {
-    // The reconstructed id must not defeat the #77 hop claim: idempotence is
+  it("replaying the same modern chain hop twice advances the chain once", async () => {
+    // The explicit id must not defeat the #77 hop claim: idempotence is
     // what makes boot reconciliation safe to run on every start.
     const store = makeChainStore();
     store.rows.set("legacy-idem", {
@@ -3023,6 +3018,8 @@ describe("#174 a legacy forward's reconstructed chain is actually advanced", () 
       target: "worker-a",
       status: "completed" as const,
       output: "HOP ONE OUTPUT",
+      kind: "forward" as const,
+      chainId: "chain-idem",
     };
     const row = { status: "interrupted", kind: "forward", correlationId: "chain-idem" };
     const host = makeChainReplayHost(store);
@@ -3034,21 +3031,22 @@ describe("#174 a legacy forward's reconstructed chain is actually advanced", () 
     expect(store.chains.get("chain-idem")).toMatchObject({ hops: [], currentIndex: 1 });
   });
 
-  it("a report_back route's address likewise comes from the ROUTE", async () => {
+  it("a modern plain forward routes to its report-back address", async () => {
     // Same class of bug, other branch: the route is authoritative for the
     // onward address, so the two can never disagree.
     const store = makeChainStore();
-    store.rows.set("rb-route", { id: "rb-route", kind: "handoff", status: "interrupted" });
+    store.rows.set("rb-route", { id: "rb-route", kind: "forward", status: "interrupted" });
     const done = {
       id: "rb-route",
       target: "worker",
       status: "completed" as const,
       output: "THE ANSWER",
+      kind: "forward" as const,
       correlationId: "corr-route",
       returnTo: "parent-thread",
       originPrompt: "the ask",
     };
-    const route = completionRoute(done as never, { status: "interrupted", kind: "handoff" });
+    const route = completionRoute(done as never, { status: "interrupted", kind: "forward" });
     expect(route).toEqual({ action: "report_back", returnTo: "parent-thread" });
 
     await makeChainReplayHost(store).replayCompletedDispatch(done, route);

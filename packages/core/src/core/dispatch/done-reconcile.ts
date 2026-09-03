@@ -126,12 +126,9 @@ export function needsCompletionReplay(
  *   - otherwise a returnTo enqueues the report-back;
  *   - a kind that never delivers onward owes only the ledger row.
  *
- * A legacy `forward` needs no guesswork: by contract its `correlationId` IS its
- * chain id, so the chain advance is reconstructed straight off the ledger row.
- *
  * The remaining case is the dangerous one. A done-file with no routing and a
- * DELIVERY-BEARING kind — in practice a plain `handoff` — is a legacy file
- * written before #174 carried routing. It cannot prove its report-back was ever
+ * delivery-bearing kind was written before #174 carried routing. It cannot
+ * prove its report-back was ever
  * enqueued, and terminalizing it would strand the answer permanently and
  * silently. So it is left non-terminal: `/seam workflows` may offer a rerun,
  * which is the pre-existing behaviour and recoverable, unlike deletion.
@@ -148,11 +145,11 @@ export function completionRoute(
   const kind = result.kind ?? row.kind;
 
   if (kind && SELF_DELIVERING_KINDS.has(kind)) return { action: "terminalize" };
-  // A forward's correlationId is its chain id by contract, so a legacy forward
-  // recovers its chain advance from the row rather than being written off.
-  const chainId =
-    result.chainId ?? (kind === "forward" ? (row.correlationId ?? undefined) : undefined);
-  if (chainId) return { action: "chain", chainId };
+  // `kind: "forward"` is shared by chain hops and the plain MCP forward tool.
+  // Only an explicit `chainId` proves this completion belongs to a chain;
+  // `correlationId` is merely the dispatch id on a plain forward. Guessing from
+  // it can terminalize the worker row without delivering its report-back.
+  if (result.chainId) return { action: "chain", chainId: result.chainId };
   if (result.returnTo) return { action: "report_back", returnTo: result.returnTo };
   if (kind && NO_ONWARD_KINDS.has(kind)) return { action: "terminalize" };
   return { action: "skip", reason: "delivery-unprovable" };

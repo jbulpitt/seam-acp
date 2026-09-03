@@ -8084,14 +8084,10 @@ export class Orchestrator {
     const text = result.output ?? "";
     // The ROUTE is authoritative for the onward address, not the done-file.
     //
-    // `completionRoute` can RECONSTRUCT routing a legacy file never carried: a
-    // pre-#174 `forward` recovers its chain id from the ledger row's
-    // correlationId, which is its chain id by contract. Rebuilding the spec
-    // from `result` alone silently discarded that — `spec.chainId` stayed
-    // undefined, `advanceChain` returned at its own `if (!chainId)` guard, and
-    // then the row was terminalized anyway. The chain stopped dead at that hop
-    // with no next dispatch and no final delivery, and because the row WAS
-    // terminalized, the next boot skipped the done-file: unrecoverable, silent.
+    // Keeping the route authoritative prevents a classifier/replay mismatch:
+    // chain routes must carry their explicit chain id and report-back routes
+    // their explicit destination. Legacy delivery-bearing files that lack both
+    // are skipped before reaching this method rather than routed by guesswork.
     const routedChainId = route.action === "chain" ? route.chainId : result.chainId;
     const routedReturnTo = route.action === "report_back" ? route.returnTo : result.returnTo;
     // Rebuild only the fields the onward paths actually read.

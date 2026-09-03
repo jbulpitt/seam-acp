@@ -469,6 +469,10 @@ async function renderBuilderCard(existing?: ScheduledPrompt): Promise<RenderedCa
     },
     store: { readConfig: () => ({ model: null }) },
     logger: silent,
+    // #159: the builder's first response goes through `respondInitial` so it
+    // can also open on an interaction the list's Edit button already deferred.
+    // Use the real one — this mock's interaction is fresh, so it replies.
+    respondInitial: Orchestrator.prototype["respondInitial" as never],
     // #159 pairs every collector with a card lifecycle. This helper only
     // exercises the render path, so a no-op lifecycle is enough.
     attachListLifecycle: () => ({

@@ -5,11 +5,13 @@
  * or the operator is left holding two live-looking cards for one object. Two
  * things have to be true at once, and only a behavioural test can show both:
  *
- * 1. The button interaction is acknowledged **before** the (slower) freeze
- *    repaint lands. The freeze edits the original slash-command reply, which
- *    is a separate REST round trip; awaiting it would hold the button unacked
- *    inside Discord's 3s budget and, under rate-limit backoff, produce "This
- *    interaction failed" with no editor at all.
+ * 1. The button interaction is acknowledged before the freeze is even
+ *    *invoked* — not merely before it resolves. The freeze edits the original
+ *    slash-command reply, a separate REST request; queuing that ahead of the
+ *    ack risks the button's 3s budget under per-route backoff, producing
+ *    "This interaction failed" with no editor at all. The builder therefore
+ *    inherits an already-deferred interaction and must render through
+ *    `editReply` rather than replying or deferring a second time.
  * 2. Exactly one editor opens, because the freeze closes the collector
  *    synchronously — so a second click is never delivered.
  */
@@ -59,8 +61,9 @@ function makeListInteraction(events: string[]) {
       createMessageComponentCollector: () => collector,
     }),
     editReply: async (payload: Record<string, unknown>) => {
-      // The freeze repaint is a real round trip — model it as slower than the
-      // ack so an ack-after-paint regression is unmissable.
+      // Logged at entry: the gate is invocation order, so a freeze that merely
+      // *starts* before the ack must fail even though it resolves later.
+      events.push("list:freeze-invoked");
       await new Promise((resolve) => setTimeout(resolve, 20));
       events.push("list:freeze-painted");
       paints.push(payload);
@@ -69,22 +72,36 @@ function makeListInteraction(events: string[]) {
   return { interaction, collector, paints };
 }
 
-/** The Edit button click. Acking it is what opening the editor must do first. */
+/**
+ * The Edit button click, tracking `deferred`/`replied` the way discord.js does
+ * so a second reply/defer is observable rather than silently fine.
+ */
 function makeEditButton(customId: string, events: string[]) {
-  return {
+  const button = {
     isButton: () => true,
     customId,
     user: { id: "u1" },
-    reply: async () => {
-      events.push("editor:acked");
-    },
+    deferred: false,
+    replied: false,
     deferReply: async () => {
-      events.push("editor:acked");
+      if (button.deferred || button.replied) throw new Error("InteractionAlreadyReplied");
+      button.deferred = true;
+      events.push("button:acked");
+    },
+    reply: async () => {
+      if (button.deferred || button.replied) throw new Error("InteractionAlreadyReplied");
+      button.replied = true;
+      events.push("button:acked");
+    },
+    editReply: async () => {
+      if (!button.deferred && !button.replied) throw new Error("InteractionNotReplied");
+      events.push("editor:rendered-via-editReply");
     },
     update: async () => {
       events.push("list:updated-via-button");
     },
   };
+  return button;
 }
 
 const scheduleRow = {
@@ -149,9 +166,11 @@ async function runScheduleListEdit(clicks: number) {
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
     buildScheduleListMessage: Orchestrator.prototype["buildScheduleListMessage" as never],
     scheduleSummaryLine: Orchestrator.prototype["scheduleSummaryLine" as never],
-    cmdScheduleAdd: async (c: { reply: () => Promise<void> }) => {
-      events.push("editor:opened");
-      await c.reply();
+    cmdScheduleAdd: async (c: { deferred: boolean; replied: boolean; editReply: () => Promise<void>; reply: () => Promise<void> }) => {
+      events.push(`editor:opened:deferred=${c.deferred}`);
+      // Mirrors Orchestrator.respondInitial.
+      if (c.deferred || c.replied) await c.editReply();
+      else await c.reply();
     },
   };
   await (
@@ -183,9 +202,10 @@ async function runPresetListEdit(clicks: number) {
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
     buildPresetListMessage: Orchestrator.prototype["buildPresetListMessage" as never],
     presetSummaryLine: Orchestrator.prototype["presetSummaryLine" as never],
-    cmdPresetBuilder: async (c: { deferReply: () => Promise<void> }) => {
-      events.push("editor:opened");
-      await c.deferReply();
+    cmdPresetBuilder: async (c: { deferred: boolean; replied: boolean; editReply: () => Promise<void>; deferReply: () => Promise<void> }) => {
+      events.push(`editor:opened:deferred=${c.deferred}`);
+      if (!c.deferred && !c.replied) await c.deferReply();
+      await c.editReply();
     },
   };
   await (
@@ -209,16 +229,32 @@ const SURFACES = [
 
 for (const surface of SURFACES) {
   describe(`${surface.name} Edit transition`, () => {
-    it("acknowledges the button before the slower freeze repaint lands", async () => {
+    // The hard gate: the ack must come first in *invocation* order, not just
+    // finish first. A freeze that is merely started before the ack already
+    // queues a REST request ahead of it.
+    it("acknowledges the button before the freeze is even invoked", async () => {
       const { events } = await surface.run(1);
-      expect(events).toContain("editor:acked");
-      expect(events).toContain("list:freeze-painted");
-      expect(events.indexOf("editor:acked")).toBeLessThan(events.indexOf("list:freeze-painted"));
+      expect(events).toContain("button:acked");
+      expect(events).toContain("list:freeze-invoked");
+      expect(events.indexOf("button:acked")).toBeLessThan(events.indexOf("list:freeze-invoked"));
+    });
+
+    it("acknowledges the button before the freeze repaint resolves", async () => {
+      const { events } = await surface.run(1);
+      expect(events.indexOf("button:acked")).toBeLessThan(events.indexOf("list:freeze-painted"));
+    });
+
+    it("hands the builder an already-deferred interaction and renders via editReply", async () => {
+      const { events } = await surface.run(1);
+      expect(events).toContain("editor:opened:deferred=true");
+      expect(events).toContain("editor:rendered-via-editReply");
+      // No second reply/defer: the fake throws InteractionAlreadyReplied.
+      expect(events.filter((e) => e === "button:acked")).toHaveLength(1);
     });
 
     it("opens exactly one editor even when the button is clicked twice", async () => {
       const { events, delivered } = await surface.run(2);
-      expect(events.filter((e) => e === "editor:opened")).toHaveLength(1);
+      expect(events.filter((e) => e.startsWith("editor:opened"))).toHaveLength(1);
       // The second click is never delivered: the transition closed the
       // collector synchronously, before its repaint was even sent.
       expect(delivered).toEqual([true, false]);
@@ -236,12 +272,12 @@ for (const surface of SURFACES) {
       expect(freeze!.components).toEqual([]);
     });
 
-    it("freezes the listing before the editor is opened", async () => {
+    it("freezes before the editor opens, so no second live listing survives", async () => {
       const { events, collector } = await surface.run(1);
-      // The collector is closed by the time the editor opens, so no second
-      // live-looking listing can survive alongside it.
       expect(collector.stopped).toBe("edit");
-      expect(events.indexOf("editor:opened")).toBeGreaterThan(-1);
+      expect(events.indexOf("list:freeze-invoked")).toBeLessThan(
+        events.findIndex((e) => e.startsWith("editor:opened"))
+      );
     });
   });
 }

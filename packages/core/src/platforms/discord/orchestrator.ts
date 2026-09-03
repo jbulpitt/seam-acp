@@ -8534,6 +8534,27 @@ export class Orchestrator {
     });
   }
 
+  /**
+   * A builder card's first response, on either a fresh interaction or one the
+   * caller already deferred.
+   *
+   * #159: the list Edit buttons acknowledge the component interaction *before*
+   * freezing the listing, so the builder they open inherits an already-deferred
+   * interaction. Replying or deferring a second time on that interaction throws
+   * (`InteractionAlreadyReplied`), which would leave the operator with a frozen
+   * list and no editor at all.
+   */
+  private async respondInitial(
+    i: ChatInputCommandInteraction | MessageComponentInteraction,
+    payload: InteractionEditReplyOptions
+  ): Promise<void> {
+    if (i.deferred || i.replied) {
+      await i.editReply(payload);
+      return;
+    }
+    await i.reply({ ...payload, flags: MessageFlags.Ephemeral } as never);
+  }
+
   // --- /seam schedule … -----------------------------------------------------
 
   private async cmdSchedule(i: ChatInputCommandInteraction): Promise<void> {
@@ -8617,14 +8638,14 @@ export class Orchestrator {
           // Run is repeatable; rebuild so the card shows the new last-status.
           await lifecycle.refresh(this.buildScheduleListMessage(channel));
         } else if (action === "edit") {
+          // ACK first, before anything touches the original card. The freeze
+          // below edits the *original* slash reply — a separate REST request —
+          // and queuing that ahead of this button's ack risks its 3s budget
+          // under per-route backoff: "This interaction failed", no editor.
+          await c.deferReply({ flags: MessageFlags.Ephemeral });
           // Transition: freeze the listing BEFORE the builder opens, or the
           // user is left holding two live-looking cards for one schedule.
-          // Deliberately not awaited: `transition` closes the collector and
-          // marks the card settled synchronously, and only the repaint is a
-          // REST round trip. Awaiting it would hold this button unacked inside
-          // Discord's 3s budget, which under rate-limit backoff shows
-          // "This interaction failed" and opens no editor at all.
-          void lifecycle.transition("edit", {
+          await lifecycle.transition("edit", {
             content: `✏️ Editing **${row.name}** — this listing was replaced by the editor below.`,
             embeds: [],
             components: [],
@@ -8727,7 +8748,7 @@ export class Orchestrator {
   private async cmdScheduleAdd(i: ChatInputCommandInteraction | MessageComponentInteraction, existing?: ScheduledPrompt): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
-      await i.reply({ content: "Use `/seam schedule add` inside a thread.", flags: MessageFlags.Ephemeral });
+      await this.respondInitial(i, { content: "Use `/seam schedule add` inside a thread." });
       return;
     }
     // Bind the thread to a session record if it isn't already (so the job has a
@@ -8833,7 +8854,7 @@ export class Orchestrator {
       return { embeds: [embed], components: rows };
     };
 
-    await i.reply({ ...render(), flags: MessageFlags.Ephemeral });
+    await this.respondInitial(i, render());
     const msg = await i.fetchReply();
     const collector = msg.createMessageComponentCollector({
       filter: (c) => c.user.id === i.user.id,
@@ -16387,10 +16408,11 @@ export class Orchestrator {
             flags: MessageFlags.Ephemeral,
           });
         } else if (action === "edit") {
+          // ACK first, for the same reason as the schedule list above.
+          await c.deferReply({ flags: MessageFlags.Ephemeral });
           // Transition: freeze the listing BEFORE the builder opens, or the
-          // user is left holding two live-looking cards for one preset. Not
-          // awaited, for the same ack-first reason as the schedule list above.
-          void lifecycle.transition("edit", {
+          // user is left holding two live-looking cards for one preset.
+          await lifecycle.transition("edit", {
             content: `✏️ Editing preset **${preset.name}** — this listing was replaced by the editor below.`,
             embeds: [],
             components: [],
@@ -16658,7 +16680,8 @@ export class Orchestrator {
       };
     };
 
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    // Already deferred when opened from the list's Edit button (#159).
+    if (!i.deferred && !i.replied) await i.deferReply({ flags: MessageFlags.Ephemeral });
     await i.editReply(render());
     const msg = await i.fetchReply();
     const collector = msg.createMessageComponentCollector({

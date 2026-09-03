@@ -235,6 +235,55 @@ export function paginateInterruptedRows(
   return { page: p, pageCount, total: actionable.length, items };
 }
 
+/**
+ * Discord rejects an embed whose title + description + field names/values +
+ * footer exceed this in total, independently of the 1024 per-field cap.
+ */
+export const DISCORD_EMBED_TOTAL_LIMIT = 6000;
+
+export interface EmbedFieldSpec {
+  name: string;
+  value: string;
+}
+
+/**
+ * Fit an embed's fields inside Discord's aggregate character budget.
+ *
+ * `/seam workflows` can legitimately carry ten independently-clamped sections
+ * (ledger, anomalies, wakes, watches, live help, ingest, choices, interrupted…),
+ * which together can exceed 6000 and get the whole card rejected. Sections
+ * marked `required` — the interrupted rows that have buttons under them — are
+ * always kept; the rest are dropped from the tail of the budget, in order, so
+ * the card degrades instead of failing.
+ */
+export function fitEmbedFields(
+  fields: ReadonlyArray<EmbedFieldSpec & { required?: boolean }>,
+  overhead: number,
+  limit: number = DISCORD_EMBED_TOTAL_LIMIT
+): { fields: EmbedFieldSpec[]; dropped: number } {
+  const cost = (f: EmbedFieldSpec) => f.name.length + f.value.length;
+  const requiredCost = fields
+    .filter((f) => f.required)
+    .reduce((sum, f) => sum + cost(f), 0);
+  let budget = limit - overhead - requiredCost;
+  const kept: EmbedFieldSpec[] = [];
+  let dropped = 0;
+  for (const field of fields) {
+    if (field.required) {
+      kept.push({ name: field.name, value: field.value });
+      continue;
+    }
+    const size = cost(field);
+    if (size > budget) {
+      dropped++;
+      continue;
+    }
+    budget -= size;
+    kept.push({ name: field.name, value: field.value });
+  }
+  return { fields: kept, dropped };
+}
+
 /** The embed fields for the inventory's interrupted section. */
 export interface InterruptedInventorySection {
   page: number;

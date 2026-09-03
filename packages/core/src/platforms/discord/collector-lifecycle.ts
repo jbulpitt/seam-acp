@@ -253,6 +253,45 @@ export class CardLifecycle {
   }
 }
 
+/**
+ * Single-flight guard for **repeatable** cards.
+ *
+ * A terminal or transition action is protected by the lifecycle itself: the
+ * collector stops before the awaited re-render, so a second click cannot even
+ * be delivered. A repeatable card has no such protection *by design* — it stays
+ * live so the operator can act on the next row — which means two rapid clicks
+ * on the same control can both enter the handler before the first mutation
+ * lands and the authoritative rebuild removes it.
+ *
+ * Claims are keyed (by row id, not by action) so acting twice on one subject is
+ * impossible while its mutation is in flight, without serialising unrelated
+ * rows behind each other.
+ */
+export class ActionGuard {
+  private readonly inFlight = new Set<string>();
+
+  /** Take `key`. `false` means another click already owns it. */
+  claim(key: string): boolean {
+    if (this.inFlight.has(key)) return false;
+    this.inFlight.add(key);
+    return true;
+  }
+
+  release(key: string): void {
+    this.inFlight.delete(key);
+  }
+
+  /** True while `key` has a mutation in flight. */
+  isBusy(key: string): boolean {
+    return this.inFlight.has(key);
+  }
+
+  /** Number of claims currently held. */
+  get pending(): number {
+    return this.inFlight.size;
+  }
+}
+
 /** The minimum a collector must expose for `attachCardLifecycle`. */
 export interface StoppableCollector {
   on(event: "end", listener: (collected: unknown, reason: string) => void): unknown;

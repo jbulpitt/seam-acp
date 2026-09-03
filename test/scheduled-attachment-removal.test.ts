@@ -469,6 +469,19 @@ async function renderBuilderCard(existing?: ScheduledPrompt): Promise<RenderedCa
     },
     store: { readConfig: () => ({ model: null }) },
     logger: silent,
+    // #159 pairs every collector with a card lifecycle. This helper only
+    // exercises the render path, so a no-op lifecycle is enough.
+    attachListLifecycle: () => ({
+      settled: false,
+      state: null,
+      reason: null,
+      refresh: async () => true,
+      transition: async () => true,
+      terminal: async () => true,
+      dispose: async () => true,
+      expire: async () => true,
+      handleEnd: async () => {},
+    }),
   };
   await (
     Orchestrator.prototype as unknown as {

@@ -89,9 +89,11 @@ import {
   clampFieldValue,
   formatAnomalyLines,
   buildInterruptedInventory,
+  fitEmbedFields,
   interruptedRowActions,
   type InterruptedTurnRow,
 } from "./workflows-view.js";
+import { WorkflowInventoryController } from "./workflow-inventory-controls.js";
 import {
   attachCardLifecycle,
   expiredCardView,
@@ -8505,10 +8507,14 @@ export class Orchestrator {
    * Attach the shared card lifecycle (#159) to an interactive card's collector.
    *
    * Every `createMessageComponentCollector` in this file is paired with exactly
-   * one of these, so terminal, transition, refresh, and timeout paths all funnel
-   * through one implementation and no card can end while still showing enabled
-   * controls. Rendering is best-effort: a 15-minute-expired interaction token
-   * must not take the action itself down with it.
+   * one of these, so every *settling* path — terminal, transition, timeout —
+   * goes through one implementation and no card can end while still showing
+   * enabled controls. A repeatable rebuild that already has the clicking
+   * interaction in hand may still paint via `c.update(...)`, which acks and
+   * repaints in a single round trip; that is a render detail, not a second
+   * lifecycle, and it cannot outlive a settle because the collector is closed.
+   * Rendering is best-effort: a 15-minute-expired interaction token must not
+   * take the action itself down with it.
    */
   private attachListLifecycle(
     i: ChatInputCommandInteraction | MessageComponentInteraction,
@@ -8613,12 +8619,17 @@ export class Orchestrator {
         } else if (action === "edit") {
           // Transition: freeze the listing BEFORE the builder opens, or the
           // user is left holding two live-looking cards for one schedule.
-          await lifecycle.transition("edit", {
+          // Deliberately not awaited: `transition` closes the collector and
+          // marks the card settled synchronously, and only the repaint is a
+          // REST round trip. Awaiting it would hold this button unacked inside
+          // Discord's 3s budget, which under rate-limit backoff shows
+          // "This interaction failed" and opens no editor at all.
+          void lifecycle.transition("edit", {
             content: `✏️ Editing **${row.name}** — this listing was replaced by the editor below.`,
             embeds: [],
             components: [],
           });
-          await this.cmdScheduleAdd(c, row); // opens the builder card in edit mode
+          await this.cmdScheduleAdd(c, row); // acks `c`, opens the builder card
         } else if (action === "toggle") {
           const updated: ScheduledPrompt = { ...row, enabled: !row.enabled, updatedUtc: new Date().toISOString() };
           this.store.upsertScheduled(updated);
@@ -11642,9 +11653,7 @@ export class Orchestrator {
 
     // #159: Resume/Abandon rebuilds this card from authoritative state, so the
     // inventory is a re-runnable render rather than a one-shot build.
-    let page = 0;
-    const initial = await this.renderWorkflowInventory(i, limit, page);
-    page = initial.page;
+    const initial = await this.renderWorkflowInventory(i, limit, 0);
     await i.reply({
       embeds: initial.embeds,
       ...(initial.components.length ? { components: initial.components } : {}),
@@ -11661,38 +11670,30 @@ export class Orchestrator {
     const lifecycle = this.attachListLifecycle(i, collector, () =>
       expiredCardView("\u23f0 Workflow inventory expired \u2014 run `/seam workflows` again.")
     );
+    // Ack, mutate, then rebuild the originating card from the store so the
+    // consumed row's controls disappear atomically with the action — the old
+    // code replied separately and left the acted-on row clickable. This card
+    // stays live on purpose (the other rows are still actionable), so the
+    // controller claims each row for the duration of its mutation: the
+    // collector cannot be the guard for a repeatable card.
+    const controls = new WorkflowInventoryController({
+      resume: (id) => this.resumeTurnManually(id),
+      abandon: (id) => this.abandonTurnManually(id),
+      render: (requested) => this.renderWorkflowInventory(i, limit, requested),
+      refresh: (view) => lifecycle.refresh(view),
+      terminal: (reason, view) => lifecycle.terminal(reason, view),
+    });
     collector.on("collect", async (c) => {
       try {
         if (!c.isButton()) return;
-        const [, action, ...rest] = c.customId.split(":");
-        const id = rest.join(":");
-        if (action === "page") {
-          const requested = Number(id);
-          if (!Number.isFinite(requested)) return;
-          await c.deferUpdate();
-          const paged = await this.renderWorkflowInventory(i, limit, requested);
-          page = paged.page;
-          await lifecycle.refresh(paged);
-          return;
-        }
-        if (!id || (action !== "resume" && action !== "abandon")) return;
-        // Ack, mutate, then rebuild the originating card from the store so the
-        // consumed row's controls disappear atomically with the action \u2014 the
-        // old code replied separately and left the acted-on row clickable.
-        await c.deferUpdate();
-        const result =
-          action === "resume"
-            ? await this.resumeTurnManually(id)
-            : await this.abandonTurnManually(id);
-        const rebuilt = await this.renderWorkflowInventory(i, limit, page);
-        page = rebuilt.page;
-        if (rebuilt.components.length === 0) {
-          // Nothing actionable left: terminal state, no components at all.
-          await lifecycle.terminal(action, { embeds: rebuilt.embeds, components: [] });
-        } else {
-          await lifecycle.refresh(rebuilt);
-        }
-        await c.followUp({ content: result, flags: MessageFlags.Ephemeral });
+        await controls.handle(c.customId, {
+          ack: async () => {
+            await c.deferUpdate();
+          },
+          followUp: async (text) => {
+            await c.followUp({ content: text, flags: MessageFlags.Ephemeral });
+          },
+        });
       } catch (err) {
         this.logger.warn({ err }, "workflows resume/abandon button failed");
       }
@@ -11863,6 +11864,7 @@ export class Orchestrator {
 
     const interrupted = await this.collectInterruptedRows();
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
+    const requiredFieldNames = new Set<string>();
     let page = 0;
     if (interrupted.length > 0) {
       // Controls exist only for rows a click can still act on, and the visible
@@ -11871,7 +11873,12 @@ export class Orchestrator {
       // backing operation was already consumed.
       const slice = buildInterruptedInventory(interrupted, requestedPage, now);
       page = slice.page;
-      if (slice.actionable) embed.addFields(slice.actionable);
+      if (slice.actionable) {
+        embed.addFields(slice.actionable);
+        // Never dropped by the embed budget below: these are the rows the
+        // buttons act on.
+        requiredFieldNames.add(slice.actionable.name);
+      }
       if (slice.inert) embed.addFields(slice.inert);
       if (view.empty) embed.setDescription(null);
       // Per-entry Resume / Abandon \u2014 same pattern as schedule-list cards.
@@ -11920,6 +11927,30 @@ export class Orchestrator {
           )
         );
       }
+    }
+
+    // Discord caps the WHOLE embed at 6000 chars across title/description/
+    // fields/footer, independently of the 1024 per-field cap — and this card
+    // can carry ten independently-clamped sections. Trim optional ones rather
+    // than letting the API reject the card outright.
+    const footerText = embed.data.footer?.text ?? "";
+    const overhead =
+      (embed.data.title?.length ?? 0) +
+      (embed.data.description?.length ?? 0) +
+      footerText.length;
+    const fitted = fitEmbedFields(
+      (embed.data.fields ?? []).map((f) => ({
+        name: f.name,
+        value: f.value,
+        required: requiredFieldNames.has(f.name),
+      })),
+      overhead
+    );
+    if (fitted.dropped > 0) {
+      embed.setFields(fitted.fields);
+      embed.setFooter({
+        text: `${footerText ? `${footerText} · ` : ""}${fitted.dropped} section(s) hidden to fit Discord's embed limit`,
+      });
     }
 
     return { embeds: [embed], components, page };
@@ -16357,13 +16388,14 @@ export class Orchestrator {
           });
         } else if (action === "edit") {
           // Transition: freeze the listing BEFORE the builder opens, or the
-          // user is left holding two live-looking cards for one preset.
-          await lifecycle.transition("edit", {
+          // user is left holding two live-looking cards for one preset. Not
+          // awaited, for the same ack-first reason as the schedule list above.
+          void lifecycle.transition("edit", {
             content: `✏️ Editing preset **${preset.name}** — this listing was replaced by the editor below.`,
             embeds: [],
             components: [],
           });
-          await this.cmdPresetBuilder(c, preset);
+          await this.cmdPresetBuilder(c, preset); // acks `c`, opens the builder
         } else if (action === "del") {
           this.store.deletePreset(id);
           const remaining = this.store.listPresetsForProject(projectRef);

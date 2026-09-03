@@ -10,6 +10,8 @@ import {
   formatInterruptedLine,
   formatInterruptedLines,
   buildInterruptedInventory,
+  fitEmbedFields,
+  DISCORD_EMBED_TOTAL_LIMIT,
   interruptedRowActions,
   isActionableInterruptedRow,
   paginateInterruptedRows,
@@ -414,5 +416,52 @@ describe("buildInterruptedInventory — text matches the buttons", () => {
         expect(section.actionable!.value).toContain(shortId(row.id));
       }
     }
+  });
+});
+
+describe("fitEmbedFields — Discord's 6000-char aggregate cap", () => {
+  const field = (name: string, size: number) => ({ name, value: "x".repeat(size) });
+
+  it("keeps everything when the card already fits", () => {
+    const fitted = fitEmbedFields([field("a", 100), field("b", 100)], 50);
+    expect(fitted.dropped).toBe(0);
+    expect(fitted.fields.map((f) => f.name)).toEqual(["a", "b"]);
+  });
+
+  it("ten 1024-char sections would blow the cap, so optional ones are dropped", () => {
+    const fields = Array.from({ length: 10 }, (_, i) => field(`f${i}`, 1024));
+    const fitted = fitEmbedFields(fields, 200);
+    const total =
+      200 + fitted.fields.reduce((sum, f) => sum + f.name.length + f.value.length, 0);
+    expect(total).toBeLessThanOrEqual(DISCORD_EMBED_TOTAL_LIMIT);
+    expect(fitted.dropped).toBeGreaterThan(0);
+    expect(fitted.fields.length + fitted.dropped).toBe(10);
+  });
+
+  it("never drops a required section — the rows with buttons under them", () => {
+    const fields = [
+      ...Array.from({ length: 9 }, (_, i) => field(`bulk${i}`, 1024)),
+      { ...field("actionable", 400), required: true },
+    ];
+    const fitted = fitEmbedFields(fields, 200);
+    expect(fitted.fields.map((f) => f.name)).toContain("actionable");
+    expect(fitted.dropped).toBeGreaterThan(0);
+    const total =
+      200 + fitted.fields.reduce((sum, f) => sum + f.name.length + f.value.length, 0);
+    expect(total).toBeLessThanOrEqual(DISCORD_EMBED_TOTAL_LIMIT);
+  });
+
+  it("keeps surviving fields in their original order", () => {
+    // "huge" does not fit in what "first" leaves behind, but "last" still does.
+    const fields = [field("first", 2000), field("huge", 3900), field("last", 200)];
+    const fitted = fitEmbedFields(fields, 100);
+    expect(fitted.fields.map((f) => f.name)).toEqual(["first", "last"]);
+    expect(fitted.dropped).toBe(1);
+  });
+
+  it("a required section that alone exceeds the budget is still kept", () => {
+    const fitted = fitEmbedFields([{ ...field("actionable", 1024), required: true }], 5500);
+    expect(fitted.fields).toHaveLength(1);
+    expect(fitted.dropped).toBe(0);
   });
 });

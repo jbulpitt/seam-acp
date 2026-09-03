@@ -311,6 +311,29 @@ const mapPreset = (r: PresetRow): Preset => {
   };
 };
 
+/**
+ * Deterministic ids for the child a chain-hop completion plans (#174), so a
+ * replay reuses the SAME child instead of minting a second one.
+ */
+export const CHAIN_HOP_ID_PREFIX = "chain_hop:";
+export const CHAIN_DELIVERY_ID_PREFIX = "chain_delivery:";
+
+/**
+ * Whether a stored `chain_advance:` claim's `targetRef` is a planned child id
+ * this code wrote, rather than a legacy value that only LOOKS usable.
+ *
+ * The #77 claim used the same row id and stored the hop's target THREAD there.
+ * A replay that trusted it would dispatch under a Discord thread id and, worse,
+ * read the row's `worker` — the completed hop's OWN preset — as the next hop,
+ * paying for that worker a second time.
+ */
+export function isPlannedChainChildId(id: string | null | undefined): id is string {
+  return (
+    typeof id === "string" &&
+    (id.startsWith(CHAIN_HOP_ID_PREFIX) || id.startsWith(CHAIN_DELIVERY_ID_PREFIX))
+  );
+}
+
 export class SessionStore {
   private readonly db: Database.Database;
 
@@ -1792,6 +1815,14 @@ export class SessionStore {
    * `targetRef` stores the deterministic child dispatch id and `worker` stores
    * the next worker (null means terminal delivery). Replays read this row
    * instead of inferring progress from the already-mutated chain.
+   *
+   * A pre-existing claim is only READ BACK when `isPlannedChainChildId` accepts
+   * its `targetRef`. The #77 claim this replaced used the same
+   * row id but stored the hop's TARGET THREAD in `targetRef` and the hop's OWN
+   * preset in `worker` — so trusting an old row would replay it as "dispatch
+   * worker `<this hop's preset>` under id `<a Discord thread id>`", re-running
+   * a hop that has already been paid for. Refusing (null) leaves the ledger row
+   * non-terminal and operator-visible instead, which is recoverable.
    */
   planChainHopCompletion(input: {
     dispatchId: string;
@@ -1803,7 +1834,7 @@ export class SessionStore {
       const existing = this.getReportBackByCorrelation(input.dispatchId);
       const chain = this.getChain(input.chainId);
       if (existing) {
-        if (!existing.targetRef || !chain) return null;
+        if (!chain || !isPlannedChainChildId(existing.targetRef)) return null;
         return {
           dispatchId: existing.targetRef,
           nextHop: existing.worker,
@@ -1815,8 +1846,8 @@ export class SessionStore {
 
       const nextHop = input.failed ? null : (chain.hops[0] ?? null);
       const dispatchId = nextHop
-        ? `chain_hop:${input.dispatchId}`
-        : `chain_delivery:${input.dispatchId}`;
+        ? `${CHAIN_HOP_ID_PREFIX}${input.dispatchId}`
+        : `${CHAIN_DELIVERY_ID_PREFIX}${input.dispatchId}`;
       const claim = this.tryRecordReportBack({
         id: `chain_advance:${input.dispatchId}`,
         kind: "report_back",

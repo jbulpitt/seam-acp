@@ -1389,6 +1389,27 @@ export class Orchestrator {
     return this.activeTurns;
   }
 
+  /**
+   * What the restart-sentinel drain waits on: turns PLUS admitted gateway
+   * handlers.
+   *
+   * `activeTurns` alone is a turn's-eye view, and a message becomes a turn only
+   * once its channel FIFO reaches it. Everything before that — the pre-queue
+   * body (which writes the store: parked clear, turn markers, abort) and the
+   * wait for its place in line — counts as zero. So a message admitted while
+   * the channel is idle can leave the drain sampling 0, skipping the wait
+   * entirely, and start a full agent turn on the far side of it.
+   *
+   * `inboundWork` spans exactly that window: `handleIncomingMessage` is entered
+   * through `runInbound` and awaits its own queue link, so one entry covers
+   * admission through the last `endTurn()`. Counting both makes an admitted
+   * message extend the drain the same way a due cron fire does. The drain is
+   * still bounded by `RESTART_DRAIN_TIMEOUT_MS`, which force-restarts.
+   */
+  private get outstandingRestartWork(): number {
+    return this.activeTurns + this.inboundWork.size;
+  }
+
   /** True when this thread has a turn in `channelQueues` (#89 busy gate). */
   isChannelBusy(channelRef: string): boolean {
     return this.channelQueues.has(channelRef);
@@ -1468,26 +1489,32 @@ export class Orchestrator {
         "♻️ Force restart — interrupting live turns; they will resume."
       );
       this.logger.info({ activeTurns: this.activeTurns }, "force restart sentinel; skipping drain");
-    } else if (this.activeTurns > 0) {
-      const turnWord = this.activeTurns === 1 ? "turn" : "turn(s)";
+    } else if (this.outstandingRestartWork > 0) {
+      const outstanding = this.outstandingRestartWork;
+      const word = outstanding === 1 ? "item" : "items";
       void this.postNotification(
-        `♻️ Restart requested — waiting for ${this.activeTurns} ${turnWord} to finish.`
+        `♻️ Restart requested — waiting for ${outstanding} in-flight ${word} to finish.`
       );
-      this.logger.info({ activeTurns: this.activeTurns }, "restart pending, draining turns");
+      this.logger.info(
+        { activeTurns: this.activeTurns, inboundWork: this.inboundWork.size },
+        "restart pending, draining turns and admitted handlers"
+      );
 
       const drain = await waitForRestartDrain(
-        () => this.activeTurns,
+        () => this.outstandingRestartWork,
         drainTimeoutMs
       );
       if (!drain.drained) {
         forceShutdown = true;
         void this.postNotification(
-          `♻️ Restart drain timed out with ${drain.activeTurns} active turn(s) — ` +
+          `♻️ Restart drain timed out with ${drain.activeTurns} in-flight item(s) — ` +
             "interrupting them now; they will resume."
         );
         this.logger.warn(
           {
-            activeTurns: drain.activeTurns,
+            outstanding: drain.activeTurns,
+            activeTurns: this.activeTurns,
+            inboundWork: this.inboundWork.size,
             timeoutMs: drainTimeoutMs,
           },
           "restart drain timed out; continuing through force restart path"

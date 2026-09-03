@@ -46,7 +46,11 @@ import {
   SHUTDOWN_OVERHEAD_ALLOWANCE_MS,
 } from "../packages/core/src/lib/shutdown-budget.js";
 import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
-import { SessionStore } from "../packages/core/src/core/session-store.js";
+import {
+  SessionStore,
+  isPlannedChainChildId,
+  CHAIN_HOP_ID_PREFIX,
+} from "../packages/core/src/core/session-store.js";
 import net from "node:net";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
@@ -1317,6 +1321,146 @@ describe("#174 admission gates", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  /**
+   * `activeTurns` is a turn's-eye view: a message counts only once its channel
+   * FIFO reaches it. Everything before that — the pre-queue body, which writes
+   * the store, and the wait for its place in line — reads as zero, so a message
+   * admitted while the channel is idle could let the drain sample 0, skip the
+   * wait entirely, and start a full agent turn on the far side of it.
+   */
+  it("waits for a message admitted before it has become a turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      const notes: string[] = [];
+      const gate = deferred(); // parks the message inside its PRE-QUEUE body
+      await writeFile(path.join(dataDir, ".restart-pending"), "", "utf8"); // graceful
+      const host = makeQuiesceHost({
+        config: {
+          DATA_DIR: dataDir,
+          RESTART_DRAIN_TIMEOUT_MS: 60_000,
+          TURN_TIMEOUT_SECONDS: 900,
+        },
+        restartPending: false,
+        dispatchWatcher: { stop: () => {}, inFlightCount: 0 },
+        scheduledManager: { stop: () => {} },
+        postNotification: async (m: string) => void notes.push(m),
+        restartProcess: async () => void order.push("pm2-restart"),
+        channelGenerations: new Map<string, number>(),
+        lastUserMessageAt: new Map<string, number>(),
+        store: {},
+        router: { ensureSessionRecord: () => ({ id: "discord:c1" }), abortTurn: async () => "" },
+        tryConsumeConfigEditorRiderUpload: async () => {
+          await gate.promise;
+          return false;
+        },
+        clearTurnMarkersForChannel: async () => {},
+        tryParkForOfflineBridge: async () => false,
+        handleIncomingMessageInner: async () => void order.push("turn-ran"),
+      });
+
+      void host
+        .runInbound("message", () =>
+          (host as unknown as { handleIncomingMessage(m: unknown): Promise<void> })
+            .handleIncomingMessage({ channel: { id: "c1" }, text: "hi", authorId: "u1" })
+        )
+        .catch(() => {});
+      await vi.advanceTimersByTimeAsync(0);
+      // The sharp state: admitted and doing store-backed work, but not a turn.
+      expect(host.activeTurns).toBe(0);
+      expect(host.inboundWork.size).toBe(1);
+
+      const done = (host as unknown as { handleRestartSentinel(): Promise<void> })
+        .handleRestartSentinel();
+      await vi.advanceTimersByTimeAsync(5000);
+      // The load-bearing assertion: the drain was ENTERED and is holding for
+      // this message. Sampling `activeTurns` alone reads 0 here, takes the
+      // no-drain branch — announcing nothing — and restarts straight through it.
+      expect(notes).toEqual(["♻️ Restart requested — waiting for 1 in-flight item to finish."]);
+      expect(order).toEqual([]);
+
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(5000);
+      await done;
+      // The turn ran to completion first, and only then did the restart fire.
+      expect(order).toEqual(["turn-ran", "pm2-restart"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * The channel FIFO's generation-skip branch returns BEFORE `beginTurn()`, so
+   * a superseded message is in no turn set at all. The question that matters is
+   * whether that can make the barrier snapshot early — a queued message is real
+   * work, and the one that supersedes it is a real turn.
+   *
+   * It cannot, and this pins WHY: `handleIncomingMessage` is admitted through
+   * `runInbound` and awaits its own queue link, so from admission to the last
+   * `endTurn()` it is one entry in `inboundWork`, which `settleAllWork` drains.
+   * The skip branch registers nothing because it DOES nothing — it returns
+   * without touching the store — while the message that superseded it is held
+   * by both its turn and its own inbound entry.
+   */
+  it("holds quiesce for a queued message, including one the generation bump skips", async () => {
+    const inner = deferred();
+    const q0 = deferred();
+    const started: string[] = [];
+    const host = makeQuiesceHost({
+      config: { TURN_TIMEOUT_SECONDS: 900 },
+      channelGenerations: new Map<string, number>(),
+      lastUserMessageAt: new Map<string, number>(),
+      store: {},
+      router: {
+        ensureSessionRecord: () => ({ id: "discord:c1" }),
+        abortTurn: async () => "cancelled",
+      },
+      tryConsumeConfigEditorRiderUpload: async () => false,
+      clearTurnMarkersForChannel: async () => {},
+      tryParkForOfflineBridge: async () => false,
+      handleIncomingMessageInner: async (m: { text: string }) => {
+        started.push(m.text);
+        await inner.promise;
+      },
+    });
+    // A turn already owns the channel, so both messages queue behind it.
+    host.channelQueues.set("c1", q0.promise);
+    const send = (text: string) =>
+      host.runInbound("message", () =>
+        (host as unknown as { handleIncomingMessage(m: unknown): Promise<void> })
+          .handleIncomingMessage({ channel: { id: "c1" }, text, authorId: "u1" })
+      );
+
+    const first = send("first").catch(() => {});
+    await flush();
+    const second = send("second").catch(() => {});
+    await flush();
+    expect(host.inboundWork.size).toBe(2); // both admitted, neither started
+    expect(host.activeTurns).toBe(0); // …and neither is a turn yet
+
+    // Quiesce snapshots HERE — the sharpest moment, with real work queued and
+    // nothing registered as a turn.
+    let drained = false;
+    const phase = host.quiesce({ timeoutMs: 5000 }).then((r) => ((drained = true), r));
+    await flush();
+    expect(drained).toBe(false);
+
+    q0.resolve();
+    await flush();
+    // The superseded message took the skip branch: it started nothing, left no
+    // turn behind, and its inbound entry is gone.
+    expect(started).toEqual(["second"]);
+    expect(host.activeTurns).toBe(1);
+    expect(host.inboundWork.size).toBe(1);
+    expect(drained).toBe(false); // still held by the turn that replaced it
+
+    inner.resolve();
+    expect((await phase).drained).toBe(true);
+    await Promise.all([first, second]);
+    expect(host.activeTurns).toBe(0);
+    expect(host.inboundWork.size).toBe(0);
   });
 
   it("SIGTERM's closeAdmission shuts BOTH doors, and quiesce implies it", async () => {
@@ -3170,7 +3314,8 @@ function makeChainStore() {
       const existing = ledger.getReportBackByCorrelation(input.dispatchId);
       const chain = chains.get(input.chainId);
       if (existing) {
-        if (!existing.targetRef || !chain) return null;
+        // Mirrors the real guard: only a PLANNED child id may be read back.
+        if (!isPlannedChainChildId(existing.targetRef) || !chain) return null;
         return {
           dispatchId: existing.targetRef,
           nextHop: existing.worker ?? null,
@@ -3415,6 +3560,75 @@ describe("#174 a routed forward is actually delivered or advanced", () => {
 
     expect((await pendingSpecs()).filter((s) => s.preset === "worker-b")).toHaveLength(1);
     expect(store.chains.get("chain-idem")).toMatchObject({ hops: [], currentIndex: 1 });
+  });
+
+  /**
+   * Against the REAL `SessionStore`, not the in-memory mirror: the guard is a
+   * store invariant and the mirror could drift from it.
+   *
+   * The #77 claim this replaced wrote the SAME row id (`chain_advance:<spec>`)
+   * but stored the hop's target THREAD in `targetRef` and the completed hop's
+   * OWN preset in `worker`. Reading one back as a plan would dispatch under a
+   * Discord thread id and re-run a worker that has already been paid for —
+   * exactly what #174 exists to prevent.
+   */
+  it("refuses to read a legacy #77 hop claim back as a completion plan", () => {
+    const store = new SessionStore(path.join(dataDir, "chain-guard.db"));
+    try {
+      store.createChain({ id: "chain-legacy77", hops: ["worker-b"], originRef: "origin-thread" });
+      // Exactly what the pre-#174 `claimChainHopAdvance` wrote.
+      store.tryRecordReportBack({
+        id: "chain_advance:hop-1",
+        kind: "report_back",
+        sourceRef: "chain-legacy77",
+        targetRef: "worker-thread-id", // a THREAD, not a planned child id
+        worker: "worker-a", // this hop's OWN preset, not the next one
+        promptPreview: "old",
+        correlationId: "hop-1",
+        status: "completed",
+      });
+
+      expect(
+        store.planChainHopCompletion({
+          dispatchId: "hop-1",
+          chainId: "chain-legacy77",
+          failed: false,
+        })
+      ).toBeNull();
+      // And it refused without touching the chain, so nothing is lost.
+      expect(store.getChain("chain-legacy77")).toMatchObject({
+        status: "running",
+        hops: ["worker-b"],
+        currentIndex: 0,
+      });
+
+      // Positive control: a plan THIS code wrote is read straight back, with
+      // the popped chain state left exactly as the first pass committed it.
+      store.createChain({ id: "chain-modern77", hops: ["worker-b"], originRef: "origin-thread" });
+      const first = store.planChainHopCompletion({
+        dispatchId: "hop-2",
+        chainId: "chain-modern77",
+        failed: false,
+      });
+      expect(first).toMatchObject({
+        dispatchId: `${CHAIN_HOP_ID_PREFIX}hop-2`,
+        nextHop: "worker-b",
+        created: true,
+      });
+      const replay = store.planChainHopCompletion({
+        dispatchId: "hop-2",
+        chainId: "chain-modern77",
+        failed: false,
+      });
+      expect(replay).toMatchObject({
+        dispatchId: `${CHAIN_HOP_ID_PREFIX}hop-2`,
+        nextHop: "worker-b",
+        created: false,
+      });
+      expect(store.getChain("chain-modern77")).toMatchObject({ hops: [], currentIndex: 1 });
+    } finally {
+      store.close();
+    }
   });
 
   it("repairs a crash after atomic chain plan/pop but before child enqueue", async () => {

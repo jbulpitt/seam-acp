@@ -120,14 +120,14 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 
 | Command | What it does |
 |---|---|
-| `/seam new [name]` | Create a new public thread, bind a session to it, and post the repo picker — all in one step |
+| `/seam new [name]` | Create a new public thread, add you to it, bind a session, and post the `/seam config edit` card — all in one step |
 | `/seam cancel` | Gracefully cancel this thread's in-flight turn |
 | `/seam cancel force:true` | Escalate: cancel, then force-kill this thread's turn if it's hung (old `/seam abort`) |
 | `/seam cancel scope:all` | Force-kill every active session bot-wide (old `/seam kill`). Privileged — not lock-exempt, not participant-allowed. |
 | `/seam steer <thread> <prompt> [now]` | Steer a node mid-task (inbox by default; `now:true` cancel-and-reprompt) |
 | `/seam attach <path>` | Upload a host-side file (under `REPOS_ROOT` or `ATTACH_ROOTS`) into the channel without involving the agent |
 | `/seam workflows` | Delegation ledger + this thread's pending wakes/watches |
-| `/seam config init` | Bind the current thread as a session and post the repo picker |
+| `/seam config init` | Bind the current thread as a session and post the `/seam config edit` card (same surface as `/seam new`) |
 | `/seam config repo <path>` | Set the working repo (relative to `REPOS_ROOT` or absolute under it) |
 | `/seam config agent [id]` | With no id: posts an interactive picker of registered profiles. With id: switch directly. |
 | `/seam config model [id]` | With no id: starts the agent if needed and posts a picker of advertised models. With id: set directly (live if a runtime is active). |
@@ -136,6 +136,7 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seam config tools <allow\|exclude> [csv]` | Tool allow / exclude list (empty list = clear) |
 | `/seam config approve <always\|ask\|deny>` | Permission policy for this thread. `always` auto-approves every request; `ask` posts a Discord prompt with buttons (auto-denies after 5 min); `deny` auto-denies. |
 | `/seam config reset` | End the current ACP session for this thread; next message starts a fresh one |
+| `/seam config edit` | Draft-then-save config card: agent (`agentId@host`), model, effort, repo, role, rider, approve, card/GIF. One **Agent** control sets the host — there is no separate host selector. |
 | `/seam config show` | Show the session config JSON |
 | `/seam config set <json>` | Replace the session config wholesale |
 | `/seam config audit` | Recent config mutations (who/what/when) |

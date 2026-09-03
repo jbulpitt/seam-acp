@@ -180,6 +180,7 @@ import {
   currentRiderText,
   decodeRiderUpload,
   editScopeOf,
+  effectiveAgentAtLocation,
   isDirty,
   makeCustomId,
   parseCustomId,
@@ -205,7 +206,6 @@ import {
   LOCAL_LOCATION,
   formatAgentAtLocation,
   hostShortName,
-  listHosts,
 } from "../../core/location.js";
 
 /** Accent color for scheduled-prompt cards ("cron blue"). */
@@ -8969,20 +8969,27 @@ export class Orchestrator {
       return;
     }
     await i.deferReply({ flags: MessageFlags.Ephemeral });
+    // createChildThread adds the invoking user to the new thread (mention
+    // fallback on failure) — that is the main reason people run this command,
+    // so it happens before anything that can fail.
     const thread = await this.createChildThread(i.channelId, name, i.user.id);
 
-    // Auto-init: bind a session to the new thread and start the setup
-    // flow so the user doesn't have to /seam config init themselves.
-    // Reply BEFORE the pickers — Discord interaction tokens last 15 min
-    // and a full wizard (agent/cwd/model/effort) can outlive that.
+    // Auto-init: bind a session to the new thread and post the same config
+    // card `/seam config edit` uses (#157), so the user doesn't have to run
+    // `/seam config init` themselves. Reply BEFORE the card — Discord
+    // interaction tokens last 15 min and the draft outlives that.
     try {
       const record = this.bindSessionToThread(thread);
       await this.applyThreadName(record, { fresh: true });
       await i.editReply(`Created thread <#${thread.id}> and initialized it.`);
-      if (this.config.NEW_THREAD_WIZARD === "full") {
-        await this.runSetupWizard(thread, record);
-      } else {
-        await this.sendRepoPicker(thread);
+      const opened = await this.openConfigEditorCard(thread, i.user.id);
+      if (!opened) {
+        await this.adapter
+          .sendMessage(
+            thread,
+            "Run `/seam config repo` here to pick a working repo, then send a message to begin."
+          )
+          .catch(() => {});
       }
     } catch (err) {
       this.logger.warn({ err, threadId: thread.id }, "auto-init after /seam new failed");
@@ -10525,6 +10532,33 @@ export class Orchestrator {
       });
       return;
     }
+    if (!this.adapter.sendPanel) {
+      await i.reply({
+        content: "This platform cannot render the config editor card.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await i.reply({
+      content: "Opening thread config editor…",
+      flags: MessageFlags.Ephemeral,
+    });
+    await this.openConfigEditorCard(channel, i.user.id);
+  }
+
+  /**
+   * Bind `channel` as a session and post the config-editor hub card into it,
+   * owned by `userId`. The single configuration surface (#90): `/seam config
+   * edit`, `/seam new`, and `/seam config init` (#157) all land here instead of
+   * running their own picker sequences.
+   *
+   * Returns the drafted card, or `null` when the platform cannot render panels.
+   */
+  private async openConfigEditorCard(
+    channel: ChannelRef,
+    userId: string
+  ): Promise<ThreadConfigDraft | null> {
+    if (!this.adapter.sendPanel) return null;
     const record = this.router.ensureSessionRecord({
       platform: channel.platform,
       channelRef: channel.id,
@@ -10541,7 +10575,7 @@ export class Orchestrator {
       id: randomUUID(),
       threadId: channel.id,
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      userId: i.user.id,
+      userId,
       createdAt: now,
       updatedAt: now,
       snapshot: {
@@ -10563,27 +10597,16 @@ export class Orchestrator {
     if (evicted?.messageId) {
       await this.editConfigEditorCard(channel, evicted.messageId, renderExpiredHub(evicted));
     }
-    if (!this.adapter.sendPanel) {
-      await i.reply({
-        content: "This platform cannot render the config editor card.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-    await i.reply({
-      content: "Opening thread config editor…",
-      flags: MessageFlags.Ephemeral,
-    });
     const panel = renderHub(draft, {
       effortDisabled: this.effortDisabledFor(draft),
       canEditChannel: Orchestrator.canEditChannelPreset(
         this.config,
-        i.user.id,
+        userId,
         channel.parentId
       ),
     });
     const ref = await this.adapter.sendPanel(channel, panel);
-    this.configEditor.touch(draft.id, { messageId: ref.id });
+    return this.configEditor.touch(draft.id, { messageId: ref.id }) ?? draft;
   }
 
   private inheritedConfigFor(
@@ -11020,6 +11043,19 @@ export class Orchestrator {
       );
     } else if (namingRecord) {
       await this.applyThreadName(namingRecord);
+      // #157: the card is now the `/seam new` setup surface, so saving a repo
+      // still renames a thread whose base is the untouched `seam` placeholder.
+      if (plan.threadPreset.cwd) {
+        await this.renameThreadForSetup(
+          {
+            platform: PLATFORM,
+            id: draft.threadId,
+            ...(draft.parentRef ? { parentId: draft.parentRef } : {}),
+          },
+          this.store.getByChannel(PLATFORM, draft.threadId) ?? namingRecord,
+          plan.threadPreset.cwd
+        );
+      }
     }
     // D10: do NOT abort or invalidate a live turn. Overlay applies on next spawn.
     this.configEditor.delete(draft.id);
@@ -11055,49 +11091,27 @@ export class Orchestrator {
     let picked: { value: string; userId: string } | null = null;
     const field = action as Parameters<typeof applyPickerValue>[1];
 
-    if (action === "host") {
-      const hosts = listHosts({
-        bridges: this.config.bridgePresets.values(),
-        connected: this.bridgeHub?.connectedIds(),
-      });
-      picked = await this.adapter.sendChoicePicker!(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: "🖥 Choose a host",
-          fields: [{ name: "Current", value: `\`${draft.snapshot.location.value}\``, inline: true }],
-        },
-        choices: [
-          inherit,
-          ...hosts.map((h) => ({
-            value: h.id,
-            label: `${h.emoji} ${h.shortName}`.slice(0, 80),
-            description: h.ready ? "ready" : "offline",
-          })),
-        ],
-        authorizedUserIds: owner,
-      });
-    } else if (action === "agent") {
-      const loc =
-        draft.overlay.location === undefined
-          ? draft.snapshot.location.value
-          : draft.overlay.location ?? draft.snapshot.withoutThread.location;
-      const all = agentLocationPickerChoices(this.router.listProfiles(), {
+    if (action === "agent") {
+      // #156: there is no separate Host control — an agent id encodes its host,
+      // so this picker offers every `agentId@host` the fleet actually has and
+      // is the single writer of the thread's location.
+      const choices = agentLocationPickerChoices(this.router.listProfiles(), {
         bridges: this.config.bridgePresets.values(),
         connected: this.bridgeHub?.connectedIds(),
         agentsByHost: this.bridgeHub?.installedAgentsByHost(),
       });
-      const filtered = all.filter((c) => {
-        const at = c.value.lastIndexOf("@");
-        const host = at > 0 ? c.value.slice(at + 1) : LOCAL_LOCATION;
-        return host === loc;
-      });
+      const current = channelScope
+        ? draft.overlay.channelAgent === undefined
+          ? draft.snapshot.channelPins?.agent ?? "not set"
+          : draft.overlay.channelAgent ?? "not set"
+        : effectiveAgentAtLocation(draft);
       picked = await this.adapter.sendChoicePicker!(channel, {
         panel: {
           color: 0x5865f2,
-          title: "🤖 Choose an agent",
-          fields: [{ name: "Host", value: `\`${loc}\``, inline: true }],
+          title: channelScope ? "🤖 Choose an agent" : "🤖 Choose an agent @ host",
+          fields: [{ name: "Current", value: `\`${current}\``, inline: true }],
         },
-        choices: [inherit, ...(filtered.length > 0 ? filtered : all)],
+        choices: [inherit, ...choices],
         authorizedUserIds: owner,
       });
     } else if (action === "model") {
@@ -13799,23 +13813,25 @@ export class Orchestrator {
       });
       return;
     }
-    const record = this.router.ensureSessionRecord({
+    // Bind even when the platform cannot render the card — that is what
+    // `init` promises. The card is the configuration step on top.
+    this.router.ensureSessionRecord({
       platform: channel.platform,
       channelRef: channel.id,
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
     await i.reply({
-      content:
-        this.config.NEW_THREAD_WIZARD === "full"
-          ? "Session ready. Starting setup…"
-          : "Session ready. Pick a repo to begin:",
+      content: "Session ready. Opening the config editor…",
       flags: MessageFlags.Ephemeral,
     });
-    if (this.config.NEW_THREAD_WIZARD === "full") {
-      await this.runSetupWizard(channel, record);
-    } else {
-      await this.sendRepoPicker(channel);
+    // #157: `init` shares `/seam new`'s surface deliberately — one card, no
+    // second setup path to drift out of sync.
+    const opened = await this.openConfigEditorCard(channel, i.user.id);
+    if (!opened) {
+      await i.editReply(
+        "Session ready. This platform cannot render the config card — use `/seam config repo` to pick a working repo."
+      );
     }
   }
 
@@ -15721,23 +15737,6 @@ export class Orchestrator {
     return result?.value ?? null;
   }
 
-  private async sendRepoPicker(channel: ChannelRef): Promise<void> {
-    const picked = await this.promptRepoPath(channel, {
-      title: "🗂️ Select a project to begin",
-    });
-    if (!picked) return;
-    const applied = await this.applyPickedRepo(channel, picked);
-    if (!applied.ok) {
-      await this.adapter.sendMessage(channel, `🛡️ ${applied.error}`);
-      return;
-    }
-    await this.renameThreadForSetup(channel, applied.record);
-    await this.adapter.sendMessage(
-      channel,
-      `📌 Repo set to \`${this.repoDisplay(applied.record.repoPath ?? picked)}\`. Send a message to begin.`
-    );
-  }
-
   /**
    * D11: enumerate workspaces on the bound host. Remote → rpc listWorkspaces
    * (absolute host paths, no cwd rewrite). Local → loopback scan of REPOS_ROOT.
@@ -15766,169 +15765,16 @@ export class Orchestrator {
   }
 
   /**
-   * Full new-thread wizard: Agent → CWD → Model → Effort (if the agent
-   * exposes settable levels). Agent is first so the CWD list is the bound
-   * host's workspaces. Each step can be skipped (one option, timeout, or
-   * no picker); a runtime start failure for the model picker is a notice.
+   * Replace the still-untouched `seam` base once a setup repo is known, so a
+   * `/seam new` thread ends up named after the repo it was pointed at. Any
+   * other base is the user's — left alone.
    */
-  private async runSetupWizard(
-    channel: ChannelRef,
-    record: SessionRecord
-  ): Promise<void> {
-    let currentRecord = record;
-
-    // Step 1: Agent @ host (skip when there's only one choice). Timeout
-    // keeps the default agent so CWD still lists that host.
-    const profiles = this.router.listProfiles();
-    const agentChoices = agentLocationPickerChoices(profiles, {
-      bridges: this.config.bridgePresets.values(),
-      connected: this.bridgeHub?.connectedIds(),
-      agentsByHost: this.bridgeHub?.installedAgentsByHost(),
-    });
-    if (agentChoices.length > 1 && this.adapter.sendChoicePicker) {
-      const picked = await this.adapter.sendChoicePicker(channel, {
-        panel: {
-          color: 0x5865f2,
-          title: "🤖 Choose an agent",
-          fields: [{ name: "Default", value: `\`${currentRecord.agentId}\``, inline: true }],
-        },
-        choices: agentChoices,
-        authorizedUserIds: mayConfigureUserIds(this.config),
-        successPanel: (pickedChoice, username) => ({
-          color: 0x57f287,
-          title: "✅ Agent changed",
-          fields: [
-            { name: "Default", value: `\`${currentRecord.agentId}\``, inline: true },
-            { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
-          ],
-          footer: `Changed by ${username}`
-        }),
-      });
-      if (
-        picked &&
-        picked.value !==
-          currentAgentAtLocation(currentRecord.agentId, this.config, channel.id)
-      ) {
-        await this.applyAgentChange(channel, currentRecord, picked.value);
-        currentRecord = this.store.get(currentRecord.id) ?? currentRecord;
-      }
-    }
-
-    // Step 2: CWD on the (now bound) host.
-    const repoPicked = await this.promptRepoPath(channel, {
-      title: "🗂️ Select a working directory",
-    });
-    if (repoPicked) {
-      const applied = await this.applyPickedRepo(channel, repoPicked);
-      if (applied.ok) {
-        currentRecord = applied.record;
-      } else {
-        await this.adapter.sendMessage(channel, `🛡️ ${applied.error}`);
-      }
-    }
-
-    await this.renameThreadForSetup(channel, currentRecord);
-
-    // Step 3: Model
-    if (this.adapter.sendChoicePicker) {
-      try {
-        let models: ReadonlyArray<{ modelId: string; name?: string }> = [];
-        const profile = this.router.getProfile(currentRecord.agentId);
-
-        if (profile?.staticModels && profile.staticModels.length > 0) {
-          models = profile.staticModels;
-        } else {
-          const rt = await this.router.getOrStartRuntime(currentRecord);
-          models = rt.getSessionInfo()?.availableModels ?? [];
-        }
-
-        this.logger.info(
-          { agentId: currentRecord.agentId, modelsLength: models.length },
-          "Setup wizard checking models for picker"
-        );
-
-        if (models.length > 1) {
-          const cfg = this.store.readConfig(currentRecord);
-          const current = cfg.model ?? this.config.DEFAULT_MODEL;
-          const picked = await this.adapter.sendChoicePicker(channel, {
-            panel: {
-              color: 0x5865f2,
-              title: "🧠 Choose a model",
-              fields: [{ name: "Default", value: `\`${current}\``, inline: true }],
-            },
-            choices: models.map((m) => ({
-              value: m.modelId,
-              label: m.name ?? m.modelId,
-              description:
-                m.modelId === current ? `${m.modelId} (current)` : m.modelId,
-            })),
-            authorizedUserIds: mayConfigureUserIds(this.config),
-            successPanel: (pickedChoice, username) =>
-              modelSelectionConfirmationPanel(current, pickedChoice.value, username),
-          });
-          if (picked && picked.value !== current) {
-            await this.applyModelChange(channel, currentRecord, picked.value);
-          }
-        }
-      } catch (err) {
-        this.logger.warn(
-          { err },
-          "wizard: could not start runtime for model picker"
-        );
-        await this.adapter.sendMessage(
-          channel,
-          `_Could not list models: ${(err as Error).message}. Use \`/seam config model\` later._`
-        );
-      }
-    }
-
-    // Step 4: Effort, only when this agent exposes settable levels.
-    const effortProfile = this.router.getProfile(currentRecord.agentId);
-    const supported = effortProfile?.effort?.levels ?? [];
-    if (supported.length > 0 && this.adapter.sendChoicePicker) {
-      const cfg = this.store.readConfig(currentRecord);
-      const current = cfg.reasoningEffort ?? "default";
-      const effortChoices = EFFORT_CHOICES.filter((c) =>
-        supported.includes(c.value)
-      );
-      if (effortChoices.length > 0) {
-        const picked = await this.adapter.sendChoicePicker(channel, {
-          panel: {
-            color: 0x5865f2,
-            title: "⚡ Choose reasoning effort",
-            fields: [{ name: "Default", value: `\`${current}\``, inline: true }],
-          },
-          choices: effortChoices,
-          authorizedUserIds: mayConfigureUserIds(this.config),
-          successPanel: (pickedChoice, username) => ({
-            color: 0x57f287,
-            title: "✅ Effort changed",
-            fields: [
-              { name: "Default", value: `\`${current}\``, inline: true },
-              { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
-            ],
-            footer: `Changed by ${username} — applies on the next message`,
-          }),
-        });
-        if (picked && picked.value !== current) {
-          await this.applyEffortChange(currentRecord, picked.value);
-        }
-      }
-    }
-
-    await this.adapter.sendMessage(
-      channel,
-      `✅ Setup complete. Send a message to begin.`
-    );
-  }
-
-  /** Replace the untouched `seam` base after the setup repo is known. */
   private async renameThreadForSetup(
     channel: ChannelRef,
-    record: SessionRecord
+    record: SessionRecord,
+    repoPath: string | null | undefined
   ): Promise<void> {
     if (!this.adapter.renameThread || !this.adapter.getThreadName || !channel.parentId) return;
-    const repoPath = record.repoPath;
     if (!repoPath) return;
     try {
       const current = await this.adapter.getThreadName(channel);
@@ -15937,7 +15783,7 @@ export class Orchestrator {
       if (base?.toLowerCase() !== "seam") return;
       await this.renameThreadBase(record, this.repoDisplay(repoPath));
     } catch (err) {
-      this.logger.warn({ err, channelId: channel.id }, "wizard: thread naming failed");
+      this.logger.warn({ err, channelId: channel.id }, "setup thread naming failed");
     }
   }
 

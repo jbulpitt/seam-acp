@@ -10,6 +10,7 @@ import type {
   ConfigLayer,
   ResolvedSetting,
 } from "../../core/session-router.js";
+import { formatAgentAtLocation } from "../../core/location.js";
 
 export const CFG_EDIT_PREFIX = "seam-cfg-edit";
 export const INHERIT_VALUE = "__inherit__";
@@ -19,7 +20,6 @@ export const RIDER_MODAL_MAX = 4000;
 export const RIDER_FILE_MAX_BYTES = 25 * 1024 * 1024;
 
 export type ConfigEditorAction =
-  | "host"
   | "agent"
   | "model"
   | "effort"
@@ -45,7 +45,6 @@ export type ConfigEditorScope = "thread" | "channel";
 export const HUB_FIELD_ACTIONS: ReadonlyArray<
   Exclude<ConfigEditorAction, "save" | "cancel" | "scope" | "rider-save" | "role-save">
 > = [
-  "host",
   "agent",
   "model",
   "effort",
@@ -589,6 +588,23 @@ function draftNoteFor(
   return `will be ${code(overlay)}`;
 }
 
+/** The addressable id the thread will run as once this draft is saved (#156). */
+export function effectiveAgentAtLocation(draft: ThreadConfigDraft): string {
+  const next = effectiveAfterDraft(draft);
+  return formatAgentAtLocation(next.agent, next.location);
+}
+
+/** Agent + host move together, so they get one "will be `agent@host`" note. */
+function agentDraftNote(draft: ThreadConfigDraft): string | undefined {
+  const o = draft.overlay;
+  if (o.agent === undefined && o.location === undefined) return undefined;
+  const w = draft.snapshot.withoutThread;
+  if (o.agent === null) {
+    return `will inherit ${code(formatAgentAtLocation(w.agent, w.location))}`;
+  }
+  return `will be ${code(effectiveAgentAtLocation(draft))}`;
+}
+
 export function renderHub(
   draft: ThreadConfigDraft,
   ctx: HubRenderContext = {}
@@ -686,12 +702,8 @@ export function renderHub(
   }
   const actions: StructuredPanel["actions"] = [
     [
-      {
-        customId: makeCustomId(id, "host"),
-        label: "Host",
-        style: "secondary",
-        disabled: threadOnlyDisabled,
-      },
+      // #156: no separate Host button — Agent picks `agentId@location`, so the
+      // host is chosen with the agent and shown read-only below.
       { customId: makeCustomId(id, "agent"), label: "Agent", style: "secondary" },
       { customId: makeCustomId(id, "model"), label: "Model", style: "secondary" },
       {
@@ -726,13 +738,26 @@ export function renderHub(
     ],
   ];
 
+  // #156: render the addressable id (`agentId@location`) so the card states the
+  // host exactly once, on the control that sets it.
   const agentLine = channelScope
     ? fieldLine(
         code(pins.agent),
         pins.agent ? "channel" : "default",
         draftNoteFor(o.channelAgent, "not set")
       )
-    : fieldLine(code(s.agent.value), sourceLabel(s.agent.source), draftNoteFor(o.agent, w.agent));
+    : fieldLine(
+        code(formatAgentAtLocation(s.agent.value, s.location.value)),
+        sourceLabel(s.agent.source),
+        agentDraftNote(draft)
+      );
+  const hostLine = channelScope
+    ? fieldLine("`per-thread`", "set with the agent")
+    : fieldLine(
+        locCurrent,
+        `${sourceLabel(s.location.source)} · from agent`,
+        draftNoteFor(o.location, w.location)
+      );
   const modelLine = channelScope
     ? fieldLine(
         code(pins.model),
@@ -796,16 +821,13 @@ export function renderHub(
     ...(warningBlock ? { description: warningBlock } : {}),
     fields: [
       {
-        name: "Host",
-        value: trunc(
-          fieldLine(locCurrent, sourceLabel(s.location.source), draftNoteFor(o.location, w.location)),
-          1024
-        ),
+        name: "Agent",
+        value: trunc(agentLine, 1024),
         inline: true,
       },
       {
-        name: "Agent",
-        value: trunc(agentLine, 1024),
+        name: "Host",
+        value: trunc(hostLine, 1024),
         inline: true,
       },
       {
@@ -1109,26 +1131,27 @@ export function applyPickerValue(
   const channelScope = editScopeOf(draft) === "channel";
 
   switch (field) {
-    case "host":
-      if (channelScope) return draft;
-      overlay.location = inherit ? null : value;
-      break;
+    // #156: an agent id already encodes its host (`agentId@location`), so the
+    // agent picker is the ONLY writer of `location`. Every branch below writes
+    // both halves together — the draft can never hold a host that no agent
+    // choice put there.
     case "agent": {
       if (channelScope) {
+        // Channel presets pin an agent id only; location stays per-thread.
         overlay.channelAgent = inherit ? null : value.includes("@") ? value.slice(0, value.lastIndexOf("@")) : value;
         break;
       }
       if (inherit) {
         overlay.agent = null;
-      } else {
-        const at = value.lastIndexOf("@");
-        if (at > 0 && at < value.length - 1) {
-          overlay.agent = value.slice(0, at);
-          overlay.location = value.slice(at + 1);
-        } else {
-          overlay.agent = value;
-        }
+        overlay.location = null;
+        break;
       }
+      const at = value.lastIndexOf("@");
+      const explicit = at > 0 && at < value.length - 1;
+      overlay.agent = explicit ? value.slice(0, at) : value;
+      // A bare id means "local" everywhere else in Seam; clearing the overlay
+      // inherits local rather than stranding the previous host pin.
+      overlay.location = explicit ? value.slice(at + 1) : null;
       break;
     }
     case "model":
@@ -1202,7 +1225,7 @@ export function applyPickerValue(
     warnings,
     updatedAt: now,
   };
-  if (!channelScope && (field === "host" || field === "agent")) {
+  if (!channelScope && field === "agent") {
     const agentId = effectiveAfterDraft(updated).agent;
     return dropUnsupported(updated, capsForAgent(agentId));
   }

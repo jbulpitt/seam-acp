@@ -147,6 +147,12 @@ Discord has no aliases; old invocations disappear.
   - `role` sets a thread's naming role; `rename` refreshes/migrates names
     (`migrate-legacy:true` for old hand-typed prefixes); `namer` edits the
     agent/model/role symbol tables.
+  - `edit` is the **one** configuration surface (#157): `/seam new` and
+    `/seam config init` both post this card instead of running a setup wizard.
+    There is no host selector on it — an agent id is `agentId@location`, so
+    the **Agent** picker binds the host too and Host is shown read-only (#156).
+    To pre-bind a host that is currently offline (it lists no agents), use
+    `/seam config agent id:<agentId>@<host>`.
 - `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
 - `schedule` (7), `preset` (6), `project` (3) — unchanged
 - `upload` (3): `pull` `push` `secret` — **admin-only**. Hard cutover of `/seam attach`.

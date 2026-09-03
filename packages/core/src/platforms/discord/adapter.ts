@@ -93,6 +93,7 @@ import {
   choicePickerLayout,
   choicePickerPageCaption,
   describeMultiSelectMenu,
+  finalizeChoicePick,
   sliceChoicePage,
 } from "./choice-picker.js";
 import {
@@ -1007,6 +1008,13 @@ export class DiscordAdapter implements ChatAdapter {
       timeoutMs?: number;
       authorizedUserIds?: ReadonlySet<string>;
       successPanel?: (picked: { value: string; label: string }, username: string) => import("../../core/types.js").StructuredPanel;
+      commit?: (
+        picked: { value: string; label: string },
+        username: string
+      ) => Promise<
+        | { ok: true; successPanel?: import("../../core/types.js").StructuredPanel }
+        | { ok: false; error: string; failurePanel?: import("../../core/types.js").StructuredPanel }
+      >;
       allowCustom?: {
         buttonLabel?: string;
         modalTitle?: string;
@@ -1121,12 +1129,14 @@ export class DiscordAdapter implements ChatAdapter {
 
     const successPayload = (
       chosen: { value: string; label: string },
-      username: string
+      username: string,
+      panel?: import("../../core/types.js").StructuredPanel
     ) => {
-      if (opts.successPanel) {
+      const successPanel = panel ?? opts.successPanel?.(chosen, username);
+      if (successPanel) {
         return {
           content: opts.prompt,
-          embeds: [DiscordAdapter.buildEmbed(opts.successPanel(chosen, username))],
+          embeds: [DiscordAdapter.buildEmbed(successPanel)],
           components: [],
         };
       }
@@ -1143,6 +1153,51 @@ export class DiscordAdapter implements ChatAdapter {
         embeds: [],
         components: [],
       };
+    };
+
+    const failurePayload = (
+      chosen: { value: string; label: string },
+      error: string,
+      panel?: import("../../core/types.js").StructuredPanel
+    ) => {
+      if (panel) {
+        return {
+          content: opts.prompt,
+          embeds: [DiscordAdapter.buildEmbed(panel)],
+          components: [],
+        };
+      }
+      const failEmbed = DiscordAdapter.buildEmbed(
+        opts.panel ?? { color: 0xed4245, title: "Choice failed", fields: [] }
+      ).setColor(0xed4245);
+      failEmbed.setDescription(`❌ **${chosen.label}** — ${error}`.slice(0, 4096));
+      return { content: opts.prompt, embeds: [failEmbed], components: [] };
+    };
+
+    const settlePick = async (
+      interaction: MessageComponentInteraction | ModalSubmitInteraction,
+      chosen: { value: string; label: string },
+      username: string
+    ): Promise<{ value: string; userId: string } | null> => {
+      await interaction.deferUpdate().catch(() => {});
+      if (opts.commit) {
+        const settled = await finalizeChoicePick({
+          picked: chosen,
+          username,
+          successPanel: opts.successPanel,
+          commit: opts.commit,
+          showSuccess: async (panel) => {
+            await msg.edit(successPayload(chosen, username, panel));
+          },
+          showFailure: async (error, panel) => {
+            await msg.edit(failurePayload(chosen, error, panel));
+          },
+        });
+        if (!settled.applied) return null;
+        return { value: chosen.value, userId: interaction.user.id };
+      }
+      await msg.edit(successPayload(chosen, username));
+      return { value: chosen.value, userId: interaction.user.id };
     };
 
     const msg = await ch.send({
@@ -1250,11 +1305,11 @@ export class DiscordAdapter implements ChatAdapter {
             await rejectPick(submitted, err);
             continue;
           }
-          await submitted.deferUpdate();
-          await msg.edit(
-            successPayload({ value: raw, label: raw }, submitted.user.username)
+          return await settlePick(
+            submitted,
+            { value: raw, label: raw },
+            submitted.user.username
           );
-          return { value: raw, userId: submitted.user.id };
         }
 
         let pickedIdx: number | undefined;
@@ -1291,13 +1346,11 @@ export class DiscordAdapter implements ChatAdapter {
           await rejectPick(interaction, err);
           continue;
         }
-        await interaction.update(
-          successPayload(
-            { value: chosen.value, label: chosen.label },
-            interaction.user.username
-          )
+        return await settlePick(
+          interaction,
+          { value: chosen.value, label: chosen.label },
+          interaction.user.username
         );
-        return { value: chosen.value, userId: interaction.user.id };
       }
     } catch {
       try {

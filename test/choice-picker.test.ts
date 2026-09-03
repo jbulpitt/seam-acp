@@ -7,6 +7,7 @@ import {
   describeMultiSelectMenu,
   sliceChoicePage,
   choicePickerPageCaption,
+  finalizeChoicePick,
 } from "../packages/core/src/platforms/discord/choice-picker.js";
 import {
   makeChoiceConfirmId,
@@ -197,5 +198,70 @@ describe("multi-select menu + Confirm (#94)", () => {
     expect(confirmJson.components[0]!.custom_id).toBe("choice:abc:c");
     expect(confirmJson.components[0]!.label).toBe("Confirm");
     expect(confirmJson.components[0]!.disabled).toBe(true);
+  });
+});
+
+describe("finalizeChoicePick commit-then-render order", () => {
+  const picked = { value: "codex@local", label: "Codex" };
+
+  it("does not render success until commit resolves ok", async () => {
+    const order: string[] = [];
+    const result = await finalizeChoicePick({
+      picked,
+      username: "jesse",
+      commit: async () => {
+        order.push("commit");
+        return { ok: true, successPanel: { color: 0x57f287, title: "✅ Agent changed", fields: [] } };
+      },
+      showSuccess: async () => {
+        order.push("success");
+      },
+      showFailure: async () => {
+        order.push("failure");
+      },
+    });
+    expect(result).toEqual({ applied: true });
+    expect(order).toEqual(["commit", "success"]);
+  });
+
+  it("renders failure and skips success when commit returns ok:false", async () => {
+    const order: string[] = [];
+    const result = await finalizeChoicePick({
+      picked,
+      username: "jesse",
+      successPanel: () => ({ color: 0x57f287, title: "✅ Agent changed", fields: [] }),
+      commit: async () => {
+        order.push("commit");
+        return { ok: false, error: "injected overlay failure" };
+      },
+      showSuccess: async () => {
+        order.push("success");
+      },
+      showFailure: async (error) => {
+        order.push(`failure:${error}`);
+      },
+    });
+    expect(result.applied).toBe(false);
+    expect(order).toEqual(["commit", "failure:injected overlay failure"]);
+  });
+
+  it("renders failure when commit throws", async () => {
+    const order: string[] = [];
+    const result = await finalizeChoicePick({
+      picked,
+      username: "jesse",
+      commit: async () => {
+        order.push("commit");
+        throw new Error("injected persistence exception");
+      },
+      showSuccess: async () => {
+        order.push("success");
+      },
+      showFailure: async (error) => {
+        order.push(`failure:${error}`);
+      },
+    });
+    expect(result.applied).toBe(false);
+    expect(order).toEqual(["commit", "failure:injected persistence exception"]);
   });
 });

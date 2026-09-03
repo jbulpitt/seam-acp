@@ -10211,8 +10211,8 @@ export class Orchestrator {
       // No id given — show an interactive picker. Eagerly start the
       // runtime if needed so we have an availableModels list (the model
       // catalog comes from the agent at session-start, not from us).
-      const cfg = this.store.readConfig(record);
-      const current = cfg.model ?? this.config.DEFAULT_MODEL;
+      const live = this.store.get(record.id) ?? record;
+      const current = this.router.describeConfig(live).model.value;
       const displayCurrent = `\`${current}\``;
       if (!this.adapter.sendChoicePicker) {
         await i.reply({
@@ -10223,7 +10223,7 @@ export class Orchestrator {
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       let models: ReadonlyArray<{ modelId: string; name?: string }> = [];
-      const profile = this.router.getProfile(record.agentId);
+      const profile = this.router.getProfile(this.router.describeConfig(live).agent.value);
       if (profile?.staticModels && profile.staticModels.length > 0) {
         models = profile.staticModels;
       } else {
@@ -10279,8 +10279,9 @@ export class Orchestrator {
     id: string,
     interaction?: ChatInputCommandInteraction
   ): Promise<void> {
-    const cfg = this.store.readConfig(record);
-    const current = cfg.model ?? this.config.DEFAULT_MODEL;
+    const live = this.store.get(record.id) ?? record;
+    const cfg = this.store.readConfig(live);
+    const current = this.router.describeConfig(live).model.value;
     if (id === current) {
       await this.applyThreadName(this.store.get(record.id) ?? record);
       const message = `🧠 Model already set to \`${id}\` (no change).`;
@@ -10296,7 +10297,7 @@ export class Orchestrator {
     // belong to a different model now. Invalidate so the next turn starts
     // clean rather than seeding the panel with mismatched numbers.
     cfg.lastContextUsage = undefined;
-    this.persistConfig(record, cfg);
+    this.persistConfig(live, cfg);
     const overlay = this.configMutation.applyThreadOverlay({
       threadId: channel.id,
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
@@ -11513,9 +11514,10 @@ export class Orchestrator {
     });
     const id = i.options.getString("id");
     const profiles = this.router.listProfiles();
-    const currentAt = currentAgentAtLocation(record.agentId, this.config, channel.id);
+    const effectiveAgent = this.router.describeConfig(record).agent.value;
+    const currentAt = currentAgentAtLocation(effectiveAgent, this.config, channel.id);
     const currentLabel = currentHostPrefixedLabel(
-      record.agentId,
+      effectiveAgent,
       this.config,
       channel.id,
       this.config.bridgePresets
@@ -11542,7 +11544,7 @@ export class Orchestrator {
         content: `Current agent: \`${currentAt}\`. Posting picker…`,
         flags: MessageFlags.Ephemeral,
       });
-      const picked = await this.adapter.sendChoicePicker(channel, {
+      await this.adapter.sendChoicePicker(channel, {
         panel: {
           color: 0x5865f2,
           title: "🤖 Choose an agent @ host",
@@ -11550,18 +11552,38 @@ export class Orchestrator {
         },
         choices,
         authorizedUserIds: mayConfigureUserIds(this.config),
-        successPanel: (pickedChoice, username) => ({
-          color: 0x57f287,
-          title: "✅ Agent changed",
-          fields: [
-            { name: "Previous", value: `\`${currentAt}\``, inline: true },
-            { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
-          ],
-          footer: `Changed by ${username}`
-        }),
+        commit: async (pickedChoice, username) => {
+          const result = await this.applyAgentChange(channel, record, pickedChoice.value);
+          if (!result.ok) {
+            return {
+              ok: false,
+              error: result.error,
+              failurePanel: {
+                color: 0xed4245,
+                title: "❌ Agent not changed",
+                fields: [
+                  { name: "Current", value: `\`${currentAt}\``, inline: true },
+                  { name: "Requested", value: `\`${pickedChoice.value}\``, inline: true },
+                  { name: "Error", value: result.error.slice(0, 1024) },
+                ],
+                footer: `Attempted by ${username}`,
+              },
+            };
+          }
+          return {
+            ok: true,
+            successPanel: {
+              color: 0x57f287,
+              title: "✅ Agent changed",
+              fields: [
+                { name: "Previous", value: `\`${currentAt}\``, inline: true },
+                { name: "New", value: `\`${pickedChoice.value}\``, inline: true },
+              ],
+              footer: `Changed by ${username}`,
+            },
+          };
+        },
       });
-      if (!picked) return;
-      await this.applyAgentChange(channel, record, picked.value);
       return;
     }
 
@@ -11573,85 +11595,175 @@ export class Orchestrator {
     record: SessionRecord,
     id: string,
     interaction?: ChatInputCommandInteraction
-  ): Promise<void> {
+  ): Promise<{ ok: true; message: string } | { ok: false; error: string }> {
     const parsed = parseAgentAtLocation(id);
     const profile = this.router.getProfile(parsed.agentId);
+    const respond = async (msg: string): Promise<void> => {
+      if (interaction) {
+        if (!interaction.replied && !interaction.deferred) {
+          await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
+        } else {
+          await this.adapter.sendMessage(channel, msg);
+        }
+      } else {
+        await this.adapter.sendMessage(channel, msg);
+      }
+    };
+    const fail = async (error: string): Promise<{ ok: false; error: string }> => {
+      await respond(error.startsWith("Could not") ? error : `Could not switch agent: ${error}`);
+      return { ok: false, error };
+    };
     if (!profile) {
-      const msg = `Unknown agent \`${parsed.agentId}\`.`;
-      if (interaction) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-      else await this.adapter.sendMessage(channel, msg);
-      return;
+      return fail(`Unknown agent \`${parsed.agentId}\`.`);
     }
+
+
+    // Re-read after picker latency (or any concurrent command) so the write is
+    // constructed from the live row, not the pre-picker snapshot.
+    record = this.store.get(record.id) ?? record;
+    const describedBefore = this.router.describeConfig(record);
     const currentLocation = resolveThreadLocation(this.config, channel.id);
     const nextLocation = parsed.explicit ? parsed.location : currentLocation;
-    // Spawn uses thread/channel preset over the session record. Compare the
-    // EFFECTIVE agent so a shadowed session write isn't treated as a no-op.
-    const effectiveAgent = this.router.describeConfig(record).agent.value;
-    const sameAgent = effectiveAgent === parsed.agentId;
+    const sameAgent = describedBefore.agent.value === parsed.agentId;
     const sameLocation = currentLocation === nextLocation;
     if (sameAgent && sameLocation) {
       await this.applyThreadName(this.store.get(record.id) ?? record);
       const msg = `Agent is already \`${formatAgentAtLocation(parsed.agentId, nextLocation)}\`.`;
-      if (interaction) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-      else await this.adapter.sendMessage(channel, msg);
-      return;
+      await respond(msg);
+      return { ok: true, message: msg };
     }
-    if (!sameLocation) {
-      const written = this.configMutation.applyThreadLocation({
+
+    const actor = interaction
+      ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
+      : { id: null, name: null };
+    const sessionBefore = { ...(this.store.get(record.id) ?? record) };
+    const overlayBefore = this.configMutation.readThreadPresetEntry(channel.id);
+    const originalEffective = {
+      agent: describedBefore.agent.value,
+      model: describedBefore.model.value,
+      location: describedBefore.location.value,
+    };
+
+    const rollback = (): { acpRestored: boolean } => {
+      const overlayRestored = this.configMutation.restoreThreadPresetEntry(
+        channel.id,
+        overlayBefore
+      );
+      this.store.upsert({
+        ...sessionBefore,
+        acpSessionId: "",
+        updatedUtc: new Date().toISOString(),
+      });
+      const now = this.store.get(sessionBefore.id) ?? sessionBefore;
+      const described = this.router.describeConfig(now);
+      const canRestoreAcp =
+        Boolean(sessionBefore.acpSessionId) &&
+        described.agent.value === originalEffective.agent &&
+        described.model.value === originalEffective.model &&
+        described.location.value === originalEffective.location;
+      if (canRestoreAcp) {
+        this.store.upsert({
+          ...now,
+          acpSessionId: sessionBefore.acpSessionId,
+          updatedUtc: new Date().toISOString(),
+        });
+        return { acpRestored: true };
+      }
+      if (!overlayRestored.ok) {
+        this.logger.warn(
+          { err: overlayRestored.error, threadId: channel.id },
+          "agent-switch overlay rollback failed; ACP id left cleared"
+        );
+      }
+      return { acpRestored: false };
+    };
+
+    try {
+      await this.router.invalidate(record.id);
+      const live = this.store.get(record.id) ?? record;
+      const cfg = this.store.readConfig(live);
+      if (!sameAgent) {
+        cfg.model = profile.defaultModel;
+        delete cfg.lastContextUsage;
+      }
+      const intendedModel = cfg.model ?? profile.defaultModel;
+      this.store.upsert({
+        ...live,
+        agentId: parsed.agentId,
+        acpSessionId: "",
+        configJson: this.store.writeConfig(cfg),
+        updatedUtc: new Date().toISOString(),
+      });
+
+      if (!sameLocation) {
+        const written = this.configMutation.applyThreadLocation({
+          threadId: channel.id,
+          ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+          location: nextLocation,
+          actor,
+        });
+        if (!written.ok) {
+          const rolled = rollback();
+          const suffix = rolled.acpRestored
+            ? ""
+            : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
+          return fail(`${written.error}${suffix}`);
+        }
+      }
+
+      const overlay = this.configMutation.applyThreadOverlay({
         threadId: channel.id,
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-        location: nextLocation,
-        actor: interaction
-          ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
-          : { id: null, name: null },
+        changes: {
+          agent: parsed.agentId,
+          model: intendedModel,
+        },
+        actor,
       });
-      if (!written.ok) {
-        const msg = written.error;
-        if (interaction) await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-        else await this.adapter.sendMessage(channel, msg);
-        return;
+      if (!overlay.ok) {
+        const rolled = rollback();
+        const suffix = rolled.acpRestored
+          ? ""
+          : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
+        this.logger.warn(
+          { err: overlay.error, threadId: channel.id },
+          "thread agent overlay write failed; mutation rolled back"
+        );
+        return fail(`${overlay.error}${suffix}`);
       }
-    }
-    // Kill the live runtime (ends any in-flight turn) and wipe the ACP
-    // session id so the next message spawns the new agent fresh. D2: a
-    // location change is a new host — never migrate the old session.
-    await this.router.invalidate(record.id);
-    const cfg = this.store.readConfig(record);
-    if (!sameAgent) {
-      cfg.model = profile.defaultModel;
-      cfg.lastContextUsage = undefined;
-    }
-    this.persistConfig(record, cfg);
-    this.store.upsert({
-      ...record,
-      agentId: parsed.agentId,
-      acpSessionId: "",
-      updatedUtc: new Date().toISOString(),
-    });
-    // Thread overlay beats a locked channel preset (school channels pin grok).
-    const overlay = this.configMutation.applyThreadOverlay({
-      threadId: channel.id,
-      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      changes: {
-        agent: parsed.agentId,
-        model: cfg.model ?? profile.defaultModel,
-      },
-      actor: interaction
-        ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
-        : { id: null, name: null },
-    });
-    if (!overlay.ok) {
-      this.logger.warn({ err: overlay.error, threadId: channel.id }, "thread agent overlay write failed");
-    }
-    bindSessionLocation(this.bridgeHub, record.id, nextLocation);
-    const renamedRecord = this.store.get(record.id) ?? { ...record, agentId: parsed.agentId };
-    await this.applyThreadName(renamedRecord);
-    const at = formatAgentAtLocation(parsed.agentId, nextLocation);
-    const message = `🤖 Agent switched to \`${at}\` (${profile.displayName}), model \`${cfg.model ?? profile.defaultModel}\`. Next message will start a fresh session.`;
-    if (interaction) {
-      await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
-    } else {
-      await this.adapter.sendMessage(channel, message);
+
+      const verified = this.store.get(live.id) ?? live;
+      const described = this.router.describeConfig(verified);
+      const spawn = this.router.planRuntimeSpawn(verified);
+      if (
+        described.agent.value !== parsed.agentId ||
+        described.model.value !== intendedModel ||
+        spawn.agentId !== parsed.agentId ||
+        spawn.model !== intendedModel
+      ) {
+        const rolled = rollback();
+        const suffix = rolled.acpRestored
+          ? ""
+          : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
+        return fail(
+          `the effective configuration did not match the requested agent/model.${suffix}`
+        );
+      }
+
+      bindSessionLocation(this.bridgeHub, verified.id, nextLocation);
+      await this.applyThreadName(verified);
+      const at = formatAgentAtLocation(parsed.agentId, nextLocation);
+      const message = `🤖 Agent switched to \`${at}\` (${profile.displayName}), model \`${intendedModel}\`. Next message will start a fresh session.`;
+      await respond(message);
+      return { ok: true, message };
+    } catch (err) {
+      const rolled = rollback();
+      const detail = err instanceof Error ? err.message : String(err);
+      const suffix = rolled.acpRestored
+        ? ""
+        : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
+      this.logger.warn({ err, threadId: channel.id }, "agent switch threw; mutation rolled back");
+      return fail(`${detail}${suffix}`);
     }
   }
 

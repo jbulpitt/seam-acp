@@ -195,6 +195,17 @@ export interface ChatAdapter {
       authorizedUserIds?: ReadonlySet<string>;
       successPanel?: (picked: { value: string; label: string }, username: string) => StructuredPanel;
       /**
+       * Durable side effect that must finish BEFORE any success panel is shown.
+       * Return `{ ok:false }` (or throw) to render a failure panel instead.
+       */
+      commit?: (
+        picked: { value: string; label: string },
+        username: string
+      ) => Promise<
+        | { ok: true; successPanel?: StructuredPanel }
+        | { ok: false; error: string; failurePanel?: StructuredPanel }
+      >;
+      /**
        * When set, the picker includes a button that opens a modal for a
        * free-typed value (e.g. a repo path that isn't in the listed folders).
        * Discord select menus cannot accept arbitrary typed values themselves.

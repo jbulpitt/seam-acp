@@ -1144,6 +1144,31 @@ describe("thread-preset mutation (Tier C, #68)", () => {
     expect(raw.threads[THREAD].model).toEqual({ value: "kimi-k3:cloud" });
     expect(live.threadPresets.get(THREAD)?.agent?.value).toBe("ollama-cloud");
   });
+
+  it("reload failure restores the previous presets file instead of leaving a latent overlay", () => {
+    const file = writePresetsFile({ channels: {}, threads: {} });
+    const live = {
+      channelPresets: new Map<string, ChannelPreset>(),
+      threadPresets: new Map<string, ThreadPreset>(),
+    };
+    const svc = makeService({
+      presetsFile: file,
+      tierCEnabled: false,
+      reloadPresets: () => ({ ok: false, error: "injected reload failure" }),
+    });
+    const result = svc.applyThreadOverlay({
+      threadId: THREAD,
+      parentRef: CHAN,
+      changes: { agent: "codex", model: "gpt-5.6-sol" },
+      actor: { id: "user-jesse", name: "Jesse" },
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toMatch(/injected reload failure/);
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(raw.threads?.[THREAD]?.agent).toBeUndefined();
+    expect(live.threadPresets.get(THREAD)?.agent).toBeUndefined();
+  });
 });
 
 // -------------------------------------------------------------------------

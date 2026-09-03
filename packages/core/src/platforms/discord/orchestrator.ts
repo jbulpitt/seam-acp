@@ -8584,10 +8584,10 @@ export class Orchestrator {
   async runScheduledPrompt(id: string): Promise<void> {
     const row = this.store.getScheduled(id);
     if (!row) return;
-    // Live fires run through `queueOnChannel`, which already increments
-    // `activeTurns` around the turn — incrementing here too would double-count
-    // and inflate the redeploy-drain counter while running. So only the isolated
-    // path takes the outer increment (M3).
+    // Live fires run through `queueOnChannel`, which already registers the
+    // turn — registering here too would double-count it and hold the drain open
+    // after the turn had finished. So only the isolated path takes the outer
+    // registration (M3).
     if (row.sessionMode === "live") {
       await this.runScheduledPromptInner(row);
       return;

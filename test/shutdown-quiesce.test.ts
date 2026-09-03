@@ -791,11 +791,11 @@ describe("#174 admission gates", () => {
    * this blocker is about — with only its collaborators faked.
    *
    * What is real: the sentinel read, `stopIntake()`, `waitForRestartDrain`'s
-   * polling, the 2s flush wait, the unlink, and the order of all of it.
-   * What is simulated: the value of `activeTurns`. `runScheduledPrompt`'s
-   * increment is stood in for by moving the counter, so what this proves about
-   * a due fire is precisely that the drain keeps waiting while the counter is
-   * non-zero, and that cron was never stopped before it could fire.
+   * polling, the 2s flush wait, the unlink, the order of all of it — and the
+   * turns, which are registered through the same `beginTurn()` primitive
+   * `runScheduledPrompt` uses, so the drain reads them exactly as it would in
+   * production. What is stubbed is only WHAT the due fire does, not that it
+   * is counted.
    */
   it("keeps cron running through the drain and stops it only in the last beat", async () => {
     vi.useFakeTimers();
@@ -823,8 +823,8 @@ describe("#174 admission gates", () => {
       expect(order).toEqual(["dispatch-intake"]);
 
       // …and cron keeps its timers, which is the only reason a schedule can
-      // still come due here. Simulate one doing so: it takes activeTurns up
-      // even as the original user turn finishes.
+      // still come due here. One does: it registers a turn even as the
+      // original user turn finishes.
       await vi.advanceTimersByTimeAsync(1500);
       expect(order).not.toContain("cron");
       const endDueFire = self.beginTurn(); // a schedule comes due and fires

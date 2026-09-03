@@ -166,6 +166,8 @@ async function main(): Promise<void> {
 
   const claude = makeClaudeProfile({
     ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
+    // Direct api.anthropic.com — the only backend Fast mode (#37) exists on.
+    directAnthropic: true,
     defaultModel: config.CLAUDE_DEFAULT_MODEL,
     staticModels: config.CLAUDE_MODELS,
     maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
@@ -180,6 +182,8 @@ async function main(): Promise<void> {
       displayName: `Anthropic Claude (${p.id})`,
       configDir: p.configDir,
       ...(config.CLAUDE_CLI_PATH ? { cliPath: config.CLAUDE_CLI_PATH } : {}),
+      // Alternate credentials, same direct Anthropic endpoint (#37).
+      directAnthropic: true,
       defaultModel: config.CLAUDE_DEFAULT_MODEL,
       staticModels: config.CLAUDE_MODELS,
       maxThinkingTokens: config.CLAUDE_MAX_THINKING_TOKENS,
@@ -713,6 +717,7 @@ async function main(): Promise<void> {
               agent: cfg.agent.value,
               model: cfg.model.value,
               effort: cfg.effort.value,
+              fastMode: cfg.fastMode?.value === true,
               cwd: cfg.cwd.value,
               busy: router.isBusy(s.id),
               status,

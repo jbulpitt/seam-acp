@@ -11,6 +11,7 @@ import type {
   ResolvedSetting,
 } from "../../core/session-router.js";
 import { formatAgentAtLocation } from "../../core/location.js";
+import { FAST_MODE_COST_WARNING } from "../../core/fast-mode.js";
 
 export const CFG_EDIT_PREFIX = "seam-cfg-edit";
 export const INHERIT_VALUE = "__inherit__";
@@ -31,6 +32,7 @@ export type ConfigEditorAction =
   | "role"
   | "prefix"
   | "attach"
+  | "fast"
   | "save"
   | "cancel"
   | "scope"
@@ -56,6 +58,7 @@ export const HUB_FIELD_ACTIONS: ReadonlyArray<
   "role",
   "prefix",
   "attach",
+  "fast",
 ];
 
 export interface InheritedConfig {
@@ -66,6 +69,8 @@ export interface InheritedConfig {
   cwd: string;
   permission: PermissionPolicyMode;
   detached: boolean;
+  /** Claude Fast mode (#37). Thread-only, so inheriting always means off. */
+  fastMode: boolean;
   statusCardStyle: StatusCardStyle;
   simpleCardGif: boolean;
   role: string | null;
@@ -80,6 +85,7 @@ export interface ThreadConfigSnapshot {
   cwd: ResolvedSetting<string>;
   permission: ResolvedSetting<PermissionPolicyMode>;
   detached: ResolvedSetting<boolean>;
+  fastMode: ResolvedSetting<boolean>;
   statusCardStyle: ResolvedSetting<StatusCardStyle>;
   simpleCardGif: ResolvedSetting<boolean>;
   role: ResolvedSetting<string | null>;
@@ -112,6 +118,8 @@ export interface DraftOverlay {
   cwd?: string | null;
   rider?: string | null;
   detached?: boolean;
+  /** Claude Fast mode (#37). Raw boolean like `detached`; inherit ⇒ off. */
+  fastMode?: boolean;
   permission?: PermissionPolicyMode | null;
   statusCardStyle?: StatusCardStyle | null;
   /** Channel-preset card write (independent of this thread's session overlay). */
@@ -155,6 +163,10 @@ export interface DraftAgentCapabilities {
 
 export interface HubRenderContext {
   effortDisabled?: boolean;
+  /** True when the drafted agent has no Fast mode (#37) — Claude-only, and only
+   *  for direct-Anthropic backends. Disables the Fast control rather than
+   *  offering one that could only ever refuse. */
+  fastDisabled?: boolean;
   /** When false, the Thread↔Channel scope toggle is hidden. Default: shown if the draft has a parent channel. */
   canEditChannel?: boolean;
 }
@@ -199,6 +211,7 @@ export function snapshotFromDescribe(
     cwd: d.cwd,
     permission: d.permission,
     detached: d.detached,
+    fastMode: d.fastMode ?? { value: false, source: "default" },
     statusCardStyle: d.statusCardStyle ?? { value: "full", source: "default" },
     simpleCardGif: d.simpleCardGif ?? { value: false, source: "default" },
     role: d.role ?? { value: null, source: "default" },
@@ -223,6 +236,7 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
   cwd: string;
   permission: PermissionPolicyMode;
   detached: boolean;
+  fastMode: boolean;
   riderThread: string | undefined;
   riderChannel: string | undefined;
   statusCardStyle: StatusCardStyle;
@@ -242,6 +256,7 @@ export function effectiveAfterDraft(draft: ThreadConfigDraft): {
     permission:
       o.permission === undefined ? s.permission.value : o.permission ?? w.permission,
     detached: o.detached === undefined ? s.detached.value : o.detached,
+    fastMode: o.fastMode === undefined ? s.fastMode?.value === true : o.fastMode === true,
     riderThread: o.rider === undefined ? s.rider.thread : o.rider ?? undefined,
     riderChannel: o.channelRider === undefined ? s.rider.channel : o.channelRider ?? undefined,
     statusCardStyle: effectiveCardStyle(draft),
@@ -298,7 +313,18 @@ export function willResetSession(draft: ThreadConfigDraft): boolean {
   const next = effectiveAfterDraft(draft);
   return (
     next.location !== draft.snapshot.location.value ||
-    next.agent !== draft.snapshot.agent.value
+    next.agent !== draft.snapshot.agent.value ||
+    // #37: Fast is a session-start dimension — changing it must land on a fresh
+    // session so an accumulated conversation is never repriced mid-flight.
+    next.fastMode !== (draft.snapshot.fastMode?.value === true)
+  );
+}
+
+/** True when saving this draft turns Fast mode ON (the paid-credit direction). */
+export function willEnableFastMode(draft: ThreadConfigDraft): boolean {
+  return (
+    effectiveAfterDraft(draft).fastMode &&
+    draft.snapshot.fastMode?.value !== true
   );
 }
 
@@ -411,6 +437,10 @@ export function dirtyThreadPresetChanges(draft: ThreadConfigDraft): ThreadPreset
   if (o.detached !== undefined) {
     const current = s.detached.value === true;
     if (o.detached !== current) changes.detached = o.detached;
+  }
+  if (o.fastMode !== undefined) {
+    const current = s.fastMode?.value === true;
+    if (o.fastMode !== current) changes.fastMode = o.fastMode;
   }
   return changes;
 }
@@ -627,6 +657,10 @@ export function renderHub(
     s.location.value === "local" && s.location.source === "default"
       ? "`local` (default)"
       : code(s.location.value);
+  // #37: Fast is thread-only, so channel scope has nothing to show but why.
+  const fastCurrent = s.fastMode?.value ? "`on`" : "`off`";
+  const fastSource = s.fastMode?.source ?? "default";
+
   const attachCurrent = s.detached.value ? "`detached`" : "`attached`";
   const attachSource = s.detached.value ? "thread" : "default";
   const attachDraft =
@@ -635,6 +669,18 @@ export function renderHub(
       : o.detached
         ? "will be `detached`"
         : "will be `attached`";
+
+  const fastLine = channelScope
+    ? fieldLine("`per-thread`", "Fast is never pinned channel-wide")
+    : fieldLine(
+        fastCurrent,
+        sourceLabel(fastSource),
+        o.fastMode === undefined
+          ? undefined
+          : o.fastMode
+            ? "will be `on` — fresh session, paid credits"
+            : "will be `off` — fresh session"
+      );
 
   const riderThread = o.rider === undefined ? s.rider.thread : o.rider ?? undefined;
   const riderChannel = o.channelRider === undefined ? s.rider.channel : o.channelRider ?? undefined;
@@ -676,7 +722,16 @@ export function renderHub(
   const footerParts = channelScope
     ? ["editing channel preset", "all threads inherit", "applies on the next turn"]
     : ["applies on the next turn"];
-  if (reset) footerParts.push("⚠ Saving will reset the ACP session (host/agent change)");
+  const fastChanging =
+    effectiveAfterDraft(draft).fastMode !== (s.fastMode?.value === true);
+  if (reset) {
+    footerParts.push(
+      fastChanging
+        ? "⚠ Saving will reset the ACP session (Fast mode is applied to a fresh session)"
+        : "⚠ Saving will reset the ACP session (host/agent change)"
+    );
+  }
+  if (willEnableFastMode(draft)) footerParts.push(`⚡ ${FAST_MODE_COST_WARNING}`);
   if (!dirty) footerParts.push("no changes yet");
   if (s.effortIgnoredNote) footerParts.push(s.effortIgnoredNote);
   if (s.locked && channelScope) footerParts.push("channel is locked — admin-only");
@@ -735,6 +790,13 @@ export function renderHub(
     [
       { customId: makeCustomId(id, "role"), label: "Role", style: "secondary" },
       { customId: makeCustomId(id, "prefix"), label: "Auto-name", style: "secondary" },
+      {
+        customId: makeCustomId(id, "fast"),
+        label: "Fast",
+        style: "secondary",
+        // Thread-only (a channel pin would bill every sibling) and Claude-only.
+        disabled: threadOnlyDisabled || ctx.fastDisabled === true,
+      },
     ],
   ];
 
@@ -878,6 +940,11 @@ export function renderHub(
         inline: true,
       },
       {
+        name: "Fast",
+        value: trunc(fastLine, 1024),
+        inline: true,
+      },
+      {
         name: "Card",
         value: trunc(
           fieldLine(
@@ -983,6 +1050,10 @@ export function draftAfterSave(draft: ThreadConfigDraft): ThreadConfigDraft {
       detached: {
         value: next.detached,
         source: next.detached ? "thread preset" : "default",
+      },
+      fastMode: {
+        value: next.fastMode,
+        source: next.fastMode ? "thread preset" : "default",
       },
       statusCardStyle: {
         value: next.statusCardStyle,
@@ -1190,6 +1261,12 @@ export function applyPickerValue(
       if (channelScope) return draft;
       if (inherit) overlay.detached = false;
       else overlay.detached = value === "detached";
+      break;
+    // #37: thread-only, like attach/approve. Inherit means off — there is no
+    // channel or session layer beneath a thread's Fast setting.
+    case "fast":
+      if (channelScope) return draft;
+      overlay.fastMode = !inherit && value === "on";
       break;
     case "card":
       if (inherit) {

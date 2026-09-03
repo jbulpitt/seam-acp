@@ -10,6 +10,7 @@ import {
   type AgentProfile,
 } from "../agent-profile.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
+import { CLAUDE_FAST_MODE } from "../fast-mode.js";
 
 /**
  * Resolve the Claude Code projects directory for a given cwd. Claude Code's
@@ -110,6 +111,14 @@ export function makeClaudeProfile(opts: {
    * are not Anthropic (zai → `z-ai`, ollama-cloud, claude-vertex → `vertex`).
    */
   brand?: string;
+  /**
+   * Opt in to direct-Anthropic-only capabilities — today just Fast mode (#37).
+   * MUST stay a positive allowlist: set it only for profiles that reach
+   * api.anthropic.com directly. Vertex/Bedrock/Foundry and Anthropic-compatible
+   * third parties (Z.ai, Ollama Cloud) leave it unset, so no Fast control is
+   * ever offered for a backend that cannot serve it.
+   */
+  directAnthropic?: boolean;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "claude-agent-acp";
   const configDir = opts.configDir?.trim() || undefined;
@@ -133,6 +142,19 @@ export function makeClaudeProfile(opts: {
     // Effort is applied via `_meta.claudeCode.options.effort` in newSessionMeta.
     // Overridable for non-Anthropic backends (e.g. Ollama → mechanism "none").
     effort: opts.effort ?? { mechanism: "meta", levels: ["low", "medium", "high", "xhigh", "max"] },
+    // Fast mode (#37) is a **direct-Anthropic** serving mode: upstream reports
+    // `not_first_party` for Vertex / Bedrock / Foundry, and an Anthropic-compat
+    // endpoint (Z.ai, Ollama Cloud) has no such concept at all.
+    //
+    // This is a POSITIVE allowlist — `directAnthropic` must be opted into by the
+    // caller. A negative "no base URL" check silently re-broke for Vertex (which
+    // redirects via CLAUDE_CODE_USE_VERTEX, not a base URL) and would re-break
+    // for the next backend. Defaulting to off means a new profile is Fast-less
+    // until someone deliberately says otherwise.
+    //
+    // Even opted in, this is eligibility only: AgentRuntime still requires the
+    // live session to advertise config id `fast` before applying anything.
+    ...(opts.directAnthropic ? { fastMode: CLAUDE_FAST_MODE } : {}),
     spawn(modelOverride?: string, _effortOverride?: string) {
       const env: NodeJS.ProcessEnv = { ...process.env };
       if (configDir) env.CLAUDE_CONFIG_DIR = configDir;

@@ -2,6 +2,7 @@ import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable as NodeReadable, Writable as NodeWritable } from "node:stream";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { ContextUsage, ISessionManager, SessionSummary } from "./session-manager.js";
+import type { FastModeDescriptor } from "./fast-mode.js";
 
 /**
  * Adapter contract version advertised by in-process local agents via
@@ -175,6 +176,18 @@ export interface AgentAdapter {
    * Omit entirely to mean "not settable" (treated like "none").
    */
   readonly effort?: EffortDescriptor;
+
+  /**
+   * Whether this agent can serve turns in Fast mode (#37), and under which ACP
+   * config id / values. Claude-only today, and only for direct-Anthropic
+   * backends — a Claude harness pointed at another provider has no Fast mode.
+   *
+   * Declaring this is a claim of *eligibility*, never proof: Fast support
+   * varies per model and per wrapper build, so `AgentRuntime` still requires
+   * the live session's `configOptions` to advertise `configId` before applying
+   * anything. Omit entirely to mean "no Fast mode".
+   */
+  readonly fastMode?: FastModeDescriptor;
 
   /**
    * Optional `_meta` payload to attach to `session/new`. Lets a vendor

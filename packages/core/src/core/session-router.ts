@@ -58,6 +58,9 @@ export interface RuntimeSpawnPlan {
   profile: AgentProfile;
   model: string;
   effort?: string;
+  /** Claude Fast mode (#37). Only ever true when the profile declares Fast —
+   *  the live session's advertised options are still the final authority. */
+  fastMode: boolean;
   cwd: string;
   mcpServers: McpServer[];
   remote: boolean;
@@ -153,6 +156,13 @@ export interface ConfigDescription {
   simpleCardGif: ResolvedSetting<boolean>;
   /** OR-composed session/thread/channel opt-out from automatic thread naming. */
   disableThreadPrefix: ResolvedSetting<boolean>;
+  /**
+   * Claude Fast mode (#37): a per-thread **session-start** dimension, distinct
+   * from model and effort. Thread-preset only (a channel-wide pin would bill
+   * every sibling thread), default `false`. Requesting it does not guarantee it
+   * — the live session must advertise ACP config id `fast`.
+   */
+  fastMode: ResolvedSetting<boolean>;
 }
 
 /** Layout the status card should render. Always `"full"` or `"simple"`. */
@@ -381,6 +391,12 @@ export class SessionRouter {
       ? { value: true, source: "thread preset" }
       : { value: false, source: "default" };
 
+    // #37: thread-preset only, like `detached`/`tts`. Off is the default and the
+    // only state an agent without Fast can be in.
+    const fastMode: ResolvedSetting<boolean> = thread?.fastMode
+      ? { value: true, source: "thread preset" }
+      : { value: false, source: "default" };
+
     const ttsVoice: ResolvedSetting<string | null> = thread?.ttsVoice
       ? { value: thread.ttsVoice, source: "thread preset" }
       : { value: null, source: "default" };
@@ -455,6 +471,7 @@ export class SessionRouter {
       statusCardStyle,
       simpleCardGif,
       disableThreadPrefix,
+      fastMode,
       ...(effortIgnoredNote ? { effortIgnoredNote } : {}),
     };
   }
@@ -787,7 +804,12 @@ export class SessionRouter {
       : presetEffortUsable
         ? preset.effort!.value
         : cfg.reasoningEffort;
-    const cwd = this.describeConfig(record).cwd.value;
+    const described = this.describeConfig(record);
+    const cwd = described.cwd.value;
+    // #37: never request Fast from an agent that has no such concept — that
+    // would be an un-actionable refusal on every single turn. Whether the live
+    // session honors it is decided against its advertised config options.
+    const fastMode = described.fastMode.value === true && profile.fastMode !== undefined;
 
     if (this.seamMcp && this.seamMcp.getPort() === undefined) {
       this.logger.warn(
@@ -838,7 +860,7 @@ export class SessionRouter {
         });
     }
 
-    return { agentId, profile, model, effort, cwd, mcpServers, remote, spawnChild };
+    return { agentId, profile, model, effort, fastMode, cwd, mcpServers, remote, spawnChild };
   }
 
   /**
@@ -861,7 +883,7 @@ export class SessionRouter {
     // whatever's in CHANNEL_PRESETS_FILE wins, regardless of what's in the
     // DB. See resolveChannelPreset in config.ts.
     const plan = this.planRuntimeSpawn(record);
-    const { profile, model, effort, cwd, mcpServers } = plan;
+    const { profile, model, effort, fastMode, cwd, mcpServers } = plan;
 
     const runtime = new AgentRuntime({
       profile,
@@ -932,6 +954,10 @@ export class SessionRouter {
               cwd,
               model,
               ...(effort ? { effort } : {}),
+              // #37: the persisted REQUEST, for reporting only. loadSession
+              // never applies Fast — re-enabling it on a session that already
+              // has history is the repricing case the design forbids.
+              ...(fastMode ? { fastMode: true } : {}),
             });
             this.logger.debug(
               { sessionId: record.id, acpSessionId: record.acpSessionId, attempt },
@@ -957,6 +983,10 @@ export class SessionRouter {
         cwd,
         model,
         ...(effort ? { effort } : {}),
+        // #37: Fast is a session-start dimension, so it is passed HERE only.
+        // The resume branch above deliberately omits it — re-enabling Fast on a
+        // loaded session is the repricing case the design forbids.
+        ...(fastMode ? { fastMode: true } : {}),
       });
       // Persist the new ACP session id so we can resume on restart. Also sync the
       // caller's in-memory record: getOrStartRuntime receives the same record the

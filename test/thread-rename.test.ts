@@ -65,6 +65,7 @@ describe("/seam config rename and namer surfaces", () => {
           effort: "high",
           role: "orch",
           disableThreadPrefix: false,
+          fastMode: false,
         },
         changes: {
           agent: { before: "agy", after: "claude", changed: true },
@@ -72,6 +73,7 @@ describe("/seam config rename and namer surfaces", () => {
           effort: { before: "high", after: "high", changed: false },
           role: { before: "auto", after: "orch", changed: true },
           disableThreadPrefix: { before: "enabled", after: "enabled", changed: false },
+          fastMode: { before: "off", after: "off", changed: false },
         },
         sessionReset: true,
         resetReason: "agent-switch",

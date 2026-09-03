@@ -5,6 +5,14 @@ import {
   type SessionConfigChanges,
 } from "./config-mutation.js";
 import type { ConfigDescription } from "./session-router.js";
+import {
+  FAST_MODE_COST_WARNING,
+  FAST_MODE_CONFIG_ID,
+  FAST_MODE_ON,
+  checkFastModeEligibility,
+  fastModeUnsupportedRefusal,
+  type FastModeOutcome,
+} from "./fast-mode.js";
 import type { SessionConfigState, SessionRecord } from "./types.js";
 
 export interface ConfigureThreadInput {
@@ -15,6 +23,12 @@ export interface ConfigureThreadInput {
   role?: string;
   /** Thread-local automatic naming opt-out. False re-enables future exact passes. */
   disableThreadPrefix?: boolean;
+  /**
+   * Claude Fast mode (#37). `true` is refused outright for agents without Fast
+   * or when the environment kill switch is set — never silently ignored.
+   * Changing it always forges a fresh session before Fast is applied.
+   */
+  fastMode?: boolean;
 }
 
 export interface MigrateSelfInput extends Omit<ConfigureThreadInput, "role"> {
@@ -54,7 +68,7 @@ export interface ConfigureThreadSuccess {
   /** Exact before/after status for every identity field, including no-ops. */
   changes: ThreadConfigurationChanges;
   sessionReset: boolean;
-  resetReason?: "agent-switch" | "model-switch";
+  resetReason?: "agent-switch" | "model-switch" | "fast-mode-switch";
   newSessionId?: string;
   /** The ACP session survived, but its process was reloaded to apply spawn/meta effort. */
   runtimeReloaded: boolean;
@@ -73,6 +87,8 @@ export interface ThreadConfigurationIdentity {
   /** Effective naming role, or `auto` when no role is active. */
   role: string;
   disableThreadPrefix: boolean;
+  /** Claude Fast mode (#37): the state that is actually in force. */
+  fastMode: boolean;
 }
 
 export interface ThreadConfigurationFieldChange {
@@ -87,6 +103,7 @@ export interface ThreadConfigurationChanges {
   effort: ThreadConfigurationFieldChange;
   role: ThreadConfigurationFieldChange;
   disableThreadPrefix: ThreadConfigurationFieldChange;
+  fastMode: ThreadConfigurationFieldChange;
 }
 
 export type ConfigureThreadOutcome =
@@ -100,6 +117,8 @@ export type ResetThreadSessionOutcome =
 export interface SessionControlRuntime {
   getSessionInfo(): { sessionId: string; availableModels: ReadonlyArray<{ modelId: string }> } | undefined;
   getConfigSelectValues(configId: string): ReadonlyArray<string>;
+  /** #37: what Fast actually resolved to on the live session, if determined. */
+  getFastModeOutcome?(): FastModeOutcome | undefined;
   setModel(modelId: string): Promise<void>;
   setConfigOption(configId: string, value: string | boolean): Promise<void>;
 }
@@ -141,6 +160,7 @@ export interface ThreadSessionControlDeps {
         effort?: string | null;
         role?: string | null;
         disableThreadPrefix?: boolean | null;
+        fastMode?: boolean;
       };
       actor: { id: string | null; name: string | null };
     }): { ok: true; message: string; auditId: string } | { ok: false; error: string };
@@ -331,8 +351,8 @@ export class ThreadSessionControlService {
     target: SessionRecord,
     input: ConfigureThreadInput
   ): Promise<ConfigureThreadOutcome> {
-    const supplied = input.agent !== undefined || input.model !== undefined || input.effort !== undefined || input.role !== undefined || input.disableThreadPrefix !== undefined;
-    if (!supplied) return { ok: false, error: "Provide at least one of agent, model, effort, role, or disableThreadPrefix." };
+    const supplied = input.agent !== undefined || input.model !== undefined || input.effort !== undefined || input.role !== undefined || input.disableThreadPrefix !== undefined || input.fastMode !== undefined;
+    if (!supplied) return { ok: false, error: "Provide at least one of agent, model, effort, role, disableThreadPrefix, or fastMode." };
 
     const before = this.deps.router.describeConfig(target);
     const previousAgentId = before.agent.value;
@@ -386,8 +406,40 @@ export class ThreadSessionControlService {
     const nextDisableThreadPrefix = input.disableThreadPrefix
       ?? before.disableThreadPrefix?.value
       ?? false;
-    const reset = detectSessionReset({ previousAgentId, nextAgentId, modelChanged });
+
+    // #37 Fast mode. Eligibility (agent declares it, environment permits it) is
+    // a HARD refusal, not a warning: confirming a Fast change that can never
+    // apply is exactly the false confirmation this feature must not produce.
     const warnings: string[] = [];
+    const eligible = checkFastModeEligibility({
+      requested: input.fastMode === true,
+      agentId: nextAgentId,
+      descriptor: profile.fastMode,
+    });
+    if (!eligible.ok) return { ok: false, error: eligible.error };
+    let nextFastMode = input.fastMode ?? before.fastMode?.value ?? false;
+    if (nextFastMode && !profile.fastMode) {
+      // Inherited-on + agent switched to one without Fast: force it off rather
+      // than carrying a flag the new agent can never honor. (An EXPLICIT `true`
+      // for such an agent was already refused above.)
+      warnings.push(
+        `Fast mode was on for this thread but "${nextAgentId}" has no Fast mode; turning it off.`
+      );
+      nextFastMode = false;
+    }
+    const fastModeChanged = nextFastMode !== (before.fastMode?.value ?? false);
+    // Fast is validated per SESSION **and per model** — Opus advertises it,
+    // Sonnet does not. Changing the model under an active Fast session would
+    // leave Fast unverified on the new model (Claude model switches are
+    // otherwise live-config and preserve the session), so treat that as needing
+    // a fresh session too. The post-forge check below then re-validates it.
+    const fastNeedsFreshSession = fastModeChanged || (nextFastMode && modelChanged);
+    const reset = detectSessionReset({
+      previousAgentId,
+      nextAgentId,
+      modelChanged,
+      fastModeChanged: fastNeedsFreshSession,
+    });
     const effortTouched = input.effort !== undefined || modelChanged || agentChanged;
     if (
       desiredEffort &&
@@ -409,6 +461,7 @@ export class ThreadSessionControlService {
       effort: desiredEffort ?? "auto",
       role: input.role === undefined ? before.role.value ?? "auto" : nextRole ?? "auto",
       disableThreadPrefix: nextDisableThreadPrefix,
+      fastMode: nextFastMode,
     };
     const plannedChanges = diffIdentity(beforeIdentity, plannedIdentity);
 
@@ -419,7 +472,8 @@ export class ThreadSessionControlService {
       !plannedChanges.model.changed &&
       !plannedChanges.effort.changed &&
       !plannedChanges.role.changed &&
-      !plannedChanges.disableThreadPrefix.changed
+      !plannedChanges.disableThreadPrefix.changed &&
+      !plannedChanges.fastMode.changed
     ) {
       const threadIdentityUpdated = await this.applyNaming(target);
       return {
@@ -444,6 +498,7 @@ export class ThreadSessionControlService {
         ...(input.disableThreadPrefix !== undefined
           ? { disableThreadPrefix: input.disableThreadPrefix }
           : {}),
+        ...(fastModeChanged ? { fastMode: nextFastMode } : {}),
       },
       actor
     );
@@ -452,7 +507,8 @@ export class ThreadSessionControlService {
     const onlyNaming = (input.role !== undefined || input.disableThreadPrefix !== undefined)
       && input.agent === undefined
       && input.model === undefined
-      && input.effort === undefined;
+      && input.effort === undefined
+      && !fastModeChanged;
     if (onlyNaming) {
       const current = this.deps.store.get(target.id);
       if (!current) return { ok: false, error: "Target session disappeared after configuration." };
@@ -527,6 +583,37 @@ export class ThreadSessionControlService {
       }
     }
 
+    // #37: whenever a FRESH session was forged and Fast is meant to be on, the
+    // runtime has already applied (or refused) it — planRuntimeSpawn read the
+    // value we just persisted. Believe the runtime, not the request.
+    //
+    // Gating this on `fastModeChanged` was wrong: switching Opus 5 → Sonnet 5
+    // with Fast already on forges a fresh session (model-switch reset), Fast is
+    // requested, the session refuses it, and the flag would have stayed `true`
+    // with no user-visible signal. Support is per-SESSION, so the profile-level
+    // guard above cannot see an intra-Claude model change either.
+    if (reset.sessionReset && nextFastMode) {
+      const outcome = runtime.getFastModeOutcome?.();
+      if (outcome?.applied !== true) {
+        const advertised = runtime.getConfigSelectValues(FAST_MODE_CONFIG_ID);
+        warnings.push(
+          outcome?.error ??
+            fastModeUnsupportedRefusal(nextAgentId, nextModel, advertised)
+        );
+        const reverted = this.applyTargetIdentity(
+          this.deps.store.get(target.id) ?? target,
+          { fastMode: false },
+          actor
+        );
+        if (!reverted.ok) return reverted;
+        nextFastMode = false;
+        // No second reset: the session simply is not Fast. Resetting again
+        // would drop context twice to reach the state we already have.
+      } else {
+        warnings.push(FAST_MODE_COST_WARNING);
+      }
+    }
+
     const current = this.deps.store.get(target.id);
     if (!current) return { ok: false, error: "Target session disappeared after configuration." };
     const threadIdentityUpdated = await this.applyNaming(current);
@@ -560,6 +647,7 @@ export class ThreadSessionControlService {
       effort?: string | null;
       role?: string | null;
       disableThreadPrefix?: boolean;
+      fastMode?: boolean;
     },
     actor: { id: string | null; name: string | null }
   ): { ok: true } | { ok: false; error: string } {
@@ -578,6 +666,9 @@ export class ThreadSessionControlService {
         ...(changes.disableThreadPrefix !== undefined
           ? { disableThreadPrefix: changes.disableThreadPrefix }
           : {}),
+        // #37: thread-preset only — there is no session-config mirror to keep
+        // in sync, so the overlay below is the single source of truth.
+        ...(changes.fastMode !== undefined ? { fastMode: changes.fastMode } : {}),
       },
       actor,
     });
@@ -685,6 +776,7 @@ function identityFromDescription(value: ConfigDescription): ThreadConfigurationI
     effort: value.effort.value ?? "auto",
     role: value.role?.value ?? "auto",
     disableThreadPrefix: value.disableThreadPrefix?.value ?? false,
+    fastMode: value.fastMode?.value ?? false,
   };
 }
 
@@ -705,6 +797,10 @@ function diffIdentity(
     disableThreadPrefix: field(
       before.disableThreadPrefix ? "disabled" : "enabled",
       after.disableThreadPrefix ? "disabled" : "enabled"
+    ),
+    fastMode: field(
+      before.fastMode ? FAST_MODE_ON : "off",
+      after.fastMode ? FAST_MODE_ON : "off"
     ),
   };
 }

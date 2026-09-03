@@ -16,7 +16,10 @@ import { mkdtemp, mkdir, rm, writeFile, readdir, readFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
-import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
+import {
+  DispatchWatcher,
+  type DispatchWatcherOpts,
+} from "../packages/core/src/core/dispatch/watcher.js";
 import {
   reconcileCompletedDoneFiles,
   needsCompletionReplay,
@@ -635,6 +638,74 @@ describe("#174 admission gates", () => {
     expect(deleteParked).not.toHaveBeenCalled(); // and not lost either
   });
 
+  /**
+   * The other two ways an INTERACTIVE turn is opened. Neither goes through
+   * `handleIncomingMessage`, so neither is covered by the gate above; both
+   * reach `queueOnChannel` directly and would be counted after the snapshot.
+   */
+  it("skips a preset's opening turn once intake is closed", () => {
+    const queueOnChannel = vi.fn(async () => {});
+    const make = (intakeStopped: boolean) =>
+      ({
+        logger: silent,
+        intakeStopped,
+        queueOnChannel,
+        handleIncomingMessageInner: async () => {},
+        startPresetOpeningTurn: Orchestrator.prototype["startPresetOpeningTurn" as never],
+      }) as unknown as {
+        startPresetOpeningTurn(t: unknown, r: unknown, p: unknown, a: string): void;
+      };
+    const thread = { platform: "discord", id: "t-new" };
+    const preset = { name: "p", instructions: "say hello" };
+
+    make(true).startPresetOpeningTurn(thread, {}, preset, "u1");
+    expect(queueOnChannel).not.toHaveBeenCalled();
+    // Positive control: the same call opens a turn while intake is open.
+    make(false).startPresetOpeningTurn(thread, {}, preset, "u1");
+    expect(queueOnChannel).toHaveBeenCalledOnce();
+  });
+
+  it("refuses a preemptive steer once intake is closed, without cancelling", async () => {
+    const abortTurn = vi.fn(async () => "cancelled");
+    const queueOnChannel = vi.fn(async () => ({ text: "ok" }));
+    const editReply = vi.fn(async () => {});
+    const make = (intakeStopped: boolean) =>
+      ({
+        logger: silent,
+        intakeStopped,
+        config: { TURN_TIMEOUT_SECONDS: 900, REPOS_ROOT: "/tmp" },
+        router: { ensureSessionRecord: () => ({ id: "s1" }), abortTurn },
+        queueOnChannel,
+        injectTurn: async () => ({ text: "ok" }),
+        postSteerCard: async () => {},
+        postSteerOutput: async () => {},
+        pushHumanInbox: () => ({ queued: 1 }),
+        channelRefFromInteraction: () => ({ platform: "discord", id: "t1" }),
+        interactionSpeakerName: () => "op",
+        cmdSteer: Orchestrator.prototype["cmdSteer" as never],
+      }) as unknown as { cmdSteer(i: unknown): Promise<void> };
+    const interaction = {
+      options: {
+        getString: (name: string) => (name === "prompt" ? "do it" : undefined),
+        getBoolean: () => true, // now:true — the mode that opens a turn
+      },
+      user: { id: "u1" },
+      deferReply: async () => {},
+      editReply,
+    };
+
+    await make(true).cmdSteer(interaction);
+    expect(abortTurn).not.toHaveBeenCalled(); // no live turn was killed…
+    expect(queueOnChannel).not.toHaveBeenCalled(); // …and none was admitted
+    expect(String(editReply.mock.calls[0]![0])).toMatch(/Restarting/i);
+    expect(String(editReply.mock.calls[0]![0])).toMatch(/again/i);
+
+    // Positive control: open intake still cancels and steers.
+    await make(false).cmdSteer(interaction);
+    expect(abortTurn).toHaveBeenCalledOnce();
+    expect(queueOnChannel).toHaveBeenCalledOnce();
+  });
+
   it("stopIntake does NOT stop the scheduled manager (preserves the cron-drain fix)", () => {
     const schedStop = vi.fn();
     const dispatchStop = vi.fn();
@@ -653,19 +724,72 @@ describe("#174 admission gates", () => {
     expect(schedStop).not.toHaveBeenCalled();
   });
 
-  it("a schedule becoming due during the drain still fires and extends it", async () => {
-    // Isolated scheduled fires increment activeTurns, so a due fire must be
-    // able to START after intake closes and keep the drain alive.
-    const host = makeQuiesceHost();
-    await host.quiesce({ timeoutMs: 200 }); // intake now closed
-    const dueFire = deferred();
-    host.trackContinuation(dueFire.promise); // stands in for the in-flight fire
-    let done = false;
-    const phase = host.drainAfterDispose({ timeoutMs: 5000 }).then((r) => ((done = true), r));
-    await flush();
-    expect(done).toBe(false); // the drain waited for it
-    dueFire.resolve();
-    expect((await phase).timedOut).toBe(false);
+  /**
+   * Drive the REAL `handleRestartSentinel` — the method that owns the ordering
+   * this blocker is about — with only its collaborators faked.
+   *
+   * What is real: the sentinel read, `stopIntake()`, `waitForRestartDrain`'s
+   * polling, the 2s flush wait, the unlink, and the order of all of it.
+   * What is simulated: the value of `activeTurns`. `runScheduledPrompt`'s
+   * increment is stood in for by moving the counter, so what this proves about
+   * a due fire is precisely that the drain keeps waiting while the counter is
+   * non-zero, and that cron was never stopped before it could fire.
+   */
+  it("keeps cron running through the drain and stops it only in the last beat", async () => {
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      await writeFile(path.join(dataDir, ".restart-pending"), "", "utf8"); // graceful
+      const self = {
+        logger: silent,
+        config: { DATA_DIR: dataDir, RESTART_DRAIN_TIMEOUT_MS: 60_000 },
+        activeTurns: 1, // a user turn is mid-flight when the sentinel lands
+        intakeStopped: false,
+        restartPending: false,
+        dispatchWatcher: { stop: () => order.push("dispatch-intake"), inFlightCount: 0 },
+        scheduledManager: { stop: () => order.push("cron") },
+        postNotification: async () => {},
+        restartProcess: async () => void order.push("pm2-restart"),
+        stopIntake: Orchestrator.prototype["stopIntake" as never],
+        sentinelPath: Orchestrator.prototype["sentinelPath" as never],
+        readSentinelForce: Orchestrator.prototype["readSentinelForce" as never],
+        handleRestartSentinel: Orchestrator.prototype["handleRestartSentinel" as never],
+      } as unknown as {
+        handleRestartSentinel(): Promise<void>;
+        activeTurns: number;
+        intakeStopped: boolean;
+      };
+
+      const done = self.handleRestartSentinel();
+      await vi.advanceTimersByTimeAsync(0);
+      // Dispatch/user/parked admission closes BEFORE the drain samples turns…
+      expect(self.intakeStopped).toBe(true);
+      expect(order).toEqual(["dispatch-intake"]);
+
+      // …and cron keeps its timers, which is the only reason a schedule can
+      // still come due here. Simulate one doing so: it takes activeTurns up
+      // even as the original user turn finishes.
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(order).not.toContain("cron");
+      self.activeTurns = 2; // due fire starts
+      self.activeTurns = 1; // user turn ends; the fire is still running
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(order).not.toContain("pm2-restart"); // the fire extended the drain
+
+      self.activeTurns = 0; // the scheduled fire finishes
+      await vi.advanceTimersByTimeAsync(500); // drain poll notices
+      expect(order).not.toContain("pm2-restart"); // still in the 2s flush wait
+      await vi.advanceTimersByTimeAsync(2000);
+      await done;
+
+      // Last beat, in order: cron stops, then pm2 restarts. `stopIntake` is
+      // called twice by this path and must stay idempotent — one entry, and
+      // never a second "cron" from the earlier call.
+      expect(order).toEqual(["dispatch-intake", "cron", "pm2-restart"]);
+      expect(await readdir(dataDir)).not.toContain(".restart-pending");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -674,56 +798,111 @@ describe("#174 admission gates", () => {
 // ---------------------------------------------------------------------------
 
 describe("#174 tick pre-claim race", () => {
-  it("a tick paused between its ready check and its claim does not run after stop()+drain()", async () => {
-    const atReaddir = deferred();
-    const released = deferred();
-    let ran = false;
+  /**
+   * Build a watcher whose PENDING listing can be parked mid-await.
+   *
+   * This is the whole point: the race lives strictly between `tick()`'s `ready`
+   * check and `tickInner`'s claim, and the only thing separating them is the
+   * directory read. Holding a tick there requires suspending that read — a
+   * test that merely starts a tick and assumes it is parked proves nothing,
+   * because it would pass just as happily against the unfixed watcher.
+   */
+  function makeParkableWatcher(onDispatch: DispatchWatcherOpts["onDispatch"]) {
+    let gate: { at: ReturnType<typeof deferred>; release: ReturnType<typeof deferred> } | null =
+      null;
     const watcher = new DispatchWatcher({
       dataDir,
       logger: silent,
-      onDispatch: async () => {
-        ran = true;
-        return { output: "should not run", stopReason: "end_turn" };
+      onDispatch,
+      readDir: async (dir) => {
+        const names = await readdir(dir);
+        if (dir === dirs.pending && gate) {
+          const g = gate;
+          gate = null; // park exactly one tick
+          g.at.resolve();
+          await g.release.promise;
+        }
+        return names;
       },
     });
-    await watcher.start(); // ready, nothing pending
+    /** Arm the next pending-listing to park. Resolves once a tick is parked. */
+    const armPark = () => {
+      const g = { at: deferred(), release: deferred() };
+      gate = g;
+      return { parked: g.at.promise, release: () => g.release.resolve() };
+    };
+    return { watcher, armPark };
+  }
+
+  it("a tick parked between its ready check and its claim claims nothing after stop()", async () => {
+    let ran = false;
+    const { watcher, armPark } = makeParkableWatcher(async () => {
+      ran = true;
+      return { output: "should not run", stopReason: "end_turn" };
+    });
+    await watcher.start(); // ready, nothing pending yet
     await dropSpec({ id: "racy" });
 
-    // Enter a tick and hold it exactly in the gap the race lives in: past the
-    // `ready` check, inside the readdir await, before any claim.
-    const origReaddir = (watcher as unknown as { dirs: { pending: string } }).dirs.pending;
-    void origReaddir;
-    const tick = (async () => {
-      const inner = watcher.tick();
-      atReaddir.resolve();
-      await released.promise;
-      await inner;
-    })();
+    // Park a tick INSIDE the listing: past `ready`, before any claim.
+    const park = armPark();
+    const tick = watcher.tick();
+    await park.parked;
 
-    await atReaddir.promise;
+    // Intake closes while the tick sits in that gap — the exact race.
     watcher.stop();
-    released.resolve();
-    await watcher.drain();
-    await tick;
 
-    // The spec must be left for the next boot, not claimed into the window.
+    // drain() must not be able to declare victory over a parked tick.
+    let drained = false;
+    const drain = watcher.drain().then(() => (drained = true));
+    await flush();
+    expect(drained).toBe(false);
+
+    park.release();
+    await drain;
+    await tick;
+    expect(drained).toBe(true);
+
+    // The re-check after the await is what leaves the spec for the next boot.
     expect(ran).toBe(false);
     expect(await readdir(dirs.pending)).toContain("racy.json");
     expect(await readdir(dirs.done)).not.toContain("racy.json");
+    expect(watcher.inFlightCount).toBe(0);
   });
 
-  it("drain awaits in-progress ticks, not just queues", async () => {
-    const watcher = new DispatchWatcher({
-      dataDir,
-      logger: silent,
-      onDispatch: async () => ({ output: "x", stopReason: "end_turn" }),
+  it("drain awaits a parked tick and the work it goes on to claim", async () => {
+    // Same park, intake NOT closed: drain must still wait for the tick, then
+    // for the spec that tick claims after it resumes. Draining queues first
+    // would return here with the dispatch not yet enqueued anywhere.
+    const gate = deferred();
+    let finished = false;
+    const { watcher, armPark } = makeParkableWatcher(async () => {
+      await gate.promise;
+      finished = true;
+      return { output: "x", stopReason: "end_turn" };
     });
     await watcher.start();
     await dropSpec({ id: "t1" });
-    const ticking = watcher.tick();
-    await watcher.drain();
-    await ticking;
+
+    const park = armPark();
+    const tick = watcher.tick();
+    await park.parked;
+
+    let drained = false;
+    const drain = watcher.drain().then(() => (drained = true));
+    await flush();
+    expect(drained).toBe(false); // waiting on the tick itself
+
+    park.release();
+    await flush();
+    expect(drained).toBe(false); // now waiting on what it claimed
+    expect(watcher.inFlightCount).toBe(1);
+
+    gate.resolve();
+    await drain;
+    await tick;
+    expect(finished).toBe(true);
     expect(watcher.inFlightCount).toBe(0);
+    expect(await readdir(dirs.done)).toContain("t1.json");
   });
 });
 
@@ -814,5 +993,164 @@ describe("#174 recovery contract is bounded and honest", () => {
       },
     });
     expect(noDoneFile.scanned).toBe(1); // only the finished one is even seen
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. Real shutdown ORDER, not method stand-ins
+// ---------------------------------------------------------------------------
+
+/**
+ * A store that behaves like better-sqlite3: every access after `close()`
+ * throws the exact production error. Records violations rather than only
+ * throwing, so a test can assert "nothing touched me after close".
+ */
+function makeClosableStore() {
+  const violations: string[] = [];
+  let closed = false;
+  const ledger = makeLedger();
+  const guard = (name: string) => {
+    if (closed) {
+      violations.push(name);
+      throw new TypeError("The database connection is not open");
+    }
+  };
+  return {
+    violations,
+    get closed() {
+      return closed;
+    },
+    close() {
+      closed = true;
+    },
+    getDelegation: (id: string) => (guard("getDelegation"), ledger.getDelegation(id)),
+    updateDelegationStatus: (id: string, s: string) => (
+      guard("updateDelegationStatus"), ledger.updateDelegationStatus(id, s)
+    ),
+    getReportBackByCorrelation: (c: string) => (
+      guard("getReportBackByCorrelation"), ledger.getReportBackByCorrelation(c)
+    ),
+    tryRecordReportBack: (e: { id: string; correlationId?: string }) => (
+      guard("tryRecordReportBack"), ledger.tryRecordReportBack(e)
+    ),
+    rows: ledger.rows,
+  };
+}
+
+/** An adapter that records any use after `stop()`. */
+function makeStoppableAdapter() {
+  const violations: string[] = [];
+  let stopped = false;
+  return {
+    violations,
+    get stopped() {
+      return stopped;
+    },
+    async stop() {
+      stopped = true;
+    },
+    sendMessage: async () => {
+      if (stopped) violations.push("sendMessage");
+    },
+  };
+}
+
+describe("#174 real shutdown sequence keeps adapter and store live", () => {
+  /**
+   * Drive the ACTUAL phase order against real objects: a real DispatchWatcher
+   * with an in-flight dispatch whose completion runs the real DB-first
+   * report-back claim, plus disposal that rejects the turn and registers a late
+   * continuation touching both store and adapter.
+   */
+  async function runShutdown(opts: { postDisposeDrain: boolean }) {
+    const store = makeClosableStore();
+    const adapter = makeStoppableAdapter();
+    store.rows.set("w-live", { id: "w-live", kind: "handoff", status: "running" });
+
+    const turnGate = deferred();
+    const host = makeQuiesceHost();
+    const replayHost = makeReplayHost(store as never);
+
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async () => {
+        await turnGate.promise; // still running when shutdown begins
+        // Completion does DB-first report-back work + an adapter post.
+        await replayHost.replayCompletedDispatch({
+          id: "w-live",
+          target: "worker",
+          status: "completed",
+          output: "THE ANSWER",
+          correlationId: "corr-live",
+          returnTo: "parent",
+        });
+        await adapter.sendMessage();
+        return { output: "THE ANSWER", stopReason: "end_turn" };
+      },
+    });
+    await dropSpec({ id: "w-live", target: "worker", returnTo: "parent", correlationId: "corr-live" });
+    // NOT awaited: start() awaits its first tick, which blocks on the gated turn.
+    void watcher.start();
+    await vi.waitFor(() => expect(watcher.inFlightCount).toBe(1));
+
+    (host as unknown as { dispatchWatcher: unknown }).dispatchWatcher = watcher;
+
+    // ---- the real sequence ----
+    // phase 1: stop intake + bounded pre-dispose quiesce
+    const phase1 = host.quiesce({ timeoutMs: 5000 });
+    // "disposal" releases the turn, exactly as killing an agent would.
+    turnGate.resolve();
+    await phase1;
+    // phase 2: dispose runtimes (adapter + store STILL open). Killing an agent
+    // rejects its turn, and THAT rejection registers the cleanup continuation
+    // — which is why the set can grow after phase 1 has already drained it.
+    const killed = deferred();
+    const turnRejection = killed.promise.then(() => {
+      host.trackContinuation(
+        (async () => {
+          // Real cleanup is not a single microtask: it settles a card, posts to
+          // Discord and re-reads the ledger, so it spans I/O. Modelled with one
+          // real timer hop — the smallest thing a `setImmediate` cannot cover.
+          await new Promise((r) => setTimeout(r, 5));
+          store.getDelegation("w-live");
+          await adapter.sendMessage();
+        })()
+      );
+    });
+    killed.resolve();
+    await turnRejection; // dispose() returns once the kill has propagated
+    // phase 3: bounded post-dispose drain (the thing under test)
+    if (opts.postDisposeDrain) await host.drainAfterDispose({ timeoutMs: 5000 });
+    else await new Promise((r) => setImmediate(r)); // the rejected single-yield design
+    // phase 4: only now tear down
+    await adapter.stop();
+    store.close();
+    await flush();
+
+    return { store, adapter, watcher };
+  }
+
+  it("completes an in-flight dispatch and its report-back before anything closes", async () => {
+    const { store, adapter } = await runShutdown({ postDisposeDrain: true });
+
+    expect(store.violations).toEqual([]);
+    expect(adapter.violations).toEqual([]);
+    // The report-back was durably queued while the store was open…
+    const specs = await pendingReportBacks();
+    expect(specs).toHaveLength(1);
+    expect(String(specs[0]!.prompt)).toContain("THE ANSWER");
+    // …and the worker row reached terminal, so boot will not offer a rerun.
+    expect(store.rows.get("w-live")!.status).toBe("completed");
+    // Teardown really did happen.
+    expect(store.closed).toBe(true);
+    expect(adapter.stopped).toBe(true);
+  });
+
+  it("NEGATIVE CONTROL: without the post-dispose drain, late work hits a closed store", async () => {
+    // Proves this test can actually detect the regression it guards.
+    const { store } = await runShutdown({ postDisposeDrain: false });
+    expect(store.violations.length).toBeGreaterThan(0);
+    expect(store.violations).toContain("getDelegation");
   });
 });

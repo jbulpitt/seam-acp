@@ -49,6 +49,16 @@ export interface DispatchWatcherOpts {
   resumeEnabled?: boolean;
   /** Durable ledger gate: false means recovery must terminalize, never replay. */
   mayRecover?: (id: string) => boolean;
+  /**
+   * Directory-listing seam. Defaults to `fs.readdir`.
+   *
+   * #174: `tickInner` checks `ready`, then AWAITS this call before claiming
+   * anything — that await IS the pre-claim race window. Tests inject a gated
+   * listing to park a tick precisely inside it; there is no other way to hold a
+   * tick there deterministically, and a timing-based approximation would pass
+   * against the buggy code.
+   */
+  readDir?: (dir: string) => Promise<string[]>;
 }
 
 export class DispatchWatcher {
@@ -58,6 +68,7 @@ export class DispatchWatcher {
   private readonly pollMs: number;
   private readonly resumeEnabled: boolean;
   private readonly mayRecover: (id: string) => boolean;
+  private readonly readDir: (dir: string) => Promise<string[]>;
 
   /** One FIFO per target thread — different targets get different queues and
    *  therefore run concurrently. */
@@ -87,6 +98,7 @@ export class DispatchWatcher {
     this.pollMs = opts.pollMs ?? 1000;
     this.resumeEnabled = opts.resumeEnabled === true;
     this.mayRecover = opts.mayRecover ?? (() => true);
+    this.readDir = opts.readDir ?? readdir;
   }
 
   /** Create the queue dirs, recover anything a crash left in `running/`, then
@@ -178,7 +190,7 @@ export class DispatchWatcher {
   private async tickInner(): Promise<void> {
     let names: string[];
     try {
-      names = await readdir(this.dirs.pending);
+      names = await this.readDir(this.dirs.pending);
     } catch (err) {
       this.logger.warn({ err }, "cannot read pending dir");
       return;
@@ -240,7 +252,7 @@ export class DispatchWatcher {
   private async recoverStale(): Promise<void> {
     let names: string[];
     try {
-      names = await readdir(this.dirs.running);
+      names = await this.readDir(this.dirs.running);
     } catch {
       return;
     }
@@ -280,7 +292,7 @@ export class DispatchWatcher {
   private async markStaleInPlace(): Promise<void> {
     let names: string[];
     try {
-      names = await readdir(this.dirs.running);
+      names = await this.readDir(this.dirs.running);
     } catch {
       return;
     }
@@ -322,7 +334,7 @@ export class DispatchWatcher {
   async listStaleRunning(): Promise<DispatchSpec[]> {
     let names: string[];
     try {
-      names = await readdir(this.dirs.running);
+      names = await this.readDir(this.dirs.running);
     } catch {
       return [];
     }
@@ -481,7 +493,7 @@ export class DispatchWatcher {
       const dir = this.dirs[sub];
       let names: string[];
       try {
-        names = await readdir(dir);
+        names = await this.readDir(dir);
       } catch {
         continue;
       }

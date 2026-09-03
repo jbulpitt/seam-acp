@@ -1476,6 +1476,27 @@ export class Orchestrator {
    * `channelGenerations` bump, no `abortTurn`. It just waits its place in line.
    * (The converse still holds — a user message arriving mid-dispatch aborts the
    * dispatch, because the user is the priority interrupt.)
+   *
+   * #174 admission is stated here because this is the only place a channel turn
+   * is counted. The gate itself lives at the CALLERS, because they do not all
+   * want the same answer:
+   *
+   *   gated    `handleIncomingMessage` (user message), `tryFireParked`,
+   *            `startPresetOpeningTurn`, `cmdSteer now:true` — an interactive
+   *            NEW turn admitted after the quiesce snapshot is exactly the bug.
+   *   gated    dispatch (`dispatchInjectTurn`) — upstream, by watcher intake:
+   *            unclaimed specs stay in `pending/` for the next boot.
+   *   OPEN     `runScheduledPrompt` — deliberate. A cron fire coming due mid
+   *            -drain must be able to start and EXTEND the drain; stopping
+   *            cron early is what made `report-update` miss 5:25.
+   *   OPEN     `refireLiveTurn` — boot-time resume, never runs during shutdown.
+   *
+   * Slash commands, component clicks and thread-delete are NOT gated wholesale
+   * and do not need to be: none of them count a turn on their own, and they
+   * arrive over the gateway, which `adapter.stop()` closes BEFORE `store.close()`
+   * — so they cannot reach a closed store either. A choice-card click during
+   * shutdown persists its dispatch spec to `pending/` and lands on the next
+   * boot, which is strictly better than refusing it.
    */
   private queueOnChannel<T>(channelId: string, task: () => Promise<T>): Promise<T> {
     const existing = this.channelQueues.get(channelId) ?? Promise.resolve();
@@ -10879,6 +10900,18 @@ export class Orchestrator {
       return;
     }
 
+    // #174: `now:true` is the one steer mode that OPENS a turn (the cooperative
+    // path above only writes to the inbox), and it does so outside the
+    // `handleIncomingMessage` gate. Refuse it once admission is closed rather
+    // than cancelling a live turn and starting a replacement the drain has
+    // already stopped waiting for. Told plainly, so the operator can resend.
+    if (this.intakeStopped) {
+      await i.editReply(
+        "♻️ Restarting — the steer was not sent and nothing was cancelled. Try again in a moment."
+      );
+      return;
+    }
+
     // Preemptive cancel — identical to `/seam cancel` (graceful ACP cancel).
     const cancelOutcome = await this.router.abortTurn(record.id, { force: false });
 
@@ -17738,6 +17771,15 @@ export class Orchestrator {
   ): void {
     const prompt = (preset.instructions ?? "").trim();
     if (!prompt) return;
+    // #174: this opens a brand-new channel turn WITHOUT going through
+    // `handleIncomingMessage`, so it needs its own admission check — otherwise
+    // a `/seam preset thread` landing during the drain starts a turn after the
+    // quiesce snapshot. The thread and its applied preset are already durable;
+    // only the opening turn is skipped, and the user can prompt it after boot.
+    if (this.intakeStopped) {
+      this.logger.info({ thread: thread.id }, "preset opening turn skipped; shutting down");
+      return;
+    }
     const synthetic: IncomingMessage = {
       channel: thread,
       authorId,

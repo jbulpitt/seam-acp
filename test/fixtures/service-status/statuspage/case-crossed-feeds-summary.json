@@ -1,0 +1,75 @@
+{
+  "page": {
+    "id": "tymt9n04zgry",
+    "name": "Claude",
+    "url": "https://status.claude.com",
+    "time_zone": "Etc/UTC",
+    "updated_at": "2026-09-03T14:05:00.000Z"
+  },
+  "components": [
+    {
+      "id": "k8w3r06qmzrp",
+      "name": "Claude API (api.anthropic.com)",
+      "status": "operational",
+      "created_at": "2023-07-11T17:52:24.275Z",
+      "updated_at": "2026-09-03T16:23:11.970Z",
+      "position": 3,
+      "description": null,
+      "showcase": true,
+      "start_date": "2023-07-11",
+      "group_id": null,
+      "page_id": "tymt9n04zgry",
+      "group": false,
+      "only_show_if_degraded": false
+    }
+  ],
+  "incidents": [
+    {
+      "id": "461yvfrzpwtt",
+      "name": "Elevated errors for multiple models",
+      "status": "investigating",
+      "created_at": "2026-09-03T13:26:04.201Z",
+      "updated_at": "2026-09-03T14:05:00.000Z",
+      "monitoring_at": null,
+      "resolved_at": null,
+      "impact": "major",
+      "shortlink": "https://stspg.io/9xz4hhmd1jzn",
+      "started_at": "2026-09-03T13:26:04.191Z",
+      "page_id": "tymt9n04zgry",
+      "incident_updates": [
+        {
+          "id": "stale00investigating",
+          "status": "investigating",
+          "body": "We are investigating elevated errors for multiple models.",
+          "incident_id": "461yvfrzpwtt",
+          "created_at": "2026-09-03T14:05:00.000Z",
+          "updated_at": "2026-09-03T14:05:00.000Z",
+          "display_at": "2026-09-03T14:05:00.000Z",
+          "affected_components": [
+            {
+              "code": "k8w3r06qmzrp",
+              "name": "Claude API (api.anthropic.com)",
+              "old_status": "operational",
+              "new_status": "partial_outage"
+            }
+          ],
+          "deliver_notifications": true,
+          "custom_tweet": null,
+          "tweet_id": null
+        }
+      ],
+      "components": [
+        {
+          "id": "k8w3r06qmzrp",
+          "name": "Claude API (api.anthropic.com)",
+          "status": "partial_outage"
+        }
+      ]
+    }
+  ],
+  "scheduled_maintenances": [],
+  "status": {
+    "indicator": "major",
+    "description": "Partial System Outage"
+  }
+}

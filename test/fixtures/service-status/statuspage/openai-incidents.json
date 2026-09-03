@@ -1,0 +1,79 @@
+{
+  "page": {
+    "id": "01JMDK9XYNY6RXSED6SDWW50WY",
+    "name": "OpenAI",
+    "url": "https://status.openai.com/",
+    "updated_at": "2026-09-03T16:55:49Z"
+  },
+  "incidents": [
+    {
+      "id": "01M1KWEDH417T2CF44YYHZDFCR",
+      "name": "Elevated errors across ChatGPT and Codex",
+      "status": "resolved",
+      "created_at": "2026-09-03T14:58:23Z",
+      "updated_at": "2026-09-03T16:55:49Z",
+      "resolved_at": "2026-09-03T16:55:49Z",
+      "impact": "minor",
+      "page_id": "01JMDK9XYNY6RXSED6SDWW50WY",
+      "incident_updates": [
+        {
+          "id": "01M1M35DFWZ2BC10EH5JMSH2XV",
+          "body": "The issue causing elevated errors across ChatGPT and Codex has been resolved.\n\nSome Codex remote control users may need to pair their mobile device again following this incident.",
+          "created_at": "2026-09-03T16:55:49Z",
+          "display_at": "2026-09-03T16:55:49Z",
+          "incident_id": "01M1KWEDH417T2CF44YYHZDFCR",
+          "status": "resolved",
+          "updated_at": "2026-09-03T16:55:49Z"
+        },
+        {
+          "id": "01M1KZE5EW98D4TP0QC73DNYC2",
+          "body": "We have applied the mitigation and are monitoring the recovery.",
+          "created_at": "2026-09-03T15:50:41Z",
+          "display_at": "2026-09-03T15:17:00Z",
+          "incident_id": "01M1KWEDH417T2CF44YYHZDFCR",
+          "status": "monitoring",
+          "updated_at": "2026-09-03T16:44:18Z"
+        },
+        {
+          "id": "01M1KWEDH4HZZS0RR8FK6AFNY8",
+          "body": "We are investigating the issue for the listed services.",
+          "created_at": "2026-09-03T14:58:23Z",
+          "display_at": "2026-09-03T14:43:00Z",
+          "incident_id": "01M1KWEDH417T2CF44YYHZDFCR",
+          "status": "investigating",
+          "updated_at": "2026-09-03T16:22:41Z"
+        }
+      ]
+    },
+    {
+      "id": "01M1J99EDCYED5GP2W8GZ3N2NA",
+      "name": "ChatGPT Work Mode High Error Rates",
+      "status": "resolved",
+      "created_at": "2026-09-03T00:04:23Z",
+      "updated_at": "2026-09-03T00:10:45Z",
+      "resolved_at": "2026-09-03T00:10:45Z",
+      "impact": "major",
+      "page_id": "01JMDK9XYNY6RXSED6SDWW50WY",
+      "incident_updates": [
+        {
+          "id": "01M1J9N3CXHGQ0MMH1558ZRD2J",
+          "body": "All impacted services have now fully recovered.",
+          "created_at": "2026-09-03T00:10:45Z",
+          "display_at": "2026-09-03T00:10:45Z",
+          "incident_id": "01M1J99EDCYED5GP2W8GZ3N2NA",
+          "status": "resolved",
+          "updated_at": "2026-09-03T00:10:45Z"
+        },
+        {
+          "id": "01M1J99EDCY4A8VS9944YYM496",
+          "body": "ChatGPT Work Mode is experiencing high error rates. We are investigating the issue.",
+          "created_at": "2026-09-03T00:04:23Z",
+          "display_at": "2026-09-03T00:04:23Z",
+          "incident_id": "01M1J99EDCYED5GP2W8GZ3N2NA",
+          "status": "investigating",
+          "updated_at": "2026-09-03T00:04:23Z"
+        }
+      ]
+    }
+  ]
+}

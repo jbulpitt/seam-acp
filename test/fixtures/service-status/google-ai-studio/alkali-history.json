@@ -1,0 +1,96 @@
+[
+  [
+    [
+      [
+        "AIStudio-build-environments-20260714",
+        "Issues with apps in AI Studio Build.",
+        1,
+        [
+          [
+            1,
+            "2026-07-14 19:46",
+            [
+              "1784083560"
+            ],
+            "We are experiencing issues with apps in AI Studio Build. Users may see errors or timeouts when attempting to create, open, run, or deploy applications. Investigation is underway."
+          ],
+          [
+            4,
+            "2026-07-15 08:39",
+            [
+              "1784129940"
+            ],
+            "Issue has been resolved."
+          ]
+        ],
+        3,
+        [
+          3
+        ]
+      ],
+      [
+        "AIStudio-postpay-upgrade-20260422",
+        "Customer upgrade to postpay experiencing service disruption",
+        1,
+        [
+          [
+            1,
+            "2026-04-21 16:24",
+            [
+              "1776813840"
+            ],
+            "Investigation is underway."
+          ],
+          [
+            5,
+            "2026-04-22 10:00",
+            [
+              "1776877200"
+            ],
+            "Mitigations are underway."
+          ],
+          [
+            4,
+            "2026-04-23 12:46",
+            [
+              "1776973560"
+            ],
+            "Issue has been mitigated."
+          ]
+        ],
+        1,
+        [
+          1
+        ]
+      ],
+      [
+        "GeminiAPI-context-caching-issue-20260619",
+        "Issues with Nano Banana",
+        1,
+        [
+          [
+            1,
+            "2026-06-19 00:54",
+            [
+              "1781855640"
+            ],
+            "We are experiencing issues with Nano Banana 2 and Nano Banana Pro models on Gemini API and AI Studio when using 2k or 4k resolution. Investigation is underway."
+          ],
+          [
+            4,
+            "2026-06-19 05:30",
+            [
+              "1781872200"
+            ],
+            "Issue has been resolved."
+          ]
+        ],
+        1,
+        [
+          1,
+          3
+        ]
+      ]
+    ]
+  ]
+]

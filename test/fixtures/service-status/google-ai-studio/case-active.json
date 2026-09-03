@@ -1,0 +1,61 @@
+[
+  [
+    [
+      [
+        "GeminiAPI-elevated-errors-20260903",
+        "Elevated error rates on the Gemini API",
+        1,
+        [
+          [
+            1,
+            "2026-09-03 09:15",
+            [
+              "1788452100"
+            ],
+            "We are experiencing elevated error rates on the Gemini API. Investigation is underway."
+          ],
+          [
+            5,
+            "2026-09-03 10:40",
+            [
+              "1788457200"
+            ],
+            "Mitigations are underway."
+          ]
+        ],
+        1,
+        [
+          1,
+          3
+        ]
+      ],
+      [
+        "AIStudio-build-environments-20260714",
+        "Issues with apps in AI Studio Build.",
+        1,
+        [
+          [
+            1,
+            "2026-07-14 19:46",
+            [
+              "1784083560"
+            ],
+            "We are experiencing issues with apps in AI Studio Build."
+          ],
+          [
+            4,
+            "2026-07-15 08:39",
+            [
+              "1784129940"
+            ],
+            "Issue has been resolved."
+          ]
+        ],
+        3,
+        [
+          3
+        ]
+      ]
+    ]
+  ]
+]

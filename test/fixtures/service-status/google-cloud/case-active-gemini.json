@@ -1,0 +1,48 @@
+[
+  {
+    "id": "GcActiveGeminiFixture01",
+    "number": "6876619551109882403",
+    "begin": "2026-09-03T15:10:00+00:00",
+    "created": "2026-09-03T15:24:00+00:00",
+    "end": null,
+    "modified": "2026-09-03T17:05:00+00:00",
+    "external_desc": "Gemini Code Assist requests are failing for a subset of users.",
+    "updates": [
+      {
+        "created": "2026-09-03T17:05:00+00:00",
+        "modified": "2026-09-03T17:05:00+00:00",
+        "when": "2026-09-03T17:05:00+00:00",
+        "text": "Mitigation is in progress. We will provide another update shortly.",
+        "status": "SERVICE_OUTAGE",
+        "affected_locations": []
+      },
+      {
+        "created": "2026-09-03T15:24:00+00:00",
+        "modified": "2026-09-03T15:24:00+00:00",
+        "when": "2026-09-03T15:24:00+00:00",
+        "text": "We are investigating reports of failing Gemini Code Assist requests.",
+        "status": "SERVICE_OUTAGE",
+        "affected_locations": []
+      }
+    ],
+    "status_impact": "SERVICE_OUTAGE",
+    "severity": "high",
+    "service_key": "zall",
+    "service_name": "Multiple Products",
+    "affected_products": [
+      {
+        "title": "Gemini Code Assist",
+        "id": "deUeOEPYanfJ9w8cpyBJ",
+        "current_title": "Gemini Code Assist"
+      }
+    ],
+    "uri": "incidents/GcActiveGeminiFixture01",
+    "currently_affected_locations": [
+      {
+        "title": "Global",
+        "id": "global"
+      }
+    ],
+    "previously_affected_locations": []
+  }
+]

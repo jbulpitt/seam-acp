@@ -30,6 +30,8 @@ import {
   FAST_MODE_RESET_NOTICE,
   checkFastModeEligibility,
   describeFastModeOutcome,
+  fastModeNeedsFreshSession,
+  settleFastMode,
   fastModeLabel,
   isFastModeDisabledByEnv,
 } from "../packages/core/src/core/fast-mode.js";
@@ -53,12 +55,14 @@ import {
   renderHub,
   willEnableFastMode,
   willResetSession,
+  willVerifyFastMode,
   type DraftAgentCapabilities,
   type InheritedConfig,
   type ThreadConfigDraft,
   type ThreadConfigSnapshot,
 } from "../packages/core/src/platforms/discord/config-editor.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
+import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -112,6 +116,8 @@ class FastConn {
   loadOptions: unknown = null;
   /** What the session reports AFTER a set — the "accepted then snapped back" case. */
   echoAfterSet?: unknown;
+  /** Simulate a wrapper that accepts the call but echoes no configOptions. */
+  echoNothing = false;
   rejectSet = false;
 
   async newSession() {
@@ -128,6 +134,7 @@ class FastConn {
   async setSessionConfigOption(params: { configId: string; value: unknown }) {
     this.setCalls.push({ configId: params.configId, value: params.value });
     if (this.rejectSet) throw new Error("Invalid value for config option fast");
+    if (this.echoNothing) return {};
     return { configOptions: this.echoAfterSet ?? this.newOptions };
   }
 }
@@ -210,6 +217,100 @@ describe("#37 contract 2 — a supported session applies fast=on and records it"
     expect(outcome?.requested).toBe(true);
     expect(outcome?.applied).toBe(false);
     expect(outcome?.error).toMatch(/declined to stay in Fast/i);
+  });
+});
+
+describe("#37 — an unverifiable apply is never a confirmation", () => {
+  it("a set response with no configOptions is UNDETERMINED, not applied", async () => {
+    // The wrapper accepted the call but reported nothing back. Recording
+    // `applied: true` here would be a confirmation we cannot support — and the
+    // one that costs real money.
+    const { rt, conn } = runtimeFor(CLAUDE_PROFILE);
+    conn.newOptions = [fastOption(FAST_MODE_OFF)];
+    conn.echoNothing = true;
+    await rt.newSession({ cwd: "/repo", fastMode: true });
+    const outcome = rt.getFastModeOutcome();
+    expect(outcome?.applied).toBe(null);
+    expect(outcome?.error).toMatch(/did not report its resulting "fast" state/);
+    // Every downstream gate treats it as not-in-Fast.
+    expect(outcome?.applied !== true).toBe(true);
+    expect(
+      settleFastMode({ outcome, agentId: "claude", model: "claude-opus-5" }).ok
+    ).toBe(false);
+    expect(describeFastModeOutcome(outcome)).toBe("on requested · not applied");
+  });
+
+  it("an unverifiable DISABLE is not treated as an error", async () => {
+    const { rt, conn } = runtimeFor(CLAUDE_PROFILE);
+    conn.newOptions = [fastOption(FAST_MODE_ON)];
+    conn.echoNothing = true;
+    await rt.newSession({ cwd: "/repo" });
+    expect(rt.getFastModeOutcome()).toEqual({ requested: false, applied: null });
+  });
+});
+
+describe("#37 — a live model switch re-derives the recorded Fast state", () => {
+  it("clears a stale `applied: true` when the new model drops the option", async () => {
+    // Claude model switches are live-config on the SAME session, so without
+    // this the status card keeps rendering "⚡ fast on" for a model that has
+    // no Fast — an active false confirmation.
+    const { rt, conn } = runtimeFor(CLAUDE_PROFILE);
+    conn.newOptions = [fastOption(FAST_MODE_OFF)];
+    conn.echoAfterSet = [fastOption(FAST_MODE_ON)];
+    await rt.newSession({ cwd: "/repo", fastMode: true });
+    expect(rt.getFastModeOutcome()).toEqual({ requested: true, applied: true });
+
+    // Switching to a model whose option set has no `fast`.
+    conn.echoAfterSet = NO_FAST_OPTIONS;
+    await rt.setModel("claude-sonnet-5");
+    const outcome = rt.getFastModeOutcome();
+    expect(outcome?.applied).toBe(false);
+    expect(outcome?.error).toMatch(/no longer offered by this session/);
+    expect(describeFastModeOutcome(outcome)).toBe("on requested · off applied");
+  });
+
+  it("keeps Fast on when the new model still advertises it", async () => {
+    const { rt, conn } = runtimeFor(CLAUDE_PROFILE);
+    conn.newOptions = [fastOption(FAST_MODE_OFF)];
+    conn.echoAfterSet = [fastOption(FAST_MODE_ON)];
+    await rt.newSession({ cwd: "/repo", fastMode: true });
+    conn.echoAfterSet = [fastOption(FAST_MODE_ON)];
+    await rt.setModel("claude-opus-4-8");
+    expect(rt.getFastModeOutcome()).toEqual({ requested: true, applied: true });
+  });
+
+  it("leaves agents with no Fast concept untouched", async () => {
+    const { rt, conn } = runtimeFor({ id: "codex" });
+    conn.newOptions = NO_FAST_OPTIONS;
+    await rt.newSession({ cwd: "/repo" });
+    await rt.setModel("gpt-new");
+    expect(rt.getFastModeOutcome()).toBeUndefined();
+  });
+});
+
+describe("#37 shared fresh-session rule", () => {
+  it("requires a fresh session for a model/agent/host change while Fast is on", () => {
+    const on = { nextFastMode: true, fastModeChanged: false };
+    expect(fastModeNeedsFreshSession({ ...on, modelChanged: true })).toBe(true);
+    expect(fastModeNeedsFreshSession({ ...on, agentChanged: true })).toBe(true);
+    expect(fastModeNeedsFreshSession({ ...on, locationChanged: true })).toBe(true);
+    expect(fastModeNeedsFreshSession(on)).toBe(false);
+  });
+
+  it("always requires one when the Fast setting itself moves", () => {
+    expect(
+      fastModeNeedsFreshSession({ nextFastMode: false, fastModeChanged: true })
+    ).toBe(true);
+  });
+
+  it("never requires one for a model change while Fast is off", () => {
+    expect(
+      fastModeNeedsFreshSession({
+        nextFastMode: false,
+        fastModeChanged: false,
+        modelChanged: true,
+      })
+    ).toBe(false);
   });
 });
 
@@ -970,5 +1071,210 @@ describe("#37 configure_thread", () => {
     const h = ctrlHarness();
     const res = await h.service.configure(h.caller, h.target, { fastMode: true });
     expect(res.ok).toBe(true);
+  });
+});
+
+// --------------------------------------------------------------------------
+// The Discord `/seam config edit` SAVE transaction (#37)
+//
+// The most intricate path in the change: reset the session, start the
+// replacement, read the outcome, roll back on refusal, correct the card, and
+// surface the refusal. Driven through the real `saveConfigEditorDraft`.
+// --------------------------------------------------------------------------
+
+function saveHarness(opts: {
+  /** Whether the replacement session advertises `fast`. */
+  freshAdvertisesFast?: boolean;
+  /** Persisted thread-preset fastMode before the save. */
+  fastMode?: boolean;
+  model?: string;
+  /** Make the replacement runtime fail to start. */
+  failFreshStart?: boolean;
+} = {}) {
+  const advertises = opts.freshAdvertisesFast !== false;
+  let fastPreset = opts.fastMode === true;
+  let model = opts.model ?? "claude-opus-5";
+  const overlays: Array<Record<string, unknown>> = [];
+  const invalidated: Array<{ id: string; opts: unknown }> = [];
+  const editedPanels: Array<{ id: string; panel: any }> = [];
+  const ephemerals: string[] = [];
+  const started: string[] = [];
+
+  const rec: SessionRecord = {
+    id: "discord:t1",
+    platform: "discord",
+    channelRef: "t1",
+    parentRef: "c1",
+    agentId: "claude",
+    acpSessionId: "acp-old",
+    repoPath: "/repo",
+    configJson: "{}",
+    createdUtc: "2026-09-01T00:00:00.000Z",
+    updatedUtc: "2026-09-01T00:00:00.000Z",
+  };
+
+  const orch = {
+    store: {
+      getByChannel: () => rec,
+      get: () => rec,
+      readConfig: () => ({}),
+    },
+    router: {
+      invalidate: async (id: string, o: unknown) => {
+        invalidated.push({ id, opts: o });
+        rec.acpSessionId = "";
+      },
+      getOrStartRuntime: async () => {
+        if (opts.failFreshStart) throw new Error("replacement unavailable");
+        started.push("start");
+        rec.acpSessionId = "acp-fresh";
+        return {
+          getFastModeOutcome: () =>
+            fastPreset
+              ? advertises
+                ? { requested: true, applied: true }
+                : { requested: true, applied: false }
+              : { requested: false, applied: false },
+          getConfigSelectValues: (id: string) =>
+            id === FAST_MODE_CONFIG_ID && advertises ? [FAST_MODE_ON, FAST_MODE_OFF] : [],
+        };
+      },
+      describeConfig: () => ({
+        agent: { value: "claude", source: "session config" },
+        model: { value: model, source: "session config" },
+      }),
+      ensureSessionRecord: () => rec,
+    },
+    configMutation: {
+      applyThreadOverlay: ({ changes }: { changes: Record<string, unknown> }) => {
+        overlays.push(changes);
+        if (changes.fastMode !== undefined) fastPreset = changes.fastMode === true;
+        if (typeof changes.model === "string") model = changes.model;
+        return { ok: true, message: "ok", auditId: "a1" };
+      },
+      applyChannelOverlay: () => ({ ok: true, message: "ok", auditId: "a2" }),
+    },
+    configEditor: { delete: () => {} },
+    threadNamer: { recompactChannel: async () => {} },
+    applyThreadName: async () => ({}),
+    renameThreadForSetup: async () => {},
+    logger: { warn() {}, error() {}, info() {}, debug() {} },
+    adapter: {
+      editPanel: async (ref: { id: string }, panel: unknown) => {
+        editedPanels.push({ id: ref.id, panel });
+      },
+    },
+    editConfigEditorCard: async (_ch: unknown, id: string, panel: unknown) => {
+      editedPanels.push({ id, panel });
+    },
+    saveConfigEditorDraft: (Orchestrator.prototype as any).saveConfigEditorDraft,
+  } as any;
+
+  const evt = {
+    userId: "u1",
+    userName: "jesse",
+    channel: { platform: "discord", id: "t1", parentId: "c1" },
+    messageId: "m1",
+    followUpEphemeral: async (t: string) => { ephemerals.push(t); },
+    replyEphemeral: async (t: string) => { ephemerals.push(t); },
+    deferUpdate: async () => {},
+  } as any;
+
+  return {
+    orch,
+    evt,
+    overlays,
+    invalidated,
+    editedPanels,
+    ephemerals,
+    started,
+    fastPresetNow: () => fastPreset,
+    run: (d: ThreadConfigDraft) => orch.saveConfigEditorDraft.call(orch, d, evt),
+  };
+}
+
+describe("#37 — /seam config edit Save transaction", () => {
+  it("a supported fresh session keeps Fast on, resets the session, and does not refuse", async () => {
+    const h = saveHarness();
+    await h.run(applyPickerValue(draft(), "fast", FAST_MODE_ON, caps));
+    expect(h.overlays).toContainEqual({ fastMode: true });
+    expect(h.invalidated[0]).toMatchObject({
+      id: "discord:t1",
+      opts: { clearAcpSession: true },
+    });
+    expect(h.started).toHaveLength(1);
+    expect(h.ephemerals).toEqual([]);
+    expect(h.fastPresetNow()).toBe(true);
+    expect(h.editedPanels.at(-1)!.panel.footer).toMatch(/Saved/);
+  });
+
+  it("an unsupported fresh session rolls back and the saved card renders off", async () => {
+    const h = saveHarness({ freshAdvertisesFast: false });
+    await h.run(applyPickerValue(draft(), "fast", FAST_MODE_ON, caps));
+    // Persisted true, then reverted — no stale requested state survives.
+    expect(h.overlays).toContainEqual({ fastMode: true });
+    expect(h.overlays).toContainEqual({ fastMode: false });
+    expect(h.fastPresetNow()).toBe(false);
+    expect(h.ephemerals.join(" ")).toMatch(/does not advertise config id "fast"/);
+    const card = h.editedPanels.at(-1)!.panel;
+    expect(card.fields.find((f: any) => f.name === "Fast").value).toMatch(/`off`/);
+  });
+
+  it("a replacement session that fails to start refuses instead of silently succeeding", async () => {
+    const h = saveHarness({ failFreshStart: true });
+    await h.run(applyPickerValue(draft(), "fast", FAST_MODE_ON, caps));
+    expect(h.ephemerals.join(" ")).toMatch(/could not be verified/i);
+    expect(h.overlays).toContainEqual({ fastMode: false });
+    expect(h.fastPresetNow()).toBe(false);
+  });
+
+  it("BLOCKER regression: a model-only change with Fast already on re-verifies and rolls back", async () => {
+    // Opus 5 (Fast on) → Sonnet 5. The Fast SETTING does not move, so the old
+    // gate skipped reset + verification and left `fastMode: true` persisted
+    // against a session that never offered it.
+    const started = draft({
+      snapshot: snapshot({
+        fastMode: setting(true, "thread preset"),
+        model: setting("claude-opus-5", "session config"),
+      }),
+    });
+    const withModel: ThreadConfigDraft = {
+      ...started,
+      overlay: { model: "claude-sonnet-5" },
+    };
+    expect(willResetSession(withModel)).toBe(true);
+    expect(willVerifyFastMode(withModel)).toBe(true);
+
+    const h = saveHarness({ fastMode: true, freshAdvertisesFast: false });
+    await h.run(withModel);
+    expect(h.invalidated).toHaveLength(1);
+    expect(h.started).toHaveLength(1);
+    expect(h.overlays).toContainEqual({ fastMode: false });
+    expect(h.fastPresetNow()).toBe(false);
+    expect(h.ephemerals.join(" ")).toMatch(/does not advertise config id "fast"/);
+  });
+
+  it("a model-only change with Fast OFF does not reset or start anything", async () => {
+    const plain: ThreadConfigDraft = { ...draft(), overlay: { model: "claude-sonnet-5" } };
+    expect(willResetSession(plain)).toBe(false);
+    expect(willVerifyFastMode(plain)).toBe(false);
+
+    const h = saveHarness();
+    await h.run(plain);
+    expect(h.invalidated).toEqual([]);
+    expect(h.started).toEqual([]);
+    expect(h.ephemerals).toEqual([]);
+  });
+
+  it("turning Fast OFF resets the session but never needs verification", async () => {
+    const started = draft({ snapshot: snapshot({ fastMode: setting(true, "thread preset") }) });
+    const off = applyPickerValue(started, "fast", FAST_MODE_OFF, caps);
+    expect(willVerifyFastMode(off)).toBe(false);
+
+    const h = saveHarness({ fastMode: true });
+    await h.run(off);
+    expect(h.invalidated).toHaveLength(1);
+    expect(h.started).toEqual([]);
+    expect(h.ephemerals).toEqual([]);
   });
 });

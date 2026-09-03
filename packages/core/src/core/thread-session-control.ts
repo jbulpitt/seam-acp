@@ -10,7 +10,8 @@ import {
   FAST_MODE_CONFIG_ID,
   FAST_MODE_ON,
   checkFastModeEligibility,
-  fastModeUnsupportedRefusal,
+  fastModeNeedsFreshSession,
+  settleFastMode,
   type FastModeOutcome,
 } from "./fast-mode.js";
 import type { SessionConfigState, SessionRecord } from "./types.js";
@@ -428,17 +429,19 @@ export class ThreadSessionControlService {
       nextFastMode = false;
     }
     const fastModeChanged = nextFastMode !== (before.fastMode?.value ?? false);
-    // Fast is validated per SESSION **and per model** — Opus advertises it,
-    // Sonnet does not. Changing the model under an active Fast session would
-    // leave Fast unverified on the new model (Claude model switches are
-    // otherwise live-config and preserve the session), so treat that as needing
-    // a fresh session too. The post-forge check below then re-validates it.
-    const fastNeedsFreshSession = fastModeChanged || (nextFastMode && modelChanged);
+    // Shared rule (#37): Fast is validated per session AND per model, so a
+    // model/agent change under an active Fast setting needs a fresh session
+    // even though the Fast setting itself did not change.
     const reset = detectSessionReset({
       previousAgentId,
       nextAgentId,
       modelChanged,
-      fastModeChanged: fastNeedsFreshSession,
+      fastModeChanged: fastModeNeedsFreshSession({
+        nextFastMode,
+        fastModeChanged,
+        modelChanged,
+        agentChanged,
+      }),
     });
     const effortTouched = input.effort !== undefined || modelChanged || agentChanged;
     if (
@@ -593,13 +596,14 @@ export class ThreadSessionControlService {
     // with no user-visible signal. Support is per-SESSION, so the profile-level
     // guard above cannot see an intra-Claude model change either.
     if (reset.sessionReset && nextFastMode) {
-      const outcome = runtime.getFastModeOutcome?.();
-      if (outcome?.applied !== true) {
-        const advertised = runtime.getConfigSelectValues(FAST_MODE_CONFIG_ID);
-        warnings.push(
-          outcome?.error ??
-            fastModeUnsupportedRefusal(nextAgentId, nextModel, advertised)
-        );
+      const settled = settleFastMode({
+        outcome: runtime.getFastModeOutcome?.(),
+        agentId: nextAgentId,
+        model: nextModel,
+        advertised: runtime.getConfigSelectValues(FAST_MODE_CONFIG_ID),
+      });
+      if (!settled.ok) {
+        warnings.push(settled.refusal);
         const reverted = this.applyTargetIdentity(
           this.deps.store.get(target.id) ?? target,
           { fastMode: false },

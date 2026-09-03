@@ -190,6 +190,9 @@ export class AgentRuntime {
   /** What Fast mode (#37) actually resolved to on this session, if anything.
    *  Read by the status card so the runtime result is visible, never assumed. */
   private fastModeOutcome?: FastModeOutcome;
+  /** True when the last `setConfigOption` echoed a fresh option snapshot. A
+   *  read-back is only meaningful when it did. */
+  private lastConfigOptionRefreshed = false;
   /** True while a `session/prompt` is awaiting a response — lets the abort path
    *  tell whether a graceful cancel actually ended the turn before escalating. */
   private promptInFlight = false;
@@ -765,6 +768,66 @@ export class AgentRuntime {
     if (this.sessionInfo) {
       this.sessionInfo = { ...this.sessionInfo, currentModelId: modelId };
     }
+    // #37: Fast availability is per MODEL, and a Claude model switch is
+    // live-config — the same session now advertises a different option set.
+    // Recompute from it, or the card keeps rendering "⚡ fast on" for a model
+    // that just dropped the option: an active false confirmation.
+    this.reconcileFastModeForCurrentOptions();
+  }
+
+  /**
+   * Re-derive the recorded Fast outcome from whatever the session advertises
+   * RIGHT NOW. Never sets anything — enabling Fast mid-conversation is exactly
+   * what the design forbids; this only stops a stale `applied: true` surviving
+   * a change that removed the capability.
+   */
+  private reconcileFastModeForCurrentOptions(): void {
+    const spec = this.profile.fastMode;
+    if (!spec || !this.fastModeOutcome) return;
+    const requested = this.fastModeOutcome.requested;
+    if (!this.lastConfigOptionRefreshed) {
+      // The switch told us nothing new, so the cached options describe the OLD
+      // model. Undetermined beats reporting a state we did not observe.
+      this.fastModeOutcome = {
+        requested,
+        applied: null,
+        ...(requested
+          ? {
+              error:
+                `Fast mode could not be re-checked after the model changed — the ` +
+                `session did not report its options, so it is not confirmed.`,
+            }
+          : {}),
+      };
+      return;
+    }
+    const current = this.getConfigCurrentValue(spec.configId);
+    if (current === undefined) {
+      this.fastModeOutcome = {
+        requested,
+        applied: false,
+        ...(requested
+          ? {
+              error:
+                `Fast mode is no longer offered by this session (the current model ` +
+                `does not advertise "${spec.configId}"), so it is not in effect.`,
+            }
+          : {}),
+      };
+      return;
+    }
+    const on = current === spec.onValue;
+    this.fastModeOutcome = {
+      requested,
+      applied: on,
+      ...(requested && !on
+        ? {
+            error:
+              `Fast mode is requested but this session now reports "${current}". ` +
+              `Toggle Fast off and on to start a fresh session with it.`,
+          }
+        : {}),
+    };
   }
 
   async setMode(modeId: string): Promise<void> {
@@ -794,6 +857,10 @@ export class AgentRuntime {
         configId,
         value,
       });
+    // Whether the agent echoed a FRESH option snapshot. Without it the cached
+    // `sessionConfigOptions` still describes the state BEFORE this call, so any
+    // read-back would report the stale value as if it were the result (#37).
+    this.lastConfigOptionRefreshed = Boolean(result?.configOptions);
     if (result?.configOptions) {
       this.sessionConfigOptions = result.configOptions;
     }
@@ -911,19 +978,41 @@ export class AgentRuntime {
       // setConfigOption stores the echoed configOptions, so re-read and derive
       // `applied` from what the session now reports — the status card claims to
       // show the applied state, so it must be observed, not assumed.
-      const echoed = this.getConfigCurrentValue(spec.configId);
-      const actual = echoed === undefined ? want : echoed === spec.onValue;
-      this.fastModeOutcome = {
-        requested: want,
-        applied: actual,
-        ...(want && !actual
-          ? {
-              error:
-                `Fast mode was accepted but the session reports "${echoed}" — ` +
-                `the backend declined to stay in Fast for this model/account.`,
-            }
-          : {}),
-      };
+      // Only trust a read-back when the response actually refreshed the
+      // snapshot; otherwise `getConfigCurrentValue` returns the PRE-set value.
+      const echoed = this.lastConfigOptionRefreshed
+        ? this.getConfigCurrentValue(spec.configId)
+        : undefined;
+      if (echoed === undefined) {
+        // The wrapper accepted the call but told us nothing about the resulting
+        // state. That is UNDETERMINED, never a confirmation: `applied: null`
+        // makes every `applied !== true` check (status card, both rollback
+        // paths) treat it as not-in-Fast, so no surprise bill can hide here.
+        this.fastModeOutcome = {
+          requested: want,
+          applied: null,
+          ...(want
+            ? {
+                error:
+                  `Fast mode was accepted but the session did not report its ` +
+                  `resulting "${spec.configId}" state, so it cannot be confirmed.`,
+              }
+            : {}),
+        };
+      } else {
+        const actual = echoed === spec.onValue;
+        this.fastModeOutcome = {
+          requested: want,
+          applied: actual,
+          ...(want && !actual
+            ? {
+                error:
+                  `Fast mode was accepted but the session reports "${echoed}" — ` +
+                  `the backend declined to stay in Fast for this model/account.`,
+              }
+            : {}),
+        };
+      }
       this.logger.info(
         { configId: spec.configId, value: wanted, reported: echoed },
         "applied fast mode"

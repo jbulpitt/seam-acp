@@ -11,7 +11,10 @@ import type {
   ResolvedSetting,
 } from "../../core/session-router.js";
 import { formatAgentAtLocation } from "../../core/location.js";
-import { FAST_MODE_COST_WARNING } from "../../core/fast-mode.js";
+import {
+  FAST_MODE_COST_WARNING,
+  fastModeNeedsFreshSession,
+} from "../../core/fast-mode.js";
 
 export const CFG_EDIT_PREFIX = "seam-cfg-edit";
 export const INHERIT_VALUE = "__inherit__";
@@ -310,14 +313,31 @@ function effectiveGif(draft: ThreadConfigDraft): boolean {
 }
 
 export function willResetSession(draft: ThreadConfigDraft): boolean {
+  const s = draft.snapshot;
   const next = effectiveAfterDraft(draft);
   return (
-    next.location !== draft.snapshot.location.value ||
-    next.agent !== draft.snapshot.agent.value ||
-    // #37: Fast is a session-start dimension — changing it must land on a fresh
-    // session so an accumulated conversation is never repriced mid-flight.
-    next.fastMode !== (draft.snapshot.fastMode?.value === true)
+    next.location !== s.location.value ||
+    next.agent !== s.agent.value ||
+    // #37: Fast is a session-start dimension. Changing it must land on a fresh
+    // session so an accumulated conversation is never repriced mid-flight —
+    // and so must a model/agent/host change while Fast is ON, because Fast is
+    // advertised per model (Opus has it, Sonnet does not) and a Claude model
+    // switch is otherwise live-config on the SAME session.
+    fastModeWillResetSession(draft)
   );
+}
+
+/** Whether this draft's Fast state requires a fresh session (shared #37 rule). */
+export function fastModeWillResetSession(draft: ThreadConfigDraft): boolean {
+  const s = draft.snapshot;
+  const next = effectiveAfterDraft(draft);
+  return fastModeNeedsFreshSession({
+    nextFastMode: next.fastMode,
+    fastModeChanged: next.fastMode !== (s.fastMode?.value === true),
+    modelChanged: next.model !== s.model.value,
+    agentChanged: next.agent !== s.agent.value,
+    locationChanged: next.location !== s.location.value,
+  });
 }
 
 /** True when saving this draft turns Fast mode ON (the paid-credit direction). */
@@ -326,6 +346,15 @@ export function willEnableFastMode(draft: ThreadConfigDraft): boolean {
     effectiveAfterDraft(draft).fastMode &&
     draft.snapshot.fastMode?.value !== true
   );
+}
+
+/**
+ * Whether saving must (re)verify Fast against a fresh session. True whenever
+ * Fast ends up ON and something invalidated its capability check — not just
+ * when the Fast toggle itself moved.
+ */
+export function willVerifyFastMode(draft: ThreadConfigDraft): boolean {
+  return effectiveAfterDraft(draft).fastMode && fastModeWillResetSession(draft);
 }
 
 /** Thread rider the draft is editing (overlay, else snapshot). `null` = inherit. */
@@ -722,8 +751,7 @@ export function renderHub(
   const footerParts = channelScope
     ? ["editing channel preset", "all threads inherit", "applies on the next turn"]
     : ["applies on the next turn"];
-  const fastChanging =
-    effectiveAfterDraft(draft).fastMode !== (s.fastMode?.value === true);
+  const fastChanging = fastModeWillResetSession(draft);
   if (reset) {
     footerParts.push(
       fastChanging

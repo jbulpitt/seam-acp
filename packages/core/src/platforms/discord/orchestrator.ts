@@ -193,6 +193,8 @@ import {
   renderExpiredHub,
   renderHub,
   renderSavedHub,
+  fastModeWillResetSession,
+  willVerifyFastMode,
   riderDownloadFilename,
   riderTooLong,
   snapshotFromDescribe,
@@ -293,8 +295,8 @@ import {
   describeFastModeOutcome,
   fastModeAgentRefusal,
   fastModeEnvRefusal,
-  fastModeUnsupportedRefusal,
   isFastModeDisabledByEnv,
+  settleFastMode,
 } from "../../core/fast-mode.js";
 import type { CardGifCatalog } from "../../core/card-gifs.js";
 import {
@@ -11346,8 +11348,14 @@ export class Orchestrator {
     // `configure_thread` does: the card's own picker promises "a model without
     // it is refused on Save rather than silently ignored", so the two mutation
     // surfaces must not disagree. A refusal rolls the flag straight back.
+    //
+    // The gate is NOT "the Fast toggle moved": Fast is advertised per model, and
+    // a Claude model switch is live-config on the SAME session, so changing the
+    // model with Fast already on would otherwise leave `fastMode: true`
+    // persisted against a session that never offered it.
     let fastRefusal: string | undefined;
-    if (plan.threadPreset.fastMode !== undefined) {
+    const fastNeedsFreshSession = fastModeWillResetSession(draft);
+    if (fastNeedsFreshSession) {
       const bound = this.store.getByChannel(PLATFORM, draft.threadId);
       if (bound) {
         await this.router
@@ -11355,21 +11363,19 @@ export class Orchestrator {
           .catch((err) =>
             this.logger.warn({ err, threadId: draft.threadId }, "fast-mode session reset failed")
           );
-        if (plan.threadPreset.fastMode === true) {
+        if (willVerifyFastMode(draft)) {
           try {
             const fresh = this.store.get(bound.id) ?? bound;
             const runtime = await this.router.getOrStartRuntime(fresh);
-            const outcome = runtime.getFastModeOutcome();
-            if (outcome?.applied !== true) {
-              const described = this.router.describeConfig(fresh);
-              fastRefusal =
-                outcome?.error ??
-                fastModeUnsupportedRefusal(
-                  described.agent.value,
-                  described.model.value,
-                  runtime.getConfigSelectValues(FAST_MODE_CONFIG_ID)
-                );
-            }
+            const described = this.router.describeConfig(fresh);
+            // Same decision `configure_thread` makes — one rule, two surfaces.
+            const settled = settleFastMode({
+              outcome: runtime.getFastModeOutcome(),
+              agentId: described.agent.value,
+              model: described.model.value,
+              advertised: runtime.getConfigSelectValues(FAST_MODE_CONFIG_ID),
+            });
+            if (!settled.ok) fastRefusal = settled.refusal;
           } catch (err) {
             fastRefusal =
               `Fast mode could not be verified — the replacement session failed to start: ` +

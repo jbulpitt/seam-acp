@@ -147,6 +147,59 @@ export function checkFastModeEligibility(input: {
 }
 
 /**
+ * The ONE rule both mutation surfaces use to decide whether a persisted
+ * `fast = true` survives contact with the live session (#37).
+ *
+ * `/seam config edit` and `configure_thread` each own their own I/O (persist,
+ * roll back, report), but the *decision* lives here so the next rule change
+ * cannot land in only one of them — which is exactly how the two drifted apart
+ * once already.
+ *
+ * A missing outcome, `applied: false`, and `applied: null` (undetermined) all
+ * fail: the contract is "never confirm what was not applied", so anything short
+ * of an observed `true` rolls back.
+ */
+export function settleFastMode(input: {
+  outcome: FastModeOutcome | undefined;
+  agentId: string;
+  model: string;
+  advertised?: ReadonlyArray<string>;
+}): { ok: true } | { ok: false; refusal: string } {
+  if (input.outcome?.applied === true) return { ok: true };
+  return {
+    ok: false,
+    refusal:
+      input.outcome?.error ??
+      fastModeUnsupportedRefusal(input.agentId, input.model, input.advertised ?? []),
+  };
+}
+
+/**
+ * Whether a pending change needs a FRESH session before Fast can be trusted.
+ *
+ * Fast is validated per session AND per model: Opus advertises it, Sonnet does
+ * not. So changing the model (or agent, or host) under an active Fast setting
+ * has to re-run the capability check on a new session, even though the Fast
+ * setting itself did not change.
+ */
+export function fastModeNeedsFreshSession(input: {
+  /** Fast state after the pending change. */
+  nextFastMode: boolean;
+  fastModeChanged: boolean;
+  modelChanged?: boolean;
+  agentChanged?: boolean;
+  locationChanged?: boolean;
+}): boolean {
+  if (input.fastModeChanged) return true;
+  if (!input.nextFastMode) return false;
+  return (
+    input.modelChanged === true ||
+    input.agentChanged === true ||
+    input.locationChanged === true
+  );
+}
+
+/**
  * One-line runtime state for the status/identity card: what was asked for and
  * what the session actually ended up with. Returns undefined when there is
  * nothing worth showing (Fast off and never requested), so ordinary turns are

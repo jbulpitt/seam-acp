@@ -181,6 +181,7 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     stopIntake: Orchestrator.prototype["stopIntake" as never],
     quiesce: Orchestrator.prototype["quiesce" as never],
     drainAfterDispose: Orchestrator.prototype["drainAfterDispose" as never],
+    settleAllWork: Orchestrator.prototype["settleAllWork" as never],
     settleTrackedContinuations: Orchestrator.prototype["settleTrackedContinuations" as never],
     runBoundedDrain: Orchestrator.prototype["runBoundedDrain" as never],
     trackContinuation: Orchestrator.prototype["trackContinuation" as never],
@@ -193,6 +194,8 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     pendingContinuations: Set<Promise<void>>;
     channelQueues: Map<string, Promise<void>>;
     intakeStopped: boolean;
+    activeTurns: number;
+    dispatchWatcher?: DispatchWatcher;
   };
 }
 
@@ -1152,5 +1155,120 @@ describe("#174 real shutdown sequence keeps adapter and store live", () => {
     const { store } = await runShutdown({ postDisposeDrain: false });
     expect(store.violations.length).toBeGreaterThan(0);
     expect(store.violations).toContain("getDelegation");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 10. Phase 2 must watch everything phase 1 watches (isolated dispatch)
+// ---------------------------------------------------------------------------
+
+describe("#174 post-dispose drain covers an ISOLATED dispatch", () => {
+  /**
+   * The case phase 2 was blind to. An isolated dispatch (`session` != "live")
+   * takes NO channel queue and registers NO post-turn continuation — it is
+   * counted in `activeTurns` and lives in the watcher's own per-target queue.
+   * So when phase 1 times out on one and `disposeAll()` is what finally
+   * releases it, a phase 2 that watched only `channelQueues` + continuations
+   * would resolve immediately and close the store on top of the completion.
+   */
+  it("phase 1 times out, disposal releases it, phase 2 holds until the done-file lands", async () => {
+    const store = makeClosableStore();
+    const adapter = makeStoppableAdapter();
+    store.rows.set("w-iso", { id: "w-iso", kind: "handoff", status: "running" });
+
+    const kill = deferred(); // released by disposal
+    const completion = deferred(); // the DB-first completion work in flight
+    const host = makeQuiesceHost();
+    const replayHost = makeReplayHost(store as never);
+
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async () => {
+        // Mirrors the isolated branch of `dispatchInjectTurn`: counted, unqueued.
+        host.activeTurns++;
+        try {
+          await kill.promise;
+          await completion.promise;
+          await replayHost.replayCompletedDispatch({
+            id: "w-iso",
+            target: "worker",
+            status: "completed",
+            output: "THE ANSWER",
+            correlationId: "corr-iso",
+            returnTo: "parent",
+          });
+          await adapter.sendMessage();
+          return { output: "THE ANSWER", stopReason: "end_turn" };
+        } finally {
+          host.activeTurns--;
+        }
+      },
+    });
+    await dropSpec({
+      id: "w-iso",
+      target: "worker",
+      session: "isolated",
+      returnTo: "parent",
+      correlationId: "corr-iso",
+    });
+    void watcher.start();
+    await vi.waitFor(() => expect(watcher.inFlightCount).toBe(1));
+    host.dispatchWatcher = watcher;
+
+    // The structural fact that made phase 2 blind: nothing in the two sets it
+    // used to watch refers to this turn.
+    expect(host.channelQueues.size).toBe(0);
+    expect(host.pendingContinuations.size).toBe(0);
+    expect(host.activeTurns).toBe(1);
+
+    // phase 1: wedged, so it must give up rather than stall the restart.
+    const phase1 = await host.quiesce({ timeoutMs: 100 });
+    expect(phase1.timedOut).toBe(true);
+    expect(await readdir(dirs.done)).not.toContain("w-iso.json");
+
+    // phase 2 starts while the turn is STILL running…
+    let drained = false;
+    const phase2 = host.drainAfterDispose({ timeoutMs: 5000 }).then((r) => ((drained = true), r));
+    await flush();
+    expect(drained).toBe(false);
+
+    // …disposal kills the agent, which releases the turn into its completion…
+    kill.resolve();
+    await flush();
+    expect(drained).toBe(false); // still holding: the completion has not landed
+    expect(await readdir(dirs.done)).not.toContain("w-iso.json");
+
+    // …and only when the done-file and its side effects are durable does the
+    // barrier let go.
+    completion.resolve();
+    expect((await phase2).timedOut).toBe(false);
+    expect(await readdir(dirs.done)).toContain("w-iso.json");
+    expect(await pendingReportBacks()).toHaveLength(1);
+    expect(store.rows.get("w-iso")!.status).toBe("completed");
+    expect(host.activeTurns).toBe(0);
+    expect(watcher.inFlightCount).toBe(0);
+
+    // Teardown lands after all of it, touching nothing that was already closed.
+    await adapter.stop();
+    store.close();
+    await flush();
+    expect(store.violations).toEqual([]);
+    expect(adapter.violations).toEqual([]);
+  });
+
+  it("phase 2 also holds for an isolated turn with no watcher entry at all", async () => {
+    // An isolated SCHEDULED fire: no channel queue, no continuation, and no
+    // dispatch spec either — `activeTurns` is the only evidence it exists.
+    const host = makeQuiesceHost();
+    host.activeTurns = 1;
+
+    let drained = false;
+    const phase2 = host.drainAfterDispose({ timeoutMs: 5000 }).then((r) => ((drained = true), r));
+    await flush();
+    expect(drained).toBe(false);
+
+    host.activeTurns = 0;
+    expect((await phase2).timedOut).toBe(false);
   });
 });

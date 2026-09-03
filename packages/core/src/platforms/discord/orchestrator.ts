@@ -508,6 +508,14 @@ const PLATFORM = "discord";
  */
 const QUIESCE_TIMEOUT_MS = 10_000;
 
+/**
+ * Re-check interval for the one kind of outstanding work with no promise to
+ * await: `activeTurns`, which is how an ISOLATED turn (dispatch or scheduled
+ * fire) is counted. Short enough not to add meaningful latency to a clean
+ * shutdown, long enough not to spin — and always bounded by the phase deadline.
+ */
+const QUIESCE_POLL_MS = 25;
+
 /** Result of one bounded shutdown drain phase (#174). */
 export interface QuiesceOutcome {
   phase: "pre-dispose" | "post-dispose";
@@ -1647,16 +1655,9 @@ export class Orchestrator {
    * reconciliation is what makes giving up safe.
    */
   async quiesce(opts: { timeoutMs?: number } = {}): Promise<QuiesceOutcome> {
-    return this.runBoundedDrain("pre-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, async () => {
-      // Claimed dispatches first: their report-back and chain advance are
-      // awaited inside the per-target queue task, so this drains them too.
-      await this.dispatchWatcher?.drain();
-      // Then the channel FIFOs (user turns and live dispatches share them).
-      await Promise.allSettled([...this.channelQueues.values()]);
-      // Then the post-turn continuations those queues just spawned. Draining
-      // the queues is what CREATES these, so this order matters.
-      await this.settleTrackedContinuations();
-    });
+    return this.runBoundedDrain("pre-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, () =>
+      this.settleAllWork()
+    );
   }
 
   /**
@@ -1667,19 +1668,59 @@ export class Orchestrator {
    * registers fresh post-turn continuations. A single `setImmediate` yield is
    * not a barrier for that — the work can span multiple awaits and I/O.
    *
-   * So the tracked-continuation set is drained a second time, bounded again,
-   * before the adapter and store are closed. Whatever is still outstanding
-   * when this expires is exactly what boot done-file reconciliation repairs.
+   * It waits for exactly what phase 1 waits for, deliberately: phase 1 may have
+   * TIMED OUT, and `disposeAll()` is then the thing that forces those wedged
+   * turns to finish. A phase-2 barrier that watched less than phase 1 would be
+   * blind to precisely the work disposal just released. That is not
+   * hypothetical — an ISOLATED dispatch has no channel queue and no tracked
+   * continuation (see `dispatchInjectTurn`; it is counted in `activeTurns` and
+   * lives in the watcher's own queue), so a phase 2 built from
+   * `channelQueues` + continuations alone would return with the done-file
+   * unwritten and close the store on top of it. That is the original #174 race,
+   * one phase later.
    */
   async drainAfterDispose(opts: { timeoutMs?: number } = {}): Promise<QuiesceOutcome> {
-    return this.runBoundedDrain(
-      "post-dispose",
-      opts.timeoutMs ?? QUIESCE_TIMEOUT_MS,
-      async () => {
-        await Promise.allSettled([...this.channelQueues.values()]);
-        await this.settleTrackedContinuations();
-      }
+    return this.runBoundedDrain("post-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, () =>
+      this.settleAllWork()
     );
+  }
+
+  /**
+   * The single definition of "no work is outstanding", shared by both shutdown
+   * phases so they can never drift apart.
+   *
+   * Four kinds of outstanding work, and they are not nested:
+   *   - claimed dispatches — the watcher's per-target queues; their report-back
+   *     and chain advance are awaited inside the queue task, so this covers
+   *     those side effects too;
+   *   - channel FIFOs — user turns and `session: "live"` dispatches;
+   *   - tracked post-turn continuations — the fire-and-forget work that runs
+   *     after `activeTurns--` and is therefore invisible to a counter check;
+   *   - `activeTurns` itself — the ONLY thing that sees an isolated turn
+   *     (isolated dispatch, isolated scheduled fire), which has neither a
+   *     channel queue nor a continuation to await. There is no promise to hold,
+   *     so it is polled.
+   *
+   * Runs to a real fixpoint over all four: settling one can create another (a
+   * finishing dispatch enqueues a report-back; a queue release fires a parked
+   * prompt). No internal cap — a cap would let this report "drained" with work
+   * still running, which is the failure it exists to prevent. Termination comes
+   * from outside: intake is closed, and `runBoundedDrain` races a deadline.
+   */
+  private async settleAllWork(): Promise<void> {
+    for (;;) {
+      await this.dispatchWatcher?.drain();
+      await Promise.allSettled([...this.channelQueues.values()]);
+      await this.settleTrackedContinuations();
+      if (
+        this.activeTurns === 0 &&
+        this.pendingContinuations.size === 0 &&
+        (this.dispatchWatcher?.inFlightCount ?? 0) === 0
+      ) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, QUIESCE_POLL_MS));
+    }
   }
 
   /**

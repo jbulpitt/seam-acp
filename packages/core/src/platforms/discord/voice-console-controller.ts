@@ -17,6 +17,7 @@ import type {
   VoiceConsoleCaptureSnapshotDraft,
 } from "../../core/voice-console/capture-router.js";
 import { VoiceConsoleSpeechScheduler } from "../../core/voice-console/speech-scheduler.js";
+import { voiceConsoleSpeechSourceKey } from "../../core/voice-console/speech-types.js";
 import type {
   VoiceConsoleSpeechProfile,
   VoiceConsoleSpeechSourceRef,
@@ -449,7 +450,7 @@ export class VoiceConsoleController
       this.logger.warn({ err, ...ref }, "voice console speech source registration failed");
       return null;
     }
-    runtime.sources.set(sourceKey(ref), { ref, lastEventOrdinal: 0 });
+    runtime.sources.set(voiceConsoleSpeechSourceKey(ref), { ref, lastEventOrdinal: 0 });
     void this.refreshCard(binding.consoleId);
     return ref;
   }
@@ -460,7 +461,7 @@ export class VoiceConsoleController
     text: string
   ): void {
     const runtime = this.runtimes.get(handle.consoleId);
-    const state = runtime?.sources.get(sourceKey(handle));
+    const state = runtime?.sources.get(voiceConsoleSpeechSourceKey(handle));
     if (!runtime || !state || ordinal <= state.lastEventOrdinal) return;
     state.lastEventOrdinal = ordinal;
     runtime.scheduler.feedSourceText(state.ref, text, "prose");
@@ -468,25 +469,25 @@ export class VoiceConsoleController
 
   async finishVisibleTurn(handle: VoiceConsoleVisibleTurnHandle): Promise<void> {
     const runtime = this.runtimes.get(handle.consoleId);
-    const state = runtime?.sources.get(sourceKey(handle));
+    const state = runtime?.sources.get(voiceConsoleSpeechSourceKey(handle));
     if (!runtime || !state) return;
     try {
       await runtime.scheduler.finishSource(state.ref);
     } finally {
       runtime.scheduler.forgetSource(state.ref);
-      runtime.sources.delete(sourceKey(handle));
+      runtime.sources.delete(voiceConsoleSpeechSourceKey(handle));
       await this.refreshCard(handle.consoleId);
     }
   }
 
   async cancelVisibleTurn(handle: VoiceConsoleVisibleTurnHandle): Promise<void> {
     const runtime = this.runtimes.get(handle.consoleId);
-    const state = runtime?.sources.get(sourceKey(handle));
+    const state = runtime?.sources.get(voiceConsoleSpeechSourceKey(handle));
     if (!runtime || !state) return;
     runtime.scheduler.cancelSource(state.ref);
     await runtime.scheduler.waitForSourceDrain(state.ref);
     runtime.scheduler.forgetSource(state.ref);
-    runtime.sources.delete(sourceKey(handle));
+    runtime.sources.delete(voiceConsoleSpeechSourceKey(handle));
     await this.refreshCard(handle.consoleId);
   }
 
@@ -1241,10 +1242,6 @@ function normalizedPace(value: string | null | undefined): TtsPace {
 
 function normalizedStyle(value: string | null | undefined): TtsStyle {
   return value && isTtsStyle(value) ? value : "neutral";
-}
-
-function sourceKey(ref: VoiceConsoleSpeechSourceRef): string {
-  return `${ref.bindingId}\u0000${ref.turnId}`;
 }
 
 function laneState(

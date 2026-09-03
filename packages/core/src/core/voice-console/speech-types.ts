@@ -12,6 +12,44 @@ export interface VoiceConsoleSpeechSourceRef {
   turnId: string;
 }
 
+/**
+ * Delimiter for Voice Console composite `Map` keys (#171).
+ *
+ * These keys are process-local only — never persisted, logged, or rendered
+ * (a read-only scan of the live DB found zero occurrences across 30 tables and
+ * 365 columns), so the byte itself is an implementation detail and is
+ * deliberately left as-is.
+ *
+ * It is nonetheless load-bearing. Without a delimiter, unregistering binding
+ * `b1` prefix-matches `b10`, and the tuples `(12, 3)` and `(1, 23)` collide.
+ *
+ * Correctness needs exactly one property: the delimiter must not occur in the
+ * FIRST component. Binding ids are authority ids
+ * (`assertVoiceConsoleAuthorityId`, `^[A-Za-z0-9_-]{1,48}$`), which excludes it,
+ * and the scheduler now enforces that at its registration boundary. Turn ids
+ * are deliberately NOT constrained — they legitimately carry colons
+ * (`dispatch:<id>`, `scheduled:<id>:<ts>`) — because the first delimiter
+ * occurrence already terminates the binding id, leaving the rest unambiguous.
+ */
+export const VOICE_CONSOLE_KEY_DELIMITER = "\u0000";
+
+/**
+ * The one source-key format, shared by the speech scheduler and the Discord
+ * voice console controller. Previously duplicated in both.
+ */
+export function voiceConsoleSpeechSourceKey(ref: VoiceConsoleSpeechSourceRef): string {
+  return `${ref.bindingId}${VOICE_CONSOLE_KEY_DELIMITER}${ref.turnId}`;
+}
+
+/**
+ * Prefix matching exactly the source keys of one binding. Derived from the same
+ * delimiter as the key itself, so a prefix scan can never drift from the format
+ * it is scanning.
+ */
+export function voiceConsoleSpeechBindingKeyPrefix(bindingId: string): string {
+  return `${bindingId}${VOICE_CONSOLE_KEY_DELIMITER}`;
+}
+
 export interface VoiceConsoleSpeechChunk extends VoiceConsoleSpeechSourceRef {
   ordinal: number;
   text: string;

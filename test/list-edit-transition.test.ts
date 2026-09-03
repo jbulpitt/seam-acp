@@ -76,7 +76,7 @@ function makeListInteraction(events: string[]) {
  * The Edit button click, tracking `deferred`/`replied` the way discord.js does
  * so a second reply/defer is observable rather than silently fine.
  */
-function makeEditButton(customId: string, events: string[]) {
+function makeEditButton(customId: string, events: string[], ackGate?: Promise<void>) {
   const button = {
     isButton: () => true,
     customId,
@@ -85,6 +85,9 @@ function makeEditButton(customId: string, events: string[]) {
     replied: false,
     deferReply: async () => {
       if (button.deferred || button.replied) throw new Error("InteractionAlreadyReplied");
+      // Logged at entry: the gate is invocation order.
+      events.push("button:ack-invoked");
+      if (ackGate) await ackGate;
       button.deferred = true;
       events.push("button:acked");
     },
@@ -102,6 +105,33 @@ function makeEditButton(customId: string, events: string[]) {
     },
   };
   return button;
+}
+
+interface RunOpts {
+  /** Holds the button's ack open so both clicks are genuinely in flight. */
+  ackGate?: Promise<void>;
+  releaseAck?: () => void;
+}
+
+/**
+ * Fire `count` clicks. They are dispatched WITHOUT awaiting each other, so a
+ * second click lands while the first is still parked on its unresolved ack —
+ * the window a settle that stops only after awaiting would leave open.
+ */
+async function fireClicks(
+  collector: FakeCollector,
+  count: number,
+  makeButton: (events: string[]) => unknown,
+  events: string[],
+  releaseAck?: () => void
+): Promise<boolean[]> {
+  const inFlight: Array<Promise<boolean>> = [];
+  for (let n = 0; n < count; n++) inFlight.push(collector.click(makeButton(events)));
+  releaseAck?.();
+  const delivered = await Promise.all(inFlight);
+  // Let the deliberately slow freeze repaint land.
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  return delivered;
 }
 
 const scheduleRow = {
@@ -151,7 +181,8 @@ const presetRow = {
   updatedUtc: "2026-09-01T00:00:00.000Z",
 };
 
-async function runScheduleListEdit(clicks: number) {
+async function runScheduleListEdit(clicks: number, opts: RunOpts = {}) {
+  const { ackGate, releaseAck } = opts;
   const events: string[] = [];
   const { interaction, collector, paints } = makeListInteraction(events);
   const self = {
@@ -164,6 +195,9 @@ async function runScheduleListEdit(clicks: number) {
     },
     scheduledManager: undefined,
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
+    // The real wrapper, so a builder that throws after the freeze is surfaced
+    // rather than leaving a permanently "thinking" ephemeral.
+    openEditorAfterFreeze: Orchestrator.prototype["openEditorAfterFreeze" as never],
     buildScheduleListMessage: Orchestrator.prototype["buildScheduleListMessage" as never],
     scheduleSummaryLine: Orchestrator.prototype["scheduleSummaryLine" as never],
     cmdScheduleAdd: async (c: { deferred: boolean; replied: boolean; editReply: () => Promise<void>; reply: () => Promise<void> }) => {
@@ -179,16 +213,16 @@ async function runScheduleListEdit(clicks: number) {
     }
   ).cmdScheduleList.call(self, interaction);
 
-  const delivered: boolean[] = [];
-  for (let n = 0; n < clicks; n++) {
-    delivered.push(await collector.click(makeEditButton(`sl:edit:${scheduleRow.id}`, events)));
-  }
-  // Let the deliberately slow freeze repaint land.
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  const delivered = await fireClicks(collector, clicks, (e) =>
+    makeEditButton(`sl:edit:${scheduleRow.id}`, e, ackGate),
+    events,
+    releaseAck
+  );
   return { events, collector, paints, delivered };
 }
 
-async function runPresetListEdit(clicks: number) {
+async function runPresetListEdit(clicks: number, opts: RunOpts = {}) {
+  const { ackGate, releaseAck } = opts;
   const events: string[] = [];
   const { interaction, collector, paints } = makeListInteraction(events);
   const self = {
@@ -200,6 +234,9 @@ async function runPresetListEdit(clicks: number) {
     },
     repoDisplay: (p: string) => p,
     attachListLifecycle: Orchestrator.prototype["attachListLifecycle" as never],
+    // The real wrapper, so a builder that throws after the freeze is surfaced
+    // rather than leaving a permanently "thinking" ephemeral.
+    openEditorAfterFreeze: Orchestrator.prototype["openEditorAfterFreeze" as never],
     buildPresetListMessage: Orchestrator.prototype["buildPresetListMessage" as never],
     presetSummaryLine: Orchestrator.prototype["presetSummaryLine" as never],
     cmdPresetBuilder: async (c: { deferred: boolean; replied: boolean; editReply: () => Promise<void>; deferReply: () => Promise<void> }) => {
@@ -214,11 +251,11 @@ async function runPresetListEdit(clicks: number) {
     }
   ).cmdPresetList.call(self, interaction);
 
-  const delivered: boolean[] = [];
-  for (let n = 0; n < clicks; n++) {
-    delivered.push(await collector.click(makeEditButton(`pr:edit:${presetRow.id}`, events)));
-  }
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  const delivered = await fireClicks(collector, clicks, (e) =>
+    makeEditButton(`pr:edit:${presetRow.id}`, e, ackGate),
+    events,
+    releaseAck
+  );
   return { events, collector, paints, delivered };
 }
 
@@ -234,9 +271,9 @@ for (const surface of SURFACES) {
     // queues a REST request ahead of it.
     it("acknowledges the button before the freeze is even invoked", async () => {
       const { events } = await surface.run(1);
-      expect(events).toContain("button:acked");
+      expect(events).toContain("button:ack-invoked");
       expect(events).toContain("list:freeze-invoked");
-      expect(events.indexOf("button:acked")).toBeLessThan(events.indexOf("list:freeze-invoked"));
+      expect(events.indexOf("button:ack-invoked")).toBeLessThan(events.indexOf("list:freeze-invoked"));
     });
 
     it("acknowledges the button before the freeze repaint resolves", async () => {
@@ -281,3 +318,41 @@ for (const surface of SURFACES) {
     });
   });
 }
+
+// QA gate: a sequential second click proves nothing about the window between
+// the handler starting and its ack resolving. These launch both clicks with the
+// ack deliberately unresolved, so the only thing that can prevent a second
+// editor is a collector that was stopped SYNCHRONOUSLY, before any await.
+describe("concurrent Edit clicks while the ACK is still unresolved", () => {
+  const SURFACE_RUNNERS = [
+    { name: "schedule list", run: runScheduleListEdit },
+    { name: "preset list", run: runPresetListEdit },
+  ];
+
+  for (const surface of SURFACE_RUNNERS) {
+    it(`${surface.name}: two in-flight clicks open exactly one editor`, async () => {
+      let releaseAck!: () => void;
+      const ackGate = new Promise<void>((resolve) => {
+        releaseAck = resolve;
+      });
+      const { events, delivered, collector } = await surface.run(2, { ackGate, releaseAck });
+
+      expect(events.filter((e) => e.startsWith("editor:opened"))).toHaveLength(1);
+      // The second click was refused at dispatch: the settle stopped the
+      // collector before the first handler ever awaited its ack.
+      expect(delivered).toEqual([true, false]);
+      expect(collector.stopped).toBe("edit");
+      // Exactly one ack was even attempted.
+      expect(events.filter((e) => e === "button:ack-invoked")).toHaveLength(1);
+    });
+
+    it(`${surface.name}: the ack is invoked before the freeze repaint is`, async () => {
+      let releaseAck!: () => void;
+      const ackGate = new Promise<void>((resolve) => {
+        releaseAck = resolve;
+      });
+      const { events } = await surface.run(1, { ackGate, releaseAck });
+      expect(events.indexOf("button:ack-invoked")).toBeLessThan(events.indexOf("list:freeze-invoked"));
+    });
+  }
+});

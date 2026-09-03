@@ -8555,6 +8555,32 @@ export class Orchestrator {
     await i.reply({ ...payload, flags: MessageFlags.Ephemeral } as never);
   }
 
+  /**
+   * Open an editor whose originating listing has already been frozen.
+   *
+   * By this point the button is deferred and the list is inert, so a throw
+   * would leave the operator staring at a permanently "thinking" ephemeral
+   * next to a dead listing. Surface it instead of only logging.
+   */
+  private async openEditorAfterFreeze(
+    c: MessageComponentInteraction,
+    open: () => Promise<void>,
+    surface: string
+  ): Promise<void> {
+    try {
+      await open();
+    } catch (err) {
+      this.logger.warn({ err, surface }, "editor failed to open after list freeze");
+      await c
+        .editReply({
+          content: `❌ Could not open the ${surface} editor. Run \`/seam ${surface} edit\` again.`,
+          embeds: [],
+          components: [],
+        })
+        .catch(() => {});
+    }
+  }
+
   // --- /seam schedule … -----------------------------------------------------
 
   private async cmdSchedule(i: ChatInputCommandInteraction): Promise<void> {
@@ -8638,19 +8664,23 @@ export class Orchestrator {
           // Run is repeatable; rebuild so the card shows the new last-status.
           await lifecycle.refresh(this.buildScheduleListMessage(channel));
         } else if (action === "edit") {
-          // ACK first, before anything touches the original card. The freeze
-          // below edits the *original* slash reply — a separate REST request —
-          // and queuing that ahead of this button's ack risks its 3s budget
-          // under per-route backoff: "This interaction failed", no editor.
-          await c.deferReply({ flags: MessageFlags.Ephemeral });
-          // Transition: freeze the listing BEFORE the builder opens, or the
-          // user is left holding two live-looking cards for one schedule.
-          await lifecycle.transition("edit", {
-            content: `✏️ Editing **${row.name}** — this listing was replaced by the editor below.`,
-            embeds: [],
-            components: [],
-          });
-          await this.cmdScheduleAdd(c, row); // acks `c`, opens the builder card
+          // Freeze the listing BEFORE the builder opens, or the user is left
+          // holding two live-looking cards for one schedule. The collector is
+          // closed synchronously inside the settle — so a concurrent second
+          // click is never collected — and the button's ack is ordered ahead
+          // of the freeze repaint, which targets the original slash token.
+          await lifecycle.transitionWithAck(
+            "edit",
+            {
+              content: `✏️ Editing **${row.name}** — this listing was replaced by the editor below.`,
+              embeds: [],
+              components: [],
+            },
+            async () => {
+              await c.deferReply({ flags: MessageFlags.Ephemeral });
+            }
+          );
+          await this.openEditorAfterFreeze(c, () => this.cmdScheduleAdd(c, row), "schedule");
         } else if (action === "toggle") {
           const updated: ScheduledPrompt = { ...row, enabled: !row.enabled, updatedUtc: new Date().toISOString() };
           this.store.upsertScheduled(updated);
@@ -16408,16 +16438,20 @@ export class Orchestrator {
             flags: MessageFlags.Ephemeral,
           });
         } else if (action === "edit") {
-          // ACK first, for the same reason as the schedule list above.
-          await c.deferReply({ flags: MessageFlags.Ephemeral });
-          // Transition: freeze the listing BEFORE the builder opens, or the
-          // user is left holding two live-looking cards for one preset.
-          await lifecycle.transition("edit", {
-            content: `✏️ Editing preset **${preset.name}** — this listing was replaced by the editor below.`,
-            embeds: [],
-            components: [],
-          });
-          await this.cmdPresetBuilder(c, preset); // acks `c`, opens the builder
+          // Same ordering as the schedule list above: synchronous stop, then
+          // the ack, then the freeze repaint.
+          await lifecycle.transitionWithAck(
+            "edit",
+            {
+              content: `✏️ Editing preset **${preset.name}** — this listing was replaced by the editor below.`,
+              embeds: [],
+              components: [],
+            },
+            async () => {
+              await c.deferReply({ flags: MessageFlags.Ephemeral });
+            }
+          );
+          await this.openEditorAfterFreeze(c, () => this.cmdPresetBuilder(c, preset), "preset");
         } else if (action === "del") {
           this.store.deletePreset(id);
           const remaining = this.store.listPresetsForProject(projectRef);

@@ -90,8 +90,6 @@ function describeConfig(record: SessionRecord): ConfigDescription {
 /** Ids passed to `reschedule` (the timer-arm hook), so a test can assert the
  *  HARD REQUIREMENT that every schedule write re-arms the manager. */
 let rescheduled: string[] = [];
-/** Ids whose on-disk attachments were cleaned up (delete path). */
-let cleanedUp: string[] = [];
 
 function makeService(over: {
   presetsFile?: string;
@@ -110,7 +108,6 @@ function makeService(over: {
     reloadPresets: over.reloadPresets ?? (() => ({ ok: true })),
     reschedule: over.reschedule ?? ((id) => rescheduled.push(id)),
     defaultTimezone: over.defaultTimezone ?? "America/Chicago",
-    cleanupScheduleAttachments: (id) => cleanedUp.push(id),
     logger: silent,
   });
 }
@@ -119,7 +116,6 @@ beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-cfgmut-"));
   store = new SessionStore(path.join(dir, "test.db"));
   rescheduled = [];
-  cleanedUp = [];
 });
 afterEach(() => {
   store.close();
@@ -1172,7 +1168,7 @@ describe("scheduled-prompt mutation (Tier D)", () => {
       sessionMode: "isolated",
       catchupSeconds: 7200,
       enabled: true,
-      attachments: [],
+      legacyAttachmentCount: 0,
       createdBy: "user-jesse",
       createdUtc: "2026-01-01T00:00:00Z",
       updatedUtc: "2026-01-01T00:00:00Z",
@@ -1286,7 +1282,7 @@ describe("scheduled-prompt mutation (Tier D)", () => {
     expect(again.ok).toBe(false);
   });
 
-  it("delete: removes the row, disarms the timer (via reschedule), cleans attachments, audits", () => {
+  it("delete: removes the row, disarms the timer (via reschedule), audits", () => {
     const record = makeRecord();
     store.upsert(record);
     const seed = seedSchedule();
@@ -1299,7 +1295,6 @@ describe("scheduled-prompt mutation (Tier D)", () => {
 
     expect(store.getScheduled(seed.id)).toBeNull();
     expect(rescheduled).toEqual([seed.id]); // reschedule with row gone → disarm
-    expect(cleanedUp).toEqual([seed.id]);
     expect(store.listConfigMutations()[0]).toMatchObject({ tier: "schedule" });
   });
 

@@ -14,7 +14,7 @@ import {
  *   GROUPS (9):
  *     config   (17) model effort agent mode repo tools card gif approve reset init detach tts show edit set audit
  *     info     (6)  whoami usage avatar help sessions repos
- *     schedule (7)  unchanged
+ *     schedule (5)  add list remove toggle edit — no attachments (#158)
  *     preset   (7)  list create apply delete show edit thread
  *     project  (3)  unchanged
  *     upload   (3)  pull push secret  — admin-only; hard cutover of /seam attach
@@ -535,19 +535,12 @@ export function buildSeamCommand(): SlashCommandBuilder {
     g
       .setName("schedule")
       .setDescription("Recurring scheduled prompts for this thread")
+      // #158: no attachment options. A scheduled prompt stands on its own; for
+      // substantial instructions, commit a runbook and reference it in the prompt.
       .addSubcommand((sub) =>
         sub
           .setName("add")
           .setDescription("Create a scheduled prompt (finish setup on the card)")
-          .addAttachmentOption((o) =>
-            o.setName("file").setDescription("Optional reference file (re-sent on every run)").setRequired(false)
-          )
-          .addAttachmentOption((o) =>
-            o.setName("file2").setDescription("Optional reference file").setRequired(false)
-          )
-          .addAttachmentOption((o) =>
-            o.setName("file3").setDescription("Optional reference file").setRequired(false)
-          )
       )
       .addSubcommand((sub) =>
         sub.setName("list").setDescription("List this thread's scheduled prompts")
@@ -570,30 +563,6 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setDescription("Enable or disable a scheduled prompt")
           .addStringOption((o) =>
             o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("addfile")
-          .setDescription("Attach another reference file to a scheduled prompt")
-          .addStringOption((o) =>
-            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
-          )
-          .addAttachmentOption((o) => o.setName("file").setDescription("File to add").setRequired(true))
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("removefile")
-          .setDescription("Remove a reference file from a scheduled prompt")
-          .addStringOption((o) =>
-            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
-          )
-          .addStringOption((o) =>
-            o
-              .setName("filename")
-              .setDescription("Filename to remove")
-              .setRequired(true)
-              .setAutocomplete(true)
           )
       )
       .addSubcommand((sub) =>

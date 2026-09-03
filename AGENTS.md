@@ -154,7 +154,13 @@ Discord has no aliases; old invocations disappear.
     To pre-bind a host that is currently offline (it lists no agents), use
     `/seam config agent id:<agentId>@<host>`.
 - `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
-- `schedule` (7), `preset` (6), `project` (3) — unchanged
+- `schedule` (5): `add` `list` `remove` `toggle` `edit` — **no attachments**
+  (#158). A scheduled prompt carries no files on any surface; when a job needs
+  substantial instructions, commit a runbook and make the prompt a short request
+  to follow it. A pre-#158 row that still records files is **quarantined** (never
+  armed, never fired); editing the schedule clears that record and re-arms it.
+  Stored bytes under `data/scheduled-attachments/` are never deleted by Seam.
+- `preset` (6), `project` (3) — unchanged
 - `upload` (3): `pull` `push` `secret` — **admin-only**. Hard cutover of `/seam attach`.
 - `bridge` (4), `debug` (6) — admin-only pairing / host debug (`voice-ping` / `voice-capture` / `voice-live` are the live-help spike)
 - `voice` (7): `start` `add` `remove` `configure` `console` `status` `stop` — **admin-only** Shared Voice Console V2.

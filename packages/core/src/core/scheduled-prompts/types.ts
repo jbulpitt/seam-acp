@@ -4,14 +4,6 @@
  * its own throwaway session and posts output back to the thread as cards.
  */
 
-/** One persisted reference file, re-sent to the agent on every run. The bytes
- *  live on disk under data/scheduled-attachments/<id>/<filename>. */
-export interface ScheduledAttachment {
-  filename: string;
-  mime: string;
-  size: number;
-}
-
 export interface ScheduledPrompt {
   id: string;
   platform: string;
@@ -47,7 +39,19 @@ export interface ScheduledPrompt {
    *  consults this: a missed `nextRunUtc` always fires once on boot. */
   catchupSeconds: number;
   enabled: boolean;
-  attachments: ScheduledAttachment[];
+  /** Legacy-only (#158). Scheduled prompts no longer support file attachments:
+   *  there is no route to add one, and nothing is ever re-sent at fire time.
+   *  This is the *count* of entries still recorded in the row's legacy
+   *  `attachments_json`, kept readable so an operator can find rows that were
+   *  written before the removal. A row with a non-zero count is QUARANTINED —
+   *  the manager refuses to arm or fire it (see `legacyAttachmentQuarantine`).
+   *
+   *  Writes: the store never overwrites a stored legacy manifest on update, so
+   *  spreading an existing row preserves the count (and the quarantine). Setting
+   *  this to 0 explicitly is the deliberate "I revised this schedule" act — it
+   *  clears the manifest and lifts the quarantine. The bytes on disk under
+   *  `data/scheduled-attachments/<id>/` are NEVER deleted by Seam. */
+  legacyAttachmentCount: number;
   /** Discord user id of the creator (auth stamp). */
   createdBy: string;
   createdUtc: string;

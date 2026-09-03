@@ -11,6 +11,7 @@
 import { Cron } from "croner";
 import type { SessionStore } from "../session-store.js";
 import type { ScheduledPrompt } from "./types.js";
+import { legacyAttachmentQuarantine, legacyAttachmentStatus } from "./quarantine.js";
 import type { Logger } from "../../lib/logger.js";
 
 export interface ScheduledPromptManagerOpts {
@@ -37,20 +38,48 @@ export class ScheduledPromptManager {
     this.logger = opts.logger;
   }
 
-  /** Rehydrate: catch-up missed fires, then arm every enabled schedule. */
+  /** Rehydrate: catch-up missed fires, then arm every enabled schedule.
+   *  #158: an enabled row that still carries legacy attachments is reported and
+   *  left disarmed — it is neither caught up nor armed. */
   start(): void {
     const rows = this.store.listScheduledEnabled();
+    const quarantined: string[] = [];
     for (const row of rows) {
+      if (legacyAttachmentQuarantine(row)) {
+        quarantined.push(row.id);
+        this.armFromRow(row); // reports + stamps the row; arms nothing
+        continue;
+      }
       this.catchUp(row); // uses the pre-downtime next_run_utc; may fire once
       this.armFromRow(row); // sets a fresh forward next_run_utc
     }
-    this.logger.info({ count: rows.length }, "scheduled prompts armed");
+    this.logger.info(
+      { count: rows.length - quarantined.length, quarantined: quarantined.length },
+      "scheduled prompts armed"
+    );
+    if (quarantined.length > 0) {
+      this.logger.warn(
+        { ids: quarantined },
+        "scheduled prompts NOT armed: enabled rows still carry legacy attachments (#158); " +
+          "edit each schedule so its prompt references a repository runbook"
+      );
+    }
   }
 
-  /** (Re)arm a single schedule from its current row. No-op (disarms) if disabled. */
+  /** (Re)arm a single schedule from its current row. No-op (disarms) if disabled
+   *  or quarantined by a legacy attachment manifest (#158). */
   armFromRow(row: ScheduledPrompt): void {
     this.disarm(row.id);
     if (!row.enabled) return;
+    // #158 arming boundary: refuse an enabled legacy attachment-bearing row.
+    // Its prompt was authored assuming the files would be re-sent; running it
+    // silently without them is the failure mode we are removing.
+    const quarantine = legacyAttachmentQuarantine(row);
+    if (quarantine) {
+      this.logger.warn({ id: row.id, name: row.name, files: row.legacyAttachmentCount }, quarantine);
+      this.patchRow(row.id, { lastStatus: legacyAttachmentStatus(row), nextRunUtc: null });
+      return;
+    }
     let job: Cron;
     try {
       job = new Cron(row.cron, { timezone: row.timezone, name: row.id }, () => {
@@ -91,9 +120,10 @@ export class ScheduledPromptManager {
   }
 
   /** Manual invoke: same `onFire` path as the cron tick (isolated vs live,
-   *  cards vs messages, model, attachments). Does not consume a cron slot —
-   *  `next_run` is only refreshed from the armed timer if one exists. Honors
-   *  the in-flight overlap guard. Works on disabled rows. */
+   *  cards vs messages, model). Does not consume a cron slot — `next_run` is
+   *  only refreshed from the armed timer if one exists. Honors the in-flight
+   *  overlap guard. Works on disabled rows, but not on a row quarantined by a
+   *  legacy attachment manifest (#158). */
   runNow(id: string): Promise<void> {
     return this.fire(id);
   }
@@ -111,6 +141,18 @@ export class ScheduledPromptManager {
 
   /** Execute one fire: run the job, then refresh next_run from the armed timer. */
   private async fire(id: string): Promise<void> {
+    // #158: last line of defence. `armFromRow` never arms a quarantined row, but
+    // catch-up and manual "Run now" reach `fire` directly — refuse there too so
+    // there is exactly one answer for a legacy attachment-bearing schedule.
+    const current = this.store.getScheduled(id);
+    if (current) {
+      const quarantine = legacyAttachmentQuarantine(current);
+      if (quarantine) {
+        this.logger.warn({ id, files: current.legacyAttachmentCount }, quarantine);
+        this.patchRow(id, { lastStatus: legacyAttachmentStatus(current) });
+        return;
+      }
+    }
     // D3: skip (don't stack) if a prior fire of this same schedule is still
     // running. With live + per-channel FIFO, stacking would grow the channel
     // queue without bound and pin the thread replaying stale fires.

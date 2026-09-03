@@ -5,7 +5,24 @@
 a Discord thread. When one fires, a card announces it, the prompt runs as a
 **self-contained job in its own isolated session**, and the output is posted back
 to the thread as cards. Each job runs with no memory of prior conversation, so it
-must carry its own instructions + context (text and/or attached files).
+must carry its own instructions.
+
+> ### ⚠️ Attachments were removed (#158)
+>
+> Everything below about **reference files** describes v1 and no longer exists.
+> A scheduled prompt carries no files on any surface: there is no `file` /
+> `file2` / `file3` option, no `/seam schedule addfile` or `removefile`, no
+> remove-file control on the builder card, and nothing is loaded from disk at
+> fire time. A `config_propose` schedule mutation naming an attachment-shaped
+> key is refused outright.
+>
+> **Write prompts that stand alone.** When a job needs substantial instructions,
+> commit them as a runbook in the repository and make the prompt a short request
+> to follow it (`"Follow docs/runbooks/cleanup-stories.md."`). Seam does not
+> manage the referenced file — the repo does.
+>
+> See [Attachment removal (#158)](#attachment-removal-158) for the migration
+> behaviour and the legacy-row quarantine.
 
 ---
 
@@ -30,10 +47,11 @@ must carry its own instructions + context (text and/or attached files).
    deleted thread → drop the schedule; **locked** thread → skip (record why);
    merely archived → run (the announce card auto-reopens it). Only *locked* or
    *deleted* auto-stops a schedule. Manual pause is an explicit `enabled` toggle.
-5. **Files via slash attachment options → an ephemeral builder card.** No
+5. ~~**Files via slash attachment options → an ephemeral builder card.** No
    message-window capture (the `/seam image` flow we want to avoid). Bytes are
    downloaded and **persisted locally**, then re-attached every run (Discord URLs
-   expire ~24h).
+   expire ~24h).~~ **Reversed by #158** — schedules carry no files; point the
+   prompt at a repository runbook instead.
 6. **Catch-up window for missed fires.** Per-schedule `catchup_seconds` (default
    **900** / 15 min, `0` = never). On boot/re-arm, if a fire was missed but within
    the window, run it **once**; otherwise roll forward. Never burst-fire multiple
@@ -59,7 +77,7 @@ runScheduled(row):
                   model: cfg.model, effort: cfg.effort })   // thread's config
   collect:  agent-text  → output buffer
             agent-file  → forward to the thread (reuse sendFile)
-  rt.prompt(row.prompt_text, <attachments rehydrated from stored bytes>)
+  rt.prompt(row.prompt_text)                                   // no files (#158)
   rt.dispose();  manager.deleteSession(cwd, tempSessionId)   // don't clutter /seam sessions
 ```
 
@@ -103,7 +121,7 @@ runScheduled(row):
 | `timezone` | TEXT | IANA tz (e.g. America/Chicago) |
 | `catchup_seconds` | INTEGER | missed-fire window; default 900, 0 = never |
 | `enabled` | INTEGER | 0/1 — the manual pause flag |
-| `attachments_json` | TEXT | manifest `[{filename, mime, size}]` |
+| `attachments_json` | TEXT | **legacy (#158)** — read-only; new rows are always `[]`. A non-empty manifest quarantines the row. Drop the column in a later migration. |
 | `created_by` | TEXT | creator user id (auth stamp) |
 | `created_utc` / `updated_utc` | TEXT | ISO |
 | `last_run_utc` | TEXT | last fire time |
@@ -113,10 +131,11 @@ runScheduled(row):
 
 Index on `(platform, channel_ref)` and on `enabled` (rehydration).
 
-### Attachment storage
-- `data/scheduled-attachments/<id>/<filename>` — bytes downloaded at **Create**
-  time (URL still valid within the builder session). Manifest mirrored in
-  `attachments_json`. Cleaned up on schedule delete and on thread-delete.
+### Attachment storage (removed — #158)
+`data/scheduled-attachments/<id>/<filename>` is no longer written, read, or
+deleted. Bytes left behind by v1 stay on disk forever unless an operator removes
+them by hand; that is deliberate, so a revision can be made with the original
+material still in front of you.
 
 ---
 
@@ -149,10 +168,10 @@ Index on `(platform, channel_ref)` and on `enabled` (rehydration).
 
 ```
 1. Resolve thread by channel_ref.
-   └─ not found (404) ........ delete row + attachment dir → done
+   └─ not found (404) ........ delete row → done (stored bytes are left alone)
 2. thread.locked? ............ last_status = "skipped: locked" → done (can't post)
 3. Post blue "⏰ Running '<name>'…" card  (also auto-reopens an archived thread).
-4. Run isolated job (§2): own session, thread's repo + model, attachments.
+4. Run isolated job (§2): own session, thread's repo + model. Prompt only.
 5. Post output as blue cards (chunked; overflow → file); forward any agent files.
 6. last_run_utc = now; last_status = ok | error: <msg>; edit the run card to result.
 ```
@@ -168,15 +187,11 @@ fire-time 404 is the lazy fallback if the bot was offline for the delete.)
 ### Command home
 `/seam schedule …` as a **subcommand group** (21 subcommands today → 22/25, fits).
 
-- `add` — options: `cron?`, `timezone?`, `file?`, `file2?`, `file3?` (all optional,
-  incl. 3 attachment slots). Kicking it off with *just files* (or nothing) is fine
-  — the rest is set on the card.
-- `list` · `remove <id>` · `toggle <id>` · `addfile <id> <attachment>` ·
-  `removefile <id> <name>` · `edit <id>` (reopens the builder).
+- `add` — no options (#158). Everything is set on the card.
+- `list` · `remove <id>` · `toggle <id>` · `edit <id>` (reopens the builder).
 
 ### Builder card (ephemeral; mirrors `ImagePickerState` + `renderImagePicker` +
 button-collector, `orchestrator.ts:2025`)
-- 📎 **Files:** chips with ✖ remove
 - ✏️ **Prompt** → multi-line **modal** (why text comes via the card, not a slash
   string option)
 - 🕐 **Runs** → cadence **picker** (Daily / Weekdays / Weekly / Hourly / Every N
@@ -220,8 +235,8 @@ button-collector, `orchestrator.ts:2025`)
 | 0 | deps (`croner`, `cronstrue`), `scheduled-prompts/` scaffold | 0.25d |
 | 1 | `scheduled_prompts` table + SessionStore CRUD + attachment store/cleanup | 0.75d |
 | 2 | `ScheduledPromptManager` (arm/disarm/rehydrate/tick + catch-up) + index.ts lifecycle | 1–1.25d |
-| 3 | isolated fire runner (reuse runAgent pattern + attachments) + blue-card output renderer | 0.75d |
-| 4 | `/seam schedule` group + builder card + modals + list/remove/toggle/addfile | 1.5d |
+| 3 | isolated fire runner (reuse runAgent pattern) + blue-card output renderer | 0.75d |
+| 4 | `/seam schedule` group + builder card + modals + list/remove/toggle | 1.5d |
 | 5 | `Events.ThreadDelete` cleanup (Guilds intent already delivers it) | 0.25d |
 | 6 | friendly copy, `cronstrue` echo, list/confirmation card polish | 0.5d |
 | — | unit tests (cron calc, catch-up, decision flow); live shake-out by user | 0.5d |
@@ -245,7 +260,7 @@ catch-up). No surgery on the core turn path.
 ## 10. Post-v1 enhancements (built)
 
 - **Running card is a permanent record**, not edited later: it carries the run
-  details (schedule, working dir, model, output target, files) and stays as
+  details (schedule, working dir, model, output target) and stays as
   history. Output arrives as **fresh** message(s) back-to-back.
 - **Per-schedule overrides** (all default to current behavior, leaning into the
   session-decoupling):
@@ -260,3 +275,60 @@ catch-up). No surgery on the core turn path.
 - New nullable columns `cwd`, `target_channel`, `output_type` with defensive
   ALTERs; builder card gained the working-dir / output-id fields (in the
   Prompt & details modal) and an output-type toggle button.
+
+---
+
+## 11. Attachment removal (#158)
+
+Scheduled-prompt file attachments are gone. A scheduled prompt should stay small
+and self-contained; when a workflow needs substantial instructions, those
+instructions belong in a **repository runbook** and the schedule's prompt should
+be a short request to follow it.
+
+### What was removed
+
+- `file` / `file2` / `file3` options on `/seam schedule add`.
+- `/seam schedule addfile` and `/seam schedule removefile` (the group is now 5
+  subcommands: `add` `list` `remove` `toggle` `edit`), and their autocomplete.
+- The builder card's Files field and its remove-file select.
+- The fire-time reload/inject of persisted bytes, in both isolated and live mode.
+- `src/core/scheduled-prompts/attachments.ts` (the whole on-disk store, including
+  every delete path).
+- The `Files` field on the announce card, the file chip in `/seam schedule list`,
+  and the `files:` line in `config_describe`.
+
+### What is refused
+
+`config_propose` with `schedule.attachments` / `attachment` / `files` / `file` /
+`file2` / `file3` / `addFile` / `removeFile` is rejected before anything is
+validated or written, with a message pointing at the runbook pattern. The MCP
+surface forwards `args.schedule` verbatim, so this is a runtime check, not a
+type-level one.
+
+### Legacy rows (the quarantine)
+
+`scheduled_prompts.attachments_json` is still **read** so pre-removal rows can be
+found. It is never written except to clear it. A row whose manifest is non-empty
+is **quarantined**:
+
+- `ScheduledPromptManager` will not arm it, will not catch it up on boot, and
+  will not run it from a manual **Run now**. `start()` logs the quarantined ids.
+- `last_status` is stamped with a short, actionable reason; `/seam schedule list`
+  shows a legacy-files warning; `config_describe` prints a `QUARANTINED` line;
+  enabling it via `config_propose` warns that enabling alone will not arm it.
+- **The fix is to revise the schedule.** Saving the builder card, or applying a
+  `config_propose` schedule update, writes `legacyAttachmentCount: 0` — that
+  clears the manifest and re-arms the row. The confirmation names what happened.
+
+Corrupt or non-array `attachments_json` degrades to a count of 0 rather than
+throwing, so a bad legacy value can never wedge boot.
+
+### Bytes are never deleted
+
+Nothing under `data/scheduled-attachments/` is removed by Seam any more — not on
+schedule delete, not on thread delete, not by the quarantine lift. Orphaned bytes
+stay until an operator removes them by hand. That is deliberate: a prompt can be
+revised with the original material still in front of you.
+
+Dropping the `attachments_json` column is a **later** migration, once no rows
+carry entries.

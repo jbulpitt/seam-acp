@@ -151,19 +151,19 @@ describe("collectStringOptionValues", () => {
   it("walks nested subcommand groups for sibling string values", () => {
     const data = [
       {
-        name: "schedule",
+        name: "group",
         options: [
           {
-            name: "removefile",
+            name: "sub",
             options: [
               { name: "id", value: "sch_1" },
-              { name: "filename", value: "notes" },
+              { name: "scope", value: "notes" },
             ],
           },
         ],
       },
     ];
-    expect(collectStringOptionValues(data)).toEqual({ id: "sch_1", filename: "notes" });
+    expect(collectStringOptionValues(data)).toEqual({ id: "sch_1", scope: "notes" });
   });
 
   it("skips non-string values", () => {

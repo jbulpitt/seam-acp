@@ -27,7 +27,7 @@ function makeRow(over: Partial<ScheduledPrompt> = {}): ScheduledPrompt {
     sessionMode: "live",
     catchupSeconds: 900,
     enabled: true,
-    attachments: [],
+    legacyAttachmentCount: 0,
     createdBy: "user-1",
     createdUtc: new Date().toISOString(),
     updatedUtc: new Date().toISOString(),

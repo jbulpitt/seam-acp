@@ -15,11 +15,10 @@ interface ScheduledRunnerArgs {
   effort?: string;
   channel: unknown;
   promptText: string;
-  attachments: unknown[];
 }
 
 describe("scheduled isolated Seam-MCP wiring", () => {
-  it("reuses the authoring session MCP token for tool-mediated attachments", async () => {
+  it("reuses the authoring session MCP token and sends no attachments (#158)", async () => {
     const mcpServers = [{ name: "seam-mcp", url: "http://127.0.0.1/mcp" }];
     const reuseMcpServers = vi.fn(() => mcpServers);
     const injectTurn = vi.fn(async () => ({ text: "inspected" }));
@@ -45,8 +44,7 @@ describe("scheduled isolated Seam-MCP wiring", () => {
           cwd: "/tmp",
           model: "glm-5.3:cloud",
           channel: { id: "discord:target" },
-          promptText: "Inspect the staged image.",
-          attachments: [],
+          promptText: "Follow docs/runbooks/nightly.md.",
         }
       )
     ).resolves.toEqual({ text: "inspected" });
@@ -54,12 +52,14 @@ describe("scheduled isolated Seam-MCP wiring", () => {
     expect(reuseMcpServers).toHaveBeenCalledWith("discord:scheduled-owner");
     expect(injectTurn).toHaveBeenCalledWith(
       { id: "discord:scheduled-owner" },
-      "Inspect the staged image.",
+      "Follow docs/runbooks/nightly.md.",
       expect.objectContaining({
         session: "isolated",
         mcpServers,
         model: "glm-5.3:cloud",
       })
     );
+    // #158: a scheduled fire never carries files — not even an empty array.
+    expect(injectTurn.mock.calls[0]![2]).not.toHaveProperty("attachments");
   });
 });

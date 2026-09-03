@@ -2486,7 +2486,7 @@ describe("config_describe", () => {
     disableThreadPrefix: { value: false as const, source: "default" as const },
   };
 
-  async function makeDescribeServer(): Promise<SeamMcpServer> {
+  async function makeDescribeServer(legacyAttachmentCount = 0): Promise<SeamMcpServer> {
     const server = new SeamMcpServer({
       logger: silent,
       resolveSession: (token) => (token === "good-token" ? makeRecord({ parentRef: "chan-1" }) : undefined),
@@ -2507,7 +2507,7 @@ describe("config_describe", () => {
             targetChannel: null,
             outputType: "card",
             catchupSeconds: 7200,
-            attachments: ["spec.md"],
+            legacyAttachmentCount,
             lastStatus: "ok",
             lastRunUtc: "2026-08-16T12:00:00Z",
             nextRunUtc: "2026-08-17T12:00:00Z",
@@ -2560,15 +2560,29 @@ describe("config_describe", () => {
       expect(text).toMatch(/card style:.*simple.*channel preset/s);
       expect(text).toMatch(/card gif:.*on.*channel preset/s);
       // Entity listing folds in — now the FULL definition (#69): the id (needed
-      // to target an edit), the promptText (the actual content), attachments,
-      // and last-run status all render, not just name/cron/tz.
+      // to target an edit), the promptText (the actual content), and last-run
+      // status all render, not just name/cron/tz.
       expect(text).toContain("morning");
       expect(text).toContain("sch_morning1");
       expect(text).toContain("Summarize overnight PRs and post the standup");
-      expect(text).toContain("spec.md");
+      // #158: a clean schedule renders no file line and no quarantine banner.
+      expect(text).not.toContain("QUARANTINED");
       expect(text).toContain("ts-reviewer");
       expect(text).toContain("Reviews TypeScript PRs");
       expect(text).toMatch(/parent channel|<channelId>/);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("flags a legacy attachment-bearing schedule as quarantined (#158)", async () => {
+    const server = await makeDescribeServer(2);
+    try {
+      const body = await callTool(server, {});
+      const text = body.result.content[0].text as string;
+      expect(text).toContain("QUARANTINED");
+      expect(text).toContain("2 legacy reference file(s)");
+      expect(text).toContain("runbook");
     } finally {
       await server.stop();
     }

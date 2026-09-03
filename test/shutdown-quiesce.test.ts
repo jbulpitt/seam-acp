@@ -31,6 +31,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { startHealthServer } from "../packages/core/src/lib/health.js";
 import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js";
+import net from "node:net";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -2069,6 +2070,27 @@ describe("#174 seam-mcp shares one gate across both entry points", () => {
     expect(server.inFlightCount).toBe(0);
   });
 
+  it("bounds the CONNECTION close against a lingering socket", async () => {
+    // `server.close()` does not call back until every open connection ends, so
+    // awaiting it unbounded stalls shutdown exactly when a hung tool call is
+    // what caused the quiesce timeout. A raw socket reproduces that: connected,
+    // never sending, never closing.
+    const server = makeMcpHost();
+    await server.start();
+    const sock = net.connect(server.port, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => {
+      sock.once("connect", () => resolve());
+      sock.once("error", reject);
+    });
+    try {
+      const started = Date.now();
+      await server.stop({ timeoutMs: 150 });
+      expect(Date.now() - started).toBeLessThan(3000); // gave up, did not hang
+    } finally {
+      sock.destroy();
+    }
+  });
+
   it("bounds the drain rather than waiting on a wedged tool call", async () => {
     const server = makeMcpHost({ handleAdmitted: () => new Promise<void>(() => {}) });
     void server.handleRequest({ method: "POST", url: "/mcp" } as never, fakeRes() as never);
@@ -2160,5 +2182,53 @@ describe("#174 an admitted gateway handler is part of quiescence", () => {
     await untracked;
     await flush();
     expect(store.violations).toContain("getDelegation");
+  });
+});
+
+describe("#174 the component wrapper AWAITS its handlers, not just gates them", () => {
+  /**
+   * The four component handlers used to be `void`-ed individually — four
+   * fire-and-forget promises with no handle, so nothing could ever wait for
+   * them. Gating the wrapper does not fix that: a click admitted just before
+   * the gate closed still runs untracked. The wrapper must aggregate them into
+   * the ONE promise it registers, or `inboundWork` holds a promise that
+   * resolves while the real work is still going.
+   */
+  it("a blocked component handler keeps quiesce pending until it settles", async () => {
+    const onComponent = vi.fn();
+    const slow = deferred();
+    let finished = false;
+    const host = makeQuiesceHost({
+      adapter: { onMessage: () => {}, onComponent, setActiveChannelCheck: () => {} },
+      store: {},
+      watchSentinel: () => {},
+      handleConfigEditorComponent: async () => {},
+      handleTtsEditorComponent: async () => {},
+      handleQuotaCardComponent: async () => {},
+      // One slow handler stands for any real store-backed component action.
+      handleVoiceConsoleComponent: async () => {
+        await slow.promise;
+        finished = true;
+      },
+    }) as unknown as ReturnType<typeof makeQuiesceHost> & { install(): void };
+
+    host.install();
+    const wrapper = onComponent.mock.calls[0]![0] as (e: unknown) => void;
+    wrapper({ customId: "vc:x", replyEphemeral: async () => {} });
+    await flush();
+
+    // Admitted and tracked as ONE promise covering all four handlers.
+    expect(host.inboundWork.size).toBe(1);
+
+    let drained = false;
+    const phase1 = host.quiesce({ timeoutMs: 5000 }).then((r) => ((drained = true), r));
+    await flush();
+    expect(drained).toBe(false); // the tracked promise has NOT resolved early
+    expect(finished).toBe(false);
+
+    slow.resolve();
+    expect((await phase1).drained).toBe(true);
+    expect(finished).toBe(true);
+    expect(host.inboundWork.size).toBe(0);
   });
 });

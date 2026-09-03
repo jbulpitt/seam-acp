@@ -5,6 +5,7 @@
  * 5 buttons × 5 rows. We paginate instead of silently dropping overflow, and
  * switch to a select once the button layout would get crowded.
  */
+import type { StructuredPanel } from "../../core/types.js";
 
 /** StringSelectMenuBuilder.addOptions hard cap. */
 export const DISCORD_SELECT_MAX = 25;
@@ -109,4 +110,47 @@ export function describeMultiSelectMenu(opts: {
     confirmDisabled: Boolean(opts.disabled) || !inRange,
     confirmLabel: "Confirm",
   };
+}
+
+export type ChoicePick = { value: string; label: string };
+
+export type ChoicePickCommitResult =
+  | { ok: true; successPanel?: StructuredPanel }
+  | { ok: false; error: string; failurePanel?: StructuredPanel };
+
+/**
+ * Commit-then-render ordering for a picker selection.
+ *
+ * When `commit` is provided, the success panel MUST NOT render until commit
+ * resolves ok. A failed or thrown commit renders failure instead. Callers that
+ * omit `commit` keep the historical immediate-success path.
+ */
+export async function finalizeChoicePick(opts: {
+  picked: ChoicePick;
+  username: string;
+  successPanel?: (picked: ChoicePick, username: string) => StructuredPanel;
+  commit?: (picked: ChoicePick, username: string) => Promise<ChoicePickCommitResult>;
+  showSuccess: (panel: StructuredPanel | undefined) => Promise<void>;
+  showFailure: (error: string, panel?: StructuredPanel) => Promise<void>;
+}): Promise<{ applied: boolean; error?: string }> {
+  if (opts.commit) {
+    let result: ChoicePickCommitResult;
+    try {
+      result = await opts.commit(opts.picked, opts.username);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      await opts.showFailure(error);
+      return { applied: false, error };
+    }
+    if (!result.ok) {
+      await opts.showFailure(result.error, result.failurePanel);
+      return { applied: false, error: result.error };
+    }
+    await opts.showSuccess(
+      result.successPanel ?? opts.successPanel?.(opts.picked, opts.username)
+    );
+    return { applied: true };
+  }
+  await opts.showSuccess(opts.successPanel?.(opts.picked, opts.username));
+  return { applied: true };
 }

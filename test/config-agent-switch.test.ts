@@ -247,13 +247,31 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
   });
 
   it("picker path writes the same atomic agent/model/session reset as explicit-id", async () => {
+    const order: string[] = [];
     const { orch, router, store, sent } = makeOrch({
-      sendChoicePicker: async () => ({ value: "codex@local", label: "OpenAI Codex @ local" }),
+      sendChoicePicker: async (_ch, opts: any) => {
+        expect(opts.successPanel).toBeUndefined();
+        expect(typeof opts.commit).toBe("function");
+        order.push("picked");
+        const result = await opts.commit(
+          { value: "codex@local", label: "OpenAI Codex @ local" },
+          "jesse"
+        );
+        order.push("commit-done");
+        if (result.ok) {
+          order.push("render-success");
+          expect(result.successPanel?.title).toMatch(/Agent changed/);
+          return { value: "codex@local", userId: ADMIN };
+        }
+        order.push("render-failure");
+        return null;
+      },
     });
     seedSession(store);
     const { i, replies } = slashI({ strings: {} });
     await (orch as any).cmdAgent(i);
     expect(replies[0]?.content).toMatch(/Posting picker/);
+    expect(order).toEqual(["picked", "commit-done", "render-success"]);
     expect(sent.some((m) => m.includes("Agent switched to `codex@local`") && m.includes("gpt-5.6-sol"))).toBe(
       true
     );
@@ -351,5 +369,134 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     const { i, replies } = slashI({ strings: { id: "gpt-5.6-sol" } });
     await (orch as any).cmdModel(i);
     expect(replies[0]?.content).toMatch(/already set to `gpt-5\.6-sol`/);
+  });
+
+  it("re-reads the live row after picker latency so concurrent repo/role/permission survive", async () => {
+    const { orch, store } = makeOrch({
+      sendChoicePicker: async (_ch, opts: any) => {
+        const rec = store.get(`discord:${THREAD}`)!;
+        const cfg = JSON.parse(rec.configJson) as SessionConfigState;
+        cfg.role = "concurrent-role";
+        cfg.permissionPolicy = "always";
+        store.upsert({
+          ...rec,
+          repoPath: "/concurrent-repo",
+          configJson: JSON.stringify(cfg),
+          updatedUtc: new Date().toISOString(),
+        });
+        const result = await opts.commit(
+          { value: "codex@local", label: "codex" },
+          "jesse"
+        );
+        expect(result.ok).toBe(true);
+        return { value: "codex@local", userId: ADMIN };
+      },
+    });
+    seedSession(store);
+    await (orch as any).cmdAgent(slashI({ strings: {} }).i);
+    const rec = store.get(`discord:${THREAD}`)!;
+    expect(rec.agentId).toBe("codex");
+    expect(rec.repoPath).toBe("/concurrent-repo");
+    const cfg = sessionConfig(store);
+    expect(cfg.model).toBe("gpt-5.6-sol");
+    expect(cfg.role).toBe("concurrent-role");
+    expect(cfg.permissionPolicy).toBe("always");
+  });
+
+  it("thrown overlay write rolls back session and replies instead of claiming success", async () => {
+    const { orch, store, presetsFile } = makeOrch();
+    seedSession(store);
+    const mutation = (orch as any).configMutation;
+    mutation.applyThreadOverlay = () => {
+      throw new Error("injected persistence exception");
+    };
+    const { i, replies } = slashI({ strings: { id: "codex@local" } });
+    await (orch as any).cmdAgent(i);
+    expect(replies[0]?.content).toMatch(/Could not switch agent: injected persistence exception/);
+    expect(replies[0]?.content).not.toMatch(/Agent switched/);
+    const rec = store.get(`discord:${THREAD}`)!;
+    expect(rec.agentId).toBe("claude");
+    expect(rec.acpSessionId).toBe("acp-old");
+    expect(sessionConfig(store).model).toBe("claude-opus-5");
+    const raw = JSON.parse(fs.readFileSync(presetsFile, "utf8"));
+    expect(raw.threads?.[THREAD]?.agent).toBeUndefined();
+  });
+
+  it("reload failure restores the previous overlay file so restart cannot activate the switch", async () => {
+    const { orch, store, presetsFile, threadPresets } = makeOrch();
+    seedSession(store);
+    const mutation = (orch as any).configMutation;
+    mutation.deps.reloadPresets = () => ({ ok: false, error: "injected reload failure" });
+    const { i, replies } = slashI({ strings: { id: "codex@local" } });
+    await (orch as any).cmdAgent(i);
+    expect(replies[0]?.content).toMatch(/Could not switch agent: injected reload failure/);
+    expect(replies[0]?.content).not.toMatch(/Agent switched/);
+    const rec = store.get(`discord:${THREAD}`)!;
+    expect(rec.agentId).toBe("claude");
+    expect(sessionConfig(store).model).toBe("claude-opus-5");
+    expect(threadPresets.get(THREAD)?.agent?.value).not.toBe("codex");
+    const raw = JSON.parse(fs.readFileSync(presetsFile, "utf8"));
+    expect(raw.threads?.[THREAD]?.agent?.value).not.toBe("codex");
+    expect(raw.threads?.[THREAD]?.model?.value).not.toBe("gpt-5.6-sol");
+  });
+
+  it("partial location success is rolled back when the agent overlay fails", async () => {
+    const { orch, store, presetsFile, threadPresets } = makeOrch();
+    seedSession(store);
+    const mutation = (orch as any).configMutation;
+    const origLocation = mutation.applyThreadLocation.bind(mutation);
+    mutation.applyThreadLocation = (...args: unknown[]) => origLocation(...args);
+    mutation.applyThreadOverlay = () => ({ ok: false, error: "injected overlay failure" });
+    const { i, replies } = slashI({ strings: { id: "codex@mac" } });
+    await (orch as any).cmdAgent(i);
+    expect(replies[0]?.content).toMatch(/Could not switch agent: injected overlay failure/);
+    expect(threadPresets.get(THREAD)?.location).toBeUndefined();
+    const raw = JSON.parse(fs.readFileSync(presetsFile, "utf8"));
+    expect(raw.threads?.[THREAD]?.location).toBeUndefined();
+    const rec = store.get(`discord:${THREAD}`)!;
+    expect(rec.agentId).toBe("claude");
+    expect(rec.acpSessionId).toBe("acp-old");
+  });
+
+  it("post-overlay spawn-plan failure restores overlay and ACP when original identity is effective", async () => {
+    const { orch, router, store, presetsFile, threadPresets } = makeOrch();
+    seedSession(store);
+    const orig = router.planRuntimeSpawn.bind(router);
+    router.planRuntimeSpawn = ((rec: Parameters<typeof orig>[0]) => {
+      if (rec.agentId === "codex") throw new Error("injected spawn-plan failure");
+      return orig(rec);
+    }) as typeof orig;
+    const { i, replies } = slashI({ strings: { id: "codex@local" } });
+    await (orch as any).cmdAgent(i);
+    expect(replies[0]?.content).toMatch(/Could not switch agent: injected spawn-plan failure/);
+    const rec = store.get(`discord:${THREAD}`)!;
+    expect(rec.agentId).toBe("claude");
+    expect(rec.acpSessionId).toBe("acp-old");
+    expect(sessionConfig(store).model).toBe("claude-opus-5");
+    expect(threadPresets.get(THREAD)?.agent?.value).not.toBe("codex");
+    const raw = JSON.parse(fs.readFileSync(presetsFile, "utf8"));
+    expect(raw.threads?.[THREAD]?.agent?.value).not.toBe("codex");
+    const described = router.describeConfig(rec);
+    expect(described.agent.value).toBe("claude");
+    expect(described.model.value).toBe("claude-opus-5");
+  });
+
+  it("does not restore ACP when rollback cannot make the original identity effective", async () => {
+    const { orch, router, store } = makeOrch();
+    seedSession(store);
+    const mutation = (orch as any).configMutation;
+    mutation.restoreThreadPresetEntry = () => ({ ok: false, error: "injected restore failure" });
+    const orig = router.planRuntimeSpawn.bind(router);
+    router.planRuntimeSpawn = ((rec: Parameters<typeof orig>[0]) => {
+      if (rec.agentId === "codex") throw new Error("injected spawn-plan failure");
+      return orig(rec);
+    }) as typeof orig;
+    const { i, replies } = slashI({ strings: { id: "codex@local" } });
+    await (orch as any).cmdAgent(i);
+    expect(replies[0]?.content).toMatch(/Could not switch agent: injected spawn-plan failure/);
+    expect(replies[0]?.content).toMatch(/Previous ACP session was not restored/);
+    const rec = store.get(`discord:${THREAD}`)!;
+    expect(rec.agentId).toBe("claude");
+    expect(rec.acpSessionId).toBe("");
   });
 });

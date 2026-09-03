@@ -500,8 +500,13 @@ export class ConfigMutationService {
       }
       return built;
     }
-    const applied = built.proposal.apply(opts.actor);
-    return { ok: true, message: applied.message, auditId: applied.auditId };
+    try {
+      const applied = built.proposal.apply(opts.actor);
+      if (!applied.ok) return { ok: false, error: applied.message };
+      return { ok: true, message: applied.message, auditId: applied.auditId };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   applyThreadOverlay(opts: {
@@ -522,8 +527,13 @@ export class ConfigMutationService {
       }
       return built;
     }
-    const applied = built.proposal.apply(opts.actor);
-    return { ok: true, message: applied.message, auditId: applied.auditId };
+    try {
+      const applied = built.proposal.apply(opts.actor);
+      if (!applied.ok) return { ok: false, error: applied.message };
+      return { ok: true, message: applied.message, auditId: applied.auditId };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   applyThreadLocation(opts: {
@@ -549,8 +559,13 @@ export class ConfigMutationService {
       }
       return built;
     }
-    const applied = built.proposal.apply(opts.actor);
-    return { ok: true, message: applied.message, auditId: applied.auditId };
+    try {
+      const applied = built.proposal.apply(opts.actor);
+      if (!applied.ok) return { ok: false, error: applied.message };
+      return { ok: true, message: applied.message, auditId: applied.auditId };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   // --- Bridges (D8 / D11 / #86): slash-path writes into `bridges` ----------
@@ -723,6 +738,98 @@ export class ConfigMutationService {
     return { ok: true, file, doc };
   }
 
+  /**
+   * Atomically replace `channel-presets.json` and hot-reload live maps.
+   * A reload failure (or throw) restores the previous file bytes so a later
+   * restart cannot activate a mutation that did not take effect live.
+   */
+  private persistPresetsCandidate(opts: {
+    file: string;
+    candidate: unknown;
+    tmpId: string;
+  }): { ok: true } | { ok: false; error: string } {
+    const abs = path.resolve(opts.file);
+    let previous: string | null = null;
+    try {
+      previous = fs.readFileSync(abs, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        return { ok: false, error: (err as Error).message };
+      }
+    }
+    const restorePrevious = (): void => {
+      try {
+        if (previous === null) fs.rmSync(abs, { force: true });
+        else fs.writeFileSync(abs, previous, "utf8");
+      } catch (err) {
+        this.logger.error({ err, file: abs }, "presets file restore failed after a failed mutation");
+      }
+      const reloaded = this.deps.reloadPresets();
+      if (!reloaded.ok) {
+        this.logger.error(
+          { err: reloaded.error, file: abs },
+          "presets live-map restore reload failed after a failed mutation"
+        );
+      }
+    };
+    try {
+      const tmp = `${abs}.tmp-${opts.tmpId.slice(0, 8)}`;
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(tmp, `${JSON.stringify(opts.candidate, null, 2)}\n`, "utf8");
+      fs.renameSync(tmp, abs);
+      const reload = this.deps.reloadPresets();
+      if (!reload.ok) {
+        restorePrevious();
+        this.logger.error(
+          { err: reload.error, file: abs },
+          "preset hot-reload failed after write; previous file restored"
+        );
+        return { ok: false, error: reload.error ?? "preset hot-reload failed" };
+      }
+      return { ok: true };
+    } catch (err) {
+      restorePrevious();
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /** Snapshot one thread's persisted overlay entry (file JSON, not live defaults). */
+  readThreadPresetEntry(threadId: string): unknown | undefined {
+    const loaded = this.readPresetsDoc();
+    if (!loaded.ok) return undefined;
+    const entry = loaded.doc.threads?.[threadId];
+    if (entry === undefined) return undefined;
+    return JSON.parse(JSON.stringify(entry)) as unknown;
+  }
+
+  /**
+   * Replace one thread overlay with a prior snapshot (or delete the key).
+   * Uses the same persist+reload path so rollback cannot leave a latent file.
+   */
+  restoreThreadPresetEntry(
+    threadId: string,
+    previous: unknown | undefined
+  ): { ok: true } | { ok: false; error: string } {
+    const loaded = this.readPresetsDoc();
+    if (!loaded.ok) return loaded;
+    const threads: Record<string, unknown> = { ...(loaded.doc.threads ?? {}) };
+    if (previous === undefined) delete threads[threadId];
+    else threads[threadId] = previous;
+    const candidate = { ...loaded.doc, threads };
+    const parsed = PresetsFileSchema.safeParse(candidate);
+    if (!parsed.success) {
+      const issues = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+        .join("; ");
+      return { ok: false, error: `Refused overlay restore: ${issues}` };
+    }
+    return this.persistPresetsCandidate({
+      file: loaded.file,
+      candidate: parsed.data,
+      tmpId: randomUUID(),
+    });
+  }
+
   private writeBridgesDoc(opts: {
     file: string;
     doc: Record<string, unknown>;
@@ -745,15 +852,12 @@ export class ConfigMutationService {
       };
     }
     const id = randomUUID();
-    const abs = path.resolve(opts.file);
-    const tmp = `${abs}.tmp-${id.slice(0, 8)}`;
-    fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.writeFileSync(tmp, `${JSON.stringify(candidate, null, 2)}\n`, "utf8");
-    fs.renameSync(tmp, abs);
-    const reload = this.deps.reloadPresets();
-    if (!reload.ok) {
-      this.logger.error({ err: reload.error, file: abs }, "bridge-config reload failed after write");
-    }
+    const persisted = this.persistPresetsCandidate({
+      file: opts.file,
+      candidate,
+      tmpId: id,
+    });
+    if (!persisted.ok) return persisted;
     const audit = this.writeAudit({
       tier: "bridge",
       scope: opts.scope,
@@ -1456,18 +1560,13 @@ export class ConfigMutationService {
       ],
       restartsSession: true,
       apply: (actor) => {
-        // Serialize the FULL candidate document and swap atomically (temp+rename),
-        // then hot-reload the live maps (P0) so it takes effect with no redeploy.
-        const abs = path.resolve(file);
-        const tmp = `${abs}.tmp-${id.slice(0, 8)}`;
-        fs.writeFileSync(tmp, `${JSON.stringify(candidate, null, 2)}\n`, "utf8");
-        fs.renameSync(tmp, abs);
-        const reload = this.deps.reloadPresets();
-        if (!reload.ok) {
-          // The written file passed PresetsFileSchema above, so a reload failure
-          // here is unexpected; log loudly. The file is written but the live map
-          // keeps the previous good config (P0 guarantees no half-applied map).
-          this.logger.error({ err: reload.error, file: abs }, "Tier-C reload failed after write");
+        const persisted = this.persistPresetsCandidate({
+          file,
+          candidate,
+          tmpId: id,
+        });
+        if (!persisted.ok) {
+          return { ok: false, message: persisted.error, auditId: "" };
         }
         const audit = this.writeAudit({
           tier: "channel-preset",
@@ -1798,18 +1897,13 @@ export class ConfigMutationService {
       ),
       // location changes pin the session to a different host (D2) — restart.
       apply: (actor) => {
-        // Serialize the FULL candidate document and swap atomically (temp+rename),
-        // then hot-reload the live maps (P0) so it takes effect with no redeploy.
-        const abs = path.resolve(file);
-        const tmp = `${abs}.tmp-${id.slice(0, 8)}`;
-        fs.writeFileSync(tmp, `${JSON.stringify(candidate, null, 2)}\n`, "utf8");
-        fs.renameSync(tmp, abs);
-        const reload = this.deps.reloadPresets();
-        if (!reload.ok) {
-          // The written file passed PresetsFileSchema above, so a reload failure
-          // here is unexpected; log loudly. The file is written but the live map
-          // keeps the previous good config (P0 guarantees no half-applied map).
-          this.logger.error({ err: reload.error, file: abs }, "Tier-C reload failed after write");
+        const persisted = this.persistPresetsCandidate({
+          file,
+          candidate,
+          tmpId: id,
+        });
+        if (!persisted.ok) {
+          return { ok: false, message: persisted.error, auditId: "" };
         }
         const audit = this.writeAudit({
           tier: "thread-preset",

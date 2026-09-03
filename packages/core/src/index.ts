@@ -74,6 +74,12 @@ import { collectAgentModelCatalog } from "./core/model-metadata/catalog.js";
 import { ArtificialAnalysisMetadataSource } from "./core/model-metadata/artificial-analysis.js";
 import { ModelValueRankingsCard } from "./core/model-value/rankings-card.js";
 import { LiveMessageSearch, MessageReader } from "./core/message-reader.js";
+import {
+  createDefaultServiceStatusSources,
+  ServiceStatusRefreshManager,
+  ServiceStatusStore,
+} from "./core/service-status/index.js";
+import { ServiceStatusCard } from "./core/service-status-card.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -349,6 +355,8 @@ async function main(): Promise<void> {
   });
   let seamMcpServer: SeamMcpServer | undefined;
   let bridgeHub: BridgeHub | undefined;
+  let serviceStatusStore: ServiceStatusStore | undefined;
+  let stopServiceStatus: (() => void) | undefined;
 
   const router = new SessionRouter({
     logger,
@@ -1119,6 +1127,40 @@ async function main(): Promise<void> {
     );
   }
 
+  // Pinned upstream-status card (#183). Constructing the manager registers all
+  // sources, then the card paints cached/no-data rows before polling begins.
+  if (config.DISCORD_SERVICE_STATUS_THREAD_ID) {
+    const sources = createDefaultServiceStatusSources();
+    const statusStore = new ServiceStatusStore(
+      path.join(config.DATA_DIR, "service-status.sqlite")
+    );
+    const statusCard = new ServiceStatusCard({
+      logger,
+      adapter,
+      threadId: config.DISCORD_SERVICE_STATUS_THREAD_ID,
+      dataDir: config.DATA_DIR,
+      sources,
+      collect: () => statusStore.listSnapshots(),
+    });
+    const statusManager = new ServiceStatusRefreshManager({
+      store: statusStore,
+      sources,
+      logger: logger.child({ mod: "service-status" }),
+      onUpdate: () => statusCard.poke(),
+    });
+    serviceStatusStore = statusStore;
+    orchestrator.setServiceStatusRefresh(() => statusManager.refresh({ force: true }));
+    stopServiceStatus = () => {
+      orchestrator.setServiceStatusRefresh(undefined);
+      statusManager.stop();
+      statusCard.stop();
+    };
+    await statusCard.start().catch((err) =>
+      logger.warn({ err }, "service status card failed to start")
+    );
+    statusManager.start();
+  }
+
   // One editable server-status card (uptime / turns / bridges). Posts once,
   // then edits in place — 30s tick + immediate bump on bridge connect/drop.
   let stopStatusCard: (() => void) | undefined;
@@ -1250,6 +1292,7 @@ async function main(): Promise<void> {
     stopQuotaCard?.();
     stopRankingsCard?.();
     stopStatusCard?.();
+    stopServiceStatus?.();
     scheduledManager.stop();
     wakeManager.stop();
     parkedManager.stop();
@@ -1415,6 +1458,11 @@ async function main(): Promise<void> {
         }
         try {
           modelValueStore.close();
+        } catch {
+          /* ignore */
+        }
+        try {
+          serviceStatusStore?.close();
         } catch {
           /* ignore */
         }

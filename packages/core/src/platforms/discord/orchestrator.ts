@@ -9365,6 +9365,23 @@ export class Orchestrator {
   }
 
   private async cmdThreadRename(i: ChatInputCommandInteraction): Promise<void> {
+    // Admin gate (#151). `rename` is the most destructive verb in the tree:
+    // `scope:channel` rebuilds every thread name in the channel, and
+    // `migrate-legacy` / `role-name` rewrite names from scratch. It shipped
+    // with no privilege check at all. Same gate + semantics as
+    // `cmdNamerEditor`: an UNSET SEAM_CONFIG_ADMIN_USER_IDS stays allowed
+    // (opt-out, not deny-all — see test/config-admin-ids.test.ts), so hosts
+    // that never configured admins keep today's behavior. Refuse before
+    // `deferReply` so the refusal is a plain ephemeral reply and no rename
+    // work is started.
+    const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+    if (admins && !admins.has(i.user.id)) {
+      await i.reply({
+        content: "Renaming threads requires a config admin.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     const record = this.recordFromInteraction(i);
     if (!record) {
       await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });

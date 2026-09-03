@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import { MessageFlags } from "discord.js";
 import { buildSeamCommand } from "../packages/core/src/platforms/discord/commands.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+
+const ADMIN_ID = "admin-1";
+const ADMINS = new Set([ADMIN_ID]);
 
 describe("/seam config rename and namer surfaces", () => {
   it("publishes thread/channel rename, explicit legacy migration, and namer editor", () => {
@@ -110,8 +114,10 @@ describe("/seam config rename and namer surfaces", () => {
         parentRef: "channel-456",
       }),
       threadNamer: { recompactChannel },
+      config: { SEAM_CONFIG_ADMIN_USER_IDS: ADMINS },
     } as any;
     const interaction = {
+      user: { id: ADMIN_ID },
       options: {
         getString: () => "channel",
         getBoolean: (name: string) => name === "role-name",
@@ -152,8 +158,10 @@ describe("/seam config rename and namer surfaces", () => {
         parentRef: "channel-456",
       }),
       applyThreadName,
+      config: { SEAM_CONFIG_ADMIN_USER_IDS: ADMINS },
     } as any;
     const interaction = {
+      user: { id: ADMIN_ID },
       options: {
         getString: () => "thread",
         getBoolean: () => true,
@@ -172,5 +180,112 @@ describe("/seam config rename and namer surfaces", () => {
       roleName: true,
     });
     expect(editReply).toHaveBeenCalledWith({ content: "Rebuilt as 🤖 worker." });
+  });
+});
+
+/**
+ * `/seam config rename` shipped with NO privilege check (#151): its only guards
+ * were "Use inside a thread" and "This thread has no parent channel", so any
+ * user who could invoke `/seam` could trigger a channel-wide destructive rename
+ * — including `migrate-legacy:true` and `role-name:true`, which rebuild every
+ * thread name in the channel from scratch.
+ *
+ * The gate matches `cmdNamerEditor`: an UNSET `SEAM_CONFIG_ADMIN_USER_IDS` is
+ * opt-out, NOT deny-all (see config-admin-ids.test.ts), and the refusal happens
+ * before `deferReply` so nothing is started for a refused caller.
+ */
+describe("/seam config rename admin gate (#151)", () => {
+  const RENAME_REFUSAL = "Renaming threads requires a config admin.";
+
+  function harness(opts: {
+    admins?: Set<string>;
+    userId: string;
+    scope: "thread" | "channel";
+  }) {
+    const reply = vi.fn(async () => {});
+    const deferReply = vi.fn(async () => {});
+    const editReply = vi.fn(async () => {});
+    const applyThreadName = vi.fn(async () => ({ status: "renamed", name: "🤖 worker" }));
+    const recompactChannel = vi.fn(async () => [{ status: "renamed" }]);
+    const recordFromInteraction = vi.fn(() => ({
+      id: "discord:thread-123",
+      platform: "discord",
+      channelRef: "thread-123",
+      parentRef: "channel-456",
+    }));
+    const mock = {
+      recordFromInteraction,
+      applyThreadName,
+      threadNamer: { recompactChannel },
+      config: { SEAM_CONFIG_ADMIN_USER_IDS: opts.admins },
+    } as any;
+    const interaction = {
+      user: { id: opts.userId },
+      options: {
+        getString: () => opts.scope,
+        getBoolean: () => false,
+      },
+      reply,
+      deferReply,
+      editReply,
+    } as any;
+    const run = () => (Orchestrator.prototype as any).cmdThreadRename.call(mock, interaction);
+    return { run, reply, deferReply, editReply, applyThreadName, recompactChannel, recordFromInteraction };
+  }
+
+  it("refuses a non-admin ephemerally without deferring or renaming anything", async () => {
+    const h = harness({ admins: ADMINS, userId: "rando", scope: "thread" });
+    await h.run();
+
+    expect(h.reply).toHaveBeenCalledWith({
+      content: RENAME_REFUSAL,
+      flags: MessageFlags.Ephemeral,
+    });
+    expect(h.deferReply).not.toHaveBeenCalled();
+    expect(h.editReply).not.toHaveBeenCalled();
+    expect(h.applyThreadName).not.toHaveBeenCalled();
+    expect(h.recompactChannel).not.toHaveBeenCalled();
+    // Gate runs before any state is inspected, so a refused caller learns
+    // nothing about whether this thread is even a bound session.
+    expect(h.recordFromInteraction).not.toHaveBeenCalled();
+  });
+
+  it("refuses a non-admin on the channel-wide scope — the destructive one", async () => {
+    const h = harness({ admins: ADMINS, userId: "rando", scope: "channel" });
+    await h.run();
+
+    expect(h.reply).toHaveBeenCalledWith({
+      content: RENAME_REFUSAL,
+      flags: MessageFlags.Ephemeral,
+    });
+    expect(h.deferReply).not.toHaveBeenCalled();
+    expect(h.recompactChannel).not.toHaveBeenCalled();
+  });
+
+  it("allows a config admin to rename this thread", async () => {
+    const h = harness({ admins: ADMINS, userId: ADMIN_ID, scope: "thread" });
+    await h.run();
+
+    expect(h.reply).not.toHaveBeenCalled();
+    expect(h.deferReply).toHaveBeenCalledOnce();
+    expect(h.applyThreadName).toHaveBeenCalledOnce();
+  });
+
+  it("allows a config admin to recompact the whole channel", async () => {
+    const h = harness({ admins: ADMINS, userId: ADMIN_ID, scope: "channel" });
+    await h.run();
+
+    expect(h.reply).not.toHaveBeenCalled();
+    expect(h.deferReply).toHaveBeenCalledOnce();
+    expect(h.recompactChannel).toHaveBeenCalledOnce();
+  });
+
+  it("unset SEAM_CONFIG_ADMIN_USER_IDS stays allowed (opt-out, not deny-all)", async () => {
+    const h = harness({ admins: undefined, userId: "anyone", scope: "channel" });
+    await h.run();
+
+    expect(h.reply).not.toHaveBeenCalled();
+    expect(h.deferReply).toHaveBeenCalledOnce();
+    expect(h.recompactChannel).toHaveBeenCalledOnce();
   });
 });

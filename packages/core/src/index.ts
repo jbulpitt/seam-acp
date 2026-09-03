@@ -825,7 +825,7 @@ async function main(): Promise<void> {
             targetChannel: s.targetChannel,
             outputType: s.outputType,
             catchupSeconds: s.catchupSeconds,
-            attachments: s.attachments.map((a) => a.filename),
+            legacyAttachmentCount: s.legacyAttachmentCount,
             lastStatus: s.lastStatus,
             lastRunUtc: s.lastRunUtc,
             nextRunUtc: s.nextRunUtc,

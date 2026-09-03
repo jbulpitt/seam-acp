@@ -81,8 +81,9 @@ export interface ConfigEntities {
     targetChannel: string | null;
     outputType: "card" | "messages";
     catchupSeconds: number;
-    /** Reference files re-sent every run (names only — bytes live on disk). */
-    attachments: string[];
+    /** #158: legacy attachment entries still recorded on the row. Non-zero means
+     *  the schedule is quarantined — it will not arm or fire until it is edited. */
+    legacyAttachmentCount: number;
     lastStatus: string | null;
     lastRunUtc: string | null;
     nextRunUtc: string | null;
@@ -1164,8 +1165,9 @@ const TOOLS = [
       "user's natural-language cadence into a standard cron expression (e.g. \"every weekday at 7am\" → " +
       "\"0 7 * * 1-5\"); the card echoes the parsed cadence AND the resolved next run time so a timezone " +
       "mistake is visible before Apply. An invalid cron or timezone is refused before anything is written. " +
-      "NOTE: attachments (reference files) CANNOT be managed here — their bytes come from Discord uploads " +
-      "(`/seam schedule add-file`); everything else about a schedule can.\n" +
+      "NOTE: scheduled prompts carry NO file attachments, anywhere — a mutation naming one is refused. " +
+      "For substantial instructions, commit a runbook to the repository and have `promptText` ask the " +
+      "agent to read it.\n" +
       "You can only ever change your OWN thread/channel — cross-thread config is not available here, and a " +
       "locked channel refuses every change.",
     inputSchema: {
@@ -1367,7 +1369,8 @@ const TOOLS = [
           type: "object",
           description:
             "Tier D — a scheduled prompt bound to THIS thread. `create` needs name + promptText + cron; " +
-            "update/enable/disable/delete need `id` (from config_describe). Attachments are not settable here.",
+            "update/enable/disable/delete need `id` (from config_describe). Scheduled prompts have no file " +
+            "attachments: any attachment-shaped key is rejected. Point `promptText` at a repository runbook instead.",
           properties: {
             action: {
               type: "string",
@@ -2934,8 +2937,11 @@ export class SeamMcpServer {
                 : ""),
             `      prompt: ${oneLine(s.promptText, 400)}`
           );
-          if (s.attachments.length > 0) {
-            lines.push(`      files:  ${s.attachments.join(", ")}`);
+          if (s.legacyAttachmentCount > 0) {
+            lines.push(
+              `      ⚠ QUARANTINED: ${s.legacyAttachmentCount} legacy reference file(s) (#158). ` +
+                `This schedule will not run until it is edited so its prompt stands alone or points at a repository runbook.`
+            );
           }
           const ran =
             s.lastRunUtc || s.lastStatus

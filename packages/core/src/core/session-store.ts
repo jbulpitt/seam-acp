@@ -117,6 +117,10 @@ CREATE TABLE IF NOT EXISTS scheduled_prompts (
   session_mode       TEXT NOT NULL DEFAULT 'isolated',
   catchup_seconds    INTEGER NOT NULL DEFAULT 7200,
   enabled            INTEGER NOT NULL DEFAULT 1,
+  -- LEGACY (#158): scheduled-prompt attachments were removed. Kept readable
+  -- only so pre-removal rows can be detected and quarantined; new rows are
+  -- always '[]'. Drop the column in a later migration once no rows carry
+  -- entries. See scheduled-prompts/quarantine.ts.
   attachments_json   TEXT NOT NULL DEFAULT '[]',
   created_by         TEXT NOT NULL,
   created_utc        TEXT NOT NULL,
@@ -214,11 +218,14 @@ interface ScheduledRow {
 }
 
 const mapScheduled = (r: ScheduledRow): ScheduledPrompt => {
-  let attachments: ScheduledPrompt["attachments"] = [];
+  // #158: attachments are gone. The column is still read (never written except
+  // to clear) so legacy rows can be identified and quarantined; a corrupt or
+  // non-array value degrades to "no legacy attachments" rather than throwing.
+  let legacyAttachmentCount = 0;
   try {
     const parsed = JSON.parse(r.attachments_json);
-    if (Array.isArray(parsed)) attachments = parsed;
-  } catch { /* keep empty */ }
+    if (Array.isArray(parsed)) legacyAttachmentCount = parsed.length;
+  } catch { /* keep 0 */ }
   return {
     id: r.id,
     platform: r.platform,
@@ -235,7 +242,7 @@ const mapScheduled = (r: ScheduledRow): ScheduledPrompt => {
     sessionMode: r.session_mode === "live" ? "live" : "isolated",
     catchupSeconds: r.catchup_seconds,
     enabled: r.enabled !== 0,
-    attachments,
+    legacyAttachmentCount,
     createdBy: r.created_by,
     createdUtc: r.created_utc,
     updatedUtc: r.updated_utc,
@@ -1069,6 +1076,14 @@ export class SessionStore {
 
   // --- scheduled prompts ----------------------------------------------------
 
+  /**
+   * #158: `attachments_json` is legacy. New rows insert `'[]'`; an UPDATE never
+   * overwrites what is stored unless the caller explicitly passes
+   * `legacyAttachmentCount: 0` on a row that had entries — the deliberate
+   * "this schedule has been revised" act that lifts the quarantine. Anything
+   * built by spreading an existing row therefore keeps its legacy manifest, so
+   * a routine toggle/status patch can't silently erase the evidence.
+   */
   upsertScheduled(s: ScheduledPrompt): void {
     this.db
       .prepare(
@@ -1098,7 +1113,9 @@ export class SessionStore {
            session_mode     = excluded.session_mode,
            catchup_seconds  = excluded.catchup_seconds,
            enabled          = excluded.enabled,
-           attachments_json = excluded.attachments_json,
+           attachments_json = CASE WHEN @clearLegacyAttachments = 1
+                                THEN '[]'
+                                ELSE scheduled_prompts.attachments_json END,
            updated_utc      = excluded.updated_utc,
            last_run_utc     = excluded.last_run_utc,
            last_status      = excluded.last_status,
@@ -1121,7 +1138,9 @@ export class SessionStore {
         sessionMode: s.sessionMode,
         catchupSeconds: s.catchupSeconds,
         enabled: s.enabled ? 1 : 0,
-        attachmentsJson: JSON.stringify(s.attachments ?? []),
+        // Inserts always start clean; the UPDATE arm only clears when asked.
+        attachmentsJson: "[]",
+        clearLegacyAttachments: (s.legacyAttachmentCount ?? 0) === 0 ? 1 : 0,
         createdBy: s.createdBy,
         createdUtc: s.createdUtc,
         updatedUtc: s.updatedUtc,

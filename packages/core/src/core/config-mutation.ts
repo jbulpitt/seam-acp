@@ -35,6 +35,7 @@ import type { Logger } from "../lib/logger.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { ConfigDescription } from "./session-router.js";
 import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
+import { legacyAttachmentQuarantine } from "./scheduled-prompts/quarantine.js";
 import type { ScheduledPrompt } from "./scheduled-prompts/types.js";
 import {
   parseSimpleCardGif,
@@ -174,9 +175,9 @@ export interface ThreadPresetChanges {
  *
  *  The cron is validated through the SAME `validateCron` the arm path uses, so a
  *  bad expression is refused at WRITE time rather than silently never firing.
- *  ATTACHMENTS ARE DELIBERATELY ABSENT: their bytes come from Discord uploads and
- *  are persisted at create-time on disk (`saveScheduledAttachment`), so they
- *  cannot be managed conversationally — everything else about a schedule can. */
+ *  ATTACHMENTS DO NOT EXIST (#158): scheduled prompts carry no files at all, on
+ *  any surface. A mutation that names one is refused outright — put substantial
+ *  instructions in a repository runbook and reference it from `promptText`. */
 export interface ScheduleChanges {
   /** create = new schedule; the rest target an EXISTING schedule by `id`. */
   action: "create" | "update" | "enable" | "disable" | "delete";
@@ -324,13 +325,25 @@ export interface ConfigMutationDeps {
   reschedule: (id: string) => void;
   /** Deployment default IANA timezone for a schedule created without one (#69). */
   defaultTimezone: string;
-  /** Best-effort removal of a deleted schedule's on-disk attachment dir (#69).
-   *  Fire-and-forget; undefined ⇒ no attachment store to clean (e.g. tests). */
-  cleanupScheduleAttachments?: (id: string) => void;
   logger: Logger;
 }
 
 const PERMISSIONS: PermissionPolicyMode[] = ["always", "ask", "deny"];
+
+/** #158: keys a caller might reach for to attach a file to a schedule.
+ *  `ScheduleChanges` has no such field, but the MCP surface forwards
+ *  `args.schedule` verbatim, so the rejection has to happen at runtime rather
+ *  than rely on the type. */
+const SCHEDULE_ATTACHMENT_KEYS = [
+  "attachments",
+  "attachment",
+  "files",
+  "file",
+  "file2",
+  "file3",
+  "addFile",
+  "removeFile",
+] as const;
 
 export class ConfigMutationService {
   private readonly deps: ConfigMutationDeps;
@@ -1810,6 +1823,22 @@ export class ConfigMutationService {
       };
     }
 
+    // #158: refuse any mutation that tries to bring a file along, whatever it is
+    // called. Silently dropping the key would look like it worked and produce a
+    // schedule whose prompt references a file that will never be sent.
+    const attachmentKey = SCHEDULE_ATTACHMENT_KEYS.find(
+      (k) => (changes as unknown as Record<string, unknown>)[k] !== undefined
+    );
+    if (attachmentKey) {
+      return {
+        ok: false,
+        error:
+          `\`schedule.${attachmentKey}\` is not supported: scheduled prompts no longer carry file ` +
+          `attachments. Commit the material as a runbook in the repository and have \`promptText\` ` +
+          `ask the agent to read it. Nothing was written.`,
+      };
+    }
+
     // --- resolve + self-scope the target for every non-create action ---------
     let existing: ScheduledPrompt | null = null;
     if (action !== "create") {
@@ -1854,15 +1883,19 @@ export class ConfigMutationService {
         { label: "name", before: existing.name, after: "(deleted)" },
         { label: "cadence", before: `${describeCron(existing.cron)} (${existing.timezone})`, after: "(deleted)" },
       ],
-      warnings: existing.attachments.length
-        ? [`${existing.attachments.length} attached reference file(s) will be removed with it.`]
+      // #158: deleting the row never deletes bytes. Say where the orphans land
+      // so an operator can clean them up on purpose.
+      warnings: existing.legacyAttachmentCount
+        ? [
+            `${existing.legacyAttachmentCount} legacy reference file(s) stay on disk under ` +
+              `data/scheduled-attachments/${existing.id}/ — Seam does not delete them. Remove them by hand if you want them gone.`,
+          ]
         : [],
       restartsSession: false,
       apply: (actor) => {
         this.deps.store.deleteScheduled(existing.id);
         // reschedule with the row now gone disarms the timer (D: manager owns it).
         this.deps.reschedule(existing.id);
-        this.deps.cleanupScheduleAttachments?.(existing.id);
         const audit = this.writeAudit({
           tier: "schedule",
           scope: record.channelRef,
@@ -1893,6 +1926,10 @@ export class ConfigMutationService {
         error: `Schedule "${existing.name}" is already ${enable ? "enabled" : "disabled"}.`,
       };
     }
+    // #158: enabling doesn't lift a legacy-attachment quarantine — only editing
+    // the schedule does. Say so on the card rather than letting the operator
+    // believe the row is live.
+    const quarantine = enable ? legacyAttachmentQuarantine(existing) : null;
     const id = randomUUID();
     const proposal: ConfigProposal = {
       id,
@@ -1900,7 +1937,7 @@ export class ConfigMutationService {
       scope: record.channelRef,
       title: `${enable ? "Enable" : "Disable"} scheduled prompt "${existing.name}"`,
       fields: [{ label: "enabled", before: String(existing.enabled), after: String(enable) }],
-      warnings: [],
+      warnings: quarantine ? [quarantine] : [],
       restartsSession: false,
       apply: (actor) => {
         const updated: ScheduledPrompt = {
@@ -1994,7 +2031,9 @@ export class ConfigMutationService {
     const nextRunUtc = nextRunDate.toISOString();
 
     // Build the row to persist. On update, preserve id / created* / enabled /
-    // last-run / attachments (attachments can't be managed conversationally).
+    // last-run. `legacyAttachmentCount: 0` is the deliberate revision (#158):
+    // it clears a pre-removal row's attachment manifest so the manager arms it
+    // again. The bytes on disk are left where they are.
     const buildRow = (actor: MutationActor): ScheduledPrompt =>
       existing
         ? {
@@ -2009,6 +2048,7 @@ export class ConfigMutationService {
             targetChannel,
             outputType,
             catchupSeconds,
+            legacyAttachmentCount: 0,
             updatedUtc: now,
             nextRunUtc,
           }
@@ -2028,7 +2068,7 @@ export class ConfigMutationService {
             sessionMode,
             catchupSeconds,
             enabled: true,
-            attachments: [],
+            legacyAttachmentCount: 0,
             createdBy: actor.id ?? "seam-mcp",
             createdUtc: now,
             updatedUtc: now,
@@ -2070,8 +2110,16 @@ export class ConfigMutationService {
     if (live && (changes.model != null || changes.cwd != null || changes.targetChannel != null || changes.outputType != null)) {
       warnings.push("Live mode ignores model / cwd / targetChannel / outputType — the thread's own config governs the run.");
     }
-    if (creating) {
-      warnings.push("Attachments can't be added conversationally — use `/seam schedule add-file` to attach reference files.");
+    // #158: saving over a pre-removal row clears its legacy manifest and re-arms
+    // it — a visible, deliberate act, not a silent side effect.
+    if (existing && legacyAttachmentQuarantine(existing)) {
+      const n = existing.legacyAttachmentCount;
+      warnings.push(
+        `This schedule still records ${n} legacy reference file${n === 1 ? "" : "s"} and is currently ` +
+          `quarantined (#158). Applying this update clears that record and re-arms the schedule — the ` +
+          `prompt must stand on its own or point at a repository runbook. The stored bytes under ` +
+          `data/scheduled-attachments/${existing.id}/ are left on disk.`
+      );
     }
 
     const id = randomUUID();
@@ -2203,6 +2251,8 @@ export class ConfigMutationService {
       catchupSeconds: s.catchupSeconds,
       enabled: s.enabled,
       nextRunUtc: s.nextRunUtc,
+      // #158: audited so a quarantine lift is visible in the before/after diff.
+      legacyAttachmentCount: s.legacyAttachmentCount,
     };
   }
 }

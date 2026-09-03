@@ -82,13 +82,8 @@ import {
   WATCH_DEFAULT_MAX_FIRES,
   WATCH_MAX_FIRES_CEILING,
 } from "../../core/watch/types.js";
-import {
-  loadScheduledAttachments,
-  deleteScheduledAttachmentDir,
-  saveScheduledAttachment,
-  deleteScheduledAttachment,
-} from "../../core/scheduled-prompts/attachments.js";
 import { describeCron, validateCron, nextRun as cronNextRun } from "../../core/scheduled-prompts/cron.js";
+import { legacyAttachmentQuarantine } from "../../core/scheduled-prompts/quarantine.js";
 import {
   formatWorkflowsView,
   clampFieldValue,
@@ -735,9 +730,6 @@ export class Orchestrator {
       // index.ts after construction; the `?.` guards the pre-wire window.
       reschedule: (id) => this.scheduledManager?.reschedule(id),
       defaultTimezone: SCHEDULE_DEFAULT_TZ,
-      cleanupScheduleAttachments: (id) => {
-        void deleteScheduledAttachmentDir(this.config.DATA_DIR, id).catch(() => {});
-      },
       logger: this.logger,
     });
 
@@ -865,23 +857,9 @@ export class Orchestrator {
         return [];
       }
     };
-    for (const sub of ["remove", "toggle", "addfile", "removefile", "edit"] as const) {
+    for (const sub of ["remove", "toggle", "edit"] as const) {
       this.autocomplete.register("schedule", sub, "id", scheduleIdResponder);
     }
-    this.autocomplete.register("schedule", "removefile", "filename", (ctx) => {
-      try {
-        const id = ctx.optionValues?.id;
-        if (!id || !ctx.channelId) return [];
-        const row = this.store.getScheduled(id);
-        if (!row || row.channelRef !== ctx.channelId) return [];
-        return labeledAutocompleteChoices(
-          row.attachments.map((a) => ({ name: a.filename, value: a.filename })),
-          ctx.focusedValue
-        );
-      } catch {
-        return [];
-      }
-    });
 
     this.autocomplete.register(null, "workflows", "cancel-wake", (ctx) => {
       try {
@@ -1154,9 +1132,10 @@ export class Orchestrator {
     this.watchSentinel();
   }
 
-  /** Instant cleanup when a thread is deleted: drop its scheduled prompts and
-   *  their stored attachments. (Fire-time 404 is the lazy fallback if the bot
-   *  was offline when the delete happened.) Also drops a parked prompt (#88). */
+  /** Instant cleanup when a thread is deleted: drop its scheduled prompts.
+   *  (Fire-time 404 is the lazy fallback if the bot was offline when the delete
+   *  happened.) Also drops a parked prompt (#88). Any pre-#158 bytes under
+   *  `data/scheduled-attachments/` are deliberately left alone. */
   private async handleThreadDeleted(channelRef: string): Promise<void> {
     const rows = this.store.listScheduledByChannel(PLATFORM, channelRef);
     if (rows.length > 0) {
@@ -1164,7 +1143,6 @@ export class Orchestrator {
       for (const row of rows) {
         this.scheduledManager?.disarm(row.id);
         this.store.deleteScheduled(row.id);
-        await deleteScheduledAttachmentDir(this.config.DATA_DIR, row.id).catch(() => {});
       }
     }
     await this.dropParkedForDeletedThread(channelRef);
@@ -7959,7 +7937,6 @@ export class Orchestrator {
           this.logger.info({ id, channel: row.channelRef }, "scheduled: thread deleted; dropping schedule");
           this.store.deleteScheduled(id);
           this.scheduledManager?.disarm(id);
-          await deleteScheduledAttachmentDir(this.config.DATA_DIR, id).catch(() => {});
         } else {
           this.patchScheduledStatus(id, "skipped: target deleted");
         }
@@ -7976,20 +7953,18 @@ export class Orchestrator {
     //     user message uses, so it streams identically — status panel, live text,
     //     FenceStream, auto-compaction, permission prompts — for free (D-below).
     //     No announce card (D6), no model/cwd/target/output knobs (D1): the
-    //     thread's persistent runtime governs the turn. Attachments pass straight
-    //     through unpartitioned (D7) — the inner path does its own staging.
+    //     thread's persistent runtime governs the turn. A scheduled fire carries
+    //     no files (#158) — the prompt stands alone or points at a runbook.
     if (row.sessionMode === "live") {
       // Archived-but-unlocked threads: no announce card reopens it now (D6), but
       // the turn's own first message (the status panel) lands in the thread and
       // Discord auto-unarchives on a new message — so it reopens implicitly.
-      const loaded = await loadScheduledAttachments(this.config.DATA_DIR, id, row.attachments);
       const marker = `⏰ *Scheduled: ${row.name}*`;
       const synthetic: IncomingMessage = {
         channel: bindingThread,
         authorId: row.createdBy,
         authorIsBot: false,
         text: `${marker}\n\n${row.promptText}`,
-        ...(loaded.length ? { attachments: loaded } : {}),
       };
       let aborted = false;
       try {
@@ -8042,9 +8017,6 @@ export class Orchestrator {
         { name: "Schedule", value: `${describeCron(row.cron)} (${row.timezone})` },
         { name: "Working dir", value: `\`${cwd}\``, inline: true },
         { name: "Model", value: model ? `\`${model}\`` : "session default", inline: true },
-        ...(row.attachments.length
-          ? [{ name: "Files", value: row.attachments.map((a) => `\`${a.filename}\``).join(", ") }]
-          : []),
       ],
       footer: `id ${id} · output: ${row.outputType}`,
     };
@@ -8055,23 +8027,10 @@ export class Orchestrator {
       this.logger.warn({ id, err }, "scheduled: announce card failed");
     }
 
-    // 4. Run isolated + capture. Stage non-inlineable files (PDF/Office/HEIC/…)
-    //    to a path the agent reads with its tools — same handling as a live turn,
-    //    so scheduled jobs aren't limited to text/image attachments.
-    const loaded = await loadScheduledAttachments(this.config.DATA_DIR, id, row.attachments);
-    const scheduledModel = model ?? profile.defaultModel;
-    const scheduledVision = resolveModelVisionRouting(
-      undefined,
-      profile.staticModels?.find((entry) => entry.modelId === scheduledModel)?.visionMode
-    );
-    const { inline, hint } = profile.restrictDiscordAccess
-      ? { inline: loaded, hint: null as string | null }
-      : await this.partitionAndStageAttachments(
-          loaded,
-          scheduledVision.agentHasVision,
-          scheduledVision.viaTool,
-          record.id
-        );
+    // 4. Run isolated + capture. The prompt is the whole payload (#158): a
+    //    schedule carries no files, so there is nothing to load, partition or
+    //    stage. Substantial instructions belong in a repository runbook the
+    //    prompt asks the agent to read.
     const result = await this.runIsolatedScheduledJob({
       profile,
       record,
@@ -8079,8 +8038,7 @@ export class Orchestrator {
       ...(model ? { model } : {}),
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
       channel: target,
-      promptText: hint ? `${row.promptText}${hint}` : row.promptText,
-      attachments: inline,
+      promptText: row.promptText,
     });
 
     // 5. Post result as NEW message(s) + record status.
@@ -8137,9 +8095,8 @@ export class Orchestrator {
     effort?: string;
     channel: ChannelRef;
     promptText: string;
-    attachments: MessageAttachment[];
   }): Promise<{ text: string; error?: string }> {
-    const { profile, record, cwd, model, effort, channel, promptText, attachments } = args;
+    const { profile, record, cwd, model, effort, channel, promptText } = args;
     // Target = the binding thread's session (what the job belongs to);
     // outputTo = where the run reports, which may be a different channel when
     // the schedule sets an explicit target.
@@ -8150,7 +8107,6 @@ export class Orchestrator {
       ...(model ? { model } : {}),
       ...(effort ? { effort } : {}),
       outputTo: channel,
-      attachments,
       // Scheduled isolated turns belong to the authoring session. Reuse its
       // token-scoped Seam-MCP server so tool-mediated vision can inspect only
       // that session's staged files; never mint or rotate a second token.
@@ -8345,15 +8301,13 @@ export class Orchestrator {
       case "list": return this.cmdScheduleList(i);
       case "remove": return this.cmdScheduleRemove(i);
       case "toggle": return this.cmdScheduleToggle(i);
-      case "addfile": return this.cmdScheduleAddFile(i);
-      case "removefile": return this.cmdScheduleRemoveFile(i);
       default:
         await i.reply({ content: `Unknown schedule subcommand: ${sub}`, flags: MessageFlags.Ephemeral });
     }
   }
 
-  /** Download a Discord attachment's bytes (URL is valid now; we persist them
-   *  because Discord CDN URLs expire ~24h). */
+  /** Download a Discord attachment's bytes (the CDN URL is valid now and
+   *  expires in ~24h, so anything we keep has to be fetched immediately). */
   private async downloadAttachmentBytes(url: string): Promise<Buffer> {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`download failed (${res.status})`);
@@ -8364,11 +8318,13 @@ export class Orchestrator {
     const state = s.enabled ? "🟢" : "⏸️";
     const last = s.lastStatus ? ` · last: ${s.lastStatus}` : "";
     const next = s.enabled && s.nextRunUtc ? ` · next: <t:${Math.floor(Date.parse(s.nextRunUtc) / 1000)}:R>` : "";
-    const files = s.attachments.length ? ` · 📎${s.attachments.length}` : "";
+    // #158: a row that still carries legacy attachments is quarantined — it is
+    // never armed, so say so where the operator is already looking.
+    const quarantined = legacyAttachmentQuarantine(s) ? " · ⚠️ legacy files — edit to re-arm" : "";
     // Model is only meaningful for isolated schedules (live uses the thread's).
     const model = s.sessionMode !== "live" && s.model ? ` · 🤖${s.model}` : "";
     const mode = s.sessionMode === "live" ? " · 🧠live" : "";
-    return `${state} **${s.name}** \`${s.id}\`\n   ${describeCron(s.cron)} (${s.timezone})${mode}${model}${files}${next}${last}`;
+    return `${state} **${s.name}** \`${s.id}\`\n   ${describeCron(s.cron)} (${s.timezone})${mode}${model}${quarantined}${next}${last}`;
   }
 
   private async cmdScheduleList(i: ChatInputCommandInteraction): Promise<void> {
@@ -8420,7 +8376,6 @@ export class Orchestrator {
         } else if (action === "del") {
           this.scheduledManager?.disarm(id);
           this.store.deleteScheduled(id);
-          await deleteScheduledAttachmentDir(this.config.DATA_DIR, id).catch(() => {});
           await c.update(this.buildScheduleListMessage(channel));
         }
       } catch (err) {
@@ -8470,7 +8425,6 @@ export class Orchestrator {
     }
     this.scheduledManager?.disarm(id);
     this.store.deleteScheduled(id);
-    await deleteScheduledAttachmentDir(this.config.DATA_DIR, id).catch(() => {});
     await i.reply({ content: `🗑️ Deleted scheduled prompt **${row.name}** (\`${id}\`).`, flags: MessageFlags.Ephemeral });
   }
 
@@ -8492,54 +8446,6 @@ export class Orchestrator {
     });
   }
 
-  private async cmdScheduleAddFile(i: ChatInputCommandInteraction): Promise<void> {
-    const id = i.options.getString("id", true);
-    const file = i.options.getAttachment("file", true);
-    const row = this.store.getScheduled(id);
-    const channel = this.channelRefFromInteraction(i);
-    if (!row || !channel || row.channelRef !== channel.id) {
-      await i.reply({ content: `No schedule \`${id}\` in this thread.`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
-    try {
-      const bytes = await this.downloadAttachmentBytes(file.url);
-      const saved = await saveScheduledAttachment(this.config.DATA_DIR, id, {
-        filename: file.name,
-        mime: file.contentType ?? "application/octet-stream",
-        bytes,
-      });
-      const updated: ScheduledPrompt = {
-        ...row,
-        attachments: [...row.attachments.filter((a) => a.filename !== saved.filename), saved],
-        updatedUtc: new Date().toISOString(),
-      };
-      this.store.upsertScheduled(updated);
-      await i.editReply(`📎 Added \`${saved.filename}\` to **${row.name}** (${updated.attachments.length} file(s)).`);
-    } catch (err) {
-      await i.editReply(`❌ Failed to add file: ${(err as Error).message}`);
-    }
-  }
-
-  private async cmdScheduleRemoveFile(i: ChatInputCommandInteraction): Promise<void> {
-    const id = i.options.getString("id", true);
-    const filename = i.options.getString("filename", true);
-    const row = this.store.getScheduled(id);
-    const channel = this.channelRefFromInteraction(i);
-    if (!row || !channel || row.channelRef !== channel.id) {
-      await i.reply({ content: `No schedule \`${id}\` in this thread.`, flags: MessageFlags.Ephemeral });
-      return;
-    }
-    await deleteScheduledAttachment(this.config.DATA_DIR, id, filename).catch(() => {});
-    const updated: ScheduledPrompt = {
-      ...row,
-      attachments: row.attachments.filter((a) => a.filename !== filename),
-      updatedUtc: new Date().toISOString(),
-    };
-    this.store.upsertScheduled(updated);
-    await i.reply({ content: `🗑️ Removed \`${filename}\` from **${row.name}**.`, flags: MessageFlags.Ephemeral });
-  }
-
   private async cmdScheduleEdit(i: ChatInputCommandInteraction): Promise<void> {
     const id = i.options.getString("id", true);
     const row = this.store.getScheduled(id);
@@ -8552,8 +8458,9 @@ export class Orchestrator {
   }
 
   /** Shared builder card for create (existing undefined) and edit (existing set).
-   *  In edit mode the schedule's stored attachments are managed separately via
-   *  addfile/removefile; the card edits prompt/schedule/model/cwd/output. */
+   *  The card edits prompt/schedule/model/cwd/output. Schedules carry no files
+   *  (#158) — saving an edit also clears any legacy attachment manifest, which
+   *  is what lifts the quarantine on a pre-removal row. */
   private async cmdScheduleAdd(i: ChatInputCommandInteraction | MessageComponentInteraction, existing?: ScheduledPrompt): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
@@ -8573,16 +8480,6 @@ export class Orchestrator {
     const sessionModel = cfg.model ?? profile?.defaultModel ?? null;
     const models = (profile?.staticModels ?? []).slice(0, 24);
 
-    // Capture any files supplied on the command (references held; bytes fetched
-    // on Create, while the URLs are still valid).
-    const pending: Array<{ name: string; url: string; mime: string }> = [];
-    if (i.isChatInputCommand()) {
-      for (const opt of ["file", "file2", "file3"]) {
-        const a = i.options.getAttachment(opt, false);
-        if (a) pending.push({ name: a.name, url: a.url, mime: a.contentType ?? "application/octet-stream" });
-      }
-    }
-
     const state = {
       name: existing?.name ?? "",
       promptText: existing?.promptText ?? "",
@@ -8596,35 +8493,31 @@ export class Orchestrator {
       // this thread, sharing its session context (M4/D1). In live mode
       // model/cwd/target/output are meaningless and hidden below.
       sessionMode: (existing?.sessionMode ?? "isolated") as "isolated" | "live",
-      files: pending,
     };
-    // Edit mode: manage the row's stored attachments live — remove via the select
-    // on the card, add via `/seam schedule addfile` (Discord cards can't accept a
-    // file upload). Mutable copy so Save writes the current set, not the stale
-    // original spread from `existing`.
-    const editFiles = existing ? [...existing.attachments] : [];
+    // #158: a pre-removal row still recorded reference files. Saving this card
+    // is the deliberate revision that clears them and re-arms the schedule; the
+    // stored bytes on disk are left alone.
+    const quarantine = existing ? legacyAttachmentQuarantine(existing) : null;
 
     const render = () => {
       const cronLine = state.cron
         ? `${describeCron(state.cron)} \`${state.cron}\``
         : "*(not set)*";
       const next = state.cron ? cronNextRun(state.cron, state.timezone) : null;
-      const filesValue = existing
-        ? (editFiles.length
-            ? editFiles.map((a) => `\`${a.filename}\``).join(", ") + " · *(remove below; add via `/seam schedule addfile`)*"
-            : "*(none — add via `/seam schedule addfile`)*")
-        : (state.files.length ? state.files.map((f) => `\`${f.name}\``).join(", ") : "*(none)*");
       const isLive = state.sessionMode === "live";
       const embed = new EmbedBuilder()
         .setTitle(existing ? `✏️ Edit scheduled prompt \`${existing.id}\`` : "⏰ New scheduled prompt")
         .setColor(SCHEDULED_COLOR)
         .setDescription(
-          isLive
+          (isLive
             ? "This runs **in this thread**, as a real turn on this conversation's session. " +
               "It streams like a normal message, shares and remembers this thread's context, and " +
-              "waits its turn if the thread is busy. Attach any files it needs (re-sent every run)."
+              "waits its turn if the thread is busy."
             : "This runs **on its own, on a clean session** — it won't remember this conversation. " +
-              "Write the prompt so it stands alone, and attach any files it needs (re-sent every run)."
+              "Write the prompt so it stands alone.") +
+            " Schedules don't carry files: for anything substantial, commit a runbook to the repo and " +
+            "have the prompt ask the agent to read it." +
+            (quarantine ? `\n\n⚠️ ${quarantine}` : "")
         )
         .addFields(
           { name: "🏷️ Name", value: state.name || "*(not set)*" },
@@ -8638,8 +8531,7 @@ export class Orchestrator {
             { name: "📂 Working dir", value: state.cwd ? `\`${state.cwd}\`` : "*(this thread's repo)*", inline: true },
             { name: "📮 Output to", value: state.target ? `<#${state.target}>` : "*(this thread)*", inline: true },
             { name: "🖼️ Output as", value: state.outputType === "messages" ? "plain messages" : "status cards", inline: true },
-          ]),
-          { name: "📎 Files", value: filesValue }
+          ])
         );
       const cadence = new StringSelectMenuBuilder()
         .setCustomId("sched:cadence")
@@ -8675,14 +8567,6 @@ export class Orchestrator {
         rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(modelSelect));
       }
       rows.push(buttons);
-      // Edit mode with files: a select to remove one (removal persists live).
-      if (existing && editFiles.length > 0) {
-        const rmfile = new StringSelectMenuBuilder()
-          .setCustomId("sched:rmfile")
-          .setPlaceholder("🗑️ Remove a file…")
-          .addOptions(editFiles.slice(0, 25).map((a) => ({ label: a.filename.slice(0, 100), value: a.filename })));
-        rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(rmfile));
-      }
       return { embeds: [embed], components: rows };
     };
 
@@ -8720,17 +8604,6 @@ export class Orchestrator {
         } else if (c.isStringSelectMenu() && c.customId === "sched:model") {
           const v = c.values[0]!;
           state.model = v === "__default__" ? null : v;
-          await c.update(render());
-        } else if (c.isStringSelectMenu() && c.customId === "sched:rmfile") {
-          // Remove a stored file immediately (matches /seam schedule removefile),
-          // independent of Save; keep editFiles in sync so Save writes the rest.
-          const filename = c.values[0]!;
-          if (existing) {
-            await deleteScheduledAttachment(this.config.DATA_DIR, existing.id, filename).catch(() => {});
-            const idx = editFiles.findIndex((a) => a.filename === filename);
-            if (idx >= 0) editFiles.splice(idx, 1);
-            this.store.upsertScheduled({ ...existing, attachments: editFiles, updatedUtc: new Date().toISOString() });
-          }
           await c.update(render());
         } else if (c.isStringSelectMenu() && c.customId === "sched:cadence") {
           const v = c.values[0]!;
@@ -8847,36 +8720,28 @@ export class Orchestrator {
           const persistedOutput: "card" | "messages" = live ? "card" : state.outputType;
           let row: ScheduledPrompt;
           if (existing) {
-            // Edit: preserve id, created*, enabled, last-run. Use editFiles (the
-            // live-managed set) for attachments so a file removed via the card's
-            // select isn't re-added by spreading the stale `existing`.
+            // Edit: preserve id, created*, enabled, last-run. `legacyAttachmentCount: 0`
+            // is the deliberate revision (#158): it clears a pre-removal row's
+            // attachment manifest so the manager will arm it again. The bytes on
+            // disk are left where they are.
             row = {
               ...existing,
               name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
               model: persistedModel, cwd: persistedCwd, targetChannel: persistedTarget, outputType: persistedOutput,
               sessionMode: state.sessionMode,
-              attachments: editFiles,
+              legacyAttachmentCount: 0,
               updatedUtc: now, nextRunUtc: next ? next.toISOString() : null,
             };
             this.store.upsertScheduled(row);
             this.scheduledManager?.reschedule(existing.id);
           } else {
             const id = `sch_${randomUUID().slice(0, 8)}`;
-            const attachments = [];
-            for (const f of state.files) {
-              try {
-                const bytes = await this.downloadAttachmentBytes(f.url);
-                attachments.push(await saveScheduledAttachment(this.config.DATA_DIR, id, { filename: f.name, mime: f.mime, bytes }));
-              } catch (err) {
-                this.logger.warn({ err, file: f.name }, "schedule: file download failed");
-              }
-            }
             row = {
               id, platform: PLATFORM, channelRef: channel.id, parentRef: channel.parentId ?? null,
               name: state.name, promptText: state.promptText, cron: state.cron, timezone: state.timezone,
               model: persistedModel, cwd: persistedCwd, targetChannel: persistedTarget, outputType: persistedOutput,
               sessionMode: state.sessionMode,
-              catchupSeconds: 7200, enabled: true, attachments, createdBy: i.user.id,
+              catchupSeconds: 7200, enabled: true, legacyAttachmentCount: 0, createdBy: i.user.id,
               createdUtc: now, updatedUtc: now, lastRunUtc: null, lastStatus: null,
               nextRunUtc: next ? next.toISOString() : null, pinnedSessionId: null,
             };
@@ -8896,7 +8761,10 @@ export class Orchestrator {
                 (state.target ? `\nOutput to: <#${state.target}>` : "") +
                 `\nOutput as: ${state.outputType === "messages" ? "plain messages" : "status cards"}`) +
               (next ? `\nNext run: <t:${Math.floor(next.getTime() / 1000)}:F>` : "") +
-              (row.attachments.length ? `\n📎 ${row.attachments.length} file(s) attached` : "") +
+              (quarantine
+                ? `\n\n📎 Cleared this schedule's legacy reference files (#158) — it can run again. ` +
+                  `The stored bytes were left on disk under \`data/scheduled-attachments/${row.id}/\`.`
+                : "") +
               (existing && !row.enabled ? `\n\n⏸️ This schedule is currently disabled — enable it with \`/seam schedule toggle\`.` : "") +
               `\n\nManage it with \`/seam schedule list\`.`
             );

@@ -191,7 +191,8 @@ describe("/seam slash command", () => {
     const json = built();
     const count = (name: string) =>
       json.options?.find((o) => o.name === name)?.options?.length ?? 0;
-    expect(count("schedule")).toBe(7);
+    // 5 since #158 removed addfile/removefile.
+    expect(count("schedule")).toBe(5);
     expect(count("preset")).toBe(7);
     expect(count("project")).toBe(3);
     const upload = json.options?.find((o) => o.name === "upload");
@@ -282,12 +283,10 @@ describe("/seam slash command", () => {
     expect(cfg("repo")?.options?.find((o) => o.name === "scope")?.autocomplete ?? false).toBe(false);
 
     const schedule = json.options?.find((o) => o.name === "schedule");
-    for (const leaf of ["remove", "toggle", "addfile", "removefile", "edit"]) {
+    for (const leaf of ["remove", "toggle", "edit"]) {
       const sub = (schedule?.options ?? []).find((o) => o.name === leaf);
       expect(sub?.options?.find((o) => o.name === "id")?.autocomplete, leaf).toBe(true);
     }
-    const removefile = (schedule?.options ?? []).find((o) => o.name === "removefile");
-    expect(removefile?.options?.find((o) => o.name === "filename")?.autocomplete).toBe(true);
 
     const workflows = json.options?.find((o) => o.name === "workflows");
     for (const name of ["cancel-wake", "cancel-watch", "cancel-choice", "cancel-ingest", "cancel-live"]) {

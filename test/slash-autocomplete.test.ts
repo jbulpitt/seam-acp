@@ -168,7 +168,7 @@ function schedule(over: Partial<ScheduledPrompt> = {}): ScheduledPrompt {
     sessionMode: "isolated",
     catchupSeconds: 7200,
     enabled: true,
-    attachments: [],
+    legacyAttachmentCount: 0,
     createdBy: "user-jesse",
     createdUtc: now,
     updatedUtc: now,
@@ -293,39 +293,19 @@ describe("slash autocomplete responders", () => {
     expect(responded[0]).toEqual([{ name: "Morning brief (sch_aa)", value: "sch_aa" }]);
   });
 
-  it("schedule removefile filename uses the sibling id", async () => {
-    store.upsertScheduled(
-      schedule({
-        id: "sch_aa",
-        attachments: [
-          { filename: "notes.pdf", mime: "application/pdf", size: 12 },
-          { filename: "rubric.txt", mime: "text/plain", size: 4 },
-        ],
-      })
-    );
+  // #158: `/seam schedule addfile` / `removefile` are gone, so nothing is
+  // registered for them — an invocation of either responds with no choices.
+  it.each(["addfile", "removefile"])("schedule %s has no autocomplete responder", async (sub) => {
+    store.upsertScheduled(schedule({ id: "sch_aa" }));
     const { orch } = makeOrch();
     const { i, responded } = autocompleteI({
       group: "schedule",
-      sub: "removefile",
-      option: "filename",
-      value: "rub",
-      data: [
-        {
-          name: "schedule",
-          options: [
-            {
-              name: "removefile",
-              options: [
-                { name: "id", value: "sch_aa" },
-                { name: "filename", value: "rub" },
-              ],
-            },
-          ],
-        },
-      ],
+      sub,
+      option: "id",
+      value: "Mor",
     });
     await orch.handleAutocompleteInteraction(i as any);
-    expect(responded[0]).toEqual([{ name: "rubric.txt", value: "rubric.txt" }]);
+    expect(responded[0]).toEqual([]);
   });
 
   it("workflows cancel-wake / cancel-watch are thread-scoped", async () => {

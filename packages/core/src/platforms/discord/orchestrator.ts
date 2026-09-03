@@ -10211,8 +10211,8 @@ export class Orchestrator {
       // No id given — show an interactive picker. Eagerly start the
       // runtime if needed so we have an availableModels list (the model
       // catalog comes from the agent at session-start, not from us).
-      const cfg = this.store.readConfig(record);
-      const current = cfg.model ?? this.config.DEFAULT_MODEL;
+      const live = this.store.get(record.id) ?? record;
+      const current = this.router.describeConfig(live).model.value;
       const displayCurrent = `\`${current}\``;
       if (!this.adapter.sendChoicePicker) {
         await i.reply({
@@ -10223,7 +10223,7 @@ export class Orchestrator {
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
       let models: ReadonlyArray<{ modelId: string; name?: string }> = [];
-      const profile = this.router.getProfile(record.agentId);
+      const profile = this.router.getProfile(this.router.describeConfig(live).agent.value);
       if (profile?.staticModels && profile.staticModels.length > 0) {
         models = profile.staticModels;
       } else {
@@ -10279,8 +10279,9 @@ export class Orchestrator {
     id: string,
     interaction?: ChatInputCommandInteraction
   ): Promise<void> {
-    const cfg = this.store.readConfig(record);
-    const current = cfg.model ?? this.config.DEFAULT_MODEL;
+    const live = this.store.get(record.id) ?? record;
+    const cfg = this.store.readConfig(live);
+    const current = this.router.describeConfig(live).model.value;
     if (id === current) {
       await this.applyThreadName(this.store.get(record.id) ?? record);
       const message = `🧠 Model already set to \`${id}\` (no change).`;
@@ -10296,7 +10297,7 @@ export class Orchestrator {
     // belong to a different model now. Invalidate so the next turn starts
     // clean rather than seeding the panel with mismatched numbers.
     cfg.lastContextUsage = undefined;
-    this.persistConfig(record, cfg);
+    this.persistConfig(live, cfg);
     const overlay = this.configMutation.applyThreadOverlay({
       threadId: channel.id,
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
@@ -11513,9 +11514,10 @@ export class Orchestrator {
     });
     const id = i.options.getString("id");
     const profiles = this.router.listProfiles();
-    const currentAt = currentAgentAtLocation(record.agentId, this.config, channel.id);
+    const effectiveAgent = this.router.describeConfig(record).agent.value;
+    const currentAt = currentAgentAtLocation(effectiveAgent, this.config, channel.id);
     const currentLabel = currentHostPrefixedLabel(
-      record.agentId,
+      effectiveAgent,
       this.config,
       channel.id,
       this.config.bridgePresets
@@ -11612,6 +11614,26 @@ export class Orchestrator {
         return;
       }
     }
+    // Snapshot the durable row BEFORE we mutate it so an overlay failure can
+    // restore agent/model/ACP session instead of claiming a switch that did
+    // not actually take effect. `record` itself is the pre-switch in-memory
+    // object — spreading it after a config write is what used to clobber the
+    // new default model (#178).
+    const previous = this.store.get(record.id) ?? { ...record };
+    const restorePreviousSession = (): void => {
+      this.store.upsert({
+        ...previous,
+        updatedUtc: new Date().toISOString(),
+      });
+    };
+    const respond = async (msg: string): Promise<void> => {
+      if (interaction) {
+        await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
+      } else {
+        await this.adapter.sendMessage(channel, msg);
+      }
+    };
+
     // Kill the live runtime (ends any in-flight turn) and wipe the ACP
     // session id so the next message spawns the new agent fresh. D2: a
     // location change is a new host — never migrate the old session.
@@ -11619,40 +11641,83 @@ export class Orchestrator {
     const cfg = this.store.readConfig(record);
     if (!sameAgent) {
       cfg.model = profile.defaultModel;
-      cfg.lastContextUsage = undefined;
+      delete cfg.lastContextUsage;
     }
-    this.persistConfig(record, cfg);
+    const intendedModel = cfg.model ?? profile.defaultModel;
+    // One authoritative write: agentId + default model config + cleared ACP
+    // session. Separate persistConfig + upsert({...record}) restored the
+    // stale configJson and is the #178 split-brain.
     this.store.upsert({
       ...record,
       agentId: parsed.agentId,
       acpSessionId: "",
+      configJson: this.store.writeConfig(cfg),
       updatedUtc: new Date().toISOString(),
     });
+    record = this.store.get(record.id) ?? record;
     // Thread overlay beats a locked channel preset (school channels pin grok).
     const overlay = this.configMutation.applyThreadOverlay({
       threadId: channel.id,
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       changes: {
         agent: parsed.agentId,
-        model: cfg.model ?? profile.defaultModel,
+        model: intendedModel,
       },
       actor: interaction
         ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
         : { id: null, name: null },
     });
     if (!overlay.ok) {
-      this.logger.warn({ err: overlay.error, threadId: channel.id }, "thread agent overlay write failed");
+      restorePreviousSession();
+      this.logger.warn(
+        { err: overlay.error, threadId: channel.id },
+        "thread agent overlay write failed; session rolled back"
+      );
+      await respond(`Could not switch agent: ${overlay.error}`);
+      return;
     }
-    bindSessionLocation(this.bridgeHub, record.id, nextLocation);
-    const renamedRecord = this.store.get(record.id) ?? { ...record, agentId: parsed.agentId };
-    await this.applyThreadName(renamedRecord);
+    const live = this.store.get(record.id) ?? record;
+    const described = this.router.describeConfig(live);
+    let spawn: ReturnType<SessionRouter["planRuntimeSpawn"]>;
+    try {
+      spawn = this.router.planRuntimeSpawn(live);
+    } catch (err) {
+      restorePreviousSession();
+      const detail = err instanceof Error ? err.message : String(err);
+      this.logger.warn({ err, threadId: channel.id }, "agent switch spawn plan failed; session rolled back");
+      await respond(`Could not switch agent: ${detail}`);
+      return;
+    }
+    if (
+      described.agent.value !== parsed.agentId ||
+      described.model.value !== intendedModel ||
+      spawn.agentId !== parsed.agentId ||
+      spawn.model !== intendedModel
+    ) {
+      restorePreviousSession();
+      this.logger.warn(
+        {
+          threadId: channel.id,
+          intendedAgent: parsed.agentId,
+          intendedModel,
+          describedAgent: described.agent.value,
+          describedModel: described.model.value,
+          spawnAgent: spawn.agentId,
+          spawnModel: spawn.model,
+        },
+        "agent switch did not take effect; session rolled back"
+      );
+      await respond(
+        "Could not switch agent: the effective configuration did not match the requested agent/model."
+      );
+      return;
+    }
+    bindSessionLocation(this.bridgeHub, live.id, nextLocation);
+    await this.applyThreadName(live);
     const at = formatAgentAtLocation(parsed.agentId, nextLocation);
-    const message = `🤖 Agent switched to \`${at}\` (${profile.displayName}), model \`${cfg.model ?? profile.defaultModel}\`. Next message will start a fresh session.`;
-    if (interaction) {
-      await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
-    } else {
-      await this.adapter.sendMessage(channel, message);
-    }
+    await respond(
+      `🤖 Agent switched to \`${at}\` (${profile.displayName}), model \`${intendedModel}\`. Next message will start a fresh session.`
+    );
   }
 
   private async cmdConfig(i: ChatInputCommandInteraction): Promise<void> {

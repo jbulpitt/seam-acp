@@ -1507,16 +1507,15 @@ export class Orchestrator {
         runtimeBusy: false,
       };
     }
-    if (meta) {
-      if (runtimeBusy) meta.runtimeIdleSinceMs = undefined;
-      else meta.runtimeIdleSinceMs ??= nowMs;
-    }
     const durableSince = durable.length > 0 ? Date.parse(durable[0]!.updatedUtc) : Number.NaN;
-    const ageMs = meta?.runtimeIdleSinceMs !== undefined
-      ? Math.max(0, nowMs - meta.runtimeIdleSinceMs)
-      : Number.isFinite(durableSince)
-        ? Math.max(0, nowMs - durableSince)
-        : 0;
+    const idleSince = meta?.runtimeIdleSinceMs ?? meta?.lastProgressAtMs;
+    const ageMs = runtimeBusy
+      ? 0
+      : idleSince !== undefined
+        ? Math.max(0, nowMs - idleSince)
+        : Number.isFinite(durableSince)
+          ? Math.max(0, nowMs - durableSince)
+          : 0;
     const graceMs = (this.config.CHANNEL_QUEUE_WEDGE_GRACE_SECONDS ?? 30) * 1000;
     const state: ChannelQueueState = runtimeBusy
       ? "runtime_busy"
@@ -1782,7 +1781,7 @@ export class Orchestrator {
     // #88 D8: park BEFORE getOrStartRuntime when this thread is bound to a
     // remote bridge that is not ready. After aborting any in-flight turn so
     // this message replaces it. Does not hold the Discord turn open.
-    if (await this.tryParkForOfflineBridge(msg)) return;
+    if (await this.tryParkForOfflineBridge(msg, admissionId)) return;
 
     await this.queueOnChannel(channelId, async (fence) => {
       // A newer message arrived after us — skip this turn entirely.
@@ -1986,15 +1985,17 @@ export class Orchestrator {
       return { ok: false, before, epoch: currentEpoch, message: "No session is bound to that thread." };
     }
 
-    // Fence first. Any await below may let the abandoned promise wake up, but
-    // it can no longer emit, mutate the session, or terminalize recovered work.
+    // Fence and reconcile the filesystem owner FIRST. Advancing the channel
+    // epoch or aborting the runtime can release dispatchInjectTurn's old queue
+    // promise; the watcher must already reject that late terminal write or it
+    // can replace the sole running artifact with a done-file before requeue.
+    const dispatches = (await this.dispatchWatcher?.recoverTarget(channelRef)) ?? [];
     const epoch = this.advanceChannelQueueEpoch(channelRef);
     await this.clearTurnMarkersForChannel(channelRef, "cancelled", {
       preserveDispatch: true,
     });
     await this.router.abortTurn(record.id, { force: true });
     await this.router.invalidate(record.id, { clearAcpSession: false }).catch(() => {});
-    const dispatches = (await this.dispatchWatcher?.recoverTarget(channelRef)) ?? [];
     const inbound = this.store.recoverInboundChannel(channelRef, new Date().toISOString());
     if (inbound) this.startRecoveredInbound(inbound);
     void this.dispatchWatcher?.tick().catch((err) =>
@@ -5698,10 +5699,13 @@ export class Orchestrator {
    * a runtime). Real Discord messages only (`msg.raw`) — synthetic
    * schedule/wake/resume turns go through Inner and must not park here.
    */
-  private async tryParkForOfflineBridge(msg: IncomingMessage): Promise<boolean> {
+  private async tryParkForOfflineBridge(
+    msg: IncomingMessage,
+    inboundAdmissionId?: string
+  ): Promise<boolean> {
     if (!this.wouldParkForOfflineBridge(msg)) return false;
     const location = resolveThreadLocation(this.config, msg.channel.id);
-    await this.parkUserPrompt(msg, location);
+    await this.parkUserPrompt(msg, location, inboundAdmissionId);
     // Race: the host came ready while we staged. Fire now rather than waiting
     // for the next hello (which may be hours away).
     if (this.bridgeHub?.isBridgeReady(location)) {
@@ -5747,7 +5751,11 @@ export class Orchestrator {
     return body;
   }
 
-  private async parkUserPrompt(msg: IncomingMessage, location: string): Promise<void> {
+  private async parkUserPrompt(
+    msg: IncomingMessage,
+    location: string,
+    inboundAdmissionId?: string
+  ): Promise<void> {
     await this.parkPrompt({
       channel: msg.channel,
       location,
@@ -5757,6 +5765,7 @@ export class Orchestrator {
       kind: "bridge_offline",
       attachments: msg.attachments,
       busy: this.channelQueues.has(msg.channel.id),
+      ...(inboundAdmissionId ? { inboundAdmissionId } : {}),
     });
   }
 
@@ -5773,6 +5782,7 @@ export class Orchestrator {
     kind: ParkedKind;
     attachments?: ReadonlyArray<MessageAttachment>;
     busy?: boolean;
+    inboundAdmissionId?: string;
   }): Promise<ParkedPrompt> {
     const previous = this.store.getParkedByChannel(PLATFORM, args.channel.id);
     if (previous) {
@@ -5805,7 +5815,7 @@ export class Orchestrator {
       attachments: kept,
       createdUtc: new Date().toISOString(),
     };
-    this.store.upsertParked(row);
+    this.store.upsertParked(row, args.inboundAdmissionId);
     this.logger.info(
       {
         id,
@@ -11115,7 +11125,8 @@ export class Orchestrator {
   }
 
   private async cmdRecover(i: ChatInputCommandInteraction): Promise<void> {
-    if (!this.config.SEAM_CONFIG_ADMIN_USER_IDS?.has(i.user.id)) {
+    const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+    if (admins && !admins.has(i.user.id)) {
       await i.reply({
         content: "🔒 `/seamadmin recover` is config-admin-only.",
         flags: MessageFlags.Ephemeral,
@@ -11322,14 +11333,10 @@ export class Orchestrator {
       );
     }
     if (!opts?.preserveDispatch) {
-      const activeDispatchId = this.activeLiveDispatch.get(channelRef);
-      // Always make the watcher call so marker finalization ordering stays
-      // observable/testable, but use an impossible exact id when no dispatch is
-      // active. Pending recovery artifacts are never selected by target.
       await this.dispatchWatcher
-        ?.cancelRunning({ id: activeDispatchId ?? "__no-active-dispatch__" })
+        ?.cancelRunning({ target: channelRef })
         .catch((err) =>
-          this.logger.warn({ err, channelRef, activeDispatchId }, "dispatch cancelRunning failed")
+          this.logger.warn({ err, channelRef }, "dispatch cancelRunning failed")
         );
     }
   }

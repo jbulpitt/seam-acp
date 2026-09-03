@@ -392,9 +392,23 @@ export class DispatchWatcher {
     for (const spec of specs) {
       if (spec.target !== target || recovered.includes(spec.id)) continue;
       const name = `${spec.id}.json`;
-      if (await exists(path.join(this.dirs.done, name))) continue;
       const runningPath = path.join(this.dirs.running, name);
       const pendingPath = path.join(this.dirs.pending, name);
+      if (await exists(path.join(this.dirs.done, name))) {
+        await rm(runningPath, { force: true }).catch(() => {});
+        await rm(pendingPath, { force: true }).catch(() => {});
+        this.inFlight.delete(spec.id);
+        continue;
+      }
+      if (!this.mayRecover(spec.id)) {
+        await this.abandonRunning(spec.id, "durable delegation ledger is terminal");
+        this.inFlight.delete(spec.id);
+        this.logger.warn(
+          { id: spec.id, target },
+          "dispatch: local recovery terminalized artifact blocked by ledger"
+        );
+        continue;
+      }
       if (await exists(runningPath)) {
         try {
           await rename(runningPath, pendingPath);
@@ -424,6 +438,10 @@ export class DispatchWatcher {
       if (filter?.id && spec.id !== filter.id) continue;
       if (seen.has(spec.id)) continue;
       seen.add(spec.id);
+      const inFlight = this.inFlight.has(spec.id);
+      // Fence first: a running isolated callback or a same-target task already
+      // claimed into the SerialQueue must not overwrite this terminal result.
+      this.quarantined.add(spec.id);
       await this.finish(spec.id, {
         id: spec.id,
         status: "failed",
@@ -432,6 +450,7 @@ export class DispatchWatcher {
         ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
         finishedUtc: new Date().toISOString(),
       });
+      if (!inFlight) this.quarantined.delete(spec.id);
       cancelled.push(spec.id);
     }
     return cancelled;
@@ -441,15 +460,15 @@ export class DispatchWatcher {
   async abandonRunning(id: string, reason: string): Promise<void> {
     let target = "";
     let correlationId: string | undefined;
-    try {
-      const spec = parseDispatchSpec(
-        id,
-        await readFile(path.join(this.dirs.running, `${id}.json`), "utf8")
-      );
-      target = spec.target;
-      correlationId = spec.correlationId;
-    } catch {
-      // still finalize so recoverStale cannot re-run it
+    for (const dir of [this.dirs.running, this.dirs.pending]) {
+      try {
+        const spec = parseDispatchSpec(id, await readFile(path.join(dir, `${id}.json`), "utf8"));
+        target = spec.target;
+        correlationId = spec.correlationId;
+        break;
+      } catch {
+        // Try the other durable queue location; still finalize if neither parses.
+      }
     }
     await this.finish(id, {
       id,

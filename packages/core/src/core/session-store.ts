@@ -2004,10 +2004,13 @@ export class SessionStore {
 
   // --- parked prompts (#88) -------------------------------------------------
 
-  /** Insert or replace the single parked prompt for this thread (D1). */
-  upsertParked(p: ParkedPrompt): void {
-    this.db
-      .prepare(
+  /** Insert or replace the single parked prompt for this thread (D1). When a
+   * just-admitted Discord message is being transferred to this durable owner,
+   * terminalize that admission in the same SQLite transaction. */
+  upsertParked(p: ParkedPrompt, completedInboundMessageId?: string): void {
+    const upsert = this.db.transaction(() => {
+      this.db
+        .prepare(
         `INSERT INTO parked_prompts
            (id, platform, channel_ref, parent_ref, location, kind, prompt,
             author_id, author_name, notice_message_id, attachments_json, created_utc)
@@ -2026,20 +2029,36 @@ export class SessionStore {
            attachments_json   = excluded.attachments_json,
            created_utc        = excluded.created_utc`
       )
-      .run({
-        id: p.id,
-        platform: p.platform,
-        channelRef: p.channelRef,
-        parentRef: p.parentRef,
-        location: p.location,
-        kind: p.kind === "user_queue" ? "user_queue" : "bridge_offline",
-        prompt: p.prompt,
-        authorId: p.authorId,
-        authorName: p.authorName,
-        noticeMessageId: p.noticeMessageId,
-        attachmentsJson: JSON.stringify(p.attachments),
-        createdUtc: p.createdUtc,
-      });
+        .run({
+          id: p.id,
+          platform: p.platform,
+          channelRef: p.channelRef,
+          parentRef: p.parentRef,
+          location: p.location,
+          kind: p.kind === "user_queue" ? "user_queue" : "bridge_offline",
+          prompt: p.prompt,
+          authorId: p.authorId,
+          authorName: p.authorName,
+          noticeMessageId: p.noticeMessageId,
+          attachmentsJson: JSON.stringify(p.attachments),
+          createdUtc: p.createdUtc,
+        });
+      if (completedInboundMessageId) {
+        const completed = this.db
+          .prepare(
+            `UPDATE inbound_admissions
+             SET state = 'completed', updated_utc = ?
+             WHERE message_id = ? AND state = 'pending' AND queue_epoch IS NULL`
+          )
+          .run(p.createdUtc, completedInboundMessageId);
+        if (completed.changes !== 1) {
+          throw new Error(
+            `cannot transfer inbound admission ${completedInboundMessageId} to parked prompt`
+          );
+        }
+      }
+    });
+    upsert();
   }
 
   getParked(id: string): ParkedPrompt | null {

@@ -12,6 +12,7 @@ import {
   ChannelQueueFencedError,
 } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { stageRestartSentinel } from "../packages/core/src/core/restart-sentinel.js";
+import { DELEGATION_TERMINAL_STATUSES } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
@@ -63,8 +64,10 @@ describe("#180 durable inbound admission", () => {
 
     const recovered = store.recoverInboundChannel("100", "2026-09-03T00:00:11.000Z");
     expect(recovered).toMatchObject({ messageId: "1", state: "pending", queueEpoch: null });
+    expect(store.claimInbound("1", 1, "2026-09-03T00:00:11.500Z")).toBe(true);
     expect(store.completeInbound("1", 0, "2026-09-03T00:00:12.000Z")).toBe(false);
-    expect(store.getInbound("1")?.state).toBe("pending");
+    expect(store.getInbound("1")).toMatchObject({ state: "running", queueEpoch: 1 });
+    expect(store.completeInbound("1", 1, "2026-09-03T00:00:13.000Z")).toBe(true);
   });
 
   it("durably applies replacement semantics and recovers only the newest prompt", () => {
@@ -171,24 +174,24 @@ describe("#180 channel queue fencing", () => {
     expect(store.getInbound("300")?.state).toBe("pending");
   });
 
-  it("reports runtime-idle queue tails as queued, then wedged after the grace", () => {
+  it("reports a first-observed idle tail from its last progress without mutating inspection state", () => {
     const { host } = makeHost();
     (host as any).channelQueues.set("100", new Promise<void>(() => {}));
-    (host as any).channelQueueMeta.set("100", {
+    const meta = {
       epoch: 4,
       queued: 2,
       admittedAtMs: 100,
-      lastProgressAtMs: 100,
-    });
+      lastProgressAtMs: 1_000,
+    };
+    (host as any).channelQueueMeta.set("100", meta);
     (host as any).channelQueueEpochs.set("100", 4);
 
-    expect(host.inspectChannelQueue("100", 1_000)).toMatchObject({ state: "queued", queued: 2 });
-    expect(host.inspectChannelQueue("100", 1_999).state).toBe("queued");
     expect(host.inspectChannelQueue("100", 2_000)).toMatchObject({
       state: "wedged",
       epoch: 4,
       ageMs: 1_000,
     });
+    expect((host as any).channelQueueMeta.get("100")).toEqual(meta);
   });
 
   it("keeps a crash-window durable admission visible without an in-memory tail", () => {
@@ -239,6 +242,45 @@ describe("#180 channel queue fencing", () => {
     expect(store.getInbound("301")?.state).toBe("completed");
   });
 
+  it("terminalizes an admission when the second availability check parks it", async () => {
+    const { host } = makeHost();
+    (host as any).tryParkForOfflineBridge = vi.fn(
+      async (_msg: unknown, inboundAdmissionId: string | undefined) => {
+        store.upsertParked(
+          {
+            id: "parked-302",
+            platform: "discord",
+            channelRef: "100",
+            parentRef: "10",
+            location: "remote",
+            kind: "bridge_offline",
+            prompt: "park after admission",
+            authorId: "200",
+            authorName: "Jesse",
+            noticeMessageId: null,
+            attachments: [],
+            createdUtc: "2026-09-03T00:00:30.000Z",
+          },
+          inboundAdmissionId
+        );
+        return true;
+      }
+    );
+    await (host as any).handleIncomingMessage({
+      messageId: "302",
+      channel: { platform: "discord", id: "100", parentId: "10" },
+      authorId: "200",
+      authorName: "Jesse",
+      authorIsBot: false,
+      text: "park after admission",
+    });
+
+    expect(store.getInbound("302")?.state).toBe("completed");
+    expect(store.getParkedByChannel("discord", "100")?.prompt).toBe("park after admission");
+    expect(store.recoverAllInbound("2026-09-03T00:01:00.000Z")).toEqual([]);
+    expect((host as any).handleIncomingMessageInner).not.toHaveBeenCalled();
+  });
+
   it("auto recovery refuses a healthy runtime; force fences locally and preserves durable work", async () => {
     const { host, router } = makeHost();
     expect(admit("9", "recover me")).toBe(true);
@@ -272,6 +314,64 @@ describe("#180 channel queue fencing", () => {
     expect(store.listConfigMutations(1)[0]?.summary).toBe("Recovered channel queue (force)");
   });
 
+  it("fences and requeues the real watcher before abort releases the old channel run", async () => {
+    const { host, router } = makeHost();
+    const blocker = deferred();
+    const dispatchEntered = deferred();
+    (host as any).channelQueues.set("100", blocker.promise);
+    (host as any).channelQueueMeta.set("100", {
+      epoch: 0,
+      queued: 1,
+      admittedAtMs: 0,
+      lastProgressAtMs: 0,
+    });
+
+    const watcher = new DispatchWatcher({
+      dataDir: dir,
+      logger: silent,
+      pollMs: 60_000,
+      onDispatch: async (spec) => {
+        dispatchEntered.resolve();
+        return (host as any).queueOnChannel(spec.target, async () => ({
+          output: "stale completion",
+          stopReason: "end_turn",
+        }));
+      },
+    });
+    (host as any).dispatchWatcher = watcher;
+    await enqueueDispatchSpec(dir, {
+      id: "d1",
+      target: "100",
+      prompt: "paid work",
+      session: "live",
+      createdUtc: "2026-09-03T00:00:00.000Z",
+    });
+    const starting = watcher.start();
+    await dispatchEntered.promise;
+    watcher.stop();
+
+    (router.abortTurn as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      const watcherWasFenced = (watcher as any).targetEpoch("100") > 0;
+      blocker.resolve();
+      // Make the old broken ordering deterministic: it terminalizes d1 before
+      // recoverTarget gets a chance to see the sole running artifact.
+      if (!watcherWasFenced) {
+        await vi.waitFor(async () => {
+          expect(await readdir(dispatchDirs(dir).done)).toContain("d1.json");
+        });
+      }
+      return "killed";
+    });
+
+    await expect(host.recoverChannel("100", "force")).resolves.toMatchObject({
+      ok: true,
+    });
+    await starting;
+    await watcher.drain();
+    expect(await readdir(dispatchDirs(dir).pending)).toContain("d1.json");
+    expect(await readdir(dispatchDirs(dir).done)).not.toContain("d1.json");
+  }, 15_000);
+
   it("reconciles a boot crash between admission and execution", async () => {
     const { host } = makeHost();
     expect(admit("8", "boot replay")).toBe(true);
@@ -287,21 +387,156 @@ describe("#180 channel queue fencing", () => {
 });
 
 describe("#180 dispatch and restart recovery", () => {
-  it("an idle per-thread cancel cannot erase a pending recovery dispatch", async () => {
+  it("/seam cancel terminalizes queued and running isolated target dispatches", async () => {
+    const record = {
+      id: "discord:100",
+      platform: "discord",
+      channelRef: "100",
+      parentRef: "10",
+      agentId: "codex",
+      acpSessionId: "",
+      repoPath: "/repo",
+      configJson: "{}",
+      namePrefix: null,
+      createdUtc: "2026-09-03T00:00:00.000Z",
+      updatedUtc: "2026-09-03T00:00:00.000Z",
+    };
+    store.upsert(record);
+    const release = deferred();
+    const isolatedEntered = deferred();
+    const calls: string[] = [];
     const watcher = new DispatchWatcher({
       dataDir: dir,
       logger: silent,
-      onDispatch: async () => ({ output: "unused", stopReason: "end_turn" }),
+      pollMs: 60_000,
+      onDispatch: async (spec) => {
+        calls.push(spec.id);
+        if (spec.id === "isolated") {
+          isolatedEntered.resolve();
+          await release.promise;
+        }
+        return { output: "late", stopReason: "end_turn" };
+      },
     });
     await enqueueDispatchSpec(dir, {
-      id: "keep-me",
+      id: "isolated",
       target: "100",
-      prompt: "replacement",
-      session: "live",
+      prompt: "isolated paid work",
+      session: "isolated",
       createdUtc: "2026-09-03T00:00:00.000Z",
     });
-    expect(await watcher.cancelRunning({ id: "__no-active-dispatch__" })).toEqual([]);
-    expect(await readdir(dispatchDirs(dir).pending)).toContain("keep-me.json");
+    await enqueueDispatchSpec(dir, {
+      id: "queued",
+      target: "100",
+      prompt: "queued next work",
+      session: "live",
+      createdUtc: "2026-09-03T00:00:01.000Z",
+    });
+    const starting = watcher.start();
+    await isolatedEntered.promise;
+    watcher.stop();
+
+    const { host, router } = (() => {
+      const host = new Orchestrator({
+        logger: silent,
+        config: {
+          DATA_DIR: dir,
+          REPOS_ROOT: "/repo",
+          TURN_TIMEOUT_SECONDS: 60,
+          channelPresets: new Map(),
+          threadPresets: new Map(),
+          bridgePresets: new Map(),
+        } as never,
+        adapter: {} as never,
+        router: {
+          isBusy: () => false,
+          abortTurn: vi.fn(async () => "idle" as const),
+          listProfiles: () => [],
+          describeConfig: () => ({}),
+        } as never,
+        store,
+        renderer: {} as never,
+      });
+      return { host, router: (host as any).router };
+    })();
+    host.setDispatchWatcher(watcher);
+    (host as any).recordFromInteraction = () => record;
+    const replies: string[] = [];
+    await (host as any).cmdCancel({
+      options: { getString: () => null, getBoolean: () => false },
+      deferReply: async () => undefined,
+      editReply: async (text: string) => void replies.push(text),
+    });
+    expect(router.abortTurn).toHaveBeenCalled();
+    release.resolve();
+    await starting;
+    await watcher.drain();
+
+    expect(calls).toEqual(["isolated"]);
+    for (const id of ["isolated", "queued"]) {
+      const done = JSON.parse(
+        await readFile(path.join(dispatchDirs(dir).done, `${id}.json`), "utf8")
+      );
+      expect(done).toMatchObject({ id, status: "failed", error: "cancelled by operator" });
+    }
+    expect(await readdir(dispatchDirs(dir).pending)).toEqual([]);
+    expect(await readdir(dispatchDirs(dir).running)).toEqual([]);
+  }, 15_000);
+
+  it("does not requeue a paid running artifact after its durable ledger becomes terminal", async () => {
+    const release = deferred();
+    const paidWorkEntered = deferred();
+    let calls = 0;
+    store.recordDelegation({
+      id: "paid",
+      kind: "handoff",
+      targetRef: "100",
+      correlationId: "paid",
+      status: "running",
+    });
+    const watcher = new DispatchWatcher({
+      dataDir: dir,
+      logger: silent,
+      pollMs: 60_000,
+      mayRecover: (id) => {
+        const row = store.getDelegation(id);
+        return !row || !DELEGATION_TERMINAL_STATUSES.includes(row.status);
+      },
+      onDispatch: async () => {
+        calls += 1;
+        paidWorkEntered.resolve();
+        await release.promise;
+        return { output: "paid result", stopReason: "end_turn" };
+      },
+    });
+    await enqueueDispatchSpec(dir, {
+      id: "paid",
+      target: "100",
+      prompt: "charge once",
+      session: "isolated",
+      createdUtc: "2026-09-03T00:00:00.000Z",
+    });
+    const starting = watcher.start();
+    await paidWorkEntered.promise;
+    watcher.stop();
+    store.updateDelegationStatus("paid", "completed");
+
+    expect(await watcher.recoverTarget("100")).toEqual([]);
+    const abandoned = JSON.parse(
+      await readFile(path.join(dispatchDirs(dir).done, "paid.json"), "utf8")
+    );
+    expect(abandoned).toMatchObject({
+      id: "paid",
+      status: "failed",
+      error: "abandoned: durable delegation ledger is terminal",
+    });
+    expect(await readdir(dispatchDirs(dir).pending)).toEqual([]);
+    expect(await readdir(dispatchDirs(dir).running)).toEqual([]);
+
+    release.resolve();
+    await starting;
+    await watcher.drain();
+    expect(calls).toBe(1);
   });
 
   it("requeues a running dispatch and ignores the late old generation result", async () => {
@@ -411,5 +646,64 @@ describe("#180 dispatch and restart recovery", () => {
 
     await (host as any).cmdBridgeRestart(interaction(true));
     expect(await readFile(path.join(dir, ".restart-pending"), "utf8")).toBe("force\n");
+  });
+
+  it("allows the established ManageGuild fallback when config-admin ids are unset", async () => {
+    const { host } = (() => {
+      const host = new Orchestrator({
+        logger: silent,
+        config: {
+          DATA_DIR: dir,
+          REPOS_ROOT: "/repo",
+          SEAM_CONFIG_ADMIN_USER_IDS: undefined,
+          DISCORD_USER_NAMES: new Map(),
+          channelPresets: new Map(),
+          threadPresets: new Map(),
+          bridgePresets: new Map(),
+        } as never,
+        adapter: {} as never,
+        router: { listProfiles: () => [], describeConfig: () => ({}) } as never,
+        store,
+        renderer: {} as never,
+      });
+      return { host };
+    })();
+    const recover = vi.fn(async () => ({
+      ok: true,
+      message: "recovered",
+      before: { state: "wedged" },
+      epoch: 1,
+    }));
+    (host as any).recoverChannel = recover;
+    const replies: string[] = [];
+    await (host as any).cmdRecover({
+      user: { id: "guild-manager", username: "manager", globalName: null },
+      member: null,
+      options: {
+        getString: (name: string) => (name === "thread" ? "100" : "auto"),
+      },
+      deferReply: async () => undefined,
+      editReply: async (text: string) => void replies.push(text),
+      reply: async ({ content }: { content: string }) => void replies.push(content),
+    });
+    expect(recover).toHaveBeenCalledWith("100", "auto", {
+      id: "guild-manager",
+      name: "manager",
+    });
+    expect(replies).toEqual(["🛠️ recovered"]);
+
+    (host as any).config.SEAM_CONFIG_ADMIN_USER_IDS = new Set(["configured-admin"]);
+    recover.mockClear();
+    replies.length = 0;
+    await (host as any).cmdRecover({
+      user: { id: "guild-manager", username: "manager", globalName: null },
+      member: null,
+      options: { getString: () => "100" },
+      deferReply: async () => undefined,
+      editReply: async (text: string) => void replies.push(text),
+      reply: async ({ content }: { content: string }) => void replies.push(content),
+    });
+    expect(recover).not.toHaveBeenCalled();
+    expect(replies).toEqual(["🔒 `/seamadmin recover` is config-admin-only."]);
   });
 });

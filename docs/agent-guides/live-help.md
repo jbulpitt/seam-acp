@@ -14,7 +14,7 @@ Do not fork the protocol.
 v1 is specified in GitHub **#98**. Spike (join / capture / Live round-trip) is
 proven. **MCP `create_live_help` / `cancel_live_help` are the product.** If they
 are **not** in your tool list yet (old process), do not invent a fence and do
-not run `/seam debug voice-*` — wait, or ask Jesse.
+not run `/seamadmin debug voice-*` — wait, or ask Jesse.
 
 ---
 
@@ -71,7 +71,7 @@ That is enough for a lesson.
   make them supply or choose an arbitrary snowflake.
 - **Not** a `seam-live` fence. Same reason as `create_ingest`: a fence taxes
   the coaching turn and is the wrong object.
-- `/seam debug voice-ping|voice-capture|voice-live` is **admin spike** in
+- `/seamadmin debug voice-ping|voice-capture|voice-live` is **admin spike** in
   pairing, not how you start a lesson.
 
 If `create_live_help` is refused, report the actual host error (for example a

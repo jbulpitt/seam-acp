@@ -140,7 +140,7 @@ Use this as a map, not as a substitute for each tool's live schema.
 - Gemini joins a voice channel for a parallel audio conversation:
   `create_live_help` / `cancel_live_help`.
 - The admin-operated Shared Voice Console that routes speech among ACP threads
-  is **Thread Voice**, controlled with `/seam voice ...`; it is not Live Help.
+  is **Thread Voice**, controlled with `/seamadmin voice ...`; it is not Live Help.
 
 ## Task-specific guides
 

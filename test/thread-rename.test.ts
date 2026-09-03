@@ -1,17 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
 import { MessageFlags } from "discord.js";
-import { buildSeamCommand } from "../packages/core/src/platforms/discord/commands.js";
+import {
+  buildSeamAdminCommand,
+  buildSeamCommand,
+} from "../packages/core/src/platforms/discord/commands.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 
 const ADMIN_ID = "admin-1";
 const ADMINS = new Set([ADMIN_ID]);
 
-describe("/seam config rename and namer surfaces", () => {
+describe("/seamadmin naming rename and namer surfaces", () => {
   it("publishes thread/channel rename, explicit legacy migration, and namer editor", () => {
-    const command = buildSeamCommand().toJSON();
-    const config = command.options?.find((option) => option.name === "config");
-    const rename = config?.options?.find((option) => option.name === "rename");
-    const namer = config?.options?.find((option) => option.name === "namer");
+    // #151 moved both leaves out of `/seam config` into `/seamadmin naming`.
+    const command = buildSeamAdminCommand().toJSON();
+    const naming = command.options?.find((option) => option.name === "naming");
+    const rename = naming?.options?.find((option) => option.name === "rename");
+    const namer = naming?.options?.find((option) => option.name === "namer");
 
     expect(rename).toBeDefined();
     expect(rename?.options?.find((option) => option.name === "scope")?.choices)
@@ -27,6 +31,26 @@ describe("/seam config rename and namer surfaces", () => {
     ]);
     expect(rename?.options?.find((option) => option.name === "role-name")?.type).toBe(5);
     expect(namer).toBeDefined();
+
+    // …and are gone from `/seam config`, so a non-admin has no path to them.
+    const seamConfig = buildSeamCommand()
+      .toJSON()
+      .options?.find((option) => option.name === "config");
+    const configLeaves = (seamConfig?.options ?? []).map((option) => option.name);
+    expect(configLeaves).not.toContain("rename");
+    expect(configLeaves).not.toContain("namer");
+  });
+
+  it("restores the descriptions #150 had to delete for the 8,000-char budget", () => {
+    const naming = buildSeamAdminCommand()
+      .toJSON()
+      .options?.find((option) => option.name === "naming");
+    const rename = naming?.options?.find((option) => option.name === "rename");
+    expect(rename?.description).toBe("Refresh/migrate names");
+    expect(rename?.options?.find((o) => o.name === "scope")?.description).toBe("Rename scope");
+    expect(rename?.options?.find((o) => o.name === "migrate-legacy")?.description).toBe(
+      "Migrate legacy prefix"
+    );
   });
 
   it("shows naming state without reapplying after core configure already ran the funnel", async () => {
@@ -195,8 +219,12 @@ describe("/seam config rename and namer surfaces", () => {
  * The gate matches `cmdNamerEditor`: an UNSET `SEAM_CONFIG_ADMIN_USER_IDS` is
  * opt-out, NOT deny-all (see config-admin-ids.test.ts), and the refusal happens
  * before `deferReply` so nothing is started for a refused caller.
+ *
+ * The leaf now lives at `/seamadmin naming rename`, whose ManageGuild default
+ * permission hides it from non-admins — but that is VISIBILITY, not authorization
+ * (a guild admin can grant the command to anyone), so this handler gate stays.
  */
-describe("/seam config rename admin gate (#151)", () => {
+describe("/seamadmin naming rename admin gate (#151/#160)", () => {
   const RENAME_REFUSAL = "Renaming threads requires a config admin.";
 
   function harness(opts: {

@@ -116,6 +116,30 @@ pm2 stop seam-acp       # stop the bot
 
 ## Slash commands
 
+The tree is split across **two** application commands (#151). Discord caps a
+single command at 8,000 characters — the sum of every name, description and
+choice value — and rejects registration of the *whole* command at boot when it
+is exceeded. `/seam` had 15 characters of headroom, so the operator half moved
+to its own command and its own fresh 8,000.
+
+- **`/seam`** — everyday user + agent surface. 8 slots: `cancel` `steer` `new`
+  `workflows` `queue`, plus the `config` (18), `info` (6) and `preset` (7) groups.
+- **`/seamadmin`** — operator surface. 8 slots: `rebuild`, plus the `schedule` (5),
+  `project` (3), `upload` (3), `bridge` (4), `debug` (6), `voice` (7) and
+  `naming` (2) groups. Registered with `default_member_permissions =
+  ManageGuild` and `contexts = [Guild]`, so it does not appear in the command
+  picker for non-admins and is unavailable in DMs.
+
+That permission is a **visibility** control, not the authorization model: every
+runtime refusal (`SEAM_CONFIG_ADMIN_USER_IDS`, the bridge/voice admin gates,
+the `naming rename` gate) is still enforced in the handler, because a guild
+admin can grant `/seamadmin` to anyone.
+
+Discord has no command aliasing, so this was a **hard cutover** — `/seam debug …`
+simply ceases to exist once the new set is registered. Moved paths:
+`/seam rebuild|schedule|project|upload|bridge|debug|voice` → `/seamadmin …`, and
+`/seam config rename|namer` → `/seamadmin naming rename|namer`.
+
 All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (where it matters) thread-scoped.
 
 | Command | What it does |
@@ -145,7 +169,16 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seam info whoami` | Show which account this thread's agent profile is signed in as (Copilot only — reads `<config-dir>/config.json`) |
 | `/seam info avatar` | Re-push the bot avatar to Discord (force re-upload) |
 | `/seam info help` | Show this list |
-| `/seam schedule` / `preset` / `project` | Recurring prompts, reusable session presets, DB-backed channel activation |
+| `/seam preset` | Reusable session presets (`list` `create` `apply` `delete` `show` `edit` `thread`) |
+| `/seamadmin rebuild [agent] [model]` | Rebuild this session from Discord thread history |
+| `/seamadmin naming rename [scope] [migrate-legacy] [role-name]` | Rebuild thread names from their identity. Admin-gated in the handler (#160) |
+| `/seamadmin naming namer` | Edit the agent / model / role symbol tables |
+| `/seamadmin schedule` | Recurring scheduled prompts (`add` `list` `remove` `toggle` `edit`) — **no attachments** since #158 |
+| `/seamadmin project` | DB-backed channel activation (`new` `list` `remove`), no redeploy |
+| `/seamadmin upload` | Host file transfer (`pull` `push` `secret`) |
+| `/seamadmin bridge` | Pair remote bridges (`add` `rotate` `list` `remove`) |
+| `/seamadmin debug` | Host debug (`tail` `exec` `status`) and the live-help voice spike |
+| `/seamadmin voice` | Shared Voice Console V2 (`start` `add` `remove` `configure` `console` `status` `stop`) |
 
 Interactive pickers use buttons for ≤15 choices (laid out across up to 3 rows of 5) and a select menu for 16–25.
 

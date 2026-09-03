@@ -1,5 +1,5 @@
 /**
- * #152 — `/seam schedule list` pagination.
+ * #152 — `/seamadmin schedule list` pagination.
  *
  * Two classes of test: the pure page math / view budget (this file's first
  * half), and the wired card — that a `sl:page:<n>` click is answered before the

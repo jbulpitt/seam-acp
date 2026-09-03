@@ -186,7 +186,7 @@ export class VoiceConsoleController
       return {
         ok: false as const,
         error: occupied.ownerUserId === request.ownerUserId
-          ? `Voice Console ${occupied.id} is already active; use /seam voice add.`
+          ? `Voice Console ${occupied.id} is already active; use /seamadmin voice add.`
           : `Voice Console ${occupied.id} already owns this guild voice lease.`,
       };
     }
@@ -1142,7 +1142,7 @@ export class VoiceConsoleController
       noticeMessageId: sent.id,
     });
     if (!updated.ok) {
-      await this.adapter.editMessage(sent, "🎛️ Voice Console notice unavailable; use `/seam voice console`.")
+      await this.adapter.editMessage(sent, "🎛️ Voice Console notice unavailable; use `/seamadmin voice console`.")
         .catch(() => undefined);
       throw new Error(updated.error);
     }

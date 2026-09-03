@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { pino } from "pino";
-import { buildSeamCommand } from "../packages/core/src/platforms/discord/commands.js";
+import { buildSeamAdminCommand } from "../packages/core/src/platforms/discord/commands.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
 import {
@@ -62,7 +62,8 @@ function schedule(over: Partial<ScheduledPrompt> = {}): ScheduledPrompt {
 // --- command registration ---------------------------------------------------
 
 describe("#158 command surface", () => {
-  const json = buildSeamCommand().toJSON() as {
+  // #151 moved the schedule group to the operator command.
+  const json = buildSeamAdminCommand().toJSON() as {
     options?: Array<{ name: string; options?: Array<{ name: string; type?: number; options?: Array<{ name: string; type?: number }> }> }>;
   };
   const group = json.options?.find((o) => o.name === "schedule");
@@ -77,12 +78,12 @@ describe("#158 command surface", () => {
     ]);
   });
 
-  it("`/seam schedule add` takes no options at all (file/file2/file3 are gone)", () => {
+  it("`/seamadmin schedule add` takes no options at all (file/file2/file3 are gone)", () => {
     const add = (group?.options ?? []).find((o) => o.name === "add");
     expect(add?.options ?? []).toEqual([]);
   });
 
-  it("no /seam schedule subcommand accepts an attachment option", () => {
+  it("no /seamadmin schedule subcommand accepts an attachment option", () => {
     const attachmentOptions = (group?.options ?? []).flatMap((sub) =>
       (sub.options ?? []).filter((o) => o.type === ATTACHMENT_OPTION_TYPE).map((o) => `${sub.name}.${o.name}`)
     );

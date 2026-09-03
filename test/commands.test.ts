@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { buildSeamCommand } from "../packages/core/src/platforms/discord/commands.js";
+import { PermissionFlagsBits, InteractionContextType } from "discord.js";
+import {
+  SEAM_ADMIN_COMMAND_NAME,
+  SEAM_COMMAND_NAME,
+  buildSeamAdminCommand,
+  buildSeamCommand,
+  buildSlashRegistrationBody,
+} from "../packages/core/src/platforms/discord/commands.js";
 
 // Discord ApplicationCommandOptionType
 const SUB_COMMAND = 1;
@@ -11,16 +18,35 @@ const BOOLEAN = 5;
 type Opt = {
   name: string;
   type: number;
+  description?: string;
   required?: boolean;
   autocomplete?: boolean;
   options?: Opt[];
   choices?: { name: string; value: string }[];
 };
 
-function built(): { options?: Opt[] } {
-  return buildSeamCommand().toJSON() as { options?: Opt[] };
-}
+type Built = {
+  name?: string;
+  options?: Opt[];
+  default_member_permissions?: string | null;
+  contexts?: number[] | null;
+  dm_permission?: boolean;
+};
 
+const seam = (): Built => buildSeamCommand().toJSON() as Built;
+const admin = (): Built => buildSeamAdminCommand().toJSON() as Built;
+
+const slot = (cmd: Built, name: string): Opt | undefined =>
+  cmd.options?.find((o) => o.name === name);
+const leafNames = (cmd: Built, group: string): string[] =>
+  (slot(cmd, group)?.options ?? []).map((o) => o.name);
+
+/**
+ * Discord counts a command's size as the sum of EVERY string in the payload —
+ * names, descriptions, and choice values across the whole tree. This mirrors
+ * that, because the failure is not graceful: over 8,000 and Discord rejects
+ * registration of the entire command at boot.
+ */
 function commandStringSize(value: unknown): number {
   if (typeof value === "string") return value.length;
   if (Array.isArray(value)) return value.reduce((sum, item) => sum + commandStringSize(item), 0);
@@ -30,81 +56,87 @@ function commandStringSize(value: unknown): number {
   return 0;
 }
 
+/** Every leaf must list required options before optional ones, or Discord
+ *  rejects the whole PUT with APPLICATION_COMMAND_OPTIONS_REQUIRED_INVALID. */
+function requiredOrderFailures(cmd: Built, label: string): string[] {
+  const failures: string[] = [];
+  const walk = (opts: Opt[] | undefined, path: string): void => {
+    if (!opts) return;
+    let seenOptional = false;
+    for (const opt of opts) {
+      if (opt.type === SUB_COMMAND || opt.type === SUB_COMMAND_GROUP) {
+        walk(opt.options, `${path}/${opt.name}`);
+        continue;
+      }
+      const required = opt.required ?? false;
+      if (required && seenOptional) {
+        failures.push(`${path}: required "${opt.name}" follows an optional option`);
+      }
+      if (!required) seenOptional = true;
+      walk(opt.options, `${path}/${opt.name}`);
+    }
+  };
+  walk(cmd.options, label);
+  return failures;
+}
+
+/** Sibling names must be unique at every level — Discord rejects duplicates. */
+function duplicateSiblings(cmd: Built, label: string): string[] {
+  const dupes: string[] = [];
+  const walk = (opts: Opt[] | undefined, path: string): void => {
+    if (!opts) return;
+    const seen = new Set<string>();
+    for (const opt of opts) {
+      if (seen.has(opt.name)) dupes.push(`${path}: duplicate "${opt.name}"`);
+      seen.add(opt.name);
+      walk(opt.options, `${path}/${opt.name}`);
+    }
+  };
+  walk(cmd.options, label);
+  return dupes;
+}
+
 // Regression guard: the whole feature build-out (workflows/steer/project/…) once
 // pushed /seam to 28 top-level options and Discord's 25-cap made the bot crash
 // at boot (registerSlashCommands -> validateMaxOptionsLength). tsc + unit tests
-// were all green because nothing exercised the real command builder. This does.
-describe("/seam slash command", () => {
+// were all green because nothing exercised the real command builder. This does —
+// and since #151 there are TWO builders, so both are exercised here.
+describe("/seam — everyday surface", () => {
   it("builds without throwing — this is exactly what registration does at boot", () => {
     expect(() => buildSeamCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 15 top-level slots (6 subcommands + 9 groups)", () => {
-    const json = built();
-    expect(json.options?.length ?? 0).toBe(15);
+  it("registers exactly 8 top-level slots (5 subcommands + 3 groups)", () => {
+    const json = seam();
+    expect(json.options?.length ?? 0).toBe(8);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
   it("stays below Discord's 8,000-character application-command limit", () => {
-    expect(commandStringSize(buildSeamCommand().toJSON())).toBeLessThanOrEqual(7_900);
+    // Was 7,885/8,000 before the split — fifteen characters of headroom, which
+    // is why #150 had to delete help text to land one option.
+    expect(commandStringSize(seam())).toBeLessThanOrEqual(7_900);
   });
 
-  it("top-level names include rebuild plus the existing commands and 9 groups", () => {
-    const names = (built().options ?? []).map((o) => o.name);
-    expect(names).toEqual([
-      "cancel",
-      "steer",
-      "new",
-      "workflows",
-      "queue",
-      "rebuild",
-      "config",
-      "info",
-      "schedule",
-      "preset",
-      "project",
-      "upload",
-      "bridge",
-      "debug",
-      "voice",
-    ]);
+  it("lists exactly the everyday top-level names — no admin verbs", () => {
+    const names = (seam().options ?? []).map((o) => o.name);
+    expect(names).toEqual(["cancel", "steer", "new", "workflows", "queue", "config", "info", "preset"]);
+    for (const moved of ["rebuild", "schedule", "project", "upload", "bridge", "debug", "voice", "naming"]) {
+      expect(names, moved).not.toContain(moved);
+    }
     expect(names).not.toContain("attach");
   });
 
-  it("voice group exposes the seven-command V2 hard cutover", () => {
-    const voice = built().options?.find((o) => o.name === "voice");
-    expect(voice?.type).toBe(SUB_COMMAND_GROUP);
-    expect((voice?.options ?? []).map((o) => o.name)).toEqual([
-      "start", "add", "remove", "configure", "console", "status", "stop",
-    ]);
-    const stop = voice?.options?.find((o) => o.name === "stop");
-    const discard = stop?.options?.find((o) => o.name === "discard-pending");
-    expect(discard?.type).toBe(BOOLEAN);
-    expect(discard?.required ?? false).toBe(false);
+  it("carries no Discord permission gate — it is the everyday surface", () => {
+    const json = seam();
+    expect(json.default_member_permissions ?? null).toBeNull();
   });
 
-  it("/seam rebuild has optional agent and model strings", () => {
-    const rebuild = built().options?.find((o) => o.name === "rebuild");
-    expect(rebuild?.type).toBe(SUB_COMMAND);
-    expect((rebuild?.options ?? []).map((o) => o.name)).toEqual(["agent", "model"]);
-    for (const option of rebuild?.options ?? []) {
-      expect(option.type).toBe(STRING);
-      expect(option.required ?? false).toBe(false);
-    }
-  });
-
-  it("each group stays within Discord's 25-option-per-group cap", () => {
-    for (const opt of built().options ?? []) {
-      if (opt.type === SUB_COMMAND_GROUP) {
-        expect(opt.options?.length ?? 0, opt.name).toBeLessThanOrEqual(25);
-      }
-    }
-  });
-
-  it("config group has the 20 config leaves including role, rename, and namer", () => {
-    const config = built().options?.find((o) => o.name === "config");
+  it("config group has 18 leaves — rename and namer moved to /seamadmin naming", () => {
+    const json = seam();
+    const config = slot(json, "config");
     expect(config?.type).toBe(SUB_COMMAND_GROUP);
-    const names = (config?.options ?? []).map((o) => o.name);
+    const names = leafNames(json, "config");
     expect(names).toEqual([
       "model",
       "effort",
@@ -124,157 +156,112 @@ describe("/seam slash command", () => {
       "edit",
       "set",
       "audit",
-      "rename",
-      "namer",
     ]);
-    expect(names).toHaveLength(20);
-    const gif = (config?.options ?? []).find((o) => o.name === "gif");
+    expect(names).toHaveLength(18);
+    expect(names).not.toContain("rename");
+    expect(names).not.toContain("namer");
+
+    const gif = config?.options?.find((o) => o.name === "gif");
     expect(gif?.options?.find((o) => o.name === "state")?.required ?? false).toBe(false);
-    const detach = (config?.options ?? []).find((o) => o.name === "detach");
+    const detach = config?.options?.find((o) => o.name === "detach");
     const state = detach?.options?.find((o) => o.name === "state");
     expect(state?.type).toBe(STRING);
     expect(state?.required).toBe(true);
-    const tts = (config?.options ?? []).find((o) => o.name === "tts");
-    const ttsState = tts?.options?.find((o) => o.name === "state");
-    expect(ttsState?.type).toBe(STRING);
-    expect(ttsState?.required ?? false).toBe(false);
-    const ttsVoice = tts?.options?.find((o) => o.name === "voice");
-    expect(ttsVoice?.type).toBe(STRING);
-    expect(ttsVoice?.required ?? false).toBe(false);
-    expect(ttsVoice?.autocomplete).toBe(true);
+    const tts = config?.options?.find((o) => o.name === "tts");
     expect((tts?.options ?? []).map((o) => o.name)).toEqual(["state", "voice", "pace", "style"]);
-    const repo = (config?.options ?? []).find((o) => o.name === "repo");
+    const ttsVoice = tts?.options?.find((o) => o.name === "voice");
+    expect(ttsVoice?.autocomplete).toBe(true);
+    const repo = config?.options?.find((o) => o.name === "repo");
     expect((repo?.options ?? []).map((o) => o.name)).toEqual(["path", "scope"]);
-    const repoScope = repo?.options?.find((o) => o.name === "scope");
-    expect(repoScope?.type).toBe(STRING);
-    expect(repoScope?.required ?? false).toBe(false);
-    expect(repoScope?.choices?.map((c) => c.value)).toEqual(["session", "thread", "channel"]);
-    const card = (config?.options ?? []).find((o) => o.name === "card");
-    expect((card?.options ?? []).map((o) => o.name)).toEqual(["style", "scope"]);
-    const scope = card?.options?.find((o) => o.name === "scope");
-    expect(scope?.type).toBe(STRING);
-    expect(scope?.required ?? false).toBe(false);
-    expect(scope?.choices?.map((c) => c.value)).toEqual(["session", "thread", "channel"]);
-  });
-
-  it("info group has 6 leaves (sessions/repos moved in; config-audit moved out)", () => {
-    const info = built().options?.find((o) => o.name === "info");
-    expect(info?.type).toBe(SUB_COMMAND_GROUP);
-    const names = (info?.options ?? []).map((o) => o.name);
-    expect(names).toEqual(["whoami", "usage", "avatar", "help", "sessions", "repos"]);
-    expect(names).toHaveLength(6);
-    expect(names).not.toContain("config-audit");
-  });
-
-  it("bridge group has add/rotate/list/remove; debug has tail/exec/status/voice-ping/voice-capture/voice-live", () => {
-    const json = built();
-    const bridge = json.options?.find((o) => o.name === "bridge");
-    expect(bridge?.type).toBe(SUB_COMMAND_GROUP);
-    expect((bridge?.options ?? []).map((o) => o.name)).toEqual(["add", "rotate", "list", "remove"]);
-    const debug = json.options?.find((o) => o.name === "debug");
-    expect(debug?.type).toBe(SUB_COMMAND_GROUP);
-    expect((debug?.options ?? []).map((o) => o.name)).toEqual([
-      "tail",
-      "exec",
-      "status",
-      "voice-ping",
-      "voice-capture",
-      "voice-live",
+    expect(repo?.options?.find((o) => o.name === "scope")?.choices?.map((c) => c.value)).toEqual([
+      "session",
+      "thread",
+      "channel",
     ]);
-    const add = (bridge?.options ?? []).find((o) => o.name === "add");
-    const addNames = (add?.options ?? []).map((o) => o.name);
-    expect(addNames[0]).toBe("name");
-    expect(add?.options?.[0]?.required).toBe(true);
+    const card = config?.options?.find((o) => o.name === "card");
+    expect((card?.options ?? []).map((o) => o.name)).toEqual(["style", "scope"]);
+    expect(card?.options?.find((o) => o.name === "scope")?.choices?.map((c) => c.value)).toEqual([
+      "session",
+      "thread",
+      "channel",
+    ]);
   });
 
-  it("schedule/project group sizes are unchanged; preset has thread; upload has pull/push/secret", () => {
-    const json = built();
-    const count = (name: string) =>
-      json.options?.find((o) => o.name === name)?.options?.length ?? 0;
-    // 5 since #158 removed addfile/removefile.
-    expect(count("schedule")).toBe(5);
-    expect(count("preset")).toBe(7);
-    expect(count("project")).toBe(3);
-    const upload = json.options?.find((o) => o.name === "upload");
-    expect(upload?.type).toBe(SUB_COMMAND_GROUP);
-    expect((upload?.options ?? []).map((o) => o.name)).toEqual(["pull", "push", "secret"]);
+  it("info group has 6 leaves", () => {
+    const json = seam();
+    expect(slot(json, "info")?.type).toBe(SUB_COMMAND_GROUP);
+    expect(leafNames(json, "info")).toEqual([
+      "whoami",
+      "usage",
+      "avatar",
+      "help",
+      "sessions",
+      "repos",
+    ]);
   });
 
-  it("/seam preset thread has required preset first, optional name second", () => {
-    const preset = built().options?.find((o) => o.name === "preset");
-    expect(preset?.type).toBe(SUB_COMMAND_GROUP);
-    const names = (preset?.options ?? []).map((o) => o.name);
-    expect(names).toEqual(["list", "create", "apply", "delete", "show", "edit", "thread"]);
-    const thread = (preset?.options ?? []).find((o) => o.name === "thread");
+  it("preset thread has required preset first, optional name second", () => {
+    const json = seam();
+    expect(slot(json, "preset")?.type).toBe(SUB_COMMAND_GROUP);
+    expect(leafNames(json, "preset")).toEqual([
+      "list",
+      "create",
+      "apply",
+      "delete",
+      "show",
+      "edit",
+      "thread",
+    ]);
+    const preset = slot(json, "preset");
+    const thread = preset?.options?.find((o) => o.name === "thread");
     const opts = thread?.options ?? [];
     expect(opts.map((o) => o.name)).toEqual(["preset", "name", "quantity"]);
-    expect(opts[0]?.type).toBe(STRING);
     expect(opts[0]?.required).toBe(true);
     expect(opts[0]?.autocomplete).toBe(true);
-    expect(opts[1]?.type).toBe(STRING);
     expect(opts[1]?.required ?? false).toBe(false);
-    expect(opts[1]?.autocomplete ?? false).toBe(false);
     expect(opts[2]?.type).toBe(INTEGER);
-    expect(opts[2]?.required ?? false).toBe(false);
     expect((opts[2] as Opt & { min_value?: number }).min_value).toBe(1);
-    expect((opts[2] as Opt & { max_value?: number }).max_value).toBeUndefined();
     for (const leaf of ["apply", "delete", "show", "edit"]) {
-      const sub = (preset?.options ?? []).find((o) => o.name === leaf);
-      const nameOpt = (sub?.options ?? []).find((o) => o.name === "name");
+      const sub = preset?.options?.find((o) => o.name === leaf);
+      const nameOpt = sub?.options?.find((o) => o.name === "name");
       expect(nameOpt?.required, leaf).toBe(true);
       expect(nameOpt?.autocomplete, leaf).toBe(true);
     }
-    const create = (preset?.options ?? []).find((o) => o.name === "create");
-    expect((create?.options ?? []).find((o) => o.name === "name")).toBeUndefined();
+    expect(preset?.options?.find((o) => o.name === "create")?.options?.find((o) => o.name === "name"))
+      .toBeUndefined();
   });
 
-  it("removed image/abort/kill and old top-level config leaves", () => {
-    const top = new Set((built().options ?? []).map((o) => o.name));
-    for (const gone of [
-      "image",
-      "abort",
-      "kill",
-      "attach",
-      "model",
-      "effort",
-      "agent",
-      "mode",
-      "repo",
-      "tools",
-      "approve",
-      "reset",
-      "init",
-      "config-set",
-      "sessions",
-      "repos",
-    ]) {
-      expect(top.has(gone), gone).toBe(false);
-    }
-    // `config` remains, but as a GROUP not a leaf
-    expect(built().options?.find((o) => o.name === "config")?.type).toBe(SUB_COMMAND_GROUP);
+  it("cancel absorbs abort+kill via force/scope options, not new keywords", () => {
+    const cancel = slot(seam(), "cancel");
+    expect(cancel?.type).toBe(SUB_COMMAND);
+    expect(cancel?.options?.find((o) => o.name === "force")?.type).toBe(BOOLEAN);
+    expect(cancel?.options?.find((o) => o.name === "scope")?.type).toBe(STRING);
   });
 
-  // #63: the human-inbox two-tier lives as an OPTION on the existing `steer`
-  // subcommand (options are free — they don't count toward the 25), so adding it
-  // must NOT introduce a new top-level command and must leave the cap green.
-  it("adds `now` as an option on `steer` — not a new top-level command", () => {
-    const json = built();
-    const steer = json.options?.find((o) => o.name === "steer");
+  // #63: the human-inbox two-tier lives as an OPTION on `steer` (options are
+  // free — they don't count toward the 25), so it must not add a top-level slot.
+  it("steer lists required prompt before optional thread/now", () => {
+    const steer = slot(seam(), "steer");
     expect(steer?.type).toBe(SUB_COMMAND);
-    const now = steer?.options?.find((o) => o.name === "now");
-    expect(now).toBeTruthy();
-    expect(now?.type).toBe(BOOLEAN);
-    expect(now?.required ?? false).toBe(false);
-    const thread = steer?.options?.find((o) => o.name === "thread");
-    expect(thread?.type).toBe(STRING);
-    expect(thread?.required ?? false).toBe(false);
-    expect(thread?.autocomplete).toBe(true);
+    expect((steer?.options ?? []).map((o) => o.name)).toEqual(["prompt", "thread", "now"]);
+    expect(steer?.options?.[0]?.required).toBe(true);
+    expect(steer?.options?.[1]?.required ?? false).toBe(false);
+    expect(steer?.options?.[1]?.autocomplete).toBe(true);
+    expect(steer?.options?.[2]?.type).toBe(BOOLEAN);
+    expect(steer?.options?.[2]?.required ?? false).toBe(false);
+  });
+
+  it("queue is a top-level subcommand with required prompt (#89)", () => {
+    const queue = slot(seam(), "queue");
+    expect(queue?.type).toBe(SUB_COMMAND);
+    expect((queue?.options ?? []).map((o) => o.name)).toEqual(["prompt"]);
+    expect(queue?.options?.[0]?.required).toBe(true);
   });
 
   it("enables autocomplete on bounded free-form ids (not on enum addChoices)", () => {
-    const json = built();
-    const config = json.options?.find((o) => o.name === "config");
-    const cfg = (name: string) => (config?.options ?? []).find((o) => o.name === name);
+    const json = seam();
+    const config = slot(json, "config");
+    const cfg = (name: string) => config?.options?.find((o) => o.name === name);
     expect(cfg("model")?.options?.find((o) => o.name === "id")?.autocomplete).toBe(true);
     expect(cfg("agent")?.options?.find((o) => o.name === "id")?.autocomplete).toBe(true);
     expect(cfg("mode")?.options?.find((o) => o.name === "id")?.autocomplete).toBe(true);
@@ -282,74 +269,191 @@ describe("/seam slash command", () => {
     expect(cfg("effort")?.options?.find((o) => o.name === "level")?.autocomplete ?? false).toBe(false);
     expect(cfg("repo")?.options?.find((o) => o.name === "scope")?.autocomplete ?? false).toBe(false);
 
-    const schedule = json.options?.find((o) => o.name === "schedule");
-    for (const leaf of ["remove", "toggle", "edit"]) {
-      const sub = (schedule?.options ?? []).find((o) => o.name === leaf);
-      expect(sub?.options?.find((o) => o.name === "id")?.autocomplete, leaf).toBe(true);
-    }
-
-    const workflows = json.options?.find((o) => o.name === "workflows");
+    const workflows = slot(json, "workflows");
     for (const name of ["cancel-wake", "cancel-watch", "cancel-choice", "cancel-ingest", "cancel-live"]) {
       expect(workflows?.options?.find((o) => o.name === name)?.autocomplete, name).toBe(true);
     }
   });
 
   it("config repo path is optional so omitting it opens the picker", () => {
-    const config = built().options?.find((o) => o.name === "config");
-    const repo = (config?.options ?? []).find((o) => o.name === "repo");
-    const pathOpt = repo?.options?.find((o) => o.name === "path");
-    expect(pathOpt?.type).toBe(STRING);
-    expect(pathOpt?.required ?? false).toBe(false);
+    const repo = slot(seam(), "config")?.options?.find((o) => o.name === "repo");
+    expect(repo?.options?.find((o) => o.name === "path")?.required ?? false).toBe(false);
   });
 
-  it("queue is a top-level subcommand with required prompt (#89)", () => {
-    const queue = built().options?.find((o) => o.name === "queue");
-    expect(queue?.type).toBe(SUB_COMMAND);
-    const names = (queue?.options ?? []).map((o) => o.name);
-    expect(names).toEqual(["prompt"]);
-    expect(queue?.options?.[0]?.required).toBe(true);
-    expect(queue?.options?.[0]?.type).toBe(STRING);
+  it("removed image/abort/kill and old top-level config leaves", () => {
+    const top = new Set((seam().options ?? []).map((o) => o.name));
+    for (const gone of [
+      "image", "abort", "kill", "attach", "model", "effort", "agent", "mode",
+      "repo", "tools", "approve", "reset", "init", "config-set", "sessions", "repos",
+    ]) {
+      expect(top.has(gone), gone).toBe(false);
+    }
+    expect(slot(seam(), "config")?.type).toBe(SUB_COMMAND_GROUP);
+  });
+});
+
+describe("/seamadmin — operator surface (#151)", () => {
+  it("builds without throwing — registration does this at boot too", () => {
+    expect(() => buildSeamAdminCommand().toJSON()).not.toThrow();
   });
 
-  it("steer lists required prompt before optional thread/now (Discord option order)", () => {
-    const steer = built().options?.find((o) => o.name === "steer");
-    const names = (steer?.options ?? []).map((o) => o.name);
-    expect(names).toEqual(["prompt", "thread", "now"]);
-    expect(steer?.options?.[0]?.required).toBe(true);
-    expect(steer?.options?.[1]?.required ?? false).toBe(false);
-    expect(steer?.options?.[2]?.required ?? false).toBe(false);
+  it("registers exactly 8 top-level slots (1 subcommand + 7 groups)", () => {
+    const json = admin();
+    expect(json.options?.length ?? 0).toBe(8);
+    expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
-  it("every leaf keeps required options before optional ones", () => {
-    const failures: string[] = [];
-    const walk = (opts: Opt[] | undefined, path: string): void => {
-      if (!opts) return;
-      let seenOptional = false;
-      for (const opt of opts) {
-        if (opt.type === SUB_COMMAND || opt.type === SUB_COMMAND_GROUP) {
-          walk(opt.options, `${path}/${opt.name}`);
-          continue;
+  it("gets its own fresh 8,000-character budget — the entire point of the split", () => {
+    expect(commandStringSize(admin())).toBeLessThanOrEqual(7_900);
+  });
+
+  it("lists exactly the operator slots", () => {
+    expect((admin().options ?? []).map((o) => o.name)).toEqual([
+      "rebuild",
+      "schedule",
+      "project",
+      "upload",
+      "bridge",
+      "debug",
+      "voice",
+      "naming",
+    ]);
+  });
+
+  it("declares the exact ManageGuild permission and Guild-only context", () => {
+    const json = admin();
+    // Serialized as a decimal STRING bitfield, not a number — assert the exact
+    // value so a widened permission (or a dropped one) fails loudly.
+    expect(json.default_member_permissions).toBe(String(PermissionFlagsBits.ManageGuild));
+    expect(json.default_member_permissions).toBe("32");
+    // setContexts, NOT the deprecated setDMPermission.
+    expect(json.contexts).toEqual([InteractionContextType.Guild]);
+    expect(json.contexts).toEqual([0]);
+    expect(json.dm_permission).toBeUndefined();
+  });
+
+  it("naming group wraps rename + namer with the descriptions #150 deleted", () => {
+    const json = admin();
+    expect(slot(json, "naming")?.type).toBe(SUB_COMMAND_GROUP);
+    expect(leafNames(json, "naming")).toEqual(["rename", "namer"]);
+    const rename = slot(json, "naming")?.options?.find((o) => o.name === "rename");
+    expect(rename?.description).toBe("Refresh/migrate names");
+    expect(rename?.options?.map((o) => o.name)).toEqual(["scope", "migrate-legacy", "role-name"]);
+    expect(rename?.options?.find((o) => o.name === "scope")?.description).toBe("Rename scope");
+    expect(rename?.options?.find((o) => o.name === "migrate-legacy")?.description).toBe(
+      "Migrate legacy prefix"
+    );
+    expect(rename?.options?.find((o) => o.name === "migrate-legacy")?.type).toBe(BOOLEAN);
+    expect(rename?.options?.find((o) => o.name === "role-name")?.type).toBe(BOOLEAN);
+  });
+
+  it("schedule has 5 leaves — addfile/removefile removed by #158", () => {
+    expect(leafNames(admin(), "schedule")).toEqual([
+      "add",
+      "list",
+      "remove",
+      "toggle",
+      "edit",
+    ]);
+  });
+
+  it("keeps schedule-id autocomplete working from its new /seamadmin home", () => {
+    const schedule = slot(admin(), "schedule");
+    for (const leaf of ["remove", "toggle", "edit"]) {
+      const sub = schedule?.options?.find((o) => o.name === leaf);
+      const id = sub?.options?.find((o) => o.name === "id");
+      expect(id?.type, leaf).toBe(STRING);
+      expect(id?.required, leaf).toBe(true);
+      expect(id?.autocomplete, leaf).toBe(true);
+    }
+  });
+
+  it("project/upload/bridge/debug/voice keep their leaves", () => {
+    const json = admin();
+    expect(leafNames(json, "project")).toEqual(["new", "list", "remove"]);
+    expect(leafNames(json, "upload")).toEqual(["pull", "push", "secret"]);
+    expect(leafNames(json, "bridge")).toEqual(["add", "rotate", "list", "remove"]);
+    expect(leafNames(json, "debug")).toEqual([
+      "tail",
+      "exec",
+      "status",
+      "voice-ping",
+      "voice-capture",
+      "voice-live",
+    ]);
+    expect(leafNames(json, "voice")).toEqual([
+      "start",
+      "add",
+      "remove",
+      "configure",
+      "console",
+      "status",
+      "stop",
+    ]);
+    const stop = slot(json, "voice")?.options?.find((o) => o.name === "stop");
+    const discard = stop?.options?.find((o) => o.name === "discard-pending");
+    expect(discard?.type).toBe(BOOLEAN);
+    expect(discard?.required ?? false).toBe(false);
+    const bridgeAdd = slot(json, "bridge")?.options?.find((o) => o.name === "add");
+    expect(bridgeAdd?.options?.[0]?.name).toBe("name");
+    expect(bridgeAdd?.options?.[0]?.required).toBe(true);
+  });
+
+  it("rebuild stays a top-level subcommand with optional agent and model", () => {
+    const rebuild = slot(admin(), "rebuild");
+    expect(rebuild?.type).toBe(SUB_COMMAND);
+    expect((rebuild?.options ?? []).map((o) => o.name)).toEqual(["agent", "model"]);
+    for (const option of rebuild?.options ?? []) {
+      expect(option.type).toBe(STRING);
+      expect(option.required ?? false).toBe(false);
+    }
+  });
+});
+
+describe("the split as a whole", () => {
+  it("registers BOTH commands — a body missing one silently unregisters it", () => {
+    // Discord replaces the full command set on PUT, so shipping only /seam here
+    // would delete /seamadmin from the guild.
+    const body = buildSlashRegistrationBody();
+    expect(body.map((c) => c.name)).toEqual([SEAM_COMMAND_NAME, SEAM_ADMIN_COMMAND_NAME]);
+    expect(body.map((c) => c.name)).toEqual(["seam", "seamadmin"]);
+    expect(body).toHaveLength(2);
+  });
+
+  it("has no overlapping top-level names across the two commands", () => {
+    const a = new Set((seam().options ?? []).map((o) => o.name));
+    const overlap = (admin().options ?? []).map((o) => o.name).filter((n) => a.has(n));
+    expect(overlap).toEqual([]);
+  });
+
+  it("has no duplicate sibling names anywhere in either tree", () => {
+    expect(duplicateSiblings(seam(), "/seam")).toEqual([]);
+    expect(duplicateSiblings(admin(), "/seamadmin")).toEqual([]);
+  });
+
+  it("keeps required options before optional ones in every leaf of both trees", () => {
+    expect(requiredOrderFailures(seam(), "/seam")).toEqual([]);
+    expect(requiredOrderFailures(admin(), "/seamadmin")).toEqual([]);
+  });
+
+  it("keeps every group within Discord's 25-option-per-group cap", () => {
+    for (const cmd of [seam(), admin()]) {
+      for (const opt of cmd.options ?? []) {
+        if (opt.type === SUB_COMMAND_GROUP) {
+          expect(opt.options?.length ?? 0, `${cmd.name}/${opt.name}`).toBeLessThanOrEqual(25);
         }
-        const required = opt.required ?? false;
-        if (required && seenOptional) {
-          failures.push(`${path}: required "${opt.name}" follows an optional option`);
-        }
-        if (!required) seenOptional = true;
-        walk(opt.options, `${path}/${opt.name}`);
       }
-    };
-    walk(built().options, "/seam");
-    expect(failures).toEqual([]);
+    }
   });
 
-  it("cancel absorbs abort+kill via force/scope options, not new keywords", () => {
-    const cancel = built().options?.find((o) => o.name === "cancel");
-    expect(cancel?.type).toBe(SUB_COMMAND);
-    const force = cancel?.options?.find((o) => o.name === "force");
-    const scope = cancel?.options?.find((o) => o.name === "scope");
-    expect(force?.type).toBe(BOOLEAN);
-    expect(force?.required ?? false).toBe(false);
-    expect(scope?.type).toBe(STRING);
-    expect(scope?.required ?? false).toBe(false);
+  it("moved every operator verb — none is reachable from /seam any more", () => {
+    const seamTop = new Set((seam().options ?? []).map((o) => o.name));
+    const adminTop = new Set((admin().options ?? []).map((o) => o.name));
+    for (const moved of [
+      "rebuild", "schedule", "project", "upload", "bridge", "debug", "voice", "naming",
+    ]) {
+      expect(seamTop.has(moved), `/seam still has ${moved}`).toBe(false);
+      expect(adminTop.has(moved), `/seamadmin is missing ${moved}`).toBe(true);
+    }
   });
 });

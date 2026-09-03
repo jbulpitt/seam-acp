@@ -11,7 +11,14 @@ import {
   tokenAutocompleteChoices,
   DISCORD_AUTOCOMPLETE_MAX,
 } from "../packages/core/src/platforms/discord/autocomplete.js";
-import { classifyDiscordInteraction } from "../packages/core/src/platforms/discord/adapter.js";
+import {
+  classifyDiscordInteraction,
+  isSeamCommandName,
+} from "../packages/core/src/platforms/discord/adapter.js";
+import {
+  SEAM_ADMIN_COMMAND_NAME,
+  SEAM_COMMAND_NAME,
+} from "../packages/core/src/platforms/discord/commands.js";
 import { CHOICE_CUSTOM_ID_PREFIX } from "../packages/core/src/core/choice/types.js";
 
 describe("AutocompleteRegistry", () => {
@@ -326,5 +333,45 @@ describe("classifyDiscordInteraction — autocomplete is a parallel branch", () 
         commandName: "seam",
       })
     ).toBe("slash");
+  });
+
+  /**
+   * #151 split the tree into `/seam` + `/seamadmin`. The classifier is the
+   * single chokepoint for BOTH routes, and missing either one fails silently:
+   *   - miss the chat-input branch → every operator verb (schedule, upload,
+   *     bridge, debug, voice, project, rebuild, naming) does nothing at all;
+   *   - miss the autocomplete branch → the schedule-id / bridge-name / voice
+   *     pickers return empty with no error logged anywhere.
+   * Neither shows up in a build or a handler test, so it is locked here.
+   */
+  it("routes /seamadmin chat-input to slash", () => {
+    expect(classifyDiscordInteraction(flags({ chat: true, commandName: "seamadmin" }))).toBe(
+      "slash"
+    );
+  });
+
+  it("routes /seamadmin autocomplete to autocomplete", () => {
+    expect(
+      classifyDiscordInteraction(flags({ autocomplete: true, commandName: "seamadmin" }))
+    ).toBe("autocomplete");
+  });
+
+  it("recognises both command names and nothing else", () => {
+    expect(isSeamCommandName(SEAM_COMMAND_NAME)).toBe(true);
+    expect(isSeamCommandName(SEAM_ADMIN_COMMAND_NAME)).toBe(true);
+    expect(isSeamCommandName("seam")).toBe(true);
+    expect(isSeamCommandName("seamadmin")).toBe(true);
+    for (const other of ["seams", "seamadmin2", "admin", "ping", "", undefined]) {
+      expect(isSeamCommandName(other), String(other)).toBe(false);
+    }
+  });
+
+  it("does not route a look-alike command name", () => {
+    expect(
+      classifyDiscordInteraction(flags({ autocomplete: true, commandName: "seamadmin-x" }))
+    ).toBe("none");
+    expect(classifyDiscordInteraction(flags({ chat: true, commandName: "seamadmin-x" }))).toBe(
+      "none"
+    );
   });
 });

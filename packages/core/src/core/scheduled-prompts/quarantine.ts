@@ -9,7 +9,7 @@
  * we refuse: the row is QUARANTINED — never armed, never fired — until an
  * operator revises it.
  *
- * Revising means editing the schedule (the `/seam schedule` builder card, or a
+ * Revising means editing the schedule (the `/seamadmin schedule` builder card, or a
  * `config_propose` schedule update) so the prompt points at a repository
  * runbook instead. That write clears the legacy manifest and lifts the
  * quarantine. The bytes under `data/scheduled-attachments/<id>/` are never

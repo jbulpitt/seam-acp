@@ -66,7 +66,7 @@ export function normalizePublicBridgeWsUrl(raw: string): string {
 }
 
 /**
- * Public WS URL handed to `/seam bridge add` bootstrap.
+ * Public WS URL handed to `/seamadmin bridge add` bootstrap.
  * Prefer a permanent `SEAM_BRIDGE_PUBLIC_URL`, then the quick-tunnel file,
  * then loopback health (only useful on the same host).
  */

@@ -1,5 +1,5 @@
 /**
- * `/seam schedule list` pagination (#152).
+ * `/seamadmin schedule list` pagination (#152).
  *
  * The listing rendered every schedule into one embed with controls for the
  * first five. That is two bugs in one card: a channel with twenty schedules

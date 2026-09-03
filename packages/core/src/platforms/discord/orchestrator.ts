@@ -295,6 +295,7 @@ import {
   describeFastModeOutcome,
   fastModeAgentRefusal,
   fastModeEnvRefusal,
+  fastModeRetirementFailure,
   isFastModeDisabledByEnv,
   settleFastMode,
 } from "../../core/fast-mode.js";
@@ -11355,6 +11356,9 @@ export class Orchestrator {
     // persisted against a session that never offered it.
     let fastRefusal: string | undefined;
     let retireUnverifiedSession = false;
+    // Set when a possibly-Fast session could NOT be discarded — the card must
+    // not read like an ordinary successful save.
+    let fastRetireFailed = false;
     const fastNeedsFreshSession = fastModeWillResetSession(draft);
     if (fastNeedsFreshSession) {
       const bound = this.store.getByChannel(PLATFORM, draft.threadId);
@@ -11407,14 +11411,23 @@ export class Orchestrator {
               // Never observed landing on `off`, so this session may actually be
               // serving (and billing) Fast. Throw it away — it was just forged
               // and holds no user context; the next turn starts clean.
-              await this.router
-                .invalidate(bound.id, { clearAcpSession: true, clearStartFailure: true })
-                .catch((err) =>
-                  this.logger.warn(
-                    { err, threadId: draft.threadId },
-                    "could not retire unverified fast-mode session"
-                  )
+              try {
+                await this.router.invalidate(bound.id, {
+                  clearAcpSession: true,
+                  clearStartFailure: true,
+                });
+              } catch (err) {
+                // Log-only here would render a calm "Saved · Fast off" card over
+                // a session that may still be billing. Escalate it instead.
+                this.logger.error(
+                  { err, threadId: draft.threadId },
+                  "could not retire unverified fast-mode session"
                 );
+                fastRefusal = fastModeRetirementFailure(
+                  err instanceof Error ? err.message : String(err)
+                );
+                fastRetireFailed = true;
+              }
             }
           }
         }
@@ -11446,13 +11459,27 @@ export class Orchestrator {
     // (#37 Fast is the one exception, handled above — it MUST reset the session.)
     this.configEditor.delete(draft.id);
     if (draft.messageId) {
-      await this.editConfigEditorCard(evt.channel, draft.messageId, renderSavedHub(draft));
+      const savedPanel = renderSavedHub(draft);
+      await this.editConfigEditorCard(
+        evt.channel,
+        draft.messageId,
+        fastRetireFailed
+          ? {
+              ...savedPanel,
+              color: 0xed4245,
+              footer:
+                "🚨 Saved, but a session that may be serving Fast could not be " +
+                "discarded — run `/seam config reset` before the next turn.",
+            }
+          : savedPanel
+      );
     }
     // #37: say plainly that Fast did NOT take, right after the card that now
     // (correctly) reads `off`. Silence here would be the false confirmation the
     // whole feature is designed to avoid.
     if (fastRefusal) {
-      await evt.followUpEphemeral(`⚡ ${fastRefusal}`).catch(() => {});
+      await evt.followUpEphemeral(fastRetireFailed ? fastRefusal : `⚡ ${fastRefusal}`)
+        .catch(() => {});
     }
   }
 

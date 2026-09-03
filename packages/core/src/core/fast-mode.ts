@@ -117,6 +117,21 @@ export function fastModeUnsupportedRefusal(
   );
 }
 
+/**
+ * The one thing worse than an unverified Fast session is an unverified Fast
+ * session we FAILED to discard: it may still be serving and billing Fast while
+ * every surface reads `off`. That is never a success — it is a critical,
+ * user-visible condition with a concrete recovery action.
+ */
+export function fastModeRetirementFailure(detail: string): string {
+  return (
+    `🚨 Fast mode was rolled back, but the session it may have enabled could NOT ` +
+    `be discarded (${detail}). That session may still be serving — and billing — ` +
+    `Fast mode even though this thread now reads "off". Run \`/seam config reset\` ` +
+    `in that thread to force a clean session before sending another turn.`
+  );
+}
+
 /** Canonical `on` / `off` label used by every Fast surface. */
 export function fastModeLabel(value: boolean | null | undefined): string {
   if (value === null || value === undefined) return "unknown";

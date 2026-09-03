@@ -11,6 +11,7 @@ import {
   FAST_MODE_ON,
   checkFastModeEligibility,
   fastModeNeedsFreshSession,
+  fastModeRetirementFailure,
   settleFastMode,
   type FastModeOutcome,
 } from "./fast-mode.js";
@@ -620,10 +621,19 @@ export class ThreadSessionControlService {
           // it: it was just forged, holds no user context, and the next turn
           // starts clean with Fast off. Claiming it "is not Fast" without
           // observing that is the exact false confirmation this feature bans.
-          await this.deps.router
-            .invalidate(target.id, { clearAcpSession: true })
-            .catch(() => {});
-          retiredUnverifiedSession = true;
+          try {
+            await this.deps.router.invalidate(target.id, { clearAcpSession: true });
+            retiredUnverifiedSession = true;
+          } catch (err) {
+            // Swallowing this would return a cheerful "Fast: off" while a
+            // possibly-billing session stays live. Fail the whole call instead.
+            return {
+              ok: false,
+              error: fastModeRetirementFailure(
+                err instanceof Error ? err.message : String(err)
+              ),
+            };
+          }
         }
       } else {
         warnings.push(FAST_MODE_COST_WARNING);

@@ -885,7 +885,12 @@ function ctrlHarness(opts: {
     router: {
       describeConfig,
       getProfile: (id) => byId.get(id),
-      invalidate: async (id) => { invalidated.push(id); },
+      invalidate: async (id) => {
+        invalidated.push(id);
+        if (opts.failRetire && invalidated.length > 1) {
+          throw new Error("runtime stuck");
+        }
+      },
       getOrStartRuntime: async (value) => {
         const current = records.get(value.id) ?? value;
         const sessionId = current.acpSessionId || "session-fresh";
@@ -1127,6 +1132,9 @@ function saveHarness(opts: {
     router: {
       invalidate: async (id: string, o: unknown) => {
         invalidated.push({ id, opts: o });
+        if (opts.failRetire && invalidated.length > 1) {
+          throw new Error("runtime stuck");
+        }
         rec.acpSessionId = "";
       },
       getOrStartRuntime: async () => {
@@ -1362,5 +1370,42 @@ describe("#37 — an unverifiable enable retires the session it may have enabled
     expect(h.fastPresetNow()).toBe(false);
     expect(h.invalidated).toHaveLength(1);
     expect(h.ephemerals.join(" ")).not.toMatch(/discarded/);
+  });
+});
+
+describe("#37 — a FAILED retirement is critical, never a quiet success", () => {
+  it("configure_thread fails the whole call with a recovery action", async () => {
+    const h = ctrlHarness({ appliedOverride: null, failRetire: true });
+    const res = await h.service.configure(h.caller, h.target, { fastMode: true });
+    // Not `ok: true` with "Fast: off" — a possibly-billing session is still live.
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.error).toMatch(/could NOT\s+be discarded/);
+    expect(res.error).toMatch(/may still be serving — and billing — Fast/);
+    expect(res.error).toMatch(/\/seam config reset/);
+    // The rollback itself still happened, so the persisted flag is honest.
+    expect(h.fastPresetNow()).toBe(false);
+  });
+
+  it("the config-edit Save marks the card critical instead of a calm Saved", async () => {
+    const h = saveHarness({ appliedOverride: null, failRetire: true });
+    await h.run(applyPickerValue(draft(), "fast", FAST_MODE_ON, caps));
+    expect(h.fastPresetNow()).toBe(false);
+    const card = h.editedPanels.at(-1)!.panel;
+    expect(card.color).toBe(0xed4245);
+    expect(card.footer).toMatch(/🚨/);
+    expect(card.footer).toMatch(/could not be discarded/);
+    expect(card.footer).not.toMatch(/^✅/);
+    expect(h.ephemerals.join(" ")).toMatch(/may still be serving — and billing — Fast/);
+    expect(h.ephemerals.join(" ")).toMatch(/\/seam config reset/);
+  });
+
+  it("a successful retirement still renders the ordinary saved card", async () => {
+    const h = saveHarness({ appliedOverride: null });
+    await h.run(applyPickerValue(draft(), "fast", FAST_MODE_ON, caps));
+    const card = h.editedPanels.at(-1)!.panel;
+    expect(card.color).not.toBe(0xed4245);
+    expect(card.footer).toMatch(/Saved/);
+    expect(h.ephemerals.join(" ")).not.toMatch(/🚨/);
   });
 });

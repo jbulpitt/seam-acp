@@ -727,6 +727,11 @@ session that already has history:
   then roll the flag back *and* retire that just-forged session, so the next
   turn starts clean with Fast off. Only a positively observed `off` keeps the
   session. Nothing may claim a session is Fast-free without observing it.
+- **A failed retirement is critical, not a warning.** If that retirement itself
+  fails, a possibly-billing session is still live: `configure_thread` fails the
+  whole call, and the config card turns red with a `🚨` footer instead of a calm
+  "Saved". Both name the recovery: `/seam config reset` in that thread before
+  the next turn.
 
 ### 12.4 Where it lives
 

@@ -1,0 +1,12 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Live dashboard · LLM Monitor</title></head>
+<body class="min-h-screen flex flex-col">
+<!--
+  Derived from the recorded live.html fixture: the same server-rendered row
+  shape with a status pill word the adapter has never observed. It exists to
+  prove the adapter fails closed rather than reading an unfamiliar dashboard
+  state as healthy.
+-->
+<main class="flex-1 w-full max-w-[1180px] mx-auto px-6">
+<div role="table"><div class="grid px-3 -mx-3 pb-2 mb-1 border-b border-line" role="row"><div class="eyebrow text-[12px]">Endpoint</div><div class="eyebrow text-[12px]">Status</div></div><a href="/live" title="gemma4-26b on FORGE — RTX 5090 · vLLM" role="row" class="grid px-3 -mx-3 py-3 border-b border-line/60 group"><div class="min-w-0"><div class="font-mono text-[16px] text-ink truncate group-hover:text-accent transition-colors" title="FORGE · RTX 5090 · vLLM · gemma4-26b">FORGE · gemma4-26b</div><div class="font-mono text-[12px] text-ink-faint truncate mt-0.5"><span title="Last probe at Thu, 03 Sep 2026 18:03:38 GMT (local: 9/3/2026, 6:03:38 PM)">21m ago</span></div></div><div class="justify-self-start"><span class="pill-mystery">QUARANTINED</span></div></a></div>
+</main>
+</body></html>

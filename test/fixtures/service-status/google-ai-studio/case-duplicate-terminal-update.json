@@ -1,0 +1,41 @@
+[
+  [
+    [
+      [
+        "GeminiAPI-duplicate-terminal-20260903",
+        "Resolution posted twice with identical content",
+        1,
+        [
+          [
+            1,
+            "2026-09-03 09:15",
+            [
+              "1788452100"
+            ],
+            "We are experiencing elevated error rates on the Gemini API. Investigation is underway."
+          ],
+          [
+            4,
+            "2026-09-03 11:20",
+            [
+              "1788459600"
+            ],
+            "Issue has been resolved."
+          ],
+          [
+            4,
+            "2026-09-03 11:20",
+            [
+              "1788459600"
+            ],
+            "Issue has been resolved."
+          ]
+        ],
+        1,
+        [
+          1
+        ]
+      ]
+    ]
+  ]
+]

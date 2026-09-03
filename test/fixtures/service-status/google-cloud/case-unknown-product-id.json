@@ -1,0 +1,35 @@
+[
+  {
+    "id": "GcUnknownProductFixture01",
+    "number": "6876619551109882404",
+    "begin": "2026-09-03T15:10:00+00:00",
+    "created": "2026-09-03T15:24:00+00:00",
+    "end": null,
+    "modified": "2026-09-03T17:05:00+00:00",
+    "external_desc": "An incident naming a product that the catalogue does not list.",
+    "updates": [
+      {
+        "created": "2026-09-03T15:24:00+00:00",
+        "modified": "2026-09-03T15:24:00+00:00",
+        "when": "2026-09-03T15:24:00+00:00",
+        "text": "We are investigating an issue.",
+        "status": "SERVICE_OUTAGE",
+        "affected_locations": []
+      }
+    ],
+    "status_impact": "SERVICE_OUTAGE",
+    "severity": "high",
+    "service_key": "zall",
+    "service_name": "Multiple Products",
+    "affected_products": [
+      {
+        "title": "Some Product Not In The Catalogue",
+        "id": "aProductIdMissingFromCatalogue",
+        "current_title": "Some Product Not In The Catalogue"
+      }
+    ],
+    "uri": "incidents/GcUnknownProductFixture01",
+    "currently_affected_locations": [],
+    "previously_affected_locations": []
+  }
+]

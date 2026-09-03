@@ -1,0 +1,64 @@
+{
+  "products": [
+    {
+      "title": "Agent Assist",
+      "id": "eUntUKqUrHdbBLNcVVXq",
+      "current_title": "Agent Assist"
+    },
+    {
+      "title": "AlloyDB for PostgreSQL",
+      "id": "fPovtKbaWN9UTepMm3kJ",
+      "current_title": "AlloyDB for PostgreSQL"
+    },
+    {
+      "title": "Apigee",
+      "id": "9Y13BNFy4fJydvjdsN3X",
+      "current_title": "Apigee"
+    },
+    {
+      "title": "Cloud Filestore",
+      "id": "jog4nyYkquiLeSK5s26q",
+      "current_title": "Cloud Filestore"
+    },
+    {
+      "title": "Cloud Run",
+      "id": "9D7d2iNBQWN24zc1VamE",
+      "current_title": "Cloud Run"
+    },
+    {
+      "title": "Dialogflow CX",
+      "id": "BnCicQdHSdxaCv8Ya6Vm",
+      "current_title": "Dialogflow CX"
+    },
+    {
+      "title": "Gemini Code Assist",
+      "id": "deUeOEPYanfJ9w8cpyBJ",
+      "current_title": "Gemini Code Assist"
+    },
+    {
+      "title": "Vertex Gemini API",
+      "id": "Z0FZJAMvEB4j3NbCJs6B",
+      "current_title": "Gemini on Agent Platform"
+    },
+    {
+      "title": "Google BigQuery",
+      "id": "9CcrhHUcFevXPSVaSxkf",
+      "current_title": "Google BigQuery"
+    },
+    {
+      "title": "Google Cloud Storage",
+      "id": "UwaYoXQ5bHYHG6EdiPB8",
+      "current_title": "Google Cloud Storage"
+    },
+    {
+      "title": "Google Cloud Support",
+      "id": "bGThzF7oEGP5jcuDdMuk",
+      "current_title": "Google Cloud Support"
+    },
+    {
+      "title": "Google Compute Engine",
+      "id": "L3ggmi3Jy4xJmgodFA9K",
+      "current_title": "Google Compute Engine"
+    }
+  ]
+}

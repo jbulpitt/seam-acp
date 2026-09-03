@@ -1,0 +1,33 @@
+[
+  [
+    [
+      [
+        "GeminiAPI-schema-drift-20260903",
+        "Lifecycle code outside the observed range",
+        1,
+        [
+          [
+            1,
+            "2026-09-03 09:15",
+            [
+              "1788452100"
+            ],
+            "Investigation is underway."
+          ],
+          [
+            9,
+            "2026-09-03 10:40",
+            [
+              "1788457200"
+            ],
+            "An unrecognized lifecycle code."
+          ]
+        ],
+        1,
+        [
+          1
+        ]
+      ]
+    ]
+  ]
+]

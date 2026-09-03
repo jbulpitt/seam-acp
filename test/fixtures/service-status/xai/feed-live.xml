@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>SpaceXAI System Status</title>
+    <link>https://status.x.ai</link>
+    <description>Current status and incident history of SpaceXAI's services and systems</description>
+    <language>en-us</language>
+    <atom:link href="https://status.x.ai/feed.xml" rel="self" type="application/rss+xml" />
+    <lastBuildDate>Thu, 03 Sep 2026 17:10:57 GMT</lastBuildDate>
+    <ttl>30</ttl>
+
+    <item>
+      <title>[Grok (iOS)] Models outage</title>
+      <link>https://status.x.ai/ios-app/INCc33a8af</link>
+      <guid isPermaLink="false">INCc33a8af</guid>
+      <description><![CDATA[
+           <h3>Status: RESOLVED</h3>
+           <p>Severity: available</p>
+           <p>Resolved: Thu, 03 Sep 2026 17:08:11 GMT</p>
+           <hr />
+           <h4>Updates:</h4>
+
+             <div>
+               <p><strong>Thu, 03 Sep 2026 17:08:11 GMT</strong></p>
+               <h3>Traffic is healthy again</h3>
+               <p>We have resolved the situation, and traffic is healthy again.</p>
+             </div>
+
+             <div>
+               <p><strong>Thu, 03 Sep 2026 13:30:00 GMT</strong></p>
+               <h3>Investigating outage</h3>
+               <p>Grok is experiencing issues. We are working on restoring service as quickly as possible.</p>
+             </div>
+
+      ]]></description>
+      <pubDate>Thu, 03 Sep 2026 13:30:00 GMT</pubDate>
+      <category>available</category>
+      <category>resolved</category>
+    </item>
+    <item>
+      <title>[API (us-east-1.api.x.ai)] Models outage</title>
+      <link>https://status.x.ai/api-us-east-1/INC410324ed</link>
+      <guid isPermaLink="false">INC410324ed</guid>
+      <description><![CDATA[
+           <h3>Status: RESOLVED</h3>
+           <p>Severity: available</p>
+           <p>Resolved: Thu, 03 Sep 2026 17:07:20 GMT</p>
+           <hr />
+           <h4>Updates:</h4>
+
+             <div>
+               <p><strong>Thu, 03 Sep 2026 17:07:20 GMT</strong></p>
+               <h3>Traffic is healthy again</h3>
+               <p>We have resolved the situation, and traffic is healthy again.</p>
+             </div>
+
+             <div>
+               <p><strong>Thu, 03 Sep 2026 13:30:00 GMT</strong></p>
+               <h3>Investigating outage</h3>
+               <p>Grok is experiencing issues. We are working on restoring service as quickly as possible.</p>
+             </div>
+
+      ]]></description>
+      <pubDate>Thu, 03 Sep 2026 13:30:00 GMT</pubDate>
+      <category>available</category>
+      <category>resolved</category>
+    </item>
+    <item>
+      <title>[API Console] Console not loading</title>
+      <link>https://status.x.ai/api-console/INC702624e4</link>
+      <guid isPermaLink="false">INC702624e4</guid>
+      <description><![CDATA[
+           <h3>Status: RESOLVED</h3>
+           <p>Severity: available</p>
+
+           <hr />
+           <h4>Updates:</h4>
+
+             <div>
+               <p><strong>Mon, 18 May 2026 02:29:34 GMT</strong></p>
+               <h3>Investigating</h3>
+               <p>Investigating issues related to authentication</p>
+             </div>
+
+             <div>
+               <p><strong>Mon, 18 May 2026 12:00:00 GMT</strong></p>
+               <h3>Updated</h3>
+               <p>The issue has been resolved.</p>
+             </div>
+
+      ]]></description>
+      <pubDate>Mon, 18 May 2026 01:58:00 GMT</pubDate>
+      <category>available</category>
+      <category>resolved</category>
+    </item>
+    <item>
+      <title>[API (us-east-1.api.x.ai)] grok-3 degraded performance</title>
+      <link>https://status.x.ai/api-us-east-1/INC3c8ce3f2</link>
+      <guid isPermaLink="false">INC3c8ce3f2</guid>
+      <description><![CDATA[
+           <h3>Status: RESOLVED</h3>
+           <p>Severity: available</p>
+           <p>Resolved: Tue, 10 Feb 2026 18:50:00 GMT</p>
+           <hr />
+           <h4>Updates:</h4>
+
+             <div>
+               <p><strong>Tue, 10 Feb 2026 18:54:49 GMT</strong></p>
+               <h3>grok-3 degraded performance resolved</h3>
+               <p>Clusters are fully healthy again.</p>
+             </div>
+
+             <div>
+               <p><strong>Tue, 10 Feb 2026 17:32:20 GMT</strong></p>
+               <h3>Grok 3 through our API is currently suffering degraded performance</h3>
+               <p>We have identified the root cause and will be working on a solution.</p>
+             </div>
+
+      ]]></description>
+      <pubDate>Fri, 24 Oct 2025 17:20:00 GMT</pubDate>
+      <category>available</category>
+      <category>resolved</category>
+    </item>
+  </channel>
+</rss>

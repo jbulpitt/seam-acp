@@ -1,6 +1,7 @@
 import type { Renderer } from "../platforms/renderer.js";
 import type {
   TurnState,
+  PanelOrigin,
   StatusPanel,
   StatusCardStyle,
   StructuredPanel,
@@ -24,6 +25,9 @@ export interface StatusPanelInput {
    *  ("📨 Handoff", "⏰ Wake"). Left unset for normal user turns so the panel
    *  title is just the state. */
   titlePrefix?: string;
+  /** Provenance for a dispatched turn (#153): what the work is and where it
+   *  came from. Unset for normal user turns. */
+  origin?: PanelOrigin;
   action: string;
   /** Optional context-window line shown when tokens are known. */
   context?: string;
@@ -55,6 +59,7 @@ export function renderStatusPanel(
     ...(input.resolvedModel ? { resolvedModel: input.resolvedModel } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
     ...(input.titlePrefix ? { titlePrefix: input.titlePrefix } : {}),
+    ...(input.origin ? { origin: input.origin } : {}),
     action: input.action,
     context: input.context,
     ...(input.contextPct != null ? { contextPct: input.contextPct } : {}),
@@ -65,6 +70,27 @@ export function renderStatusPanel(
     ...(input.authorName ? { authorName: input.authorName } : {}),
   };
   return renderer.statusPanel(panel);
+}
+
+/** True when a {@link PanelOrigin} carries anything worth rendering. An origin
+ *  whose every member was omitted as redundant is dropped, not shown blank. */
+export function hasOrigin(origin: PanelOrigin | undefined): origin is PanelOrigin {
+  if (!origin) return false;
+  return Boolean(origin.promptExcerpt || origin.threadName || origin.channelName);
+}
+
+/**
+ * The "who asked for this" line: `<thread name> · #<channel>`, with each part
+ * present only when it was NOT dropped as redundant (#153 — a same-channel
+ * label is noise, and naming this very thread as the origin is noise too).
+ * Returns "" when nothing survives.
+ */
+export function formatOriginSource(origin: PanelOrigin | undefined): string {
+  if (!origin) return "";
+  const parts: string[] = [];
+  if (origin.threadName) parts.push(origin.threadName);
+  if (origin.channelName) parts.push(`#${origin.channelName}`);
+  return parts.join(" · ");
 }
 
 /** Format a context-window usage line, e.g. "128k / 1m (13%)". Shared by the
@@ -98,6 +124,9 @@ export class TurnStatus {
   /** Optional title prefix (e.g. a dispatch type "📨 Handoff"). Unset for
    *  normal user turns. Rendered before the turn state in the panel title. */
   titlePrefix?: string;
+  /** Provenance for a dispatched turn (#153) — prompt excerpt + source
+   *  thread/channel. Fixed at turn start; unset for normal user turns. */
+  origin?: PanelOrigin;
   repoDisplay: string;
   startedUtc: number;
   context?: string;
@@ -130,6 +159,7 @@ export class TurnStatus {
     repoDisplay: string;
     effort?: string;
     titlePrefix?: string;
+    origin?: PanelOrigin;
     style?: StatusCardStyle;
     brandFilename?: string;
     authorName?: string;
@@ -138,6 +168,7 @@ export class TurnStatus {
     this.repoDisplay = opts.repoDisplay;
     if (opts.effort) this.effort = opts.effort;
     if (opts.titlePrefix) this.titlePrefix = opts.titlePrefix;
+    if (opts.origin && hasOrigin(opts.origin)) this.origin = opts.origin;
     if (opts.style) this.style = opts.style;
     if (opts.brandFilename) this.brandFilename = opts.brandFilename;
     if (opts.authorName) this.authorName = opts.authorName;
@@ -236,6 +267,7 @@ export class TurnStatus {
       ...(this.resolvedModel ? { resolvedModel: this.resolvedModel } : {}),
       ...(this.effort ? { effort: this.effort } : {}),
       ...(this.titlePrefix ? { titlePrefix: this.titlePrefix } : {}),
+      ...(this.origin ? { origin: this.origin } : {}),
       action: this.action,
       context: this.context,
       ...(contextPct != null ? { contextPct } : {}),

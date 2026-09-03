@@ -54,7 +54,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Logger } from "../../lib/logger.js";
 import { isThreadDetached, mayConfigureUserIds, type Config } from "../../config.js";
-import { isObfuscatedChannel, visibleDiscordChannelName } from "./channel-visibility.js";
+import {
+  isObfuscatedChannel,
+  visibleDiscordChannelName,
+  type ChannelVisibilityInput,
+} from "./channel-visibility.js";
 import type {
   ChatAdapter,
   ChannelRef,
@@ -68,6 +72,7 @@ import type {
   MessageRef,
 } from "../chat-adapter.js";
 import type { PanelButton, StructuredPanel } from "../../core/types.js";
+import { clampPanelForDiscord } from "../../core/panel-limits.js";
 import {
   CHOICE_CUSTOM_ID_PREFIX,
   CHOICE_CUSTOM_TEXT_MAX,
@@ -1370,6 +1375,19 @@ export class DiscordAdapter implements ChatAdapter {
     }
   }
 
+  /** Display name of ANY channel (thread or parent). #52: an obfuscated
+   *  channel has no real name, so we return undefined rather than the
+   *  `___hidden___` sentinel. Never throws — the caller just omits the label. */
+  async getChannelName(channelId: string): Promise<string | undefined> {
+    try {
+      const ch = await this.client.channels.fetch(channelId);
+      if (!ch) return undefined;
+      return visibleDiscordChannelName(ch as unknown as ChannelVisibilityInput);
+    } catch {
+      return undefined;
+    }
+  }
+
   async fetchThreadMessages(
     channel: ChannelRef
   ): Promise<Array<{ authorIsBot: boolean; text: string; authorName?: string }>> {
@@ -1969,8 +1987,12 @@ export class DiscordAdapter implements ChatAdapter {
   }
 
   private static buildEmbed(
-    panel: StructuredPanel
+    input: StructuredPanel
   ): EmbedBuilder {
+    // One grapheme-safe pass enforces every per-part cap AND the aggregate
+    // 6000-char embed budget, so a card carrying prompt excerpts + provenance
+    // (#153/#154/#155) can never 400 the whole post or cut an emoji in half.
+    const panel = clampPanelForDiscord(input);
     const embed = new EmbedBuilder()
       .setColor(panel.color);
     if (panel.title) {
@@ -1983,17 +2005,17 @@ export class DiscordAdapter implements ChatAdapter {
       });
     }
     if (panel.description) {
-      embed.setDescription(panel.description.slice(0, 4096));
+      embed.setDescription(panel.description);
     }
     for (const f of panel.fields) {
       embed.addFields({
-        name: f.name.slice(0, 256),
-        value: f.value.slice(0, 1024) || "\u200B",
+        name: f.name,
+        value: f.value || "\u200B",
         inline: f.inline ?? false,
       });
     }
     if (panel.footer) {
-      embed.setFooter({ text: panel.footer.slice(0, 2048) });
+      embed.setFooter({ text: panel.footer });
     }
     if (panel.imageUrl) {
       embed.setImage(panel.imageUrl);

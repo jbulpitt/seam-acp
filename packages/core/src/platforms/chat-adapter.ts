@@ -104,6 +104,13 @@ export interface ChatAdapter {
   /** Optional: return the current display name of a thread/channel. */
   getThreadName?(channel: ChannelRef): Promise<string | undefined>;
 
+  /**
+   * Optional: display name of any channel, thread or not — used for the parent
+   * channel of an originating thread on observability cards (#153). Returns
+   * undefined for an unknown or bot-invisible (obfuscated) channel.
+   */
+  getChannelName?(channelId: string): Promise<string | undefined>;
+
   /** Optional: fetch historical messages for a thread (chronological order). */
   fetchThreadMessages?(
     channel: ChannelRef

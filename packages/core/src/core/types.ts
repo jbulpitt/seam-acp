@@ -196,6 +196,25 @@ export type TurnState =
   // resume on its own (Claude Monitor tool / run_in_background tasks).
   | "Monitoring";
 
+/**
+ * Where a card's work came from (#153). Attached to a DISPATCHED turn's status
+ * panel so a handoff / report-back says what the work is and who asked for it,
+ * without opening the other thread.
+ *
+ * Every member is optional and every member is omitted when it would be
+ * redundant: `threadName` is dropped when the origin IS this thread, and
+ * `channelName` is dropped when the origin shares this thread's channel (the
+ * common case — a same-channel label is pure noise).
+ */
+export interface PanelOrigin {
+  /** Word-boundary excerpt of the prompt that drove this work. */
+  promptExcerpt?: string;
+  /** Originating / source thread's display name (carries its identity prefix). */
+  threadName?: string;
+  /** Originating / source channel name — set ONLY when it differs from here. */
+  channelName?: string;
+}
+
 export interface StatusPanel {
   state: TurnState;
   repoDisplay: string;
@@ -207,6 +226,9 @@ export interface StatusPanel {
   /** Optional title prefix shown before the state, e.g. a dispatch type
    *  ("📨 Handoff", "⏰ Wake"). Unset for normal user turns. */
   titlePrefix?: string;
+  /** Provenance for a dispatched turn (#153). Unset for normal user turns —
+   *  the thread you are reading IS the origin. */
+  origin?: PanelOrigin;
   action: string;
   elapsedSeconds: number;
   /** Optional context-window line shown when token info is known. */

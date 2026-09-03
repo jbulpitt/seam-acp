@@ -55,6 +55,22 @@ export interface DispatchSpec {
   /** When set, after this turn completes the runtime auto-dispatches the
    *  captured output back into this thread (report-back). */
   returnTo?: string;
+  /**
+   * Card observability (#153). The thread this dispatch's work came FROM, when
+   * it is not simply `returnTo`. A handoff's origin IS its `returnTo` (the
+   * delegator), so handoffs leave this unset; a **report-back** sets it to the
+   * worker thread whose output is being delivered, which `returnTo` cannot
+   * express (a report-back has no returnTo — it IS the return).
+   */
+  originThreadRef?: string;
+  /**
+   * Card observability (#153). The prompt that ORIGINATED this work, when it
+   * differs from `prompt`. A report-back's own `prompt` is the worker's wrapped
+   * output, so the card would otherwise show the result instead of the ask;
+   * this carries the original handoff prompt through so the excerpt still says
+   * what the work was.
+   */
+  originPrompt?: string;
   /** Ledger classification; defaults to "handoff". The report-back
    *  re-injection sets "report_back"; a fired wake (#59) sets "wake"; a fired
    *  watch (#60) sets "watch"; an agent-triggered compaction sets "compact";
@@ -145,6 +161,8 @@ export const DispatchSpecSchema = z.object({
   agentId: z.string().min(1).optional(),
   correlationId: z.string().min(1).optional(),
   returnTo: z.string().min(1).optional(),
+  originThreadRef: z.string().min(1).optional(),
+  originPrompt: z.string().min(1).optional(),
   kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact", "parked", "choice", "ingest", "migrate_self", "thread_voice"]).optional(),
   migration: z.object({
     agent: z.string().min(1),
@@ -265,6 +283,8 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.agentId ? { agentId: d.agentId } : {}),
     ...(d.correlationId ? { correlationId: d.correlationId } : {}),
     ...(d.returnTo ? { returnTo: d.returnTo } : {}),
+    ...(d.originThreadRef ? { originThreadRef: d.originThreadRef } : {}),
+    ...(d.originPrompt ? { originPrompt: d.originPrompt } : {}),
     ...(d.kind ? { kind: d.kind } : {}),
     ...(d.migration ? { migration: d.migration } : {}),
     ...(d.authorId ? { authorId: d.authorId } : {}),
@@ -321,6 +341,26 @@ export function applyPresetIdentity(
 ): string {
   if (!preset?.instructions) return prompt;
   return `<seam-worker-identity name="${preset.name}">\n${preset.instructions}\n</seam-worker-identity>\n\n${prompt}`;
+}
+
+/**
+ * Where a dispatched turn's card should say the work came from (#153), as raw
+ * refs — resolving those to display names is the platform's job.
+ *
+ * `threadRef` is the explicit `originThreadRef` when the spec carries one (a
+ * report-back naming its worker), else `returnTo` (a handoff's delegator).
+ * `prompt` is the ORIGINATING prompt when the spec carries one, else this
+ * dispatch's own prompt. Pure, so the precedence is unit-testable.
+ */
+export function dispatchOriginRefs(spec: DispatchSpec): {
+  threadRef?: string;
+  prompt: string;
+} {
+  const threadRef = spec.originThreadRef ?? spec.returnTo;
+  return {
+    ...(threadRef ? { threadRef } : {}),
+    prompt: spec.originPrompt ?? spec.prompt,
+  };
 }
 
 /** A Discord snowflake is a long run of digits; a preset is a human name. Used

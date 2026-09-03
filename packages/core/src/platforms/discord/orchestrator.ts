@@ -6483,19 +6483,39 @@ export class Orchestrator {
 
     // Ledger: record the dispatch as a handoff (operator-originated, so no
     // source thread). Best-effort — a ledger write must never break a dispatch.
-    try {
-      this.store.recordDelegation({
-        id: spec.id,
-        kind: spec.kind ?? "handoff",
-        sourceRef: null,
-        targetRef: spec.target,
-        worker: preset?.name ?? null,
-        promptPreview: spec.prompt,
-        correlationId: spec.correlationId ?? null,
-        status: "dispatched",
-      });
-    } catch (err) {
-      this.logger.warn({ err, dispatch: spec.id }, "dispatch: ledger record failed");
+    //
+    // #170: two upstream paths have ALREADY written this exact row. A
+    // report-back's #77 correlation claim (`claimAndEnqueueReportBack`) is
+    // itself a ledger row keyed on this same `spec.id`, written before the
+    // spec was enqueued; and crash recovery re-dispatches a spec that was
+    // ledgered on its first run. Re-inserting either is a guaranteed
+    // unique-index collision, so the warn below fired on the *success* path of
+    // essentially every report-back — training a real alarm to be ignored.
+    //
+    // Skip on an exact id match only. Deliberately not `INSERT OR IGNORE`: a
+    // genuine constraint failure (a DIFFERENT id colliding on a correlation)
+    // must still surface as a warning.
+    const alreadyLedgered = ledger ?? this.store.getDelegation(spec.id);
+    if (alreadyLedgered) {
+      this.logger.debug(
+        { dispatch: spec.id, kind: alreadyLedgered.kind, status: alreadyLedgered.status },
+        "dispatch: already ledgered (prior claim or re-dispatch); skipping record"
+      );
+    } else {
+      try {
+        this.store.recordDelegation({
+          id: spec.id,
+          kind: spec.kind ?? "handoff",
+          sourceRef: null,
+          targetRef: spec.target,
+          worker: preset?.name ?? null,
+          promptPreview: spec.prompt,
+          correlationId: spec.correlationId ?? null,
+          status: "dispatched",
+        });
+      } catch (err) {
+        this.logger.warn({ err, dispatch: spec.id }, "dispatch: ledger record failed");
+      }
     }
 
     if (!preset && spec.session === "live" && (spec.model || spec.effort)) {

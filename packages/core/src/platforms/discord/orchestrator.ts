@@ -501,6 +501,23 @@ const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
 
+/**
+ * Default ceiling for the pre-close quiesce barrier (#174). Long enough for a
+ * report-back enqueue and a card repaint to land, short enough that a wedged
+ * agent cannot stall a restart — pm2 is already waiting on us at this point.
+ */
+const QUIESCE_TIMEOUT_MS = 10_000;
+
+/** Result of one bounded shutdown drain phase (#174). */
+export interface QuiesceOutcome {
+  phase: "pre-dispose" | "post-dispose";
+  /** True when the deadline won — outstanding work is left to boot repair. */
+  timedOut: boolean;
+  activeTurns: number;
+  inFlight: number;
+  continuations: number;
+}
+
 /** Reasoning-effort options for the `/seam effort` picker. Mirror of the SDK's
  *  EffortLevel type — keep in sync with commands.ts and the bundled SDK
  *  (docs/model-management-runbook.md §11). `ultra` is codex-only (not in the Claude SDK). */
@@ -597,6 +614,13 @@ export class Orchestrator {
 
   private activeTurns = 0;
   private restartPending = false;
+  /** #174: set once intake is closed, so `stopIntake()` is idempotent. */
+  private intakeStopped = false;
+  /**
+   * #174: post-turn continuations that run after `activeTurns--` and are
+   * therefore invisible to the restart drain. `quiesce()` awaits these.
+   */
+  private readonly pendingContinuations = new Set<Promise<void>>();
   private readonly channelQueues = new Map<string, Promise<void>>();
   private readonly channelGenerations = new Map<string, number>();
   /** Per-session timers that settle a woken "Working" card back to "Monitoring"
@@ -1269,6 +1293,13 @@ export class Orchestrator {
     // `force` (relocate-repo) skips the drain so live ACP processes take
     // SIGTERM; turn-resume continues them after boot.
 
+    // #174: close the intake door BEFORE sampling activeTurns. Previously the
+    // dispatch watcher kept claiming specs throughout the drain and the 2s
+    // flush wait, so the counter could reach zero while fresh work was already
+    // being admitted behind it. Unclaimed specs stay in `pending/` and are
+    // delivered on the next boot, so this loses nothing.
+    this.stopIntake();
+
     if (force) {
       void this.postNotification(
         "♻️ Force restart — interrupting live turns; they will resume."
@@ -1314,7 +1345,9 @@ export class Orchestrator {
         ? "force restart, executing pm2 restart"
         : "all turns drained, executing restart"
     );
-    this.scheduledManager?.stop();
+    // Intake (dispatch + scheduled) was already stopped above, before the
+    // drain sample; this stays as a no-op safety net for the force path.
+    this.stopIntake();
     try {
       await fsp.unlink(this.sentinelPath());
     } catch {
@@ -1486,15 +1519,174 @@ export class Orchestrator {
    * fire hook alongside `onBridgeReady`.
    */
   private releaseChannelQueue(channelId: string, link: Promise<void>): void {
-    void link.then(() => {
-      if (this.channelQueues.get(channelId) === link) {
-        this.channelQueues.delete(channelId);
-        void this.voiceConsole?.markBindingActivitySettled(channelId).catch((err) =>
+    // #174: this continuation runs strictly AFTER `activeTurns--`, so the
+    // restart drain structurally cannot see it — that is how a post-turn
+    // settlement ended up touching a closed store on an otherwise clean
+    // drain. Track it so `quiesce()` has something to await.
+    const settled = link.then(async () => {
+      if (this.channelQueues.get(channelId) !== link) return;
+      this.channelQueues.delete(channelId);
+      await this.voiceConsole
+        ?.markBindingActivitySettled(channelId)
+        .catch((err) =>
           this.logger.warn({ err, channelId }, "voice console post-turn settlement failed")
         );
-        void this.tryFireParked(channelId);
-      }
+      await this.tryFireParked(channelId).catch?.(() => {});
     });
+    this.trackContinuation(settled);
+  }
+
+  /**
+   * Register a fire-and-forget post-turn continuation so shutdown can await it.
+   *
+   * The set is self-clearing: each promise removes itself on settle, so a long
+   * -running process does not accumulate references. Failures are already
+   * handled inside the continuations, so this only ever observes completion.
+   */
+  private trackContinuation(p: Promise<void>): void {
+    const tracked = p.catch(() => undefined).finally(() => {
+      this.pendingContinuations.delete(tracked);
+    });
+    this.pendingContinuations.add(tracked);
+  }
+
+  /** How many post-turn continuations are still outstanding. */
+  get pendingContinuationCount(): number {
+    return this.pendingContinuations.size;
+  }
+
+  /**
+   * Close the intake door: no new dispatch is claimed and no scheduled prompt
+   * fires. Anything still in `dispatch/pending/` stays there and is delivered
+   * on the next boot, so stopping intake early is lossless.
+   *
+   * #174: this must run BEFORE the restart drain samples `activeTurns`, or the
+   * watcher keeps claiming specs into the very window the drain is trying to
+   * empty — observed on 2026-09-02, where a fresh dispatch started during the
+   * post-drain flush wait and was still running when the store closed.
+   */
+  stopIntake(): void {
+    if (this.intakeStopped) return;
+    this.intakeStopped = true;
+    this.dispatchWatcher?.stop();
+    this.scheduledManager?.stop();
+    this.logger.info(
+      { activeTurns: this.activeTurns, inFlight: this.dispatchWatcher?.inFlightCount ?? 0 },
+      "intake stopped; no new dispatches or scheduled fires will be claimed"
+    );
+  }
+
+  /**
+   * Bounded pre-close barrier (#174).
+   *
+   * Resolves when every claimed dispatch, active channel turn, and tracked
+   * post-turn continuation has settled — while the adapter and store are still
+   * usable, so their DB-first completion work (ledger status, report-back
+   * claim, chain advance) actually lands.
+   *
+   * ALWAYS bounded. A hung agent must not be able to block a restart; that is
+   * what `RESTART_DRAIN_TIMEOUT_MS` exists to prevent, and a force restart is
+   * an explicit instruction to stop waiting. On timeout this returns
+   * `timedOut: true` and shutdown proceeds — the boot-time done-file
+   * reconciliation is what makes giving up safe.
+   */
+  async quiesce(opts: { timeoutMs?: number } = {}): Promise<QuiesceOutcome> {
+    return this.runBoundedDrain("pre-dispose", opts.timeoutMs ?? QUIESCE_TIMEOUT_MS, async () => {
+      // Claimed dispatches first: their report-back and chain advance are
+      // awaited inside the per-target queue task, so this drains them too.
+      await this.dispatchWatcher?.drain();
+      // Then the channel FIFOs (user turns and live dispatches share them).
+      await Promise.allSettled([...this.channelQueues.values()]);
+      // Then the post-turn continuations those queues just spawned. Draining
+      // the queues is what CREATES these, so this order matters.
+      await this.settleTrackedContinuations();
+    });
+  }
+
+  /**
+   * Phase two of shutdown (#174), run AFTER `router.disposeAll()`.
+   *
+   * Disposal is not passive: killing an agent rejects its in-flight turn, and
+   * those rejections run cleanup that settles cards, releases queues, and
+   * registers fresh post-turn continuations. A single `setImmediate` yield is
+   * not a barrier for that — the work can span multiple awaits and I/O.
+   *
+   * So the tracked-continuation set is drained a second time, bounded again,
+   * before the adapter and store are closed. Whatever is still outstanding
+   * when this expires is exactly what boot done-file reconciliation repairs.
+   */
+  async drainAfterDispose(opts: { timeoutMs?: number } = {}): Promise<QuiesceOutcome> {
+    return this.runBoundedDrain(
+      "post-dispose",
+      opts.timeoutMs ?? QUIESCE_TIMEOUT_MS,
+      async () => {
+        await Promise.allSettled([...this.channelQueues.values()]);
+        await this.settleTrackedContinuations();
+      }
+    );
+  }
+
+  /**
+   * Await tracked continuations to a fixpoint: a settling continuation may
+   * register another (a queue release firing a parked prompt), so one pass
+   * over the set is not enough. Bounded by the caller's deadline, never
+   * internally — an internal cap would report "drained" while work runs.
+   */
+  private async settleTrackedContinuations(): Promise<void> {
+    while (this.pendingContinuations.size > 0) {
+      await Promise.allSettled([...this.pendingContinuations]);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /**
+   * Race `barrier` against a bounded deadline and report which won.
+   *
+   * The timeout is the ONLY thing that terminates a drain — the barriers
+   * themselves run to a true fixpoint on purpose, so they can never claim to
+   * be finished while work is outstanding. Callers must always pass a bound.
+   */
+  private async runBoundedDrain(
+    phase: "pre-dispose" | "post-dispose",
+    timeoutMs: number,
+    barrier: () => Promise<void>
+  ): Promise<QuiesceOutcome> {
+    this.stopIntake();
+    let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        resolve();
+      }, timeoutMs);
+      timer.unref?.();
+    });
+
+    // Never let a barrier rejection escape as an unhandled rejection during
+    // shutdown; a failed drain is a timeout-equivalent, not a crash.
+    const running = barrier().catch((err) => {
+      this.logger.warn({ err, phase }, "quiesce barrier failed");
+    });
+
+    await Promise.race([running, deadline]);
+    if (timer) clearTimeout(timer);
+
+    const state: QuiesceOutcome = {
+      phase,
+      timedOut,
+      activeTurns: this.activeTurns,
+      inFlight: this.dispatchWatcher?.inFlightCount ?? 0,
+      continuations: this.pendingContinuations.size,
+    };
+    if (timedOut) {
+      this.logger.warn(
+        { ...state, timeoutMs },
+        "quiesce timed out; proceeding — outstanding completions reconcile at boot"
+      );
+    } else {
+      this.logger.info(state, "quiesce phase complete");
+    }
+    return state;
   }
 
   private async handleIncomingMessageInner(msg: IncomingMessage): Promise<void> {
@@ -7480,6 +7672,70 @@ export class Orchestrator {
    * re-run of the same hop is a no-op. The chain's origin delivery uses
    * the same report-back claim on `chainId`.
    */
+  /**
+   * Replay the DURABLE completion actions for a dispatch whose done-file exists
+   * but whose ledger row never went terminal (#174).
+   *
+   * The worker is NOT rerun — its output comes from the done-file. Only the
+   * three side effects the store owns are replayed, in the same order and
+   * through the same DB-first entry points the live path uses, so the
+   * report-back claim stays atomic and dedup is unchanged.
+   *
+   * Safe to call repeatedly: `claimAndEnqueueReportBack` refuses a correlation
+   * that already has a ledger row, and `advanceChain` refuses a chain that is
+   * not `running`.
+   */
+  async replayCompletedDispatch(result: {
+    id: string;
+    target: string;
+    status: "completed" | "failed";
+    output?: string;
+    error?: string;
+    correlationId?: string;
+    returnTo?: string;
+    chainId?: string;
+    originPrompt?: string;
+  }): Promise<void> {
+    const text = result.output ?? "";
+    // Rebuild only the fields the onward paths actually read.
+    const spec: DispatchSpec = {
+      id: result.id,
+      target: result.target,
+      prompt: result.originPrompt ?? "",
+      session: "live",
+      createdUtc: new Date().toISOString(),
+      ...(result.correlationId ? { correlationId: result.correlationId } : {}),
+      ...(result.returnTo ? { returnTo: result.returnTo } : {}),
+      ...(result.chainId ? { chainId: result.chainId } : {}),
+    };
+
+    // ORDER IS LOAD-BEARING. The onward side effect must be durably claimed
+    // BEFORE the worker row goes terminal, because the non-terminal row is the
+    // only thing that brings us back here after a crash.
+    //
+    // Terminalizing first would recreate the exact bug this repairs: a crash
+    // between the two steps leaves a terminal row with no report-back, the
+    // next boot skips the done-file, and the answer is lost permanently.
+    //
+    // Crash-safety of this order:
+    //   before onward       → row non-terminal, done-file present → replayed
+    //   between the two     → row non-terminal → replayed; the report-back's
+    //                         DB-first claim sees its own ledger row and
+    //                         returns false, so no double delivery
+    //   after terminalize   → row terminal → skipped, correctly
+    if (result.chainId) {
+      await this.advanceChain(spec, text, result.error);
+    } else if (result.returnTo) {
+      await this.enqueueReportBack(spec, text, result.error);
+    }
+
+    // Only now is the completion fully recorded. A throw above propagates to
+    // the caller, which logs and leaves the row non-terminal for the next boot
+    // — retrying is safe, dropping it is not.
+    const ledgerStatus = result.status === "completed" ? "completed" : "failed";
+    this.store.updateDelegationStatus(result.id, ledgerStatus);
+  }
+
   private async advanceChain(spec: DispatchSpec, output: string, error?: string): Promise<void> {
     const chainId = spec.chainId;
     if (!chainId) return;

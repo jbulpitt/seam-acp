@@ -26,6 +26,9 @@ import type { Logger } from "../../lib/logger.js";
 import type { DispatchResult, DispatchSpec } from "./types.js";
 import { dispatchDirs, parseDispatchSpec } from "./types.js";
 
+/** Clamp on the originating prompt copied into a done-file (#174). */
+export const DONE_ORIGIN_PROMPT_MAX = 4000;
+
 export interface DispatchWatcherOpts {
   /** `config.DATA_DIR` — the queue lives at `<dataDir>/dispatch/`. */
   dataDir: string;
@@ -99,10 +102,51 @@ export class DispatchWatcher {
     await this.tick();
   }
 
+  /**
+   * Stop INTAKE. This closes the claim door — no further tick claims a spec —
+   * but says nothing about work already claimed.
+   *
+   * #174: `stop()` was previously treated as "drained" by the shutdown path,
+   * which is what let `store.close()` land on top of an in-flight dispatch.
+   * Anything left in `pending/` after this is simply delivered on the next
+   * boot, so stopping intake early is lossless.
+   */
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     this.ready = false;
+  }
+
+  /** True while any claimed spec is still running. */
+  get inFlightCount(): number {
+    return this.inFlight.size;
+  }
+
+  /**
+   * Resolve once every CLAIMED spec has finished and its done-file is written.
+   *
+   * This is the real barrier `stop()` is not. A spec's report-back and chain
+   * advance are awaited inside its per-target `SerialQueue` task, so draining
+   * the queues drains those side effects too — while the store is still open.
+   *
+   * Runs to an ACTUAL fixpoint: it keeps settling queues until nothing is in
+   * flight and no new queue appeared, because a completing task can enqueue
+   * onto a different target. It deliberately has no internal pass cap — a
+   * fixed cap would let it return "drained" with work still running, which is
+   * the failure it exists to prevent. Termination is guaranteed from outside:
+   * `stop()` closes intake, and the caller races this against a bounded
+   * timeout (`Orchestrator.quiesce`). Never call it without both.
+   */
+  async drain(): Promise<void> {
+    for (;;) {
+      const queues = [...this.queues.values()];
+      await Promise.allSettled(queues.map((q) => q.idle()));
+      // Yield so a just-settled task can register its follow-on work before
+      // we decide we are done.
+      await new Promise((resolve) => setImmediate(resolve));
+      const grew = this.queues.size !== queues.length;
+      if (this.inFlight.size === 0 && !grew) return;
+    }
   }
 
   /**
@@ -485,6 +529,14 @@ export class DispatchWatcher {
         id,
         target: spec.target,
         ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
+        // #174: carry the routing forward so a completion whose ledger side
+        // effects were lost to a shutdown race can be replayed at boot from
+        // the done-file alone, without rerunning the worker.
+        ...(spec.returnTo ? { returnTo: spec.returnTo } : {}),
+        ...(spec.chainId ? { chainId: spec.chainId } : {}),
+        ...(spec.prompt
+          ? { originPrompt: spec.prompt.slice(0, DONE_ORIGIN_PROMPT_MAX) }
+          : {}),
       };
       try {
         const { output, stopReason } = await this.onDispatch(spec);

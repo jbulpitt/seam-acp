@@ -140,6 +140,20 @@ export interface DispatchResult {
   target: string;
   correlationId?: string;
   finishedUtc: string;
+  /**
+   * #174 replay fields. The done-file is the only durable record that survives
+   * the process, but completion has side effects the ledger owns — a
+   * report-back enqueue and a chain advance. If the store closes before those
+   * run (shutdown race), boot reconciliation has to replay them from here, so
+   * the file must carry the *routing* the spec knew and the result does not.
+   *
+   * All optional: a done-file written before #174 simply does not reconcile,
+   * which is correct — those dispatches are long since terminal or abandoned.
+   */
+  returnTo?: string;
+  chainId?: string;
+  /** `spec.prompt` (clamped) — the originating ask, for the report-back card. */
+  originPrompt?: string;
 }
 
 /**

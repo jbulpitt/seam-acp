@@ -35,6 +35,7 @@ import {
 import { VoiceLeaseManager } from "./core/voice-lease.js";
 import { evaluateWatch } from "./core/watch/evaluate.js";
 import { DispatchWatcher } from "./core/dispatch/watcher.js";
+import { reconcileCompletedDoneFiles } from "./core/dispatch/done-reconcile.js";
 import { dispatchDirs, enqueueDispatchSpec, type DispatchSpec } from "./core/dispatch/types.js";
 import { SeamTokenRegistry } from "./core/mcp/token-registry.js";
 import { SeamMcpServer } from "./core/mcp/seam-mcp-server.js";
@@ -974,6 +975,30 @@ async function main(): Promise<void> {
       style: resolveThreadTtsStyle(config, channelRef) ?? "neutral",
     }),
   });
+  // #174: repair completions whose output reached `done/` but whose DB-first
+  // side effects (ledger status, report-back, chain advance) were lost to a
+  // shutdown race. Runs BEFORE the watcher starts, so a report-back this
+  // enqueues is picked up by the very first tick. The worker is never
+  // re-executed; its output is read off disk.
+  //
+  // The #75 orphan pass has already run far above, so these rows arrive here
+  // as `interrupted` — which this treats as NON-terminal on purpose. An
+  // `interrupted` row that has a done-file did not fail; its completion was
+  // simply never recorded, and that is precisely the state to repair. Rows
+  // with no done-file keep the existing interrupted/Resume behaviour.
+  try {
+    const repaired = await reconcileCompletedDoneFiles({
+      dataDir: config.DATA_DIR,
+      logger,
+      getDelegation: (id) => store.getDelegation(id),
+      replay: (result) => orchestrator.replayCompletedDispatch(result),
+    });
+    if (repaired.reconciled > 0 || repaired.failed > 0) {
+      logger.warn(repaired, "reconciled completed dispatches whose ledger row was non-terminal");
+    }
+  } catch (err) {
+    logger.warn({ err }, "done-file completion reconciliation failed");
+  }
   // Only now may durable specs run: Thread Voice verification, settlement,
   // lease reconciliation, and recovery bookkeeping are all installed first.
   await dispatchWatcher.start();
@@ -1192,7 +1217,16 @@ async function main(): Promise<void> {
     parkedManager.stop();
     cardGifs.stop();
     watchManager.stop();
-    dispatchWatcher.stop();
+    // #174 phase 1: quiesce BEFORE anything is torn down. `dispatchWatcher.stop()`
+    // only closes intake; `quiesce()` is the barrier that waits for claimed
+    // dispatches, active channel turns, and post-turn continuations to settle
+    // — while the adapter and store are still usable, so their DB-first
+    // completion work (ledger status, report-back claim, chain advance)
+    // actually lands. Bounded: a wedged agent cannot stall the restart, and
+    // anything left over is repaired by boot done-file reconciliation.
+    await orchestrator
+      .quiesce({ timeoutMs: config.SHUTDOWN_QUIESCE_TIMEOUT_MS })
+      .catch((err) => logger.warn({ err }, "quiesce failed"));
     await voiceConsoleController.shutdownAll();
     voiceConsoleManager.shutdown();
     liveHelpManager.stopAll();
@@ -1201,15 +1235,28 @@ async function main(): Promise<void> {
       logger.warn({ err }, "seam-mcp stop failed")
     );
     stopTunnelGist?.();
-    try {
-      await adapter.stop();
-    } catch (err) {
-      logger.warn({ err }, "adapter stop failed");
-    }
+    // #174 phase 2: dispose runtimes while the adapter and store are STILL
+    // usable. Disposal kills agent processes, which rejects any in-flight turn;
+    // those rejections run cleanup that posts to Discord and writes to the
+    // store. Stopping the adapter first (the old order) guaranteed that
+    // cleanup hit a dead adapter.
     try {
       await router.disposeAll();
     } catch (err) {
       logger.warn({ err }, "router disposeAll failed");
+    }
+    // #174 phase 3: disposal SPAWNS work — rejection handlers register fresh
+    // post-turn continuations. A single setImmediate is not a barrier for
+    // that, so drain the tracked set again, bounded, before the transport and
+    // store go away. Anything still outstanding when this expires is exactly
+    // what boot done-file reconciliation repairs.
+    await orchestrator
+      .drainAfterDispose({ timeoutMs: config.SHUTDOWN_QUIESCE_TIMEOUT_MS })
+      .catch((err) => logger.warn({ err }, "post-dispose drain failed"));
+    try {
+      await adapter.stop();
+    } catch (err) {
+      logger.warn({ err }, "adapter stop failed");
     }
     try {
       modelMetadataStore.close();

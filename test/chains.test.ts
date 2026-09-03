@@ -3,13 +3,24 @@ import { pino } from "pino";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { SessionStore } from "../packages/core/src/core/session-store.js";
+import {
+  CHAIN_DELIVERY_ID_PREFIX,
+  CHAIN_HOP_ID_PREFIX,
+  MAX_CHAIN_CHILD_DISPATCH_ID_LENGTH,
+  SessionStore,
+  plannedChainChildDispatchId,
+} from "../packages/core/src/core/session-store.js";
 import { PROMPT_PREVIEW_MAX, type ChainCreateInput, type SessionRecord } from "../packages/core/src/core/types.js";
 import {
   SeamMcpServer,
 } from "../packages/core/src/core/mcp/seam-mcp-server.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
-import { buildChainHopSpec, type DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import {
+  buildChainHopSpec,
+  dispatchDirs,
+  enqueueDispatchSpec,
+  type DispatchSpec,
+} from "../packages/core/src/core/dispatch/types.js";
 
 let dir: string;
 let store: SessionStore;
@@ -71,6 +82,129 @@ describe("buildChainHopSpec", () => {
     expect(spec.session).toBe("live");
     expect(spec.preset).toBeUndefined();
     expect(spec.location).toBeUndefined();
+  });
+});
+
+describe("planned chain child ids", () => {
+  it("is deterministic, position-specific, and fixed-size", () => {
+    const input = {
+      chainId: "chain-" + "x".repeat(2_000),
+      currentIndex: 41,
+      kind: "hop" as const,
+    };
+    const first = plannedChainChildDispatchId(input);
+    expect(plannedChainChildDispatchId(input)).toBe(first);
+    expect(first).toHaveLength(CHAIN_HOP_ID_PREFIX.length + 64);
+    expect(first.length).toBeLessThanOrEqual(MAX_CHAIN_CHILD_DISPATCH_ID_LENGTH);
+    expect(plannedChainChildDispatchId({ ...input, currentIndex: 42 })).not.toBe(first);
+    const delivery = plannedChainChildDispatchId({ ...input, kind: "delivery" });
+    expect(delivery).not.toBe(first);
+    expect(delivery.startsWith(CHAIN_DELIVERY_ID_PREFIX)).toBe(true);
+    expect(() => plannedChainChildDispatchId({ ...input, currentIndex: -1 })).toThrow(
+      "invalid chain current index"
+    );
+  });
+
+  it("keeps a 3-hop plan stable and unique across replay", () => {
+    store.createChain({ id: "three", hops: ["w1", "w2", "w3"], originRef: "origin" });
+    expect(store.advanceChain("three")?.nextHop).toBe("w1");
+
+    let parentId = "initial-dispatch";
+    const ids: string[] = [];
+    for (let completedIndex = 1; completedIndex <= 3; completedIndex += 1) {
+      const first = store.planChainHopCompletion({
+        dispatchId: parentId,
+        chainId: "three",
+        failed: false,
+      });
+      expect(first).not.toBeNull();
+      expect(first!.dispatchId).toBe(
+        plannedChainChildDispatchId({
+          chainId: "three",
+          currentIndex: completedIndex,
+          kind: completedIndex < 3 ? "hop" : "delivery",
+        })
+      );
+      expect(
+        store.planChainHopCompletion({ dispatchId: parentId, chainId: "three", failed: false })
+      ).toEqual({ ...first, created: false });
+      ids.push(first!.dispatchId);
+      parentId = first!.dispatchId;
+    }
+    expect(new Set(ids).size).toBe(3);
+  });
+
+  it("continues to read an already-committed recursive child id", () => {
+    store.createChain({ id: "legacy-planned", hops: ["next"], originRef: "origin" });
+    expect(store.advanceChain("legacy-planned")?.nextHop).toBe("next");
+    store.tryRecordReportBack({
+      id: "chain_advance:legacy-parent",
+      kind: "report_back",
+      sourceRef: "legacy-planned",
+      targetRef: "chain_hop:legacy-parent",
+      worker: "next",
+      correlationId: "legacy-parent",
+      status: "completed",
+    });
+
+    expect(
+      store.planChainHopCompletion({
+        dispatchId: "legacy-parent",
+        chainId: "legacy-planned",
+        failed: false,
+      })
+    ).toEqual({
+      dispatchId: "chain_hop:legacy-parent",
+      nextHop: "next",
+      originRef: "origin",
+      created: false,
+    });
+    expect(store.getChain("legacy-planned")).toMatchObject({ hops: [], currentIndex: 1 });
+  });
+
+  it("plans, replays, and enqueues every child of a 100-hop chain within NAME_MAX", async () => {
+    const chainId = "long-chain-" + "z".repeat(2_000);
+    const workers = Array.from({ length: 100 }, (_, index) => `worker-${index}`);
+    store.createChain({ id: chainId, hops: workers, originRef: "origin" });
+    expect(store.advanceChain(chainId)?.nextHop).toBe("worker-0");
+
+    let parentId = "root-dispatch";
+    const ids: string[] = [];
+    for (let completedIndex = 1; completedIndex <= workers.length; completedIndex += 1) {
+      const plan = store.planChainHopCompletion({ dispatchId: parentId, chainId, failed: false });
+      expect(plan).not.toBeNull();
+      expect(
+        store.planChainHopCompletion({ dispatchId: parentId, chainId, failed: false })
+      ).toEqual({ ...plan, created: false });
+
+      ids.push(plan!.dispatchId);
+
+      const spec: DispatchSpec = plan!.nextHop
+        ? buildChainHopSpec({
+            id: plan!.dispatchId,
+            chainId,
+            worker: plan!.nextHop,
+            prompt: "next",
+            originRef: "origin",
+          })
+        : {
+            id: plan!.dispatchId,
+            target: "origin",
+            prompt: "complete",
+            session: "live",
+            kind: "report_back",
+            createdUtc: new Date().toISOString(),
+          };
+      await enqueueDispatchSpec(dir, spec);
+      parentId = plan!.dispatchId;
+    }
+
+    expect(new Set(ids).size).toBe(100);
+    expect(ids.every((id) => id.length <= MAX_CHAIN_CHILD_DISPATCH_ID_LENGTH)).toBe(true);
+    expect(ids.every((id) => Buffer.byteLength(`.${id}.json.tmp`) <= 255)).toBe(true);
+    const names = fs.readdirSync(dispatchDirs(dir).pending);
+    expect(names).toHaveLength(100);
+    expect(names.every((name) => Buffer.byteLength(name) <= 255)).toBe(true);
   });
 });
 

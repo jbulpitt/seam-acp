@@ -317,6 +317,35 @@ const mapPreset = (r: PresetRow): Preset => {
  */
 export const CHAIN_HOP_ID_PREFIX = "chain_hop:";
 export const CHAIN_DELIVERY_ID_PREFIX = "chain_delivery:";
+const CHAIN_CHILD_ID_DIGEST_HEX_LENGTH = 64;
+export const MAX_CHAIN_CHILD_DISPATCH_ID_LENGTH =
+  CHAIN_DELIVERY_ID_PREFIX.length + CHAIN_CHILD_ID_DIGEST_HEX_LENGTH;
+
+/**
+ * Build a deterministic, filesystem-safe id for a chain completion's child.
+ *
+ * The id deliberately depends on logical chain position rather than the
+ * completing dispatch id. Prefixing each child with its parent's id made the
+ * filename grow once per hop until ordinary long chains hit NAME_MAX.
+ */
+export function plannedChainChildDispatchId(input: {
+  chainId: string;
+  currentIndex: number;
+  kind: "hop" | "delivery";
+}): string {
+  if (!Number.isSafeInteger(input.currentIndex) || input.currentIndex < 0) {
+    throw new Error(`invalid chain current index: ${input.currentIndex}`);
+  }
+  const prefix = input.kind === "hop" ? CHAIN_HOP_ID_PREFIX : CHAIN_DELIVERY_ID_PREFIX;
+  const digest = createHash("sha256")
+    .update(input.kind)
+    .update("\0")
+    .update(input.chainId)
+    .update("\0")
+    .update(String(input.currentIndex))
+    .digest("hex");
+  return `${prefix}${digest}`;
+}
 
 /**
  * Whether a stored `chain_advance:` claim's `targetRef` is a planned child id
@@ -1845,9 +1874,11 @@ export class SessionStore {
       if (!chain || chain.status !== "running") return null;
 
       const nextHop = input.failed ? null : (chain.hops[0] ?? null);
-      const dispatchId = nextHop
-        ? `${CHAIN_HOP_ID_PREFIX}${input.dispatchId}`
-        : `${CHAIN_DELIVERY_ID_PREFIX}${input.dispatchId}`;
+      const dispatchId = plannedChainChildDispatchId({
+        chainId: input.chainId,
+        currentIndex: chain.currentIndex,
+        kind: nextHop ? "hop" : "delivery",
+      });
       const claim = this.tryRecordReportBack({
         id: `chain_advance:${input.dispatchId}`,
         kind: "report_back",

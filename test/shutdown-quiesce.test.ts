@@ -49,7 +49,7 @@ import { SeamMcpServer } from "../packages/core/src/core/mcp/seam-mcp-server.js"
 import {
   SessionStore,
   isPlannedChainChildId,
-  CHAIN_HOP_ID_PREFIX,
+  plannedChainChildDispatchId,
 } from "../packages/core/src/core/session-store.js";
 import net from "node:net";
 
@@ -3325,9 +3325,11 @@ function makeChainStore() {
       }
       if (!chain || chain.status !== "running") return null;
       const nextHop = input.failed ? null : (chain.hops[0] ?? null);
-      const dispatchId = nextHop
-        ? `chain_hop:${input.dispatchId}`
-        : `chain_delivery:${input.dispatchId}`;
+      const dispatchId = plannedChainChildDispatchId({
+        chainId: input.chainId,
+        currentIndex: chain.currentIndex,
+        kind: nextHop ? "hop" : "delivery",
+      });
       ledger.tryRecordReportBack({
         id: `chain_advance:${input.dispatchId}`,
         correlationId: input.dispatchId,
@@ -3611,7 +3613,11 @@ describe("#174 a routed forward is actually delivered or advanced", () => {
         failed: false,
       });
       expect(first).toMatchObject({
-        dispatchId: `${CHAIN_HOP_ID_PREFIX}hop-2`,
+        dispatchId: plannedChainChildDispatchId({
+          chainId: "chain-modern77",
+          currentIndex: 0,
+          kind: "hop",
+        }),
         nextHop: "worker-b",
         created: true,
       });
@@ -3621,7 +3627,11 @@ describe("#174 a routed forward is actually delivered or advanced", () => {
         failed: false,
       });
       expect(replay).toMatchObject({
-        dispatchId: `${CHAIN_HOP_ID_PREFIX}hop-2`,
+        dispatchId: plannedChainChildDispatchId({
+          chainId: "chain-modern77",
+          currentIndex: 0,
+          kind: "hop",
+        }),
         nextHop: "worker-b",
         created: false,
       });
@@ -3646,7 +3656,12 @@ describe("#174 a routed forward is actually delivered or advanced", () => {
       chainId: "chain-crash",
       failed: false,
     });
-    expect(plan).toMatchObject({ dispatchId: "chain_hop:parent-hop", nextHop: "worker-b" });
+    const childId = plannedChainChildDispatchId({
+      chainId: "chain-crash",
+      currentIndex: 0,
+      kind: "hop",
+    });
+    expect(plan).toMatchObject({ dispatchId: childId, nextHop: "worker-b" });
     expect(store.chains.get("chain-crash")).toMatchObject({ hops: [], currentIndex: 1 });
     expect(await readdir(dirs.pending)).toEqual([]);
 
@@ -3660,7 +3675,7 @@ describe("#174 a routed forward is actually delivered or advanced", () => {
       },
       { action: "chain", chainId: "chain-crash" }
     );
-    expect(await readdir(dirs.pending)).toEqual(["chain_hop:parent-hop.json"]);
+    expect(await readdir(dirs.pending)).toEqual([`${childId}.json`]);
     expect(store.chains.get("chain-crash")).toMatchObject({ status: "running", currentIndex: 1 });
   });
 
@@ -3679,6 +3694,11 @@ describe("#174 a routed forward is actually delivered or advanced", () => {
       chainId: "chain-last",
       failed: false,
     });
+    const childId = plannedChainChildDispatchId({
+      chainId: "chain-last",
+      currentIndex: 0,
+      kind: "hop",
+    });
 
     await makeChainReplayHost(store).replayCompletedDispatch(
       {
@@ -3693,7 +3713,7 @@ describe("#174 a routed forward is actually delivered or advanced", () => {
     const specs = await pendingSpecs();
     expect(specs).toHaveLength(1);
     expect(specs[0]).toMatchObject({
-      id: "chain_hop:parent-hop",
+      id: childId,
       target: "origin",
       preset: "last-worker",
       chainId: "chain-last",
@@ -3748,9 +3768,14 @@ describe("#174 atomic chain completion plan", () => {
         failed: false,
         promptPreview: "ask",
       });
+      const childId = plannedChainChildDispatchId({
+        chainId: "chain-db",
+        currentIndex: 0,
+        kind: "hop",
+      });
 
       expect(first).toEqual({
-        dispatchId: "chain_hop:parent-db",
+        dispatchId: childId,
         nextHop: "worker-b",
         originRef: "origin",
         created: true,
@@ -3759,7 +3784,7 @@ describe("#174 atomic chain completion plan", () => {
       expect(store.getChain("chain-db")).toMatchObject({ hops: [], currentIndex: 1 });
       expect(store.getReportBackByCorrelation("parent-db")).toMatchObject({
         id: "chain_advance:parent-db",
-        targetRef: "chain_hop:parent-db",
+        targetRef: childId,
         worker: "worker-b",
       });
     } finally {

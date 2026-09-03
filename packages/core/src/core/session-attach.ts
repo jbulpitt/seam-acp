@@ -84,17 +84,29 @@ export interface AttachInput {
 /**
  * Decide the binding from authoritative state.
  *
- * Order is load-bearing:
+ * Order is load-bearing, and the second step is the one that matters:
  *
  * 1. no record — nothing to write, and writing would resurrect a deleted row;
- * 2. already on the new session — a replay or a double completion; idempotent;
- * 3. still on the source — the swap this whole feature exists for. Checked
- *    BEFORE the "did it change?" test on purpose: if the operator attached the
- *    source session mid-run, moving it onto that session's own compaction is
- *    still exactly what they asked for;
- * 4. unbound — attach only when the caller has that authority;
- * 5. bound elsewhere, and it CHANGED during the run — a newer deliberate
- *    choice; never overwrite it;
+ * 2. already on the new session — a replay or a double completion. This is the
+ *    ONE case that outranks change detection, because it is not a change: the
+ *    desired end state is already the actual one, so the operation is a no-op
+ *    however it got there;
+ * 3. **anything observably different from where we started** — the operator
+ *    moved the binding while the pipeline ran, and their choice is newer than
+ *    ours. Every direction counts, including the two that look benign:
+ *
+ *      source → unbound   they DETACHED the very session being compacted.
+ *                         Binding the result would undo that on their behalf.
+ *      unbound → source   they ATTACHED the session being compacted. An earlier
+ *                         revision treated this as "so they want its
+ *                         compaction", swapped, and thereby overwrote a
+ *                         deliberate choice with a guess about intent.
+ *
+ *    A compaction that started against one world does not get to write into a
+ *    different one. The result is still seeded and still listed; the operator
+ *    can attach it in one click if that is what they meant;
+ * 4. still on the source, unchanged — the swap this feature exists for;
+ * 5. unbound, unchanged — attach only when the caller has that authority;
  * 6. bound elsewhere, unchanged — the pre-existing "not your binding" case.
  */
 export function planSessionAttachment(input: AttachInput): AttachPlan {
@@ -104,6 +116,9 @@ export function planSessionAttachment(input: AttachInput): AttachPlan {
   if (newId !== "" && current === newId) {
     return { action: "noop", attached: true, reason: "already-attached" };
   }
+  if (current !== observedAtStart) {
+    return { action: "skip", attached: false, reason: "rebound-elsewhere" };
+  }
   if (sourceId !== "" && current === sourceId) {
     return { action: "cas", expect: sourceId, next: newId, reason: "swapped" };
   }
@@ -111,9 +126,6 @@ export function planSessionAttachment(input: AttachInput): AttachPlan {
     return intent === "attach"
       ? { action: "cas", expect: "", next: newId, reason: "bound-unbound" }
       : { action: "skip", attached: false, reason: "source-inactive" };
-  }
-  if (current !== observedAtStart) {
-    return { action: "skip", attached: false, reason: "rebound-elsewhere" };
   }
   return { action: "skip", attached: false, reason: "source-inactive" };
 }

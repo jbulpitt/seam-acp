@@ -378,6 +378,15 @@ export function attachCardLifecycle(
     render: (view: CardView) => Promise<void>;
     expired: (reason: string) => CardView;
     onError?: (err: unknown, phase: CardLifecycleState, reason: string) => void;
+    /**
+     * Hand the expiry render's promise to a tracker (#179).
+     *
+     * `end` is an event, so the render it triggers is fire-and-forget: the card
+     * still shows its controls for the duration. Anything that needs to know
+     * the card has actually stopped showing them — shutdown, and a test
+     * asserting the invariant — otherwise has to guess with a timer.
+     */
+    track?: (settling: Promise<void>) => void;
   }
 ): CardLifecycle {
   const lifecycle = new CardLifecycle({
@@ -387,7 +396,9 @@ export function attachCardLifecycle(
     ...(opts.onError ? { onError: opts.onError } : {}),
   });
   collector.on("end", (_collected, reason) => {
-    void lifecycle.handleEnd(reason);
+    const settling = lifecycle.handleEnd(reason);
+    opts.track?.(settling);
+    void settling;
   });
   return lifecycle;
 }

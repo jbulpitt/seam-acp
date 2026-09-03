@@ -520,10 +520,50 @@ const LONG_JOB_CARD_EXPIRED_NOTE =
   "⏰ This session browser timed out while the job ran, so its buttons are gone — " +
   "run `/seam info sessions` again to act on the result.";
 
-/** Flatten `**bold**` for the plain-message fallback, which has no embed. */
+/** Flatten `**bold**` for a plain message, which has no embed. */
 function stripMarkdownEmphasis(text: string): string {
   return text.replace(/\*\*/g, "");
 }
+
+/** The session-browser jobs that can outlive their card (#179). */
+export type CardFallbackKind = "compaction" | "rebuild" | "summary" | "migration" | "import";
+
+/**
+ * The ONLY sentences a dead-token fallback may put in the thread (#179).
+ *
+ * A fixed table rather than a formatted string, because the card being replaced
+ * was ephemeral and the thread is not. Composing this text at the call site is
+ * how a session id — the name of a stored conversation — or a raw exception
+ * message, which can carry file paths, prompt fragments or credentials, ends up
+ * broadcast to everyone in the thread merely because an interaction token
+ * expired. There is no parameter here to leak through.
+ *
+ * The RESULT the operator paid for is delivered separately, as a file
+ * (`postCardFallback`); this is only the "your card is gone, here is what
+ * happened" line.
+ */
+export const CARD_FALLBACK_TEXT: Record<CardFallbackKind, { ok: string; failed: string }> = {
+  compaction: {
+    ok: "🗳️ Your compaction finished, but the session browser expired before it could be shown. The new session is saved — run `/seam info sessions` to see and attach it.",
+    failed: "🗳️ Your compaction failed, and the session browser expired before the error could be shown. Nothing was changed; check the bot logs for details.",
+  },
+  rebuild: {
+    ok: "🏗️ Your session rebuild finished, but the session browser expired before it could be shown. Run `/seam info sessions` to see the result.",
+    failed: "🏗️ Your session rebuild failed, and the session browser expired before the error could be shown. Nothing was changed; check the bot logs for details.",
+  },
+  summary: {
+    ok: "🪄 Your AI summary finished, but the session browser expired before it could be shown — it is attached here so it is not lost.",
+    failed: "🪄 Your AI summary failed, and the session browser expired before the error could be shown. Check the bot logs for details.",
+  },
+  migration: {
+    ok: "🎉 Your session migration finished, but the session browser expired before it could be shown. Run `/seam info sessions` to see the result.",
+    failed: "🎉 Your session migration failed, and the session browser expired before the error could be shown. Check the bot logs for details.",
+  },
+  import: {
+    ok: "📤 Your session import finished, but the session browser expired before it could be shown. Run `/seam info sessions` to see the result.",
+    failed: "📤 Your session import failed, and the session browser expired before the error could be shown. Check the bot logs for details.",
+  },
+};
 
 /**
  * Default ceiling for the pre-close quiesce barrier (#174). Long enough for a
@@ -4629,6 +4669,14 @@ export class Orchestrator {
     const cwd = record.repoPath ?? this.config.REPOS_ROOT;
     const channel: ChannelRef = opts?.channel ?? { platform: record.platform, id: record.channelRef };
     const onProgress = opts?.onProgress;
+    // #179: read the binding ONCE, here, before the first pipeline await, and
+    // never again. `record` is a live object shared with the caller — the
+    // session browser holds it for its whole ten-minute life, and
+    // `attachCompactedSession` itself writes back to it — so reading
+    // `record.acpSessionId` at completion time would compare the world against
+    // a value the world had already moved, and the change detection below would
+    // see nothing. This is the immutable "before" of the whole operation.
+    const observedAtStart = record.acpSessionId;
 
     const result =
       source === "discord"
@@ -4666,11 +4714,9 @@ export class Orchestrator {
       record,
       sourceId: sessionId,
       newId: newSessionId,
-      // The binding as it was when this job STARTED. `record` is a snapshot the
-      // caller captured before a pipeline that can run for many minutes, so it
-      // is used ONLY to detect that the binding moved — never as the value to
-      // write back.
-      observedAtStart: record.acpSessionId,
+      // Captured before the pipeline (above). Used ONLY to detect that the
+      // binding moved — never as the value to write back.
+      observedAtStart,
       intent: opts?.attachIntent ?? "swap-only",
     });
 
@@ -9426,7 +9472,59 @@ export class Orchestrator {
       onError: (err, phase, reason) => {
         this.logger.debug({ err, phase, reason }, "card lifecycle render skipped");
       },
+      // The expiry render is triggered by an event, so it is fire-and-forget
+      // like the jobs below; track it in the same set.
+      track: (settling) => this.trackCardJob(settling),
     });
+  }
+
+  /**
+   * Fire-and-forget work launched from an interactive card (#179).
+   *
+   * A premium compaction, a rebuild, an AI summary, a migration and the import
+   * modal all run for minutes after their button handler returns — they have
+   * to, or the collector could not answer anything else meanwhile. They were
+   * launched as bare `void (async () => …)()`, which has two costs: an
+   * exception escaping the block is an unhandled rejection, and NOTHING can
+   * tell whether the card's result has landed. The second cost is why the only
+   * available test for "did the expired card stay inert?" was a timer.
+   */
+  private readonly cardJobs = new Set<Promise<void>>();
+
+  /** Register an already-running card promise. Never rejects to the caller. */
+  private trackCardJob(work: Promise<void>): void {
+    const tracked = work
+      .catch((err) => {
+        this.logger.error({ err }, "card job failed");
+      })
+      .finally(() => {
+        this.cardJobs.delete(tracked);
+      });
+    this.cardJobs.add(tracked);
+  }
+
+  /** Launch a card job. `.then(work)` so a SYNCHRONOUS throw is caught too. */
+  private runCardJob(work: () => Promise<void>): void {
+    this.trackCardJob(Promise.resolve().then(work));
+  }
+
+  /** How many card jobs are still running. */
+  get pendingCardJobCount(): number {
+    return this.cardJobs.size;
+  }
+
+  /**
+   * Resolve once every card job — including a collector expiry's own render —
+   * has settled.
+   *
+   * Runs to a fixpoint: a settling job can register another (a completion that
+   * expires the card). Callers must bound it; there is no internal cap, because
+   * a cap would let this report "finished" with work still running.
+   */
+  async settleCardJobs(): Promise<void> {
+    while (this.cardJobs.size > 0) {
+      await Promise.allSettled([...this.cardJobs]);
+    }
   }
 
   /**
@@ -9454,11 +9552,36 @@ export class Orchestrator {
     render: (view: CardView) => Promise<void>;
     /** The result card, controls included. Stripped automatically when settled. */
     view: CardView;
+    /**
+     * `"terminal"` settles the card component-free even while the collector is
+     * live — for jobs whose result ENDS the card (a migration rebinds the
+     * thread; there is nothing left to go Back to). `"repeatable"` keeps the
+     * controls while the collector can still answer them.
+     */
+    mode?: "repeatable" | "terminal";
+    /** Lifecycle reason recorded for a terminal settle. */
+    reason?: string;
     /** Where to post if the card cannot be edited at all. */
     channel: ChannelRef | null;
-    /** What to say there. Must stand alone — the card may be unreachable. */
-    fallbackText: string;
+    /** WHICH fixed sentence the thread gets — never free text. See the table. */
+    fallback: { kind: CardFallbackKind; outcome: "ok" | "failed" };
+    /**
+     * Content that would otherwise die with the card. Delivered as a file so a
+     * result the operator paid for survives an expired token — an AI summary
+     * exists nowhere else once the card is gone.
+     */
+    fallbackFile?: { filename: string; body: string };
   }): Promise<"live" | "inert" | "fallback"> {
+    // A terminal result settles the card FIRST and renders second, deliberately
+    // not through `lifecycle.terminal`: that helper swallows its own render
+    // error and reports success, so a dead interaction token would look like a
+    // delivered card. `dispose` stops the collector and blocks every later
+    // settle without rendering anything, which leaves the render — and its
+    // failure — visible to the fallback below.
+    if (opts.mode === "terminal" && !opts.lifecycle.settled) {
+      await opts.lifecycle.dispose(opts.reason ?? "job-complete");
+    }
+
     const settled = opts.lifecycle.settled;
     const paint = async (view: CardView): Promise<boolean> => {
       const shaped = completionView(view, { settled, expiredNote: LONG_JOB_CARD_EXPIRED_NOTE });
@@ -9486,14 +9609,49 @@ export class Orchestrator {
       if (await paint(attempt)) return settled ? "inert" : "live";
     }
 
-    if (opts.channel && this.adapter.sendMessage) {
+    await this.postCardFallback(opts.channel, opts.fallback, opts.fallbackFile);
+    return "fallback";
+  }
+
+  /**
+   * Tell the THREAD that a card action finished, when the card itself is
+   * unreachable (#179).
+   *
+   * The sentence is chosen from a fixed table, never composed. The card this
+   * replaces was ephemeral — only the operator saw it — while the thread is
+   * not, so nothing may be widened just because a token expired. A session id
+   * names a stored conversation; an exception message can carry file paths,
+   * prompt fragments or credentials. Neither is available to this function by
+   * construction, which is a stronger guarantee than remembering to redact.
+   *
+   * Content the operator would otherwise lose still rides along as a FILE —
+   * that is the result they asked for, not incidental metadata about it.
+   */
+  private async postCardFallback(
+    channel: ChannelRef | null,
+    fallback: { kind: CardFallbackKind; outcome: "ok" | "failed" },
+    file?: { filename: string; body: string }
+  ): Promise<void> {
+    if (!channel) return;
+    const text = CARD_FALLBACK_TEXT[fallback.kind][fallback.outcome];
+    if (this.adapter.sendMessage) {
       try {
-        await this.adapter.sendMessage(opts.channel, opts.fallbackText);
+        await this.adapter.sendMessage(channel, text);
       } catch (err) {
-        this.logger.warn({ err }, "long job: result fallback message failed");
+        this.logger.warn({ err, kind: fallback.kind }, "card fallback notice failed");
       }
     }
-    return "fallback";
+    if (file && this.adapter.sendFile) {
+      try {
+        await this.adapter.sendFile(channel, {
+          data: Buffer.from(file.body, "utf8"),
+          filename: file.filename,
+          mimeType: "text/markdown",
+        });
+      } catch (err) {
+        this.logger.warn({ err, kind: fallback.kind }, "card fallback file failed");
+      }
+    }
   }
 
   /**
@@ -13927,7 +14085,7 @@ export class Orchestrator {
         report?: { path: string; name: string };
       }>;
     }): void => {
-      void (async () => {
+      this.runCardJob(async () => {
         // The start card: component-free by construction, so a click during the
         // run cannot reach a control the job is about to invalidate.
         await lifecycle.refresh({ embeds: [opts.progressEmbed], components: [] });
@@ -13999,9 +14157,7 @@ export class Orchestrator {
                 : {}),
             },
             channel: browserChannel ?? null,
-            fallbackText:
-              `${opts.successTitle} — new session \`${res.newId}\` ` +
-              `(from \`${opts.session.sessionId}\`). ${stripMarkdownEmphasis(attachLine)}`,
+            fallback: { kind: "compaction", outcome: "ok" },
           });
         } catch (err: unknown) {
           const message = (err as Error)?.message ?? String(err);
@@ -14022,10 +14178,10 @@ export class Orchestrator {
             },
             view: { embeds: [errorEmbed], components: [backRow()] },
             channel: browserChannel ?? null,
-            fallbackText: `${opts.failureTitle}: ${message.slice(0, 500)}`,
+            fallback: { kind: "compaction", outcome: "failed" },
           });
         }
-      })();
+      });
     };
 
     collector.on("collect", async (btnInteraction) => {
@@ -14278,7 +14434,7 @@ export class Orchestrator {
           components: [],
         });
 
-        void (async () => {
+        this.runCardJob(async () => {
           try {
             const channelRef = { platform: "discord", id: i.channelId };
             const { newSessionId, summary } = await this.rebuildSessionFromThread(
@@ -14318,7 +14474,7 @@ export class Orchestrator {
                 ],
               },
               channel: browserChannel ?? null,
-              fallbackText: `🏗️ Session rebuilt — new session \`${newSessionId}\`.`,
+              fallback: { kind: "rebuild", outcome: "ok" },
             });
           } catch (err: any) {
             this.logger.error({ err, channelId: i.channelId }, "failed to rebuild session");
@@ -14335,10 +14491,10 @@ export class Orchestrator {
               },
               view: { embeds: [errorEmbed], components: [backRow()] },
               channel: browserChannel ?? null,
-              fallbackText: `❌ Rebuild failed: ${String(err?.message ?? err).slice(0, 500)}`,
+              fallback: { kind: "rebuild", outcome: "failed" },
             });
           }
-        })();
+        });
       } else if (customId === "sessions:summary") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
@@ -14353,7 +14509,7 @@ export class Orchestrator {
             components: [],
           });
 
-          void (async () => {
+          this.runCardJob(async () => {
             let tempRuntime: AgentRuntime | undefined;
             try {
               const transcript = await manager.getTranscript(cwd, session.sessionId);
@@ -14449,7 +14605,11 @@ export class Orchestrator {
                 },
                 view: { embeds: [summaryEmbed], components: [backRow()] },
                 channel: browserChannel ?? null,
-                fallbackText: `🪄 AI summary for \`${session.sessionId}\` is ready, but this browser card expired.`,
+                fallback: { kind: "summary", outcome: "ok" },
+                // #179: a summary exists NOWHERE else. A "your summary is
+                // ready" notice with the summary discarded is the same silent
+                // loss this issue is about, one surface over.
+                fallbackFile: { filename: "session-summary.md", body: summaryText },
               });
             } catch (err: any) {
               this.logger.error({ err, sessionId: session.sessionId }, "failed to generate AI summary");
@@ -14466,7 +14626,7 @@ export class Orchestrator {
                 },
                 view: { embeds: [errorEmbed], components: [backRow()] },
                 channel: browserChannel ?? null,
-                fallbackText: `❌ AI summary failed: ${String(err?.message ?? err).slice(0, 500)}`,
+                fallback: { kind: "summary", outcome: "failed" },
               });
             } finally {
               if (tempRuntime) {
@@ -14479,7 +14639,7 @@ export class Orchestrator {
                 }
               }
             }
-          })();
+          });
         }
       } else if (
         customId === "sessions:compact" ||
@@ -14513,6 +14673,11 @@ export class Orchestrator {
                     `Compaction is not supported for agent profile \`${record.agentId}\` (no summarizer model).`
                   );
                 }
+                // #179: before the FIRST await, not after. `record` is the
+                // browser's live snapshot and is written back to on completion,
+                // so reading it later compares the world against a value that
+                // has already followed it.
+                const observedAtStart = record.acpSessionId;
                 const built = await this.buildDefaultCompactionSeed({
                   profile,
                   manager,
@@ -14525,7 +14690,6 @@ export class Orchestrator {
                 // Non-destructive: seed a NEW session with the summary
                 // (resumable) and leave the original intact.
                 const cfg = this.store.readConfig(record);
-                const observedAtStart = record.acpSessionId;
                 const newId = await this.seedNewSession({
                   profile, cwd,
                   ...(cfg.model ? { model: cfg.model } : {}),
@@ -14654,7 +14818,11 @@ export class Orchestrator {
         }
 
         await submission.deferUpdate();
-        await submission.editReply({
+        // #179: unlike the other progress paints, this one is on the far side of
+        // a modal that can sit open for two minutes — long enough for the
+        // collector to expire underneath it. Through the lifecycle, so it
+        // cannot overwrite the expiry notice with something that looks live.
+        await lifecycle.refresh({
           embeds: [
             new EmbedBuilder()
               .setTitle("📤 Importing Session…")
@@ -14666,7 +14834,7 @@ export class Orchestrator {
           components: [],
         });
 
-        void (async () => {
+        this.runCardJob(async () => {
           let tempRuntime: AgentRuntime | undefined;
           try {
             const transcript = await manager.getTranscript(cwd, session.sessionId);
@@ -14754,7 +14922,7 @@ export class Orchestrator {
               },
               view: { embeds: [successEmbed], components: [backRow()] },
               channel: browserChannel ?? null,
-              fallbackText: `📤 Import finished for \`${session.sessionId}\`, but this browser card expired.`,
+              fallback: { kind: "import", outcome: "ok" },
             });
           } catch (err: any) {
             this.logger.error({ err, sessionId: session.sessionId }, "failed to import session");
@@ -14769,7 +14937,7 @@ export class Orchestrator {
               },
               view: { embeds: [errorEmbed], components: [backRow()] },
               channel: browserChannel ?? null,
-              fallbackText: `❌ Import failed: ${String(err?.message ?? err).slice(0, 500)}`,
+              fallback: { kind: "import", outcome: "failed" },
             });
           } finally {
             if (tempRuntime) {
@@ -14785,7 +14953,7 @@ export class Orchestrator {
               }
             }
           }
-        })();
+        });
       } else if (customId === "sessions:migrate") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
@@ -14857,7 +15025,7 @@ export class Orchestrator {
             components: [],
           });
 
-          void (async () => {
+          this.runCardJob(async () => {
             let tempRuntime: AgentRuntime | undefined;
             try {
               const transcript = await manager.getTranscript(cwd, session.sessionId);
@@ -14957,9 +15125,24 @@ export class Orchestrator {
               // #159: this used to render a "Close" button and stop the
               // collector in the same breath — a control that could only ever
               // answer "interaction failed". Terminal means no components.
-              await lifecycle.terminal("migrated", {
-                embeds: [successEmbed],
-                components: [],
+              //
+              // #179: and it goes through the SAME settle path as the failure
+              // branch below. `lifecycle.terminal` swallows its own render
+              // error and returns true, so a migration that outlived the
+              // interaction token reported success while the operator saw
+              // nothing at all — the card frozen mid-progress, the thread
+              // rebound underneath them, and no notice anywhere. Success is the
+              // branch where losing the message matters MOST.
+              await this.settleLongJobCard({
+                lifecycle,
+                render: async (view) => {
+                  await i.editReply(view as InteractionEditReplyOptions);
+                },
+                view: { embeds: [successEmbed], components: [] },
+                mode: "terminal",
+                reason: "migrated",
+                channel: browserChannel ?? null,
+                fallback: { kind: "migration", outcome: "ok" },
               });
             } catch (err: any) {
               this.logger.error({ err, sessionId: session.sessionId }, "failed to migrate session");
@@ -14979,7 +15162,7 @@ export class Orchestrator {
                 },
                 view: { embeds: [errorEmbed], components: [backRow()] },
                 channel: browserChannel ?? null,
-                fallbackText: `❌ Migration failed: ${String(err?.message ?? err).slice(0, 500)}`,
+                fallback: { kind: "migration", outcome: "failed" },
               });
             } finally {
               if (tempRuntime) {
@@ -14992,7 +15175,7 @@ export class Orchestrator {
                 }
               }
             }
-          })();
+          });
         }
       } else if (customId === "sessions:summary_back") {
         await btnInteraction.deferUpdate();

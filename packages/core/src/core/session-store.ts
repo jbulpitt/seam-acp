@@ -1107,15 +1107,26 @@ export class SessionStore {
    *
    * `expected` is the empty string for "currently unbound", matching how
    * `SessionRecord.acpSessionId` represents it everywhere else.
+   *
+   * Touches `acp_session_id` and NOTHING else — deliberately not `updated_utc`.
+   * That column is the thread's own last-modified stamp, read by name
+   * refreshes, staleness checks and operator listings; a compaction moving a
+   * binding is not the thread being edited, and bumping it would make an
+   * automated swap indistinguishable from a user's own change. Every other
+   * column stays byte-identical, which is the whole point of doing this as one
+   * conditional UPDATE instead of a whole-record upsert.
    */
   compareAndSwapAcpSession(id: string, expected: string, next: string): boolean {
+    // `acp_session_id` is `TEXT NOT NULL` (see the schema above), so "unbound"
+    // is the empty string and a plain `=` is exact — no COALESCE needed, and
+    // none written, so nobody reads one as evidence that NULL is reachable.
     const res = this.db
       .prepare(
         `UPDATE sessions
-            SET acp_session_id = ?, updated_utc = ?
-          WHERE id = ? AND COALESCE(acp_session_id, '') = ?`
+            SET acp_session_id = ?
+          WHERE id = ? AND acp_session_id = ?`
       )
-      .run(next, new Date().toISOString(), id, expected);
+      .run(next, id, expected);
     return res.changes > 0;
   }
 

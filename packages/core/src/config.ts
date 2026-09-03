@@ -505,6 +505,14 @@ const Schema = z.object({
 
 
   TURN_TIMEOUT_SECONDS: z.coerce.number().int().min(10).max(604800).default(900),
+  /** Runtime-idle channel tails older than this are reported as wedged and may
+   * be repaired by `/seamadmin recover` in auto mode. */
+  CHANNEL_QUEUE_WEDGE_GRACE_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(3600)
+    .default(30),
   /** Maximum graceful restart drain. On expiry the existing force-restart path
    * takes over so a leaked turn counter can never wedge redeploy indefinitely. */
   RESTART_DRAIN_TIMEOUT_MS: z.coerce

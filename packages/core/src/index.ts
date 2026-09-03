@@ -699,6 +699,7 @@ async function main(): Promise<void> {
             }
             const location = resolveThreadLocation(config, s.channelRef);
             const host = location === "local" ? undefined : config.bridgePresets.get(location);
+            const queue = orchestrator.inspectChannelQueue(s.channelRef);
             return {
               id: s.channelRef,
               name,
@@ -708,7 +709,10 @@ async function main(): Promise<void> {
               effort: cfg.effort.value,
               fastMode: cfg.fastMode?.value === true,
               cwd: cfg.cwd.value,
-              busy: router.isBusy(s.id),
+              busy: router.isBusy(s.id) || queue.state !== "idle",
+              queueState: queue.state,
+              queueAgeMs: queue.ageMs,
+              queueEpoch: queue.epoch,
               status,
               lastActivityUtc: s.updatedUtc,
               location,

@@ -71,3 +71,24 @@ export function writeForceRestartSentinel(dataDir: string): string {
   fs.writeFileSync(file, RESTART_SENTINEL_FORCE_BODY, "utf8");
   return file;
 }
+
+/** Stage a restart without overwriting a request already being drained. */
+export function stageRestartSentinel(
+  dataDir: string,
+  mode: "drain" | "force"
+): { path: string; staged: boolean } {
+  const file = restartSentinelPath(dataDir);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  try {
+    fs.writeFileSync(file, mode === "force" ? RESTART_SENTINEL_FORCE_BODY : "", {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    return { path: file, staged: true };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      return { path: file, staged: false };
+    }
+    throw err;
+  }
+}

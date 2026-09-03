@@ -297,9 +297,9 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(() => buildSeamAdminCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 8 top-level slots (1 subcommand + 7 groups)", () => {
+  it("registers exactly 9 top-level slots (2 subcommands + 7 groups)", () => {
     const json = admin();
-    expect(json.options?.length ?? 0).toBe(8);
+    expect(json.options?.length ?? 0).toBe(9);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
@@ -310,6 +310,7 @@ describe("/seamadmin — operator surface (#151)", () => {
   it("lists exactly the operator slots", () => {
     expect((admin().options ?? []).map((o) => o.name)).toEqual([
       "rebuild",
+      "recover",
       "schedule",
       "project",
       "upload",
@@ -372,7 +373,7 @@ describe("/seamadmin — operator surface (#151)", () => {
     const json = admin();
     expect(leafNames(json, "project")).toEqual(["new", "list", "remove"]);
     expect(leafNames(json, "upload")).toEqual(["pull", "push", "secret"]);
-    expect(leafNames(json, "bridge")).toEqual(["add", "rotate", "list", "remove"]);
+    expect(leafNames(json, "bridge")).toEqual(["add", "rotate", "list", "remove", "restart"]);
     expect(leafNames(json, "debug")).toEqual([
       "tail",
       "exec",
@@ -407,6 +408,25 @@ describe("/seamadmin — operator surface (#151)", () => {
       expect(option.type).toBe(STRING);
       expect(option.required ?? false).toBe(false);
     }
+  });
+
+  it("exposes localized queue recovery and explicit restart modes (#180)", () => {
+    const recover = slot(admin(), "recover");
+    expect(recover?.type).toBe(SUB_COMMAND);
+    expect(recover?.options?.map((o) => o.name)).toEqual(["thread", "mode"]);
+    expect(recover?.options?.[0]).toMatchObject({ required: true, autocomplete: true });
+    expect(recover?.options?.[1]?.choices?.map((choice) => choice.value)).toEqual([
+      "auto",
+      "force",
+    ]);
+
+    const restart = slot(admin(), "bridge")?.options?.find((o) => o.name === "restart");
+    expect(restart?.options?.map((o) => o.name)).toEqual(["mode", "confirm"]);
+    expect(restart?.options?.[0]?.choices?.map((choice) => choice.value)).toEqual([
+      "drain",
+      "force",
+    ]);
+    expect(restart?.options?.[1]?.type).toBe(BOOLEAN);
   });
 });
 

@@ -20,6 +20,7 @@
  * order they reach the thread.
  */
 import { access, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { renameSync, rmSync } from "node:fs";
 import * as path from "node:path";
 import { SerialQueue } from "../serial-queue.js";
 import type { Logger } from "../../lib/logger.js";
@@ -59,6 +60,27 @@ export interface DispatchWatcherOpts {
    * against the buggy code.
    */
   readDir?: (dir: string) => Promise<string[]>;
+  /** Deterministic test seam: pauses an owned writer after its temp file is
+   * durable but before the atomic done-file rename. */
+  beforeOwnedDoneCommit?: (id: string) => Promise<void>;
+  /** Deterministic test seam: pauses recovery after its first ledger check but
+   * before publishing the recovered pending artifact. */
+  beforeRecoveryPublish?: (id: string) => Promise<void>;
+}
+
+interface ClaimOwnership {
+  readonly token: symbol;
+  readonly spec: DispatchSpec;
+  readonly targetEpoch: number;
+  readonly globalEpoch: number;
+}
+
+/** Opaque synchronous fence handed from the orchestrator to async recovery. */
+export interface DispatchTargetFence {
+  readonly target: string;
+  readonly epoch: number;
+  readonly token: symbol;
+  readonly claims: readonly DispatchSpec[];
 }
 
 export class DispatchWatcher {
@@ -69,6 +91,8 @@ export class DispatchWatcher {
   private readonly resumeEnabled: boolean;
   private readonly mayRecover: (id: string) => boolean;
   private readonly readDir: (dir: string) => Promise<string[]>;
+  private readonly beforeOwnedDoneCommit?: (id: string) => Promise<void>;
+  private readonly beforeRecoveryPublish?: (id: string) => Promise<void>;
 
   /** One FIFO per target thread — different targets get different queues and
    *  therefore run concurrently. */
@@ -76,11 +100,31 @@ export class DispatchWatcher {
   /** Ids claimed by this process, so an overlapping poll tick can't pick up a
    *  spec that's mid-flight (the rename claim also guards this, but only until
    *  the file lands in `running/`). */
-  private readonly inFlight = new Set<string>();
+  private readonly inFlight = new Map<string, ClaimOwnership>();
+  /** Pending-file reads that have not resolved enough metadata to become an
+   * owned claim yet. Target fencing is detected with `fenceSequence`. */
+  private readonly claiming = new Set<string>();
   /** Artifacts terminalized by the Voice Console quarantine path. A claimed
    *  callback may still be waiting in its target queue (or cancelling); this
    *  fence prevents it from starting or overwriting the quarantine result. */
   private readonly quarantined = new Set<string>();
+  /** Local recovery swaps both this generation and the SerialQueue instance.
+   * A late callback from the old generation is observation-only: it may settle,
+   * but it cannot write done or remove the re-queued running artifact. */
+  private readonly targetEpochs = new Map<string, number>();
+  /** Sequence of the latest synchronous fence for each target. A claim reads
+   * the spec before rename and refuses the rename if its target was fenced in
+   * that window. */
+  private fenceSequence = 0;
+  private readonly targetFenceSequences = new Map<string, number>();
+  /** A target stays blocked between synchronous fencing and the caller's
+   * explicit release after async filesystem/runtime reconciliation. */
+  private readonly targetFences = new Map<string, symbol>();
+  private globalEpoch = 0;
+  private globalFence?: symbol;
+  /** Filesystem commits for one artifact are serialized across worker finish,
+   * recovery, cancellation, and quarantine. */
+  private readonly artifactTails = new Map<string, Promise<void>>();
   private timer?: NodeJS.Timeout;
   private ready = false;
   /**
@@ -99,6 +143,8 @@ export class DispatchWatcher {
     this.resumeEnabled = opts.resumeEnabled === true;
     this.mayRecover = opts.mayRecover ?? (() => true);
     this.readDir = opts.readDir ?? readdir;
+    this.beforeOwnedDoneCommit = opts.beforeOwnedDoneCommit;
+    this.beforeRecoveryPublish = opts.beforeRecoveryPublish;
   }
 
   /** Create the queue dirs, recover anything a crash left in `running/`, then
@@ -138,7 +184,7 @@ export class DispatchWatcher {
 
   /** True while any claimed spec is still running. */
   get inFlightCount(): number {
-    return this.inFlight.size;
+    return this.inFlight.size + this.claiming.size;
   }
 
   /**
@@ -168,7 +214,7 @@ export class DispatchWatcher {
       // we decide we are done.
       await new Promise((resolve) => setImmediate(resolve));
       const grew = this.queues.size !== queues.length;
-      if (this.inFlight.size === 0 && this.activeTicks.size === 0 && !grew) return;
+      if (this.inFlightCount === 0 && this.activeTicks.size === 0 && !grew) return;
     }
   }
 
@@ -203,8 +249,11 @@ export class DispatchWatcher {
     const ids = names
       .filter((name) => name.endsWith(".json"))
       .map((name) => name.slice(0, -".json".length))
-      .filter((id) => !this.inFlight.has(id));
-    for (const id of ids) this.inFlight.add(id);
+      .filter((id) => !this.inFlight.has(id) && !this.claiming.has(id));
+    const claimFenceSequence = this.fenceSequence;
+    const claimGlobalEpoch = this.globalEpoch;
+    const claims = ids.map((id) => ({ id, token: Symbol(id) }));
+    for (const { id } of claims) this.claiming.add(id);
 
     // Claim (rename + parse) concurrently — a race here is harmless — but collect
     // the winners and ENQUEUE their runs in a deterministic arrival order
@@ -212,16 +261,16 @@ export class DispatchWatcher {
     // would reach their SerialQueue in whatever order the async claim races
     // resolve, breaking the "on-disk arrival order is the order they reach the
     // thread" guarantee (and flaking any test that relies on it).
-    const claimed: Array<{ id: string; spec: DispatchSpec }> = [];
+    const claimed: Array<{ id: string; spec: DispatchSpec; owner: ClaimOwnership }> = [];
     await Promise.all(
-      ids.map(async (id) => {
+      claims.map(async ({ id, token }) => {
         try {
-          const spec = await this.claimSpec(id);
-          if (spec) claimed.push({ id, spec });
-          else this.inFlight.delete(id); // ENOENT (lost the claim) or already finalized
+          const claim = await this.claimSpec(id, token, claimFenceSequence, claimGlobalEpoch);
+          if (claim) claimed.push({ id, ...claim });
         } catch (err) {
           this.logger.error({ err, id }, "dispatch: claim failed unexpectedly");
-          this.inFlight.delete(id);
+        } finally {
+          this.claiming.delete(id);
         }
       })
     );
@@ -231,12 +280,11 @@ export class DispatchWatcher {
         a.id.localeCompare(b.id)
     );
 
-    const jobs = claimed.map(({ id, spec }) =>
-      this.runSpec(id, spec)
+    const jobs = claimed.map(({ id, spec, owner }) =>
+      this.runSpec(id, spec, owner)
         .catch((err) => this.logger.error({ err, id }, "dispatch failed unexpectedly"))
         .finally(() => {
-          this.inFlight.delete(id);
-          this.quarantined.delete(id);
+          if (this.inFlight.get(id) === owner) this.inFlight.delete(id);
         })
     );
     await Promise.all(jobs);
@@ -271,12 +319,7 @@ export class DispatchWatcher {
         this.logger.warn({ id }, "dispatch: terminalized stale spec blocked by ledger");
         continue;
       }
-      try {
-        await rename(runningPath, path.join(this.dirs.pending, name));
-        requeued++;
-      } catch (err) {
-        this.logger.warn({ err, id }, "dispatch: could not re-enqueue stale spec");
-      }
+      if (await this.requeueStale(id)) requeued++;
     }
     if (requeued > 0) {
       this.logger.info({ requeued }, "dispatch: re-enqueued stale running specs");
@@ -356,69 +399,234 @@ export class DispatchWatcher {
   /** Move a marked stale spec from `running/` to `pending/` so the next tick
    *  claims it through the normal dispatch path. */
   async requeueStale(id: string): Promise<boolean> {
-    const name = `${id}.json`;
-    const runningPath = path.join(this.dirs.running, name);
-    const pendingPath = path.join(this.dirs.pending, name);
-    if (await exists(path.join(this.dirs.done, name))) {
-      await rm(runningPath, { force: true }).catch(() => {});
-      return false;
-    }
-    try {
-      await rename(runningPath, pendingPath);
+    return this.withArtifact(id, async () => {
+      const name = `${id}.json`;
+      const runningPath = path.join(this.dirs.running, name);
+      const pendingPath = path.join(this.dirs.pending, name);
+      if (await exists(path.join(this.dirs.done, name))) {
+        await rm(runningPath, { force: true }).catch(() => {});
+        return false;
+      }
+      let spec: DispatchSpec;
+      try {
+        spec = parseDispatchSpec(id, await readFile(runningPath, "utf8"));
+      } catch (err) {
+        this.logger.warn({ err, id }, "dispatch: could not read resume spec");
+        return false;
+      }
+      if (!this.mayRecover(id)) {
+        await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
+        return false;
+      }
+      if (this.beforeRecoveryPublish) await this.beforeRecoveryPublish(id);
+      if (!this.mayRecover(id)) {
+        await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
+        return false;
+      }
+      try {
+        // The final ledger check and publication are one non-yielding commit
+        // section, so a terminal transition cannot land between them.
+        renameSync(runningPath, pendingPath);
+      } catch (err) {
+        this.logger.warn({ err, id }, "dispatch: could not requeue resume spec");
+        return false;
+      }
+      if (!this.mayRecover(id)) {
+        await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
+        return false;
+      }
       return true;
-    } catch (err) {
-      this.logger.warn({ err, id }, "dispatch: could not requeue resume spec");
-      return false;
+    });
+  }
+
+  /**
+   * Synchronously revoke every current claim for a target and block new ones.
+   * The caller must do this before its first await, then retain the returned
+   * fence through filesystem reconciliation and runtime abort/invalidation.
+   */
+  fenceTarget(target: string): DispatchTargetFence {
+    const epoch = this.targetEpoch(target) + 1;
+    const token = Symbol(`target-fence:${target}:${epoch}`);
+    const sequence = ++this.fenceSequence;
+    this.targetEpochs.set(target, epoch);
+    this.targetFenceSequences.set(target, sequence);
+    this.targetFences.set(target, token);
+    this.queues.set(target, new SerialQueue());
+    const claims = [...this.inFlight.values()].filter((owner) => owner.spec.target === target);
+    for (const owner of claims) {
+      if (this.inFlight.get(owner.spec.id) === owner) this.inFlight.delete(owner.spec.id);
+    }
+    return Object.freeze({
+      target,
+      epoch,
+      token,
+      claims: Object.freeze(claims.map((owner) => owner.spec)),
+    });
+  }
+
+  /** Release a target only when this is still its newest fence. */
+  releaseTargetFence(fence: DispatchTargetFence): void {
+    if (this.targetFences.get(fence.target) === fence.token) {
+      this.targetFences.delete(fence.target);
     }
   }
 
   /**
+   * Async half of localized repair. Worker finalization, recovery publication,
+   * and cleanup all take the same id-scoped serializer. The durable ledger is
+   * checked immediately before and immediately after the atomic publication,
+   * closing the check/rename window in both directions.
+   */
+  async recoverTarget(fence: DispatchTargetFence): Promise<string[]> {
+    if (this.targetFences.get(fence.target) !== fence.token) return [];
+    const listed = await this.listQueueSpecs(["running", "pending"]);
+    const byId = new Map<string, DispatchSpec>();
+    for (const spec of [...listed, ...fence.claims]) {
+      if (spec.target === fence.target) byId.set(spec.id, spec);
+    }
+
+    const recovered: string[] = [];
+    for (const spec of byId.values()) {
+      const didRecover = await this.withArtifact(spec.id, async () => {
+        if (!this.fenceCurrent(fence)) return false;
+        const name = `${spec.id}.json`;
+        const runningPath = path.join(this.dirs.running, name);
+        const pendingPath = path.join(this.dirs.pending, name);
+        const donePath = path.join(this.dirs.done, name);
+        if (await exists(donePath)) {
+          await rm(runningPath, { force: true }).catch(() => {});
+          await rm(pendingPath, { force: true }).catch(() => {});
+          return false;
+        }
+        if (!this.mayRecover(spec.id)) {
+          await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
+          this.logger.warn(
+            { id: spec.id, target: fence.target },
+            "dispatch: local recovery terminalized artifact blocked by ledger"
+          );
+          return false;
+        }
+
+        if (this.beforeRecoveryPublish) await this.beforeRecoveryPublish(spec.id);
+        if (!this.fenceCurrent(fence)) return false;
+        if (!this.mayRecover(spec.id)) {
+          await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
+          return false;
+        }
+
+        if (await exists(runningPath)) {
+          if (!this.fenceCurrent(fence)) return false;
+          if (!this.mayRecover(spec.id)) {
+            await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
+            return false;
+          }
+          try {
+            // Same non-yielding ledger-check/publication commit as manual and
+            // boot recovery.
+            renameSync(runningPath, pendingPath);
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+              this.logger.warn(
+                { err, id: spec.id, target: fence.target },
+                "dispatch: local recovery requeue failed"
+              );
+              return false;
+            }
+          }
+        } else if (!(await exists(pendingPath))) {
+          const published = await this.publishPendingLocked(
+            spec,
+            () => this.fenceCurrent(fence) && this.mayRecover(spec.id)
+          );
+          if (!published) {
+            if (this.fenceCurrent(fence) && !this.mayRecover(spec.id)) {
+              await this.terminalizeLocked(
+                spec,
+                "abandoned: durable delegation ledger is terminal"
+              );
+            }
+            return false;
+          }
+        }
+
+        // A ledger transition can occur during any preceding staging/existence
+        // await. Reconcile it before exposing this artifact for execution.
+        if (!this.fenceCurrent(fence)) return false;
+        if (!this.mayRecover(spec.id)) {
+          await this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal");
+          return false;
+        }
+        return exists(pendingPath);
+      });
+      if (didRecover) recovered.push(spec.id);
+    }
+    return recovered;
+  }
+
+  /**
    * Command-layer cancel: write a terminal done-file THEN drop the running
-   * (and any pending) spec. Same commit ordering as {@link finish}. Does NOT
+   * (and any pending) spec. Same commit ordering as worker finalization. Does NOT
    * live in dispose() — SIGTERM must leave markers intact.
    */
-  async cancelRunning(filter?: { target?: string }): Promise<string[]> {
-    const cancelled: string[] = [];
-    const seen = new Set<string>();
-    for (const spec of await this.listQueueSpecs(["running", "pending"])) {
-      if (filter?.target && spec.target !== filter.target) continue;
-      if (seen.has(spec.id)) continue;
-      seen.add(spec.id);
-      await this.finish(spec.id, {
-        id: spec.id,
-        status: "failed",
-        error: "cancelled by operator",
-        target: spec.target,
-        ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
-        finishedUtc: new Date().toISOString(),
-      });
-      cancelled.push(spec.id);
+  async cancelRunning(filter?: { target?: string; id?: string }): Promise<string[]> {
+    const targetFence = filter?.target ? this.fenceTarget(filter.target) : undefined;
+    const globalFence = filter?.target ? undefined : this.fenceAll();
+    if (filter?.id) {
+      this.quarantined.add(filter.id);
+      this.revokeArtifact(filter.id);
     }
-    return cancelled;
+    try {
+      const listed = await this.listQueueSpecs(["running", "pending"]);
+      const claims = targetFence?.claims ?? globalFence?.claims ?? [];
+      const byId = new Map<string, DispatchSpec>();
+      for (const spec of [...listed, ...claims]) {
+        if (filter?.target && spec.target !== filter.target) continue;
+        if (filter?.id && spec.id !== filter.id) continue;
+        byId.set(spec.id, spec);
+      }
+
+      const cancelled: string[] = [];
+      for (const spec of byId.values()) {
+        this.quarantined.add(spec.id);
+        await this.withArtifact(spec.id, () =>
+          this.terminalizeLocked(spec, "cancelled by operator")
+        );
+        this.quarantined.delete(spec.id);
+        cancelled.push(spec.id);
+      }
+      return cancelled;
+    } finally {
+      if (targetFence) this.releaseTargetFence(targetFence);
+      if (globalFence && this.globalFence === globalFence.token) this.globalFence = undefined;
+      if (filter?.id) this.quarantined.delete(filter.id);
+    }
   }
 
   /** Max-age / deleted-thread abandon: terminal write then drop the marker. */
   async abandonRunning(id: string, reason: string): Promise<void> {
+    this.revokeArtifact(id);
     let target = "";
     let correlationId: string | undefined;
-    try {
-      const spec = parseDispatchSpec(
-        id,
-        await readFile(path.join(this.dirs.running, `${id}.json`), "utf8")
-      );
-      target = spec.target;
-      correlationId = spec.correlationId;
-    } catch {
-      // still finalize so recoverStale cannot re-run it
+    for (const dir of [this.dirs.running, this.dirs.pending]) {
+      try {
+        const spec = parseDispatchSpec(id, await readFile(path.join(dir, `${id}.json`), "utf8"));
+        target = spec.target;
+        correlationId = spec.correlationId;
+        break;
+      } catch {
+        // Try the other durable queue location; still finalize if neither parses.
+      }
     }
-    await this.finish(id, {
-      id,
-      status: "failed",
-      error: `abandoned: ${reason}`,
-      target,
-      ...(correlationId ? { correlationId } : {}),
-      finishedUtc: new Date().toISOString(),
-    });
+    await this.withArtifact(id, () =>
+      this.finishLocked(id, {
+        id,
+        status: "failed",
+        error: `abandoned: ${reason}`,
+        target,
+        ...(correlationId ? { correlationId } : {}),
+        finishedUtc: new Date().toISOString(),
+      })
+    );
   }
 
   /**
@@ -435,56 +643,55 @@ export class DispatchWatcher {
     id: string,
     reason: string
   ): Promise<{ state: "missing" | "done" | "terminalized"; inFlight: boolean }> {
-    const name = `${id}.json`;
-    const donePath = path.join(this.dirs.done, name);
-    const runningPath = path.join(this.dirs.running, name);
-    const pendingPath = path.join(this.dirs.pending, name);
     // Fence first, before filesystem awaits give a polling tick a chance to
     // claim and enter the callback.
+    const owner = this.inFlight.get(id);
+    const inFlight = owner !== undefined;
     this.quarantined.add(id);
+    this.revokeArtifact(id);
+    try {
+      return await this.withArtifact(id, async () => {
+        const name = `${id}.json`;
+        const donePath = path.join(this.dirs.done, name);
+        const runningPath = path.join(this.dirs.running, name);
+        const pendingPath = path.join(this.dirs.pending, name);
+        if (await exists(donePath)) {
+          await rm(runningPath, { force: true }).catch(() => {});
+          await rm(pendingPath, { force: true }).catch(() => {});
+          return { state: "done" as const, inFlight };
+        }
 
-    if (await exists(donePath)) {
-      await rm(runningPath, { force: true }).catch(() => {});
-      await rm(pendingPath, { force: true }).catch(() => {});
-      const inFlight = this.inFlight.has(id);
-      if (!inFlight) this.quarantined.delete(id);
-      return { state: "done", inFlight };
-    }
+        let spec = owner?.spec;
+        let found = spec !== undefined;
+        if (!spec) {
+          for (const artifactPath of [runningPath, pendingPath]) {
+            try {
+              spec = parseDispatchSpec(id, await readFile(artifactPath, "utf8"));
+              found = true;
+              break;
+            } catch (err) {
+              if ((err as NodeJS.ErrnoException).code !== "ENOENT") found = true;
+            }
+          }
+        }
+        if (!found) return { state: "missing" as const, inFlight: false };
 
-    let target = "";
-    let correlationId: string | undefined;
-    let found = false;
-    for (const artifactPath of [runningPath, pendingPath]) {
-      try {
-        const spec = parseDispatchSpec(id, await readFile(artifactPath, "utf8"));
-        target = spec.target;
-        correlationId = spec.correlationId;
-        found = true;
-        break;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") found = true;
-      }
-    }
-    const inFlight = this.inFlight.has(id);
-    if (!found && !inFlight) {
+        await this.finishLocked(id, {
+          id,
+          status: "failed",
+          error: `quarantined: ${reason}`,
+          target: spec?.target ?? "",
+          ...(spec?.correlationId ? { correlationId: spec.correlationId } : {}),
+          finishedUtc: new Date().toISOString(),
+        });
+        if (!(await exists(donePath))) {
+          throw new Error(`dispatch ${id}: quarantine result was not durable`);
+        }
+        return { state: "terminalized" as const, inFlight };
+      });
+    } finally {
       this.quarantined.delete(id);
-      return { state: "missing", inFlight: false };
     }
-
-    await mkdir(this.dirs.done, { recursive: true });
-    await this.finish(id, {
-      id,
-      status: "failed",
-      error: `quarantined: ${reason}`,
-      target,
-      ...(correlationId ? { correlationId } : {}),
-      finishedUtc: new Date().toISOString(),
-    });
-    if (!(await exists(donePath))) {
-      throw new Error(`dispatch ${id}: quarantine result was not durable`);
-    }
-    if (!inFlight) this.quarantined.delete(id);
-    return { state: "terminalized", inFlight };
   }
 
   private async listQueueSpecs(subdirs: Array<"running" | "pending">): Promise<DispatchSpec[]> {
@@ -511,53 +718,102 @@ export class DispatchWatcher {
   }
 
   /**
-   * Claim a pending spec by atomic rename into `running/`, then parse it.
+   * Parse a pending spec, publish immutable ownership, then claim it by atomic
+   * rename into `running/`.
    * Returns the spec on success; `null` when the claim was lost (ENOENT — a
    * racing tick/process won it) or the spec was unparseable (already finalized
    * as `failed` here, since retrying could never succeed). Kept separate from
    * {@link runSpec} so `tick` can order the runs after all claims land.
    */
-  private async claimSpec(id: string): Promise<DispatchSpec | null> {
-    const name = `${id}.json`;
-    const runningPath = path.join(this.dirs.running, name);
+  private async claimSpec(
+    id: string,
+    token: symbol,
+    startedFenceSequence: number,
+    startedGlobalEpoch: number
+  ): Promise<{ spec: DispatchSpec; owner: ClaimOwnership } | null> {
+    return this.withArtifact(id, async () => {
+      const name = `${id}.json`;
+      const pendingPath = path.join(this.dirs.pending, name);
+      const runningPath = path.join(this.dirs.running, name);
+      let spec: DispatchSpec;
+      try {
+        // Parse before rename so target fencing can publish its ownership
+        // barrier before this claim crosses the pending→running commit point.
+        spec = parseDispatchSpec(id, await readFile(pendingPath, "utf8"));
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        try {
+          await rename(pendingPath, runningPath);
+        } catch (renameErr) {
+          if ((renameErr as NodeJS.ErrnoException).code === "ENOENT") return null;
+          throw renameErr;
+        }
+        const message = (err as Error).message;
+        this.logger.error({ id, err }, "dispatch: unusable spec");
+        await this.finishLocked(id, {
+          id,
+          status: "failed",
+          target: "",
+          error: message,
+          finishedUtc: new Date().toISOString(),
+        });
+        return null;
+      }
 
-    // Claim by rename: atomic within a filesystem, so if two ticks (or two
-    // processes) race, exactly one wins and the loser sees ENOENT.
-    try {
-      await rename(path.join(this.dirs.pending, name), runningPath);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-      throw err;
-    }
-
-    try {
-      return parseDispatchSpec(id, await readFile(runningPath, "utf8"));
-    } catch (err) {
-      // Unparseable specs can never succeed — retrying would spin forever, so
-      // record the failure and drain the file out of the queue.
-      const message = (err as Error).message;
-      this.logger.error({ id, err }, "dispatch: unusable spec");
-      await this.finish(id, {
-        id,
-        status: "failed",
-        target: "",
-        error: message,
-        finishedUtc: new Date().toISOString(),
+      const owner: ClaimOwnership = Object.freeze({
+        token,
+        spec,
+        targetEpoch: this.targetEpoch(spec.target),
+        globalEpoch: this.globalEpoch,
       });
-      return null;
-    }
+      const targetWasFenced =
+        (this.targetFenceSequences.get(spec.target) ?? 0) > startedFenceSequence;
+      if (
+        targetWasFenced ||
+        this.globalEpoch !== startedGlobalEpoch ||
+        this.targetFences.has(spec.target) ||
+        this.globalFence
+      ) {
+        return null;
+      }
+      this.inFlight.set(id, owner);
+
+      // Claim by rename: atomic within a filesystem, so if two processes race,
+      // exactly one wins. It is synchronous so a target fence cannot interleave
+      // between the ownership check above and this commit point.
+      try {
+        renameSync(pendingPath, runningPath);
+      } catch (err) {
+        if (this.inFlight.get(id) === owner) this.inFlight.delete(id);
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw err;
+      }
+      return { spec, owner };
+    });
   }
 
   /** Run one claimed spec through its target's SerialQueue and record the
    *  outcome. Invoked by `tick` in arrival order, so the synchronous
    *  `queueFor(target).run(...)` enqueue below preserves same-target order. */
-  private async runSpec(id: string, spec: DispatchSpec): Promise<void> {
+  private async runSpec(id: string, spec: DispatchSpec, owner: ClaimOwnership): Promise<void> {
     this.logger.info(
       { id, target: spec.target, session: spec.session, correlationId: spec.correlationId },
       "dispatch: running"
     );
 
     await this.queueFor(spec.target).run(async () => {
+      if (!this.owns(owner)) return;
+      if (!this.mayRecover(id)) {
+        this.revokeArtifact(id);
+        await this.withArtifact(id, () =>
+          this.terminalizeLocked(spec, "abandoned: durable delegation ledger is terminal")
+        );
+        this.logger.warn(
+          { id, target: spec.target },
+          "dispatch: execution blocked by terminal ledger"
+        );
+        return;
+      }
       if (this.quarantined.has(id)) {
         this.logger.warn({ id, target: spec.target }, "dispatch: quarantined before execution");
         return;
@@ -580,17 +836,18 @@ export class DispatchWatcher {
       };
       try {
         const { output, stopReason } = await this.onDispatch(spec);
-        if (this.quarantined.has(id)) return;
-        await this.finish(id, {
+        const committed = await this.finishOwned(owner, {
           ...base,
           status: "completed",
           output,
           ...(stopReason ? { stopReason } : {}),
           finishedUtc: new Date().toISOString(),
         });
-        this.logger.info({ id, target: spec.target, chars: output.length }, "dispatch: completed");
+        if (committed) {
+          this.logger.info({ id, target: spec.target, chars: output.length }, "dispatch: completed");
+        }
       } catch (err) {
-        if (this.quarantined.has(id)) return;
+        if (!this.owns(owner)) return;
         const message = (err as Error)?.message ?? String(err);
         const partial = err instanceof DispatchTurnError ? err.output : undefined;
         const stopReason = err instanceof DispatchTurnError ? err.stopReason : undefined;
@@ -601,7 +858,7 @@ export class DispatchWatcher {
         // whose onward delivery was deliberately suppressed has to say so —
         // otherwise boot replay reads that routing as work still owed.
         const suppressedOnward = err instanceof DispatchTurnError && err.suppressedOnward;
-        await this.finish(id, {
+        const committed = await this.finishOwned(owner, {
           ...base,
           status: "failed",
           ...(partial ? { output: partial } : {}),
@@ -613,7 +870,7 @@ export class DispatchWatcher {
           ...(stopReason ? { stopReason } : {}),
           finishedUtc: new Date().toISOString(),
         });
-        this.logger.warn({ id, target: spec.target, err }, "dispatch: failed");
+        if (committed) this.logger.warn({ id, target: spec.target, err }, "dispatch: failed");
       }
     });
   }
@@ -621,7 +878,45 @@ export class DispatchWatcher {
   /** Write the done-file (atomically, so `--wait` never reads a half-file),
    *  then drop the running-file. Order matters — see the class doc on
    *  at-least-once delivery. */
-  private async finish(id: string, result: DispatchResult): Promise<void> {
+  private async finishOwned(owner: ClaimOwnership, result: DispatchResult): Promise<boolean> {
+    return this.withArtifact(owner.spec.id, async () => {
+      if (!this.owns(owner)) {
+        await this.restoreRevokedOwnerLocked(owner);
+        return false;
+      }
+      const id = owner.spec.id;
+      const name = `${id}.json`;
+      const finalPath = path.join(this.dirs.done, name);
+      const tmpPath = `${finalPath}.tmp`;
+      let published = false;
+      try {
+        await writeFile(tmpPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+        if (this.beforeOwnedDoneCommit) await this.beforeOwnedDoneCommit(id);
+        if (!this.owns(owner)) {
+          await rm(tmpPath, { force: true }).catch(() => {});
+          await this.restoreRevokedOwnerLocked(owner);
+          return false;
+        }
+        // These tiny metadata operations intentionally do not yield. Ownership
+        // is checked at the actual publication boundary, and neither recovery
+        // nor cancellation can revoke it between that check, the atomic rename,
+        // and cleanup of this claim's queue artifacts.
+        renameSync(tmpPath, finalPath);
+        published = true;
+        rmSync(path.join(this.dirs.running, name), { force: true });
+        rmSync(path.join(this.dirs.pending, name), { force: true });
+      } catch (err) {
+        this.logger.error({ err, id }, "dispatch: could not write result file");
+        await rm(tmpPath, { force: true }).catch(() => {});
+        // If publication succeeded but cleanup failed, the done-file remains
+        // authoritative and startup recovery drops the leftover marker.
+        return published && (await exists(finalPath));
+      }
+      return true;
+    });
+  }
+
+  private async finishLocked(id: string, result: DispatchResult): Promise<void> {
     const name = `${id}.json`;
     const finalPath = path.join(this.dirs.done, name);
     const tmpPath = `${finalPath}.tmp`;
@@ -639,6 +934,115 @@ export class DispatchWatcher {
     await rm(path.join(this.dirs.pending, name), { force: true }).catch(() => {});
   }
 
+  private owns(owner: ClaimOwnership): boolean {
+    const current = this.inFlight.get(owner.spec.id);
+    return (
+      current?.token === owner.token &&
+      current.targetEpoch === owner.targetEpoch &&
+      current.globalEpoch === owner.globalEpoch &&
+      owner.targetEpoch === this.targetEpoch(owner.spec.target) &&
+      owner.globalEpoch === this.globalEpoch &&
+      !this.targetFences.has(owner.spec.target) &&
+      !this.globalFence &&
+      !this.quarantined.has(owner.spec.id)
+    );
+  }
+
+  private fenceCurrent(fence: DispatchTargetFence): boolean {
+    return (
+      this.targetFences.get(fence.target) === fence.token &&
+      this.targetEpoch(fence.target) === fence.epoch
+    );
+  }
+
+  private fenceAll(): { token: symbol; claims: readonly DispatchSpec[] } {
+    const token = Symbol(`global-fence:${this.globalEpoch + 1}`);
+    this.globalEpoch += 1;
+    this.globalFence = token;
+    this.fenceSequence += 1;
+    const claims = [...this.inFlight.values()];
+    for (const owner of claims) {
+      if (this.inFlight.get(owner.spec.id) === owner) this.inFlight.delete(owner.spec.id);
+    }
+    return Object.freeze({
+      token,
+      claims: Object.freeze(claims.map((owner) => owner.spec)),
+    });
+  }
+
+  private revokeArtifact(id: string): void {
+    this.inFlight.delete(id);
+  }
+
+  private async terminalizeLocked(spec: DispatchSpec, error: string): Promise<void> {
+    await this.finishLocked(spec.id, {
+      id: spec.id,
+      status: "failed",
+      error,
+      target: spec.target,
+      ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
+      finishedUtc: new Date().toISOString(),
+    });
+  }
+
+  /** Recreate the claimed spec only when no later terminal owner exists. */
+  private async restoreRevokedOwnerLocked(owner: ClaimOwnership): Promise<void> {
+    const current = this.inFlight.get(owner.spec.id);
+    if (current && current.token !== owner.token) return;
+    await this.restorePendingLocked(owner.spec);
+  }
+
+  private async restorePendingLocked(spec: DispatchSpec): Promise<void> {
+    const name = `${spec.id}.json`;
+    if (await exists(path.join(this.dirs.done, name))) return;
+    const runningPath = path.join(this.dirs.running, name);
+    const pendingPath = path.join(this.dirs.pending, name);
+    if (await exists(runningPath)) {
+      try {
+        await rename(runningPath, pendingPath);
+        return;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+    if (!(await exists(pendingPath))) await this.publishPendingLocked(spec);
+  }
+
+  private async publishPendingLocked(
+    spec: DispatchSpec,
+    mayCommit?: () => boolean
+  ): Promise<boolean> {
+    const pendingPath = path.join(this.dirs.pending, `${spec.id}.json`);
+    const tmpPath = `${pendingPath}.recovery.tmp`;
+    await writeFile(tmpPath, `${JSON.stringify(spec, null, 2)}\n`, "utf8");
+    if (mayCommit && !mayCommit()) {
+      await rm(tmpPath, { force: true }).catch(() => {});
+      return false;
+    }
+    renameSync(tmpPath, pendingPath);
+    return true;
+  }
+
+  private async withArtifact<T>(id: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.artifactTails.get(id) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(
+      () => gate,
+      () => gate
+    );
+    this.artifactTails.set(id, tail);
+    await previous.catch(() => {});
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.artifactTails.get(id) === tail) this.artifactTails.delete(id);
+    }
+  }
+
   private queueFor(target: string): SerialQueue {
     let q = this.queues.get(target);
     if (!q) {
@@ -646,6 +1050,10 @@ export class DispatchWatcher {
       this.queues.set(target, q);
     }
     return q;
+  }
+
+  private targetEpoch(target: string): number {
+    return this.targetEpochs.get(target) ?? 0;
   }
 }
 

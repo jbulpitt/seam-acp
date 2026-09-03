@@ -144,6 +144,11 @@ export interface ThreadEntry {
    *  (interrupting) when a teammate is busy. Derived from the control-plane
    *  runtime even when the agent process lives on a bridge. */
   busy: boolean;
+  /** Channel-tail truth. `wedged` means runtime-idle but an admitted queue tail
+   * exceeded its bounded progress grace. */
+  queueState?: "idle" | "runtime_busy" | "queued" | "wedged";
+  queueAgeMs?: number;
+  queueEpoch?: number;
   /** Host binding (D10). Omit ⇒ `local`. Rendered as `agentId@location`. */
   location?: string;
   /** Host emoji prefix (local 🏠 + each paired bridge). */
@@ -632,7 +637,8 @@ const TOOLS = [
       "verbatim as the thread arg elsewhere), `name` (the human thread title — how you pick the right " +
       "teammate), `isSelf` (true for YOUR OWN thread — never hand off to yourself), the teammate's " +
       "`agent`/`model`/`cwd` (agent is `agentId@location` with host emoji), `status` (active | archived | gone), `lastActivityUtc`, and `busy`. " +
-      "`busy` IS LOAD-BEARING for choosing HOW to reach a teammate: when a thread is busy:true a live turn " +
+      "`busy` IS LOAD-BEARING for choosing HOW to reach a teammate: it includes admitted channel work even " +
+      "when the ACP runtime is idle. `queueState` distinguishes runtime_busy, queued, and wedged. When busy:true a live turn " +
       "is running, so prefer `send` (PULL-ONLY — it waits in the inbox and never interrupts) unless you " +
       "truly need to preempt, in which case use `steer` or `send(interrupt:true)`; when busy:false the " +
       "teammate is idle, so `handoff`/`forward` (which START a turn) land cleanly. Read-only and " +

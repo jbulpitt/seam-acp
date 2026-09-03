@@ -1120,6 +1120,45 @@ export class SessionStore {
       .run({ ...record, namePrefix: record.namePrefix ?? null });
   }
 
+  /**
+   * Move the thread's ACP binding from `expected` to `next`, atomically (#179).
+   *
+   * Returns whether THIS call performed the write. `false` means the binding
+   * was no longer `expected` — someone else changed it — and nothing was
+   * touched.
+   *
+   * Deliberately not `upsert({ ...record, acpSessionId })`. That helper writes
+   * every column from the caller's snapshot, which for a compaction is a record
+   * read ten minutes earlier: it would silently revert any repo/config/agent
+   * change made meanwhile, and it has no way to notice that the binding it is
+   * overwriting is a newer deliberate choice. A single conditional UPDATE
+   * touches one column and lets SQLite arbitrate the race.
+   *
+   * `expected` is the empty string for "currently unbound", matching how
+   * `SessionRecord.acpSessionId` represents it everywhere else.
+   *
+   * Touches `acp_session_id` and NOTHING else — deliberately not `updated_utc`.
+   * That column is the thread's own last-modified stamp, read by name
+   * refreshes, staleness checks and operator listings; a compaction moving a
+   * binding is not the thread being edited, and bumping it would make an
+   * automated swap indistinguishable from a user's own change. Every other
+   * column stays byte-identical, which is the whole point of doing this as one
+   * conditional UPDATE instead of a whole-record upsert.
+   */
+  compareAndSwapAcpSession(id: string, expected: string, next: string): boolean {
+    // `acp_session_id` is `TEXT NOT NULL` (see the schema above), so "unbound"
+    // is the empty string and a plain `=` is exact — no COALESCE needed, and
+    // none written, so nobody reads one as evidence that NULL is reachable.
+    const res = this.db
+      .prepare(
+        `UPDATE sessions
+            SET acp_session_id = ?
+          WHERE id = ? AND acp_session_id = ?`
+      )
+      .run(next, id, expected);
+    return res.changes > 0;
+  }
+
   setNamePrefix(id: string, prefix: string | null): void {
     this.db
       .prepare("UPDATE sessions SET name_prefix = ?, updated_utc = ? WHERE id = ?")

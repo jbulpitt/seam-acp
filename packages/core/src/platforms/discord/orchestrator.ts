@@ -106,11 +106,18 @@ import {
 import { WorkflowInventoryController } from "./workflow-inventory-controls.js";
 import {
   attachCardLifecycle,
+  completionView,
   expiredCardView,
   type CardLifecycle,
   type CardView,
   type StoppableCollector,
 } from "./collector-lifecycle.js";
+import {
+  describeAttachOutcome,
+  planSessionAttachment,
+  type AttachIntent,
+  type AttachOutcome,
+} from "../../core/session-attach.js";
 import { DispatchWatcher } from "../../core/dispatch/watcher.js";
 import {
   CONTINUE_PROMPT,
@@ -460,6 +467,7 @@ import {
 import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { SerialQueue } from "../../core/serial-queue.js";
+import { CardResultVault, type StoredCardResult } from "../../core/card-result-vault.js";
 import { StreamingPanel } from "../../core/streaming-panel.js";
 import { StreamingMessageRenderer } from "../../core/streaming-message-renderer.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
@@ -503,6 +511,67 @@ import {
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
+
+/**
+ * Appended when a long job finishes onto a card whose collector has already
+ * expired (#179). The result is still shown; the controls are not, so the note
+ * has to say where they went.
+ */
+const LONG_JOB_CARD_EXPIRED_NOTE =
+  "⏰ This session browser timed out while the job ran, so its buttons are gone — " +
+  "run `/seam info sessions` again to act on the result.";
+
+/** Flatten `**bold**` for a plain message, which has no embed. */
+function stripMarkdownEmphasis(text: string): string {
+  return text.replace(/\*\*/g, "");
+}
+
+/** The session-browser jobs that can outlive their card (#179). */
+export type CardFallbackKind = "compaction" | "rebuild" | "summary" | "migration" | "import";
+
+/**
+ * The ONLY sentences a dead-token fallback may put in the thread (#179).
+ *
+ * A fixed table rather than a formatted string, because the card being replaced
+ * was ephemeral and the thread is not. Composing this text at the call site is
+ * how a session id — the name of a stored conversation — or a raw exception
+ * message, which can carry file paths, prompt fragments or credentials, ends up
+ * broadcast to everyone in the thread merely because an interaction token
+ * expired. There is no parameter here to leak through.
+ *
+ * The RESULT the operator paid for is delivered separately, as a file
+ * (`postCardFallback`); this is only the "your card is gone, here is what
+ * happened" line.
+ */
+/**
+ * Appended when a result was parked for private collection. Says that
+ * something is waiting and how to get it — never what it is.
+ */
+export const CARD_RESULT_PARKED_NOTICE =
+  "The result is held privately for you — run `/seam info sessions` in this thread to collect it.";
+
+export const CARD_FALLBACK_TEXT: Record<CardFallbackKind, { ok: string; failed: string }> = {
+  compaction: {
+    ok: "🗳️ Your compaction finished, but the session browser expired before it could be shown. The new session is saved — run `/seam info sessions` to see and attach it.",
+    failed: "🗳️ Your compaction failed, and the session browser expired before the error could be shown. Nothing was changed; check the bot logs for details.",
+  },
+  rebuild: {
+    ok: "🏗️ Your session rebuild finished, but the session browser expired before it could be shown. Run `/seam info sessions` to see the result.",
+    failed: "🏗️ Your session rebuild failed, and the session browser expired before the error could be shown. Nothing was changed; check the bot logs for details.",
+  },
+  summary: {
+    ok: "🪄 Your AI summary finished, but the session browser expired before it could be shown.",
+    failed: "🪄 Your AI summary failed, and the session browser expired before the error could be shown. Check the bot logs for details.",
+  },
+  migration: {
+    ok: "🎉 Your session migration finished, but the session browser expired before it could be shown. Run `/seam info sessions` to see the result.",
+    failed: "🎉 Your session migration failed, and the session browser expired before the error could be shown. Check the bot logs for details.",
+  },
+  import: {
+    ok: "📤 Your session import finished, but the session browser expired before it could be shown. Run `/seam info sessions` to see the result.",
+    failed: "📤 Your session import failed, and the session browser expired before the error could be shown. Check the bot logs for details.",
+  },
+};
 
 /**
  * Default ceiling for the pre-close quiesce barrier (#174). Long enough for a
@@ -623,6 +692,8 @@ export class Orchestrator {
   private readonly configMutation: ConfigMutationService;
   private readonly threadNamerConfig: ThreadNamerConfigStore;
   private readonly threadNamer: ThreadNamer;
+  /** #179: private hand-off for results whose card died before showing them. */
+  private readonly cardResults: CardResultVault;
 
   /**
    * #174: one settle-promise per in-flight turn.
@@ -777,6 +848,7 @@ export class Orchestrator {
       path.join(this.config.DATA_DIR, "thread-namer.json"),
       this.logger
     );
+    this.cardResults = new CardResultVault(this.config.DATA_DIR, this.logger);
     this.threadNamer = new ThreadNamer({
       getConfig: () => this.threadNamerConfig.get(),
       describeConfig: (record) => this.router.describeConfig(record),
@@ -1970,7 +2042,7 @@ export class Orchestrator {
    * The single definition of "no work is outstanding", shared by both shutdown
    * phases so they can never drift apart.
    *
-   * Four kinds of outstanding work, and they are not nested:
+   * Five kinds of outstanding work, and they are not nested:
    *   - claimed dispatches — the watcher's per-target queues; their report-back
    *     and chain advance are awaited inside the queue task, so this covers
    *     those side effects too;
@@ -1982,7 +2054,10 @@ export class Orchestrator {
    *     running fire is referenced by nothing else, and its `finally` still has
    *     a schedule-status patch to write;
    *   - tracked post-turn continuations — the fire-and-forget work that runs
-   *     after a turn is released and is therefore invisible to the turn set.
+   *     after a turn is released and is therefore invisible to the turn set;
+   *   - tracked CARD jobs (#179) — a premium compaction, rebuild, AI summary,
+   *     migration or import launched from an interactive card. These outlive
+   *     their click handler by minutes and belong to none of the sets above.
    *
    * Runs to a real fixpoint over all four: settling one can create another (a
    * finishing dispatch enqueues a report-back; a queue release fires a parked
@@ -2010,6 +2085,15 @@ export class Orchestrator {
       await stage(() => Promise.allSettled([...this.activeTurnSettles]));
       await stage(() => Promise.allSettled([...this.inboundWork]));
       await stage(() => this.settleTrackedContinuations());
+      // #179: card jobs are the fifth kind of outstanding work, and the only
+      // one that is neither a turn nor a continuation: a premium compaction
+      // launched from `/seam info sessions` runs for MINUTES after the click
+      // handler that started it returned. It sits in no channel queue, is no
+      // registered turn, and registers no post-turn continuation — so before
+      // this stage existed, shutdown could report a perfectly clean drain while
+      // one was mid-pipeline, and then close the store underneath its
+      // compare-and-swap. Exactly the #174 failure, on a surface #174 predates.
+      await stage(() => this.settleCardJobs());
 
       // Every stage got its chance; now stop. Looping on a failing stage would
       // spin the CPU until the deadline for no benefit — a stage that threw
@@ -2029,6 +2113,7 @@ export class Orchestrator {
         this.activeTurnSettles.size === 0 &&
         this.pendingContinuations.size === 0 &&
         this.inboundWork.size === 0 &&
+        this.cardJobs.size === 0 &&
         (this.dispatchWatcher?.inFlightCount ?? 0) === 0
       ) {
         return;
@@ -4566,11 +4651,36 @@ export class Orchestrator {
       sessionId?: string;
       channel?: ChannelRef;
       onProgress?: (m: string) => void;
+      /**
+       * #179: how much authority this caller has to bind the thread to the
+       * result. Defaults to `"swap-only"` — the programmatic contract, which
+       * follows the binding only if the compacted session held it. The
+       * operator-facing browser buttons pass `"attach"`, which additionally
+       * binds a thread that is currently disconnected.
+       */
+      attachIntent?: AttachIntent;
+      /**
+       * #179: the thread's binding as it was when the operator's ACTION was
+       * admitted, not when this method was entered. A button handler defers the
+       * interaction and repaints a progress card before it ever reaches here —
+       * two round trips in which the operator can attach something else — so
+       * the caller that owns the click is the only one that can sample the real
+       * "before". Defaults to a read at entry for programmatic callers, which
+       * have no earlier moment.
+       */
+      observedAtStart?: string;
     }
   ): Promise<{
     newSessionId: string;
     originalSessionId: string;
+    /**
+     * The compacted session still held the thread's binding at COMPLETION, so
+     * the swap happened. Kept for the MCP/dispatch contract; prefer
+     * `attachment`, which also distinguishes the unattached reasons.
+     */
     wasActive: boolean;
+    /** #179: the authoritative attach decision, taken at completion. */
+    attachment: AttachOutcome;
     reportMarkdown: string;
     stats: PremiumCompactionResult["stats"];
   }> {
@@ -4593,6 +4703,14 @@ export class Orchestrator {
     const cwd = record.repoPath ?? this.config.REPOS_ROOT;
     const channel: ChannelRef = opts?.channel ?? { platform: record.platform, id: record.channelRef };
     const onProgress = opts?.onProgress;
+    // #179: read the binding ONCE, here, before the first pipeline await, and
+    // never again. `record` is a live object shared with the caller — the
+    // session browser holds it for its whole ten-minute life, and
+    // `attachCompactedSession` itself writes back to it — so reading
+    // `record.acpSessionId` at completion time would compare the world against
+    // a value the world had already moved, and the change detection below would
+    // see nothing. This is the immutable "before" of the whole operation.
+    const observedAtStart = opts?.observedAtStart ?? record.acpSessionId;
 
     const result =
       source === "discord"
@@ -4615,9 +4733,9 @@ export class Orchestrator {
 
     if (!result.assembledSeed.trim()) throw new Error("Pipeline produced an empty result.");
 
-    // Non-destructive: seed a NEW resumable session with the summary, bind the
-    // thread to it only if this WAS its active session, and leave the original
-    // intact (recoverable / deletable from the session manager).
+    // Non-destructive: seed a NEW resumable session with the summary, decide
+    // the binding from AUTHORITATIVE state below, and leave the original intact
+    // (recoverable / deletable from the session manager).
     const cfg = this.store.readConfig(record);
     const newSessionId = await this.seedNewSession({
       profile,
@@ -4626,19 +4744,84 @@ export class Orchestrator {
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
       summary: result.assembledSeed,
     });
-    const wasActive = sessionId === record.acpSessionId;
-    if (wasActive) {
-      this.store.upsert({ ...record, acpSessionId: newSessionId, updatedUtc: new Date().toISOString() });
-      await this.router.invalidate(record.id, { clearAcpSession: false });
-    }
+    const attachment = await this.attachCompactedSession({
+      record,
+      sourceId: sessionId,
+      newId: newSessionId,
+      // Captured before the pipeline (above). Used ONLY to detect that the
+      // binding moved — never as the value to write back.
+      observedAtStart,
+      intent: opts?.attachIntent ?? "swap-only",
+    });
 
     return {
       newSessionId,
       originalSessionId: sessionId,
-      wasActive,
+      wasActive: attachment.attached && attachment.reason === "swapped",
+      attachment,
       reportMarkdown: this.formatPremiumReport(result, sessionId),
       stats: result.stats,
     };
+  }
+
+  /**
+   * Bind the thread to a freshly compacted session, compare-and-swap (#179).
+   *
+   * The decision is taken from the record re-read HERE, at completion, not from
+   * the snapshot the job started with — a premium run lasts minutes, and in
+   * that window the thread can be attached, detached or switched. The store's
+   * conditional UPDATE then arbitrates the last narrow race: if the binding
+   * moved between this read and the write, the write is refused and the newer
+   * choice stands.
+   *
+   * Also keeps the caller's `record` snapshot in step with what was persisted,
+   * so a browser that re-renders after this call marks the right session
+   * active instead of the one it captured ten minutes ago.
+   */
+  private async attachCompactedSession(opts: {
+    record: SessionRecord;
+    sourceId: string;
+    newId: string;
+    observedAtStart: string;
+    intent: AttachIntent;
+  }): Promise<AttachOutcome> {
+    const { record, sourceId, newId, observedAtStart, intent } = opts;
+    const fresh = this.store.get(record.id);
+    const plan = planSessionAttachment({
+      current: fresh ? fresh.acpSessionId : null,
+      observedAtStart,
+      sourceId,
+      newId,
+      intent,
+    });
+
+    let outcome: AttachOutcome;
+    if (plan.action === "cas") {
+      if (this.store.compareAndSwapAcpSession(record.id, plan.expect, plan.next)) {
+        outcome = { attached: true, reason: plan.reason };
+        // Drop the warm runtime so the next turn resumes the seeded session.
+        // `clearAcpSession: false` — the binding we just wrote must survive.
+        await this.router.invalidate(record.id, { clearAcpSession: false });
+      } else {
+        // Lost the race between the read above and the UPDATE. Someone bound
+        // the thread in that gap; theirs is the newer deliberate choice.
+        outcome = { attached: false, reason: "rebound-elsewhere" };
+      }
+    } else if (plan.action === "noop") {
+      outcome = { attached: true, reason: plan.reason };
+    } else {
+      outcome = { attached: false, reason: plan.reason };
+    }
+
+    // Re-sync the caller's snapshot from the store either way: the value it
+    // holds is stale whether or not WE were the one who changed it.
+    const settled = this.store.get(record.id);
+    if (settled) record.acpSessionId = settled.acpSessionId;
+    this.logger.info(
+      { recordId: record.id, sourceId, newId, intent, outcome },
+      "compaction attachment decided"
+    );
+    return outcome;
   }
 
   setDispatchWatcher(watcher: DispatchWatcher): void {
@@ -7998,9 +8181,13 @@ export class Orchestrator {
         channel: target,
         onProgress: (m) => this.logger.debug({ dispatch: spec.id, compact: spec.target }, m),
       });
+      // #179: state the attachment outcome explicitly, including the cases
+      // where the binding was deliberately left alone. Silence used to be the
+      // only signal that the seeded session had nothing pointing at it.
       const summary =
-        `✅ Compacted into a new session \`${res.newSessionId}\` via the multi-agent pipeline` +
-        `${res.wasActive ? " — this thread is now bound to it" : ""} (${res.stats.chunks} chunk(s)). ` +
+        `✅ Compacted into a new session \`${res.newSessionId}\` via the multi-agent pipeline ` +
+        `(${res.stats.chunks} chunk(s)). ` +
+        `${stripMarkdownEmphasis(describeAttachOutcome(res.attachment, { newId: res.newSessionId, sourceId: res.originalSessionId }))} ` +
         `Original \`${res.originalSessionId}\` is preserved (review or delete it from the session manager).`;
       await finalize(summary);
       await statusPanel?.finalize("Done", `Compacted (${res.stats.chunks} chunk(s))`).catch(() => {});
@@ -8008,7 +8195,7 @@ export class Orchestrator {
       await this.sendResultFile(target, res.originalSessionId, res.reportMarkdown, "premium-compaction").catch(() => {});
       try { this.store.updateDelegationStatus(spec.id, "completed"); } catch { /* best-effort */ }
       this.logger.info(
-        { dispatch: spec.id, actor, target: spec.target, newSessionId: res.newSessionId, wasActive: res.wasActive },
+        { dispatch: spec.id, actor, target: spec.target, newSessionId: res.newSessionId, attachment: res.attachment },
         "compact-dispatch: completed"
       );
       return { output: summary, stopReason: "compacted" };
@@ -9311,15 +9498,284 @@ export class Orchestrator {
     collector: { stop(reason?: string): void },
     expired: (reason: string) => CardView
   ): CardLifecycle {
+    // #179: ONE FIFO for every render this card will ever make — progress
+    // frames, refreshes, settles and the collector's own expiry.
+    //
+    // Two bugs live in the gap between issuing an edit and Discord acking it.
+    // Ordering: a progress frame issued at T=0 and a terminal completion issued
+    // at T=1 are two independent REST calls, so under per-route backoff the
+    // progress edit can land last and the operator's final view is a stale
+    // "compacting…". Observability: a fire-and-forget `void lifecycle.refresh`
+    // is invisible to shutdown, so the store can close while an edit is in
+    // flight. Serialising and tracking here fixes both for every card at once,
+    // rather than one call site at a time.
+    //
+    // NOTHING may wrap a whole job in `renderQueue.run` — a job renders from
+    // inside, and a nested `run` on the same queue waits for a tail that
+    // contains itself. Only leaf renders are queued.
+    const renderQueue = new SerialQueue();
     return attachCardLifecycle(collector as StoppableCollector, {
-      render: async (view) => {
-        await i.editReply(view as InteractionEditReplyOptions);
-      },
+      render: (view) =>
+        // Tracked copy for shutdown; the ORIGINAL is returned so a caller that
+        // needs to see a dead interaction token (`renderSettledResult`) still
+        // does, instead of getting the swallowed one.
+        this.trackedCardWork(
+          renderQueue.run(async () => {
+            await i.editReply(view as InteractionEditReplyOptions);
+          })
+        ),
       expired,
       onError: (err, phase, reason) => {
         this.logger.debug({ err, phase, reason }, "card lifecycle render skipped");
       },
+      // `handleEnd` is triggered by an event, so it is fire-and-forget like the
+      // jobs below; track the whole settle, not just its render.
+      track: (settling) => this.trackCardJob(settling),
     });
+  }
+
+  /**
+   * Fire-and-forget work launched from an interactive card (#179).
+   *
+   * A premium compaction, a rebuild, an AI summary, a migration and the import
+   * modal all run for minutes after their button handler returns — they have
+   * to, or the collector could not answer anything else meanwhile. They were
+   * launched as bare `void (async () => …)()`, which has two costs: an
+   * exception escaping the block is an unhandled rejection, and NOTHING can
+   * tell whether the card's result has landed. The second cost is why the only
+   * available test for "did the expired card stay inert?" was a timer.
+   */
+  private readonly cardJobs = new Set<Promise<void>>();
+
+  /**
+   * Track `work` for shutdown and hand the ORIGINAL promise back.
+   *
+   * The tracked copy swallows errors so the drain always completes; the
+   * returned one does not, so a caller that must react to a failure — a dead
+   * interaction token, say — still can. Same shape as `runInbound` (#174), and
+   * for the same reason: tracking is not an error boundary.
+   */
+  private trackedCardWork(work: Promise<void>): Promise<void> {
+    this.trackCardJob(work);
+    return work;
+  }
+
+  /** Register an already-running card promise. Never rejects to the caller. */
+  private trackCardJob(work: Promise<void>): void {
+    const tracked = work
+      .catch((err) => {
+        this.logger.error({ err }, "card job failed");
+      })
+      .finally(() => {
+        this.cardJobs.delete(tracked);
+      });
+    this.cardJobs.add(tracked);
+  }
+
+  /** Launch a card job. `.then(work)` so a SYNCHRONOUS throw is caught too. */
+  private runCardJob(work: () => Promise<void>): void {
+    this.trackCardJob(Promise.resolve().then(work));
+  }
+
+  /** How many card jobs are still running. */
+  get pendingCardJobCount(): number {
+    return this.cardJobs.size;
+  }
+
+  /**
+   * Resolve once every card job — including a collector expiry's own render —
+   * has settled.
+   *
+   * Runs to a fixpoint: a settling job can register another (a completion that
+   * expires the card). Callers must bound it; there is no internal cap, because
+   * a cap would let this report "finished" with work still running.
+   */
+  async settleCardJobs(): Promise<void> {
+    while (this.cardJobs.size > 0) {
+      await Promise.allSettled([...this.cardJobs]);
+    }
+  }
+
+  /**
+   * Deliver a LONG JOB's result to the card it was launched from (#179).
+   *
+   * Three things can be true by the time a premium compaction finishes, and
+   * the old code handled none of them:
+   *
+   *   1. the card is still live — paint the result WITH its controls, through
+   *      the lifecycle, so a `Back` button always has a collector behind it;
+   *   2. the 10-minute collector already expired — paint the result INERT. The
+   *      operator still gets the answer they paid for; what they must not get
+   *      is a `Back to Manage` button that can only answer "interaction
+   *      failed". A raw `editReply({ components: [backRow] })` here was the
+   *      #159 regression this issue reports;
+   *   3. the interaction TOKEN is dead too (Discord expires it at 15 minutes,
+   *      independently of the collector) — every edit above throws, so fall
+   *      back to a plain message in the thread rather than losing the result.
+   *
+   * Returns which of the three happened, so callers (and tests) can assert it.
+   */
+  private async settleLongJobCard(opts: {
+    lifecycle: CardLifecycle;
+    /** The result card, controls included. Stripped automatically when settled. */
+    view: CardView;
+    /**
+     * `"terminal"` settles the card component-free even while the collector is
+     * live — for jobs whose result ENDS the card (a migration rebinds the
+     * thread; there is nothing left to go Back to). `"repeatable"` keeps the
+     * controls while the collector can still answer them.
+     */
+    mode?: "repeatable" | "terminal";
+    /** Lifecycle reason recorded for a terminal settle. */
+    reason?: string;
+    /** Where to post if the card cannot be edited at all. */
+    channel: ChannelRef | null;
+    /** WHICH fixed sentence the thread gets — never free text. See the table. */
+    fallback: {
+      kind: CardFallbackKind;
+      outcome: "ok" | "failed";
+      recordId?: string;
+      userId?: string;
+    };
+    /**
+     * Content that would otherwise die with the card — an AI summary exists
+     * nowhere else once the card is gone. PARKED for private collection, never
+     * posted: see `postCardFallback`.
+     */
+    fallbackFile?: { filename: string; body: string };
+  }): Promise<"live" | "inert" | "fallback"> {
+    // A terminal result settles the card FIRST and renders second, deliberately
+    // not through `lifecycle.terminal`: that helper swallows its own render
+    // error and reports success, so a dead interaction token would look like a
+    // delivered card. `dispose` stops the collector and blocks every later
+    // settle without rendering anything, which leaves the render — and its
+    // failure — visible to the fallback below.
+    if (opts.mode === "terminal" && !opts.lifecycle.settled) {
+      await opts.lifecycle.dispose(opts.reason ?? "job-complete");
+    }
+
+    const settled = opts.lifecycle.settled;
+    const paint = async (view: CardView): Promise<boolean> => {
+      const shaped = completionView(view, { settled, expiredNote: LONG_JOB_CARD_EXPIRED_NOTE });
+      if (!settled) {
+        // `refresh` is a no-op once the card has settled, so this cannot
+        // resurrect controls even if expiry lands between the check and here.
+        return opts.lifecycle.refresh(shaped);
+      }
+      try {
+        // Bypasses the settle guard on purpose — `refresh` paints CONTROLS and
+        // is correctly inert here, but the operator's RESULT still has to
+        // arrive. Errors propagate so a dead token reaches the fallback.
+        await opts.lifecycle.renderSettledResult(shaped);
+        return true;
+      } catch (err) {
+        this.logger.debug({ err }, "long job: settled-card render failed");
+        return false;
+      }
+    };
+
+    // An unreadable/oversized report attachment must not cost the operator the
+    // result card itself — retry once without it, as the old handlers did.
+    const attempts: CardView[] =
+      opts.view.files && opts.view.files.length > 0
+        ? [opts.view, { ...opts.view, files: [] }]
+        : [opts.view];
+    for (const attempt of attempts) {
+      if (await paint(attempt)) return settled ? "inert" : "live";
+    }
+
+    await this.postCardFallback(opts.channel, opts.fallback, opts.fallbackFile);
+    return "fallback";
+  }
+
+  /**
+   * Tell the THREAD that a card action finished, when the card itself is
+   * unreachable (#179).
+   *
+   * The sentence is chosen from a fixed table, never composed. The card this
+   * replaces was ephemeral — only the operator saw it — while the thread is
+   * not, so nothing may be widened just because a token expired. A session id
+   * names a stored conversation; an exception message can carry file paths,
+   * prompt fragments or credentials. Neither is available to this function by
+   * construction, which is a stronger guarantee than remembering to redact.
+   *
+   * Content the operator would otherwise lose still rides along as a FILE —
+   * that is the result they asked for, not incidental metadata about it.
+   */
+  private async postCardFallback(
+    channel: ChannelRef | null,
+    fallback: {
+      kind: CardFallbackKind;
+      outcome: "ok" | "failed";
+      /** Who may collect the parked result, and from where. */
+      recordId?: string;
+      userId?: string;
+    },
+    file?: { filename: string; body: string }
+  ): Promise<void> {
+    // The RESULT is parked privately; only a fixed, contentless sentence goes
+    // to the thread. The card was ephemeral — visible to one operator — and a
+    // timeout is not consent to publish its contents to the whole channel.
+    // There is no code path from `file` to `sendMessage`/`sendFile` here, which
+    // is a stronger guarantee than remembering to redact.
+    let parked = false;
+    if (file && fallback.recordId && fallback.userId) {
+      parked =
+        (await this.cardResults.put({
+          recordId: fallback.recordId,
+          userId: fallback.userId,
+          label: fallback.kind,
+          filename: file.filename,
+          body: file.body,
+        })) !== null;
+    }
+    if (!channel || !this.adapter.sendMessage) return;
+    const text = CARD_FALLBACK_TEXT[fallback.kind][fallback.outcome];
+    try {
+      await this.adapter.sendMessage(
+        channel,
+        parked ? `${text}\n${CARD_RESULT_PARKED_NOTICE}` : text
+      );
+    } catch (err) {
+      this.logger.warn({ err, kind: fallback.kind }, "card fallback notice failed");
+    }
+  }
+
+  /**
+   * Hand back anything parked for THIS operator on THIS thread (#179).
+   *
+   * Called when the browser opens, which is the authenticated moment: the
+   * operator ran the command themselves, and the reply is ephemeral, so the
+   * result returns to exactly the audience it was generated for. Best-effort —
+   * a delivery failure must not stop the browser from opening.
+   */
+  private async deliverParkedCardResults(
+    i: ChatInputCommandInteraction,
+    recordId: string
+  ): Promise<number> {
+    let parked: StoredCardResult[];
+    try {
+      parked = await this.cardResults.take(recordId, i.user.id);
+    } catch (err) {
+      this.logger.warn({ err, recordId }, "parked card results could not be read");
+      return 0;
+    }
+    let delivered = 0;
+    for (const entry of parked) {
+      try {
+        await i.followUp({
+          content: `📦 A result from an earlier session-browser action, held for you: **${entry.label}**.`,
+          files: [
+            new AttachmentBuilder(Buffer.from(entry.body, "utf8"), { name: entry.filename }),
+          ],
+          flags: MessageFlags.Ephemeral,
+        });
+        delivered++;
+      } catch (err) {
+        this.logger.warn({ err, recordId, entry: entry.id }, "parked card result delivery failed");
+      }
+    }
+    return delivered;
   }
 
   /**
@@ -13772,8 +14228,30 @@ export class Orchestrator {
       };
     };
 
+    /**
+     * The thread's binding, re-read from the store and written back into the
+     * local snapshot (#179).
+     *
+     * `record` is captured once when the browser opens and then lives for the
+     * whole ten-minute session; a compaction, an attach from another surface,
+     * or an agent switch can move the binding underneath it. Rendering from the
+     * captured value is what made a just-compacted session still show as
+     * "⚪ Inactive". Every render below asks this instead.
+     */
+    const activeSessionId = (): string => {
+      const fresh = this.store.get(record.id);
+      if (fresh) record.acpSessionId = fresh.acpSessionId;
+      return record.acpSessionId;
+    };
+
+    // #179: anything a previous run parked for THIS operator on THIS thread is
+    // handed back here — an authenticated moment (they ran the command) with an
+    // ephemeral reply (only they see it), which is the audience the result was
+    // generated for in the first place.
+    await this.deliverParkedCardResults(i, record.id);
+
     // Render first session in the list
-    const msg = await i.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+    const msg = await i.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
 
     const collector = msg.createMessageComponentCollector({
       filter: (btnInteraction) => btnInteraction.user.id === i.user.id,
@@ -13785,8 +14263,7 @@ export class Orchestrator {
     // no-current-session case (which used to leave the card untouched) is
     // covered too.
     const lifecycle = this.attachListLifecycle(i, collector, () => {
-      const fresh = this.store.get(record.id);
-      const activeId = fresh ? fresh.acpSessionId : record.acpSessionId;
+      const activeId = activeSessionId();
       const currentSession = sessions[currentIndex];
       if (!currentSession) {
         return expiredCardView("⏰ Session browser closed — run `/seam info sessions` again.");
@@ -13808,6 +14285,150 @@ export class Orchestrator {
       return { embeds: [embed], components: [] };
     });
 
+    const browserChannel = this.channelRefFromInteraction(i);
+    const backRow = () =>
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("sessions:summary_back")
+          .setLabel("⬅ Back to Manage")
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+    /**
+     * Run one compaction from the browser and settle its card (#179).
+     *
+     * The single place all three compaction buttons meet, because all three had
+     * the same two defects and only the premium pair was reported:
+     *
+     *   - progress edits and the completion render now go through the card
+     *     LIFECYCLE. A premium run routinely outlives the 10-minute collector;
+     *     the old raw `editReply({ components: [backRow] })` then repainted a
+     *     `Back to Manage` button onto an already-expired card, with no
+     *     collector left to answer it (#159's invariant, broken from the late
+     *     -writer side);
+     *   - the outcome copy is generated from the ATTACH decision rather than a
+     *     start-of-job boolean, so "left unattached" is always stated instead
+     *     of being the silent absence of a sentence.
+     *
+     * Deliberately fire-and-forget: the collector must stay responsive (Close,
+     * navigation) while a multi-minute pipeline runs behind it.
+     */
+    const runBrowserCompaction = (opts: {
+      session: SessionSummary;
+      progressEmbed: EmbedBuilder;
+      progressPrefix: string;
+      successTitle: string;
+      failureTitle: string;
+      run: (onProgress: (m: string) => void) => Promise<{
+        newId: string;
+        attachment: AttachOutcome;
+        /** One line saying what was compacted into what. */
+        detail: string;
+        report?: { path: string; name: string };
+      }>;
+    }): void => {
+      this.runCardJob(async () => {
+        // The start card: component-free by construction, so a click during the
+        // run cannot reach a control the job is about to invalidate.
+        await lifecycle.refresh({ embeds: [opts.progressEmbed], components: [] });
+
+        let lastEdit = 0;
+        let editing = false;
+        /**
+         * Set SYNCHRONOUSLY the moment the pipeline returns, before anything is
+         * awaited. Enqueue order is what fixes render order (`SerialQueue`), so
+         * the only way a progress frame can outlive the result is by being
+         * enqueued after it. A pipeline that keeps calling `onProgress` from a
+         * retained callback after resolving would do exactly that.
+         */
+        let sealed = false;
+        const lines: string[] = [];
+        const pushProgress = (m: string) => {
+          lines.push(m);
+          // Progress goes through the LIFECYCLE, never a raw edit: `refresh` is
+          // a no-op once the card has settled, so the expiry notice stays the
+          // last word, and the host render puts this frame in the card's single
+          // FIFO where it cannot overtake the result.
+          if (sealed || editing) return;
+          const now = Date.now();
+          if (now - lastEdit < STATUS_EDIT_DEBOUNCE_MS) return;
+          editing = true;
+          lastEdit = now;
+          const tail = lines.slice(-8).map((l) => `• ${l}`).join("\n");
+          void lifecycle
+            .refresh({
+              embeds: [
+                EmbedBuilder.from(opts.progressEmbed).setDescription(
+                  `${opts.progressPrefix}\n\n${tail}`
+                ),
+              ],
+              components: [],
+            })
+            .finally(() => {
+              editing = false;
+            });
+        };
+
+        try {
+          const res = await opts.run(pushProgress);
+          sealed = true;
+          // Re-list so the browser can position on the seeded session; its
+          // Attach button is then one click away when the binding was left
+          // deliberately alone.
+          sessions = await manager.listSessions(cwd);
+          const newIndex = sessions.findIndex((s) => s.sessionId === res.newId);
+          if (newIndex !== -1) currentIndex = newIndex;
+
+          const attachLine = describeAttachOutcome(res.attachment, {
+            newId: res.newId,
+            sourceId: opts.session.sessionId,
+          });
+          const successEmbed = new EmbedBuilder()
+            .setTitle(opts.successTitle)
+            .setDescription(
+              `${res.detail}\n${attachLine}\n\n` +
+              `Original \`${opts.session.sessionId}\` is **preserved** — review or delete it from this list.`
+            )
+            // Amber, not green, when the result is not attached: the compaction
+            // succeeded but the thread is not on it, and that must not read as
+            // an unqualified success.
+            .setColor(res.attachment.attached ? 0x2ecc71 : 0xf1c40f);
+
+          await this.settleLongJobCard({
+            lifecycle,
+            view: {
+              embeds: [successEmbed],
+              components: [backRow()],
+              ...(res.report
+                ? { files: [new AttachmentBuilder(res.report.path, { name: res.report.name })] }
+                : {}),
+            },
+            channel: browserChannel ?? null,
+            fallback: { kind: "compaction", outcome: "ok" },
+          });
+        } catch (err: unknown) {
+          sealed = true;
+          const message = (err as Error)?.message ?? String(err);
+          this.logger.error(
+            { err, sessionId: opts.session.sessionId, customId: opts.successTitle },
+            "session browser compaction failed"
+          );
+          const errorEmbed = new EmbedBuilder()
+            .setTitle(opts.failureTitle)
+            .setDescription(`\`\`\`\n${message.slice(0, 1500)}\n\`\`\``)
+            .setColor(0xe74c3c);
+          // Failures obey the same lifecycle rule as successes — a spent card
+          // must not regain a Back button just because the job errored.
+          await this.settleLongJobCard({
+            lifecycle,
+            view: { embeds: [errorEmbed], components: [backRow()] },
+            channel: browserChannel ?? null,
+            fallback: { kind: "compaction", outcome: "failed" },
+          });
+        }
+      });
+    };
+
     collector.on("collect", async (btnInteraction) => {
       const customId = btnInteraction.customId;
 
@@ -13815,13 +14436,13 @@ export class Orchestrator {
         await btnInteraction.deferUpdate();
         if (currentIndex > 0) {
           currentIndex--;
-          await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+          await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
         }
       } else if (customId === "sessions:next") {
         await btnInteraction.deferUpdate();
         if (currentIndex < sessions.length - 1) {
           currentIndex++;
-          await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+          await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
         }
       } else if (customId === "sessions:close") {
         await btnInteraction.deferUpdate();
@@ -13865,7 +14486,7 @@ export class Orchestrator {
             if (newIndex !== -1) {
               currentIndex = newIndex;
             }
-            const opts = makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager);
+            const opts = makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager);
             const embed = opts.embeds?.[0];
             if (embed) {
               embed.setDescription(
@@ -13947,7 +14568,7 @@ export class Orchestrator {
         }
       } else if (customId === "sessions:delete_cancel") {
         await btnInteraction.deferUpdate();
-        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
       } else if (customId === "sessions:delete_confirm") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
@@ -13983,7 +14604,7 @@ export class Orchestrator {
               });
             } else {
               currentIndex = 0;
-              await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+              await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
             }
           } catch (err: any) {
             await btnInteraction.followUp({
@@ -14019,7 +14640,7 @@ export class Orchestrator {
         }
       } else if (customId === "sessions:repair_cancel") {
         await btnInteraction.deferUpdate();
-        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
       } else if (customId === "sessions:repair_confirm") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
@@ -14030,7 +14651,7 @@ export class Orchestrator {
               await this.router.invalidate(record.id);
             }
             sessions = await manager.listSessions(cwd);
-            const opts = makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager);
+            const opts = makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager);
             const embed = opts.embeds?.[0];
             if (embed) {
               embed.setDescription(
@@ -14058,7 +14679,7 @@ export class Orchestrator {
           components: [],
         });
 
-        void (async () => {
+        this.runCardJob(async () => {
           try {
             const channelRef = { platform: "discord", id: i.channelId };
             const { newSessionId, summary } = await this.rebuildSessionFromThread(
@@ -14078,16 +14699,24 @@ export class Orchestrator {
               .setDescription(`Thread has been reconstructed from Discord history.\n\n**New Session ID:** \`${newSessionId}\`\n\n**Summary:**\n${summary.substring(0, 1500)}${summary.length > 1500 ? "..." : ""}`)
               .setColor(0x2ecc71);
 
-            await btnInteraction.editReply({
-              embeds: [successEmbed],
-              components: [
-                new ActionRowBuilder<ButtonBuilder>().addComponents(
-                  new ButtonBuilder()
-                    .setCustomId("sessions:close")
-                    .setLabel("Close")
-                    .setStyle(ButtonStyle.Secondary)
-                ),
-              ],
+            // #179: same rule as the compaction buttons — a rebuild is a long
+            // unawaited job on this card, so its result must go through the
+            // lifecycle or it repaints a Close button onto an expired card.
+            await this.settleLongJobCard({
+              lifecycle,
+              view: {
+                embeds: [successEmbed],
+                components: [
+                  new ActionRowBuilder<ButtonBuilder>().addComponents(
+                    new ButtonBuilder()
+                      .setCustomId("sessions:close")
+                      .setLabel("Close")
+                      .setStyle(ButtonStyle.Secondary)
+                  ),
+                ],
+              },
+              channel: browserChannel ?? null,
+              fallback: { kind: "rebuild", outcome: "ok" },
             });
           } catch (err: any) {
             this.logger.error({ err, channelId: i.channelId }, "failed to rebuild session");
@@ -14097,19 +14726,14 @@ export class Orchestrator {
               .setDescription(`An error occurred while reconstructing the session:\n\`\`\`\n${err.message}\n\`\`\``)
               .setColor(0xe74c3c);
 
-            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-              new ButtonBuilder()
-                .setCustomId("sessions:summary_back")
-                .setLabel("⬅ Back to Manage")
-                .setStyle(ButtonStyle.Secondary)
-            );
-
-            await btnInteraction.editReply({
-              embeds: [errorEmbed],
-              components: [row],
+            await this.settleLongJobCard({
+              lifecycle,
+              view: { embeds: [errorEmbed], components: [backRow()] },
+              channel: browserChannel ?? null,
+              fallback: { kind: "rebuild", outcome: "failed" },
             });
           }
-        })();
+        });
       } else if (customId === "sessions:summary") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
@@ -14124,7 +14748,7 @@ export class Orchestrator {
             components: [],
           });
 
-          void (async () => {
+          this.runCardJob(async () => {
             let tempRuntime: AgentRuntime | undefined;
             try {
               const transcript = await manager.getTranscript(cwd, session.sessionId);
@@ -14213,16 +14837,22 @@ export class Orchestrator {
                 )
                 .setColor(0x9b59b6);
 
-              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-                new ButtonBuilder()
-                  .setCustomId("sessions:summary_back")
-                  .setLabel("⬅ Back to Manage")
-                  .setStyle(ButtonStyle.Secondary)
-              );
-
-              await btnInteraction.editReply({
-                embeds: [summaryEmbed],
-                components: [row],
+              await this.settleLongJobCard({
+                lifecycle,
+                view: { embeds: [summaryEmbed], components: [backRow()] },
+                channel: browserChannel ?? null,
+                fallback: {
+                  kind: "summary",
+                  outcome: "ok",
+                  recordId: record.id,
+                  userId: i.user.id,
+                },
+                // #179: a summary exists NOWHERE else. Discarding it behind a
+                // "your summary is ready" notice is the same silent loss this
+                // issue is about, one surface over — and POSTING it would
+                // promote an ephemeral, one-operator result to the whole
+                // channel. Parked for private collection instead.
+                fallbackFile: { filename: "session-summary.md", body: summaryText },
               });
             } catch (err: any) {
               this.logger.error({ err, sessionId: session.sessionId }, "failed to generate AI summary");
@@ -14232,16 +14862,11 @@ export class Orchestrator {
                 .setDescription(`An error occurred while generating the summary:\n\`\`\`\n${err.message}\n\`\`\``)
                 .setColor(0xe74c3c);
 
-              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-                new ButtonBuilder()
-                  .setCustomId("sessions:summary_back")
-                  .setLabel("⬅ Back to Manage")
-                  .setStyle(ButtonStyle.Secondary)
-              );
-
-              await btnInteraction.editReply({
-                embeds: [errorEmbed],
-                components: [row],
+              await this.settleLongJobCard({
+                lifecycle,
+                view: { embeds: [errorEmbed], components: [backRow()] },
+                channel: browserChannel ?? null,
+                fallback: { kind: "summary", outcome: "failed" },
               });
             } finally {
               if (tempRuntime) {
@@ -14254,234 +14879,142 @@ export class Orchestrator {
                 }
               }
             }
-          })();
-        }
-      } else if (customId === "sessions:compact") {
-        await btnInteraction.deferUpdate();
-        const session = sessions[currentIndex];
-        if (session) {
-          await btnInteraction.editReply({
-            embeds: [
-              new EmbedBuilder()
-                .setTitle("🗳️ Compacting Session...")
-                .setDescription(`Generating compaction summary for session \`${session.sessionId}\` (summary + verbatim recent window + pinned facts)...`)
-                .setColor(0xe67e22)
-            ],
-            components: [],
           });
-
-          const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId("sessions:summary_back").setLabel("⬅ Back to Manage").setStyle(ButtonStyle.Secondary)
-          );
-
-          void (async () => {
-            try {
-              if (!this.compactionModelFor(record.agentId)) {
-                throw new Error(`Compaction is not supported for agent profile \`${record.agentId}\` (no summarizer model).`);
-              }
-              const built = await this.buildDefaultCompactionSeed({
-                profile,
-                manager,
-                agentId: record.agentId,
-                cwd,
-                sessionId: session.sessionId,
-              });
-              if (!built) throw new Error("Nothing to compact (empty transcript or no summarizer model).");
-
-              // Non-destructive: seed a NEW session with the summary (resumable),
-              // bind the thread to it if this was its active session, and leave
-              // the original intact.
-              const cfg = this.store.readConfig(record);
-              const newId = await this.seedNewSession({
-                profile, cwd,
-                ...(cfg.model ? { model: cfg.model } : {}),
-                ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
-                summary: built.seed,
-              });
-              const wasActive = session.sessionId === record.acpSessionId;
-              if (wasActive) {
-                this.store.upsert({ ...record, acpSessionId: newId, updatedUtc: new Date().toISOString() });
-                await this.router.invalidate(record.id, { clearAcpSession: false });
-              }
-
-              sessions = await manager.listSessions(cwd);
-              const newIndex = sessions.findIndex(s => s.sessionId === newId);
-              if (newIndex !== -1) currentIndex = newIndex;
-
-              const successEmbed = new EmbedBuilder()
-                .setTitle("🗳️ Session Compacted")
-                .setDescription(
-                  `Compacted into a **new session** \`${newId}\` (summarized ${built.summarizedTurns} older turn(s), kept ${built.keptTurns} verbatim, pinned ${built.pinnedCount} fact(s)).` +
-                  (wasActive ? `\nThis thread is now bound to it.` : ``) +
-                  `\n\nThe original \`${session.sessionId}\` is **preserved** — find it in this list to review or delete.`
-                )
-                .setColor(0x2ecc71);
-              await btnInteraction.editReply({ embeds: [successEmbed], components: [backRow] });
-            } catch (err: any) {
-              this.logger.error({ err, sessionId: session.sessionId }, "failed to compact session");
-              const errorEmbed = new EmbedBuilder()
-                .setTitle("❌ Compaction Failed")
-                .setDescription(`An error occurred during compaction:\n\`\`\`\n${(err?.message ?? String(err)).slice(0, 1500)}\n\`\`\``)
-                .setColor(0xe74c3c);
-              await btnInteraction.editReply({ embeds: [errorEmbed], components: [backRow] });
-            }
-          })();
         }
-      } else if (customId === "sessions:premium") {
+      } else if (
+        customId === "sessions:compact" ||
+        customId === "sessions:premium" ||
+        customId === "sessions:premium_discord"
+      ) {
+        // #179: the binding as it was at ADMISSION — the instant the click was
+        // accepted, before `deferUpdate`, before the progress repaint, before
+        // any await at all. The store read is synchronous, so nothing can
+        // interleave ahead of it.
+        //
+        // Anywhere later is already too late. `deferUpdate` and the initial
+        // repaint are round trips to Discord; the operator can hit **Attach**
+        // inside that window, and a "before" sampled after it would record
+        // their new choice as the baseline and then quietly overwrite it as if
+        // nothing had moved.
+        const observedAtStart = activeSessionId();
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
         if (session) {
-          const channelRef = this.channelRefFromInteraction(i);
-          const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId("sessions:summary_back").setLabel("⬅ Back to Manage").setStyle(ButtonStyle.Secondary)
-          );
-          const progressEmbed = new EmbedBuilder()
-            .setTitle("✨ Premium Compaction")
-            .setDescription(`Running multi-agent compaction on \`${session.sessionId}\`…\nThis can take several minutes (fan-out → reduce → deep-dive → synthesize → verify).`)
-            .setColor(0x9b59b6);
-          await btnInteraction.editReply({ embeds: [progressEmbed], components: [] });
-
-          void (async () => {
-            // Throttle progress edits so we don't hit Discord's rate limit.
-            let lastEdit = 0;
-            let editing = false;
-            const lines: string[] = [];
-            const pushProgress = (m: string) => {
-              lines.push(m);
-              const now = Date.now();
-              if (editing || now - lastEdit < 2500) return;
-              editing = true;
-              lastEdit = now;
-              const tail = lines.slice(-8).map((l) => `• ${l}`).join("\n");
-              btnInteraction.editReply({
-                embeds: [EmbedBuilder.from(progressEmbed).setDescription(`Compacting \`${session.sessionId}\`…\n\n${tail}`)],
-                components: [],
-              }).catch(() => {}).finally(() => { editing = false; });
-            };
-
-            try {
-              // Delegate the run+seed+swap to the shared primitive (identical
-              // behavior, non-destructive); this handler keeps its card rendering.
-              const res = await this.compactThread(record, {
-                sessionId: session.sessionId,
-                ...(channelRef ? { channel: channelRef } : {}),
-                onProgress: pushProgress,
-              });
-              const newId = res.newSessionId;
-              const wasActive = res.wasActive;
-              sessions = await manager.listSessions(cwd);
-              const newIndex = sessions.findIndex((s) => s.sessionId === newId);
-              if (newIndex !== -1) currentIndex = newIndex;
-
-              const reportPath = path.join(os.tmpdir(), `premium-compaction-${session.sessionId}.md`);
-              await fsp.writeFile(reportPath, res.reportMarkdown, "utf8").catch(() => {});
-
-              const successEmbed = new EmbedBuilder()
-                .setTitle("✨ Premium Compaction Complete")
+          // #179: all three compaction buttons run through ONE launcher, so the
+          // attachment contract and the card lifecycle cannot be honoured by
+          // some of them and forgotten by the rest — which is exactly how the
+          // premium pair ended up resurrecting an expired Back button while the
+          // plain sibling did something subtly different with the binding.
+          if (customId === "sessions:compact") {
+            runBrowserCompaction({
+              session,
+              progressEmbed: new EmbedBuilder()
+                .setTitle("🗳️ Compacting Session...")
                 .setDescription(
-                  `Compacted into a **new session** \`${newId}\` with the multi-agent pipeline.` +
-                  (wasActive ? ` This thread is now bound to it.` : ``) +
-                  `\nOriginal \`${session.sessionId}\` is **preserved** (review or delete it from this list).`
+                  `Generating compaction summary for session \`${session.sessionId}\` ` +
+                  `(summary + verbatim recent window + pinned facts)...`
                 )
-                .addFields(
-                  { name: "Chunks", value: String(res.stats.chunks), inline: true },
-                )
-                .setColor(0x2ecc71);
+                .setColor(0xe67e22),
+              progressPrefix: `Compacting \`${session.sessionId}\`…`,
+              successTitle: "🗳️ Session Compacted",
+              failureTitle: "❌ Compaction Failed",
+              run: async () => {
+                if (!this.compactionModelFor(record.agentId)) {
+                  throw new Error(
+                    `Compaction is not supported for agent profile \`${record.agentId}\` (no summarizer model).`
+                  );
+                }
+                const built = await this.buildDefaultCompactionSeed({
+                  profile,
+                  manager,
+                  agentId: record.agentId,
+                  cwd,
+                  sessionId: session.sessionId,
+                });
+                if (!built) throw new Error("Nothing to compact (empty transcript or no summarizer model).");
 
-              await btnInteraction.editReply({
-                embeds: [successEmbed],
-                components: [backRow],
-                files: [new AttachmentBuilder(reportPath, { name: `premium-compaction-${session.sessionId}.md` })],
-              }).catch(async () => {
-                await btnInteraction.editReply({ embeds: [successEmbed], components: [backRow] }).catch(() => {});
-              });
-            } catch (err: any) {
-              this.logger.error({ err, sessionId: session.sessionId }, "premium compaction failed");
-              const errorEmbed = new EmbedBuilder()
-                .setTitle("❌ Premium Compaction Failed")
-                .setDescription(`\`\`\`\n${(err?.message ?? String(err)).slice(0, 1500)}\n\`\`\``)
-                .setColor(0xe74c3c);
-              await btnInteraction.editReply({ embeds: [errorEmbed], components: [backRow] }).catch(() => {});
-            }
-          })();
-        }
-      } else if (customId === "sessions:premium_discord") {
-        await btnInteraction.deferUpdate();
-        const session = sessions[currentIndex];
-        if (session) {
-          const channelRef = this.channelRefFromInteraction(i);
-          const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId("sessions:summary_back").setLabel("⬅ Back to Manage").setStyle(ButtonStyle.Secondary)
-          );
-          const progressEmbed = new EmbedBuilder()
-            .setTitle("✨ Premium Compaction (Discord)")
-            .setDescription(`Running multi-agent compaction on full Discord history…\nThis can take several minutes (fan-out → reduce → deep-dive → synthesize → verify).`)
-            .setColor(0x9b59b6);
-          await btnInteraction.editReply({ embeds: [progressEmbed], components: [] });
-
-          void (async () => {
-            let lastEdit = 0;
-            let editing = false;
-            const lines: string[] = [];
-            const pushProgress = (m: string) => {
-              lines.push(m);
-              const now = Date.now();
-              if (editing || now - lastEdit < 2500) return;
-              editing = true;
-              lastEdit = now;
-              const tail = lines.slice(-8).map((l) => `• ${l}`).join("\n");
-              btnInteraction.editReply({
-                embeds: [EmbedBuilder.from(progressEmbed).setDescription(`Compacting from Discord history…\n\n${tail}`)],
-                components: [],
-              }).catch(() => {}).finally(() => { editing = false; });
-            };
-
-            try {
-              // Delegate the run+seed+swap to the shared primitive with the
-              // full-Discord source; this handler keeps its card rendering.
-              const res = await this.compactThread(record, {
-                source: "discord",
-                sessionId: session.sessionId,
-                ...(channelRef ? { channel: channelRef } : {}),
-                onProgress: pushProgress,
-              });
-              const newId = res.newSessionId;
-              const wasActive = res.wasActive;
-              sessions = await manager.listSessions(cwd);
-              const newIndex = sessions.findIndex((s) => s.sessionId === newId);
-              if (newIndex !== -1) currentIndex = newIndex;
-
-              const reportPath = path.join(os.tmpdir(), `premium-compaction-discord-${session.sessionId}.md`);
-              await fsp.writeFile(reportPath, res.reportMarkdown, "utf8").catch(() => {});
-
-              const successEmbed = new EmbedBuilder()
-                .setTitle("✨ Premium Compaction (Discord) Complete")
+                // Non-destructive: seed a NEW session with the summary
+                // (resumable) and leave the original intact.
+                const cfg = this.store.readConfig(record);
+                const newId = await this.seedNewSession({
+                  profile, cwd,
+                  ...(cfg.model ? { model: cfg.model } : {}),
+                  ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+                  summary: built.seed,
+                });
+                const attachment = await this.attachCompactedSession({
+                  record,
+                  sourceId: session.sessionId,
+                  newId,
+                  observedAtStart,
+                  intent: "attach",
+                });
+                return {
+                  newId,
+                  attachment,
+                  detail:
+                    `Compacted into a **new session** \`${newId}\` ` +
+                    `(summarized ${built.summarizedTurns} older turn(s), kept ${built.keptTurns} verbatim, ` +
+                    `pinned ${built.pinnedCount} fact(s)).`,
+                };
+              },
+            });
+          } else {
+            const fromDiscord = customId === "sessions:premium_discord";
+            runBrowserCompaction({
+              session,
+              progressEmbed: new EmbedBuilder()
+                .setTitle(fromDiscord ? "✨ Premium Compaction (Discord)" : "✨ Premium Compaction")
                 .setDescription(
-                  `Compacted from Discord thread history into a **new session** \`${newId}\` with the multi-agent pipeline.` +
-                  (wasActive ? ` This thread is now bound to it.` : ``) +
-                  `\nOriginal \`${session.sessionId}\` is **preserved** (review or delete it from this list).`
+                  (fromDiscord
+                    ? `Running multi-agent compaction on full Discord history…`
+                    : `Running multi-agent compaction on \`${session.sessionId}\`…`) +
+                  `\nThis can take several minutes (fan-out → reduce → deep-dive → synthesize → verify).`
                 )
-                .addFields(
-                  { name: "Chunks", value: String(res.stats.chunks), inline: true },
-                )
-                .setColor(0x2ecc71);
-
-              await btnInteraction.editReply({
-                embeds: [successEmbed],
-                components: [backRow],
-                files: [new AttachmentBuilder(reportPath, { name: `premium-compaction-discord-${session.sessionId}.md` })],
-              }).catch(async () => {
-                await btnInteraction.editReply({ embeds: [successEmbed], components: [backRow] }).catch(() => {});
-              });
-            } catch (err: any) {
-              this.logger.error({ err, sessionId: session.sessionId }, "premium compaction (Discord) failed");
-              const errorEmbed = new EmbedBuilder()
-                .setTitle("❌ Premium Compaction Failed")
-                .setDescription(`\`\`\`\n${(err?.message ?? String(err)).slice(0, 1500)}\n\`\`\``)
-                .setColor(0xe74c3c);
-              await btnInteraction.editReply({ embeds: [errorEmbed], components: [backRow] }).catch(() => {});
-            }
-          })();
+                .setColor(0x9b59b6),
+              progressPrefix: fromDiscord
+                ? "Compacting from Discord history…"
+                : `Compacting \`${session.sessionId}\`…`,
+              successTitle: fromDiscord
+                ? "✨ Premium Compaction (Discord) Complete"
+                : "✨ Premium Compaction Complete",
+              failureTitle: "❌ Premium Compaction Failed",
+              run: async (onProgress) => {
+                // The shared primitive owns run+seed+compare-and-swap; this
+                // handler owns only the card. `attachIntent: "attach"` is what
+                // makes the BUTTON compact-and-attach: a thread left unbound by
+                // an agent switch is bound to the result instead of being left
+                // silently disconnected. It still never steals a binding that
+                // points somewhere else.
+                const res = await this.compactThread(record, {
+                  ...(fromDiscord ? { source: "discord" as const } : {}),
+                  sessionId: session.sessionId,
+                  ...(browserChannel ? { channel: browserChannel } : {}),
+                  attachIntent: "attach",
+                  // Admission-time, from the click handler — see above.
+                  observedAtStart,
+                  onProgress,
+                });
+                const reportName =
+                  `premium-compaction${fromDiscord ? "-discord" : ""}-${session.sessionId}.md`;
+                const reportPath = path.join(os.tmpdir(), reportName);
+                const wrote = await fsp
+                  .writeFile(reportPath, res.reportMarkdown, "utf8")
+                  .then(() => true)
+                  .catch(() => false);
+                return {
+                  newId: res.newSessionId,
+                  attachment: res.attachment,
+                  detail:
+                    (fromDiscord
+                      ? `Compacted from Discord thread history into a **new session** \`${res.newSessionId}\``
+                      : `Compacted into a **new session** \`${res.newSessionId}\``) +
+                    ` with the multi-agent pipeline (${res.stats.chunks} chunk(s)).`,
+                  ...(wrote ? { report: { path: reportPath, name: reportName } } : {}),
+                };
+              },
+            });
+          }
         }
       } else if (customId === "sessions:import_to_cwd") {
         const session = sessions[currentIndex];
@@ -14533,7 +15066,11 @@ export class Orchestrator {
         }
 
         await submission.deferUpdate();
-        await submission.editReply({
+        // #179: unlike the other progress paints, this one is on the far side of
+        // a modal that can sit open for two minutes — long enough for the
+        // collector to expire underneath it. Through the lifecycle, so it
+        // cannot overwrite the expiry notice with something that looks live.
+        await lifecycle.refresh({
           embeds: [
             new EmbedBuilder()
               .setTitle("📤 Importing Session…")
@@ -14545,7 +15082,7 @@ export class Orchestrator {
           components: [],
         });
 
-        void (async () => {
+        this.runCardJob(async () => {
           let tempRuntime: AgentRuntime | undefined;
           try {
             const transcript = await manager.getTranscript(cwd, session.sessionId);
@@ -14622,27 +15159,28 @@ export class Orchestrator {
               )
               .setColor(0x2ecc71);
 
-            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-              new ButtonBuilder()
-                .setCustomId("sessions:summary_back")
-                .setLabel("⬅ Back to Manage")
-                .setStyle(ButtonStyle.Secondary)
-            );
-
-            await submission.editReply({ embeds: [successEmbed], components: [row] });
+            // #179: the modal's `deferUpdate` targets the BROWSER card, so this
+            // is the same late-writer path as the compaction buttons — an
+            // import that outlives the collector must not repaint its Back
+            // button either.
+            await this.settleLongJobCard({
+              lifecycle,
+              view: { embeds: [successEmbed], components: [backRow()] },
+              channel: browserChannel ?? null,
+              fallback: { kind: "import", outcome: "ok" },
+            });
           } catch (err: any) {
             this.logger.error({ err, sessionId: session.sessionId }, "failed to import session");
             const errorEmbed = new EmbedBuilder()
               .setTitle("❌ Import Failed")
               .setDescription(`An error occurred during import:\n\`\`\`\n${err.message}\n\`\`\``)
               .setColor(0xe74c3c);
-            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-              new ButtonBuilder()
-                .setCustomId("sessions:summary_back")
-                .setLabel("⬅ Back to Manage")
-                .setStyle(ButtonStyle.Secondary)
-            );
-            await submission.editReply({ embeds: [errorEmbed], components: [row] });
+            await this.settleLongJobCard({
+              lifecycle,
+              view: { embeds: [errorEmbed], components: [backRow()] },
+              channel: browserChannel ?? null,
+              fallback: { kind: "import", outcome: "failed" },
+            });
           } finally {
             if (tempRuntime) {
               const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
@@ -14657,7 +15195,7 @@ export class Orchestrator {
               }
             }
           }
-        })();
+        });
       } else if (customId === "sessions:migrate") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
@@ -14703,7 +15241,7 @@ export class Orchestrator {
         }
       } else if (customId === "sessions:migrate_cancel") {
         await btnInteraction.deferUpdate();
-        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
       } else if (btnInteraction.isStringSelectMenu() && customId === "sessions:migrate_target") {
         await btnInteraction.deferUpdate();
         const targetAgentId = btnInteraction.values[0];
@@ -14729,7 +15267,7 @@ export class Orchestrator {
             components: [],
           });
 
-          void (async () => {
+          this.runCardJob(async () => {
             let tempRuntime: AgentRuntime | undefined;
             try {
               const transcript = await manager.getTranscript(cwd, session.sessionId);
@@ -14829,9 +15367,21 @@ export class Orchestrator {
               // #159: this used to render a "Close" button and stop the
               // collector in the same breath — a control that could only ever
               // answer "interaction failed". Terminal means no components.
-              await lifecycle.terminal("migrated", {
-                embeds: [successEmbed],
-                components: [],
+              //
+              // #179: and it goes through the SAME settle path as the failure
+              // branch below. `lifecycle.terminal` swallows its own render
+              // error and returns true, so a migration that outlived the
+              // interaction token reported success while the operator saw
+              // nothing at all — the card frozen mid-progress, the thread
+              // rebound underneath them, and no notice anywhere. Success is the
+              // branch where losing the message matters MOST.
+              await this.settleLongJobCard({
+                lifecycle,
+                view: { embeds: [successEmbed], components: [] },
+                mode: "terminal",
+                reason: "migrated",
+                channel: browserChannel ?? null,
+                fallback: { kind: "migration", outcome: "ok" },
               });
             } catch (err: any) {
               this.logger.error({ err, sessionId: session.sessionId }, "failed to migrate session");
@@ -14841,16 +15391,14 @@ export class Orchestrator {
                 .setDescription(`An error occurred during migration:\n\`\`\`\n${err.message}\n\`\`\``)
                 .setColor(0xe74c3c);
 
-              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-                new ButtonBuilder()
-                  .setCustomId("sessions:summary_back")
-                  .setLabel("⬅ Back to Manage")
-                  .setStyle(ButtonStyle.Secondary)
-              );
-
-              await btnInteraction.editReply({
-                embeds: [errorEmbed],
-                components: [row],
+              // #179: the migrate SUCCESS path already settles through the
+              // lifecycle (#159); its failure path did not, and a migration is
+              // just as long-running as the compaction that reported this bug.
+              await this.settleLongJobCard({
+                lifecycle,
+                view: { embeds: [errorEmbed], components: [backRow()] },
+                channel: browserChannel ?? null,
+                fallback: { kind: "migration", outcome: "failed" },
               });
             } finally {
               if (tempRuntime) {
@@ -14863,11 +15411,11 @@ export class Orchestrator {
                 }
               }
             }
-          })();
+          });
         }
       } else if (customId === "sessions:summary_back") {
         await btnInteraction.deferUpdate();
-        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
       }
     });
 

@@ -5,6 +5,7 @@
 
 import type { LedgerEntry, DelegationStatus } from "../../core/types.js";
 import type { AnomalySummary } from "../../core/watchdog.js";
+import { sliceChoicePage } from "./choice-picker.js";
 
 /** Rendered, embed-ready view of the ledger. */
 export interface WorkflowsView {
@@ -162,6 +163,55 @@ export function formatInterruptedLine(row: InterruptedTurnRow, now: Date): strin
 
 export function formatInterruptedLines(rows: InterruptedTurnRow[], now: Date): string[] {
   return rows.map((r) => formatInterruptedLine(r, now));
+}
+
+/** The buttons `/seam workflows` may offer for one inventory row. */
+export type InterruptedRowAction = "resume" | "abandon";
+
+/**
+ * Which actions are still *live* for a row (#159).
+ *
+ * A control whose backing operation has already been consumed is exactly the
+ * bug this inventory used to have: an abandoned turn kept an "Abandon" button
+ * that could only answer "No resumable turn". An already-abandoned row is
+ * therefore resume-only, and only when a recorded ACP session still makes the
+ * resume possible; a live marker that was abandoned has nothing left at all.
+ */
+export function interruptedRowActions(
+  row: InterruptedTurnRow
+): readonly InterruptedRowAction[] {
+  if (row.status === "interrupted") return ["resume", "abandon"];
+  return row.acpSessionId && row.source === "dispatch" ? ["resume"] : [];
+}
+
+/** True when the row still has at least one action a click could perform. */
+export function isActionableInterruptedRow(row: InterruptedTurnRow): boolean {
+  return interruptedRowActions(row).length > 0;
+}
+
+/**
+ * `/seam workflows` is rarely used, so the inventory stays deliberately
+ * compact: one summary page of every interrupted/abandoned row, and controls
+ * (with pagination) only for the rows that can still be acted on. Four rows
+ * per page leaves the fifth of Discord's five action rows for Prev/Page/Next.
+ */
+export const WORKFLOW_INVENTORY_PAGE_SIZE = 4;
+
+/** Paginate the *actionable* subset of the inventory. */
+export function paginateInterruptedRows(
+  rows: ReadonlyArray<InterruptedTurnRow>,
+  page: number,
+  pageSize: number = WORKFLOW_INVENTORY_PAGE_SIZE
+): {
+  page: number;
+  pageCount: number;
+  total: number;
+  items: InterruptedTurnRow[];
+} {
+  const actionable = rows.filter(isActionableInterruptedRow);
+  const { page: p, items } = sliceChoicePage(actionable, page, pageSize);
+  const pageCount = Math.max(1, Math.ceil(actionable.length / pageSize) || 1);
+  return { page: p, pageCount, total: actionable.length, items };
 }
 
 export function clampFieldValue(lines: string[], max = 1024): string {

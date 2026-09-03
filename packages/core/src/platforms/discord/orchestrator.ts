@@ -3,7 +3,7 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message } from "discord.js";
+import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
 import {
@@ -89,8 +89,18 @@ import {
   clampFieldValue,
   formatAnomalyLines,
   formatInterruptedLines,
+  interruptedRowActions,
+  paginateInterruptedRows,
+  WORKFLOW_INVENTORY_PAGE_SIZE,
   type InterruptedTurnRow,
 } from "./workflows-view.js";
+import {
+  attachCardLifecycle,
+  expiredCardView,
+  type CardLifecycle,
+  type CardView,
+  type StoppableCollector,
+} from "./collector-lifecycle.js";
 import { DispatchWatcher } from "../../core/dispatch/watcher.js";
 import {
   CONTINUE_PROMPT,
@@ -343,6 +353,7 @@ import {
   renderVoiceConsoleBindingEditor,
   renderVoiceConsoleEndConfirmation,
   renderVoiceConsoleMutationConfirmation,
+  type VoiceConsoleMutationOutcome,
   renderVoiceConsoleVoicePreview,
   type VoiceConsolePanelSpec,
 } from "./voice-console-panel.js";
@@ -5280,13 +5291,11 @@ export class Orchestrator {
       if (action === "edit-cancel") {
         this.voiceConsoleEditorDrafts.delete(key);
         this.voiceConsoleEphemeralViews.delete(evt.messageId);
-        await evt.updateEphemeralView({
-          embeds: [DiscordAdapter.buildVoiceConsoleEmbed(renderVoiceConsoleMutationConfirmation({
-            title: "Voice Console edit cancelled",
-            summary: "The binding profile was not changed.",
-            revision: console.revision,
-          }))],
-          components: [],
+        await this.settleVoiceConsoleConfirmation(evt, {
+          title: "Voice Console edit cancelled",
+          summary: "The binding profile was not changed.",
+          revision: console.revision,
+          outcome: "cancelled",
         });
         return;
       }
@@ -5381,18 +5390,24 @@ export class Orchestrator {
           interactionId: evt.interactionId,
         });
         if (!result.ok) {
-          await evt.followUpEphemeral(result.error);
+          // #159: a refused save consumes this confirmation too — end it
+          // component-free rather than leaving Save/Confirm looking live.
+          this.voiceConsoleEphemeralViews.delete(evt.messageId);
+          this.voiceConsoleEditorDrafts.delete(key);
+          await this.settleVoiceConsoleConfirmation(evt, {
+            title: `Binding not saved: ${profile.alias}`,
+            summary: `${result.error}\n\nReopen the editor from the canonical card to try again.`,
+            revision: console.revision,
+            outcome: "failed",
+          });
           return;
         }
         this.retainVoiceConsoleReplayState(evt.messageId, [action], key);
-        const panel = renderVoiceConsoleMutationConfirmation({
+        await this.settleVoiceConsoleConfirmation(evt, {
           title: `Binding saved: ${profile.alias}`,
           summary: `${profile.voice} · ${profile.pace} · ${profile.style}`,
           revision: result.value.console.revision,
-        });
-        await evt.updateEphemeralView({
-          embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
-          components: [],
+          outcome: "saved",
         });
         return;
       }
@@ -5516,16 +5531,46 @@ export class Orchestrator {
         return;
       }
       await evt.deferUpdate();
+      const keptId = parsed.bindingIds[0]!;
+      const kept = bindings.find((binding) => binding.id === keptId);
       const result = await this.voiceConsoleControl.setInputTargets(
         console.id, parsed.bindingIds, false, parsed.id.revision, evt.interactionId
       );
       if (result.ok) this.retainVoiceConsoleReplayState(evt.messageId, [action]);
-      if (!result.ok) await evt.followUpEphemeral(result.error);
+      else this.voiceConsoleEphemeralViews.delete(evt.messageId);
+      // #159: the choice is spent either way — the confirmation ends
+      // component-free instead of keeping a second, dead "keep this one".
+      await this.settleVoiceConsoleConfirmation(evt, result.ok
+        ? {
+            title: "Fan-out disarmed",
+            summary: `Input is now captured from ${kept?.alias ?? keptId} only.`,
+            revision: console.revision,
+            outcome: "saved",
+          }
+        : {
+            title: "Fan-out unchanged",
+            summary: result.error,
+            revision: console.revision,
+            outcome: "failed",
+          });
       return;
     }
     if (action === "fanout-cancel" || action === "end-cancel") {
       this.voiceConsoleEphemeralViews.delete(evt.messageId);
       await evt.deferUpdate();
+      await this.settleVoiceConsoleConfirmation(evt, action === "end-cancel"
+        ? {
+            title: "Shared Voice Console kept running",
+            summary: "Nothing was ended and no pending speech was discarded.",
+            revision: console.revision,
+            outcome: "cancelled",
+          }
+        : {
+            title: "Fan-out left armed",
+            summary: "Fan-out is still armed and the current input targets are unchanged.",
+            revision: console.revision,
+            outcome: "cancelled",
+          });
       return;
     }
     if (action === "end") {
@@ -5560,11 +5605,60 @@ export class Orchestrator {
         reason: `ended from canonical card by ${evt.userId}`,
       });
       if (result.ok) this.retainVoiceConsoleReplayState(evt.messageId, [action]);
-      else await evt.followUpEphemeral(result.error);
+      else this.voiceConsoleEphemeralViews.delete(evt.messageId);
+      // #159: the console this confirmation was about is gone (or refused the
+      // stop) — either way its Preserve/Discard/Cancel buttons are consumed.
+      await this.settleVoiceConsoleConfirmation(evt, result.ok
+        ? {
+            title: "Shared Voice Console ended",
+            summary: action === "end-discard"
+              ? "Capture and VC speech stopped; pending segments were discarded."
+              : "Capture and VC speech stopped; finalized pending segments were preserved.",
+            revision: console.revision,
+            outcome: "saved",
+          }
+        : {
+            title: "Shared Voice Console not ended",
+            summary: result.error,
+            revision: console.revision,
+            outcome: "failed",
+          });
       await this.voiceConsoleControl.refreshCard(console.id, true).catch(() => undefined);
       return;
     }
     await evt.replyEphemeral("That Voice Console action is not available in this view.");
+  }
+
+  /**
+   * Terminal state for an ephemeral Voice Console confirmation (#159).
+   *
+   * The canonical console card is revision-checked and self-refreshing, but the
+   * ephemeral confirmations layered on top of it (`fanout-keep`,
+   * `fanout-cancel`, `end-preserve`, `end-discard`, `end-cancel`, and the
+   * binding-editor save) used to keep their buttons after the replay state or
+   * the console itself was gone. Every branch now replaces the card with a
+   * component-free result, so a second click is impossible rather than merely
+   * futile.
+   */
+  private async settleVoiceConsoleConfirmation(
+    evt: ComponentEvent,
+    input: {
+      title: string;
+      summary: string;
+      revision: number;
+      outcome: VoiceConsoleMutationOutcome;
+    }
+  ): Promise<void> {
+    const panel = renderVoiceConsoleMutationConfirmation(input);
+    try {
+      await evt.updateEphemeralView({
+        embeds: [DiscordAdapter.buildVoiceConsoleEmbed(panel)],
+        components: [],
+      });
+    } catch (err) {
+      // The action already stands; a lost render must not fail the interaction.
+      this.logger.warn({ err, outcome: input.outcome }, "voice console confirmation render failed");
+    }
   }
 
   /** Keep just enough authenticated ephemeral state for Discord to redeliver
@@ -8409,6 +8503,33 @@ export class Orchestrator {
     this.store.upsertScheduled({ ...fresh, lastStatus: status, lastRunUtc: new Date().toISOString() });
   }
 
+  /**
+   * Attach the shared card lifecycle (#159) to an interactive card's collector.
+   *
+   * Every `createMessageComponentCollector` in this file is paired with exactly
+   * one of these, so terminal, transition, refresh, and timeout paths all funnel
+   * through one implementation and no card can end while still showing enabled
+   * controls. Rendering is best-effort: a 15-minute-expired interaction token
+   * must not take the action itself down with it.
+   */
+  private attachListLifecycle(
+    i: ChatInputCommandInteraction | MessageComponentInteraction,
+    // discord.js declares `on` as a set of event overloads, so the lifecycle
+    // takes the structural subset it actually needs and re-widens internally.
+    collector: { stop(reason?: string): void },
+    expired: (reason: string) => CardView
+  ): CardLifecycle {
+    return attachCardLifecycle(collector as StoppableCollector, {
+      render: async (view) => {
+        await i.editReply(view as InteractionEditReplyOptions);
+      },
+      expired,
+      onError: (err, phase, reason) => {
+        this.logger.debug({ err, phase, reason }, "card lifecycle render skipped");
+      },
+    });
+  }
+
   // --- /seam schedule … -----------------------------------------------------
 
   private async cmdSchedule(i: ChatInputCommandInteraction): Promise<void> {
@@ -8462,6 +8583,11 @@ export class Orchestrator {
       filter: (c) => c.user.id === i.user.id,
       time: 600_000,
     });
+    // #159: the listing had no end handler, so an expired collector left every
+    // Run/Edit/Toggle/Delete button looking live. Expiry now strips them.
+    const lifecycle = this.attachListLifecycle(i, collector, () =>
+      expiredCardView("⏰ Schedule list expired — run `/seam schedule list` again.")
+    );
     collector.on("collect", async (c) => {
       try {
         if (!c.isButton()) return;
@@ -8469,6 +8595,8 @@ export class Orchestrator {
         const row = id ? this.store.getScheduled(id) : undefined;
         if (!row || !id || row.channelRef !== channel.id) {
           await c.reply({ content: "That schedule no longer exists.", flags: MessageFlags.Ephemeral });
+          // Repeatable: rebuild from the store so the vanished row's controls go.
+          await lifecycle.refresh(this.buildScheduleListMessage(channel));
           return;
         }
         if (action === "run") {
@@ -8482,8 +8610,16 @@ export class Orchestrator {
               ? `⏸️ **${row.name}** is already running — this click was skipped.`
               : `▶️ **${row.name}** finished — last: \`${status}\`.`
           );
+          // Run is repeatable; rebuild so the card shows the new last-status.
+          await lifecycle.refresh(this.buildScheduleListMessage(channel));
         } else if (action === "edit") {
-          collector.stop("edit");
+          // Transition: freeze the listing BEFORE the builder opens, or the
+          // user is left holding two live-looking cards for one schedule.
+          await lifecycle.transition("edit", {
+            content: `✏️ Editing **${row.name}** — this listing was replaced by the editor below.`,
+            embeds: [],
+            components: [],
+          });
           await this.cmdScheduleAdd(c, row); // opens the builder card in edit mode
         } else if (action === "toggle") {
           const updated: ScheduledPrompt = { ...row, enabled: !row.enabled, updatedUtc: new Date().toISOString() };
@@ -8699,20 +8835,13 @@ export class Orchestrator {
     // and say so. Otherwise the card sits there looking clickable but dead — a
     // second silent-failure path on top of the Create no-op: the user keeps
     // clicking a timed-out builder and nothing happens or persists.
-    collector.on("end", async (_collected, reason) => {
-      // "created"/"saved"/"cancel" already replaced the message; only handle the
-      // timeout (and ignore message-deleted, where there's nothing to edit).
-      if (reason !== "time") return;
-      try {
-        await i.editReply({
-          content: "⏰ Schedule builder timed out — nothing was saved. Run the schedule builder again to start over.",
-          embeds: [],
-          components: [],
-        });
-      } catch {
-        /* interaction token expired (>15 min) — nothing we can edit */
-      }
-    });
+    // "created"/"saved"/"cancel" settle the card themselves; the lifecycle skips
+    // those and expires everything else (#159).
+    const lifecycle = this.attachListLifecycle(i, collector, () =>
+      expiredCardView(
+        "⏰ Schedule builder timed out — nothing was saved. Run the schedule builder again to start over."
+      )
+    );
 
     collector.on("collect", async (c) => {
       try {
@@ -8805,8 +8934,8 @@ export class Orchestrator {
             if (errors.length) await sub.followUp({ content: `⚠️ ${errors.join("; ")}`, flags: MessageFlags.Ephemeral });
           }
         } else if (c.isButton() && c.customId === "sched:cancel") {
-          collector.stop("cancel");
-          await c.update({ content: "Cancelled.", embeds: [], components: [] });
+          await c.deferUpdate();
+          await lifecycle.terminal("cancel", { content: "Cancelled.", embeds: [], components: [] });
         } else if (c.isButton() && c.customId === "sched:create") {
           await c.deferUpdate();
           // Don't silently no-op on a half-filled form. Clicking Create with an
@@ -8866,7 +8995,6 @@ export class Orchestrator {
             this.store.upsertScheduled(row);
             this.scheduledManager?.armFromRow(row);
           }
-          collector.stop(existing ? "saved" : "created");
           const confirm = new EmbedBuilder()
             .setTitle(existing ? "✏️ Scheduled prompt updated" : "⏰ Scheduled prompt created")
             .setColor(0x2ecc71)
@@ -8886,7 +9014,10 @@ export class Orchestrator {
               (existing && !row.enabled ? `\n\n⏸️ This schedule is currently disabled — enable it with \`/seam schedule toggle\`.` : "") +
               `\n\nManage it with \`/seam schedule list\`.`
             );
-          await i.editReply({ embeds: [confirm], components: [] });
+          await lifecycle.terminal(existing ? "saved" : "created", {
+            embeds: [confirm],
+            components: [],
+          });
         }
       } catch (err) {
         this.logger.error({ err }, "schedule builder interaction failed");
@@ -9468,6 +9599,11 @@ export class Orchestrator {
       filter: (component) => component.user.id === i.user.id && component.customId === "namer:edit",
       time: 600_000,
     });
+    // #159: without an end handler the "Edit match tables" button stayed live
+    // past the collector's 10 minutes and answered nothing.
+    const lifecycle = this.attachListLifecycle(i, collector, () =>
+      expiredCardView("⏰ Thread namer editor expired — run `/seam config namer` again.")
+    );
     collector.on("collect", async (component) => {
       if (!component.isButton()) return;
       const current = this.threadNamerConfig.get();
@@ -9524,10 +9660,11 @@ export class Orchestrator {
           });
           await submit.deferUpdate();
           await this.refreshAllManagedThreadNames();
-          await i.editReply(render());
+          // Repeatable: the editor stays open, rebuilt from the saved tables.
+          await lifecycle.refresh(render());
         } catch (err) {
           await submit.deferUpdate().catch(() => {});
-          await i.editReply(render(err instanceof Error ? err.message : String(err)));
+          await lifecycle.refresh(render(err instanceof Error ? err.message : String(err)));
         }
       } catch {
         /* modal timeout */
@@ -11408,7 +11545,6 @@ export class Orchestrator {
    *  writes, no schema, purely observability. */
   private async cmdWorkflows(i: ChatInputCommandInteraction): Promise<void> {
     const limit = i.options.getInteger("limit") ?? 20;
-    const now = new Date();
 
     // Wake cancel (#59, D6): fold into /seam workflows per #26 rather than a new
     // top-level subcommand (the /seam tree is at Discord's 25-option cap).
@@ -11500,6 +11636,84 @@ export class Orchestrator {
       return;
     }
 
+    // #159: Resume/Abandon rebuilds this card from authoritative state, so the
+    // inventory is a re-runnable render rather than a one-shot build.
+    let page = 0;
+    const initial = await this.renderWorkflowInventory(i, limit, page);
+    page = initial.page;
+    await i.reply({
+      embeds: initial.embeds,
+      ...(initial.components.length ? { components: initial.components } : {}),
+      flags: MessageFlags.Ephemeral,
+    });
+    if (initial.components.length === 0) return;
+    const msg = await i.fetchReply();
+    const collector = msg.createMessageComponentCollector({
+      filter: (c) => c.user.id === i.user.id,
+      time: 600_000,
+    });
+    // #159: the inventory had no end handler, so Resume/Abandon stayed
+    // clickable long after the collector expired.
+    const lifecycle = this.attachListLifecycle(i, collector, () =>
+      expiredCardView("\u23f0 Workflow inventory expired \u2014 run `/seam workflows` again.")
+    );
+    collector.on("collect", async (c) => {
+      try {
+        if (!c.isButton()) return;
+        const [, action, ...rest] = c.customId.split(":");
+        const id = rest.join(":");
+        if (action === "page") {
+          const requested = Number(id);
+          if (!Number.isFinite(requested)) return;
+          await c.deferUpdate();
+          const paged = await this.renderWorkflowInventory(i, limit, requested);
+          page = paged.page;
+          await lifecycle.refresh(paged);
+          return;
+        }
+        if (!id || (action !== "resume" && action !== "abandon")) return;
+        // Ack, mutate, then rebuild the originating card from the store so the
+        // consumed row's controls disappear atomically with the action \u2014 the
+        // old code replied separately and left the acted-on row clickable.
+        await c.deferUpdate();
+        const result =
+          action === "resume"
+            ? await this.resumeTurnManually(id)
+            : await this.abandonTurnManually(id);
+        const rebuilt = await this.renderWorkflowInventory(i, limit, page);
+        page = rebuilt.page;
+        if (rebuilt.components.length === 0) {
+          // Nothing actionable left: terminal state, no components at all.
+          await lifecycle.terminal(action, { embeds: rebuilt.embeds, components: [] });
+        } else {
+          await lifecycle.refresh(rebuilt);
+        }
+        await c.followUp({ content: result, flags: MessageFlags.Ephemeral });
+      } catch (err) {
+        this.logger.warn({ err }, "workflows resume/abandon button failed");
+      }
+    });
+  }
+
+  /**
+   * One render of the `/seam workflows` inventory, built fresh from the store.
+   *
+   * `/seam workflows` is rarely used, so this stays deliberately compact: one
+   * summary page of ledger/wake/watch/ingest/choice state, plus controls (and
+   * pagination) only for the interrupted rows that still have a live action.
+   * Rebuilt after every Resume/Abandon so a consumed row cannot be clicked
+   * twice (#159).
+   */
+  private async renderWorkflowInventory(
+    i: ChatInputCommandInteraction,
+    limit: number,
+    requestedPage: number
+  ): Promise<{
+    embeds: EmbedBuilder[];
+    components: ActionRowBuilder<ButtonBuilder>[];
+    page: number;
+  }> {
+    const now = new Date();
     const active = this.store.listActiveDelegations();
     const view = formatWorkflowsView(
       active,
@@ -11645,56 +11859,75 @@ export class Orchestrator {
 
     const interrupted = await this.collectInterruptedRows();
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
+    let page = 0;
     if (interrupted.length > 0) {
+      // Controls exist only for rows a click can still act on. An abandoned row
+      // keeping an "Abandon" button was the #159 bug in miniature: a control
+      // whose backing operation was already consumed.
+      const slice = paginateInterruptedRows(interrupted, requestedPage);
+      page = slice.page;
+      const caption = choicePickerPageCaption(
+        slice.total,
+        slice.page,
+        WORKFLOW_INVENTORY_PAGE_SIZE
+      );
+      const lines = formatInterruptedLines(interrupted, now);
       embed.addFields({
-        name: `⚠️ Interrupted / abandoned (${interrupted.length})`,
-        value: clampFieldValue(formatInterruptedLines(interrupted, now)),
+        name: `\u26a0\ufe0f Interrupted / abandoned (${interrupted.length})`,
+        value: clampFieldValue(
+          caption ? [`_${caption} Controls below act on this page._`, ...lines] : lines
+        ),
       });
       if (view.empty) embed.setDescription(null);
-      // Per-entry Resume / Abandon — same pattern as schedule-list cards.
-      // Zero extra command slots. First 5 rows (Discord's 5-row cap).
-      for (const row of interrupted.slice(0, 5)) {
+      // Per-entry Resume / Abandon \u2014 same pattern as schedule-list cards.
+      // Zero extra command slots. Four rows leave the fifth for pagination.
+      for (const row of slice.items) {
+        const actions = interruptedRowActions(row);
+        const buttons: ButtonBuilder[] = [];
+        if (actions.includes("resume")) {
+          buttons.push(
+            new ButtonBuilder()
+              .setCustomId(`wf:resume:${row.id}`)
+              .setLabel(`\u25b6\ufe0f Resume ${row.source}`.slice(0, 80))
+              .setStyle(ButtonStyle.Primary)
+          );
+        }
+        if (actions.includes("abandon")) {
+          buttons.push(
+            new ButtonBuilder()
+              .setCustomId(`wf:abandon:${row.id}`)
+              .setLabel("\U0001f6ab Abandon")
+              .setStyle(ButtonStyle.Danger)
+          );
+        }
+        if (buttons.length > 0) {
+          components.push(new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons));
+        }
+      }
+      if (slice.pageCount > 1) {
         components.push(
           new ActionRowBuilder<ButtonBuilder>().addComponents(
             new ButtonBuilder()
-              .setCustomId(`wf:resume:${row.id}`)
-              .setLabel(`▶️ Resume ${row.source}`.slice(0, 80))
-              .setStyle(ButtonStyle.Primary),
+              .setCustomId(`wf:page:${slice.page - 1}`)
+              .setLabel("\u25c0 Prev")
+              .setStyle(ButtonStyle.Secondary)
+              .setDisabled(slice.page === 0),
             new ButtonBuilder()
-              .setCustomId(`wf:abandon:${row.id}`)
-              .setLabel("🚫 Abandon")
-              .setStyle(ButtonStyle.Danger)
+              .setCustomId(`wf:page:${slice.page}`)
+              .setLabel(`Page ${slice.page + 1}/${slice.pageCount}`)
+              .setStyle(ButtonStyle.Secondary)
+              .setDisabled(true),
+            new ButtonBuilder()
+              .setCustomId(`wf:page:${slice.page + 1}`)
+              .setLabel("Next \u25b6")
+              .setStyle(ButtonStyle.Secondary)
+              .setDisabled(slice.page >= slice.pageCount - 1)
           )
         );
       }
     }
 
-    await i.reply({
-      embeds: [embed],
-      ...(components.length ? { components } : {}),
-      flags: MessageFlags.Ephemeral,
-    });
-    if (components.length === 0) return;
-    const msg = await i.fetchReply();
-    const collector = msg.createMessageComponentCollector({
-      filter: (c) => c.user.id === i.user.id,
-      time: 600_000,
-    });
-    collector.on("collect", async (c) => {
-      try {
-        if (!c.isButton()) return;
-        const [, action, ...rest] = c.customId.split(":");
-        const id = rest.join(":");
-        if (!id || (action !== "resume" && action !== "abandon")) return;
-        const result =
-          action === "resume"
-            ? await this.resumeTurnManually(id)
-            : await this.abandonTurnManually(id);
-        await c.reply({ content: result, flags: MessageFlags.Ephemeral });
-      } catch (err) {
-        this.logger.warn({ err }, "workflows resume/abandon button failed");
-      }
-    });
+    return { embeds: [embed], components, page };
   }
 
   /** `/seam config audit` — read the immutable config-mutation trail (#70).
@@ -12295,6 +12528,34 @@ export class Orchestrator {
       time: 600_000, // 10 minutes
     });
 
+    // #159: every stop reason except an explicit close lands here, so the
+    // browser can never expire while still showing enabled controls — and the
+    // no-current-session case (which used to leave the card untouched) is
+    // covered too.
+    const lifecycle = this.attachListLifecycle(i, collector, () => {
+      const fresh = this.store.get(record.id);
+      const activeId = fresh ? fresh.acpSessionId : record.acpSessionId;
+      const currentSession = sessions[currentIndex];
+      if (!currentSession) {
+        return expiredCardView("⏰ Session browser closed — run `/seam info sessions` again.");
+      }
+      const embed = new EmbedBuilder()
+        .setTitle(`Browse Sessions — ${profile.displayName} (Closed)`)
+        .setDescription(
+          `**Session ID:** \`${currentSession.sessionId}\`\n` +
+          `**Created:** ${currentSession.createdAt ? `<t:${Math.floor(currentSession.createdAt / 1000)}:f>` : "Unknown"}\n` +
+          `**Last Activity:** ${currentSession.lastActivityAt ? `<t:${Math.floor(currentSession.lastActivityAt / 1000)}:R>` : "Unknown"}\n` +
+          `**Status:** ${activeId === currentSession.sessionId ? "🟢 **Active Session in this channel**" : "⚪ Inactive"}\n\n` +
+          `**Preview (Heuristic):**\n` +
+          (currentSession.previewLines.length > 0
+            ? currentSession.previewLines.map(formatLine).filter(Boolean).join("\n") || "*No meaningful messages in this session.*"
+            : "*No messages in this session yet.*")
+        )
+        .setColor(activeId === currentSession.sessionId ? 0x2ecc71 : 0x7f8c8d)
+        .setFooter({ text: `Session ${currentIndex + 1} of ${sessions.length} (Menu Timed Out)` });
+      return { embeds: [embed], components: [] };
+    });
+
     collector.on("collect", async (btnInteraction) => {
       const customId = btnInteraction.customId;
 
@@ -12314,7 +12575,8 @@ export class Orchestrator {
         await btnInteraction.deferUpdate();
         await btnInteraction.deleteReply().catch(() => {});
         await i.deleteReply().catch(() => {});
-        collector.stop("user_closed");
+        // Terminal by deletion: nothing left to render.
+        await lifecycle.dispose("user_closed");
       } else if (customId === "sessions:attach") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
@@ -12329,7 +12591,7 @@ export class Orchestrator {
           if (fresh) {
             record.acpSessionId = fresh.acpSessionId;
           }
-          await btnInteraction.editReply({
+          await lifecycle.terminal("attached", {
             embeds: [
               new EmbedBuilder()
                 .setTitle("Session Attached")
@@ -12338,7 +12600,6 @@ export class Orchestrator {
             ],
             components: [],
           });
-          collector.stop();
         }
       } else if (customId === "sessions:clone") {
         await btnInteraction.deferUpdate();
@@ -12388,7 +12649,7 @@ export class Orchestrator {
               record.acpSessionId = fresh.acpSessionId;
             }
 
-            await btnInteraction.editReply({
+            await lifecycle.terminal("cloned_attached", {
               embeds: [
                 new EmbedBuilder()
                   .setTitle("Session Cloned & Attached")
@@ -12400,7 +12661,6 @@ export class Orchestrator {
               ],
               components: [],
             });
-            collector.stop();
           } catch (err: any) {
             await btnInteraction.followUp({
               content: `❌ Failed to clone and attach session: ${err.message}`,
@@ -13314,19 +13574,13 @@ export class Orchestrator {
                 )
                 .setColor(0x2ecc71);
 
-              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-                new ButtonBuilder()
-                  .setCustomId("sessions:close")
-                  .setLabel("Close")
-                  .setStyle(ButtonStyle.Secondary)
-              );
-
-              await btnInteraction.editReply({
+              // #159: this used to render a "Close" button and stop the
+              // collector in the same breath — a control that could only ever
+              // answer "interaction failed". Terminal means no components.
+              await lifecycle.terminal("migrated", {
                 embeds: [successEmbed],
-                components: [row],
+                components: [],
               });
-
-              collector.stop();
             } catch (err: any) {
               this.logger.error({ err, sessionId: session.sessionId }, "failed to migrate session");
 
@@ -13365,39 +13619,6 @@ export class Orchestrator {
       }
     });
 
-    collector.on("end", async (collected, reason) => {
-      if (reason === "user_closed") {
-        return;
-      }
-      try {
-        const fresh = this.store.get(record.id);
-        const activeId = fresh ? fresh.acpSessionId : record.acpSessionId;
-        const currentSession = sessions[currentIndex];
-        if (currentSession) {
-          const embed = new EmbedBuilder()
-            .setTitle(`Browse Sessions — ${profile.displayName} (Closed)`)
-            .setDescription(
-              `**Session ID:** \`${currentSession.sessionId}\`\n` +
-              `**Created:** ${currentSession.createdAt ? `<t:${Math.floor(currentSession.createdAt / 1000)}:f>` : "Unknown"}\n` +
-              `**Last Activity:** ${currentSession.lastActivityAt ? `<t:${Math.floor(currentSession.lastActivityAt / 1000)}:R>` : "Unknown"}\n` +
-              `**Status:** ${activeId === currentSession.sessionId ? "🟢 **Active Session in this channel**" : "⚪ Inactive"}\n\n` +
-              `**Preview (Heuristic):**\n` +
-              (currentSession.previewLines.length > 0
-                ? currentSession.previewLines.map(formatLine).filter(Boolean).join("\n") || "*No meaningful messages in this session.*"
-                : "*No messages in this session yet.*")
-            )
-            .setColor(activeId === currentSession.sessionId ? 0x2ecc71 : 0x7f8c8d)
-            .setFooter({ text: `Session ${currentIndex + 1} of ${sessions.length} (Menu Timed Out)` });
-
-          await i.editReply({
-            embeds: [embed],
-            components: [],
-          });
-        }
-      } catch {
-        // ignore errors on end
-      }
-    });
   }
 
   private async cmdTools(i: ChatInputCommandInteraction): Promise<void> {
@@ -16093,16 +16314,9 @@ export class Orchestrator {
       filter: (c) => c.user.id === i.user.id,
       time: 600_000,
     });
-    collector.on("end", async (_collected, reason) => {
-      if (reason !== "time") return;
-      try {
-        await i.editReply({
-          content: "⏰ Preset list timed out. Run `/seam preset list` again.",
-          embeds: [],
-          components: [],
-        });
-      } catch { /* token expired */ }
-    });
+    const lifecycle = this.attachListLifecycle(i, collector, () =>
+      expiredCardView("⏰ Preset list expired. Run `/seam preset list` again.")
+    );
     collector.on("collect", async (c) => {
       try {
         if (!c.isButton()) return;
@@ -16122,6 +16336,8 @@ export class Orchestrator {
             content: "That preset no longer exists.",
             flags: MessageFlags.Ephemeral,
           });
+          // Repeatable: rebuild from the store so the vanished row's controls go.
+          await lifecycle.refresh(this.buildPresetListMessage(projectRef, page));
           return;
         }
         if (action === "apply") {
@@ -16145,7 +16361,13 @@ export class Orchestrator {
             flags: MessageFlags.Ephemeral,
           });
         } else if (action === "edit") {
-          collector.stop("edit");
+          // Transition: freeze the listing BEFORE the builder opens, or the
+          // user is left holding two live-looking cards for one preset.
+          await lifecycle.transition("edit", {
+            content: `✏️ Editing preset **${preset.name}** — this listing was replaced by the editor below.`,
+            embeds: [],
+            components: [],
+          });
           await this.cmdPresetBuilder(c, preset);
         } else if (action === "del") {
           this.store.deletePreset(id);
@@ -16417,16 +16639,11 @@ export class Orchestrator {
       time: 600_000,
     });
 
-    collector.on("end", async (_collected, reason) => {
-      if (reason !== "time") return;
-      try {
-        await i.editReply({
-          content: "⏰ Preset builder timed out — nothing was saved. Run the command again.",
-          embeds: [],
-          components: [],
-        });
-      } catch { /* token expired */ }
-    });
+    // "created"/"saved"/"cancel" settle the card themselves; the lifecycle
+    // expires everything else, including any stop reason added later (#159).
+    const lifecycle = this.attachListLifecycle(i, collector, () =>
+      expiredCardView("⏰ Preset builder timed out — nothing was saved. Run the command again.")
+    );
 
     collector.on("collect", async (c) => {
       try {
@@ -16689,15 +16906,15 @@ export class Orchestrator {
             updatedUtc: now,
           };
           this.store.upsertPreset(preset);
-          collector.stop(existing ? "saved" : "created");
-          await c.update({
+          await c.deferUpdate();
+          await lifecycle.terminal(existing ? "saved" : "created", {
             content: `${existing ? "💾 Updated" : "✅ Created"} preset **${preset.name}** (\`${preset.id}\`).`,
             embeds: [],
             components: [],
           });
         } else if (c.isButton() && c.customId === "preset:cancel") {
-          collector.stop("cancel");
-          await c.update({ content: "Cancelled.", embeds: [], components: [] });
+          await c.deferUpdate();
+          await lifecycle.terminal("cancel", { content: "Cancelled.", embeds: [], components: [] });
         }
       } catch (err) {
         this.logger.warn({ err }, "preset builder interaction failed");

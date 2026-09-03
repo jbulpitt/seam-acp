@@ -356,6 +356,8 @@ import { buildSeamHelpPages } from "./help-text.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
 import { formatLocalTime } from "../../core/format-time.js";
 import { formatCoarseDuration } from "../../core/server-status.js";
+import type { RefreshResult } from "../../core/service-status/manager.js";
+import { SERVICE_STATUS_REFRESH_CUSTOM_ID } from "../../core/service-status-card.js";
 import { humanInboxFrom, scrubDiscordUrls } from "../../core/human-inject.js";
 import {
   TurnStatus,
@@ -714,6 +716,8 @@ export class Orchestrator {
   private readonly store: SessionStore;
   private readonly renderer: Renderer;
   private readonly quotaPoller?: AgentQuotaPoller;
+  /** Installed by index.ts only while the upstream-status subsystem is active. */
+  private serviceStatusRefresh?: () => Promise<RefreshResult>;
   /** Injected only by deterministic restart tests; production uses detached PM2. */
   private readonly restartProcess: () => Promise<void>;
   /** Debounce for the quota-card "Refresh" button: the force-refresh bypasses
@@ -1391,6 +1395,7 @@ export class Orchestrator {
             ["tts editor", () => this.handleTtsEditorComponent(evt)],
             ["voice console", () => this.runVoiceConsoleComponent(evt)],
             ["quota card", () => this.handleQuotaCardComponent(evt)],
+            ["service status card", () => this.handleServiceStatusCardComponent(evt)],
           ];
           await Promise.all(
             handlers.map(([handler, run]) =>
@@ -5433,6 +5438,10 @@ export class Orchestrator {
     this.onParkedChange = fn;
   }
 
+  setServiceStatusRefresh(refresh: (() => Promise<RefreshResult>) | undefined): void {
+    this.serviceStatusRefresh = refresh;
+  }
+
   // --- agent-scheduled wake events (#59) ------------------------------------
 
   /**
@@ -6393,6 +6402,51 @@ export class Orchestrator {
     if (now - this.lastQuotaRefreshClickAt < 10_000) return;
     this.lastQuotaRefreshClickAt = now;
     await this.quotaPoller.refreshAll(true);
+  }
+
+  /** Manual refresh on the pinned upstream-status card. */
+  private async handleServiceStatusCardComponent(evt: ComponentEvent): Promise<void> {
+    if (evt.customId !== SERVICE_STATUS_REFRESH_CUSTOM_ID) return;
+    if (
+      !this.config.DISCORD_SERVICE_STATUS_THREAD_ID ||
+      evt.channel.id !== this.config.DISCORD_SERVICE_STATUS_THREAD_ID
+    ) {
+      await evt.replyEphemeral("This service-status control is not active in this thread.");
+      return;
+    }
+    const refresh = this.serviceStatusRefresh;
+    if (!refresh) {
+      await evt.replyEphemeral("Service-status refresh is unavailable during startup or shutdown.");
+      return;
+    }
+
+    await evt.replyEphemeral("Refreshing upstream service status…");
+    try {
+      const result = await refresh();
+      const attempted = result.sources.filter((source) => source.attempted).length;
+      const failed = result.sources.filter((source) => source.succeeded === false).length;
+      const rateLimited = result.sources.filter(
+        (source) => source.disposition === "rate_limited"
+      ).length;
+      let message: string;
+      if (attempted === 0 && rateLimited > 0) {
+        message = "Refresh is cooling down; no upstream source was fetched again.";
+      } else if (result.outcome === "succeeded") {
+        message = `Service status refreshed (${String(attempted)} sources).`;
+      } else if (result.outcome === "mixed") {
+        message = `Service status refreshed with ${String(failed)} source failure${failed === 1 ? "" : "s"}.`;
+      } else if (result.outcome === "failed") {
+        message = "Service-status refresh failed; the card is retaining its last known good provider data.";
+      } else {
+        message = "No service-status source was eligible to refresh yet.";
+      }
+      await evt.editReplyEphemeral(message);
+    } catch (err) {
+      this.logger.warn({ err }, "manual service status refresh failed");
+      await evt
+        .editReplyEphemeral("Service-status refresh failed; cached provider data is unchanged.")
+        .catch(() => evt.followUpEphemeral("Service-status refresh failed; cached provider data is unchanged."));
+    }
   }
 
   private async handleVoiceConsoleComponent(evt: ComponentEvent): Promise<void> {

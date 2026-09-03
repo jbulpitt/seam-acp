@@ -667,6 +667,12 @@ const Schema = z.object({
     .regex(/^\d+$/, "DISCORD_AGENT_QUOTA_THREAD_ID must be a numeric Discord channel id")
     .optional(),
 
+  /** Optional Discord thread/channel id for the pinned upstream status card. */
+  DISCORD_SERVICE_STATUS_THREAD_ID: z
+    .string()
+    .regex(/^\d+$/, "DISCORD_SERVICE_STATUS_THREAD_ID must be a numeric Discord channel id")
+    .optional(),
+
   /**
    * Optional Discord thread/channel id for the pinned model-value rankings
    * card. The card reads only the latest durable #130 snapshot, edits in place

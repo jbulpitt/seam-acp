@@ -106,11 +106,18 @@ import {
 import { WorkflowInventoryController } from "./workflow-inventory-controls.js";
 import {
   attachCardLifecycle,
+  completionView,
   expiredCardView,
   type CardLifecycle,
   type CardView,
   type StoppableCollector,
 } from "./collector-lifecycle.js";
+import {
+  describeAttachOutcome,
+  planSessionAttachment,
+  type AttachIntent,
+  type AttachOutcome,
+} from "../../core/session-attach.js";
 import { DispatchWatcher } from "../../core/dispatch/watcher.js";
 import {
   CONTINUE_PROMPT,
@@ -503,6 +510,20 @@ import {
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
+
+/**
+ * Appended when a long job finishes onto a card whose collector has already
+ * expired (#179). The result is still shown; the controls are not, so the note
+ * has to say where they went.
+ */
+const LONG_JOB_CARD_EXPIRED_NOTE =
+  "⏰ This session browser timed out while the job ran, so its buttons are gone — " +
+  "run `/seam info sessions` again to act on the result.";
+
+/** Flatten `**bold**` for the plain-message fallback, which has no embed. */
+function stripMarkdownEmphasis(text: string): string {
+  return text.replace(/\*\*/g, "");
+}
 
 /**
  * Default ceiling for the pre-close quiesce barrier (#174). Long enough for a
@@ -4566,11 +4587,26 @@ export class Orchestrator {
       sessionId?: string;
       channel?: ChannelRef;
       onProgress?: (m: string) => void;
+      /**
+       * #179: how much authority this caller has to bind the thread to the
+       * result. Defaults to `"swap-only"` — the programmatic contract, which
+       * follows the binding only if the compacted session held it. The
+       * operator-facing browser buttons pass `"attach"`, which additionally
+       * binds a thread that is currently disconnected.
+       */
+      attachIntent?: AttachIntent;
     }
   ): Promise<{
     newSessionId: string;
     originalSessionId: string;
+    /**
+     * The compacted session still held the thread's binding at COMPLETION, so
+     * the swap happened. Kept for the MCP/dispatch contract; prefer
+     * `attachment`, which also distinguishes the unattached reasons.
+     */
     wasActive: boolean;
+    /** #179: the authoritative attach decision, taken at completion. */
+    attachment: AttachOutcome;
     reportMarkdown: string;
     stats: PremiumCompactionResult["stats"];
   }> {
@@ -4615,9 +4651,9 @@ export class Orchestrator {
 
     if (!result.assembledSeed.trim()) throw new Error("Pipeline produced an empty result.");
 
-    // Non-destructive: seed a NEW resumable session with the summary, bind the
-    // thread to it only if this WAS its active session, and leave the original
-    // intact (recoverable / deletable from the session manager).
+    // Non-destructive: seed a NEW resumable session with the summary, decide
+    // the binding from AUTHORITATIVE state below, and leave the original intact
+    // (recoverable / deletable from the session manager).
     const cfg = this.store.readConfig(record);
     const newSessionId = await this.seedNewSession({
       profile,
@@ -4626,19 +4662,86 @@ export class Orchestrator {
       ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
       summary: result.assembledSeed,
     });
-    const wasActive = sessionId === record.acpSessionId;
-    if (wasActive) {
-      this.store.upsert({ ...record, acpSessionId: newSessionId, updatedUtc: new Date().toISOString() });
-      await this.router.invalidate(record.id, { clearAcpSession: false });
-    }
+    const attachment = await this.attachCompactedSession({
+      record,
+      sourceId: sessionId,
+      newId: newSessionId,
+      // The binding as it was when this job STARTED. `record` is a snapshot the
+      // caller captured before a pipeline that can run for many minutes, so it
+      // is used ONLY to detect that the binding moved — never as the value to
+      // write back.
+      observedAtStart: record.acpSessionId,
+      intent: opts?.attachIntent ?? "swap-only",
+    });
 
     return {
       newSessionId,
       originalSessionId: sessionId,
-      wasActive,
+      wasActive: attachment.attached && attachment.reason === "swapped",
+      attachment,
       reportMarkdown: this.formatPremiumReport(result, sessionId),
       stats: result.stats,
     };
+  }
+
+  /**
+   * Bind the thread to a freshly compacted session, compare-and-swap (#179).
+   *
+   * The decision is taken from the record re-read HERE, at completion, not from
+   * the snapshot the job started with — a premium run lasts minutes, and in
+   * that window the thread can be attached, detached or switched. The store's
+   * conditional UPDATE then arbitrates the last narrow race: if the binding
+   * moved between this read and the write, the write is refused and the newer
+   * choice stands.
+   *
+   * Also keeps the caller's `record` snapshot in step with what was persisted,
+   * so a browser that re-renders after this call marks the right session
+   * active instead of the one it captured ten minutes ago.
+   */
+  private async attachCompactedSession(opts: {
+    record: SessionRecord;
+    sourceId: string;
+    newId: string;
+    observedAtStart: string;
+    intent: AttachIntent;
+  }): Promise<AttachOutcome> {
+    const { record, sourceId, newId, observedAtStart, intent } = opts;
+    const fresh = this.store.get(record.id);
+    const plan = planSessionAttachment({
+      current: fresh ? fresh.acpSessionId : null,
+      observedAtStart,
+      sourceId,
+      newId,
+      intent,
+    });
+
+    let outcome: AttachOutcome;
+    if (plan.action === "cas") {
+      if (this.store.compareAndSwapAcpSession(record.id, plan.expect, plan.next)) {
+        outcome = { attached: true, reason: plan.reason };
+        // Drop the warm runtime so the next turn resumes the seeded session.
+        // `clearAcpSession: false` — the binding we just wrote must survive.
+        await this.router.invalidate(record.id, { clearAcpSession: false });
+      } else {
+        // Lost the race between the read above and the UPDATE. Someone bound
+        // the thread in that gap; theirs is the newer deliberate choice.
+        outcome = { attached: false, reason: "rebound-elsewhere" };
+      }
+    } else if (plan.action === "noop") {
+      outcome = { attached: true, reason: plan.reason };
+    } else {
+      outcome = { attached: false, reason: plan.reason };
+    }
+
+    // Re-sync the caller's snapshot from the store either way: the value it
+    // holds is stale whether or not WE were the one who changed it.
+    const settled = this.store.get(record.id);
+    if (settled) record.acpSessionId = settled.acpSessionId;
+    this.logger.info(
+      { recordId: record.id, sourceId, newId, intent, outcome },
+      "compaction attachment decided"
+    );
+    return outcome;
   }
 
   setDispatchWatcher(watcher: DispatchWatcher): void {
@@ -7998,9 +8101,13 @@ export class Orchestrator {
         channel: target,
         onProgress: (m) => this.logger.debug({ dispatch: spec.id, compact: spec.target }, m),
       });
+      // #179: state the attachment outcome explicitly, including the cases
+      // where the binding was deliberately left alone. Silence used to be the
+      // only signal that the seeded session had nothing pointing at it.
       const summary =
-        `✅ Compacted into a new session \`${res.newSessionId}\` via the multi-agent pipeline` +
-        `${res.wasActive ? " — this thread is now bound to it" : ""} (${res.stats.chunks} chunk(s)). ` +
+        `✅ Compacted into a new session \`${res.newSessionId}\` via the multi-agent pipeline ` +
+        `(${res.stats.chunks} chunk(s)). ` +
+        `${stripMarkdownEmphasis(describeAttachOutcome(res.attachment, { newId: res.newSessionId, sourceId: res.originalSessionId }))} ` +
         `Original \`${res.originalSessionId}\` is preserved (review or delete it from the session manager).`;
       await finalize(summary);
       await statusPanel?.finalize("Done", `Compacted (${res.stats.chunks} chunk(s))`).catch(() => {});
@@ -8008,7 +8115,7 @@ export class Orchestrator {
       await this.sendResultFile(target, res.originalSessionId, res.reportMarkdown, "premium-compaction").catch(() => {});
       try { this.store.updateDelegationStatus(spec.id, "completed"); } catch { /* best-effort */ }
       this.logger.info(
-        { dispatch: spec.id, actor, target: spec.target, newSessionId: res.newSessionId, wasActive: res.wasActive },
+        { dispatch: spec.id, actor, target: spec.target, newSessionId: res.newSessionId, attachment: res.attachment },
         "compact-dispatch: completed"
       );
       return { output: summary, stopReason: "compacted" };
@@ -9320,6 +9427,73 @@ export class Orchestrator {
         this.logger.debug({ err, phase, reason }, "card lifecycle render skipped");
       },
     });
+  }
+
+  /**
+   * Deliver a LONG JOB's result to the card it was launched from (#179).
+   *
+   * Three things can be true by the time a premium compaction finishes, and
+   * the old code handled none of them:
+   *
+   *   1. the card is still live — paint the result WITH its controls, through
+   *      the lifecycle, so a `Back` button always has a collector behind it;
+   *   2. the 10-minute collector already expired — paint the result INERT. The
+   *      operator still gets the answer they paid for; what they must not get
+   *      is a `Back to Manage` button that can only answer "interaction
+   *      failed". A raw `editReply({ components: [backRow] })` here was the
+   *      #159 regression this issue reports;
+   *   3. the interaction TOKEN is dead too (Discord expires it at 15 minutes,
+   *      independently of the collector) — every edit above throws, so fall
+   *      back to a plain message in the thread rather than losing the result.
+   *
+   * Returns which of the three happened, so callers (and tests) can assert it.
+   */
+  private async settleLongJobCard(opts: {
+    lifecycle: CardLifecycle;
+    /** Renders on the ORIGINAL interaction — the same target the lifecycle uses. */
+    render: (view: CardView) => Promise<void>;
+    /** The result card, controls included. Stripped automatically when settled. */
+    view: CardView;
+    /** Where to post if the card cannot be edited at all. */
+    channel: ChannelRef | null;
+    /** What to say there. Must stand alone — the card may be unreachable. */
+    fallbackText: string;
+  }): Promise<"live" | "inert" | "fallback"> {
+    const settled = opts.lifecycle.settled;
+    const paint = async (view: CardView): Promise<boolean> => {
+      const shaped = completionView(view, { settled, expiredNote: LONG_JOB_CARD_EXPIRED_NOTE });
+      if (!settled) {
+        // `refresh` is a no-op once the card has settled, so this cannot
+        // resurrect controls even if expiry lands between the check and here.
+        return opts.lifecycle.refresh(shaped);
+      }
+      try {
+        await opts.render(shaped);
+        return true;
+      } catch (err) {
+        this.logger.debug({ err }, "long job: settled-card render failed");
+        return false;
+      }
+    };
+
+    // An unreadable/oversized report attachment must not cost the operator the
+    // result card itself — retry once without it, as the old handlers did.
+    const attempts: CardView[] =
+      opts.view.files && opts.view.files.length > 0
+        ? [opts.view, { ...opts.view, files: [] }]
+        : [opts.view];
+    for (const attempt of attempts) {
+      if (await paint(attempt)) return settled ? "inert" : "live";
+    }
+
+    if (opts.channel && this.adapter.sendMessage) {
+      try {
+        await this.adapter.sendMessage(opts.channel, opts.fallbackText);
+      } catch (err) {
+        this.logger.warn({ err }, "long job: result fallback message failed");
+      }
+    }
+    return "fallback";
   }
 
   /**
@@ -13660,8 +13834,24 @@ export class Orchestrator {
       };
     };
 
+    /**
+     * The thread's binding, re-read from the store and written back into the
+     * local snapshot (#179).
+     *
+     * `record` is captured once when the browser opens and then lives for the
+     * whole ten-minute session; a compaction, an attach from another surface,
+     * or an agent switch can move the binding underneath it. Rendering from the
+     * captured value is what made a just-compacted session still show as
+     * "⚪ Inactive". Every render below asks this instead.
+     */
+    const activeSessionId = (): string => {
+      const fresh = this.store.get(record.id);
+      if (fresh) record.acpSessionId = fresh.acpSessionId;
+      return record.acpSessionId;
+    };
+
     // Render first session in the list
-    const msg = await i.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+    const msg = await i.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
 
     const collector = msg.createMessageComponentCollector({
       filter: (btnInteraction) => btnInteraction.user.id === i.user.id,
@@ -13673,8 +13863,7 @@ export class Orchestrator {
     // no-current-session case (which used to leave the card untouched) is
     // covered too.
     const lifecycle = this.attachListLifecycle(i, collector, () => {
-      const fresh = this.store.get(record.id);
-      const activeId = fresh ? fresh.acpSessionId : record.acpSessionId;
+      const activeId = activeSessionId();
       const currentSession = sessions[currentIndex];
       if (!currentSession) {
         return expiredCardView("⏰ Session browser closed — run `/seam info sessions` again.");
@@ -13696,6 +13885,149 @@ export class Orchestrator {
       return { embeds: [embed], components: [] };
     });
 
+    const browserChannel = this.channelRefFromInteraction(i);
+    const backRow = () =>
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("sessions:summary_back")
+          .setLabel("⬅ Back to Manage")
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+    /**
+     * Run one compaction from the browser and settle its card (#179).
+     *
+     * The single place all three compaction buttons meet, because all three had
+     * the same two defects and only the premium pair was reported:
+     *
+     *   - progress edits and the completion render now go through the card
+     *     LIFECYCLE. A premium run routinely outlives the 10-minute collector;
+     *     the old raw `editReply({ components: [backRow] })` then repainted a
+     *     `Back to Manage` button onto an already-expired card, with no
+     *     collector left to answer it (#159's invariant, broken from the late
+     *     -writer side);
+     *   - the outcome copy is generated from the ATTACH decision rather than a
+     *     start-of-job boolean, so "left unattached" is always stated instead
+     *     of being the silent absence of a sentence.
+     *
+     * Deliberately fire-and-forget: the collector must stay responsive (Close,
+     * navigation) while a multi-minute pipeline runs behind it.
+     */
+    const runBrowserCompaction = (opts: {
+      session: SessionSummary;
+      progressEmbed: EmbedBuilder;
+      progressPrefix: string;
+      successTitle: string;
+      failureTitle: string;
+      run: (onProgress: (m: string) => void) => Promise<{
+        newId: string;
+        attachment: AttachOutcome;
+        /** One line saying what was compacted into what. */
+        detail: string;
+        report?: { path: string; name: string };
+      }>;
+    }): void => {
+      void (async () => {
+        // The start card: component-free by construction, so a click during the
+        // run cannot reach a control the job is about to invalidate.
+        await lifecycle.refresh({ embeds: [opts.progressEmbed], components: [] });
+
+        let lastEdit = 0;
+        let editing = false;
+        const lines: string[] = [];
+        const pushProgress = (m: string) => {
+          lines.push(m);
+          // Progress goes through the LIFECYCLE, never a raw edit. That is what
+          // stops a frame from landing on a card the collector already expired
+          // — `CardLifecycle.refresh` is a no-op once the card has settled, so
+          // the expiry notice stays the last word instead of being overwritten
+          // by something that reads as a live card again.
+          if (editing) return;
+          const now = Date.now();
+          if (now - lastEdit < STATUS_EDIT_DEBOUNCE_MS) return;
+          editing = true;
+          lastEdit = now;
+          const tail = lines.slice(-8).map((l) => `• ${l}`).join("\n");
+          void lifecycle
+            .refresh({
+              embeds: [
+                EmbedBuilder.from(opts.progressEmbed).setDescription(
+                  `${opts.progressPrefix}\n\n${tail}`
+                ),
+              ],
+              components: [],
+            })
+            .finally(() => {
+              editing = false;
+            });
+        };
+
+        try {
+          const res = await opts.run(pushProgress);
+          // Re-list so the browser can position on the seeded session; its
+          // Attach button is then one click away when the binding was left
+          // deliberately alone.
+          sessions = await manager.listSessions(cwd);
+          const newIndex = sessions.findIndex((s) => s.sessionId === res.newId);
+          if (newIndex !== -1) currentIndex = newIndex;
+
+          const attachLine = describeAttachOutcome(res.attachment, {
+            newId: res.newId,
+            sourceId: opts.session.sessionId,
+          });
+          const successEmbed = new EmbedBuilder()
+            .setTitle(opts.successTitle)
+            .setDescription(
+              `${res.detail}\n${attachLine}\n\n` +
+              `Original \`${opts.session.sessionId}\` is **preserved** — review or delete it from this list.`
+            )
+            // Amber, not green, when the result is not attached: the compaction
+            // succeeded but the thread is not on it, and that must not read as
+            // an unqualified success.
+            .setColor(res.attachment.attached ? 0x2ecc71 : 0xf1c40f);
+
+          await this.settleLongJobCard({
+            lifecycle,
+            render: async (view) => {
+              await i.editReply(view as InteractionEditReplyOptions);
+            },
+            view: {
+              embeds: [successEmbed],
+              components: [backRow()],
+              ...(res.report
+                ? { files: [new AttachmentBuilder(res.report.path, { name: res.report.name })] }
+                : {}),
+            },
+            channel: browserChannel ?? null,
+            fallbackText:
+              `${opts.successTitle} — new session \`${res.newId}\` ` +
+              `(from \`${opts.session.sessionId}\`). ${stripMarkdownEmphasis(attachLine)}`,
+          });
+        } catch (err: unknown) {
+          const message = (err as Error)?.message ?? String(err);
+          this.logger.error(
+            { err, sessionId: opts.session.sessionId, customId: opts.successTitle },
+            "session browser compaction failed"
+          );
+          const errorEmbed = new EmbedBuilder()
+            .setTitle(opts.failureTitle)
+            .setDescription(`\`\`\`\n${message.slice(0, 1500)}\n\`\`\``)
+            .setColor(0xe74c3c);
+          // Failures obey the same lifecycle rule as successes — a spent card
+          // must not regain a Back button just because the job errored.
+          await this.settleLongJobCard({
+            lifecycle,
+            render: async (view) => {
+              await i.editReply(view as InteractionEditReplyOptions);
+            },
+            view: { embeds: [errorEmbed], components: [backRow()] },
+            channel: browserChannel ?? null,
+            fallbackText: `${opts.failureTitle}: ${message.slice(0, 500)}`,
+          });
+        }
+      })();
+    };
+
     collector.on("collect", async (btnInteraction) => {
       const customId = btnInteraction.customId;
 
@@ -13703,13 +14035,13 @@ export class Orchestrator {
         await btnInteraction.deferUpdate();
         if (currentIndex > 0) {
           currentIndex--;
-          await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+          await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
         }
       } else if (customId === "sessions:next") {
         await btnInteraction.deferUpdate();
         if (currentIndex < sessions.length - 1) {
           currentIndex++;
-          await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+          await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
         }
       } else if (customId === "sessions:close") {
         await btnInteraction.deferUpdate();
@@ -13753,7 +14085,7 @@ export class Orchestrator {
             if (newIndex !== -1) {
               currentIndex = newIndex;
             }
-            const opts = makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager);
+            const opts = makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager);
             const embed = opts.embeds?.[0];
             if (embed) {
               embed.setDescription(
@@ -13835,7 +14167,7 @@ export class Orchestrator {
         }
       } else if (customId === "sessions:delete_cancel") {
         await btnInteraction.deferUpdate();
-        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
       } else if (customId === "sessions:delete_confirm") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
@@ -13871,7 +14203,7 @@ export class Orchestrator {
               });
             } else {
               currentIndex = 0;
-              await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+              await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
             }
           } catch (err: any) {
             await btnInteraction.followUp({
@@ -13907,7 +14239,7 @@ export class Orchestrator {
         }
       } else if (customId === "sessions:repair_cancel") {
         await btnInteraction.deferUpdate();
-        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
       } else if (customId === "sessions:repair_confirm") {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
@@ -13918,7 +14250,7 @@ export class Orchestrator {
               await this.router.invalidate(record.id);
             }
             sessions = await manager.listSessions(cwd);
-            const opts = makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager);
+            const opts = makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager);
             const embed = opts.embeds?.[0];
             if (embed) {
               embed.setDescription(
@@ -13966,16 +14298,27 @@ export class Orchestrator {
               .setDescription(`Thread has been reconstructed from Discord history.\n\n**New Session ID:** \`${newSessionId}\`\n\n**Summary:**\n${summary.substring(0, 1500)}${summary.length > 1500 ? "..." : ""}`)
               .setColor(0x2ecc71);
 
-            await btnInteraction.editReply({
-              embeds: [successEmbed],
-              components: [
-                new ActionRowBuilder<ButtonBuilder>().addComponents(
-                  new ButtonBuilder()
-                    .setCustomId("sessions:close")
-                    .setLabel("Close")
-                    .setStyle(ButtonStyle.Secondary)
-                ),
-              ],
+            // #179: same rule as the compaction buttons — a rebuild is a long
+            // unawaited job on this card, so its result must go through the
+            // lifecycle or it repaints a Close button onto an expired card.
+            await this.settleLongJobCard({
+              lifecycle,
+              render: async (view) => {
+                await i.editReply(view as InteractionEditReplyOptions);
+              },
+              view: {
+                embeds: [successEmbed],
+                components: [
+                  new ActionRowBuilder<ButtonBuilder>().addComponents(
+                    new ButtonBuilder()
+                      .setCustomId("sessions:close")
+                      .setLabel("Close")
+                      .setStyle(ButtonStyle.Secondary)
+                  ),
+                ],
+              },
+              channel: browserChannel ?? null,
+              fallbackText: `🏗️ Session rebuilt — new session \`${newSessionId}\`.`,
             });
           } catch (err: any) {
             this.logger.error({ err, channelId: i.channelId }, "failed to rebuild session");
@@ -13985,16 +14328,14 @@ export class Orchestrator {
               .setDescription(`An error occurred while reconstructing the session:\n\`\`\`\n${err.message}\n\`\`\``)
               .setColor(0xe74c3c);
 
-            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-              new ButtonBuilder()
-                .setCustomId("sessions:summary_back")
-                .setLabel("⬅ Back to Manage")
-                .setStyle(ButtonStyle.Secondary)
-            );
-
-            await btnInteraction.editReply({
-              embeds: [errorEmbed],
-              components: [row],
+            await this.settleLongJobCard({
+              lifecycle,
+              render: async (view) => {
+                await i.editReply(view as InteractionEditReplyOptions);
+              },
+              view: { embeds: [errorEmbed], components: [backRow()] },
+              channel: browserChannel ?? null,
+              fallbackText: `❌ Rebuild failed: ${String(err?.message ?? err).slice(0, 500)}`,
             });
           }
         })();
@@ -14101,16 +14442,14 @@ export class Orchestrator {
                 )
                 .setColor(0x9b59b6);
 
-              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-                new ButtonBuilder()
-                  .setCustomId("sessions:summary_back")
-                  .setLabel("⬅ Back to Manage")
-                  .setStyle(ButtonStyle.Secondary)
-              );
-
-              await btnInteraction.editReply({
-                embeds: [summaryEmbed],
-                components: [row],
+              await this.settleLongJobCard({
+                lifecycle,
+                render: async (view) => {
+                  await i.editReply(view as InteractionEditReplyOptions);
+                },
+                view: { embeds: [summaryEmbed], components: [backRow()] },
+                channel: browserChannel ?? null,
+                fallbackText: `🪄 AI summary for \`${session.sessionId}\` is ready, but this browser card expired.`,
               });
             } catch (err: any) {
               this.logger.error({ err, sessionId: session.sessionId }, "failed to generate AI summary");
@@ -14120,16 +14459,14 @@ export class Orchestrator {
                 .setDescription(`An error occurred while generating the summary:\n\`\`\`\n${err.message}\n\`\`\``)
                 .setColor(0xe74c3c);
 
-              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-                new ButtonBuilder()
-                  .setCustomId("sessions:summary_back")
-                  .setLabel("⬅ Back to Manage")
-                  .setStyle(ButtonStyle.Secondary)
-              );
-
-              await btnInteraction.editReply({
-                embeds: [errorEmbed],
-                components: [row],
+              await this.settleLongJobCard({
+                lifecycle,
+                render: async (view) => {
+                  await i.editReply(view as InteractionEditReplyOptions);
+                },
+                view: { embeds: [errorEmbed], components: [backRow()] },
+                channel: browserChannel ?? null,
+                fallbackText: `❌ AI summary failed: ${String(err?.message ?? err).slice(0, 500)}`,
               });
             } finally {
               if (tempRuntime) {
@@ -14144,232 +14481,128 @@ export class Orchestrator {
             }
           })();
         }
-      } else if (customId === "sessions:compact") {
+      } else if (
+        customId === "sessions:compact" ||
+        customId === "sessions:premium" ||
+        customId === "sessions:premium_discord"
+      ) {
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
         if (session) {
-          await btnInteraction.editReply({
-            embeds: [
-              new EmbedBuilder()
+          // #179: all three compaction buttons run through ONE launcher, so the
+          // attachment contract and the card lifecycle cannot be honoured by
+          // some of them and forgotten by the rest — which is exactly how the
+          // premium pair ended up resurrecting an expired Back button while the
+          // plain sibling did something subtly different with the binding.
+          if (customId === "sessions:compact") {
+            runBrowserCompaction({
+              session,
+              progressEmbed: new EmbedBuilder()
                 .setTitle("🗳️ Compacting Session...")
-                .setDescription(`Generating compaction summary for session \`${session.sessionId}\` (summary + verbatim recent window + pinned facts)...`)
-                .setColor(0xe67e22)
-            ],
-            components: [],
-          });
-
-          const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId("sessions:summary_back").setLabel("⬅ Back to Manage").setStyle(ButtonStyle.Secondary)
-          );
-
-          void (async () => {
-            try {
-              if (!this.compactionModelFor(record.agentId)) {
-                throw new Error(`Compaction is not supported for agent profile \`${record.agentId}\` (no summarizer model).`);
-              }
-              const built = await this.buildDefaultCompactionSeed({
-                profile,
-                manager,
-                agentId: record.agentId,
-                cwd,
-                sessionId: session.sessionId,
-              });
-              if (!built) throw new Error("Nothing to compact (empty transcript or no summarizer model).");
-
-              // Non-destructive: seed a NEW session with the summary (resumable),
-              // bind the thread to it if this was its active session, and leave
-              // the original intact.
-              const cfg = this.store.readConfig(record);
-              const newId = await this.seedNewSession({
-                profile, cwd,
-                ...(cfg.model ? { model: cfg.model } : {}),
-                ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
-                summary: built.seed,
-              });
-              const wasActive = session.sessionId === record.acpSessionId;
-              if (wasActive) {
-                this.store.upsert({ ...record, acpSessionId: newId, updatedUtc: new Date().toISOString() });
-                await this.router.invalidate(record.id, { clearAcpSession: false });
-              }
-
-              sessions = await manager.listSessions(cwd);
-              const newIndex = sessions.findIndex(s => s.sessionId === newId);
-              if (newIndex !== -1) currentIndex = newIndex;
-
-              const successEmbed = new EmbedBuilder()
-                .setTitle("🗳️ Session Compacted")
                 .setDescription(
-                  `Compacted into a **new session** \`${newId}\` (summarized ${built.summarizedTurns} older turn(s), kept ${built.keptTurns} verbatim, pinned ${built.pinnedCount} fact(s)).` +
-                  (wasActive ? `\nThis thread is now bound to it.` : ``) +
-                  `\n\nThe original \`${session.sessionId}\` is **preserved** — find it in this list to review or delete.`
+                  `Generating compaction summary for session \`${session.sessionId}\` ` +
+                  `(summary + verbatim recent window + pinned facts)...`
                 )
-                .setColor(0x2ecc71);
-              await btnInteraction.editReply({ embeds: [successEmbed], components: [backRow] });
-            } catch (err: any) {
-              this.logger.error({ err, sessionId: session.sessionId }, "failed to compact session");
-              const errorEmbed = new EmbedBuilder()
-                .setTitle("❌ Compaction Failed")
-                .setDescription(`An error occurred during compaction:\n\`\`\`\n${(err?.message ?? String(err)).slice(0, 1500)}\n\`\`\``)
-                .setColor(0xe74c3c);
-              await btnInteraction.editReply({ embeds: [errorEmbed], components: [backRow] });
-            }
-          })();
-        }
-      } else if (customId === "sessions:premium") {
-        await btnInteraction.deferUpdate();
-        const session = sessions[currentIndex];
-        if (session) {
-          const channelRef = this.channelRefFromInteraction(i);
-          const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId("sessions:summary_back").setLabel("⬅ Back to Manage").setStyle(ButtonStyle.Secondary)
-          );
-          const progressEmbed = new EmbedBuilder()
-            .setTitle("✨ Premium Compaction")
-            .setDescription(`Running multi-agent compaction on \`${session.sessionId}\`…\nThis can take several minutes (fan-out → reduce → deep-dive → synthesize → verify).`)
-            .setColor(0x9b59b6);
-          await btnInteraction.editReply({ embeds: [progressEmbed], components: [] });
+                .setColor(0xe67e22),
+              progressPrefix: `Compacting \`${session.sessionId}\`…`,
+              successTitle: "🗳️ Session Compacted",
+              failureTitle: "❌ Compaction Failed",
+              run: async () => {
+                if (!this.compactionModelFor(record.agentId)) {
+                  throw new Error(
+                    `Compaction is not supported for agent profile \`${record.agentId}\` (no summarizer model).`
+                  );
+                }
+                const built = await this.buildDefaultCompactionSeed({
+                  profile,
+                  manager,
+                  agentId: record.agentId,
+                  cwd,
+                  sessionId: session.sessionId,
+                });
+                if (!built) throw new Error("Nothing to compact (empty transcript or no summarizer model).");
 
-          void (async () => {
-            // Throttle progress edits so we don't hit Discord's rate limit.
-            let lastEdit = 0;
-            let editing = false;
-            const lines: string[] = [];
-            const pushProgress = (m: string) => {
-              lines.push(m);
-              const now = Date.now();
-              if (editing || now - lastEdit < 2500) return;
-              editing = true;
-              lastEdit = now;
-              const tail = lines.slice(-8).map((l) => `• ${l}`).join("\n");
-              btnInteraction.editReply({
-                embeds: [EmbedBuilder.from(progressEmbed).setDescription(`Compacting \`${session.sessionId}\`…\n\n${tail}`)],
-                components: [],
-              }).catch(() => {}).finally(() => { editing = false; });
-            };
-
-            try {
-              // Delegate the run+seed+swap to the shared primitive (identical
-              // behavior, non-destructive); this handler keeps its card rendering.
-              const res = await this.compactThread(record, {
-                sessionId: session.sessionId,
-                ...(channelRef ? { channel: channelRef } : {}),
-                onProgress: pushProgress,
-              });
-              const newId = res.newSessionId;
-              const wasActive = res.wasActive;
-              sessions = await manager.listSessions(cwd);
-              const newIndex = sessions.findIndex((s) => s.sessionId === newId);
-              if (newIndex !== -1) currentIndex = newIndex;
-
-              const reportPath = path.join(os.tmpdir(), `premium-compaction-${session.sessionId}.md`);
-              await fsp.writeFile(reportPath, res.reportMarkdown, "utf8").catch(() => {});
-
-              const successEmbed = new EmbedBuilder()
-                .setTitle("✨ Premium Compaction Complete")
+                // Non-destructive: seed a NEW session with the summary
+                // (resumable) and leave the original intact.
+                const cfg = this.store.readConfig(record);
+                const observedAtStart = record.acpSessionId;
+                const newId = await this.seedNewSession({
+                  profile, cwd,
+                  ...(cfg.model ? { model: cfg.model } : {}),
+                  ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+                  summary: built.seed,
+                });
+                const attachment = await this.attachCompactedSession({
+                  record,
+                  sourceId: session.sessionId,
+                  newId,
+                  observedAtStart,
+                  intent: "attach",
+                });
+                return {
+                  newId,
+                  attachment,
+                  detail:
+                    `Compacted into a **new session** \`${newId}\` ` +
+                    `(summarized ${built.summarizedTurns} older turn(s), kept ${built.keptTurns} verbatim, ` +
+                    `pinned ${built.pinnedCount} fact(s)).`,
+                };
+              },
+            });
+          } else {
+            const fromDiscord = customId === "sessions:premium_discord";
+            runBrowserCompaction({
+              session,
+              progressEmbed: new EmbedBuilder()
+                .setTitle(fromDiscord ? "✨ Premium Compaction (Discord)" : "✨ Premium Compaction")
                 .setDescription(
-                  `Compacted into a **new session** \`${newId}\` with the multi-agent pipeline.` +
-                  (wasActive ? ` This thread is now bound to it.` : ``) +
-                  `\nOriginal \`${session.sessionId}\` is **preserved** (review or delete it from this list).`
+                  (fromDiscord
+                    ? `Running multi-agent compaction on full Discord history…`
+                    : `Running multi-agent compaction on \`${session.sessionId}\`…`) +
+                  `\nThis can take several minutes (fan-out → reduce → deep-dive → synthesize → verify).`
                 )
-                .addFields(
-                  { name: "Chunks", value: String(res.stats.chunks), inline: true },
-                )
-                .setColor(0x2ecc71);
-
-              await btnInteraction.editReply({
-                embeds: [successEmbed],
-                components: [backRow],
-                files: [new AttachmentBuilder(reportPath, { name: `premium-compaction-${session.sessionId}.md` })],
-              }).catch(async () => {
-                await btnInteraction.editReply({ embeds: [successEmbed], components: [backRow] }).catch(() => {});
-              });
-            } catch (err: any) {
-              this.logger.error({ err, sessionId: session.sessionId }, "premium compaction failed");
-              const errorEmbed = new EmbedBuilder()
-                .setTitle("❌ Premium Compaction Failed")
-                .setDescription(`\`\`\`\n${(err?.message ?? String(err)).slice(0, 1500)}\n\`\`\``)
-                .setColor(0xe74c3c);
-              await btnInteraction.editReply({ embeds: [errorEmbed], components: [backRow] }).catch(() => {});
-            }
-          })();
-        }
-      } else if (customId === "sessions:premium_discord") {
-        await btnInteraction.deferUpdate();
-        const session = sessions[currentIndex];
-        if (session) {
-          const channelRef = this.channelRefFromInteraction(i);
-          const backRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId("sessions:summary_back").setLabel("⬅ Back to Manage").setStyle(ButtonStyle.Secondary)
-          );
-          const progressEmbed = new EmbedBuilder()
-            .setTitle("✨ Premium Compaction (Discord)")
-            .setDescription(`Running multi-agent compaction on full Discord history…\nThis can take several minutes (fan-out → reduce → deep-dive → synthesize → verify).`)
-            .setColor(0x9b59b6);
-          await btnInteraction.editReply({ embeds: [progressEmbed], components: [] });
-
-          void (async () => {
-            let lastEdit = 0;
-            let editing = false;
-            const lines: string[] = [];
-            const pushProgress = (m: string) => {
-              lines.push(m);
-              const now = Date.now();
-              if (editing || now - lastEdit < 2500) return;
-              editing = true;
-              lastEdit = now;
-              const tail = lines.slice(-8).map((l) => `• ${l}`).join("\n");
-              btnInteraction.editReply({
-                embeds: [EmbedBuilder.from(progressEmbed).setDescription(`Compacting from Discord history…\n\n${tail}`)],
-                components: [],
-              }).catch(() => {}).finally(() => { editing = false; });
-            };
-
-            try {
-              // Delegate the run+seed+swap to the shared primitive with the
-              // full-Discord source; this handler keeps its card rendering.
-              const res = await this.compactThread(record, {
-                source: "discord",
-                sessionId: session.sessionId,
-                ...(channelRef ? { channel: channelRef } : {}),
-                onProgress: pushProgress,
-              });
-              const newId = res.newSessionId;
-              const wasActive = res.wasActive;
-              sessions = await manager.listSessions(cwd);
-              const newIndex = sessions.findIndex((s) => s.sessionId === newId);
-              if (newIndex !== -1) currentIndex = newIndex;
-
-              const reportPath = path.join(os.tmpdir(), `premium-compaction-discord-${session.sessionId}.md`);
-              await fsp.writeFile(reportPath, res.reportMarkdown, "utf8").catch(() => {});
-
-              const successEmbed = new EmbedBuilder()
-                .setTitle("✨ Premium Compaction (Discord) Complete")
-                .setDescription(
-                  `Compacted from Discord thread history into a **new session** \`${newId}\` with the multi-agent pipeline.` +
-                  (wasActive ? ` This thread is now bound to it.` : ``) +
-                  `\nOriginal \`${session.sessionId}\` is **preserved** (review or delete it from this list).`
-                )
-                .addFields(
-                  { name: "Chunks", value: String(res.stats.chunks), inline: true },
-                )
-                .setColor(0x2ecc71);
-
-              await btnInteraction.editReply({
-                embeds: [successEmbed],
-                components: [backRow],
-                files: [new AttachmentBuilder(reportPath, { name: `premium-compaction-discord-${session.sessionId}.md` })],
-              }).catch(async () => {
-                await btnInteraction.editReply({ embeds: [successEmbed], components: [backRow] }).catch(() => {});
-              });
-            } catch (err: any) {
-              this.logger.error({ err, sessionId: session.sessionId }, "premium compaction (Discord) failed");
-              const errorEmbed = new EmbedBuilder()
-                .setTitle("❌ Premium Compaction Failed")
-                .setDescription(`\`\`\`\n${(err?.message ?? String(err)).slice(0, 1500)}\n\`\`\``)
-                .setColor(0xe74c3c);
-              await btnInteraction.editReply({ embeds: [errorEmbed], components: [backRow] }).catch(() => {});
-            }
-          })();
+                .setColor(0x9b59b6),
+              progressPrefix: fromDiscord
+                ? "Compacting from Discord history…"
+                : `Compacting \`${session.sessionId}\`…`,
+              successTitle: fromDiscord
+                ? "✨ Premium Compaction (Discord) Complete"
+                : "✨ Premium Compaction Complete",
+              failureTitle: "❌ Premium Compaction Failed",
+              run: async (onProgress) => {
+                // The shared primitive owns run+seed+compare-and-swap; this
+                // handler owns only the card. `attachIntent: "attach"` is what
+                // makes the BUTTON compact-and-attach: a thread left unbound by
+                // an agent switch is bound to the result instead of being left
+                // silently disconnected. It still never steals a binding that
+                // points somewhere else.
+                const res = await this.compactThread(record, {
+                  ...(fromDiscord ? { source: "discord" as const } : {}),
+                  sessionId: session.sessionId,
+                  ...(browserChannel ? { channel: browserChannel } : {}),
+                  attachIntent: "attach",
+                  onProgress,
+                });
+                const reportName =
+                  `premium-compaction${fromDiscord ? "-discord" : ""}-${session.sessionId}.md`;
+                const reportPath = path.join(os.tmpdir(), reportName);
+                const wrote = await fsp
+                  .writeFile(reportPath, res.reportMarkdown, "utf8")
+                  .then(() => true)
+                  .catch(() => false);
+                return {
+                  newId: res.newSessionId,
+                  attachment: res.attachment,
+                  detail:
+                    (fromDiscord
+                      ? `Compacted from Discord thread history into a **new session** \`${res.newSessionId}\``
+                      : `Compacted into a **new session** \`${res.newSessionId}\``) +
+                    ` with the multi-agent pipeline (${res.stats.chunks} chunk(s)).`,
+                  ...(wrote ? { report: { path: reportPath, name: reportName } } : {}),
+                };
+              },
+            });
+          }
         }
       } else if (customId === "sessions:import_to_cwd") {
         const session = sessions[currentIndex];
@@ -14510,27 +14743,34 @@ export class Orchestrator {
               )
               .setColor(0x2ecc71);
 
-            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-              new ButtonBuilder()
-                .setCustomId("sessions:summary_back")
-                .setLabel("⬅ Back to Manage")
-                .setStyle(ButtonStyle.Secondary)
-            );
-
-            await submission.editReply({ embeds: [successEmbed], components: [row] });
+            // #179: the modal's `deferUpdate` targets the BROWSER card, so this
+            // is the same late-writer path as the compaction buttons — an
+            // import that outlives the collector must not repaint its Back
+            // button either.
+            await this.settleLongJobCard({
+              lifecycle,
+              render: async (view) => {
+                await i.editReply(view as InteractionEditReplyOptions);
+              },
+              view: { embeds: [successEmbed], components: [backRow()] },
+              channel: browserChannel ?? null,
+              fallbackText: `📤 Import finished for \`${session.sessionId}\`, but this browser card expired.`,
+            });
           } catch (err: any) {
             this.logger.error({ err, sessionId: session.sessionId }, "failed to import session");
             const errorEmbed = new EmbedBuilder()
               .setTitle("❌ Import Failed")
               .setDescription(`An error occurred during import:\n\`\`\`\n${err.message}\n\`\`\``)
               .setColor(0xe74c3c);
-            const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-              new ButtonBuilder()
-                .setCustomId("sessions:summary_back")
-                .setLabel("⬅ Back to Manage")
-                .setStyle(ButtonStyle.Secondary)
-            );
-            await submission.editReply({ embeds: [errorEmbed], components: [row] });
+            await this.settleLongJobCard({
+              lifecycle,
+              render: async (view) => {
+                await i.editReply(view as InteractionEditReplyOptions);
+              },
+              view: { embeds: [errorEmbed], components: [backRow()] },
+              channel: browserChannel ?? null,
+              fallbackText: `❌ Import failed: ${String(err?.message ?? err).slice(0, 500)}`,
+            });
           } finally {
             if (tempRuntime) {
               const tempSessionId = tempRuntime.getSessionInfo()?.sessionId;
@@ -14591,7 +14831,7 @@ export class Orchestrator {
         }
       } else if (customId === "sessions:migrate_cancel") {
         await btnInteraction.deferUpdate();
-        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
       } else if (btnInteraction.isStringSelectMenu() && customId === "sessions:migrate_target") {
         await btnInteraction.deferUpdate();
         const targetAgentId = btnInteraction.values[0];
@@ -14729,16 +14969,17 @@ export class Orchestrator {
                 .setDescription(`An error occurred during migration:\n\`\`\`\n${err.message}\n\`\`\``)
                 .setColor(0xe74c3c);
 
-              const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-                new ButtonBuilder()
-                  .setCustomId("sessions:summary_back")
-                  .setLabel("⬅ Back to Manage")
-                  .setStyle(ButtonStyle.Secondary)
-              );
-
-              await btnInteraction.editReply({
-                embeds: [errorEmbed],
-                components: [row],
+              // #179: the migrate SUCCESS path already settles through the
+              // lifecycle (#159); its failure path did not, and a migration is
+              // just as long-running as the compaction that reported this bug.
+              await this.settleLongJobCard({
+                lifecycle,
+                render: async (view) => {
+                  await i.editReply(view as InteractionEditReplyOptions);
+                },
+                view: { embeds: [errorEmbed], components: [backRow()] },
+                channel: browserChannel ?? null,
+                fallbackText: `❌ Migration failed: ${String(err?.message ?? err).slice(0, 500)}`,
               });
             } finally {
               if (tempRuntime) {
@@ -14755,7 +14996,7 @@ export class Orchestrator {
         }
       } else if (customId === "sessions:summary_back") {
         await btnInteraction.deferUpdate();
-        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, record.acpSessionId, manager));
+        await btnInteraction.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
       }
     });
 

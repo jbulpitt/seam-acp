@@ -1091,6 +1091,34 @@ export class SessionStore {
       .run({ ...record, namePrefix: record.namePrefix ?? null });
   }
 
+  /**
+   * Move the thread's ACP binding from `expected` to `next`, atomically (#179).
+   *
+   * Returns whether THIS call performed the write. `false` means the binding
+   * was no longer `expected` — someone else changed it — and nothing was
+   * touched.
+   *
+   * Deliberately not `upsert({ ...record, acpSessionId })`. That helper writes
+   * every column from the caller's snapshot, which for a compaction is a record
+   * read ten minutes earlier: it would silently revert any repo/config/agent
+   * change made meanwhile, and it has no way to notice that the binding it is
+   * overwriting is a newer deliberate choice. A single conditional UPDATE
+   * touches one column and lets SQLite arbitrate the race.
+   *
+   * `expected` is the empty string for "currently unbound", matching how
+   * `SessionRecord.acpSessionId` represents it everywhere else.
+   */
+  compareAndSwapAcpSession(id: string, expected: string, next: string): boolean {
+    const res = this.db
+      .prepare(
+        `UPDATE sessions
+            SET acp_session_id = ?, updated_utc = ?
+          WHERE id = ? AND COALESCE(acp_session_id, '') = ?`
+      )
+      .run(next, new Date().toISOString(), id, expected);
+    return res.changes > 0;
+  }
+
   setNamePrefix(id: string, prefix: string | null): void {
     this.db
       .prepare("UPDATE sessions SET name_prefix = ?, updated_utc = ? WHERE id = ?")

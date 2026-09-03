@@ -36,10 +36,15 @@ const fakeResult = () => ({
 function makeOrch(over?: {
   profile?: unknown;
   cfg?: { model?: string; reasoningEffort?: string };
+  /** The row the store hands back — `null` models a deleted thread. */
+  stored?: SessionRecord | null;
+  /** Runs between the CAS read and the CAS write, to inject a race. */
+  onCasRead?: (bound: { value: string }) => void;
 }) {
   const upserts: SessionRecord[] = [];
   const invalidated: Array<{ id: string; opts: unknown }> = [];
   const deletes: string[] = [];
+  const casCalls: Array<{ id: string; expected: string; next: string; ok: boolean }> = [];
   const profile =
     over?.profile !== undefined
       ? over.profile
@@ -53,8 +58,20 @@ function makeOrch(over?: {
       invalidated.push({ id, opts });
     },
   };
+  // A real-ish binding cell, so the compare-and-swap is genuinely exercised
+  // rather than asserted against a recorder that always says yes.
+  const stored = over?.stored === undefined ? record() : over.stored;
+  const bound = { value: stored?.acpSessionId ?? "" };
   const store = {
     readConfig: () => over?.cfg ?? { model: "opus", reasoningEffort: "high" },
+    get: (_id: string) => (stored ? { ...stored, acpSessionId: bound.value } : null),
+    compareAndSwapAcpSession: (id: string, expected: string, next: string) => {
+      over?.onCasRead?.(bound);
+      const ok = bound.value === expected;
+      if (ok) bound.value = next;
+      casCalls.push({ id, expected, next, ok });
+      return ok;
+    },
     upsert: (r: SessionRecord) => {
       upserts.push(r);
     },
@@ -101,7 +118,7 @@ function makeOrch(over?: {
     return "sess-new";
   };
 
-  return { orch, upserts, invalidated, deletes, sessionCalls, discordCalls, seedCalls };
+  return { orch, upserts, invalidated, deletes, sessionCalls, discordCalls, seedCalls, casCalls, bound };
 }
 
 describe("Orchestrator.compactThread", () => {
@@ -123,12 +140,15 @@ describe("Orchestrator.compactThread", () => {
     expect(res.stats.chunks).toBe(4);
     expect(res.reportMarkdown).toContain("Premium compaction report");
 
-    // The thread was rebound to the new session (upsert + router invalidate).
-    expect(t.upserts).toHaveLength(1);
-    expect(t.upserts[0].acpSessionId).toBe("sess-new");
-    // Only acpSessionId changed — the record otherwise preserved.
-    expect(t.upserts[0].id).toBe("discord:thread-c");
-    expect(t.upserts[0].agentId).toBe("claude");
+    // #179: rebound through a compare-and-swap on the ONE column, expecting the
+    // session that was compacted — never a whole-record write-back of a
+    // ten-minute-old snapshot.
+    expect(res.attachment).toEqual({ attached: true, reason: "swapped" });
+    expect(t.casCalls).toEqual([
+      { id: "discord:thread-c", expected: "acp-active", next: "sess-new", ok: true },
+    ]);
+    expect(t.bound.value).toBe("sess-new");
+    expect(t.upserts).toHaveLength(0);
     expect(t.invalidated).toHaveLength(1);
     expect(t.invalidated[0]).toEqual({ id: "discord:thread-c", opts: { clearAcpSession: false } });
 
@@ -148,15 +168,119 @@ describe("Orchestrator.compactThread", () => {
     const res = await t.orch.compactThread(record(), { sessionId: "acp-older" });
 
     expect(res.wasActive).toBe(false);
+    expect(res.attachment).toEqual({ attached: false, reason: "source-inactive" });
     expect(res.originalSessionId).toBe("acp-older");
     expect(res.newSessionId).toBe("sess-new");
     // A new session was still seeded (compaction ran)...
     expect(t.seedCalls).toHaveLength(1);
-    // ...but the thread's active binding is untouched.
+    // ...but the thread's active binding is untouched — no write was even
+    // attempted, so there is nothing for a race to lose.
+    expect(t.casCalls).toHaveLength(0);
+    expect(t.bound.value).toBe("acp-active");
     expect(t.upserts).toHaveLength(0);
     expect(t.invalidated).toHaveLength(0);
     // Pipeline ran against the explicitly-targeted session.
     expect(t.sessionCalls[0].sessionId).toBe("acp-older");
+  });
+
+  // ---------------------------------------------------------------------
+  // #179 — the decision is taken at COMPLETION, from the store
+  // ---------------------------------------------------------------------
+
+  it("attaches an UNBOUND thread when the caller asked to (the post-agent-switch case)", async () => {
+    // The reported flow: an agent switch cleared the binding, then the operator
+    // compacted a session picked from the browser. The old start-of-job boolean
+    // made this `wasActive: false` and left the seeded session pointed at by
+    // nothing at all.
+    const t = makeOrch({ stored: record({ acpSessionId: "" }) });
+    const res = await t.orch.compactThread(record({ acpSessionId: "" }), {
+      sessionId: "acp-older",
+      attachIntent: "attach",
+    });
+
+    expect(res.attachment).toEqual({ attached: true, reason: "bound-unbound" });
+    expect(t.casCalls).toEqual([
+      { id: "discord:thread-c", expected: "", next: "sess-new", ok: true },
+    ]);
+    expect(t.bound.value).toBe("sess-new");
+    expect(t.invalidated).toHaveLength(1);
+  });
+
+  it("leaves an UNBOUND thread alone for a programmatic compaction (default intent)", async () => {
+    // Negative control for the case above: the same state, without the operator
+    // authority, must keep today's conservative behaviour.
+    const t = makeOrch({ stored: record({ acpSessionId: "" }) });
+    const res = await t.orch.compactThread(record({ acpSessionId: "" }), { sessionId: "acp-older" });
+
+    expect(res.attachment).toEqual({ attached: false, reason: "source-inactive" });
+    expect(t.casCalls).toHaveLength(0);
+    expect(t.bound.value).toBe("");
+  });
+
+  it("preserves a binding changed DURING the run instead of overwriting it", async () => {
+    // The snapshot says the compacted session was active; the store says the
+    // operator moved on. The newer deliberate choice wins.
+    const t = makeOrch({ stored: record({ acpSessionId: "acp-someone-else" }) });
+    const res = await t.orch.compactThread(record({ acpSessionId: "acp-active" }), {
+      attachIntent: "attach",
+    });
+
+    expect(res.attachment).toEqual({ attached: false, reason: "rebound-elsewhere" });
+    expect(res.wasActive).toBe(false);
+    expect(t.casCalls).toHaveLength(0);
+    expect(t.bound.value).toBe("acp-someone-else");
+    expect(t.invalidated).toHaveLength(0);
+  });
+
+  it("loses the compare-and-swap to a write that lands after the read", async () => {
+    // The last narrow race: the decision read "still on the source", then a
+    // concurrent attach committed before our UPDATE. SQLite refuses the write
+    // and we must report it unattached rather than claim a swap.
+    const t = makeOrch({
+      onCasRead: (bound) => {
+        bound.value = "acp-raced-in";
+      },
+    });
+    const res = await t.orch.compactThread(record(), { attachIntent: "attach" });
+
+    expect(t.casCalls).toEqual([
+      { id: "discord:thread-c", expected: "acp-active", next: "sess-new", ok: false },
+    ]);
+    expect(res.attachment).toEqual({ attached: false, reason: "rebound-elsewhere" });
+    expect(res.wasActive).toBe(false);
+    expect(t.bound.value).toBe("acp-raced-in");
+    // Nothing was invalidated: the runtime still belongs to the winner.
+    expect(t.invalidated).toHaveLength(0);
+  });
+
+  it("is idempotent when the thread is already on the seeded session", async () => {
+    const t = makeOrch({ stored: record({ acpSessionId: "sess-new" }) });
+    const res = await t.orch.compactThread(record({ acpSessionId: "acp-active" }), {
+      attachIntent: "attach",
+    });
+
+    expect(res.attachment).toEqual({ attached: true, reason: "already-attached" });
+    expect(t.casCalls).toHaveLength(0); // no write needed
+    expect(t.invalidated).toHaveLength(0);
+  });
+
+  it("writes nothing when the session record disappeared mid-run", async () => {
+    const t = makeOrch({ stored: null });
+    const res = await t.orch.compactThread(record(), { attachIntent: "attach" });
+
+    expect(res.attachment).toEqual({ attached: false, reason: "record-gone" });
+    expect(t.casCalls).toHaveLength(0);
+    expect(t.upserts).toHaveLength(0);
+  });
+
+  it("re-syncs the caller's stale snapshot from the store", async () => {
+    // The session browser holds `record` for its whole 10-minute life and
+    // renders "🟢 Active" from it. If a completion does not write back, a
+    // just-compacted session keeps rendering as inactive.
+    const snapshot = record();
+    const t = makeOrch({ stored: snapshot });
+    await t.orch.compactThread(snapshot, { attachIntent: "attach" });
+    expect(snapshot.acpSessionId).toBe("sess-new");
   });
 
   it("runs the Discord-history pipeline when source is 'discord'", async () => {
@@ -270,6 +394,7 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
         newSessionId: "sess-new",
         originalSessionId: "acp-active",
         wasActive: true,
+        attachment: { attached: true, reason: "swapped" },
         reportMarkdown: "# Premium compaction report — acp-active",
         stats: { chunks: 4 },
       };

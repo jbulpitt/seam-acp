@@ -27,6 +27,13 @@ export interface CardView {
   content?: string;
   embeds?: unknown[];
   components?: unknown[];
+  /**
+   * Attachments ride along so a long job's result file can be delivered by the
+   * same render the lifecycle governs, instead of a raw `editReply` beside it.
+   * `inertView` preserves them: a spent card may keep its report, it just may
+   * not keep its buttons.
+   */
+  files?: unknown[];
 }
 
 /** The four legal end states of an interactive card. */
@@ -87,6 +94,32 @@ export function inertView(view: CardView): CardView {
 /** A component-free "this card is spent" view: text only. */
 export function expiredCardView(text: string): CardView {
   return { content: text, embeds: [], components: [] };
+}
+
+/**
+ * The view a LONG JOB may paint when it finishes (#179).
+ *
+ * A premium compaction can outlive the 10-minute collector that started it.
+ * The job then finished correctly but its card did not: the lifecycle has
+ * already expired it and removed the controls. Painting the ordinary success
+ * view at that point re-introduces a `Back to Manage` button with no collector
+ * behind it — a control whose only possible answer is Discord's interaction
+ * error. That is precisely the invariant #159 established, broken from the one
+ * direction #159 did not cover: not a settle that forgets to strip controls,
+ * but a late writer that never asked the lifecycle at all.
+ *
+ * So the result is still shown — the operator paid for it — but on a settled
+ * card it is shown inert, with a note saying where the controls went. Content
+ * after a settle is fine; CONTROLS after a settle are the bug.
+ */
+export function completionView(
+  view: CardView,
+  opts: { settled: boolean; expiredNote: string }
+): CardView {
+  if (!opts.settled) return view;
+  const inert = inertView(view);
+  const content = [inert.content, opts.expiredNote].filter((s) => s && s.length > 0).join("\n");
+  return { ...inert, content };
 }
 
 function toPlain(node: unknown): Record<string, unknown> | undefined {

@@ -319,33 +319,19 @@ and the [Gateway intent reference](https://docs.discord.com/developers/events/ga
 - Tunnel URL publishing: `TUNNEL_GIST_ID` env var (GitHub Gist)
 - Profile source: [`remote.ts`](../src/agents/profiles/remote.ts) (470 lines)
 
-### 1.7 Opencode / LM Studio (local models)
+### 1.7 Opencode / LM Studio — RETIRED (#12)
 
-> **Opencode** (`opencode acp`, from [sst/opencode](https://github.com/sst/opencode)) is the
-> CLI behind seam-acp's **"LM Studio 🦙"** agent. seam-acp uses it to expose
-> **local** LM Studio models (not a hosted provider) over ACP. It was added
-> after the original runbook was written and is now a first-class integration.
-
-| Source | URL | What It Covers | Feed |
-|---|---|---|---|
-| opencode site / docs | https://opencode.ai/ | Docs, config schema (`https://opencode.ai/config.json`) | — |
-| opencode GitHub repo | https://github.com/anomalyco/opencode | Source, issues, releases (repo moved from sst/opencode as of 2026-06-18 sweep) | [Atom](https://github.com/anomalyco/opencode/releases.atom) |
-| npm: `opencode-ai` | https://registry.npmjs.org/opencode-ai | Versions (latest: 1.17.8 at 2026-06-18 sweep) | [API](https://registry.npmjs.org/opencode-ai) |
-| LM Studio | https://lmstudio.ai/ | Local model server (the model source) | — |
-
-**seam-acp integration points**:
-- CLI binary: `opencode acp` (env: `OPENCODE_CLI_PATH`, default `opencode` on PATH)
-- Enable flag: `OPENCODE_ENABLED` env var
-- opencode reads its **global** config at `~/.config/opencode/opencode.json` — seam-acp **writes a custom LM Studio provider block** into it (opencode ≤1.15.x does NOT auto-discover models for a custom provider)
-- **Capability flags are load-bearing**: each model must declare `modalities` (vision) or opencode silently strips image attachments before sending to a vision model
-- Model IDs are `<prefix>/<rawId>` (e.g. `lmstudio-remote/google/gemma-4-26b-a4b`)
-- MCP entries managed under the config's `mcp` key; `{env:VAR}` substitution supported
-- Profile source: [`opencode.ts`](../src/agents/profiles/opencode.ts) (249 lines)
-
-> **Watch for**: opencode config-schema changes (`opencode.json` shape, the
-> per-model capability/`modalities` fields), changes to `opencode acp`, and
-> whether opencode adds auto-discovery for custom providers (would let seam-acp
-> stop writing the provider block itself).
+> **Do not monitor this.** The opencode / LM Studio agent (`opencode acp`,
+> seam-acp's "LM Studio 🔮") was **retired on 2026-09-03**. The remote LM Studio
+> host served zero models, the surface was unused, and the owner chose
+> retirement over restoring a model. `opencode-ai` is no longer a seam-acp
+> dependency at any version — the long-running 1.15.13 → 1.18.x upgrade question
+> is closed with it.
+>
+> Nothing in seam-acp spawns `opencode`, reads `~/.config/opencode/opencode.json`,
+> or talks to LM Studio. If you want local models back, that is a new
+> integration, not a revival: see `packages/core/src/core/retired-agents.ts` for
+> what a retired id does today, and git history for the removed profile.
 
 ### 1.8 Billing & Pricing (All Providers)
 
@@ -459,11 +445,6 @@ Use this checklist for each monitoring sweep. Copy it into your report and check
 - [ ] Check [Coding Agent docs](https://docs.github.com/en/copilot/using-github-copilot/using-copilot-coding-agent) for updates
 - [ ] Check [GitHub Community Announcements](https://github.com/orgs/community/discussions/categories/announcements) for billing/policy updates
 
-#### Opencode / LM Studio
-- [ ] Check [opencode releases](https://github.com/anomalyco/opencode/releases) and npm [`opencode-ai`](https://registry.npmjs.org/opencode-ai/latest) — last checked version: **1.18.26** (2026-09-02 sweep; installed 1.15.13, upgrade tracked in #12; 1.18.26: Claude 5 stale thinking block fix, Bedrock GPT-5.6 reasoning fix, apply_patch metadata fix; #12 updated)
-- [ ] Check [opencode config schema](https://opencode.ai/config.json) for shape changes (esp. per-model `modalities`/capability fields)
-- [ ] Check for `opencode acp` subcommand changes or custom-provider auto-discovery
-
 #### ACP Protocol
 - [ ] Check [ACP SDK npm](https://registry.npmjs.org/@agentclientprotocol/sdk) — current pinned: `^1.4.0`, installed: 1.4.0, latest: **1.4.0** (installed in workspace; #28 closed)
 - [ ] Check [ACP monorepo releases](https://github.com/agentclientprotocol/agent-client-protocol/releases) for spec/schema changes (`schema-v*` tags; Schema v1.21.0 & Schema v2.0.0-alpha.3 released 2026-08-20)
@@ -510,7 +491,7 @@ Every finding should be analyzed from three angles:
 | **Session storage?** | Does this change session file formats, paths, or storage mechanisms? |
 
 **Key files to consider**:
-- Agent profiles: `packages/adapters/src/profiles/{copilot,claude,agy,opencode,remote}.ts` (`gemini.ts` has been removed)
+- Agent profiles: `packages/adapters/src/profiles/{copilot,claude,agy,codex,grok,remote}.ts` (`gemini.ts` and `opencode.ts` have been removed)
 - Runtime: `packages/core/src/agents/agent-runtime.ts`
 - Config: `packages/core/src/config.ts`
 - Claude model/context config: `packages/adapters/src/profiles/claude.ts` (`CLAUDE_CONTEXT_WINDOWS`, `getClaudeContextWindow`) — replaces the retired `scripts/patch-claude-agent-acp.mjs`
@@ -550,7 +531,7 @@ If **yes** (new CLI flag, changed API behavior, new model needing registration, 
 **Step 2 — Check the GitHub Issues list for seam-acp.**
 
 Search [https://github.com/jbulpitt/seam-acp/issues](https://github.com/jbulpitt/seam-acp/issues) for an existing issue covering this upgrade. Search by:
-- Package/tool name (e.g., `claude-agent-acp`, `opencode`, `ACP SDK`, `copilot`)
+- Package/tool name (e.g., `claude-agent-acp`, `codex-acp`, `ACP SDK`, `copilot`)
 - Version number(s) involved
 - Symptom or behavior keyword (e.g., `model resolver`, `resolveModelPreference`, `modalities`, `EffortLevel`)
 
@@ -709,13 +690,10 @@ Remaining cleanup:
 5. For GitHub AI Credits: check if agentic usage metering changed.
 6. For Anthropic: check if agent SDK billing separation affects our usage.
 
-### 5.9 Opencode (sst/opencode) updated
+### 5.9 Opencode (sst/opencode) updated — N/A (retired #12)
 
-1. Check [releases](https://github.com/sst/opencode/releases.atom) and npm [`opencode-ai`](https://registry.npmjs.org/opencode-ai).
-2. Check for changes to the `opencode acp` subcommand.
-3. **Check the config schema** (`https://opencode.ai/config.json`) — seam-acp writes a custom provider block into `~/.config/opencode/opencode.json`; a schema change (esp. the per-model `modalities`/capability fields) can silently break vision (images stripped). See [`opencode.ts`](../src/agents/profiles/opencode.ts).
-4. Check whether opencode added **auto-discovery for custom providers** — if so, seam-acp could stop writing the provider block.
-5. Test an "LM Studio 🦙" session via Discord; confirm models load and an image attachment reaches a vision model.
+seam-acp no longer integrates opencode or LM Studio. Skip it: there is nothing
+to check, upgrade, or test. See §1.7.
 
 ---
 
@@ -788,7 +766,7 @@ Record current versions at time of sweep:
 | `@anthropic-ai/claude-code` | | |
 | `@agentclientprotocol/claude-agent-acp` | | |
 | `copilot` CLI (`@github/copilot`) | | |
-| `opencode` (`opencode-ai`, LM Studio profile) | | |
+| `opencode` (`opencode-ai`) | ⚠️ RETIRED #12 — no longer a dependency | |
 | `@agentclientprotocol/sdk` | | |
 | `discord.js` | | |
 | Claude resolver patch | RETIRED at 0.54.1 (no patch) | |

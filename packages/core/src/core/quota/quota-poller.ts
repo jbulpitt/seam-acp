@@ -104,13 +104,6 @@ export function createAgentQuotaSources(
         fetch: async () => mapClaudeQuota(identity, await fetchClaudeUsage(profile.configDir)),
       };
     }
-    if (profile.id === "opencode" || profile.brand === "ollama") {
-      return {
-        ...identity,
-        eventDriven: false,
-        fetch: async () => mapUnlimitedQuota(identity),
-      };
-    }
     return {
       ...identity,
       eventDriven: false,

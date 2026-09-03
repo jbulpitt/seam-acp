@@ -4,6 +4,11 @@
 **Updated:** 2026-08-19 (PR1 folded §14.0 / #82 cosmetic anchors) ·
 **Owner:** jbulpitt · **Start at:** §9 PR1 (PR0 subtract is done)
 
+> **Note (#12, 2026-09-03):** every mention of **opencode / LM Studio** below is
+> historical. That agent was retired; the roster this plan calls "6 agents" is
+> now 5 (claude, copilot, agy, codex, grok) plus the claude-vertex /
+> ollama-cloud / zai variants. Nothing else in the spec changes.
+
 > **⚠️ 2026-08-18 vetting.** The spine still holds — location-as-binding, co-located
 > adapters, the command bus, keeping `makeMux`, and the PR0→PR4 sequence are all
 > intact and arguably *more* valuable now (more agents; a worker pool that could run

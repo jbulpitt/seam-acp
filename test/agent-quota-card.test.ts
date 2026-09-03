@@ -61,16 +61,14 @@ describe("agent quota card", () => {
     expect(QUOTA_REFRESH_CUSTOM_ID.startsWith("seam-quota:")).toBe(true);
   });
 
-  it("omits claude-vertex and opencode without removing them from the registry", () => {
+  it("omits claude-vertex without removing it from the registry", () => {
     const registry = new QuotaRegistry();
     registry.set(mapUnlimitedQuota({ agentId: "claude", displayName: "Claude" }));
     registry.set(mapUnlimitedQuota({ agentId: "claude-vertex", displayName: "Vertex" }));
-    registry.set(mapUnlimitedQuota({ agentId: "opencode", displayName: "OpenCode" }));
     const quotas = registry.all();
     expect(quotas.map((quota) => quota.agentId).sort()).toEqual([
       "claude",
       "claude-vertex",
-      "opencode",
     ]);
 
     const layout = renderAgentQuotaLayout(quotas);
@@ -80,9 +78,7 @@ describe("agent quota card", () => {
       .join("\n");
     expect(text).toContain("`claude`");
     expect(text).not.toContain("claude-vertex");
-    expect(text).not.toContain("opencode");
     expect(text).not.toContain("Vertex");
-    expect(text).not.toContain("OpenCode");
   });
 
   it("edits the pinned card and silently self-bumps only after 20 hours", async () => {

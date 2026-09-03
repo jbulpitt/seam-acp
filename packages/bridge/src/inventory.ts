@@ -11,7 +11,6 @@ import {
   makeCodexProfile,
   makeCopilotProfile,
   makeGrokProfile,
-  makeOpencodeProfile,
   type AgentAdapter,
   type HelloAgentInventory,
 } from "@seam/adapters";
@@ -48,11 +47,6 @@ export function loadHostAdapters(
       make: () => makeAgyProfile({ defaultModel: "default" }),
     },
     {
-      id: "opencode",
-      bin: process.env.OPENCODE_CLI_PATH ?? "opencode",
-      make: () => makeOpencodeProfile({ defaultModel: "default" }),
-    },
-    {
       id: "codex",
       bin: "codex-acp",
       make: () => makeCodexProfile({ defaultModel: "gpt-5.5" }),
@@ -84,7 +78,6 @@ export function inventoryFromAdapters(
     copilot: copilotCmd,
     claude: process.env.CLAUDE_CLI_PATH ?? "claude-agent-acp",
     agy: "agy",
-    opencode: process.env.OPENCODE_CLI_PATH ?? "opencode",
     codex: "codex-acp",
     grok: "grok",
   };

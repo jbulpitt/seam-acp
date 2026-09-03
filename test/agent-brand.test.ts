@@ -28,11 +28,10 @@ describe("resolveAgentBrand (#96)", () => {
     expect(resolveAgentBrand("claude-vertex-prod")).toBe("vertex");
   });
 
-  it("is 1:1 for grok/agy/codex/opencode/kimi", () => {
+  it("is 1:1 for grok/agy/codex/kimi", () => {
     expect(resolveAgentBrand("grok")).toBe("grok");
     expect(resolveAgentBrand("agy")).toBe("agy");
     expect(resolveAgentBrand("codex")).toBe("codex");
-    expect(resolveAgentBrand("opencode")).toBe("opencode");
     expect(resolveAgentBrand("kimi")).toBe("kimi");
   });
 
@@ -52,7 +51,6 @@ describe("loadBrandAsset (#96)", () => {
       "grok",
       "kimi",
       "ollama-cloud",
-      "opencode",
       "vertex",
       "z-ai",
     ]) {

@@ -42,7 +42,6 @@ export const DEFAULT_THREAD_NAMER_CONFIG: ThreadNamerConfig = {
     { match: "grok", replacement: "🪐" },
     { match: "agy", replacement: "🌌" },
     { match: "codex", replacement: "🧬" },
-    { match: "opencode", replacement: "🔮" },
   ],
   models: [
     { match: "sonnet", replacement: "📜" },

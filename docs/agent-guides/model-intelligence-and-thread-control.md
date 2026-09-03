@@ -48,7 +48,7 @@ onto a cheaper model that still clears a quality bar.
 
 ### `model_metadata_query({ filters?, sort?, limit? })`
 Query cached metadata for models across **all** configured agents (claude, codex,
-grok, agy, copilot, ollama-cloud, opencode…).
+grok, agy, copilot, ollama-cloud, codex…).
 - `filters`: `provider`, `creator`, `agent` (which agent can run it),
   `minContextWindow`, `benchmark {name?, min}`,
   `maxPrice {input?, output?}` ($/Mtok), `releasedAfter` (YYYY-MM-DD),

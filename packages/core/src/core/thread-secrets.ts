@@ -1,5 +1,5 @@
 /**
- * One-shot per-thread secrets for `/seam upload secret`.
+ * One-shot per-thread secrets for `/seamadmin upload secret`.
  *
  * Values live as 0600 files under `<dataDir>/secrets/<threadId>/<name>`.
  * The agent is told the PATH only (harness). After the next live turn in that

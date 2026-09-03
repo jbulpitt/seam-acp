@@ -82,7 +82,11 @@ import {
   makeChoiceSelectId,
 } from "../../core/choice/types.js";
 import type { MessagePageItem, MessagePageRequest } from "../../core/message-reader.js";
-import { buildSeamCommand } from "./commands.js";
+import {
+  SEAM_ADMIN_COMMAND_NAME,
+  SEAM_COMMAND_NAME,
+  buildSlashRegistrationBody,
+} from "./commands.js";
 import { sanitizeSpeakerName } from "../../core/agent-conventions.js";
 import {
   DISCORD_BUTTONS_PER_ROW,
@@ -345,6 +349,14 @@ export type DiscordInteractionRoute =
   | "choice"
   | "none";
 
+/** Command names this bot owns. #151 split the tree in two, and BOTH halves
+ *  need both routes: miss `seamadmin` in the chat-input branch and every
+ *  operator verb silently dies; miss it in the autocomplete branch and the
+ *  schedule-id / bridge / voice pickers go blank with no error anywhere. */
+export function isSeamCommandName(name: string | undefined): boolean {
+  return name === SEAM_COMMAND_NAME || name === SEAM_ADMIN_COMMAND_NAME;
+}
+
 export function classifyDiscordInteraction(interaction: {
   isAutocomplete?: () => boolean;
   isChatInputCommand: () => boolean;
@@ -355,10 +367,10 @@ export function classifyDiscordInteraction(interaction: {
   customId?: string;
 }): DiscordInteractionRoute {
   if (interaction.isAutocomplete?.()) {
-    return interaction.commandName === "seam" ? "autocomplete" : "none";
+    return isSeamCommandName(interaction.commandName) ? "autocomplete" : "none";
   }
   if (interaction.isChatInputCommand()) {
-    return interaction.commandName === "seam" ? "slash" : "none";
+    return isSeamCommandName(interaction.commandName) ? "slash" : "none";
   }
   const isButton = interaction.isButton();
   const isModal = interaction.isModalSubmit();
@@ -382,7 +394,8 @@ export function classifyDiscordInteraction(interaction: {
  *
  * Responsibilities:
  *  - connect with Guild + GuildMessages + MessageContent + GuildVoiceStates intents
- *  - register `/seam` slash commands (guild-scoped if DEV guild set, global otherwise)
+ *  - register `/seam` + `/seamadmin` slash commands (guild-scoped if DEV guild
+ *    set, global otherwise)
  *  - filter incoming messages: only thread messages, only the configured owner,
  *    only when the bot is in a thread it created (parent channel match optional)
  *  - send/edit messages
@@ -2459,7 +2472,9 @@ export class DiscordAdapter implements ChatAdapter {
     const rest = new REST({ version: "10" }).setToken(
       this.config.DISCORD_BOT_TOKEN
     );
-    const body = [buildSeamCommand().toJSON()];
+    // BOTH commands, in one PUT — Discord replaces the full set, so shipping
+    // only `/seam` here would silently unregister `/seamadmin` (#151).
+    const body = buildSlashRegistrationBody();
     const guildIds = this.config.DISCORD_DEV_GUILD_ID;
     if (guildIds.length > 0) {
       // Register to each listed guild — instant, and scoped to servers we

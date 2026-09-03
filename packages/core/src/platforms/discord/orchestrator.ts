@@ -340,6 +340,7 @@ import {
   type DispatchSpec,
 } from "../../core/dispatch/types.js";
 import { promptExcerpt } from "../../core/prompt-excerpt.js";
+import { buildSeamHelpPages } from "./help-text.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
 import { formatLocalTime } from "../../core/format-time.js";
 import { formatCoarseDuration } from "../../core/server-status.js";
@@ -602,7 +603,7 @@ export class Orchestrator {
    *  after background activity goes quiet. Display-only; cleared when a new turn
    *  takes over the session's status card. */
   private readonly bgSettleTimers = new Map<string, NodeJS.Timeout>();
-  /** Set by index.ts after construction; used by /seam schedule handlers to
+  /** Set by index.ts after construction; used by /seamadmin schedule handlers to
    *  arm/disarm timers and by the fire runner to drop deleted-thread schedules. */
   private scheduledManager?: ScheduledPromptManager;
   /** Set by index.ts after construction; the DB sweeper for agent-scheduled
@@ -2949,7 +2950,7 @@ export class Orchestrator {
       const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
       if (!admins?.has(interaction.user.id)) {
         await interaction.reply({
-          content: "🔒 `/seam upload` is admin-only.",
+          content: "🔒 `/seamadmin upload` is admin-only.",
           flags: MessageFlags.Ephemeral,
         });
         return;
@@ -3089,6 +3090,13 @@ export class Orchestrator {
           return this.cmdConfigSet(interaction);
         case "audit":
           return this.cmdConfigAudit(interaction);
+      }
+    }
+    // #151: `rename` / `namer` moved out of `config` into `/seamadmin naming`.
+    // The handlers are unchanged and keep their own SEAM_CONFIG_ADMIN_USER_IDS
+    // gates (#160) — only the path into them moved.
+    if (slashGroup === "naming") {
+      switch (interaction.options.getSubcommand(true)) {
         case "rename":
           return this.cmdThreadRename(interaction);
         case "namer":
@@ -5715,7 +5723,7 @@ export class Orchestrator {
     }
     const record = this.recordFromInteraction(i);
     if (!record || !i.channel?.isThread() || !i.guildId) {
-      await i.reply({ content: "Use `/seam voice` inside a Discord thread.", flags: MessageFlags.Ephemeral });
+      await i.reply({ content: "Use `/seamadmin voice` inside a Discord thread.", flags: MessageFlags.Ephemeral });
       return;
     }
     const sub = i.options.getSubcommand(true);
@@ -5874,7 +5882,7 @@ export class Orchestrator {
           await i.reply({
             content:
               `That voice is already used by ${duplicateAliases.join(", ")}. ` +
-              "Run `/seam voice configure` with no options and confirm the duplicate in the editor.",
+              "Run `/seamadmin voice configure` with no options and confirm the duplicate in the editor.",
             flags: MessageFlags.Ephemeral,
           });
           return;
@@ -8593,7 +8601,11 @@ export class Orchestrator {
   private async openEditorAfterFreeze(
     c: MessageComponentInteraction,
     open: () => Promise<void>,
-    surface: string
+    surface: string,
+    // #151 split the tree, so the retry path is no longer `/seam <surface>`:
+    // `schedule` moved to /seamadmin while `preset` stayed on /seam. Pass the
+    // real invocation rather than deriving a path that may not exist.
+    retryCommand: string
   ): Promise<void> {
     try {
       await open();
@@ -8601,7 +8613,7 @@ export class Orchestrator {
       this.logger.warn({ err, surface }, "editor failed to open after list freeze");
       await c
         .editReply({
-          content: `❌ Could not open the ${surface} editor. Run \`/seam ${surface} edit\` again.`,
+          content: `❌ Could not open the ${surface} editor. Run \`${retryCommand}\` again.`,
           embeds: [],
           components: [],
         })
@@ -8609,7 +8621,7 @@ export class Orchestrator {
     }
   }
 
-  // --- /seam schedule … -----------------------------------------------------
+  // --- /seamadmin schedule … ------------------------------------------------
 
   private async cmdSchedule(i: ChatInputCommandInteraction): Promise<void> {
     const sub = i.options.getSubcommand(true);
@@ -8653,7 +8665,7 @@ export class Orchestrator {
     }
     const rows = this.store.listScheduledByChannel(PLATFORM, channel.id);
     if (rows.length === 0) {
-      await i.reply({ content: "No scheduled prompts for this thread. Create one with `/seam schedule add`.", flags: MessageFlags.Ephemeral });
+      await i.reply({ content: "No scheduled prompts for this thread. Create one with `/seamadmin schedule add`.", flags: MessageFlags.Ephemeral });
       return;
     }
     // #152: the page the card is currently showing. Every rebuild threads it
@@ -8675,7 +8687,7 @@ export class Orchestrator {
     // #159: the listing had no end handler, so an expired collector left every
     // Run/Edit/Toggle/Delete button looking live. Expiry now strips them.
     const lifecycle = this.attachListLifecycle(i, collector, () =>
-      expiredCardView("⏰ Schedule list expired — run `/seam schedule list` again.")
+      expiredCardView("⏰ Schedule list expired — run `/seamadmin schedule list` again.")
     );
     collector.on("collect", async (c) => {
       try {
@@ -8734,7 +8746,12 @@ export class Orchestrator {
               await c.deferReply({ flags: MessageFlags.Ephemeral });
             }
           );
-          await this.openEditorAfterFreeze(c, () => this.cmdScheduleAdd(c, row), "schedule");
+          await this.openEditorAfterFreeze(
+            c,
+            () => this.cmdScheduleAdd(c, row),
+            "schedule",
+            "/seamadmin schedule edit"
+          );
         } else if (action === "toggle") {
           const updated: ScheduledPrompt = { ...row, enabled: !row.enabled, updatedUtc: new Date().toISOString() };
           this.store.upsertScheduled(updated);
@@ -8761,7 +8778,7 @@ export class Orchestrator {
   }
 
   /**
-   * `/seam schedule list` message: one PAGE of schedules (#152).
+   * `/seamadmin schedule list` message: one PAGE of schedules (#152).
    *
    * Before pagination this described every schedule but gave controls to only
    * the first five — so a long list both risked Discord's 4096-char embed cap
@@ -8878,7 +8895,7 @@ export class Orchestrator {
   private async cmdScheduleAdd(i: ChatInputCommandInteraction | MessageComponentInteraction, existing?: ScheduledPrompt): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
-      await this.respondInitial(i, { content: "Use `/seam schedule add` inside a thread." });
+      await this.respondInitial(i, { content: "Use `/seamadmin schedule add` inside a thread." });
       return;
     }
     // Bind the thread to a session record if it isn't already (so the job has a
@@ -9171,8 +9188,8 @@ export class Orchestrator {
                 ? `\n\n📎 Cleared this schedule's legacy reference files (#158) — it can run again. ` +
                   `The stored bytes were left on disk under \`data/scheduled-attachments/${row.id}/\`.`
                 : "") +
-              (existing && !row.enabled ? `\n\n⏸️ This schedule is currently disabled — enable it with \`/seam schedule toggle\`.` : "") +
-              `\n\nManage it with \`/seam schedule list\`.`
+              (existing && !row.enabled ? `\n\n⏸️ This schedule is currently disabled — enable it with \`/seamadmin schedule toggle\`.` : "") +
+              `\n\nManage it with \`/seamadmin schedule list\`.`
             );
           await lifecycle.terminal(existing ? "saved" : "created", {
             embeds: [confirm],
@@ -9762,7 +9779,7 @@ export class Orchestrator {
     // #159: without an end handler the "Edit match tables" button stayed live
     // past the collector's 10 minutes and answered nothing.
     const lifecycle = this.attachListLifecycle(i, collector, () =>
-      expiredCardView("⏰ Thread namer editor expired — run `/seam config namer` again.")
+      expiredCardView("⏰ Thread namer editor expired — run `/seamadmin naming namer` again.")
     );
     collector.on("collect", async (component) => {
       if (!component.isButton()) return;
@@ -12537,7 +12554,7 @@ export class Orchestrator {
   private async cmdRebuild(i: ChatInputCommandInteraction): Promise<void> {
     const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
     if (admins && admins.size > 0 && !admins.has(i.user.id)) {
-      await i.reply({ content: "🔒 `/seam rebuild` is admin-only.", flags: MessageFlags.Ephemeral });
+      await i.reply({ content: "🔒 `/seamadmin rebuild` is admin-only.", flags: MessageFlags.Ephemeral });
       return;
     }
     const channel = this.channelRefFromInteraction(i);
@@ -14732,12 +14749,12 @@ export class Orchestrator {
 
   private static readonly DISCORD_UPLOAD_MAX = 25 * 1024 * 1024;
 
-  /** `/seam upload pull` — admin-only, no root jail. Relative = process cwd. */
+  /** `/seamadmin upload pull` — admin-only, no root jail. Relative = process cwd. */
   private async cmdUploadPull(i: ChatInputCommandInteraction): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
       await i.reply({
-        content: "Use `/seam upload pull` from inside a thread.",
+        content: "Use `/seamadmin upload pull` from inside a thread.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -14806,12 +14823,12 @@ export class Orchestrator {
           : `📎 Posted \`${filename}\` (${data.byteLength} B).`
       );
     } catch (err) {
-      this.logger.warn({ err, filename }, "/seam upload pull failed");
+      this.logger.warn({ err, filename }, "/seamadmin upload pull failed");
       await i.editReply(`Upload failed: ${(err as Error).message}`);
     }
   }
 
-  /** `/seam upload push` — write a Discord attachment to a host path. */
+  /** `/seamadmin upload push` — write a Discord attachment to a host path. */
   private async cmdUploadPush(i: ChatInputCommandInteraction): Promise<void> {
     const destIn = i.options.getString("path", true);
     const file = i.options.getAttachment("file", true);
@@ -14864,12 +14881,12 @@ export class Orchestrator {
     await i.editReply(`Wrote \`${file.name ?? "file"}\` → \`${dest}\` (${bytes.byteLength} B).`);
   }
 
-  /** `/seam upload secret` — modal for name+value; one-shot file, path-only. */
+  /** `/seamadmin upload secret` — modal for name+value; one-shot file, path-only. */
   private async cmdUploadSecret(i: ChatInputCommandInteraction): Promise<void> {
     const channel = this.channelRefFromInteraction(i);
     if (!channel) {
       await i.reply({
-        content: "Use `/seam upload secret` from inside a thread.",
+        content: "Use `/seamadmin upload secret` from inside a thread.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -15063,56 +15080,22 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * `/seam info help`. The body is PAGED (`buildSeamHelpPages`) because Discord
+   * caps message content at 2,000 characters and the single-string version had
+   * grown to 2,554 — the help command was failing outright. Page 1 goes out as
+   * the reply; the rest follow up on the same ephemeral interaction, so the
+   * user still sees one contiguous, private answer.
+   */
   private async cmdHelp(i: ChatInputCommandInteraction): Promise<void> {
-    const lines = [
-      "**seam-acp** — control the agent in this thread.",
-      "",
-      "**Top-level**",
-      "`/seam new [name]` — create a new agent thread",
-      "`/seam cancel` — gracefully cancel this thread's turn",
-      "`/seam cancel force:true` — escalate if the turn ignores cancel (old abort)",
-      "`/seam cancel scope:all` — force-kill every active session (old kill)",
-      "`/seam steer [thread] <prompt> [now]` — steer a node (thread defaults to here)",
-      "`/seam queue <prompt>` — queue the next live turn (waits; does not abort)",
-      "`/seam workflows` — delegation ledger + pending wakes/watches/live-help",
-      "",
-      "**`/seam upload`** (admin only)",
-      "`/seam upload pull <path>` — post a host file here (zips if over 25 MB)",
-      "`/seam upload push <file> <path>` — write an uploaded file to the host",
-      "`/seam upload secret` — one-shot secret for this thread (deleted after the next turn)",
-      "",
-      "**`/seam config`**",
-      "`/seam config model [id]` — get / set agent model",
-      "`/seam config effort [level]` — reasoning effort",
-      "`/seam config agent [id]` — get / set agent@location (resets session)",
-      "`/seam config mode <id>` — set agent operational mode",
-      "`/seam config repo [path] [scope:session|thread|channel]` — working repo (picker if omitted)",
-      "`/seam config tools <allow|exclude> [list]` — tool filters",
-      "`/seam config approve <always|ask|deny>` — permission policy",
-      "`/seam config card [full|simple] [scope:session|thread|channel]` — status-card layout (channel = inherit live)",
-      "`/seam config gif [on|off] [scope:session|thread|channel]` — random GIF on the simple status card",
-      "`/seam config reset` — end this thread's ACP session; next message starts fresh",
-      "`/seam config init` — bind this thread + start setup (repo picker, or full wizard)",
-      "`/seam config detach <detached|attached>` — keep this thread session-less (no bot replies; does not delete history)",
-      "`/seam config tts` — TTS settings card (toggle, voice stepper, pace, style)",
-      "`/seam config tts [on|off] [voice] [pace] [style]` — set immediately without the card",
-      "`/seam config show` — show session config JSON",
-      "`/seam config set <json>` — replace session config",
-      "`/seam config audit` — recent config mutations (who/what/when)",
-      "",
-      "**`/seam info`**",
-      "`/seam info whoami` — show the account this thread's agent is signed in as",
-      "`/seam info usage` — show usage / credits (agy, claude, copilot, grok)",
-      "`/seam info avatar` — re-push bot avatar to Discord",
-      "`/seam info help` — this list",
-      "`/seam info sessions` — list known sessions",
-      "`/seam info repos` — list repos under REPOS_ROOT",
-      "",
-      "**Groups** — `/seam schedule`, `/seam preset`, `/seam project`, `/seam upload`, `/seam bridge`",
-      "",
-      "Free-form messages in a thread are sent to the agent.",
-    ];
-    await i.reply({ content: lines.join("\n"), flags: MessageFlags.Ephemeral });
+    const [first, ...rest] = buildSeamHelpPages();
+    await i.reply({
+      content: first ?? "No help available.",
+      flags: MessageFlags.Ephemeral,
+    });
+    for (const page of rest) {
+      await i.followUp({ content: page, flags: MessageFlags.Ephemeral });
+    }
   }
 
   // --- agent file uploads (Phase 2) ---
@@ -16493,7 +16476,7 @@ export class Orchestrator {
     const channelRef = this.projectScopeId(i);
     if (!channelRef) {
       await i.reply({
-        content: "Use `/seam project new` inside a server channel or thread.",
+        content: "Use `/seamadmin project new` inside a server channel or thread.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -16526,7 +16509,7 @@ export class Orchestrator {
     const projects = this.store.listActiveProjects();
     if (projects.length === 0) {
       await i.reply({
-        content: "No active projects yet. Activate one with `/seam project new`.",
+        content: "No active projects yet. Activate one with `/seamadmin project new`.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -16546,7 +16529,7 @@ export class Orchestrator {
     const channelRef = this.projectScopeId(i);
     if (!channelRef) {
       await i.reply({
-        content: "Use `/seam project remove` inside a server channel or thread.",
+        content: "Use `/seamadmin project remove` inside a server channel or thread.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -16733,7 +16716,12 @@ export class Orchestrator {
               await c.deferReply({ flags: MessageFlags.Ephemeral });
             }
           );
-          await this.openEditorAfterFreeze(c, () => this.cmdPresetBuilder(c, preset), "preset");
+          await this.openEditorAfterFreeze(
+            c,
+            () => this.cmdPresetBuilder(c, preset),
+            "preset",
+            "/seam preset edit"
+          );
         } else if (action === "del") {
           this.store.deletePreset(id);
           const remaining = this.store.listPresetsForProject(projectRef);

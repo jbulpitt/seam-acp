@@ -1,5 +1,5 @@
 /**
- * `/seam debug` slash group (PR3 / D7 / #83). Admin-only even when the
+ * `/seamadmin debug` slash group (PR3 / D7 / #83). Admin-only even when the
  * bridge process has `--dev` / `SEAM_BRIDGE_DEV=1`.
  */
 import { MessageFlags, type ChatInputCommandInteraction } from "discord.js";
@@ -51,7 +51,7 @@ export async function handleDebugSlash(
       return cmdVoiceLive(interaction, deps);
     default:
       await interaction.reply({
-        content: `Unknown /seam debug subcommand: ${sub}`,
+        content: `Unknown /seamadmin debug subcommand: ${sub}`,
         flags: MessageFlags.Ephemeral,
       });
   }

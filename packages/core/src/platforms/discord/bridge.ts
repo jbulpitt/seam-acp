@@ -1,5 +1,5 @@
 /**
- * `/seam bridge` slash group (PR3 / #86). Pairing UX lives here so
+ * `/seamadmin bridge` slash group (PR3 / #86). Pairing UX lives here so
  * orchestrator.ts only has a thin switch.
  */
 import { MessageFlags, type ChatInputCommandInteraction } from "discord.js";
@@ -50,7 +50,7 @@ export async function handleBridgeSlash(
       return cmdRemove(interaction, deps);
     default:
       await interaction.reply({
-        content: `Unknown /seam bridge subcommand: ${sub}`,
+        content: `Unknown /seamadmin bridge subcommand: ${sub}`,
         flags: MessageFlags.Ephemeral,
       });
   }
@@ -130,7 +130,7 @@ async function cmdList(
   const paired = [...deps.config.bridgePresets.values()];
   if (paired.length === 0) {
     await i.reply({
-      content: "No bridges paired. Use `/seam bridge add` (admin).",
+      content: "No bridges paired. Use `/seamadmin bridge add` (admin).",
       flags: MessageFlags.Ephemeral,
     });
     return;

@@ -8,27 +8,27 @@ separate Gemini Live product and keeps its student self-service behavior.
 
 ## Start and bind threads
 
-All `/seam voice` commands and card controls are owner/admin control surfaces.
+All `/seamadmin voice` commands and card controls are owner/admin control surfaces.
 Speaker authorization is separate: audio is accepted only for current members
 of `DISCORD_ALLOWED_USER_IDS`.
 
 - Join a visible voice channel in the same guild and self-mute.
-- Run `/seam voice start alias:…` inside the first ACP thread. Seam verifies
+- Run `/seamadmin voice start alias:…` inside the first ACP thread. Seam verifies
   `ViewChannel`, `Connect`, `SendMessages`, `EmbedLinks`, and
   `ReadMessageHistory`, then posts the canonical card in the voice channel's
   built-in chat before it creates durable state, acquires the lease, or joins.
-- Run `/seam voice add alias:… claim:true` in another thread to add a binding.
+- Run `/seamadmin voice add alias:… claim:true` in another thread to add a binding.
   `claim` defaults true. Aliases are console-local, inert presentation labels.
-- Run `/seam voice remove discard-pending:false` in a bound thread to remove
+- Run `/seamadmin voice remove discard-pending:false` in a bound thread to remove
   that binding. Finalized text is preserved unless explicitly discarded and no
   dispatch artifact owns it.
-- Run `/seam voice configure alias:… voice:… pace:… style:…` for the current
+- Run `/seamadmin voice configure alias:… voice:… pace:… style:…` for the current
   binding. Voice autocomplete uses the existing Gemini TTS catalog.
-- Run `/seam voice console repost:true` only to replace a missing canonical
+- Run `/seamadmin voice console repost:true` only to replace a missing canonical
   card in the same VC chat. There is no thread or text-channel fallback.
-- Run `/seam voice status` for paginated capture, speaker, binding, ACP,
+- Run `/seamadmin voice status` for paginated capture, speaker, binding, ACP,
   scheduler, lease, STT, and card diagnostics.
-- Run `/seam voice stop discard-pending:false` to stop the whole console.
+- Run `/seamadmin voice stop discard-pending:false` to stop the whole console.
   Ending the console deletes its canonical VC-chat card after disconnecting.
   Starting a new console first removes terminal cards left in that voice
   channel by any earlier failed cleanup. Process restarts preserve active cards

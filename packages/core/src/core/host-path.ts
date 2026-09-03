@@ -1,5 +1,5 @@
 /**
- * Unrestricted host-path resolution for admin-only `/seam upload` commands.
+ * Unrestricted host-path resolution for admin-only `/seamadmin upload` commands.
  * Relative paths (no leading `/`) resolve against `process.cwd()`. Absolute
  * paths are used as-is. No allowlist, no repo jail.
  */

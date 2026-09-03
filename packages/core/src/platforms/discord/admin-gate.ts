@@ -1,5 +1,5 @@
 /**
- * #83 / #71 stamped-admin predicate for `/seam bridge` and `/seam debug`.
+ * #83 / #71 stamped-admin predicate for `/seamadmin bridge` and `/seamadmin debug`.
  *
  * Fail closed when speaker identity is off or there is no stamped id — the
  * same rule as config_propose in a locked channel. Discord `interaction.user.id`
@@ -11,7 +11,7 @@ import type { Config } from "../../config.js";
 export const BRIDGE_ADMIN_REFUSAL =
   "🔒 Bridge and debug commands are admin-only.";
 export const THREAD_VOICE_ADMIN_REFUSAL =
-  "🔒 `/seam voice` is admin-only in Thread Voice v1.";
+  "🔒 `/seamadmin voice` is admin-only in Thread Voice v1.";
 
 export interface StampedAdminResult {
   allowed: boolean;

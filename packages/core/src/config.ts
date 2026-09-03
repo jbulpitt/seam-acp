@@ -683,7 +683,7 @@ const Schema = z.object({
 
   /**
    * Permanent public WebSocket URL for remote-bridge bootstrap
-   * (`/seam bridge add`). Survives reboot — unlike data/tunnel-url.txt,
+   * (`/seamadmin bridge add`). Survives reboot — unlike data/tunnel-url.txt,
    * which is overwritten by the Cloudflare *quick* tunnel every start.
    * Example: `wss://seamacp.runbooksynthesis.com/bridge`. Empty/unset ⇒
    * fall back to tunnel-url.txt, then `ws://127.0.0.1:$HEALTH_PORT/bridge`.

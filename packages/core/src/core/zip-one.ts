@@ -1,5 +1,5 @@
 /**
- * Pack a single file into a ZIP (STORE or DEFLATE). Used by `/seam upload pull`
+ * Pack a single file into a ZIP (STORE or DEFLATE). Used by `/seamadmin upload pull`
  * when the raw file exceeds Discord's attachment cap.
  */
 import { deflateRawSync, crc32 } from "node:zlib";

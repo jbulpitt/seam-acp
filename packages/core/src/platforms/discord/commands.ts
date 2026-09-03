@@ -1,33 +1,57 @@
 import {
+  InteractionContextType,
+  PermissionFlagsBits,
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
+  type RESTPostAPIApplicationCommandsJSONBody,
 } from "discord.js";
 
+/** The everyday user + agent surface. */
+export const SEAM_COMMAND_NAME = "seam";
+/** The operator surface — ManageGuild-gated, guild-only (#151). */
+export const SEAM_ADMIN_COMMAND_NAME = "seamadmin";
+
 /**
- * `/seam` slash-command tree (#78).
+ * The two slash-command trees (#78, split in #151).
  *
- * Discord caps each command at 25 top-level options (subcommands + groups).
- * The tree is 15/25: 6 top-level subcommands + 9 groups. Future surfaces
- * default to living INSIDE a group (each group has its own 25 budget).
+ * Discord caps a SINGLE application command at 8,000 characters — the sum of
+ * every name, description and choice value in the whole tree — and at 25
+ * top-level options. Exceeding either makes Discord reject registration of the
+ * ENTIRE command at boot, not just the offending option.
  *
- *   TOP-LEVEL (6): cancel, steer, new, workflows, queue, rebuild
- *   GROUPS (9):
- *     config   (17) model effort agent mode repo tools card gif approve reset init detach tts show edit set audit
- *     info     (6)  whoami usage avatar help sessions repos
+ * `/seam` hit 7,885 of 8,000. #150 could only land `role-name` by DELETING help
+ * text ("Refresh/migrate names" → "Rename"). The budget is per command, not per
+ * bot, so a second registered command gets a fresh 8,000 — that is the whole
+ * fix. `test/commands.test.ts` guards both at 7,900.
+ *
+ *   /seam       (8 slots)  everyday surface — no admin verbs
+ *     cancel · steer · new · workflows · queue
+ *     info   (6)  whoami usage avatar help sessions repos
+ *     preset (7)  list create apply delete show edit thread
+ *     config (18) model effort agent role mode repo tools card gif approve
+ *                 reset init detach tts show edit set audit
+ *
+ *   /seamadmin  (8 slots)  operator surface — ManageGuild + guild-only
+ *     rebuild
+ *     project  (3)  new list remove
+ *     upload   (3)  pull push secret
+ *     bridge   (4)  add rotate list remove
  *     schedule (5)  add list remove toggle edit — no attachments (#158)
- *     preset   (7)  list create apply delete show edit thread
- *     project  (3)  unchanged
- *     upload   (3)  pull push secret  — admin-only; hard cutover of /seam attach
- *     bridge   (4)  add rotate list remove  — admin-only pairing (#83/#86)
- *     debug    (6)  tail exec status voice-ping voice-capture voice-live — admin-only even when SEAM_BRIDGE_DEV (#83)
- *     voice    (7)  start add remove configure console status stop — Voice Console V2, admin-only
+ *     debug    (6)  tail exec status voice-ping voice-capture voice-live
+ *     voice    (7)  start add remove configure console status stop
+ *     naming   (2)  rename namer — lifted out of `config` (#151)
+ *
+ * The Discord permission is a VISIBILITY control, not the authorization model:
+ * every runtime refusal (`SEAM_CONFIG_ADMIN_USER_IDS`, `BRIDGE_ADMIN_REFUSAL`,
+ * `THREAD_VOICE_ADMIN_REFUSAL`, the #160 `cmdThreadRename` gate) stays exactly
+ * where it was. A guild admin can still grant `/seamadmin` to anyone.
  */
 export function buildSeamCommand(): SlashCommandBuilder {
   const cmd = new SlashCommandBuilder()
-    .setName("seam")
+    .setName(SEAM_COMMAND_NAME)
     .setDescription("Control the seam-acp agent");
 
-  // --- top-level (6): cancel, steer, new, workflows, queue, rebuild --------
+  // --- top-level (5): cancel, steer, new, workflows, queue ------------------
 
   cmd.addSubcommand((sub) =>
     sub
@@ -107,7 +131,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setMaxValue(100)
       )
       // Wakes are agent-authored bookkeeping (#59, D4) — surfaced here, not in
-      // the human `/seam schedule` UI. This option cancels one pending wake in
+      // the human `/seamadmin schedule` UI. This option cancels one pending wake in
       // the current thread by id (D6: visible + cancellable).
       .addStringOption((o) =>
         o
@@ -117,7 +141,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .setAutocomplete(true)
       )
       // Watches (#60, D7) are agent-authored condition triggers — surfaced +
-      // cancelled here (not in the human `/seam schedule` UI), same as wakes.
+      // cancelled here (not in the human `/seamadmin schedule` UI), same as wakes.
       .addStringOption((o) =>
         o
           .setName("cancel-watch")
@@ -160,25 +184,7 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
-  cmd.addSubcommand((sub) =>
-    sub
-      .setName("rebuild")
-      .setDescription("Rebuild this session from Discord thread history, optionally changing agent/model")
-      .addStringOption((o) =>
-        o
-          .setName("agent")
-          .setDescription("Target agent id (uses its default model when model is omitted)")
-          .setRequired(false)
-      )
-      .addStringOption((o) =>
-        o
-          .setName("model")
-          .setDescription("Target model id")
-          .setRequired(false)
-      )
-  );
-
-  // --- groups (9) -----------------------------------------------------------
+  // --- groups (3): config, info, preset -------------------------------------
 
   cmd.addSubcommandGroup((g) =>
     g
@@ -473,38 +479,6 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .setRequired(false)
           )
       )
-      .addSubcommand((sub) =>
-        sub
-          .setName("rename")
-          .setDescription("Rename")
-          .addStringOption((o) =>
-            o
-              .setName("scope")
-              .setDescription("Scope")
-              .setRequired(false)
-              .addChoices(
-                { name: "thread", value: "thread" },
-                { name: "channel", value: "channel" }
-              )
-          )
-          .addBooleanOption((o) =>
-            o
-              .setName("migrate-legacy")
-              .setDescription("Legacy")
-              .setRequired(false)
-          )
-          .addBooleanOption((o) =>
-            o
-              .setName("role-name")
-              .setDescription("Use role as base")
-              .setRequired(false)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("namer")
-          .setDescription("Edit naming rules")
-      )
   );
 
   cmd.addSubcommandGroup((g) =>
@@ -528,50 +502,6 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
       .addSubcommand((sub) =>
         sub.setName("repos").setDescription("List repos under REPOS_ROOT")
-      )
-  );
-
-  cmd.addSubcommandGroup((g) =>
-    g
-      .setName("schedule")
-      .setDescription("Recurring scheduled prompts for this thread")
-      // #158: no attachment options. A scheduled prompt stands on its own; for
-      // substantial instructions, commit a runbook and reference it in the prompt.
-      .addSubcommand((sub) =>
-        sub
-          .setName("add")
-          .setDescription("Create a scheduled prompt (finish setup on the card)")
-      )
-      .addSubcommand((sub) =>
-        sub.setName("list").setDescription("List this thread's scheduled prompts")
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("remove")
-          .setDescription("Delete a scheduled prompt")
-          .addStringOption((o) =>
-            o
-              .setName("id")
-              .setDescription("Schedule id (see /seam schedule list)")
-              .setRequired(true)
-              .setAutocomplete(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("toggle")
-          .setDescription("Enable or disable a scheduled prompt")
-          .addStringOption((o) =>
-            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
-          )
-      )
-      .addSubcommand((sub) =>
-        sub
-          .setName("edit")
-          .setDescription("Edit a scheduled prompt (reopens the builder card)")
-          .addStringOption((o) =>
-            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
-          )
       )
   );
 
@@ -675,6 +605,92 @@ export function buildSeamCommand(): SlashCommandBuilder {
               .setDescription("Thread count")
               .setRequired(false)
               .setMinValue(1)
+          )
+      )
+  );
+
+  return cmd;
+}
+
+/**
+ * The operator surface (#151).
+ *
+ * `setDefaultMemberPermissions(ManageGuild)` hides it from non-admins in the
+ * command picker entirely — today every admin verb is visible to everyone and
+ * only refuses at runtime. `setContexts(Guild)` replaces the deprecated
+ * `setDMPermission(false)`: none of these verbs mean anything in a DM.
+ */
+export function buildSeamAdminCommand(): SlashCommandBuilder {
+  const cmd = new SlashCommandBuilder()
+    .setName(SEAM_ADMIN_COMMAND_NAME)
+    .setDescription("Operator surface: hosts, schedules, uploads, voice, naming")
+    // Visibility gate only — the runtime refusals remain the authorization model.
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    // Guild-only. setDMPermission is deprecated; setContexts is the replacement.
+    .setContexts(InteractionContextType.Guild);
+
+  // --- top-level (1): rebuild ------------------------------------------------
+
+  cmd.addSubcommand((sub) =>
+    sub
+      .setName("rebuild")
+      .setDescription("Rebuild this session from Discord thread history, optionally changing agent/model")
+      .addStringOption((o) =>
+        o
+          .setName("agent")
+          .setDescription("Target agent id (uses its default model when model is omitted)")
+          .setRequired(false)
+      )
+      .addStringOption((o) =>
+        o
+          .setName("model")
+          .setDescription("Target model id")
+          .setRequired(false)
+      )
+  );
+
+  // --- groups (7) -----------------------------------------------------------
+
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("schedule")
+      .setDescription("Recurring scheduled prompts for this thread")
+      // #158: no attachment options. A scheduled prompt stands on its own; for
+      // substantial instructions, commit a runbook and reference it in the prompt.
+      .addSubcommand((sub) =>
+        sub
+          .setName("add")
+          .setDescription("Create a scheduled prompt (finish setup on the card)")
+      )
+      .addSubcommand((sub) =>
+        sub.setName("list").setDescription("List this thread's scheduled prompts")
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("remove")
+          .setDescription("Delete a scheduled prompt")
+          .addStringOption((o) =>
+            o
+              .setName("id")
+              .setDescription("Schedule id (see /seamadmin schedule list)")
+              .setRequired(true)
+              .setAutocomplete(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("toggle")
+          .setDescription("Enable or disable a scheduled prompt")
+          .addStringOption((o) =>
+            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("edit")
+          .setDescription("Edit a scheduled prompt (reopens the builder card)")
+          .addStringOption((o) =>
+            o.setName("id").setDescription("Schedule id").setRequired(true).setAutocomplete(true)
           )
       )
   );
@@ -931,7 +947,62 @@ export function buildSeamCommand(): SlashCommandBuilder {
       )
   );
 
+  // Thread naming (#145), lifted out of `config` by #151. `rename` is the most
+  // destructive verb in the tree — it rebuilds every thread name in a channel —
+  // and `namer` edits the symbol tables it reads from. Both keep their handler
+  // gate on SEAM_CONFIG_ADMIN_USER_IDS (#160); the command-level ManageGuild
+  // permission is defence in depth, never a replacement for it.
+  //
+  // The descriptions here are the ones #150 had to delete for budget
+  // ("Rename", "Scope", "Legacy"). Reclaiming them is part of the point.
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("naming")
+      .setDescription("Admin-only: rebuild thread names, or edit the naming symbol tables")
+      .addSubcommand((sub) =>
+        sub
+          .setName("rename")
+          .setDescription("Refresh/migrate names")
+          .addStringOption((o) =>
+            o
+              .setName("scope")
+              .setDescription("Rename scope")
+              .setRequired(false)
+              .addChoices(
+                { name: "thread", value: "thread" },
+                { name: "channel", value: "channel" }
+              )
+          )
+          .addBooleanOption((o) =>
+            o
+              .setName("migrate-legacy")
+              .setDescription("Migrate legacy prefix")
+              .setRequired(false)
+          )
+          .addBooleanOption((o) =>
+            o
+              .setName("role-name")
+              .setDescription("Use role as base")
+              .setRequired(false)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("namer")
+          .setDescription("Edit naming rules")
+      )
+  );
+
   return cmd;
+}
+
+/**
+ * The exact payload `registerSlashCommands` PUTs to Discord. Extracted so the
+ * registration set is testable without standing up a Client or a REST call —
+ * "did we actually ship /seamadmin?" is a unit test, not a boot-time surprise.
+ */
+export function buildSlashRegistrationBody(): RESTPostAPIApplicationCommandsJSONBody[] {
+  return [buildSeamCommand().toJSON(), buildSeamAdminCommand().toJSON()];
 }
 
 export type SeamSubcommand =

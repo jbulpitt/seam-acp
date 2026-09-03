@@ -133,20 +133,26 @@ Layout: `~/Projects/.worktrees/seam-acp/<name>/`. Bind-mount `node_modules` from
 
 Load `~/.local/share/wt-helpers/AGENTS.md` before creating or tearing down a tree. If `wt` is missing, run `~/.local/share/wt-helpers/install.sh` then `wt doctor`.
 
-## Slash command tree (`/seam`)
+## Slash command tree (`/seam` + `/seamadmin`)
 
-Discord caps each command at 25 top-level options. `/seam` is 15/25: 6
-top-level subcommands + 9 groups. Future surfaces default to living
-**inside a group** (each group has its own 25 budget). Hard cutover —
-Discord has no aliases; old invocations disappear.
+Discord caps a **single** application command at 8,000 characters — the sum of
+every name, description and choice value in the tree — and at 25 top-level
+options. Blowing either makes Discord reject registration of the **entire
+command at boot**, not just the new option. `/seam` reached 7,885/8,000, which
+is why #150 could only add `role-name` by deleting help text.
 
-**Top-level (6):** `cancel`, `steer`, `new`, `workflows`, `queue`, `rebuild`
+The budget is **per command**, so #151 split the tree in two. Hard cutover —
+Discord has no aliases; old invocations simply disappear.
 
-**Groups (9):**
-- `config` (20): `model` `effort` `agent` `role` `mode` `repo` `tools` `card` `gif` `approve` `reset` `init` `detach` `tts` `show` `edit` `set` `audit` `rename` `namer`
-  - `role` sets a thread's naming role; `rename` refreshes/migrates names
-    (`migrate-legacy:true` for old hand-typed prefixes); `namer` edits the
-    agent/model/role symbol tables.
+### `/seam` — everyday user + agent surface (8 slots)
+
+**Top-level (5):** `cancel`, `steer`, `new`, `workflows`, `queue`
+
+**Groups (3):**
+- `config` (18): `model` `effort` `agent` `role` `mode` `repo` `tools` `card`
+  `gif` `approve` `reset` `init` `detach` `tts` `show` `edit` `set` `audit`
+  - `role` sets a thread's naming role. `rename` / `namer` are **no longer
+    here** — they live under `/seamadmin naming`.
   - `edit` is the **one** configuration surface (#157): `/seam new` and
     `/seam config init` both post this card instead of running a setup wizard.
     There is no host selector on it — an agent id is `agentId@location`, so
@@ -154,16 +160,43 @@ Discord has no aliases; old invocations disappear.
     To pre-bind a host that is currently offline (it lists no agents), use
     `/seam config agent id:<agentId>@<host>`.
 - `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
+- `preset` (7): `list` `create` `apply` `delete` `show` `edit` `thread`
+
+### `/seamadmin` — operator surface (8 slots)
+
+Registered with `default_member_permissions = ManageGuild` and
+`contexts = [Guild]` (via `setContexts`, not the deprecated `setDMPermission`),
+so it does not appear in the command picker for non-admins and is unavailable
+in DMs.
+
+That permission is **visibility, not authorization** — a guild admin can grant
+the command to anyone, so every runtime refusal stays exactly where it was:
+`SEAM_CONFIG_ADMIN_USER_IDS` for `upload` / `rebuild` / `naming`, plus
+`BRIDGE_ADMIN_REFUSAL` and `THREAD_VOICE_ADMIN_REFUSAL`.
+
+**Top-level (1):** `rebuild`
+
+**Groups (7):**
 - `schedule` (5): `add` `list` `remove` `toggle` `edit` — **no attachments**
   (#158). A scheduled prompt carries no files on any surface; when a job needs
   substantial instructions, commit a runbook and make the prompt a short request
   to follow it. A pre-#158 row that still records files is **quarantined** (never
   armed, never fired); editing the schedule clears that record and re-arms it.
   Stored bytes under `data/scheduled-attachments/` are never deleted by Seam.
-- `preset` (6), `project` (3) — unchanged
-- `upload` (3): `pull` `push` `secret` — **admin-only**. Hard cutover of `/seam attach`.
-- `bridge` (4), `debug` (6) — admin-only pairing / host debug (`voice-ping` / `voice-capture` / `voice-live` are the live-help spike)
-- `voice` (7): `start` `add` `remove` `configure` `console` `status` `stop` — **admin-only** Shared Voice Console V2.
+- `project` (3): `new` `list` `remove`
+- `upload` (3): `pull` `push` `secret`
+- `bridge` (4), `debug` (6) — pairing / host debug (`voice-ping` /
+  `voice-capture` / `voice-live` are the live-help spike)
+- `voice` (7): `start` `add` `remove` `configure` `console` `status` `stop` —
+  Shared Voice Console V2
+- `naming` (2): `rename` `namer` — lifted out of `config` by #151. `rename`
+  refreshes/migrates thread names (`migrate-legacy:true` for old hand-typed
+  prefixes, `role-name:true` to rebuild from the role); `namer` edits the
+  agent/model/role symbol tables. **Do not hand-rename a thread to fix its
+  prefix** — set the identity and the name follows.
+
+**Moved by #151:** `/seam rebuild|schedule|project|upload|bridge|debug|voice`
+→ `/seamadmin …`, and `/seam config rename|namer` → `/seamadmin naming …`.
 
 **Queue:** `/seam queue prompt:…` parks the next live turn (does not abort).
 Idle + host ready runs now. A later bare message still interrupts and
@@ -201,13 +234,13 @@ mint with MCP `create_live_help` (no fence); `cancel_live_help` hangs up.
 family-guild General. Students may request, start, and stop their own session
 through the course agent; do not ask a parent/admin for approval.
 Canonical: `docs/agent-guides/live-help.md`. School overlay paste:
-`docs/agent-guides/live-help-onboarding.md`. Do not use `/seam debug voice-*`
+`docs/agent-guides/live-help-onboarding.md`. Do not use `/seamadmin debug voice-*`
 from a course thread.
 
 ## Thread Voice V2
 
 One admin owns one guild-scoped Shared Voice Console in their current self-muted
-voice channel. `/seam voice start` creates its first thread binding; `add`,
+voice channel. `/seamadmin voice start` creates its first thread binding; `add`,
 `remove`, and `configure` manage up to ten aliased bindings. The canonical
 five-row card exists only in the voice channel's built-in chat. The owner/admin
 selects one input binding or explicitly arms fan-out; allowlisted speakers are

@@ -255,6 +255,34 @@ before running any procedure in this runbook:
 - Config: `DISCORD_BOT_TOKEN`, `DISCORD_ALLOWED_USER_IDS`, `DISCORD_ALLOWED_CHANNEL_IDS`, `DISCORD_DEV_GUILD_ID`, `DISCORD_NOTIFICATIONS_CHANNEL_ID`
 - **Key concern**: Discord API version deprecations, Gateway intent changes, message content intent, rate limit policy changes, webhook format changes
 
+#### Privileged-intent operations
+
+The Discord adapter currently requests `Guilds`, `GuildMessages`,
+`MessageContent`, and `GuildVoiceStates`. Of those, only `MessageContent` is a
+privileged intent; `GuildMessages` is a standard intent.
+
+Discord's June 10, 2026 policy uses the number of users who can access an app,
+not its server count. An app accessible to fewer than 10,000 users can continue
+using a privileged intent after enabling it in the Developer Portal and does
+not enter the review or annual-reapplication process. Once an app reaches
+10,000 accessible users, it must apply for privileged-intent access. An app
+whose access was granted through that review must reapply once per year.
+
+For this private deployment there is currently no reviewed approval anniversary
+to schedule. If its accessible audience approaches 10,000 users:
+
+1. Apply for `MessageContent` access in the Discord Developer Portal before the
+   threshold is crossed.
+2. Record the approval date and responsible owner in the operations calendar.
+3. Schedule an annual reminder far enough ahead of the approval anniversary to
+   complete reapplication without an access gap.
+4. During each Discord monitoring sweep, confirm the audience remains below the
+   threshold or that the reminder and approval are current.
+
+Sources: [Discord's June 10, 2026 policy
+announcement](https://docs.discord.com/developers/change-log#changes-to-privileged-intent-access-for-discord-apps)
+and the [Gateway intent reference](https://docs.discord.com/developers/events/gateway#privileged-intents).
+
 ### 1.5 Agent Client Protocol (ACP)
 
 | Source | URL | What It Covers | Feed |

@@ -5,7 +5,7 @@
 
 import type { LedgerEntry, DelegationStatus } from "../../core/types.js";
 import type { AnomalySummary } from "../../core/watchdog.js";
-import { sliceChoicePage } from "./choice-picker.js";
+import { choicePickerPageCaption, sliceChoicePage } from "./choice-picker.js";
 
 /** Rendered, embed-ready view of the ledger. */
 export interface WorkflowsView {
@@ -151,6 +151,12 @@ export interface InterruptedTurnRow {
   status: "interrupted" | "abandoned";
   startedUtc: string;
   acpSessionId: string | null;
+  /**
+   * Where a resume would land: the ledger's dispatch target for a `dispatch`
+   * row, the thread for a `live` marker. A dispatch resume re-enqueues into
+   * this ref, so a row without one cannot be resumed at all (#159).
+   */
+  targetRef: string | null;
 }
 
 /** One inventory line: thread, age, correlation — what the operator needs
@@ -173,15 +179,30 @@ export type InterruptedRowAction = "resume" | "abandon";
  *
  * A control whose backing operation has already been consumed is exactly the
  * bug this inventory used to have: an abandoned turn kept an "Abandon" button
- * that could only answer "No resumable turn". An already-abandoned row is
- * therefore resume-only, and only when a recorded ACP session still makes the
- * resume possible; a live marker that was abandoned has nothing left at all.
+ * that could only answer "No resumable turn". A rendered button must not be
+ * able to fail deterministically, so this mirrors every precondition
+ * `resumeTurnManually` / `abandonTurnManually` actually check:
+ *
+ * - A **live** marker resumes from its recorded ACP session and is abandoned
+ *   by dropping the marker itself (no ledger row involved). Once abandoned the
+ *   marker is gone, so neither action can reach anything.
+ * - A **dispatch** row resumes through the ledger, which re-enqueues into
+ *   `targetRef` *and* loads `acpSessionId` — it needs both. Abandoning only
+ *   means something while the row is still interrupted.
  */
 export function interruptedRowActions(
   row: InterruptedTurnRow
 ): readonly InterruptedRowAction[] {
-  if (row.status === "interrupted") return ["resume", "abandon"];
-  return row.acpSessionId && row.source === "dispatch" ? ["resume"] : [];
+  const actions: InterruptedRowAction[] = [];
+  if (row.source === "live") {
+    if (row.status === "abandoned") return actions;
+    if (row.acpSessionId) actions.push("resume");
+    actions.push("abandon");
+    return actions;
+  }
+  if (row.targetRef && row.acpSessionId) actions.push("resume");
+  if (row.status === "interrupted") actions.push("abandon");
+  return actions;
 }
 
 /** True when the row still has at least one action a click could perform. */
@@ -212,6 +233,63 @@ export function paginateInterruptedRows(
   const { page: p, items } = sliceChoicePage(actionable, page, pageSize);
   const pageCount = Math.max(1, Math.ceil(actionable.length / pageSize) || 1);
   return { page: p, pageCount, total: actionable.length, items };
+}
+
+/** The embed fields for the inventory's interrupted section. */
+export interface InterruptedInventorySection {
+  page: number;
+  pageCount: number;
+  /** Actionable rows across every page. */
+  total: number;
+  /** The rows this page's controls act on, in button order. */
+  items: InterruptedTurnRow[];
+  /** One line per control row, same order — or `null` when nothing is actionable. */
+  actionable: { name: string; value: string } | null;
+  /** Compact summary of everything with no live action left. */
+  inert: { name: string; value: string } | null;
+}
+
+/**
+ * Build the interrupted section so the visible text and the buttons always
+ * describe the same rows.
+ *
+ * Listing the whole inventory in one field while paginating only the
+ * actionable subset breaks down past page 1: the 1024-char clamp can drop
+ * exactly the rows the buttons act on, leaving controls pointing at text the
+ * operator cannot see. The actionable field therefore carries *only* this
+ * page's controlled rows, in button order, and everything inert moves to its
+ * own compact summary.
+ */
+export function buildInterruptedInventory(
+  rows: ReadonlyArray<InterruptedTurnRow>,
+  page: number,
+  now: Date,
+  pageSize: number = WORKFLOW_INVENTORY_PAGE_SIZE
+): InterruptedInventorySection {
+  const slice = paginateInterruptedRows(rows, page, pageSize);
+  const caption = choicePickerPageCaption(slice.total, slice.page, pageSize);
+  const lines = formatInterruptedLines(slice.items, now);
+  const inertRows = rows.filter((row) => !isActionableInterruptedRow(row));
+  return {
+    page: slice.page,
+    pageCount: slice.pageCount,
+    total: slice.total,
+    items: slice.items,
+    actionable: slice.items.length
+      ? {
+          name: `⚠️ Interrupted / abandoned — actionable (${slice.total})`,
+          // Caption last: if anything must be dropped it is the caption, never
+          // a row that has a button under it.
+          value: clampFieldValue(caption ? [...lines, `_${caption}_`] : lines),
+        }
+      : null,
+    inert: inertRows.length
+      ? {
+          name: `🗄️ Interrupted / abandoned — no action available (${inertRows.length})`,
+          value: clampFieldValue(formatInterruptedLines(inertRows, now)),
+        }
+      : null,
+  };
 }
 
 export function clampFieldValue(lines: string[], max = 1024): string {

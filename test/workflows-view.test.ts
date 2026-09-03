@@ -9,6 +9,7 @@ import {
   clampFieldValue,
   formatInterruptedLine,
   formatInterruptedLines,
+  buildInterruptedInventory,
   interruptedRowActions,
   isActionableInterruptedRow,
   paginateInterruptedRows,
@@ -154,6 +155,7 @@ describe("formatInterruptedLine", () => {
         status: "interrupted",
         startedUtc: "2026-08-16T11:50:00.000Z",
         acpSessionId: "acp-1",
+        targetRef: "discord:thread-worker",
       },
       NOW
     );
@@ -176,6 +178,7 @@ describe("formatInterruptedLine", () => {
           status: "abandoned",
           startedUtc: "2026-08-16T11:00:00.000Z",
           acpSessionId: null,
+          targetRef: "t",
         },
       ],
       NOW
@@ -213,6 +216,7 @@ const irow = (over: Partial<InterruptedTurnRow> = {}): InterruptedTurnRow => ({
   status: "interrupted",
   startedUtc: "2026-08-16T11:50:00.000Z",
   acpSessionId: "acp-1",
+  targetRef: "discord:thread-b",
   ...over,
 });
 
@@ -230,10 +234,32 @@ describe("interruptedRowActions", () => {
     expect(isActionableInterruptedRow(irow({ status: "abandoned", acpSessionId: null }))).toBe(false);
   });
 
+  // resumeTurnManually's ledger path needs BOTH the target it re-enqueues into
+  // and the session to load; offering Resume on either alone renders a button
+  // that can only answer "missing target or ACP session".
+  it("an abandoned dispatch missing targetRef offers nothing", () => {
+    const row = irow({ status: "abandoned", targetRef: null });
+    expect(interruptedRowActions(row)).toEqual([]);
+    expect(isActionableInterruptedRow(row)).toBe(false);
+  });
+
+  it("an interrupted dispatch missing targetRef keeps Abandon but drops Resume", () => {
+    expect(interruptedRowActions(irow({ targetRef: null }))).toEqual(["abandon"]);
+  });
+
+  it("an interrupted dispatch missing its session keeps Abandon but drops Resume", () => {
+    expect(interruptedRowActions(irow({ acpSessionId: null }))).toEqual(["abandon"]);
+  });
+
   it("an abandoned live turn has nothing left to click", () => {
     expect(
       interruptedRowActions(irow({ source: "live", status: "abandoned", acpSessionId: "acp-9" }))
     ).toEqual([]);
+  });
+
+  it("a live marker is always abandonable, and resumable only with a session", () => {
+    expect(interruptedRowActions(irow({ source: "live" }))).toEqual(["resume", "abandon"]);
+    expect(interruptedRowActions(irow({ source: "live", acpSessionId: null }))).toEqual(["abandon"]);
   });
 });
 
@@ -252,7 +278,7 @@ describe("paginateInterruptedRows", () => {
   it("paginates only the actionable rows — dead ones are summary-only", () => {
     const mixed = [
       irow({ id: "live-1" }),
-      irow({ id: "dead-1", status: "abandoned", acpSessionId: null }),
+      irow({ id: "dead-1", status: "abandoned", targetRef: null }),
       irow({ id: "dead-2", source: "live", status: "abandoned" }),
       irow({ id: "live-2" }),
     ];
@@ -291,5 +317,102 @@ describe("paginateInterruptedRows", () => {
     expect(slice.items).toEqual([]);
     // …while the summary still lists it.
     expect(formatInterruptedLines(dead, NOW)).toHaveLength(1);
+  });
+});
+
+describe("buildInterruptedInventory — text matches the buttons", () => {
+  // 9 actionable rows: three pages of controls.
+  const rows = Array.from({ length: 9 }, (_, i) =>
+    irow({ id: `del-actionable-${i}`, channelRef: `discord:thread-${i}` })
+  );
+
+  it("page 0 lists exactly the rows its buttons act on, in button order", () => {
+    const section = buildInterruptedInventory(rows, 0, NOW);
+    expect(section.items.map((r) => r.id)).toEqual([
+      "del-actionable-0",
+      "del-actionable-1",
+      "del-actionable-2",
+      "del-actionable-3",
+    ]);
+    for (const row of section.items) {
+      expect(section.actionable!.value).toContain(shortId(row.id));
+    }
+  });
+
+  // The regression QA asked for: with the whole inventory in one field the
+  // 1024-char clamp dropped later pages' rows, so buttons pointed at text the
+  // operator could not see.
+  it("a later page shows its own rows and none of page 0's", () => {
+    const section = buildInterruptedInventory(rows, 2, NOW);
+    expect(section.page).toBe(2);
+    expect(section.items.map((r) => r.id)).toEqual(["del-actionable-8"]);
+    expect(section.actionable!.value).toContain("thread-8");
+    expect(section.actionable!.value).not.toContain("thread-0");
+    expect(section.actionable!.value).not.toContain("thread-3");
+  });
+
+  it("every page's visible line count equals its button-row count", () => {
+    for (let page = 0; page < 3; page++) {
+      const section = buildInterruptedInventory(rows, page, NOW);
+      const lines = section
+        .actionable!.value.split("\n")
+        .filter((line) => !line.startsWith("_"));
+      expect(lines).toHaveLength(section.items.length);
+      lines.forEach((line, idx) => {
+        expect(line).toContain(shortId(section.items[idx]!.id));
+      });
+    }
+  });
+
+  it("carries a page caption only when there is more than one page", () => {
+    expect(buildInterruptedInventory(rows, 0, NOW).actionable!.value).toContain("Page 1 of 3");
+    const single = buildInterruptedInventory(rows.slice(0, 3), 0, NOW);
+    expect(single.actionable!.value).not.toContain("Page");
+  });
+
+  it("non-actionable rows stay in their own compact summary, not the button field", () => {
+    const mixed = [
+      irow({ id: "del-live-1", channelRef: "discord:thread-live" }),
+      irow({ id: "del-dead-1", channelRef: "discord:thread-dead", status: "abandoned", targetRef: null }),
+    ];
+    const section = buildInterruptedInventory(mixed, 0, NOW);
+    expect(section.total).toBe(1);
+    expect(section.actionable!.value).toContain("thread-live");
+    expect(section.actionable!.value).not.toContain("thread-dead");
+    expect(section.inert!.name).toContain("no action available (1)");
+    expect(section.inert!.value).toContain("thread-dead");
+  });
+
+  it("an inventory with nothing actionable has no button field at all", () => {
+    const dead = [irow({ status: "abandoned", targetRef: null })];
+    const section = buildInterruptedInventory(dead, 0, NOW);
+    expect(section.actionable).toBeNull();
+    expect(section.items).toEqual([]);
+    expect(section.inert).not.toBeNull();
+  });
+
+  it("stays inside Discord's field and action-row limits at worst case", () => {
+    // Longest line this formatter can emit: every optional part present and
+    // every id/ref past its clamp.
+    const fat = Array.from({ length: 40 }, (_, i) =>
+      irow({
+        id: `del-${"9".repeat(24)}${i}`,
+        channelRef: `discord:${"z".repeat(40)}`,
+        correlationId: `corr-${"8".repeat(24)}`,
+        startedUtc: "2020-01-01T00:00:00.000Z",
+      })
+    );
+    for (let page = 0; page < 10; page++) {
+      const section = buildInterruptedInventory(fat, page, NOW);
+      // 4 control rows + 1 nav row = Discord's 5-action-row cap.
+      expect(section.items.length).toBeLessThanOrEqual(4);
+      expect(section.actionable!.value.length).toBeLessThanOrEqual(1024);
+      expect(section.inert?.value.length ?? 0).toBeLessThanOrEqual(1024);
+      // No row a button acts on may be clamped out of the visible text.
+      expect(section.actionable!.value).not.toContain("…and");
+      for (const row of section.items) {
+        expect(section.actionable!.value).toContain(shortId(row.id));
+      }
+    }
   });
 });

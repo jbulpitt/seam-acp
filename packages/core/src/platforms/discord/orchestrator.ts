@@ -88,10 +88,8 @@ import {
   formatWorkflowsView,
   clampFieldValue,
   formatAnomalyLines,
-  formatInterruptedLines,
+  buildInterruptedInventory,
   interruptedRowActions,
-  paginateInterruptedRows,
-  WORKFLOW_INVENTORY_PAGE_SIZE,
   type InterruptedTurnRow,
 } from "./workflows-view.js";
 import {
@@ -10167,6 +10165,10 @@ export class Orchestrator {
         status: e.status === "abandoned" ? "abandoned" : "interrupted",
         startedUtc: e.updatedUtc || e.createdUtc,
         acpSessionId: e.acpSessionId,
+        // Resume re-enqueues into the ledger's own target, which `channelRef`
+        // conflates with sourceRef — carry it verbatim so the Resume button is
+        // only offered when the resume can actually run (#159).
+        targetRef: e.targetRef,
       });
     }
     const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
@@ -10180,6 +10182,7 @@ export class Orchestrator {
         status: "interrupted",
         startedUtc: m.startedUtc,
         acpSessionId: m.acpSessionId ?? null,
+        targetRef: m.channelRef,
       });
     }
     const abandonedLive = await listAbandonedLiveTurns(this.config.DATA_DIR).catch(
@@ -10195,6 +10198,7 @@ export class Orchestrator {
         status: "abandoned",
         startedUtc: r.finishedUtc,
         acpSessionId: null,
+        targetRef: r.channelRef,
       });
     }
     return rows;
@@ -11861,23 +11865,14 @@ export class Orchestrator {
     const components: ActionRowBuilder<ButtonBuilder>[] = [];
     let page = 0;
     if (interrupted.length > 0) {
-      // Controls exist only for rows a click can still act on. An abandoned row
-      // keeping an "Abandon" button was the #159 bug in miniature: a control
-      // whose backing operation was already consumed.
-      const slice = paginateInterruptedRows(interrupted, requestedPage);
+      // Controls exist only for rows a click can still act on, and the visible
+      // lines are exactly those rows in button order. An abandoned row keeping
+      // an "Abandon" button was the #159 bug in miniature: a control whose
+      // backing operation was already consumed.
+      const slice = buildInterruptedInventory(interrupted, requestedPage, now);
       page = slice.page;
-      const caption = choicePickerPageCaption(
-        slice.total,
-        slice.page,
-        WORKFLOW_INVENTORY_PAGE_SIZE
-      );
-      const lines = formatInterruptedLines(interrupted, now);
-      embed.addFields({
-        name: `\u26a0\ufe0f Interrupted / abandoned (${interrupted.length})`,
-        value: clampFieldValue(
-          caption ? [`_${caption} Controls below act on this page._`, ...lines] : lines
-        ),
-      });
+      if (slice.actionable) embed.addFields(slice.actionable);
+      if (slice.inert) embed.addFields(slice.inert);
       if (view.empty) embed.setDescription(null);
       // Per-entry Resume / Abandon \u2014 same pattern as schedule-list cards.
       // Zero extra command slots. Four rows leave the fifth for pagination.

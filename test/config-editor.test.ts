@@ -223,7 +223,7 @@ describe("hub render (#90)", () => {
       "GIF",
       "Channel",
     ]);
-    expect(panel.actions![3].map((b) => b.label)).toEqual(["Role", "Auto-name"]);
+    expect(panel.actions![3].map((b) => b.label)).toEqual(["Role", "Auto-name", "Fast"]);
     expect(panel.fields.find((f) => f.name === "Role")!.value).toMatch(/not set/);
     expect(panel.fields.find((f) => f.name === "Auto-name")!.value).toMatch(/enabled/);
     expect(panel.actions![2][0]!.disabled).toBe(true);

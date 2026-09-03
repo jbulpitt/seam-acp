@@ -179,6 +179,9 @@ export const discordRenderer: Renderer = {
     const segments = [`⏱ ${state.elapsedSeconds}s elapsed`];
     if (state.context) segments.push(`🪟 ${state.context}`);
     segments.push(`🧠 ${state.effort ?? "default"} effort`);
+    // #37: only shown when Fast actually matters this turn — either it is on,
+    // or it was asked for and the live session refused it.
+    if (state.fastMode) segments.push(`⚡ fast ${state.fastMode}`);
     footerParts.push("\n" + segments.join(" • "));
 
     // Dispatched turns carry a title prefix (the dispatch type) so the panel

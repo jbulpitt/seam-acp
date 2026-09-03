@@ -135,6 +135,9 @@ export interface ThreadEntry {
   agent: string;
   model: string;
   effort: string | null;
+  /** Claude Fast mode (#37). Surfaced so a teammate's cost posture is visible
+   *  in the same identity line as agent/model/effort. */
+  fastMode?: boolean;
   cwd: string;
   /** Whether a live turn is CURRENTLY running in that thread — the load-bearing
    *  field: choose `send` (non-interrupting) over `steer`/`handoff`
@@ -652,13 +655,16 @@ const TOOLS = [
   {
     name: "configure_thread",
     description:
-      "Change a teammate thread's agent, model, reasoning effort, naming role, and/or automatic-naming opt-out within YOUR channel. " +
+      "Change a teammate thread's agent, model, reasoning effort, naming role, automatic-naming " +
+      "opt-out, and/or Claude Fast mode within YOUR channel. " +
       "An agent switch ALWAYS creates a fresh session and drops that thread's conversation context. " +
       "Model switches reset only on session-pinned backends (codex and ollama-cloud); live-config " +
       "backends such as Claude preserve context. Effort never resets the ACP session: config-option " +
       "agents update live, while meta/spawn-argument agents (including Claude) reload their runtime " +
-      "with context preserved. The result and target-thread confirmation card report the exact " +
-      "effective agent/model/effort, marking every unchanged field explicitly.",
+      "with context preserved. Changing fastMode ALWAYS forges a fresh session (Fast is a " +
+      "session-start dimension) and Fast spends paid usage credits outside subscription limits. " +
+      "The result and target-thread confirmation card report the exact " +
+      "effective agent/model/effort/fast, marking every unchanged field explicitly.",
     inputSchema: {
       type: "object",
       properties: {
@@ -676,6 +682,19 @@ const TOOLS = [
         disableThreadPrefix: {
           type: "boolean",
           description: "Optional thread-local naming opt-out. True disables automatic naming; false re-enables it.",
+        },
+        fastMode: {
+          type: "boolean",
+          description:
+            "Optional Claude Fast mode: a latency-over-cost serving mode for the selected model, " +
+            "NOT a model and NOT an effort level. Default off. Changing it forges a fresh ACP " +
+            "session (dropping that thread's context) before it applies, and it bills paid usage " +
+            "credits outside subscription limits. Refused for non-Claude agents, when the " +
+            "deployment sets CLAUDE_CODE_DISABLE_FAST_MODE, or when the live session does not " +
+            "advertise it. Support belongs to the RESOLVED model, not the slug you ask for: " +
+            "verified available on claude-opus-5 and claude-opus-4-8, absent on claude-sonnet-5, " +
+            "and the `default` alias is resolved by the wrapper at session start, so whether it " +
+            "offers Fast depends on what it resolved to that time (observed both ways).",
         },
       },
       required: ["thread"],
@@ -1580,7 +1599,7 @@ const INSTRUCTIONS = [
   "  result is dispatched back into your thread when it completes.",
   "- forward(to, content): relay a message into another thread (thin handoff, no specialist framing).",
   "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
-  "- configure_thread(thread, agent?, model?, effort?, role?, disableThreadPrefix?): reconfigure a teammate in YOUR channel; returns exact changed/no-change identity, posts a target confirmation card, and agent switches reset context.",
+  "- configure_thread(thread, agent?, model?, effort?, role?, disableThreadPrefix?, fastMode?): reconfigure a teammate in YOUR channel; returns exact changed/no-change identity, posts a target confirmation card, and agent switches reset context. `fastMode` is Claude-only, defaults off, always forges a fresh session, and spends paid usage credits.",
   "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
   "- migrate_self(agent?, model?, effort?, manifest): migrate YOUR OWN thread after this turn ends; the manifest is the replacement session's first prompt. Purpose-agnostic and rollback-safe.",
   "- search_messages(query, threads?, author?, since?, limit?): search live conversation text in your thread or same-channel siblings.",
@@ -1882,6 +1901,7 @@ export class SeamMcpServer {
       ...(typeof args.disableThreadPrefix === "boolean"
         ? { disableThreadPrefix: args.disableThreadPrefix }
         : {}),
+      ...(typeof args.fastMode === "boolean" ? { fastMode: args.fastMode } : {}),
     };
     const outcome = await this.deps.configureThread(caller, target.record, input);
     if (!outcome.ok) return textResult(outcome.error, true);
@@ -1910,6 +1930,7 @@ export class SeamMcpServer {
       `• Effort: ${outcome.applied.effort} (${status(outcome.changes.effort)})`,
       `• Role: ${outcome.applied.role} (${status(outcome.changes.role)})`,
       `• Auto-name: ${outcome.applied.disableThreadPrefix ? "disabled" : "enabled"} (${status(outcome.changes.disableThreadPrefix)})`,
+      `• Fast mode: ${outcome.applied.fastMode ? "on" : "off"} (${status(outcome.changes.fastMode)})`,
       `• Runtime: ${runtime}`,
       ...(presentation.length ? [`• Presentation: ${presentation.join("; ")}`] : []),
       ...outcome.warnings.map((warning) => `⚠️ ${warning}`),
@@ -2383,6 +2404,8 @@ export class SeamMcpServer {
         agentAt.trim(),
         t.model,
         `effort ${t.effort ?? "auto"}`,
+        // Only ever shown when ON — an "off" badge on every idle thread is noise.
+        t.fastMode ? "⚡ fast on" : null,
       ].filter(Boolean).join(" / ");
       lines.push(
         `• ${name} — id ${t.id} [${flags.join(", ")}]` +
@@ -2902,6 +2925,7 @@ export class SeamMcpServer {
       line("card gif:", d.simpleCardGif?.value ? "on" : "off", d.simpleCardGif?.source ?? "default"),
       line("auto-name:", d.disableThreadPrefix?.value ? "disabled" : "enabled", d.disableThreadPrefix?.source ?? "default"),
       line("detached:", d.detached.value ? "true" : "false", d.detached.source),
+      line("fast mode:", d.fastMode?.value ? "on" : "off", d.fastMode?.source ?? "default"),
       line("tts:", d.tts.value ? "true" : "false", d.tts.source),
       line("tts voice:", d.ttsVoice.value ?? "(unset)", d.ttsVoice.source),
       line("tts pace:", d.ttsPace.value, d.ttsPace.source),

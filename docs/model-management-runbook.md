@@ -649,3 +649,109 @@ with `EffortLevel` (`packages/core/src/platforms/discord/commands.ts`).
 fall back to the highest supported level per Claude Code's documented behavior.
 Do not use a bogus string as a wiring oracle: SDK 0.3.257 no longer rejects one
 at `session/new`; the JSONL `effort` field is the authoritative check.
+
+---
+
+## 12. Fast mode (#37)
+
+**Fast is a serving mode for the model you already selected.** It is not another
+model, not an effort level, and there are no synthetic `-fast` slugs. It trades
+cost efficiency for latency and it **spends usage credits outside subscription
+limits** — the only dimension in this runbook that can cost real money per turn.
+
+Seam therefore exposes it as its own explicit, opt-in, per-thread
+**session-start** setting. Default off. It never rides along on a model pick.
+
+### 12.1 API surface
+
+- **ACP config id:** `fast` (not `fast_mode`).
+- **Shape:** a `select`, values **`on` / `off`** (not `true` / `false`), with
+  `currentValue` reported on the session.
+- **Applied with:** `setSessionConfigOption({ sessionId, configId: "fast", value })`.
+- **Environment kill switch:** `CLAUDE_CODE_DISABLE_FAST_MODE=1`. When set the
+  wrapper **omits the option entirely** — there is no "present but disabled"
+  state to detect.
+
+### 12.2 Eligible models — never infer from the slug
+
+Fast support is a property of the **live session's `configOptions`**, not of the
+string you asked for. Verified 2026-09-03 with the zero-token probe
+(`node scripts/claude-fast-mode-probe.mjs --clean-env`, claude-agent-acp 0.73.0):
+
+- `claude-opus-5` — resolved to `opus[1m]`; **advertises** `fast`
+  (`select`, `[on|off]`, current `off`); `set on` ✓ and `set off` ✓.
+- `claude-opus-4-8` — resolved to itself; **advertises** `fast`, same shape,
+  both values accepted.
+- `claude-sonnet-5` — resolved to `sonnet`; **does not advertise** `fast`
+  (config ids: `mode, model, effort`).
+- `default` — **an alias, resolved by the wrapper at session start.** It has
+  been observed **both ways**: advertising `fast` when it resolved to Opus 5,
+  and not advertising it when it resolved to `sonnet` (the 2026-09-03 runs).
+  This is the single most important reason nothing in the code may key Fast off
+  a slug. Ask the session, every time.
+- `CLAUDE_CODE_DISABLE_FAST_MODE=1` + `claude-opus-5` — **does not advertise**
+  `fast`. The kill switch is indistinguishable from an ineligible model at the
+  protocol level, which is why Seam checks the env var separately so it can give
+  an *actionable* refusal instead of "this model doesn't support Fast".
+
+> **Run the probe from a clean shell.** Invoked from inside a Claude Code
+> session it inherits `CLAUDECODE` / `CLAUDE_CODE_CHILD_SESSION` /
+> `CLAUDE_CODE_*`, which pm2 never sets. `--clean-env` strips them. The probe
+> also prints the **resolved** model, without which an alias result proves
+> nothing — that omission is exactly what produced a contradictory reading the
+> first time this was measured.
+
+### 12.3 Cost and reset semantics
+
+Enabling Fast **inside an established conversation may charge the whole
+accumulated context at Fast rates.** Seam therefore refuses to apply Fast to a
+session that already has history:
+
+- `fastMode` is applied **only in `AgentRuntime.newSession`**, never in
+  `loadSession`. A resumed session is *observed* (its advertised `currentValue`
+  is read) but never re-set.
+- Changing the setting **forces a fresh ACP session** before it applies:
+  `detectSessionReset` returns `resetReason: "fast-mode-switch"`, the config
+  editor's Save clears the stored `acpSessionId`, and `configure_thread` forges
+  a replacement session.
+- Every confirmation states both facts: context was reset, and Fast bills paid
+  usage credits.
+- **Off is silent on the wire.** A thread that never asked for Fast issues no
+  `set_config_option` at all; `off` is written explicitly only when a session
+  came up `on`.
+- **An unverifiable enable is discarded, not assumed off.** `applied` is read
+  back from the echoed `configOptions` (a resolved RPC is not proof — upstream
+  carries a `fast_mode_disabled_reason` for toggles that snap back). If the
+  response echoes nothing, the state is `null` (undetermined), **not** `off`:
+  the session may genuinely be serving and billing Fast. Both mutation surfaces
+  then roll the flag back *and* retire that just-forged session, so the next
+  turn starts clean with Fast off. Only a positively observed `off` keeps the
+  session. Nothing may claim a session is Fast-free without observing it.
+- **A failed retirement is critical, not a warning.** If that retirement itself
+  fails, a possibly-billing session is still live: `configure_thread` fails the
+  whole call, and the config card turns red with a `🚨` footer instead of a calm
+  "Saved". Both name the recovery: `/seam config reset` in that thread before
+  the next turn.
+
+### 12.4 Where it lives
+
+- Storage: `channel-presets.json` → `threads.<id>.fastMode` (raw boolean).
+  **Thread-only** — a channel-level `fastMode` is rejected by
+  `ChannelPresetSchema` so a channel pin can never bill every sibling thread.
+- Resolution: `describeConfig().fastMode` (`ResolvedSetting<boolean>`).
+- Eligibility: `AgentProfile.fastMode` (Claude only, and only for
+  direct-Anthropic backends — a Claude harness pointed at Ollama/Z.ai via
+  `ANTHROPIC_BASE_URL` declares none).
+- Policy: `packages/core/src/core/fast-mode.ts`; wire constants:
+  `packages/adapters/src/fast-mode.ts`.
+- Surfaces: `/seam config edit` (Fast button), `configure_thread` MCP
+  (`fastMode`), `config_describe`, `threads()`, the confirmation card, the
+  status card footer (`⚡ fast …`), and the config audit trail.
+
+### 12.5 Verification boundary — do not spend credits casually
+
+The probe above proves **advertisement and acceptance** and costs nothing.
+Proving a completion was actually *served* in Fast mode requires a **paid**
+usage-credit turn and inspection of the resulting `fast_mode_state`. Do not run
+that without explicit authorization from the account owner; note in any report
+which of the two you actually did.

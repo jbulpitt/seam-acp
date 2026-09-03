@@ -309,6 +309,7 @@ describe("ThreadSessionControlService", () => {
         effort: "low",
         role: "auto",
         disableThreadPrefix: false,
+        fastMode: false,
       },
       changes: {
         agent: { before: "claude", after: "claude", changed: false },
@@ -316,6 +317,7 @@ describe("ThreadSessionControlService", () => {
         effort: { before: "low", after: "low", changed: false },
         role: { before: "auto", after: "auto", changed: false },
         disableThreadPrefix: { before: "enabled", after: "enabled", changed: false },
+        fastMode: { before: "off", after: "off", changed: false },
       },
       sessionReset: false,
       runtimeReloaded: false,

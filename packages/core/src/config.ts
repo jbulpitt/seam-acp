@@ -831,6 +831,15 @@ const ChannelPresetSchema = PresetValuesSchema.extend({
       invalid_type_error: "ttsStyle is a thread-only setting and cannot be set on a channel",
     })
     .optional(),
+  // Thread-only (#37). Rejected so a channel-wide `fastMode` cannot silently
+  // bill every sibling thread against paid usage credits — Fast is a per-thread
+  // cost decision that must be opted into where it is paid for.
+  fastMode: z
+    .undefined({
+      invalid_type_error:
+        "fastMode is a thread-only setting and cannot be set on a channel",
+    })
+    .optional(),
 });
 
 // Raw boolean on the THREAD entry — NOT wrapped `{value:true}` (that wrapper
@@ -847,6 +856,12 @@ const ThreadPresetSchema = PresetValuesSchema.extend({
   ttsVoice: z.string().min(1).max(64).optional(),
   ttsPace: z.enum(["slow", "natural", "fast", "faster"]).optional(),
   ttsStyle: z.enum(["neutral", "warm", "clear"]).optional(),
+  // Claude Fast mode (#37): raw boolean, default false — exactly the shape of
+  // `detached`/`tts`. The default only materializes in the in-memory map: the
+  // Tier-C writer builds its candidate from the RAW file JSON, so an omitted
+  // `fastMode` is never serialized back as an explicit `false`.
+  // A session-start dimension, so changing it forces a fresh ACP session.
+  fastMode: z.boolean().optional().default(false),
 });
 
 /** Per-host bridge config (D11 / #86). Token is stored as SHA-256 hex only. */
@@ -894,6 +909,8 @@ export type ChannelPreset = PresetValues & { locked: boolean };
 export type ThreadPreset = PresetValues & {
   detached?: boolean;
   location?: string;
+  /** Claude Fast mode (#37). Thread-only; absent/false = off. */
+  fastMode?: boolean;
   tts?: boolean;
   ttsVoice?: string;
   ttsPace?: "slow" | "natural" | "fast" | "faster";

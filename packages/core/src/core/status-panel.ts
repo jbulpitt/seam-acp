@@ -21,6 +21,8 @@ export interface StatusPanelInput {
   resolvedModel?: string;
   /** Reasoning effort for this turn, if set. */
   effort?: string;
+  /** Resolved Claude Fast-mode state for this turn (#37), if worth showing. */
+  fastMode?: string;
   /** Optional title prefix shown before the turn state, e.g. a dispatch type
    *  ("📨 Handoff", "⏰ Wake"). Left unset for normal user turns so the panel
    *  title is just the state. */
@@ -58,6 +60,7 @@ export function renderStatusPanel(
     model: input.model,
     ...(input.resolvedModel ? { resolvedModel: input.resolvedModel } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
+    ...(input.fastMode ? { fastMode: input.fastMode } : {}),
     ...(input.titlePrefix ? { titlePrefix: input.titlePrefix } : {}),
     ...(input.origin ? { origin: input.origin } : {}),
     action: input.action,
@@ -121,6 +124,9 @@ export class TurnStatus {
   /** Reasoning effort for this turn (low|medium|high|xhigh|max), or undefined
    *  when unset (the model's built-in default applies). */
   effort?: string;
+  /** Resolved Claude Fast-mode state (#37). Set from the runtime outcome after
+   *  the session exists, so the card reports what was APPLIED, not requested. */
+  fastMode?: string;
   /** Optional title prefix (e.g. a dispatch type "📨 Handoff"). Unset for
    *  normal user turns. Rendered before the turn state in the panel title. */
   titlePrefix?: string;
@@ -266,6 +272,7 @@ export class TurnStatus {
       model: this.model,
       ...(this.resolvedModel ? { resolvedModel: this.resolvedModel } : {}),
       ...(this.effort ? { effort: this.effort } : {}),
+      ...(this.fastMode ? { fastMode: this.fastMode } : {}),
       ...(this.titlePrefix ? { titlePrefix: this.titlePrefix } : {}),
       ...(this.origin ? { origin: this.origin } : {}),
       action: this.action,

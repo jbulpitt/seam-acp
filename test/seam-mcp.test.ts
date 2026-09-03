@@ -481,6 +481,7 @@ describe("SeamMcpServer", () => {
         effort: "high",
         role: "analyst",
         disableThreadPrefix: true,
+        fastMode: false,
       },
       changes: {
         agent: { before: "claude", after: "claude", changed: false },
@@ -488,6 +489,7 @@ describe("SeamMcpServer", () => {
         effort: { before: "auto", after: "high", changed: true },
         role: { before: "auto", after: "analyst", changed: true },
         disableThreadPrefix: { before: "enabled", after: "disabled", changed: true },
+        fastMode: { before: "off", after: "off", changed: false },
       },
       sessionReset: false,
       runtimeReloaded: true,
@@ -527,6 +529,8 @@ describe("SeamMcpServer", () => {
     expect(body.result.content[0].text).toContain("Effort: high (changed from auto)");
     expect(body.result.content[0].text).toContain("Role: analyst (changed from auto)");
     expect(body.result.content[0].text).toContain("Auto-name: disabled (changed from enabled)");
+    // #37: an untouched Fast state is still reported, explicitly as "no change".
+    expect(body.result.content[0].text).toContain("Fast mode: off (no change)");
     expect(body.result.content[0].text).toContain("runtime reloaded; ACP session/context preserved");
     expect(configureThread).toHaveBeenCalledWith(
       expect.objectContaining({ channelRef: "thread-caller", parentRef: "chan-1" }),
@@ -892,6 +896,26 @@ describe("SeamMcpServer", () => {
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("handoff").inputSchema.properties.stream.type).toBe("boolean");
     expect(byName.get("forward").inputSchema.properties.stream.type).toBe("boolean");
+  });
+
+  // --- Claude Fast mode (#37) ----------------------------------------------
+
+  it("configure_thread advertises fastMode with cost, reset and non-slug guidance", async () => {
+    h = await makeHarness();
+    const { body } = await h.call("tools/list");
+    const tool = body.result.tools.find((t: any) => t.name === "configure_thread");
+    const fast = tool.inputSchema.properties.fastMode;
+    expect(fast.type).toBe("boolean");
+    expect(fast.description).toMatch(/fresh ACP\s+session/);
+    expect(fast.description).toMatch(/paid usage\s+credits/);
+    expect(fast.description).toMatch(/CLAUDE_CODE_DISABLE_FAST_MODE/);
+    // Support follows the RESOLVED model; the description must not tell agents
+    // the `default` alias never has Fast (it has been observed both ways).
+    expect(fast.description).toMatch(/RESOLVED model, not the slug/);
+    expect(fast.description).toMatch(/observed both ways/);
+    // Still optional — only `thread` is required.
+    expect(tool.inputSchema.required).toEqual(["thread"]);
+    expect(tool.description).toMatch(/Changing fastMode ALWAYS forges a fresh session/);
   });
 
   // --- handoff feedback channel: watchFeedback (#62) ------------------------

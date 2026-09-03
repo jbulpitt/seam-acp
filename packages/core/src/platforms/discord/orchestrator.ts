@@ -193,6 +193,8 @@ import {
   renderExpiredHub,
   renderHub,
   renderSavedHub,
+  fastModeWillResetSession,
+  willVerifyFastMode,
   riderDownloadFilename,
   riderTooLong,
   snapshotFromDescribe,
@@ -286,6 +288,17 @@ const VOICE_CONSOLE_DURABLE_ACTIONS: ReadonlySet<string> = new Set([
 import type { SessionStore } from "../../core/session-store.js";
 import { makeSessionId } from "../../core/session-store.js";
 import { SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
+import {
+  FAST_MODE_COST_WARNING,
+  FAST_MODE_CONFIG_ID,
+  FAST_MODE_RESET_NOTICE,
+  describeFastModeOutcome,
+  fastModeAgentRefusal,
+  fastModeEnvRefusal,
+  fastModeRetirementFailure,
+  isFastModeDisabledByEnv,
+  settleFastMode,
+} from "../../core/fast-mode.js";
 import type { CardGifCatalog } from "../../core/card-gifs.js";
 import {
   deleteSimpleCardGifMessage,
@@ -1854,6 +1867,10 @@ export class Orchestrator {
 
     try {
       let activeRuntime = await this.router.getOrStartRuntime(record);
+      // #37: report what the LIVE session resolved Fast to, never what was
+      // requested — the runtime only records `on` once the session accepted it.
+      const fastState = describeFastModeOutcome(activeRuntime.getFastModeOutcome());
+      if (fastState) status.fastMode = fastState;
       if (record.agentId === "grok" || record.agentId.startsWith("grok-")) {
         quotaRequest = (method, params) => activeRuntime.request(method, params);
       }
@@ -4125,6 +4142,7 @@ export class Orchestrator {
         { name: "Effort", value: displayField(outcome.changes.effort), inline: true },
         { name: "Role", value: displayField(outcome.changes.role), inline: true },
         { name: "Auto-name", value: displayField(outcome.changes.disableThreadPrefix), inline: true },
+        { name: "Fast", value: displayField(outcome.changes.fastMode), inline: true },
         { name: "Runtime", value: runtime },
       ],
       ...(outcome.warnings.length
@@ -10865,6 +10883,7 @@ export class Orchestrator {
     }
     const panel = renderHub(draft, {
       effortDisabled: this.effortDisabledFor(draft),
+      fastDisabled: this.fastDisabledFor(draft),
       canEditChannel: Orchestrator.canEditChannelPreset(
         this.config,
         userId,
@@ -10902,6 +10921,8 @@ export class Orchestrator {
       cwd: chan?.cwd?.value ?? record.repoPath ?? this.config.REPOS_ROOT,
       permission,
       detached: false,
+      // #37: Fast is thread-preset only, so "without this thread" is always off.
+      fastMode: false,
       statusCardStyle:
         chan?.statusCardStyle?.value === "simple" || chan?.statusCardStyle?.value === "full"
           ? chan.statusCardStyle.value
@@ -10910,6 +10931,20 @@ export class Orchestrator {
       role: chan?.role?.value ?? null,
       disableThreadPrefix: chan?.disableThreadPrefix?.value === true,
     };
+  }
+
+  /**
+   * #37: hide the Fast control unless the drafted agent actually has Fast (and
+   * the deployment has not killed it). Offering a button that could only ever
+   * refuse is worse than not offering one.
+   */
+  private fastDisabledFor(draft: ThreadConfigDraft): boolean {
+    if (isFastModeDisabledByEnv()) return true;
+    const agentId =
+      draft.overlay.agent === undefined
+        ? draft.snapshot.agent.value
+        : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
+    return this.router.getProfile(agentId)?.fastMode === undefined;
   }
 
   private effortDisabledFor(draft: ThreadConfigDraft): boolean {
@@ -10959,6 +10994,7 @@ export class Orchestrator {
     if (!draft.messageId) return;
     const panel = renderHub(draft, {
       effortDisabled: this.effortDisabledFor(draft),
+      fastDisabled: this.fastDisabledFor(draft),
       canEditChannel: Orchestrator.canEditChannelPreset(
         this.config,
         draft.userId,
@@ -11223,6 +11259,8 @@ export class Orchestrator {
   }
 
   private async saveConfigEditorDraft(
+    // Reassigned only by the #37 Fast rollback, so the saved card renders the
+    // state the live session actually has rather than the one that was asked for.
     draft: ThreadConfigDraft,
     evt: ComponentEvent
   ): Promise<void> {
@@ -11302,6 +11340,100 @@ export class Orchestrator {
       }
       this.persistConfig(record, cfg);
     }
+    // #37: Fast is a session-start dimension, so a change here MUST land on a
+    // fresh ACP session — the overlay alone would be resumed into the existing
+    // one and never applied. Clearing the stored session id (and retiring the
+    // warm runtime) is exactly the "reset the Claude session" requirement.
+    //
+    // Turning it ON is then VERIFIED against that fresh session, the same way
+    // `configure_thread` does: the card's own picker promises "a model without
+    // it is refused on Save rather than silently ignored", so the two mutation
+    // surfaces must not disagree. A refusal rolls the flag straight back.
+    //
+    // The gate is NOT "the Fast toggle moved": Fast is advertised per model, and
+    // a Claude model switch is live-config on the SAME session, so changing the
+    // model with Fast already on would otherwise leave `fastMode: true`
+    // persisted against a session that never offered it.
+    let fastRefusal: string | undefined;
+    let retireUnverifiedSession = false;
+    // Set when a possibly-Fast session could NOT be discarded — the card must
+    // not read like an ordinary successful save.
+    let fastRetireFailed = false;
+    const fastNeedsFreshSession = fastModeWillResetSession(draft);
+    if (fastNeedsFreshSession) {
+      const bound = this.store.getByChannel(PLATFORM, draft.threadId);
+      if (bound) {
+        await this.router
+          .invalidate(bound.id, { clearAcpSession: true, clearStartFailure: true })
+          .catch((err) =>
+            this.logger.warn({ err, threadId: draft.threadId }, "fast-mode session reset failed")
+          );
+        if (willVerifyFastMode(draft)) {
+          try {
+            const fresh = this.store.get(bound.id) ?? bound;
+            const runtime = await this.router.getOrStartRuntime(fresh);
+            const described = this.router.describeConfig(fresh);
+            // Same decision `configure_thread` makes — one rule, two surfaces.
+            const settled = settleFastMode({
+              outcome: runtime.getFastModeOutcome(),
+              agentId: described.agent.value,
+              model: described.model.value,
+              advertised: runtime.getConfigSelectValues(FAST_MODE_CONFIG_ID),
+            });
+            if (!settled.ok) {
+              fastRefusal = settled.refusal;
+              retireUnverifiedSession = settled.retireSession;
+            }
+          } catch (err) {
+            fastRefusal =
+              `Fast mode could not be verified — the replacement session failed to start: ` +
+              `${err instanceof Error ? err.message : String(err)}`;
+            this.logger.warn({ err, threadId: draft.threadId }, "fast-mode verification failed");
+          }
+          if (fastRefusal) {
+            // Roll the persisted flag back so nothing reports a state the live
+            // session does not have, and correct the draft so the saved card
+            // renders `off` instead of the requested `on`.
+            const reverted = this.configMutation.applyThreadOverlay({
+              threadId: draft.threadId,
+              ...(draft.parentRef ? { parentRef: draft.parentRef } : {}),
+              changes: { fastMode: false },
+              actor,
+            });
+            if (!reverted.ok) {
+              this.logger.error(
+                { err: reverted.error, threadId: draft.threadId },
+                "fast-mode rollback failed; persisted flag may be stale"
+              );
+            }
+            draft = { ...draft, overlay: { ...draft.overlay, fastMode: false } };
+            if (retireUnverifiedSession) {
+              // Never observed landing on `off`, so this session may actually be
+              // serving (and billing) Fast. Throw it away — it was just forged
+              // and holds no user context; the next turn starts clean.
+              try {
+                await this.router.invalidate(bound.id, {
+                  clearAcpSession: true,
+                  clearStartFailure: true,
+                });
+              } catch (err) {
+                // Log-only here would render a calm "Saved · Fast off" card over
+                // a session that may still be billing. Escalate it instead.
+                this.logger.error(
+                  { err, threadId: draft.threadId },
+                  "could not retire unverified fast-mode session"
+                );
+                fastRefusal = fastModeRetirementFailure(
+                  err instanceof Error ? err.message : String(err)
+                );
+                fastRetireFailed = true;
+              }
+            }
+          }
+        }
+      }
+    }
+
     const namingRecord = this.store.getByChannel(PLATFORM, draft.threadId);
     if (plan.channelPreset && draft.parentRef) {
       await this.threadNamer.recompactChannel(PLATFORM, draft.parentRef).catch((err) =>
@@ -11324,9 +11456,30 @@ export class Orchestrator {
       }
     }
     // D10: do NOT abort or invalidate a live turn. Overlay applies on next spawn.
+    // (#37 Fast is the one exception, handled above — it MUST reset the session.)
     this.configEditor.delete(draft.id);
     if (draft.messageId) {
-      await this.editConfigEditorCard(evt.channel, draft.messageId, renderSavedHub(draft));
+      const savedPanel = renderSavedHub(draft);
+      await this.editConfigEditorCard(
+        evt.channel,
+        draft.messageId,
+        fastRetireFailed
+          ? {
+              ...savedPanel,
+              color: 0xed4245,
+              footer:
+                "🚨 Saved, but a session that may be serving Fast could not be " +
+                "discarded — run `/seam config reset` before the next turn.",
+            }
+          : savedPanel
+      );
+    }
+    // #37: say plainly that Fast did NOT take, right after the card that now
+    // (correctly) reads `off`. Silence here would be the false confirmation the
+    // whole feature is designed to avoid.
+    if (fastRefusal) {
+      await evt.followUpEphemeral(fastRetireFailed ? fastRefusal : `⚡ ${fastRefusal}`)
+        .catch(() => {});
     }
   }
 
@@ -11570,6 +11723,53 @@ export class Orchestrator {
           inherit,
           { value: "attached", label: "Attached", description: "Bot replies in this thread" },
           { value: "detached", label: "Detached", description: "No bot replies" },
+        ],
+        authorizedUserIds: owner,
+      });
+    } else if (action === "fast") {
+      // #37: hard-refuse rather than render a picker whose "on" can never land.
+      if (channelScope) return;
+      if (this.fastDisabledFor(draft)) {
+        const agentId =
+          draft.overlay.agent === undefined
+            ? draft.snapshot.agent.value
+            : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
+        await evt
+          .followUpEphemeral(
+            isFastModeDisabledByEnv()
+              ? fastModeEnvRefusal()
+              : fastModeAgentRefusal(agentId)
+          )
+          .catch(() => {});
+        return;
+      }
+      picked = await this.adapter.sendChoicePicker!(channel, {
+        panel: {
+          color: 0x5865f2,
+          title: "⚡ Claude Fast mode",
+          description:
+            `${FAST_MODE_COST_WARNING} ${FAST_MODE_RESET_NOTICE} ` +
+            `Availability is decided by the fresh session's advertised \`${FAST_MODE_CONFIG_ID}\` ` +
+            `option, so a model without it is refused on Save rather than silently ignored.`,
+          fields: [
+            {
+              name: "Current",
+              value: draft.snapshot.fastMode?.value ? "`on`" : "`off`",
+              inline: true,
+            },
+          ],
+        },
+        choices: [
+          {
+            value: "off",
+            label: "Off (default)",
+            description: "Normal serving; covered by your subscription",
+          },
+          {
+            value: "on",
+            label: "On — paid usage credits",
+            description: "Lower latency, billed outside subscription limits",
+          },
         ],
         authorizedUserIds: owner,
       });

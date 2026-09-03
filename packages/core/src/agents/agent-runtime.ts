@@ -22,6 +22,13 @@ import {
 } from "./attachments.js";
 import { blockToFile } from "./agent-content.js";
 import { SerialQueue } from "../core/serial-queue.js";
+import {
+  fastModeAgentRefusal,
+  fastModeEnvRefusal,
+  fastModeUnsupportedRefusal,
+  isFastModeDisabledByEnv,
+  type FastModeOutcome,
+} from "../core/fast-mode.js";
 
 /** Events surfaced from the ACP `session/update` stream. */
 export type AgentEvent =
@@ -71,6 +78,14 @@ export interface NewSessionOptions {
   /** Optional reasoning effort (low|medium|high|xhigh|max). Passed via
    *  `newSessionMeta` into `_meta.claudeCode.options.effort`. */
   effort?: string;
+  /**
+   * Claude Fast mode (#37). A **session-start** dimension: applied only here,
+   * on a fresh session, never on `loadSession` — enabling Fast inside an
+   * established conversation can charge the accumulated context at Fast rates.
+   * Honored only when the profile declares `fastMode` AND the live session
+   * advertises that config id; otherwise it is refused, never silently dropped.
+   */
+  fastMode?: boolean;
   /** Extra ACP `_meta` to merge into `session/new`. */
   meta?: Record<string, unknown>;
   /**
@@ -172,6 +187,12 @@ export class AgentRuntime {
   private sessionInfo?: SessionInfo;
   /** Latest full config-option snapshot advertised by session/new/load/update. */
   private sessionConfigOptions: ReadonlyArray<SessionConfigOption> = [];
+  /** What Fast mode (#37) actually resolved to on this session, if anything.
+   *  Read by the status card so the runtime result is visible, never assumed. */
+  private fastModeOutcome?: FastModeOutcome;
+  /** True when the last `setConfigOption` echoed a fresh option snapshot. A
+   *  read-back is only meaningful when it did. */
+  private lastConfigOptionRefreshed = false;
   /** True while a `session/prompt` is awaiting a response — lets the abort path
    *  tell whether a graceful cancel actually ended the turn before escalating. */
   private promptInFlight = false;
@@ -485,6 +506,10 @@ export class AgentRuntime {
     // Apply reasoning effort for agents that take it as a config option (Copilot).
     await this.applyConfigOptionEffort(opts.effort);
 
+    // #37: Fast mode is a session-start dimension — this is the ONLY place it
+    // is applied, and only against the options this fresh session advertised.
+    await this.applyFastMode(opts.fastMode);
+
     return this.sessionInfo;
   }
 
@@ -494,6 +519,12 @@ export class AgentRuntime {
     cwd: string;
     model?: string;
     effort?: string;
+    /**
+     * The thread's PERSISTED Fast request (#37). Never applied on resume — it
+     * is only used to report a divergence between what the thread asked for and
+     * what the resumed session is actually serving.
+     */
+    fastMode?: boolean;
     /** Isolated ingest: fail the load instead of warning on setModel. */
     strictModel?: boolean;
   }): Promise<SessionInfo> {
@@ -561,6 +592,11 @@ export class AgentRuntime {
     // Re-apply reasoning effort on resume (config options don't persist across
     // a subprocess restart any more than the model does).
     await this.applyConfigOptionEffort(opts.effort);
+
+    // #37: observe, never re-apply. A resumed session already carries the Fast
+    // state it was created with; issuing `fast=on` here would be the very
+    // "enable inside an established conversation" the design exists to prevent.
+    this.observeFastMode(opts.fastMode === true);
 
     // Mark the resume so the NEXT prompt gates its replay preamble (see the
     // resume-replay fields). Scoped to exactly the first following prompt.
@@ -732,6 +768,66 @@ export class AgentRuntime {
     if (this.sessionInfo) {
       this.sessionInfo = { ...this.sessionInfo, currentModelId: modelId };
     }
+    // #37: Fast availability is per MODEL, and a Claude model switch is
+    // live-config — the same session now advertises a different option set.
+    // Recompute from it, or the card keeps rendering "⚡ fast on" for a model
+    // that just dropped the option: an active false confirmation.
+    this.reconcileFastModeForCurrentOptions();
+  }
+
+  /**
+   * Re-derive the recorded Fast outcome from whatever the session advertises
+   * RIGHT NOW. Never sets anything — enabling Fast mid-conversation is exactly
+   * what the design forbids; this only stops a stale `applied: true` surviving
+   * a change that removed the capability.
+   */
+  private reconcileFastModeForCurrentOptions(): void {
+    const spec = this.profile.fastMode;
+    if (!spec || !this.fastModeOutcome) return;
+    const requested = this.fastModeOutcome.requested;
+    if (!this.lastConfigOptionRefreshed) {
+      // The switch told us nothing new, so the cached options describe the OLD
+      // model. Undetermined beats reporting a state we did not observe.
+      this.fastModeOutcome = {
+        requested,
+        applied: null,
+        ...(requested
+          ? {
+              error:
+                `Fast mode could not be re-checked after the model changed — the ` +
+                `session did not report its options, so it is not confirmed.`,
+            }
+          : {}),
+      };
+      return;
+    }
+    const current = this.getConfigCurrentValue(spec.configId);
+    if (current === undefined) {
+      this.fastModeOutcome = {
+        requested,
+        applied: false,
+        ...(requested
+          ? {
+              error:
+                `Fast mode is no longer offered by this session (the current model ` +
+                `does not advertise "${spec.configId}"), so it is not in effect.`,
+            }
+          : {}),
+      };
+      return;
+    }
+    const on = current === spec.onValue;
+    this.fastModeOutcome = {
+      requested,
+      applied: on,
+      ...(requested && !on
+        ? {
+            error:
+              `Fast mode is requested but this session now reports "${current}". ` +
+              `Toggle Fast off and on to start a fresh session with it.`,
+          }
+        : {}),
+    };
   }
 
   async setMode(modeId: string): Promise<void> {
@@ -761,6 +857,10 @@ export class AgentRuntime {
         configId,
         value,
       });
+    // Whether the agent echoed a FRESH option snapshot. Without it the cached
+    // `sessionConfigOptions` still describes the state BEFORE this call, so any
+    // read-back would report the stale value as if it were the result (#37).
+    this.lastConfigOptionRefreshed = Boolean(result?.configOptions);
     if (result?.configOptions) {
       this.sessionConfigOptions = result.configOptions;
     }
@@ -782,6 +882,185 @@ export class AgentRuntime {
         "failed to apply reasoning-effort config option"
       );
     }
+  }
+
+  /** Live current value of one ACP select option (e.g. `fast` → `"on"`). */
+  getConfigCurrentValue(configId: string): string | undefined {
+    const option = this.sessionConfigOptions.find((c) => c.id === configId);
+    if (!option || option.type !== "select") return undefined;
+    return typeof option.currentValue === "string" ? option.currentValue : undefined;
+  }
+
+  /**
+   * What Fast mode actually ended up as on this runtime's session (#37).
+   * `applied: null` means "not determined here" — a resumed session that never
+   * re-advertised the option, which is deliberately distinct from "off".
+   */
+  getFastModeOutcome(): FastModeOutcome | undefined {
+    return this.fastModeOutcome;
+  }
+
+  /**
+   * Apply Fast mode to the session that was JUST created (#37).
+   *
+   * Never called on resume: enabling Fast inside an established conversation
+   * can charge the accumulated context at Fast rates, so a change of the
+   * setting forces a fresh session and lands here instead. Records exactly what
+   * happened so no surface can confirm a state the session does not have.
+   */
+  private async applyFastMode(requested: boolean | undefined): Promise<void> {
+    const spec = this.profile.fastMode;
+    const want = requested === true;
+
+    if (!spec) {
+      // Agent has no Fast concept. Silence unless something was asked for.
+      this.fastModeOutcome = want
+        ? {
+            requested: true,
+            applied: false,
+            error: fastModeAgentRefusal(this.profile.id),
+          }
+        : undefined;
+      return;
+    }
+
+    const advertised = this.getConfigSelectValues(spec.configId);
+    const wanted = want ? spec.onValue : spec.offValue;
+    if (!advertised.includes(wanted)) {
+      // The environment kill switch and unsupported models both land here: the
+      // wrapper simply omits the option. Off is the backend default, so a
+      // not-requested Fast on a session without the option is plain `off`.
+      // The env kill switch and an ineligible model are indistinguishable on the
+      // wire (both just omit the option), so disambiguate here — "pin a
+      // different model" is useless advice when the deployment disabled Fast.
+      this.fastModeOutcome = want
+        ? {
+            requested: true,
+            applied: false,
+            error: isFastModeDisabledByEnv()
+              ? fastModeEnvRefusal()
+              : fastModeUnsupportedRefusal(
+                  this.profile.id,
+                  this.sessionInfo?.currentModelId ?? this.modelOverride ?? this.profile.defaultModel,
+                  advertised
+                ),
+          }
+        : { requested: false, applied: false };
+      if (want) {
+        this.logger.warn(
+          { configId: spec.configId, advertised },
+          "fast mode requested but not advertised by this session"
+        );
+      }
+      return;
+    }
+
+    const current = this.getConfigCurrentValue(spec.configId);
+
+    // Default/off must be SILENT on the wire: a thread that never asked for Fast
+    // issues no `set_config_option` at all. `off` is the backend default, so the
+    // only case that needs an explicit write is a session that came up `on`.
+    if (!want && current !== spec.onValue) {
+      this.fastModeOutcome = { requested: false, applied: false };
+      return;
+    }
+
+    // Skip a redundant RPC when the session already reports the wanted value.
+    if (current === wanted) {
+      this.fastModeOutcome = { requested: want, applied: want };
+      return;
+    }
+
+    try {
+      await this.setConfigOption(spec.configId, wanted);
+      // A resolved RPC is NOT proof the session is in Fast: upstream can snap it
+      // back off (it carries a `fast_mode_disabled_reason` for exactly that).
+      // setConfigOption stores the echoed configOptions, so re-read and derive
+      // `applied` from what the session now reports — the status card claims to
+      // show the applied state, so it must be observed, not assumed.
+      // Only trust a read-back when the response actually refreshed the
+      // snapshot; otherwise `getConfigCurrentValue` returns the PRE-set value.
+      const echoed = this.lastConfigOptionRefreshed
+        ? this.getConfigCurrentValue(spec.configId)
+        : undefined;
+      if (echoed === undefined) {
+        // The wrapper accepted the call but told us nothing about the resulting
+        // state. That is UNDETERMINED, never a confirmation: `applied: null`
+        // makes every `applied !== true` check (status card, both rollback
+        // paths) treat it as not-in-Fast, so no surprise bill can hide here.
+        this.fastModeOutcome = {
+          requested: want,
+          applied: null,
+          ...(want
+            ? {
+                error:
+                  `Fast mode was accepted but the session did not report its ` +
+                  `resulting "${spec.configId}" state, so it cannot be confirmed.`,
+              }
+            : {}),
+        };
+      } else {
+        const actual = echoed === spec.onValue;
+        this.fastModeOutcome = {
+          requested: want,
+          applied: actual,
+          ...(want && !actual
+            ? {
+                error:
+                  `Fast mode was accepted but the session reports "${echoed}" — ` +
+                  `the backend declined to stay in Fast for this model/account.`,
+              }
+            : {}),
+        };
+      }
+      this.logger.info(
+        { configId: spec.configId, value: wanted, reported: echoed },
+        "applied fast mode"
+      );
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      this.fastModeOutcome = {
+        requested: want,
+        applied: false,
+        ...(want ? { error: `Fast mode could not be enabled: ${detail}` } : {}),
+      };
+      this.logger.warn({ err, configId: spec.configId, value: wanted }, "failed to apply fast mode");
+    }
+  }
+
+  /**
+   * Read (do not set) Fast state after a resume. The session keeps whatever it
+   * was created with; re-issuing `fast=on` here would be exactly the
+   * "enable inside an established conversation" the design forbids.
+   */
+  private observeFastMode(requested: boolean): void {
+    const spec = this.profile.fastMode;
+    if (!spec) {
+      this.fastModeOutcome = requested
+        ? { requested: true, applied: false, error: fastModeAgentRefusal(this.profile.id) }
+        : undefined;
+      return;
+    }
+    const current = this.getConfigCurrentValue(spec.configId);
+    if (current === undefined) {
+      // Session did not report the option. `applied: null` is "undetermined",
+      // deliberately not "off" — the card renders "requested · not applied"
+      // rather than silently claiming Fast is off.
+      this.fastModeOutcome = requested ? { requested: true, applied: null } : undefined;
+      return;
+    }
+    const on = current === spec.onValue;
+    this.fastModeOutcome = {
+      requested: requested || on,
+      applied: on,
+      ...(requested && !on
+        ? {
+            error:
+              `This thread requests Fast mode, but the resumed session is serving ` +
+              `"${current}". Toggle Fast off and on to start a fresh session with it.`,
+          }
+        : {}),
+    };
   }
 
   async cancel(): Promise<void> {

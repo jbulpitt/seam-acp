@@ -36,6 +36,7 @@ import type { AgentProfile } from "@seam/adapters";
 import type { ConfigDescription } from "./session-router.js";
 import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
 import { legacyAttachmentQuarantine } from "./scheduled-prompts/quarantine.js";
+import { FAST_MODE_COST_WARNING, FAST_MODE_RESET_NOTICE } from "./fast-mode.js";
 import type { ScheduledPrompt } from "./scheduled-prompts/types.js";
 import {
   parseSimpleCardGif,
@@ -162,6 +163,13 @@ export interface ThreadPresetChanges {
   simpleCardGif?: boolean | null;
   detached?: boolean;
   location?: string | null;
+  /**
+   * Claude Fast mode (#37). RAW boolean like `detached`: true writes the key,
+   * false omits it. A session-start dimension — it is deliberately NOT in the
+   * no-restart list below, so changing it restarts the session and the fresh
+   * one is what Fast is applied to.
+   */
+  fastMode?: boolean;
   tts?: boolean;
   /** Raw Gemini TTS voice name. `null` clears back to the env default. */
   ttsVoice?: string | null;
@@ -249,7 +257,7 @@ export interface AppliedSessionConfig extends ConfigApplyResult {
 
 export interface SessionResetDecision {
   sessionReset: boolean;
-  resetReason?: "agent-switch" | "model-switch";
+  resetReason?: "agent-switch" | "model-switch" | "fast-mode-switch";
 }
 
 /** Backend reset semantics for cross-thread session control (#129). */
@@ -257,6 +265,10 @@ export function detectSessionReset(input: {
   previousAgentId: string;
   nextAgentId: string;
   modelChanged: boolean;
+  /** #37: Fast mode is a session-start dimension. Changing it MUST land on a
+   *  fresh session so an already-accumulated conversation is never repriced at
+   *  Fast rates by a mid-conversation enable. */
+  fastModeChanged?: boolean;
 }): SessionResetDecision {
   if (input.previousAgentId !== input.nextAgentId) {
     return { sessionReset: true, resetReason: "agent-switch" };
@@ -266,6 +278,9 @@ export function detectSessionReset(input: {
     (input.nextAgentId === "codex" || input.nextAgentId === "ollama-cloud")
   ) {
     return { sessionReset: true, resetReason: "model-switch" };
+  }
+  if (input.fastModeChanged) {
+    return { sessionReset: true, resetReason: "fast-mode-switch" };
   }
   return { sessionReset: false };
 }
@@ -1659,6 +1674,25 @@ export class ConfigMutationService {
           before: beforeDetached ? "true" : "false",
           after: afterDetached ? "true" : "false",
         });
+      }
+    }
+
+    // Claude Fast mode (#37): RAW boolean like detached. Unlike detached/tts this
+    // IS a session-affecting field, so it stays out of the no-restart list and a
+    // change forces the fresh session Fast is applied to.
+    if (changes.fastMode !== undefined) {
+      const beforeFast = current.fastMode === true;
+      const afterFast = changes.fastMode === true;
+      if (beforeFast !== afterFast) {
+        if (afterFast) next.fastMode = true;
+        else delete next.fastMode;
+        fields.push({
+          label: "fastMode",
+          before: beforeFast ? "on" : "off",
+          after: afterFast ? "on" : "off",
+        });
+        if (afterFast) warnings.push(FAST_MODE_COST_WARNING);
+        warnings.push(FAST_MODE_RESET_NOTICE);
       }
     }
 

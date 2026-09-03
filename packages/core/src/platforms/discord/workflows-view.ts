@@ -5,6 +5,7 @@
 
 import type { LedgerEntry, DelegationStatus } from "../../core/types.js";
 import type { AnomalySummary } from "../../core/watchdog.js";
+import { choicePickerPageCaption, sliceChoicePage } from "./choice-picker.js";
 
 /** Rendered, embed-ready view of the ledger. */
 export interface WorkflowsView {
@@ -150,6 +151,12 @@ export interface InterruptedTurnRow {
   status: "interrupted" | "abandoned";
   startedUtc: string;
   acpSessionId: string | null;
+  /**
+   * Where a resume would land: the ledger's dispatch target for a `dispatch`
+   * row, the thread for a `live` marker. A dispatch resume re-enqueues into
+   * this ref, so a row without one cannot be resumed at all (#159).
+   */
+  targetRef: string | null;
 }
 
 /** One inventory line: thread, age, correlation — what the operator needs
@@ -162,6 +169,176 @@ export function formatInterruptedLine(row: InterruptedTurnRow, now: Date): strin
 
 export function formatInterruptedLines(rows: InterruptedTurnRow[], now: Date): string[] {
   return rows.map((r) => formatInterruptedLine(r, now));
+}
+
+/** The buttons `/seam workflows` may offer for one inventory row. */
+export type InterruptedRowAction = "resume" | "abandon";
+
+/**
+ * Which actions are still *live* for a row (#159).
+ *
+ * A control whose backing operation has already been consumed is exactly the
+ * bug this inventory used to have: an abandoned turn kept an "Abandon" button
+ * that could only answer "No resumable turn". A rendered button must not be
+ * able to fail deterministically, so this mirrors every precondition
+ * `resumeTurnManually` / `abandonTurnManually` actually check:
+ *
+ * - A **live** marker resumes from its recorded ACP session and is abandoned
+ *   by dropping the marker itself (no ledger row involved). Once abandoned the
+ *   marker is gone, so neither action can reach anything.
+ * - A **dispatch** row resumes through the ledger, which re-enqueues into
+ *   `targetRef` *and* loads `acpSessionId` — it needs both. Abandoning only
+ *   means something while the row is still interrupted.
+ */
+export function interruptedRowActions(
+  row: InterruptedTurnRow
+): readonly InterruptedRowAction[] {
+  const actions: InterruptedRowAction[] = [];
+  if (row.source === "live") {
+    if (row.status === "abandoned") return actions;
+    if (row.acpSessionId) actions.push("resume");
+    actions.push("abandon");
+    return actions;
+  }
+  if (row.targetRef && row.acpSessionId) actions.push("resume");
+  if (row.status === "interrupted") actions.push("abandon");
+  return actions;
+}
+
+/** True when the row still has at least one action a click could perform. */
+export function isActionableInterruptedRow(row: InterruptedTurnRow): boolean {
+  return interruptedRowActions(row).length > 0;
+}
+
+/**
+ * `/seam workflows` is rarely used, so the inventory stays deliberately
+ * compact: one summary page of every interrupted/abandoned row, and controls
+ * (with pagination) only for the rows that can still be acted on. Four rows
+ * per page leaves the fifth of Discord's five action rows for Prev/Page/Next.
+ */
+export const WORKFLOW_INVENTORY_PAGE_SIZE = 4;
+
+/** Paginate the *actionable* subset of the inventory. */
+export function paginateInterruptedRows(
+  rows: ReadonlyArray<InterruptedTurnRow>,
+  page: number,
+  pageSize: number = WORKFLOW_INVENTORY_PAGE_SIZE
+): {
+  page: number;
+  pageCount: number;
+  total: number;
+  items: InterruptedTurnRow[];
+} {
+  const actionable = rows.filter(isActionableInterruptedRow);
+  const { page: p, items } = sliceChoicePage(actionable, page, pageSize);
+  const pageCount = Math.max(1, Math.ceil(actionable.length / pageSize) || 1);
+  return { page: p, pageCount, total: actionable.length, items };
+}
+
+/**
+ * Discord rejects an embed whose title + description + field names/values +
+ * footer exceed this in total, independently of the 1024 per-field cap.
+ */
+export const DISCORD_EMBED_TOTAL_LIMIT = 6000;
+
+export interface EmbedFieldSpec {
+  name: string;
+  value: string;
+}
+
+/**
+ * Fit an embed's fields inside Discord's aggregate character budget.
+ *
+ * `/seam workflows` can legitimately carry ten independently-clamped sections
+ * (ledger, anomalies, wakes, watches, live help, ingest, choices, interrupted…),
+ * which together can exceed 6000 and get the whole card rejected. Sections
+ * marked `required` — the interrupted rows that have buttons under them — are
+ * always kept; the rest are dropped from the tail of the budget, in order, so
+ * the card degrades instead of failing.
+ */
+export function fitEmbedFields(
+  fields: ReadonlyArray<EmbedFieldSpec & { required?: boolean }>,
+  overhead: number,
+  limit: number = DISCORD_EMBED_TOTAL_LIMIT
+): { fields: EmbedFieldSpec[]; dropped: number } {
+  const cost = (f: EmbedFieldSpec) => f.name.length + f.value.length;
+  const requiredCost = fields
+    .filter((f) => f.required)
+    .reduce((sum, f) => sum + cost(f), 0);
+  let budget = limit - overhead - requiredCost;
+  const kept: EmbedFieldSpec[] = [];
+  let dropped = 0;
+  for (const field of fields) {
+    if (field.required) {
+      kept.push({ name: field.name, value: field.value });
+      continue;
+    }
+    const size = cost(field);
+    if (size > budget) {
+      dropped++;
+      continue;
+    }
+    budget -= size;
+    kept.push({ name: field.name, value: field.value });
+  }
+  return { fields: kept, dropped };
+}
+
+/** The embed fields for the inventory's interrupted section. */
+export interface InterruptedInventorySection {
+  page: number;
+  pageCount: number;
+  /** Actionable rows across every page. */
+  total: number;
+  /** The rows this page's controls act on, in button order. */
+  items: InterruptedTurnRow[];
+  /** One line per control row, same order — or `null` when nothing is actionable. */
+  actionable: { name: string; value: string } | null;
+  /** Compact summary of everything with no live action left. */
+  inert: { name: string; value: string } | null;
+}
+
+/**
+ * Build the interrupted section so the visible text and the buttons always
+ * describe the same rows.
+ *
+ * Listing the whole inventory in one field while paginating only the
+ * actionable subset breaks down past page 1: the 1024-char clamp can drop
+ * exactly the rows the buttons act on, leaving controls pointing at text the
+ * operator cannot see. The actionable field therefore carries *only* this
+ * page's controlled rows, in button order, and everything inert moves to its
+ * own compact summary.
+ */
+export function buildInterruptedInventory(
+  rows: ReadonlyArray<InterruptedTurnRow>,
+  page: number,
+  now: Date,
+  pageSize: number = WORKFLOW_INVENTORY_PAGE_SIZE
+): InterruptedInventorySection {
+  const slice = paginateInterruptedRows(rows, page, pageSize);
+  const caption = choicePickerPageCaption(slice.total, slice.page, pageSize);
+  const lines = formatInterruptedLines(slice.items, now);
+  const inertRows = rows.filter((row) => !isActionableInterruptedRow(row));
+  return {
+    page: slice.page,
+    pageCount: slice.pageCount,
+    total: slice.total,
+    items: slice.items,
+    actionable: slice.items.length
+      ? {
+          name: `⚠️ Interrupted / abandoned — actionable (${slice.total})`,
+          // Caption last: if anything must be dropped it is the caption, never
+          // a row that has a button under it.
+          value: clampFieldValue(caption ? [...lines, `_${caption}_`] : lines),
+        }
+      : null,
+    inert: inertRows.length
+      ? {
+          name: `🗄️ Interrupted / abandoned — no action available (${inertRows.length})`,
+          value: clampFieldValue(formatInterruptedLines(inertRows, now)),
+        }
+      : null,
+  };
 }
 
 export function clampFieldValue(lines: string[], max = 1024): string {

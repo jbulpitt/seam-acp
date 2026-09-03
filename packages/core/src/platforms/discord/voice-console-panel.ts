@@ -504,17 +504,36 @@ export function renderDuplicateVoiceConfirmation(input: {
   });
 }
 
+/**
+ * How a confirmation card resolved. Every ephemeral Voice Console
+ * confirmation ends on one of these, and all three are component-free: once
+ * the replay state or the console behind a confirmation is gone, keeping its
+ * buttons on screen advertises an action that can no longer happen (#159).
+ */
+export type VoiceConsoleMutationOutcome = "saved" | "cancelled" | "failed";
+
+const MUTATION_OUTCOME_STYLE: Record<
+  VoiceConsoleMutationOutcome,
+  { color: number; footer: string }
+> = {
+  saved: { color: 0x57f287, footer: "Saved" },
+  cancelled: { color: 0x99aab5, footer: "Cancelled — nothing changed" },
+  failed: { color: 0xed4245, footer: "Not applied" },
+};
+
 export function renderVoiceConsoleMutationConfirmation(input: {
   title: string;
   summary: string;
   revision: number;
+  outcome?: VoiceConsoleMutationOutcome;
 }): VoiceConsolePanelSpec {
+  const style = MUTATION_OUTCOME_STYLE[input.outcome ?? "saved"];
   return constrainVoiceConsolePanel({
-    color: 0x57f287,
+    color: style.color,
     title: inertVoiceConsoleText(input.title),
     description: inertVoiceConsoleText(input.summary),
     fields: [],
-    footer: `Saved · revision ${input.revision}`,
+    footer: `${style.footer} · revision ${input.revision}`,
     components: [],
   });
 }

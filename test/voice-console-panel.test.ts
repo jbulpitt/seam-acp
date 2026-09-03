@@ -24,6 +24,7 @@ import {
   type VoiceConsoleBindingPresentation,
   type VoiceConsoleDiagnosticState,
   type VoiceConsolePanelState,
+  type VoiceConsoleMutationOutcome,
   type VoiceConsolePanelSpec,
 } from "../packages/core/src/platforms/discord/voice-console-panel.js";
 import {
@@ -561,5 +562,62 @@ describe("confirmation and profile views", () => {
     expect(preview.title).toMatch(/Voice \d+\/30 · Puck/);
     expect(preview.previewRequest).toMatchObject({ voice: "Puck", bindingId: "tvb_0" });
     expect(preview.components).toHaveLength(2);
+  });
+});
+
+// --- Ephemeral confirmation terminal states (#159) -------------------------
+
+describe("renderVoiceConsoleMutationConfirmation — every outcome is inert", () => {
+  const outcomes: VoiceConsoleMutationOutcome[] = ["saved", "cancelled", "failed"];
+
+  for (const outcome of outcomes) {
+    it(`"${outcome}" renders no components`, () => {
+      const panel = renderVoiceConsoleMutationConfirmation({
+        title: "Shared Voice Console ended",
+        summary: "Capture and VC speech stopped.",
+        revision: 7,
+        outcome,
+      });
+      expect(panel.components).toEqual([]);
+      expect(panel.footer).toContain("revision 7");
+    });
+  }
+
+  it("defaults to the saved styling when no outcome is given", () => {
+    const panel = renderVoiceConsoleMutationConfirmation({
+      title: "Binding saved: alpha",
+      summary: "Kore · natural · neutral",
+      revision: 3,
+    });
+    expect(panel.footer).toBe("Saved · revision 3");
+    expect(panel.components).toEqual([]);
+  });
+
+  it("a cancel reads as a cancel, not as a save", () => {
+    const panel = renderVoiceConsoleMutationConfirmation({
+      title: "Fan-out left armed",
+      summary: "Nothing changed.",
+      revision: 4,
+      outcome: "cancelled",
+    });
+    expect(panel.footer).toBe("Cancelled — nothing changed · revision 4");
+  });
+
+  it("the confirmations it replaces DO carry controls — the replacement is the fix", () => {
+    const end = renderVoiceConsoleEndConfirmation({
+      consoleId: "vc-1",
+      revision: 2,
+      bindingCount: 2,
+      pendingSegments: 3,
+      allowDiscard: true,
+    });
+    expect(end.components.length).toBeGreaterThan(0);
+    const settled = renderVoiceConsoleMutationConfirmation({
+      title: "Shared Voice Console ended",
+      summary: "done",
+      revision: 2,
+      outcome: "saved",
+    });
+    expect(settled.components).toEqual([]);
   });
 });

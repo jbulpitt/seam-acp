@@ -1261,14 +1261,20 @@ async function main(): Promise<void> {
     // closed watcher intake and delivered on the next boot.
     //
     // Discord admission closes in the SAME synchronous beat, and for the same
-    // reason. `quiesce()` calls `stopIntake()` too, but that is on the far side
-    // of the HTTP drain await below — a window of up to the full drain budget
-    // in which a slash command, component click or message could still be
-    // admitted and start store-backed work that nothing has yet begun draining.
-    // All three gates shut before the first await, so there is no such window.
+    // reason. `quiesce()` calls `closeAdmission()` too, but that is on the far
+    // side of the HTTP drain await below — a window of up to the full drain
+    // budget in which a slash command, component click or message could still
+    // be admitted and start store-backed work that nothing has yet begun
+    // draining. All three gates shut before the first await, so there is no
+    // such window.
+    //
+    // `closeAdmission()`, not `stopIntake()`: this is the only place that is
+    // allowed to refuse the Discord transport, because it is the only place
+    // where the store really is about to close. The restart-sentinel drain uses
+    // `stopIntake()` and keeps the control surface (`/seam cancel`) reachable.
     seamMcpServer?.closeAdmission();
     health.closeIngress();
-    orchestrator.stopIntake();
+    orchestrator.closeAdmission();
     const httpDrain = budget.forStage(config.SHUTDOWN_QUIESCE_TIMEOUT_MS);
     const [mcpDrained, healthDrained] = await Promise.all([
       seamMcpServer

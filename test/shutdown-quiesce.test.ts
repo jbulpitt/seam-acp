@@ -290,6 +290,7 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
   Object.assign(self, {
     logger: silent,
     intakeStopped: false,
+    gatewayClosed: false,
     activeTurnSettles: new Set<Promise<void>>(),
     inboundWork: new Set<Promise<void>>(),
     pendingContinuations: new Set<Promise<void>>(),
@@ -315,6 +316,11 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     ): Promise<void>;
     channelQueues: Map<string, Promise<void>>;
     intakeStopped: boolean;
+    gatewayClosed: boolean;
+    readonly admissionClosed: boolean;
+    closeAdmission(): void;
+    stopIntake(): void;
+    handleRestartSentinel(): Promise<void>;
     readonly activeTurns: number;
     dispatchWatcher?: DispatchWatcher;
   };
@@ -935,12 +941,12 @@ describe("#174 boot done-file reconciliation", () => {
 
 /**
  * An orchestrator shell for the ingress gates, built on the real prototype so
- * `admissionClosed` is the REAL getter over the REAL `intakeStopped` field —
+ * `admissionClosed` is the REAL getter over the REAL `gatewayClosed` field —
  * a hand-set `admissionClosed: true` would let the gate be faked.
  */
 function makeIngressHost<T>(over: Record<string, unknown>): T {
   const self = Object.create(Orchestrator.prototype) as Record<string, unknown>;
-  Object.assign(self, { logger: silent, intakeStopped: true, ...over });
+  Object.assign(self, { logger: silent, intakeStopped: true, gatewayClosed: true, ...over });
   return self as unknown as T;
 }
 
@@ -1262,6 +1268,75 @@ describe("#174 admission gates", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  /**
+   * The restart drain and SIGTERM close DIFFERENT doors, and conflating them
+   * is a trap: the drain can hold for `RESTART_DRAIN_TIMEOUT_MS` (15 min) with
+   * the store and the gateway fully alive, so refusing Discord ingress there
+   * takes `/seam cancel` — the one lever that ends the wedged turn the drain is
+   * waiting on — away from the operator, for the entire wait.
+   */
+  it("keeps the Discord control surface reachable for the whole restart drain", async () => {
+    vi.useFakeTimers();
+    try {
+      await writeFile(path.join(dataDir, ".restart-pending"), "", "utf8"); // graceful
+      const fireParked = vi.fn(async () => {});
+      const self = makeQuiesceHost({
+        config: { DATA_DIR: dataDir, RESTART_DRAIN_TIMEOUT_MS: 60_000 },
+        restartPending: false,
+        dispatchWatcher: { stop: () => {}, inFlightCount: 0 },
+        scheduledManager: { stop: () => {} },
+        postNotification: async () => {},
+        restartProcess: async () => {},
+        fireParked,
+        store: { getParkedByChannel: () => ({ id: "p1", channelRef: "c1" }), deleteParked: vi.fn() },
+      });
+      const endWedgedTurn = self.beginTurn(); // something is holding the drain
+
+      const done = self.handleRestartSentinel();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // WORK intake is shut — a parked prompt must not open a new turn here…
+      expect(self.intakeStopped).toBe(true);
+      await (self as unknown as { tryFireParked(c: string): Promise<void> }).tryFireParked("c1");
+      expect(fireParked).not.toHaveBeenCalled();
+
+      // …but the transport is NOT, so a slash command still reaches its handler
+      // rather than being answered "Restarting — that command was not run".
+      expect(self.admissionClosed).toBe(false);
+      const cancelRan = vi.fn(async () => {});
+      const refused = vi.fn(async () => {});
+      await self.runInbound("slash", cancelRan, refused);
+      expect(cancelRan).toHaveBeenCalledOnce();
+      expect(refused).not.toHaveBeenCalled();
+
+      endWedgedTurn();
+      await vi.advanceTimersByTimeAsync(3000);
+      await done;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("SIGTERM's closeAdmission shuts BOTH doors, and quiesce implies it", async () => {
+    const dispatchStop = vi.fn();
+    const self = makeQuiesceHost({
+      dispatchWatcher: { stop: dispatchStop, drain: async () => {}, inFlightCount: 0 },
+    });
+    expect(self.admissionClosed).toBe(false);
+
+    self.closeAdmission();
+    expect(self.admissionClosed).toBe(true);
+    expect(self.intakeStopped).toBe(true); // strictly stronger, never weaker
+    expect(dispatchStop).toHaveBeenCalled();
+
+    // And the barrier does not depend on the caller having closed it first.
+    const viaQuiesce = makeQuiesceHost({
+      dispatchWatcher: { stop: () => {}, drain: async () => {}, inFlightCount: 0 },
+    });
+    await viaQuiesce.quiesce({ timeoutMs: 100 });
+    expect(viaQuiesce.admissionClosed).toBe(true);
   });
 });
 
@@ -2774,7 +2849,7 @@ describe("#174 nothing is explicitly closed while callbacks may still resume", (
 describe("#174 runInbound tracks without swallowing", () => {
   it("an admitted handler's failure still rejects to the adapter boundary", async () => {
     const log = makeCapturingLogger();
-    const host = makeQuiesceHost({ logger: log.logger, intakeStopped: false });
+    const host = makeQuiesceHost({ logger: log.logger, gatewayClosed: false });
 
     await expect(host.runInbound("slash", async () => {
       throw new Error("handler boom");
@@ -2786,7 +2861,7 @@ describe("#174 runInbound tracks without swallowing", () => {
   });
 
   it("a SYNCHRONOUS throw is tracked too, and still rejects", async () => {
-    const host = makeQuiesceHost({ intakeStopped: false });
+    const host = makeQuiesceHost({ gatewayClosed: false });
     let trackedDuring = -1;
 
     const running = host.runInbound("component", () => {
@@ -2803,7 +2878,7 @@ describe("#174 runInbound tracks without swallowing", () => {
   });
 
   it("a failing handler is still drained, not left in the tracking set", async () => {
-    const host = makeQuiesceHost({ intakeStopped: false });
+    const host = makeQuiesceHost({ gatewayClosed: false });
     const gate = deferred();
     const running = host
       .runInbound("slash", async () => {
@@ -2827,7 +2902,7 @@ describe("#174 runInbound tracks without swallowing", () => {
   });
 
   it("a refusal that throws SYNCHRONOUSLY is still silent", async () => {
-    const host = makeQuiesceHost({ intakeStopped: true });
+    const host = makeQuiesceHost({ gatewayClosed: true });
     const run = vi.fn(async () => {});
 
     // `Promise.resolve(refuse())` would have let this escape the `.catch`,
@@ -2842,7 +2917,7 @@ describe("#174 runInbound tracks without swallowing", () => {
   });
 
   it("a refusal that rejects ASYNCHRONOUSLY is likewise silent", async () => {
-    const host = makeQuiesceHost({ intakeStopped: true });
+    const host = makeQuiesceHost({ gatewayClosed: true });
     await expect(
       host.runInbound("choice", async () => {}, async () => {
         throw new Error("transport gone");
@@ -2858,7 +2933,7 @@ describe("#174 the component aggregate reports every handler's failure", () => {
     const onComponent = vi.fn();
     const host = makeQuiesceHost({
       logger: log.logger,
-      intakeStopped: false,
+      gatewayClosed: false,
       adapter: { onMessage: () => {}, onComponent, setActiveChannelCheck: () => {} },
       store: {},
       watchSentinel: () => {},

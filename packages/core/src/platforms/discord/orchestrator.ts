@@ -636,8 +636,13 @@ export class Orchestrator {
    */
   private readonly activeTurnSettles = new Set<Promise<void>>();
   private restartPending = false;
-  /** #174: set once intake is closed, so `stopIntake()` is idempotent. */
+  /** #174: set once WORK intake is closed, so `stopIntake()` is idempotent. */
   private intakeStopped = false;
+  /**
+   * #174: set once SHUTDOWN closes the Discord transport. Strictly stronger
+   * than `intakeStopped` and deliberately separate — see `closeAdmission()`.
+   */
+  private gatewayClosed = false;
   /**
    * #174: post-turn continuations that run after `activeTurns--` and are
    * therefore invisible to the restart drain. `quiesce()` awaits these.
@@ -1446,11 +1451,16 @@ export class Orchestrator {
     // `force` (relocate-repo) skips the drain so live ACP processes take
     // SIGTERM; turn-resume continues them after boot.
 
-    // #174: close the intake door BEFORE sampling activeTurns. Previously the
-    // dispatch watcher kept claiming specs throughout the drain and the 2s
+    // #174: close the WORK intake door BEFORE sampling activeTurns. Previously
+    // the dispatch watcher kept claiming specs throughout the drain and the 2s
     // flush wait, so the counter could reach zero while fresh work was already
     // being admitted behind it. Unclaimed specs stay in `pending/` and are
     // delivered on the next boot, so this loses nothing.
+    //
+    // NOT `closeAdmission()`. The wait below can last `RESTART_DRAIN_TIMEOUT_MS`
+    // (15 min) with the store and the gateway fully alive, and refusing Discord
+    // ingress for that whole window would take `/seam cancel` away — the one
+    // lever that ends the wedged turn this drain is waiting on.
     this.stopIntake();
 
     if (force) {
@@ -1614,24 +1624,29 @@ export class Orchestrator {
    * is counted. The gate itself lives at the CALLERS, because they do not all
    * want the same answer:
    *
-   *   gated    `handleIncomingMessage` (user message), `tryFireParked`,
-   *            `startPresetOpeningTurn`, `cmdSteer now:true` — an interactive
-   *            NEW turn admitted after the quiesce snapshot is exactly the bug.
-   *   gated    dispatch (`dispatchInjectTurn`) — upstream, by watcher intake:
+   *   intake   `tryFireParked`, `startPresetOpeningTurn`, `cmdSteer now:true`
+   *            — they open an interactive NEW turn without going through
+   *            `handleIncomingMessage`, so they check `intakeStopped` and are
+   *            already closed for the whole restart drain.
+   *   intake   dispatch (`dispatchInjectTurn`) — upstream, by watcher intake:
    *            unclaimed specs stay in `pending/` for the next boot.
    *   OPEN     `runScheduledPrompt` — deliberate. A cron fire coming due mid
    *            -drain must be able to start and EXTEND the drain; stopping
    *            cron early is what made `report-update` miss 5:25.
    *   OPEN     `refireLiveTurn` — boot-time resume, never runs during shutdown.
    *
-   * Every OTHER Discord ingress is gated too, at its own entry point:
-   * `handleSlashInteraction`, `handleAutocompleteInteraction`, the `onComponent`
-   * and `onChoiceInteraction` wrappers, and thread-delete. An earlier revision
-   * of this comment argued they were safe because `adapter.stop()` runs before
-   * `store.close()`. That was wrong: `adapter.stop()` closes the gateway but
-   * does NOT await handlers already in flight, and none of that work is tracked
-   * by any drain — so a handler admitted after the snapshot can still be
-   * mid-await when the store closes.
+   * Every Discord ingress — `handleIncomingMessage`, `handleSlashInteraction`,
+   * `handleAutocompleteInteraction`, the `onComponent` and `onChoiceInteraction`
+   * wrappers, thread-delete — is gated on the STRICTER `admissionClosed`, which
+   * only SIGTERM sets. An earlier revision of this comment argued they were safe
+   * because `adapter.stop()` runs before `store.close()`. That was wrong:
+   * `adapter.stop()` closes the gateway but does NOT await handlers already in
+   * flight, and none of that work is tracked by any drain — so a handler
+   * admitted after the snapshot can still be mid-await when the store closes.
+   *
+   * They are NOT gated on `intakeStopped`, because that door is also open for
+   * the restart drain's fifteen minutes, with the store fully alive; refusing
+   * `/seam cancel` there takes away the only lever that ends a wedged turn.
    */
   private queueOnChannel<T>(channelId: string, task: () => Promise<T>): Promise<T> {
     const existing = this.channelQueues.get(channelId) ?? Promise.resolve();
@@ -1799,14 +1814,20 @@ export class Orchestrator {
   }
 
   /**
-   * Close the intake door: no new dispatch is claimed and no scheduled prompt
-   * fires. Anything still in `dispatch/pending/` stays there and is delivered
-   * on the next boot, so stopping intake early is lossless.
+   * Close the WORK intake door: no new dispatch is claimed, no parked prompt
+   * fires, no preset opening turn or preemptive steer starts. Anything still in
+   * `dispatch/pending/` stays there and is delivered on the next boot, so
+   * stopping intake early is lossless.
    *
    * #174: this must run BEFORE the restart drain samples `activeTurns`, or the
    * watcher keeps claiming specs into the very window the drain is trying to
    * empty — observed on 2026-09-02, where a fresh dispatch started during the
    * post-drain flush wait and was still running when the store closed.
+   *
+   * Deliberately does NOT touch the Discord transport. The restart drain holds
+   * this door shut for up to `RESTART_DRAIN_TIMEOUT_MS` while the store and the
+   * gateway are fully alive, and the bot has to stay answerable during it —
+   * `closeAdmission()` is the shutdown-only lever that refuses ingress.
    */
   stopIntake(): void {
     if (this.intakeStopped) return;
@@ -1820,13 +1841,43 @@ export class Orchestrator {
     // The scheduled manager is stopped in the last beat before pm2 restart.
     this.logger.info(
       { activeTurns: this.activeTurns, inFlight: this.dispatchWatcher?.inFlightCount ?? 0 },
-      "intake stopped; no new dispatch, user turn, or parked fire will be admitted"
+      "intake stopped; no new dispatch, parked fire, preset opener or preemptive steer will be admitted"
     );
   }
 
   /**
-   * True once shutdown has closed admission — the single bound every ingress
-   * checks at handler ENTRY.
+   * Close the Discord transport as well — every gateway handler refuses from
+   * here on. Implies `stopIntake()`.
+   *
+   * SHUTDOWN ONLY. This is deliberately a second, stricter lever rather than
+   * part of `stopIntake()`, because the two doors answer different questions
+   * and are open for wildly different lengths of time:
+   *
+   *   `stopIntake()`    "do not start new WORK." The restart-sentinel drain
+   *                     calls it and then waits up to `RESTART_DRAIN_TIMEOUT_MS`
+   *                     (15 min) with the store and the gateway fully alive.
+   *   `closeAdmission()` "the store is about to close." Only true once SIGTERM
+   *                     has been received; the window is seconds.
+   *
+   * Collapsing them refused every slash command, message, component click and
+   * choice-card pick for the WHOLE drain — including `/seam cancel`, the one
+   * lever that ends a wedged turn and lets the restart proceed. The operator
+   * was told "Restarting — that command was not run" by the very restart they
+   * were trying to unblock, for up to fifteen minutes.
+   */
+  closeAdmission(): void {
+    this.stopIntake();
+    if (this.gatewayClosed) return;
+    this.gatewayClosed = true;
+    this.logger.info(
+      { inboundWork: this.inboundWork.size },
+      "gateway admission closed; Discord ingress refused"
+    );
+  }
+
+  /**
+   * True once SHUTDOWN has closed gateway admission — the single bound every
+   * Discord ingress checks at handler ENTRY.
    *
    * Entry is the only safe place. `adapter.stop()` stops future events but does
    * not cancel a handler already admitted before it, and none of that work sits
@@ -1836,10 +1887,11 @@ export class Orchestrator {
    *
    * Applied uniformly, INCLUDING read-only commands: classifying which ones are
    * "safe" would be a per-command judgement that rots the moment a command
-   * grows a store read.
+   * grows a store read. That uniformity is affordable precisely BECAUSE this is
+   * scoped to the seconds after SIGTERM — see `closeAdmission()`.
    */
   get admissionClosed(): boolean {
-    return this.intakeStopped;
+    return this.gatewayClosed;
   }
 
   /**
@@ -1982,7 +2034,10 @@ export class Orchestrator {
     timeoutMs: number,
     barrier: (onStageError: (err: unknown) => void) => Promise<void>
   ): Promise<QuiesceOutcome> {
-    this.stopIntake();
+    // Both drains are shutdown-only, so this closes the gateway too — a
+    // handler admitted after the snapshot is work the barrier is not waiting
+    // for and the store is about to close underneath.
+    this.closeAdmission();
     let timer: NodeJS.Timeout | undefined;
     let timedOut = false;
     let barrierFailed = false;

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { CardResultVault } from "../packages/core/src/core/card-result-vault.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
@@ -641,5 +642,75 @@ describe("SessionStore.compareAndSwapAcpSession", () => {
     } finally {
       store.close();
     }
+  });
+});
+
+// -------------------------------------------------------------------------
+// #179 — the private result vault
+// -------------------------------------------------------------------------
+
+describe("CardResultVault", () => {
+  const dirs: string[] = [];
+  const openVault = (ttlMs?: number) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-179-vault-"));
+    dirs.push(dir);
+    return { dir, vault: new CardResultVault(dir, silent, ttlMs) };
+  };
+  afterEach(() => {
+    for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+  });
+
+  const entry = (over: Partial<Parameters<CardResultVault["put"]>[0]> = {}) => ({
+    recordId: "discord:thread-1",
+    userId: "op",
+    label: "summary",
+    filename: "session-summary.md",
+    body: "PRIVATE SUMMARY BODY",
+    ...over,
+  });
+
+  it("hands a parked result back to its owner, exactly once", async () => {
+    const { vault } = openVault();
+    await vault.put(entry());
+
+    const first = await vault.take("discord:thread-1", "op");
+    expect(first).toHaveLength(1);
+    expect(first[0]!.body).toBe("PRIVATE SUMMARY BODY");
+    // Collected, not copied: a second read finds nothing.
+    expect(await vault.take("discord:thread-1", "op")).toHaveLength(0);
+  });
+
+  it("refuses a different operator, and a different thread", async () => {
+    const { vault } = openVault();
+    await vault.put(entry());
+
+    // The card this replaces was visible to ONE operator; matching on the
+    // record alone would hand it to whoever next opened the browser.
+    expect(await vault.take("discord:thread-1", "someone-else")).toHaveLength(0);
+    expect(await vault.take("discord:other", "op")).toHaveLength(0);
+    // Still there for the person it belongs to.
+    expect(await vault.take("discord:thread-1", "op")).toHaveLength(1);
+  });
+
+  it("survives a restart — the vault is on disk, not in memory", async () => {
+    const { dir, vault } = openVault();
+    await vault.put(entry());
+
+    const reopened = new CardResultVault(dir, silent);
+    const got = await reopened.take("discord:thread-1", "op");
+    expect(got.map((g) => g.body)).toEqual(["PRIVATE SUMMARY BODY"]);
+  });
+
+  it("drops results past their TTL instead of hoarding them", async () => {
+    const { vault } = openVault(-1); // everything is already expired
+    await vault.put(entry());
+    expect(await vault.take("discord:thread-1", "op")).toHaveLength(0);
+    // …and the expired file was swept, not left to accumulate.
+    expect(await vault.take("discord:thread-1", "op")).toHaveLength(0);
+  });
+
+  it("returns nothing, and does not throw, before anything is parked", async () => {
+    const { vault } = openVault();
+    await expect(vault.take("discord:thread-1", "op")).resolves.toEqual([]);
   });
 });

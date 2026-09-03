@@ -269,6 +269,24 @@ export class CardLifecycle {
     return true;
   }
 
+  /**
+   * Render a late job's result onto an ALREADY-SETTLED card (#179).
+   *
+   * Deliberately bypasses the settle guard, and deliberately does not touch
+   * lifecycle state. A premium compaction can finish after the collector
+   * expired: the operator paid for that answer and must still see it, while the
+   * card must not regain a single control. `refresh` cannot serve this — it is
+   * a no-op after a settle, by design, because it paints CONTROLS.
+   *
+   * Callers pass an inert view; this method does not enforce that, `settle`'s
+   * `inertView` and `completionView` do. Errors propagate, unlike every other
+   * render here, because a dead interaction token is exactly what the caller
+   * needs to see in order to fall back to another surface.
+   */
+  renderSettledResult(view: CardView): Promise<void> {
+    return this.host.render(view);
+  }
+
   /** State 4 — expired. Mark the card expired and drop every component. */
   expire(reason: string, view?: CardView): Promise<boolean> {
     return this.settle("expired", reason, view ?? this.host.expired(reason));

@@ -298,6 +298,9 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     activeTurnSettles: new Set<Promise<void>>(),
     inboundWork: new Set<Promise<void>>(),
     pendingContinuations: new Set<Promise<void>>(),
+    // #179 added a fifth kind of outstanding work to the barrier: jobs launched
+    // from an interactive card, which outlive their click handler by minutes.
+    cardJobs: new Set<Promise<void>>(),
     channelQueues: new Map<string, Promise<void>>(),
     dispatchWatcher: undefined,
     scheduledManager: undefined,
@@ -313,6 +316,9 @@ function makeQuiesceHost(over: Record<string, unknown> = {}) {
     pendingContinuations: Set<Promise<void>>;
     activeTurnSettles: Set<Promise<void>>;
     inboundWork: Set<Promise<void>>;
+    cardJobs: Set<Promise<void>>;
+    settleCardJobs(): Promise<void>;
+    trackCardJob(p: Promise<void>): void;
     runInbound(
       label: string,
       run: () => Promise<void>,
@@ -2692,6 +2698,165 @@ describe("#174 an admitted gateway handler is part of quiescence", () => {
     await untracked;
     await flush();
     expect(store.violations).toContain("getDelegation");
+  });
+});
+
+/**
+ * #179 — a card job is the fifth kind of outstanding work.
+ *
+ * A premium compaction launched from `/seam info sessions` runs for MINUTES
+ * after its click handler returned. It sits in no channel queue, is no
+ * registered turn, and registers no post-turn continuation, so before it was a
+ * barrier stage the shutdown drain could report a perfectly clean pass while
+ * one was mid-pipeline — and then close the store underneath its
+ * compare-and-swap. That is the #174 failure on a surface #174 predates.
+ */
+describe("#179 card jobs hold the shutdown barrier", () => {
+  it("a held card job keeps quiesce from reporting drained", async () => {
+    const host = makeQuiesceHost();
+    const job = deferred();
+    host.trackCardJob(job.promise);
+    expect(host.cardJobs.size).toBe(1);
+
+    let outcome: { drained: boolean } | undefined;
+    const phase = host.quiesce({ timeoutMs: 5000 }).then((r) => (outcome = r));
+    await flush();
+    expect(outcome).toBeUndefined(); // genuinely held, not merely slow
+
+    job.resolve();
+    await phase;
+    expect(outcome!.drained).toBe(true);
+    expect(host.cardJobs.size).toBe(0);
+  });
+
+  it("phase 2 holds for it too — disposal can leave one running", async () => {
+    const host = makeQuiesceHost();
+    const job = deferred();
+    host.trackCardJob(job.promise);
+
+    let done = false;
+    const phase = host.drainAfterDispose({ timeoutMs: 5000 }).then((r) => ((done = true), r));
+    await flush();
+    expect(done).toBe(false);
+
+    job.resolve();
+    expect((await phase).drained).toBe(true);
+  });
+
+  it("AWAITS the job rather than polling for it", async () => {
+    // Without the dedicated stage the barrier still terminates — the quiet
+    // condition eventually goes true — but it gets there by spinning the whole
+    // loop, `setImmediate` after `setImmediate`, for the entire ten minutes a
+    // premium compaction runs. #174 added that condition precisely so a drain
+    // could not burn CPU waiting; the stage is what makes this a wait.
+    //
+    // One loop pass ⇒ one watcher drain. A spin shows up as many.
+    let passes = 0;
+    const host = makeQuiesceHost({
+      dispatchWatcher: {
+        stop: () => {},
+        inFlightCount: 0,
+        drain: async () => {
+          passes++;
+        },
+      },
+    });
+    const job = deferred();
+    host.trackCardJob(job.promise);
+
+    const phase = host.quiesce({ timeoutMs: 5000 });
+    await flush(20);
+    expect(passes).toBe(1);
+
+    job.resolve();
+    expect((await phase).drained).toBe(true);
+  });
+
+  it("a job registered after the card stage still re-arms the loop", async () => {
+    // The stage drains to its own fixpoint, so it catches anything registered
+    // WHILE it runs. What it cannot catch is a registration that lands in the
+    // yield between the last stage and the quiet check — a settling render
+    // scheduling one more. That gap is what the `cardJobs.size` term closes.
+    const host = makeQuiesceHost();
+    const late = deferred();
+    const first = deferred();
+    host.trackCardJob(
+      first.promise.then(() => {
+        // Scheduled, not registered: this lands after the stage has finished.
+        setImmediate(() => host.trackCardJob(late.promise));
+      })
+    );
+
+    let done = false;
+    const phase = host.quiesce({ timeoutMs: 5000 }).then((r) => ((done = true), r));
+    await flush();
+    first.resolve();
+    await flush();
+    expect(done).toBe(false); // the late registration re-armed the loop
+
+    late.resolve();
+    expect((await phase).drained).toBe(true);
+  });
+
+  it("a card job registered by another card job re-arms the fixpoint", async () => {
+    // A completion can start another render, which is itself tracked. One pass
+    // over the set is not enough.
+    const host = makeQuiesceHost();
+    const first = deferred();
+    const second = deferred();
+    host.trackCardJob(
+      first.promise.then(() => {
+        host.trackCardJob(second.promise);
+      })
+    );
+
+    let done = false;
+    const phase = host.quiesce({ timeoutMs: 5000 }).then((r) => ((done = true), r));
+    await flush();
+    first.resolve();
+    await flush();
+    expect(done).toBe(false); // the follow-on job is holding it now
+
+    second.resolve();
+    expect((await phase).drained).toBe(true);
+  });
+
+  it("times out honestly rather than hanging on a wedged card job", async () => {
+    const host = makeQuiesceHost();
+    host.trackCardJob(new Promise<void>(() => {})); // never settles
+    const out = await host.quiesce({ timeoutMs: 30 });
+    expect(out.timedOut).toBe(true);
+    expect(out.drained).toBe(false);
+  });
+
+  it("NEGATIVE CONTROL: without the stage, the same drain reports CLEAN", async () => {
+    // The pre-#179 barrier: `cardJobs` existed but `settleAllWork` neither
+    // awaited it nor counted it in the quiet condition. Model exactly that by
+    // neutralising the stage and the termination term, and the identical held
+    // job becomes invisible — `drained: true` with a compaction still running.
+    const host = makeQuiesceHost({
+      settleCardJobs: async () => {},
+      cardJobs: {
+        size: 0,
+        add() {},
+        delete() {},
+        [Symbol.iterator]: function* () {},
+      },
+    });
+    const job = deferred();
+    let touchedStoreAfterDrain = false;
+    const running = job.promise.then(() => {
+      touchedStoreAfterDrain = true;
+    });
+
+    const out = await host.quiesce({ timeoutMs: 1000 });
+    expect(out.drained).toBe(true); // …and it is lying
+
+    job.resolve();
+    await running;
+    await flush();
+    // The work the drain claimed was finished ran AFTER shutdown moved on.
+    expect(touchedStoreAfterDrain).toBe(true);
   });
 });
 

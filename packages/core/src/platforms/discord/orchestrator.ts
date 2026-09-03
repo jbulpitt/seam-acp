@@ -467,6 +467,7 @@ import {
 import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { SerialQueue } from "../../core/serial-queue.js";
+import { CardResultVault, type StoredCardResult } from "../../core/card-result-vault.js";
 import { StreamingPanel } from "../../core/streaming-panel.js";
 import { StreamingMessageRenderer } from "../../core/streaming-message-renderer.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
@@ -542,6 +543,13 @@ export type CardFallbackKind = "compaction" | "rebuild" | "summary" | "migration
  * (`postCardFallback`); this is only the "your card is gone, here is what
  * happened" line.
  */
+/**
+ * Appended when a result was parked for private collection. Says that
+ * something is waiting and how to get it — never what it is.
+ */
+export const CARD_RESULT_PARKED_NOTICE =
+  "The result is held privately for you — run `/seam info sessions` in this thread to collect it.";
+
 export const CARD_FALLBACK_TEXT: Record<CardFallbackKind, { ok: string; failed: string }> = {
   compaction: {
     ok: "🗳️ Your compaction finished, but the session browser expired before it could be shown. The new session is saved — run `/seam info sessions` to see and attach it.",
@@ -552,7 +560,7 @@ export const CARD_FALLBACK_TEXT: Record<CardFallbackKind, { ok: string; failed: 
     failed: "🏗️ Your session rebuild failed, and the session browser expired before the error could be shown. Nothing was changed; check the bot logs for details.",
   },
   summary: {
-    ok: "🪄 Your AI summary finished, but the session browser expired before it could be shown — it is attached here so it is not lost.",
+    ok: "🪄 Your AI summary finished, but the session browser expired before it could be shown.",
     failed: "🪄 Your AI summary failed, and the session browser expired before the error could be shown. Check the bot logs for details.",
   },
   migration: {
@@ -684,6 +692,8 @@ export class Orchestrator {
   private readonly configMutation: ConfigMutationService;
   private readonly threadNamerConfig: ThreadNamerConfigStore;
   private readonly threadNamer: ThreadNamer;
+  /** #179: private hand-off for results whose card died before showing them. */
+  private readonly cardResults: CardResultVault;
 
   /**
    * #174: one settle-promise per in-flight turn.
@@ -838,6 +848,7 @@ export class Orchestrator {
       path.join(this.config.DATA_DIR, "thread-namer.json"),
       this.logger
     );
+    this.cardResults = new CardResultVault(this.config.DATA_DIR, this.logger);
     this.threadNamer = new ThreadNamer({
       getConfig: () => this.threadNamerConfig.get(),
       describeConfig: (record) => this.router.describeConfig(record),
@@ -2031,7 +2042,7 @@ export class Orchestrator {
    * The single definition of "no work is outstanding", shared by both shutdown
    * phases so they can never drift apart.
    *
-   * Four kinds of outstanding work, and they are not nested:
+   * Five kinds of outstanding work, and they are not nested:
    *   - claimed dispatches — the watcher's per-target queues; their report-back
    *     and chain advance are awaited inside the queue task, so this covers
    *     those side effects too;
@@ -2043,7 +2054,10 @@ export class Orchestrator {
    *     running fire is referenced by nothing else, and its `finally` still has
    *     a schedule-status patch to write;
    *   - tracked post-turn continuations — the fire-and-forget work that runs
-   *     after a turn is released and is therefore invisible to the turn set.
+   *     after a turn is released and is therefore invisible to the turn set;
+   *   - tracked CARD jobs (#179) — a premium compaction, rebuild, AI summary,
+   *     migration or import launched from an interactive card. These outlive
+   *     their click handler by minutes and belong to none of the sets above.
    *
    * Runs to a real fixpoint over all four: settling one can create another (a
    * finishing dispatch enqueues a report-back; a queue release fires a parked
@@ -2071,6 +2085,15 @@ export class Orchestrator {
       await stage(() => Promise.allSettled([...this.activeTurnSettles]));
       await stage(() => Promise.allSettled([...this.inboundWork]));
       await stage(() => this.settleTrackedContinuations());
+      // #179: card jobs are the fifth kind of outstanding work, and the only
+      // one that is neither a turn nor a continuation: a premium compaction
+      // launched from `/seam info sessions` runs for MINUTES after the click
+      // handler that started it returned. It sits in no channel queue, is no
+      // registered turn, and registers no post-turn continuation — so before
+      // this stage existed, shutdown could report a perfectly clean drain while
+      // one was mid-pipeline, and then close the store underneath its
+      // compare-and-swap. Exactly the #174 failure, on a surface #174 predates.
+      await stage(() => this.settleCardJobs());
 
       // Every stage got its chance; now stop. Looping on a failing stage would
       // spin the CPU until the deadline for no benefit — a stage that threw
@@ -2090,6 +2113,7 @@ export class Orchestrator {
         this.activeTurnSettles.size === 0 &&
         this.pendingContinuations.size === 0 &&
         this.inboundWork.size === 0 &&
+        this.cardJobs.size === 0 &&
         (this.dispatchWatcher?.inFlightCount ?? 0) === 0
       ) {
         return;
@@ -4635,6 +4659,16 @@ export class Orchestrator {
        * binds a thread that is currently disconnected.
        */
       attachIntent?: AttachIntent;
+      /**
+       * #179: the thread's binding as it was when the operator's ACTION was
+       * admitted, not when this method was entered. A button handler defers the
+       * interaction and repaints a progress card before it ever reaches here —
+       * two round trips in which the operator can attach something else — so
+       * the caller that owns the click is the only one that can sample the real
+       * "before". Defaults to a read at entry for programmatic callers, which
+       * have no earlier moment.
+       */
+      observedAtStart?: string;
     }
   ): Promise<{
     newSessionId: string;
@@ -4676,7 +4710,7 @@ export class Orchestrator {
     // `record.acpSessionId` at completion time would compare the world against
     // a value the world had already moved, and the change detection below would
     // see nothing. This is the immutable "before" of the whole operation.
-    const observedAtStart = record.acpSessionId;
+    const observedAtStart = opts?.observedAtStart ?? record.acpSessionId;
 
     const result =
       source === "discord"
@@ -9464,16 +9498,38 @@ export class Orchestrator {
     collector: { stop(reason?: string): void },
     expired: (reason: string) => CardView
   ): CardLifecycle {
+    // #179: ONE FIFO for every render this card will ever make — progress
+    // frames, refreshes, settles and the collector's own expiry.
+    //
+    // Two bugs live in the gap between issuing an edit and Discord acking it.
+    // Ordering: a progress frame issued at T=0 and a terminal completion issued
+    // at T=1 are two independent REST calls, so under per-route backoff the
+    // progress edit can land last and the operator's final view is a stale
+    // "compacting…". Observability: a fire-and-forget `void lifecycle.refresh`
+    // is invisible to shutdown, so the store can close while an edit is in
+    // flight. Serialising and tracking here fixes both for every card at once,
+    // rather than one call site at a time.
+    //
+    // NOTHING may wrap a whole job in `renderQueue.run` — a job renders from
+    // inside, and a nested `run` on the same queue waits for a tail that
+    // contains itself. Only leaf renders are queued.
+    const renderQueue = new SerialQueue();
     return attachCardLifecycle(collector as StoppableCollector, {
-      render: async (view) => {
-        await i.editReply(view as InteractionEditReplyOptions);
-      },
+      render: (view) =>
+        // Tracked copy for shutdown; the ORIGINAL is returned so a caller that
+        // needs to see a dead interaction token (`renderSettledResult`) still
+        // does, instead of getting the swallowed one.
+        this.trackedCardWork(
+          renderQueue.run(async () => {
+            await i.editReply(view as InteractionEditReplyOptions);
+          })
+        ),
       expired,
       onError: (err, phase, reason) => {
         this.logger.debug({ err, phase, reason }, "card lifecycle render skipped");
       },
-      // The expiry render is triggered by an event, so it is fire-and-forget
-      // like the jobs below; track it in the same set.
+      // `handleEnd` is triggered by an event, so it is fire-and-forget like the
+      // jobs below; track the whole settle, not just its render.
       track: (settling) => this.trackCardJob(settling),
     });
   }
@@ -9490,6 +9546,19 @@ export class Orchestrator {
    * available test for "did the expired card stay inert?" was a timer.
    */
   private readonly cardJobs = new Set<Promise<void>>();
+
+  /**
+   * Track `work` for shutdown and hand the ORIGINAL promise back.
+   *
+   * The tracked copy swallows errors so the drain always completes; the
+   * returned one does not, so a caller that must react to a failure — a dead
+   * interaction token, say — still can. Same shape as `runInbound` (#174), and
+   * for the same reason: tracking is not an error boundary.
+   */
+  private trackedCardWork(work: Promise<void>): Promise<void> {
+    this.trackCardJob(work);
+    return work;
+  }
 
   /** Register an already-running card promise. Never rejects to the caller. */
   private trackCardJob(work: Promise<void>): void {
@@ -9548,8 +9617,6 @@ export class Orchestrator {
    */
   private async settleLongJobCard(opts: {
     lifecycle: CardLifecycle;
-    /** Renders on the ORIGINAL interaction — the same target the lifecycle uses. */
-    render: (view: CardView) => Promise<void>;
     /** The result card, controls included. Stripped automatically when settled. */
     view: CardView;
     /**
@@ -9564,11 +9631,16 @@ export class Orchestrator {
     /** Where to post if the card cannot be edited at all. */
     channel: ChannelRef | null;
     /** WHICH fixed sentence the thread gets — never free text. See the table. */
-    fallback: { kind: CardFallbackKind; outcome: "ok" | "failed" };
+    fallback: {
+      kind: CardFallbackKind;
+      outcome: "ok" | "failed";
+      recordId?: string;
+      userId?: string;
+    };
     /**
-     * Content that would otherwise die with the card. Delivered as a file so a
-     * result the operator paid for survives an expired token — an AI summary
-     * exists nowhere else once the card is gone.
+     * Content that would otherwise die with the card — an AI summary exists
+     * nowhere else once the card is gone. PARKED for private collection, never
+     * posted: see `postCardFallback`.
      */
     fallbackFile?: { filename: string; body: string };
   }): Promise<"live" | "inert" | "fallback"> {
@@ -9591,7 +9663,10 @@ export class Orchestrator {
         return opts.lifecycle.refresh(shaped);
       }
       try {
-        await opts.render(shaped);
+        // Bypasses the settle guard on purpose — `refresh` paints CONTROLS and
+        // is correctly inert here, but the operator's RESULT still has to
+        // arrive. Errors propagate so a dead token reaches the fallback.
+        await opts.lifecycle.renderSettledResult(shaped);
         return true;
       } catch (err) {
         this.logger.debug({ err }, "long job: settled-card render failed");
@@ -9629,29 +9704,78 @@ export class Orchestrator {
    */
   private async postCardFallback(
     channel: ChannelRef | null,
-    fallback: { kind: CardFallbackKind; outcome: "ok" | "failed" },
+    fallback: {
+      kind: CardFallbackKind;
+      outcome: "ok" | "failed";
+      /** Who may collect the parked result, and from where. */
+      recordId?: string;
+      userId?: string;
+    },
     file?: { filename: string; body: string }
   ): Promise<void> {
-    if (!channel) return;
-    const text = CARD_FALLBACK_TEXT[fallback.kind][fallback.outcome];
-    if (this.adapter.sendMessage) {
-      try {
-        await this.adapter.sendMessage(channel, text);
-      } catch (err) {
-        this.logger.warn({ err, kind: fallback.kind }, "card fallback notice failed");
-      }
-    }
-    if (file && this.adapter.sendFile) {
-      try {
-        await this.adapter.sendFile(channel, {
-          data: Buffer.from(file.body, "utf8"),
+    // The RESULT is parked privately; only a fixed, contentless sentence goes
+    // to the thread. The card was ephemeral — visible to one operator — and a
+    // timeout is not consent to publish its contents to the whole channel.
+    // There is no code path from `file` to `sendMessage`/`sendFile` here, which
+    // is a stronger guarantee than remembering to redact.
+    let parked = false;
+    if (file && fallback.recordId && fallback.userId) {
+      parked =
+        (await this.cardResults.put({
+          recordId: fallback.recordId,
+          userId: fallback.userId,
+          label: fallback.kind,
           filename: file.filename,
-          mimeType: "text/markdown",
+          body: file.body,
+        })) !== null;
+    }
+    if (!channel || !this.adapter.sendMessage) return;
+    const text = CARD_FALLBACK_TEXT[fallback.kind][fallback.outcome];
+    try {
+      await this.adapter.sendMessage(
+        channel,
+        parked ? `${text}\n${CARD_RESULT_PARKED_NOTICE}` : text
+      );
+    } catch (err) {
+      this.logger.warn({ err, kind: fallback.kind }, "card fallback notice failed");
+    }
+  }
+
+  /**
+   * Hand back anything parked for THIS operator on THIS thread (#179).
+   *
+   * Called when the browser opens, which is the authenticated moment: the
+   * operator ran the command themselves, and the reply is ephemeral, so the
+   * result returns to exactly the audience it was generated for. Best-effort —
+   * a delivery failure must not stop the browser from opening.
+   */
+  private async deliverParkedCardResults(
+    i: ChatInputCommandInteraction,
+    recordId: string
+  ): Promise<number> {
+    let parked: StoredCardResult[];
+    try {
+      parked = await this.cardResults.take(recordId, i.user.id);
+    } catch (err) {
+      this.logger.warn({ err, recordId }, "parked card results could not be read");
+      return 0;
+    }
+    let delivered = 0;
+    for (const entry of parked) {
+      try {
+        await i.followUp({
+          content: `📦 A result from an earlier session-browser action, held for you: **${entry.label}**.`,
+          files: [
+            new AttachmentBuilder(Buffer.from(entry.body, "utf8"), { name: entry.filename }),
+          ],
+          flags: MessageFlags.Ephemeral,
         });
+        delivered++;
       } catch (err) {
-        this.logger.warn({ err, kind: fallback.kind }, "card fallback file failed");
+        this.logger.warn({ err, recordId, entry: entry.id }, "parked card result delivery failed");
       }
     }
+    return delivered;
   }
 
   /**
@@ -14008,6 +14132,12 @@ export class Orchestrator {
       return record.acpSessionId;
     };
 
+    // #179: anything a previous run parked for THIS operator on THIS thread is
+    // handed back here — an authenticated moment (they ran the command) with an
+    // ephemeral reply (only they see it), which is the audience the result was
+    // generated for in the first place.
+    await this.deliverParkedCardResults(i, record.id);
+
     // Render first session in the list
     const msg = await i.editReply(makeSessionMessageOptions(currentIndex, sessions, activeSessionId(), manager));
 
@@ -14092,15 +14222,22 @@ export class Orchestrator {
 
         let lastEdit = 0;
         let editing = false;
+        /**
+         * Set SYNCHRONOUSLY the moment the pipeline returns, before anything is
+         * awaited. Enqueue order is what fixes render order (`SerialQueue`), so
+         * the only way a progress frame can outlive the result is by being
+         * enqueued after it. A pipeline that keeps calling `onProgress` from a
+         * retained callback after resolving would do exactly that.
+         */
+        let sealed = false;
         const lines: string[] = [];
         const pushProgress = (m: string) => {
           lines.push(m);
-          // Progress goes through the LIFECYCLE, never a raw edit. That is what
-          // stops a frame from landing on a card the collector already expired
-          // — `CardLifecycle.refresh` is a no-op once the card has settled, so
-          // the expiry notice stays the last word instead of being overwritten
-          // by something that reads as a live card again.
-          if (editing) return;
+          // Progress goes through the LIFECYCLE, never a raw edit: `refresh` is
+          // a no-op once the card has settled, so the expiry notice stays the
+          // last word, and the host render puts this frame in the card's single
+          // FIFO where it cannot overtake the result.
+          if (sealed || editing) return;
           const now = Date.now();
           if (now - lastEdit < STATUS_EDIT_DEBOUNCE_MS) return;
           editing = true;
@@ -14122,6 +14259,7 @@ export class Orchestrator {
 
         try {
           const res = await opts.run(pushProgress);
+          sealed = true;
           // Re-list so the browser can position on the seeded session; its
           // Attach button is then one click away when the binding was left
           // deliberately alone.
@@ -14146,9 +14284,6 @@ export class Orchestrator {
 
           await this.settleLongJobCard({
             lifecycle,
-            render: async (view) => {
-              await i.editReply(view as InteractionEditReplyOptions);
-            },
             view: {
               embeds: [successEmbed],
               components: [backRow()],
@@ -14160,6 +14295,7 @@ export class Orchestrator {
             fallback: { kind: "compaction", outcome: "ok" },
           });
         } catch (err: unknown) {
+          sealed = true;
           const message = (err as Error)?.message ?? String(err);
           this.logger.error(
             { err, sessionId: opts.session.sessionId, customId: opts.successTitle },
@@ -14173,9 +14309,6 @@ export class Orchestrator {
           // must not regain a Back button just because the job errored.
           await this.settleLongJobCard({
             lifecycle,
-            render: async (view) => {
-              await i.editReply(view as InteractionEditReplyOptions);
-            },
             view: { embeds: [errorEmbed], components: [backRow()] },
             channel: browserChannel ?? null,
             fallback: { kind: "compaction", outcome: "failed" },
@@ -14459,9 +14592,6 @@ export class Orchestrator {
             // lifecycle or it repaints a Close button onto an expired card.
             await this.settleLongJobCard({
               lifecycle,
-              render: async (view) => {
-                await i.editReply(view as InteractionEditReplyOptions);
-              },
               view: {
                 embeds: [successEmbed],
                 components: [
@@ -14486,9 +14616,6 @@ export class Orchestrator {
 
             await this.settleLongJobCard({
               lifecycle,
-              render: async (view) => {
-                await i.editReply(view as InteractionEditReplyOptions);
-              },
               view: { embeds: [errorEmbed], components: [backRow()] },
               channel: browserChannel ?? null,
               fallback: { kind: "rebuild", outcome: "failed" },
@@ -14600,15 +14727,19 @@ export class Orchestrator {
 
               await this.settleLongJobCard({
                 lifecycle,
-                render: async (view) => {
-                  await i.editReply(view as InteractionEditReplyOptions);
-                },
                 view: { embeds: [summaryEmbed], components: [backRow()] },
                 channel: browserChannel ?? null,
-                fallback: { kind: "summary", outcome: "ok" },
-                // #179: a summary exists NOWHERE else. A "your summary is
-                // ready" notice with the summary discarded is the same silent
-                // loss this issue is about, one surface over.
+                fallback: {
+                  kind: "summary",
+                  outcome: "ok",
+                  recordId: record.id,
+                  userId: i.user.id,
+                },
+                // #179: a summary exists NOWHERE else. Discarding it behind a
+                // "your summary is ready" notice is the same silent loss this
+                // issue is about, one surface over — and POSTING it would
+                // promote an ephemeral, one-operator result to the whole
+                // channel. Parked for private collection instead.
                 fallbackFile: { filename: "session-summary.md", body: summaryText },
               });
             } catch (err: any) {
@@ -14621,9 +14752,6 @@ export class Orchestrator {
 
               await this.settleLongJobCard({
                 lifecycle,
-                render: async (view) => {
-                  await i.editReply(view as InteractionEditReplyOptions);
-                },
                 view: { embeds: [errorEmbed], components: [backRow()] },
                 channel: browserChannel ?? null,
                 fallback: { kind: "summary", outcome: "failed" },
@@ -14646,6 +14774,17 @@ export class Orchestrator {
         customId === "sessions:premium" ||
         customId === "sessions:premium_discord"
       ) {
+        // #179: the binding as it was at ADMISSION — the instant the click was
+        // accepted, before `deferUpdate`, before the progress repaint, before
+        // any await at all. The store read is synchronous, so nothing can
+        // interleave ahead of it.
+        //
+        // Anywhere later is already too late. `deferUpdate` and the initial
+        // repaint are round trips to Discord; the operator can hit **Attach**
+        // inside that window, and a "before" sampled after it would record
+        // their new choice as the baseline and then quietly overwrite it as if
+        // nothing had moved.
+        const observedAtStart = activeSessionId();
         await btnInteraction.deferUpdate();
         const session = sessions[currentIndex];
         if (session) {
@@ -14673,11 +14812,6 @@ export class Orchestrator {
                     `Compaction is not supported for agent profile \`${record.agentId}\` (no summarizer model).`
                   );
                 }
-                // #179: before the FIRST await, not after. `record` is the
-                // browser's live snapshot and is written back to on completion,
-                // so reading it later compares the world against a value that
-                // has already followed it.
-                const observedAtStart = record.acpSessionId;
                 const built = await this.buildDefaultCompactionSeed({
                   profile,
                   manager,
@@ -14745,6 +14879,8 @@ export class Orchestrator {
                   sessionId: session.sessionId,
                   ...(browserChannel ? { channel: browserChannel } : {}),
                   attachIntent: "attach",
+                  // Admission-time, from the click handler — see above.
+                  observedAtStart,
                   onProgress,
                 });
                 const reportName =
@@ -14917,9 +15053,6 @@ export class Orchestrator {
             // button either.
             await this.settleLongJobCard({
               lifecycle,
-              render: async (view) => {
-                await i.editReply(view as InteractionEditReplyOptions);
-              },
               view: { embeds: [successEmbed], components: [backRow()] },
               channel: browserChannel ?? null,
               fallback: { kind: "import", outcome: "ok" },
@@ -14932,9 +15065,6 @@ export class Orchestrator {
               .setColor(0xe74c3c);
             await this.settleLongJobCard({
               lifecycle,
-              render: async (view) => {
-                await i.editReply(view as InteractionEditReplyOptions);
-              },
               view: { embeds: [errorEmbed], components: [backRow()] },
               channel: browserChannel ?? null,
               fallback: { kind: "import", outcome: "failed" },
@@ -15135,9 +15265,6 @@ export class Orchestrator {
               // branch where losing the message matters MOST.
               await this.settleLongJobCard({
                 lifecycle,
-                render: async (view) => {
-                  await i.editReply(view as InteractionEditReplyOptions);
-                },
                 view: { embeds: [successEmbed], components: [] },
                 mode: "terminal",
                 reason: "migrated",
@@ -15157,9 +15284,6 @@ export class Orchestrator {
               // just as long-running as the compaction that reported this bug.
               await this.settleLongJobCard({
                 lifecycle,
-                render: async (view) => {
-                  await i.editReply(view as InteractionEditReplyOptions);
-                },
                 view: { embeds: [errorEmbed], components: [backRow()] },
                 channel: browserChannel ?? null,
                 fallback: { kind: "migration", outcome: "failed" },

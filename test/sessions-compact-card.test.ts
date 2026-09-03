@@ -30,7 +30,10 @@
  *                  which is precisely why the only way to observe them was a
  *                  timer.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterAll } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { pino } from "pino";
 
 /**
@@ -87,7 +90,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
   };
 });
 
-const { Orchestrator, CARD_FALLBACK_TEXT } = await import(
+const { Orchestrator, CARD_FALLBACK_TEXT, CARD_RESULT_PARKED_NOTICE } = await import(
   "../packages/core/src/platforms/discord/orchestrator.js"
 );
 const { hasEnabledComponents } = await import(
@@ -96,10 +99,15 @@ const { hasEnabledComponents } = await import(
 const { describeAttachOutcome, planSessionAttachment } = await import(
   "../packages/core/src/core/session-attach.js"
 );
+const { MessageFlags } = await import("discord.js");
 type SessionRecord = import("../packages/core/src/core/types.js").SessionRecord;
 type Logger = import("../packages/core/src/lib/logger.js").Logger;
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
+
+/** One scratch DATA_DIR per test file run; the result vault lives under it. */
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-179-card-"));
+afterAll(() => fs.rmSync(dataDir, { recursive: true, force: true }));
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
@@ -112,6 +120,16 @@ function deferred<T>() {
   promise.catch(() => {});
   return { promise, resolve, reject };
 }
+
+/**
+ * Drain the microtask queue. Deterministic — every await in the paths under
+ * test is on an already-resolved promise, so this is ordering, not timing.
+ * Deliberately NOT `setTimeout`: a macrotask hop would let real I/O interleave
+ * and turn an ordering assertion back into a race.
+ */
+const microtasks = async (turns = 25) => {
+  for (let n = 0; n < turns; n++) await Promise.resolve();
+};
 
 const summaryRow = (sessionId: string) => ({
   sessionId,
@@ -131,8 +149,9 @@ class FakeCollector {
   private collectListeners: Array<(evt: unknown) => Promise<void>> = [];
 
   constructor(
-    private readonly edit: (payload: unknown) => void,
-    private readonly modal: () => unknown
+    private readonly edit: (payload: unknown) => Promise<void>,
+    private readonly modal: () => unknown,
+    private readonly onDefer: () => void = () => {}
   ) {}
 
   on(event: "end" | "collect", listener: (...args: never[]) => unknown): this {
@@ -166,8 +185,14 @@ class FakeCollector {
       user: { id: "op" },
       isStringSelectMenu: () => Boolean(values),
       values: values ?? [],
-      deferUpdate: async () => {},
-      editReply: async (payload: unknown) => this.edit(payload),
+      // Acking the click is itself a round trip to Discord — a window in which
+      // the operator can still press another button.
+      deferUpdate: async () => {
+        this.onDefer();
+      },
+      editReply: async (payload: unknown) => {
+        await this.edit(payload);
+      },
       followUp: async () => {},
       reply: async () => {},
       deleteReply: async () => {},
@@ -182,6 +207,15 @@ class FakeCollector {
 interface HarnessOpts {
   bound?: string;
   sessions?: string[];
+  /** Who is driving the browser — retrieval is keyed on this. */
+  userId?: string;
+  /** DATA_DIR, so two harnesses can share one result vault. */
+  dataDir?: string;
+  /** Hold the Nth render (1-based), so a click can land inside a repaint. */
+  holdRenderNo?: number;
+  holdUntil?: Promise<void>;
+  /** Runs while the click is being ACKed — before any repaint exists. */
+  onDeferUpdate?: (bound: { value: string }) => void;
   /** Kill the interaction token after the browser is open (Discord's 15 min). */
   killTokenAfterOpen?: boolean;
   onCasRead?: (cell: { value: string }) => void;
@@ -248,7 +282,13 @@ function makeHarness(opts: HarnessOpts = {}) {
   const threadMessages: string[] = [];
   const threadFiles: Array<{ filename: string; body: string }> = [];
   const tokenDead = { value: false };
-  const paint = (payload: unknown) => {
+  let rendersSeen = 0;
+  const paint = async (payload: unknown) => {
+    rendersSeen++;
+    // The card's real edits are round trips. Holding the FIRST one models the
+    // window between admitting a click and its progress card landing — the
+    // window in which the operator can still press Attach.
+    if (opts.holdUntil && rendersSeen === (opts.holdRenderNo ?? 2)) await opts.holdUntil;
     if (tokenDead.value) throw new Error("Unknown Webhook");
     renders.push(payload);
   };
@@ -258,20 +298,32 @@ function makeHarness(opts: HarnessOpts = {}) {
     user: { id: "op" },
     reply: async () => {},
     deferUpdate: async () => {},
-    editReply: async (payload: unknown) => paint(payload),
+    editReply: async (payload: unknown) => {
+      await paint(payload);
+    },
   };
 
-  const collector = new FakeCollector(paint, () => modalSubmission);
+  const collector = new FakeCollector(paint, () => modalSubmission, () =>
+    opts.onDeferUpdate?.(bound)
+  );
+  /** The card's real `CardLifecycle`, captured as `cmdSessions` builds it. */
+  let lifecycle!: import("../packages/core/src/platforms/discord/collector-lifecycle.js").CardLifecycle;
   const msg = { createMessageComponentCollector: () => collector };
 
+  /** Ephemeral follow-ups: the PRIVATE surface, visible only to the invoker. */
+  const followUps: any[] = [];
   const interaction = {
     channelId: "thread-1",
     channel: null,
-    user: { id: "op" },
+    user: { id: opts.userId ?? "op" },
     deferReply: async () => {},
     editReply: async (payload: any) => {
-      paint(payload);
+      await paint(payload);
       return msg;
+    },
+    followUp: async (payload: any) => {
+      followUps.push(payload);
+      return { id: "fu1" };
     },
     deleteReply: async () => {},
     options: { getSubcommand: () => "sessions" },
@@ -291,7 +343,7 @@ function makeHarness(opts: HarnessOpts = {}) {
   const orch = new Orchestrator({
     logger: silent,
     config: {
-      DATA_DIR: "/tmp/none",
+      DATA_DIR: opts.dataDir ?? dataDir,
       REPOS_ROOT: "/repo",
       DEFAULT_MODEL: "default",
       CLAUDE_COMPACTION_MODEL: "claude-opus-4.8",
@@ -331,8 +383,29 @@ function makeHarness(opts: HarnessOpts = {}) {
     return "acp-new";
   };
   (orch as any).applyThreadName = async () => {};
+  // Capture the REAL lifecycle `cmdSessions` builds — not a stand-in — so a
+  // test can issue a render through exactly the path production uses.
+  const attachReal = (orch as any).attachListLifecycle.bind(orch);
+  (orch as any).attachListLifecycle = (...args: unknown[]) => {
+    lifecycle = attachReal(...args);
+    return lifecycle;
+  };
   // The runtime-backed jobs (summary / migrate / import) signal entry here.
   runtime.onStart = () => entered.resolve();
+
+  /**
+   * Resolves the moment the job reaches `settleLongJobCard` — i.e. it has
+   * finished everything else (including the report file write, which is real
+   * I/O) and is about to issue its RESULT edit. A production entry point, not a
+   * drain: the whole question under test is what happens between "about to
+   * render" and "rendered".
+   */
+  const settleEntered = deferred<void>();
+  const realSettleLongJobCard = (orch as any).settleLongJobCard.bind(orch);
+  (orch as any).settleLongJobCard = (o: unknown) => {
+    settleEntered.resolve();
+    return realSettleLongJobCard(o);
+  };
 
   const attachViaPrimitive = (newId = "acp-new") =>
     (orch as any).attachCompactedSession({
@@ -355,7 +428,15 @@ function makeHarness(opts: HarnessOpts = {}) {
     settle: () => (orch as any).settleCardJobs() as Promise<void>,
     killToken: () => void (tokenDead.value = true),
     collector,
+    /** Edits STARTED, including any still in flight. */
+    rendersSeen: () => rendersSeen,
+    /** Resolves when the job is about to issue its result edit. */
+    aboutToRenderResult: settleEntered.promise,
+    get lifecycle() {
+      return lifecycle;
+    },
     renders,
+    followUps,
     threadMessages,
     threadFiles,
     invalidated,
@@ -853,6 +934,161 @@ describe("#179 sessions:import_to_cwd exits", () => {
 });
 
 // ---------------------------------------------------------------------------
+// B2. Render ordering, and the admission-time "before"
+// ---------------------------------------------------------------------------
+
+describe("#179 renders serialize; the result is the last word", () => {
+  it("the result edit cannot even BEGIN while an earlier one is in flight", async () => {
+    // Two independent REST edits: under per-route backoff the earlier one can
+    // finish last, and the operator's final view becomes a stale "compacting…".
+    // The fix is that they are not independent — one FIFO per card — so the
+    // observable property is that the result edit does not START until the
+    // progress edit it was queued behind has landed.
+    const held = deferred<void>();
+    const h = makeHarness({ holdRenderNo: 3, holdUntil: held.promise });
+    await h.open();
+    await h.collector.click("sessions:premium");
+    await h.started;
+
+    const onProgress = h.compactCalls[0].opts.onProgress as (m: string) => void;
+    onProgress("halfway"); // edit #3 — parked mid-flight
+    await microtasks();
+    expect(h.rendersSeen()).toBe(3);
+
+    // Let the job run all the way to the point of issuing its result…
+    const attachment = await h.attachViaPrimitive();
+    h.addSession("acp-new");
+    h.pipeline.resolve({
+      newSessionId: "acp-new",
+      originalSessionId: "acp-source",
+      wasActive: true,
+      attachment,
+      reportMarkdown: "# report",
+      stats: { chunks: 3 },
+    });
+    await h.aboutToRenderResult;
+    await microtasks();
+
+    // …and it is STILL queued behind the parked progress frame. Unserialized,
+    // the result edit would already have gone out over the top of it.
+    expect(h.rendersSeen()).toBe(3);
+
+    held.resolve();
+    await h.settle();
+
+    const titles = h.renders.map((r: any) => String(r?.embeds?.[0]?.data?.title ?? ""));
+    expect(titles[titles.length - 1]).toBe("✨ Premium Compaction Complete");
+    expect(titles.lastIndexOf("✨ Premium Compaction Complete")).toBeGreaterThan(
+      titles.lastIndexOf("✨ Premium Compaction")
+    );
+  });
+
+  it("a progress frame requested AFTER the pipeline returned is dropped", async () => {
+    const h = makeHarness();
+    await h.open();
+    await h.collector.click("sessions:premium");
+    await h.started;
+    const onProgress = h.compactCalls[0].opts.onProgress as (m: string) => void;
+
+    await finishCompaction(h, "sessions:premium");
+    const settledCount = h.renders.length;
+
+    // A pipeline that retained the callback and kept emitting must not be able
+    // to repaint over its own result.
+    for (let n = 0; n < 5; n++) onProgress(`late ${n}`);
+    await h.settle();
+    expect(h.renders.length).toBe(settledCount);
+    expect(String(h.last()?.embeds?.[0]?.data?.title)).toBe("✨ Premium Compaction Complete");
+  });
+
+  it("a render in flight is tracked even when no job is running", async () => {
+    // Isolated from the job on purpose: while a compaction is outstanding its
+    // own promise holds the drain, which would mask an untracked edit. Here the
+    // card is idle and only the EDIT is in flight.
+    const held = deferred<void>();
+    const h = makeHarness({ holdRenderNo: 2, holdUntil: held.promise });
+    await h.open();
+    await h.settle();
+    expect(h.orch.pendingCardJobCount).toBe(0);
+
+    // A fire-and-forget repaint, exactly as `pushProgress` issues one.
+    void h.lifecycle.refresh({ embeds: [], components: [] });
+    await Promise.resolve();
+    expect(h.orch.pendingCardJobCount).toBeGreaterThan(0);
+
+    let drained = false;
+    const gate = h.settle().then(() => {
+      drained = true;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false); // the in-flight EDIT is holding shutdown
+
+    held.resolve();
+    await gate;
+    expect(h.orch.pendingCardJobCount).toBe(0);
+  });
+});
+
+describe("#179 the 'before' is sampled at click admission", () => {
+  it("a DETACH landing while the click is being ACKed is not undone", async () => {
+    // `deferUpdate` is a round trip. Sampling the binding on the far side of it
+    // — even "early", before the progress repaint — records whatever the
+    // operator just did as the baseline. Here they detach the session being
+    // compacted: a later sample sees ""=="" , calls it "no change", and
+    // re-binds the thread they just disconnected.
+    const h = makeHarness({
+      bound: "acp-source",
+      onDeferUpdate: (bound) => {
+        bound.value = "";
+      },
+    });
+    await h.open();
+    await h.collector.click("sessions:premium");
+    await h.started;
+
+    const attachment = await finishCompaction(h, "sessions:premium");
+    expect(attachment).toEqual({ attached: false, reason: "rebound-elsewhere" });
+    expect(h.casCalls).toHaveLength(0); // nothing written…
+    expect(h.bound.value).toBe(""); // …so the detach stands
+  });
+
+  it("an Attach landing inside the initial repaint is preserved, not overwritten", async () => {
+    const held = deferred<void>();
+    const h = makeHarness({ bound: "acp-source", holdUntil: held.promise });
+    await h.open();
+
+    const click = h.collector.click("sessions:premium");
+    await Promise.resolve();
+    // Admitted; its progress repaint is still in flight. The operator attaches
+    // something else RIGHT NOW.
+    h.bound.value = "acp-attached-mid-repaint";
+
+    held.resolve();
+    await click;
+    await h.started;
+
+    const attachment = await finishCompaction(h, "sessions:premium");
+    expect(attachment).toEqual({ attached: false, reason: "rebound-elsewhere" });
+    expect(h.casCalls).toHaveLength(0);
+    expect(h.bound.value).toBe("acp-attached-mid-repaint");
+  });
+
+  it("passes the admission-time value into compactThread, not a later read", async () => {
+    const h = makeHarness({
+      bound: "acp-source",
+      onDeferUpdate: (bound) => {
+        bound.value = "acp-moved";
+      },
+    });
+    await h.open();
+    await h.collector.click("sessions:premium");
+    await h.started;
+
+    expect(h.compactCalls[0].opts.observedAtStart).toBe("acp-source");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // C. Dead interaction token — deliver the result, leak nothing
 // ---------------------------------------------------------------------------
 
@@ -887,10 +1123,12 @@ describe("#179 dead-token recovery", () => {
     expect(h.collector.stopped).not.toBeNull();
   });
 
-  it("a completed AI SUMMARY is delivered, not replaced by a 'ready' notice", async () => {
-    // The summary exists nowhere else — no session, no file, no log. Announcing
-    // that it finished while discarding it is the same silent loss this issue
-    // is about, one surface over.
+  it("a completed AI SUMMARY is held privately, never published to the thread", async () => {
+    // The summary exists nowhere else — no session, no file, no log. Discarding
+    // it behind a "your summary is ready" notice loses work the operator paid
+    // for; POSTING it promotes an ephemeral, one-operator result to everyone in
+    // the channel, permanently, because a token timed out. Neither is
+    // acceptable, so it is parked for private collection.
     const h = makeHarness();
     const gate = deferred<void>();
     runtime.gate = gate.promise;
@@ -902,11 +1140,65 @@ describe("#179 dead-token recovery", () => {
     gate.resolve();
     await h.settle();
 
-    expect(h.threadMessages).toEqual([CARD_FALLBACK_TEXT.summary.ok]);
-    expect(h.threadFiles).toHaveLength(1);
-    expect(h.threadFiles[0]!.body).toContain("THE GENERATED SUMMARY BODY");
-    // Generic filename — it must not name the session either.
-    expect(h.threadFiles[0]!.filename).toBe("session-summary.md");
+    // The thread learns only that something finished and where to get it.
+    expect(h.threadMessages).toHaveLength(1);
+    expect(h.threadMessages[0]).toContain(CARD_FALLBACK_TEXT.summary.ok);
+    expect(h.threadMessages[0]).toContain(CARD_RESULT_PARKED_NOTICE);
+    // The BODY never crossed publicly — no message, no attachment.
+    expect(h.threadMessages.join("\n")).not.toContain("THE GENERATED SUMMARY BODY");
+    expect(h.threadFiles).toHaveLength(0);
+  });
+
+  it("…and the same operator collects it privately by re-opening the browser", async () => {
+    const shared = fs.mkdtempSync(path.join(dataDir, "vault-"));
+    const first = makeHarness({ dataDir: shared, userId: "op" });
+    const gate = deferred<void>();
+    runtime.gate = gate.promise;
+    await first.open();
+    await first.collector.click("sessions:summary");
+    first.transcript.resolve("### User\nhello");
+    await first.started;
+    first.killToken();
+    gate.resolve();
+    await first.settle();
+
+    // Re-opening is the authenticated moment, and the reply is ephemeral — the
+    // audience the summary was generated for in the first place.
+    const again = makeHarness({ dataDir: shared, userId: "op" });
+    await again.open();
+    expect(again.followUps).toHaveLength(1);
+    expect(again.followUps[0].flags).toBe(MessageFlags.Ephemeral);
+    expect(String(again.followUps[0].files[0].name)).toBe("session-summary.md");
+    expect(again.threadMessages).toHaveLength(0); // nothing public
+    // Collected once: a third open finds nothing left to hand over.
+    const third = makeHarness({ dataDir: shared, userId: "op" });
+    await third.open();
+    expect(third.followUps).toHaveLength(0);
+  });
+
+  it("a DIFFERENT operator in the same thread is never handed it", async () => {
+    const shared = fs.mkdtempSync(path.join(dataDir, "vault-"));
+    const owner = makeHarness({ dataDir: shared, userId: "op" });
+    const gate = deferred<void>();
+    runtime.gate = gate.promise;
+    await owner.open();
+    await owner.collector.click("sessions:summary");
+    owner.transcript.resolve("### User\nhello");
+    await owner.started;
+    owner.killToken();
+    gate.resolve();
+    await owner.settle();
+
+    // Same thread, same record, different person: the card this replaces was
+    // visible to one operator, and the replacement must not be more visible.
+    const bystander = makeHarness({ dataDir: shared, userId: "someone-else" });
+    await bystander.open();
+    expect(bystander.followUps).toHaveLength(0);
+
+    // …and it is still there for the person it belongs to.
+    const owner2 = makeHarness({ dataDir: shared, userId: "op" });
+    await owner2.open();
+    expect(owner2.followUps).toHaveLength(1);
   });
 
   it("leaks no session id and no exception text into the thread", async () => {
@@ -921,6 +1213,7 @@ describe("#179 dead-token recovery", () => {
     await h.settle();
 
     expect(h.threadMessages).toEqual([CARD_FALLBACK_TEXT.compaction.failed]);
+    expect(h.threadFiles).toHaveLength(0); // nothing content-bearing, ever
     const posted = h.threadMessages.join("\n") + h.threadFiles.map((f) => f.filename).join("\n");
     expect(posted).not.toContain("acp-source");
     expect(posted).not.toContain("acp-new");

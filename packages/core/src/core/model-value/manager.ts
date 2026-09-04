@@ -23,15 +23,16 @@ export class ModelValueManager {
   private job?: Cron;
   private inFlight?: Promise<void>;
   private onUpdate?: () => void;
+  private stopped = false;
 
   constructor(options: ModelValueManagerOptions) {
     this.options = options;
   }
 
   start(): void {
-    if (this.job) return;
+    if (this.stopped || this.job) return;
     this.job = new Cron(MODEL_METADATA_REFRESH_CRON, { timezone: "UTC", name: "model-value-ranking" }, () => {
-      void this.refresh();
+      this.onRefreshTick();
     });
     // Warm asynchronously: MCP remains cache-only and can serve the previous
     // durable snapshot while any network/CLI source is slow or unavailable.
@@ -43,8 +44,22 @@ export class ModelValueManager {
   }
 
   stop(): void {
+    this.stopped = true;
     this.job?.stop();
     this.job = undefined;
+  }
+
+  /** Await the in-flight refresh, if any. New refreshes cannot start after stop. */
+  async drain(): Promise<void> {
+    while (this.inFlight) {
+      await this.inFlight;
+    }
+  }
+
+  /** Cron entry: a tick queued before stop is a no-op once admission is closed. */
+  private onRefreshTick(): void {
+    if (this.stopped) return;
+    void this.refresh();
   }
 
   /** Notify render-only consumers strictly after a new snapshot is durable. */
@@ -54,6 +69,7 @@ export class ModelValueManager {
 
   refresh(): Promise<void> {
     if (this.inFlight) return this.inFlight;
+    if (this.stopped) return Promise.resolve();
     this.inFlight = this.refreshInner().finally(() => {
       this.inFlight = undefined;
     });

@@ -70,6 +70,7 @@ export class WatchManager {
   private timer?: ReturnType<typeof setInterval>;
   private sweeping = false;
   private readonly activeSweeps = new Set<Promise<void>>();
+  private stopped = false;
   /** Rolling per-thread fire timestamps (ms) for the hourly rate cap (D5). In
    *  memory — a rate *backstop*, not durable accounting; a restart resets it. */
   private readonly fireHistory = new Map<string, number[]>();
@@ -85,15 +86,23 @@ export class WatchManager {
   }
 
   start(): void {
+    if (this.stopped) return;
     void this.sweep();
-    this.timer = setInterval(() => void this.sweep(), this.sweepMs);
+    this.timer = setInterval(() => this.onSweepTick(), this.sweepMs);
     this.timer.unref?.();
     this.logger.info({ sweepMs: this.sweepMs }, "watch sweeper started");
   }
 
   stop(): void {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+  }
+
+  /** Interval entry: a tick queued before stop is a no-op once admission is closed. */
+  private onSweepTick(): void {
+    if (this.stopped) return;
+    void this.sweep();
   }
 
   async drain(): Promise<void> {
@@ -106,6 +115,7 @@ export class WatchManager {
    *  Resolves when all watches picked up by this sweep have been handled — the
    *  property that makes the sweeper testable without real timers. */
   sweep(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     if (this.sweeping) return Promise.resolve();
     this.sweeping = true;
     const running = this.sweepInner();

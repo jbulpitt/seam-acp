@@ -16,15 +16,16 @@ export interface ModelMetadataManagerOptions {
 export class ModelMetadataManager {
   private job?: Cron;
   private inFlight?: Promise<void>;
+  private stopped = false;
 
   constructor(private readonly options: ModelMetadataManagerOptions) {}
 
   start(): void {
-    if (this.job) return;
+    if (this.stopped || this.job) return;
     this.job = new Cron(
       MODEL_METADATA_REFRESH_CRON,
       { timezone: "UTC", name: "model-metadata" },
-      () => { void this.refresh(); }
+      () => this.onRefreshTick()
     );
     void this.refresh();
     this.options.logger.info(
@@ -34,12 +35,27 @@ export class ModelMetadataManager {
   }
 
   stop(): void {
+    this.stopped = true;
     this.job?.stop();
     this.job = undefined;
   }
 
+  /** Await the in-flight refresh, if any. New refreshes cannot start after stop. */
+  async drain(): Promise<void> {
+    while (this.inFlight) {
+      await this.inFlight;
+    }
+  }
+
+  /** Cron entry: a tick queued before stop is a no-op once admission is closed. */
+  private onRefreshTick(): void {
+    if (this.stopped) return;
+    void this.refresh();
+  }
+
   refresh(): Promise<void> {
     if (this.inFlight) return this.inFlight;
+    if (this.stopped) return Promise.resolve();
     this.inFlight = this.refreshInner().finally(() => {
       this.inFlight = undefined;
     });

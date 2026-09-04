@@ -814,7 +814,7 @@ describe("#174 boot done-file reconciliation", () => {
       "utf8"
     );
     const http = source.indexOf("seamMcpServer.drainRequests(httpDrain)");
-    const manager = source.indexOf('stage: "manager-callbacks"');
+    const manager = source.indexOf("drainStoreWritingManagers(");
     const quiesce = source.indexOf('stage: "pre-dispose-quiesce"');
     expect(http).toBeGreaterThan(0);
     expect(manager).toBeGreaterThan(http);
@@ -3000,6 +3000,8 @@ describe("#174 nothing is explicitly closed while callbacks may still resume", (
     "seam-mcp-ingress",
     "health-ingress",
     "manager-callbacks",
+    "model-metadata-refresh",
+    "model-value-refresh",
     "pre-dispose-quiesce",
     "voice-console-shutdown",
     "live-help-shutdown",
@@ -3036,7 +3038,7 @@ describe("#174 nothing is explicitly closed while callbacks may still resume", (
     // every stage before this is consulted. Pinned so a lost `push` is visible
     // as a behaviour change here rather than as a silent early close.
     expect(safeToCloseResources([])).toBe(true);
-    expect(ALL_STAGES).toHaveLength(8);
+    expect(ALL_STAGES).toHaveLength(10);
   });
 
   /**

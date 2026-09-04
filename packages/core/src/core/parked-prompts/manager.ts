@@ -41,6 +41,7 @@ export class ParkedPromptManager {
   private offReady?: () => void;
   private readonly firing = new Set<string>();
   private readonly activeFires = new Set<Promise<void>>();
+  private stopped = false;
 
   constructor(opts: ParkedPromptManagerOpts) {
     this.store = opts.store;
@@ -51,16 +52,22 @@ export class ParkedPromptManager {
   }
 
   start(): void {
-    this.offReady = this.hub.onBridgeReady((id) => {
-      void this.fireLocation(id);
-    });
+    if (this.stopped) return;
+    this.offReady = this.hub.onBridgeReady((id) => this.onHubReady(id));
     void this.rehydrate();
     this.logger.info("parked-prompt manager started");
   }
 
   stop(): void {
+    this.stopped = true;
     this.offReady?.();
     this.offReady = undefined;
+  }
+
+  /** Hub entry: a ready event queued before stop is a no-op once admission is closed. */
+  private onHubReady(id: string): void {
+    if (this.stopped) return;
+    void this.fireLocation(id);
   }
 
   async drain(): Promise<void> {
@@ -74,6 +81,7 @@ export class ParkedPromptManager {
    * on `onBridgeReady`. Event-driven — no sweep interval.
    */
   async rehydrate(): Promise<void> {
+    if (this.stopped) return;
     try {
       const pending = this.store.listParked();
       const locations = new Set(pending.map((p) => p.location));
@@ -91,6 +99,7 @@ export class ParkedPromptManager {
    * a double ready event cannot double-deliver.
    */
   fireLocation(location: string): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     if (this.firing.has(location)) return Promise.resolve();
     this.firing.add(location);
     const running = this.fireLocationInner(location);

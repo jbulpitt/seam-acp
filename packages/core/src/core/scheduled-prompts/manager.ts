@@ -29,6 +29,7 @@ export class ScheduledPromptManager {
    *  timer path and the boot catch-up path (both go through `fire`). */
   private readonly inFlight = new Set<string>();
   private readonly activeFires = new Set<Promise<void>>();
+  private stopped = false;
   private readonly store: SessionStore;
   private readonly onFire: (id: string) => Promise<void>;
   private readonly logger: Logger;
@@ -43,6 +44,7 @@ export class ScheduledPromptManager {
    *  #158: an enabled row that still carries legacy attachments is reported and
    *  left disarmed — it is neither caught up nor armed. */
   start(): void {
+    if (this.stopped) return;
     const rows = this.store.listScheduledEnabled();
     const quarantined: string[] = [];
     for (const row of rows) {
@@ -70,6 +72,7 @@ export class ScheduledPromptManager {
   /** (Re)arm a single schedule from its current row. No-op (disarms) if disabled
    *  or quarantined by a legacy attachment manifest (#158). */
   armFromRow(row: ScheduledPrompt): void {
+    if (this.stopped) return;
     this.disarm(row.id);
     if (!row.enabled) return;
     // #158 arming boundary: refuse an enabled legacy attachment-bearing row.
@@ -84,7 +87,7 @@ export class ScheduledPromptManager {
     let job: Cron;
     try {
       job = new Cron(row.cron, { timezone: row.timezone, name: row.id }, () => {
-        void this.fire(row.id);
+        this.onCronTick(row.id);
       });
     } catch (err) {
       this.logger.error({ id: row.id, cron: row.cron, err }, "invalid cron; not armed");
@@ -116,8 +119,15 @@ export class ScheduledPromptManager {
   }
 
   stop(): void {
+    this.stopped = true;
     for (const job of this.jobs.values()) job.stop();
     this.jobs.clear();
+  }
+
+  /** Cron entry: a tick queued before stop is a no-op once admission is closed. */
+  private onCronTick(id: string): void {
+    if (this.stopped) return;
+    void this.fire(id);
   }
 
   async drain(): Promise<void> {

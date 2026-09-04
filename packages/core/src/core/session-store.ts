@@ -12,6 +12,7 @@ import {
   type Preset,
   parseStatusCardStyle,
   DELEGATION_ACTIVE_STATUSES,
+  DELEGATION_TERMINAL_STATUSES,
   PROMPT_PREVIEW_MAX,
   type DelegationKind,
   type DelegationStatus,
@@ -1790,6 +1791,65 @@ export class SessionStore {
          ORDER BY updated_utc ASC, rowid ASC`
       )
       .all(...statuses)
+      .map(mapLedger);
+  }
+
+  /**
+   * Rows whose durable completion side effects may still need replay. This is
+   * the boot recovery index for done-files: callers read only these exact
+   * filenames instead of enumerating a lifetime-sized `dispatch/done` dir.
+   */
+  listNonTerminalDelegations(
+    after: { updatedUtc: string; id: string } | null,
+    limit: number
+  ): LedgerEntry[] {
+    const boundedLimit = Math.max(1, Math.floor(limit));
+    const placeholders = DELEGATION_TERMINAL_STATUSES.map(() => "?").join(", ");
+    const cursorSql = after
+      ? "AND (updated_utc > ? OR (updated_utc = ? AND id > ?))"
+      : "";
+    const params: Array<string | number> = [
+      ...DELEGATION_TERMINAL_STATUSES,
+      ...(after ? [after.updatedUtc, after.updatedUtc, after.id] : []),
+      boundedLimit,
+    ];
+    return this.db
+      .prepare<Array<string | number>, LedgerRow>(
+        `SELECT * FROM delegation_log WHERE status NOT IN (${placeholders}) ${cursorSql}
+         ORDER BY updated_utc ASC, id ASC LIMIT ?`
+      )
+      .all(...params)
+      .map(mapLedger);
+  }
+
+  /**
+   * One keyset-paginated window of old terminal rows. The `(updated_utc,id)`
+   * cursor is non-authoritative maintenance state: repeating a page after a
+   * crash is safe, while the hard limit bounds filesystem probes per boot.
+   */
+  listTerminalDelegationsForDoneRetention(
+    cutoffUtc: string,
+    after: { updatedUtc: string; id: string } | null,
+    limit: number
+  ): LedgerEntry[] {
+    const boundedLimit = Math.max(1, Math.floor(limit));
+    const placeholders = DELEGATION_TERMINAL_STATUSES.map(() => "?").join(", ");
+    const cursorSql = after
+      ? "AND (updated_utc > ? OR (updated_utc = ? AND id > ?))"
+      : "";
+    const params: Array<string | number> = [
+      ...DELEGATION_TERMINAL_STATUSES,
+      cutoffUtc,
+      ...(after ? [after.updatedUtc, after.updatedUtc, after.id] : []),
+      boundedLimit,
+    ];
+    return this.db
+      .prepare<Array<string | number>, LedgerRow>(
+        `SELECT * FROM delegation_log
+         WHERE status IN (${placeholders}) AND updated_utc < ? ${cursorSql}
+         ORDER BY updated_utc ASC, id ASC LIMIT ?`
+      )
+      .all(...params)
       .map(mapLedger);
   }
 
@@ -5571,6 +5631,8 @@ CREATE INDEX IF NOT EXISTS idx_delegation_correlation
   ON delegation_log(correlation_id);
 CREATE INDEX IF NOT EXISTS idx_delegation_source
   ON delegation_log(source_ref);
+CREATE INDEX IF NOT EXISTS idx_delegation_done_retention
+  ON delegation_log(updated_utc, id, status);
 `;
 
 interface LedgerRow {

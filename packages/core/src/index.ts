@@ -1015,11 +1015,11 @@ async function main(): Promise<void> {
       style: resolveThreadTtsStyle(config, channelRef) ?? "neutral",
     }),
   });
-  // #174: repair completions whose output reached `done/` but whose DB-first
-  // side effects (ledger status, report-back, chain advance) were lost to a
-  // shutdown race. Runs BEFORE the watcher starts, so a report-back this
-  // enqueues is picked up by the very first tick. The worker is never
-  // re-executed; its output is read off disk.
+  // #174/#193: repair completions whose output reached `done/` but whose
+  // DB-first side effects (ledger status, report-back, chain advance) were lost
+  // to a shutdown race, then prune one bounded page of proven-settled results.
+  // Runs BEFORE the watcher starts, so a report-back this enqueues is picked up
+  // by the first tick. The worker is never re-executed; output comes from disk.
   //
   // This deliberately runs BEFORE the #137 stale and #75 orphan passes below.
   // A done-backed row is a completed turn awaiting side effects, not stale
@@ -1029,10 +1029,24 @@ async function main(): Promise<void> {
       dataDir: config.DATA_DIR,
       logger,
       getDelegation: (id) => store.getDelegation(id),
+      listRecoveryCandidates: (after, limit) =>
+        store.listNonTerminalDelegations(after, limit),
       replay: (result, route) => orchestrator.replayCompletedDispatch(result, route),
+      retention: {
+        listCandidates: (cutoffUtc, after, limit) =>
+          store.listTerminalDelegationsForDoneRetention(cutoffUtc, after, limit),
+        getReportBackByCorrelation: (correlationId) =>
+          store.getReportBackByCorrelation(correlationId),
+      },
     });
-    if (repaired.reconciled > 0 || repaired.failed > 0 || repaired.skippedUnprovable > 0) {
-      logger.warn(repaired, "reconciled completed dispatches whose ledger row was non-terminal");
+    if (
+      repaired.reconciled > 0 ||
+      repaired.pruned > 0 ||
+      repaired.quarantined > 0 ||
+      repaired.failed > 0 ||
+      repaired.skippedUnprovable > 0
+    ) {
+      logger.warn(repaired, "dispatch done-file boot maintenance reported work or failures");
     }
   } catch (err) {
     logger.warn({ err }, "done-file completion reconciliation failed");

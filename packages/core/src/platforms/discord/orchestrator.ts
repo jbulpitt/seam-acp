@@ -471,7 +471,7 @@ import {
 import { splitForFlush } from "../../core/stream-flush.js";
 import { FenceStream, type CompletedFence } from "../../core/fence-stream.js";
 import { SerialQueue } from "../../core/serial-queue.js";
-import { CardResultVault, type StoredCardResult } from "../../core/card-result-vault.js";
+import { CardResultVault, type ClaimedCardResult } from "../../core/card-result-vault.js";
 import { StreamingPanel } from "../../core/streaming-panel.js";
 import { StreamingMessageRenderer } from "../../core/streaming-message-renderer.js";
 import { mimeTypeForFilename } from "../../core/fence-mime.js";
@@ -583,6 +583,10 @@ export type CardFallbackKind = "compaction" | "rebuild" | "summary" | "migration
  */
 export const CARD_RESULT_PARKED_NOTICE =
   "The result is held privately for you — run `/seam info sessions` in this thread to collect it.";
+
+/** Fixed, contentless notice when a result cannot safely enter the vault. */
+export const CARD_RESULT_REJECTED_NOTICE =
+  "The private result could not be retained safely; check the bot logs for details.";
 
 export const CARD_FALLBACK_TEXT: Record<CardFallbackKind, { ok: string; failed: string }> = {
   compaction: {
@@ -10179,7 +10183,9 @@ export class Orchestrator {
     // There is no code path from `file` to `sendMessage`/`sendFile` here, which
     // is a stronger guarantee than remembering to redact.
     let parked = false;
+    let parkAttempted = false;
     if (file && fallback.recordId && fallback.userId) {
+      parkAttempted = true;
       parked =
         (await this.cardResults.put({
           recordId: fallback.recordId,
@@ -10194,7 +10200,11 @@ export class Orchestrator {
     try {
       await this.adapter.sendMessage(
         channel,
-        parked ? `${text}\n${CARD_RESULT_PARKED_NOTICE}` : text
+        parked
+          ? `${text}\n${CARD_RESULT_PARKED_NOTICE}`
+          : parkAttempted
+            ? `${text}\n${CARD_RESULT_REJECTED_NOTICE}`
+            : text
       );
     } catch (err) {
       this.logger.warn({ err, kind: fallback.kind }, "card fallback notice failed");
@@ -10213,15 +10223,16 @@ export class Orchestrator {
     i: ChatInputCommandInteraction,
     recordId: string
   ): Promise<number> {
-    let parked: StoredCardResult[];
+    let parked: ClaimedCardResult[];
     try {
-      parked = await this.cardResults.take(recordId, i.user.id);
+      parked = await this.cardResults.claim(recordId, i.user.id);
     } catch (err) {
       this.logger.warn({ err, recordId }, "parked card results could not be read");
       return 0;
     }
     let delivered = 0;
-    for (const entry of parked) {
+    for (const claim of parked) {
+      const entry = claim.entry;
       try {
         await i.followUp({
           content: `📦 A result from an earlier session-browser action, held for you: **${entry.label}**.`,
@@ -10230,9 +10241,23 @@ export class Orchestrator {
           ],
           flags: MessageFlags.Ephemeral,
         });
-        delivered++;
       } catch (err) {
+        await this.cardResults.release(claim).catch((releaseErr) =>
+          this.logger.warn(
+            { err: releaseErr, recordId, entry: entry.id },
+            "parked card result release failed"
+          )
+        );
         this.logger.warn({ err, recordId, entry: entry.id }, "parked card result delivery failed");
+        continue;
+      }
+      delivered++;
+      const acknowledged = await this.cardResults.acknowledge(claim).catch((err) => {
+        this.logger.warn({ err, recordId, entry: entry.id }, "parked card result ack failed");
+        return false;
+      });
+      if (!acknowledged) {
+        this.logger.warn({ recordId, entry: entry.id }, "parked card result ack ownership was lost");
       }
     }
     return delivered;

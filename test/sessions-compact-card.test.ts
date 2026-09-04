@@ -90,8 +90,14 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
   };
 });
 
-const { Orchestrator, CARD_FALLBACK_TEXT, CARD_RESULT_PARKED_NOTICE } = await import(
-  "../packages/core/src/platforms/discord/orchestrator.js"
+const {
+  Orchestrator,
+  CARD_FALLBACK_TEXT,
+  CARD_RESULT_PARKED_NOTICE,
+  CARD_RESULT_REJECTED_NOTICE,
+} = await import("../packages/core/src/platforms/discord/orchestrator.js");
+const { CARD_RESULT_BODY_MAX_BYTES } = await import(
+  "../packages/core/src/core/card-result-vault.js"
 );
 const { hasEnabledComponents } = await import(
   "../packages/core/src/platforms/discord/collector-lifecycle.js"
@@ -218,6 +224,8 @@ interface HarnessOpts {
   onDeferUpdate?: (bound: { value: string }) => void;
   /** Kill the interaction token after the browser is open (Discord's 15 min). */
   killTokenAfterOpen?: boolean;
+  /** Inject Discord follow-up latency/failure at the delivery boundary. */
+  followUp?: (payload: any) => Promise<void>;
   onCasRead?: (cell: { value: string }) => void;
 }
 
@@ -322,6 +330,7 @@ function makeHarness(opts: HarnessOpts = {}) {
       return msg;
     },
     followUp: async (payload: any) => {
+      await opts.followUp?.(payload);
       followUps.push(payload);
       return { id: "fu1" };
     },
@@ -1174,6 +1183,98 @@ describe("#179 dead-token recovery", () => {
     const third = makeHarness({ dataDir: shared, userId: "op" });
     await third.open();
     expect(third.followUps).toHaveLength(0);
+  });
+
+  it("a failed follow-up leaves the private result available for one later retry", async () => {
+    const shared = fs.mkdtempSync(path.join(dataDir, "vault-"));
+    const first = makeHarness({ dataDir: shared, userId: "op" });
+    const gate = deferred<void>();
+    runtime.gate = gate.promise;
+    await first.open();
+    await first.collector.click("sessions:summary");
+    first.transcript.resolve("### User\nhello");
+    await first.started;
+    first.killToken();
+    gate.resolve();
+    await first.settle();
+
+    const failed = makeHarness({
+      dataDir: shared,
+      userId: "op",
+      followUp: async () => {
+        throw new Error("injected Discord failure");
+      },
+    });
+    await failed.open();
+    expect(failed.followUps).toHaveLength(0);
+
+    const retry = makeHarness({ dataDir: shared, userId: "op" });
+    await retry.open();
+    expect(retry.followUps).toHaveLength(1);
+    expect(retry.followUps[0].files[0].attachment.toString("utf8")).toContain(
+      "THE GENERATED SUMMARY BODY"
+    );
+
+    const afterAck = makeHarness({ dataDir: shared, userId: "op" });
+    await afterAck.open();
+    expect(afterAck.followUps).toHaveLength(0);
+  });
+
+  it("two simultaneous browser opens have one private delivery consumer", async () => {
+    const shared = fs.mkdtempSync(path.join(dataDir, "vault-"));
+    const producer = makeHarness({ dataDir: shared, userId: "op" });
+    const jobGate = deferred<void>();
+    runtime.gate = jobGate.promise;
+    await producer.open();
+    await producer.collector.click("sessions:summary");
+    producer.transcript.resolve("### User\nhello");
+    await producer.started;
+    producer.killToken();
+    jobGate.resolve();
+    await producer.settle();
+
+    const followEntered = deferred<void>();
+    const followGate = deferred<void>();
+    const first = makeHarness({
+      dataDir: shared,
+      userId: "op",
+      followUp: async () => {
+        followEntered.resolve();
+        await followGate.promise;
+      },
+    });
+    const firstOpen = first.open();
+    await followEntered.promise;
+
+    const second = makeHarness({ dataDir: shared, userId: "op" });
+    await second.open();
+    expect(second.followUps).toHaveLength(0);
+
+    followGate.resolve();
+    await firstOpen;
+    expect(first.followUps).toHaveLength(1);
+    const third = makeHarness({ dataDir: shared, userId: "op" });
+    await third.open();
+    expect(third.followUps).toHaveLength(0);
+  });
+
+  it("oversized private output fails closed with only a generic thread notice", async () => {
+    const shared = fs.mkdtempSync(path.join(dataDir, "vault-"));
+    const h = makeHarness({ dataDir: shared, userId: "op" });
+    const privateBody = "S".repeat(CARD_RESULT_BODY_MAX_BYTES + 1);
+
+    await (h.orch as any).postCardFallback(
+      { platform: "discord", id: "thread-1" },
+      { kind: "summary", outcome: "ok", recordId: "discord:thread-1", userId: "op" },
+      { filename: "session-summary.md", body: privateBody }
+    );
+
+    expect(h.threadMessages).toHaveLength(1);
+    expect(h.threadMessages[0]).toContain(CARD_RESULT_REJECTED_NOTICE);
+    expect(h.threadMessages[0]).not.toContain(privateBody.slice(0, 100));
+    expect(h.threadFiles).toHaveLength(0);
+    const vaultDir = path.join(shared, "card-results");
+    expect(fs.existsSync(vaultDir) ? fs.readdirSync(vaultDir) : []).toEqual([]);
   });
 
   it("a DIFFERENT operator in the same thread is never handed it", async () => {

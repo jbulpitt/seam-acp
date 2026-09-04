@@ -14,6 +14,7 @@ import {
   SHUTDOWN_EXIT_FALLBACK_MS,
   type DrainVerdict,
 } from "./lib/shutdown-budget.js";
+import { drainStoreWritingManagers } from "./lib/shutdown-managers.js";
 import { SessionStore } from "./core/session-store.js";
 import { DelegationReconciler } from "./core/delegation-reconciler.js";
 import { DELEGATION_TERMINAL_STATUSES } from "./core/types.js";
@@ -1347,17 +1348,21 @@ async function main(): Promise<void> {
     // finished. An admitted run-now request can enter a manager after the
     // synchronous stop() calls above; draining first would miss that late
     // callback and permit it to reach the store during teardown.
-    verdicts.push({
-      stage: "manager-callbacks",
-      drained: await bounded("manager callbacks", config.SHUTDOWN_QUIESCE_TIMEOUT_MS, async () => {
-        await Promise.all([
-          scheduledManager.drain(),
-          wakeManager.drain(),
-          watchManager.drain(),
-          parkedManager.drain(),
-        ]);
-      }),
-    });
+    // Model metadata/value refreshes write the same SQLite file, so their
+    // in-flight fetches join this verdict set (#192).
+    verdicts.push(
+      ...(await drainStoreWritingManagers(
+        {
+          scheduled: scheduledManager,
+          wake: wakeManager,
+          watch: watchManager,
+          parked: parkedManager,
+          modelMetadata: modelMetadataManager,
+          modelValue: modelValueManager,
+        },
+        (label, work) => bounded(label, config.SHUTDOWN_QUIESCE_TIMEOUT_MS, work)
+      ))
+    );
     // #174 phase 1: quiesce BEFORE anything is torn down. `dispatchWatcher.stop()`
     // only closes intake; `quiesce()` is the barrier that waits for claimed
     // dispatches, active channel turns, and post-turn continuations to settle

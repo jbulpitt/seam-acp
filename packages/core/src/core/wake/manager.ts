@@ -46,6 +46,7 @@ export class WakeManager {
   /** Reentrancy guard: a slow sweep must not overlap the next interval tick. */
   private sweeping = false;
   private readonly activePasses = new Set<Promise<void>>();
+  private stopped = false;
 
   constructor(opts: WakeManagerOpts) {
     this.store = opts.store;
@@ -58,9 +59,10 @@ export class WakeManager {
    *  interval. The catch-up sweep and the startup pass both run BEFORE the
    *  interval is armed (kicked off here, non-blocking so boot isn't delayed). */
   start(): void {
+    if (this.stopped) return;
     void this.sweep();
     void this.fireStartupWakes();
-    this.timer = setInterval(() => void this.sweep(), this.sweepMs);
+    this.timer = setInterval(() => this.onSweepTick(), this.sweepMs);
     // Don't hold the event loop open just for the poller.
     this.timer.unref?.();
     this.logger.info({ sweepMs: this.sweepMs }, "wake sweeper started");
@@ -78,6 +80,7 @@ export class WakeManager {
    * startup wake fires on the next boot however long the process was down.
    */
   fireStartupWakes(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     return this.trackPass(() => this.fireStartupWakesInner());
   }
 
@@ -110,8 +113,15 @@ export class WakeManager {
   }
 
   stop(): void {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+  }
+
+  /** Interval entry: a tick queued before stop is a no-op once admission is closed. */
+  private onSweepTick(): void {
+    if (this.stopped) return;
+    void this.sweep();
   }
 
   async drain(): Promise<void> {
@@ -126,6 +136,7 @@ export class WakeManager {
    * sweeper testable without real timers.
    */
   sweep(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     if (this.sweeping) return Promise.resolve();
     this.sweeping = true;
     return this.trackPass(() => this.sweepInner()).finally(() => {

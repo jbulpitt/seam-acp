@@ -65,6 +65,7 @@ import type {
   ComponentEvent,
   ChoiceCardPost,
   ChoiceInteraction,
+  ElicitationCardPost,
   ConfirmationCard,
   ConfirmationDecision,
   IncomingMessage,
@@ -348,6 +349,7 @@ export type DiscordInteractionRoute =
   | "slash"
   | "config-edit"
   | "choice"
+  | "elicitation"
   | "none";
 
 /** Command names this bot owns. #151 split the tree in two, and BOTH halves
@@ -387,6 +389,7 @@ export function classifyDiscordInteraction(interaction: {
     return "config-edit";
   }
   if (cid.startsWith(CHOICE_CUSTOM_ID_PREFIX)) return "choice";
+  if (cid.startsWith("seam-elicit:")) return "elicitation";
   return "none";
 }
 
@@ -1982,6 +1985,75 @@ export class DiscordAdapter implements ChatAdapter {
     await msg.edit({ content: "", embeds: [embed], components });
   }
 
+  async sendElicitationCard(
+    channel: ChannelRef,
+    card: ElicitationCardPost
+  ): Promise<MessageRef> {
+    const ch = await this.fetchSendableChannel(channel.id);
+    const sent = await ch.send({
+      embeds: [DiscordAdapter.buildEmbed(card.panel)],
+      components: DiscordAdapter.buildElicitationComponents(card),
+      allowedMentions: { parse: [] },
+    });
+    return { channel, id: sent.id };
+  }
+
+  async editElicitationCard(message: MessageRef, card: ElicitationCardPost): Promise<void> {
+    const ch = await this.fetchSendableChannel(message.channel.id);
+    const msg = await ch.messages.fetch(message.id);
+    await msg.edit({
+      content: "",
+      embeds: [DiscordAdapter.buildEmbed(card.panel)],
+      components: DiscordAdapter.buildElicitationComponents(card),
+      allowedMentions: { parse: [] },
+    });
+  }
+
+  private static buildElicitationComponents(
+    card: ElicitationCardPost
+  ): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
+    const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [];
+    if (card.select) {
+      const select = new StringSelectMenuBuilder()
+        .setCustomId(card.select.customId.slice(0, 100))
+        .setPlaceholder(card.select.placeholder.slice(0, 150))
+        .setMinValues(Math.max(0, Math.min(card.select.min, card.select.options.length)))
+        .setMaxValues(Math.max(1, Math.min(card.select.max, card.select.options.length)))
+        .setDisabled(card.select.disabled ?? false)
+        .addOptions(
+          card.select.options.slice(0, 25).map((option) => ({
+            label: option.label.slice(0, 100),
+            value: option.value.slice(0, 100),
+            ...(option.description ? { description: option.description.slice(0, 100) } : {}),
+          }))
+        );
+      rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select));
+    }
+    if (card.buttons?.length) {
+      const row = new ActionRowBuilder<ButtonBuilder>();
+      for (const button of card.buttons.slice(0, 5)) {
+        const built = new ButtonBuilder()
+          .setLabel(button.label.slice(0, 80))
+          .setStyle(
+            button.style === "link"
+              ? ButtonStyle.Link
+              : DiscordAdapter.buttonStyle(button.style)
+          )
+          .setDisabled(button.disabled ?? false);
+        if (button.style === "link") {
+          if (!button.url) throw new Error("elicitation link button requires a URL");
+          built.setURL(button.url);
+        } else {
+          if (!button.customId) throw new Error("elicitation action requires a custom id");
+          built.setCustomId(button.customId.slice(0, 100));
+        }
+        row.addComponents(built);
+      }
+      rows.push(row);
+    }
+    return rows;
+  }
+
   private static buildChoiceComponents(
     card: ChoiceCardPost
   ): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
@@ -2143,6 +2215,13 @@ export class DiscordAdapter implements ChatAdapter {
             interaction as ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
           ).catch((err) => {
             this.logger.error({ err }, "choice-card interaction handler crashed");
+          });
+          return;
+        case "elicitation":
+          this.handlePersistentComponent(
+            interaction as ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction
+          ).catch((err) => {
+            this.logger.error({ err }, "elicitation component handler crashed");
           });
           return;
         default:

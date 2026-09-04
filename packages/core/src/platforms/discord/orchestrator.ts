@@ -306,6 +306,7 @@ const VOICE_CONSOLE_DURABLE_ACTIONS: ReadonlySet<string> = new Set([
 ]);
 import type { SessionStore } from "../../core/session-store.js";
 import { makeSessionId } from "../../core/session-store.js";
+import { ElicitationManager } from "../../core/elicitation/manager.js";
 import type { InboundAdmission } from "../../core/inbound-admission/types.js";
 import { SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
 import {
@@ -737,6 +738,7 @@ export class Orchestrator {
   private readonly threadNamer: ThreadNamer;
   /** #179: private hand-off for results whose card died before showing them. */
   private readonly cardResults: CardResultVault;
+  private readonly elicitations: ElicitationManager;
 
   /**
    * #174: one settle-promise per in-flight turn.
@@ -896,6 +898,30 @@ export class Orchestrator {
       this.logger
     );
     this.cardResults = new CardResultVault(this.config.DATA_DIR, this.logger);
+    this.elicitations = new ElicitationManager({
+      store: this.store,
+      adapter: this.adapter,
+      logger: this.logger,
+      currentUserId: (channelRef) => this.currentAuthorIds.get(channelRef),
+    });
+    this.router.setElicitationHandlers?.({
+      create: (record, request, context) => this.elicitations.create(record, request, context),
+      complete: async (record, notification) => {
+        const completed = await this.elicitations.completeUrl(
+          notification.elicitationId,
+          record.id
+        );
+        if (!completed) {
+          this.logger.info(
+            { elicitationId: notification.elicitationId, sessionId: record.id },
+            "ignored stale or mismatched elicitation completion"
+          );
+        }
+      },
+      cancel: async (record, reason, detail) => {
+        await this.elicitations.cancelForSession(record.id, reason, detail);
+      },
+    });
     this.threadNamer = new ThreadNamer({
       getConfig: () => this.threadNamerConfig.get(),
       describeConfig: (record) => this.router.describeConfig(record),
@@ -1545,6 +1571,12 @@ export class Orchestrator {
           // tests). Anything that somehow escapes rejects `runInbound`, which
           // logs it and hands it to the adapter boundary.
           const handlers: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
+            ...(this.elicitations
+              ? [[
+                  "elicitation",
+                  () => this.elicitations.handleComponent(evt),
+                ] as const]
+              : []),
             ["config editor", () => this.handleConfigEditorComponent(evt)],
             ["tts editor", () => this.handleTtsEditorComponent(evt)],
             ["voice console", () => this.runVoiceConsoleComponent(evt)],
@@ -1588,6 +1620,11 @@ export class Orchestrator {
     // an enabled active_projects row as allowed, additive to the env allowlist.
     this.adapter.setActiveChannelCheck?.((ref) => this.store.isChannelActive(ref));
     this.watchSentinel();
+  }
+
+  /** Freeze any card whose ACP request disappeared with the prior process. */
+  async recoverElicitations(): Promise<number> {
+    return this.elicitations.recoverOpen();
   }
 
   /**
@@ -1924,6 +1961,21 @@ export class Orchestrator {
     // Must run before abort / park so the upload is not treated as a new turn.
     if (await this.tryConsumeConfigEditorRiderUpload(msg)) return;
 
+    // A normal user turn supersedes an outstanding ACP elicitation before the
+    // new prompt is admitted. This also precedes mid-turn inbox routing: a user
+    // answer typed as a message is a competing turn, never a hidden form reply.
+    let supersededElicitation = 0;
+    if (msg.raw) {
+      const existing = this.store.getByChannel(msg.channel.platform, channelId);
+      if (existing) {
+        supersededElicitation = await this.elicitations.cancelForSession(
+          existing.id,
+          "superseded",
+          "A newer user message superseded this request."
+        );
+      }
+    }
+
     // #63: cooperative mid-turn reply routing (flag-gated, DARK by default). When
     // a turn is already active on this thread and SEAM_MIDTURN_REPLY_MODE="inbox",
     // a bare reply joins the running agent's inbox (#61) instead of force-aborting
@@ -1932,7 +1984,8 @@ export class Orchestrator {
     // "abort" mode falls through to the priority-interrupt path unchanged.
     if (
       this.config.SEAM_MIDTURN_REPLY_MODE === "inbox" &&
-      this.channelQueues.has(channelId)
+      this.channelQueues.has(channelId) &&
+      supersededElicitation === 0
     ) {
       await this.routeMidTurnReplyToInbox(msg);
       return;
@@ -3080,6 +3133,10 @@ export class Orchestrator {
 
     let quotaRequest: QuotaConnectionRequest | undefined;
 
+    // Available during session/new as well as session/prompt so request-scoped
+    // elicitation during agent setup can still be safely attributed. The
+    // existing finally below clears it even if runtime startup fails.
+    if (msg.authorId) this.currentAuthorIds.set(record.channelRef, msg.authorId);
     try {
       let activeRuntime = await this.router.getOrStartRuntime(record);
       this.assertQueueFence(queueFence);

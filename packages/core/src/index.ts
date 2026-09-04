@@ -546,6 +546,9 @@ async function main(): Promise<void> {
   });
 
   await adapter.start();
+  await orchestrator.recoverElicitations().catch((err) => {
+    logger.warn({ err }, "elicitation recovery failed");
+  });
   // Seed one normalized snapshot per configured agent before MCP/card startup,
   // then let each agent's own recent turn rate drive its recursive poll timer.
   await quotaPoller.start();

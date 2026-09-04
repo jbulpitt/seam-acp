@@ -12,10 +12,14 @@ import { retiredAgentMessage } from "./retired-agents.js";
 
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
 import type {
+  CompleteElicitationNotification,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
   McpServer,
   RequestPermissionRequest,
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
+import type { ElicitationRequestContext } from "./elicitation/types.js";
 import {
   planSeamMcpInjection,
   spawnRemoteSlot,
@@ -74,6 +78,20 @@ export type AskUserFn = (
   record: SessionRecord,
   req: RequestPermissionRequest
 ) => Promise<RequestPermissionResponse>;
+export type ElicitUserFn = (
+  record: SessionRecord,
+  request: CreateElicitationRequest,
+  context: ElicitationRequestContext
+) => Promise<CreateElicitationResponse>;
+export type CompleteElicitationFn = (
+  record: SessionRecord,
+  notification: CompleteElicitationNotification
+) => Promise<void>;
+export type CancelElicitationsFn = (
+  record: SessionRecord,
+  reason: "cancelled" | "interrupted",
+  detail: string
+) => Promise<void>;
 
 /**
  * Which configuration layer supplied an effective value. Mirrors the precedence
@@ -197,6 +215,9 @@ export class SessionRouter {
   private readonly channelPresets: Map<string, ChannelPreset>;
   private readonly threadPresets: Map<string, ThreadPreset>;
   private askUser?: AskUserFn;
+  private elicitUser?: ElicitUserFn;
+  private completeElicitation?: CompleteElicitationFn;
+  private cancelElicitations?: CancelElicitationsFn;
 
   private readonly runtimes = new Map<string, AgentRuntime>();
   private readonly creationLocks = new Map<string, Promise<AgentRuntime>>();
@@ -272,6 +293,16 @@ export class SessionRouter {
    */
   setAskUser(fn: AskUserFn): void {
     this.askUser = fn;
+  }
+
+  setElicitationHandlers(handlers: {
+    create: ElicitUserFn;
+    complete: CompleteElicitationFn;
+    cancel: CancelElicitationsFn;
+  }): void {
+    this.elicitUser = handlers.create;
+    this.completeElicitation = handlers.complete;
+    this.cancelElicitations = handlers.cancel;
   }
 
   /** List the registered agent profiles. */
@@ -586,6 +617,14 @@ export class SessionRouter {
 
     const rt = this.runtimes.get(sessionId);
     if (rt) {
+      const record = this.store.get(sessionId);
+      if (record) {
+        await this.cancelElicitations?.(
+          record,
+          "interrupted",
+          "The agent session was replaced before this request completed."
+        ).catch(() => {});
+      }
       await this.retireRuntime(sessionId, rt, "invalidate");
     }
     if (opts?.clearAcpSession) {
@@ -926,6 +965,20 @@ export class SessionRouter {
         }
         // mode === "deny" (or "ask" with no askUser wired)
         return { outcome: { outcome: "cancelled" } };
+      },
+      elicitationHandler: async (request, context) => {
+        if (!this.elicitUser) return { action: "decline" };
+        return this.elicitUser(record, request, context);
+      },
+      completeElicitationHandler: async (notification) => {
+        await this.completeElicitation?.(record, notification);
+      },
+      cancelElicitations: async () => {
+        await this.cancelElicitations?.(
+          record,
+          "cancelled",
+          "The running turn was cancelled before this request completed."
+        );
       },
     });
 

@@ -268,6 +268,31 @@ export interface ChatAdapter {
   editChoiceCard?(message: MessageRef, card: ChoiceCardPost): Promise<void>;
   /** Persistent `choice:` InteractionCreate handler (not a collector). */
   onChoiceInteraction?(handler: (evt: ChoiceInteraction) => void | Promise<void>): void;
+
+  /** Post/edit an ACP elicitation card with Discord-native controls. */
+  sendElicitationCard?(channel: ChannelRef, card: ElicitationCardPost): Promise<MessageRef>;
+  editElicitationCard?(message: MessageRef, card: ElicitationCardPost): Promise<void>;
+}
+
+/** Durable ACP elicitation card. Values are deliberately absent: saved answers
+ * never echo into the public Discord thread. */
+export interface ElicitationCardPost {
+  panel: StructuredPanel;
+  buttons?: ReadonlyArray<{
+    customId?: string;
+    url?: string;
+    label: string;
+    style?: "primary" | "secondary" | "success" | "danger" | "link";
+    disabled?: boolean;
+  }>;
+  select?: {
+    customId: string;
+    placeholder: string;
+    options: ReadonlyArray<{ label: string; value: string; description?: string }>;
+    min: number;
+    max: number;
+    disabled?: boolean;
+  };
 }
 
 /** Frozen choice-card post (#91). Adapter turns this into embed + ActionRows. */

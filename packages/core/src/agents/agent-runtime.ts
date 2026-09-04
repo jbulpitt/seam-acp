@@ -1,15 +1,18 @@
 import { Readable, Writable } from "node:stream";
 import {
-  ClientSideConnection,
+  client,
+  methods,
   PROTOCOL_VERSION,
   ndJsonStream,
   RequestError,
-  type Client,
+  type ClientSideConnection,
+  type ClientConnection,
+  type ClientCapabilities,
+  type CompleteElicitationNotification,
   type McpServer,
   type PromptCapabilities,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
-  type SessionNotification,
   type SessionConfigOption,
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
@@ -29,6 +32,10 @@ import {
   isFastModeDisabledByEnv,
   type FastModeOutcome,
 } from "../core/fast-mode.js";
+import type {
+  ElicitationHandler,
+  ElicitationRequestContext,
+} from "../core/elicitation/types.js";
 
 /** Events surfaced from the ACP `session/update` stream. */
 export type AgentEvent =
@@ -158,6 +165,11 @@ function flattenConfigSelectOptions(
 const START_TIMEOUT_MS = 45_000;
 const NEW_SESSION_TIMEOUT_MS = 45_000;
 
+export const ACP_CLIENT_CAPABILITIES = Object.freeze({
+  fs: Object.freeze({ readTextFile: false, writeTextFile: false }),
+  elicitation: Object.freeze({ form: Object.freeze({}), url: Object.freeze({}) }),
+}) satisfies ClientCapabilities;
+
 function withTimeout<T = never>(ms: number, message: string): Promise<T> {
   return new Promise((_resolve, reject) => {
     const t = setTimeout(() => reject(new Error(message)), ms);
@@ -171,6 +183,11 @@ export class AgentRuntime {
   private readonly permissionPolicy: PermissionPolicy;
   private readonly mcpServers: McpServer[];
   private readonly onDead?: () => void;
+  private readonly elicitationHandler?: ElicitationHandler;
+  private readonly completeElicitationHandler?: (
+    notification: CompleteElicitationNotification
+  ) => Promise<void>;
+  private readonly cancelElicitations?: () => Promise<void>;
   /**
    * Optional spawn override. Remote (bridge) sessions pass a function that
    * mux.spawn()s a slot then rpc("spawn", { slot, mcpServers, … }) before the
@@ -183,6 +200,7 @@ export class AgentRuntime {
 
   private child?: ReturnType<AgentProfile["spawn"]>;
   private connection?: ClientSideConnection;
+  private transportConnection?: ClientConnection;
   private sessionId?: string;
   private sessionInfo?: SessionInfo;
   /** Latest full config-option snapshot advertised by session/new/load/update. */
@@ -291,6 +309,11 @@ export class AgentRuntime {
     logger: Logger;
     permissionPolicy?: PermissionPolicy;
     mcpServers?: McpServer[];
+    elicitationHandler?: ElicitationHandler;
+    completeElicitationHandler?: (
+      notification: CompleteElicitationNotification
+    ) => Promise<void>;
+    cancelElicitations?: () => Promise<void>;
     /** Called when the agent process exits after a successful initialize. */
     onDead?: () => void;
     /**
@@ -307,6 +330,9 @@ export class AgentRuntime {
     this.mcpServers = opts.mcpServers ?? [];
     this.onDead = opts.onDead;
     this.spawnFn = opts.spawnFn;
+    this.elicitationHandler = opts.elicitationHandler;
+    this.completeElicitationHandler = opts.completeElicitationHandler;
+    this.cancelElicitations = opts.cancelElicitations;
     this.permissionPolicy =
       opts.permissionPolicy ??
       (async (req) => {
@@ -411,15 +437,50 @@ export class AgentRuntime {
 
     const stream = ndJsonStream(writable, readable);
 
-    const client = this.makeClient();
-    this.connection = new ClientSideConnection(() => client, stream);
+    const app = client()
+      .onRequest(methods.client.session.requestPermission, ({ params }) =>
+        this.permissionPolicy(params)
+      )
+      .onNotification(methods.client.session.update, async ({ params }) => {
+        await this.handleSessionUpdate(params.update);
+      })
+      .onRequest(methods.client.elicitation.create, async ({ params, requestId, signal }) => {
+        if (!this.elicitationHandler) return { action: "decline" };
+        const context: ElicitationRequestContext = { requestId, signal };
+        return this.elicitationHandler(params, context);
+      })
+      .onNotification(methods.client.elicitation.complete, async ({ params }) => {
+        await this.completeElicitationHandler?.(params);
+      });
+    this.transportConnection = app.connect(stream);
+    const agent = this.transportConnection.agent;
+    // The current SDK's ClientApp exposes one generic typed context. Keep the
+    // runtime's existing narrow connection surface while routing each call
+    // through the stable v1 method constants.
+    this.connection = {
+      initialize: (params: Parameters<ClientSideConnection["initialize"]>[0]) =>
+        agent.request(methods.agent.initialize, params),
+      newSession: (params: Parameters<ClientSideConnection["newSession"]>[0]) =>
+        agent.request(methods.agent.session.new, params),
+      loadSession: (params: Parameters<ClientSideConnection["loadSession"]>[0]) =>
+        agent.request(methods.agent.session.load, params),
+      prompt: (params: Parameters<ClientSideConnection["prompt"]>[0]) =>
+        agent.request(methods.agent.session.prompt, params),
+      setSessionMode: (params: Parameters<ClientSideConnection["setSessionMode"]>[0]) =>
+        agent.request(methods.agent.session.setMode, params),
+      setSessionConfigOption: (
+        params: Parameters<ClientSideConnection["setSessionConfigOption"]>[0]
+      ) => agent.request(methods.agent.session.setConfigOption, params),
+      cancel: (params: Parameters<ClientSideConnection["cancel"]>[0]) =>
+        agent.notify(methods.agent.session.cancel, params),
+      request: <T = unknown>(method: string, params?: unknown) =>
+        agent.request<T>(method, params),
+    } as unknown as ClientSideConnection;
 
     const initResult = await Promise.race([
       this.connection.initialize({
         protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: {
-          fs: { readTextFile: false, writeTextFile: false },
-        },
+        clientCapabilities: ACP_CLIENT_CAPABILITIES,
       }),
       errorWaiter,
       withTimeout(
@@ -1064,6 +1125,9 @@ export class AgentRuntime {
   }
 
   async cancel(): Promise<void> {
+    await this.cancelElicitations?.().catch((err) => {
+      this.logger.warn({ err }, "elicitation cancellation failed");
+    });
     if (!this.connection || !this.sessionId) return;
     try {
       await this.connection.cancel({ sessionId: this.sessionId });
@@ -1132,6 +1196,8 @@ export class AgentRuntime {
         }
       }
     }
+    this.transportConnection?.close();
+    this.transportConnection = undefined;
     this.connection = undefined;
     this.sessionId = undefined;
     this.sessionInfo = undefined;
@@ -1187,21 +1253,6 @@ export class AgentRuntime {
     // divergence past the prompt's opening) doesn't defeat the boundary.
     const prefix = want.slice(0, Math.min(want.length, RESUME_ECHO_PREFIX_LEN));
     return prefix.length >= RESUME_ECHO_MIN_PREFIX && got.includes(prefix);
-  }
-
-  private makeClient(): Client {
-    const runtime = this;
-    return {
-      async requestPermission(
-        params: RequestPermissionRequest
-      ): Promise<RequestPermissionResponse> {
-        return runtime.permissionPolicy(params);
-      },
-
-      async sessionUpdate(params: SessionNotification): Promise<void> {
-        await runtime.handleSessionUpdate(params.update);
-      },
-    };
   }
 
   private handleSessionUpdate(update: SessionUpdate): Promise<void> {

@@ -86,6 +86,12 @@ import type {
   InboundAdmission,
   NewInboundAdmission,
 } from "./inbound-admission/types.js";
+import type {
+  ElicitationRow,
+  ElicitationStatus,
+  ElicitationTerminalStatus,
+  NewElicitationRow,
+} from "./elicitation/types.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -387,6 +393,7 @@ export class SessionStore {
     this.db.exec(INBOX_SCHEMA);
     this.db.exec(PARKED_PROMPTS_SCHEMA);
     this.db.exec(INBOUND_ADMISSIONS_SCHEMA);
+    this.db.exec(ELICITATIONS_SCHEMA);
     this.migrateParkedKind();
     this.db.exec(CHOICE_CARDS_SCHEMA);
     this.migrateChoiceIngest();
@@ -1124,6 +1131,275 @@ export class SessionStore {
            updated_utc     = excluded.updated_utc`
       )
       .run({ ...record, namePrefix: record.namePrefix ?? null });
+  }
+
+  /** Atomically supersede every conflicting open request and publish a new one. */
+  replaceOpenElicitation(row: NewElicitationRow): ElicitationRow[] {
+    return this.db.transaction((input: NewElicitationRow) => {
+      const conflicts = this.db
+        .prepare<[string, string | null, string | null], ElicitationDbRow>(
+          `SELECT * FROM elicitations
+             WHERE status = 'open'
+               AND (session_record_id = ?
+                 OR (? IS NOT NULL AND elicitation_id = ?))
+             ORDER BY created_utc ASC`
+        )
+        .all(input.sessionRecordId, input.elicitationId, input.elicitationId);
+      this.db
+        .prepare(
+          `UPDATE elicitations
+              SET status = 'superseded', terminal_detail = 'replaced by a newer elicitation',
+                  values_json = '{}', lease_token = NULL, lease_expires_utc = NULL,
+                  updated_utc = @updatedUtc
+            WHERE status = 'open'
+              AND (session_record_id = @sessionRecordId
+                OR (@elicitationId IS NOT NULL AND elicitation_id = @elicitationId))`
+        )
+        .run(input);
+      this.db
+        .prepare(
+          `INSERT INTO elicitations (
+             id, session_record_id, platform, channel_ref, parent_ref,
+             authorized_user_id, acp_session_id, request_correlation, mode,
+             elicitation_id, request_json, values_json, completed_pages_json,
+             current_page, status, message_id, lease_token, lease_expires_utc,
+             terminal_detail, created_utc, updated_utc, expires_utc
+           ) VALUES (
+             @id, @sessionRecordId, @platform, @channelRef, @parentRef,
+             @authorizedUserId, @acpSessionId, @requestCorrelation, @mode,
+             @elicitationId, @requestJson, @valuesJson, @completedPagesJson,
+             @currentPage, @status, @messageId, @leaseToken, @leaseExpiresUtc,
+             @terminalDetail, @createdUtc, @updatedUtc, @expiresUtc
+           )`
+        )
+        .run(input);
+      return conflicts.map((old) =>
+        mapElicitation({
+          ...old,
+          status: "superseded",
+          values_json: "{}",
+          terminal_detail: "replaced by a newer elicitation",
+          lease_token: null,
+          lease_expires_utc: null,
+          updated_utc: input.updatedUtc,
+        })
+      );
+    })(row);
+  }
+
+  getElicitation(id: string): ElicitationRow | null {
+    const row = this.db
+      .prepare<[string], ElicitationDbRow>("SELECT * FROM elicitations WHERE id = ?")
+      .get(id);
+    return row ? mapElicitation(row) : null;
+  }
+
+  listOpenElicitations(): ElicitationRow[] {
+    return this.db
+      .prepare<[], ElicitationDbRow>(
+        "SELECT * FROM elicitations WHERE status = 'open' ORDER BY created_utc ASC"
+      )
+      .all()
+      .map(mapElicitation);
+  }
+
+  findOpenElicitationByExternalId(elicitationId: string): ElicitationRow | null {
+    const row = this.db
+      .prepare<[string], ElicitationDbRow>(
+        `SELECT * FROM elicitations
+          WHERE elicitation_id = ? AND status = 'open'
+          ORDER BY created_utc DESC LIMIT 1`
+      )
+      .get(elicitationId);
+    return row ? mapElicitation(row) : null;
+  }
+
+  attachElicitationMessage(id: string, messageId: string, nowUtc: string): boolean {
+    return this.db
+      .prepare(
+        `UPDATE elicitations SET message_id = ?, updated_utc = ?
+          WHERE id = ? AND status = 'open' AND message_id IS NULL`
+      )
+      .run(messageId, nowUtc, id).changes === 1;
+  }
+
+  claimElicitationLease(
+    id: string,
+    token: string,
+    leaseExpiresUtc: string,
+    nowUtc: string
+  ): ElicitationRow | null {
+    const changed = this.db
+      .prepare(
+        `UPDATE elicitations
+            SET lease_token = ?, lease_expires_utc = ?, updated_utc = ?
+          WHERE id = ? AND status = 'open'`
+      )
+      .run(token, leaseExpiresUtc, nowUtc, id).changes;
+    return changed === 1 ? this.getElicitation(id) : null;
+  }
+
+  releaseElicitationLease(id: string, token: string, nowUtc: string): boolean {
+    return this.db
+      .prepare(
+        `UPDATE elicitations
+            SET lease_token = NULL, lease_expires_utc = NULL, updated_utc = ?
+          WHERE id = ? AND status = 'open' AND lease_token = ?`
+      )
+      .run(nowUtc, id, token).changes === 1;
+  }
+
+  saveElicitationPage(input: {
+    id: string;
+    leaseToken: string;
+    valuesJson: string;
+    completedPagesJson: string;
+    currentPage: number;
+    nowUtc: string;
+  }): ElicitationRow | null {
+    const changed = this.db
+      .prepare(
+        `UPDATE elicitations
+            SET values_json = @valuesJson,
+                completed_pages_json = @completedPagesJson,
+                current_page = @currentPage,
+                lease_token = NULL,
+                lease_expires_utc = NULL,
+                updated_utc = @nowUtc
+          WHERE id = @id AND status = 'open' AND lease_token = @leaseToken`
+      )
+      .run(input).changes;
+    return changed === 1 ? this.getElicitation(input.id) : null;
+  }
+
+  setElicitationPage(id: string, page: number, nowUtc: string): ElicitationRow | null {
+    const changed = this.db
+      .prepare(
+        `UPDATE elicitations
+            SET current_page = ?, lease_token = NULL, lease_expires_utc = NULL, updated_utc = ?
+          WHERE id = ? AND status = 'open'`
+      )
+      .run(page, nowUtc, id).changes;
+    return changed === 1 ? this.getElicitation(id) : null;
+  }
+
+  settleElicitation(
+    id: string,
+    status: ElicitationTerminalStatus,
+    detail: string,
+    nowUtc: string
+  ): ElicitationRow | null {
+    return this.db.transaction(() => {
+      const before = this.db
+        .prepare<[string], ElicitationDbRow>(
+          "SELECT * FROM elicitations WHERE id = ? AND status = 'open'"
+        )
+        .get(id);
+      if (!before) return null;
+      const changed = this.db
+        .prepare(
+          `UPDATE elicitations
+              SET status = ?, values_json = '{}', terminal_detail = ?, lease_token = NULL,
+                  lease_expires_utc = NULL, updated_utc = ?
+            WHERE id = ? AND status = 'open'`
+        )
+        .run(status, detail, nowUtc, id).changes;
+      return changed === 1
+        ? mapElicitation({
+            ...before,
+            status,
+            values_json: "{}",
+            terminal_detail: detail,
+            lease_token: null,
+            lease_expires_utc: null,
+            updated_utc: nowUtc,
+          })
+        : null;
+    })();
+  }
+
+  acceptElicitation(
+    id: string,
+    detail: string,
+    nowUtc: string,
+    leaseToken?: string
+  ): ElicitationRow | null {
+    return this.db.transaction(() => {
+      const before = this.db
+        .prepare<[string], ElicitationDbRow>(
+          "SELECT * FROM elicitations WHERE id = ? AND status = 'open'"
+        )
+        .get(id);
+      if (!before || (leaseToken !== undefined && before.lease_token !== leaseToken)) return null;
+      const changed = this.db
+        .prepare(
+          `UPDATE elicitations
+              SET status = 'accepted', values_json = '{}', terminal_detail = ?,
+                  lease_token = NULL, lease_expires_utc = NULL, updated_utc = ?
+            WHERE id = ? AND status = 'open'
+              AND (? IS NULL OR lease_token = ?)`
+        )
+        .run(detail, nowUtc, id, leaseToken ?? null, leaseToken ?? null).changes;
+      return changed === 1
+        ? mapElicitation({
+            ...before,
+            status: "accepted",
+            values_json: "{}",
+            terminal_detail: detail,
+            lease_token: null,
+            lease_expires_utc: null,
+            updated_utc: nowUtc,
+          })
+        : null;
+    })();
+  }
+
+  settleOpenElicitationsForSession(
+    sessionRecordId: string,
+    status: Exclude<ElicitationTerminalStatus, "accepted">,
+    detail: string,
+    nowUtc: string
+  ): ElicitationRow[] {
+    return this.db.transaction(() => {
+      const rows = this.db
+        .prepare<[string], ElicitationDbRow>(
+          "SELECT * FROM elicitations WHERE session_record_id = ? AND status = 'open'"
+        )
+        .all(sessionRecordId);
+      this.db
+        .prepare(
+          `UPDATE elicitations
+              SET status = ?, values_json = '{}', terminal_detail = ?, lease_token = NULL,
+                  lease_expires_utc = NULL, updated_utc = ?
+            WHERE session_record_id = ? AND status = 'open'`
+        )
+        .run(status, detail, nowUtc, sessionRecordId);
+      return rows.map((row) =>
+        mapElicitation({
+          ...row,
+          status,
+          values_json: "{}",
+          terminal_detail: detail,
+          lease_token: null,
+          lease_expires_utc: null,
+          updated_utc: nowUtc,
+        })
+      );
+    })();
+  }
+
+  clearExpiredElicitationLeases(nowUtc: string): number {
+    return this.db
+      .prepare(
+        `UPDATE elicitations
+            SET lease_token = NULL, lease_expires_utc = NULL, updated_utc = ?
+          WHERE status = 'open' AND lease_expires_utc IS NOT NULL AND lease_expires_utc <= ?`
+      )
+      .run(nowUtc, nowUtc).changes;
+  }
+
+  clearElicitationValues(id: string): void {
+    this.db.prepare("UPDATE elicitations SET values_json = '{}' WHERE id = ?").run(id);
   }
 
   /**
@@ -6839,6 +7115,93 @@ CREATE TABLE IF NOT EXISTS inbound_admissions (
 CREATE INDEX IF NOT EXISTS idx_inbound_channel_state
   ON inbound_admissions(channel_ref, state, created_utc);
 `;
+
+// --- durable ACP elicitation state (#45) -----------------------------------
+
+const ELICITATIONS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS elicitations (
+  id                       TEXT PRIMARY KEY,
+  session_record_id        TEXT NOT NULL,
+  platform                 TEXT NOT NULL,
+  channel_ref              TEXT NOT NULL,
+  parent_ref               TEXT,
+  authorized_user_id       TEXT NOT NULL,
+  acp_session_id           TEXT,
+  request_correlation      TEXT NOT NULL,
+  mode                     TEXT NOT NULL CHECK (mode IN ('form','url')),
+  elicitation_id           TEXT,
+  request_json             TEXT NOT NULL,
+  values_json              TEXT NOT NULL DEFAULT '{}',
+  completed_pages_json     TEXT NOT NULL DEFAULT '[]',
+  current_page             INTEGER NOT NULL DEFAULT 0,
+  status                   TEXT NOT NULL CHECK (
+    status IN ('open','accepted','cancelled','expired','superseded','interrupted','declined')
+  ),
+  message_id               TEXT,
+  lease_token              TEXT,
+  lease_expires_utc        TEXT,
+  terminal_detail          TEXT,
+  created_utc              TEXT NOT NULL,
+  updated_utc              TEXT NOT NULL,
+  expires_utc              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_elicitation_session_status
+  ON elicitations(session_record_id, status, created_utc);
+CREATE INDEX IF NOT EXISTS idx_elicitation_expiry
+  ON elicitations(status, expires_utc);
+CREATE INDEX IF NOT EXISTS idx_elicitation_external
+  ON elicitations(elicitation_id, status);
+`;
+
+interface ElicitationDbRow {
+  id: string;
+  session_record_id: string;
+  platform: string;
+  channel_ref: string;
+  parent_ref: string | null;
+  authorized_user_id: string;
+  acp_session_id: string | null;
+  request_correlation: string;
+  mode: "form" | "url";
+  elicitation_id: string | null;
+  request_json: string;
+  values_json: string;
+  completed_pages_json: string;
+  current_page: number;
+  status: ElicitationStatus;
+  message_id: string | null;
+  lease_token: string | null;
+  lease_expires_utc: string | null;
+  terminal_detail: string | null;
+  created_utc: string;
+  updated_utc: string;
+  expires_utc: string;
+}
+
+const mapElicitation = (row: ElicitationDbRow): ElicitationRow => ({
+  id: row.id,
+  sessionRecordId: row.session_record_id,
+  platform: row.platform,
+  channelRef: row.channel_ref,
+  parentRef: row.parent_ref,
+  authorizedUserId: row.authorized_user_id,
+  acpSessionId: row.acp_session_id,
+  requestCorrelation: row.request_correlation,
+  mode: row.mode,
+  elicitationId: row.elicitation_id,
+  requestJson: row.request_json,
+  valuesJson: row.values_json,
+  completedPagesJson: row.completed_pages_json,
+  currentPage: row.current_page,
+  status: row.status,
+  messageId: row.message_id,
+  leaseToken: row.lease_token,
+  leaseExpiresUtc: row.lease_expires_utc,
+  terminalDetail: row.terminal_detail,
+  createdUtc: row.created_utc,
+  updatedUtc: row.updated_utc,
+  expiresUtc: row.expires_utc,
+});
 
 interface InboundAdmissionRow {
   message_id: string;

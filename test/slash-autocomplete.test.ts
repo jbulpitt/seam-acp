@@ -235,6 +235,91 @@ describe("slash autocomplete responders", () => {
     expect(responded[0]).toEqual([{ name: "Grok 4.6 (grok-4.6)", value: "grok-4.6" }]);
   });
 
+  it("config set agent suggests the same agent@location values as the dedicated command", async () => {
+    const { orch } = makeOrch();
+    const { i, responded } = autocompleteI({
+      group: "config",
+      sub: "set",
+      option: "agent",
+      value: "cop",
+    });
+    await orch.handleAutocompleteInteraction(i as any);
+    expect(responded[0]).toEqual([
+      { name: "🏠 Copilot @ local (copilot@local)", value: "copilot@local" },
+    ]);
+  });
+
+  it("config set model and effort follow the sibling agent option", async () => {
+    store.upsert(session({ agentId: "grok" }));
+    const { orch } = makeOrch();
+    const data = [
+      {
+        name: "config",
+        options: [
+          {
+            name: "set",
+            options: [
+              { name: "agent", value: "copilot@local" },
+              { name: "model", value: "", focused: true },
+            ],
+          },
+        ],
+      },
+    ];
+    const { i, responded } = autocompleteI({
+      group: "config",
+      sub: "set",
+      option: "model",
+      value: "",
+      data,
+    });
+    await orch.handleAutocompleteInteraction(i as any);
+    expect(responded[0]).toEqual([{ name: "GPT-5 (gpt-5)", value: "gpt-5" }]);
+
+    const effortData = JSON.parse(JSON.stringify(data));
+    effortData[0].options[0].options[1] = { name: "effort", value: "", focused: true };
+    const { i: effort, responded: effortResponded } = autocompleteI({
+      group: "config",
+      sub: "set",
+      option: "effort",
+      value: "",
+      data: effortData,
+    });
+    await orch.handleAutocompleteInteraction(effort as any);
+    expect(effortResponded[0]).toEqual([{ name: "Default / unset", value: "default" }]);
+  });
+
+  it("config set repo uses the same workspace cache-backed responder", async () => {
+    const { orch } = makeOrch();
+    const { i, responded } = autocompleteI({
+      group: "config",
+      sub: "set",
+      option: "repo",
+      value: "bet",
+    });
+    await orch.handleAutocompleteInteraction(i as any);
+    expect(responded[0]).toEqual([
+      { name: "beta-lib", value: path.join(reposRoot, "beta-lib") },
+    ]);
+  });
+
+  it.each([
+    ["role", "qa", [{ name: "QA", value: "qa" }]],
+    ["permissions", "as", [{ name: "Ask each time", value: "ask" }]],
+    ["card", "si", [{ name: "Simple", value: "simple" }]],
+    ["gif", "de", [{ name: "Default / inherit", value: "default" }]],
+  ])("config set %s has bounded autocomplete", async (option, value, expected) => {
+    const { orch } = makeOrch();
+    const { i, responded } = autocompleteI({
+      group: "config",
+      sub: "set",
+      option,
+      value,
+    });
+    await orch.handleAutocompleteInteraction(i as any);
+    expect(responded[0]).toEqual(expected);
+  });
+
   it("config model is empty when no session is bound", async () => {
     const { orch } = makeOrch();
     const { i, responded } = autocompleteI({

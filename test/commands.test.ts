@@ -185,6 +185,22 @@ describe("/seam — everyday surface", () => {
       "thread",
       "channel",
     ]);
+    const set = config?.options?.find((o) => o.name === "set");
+    expect((set?.options ?? []).map((o) => o.name)).toEqual([
+      "json",
+      "agent",
+      "model",
+      "effort",
+      "repo",
+      "role",
+      "permissions",
+      "card",
+      "gif",
+    ]);
+    expect(set?.options?.find((o) => o.name === "json")?.required ?? false).toBe(false);
+    for (const name of ["agent", "model", "effort", "repo", "role", "permissions", "card", "gif"]) {
+      expect(set?.options?.find((o) => o.name === name)?.autocomplete, name).toBe(true);
+    }
   });
 
   it("info group has 6 leaves", () => {

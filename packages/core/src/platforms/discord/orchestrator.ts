@@ -486,6 +486,8 @@ import {
 } from "../../core/thread-secrets.js";
 import {
   defaultSessionConfig,
+  parseSimpleCardGif,
+  parseStatusCardStyle,
   type ActiveProject,
   type DelegationKind,
   type PanelOrigin,
@@ -990,7 +992,7 @@ export class Orchestrator {
    * `handleAutocompleteInteraction` (never a one-off branch there).
    */
   private wireSlashAutocomplete(): void {
-    this.autocomplete.register("config", "agent", "id", (ctx) => {
+    const agentAtLocationResponder: AutocompleteResponder = (ctx) => {
       try {
         const choices = agentLocationPickerChoices(this.router.listProfiles(), {
           bridges: this.config.bridgePresets.values(),
@@ -1004,11 +1006,30 @@ export class Orchestrator {
       } catch {
         return [];
       }
-    });
+    };
+    this.autocomplete.register("config", "agent", "id", agentAtLocationResponder);
 
-    this.autocomplete.register("config", "repo", "path", async (ctx) => {
+    this.autocomplete.register("config", "set", "agent", agentAtLocationResponder);
+
+    const repoResponder: AutocompleteResponder = async (ctx) => {
       try {
         const dirs = await this.listHostWorkspacePaths(ctx.channelId);
+        if (!dirs) return [];
+        return labeledAutocompleteChoices(
+          dirs.map((p) => ({ name: path.basename(p), value: p })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    };
+    this.autocomplete.register("config", "repo", "path", repoResponder);
+    this.autocomplete.register("config", "set", "repo", async (ctx) => {
+      try {
+        const selected = ctx.optionValues?.agent?.trim();
+        const parsed = selected ? parseAgentAtLocation(selected) : undefined;
+        const location = parsed?.explicit ? parsed.location : undefined;
+        const dirs = await this.listHostWorkspacePaths(ctx.channelId, location);
         if (!dirs) return [];
         return labeledAutocompleteChoices(
           dirs.map((p) => ({ name: path.basename(p), value: p })),
@@ -1035,6 +1056,95 @@ export class Orchestrator {
         return [];
       }
     });
+
+    this.autocomplete.register("config", "set", "model", async (ctx) => {
+      try {
+        const selectedAgent = ctx.optionValues?.agent?.trim() || ctx.agentId;
+        if (!selectedAgent) return [];
+        const profile = this.router.getProfile(parseAgentAtLocation(selectedAgent).agentId);
+        if (!profile) return [];
+        const models = await pickerModelsForProfile(profile, DISCORD_AUTOCOMPLETE_MAX);
+        return labeledAutocompleteChoices(
+          models.map((m) => ({
+            name: m.name && m.name !== m.modelId ? `${m.name} (${m.modelId})` : m.modelId,
+            value: m.modelId,
+          })),
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+
+    this.autocomplete.register("config", "set", "effort", (ctx) => {
+      try {
+        const selectedAgent = ctx.optionValues?.agent?.trim() || ctx.agentId;
+        const profile = selectedAgent
+          ? this.router.getProfile(parseAgentAtLocation(selectedAgent).agentId)
+          : undefined;
+        const levels = profile?.effort?.levels ?? [];
+        return labeledAutocompleteChoices(
+          [
+            { name: "Default / unset", value: "default" },
+            ...EFFORT_CHOICES.filter((choice) => levels.includes(choice.value)).map((choice) => ({
+              name: choice.label,
+              value: choice.value,
+            })),
+          ],
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+
+    this.autocomplete.register("config", "set", "role", (ctx) =>
+      labeledAutocompleteChoices(
+        [
+          { name: "Auto / none", value: "auto" },
+          { name: "Orchestrator", value: "orchestrator" },
+          { name: "Worker", value: "worker" },
+          { name: "QA", value: "qa" },
+          { name: "Analyst", value: "analyst" },
+          { name: "Planner", value: "planner" },
+        ],
+        ctx.focusedValue
+      )
+    );
+    const fixedSetChoices: ReadonlyArray<{
+      option: "permissions" | "card" | "gif";
+      choices: ReadonlyArray<{ name: string; value: string }>;
+    }> = [
+      {
+        option: "permissions",
+        choices: [
+          { name: "Always approve", value: "always" },
+          { name: "Ask each time", value: "ask" },
+          { name: "Deny", value: "deny" },
+        ],
+      },
+      {
+        option: "card",
+        choices: [
+          { name: "Full", value: "full" },
+          { name: "Simple", value: "simple" },
+          { name: "Default / inherit", value: "default" },
+        ],
+      },
+      {
+        option: "gif",
+        choices: [
+          { name: "On", value: "on" },
+          { name: "Off", value: "off" },
+          { name: "Default / inherit", value: "default" },
+        ],
+      },
+    ];
+    for (const { option, choices } of fixedSetChoices) {
+      this.autocomplete.register("config", "set", option, (ctx) =>
+        labeledAutocompleteChoices(choices, ctx.focusedValue)
+      );
+    }
 
     this.autocomplete.register("config", "mode", "id", (ctx) => {
       try {
@@ -16146,30 +16256,312 @@ export class Orchestrator {
     i: ChatInputCommandInteraction
   ): Promise<void> {
     const record = this.recordFromInteraction(i);
-    if (!record) {
+    const channel = this.channelRefFromInteraction(i);
+    if (!record || !channel) {
       await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const json = i.options.getString("json", true);
-    let cfg: SessionConfigState;
-    try {
-      const parsed = JSON.parse(json) as unknown;
-      if (!parsed || typeof parsed !== "object") throw new Error("not an object");
-      cfg = parsed as SessionConfigState;
-    } catch (err) {
+    const names = [
+      "agent",
+      "model",
+      "effort",
+      "repo",
+      "role",
+      "permissions",
+      "card",
+      "gif",
+    ] as const;
+    const json = i.options.getString("json");
+    const values = Object.fromEntries(names.map((name) => [name, i.options.getString(name)])) as
+      Record<(typeof names)[number], string | null>;
+    const supplied = names.filter((name) => values[name] !== null);
+    if (json !== null && supplied.length > 0) {
       await i.reply({
-        content: `Invalid JSON: ${(err as Error).message}`,
+        content: "Use either `json:` or named fields, not both.",
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
-    if (!cfg.model) cfg.model = this.config.DEFAULT_MODEL;
-    this.persistConfig(record, cfg);
-    await this.router.invalidate(record.id);
-    await i.reply({
-      content: "Config replaced; next turn starts a fresh runtime.",
-      flags: MessageFlags.Ephemeral,
-    });
+    if (json === null && supplied.length === 0) {
+      await i.reply({
+        content: "Provide `json:` or at least one named field.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    // A repo lookup or runtime retirement can exceed Discord's three-second
+    // interaction deadline. Acknowledge before either one starts.
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+
+    if (json !== null) {
+      let cfg: SessionConfigState;
+      try {
+        const parsed = JSON.parse(json) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error("not an object");
+        }
+        cfg = parsed as SessionConfigState;
+      } catch (err) {
+        await i.editReply(`Invalid JSON: ${(err as Error).message}`);
+        return;
+      }
+      if (!cfg.model) cfg.model = this.config.DEFAULT_MODEL;
+      try {
+        await this.router.invalidate(record.id);
+        this.persistConfig(this.store.get(record.id) ?? record, cfg);
+        await this.applyThreadName(this.store.get(record.id) ?? record);
+        await i.editReply("Config replaced; next turn starts a fresh runtime.");
+      } catch (err) {
+        this.logger.warn({ err, sessionId: record.id }, "JSON config replacement failed");
+        await i.editReply(
+          `Could not replace config: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      return;
+    }
+
+    const requestedAgent = values.agent?.trim();
+    if (values.agent !== null && !requestedAgent) {
+      await i.editReply("`agent` must be a non-empty profile id.");
+      return;
+    }
+    const parsedAgent = requestedAgent ? parseAgentAtLocation(requestedAgent) : undefined;
+    const before = this.store.get(record.id) ?? record;
+    const describedBefore = this.router.describeConfig(before);
+    const nextAgentId = parsedAgent?.agentId ?? describedBefore.agent.value;
+    const profile = this.router.getProfile(nextAgentId);
+    if (!profile) {
+      await i.editReply(`Unknown agent \`${nextAgentId}\`.`);
+      return;
+    }
+
+    const requestedModel = values.model?.trim();
+    if (values.model !== null && !requestedModel) {
+      await i.editReply("`model` must be a non-empty id.");
+      return;
+    }
+    const requestedEffort = values.effort?.trim().toLowerCase();
+    const clearEffort = requestedEffort === "default" || requestedEffort === "auto";
+    if (values.effort !== null && !requestedEffort) {
+      await i.editReply("`effort` must be a level or `default`.");
+      return;
+    }
+    if (
+      requestedEffort &&
+      !clearEffort &&
+      !(profile.effort?.levels ?? []).includes(requestedEffort)
+    ) {
+      const supported = profile.effort?.levels ?? [];
+      await i.editReply(
+        `Effort \`${requestedEffort}\` is not supported by \`${nextAgentId}\`. ` +
+          `Choose ${supported.length ? supported.map((v) => `\`${v}\``).join(", ") : "`default`"}.`
+      );
+      return;
+    }
+
+    const requestedRole = values.role?.trim();
+    if (requestedRole && requestedRole.length > 64) {
+      await i.editReply("`role` must be at most 64 characters.");
+      return;
+    }
+    const permission = values.permissions?.trim().toLowerCase();
+    if (
+      values.permissions !== null &&
+      (!permission || (permission !== "always" && permission !== "ask" && permission !== "deny"))
+    ) {
+      await i.editReply("`permissions` must be `always`, `ask`, or `deny`.");
+      return;
+    }
+    const card = values.card?.trim().toLowerCase();
+    if (values.card !== null && (!card || (card !== "default" && !parseStatusCardStyle(card)))) {
+      await i.editReply("`card` must be `full`, `simple`, or `default`.");
+      return;
+    }
+    const gif = values.gif?.trim().toLowerCase();
+    if (
+      values.gif !== null &&
+      (!gif || (gif !== "default" && parseSimpleCardGif(gif) === undefined))
+    ) {
+      await i.editReply("`gif` must be `on`, `off`, or `default`.");
+      return;
+    }
+
+    const currentLocation = resolveThreadLocation(this.config, channel.id);
+    const nextLocation = parsedAgent?.explicit ? parsedAgent.location : currentLocation;
+    let resolvedRepo: string | undefined;
+    if (values.repo !== null) {
+      const requestedRepo = values.repo?.trim();
+      if (!requestedRepo) {
+        await i.editReply("`repo` must be a non-empty path.");
+        return;
+      }
+      try {
+        resolvedRepo = await this.resolveRequestedRepoPath(channel, requestedRepo, nextLocation);
+      } catch (err) {
+        await i.editReply(`Invalid repo: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      if (isLocalLocation(nextLocation) && !isWithinRoot(resolvedRepo, this.config.REPOS_ROOT)) {
+        await i.editReply(
+          `Repo \`${resolvedRepo}\` is outside REPOS_ROOT (\`${this.config.REPOS_ROOT}\`).`
+        );
+        return;
+      }
+    }
+
+    const restartRequested =
+      values.agent !== null ||
+      values.model !== null ||
+      values.effort !== null ||
+      values.repo !== null;
+    let sessionBefore: SessionRecord | undefined;
+    let overlayBefore: unknown | undefined;
+    let mutationStarted = false;
+    const rollback = (): string => {
+      if (!mutationStarted || !sessionBefore) return "";
+      const restored = this.configMutation.restoreThreadPresetEntry(channel.id, overlayBefore);
+      this.store.upsert(sessionBefore);
+      return restored.ok ? "" : ` Overlay rollback also failed: ${restored.error}`;
+    };
+    try {
+      if (restartRequested) {
+        // Retire first, then take the authoritative row. Nothing awaits between
+        // this read and the single SQLite upsert, so a concurrent config write
+        // cannot be lost across the retirement window.
+        await this.router.invalidate(record.id, { clearAcpSession: false });
+      }
+      const live = this.store.get(record.id) ?? record;
+      const liveDescription = this.router.describeConfig(live);
+      const appliedAgentId = parsedAgent?.agentId ?? liveDescription.agent.value;
+      const storedAgentId = parsedAgent?.agentId ?? live.agentId;
+      const appliedProfile = this.router.getProfile(appliedAgentId);
+      if (!appliedProfile) {
+        await i.editReply(`Unknown agent \`${appliedAgentId}\`.`);
+        return;
+      }
+      if (
+        requestedEffort &&
+        !clearEffort &&
+        !(appliedProfile.effort?.levels ?? []).includes(requestedEffort)
+      ) {
+        await i.editReply(
+          `Effort \`${requestedEffort}\` is not supported by \`${appliedAgentId}\`.`
+        );
+        return;
+      }
+      sessionBefore = { ...live };
+      overlayBefore = this.configMutation.readThreadPresetEntry(channel.id);
+      const cfg = this.store.readConfig(live);
+      const agentChanged = appliedAgentId !== liveDescription.agent.value;
+      const locationChanged = nextLocation !== liveDescription.location.value;
+      const model = requestedModel ?? (agentChanged ? appliedProfile.defaultModel : cfg.model);
+      if (model !== undefined) cfg.model = model;
+      if (values.model !== null || agentChanged) delete cfg.lastContextUsage;
+      if (values.effort !== null) {
+        if (clearEffort) delete cfg.reasoningEffort;
+        else cfg.reasoningEffort = requestedEffort;
+      }
+      if (values.role !== null) {
+        if (!requestedRole || requestedRole.toLowerCase() === "auto") delete cfg.role;
+        else cfg.role = requestedRole;
+      }
+      if (values.permissions !== null) {
+        cfg.permissionPolicy = permission as PermissionPolicyMode;
+        delete cfg.autoApprovePermissions;
+      }
+      if (values.card !== null) {
+        if (!card || card === "default") delete cfg.statusCardStyle;
+        else cfg.statusCardStyle = card as StatusCardStyle;
+      }
+      if (values.gif !== null) {
+        if (!gif || gif === "default") delete cfg.simpleCardGif;
+        else cfg.simpleCardGif = parseSimpleCardGif(gif);
+      }
+      const updated = {
+        ...live,
+        agentId: storedAgentId,
+        ...(resolvedRepo !== undefined ? { repoPath: resolvedRepo } : {}),
+        ...(agentChanged || locationChanged ? { acpSessionId: "" } : {}),
+        configJson: this.store.writeConfig(cfg),
+        updatedUtc: new Date().toISOString(),
+      };
+      mutationStarted = true;
+      this.store.upsert(updated);
+
+      const overlayChanges: {
+        agent?: string;
+        model?: string;
+        effort?: string | null;
+        location?: string;
+      } = {};
+      if (values.agent !== null) {
+        overlayChanges.agent = appliedAgentId;
+        if (model !== undefined) overlayChanges.model = model;
+        if (parsedAgent?.explicit) overlayChanges.location = nextLocation;
+      } else if (values.model !== null && model !== undefined) {
+        overlayChanges.model = model;
+      }
+      if (values.effort !== null) {
+        overlayChanges.effort = clearEffort ? null : requestedEffort;
+      }
+      if (Object.keys(overlayChanges).length > 0) {
+        const overlaid = this.configMutation.applyThreadOverlay({
+          threadId: channel.id,
+          ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+          changes: overlayChanges,
+          actor: {
+            id: i.user.id,
+            name: i.user.displayName ?? i.user.username,
+          },
+        });
+        if (!overlaid.ok) throw new Error(overlaid.error);
+      }
+
+      const committed = this.store.get(record.id) ?? updated;
+      const effective = this.router.describeConfig(committed);
+      const mismatch =
+        (values.agent !== null && effective.agent.value !== appliedAgentId) ||
+        ((values.model !== null || agentChanged) &&
+          model !== undefined &&
+          effective.model.value !== model) ||
+        (values.effort !== null &&
+          !clearEffort &&
+          effective.effort.value !== requestedEffort) ||
+        (parsedAgent?.explicit === true && effective.location.value !== nextLocation);
+      if (mismatch) {
+        throw new Error("the effective agent/model/effort/location did not match the requested values");
+      }
+      if (parsedAgent?.explicit) bindSessionLocation(this.bridgeHub, committed.id, nextLocation);
+      // The durable session + overlay commit is complete. Presentation failures
+      // after this point must never roll a successfully applied config back.
+      mutationStarted = false;
+      await this.applyThreadName(this.store.get(record.id) ?? updated);
+
+      const changed = supplied.map((name) => `\`${name}\``).join(", ");
+      await i.editReply(
+        `Updated ${changed}. Effective: agent \`${effective.agent.value}\`, model ` +
+          `\`${effective.model.value}\`, effort \`${effective.effort.value ?? "default"}\`, ` +
+          `repo \`${this.repoDisplay(effective.cwd.value)}\`, role ` +
+          `\`${effective.role.value ?? "auto"}\`, permissions \`${effective.permission.value}\`, ` +
+          `card \`${effective.statusCardStyle.value}\`, gif ` +
+          `\`${effective.simpleCardGif.value ? "on" : "off"}\`.` +
+          (restartRequested ? " Next turn uses the new runtime configuration." : "")
+      );
+    } catch (err) {
+      let rollbackError = "";
+      try {
+        rollbackError = rollback();
+      } catch (rollbackFailure) {
+        rollbackError = ` Rollback failed: ${
+          rollbackFailure instanceof Error ? rollbackFailure.message : String(rollbackFailure)
+        }`;
+      }
+      this.logger.warn({ err, sessionId: record.id }, "bulk config set failed");
+      await i.editReply(
+        `Could not update config: ${err instanceof Error ? err.message : String(err)}${rollbackError}`
+      );
+    }
   }
 
   private async cmdRepos(i: ChatInputCommandInteraction): Promise<void> {
@@ -18347,15 +18739,16 @@ export class Orchestrator {
    */
   private async resolveRequestedRepoPath(
     channel: ChannelRef,
-    requested: string
+    requested: string,
+    locationOverride?: string
   ): Promise<string> {
-    const location = resolveThreadLocation(this.config, channel.id);
+    const location = locationOverride ?? resolveThreadLocation(this.config, channel.id);
     if (isLocalLocation(location)) {
       return resolveRepoPath(this.config.REPOS_ROOT, requested);
     }
     if (requested.startsWith("/")) return requested;
     return (
-      (await this.listHostWorkspacePaths(channel.id))?.find(
+      (await this.listHostWorkspacePaths(channel.id, location))?.find(
         (p) => path.basename(p) === requested || p === requested
       ) ?? requested
     );

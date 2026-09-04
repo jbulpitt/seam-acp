@@ -455,9 +455,33 @@ export function buildSeamCommand(): SlashCommandBuilder {
       .addSubcommand((sub) =>
         sub
           .setName("set")
-          .setDescription("Replace session config with a JSON blob")
+          .setDescription("Patch named config fields together, or replace session JSON")
           .addStringOption((o) =>
-            o.setName("json").setDescription("Config JSON").setRequired(true)
+            o.setName("json").setDescription("Full config JSON (cannot mix with named fields)").setRequired(false)
+          )
+          .addStringOption((o) =>
+            o.setName("agent").setDescription("Agent id or agent@host").setRequired(false).setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o.setName("model").setDescription("Model id").setRequired(false).setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o.setName("effort").setDescription("Reasoning effort; default clears").setRequired(false).setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o.setName("repo").setDescription("Working repo path").setRequired(false).setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o.setName("role").setDescription("Naming role; auto clears").setRequired(false).setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o.setName("permissions").setDescription("always, ask, or deny").setRequired(false).setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o.setName("card").setDescription("full, simple, or default").setRequired(false).setAutocomplete(true)
+          )
+          .addStringOption((o) =>
+            o.setName("gif").setDescription("on, off, or default").setRequired(false).setAutocomplete(true)
           )
       )
       .addSubcommand((sub) =>

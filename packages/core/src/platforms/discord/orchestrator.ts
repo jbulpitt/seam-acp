@@ -161,6 +161,7 @@ import {
   safeAutocompleteRespond,
   toAutocompleteChoices,
   tokenAutocompleteChoices,
+  type AutocompleteContext,
   type AutocompleteResponder,
 } from "./autocomplete.js";
 import {
@@ -951,14 +952,14 @@ export class Orchestrator {
       const presets = this.store.listPresetsForProject(ctx.projectScopeId);
       return presetAutocompleteChoices(presets, ctx.focusedValue, ctx.projectScopeId);
     };
-    this.autocomplete.register("preset", "thread", "preset", presetNameResponder);
+    this.autocomplete.register("preset", "thread", "preset", "canonical", presetNameResponder);
     for (const sub of ["apply", "delete", "show", "edit"] as const) {
-      this.autocomplete.register("preset", sub, "name", presetNameResponder);
+      this.autocomplete.register("preset", sub, "name", "canonical", presetNameResponder);
     }
-    this.autocomplete.register("config", "tts", "voice", (ctx) =>
+    this.autocomplete.register("config", "tts", "voice", "canonical", (ctx) =>
       toAutocompleteChoices(geminiTtsVoiceChoices(ctx.focusedValue))
     );
-    this.autocomplete.register("voice", "configure", "voice", (ctx) =>
+    this.autocomplete.register("voice", "configure", "voice", "canonical", (ctx) =>
       toAutocompleteChoices(geminiTtsVoiceChoices(ctx.focusedValue))
     );
     this.wireSlashAutocomplete();
@@ -1007,9 +1008,9 @@ export class Orchestrator {
         return [];
       }
     };
-    this.autocomplete.register("config", "agent", "id", agentAtLocationResponder);
+    this.autocomplete.register("config", "agent", "id", "canonical", agentAtLocationResponder);
 
-    this.autocomplete.register("config", "set", "agent", agentAtLocationResponder);
+    this.autocomplete.register("config", "set", "agent", "canonical", agentAtLocationResponder);
 
     const repoResponder: AutocompleteResponder = async (ctx) => {
       try {
@@ -1023,8 +1024,8 @@ export class Orchestrator {
         return [];
       }
     };
-    this.autocomplete.register("config", "repo", "path", repoResponder);
-    this.autocomplete.register("config", "set", "repo", async (ctx) => {
+    this.autocomplete.register("config", "repo", "path", "canonical", repoResponder);
+    this.autocomplete.register("config", "set", "repo", "canonical", async (ctx) => {
       try {
         const selected = ctx.optionValues?.agent?.trim();
         const parsed = selected ? parseAgentAtLocation(selected) : undefined;
@@ -1040,7 +1041,7 @@ export class Orchestrator {
       }
     });
 
-    this.autocomplete.register("config", "model", "id", async (ctx) => {
+    this.autocomplete.register("config", "model", "id", "canonical", async (ctx) => {
       try {
         if (!ctx.agentId) return [];
         const profile = this.router.getProfile(ctx.agentId);
@@ -1057,7 +1058,7 @@ export class Orchestrator {
       }
     });
 
-    this.autocomplete.register("config", "set", "model", async (ctx) => {
+    this.autocomplete.register("config", "set", "model", "canonical", async (ctx) => {
       try {
         const selectedAgent = ctx.optionValues?.agent?.trim() || ctx.agentId;
         if (!selectedAgent) return [];
@@ -1076,7 +1077,7 @@ export class Orchestrator {
       }
     });
 
-    this.autocomplete.register("config", "set", "effort", (ctx) => {
+    this.autocomplete.register("config", "set", "effort", "canonical", (ctx) => {
       try {
         const selectedAgent = ctx.optionValues?.agent?.trim() || ctx.agentId;
         const profile = selectedAgent
@@ -1098,7 +1099,7 @@ export class Orchestrator {
       }
     });
 
-    this.autocomplete.register("config", "set", "role", (ctx) =>
+    this.autocomplete.register("config", "set", "role", "canonical", (ctx) =>
       labeledAutocompleteChoices(
         [
           { name: "Auto / none", value: "auto" },
@@ -1141,12 +1142,12 @@ export class Orchestrator {
       },
     ];
     for (const { option, choices } of fixedSetChoices) {
-      this.autocomplete.register("config", "set", option, (ctx) =>
+      this.autocomplete.register("config", "set", option, "canonical", (ctx) =>
         labeledAutocompleteChoices(choices, ctx.focusedValue)
       );
     }
 
-    this.autocomplete.register("config", "mode", "id", (ctx) => {
+    this.autocomplete.register("config", "mode", "id", "canonical", (ctx) => {
       try {
         if (!ctx.sessionId) return [];
         const rt =
@@ -1179,10 +1180,10 @@ export class Orchestrator {
       }
     };
     for (const sub of ["remove", "toggle", "edit"] as const) {
-      this.autocomplete.register("schedule", sub, "id", scheduleIdResponder);
+      this.autocomplete.register("schedule", sub, "id", "opaque", scheduleIdResponder);
     }
 
-    this.autocomplete.register(null, "workflows", "cancel-wake", (ctx) => {
+    this.autocomplete.register(null, "workflows", "cancel-wake", "opaque", (ctx) => {
       try {
         if (!ctx.channelId) return [];
         return tokenAutocompleteChoices(
@@ -1196,7 +1197,7 @@ export class Orchestrator {
         return [];
       }
     });
-    this.autocomplete.register(null, "workflows", "cancel-watch", (ctx) => {
+    this.autocomplete.register(null, "workflows", "cancel-watch", "opaque", (ctx) => {
       try {
         if (!ctx.channelId) return [];
         return tokenAutocompleteChoices(
@@ -1210,7 +1211,7 @@ export class Orchestrator {
         return [];
       }
     });
-    this.autocomplete.register(null, "workflows", "cancel-choice", (ctx) => {
+    this.autocomplete.register(null, "workflows", "cancel-choice", "opaque", (ctx) => {
       try {
         if (!ctx.channelId) return [];
         return tokenAutocompleteChoices(
@@ -1224,7 +1225,7 @@ export class Orchestrator {
         return [];
       }
     });
-    this.autocomplete.register(null, "workflows", "cancel-ingest", (ctx) => {
+    this.autocomplete.register(null, "workflows", "cancel-ingest", "opaque", (ctx) => {
       try {
         if (!ctx.channelId) return [];
         return tokenAutocompleteChoices(
@@ -1238,7 +1239,7 @@ export class Orchestrator {
         return [];
       }
     });
-    this.autocomplete.register(null, "workflows", "cancel-live", (ctx) => {
+    this.autocomplete.register(null, "workflows", "cancel-live", "opaque", (ctx) => {
       try {
         if (!ctx.channelId) return [];
         const rows = (this.liveHelpManager?.listForThread(PLATFORM, ctx.channelId) ?? []).filter(
@@ -1256,7 +1257,7 @@ export class Orchestrator {
       }
     });
 
-    this.autocomplete.register(null, "steer", "thread", (ctx) => {
+    this.autocomplete.register(null, "steer", "thread", "opaque", (ctx) => {
       try {
         const parent = ctx.projectScopeId ?? ctx.parentId;
         if (!parent) return [];
@@ -1288,7 +1289,7 @@ export class Orchestrator {
         return [];
       }
     });
-    this.autocomplete.register(null, "recover", "thread", (ctx) => {
+    this.autocomplete.register(null, "recover", "thread", "opaque", (ctx) => {
       try {
         const parent = ctx.projectScopeId ?? ctx.parentId;
         if (!parent) return [];
@@ -1335,40 +1336,79 @@ export class Orchestrator {
         const focused = interaction.options.getFocused(true);
         const responder = this.autocomplete.get(group, sub, focused.name);
         if (!responder) return [];
-        const channelId = interaction.channelId ?? undefined;
-        const ch = interaction.channel as
-          | { isThread?: () => boolean; parentId?: string | null }
-          | null
-          | undefined;
-        const parentId =
-          ch && typeof ch.isThread === "function" && ch.isThread()
-            ? (ch.parentId ?? undefined)
-            : undefined;
-        const session = channelId
-          ? this.store.get(makeSessionId(PLATFORM, channelId))
-          : undefined;
-        let agentId = session?.agentId;
-        if (session) {
-          try {
-            const v = this.router.describeConfig(session)?.agent?.value;
-            if (typeof v === "string" && v) agentId = v;
-          } catch {
-            /* mock routers may not implement describeConfig */
-          }
-        }
-        return responder({
-          group,
-          subcommand: sub,
-          optionName: focused.name,
-          focusedValue: String(focused.value ?? ""),
-          projectScopeId: this.projectScopeId(interaction),
-          channelId,
-          parentId,
-          sessionId: session?.id,
-          agentId,
-          optionValues: collectStringOptionValues(interaction.options.data ?? []),
-        });
+        return responder(
+          this.autocompleteContext(
+            interaction,
+            group,
+            sub,
+            focused.name,
+            String(focused.value ?? "")
+          )
+        );
       }
+    );
+  }
+
+  private autocompleteContext(
+    interaction: ChatInputCommandInteraction | AutocompleteInteraction,
+    group: string | null,
+    subcommand: string | null,
+    optionName: string,
+    focusedValue: string
+  ): AutocompleteContext {
+    const channelId = interaction.channelId ?? undefined;
+    const ch = interaction.channel as
+      | { isThread?: () => boolean; parentId?: string | null }
+      | null
+      | undefined;
+    const parentId =
+      ch && typeof ch.isThread === "function" && ch.isThread()
+        ? (ch.parentId ?? undefined)
+        : undefined;
+    // A few narrow command-unit harnesses deliberately provide only the store
+    // methods their command uses. Production SessionStore always has `get`,
+    // while keeping this context builder defensive lets those harnesses test
+    // submission normalization without manufacturing unrelated session state.
+    const session =
+      channelId && typeof this.store.get === "function"
+        ? this.store.get(makeSessionId(PLATFORM, channelId))
+        : undefined;
+    let agentId = session?.agentId;
+    if (session) {
+      try {
+        const v = this.router.describeConfig(session)?.agent?.value;
+        if (typeof v === "string" && v) agentId = v;
+      } catch {
+        /* mock routers may not implement describeConfig */
+      }
+    }
+    return {
+      group,
+      subcommand,
+      optionName,
+      focusedValue,
+      projectScopeId: this.projectScopeId(interaction),
+      channelId,
+      parentId,
+      sessionId: session?.id,
+      agentId,
+      optionValues: collectStringOptionValues(interaction.options.data ?? []),
+    };
+  }
+
+  private normalizeAutocompleteSubmission(
+    interaction: ChatInputCommandInteraction,
+    group: string | null,
+    subcommand: string,
+    optionName: string,
+    input: string
+  ): Promise<string> {
+    return this.autocomplete.normalizeSubmission(
+      group,
+      subcommand,
+      optionName,
+      input,
+      this.autocompleteContext(interaction, group, subcommand, optionName, input)
     );
   }
 
@@ -10650,7 +10690,13 @@ export class Orchestrator {
   }
 
   private async cmdScheduleRemove(i: ChatInputCommandInteraction): Promise<void> {
-    const id = i.options.getString("id", true);
+    const id = await this.normalizeAutocompleteSubmission(
+      i,
+      "schedule",
+      "remove",
+      "id",
+      i.options.getString("id", true)
+    );
     const row = this.store.getScheduled(id);
     const channel = this.channelRefFromInteraction(i);
     if (!row || !channel || row.channelRef !== channel.id) {
@@ -10663,7 +10709,13 @@ export class Orchestrator {
   }
 
   private async cmdScheduleToggle(i: ChatInputCommandInteraction): Promise<void> {
-    const id = i.options.getString("id", true);
+    const id = await this.normalizeAutocompleteSubmission(
+      i,
+      "schedule",
+      "toggle",
+      "id",
+      i.options.getString("id", true)
+    );
     const row = this.store.getScheduled(id);
     const channel = this.channelRefFromInteraction(i);
     if (!row || !channel || row.channelRef !== channel.id) {
@@ -10681,7 +10733,13 @@ export class Orchestrator {
   }
 
   private async cmdScheduleEdit(i: ChatInputCommandInteraction): Promise<void> {
-    const id = i.options.getString("id", true);
+    const id = await this.normalizeAutocompleteSubmission(
+      i,
+      "schedule",
+      "edit",
+      "id",
+      i.options.getString("id", true)
+    );
     const row = this.store.getScheduled(id);
     const channel = this.channelRefFromInteraction(i);
     if (!row || !channel || row.channelRef !== channel.id) {
@@ -11900,7 +11958,13 @@ export class Orchestrator {
       });
       return;
     }
-    const thread = i.options.getString("thread", true);
+    const thread = await this.normalizeAutocompleteSubmission(
+      i,
+      null,
+      "recover",
+      "thread",
+      i.options.getString("thread", true)
+    );
     if (!/^\d+$/.test(thread)) {
       await i.reply({ content: "Thread must be a Discord thread id.", flags: MessageFlags.Ephemeral });
       return;
@@ -12522,7 +12586,10 @@ export class Orchestrator {
   }
 
   private async cmdSteer(i: ChatInputCommandInteraction): Promise<void> {
-    const explicit = i.options.getString("thread")?.trim();
+    const threadInput = i.options.getString("thread")?.trim();
+    const explicit = threadInput
+      ? await this.normalizeAutocompleteSubmission(i, null, "steer", "thread", threadInput)
+      : undefined;
     const here = this.channelRefFromInteraction(i);
     const threadId = explicit || here?.id;
     const prompt = i.options.getString("prompt", true);
@@ -12533,6 +12600,13 @@ export class Orchestrator {
     if (!threadId) {
       await i.reply({
         content: "Pass `thread:` or run this inside a thread.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    if (explicit && !/^\d+$/.test(explicit)) {
+      await i.reply({
+        content: "Thread must be a Discord thread id.",
         flags: MessageFlags.Ephemeral,
       });
       return;
@@ -14056,7 +14130,16 @@ export class Orchestrator {
 
     // Wake cancel (#59, D6): fold into /seam workflows per #26 rather than a new
     // top-level subcommand (the /seam tree is at Discord's 25-option cap).
-    const cancelWakeId = i.options.getString("cancel-wake");
+    const cancelWakeInput = i.options.getString("cancel-wake");
+    const cancelWakeId = cancelWakeInput
+      ? await this.normalizeAutocompleteSubmission(
+          i,
+          null,
+          "workflows",
+          "cancel-wake",
+          cancelWakeInput
+        )
+      : null;
     if (cancelWakeId) {
       const record = this.recordFromInteraction(i);
       const ok = record ? this.cancelWake(record, cancelWakeId) : false;
@@ -14071,7 +14154,16 @@ export class Orchestrator {
 
     // Watch cancel (#60, D7): same surface as wake cancel — the /seam tree is at
     // Discord's option cap, so watch lifecycle folds into /seam workflows too.
-    const cancelLiveId = i.options.getString("cancel-live");
+    const cancelLiveInput = i.options.getString("cancel-live");
+    const cancelLiveId = cancelLiveInput
+      ? await this.normalizeAutocompleteSubmission(
+          i,
+          null,
+          "workflows",
+          "cancel-live",
+          cancelLiveInput
+        )
+      : null;
     if (cancelLiveId) {
       const record = this.recordFromInteraction(i);
       if (!record) {
@@ -14091,7 +14183,16 @@ export class Orchestrator {
       return;
     }
 
-    const cancelIngestId = i.options.getString("cancel-ingest");
+    const cancelIngestInput = i.options.getString("cancel-ingest");
+    const cancelIngestId = cancelIngestInput
+      ? await this.normalizeAutocompleteSubmission(
+          i,
+          null,
+          "workflows",
+          "cancel-ingest",
+          cancelIngestInput
+        )
+      : null;
     if (cancelIngestId) {
       const record = this.recordFromInteraction(i);
       if (!record) {
@@ -14111,7 +14212,16 @@ export class Orchestrator {
       return;
     }
 
-    const cancelChoiceId = i.options.getString("cancel-choice");
+    const cancelChoiceInput = i.options.getString("cancel-choice");
+    const cancelChoiceId = cancelChoiceInput
+      ? await this.normalizeAutocompleteSubmission(
+          i,
+          null,
+          "workflows",
+          "cancel-choice",
+          cancelChoiceInput
+        )
+      : null;
     if (cancelChoiceId) {
       const record = this.recordFromInteraction(i);
       if (!record) {
@@ -14131,7 +14241,16 @@ export class Orchestrator {
       return;
     }
 
-    const cancelWatchId = i.options.getString("cancel-watch");
+    const cancelWatchInput = i.options.getString("cancel-watch");
+    const cancelWatchId = cancelWatchInput
+      ? await this.normalizeAutocompleteSubmission(
+          i,
+          null,
+          "workflows",
+          "cancel-watch",
+          cancelWatchInput
+        )
+      : null;
     if (cancelWatchId) {
       const record = this.recordFromInteraction(i);
       const ok = record ? this.cancelWatch(record, cancelWatchId) : false;

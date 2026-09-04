@@ -4,6 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { buildSlashRegistrationBody } from "../packages/core/src/platforms/discord/commands.js";
+import {
+  AutocompleteRegistry,
+  autocompleteKey,
+  type AutocompleteContext,
+  type AutocompleteRoundTripPolicy,
+} from "../packages/core/src/platforms/discord/autocomplete.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { hashBridgeToken } from "../packages/core/src/core/bridge-pairing.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -73,6 +80,35 @@ function autocompleteI(over: {
     }),
   };
   return { i, responded };
+}
+
+/** Extract the actual autocomplete surface Discord receives from both trees. */
+function registeredAutocompleteKeys(): string[] {
+  type Option = {
+    name: string;
+    type: number;
+    autocomplete?: boolean;
+    options?: Option[];
+  };
+  const keys: string[] = [];
+  for (const command of buildSlashRegistrationBody()) {
+    for (const first of (command.options ?? []) as Option[]) {
+      if (first.type === 1) {
+        for (const option of first.options ?? []) {
+          if (option.autocomplete) keys.push(autocompleteKey(null, first.name, option.name));
+        }
+      } else if (first.type === 2) {
+        for (const subcommand of first.options ?? []) {
+          for (const option of subcommand.options ?? []) {
+            if (option.autocomplete) {
+              keys.push(autocompleteKey(first.name, subcommand.name, option.name));
+            }
+          }
+        }
+      }
+    }
+  }
+  return keys.sort();
 }
 
 function makeOrch(over?: {
@@ -194,6 +230,46 @@ afterEach(() => {
 });
 
 describe("slash autocomplete responders", () => {
+  it("inventory covers every registered responder and declares its round-trip policy", () => {
+    const { orch } = makeOrch();
+    const registry = (orch as unknown as { autocomplete: AutocompleteRegistry }).autocomplete;
+    const inventory = registry.inventory();
+    expect(inventory.map((entry) => entry.key)).toEqual(registeredAutocompleteKeys());
+
+    const expected = new Map<string, AutocompleteRoundTripPolicy>([
+      ["/recover/thread", "opaque"],
+      ["/steer/thread", "opaque"],
+      ["/workflows/cancel-choice", "opaque"],
+      ["/workflows/cancel-ingest", "opaque"],
+      ["/workflows/cancel-live", "opaque"],
+      ["/workflows/cancel-wake", "opaque"],
+      ["/workflows/cancel-watch", "opaque"],
+      ["config/agent/id", "canonical"],
+      ["config/mode/id", "canonical"],
+      ["config/model/id", "canonical"],
+      ["config/repo/path", "canonical"],
+      ["config/set/agent", "canonical"],
+      ["config/set/card", "canonical"],
+      ["config/set/effort", "canonical"],
+      ["config/set/gif", "canonical"],
+      ["config/set/model", "canonical"],
+      ["config/set/permissions", "canonical"],
+      ["config/set/repo", "canonical"],
+      ["config/set/role", "canonical"],
+      ["config/tts/voice", "canonical"],
+      ["preset/apply/name", "canonical"],
+      ["preset/delete/name", "canonical"],
+      ["preset/edit/name", "canonical"],
+      ["preset/show/name", "canonical"],
+      ["preset/thread/preset", "canonical"],
+      ["schedule/edit/id", "opaque"],
+      ["schedule/remove/id", "opaque"],
+      ["schedule/toggle/id", "opaque"],
+      ["voice/configure/voice", "canonical"],
+    ]);
+    expect(new Map(inventory.map((entry) => [entry.key, entry.policy]))).toEqual(expected);
+  });
+
   it("config agent lists configured agent@location ids", async () => {
     const { orch } = makeOrch();
     const { i, responded } = autocompleteI({
@@ -208,7 +284,7 @@ describe("slash autocomplete responders", () => {
     expect(values).not.toContain("claude@local");
   });
 
-  it("config repo lists REPOS_ROOT children (name = basename, value = path)", async () => {
+  it("config repo filters by friendly basename but emits canonical path", async () => {
     const { orch } = makeOrch();
     const { i, responded } = autocompleteI({
       group: "config",
@@ -217,9 +293,8 @@ describe("slash autocomplete responders", () => {
       value: "alp",
     });
     await orch.handleAutocompleteInteraction(i as any);
-    expect(responded[0]).toEqual([
-      { name: "alpha-app", value: path.join(reposRoot, "alpha-app") },
-    ]);
+    const canonical = path.join(reposRoot, "alpha-app");
+    expect(responded[0]).toEqual([{ name: canonical, value: canonical }]);
   });
 
   it("config model uses the thread agent's staticModels catalog", async () => {
@@ -229,10 +304,10 @@ describe("slash autocomplete responders", () => {
       group: "config",
       sub: "model",
       option: "id",
-      value: "grok-4.6",
+      value: "Grok 4.6",
     });
     await orch.handleAutocompleteInteraction(i as any);
-    expect(responded[0]).toEqual([{ name: "Grok 4.6 (grok-4.6)", value: "grok-4.6" }]);
+    expect(responded[0]).toEqual([{ name: "grok-4.6", value: "grok-4.6" }]);
   });
 
   it("config set agent suggests the same agent@location values as the dedicated command", async () => {
@@ -241,12 +316,10 @@ describe("slash autocomplete responders", () => {
       group: "config",
       sub: "set",
       option: "agent",
-      value: "cop",
+      value: "Copilot",
     });
     await orch.handleAutocompleteInteraction(i as any);
-    expect(responded[0]).toEqual([
-      { name: "🏠 Copilot @ local (copilot@local)", value: "copilot@local" },
-    ]);
+    expect(responded[0]).toEqual([{ name: "copilot@local", value: "copilot@local" }]);
   });
 
   it("config set model and effort follow the sibling agent option", async () => {
@@ -274,7 +347,7 @@ describe("slash autocomplete responders", () => {
       data,
     });
     await orch.handleAutocompleteInteraction(i as any);
-    expect(responded[0]).toEqual([{ name: "GPT-5 (gpt-5)", value: "gpt-5" }]);
+    expect(responded[0]).toEqual([{ name: "gpt-5", value: "gpt-5" }]);
 
     const effortData = JSON.parse(JSON.stringify(data));
     effortData[0].options[0].options[1] = { name: "effort", value: "", focused: true };
@@ -286,7 +359,7 @@ describe("slash autocomplete responders", () => {
       data: effortData,
     });
     await orch.handleAutocompleteInteraction(effort as any);
-    expect(effortResponded[0]).toEqual([{ name: "Default / unset", value: "default" }]);
+    expect(effortResponded[0]).toEqual([{ name: "default", value: "default" }]);
   });
 
   it("config set repo uses the same workspace cache-backed responder", async () => {
@@ -298,16 +371,15 @@ describe("slash autocomplete responders", () => {
       value: "bet",
     });
     await orch.handleAutocompleteInteraction(i as any);
-    expect(responded[0]).toEqual([
-      { name: "beta-lib", value: path.join(reposRoot, "beta-lib") },
-    ]);
+    const canonical = path.join(reposRoot, "beta-lib");
+    expect(responded[0]).toEqual([{ name: canonical, value: canonical }]);
   });
 
   it.each([
-    ["role", "qa", [{ name: "QA", value: "qa" }]],
-    ["permissions", "as", [{ name: "Ask each time", value: "ask" }]],
-    ["card", "si", [{ name: "Simple", value: "simple" }]],
-    ["gif", "de", [{ name: "Default / inherit", value: "default" }]],
+    ["role", "qa", [{ name: "qa", value: "qa" }]],
+    ["permissions", "Ask each", [{ name: "ask", value: "ask" }]],
+    ["card", "si", [{ name: "simple", value: "simple" }]],
+    ["gif", "de", [{ name: "default", value: "default" }]],
   ])("config set %s has bounded autocomplete", async (option, value, expected) => {
     const { orch } = makeOrch();
     const { i, responded } = autocompleteI({
@@ -361,7 +433,7 @@ describe("slash autocomplete responders", () => {
       value: "as",
     });
     await live.handleAutocompleteInteraction(i2 as any);
-    expect(r2[0]).toEqual([{ name: "Ask (ask)", value: "ask" }]);
+    expect(r2[0]).toEqual([{ name: "ask", value: "ask" }]);
   });
 
   it("schedule id lists this thread's schedules as name (id)", async () => {
@@ -524,19 +596,19 @@ describe("slash autocomplete responders", () => {
   });
 
   it("steer thread lists sibling sessions in the parent channel", async () => {
-    store.upsert(session({ channelRef: "thread-1", agentId: "grok" }));
-    store.upsert(session({ channelRef: "thread-2", agentId: "copilot" }));
+    store.upsert(session({ channelRef: "1001", agentId: "grok" }));
+    store.upsert(session({ channelRef: "1002", agentId: "copilot" }));
     store.upsert(session({ channelRef: "other", parentRef: "chan-other", agentId: "grok" }));
-    const { orch } = makeOrch({ isBusy: (id) => id === "discord:thread-2" });
+    const { orch } = makeOrch({ isBusy: (id) => id === "discord:1002" });
     const { i, responded } = autocompleteI({
       group: null,
       sub: "steer",
       option: "thread",
-      value: "thread-2",
+      value: "1002",
     });
     await orch.handleAutocompleteInteraction(i as any);
     expect(responded[0]).toEqual([
-      { name: "thread-2 · copilot · busy", value: "thread-2" },
+      { name: "1002 · copilot · busy", value: "1002" },
     ]);
   });
 
@@ -570,7 +642,186 @@ describe("slash autocomplete responders", () => {
       parentId: undefined,
     });
     await orch.handleAutocompleteInteraction(i as any);
-    expect((responded[0] as Array<{ value: string }>).map((c) => c.value)).toEqual(["reviewer"]);
+    expect(responded[0]).toEqual([{ name: "reviewer", value: "reviewer" }]);
+  });
+
+  it("voice metadata remains searchable while Discord sees the canonical voice", async () => {
+    const { orch } = makeOrch();
+    for (const [group, sub] of [["config", "tts"], ["voice", "configure"]] as const) {
+      const { i, responded } = autocompleteI({
+        group,
+        sub,
+        option: "voice",
+        value: "Soft",
+      });
+      await orch.handleAutocompleteInteraction(i as any);
+      expect(responded[0]).toEqual([{ name: "Achernar", value: "Achernar" }]);
+    }
+  });
+
+  it("round-trips every opaque family from exact displayed label and canonical id", async () => {
+    store.upsertScheduled(schedule({ id: "sch_round", name: "Morning brief" }));
+    store.upsertWake({
+      id: "wake_round",
+      platform: "discord",
+      channelRef: "thread-1",
+      parentRef: "chan-1",
+      fireAtUtc: new Date(Date.now() + 120_000).toISOString(),
+      prompt: "resume",
+      reason: "check back",
+      createdBy: "discord:thread-1",
+      correlationId: null,
+      chainDepth: 0,
+      catchupSeconds: 900,
+      fireOnStartup: false,
+      createdUtc: now,
+    });
+    store.upsertWatch({
+      id: "watch_round",
+      platform: "discord",
+      channelRef: "thread-1",
+      parentRef: "chan-1",
+      kind: "file",
+      spec: "/tmp/done",
+      match: null,
+      intervalSeconds: 30,
+      prompt: "go",
+      reason: "wait for CI",
+      mode: "once",
+      maxFires: 1,
+      fireCount: 0,
+      lastCheckedUtc: null,
+      lastFiredUtc: null,
+      lastObserved: null,
+      expiresAtUtc: new Date(Date.now() + 3600_000).toISOString(),
+      createdBy: "discord:thread-1",
+      correlationId: null,
+      createdUtc: now,
+    });
+    store.insertChoiceCard({
+      id: "ch_round",
+      platform: "discord",
+      channelRef: "thread-1",
+      parentRef: "chan-1",
+      messageId: "msg-round",
+      title: "Ship this?",
+      body: null,
+      maxClicks: 1,
+      targetUserId: null,
+      defaultTarget: { type: "live" },
+      options: [{ label: "Yes", kind: "prompt", payload: "yes" }],
+      clickCount: 0,
+      status: "open",
+      lastClickerId: null,
+      lastClickerName: null,
+      lastOptionIndex: null,
+      createdBy: "discord:thread-1",
+      createdUtc: now,
+      ingestTokenHash: null,
+      ingestOptionIndex: null,
+      resultSchema: null,
+      ingestWrapper: null,
+      ingestCors: null,
+    });
+    store.insertIngestEndpoint({
+      id: "ie_round",
+      tokenHash: hashBridgeToken("round-token"),
+      name: "essay-check",
+      cwd: "/repo",
+      agentId: "grok",
+      model: "grok-4",
+      effort: null,
+      wrapper: null,
+      resultSchema: null,
+      corsOrigins: null,
+      uniqueStudent: false,
+      notifyThread: null,
+      preset: null,
+      status: "open",
+      createdBy: "discord:thread-1",
+      createdUtc: now,
+      authoringChannelRef: "thread-1",
+      authoringParentRef: "chan-1",
+      platform: "discord",
+    });
+    store.upsert(session({ channelRef: "1001", parentRef: "chan-1" }));
+    store.upsert(session({ channelRef: "1002", parentRef: "chan-1", agentId: "copilot" }));
+
+    const { orch } = makeOrch({ isBusy: (id) => id === "discord:1002" });
+    (orch as any).liveHelpManager = {
+      listForThread: () => [{ id: "lh_round", status: "live", channelName: "Tutor room" }],
+    };
+    const registry = (orch as unknown as { autocomplete: AutocompleteRegistry }).autocomplete;
+    const families = [
+      ...(["remove", "toggle", "edit"] as const).map((subcommand) => ({
+        group: "schedule", subcommand, optionName: "id", focusedValue: "Morning", value: "sch_round",
+      })),
+      { group: null, subcommand: "workflows", optionName: "cancel-wake", focusedValue: "check", value: "wake_round" },
+      { group: null, subcommand: "workflows", optionName: "cancel-watch", focusedValue: "wait", value: "watch_round" },
+      { group: null, subcommand: "workflows", optionName: "cancel-choice", focusedValue: "Ship", value: "ch_round" },
+      { group: null, subcommand: "workflows", optionName: "cancel-ingest", focusedValue: "essay", value: "ie_round" },
+      { group: null, subcommand: "workflows", optionName: "cancel-live", focusedValue: "Tutor", value: "lh_round" },
+      { group: null, subcommand: "steer", optionName: "thread", focusedValue: "1002", value: "1002" },
+      { group: null, subcommand: "recover", optionName: "thread", focusedValue: "1002", value: "1002" },
+    ] as const;
+
+    for (const family of families) {
+      const ctx: AutocompleteContext = {
+        ...family,
+        projectScopeId: "chan-1",
+        channelId: "thread-1",
+        parentId: "chan-1",
+      };
+      const responder = registry.get(family.group, family.subcommand, family.optionName);
+      expect(responder, autocompleteKey(family.group, family.subcommand, family.optionName)).toBeDefined();
+      const choices = await responder!(ctx);
+      const choice = choices.find((candidate) => candidate.value === family.value);
+      expect(choice, autocompleteKey(family.group, family.subcommand, family.optionName)).toBeDefined();
+
+      const fromLabel = await registry.normalizeSubmission(
+        family.group, family.subcommand, family.optionName, choice!.name,
+        { ...ctx, focusedValue: choice!.name }
+      );
+      const fromCanonical = await registry.normalizeSubmission(
+        family.group, family.subcommand, family.optionName, family.value,
+        { ...ctx, focusedValue: family.value }
+      );
+      expect(fromLabel).toBe(family.value);
+      expect(fromCanonical).toBe(family.value);
+
+      const altered = `${choice!.name} altered`;
+      await expect(registry.normalizeSubmission(
+        family.group, family.subcommand, family.optionName, altered,
+        { ...ctx, focusedValue: altered }
+      )).resolves.toBe(altered);
+    }
+  });
+
+  it("executes an exact detokenized schedule label but rejects altered and fuzzy labels", async () => {
+    const row = schedule({ id: "sch_submit", name: "Morning brief" });
+    store.upsertScheduled(row);
+    const { orch } = makeOrch();
+    const replies: string[] = [];
+    const command = (input: string) => ({
+      options: { getString: () => input, data: [] },
+      channelId: "thread-1",
+      channel: { isThread: () => true, parentId: "chan-1" },
+      reply: vi.fn(async (payload: { content: string }) => { replies.push(payload.content); }),
+    });
+
+    await (orch as any).cmdScheduleRemove(command("Morning brief (sch_submit)"));
+    expect(store.getScheduled("sch_submit")).toBeNull();
+    expect(replies.at(-1)).toContain("Deleted scheduled prompt");
+
+    for (const alias of ["Morning brief (sch_submit) altered", "Morning bri"]) {
+      store.upsertScheduled(row);
+      await (orch as any).cmdScheduleRemove(command(alias));
+      expect(store.getScheduled("sch_submit"), alias).not.toBeNull();
+      expect(replies.at(-1), alias).toContain("No schedule");
+    }
+
+    await (orch as any).cmdScheduleRemove(command("sch_submit"));
+    expect(store.getScheduled("sch_submit")).toBeNull();
   });
 });
 

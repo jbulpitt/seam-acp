@@ -603,7 +603,10 @@ function steerInteraction(opts: {
         getBoolean: (name: string) => (name === "now" ? opts.now : null),
       },
       channelId: opts.channelId ?? "thread-o",
-      channel: { parentId: opts.parentId ?? "channel-a" },
+      channel: {
+        parentId: opts.parentId ?? "channel-a",
+        isThread: () => true,
+      },
       deferReply: vi.fn(async () => {}),
       editReply,
       reply: vi.fn(async () => {}),
@@ -623,12 +626,12 @@ describe("slash steer card (#155)", () => {
     const { i } = steerInteraction({
       now: false,
       prompt: "stop touching the renderer; finish the store migration first",
-      thread: "thread-w",
+      thread: "1002",
     });
     await (orch as never as { cmdSteer(i: unknown): Promise<void> }).cmdSteer(i);
 
     const card = calls.sendPanel.at(-1)!;
-    expect(card.channel.id).toBe("thread-w");
+    expect(card.channel.id).toBe("1002");
     expect(card.panel.title).toBe("🧭 Steer · queued to inbox");
     expect(field(card.panel, "Steer")?.value).toBe(
       "stop touching the renderer; finish the store migration first"
@@ -655,7 +658,7 @@ describe("slash steer card (#155)", () => {
     const { i } = steerInteraction({
       now: true,
       prompt: "abandon that approach and use the SerialQueue",
-      thread: "thread-w",
+      thread: "1002",
     });
     await (orch as never as { cmdSteer(i: unknown): Promise<void> }).cmdSteer(i);
 
@@ -679,7 +682,7 @@ describe("slash steer card (#155)", () => {
     const { i } = steerInteraction({
       now: false,
       prompt: "pause the migration",
-      thread: "thread-w",
+      thread: "1002",
       channelId: "thread-far",
       parentId: "channel-b",
     });
@@ -696,7 +699,7 @@ describe("slash steer card (#155)", () => {
     const orch = makeOrch({ dataDir, adapter });
     (orch as never as { pushHumanInbox: unknown }).pushHumanInbox = () => ({ queued: 1 });
 
-    const { i } = steerInteraction({ now: false, prompt: long, thread: "thread-w" });
+    const { i } = steerInteraction({ now: false, prompt: long, thread: "1002" });
     await (orch as never as { cmdSteer(i: unknown): Promise<void> }).cmdSteer(i);
 
     const value = field(calls.sendPanel.at(-1)!.panel, "Steer")!.value;

@@ -9,6 +9,7 @@ import {
   safeAutocompleteRespond,
   toAutocompleteChoices,
   tokenAutocompleteChoices,
+  projectRoundTripChoices,
   DISCORD_AUTOCOMPLETE_MAX,
 } from "../packages/core/src/platforms/discord/autocomplete.js";
 import {
@@ -24,7 +25,9 @@ import { CHOICE_CUSTOM_ID_PREFIX } from "../packages/core/src/core/choice/types.
 describe("AutocompleteRegistry", () => {
   it("keys responders by (group, subcommand, optionName)", async () => {
     const reg = new AutocompleteRegistry();
-    reg.register("preset", "thread", "preset", () => [{ name: "reviewer", value: "reviewer" }]);
+    reg.register("preset", "thread", "preset", "canonical", () => [
+      { name: "Reviewer", value: "reviewer" },
+    ]);
     expect(autocompleteKey("preset", "thread", "preset")).toBe("preset/thread/preset");
     const hit = reg.get("preset", "thread", "preset");
     expect(hit).toBeTypeOf("function");
@@ -43,7 +46,7 @@ describe("AutocompleteRegistry", () => {
     const reg = new AutocompleteRegistry();
     const responder = () => [{ name: "reviewer", value: "reviewer" }];
     for (const sub of ["apply", "delete", "show", "edit"] as const) {
-      reg.register("preset", sub, "name", responder);
+      reg.register("preset", sub, "name", "canonical", responder);
     }
     for (const sub of ["apply", "delete", "show", "edit"] as const) {
       const hit = reg.get("preset", sub, "name");
@@ -151,6 +154,57 @@ describe("tokenAutocompleteChoices / labeledAutocompleteChoices", () => {
       value: `v${String(i).padStart(2, "0")}`,
     }));
     expect(labeledAutocompleteChoices(many, "n")).toHaveLength(DISCORD_AUTOCOMPLETE_MAX);
+  });
+
+  it("never truncates an overlong canonical value", () => {
+    const overlong = "x".repeat(101);
+    expect(toAutocompleteChoices([{ name: "friendly", value: overlong }])).toEqual([]);
+    expect(
+      projectRoundTripChoices([{ name: "friendly", value: overlong }], "canonical")
+    ).toEqual([]);
+  });
+
+  it("projects semantic display names to the exact canonical value", () => {
+    expect(
+      projectRoundTripChoices(
+        [{ name: "Grok Build @ local", value: "grok@local" }],
+        "canonical"
+      )
+    ).toEqual([{ name: "grok@local", value: "grok@local" }]);
+  });
+
+  it("normalizes only exact current opaque labels and rejects ambiguity", async () => {
+    const reg = new AutocompleteRegistry();
+    reg.register(null, "workflows", "cancel-wake", "opaque", () => [
+      { name: "Check back (wake_1)", value: "wake_1" },
+      { name: "Duplicate", value: "wake_2" },
+      { name: "Duplicate", value: "wake_3" },
+    ]);
+    const ctx = {
+      group: null,
+      subcommand: "workflows",
+      optionName: "cancel-wake",
+      focusedValue: "",
+      projectScopeId: "chan-1",
+    };
+    await expect(
+      reg.normalizeSubmission(null, "workflows", "cancel-wake", "wake_1", ctx)
+    ).resolves.toBe("wake_1");
+    await expect(
+      reg.normalizeSubmission(
+        null,
+        "workflows",
+        "cancel-wake",
+        "Check back (wake_1)",
+        ctx
+      )
+    ).resolves.toBe("wake_1");
+    await expect(
+      reg.normalizeSubmission(null, "workflows", "cancel-wake", "Check bac", ctx)
+    ).resolves.toBe("Check bac");
+    await expect(
+      reg.normalizeSubmission(null, "workflows", "cancel-wake", "Duplicate", ctx)
+    ).resolves.toBe("Duplicate");
   });
 });
 

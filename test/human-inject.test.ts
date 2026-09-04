@@ -83,6 +83,7 @@ function makeOrch(opts: {
       }),
     getProfile: () => ({ restrictDiscordAccess: opts.restrictDiscordAccess ?? false }),
     abortTurn,
+    isBusy: () => false,
   };
   const orch = new Orchestrator({
     logger: silent,
@@ -176,27 +177,32 @@ describe("Orchestrator mid-turn reply routing (#63)", () => {
 function steerInteraction(opts: { now: boolean; prompt?: string; thread?: string }) {
   const editReply = vi.fn(async () => {});
   const deferReply = vi.fn(async () => {});
+  const reply = vi.fn(async () => {});
   const i = {
     options: {
       getString: (name: string, _req?: boolean) =>
-        name === "thread" ? (opts.thread ?? "thread-7") : (opts.prompt ?? "do the thing"),
+        name === "thread" ? (opts.thread ?? "1007") : (opts.prompt ?? "do the thing"),
       getBoolean: (name: string) => (name === "now" ? opts.now : null),
+      data: [],
     },
+    channelId: "1001",
+    channel: { isThread: () => true, parentId: "channel-1" },
     deferReply,
     editReply,
+    reply,
     user: { id: "1487094572696867019", username: "jbulpitt", globalName: "Jesse" },
     member: null,
   };
-  return { i, editReply, deferReply };
+  return { i, editReply, deferReply, reply };
 }
 
 describe("Orchestrator.cmdSteer now: option (#63)", () => {
   it("now:false (default) → cooperative inbox push, NO cancel", async () => {
     const { orch, abortTurn } = makeOrch({});
-    const { i } = steerInteraction({ now: false, prompt: "check the logs", thread: "thread-7" });
+    const { i } = steerInteraction({ now: false, prompt: "check the logs", thread: "1007" });
     await (orch as any).cmdSteer(i);
 
-    const listed = store.listInbox("discord:thread-7");
+    const listed = store.listInbox("discord:1007");
     expect(listed).toHaveLength(1);
     expect(listed[0]!.body).toBe("check the logs");
     expect(listed[0]!.fromRef).toBe("human:Jesse");
@@ -213,11 +219,34 @@ describe("Orchestrator.cmdSteer now: option (#63)", () => {
     (orch as any).injectTurn = async () => ({ text: "done", error: undefined });
     (orch as any).postSteerOutput = async () => {};
 
-    const { i } = steerInteraction({ now: true, prompt: "redirect now", thread: "thread-7" });
+    const { i } = steerInteraction({ now: true, prompt: "redirect now", thread: "1007" });
     await (orch as any).cmdSteer(i);
 
-    expect(abortTurn).toHaveBeenCalledWith("discord:thread-7", { force: false });
-    expect(store.countInbox("discord:thread-7")).toBe(0);
+    expect(abortTurn).toHaveBeenCalledWith("discord:1007", { force: false });
+    expect(store.countInbox("discord:1007")).toBe(0);
+  });
+
+  it("accepts the exact current thread label and rejects a modified alias", async () => {
+    store.upsert(record({ id: "discord:1007", channelRef: "1007", parentRef: "channel-1" }));
+    const { orch } = makeOrch({});
+
+    const selected = steerInteraction({
+      now: false,
+      prompt: "use the selected worker",
+      thread: "1007 · claude · idle",
+    });
+    await (orch as any).cmdSteer(selected.i);
+    expect(store.listInbox("discord:1007")).toHaveLength(1);
+
+    const altered = steerInteraction({
+      now: false,
+      thread: "1007 · claude · idle-ish",
+    });
+    await (orch as any).cmdSteer(altered.i);
+    expect(altered.reply).toHaveBeenCalledWith(
+      expect.objectContaining({ content: "Thread must be a Discord thread id." })
+    );
+    expect(store.listInbox("discord:1007")).toHaveLength(1);
   });
 });
 

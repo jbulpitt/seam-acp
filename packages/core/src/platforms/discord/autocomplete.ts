@@ -12,6 +12,7 @@
 export const DISCORD_AUTOCOMPLETE_MAX = 25;
 
 export type AutocompleteChoice = { name: string; value: string };
+export type AutocompleteRoundTripPolicy = "canonical" | "opaque";
 
 export type AutocompleteContext = {
   group: string | null;
@@ -36,6 +37,18 @@ export type AutocompleteResponder = (
   ctx: AutocompleteContext
 ) => Promise<readonly AutocompleteChoice[]> | readonly AutocompleteChoice[];
 
+export interface AutocompleteInventoryEntry {
+  key: string;
+  group: string | null;
+  subcommand: string | null;
+  optionName: string;
+  policy: AutocompleteRoundTripPolicy;
+}
+
+interface RegisteredAutocomplete extends AutocompleteInventoryEntry {
+  responder: AutocompleteResponder;
+}
+
 export function autocompleteKey(
   group: string | null,
   subcommand: string | null,
@@ -45,15 +58,17 @@ export function autocompleteKey(
 }
 
 export class AutocompleteRegistry {
-  private readonly responders = new Map<string, AutocompleteResponder>();
+  private readonly responders = new Map<string, RegisteredAutocomplete>();
 
   register(
     group: string | null,
     subcommand: string | null,
     optionName: string,
+    policy: AutocompleteRoundTripPolicy,
     responder: AutocompleteResponder
   ): void {
-    this.responders.set(autocompleteKey(group, subcommand, optionName), responder);
+    const key = autocompleteKey(group, subcommand, optionName);
+    this.responders.set(key, { key, group, subcommand, optionName, policy, responder });
   }
 
   get(
@@ -61,8 +76,69 @@ export class AutocompleteRegistry {
     subcommand: string | null,
     optionName: string
   ): AutocompleteResponder | undefined {
-    return this.responders.get(autocompleteKey(group, subcommand, optionName));
+    const registered = this.responders.get(autocompleteKey(group, subcommand, optionName));
+    if (!registered) return undefined;
+    return async (ctx) =>
+      projectRoundTripChoices(await registered.responder(ctx), registered.policy);
   }
+
+  inventory(): AutocompleteInventoryEntry[] {
+    return [...this.responders.values()]
+      .map(({ responder: _responder, ...entry }) => entry)
+      .sort((a, b) => a.key.localeCompare(b.key));
+  }
+
+  /**
+   * Convert an exact, currently emitted opaque display label back to its id.
+   * Canonical fields and hand-typed ids pass through unchanged for their
+   * existing submission validators. Modified, stale, fuzzy, and ambiguous
+   * labels also pass through unchanged, which makes those validators fail
+   * closed instead of guessing.
+   */
+  async normalizeSubmission(
+    group: string | null,
+    subcommand: string | null,
+    optionName: string,
+    input: string,
+    ctx: AutocompleteContext
+  ): Promise<string> {
+    const registered = this.responders.get(autocompleteKey(group, subcommand, optionName));
+    if (!registered || registered.policy === "canonical") return input;
+    let choices: AutocompleteChoice[];
+    try {
+      choices = projectRoundTripChoices(
+        await registered.responder({ ...ctx, focusedValue: input }),
+        registered.policy
+      );
+    } catch {
+      return input;
+    }
+    if (choices.some((choice) => choice.value === input)) return input;
+    const matches = new Set(
+      choices.filter((choice) => choice.name === input).map((choice) => choice.value)
+    );
+    return matches.size === 1 ? [...matches][0]! : input;
+  }
+}
+
+/** Apply the selected field's round-trip contract at the registry boundary. */
+export function projectRoundTripChoices(
+  choices: readonly AutocompleteChoice[],
+  policy: AutocompleteRoundTripPolicy
+): AutocompleteChoice[] {
+  const seen = new Set<string>();
+  const out: AutocompleteChoice[] = [];
+  for (const choice of choices) {
+    // Discord caps both fields at 100. Never truncate a canonical submission:
+    // an altered path/model/id would look valid while resolving differently.
+    if (choice.value.length < 1 || choice.value.length > 100 || seen.has(choice.value)) continue;
+    const name = policy === "canonical" ? choice.value : choice.name.slice(0, 100);
+    if (name.length < 1) continue;
+    seen.add(choice.value);
+    out.push({ name, value: choice.value });
+    if (out.length >= DISCORD_AUTOCOMPLETE_MAX) break;
+  }
+  return out;
 }
 
 /** Case-insensitive prefix match on `name` or `value`. Empty prefix ⇒ all items. */
@@ -80,7 +156,8 @@ export function filterByPrefix<T extends { name: string; value?: string }>(
 
 /**
  * Map `{name}` rows to Discord choices, de-dupe by value, cap at 25.
- * Discord choice name/value are each max 100 chars.
+ * Discord choice name/value are each max 100 chars. Display metadata may be
+ * truncated, but an overlong submitted value is omitted rather than altered.
  */
 export function toAutocompleteChoices(
   items: readonly { name: string; value?: string }[],
@@ -90,9 +167,10 @@ export function toAutocompleteChoices(
   const out: AutocompleteChoice[] = [];
   for (const item of items) {
     const value = item.value ?? item.name;
+    if (value.length < 1 || value.length > 100) continue;
     if (seen.has(value)) continue;
     seen.add(value);
-    out.push({ name: item.name.slice(0, 100), value: value.slice(0, 100) });
+    out.push({ name: item.name.slice(0, 100), value });
     if (out.length >= cap) break;
   }
   return out;

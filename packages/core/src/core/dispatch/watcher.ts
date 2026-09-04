@@ -68,6 +68,16 @@ export interface DispatchWatcherOpts {
   beforeRecoveryPublish?: (id: string) => Promise<void>;
 }
 
+export interface DispatchWatcherStartOpts {
+  /**
+   * Preserve the historical test/utility behavior by default: `start()` does
+   * not resolve until every spec found by its first pending-directory scan has
+   * settled. Production startup disables this so paid agent work cannot delay
+   * the rest of application readiness.
+   */
+  waitForInitialDispatches?: boolean;
+}
+
 interface ClaimOwnership {
   readonly token: symbol;
   readonly spec: DispatchSpec;
@@ -127,6 +137,9 @@ export class DispatchWatcher {
   private readonly artifactTails = new Map<string, Promise<void>>();
   private timer?: NodeJS.Timeout;
   private ready = false;
+  /** Settles after the first pending-directory pass, including every dispatch
+   * it claimed. The handled promise is safe to observe from boot sequencing. */
+  private initialDispatchPass: Promise<void> = Promise.resolve();
   /**
    * #174: in-progress `tick()` calls. A tick checks `ready`, then AWAITS
    * `readdir` — so `stop()` can land in that gap and `drain()` would see empty
@@ -148,8 +161,9 @@ export class DispatchWatcher {
   }
 
   /** Create the queue dirs, recover anything a crash left in `running/`, then
-   *  start polling. Safe to await — index.ts does. */
-  async start(): Promise<void> {
+   * start polling. Callers may arm the first dispatch pass in the background;
+   * crash reconciliation itself is always complete before this resolves. */
+  async start(opts: DispatchWatcherStartOpts = {}): Promise<void> {
     await mkdir(this.dirs.pending, { recursive: true });
     await mkdir(this.dirs.running, { recursive: true });
     await mkdir(this.dirs.done, { recursive: true });
@@ -164,7 +178,23 @@ export class DispatchWatcher {
     this.timer = setInterval(() => void this.tick(), this.pollMs);
     // Don't hold the event loop open just for the poller.
     this.timer.unref?.();
-    await this.tick();
+    const initialPass = this.tick();
+    this.initialDispatchPass = initialPass.catch((err) => {
+      this.logger.warn({ err }, "initial dispatch pass failed");
+    });
+    if (opts.waitForInitialDispatches !== false) await initialPass;
+  }
+
+  /** Observe the background first pass without changing normal drain
+   * semantics. Used to preserve boot-recovery ordering without holding the
+   * application readiness notification behind paid agent turns. */
+  initialDispatchesSettled(): Promise<void> {
+    return this.initialDispatchPass;
+  }
+
+  /** False after shutdown closes watcher intake. */
+  get isAcceptingDispatches(): boolean {
+    return this.ready;
   }
 
   /**

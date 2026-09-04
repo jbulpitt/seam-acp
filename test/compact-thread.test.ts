@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
-import { CardResultVault } from "../packages/core/src/core/card-result-vault.js";
+import {
+  CARD_RESULT_BODY_MAX_BYTES,
+  CARD_RESULT_FILENAME_MAX_BYTES,
+  CardResultVault,
+  type CardResultVaultOptions,
+} from "../packages/core/src/core/card-result-vault.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
@@ -651,10 +656,10 @@ describe("SessionStore.compareAndSwapAcpSession", () => {
 
 describe("CardResultVault", () => {
   const dirs: string[] = [];
-  const openVault = (ttlMs?: number) => {
+  const openVault = (options?: CardResultVaultOptions) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-179-vault-"));
     dirs.push(dir);
-    return { dir, vault: new CardResultVault(dir, silent, ttlMs) };
+    return { dir, vault: new CardResultVault(dir, silent, options) };
   };
   afterEach(() => {
     for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
@@ -669,15 +674,16 @@ describe("CardResultVault", () => {
     ...over,
   });
 
-  it("hands a parked result back to its owner, exactly once", async () => {
+  it("keeps a claimed result durable until its owner acknowledges delivery", async () => {
     const { vault } = openVault();
     await vault.put(entry());
 
-    const first = await vault.take("discord:thread-1", "op");
+    const first = await vault.claim("discord:thread-1", "op");
     expect(first).toHaveLength(1);
-    expect(first[0]!.body).toBe("PRIVATE SUMMARY BODY");
-    // Collected, not copied: a second read finds nothing.
-    expect(await vault.take("discord:thread-1", "op")).toHaveLength(0);
+    expect(first[0]!.entry.body).toBe("PRIVATE SUMMARY BODY");
+    expect(await vault.claim("discord:thread-1", "op")).toHaveLength(0);
+    expect(await vault.acknowledge(first[0]!)).toBe(true);
+    expect(await vault.claim("discord:thread-1", "op")).toHaveLength(0);
   });
 
   it("refuses a different operator, and a different thread", async () => {
@@ -686,10 +692,10 @@ describe("CardResultVault", () => {
 
     // The card this replaces was visible to ONE operator; matching on the
     // record alone would hand it to whoever next opened the browser.
-    expect(await vault.take("discord:thread-1", "someone-else")).toHaveLength(0);
-    expect(await vault.take("discord:other", "op")).toHaveLength(0);
+    expect(await vault.claim("discord:thread-1", "someone-else")).toHaveLength(0);
+    expect(await vault.claim("discord:other", "op")).toHaveLength(0);
     // Still there for the person it belongs to.
-    expect(await vault.take("discord:thread-1", "op")).toHaveLength(1);
+    expect(await vault.claim("discord:thread-1", "op")).toHaveLength(1);
   });
 
   it("survives a restart — the vault is on disk, not in memory", async () => {
@@ -697,20 +703,129 @@ describe("CardResultVault", () => {
     await vault.put(entry());
 
     const reopened = new CardResultVault(dir, silent);
-    const got = await reopened.take("discord:thread-1", "op");
-    expect(got.map((g) => g.body)).toEqual(["PRIVATE SUMMARY BODY"]);
+    const got = await reopened.claim("discord:thread-1", "op");
+    expect(got.map((g) => g.entry.body)).toEqual(["PRIVATE SUMMARY BODY"]);
   });
 
   it("drops results past their TTL instead of hoarding them", async () => {
-    const { vault } = openVault(-1); // everything is already expired
+    const { vault } = openVault({ ttlMs: -1 }); // everything is already expired
     await vault.put(entry());
-    expect(await vault.take("discord:thread-1", "op")).toHaveLength(0);
+    expect(await vault.claim("discord:thread-1", "op")).toHaveLength(0);
     // …and the expired file was swept, not left to accumulate.
-    expect(await vault.take("discord:thread-1", "op")).toHaveLength(0);
+    expect(await vault.claim("discord:thread-1", "op")).toHaveLength(0);
   });
 
   it("returns nothing, and does not throw, before anything is parked", async () => {
     const { vault } = openVault();
-    await expect(vault.take("discord:thread-1", "op")).resolves.toEqual([]);
+    await expect(vault.claim("discord:thread-1", "op")).resolves.toEqual([]);
+  });
+
+  it("releases a failed delivery for an immediate, single retry", async () => {
+    const { vault } = openVault();
+    await vault.put(entry());
+
+    const [failed] = await vault.claim("discord:thread-1", "op");
+    expect(failed).toBeDefined();
+    expect(await vault.release(failed!)).toBe(true);
+
+    const retry = await vault.claim("discord:thread-1", "op");
+    expect(retry).toHaveLength(1);
+    expect(retry[0]!.entry.body).toBe("PRIVATE SUMMARY BODY");
+    await vault.acknowledge(retry[0]!);
+    expect(await vault.claim("discord:thread-1", "op")).toHaveLength(0);
+  });
+
+  it("has one atomic winner when two vault instances race after the same read", async () => {
+    const { dir, vault } = openVault();
+    await vault.put(entry());
+
+    let arrivals = 0;
+    let release!: () => void;
+    const bothRead = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const beforeClaimRename = async () => {
+      arrivals++;
+      if (arrivals === 2) release();
+      await bothRead;
+    };
+    const a = new CardResultVault(dir, silent, { hooks: { beforeClaimRename } });
+    const b = new CardResultVault(dir, silent, { hooks: { beforeClaimRename } });
+    const [aClaims, bClaims] = await Promise.all([
+      a.claim("discord:thread-1", "op"),
+      b.claim("discord:thread-1", "op"),
+    ]);
+
+    expect(aClaims.length + bClaims.length).toBe(1);
+    const winner = aClaims[0] ?? bClaims[0]!;
+    await (aClaims.length ? a : b).acknowledge(winner);
+    expect(await vault.claim("discord:thread-1", "op")).toHaveLength(0);
+  });
+
+  it("revalidates owner and thread after the claim rename commit point", async () => {
+    const { dir, vault } = openVault();
+    const id = await vault.put(entry());
+    expect(id).toBeTruthy();
+
+    let swapped = false;
+    const racing = new CardResultVault(dir, silent, {
+      hooks: {
+        beforeClaimRename: async (candidate) => {
+          if (swapped) return;
+          swapped = true;
+          fs.writeFileSync(
+            path.join(dir, "card-results", `${candidate.id}.json`),
+            JSON.stringify({
+              ...candidate,
+              recordId: "discord:other-thread",
+              userId: "other-user",
+              body: "OTHER USER PRIVATE BODY",
+            })
+          );
+        },
+      },
+    });
+
+    expect(await racing.claim("discord:thread-1", "op")).toEqual([]);
+    const rightful = await racing.claim("discord:other-thread", "other-user");
+    expect(rightful).toHaveLength(1);
+    expect(rightful[0]!.entry.body).toBe("OTHER USER PRIVATE BODY");
+    await racing.acknowledge(rightful[0]!);
+  });
+
+  it("recovers an expired lease and sweeps malformed and abandoned files", async () => {
+    let now = Date.parse("2026-09-03T12:00:00.000Z");
+    const { dir, vault } = openVault({ now: () => now, leaseMs: 10, tempTtlMs: 10 });
+    const id = await vault.put(entry());
+    expect(id).toBeTruthy();
+    expect(await vault.claim("discord:thread-1", "op")).toHaveLength(1);
+
+    const vaultDir = path.join(dir, "card-results");
+    const malformedId = "11111111-1111-4111-8111-111111111111";
+    fs.writeFileSync(
+      path.join(vaultDir, `${malformedId}.json`),
+      JSON.stringify({ ...entry(), id: malformedId, createdUtc: "not-a-time" })
+    );
+    fs.writeFileSync(path.join(vaultDir, "malformed.json"), "PRIVATE MALFORMED BODY");
+    const abandoned = path.join(vaultDir, `${malformedId}.json.tmp`);
+    fs.writeFileSync(abandoned, "PRIVATE TEMP BODY");
+    fs.utimesSync(abandoned, new Date(now - 100), new Date(now - 100));
+
+    now += 11;
+    const recovered = await vault.claim("discord:thread-1", "op");
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]!.entry.id).toBe(id);
+    await vault.acknowledge(recovered[0]!);
+    expect(fs.readdirSync(vaultDir)).toEqual([]);
+  });
+
+  it("rejects bodies and filenames that cannot use the Discord attachment path", async () => {
+    const { dir, vault } = openVault();
+    expect(CARD_RESULT_BODY_MAX_BYTES).toBe(25 * 1024 * 1024);
+    expect(CARD_RESULT_FILENAME_MAX_BYTES).toBe(255);
+    expect(await vault.put(entry({ body: "x".repeat(CARD_RESULT_BODY_MAX_BYTES + 1) }))).toBeNull();
+    expect(await vault.put(entry({ filename: "../private.md" }))).toBeNull();
+    expect(await vault.put(entry({ filename: `${"é".repeat(128)}.md` }))).toBeNull();
+    expect(fs.existsSync(path.join(dir, "card-results"))).toBe(false);
   });
 });

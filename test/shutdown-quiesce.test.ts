@@ -24,6 +24,7 @@ import {
   reconcileCompletedDoneFiles,
   needsCompletionReplay,
   completionRoute,
+  type DoneReconcileDeps,
 } from "../packages/core/src/core/dispatch/done-reconcile.js";
 import {
   DispatchTurnError,
@@ -84,6 +85,32 @@ async function dropSpec(spec: Partial<DispatchSpec> & { id: string }): Promise<v
 }
 async function writeDone(id: string, body: Record<string, unknown>): Promise<void> {
   await writeFile(path.join(dirs.done, `${id}.json`), JSON.stringify(body), "utf8");
+}
+
+/** Legacy #174 cases deliberately exercise arbitrary files. Production boot
+ * uses SessionStore's non-terminal index and never enumerates this directory. */
+async function reconcileDoneFilesForTest(
+  deps: Omit<DoneReconcileDeps, "listRecoveryCandidates">
+) {
+  const names = await readdir(dispatchDirs(deps.dataDir).done).catch(() => []);
+  return reconcileCompletedDoneFiles({
+    ...deps,
+    listRecoveryCandidates: () =>
+      names
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => {
+          const id = name.slice(0, -".json".length);
+          const row = deps.getDelegation(id);
+          return {
+            id,
+            updatedUtc: row?.updatedUtc ?? "",
+            status: row?.status ?? "interrupted",
+            ...(row?.kind ? { kind: row.kind } : {}),
+            ...(row?.correlationId !== undefined ? { correlationId: row.correlationId } : {}),
+            ...(row?.targetRef !== undefined ? { targetRef: row.targetRef } : {}),
+          };
+        }),
+  });
 }
 /** Flush enough macrotask turns that a non-blocking barrier would have won. */
 const flush = async (turns = 8) => {
@@ -834,7 +861,7 @@ describe("#174 boot done-file reconciliation", () => {
     await writeDone("d1", { id: "d1", ...base });
     const replay = vi.fn(async () => {});
     const onDispatch = vi.fn(async () => ({ output: "RERUN", stopReason: "end_turn" }));
-    const summary = await reconcileCompletedDoneFiles({
+    const summary = await reconcileDoneFilesForTest({
       dataDir,
       logger: silent,
       getDelegation: () => ({ status: "interrupted" }),
@@ -888,7 +915,7 @@ describe("#174 boot done-file reconciliation", () => {
     // a wake owes no onward delivery, so terminalizing loses nothing.
     await writeDone("d2", { id: "d2", target: "t", status: "completed", finishedUtc: "x" });
     const getDelegation = vi.fn(() => ({ status: "interrupted", kind: "wake" }));
-    const summary = await reconcileCompletedDoneFiles({
+    const summary = await reconcileDoneFilesForTest({
       dataDir, logger: silent, getDelegation, replay: async () => {},
     });
     expect(summary.reconciled).toBe(1);
@@ -897,12 +924,12 @@ describe("#174 boot done-file reconciliation", () => {
 
   it("skips an unknown ledger row and a terminal row", async () => {
     await writeDone("d3", { id: "d3", ...base });
-    const unknown = await reconcileCompletedDoneFiles({
+    const unknown = await reconcileDoneFilesForTest({
       dataDir, logger: silent, getDelegation: () => null, replay: async () => {},
     });
     expect(unknown).toMatchObject({ reconciled: 0, skippedUnknown: 1 });
 
-    const terminal = await reconcileCompletedDoneFiles({
+    const terminal = await reconcileDoneFilesForTest({
       dataDir, logger: silent, getDelegation: () => ({ status: "completed" }), replay: async () => {},
     });
     expect(terminal).toMatchObject({ reconciled: 0, skippedTerminal: 1 });
@@ -915,9 +942,9 @@ describe("#174 boot done-file reconciliation", () => {
       status = "completed";
     });
     const deps = { dataDir, logger: silent, getDelegation: () => ({ status }), replay };
-    await reconcileCompletedDoneFiles(deps);
-    await reconcileCompletedDoneFiles(deps);
-    await reconcileCompletedDoneFiles(deps);
+    await reconcileDoneFilesForTest(deps);
+    await reconcileDoneFilesForTest(deps);
+    await reconcileDoneFilesForTest(deps);
     expect(replay).toHaveBeenCalledOnce();
   });
 
@@ -925,20 +952,20 @@ describe("#174 boot done-file reconciliation", () => {
     await writeDone("ok1", { id: "ok1", ...base });
     await writeFile(path.join(dirs.done, "broken.json"), "{not json", "utf8");
     await writeDone("ok2", { id: "ok2", ...base });
-    const summary = await reconcileCompletedDoneFiles({
+    const summary = await reconcileDoneFilesForTest({
       dataDir, logger: silent,
       getDelegation: () => ({ status: "interrupted" }),
       replay: async (r) => {
         if (r.id === "ok1") throw new Error("replay boom");
       },
     });
-    expect(summary.failed).toBe(1);
+    expect(summary.failed).toBe(2); // replay failure + visible retained corrupt artifact
     expect(summary.reconciled).toBe(1); // ok2 still processed
   });
 
   it("returns an empty summary when nothing has ever completed", async () => {
     await rm(dirs.done, { recursive: true, force: true });
-    const summary = await reconcileCompletedDoneFiles({
+    const summary = await reconcileDoneFilesForTest({
       dataDir, logger: silent, getDelegation: () => null, replay: async () => {},
     });
     expect(summary).toMatchObject({ scanned: 0, reconciled: 0 });
@@ -1621,7 +1648,7 @@ describe("#174 an unrouted completion is judged by its KIND", () => {
         // deliberately no returnTo / chainId
       });
       const replay = vi.fn(async () => {});
-      const summary = await reconcileCompletedDoneFiles({
+      const summary = await reconcileDoneFilesForTest({
         dataDir,
         logger: silent,
         getDelegation: () => ({ status: "interrupted", kind }),
@@ -1746,7 +1773,7 @@ describe("#174 a completion the interrupt suppressed is never re-delivered", () 
       finishedUtc: "2026-09-03T00:00:00.000Z",
     });
 
-    const summary = await reconcileCompletedDoneFiles({
+    const summary = await reconcileDoneFilesForTest({
       dataDir,
       logger: silent,
       getDelegation: (id) => ledger.getDelegation(id),
@@ -1774,7 +1801,7 @@ describe("#174 a completion the interrupt suppressed is never re-delivered", () 
       finishedUtc: "2026-09-03T00:00:00.000Z",
     });
 
-    const summary = await reconcileCompletedDoneFiles({
+    const summary = await reconcileDoneFilesForTest({
       dataDir,
       logger: silent,
       getDelegation: (id) => ledger.getDelegation(id),
@@ -1849,7 +1876,7 @@ describe("#174 replay matches the LIVE dispatch contract, not just the fields", 
       // no kind, no returnTo, no chainId — a pre-#174 file
     });
     const replay = vi.fn(async () => {});
-    const summary = await reconcileCompletedDoneFiles({
+    const summary = await reconcileDoneFilesForTest({
       dataDir,
       logger: silent,
       getDelegation: () => ({ status: "interrupted", kind: "forward", correlationId: "legacy-h" }),
@@ -1897,7 +1924,7 @@ describe("#174 recovery contract is bounded and honest", () => {
       finishedUtc: "2026-09-03T00:00:00.000Z",
     });
     const replay = vi.fn(async () => {});
-    const summary = await reconcileCompletedDoneFiles({
+    const summary = await reconcileDoneFilesForTest({
       dataDir, logger: silent, getDelegation: () => ({ status: "interrupted" }), replay,
     });
     expect(summary.reconciled).toBe(1);
@@ -1907,7 +1934,7 @@ describe("#174 recovery contract is bounded and honest", () => {
     // path, and rerunning it is correct because nothing completed. The barrier
     // promise may still be running as teardown proceeds; that late work is
     // explicitly out of scope for this repair.
-    const noDoneFile = await reconcileCompletedDoneFiles({
+    const noDoneFile = await reconcileDoneFilesForTest({
       dataDir,
       logger: silent,
       getDelegation: () => ({ status: "interrupted" }),

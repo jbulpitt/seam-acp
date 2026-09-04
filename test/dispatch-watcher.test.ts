@@ -157,6 +157,48 @@ describe("DispatchWatcher", () => {
     expect(await readdir(dirs.running)).toEqual([]);
   });
 
+  it("can arm the initial backlog without holding startup behind a paid dispatch", async () => {
+    let entered = false;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async () => {
+        entered = true;
+        await held;
+        return { output: "eventually durable", stopReason: "end_turn" };
+      },
+    });
+    await dropSpec({ id: "boot-backlog" });
+
+    await watcher.start({ waitForInitialDispatches: false });
+    await vi_waitFor(() => entered);
+
+    // start() has returned while the genuine dispatch is still held, and the
+    // explicit completion handle remains pending until its done-file lands.
+    let initialSettled = false;
+    void watcher.initialDispatchesSettled().then(() => { initialSettled = true; });
+    await Promise.resolve();
+    expect(initialSettled).toBe(false);
+
+    // A shutdown arriving during the background pass must still see it through
+    // the normal watcher drain rather than closing resources underneath it.
+    watcher.stop();
+    let drained = false;
+    const draining = watcher.drain().then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+
+    release();
+    await Promise.all([watcher.initialDispatchesSettled(), draining]);
+
+    expect(await readDone("boot-backlog")).toMatchObject({
+      status: "completed",
+      output: "eventually durable",
+    });
+  });
+
   it("records status failed with the error when the callback rejects", async () => {
     const watcher = new DispatchWatcher({
       dataDir,

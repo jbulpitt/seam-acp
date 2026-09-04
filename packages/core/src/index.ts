@@ -76,6 +76,8 @@ import { ModelValueRankingsCard } from "./core/model-value/rankings-card.js";
 import { LiveMessageSearch, MessageReader } from "./core/message-reader.js";
 import {
   createDefaultServiceStatusSources,
+  createServiceStatusMcpView,
+  ServiceStatusMcpView,
   ServiceStatusRefreshManager,
   ServiceStatusStore,
 } from "./core/service-status/index.js";
@@ -356,6 +358,9 @@ async function main(): Promise<void> {
   let seamMcpServer: SeamMcpServer | undefined;
   let bridgeHub: BridgeHub | undefined;
   let serviceStatusStore: ServiceStatusStore | undefined;
+  let serviceStatusManager: ServiceStatusRefreshManager | undefined;
+  let serviceStatusView: ServiceStatusMcpView | undefined;
+  let serviceStatusCard: ServiceStatusCard | undefined;
   let stopServiceStatus: (() => void) | undefined;
 
   const router = new SessionRouter({
@@ -546,6 +551,34 @@ async function main(): Promise<void> {
   modelMetadataManager.start();
   modelValueManager.start();
 
+  // Upstream service-status subsystem (#182). Built here, ahead of the MCP
+  // server, because two independent consumers need it: the pinned Discord card
+  // (#183, constructed further down once the adapter is fully up) and the
+  // seam-MCP tools (#184). Construction opens the database and registers the
+  // static source list; no polling happens until `start()` below, and the card
+  // is optional — enabling the subsystem without a card is what gives an
+  // MCP-only deployment the tools.
+  const serviceStatusEnabled =
+    config.SERVICE_STATUS_ENABLED ?? Boolean(config.DISCORD_SERVICE_STATUS_THREAD_ID);
+  if (serviceStatusEnabled) {
+    const sources = createDefaultServiceStatusSources();
+    serviceStatusStore = new ServiceStatusStore(
+      path.join(config.DATA_DIR, "service-status.sqlite")
+    );
+    serviceStatusManager = new ServiceStatusRefreshManager({
+      store: serviceStatusStore,
+      sources,
+      logger: logger.child({ mod: "service-status" }),
+      // Read at call time: the card is constructed later, or not at all.
+      onUpdate: () => serviceStatusCard?.poke(),
+    });
+    serviceStatusView = createServiceStatusMcpView({
+      store: serviceStatusStore,
+      manager: serviceStatusManager,
+      sources,
+    });
+  }
+
   // Start the shared seam-MCP server now that the adapter exists (peek reads
   // threads through it). Its ephemeral port feeds the router's late-bound
   // getPort, so per-session injection works from here on. The tools only
@@ -615,6 +648,12 @@ async function main(): Promise<void> {
         const quota = quotaRegistry.get(agentId);
         return quota ? [quota] : [];
       },
+      ...(serviceStatusView
+        ? {
+            readServiceStatus: (options) => serviceStatusView!.read(options),
+            refreshServiceStatus: (options) => serviceStatusView!.refresh(options),
+          }
+        : {}),
       getModelValueRankings: (options) => modelValueStore.getRankings(options),
       getModelMetadata: (idOrSlug) => modelMetadataStore.get(idOrSlug),
       queryModelMetadata: (options) => modelMetadataStore.query(options),
@@ -1127,37 +1166,31 @@ async function main(): Promise<void> {
     );
   }
 
-  // Pinned upstream-status card (#183). Constructing the manager registers all
-  // sources, then the card paints cached/no-data rows before polling begins.
-  if (config.DISCORD_SERVICE_STATUS_THREAD_ID) {
-    const sources = createDefaultServiceStatusSources();
-    const statusStore = new ServiceStatusStore(
-      path.join(config.DATA_DIR, "service-status.sqlite")
-    );
-    const statusCard = new ServiceStatusCard({
-      logger,
-      adapter,
-      threadId: config.DISCORD_SERVICE_STATUS_THREAD_ID,
-      dataDir: config.DATA_DIR,
-      sources,
-      collect: () => statusStore.listSnapshots(),
-    });
-    const statusManager = new ServiceStatusRefreshManager({
-      store: statusStore,
-      sources,
-      logger: logger.child({ mod: "service-status" }),
-      onUpdate: () => statusCard.poke(),
-    });
-    serviceStatusStore = statusStore;
-    orchestrator.setServiceStatusRefresh(() => statusManager.refresh({ force: true }));
+  // Pinned upstream-status card (#183), an optional consumer of the subsystem
+  // constructed above. The card paints cached/no-data rows before polling
+  // begins; polling itself starts once, below, whether or not a card exists.
+  if (serviceStatusManager && serviceStatusStore) {
+    const statusStore = serviceStatusStore;
+    const statusManager = serviceStatusManager;
+    if (config.DISCORD_SERVICE_STATUS_THREAD_ID) {
+      serviceStatusCard = new ServiceStatusCard({
+        logger,
+        adapter,
+        threadId: config.DISCORD_SERVICE_STATUS_THREAD_ID,
+        dataDir: config.DATA_DIR,
+        sources: createDefaultServiceStatusSources(),
+        collect: () => statusStore.listSnapshots(),
+      });
+      orchestrator.setServiceStatusRefresh(() => statusManager.refresh({ force: true }));
+      await serviceStatusCard.start().catch((err) =>
+        logger.warn({ err }, "service status card failed to start")
+      );
+    }
     stopServiceStatus = () => {
       orchestrator.setServiceStatusRefresh(undefined);
       statusManager.stop();
-      statusCard.stop();
+      serviceStatusCard?.stop();
     };
-    await statusCard.start().catch((err) =>
-      logger.warn({ err }, "service status card failed to start")
-    );
     statusManager.start();
   }
 

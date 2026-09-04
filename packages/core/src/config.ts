@@ -674,6 +674,21 @@ const Schema = z.object({
     .optional(),
 
   /**
+   * Master switch for the upstream service-status subsystem (#182): the durable
+   * store and the polling refresh manager that feed both the pinned Discord
+   * card (#183) and the seam-MCP `service_status` tools (#184).
+   *
+   * Unset (the default) means "on when the card is configured", so existing
+   * deployments are unchanged. Set it to "true" to run the subsystem — and get
+   * the MCP tools — without a Discord card, or "false" to disable the polling
+   * entirely even where a card thread id is present.
+   */
+  SERVICE_STATUS_ENABLED: z
+    .enum(["true", "false"])
+    .optional()
+    .transform((v) => (v === undefined ? undefined : v === "true")),
+
+  /**
    * Optional Discord thread/channel id for the pinned model-value rankings
    * card. The card reads only the latest durable #130 snapshot, edits in place
    * after successful refreshes, and silently self-bumps its thread.

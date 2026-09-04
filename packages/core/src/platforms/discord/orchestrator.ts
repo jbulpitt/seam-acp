@@ -11162,7 +11162,7 @@ export class Orchestrator {
         return;
       }
       await i.editReply(`Current model: ${displayCurrent}. Posting picker…`);
-      const picked = await this.adapter.sendChoicePicker(channel, {
+      await this.adapter.sendChoicePicker(channel, {
         panel: {
           color: 0x5865f2,
           title: "🧠 Choose a model",
@@ -11174,79 +11174,191 @@ export class Orchestrator {
           description: m.modelId,
         })),
         authorizedUserIds: mayConfigureUserIds(this.config),
-        successPanel: (pickedChoice, username) =>
-          modelSelectionConfirmationPanel(current, pickedChoice.value, username),
+        commit: async (pickedChoice, username) => {
+          const result = await this.applyModelChange(channel, record, pickedChoice.value);
+          if (!result.ok) {
+            return {
+              ok: false,
+              error: result.error,
+              failurePanel: {
+                color: 0xed4245,
+                title: "❌ Model not changed",
+                fields: [
+                  { name: "Current", value: displayCurrent, inline: true },
+                  { name: "Requested", value: `\`${pickedChoice.value}\``, inline: true },
+                  { name: "Error", value: result.error.slice(0, 1024) },
+                ],
+                footer: `Attempted by ${username}`,
+              },
+            };
+          }
+          return {
+            ok: true,
+            successPanel: modelSelectionConfirmationPanel(current, pickedChoice.value, username),
+          };
+        },
       });
-      if (!picked) return;
-      await this.applyModelChange(channel, record, picked.value);
       return;
     }
     await this.applyModelChange(channel, record, id, i);
   }
 
   /**
-   * Persist + (best-effort) live-apply a model id. If `interaction` is
-   * supplied, reply ephemerally to it; otherwise post the result to the
-   * channel (for picker-driven flows).
+   * Persist session model + thread overlay as one failure-atomic transaction
+   * (#191), then optionally live-apply. Success is emitted only after the
+   * effective spawn model matches. Overlay/write/reload/mismatch failures
+   * roll both stores back.
    */
   private async applyModelChange(
     channel: ChannelRef,
     record: SessionRecord,
     id: string,
     interaction?: ChatInputCommandInteraction
-  ): Promise<void> {
-    const live = this.store.get(record.id) ?? record;
-    const cfg = this.store.readConfig(live);
-    const current = this.router.describeConfig(live).model.value;
+  ): Promise<{ ok: true; message: string } | { ok: false; error: string }> {
+    const respond = async (msg: string): Promise<void> => {
+      if (interaction) {
+        if (!interaction.replied && !interaction.deferred) {
+          await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
+        } else {
+          await this.adapter.sendMessage(channel, msg);
+        }
+      } else {
+        await this.adapter.sendMessage(channel, msg);
+      }
+    };
+    const fail = async (error: string): Promise<{ ok: false; error: string }> => {
+      await respond(error.startsWith("Could not") ? error : `Could not set model: ${error}`);
+      return { ok: false, error };
+    };
+
+    record = this.store.get(record.id) ?? record;
+    const describedBefore = this.router.describeConfig(record);
+    const current = describedBefore.model.value;
     if (id === current) {
       await this.applyThreadName(this.store.get(record.id) ?? record);
       const message = `🧠 Model already set to \`${id}\` (no change).`;
-      if (interaction) {
-        await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
+      await respond(message);
+      return { ok: true, message };
+    }
+
+    const actor = interaction
+      ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
+      : { id: null, name: null };
+    const sessionBefore = { ...(this.store.get(record.id) ?? record) };
+    const overlayBefore = this.configMutation.readThreadPresetEntry(channel.id);
+    const originalEffective = {
+      agent: describedBefore.agent.value,
+      model: describedBefore.model.value,
+      location: describedBefore.location.value,
+    };
+
+    const rollback = (): { acpRestored: boolean } => {
+      const overlayRestored = this.configMutation.restoreThreadPresetEntry(
+        channel.id,
+        overlayBefore
+      );
+      this.store.upsert({
+        ...sessionBefore,
+        acpSessionId: "",
+        updatedUtc: new Date().toISOString(),
+      });
+      const now = this.store.get(sessionBefore.id) ?? sessionBefore;
+      const described = this.router.describeConfig(now);
+      const canRestoreAcp =
+        Boolean(sessionBefore.acpSessionId) &&
+        described.agent.value === originalEffective.agent &&
+        described.model.value === originalEffective.model &&
+        described.location.value === originalEffective.location;
+      if (canRestoreAcp) {
+        this.store.upsert({
+          ...now,
+          acpSessionId: sessionBefore.acpSessionId,
+          updatedUtc: new Date().toISOString(),
+        });
+        return { acpRestored: true };
+      }
+      if (!overlayRestored.ok) {
+        this.logger.warn(
+          { err: overlayRestored.error, threadId: channel.id },
+          "model-switch overlay rollback failed; ACP id left cleared"
+        );
+      }
+      return { acpRestored: false };
+    };
+
+    const mismatchSuffix = (rolled: { acpRestored: boolean }): string =>
+      rolled.acpRestored
+        ? ""
+        : " Previous ACP session was not restored because the effective model no longer matches.";
+
+    try {
+      const live = this.store.get(record.id) ?? record;
+      const cfg = this.store.readConfig(live);
+      cfg.model = id;
+      delete cfg.lastContextUsage;
+      this.store.upsert({
+        ...live,
+        configJson: this.store.writeConfig(cfg),
+        updatedUtc: new Date().toISOString(),
+      });
+
+      const overlay = this.configMutation.applyThreadOverlay({
+        threadId: channel.id,
+        ...(channel.parentId ? { parentRef: channel.parentId } : {}),
+        changes: { model: id },
+        actor,
+      });
+      if (!overlay.ok) {
+        const rolled = rollback();
+        this.logger.warn(
+          { err: overlay.error, threadId: channel.id },
+          "thread model overlay write failed; mutation rolled back"
+        );
+        return fail(`${overlay.error}${mismatchSuffix(rolled)}`);
+      }
+
+      const verified = this.store.get(live.id) ?? live;
+      const described = this.router.describeConfig(verified);
+      const spawn = this.router.planRuntimeSpawn(verified);
+      if (described.model.value !== id || spawn.model !== id) {
+        const rolled = rollback();
+        return fail(
+          `the effective configuration did not match the requested model.${mismatchSuffix(rolled)}`
+        );
+      }
+
+      let message: string;
+      if (this.router.hasRuntime(verified.id)) {
+        try {
+          const rt = await this.router.getOrStartRuntime(verified);
+          await rt.setModel(id);
+          message = `🧠 Model set to \`${id}\` (live).`;
+        } catch (err) {
+          this.logger.warn({ err }, "live model set failed; invalidating runtime for respawn");
+          await this.router.invalidate(verified.id);
+          const still = this.store.get(verified.id) ?? verified;
+          const stillDescribed = this.router.describeConfig(still);
+          const stillSpawn = this.router.planRuntimeSpawn(still);
+          if (stillDescribed.model.value !== id || stillSpawn.model !== id) {
+            const rolled = rollback();
+            return fail(
+              `live model apply failed and the durable model is no longer ${id}.${mismatchSuffix(rolled)}`
+            );
+          }
+          message = `🧠 Model will be \`${id}\` on the next turn (session respawn).`;
+        }
       } else {
-        await this.adapter.sendMessage(channel, message);
+        message = `🧠 Model will be \`${id}\` on the next turn.`;
       }
-      return;
-    }
-    cfg.model = id;
-    // The cached usage was measured under the prior model; window/used both
-    // belong to a different model now. Invalidate so the next turn starts
-    // clean rather than seeding the panel with mismatched numbers.
-    cfg.lastContextUsage = undefined;
-    this.persistConfig(live, cfg);
-    const overlay = this.configMutation.applyThreadOverlay({
-      threadId: channel.id,
-      ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-      changes: { model: id },
-      actor: interaction
-        ? { id: interaction.user.id, name: interaction.user.displayName ?? interaction.user.username }
-        : { id: null, name: null },
-    });
-    if (!overlay.ok) {
-      this.logger.warn({ err: overlay.error, threadId: channel.id }, "thread model overlay write failed");
-    }
-    let message: string;
-    if (this.router.hasRuntime(record.id)) {
-      try {
-        const rt = await this.router.getOrStartRuntime(record);
-        await rt.setModel(id);
-        message = `🧠 Model set to \`${id}\` (live).`;
-      } catch (err) {
-        this.logger.warn({ err }, "live model set failed; invalidating runtime for respawn");
-        // Kill the runtime so next turn spawns with the correct model in env
-        // vars (ANTHROPIC_MODEL). Without this, non-Anthropic backends (Ollama
-        // Cloud, Z.ai) keep running the old model since setModel() is rejected.
-        await this.router.invalidate(record.id);
-        message = `🧠 Model will be \`${id}\` on the next turn (session respawn).`;
-      }
-    } else {
-      message = `🧠 Model will be \`${id}\` on the next turn.`;
-    }
-    await this.applyThreadName(this.store.get(record.id) ?? record);
-    if (interaction) {
-      await interaction.reply({ content: message, flags: MessageFlags.Ephemeral });
-    } else {
-      await this.adapter.sendMessage(channel, message);
+
+      await this.applyThreadName(this.store.get(verified.id) ?? verified);
+      await respond(message);
+      return { ok: true, message };
+    } catch (err) {
+      const rolled = rollback();
+      const detail = err instanceof Error ? err.message : String(err);
+      this.logger.warn({ err, threadId: channel.id }, "model switch threw; mutation rolled back");
+      return fail(`${detail}${mismatchSuffix(rolled)}`);
     }
   }
 

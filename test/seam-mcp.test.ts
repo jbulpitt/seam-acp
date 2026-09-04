@@ -433,6 +433,8 @@ describe("SeamMcpServer", () => {
       "schedule_wake",
       "search_messages",
       "send",
+      "service_status",
+      "service_status_refresh",
       "steer",
       "submit_result",
       "threads",
@@ -927,7 +929,7 @@ describe("SeamMcpServer", () => {
     // Adding an OPTION to handoff does NOT change the tool count; inspect_image
     // plus the standalone capabilities — inspect_image, model metadata (2),
     // model_value_rankings, thread controls, and message search/read bring the catalog to 34.
-    expect(body.result.tools).toHaveLength(34);
+    expect(body.result.tools).toHaveLength(36);
     expect(byName.get("handoff").inputSchema.properties.watchFeedback.type).toBe("boolean");
   });
 
@@ -1862,7 +1864,7 @@ describe("SeamMcpServer", () => {
     h = await makeHarness();
     const { body } = await h.call("tools/list");
     // Params on `send` must NOT add a tool — the set stays at 34.
-    expect(body.result.tools).toHaveLength(34);
+    expect(body.result.tools).toHaveLength(36);
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("send").inputSchema.properties.interrupt.type).toBe("boolean");
     expect(byName.get("send").inputSchema.properties.fresh.type).toBe("boolean");

@@ -80,6 +80,15 @@ hand-editing runtime state.
   optional; the repo picker skips symlink dirs. Successful `--apply` writes a
   **force** restart sentinel (SIGTERM live turns; turn-resume continues).
   `npm run redeploy` is the drain-style restart for code changes.
+- **Is the upstream down, or is it us?** MCP `service_status` — cached, instant,
+  no network. Check it *before* debugging Seam when agent calls start failing.
+  Read the two axes separately: `reportedStatus` is what the provider said,
+  `observation.health` is whether Seam can currently reach it, so "we cannot
+  tell" never reads as "it is fine". `service_status_refresh` forces a bounded
+  live re-check and waits for it; parallel callers share one fetch and a repeat
+  call inside the cooldown returns `rate_limited`. Only registered source ids
+  are accepted — no URL or credential argument exists. How-to:
+  `docs/agent-guides/service-status.md`.
 - **Git worktrees:** `wt` only — see Git worktrees below.
 
 `poll_inbox` at the start of a turn (and at checkpoints). Empty is normal.
@@ -336,8 +345,14 @@ runbook end to end (§1 pull → §2 changelogs → §3 update → §3a patch �
 
 When a Claude Code session returns persistent `500 Internal server error`
 responses (visible in `pm2 logs` as `"turn failed"` with
-`"errorKind":"server_error"`), **check https://status.claude.com first** before
-investigating code-level causes. The error message itself directs you there.
+`"errorKind":"server_error"`), **check upstream status first** before
+investigating code-level causes.
+
+Fastest path: MCP `service_status({ sourceIds: ["anthropic"] })` — cached and
+instant. If `observation.health` is not `ok`, Seam has not been able to reach
+the status page either, so run `service_status_refresh` before concluding
+anything. Otherwise https://status.claude.com is the same data by hand; the
+error message itself directs you there.
 
 Signs it's an upstream outage rather than a bot bug:
 - Multiple threads/sessions fail around the same time.

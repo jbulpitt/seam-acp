@@ -439,6 +439,8 @@ describe("chain MCP tool", () => {
       "schedule_wake",
       "search_messages",
       "send",
+      "service_status",
+      "service_status_refresh",
       "steer",
       "submit_result",
       "threads",

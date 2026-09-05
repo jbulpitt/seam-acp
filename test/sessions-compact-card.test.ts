@@ -405,7 +405,11 @@ function makeHarness(opts: HarnessOpts = {}) {
     entered.resolve();
     return pipeline.promise;
   };
-  (orch as any).rebuildSessionFromThread = async () => {
+  (orch as any).compactSessionFromThread = async () => {
+    entered.resolve();
+    return pipeline.promise;
+  };
+  (orch as any).reconstructSessionFromDiscord = async () => {
     entered.resolve();
     return pipeline.promise;
   };
@@ -772,6 +776,66 @@ describe("#179 sessions:rebuild exits", () => {
   const run = async (h: ReturnType<typeof makeHarness>) => {
     await h.open();
     await h.collector.click("sessions:rebuild");
+    await h.started;
+  };
+  const seed = {
+    contextWindow: 200_000,
+    sourcePostCount: 12,
+    projectedLogicalCount: 8,
+    retainedLogicalCount: 8,
+    omittedLogicalCount: 0,
+    estimatedTokens: 900,
+    budgetTokens: 120_000,
+    transformSavedTokens: 0,
+  };
+
+  it("exposes Rebuild and Compact from Thread as distinct card actions", async () => {
+    const h = makeHarness();
+    await h.open();
+    const payload = JSON.stringify(h.last());
+    expect(payload).toContain("sessions:rebuild");
+    expect(payload).toContain("sessions:compact_thread");
+    expect(payload).toContain("Rebuild");
+    expect(payload).toContain("Compact from Thread");
+    expect(payload).not.toMatch(/lossless/i);
+    expect(CARD_FALLBACK_TEXT.rebuild.ok).not.toMatch(/lossless/i);
+    expect(CARD_FALLBACK_TEXT.compact_thread.ok).not.toMatch(/lossless/i);
+  });
+
+  it("SUCCESS on a live card keeps its Close button", async () => {
+    const h = makeHarness();
+    await run(h);
+    h.pipeline.resolve({
+      newSessionId: "acp-rebuilt",
+      attachment: { attached: true, reason: "swapped" },
+      seed,
+    });
+    await h.settle();
+    expect(text(h.last())).toContain("acp-rebuilt");
+    expect(text(h.last())).toContain("opus");
+    expect(text(h.last())).toContain("window 200000");
+    expect(text(h.last())).toContain("60% budget");
+    expect(text(h.last())).not.toMatch(/lossless/i);
+    expect(hasEnabledComponents(h.last().components)).toBe(true);
+    expect(JSON.stringify(h.last().components)).toContain("sessions:close");
+  });
+
+  it("FAILURE after expiry settles component-free", async () => {
+    const h = makeHarness();
+    await run(h);
+    h.collector.stop("time");
+    await h.collector.expired();
+    h.pipeline.reject(new Error("rebuild boom"));
+    await h.settle();
+    expect(text(h.last())).toContain("rebuild boom");
+    expect(hasEnabledComponents(h.last().components)).toBe(false);
+  });
+});
+
+describe("#179 sessions:compact_thread exits", () => {
+  const run = async (h: ReturnType<typeof makeHarness>) => {
+    await h.open();
+    await h.collector.click("sessions:compact_thread");
     await h.started;
   };
 

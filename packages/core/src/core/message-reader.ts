@@ -160,7 +160,8 @@ export function isMessageCardOrNoise(message: MessagePageItem): boolean {
   if (!text) return false;
   return (
     /^_?starting…?_?$/iu.test(text) ||
-    /^_?(?:▶|✅|❌)\s+(?:handoff|forward|chain|report-back|wake fired|watch fired|peek|compact|scheduled|parked prompt|choice|ingest|self migration)\b[^\n]*_?$/iu.test(text) ||
+    /^_?(?:▶|✅|❌|⌚|🗜)\s+(?:handoff|forward|chain|report-back|wake fired|watch fired|peek|compact|scheduled|parked prompt|choice|ingest|self migration)\b[^\n]*_?$/iu.test(text) ||
+    /(?:wake fired|watch fired)/iu.test(text) ||
     /^_?(?:✅\s+Done|❌\s+Failed)(?:\s+[—-].*)?_?$/iu.test(text)
   );
 }

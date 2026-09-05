@@ -479,6 +479,10 @@ export class DiscordAdapter implements ChatAdapter {
     await this.applyAvatarIfNeeded();
   }
 
+  getBotUserId(): string | undefined {
+    return this.botUserId ?? this.client.user?.id;
+  }
+
   /** Gateway heartbeat RTT in ms; undefined if the WS isn't ready. */
   gatewayPingMs(): number | undefined {
     const ping = this.client.ws.ping;
@@ -1479,7 +1483,7 @@ export class DiscordAdapter implements ChatAdapter {
 
         // Skip bot messages that are status cards / panels. These are embed-
         // only messages (or embed + minimal content) that show operational info
-        // (model, context usage, timing) — useless noise for rebuild summaries.
+        // (model, context usage, timing) — useless noise for Compact from Thread.
         if (msg.author.bot && msg.embeds.length > 0 && !msg.content?.trim()) continue;
 
         let text = msg.content ?? "";

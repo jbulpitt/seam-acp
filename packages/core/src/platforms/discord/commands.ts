@@ -31,8 +31,8 @@ export const SEAM_ADMIN_COMMAND_NAME = "seamadmin";
  *     config (18) model effort agent role mode repo tools card gif approve
  *                 reset init detach tts show edit set audit
  *
- *   /seamadmin  (9 slots)  operator surface — ManageGuild + guild-only
- *     rebuild · recover
+ *   /seamadmin  (10 slots)  operator surface — ManageGuild + guild-only
+ *     rebuild · compact-thread · recover
  *     project  (3)  new list remove
  *     upload   (3)  pull push secret
  *     bridge   (5)  add rotate list remove restart
@@ -653,12 +653,18 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
     // Guild-only. setDMPermission is deprecated; setContexts is the replacement.
     .setContexts(InteractionContextType.Guild);
 
-  // --- top-level (2): rebuild, recover ---------------------------------------
+  // --- top-level (3): rebuild, compact-thread, recover -----------------------
 
   cmd.addSubcommand((sub) =>
     sub
       .setName("rebuild")
-      .setDescription("Rebuild this session from Discord thread history, optionally changing agent/model")
+      .setDescription("Deterministic Discord reconstruction (no summarizer; one seed turn, ≤60% window)")
+  );
+
+  cmd.addSubcommand((sub) =>
+    sub
+      .setName("compact-thread")
+      .setDescription("Model-assisted reconstruction from Discord history")
       .addStringOption((o) =>
         o
           .setName("agent")
@@ -1075,6 +1081,7 @@ export type SeamSubcommand =
   | "steer"
   | "workflows"
   | "rebuild"
+  | "compact-thread"
   | "recover"
   | "restart"
   | "pull"

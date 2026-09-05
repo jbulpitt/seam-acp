@@ -122,6 +122,9 @@ export interface ChatAdapter {
   /** Optional: one cursor-addressed page of raw conversational messages. */
   fetchMessagePage?(threadId: string, request: MessagePageRequest): Promise<MessagePageItem[]>;
 
+  /** Optional: this application's bot user id, used to identify Seam assistant posts. */
+  getBotUserId?(): string | undefined;
+
   /** Optional: register a handler called when a thread is deleted (channelRef =
    *  the thread id). Used by scheduled prompts for instant cleanup. */
   onThreadDelete?(handler: (channelRef: string) => void | Promise<void>): void;

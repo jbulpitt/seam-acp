@@ -466,9 +466,16 @@ async function renderBuilderCard(existing?: ScheduledPrompt): Promise<RenderedCa
     config: { REPOS_ROOT: "/repo" },
     router: {
       ensureSessionRecord: () => ({ id: "discord:thread-1", agentId: "claude", repoPath: "/repo" }),
-      getProfile: () => ({ defaultModel: "default", staticModels: [] }),
+      describeConfig: () => ({
+        agent: { value: "claude", source: "session config" },
+        model: { value: "default", source: "default" },
+        effort: { value: null, source: "default" },
+        cwd: { value: "/repo", source: "session config" },
+      }),
+      getProfile: (id: string) =>
+        id === "claude" ? { id: "claude", defaultModel: "default", staticModels: [] } : undefined,
     },
-    store: { readConfig: () => ({ model: null }) },
+    store: { readConfig: () => ({ model: null }), get: () => null },
     logger: silent,
     // #159: the builder's first response goes through `respondInitial` so it
     // can also open on an interaction the list's Edit button already deferred.

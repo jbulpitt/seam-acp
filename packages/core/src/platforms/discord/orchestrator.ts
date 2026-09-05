@@ -9804,10 +9804,69 @@ export class Orchestrator {
     await streamPanel.finalize();
   }
 
+  /**
+   * Isolated-schedule execution identity (#208).
+   *
+   * Agent / model / effort / cwd come from one `describeConfig` snapshot —
+   * the same effective-config resolver live turns and `planRuntimeSpawn` use.
+   * Per-schedule `model` / `cwd` overrides apply only after that snapshot.
+   * There is no schedule-level agent override. Unknown or unregistered
+   * effective agents fail closed; callers must not fall back to
+   * `record.agentId`, raw `cfg.model`, or raw `record.repoPath`.
+   *
+   * Cwd is `described.cwd.value` (plus an explicit schedule override). This
+   * method does not fork a second cwd precedence table; if describeConfig
+   * still prefers a stale session `repoPath`, that value is what isolated
+   * fire inherits until cwd ownership is fixed there.
+   */
+  private resolveIsolatedScheduleIdentity(
+    record: SessionRecord,
+    overrides?: { model?: string | null; cwd?: string | null }
+  ):
+    | {
+        ok: true;
+        agentId: string;
+        profile: AgentProfile;
+        model: string;
+        effort: string | null;
+        cwd: string;
+      }
+    | { ok: false; agentId: string; error: string } {
+    const described = this.router.describeConfig(record);
+    const agentId = described.agent.value;
+    const profile = this.router.getProfile(agentId);
+    if (!profile) {
+      return { ok: false, agentId, error: `unknown agent ${agentId}` };
+    }
+    const overrideModel = overrides?.model?.trim() ? overrides.model.trim() : null;
+    const overrideCwd = overrides?.cwd?.trim() ? overrides.cwd.trim() : null;
+    return {
+      ok: true,
+      agentId,
+      profile,
+      model: overrideModel ?? described.model.value,
+      effort: described.effort.value,
+      cwd: overrideCwd ?? described.cwd.value,
+    };
+  }
+
+  private isolatedScheduleIdentityFields(identity: {
+    agentId: string;
+    model: string;
+    cwd: string;
+  }): StructuredPanel["fields"] {
+    return [
+      { name: "Agent", value: `\`${identity.agentId}\``, inline: true },
+      { name: "Model", value: `\`${identity.model}\``, inline: true },
+      { name: "Working dir", value: `\`${identity.cwd}\``, inline: true },
+    ];
+  }
+
   /** Manager `onFire` handler: run a scheduled prompt as an **isolated job** (own
-   *  throwaway session, thread's repo + model + attachments) and post the output
-   *  to the thread as blue cards. Owns last_run/last_status only — the manager
-   *  owns next_run. Read-only w.r.t. the thread's live session. */
+   *  throwaway session, binding thread's *effective* agent/model/cwd, then any
+   *  per-schedule model/cwd overrides) and post the output to the thread as
+   *  blue cards. Owns last_run/last_status only — the manager owns next_run.
+   *  Read-only w.r.t. the thread's live session. */
   async runScheduledPrompt(id: string): Promise<void> {
     const row = this.store.getScheduled(id);
     if (!row) return;
@@ -9904,32 +9963,39 @@ export class Orchestrator {
       return;
     }
 
-    // 2. Resolve the agent / model / cwd from the binding thread's record,
-    //    with per-schedule overrides.
+    // 2. Re-read the live session and resolve agent / model / cwd from the
+    //    binding thread's *effective* configuration (`describeConfig`), then
+    //    apply per-schedule model/cwd overrides. Do not freeze thread config
+    //    at schedule-create time, and do not read stale `record.agentId` /
+    //    `cfg.model` / `record.repoPath` columns. Live-mode returns above and
+    //    never takes this path.
     const record = this.router.ensureSessionRecord({
       platform: PLATFORM,
       channelRef: row.channelRef,
       ...(row.parentRef ? { parentRef: row.parentRef } : {}),
       cwd: this.config.REPOS_ROOT,
     });
-    const profile = this.router.getProfile(record.agentId);
-    if (!profile) {
-      this.patchScheduledStatus(id, `error: unknown agent ${record.agentId}`);
+    const live = this.store.get(record.id) ?? record;
+    const identity = this.resolveIsolatedScheduleIdentity(live, {
+      model: row.model,
+      cwd: row.cwd,
+    });
+    if (!identity.ok) {
+      this.patchScheduledStatus(id, `error: ${identity.error}`);
       return;
     }
-    const cfg = this.store.readConfig(record);
-    const cwd = row.cwd ?? record.repoPath ?? this.config.REPOS_ROOT;
-    const model = row.model ?? cfg.model;
+    const { profile, agentId, cwd, model, effort } = identity;
+    const identityFields = this.isolatedScheduleIdentityFields({ agentId, model, cwd });
 
     // 3. Announce card — stays as a permanent run record (also auto-reopens an
-    //    archived-but-unlocked thread). Not edited later.
+    //    archived-but-unlocked thread). Not edited later. Fields match the
+    //    agent/model/cwd actually passed to the isolated runtime.
     const running: StructuredPanel = {
       color: SCHEDULED_COLOR,
       title: `⏰ Running scheduled: ${row.name}`,
       fields: [
         { name: "Schedule", value: `${describeCron(row.cron)} (${row.timezone})` },
-        { name: "Working dir", value: `\`${cwd}\``, inline: true },
-        { name: "Model", value: model ? `\`${model}\`` : "session default", inline: true },
+        ...identityFields,
       ],
       footer: `id ${id} · output: ${row.outputType}`,
     };
@@ -9946,21 +10012,28 @@ export class Orchestrator {
     //    prompt asks the agent to read.
     const result = await this.runIsolatedScheduledJob({
       profile,
-      record,
+      record: live,
       cwd,
-      ...(model ? { model } : {}),
-      ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+      model,
+      ...(effort ? { effort } : {}),
       channel: target,
       promptText: row.promptText,
     });
 
-    // 5. Post result as NEW message(s) + record status.
+    // 5. Post result as NEW message(s) + record status. Result cards carry
+    //    the same identity the isolated runtime actually received.
     if (result.error) {
       this.patchScheduledStatus(id, `error: ${result.error.slice(0, 200)}`);
-      await this.sendResultCard(target, `⏰ ${row.name} — failed`, `❌ ${result.error.slice(0, 1500)}`, 0xe74c3c);
+      await this.sendResultCard(
+        target,
+        `⏰ ${row.name} — failed`,
+        `❌ ${result.error.slice(0, 1500)}`,
+        0xe74c3c,
+        identityFields
+      );
     } else {
       this.patchScheduledStatus(id, "ok");
-      await this.postScheduledVisibleResult(target, id, row.name, result.text, row.outputType);
+      await this.postScheduledVisibleResult(target, id, row.name, result.text, row.outputType, identityFields);
     }
   }
 
@@ -9971,14 +10044,15 @@ export class Orchestrator {
     scheduleId: string,
     name: string,
     text: string,
-    outputType: "card" | "messages"
+    outputType: "card" | "messages",
+    identityFields: StructuredPanel["fields"] = []
   ): Promise<void> {
     const speech = text.trim()
       ? this.voiceConsole?.beginVisibleTurn(target.id, `scheduled:${scheduleId}:${Date.now()}`) ?? null
       : null;
     if (speech) this.voiceConsole?.acceptVisibleAgentText(speech, 1, text);
     try {
-      await this.postScheduledResult(target, name, text, outputType);
+      await this.postScheduledResult(target, name, text, outputType, identityFields);
     } finally {
       if (speech) {
         await this.voiceConsole?.finishVisibleTurn(speech).catch((err) =>
@@ -10041,11 +10115,12 @@ export class Orchestrator {
     channel: ChannelRef,
     name: string,
     text: string,
-    outputType: "card" | "messages"
+    outputType: "card" | "messages",
+    identityFields: StructuredPanel["fields"] = []
   ): Promise<void> {
     const body = text.trim();
     if (!body) {
-      await this.sendResultCard(channel, `⏰ ${name}`, "✅ Done — no output.", SCHEDULED_COLOR);
+      await this.sendResultCard(channel, `⏰ ${name}`, "✅ Done — no output.", SCHEDULED_COLOR, identityFields);
       return;
     }
 
@@ -10065,10 +10140,10 @@ export class Orchestrator {
     if (chunks.length <= 3) {
       for (let j = 0; j < chunks.length; j++) {
         const suffix = chunks.length > 1 ? ` (${j + 1}/${chunks.length})` : "";
-        await this.sendResultCard(channel, `⏰ ${name}${suffix}`, chunks[j]!, SCHEDULED_COLOR);
+        await this.sendResultCard(channel, `⏰ ${name}${suffix}`, chunks[j]!, SCHEDULED_COLOR, identityFields);
       }
     } else {
-      await this.sendResultCard(channel, `⏰ ${name}`, `✅ Done — full output attached (${body.length} chars).`, SCHEDULED_COLOR);
+      await this.sendResultCard(channel, `⏰ ${name}`, `✅ Done — full output attached (${body.length} chars).`, SCHEDULED_COLOR, identityFields);
       await this.sendResultFile(channel, name, body);
     }
   }
@@ -10884,16 +10959,20 @@ export class Orchestrator {
       return;
     }
     // Bind the thread to a session record if it isn't already (so the job has a
-    // repo/agent to run under).
+    // repo/agent to run under). Inherited agent/model/effort/cwd come from the
+    // live effective-config snapshot, not the durable session columns — those
+    // can lag a thread-preset overlay (#208).
     const record = this.router.ensureSessionRecord({
       platform: PLATFORM,
       channelRef: channel.id,
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
-    const profile = this.router.getProfile(record.agentId);
-    const cfg = this.store.readConfig(record);
-    const sessionModel = cfg.model ?? profile?.defaultModel ?? null;
+    const described = this.router.describeConfig(record);
+    const inheritedAgent = described.agent.value;
+    const profile = this.router.getProfile(inheritedAgent);
+    const sessionModel = described.model.value;
+    const inheritedCwd = described.cwd.value;
     const models = (profile?.staticModels ?? []).slice(0, 24);
 
     const state = {
@@ -10901,8 +10980,8 @@ export class Orchestrator {
       promptText: existing?.promptText ?? "",
       cron: (existing?.cron ?? null) as string | null,
       timezone: existing?.timezone ?? SCHEDULE_DEFAULT_TZ,
-      model: existing?.model ?? null, // null = use session model
-      cwd: existing?.cwd ?? null, // null = thread's repoPath
+      model: existing?.model ?? null, // null = inherit effective thread model at fire time
+      cwd: existing?.cwd ?? null, // null = inherit effective thread cwd at fire time
       target: existing?.targetChannel ?? null, // null = this thread
       outputType: (existing?.outputType ?? "card") as "card" | "messages",
       // "isolated" = throwaway clean session (default); "live" = a real turn in
@@ -10933,6 +11012,9 @@ export class Orchestrator {
               "Write the prompt so it stands alone.") +
             " Schedules don't carry files: for anything substantial, commit a runbook to the repo and " +
             "have the prompt ask the agent to read it." +
+            (profile
+              ? ""
+              : `\n\n⚠️ Effective agent \`${inheritedAgent}\` is not registered on this bot — isolated fires will fail closed.`) +
             (quarantine ? `\n\n⚠️ ${quarantine}` : "")
         )
         .addFields(
@@ -10942,9 +11024,12 @@ export class Orchestrator {
           { name: "🌍 Timezone", value: state.timezone, inline: true },
           { name: "🧠 Session", value: isLive ? "live (in this thread)" : "isolated (clean session)", inline: true },
           // model/cwd/target/output are meaningless in live mode (D1) — hide them.
+          // Isolated inherits the thread's *effective* agent/model/cwd (describeConfig),
+          // not the durable session row. There is no schedule-level agent override.
           ...(isLive ? [] : [
-            { name: "🤖 Model", value: state.model ? `\`${state.model}\`` : `Session default${sessionModel ? ` (\`${sessionModel}\`)` : ""}`, inline: true },
-            { name: "📂 Working dir", value: state.cwd ? `\`${state.cwd}\`` : "*(this thread's repo)*", inline: true },
+            { name: "Agent", value: `\`${inheritedAgent}\``, inline: true },
+            { name: "🤖 Model", value: state.model ? `\`${state.model}\`` : `Thread default (\`${sessionModel}\`)`, inline: true },
+            { name: "📂 Working dir", value: state.cwd ? `\`${state.cwd}\`` : `\`${inheritedCwd}\``, inline: true },
             { name: "📮 Output to", value: state.target ? `<#${state.target}>` : "*(this thread)*", inline: true },
             { name: "🖼️ Output as", value: state.outputType === "messages" ? "plain messages" : "status cards", inline: true },
           ])
@@ -10977,7 +11062,7 @@ export class Orchestrator {
           .setCustomId("sched:model")
           .setPlaceholder("🤖 Model")
           .addOptions(
-            { label: `Session default${sessionModel ? ` (${sessionModel})` : ""}`.slice(0, 100), value: "__default__", default: state.model === null },
+            { label: `Thread default (${sessionModel})`.slice(0, 100), value: "__default__", default: state.model === null },
             ...models.map((m) => ({ label: m.name.slice(0, 100), value: m.modelId, default: m.modelId === state.model }))
           );
         rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(modelSelect));

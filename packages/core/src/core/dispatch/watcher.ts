@@ -25,7 +25,12 @@ import * as path from "node:path";
 import { SerialQueue } from "../serial-queue.js";
 import type { Logger } from "../../lib/logger.js";
 import type { DispatchResult, DispatchSpec } from "./types.js";
-import { DispatchTurnError, dispatchDirs, parseDispatchSpec } from "./types.js";
+import {
+  DispatchTurnError,
+  dispatchDirs,
+  parseDispatchSpec,
+  shouldInlineCardReportBack,
+} from "./types.js";
 
 /** Clamp on the originating prompt copied into a done-file (#174). */
 export const DONE_ORIGIN_PROMPT_MAX = 4000;
@@ -860,6 +865,7 @@ export class DispatchWatcher {
         ...(spec.kind ? { kind: spec.kind } : {}),
         ...(spec.returnTo ? { returnTo: spec.returnTo } : {}),
         ...(spec.chainId ? { chainId: spec.chainId } : {}),
+        ...(shouldInlineCardReportBack(spec) ? { inlinedReportBack: true } : {}),
         ...(spec.prompt
           ? { originPrompt: spec.prompt.slice(0, DONE_ORIGIN_PROMPT_MAX) }
           : {}),

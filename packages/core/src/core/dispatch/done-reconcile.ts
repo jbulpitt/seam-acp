@@ -326,7 +326,7 @@ function onwardIsSettled(
  * irrelevant here — it decides WHAT the replay does, not WHETHER it is owed.
  */
 export function needsCompletionReplay(
-  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind" | "suppressedOnward">,
+  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind" | "suppressedOnward" | "inlinedReportBack">,
   row: { status: string; kind?: string; correlationId?: string | null } | null
 ): boolean {
   return completionRoute(result, row).action !== "skip";
@@ -340,6 +340,8 @@ export function needsCompletionReplay(
  * for a completion that the live path would otherwise have done:
  *
  *   - an interrupt-suppressed completion (#67) owes only the ledger row;
+ *   - a same-thread stateless-handoff card already wrote the report-back onto
+ *     its Done embed; it owes only the ledger row;
  *   - self-delivering kinds (compact / ingest / thread_voice) already posted
  *     their own result; they owe only the ledger row;
  *   - a chainId advances the chain;
@@ -354,7 +356,7 @@ export function needsCompletionReplay(
  * which is the pre-existing behaviour and recoverable, unlike deletion.
  */
 export function completionRoute(
-  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind" | "suppressedOnward">,
+  result: Pick<DispatchResult, "returnTo" | "chainId" | "kind" | "suppressedOnward" | "inlinedReportBack">,
   row: { status: string; kind?: string; correlationId?: string | null } | null
 ): CompletionRoute {
   if (!row) return { action: "skip", reason: "unknown-row" };
@@ -367,6 +369,11 @@ export function completionRoute(
   // delivers the stale answer after the directive that superseded it. Only the
   // ledger row is owed.
   if (result.suppressedOnward) return { action: "terminalize" };
+
+  // Stateless handoff card: the live path already put the report-back on the
+  // Done embed. `returnTo` is still copied onto the done-file (it names the
+  // caller), so without this check replay would inject a live caller turn.
+  if (result.inlinedReportBack) return { action: "terminalize" };
 
   // The done-file's own kind wins; the ledger row is the fallback for files
   // written before `kind` was carried.

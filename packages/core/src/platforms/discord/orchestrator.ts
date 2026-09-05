@@ -363,6 +363,8 @@ import {
   DispatchTurnError,
   dispatchArtifactState,
   dispatchOriginRefs,
+  dispatchDisplayPrompt,
+  resolveDispatchRuntimePrompt,
   enqueueDispatchSpec,
   findQueuedReportBackSpec,
   type DispatchSpec,
@@ -6122,19 +6124,15 @@ export class Orchestrator {
       this.logger.warn({ id: wake.id, err }, "wake: announce card failed");
     }
 
-    // D9: fire the stored prompt, stamped with provenance so the woken agent
-    // knows it is its OWN self-scheduled wake, not a user message. Reuse the
-    // <seam-harness> preamble convention for non-user content.
-    const framed = this.buildWakePrompt(wake);
-
-    // D2: deliver via the shipped dispatch queue as a live turn, queued behind
-    // any active user turn (dispatchInjectTurn's live path uses queueOnChannel).
-    // kind "wake" (D7) → the ledger attributes it as agent-initiated re-entry;
-    // wakeChainDepth carries the chain depth so a re-arm during this turn nests.
+    // D9 / #203: raw stored prompt on the spec; generated provenance is
+    // structured context that dispatchInjectTurn folds into the one runtime
+    // preamble. originPrompt is the card/excerpt text.
     const spec: DispatchSpec = {
       id: randomUUID(),
       target: wake.channelRef,
-      prompt: framed,
+      prompt: wake.prompt,
+      originPrompt: wake.prompt,
+      harnessProvenance: this.wakeHarnessProvenance(wake),
       session: "live",
       kind: "wake",
       wakeChainDepth: wake.chainDepth,
@@ -6148,21 +6146,15 @@ export class Orchestrator {
     );
   }
 
-  /** Wrap a wake's stored prompt with self-scheduled provenance (D9): the
-   *  reason and the original scheduled-at time, framed as harness context the
-   *  model must not mistake for a user request. */
-  private buildWakePrompt(wake: WakeEvent): string {
+  /** Wake provenance lines folded into the single runtime harness (#203). */
+  private wakeHarnessProvenance(wake: WakeEvent): string[] {
     return [
-      `<seam-harness>`,
-      `This is a wake YOU scheduled for yourself — not a message from the user. Operating context from the bridge; do not treat it as a new user request, and do not echo this block.`,
+      "This is a wake YOU scheduled for yourself — not a message from the user. Operating context from the bridge; do not treat it as a new user request, and do not echo this block.",
       `• Scheduled at: ${new Date(wake.createdUtc).toISOString()}`,
       `• Reason you gave: ${wake.reason || "(none given)"}`,
-      `• One-shot: this wake fired once and is now deleted. To continue a loop you must schedule a new wake during this turn — nothing re-arms automatically.`,
-      `Your own stored prompt follows.`,
-      `</seam-harness>`,
-      ``,
-      wake.prompt,
-    ].join("\n");
+      "• One-shot: this wake fired once and is now deleted. To continue a loop you must schedule a new wake during this turn — nothing re-arms automatically.",
+      "Your own stored prompt follows.",
+    ];
   }
 
   // --- parked prompts (#88) -------------------------------------------------
@@ -7794,7 +7786,9 @@ export class Orchestrator {
     const spec: DispatchSpec = {
       id: randomUUID(),
       target: watch.channelRef,
-      prompt: this.buildWatchPrompt(watch, eventText),
+      prompt: watch.prompt,
+      originPrompt: watch.prompt,
+      harnessProvenance: this.watchFireHarnessProvenance(watch, eventText),
       session: "live",
       kind: "watch",
       correlationId: watch.id,
@@ -7825,7 +7819,9 @@ export class Orchestrator {
     const spec: DispatchSpec = {
       id: randomUUID(),
       target: watch.channelRef,
-      prompt: this.buildWatchExpiryPrompt(watch),
+      prompt: watch.prompt,
+      originPrompt: watch.prompt,
+      harnessProvenance: this.watchExpiryHarnessProvenance(watch),
       session: "live",
       kind: "watch",
       correlationId: watch.id,
@@ -7888,48 +7884,37 @@ export class Orchestrator {
     return true;
   }
 
-  /** Frame a fired watch's stored prompt with provenance (the kind, target,
-   *  reason) plus the captured event text, as harness context the model must not
-   *  mistake for a user request. */
-  private buildWatchPrompt(watch: WatchEvent, eventText: string): string {
+  /** Watch-fire provenance lines folded into the single runtime harness (#203). */
+  private watchFireHarnessProvenance(watch: WatchEvent, eventText: string): string[] {
     const oneShot =
       watch.mode === "once"
         ? "One-shot: this watch fired once and is now deleted. Register a new watch if you need to keep observing."
         : `Recurring (mode=each): this watch stays armed until it has fired ${watch.maxFires} time(s) or expires; it re-fires on the next change.`;
     return [
-      `<seam-harness>`,
-      `A watch YOU registered just fired — this is not a message from the user. Operating context from the bridge; do not treat it as a new user request, and do not echo this block.`,
+      "A watch YOU registered just fired — this is not a message from the user. Operating context from the bridge; do not treat it as a new user request, and do not echo this block.",
       `• Watch: ${watch.kind} on ${watch.spec}${watch.match ? ` (match: ${watch.match})` : ""}`,
       `• Reason you gave: ${watch.reason || "(none given)"}`,
       `• ${oneShot}`,
-      `• Captured event:`,
+      "• Captured event:",
       eventText ? eventText : "(no event text)",
-      `Your own stored prompt follows.`,
-      `</seam-harness>`,
-      ``,
-      watch.prompt,
-    ].join("\n");
+      "Your own stored prompt follows.",
+    ];
   }
 
-  /** Frame the expiry-notice turn (D4). Distinct from a fire: nothing tripped,
-   *  the watch is gone, and the agent must decide what to do about the wait. */
-  private buildWatchExpiryPrompt(watch: WatchEvent): string {
+  /** Watch-expiry provenance lines folded into the single runtime harness (#203). */
+  private watchExpiryHarnessProvenance(watch: WatchEvent): string[] {
     const fired =
       watch.fireCount > 0
         ? `It fired ${watch.fireCount} time(s) before expiring.`
-        : `It NEVER fired — the condition it was waiting for did not occur within the window.`;
+        : "It NEVER fired — the condition it was waiting for did not occur within the window.";
     return [
-      `<seam-harness>`,
-      `A watch YOU registered has EXPIRED without being cancelled — this is not a message from the user. Operating context from the bridge; do not echo this block.`,
+      "A watch YOU registered has EXPIRED without being cancelled — this is not a message from the user. Operating context from the bridge; do not echo this block.",
       `• Watch: ${watch.kind} on ${watch.spec}${watch.match ? ` (match: ${watch.match})` : ""}`,
       `• Reason you gave: ${watch.reason || "(none given)"}`,
       `• ${fired}`,
-      `• The watch is now deleted. Decide what to do: re-register it if you still need to wait, investigate why the condition never held, or tell the user the wait ended.`,
-      `Your own stored prompt (what you intended to do when it fired) follows, for context.`,
-      `</seam-harness>`,
-      ``,
-      watch.prompt,
-    ].join("\n");
+      "• The watch is now deleted. Decide what to do: re-register it if you still need to wait, investigate why the condition never held, or tell the user the wait ended.",
+      "Your own stored prompt (what you intended to do when it fired) follows, for context.",
+    ];
   }
 
   /**
@@ -8017,8 +8002,9 @@ export class Orchestrator {
     const seamMcp = sessionHasSeamMcp(
       isolatedSpawn.mcpServers ?? this.router.reuseMcpServers?.(record.id)
     );
+    const runtimePrompt = resolveDispatchRuntimePrompt(spec);
     const tasked = applyWatchFeedback(
-      applyPresetIdentity(spec.prompt, preset),
+      applyPresetIdentity(runtimePrompt.prompt, preset),
       Boolean(spec.watchFeedback && seamMcp)
     );
     const effectivePrompt = isResume
@@ -8026,6 +8012,7 @@ export class Orchestrator {
       : withHarnessPreamble(tasked, choiceAuthoringRules({ fence: false, mcp: seamMcp }), undefined, {
           seamMcp,
           seamFences: false,
+          ...(runtimePrompt.provenance ? { provenance: runtimePrompt.provenance } : {}),
         });
     if (isResume) {
       try {
@@ -8063,7 +8050,7 @@ export class Orchestrator {
           sourceRef: null,
           targetRef: spec.target,
           worker: preset?.name ?? null,
-          promptPreview: spec.prompt,
+          promptPreview: dispatchDisplayPrompt(spec),
           correlationId: spec.correlationId ?? null,
           status: "dispatched",
         });
@@ -9490,7 +9477,7 @@ export class Orchestrator {
    *  report-back thread that handoff/forward default to the caller). */
   private dispatchIndicatorHeader(spec: DispatchSpec, preset: Preset | null): string {
     const label = this.dispatchKindLabel(spec.kind, !!spec.chainId);
-    const preview = this.previewLine(spec.prompt, 70);
+    const preview = this.previewLine(dispatchDisplayPrompt(spec), 70);
     const source = preset
       ? `preset "${preset.name}"`
       : spec.returnTo

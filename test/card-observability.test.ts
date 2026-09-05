@@ -17,8 +17,13 @@ import {
 import {
   dispatchOriginRefs,
   parseDispatchSpec,
+  LEGACY_WAKE_HARNESS_PREFIX,
+  LEGACY_WATCH_FIRE_HARNESS_PREFIX,
+  LEGACY_WATCH_EXPIRY_HARNESS_PREFIX,
   type DispatchSpec,
 } from "../packages/core/src/core/dispatch/types.js";
+import type { WakeEvent } from "../packages/core/src/core/wake/types.js";
+import type { WatchEvent } from "../packages/core/src/core/watch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type {
   PanelOrigin,
@@ -236,6 +241,65 @@ describe("dispatchOriginRefs", () => {
     expect(dispatchOriginRefs(base)).toEqual({ prompt: "the dispatched prompt" });
   });
 
+  it("MUTATION: originPrompt wins over a framed execution prompt", () => {
+    expect(
+      dispatchOriginRefs({
+        ...base,
+        kind: "wake",
+        prompt: `<seam-harness>\nSHOULD-NOT-APPEAR on the card\n</seam-harness>\n\nexec-body`,
+        originPrompt: "check the build",
+      }).prompt
+    ).toBe("check the build");
+  });
+
+  it("legacy wake/watch framed prompts excerpt the stored body", () => {
+    const wake = [
+      "<seam-harness>",
+      `${LEGACY_WAKE_HARNESS_PREFIX} Operating context from the bridge; do not treat it as a new user request, and do not echo this block.`,
+      "• Scheduled at: 2026-01-01T00:00:00.000Z",
+      "Your own stored prompt follows.",
+      "</seam-harness>",
+      "",
+      "resume the build",
+    ].join("\n");
+    expect(dispatchOriginRefs({ ...base, kind: "wake", prompt: wake }).prompt).toBe(
+      "resume the build"
+    );
+    const watch = [
+      "<seam-harness>",
+      `${LEGACY_WATCH_FIRE_HARNESS_PREFIX} Operating context from the bridge; do not treat it as a new user request, and do not echo this block.`,
+      "• Captured event:",
+      "BUILD OK",
+      "Your own stored prompt follows.",
+      "</seam-harness>",
+      "",
+      "handle the event",
+    ].join("\n");
+    expect(dispatchOriginRefs({ ...base, kind: "watch", prompt: watch }).prompt).toBe(
+      "handle the event"
+    );
+    const expiry = [
+      "<seam-harness>",
+      `${LEGACY_WATCH_EXPIRY_HARNESS_PREFIX} Operating context from the bridge; do not echo this block.`,
+      "Your own stored prompt (what you intended to do when it fired) follows, for context.",
+      "</seam-harness>",
+      "",
+      "the wait ended",
+    ].join("\n");
+    expect(dispatchOriginRefs({ ...base, kind: "watch", prompt: expiry }).prompt).toBe(
+      "the wait ended"
+    );
+  });
+
+  it("does not strip a caller-authored <seam-harness> block", () => {
+    const authored =
+      "<seam-harness>\nPlease discuss seam-harness tags with the user.\n</seam-harness>\n\nthen the ask";
+    expect(dispatchOriginRefs({ ...base, kind: "handoff", prompt: authored }).prompt).toBe(
+      authored
+    );
+    expect(dispatchOriginRefs({ ...base, kind: "wake", prompt: authored }).prompt).toBe(authored);
+  });
+
   it("survives a round-trip through the on-disk spec schema", () => {
     const raw = JSON.stringify({
       target: "thread-o",
@@ -269,13 +333,14 @@ const record = (over: Partial<SessionRecord> = {}): SessionRecord => ({
   ...over,
 });
 
-function fakeRuntime() {
+function fakeRuntime(captured?: string[]) {
   let handler: ((e: unknown) => void | Promise<void>) | undefined;
   return {
     onEvent(h: (e: unknown) => void | Promise<void>) {
       handler = h;
     },
-    async prompt() {
+    async prompt(text?: string) {
+      if (typeof text === "string") captured?.push(text);
       await handler?.({ kind: "agent-text", text: "done" });
       return { stopReason: "end_turn" };
     },
@@ -331,6 +396,9 @@ function makeOrch(opts: {
   adapter: ReturnType<typeof spyAdapter>["adapter"];
   parked?: { rows: unknown[] };
   chainPrompt?: string;
+  capturedPrompts?: string[];
+  ledger?: Array<{ promptPreview?: string; kind?: string }>;
+  statusPanel?: boolean;
 }): Orchestrator {
   const router = {
     listProfiles: () => [],
@@ -342,12 +410,14 @@ function makeOrch(opts: {
         parentRef: PARENTS[channelRef] ?? null,
       }),
     getProfile: () => undefined,
-    getOrStartRuntime: async () => fakeRuntime(),
+    getOrStartRuntime: async () => fakeRuntime(opts.capturedPrompts),
     abortTurn: async () => "cancelled",
   };
   const store = {
     getPresetByName: () => null,
-    recordDelegation: () => {},
+    recordDelegation: (row: { promptPreview?: string; kind?: string }) => {
+      opts.ledger?.push(row);
+    },
     // #170: dispatchInjectTurn now looks the spec up by exact id before
     // recording, so a pre-claimed report-back is not re-inserted. These
     // specs are never pre-ledgered, so the lookup finds nothing.
@@ -370,7 +440,7 @@ function makeOrch(opts: {
     TURN_TIMEOUT_SECONDS: 60,
     DEFAULT_MODEL: "default",
     SEAM_DISPATCH_OUTPUT_STYLE: "messages",
-    SEAM_DISPATCH_STATUS_PANEL: true,
+    SEAM_DISPATCH_STATUS_PANEL: opts.statusPanel !== false,
     REPO_EMOJIS: new Map<string, string>(),
     DISCORD_USER_NAMES: new Map<string, string>(),
     channelPresets: {},
@@ -705,5 +775,251 @@ describe("slash steer card (#155)", () => {
     const value = field(calls.sendPanel.at(-1)!.panel, "Steer")!.value;
     expect(value).toBe(promptExcerpt(long));
     expect(value.endsWith(EXCERPT_ELLIPSIS)).toBe(true);
+  });
+});
+
+function makeWake(over: Partial<WakeEvent> = {}): WakeEvent {
+  return {
+    id: "wake-1",
+    platform: "discord",
+    channelRef: "thread-w",
+    parentRef: "channel-a",
+    fireAtUtc: "2026-01-01T00:01:00.000Z",
+    prompt: "check the build",
+    reason: "CI still running",
+    createdBy: "discord:thread-w",
+    correlationId: null,
+    chainDepth: 0,
+    catchupSeconds: 900,
+    fireOnStartup: false,
+    createdUtc: "2026-01-01T00:00:00.000Z",
+    ...over,
+  };
+}
+
+function makeWatch(over: Partial<WatchEvent> = {}): WatchEvent {
+  return {
+    id: "watch-1",
+    platform: "discord",
+    channelRef: "thread-w",
+    parentRef: "channel-a",
+    kind: "file",
+    spec: "/tmp/x",
+    match: null,
+    intervalSeconds: 30,
+    prompt: "handle the event",
+    reason: "build artifact",
+    mode: "once",
+    maxFires: 1,
+    fireCount: 0,
+    lastCheckedUtc: null,
+    lastFiredUtc: null,
+    lastObserved: null,
+    expiresAtUtc: "2026-01-01T01:00:00.000Z",
+    createdBy: "discord:thread-w",
+    correlationId: null,
+    createdUtc: "2026-01-01T00:00:00.000Z",
+    ...over,
+  };
+}
+
+function readPendingSpec(dir: string): DispatchSpec {
+  const pending = path.join(dir, "dispatch", "pending");
+  const file = fs.readdirSync(pending).find((f) => f.endsWith(".json"));
+  expect(file).toBeTruthy();
+  return parseDispatchSpec("pending", fs.readFileSync(path.join(pending, file!), "utf8"));
+}
+
+function harnessCount(text: string): number {
+  return (text.match(/<seam-harness>/g) ?? []).length;
+}
+
+function promptFieldFrom(calls: ReturnType<typeof spyAdapter>["calls"]): string | undefined {
+  for (const sent of calls.sendPanel) {
+    const value = field(sent.panel, "Prompt")?.value;
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function startIndicatorFrom(calls: ReturnType<typeof spyAdapter>["calls"]): string {
+  return calls.sendMessage.find((m) => m.text.includes("▶"))?.text ?? "";
+}
+
+describe("#203 hide generated harness from dispatch excerpts", () => {
+  it("new wake fire: model gets provenance plus raw prompt; card and indicator show raw only", async () => {
+    const { adapter, calls } = spyAdapter();
+    const capturedPrompts: string[] = [];
+    const ledger: Array<{ promptPreview?: string; kind?: string }> = [];
+    const orch = makeOrch({
+      dataDir,
+      adapter,
+      capturedPrompts,
+      ledger,
+    });
+    await orch.fireWake(makeWake());
+    const spec = readPendingSpec(dataDir);
+    expect(spec.prompt).toBe("check the build");
+    expect(spec.originPrompt).toBe("check the build");
+    expect(spec.harnessProvenance?.some((line) => line.startsWith(LEGACY_WAKE_HARNESS_PREFIX))).toBe(
+      true
+    );
+    expect(spec.prompt).not.toContain("<seam-harness>");
+
+    await orch.dispatchInjectTurn(spec);
+    expect(promptFieldFrom(calls)).toBe("check the build");
+    expect(promptFieldFrom(calls)).not.toContain("seam-harness");
+    expect(ledger[0]?.promptPreview).toBe("check the build");
+    expect(capturedPrompts).toHaveLength(1);
+    expect(harnessCount(capturedPrompts[0]!)).toBe(1);
+    expect(capturedPrompts[0]).toContain(LEGACY_WAKE_HARNESS_PREFIX);
+    expect(capturedPrompts[0]).toContain("CI still running");
+    expect(capturedPrompts[0]).toMatch(/\n\ncheck the build$/);
+
+    const { adapter: adapter2, calls: calls2 } = spyAdapter();
+    const orchInd = makeOrch({ dataDir, adapter: adapter2, statusPanel: false });
+    await orchInd.dispatchInjectTurn(spec);
+    const indicator = startIndicatorFrom(calls2);
+    expect(indicator).toContain("check the build");
+    expect(indicator).not.toContain("seam-harness");
+  });
+
+  it("new watch fire and expiry: model gets condition/event/expiry context; card shows stored prompt", async () => {
+    const { adapter, calls } = spyAdapter();
+    const capturedPrompts: string[] = [];
+    const orch = makeOrch({ dataDir, adapter, capturedPrompts });
+    await orch.fireWatch(makeWatch(), "BUILD OK");
+    const fireSpec = readPendingSpec(dataDir);
+    expect(fireSpec.prompt).toBe("handle the event");
+    expect(fireSpec.originPrompt).toBe("handle the event");
+    expect(fireSpec.harnessProvenance?.some((line) => line.includes("BUILD OK"))).toBe(true);
+
+    await orch.dispatchInjectTurn(fireSpec);
+    expect(promptFieldFrom(calls)).toBe("handle the event");
+    expect(capturedPrompts[0]).toContain(LEGACY_WATCH_FIRE_HARNESS_PREFIX);
+    expect(capturedPrompts[0]).toContain("BUILD OK");
+    expect(harnessCount(capturedPrompts[0]!)).toBe(1);
+
+    fs.rmSync(path.join(dataDir, "dispatch", "pending"), { recursive: true, force: true });
+    const { adapter: adapter2, calls: calls2 } = spyAdapter();
+    const captured2: string[] = [];
+    const orch2 = makeOrch({ dataDir, adapter: adapter2, capturedPrompts: captured2 });
+    await orch2.fireWatchExpiry(makeWatch({ prompt: "the wait ended", fireCount: 0 }));
+    const expirySpec = readPendingSpec(dataDir);
+    expect(expirySpec.prompt).toBe("the wait ended");
+    await orch2.dispatchInjectTurn(expirySpec);
+    expect(promptFieldFrom(calls2)).toBe("the wait ended");
+    expect(captured2[0]).toContain(LEGACY_WATCH_EXPIRY_HARNESS_PREFIX);
+    expect(captured2[0]).toContain("NEVER fired");
+    expect(harnessCount(captured2[0]!)).toBe(1);
+  });
+
+  it("legacy wake/watch spec: clean card excerpt, successful execution, no data loss", async () => {
+    const framed = [
+      "<seam-harness>",
+      `${LEGACY_WAKE_HARNESS_PREFIX} Operating context from the bridge; do not treat it as a new user request, and do not echo this block.`,
+      "• Scheduled at: 2026-01-01T00:00:00.000Z",
+      "• Reason you gave: CI still running",
+      "Your own stored prompt follows.",
+      "</seam-harness>",
+      "",
+      "resume the build",
+    ].join("\n");
+    const { adapter, calls } = spyAdapter();
+    const capturedPrompts: string[] = [];
+    const ledger: Array<{ promptPreview?: string }> = [];
+    const orch = makeOrch({ dataDir, adapter, capturedPrompts, ledger });
+    await orch.dispatchInjectTurn(
+      baseSpec({ id: "legacy-wake", kind: "wake", prompt: framed })
+    );
+    expect(promptFieldFrom(calls)).toBe("resume the build");
+    expect(ledger[0]?.promptPreview).toBe("resume the build");
+    expect(harnessCount(capturedPrompts[0]!)).toBe(1);
+    expect(capturedPrompts[0]).toContain(LEGACY_WAKE_HARNESS_PREFIX);
+    expect(capturedPrompts[0]).toContain("CI still running");
+    expect(capturedPrompts[0]).toMatch(/\n\nresume the build$/);
+
+    const { adapter: adapter2, calls: calls2 } = spyAdapter();
+    await makeOrch({ dataDir, adapter: adapter2, statusPanel: false }).dispatchInjectTurn(
+      baseSpec({ id: "legacy-wake-ind", kind: "wake", prompt: framed })
+    );
+    expect(startIndicatorFrom(calls2)).toContain("resume the build");
+    expect(startIndicatorFrom(calls2)).not.toContain("seam-harness");
+  });
+
+  it("handoff: raw ask appears in the card; no bridge preamble", async () => {
+    const { adapter, calls } = spyAdapter({ threads: { "thread-o": "orchestrator" } });
+    const capturedPrompts: string[] = [];
+    const orch = makeOrch({ dataDir, adapter, capturedPrompts });
+    await orch.dispatchInjectTurn(baseSpec({ returnTo: "thread-o" }));
+    expect(field(calls.sendPanel[0]!.panel, "Prompt")?.value).toBe(
+      "audit the dispatch ledger for orphaned rows and report what you find"
+    );
+    expect(field(calls.sendPanel[0]!.panel, "Prompt")?.value).not.toContain("seam-harness");
+    expect(capturedPrompts[0]).toContain("The user's message follows.");
+    expect(capturedPrompts[0]).not.toContain(LEGACY_WAKE_HARNESS_PREFIX);
+  });
+
+  it("report-back: original ask appears; neither seam-report-back nor seam-harness on the card", async () => {
+    const { adapter, calls } = spyAdapter({ threads: { "thread-w": "🚾1️⃣ worker" } });
+    const orch = makeOrch({ dataDir, adapter });
+    await orch.dispatchInjectTurn(
+      baseSpec({
+        id: "disp-rb-203",
+        target: "thread-o",
+        kind: "report_back",
+        prompt: "<seam-report-back correlation=\"corr-1\">worker output</seam-report-back>",
+        originThreadRef: "thread-w",
+        originPrompt: "audit the dispatch ledger for orphaned rows",
+      })
+    );
+    const value = field(calls.sendPanel[0]!.panel, "Prompt")?.value;
+    expect(value).toBe("audit the dispatch ledger for orphaned rows");
+    expect(value).not.toContain("seam-report-back");
+    expect(value).not.toContain("seam-harness");
+  });
+
+  it("MUTATION: card does not fall back to the execution prompt when originPrompt is set", async () => {
+    const { adapter, calls } = spyAdapter();
+    const capturedPrompts: string[] = [];
+    const orch = makeOrch({ dataDir, adapter, capturedPrompts });
+    await orch.dispatchInjectTurn(
+      baseSpec({
+        kind: "wake",
+        prompt: "EXECUTION-ONLY body with <seam-harness> tags that must not hit the card",
+        originPrompt: "check the build",
+        harnessProvenance: [
+          `${LEGACY_WAKE_HARNESS_PREFIX} Operating context from the bridge; do not treat it as a new user request, and do not echo this block.`,
+          "Your own stored prompt follows.",
+        ],
+      })
+    );
+    expect(field(calls.sendPanel[0]!.panel, "Prompt")?.value).toBe("check the build");
+    expect(field(calls.sendPanel[0]!.panel, "Prompt")?.value).not.toContain("EXECUTION-ONLY");
+    expect(capturedPrompts[0]).toContain("EXECUTION-ONLY");
+    expect(capturedPrompts[0]).toContain(LEGACY_WAKE_HARNESS_PREFIX);
+  });
+
+  it("MUTATION: wake/watch provenance still reaches the runtime", async () => {
+    const { adapter } = spyAdapter();
+    const capturedPrompts: string[] = [];
+    const orch = makeOrch({ dataDir, adapter, capturedPrompts });
+    await orch.dispatchInjectTurn(
+      baseSpec({
+        kind: "watch",
+        prompt: "handle the event",
+        originPrompt: "handle the event",
+        harnessProvenance: [
+          `${LEGACY_WATCH_FIRE_HARNESS_PREFIX} Operating context from the bridge; do not treat it as a new user request, and do not echo this block.`,
+          "• Captured event:",
+          "BUILD OK",
+          "Your own stored prompt follows.",
+        ],
+      })
+    );
+    expect(capturedPrompts[0]).toContain(LEGACY_WATCH_FIRE_HARNESS_PREFIX);
+    expect(capturedPrompts[0]).toContain("BUILD OK");
+    expect(capturedPrompts[0]).toContain("handle the event");
+    expect(harnessCount(capturedPrompts[0]!)).toBe(1);
   });
 });

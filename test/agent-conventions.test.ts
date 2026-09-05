@@ -35,6 +35,20 @@ describe("harnessPreamble — flag off / no speaker", () => {
     expect(withHarnessPreamble("hello", [])).toBe(`${GOLDEN_NO_SPEAKER}\n\nhello`);
   });
 
+  it("folds provenance into the same harness block and skips the default closer", () => {
+    const out = withHarnessPreamble("check the build", [], undefined, {
+      provenance: [
+        "This is a wake YOU scheduled for yourself — not a message from the user.",
+        "Your own stored prompt follows.",
+      ],
+    });
+    expect((out.match(/<seam-harness>/g) ?? []).length).toBe(1);
+    expect((out.match(/<\/seam-harness>/g) ?? []).length).toBe(1);
+    expect(out).not.toContain("The user's message follows.");
+    expect(out).toContain("This is a wake YOU scheduled for yourself");
+    expect(out).toMatch(/\n\ncheck the build$/);
+  });
+
   it("emits no speaker line when a speaker has neither a usable name nor numeric id", () => {
     const out = harnessPreamble([], { id: "not-numeric", name: "" });
     expect(out).toBe(GOLDEN_NO_SPEAKER);

@@ -118,6 +118,13 @@ export interface HarnessOpts {
   /** Humanized gap since the previous turn in this thread (e.g. "3h 12m"),
    *  so "how long ago" needs no timestamp math. */
   sinceLastTurn?: string;
+  /**
+   * Extra lines inside the same `<seam-harness>` block (wake/watch provenance).
+   * Inserted as-is — not bullet-prefixed. When present, they replace the
+   * default "The user's message follows." closer so the turn gets one coherent
+   * preamble rather than a second harness block in the body.
+   */
+  provenance?: string[];
 }
 
 /** True when the injected ACP mcpServers list includes the seam-mcp HTTP entry. */
@@ -179,7 +186,11 @@ export function harnessPreamble(
       `Turn context: ${turnFacts.join("; ")}. Use these for any time-of-day or "how long ago" reasoning — do not infer the time from UTC timestamps.`
     );
   }
-  lines.push("The user's message follows.");
+  if (opts?.provenance && opts.provenance.length > 0) {
+    lines.push(...opts.provenance);
+  } else {
+    lines.push("The user's message follows.");
+  }
   lines.push("</seam-harness>");
   return lines.join("\n");
 }

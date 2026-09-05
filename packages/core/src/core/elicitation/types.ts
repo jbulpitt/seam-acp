@@ -65,6 +65,7 @@ export interface ValidatedForm {
   pages: ElicitationField[][];
   directDecision:
     | { kind: "boolean"; field: ElicitationField }
+    | { kind: "approve" }
     | {
         kind: "single" | "multi";
         field: ElicitationField;
@@ -93,6 +94,7 @@ export type ElicitationComponentAction =
   | { kind: "previous"; id: string }
   | { kind: "next"; id: string }
   | { kind: "boolean"; id: string; value: boolean }
+  | { kind: "allow"; id: string }
   | { kind: "choice"; id: string; index: number }
   | { kind: "skip"; id: string }
   | { kind: "select"; id: string }
@@ -111,6 +113,7 @@ export function parseElicitationCustomId(value: string): ElicitationComponentAct
     case "cancel": return suffix === undefined ? { kind: "cancel", id } : null;
     case "prev": return suffix === undefined ? { kind: "previous", id } : null;
     case "next": return suffix === undefined ? { kind: "next", id } : null;
+    case "allow": return suffix === undefined ? { kind: "allow", id } : null;
     case "bool":
       if (suffix === "1") return { kind: "boolean", id, value: true };
       if (suffix === "0") return { kind: "boolean", id, value: false };

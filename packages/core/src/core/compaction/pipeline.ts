@@ -16,11 +16,22 @@ import {
   assembleNewSession,
   parseJsonOutput,
   mergePinnedFacts,
+  coercePinnedFacts,
+  PINNED_FACTS_JSON_SCHEMA,
   type PinnedFacts,
 } from "./prompts.js";
 
+/** Optional per-call structured-output contract for JSON stages. */
+export interface RunAgentOptions {
+  jsonSchema?: Record<string, unknown>;
+}
+
 /** Injected agent runner: given a prompt, return the agent's text reply. */
-export type RunAgent = (prompt: string, label: string) => Promise<string>;
+export type RunAgent = (
+  prompt: string,
+  label: string,
+  opts?: RunAgentOptions
+) => Promise<string>;
 
 export interface CompactionAnalysisExecutor {
   id: string;
@@ -258,8 +269,12 @@ export async function runPremiumCompaction(
   log(`extracting pinned facts from ${pinnedChunks.length} chunk(s)`);
   const pinnedParts = await mapLimit(pinnedChunks, concurrency, async (c, i) => {
     try {
-      const raw = await runAgent(pinnedFactsPrompt({ text: c.text, thinkingAvailable }), `pinned-${i}`);
-      return parseJsonOutput<PinnedFacts>(raw);
+      const raw = await runAgent(
+        pinnedFactsPrompt({ text: c.text, thinkingAvailable }),
+        `pinned-${i}`,
+        { jsonSchema: PINNED_FACTS_JSON_SCHEMA }
+      );
+      return coercePinnedFacts(parseJsonOutput(raw));
     } catch (err) {
       log(`  [pinned-${i}] extraction failed: ${(err as Error).message}`);
       if (failClosed) {

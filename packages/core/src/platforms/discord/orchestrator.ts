@@ -56,7 +56,7 @@ import {
   requireExactCatalogModel,
   resolveDiscordCompactionProfile,
 } from "../../core/compaction/discord-executor.js";
-import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, assembleNewSession, type PinnedFacts } from "../../core/compaction/prompts.js";
+import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, coercePinnedFacts, PINNED_FACTS_JSON_SCHEMA, assembleNewSession, type PinnedFacts } from "../../core/compaction/prompts.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
@@ -4683,8 +4683,11 @@ export class Orchestrator {
       opts.attachments && opts.attachments.length > 0 ? opts.attachments : undefined;
     const runPrompt = async (rt: AgentRuntime): Promise<PromptOutcome | "timeout"> =>
       opts.timeoutMs === undefined
-        ? await rt.prompt(prompt, attachments)
-        : await raceWithTimeout(rt.prompt(prompt, attachments), opts.timeoutMs);
+        ? await rt.prompt(prompt, attachments, opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : undefined)
+        : await raceWithTimeout(
+            rt.prompt(prompt, attachments, opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : undefined),
+            opts.timeoutMs
+          );
 
     if (opts.session === "isolated") {
       const profile = opts.profile ?? this.profileForTarget(target);
@@ -4861,7 +4864,7 @@ export class Orchestrator {
     // The AGY CLI (Gemini) silently truncates stdin prompts larger than ~150KB.
     // For large prompts, write the content to a temp file and reference it.
     const LARGE_PROMPT_THRESHOLD = 100 * 1024; // 100 KB
-    return async (prompt: string, label: string): Promise<string> => {
+    return async (prompt: string, label: string, runOpts?: { jsonSchema?: Record<string, unknown> }): Promise<string> => {
       let tempFile: string | undefined;
       try {
         let actualPrompt = prompt;
@@ -4887,8 +4890,14 @@ export class Orchestrator {
           model,
           ...(strictModel ? { strictModel: true } : {}),
           ...(effort ? { effort } : {}),
+          ...(runOpts?.jsonSchema ? { jsonSchema: runOpts.jsonSchema } : {}),
           awaitIdle: true,
-          logContext: { compaction: label, analysisAgent: profile.id, analysisModel: model },
+          logContext: {
+            compaction: label,
+            analysisAgent: profile.id,
+            analysisModel: model,
+            structured: Boolean(runOpts?.jsonSchema),
+          },
         });
         // The pipeline treats a rejected stage as a recoverable per-chunk
         // failure, so propagate the ORIGINAL error, not a re-wrapped one.
@@ -5179,8 +5188,12 @@ export class Orchestrator {
     let pinnedFacts: PinnedFacts = { corrections: [], constraints: [], decisions: [], openTodos: [], activePaths: [], rules: [] };
     try {
       const fittedAll = fitTranscriptToWindow(transcript, 0, window);
-      const raw = await runAgent(pinnedFactsPrompt({ text: fittedAll, thinkingAvailable: false }), "pinned");
-      pinnedFacts = mergePinnedFacts([parseJsonOutput<PinnedFacts>(raw)]);
+      const raw = await runAgent(
+        pinnedFactsPrompt({ text: fittedAll, thinkingAvailable: false }),
+        "pinned",
+        { jsonSchema: PINNED_FACTS_JSON_SCHEMA }
+      );
+      pinnedFacts = mergePinnedFacts([coercePinnedFacts(parseJsonOutput(raw))]);
     } catch (err) {
       this.logger.warn({ err, sessionId }, "default-compact: pinned-facts extraction failed; continuing without it");
     }

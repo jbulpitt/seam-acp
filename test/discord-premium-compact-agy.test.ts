@@ -6,6 +6,7 @@ import type { SessionRecord } from "../packages/core/src/core/types.js";
 import {
   DISCORD_COMPACTION_MODEL,
 } from "../packages/core/src/core/compaction/discord-executor.js";
+import { PINNED_FACTS_JSON_SCHEMA } from "../packages/core/src/core/compaction/prompts.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -70,6 +71,7 @@ function makePolicyOrch(opts: {
     cwd?: string;
     label?: string;
     prompt?: string;
+    jsonSchema?: Record<string, unknown>;
   }> = [];
   const seedCalls: any[] = [];
   const fetches: number[] = [];
@@ -139,6 +141,7 @@ function makePolicyOrch(opts: {
       cwd: injectOpts.cwd,
       label: injectOpts.logContext?.compaction,
       prompt,
+      jsonSchema: injectOpts.jsonSchema,
     });
     if (injectOpts.profile?.id !== "agy") {
       return {
@@ -184,6 +187,14 @@ describe("Premium Compact (Discord) AGY executor boundary", () => {
       expect(t.injectCalls.some((c) => c.label?.startsWith("chunk-"))).toBe(true);
       expect(t.injectCalls.some((c) => c.label?.startsWith("pinned-"))).toBe(true);
       expect(t.injectCalls.every((c) => c.profileId !== dest.agentId)).toBe(true);
+      for (const call of t.injectCalls) {
+        if (call.label?.startsWith("chunk-")) {
+          expect(call.jsonSchema).toBeUndefined();
+        }
+        if (call.label?.startsWith("pinned-")) {
+          expect(call.jsonSchema).toEqual(PINNED_FACTS_JSON_SCHEMA);
+        }
+      }
 
       expect(t.seedCalls).toHaveLength(1);
       expect(t.seedCalls[0].profile.id).toBe(dest.agentId);
@@ -242,6 +253,25 @@ describe("Premium Compact (Discord) AGY executor boundary", () => {
     expect(t.injectCalls).toHaveLength(0);
     expect(t.seedCalls).toHaveLength(0);
     expect(t.fetches).toHaveLength(0);
+  });
+
+  it("does not fall back to the destination when a pinned stage omits structured output", async () => {
+    const t = makePolicyOrch({
+      destId: "codex",
+      destModel: "gpt-5.4",
+      destEffort: "medium",
+    });
+    const orig = (t.orch as any).injectTurn;
+    (t.orch as any).injectTurn = async (_target: unknown, prompt: string, injectOpts: any) => {
+      const result = await orig(_target, prompt, injectOpts);
+      if (String(injectOpts.logContext?.compaction ?? "").startsWith("pinned")) {
+        expect(injectOpts.jsonSchema).toEqual(PINNED_FACTS_JSON_SCHEMA);
+      }
+      return result;
+    };
+    await t.orch.compactThread(t.record, { source: "discord" });
+    expect(t.injectCalls.every((c) => c.profileId === "agy")).toBe(true);
+    expect(t.seedCalls[0].profile.id).toBe("codex");
   });
 
   it("fails closed on an AGY analysis error and does not seed or fall back", async () => {

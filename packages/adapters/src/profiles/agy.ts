@@ -913,6 +913,12 @@ class AgyAgent implements Agent {
       return { configOptions: buildAgyConfigOptions(catalog) };
     }
     const modelId = params.value;
+    const entry = catalog.find((e) => e.modelId === modelId);
+    if (!entry) {
+      throw RequestError.invalidParams({
+        details: `unknown AGY model ${modelId}`,
+      });
+    }
     const sess = this.sessions.get(params.sessionId);
     if (sess) {
       sess.modelId = modelId;
@@ -920,8 +926,7 @@ class AgyAgent implements Agent {
     // agy reads its active model from ~/.gemini/antigravity-cli/settings.json
     // at every CLI invocation. Since we spawn a fresh `agy -p` per prompt,
     // editing that file takes effect on the next turn.
-    const entry = catalog.find((e) => e.modelId === modelId);
-    if (entry && this.execution.persistModelSelection) {
+    if (this.execution.persistModelSelection) {
       try {
         let json: Record<string, unknown> = {};
         try {
@@ -968,20 +973,20 @@ class AgyAgent implements Agent {
     const agyStart = Date.now();
 
     const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
-    const currentModelId = sess.modelId || readCurrentModelId(catalog);
-    const currentModel = resolveAgyModel(
+    const selected = selectAgyTurnModel({
       catalog,
-      currentModelId,
-      this.defaultModel
-    );
-    if (
-      currentModelId &&
-      currentModel &&
-      currentModel.modelId !== currentModelId
-    ) {
+      sessionModelId: sess.modelId,
+      settingsModelId: sess.modelId ? undefined : readCurrentModelId(catalog),
+      defaultModel: this.defaultModel,
+    });
+    if (selected.error) {
+      throw RequestError.invalidParams({ details: selected.error });
+    }
+    const currentModel = selected.entry;
+    if (selected.healedFrom && currentModel) {
       // eslint-disable-next-line no-console
       console.info(
-        `[agy] auto-healing invalid model ${currentModelId} -> ${currentModel.modelId} (${currentModel.rawDisplayName})`
+        `[agy] auto-healing invalid model ${selected.healedFrom} -> ${currentModel.modelId} (${currentModel.rawDisplayName})`
       );
       sess.modelId = currentModel.modelId;
     }
@@ -1947,14 +1952,50 @@ export function filterAgyCatalogByAcceptedModels(
 export function resolveAgyModel(
   catalog: ReadonlyArray<AgyCatalogEntry>,
   sessionModelId?: string,
-  defaultModel?: string
+  defaultModel?: string,
+  opts?: { allowAutoHeal?: boolean }
 ): AgyCatalogEntry | undefined {
+  const exact = catalog.find((entry) => entry.modelId === sessionModelId);
+  if (exact) return exact;
+  if (opts?.allowAutoHeal === false) return undefined;
   return (
-    catalog.find((entry) => entry.modelId === sessionModelId) ??
     catalog.find((entry) => entry.rawDisplayName === defaultModel) ??
     catalog.find((entry) => entry.recommended) ??
     catalog[0]
   );
+}
+
+/**
+ * Choose the model for one AGY turn.
+ *
+ * An explicitly requested session model is exact-match only — never substituted
+ * for another catalog entry. Auto-heal remains for the non-explicit path
+ * (settings.json / profile default) so ordinary chat stays compatible.
+ */
+export function selectAgyTurnModel(opts: {
+  catalog: ReadonlyArray<AgyCatalogEntry>;
+  sessionModelId?: string;
+  settingsModelId?: string;
+  defaultModel?: string;
+}): { entry?: AgyCatalogEntry; healedFrom?: string; error?: string } {
+  if (opts.sessionModelId) {
+    const exact = resolveAgyModel(
+      opts.catalog,
+      opts.sessionModelId,
+      opts.defaultModel,
+      { allowAutoHeal: false }
+    );
+    if (!exact) {
+      return { error: `unknown AGY model ${opts.sessionModelId}` };
+    }
+    return { entry: exact };
+  }
+  const requested = opts.settingsModelId;
+  const entry = resolveAgyModel(opts.catalog, requested, opts.defaultModel);
+  if (requested && entry && entry.modelId !== requested) {
+    return { entry, healedFrom: requested };
+  }
+  return { entry };
 }
 
 let catalogRowsPromise: Promise<AgyCatalogEntry[]> | null = null;

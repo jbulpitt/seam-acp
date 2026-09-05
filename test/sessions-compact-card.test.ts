@@ -227,6 +227,10 @@ interface HarnessOpts {
   /** Inject Discord follow-up latency/failure at the delivery boundary. */
   followUp?: (payload: any) => Promise<void>;
   onCasRead?: (cell: { value: string }) => void;
+  /** Destination agent id. Default claude (has a compaction model in this harness). */
+  agentId?: string;
+  /** When false, the router has no usable AGY profile (Discord premium hidden). */
+  agy?: boolean;
 }
 
 function makeHarness(opts: HarnessOpts = {}) {
@@ -236,7 +240,7 @@ function makeHarness(opts: HarnessOpts = {}) {
     platform: "discord",
     channelRef: "thread-1",
     parentRef: null,
-    agentId: "claude",
+    agentId: opts.agentId ?? "claude",
     acpSessionId: bound.value,
     repoPath: "/repo",
     configJson: "{}",
@@ -253,15 +257,34 @@ function makeHarness(opts: HarnessOpts = {}) {
     deleteSession: async () => {},
     cloneSession: async () => {},
   };
-  const profile = { id: "claude", displayName: "Claude", sessionManager: manager };
+  const profile = {
+    id: opts.agentId ?? "claude",
+    displayName: "Claude",
+    sessionManager: manager,
+  };
   const target = { id: "codex", displayName: "Codex", sessionManager: manager };
+  const agy =
+    opts.agy === false
+      ? undefined
+      : {
+          id: "agy",
+          displayName: "Antigravity",
+          sessionManager: manager,
+          listPickerModels: async () => [
+            { modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
+          ],
+        };
 
   const invalidated: Array<{ id: string; opts: unknown }> = [];
   const upserts: SessionRecord[] = [];
   const router = {
-    listProfiles: () => [profile, target],
+    listProfiles: () => (agy ? [profile, target, agy] : [profile, target]),
     describeConfig: () => ({}),
-    getProfile: (id?: string) => (id === "codex" ? target : profile),
+    getProfile: (id?: string) => {
+      if (id === "agy") return agy;
+      if (id === "codex") return target;
+      return profile;
+    },
     ensureSessionRecord: () => record,
     invalidate: async (id: string, o: unknown) => void invalidated.push({ id, opts: o }),
   };
@@ -472,6 +495,23 @@ function text(payload: any): string {
   );
 }
 
+function customIds(payload: any): string[] {
+  const ids: string[] = [];
+  const walk = (node: any) => {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child);
+      return;
+    }
+    const id = node.data?.custom_id ?? node.customId ?? node.custom_id;
+    if (typeof id === "string") ids.push(id);
+    if (node.components) walk(node.components);
+    if (node.data?.components) walk(node.data.components);
+  };
+  walk(payload?.components);
+  return ids;
+}
+
 const PREMIUM = ["sessions:premium", "sessions:premium_discord"] as const;
 const ALL_COMPACT = ["sessions:compact", ...PREMIUM] as const;
 
@@ -595,6 +635,24 @@ describe("#179 compaction attaches its result", () => {
     await b.started;
     expect(b.compactCalls[0].opts.source).toBeUndefined();
     expect(b.compactCalls[0].opts.attachIntent).toBe("attach");
+  });
+
+  it("shows Discord premium when AGY is available even if the destination has no compaction model", async () => {
+    const h = makeHarness({ agentId: "no-such-agent" });
+    await h.open();
+    const ids = customIds(h.last());
+    expect(ids).toContain("sessions:premium_discord");
+    expect(ids).not.toContain("sessions:premium");
+    expect(ids).not.toContain("sessions:compact");
+  });
+
+  it("hides Discord premium when AGY is missing even if the destination can compact", async () => {
+    const h = makeHarness({ agy: false });
+    await h.open();
+    const ids = customIds(h.last());
+    expect(ids).not.toContain("sessions:premium_discord");
+    expect(ids).toContain("sessions:premium");
+    expect(ids).toContain("sessions:compact");
   });
 
   it("re-reads the binding for EVERY render, not just after its own compaction", async () => {

@@ -38,6 +38,7 @@ const fakeResult = () => ({
   assembledSeed: "## Assembled seed\nverbatim + pinned facts",
   stats: { chunks: 4 },
   pinnedFacts: { corrections: [], constraints: [], decisions: [], openTodos: [], activePaths: [], rules: [] },
+  analysisExecutor: { id: "agy", displayName: "AGY", model: "gemini-3.8-flash-high" },
 });
 
 /** Build an Orchestrator with just enough stubbed deps to exercise the compact
@@ -152,7 +153,13 @@ describe("Orchestrator.compactThread", () => {
     expect(res.originalSessionId).toBe("acp-active");
     expect(res.wasActive).toBe(true);
     expect(res.stats.chunks).toBe(4);
+    expect(res.analysisExecutor).toEqual({
+      id: "agy",
+      displayName: "AGY",
+      model: "gemini-3.8-flash-high",
+    });
     expect(res.reportMarkdown).toContain("Premium compaction report");
+    expect(res.reportMarkdown).toContain("AGY · gemini-3.8-flash-high");
 
     // #179: rebound through a compare-and-swap on the ONE column, expecting the
     // session that was compacted — never a whole-record write-back of a
@@ -471,6 +478,7 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
         attachment: { attached: true, reason: "swapped" },
         reportMarkdown: "# Premium compaction report — acp-active",
         stats: { chunks: 4 },
+        analysisExecutor: { id: "agy", displayName: "AGY", model: "gemini-3.8-flash-high" },
       };
     };
     (orch as any).injectTurn = async () => {
@@ -514,6 +522,13 @@ describe("Orchestrator.dispatchInjectTurn — compact branch", () => {
     // The premium report is still attached as a file.
     expect(t.calls.sendFile.length).toBe(1);
     expect(out.output).toContain("sess-new");
+  });
+
+  it("forwards compactSource discord into compactThread so MCP and the button share the primitive", async () => {
+    const t = makeDispatchOrch();
+    await t.orch.dispatchInjectTurn(compactSpec({ compactSource: "discord" }));
+    expect(t.compactArgs[0].opts.source).toBe("discord");
+    expect(t.injectCalled()).toBe(false);
   });
 
   it("ledgers the compaction actor→target explicitly", async () => {

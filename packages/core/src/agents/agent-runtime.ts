@@ -16,7 +16,7 @@ import {
   type SessionConfigOption,
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
-import type { AgentProfile } from "@seam/adapters";
+import { SEAM_AGY_JSON_SCHEMA_META, type AgentProfile } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { MessageAttachment } from "../platforms/chat-adapter.js";
 import {
@@ -679,7 +679,8 @@ export class AgentRuntime {
 
   async prompt(
     text: string,
-    attachments?: ReadonlyArray<MessageAttachment>
+    attachments?: ReadonlyArray<MessageAttachment>,
+    opts?: { jsonSchema?: Record<string, unknown> }
   ): Promise<PromptOutcome> {
     const conn = this.requireConnection();
     const sid = this.requireSessionId();
@@ -741,7 +742,13 @@ export class AgentRuntime {
       // close. On normal completion the RPC resolves first.
       const res = await new Promise<{ stopReason: string }>((resolve, reject) => {
         this.rejectInFlightPrompt = reject;
-        conn.prompt({ sessionId: sid, prompt }).then(resolve, reject);
+        conn.prompt({
+          sessionId: sid,
+          prompt,
+          ...(opts?.jsonSchema
+            ? { _meta: { [SEAM_AGY_JSON_SCHEMA_META]: opts.jsonSchema } }
+            : {}),
+        }).then(resolve, reject);
       });
       outcomeStopReason = res.stopReason;
       return {

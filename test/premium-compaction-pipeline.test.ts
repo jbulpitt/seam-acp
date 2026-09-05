@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { runPremiumCompaction } from "../packages/core/src/core/compaction/pipeline.js";
 import type { RichHistory } from "../packages/core/src/core/compaction/source-reader.js";
+import { PINNED_FACTS_JSON_SCHEMA } from "../packages/core/src/core/compaction/prompts.js";
 
 const executor = { id: "agy", displayName: "AGY", model: "gemini-3.8-flash-high" };
 
@@ -30,11 +31,13 @@ const gapReport = { signals: [], discordRanges: [], needDiscord: false };
 describe("runPremiumCompaction analysis executor", () => {
   it("records the actual executor/model instead of hard-coding Gemini", async () => {
     const labels: string[] = [];
+    const schemas: Array<Record<string, unknown> | undefined> = [];
     const result = await runPremiumCompaction({
       richHistory: history(12),
       gapReport,
-      runAgent: async (_prompt, label) => {
+      runAgent: async (_prompt, label, opts) => {
         labels.push(label);
+        schemas.push(opts?.jsonSchema);
         if (label.startsWith("pinned")) {
           return JSON.stringify({
             corrections: [],
@@ -54,6 +57,25 @@ describe("runPremiumCompaction analysis executor", () => {
     expect(result.analysisExecutor).toEqual(executor);
     expect(labels.some((l) => l.startsWith("chunk-"))).toBe(true);
     expect(labels.some((l) => l.startsWith("pinned-"))).toBe(true);
+    for (let i = 0; i < labels.length; i++) {
+      if (labels[i]!.startsWith("chunk-")) expect(schemas[i]).toBeUndefined();
+      if (labels[i]!.startsWith("pinned-")) expect(schemas[i]).toEqual(PINNED_FACTS_JSON_SCHEMA);
+    }
+  });
+
+  it("fail-closed rejects progress-only JSON that is not PinnedFacts", async () => {
+    await expect(
+      runPremiumCompaction({
+        richHistory: history(12),
+        gapReport,
+        runAgent: async (_prompt, label) => {
+          if (label.startsWith("chunk-")) return "summary";
+          return JSON.stringify({ toolAction: "Completing task", toolSummary: "Finish task" });
+        },
+        analysisExecutor: executor,
+        failClosed: true,
+      })
+    ).rejects.toThrow(/PinnedFacts contract|pinned-/);
   });
 
   it("fail-closed aborts the run on an analysis failure instead of stubbing", async () => {

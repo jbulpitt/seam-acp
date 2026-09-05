@@ -120,6 +120,13 @@ export interface InjectTurnOptions {
   ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
   /** MCP servers injected into an isolated remote spawn (token + reachable URL). */
   mcpServers?: McpServer[];
+
+  /**
+   * Isolated AGY print-mode structured output. When set, the AGY adapter
+   * passes `--output-format json` + `--json-schema` and consumes stdout
+   * `structured_output`. Other agents ignore this. Interactive turns omit it.
+   */
+  jsonSchema?: Record<string, unknown>;
 }
 
 export interface InjectTurnResult {

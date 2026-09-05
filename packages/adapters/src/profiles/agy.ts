@@ -785,6 +785,9 @@ export function agyExecutionPolicyArgs(
  */
 export const AGY_NO_SLASH_EXPANSION = "--disable-slash-commands";
 
+/** ACP `_meta` key: a JSON Schema object for this print-mode turn only. */
+export const SEAM_AGY_JSON_SCHEMA_META = "seam/agyJsonSchema";
+
 /**
  * Pure argv for one print-mode turn, so the flag set stays directly
  * regression-testable (same rationale as {@link agyExecutionPolicyArgs}).
@@ -803,6 +806,12 @@ export function buildAgyPromptArgs(opts: {
   cwd: string;
   execution: AgyExecutionPolicy;
   cascadeId?: string;
+  /**
+   * Print-mode structured output (agy >= 1.1.8). When set, BOTH
+   * `--output-format json` and `--json-schema` are passed. Interactive /
+   * prose turns omit this so argv stays unchanged.
+   */
+  structuredOutput?: { jsonSchema: string };
 }): string[] {
   return [
     ...(opts.useStdin ? [] : ["-p", opts.promptText]),
@@ -815,12 +824,72 @@ export function buildAgyPromptArgs(opts: {
     opts.logFile,
     "--print-timeout",
     `${opts.printTimeoutSeconds}s`,
+    ...(opts.structuredOutput
+      ? ["--output-format", "json", "--json-schema", opts.structuredOutput.jsonSchema]
+      : []),
     // agy ignores the process cwd for its "workspace" — execution policy
     // supplies --add-dir and optionally the shared staging root. Sandboxed
     // one-shot helpers deliberately expose only their private cwd.
     ...agyExecutionPolicyArgs(opts.cwd, opts.execution),
     ...(opts.cascadeId ? ["--conversation", opts.cascadeId] : []),
   ];
+}
+
+export function readAgyJsonSchemaMeta(
+  meta: { [key: string]: unknown } | null | undefined
+): Record<string, unknown> | undefined {
+  if (!meta || typeof meta !== "object") return undefined;
+  if (!Object.prototype.hasOwnProperty.call(meta, SEAM_AGY_JSON_SCHEMA_META)) {
+    return undefined;
+  }
+  const schema = meta[SEAM_AGY_JSON_SCHEMA_META];
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    throw new Error("agy structured output: json schema meta must be a JSON object");
+  }
+  return schema as Record<string, unknown>;
+}
+
+/**
+ * Canonical reader for `agy --output-format json` stdout.
+ *
+ * Empirically (agy 1.1.27): stdout is a JSON envelope. `structured_output` is
+ * the schema-conforming object. `response` is an unsafe concatenated string
+ * that can include tool-progress JSON (`toolAction` / `toolSummary`) and MUST
+ * NOT be used as the stage result.
+ */
+export function parseAgyPrintJsonEnvelope(stdout: string): {
+  status: string;
+  structuredOutput: Record<string, unknown>;
+} {
+  const trimmed = stdout.trim();
+  if (!trimmed) {
+    throw new Error("agy json output: empty stdout");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error("agy json output: stdout is not JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("agy json output: envelope is not an object");
+  }
+  const env = parsed as {
+    status?: unknown;
+    structured_output?: unknown;
+    response?: unknown;
+    error?: unknown;
+  };
+  const status = typeof env.status === "string" ? env.status : "";
+  if (status !== "SUCCESS") {
+    const detail = typeof env.error === "string" && env.error ? ` (${env.error})` : "";
+    throw new Error(`agy json output: status ${status || "missing"}${detail}`);
+  }
+  const structured = env.structured_output;
+  if (!structured || typeof structured !== "object" || Array.isArray(structured)) {
+    throw new Error("agy json output: missing structured_output");
+  }
+  return { status, structuredOutput: structured as Record<string, unknown> };
 }
 
 class AgyAgent implements Agent {
@@ -957,6 +1026,7 @@ class AgyAgent implements Agent {
     if (!promptText.trim()) {
       return { stopReason: "end_turn" };
     }
+    const jsonSchema = readAgyJsonSchemaMeta(params._meta);
 
     // Cancel any prior run for this session before starting a new one.
     if (this.active?.sessionId === params.sessionId) {
@@ -1000,6 +1070,15 @@ class AgyAgent implements Agent {
     const MAX_ARG_STRLEN = 120_000; // ~8KB headroom under the 131,072 kernel limit
     const useStdin = Buffer.byteLength(promptText, "utf8") > MAX_ARG_STRLEN;
 
+    let schemaFile: string | undefined;
+    if (jsonSchema) {
+      schemaFile = path.join(
+        os.tmpdir(),
+        `agy-json-schema-${params.sessionId}-${Date.now()}.json`
+      );
+      await fs.writeFile(schemaFile, JSON.stringify(jsonSchema), "utf8");
+    }
+
     const args = buildAgyPromptArgs({
       promptText,
       useStdin,
@@ -1009,6 +1088,7 @@ class AgyAgent implements Agent {
       cwd: sess.cwd,
       execution: this.execution,
       ...(sess.cascadeId ? { cascadeId: sess.cascadeId } : {}),
+      ...(schemaFile ? { structuredOutput: { jsonSchema: schemaFile } } : {}),
     });
 
     if (process.env.AGY_PROFILE_DEBUG) {
@@ -1027,8 +1107,19 @@ class AgyAgent implements Agent {
     }
 
     const stderrChunks: Buffer[] = [];
-    proc.stdout?.on("data", () => {}); // drain; we get the real output via gRPC
+    const stdoutChunks: Buffer[] = [];
+    // Prose turns: drain stdout — the visible answer arrives via the LS stream
+    // as plannerResponse.modifiedResponse. Structured turns: stdout IS the
+    // canonical JSON envelope (`structured_output`); the LS stream is progress.
+    if (jsonSchema) {
+      proc.stdout?.on("data", (c: Buffer) => stdoutChunks.push(c));
+    } else {
+      proc.stdout?.on("data", () => {});
+    }
     proc.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
+    const procExitPromise = new Promise<void>((resolve) => {
+      proc.once("exit", () => resolve());
+    });
     // Two independent signals:
     //   `cancelAbort` — external cancel from the ACP client (session/cancel).
     //   `procExited` — agy itself finished; the LS will close the stream
@@ -1158,6 +1249,7 @@ class AgyAgent implements Agent {
                   sess.cwd,
                   maxTokens,
                   usageTracker,
+                  Boolean(jsonSchema),
                 );
                 if (idx > sess.maxStepIndex) sess.maxStepIndex = idx;
               }
@@ -1240,6 +1332,21 @@ class AgyAgent implements Agent {
         await new Promise<void>((r) => setTimeout(r, STALE_IDLE_RETRY_DELAY_MS));
       }
 
+      if (jsonSchema) {
+        await procExitPromise;
+        const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+        const { structuredOutput } = parseAgyPrintJsonEnvelope(stdout);
+        if (this.conn) {
+          await this.conn.sessionUpdate({
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: JSON.stringify(structuredOutput) },
+            },
+          });
+        }
+      }
+
       // Flush any text held back as a potentially-partial pattern.
       await this.flushHeld(params.sessionId, heldText, "agent_message_chunk", sess.cwd);
       await this.flushHeld(params.sessionId, heldThinking, "agent_thought_chunk", sess.cwd);
@@ -1266,8 +1373,9 @@ class AgyAgent implements Agent {
             `\nerr: ${err instanceof Error ? err.message : String(err)}`,
         );
         // Surface the error to the user so a 0-char turn shows *something*
-        // instead of complete silence (the "empty results" bug).
-        if (stderr && this.conn) {
+        // instead of complete silence (the "empty results" bug). Structured
+        // turns must not mix stderr into the JSON payload injectTurn captures.
+        if (stderr && this.conn && !jsonSchema) {
           await this.conn.sessionUpdate({
             sessionId: params.sessionId,
             update: {
@@ -1278,7 +1386,7 @@ class AgyAgent implements Agent {
         }
       } else {
         const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-        if (stderr) {
+        if (stderr && !jsonSchema) {
           await this.conn.sessionUpdate({
             sessionId: params.sessionId,
             update: {
@@ -1302,6 +1410,9 @@ class AgyAgent implements Agent {
         }
       }
       if (this.active === runRef) this.active = undefined;
+      if (schemaFile) {
+        await fs.unlink(schemaFile).catch(() => {});
+      }
       // Drop our private per-turn log so /tmp doesn't grow unbounded. Keep it
       // when debugging — it's the richest post-mortem for an empty/wedged turn.
       if (process.env.AGY_PROFILE_DEBUG) {
@@ -1312,7 +1423,7 @@ class AgyAgent implements Agent {
       }
     }
 
-    if (exitCode !== null && exitCode !== 0) {
+    if (exitCode !== null && exitCode !== 0 && !jsonSchema) {
       const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
       if (stderr) {
         await this.conn.sessionUpdate({
@@ -1372,6 +1483,7 @@ class AgyAgent implements Agent {
     cwd: string,
     maxTokens: number,
     usageTracker: { maxUsed: number },
+    omitPlannerMessage = false,
   ): Promise<void> {
     if (!this.conn) return;
 
@@ -1412,7 +1524,9 @@ class AgyAgent implements Agent {
       if (text.length > prevTx.length) {
         const delta = text.slice(prevTx.length);
         lastText.set(idx, text);
-        await this.emitTextChunk(sessionId, idx, delta, heldText, "agent_message_chunk", cwd);
+        if (!omitPlannerMessage) {
+          await this.emitTextChunk(sessionId, idx, delta, heldText, "agent_message_chunk", cwd);
+        }
       }
       return;
     }

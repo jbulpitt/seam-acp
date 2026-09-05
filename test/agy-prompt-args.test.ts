@@ -131,3 +131,40 @@ describe("buildAgyPromptArgs — no other behavior changed", () => {
     expect(buildAgyPromptArgs({ ...base, printTimeoutSeconds: 30 })).toContain("30s");
   });
 });
+
+describe("buildAgyPromptArgs — structured output is stage-aware", () => {
+  it("does not pass --output-format or --json-schema on prose turns", () => {
+    const args = buildAgyPromptArgs(base);
+    expect(args).not.toContain("--output-format");
+    expect(args).not.toContain("--json-schema");
+    expect(args).not.toContain("json");
+  });
+
+  it("passes BOTH --output-format json and --json-schema when structuredOutput is set", () => {
+    const schemaPath = "/tmp/pinned-facts.schema.json";
+    const args = buildAgyPromptArgs({
+      ...base,
+      structuredOutput: { jsonSchema: schemaPath },
+    });
+    const formatAt = args.indexOf("--output-format");
+    const schemaAt = args.indexOf("--json-schema");
+    expect(formatAt).toBeGreaterThan(-1);
+    expect(args[formatAt + 1]).toBe("json");
+    expect(schemaAt).toBeGreaterThan(-1);
+    expect(args[schemaAt + 1]).toBe(schemaPath);
+    expect(args).toContain(AGY_NO_SLASH_EXPANSION);
+    expect(args).toContain("--model");
+  });
+
+  it("keeps structured flags on the stdin large-prompt path", () => {
+    const args = buildAgyPromptArgs({
+      ...base,
+      useStdin: true,
+      structuredOutput: { jsonSchema: '{"type":"object"}' },
+    });
+    expect(args).not.toContain("-p");
+    expect(args).toContain("--output-format");
+    expect(args).toContain("--json-schema");
+    expect(args[args.indexOf("--output-format") + 1]).toBe("json");
+  });
+});

@@ -364,6 +364,45 @@ export interface PinnedFacts {
   rules: string[];
 }
 
+const PINNED_FACTS_KEYS = [
+  "corrections",
+  "constraints",
+  "decisions",
+  "openTodos",
+  "activePaths",
+  "rules",
+] as const satisfies ReadonlyArray<keyof PinnedFacts>;
+
+/** JSON Schema matching {@link PinnedFacts} exactly. Used with AGY `--json-schema`. */
+export const PINNED_FACTS_JSON_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: [...PINNED_FACTS_KEYS],
+  properties: Object.fromEntries(
+    PINNED_FACTS_KEYS.map((key) => [key, { type: "array", items: { type: "string" } }])
+  ),
+};
+
+export function isPinnedFacts(value: unknown): value is PinnedFacts {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  for (const key of PINNED_FACTS_KEYS) {
+    const arr = obj[key];
+    if (!Array.isArray(arr) || arr.some((item) => typeof item !== "string")) return false;
+  }
+  for (const key of Object.keys(obj)) {
+    if (!(PINNED_FACTS_KEYS as readonly string[]).includes(key)) return false;
+  }
+  return true;
+}
+
+export function coercePinnedFacts(value: unknown): PinnedFacts {
+  if (!isPinnedFacts(value)) {
+    throw new Error("pinned facts do not match the PinnedFacts contract");
+  }
+  return value;
+}
+
 /** Union several per-chunk PinnedFacts into one, de-duplicating each category by
  *  a normalized key (trimmed, whitespace-collapsed, case-folded) while keeping
  *  the first-seen original (verbatim) string and its order. Chunked extraction

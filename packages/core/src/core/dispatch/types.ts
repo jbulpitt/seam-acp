@@ -64,13 +64,19 @@ export interface DispatchSpec {
    */
   originThreadRef?: string;
   /**
-   * Card observability (#153). The prompt that ORIGINATED this work, when it
-   * differs from `prompt`. A report-back's own `prompt` is the worker's wrapped
-   * output, so the card would otherwise show the result instead of the ask;
-   * this carries the original handoff prompt through so the excerpt still says
-   * what the work was.
+   * Card observability (#153 / #203). The prompt that ORIGINATED this work,
+   * when it differs from `prompt` or when `prompt` is the execution body
+   * rather than the display text. A report-back's own `prompt` is the worker's
+   * wrapped output; a wake/watch stores the raw scheduled prompt here so the
+   * card never excerpts generated harness provenance.
    */
   originPrompt?: string;
+  /**
+   * Generated wake/watch provenance (#203). Folded into the single runtime
+   * `<seam-harness>` preamble by `dispatchInjectTurn`. Never used as card
+   * excerpt text. Absent on handoff/report-back and on legacy framed specs.
+   */
+  harnessProvenance?: string[];
   /** Ledger classification; defaults to "handoff". The report-back
    *  re-injection sets "report_back"; a fired wake (#59) sets "wake"; a fired
    *  watch (#60) sets "watch"; an agent-triggered compaction sets "compact";
@@ -228,6 +234,7 @@ export const DispatchSpecSchema = z.object({
   returnTo: z.string().min(1).optional(),
   originThreadRef: z.string().min(1).optional(),
   originPrompt: z.string().min(1).optional(),
+  harnessProvenance: z.array(z.string()).optional(),
   kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact", "parked", "choice", "ingest", "migrate_self", "thread_voice"]).optional(),
   migration: z.object({
     agent: z.string().min(1),
@@ -350,6 +357,9 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
     ...(d.returnTo ? { returnTo: d.returnTo } : {}),
     ...(d.originThreadRef ? { originThreadRef: d.originThreadRef } : {}),
     ...(d.originPrompt ? { originPrompt: d.originPrompt } : {}),
+    ...(d.harnessProvenance && d.harnessProvenance.length > 0
+      ? { harnessProvenance: d.harnessProvenance }
+      : {}),
     ...(d.kind ? { kind: d.kind } : {}),
     ...(d.migration ? { migration: d.migration } : {}),
     ...(d.authorId ? { authorId: d.authorId } : {}),
@@ -424,8 +434,73 @@ export function dispatchOriginRefs(spec: DispatchSpec): {
   const threadRef = spec.originThreadRef ?? spec.returnTo;
   return {
     ...(threadRef ? { threadRef } : {}),
-    prompt: spec.originPrompt ?? spec.prompt,
+    prompt: dispatchDisplayPrompt(spec),
   };
+}
+
+/** Exact first-line prefixes of generated wake/watch harness blocks (#203).
+ *  Kind-gated legacy recovery matches these, not any caller-authored tag. */
+export const LEGACY_WAKE_HARNESS_PREFIX =
+  "This is a wake YOU scheduled for yourself — not a message from the user.";
+export const LEGACY_WATCH_FIRE_HARNESS_PREFIX =
+  "A watch YOU registered just fired — this is not a message from the user.";
+export const LEGACY_WATCH_EXPIRY_HARNESS_PREFIX =
+  "A watch YOU registered has EXPIRED without being cancelled — this is not a message from the user.";
+
+const HARNESS_OPEN = "<seam-harness>";
+const HARNESS_CLOSE = "</seam-harness>";
+
+function isGeneratedWakeWatchHarness(firstLine: string): boolean {
+  return (
+    firstLine.startsWith(LEGACY_WAKE_HARNESS_PREFIX) ||
+    firstLine.startsWith(LEGACY_WATCH_FIRE_HARNESS_PREFIX) ||
+    firstLine.startsWith(LEGACY_WATCH_EXPIRY_HARNESS_PREFIX)
+  );
+}
+
+/**
+ * Split a pre-#203 wake/watch spec whose `prompt` begins with the generated
+ * harness block. Returns null for any other shape, including a caller-authored
+ * prompt that merely contains `<seam-harness>` text.
+ */
+export function splitLegacyGeneratedHarness(
+  prompt: string
+): { provenance: string[]; body: string } | null {
+  const start = prompt.trimStart();
+  if (!start.startsWith(HARNESS_OPEN)) return null;
+  const closeIdx = start.indexOf(HARNESS_CLOSE);
+  if (closeIdx < 0) return null;
+  const inner = start.slice(HARNESS_OPEN.length, closeIdx).replace(/^\n/, "").replace(/\n$/, "");
+  const first = inner.split("\n").find((line) => line.trim().length > 0) ?? "";
+  if (!isGeneratedWakeWatchHarness(first)) return null;
+  const provenance = inner.split("\n");
+  const body = start.slice(closeIdx + HARNESS_CLOSE.length).replace(/^\n{0,2}/, "");
+  return { provenance, body };
+}
+
+/** Actionable prompt for cards, indicators, and ledger previews. */
+export function dispatchDisplayPrompt(spec: DispatchSpec): string {
+  if (spec.originPrompt) return spec.originPrompt;
+  if (spec.kind === "wake" || spec.kind === "watch") {
+    const split = splitLegacyGeneratedHarness(spec.prompt);
+    if (split) return split.body;
+  }
+  return spec.prompt;
+}
+
+/** Execution body + provenance lines to fold into the single runtime preamble. */
+export function resolveDispatchRuntimePrompt(spec: DispatchSpec): {
+  prompt: string;
+  provenance?: string[];
+} {
+  if (spec.harnessProvenance && spec.harnessProvenance.length > 0) {
+    return { prompt: spec.prompt, provenance: spec.harnessProvenance };
+  }
+  if (spec.kind === "wake" || spec.kind === "watch") {
+    const split = splitLegacyGeneratedHarness(spec.prompt);
+    if (split) return { prompt: split.body, provenance: split.provenance };
+  }
+  return { prompt: spec.prompt };
 }
 
 /** A Discord snowflake is a long run of digits; a preset is a human name. Used

@@ -994,12 +994,15 @@ export class ConfigMutationService {
       }
     }
 
-    // cwd
+    // cwd — a session-tier write is an explicit overlay (#207), even when the
+    // path equals REPOS_ROOT. Without the flag, that path is the creation
+    // default and must not shadow a thread/channel overlay.
     let nextRepoPath = record.repoPath;
     if (changes.cwd !== undefined) {
       const c = changes.cwd.trim();
       if (!c) return { ok: false, error: "`cwd` must be a non-empty path." };
       nextRepoPath = path.resolve(c);
+      nextCfg.sessionCwdExplicit = true;
       if (nextRepoPath !== before.cwd.value) {
         fields.push({ label: "cwd", before: before.cwd.value, after: nextRepoPath });
       }

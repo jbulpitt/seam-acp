@@ -413,6 +413,7 @@ async function main(): Promise<void> {
       : {}),
     channelPresets: config.channelPresets,
     threadPresets: config.threadPresets,
+    defaultCwd: config.REPOS_ROOT,
     bindSessionLocation: (sessionId, location) => {
       bridgeHub?.markSessionBridge(sessionId, location);
     },
@@ -507,6 +508,7 @@ async function main(): Promise<void> {
     enqueue: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
     destLive: (card, optionIndex) => orchestrator.inspectChoiceDestLive(card, optionIndex),
     authoringSession: (channelRef) => store.getByChannel("discord", channelRef),
+    authoringCwd: (record) => router.effectiveCwd(record),
     publicBase: ingestPublicBase,
     waitMs: config.SEAM_INGEST_WAIT_MS,
     bodyMax: config.SEAM_INGEST_BODY_MAX,

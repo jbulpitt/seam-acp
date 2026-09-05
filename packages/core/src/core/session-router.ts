@@ -1,3 +1,4 @@
+import path from "node:path";
 import { AgentRuntime } from "../agents/agent-runtime.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
@@ -115,6 +116,55 @@ export interface ResolvedSetting<T> {
   source: ConfigLayer;
 }
 
+/**
+ * Cwd ownership (#207).
+ *
+ * `record.repoPath` is a session-scope overlay, not the thread's working
+ * directory. Effective cwd is:
+ *
+ *   1. explicit session overlay (`repoPath` written at session scope)
+ *   2. thread-preset cwd
+ *   3. channel-preset cwd
+ *   4. `defaultCwd` (production: REPOS_ROOT)
+ *
+ * A session overlay is explicit when `sessionCwdExplicit` is set, or when
+ * `repoPath` is a path other than `defaultCwd`. Rows whose `repo_path` was
+ * only the `ensureSessionRecord` creation default (`REPOS_ROOT`) are not
+ * overlays: they used to permanently shadow a later thread-scope selection.
+ */
+export function sameResolvedPath(a: string, b: string): boolean {
+  return path.resolve(a) === path.resolve(b);
+}
+
+export function isExplicitSessionCwd(
+  repoPath: string | null | undefined,
+  defaultCwd: string,
+  sessionCwdExplicit?: boolean
+): boolean {
+  if (!repoPath) return false;
+  if (sessionCwdExplicit === true) return true;
+  return !sameResolvedPath(repoPath, defaultCwd);
+}
+
+export function resolveSessionCwd(opts: {
+  repoPath: string | null | undefined;
+  sessionCwdExplicit?: boolean;
+  threadCwd?: string | null;
+  channelCwd?: string | null;
+  defaultCwd: string;
+}): ResolvedSetting<string> {
+  if (isExplicitSessionCwd(opts.repoPath, opts.defaultCwd, opts.sessionCwdExplicit)) {
+    return { value: opts.repoPath!, source: "session config" };
+  }
+  if (opts.threadCwd) {
+    return { value: opts.threadCwd, source: "thread preset" };
+  }
+  if (opts.channelCwd) {
+    return { value: opts.channelCwd, source: "channel preset" };
+  }
+  return { value: opts.defaultCwd, source: "default" };
+}
+
 /** Effective, provenance-tagged configuration for one session/thread. */
 export interface ConfigDescription {
   sessionId: string;
@@ -215,6 +265,9 @@ export class SessionRouter {
   private readonly bindSessionLocationFn?: (sessionId: string, location: string) => void;
   private readonly channelPresets: Map<string, ChannelPreset>;
   private readonly threadPresets: Map<string, ThreadPreset>;
+  /** Fallback cwd when no session/thread/channel overlay applies. Production
+   *  supplies REPOS_ROOT so a missing overlay is not `process.cwd()`. */
+  private readonly defaultCwd: string;
   private askUser?: AskUserFn;
   private elicitUser?: ElicitUserFn;
   private completeElicitation?: CompleteElicitationFn;
@@ -244,6 +297,12 @@ export class SessionRouter {
     bindSessionLocation?: (sessionId: string, location: string) => void;
     channelPresets?: Map<string, ChannelPreset>;
     threadPresets?: Map<string, ThreadPreset>;
+    /**
+     * Default cwd when no overlay applies, and the creation-default path
+     * treated as a non-overlay on existing rows (#207). Production passes
+     * `REPOS_ROOT`.
+     */
+    defaultCwd?: string;
     /** 0 disables warm-runtime retirement. Production supplies the configured
      * TTL; tests and embedders remain opt-in. */
     runtimeIdleTtlMs?: number;
@@ -260,6 +319,7 @@ export class SessionRouter {
     this.bindSessionLocationFn = opts.bindSessionLocation ?? opts.seamMcp?.bindSessionLocation;
     this.channelPresets = opts.channelPresets ?? new Map();
     this.threadPresets = opts.threadPresets ?? new Map();
+    this.defaultCwd = opts.defaultCwd ?? process.cwd();
     this.runtimeIdleTtlMs = Math.max(0, opts.runtimeIdleTtlMs ?? 0);
     this.runtimeIdleSweepMs = Math.max(
       1_000,
@@ -397,15 +457,15 @@ export class SessionRouter {
       }
     }
 
-    // cwd — session overlay > thread preset > channel preset > process.cwd()
-    // (same precedence as statusCardStyle / #101).
-    const cwd: ResolvedSetting<string> = record.repoPath
-      ? { value: record.repoPath, source: "session config" }
-      : thread?.cwd
-        ? { value: thread.cwd.value, source: "thread preset" }
-        : chan?.cwd
-          ? { value: chan.cwd.value, source: "channel preset" }
-          : { value: process.cwd(), source: "default" };
+    // cwd — explicit session overlay > thread preset > channel preset >
+    // defaultCwd. See resolveSessionCwd (#207).
+    const cwd = resolveSessionCwd({
+      repoPath: record.repoPath,
+      sessionCwdExplicit: cfg.sessionCwdExplicit === true,
+      threadCwd: thread?.cwd?.value,
+      channelCwd: chan?.cwd?.value,
+      defaultCwd: this.defaultCwd,
+    });
 
     // permission — resolvePermissionMode layering (session policy, then legacy
     // auto-approve, then bot default). Presets do not carry permission.
@@ -508,6 +568,11 @@ export class SessionRouter {
     };
   }
 
+  /** Effective cwd for spawn, status cards, and other runtime-adjacent paths. */
+  effectiveCwd(record: SessionRecord): string {
+    return this.describeConfig(record).cwd.value;
+  }
+
   /** Look up or create the SessionRecord for a given chat channel. */
   ensureSessionRecord(opts: {
     platform: string;
@@ -519,14 +584,13 @@ export class SessionRouter {
     const existing = this.store.get(id);
     if (existing) return existing;
 
-    // Stamp the channel/thread preset into the record at creation so the
-    // persisted agent/model/cwd match what will actually run. Without this the
-    // record gets the global defaults (e.g. copilot / DEFAULT_MODEL / REPOS_ROOT)
-    // while startRuntime silently overrides them from the locked preset — a
-    // split brain where the agent runs correctly but the record and status card
-    // (and every `getProfile(record.agentId)` capability/usage lookup) show the
-    // wrong agent. The runtime still re-resolves the preset each start, so the
-    // file remains the source of truth; this just keeps the record honest.
+    // Stamp the channel/thread preset agent/model into the record at creation
+    // so capability lookups (`getProfile(record.agentId)`) match what will run.
+    // Do NOT stamp cwd into `repoPath`: that column is a session-scope overlay,
+    // and filling it with REPOS_ROOT (or a live preset cwd) made describeConfig
+    // treat a creation default as a pin that later thread-scope selections
+    // could never beat (#207). Effective cwd is re-resolved from live presets
+    // on every describeConfig / planRuntimeSpawn.
     const preset = resolveChannelPreset(
       { channelPresets: this.channelPresets, threadPresets: this.threadPresets },
       opts.parentRef ?? undefined,
@@ -538,7 +602,9 @@ export class SessionRouter {
     );
     const now = new Date().toISOString();
     // We don't yet know the ACP session id — it will be filled in by the
-    // first runtime start. Store an empty marker for now.
+    // first runtime start. Store an empty marker for now. `opts.cwd` is the
+    // caller-supplied creation default (typically REPOS_ROOT); it is NOT
+    // written to `repoPath`. describeConfig uses `defaultCwd` instead.
     const record: SessionRecord = {
       id,
       platform: opts.platform,
@@ -546,7 +612,7 @@ export class SessionRouter {
       parentRef: opts.parentRef ?? null,
       agentId: preset.agent?.value ?? this.defaultAgentId,
       acpSessionId: "",
-      repoPath: preset.cwd?.value ?? opts.cwd,
+      repoPath: null,
       configJson: JSON.stringify(cfg),
       createdUtc: now,
       updatedUtc: now,

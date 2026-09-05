@@ -51,7 +51,7 @@ export interface InjectTurnOptions {
   /** Reasoning effort for the turn (agent-specific scale). */
   effort?: string;
   /** Working directory. Required for `"isolated"`; falls back to the target
-   *  record's `repoPath` when the target is a session. */
+   *  session's effective cwd (`describeConfig`) when the target is a session. */
   cwd?: string;
 
   /**

@@ -33,6 +33,7 @@ function stubStore(): SessionStore {
 function makeRouter(opts?: {
   channelPresets?: Map<string, ChannelPreset>;
   threadPresets?: Map<string, ThreadPreset>;
+  defaultCwd?: string;
 }): SessionRouter {
   return new SessionRouter({
     logger: silent,
@@ -43,6 +44,7 @@ function makeRouter(opts?: {
     defaultPermissionMode: "ask",
     channelPresets: opts?.channelPresets ?? new Map(),
     threadPresets: opts?.threadPresets ?? new Map(),
+    ...(opts?.defaultCwd ? { defaultCwd: opts.defaultCwd } : {}),
   });
 }
 
@@ -105,7 +107,9 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
     const router = makeRouter({ channelPresets, threadPresets });
     const d = router.describeConfig(makeRecord());
 
-    // Thread wins model. Session repoPath still wins cwd (session > thread > channel).
+    // Thread wins model. An explicit session repoPath still wins cwd
+    // (session overlay > thread > channel). A REPOS_ROOT creation default
+    // is not an overlay — see #207.
     expect(d.model).toEqual({ value: "claude-haiku-4.5", source: "thread preset" });
     expect(d.cwd).toEqual({ value: "/repo/session", source: "session config" });
   });
@@ -131,6 +135,53 @@ describe("SessionRouter.describeConfig — layer provenance (#58 P1)", () => {
     ).toEqual({
       value: "/repo/chan",
       source: "channel preset",
+    });
+  });
+
+  it("treats a REPOS_ROOT-equal repoPath as the creation default, not a session overlay (#207)", () => {
+    const defaultCwd = "/home/ubuntu/Projects";
+    const selected = "/home/ubuntu/Projects/seam-acp";
+    const channelPresets = new Map<string, ChannelPreset>([
+      ["chan-1", { cwd: { value: "/repo/chan" }, locked: false }],
+    ]);
+    const threadPresets = new Map<string, ThreadPreset>([
+      ["thread-1", { cwd: { value: selected } }],
+    ]);
+    const router = makeRouter({ channelPresets, threadPresets, defaultCwd });
+    expect(
+      router.describeConfig(makeRecord({ repoPath: defaultCwd })).cwd
+    ).toEqual({ value: selected, source: "thread preset" });
+    expect(router.planRuntimeSpawn(makeRecord({ repoPath: defaultCwd })).cwd).toBe(selected);
+    expect(router.effectiveCwd(makeRecord({ repoPath: defaultCwd }))).toBe(selected);
+  });
+
+  it("lets an explicit session pin to REPOS_ROOT still win over a thread overlay", () => {
+    const defaultCwd = "/home/ubuntu/Projects";
+    const selected = "/home/ubuntu/Projects/seam-acp";
+    const threadPresets = new Map<string, ThreadPreset>([
+      ["thread-1", { cwd: { value: selected } }],
+    ]);
+    const router = makeRouter({ threadPresets, defaultCwd });
+    const record = makeRecord({
+      repoPath: defaultCwd,
+      configJson: JSON.stringify({ model: "gpt-5.4", sessionCwdExplicit: true }),
+    });
+    expect(router.describeConfig(record).cwd).toEqual({
+      value: defaultCwd,
+      source: "session config",
+    });
+  });
+
+  it("falls through to defaultCwd with a truthful default label when nothing is pinned", () => {
+    const defaultCwd = "/home/ubuntu/Projects";
+    const router = makeRouter({ defaultCwd });
+    expect(router.describeConfig(makeRecord({ repoPath: defaultCwd })).cwd).toEqual({
+      value: defaultCwd,
+      source: "default",
+    });
+    expect(router.describeConfig(makeRecord({ repoPath: null })).cwd).toEqual({
+      value: defaultCwd,
+      source: "default",
     });
   });
 

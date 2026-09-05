@@ -76,6 +76,14 @@ export interface SessionConfigState {
    * even if a parent preset is on.
    */
   simpleCardGif?: boolean;
+  /**
+   * True when `sessions.repo_path` was written as an explicit session-scope
+   * cwd pin (`/seam config repo scope:session`, session config mutation,
+   * `/seam config set repo:…`, applying a named preset with a repo, or
+   * importing a session into a cwd). Absent on rows whose `repo_path` was
+   * only the `ensureSessionRecord` creation default (#207).
+   */
+  sessionCwdExplicit?: boolean;
 }
 
 export function defaultSessionConfig(

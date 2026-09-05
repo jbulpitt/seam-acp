@@ -141,7 +141,7 @@ try (add new ones to this list when they clear the bar — that is self-update):
 - OpenAI: `sama`, `OpenAI`
 - Anthropic: `AnthropicAI`, `darioamodei`
 - Google / DeepMind: `JeffDean`, `demishassabis`, `GoogleDeepMind`, `sundarpichai`
-- Meta: `ylecun`
+- Meta: `ylecun`, `AIatMeta` (Muse Spark — LeCun is no longer the model handle)
 - Open-weight / non-flagship: `Kimi_Moonshot`, `Zai_org` / Zhipu, DeepSeek,
   Qwen / Alibaba, Mistral
 - Analysts who unspin labs: `SemiAnalysis_`, `natolambert`

@@ -20,6 +20,7 @@ import type {
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
 import type { ElicitationRequestContext } from "./elicitation/types.js";
+import { handleElicitationWithPermissionPolicy } from "./elicitation/approval-policy.js";
 import {
   planSeamMcpInjection,
   spawnRemoteSlot,
@@ -915,6 +916,12 @@ export class SessionRouter {
     return location;
   }
 
+  /** Live session row wins over the captured startRuntime record. */
+  private livePermissionMode(record: SessionRecord): PermissionPolicyMode {
+    const live = this.store.get(record.id) ?? record;
+    return resolvePermissionMode(this.store.readConfig(live), this.defaultPermissionMode);
+  }
+
   private async startRuntime(record: SessionRecord): Promise<AgentRuntime> {
     // Channel/thread presets are the source of truth for locked-down
     // channels: re-resolved on every runtime start (not just session
@@ -940,10 +947,10 @@ export class SessionRouter {
         this.runtimes.delete(record.id);
       },
       permissionPolicy: async (req) => {
-        // Always re-read: the captured `cfg` would be stale if the user later
-        // changes the policy via `/seam approve` while the runtime is alive.
-        const fresh = this.store.readConfig(record);
-        const mode = resolvePermissionMode(fresh, this.defaultPermissionMode);
+        // Always re-read from the live session row: the captured `record`
+        // would be stale if the user later changes the policy via
+        // `/seam approve` while the runtime is alive.
+        const mode = this.livePermissionMode(record);
         if (mode === "always") {
           const opt =
             req.options.find((o) => o.kind?.startsWith("allow_")) ??
@@ -967,8 +974,13 @@ export class SessionRouter {
         return { outcome: { outcome: "cancelled" } };
       },
       elicitationHandler: async (request, context) => {
-        if (!this.elicitUser) return { action: "decline" };
-        return this.elicitUser(record, request, context);
+        return handleElicitationWithPermissionPolicy({
+          request,
+          context,
+          mode: this.livePermissionMode(record),
+          elicitUser: this.elicitUser,
+          record,
+        });
       },
       completeElicitationHandler: async (notification) => {
         await this.completeElicitation?.(record, notification);

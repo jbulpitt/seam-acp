@@ -231,6 +231,8 @@ describe("ACP v1 elicitation validation and capability", () => {
     });
     expect(parseElicitationCustomId("seam-elicit:choice:id:1:extra")).toBeNull();
     expect(parseElicitationCustomId("seam-elicit:bool:id:yes")).toBeNull();
+    expect(parseElicitationCustomId("seam-elicit:allow:id")).toEqual({ kind: "allow", id: "id" });
+    expect(parseElicitationCustomId("seam-elicit:allow:id:1")).toBeNull();
   });
 
   it("handles create and complete on the installed stable-v1 SDK transport", async () => {
@@ -308,6 +310,33 @@ describe("ACP v1 elicitation validation and capability", () => {
 });
 
 describe("Discord elicitation lifecycle", () => {
+  it("renders Allow/Cancel for empty-schema MCP tool approval forms and accepts without persist", async () => {
+    const result = manager.create(
+      record,
+      {
+        mode: "form",
+        sessionId: "acp-1",
+        message: "Allow Codex to call poll_inbox?",
+        requestedSchema: { type: "object", properties: {} },
+        _meta: { codex_approval_kind: "mcp_tool_call" },
+      },
+      { requestId: 70, signal: new AbortController().signal }
+    );
+    await tick();
+    const row = pendingRow();
+    expect(adapter.sent[0]!.card.panel.title).toBe("Input requested");
+    expect(adapter.sent[0]!.card.buttons?.map((button) => button.label)).toEqual(["Allow", "Cancel"]);
+    expect(store.getElicitation(row.id)?.requestJson).toMatch(/seamMcpToolApproval/);
+    expect(store.getElicitation(row.id)?.requestJson).not.toMatch(/_meta|codex_approval_kind/);
+    await manager.handleComponent(event(elicitationCustomId("allow", row.id)));
+    await expect(result).resolves.toEqual({ action: "accept" });
+    expect(store.getElicitation(row.id)?.status).toBe("accepted");
+  });
+
+  it("still rejects empty non-approval forms", () => {
+    expect(validateFormRequest(form({}) as never)).toMatchObject({ ok: false });
+  });
+
   it("posts the explanation first and completes a boolean on direct card buttons", async () => {
     const controller = new AbortController();
     const result = manager.create(

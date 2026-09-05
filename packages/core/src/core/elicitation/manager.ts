@@ -13,6 +13,7 @@ import type {
 } from "../../platforms/chat-adapter.js";
 import type { SessionRecord } from "../types.js";
 import type { SessionStore } from "../session-store.js";
+import { durableApprovalRequest, isStoredMcpToolApproval } from "./approval-policy.js";
 import {
   ELICITATION_MAX_FIELDS,
   ELICITATION_MAX_MESSAGE,
@@ -156,6 +157,12 @@ export function validateFormRequest(request: FormRequest): Validation<ValidatedF
     return { ok: false, error: "The form must declare properties." };
   }
   const entries = Object.entries(properties);
+  if (entries.length === 0 && isStoredMcpToolApproval(request)) {
+    return {
+      ok: true,
+      value: { request, fields: [], pages: [], directDecision: { kind: "approve" } },
+    };
+  }
   if (entries.length < 1 || entries.length > ELICITATION_MAX_FIELDS) {
     return { ok: false, error: `Discord forms support 1-${ELICITATION_MAX_FIELDS} fields.` };
   }
@@ -313,7 +320,11 @@ function parseStored<T>(value: string, fallback: T): T {
 function durableRequest(request: CreateElicitationRequest): string {
   // ACP metadata is opaque and can contain application secrets. Seam does not
   // need it to render, validate, correlate, or answer, so never persist it.
-  return JSON.stringify(request, (key, value) => key === "_meta" ? undefined : value);
+  // Approval elicitations keep a boolean flag so Allow/Cancel still works
+  // after `_meta` is stripped.
+  return JSON.stringify(durableApprovalRequest(request), (key, value) =>
+    key === "_meta" ? undefined : value
+  );
 }
 
 function defaultValues(form: ValidatedForm): ElicitationValues {
@@ -570,9 +581,22 @@ export class ElicitationManager {
       return;
     }
     const form = checked.value;
+    if (action.kind === "allow") {
+      if (form.directDecision?.kind !== "approve") {
+        await event.replyEphemeral("That approval is not valid.").catch(() => {});
+        return;
+      }
+      await event.deferUpdate().catch(() => {});
+      const accepted = this.store.acceptElicitation(row.id, "Approved on the card.", this.nowUtc());
+      if (accepted) {
+        this.finish(accepted, { action: "accept" });
+        await this.refresh(accepted, form);
+      }
+      return;
+    }
     if (action.kind === "skip") {
       const direct = form.directDecision;
-      if (!direct || direct.field.required) {
+      if (!direct || !("field" in direct) || direct.field.required) {
         await event.replyEphemeral("That field cannot be skipped.").catch(() => {});
         return;
       }
@@ -581,8 +605,12 @@ export class ElicitationManager {
       return;
     }
     if (action.kind === "boolean") {
+      if (form.directDecision?.kind !== "boolean" || !form.fields[0]) {
+        await event.replyEphemeral("That choice is not valid.").catch(() => {});
+        return;
+      }
       await event.deferUpdate().catch(() => {});
-      await this.accept(row.id, { [form.fields[0]!.key]: action.value }, "Answered on the card.");
+      await this.accept(row.id, { [form.fields[0].key]: action.value }, "Answered on the card.");
       return;
     }
     if (action.kind === "choice") {
@@ -861,6 +889,15 @@ export class ElicitationManager {
       form = validated.value;
     }
     const completed = new Set(parseStored<number[]>(row.completedPagesJson, []));
+    if (form.directDecision?.kind === "approve") {
+      return {
+        panel,
+        buttons: [
+          { label: "Allow", style: "success", customId: elicitationCustomId("allow", row.id) },
+          { label: "Cancel", style: "danger", customId: elicitationCustomId("cancel", row.id) },
+        ],
+      };
+    }
     panel.fields.push({
       name: form.pages.length === 1 ? "Fields" : `Page ${row.currentPage + 1} of ${form.pages.length}`,
       value: (form.pages[row.currentPage] ?? []).map((field) =>

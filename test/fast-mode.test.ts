@@ -1171,7 +1171,6 @@ function saveHarness(opts: {
     configEditor: { delete: () => {} },
     threadNamer: { recompactChannel: async () => {} },
     applyThreadName: async () => ({}),
-    renameThreadForSetup: async () => {},
     logger: { warn() {}, error() {}, info() {}, debug() {} },
     adapter: {
       editPanel: async (ref: { id: string }, panel: unknown) => {

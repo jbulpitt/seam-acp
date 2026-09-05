@@ -432,7 +432,6 @@ import {
   ThreadNamerConfigStore,
   type ApplyThreadNameOptions,
   type ApplyThreadNameResult,
-  stripStoredThreadPrefix,
   formatThreadNamerRules,
   parseThreadNamerRules,
 } from "./thread-namer.js";
@@ -13895,19 +13894,6 @@ export class Orchestrator {
       );
     } else if (namingRecord) {
       await this.applyThreadName(namingRecord);
-      // #157: the card is now the `/seam new` setup surface, so saving a repo
-      // still renames a thread whose base is the untouched `seam` placeholder.
-      if (plan.threadPreset.cwd) {
-        await this.renameThreadForSetup(
-          {
-            platform: PLATFORM,
-            id: draft.threadId,
-            ...(draft.parentRef ? { parentId: draft.parentRef } : {}),
-          },
-          this.store.getByChannel(PLATFORM, draft.threadId) ?? namingRecord,
-          plan.threadPreset.cwd
-        );
-      }
     }
     // D10: do NOT abort or invalidate a live turn. Overlay applies on next spawn.
     // (#37 Fast is the one exception, handled above — it MUST reset the session.)
@@ -19409,29 +19395,6 @@ export class Orchestrator {
     const root = this.config.REPOS_ROOT;
     if (!fs.existsSync(root)) return undefined;
     return scanWorkspaces(root).map((w) => w.path);
-  }
-
-  /**
-   * Replace the still-untouched `seam` base once a setup repo is known, so a
-   * `/seam new` thread ends up named after the repo it was pointed at. Any
-   * other base is the user's — left alone.
-   */
-  private async renameThreadForSetup(
-    channel: ChannelRef,
-    record: SessionRecord,
-    repoPath: string | null | undefined
-  ): Promise<void> {
-    if (!this.adapter.renameThread || !this.adapter.getThreadName || !channel.parentId) return;
-    if (!repoPath) return;
-    try {
-      const current = await this.adapter.getThreadName(channel);
-      if (current === undefined || record.namePrefix === null || record.namePrefix === undefined) return;
-      const base = stripStoredThreadPrefix(current, record.namePrefix);
-      if (base?.toLowerCase() !== "seam") return;
-      await this.renameThreadBase(record, this.repoDisplay(repoPath));
-    } catch (err) {
-      this.logger.warn({ err, channelId: channel.id }, "setup thread naming failed");
-    }
   }
 
   // --- /seam preset … -------------------------------------------------------

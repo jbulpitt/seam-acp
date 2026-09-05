@@ -225,5 +225,14 @@ describe("message search helpers", () => {
     expect(isMessageCardOrNoise(message(3, "_starting…_", {
       authorId: "bot", authorName: "Seam", authorType: "bot",
     }))).toBe(true);
+    expect(isMessageCardOrNoise(message(4, "_⌚ wake fired_", {
+      authorId: "bot", authorName: "Seam", authorType: "bot",
+    }))).toBe(true);
+    expect(isMessageCardOrNoise(message(5, "_⌚ watch fired_", {
+      authorId: "bot", authorName: "Seam", authorType: "bot",
+    }))).toBe(true);
+    expect(isMessageCardOrNoise(message(6, "_🗜 compact started_", {
+      authorId: "bot", authorName: "Seam", authorType: "bot",
+    }))).toBe(true);
   });
 });

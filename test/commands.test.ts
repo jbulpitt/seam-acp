@@ -121,7 +121,9 @@ describe("/seam — everyday surface", () => {
   it("lists exactly the everyday top-level names — no admin verbs", () => {
     const names = (seam().options ?? []).map((o) => o.name);
     expect(names).toEqual(["cancel", "steer", "new", "workflows", "queue", "config", "info", "preset"]);
-    for (const moved of ["rebuild", "schedule", "project", "upload", "bridge", "debug", "voice", "naming"]) {
+    for (const moved of [
+      "rebuild", "compact-thread", "schedule", "project", "upload", "bridge", "debug", "voice", "naming",
+    ]) {
       expect(names, moved).not.toContain(moved);
     }
     expect(names).not.toContain("attach");
@@ -313,9 +315,9 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(() => buildSeamAdminCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 9 top-level slots (2 subcommands + 7 groups)", () => {
+  it("registers exactly 10 top-level slots (3 subcommands + 7 groups)", () => {
     const json = admin();
-    expect(json.options?.length ?? 0).toBe(9);
+    expect(json.options?.length ?? 0).toBe(10);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
@@ -326,6 +328,7 @@ describe("/seamadmin — operator surface (#151)", () => {
   it("lists exactly the operator slots", () => {
     expect((admin().options ?? []).map((o) => o.name)).toEqual([
       "rebuild",
+      "compact-thread",
       "recover",
       "schedule",
       "project",
@@ -416,11 +419,23 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(bridgeAdd?.options?.[0]?.required).toBe(true);
   });
 
-  it("rebuild stays a top-level subcommand with optional agent and model", () => {
+  it("rebuild is the deterministic reconstruction command with no model options", () => {
     const rebuild = slot(admin(), "rebuild");
     expect(rebuild?.type).toBe(SUB_COMMAND);
-    expect((rebuild?.options ?? []).map((o) => o.name)).toEqual(["agent", "model"]);
-    for (const option of rebuild?.options ?? []) {
+    expect(rebuild?.description).toMatch(/Deterministic/i);
+    expect(rebuild?.description).toMatch(/60%/);
+    expect(rebuild?.description).not.toMatch(/lossless/i);
+    expect(rebuild?.description?.length ?? 0).toBeLessThanOrEqual(100);
+    expect(rebuild?.options ?? []).toEqual([]);
+  });
+
+  it("compact-thread is the former model-assisted rebuild with optional agent and model", () => {
+    const compact = slot(admin(), "compact-thread");
+    expect(compact?.type).toBe(SUB_COMMAND);
+    expect(compact?.description).toMatch(/Model-assisted/i);
+    expect(compact?.description).not.toMatch(/lossless/i);
+    expect((compact?.options ?? []).map((o) => o.name)).toEqual(["agent", "model"]);
+    for (const option of compact?.options ?? []) {
       expect(option.type).toBe(STRING);
       expect(option.required ?? false).toBe(false);
     }
@@ -486,7 +501,7 @@ describe("the split as a whole", () => {
     const seamTop = new Set((seam().options ?? []).map((o) => o.name));
     const adminTop = new Set((admin().options ?? []).map((o) => o.name));
     for (const moved of [
-      "rebuild", "schedule", "project", "upload", "bridge", "debug", "voice", "naming",
+      "rebuild", "compact-thread", "schedule", "project", "upload", "bridge", "debug", "voice", "naming",
     ]) {
       expect(seamTop.has(moved), `/seam still has ${moved}`).toBe(false);
       expect(adminTop.has(moved), `/seamadmin is missing ${moved}`).toBe(true);

@@ -171,7 +171,7 @@ Discord has no aliases; old invocations simply disappear.
 - `info` (6): `whoami` `usage` `avatar` `help` `sessions` `repos`
 - `preset` (7): `list` `create` `apply` `delete` `show` `edit` `thread`
 
-### `/seamadmin` — operator surface (8 slots)
+### `/seamadmin` — operator surface (10 slots)
 
 Registered with `default_member_permissions = ManageGuild` and
 `contexts = [Guild]` (via `setContexts`, not the deprecated `setDMPermission`),
@@ -180,10 +180,12 @@ in DMs.
 
 That permission is **visibility, not authorization** — a guild admin can grant
 the command to anyone, so every runtime refusal stays exactly where it was:
-`SEAM_CONFIG_ADMIN_USER_IDS` for `upload` / `rebuild` / `naming`, plus
+`SEAM_CONFIG_ADMIN_USER_IDS` for `upload` / `rebuild` / `compact-thread` / `naming`, plus
 `BRIDGE_ADMIN_REFUSAL` and `THREAD_VOICE_ADMIN_REFUSAL`.
 
-**Top-level (1):** `rebuild`
+**Top-level (3):** `rebuild` `compact-thread` `recover`
+
+`/seamadmin rebuild` is deterministic Discord reconstruction (no summarizer; one destination seed turn that may consume up to 60% of the destination context window). `/seamadmin compact-thread` is the former model-assisted rebuild. `Premium Compact (Discord)` remains the AGY fan-out pipeline. `/seam config reset` starts a blank session with no history.
 
 **Groups (7):**
 - `schedule` (5): `add` `list` `remove` `toggle` `edit` — **no attachments**

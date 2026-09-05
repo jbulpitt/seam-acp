@@ -126,9 +126,9 @@ to its own command and its own fresh 8,000.
 
 - **`/seam`** — everyday user + agent surface. 8 slots: `cancel` `steer` `new`
   `workflows` `queue`, plus the `config` (18), `info` (6) and `preset` (7) groups.
-- **`/seamadmin`** — operator surface. 8 slots: `rebuild`, plus the `schedule` (5),
-  `project` (3), `upload` (3), `bridge` (4), `debug` (6), `voice` (7) and
-  `naming` (2) groups. Registered with `default_member_permissions =
+- **`/seamadmin`** — operator surface. Top-level `rebuild`, `compact-thread`,
+  and `recover`, plus the `schedule` (5), `project` (3), `upload` (3),
+  `bridge` (4), `debug` (6), `voice` (7) and `naming` (2) groups. Registered with `default_member_permissions =
   ManageGuild` and `contexts = [Guild]`, so it does not appear in the command
   picker for non-admins and is unavailable in DMs.
 
@@ -172,7 +172,8 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seam info avatar` | Re-push the bot avatar to Discord (force re-upload) |
 | `/seam info help` | Show this list |
 | `/seam preset` | Reusable session presets (`list` `create` `apply` `delete` `show` `edit` `thread`) |
-| `/seamadmin rebuild [agent] [model]` | Rebuild this session from Discord thread history |
+| `/seamadmin rebuild` | Deterministic Discord reconstruction (no summarizer; one destination seed turn, up to 60% of the destination context window) |
+| `/seamadmin compact-thread [agent] [model]` | Model-assisted reconstruction from Discord history (the former Rebuild) |
 | `/seamadmin naming rename [scope] [migrate-legacy] [role-name]` | Rebuild thread names from their identity. Admin-gated in the handler (#160) |
 | `/seamadmin naming namer` | Edit the agent / model / role symbol tables |
 | `/seamadmin schedule` | Recurring scheduled prompts (`add` `list` `remove` `toggle` `edit`) — **no attachments** since #158 |
@@ -181,6 +182,13 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seamadmin bridge` | Pair remote bridges (`add` `rotate` `list` `remove`) |
 | `/seamadmin debug` | Host debug (`tail` `exec` `status`) and the live-help voice spike |
 | `/seamadmin voice` | Shared Voice Console V2 (`start` `add` `remove` `configure` `console` `status` `stop`) |
+
+Session history recovery (four distinct operations):
+
+- `/seam config reset` — blank ACP session, no history loaded.
+- **Rebuild** (`/seamadmin rebuild` or the sessions-card Rebuild button) — deterministic Discord reconstruction. No summarizer/model calls except the one destination seed turn. The seed can use up to 60% of the destination model's context window.
+- **Compact from Thread** (`/seamadmin compact-thread` or the sessions-card Compact from Thread button) — the former Rebuild: Discord history summarized by a model, then seeded.
+- **Premium Compact (Discord)** — multi-stage AGY analysis, then a destination seed.
 
 Interactive pickers use buttons for ≤15 choices (laid out across up to 3 rows of 5) and a select menu for 16–25.
 

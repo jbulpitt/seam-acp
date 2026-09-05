@@ -141,10 +141,11 @@ try (add new ones to this list when they clear the bar — that is self-update):
 - OpenAI: `sama`, `OpenAI`
 - Anthropic: `AnthropicAI`, `darioamodei`
 - Google / DeepMind: `JeffDean`, `demishassabis`, `GoogleDeepMind`, `sundarpichai`
-- Meta: `ylecun`, `AIatMeta` (Muse Spark — LeCun is no longer the model handle)
+- Meta: `ylecun`, `AIatMeta`, `alexandr_wang` (Muse max shipped on Wang’s account, not AIatMeta)
 - Open-weight / non-flagship: `Kimi_Moonshot`, `Zai_org` / Zhipu, DeepSeek,
-  Qwen / Alibaba, Mistral
+  Qwen / `Alibaba_Qwen`, Mistral, Tencent Hunyuan (`Hy4`, `tencent/Hy4-preview`)
 - Analysts who unspin labs: `SemiAnalysis_`, `natolambert`
+- Benchmarks: `ArtificialAnlys` (first scores often land here before the Seam AA cache)
 
 **Talent-flow queries** (no new company name required):
 
@@ -156,7 +157,8 @@ try (add new ones to this list when they clear the bar — that is self-update):
 
 - Hugging Face trending / new orgs with large or sudden models
 - AA newly added creators not on `storylines.md`
-- LM Arena: a model appearing then vanishing
+- `from:ArtificialAnlys` plus AA’s own articles (Seam cache can lag a public first score by days)
+- LM Arena: a model appearing then vanishing; also Code Arena WebDev for non-US API snapshots
 - Epoch AI (free) if a claimed pretrain needs a compute sanity check
 
 **Free journalism that restates paid scoops** (secondary; cluster, do not

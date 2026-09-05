@@ -16,9 +16,12 @@ export interface ScheduledPrompt {
   cron: string;
   /** IANA timezone, e.g. "America/Chicago". */
   timezone: string;
-  /** Model id to run the job under. null = use the thread session's model. */
+  /** Model id to run the job under. null = inherit the binding thread's
+   *  *effective* model at fire time (`describeConfig`), not the durable
+   *  session column. Isolated only; live mode ignores this. */
   model: string | null;
-  /** Working directory to run the job in. null = the thread's repoPath. */
+  /** Working directory to run the job in. null = inherit the binding thread's
+   *  *effective* cwd at fire time (`describeConfig`). Isolated only. */
   cwd: string | null;
   /** Channel/thread id to post output to. null = the schedule's own thread. */
   targetChannel: string | null;

@@ -8095,6 +8095,8 @@ export class Orchestrator {
         if (!spec.migration || !this.selfMigrationHandler) {
           throw new Error("dispatch: self migration is not wired");
         }
+        const prior = this.store.get(record.id) ?? record;
+        const snapshot: SessionRecord = { ...prior };
         let migrated: ExecuteSelfMigrationOutcome;
         try {
           migrated = await this.selfMigrationHandler(record, spec.migration);
@@ -8112,12 +8114,47 @@ export class Orchestrator {
         }
         record = migrated.record;
         quotaAgentId = migrated.agent;
-        await this.adapter.sendMessage(
-          target,
-          `🔀 Migrated to ${migrated.agent} / ${migrated.model} — continuing`
-        ).catch((err) =>
-          this.logger.warn({ err, dispatch: spec.id }, "self migration notice failed")
-        );
+        if (spec.rebuild === true) {
+          try {
+            const rebuilt = await this.reconstructSessionFromDiscord({
+              record,
+              channel: {
+                platform: PLATFORM,
+                id: spec.target,
+                ...(record.parentRef ? { parentId: record.parentRef } : {}),
+              },
+              observedAtStart: migrated.newSessionId,
+              attachIntent: "attach",
+            });
+            record = this.store.get(record.id) ?? record;
+            await this.adapter.sendMessage(
+              target,
+              `🔀 Migrated to ${migrated.agent} / ${migrated.model} — rebuilt from Discord (` +
+                `\`${rebuilt.destination.agentId}\` · \`${rebuilt.destination.model}\` · ` +
+                `window ${rebuilt.destination.contextWindow}) — continuing`
+            ).catch((err) =>
+              this.logger.warn({ err, dispatch: spec.id }, "self migration rebuild notice failed")
+            );
+          } catch (err) {
+            const emsg = err instanceof Error ? err.message : String(err);
+            await this.router.invalidate(snapshot.id, { clearStartFailure: true }).catch(() => {});
+            this.store.upsert(snapshot);
+            await this.adapter.sendMessage(
+              target,
+              `⚠️ Migration failed; continuing on the prior agent/model. ${emsg}`
+            ).catch((noticeErr) =>
+              this.logger.warn({ err: noticeErr, dispatch: spec.id }, "self migration failure notice failed")
+            );
+            throw new Error(emsg);
+          }
+        } else {
+          await this.adapter.sendMessage(
+            target,
+            `🔀 Migrated to ${migrated.agent} / ${migrated.model} — continuing`
+          ).catch((err) =>
+            this.logger.warn({ err, dispatch: spec.id }, "self migration notice failed")
+          );
+        }
       }
       this.quotaPoller?.recordTurnStart(quotaAgentId);
       // Isolated: do not mark `running` here — wait for newSession() so the
@@ -16813,6 +16850,37 @@ export class Orchestrator {
     });
   }
 
+  /** Rebuild this thread from Discord after a successful `/seam config set`. */
+  private async configSetRebuildNote(record: SessionRecord, channel: ChannelRef): Promise<string> {
+    try {
+      const result = await this.reconstructSessionFromDiscord({
+        record,
+        channel,
+        observedAtStart: record.acpSessionId,
+        attachIntent: "attach",
+      });
+      return (
+        `\n\n🏗️ Rebuilt from Discord. New session: \`${result.newSessionId}\`. ` +
+        `Destination: \`${result.destination.agentId}\` · \`${result.destination.model}\` · ` +
+        `window ${result.destination.contextWindow}.`
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn({ err, sessionId: record.id }, "config set rebuild failed");
+      return `\n\n❌ Rebuild failed: ${message}`;
+    }
+  }
+
+  private async replyConfigSetRebuild(
+    i: ChatInputCommandInteraction,
+    record: SessionRecord,
+    channel: ChannelRef
+  ): Promise<void> {
+    const live = this.store.get(record.id) ?? record;
+    const note = await this.configSetRebuildNote(live, channel);
+    await i.editReply(note.trim() || "🏗️ Rebuild complete.");
+  }
+
   private async cmdConfigSet(
     i: ChatInputCommandInteraction
   ): Promise<void> {
@@ -16833,6 +16901,7 @@ export class Orchestrator {
       "gif",
     ] as const;
     const json = i.options.getString("json");
+    const rebuild = i.options.getBoolean("rebuild") === true;
     const values = Object.fromEntries(names.map((name) => [name, i.options.getString(name)])) as
       Record<(typeof names)[number], string | null>;
     const supplied = names.filter((name) => values[name] !== null);
@@ -16843,7 +16912,7 @@ export class Orchestrator {
       });
       return;
     }
-    if (json === null && supplied.length === 0) {
+    if (json === null && supplied.length === 0 && !rebuild) {
       await i.reply({
         content: "Provide `json:` or at least one named field.",
         flags: MessageFlags.Ephemeral,
@@ -16854,6 +16923,11 @@ export class Orchestrator {
     // A repo lookup or runtime retirement can exceed Discord's three-second
     // interaction deadline. Acknowledge before either one starts.
     await i.deferReply({ flags: MessageFlags.Ephemeral });
+
+    if (json === null && supplied.length === 0 && rebuild) {
+      await this.replyConfigSetRebuild(i, record, channel);
+      return;
+    }
 
     if (json !== null) {
       let cfg: SessionConfigState;
@@ -16872,7 +16946,9 @@ export class Orchestrator {
         await this.router.invalidate(record.id);
         this.persistConfig(this.store.get(record.id) ?? record, cfg);
         await this.applyThreadName(this.store.get(record.id) ?? record);
-        await i.editReply("Config replaced; next turn starts a fresh runtime.");
+        const replaced = this.store.get(record.id) ?? record;
+        const rebuildNote = rebuild ? await this.configSetRebuildNote(replaced, channel) : "";
+        await i.editReply("Config replaced; next turn starts a fresh runtime." + rebuildNote);
       } catch (err) {
         this.logger.warn({ err, sessionId: record.id }, "JSON config replacement failed");
         await i.editReply(
@@ -17100,6 +17176,8 @@ export class Orchestrator {
       await this.applyThreadName(this.store.get(record.id) ?? updated);
 
       const changed = supplied.map((name) => `\`${name}\``).join(", ");
+      const liveAfter = this.store.get(record.id) ?? updated;
+      const rebuildNote = rebuild ? await this.configSetRebuildNote(liveAfter, channel) : "";
       await i.editReply(
         `Updated ${changed}. Effective: agent \`${effective.agent.value}\`, model ` +
           `\`${effective.model.value}\`, effort \`${effective.effort.value ?? "default"}\`, ` +
@@ -17107,7 +17185,8 @@ export class Orchestrator {
           `\`${effective.role.value ?? "auto"}\`, permissions \`${effective.permission.value}\`, ` +
           `card \`${effective.statusCardStyle.value}\`, gif ` +
           `\`${effective.simpleCardGif.value ? "on" : "off"}\`.` +
-          (restartRequested ? " Next turn uses the new runtime configuration." : "")
+          (restartRequested ? " Next turn uses the new runtime configuration." : "") +
+          rebuildNote
       );
     } catch (err) {
       let rollbackError = "";

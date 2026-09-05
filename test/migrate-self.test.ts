@@ -5,6 +5,7 @@ import path from "node:path";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import {
+  dispatchDisplayPrompt,
   parseDispatchSpec,
   type DispatchSpec,
 } from "../packages/core/src/core/dispatch/types.js";
@@ -75,17 +76,25 @@ function harness(dir: string) {
     getSessionInfo: () => ({ sessionId: "acp-new" }),
   };
   const sent: string[] = [];
+  const rows = new Map<string, SessionRecord>([[oldRecord.id, oldRecord]]);
   const router = {
     listProfiles: () => [],
     describeConfig: () => ({}),
     ensureSessionRecord: () => oldRecord,
     getProfile: () => undefined,
+    invalidate: vi.fn(async () => {
+      log.push("invalidate");
+    }),
     getOrStartRuntime: vi.fn(async (record: SessionRecord) => {
       log.push(`runtime:${record.agentId}/${record.acpSessionId}`);
       return runtime;
     }),
   };
   const store = {
+    get: (id: string) => rows.get(id) ?? null,
+    upsert: (rec: SessionRecord) => {
+      rows.set(rec.id, { ...rec });
+    },
     getPresetByName: () => null,
     recordDelegation: () => {},
     // #170: dispatchInjectTurn now looks the spec up by exact id before
@@ -124,7 +133,7 @@ function harness(dir: string) {
     store: store as any,
     renderer: {} as any,
   });
-  return { orchestrator, oldRecord, newRecord, router, sent, log };
+  return { orchestrator, oldRecord, newRecord, router, store, sent, log, rows };
 }
 
 describe("migrate_self staged dispatch", () => {
@@ -182,6 +191,128 @@ describe("migrate_self staged dispatch", () => {
     expect(h.sent).toContain("🔀 Migrated to codex / gpt-5.6-sol — continuing");
   });
 
+  it("without rebuild does not call Reconstruct and still seeds the manifest", async () => {
+    const h = harness(dir);
+    const rebuild = vi.fn();
+    (h.orchestrator as any).reconstructSessionFromDiscord = rebuild;
+    h.orchestrator.setSelfMigrationHandler(async () => ({
+      ok: true as const,
+      record: h.newRecord,
+      agent: "codex",
+      model: "gpt-5.6-sol",
+      effort: "high",
+      newSessionId: "acp-new",
+      warnings: [],
+    }));
+
+    await expect(h.orchestrator.dispatchInjectTurn(migrationSpec())).resolves.toMatchObject({
+      output: "Manifest accepted.",
+    });
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(h.log.some((entry) => entry.startsWith("prompt:") && entry.includes(migrationSpec().prompt))).toBe(true);
+  });
+
+  it("rebuild:true applies identity, rebuilds from Discord, then injects the manifest", async () => {
+    const h = harness(dir);
+    const rebuild = vi.fn(async (args: { record: SessionRecord; observedAtStart: string }) => {
+      h.log.push(`rebuild:${args.observedAtStart}`);
+      expect(args.record.agentId).toBe("codex");
+      expect(args.observedAtStart).toBe("acp-new");
+      const attached = { ...h.newRecord, acpSessionId: "acp-rebuilt" };
+      h.store.upsert(attached);
+      return {
+        newSessionId: "acp-rebuilt",
+        attachment: { status: "attached" },
+        seed: { text: "RECONSTRUCTION_SEED from Discord history" },
+        destination: { agentId: "codex", model: "gpt-5.6-sol", contextWindow: 400_000 },
+      };
+    });
+    (h.orchestrator as any).reconstructSessionFromDiscord = rebuild;
+    const migrate = vi.fn(async () => {
+      h.log.push("migration:activate");
+      h.store.upsert(h.newRecord);
+      return {
+        ok: true as const,
+        record: h.newRecord,
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        effort: "high",
+        newSessionId: "acp-new",
+        warnings: [],
+      };
+    });
+    h.orchestrator.setSelfMigrationHandler(migrate);
+
+    const spec: DispatchSpec = {
+      ...migrationSpec(),
+      rebuild: true,
+      originPrompt: migrationSpec().prompt,
+    };
+    await expect(h.orchestrator.dispatchInjectTurn(spec)).resolves.toMatchObject({
+      output: "Manifest accepted.",
+    });
+
+    expect(migrate).toHaveBeenCalled();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    const rebuilt = await rebuild.mock.results[0]!.value;
+    expect(rebuilt.seed.text).toContain("RECONSTRUCTION_SEED");
+    expect(rebuilt.seed.text).not.toContain(spec.prompt);
+    const promptIndex = h.log.findIndex(
+      (entry) => entry.startsWith("prompt:") && entry.includes(spec.prompt)
+    );
+    expect(promptIndex).toBeGreaterThan(-1);
+    expect(h.log.indexOf("migration:activate")).toBeLessThan(h.log.indexOf("rebuild:acp-new"));
+    expect(h.log.indexOf("rebuild:acp-new")).toBeLessThan(promptIndex);
+    expect(h.sent.some((text) => text.includes("rebuilt from Discord"))).toBe(true);
+    expect(h.router.getOrStartRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({ acpSessionId: "acp-rebuilt" })
+    );
+  });
+
+  it("rebuild failure does not fire the manifest and restores the prior session", async () => {
+    const h = harness(dir);
+    const rebuild = vi.fn(async () => {
+      h.log.push("rebuild:fail");
+      throw new Error("destination window unresolved");
+    });
+    (h.orchestrator as any).reconstructSessionFromDiscord = rebuild;
+    h.orchestrator.setSelfMigrationHandler(async () => {
+      h.store.upsert(h.newRecord);
+      return {
+        ok: true as const,
+        record: h.newRecord,
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        effort: "high",
+        newSessionId: "acp-new",
+        warnings: [],
+      };
+    });
+
+    await expect(
+      h.orchestrator.dispatchInjectTurn({ ...migrationSpec(), rebuild: true })
+    ).rejects.toThrow(/destination window unresolved/);
+
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    expect(h.router.invalidate).toHaveBeenCalledWith("discord:thread-self", { clearStartFailure: true });
+    expect(h.store.get("discord:thread-self")?.acpSessionId).toBe("acp-old");
+    expect(h.store.get("discord:thread-self")?.agentId).toBe("claude");
+    expect(h.router.getOrStartRuntime).not.toHaveBeenCalled();
+    expect(h.log.some((entry) => entry.startsWith("prompt:"))).toBe(false);
+    expect(h.sent.some((text) => text.includes("continuing on the prior agent/model"))).toBe(true);
+  });
+
+  it("MUTATION: follow-up card excerpt is the manifest, not harness text", () => {
+    const spec: DispatchSpec = {
+      ...migrationSpec(),
+      rebuild: true,
+      originPrompt: migrationSpec().prompt,
+    };
+    expect(dispatchDisplayPrompt(spec)).toBe(migrationSpec().prompt);
+    expect(dispatchDisplayPrompt(spec)).not.toMatch(/seam-harness/i);
+    expect(dispatchDisplayPrompt(spec)).not.toContain("RECONSTRUCTION_SEED");
+  });
+
   it("does not run the manifest when activation fails and reports the prior session remains", async () => {
     const h = harness(dir);
     const migrate = vi.fn(async () => ({ ok: false as const, error: "replacement unavailable" }));
@@ -213,5 +344,13 @@ describe("migrate_self staged dispatch", () => {
       "migration-1",
       JSON.stringify({ ...migrationSpec(), session: "isolated" })
     )).toThrow(/must use the live session/);
+    expect(parseDispatchSpec(
+      "migration-1",
+      JSON.stringify({ ...migrationSpec(), rebuild: true, originPrompt: migrationSpec().prompt })
+    )).toMatchObject({ rebuild: true, originPrompt: migrationSpec().prompt });
+    expect(() => parseDispatchSpec(
+      "migration-1",
+      JSON.stringify({ ...migrationSpec(), kind: "handoff", rebuild: true, migration: undefined })
+    )).toThrow(/rebuild is accepted only for kind migrate_self/);
   });
 });

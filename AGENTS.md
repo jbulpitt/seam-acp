@@ -56,11 +56,14 @@ hand-editing runtime state.
   agent + model + role + ordinal — **do not hand-rename a thread to fix its
   prefix**; set the identity and the name follows.
 - **Migrate your own thread to a new brain and keep working:**
-  `migrate_self({ agent?, model?, effort?, manifest })` stages an agent/model
-  switch until your current turn ends, then seeds the fresh session with your
-  free-form continuation manifest as its first prompt. It is self-only and
-  purpose-agnostic; use it for capability, cost, availability, quota, or any
-  other reason you decide. At least one of agent/model must actually change.
+  `migrate_self({ agent?, model?, effort?, manifest, rebuild? })` stages an
+  agent/model switch until your current turn ends. Default: the manifest is
+  the replacement session's first prompt. `rebuild: true` applies the switch,
+  rebuilds this thread from Discord history (60% of the destination window),
+  then fires the manifest as the **next live turn** (the reconstruction seed
+  is not the manifest). Self-only; at least one of agent/model must change.
+  Rebuild failure rolls the prior agent/model/ACP session back and does not
+  fire the manifest.
 - **Pick a model by cost or capability:** `model_value_rankings({ tier?, benchmark? })`
   ranks the Copilot catalog by value (AA benchmark ÷ Copilot token cost) within
   flagship / balanced / flash tiers; `model_metadata_query` / `model_metadata_get`

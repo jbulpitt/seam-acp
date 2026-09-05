@@ -114,7 +114,8 @@ Use this as a map, not as a substitute for each tool's live schema.
 - Move this thread to a different agent/model and continue from an explicit
   handoff manifest: `migrate_self`. It stages until the current turn ends and
   always starts a fresh replacement session; at least the agent or model must
-  actually change.
+  actually change. Optional `rebuild: true` rebuilds from Discord first, then
+  fires the manifest as the next live turn.
 - Reclaim context while preserving the old session: `compact`.
 - Rename this thread: `rename_thread`.
 

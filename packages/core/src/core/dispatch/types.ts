@@ -84,6 +84,13 @@ export interface DispatchSpec {
   kind?: DelegationKind;
   /** Internal-only target snapshot for a self-directed post-turn migration. */
   migration?: SelfMigrationDispatchTarget;
+  /**
+   * migrate_self only (#214). When true, after the staged identity is applied
+   * the destination session is rebuilt from Discord history, then `prompt`
+   * (the manifest) runs as the next live turn. Default/omitted: the manifest
+   * is the replacement session's first prompt and Rebuild is not called.
+   */
+  rebuild?: boolean;
   /** Trusted human attribution. These three fields are an all-or-nothing tuple
    *  accepted only for the internal `thread_voice` kind. */
   authorId?: string;
@@ -236,6 +243,7 @@ export const DispatchSpecSchema = z.object({
   originPrompt: z.string().min(1).optional(),
   harnessProvenance: z.array(z.string()).optional(),
   kind: z.enum(["handoff", "forward", "report_back", "scheduled", "wake", "watch", "peek", "compact", "parked", "choice", "ingest", "migrate_self", "thread_voice"]).optional(),
+  rebuild: z.boolean().optional(),
   migration: z.object({
     agent: z.string().min(1),
     model: z.string().min(1),
@@ -277,6 +285,13 @@ export const DispatchSpecSchema = z.object({
       code: "custom",
       path: ["migration"],
       message: "migration target metadata is accepted only for kind migrate_self",
+    });
+  }
+  if (value.rebuild === true && value.kind !== "migrate_self") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["rebuild"],
+      message: "rebuild is accepted only for kind migrate_self",
     });
   }
   const trusted = [
@@ -361,6 +376,7 @@ export function parseDispatchSpec(id: string, raw: string): DispatchSpec {
       ? { harnessProvenance: d.harnessProvenance }
       : {}),
     ...(d.kind ? { kind: d.kind } : {}),
+    ...(d.rebuild === true ? { rebuild: true } : {}),
     ...(d.migration ? { migration: d.migration } : {}),
     ...(d.authorId ? { authorId: d.authorId } : {}),
     ...(d.authorName ? { authorName: d.authorName } : {}),

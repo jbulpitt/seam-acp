@@ -164,7 +164,7 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seam config reset` | End the current ACP session for this thread; next message starts a fresh one |
 | `/seam config edit` | Draft-then-save config card: agent (`agentId@host`), model, effort, repo, role, rider, approve, card/GIF. One **Agent** control sets the host — there is no separate host selector. |
 | `/seam config show` | Show the session config JSON |
-| `/seam config set [json] [agent] [model] [effort] [repo] [role] [permissions] [card] [gif]` | Patch supplied session fields together, with autocomplete, or use `json` alone to replace the session config wholesale |
+| `/seam config set [json] [agent] [model] [effort] [repo] [role] [permissions] [card] [gif] [rebuild]` | Patch supplied session fields together, with autocomplete, or use `json` alone to replace the session config wholesale. Optional `rebuild:true` rebuilds the session from Discord after a successful set. |
 | `/seam config audit` | Recent config mutations (who/what/when) |
 | `/seam info repos` | List repos found under `REPOS_ROOT` (hidden directories are skipped) |
 | `/seam info sessions` | List recent sessions across the bot |

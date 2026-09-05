@@ -40,13 +40,17 @@ const profiles = [
   },
 ] as unknown as AgentProfile[];
 
-function interaction(strings: Record<string, string | null>) {
+function interaction(
+  strings: Record<string, string | null>,
+  booleans: Record<string, boolean | null> = {}
+) {
   const replies: string[] = [];
   const edits: string[] = [];
   const order: string[] = [];
   const i = {
     options: {
       getString: (name: string) => strings[name] ?? null,
+      getBoolean: (name: string) => booleans[name] ?? null,
     },
     user: { id: USER, username: "jesse", displayName: "Jesse" },
     channelId: THREAD,
@@ -317,6 +321,69 @@ describe("/seam config set named parameters", () => {
     expect(read(store).record.acpSessionId).toBe("");
     expect(threadPresets.get(THREAD)?.location).toBe("mac");
     expect(threadPresets.get(THREAD)?.agent?.value).toBe("codex");
+    store.close();
+  });
+
+  it("rebuild:true after a model/repo patch invokes Rebuild once and does not Discord-rename from repo", async () => {
+    const { orch, store } = makeHarness();
+    const rebuild = vi.fn(async (args: { record: { repoPath: string | null; agentId: string } }) => {
+      expect(args.record.repoPath).toBe(path.join(reposRoot, "alpha"));
+      return {
+        newSessionId: "acp-rebuilt",
+        seed: { text: "discord-history" },
+        destination: { agentId: "claude", model: "gpt-5.4", contextWindow: 200_000 },
+      };
+    });
+    (orch as any).reconstructSessionFromDiscord = rebuild;
+    const applyThreadName = (orch as any).applyThreadName as ReturnType<typeof vi.fn>;
+
+    const call = interaction({ model: "gpt-5.4", repo: "alpha" }, { rebuild: true });
+    await (orch as any).cmdConfigSet(call.i);
+
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    expect(call.edits.at(-1)).toMatch(/Updated `model`, `repo`/);
+    expect(call.edits.at(-1)).toMatch(/Rebuilt from Discord/);
+    expect(call.edits.at(-1)).toMatch(/gpt-5\.4/);
+    expect(call.edits.at(-1)).toMatch(/window 200000/);
+    expect(read(store).cfg.model).toBe("gpt-5.4");
+    expect(read(store).record.repoPath).toBe(path.join(reposRoot, "alpha"));
+    expect(applyThreadName).toHaveBeenCalled();
+    store.close();
+  });
+
+  it("rebuild:true with no other fields still Rebuilds when the command succeeds", async () => {
+    const { orch, store } = makeHarness();
+    const rebuild = vi.fn(async () => ({
+      newSessionId: "acp-rebuilt",
+      seed: { text: "discord-history" },
+      destination: { agentId: "claude", model: "claude-opus-5", contextWindow: 1_000_000 },
+    }));
+    (orch as any).reconstructSessionFromDiscord = rebuild;
+
+    const empty = interaction({});
+    await (orch as any).cmdConfigSet(empty.i);
+    expect(empty.replies[0]).toMatch(/at least one named field/);
+    expect(rebuild).not.toHaveBeenCalled();
+
+    const call = interaction({}, { rebuild: true });
+    await (orch as any).cmdConfigSet(call.i);
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    expect(call.order[0]).toBe("defer");
+    expect(call.edits.at(-1)).toMatch(/Rebuilt from Discord/);
+    expect(call.edits.at(-1)).toMatch(/claude-opus-5/);
+    expect(read(store).record.agentId).toBe("claude");
+    store.close();
+  });
+
+  it("does not Rebuild when the set is refused", async () => {
+    const { orch, store } = makeHarness();
+    const rebuild = vi.fn();
+    (orch as any).reconstructSessionFromDiscord = rebuild;
+    const call = interaction({ agent: "nope" }, { rebuild: true });
+    await (orch as any).cmdConfigSet(call.i);
+    expect(call.edits.at(-1)).toMatch(/Unknown agent/);
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(read(store).record.agentId).toBe("claude");
     store.close();
   });
 });

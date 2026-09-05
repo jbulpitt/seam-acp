@@ -396,7 +396,7 @@ describe("SeamMcpServer", () => {
     expect(typeof body.result.instructions).toBe("string");
     expect(body.result.instructions).toMatch(/rename_thread\(name\)/);
     expect(body.result.instructions).toMatch(/agent_quota\(agentId\?\)/);
-    expect(body.result.instructions).toMatch(/migrate_self\(agent\?, model\?, effort\?, manifest\)/);
+    expect(body.result.instructions).toMatch(/migrate_self\(agent\?, model\?, effort\?, manifest, rebuild\?\)/);
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
 
@@ -659,6 +659,7 @@ describe("SeamMcpServer", () => {
       session: "live",
       kind: "migrate_self",
       prompt: "State is complete through parsing. Run verification next.",
+      originPrompt: "State is complete through parsing. Run verification next.",
       migration: {
         agent: "codex",
         model: "gpt-5.6-sol",
@@ -666,6 +667,47 @@ describe("SeamMcpServer", () => {
         previousModel: "default",
         previousSessionId: "acp-1",
       },
+    });
+    expect(h.enqueued[0]).not.toHaveProperty("rebuild");
+  });
+
+  it("migrate_self rebuild:true stages Rebuild after identity change", async () => {
+    const prepareSelfMigration = vi.fn(async () => ({
+      ok: true as const,
+      migration: {
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        previousAgent: "claude",
+        previousModel: "default",
+        previousSessionId: "acp-1",
+      },
+    }));
+    h = await makeHarness({ prepareSelfMigration });
+
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "migrate_self",
+        arguments: {
+          model: "gpt-5.6-sol",
+          manifest: "Continue after rebuild.",
+          rebuild: true,
+        },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBeFalsy();
+    expect(JSON.parse(body.result.content[0].text)).toMatchObject({
+      ok: true,
+      staged: true,
+      rebuild: true,
+    });
+    expect(h.enqueued[0]).toMatchObject({
+      kind: "migrate_self",
+      rebuild: true,
+      prompt: "Continue after rebuild.",
+      originPrompt: "Continue after rebuild.",
     });
   });
 

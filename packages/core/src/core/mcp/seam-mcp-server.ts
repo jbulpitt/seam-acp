@@ -513,8 +513,9 @@ const TOOLS = [
     description:
       "Hand a task to a worker and (by default) get its result reported back to you. " +
       "`worker` is EITHER a thread id (a stateful teammate — the task runs in that thread's own session) " +
-      "OR a preset name (a stateless specialist spun up cold for this one task). " +
-      "The worker's output is delivered back into your thread automatically when it finishes — you do not wait inline.",
+      "OR a preset name / `agentId@location` (a stateless specialist spun up cold for this one task). " +
+      "A thread-id worker's output is delivered back into your thread as a live turn when it finishes. " +
+      "A preset worker posts a live embed card in your thread and writes the result onto that same card when it finishes — you do not wait inline.",
     inputSchema: {
       type: "object",
       properties: {
@@ -532,7 +533,8 @@ const TOOLS = [
           description:
             "Live-stream the worker's output into its thread as it runs, behind a start indicator (default true). " +
             "Set false for a quiet run that posts one clean artifact at the end (the indicator still shows). " +
-            "Your report-back always gets the full result either way.",
+            "A thread-id worker's report-back always gets the full result either way. " +
+            "A preset worker's card still posts at the end with the result on it.",
         },
         watchFeedback: {
           type: "boolean",

@@ -367,8 +367,14 @@ import {
   resolveDispatchRuntimePrompt,
   enqueueDispatchSpec,
   findQueuedReportBackSpec,
+  isStatelessHandoffWorker,
+  shouldInlineCardReportBack,
   type DispatchSpec,
 } from "../../core/dispatch/types.js";
+import {
+  DISPATCH_CARD_WINDOW_CHARS,
+  rollingLineWindow,
+} from "../../core/rolling-line-window.js";
 import type { CompletionRoute } from "../../core/dispatch/done-reconcile.js";
 import { promptExcerpt } from "../../core/prompt-excerpt.js";
 import { buildSeamHelpPages } from "./help-text.js";
@@ -8078,9 +8084,15 @@ export class Orchestrator {
     const streaming = spec.stream !== false;
     const header = this.dispatchIndicatorHeader(spec, preset ?? null);
     // Output style: default "messages" (traditional plain assistant messages);
-    // "card" is the opt-in legacy embed path. Read defensively — a raw test/config
+    // "card" is the opt-in legacy embed path. Stateless preset / agentId@location
+    // handoffs always take the embed-card path (750-char rolling window + Done
+    // Result section) regardless of the env default — do not require anyone to
+    // set SEAM_DISPATCH_OUTPUT_STYLE. Read defensively — a raw test/config
     // object may not carry the zod default.
-    const style = this.config.SEAM_DISPATCH_OUTPUT_STYLE ?? "messages";
+    const statelessCard = isStatelessHandoffWorker(spec);
+    const style: "messages" | "card" = statelessCard
+      ? "card"
+      : (this.config.SEAM_DISPATCH_OUTPUT_STYLE ?? "messages");
     // Status panel (this feature): default ON. Give the dispatched turn the SAME
     // traditional live status panel a user turn gets — thinking, context-window
     // health, model, tools, elapsed — titled with the dispatch TYPE. Orthogonal
@@ -8224,8 +8236,13 @@ export class Orchestrator {
       // place, so it no longer needs a pre-posted message to stream into — the ▶
       // header is wanted only when there's no status panel to carry the type.
       // "card" style still edits a single panel in place, so it needs one posted.
-      const wantStartIndicator =
-        style === "messages" ? !statusPanel : streaming || !statusPanel;
+      // Stateless card: always post the start indicator so the same message
+      // can flip to Done with a Result section (including stream:false).
+      const wantStartIndicator = statelessCard
+        ? true
+        : style === "messages"
+          ? !statusPanel
+          : streaming || !statusPanel;
       const panelRef = wantStartIndicator
         ? await this.postDispatchStartIndicator(target, header, style, spec, showHeader, queueFence)
         : undefined;
@@ -8244,8 +8261,15 @@ export class Orchestrator {
       let msgRenderer: StreamingMessageRenderer | undefined;
       // Terminal-render context for the "card" path, filled in by
       // finalizeDispatchStream just before the last (done) edit.
-      const streamState: { error?: string; attached: boolean; fullText?: string; overflow?: boolean } = {
+      const streamState: {
+        error?: string;
+        attached: boolean;
+        fullText?: string;
+        overflow?: boolean;
+        rollingMaxChars?: number;
+      } = {
         attached: false,
+        ...(statelessCard ? { rollingMaxChars: DISPATCH_CARD_WINDOW_CHARS } : {}),
       };
       if (streaming && style === "messages") {
         msgRenderer = new StreamingMessageRenderer(
@@ -8277,11 +8301,14 @@ export class Orchestrator {
           if (!this.queueFenceCurrent(queueFence)) return;
           const panel = this.dispatchStreamPanel({
             header,
-            text,
+            text: done ? (streamState.fullText ?? text) : text,
             done,
             elapsedMs: Date.now() - startedAt,
             ...(done && streamState.error ? { error: streamState.error } : {}),
             ...(done && streamState.attached ? { fullAttached: true } : {}),
+            ...(streamState.rollingMaxChars != null
+              ? { rollingMaxChars: streamState.rollingMaxChars }
+              : {}),
           });
           try {
             if (this.adapter.editPanel) await this.adapter.editPanel(ref, panel);
@@ -8467,6 +8494,17 @@ export class Orchestrator {
         await this.finalizeMessagesStream(target, spec, msgRenderer, result, panelRef, header, showHeader);
       } else if (streamPanel && panelRef) {
         await this.finalizeDispatchStream(target, spec, streamPanel, streamState, result);
+      } else if (statelessCard) {
+        // Quiet (stream:false) stateless card: flip the indicator in place to
+        // Done + Result. If the indicator never posted, send one Done card.
+        await this.publishStatelessHandoffCard(
+          target,
+          spec,
+          panelRef,
+          header,
+          startedAt,
+          result
+        );
       } else {
         // Partial output is still output — post whatever was captured either way.
         await this.postDispatchOutput(target, spec, result.text, result.error);
@@ -8489,7 +8527,16 @@ export class Orchestrator {
           // Report-back: if the caller set returnTo, deliver the result back by
           // enqueuing a fresh dispatch into that thread (correlation-linked). The
           // runtime owns this — the worker never had to "remember" to report.
-          await this.enqueueReportBack(spec, result.text, result.error);
+          // Stateless same-thread card: the Done embed already carries the
+          // result — do not inject a second live `<seam-report-back>` turn.
+          if (shouldInlineCardReportBack(spec)) {
+            this.logger.info(
+              { dispatch: spec.id, target: spec.target, returnTo: spec.returnTo },
+              "dispatch: report-back inlined onto stateless handoff card"
+            );
+          } else {
+            await this.enqueueReportBack(spec, result.text, result.error);
+          }
         }
         // Only terminalize after the onward action is durable.
         const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
@@ -9778,8 +9825,10 @@ export class Orchestrator {
     elapsedMs: number;
     error?: string;
     fullAttached?: boolean;
+    /** Stateless handoff card: 750-char rolling complete-line window. */
+    rollingMaxChars?: number;
   }): StructuredPanel {
-    const { header, text, done, elapsedMs, error, fullAttached } = opts;
+    const { header, text, done, elapsedMs, error, fullAttached, rollingMaxChars } = opts;
     const elapsedSec = Math.max(0, Math.round(elapsedMs / 1000));
     const title = !done
       ? header
@@ -9787,6 +9836,37 @@ export class Orchestrator {
         ? header.replace(/^▶/, "❌")
         : header.replace(/^▶/, "✅");
     const trimmed = text.trim();
+    const footer = done ? `⏱ ${elapsedSec}s` : `⏱ ${elapsedSec}s · streaming…`;
+    const color = error ? DISPATCH_ERROR_COLOR : DISPATCH_COLOR;
+    const titleClamped = title.slice(0, 250);
+
+    if (rollingMaxChars != null) {
+      const windowed = rollingLineWindow(trimmed, rollingMaxChars);
+      if (!done) {
+        return {
+          color,
+          title: titleClamped,
+          description: windowed ? windowed : "_starting…_",
+          fields: [],
+          footer,
+        };
+      }
+      const fields: StructuredPanel["fields"] = [];
+      if (error) {
+        fields.push({ name: "Error", value: error.trim() || "failed" });
+      }
+      fields.push({
+        name: "Result",
+        value: windowed ? windowed : "_(no output)_",
+      });
+      return {
+        color,
+        title: titleClamped,
+        fields,
+        footer,
+      };
+    }
+
     let description: string;
     if (!done) {
       description = trimmed ? `${this.tailForPanel(trimmed)}…` : "_starting…_";
@@ -9802,10 +9882,9 @@ export class Orchestrator {
     } else {
       description = trimmed;
     }
-    const footer = done ? `⏱ ${elapsedSec}s` : `⏱ ${elapsedSec}s · streaming…`;
     return {
-      color: error ? DISPATCH_ERROR_COLOR : DISPATCH_COLOR,
-      title: title.slice(0, 250),
+      color,
+      title: titleClamped,
       description: description.slice(0, 4096),
       fields: [],
       footer,
@@ -9821,17 +9900,25 @@ export class Orchestrator {
     target: ChannelRef,
     spec: DispatchSpec,
     streamPanel: StreamingPanel,
-    streamState: { error?: string; attached: boolean; fullText?: string; overflow?: boolean },
+    streamState: {
+      error?: string;
+      attached: boolean;
+      fullText?: string;
+      overflow?: boolean;
+      rollingMaxChars?: number;
+    },
     result: InjectTurnResult
   ): Promise<void> {
     const body = (result.text ?? "").trim();
     if (result.error) streamState.error = result.error;
+    streamState.fullText = body;
     const label = spec.correlationId ? `${spec.id} · ${spec.correlationId}` : spec.id;
 
-    // "card" style: spill an overflowing body to a file once (no duplicate card),
-    // then flip the embed panel to its done state in place. ("messages" style no
-    // longer reaches here — it streams as real messages via finalizeMessagesStream.)
-    if (body.length > DISPATCH_STREAM_DESC_MAX) {
+    // Legacy env-card path: spill an overflowing body to a file once (no
+    // duplicate card), then flip the embed panel to its done state in place.
+    // The stateless 750-char rolling window never uses this 3800 spill — the
+    // Result section is the window, and the full text lives on the done-file.
+    if (streamState.rollingMaxChars == null && body.length > DISPATCH_STREAM_DESC_MAX) {
       try {
         await this.sendResultFile(target, label, body, "dispatch");
         streamState.attached = true;
@@ -9840,6 +9927,36 @@ export class Orchestrator {
       }
     }
     await streamPanel.finalize();
+  }
+
+  /** Quiet or fallback publish of the stateless-handoff Done card. */
+  private async publishStatelessHandoffCard(
+    target: ChannelRef,
+    spec: DispatchSpec,
+    panelRef: MessageRef | undefined,
+    header: string,
+    startedAt: number,
+    result: InjectTurnResult
+  ): Promise<void> {
+    const panel = this.dispatchStreamPanel({
+      header,
+      text: result.text ?? "",
+      done: true,
+      elapsedMs: Date.now() - startedAt,
+      ...(result.error ? { error: result.error } : {}),
+      rollingMaxChars: DISPATCH_CARD_WINDOW_CHARS,
+    });
+    try {
+      if (panelRef) {
+        if (this.adapter.editPanel) await this.adapter.editPanel(panelRef, panel);
+        else await this.adapter.editMessage(panelRef, serializePanelText(panel));
+        return;
+      }
+      if (this.adapter.sendPanel) await this.adapter.sendPanel(target, panel);
+      else await this.adapter.sendMessage(target, serializePanelText(panel));
+    } catch (err) {
+      this.logger.warn({ err, dispatch: spec.id }, "dispatch: stateless card publish failed");
+    }
   }
 
   /**

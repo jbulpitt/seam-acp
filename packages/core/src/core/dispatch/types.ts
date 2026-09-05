@@ -218,6 +218,12 @@ export interface DispatchResult {
    * directive that replaced it.
    */
   suppressedOnward?: boolean;
+  /**
+   * Stateless handoff card: the live path wrote the report-back onto the
+   * Done embed (Result section) instead of enqueueing a `kind: "report_back"`
+   * turn. Replay must terminalize, not inject a second caller turn.
+   */
+  inlinedReportBack?: boolean;
 }
 
 /**
@@ -525,6 +531,32 @@ export function resolveDispatchRuntimePrompt(spec: DispatchSpec): {
  *  for visibility). Mirrors the seam-MCP handoff heuristic. */
 export function hopLooksLikeThreadId(hop: string): boolean {
   return parseDispatchWorker(hop).kind === "thread";
+}
+
+/**
+ * Preset / `agentId@location` isolated handoffs post a live embed card in the
+ * caller thread. Thread-id (stateful) workers, chain hops, and every other
+ * kind stay on today's messages/report-back path.
+ */
+export function isStatelessHandoffWorker(
+  spec: Pick<DispatchSpec, "preset" | "agentId" | "kind" | "chainId">
+): boolean {
+  if (spec.chainId) return false;
+  const kind = spec.kind ?? "handoff";
+  if (kind !== "handoff") return false;
+  return Boolean(spec.preset || spec.agentId);
+}
+
+/**
+ * Same-thread stateless card delivery: the Done embed carries the report-back
+ * as a Result section, so a live `<seam-report-back>` turn must not be
+ * enqueued. A different `returnTo` still gets today's live report-back
+ * (the card is not in that thread). Chain hops never take this path.
+ */
+export function shouldInlineCardReportBack(
+  spec: Pick<DispatchSpec, "preset" | "agentId" | "kind" | "chainId" | "returnTo" | "target">
+): boolean {
+  return isStatelessHandoffWorker(spec) && spec.returnTo === spec.target;
 }
 
 /**

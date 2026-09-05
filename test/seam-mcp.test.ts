@@ -940,6 +940,9 @@ describe("SeamMcpServer", () => {
     const byName = new Map(body.result.tools.map((t: any) => [t.name, t]));
     expect(byName.get("handoff").inputSchema.properties.stream.type).toBe("boolean");
     expect(byName.get("forward").inputSchema.properties.stream.type).toBe("boolean");
+    // Stateless card delivery is automatic for preset workers — no per-handoff
+    // outputStyle override exists.
+    expect(byName.get("handoff").inputSchema.properties.outputStyle).toBeUndefined();
   });
 
   // --- Claude Fast mode (#37) ----------------------------------------------

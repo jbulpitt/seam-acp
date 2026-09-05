@@ -483,6 +483,12 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .addStringOption((o) =>
             o.setName("gif").setDescription("on, off, or default").setRequired(false).setAutocomplete(true)
           )
+          .addBooleanOption((o) =>
+            o
+              .setName("rebuild")
+              .setDescription("Rebuild session from Discord after applying")
+              .setRequired(false)
+          )
       )
       .addSubcommand((sub) =>
         sub

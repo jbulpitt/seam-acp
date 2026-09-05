@@ -181,17 +181,24 @@ Start a fresh session on a thread, keeping its current agent + model. Clears
 conversation context. Use to recover a wedged/confused thread without changing
 its model.
 
-### `migrate_self({ agent?, model?, effort?, manifest })`
+### `migrate_self({ agent?, model?, effort?, manifest, rebuild? })`
 Migrate **your calling thread itself** to a different agent and/or model. It
 takes no thread id: the seam session token is the sole target authority.
 - At least one of `agent` or `model` must actually change. `effort` may accompany
-  the migration but cannot be the only change.
+  the migration but cannot be the only change. `rebuild` is not a substitute
+  for an identity change.
 - Supply a required free-form `manifest` containing current state, decisions,
-  references, and next work. It is delivered as the **first prompt on the new
-  session**, preserving intentional continuity without copying old context.
+  references, and next work.
+- Default (`rebuild` omitted/false): the manifest is the **first prompt on the
+  new session**.
+- `rebuild: true`: after this turn ends, apply the staged identity, run
+  deterministic Rebuild (`reconstructSessionFromDiscord`) on **this** thread
+  so the destination session is seeded from Discord history (up to 60% of the
+  destination window), then fire the manifest as the **next live turn**. The
+  reconstruction seed is not the manifest. Rebuild failure does not fire the
+  manifest and restores the prior durable agent/model/ACP session.
 - The tool stages while your current turn is active. The invoking turn ends
-  normally; the channel FIFO then performs the reset, posts a neutral switch
-  notice, and starts the manifest on the replacement runtime.
+  normally; the channel FIFO then performs the reset.
 - The mechanism is purpose-agnostic. It does not consult quota, rankings,
   pricing, governance, or admin policy; use the intelligence tools yourself if
   those facts matter to your decision.
@@ -216,4 +223,5 @@ takes no thread id: the seam session token is the sole target authority.
 
 _Provenance: seam-acp issues #130 (value ranking), #132 (cross-thread control),
 #134 (metadata cache), #141 (self migration), #143 (message search/read),
-#145 (thread role + identity naming); drain-safety fix #137._
+#145 (thread role + identity naming), #214 (optional Rebuild on migrate_self
+and `/seam config set`); drain-safety fix #137._

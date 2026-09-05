@@ -65,6 +65,7 @@ function slashI(over: {
       getSubcommand: () => over.sub ?? "new",
       getSubcommandGroup: (_req?: boolean) => over.group ?? null,
       getString: (name: string, _req?: boolean) => over.strings?.[name] ?? null,
+      getBoolean: (_name: string, _req?: boolean) => null,
       getInteger: (_name: string, _req?: boolean) => null,
     },
     user: { id: over.userId ?? ADMIN, username: "jesse", displayName: "jesse" },

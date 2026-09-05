@@ -198,11 +198,16 @@ describe("/seam — everyday surface", () => {
       "permissions",
       "card",
       "gif",
+      "rebuild",
     ]);
     expect(set?.options?.find((o) => o.name === "json")?.required ?? false).toBe(false);
     for (const name of ["agent", "model", "effort", "repo", "role", "permissions", "card", "gif"]) {
       expect(set?.options?.find((o) => o.name === name)?.autocomplete, name).toBe(true);
     }
+    const rebuild = set?.options?.find((o) => o.name === "rebuild");
+    expect(rebuild?.type).toBe(BOOLEAN);
+    expect(rebuild?.required ?? false).toBe(false);
+    expect(rebuild?.description).toMatch(/Rebuild session from Discord after applying/);
   });
 
   it("info group has 6 leaves", () => {

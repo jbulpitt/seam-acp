@@ -743,10 +743,10 @@ const TOOLS = [
     name: "migrate_self",
     description:
       "Migrate THIS thread (yourself) onto a different agent/model, carrying a manifest prompt " +
-      "that seeds the new session so your work continues. Switching agent/model resets the session — " +
-      "the manifest is how continuity survives. Invoke it for any reason (a better model for the next " +
-      "phase, quota, cost, availability); this method does not judge the reason. On failure the thread " +
-      "stays on its current agent/model. The switch is staged until your current turn completes.",
+      "that continues your work. Switching agent/model resets the session. Optional rebuild:true " +
+      "seeds the new session from Discord history, then fires the manifest as the next live turn. " +
+      "Default: the manifest is the first prompt (no Rebuild). Staged until this turn ends; on " +
+      "failure the thread stays on its current agent/model.",
     inputSchema: {
       type: "object",
       properties: {
@@ -760,6 +760,11 @@ const TOOLS = [
           type: "string",
           description:
             "Required free-form continuation prompt: current state, decisions, references, and next work.",
+        },
+        rebuild: {
+          type: "boolean",
+          description:
+            "If true, rebuild this thread from Discord after the switch, then run the manifest as the next live turn. Default false.",
         },
       },
       required: ["manifest"],
@@ -1712,7 +1717,7 @@ const INSTRUCTIONS = [
   "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
   "- configure_thread(thread, agent?, model?, effort?, role?, disableThreadPrefix?, fastMode?): reconfigure a teammate in YOUR channel; returns exact changed/no-change identity, posts a target confirmation card, and agent switches reset context. `fastMode` is Claude-only, defaults off, always forges a fresh session, and spends paid usage credits.",
   "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
-  "- migrate_self(agent?, model?, effort?, manifest): migrate YOUR OWN thread after this turn ends; the manifest is the replacement session's first prompt. Purpose-agnostic and rollback-safe.",
+  "- migrate_self(agent?, model?, effort?, manifest, rebuild?): migrate YOUR OWN thread after this turn ends. Default: the manifest is the replacement session's first prompt. rebuild:true rebuilds from Discord history first, then fires the manifest as the next live turn. Purpose-agnostic and rollback-safe.",
   "- search_messages(query, threads?, author?, since?, limit?): search live conversation text in your thread or same-channel siblings.",
   "- read_messages(thread, around?/before?/after?, limit?): read an unfiltered same-channel message window; use around on a search hit.",
   "- peek(thread, count?): cross-channel recent-N read by raw Discord thread id; shares the reader but does not require a Seam session.",
@@ -2170,6 +2175,7 @@ export class SeamMcpServer {
       );
     }
     const manifest = requireString(args, "manifest");
+    const rebuild = optionalBool(args, "rebuild") === true;
     const input: MigrateSelfInput = {
       manifest,
       ...(optionalString(args, "agent") ? { agent: optionalString(args, "agent") } : {}),
@@ -2186,8 +2192,10 @@ export class SeamMcpServer {
       prompt: manifest,
       session: "live",
       kind: "migrate_self",
+      originPrompt: manifest,
       migration: prepared.migration,
       correlationId: dispatchId,
+      ...(rebuild ? { rebuild: true } : {}),
       createdUtc: new Date().toISOString(),
     };
     await this.deps.enqueueDispatch(spec);
@@ -2197,6 +2205,7 @@ export class SeamMcpServer {
         thread: caller.channelRef,
         agent: prepared.migration.agent,
         model: prepared.migration.model,
+        rebuild,
       },
       "seam-mcp self migration staged"
     );
@@ -2207,8 +2216,10 @@ export class SeamMcpServer {
       agent: prepared.migration.agent,
       model: prepared.migration.model,
       ...(prepared.migration.effort ? { effort: prepared.migration.effort } : {}),
-      message:
-        "Migration is staged. Finish this turn normally; the replacement session will receive the manifest first.",
+      rebuild,
+      message: rebuild
+        ? "Migration is staged. Finish this turn normally; after the switch this thread is rebuilt from Discord, then the manifest runs as the next live turn."
+        : "Migration is staged. Finish this turn normally; the replacement session will receive the manifest first.",
     }, null, 2));
   }
 

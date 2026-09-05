@@ -13,6 +13,8 @@ docs/*
 docs/agent-guides/*
 !docs/agent-guides/README.md
 !docs/agent-guides/interactive-ingest.md
+!docs/industry-watch/
+!docs/industry-watch/**
 .DS_Store
 
 # Playwright MCP scratch outputs

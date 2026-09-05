@@ -809,6 +809,7 @@ describe("#179 sessions:rebuild exits", () => {
       newSessionId: "acp-rebuilt",
       attachment: { attached: true, reason: "swapped" },
       seed,
+      destination: { agentId: "claude", model: "opus", contextWindow: 200_000 },
     });
     await h.settle();
     expect(text(h.last())).toContain("acp-rebuilt");

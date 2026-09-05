@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   getClaudeContextWindow,
   isForwardableFullModelId,
+  lookupClaudeNativeContextWindow,
   makeClaudeProfile,
 } from "@seam/adapters";
 
@@ -29,6 +30,14 @@ describe("getClaudeContextWindow", () => {
     expect(getClaudeContextWindow("claude-opus-4-6")).toBe(200_000);
     expect(getClaudeContextWindow("claude-haiku-4-5")).toBe(200_000);
     expect(getClaudeContextWindow("claude-opus-6")).toBe(200_000);
+  });
+});
+
+describe("lookupClaudeNativeContextWindow", () => {
+  it("returns only verified native windows", () => {
+    expect(lookupClaudeNativeContextWindow("default")).toBe(1_000_000);
+    expect(lookupClaudeNativeContextWindow("claude-opus-4.8")).toBe(1_000_000);
+    expect(lookupClaudeNativeContextWindow("claude-haiku-4-5")).toBeUndefined();
   });
 });
 

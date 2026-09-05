@@ -883,13 +883,25 @@ export function isForwardableFullModelId(modelId?: string): boolean {
 /** Map a model id to its TRUE context window, which drives the auto-compaction
  *  threshold in newSessionMeta. Getting this wrong causes premature compaction
  *  (a 200K threshold on a 1M model throws away 800K of usable context). */
-export function getClaudeContextWindow(modelId?: string): number {
-  if (!modelId) return 200_000;
-  // `default` resolves to the latest Opus on Max/Team-Premium → 1M. (On lower
-  // tiers it is Sonnet 200K; revisit if this bot ever runs on a non-Max account.)
+/**
+ * Verified native Claude windows only. Unknown ids return undefined — callers
+ * that need a compaction floor (newSessionMeta) use {@link getClaudeContextWindow}
+ * which still applies the conservative 200K fallback. Rebuild and other
+ * budget consumers must not use that generic fallback.
+ */
+export function lookupClaudeNativeContextWindow(modelId?: string): number | undefined {
+  if (!modelId) return undefined;
   const id = modelId.trim().toLowerCase();
+  if (!id) return undefined;
   if (id === "default") return 1_000_000;
-  return CLAUDE_CONTEXT_WINDOWS[id] ?? 200_000;
+  if (CLAUDE_CONTEXT_WINDOWS[id]) return CLAUDE_CONTEXT_WINDOWS[id];
+  // Picker/session ids often use dots (`claude-opus-4.8`); the table is hyphenated.
+  const hyphenated = id.replace(/(\d)\.(\d)/g, "$1-$2");
+  return CLAUDE_CONTEXT_WINDOWS[hyphenated];
+}
+
+export function getClaudeContextWindow(modelId?: string): number {
+  return lookupClaudeNativeContextWindow(modelId) ?? 200_000;
 }
 
 /** Stamp each picker entry with its canonical contextLimit so the orchestrator's
@@ -897,14 +909,12 @@ export function getClaudeContextWindow(modelId?: string): number {
  *  other agent) also works for Claude, seeding the display window on turn 1. */
 function withClaudeContextLimits<T extends { modelId: string; name: string; contextLimit?: number }>(
   models: ReadonlyArray<T>
-): Array<T & { contextLimit: number }> {
-  return models.map((m) => ({
-    ...m,
-    // Preserve explicit contextLimit (e.g. from OLLAMA_CLOUD_STATIC_MODELS or
-    // ZAI_STATIC_MODELS) — only fall back to the Claude lookup for models that
-    // don't already declare one.
-    contextLimit: m.contextLimit ?? getClaudeContextWindow(m.modelId),
-  }));
+): Array<T> {
+  return models.map((m) => {
+    if (m.contextLimit && m.contextLimit > 0) return m;
+    const native = lookupClaudeNativeContextWindow(m.modelId);
+    return native ? { ...m, contextLimit: native } : m;
+  });
 }
 
 /** Whether a model uses ADAPTIVE thinking (the SDK's ThinkingConfig marks this

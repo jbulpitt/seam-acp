@@ -1,6 +1,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { loadConfig, isChannelLocked, resolveThreadLocation, resolveThreadTtsVoice, resolveThreadTtsPace, resolveThreadTtsStyle, adminParticipantOverlapIds, GROK_STATIC_MODELS, ZAI_STATIC_MODELS, OLLAMA_CLOUD_STATIC_MODELS } from "./config.js";
+import { enrichModelListWithKnownLimits } from "./core/context-window.js";
 import { hostEmoji } from "./core/location.js";
 import { LoopbackHost } from "./core/loopback-host.js";
 import { logger } from "./lib/logger.js";
@@ -254,7 +255,9 @@ async function main(): Promise<void> {
     ? makeGrokProfile({
         ...(config.GROK_CLI_PATH ? { cliPath: config.GROK_CLI_PATH } : {}),
         defaultModel: config.GROK_DEFAULT_MODEL,
-        staticModels: config.GROK_MODELS ?? grokModels ?? GROK_STATIC_MODELS,
+        staticModels: enrichModelListWithKnownLimits(config.GROK_MODELS, GROK_STATIC_MODELS)
+          ?? grokModels
+          ?? GROK_STATIC_MODELS,
         ...(config.GROK_API_KEY ? { extraEnv: { XAI_API_KEY: config.GROK_API_KEY } } : {}),
       })
     : undefined;
@@ -268,7 +271,8 @@ async function main(): Promise<void> {
         displayName: "Z.ai (Zhipu GLM)",
         brand: "z-ai",
         defaultModel: config.ZAI_DEFAULT_MODEL,
-        staticModels: config.ZAI_MODELS ?? ZAI_STATIC_MODELS,
+        staticModels: enrichModelListWithKnownLimits(config.ZAI_MODELS, ZAI_STATIC_MODELS)
+          ?? ZAI_STATIC_MODELS,
         // GLM models don't support Anthropic's effort mechanism.
         effort: { mechanism: "none" as const, levels: [] },
         extraEnv: {
@@ -304,7 +308,10 @@ async function main(): Promise<void> {
     fs.writeFileSync(
       ollamaCatalogPath,
       JSON.stringify(
-        buildOllamaCodexCatalog(config.OLLAMA_CLOUD_MODELS ?? OLLAMA_CLOUD_STATIC_MODELS),
+        buildOllamaCodexCatalog(
+          enrichModelListWithKnownLimits(config.OLLAMA_CLOUD_MODELS, OLLAMA_CLOUD_STATIC_MODELS)
+            ?? OLLAMA_CLOUD_STATIC_MODELS
+        ),
         null,
         2,
       ),
@@ -331,7 +338,8 @@ async function main(): Promise<void> {
         id: "ollama-cloud",
         displayName: "Ollama Cloud",
         defaultModel: config.OLLAMA_CLOUD_DEFAULT_MODEL,
-        staticModels: config.OLLAMA_CLOUD_MODELS ?? OLLAMA_CLOUD_STATIC_MODELS,
+        staticModels: enrichModelListWithKnownLimits(config.OLLAMA_CLOUD_MODELS, OLLAMA_CLOUD_STATIC_MODELS)
+          ?? OLLAMA_CLOUD_STATIC_MODELS,
         // Restrict to reasoning_effort values codex-acp advertises AND Ollama's
         // OpenAI endpoint accepts, so every offered tier works on both sides.
         // (codex also advertises xhigh/ultra; Ollama also accepts medium/none —
@@ -464,6 +472,7 @@ async function main(): Promise<void> {
     store,
     renderer,
     quotaPoller,
+    getModelMetadata: (idOrSlug) => modelMetadataStore.get(idOrSlug).model,
   });
 
   orchestrator.install();

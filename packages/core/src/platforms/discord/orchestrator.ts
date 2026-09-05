@@ -51,8 +51,7 @@ import {
   ReconstructionUnavailableError,
   assembleReconstruction,
   projectDiscordConversation,
-  reconstructionBudgetTokens,
-  resolveDestinationContextWindow,
+  resolveContextWindow,
 } from "../../core/reconstruction/index.js";
 import { analyzeSessionCoverage, detectGaps, type TimeRange, type GapReport } from "../../core/compaction/gap-detector.js";
 import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
@@ -744,6 +743,7 @@ export class Orchestrator {
   private readonly store: SessionStore;
   private readonly renderer: Renderer;
   private readonly quotaPoller?: AgentQuotaPoller;
+  private readonly getModelMetadata?: (idOrSlug: string) => { context_window: number | null } | null;
   /** Installed by index.ts only while the upstream-status subsystem is active. */
   private serviceStatusRefresh?: () => Promise<RefreshResult>;
   /** Injected only by deterministic restart tests; production uses detached PM2. */
@@ -904,6 +904,7 @@ export class Orchestrator {
     renderer: Renderer;
     quotaPoller?: AgentQuotaPoller;
     restartProcess?: () => Promise<void>;
+    getModelMetadata?: (idOrSlug: string) => { context_window: number | null } | null;
   }) {
     this.logger = opts.logger.child({ comp: "orchestrator" });
     this.config = opts.config;
@@ -913,6 +914,7 @@ export class Orchestrator {
     this.renderer = opts.renderer;
     this.quotaPoller = opts.quotaPoller;
     this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
+    this.getModelMetadata = opts.getModelMetadata;
     this.threadNamerConfig = new ThreadNamerConfigStore(
       path.join(this.config.DATA_DIR, "thread-namer.json"),
       this.logger
@@ -14959,6 +14961,7 @@ export class Orchestrator {
     newSessionId: string;
     attachment: AttachOutcome;
     seed: ReturnType<typeof assembleReconstruction>;
+    destination: { agentId: string; model: string; contextWindow: number };
   }> {
     const { record, channel, observedAtStart, attachIntent, onProgress } = args;
     const log = (m: string) => {
@@ -14966,8 +14969,10 @@ export class Orchestrator {
       this.logger.info({ rebuild: channel.id }, m);
     };
 
-    const profile = this.router.getProfile(record.agentId);
-    if (!profile) throw new ReconstructionUnavailableError(`Agent profile "${record.agentId}" not found.`);
+    const described = this.router.describeConfig(record);
+    const agentId = described.agent.value;
+    const profile = this.router.getProfile(agentId);
+    if (!profile) throw new ReconstructionUnavailableError(`Agent profile "${agentId}" not found.`);
     const seamBotId = this.adapter.getBotUserId?.();
     if (!seamBotId) {
       throw new ReconstructionUnavailableError("Rebuild cannot identify the Seam bot user id.");
@@ -14977,16 +14982,38 @@ export class Orchestrator {
     }
 
     const cfg = this.store.readConfig(record);
-    const destinationModel = cfg.model || profile.defaultModel;
-    const staticLookup =
-      !destinationModel || destinationModel === "default" ? profile.defaultModel : destinationModel;
-    const staticContextLimit = profile.staticModels?.find((m) => m.modelId === staticLookup)?.contextLimit;
-    const contextWindow = resolveDestinationContextWindow({
-      destinationModel,
-      lastContextUsage: cfg.lastContextUsage,
-      ...(staticContextLimit ? { staticContextLimit } : {}),
+    const destinationModel = described.model.value;
+    const adapterModels =
+      typeof profile.describe === "function" ? profile.describe().models : undefined;
+    let pickerModels: Array<{ modelId: string; name: string; contextLimit?: number }> | undefined;
+    const staticHit = profile.staticModels?.find((model) => {
+      const ids = [destinationModel];
+      if (destinationModel === "default" && profile.defaultModel) ids.push(profile.defaultModel);
+      return ids.includes(model.modelId) && model.contextLimit && model.contextLimit > 0;
     });
-    const budgetTokens = reconstructionBudgetTokens(contextWindow);
+    if (!staticHit && typeof profile.listPickerModels === "function") {
+      try {
+        pickerModels = [...(await profile.listPickerModels())];
+      } catch {
+        pickerModels = undefined;
+      }
+    }
+    const metadata = this.getModelMetadata?.(destinationModel)
+      ?? (destinationModel === "default" && profile.defaultModel
+        ? this.getModelMetadata?.(profile.defaultModel)
+        : null);
+    const resolved = resolveContextWindow({
+      agentId,
+      model: destinationModel,
+      defaultModel: profile.defaultModel,
+      lastContextUsage: cfg.lastContextUsage,
+      staticModels: profile.staticModels,
+      adapterModels,
+      pickerModels,
+      metadataWindow: metadata?.context_window ?? null,
+    });
+    const contextWindow = resolved.window;
+    const budgetTokens = resolved.budgetTokens;
     log(`destination ${profile.id} · ${destinationModel} · window ${contextWindow} · 60% budget ${budgetTokens}`);
 
     const reader = new MessageReader(
@@ -15031,12 +15058,12 @@ export class Orchestrator {
       `projected ${seed.projectedLogicalCount} logical · retained ${seed.retainedLogicalCount} · omitted ${seed.omittedLogicalCount} · ~${seed.estimatedTokens} tokens`
     );
 
-    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    const cwd = described.cwd?.value ?? record.repoPath ?? this.config.REPOS_ROOT;
     const newSessionId = await this.seedNewSession({
       profile,
       cwd,
-      ...(cfg.model ? { model: cfg.model } : {}),
-      ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+      ...(destinationModel ? { model: destinationModel } : {}),
+      ...(described.effort?.value ? { effort: described.effort.value } : {}),
       summary: seed.text,
       leadIn: null,
     });
@@ -15047,7 +15074,12 @@ export class Orchestrator {
       observedAtStart,
       intent: attachIntent,
     });
-    return { newSessionId, attachment, seed };
+    return {
+      newSessionId,
+      attachment,
+      seed,
+      destination: { agentId, model: destinationModel, contextWindow },
+    };
   }
 
   private async cmdRebuild(i: ChatInputCommandInteraction): Promise<void> {
@@ -15063,7 +15095,6 @@ export class Orchestrator {
       return;
     }
     const observedAtStart = record.acpSessionId;
-    const destModel = this.store.readConfig(record).model || this.router.getProfile(record.agentId)?.defaultModel || "default";
     await i.reply({ content: "🏗️ Rebuilding from Discord (deterministic, no summarizer)…", flags: MessageFlags.Ephemeral });
     try {
       const result = await this.reconstructSessionFromDiscord({
@@ -15076,7 +15107,7 @@ export class Orchestrator {
       await i.editReply(
         `🏗️ Rebuild complete.\n` +
           `New session: \`${result.newSessionId}\`\n` +
-          `Destination: \`${record.agentId}\` · \`${destModel}\` · window ${seed.contextWindow}\n` +
+          `Destination: \`${result.destination.agentId}\` · \`${result.destination.model}\` · window ${result.destination.contextWindow}\n` +
           `Discord posts: ${seed.sourcePostCount} → logical ${seed.projectedLogicalCount}\n` +
           `Retained ${seed.retainedLogicalCount}, omitted ${seed.omittedLogicalCount}\n` +
           `Estimated seed tokens: ${seed.estimatedTokens} / ${seed.budgetTokens} (60% budget)` +
@@ -15903,7 +15934,7 @@ export class Orchestrator {
               id: i.channelId,
               ...(record.parentRef ? { parentId: record.parentRef } : {}),
             };
-            const { newSessionId, attachment, seed } = await this.reconstructSessionFromDiscord({
+            const { newSessionId, attachment, seed, destination } = await this.reconstructSessionFromDiscord({
               record,
               channel: channelRef,
               observedAtStart,
@@ -15916,14 +15947,10 @@ export class Orchestrator {
               newId: newSessionId,
               sourceId: observedAtStart,
             });
-            const destModel =
-              this.store.readConfig(record).model ||
-              this.router.getProfile(record.agentId)?.defaultModel ||
-              "default";
             const successEmbed = new EmbedBuilder()
               .setTitle("🏗️ Rebuild complete")
               .setDescription(
-                `Destination: \`${record.agentId}\` · \`${destModel}\` · window ${seed.contextWindow}\n` +
+                `Destination: \`${destination.agentId}\` · \`${destination.model}\` · window ${destination.contextWindow}\n` +
                   `Discord posts ${seed.sourcePostCount} → logical ${seed.projectedLogicalCount}\n` +
                   `Retained ${seed.retainedLogicalCount}, omitted ${seed.omittedLogicalCount}\n` +
                   `Estimated seed tokens ${seed.estimatedTokens} / ${seed.budgetTokens} (60% budget)` +

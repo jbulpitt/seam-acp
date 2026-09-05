@@ -40,20 +40,27 @@ function makeOrch(over?: {
   posts?: MessagePageItem[];
   cfg?: { model?: string; reasoningEffort?: string; lastContextUsage?: { model: string; size: number } };
   staticContextLimit?: number;
-  staticModels?: Array<{ modelId: string; name: string; contextLimit: number }> | null;
+  staticModels?: Array<{ modelId: string; name: string; contextLimit?: number }> | null;
   botId?: string | undefined;
-  channelPresets?: Map<string, { rider?: { value: string } }>;
-  threadPresets?: Map<string, { rider?: { value: string } }>;
+  channelPresets?: Map<string, { rider?: { value: string }; agent?: { value: string }; model?: { value: string } }>;
+  threadPresets?: Map<string, { rider?: { value: string }; agent?: { value: string }; model?: { value: string } }>;
   duringSeed?: (bound: { value: string }) => void;
   seedError?: Error;
   alwaysFullPage?: boolean;
+  recordOver?: Partial<SessionRecord>;
+  profiles?: Record<string, any>;
+  describeConfig?: (record: SessionRecord) => any;
+  getModelMetadata?: (id: string) => { context_window: number | null } | null;
+  listPickerModels?: () => Promise<Array<{ modelId: string; name: string; contextLimit?: number }>>;
 }) {
-  const rec = record();
+  const rec = record(over?.recordOver);
   const bound = { value: rec.acpSessionId };
   const seedCalls: any[] = [];
   const injectCalls: any[] = [];
   const casCalls: any[] = [];
   const compactCalls: string[] = [];
+  const describeCalls: SessionRecord[] = [];
+  const fetchCalls: number[] = [];
   const posts = over?.posts ?? [
     post("1", "hello"),
     post("2", "hi there", { authorType: "bot" }),
@@ -69,7 +76,9 @@ function makeOrch(over?: {
             { modelId: "claude-opus-4.8", name: "Opus", contextLimit: over?.staticContextLimit ?? 200_000 },
           ]),
     sessionManager: { name: "mgr" },
+    ...(over?.listPickerModels ? { listPickerModels: over.listPickerModels } : {}),
   };
+  const profiles = { claude: profile, ...(over?.profiles ?? {}) };
   const orch = new Orchestrator({
     logger: silent,
     config: {
@@ -84,6 +93,7 @@ function makeOrch(over?: {
     adapter: {
       getBotUserId: () => ("botId" in (over ?? {}) ? over!.botId : SEAM),
       fetchMessagePage: async () => {
+        fetchCalls.push(1);
         if (over?.alwaysFullPage) {
           return Array.from({ length: 100 }, (_, i) => post(String(i + 1), `page-item ${i + 1}`));
         }
@@ -91,11 +101,24 @@ function makeOrch(over?: {
       },
     } as any,
     router: {
-      listProfiles: () => [profile],
-      describeConfig: () => ({}),
-      getProfile: () => profile,
+      listProfiles: () => Object.values(profiles),
+      describeConfig: (session: SessionRecord) => {
+        describeCalls.push(session);
+        if (over?.describeConfig) return over.describeConfig(session);
+        const thread = (over?.threadPresets ?? new Map()).get(session.channelRef);
+        const agentId = thread?.agent?.value ?? session.agentId;
+        const model = thread?.model?.value ?? over?.cfg?.model ?? profiles[agentId]?.defaultModel ?? "claude-opus-4.8";
+        return {
+          agent: { value: agentId, source: thread?.agent ? "thread preset" : "session config" },
+          model: { value: model, source: thread?.model ? "thread preset" : "session config" },
+          effort: { value: over?.cfg?.reasoningEffort ?? null, source: "session config" },
+          cwd: { value: session.repoPath ?? "/repo", source: "session config" },
+        };
+      },
+      getProfile: (id: string) => profiles[id],
       invalidate: async () => {},
     } as any,
+    ...(over?.getModelMetadata ? { getModelMetadata: over.getModelMetadata } : {}),
     store: {
       readConfig: () => over?.cfg ?? { model: "claude-opus-4.8", reasoningEffort: "high" },
       get: () => ({ ...rec, acpSessionId: bound.value }),
@@ -128,7 +151,7 @@ function makeOrch(over?: {
     if (over?.seedError) throw over.seedError;
     return "sess-new";
   };
-  return { orch, rec, seedCalls, injectCalls, casCalls, bound, compactCalls };
+  return { orch, rec, seedCalls, injectCalls, casCalls, bound, compactCalls, describeCalls, fetchCalls };
 }
 
 describe("reconstructSessionFromDiscord", () => {
@@ -261,6 +284,7 @@ describe("reconstructSessionFromDiscord", () => {
       })
     ).rejects.toThrow(/cannot resolve a context window/);
     expect(t.seedCalls).toHaveLength(0);
+    expect(t.fetchCalls).toHaveLength(0);
   });
 
   it("does not use another model's static window for an unknown destination", async () => {
@@ -274,6 +298,7 @@ describe("reconstructSessionFromDiscord", () => {
       })
     ).rejects.toThrow(/cannot resolve a context window/);
     expect(t.seedCalls).toHaveLength(0);
+    expect(t.fetchCalls).toHaveLength(0);
   });
 
   it("fails closed when Discord history is truncated by the page cap", async () => {
@@ -321,5 +346,133 @@ describe("reconstructSessionFromDiscord", () => {
     expect(channelAt).toBeGreaterThan(-1);
     expect(threadAt).toBeGreaterThan(channelAt);
     expect(t.compactCalls).toEqual([]);
+  });
+
+  it("resolves grok-4.6 at 500K on first use when the env list has only a cosmetic (500k) label", async () => {
+    const t = makeOrch({
+      recordOver: { agentId: "grok" },
+      cfg: { model: "grok-4.6" },
+      profiles: {
+        grok: {
+          id: "grok",
+          defaultModel: "grok-4.6",
+          staticModels: [{ modelId: "grok-4.6", name: "Grok 4.6 (500k)" }],
+          sessionManager: { name: "mgr" },
+        },
+      },
+    });
+    const res = await (t.orch as any).reconstructSessionFromDiscord({
+      record: t.rec,
+      channel: { platform: "discord", id: "thread-r" },
+      observedAtStart: "acp-active",
+      attachIntent: "attach",
+    });
+    expect(t.describeCalls.length).toBeGreaterThan(0);
+    expect(res.destination).toEqual({ agentId: "grok", model: "grok-4.6", contextWindow: 500_000 });
+    expect(res.seed.contextWindow).toBe(500_000);
+    expect(res.seed.budgetTokens).toBe(300_000);
+    expect(t.seedCalls[0].profile.id).toBe("grok");
+    expect(t.seedCalls[0].model).toBe("grok-4.6");
+  });
+
+  it("does not let stale record.agentId / cfg.model override a thread-preset identity", async () => {
+    const t = makeOrch({
+      cfg: { model: "claude-opus-4.8" },
+      threadPresets: new Map([
+        ["thread-r", { agent: { value: "grok" }, model: { value: "grok-4.6" } }],
+      ]),
+      profiles: {
+        grok: {
+          id: "grok",
+          defaultModel: "grok-4.6",
+          staticModels: [{ modelId: "grok-4.6", name: "Grok 4.6 (500k)" }],
+          sessionManager: { name: "mgr" },
+        },
+      },
+    });
+    const res = await (t.orch as any).reconstructSessionFromDiscord({
+      record: t.rec,
+      channel: { platform: "discord", id: "thread-r" },
+      observedAtStart: "acp-active",
+      attachIntent: "attach",
+    });
+    expect(t.rec.agentId).toBe("claude");
+    expect(res.destination.agentId).toBe("grok");
+    expect(res.destination.model).toBe("grok-4.6");
+    expect(res.destination.contextWindow).toBe(500_000);
+    expect(t.seedCalls[0].profile.id).toBe("grok");
+    expect(t.seedCalls[0].model).toBe("grok-4.6");
+  });
+
+  it("uses AGY listPickerModels contextLimit without seeding first", async () => {
+    let pickerCalls = 0;
+    const t = makeOrch({
+      recordOver: { agentId: "agy" },
+      cfg: { model: "gemini-3.8-flash-high" },
+      profiles: {
+        agy: {
+          id: "agy",
+          defaultModel: "gemini-3.8-flash-high",
+          staticModels: [{ modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash High" }],
+          sessionManager: { name: "mgr" },
+          listPickerModels: async () => {
+            pickerCalls += 1;
+            return [
+              { modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash High", contextLimit: 1_048_576 },
+            ];
+          },
+        },
+      },
+    });
+    const res = await (t.orch as any).reconstructSessionFromDiscord({
+      record: t.rec,
+      channel: { platform: "discord", id: "thread-r" },
+      observedAtStart: "acp-active",
+      attachIntent: "attach",
+    });
+    expect(pickerCalls).toBe(1);
+    expect(res.destination.contextWindow).toBe(1_048_576);
+    expect(res.seed.budgetTokens).toBe(Math.floor(1_048_576 * 0.6));
+  });
+
+  it("uses cached copilot metadata when the static picker has no window", async () => {
+    const t = makeOrch({
+      recordOver: { agentId: "copilot" },
+      cfg: { model: "gpt-5.5" },
+      profiles: {
+        copilot: {
+          id: "copilot",
+          defaultModel: "gpt-5.5",
+          staticModels: [{ modelId: "gpt-5.5", name: "GPT-5.5" }],
+          sessionManager: { name: "mgr" },
+        },
+      },
+      getModelMetadata: (id) => (id === "gpt-5.5" ? { context_window: 400_000 } : null),
+    });
+    const res = await (t.orch as any).reconstructSessionFromDiscord({
+      record: t.rec,
+      channel: { platform: "discord", id: "thread-r" },
+      observedAtStart: "acp-active",
+      attachIntent: "attach",
+    });
+    expect(res.destination).toEqual({ agentId: "copilot", model: "gpt-5.5", contextWindow: 400_000 });
+    expect(res.seed.budgetTokens).toBe(240_000);
+  });
+
+  it("does not parse a display label for a token count", async () => {
+    const t = makeOrch({
+      cfg: { model: "mystery-999" },
+      staticModels: [{ modelId: "mystery-999", name: "Mystery (999k)" }],
+    });
+    await expect(
+      (t.orch as any).reconstructSessionFromDiscord({
+        record: t.rec,
+        channel: { platform: "discord", id: "thread-r" },
+        observedAtStart: "acp-active",
+        attachIntent: "attach",
+      })
+    ).rejects.toThrow(/agent `claude` model `mystery-999`/);
+    expect(t.seedCalls).toHaveLength(0);
+    expect(t.fetchCalls).toHaveLength(0);
   });
 });

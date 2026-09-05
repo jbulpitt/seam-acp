@@ -308,7 +308,7 @@ export function makeAgyProfile(opts: {
    * to the legacy location for back-compat.
    */
   dataDir?: string;
-  staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
   printTimeoutSeconds?: number;
   /** Run terminal tools inside agy's sandbox. Intended for tightly scoped
    *  one-shot helpers that consume untrusted content. */
@@ -335,7 +335,15 @@ export function makeAgyProfile(opts: {
     staticModels: opts.staticModels,
     async listPickerModels() {
       if (opts.staticModels && opts.staticModels.length > 0) {
-        return opts.staticModels;
+        if (!catalogRowsPromise) return opts.staticModels;
+        const rows = await getCatalog(cli);
+        const limits = new Map(
+          rows.filter((row) => row.maxTokens).map((row) => [row.modelId, row.maxTokens])
+        );
+        return opts.staticModels.map((model) => {
+          const contextLimit = model.contextLimit ?? limits.get(model.modelId);
+          return contextLimit ? { ...model, contextLimit } : model;
+        });
       }
       const rows = await getCatalog(cli);
       const rec = rows.filter((r) => r.recommended);

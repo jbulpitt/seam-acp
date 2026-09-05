@@ -32,6 +32,8 @@ export interface ChoiceIngestOpts {
   enqueue: (spec: DispatchSpec) => Promise<void>;
   destLive: (card: ChoiceCard, optionIndex: number) => Promise<"ok" | "gone" | "archived">;
   authoringSession: (channelRef: string) => SessionRecord | null;
+  /** Effective cwd for isolated inherit. Falls back to `authoringSession.repoPath`. */
+  authoringCwd?: (record: SessionRecord) => string;
   publicBase: () => string;
   waitMs?: number;
   bodyMax?: number;
@@ -47,6 +49,7 @@ export class ChoiceIngest {
   private readonly enqueue: (spec: DispatchSpec) => Promise<void>;
   private readonly destLive: ChoiceIngestOpts["destLive"];
   private readonly authoringSession: ChoiceIngestOpts["authoringSession"];
+  private readonly authoringCwd?: ChoiceIngestOpts["authoringCwd"];
   private readonly publicBase: () => string;
   private readonly waitMs: number;
   private readonly bodyMax: number;
@@ -62,6 +65,7 @@ export class ChoiceIngest {
     this.enqueue = opts.enqueue;
     this.destLive = opts.destLive;
     this.authoringSession = opts.authoringSession;
+    this.authoringCwd = opts.authoringCwd;
     this.publicBase = opts.publicBase;
     this.waitMs = opts.waitMs ?? DEFAULT_INGEST_WAIT_MS;
     this.bodyMax = opts.bodyMax ?? DEFAULT_INGEST_BODY_MAX;
@@ -206,13 +210,17 @@ export class ChoiceIngest {
       json(res, 409, { error: msg });
       return;
     }
+    const authoringSession = this.authoringSession(card.channelRef);
     const emitted = await emitChoice({
       card: claimed.card,
       optionIndex,
       actor,
       payload,
       enqueue: this.enqueue,
-      authoringSession: this.authoringSession(card.channelRef),
+      authoringSession,
+      ...(authoringSession && this.authoringCwd
+        ? { cwd: this.authoringCwd(authoringSession) }
+        : {}),
       destLive,
       defaultModel: this.defaultModel,
       source: "http",

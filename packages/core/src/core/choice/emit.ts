@@ -34,6 +34,12 @@ export interface EmitChoiceInput {
   /** Authoring thread session (for isolated inherit of agent/model/cwd). */
   authoringSession: SessionRecord | null;
   /**
+   * Effective authoring cwd for isolated inherit. Prefer this over
+   * `authoringSession.repoPath`, which may still hold the REPOS_ROOT
+   * creation default (#207).
+   */
+  cwd?: string;
+  /**
    * Live-state of the destination thread. `undefined` = skip the check
    * (tests). `"gone"` or `{ archived: true }` → refuse, do not enqueue.
    */
@@ -87,7 +93,8 @@ export function planChoiceDispatch(input: EmitChoiceInput): EmitChoiceResult {
     if (cfg.model) spec.model = cfg.model;
     else if (input.defaultModel) spec.model = input.defaultModel;
     if (cfg.reasoningEffort) spec.effort = cfg.reasoningEffort;
-    if (input.authoringSession.repoPath) spec.cwd = input.authoringSession.repoPath;
+    const cwd = input.cwd ?? input.authoringSession.repoPath;
+    if (cwd) spec.cwd = cwd;
   }
   return { ok: true, dispatchId: spec.id, spec };
 }
@@ -110,6 +117,8 @@ export interface EmitChoiceMultiInput {
   source?: "discord" | "http";
   wrapper?: string;
   untrustedStudentId?: string | null;
+  /** Effective authoring cwd for isolated inherit. See EmitChoiceInput.cwd. */
+  cwd?: string;
 }
 
 /** Combined multi-select emit (#94). Destination is the card defaultTarget. */
@@ -155,7 +164,8 @@ export function planChoiceMultiDispatch(input: EmitChoiceMultiInput): EmitChoice
     if (cfg.model) spec.model = cfg.model;
     else if (input.defaultModel) spec.model = input.defaultModel;
     if (cfg.reasoningEffort) spec.effort = cfg.reasoningEffort;
-    if (input.authoringSession.repoPath) spec.cwd = input.authoringSession.repoPath;
+    const cwd = input.cwd ?? input.authoringSession.repoPath;
+    if (cwd) spec.cwd = cwd;
   }
   return { ok: true, dispatchId: spec.id, spec };
 }

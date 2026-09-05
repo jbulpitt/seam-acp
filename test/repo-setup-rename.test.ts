@@ -311,7 +311,9 @@ describe("#206 repo-selection/setup paths do not derive the thread base from a r
     await (orch as any).cmdNew(i);
     expect(created[0]!.name).toBe("notes");
     expect(threadBase(store, THREAD, threadNames.get(THREAD))).toBe("notes");
-    expect(store.get(`discord:${THREAD}`)?.repoPath).toBe(reposRoot);
+    // #207: creation no longer stamps REPOS_ROOT into repoPath (that was a
+    // fake session overlay). The thread name still comes from `name:`, not cwd.
+    expect(store.get(`discord:${THREAD}`)?.repoPath).toBeNull();
   });
 
   it("/seam config init binds cwd without renaming", async () => {

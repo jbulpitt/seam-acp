@@ -323,7 +323,7 @@ import type { SessionStore } from "../../core/session-store.js";
 import { makeSessionId } from "../../core/session-store.js";
 import { ElicitationManager } from "../../core/elicitation/manager.js";
 import type { InboundAdmission } from "../../core/inbound-admission/types.js";
-import { SessionRouter, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
+import { SessionRouter, resolveSessionCwd, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
 import {
   FAST_MODE_COST_WARNING,
   FAST_MODE_CONFIG_ID,
@@ -2831,7 +2831,8 @@ export class Orchestrator {
 
     const cfg = this.store.readConfig(record);
     const described = this.router.describeConfig(record);
-    const repoDisplay = this.repoDisplay(record.repoPath);
+    const effectiveCwd = described.cwd.value;
+    const repoDisplay = this.repoDisplay(effectiveCwd);
     const turnProfile = this.router.getProfile(described.agent.value);
     const brand = resolveAgentBrand(described.agent.value, turnProfile?.brand);
     const brandAsset = loadBrandAsset(brand);
@@ -3329,7 +3330,7 @@ export class Orchestrator {
                 // fence-close: emit as inline message or attachment.
                 fenceCounter += 1;
                 await this.emitClosedFence(channel, seg.fence, fenceCounter, {
-                  preferredRoot: record.repoPath,
+                  preferredRoot: effectiveCwd,
                 });
                 textSent = true;
                 typingDone = true;
@@ -3352,7 +3353,7 @@ export class Orchestrator {
               if (snap) {
                 fenceCounter += 1;
                 await this.emitClosedFence(channel, snap, fenceCounter, {
-                  preferredRoot: record.repoPath,
+                  preferredRoot: effectiveCwd,
                   notice:
                     "_(fence exceeded the watchdog timeout and was closed early)_",
                 });
@@ -3556,7 +3557,7 @@ export class Orchestrator {
         const writer = activeProfile.sessionManager.writeAttachment.bind(
           activeProfile.sessionManager
         );
-        const cwd = record.repoPath ?? process.cwd();
+        const cwd = effectiveCwd;
         const pathLines: string[] = [];
         for (const a of msg.attachments) {
           if (isVoiceNoteAttachment(a)) continue;
@@ -3740,7 +3741,7 @@ export class Orchestrator {
         } else {
           fenceCounter += 1;
           await this.emitClosedFence(channel, seg.fence, fenceCounter, {
-            preferredRoot: record.repoPath,
+            preferredRoot: effectiveCwd,
           });
           textSent = true;
         }
@@ -3758,7 +3759,7 @@ export class Orchestrator {
         await drainBuffer(true, true);
         fenceCounter += 1;
         await this.emitClosedFence(channel, tail.unclosed, fenceCounter, {
-          preferredRoot: record.repoPath,
+          preferredRoot: effectiveCwd,
           notice: "_(fence was not closed by the agent)_",
         });
         textSent = true;
@@ -3850,7 +3851,7 @@ export class Orchestrator {
         let sideChannelEmitted = false;
         if (usageReader) {
           try {
-            const cwd = record.repoPath ?? process.cwd();
+            const cwd = effectiveCwd;
             const usage = await usageReader.call(
               profile.sessionManager,
               cwd,
@@ -3955,7 +3956,7 @@ export class Orchestrator {
         if (needsRepair) {
           const profile = this.router.getProfile(record.agentId);
           const manager = profile?.sessionManager;
-          const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+          const cwd = effectiveCwd;
           let repaired = false;
 
           if (manager && typeof manager.repairSession === "function" && record.acpSessionId) {
@@ -4577,7 +4578,7 @@ export class Orchestrator {
       }
     } catch { /* best-effort — don't block compaction on a failed card send */ }
 
-    const cwd = record.repoPath ?? process.cwd();
+    const cwd = this.effectiveCwd(record);
     if (!this.compactionModelFor(record.agentId)) {
       this.logger.warn({ agent: record.agentId }, "auto-compact: no compaction model configured");
       return;
@@ -4713,7 +4714,7 @@ export class Orchestrator {
       }
       const cwd =
         opts.cwd ??
-        (target && isSessionRecord(target) ? target.repoPath : undefined) ??
+        (target && isSessionRecord(target) ? this.effectiveCwd(target) : undefined) ??
         this.config.REPOS_ROOT;
       const manager = opts.sessionManager ?? profile.sessionManager;
       let rt: AgentRuntime | undefined;
@@ -5367,7 +5368,7 @@ export class Orchestrator {
     if (!sessionId) {
       throw new Error("This thread has no active session to compact yet.");
     }
-    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    const cwd = this.effectiveCwd(record);
     const channel: ChannelRef = opts?.channel ?? { platform: record.platform, id: record.channelRef };
     const onProgress = opts?.onProgress;
     // #179: read the binding ONCE, here, before the first pipeline await, and
@@ -6469,7 +6470,7 @@ export class Orchestrator {
     // preset moved (D4 / #85). startRuntime still re-reads the preset;
     // this pins the in-memory session→bridge map for the inject.
     bindSessionLocation(this.bridgeHub, record.id, parked.location);
-    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    const cwd = this.effectiveCwd(record);
     const pathLines: string[] = [];
     const ferryToHost = !isLocalLocation(parked.location);
     for (const a of parked.attachments) {
@@ -7996,7 +7997,7 @@ export class Orchestrator {
             effectiveSession,
             workerLocation,
             profile: presetProfile,
-            cwd: preset?.repoPath ?? spec.cwd ?? record.repoPath ?? this.config.REPOS_ROOT,
+            cwd: preset?.repoPath ?? spec.cwd ?? this.effectiveCwd(record),
           })
         : {};
     const seamMcp = sessionHasSeamMcp(
@@ -8185,7 +8186,7 @@ export class Orchestrator {
             const panelEffort = isolated
               ? (preset?.effort ?? spec.effort ?? cfg.reasoningEffort)
               : cfg.reasoningEffort;
-            const panelCwd = preset?.repoPath ?? spec.cwd ?? record.repoPath ?? this.config.REPOS_ROOT;
+            const panelCwd = preset?.repoPath ?? spec.cwd ?? this.effectiveCwd(record);
             const panelProfile = presetProfile ?? this.router.getProfile(record.agentId);
             return this.startDispatchStatusPanel(target, spec, {
               model: panelModel,
@@ -8886,7 +8887,7 @@ export class Orchestrator {
           return this.startDispatchStatusPanel(target, spec, {
             model: cfg.model ?? this.config.DEFAULT_MODEL,
             ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
-            cwd: record.repoPath ?? this.config.REPOS_ROOT,
+            cwd: this.effectiveCwd(record),
             ...(compactProfile ? { profile: compactProfile } : {}),
             isolated: false,
             ...(cfg.lastContextUsage
@@ -9852,9 +9853,9 @@ export class Orchestrator {
    * `record.agentId`, raw `cfg.model`, or raw `record.repoPath`.
    *
    * Cwd is `described.cwd.value` (plus an explicit schedule override). This
-   * method does not fork a second cwd precedence table; if describeConfig
-   * still prefers a stale session `repoPath`, that value is what isolated
-   * fire inherits until cwd ownership is fixed there.
+   * method does not fork a second cwd precedence table. describeConfig is
+   * the cwd owner (#207): a REPOS_ROOT creation default is not a session
+   * overlay, so a thread-preset repo is what isolated fire inherits.
    */
   private resolveIsolatedScheduleIdentity(
     record: SessionRecord,
@@ -13480,7 +13481,12 @@ export class Orchestrator {
       agent,
       model: chan?.model?.value ?? cfg.model ?? this.config.DEFAULT_MODEL,
       effort: effortUsable ? chanEffort! : cfg.reasoningEffort ?? null,
-      cwd: chan?.cwd?.value ?? record.repoPath ?? this.config.REPOS_ROOT,
+      cwd: resolveSessionCwd({
+        repoPath: record.repoPath,
+        sessionCwdExplicit: cfg.sessionCwdExplicit === true,
+        channelCwd: chan?.cwd?.value,
+        defaultCwd: this.config.REPOS_ROOT,
+      }).value,
       permission,
       detached: false,
       // #37: Fast is thread-preset only, so "without this thread" is always off.
@@ -14882,7 +14888,7 @@ export class Orchestrator {
       throw new Error("Chat adapter does not support fetching thread messages.");
     }
 
-    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    const cwd = this.effectiveCwd(record);
     let tempRuntime: AgentRuntime | undefined;
     let transcriptFile: string | undefined;
     try {
@@ -15153,7 +15159,7 @@ export class Orchestrator {
       `projected ${seed.projectedLogicalCount} logical · retained ${seed.retainedLogicalCount} · omitted ${seed.omittedLogicalCount} · ~${seed.estimatedTokens} tokens`
     );
 
-    const cwd = described.cwd?.value ?? record.repoPath ?? this.config.REPOS_ROOT;
+    const cwd = described.cwd.value;
     const newSessionId = await this.seedNewSession({
       profile,
       cwd,
@@ -15341,7 +15347,7 @@ export class Orchestrator {
 
     await i.deferReply({ flags: MessageFlags.Ephemeral });
 
-    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    const cwd = this.effectiveCwd(record);
     let sessions: SessionSummary[];
     try {
       sessions = await manager.listSessions(cwd);
@@ -16552,10 +16558,13 @@ export class Orchestrator {
 
             // Re-anchor the current thread to the new cwd + new session.
             await this.router.invalidate(record.id);
+            const importedCfg = this.store.readConfig(record);
+            importedCfg.sessionCwdExplicit = true;
             this.store.upsert({
               ...record,
               repoPath: targetCwd,
               acpSessionId: newSessionId,
+              configJson: this.store.writeConfig(importedCfg),
               updatedUtc: new Date().toISOString(),
             });
 
@@ -17115,6 +17124,7 @@ export class Orchestrator {
         if (!gif || gif === "default") delete cfg.simpleCardGif;
         else cfg.simpleCardGif = parseSimpleCardGif(gif);
       }
+      if (resolvedRepo !== undefined) cfg.sessionCwdExplicit = true;
       const updated = {
         ...live,
         agentId: storedAgentId,
@@ -17865,7 +17875,7 @@ export class Orchestrator {
 
     // For relative paths, try each candidate base in order until one
     // resolves to an existing regular file inside an allowed root:
-    //   1. The session's repoPath (the thread's current repo) if any.
+    //   1. The thread's effective cwd (describeConfig) if any.
     //   2. Each allowed root in order.
     // For absolute paths, resolve directly.
     const candidates: string[] = [];
@@ -18521,7 +18531,7 @@ export class Orchestrator {
       try {
         const ferried = await this.bridgeHub.readAttachmentForSession(
           record.id,
-          opts.preferredRoot ?? record.repoPath ?? this.config.REPOS_ROOT,
+          opts.preferredRoot ?? this.effectiveCwd(record),
           reqPath
         );
         if (ferried) {
@@ -18753,7 +18763,7 @@ export class Orchestrator {
     const spec = parsed.spec;
     const cfg = this.store.readConfig(record);
     let agentId: string | null = spec.agent ?? record.agentId ?? this.config.DEFAULT_AGENT;
-    let cwd: string | null = spec.cwd ?? record.repoPath ?? null;
+    let cwd: string | null = spec.cwd ?? this.effectiveCwd(record);
     let model: string | null = ingestMintStoredModel(spec.model);
     let effort: string | null = spec.effort ?? cfg.reasoningEffort ?? null;
     if (spec.preset) {
@@ -19083,13 +19093,15 @@ export class Orchestrator {
       return;
     }
     try {
+      const authoringSession = this.store.getByChannel(PLATFORM, card.channelRef);
       const emitted = await emitChoice({
         card: claimed.card,
         optionIndex,
         actor: { id: evt.userId, name: evt.userName },
         payload,
         enqueue: (spec) => enqueueDispatchSpec(this.config.DATA_DIR, spec),
-        authoringSession: this.store.getByChannel(PLATFORM, card.channelRef),
+        authoringSession,
+        ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
         destLive,
         defaultModel: this.config.DEFAULT_MODEL,
       });
@@ -19132,12 +19144,14 @@ export class Orchestrator {
       return;
     }
     const destLive = await this.choiceTargetLive(card, card.defaultTarget ?? { type: "live" });
+    const authoringSession = this.store.getByChannel(PLATFORM, card.channelRef);
     const planned = planChoiceMultiDispatch({
       card,
       optionIndices: indices,
       actor: { id: evt.userId, name: evt.userName },
       enqueue: async () => {},
-      authoringSession: this.store.getByChannel(PLATFORM, card.channelRef),
+      authoringSession,
+      ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
       destLive,
       defaultModel: this.config.DEFAULT_MODEL,
     });
@@ -19178,7 +19192,8 @@ export class Orchestrator {
         optionIndices: indices,
         actor: { id: evt.userId, name: evt.userName },
         enqueue: (spec) => enqueueDispatchSpec(this.config.DATA_DIR, spec),
-        authoringSession: this.store.getByChannel(PLATFORM, card.channelRef),
+        authoringSession,
+        ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
         destLive,
         defaultModel: this.config.DEFAULT_MODEL,
       });
@@ -19201,13 +19216,15 @@ export class Orchestrator {
     payload: string,
     destLive: "ok" | "gone" | "archived"
   ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const authoringSession = this.store.getByChannel(PLATFORM, card.channelRef);
     const planned = planChoiceDispatch({
       card,
       optionIndex,
       actor,
       payload,
       enqueue: async () => {},
-      authoringSession: this.store.getByChannel(PLATFORM, card.channelRef),
+      authoringSession,
+      ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
       destLive,
       defaultModel: this.config.DEFAULT_MODEL,
     });
@@ -19417,13 +19434,9 @@ export class Orchestrator {
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
-    this.store.upsert({
-      ...record,
-      repoPath: resolved,
-      updatedUtc: new Date().toISOString(),
-    });
+    const pinned = this.persistSessionCwd(record, resolved);
     await this.router.invalidate(record.id);
-    return { ok: true, record: this.store.get(record.id) ?? { ...record, repoPath: resolved } };
+    return { ok: true, record: pinned };
   }
 
   /**
@@ -20682,6 +20695,7 @@ export class Orchestrator {
     // One write for config + repo. `acp_session_id` is assigned out-of-band, so
     // re-read the authoritative value rather than trusting the in-memory record
     // (see persistConfig) — unless the agent switch above deliberately cleared it.
+    if (preset.repoPath) cfg.sessionCwdExplicit = true;
     const live = this.store.get(record.id)?.acpSessionId;
     this.store.upsert({
       ...record,
@@ -20793,6 +20807,31 @@ export class Orchestrator {
       ...(channel.parentId ? { parentRef: channel.parentId } : {}),
       cwd: this.config.REPOS_ROOT,
     });
+  }
+
+  /** Effective cwd for spawn, status cards, and other runtime-adjacent paths.
+   *  Never use `record.repoPath` for that — it is a session overlay that may
+   *  still hold the REPOS_ROOT creation default (#207). */
+  private effectiveCwd(record: SessionRecord): string {
+    const described =
+      typeof this.router.describeConfig === "function"
+        ? this.router.describeConfig(record)
+        : undefined;
+    return described?.cwd?.value ?? record.repoPath ?? this.config.REPOS_ROOT;
+  }
+
+  /** Persist an explicit session-scope cwd pin. Distinct from thread/channel overlays. */
+  private persistSessionCwd(record: SessionRecord, repoPath: string): SessionRecord {
+    const cfg = this.store.readConfig(record);
+    cfg.sessionCwdExplicit = true;
+    const next: SessionRecord = {
+      ...record,
+      repoPath,
+      configJson: this.store.writeConfig(cfg),
+      updatedUtc: new Date().toISOString(),
+    };
+    this.store.upsert(next);
+    return this.store.get(record.id) ?? next;
   }
 
   private persistConfig(

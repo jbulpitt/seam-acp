@@ -4,6 +4,7 @@ import {
   filterAgyCatalogByAcceptedModels,
   parseAgyAcceptedModels,
   resolveAgyModel,
+  selectAgyTurnModel,
   type AgyCatalogEntry,
 } from "../packages/adapters/src/profiles/agy.js";
 
@@ -166,5 +167,51 @@ describe("resolveAgyModel", () => {
       resolveAgyModel([first, recommended], "missing", "missing default")
     ).toBe(recommended);
     expect(resolveAgyModel([first], "missing", "missing default")).toBe(first);
+  });
+
+  it("does not auto-heal when allowAutoHeal is false", () => {
+    expect(
+      resolveAgyModel(
+        [first, recommended, configuredDefault],
+        "gemini-3.1-flash-lite",
+        "Gemini 3.5 Flash (High)",
+        { allowAutoHeal: false }
+      )
+    ).toBeUndefined();
+  });
+});
+
+describe("selectAgyTurnModel", () => {
+  const flash = catalogEntry("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)", true);
+  const opus = catalogEntry("claude-opus-4.6-thinking", "Claude Opus 4.6 (Thinking)");
+
+  it("uses an explicit session model exactly and never heals it", () => {
+    expect(
+      selectAgyTurnModel({
+        catalog: [flash, opus],
+        sessionModelId: "gemini-3.8-flash-high",
+        defaultModel: "Claude Opus 4.6 (Thinking)",
+      })
+    ).toEqual({ entry: flash });
+  });
+
+  it("rejects an explicit unknown session model instead of substituting another catalog entry", () => {
+    expect(
+      selectAgyTurnModel({
+        catalog: [flash, opus],
+        sessionModelId: "gemini-3.1-flash-lite",
+        defaultModel: "Claude Opus 4.6 (Thinking)",
+      })
+    ).toEqual({ error: "unknown AGY model gemini-3.1-flash-lite" });
+  });
+
+  it("still auto-heals the settings.json / default path when no session model is set", () => {
+    expect(
+      selectAgyTurnModel({
+        catalog: [flash, opus],
+        settingsModelId: "stale-settings-id",
+        defaultModel: "Claude Opus 4.6 (Thinking)",
+      })
+    ).toEqual({ entry: opus, healedFrom: "stale-settings-id" });
   });
 });

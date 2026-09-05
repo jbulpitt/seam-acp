@@ -48,6 +48,14 @@ import { cleanTextForPreview, pickerModelsForProfile, scanWorkspaces, type Sessi
 import { readRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
 import { analyzeSessionCoverage, detectGaps, type TimeRange, type GapReport } from "../../core/compaction/gap-detector.js";
 import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
+import {
+  DISCORD_COMPACTION_EXECUTOR_LABEL,
+  DISCORD_COMPACTION_MODEL,
+  discordCompactionExecutor,
+  isDiscordPremiumCompactAvailable,
+  requireExactCatalogModel,
+  resolveDiscordCompactionProfile,
+} from "../../core/compaction/discord-executor.js";
 import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, assembleNewSession, type PinnedFacts } from "../../core/compaction/prompts.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
@@ -4839,7 +4847,7 @@ export class Orchestrator {
   private makeCompactionRunAgent(
     profile: AgentProfile,
     manager: ISessionManager,
-    opts?: { model?: string; cwd?: string; effort?: string }
+    opts?: { model?: string; cwd?: string; effort?: string; strictModel?: boolean }
   ): RunAgent {
     const model = opts?.model ?? "default";
     const cwd = opts?.cwd ?? "/tmp";
@@ -4849,6 +4857,7 @@ export class Orchestrator {
     // prior `meta: { reasoningEffort }` was a silent no-op.) Undefined ⇒ no knob
     // for this agent (agy is modelBaked; remote has none) — left at its default.
     const effort = opts?.effort;
+    const strictModel = opts?.strictModel === true;
     // The AGY CLI (Gemini) silently truncates stdin prompts larger than ~150KB.
     // For large prompts, write the content to a temp file and reference it.
     const LARGE_PROMPT_THRESHOLD = 100 * 1024; // 100 KB
@@ -4876,9 +4885,10 @@ export class Orchestrator {
           sessionManager: manager,
           cwd,
           model,
+          ...(strictModel ? { strictModel: true } : {}),
           ...(effort ? { effort } : {}),
           awaitIdle: true,
-          logContext: { compaction: label },
+          logContext: { compaction: label, analysisAgent: profile.id, analysisModel: model },
         });
         // The pipeline treats a rejected stage as a recoverable per-chunk
         // failure, so propagate the ORIGINAL error, not a re-wrapped one.
@@ -4987,12 +4997,18 @@ export class Orchestrator {
       gapReport,
       ...(discordText ? { discordText } : {}),
       runAgent,
+      analysisExecutor: {
+        id: profile.id,
+        displayName: profile.displayName,
+        model: "default",
+      },
       log,
     });
   }
 
   /** Run the premium multi-agent compaction pipeline reconstructed from the full
-   *  Discord thread history. Works for any compactable agent profile. */
+   *  Discord thread history. Bulk analysis is fail-closed on AGY at the exact
+   *  Discord compaction model; the destination profile is not used here. */
   private async runPremiumCompactionForDiscord(args: {
     profile: AgentProfile;
     manager: ISessionManager;
@@ -5001,8 +5017,27 @@ export class Orchestrator {
     channel?: ChannelRef;
     onProgress?: (msg: string) => void;
   }): Promise<PremiumCompactionResult> {
-    const { profile, manager, sessionId, cwd, channel, onProgress } = args;
-    const log = (m: string) => { onProgress?.(m); this.logger.debug({ compaction: `discord-${sessionId}` }, m); };
+    const { sessionId, channel, onProgress } = args;
+    const analysisExecutor = discordCompactionExecutor();
+    const log = (m: string) => {
+      onProgress?.(m);
+      this.logger.debug(
+        {
+          compaction: `discord-${sessionId}`,
+          analysisAgent: analysisExecutor.id,
+          analysisModel: analysisExecutor.model,
+        },
+        m
+      );
+    };
+
+    const { profile: analysisProfile, manager: analysisManager } =
+      resolveDiscordCompactionProfile((id) => this.router.getProfile(id));
+    const catalog = analysisProfile.listPickerModels
+      ? await analysisProfile.listPickerModels()
+      : analysisProfile.staticModels ?? [];
+    requireExactCatalogModel(catalog, DISCORD_COMPACTION_MODEL);
+    log(`analysis executor: ${DISCORD_COMPACTION_EXECUTOR_LABEL}`);
 
     if (!channel) {
       throw new Error("Discord compaction requires an active channel context.");
@@ -5055,13 +5090,17 @@ export class Orchestrator {
       needDiscord: false,
     };
 
-    const runAgent = this.makeCompactionRunAgent(profile, manager, {
-      effort: this.compactionEffortFor(profile, "premium"),
+    const runAgent = this.makeCompactionRunAgent(analysisProfile, analysisManager, {
+      model: DISCORD_COMPACTION_MODEL,
+      strictModel: true,
+      effort: this.compactionEffortFor(analysisProfile, "premium"),
     });
     return runPremiumCompaction({
       richHistory,
       gapReport,
       runAgent,
+      analysisExecutor,
+      failClosed: true,
       log,
     });
   }
@@ -5163,10 +5202,12 @@ export class Orchestrator {
    *  recovery requests, pinned facts, the assembled seed) so the detail is
    *  reviewable beyond the Discord summary card. */
   private formatPremiumReport(result: PremiumCompactionResult, sessionId: string): string {
+    const executor = result.analysisExecutor;
     return [
       `# Premium compaction report — ${sessionId}`,
       ``,
       `- Stats: ${JSON.stringify(result.stats)}`,
+      `- Analysis: ${executor.displayName} · ${executor.model}`,
       ``,
       `---`,
       ``,
@@ -5273,6 +5314,7 @@ export class Orchestrator {
     attachment: AttachOutcome;
     reportMarkdown: string;
     stats: PremiumCompactionResult["stats"];
+    analysisExecutor: PremiumCompactionResult["analysisExecutor"];
   }> {
     const source = opts?.source ?? "session";
     const profile = this.router.getProfile(record.agentId);
@@ -5351,6 +5393,7 @@ export class Orchestrator {
       attachment,
       reportMarkdown: this.formatPremiumReport(result, sessionId),
       stats: result.stats,
+      analysisExecutor: result.analysisExecutor,
     };
   }
 
@@ -8851,7 +8894,11 @@ export class Orchestrator {
       // only signal that the seeded session had nothing pointing at it.
       const summary =
         `✅ Compacted into a new session \`${res.newSessionId}\` via the multi-agent pipeline ` +
-        `(${res.stats.chunks} chunk(s)). ` +
+        `(${res.stats.chunks} chunk(s)` +
+        (res.analysisExecutor
+          ? `, analysis ${res.analysisExecutor.displayName} · ${res.analysisExecutor.model}`
+          : "") +
+        `). ` +
         `${stripMarkdownEmphasis(describeAttachOutcome(res.attachment, { newId: res.newSessionId, sourceId: res.originalSessionId }))} ` +
         `Original \`${res.originalSessionId}\` is preserved (review or delete it from the session manager).`;
       await finalize(summary);
@@ -15129,6 +15176,9 @@ export class Orchestrator {
       // agent. (The write-back is a seedNewSession turn, which any agent with a
       // runtime supports — no special manager method required.)
       const canCompact = this.compactionModelFor(record.agentId) !== "";
+      const canDiscordPremium = isDiscordPremiumCompactAvailable((id) =>
+        this.router.getProfile(id)
+      );
       // Any agent with a session manager can receive a migrated session (the
       // summary is seeded into a fresh session under that agent).
       const targetProfiles = this.router.listProfiles().filter(p =>
@@ -15194,8 +15244,8 @@ export class Orchestrator {
             .setStyle(ButtonStyle.Success)
         );
       }
-      // Premium (Discord thread based) — works for any compactable agent.
-      if (canCompact) {
+      // Premium (Discord thread based) — AGY executor/model, not the destination.
+      if (canDiscordPremium) {
         row4Buttons.push(
           new ButtonBuilder()
             .setCustomId("sessions:premium_discord")
@@ -15954,7 +16004,7 @@ export class Orchestrator {
                 .setTitle(fromDiscord ? "✨ Premium Compaction (Discord)" : "✨ Premium Compaction")
                 .setDescription(
                   (fromDiscord
-                    ? `Running multi-agent compaction on full Discord history…`
+                    ? `Running multi-agent compaction on full Discord history via ${DISCORD_COMPACTION_EXECUTOR_LABEL}…`
                     : `Running multi-agent compaction on \`${session.sessionId}\`…`) +
                   `\nThis can take several minutes (fan-out → reduce → deep-dive → synthesize → verify).`
                 )
@@ -15996,7 +16046,11 @@ export class Orchestrator {
                     (fromDiscord
                       ? `Compacted from Discord thread history into a **new session** \`${res.newSessionId}\``
                       : `Compacted into a **new session** \`${res.newSessionId}\``) +
-                    ` with the multi-agent pipeline (${res.stats.chunks} chunk(s)).`,
+                    ` with the multi-agent pipeline (${res.stats.chunks} chunk(s)` +
+                    (res.analysisExecutor
+                      ? `, analysis ${res.analysisExecutor.displayName} · ${res.analysisExecutor.model}`
+                      : "") +
+                    `).`,
                   ...(wrote ? { report: { path: reportPath, name: reportName } } : {}),
                 };
               },
@@ -20436,6 +20490,7 @@ const COMPACTION_MODEL_WINDOWS: Record<string, number> = {
   "gpt-5.5": 400_000,
   "Gemini 3.1 Pro (High)": 1_000_000,
   "Claude Opus 4.6 (Thinking)": 250_000,
+  "gemini-3.8-flash-high": 1_000_000,
   "glm-5.2": 1_000_000,
   "qwen3-coder:480b-cloud": 256_000,
   "glm-5.3:cloud": 1_000_000,

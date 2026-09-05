@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { retiredAgentConfigMessage } from "./core/retired-agents.js";
+import { DISCORD_COMPACTION_MODEL } from "./core/compaction/discord-executor.js";
 
 const ModelsListSchema = z
   .string()
@@ -250,12 +251,12 @@ const Schema = z.object({
    */
   AGY_AUTO_COMPACT_THRESHOLD: z.coerce.number().min(0).max(1).default(0.8),
   /**
-   * Model used to generate compaction summaries (auto + manual `/compact`).
-   * Picked per-agent. Should be a high-context model with strong summarization
-   * — the session's own model may be too small to fit a near-full transcript
-   * (e.g. Sonnet 200K compacting at 80% leaves no headroom for the response).
+   * Exact AGY model used for every Premium Compact (Discord) bulk-analysis
+   * call. Literal by design: accepting another value could silently move a
+   * high-fan-out job onto an unintended model/provider. Existing deployments
+   * with an older override must update it before restart.
    */
-  AGY_COMPACTION_MODEL: z.string().default("Claude Opus 4.6 (Thinking)"),
+  AGY_COMPACTION_MODEL: z.literal(DISCORD_COMPACTION_MODEL).default(DISCORD_COMPACTION_MODEL),
   // "default" resolves to the latest Opus @ 1M on the configured Max account.
   CLAUDE_COMPACTION_MODEL: z.string().default("default"),
   COPILOT_COMPACTION_MODEL: z.string().default("gpt-5.5"),

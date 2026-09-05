@@ -22,12 +22,22 @@ import {
 /** Injected agent runner: given a prompt, return the agent's text reply. */
 export type RunAgent = (prompt: string, label: string) => Promise<string>;
 
+export interface CompactionAnalysisExecutor {
+  id: string;
+  displayName: string;
+  model: string;
+}
+
 export interface PremiumCompactionInput {
   richHistory: RichHistory;
   gapReport: GapReport;
   /** Rendered Discord text for the ranges the gap-detector flagged, if any. */
   discordText?: string;
   runAgent: RunAgent;
+  /** The executor/model actually used for every analysis call in this run. */
+  analysisExecutor: CompactionAnalysisExecutor;
+  /** Abort the whole run on any analysis failure instead of producing stubs. */
+  failClosed?: boolean;
   /** Max concurrent agent calls in a fan-out stage. */
   concurrency?: number;
   /** Token budget for the verbatim recent window kept in the new session. */
@@ -44,6 +54,7 @@ export interface PremiumCompactionResult {
   pinnedFacts: PinnedFacts;
   /** The full text to seed the new session with. */
   assembledSeed: string;
+  analysisExecutor: CompactionAnalysisExecutor;
   stats: {
     chunks: number;
   };
@@ -183,6 +194,8 @@ export async function runPremiumCompaction(
   const {
     richHistory,
     runAgent,
+    analysisExecutor,
+    failClosed = false,
     concurrency = 6,
     log = () => {},
   } = input;
@@ -230,6 +243,11 @@ export async function runPremiumCompaction(
       return summary.trim();
     } catch (err) {
       log(`  [chunk-${i}] failed: ${(err as Error).message}`);
+      if (failClosed) {
+        throw new Error(`Bulk analysis ${analysisExecutor.id}/${analysisExecutor.model} failed at chunk-${i}.`, {
+          cause: err,
+        });
+      }
       return `[Failed to summarize middle segment ${i + 1}]`;
     }
   });
@@ -244,6 +262,11 @@ export async function runPremiumCompaction(
       return parseJsonOutput<PinnedFacts>(raw);
     } catch (err) {
       log(`  [pinned-${i}] extraction failed: ${(err as Error).message}`);
+      if (failClosed) {
+        throw new Error(`Bulk analysis ${analysisExecutor.id}/${analysisExecutor.model} failed at pinned-${i}.`, {
+          cause: err,
+        });
+      }
       return { corrections: [], constraints: [], decisions: [], openTodos: [], activePaths: [], rules: [] } satisfies PinnedFacts;
     }
   });
@@ -269,7 +292,8 @@ export async function runPremiumCompaction(
   const dropNote = 
     `## Premium Compaction Note\n` +
     `- Kept first 10% of conversation verbatim (${head.length} events) as head.\n` +
-    `- Summarized middle section into ${chunks.length} segments using Gemini.\n` +
+    `- Summarized middle section into ${chunks.length} segments using ` +
+      `${analysisExecutor.displayName} · ${analysisExecutor.model}.\n` +
     `- Kept last 20% of conversation verbatim (${tail.length} events) as tail.\n` +
     `- Pinned ${pinnedCount} verbatim constraint(s)/correction(s)/rule(s)/path(s).`;
 
@@ -284,6 +308,7 @@ export async function runPremiumCompaction(
     summaryMarkdown,
     pinnedFacts,
     assembledSeed,
+    analysisExecutor,
     stats: {
       chunks: chunks.length,
     },

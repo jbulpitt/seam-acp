@@ -49,6 +49,7 @@ Copy `.env.example` to `.env` and fill it in.
 | `MODEL_VALUE_STD_OUTPUT_TOKENS` | no | Fixed output-token count for model-value cost comparisons. Default `2000`. |
 | `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam config agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
 | `AGY_CLI_PATH` | no | If `agy` is not on `PATH` (checks `~/.local/bin/agy` first) |
+| `AGY_COMPACTION_MODEL` | no | Fixed to `gemini-3.8-flash-high` for every Premium Compact (Discord) bulk-analysis call. Deployments carrying the older override must replace it before restart; the value is a public model slug, not a secret. |
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
 | `CLAUDE_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `claude-<id>` profile pinned to its own `CLAUDE_CONFIG_DIR`. See "Multiple Claude accounts" below. |

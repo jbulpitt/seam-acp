@@ -46,6 +46,14 @@ import type {
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
 import { cleanTextForPreview, pickerModelsForProfile, scanWorkspaces, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
 import { readRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
+import { MessageReader } from "../../core/message-reader.js";
+import {
+  ReconstructionUnavailableError,
+  assembleReconstruction,
+  projectDiscordConversation,
+  reconstructionBudgetTokens,
+  resolveDestinationContextWindow,
+} from "../../core/reconstruction/index.js";
 import { analyzeSessionCoverage, detectGaps, type TimeRange, type GapReport } from "../../core/compaction/gap-detector.js";
 import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
 import {
@@ -573,7 +581,7 @@ function stripMarkdownEmphasis(text: string): string {
 }
 
 /** The session-browser jobs that can outlive their card (#179). */
-export type CardFallbackKind = "compaction" | "rebuild" | "summary" | "migration" | "import";
+export type CardFallbackKind = "compaction" | "rebuild" | "compact_thread" | "summary" | "migration" | "import";
 
 /**
  * The ONLY sentences a dead-token fallback may put in the thread (#179).
@@ -606,8 +614,12 @@ export const CARD_FALLBACK_TEXT: Record<CardFallbackKind, { ok: string; failed: 
     failed: "🗳️ Your compaction failed, and the session browser expired before the error could be shown. Nothing was changed; check the bot logs for details.",
   },
   rebuild: {
-    ok: "🏗️ Your session rebuild finished, but the session browser expired before it could be shown. Run `/seam info sessions` to see the result.",
-    failed: "🏗️ Your session rebuild failed, and the session browser expired before the error could be shown. Nothing was changed; check the bot logs for details.",
+    ok: "🏗️ Your Rebuild finished, but the session browser expired before it could be shown. Run `/seam info sessions` to see the result.",
+    failed: "🏗️ Your Rebuild failed, and the session browser expired before the error could be shown. Nothing was changed; check the bot logs for details.",
+  },
+  compact_thread: {
+    ok: "🧵 Compact from Thread finished, but the session browser expired before it could be shown. Run `/seam info sessions` to see the result.",
+    failed: "🧵 Compact from Thread failed, and the session browser expired before the error could be shown. Nothing was changed; check the bot logs for details.",
   },
   summary: {
     ok: "🪄 Your AI summary finished, but the session browser expired before it could be shown.",
@@ -2606,8 +2618,8 @@ export class Orchestrator {
    *     a schedule-status patch to write;
    *   - tracked post-turn continuations — the fire-and-forget work that runs
    *     after a turn is released and is therefore invisible to the turn set;
-   *   - tracked CARD jobs (#179) — a premium compaction, rebuild, AI summary,
-   *     migration or import launched from an interactive card. These outlive
+   *   - tracked CARD jobs (#179) — a premium compaction, Rebuild, Compact from
+   *     Thread, AI summary, migration or import launched from an interactive card. These outlive
    *     their click handler by minutes and belong to none of the sets above.
    *
    * Runs to a real fixpoint over all four: settling one can create another (a
@@ -4435,6 +4447,8 @@ export class Orchestrator {
         return this.cmdWorkflows(interaction);
       case "rebuild":
         return this.cmdRebuild(interaction);
+      case "compact-thread":
+        return this.cmdCompactThread(interaction);
       case "recover":
         return this.cmdRecover(interaction);
       default:
@@ -5242,6 +5256,8 @@ export class Orchestrator {
     model?: string;
     effort?: string;
     summary: string;
+    /** `null` = seed text is already complete (Rebuild). Omit for compaction lead-in. */
+    leadIn?: string | null;
   }): Promise<string> {
     const { profile, cwd, model, effort, summary } = args;
     let rt: AgentRuntime | undefined;
@@ -5249,9 +5265,12 @@ export class Orchestrator {
       rt = new AgentRuntime({ profile, logger: this.logger.child({ compaction: "seed" }), mcpServers: [] });
       await rt.start();
       const info = await rt.newSession({ cwd, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
-      const prompt =
-        "[Loading prior-session context after compaction — read the summary below, reply with a one-line acknowledgement, then await the next instruction. Do not begin work yet.]\n\n" +
-        summary;
+      const leadIn =
+        args.leadIn === null
+          ? ""
+          : (args.leadIn ??
+            "[Loading prior-session context after compaction — read the summary below, reply with a one-line acknowledgement, then await the next instruction. Do not begin work yet.]");
+      const prompt = leadIn ? `${leadIn}\n\n${summary}` : summary;
       await rt.prompt(prompt);
       // Brief pause so Claude Code finishes flushing the new session's JSONL
       // before we tear down (the turn is the only content; it must land on disk).
@@ -14750,7 +14769,7 @@ export class Orchestrator {
     await i.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 
-  private async rebuildSessionFromThread(
+  private async compactSessionFromThread(
     channelRef: { platform: string; id: string },
     record: SessionRecord
   ): Promise<{ newSessionId: string; summary: string }> {
@@ -14791,10 +14810,10 @@ export class Orchestrator {
 
       const compactionModel = this.compactionModelFor(record.agentId);
       if (!compactionModel) {
-        throw new Error(`Rebuild is not supported for agent profile \`${record.agentId}\``);
+        throw new Error(`Compact from Thread is not supported for agent profile \`${record.agentId}\``);
       }
       const promptTemplate = await fsp.readFile("/home/ubuntu/Projects/compact.md", "utf8");
-      const rebuildAddendum =
+      const compactAddendum =
         "\n\nIMPORTANT: This is a full thread reconstruction from Discord history. " +
         "The transcript below contains the ENTIRE conversation. You MUST cover " +
         "the full conversation from start to finish in your summary. Give " +
@@ -14803,7 +14822,7 @@ export class Orchestrator {
         "Do NOT spend excessive detail on early/introductory messages at the " +
         "expense of recent ones. If the analysis section is getting very long, " +
         "abbreviate the early parts and expand on the latest work.\n";
-      const fullTemplate = promptTemplate + rebuildAddendum;
+      const fullTemplate = promptTemplate + compactAddendum;
       const templateOverhead = fullTemplate.length + "\n\nConversation Transcript:\n".length;
       sanitizedTranscript = fitTranscriptToWindow(
         sanitizedTranscript,
@@ -14817,12 +14836,12 @@ export class Orchestrator {
           transcriptChars: sanitizedTranscript.length,
           model: compactionModel,
         },
-        "rebuild: transcript assembled"
+        "compact-thread: transcript assembled"
       );
 
       transcriptFile = path.join(
         cwd,
-        `.rebuild-transcript-${channelRef.id}-${Date.now()}.txt`
+        `.compact-thread-transcript-${channelRef.id}-${Date.now()}.txt`
       );
       await fsp.writeFile(transcriptFile, sanitizedTranscript, "utf8");
       const compactionPrompt =
@@ -14834,7 +14853,7 @@ export class Orchestrator {
 
       tempRuntime = new AgentRuntime({
         profile,
-        logger: this.logger.child({ session: `temp-rebuild-${channelRef.id}` }),
+        logger: this.logger.child({ session: `temp-compact-thread-${channelRef.id}` }),
         mcpServers: [],
       });
       await tempRuntime.start();
@@ -14924,10 +14943,111 @@ export class Orchestrator {
 
     const freshRecord = this.store.get(record.id);
     if (!freshRecord) throw new Error(`Session record \`${record.id}\` disappeared during migration.`);
-    return this.rebuildSessionFromThread(
+    return this.compactSessionFromThread(
       { platform: channel.platform, id: channel.id },
       freshRecord
     );
+  }
+
+  private async reconstructSessionFromDiscord(args: {
+    record: SessionRecord;
+    channel: ChannelRef;
+    observedAtStart: string;
+    attachIntent: AttachIntent;
+    onProgress?: (msg: string) => void;
+  }): Promise<{
+    newSessionId: string;
+    attachment: AttachOutcome;
+    seed: ReturnType<typeof assembleReconstruction>;
+  }> {
+    const { record, channel, observedAtStart, attachIntent, onProgress } = args;
+    const log = (m: string) => {
+      onProgress?.(m);
+      this.logger.info({ rebuild: channel.id }, m);
+    };
+
+    const profile = this.router.getProfile(record.agentId);
+    if (!profile) throw new ReconstructionUnavailableError(`Agent profile "${record.agentId}" not found.`);
+    const seamBotId = this.adapter.getBotUserId?.();
+    if (!seamBotId) {
+      throw new ReconstructionUnavailableError("Rebuild cannot identify the Seam bot user id.");
+    }
+    if (typeof this.adapter.fetchMessagePage !== "function") {
+      throw new ReconstructionUnavailableError("Chat adapter does not support paged thread history.");
+    }
+
+    const cfg = this.store.readConfig(record);
+    const destinationModel = cfg.model || profile.defaultModel;
+    const staticLookup =
+      !destinationModel || destinationModel === "default" ? profile.defaultModel : destinationModel;
+    const staticContextLimit = profile.staticModels?.find((m) => m.modelId === staticLookup)?.contextLimit;
+    const contextWindow = resolveDestinationContextWindow({
+      destinationModel,
+      lastContextUsage: cfg.lastContextUsage,
+      ...(staticContextLimit ? { staticContextLimit } : {}),
+    });
+    const budgetTokens = reconstructionBudgetTokens(contextWindow);
+    log(`destination ${profile.id} · ${destinationModel} · window ${contextWindow} · 60% budget ${budgetTokens}`);
+
+    const reader = new MessageReader(
+      { fetchMessagePage: (threadId, request) => this.adapter.fetchMessagePage!(threadId, request) },
+      { logger: this.logger, interPageDelayMs: 180 }
+    );
+    const walked = await reader.walkThread(channel.id, { maxPages: 500 });
+    if (walked.truncated) {
+      throw new ReconstructionUnavailableError(
+        "Rebuild stopped: Discord history exceeded the page cap before the thread was exhausted."
+      );
+    }
+    log(`fetched ${walked.messages.length} Discord post(s)`);
+
+    const logical = projectDiscordConversation(walked.messages, { seamBotId });
+    if (logical.length === 0) {
+      throw new ReconstructionUnavailableError("No reconstructable Discord messages remain after filtering.");
+    }
+
+    const channelRider = channel.parentId
+      ? this.config.channelPresets.get(channel.parentId)?.rider?.value
+      : undefined;
+    const threadRider = this.config.threadPresets.get(channel.id)?.rider?.value;
+    const riders = {
+      ...(channelRider ? { channel: channelRider } : {}),
+      ...(threadRider ? { thread: threadRider } : {}),
+    };
+    const seed = assembleReconstruction({
+      messages: logical,
+      contextWindow,
+      budgetTokens,
+      sourcePostCount: logical.reduce((n, message) => n + message.sourcePostIds.length, 0),
+      ...(channelRider || threadRider ? { riders } : {}),
+      onNormalizeError: ({ messageId }) => {
+        this.logger.warn(
+          { rebuild: channel.id, messageId },
+          "reconstruction normalize failed; using uncompressed message"
+        );
+      },
+    });
+    log(
+      `projected ${seed.projectedLogicalCount} logical · retained ${seed.retainedLogicalCount} · omitted ${seed.omittedLogicalCount} · ~${seed.estimatedTokens} tokens`
+    );
+
+    const cwd = record.repoPath ?? this.config.REPOS_ROOT;
+    const newSessionId = await this.seedNewSession({
+      profile,
+      cwd,
+      ...(cfg.model ? { model: cfg.model } : {}),
+      ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
+      summary: seed.text,
+      leadIn: null,
+    });
+    const attachment = await this.attachCompactedSession({
+      record,
+      sourceId: observedAtStart,
+      newId: newSessionId,
+      observedAtStart,
+      intent: attachIntent,
+    });
+    return { newSessionId, attachment, seed };
   }
 
   private async cmdRebuild(i: ChatInputCommandInteraction): Promise<void> {
@@ -14942,10 +15062,50 @@ export class Orchestrator {
       await i.reply({ content: "No session record is bound to this thread.", flags: MessageFlags.Ephemeral });
       return;
     }
+    const observedAtStart = record.acpSessionId;
+    const destModel = this.store.readConfig(record).model || this.router.getProfile(record.agentId)?.defaultModel || "default";
+    await i.reply({ content: "🏗️ Rebuilding from Discord (deterministic, no summarizer)…", flags: MessageFlags.Ephemeral });
+    try {
+      const result = await this.reconstructSessionFromDiscord({
+        record,
+        channel,
+        observedAtStart,
+        attachIntent: "attach",
+      });
+      const seed = result.seed;
+      await i.editReply(
+        `🏗️ Rebuild complete.\n` +
+          `New session: \`${result.newSessionId}\`\n` +
+          `Destination: \`${record.agentId}\` · \`${destModel}\` · window ${seed.contextWindow}\n` +
+          `Discord posts: ${seed.sourcePostCount} → logical ${seed.projectedLogicalCount}\n` +
+          `Retained ${seed.retainedLogicalCount}, omitted ${seed.omittedLogicalCount}\n` +
+          `Estimated seed tokens: ${seed.estimatedTokens} / ${seed.budgetTokens} (60% budget)` +
+          (seed.transformSavedTokens ? `\nConservative normalization saved ~${seed.transformSavedTokens} tokens` : "") +
+          `\n${describeAttachOutcome(result.attachment, { newId: result.newSessionId, sourceId: observedAtStart })}`
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error({ err, channelId: channel.id }, "slash rebuild failed");
+      await i.editReply(`❌ Rebuild failed: ${message}`);
+    }
+  }
+
+  private async cmdCompactThread(i: ChatInputCommandInteraction): Promise<void> {
+    const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+    if (admins && admins.size > 0 && !admins.has(i.user.id)) {
+      await i.reply({ content: "🔒 `/seamadmin compact-thread` is admin-only.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const channel = this.channelRefFromInteraction(i);
+    const record = channel ? this.store.getByChannel(channel.platform, channel.id) : null;
+    if (!channel || !record) {
+      await i.reply({ content: "No session record is bound to this thread.", flags: MessageFlags.Ephemeral });
+      return;
+    }
 
     const agentOption = i.options.getString("agent");
     const modelOption = i.options.getString("model");
-    await i.reply({ content: "🏗️ Rebuilding…", flags: MessageFlags.Ephemeral });
+    await i.reply({ content: "🧵 Compacting from thread…", flags: MessageFlags.Ephemeral });
     try {
       let result: { newSessionId: string; summary: string };
       if (agentOption !== null || modelOption !== null) {
@@ -14957,16 +15117,16 @@ export class Orchestrator {
         if (!model) throw new Error("Target model must be a non-empty string.");
         result = await this.migrateThreadAgentModelAndRebuild(channel, record, agentId, model);
       } else {
-        result = await this.rebuildSessionFromThread(channel, record);
+        result = await this.compactSessionFromThread(channel, record);
       }
       const preview = result.summary.trim().slice(0, 1200);
       await i.editReply(
-        `🏗️ Session rebuilt successfully.\nNew session: \`${result.newSessionId}\`\n\n**Summary:**\n${preview}${result.summary.trim().length > 1200 ? "…" : ""}`
+        `🧵 Compact from Thread complete.\nNew session: \`${result.newSessionId}\`\n\n**Summary:**\n${preview}${result.summary.trim().length > 1200 ? "…" : ""}`
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      this.logger.error({ err, channelId: channel.id }, "slash rebuild failed");
-      await i.editReply(`❌ Rebuild failed: ${message}`);
+      this.logger.error({ err, channelId: channel.id }, "slash compact-thread failed");
+      await i.editReply(`❌ Compact from Thread failed: ${message}`);
     }
   }
 
@@ -15101,10 +15261,14 @@ export class Orchestrator {
 
         const rebuildBtn = new ButtonBuilder()
           .setCustomId("sessions:rebuild")
-          .setLabel("🏗️ Rebuild from Thread")
+          .setLabel("🏗️ Rebuild")
+          .setStyle(ButtonStyle.Primary);
+        const compactThreadBtn = new ButtonBuilder()
+          .setCustomId("sessions:compact_thread")
+          .setLabel("🧵 Compact from Thread")
           .setStyle(ButtonStyle.Primary);
 
-        const row = new ActionRowBuilder<ButtonBuilder>().addComponents(rebuildBtn);
+        const row = new ActionRowBuilder<ButtonBuilder>().addComponents(rebuildBtn, compactThreadBtn);
 
         return {
           content: "",
@@ -15230,16 +15394,18 @@ export class Orchestrator {
         );
       }
 
-      const rebuildBtn = new ButtonBuilder()
-        .setCustomId("sessions:rebuild")
-        .setLabel("🏗️ Rebuild from Thread")
-        .setStyle(ButtonStyle.Primary);
-
-      row3Buttons.push(rebuildBtn);
-
       const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(row3Buttons);
 
-      const row4Buttons: ButtonBuilder[] = [];
+      const row4Buttons: ButtonBuilder[] = [
+        new ButtonBuilder()
+          .setCustomId("sessions:rebuild")
+          .setLabel("🏗️ Rebuild")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId("sessions:compact_thread")
+          .setLabel("🧵 Compact from Thread")
+          .setStyle(ButtonStyle.Secondary),
+      ];
       if (canCompact) {
         row4Buttons.push(
           new ButtonBuilder()
@@ -15718,12 +15884,13 @@ export class Orchestrator {
           }
         }
       } else if (customId === "sessions:rebuild") {
+        const observedAtStart = activeSessionId();
         await btnInteraction.deferUpdate();
-        await btnInteraction.editReply({
+        await lifecycle.refresh({
           embeds: [
             new EmbedBuilder()
-              .setTitle("🏗️ Rebuilding Session...")
-              .setDescription(`Fetching historical messages from this Discord thread to reconstruct a premium summary...`)
+              .setTitle("🏗️ Rebuild")
+              .setDescription("Deterministic Discord reconstruction (no summarizer). One destination seed turn.")
               .setColor(0xe67e22)
           ],
           components: [],
@@ -15731,27 +15898,39 @@ export class Orchestrator {
 
         this.runCardJob(async () => {
           try {
-            const channelRef = { platform: "discord", id: i.channelId };
-            const { newSessionId, summary } = await this.rebuildSessionFromThread(
-              channelRef,
-              record
-            );
-
-            // Refresh sessions list
+            const channelRef: ChannelRef = {
+              platform: "discord",
+              id: i.channelId,
+              ...(record.parentRef ? { parentId: record.parentRef } : {}),
+            };
+            const { newSessionId, attachment, seed } = await this.reconstructSessionFromDiscord({
+              record,
+              channel: channelRef,
+              observedAtStart,
+              attachIntent: "attach",
+            });
             sessions = await manager.listSessions(cwd);
-            const newIndex = sessions.findIndex(s => s.sessionId === newSessionId);
-            if (newIndex !== -1) {
-              currentIndex = newIndex;
-            }
-
+            const newIndex = sessions.findIndex((s) => s.sessionId === newSessionId);
+            if (newIndex !== -1) currentIndex = newIndex;
+            const attachLine = describeAttachOutcome(attachment, {
+              newId: newSessionId,
+              sourceId: observedAtStart,
+            });
+            const destModel =
+              this.store.readConfig(record).model ||
+              this.router.getProfile(record.agentId)?.defaultModel ||
+              "default";
             const successEmbed = new EmbedBuilder()
-              .setTitle("🏗️ Session Rebuilt Successfully!")
-              .setDescription(`Thread has been reconstructed from Discord history.\n\n**New Session ID:** \`${newSessionId}\`\n\n**Summary:**\n${summary.substring(0, 1500)}${summary.length > 1500 ? "..." : ""}`)
-              .setColor(0x2ecc71);
-
-            // #179: same rule as the compaction buttons — a rebuild is a long
-            // unawaited job on this card, so its result must go through the
-            // lifecycle or it repaints a Close button onto an expired card.
+              .setTitle("🏗️ Rebuild complete")
+              .setDescription(
+                `Destination: \`${record.agentId}\` · \`${destModel}\` · window ${seed.contextWindow}\n` +
+                  `Discord posts ${seed.sourcePostCount} → logical ${seed.projectedLogicalCount}\n` +
+                  `Retained ${seed.retainedLogicalCount}, omitted ${seed.omittedLogicalCount}\n` +
+                  `Estimated seed tokens ${seed.estimatedTokens} / ${seed.budgetTokens} (60% budget)` +
+                  (seed.transformSavedTokens ? `\nNormalization saved ~${seed.transformSavedTokens} tokens` : "") +
+                  `\nNew session: \`${newSessionId}\`\n${attachLine}`
+              )
+              .setColor(attachment.attached ? 0x2ecc71 : 0xf1c40f);
             await this.settleLongJobCard({
               lifecycle,
               view: {
@@ -15770,17 +15949,71 @@ export class Orchestrator {
             });
           } catch (err: any) {
             this.logger.error({ err, channelId: i.channelId }, "failed to rebuild session");
-
             const errorEmbed = new EmbedBuilder()
               .setTitle("❌ Rebuild Failed")
               .setDescription(`An error occurred while reconstructing the session:\n\`\`\`\n${err.message}\n\`\`\``)
               .setColor(0xe74c3c);
-
             await this.settleLongJobCard({
               lifecycle,
               view: { embeds: [errorEmbed], components: [backRow()] },
               channel: browserChannel ?? null,
               fallback: { kind: "rebuild", outcome: "failed" },
+            });
+          }
+        });
+      } else if (customId === "sessions:compact_thread") {
+        await btnInteraction.deferUpdate();
+        await lifecycle.refresh({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle("🧵 Compact from Thread")
+              .setDescription("Fetching Discord history and asking the destination model for a summary…")
+              .setColor(0xe67e22)
+          ],
+          components: [],
+        });
+
+        this.runCardJob(async () => {
+          try {
+            const channelRef = { platform: "discord", id: i.channelId };
+            const { newSessionId, summary } = await this.compactSessionFromThread(
+              channelRef,
+              record
+            );
+            sessions = await manager.listSessions(cwd);
+            const newIndex = sessions.findIndex(s => s.sessionId === newSessionId);
+            if (newIndex !== -1) currentIndex = newIndex;
+            const successEmbed = new EmbedBuilder()
+              .setTitle("🧵 Compact from Thread complete")
+              .setDescription(`Thread was summarized from Discord history.\n\n**New Session ID:** \`${newSessionId}\`\n\n**Summary:**\n${summary.substring(0, 1500)}${summary.length > 1500 ? "..." : ""}`)
+              .setColor(0x2ecc71);
+            await this.settleLongJobCard({
+              lifecycle,
+              view: {
+                embeds: [successEmbed],
+                components: [
+                  new ActionRowBuilder<ButtonBuilder>().addComponents(
+                    new ButtonBuilder()
+                      .setCustomId("sessions:close")
+                      .setLabel("Close")
+                      .setStyle(ButtonStyle.Secondary)
+                  ),
+                ],
+              },
+              channel: browserChannel ?? null,
+              fallback: { kind: "compact_thread", outcome: "ok" },
+            });
+          } catch (err: any) {
+            this.logger.error({ err, channelId: i.channelId }, "failed to compact from thread");
+            const errorEmbed = new EmbedBuilder()
+              .setTitle("❌ Compact from Thread failed")
+              .setDescription(`An error occurred while compacting from Discord history:\n\`\`\`\n${err.message}\n\`\`\``)
+              .setColor(0xe74c3c);
+            await this.settleLongJobCard({
+              lifecycle,
+              view: { embeds: [errorEmbed], components: [backRow()] },
+              channel: browserChannel ?? null,
+              fallback: { kind: "compact_thread", outcome: "failed" },
             });
           }
         });

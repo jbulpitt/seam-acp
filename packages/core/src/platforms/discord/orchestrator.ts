@@ -53,6 +53,11 @@ import {
   projectDiscordConversation,
   resolveContextWindow,
 } from "../../core/reconstruction/index.js";
+import {
+  RebuildCardSession,
+  firstErrorLine,
+  type RebuildSuccessStats,
+} from "../../core/rebuild-card.js";
 import { analyzeSessionCoverage, detectGaps, type TimeRange, type GapReport } from "../../core/compaction/gap-detector.js";
 import { runPremiumCompaction, type PremiumCompactionResult, type RunAgent } from "../../core/compaction/pipeline.js";
 import {
@@ -15082,6 +15087,15 @@ export class Orchestrator {
       throw new ReconstructionUnavailableError("Chat adapter does not support paged thread history.");
     }
 
+    const cardStyle = statusCardStyleForRender(described);
+    const card = new RebuildCardSession<MessageRef>(cardStyle, {
+      post: (panel) => this.postRebuildPanel(channel, panel),
+      edit: (ref, panel) => this.editRebuildPanel(ref, panel),
+    }, {
+      debounceMs: STATUS_EDIT_DEBOUNCE_MS,
+      heartbeatMs: STATUS_HEARTBEAT_MS,
+    });
+
     const cfg = this.store.readConfig(record);
     const destinationModel = described.model.value;
     const adapterModels =
@@ -15115,72 +15129,135 @@ export class Orchestrator {
     });
     const contextWindow = resolved.window;
     const budgetTokens = resolved.budgetTokens;
-    log(`destination ${profile.id} · ${destinationModel} · window ${contextWindow} · 60% budget ${budgetTokens}`);
-
-    const reader = new MessageReader(
-      { fetchMessagePage: (threadId, request) => this.adapter.fetchMessagePage!(threadId, request) },
-      { logger: this.logger, interPageDelayMs: 180 }
-    );
-    const walked = await reader.walkThread(channel.id, { maxPages: 500 });
-    if (walked.truncated) {
-      throw new ReconstructionUnavailableError(
-        "Rebuild stopped: Discord history exceeded the page cap before the thread was exhausted."
-      );
-    }
-    log(`fetched ${walked.messages.length} Discord post(s)`);
-
-    const logical = projectDiscordConversation(walked.messages, { seamBotId });
-    if (logical.length === 0) {
-      throw new ReconstructionUnavailableError("No reconstructable Discord messages remain after filtering.");
-    }
-
-    const channelRider = channel.parentId
-      ? this.config.channelPresets.get(channel.parentId)?.rider?.value
-      : undefined;
-    const threadRider = this.config.threadPresets.get(channel.id)?.rider?.value;
-    const riders = {
-      ...(channelRider ? { channel: channelRider } : {}),
-      ...(threadRider ? { thread: threadRider } : {}),
-    };
-    const seed = assembleReconstruction({
-      messages: logical,
+    const destDetails = {
+      agentId: profile.id,
+      model: destinationModel,
       contextWindow,
       budgetTokens,
-      sourcePostCount: logical.reduce((n, message) => n + message.sourcePostIds.length, 0),
-      ...(channelRider || threadRider ? { riders } : {}),
-      onNormalizeError: ({ messageId }) => {
-        this.logger.warn(
-          { rebuild: channel.id, messageId },
-          "reconstruction normalize failed; using uncompressed message"
-        );
-      },
-    });
-    log(
-      `projected ${seed.projectedLogicalCount} logical · retained ${seed.retainedLogicalCount} · omitted ${seed.omittedLogicalCount} · ~${seed.estimatedTokens} tokens`
-    );
-
-    const cwd = described.cwd.value;
-    const newSessionId = await this.seedNewSession({
-      profile,
-      cwd,
-      ...(destinationModel ? { model: destinationModel } : {}),
-      ...(described.effort?.value ? { effort: described.effort.value } : {}),
-      summary: seed.text,
-      leadIn: null,
-    });
-    const attachment = await this.attachCompactedSession({
-      record,
-      sourceId: observedAtStart,
-      newId: newSessionId,
-      observedAtStart,
-      intent: attachIntent,
-    });
-    return {
-      newSessionId,
-      attachment,
-      seed,
-      destination: { agentId, model: destinationModel, contextWindow },
     };
+    log(`destination ${profile.id} · ${destinationModel} · window ${contextWindow} · 60% budget ${budgetTokens}`);
+
+    try {
+      await card.start(destDetails);
+      await card.setStage("fetching");
+
+      const reader = new MessageReader(
+        { fetchMessagePage: (threadId, request) => this.adapter.fetchMessagePage!(threadId, request) },
+        { logger: this.logger, interPageDelayMs: 180 }
+      );
+      const walked = await reader.walkThread(channel.id, { maxPages: 500 });
+      if (walked.truncated) {
+        throw new ReconstructionUnavailableError(
+          "Rebuild stopped: Discord history exceeded the page cap before the thread was exhausted."
+        );
+      }
+      log(`fetched ${walked.messages.length} Discord post(s)`);
+      await card.setStage("fetching", { discordPosts: walked.messages.length });
+
+      const logical = projectDiscordConversation(walked.messages, { seamBotId });
+      if (logical.length === 0) {
+        throw new ReconstructionUnavailableError("No reconstructable Discord messages remain after filtering.");
+      }
+
+      const channelRider = channel.parentId
+        ? this.config.channelPresets.get(channel.parentId)?.rider?.value
+        : undefined;
+      const threadRider = this.config.threadPresets.get(channel.id)?.rider?.value;
+      const riders = {
+        ...(channelRider ? { channel: channelRider } : {}),
+        ...(threadRider ? { thread: threadRider } : {}),
+      };
+      const seed = assembleReconstruction({
+        messages: logical,
+        contextWindow,
+        budgetTokens,
+        sourcePostCount: logical.reduce((n, message) => n + message.sourcePostIds.length, 0),
+        ...(channelRider || threadRider ? { riders } : {}),
+        onNormalizeError: ({ messageId }) => {
+          this.logger.warn(
+            { rebuild: channel.id, messageId },
+            "reconstruction normalize failed; using uncompressed message"
+          );
+        },
+      });
+      log(
+        `projected ${seed.projectedLogicalCount} logical · retained ${seed.retainedLogicalCount} · omitted ${seed.omittedLogicalCount} · ~${seed.estimatedTokens} tokens`
+      );
+      await card.setStage("assembled", {
+        discordPosts: walked.messages.length,
+        projectedLogicalCount: seed.projectedLogicalCount,
+        retainedLogicalCount: seed.retainedLogicalCount,
+        omittedLogicalCount: seed.omittedLogicalCount,
+        estimatedTokens: seed.estimatedTokens,
+      });
+
+      await card.setStage("seeding");
+      const cwd = described.cwd.value;
+      const newSessionId = await this.seedNewSession({
+        profile,
+        cwd,
+        ...(destinationModel ? { model: destinationModel } : {}),
+        ...(described.effort?.value ? { effort: described.effort.value } : {}),
+        summary: seed.text,
+        leadIn: null,
+      });
+      await card.setStage("attaching");
+      const attachment = await this.attachCompactedSession({
+        record,
+        sourceId: observedAtStart,
+        newId: newSessionId,
+        observedAtStart,
+        intent: attachIntent,
+      });
+      const stats: RebuildSuccessStats = {
+        agentId: profile.id,
+        model: destinationModel,
+        contextWindow,
+        sourcePostCount: seed.sourcePostCount,
+        projectedLogicalCount: seed.projectedLogicalCount,
+        retainedLogicalCount: seed.retainedLogicalCount,
+        omittedLogicalCount: seed.omittedLogicalCount,
+        estimatedTokens: seed.estimatedTokens,
+        budgetTokens: seed.budgetTokens,
+        ...(seed.transformSavedTokens ? { transformSavedTokens: seed.transformSavedTokens } : {}),
+        newSessionId,
+        attachLine: describeAttachOutcome(attachment, { newId: newSessionId, sourceId: observedAtStart }),
+      };
+      await card.succeed(stats);
+      return {
+        newSessionId,
+        attachment,
+        seed,
+        destination: { agentId, model: destinationModel, contextWindow },
+      };
+    } catch (err) {
+      await card.fail(firstErrorLine(err));
+      throw err;
+    } finally {
+      card.dispose();
+    }
+  }
+
+  private async postRebuildPanel(
+    channel: ChannelRef,
+    panel: StructuredPanel
+  ): Promise<MessageRef | undefined> {
+    try {
+      if (this.adapter.sendPanel) return await this.adapter.sendPanel(channel, panel);
+      return await this.adapter.sendMessage(channel, serializePanelText(panel));
+    } catch (err) {
+      this.logger.warn({ err, channel: channel.id }, "rebuild card post failed");
+      return undefined;
+    }
+  }
+
+  private async editRebuildPanel(ref: MessageRef, panel: StructuredPanel): Promise<void> {
+    try {
+      if (this.adapter.editPanel) await this.adapter.editPanel(ref, panel);
+      else await this.adapter.editMessage(ref, serializePanelText(panel));
+    } catch (err) {
+      this.logger.warn({ err, channel: ref.channel.id }, "rebuild card edit failed");
+    }
   }
 
   private async cmdRebuild(i: ChatInputCommandInteraction): Promise<void> {
@@ -15196,29 +15273,19 @@ export class Orchestrator {
       return;
     }
     const observedAtStart = record.acpSessionId;
-    await i.reply({ content: "🏗️ Rebuilding from Discord (deterministic, no summarizer)…", flags: MessageFlags.Ephemeral });
+    await i.reply({
+      content: "Rebuild is running in this thread.",
+      flags: MessageFlags.Ephemeral,
+    });
     try {
-      const result = await this.reconstructSessionFromDiscord({
+      await this.reconstructSessionFromDiscord({
         record,
         channel,
         observedAtStart,
         attachIntent: "attach",
       });
-      const seed = result.seed;
-      await i.editReply(
-        `🏗️ Rebuild complete.\n` +
-          `New session: \`${result.newSessionId}\`\n` +
-          `Destination: \`${result.destination.agentId}\` · \`${result.destination.model}\` · window ${result.destination.contextWindow}\n` +
-          `Discord posts: ${seed.sourcePostCount} → logical ${seed.projectedLogicalCount}\n` +
-          `Retained ${seed.retainedLogicalCount}, omitted ${seed.omittedLogicalCount}\n` +
-          `Estimated seed tokens: ${seed.estimatedTokens} / ${seed.budgetTokens} (60% budget)` +
-          (seed.transformSavedTokens ? `\nConservative normalization saved ~${seed.transformSavedTokens} tokens` : "") +
-          `\n${describeAttachOutcome(result.attachment, { newId: result.newSessionId, sourceId: observedAtStart })}`
-      );
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
       this.logger.error({ err, channelId: channel.id }, "slash rebuild failed");
-      await i.editReply(`❌ Rebuild failed: ${message}`);
     }
   }
 

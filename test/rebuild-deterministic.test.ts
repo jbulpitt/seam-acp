@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -61,6 +61,7 @@ function makeOrch(over?: {
   const compactCalls: string[] = [];
   const describeCalls: SessionRecord[] = [];
   const fetchCalls: number[] = [];
+  const panels: Array<{ title?: string; description?: string; footer?: string; fields: unknown[] }> = [];
   const posts = over?.posts ?? [
     post("1", "hello"),
     post("2", "hi there", { authorType: "bot" }),
@@ -98,6 +99,13 @@ function makeOrch(over?: {
           return Array.from({ length: 100 }, (_, i) => post(String(i + 1), `page-item ${i + 1}`));
         }
         return posts;
+      },
+      sendPanel: async (_ch: unknown, panel: unknown) => {
+        panels.push(panel as { title?: string; description?: string; footer?: string; fields: unknown[] });
+        return { id: `rebuild-card-${panels.length}`, channel: { platform: "discord", id: "thread-r" } };
+      },
+      editPanel: async (_ref: unknown, panel: unknown) => {
+        panels.push(panel as { title?: string; description?: string; footer?: string; fields: unknown[] });
       },
     } as any,
     router: {
@@ -151,7 +159,7 @@ function makeOrch(over?: {
     if (over?.seedError) throw over.seedError;
     return "sess-new";
   };
-  return { orch, rec, seedCalls, injectCalls, casCalls, bound, compactCalls, describeCalls, fetchCalls };
+  return { orch, rec, seedCalls, injectCalls, casCalls, bound, compactCalls, describeCalls, fetchCalls, panels };
 }
 
 describe("reconstructSessionFromDiscord", () => {
@@ -475,4 +483,99 @@ describe("reconstructSessionFromDiscord", () => {
     expect(t.seedCalls).toHaveLength(0);
     expect(t.fetchCalls).toHaveLength(0);
   });
+
+  it("posts a full Rebuild card, edits through stages, and freezes success", async () => {
+    const t = makeOrch();
+    const res = await (t.orch as any).reconstructSessionFromDiscord({
+      record: t.rec,
+      channel: { platform: "discord", id: "thread-r", parentId: "parent-r" },
+      observedAtStart: "acp-active",
+      attachIntent: "attach",
+    });
+    expect(res.newSessionId).toBe("sess-new");
+    const titles = t.panels.map((p) => p.title);
+    expect(titles[0]).toBe("Rebuild");
+    expect(titles.at(-1)).toBe("Rebuild complete");
+    const blobs = t.panels.map((p) => `${p.title ?? ""} ${p.description ?? ""}`);
+    expect(blobs.some((b) => /Fetching Discord history|Fetched \d+ Discord post/.test(b))).toBe(true);
+    expect(blobs.some((b) => /projected \d+ logical/.test(b))).toBe(true);
+    expect(blobs.some((b) => b.includes("Seeding new session"))).toBe(true);
+    expect(blobs.some((b) => /\bAttaching\b/.test(b))).toBe(true);
+    const frozen = t.panels.at(-1)!;
+    expect(frozen.fields).toEqual(expect.any(Array));
+    const frozenBlob = `${frozen.title} ${frozen.description ?? ""} ${JSON.stringify(frozen.fields)}`;
+    expect(frozenBlob).toContain("sess-new");
+    expect(frozenBlob).toContain("window");
+  });
+
+  it("uses simple copy when the thread status card is simple", async () => {
+    const t = makeOrch({
+      describeConfig: (session) => ({
+        agent: { value: session.agentId, source: "session config" },
+        model: { value: "claude-opus-4.8", source: "session config" },
+        effort: { value: "high", source: "session config" },
+        cwd: { value: "/repo", source: "session config" },
+        statusCardStyle: { value: "simple", source: "session config" },
+      }),
+    });
+    await (t.orch as any).reconstructSessionFromDiscord({
+      record: t.rec,
+      channel: { platform: "discord", id: "thread-r" },
+      observedAtStart: "acp-active",
+      attachIntent: "attach",
+    });
+    expect(t.panels[0]?.title).toBe("Getting ready to continue");
+    expect(t.panels.at(-1)?.title).toBe("Ready to continue");
+    const blob = t.panels.map((p) => `${p.title ?? ""} ${p.description ?? ""} ${p.footer ?? ""}`).join("\n");
+    expect(blob).not.toMatch(/rebuild/i);
+    expect(blob).not.toMatch(/sess-new/);
+    expect(blob).not.toMatch(/token/i);
+  });
+
+  it("freezes failure on the thread card and still throws", async () => {
+    const t = makeOrch({ seedError: new Error("seed boom\n    at seedNewSession") });
+    await expect(
+      (t.orch as any).reconstructSessionFromDiscord({
+        record: t.rec,
+        channel: { platform: "discord", id: "thread-r" },
+        observedAtStart: "acp-active",
+        attachIntent: "attach",
+      })
+    ).rejects.toThrow(/seed boom/);
+    expect(t.panels[0]?.title).toBe("Rebuild");
+    expect(t.panels.at(-1)?.title).toBe("Rebuild failed");
+    expect(t.panels.at(-1)?.description).toBe("seed boom");
+    expect(t.panels.at(-1)?.description).not.toMatch(/at seedNewSession/);
+  });
+
+  it("heartbeats elapsed on the card while seedNewSession is in flight", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const t = makeOrch({
+      duringSeed: () => {
+        /* opened */
+      },
+    });
+    (t.orch as any).seedNewSession = async () => {
+      await gate;
+      return "sess-new";
+    };
+    const done = (t.orch as any).reconstructSessionFromDiscord({
+      record: t.rec,
+      channel: { platform: "discord", id: "thread-r" },
+      observedAtStart: "acp-active",
+      attachIntent: "attach",
+    });
+    await vi.waitFor(() => {
+      expect(t.panels.some((p) => p.description === "Seeding new session")).toBe(true);
+    });
+    const before = t.panels.length;
+    await new Promise((r) => setTimeout(r, 5_200));
+    expect(t.panels.length).toBeGreaterThan(before);
+    release();
+    await done;
+    expect(t.panels.at(-1)?.title).toBe("Rebuild complete");
+  }, 15_000);
 });

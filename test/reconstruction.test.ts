@@ -132,6 +132,30 @@ describe("projectDiscordConversation", () => {
     expect(logical.map((m) => m.text)).toEqual(["go", "real reply"]);
   });
 
+  it("excludes a bot Rebuild card embed so it cannot pollute the seed (#217)", () => {
+    const logical = projectDiscordConversation(
+      [
+        post("1", { authorType: "human", content: "please continue" }),
+        post("2", {
+          authorType: "bot",
+          authorId: SEAM,
+          content: "Getting ready to continue",
+          hasEmbeds: true,
+        }),
+        post("3", {
+          authorType: "bot",
+          authorId: SEAM,
+          content: "Rebuild",
+          hasEmbeds: true,
+        }),
+        post("4", { authorType: "bot", authorId: SEAM, content: "assistant reply" }),
+      ],
+      { seamBotId: SEAM }
+    );
+    expect(logical.map((m) => m.text)).toEqual(["please continue", "assistant reply"]);
+    expect(logical.some((m) => /rebuild|getting ready to continue/i.test(m.text))).toBe(false);
+  });
+
   it("strips <seam-harness> blocks when present", () => {
     expect(stripSeamHarness("<seam-harness>\nsecret\n</seam-harness>\nactual")).toBe("actual");
     expect(stripSeamHarness("<seam-harness>unclosed tail")).toBe("");

@@ -234,5 +234,11 @@ describe("message search helpers", () => {
     expect(isMessageCardOrNoise(message(6, "_🗜 compact started_", {
       authorId: "bot", authorName: "Seam", authorType: "bot",
     }))).toBe(true);
+    expect(isMessageCardOrNoise(message(7, "Getting ready to continue", {
+      authorId: "bot", authorName: "Seam", authorType: "bot", hasEmbeds: true,
+    }))).toBe(true);
+    expect(isMessageCardOrNoise(message(8, "Rebuild complete", {
+      authorId: "bot", authorName: "Seam", authorType: "bot", hasEmbeds: true,
+    }))).toBe(true);
   });
 });

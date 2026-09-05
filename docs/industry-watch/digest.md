@@ -1,7 +1,7 @@
 # LLM Industry Watch
 
 - **last_sweep:** never
-- **one_line:** No sweep yet. The next fire fills this page from sources, not from a seed list.
+- **one_line:** No sweep yet. Daily fires fill this page from sources; Wed and Sat Discord posts are the weekly recap.
 
 ## Frontier snapshot
 

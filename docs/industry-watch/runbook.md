@@ -4,13 +4,16 @@
 > models, leaks, timing, lab shakeups, open-weight shocks. **Not** seam-acp
 > impact, CLI changelogs, or status pages.
 >
-> **Cadence:** Weekly (recommended: Monday morning America/Chicago).
+> **Cadence:** Daily (America/Chicago). Every fire updates the notebook.
+> **Wed and Sat** posts are a weekly recap (repeating major headlines is
+> expected). Other days are movers-only; if nothing cleared the bar, the
+> Discord message is a single "no movers" line.
 >
 > **Product:** `digest.md` is the notebook you reread. The agent's **final
 > message** is a short Discord newsletter posted to thread
 > `1545798016601034883`.
 >
-> **Last updated:** 2026-09-05
+> **Last updated:** 2026-09-05 (daily + Wed/Sat recap)
 
 ---
 
@@ -71,11 +74,11 @@ Flash-only cadence). Quote executives verbatim; never turn "soon" into a date.
 - `runbook.md` — process. Edit only when a sensor or rule was wrong.
 - `digest.md` — living notebook. Rewrite in place each sweep.
 - `storylines.md` — persistent topics **after** discovery. Empty until a sweep creates rows.
-- `snapshots/YYYY-MM-DD.md` — AA top-N for numeric diff next week.
+- `snapshots/YYYY-MM-DD.md` — AA top-N for numeric diff against yesterday.
 - `log/YYYY-MM-DD.md` — receipts: what was checked, including silence.
 
 Today's date for filenames: the sweep's local date in America/Chicago
-(`YYYY-MM-DD`).
+(`YYYY-MM-DD`). Weekday for Discord mode is also America/Chicago.
 
 ---
 
@@ -84,8 +87,20 @@ Today's date for filenames: the sweep's local date in America/Chicago
 ### Phase A — Load state
 
 Read the files in §0. Note `last_sweep` from digest front matter (or "never").
-All searches are **since last sweep**, except a first run which uses the past
-~14 days.
+Decide **Discord mode** from today's America/Chicago weekday:
+
+- **Wed or Sat → `recap`.** Discord post is a weekly summary of the last 7
+  days. Repeating major headlines already posted on a daily brief is
+  required, not a defect.
+- **Any other day → `daily`.** Discord post is only what moved **since
+  last_sweep**. If nothing cleared §4, the final message is one "no movers"
+  line (see §7). Never pad with a 🤫 Quiet list on a daily fire.
+
+All searches are **since last_sweep**, except a first run which uses the past
+~14 days. Recap days still search since last_sweep for discovery; the
+**Discord recap** additionally rereads `digest.md`, `storylines.md`, and
+the last 7 logs/snapshots so headlines from earlier in the week can be
+repeated.
 
 ### Phase B — Numbers (AA as an event feed)
 
@@ -108,8 +123,9 @@ and conclude it is fake because it is absent.
 For every **live** row in `storylines.md`, run its **canned queries** (the
 `search` field). Update `last_checked`. If something moved, update status,
 confidence, latest bullets, sources, `last_movement`. If nothing moved, write
-`no new signal` in the log — do not delete the row. After **3** consecutive
-quiet sweeps, set status to `stale` (keep the row).
+`no new signal` in the log — do not delete the row. After **14** consecutive
+quiet daily sweeps (~two weeks), set status to `stale` (keep the row). Do
+not use a 3-sweep stale rule — that was for weekly cadence.
 
 ### Phase D — Nameless discovery (the point of the product)
 
@@ -164,7 +180,7 @@ new rows created, AA movers, **silence** (checked, nothing).
 Commit **only** `docs/industry-watch/` (`git add` those paths, commit).
 Message: `docs(industry-watch): sweep YYYY-MM-DD`. Do not `git add -A`.
 Do not include `docs/upstream-monitoring-runbook.md`. Do not redeploy.
-Push if you have network and it is cheap; host disk is what next week reads.
+Push if you have network and it is cheap; host disk is what the next fire reads.
 
 ### Phase F — Discord newsletter (your final message)
 
@@ -176,8 +192,10 @@ because the schedule is bound there).
 "I committed…", no file paths dump, no MCP narration. Work log belongs in
 `log/YYYY-MM-DD.md`.
 
-Follow §7 exactly. Aim for **≤1900 characters** so Discord keeps it as **one
-plain message** (the runner splits at 1900 chars with no regard for words).
+Follow §7 for the mode chosen in Phase A (`daily` vs `recap`). Aim for
+**≤1900 characters** so Discord keeps it as **one plain message** (the
+runner splits at 1900 chars with no regard for words). Recap days should
+still fit in one message; cut Quiet and extra links first, not Movers.
 
 Do **not** try to emit Discord embed JSON, `seam-choice` cards, or custom
 rich embeds. Do **not** `forward` / `handoff` / `send` the digest into the
@@ -219,7 +237,7 @@ Each live row in `storylines.md`:
 - **confidence:** confirmed | credible | speculative | contradicted
 - **last_movement:** YYYY-MM-DD
 - **last_checked:** YYYY-MM-DD
-- **quiet_sweeps:** 0
+- **quiet_sweeps:** 0   (stale at 14)
 - **expected_window:** (quote or "unspecified" — do not invent dates)
 - **why_it_matters:** one line
 - **latest:** 2–4 bullets; execs in verbatim quotes
@@ -240,7 +258,7 @@ without a primary source.
 # LLM Industry Watch
 
 - **last_sweep:** YYYY-MM-DD
-- **one_line:** (the week in one sentence)
+- **one_line:** (current picture in one sentence)
 
 ## Frontier snapshot
 Closed vs open-weight gap on AA Intelligence Index. Only movers and new
@@ -250,7 +268,8 @@ names, plus the current top 5–8. Link slugs if useful.
 One short subsection per live row (status + latest). No process talk.
 
 ## New this sweep
-Names that were not on the list last week, and why they cleared §4.
+Names that were not on the list yesterday (or last recap, if writing the
+Wed/Sat notebook view), and why they cleared §4.
 
 ## Calendar / expected
 Quoted windows only.
@@ -265,42 +284,68 @@ Storylines checked with no movement (one line each).
 
 Plain Discord markdown. Emoji as section marks. **No tables** (they wrap and
 break). No `#` heading spam — Discord treats `#` as a channel mention. Use
-`**bold**` lines instead of `##`.
+`**bold**` lines instead of `##`. Stay ≤1900 characters.
 
-Skeleton (fill; delete empty sections; stay ≤1900 characters):
+Confidence tags: `✅ confirmed` `🟡 credible` `🟣 speculative` `⚔️ contradicted`.
+Links sparingly (`[source](https://...)`) — one on the headline item, not a
+bibliography.
+
+### 7.1 Daily brief (Sun, Mon, Tue, Thu, Fri)
+
+Only what moved since `last_sweep`. Delete empty sections. **If nothing
+cleared §4 and AA had no shock,** the entire final message is exactly:
 
 ```
-📡 **LLM Industry Watch** · 5 Sep 2026
+📡 **LLM Industry Watch** · 6 Sep 2026 — no movers.
+```
+
+Do not add Quiet, Leaderboard-of-unchanged, or "checked N sources." An empty
+assistant message becomes a useless "✅ Done — no output" card; the one-liner
+is the skip signal.
+
+Movers-day skeleton:
+
+```
+📡 **LLM Industry Watch** · 6 Sep 2026
+
+🔥 **Today**
+• **Name** — what changed, how sure
+• **Name** — …
+
+🆕 **New**
+• **Name** — why it cleared the bar
+
+📊 **Leaderboard**  (omit if no shock)
+• only deltas
+```
+
+### 7.2 Weekly recap (Wed and Sat)
+
+Cover the last 7 days. **Repeating major headlines from daily briefs is
+required.** This is the rereadable post, not a delta. Cluster (one lab
+crisis, not three items). Omit Quiet if you need the character budget.
+
+```
+📡 **LLM Industry Watch** · weekly recap · 9 Sep 2026
 
 **This week:** <one sentence>
 
-🔥 **Movers**
-• **Name** — what changed, and how sure (<confirmed|credible|speculative>)
+🔥 **Headlines**
+• **Name** — the week's arc (ok if posted Mon/Tue already)
 • **Name** — …
 
 🧭 **Storylines**
-• **slug** — latest, clustered (do not split a lab crisis into three items)
+• **slug** — where it stands now
 
 🆕 **New on the board**
-• **Name** — why it cleared the bar (talent / artifact / capital)
+• **Name** — why it cleared the bar
 
 📊 **Leaderboard**
-• Only deltas and shocks (e.g. open-weight within N pts of closed #1)
-• Skip if nothing moved
-
-🤫 **Quiet**
-• slug — no new signal
+• closed vs open-weight gap + shocks this week
 
 —
 Notebook: `docs/industry-watch/digest.md`
 ```
-
-Use real source links sparingly (`[source](https://...)`) for the 1–3 items
-a reader would want to tap. Prefer one link on the headline item, not a
-bibliography.
-
-Confidence tags in the post: `✅ confirmed` `🟡 credible` `🟣 speculative`
-`⚔️ contradicted`.
 
 ---
 

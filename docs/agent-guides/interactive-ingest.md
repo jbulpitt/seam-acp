@@ -16,8 +16,12 @@ There are two products:
 - **Headless ingest** is a reusable HTTP contract with no Discord card. Use it
   for microsites, quizzes, and refine loops.
 
-Both accept the same POST body and require the scoring agent to declare JSON
-with `submit_result`. The HTTP body is not a Discord transcript.
+Both accept the same POST body and, in their scoring form, require the agent to
+declare JSON with `submit_result`. The HTTP body is not a Discord transcript.
+
+Headless ingest has a second, non-scoring form: set `thread` at mint and every
+POST becomes an ordinary live turn in that thread. See
+[Live thread destination](#live-thread-destination-handoff).
 
 ## Card-bound ingest
 
@@ -58,7 +62,8 @@ refused for card ingest.
 Mint with MCP `create_ingest` only. It creates no hidden card and normally posts
 nothing to Discord. Scoring runs in a silent isolated session; retries are
 unlimited unless `uniqueStudent: true`. Set `notifyThread` only when Discord
-should receive a copy of the work.
+should receive a copy of the work — it still scores in isolation and then copies
+the output in. To run the POST *as* a thread instead, use `thread`.
 
 ```json
 {
@@ -94,6 +99,38 @@ The POST never selects an agent or model. At mint time choose one of:
 Keep the **assignment contract**—rubric, persistence path, and result shape—in
 `wrapper`. Keep the reusable **grader identity** in the preset.
 
+### Live thread destination (handoff)
+
+Set `thread` to a Discord thread snowflake and the endpoint stops being a
+scoring job. Each POST is a **typical live handoff** into that thread's own
+session: its agent, its model, its history, output posted there as usual, and
+**nothing reports back**.
+
+```json
+{
+  "name": "site-questions",
+  "thread": "1516907849349857421",
+  "wrapper": "A visitor asked this through the website form. Answer it here."
+}
+```
+
+- The thread must be in the **same channel** as the minting thread, and must
+  still be live. Seam checks both at mint **and** on every POST — a deleted or
+  archived thread gets `409`, and no turn is enqueued.
+- `thread` cannot be combined with `preset`, `agent`, `model`, `effort`, `cwd`,
+  or `notifyThread`. Those all choose a *different* identity than the target
+  thread's; `notifyThread` is the separate isolated-score-then-copy shape.
+- There is **no HTTP result body**. POST with `?wait=0` and expect `202`; a turn
+  that ends without `submit_result` is a success, not a failed job. (If you set
+  `resultSchema` anyway, `submit_result` is still required — asking for a shape
+  is asking for a declared result.)
+- Concurrent POSTs **serialize on that thread's turn queue**: they run one after
+  another in the target session rather than in parallel. Isolated ingest never
+  waited on Discord, so this is the one throughput difference between the modes.
+  Keep bursty public traffic on the isolated form.
+
+`create_ingest` only; there is no `/seam` option for this.
+
 ## POST and poll
 
 ```text
@@ -119,7 +156,8 @@ in public client-side JavaScript when a small backend can hold it.
 The scoring turn must call `submit_result({ ... })` before ending. The first
 successful call wins, and an optional `resultSchema` is enforced in-turn. If the
 turn ends without a declared result, the HTTP job fails; there is no transcript
-fallback.
+fallback. This does not apply to a `thread` endpoint, which has no HTTP result
+body at all.
 
 Seam is not an LMS or submission store. Persist attempts in the endpoint's
 project cwd exactly as the wrapper instructs.

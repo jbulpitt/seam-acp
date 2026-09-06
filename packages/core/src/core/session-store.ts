@@ -863,7 +863,8 @@ export class SessionStore {
     }
   }
 
-  /** #95: named preset resolved at fire. Fresh DBs get it from CREATE TABLE. */
+  /** #95: named preset resolved at fire. #224: live handoff thread.
+   *  Fresh DBs get both from CREATE TABLE. */
   private migrateIngestEndpointPreset(): void {
     try {
       const names = new Set(
@@ -874,6 +875,9 @@ export class SessionStore {
       );
       if (!names.has("preset")) {
         this.db.exec("ALTER TABLE ingest_endpoints ADD COLUMN preset TEXT");
+      }
+      if (!names.has("thread")) {
+        this.db.exec("ALTER TABLE ingest_endpoints ADD COLUMN thread TEXT");
       }
     } catch {
       /* table missing — CREATE TABLE runs first */
@@ -2829,12 +2833,12 @@ export class SessionStore {
       .prepare(
         `INSERT INTO ingest_endpoints
            (id, token_hash, name, cwd, agent_id, model, effort, wrapper,
-            result_schema_json, cors_json, unique_student, notify_thread, preset,
+            result_schema_json, cors_json, unique_student, notify_thread, thread, preset,
             status, created_by, created_utc, authoring_channel_ref,
             authoring_parent_ref, platform)
          VALUES
            (@id, @tokenHash, @name, @cwd, @agentId, @model, @effort, @wrapper,
-            @resultSchemaJson, @corsJson, @uniqueStudent, @notifyThread, @preset,
+            @resultSchemaJson, @corsJson, @uniqueStudent, @notifyThread, @thread, @preset,
             @status, @createdBy, @createdUtc, @authoringChannelRef,
             @authoringParentRef, @platform)`
       )
@@ -2851,6 +2855,7 @@ export class SessionStore {
         corsJson: e.corsOrigins == null ? null : JSON.stringify(e.corsOrigins),
         uniqueStudent: e.uniqueStudent ? 1 : 0,
         notifyThread: e.notifyThread,
+        thread: e.thread,
         preset: e.preset,
         status: e.status,
         createdBy: e.createdBy,
@@ -6115,6 +6120,7 @@ CREATE TABLE IF NOT EXISTS ingest_endpoints (
   cors_json              TEXT,
   unique_student         INTEGER NOT NULL DEFAULT 0,
   notify_thread          TEXT,
+  thread                 TEXT,
   preset                 TEXT,
   status                 TEXT NOT NULL DEFAULT 'open',
   created_by             TEXT NOT NULL,
@@ -6849,6 +6855,7 @@ interface IngestEndpointRow {
   cors_json: string | null;
   unique_student: number;
   notify_thread: string | null;
+  thread: string | null;
   preset: string | null;
   status: string;
   created_by: string;
@@ -6871,6 +6878,7 @@ const mapIngestEndpoint = (r: IngestEndpointRow): IngestEndpoint => ({
   corsOrigins: r.cors_json ? parseJsonSafe<string[]>(r.cors_json, []) : null,
   uniqueStudent: r.unique_student === 1,
   notifyThread: r.notify_thread,
+  thread: r.thread ?? null,
   preset: r.preset ?? null,
   status: r.status as IngestEndpointStatus,
   createdBy: r.created_by,

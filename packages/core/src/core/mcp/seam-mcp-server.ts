@@ -446,7 +446,14 @@ export interface SeamMcpServerDeps {
     record: SessionRecord,
     spec: unknown
   ) => Promise<
-    | { ok: true; ingestId: string; ingestToken: string; ingestUrl: string }
+    | {
+        ok: true;
+        ingestId: string;
+        ingestToken: string;
+        ingestUrl: string;
+        /** #224: set when the endpoint is a live handoff into this thread. */
+        thread?: string | null;
+      }
     | { ok: false; error: string }
   >;
   /** Revoke a headless ingest endpoint minted from this thread. */
@@ -1608,7 +1615,7 @@ const TOOLS = [
   {
     name: "create_ingest",
     description:
-      "Mint a headless HTTP ingest endpoint (no Discord card). Token shown once. Isolated silent scoring; retries unlimited unless uniqueStudent. preset is resolved at fire (not snapshot). See docs/agent-guides/interactive-prompts.md.",
+      "Mint a headless HTTP ingest endpoint (no Discord card). Token shown once. Isolated silent scoring; retries unlimited unless uniqueStudent. preset is resolved at fire (not snapshot). Set thread instead to make each POST a live handoff into that thread's own session (no HTTP result). See docs/agent-guides/interactive-ingest.md.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1617,7 +1624,12 @@ const TOOLS = [
         resultSchema: { type: "object", description: "Optional JSON Schema for submit_result." },
         corsOrigins: { type: "array", items: { type: "string" } },
         uniqueStudent: { type: "boolean", description: "If true, same studentId cannot submit twice. Default false." },
-        notifyThread: { type: "string", description: "Optional Discord snowflake to copy working into. Omitted = no Discord." },
+        notifyThread: { type: "string", description: "Optional Discord snowflake to copy an isolated job's working into. Omitted = no Discord. Not with thread." },
+        thread: {
+          type: "string",
+          description:
+            "Discord thread snowflake in THIS channel. Each POST becomes a normal live turn in that thread's own session — its agent/model/history, no report-back and no HTTP result body (POST with ?wait=0 and expect 202). Cannot combine with preset/agent/model/effort/cwd/notifyThread. Concurrent POSTs queue on that thread's turn queue.",
+        },
         preset: {
           type: "string",
           description:
@@ -1732,7 +1744,7 @@ const INSTRUCTIONS = [
   "- cancel_wake(wakeId): cancel a pending wake you scheduled.",
   "- rename_thread(name): rename YOUR OWN thread (free-form title). Restricted participants cannot.",
   "- create_choice / cancel_choice / submit_result: frozen click-cards; HTTP ingest + declared JSON result. Participants cannot author. See docs/agent-guides/interactive-prompts.md.",
-  "- create_ingest / cancel_ingest: headless HTTP endpoint (no Discord card). Isolated silent scoring, retries unlimited. Token once. Same POST /ingest + submit_result.",
+  "- create_ingest / cancel_ingest: headless HTTP endpoint (no Discord card). Isolated silent scoring, retries unlimited. Token once. Same POST /ingest + submit_result. `thread` instead makes each POST a live handoff into that thread (no HTTP result).",
   "- create_live_help / cancel_live_help: Gemini joins a Discord voice channel (audio↔audio). Parallel to this text session. Course participants may start and stop their own live-help session. See docs/agent-guides/live-help.md.",
   "- watch_create(kind, spec, intervalSeconds, prompt, expiresInSeconds, ...): register a CONDITION the bridge",
   "  checks cheaply and re-enters you ONLY when it fires (file/http/command source). Prefer this over a",
@@ -2889,8 +2901,11 @@ export class SeamMcpServer {
       { ingestId: result.ingestId, thread: caller.channelRef },
       "seam-mcp create_ingest minted"
     );
+    const how = result.thread
+      ? `Each POST runs as a live turn in thread ${result.thread} — its own session and identity, no report-back and no HTTP result body. Use ?wait=0 and expect 202; concurrent POSTs queue on that thread's turn queue.`
+      : "Isolated silent scoring; declare the HTTP body with submit_result.";
     return textResult(
-      `Ingest endpoint ${result.ingestId} minted. POST ${result.ingestUrl} with Authorization: Bearer ${result.ingestToken} (token shown once). Isolated silent scoring; declare the HTTP body with submit_result.`
+      `Ingest endpoint ${result.ingestId} minted. POST ${result.ingestUrl} with Authorization: Bearer ${result.ingestToken} (token shown once). ${how}`
     );
   }
 

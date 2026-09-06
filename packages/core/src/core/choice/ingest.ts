@@ -31,6 +31,8 @@ export interface ChoiceIngestOpts {
   logger: Logger;
   enqueue: (spec: DispatchSpec) => Promise<void>;
   destLive: (card: ChoiceCard, optionIndex: number) => Promise<"ok" | "gone" | "archived">;
+  /** Live-state of a bare thread snowflake (#224 endpoint `thread`). Omitted ⇒ skip. */
+  threadLive?: (threadId: string) => Promise<"ok" | "gone" | "archived">;
   authoringSession: (channelRef: string) => SessionRecord | null;
   /** Effective cwd for isolated inherit. Falls back to `authoringSession.repoPath`. */
   authoringCwd?: (record: SessionRecord) => string;
@@ -48,6 +50,7 @@ export class ChoiceIngest {
   private readonly logger: Logger;
   private readonly enqueue: (spec: DispatchSpec) => Promise<void>;
   private readonly destLive: ChoiceIngestOpts["destLive"];
+  private readonly threadLive?: ChoiceIngestOpts["threadLive"];
   private readonly authoringSession: ChoiceIngestOpts["authoringSession"];
   private readonly authoringCwd?: ChoiceIngestOpts["authoringCwd"];
   private readonly publicBase: () => string;
@@ -64,6 +67,7 @@ export class ChoiceIngest {
     this.logger = opts.logger;
     this.enqueue = opts.enqueue;
     this.destLive = opts.destLive;
+    this.threadLive = opts.threadLive;
     this.authoringSession = opts.authoringSession;
     this.authoringCwd = opts.authoringCwd;
     this.publicBase = opts.publicBase;
@@ -282,6 +286,19 @@ export class ChoiceIngest {
       return;
     }
     const parsed = parseIngestBody(raw, req.headers["content-type"]);
+    // #224: the destination was live when the endpoint was minted; check again
+    // here so a deleted/archived thread refuses the POST rather than enqueuing
+    // a turn that can never land. Before the unique-student claim, so a refused
+    // POST does not burn a one-shot student.
+    if (endpoint.thread && this.threadLive) {
+      const live = await this.threadLive(endpoint.thread);
+      if (live !== "ok") {
+        json(res, 409, {
+          error: live === "gone" ? "destination thread is gone" : "destination thread is archived",
+        });
+        return;
+      }
+    }
     const studentId = typeof parsed.studentId === "string" ? parsed.studentId.trim().slice(0, 80) : "";
     if (endpoint.uniqueStudent && studentId) {
       const claimed = this.store.claimIngestStudent(endpoint.id, studentId);

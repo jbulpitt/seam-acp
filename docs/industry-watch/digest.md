@@ -1,48 +1,50 @@
 # LLM Industry Watch
 
-- **last_sweep:** 2026-09-05
-- **one_line:** Fable 5.1 still leads; Astra is public-AA #2 with Plus unfinished; Google is Flash-only; Muse 1.3 max opened Friday; open-weight now includes Hy4 beside Kimi K3 and GLM-5.3.
+- **last_sweep:** 2026-09-06
+- **one_line:** Fable 5.1 takes Agent Arena #1; Astra Plus is still unfinished and Arena CIs are still open; Seam’s AA cache dropped GLM/DeepSeek (public AA still has GLM ~49); Google remains Flash-only.
 
 ## Frontier snapshot
 
-Seam AA cache is **unchanged** from this morning (`fetched_at` 2026-09-05T15:01:53Z): **Fable 5.1 56.8 / 81.6 coding**, Opus 5 54.1, Fable 5 53.2, GPT-5.6 Sol 51.3, **Kimi K3 50.2** (−6.6 vs closed leader), Grok 4.6 49.3, GLM-5.3 48.6. No new row, no ≥1.0 move in-cache.
+Seam AA cache **refreshed** (`fetched_at` 2026-09-06T05:50:10.686Z). Overlapping scores are unchanged: **Fable 5.1 56.8 / 81.6 coding**, Opus 5 54.1, Fable 5 53.2, GPT-5.6 Sol 51.3, **Kimi K3 50.2** (−6.6 vs closed leader), Grok 4.6 49.3. No new Astra / Muse / Qwen / Hy4 row.
 
-**Public AA (not in this cache — do not mix scales):** Index **v4.2** (2026-09-04) still has Fable 5.1 first, then GPT-6 Astra (+4 vs Sol). Meta is the third-ranked lab, then SpaceXAI, Moonshot/Kimi, Z.AI, Google. Sep 3 AA article had Astra at 61 on the prior index, equal to Sol and 5 behind Fable 5.1 (66). Muse Spark 1.3 max 62 / xhigh 61 (Sep 2 article). Gemini 3.8 Flash 59 (+3 vs 3.7 Flash). Qwen and Hy4 have **no** Seam `hasBenchmark` rows; absence ≠ fake.
+**Cache hole, not a public drop:** GLM 5.3 and DeepSeek V4 vanished from this cache. Public AA still has GLM-5.3 (max) **49** and Flash **46**. Gemini 3.5 Flash in-cache **41.9 → 39.7**; old Flash, treat as remap.
+
+**Public AA (not this cache — do not mix scales):** Index **v4.2** (2026-09-04) still Fable 5.1 first, GPT-6 Astra second (+4 vs Sol). Meta third-ranked lab, then SpaceXAI, Moonshot/Kimi, Z.AI, Google. AA-X today restated the v4.2 methodology, not a new score.
 
 Google’s best scored cache row remains Gemini 3.7 Flash 45.2. Latest Pro: 3.1 Pro Preview (Feb, 36.7). No 3.8 / 3.5 / 3.7 Pro.
 
 ## Live storylines
 
 ### GPT-6 Astra — shipping, confirmed
-Limited orgs Thursday, Pro / Enterprise / Business Premium Friday, Plus/Business still “coming days” (The Decoder 2026-09-05; official Friday). Altman Saturday: games-from-Astra color, not a new slice. First **public** AA score Friday: #2 behind Fable on v4.2. Arena Agent/Code live Friday. No Seam AA row.
+Plus/Business still “coming days” (Decoder 2026-09-05; no official Plus GA this window). Arena Agent: still collecting; “more data needed for strong CIs.” Altman Saturday games post and a Decoder 2026-09-06 Sottiaux productivity quote are color, not a new slice. No Seam AA row.
 
 ### Google Gemini flagship gap — delayed, credible
-3.8 Flash is the third Flash in six weeks. Public AA 59. Hassabis “Relentless progress.” No Pro. SemiAnalysis: 3.5 Pro cancelled; Arena yank ~30 min (Jul 31). Same cluster: Aug 5 Dean / Ghemawat / Vinyals / Le → Discovery Loop; Hassabis off day-to-day DeepMind. No new exec posts since Sep 4.
+No Hassabis / Pichai / DeepMind / Dean model posts since 2026-09-04. Still Flash-only. 3.8 Flash public AA 59; cache stops at 3.7 Flash 45.2. No Pro.
 
 ### Fable 5.1 / Mythos 5.1 — shipping, confirmed
-Same weights, two gates. Fable GA, still AA #1 on both the Seam cache and public v4.2. Mythos US trusted-access. No new Commerce action this sweep.
+Same weights, two gates. Fable still AA #1 in this cache and on public v4.2. **First Agent Arena score** (2026-09-06): Fable 5.1 Max **#1**, +15.8% net, $4.14 median/task, 6.7k sessions. Astra traces still open. Mythos still US trusted-access. No new Commerce action.
 
 ### Muse Spark 1.3 — shipping, confirmed
-Wang 2026-09-04: “we just publicly released Muse Spark 1.3 max!” after “completing our safety testing.” That closes the “max after further safety testing” window. Still 0 Seam AA rows. Public AA (Sep 2): max 62 / xhigh 61.
+Wang 2026-09-05: “Try out muse spark 1.3 max before you cast your judgments!” — reminder, max already public Friday. AIatMeta AIRA₃ post-hoc used **1.2**, not a 1.3 drop. Still 0 Seam AA rows.
 
 ### Kimi K3 — GA, confirmed
-Open-weight #5 in cache. No new drop.
+Open-weight #5 in cache. No K4. Official account silent.
 
 ### GLM-5.3 — GA, confirmed
-Weights still on HF trending. No 5.4 / next Ox.
+Weights still on HF trending. Public AA ~49. Seam cache 0. OpenCode “Omen Alpha” (Sep 4) is a speculative next-Flash fingerprint — not promoted.
 
 ### Tencent Hy4 preview — shipping, confirmed
-770B-A49B, Apache 2.0, HF `tencent/Hy4-preview` 2026-08-28. Code Arena WebDev ~#8 (Sep 2). Vendor blind eval claims a slight edge on GLM-5.3 / Kimi K3 — cluster, don’t take as independent SOTA. No Seam AA row.
+Still on HF trending (`tencent/Hy4-preview`). No Seam AA row. Recaps only.
 
 ### Qwen3.8-Max-0902 — shipping, confirmed
-API snapshot 2026-09-02, Code Arena WebDev point-estimate #1 (CIs overlap Opus 5 Max). Not open-weight. No Seam AA row. Flash-Next remains the HF derivative base.
+No new snapshot. Arena CIs vs Opus 5 still the open question. Official Qwen: RSI-Exam thanks, not a SKU. No Seam AA row.
 
 ### Grok next — rumored, speculative
-No new named SKU. This window is Bot / Imagine / iPad. Musk “soon” / “4.7 has a good chance” still unspecified.
+No named 4.7 / 5. Musk “Grok” replies are Bot / Imagine / tutoring, not a SKU. Grok Imagine Video 1.5 Agent hit Text-to-Video Arena #5 — video, out of this product.
 
 ## New this sweep
 
-Caught on the second Saturday fire (morning recap missed them): **Tencent Hy4 preview** (HF/Arena, Appendix A class), **Qwen3.8-Max-0902** (Arena WebDev). Also: Muse **max** is public (Wang, not AIatMeta), Astra has a **first public AA score** (v4.2), Gemini 3.8 Flash has a public AA 59. Seam cache itself did not move.
+None cleared §4.
 
 ## Calendar / expected
 
@@ -55,9 +57,13 @@ Caught on the second Saturday fire (morning recap missed them): **Tencent Hy4 pr
 
 ## Quiet
 
-- Kimi K3 — no K4 signal.
-- GLM-5.3 — no next Ox; still trending.
-- Fable/Mythos gates — no new Commerce letter.
-- DeepSeek — V4 Pro 42.1, no V5 speech.
+- GPT-6 Astra — no new access slice; Arena CIs still open.
+- Google Pro — still missing; Flash-only.
+- Kimi K3 — no K4.
+- GLM-5.3 — no confirmed 5.4 / next Ox; Omen Alpha stays speculative.
+- Hy4 — still preview.
+- Qwen 0902 — no new Arena separation.
+- Muse — max already public; no Llama successor.
+- DeepSeek — no V5 speech.
 - Mistral — silence.
-- Yann LeCun / AMI Labs — no founding/training post.
+- Yann LeCun / AMI — no training-run post.

@@ -9,6 +9,7 @@ import { makeSessionId } from "./session-store.js";
 import { resolveChannelPreset, resolveThreadLocation } from "../config.js";
 import type { ChannelPreset, ThreadPreset } from "../config.js";
 import { buildProjectMcpServers } from "../mcp.js";
+import { parkedAgentMessage } from "./parked-agents.js";
 import { retiredAgentMessage } from "./retired-agents.js";
 
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
@@ -268,6 +269,12 @@ export class SessionRouter {
   /** Fallback cwd when no session/thread/channel overlay applies. Production
    *  supplies REPOS_ROOT so a missing overlay is not `process.cwd()`. */
   private readonly defaultCwd: string;
+  /**
+   * #220: when false, leftover ollama-cloud sessions fail closed with a parked
+   * message instead of a bare unknown-agent error. Undefined means "not
+   * parked" so existing tests that omit the flag keep their prior wording.
+   */
+  private readonly ollamaCloudEnabled: boolean | undefined;
   private askUser?: AskUserFn;
   private elicitUser?: ElicitUserFn;
   private completeElicitation?: CompleteElicitationFn;
@@ -307,6 +314,12 @@ export class SessionRouter {
      * TTL; tests and embedders remain opt-in. */
     runtimeIdleTtlMs?: number;
     runtimeIdleSweepMs?: number;
+    /**
+     * Production passes `OLLAMA_CLOUD_ENABLED`. When false, a leftover
+     * ollama-cloud session fails with the parked message rather than
+     * `Unknown agent profile`.
+     */
+    ollamaCloudEnabled?: boolean;
   }) {
     this.logger = opts.logger.child({ comp: "session-router" });
     this.store = opts.store;
@@ -320,6 +333,7 @@ export class SessionRouter {
     this.channelPresets = opts.channelPresets ?? new Map();
     this.threadPresets = opts.threadPresets ?? new Map();
     this.defaultCwd = opts.defaultCwd ?? process.cwd();
+    this.ollamaCloudEnabled = opts.ollamaCloudEnabled;
     this.runtimeIdleTtlMs = Math.max(0, opts.runtimeIdleTtlMs ?? 0);
     this.runtimeIdleSweepMs = Math.max(
       1_000,
@@ -374,6 +388,33 @@ export class SessionRouter {
   /** Look up a registered profile by id, or undefined if not found. */
   getProfile(id: string): AgentProfile | undefined {
     return this.profileById.get(id);
+  }
+
+  /** Parked-select copy when ollama-cloud is disabled, else null. */
+  parkedSelectMessage(agentId: string): string | null {
+    return parkedAgentMessage(agentId, this.ollamaCloudEnabled, "select");
+  }
+
+  /**
+   * Actionable refusal for a missing / parked / retired agent id. Callers that
+   * previously inlined `Unknown agent "…"` should go through here so leftover
+   * ollama-cloud sessions name the re-enable switch.
+   */
+  unregisteredAgentMessage(agentId: string, fallback: string): string {
+    return (
+      parkedAgentMessage(agentId, this.ollamaCloudEnabled, "select") ??
+      retiredAgentMessage(agentId) ??
+      fallback
+    );
+  }
+
+  /** Leftover-session wording (parked, not "gone forever"). */
+  unregisteredAgentSessionMessage(agentId: string, fallback: string): string {
+    return (
+      parkedAgentMessage(agentId, this.ollamaCloudEnabled, "session") ??
+      retiredAgentMessage(agentId) ??
+      fallback
+    );
   }
 
   /**
@@ -885,11 +926,15 @@ export class SessionRouter {
     const agentId = preset.agent?.value ?? record.agentId;
     const profile = this.profileById.get(agentId);
     if (!profile) {
-      // #12: a retired agent gets a message that names the retirement and the
-      // fix. We deliberately do NOT substitute the default agent — that would
-      // silently run this thread's prompts on a model nobody chose.
+      // #220 / #12: a parked or retired agent gets a message that names the
+      // state and the fix. We deliberately do NOT substitute the default
+      // agent — that would silently run this thread's prompts on a model
+      // nobody chose.
       throw new Error(
-        retiredAgentMessage(agentId) ?? `Unknown agent profile "${agentId}" for session ${record.id}`
+        this.unregisteredAgentSessionMessage(
+          agentId,
+          `Unknown agent profile "${agentId}" for session ${record.id}`
+        )
       );
     }
     const cfg = this.store.readConfig(record);

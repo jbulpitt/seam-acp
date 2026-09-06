@@ -16,10 +16,16 @@ import type { ServiceStatusSourceDefinition } from "../types.js";
 /**
  * The registered upstream sources.
  *
- * Six are the vendor's own status surface (`official`). The seventh, Linkworks,
+ * Six are the vendor's own status surface (`official`). A seventh, Linkworks,
  * is an independently operated synthetic probe (`external_synthetic`) and is
  * explicitly **not** official Ollama Cloud health — its provenance and scope
  * note exist so no downstream surface can present it as such.
+ *
+ * Classification (#220): Linkworks is a third-party probe of a homelab
+ * inference cluster. Seam only registered it as the ollama-shaped check for
+ * the ollama-cloud agent, so `createDefaultServiceStatusSources` includes it
+ * only when `includeLinkworksOllama` is true (production: `OLLAMA_CLOUD_ENABLED`).
+ * A parked ollama-cloud must not still look like we are monitoring Ollama Cloud.
  */
 
 /**
@@ -65,8 +71,10 @@ export const OPENAI_COMPONENT_IDS = {
   vsCodeExtension: "01KMP3KP5M8X0EBTVW6KN327EE",
 } as const;
 
-export function createDefaultServiceStatusSources(): ServiceStatusSourceDefinition[] {
-  return [
+export function createDefaultServiceStatusSources(opts?: {
+  includeLinkworksOllama?: boolean;
+}): ServiceStatusSourceDefinition[] {
+  const sources: ServiceStatusSourceDefinition[] = [
     {
       id: "github",
       label: "GitHub",
@@ -152,7 +160,9 @@ export function createDefaultServiceStatusSources(): ServiceStatusSourceDefiniti
         ],
       }),
     },
-    {
+  ];
+  if (opts?.includeLinkworksOllama === true) {
+    sources.push({
       id: "linkworks-ollama",
       label: "Ollama endpoints (Linkworks probe)",
       provenance: "external_synthetic",
@@ -164,6 +174,7 @@ export function createDefaultServiceStatusSources(): ServiceStatusSourceDefiniti
         label: "Ollama endpoints (Linkworks probe)",
         url: LINKWORKS_LIVE_URL,
       }),
-    },
-  ];
+    });
+  }
+  return sources;
 }

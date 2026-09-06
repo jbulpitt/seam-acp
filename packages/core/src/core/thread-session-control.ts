@@ -146,6 +146,8 @@ export interface ThreadSessionControlDeps {
   router: {
     describeConfig(record: SessionRecord): ConfigDescription;
     getProfile(agentId: string): AgentProfile | undefined;
+    parkedSelectMessage?(agentId: string): string | null;
+    unregisteredAgentMessage?(agentId: string, fallback: string): string;
     getOrStartRuntime(record: SessionRecord): Promise<SessionControlRuntime>;
     invalidate(
       sessionId: string,
@@ -201,8 +203,16 @@ export class ThreadSessionControlService {
       return { ok: false, error: "`agent` must be a non-empty string." };
     }
     const nextAgent = requestedAgent ?? before.agent.value;
+    const parked = this.deps.router.parkedSelectMessage?.(nextAgent);
+    if (parked) return { ok: false, error: parked };
     const profile = this.deps.router.getProfile(nextAgent);
-    if (!profile) return { ok: false, error: `Unknown agent "${nextAgent}".` };
+    if (!profile) {
+      const fallback = `Unknown agent "${nextAgent}".`;
+      return {
+        ok: false,
+        error: this.deps.router.unregisteredAgentMessage?.(nextAgent, fallback) ?? fallback,
+      };
+    }
 
     const agentChanged = nextAgent !== before.agent.value;
     const requestedModel = input.model?.trim();
@@ -363,8 +373,16 @@ export class ThreadSessionControlService {
       return { ok: false, error: "`agent` must be a non-empty string." };
     }
     const nextAgentId = requestedAgent ?? previousAgentId;
+    const parked = this.deps.router.parkedSelectMessage?.(nextAgentId);
+    if (parked) return { ok: false, error: parked };
     const profile = this.deps.router.getProfile(nextAgentId);
-    if (!profile) return { ok: false, error: `Unknown agent "${nextAgentId}".` };
+    if (!profile) {
+      const fallback = `Unknown agent "${nextAgentId}".`;
+      return {
+        ok: false,
+        error: this.deps.router.unregisteredAgentMessage?.(nextAgentId, fallback) ?? fallback,
+      };
+    }
 
     const agentChanged = nextAgentId !== previousAgentId;
     const requestedModel = input.model?.trim();

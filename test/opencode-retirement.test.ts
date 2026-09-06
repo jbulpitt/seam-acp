@@ -186,16 +186,22 @@ describe("#12 opencode surface removed", () => {
   });
 
   it("still accepts every supported DEFAULT_AGENT", () => {
-    for (const agent of ["copilot", "claude", "codex", "grok", "agy", "ollama-cloud"]) {
+    for (const agent of ["copilot", "claude", "codex", "grok", "agy"]) {
       baseEnv({ DEFAULT_AGENT: agent });
       expect(loadConfig().DEFAULT_AGENT, agent).toBe(agent);
     }
   });
 
-  it("leaves an unrecognized DEFAULT_AGENT alone (only RETIRED ids are refused here)", () => {
+  it("accepts DEFAULT_AGENT=ollama-cloud only when OLLAMA_CLOUD_ENABLED is true", () => {
+    baseEnv({ DEFAULT_AGENT: "ollama-cloud", OLLAMA_CLOUD_ENABLED: "true" });
+    expect(loadConfig().DEFAULT_AGENT).toBe("ollama-cloud");
+  });
+
+  it("leaves an unrecognized DEFAULT_AGENT alone (only RETIRED/parked ids are refused here)", () => {
     // Boot-time validation is deliberately narrow: it knows the retirement
-    // table, not the runtime roster (which depends on which agents are enabled).
-    // A typo still reaches the router's generic unknown-agent error.
+    // table and the ollama-cloud park switch, not the runtime roster (which
+    // depends on which agents are enabled). A typo still reaches the router's
+    // generic unknown-agent error.
     baseEnv({ DEFAULT_AGENT: "cluade" });
     expect(loadConfig().DEFAULT_AGENT).toBe("cluade");
   });

@@ -1171,7 +1171,7 @@ describe("Linkworks synthetic-probe adapter", () => {
 });
 
 describe("source registry", () => {
-  it("marks six official sources and one third-party synthetic source", () => {
+  it("marks six official sources by default (linkworks-ollama is opt-in)", () => {
     const sources = createDefaultServiceStatusSources();
     const official = sources.filter((source) => source.provenance === "official");
     const synthetic = sources.filter((source) => source.provenance === "external_synthetic");
@@ -1184,14 +1184,21 @@ describe("source registry", () => {
       "openai",
       "xai",
     ]);
-    expect(synthetic.map((source) => source.id)).toEqual(["linkworks-ollama"]);
-    expect(synthetic[0]!.scopeNote).toMatch(/NOT official Ollama Cloud status/);
-    expect(synthetic[0]!.label).not.toMatch(/^Ollama Cloud$/);
+    expect(synthetic).toEqual([]);
+    expect(sources.map((source) => source.id)).not.toContain("linkworks-ollama");
 
     const aiStudio = sources.find((source) => source.id === "google-ai-studio")!;
     expect(aiStudio.scopeNote).toMatch(/not proof that the Antigravity \(agy\) host itself is healthy/i);
 
     expect(new Set(sources.map((source) => source.id)).size).toBe(sources.length);
+  });
+
+  it("includes the Linkworks probe only when opted in", () => {
+    const sources = createDefaultServiceStatusSources({ includeLinkworksOllama: true });
+    const synthetic = sources.filter((source) => source.provenance === "external_synthetic");
+    expect(synthetic.map((source) => source.id)).toEqual(["linkworks-ollama"]);
+    expect(synthetic[0]!.scopeNote).toMatch(/NOT official Ollama Cloud status/);
+    expect(synthetic[0]!.label).not.toMatch(/^Ollama Cloud$/);
   });
 });
 

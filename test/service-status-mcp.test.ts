@@ -284,14 +284,23 @@ describe("service-status MCP view — validation", () => {
       "github",
       "google-ai-studio",
       "google-cloud",
-      "linkworks-ollama",
       "openai",
       "xai",
     ]);
+    expect(view.registeredSourceIds()).not.toContain("linkworks-ollama");
     // A URL-shaped id is just an unknown id; there is no field that accepts one.
     expect(() => view.read({ sourceIds: ["https://evil.test/steal"] })).toThrow(
       /unknown service status source/
     );
+    manager.stop();
+  });
+
+  it("registers linkworks-ollama only when the ollama-cloud flag opts it in", () => {
+    const sources = createDefaultServiceStatusSources({ includeLinkworksOllama: true });
+    const store = tempStore();
+    const manager = new ServiceStatusRefreshManager({ store, sources, now: () => NOW });
+    const view = createServiceStatusMcpView({ store, manager, sources, now: () => NOW });
+    expect(view.registeredSourceIds()).toContain("linkworks-ollama");
     manager.stop();
   });
 });

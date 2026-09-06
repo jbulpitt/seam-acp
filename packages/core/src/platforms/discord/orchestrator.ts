@@ -330,6 +330,11 @@ import { ElicitationManager } from "../../core/elicitation/manager.js";
 import type { InboundAdmission } from "../../core/inbound-admission/types.js";
 import { SessionRouter, resolveSessionCwd, simpleCardGifForRender, statusCardStyleForRender } from "../../core/session-router.js";
 import {
+  formatUsageAgentList,
+  liveUsageAgentLabels,
+  parkedAgentMessage,
+} from "../../core/parked-agents.js";
+import {
   FAST_MODE_COST_WARNING,
   FAST_MODE_CONFIG_ID,
   FAST_MODE_RESET_NOTICE,
@@ -987,6 +992,7 @@ export class Orchestrator {
       describeConfig: (record) => this.router.describeConfig(record),
       profiles: new Map(this.router.listProfiles().map((p) => [p.id, p])),
       defaultModel: this.config.DEFAULT_MODEL,
+      ollamaCloudEnabled: this.config.OLLAMA_CLOUD_ENABLED,
       presetsFile: this.config.CHANNEL_PRESETS_FILE,
       tierCEnabled: this.config.SEAM_CONFIG_MUTATION_TIER_C_ENABLED,
       reloadPresets: () =>
@@ -4512,6 +4518,23 @@ export class Orchestrator {
     }
   }
 
+  /** Test stubs of SessionRouter may omit #220 helpers; fall back to the
+   *  generic unknown-agent copy in that case. */
+  private refuseUnregisteredAgent(agentId: string, fallback: string): string {
+    const fn = this.router.unregisteredAgentMessage;
+    return typeof fn === "function" ? fn.call(this.router, agentId, fallback) : fallback;
+  }
+
+  private refuseParkedSession(agentId: string, fallback: string): string {
+    const fn = this.router.unregisteredAgentSessionMessage;
+    return typeof fn === "function" ? fn.call(this.router, agentId, fallback) : fallback;
+  }
+
+  private parkedSelectRefusal(agentId: string): string | null {
+    const fn = this.router.parkedSelectMessage;
+    return typeof fn === "function" ? fn.call(this.router, agentId) : null;
+  }
+
   /** Returns the configured compaction model for an agent id, or "" if the
    *  agent isn't supported. Compaction always uses a known-good high-context
    *  summarizer rather than the session's own model — the latter can be too
@@ -4540,6 +4563,7 @@ export class Orchestrator {
       return this.config.ZAI_COMPACTION_MODEL;
     }
     if (agentId === "ollama-cloud" || agentId.startsWith("ollama-cloud-")) {
+      if (!this.config.OLLAMA_CLOUD_ENABLED) return "";
       return this.config.OLLAMA_CLOUD_COMPACTION_MODEL;
     }
     return "";
@@ -8755,7 +8779,9 @@ export class Orchestrator {
     const agentId = preset?.agentId ?? spec.agentId ?? this.config.DEFAULT_AGENT;
     const profile = this.router.getProfile(agentId);
     if (!profile) {
-      throw new Error(`dispatch ${spec.id}: unknown agent "${agentId}"`);
+      throw new Error(
+        `dispatch ${spec.id}: ${this.refuseUnregisteredAgent(agentId, `unknown agent "${agentId}"`)}`
+      );
     }
     this.quotaPoller?.recordTurnStart(agentId);
     const cwd = preset?.repoPath ?? spec.cwd ?? this.config.REPOS_ROOT;
@@ -9996,7 +10022,11 @@ export class Orchestrator {
     const agentId = described.agent.value;
     const profile = this.router.getProfile(agentId);
     if (!profile) {
-      return { ok: false, agentId, error: `unknown agent ${agentId}` };
+      return {
+        ok: false,
+        agentId,
+        error: this.refuseParkedSession(agentId, `unknown agent ${agentId}`),
+      };
     }
     const overrideModel = overrides?.model?.trim() ? overrides.model.trim() : null;
     const overrideCwd = overrides?.cwd?.trim() ? overrides.cwd.trim() : null;
@@ -13324,8 +13354,12 @@ export class Orchestrator {
       return { ok: false, error };
     };
     if (!profile) {
-      return fail(`Unknown agent \`${parsed.agentId}\`.`);
+      return fail(
+        this.refuseUnregisteredAgent(parsed.agentId, `Unknown agent \`${parsed.agentId}\`.`)
+      );
     }
+    const parkedSelect = this.parkedSelectRefusal(parsed.agentId);
+    if (parkedSelect) return fail(parkedSelect);
 
 
     // Re-read after picker latency (or any concurrent command) so the write is
@@ -15137,7 +15171,11 @@ export class Orchestrator {
     model: string
   ): Promise<{ newSessionId: string; summary: string }> {
     const profile = this.router.getProfile(agentId);
-    if (!profile) throw new Error(`Unknown agent \`${agentId}\`.`);
+    if (!profile) {
+      throw new Error(
+        this.refuseUnregisteredAgent(agentId, `Unknown agent \`${agentId}\`.`)
+      );
+    }
 
     await this.router.invalidate(record.id);
     const cfg = this.store.readConfig(record);
@@ -15427,7 +15465,11 @@ export class Orchestrator {
       if (agentOption !== null || modelOption !== null) {
         const agentId = agentOption?.trim() || record.agentId;
         const profile = this.router.getProfile(agentId);
-        if (!profile) throw new Error(`Unknown agent \`${agentId}\`.`);
+        if (!profile) {
+          throw new Error(
+            this.refuseUnregisteredAgent(agentId, `Unknown agent \`${agentId}\`.`)
+          );
+        }
         const model = modelOption?.trim() ||
           (agentOption !== null ? profile.defaultModel : this.store.readConfig(record).model ?? profile.defaultModel);
         if (!model) throw new Error("Target model must be a non-empty string.");
@@ -17160,9 +17202,16 @@ export class Orchestrator {
     const before = this.store.get(record.id) ?? record;
     const describedBefore = this.router.describeConfig(before);
     const nextAgentId = parsedAgent?.agentId ?? describedBefore.agent.value;
+    const parkedSelect = this.parkedSelectRefusal(nextAgentId);
+    if (parkedSelect) {
+      await i.editReply(parkedSelect);
+      return;
+    }
     const profile = this.router.getProfile(nextAgentId);
     if (!profile) {
-      await i.editReply(`Unknown agent \`${nextAgentId}\`.`);
+      await i.editReply(
+        this.refuseUnregisteredAgent(nextAgentId, `Unknown agent \`${nextAgentId}\`.`)
+      );
       return;
     }
 
@@ -17267,7 +17316,12 @@ export class Orchestrator {
       const storedAgentId = parsedAgent?.agentId ?? live.agentId;
       const appliedProfile = this.router.getProfile(appliedAgentId);
       if (!appliedProfile) {
-        await i.editReply(`Unknown agent \`${appliedAgentId}\`.`);
+        await i.editReply(
+          this.refuseUnregisteredAgent(
+            appliedAgentId,
+            `Unknown agent \`${appliedAgentId}\`.`
+          )
+        );
         return;
       }
       if (
@@ -18350,9 +18404,18 @@ export class Orchestrator {
       record.agentId === "copilot" || record.agentId.startsWith("copilot-");
     const isGrok = record.agentId === "grok" || record.agentId.startsWith("grok-");
     const isCodex = record.agentId === "codex" || record.agentId.startsWith("codex-");
+    if (isOllamaCloud && !this.config.OLLAMA_CLOUD_ENABLED) {
+      await i.editReply({
+        content:
+          parkedAgentMessage(record.agentId, false, "session") ??
+          `\`/seam usage\` is not available for parked agent \`${record.agentId}\`.`,
+      });
+      return;
+    }
+    const usageLabels = liveUsageAgentLabels(this.router.listProfiles().map((p) => p.id));
     if (!isAgy && !isOllamaCloud && !isClaude && !isCopilot && !isGrok && !isCodex) {
       await i.editReply({
-        content: `\`/seam usage\` is only available for the \`agy\`, \`ollama-cloud\`, \`claude\`, \`copilot\`, \`grok\`, and \`codex\` agents. This thread uses \`${record.agentId}\`.`,
+        content: `\`/seam usage\` is only available for the ${formatUsageAgentList(usageLabels) || "currently live"} agents. This thread uses \`${record.agentId}\`.`,
       });
       return;
     }
@@ -18960,7 +19023,10 @@ export class Orchestrator {
       model = null;
       effort = null;
     } else if (!this.router.getProfile(agentId)) {
-      return { ok: false, error: `Unknown agent "${agentId}".` };
+      return {
+        ok: false,
+        error: this.refuseUnregisteredAgent(agentId, `Unknown agent "${agentId}".`),
+      };
     } else {
       const modelErr = refuseIsolatedClaudeModel(agentId, model);
       if (modelErr) return { ok: false, error: modelErr };
@@ -20794,7 +20860,9 @@ export class Orchestrator {
     if (preset.agentId && preset.agentId !== record.agentId) {
       const profile = this.router.getProfile(preset.agentId);
       if (!profile) {
-        notes.push(`⚠️ Unknown agent \`${preset.agentId}\` — agent left unchanged.`);
+        notes.push(
+          `⚠️ ${this.refuseUnregisteredAgent(preset.agentId, `Unknown agent \`${preset.agentId}\``)} — agent left unchanged.`
+        );
       } else {
         await this.router.invalidate(record.id);
         const cfg = this.store.readConfig(record);

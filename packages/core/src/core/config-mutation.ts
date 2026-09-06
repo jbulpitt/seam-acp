@@ -32,6 +32,7 @@ import { randomUUID } from "node:crypto";
 import { PresetsFileSchema } from "../config.js";
 import { uniqueBridgeId } from "./bridge-pairing.js";
 import type { Logger } from "../lib/logger.js";
+import { parkedAgentMessage } from "./parked-agents.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { ConfigDescription } from "./session-router.js";
 import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
@@ -327,6 +328,11 @@ export interface ConfigMutationDeps {
   describeConfig: (record: SessionRecord) => ConfigDescription;
   profiles: Map<string, AgentProfile>;
   defaultModel: string;
+  /**
+   * #220: when false, refuse ollama-cloud as parked even if a stale profile
+   * is still in `profiles`. Undefined keeps historical unknown-agent wording.
+   */
+  ollamaCloudEnabled?: boolean;
   /** CHANNEL_PRESETS_FILE — undefined ⇒ Tier C has no file to write. */
   presetsFile: string | undefined;
   /** SEAM_CONFIG_MUTATION_TIER_C_ENABLED. */
@@ -884,6 +890,10 @@ export class ConfigMutationService {
     // agent — must be a registered profile, or the next start throws.
     let nextAgentId = record.agentId;
     if (changes.agent !== undefined) {
+      const parked = parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select");
+      if (parked) {
+        return { ok: false, error: parked };
+      }
       if (!this.deps.profiles.has(changes.agent)) {
         return {
           ok: false,
@@ -1177,8 +1187,12 @@ export class ConfigMutationService {
       return this.buildPresetDelete(record, name, projectRef);
     }
 
-    if (changes.agent !== undefined && !this.deps.profiles.has(changes.agent)) {
-      return { ok: false, error: `Unknown agent "${changes.agent}".` };
+    if (changes.agent !== undefined) {
+      const parked = parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select");
+      if (parked) return { ok: false, error: parked };
+      if (!this.deps.profiles.has(changes.agent)) {
+        return { ok: false, error: `Unknown agent "${changes.agent}".` };
+      }
     }
     if (changes.permission !== undefined && !PERMISSIONS.includes(changes.permission)) {
       return { ok: false, error: `Invalid permission "${changes.permission}".` };

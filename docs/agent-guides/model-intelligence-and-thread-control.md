@@ -47,8 +47,8 @@ Use it to answer "what's the best-value model in class X" or to steer a worker
 onto a cheaper model that still clears a quality bar.
 
 ### `model_metadata_query({ filters?, sort?, limit? })`
-Query cached metadata for models across **all** configured agents (claude, codex,
-grok, agy, copilot, ollama-cloud, codex…).
+Query cached metadata for models across **all currently configured** agents
+(claude, codex, grok, agy, copilot, … — ollama-cloud only when enabled).
 - `filters`: `provider`, `creator`, `agent` (which agent can run it),
   `minContextWindow`, `benchmark {name?, min}`,
   `maxPrice {input?, output?}` ($/Mtok), `releasedAfter` (YYYY-MM-DD),
@@ -129,7 +129,7 @@ naming opt-out (at least one field required).
   See "Reading a thread name" below.
 - **Reset is reported, not assumed.** Switching **agent** always starts a fresh
   session (context lost). Switching **model** resets on backends that pin the
-  model at session start (codex, ollama-cloud) but not on those that switch live
+  model at session start (codex, and ollama-cloud when enabled) but not on those that switch live
   (claude). Switching **effort** never resets the ACP session. Config-option
   agents update live; metadata/spawn-argument agents such as Claude reload the
   runtime process with their ACP session and conversation context preserved.

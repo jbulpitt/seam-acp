@@ -277,7 +277,8 @@ export class ServiceStatusCard {
   }
 
   private async push(): Promise<void> {
-    const snapshots = this.collect();
+    const allowed = new Set(this.sources.map((source) => source.id));
+    const snapshots = this.collect().filter((snapshot) => allowed.has(snapshot.sourceId));
     const now = this.now();
     if (this.adapter.sendLayout && this.adapter.editLayout) {
       await this.pushLayout(renderServiceStatusLayout(snapshots, this.sources));

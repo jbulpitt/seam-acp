@@ -4,7 +4,8 @@ Two seam-MCP tools that tell you whether the services Seam depends on are
 healthy. Use them **before** debugging Seam when an agent call starts failing —
 a 500 from a model provider looks exactly like a bot bug from the inside.
 
-Monitored sources (static registry; the ids below are the only accepted values):
+Monitored sources (the ids below are the only accepted values on a given
+deployment; unknown ids are rejected):
 
 - `github` — GitHub, including Copilot and its model providers
 - `anthropic` — Claude API and Claude Code
@@ -14,7 +15,10 @@ Monitored sources (static registry; the ids below are the only accepted values):
 - `google-ai-studio` — AI Studio / Gemini API surfaces
 - `google-cloud` — Gemini Code Assist and the Vertex Gemini API
 - `linkworks-ollama` — a **third-party synthetic probe**, not official Ollama
-  Cloud status, and never to be presented as such
+  Cloud status, and never to be presented as such. Registered **only when
+  `OLLAMA_CLOUD_ENABLED=true`**. It exists as the ollama-shaped check for the
+  ollama-cloud agent; when that agent is parked the source is omitted from the
+  default `service_status()` set and is not fetched.
 
 ## `service_status` — cached, instant, no network
 
@@ -94,9 +98,10 @@ asking at once cost one upstream fetch, not several.
 ## Constraints worth knowing
 
 - The tools accept **only registered source ids**. There is no argument that
-  takes a URL, a header, or a credential — the registry is static and compiled
-  in. An unknown id is a clear validation error naming the registered ids, never
-  an empty result.
+  takes a URL, a header, or a credential — the registry is compiled in, and
+  `linkworks-ollama` is present only when Ollama Cloud is enabled. An unknown
+  id is a clear validation error naming the registered ids, never an empty
+  result.
 - Every list is explicitly bounded, so output stays small enough to reason over.
 - If a deployment has the subsystem disabled, both tools answer
   "not enabled on this deployment" rather than failing silently.

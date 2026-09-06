@@ -3,6 +3,7 @@ dotenv.config({ override: true });
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { parkedAgentMessage } from "./core/parked-agents.js";
 import { retiredAgentConfigMessage } from "./core/retired-agents.js";
 import { DISCORD_COMPACTION_MODEL } from "./core/compaction/discord-executor.js";
 
@@ -469,12 +470,11 @@ const Schema = z.object({
   ZAI_COMPACTION_MODEL: z.string().default("glm-5.2"),
 
   /**
-   * Register the Ollama Cloud agent — OpenAI Codex (codex-acp) pointed at
-   * Ollama's OpenAI-compatible endpoint (https://ollama.com/v1) via a dedicated
-   * CODEX_HOME whose config.toml declares an "ollama-cloud" model_provider
-   * (wire_api = "responses"). Uses open-weight models hosted on Ollama's cloud
-   * infrastructure. Only registered when OLLAMA_CLOUD_ENABLED and
-   * OLLAMA_CLOUD_API_KEY are set.
+   * Complete reversible park switch for Ollama Cloud (#220). When false the
+   * agent is not in the live catalog, quota does not spawn `ollama-usage`,
+   * `linkworks-ollama` is not fetched, and leftover sessions fail closed with
+   * a parked message. The profile factory, schema, brand, and namer glyph
+   * stay. Registration still also requires OLLAMA_CLOUD_API_KEY.
    */
   OLLAMA_CLOUD_ENABLED: z
     .enum(["true", "false"])
@@ -1167,6 +1167,18 @@ export function loadConfig(): Config {
   // failure would only surface later, per-thread, as a turn error. Fail at boot
   // instead, and never silently substitute another agent: which agent replaces
   // a retired default is the operator's decision, not ours.
+  const parkedDefault = parkedAgentMessage(
+    cfg.DEFAULT_AGENT,
+    cfg.OLLAMA_CLOUD_ENABLED,
+    "config",
+    "DEFAULT_AGENT"
+  );
+  if (parkedDefault) {
+    throw new Error(
+      `Invalid configuration: ${parkedDefault}\n` +
+        `Supported live agents include copilot, claude, codex, grok, agy.`
+    );
+  }
   const retiredDefault = retiredAgentConfigMessage("DEFAULT_AGENT", cfg.DEFAULT_AGENT);
   if (retiredDefault) {
     throw new Error(

@@ -686,7 +686,7 @@ const TOOLS = [
       "Change a teammate thread's agent, model, reasoning effort, naming role, automatic-naming " +
       "opt-out, and/or Claude Fast mode within YOUR channel. " +
       "An agent switch ALWAYS creates a fresh session and drops that thread's conversation context. " +
-      "Model switches reset only on session-pinned backends (codex and ollama-cloud); live-config " +
+      "Model switches reset only on session-pinned backends (codex, and ollama-cloud when enabled); live-config " +
       "backends such as Claude preserve context. Effort never resets the ACP session: config-option " +
       "agents update live, while meta/spawn-argument agents (including Claude) reload their runtime " +
       "with context preserved. Changing fastMode ALWAYS forges a fresh session (Fast is a " +
@@ -793,7 +793,7 @@ const TOOLS = [
     name: "service_status",
     description:
       "Read the cached upstream status of the services Seam depends on (GitHub, Claude, OpenAI, xAI, " +
-      "Google AI Studio, Google Cloud, and a third-party Ollama probe). Cache only — this tool performs " +
+      "Google AI Studio, Google Cloud). Cache only — this tool performs " +
       "no network work and returns immediately. Each source reports `reportedStatus` (what the provider " +
       "said) separately from `observation.health` (whether Seam can currently reach it), so a stale or " +
       "failing poll is never mistaken for a provider outage. Use this first when an agent call fails and " +
@@ -1703,7 +1703,7 @@ const INSTRUCTIONS = [
   "  valid effort tiers are metadata only, and the default benchmark is the AA Intelligence Index.",
   "- service_status(sourceIds?, includeComponents?, includeIncidents?, includeHistory?, limits…): read the",
   "  CACHED upstream status of the services Seam depends on (GitHub, Claude, OpenAI, xAI, Google AI Studio,",
-  "  Google Cloud, plus a third-party Ollama probe). No network work, returns immediately. When an agent call",
+  "  Google Cloud). No network work, returns immediately. When an agent call",
   "  starts failing, check this BEFORE debugging Seam: it tells you whether the provider is down. Each source",
   "  separates `reportedStatus` (what the provider said) from `observation.health` (whether Seam can reach it),",
   "  so \"we cannot currently tell\" never reads as \"the provider is fine\".",

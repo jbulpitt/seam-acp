@@ -20,6 +20,10 @@ import { SessionStore } from "./core/session-store.js";
 import { DelegationReconciler } from "./core/delegation-reconciler.js";
 import { DELEGATION_TERMINAL_STATUSES } from "./core/types.js";
 import { SessionRouter } from "./core/session-router.js";
+import {
+  shouldIncludeLinkworksOllamaSource,
+  shouldRegisterOllamaCloud,
+} from "./core/parked-agents.js";
 import { makeCopilotProfile } from "@seam/adapters";
 import { makeClaudeProfile } from "@seam/adapters";
 import { makeAgyProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
@@ -297,9 +301,11 @@ async function main(): Promise<void> {
   //   - Existing threads self-heal: their stale claude acp_session_id fails
   //     session/load and SessionRouter falls through to a fresh codex session;
   //     :cloud-suffixed model pins still resolve on the OpenAI endpoint.
-  // Only registered when OLLAMA_CLOUD_ENABLED and OLLAMA_CLOUD_API_KEY are set.
+  // Only registered when OLLAMA_CLOUD_ENABLED and OLLAMA_CLOUD_API_KEY are set
+  // (`shouldRegisterOllamaCloud`). The flag is also the park switch (#220).
   const ollamaCloudCodexHome = path.join(process.env.HOME ?? "", ".codex-ollama-cloud");
-  if (config.OLLAMA_CLOUD_ENABLED && config.OLLAMA_CLOUD_API_KEY) {
+  const ollamaCloudLive = shouldRegisterOllamaCloud(config);
+  if (ollamaCloudLive) {
     fs.mkdirSync(ollamaCloudCodexHome, { recursive: true });
     // Per-model catalog (context windows + system prompt) for the curated model
     // list, so codex uses each model's real context window instead of falling
@@ -333,7 +339,8 @@ async function main(): Promise<void> {
       "utf8",
     );
   }
-  const ollamaCloud = config.OLLAMA_CLOUD_ENABLED && config.OLLAMA_CLOUD_API_KEY
+  const ollamaCloudApiKey = config.OLLAMA_CLOUD_API_KEY?.trim() ?? "";
+  const ollamaCloud = ollamaCloudLive && ollamaCloudApiKey
     ? makeCodexProfile({
         id: "ollama-cloud",
         displayName: "Ollama Cloud",
@@ -351,7 +358,7 @@ async function main(): Promise<void> {
         },
         extraEnv: {
           CODEX_HOME: ollamaCloudCodexHome,
-          OLLAMA_CLOUD_API_KEY: config.OLLAMA_CLOUD_API_KEY,
+          OLLAMA_CLOUD_API_KEY: ollamaCloudApiKey,
         },
         sessionsRoot: path.join(ollamaCloudCodexHome, "sessions"),
       })
@@ -371,11 +378,13 @@ async function main(): Promise<void> {
   let serviceStatusView: ServiceStatusMcpView | undefined;
   let serviceStatusCard: ServiceStatusCard | undefined;
   let stopServiceStatus: (() => void) | undefined;
+  let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
 
   const router = new SessionRouter({
     logger,
     store,
     profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])],
+    ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
     // Legacy DEFAULT_AUTO_APPROVE=true overrides the policy default to "always".
@@ -448,6 +457,7 @@ async function main(): Promise<void> {
       agyCliPath: config.AGY_CLI_PATH,
       grokCliPath: config.GROK_CLI_PATH,
       ollamaUsageCliPath: config.OLLAMA_USAGE_CLI_PATH,
+      ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
     }),
     staleRetentionMs: config.QUOTA_STALE_RETENTION_MS,
   });
@@ -576,7 +586,10 @@ async function main(): Promise<void> {
   const serviceStatusEnabled =
     config.SERVICE_STATUS_ENABLED ?? Boolean(config.DISCORD_SERVICE_STATUS_THREAD_ID);
   if (serviceStatusEnabled) {
-    const sources = createDefaultServiceStatusSources();
+    const sources = createDefaultServiceStatusSources({
+      includeLinkworksOllama: shouldIncludeLinkworksOllamaSource(config.OLLAMA_CLOUD_ENABLED),
+    });
+    serviceStatusSources = sources;
     serviceStatusStore = new ServiceStatusStore(
       path.join(config.DATA_DIR, "service-status.sqlite")
     );
@@ -678,7 +691,11 @@ async function main(): Promise<void> {
         const visionMode = effectiveProfile?.staticModels?.find(
           (entry) => entry.modelId === effective.model.value
         )?.visionMode;
-        if (effective.agent.value !== "ollama-cloud" || visionMode !== "tool") {
+        if (
+          !config.OLLAMA_CLOUD_ENABLED ||
+          effective.agent.value !== "ollama-cloud" ||
+          visionMode !== "tool"
+        ) {
           throw new Error("inspect_image is only available to tool-vision sessions");
         }
         return agyImageInspector({ ...req, ownerId: record.id });
@@ -1210,17 +1227,21 @@ async function main(): Promise<void> {
   // Pinned upstream-status card (#183), an optional consumer of the subsystem
   // constructed above. The card paints cached/no-data rows before polling
   // begins; polling itself starts once, below, whether or not a card exists.
-  if (serviceStatusManager && serviceStatusStore) {
+  if (serviceStatusManager && serviceStatusStore && serviceStatusSources) {
     const statusStore = serviceStatusStore;
     const statusManager = serviceStatusManager;
+    const sources = serviceStatusSources;
     if (config.DISCORD_SERVICE_STATUS_THREAD_ID) {
       serviceStatusCard = new ServiceStatusCard({
         logger,
         adapter,
         threadId: config.DISCORD_SERVICE_STATUS_THREAD_ID,
         dataDir: config.DATA_DIR,
-        sources: createDefaultServiceStatusSources(),
-        collect: () => statusStore.listSnapshots(),
+        sources,
+        collect: () => {
+          const allowed = new Set(sources.map((source) => source.id));
+          return statusStore.listSnapshots().filter((snap) => allowed.has(snap.sourceId));
+        },
       });
       orchestrator.setServiceStatusRefresh(() => statusManager.refresh({ force: true }));
       await serviceStatusCard.start().catch((err) =>

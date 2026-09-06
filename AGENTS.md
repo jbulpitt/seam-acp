@@ -46,8 +46,9 @@ hand-editing runtime state.
 - **Reconfigure or reset another thread's session** (not just message it):
   `configure_thread(thread, { agent?, model?, effort?, role?, disableThreadPrefix? })`
   changes its agent / model / effort / naming role and reports what actually
-  reset (agent switch always resets; model switch resets on codex/ollama, not
-  claude; effort never does); `reset_thread_session(thread)` clears its context
+  reset (agent switch always resets; model switch resets on codex, and on
+  ollama-cloud when that agent is enabled, not claude; effort never does);
+  `reset_thread_session(thread)` clears its context
   but keeps the model. Same in-channel scope as `handoff`.
 - **`role` is what a thread is for, not how it runs:** a free-form label
   (`worker`, `qa`, `orchestrator`, …) that is a first-class config dimension

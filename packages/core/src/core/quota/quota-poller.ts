@@ -9,6 +9,7 @@ import {
   type AgentProfile,
 } from "@seam/adapters";
 import type { Logger } from "../../lib/logger.js";
+import { isOllamaCloudAgentId } from "../parked-agents.js";
 import {
   mapAgyQuota,
   mapClaudeQuota,
@@ -48,9 +49,20 @@ export function createAgentQuotaSources(
     agyCliPath?: string;
     grokCliPath?: string;
     ollamaUsageCliPath?: string;
+    /**
+     * When false, never wire an ollama-cloud quota source — even if a stale
+     * profile is still in the list. `undefined` keeps historical behaviour
+     * (profile-driven) so existing tests that pass an ollama-cloud profile
+     * without the flag still exercise the CLI path.
+     */
+    ollamaCloudEnabled?: boolean;
   }
 ): AgentQuotaSource[] {
-  return profiles.map((profile) => {
+  const live =
+    opts.ollamaCloudEnabled === false
+      ? profiles.filter((profile) => !isOllamaCloudAgentId(profile.id))
+      : profiles;
+  return live.map((profile) => {
     const identity = { agentId: profile.id, displayName: profile.displayName };
     if (profile.id === "agy") {
       return {

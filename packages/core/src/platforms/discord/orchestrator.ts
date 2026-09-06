@@ -8460,7 +8460,38 @@ export class Orchestrator {
             const harvested = extractSeamResultFromText(result.text);
             if (harvested.ok) this.choiceResults.submitFromDispatch(spec.id, harvested.value);
           }
-          this.choiceResults.turnEnded(spec.id, isLiveIngest ? { resultOptional: true } : undefined);
+          // #224: "no declared result is fine" applies ONLY to a turn that
+          // actually succeeded. This runs in a `finally`, so every failure mode
+          // lands here too — injectTurn returns `{ error }` rather than throwing
+          // for turn-level failures, a timeout sets `timedOut`, a throw leaves
+          // `result` undefined, and a stale fence / interrupt means the answer
+          // was discarded. Settling any of those as `{ ok: true }` would hand an
+          // HTTP client a 200 for a handoff that never landed. Those verdicts
+          // are re-derived below for the panel/ledger; the ordering is why they
+          // cannot simply be read from there.
+          const failure = !result
+            ? "the dispatched turn failed before it produced a result"
+            : result.timedOut
+              ? "the dispatched turn timed out"
+              : result.error
+                ? `the dispatched turn failed: ${result.error}`
+                : result.cancelled
+                  ? "the dispatched turn was cancelled"
+                  : !this.queueFenceCurrent(queueFence)
+                    ? "the dispatched turn was discarded (thread reset)"
+                    : this.interruptedDispatches.has(spec.id)
+                      ? "the dispatched turn was interrupted"
+                      : undefined;
+          this.choiceResults.turnEnded(
+            spec.id,
+            // Choice keeps its original contract untouched: a declared result or
+            // nothing. Only live ingest opts into success-without-one.
+            isLiveIngest
+              ? failure
+                ? { error: failure }
+                : { resultOptional: true }
+              : undefined
+          );
         }
         const liveRuntime =
           effectiveSession === "live" && typeof this.router.getRuntime === "function"

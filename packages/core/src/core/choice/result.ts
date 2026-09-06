@@ -228,19 +228,30 @@ export class ChoiceResultHub {
    * The dispatched turn is over.
    *
    * `resultOptional` (#224, live-thread ingest) flips the default: the POST was
-   * a handoff, not a scoring job, so ending with nothing declared is SUCCESS —
-   * finish `{ ok: true }` instead of failing the job. A `resultSchema` still
-   * overrides that: asking for a shape means asking for `submit_result`.
+   * a handoff, not a scoring job, so a turn that SUCCEEDS without declaring
+   * anything is a success — finish `{ ok: true }` instead of failing the job.
+   * It is the caller's job to pass it only for a genuinely successful turn; a
+   * failed / timed-out / cancelled turn must pass `error` instead, or an HTTP
+   * client would poll a broken handoff as 200. A `resultSchema` overrides
+   * `resultOptional` either way: asking for a shape means asking for
+   * `submit_result`.
+   *
+   * `error` replaces the "no declared result" wording with the real reason.
+   *
+   * Every terminal path unbinds. The session/channel aliases are how a LIVE
+   * ingest turn's `submit_result` finds its waiter, and a live thread is reused
+   * by the next queued POST — leaving a stale channel alias behind would let
+   * that next turn settle the previous job.
    */
-  turnEnded(dispatchId: string, opts?: { resultOptional?: boolean }): void {
+  turnEnded(dispatchId: string, opts?: { resultOptional?: boolean; error?: string }): void {
     const w = this.waiters.get(dispatchId);
     const row = this.store.getChoiceResult(dispatchId);
     if (row?.status === "ok") {
-      this.waiters.delete(dispatchId);
+      this.unbind(dispatchId);
       return;
     }
     const schema = w?.schema ?? row?.schema ?? null;
-    if (opts?.resultOptional && schema == null) {
+    if (opts?.resultOptional && !opts.error && schema == null) {
       this.store.finishChoiceResult(dispatchId, "ok", { ok: true }, null);
       if (w && !w.settled) {
         w.settled = true;
@@ -249,10 +260,15 @@ export class ChoiceResultHub {
       this.unbind(dispatchId);
       return;
     }
-    this.store.finishChoiceResult(dispatchId, "missing", null, "turn ended with no submit_result / seam-result");
+    this.store.finishChoiceResult(
+      dispatchId,
+      "missing",
+      null,
+      opts?.error ?? "turn ended with no submit_result / seam-result"
+    );
     if (w && !w.settled) {
       w.settled = true;
-      w.reject(new Error("turn ended with no declared result"));
+      w.reject(new Error(opts?.error ?? "turn ended with no declared result"));
     }
     this.unbind(dispatchId);
   }

@@ -224,11 +224,29 @@ export class ChoiceResultHub {
     return { ok: true, dispatchId };
   }
 
-  turnEnded(dispatchId: string): void {
+  /**
+   * The dispatched turn is over.
+   *
+   * `resultOptional` (#224, live-thread ingest) flips the default: the POST was
+   * a handoff, not a scoring job, so ending with nothing declared is SUCCESS —
+   * finish `{ ok: true }` instead of failing the job. A `resultSchema` still
+   * overrides that: asking for a shape means asking for `submit_result`.
+   */
+  turnEnded(dispatchId: string, opts?: { resultOptional?: boolean }): void {
     const w = this.waiters.get(dispatchId);
     const row = this.store.getChoiceResult(dispatchId);
     if (row?.status === "ok") {
       this.waiters.delete(dispatchId);
+      return;
+    }
+    const schema = w?.schema ?? row?.schema ?? null;
+    if (opts?.resultOptional && schema == null) {
+      this.store.finishChoiceResult(dispatchId, "ok", { ok: true }, null);
+      if (w && !w.settled) {
+        w.settled = true;
+        w.resolve({ ok: true });
+      }
+      this.unbind(dispatchId);
       return;
     }
     this.store.finishChoiceResult(dispatchId, "missing", null, "turn ended with no submit_result / seam-result");
@@ -236,6 +254,10 @@ export class ChoiceResultHub {
       w.settled = true;
       w.reject(new Error("turn ended with no declared result"));
     }
+    this.unbind(dispatchId);
+  }
+
+  private unbind(dispatchId: string): void {
     this.waiters.delete(dispatchId);
     for (const [sid, id] of this.sessionToDispatch) {
       if (id === dispatchId) this.sessionToDispatch.delete(sid);

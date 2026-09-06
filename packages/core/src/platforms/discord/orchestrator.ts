@@ -5548,6 +5548,11 @@ export class Orchestrator {
     return this.choiceDestLive(card, optionIndex);
   }
 
+  /** Live-state of a bare thread snowflake — #224 ingest checks this at fire. */
+  inspectThreadLive(threadId: string): Promise<"ok" | "gone" | "archived"> {
+    return this.threadLiveState(threadId);
+  }
+
   submitChoiceResult(
     record: { id: string; channelRef: string },
     value: unknown
@@ -7974,7 +7979,11 @@ export class Orchestrator {
     // on the target thread and post a result card there. Same start-indicator +
     // ledger + done-file plumbing, different body (see dispatchCompact).
     if (spec.kind === "compact") return this.dispatchCompact(spec);
-    if (spec.kind === "ingest") return this.dispatchIngestEndpoint(spec);
+    // #224: a `thread` endpoint plans `session: "live"` — a typical handoff into
+    // the target thread's own session. It keeps `kind: "ingest"` for the HTTP
+    // waiter and the ledger, but must NOT take the synthetic isolated record
+    // below; it falls through to the normal live dispatch path.
+    if (spec.kind === "ingest" && spec.session !== "live") return this.dispatchIngestEndpoint(spec);
     if (spec.kind === "thread_voice") return this.dispatchThreadVoice(spec);
 
     const target: ChannelRef = { platform: PLATFORM, id: spec.target };
@@ -8359,8 +8368,14 @@ export class Orchestrator {
       // cancels); isolated/preset runs use a throwaway runtime and are unaffected.
       const isLiveDispatch = effectiveSession === "live";
       if (isLiveDispatch) this.activeLiveDispatch.set(spec.target, spec.id);
+      // Both kinds carry an HTTP waiter that must be settled when the turn ends.
+      // #224 live ingest additionally treats "no declared result" as success:
+      // the POST was a handoff, so the answer belongs in the thread, not in a
+      // JSON body. A resultSchema still forces submit_result (see turnEnded).
       const isChoice = spec.kind === "choice";
-      if (isChoice && this.choiceResults) {
+      const isLiveIngest = spec.kind === "ingest";
+      const bindsResult = isChoice || isLiveIngest;
+      if (bindsResult && this.choiceResults) {
         // Isolated MCP is injected as the authoring thread (record.id). Bind
         // that id or submit_result looks up an ACP uuid and misses.
         this.choiceResults.bindSession(record.id, spec.id);
@@ -8396,7 +8411,7 @@ export class Orchestrator {
                 acpSessionId: sessionId,
               });
             } catch { /* best-effort */ }
-            if (isChoice) this.choiceResults?.bindSession(sessionId, spec.id);
+            if (bindsResult) this.choiceResults?.bindSession(sessionId, spec.id);
           },
           // Drive both additive views from the ONE event stream:
           //  - the OUTPUT renderer gets agent-text (the answer): the flush
@@ -8440,12 +8455,12 @@ export class Orchestrator {
         if (isLiveDispatch && this.activeLiveDispatch.get(spec.target) === spec.id) {
           this.activeLiveDispatch.delete(spec.target);
         }
-        if (isChoice && this.choiceResults) {
+        if (bindsResult && this.choiceResults) {
           if (result?.text) {
             const harvested = extractSeamResultFromText(result.text);
             if (harvested.ok) this.choiceResults.submitFromDispatch(spec.id, harvested.value);
           }
-          this.choiceResults.turnEnded(spec.id);
+          this.choiceResults.turnEnded(spec.id, isLiveIngest ? { resultOptional: true } : undefined);
         }
         const liveRuntime =
           effectiveSession === "live" && typeof this.router.getRuntime === "function"
@@ -14842,9 +14857,10 @@ export class Orchestrator {
         const lines = endpoints.slice(0, 10).map((e) => {
           const uniq = e.uniqueStudent ? " · unique-student" : "";
           const notify = e.notifyThread ? ` · notify ${e.notifyThread}` : "";
+          const live = e.thread ? ` · live → ${e.thread}` : "";
           const preset = e.preset ? ` · preset ${e.preset}` : "";
           const model = e.model ? ` · ${e.model}` : "";
-          return `🌐 \`${e.id}\` ${e.name}${preset}${model}${uniq}${notify}`;
+          return `🌐 \`${e.id}\` ${e.name}${preset}${model}${uniq}${notify}${live}`;
         });
         if (endpoints.length > 10) lines.push(`…and ${endpoints.length - 10} more`);
         embed.addFields({
@@ -18992,7 +19008,13 @@ export class Orchestrator {
     record: SessionRecord,
     specInput: unknown
   ): Promise<
-    | { ok: true; ingestId: string; ingestToken: string; ingestUrl: string }
+    | {
+        ok: true;
+        ingestId: string;
+        ingestToken: string;
+        ingestUrl: string;
+        thread?: string | null;
+      }
     | { ok: false; error: string }
   > {
     const authorId = this.currentAuthorId(record.channelRef);
@@ -19013,7 +19035,41 @@ export class Orchestrator {
     let cwd: string | null = spec.cwd ?? this.effectiveCwd(record);
     let model: string | null = ingestMintStoredModel(spec.model);
     let effort: string | null = spec.effort ?? cfg.reasoningEffort ?? null;
-    if (spec.preset) {
+    if (spec.thread) {
+      // #224 live handoff. Same-channel only (the handoff rule), and the thread
+      // must still exist right now — a mint against a dead thread would only
+      // fail later, one POST at a time. Identity comes from the target session,
+      // so pin nothing here.
+      const target = this.store.getByChannel(PLATFORM, spec.thread);
+      const sameChannel =
+        spec.thread === record.channelRef ||
+        Boolean(
+          target &&
+            record.parentRef &&
+            target.parentRef === record.parentRef &&
+            target.platform === record.platform
+        );
+      if (!sameChannel) {
+        return {
+          ok: false,
+          error: `Refused: thread ${spec.thread} is not a session in your channel.`,
+        };
+      }
+      const live = await this.threadLiveState(spec.thread);
+      if (live !== "ok") {
+        return {
+          ok: false,
+          error:
+            live === "gone"
+              ? `Refused: thread ${spec.thread} no longer exists on Discord.`
+              : `Refused: thread ${spec.thread} is archived.`,
+        };
+      }
+      agentId = null;
+      cwd = null;
+      model = null;
+      effort = null;
+    } else if (spec.preset) {
       const preset = this.store.getPresetByNameScoped(spec.preset, record.parentRef);
       if (!preset) {
         return { ok: false, error: `Unknown preset "${spec.preset}" in this project.` };
@@ -19045,6 +19101,7 @@ export class Orchestrator {
       corsOrigins: spec.corsOrigins ?? null,
       uniqueStudent: spec.uniqueStudent === true,
       notifyThread: spec.notifyThread ?? null,
+      thread: spec.thread ?? null,
       preset: spec.preset ?? null,
       status: "open",
       createdBy: record.id,
@@ -19056,10 +19113,16 @@ export class Orchestrator {
     this.store.insertIngestEndpoint(row);
     const ingestUrl = this.ingestUrl ? this.ingestUrl() : "/ingest";
     this.logger.info(
-      { ingestId: row.id, thread: record.channelRef },
+      { ingestId: row.id, thread: record.channelRef, liveThread: row.thread },
       "ingest endpoint minted"
     );
-    return { ok: true, ingestId: row.id, ingestToken, ingestUrl };
+    return {
+      ok: true,
+      ingestId: row.id,
+      ingestToken,
+      ingestUrl,
+      ...(row.thread ? { thread: row.thread } : {}),
+    };
   }
 
   async cancelIngest(

@@ -517,6 +517,7 @@ async function main(): Promise<void> {
     logger: logger.child({ mod: "ingest" }),
     enqueue: (spec) => enqueueDispatchSpec(config.DATA_DIR, spec),
     destLive: (card, optionIndex) => orchestrator.inspectChoiceDestLive(card, optionIndex),
+    threadLive: (threadId) => orchestrator.inspectThreadLive(threadId),
     authoringSession: (channelRef) => store.getByChannel("discord", channelRef),
     authoringCwd: (record) => router.effectiveCwd(record),
     publicBase: ingestPublicBase,

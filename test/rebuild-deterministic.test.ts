@@ -293,6 +293,85 @@ describe("reconstructSessionFromDiscord", () => {
     ).rejects.toThrow(/cannot resolve a context window/);
     expect(t.seedCalls).toHaveLength(0);
     expect(t.fetchCalls).toHaveLength(0);
+    expect(t.panels[0]?.title).toBe("Rebuild");
+    expect(t.panels[0]?.description).toContain("window ? · 60% budget ?");
+    expect(t.panels.at(-1)?.title).toBe("Rebuild failed");
+    expect(t.panels.at(-1)?.description).toMatch(/cannot resolve a context window/);
+  });
+
+  it("warms a cold Codex context window from the picker catalog", async () => {
+    let pickerCalls = 0;
+    const t = makeOrch({
+      recordOver: { agentId: "codex" },
+      cfg: { model: "gpt-5.6-sol" },
+      profiles: {
+        codex: {
+          id: "codex",
+          defaultModel: "gpt-5.6-sol",
+          staticModels: [],
+          sessionManager: { name: "mgr" },
+          listPickerModels: async () => {
+            pickerCalls += 1;
+            return [{
+              modelId: "gpt-5.6-sol",
+              name: "GPT-5.6-Sol",
+              contextLimit: 258_400,
+            }];
+          },
+        },
+      },
+    });
+    const res = await (t.orch as any).reconstructSessionFromDiscord({
+      record: t.rec,
+      channel: { platform: "discord", id: "thread-r" },
+      observedAtStart: "acp-active",
+      attachIntent: "attach",
+    });
+    expect(pickerCalls).toBe(1);
+    expect(res.destination).toEqual({
+      agentId: "codex",
+      model: "gpt-5.6-sol",
+      contextWindow: 258_400,
+    });
+    expect(res.seed.budgetTokens).toBe(Math.floor(258_400 * 0.6));
+  });
+
+  it("warms the catalog on the destination host before the controller profile", async () => {
+    let controllerCalls = 0;
+    const hostCalls: Array<{ location: string; method: string; agentId: string }> = [];
+    const t = makeOrch({
+      recordOver: { agentId: "codex" },
+      cfg: { model: "gpt-5.6-sol" },
+      profiles: {
+        codex: {
+          id: "codex",
+          defaultModel: "gpt-5.6-sol",
+          staticModels: [],
+          sessionManager: { name: "mgr" },
+          listPickerModels: async () => {
+            controllerCalls += 1;
+            return [];
+          },
+        },
+      },
+    });
+    t.orch.setBridgeHub({
+      rpc: async (location: string, method: string, _params: unknown, agentId: string) => {
+        hostCalls.push({ location, method, agentId });
+        return [{ modelId: "gpt-5.6-sol", name: "Sol", contextLimit: 258_400 }];
+      },
+    } as any);
+    const res = await (t.orch as any).reconstructSessionFromDiscord({
+      record: t.rec,
+      channel: { platform: "discord", id: "thread-r" },
+      observedAtStart: "acp-active",
+      attachIntent: "attach",
+    });
+    expect(hostCalls).toEqual([
+      { location: "local", method: "listPickerModels", agentId: "codex" },
+    ]);
+    expect(controllerCalls).toBe(0);
+    expect(res.destination.contextWindow).toBe(258_400);
   });
 
   it("does not use another model's static window for an unknown destination", async () => {

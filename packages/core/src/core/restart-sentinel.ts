@@ -1,5 +1,5 @@
 /**
- * PM2 restart is requested by writing DATA_DIR/.restart-pending.
+ * A managed-process restart is requested by writing DATA_DIR/.restart-pending.
  * `npm run redeploy` writes an empty file → drain in-flight turns, then restart.
  * A file whose trimmed body is `force` skips the drain so SIGTERM hits live
  * ACP processes; turn-resume (#76) continues them after boot.
@@ -54,14 +54,21 @@ export function waitForRestartDrain(
   });
 }
 
-/** Spawn the same detached PM2 restart for graceful, force, and timed-out drains. */
-export async function restartSeamAcpProcess(): Promise<void> {
-  const { spawn } = await import("node:child_process");
-  const child = spawn("pm2", ["restart", "seam-acp"], {
-    detached: true,
-    stdio: "ignore",
-  });
-  child.unref();
+export type ProcessSignaler = (pid: number, signal: NodeJS.Signals) => boolean;
+
+/**
+ * End this process after the sentinel drain. The process supervisor owns the
+ * restart: PM2 does so during migration, and the production systemd unit uses
+ * `Restart=always`. Signalling ourselves keeps redeploy independent of either
+ * supervisor and still enters the normal bounded SIGTERM shutdown path.
+ *
+ * The historical export name remains during the PM2-to-systemd migration so
+ * callers do not need a flag-day rename.
+ */
+export async function restartSeamAcpProcess(
+  signalProcess: ProcessSignaler = process.kill.bind(process)
+): Promise<void> {
+  signalProcess(process.pid, "SIGTERM");
 }
 
 /** Write the force sentinel. Returns the path written. */

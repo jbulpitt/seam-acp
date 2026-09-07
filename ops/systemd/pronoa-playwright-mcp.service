@@ -1,0 +1,33 @@
+[Unit]
+Description=Pronoa Playwright MCP service
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/Projects/pronoa
+Environment=HOME=/home/ubuntu
+Environment=NODE_ENV=production
+Environment=PATH=/home/ubuntu/.nvm/versions/node/v22.22.2/bin:/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/ubuntu/.nvm/versions/node/v22.22.2/bin/playwright-mcp --port 8766 --host 127.0.0.1 --headless --isolated --executable-path /home/ubuntu/.cache/ms-playwright/chromium-1226/chrome-linux/chrome --image-responses allow --output-dir /tmp/pronoa-playwright-mcp
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+KillMode=control-group
+OOMPolicy=continue
+Nice=10
+CPUWeight=25
+IOWeight=25
+OOMScoreAdjust=300
+MemoryHigh=4G
+MemoryMax=6G
+MemorySwapMax=1G
+LimitNOFILE=65535
+SyslogIdentifier=pronoa-playwright-mcp
+
+[Install]
+WantedBy=multi-user.target

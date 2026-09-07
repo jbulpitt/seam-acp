@@ -1265,7 +1265,7 @@ describe("#174 admission gates", () => {
         dispatchWatcher: { stop: () => order.push("dispatch-intake"), inFlightCount: 0 },
         scheduledManager: { stop: () => order.push("cron") },
         postNotification: async () => {},
-        restartProcess: async () => void order.push("pm2-restart"),
+        restartProcess: async () => void order.push("process-restart"),
       }) as unknown as ReturnType<typeof makeQuiesceHost> & {
         handleRestartSentinel(): Promise<void>;
       };
@@ -1288,19 +1288,19 @@ describe("#174 admission gates", () => {
       endUserTurn(); // the original user turn ends; the fire is still running
       expect(self.activeTurns).toBe(1);
       await vi.advanceTimersByTimeAsync(1500);
-      expect(order).not.toContain("pm2-restart"); // the fire extended the drain
+      expect(order).not.toContain("process-restart"); // the fire extended the drain
 
       endDueFire(); // the scheduled fire finishes
       expect(self.activeTurns).toBe(0);
       await vi.advanceTimersByTimeAsync(500); // drain poll notices
-      expect(order).not.toContain("pm2-restart"); // still in the 2s flush wait
+      expect(order).not.toContain("process-restart"); // still in the 2s flush wait
       await vi.advanceTimersByTimeAsync(2000);
       await done;
 
-      // Last beat, in order: cron stops, then pm2 restarts. `stopIntake` is
+      // Last beat, in order: cron stops, then the managed process restarts. `stopIntake` is
       // called twice by this path and must stay idempotent — one entry, and
       // never a second "cron" from the earlier call.
-      expect(order).toEqual(["dispatch-intake", "cron", "pm2-restart"]);
+      expect(order).toEqual(["dispatch-intake", "cron", "process-restart"]);
       expect(await readdir(dataDir)).not.toContain(".restart-pending");
     } finally {
       vi.useRealTimers();
@@ -1380,7 +1380,7 @@ describe("#174 admission gates", () => {
         dispatchWatcher: { stop: () => {}, inFlightCount: 0 },
         scheduledManager: { stop: () => {} },
         postNotification: async (m: string) => void notes.push(m),
-        restartProcess: async () => void order.push("pm2-restart"),
+        restartProcess: async () => void order.push("process-restart"),
         channelGenerations: new Map<string, number>(),
         lastUserMessageAt: new Map<string, number>(),
         store: {},
@@ -1418,7 +1418,7 @@ describe("#174 admission gates", () => {
       await vi.advanceTimersByTimeAsync(5000);
       await done;
       // The turn ran to completion first, and only then did the restart fire.
-      expect(order).toEqual(["turn-ran", "pm2-restart"]);
+      expect(order).toEqual(["turn-ran", "process-restart"]);
     } finally {
       vi.useRealTimers();
     }

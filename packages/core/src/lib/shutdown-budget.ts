@@ -8,10 +8,10 @@
  */
 
 /**
- * What the host gives us after SIGTERM before SIGKILL. pm2's default
- * `kill_timeout` is 1.6s and ours is raised for #174; systemd's
- * `DefaultTimeoutStopSec` is 90s. 30s is the strictest of the plausible
- * hosts, so it is the one the budget below has to satisfy.
+ * What the host gives us after SIGTERM before SIGKILL. The legacy PM2
+ * `kill_timeout` was raised for #174, and the production systemd unit allows
+ * 120s. Keep 30s as the stricter portable contract so moving supervisors can
+ * never silently make shutdown less safe.
  */
 export const HOST_SIGKILL_BUDGET_MS = 30_000;
 

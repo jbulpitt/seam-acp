@@ -1908,7 +1908,7 @@ export class Orchestrator {
     // made `report-update` miss 5:25 while a restart sat pending for hours —
     // list still showed the stale next_run, and catch-up could then skip it.
     // Isolated scheduled fires increment activeTurns, so they extend the drain
-    // instead of being SIGTERM'd. Stop only in the last beat before pm2 restart.
+    // instead of being SIGTERM'd. Stop only in the last beat before restart.
     // `force` (relocate-repo) skips the drain so live ACP processes take
     // SIGTERM; turn-resume continues them after boot.
 
@@ -1972,7 +1972,7 @@ export class Orchestrator {
 
     this.logger.info(
       forceShutdown
-        ? "force restart, executing pm2 restart"
+        ? "force restart, terminating managed process"
         : "all turns drained, executing restart"
     );
     // Dispatch/user/parked admission closed before the drain sample above.
@@ -1988,7 +1988,8 @@ export class Orchestrator {
     }
 
     // Graceful, explicit force, and drain-timeout all converge on this exact
-    // detached PM2 path. PM2 sends SIGTERM; #76 turn-resume owns continuation.
+    // managed-process path. SIGTERM enters the bounded shutdown sequence; #76
+    // turn-resume owns continuation after the supervisor starts us again.
     await this.restartProcess();
   }
 
@@ -2520,7 +2521,7 @@ export class Orchestrator {
     // 5:25 while a restart sat pending, because `list` still showed the stale
     // next_run and catch-up then skipped it. Isolated scheduled fires increment
     // `activeTurns`, so a due schedule EXTENDS the drain rather than being lost.
-    // The scheduled manager is stopped in the last beat before pm2 restart.
+    // The scheduled manager is stopped in the last beat before process restart.
     this.logger.info(
       { activeTurns: this.activeTurns, inFlight: this.dispatchWatcher?.inFlightCount ?? 0 },
       "intake stopped; no new dispatch, parked fire, preset opener or preemptive steer will be admitted"

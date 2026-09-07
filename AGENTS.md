@@ -99,7 +99,9 @@ hand-editing runtime state.
 
 ## ⚠️ CRITICAL: Applying code changes or restarting the app
 
-**Never run `pm2 restart seam-acp` directly.** The bot is managed by PM2. A direct restart kills the process immediately — including the agent session running the command — so your reply will never be delivered to Discord.
+**Never run `systemctl restart seam-acp` or `pm2 restart seam-acp` directly.**
+A direct supervisor restart kills the process immediately — including the agent
+session running the command — so your reply will never be delivered to Discord.
 
 **Always use:**
 
@@ -110,21 +112,23 @@ npm run redeploy
 This is the only safe way to apply code changes or restart the bot. It:
 1. Compiles the TypeScript (`npm run build`)
 2. Echoes a confirmation so the reply is delivered
-3. Restarts the PM2 process 3 seconds later in the background
+3. Lets the running process drain admitted work and terminate itself
+4. Lets the configured supervisor restart it
 
 If you are asked to:
 - Apply code changes → run `npm run redeploy`
 - Restart the bot → run `npm run redeploy`
 - Rebuild the app → run `npm run redeploy`
 
-Do **not** run `pm2 restart`, `pm2 reload`, `npm start`, or any other direct process restart command.
+Do **not** run `systemctl restart seam-acp`, `pm2 restart`, `pm2 reload`,
+`npm start`, or any other direct process restart command.
 
-## Useful PM2 commands (read-only / safe)
+## Useful systemd commands (read-only / safe)
 
 ```bash
-pm2 status                      # check if the bot is running
-pm2 logs seam-acp               # tail live logs
-pm2 logs seam-acp --lines 100   # last 100 log lines
+systemctl status seam-acp --no-pager
+journalctl -u seam-acp -f
+journalctl -u seam-acp -n 100 --no-pager
 ```
 
 ## Project structure
@@ -350,7 +354,7 @@ runbook end to end (§1 pull → §2 changelogs → §3 update → §3a patch �
 ## Troubleshooting: 500 / server errors from the Claude API
 
 When a Claude Code session returns persistent `500 Internal server error`
-responses (visible in `pm2 logs` as `"turn failed"` with
+responses (visible in `journalctl -u seam-acp` as `"turn failed"` with
 `"errorKind":"server_error"`), **check upstream status first** before
 investigating code-level causes.
 

@@ -90,30 +90,27 @@ docker compose up -d --build
 
 Pass `--build-arg INSTALL_COPILOT_CLI=false` if you want to mount your own Copilot CLI binary.
 
-## Run (PM2 — background process, no Docker)
+## Run (systemd — production, no Docker)
 
-PM2 keeps the bot running in the background, restarts it on crashes, and can auto-start it at login.
+Production runs Seam as a native systemd service so it has an independent
+cgroup, restart policy, and OOM boundary. The checked-in unit template and the
+PM2 migration/rollback procedure are documented in
+[`ops/systemd/README.md`](ops/systemd/README.md).
 
-```sh
-npm install -g pm2
-npm run build
-pm2 start ecosystem.config.cjs  # starts the bot as a background daemon
-pm2 save                         # persist the process list
-pm2 startup                      # prints a command — run it to enable auto-start at login
-```
-
-**After making code changes**, use the dedicated redeploy script instead of restarting PM2 directly. A direct `pm2 restart` would kill the bot mid-reply if an agent issued the command:
+**After making code changes**, use the dedicated redeploy script instead of
+restarting the unit directly. It builds, writes a restart sentinel, lets the
+running bot drain admitted work, and then asks its supervisor to restart it:
 
 ```sh
-npm run redeploy   # builds, then restarts PM2 after a 3-second delay
+npm run redeploy
 ```
 
 Other useful commands:
 
 ```sh
-pm2 status              # check if the bot is running
-pm2 logs seam-acp       # tail live logs
-pm2 stop seam-acp       # stop the bot
+systemctl status seam-acp --no-pager
+journalctl -u seam-acp -f
+curl -fsS http://127.0.0.1:3000/health
 ```
 
 ## Slash commands

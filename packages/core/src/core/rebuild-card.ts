@@ -116,8 +116,8 @@ export function firstErrorLine(err: unknown): string {
 export function destinationLine(d: RebuildWorkingDetails): string {
   const agent = d.agentId ?? "unknown";
   const model = d.model ?? "unknown";
-  const window = d.contextWindow ?? 0;
-  const budget = d.budgetTokens ?? 0;
+  const window = d.contextWindow ?? "?";
+  const budget = d.budgetTokens ?? "?";
   return `${agent} · ${model} · window ${window} · 60% budget ${budget}`;
 }
 

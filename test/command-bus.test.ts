@@ -11,6 +11,7 @@ describe("command-bus rpc allow-list", () => {
   it("accepts adapter methods without dev mode", () => {
     expect(isAllowedRpcMethod("readAttachment", { devMode: false })).toBe(true);
     expect(isAllowedRpcMethod("prepare", { devMode: false })).toBe(true);
+    expect(isAdapterRpcMethod("listPickerModels")).toBe(true);
     expect(isAdapterRpcMethod("install")).toBe(true);
   });
 
@@ -35,6 +36,20 @@ describe("command-bus rpc allow-list", () => {
         devMode: true,
       })
     ).rejects.toThrow(/unknown rpc method/);
+  });
+
+  it("dispatches picker-model warming through the host adapter", async () => {
+    const models = [{ modelId: "gpt-5.6-sol", name: "Sol", contextLimit: 258_400 }];
+    const result = await dispatchBridgeRpc("listPickerModels", {}, "codex", {
+      adapters: new Map([["codex", {
+        staticModels: undefined,
+        listPickerModels: async () => models,
+      } as any]]),
+      workspaceRoot: "/tmp",
+      cwd: "/tmp",
+      devMode: false,
+    });
+    expect(result).toEqual(models);
   });
 
   it("protocol version is 1", () => {

@@ -51,6 +51,12 @@ export async function invokeAdapterRpc(
     case "prepare":
       if (!adapter) throw new Error("no adapter for prepare");
       return adapter.prepare();
+    case "listPickerModels":
+      if (!adapter) throw new Error("no adapter for listPickerModels");
+      if (adapter.staticModels && adapter.staticModels.length > 0) {
+        return [...adapter.staticModels];
+      }
+      return adapter.listPickerModels ? [...(await adapter.listPickerModels())] : [];
     case "install": {
       if (!adapter) throw new Error("no adapter for install");
       return adapter.install();

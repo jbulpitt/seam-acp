@@ -69,7 +69,7 @@ import {
   resolveDiscordCompactionProfile,
 } from "../../core/compaction/discord-executor.js";
 import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, coercePinnedFacts, PINNED_FACTS_JSON_SCHEMA, assembleNewSession, type PinnedFacts } from "../../core/compaction/prompts.js";
-import type { AgentProfile } from "@seam/adapters";
+import type { AdapterModel, AgentProfile } from "@seam/adapters";
 import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import type { WakeManager } from "../../core/wake/manager.js";
@@ -15279,16 +15279,7 @@ export class Orchestrator {
 
     const described = this.router.describeConfig(record);
     const agentId = described.agent.value;
-    const profile = this.router.getProfile(agentId);
-    if (!profile) throw new ReconstructionUnavailableError(`Agent profile "${agentId}" not found.`);
-    const seamBotId = this.adapter.getBotUserId?.();
-    if (!seamBotId) {
-      throw new ReconstructionUnavailableError("Rebuild cannot identify the Seam bot user id.");
-    }
-    if (typeof this.adapter.fetchMessagePage !== "function") {
-      throw new ReconstructionUnavailableError("Chat adapter does not support paged thread history.");
-    }
-
+    const destinationModel = described.model.value;
     const cardStyle = statusCardStyleForRender(described);
     const card = new RebuildCardSession<MessageRef>(cardStyle, {
       post: (panel) => this.postRebuildPanel(channel, panel),
@@ -15297,50 +15288,50 @@ export class Orchestrator {
       debounceMs: STATUS_EDIT_DEBOUNCE_MS,
       heartbeatMs: STATUS_HEARTBEAT_MS,
     });
-
-    const cfg = this.store.readConfig(record);
-    const destinationModel = described.model.value;
-    const adapterModels =
-      typeof profile.describe === "function" ? profile.describe().models : undefined;
-    let pickerModels: Array<{ modelId: string; name: string; contextLimit?: number }> | undefined;
-    const staticHit = profile.staticModels?.find((model) => {
-      const ids = [destinationModel];
-      if (destinationModel === "default" && profile.defaultModel) ids.push(profile.defaultModel);
-      return ids.includes(model.modelId) && model.contextLimit && model.contextLimit > 0;
-    });
-    if (!staticHit && typeof profile.listPickerModels === "function") {
-      try {
-        pickerModels = [...(await profile.listPickerModels())];
-      } catch {
-        pickerModels = undefined;
-      }
-    }
-    const metadata = this.getModelMetadata?.(destinationModel)
-      ?? (destinationModel === "default" && profile.defaultModel
-        ? this.getModelMetadata?.(profile.defaultModel)
-        : null);
-    const resolved = resolveContextWindow({
-      agentId,
-      model: destinationModel,
-      defaultModel: profile.defaultModel,
-      lastContextUsage: cfg.lastContextUsage,
-      staticModels: profile.staticModels,
-      adapterModels,
-      pickerModels,
-      metadataWindow: metadata?.context_window ?? null,
-    });
-    const contextWindow = resolved.window;
-    const budgetTokens = resolved.budgetTokens;
-    const destDetails = {
-      agentId: profile.id,
-      model: destinationModel,
-      contextWindow,
-      budgetTokens,
-    };
-    log(`destination ${profile.id} · ${destinationModel} · window ${contextWindow} · 60% budget ${budgetTokens}`);
-
+    await card.start({ agentId, model: destinationModel });
     try {
-      await card.start(destDetails);
+      const profile = this.router.getProfile(agentId);
+      if (!profile) {
+        throw new ReconstructionUnavailableError(`Agent profile "${agentId}" not found.`);
+      }
+      const seamBotId = this.adapter.getBotUserId?.();
+      if (!seamBotId) {
+        throw new ReconstructionUnavailableError("Rebuild cannot identify the Seam bot user id.");
+      }
+      if (typeof this.adapter.fetchMessagePage !== "function") {
+        throw new ReconstructionUnavailableError("Chat adapter does not support paged thread history.");
+      }
+
+      const cfg = this.store.readConfig(record);
+      const adapterModels =
+        typeof profile.describe === "function" ? profile.describe().models : undefined;
+      let pickerModels: AdapterModel[] | undefined;
+      const staticHit = profile.staticModels?.find((model) => {
+        const ids = [destinationModel];
+        if (destinationModel === "default" && profile.defaultModel) ids.push(profile.defaultModel);
+        return ids.includes(model.modelId) && model.contextLimit && model.contextLimit > 0;
+      });
+      if (!staticHit) {
+        pickerModels = await this.listRebuildPickerModels(profile, channel);
+      }
+      const metadata = this.getModelMetadata?.(destinationModel)
+        ?? (destinationModel === "default" && profile.defaultModel
+          ? this.getModelMetadata?.(profile.defaultModel)
+          : null);
+      const resolved = resolveContextWindow({
+        agentId,
+        model: destinationModel,
+        defaultModel: profile.defaultModel,
+        lastContextUsage: cfg.lastContextUsage,
+        staticModels: profile.staticModels,
+        adapterModels,
+        pickerModels,
+        metadataWindow: metadata?.context_window ?? null,
+      });
+      const contextWindow = resolved.window;
+      const budgetTokens = resolved.budgetTokens;
+      await card.setStage("starting", { contextWindow, budgetTokens });
+      log(`destination ${profile.id} · ${destinationModel} · window ${contextWindow} · 60% budget ${budgetTokens}`);
       await card.setStage("fetching");
 
       const reader = new MessageReader(
@@ -15437,6 +15428,44 @@ export class Orchestrator {
       throw err;
     } finally {
       card.dispose();
+    }
+  }
+
+  /**
+   * Ask the destination host for its current picker catalog before falling
+   * back to the controller's profile. Codex uses this to read that host's
+   * `models_cache.json`, so a cold Rebuild does not need a sacrificial prompt
+   * just to learn the exact effective context window.
+   */
+  private async listRebuildPickerModels(
+    profile: AgentProfile,
+    channel: ChannelRef
+  ): Promise<AdapterModel[] | undefined> {
+    const location = resolveThreadLocation(this.config, channel.id);
+    if (this.bridgeHub) {
+      try {
+        const raw = await this.bridgeHub.rpc(location, "listPickerModels", {}, profile.id);
+        if (Array.isArray(raw)) {
+          const models = raw.filter((model): model is AdapterModel =>
+            !!model &&
+            typeof model === "object" &&
+            typeof (model as AdapterModel).modelId === "string" &&
+            typeof (model as AdapterModel).name === "string"
+          );
+          if (models.length > 0) return models;
+        }
+      } catch (err) {
+        this.logger.debug(
+          { err, agentId: profile.id, location },
+          "rebuild host model-catalog warm failed; trying controller profile"
+        );
+      }
+    }
+    if (typeof profile.listPickerModels !== "function") return undefined;
+    try {
+      return [...(await profile.listPickerModels())];
+    } catch {
+      return undefined;
     }
   }
 

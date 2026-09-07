@@ -1,8 +1,71 @@
 import { spawn } from "node:child_process";
+import { promises as fsp } from "node:fs";
+import path from "node:path";
 import { asLocalAdapter, type AgentProfile } from "../agent-profile.js";
-import { CodexSessionManager } from "./codex-session-manager.js";
+import {
+  CodexSessionManager,
+  defaultCodexSessionsRoot,
+} from "./codex-session-manager.js";
 
 export { CodexSessionManager, defaultCodexSessionsRoot } from "./codex-session-manager.js";
+
+interface CodexCachedModel {
+  slug?: unknown;
+  display_name?: unknown;
+  context_window?: unknown;
+  effective_context_window_percent?: unknown;
+}
+
+/**
+ * Read Codex's host-local model cache without starting a session. The effective
+ * percentage is the same reduction Codex applies before reporting
+ * `model_context_window` in rollout usage events (for example 272000 * 95% =
+ * 258400). Missing or malformed caches fail soft so ACP discovery can remain
+ * the picker fallback.
+ */
+export async function readCodexModelCatalog(
+  modelsCachePath: string
+): Promise<Array<{ modelId: string; name: string; contextLimit?: number }>> {
+  try {
+    const parsed = JSON.parse(await fsp.readFile(modelsCachePath, "utf8")) as {
+      models?: unknown;
+    };
+    if (!Array.isArray(parsed.models)) return [];
+    const out: Array<{ modelId: string; name: string; contextLimit?: number }> = [];
+    for (const raw of parsed.models as CodexCachedModel[]) {
+      if (!raw || typeof raw !== "object" || typeof raw.slug !== "string") continue;
+      const modelId = raw.slug.trim();
+      if (!modelId) continue;
+      const name =
+        typeof raw.display_name === "string" && raw.display_name.trim()
+          ? raw.display_name.trim()
+          : modelId;
+      const nativeWindow =
+        typeof raw.context_window === "number" &&
+        Number.isFinite(raw.context_window) &&
+        raw.context_window > 0
+          ? raw.context_window
+          : undefined;
+      const effectivePercent =
+        typeof raw.effective_context_window_percent === "number" &&
+        Number.isFinite(raw.effective_context_window_percent) &&
+        raw.effective_context_window_percent > 0
+          ? raw.effective_context_window_percent
+          : 100;
+      const contextLimit = nativeWindow
+        ? Math.floor(nativeWindow * effectivePercent / 100)
+        : undefined;
+      out.push({
+        modelId,
+        name,
+        ...(contextLimit && contextLimit > 0 ? { contextLimit } : {}),
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
 
 /**
  * OpenAI Codex CLI as an ACP server, via the official adapter
@@ -39,14 +102,24 @@ export function makeCodexProfile(opts: {
    * temp dir; production omits this and uses `$HOME/.codex/sessions`.
    */
   sessionsRoot?: string;
+  /** Override Codex's host-local model catalog (`~/.codex/models_cache.json`). */
+  modelsCachePath?: string;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "codex-acp";
+  const sessionsRoot = opts.sessionsRoot ?? defaultCodexSessionsRoot();
+  const modelsCachePath =
+    opts.modelsCachePath ??
+    path.join(path.dirname(sessionsRoot), "models_cache.json");
 
   return asLocalAdapter({
     id: opts.id ?? "codex",
     displayName: opts.displayName ?? "OpenAI Codex",
     defaultModel: opts.defaultModel,
     staticModels: opts.staticModels,
+    async listPickerModels() {
+      if (opts.staticModels && opts.staticModels.length > 0) return opts.staticModels;
+      return readCodexModelCatalog(modelsCachePath);
+    },
     // Codex uses the same configOption effort mechanism as Copilot (both OpenAI).
     effort: opts.effort ?? {
       mechanism: "configOption",
@@ -68,8 +141,6 @@ export function makeCodexProfile(opts: {
         detached: true,
       });
     },
-    sessionManager: new CodexSessionManager(
-      opts.sessionsRoot ? { sessionsRoot: opts.sessionsRoot } : undefined
-    ),
+    sessionManager: new CodexSessionManager({ sessionsRoot }),
   });
 }

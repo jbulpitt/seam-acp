@@ -8,6 +8,7 @@ import {
   fetchCodexUsage,
   sessionIdFromRolloutFilename,
 } from "../packages/adapters/src/profiles/codex-session-manager.js";
+import { readCodexModelCatalog } from "../packages/adapters/src/profiles/codex.js";
 
 const ID_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const ID_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -53,6 +54,58 @@ describe("sessionIdFromRolloutFilename", () => {
         `rollout-2026-08-26T01-05-17-${ID_A}.jsonl`
       )
     ).toBe(ID_A);
+  });
+});
+
+describe("Codex model catalog", () => {
+  it("reads the host cache and applies Codex's effective-window percentage", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-models-"));
+    try {
+      const cachePath = path.join(root, "models_cache.json");
+      fs.writeFileSync(cachePath, JSON.stringify({
+        fetched_at: "2026-09-06T00:00:00Z",
+        models: [
+          {
+            slug: "gpt-5.6-sol",
+            display_name: "GPT-5.6-Sol",
+            context_window: 272_000,
+            effective_context_window_percent: 95,
+          },
+          { slug: "no-window", display_name: "No Window" },
+        ],
+      }));
+      await expect(readCodexModelCatalog(cachePath)).resolves.toEqual([
+        { modelId: "gpt-5.6-sol", name: "GPT-5.6-Sol", contextLimit: 258_400 },
+        { modelId: "no-window", name: "No Window" },
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("lets the Codex profile warm picker models without starting ACP", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-profile-models-"));
+    try {
+      const cachePath = path.join(root, "models_cache.json");
+      fs.writeFileSync(cachePath, JSON.stringify({
+        models: [{
+          slug: "gpt-5.6-sol",
+          display_name: "GPT-5.6-Sol",
+          context_window: 272_000,
+          effective_context_window_percent: 95,
+        }],
+      }));
+      const profile = makeCodexProfile({
+        defaultModel: "gpt-5.6-sol",
+        sessionsRoot: path.join(root, "sessions"),
+        modelsCachePath: cachePath,
+      });
+      await expect(profile.listPickerModels?.()).resolves.toEqual([
+        { modelId: "gpt-5.6-sol", name: "GPT-5.6-Sol", contextLimit: 258_400 },
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

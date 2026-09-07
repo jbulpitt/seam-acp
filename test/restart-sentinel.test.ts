@@ -7,6 +7,7 @@ import {
   writeForceRestartSentinel,
   restartSentinelPath,
   RESTART_SENTINEL_FORCE_BODY,
+  restartSeamAcpProcess,
   waitForRestartDrain,
 } from "../packages/core/src/core/restart-sentinel.js";
 
@@ -35,6 +36,17 @@ describe("writeForceRestartSentinel", () => {
     expect(written).toBe(restartSentinelPath(tmp));
     expect(fs.readFileSync(written, "utf8")).toBe(RESTART_SENTINEL_FORCE_BODY);
     expect(sentinelIsForce(fs.readFileSync(written, "utf8"))).toBe(true);
+  });
+});
+
+describe("restartSeamAcpProcess", () => {
+  it("signals the current process instead of invoking a supervisor CLI", async () => {
+    const signalProcess = vi.fn(() => true);
+
+    await restartSeamAcpProcess(signalProcess);
+
+    expect(signalProcess).toHaveBeenCalledOnce();
+    expect(signalProcess).toHaveBeenCalledWith(process.pid, "SIGTERM");
   });
 });
 

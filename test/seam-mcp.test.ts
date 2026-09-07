@@ -178,6 +178,7 @@ async function makeHarness(opts?: {
   resolveThread?: SeamMcpServerDeps["resolveThread"];
   getThreadLiveState?: SeamMcpServerDeps["getThreadLiveState"];
   configureThread?: SeamMcpServerDeps["configureThread"];
+  rebuildThread?: SeamMcpServerDeps["rebuildThread"];
   resetThreadSession?: SeamMcpServerDeps["resetThreadSession"];
   prepareSelfMigration?: SeamMcpServerDeps["prepareSelfMigration"];
   getAgentQuotas?: SeamMcpServerDeps["getAgentQuotas"];
@@ -282,6 +283,7 @@ async function makeHarness(opts?: {
     ...(opts?.resolveThread ? { resolveThread: opts.resolveThread } : {}),
     ...(opts?.getThreadLiveState ? { getThreadLiveState: opts.getThreadLiveState } : {}),
     ...(opts?.configureThread ? { configureThread: opts.configureThread } : {}),
+    ...(opts?.rebuildThread ? { rebuildThread: opts.rebuildThread } : {}),
     ...(opts?.resetThreadSession ? { resetThreadSession: opts.resetThreadSession } : {}),
     ...(opts?.prepareSelfMigration ? { prepareSelfMigration: opts.prepareSelfMigration } : {}),
     ...(opts?.getAgentQuotas ? { getAgentQuotas: opts.getAgentQuotas } : {}),
@@ -396,6 +398,7 @@ describe("SeamMcpServer", () => {
     expect(typeof body.result.instructions).toBe("string");
     expect(body.result.instructions).toMatch(/rename_thread\(name\)/);
     expect(body.result.instructions).toMatch(/agent_quota\(agentId\?\)/);
+    expect(body.result.instructions).toMatch(/configure_thread\(thread,.*rebuild\?\)/);
     expect(body.result.instructions).toMatch(/migrate_self\(agent\?, model\?, effort\?, manifest, rebuild\?\)/);
     expect(body.result.protocolVersion).toBe("2025-06-18");
   });
@@ -467,6 +470,11 @@ describe("SeamMcpServer", () => {
     expect(configureThread.inputSchema.properties.disableThreadPrefix).toMatchObject({
       type: "boolean",
     });
+    expect(configureThread.inputSchema.properties.rebuild).toMatchObject({
+      type: "boolean",
+    });
+    expect(configureThread.inputSchema.properties.rebuild.description).toMatch(/deterministically rebuild/i);
+    expect(configureThread.description).toMatch(/durable Rebuild card.*target thread/i);
   });
 
   it("configure_thread permits a sibling in the caller's channel and passes flat changes", async () => {
@@ -539,6 +547,235 @@ describe("SeamMcpServer", () => {
       target,
       { model: "claude-new", effort: "high", role: "analyst", disableThreadPrefix: true }
     );
+  });
+
+  it("configure_thread applies configuration first, then deterministically rebuilds the target", async () => {
+    const target = makeRecord({
+      id: "discord:thread-target",
+      channelRef: "thread-target",
+      parentRef: "chan-1",
+    });
+    const configureThread = vi.fn(async () => ({
+      ok: true as const,
+      applied: {
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        effort: "high",
+        role: "worker",
+        disableThreadPrefix: false,
+        fastMode: false,
+      },
+      changes: {
+        agent: { before: "claude", after: "codex", changed: true },
+        model: { before: "default", after: "gpt-5.6-sol", changed: true },
+        effort: { before: "auto", after: "high", changed: true },
+        role: { before: "worker", after: "worker", changed: false },
+        disableThreadPrefix: { before: "enabled", after: "enabled", changed: false },
+        fastMode: { before: "off", after: "off", changed: false },
+      },
+      sessionReset: true,
+      resetReason: "agent-switch" as const,
+      runtimeReloaded: false,
+      warnings: [],
+    }));
+    const rebuildThread = vi.fn(async () => ({
+      newSessionId: "rebuilt-1",
+      agent: "codex",
+      model: "gpt-5.6-sol",
+      contextWindow: 258_400,
+      attached: true,
+      attachmentReason: "swapped",
+    }));
+    h = await makeHarness({
+      resolveThread: (id) => id === target.channelRef ? target : undefined,
+      configureThread,
+      rebuildThread,
+    });
+
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "configure_thread",
+        arguments: {
+          thread: target.channelRef,
+          agent: "codex",
+          model: "gpt-5.6-sol",
+          effort: "high",
+          rebuild: true,
+        },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBeFalsy();
+    expect(configureThread).toHaveBeenCalledWith(
+      expect.objectContaining({ channelRef: "thread-caller" }),
+      target,
+      { agent: "codex", model: "gpt-5.6-sol", effort: "high" }
+    );
+    expect(rebuildThread).toHaveBeenCalledWith(target);
+    expect(body.result.content[0].text).toContain("configuration confirmed");
+    expect(body.result.content[0].text).toContain("deterministic Discord reconstruction complete");
+    expect(body.result.content[0].text).toContain("rebuilt-1");
+    expect(body.result.content[0].text).toContain("attached (swapped)");
+  });
+
+  it("configure_thread accepts rebuild:true as the only action", async () => {
+    const target = makeRecord({
+      id: "discord:thread-target",
+      channelRef: "thread-target",
+      parentRef: "chan-1",
+    });
+    const configureThread = vi.fn();
+    const rebuildThread = vi.fn(async () => ({
+      newSessionId: "rebuilt-only",
+      agent: "claude",
+      model: "default",
+      contextWindow: 1_000_000,
+      attached: true,
+      attachmentReason: "swapped",
+    }));
+    h = await makeHarness({
+      resolveThread: (id) => id === target.channelRef ? target : undefined,
+      configureThread,
+      rebuildThread,
+    });
+
+    const { body } = await h.call(
+      "tools/call",
+      { name: "configure_thread", arguments: { thread: target.channelRef, rebuild: true } },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBeFalsy();
+    expect(configureThread).not.toHaveBeenCalled();
+    expect(rebuildThread).toHaveBeenCalledWith(target);
+    expect(body.result.content[0].text).toContain("rebuilt from Discord");
+    expect(body.result.content[0].text).toContain("rebuilt-only");
+  });
+
+  it("configure_thread reports that configuration remains applied when Rebuild fails", async () => {
+    const target = makeRecord({
+      id: "discord:thread-target",
+      channelRef: "thread-target",
+      parentRef: "chan-1",
+    });
+    const configureThread = vi.fn(async () => ({
+      ok: true as const,
+      applied: {
+        agent: "claude",
+        model: "default",
+        effort: "high",
+        role: "worker",
+        disableThreadPrefix: false,
+        fastMode: false,
+      },
+      changes: {
+        agent: { before: "claude", after: "claude", changed: false },
+        model: { before: "default", after: "default", changed: false },
+        effort: { before: "auto", after: "high", changed: true },
+        role: { before: "worker", after: "worker", changed: false },
+        disableThreadPrefix: { before: "enabled", after: "enabled", changed: false },
+        fastMode: { before: "off", after: "off", changed: false },
+      },
+      sessionReset: false,
+      runtimeReloaded: true,
+      warnings: [],
+    }));
+    const rebuildThread = vi.fn(async () => {
+      throw new Error("destination window unavailable");
+    });
+    h = await makeHarness({
+      resolveThread: (id) => id === target.channelRef ? target : undefined,
+      configureThread,
+      rebuildThread,
+    });
+
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "configure_thread",
+        arguments: { thread: target.channelRef, effort: "high", rebuild: true },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("Configuration was applied");
+    expect(body.result.content[0].text).toContain("configuration remains applied");
+    expect(body.result.content[0].text).toContain("destination window unavailable");
+    expect(body.result.content[0].text).toContain("Rebuild card");
+  });
+
+  it("configure_thread refuses an unavailable Rebuild before applying configuration", async () => {
+    const target = makeRecord({
+      id: "discord:thread-target",
+      channelRef: "thread-target",
+      parentRef: "chan-1",
+    });
+    const configureThread = vi.fn();
+    h = await makeHarness({
+      resolveThread: (id) => id === target.channelRef ? target : undefined,
+      configureThread,
+    });
+
+    const { body } = await h.call(
+      "tools/call",
+      {
+        name: "configure_thread",
+        arguments: { thread: target.channelRef, effort: "high", rebuild: true },
+      },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toMatch(/Rebuild is not supported/);
+    expect(configureThread).not.toHaveBeenCalled();
+  });
+
+  it("configure_thread refuses rebuild:true on the calling thread before mutation", async () => {
+    const self = makeRecord({ parentRef: "chan-1" });
+    const configureThread = vi.fn();
+    const rebuildThread = vi.fn();
+    h = await makeHarness({
+      resolveThread: (id) => id === self.channelRef ? self : undefined,
+      configureThread,
+      rebuildThread,
+    });
+
+    const { body } = await h.call(
+      "tools/call",
+      { name: "configure_thread", arguments: { thread: self.channelRef, rebuild: true } },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toMatch(/cross-thread only/);
+    expect(configureThread).not.toHaveBeenCalled();
+    expect(rebuildThread).not.toHaveBeenCalled();
+  });
+
+  it("configure_thread empty input advertises rebuild:true as a valid action", async () => {
+    const target = makeRecord({
+      id: "discord:thread-target",
+      channelRef: "thread-target",
+      parentRef: "chan-1",
+    });
+    const configureThread = vi.fn();
+    h = await makeHarness({
+      resolveThread: (id) => id === target.channelRef ? target : undefined,
+      configureThread,
+    });
+
+    const { body } = await h.call(
+      "tools/call",
+      { name: "configure_thread", arguments: { thread: target.channelRef } },
+      { "X-Seam-Session": "good-token" }
+    );
+
+    expect(body.result.isError).toBe(true);
+    expect(body.result.content[0].text).toContain("rebuild:true");
+    expect(configureThread).not.toHaveBeenCalled();
   });
 
   it("cross-thread control refuses a session outside the caller's channel before mutation", async () => {

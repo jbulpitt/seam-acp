@@ -15260,6 +15260,43 @@ export class Orchestrator {
     );
   }
 
+  /**
+   * Agent-callable cross-thread Rebuild. Addressing and same-channel scope are
+   * enforced by seam-MCP before this platform method receives the bound record;
+   * this owns Discord history, the durable card, exact destination warming,
+   * seeding, and compare-and-swap attachment just like `/seamadmin rebuild`.
+   */
+  async rebuildThreadFromDiscord(record: SessionRecord): Promise<{
+    newSessionId: string;
+    agent: string;
+    model: string;
+    contextWindow: number;
+    attached: boolean;
+    attachmentReason: string;
+  }> {
+    const live = this.store.get(record.id);
+    if (!live) throw new Error("Target session disappeared before Rebuild started.");
+    const channel: ChannelRef = {
+      platform: live.platform,
+      id: live.channelRef,
+      ...(live.parentRef ? { parentId: live.parentRef } : {}),
+    };
+    const result = await this.reconstructSessionFromDiscord({
+      record: live,
+      channel,
+      observedAtStart: live.acpSessionId,
+      attachIntent: "attach",
+    });
+    return {
+      newSessionId: result.newSessionId,
+      agent: result.destination.agentId,
+      model: result.destination.model,
+      contextWindow: result.destination.contextWindow,
+      attached: result.attachment.attached,
+      attachmentReason: result.attachment.reason,
+    };
+  }
+
   private async reconstructSessionFromDiscord(args: {
     record: SessionRecord;
     channel: ChannelRef;

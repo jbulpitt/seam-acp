@@ -109,6 +109,16 @@ export interface ConfigEntities {
   }>;
 }
 
+/** Deterministic Discord reconstruction result exposed to configure_thread. */
+export interface RebuildThreadResult {
+  newSessionId: string;
+  agent: string;
+  model: string;
+  contextWindow: number;
+  attached: boolean;
+  attachmentReason: string;
+}
+
 /** MCP protocol version we speak. We echo the client's if it sends a newer one
  *  it thinks we support; otherwise advertise this. */
 const DEFAULT_PROTOCOL_VERSION = "2025-06-18";
@@ -211,6 +221,8 @@ export interface SeamMcpServerDeps {
     target: SessionRecord,
     input: ConfigureThreadInput
   ) => Promise<ConfigureThreadOutcome>;
+  /** Run the same durable-card deterministic reconstruction as /seamadmin rebuild. */
+  rebuildThread?: (target: SessionRecord) => Promise<RebuildThreadResult>;
   /** Forge a fresh session for an already-addressed target thread (#129). */
   resetThreadSession?: (
     target: SessionRecord
@@ -691,7 +703,9 @@ const TOOLS = [
     name: "configure_thread",
     description:
       "Change a teammate thread's agent, model, reasoning effort, naming role, automatic-naming " +
-      "opt-out, and/or Claude Fast mode within YOUR channel. " +
+      "opt-out, and/or Claude Fast mode within YOUR channel. Optional rebuild:true then performs " +
+      "the same deterministic Discord-history reconstruction as /seamadmin rebuild; rebuild:true " +
+      "is also valid by itself. The durable Rebuild card is posted in the target thread. " +
       "An agent switch ALWAYS creates a fresh session and drops that thread's conversation context. " +
       "Model switches reset only on session-pinned backends (codex, and ollama-cloud when enabled); live-config " +
       "backends such as Claude preserve context. Effort never resets the ACP session: config-option " +
@@ -730,6 +744,14 @@ const TOOLS = [
             "verified available on claude-opus-5 and claude-opus-4-8, absent on claude-sonnet-5, " +
             "and the `default` alias is resolved by the wrapper at session start, so whether it " +
             "offers Fast depends on what it resolved to that time (observed both ways).",
+        },
+        rebuild: {
+          type: "boolean",
+          description:
+            "If true, after any requested configuration is applied, deterministically rebuild the " +
+            "target session from its Discord history and show a durable progress/result card there. " +
+            "May be the only option besides thread. This is not premium compact and uses no summarizer. " +
+            "If configuration succeeds but Rebuild fails, the configuration remains applied. Default false.",
         },
       },
       required: ["thread"],
@@ -1729,7 +1751,7 @@ const INSTRUCTIONS = [
   "  result is dispatched back into your thread when it completes.",
   "- forward(to, content): relay a message into another thread (thin handoff, no specialist framing).",
   "- steer(thread, prompt): redirect a teammate mid-task — inject a new instruction into its live session.",
-  "- configure_thread(thread, agent?, model?, effort?, role?, disableThreadPrefix?, fastMode?): reconfigure a teammate in YOUR channel; returns exact changed/no-change identity, posts a target confirmation card, and agent switches reset context. `fastMode` is Claude-only, defaults off, always forges a fresh session, and spends paid usage credits.",
+  "- configure_thread(thread, agent?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild?): reconfigure a teammate in YOUR channel; returns exact changed/no-change identity and posts a target confirmation card. rebuild:true then runs deterministic Discord reconstruction with a durable card in the target (and may be used alone). Agent switches reset context. `fastMode` is Claude-only, defaults off, always forges a fresh session, and spends paid usage credits.",
   "- reset_thread_session(thread): deliberately drop a teammate's context and forge a fresh session with its current agent/model.",
   "- migrate_self(agent?, model?, effort?, manifest, rebuild?): migrate YOUR OWN thread after this turn ends. Default: the manifest is the replacement session's first prompt. rebuild:true rebuilds from Discord history first, then fires the manifest as the next live turn. Purpose-agnostic and rollback-safe.",
   "- search_messages(query, threads?, author?, since?, limit?): search live conversation text in your thread or same-channel siblings.",
@@ -2116,6 +2138,20 @@ export class SeamMcpServer {
     if (!target.ok) return textResult(target.error, true);
     const liveError = await this.threadLiveError(target.record.channelRef);
     if (liveError) return textResult(liveError, true);
+    const rebuild = optionalBool(args, "rebuild") === true;
+    const rebuildingSelf =
+      target.record.id === caller.id && target.record.channelRef === caller.channelRef;
+    if (rebuild && rebuildingSelf) {
+      return textResult(
+        "Refused: configure_thread rebuild:true is cross-thread only because rebuilding the " +
+          "calling session would terminate this live tool call. Use /seamadmin rebuild for this thread, " +
+          "or migrate_self with rebuild:true when changing its agent/model.",
+        true
+      );
+    }
+    if (rebuild && !this.deps.rebuildThread) {
+      return textResult("deterministic cross-thread Rebuild is not supported on this deployment.", true);
+    }
     const input: ConfigureThreadInput = {
       ...(optionalString(args, "agent") ? { agent: optionalString(args, "agent") } : {}),
       ...(optionalString(args, "model") ? { model: optionalString(args, "model") } : {}),
@@ -2126,8 +2162,70 @@ export class SeamMcpServer {
         : {}),
       ...(typeof args.fastMode === "boolean" ? { fastMode: args.fastMode } : {}),
     };
-    const outcome = await this.deps.configureThread(caller, target.record, input);
-    if (!outcome.ok) return textResult(outcome.error, true);
+    const hasConfiguration = Object.keys(input).length > 0;
+    if (!hasConfiguration && !rebuild) {
+      return textResult(
+        "Provide at least one of agent, model, effort, role, disableThreadPrefix, fastMode, or rebuild:true.",
+        true
+      );
+    }
+    let outcome: Extract<ConfigureThreadOutcome, { ok: true }> | undefined;
+    if (hasConfiguration) {
+      const configured = await this.deps.configureThread(caller, target.record, input);
+      if (!configured.ok) return textResult(configured.error, true);
+      outcome = configured;
+    }
+
+    let rebuilt: RebuildThreadResult | undefined;
+    if (rebuild) {
+      this.logger.info(
+        { actor: caller.channelRef, target: target.record.channelRef, afterConfiguration: Boolean(outcome) },
+        "seam-mcp cross-thread Rebuild started"
+      );
+      try {
+        rebuilt = await this.deps.rebuildThread!(target.record);
+        this.logger.info(
+          {
+            actor: caller.channelRef,
+            target: target.record.channelRef,
+            newSessionId: rebuilt.newSessionId,
+            attached: rebuilt.attached,
+            attachmentReason: rebuilt.attachmentReason,
+          },
+          "seam-mcp cross-thread Rebuild completed"
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.warn(
+          { err, actor: caller.channelRef, target: target.record.channelRef, configurationApplied: Boolean(outcome) },
+          "seam-mcp cross-thread Rebuild failed"
+        );
+        const prefix = outcome
+          ? "Configuration was applied, but deterministic Rebuild failed"
+          : "Deterministic Rebuild failed";
+        return textResult(
+          `❌ ${prefix}: ${message}. ` +
+            (outcome
+              ? "The preceding configuration remains applied. "
+              : "") +
+            `The target thread's Rebuild card is frozen with the failure when Discord presentation is available.`,
+          true
+        );
+      }
+    }
+
+    if (!outcome && rebuilt) {
+      return textResult([
+        `✅ Thread ${target.record.channelRef} rebuilt from Discord:`,
+        `• Session: ${rebuilt.newSessionId}`,
+        `• Destination: ${rebuilt.agent} · ${rebuilt.model} · window ${rebuilt.contextWindow}`,
+        `• Binding: ${rebuilt.attached ? "attached" : "left unchanged"} (${rebuilt.attachmentReason})`,
+      ].join("\n"));
+    }
+
+    // !outcome is unreachable: empty input is refused above, and successful
+    // rebuild-only calls return from the branch immediately before this one.
+    if (!outcome) return textResult("No configuration or rebuild action was requested.", true);
     const status = (field: { before: string; after: string; changed: boolean }) =>
       field.changed ? `changed from ${field.before}` : "no change";
     const runtime = outcome.sessionReset
@@ -2157,6 +2255,14 @@ export class SeamMcpServer {
       `• Runtime: ${runtime}`,
       ...(presentation.length ? [`• Presentation: ${presentation.join("; ")}`] : []),
       ...outcome.warnings.map((warning) => `⚠️ ${warning}`),
+      ...(rebuilt
+        ? [
+            "• Rebuild: deterministic Discord reconstruction complete",
+            `• Rebuilt session: ${rebuilt.newSessionId}`,
+            `• Rebuild destination: ${rebuilt.agent} · ${rebuilt.model} · window ${rebuilt.contextWindow}`,
+            `• Rebuild binding: ${rebuilt.attached ? "attached" : "left unchanged"} (${rebuilt.attachmentReason})`,
+          ]
+        : []),
     ].join("\n"));
   }
 

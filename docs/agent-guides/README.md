@@ -104,11 +104,13 @@ Use this as a map, not as a substitute for each tool's live schema.
 
 ### Manage thread sessions
 
-- Change another thread's agent/model/effort/role: `configure_thread`. The
+- Change another thread's agent/model/effort/role/Fast mode: `configure_thread`. The
   response reports every effective field, explicitly marks no-ops, updates the
   target thread's name prefix to match its new identity, and posts a
   confirmation card there. Claude/meta effort reloads the runtime while
-  preserving its ACP session and context.
+  preserving its ACP session and context. Optional `rebuild: true` then runs
+  deterministic Discord reconstruction and posts its durable card in the
+  target; it may also be the only requested action. This is not premium compact.
 - Clear another thread's context but keep its agent/model:
   `reset_thread_session`.
 - Move this thread to a different agent/model and continue from an explicit

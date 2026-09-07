@@ -663,6 +663,7 @@ async function main(): Promise<void> {
             : outcome.warnings,
         };
       },
+      rebuildThread: (target) => orchestrator.rebuildThreadFromDiscord(target),
       resetThreadSession: (target) => threadSessionControl.reset(target),
       prepareSelfMigration: (caller, input) =>
         threadSessionControl.prepareSelfMigration(caller, input),

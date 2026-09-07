@@ -114,9 +114,10 @@ There are two scopes. `configure_thread` and `reset_thread_session` target
 `handoff`. `migrate_self` targets only the calling thread. They compose with the
 data tools: inspect the candidates first, then apply the selected runtime.
 
-### `configure_thread(thread, { agent?, model?, effort?, role?, disableThreadPrefix? })`
-Change a target thread's agent, model, reasoning effort, naming role, and/or
-naming opt-out (at least one field required).
+### `configure_thread(thread, { agent?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild? })`
+Change a target thread's agent, model, reasoning effort, naming role, naming
+opt-out, and/or Claude Fast mode. Optional `rebuild: true` runs deterministic
+Discord reconstruction after any configuration change and is valid by itself.
 - **The result is exact, including no-ops.** Agent, model, and effort are always
   returned as the effective post-set identity; each field says whether it
   changed and names its previous value when it did. The target thread receives
@@ -153,6 +154,20 @@ naming opt-out (at least one field required).
 - **`disableThreadPrefix` opts a thread out of managed naming.** When true, Seam
   stops maintaining that thread's name prefix and leaves its title alone.
   Uncommon — use it only for a thread whose title a human curates deliberately.
+- **`fastMode` is Claude's paid latency mode.** It is not a model or an effort
+  level. Changing it always forges a fresh session, and enabling it spends paid
+  usage credits outside subscription limits. Seam refuses unsupported agents,
+  deployments, and resolved models rather than silently claiming it applied.
+- **`rebuild: true` is deterministic Rebuild, not premium compact.** Seam first
+  applies and confirms any requested configuration, then reads the target's
+  Discord history, retains up to 60% of the exact destination context window,
+  seeds a new session, and attaches it with compare-and-swap protection. A
+  durable progress/result card is posted in the target thread. If Rebuild fails,
+  its card freezes with the failure and any preceding configuration remains
+  applied. With no other fields, `rebuild: true` rebuilds the existing identity.
+  It must target another thread; rebuilding the calling session inline would
+  terminate its own live tool call. Use `/seamadmin rebuild` for the current
+  thread, or `migrate_self({ ..., rebuild: true })` while changing its identity.
 
 ### Reading a thread name
 

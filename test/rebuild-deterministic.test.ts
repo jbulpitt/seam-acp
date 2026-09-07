@@ -163,6 +163,56 @@ function makeOrch(over?: {
 }
 
 describe("reconstructSessionFromDiscord", () => {
+  it("cross-thread wrapper rebuilds the authoritative post-configuration record", async () => {
+    const t = makeOrch({
+      recordOver: {
+        agentId: "codex",
+        acpSessionId: "acp-after-config",
+        parentRef: "parent-after-config",
+      },
+    });
+    const reconstruct = vi.fn(async () => ({
+      newSessionId: "sess-rebuilt",
+      attachment: { attached: true as const, reason: "swapped" as const },
+      seed: {},
+      destination: {
+        agentId: "codex",
+        model: "gpt-5.6-sol",
+        contextWindow: 258_400,
+      },
+    }));
+    (t.orch as any).reconstructSessionFromDiscord = reconstruct;
+
+    const result = await t.orch.rebuildThreadFromDiscord(record({
+      agentId: "claude",
+      acpSessionId: "acp-stale-before-config",
+      parentRef: "parent-stale",
+    }));
+
+    expect(reconstruct).toHaveBeenCalledWith({
+      record: expect.objectContaining({
+        agentId: "codex",
+        acpSessionId: "acp-after-config",
+        parentRef: "parent-after-config",
+      }),
+      channel: {
+        platform: "discord",
+        id: "thread-r",
+        parentId: "parent-after-config",
+      },
+      observedAtStart: "acp-after-config",
+      attachIntent: "attach",
+    });
+    expect(result).toEqual({
+      newSessionId: "sess-rebuilt",
+      agent: "codex",
+      model: "gpt-5.6-sol",
+      contextWindow: 258_400,
+      attached: true,
+      attachmentReason: "swapped",
+    });
+  });
+
   it("seeds once on the destination profile and never calls injectTurn", async () => {
     const t = makeOrch();
     const res = await (t.orch as any).reconstructSessionFromDiscord({

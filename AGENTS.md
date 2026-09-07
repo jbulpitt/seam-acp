@@ -44,10 +44,12 @@ hand-editing runtime state.
   count?)` shares their reader but retains cross-channel recent-N reach by raw
   Discord thread id, including threads without a Seam session.
 - **Reconfigure or reset another thread's session** (not just message it):
-  `configure_thread(thread, { agent?, model?, effort?, role?, disableThreadPrefix? })`
+  `configure_thread(thread, { agent?, model?, effort?, role?, disableThreadPrefix?, fastMode?, rebuild? })`
   changes its agent / model / effort / naming role and reports what actually
   reset (agent switch always resets; model switch resets on codex, and on
   ollama-cloud when that agent is enabled, not claude; effort never does);
+  `rebuild: true` then performs deterministic Discord reconstruction in the
+  target thread and may be used without another config change;
   `reset_thread_session(thread)` clears its context
   but keeps the model. Same in-channel scope as `handoff`.
 - **`role` is what a thread is for, not how it runs:** a free-form label

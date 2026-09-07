@@ -99,6 +99,17 @@ hand-editing runtime state.
 
 ## ⚠️ CRITICAL: Applying code changes or restarting the app
 
+Production now runs Seam and the shared Pronoa Playwright MCP as separate
+native systemd services:
+
+- `seam-acp.service` — the Discord bot and agent subprocesses
+- `pronoa-playwright-mcp.service` — Playwright/Chromium, with its own cgroup
+  memory limits and lower CPU/I/O priority
+- `pm2-ubuntu.service` — remaining helper processes only; it has
+  `OOMPolicy=continue`
+
+The checked-in units and recovery procedure live in `ops/systemd/README.md`.
+
 **Never run `systemctl restart seam-acp` or `pm2 restart seam-acp` directly.**
 A direct supervisor restart kills the process immediately — including the agent
 session running the command — so your reply will never be delivered to Discord.
@@ -112,8 +123,9 @@ npm run redeploy
 This is the only safe way to apply code changes or restart the bot. It:
 1. Compiles the TypeScript (`npm run build`)
 2. Echoes a confirmation so the reply is delivered
-3. Lets the running process drain admitted work and terminate itself
-4. Lets the configured supervisor restart it
+3. Lets the running process drain admitted work
+4. Signals Seam with SIGTERM after the drain
+5. Lets `seam-acp.service` restart it under systemd
 
 If you are asked to:
 - Apply code changes → run `npm run redeploy`
@@ -121,7 +133,9 @@ If you are asked to:
 - Rebuild the app → run `npm run redeploy`
 
 Do **not** run `systemctl restart seam-acp`, `pm2 restart`, `pm2 reload`,
-`npm start`, or any other direct process restart command.
+`npm start`, or any other direct process restart command from an agent turn.
+`sudo systemctl restart seam-acp` is an interruption-capable emergency command
+for a human over SSH, not the normal deployment path.
 
 ## Useful systemd commands (read-only / safe)
 
@@ -129,16 +143,28 @@ Do **not** run `systemctl restart seam-acp`, `pm2 restart`, `pm2 reload`,
 systemctl status seam-acp --no-pager
 journalctl -u seam-acp -f
 journalctl -u seam-acp -n 100 --no-pager
+systemctl status pronoa-playwright-mcp --no-pager
+journalctl -u pronoa-playwright-mcp -n 100 --no-pager
+curl -fsS http://127.0.0.1:3000/health
 ```
+
+An unauthenticated `http://127.0.0.1:8766/mcp` probe returns HTTP 403 when the
+Playwright listener is healthy. Restarting that service interrupts active
+browser sessions but does not restart Seam.
+
+Do not use raw `pm2 jlist`, `pm2 prettylist`, or `pm2 env` in streamed agent
+output: PM2 embeds application environment variables and may expose secrets.
+Use `pm2 ls --no-color`, narrowly scoped `systemctl show`, or process/cgroup
+inspection instead.
 
 ## Project structure
 
-- `src/` — TypeScript source
-- `dist/` — compiled output (do not edit directly)
-- `src/config.ts` — all env var definitions and validation (Zod)
-- `src/platforms/discord/` — Discord adapter, orchestrator, and slash commands
-- `src/agents/` — agent profile definitions (Copilot, Gemini, Claude)
-- `src/core/` — session store, streaming, routing
+- `packages/adapters/src/` — ACP process/session infrastructure and agent profiles
+- `packages/core/src/` — Discord adapter, orchestration, persistence, workflows,
+  MCP, voice, status, and configuration
+- `packages/bridge/src/` — lightweight remote-host agent bridge
+- `packages/*/dist/` — compiled output (do not edit directly)
+- `ops/systemd/` — production units, PM2 OOM-policy drop-in, and operations runbook
 - `data/` — SQLite database (runtime, not committed)
 - `.env` — local environment config (not committed)
 

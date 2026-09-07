@@ -93,13 +93,16 @@ Pass `--build-arg INSTALL_COPILOT_CLI=false` if you want to mount your own Copil
 ## Run (systemd — production, no Docker)
 
 Production runs Seam as a native systemd service so it has an independent
-cgroup, restart policy, and OOM boundary. The checked-in unit template and the
-PM2 migration/rollback procedure are documented in
+cgroup, restart policy, and OOM boundary. The shared Pronoa Playwright MCP runs
+in a second native service with separate memory controls and lower CPU/I/O
+priority. PM2 remains only for helper processes and uses `OOMPolicy=continue`.
+The checked-in unit templates and rollback procedure are documented in
 [`ops/systemd/README.md`](ops/systemd/README.md).
 
 **After making code changes**, use the dedicated redeploy script instead of
 restarting the unit directly. It builds, writes a restart sentinel, lets the
-running bot drain admitted work, and then asks its supervisor to restart it:
+running bot drain admitted work, signals Seam with SIGTERM, and lets systemd
+restart it:
 
 ```sh
 npm run redeploy
@@ -111,6 +114,7 @@ Other useful commands:
 systemctl status seam-acp --no-pager
 journalctl -u seam-acp -f
 curl -fsS http://127.0.0.1:3000/health
+systemctl status pronoa-playwright-mcp --no-pager
 ```
 
 ## Slash commands

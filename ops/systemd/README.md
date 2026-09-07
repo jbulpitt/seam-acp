@@ -1,8 +1,13 @@
-# Seam systemd operations and PM2 cutover
+# Seam systemd operations and rollback
 
 Seam and the Pronoa Playwright MCP run as separate systemd services in
 production. This gives them separate cgroups and prevents an OOM-killed
 Chromium child from causing systemd to stop Seam or every PM2-managed helper.
+
+Production cutover completed on 2026-09-06. Both native services are enabled;
+PM2 retains only helper processes, and its checked-in `OOMPolicy=continue`
+drop-in is installed and active. The migration sections below remain as the
+canonical rollback/recovery record.
 
 The unit templates are host-specific. They assume:
 
@@ -27,6 +32,13 @@ waits for admitted work to finish (bounded by the configured drain timeout),
 removes the sentinel, signals itself with SIGTERM, completes its bounded
 shutdown, and lets systemd restart it.
 
+The shutdown intentionally has a five-second hard exit fallback. If an HTTP
+connection keeps the listener open through that tail, systemd may record the
+old process as `status=1/FAILURE` before `Restart=always` starts the replacement.
+Treat the redeploy as successful only after the PID changes, the sentinel is
+gone, and `/health` responds; the fallback line alone is not evidence of a
+crash.
+
 Read-only status and logs:
 
 ```bash
@@ -35,6 +47,11 @@ journalctl -u seam-acp -n 100 --no-pager
 journalctl -u seam-acp -f
 curl -fsS http://127.0.0.1:3000/health
 ```
+
+Do not stream raw `pm2 jlist`, `pm2 prettylist`, or `pm2 env` output into chat
+or logs. Those commands include application environment variables and may
+expose credentials. Use `pm2 ls --no-color`, narrowly scoped `systemctl show`,
+or process/cgroup inspection instead.
 
 An emergency restart interrupts live turns and should be run by a human over
 SSH, never by an agent inside Seam:
@@ -159,7 +176,9 @@ curl -fsS http://127.0.0.1:3000/health
 
 ## Remaining PM2 helpers
 
-After both cutovers are healthy, install the checked-in PM2 drop-in. It changes
+The production drop-in is already installed and active. These idempotent
+commands document how to restore it after host rebuild or configuration drift.
+It changes
 the remaining PM2 cgroup from `OOMPolicy=stop` to `continue` and replaces its
 100 ms daemon restart delay with five seconds.
 

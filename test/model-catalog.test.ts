@@ -522,4 +522,18 @@ describe("ModelCatalogService", () => {
     catalog.stop();
     opened.store.close();
   });
+
+  it("does not admit new refresh work after stop", async () => {
+    const opened = db();
+    const fetch = vi.fn(async () => candidate());
+    const catalog = service({ store: opened.store, fetch });
+    catalog.stop();
+    expect(await catalog.refresh({ agentId: "fake", location: "local" })).toMatchObject({
+      result: "unavailable",
+      error: "model catalog refresh is stopped",
+    });
+    expect(await catalog.refreshAll()).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+    opened.store.close();
+  });
 });

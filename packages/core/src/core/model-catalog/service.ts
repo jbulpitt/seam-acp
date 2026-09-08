@@ -198,12 +198,27 @@ export class ModelCatalogService {
     const key = bindingKey(binding);
     const existing = this.inFlight.get(key);
     if (existing) return existing;
+    if (this.stopped) {
+      const prior = this.lookup(binding).snapshot;
+      return Promise.resolve({
+        binding,
+        ok: Boolean(prior),
+        result: "unavailable",
+        previousGeneration: prior?.generation ?? null,
+        generation: prior?.generation ?? null,
+        added: 0,
+        removed: 0,
+        changed: 0,
+        error: "model catalog refresh is stopped",
+      });
+    }
     const promise = this.refreshInner(binding, reason).finally(() => this.inFlight.delete(key));
     this.inFlight.set(key, promise);
     return promise;
   }
 
   async refreshAll(reason: CatalogRefreshReason = "manual"): Promise<CatalogRefreshResult[]> {
+    if (this.stopped) return [];
     const bindings = uniqueBindings(this.options.bindings());
     const concurrency = Math.max(1, this.options.concurrency ?? 3);
     const results: CatalogRefreshResult[] = [];

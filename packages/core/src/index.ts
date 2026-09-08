@@ -375,14 +375,16 @@ async function main(): Promise<void> {
 
   const profiles: AgentProfile[] = [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
   const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
-  const persistedCatalogBindings = modelCatalogStore.loadObservations()
-    .map(({ agentId, location }) => ({ agentId, location }));
   const modelCatalog = new ModelCatalogService({
     store: modelCatalogStore,
     logger: logger.child({ mod: "model-catalog" }),
     bindings: () => {
       const bindings = profiles.map((profile) => ({ agentId: profile.id, location: "local" }));
-      bindings.push(...persistedCatalogBindings);
+      // Re-read durable observations on each orchestration pass so a
+      // remote-only adapter first seen during this process remains part of
+      // manual/scheduled refresh-all after its bridge disconnects.
+      bindings.push(...modelCatalogStore.loadObservations()
+        .map(({ agentId, location }) => ({ agentId, location })));
       for (const bridge of bridgeHub?.listConnected() ?? []) {
         for (const [agentId, info] of bridge.agents) {
           if (info.installed) bindings.push({ agentId, location: bridge.bridgeId });

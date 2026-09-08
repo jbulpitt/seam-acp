@@ -33,7 +33,6 @@ import { PresetsFileSchema } from "../config.js";
 import { uniqueBridgeId } from "./bridge-pairing.js";
 import type { Logger } from "../lib/logger.js";
 import { parkedAgentMessage } from "./parked-agents.js";
-import type { AgentProfile } from "@seam/adapters";
 import type { ConfigDescription } from "./session-router.js";
 import type { ModelCatalogService } from "./model-catalog/service.js";
 import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
@@ -325,7 +324,6 @@ export interface ConfigMutationDeps {
   store: ConfigMutationStore;
   /** Re-derives effective config + which layer won (Trap 1). */
   describeConfig: (record: SessionRecord) => ConfigDescription;
-  profiles: Map<string, AgentProfile>;
   /** Sole cache-only authority for operational model capabilities. */
   modelCatalog: Pick<ModelCatalogService, "model">;
   /**
@@ -891,17 +889,19 @@ export class ConfigMutationService {
     const fields: ProposedField[] = [];
     const warnings: string[] = [];
 
-    // agent — must be a registered profile, or the next start throws.
+    // Agent availability comes from the host-aware operational catalog.
     let nextAgentId = record.agentId;
     if (changes.agent !== undefined) {
-      const parked = parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select");
+      const parked = before.location.value === "local"
+        ? parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select")
+        : null;
       if (parked) {
         return { ok: false, error: parked };
       }
-      if (!this.deps.profiles.has(changes.agent)) {
+      if (!this.catalogModel(changes.agent, "default", before.location.value)) {
         return {
           ok: false,
-          error: `Unknown agent "${changes.agent}". Pick a registered agent profile.`,
+          error: `Unknown agent "${changes.agent}" at ${before.location.value}. Refresh its catalog first.`,
         };
       }
       nextAgentId = changes.agent;
@@ -1208,6 +1208,7 @@ export class ConfigMutationService {
   ): BuildProposalResult {
     const name = changes.name?.trim();
     if (!name) return { ok: false, error: "`preset.name` is required." };
+    const before = this.deps.describeConfig(record);
 
     // Project scope = the calling thread's channel (#21) — never global by
     // default (a conversationally-created preset lands where it was made).
@@ -1218,10 +1219,12 @@ export class ConfigMutationService {
     }
 
     if (changes.agent !== undefined) {
-      const parked = parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select");
+      const parked = before.location.value === "local"
+        ? parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select")
+        : null;
       if (parked) return { ok: false, error: parked };
-      if (!this.deps.profiles.has(changes.agent)) {
-        return { ok: false, error: `Unknown agent "${changes.agent}".` };
+      if (!this.catalogModel(changes.agent, "default", before.location.value)) {
+        return { ok: false, error: `Unknown agent "${changes.agent}" at ${before.location.value}.` };
       }
     }
     if (changes.permission !== undefined && !PERMISSIONS.includes(changes.permission)) {
@@ -1235,9 +1238,9 @@ export class ConfigMutationService {
     const nextAgentId = changes.agent ?? existing?.agentId ?? null;
     let nextModel = changes.model?.trim() || existing?.model || null;
     if (nextAgentId && nextModel && (changes.model !== undefined || changes.agent !== undefined)) {
-      const discovered = this.catalogModel(nextAgentId, nextModel, "local");
+      const discovered = this.catalogModel(nextAgentId, nextModel, before.location.value);
       if (!discovered) {
-        return { ok: false, error: `Model "${nextModel}" is unavailable in the cached catalog for ${nextAgentId}@local.` };
+        return { ok: false, error: `Model "${nextModel}" is unavailable in the cached catalog for ${nextAgentId}@${before.location.value}.` };
       }
       if (discovered) nextModel = discovered.id;
     }
@@ -1254,7 +1257,11 @@ export class ConfigMutationService {
       nextAgentId &&
       nextModel
     ) {
-      nextEffort = this.catalogModel(nextAgentId, nextModel, "local")?.effort.selectionDefault ?? nextEffort;
+      nextEffort = this.catalogModel(
+        nextAgentId,
+        nextModel,
+        before.location.value
+      )?.effort.selectionDefault ?? nextEffort;
     }
     const nextDescription =
       changes.description === null

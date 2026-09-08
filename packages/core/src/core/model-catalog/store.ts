@@ -45,8 +45,7 @@ export class ModelCatalogStore {
         scope_key TEXT NOT NULL,
         checksum TEXT NOT NULL,
         snapshot_json TEXT NOT NULL,
-        published_at TEXT NOT NULL,
-        UNIQUE(scope_key, checksum)
+        published_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS model_catalog_scopes (
         scope_key TEXT PRIMARY KEY,
@@ -79,6 +78,11 @@ export class ModelCatalogStore {
         ON model_catalog_generations(scope_key, generation DESC);
       CREATE INDEX IF NOT EXISTS idx_model_catalog_observations_scope
         ON model_catalog_observations(scope_key);
+    `);
+    this.migrateGenerationDedupConstraint();
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_model_catalog_generations_scope
+        ON model_catalog_generations(scope_key, generation DESC);
     `);
     this.ensureColumn("model_catalog_observations", "schema_version", "INTEGER NOT NULL DEFAULT 1");
     this.ensureColumn("model_catalog_observations", "source_version", "TEXT");
@@ -142,14 +146,11 @@ export class ModelCatalogStore {
     observation: CatalogObservationRow;
   }): StoredCatalogSnapshot {
     return this.db.transaction(() => {
-      this.db.prepare(`
+      const inserted = this.db.prepare(`
         INSERT INTO model_catalog_generations(scope_key, checksum, snapshot_json, published_at)
         VALUES (?, ?, ?, ?)
-        ON CONFLICT(scope_key, checksum) DO NOTHING
       `).run(input.scopeKey, input.checksum, JSON.stringify(input.candidate), input.publishedAt);
-      const generation = Number((this.db.prepare(
-        "SELECT generation FROM model_catalog_generations WHERE scope_key = ? AND checksum = ?"
-      ).get(input.scopeKey, input.checksum) as { generation: number }).generation);
+      const generation = Number(inserted.lastInsertRowid);
       this.db.prepare(`
         INSERT INTO model_catalog_scopes(scope_key, active_generation, updated_at)
         VALUES (?, ?, ?)
@@ -192,6 +193,43 @@ export class ModelCatalogStore {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
     if (!columns.some((entry) => entry.name === column)) {
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
+    }
+  }
+
+  /**
+   * Early #229 builds de-duplicated (scope, checksum), which let A→B→A point
+   * the active scope backwards to generation 1. Rebuild the table once so
+   * every publication is a new immutable, strictly increasing generation.
+   */
+  private migrateGenerationDedupConstraint(): void {
+    const row = this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='model_catalog_generations'"
+    ).get() as { sql?: string } | undefined;
+    if (!row?.sql || !/UNIQUE\s*\(\s*scope_key\s*,\s*checksum\s*\)/i.test(row.sql)) return;
+    const foreignKeys = Number(this.db.pragma("foreign_keys", { simple: true })) === 1;
+    if (foreignKeys) this.db.pragma("foreign_keys = OFF");
+    try {
+      this.db.transaction(() => {
+        this.db.exec(`
+        CREATE TABLE model_catalog_generations_next (
+          generation INTEGER PRIMARY KEY AUTOINCREMENT,
+          scope_key TEXT NOT NULL,
+          checksum TEXT NOT NULL,
+          snapshot_json TEXT NOT NULL,
+          published_at TEXT NOT NULL
+        );
+        INSERT INTO model_catalog_generations_next(
+          generation, scope_key, checksum, snapshot_json, published_at
+        )
+        SELECT generation, scope_key, checksum, snapshot_json, published_at
+        FROM model_catalog_generations
+        ORDER BY generation;
+        DROP TABLE model_catalog_generations;
+        ALTER TABLE model_catalog_generations_next RENAME TO model_catalog_generations;
+        `);
+      })();
+    } finally {
+      if (foreignKeys) this.db.pragma("foreign_keys = ON");
     }
   }
 

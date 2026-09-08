@@ -503,7 +503,7 @@ describe("#208 isolated fire re-resolves effective config", () => {
     expect(captured.statuses.some((s) => s.includes("unknown agent not-a-real-agent"))).toBe(
       true
     );
-    expect(captured.getProfile).toHaveBeenCalledWith("not-a-real-agent");
+    expect(captured.getProfile).toHaveBeenCalledWith("not-a-real-agent", "local");
     expect(captured.getProfile.mock.calls.map((c) => c[0])).not.toContain("copilot");
     expect(captured.panels).toEqual([]);
   });

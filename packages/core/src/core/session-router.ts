@@ -1,6 +1,6 @@
 import path from "node:path";
 import { AgentRuntime } from "../agents/agent-runtime.js";
-import type { AgentProfile } from "@seam/adapters";
+import { asRemoteCatalogAdapter, type AgentProfile } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore } from "./session-store.js";
 import type { SessionRecord, PermissionPolicyMode, StatusCardStyle } from "./types.js";
@@ -30,6 +30,8 @@ import {
   spawnRemoteSlot,
   type MuxHandle,
 } from "./remote-spawn.js";
+import { bindingKey } from "./model-catalog/service.js";
+import { isLocalLocation } from "./location.js";
 
 /**
  * Wiring for the per-session seam-MCP surface. The token identifies the
@@ -268,6 +270,7 @@ export class SessionRouter {
   private readonly logger: Logger;
   private readonly store: SessionStore;
   private readonly profileById: Map<string, AgentProfile>;
+  private readonly remoteProfiles = new Map<string, { generation: number; profile: AgentProfile }>();
   private readonly modelCatalog: ModelCatalogService;
   private readonly defaultAgentId: string;
   private readonly defaultPermissionMode: PermissionPolicyMode;
@@ -396,9 +399,19 @@ export class SessionRouter {
     return [...this.profileById.values()];
   }
 
-  /** Look up a registered profile by id, or undefined if not found. */
-  getProfile(id: string): AgentProfile | undefined {
-    return this.profileById.get(id);
+  /** Look up a local profile or synthesize a cache-backed remote-only one. */
+  getProfile(id: string, location = "local"): AgentProfile | undefined {
+    const local = this.profileById.get(id);
+    if (local || isLocalLocation(location)) return local;
+    const binding = { agentId: id, location };
+    const lookup = this.modelCatalog.lookup(binding);
+    if (!lookup.snapshot || lookup.state === "drift") return undefined;
+    const key = bindingKey(binding);
+    const cached = this.remoteProfiles.get(key);
+    if (cached?.generation === lookup.snapshot.generation) return cached.profile;
+    const profile = asRemoteCatalogAdapter(id, lookup.snapshot.candidate);
+    this.remoteProfiles.set(key, { generation: lookup.snapshot.generation, profile });
+    return profile;
   }
 
   /** Parked-select copy when ollama-cloud is disabled, else null. */
@@ -482,7 +495,6 @@ export class SessionRouter {
     // effort — a preset effort only wins if the RESOLVED agent supports that
     // exact level; otherwise it is dropped and cfg.reasoningEffort applies
     // (Trap 2). Mirrors startRuntime's `presetEffortUsable` gate exactly.
-    const profile = this.profileById.get(agent.value);
     const catalogEfforts = this.modelCatalog.effortChoices(
       { agentId: agent.value, location: locationValue },
       model.value
@@ -956,7 +968,7 @@ export class SessionRouter {
     );
 
     const agentId = preset.agent?.value ?? record.agentId;
-    const profile = this.profileById.get(agentId);
+    const profile = this.getProfile(agentId, location);
     if (!profile) {
       // #220 / #12: a parked or retired agent gets a message that names the
       // state and the fix. We deliberately do NOT substitute the default

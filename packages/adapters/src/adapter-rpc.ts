@@ -51,6 +51,9 @@ export async function invokeAdapterRpc(
     case "prepare":
       if (!adapter) throw new Error("no adapter for prepare");
       return adapter.prepare();
+    case "describeModelCatalog":
+      if (!adapter) throw new Error("no adapter for describeModelCatalog");
+      return adapter.catalog.scope();
     case "fetchModelCatalog":
       if (!adapter) throw new Error("no adapter for fetchModelCatalog");
       {

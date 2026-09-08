@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { Cron } from "croner";
 import type {
   AdapterCatalogCandidate,
+  CatalogScope,
   CatalogModel,
   NormalizedCatalogSelection,
   RawCatalogSelection,
@@ -48,6 +49,17 @@ export interface ResolvedCatalogSelection {
   generation: number;
 }
 
+export interface CatalogPublication {
+  binding: CatalogBinding;
+  snapshot: StoredCatalogSnapshot;
+}
+
+export interface AvailableCatalogModel {
+  binding: CatalogBinding;
+  model: CatalogModel;
+  generation: number;
+}
+
 const DEFAULT_REFRESH_CRON = "17 */6 * * *";
 
 export class ModelCatalogService {
@@ -56,6 +68,7 @@ export class ModelCatalogService {
   private readonly inFlight = new Map<string, Promise<CatalogRefreshResult>>();
   private readonly fetchInFlight = new Map<string, Promise<AdapterCatalogCandidate>>();
   private readonly collapseConfirmations = new Map<string, string>();
+  private readonly publicationListeners = new Set<(event: CatalogPublication) => void>();
   private job?: Cron;
   private stopped = false;
 
@@ -63,6 +76,8 @@ export class ModelCatalogService {
     store: ModelCatalogStore;
     logger: Logger;
     bindings: () => ReadonlyArray<CatalogBinding>;
+    /** Adapter-owned semantic scope; no provider work is allowed here. */
+    scope?: (binding: CatalogBinding) => CatalogScope | Promise<CatalogScope>;
     fetch: (binding: CatalogBinding) => Promise<AdapterCatalogCandidate>;
     isOnline?: (binding: CatalogBinding) => boolean;
     now?: () => Date;
@@ -99,6 +114,29 @@ export class ModelCatalogService {
 
   knownBindings(): CatalogBinding[] {
     return [...this.observations.values()].map(({ agentId, location }) => ({ agentId, location }));
+  }
+
+  /** Cache-only fleet view used by enrichment; drifted bindings contribute nothing. */
+  availableModels(): AvailableCatalogModel[] {
+    const rows: AvailableCatalogModel[] = [];
+    for (const observation of this.observations.values()) {
+      if (observation.drift) continue;
+      const snapshot = this.snapshots.get(observation.scopeKey);
+      if (!snapshot) continue;
+      for (const model of snapshot.candidate.models) {
+        rows.push({
+          binding: { agentId: observation.agentId, location: observation.location },
+          model,
+          generation: snapshot.generation,
+        });
+      }
+    }
+    return rows;
+  }
+
+  onPublication(listener: (event: CatalogPublication) => void): () => void {
+    this.publicationListeners.add(listener);
+    return () => this.publicationListeners.delete(listener);
   }
 
   lookup(binding: CatalogBinding): CatalogLookup {
@@ -192,17 +230,19 @@ export class ModelCatalogService {
         ? `scope:${candidate.scope.fingerprint}` : `binding:${key}`;
       const activeForScope = this.snapshots.get(desiredScope);
       const currentObservation = this.observations.get(key);
-      const advancesKnownActive = Boolean(
+      // A binding that last observed the active generation is allowed to move
+      // the canonical scope forward. Peer observations may legitimately lag
+      // by several generations; treating those as conflicts made A→B→C fail
+      // as soon as another host still reported A. A binding that did *not*
+      // observe the active generation may only catch up to it; a divergent
+      // candidate is quarantined until equivalence is re-established.
+      const ownsActive = Boolean(
         activeForScope && currentObservation?.scopeKey === desiredScope &&
-        currentObservation.checksum === activeForScope.checksum
+        currentObservation.checksum === activeForScope.checksum &&
+        !currentObservation.drift
       );
-      const conflicts = [...this.observations.values()].filter(
-        (row) => row.bindingKey !== key && row.scopeKey === desiredScope &&
-          row.checksum !== checksum &&
-          (!advancesKnownActive || row.checksum !== activeForScope?.checksum)
-      );
-      const drift = conflicts.length
-        ? `catalog conflicts with ${conflicts.map((row) => row.bindingKey).join(", ")}; binding quarantined`
+      const drift = activeForScope && checksum !== activeForScope.checksum && !ownsActive
+        ? `catalog conflicts with active generation ${activeForScope.generation}; binding quarantined`
         : null;
       const scopeKey = desiredScope;
       const priorForScope = this.snapshots.get(scopeKey) ?? prior;
@@ -262,6 +302,13 @@ export class ModelCatalogService {
       this.options.store.recordAttempt({ bindingKey: key, attemptedAt, result: "published", error: drift, source: candidate.source, candidateChecksum: checksum });
       this.snapshots.set(scopeKey, deepFreeze(snapshot));
       this.observations.set(key, observation);
+      for (const listener of this.publicationListeners) {
+        try {
+          listener({ binding, snapshot: this.snapshots.get(scopeKey)! });
+        } catch (err) {
+          this.options.logger.warn({ err, binding: key }, "model catalog publication listener failed");
+        }
+      }
       this.options.logger.info({ binding: key, scopeKey, generation: snapshot.generation, ...diff, drift }, "model catalog published");
       return { ...base, ...diff, ok: !drift, result: "published", source: candidate.source, scope: scopeKey, generation: snapshot.generation, fetchedAt: candidate.fetchedAt, cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion, ...(drift ? { error: drift } : {}) };
     } catch (caught) {
@@ -272,14 +319,29 @@ export class ModelCatalogService {
     }
   }
 
-  private fetchCandidate(binding: CatalogBinding): Promise<AdapterCatalogCandidate> {
-    // Once a binding has an observation, semantically equivalent bindings share
-    // provider work while retaining their own observation/publication rows.
-    const scopeKey = this.observations.get(bindingKey(binding))?.scopeKey;
-    if (!scopeKey) return this.options.fetch(binding);
+  private async fetchCandidate(binding: CatalogBinding): Promise<AdapterCatalogCandidate> {
+    // Scope discovery is adapter-owned and provider-work-free, so equivalent
+    // cold bindings share the very first provider/CLI fetch as well as all
+    // later refreshes. Old embedders without the scope hook conservatively use
+    // a prior observation or isolate by binding.
+    const observedScope = this.observations.get(bindingKey(binding))?.scopeKey;
+    const declared = this.options.scope ? await this.options.scope(binding) : null;
+    const scopeKey = declared && trustworthyFingerprint(declared.fingerprint)
+      ? `scope:${declared.fingerprint}`
+      : observedScope ?? `binding:${bindingKey(binding)}`;
     const existing = this.fetchInFlight.get(scopeKey);
     if (existing) return existing;
-    const promise = this.options.fetch(binding).finally(() => this.fetchInFlight.delete(scopeKey));
+    const promise = this.options.fetch(binding).then((candidate) => {
+      if (
+        declared && trustworthyFingerprint(declared.fingerprint) &&
+        candidate.scope.fingerprint !== declared.fingerprint
+      ) {
+        throw new Error(
+          `adapter catalog scope changed during fetch (${declared.fingerprint} → ${candidate.scope.fingerprint})`
+        );
+      }
+      return candidate;
+    }).finally(() => this.fetchInFlight.delete(scopeKey));
     this.fetchInFlight.set(scopeKey, promise);
     return promise;
   }

@@ -629,6 +629,31 @@ describe("host/agent change drops unsupported model/effort (D13)", () => {
     expect(next.overlay.location).toBe("mac");
   });
 
+  it("pins model defaults from the selected remote location, not local", () => {
+    const started = draft({
+      snapshot: snapshot({
+        agent: setting("remote-only", "thread preset"),
+        location: setting("gpu", "thread preset"),
+        model: setting("old", "thread preset"),
+        withoutThread: { ...WITHOUT, agent: "remote-only", location: "gpu", model: "old" },
+      }),
+    });
+    const seen: string[] = [];
+    const next = applyPickerValue(started, "model", "remote-model", (_agentId, location) => {
+      seen.push(location);
+      return {
+        models: [{
+          modelId: "remote-model",
+          effortMechanism: "configOption",
+          effortLevels: ["low", "xhigh"],
+          effortDefault: "xhigh",
+        }],
+      };
+    });
+    expect(seen).toEqual(["gpu"]);
+    expect(next.overlay).toMatchObject({ model: "remote-model", effort: "xhigh" });
+  });
+
   it("agent@location picker sets both agent and host", () => {
     const next = applyPickerValue(draft(), "agent", "claude@mac", caps);
     expect(next.overlay.agent).toBe("claude");

@@ -26,7 +26,7 @@ const bareProfile = (defaultModel: string) =>
 
 describe("AgentAdapter.describe()", () => {
   it("uses the current adapter contract version", () => {
-    expect(AGENT_ADAPTER_VERSION).toBe(3);
+    expect(AGENT_ADAPTER_VERSION).toBe(4);
   });
 
   it("keeps describe non-authoritative while Claude catalog owns full context data", async () => {

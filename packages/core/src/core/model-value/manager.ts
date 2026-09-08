@@ -1,7 +1,7 @@
 import { Cron } from "croner";
 import type { Logger } from "../../lib/logger.js";
 import { buildModelValueSnapshot } from "./ranking.js";
-import { fetchAaModels, fetchCopilotModelMetadata, fetchCopilotPricing } from "./sources.js";
+import { fetchAaModels, fetchCopilotPricing } from "./sources.js";
 import { MODEL_METADATA_REFRESH_CRON } from "../model-metadata/artificial-analysis.js";
 import type { ModelValueStore } from "./store.js";
 import type { AaModel, CopilotModelMetadata, CopilotPricing } from "./types.js";
@@ -12,16 +12,17 @@ export interface ModelValueManagerOptions {
   aaApiKey: string;
   inputTokens: number;
   outputTokens: number;
-  copilotCliPath?: string;
   fetchAa?: () => Promise<AaModel[]>;
   fetchPricing?: () => Promise<CopilotPricing[]>;
-  fetchCopilot?: () => Promise<CopilotModelMetadata[]>;
+  /** Required cache-only operational catalog join; never probe an ACP session here. */
+  fetchCopilot: () => Promise<CopilotModelMetadata[]>;
 }
 
 export class ModelValueManager {
   private readonly options: ModelValueManagerOptions;
   private job?: Cron;
   private inFlight?: Promise<void>;
+  private catalogRefreshPending = false;
   private onUpdate?: () => void;
   private stopped = false;
 
@@ -45,6 +46,7 @@ export class ModelValueManager {
 
   stop(): void {
     this.stopped = true;
+    this.catalogRefreshPending = false;
     this.job?.stop();
     this.job = undefined;
   }
@@ -67,11 +69,25 @@ export class ModelValueManager {
     this.onUpdate = onUpdate;
   }
 
+  /** Coalesce a catalog-generation notification behind any active enrichment fetch. */
+  refreshForCatalogGeneration(): void {
+    if (this.stopped) return;
+    if (this.inFlight) {
+      this.catalogRefreshPending = true;
+      return;
+    }
+    void this.refresh();
+  }
+
   refresh(): Promise<void> {
     if (this.inFlight) return this.inFlight;
     if (this.stopped) return Promise.resolve();
     this.inFlight = this.refreshInner().finally(() => {
       this.inFlight = undefined;
+      if (this.catalogRefreshPending && !this.stopped) {
+        this.catalogRefreshPending = false;
+        void this.refresh();
+      }
     });
     return this.inFlight;
   }
@@ -79,12 +95,7 @@ export class ModelValueManager {
   private async refreshInner(): Promise<void> {
     const fetchAa = this.options.fetchAa ?? (() => fetchAaModels(this.options.aaApiKey));
     const fetchPricing = this.options.fetchPricing ?? fetchCopilotPricing;
-    const fetchCopilot =
-      this.options.fetchCopilot ??
-      (() =>
-        fetchCopilotModelMetadata({
-          ...(this.options.copilotCliPath ? { cliPath: this.options.copilotCliPath } : {}),
-        }));
+    const fetchCopilot = this.options.fetchCopilot;
     try {
       const [aaModels, pricing, copilotModels] = await Promise.all([
         fetchAa(),

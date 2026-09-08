@@ -90,11 +90,13 @@ function service(opts: {
   fetch: (binding: { agentId: string; location: string }) => Promise<AdapterCatalogCandidate>;
   bindings?: Array<{ agentId: string; location: string }>;
   online?: (binding: { agentId: string; location: string }) => boolean;
+  scope?: (binding: { agentId: string; location: string }) => AdapterCatalogCandidate["scope"];
 }) {
   return new ModelCatalogService({
     store: opts.store,
     logger,
     bindings: () => opts.bindings ?? [{ agentId: "fake", location: "local" }],
+    ...(opts.scope ? { scope: opts.scope } : {}),
     fetch: opts.fetch,
     isOnline: opts.online,
     refreshCron: "0 0 1 1 *",
@@ -124,6 +126,42 @@ describe("ModelCatalogService", () => {
     expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining([
       "schema_version", "source_version",
     ]));
+  });
+
+  it("migrates checksum-deduplicated generations without losing the active snapshot", () => {
+    const opened = db();
+    opened.store.close();
+    const sqlite = new Database(opened.file);
+    sqlite.exec(`
+      DROP TABLE model_catalog_scopes;
+      DROP TABLE model_catalog_generations;
+      CREATE TABLE model_catalog_generations (
+        generation INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope_key TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        UNIQUE(scope_key, checksum)
+      );
+      CREATE TABLE model_catalog_scopes (
+        scope_key TEXT PRIMARY KEY,
+        active_generation INTEGER NOT NULL REFERENCES model_catalog_generations(generation),
+        updated_at TEXT NOT NULL
+      );
+    `);
+    sqlite.close();
+    const migrated = new ModelCatalogStore(opened.file);
+    const first = candidate();
+    const observation = {
+      bindingKey: "fake@local", agentId: "fake", location: "local",
+      scopeKey: "scope:test", checksum: "a", adapterVersion: 1,
+      schemaVersion: 1, cliVersion: null, sourceVersion: null,
+      source: "test", fetchedAt: first.fetchedAt, drift: null,
+    };
+    expect(migrated.publish({ scopeKey: "scope:test", checksum: "a", candidate: first, publishedAt: first.fetchedAt, observation }).generation).toBe(1);
+    expect(migrated.publish({ scopeKey: "scope:test", checksum: "b", candidate: first, publishedAt: first.fetchedAt, observation: { ...observation, checksum: "b" } }).generation).toBe(2);
+    expect(migrated.publish({ scopeKey: "scope:test", checksum: "a", candidate: first, publishedAt: first.fetchedAt, observation }).generation).toBe(3);
+    migrated.close();
   });
 
   it("publishes an immutable generation and applies the adapter's outlier codec", async () => {
@@ -283,6 +321,31 @@ describe("ModelCatalogService", () => {
     opened.store.close();
   });
 
+  it("single-flights equivalent bindings on their first cold fetch", async () => {
+    const opened = db();
+    const bindings = [
+      { agentId: "fake-a", location: "local" },
+      { agentId: "fake-b", location: "remote-a" },
+    ];
+    let release: (() => void) | undefined;
+    const fetch = vi.fn(() => new Promise<AdapterCatalogCandidate>((resolve) => {
+      release = () => resolve(candidate());
+    }));
+    const catalog = service({
+      store: opened.store,
+      fetch,
+      bindings,
+      scope: () => candidate().scope,
+    });
+    const both = bindings.map((binding) => catalog.refresh(binding));
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    release?.();
+    const results = await Promise.all(both);
+    expect(results.map((result) => result.result).sort()).toEqual(["published", "unchanged"]);
+    expect(fetch).toHaveBeenCalledOnce();
+    opened.store.close();
+  });
+
   it("single-flights startup, scheduled, and manual refresh triggers for a binding", async () => {
     const opened = db();
     const binding = { agentId: "fake", location: "local" };
@@ -317,7 +380,7 @@ describe("ModelCatalogService", () => {
     });
     await catalog.refresh(local);
     const result = await catalog.refresh(remote);
-    expect(result.error).toContain("conflicts with fake@local");
+    expect(result.error).toContain("conflicts with active generation");
     expect(catalog.lookup(remote).state).toBe("drift");
     expect(catalog.models(remote)).toEqual([]);
     expect(() => catalog.resolve(remote, { model: "nebula" })).toThrow(/unavailable/);
@@ -352,6 +415,40 @@ describe("ModelCatalogService", () => {
     });
     expect(await evolving.refresh(local)).toMatchObject({ result: "published", generation: 2 });
     expect(evolving.models(local).map((entry) => entry.id)).toEqual(["nebula", "second"]);
+    opened.store.close();
+  });
+
+  it("allows repeated canonical advances while a peer observation remains stale", async () => {
+    const opened = db();
+    const local = { agentId: "fake", location: "local" };
+    const remote = { agentId: "fake", location: "remote-a" };
+    let localIds = ["nebula", "a"];
+    const catalog = service({
+      store: opened.store,
+      fetch: async (binding) => candidate(binding.location === "local" ? localIds : ["nebula", "a"]),
+      scope: () => candidate().scope,
+    });
+    expect(await catalog.refresh(local)).toMatchObject({ generation: 1, result: "published" });
+    expect(await catalog.refresh(remote)).toMatchObject({ generation: 1, result: "unchanged" });
+    localIds = ["nebula", "b"];
+    expect(await catalog.refresh(local)).toMatchObject({ generation: 2, result: "published" });
+    localIds = ["nebula", "c"];
+    expect(await catalog.refresh(local)).toMatchObject({ generation: 3, result: "published" });
+    expect(catalog.lookup(local).state).toBe("ready");
+    expect(catalog.lookup(remote).observation?.checksum).not.toBe(catalog.lookup(local).snapshot?.checksum);
+    opened.store.close();
+  });
+
+  it("never moves generation backwards when content returns to an earlier checksum", async () => {
+    const opened = db();
+    let ids = ["nebula", "a"];
+    const catalog = service({ store: opened.store, fetch: async () => candidate(ids) });
+    const binding = { agentId: "fake", location: "local" };
+    expect((await catalog.refresh(binding)).generation).toBe(1);
+    ids = ["nebula", "b"];
+    expect((await catalog.refresh(binding)).generation).toBe(2);
+    ids = ["nebula", "a"];
+    expect((await catalog.refresh(binding)).generation).toBe(3);
     opened.store.close();
   });
 

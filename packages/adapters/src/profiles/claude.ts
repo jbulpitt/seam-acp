@@ -10,7 +10,7 @@ import {
   type AgentIdentity,
   type AgentProfile,
 } from "../agent-profile.js";
-import { manifestCatalogSource, readCliVersion } from "../model-catalog.js";
+import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 import { CLAUDE_FAST_MODE } from "../fast-mode.js";
 
@@ -142,6 +142,13 @@ export function makeClaudeProfile(opts: {
     ...(opts.brand ? { brand: opts.brand } : {}),
     defaultModel: opts.defaultModel,
     catalog: {
+      scope: () => manifestCatalogScope({
+        provider: opts.directAnthropic ? "anthropic" : (opts.brand ?? "claude-compatible"),
+        backend: opts.extraEnv?.CLAUDE_CODE_USE_VERTEX === "1" ? "vertex" : opts.extraEnv?.ANTHROPIC_BASE_URL,
+        credentialProfile: configDir ?? "default",
+        project: opts.extraEnv?.ANTHROPIC_VERTEX_PROJECT_ID,
+        region: opts.extraEnv?.CLOUD_ML_REGION,
+      }),
       async fetch() {
         const candidate = await manifestCatalogSource({
           provider: opts.directAnthropic ? "anthropic" : (opts.brand ?? "claude-compatible"),

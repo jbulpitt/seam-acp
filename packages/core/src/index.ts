@@ -370,6 +370,7 @@ async function main(): Promise<void> {
   let serviceStatusCard: ServiceStatusCard | undefined;
   let stopServiceStatus: (() => void) | undefined;
   let stopCatalogBridgeRefresh: (() => void) | undefined;
+  let stopCatalogEnrichmentRefresh: (() => void) | undefined;
   let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
 
   const profiles: AgentProfile[] = [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
@@ -390,6 +391,15 @@ async function main(): Promise<void> {
       return bindings;
     },
     isOnline: ({ location }) => location === "local" || Boolean(bridgeHub?.isBridgeReady(location)),
+    scope: async ({ agentId, location }) => {
+      if (location === "local") {
+        const profile = profilesById.get(agentId);
+        if (!profile) throw new Error(`unknown local agent ${agentId}`);
+        return profile.catalog.scope();
+      }
+      if (!bridgeHub) throw new Error("bridge hub is not ready");
+      return await bridgeHub.rpc(location, "describeModelCatalog", {}, agentId) as ReturnType<AgentProfile["catalog"]["scope"]>;
+    },
     fetch: async ({ agentId, location }): Promise<AdapterCatalogCandidate> => {
       if (location === "local") {
         const profile = profilesById.get(agentId);
@@ -461,15 +471,13 @@ async function main(): Promise<void> {
     store: modelMetadataStore,
     logger: logger.child({ mod: "model-metadata" }),
     source: artificialAnalysis,
-    getCatalog: async () => profiles.flatMap((profile) =>
-      modelCatalog.models({ agentId: profile.id, location: "local" }).map((model) => ({
-        agentId: profile.id,
-        modelId: model.id,
-        name: model.displayName,
-        contextWindow: model.context.effective,
-        vision: model.modalities.input.includes("image"),
-      }))
-    ),
+    getCatalog: async () => modelCatalog.availableModels().map(({ binding, model }) => ({
+      agentId: binding.agentId,
+      modelId: model.id,
+      name: model.displayName,
+      contextWindow: model.context.effective,
+      vision: model.modalities.input.includes("image"),
+    })),
   });
   const modelValueManager = new ModelValueManager({
     store: modelValueStore,
@@ -480,8 +488,11 @@ async function main(): Promise<void> {
     fetchAa: () => artificialAnalysis.fetch(),
     // Operational model/effort data has one authority. Rankings enrich the
     // current catalog snapshot instead of probing a second ACP session.
-    fetchCopilot: async () => modelCatalog.models({ agentId: copilot.id, location: "local" })
-      .map((model) => ({
+    fetchCopilot: async () => [...new Map(
+      modelCatalog.availableModels()
+        .filter(({ binding }) => binding.agentId === copilot.id)
+        .map(({ model }) => [model.id, model] as const)
+    ).values()].map((model) => ({
         modelId: model.id,
         displayName: model.displayName,
         validEffortTiers: model.effort.choices
@@ -489,6 +500,14 @@ async function main(): Promise<void> {
           .filter((effort) => effort !== "default"),
         priceCategory: model.pricingCategory,
       })),
+  });
+  // Enrichment must follow the operational generation, not merely its own
+  // 12-hour clock. Each manager coalesces a publication behind any active
+  // source fetch so a cold startup cannot finish with the pre-publication
+  // empty catalog and remain stale until the next cron tick.
+  stopCatalogEnrichmentRefresh = modelCatalog.onPublication(() => {
+    modelMetadataManager.refreshForCatalogGeneration();
+    modelValueManager.refreshForCatalogGeneration();
   });
 
   const quotaRegistry = new QuotaRegistry();
@@ -1442,6 +1461,7 @@ async function main(): Promise<void> {
     quotaPoller.stop();
     modelMetadataManager.stop();
     modelValueManager.stop();
+    stopCatalogEnrichmentRefresh?.();
     modelCatalog.stop();
     stopCatalogBridgeRefresh?.();
     stopQuotaCard?.();

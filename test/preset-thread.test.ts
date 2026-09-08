@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { MessageFlags } from "discord.js";
-import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { Orchestrator, presetModelSelectOptions } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { PARTICIPANT_CONFIG_REFUSAL } from "../packages/core/src/config.js";
 import { formatThreadOrdinal as formatKeycap } from "../packages/core/src/platforms/discord/thread-namer.js";
@@ -23,6 +23,20 @@ let dir: string;
 let store: SessionStore;
 
 const now = "2026-08-22T00:00:00.000Z";
+
+describe("preset model catalog select", () => {
+  it("stays within Discord's 25-option cap and routes overflow to the full picker", () => {
+    const models = Array.from({ length: 25 }, (_, index) => ({
+      modelId: `model-${index}`,
+      name: `Model ${index}`,
+    }));
+    const options = presetModelSelectOptions(models, "model-24");
+    expect(options).toHaveLength(25);
+    expect(options.at(-1)?.value).toBe("__more__");
+    expect(options.some((option) => option.value === "model-24" && option.default)).toBe(true);
+    expect(presetModelSelectOptions(models.slice(0, 24), null)).toHaveLength(25);
+  });
+});
 
 function preset(over: Partial<Preset> & { name: string }): Preset {
   return {

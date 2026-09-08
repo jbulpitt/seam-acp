@@ -5,10 +5,50 @@ import {
   makeCodexProfile,
   makeCopilotProfile,
   makeGrokProfile,
+  manifestCatalogSource,
 } from "@seam/adapters";
 import { validateCandidate } from "../packages/core/src/core/model-catalog/service.js";
 
 describe("production adapter catalog sources", () => {
+  it("keeps distinct normalized/runtime ids and unusual effort bindings through the manifest seam", async () => {
+    const source = manifestCatalogSource({
+      provider: "architectural-outlier",
+      defaultModel: "normalized-nebula",
+      models: () => [{
+        modelId: "normalized-nebula",
+        runtimeId: "vendor::nebula@2031",
+        name: "Nebula",
+        effort: {
+          mechanism: "configOption",
+          configId: "cognition.mode/v9",
+          choices: [
+            { id: "swift", raw: "SPEED::1" },
+            { id: "deliberate", raw: "THINK::9000" },
+          ],
+          selectionDefault: "deliberate",
+        },
+      }],
+      adapterVersion: 91,
+    });
+    const catalog = await source.fetch();
+    validateCandidate(catalog);
+    expect(catalog.models[0]?.bindings).toEqual([
+      {
+        model: "normalized-nebula",
+        effort: "swift",
+        rawModel: "vendor::nebula@2031",
+        rawEffort: "SPEED::1",
+      },
+      {
+        model: "normalized-nebula",
+        effort: "deliberate",
+        rawModel: "vendor::nebula@2031",
+        rawEffort: "THINK::9000",
+      },
+    ]);
+    expect(source.scope()).toEqual(catalog.scope);
+  });
+
   it("collects Copilot's model-specific effort choices and defaults", async () => {
     const profile = makeCopilotProfile({
       cliPath: "false",

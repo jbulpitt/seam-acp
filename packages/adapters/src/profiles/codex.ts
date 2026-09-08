@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
 import {
+  manifestCatalogScope,
   manifestCatalogSource,
   readCliVersion,
   readJsonFileBounded,
@@ -167,6 +168,11 @@ export function makeCodexProfile(opts: {
     displayName: opts.displayName ?? "OpenAI Codex",
     defaultModel: opts.defaultModel,
     catalog: {
+      scope: () => manifestCatalogScope({
+        provider: opts.id === "ollama-cloud" ? "ollama-cloud" : "openai",
+        backend: opts.extraEnv?.OPENAI_BASE_URL,
+        credentialProfile: path.dirname(modelsCachePath),
+      }),
       async fetch() {
         const snapshot: CodexCatalogSnapshot = opts.staticModels?.length
           ? { models: [...opts.staticModels] }

@@ -1224,7 +1224,7 @@ export function applyPickerValue(
   draft: ThreadConfigDraft,
   field: ConfigEditorAction,
   value: string,
-  capsForAgent: (agentId: string) => DraftAgentCapabilities | undefined,
+  capsForAgent: (agentId: string, location: string) => DraftAgentCapabilities | undefined,
   now = Date.now()
 ): ThreadConfigDraft {
   const inherit = value === INHERIT_VALUE;
@@ -1269,8 +1269,8 @@ export function applyPickerValue(
         if (channelScope) overlay.channelEffort = null;
         else overlay.effort = null;
       } else if (value !== currentModel) {
-        const agentId = effectiveAfterDraft({ ...draft, overlay }).agent;
-        const model = capsForAgent(agentId)?.models?.find((entry) => entry.modelId === value);
+        const effective = effectiveAfterDraft({ ...draft, overlay });
+        const model = capsForAgent(effective.agent, effective.location)?.models?.find((entry) => entry.modelId === value);
         if (model) {
           if (channelScope) overlay.channelEffort = model.effortDefault;
           else overlay.effort = model.effortDefault;
@@ -1352,8 +1352,8 @@ export function applyPickerValue(
     updatedAt: now,
   };
   if (!channelScope && field === "agent") {
-    const agentId = effectiveAfterDraft(updated).agent;
-    return dropUnsupported(updated, capsForAgent(agentId));
+    const effective = effectiveAfterDraft(updated);
+    return dropUnsupported(updated, capsForAgent(effective.agent, effective.location));
   }
   return updated;
 }

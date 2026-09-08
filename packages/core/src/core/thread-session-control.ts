@@ -17,6 +17,7 @@ import {
 } from "./fast-mode.js";
 import type { SessionConfigState, SessionRecord } from "./types.js";
 import type { CatalogBinding, ModelCatalogService } from "./model-catalog/service.js";
+import { isLocalLocation } from "./location.js";
 
 export interface ConfigureThreadInput {
   agent?: string;
@@ -146,7 +147,7 @@ export interface ThreadSessionControlDeps {
   };
   router: {
     describeConfig(record: SessionRecord): ConfigDescription;
-    getProfile(agentId: string): AgentProfile | undefined;
+    getProfile(agentId: string, location?: string): AgentProfile | undefined;
     parkedSelectMessage?(agentId: string): string | null;
     unregisteredAgentMessage?(agentId: string, fallback: string): string;
     getOrStartRuntime(record: SessionRecord): Promise<SessionControlRuntime>;
@@ -200,14 +201,17 @@ export class ThreadSessionControlService {
     }
 
     const before = this.deps.router.describeConfig(target);
+    const location = before.location?.value ?? "local";
     const requestedAgent = input.agent?.trim();
     if (input.agent !== undefined && !requestedAgent) {
       return { ok: false, error: "`agent` must be a non-empty string." };
     }
     const nextAgent = requestedAgent ?? before.agent.value;
-    const parked = this.deps.router.parkedSelectMessage?.(nextAgent);
+    const parked = isLocalLocation(location)
+      ? this.deps.router.parkedSelectMessage?.(nextAgent)
+      : null;
     if (parked) return { ok: false, error: parked };
-    const profile = this.deps.router.getProfile(nextAgent);
+    const profile = this.deps.router.getProfile(nextAgent, location);
     if (!profile) {
       const fallback = `Unknown agent "${nextAgent}".`;
       return {
@@ -223,13 +227,13 @@ export class ThreadSessionControlService {
     }
     const catalogDefault = this.deps.modelCatalog.models({
       agentId: nextAgent,
-      location: before.location.value,
+      location,
     }).find((model) => model.default);
     const requestedTargetModel = requestedModel ?? (agentChanged ? catalogDefault?.id : before.model.value);
     if (!requestedTargetModel) {
       return {
         ok: false,
-        error: `Model catalog for ${nextAgent}@${before.location.value} is warming/unavailable.`,
+        error: `Model catalog for ${nextAgent}@${location} is warming/unavailable.`,
       };
     }
     if (!agentChanged && requestedTargetModel === before.model.value) {
@@ -243,7 +247,7 @@ export class ThreadSessionControlService {
       profile,
       target,
       agentChanged,
-      { agentId: nextAgent, location: before.location.value }
+      { agentId: nextAgent, location }
     );
     if (models.length === 0) {
       return {
@@ -252,7 +256,7 @@ export class ThreadSessionControlService {
       };
     }
     const catalogModel = this.deps.modelCatalog.model(
-      { agentId: nextAgent, location: before.location.value },
+      { agentId: nextAgent, location },
       requestedTargetModel
     );
     if (!catalogModel || !models.includes(catalogModel.id)) {
@@ -374,15 +378,18 @@ export class ThreadSessionControlService {
     if (!supplied) return { ok: false, error: "Provide at least one of agent, model, effort, role, disableThreadPrefix, or fastMode." };
 
     const before = this.deps.router.describeConfig(target);
+    const location = before.location?.value ?? "local";
     const previousAgentId = before.agent.value;
     const requestedAgent = input.agent?.trim();
     if (input.agent !== undefined && !requestedAgent) {
       return { ok: false, error: "`agent` must be a non-empty string." };
     }
     const nextAgentId = requestedAgent ?? previousAgentId;
-    const parked = this.deps.router.parkedSelectMessage?.(nextAgentId);
+    const parked = isLocalLocation(location)
+      ? this.deps.router.parkedSelectMessage?.(nextAgentId)
+      : null;
     if (parked) return { ok: false, error: parked };
-    const profile = this.deps.router.getProfile(nextAgentId);
+    const profile = this.deps.router.getProfile(nextAgentId, location);
     if (!profile) {
       const fallback = `Unknown agent "${nextAgentId}".`;
       return {
@@ -398,13 +405,13 @@ export class ThreadSessionControlService {
     }
     const catalogDefault = this.deps.modelCatalog.models({
       agentId: nextAgentId,
-      location: before.location.value,
+      location,
     }).find((model) => model.default);
     const requestedTargetModel = requestedModel ?? (agentChanged ? catalogDefault?.id : before.model.value);
     if (!requestedTargetModel) {
       return {
         ok: false,
-        error: `Model catalog for ${nextAgentId}@${before.location.value} is warming/unavailable.`,
+        error: `Model catalog for ${nextAgentId}@${location} is warming/unavailable.`,
       };
     }
 
@@ -413,7 +420,7 @@ export class ThreadSessionControlService {
         profile,
         target,
         agentChanged,
-        { agentId: nextAgentId, location: before.location.value }
+        { agentId: nextAgentId, location }
       );
       if (models.length === 0) {
         return {
@@ -422,7 +429,7 @@ export class ThreadSessionControlService {
         };
       }
       if (!this.deps.modelCatalog.model(
-        { agentId: nextAgentId, location: before.location.value },
+        { agentId: nextAgentId, location },
         requestedModel
       )) {
         return {
@@ -437,13 +444,13 @@ export class ThreadSessionControlService {
       return { ok: false, error: "`effort` must be a non-empty string or `auto`." };
     }
     const catalogModel = this.deps.modelCatalog.model(
-      { agentId: nextAgentId, location: before.location.value },
+      { agentId: nextAgentId, location },
       requestedTargetModel
     );
     if (!catalogModel) {
       return {
         ok: false,
-        error: `Model "${requestedTargetModel}" is unavailable in the cached catalog for ${nextAgentId}@${before.location.value}.`,
+        error: `Model "${requestedTargetModel}" is unavailable in the cached catalog for ${nextAgentId}@${location}.`,
       };
     }
     const nextModel = catalogModel.id;
@@ -626,7 +633,7 @@ export class ThreadSessionControlService {
       runtime = await this.deps.router.getOrStartRuntime(current);
       if (modelChanged) {
         const selection = this.deps.modelCatalog.resolve(
-          { agentId: nextAgentId, location: before.location.value },
+          { agentId: nextAgentId, location },
           { model: nextModel, effort: desiredEffort }
         );
         await runtime.setModel(selection.raw.model);
@@ -642,7 +649,7 @@ export class ThreadSessionControlService {
         return { ok: false, error: `Catalog is missing the config id for ${nextAgentId}/${nextModel}.` };
       }
       const rawEffort = this.deps.modelCatalog.resolve(
-        { agentId: nextAgentId, location: before.location.value },
+        { agentId: nextAgentId, location },
         { model: nextModel, effort: desiredEffort }
       ).raw.effort;
       const liveValues = runtime.getConfigSelectValues(configId);

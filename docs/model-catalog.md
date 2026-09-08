@@ -8,7 +8,8 @@ only. A read path never spawns an ACP process or contacts a provider.
 
 ## Ownership boundary
 
-Each `AgentAdapter` owns a `catalog` source. It fetches provider/CLI data,
+Each `AgentAdapter` owns a `catalog` source. Its synchronous `scope()` declares
+the non-secret semantic scope before provider work, and `fetch()` fetches provider/CLI data,
 normalizes models and model-specific effort capabilities, declares how a model
 change applies (`live`, `reload`, or `freshSession`), and supplies exhaustive
 normalized-to-raw bindings. Core knows no provider naming convention.
@@ -36,7 +37,8 @@ Production sources are explicit for every registered profile:
 - Parked/optional Ollama Cloud uses its curated Codex manifest and a separate
   provider scope.
 
-Remote bridges expose the same adapter-owned `fetchModelCatalog` RPC. The core
+Remote bridges expose adapter-owned `describeModelCatalog` (scope-only) and
+`fetchModelCatalog` RPCs. The core
 service applies identical generic validation and persistence to local and remote
 candidates; adapter-specific validation runs on the host before an RPC result is
 returned.
@@ -52,15 +54,18 @@ returned.
 - `model_catalog_refresh_status`: the last attempt, including quarantined and
   failed candidates.
 
-Publication is one SQLite transaction: insert the immutable generation, switch
+Publication is one SQLite transaction: insert a new immutable generation, switch
 the active pointer, and write the binding observation. The in-memory frozen
-snapshot changes only after that transaction commits. Empty, malformed,
+snapshot changes only after that transaction commits. Generations are strictly
+monotonic even when content returns from A to B and back to A. Empty, malformed,
 incompatible, ambiguous, conflicting, or suspiciously collapsed candidates do
 not overwrite last-known-good. A coverage collapse requires the same candidate
 on two consecutive refresh attempts. Equivalent-scope disagreement quarantines
 the disagreeing binding instead of contaminating its peer.
 
-Offline remote hosts retain their snapshot and report it as `stale`. A binding
+Offline remote hosts retain their snapshot and report it as `stale`. Remote-only
+agent ids remain selectable and use a catalog-backed controller descriptor while
+the actual process is spawned by the bridge. A binding
 with no valid generation reports `warming`; selection fails closed. Runtime ACP
 configuration is execution evidence only: if a live config option contradicts
 the catalog's raw effort binding, Seam reports runtime/catalog drift and refuses
@@ -71,8 +76,14 @@ to claim success.
 SQLite snapshots are loaded synchronously. After Discord readiness,
 `ModelCatalogService.start()` queues a non-blocking startup refresh and arms the
 UTC cron (`17 */6 * * *`). Refreshes are bounded-concurrency and single-flight
-per observed semantic scope. A remote bridge ready event refreshes every
+per adapter-declared semantic scope, including the first cold fetch. A remote bridge ready event refreshes every
 installed adapter on that host.
+
+Every newly published generation notifies model metadata and model-value
+enrichment. If either enrichment is already fetching, it queues one follow-up
+pass so publication cannot leave a cold or stale join until the independent
+12-hour cron. Enrichment has no fallback ACP probe and never determines
+operational availability.
 
 Operators can force a refresh with:
 

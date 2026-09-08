@@ -84,6 +84,8 @@ export interface AdapterCatalogCandidate {
 }
 
 export interface AdapterCatalogSource {
+  /** Cache-independent semantic scope used to single-flight even a cold fetch. */
+  scope(): CatalogScope;
   /** Fetch/parse/normalize boundary. This is called only by refresh orchestration. */
   fetch(): Promise<AdapterCatalogCandidate>;
   /** Optional provider-specific validation after generic validation. */
@@ -160,8 +162,34 @@ export interface ManifestCatalogModel {
   effort?: {
     mechanism: CatalogEffortMechanism;
     configId?: string;
-    choices: ReadonlyArray<string>;
+    choices: ReadonlyArray<string | CatalogEffortChoice>;
     selectionDefault?: string;
+  };
+}
+
+export function manifestCatalogScope(opts: {
+  provider: string;
+  backend?: string;
+  credentialProfile?: string;
+  policy?: string;
+  project?: string;
+  region?: string;
+}): CatalogScope {
+  return {
+    fingerprint: catalogScopeFingerprint({
+      provider: opts.provider,
+      backend: opts.backend,
+      credentialProfile: opts.credentialProfile,
+      policy: opts.policy,
+      project: opts.project,
+      region: opts.region,
+    }),
+    provider: opts.provider,
+    ...(opts.backend ? { backend: opts.backend } : {}),
+    ...(opts.credentialProfile ? { credentialProfile: opts.credentialProfile } : {}),
+    ...(opts.policy ? { policy: opts.policy } : {}),
+    ...(opts.project ? { project: opts.project } : {}),
+    ...(opts.region ? { region: opts.region } : {}),
   };
 }
 
@@ -178,25 +206,36 @@ export function manifestCatalogSource(opts: {
   effort?: {
     mechanism: CatalogEffortMechanism;
     configId?: string;
-    choices: ReadonlyArray<string>;
+    choices: ReadonlyArray<string | CatalogEffortChoice>;
     selectionDefault?: string;
   };
   adapterVersion: number;
   applicationMode?: CatalogApplicationMode;
   source?: string;
 }): AdapterCatalogSource {
+  const scope = manifestCatalogScope(opts);
   return {
+    scope: () => scope,
     async fetch() {
       const rawModels = [...opts.models()];
       const normalized = rawModels.map((raw): CatalogModel => {
         const declared = raw.effort ?? opts.effort;
         const selectionDefault = declared?.selectionDefault ?? "default";
-        const choices = declared?.choices.length ? [...declared.choices] : ["default"];
-        if (!choices.includes(selectionDefault)) choices.unshift(selectionDefault);
+        const choices: CatalogEffortChoice[] = declared?.choices.length
+          ? declared.choices.map((choice) => typeof choice === "string"
+              ? { id: choice, ...(choice === "default" ? {} : { raw: choice }) }
+              : { ...choice })
+          : [{ id: "default" }];
+        if (!choices.some((choice) => choice.id === selectionDefault)) {
+          choices.unshift({
+            id: selectionDefault,
+            ...(selectionDefault === "default" ? {} : { raw: selectionDefault }),
+          });
+        }
         const effort: CatalogEffort = {
           mechanism: declared?.mechanism ?? "none",
           ...(declared?.configId ? { configId: declared.configId } : {}),
-          choices: choices.map((id) => ({ id, ...(id === "default" ? {} : { raw: id }) })),
+          choices,
           selectionDefault,
         };
         return {
@@ -226,9 +265,9 @@ export function manifestCatalogSource(opts: {
           applicationMode: opts.applicationMode ?? "freshSession",
           bindings: choices.map((choice) => ({
             model: raw.modelId,
-            effort: choice,
-            rawModel: raw.modelId,
-            ...(choice === "default" ? {} : { rawEffort: choice }),
+            effort: choice.id,
+            rawModel: raw.runtimeId ?? raw.modelId,
+            ...(choice.raw ? { rawEffort: choice.raw } : {}),
           })),
         };
       });
@@ -240,22 +279,7 @@ export function manifestCatalogSource(opts: {
       }
       return {
         schemaVersion: MODEL_CATALOG_SCHEMA_VERSION,
-        scope: {
-          fingerprint: catalogScopeFingerprint({
-            provider: opts.provider,
-            backend: opts.backend,
-            credentialProfile: opts.credentialProfile,
-            policy: opts.policy,
-            project: opts.project,
-            region: opts.region,
-          }),
-          provider: opts.provider,
-          ...(opts.backend ? { backend: opts.backend } : {}),
-          ...(opts.credentialProfile ? { credentialProfile: opts.credentialProfile } : {}),
-          ...(opts.policy ? { policy: opts.policy } : {}),
-          ...(opts.project ? { project: opts.project } : {}),
-          ...(opts.region ? { region: opts.region } : {}),
-        },
+        scope,
         models: normalized,
         source: opts.source ?? "validated-manifest",
         adapterVersion: opts.adapterVersion,

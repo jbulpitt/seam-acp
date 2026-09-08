@@ -16,7 +16,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import { asLocalAdapter, type AgentIdentity, type AgentProfile } from "../agent-profile.js";
 import { AGENT_ADAPTER_VERSION } from "../agent-profile.js";
-import { manifestCatalogSource, readCliVersion } from "../model-catalog.js";
+import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 
 interface SeamAcpSessionIdRow {
@@ -225,6 +225,10 @@ export function makeCopilotProfile(opts: {
     displayName: opts.displayName ?? "GitHub Copilot",
     defaultModel: opts.defaultModel,
     catalog: {
+      scope: () => manifestCatalogScope({
+        provider: "github-copilot",
+        credentialProfile: configDir ?? "default",
+      }),
       async fetch() {
         const probe = opts.catalogProbe
           ? await opts.catalogProbe()

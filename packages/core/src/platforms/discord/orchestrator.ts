@@ -706,6 +706,31 @@ export function catalogEffortChoices(supported: ReadonlyArray<string>): Array<{
   return [...known, ...fallback];
 }
 
+export function presetModelSelectOptions(
+  models: ReadonlyArray<{ modelId: string; name: string }>,
+  selected: string | null
+): Array<{ label: string; value: string; description?: string; default?: boolean }> {
+  const limit = models.length > 24 ? 23 : 24;
+  const visible = models.slice(0, limit);
+  if (selected && !visible.some((model) => model.modelId === selected)) {
+    const selectedModel = models.find((model) => model.modelId === selected);
+    if (selectedModel) visible.splice(Math.max(0, visible.length - 1), 1, selectedModel);
+  }
+  return [
+    { label: "Default", value: "__default__", default: selected === null },
+    ...visible.map((model) => ({
+      label: model.name.slice(0, 100),
+      value: model.modelId,
+      default: model.modelId === selected,
+    })),
+    ...(models.length > 24 ? [{
+      label: "More… (full picker)",
+      value: "__more__",
+      description: `Browse all ${models.length} cached models`,
+    }] : []),
+  ];
+}
+
 export function modelSelectionConfirmationPanel(
   current: string,
   picked: string,
@@ -1003,14 +1028,13 @@ export class Orchestrator {
     });
 
     // #58 P2/P3: the mutation engine reuses the router's precedence resolver
-    // (describeConfig) and profiles, and hot-reloads the LIVE preset maps
+    // (describeConfig) and the operational catalog, and hot-reloads the LIVE preset maps
     // (config.channelPresets / config.threadPresets — the same references
     // SessionRouter holds) after a validated Tier-C write, so a channel-preset
     // change takes effect on the next turn with no redeploy (P0).
     this.configMutation = new ConfigMutationService({
       store: this.store,
       describeConfig: (record) => this.router.describeConfig(record),
-      profiles: new Map(this.router.listProfiles().map((p) => [p.id, p])),
       modelCatalog: this.modelCatalog,
       ollamaCloudEnabled: this.config.OLLAMA_CLOUD_ENABLED,
       presetsFile: this.config.CHANNEL_PRESETS_FILE,
@@ -1113,6 +1137,21 @@ export class Orchestrator {
     return this.modelCatalog.models(binding).find((model) => model.default)?.id ?? null;
   }
 
+  /** Connected inventory plus durable observations for offline remote-only agents. */
+  private catalogAgentsByHost(): Map<string, Set<string>> {
+    const out = this.bridgeHub?.installedAgentsByHost() ?? new Map<string, Set<string>>();
+    const knownBindings = typeof this.modelCatalog.knownBindings === "function"
+      ? this.modelCatalog.knownBindings()
+      : [];
+    for (const { agentId, location } of knownBindings) {
+      if (location === LOCAL_LOCATION) continue;
+      const ids = out.get(location) ?? new Set<string>();
+      ids.add(agentId);
+      out.set(location, ids);
+    }
+    return out;
+  }
+
   private wireSlashAutocomplete(): void {
     this.autocomplete.register("catalog", "refresh", "agent", "canonical", (ctx) =>
       labeledAutocompleteChoices(
@@ -1121,7 +1160,7 @@ export class Orchestrator {
           ...agentLocationPickerChoices(this.router.listProfiles(), {
             bridges: this.config.bridgePresets.values(),
             connected: this.bridgeHub?.connectedIds(),
-            agentsByHost: this.bridgeHub?.installedAgentsByHost(),
+            agentsByHost: this.catalogAgentsByHost(),
           }).map((choice) => ({ name: choice.label, value: choice.value })),
         ],
         ctx.focusedValue
@@ -1132,7 +1171,7 @@ export class Orchestrator {
         const choices = agentLocationPickerChoices(this.router.listProfiles(), {
           bridges: this.config.bridgePresets.values(),
           connected: this.bridgeHub?.connectedIds(),
-          agentsByHost: this.bridgeHub?.installedAgentsByHost(),
+          agentsByHost: this.catalogAgentsByHost(),
         });
         return labeledAutocompleteChoices(
           choices.map((c) => ({ name: `${c.label} (${c.value})`, value: c.value })),
@@ -2931,7 +2970,7 @@ export class Orchestrator {
     const described = this.router.describeConfig(record);
     const effectiveCwd = described.cwd.value;
     const repoDisplay = this.repoDisplay(effectiveCwd);
-    const turnProfile = this.router.getProfile(described.agent.value);
+    const turnProfile = this.router.getProfile(described.agent.value, described.location.value);
     const brand = resolveAgentBrand(described.agent.value, turnProfile?.brand);
     const brandAsset = loadBrandAsset(brand);
     const cardStyle = statusCardStyleForRender(described);
@@ -3644,7 +3683,7 @@ export class Orchestrator {
           : {}),
       });
       let promptAttachments = msg.attachments;
-      const activeProfile = this.router.getProfile(described.agent.value);
+      const activeProfile = this.router.getProfile(described.agent.value, described.location.value);
       if (
         activeProfile?.restrictDiscordAccess &&
         msg.attachments &&
@@ -4836,7 +4875,8 @@ export class Orchestrator {
         this.config.REPOS_ROOT;
       const location = opts.location
         ?? (target && isSessionRecord(target)
-          ? this.router.describeConfig(target).location.value
+          ? this.router.describeConfig(target).location?.value
+            ?? resolveThreadLocation(this.config, target.channelRef)
           : LOCAL_LOCATION);
       const binding = { agentId: profile.id, location };
       const requestedModel = opts.model
@@ -4990,7 +5030,12 @@ export class Orchestrator {
     const record = isSessionRecord(target)
       ? target
       : this.store.get(makeSessionId(target.platform, target.id));
-    return record ? this.router.getProfile(record.agentId) : undefined;
+    if (!record) return undefined;
+    const described = this.router.describeConfig(record);
+    return this.router.getProfile(
+      described.agent?.value ?? record.agentId,
+      described.location?.value ?? resolveThreadLocation(this.config, record.channelRef)
+    );
   }
 
   /** Build a premium-compaction `runAgent`: each call spawns a FRESH throwaway
@@ -10212,7 +10257,7 @@ export class Orchestrator {
     | { ok: false; agentId: string; error: string } {
     const described = this.router.describeConfig(record);
     const agentId = described.agent.value;
-    const profile = this.router.getProfile(agentId);
+    const profile = this.router.getProfile(agentId, described.location.value);
     if (!profile) {
       return {
         ok: false,
@@ -13492,7 +13537,7 @@ export class Orchestrator {
       const choices = agentLocationPickerChoices(profiles, {
         bridges: this.config.bridgePresets.values(),
         connected: this.bridgeHub?.connectedIds(),
-        agentsByHost: this.bridgeHub?.installedAgentsByHost(),
+        agentsByHost: this.catalogAgentsByHost(),
       });
       // Show interactive picker — every agentId@location, host-emoji prefixed (D10).
       if (!this.adapter.sendChoicePicker || choices.length === 0) {
@@ -13562,7 +13607,6 @@ export class Orchestrator {
     interaction?: ChatInputCommandInteraction
   ): Promise<{ ok: true; message: string } | { ok: false; error: string }> {
     const parsed = parseAgentAtLocation(id);
-    const profile = this.router.getProfile(parsed.agentId);
     const respond = async (msg: string): Promise<void> => {
       if (interaction) {
         if (!interaction.replied && !interaction.deferred) {
@@ -13578,21 +13622,23 @@ export class Orchestrator {
       await respond(error.startsWith("Could not") ? error : `Could not switch agent: ${error}`);
       return { ok: false, error };
     };
-    if (!profile) {
-      return fail(
-        this.refuseUnregisteredAgent(parsed.agentId, `Unknown agent \`${parsed.agentId}\`.`)
-      );
-    }
-    const parkedSelect = this.parkedSelectRefusal(parsed.agentId);
-    if (parkedSelect) return fail(parkedSelect);
-
-
     // Re-read after picker latency (or any concurrent command) so the write is
     // constructed from the live row, not the pre-picker snapshot.
     record = this.store.get(record.id) ?? record;
     const describedBefore = this.router.describeConfig(record);
     const currentLocation = resolveThreadLocation(this.config, channel.id);
     const nextLocation = parsed.explicit ? parsed.location : currentLocation;
+    const profile = this.router.getProfile(parsed.agentId, nextLocation);
+    if (!profile) {
+      return fail(
+        this.refuseUnregisteredAgent(parsed.agentId, `Unknown agent \`${parsed.agentId}\` at \`${nextLocation}\`.`)
+      );
+    }
+    const parkedSelect = nextLocation === LOCAL_LOCATION
+      ? this.parkedSelectRefusal(parsed.agentId)
+      : null;
+    if (parkedSelect) return fail(parkedSelect);
+
     const sameAgent = describedBefore.agent.value === parsed.agentId;
     const sameLocation = currentLocation === nextLocation;
     if (sameAgent && sameLocation) {
@@ -13950,21 +13996,16 @@ export class Orchestrator {
       model.effort.choices.every((choice) => choice.id === "default");
   }
 
-  private capsForAgent = (agentId: string): DraftAgentCapabilities | undefined => {
-    const profile = this.router.getProfile(agentId);
-    if (!profile) return undefined;
-    const models = this.modelCatalog.models({ agentId, location: "local" });
+  private capsForAgent = (agentId: string, location = LOCAL_LOCATION): DraftAgentCapabilities | undefined => {
+    const models = this.modelCatalog.models({ agentId, location });
+    if (!models.length) return undefined;
     return {
-      ...(models.length
-        ? {
-            models: models.map((model) => ({
-              modelId: model.id,
-              effortMechanism: model.effort.mechanism,
-              effortLevels: model.effort.choices.map((choice) => choice.id),
-              effortDefault: model.effort.selectionDefault,
-            })),
-          }
-        : {}),
+      models: models.map((model) => ({
+        modelId: model.id,
+        effortMechanism: model.effort.mechanism,
+        effortLevels: model.effort.choices.map((choice) => choice.id),
+        effortDefault: model.effort.selectionDefault,
+      })),
     };
   };
 
@@ -14495,7 +14536,7 @@ export class Orchestrator {
       const choices = agentLocationPickerChoices(this.router.listProfiles(), {
         bridges: this.config.bridgePresets.values(),
         connected: this.bridgeHub?.connectedIds(),
-        agentsByHost: this.bridgeHub?.installedAgentsByHost(),
+        agentsByHost: this.catalogAgentsByHost(),
       });
       const current = channelScope
         ? draft.overlay.channelAgent === undefined
@@ -15544,7 +15585,7 @@ export class Orchestrator {
     });
     await card.start({ agentId, model: destinationModel });
     try {
-      const profile = this.router.getProfile(agentId);
+      const profile = this.router.getProfile(agentId, described.location.value);
       if (!profile) {
         throw new ReconstructionUnavailableError(`Agent profile "${agentId}" not found.`);
       }
@@ -17516,12 +17557,16 @@ export class Orchestrator {
     const before = this.store.get(record.id) ?? record;
     const describedBefore = this.router.describeConfig(before);
     const nextAgentId = parsedAgent?.agentId ?? describedBefore.agent.value;
-    const parkedSelect = this.parkedSelectRefusal(nextAgentId);
+    const currentLocation = resolveThreadLocation(this.config, channel.id);
+    const nextLocation = parsedAgent?.explicit ? parsedAgent.location : currentLocation;
+    const parkedSelect = nextLocation === LOCAL_LOCATION
+      ? this.parkedSelectRefusal(nextAgentId)
+      : null;
     if (parkedSelect) {
       await i.editReply(parkedSelect);
       return;
     }
-    const profile = this.router.getProfile(nextAgentId);
+    const profile = this.router.getProfile(nextAgentId, nextLocation);
     if (!profile) {
       await i.editReply(
         this.refuseUnregisteredAgent(nextAgentId, `Unknown agent \`${nextAgentId}\`.`)
@@ -17567,8 +17612,6 @@ export class Orchestrator {
       return;
     }
 
-    const currentLocation = resolveThreadLocation(this.config, channel.id);
-    const nextLocation = parsedAgent?.explicit ? parsedAgent.location : currentLocation;
     const candidateModel = requestedModel
       ?? (nextAgentId !== describedBefore.agent.value
         ? this.modelCatalog.model({ agentId: nextAgentId, location: nextLocation }, "default")?.id ?? "default"
@@ -17643,7 +17686,7 @@ export class Orchestrator {
       const liveDescription = this.router.describeConfig(live);
       const appliedAgentId = parsedAgent?.agentId ?? liveDescription.agent.value;
       const storedAgentId = parsedAgent?.agentId ?? live.agentId;
-      const appliedProfile = this.router.getProfile(appliedAgentId);
+      const appliedProfile = this.router.getProfile(appliedAgentId, nextLocation);
       if (!appliedProfile) {
         await i.editReply(
           this.refuseUnregisteredAgent(
@@ -20629,14 +20672,7 @@ export class Orchestrator {
         .setCustomId("preset:model")
         .setPlaceholder("🧠 Model");
       if (models.length > 0) {
-        modelSelect.addOptions(
-          { label: "Default", value: "__default__", default: state.model === null },
-          ...models.map((m) => ({
-            label: m.name.slice(0, 100),
-            value: m.modelId,
-            default: m.modelId === state.model,
-          }))
-        );
+        modelSelect.addOptions(presetModelSelectOptions(models, state.model));
       } else {
         modelSelect.addOptions({
           label: state.agentId
@@ -20776,6 +20812,35 @@ export class Orchestrator {
           await c.editReply(render());
         } else if (c.isStringSelectMenu() && c.customId === "preset:model") {
           const v = c.values[0]!;
+          if (v === "__more__") {
+            await c.deferUpdate();
+            const channel = this.channelRefFromInteraction(c);
+            if (!channel || !this.adapter.sendChoicePicker) return;
+            const picked = await this.adapter.sendChoicePicker(channel, {
+              panel: {
+                color: PRESET_COLOR,
+                title: "🧠 Choose a preset model",
+                fields: [{ name: "Current", value: state.model ? `\`${state.model}\`` : "Default" }],
+              },
+              choices: models.map((model) => ({
+                value: model.modelId,
+                label: model.name,
+                description: model.modelId,
+              })),
+              authorizedUserIds: new Set([i.user.id]),
+            });
+            if (picked && picked.value !== state.model) {
+              state.model = picked.value;
+              state.effort = state.agentId
+                ? this.modelCatalog.model(
+                    { agentId: state.agentId, location: LOCAL_LOCATION },
+                    picked.value
+                  )?.effort.selectionDefault ?? null
+                : null;
+            }
+            await i.editReply(render());
+            return;
+          }
           const nextModel = v === "__default__" ? null : v;
           if (nextModel !== state.model) {
             state.model = nextModel;

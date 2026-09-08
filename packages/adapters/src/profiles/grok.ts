@@ -4,7 +4,7 @@ import { readdir, stat, readFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
-import { manifestCatalogSource, readCliVersion } from "../model-catalog.js";
+import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import type { ContextUsage, ISessionManager, SessionSummary } from "../session-manager.js";
 
 /**
@@ -151,6 +151,7 @@ export function makeGrokProfile(opts: {
     displayName: opts.displayName ?? "Grok Build",
     defaultModel: opts.defaultModel,
     catalog: {
+      scope: () => manifestCatalogScope({ provider: "xai" }),
       async fetch() {
         const discovered = opts.discoverModels ? await opts.discoverModels() : undefined;
         if (opts.discoverModels && !discovered?.length) {

@@ -24,6 +24,7 @@ describe("model catalog architecture", () => {
     expect(source("packages/core/src/platforms/discord/orchestrator.ts")).not.toContain("this.config.DEFAULT_MODEL");
     expect(source("packages/adapters/src/command-bus.ts")).not.toContain("listPickerModels");
     expect(source("packages/adapters/src/command-bus.ts")).toContain("fetchModelCatalog");
+    expect(source("packages/core/src/core/model-value/sources.ts")).not.toContain("probeCopilotCatalog");
   });
 
   it("keeps provider naming rules out of core model selection", () => {
@@ -40,6 +41,7 @@ describe("model catalog architecture", () => {
   it("requires every adapter to expose the single catalog boundary", () => {
     const contract = source("packages/adapters/src/agent-profile.ts");
     expect(contract).toContain("readonly catalog: AdapterCatalogSource");
+    expect(source("packages/adapters/src/model-catalog.ts")).toContain("scope(): CatalogScope");
     expect(contract).not.toContain("readonly staticModels");
     for (const profile of ["copilot", "claude", "codex", "agy", "grok"]) {
       expect(source(`packages/adapters/src/profiles/${profile}.ts`)).toMatch(/catalog:\s*(?:\{|manifestCatalogSource)/);

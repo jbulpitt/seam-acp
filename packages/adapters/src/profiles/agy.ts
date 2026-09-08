@@ -55,7 +55,7 @@ import {
   type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
 import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
-import { manifestCatalogSource, readCliVersion } from "../model-catalog.js";
+import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import {
   discoverAgyLs,
   subscribeToAgyStream,
@@ -331,6 +331,7 @@ export function makeAgyProfile(opts: {
     displayName: "Antigravity",
     defaultModel,
     catalog: {
+      scope: () => manifestCatalogScope({ provider: "google-antigravity" }),
       async fetch() {
         let models: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
         if (opts.staticModels && opts.staticModels.length > 0) {

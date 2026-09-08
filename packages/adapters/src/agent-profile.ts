@@ -3,13 +3,13 @@ import type { Readable as NodeReadable, Writable as NodeWritable } from "node:st
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { ContextUsage, ISessionManager, SessionSummary } from "./session-manager.js";
 import type { FastModeDescriptor } from "./fast-mode.js";
-import type { AdapterCatalogSource } from "./model-catalog.js";
+import type { AdapterCatalogCandidate, AdapterCatalogSource } from "./model-catalog.js";
 
 /**
  * Adapter contract version advertised by in-process local agents via
  * `describe()`. Bumped when the §4 surface itself changes (not per agent).
  */
-export const AGENT_ADAPTER_VERSION = 3;
+export const AGENT_ADAPTER_VERSION = 4;
 
 /** How an agent exposes reasoning effort. See `AgentAdapter.effort`. */
 export type EffortMechanism =
@@ -367,6 +367,37 @@ export function asLocalAdapter(core: AgentProfileCore): AgentAdapter {
     },
   };
   return adapter;
+}
+
+/**
+ * Controller-side runtime descriptor for an adapter that exists only on a
+ * remote bridge. The bridge owns process creation and catalog collection; this
+ * object supplies the generic ACP client with the cached model/effort contract
+ * without pretending the controller can spawn the agent locally.
+ */
+export function asRemoteCatalogAdapter(
+  id: string,
+  candidate: AdapterCatalogCandidate
+): AgentAdapter {
+  const defaultModel = candidate.models.find((model) => model.default) ?? candidate.models[0];
+  if (!defaultModel) throw new Error(`remote catalog for ${id} has no models`);
+  return asLocalAdapter({
+    id,
+    displayName: id,
+    defaultModel: defaultModel.runtimeId,
+    catalog: {
+      scope: () => candidate.scope,
+      fetch: async () => candidate,
+    },
+    effort: {
+      mechanism: defaultModel.effort.mechanism,
+      ...(defaultModel.effort.configId ? { configId: defaultModel.effort.configId } : {}),
+      levels: defaultModel.effort.choices.map((choice) => choice.id),
+    },
+    spawn(): never {
+      throw new Error(`remote-only agent ${id} cannot be spawned on the controller`);
+    },
+  });
 }
 
 /** Identity of the account a profile is authenticated as. */

@@ -1,5 +1,4 @@
-import { probeCopilotCatalog } from "@seam/adapters";
-import type { CopilotModelMetadata, CopilotPricing } from "./types.js";
+import type { CopilotPricing } from "./types.js";
 export {
   AA_MODELS_URL,
   fetchAaModels,
@@ -104,24 +103,4 @@ export async function fetchCopilotPricing(fetchImpl: FetchLike = fetch): Promise
   });
   if (!response.ok) throw new Error(`Copilot pricing request failed: HTTP ${response.status}`);
   return parseCopilotPricingMarkdown(await response.text());
-}
-
-export interface CopilotProbeOptions {
-  cliPath?: string;
-  cwd?: string;
-  timeoutMs?: number;
-}
-
-/** Probe model-specific ACP configuration. The same session is reused because
- * setSessionConfigOption returns the newly applicable effort selector. */
-export async function fetchCopilotModelMetadata(
-  options: CopilotProbeOptions = {}
-): Promise<CopilotModelMetadata[]> {
-  const result = await probeCopilotCatalog(options);
-  return result.models.map((model) => ({
-    modelId: model.modelId,
-    displayName: model.displayName,
-    validEffortTiers: model.effortChoices,
-    priceCategory: model.priceCategory,
-  }));
 }

@@ -14,6 +14,7 @@ export const ADAPTER_RPC_METHODS = [
   "prepare",
   "install",
   "spawn",
+  "describeModelCatalog",
   "fetchModelCatalog",
   "listWorkspaces",
   "listSessions",

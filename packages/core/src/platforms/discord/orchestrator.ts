@@ -44,7 +44,8 @@ import type {
   SessionRecord,
 } from "../chat-adapter.js";
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
-import { cleanTextForPreview, pickerModelsForProfile, scanWorkspaces, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
+import { cleanTextForPreview, scanWorkspaces, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
+import type { ModelCatalogService, CatalogBinding } from "../../core/model-catalog/service.js";
 import { readRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
 import { MessageReader } from "../../core/message-reader.js";
 import {
@@ -69,7 +70,7 @@ import {
   resolveDiscordCompactionProfile,
 } from "../../core/compaction/discord-executor.js";
 import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, coercePinnedFacts, PINNED_FACTS_JSON_SCHEMA, assembleNewSession, type PinnedFacts } from "../../core/compaction/prompts.js";
-import type { AdapterModel, AgentProfile } from "@seam/adapters";
+import type { AgentProfile } from "@seam/adapters";
 import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import type { WakeManager } from "../../core/wake/manager.js";
@@ -689,6 +690,22 @@ const EFFORT_CHOICES = [
   { value: "ultra", label: "Ultra", description: "Max reasoning + auto task delegation (codex)" },
 ];
 
+/** Generic labels/order only; availability always comes from the selected model. */
+export function catalogEffortChoices(supported: ReadonlyArray<string>): Array<{
+  value: string;
+  label: string;
+  description?: string;
+}> {
+  const declared = new Set(supported);
+  const known = EFFORT_CHOICES.filter((choice) => declared.delete(choice.value));
+  const fallback = [...declared].map((value) => ({
+    value,
+    label: value === "default" ? "Default" : value,
+    description: value === "default" ? "Use the catalog's provider default" : "Adapter-defined effort",
+  }));
+  return [...known, ...fallback];
+}
+
 export function modelSelectionConfirmationPanel(
   current: string,
   picked: string,
@@ -760,6 +777,7 @@ export class Orchestrator {
   private readonly store: SessionStore;
   private readonly renderer: Renderer;
   private readonly quotaPoller?: AgentQuotaPoller;
+  private readonly modelCatalog: ModelCatalogService;
   private readonly getModelMetadata?: (idOrSlug: string) => { context_window: number | null } | null;
   /** Installed by index.ts only while the upstream-status subsystem is active. */
   private serviceStatusRefresh?: () => Promise<RefreshResult>;
@@ -920,6 +938,7 @@ export class Orchestrator {
     store: SessionStore;
     renderer: Renderer;
     quotaPoller?: AgentQuotaPoller;
+    modelCatalog: ModelCatalogService;
     restartProcess?: () => Promise<void>;
     getModelMetadata?: (idOrSlug: string) => { context_window: number | null } | null;
   }) {
@@ -930,6 +949,7 @@ export class Orchestrator {
     this.store = opts.store;
     this.renderer = opts.renderer;
     this.quotaPoller = opts.quotaPoller;
+    this.modelCatalog = opts.modelCatalog;
     this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
     this.getModelMetadata = opts.getModelMetadata;
     this.threadNamerConfig = new ThreadNamerConfigStore(
@@ -991,7 +1011,7 @@ export class Orchestrator {
       store: this.store,
       describeConfig: (record) => this.router.describeConfig(record),
       profiles: new Map(this.router.listProfiles().map((p) => [p.id, p])),
-      defaultModel: this.config.DEFAULT_MODEL,
+      modelCatalog: this.modelCatalog,
       ollamaCloudEnabled: this.config.OLLAMA_CLOUD_ENABLED,
       presetsFile: this.config.CHANNEL_PRESETS_FILE,
       tierCEnabled: this.config.SEAM_CONFIG_MUTATION_TIER_C_ENABLED,
@@ -1058,7 +1078,55 @@ export class Orchestrator {
    * next to the preset / TTS voice responders; dispatch stays in
    * `handleAutocompleteInteraction` (never a one-off branch there).
    */
+  private catalogBinding(ctx: AutocompleteContext, selectedAgent?: string): CatalogBinding | null {
+    const raw = selectedAgent?.trim() || ctx.agentId;
+    if (!raw) return null;
+    const parsed = parseAgentAtLocation(raw);
+    const location = parsed.explicit
+      ? parsed.location
+      : resolveThreadLocation(this.config, ctx.channelId);
+    return { agentId: parsed.agentId, location };
+  }
+
+  private cachedDefaultModel(agentId: string, location: string): string {
+    return this.modelCatalog?.model?.({ agentId, location }, "default")?.id ?? "default";
+  }
+
+  private choiceDefaultModel(record?: SessionRecord | null): string {
+    if (record) {
+      const described = this.router.describeConfig(record);
+      return described.model?.value ?? this.store.readConfig(record).model ?? this.cachedDefaultModel(
+        described.agent?.value ?? record.agentId,
+        described.location?.value ?? LOCAL_LOCATION
+      );
+    }
+    return this.cachedDefaultModel(this.config.DEFAULT_AGENT ?? "copilot", LOCAL_LOCATION);
+  }
+
+  private catalogModelForAutocomplete(ctx: AutocompleteContext, binding: CatalogBinding): string | null {
+    const selected = ctx.optionValues?.model?.trim();
+    if (selected) return selected;
+    if (!ctx.channelId) return null;
+    const record = this.store.get(makeSessionId(PLATFORM, ctx.channelId));
+    const current = record ? this.router.describeConfig(record).model.value : null;
+    if (current && this.modelCatalog.model(binding, current)) return current;
+    return this.modelCatalog.models(binding).find((model) => model.default)?.id ?? null;
+  }
+
   private wireSlashAutocomplete(): void {
+    this.autocomplete.register("catalog", "refresh", "agent", "canonical", (ctx) =>
+      labeledAutocompleteChoices(
+        [
+          { name: "All catalogs", value: "all" },
+          ...agentLocationPickerChoices(this.router.listProfiles(), {
+            bridges: this.config.bridgePresets.values(),
+            connected: this.bridgeHub?.connectedIds(),
+            agentsByHost: this.bridgeHub?.installedAgentsByHost(),
+          }).map((choice) => ({ name: choice.label, value: choice.value })),
+        ],
+        ctx.focusedValue
+      )
+    );
     const agentAtLocationResponder: AutocompleteResponder = (ctx) => {
       try {
         const choices = agentLocationPickerChoices(this.router.listProfiles(), {
@@ -1109,13 +1177,13 @@ export class Orchestrator {
 
     this.autocomplete.register("config", "model", "id", "canonical", async (ctx) => {
       try {
-        if (!ctx.agentId) return [];
-        const profile = this.router.getProfile(ctx.agentId);
-        const models = await pickerModelsForProfile(profile, DISCORD_AUTOCOMPLETE_MAX);
+        const binding = this.catalogBinding(ctx);
+        if (!binding) return [];
+        const models = this.modelCatalog.models(binding);
         return labeledAutocompleteChoices(
           models.map((m) => ({
-            name: m.name && m.name !== m.modelId ? `${m.name} (${m.modelId})` : m.modelId,
-            value: m.modelId,
+            name: m.displayName && m.displayName !== m.id ? `${m.displayName} (${m.id})` : m.id,
+            value: m.id,
           })),
           ctx.focusedValue
         );
@@ -1127,14 +1195,13 @@ export class Orchestrator {
     this.autocomplete.register("config", "set", "model", "canonical", async (ctx) => {
       try {
         const selectedAgent = ctx.optionValues?.agent?.trim() || ctx.agentId;
-        if (!selectedAgent) return [];
-        const profile = this.router.getProfile(parseAgentAtLocation(selectedAgent).agentId);
-        if (!profile) return [];
-        const models = await pickerModelsForProfile(profile, DISCORD_AUTOCOMPLETE_MAX);
+        const binding = this.catalogBinding(ctx, selectedAgent);
+        if (!binding) return [];
+        const models = this.modelCatalog.models(binding);
         return labeledAutocompleteChoices(
           models.map((m) => ({
-            name: m.name && m.name !== m.modelId ? `${m.name} (${m.modelId})` : m.modelId,
-            value: m.modelId,
+            name: m.displayName && m.displayName !== m.id ? `${m.displayName} (${m.id})` : m.id,
+            value: m.id,
           })),
           ctx.focusedValue
         );
@@ -1146,18 +1213,31 @@ export class Orchestrator {
     this.autocomplete.register("config", "set", "effort", "canonical", (ctx) => {
       try {
         const selectedAgent = ctx.optionValues?.agent?.trim() || ctx.agentId;
-        const profile = selectedAgent
-          ? this.router.getProfile(parseAgentAtLocation(selectedAgent).agentId)
-          : undefined;
-        const levels = profile?.effort?.levels ?? [];
+        const binding = this.catalogBinding(ctx, selectedAgent);
+        const model = binding ? this.catalogModelForAutocomplete(ctx, binding) : null;
+        const levels = binding && model ? this.modelCatalog.effortChoices(binding, model) : [];
         return labeledAutocompleteChoices(
           [
-            { name: "Default / unset", value: "default" },
-            ...EFFORT_CHOICES.filter((choice) => levels.includes(choice.value)).map((choice) => ({
+            ...(levels.includes("default") ? [{ name: "Default / unset", value: "default" }] : []),
+            ...catalogEffortChoices(levels.filter((level) => level !== "default")).map((choice) => ({
               name: choice.label,
               value: choice.value,
             })),
           ],
+          ctx.focusedValue
+        );
+      } catch {
+        return [];
+      }
+    });
+
+    this.autocomplete.register("config", "effort", "level", "canonical", (ctx) => {
+      try {
+        const binding = this.catalogBinding(ctx);
+        const model = binding ? this.catalogModelForAutocomplete(ctx, binding) : null;
+        const levels = binding && model ? this.modelCatalog.effortChoices(binding, model) : [];
+        return labeledAutocompleteChoices(
+          catalogEffortChoices(levels).map((choice) => ({ name: choice.label, value: choice.value })),
           ctx.focusedValue
         );
       } catch {
@@ -2876,19 +2956,18 @@ export class Orchestrator {
     // side-channel read.
     const cachedUsage = cfg.lastContextUsage;
     const activeModel = described.model.value;
-    // Authoritative per-model window when seam-acp knows it (staticModels
-    // contextLimit — e.g. Ollama, discovered from /api/show). Some
+    // Authoritative per-model window from the operational catalog. Some
     // agents report a generic default (~200K) in usage_update regardless of the
     // real window; use this as a FLOOR so the panel shows the true size.
-    // Look up the authoritative context window from static models.  When
+    // Look up the authoritative context window from the cached catalog. When
     // claude-agent-acp is pointed at a non-Anthropic backend (Ollama Cloud,
     // Z.ai) it reports its *internal* Claude model name, not the real model.
     // Fallback: if the activeModel doesn't match any static entry, try the
     // profile's defaultModel — that's what the backend is actually running.
-    const modelContextFloor =
-      turnProfile?.staticModels?.find((m) => m.modelId === activeModel)?.contextLimit
-        ?? turnProfile?.staticModels?.find((m) => m.modelId === turnProfile.defaultModel)?.contextLimit
-        ?? 0;
+    const modelContextFloor = this.modelCatalog.model(
+      { agentId: described.agent.value, location: described.location.value },
+      activeModel
+    )?.context.effective ?? 0;
     if (
       cachedUsage &&
       cachedUsage.model === activeModel &&
@@ -3616,8 +3695,9 @@ export class Orchestrator {
         // no-vision ACP bridge (e.g. Grok) they're staged to disk instead so its
         // own tools can read them, rather than becoming a bytes-less link.
         const selectedModel = described.model.value;
-        const visionMode = activeProfile?.staticModels?.find(
-          (entry) => entry.modelId === selectedModel
+        const visionMode = this.modelCatalog.model(
+          { agentId: described.agent.value, location: described.location.value },
+          selectedModel
         )?.visionMode;
         const visionRouting = resolveModelVisionRouting(
           activeRuntime.getPromptCapabilities()?.image,
@@ -3879,13 +3959,12 @@ export class Orchestrator {
             // Trust seam-acp's per-profile model→limit table over whatever the
             // bridge inferred from the JSONL — on proxied setups the JSONL
             // model id can be remapped/wrong.
-            const selectedModel = cfg.model ?? profile?.defaultModel;
-            const modelEntry = profile?.staticModels?.find(
-              (m) => m.modelId === selectedModel
-            ) ?? profile?.staticModels?.find(
-              (m) => m.modelId === profile.defaultModel
+            const selectedModel = described.model.value;
+            const modelEntry = this.modelCatalog.model(
+              { agentId: described.agent.value, location: described.location.value },
+              selectedModel
             );
-            const computedSize = modelEntry?.contextLimit ?? usage?.contextLimit ?? 0;
+            const computedSize = modelEntry?.context.effective ?? usage?.contextLimit ?? 0;
             // `used` may legitimately drop (post-compaction), so we bypass its
             // ceiling. But the window must never shrink: getUsage can return a
             // stale 200K default when the bridge has not yet reported the
@@ -3921,7 +4000,7 @@ export class Orchestrator {
             persistedCfg.lastContextUsage = {
               used: status.contextUsedHighWater,
               size: status.contextWindowSize,
-              model: cfg.model ?? this.config.DEFAULT_MODEL,
+              model: this.router.describeConfig(record).model.value,
               atUtc: new Date().toISOString(),
             };
             this.persistConfig(record, persistedCfg);
@@ -4333,6 +4412,9 @@ export class Orchestrator {
     }
     if (interaction.options.getSubcommandGroup(false) === "schedule") {
       return this.cmdSchedule(interaction);
+    }
+    if (slashGroup === "catalog") {
+      return this.cmdCatalogRefresh(interaction);
     }
     if (interaction.options.getSubcommandGroup(false) === "preset") {
       return this.cmdPreset(interaction);
@@ -4752,6 +4834,18 @@ export class Orchestrator {
         opts.cwd ??
         (target && isSessionRecord(target) ? this.effectiveCwd(target) : undefined) ??
         this.config.REPOS_ROOT;
+      const location = opts.location
+        ?? (target && isSessionRecord(target)
+          ? this.router.describeConfig(target).location.value
+          : LOCAL_LOCATION);
+      const binding = { agentId: profile.id, location };
+      const requestedModel = opts.model
+        ?? this.modelCatalog.model(binding, "default")?.id
+        ?? "default";
+      const selection = this.modelCatalog.resolve(binding, {
+        model: requestedModel,
+        effort: opts.effort,
+      });
       const manager = opts.sessionManager ?? profile.sessionManager;
       let rt: AgentRuntime | undefined;
       let sessionId: string | undefined;
@@ -4760,7 +4854,12 @@ export class Orchestrator {
           profile,
           logger,
           mcpServers: opts.mcpServers ?? [],
-          ...(opts.spawnFn ? { spawnFn: opts.spawnFn } : {}),
+          effortDescriptor: selection.model.effort,
+          spawnFn: opts.spawnFn ?? (() => profile.spawn(
+            selection.raw.model,
+            selection.raw.effort,
+            opts.mcpServers ?? []
+          )),
         });
         await rt.start();
         if (opts.resumeSessionId) {
@@ -4768,16 +4867,16 @@ export class Orchestrator {
           await rt.loadSession({
             sessionId: opts.resumeSessionId,
             cwd,
-            ...(opts.model ? { model: opts.model } : {}),
-            ...(opts.effort ? { effort: opts.effort } : {}),
+            model: selection.raw.model,
+            ...(selection.raw.effort ? { effort: selection.raw.effort } : {}),
             ...(opts.strictModel ? { strictModel: true } : {}),
           });
           sessionId = opts.resumeSessionId;
         } else {
           const info = await rt.newSession({
             cwd,
-            ...(opts.model ? { model: opts.model } : {}),
-            ...(opts.effort ? { effort: opts.effort } : {}),
+            model: selection.raw.model,
+            ...(selection.raw.effort ? { effort: selection.raw.effort } : {}),
             ...(opts.strictModel ? { strictModel: true } : {}),
           });
           sessionId = info.sessionId;
@@ -4972,8 +5071,15 @@ export class Orchestrator {
    *  takes the top level and cheap one below it. agy (modelBaked — effort IS the
    *  model choice) and the remote Mac (no effort mechanism) return undefined:
    *  there is no separate knob to set, so the runner leaves the agent's default. */
-  private compactionEffortFor(profile: AgentProfile, tier: "premium" | "cheap"): string | undefined {
-    const levels = profile.effort?.levels ?? [];
+  private compactionEffortFor(
+    profile: AgentProfile,
+    model: string,
+    tier: "premium" | "cheap"
+  ): string | undefined {
+    const entry = this.modelCatalog.model({ agentId: profile.id, location: "local" }, model);
+    const levels = entry?.effort.choices
+      .map((choice) => choice.id)
+      .filter((choice) => choice !== "default") ?? [];
     if (levels.length === 0) return undefined;
     if (levels.includes("xhigh")) return tier === "premium" ? "xhigh" : "high";
     return tier === "premium"
@@ -5053,7 +5159,7 @@ export class Orchestrator {
     // xhigh, Copilot high; agy/remote have no separate knob) — fidelity is the
     // whole point of this tier.
     const runAgent = this.makeCompactionRunAgent(profile, manager, {
-      effort: this.compactionEffortFor(profile, "premium"),
+      effort: this.compactionEffortFor(profile, "default", "premium"),
     });
     return runPremiumCompaction({
       richHistory,
@@ -5096,9 +5202,14 @@ export class Orchestrator {
 
     const { profile: analysisProfile, manager: analysisManager } =
       resolveDiscordCompactionProfile((id) => this.router.getProfile(id));
-    const catalog = analysisProfile.listPickerModels
-      ? await analysisProfile.listPickerModels()
-      : analysisProfile.staticModels ?? [];
+    const catalog = this.modelCatalog.models({
+      agentId: analysisProfile.id,
+      location: "local",
+    }).map((model) => ({
+      modelId: model.id,
+      name: model.displayName,
+      ...(model.context.effective ? { contextLimit: model.context.effective } : {}),
+    }));
     requireExactCatalogModel(catalog, DISCORD_COMPACTION_MODEL);
     log(`analysis executor: ${DISCORD_COMPACTION_EXECUTOR_LABEL}`);
 
@@ -5156,7 +5267,7 @@ export class Orchestrator {
     const runAgent = this.makeCompactionRunAgent(analysisProfile, analysisManager, {
       model: DISCORD_COMPACTION_MODEL,
       strictModel: true,
-      effort: this.compactionEffortFor(analysisProfile, "premium"),
+      effort: this.compactionEffortFor(analysisProfile, DISCORD_COMPACTION_MODEL, "premium"),
     });
     return runPremiumCompaction({
       richHistory,
@@ -5221,7 +5332,7 @@ export class Orchestrator {
     const runAgent = this.makeCompactionRunAgent(profile, manager, {
       model: compactionModel,
       cwd,
-      effort: this.compactionEffortFor(profile, "cheap"),
+      effort: this.compactionEffortFor(profile, compactionModel, "cheap"),
     });
 
     // Summary of the older prefix via the existing single-pass template.
@@ -5618,27 +5729,51 @@ export class Orchestrator {
     workerLocation: string;
     profile?: AgentProfile;
     cwd: string;
-  }): Pick<InjectTurnOptions, "spawnFn" | "mcpServers"> {
+    model?: string;
+    effort?: string;
+  }): Pick<InjectTurnOptions, "spawnFn" | "mcpServers" | "model" | "effort" | "location"> {
     if (opts.effectiveSession !== "isolated") return {};
     // Local isolated used to spawn with mcpServers: [] — ingest scoring then
     // had no submit_result. Reuse the authoring thread's token (do not mint).
+    const agentId = opts.profile?.id ?? opts.record.agentId;
+    const binding = { agentId, location: opts.workerLocation };
+    const requestedModel = opts.model
+      ?? this.modelCatalog.model(binding, opts.profile?.defaultModel ?? "default")?.id
+      ?? this.modelCatalog.model(binding, "default")?.id;
+    if (!requestedModel) {
+      throw new Error(`dispatch ${opts.spec.id}: catalog has no default model for ${agentId}@${opts.workerLocation}`);
+    }
+    const selection = this.modelCatalog.resolve(binding, {
+      model: requestedModel,
+      effort: opts.effort,
+    });
     if (isLocalLocation(opts.workerLocation)) {
-      return { mcpServers: this.router.reuseMcpServers(opts.record.id) };
+      return {
+        mcpServers: this.router.reuseMcpServers(opts.record.id),
+        model: selection.normalized.model,
+        effort: selection.normalized.effort,
+        location: opts.workerLocation,
+      };
     }
     if (!this.bridgeHub) {
       throw new Error(`dispatch ${opts.spec.id}: location "${opts.workerLocation}" needs a connected bridge`);
     }
-    const agentId = opts.profile?.id ?? opts.record.agentId;
     const planned = planIsolatedRemoteSpawn({
       hub: this.bridgeHub,
       sessionId: isolatedBindSessionId(opts.spec.id),
       location: opts.workerLocation,
       agentId,
       cwd: opts.cwd,
-      ...(opts.spec.model ? { model: opts.spec.model } : {}),
-      ...(opts.spec.effort ? { effort: opts.spec.effort } : {}),
+      model: selection.raw.model,
+      ...(selection.raw.effort ? { effort: selection.raw.effort } : {}),
     });
-    return { spawnFn: planned.spawnFn, mcpServers: planned.mcpServers };
+    return {
+      spawnFn: planned.spawnFn,
+      mcpServers: planned.mcpServers,
+      model: selection.normalized.model,
+      effort: selection.normalized.effort,
+      location: opts.workerLocation,
+    };
   }
 
   /** Exposed so index.ts can wire BridgeHub audit writes without growing this file. */
@@ -8043,6 +8178,8 @@ export class Orchestrator {
             workerLocation,
             profile: presetProfile,
             cwd: preset?.repoPath ?? spec.cwd ?? this.effectiveCwd(record),
+            model: preset?.model ?? spec.model,
+            effort: preset?.effort ?? spec.effort,
           })
         : {};
     const seamMcp = sessionHasSeamMcp(
@@ -8231,9 +8368,11 @@ export class Orchestrator {
         ? await (async () => {
             const cfg = this.store.readConfig(record);
             const isolated = effectiveSession === "isolated";
+            const described = this.router.describeConfig(record);
+            const describedModel = described.model?.value ?? cfg.model ?? this.choiceDefaultModel(record);
             const panelModel = isolated
-              ? (preset?.model ?? spec.model ?? cfg.model ?? this.config.DEFAULT_MODEL)
-              : (cfg.model ?? this.config.DEFAULT_MODEL);
+              ? (preset?.model ?? spec.model ?? describedModel)
+              : describedModel;
             const panelEffort = isolated
               ? (preset?.effort ?? spec.effort ?? cfg.reasoningEffort)
               : cfg.reasoningEffort;
@@ -9008,9 +9147,10 @@ export class Orchestrator {
     const statusPanel = statusPanelOn
       ? await (async () => {
           const cfg = this.store.readConfig(record);
+          const described = this.router.describeConfig(record);
           const compactProfile = this.router.getProfile(record.agentId);
           return this.startDispatchStatusPanel(target, spec, {
-            model: cfg.model ?? this.config.DEFAULT_MODEL,
+            model: described.model?.value ?? cfg.model ?? this.choiceDefaultModel(record),
             ...(cfg.reasoningEffort ? { effort: cfg.reasoningEffort } : {}),
             cwd: this.effectiveCwd(record),
             ...(compactProfile ? { profile: compactProfile } : {}),
@@ -9724,15 +9864,20 @@ export class Orchestrator {
   ): Promise<DispatchStatusPanel<MessageRef> | undefined> {
     if (!this.queueFenceCurrent(queueFence)) return undefined;
     const repoDisplay = this.repoDisplay(resolved.cwd);
-    const modelContextFloor =
-      resolved.profile?.staticModels?.find((m) => m.modelId === resolved.model)?.contextLimit
-        ?? resolved.profile?.staticModels?.find((m) => m.modelId === resolved.profile?.defaultModel)?.contextLimit
-        ?? 0;
     const destRecord =
       typeof this.store.getByChannel === "function"
         ? this.store.getByChannel(target.platform, target.id)
         : null;
     const destDescribed = destRecord ? this.router.describeConfig(destRecord) : undefined;
+    const modelContextFloor = resolved.profile
+      ? this.modelCatalog.model(
+          {
+            agentId: destDescribed?.agent.value ?? resolved.profile.id,
+            location: destDescribed?.location.value ?? "local",
+          },
+          resolved.model
+        )?.context.effective ?? 0
+      : 0;
     const destStyle: StatusCardStyle = destDescribed
       ? statusCardStyleForRender(destDescribed)
       : "full";
@@ -10900,6 +11045,42 @@ export class Orchestrator {
     }
   }
 
+  private async cmdCatalogRefresh(i: ChatInputCommandInteraction): Promise<void> {
+    const admins = this.config.SEAM_CONFIG_ADMIN_USER_IDS;
+    if (admins && admins.size > 0 && !admins.has(i.user.id)) {
+      await i.reply({ content: "🔒 `/seamadmin catalog refresh` is config-admin-only.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const requested = i.options.getString("agent", true).trim();
+    await i.reply({ content: `🔄 Refreshing model catalog \`${requested}\`…` });
+    const results = requested === "all"
+      ? await this.modelCatalog.refreshAll("manual")
+      : [await this.modelCatalog.refresh((() => {
+          const parsed = parseAgentAtLocation(requested);
+          return { agentId: parsed.agentId, location: parsed.location };
+        })(), "manual")];
+    const lines = results.map((result) => {
+      const generation = `${result.previousGeneration ?? "none"} → ${result.generation ?? "none"}`;
+      const detail = result.ok
+        ? `${result.result}; +${result.added} −${result.removed} ~${result.changed}`
+        : result.generation === null
+          ? `${result.result}; candidate not published; catalog remains warming/unavailable`
+          : `${result.result}; candidate not published; previous snapshot retained`;
+      return [
+        `**${result.binding.agentId}@${result.binding.location}** — ${detail}`,
+        `generation ${generation}; source ${result.source ?? "unavailable"}; fetched ${result.fetchedAt ?? "n/a"}`,
+        ...(result.scope ? [`scope ${result.scope}`] : []),
+        ...(result.sourceVersion || result.cliVersion
+          ? [`provider/CLI ${[result.sourceVersion, result.cliVersion].filter(Boolean).join(" / ")}`]
+          : []),
+        ...(result.error ? [`failure: ${result.error}`] : []),
+      ].join("\n");
+    });
+    await i.editReply({
+      content: `🗂️ Model catalog refresh finished.\n\n${lines.join("\n\n").slice(0, 1950)}`,
+    });
+  }
+
   // --- /seamadmin schedule … ------------------------------------------------
 
   private async cmdSchedule(i: ChatInputCommandInteraction): Promise<void> {
@@ -11210,7 +11391,10 @@ export class Orchestrator {
     const profile = this.router.getProfile(inheritedAgent);
     const sessionModel = described.model.value;
     const inheritedCwd = described.cwd.value;
-    const models = (profile?.staticModels ?? []).slice(0, 24);
+    const models = this.modelCatalog.models({
+      agentId: inheritedAgent,
+      location: described.location.value,
+    }).map((model) => ({ modelId: model.id, name: model.displayName })).slice(0, 24);
 
     const state = {
       name: existing?.name ?? "",
@@ -11763,11 +11947,11 @@ export class Orchestrator {
     });
     const id = i.options.getString("id");
     if (!id) {
-      // No id given — show an interactive picker. Eagerly start the
-      // runtime if needed so we have an availableModels list (the model
-      // catalog comes from the agent at session-start, not from us).
+      // No id given — render the cache-only catalog. Picker reads never start
+      // an agent or touch provider files/network.
       const live = this.store.get(record.id) ?? record;
-      const current = this.router.describeConfig(live).model.value;
+      const described = this.router.describeConfig(live);
+      const current = described.model.value;
       const displayCurrent = `\`${current}\``;
       if (!this.adapter.sendChoicePicker) {
         await i.reply({
@@ -11777,26 +11961,13 @@ export class Orchestrator {
         return;
       }
       await i.deferReply({ flags: MessageFlags.Ephemeral });
-      let models: ReadonlyArray<{ modelId: string; name?: string }> = [];
-      const profile = this.router.getProfile(this.router.describeConfig(live).agent.value);
-      if (profile?.staticModels && profile.staticModels.length > 0) {
-        models = profile.staticModels;
-      } else {
-        try {
-          const rt = await this.router.getOrStartRuntime(record);
-          models = rt.getSessionInfo()?.availableModels ?? [];
-        } catch (err) {
-          this.logger.warn({ err }, "could not start runtime / enumerate models");
-          await i.editReply(
-            `Current model: ${displayCurrent}\nFailed to start the agent to list models: ${(err as Error).message}`
-          );
-          return;
-        }
-      }
+      const binding = { agentId: described.agent.value, location: described.location.value };
+      const lookup = this.modelCatalog.lookup(binding);
+      const models = this.modelCatalog.models(binding);
 
       if (models.length === 0) {
         await i.editReply(
-          `Current model: ${displayCurrent}\n_(agent did not advertise any models — pass an id manually: \`/seam config model id:<name>\`.)_`
+          `Current model: ${displayCurrent}\n_(catalog is ${lookup.state}; refresh with \`/seamadmin catalog refresh\`.)_`
         );
         return;
       }
@@ -11808,9 +11979,9 @@ export class Orchestrator {
           fields: [{ name: "Current", value: displayCurrent, inline: true }],
         },
         choices: models.map((m) => ({
-          value: m.modelId,
-          label: m.name ?? m.modelId,
-          description: m.modelId,
+          value: m.id,
+          label: m.displayName,
+          description: m.id,
         })),
         authorizedUserIds: mayConfigureUserIds(this.config),
         commit: async (pickedChoice, username) => {
@@ -11872,10 +12043,22 @@ export class Orchestrator {
 
     record = this.store.get(record.id) ?? record;
     const describedBefore = this.router.describeConfig(record);
+    const binding = {
+      agentId: describedBefore.agent.value,
+      location: describedBefore.location.value,
+    };
+    const selected = this.modelCatalog.model(binding, id);
+    if (!selected) {
+      return fail(
+        `model ${JSON.stringify(id)} is not available in the cached catalog for ${binding.agentId}@${binding.location}`
+      );
+    }
+    const canonicalId = selected.id;
+    const defaultEffort = selected.effort.selectionDefault;
     const current = describedBefore.model.value;
-    if (id === current) {
+    if (canonicalId === current) {
       await this.applyThreadName(this.store.get(record.id) ?? record);
-      const message = `🧠 Model already set to \`${id}\` (no change).`;
+      const message = `🧠 Model already set to \`${canonicalId}\` (no change).`;
       await respond(message);
       return { ok: true, message };
     }
@@ -11933,7 +12116,8 @@ export class Orchestrator {
     try {
       const live = this.store.get(record.id) ?? record;
       const cfg = this.store.readConfig(live);
-      cfg.model = id;
+      cfg.model = canonicalId;
+      cfg.reasoningEffort = defaultEffort;
       delete cfg.lastContextUsage;
       this.store.upsert({
         ...live,
@@ -11944,7 +12128,7 @@ export class Orchestrator {
       const overlay = this.configMutation.applyThreadOverlay({
         threadId: channel.id,
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
-        changes: { model: id },
+        changes: { model: canonicalId, effort: defaultEffort },
         actor,
       });
       if (!overlay.ok) {
@@ -11959,7 +12143,7 @@ export class Orchestrator {
       const verified = this.store.get(live.id) ?? live;
       const described = this.router.describeConfig(verified);
       const spawn = this.router.planRuntimeSpawn(verified);
-      if (described.model.value !== id || spawn.model !== id) {
+      if (described.model.value !== canonicalId || spawn.model !== selected.runtimeId) {
         const rolled = rollback();
         return fail(
           `the effective configuration did not match the requested model.${mismatchSuffix(rolled)}`
@@ -11968,26 +12152,12 @@ export class Orchestrator {
 
       let message: string;
       if (this.router.hasRuntime(verified.id)) {
-        try {
-          const rt = await this.router.getOrStartRuntime(verified);
-          await rt.setModel(id);
-          message = `🧠 Model set to \`${id}\` (live).`;
-        } catch (err) {
-          this.logger.warn({ err }, "live model set failed; invalidating runtime for respawn");
-          await this.router.invalidate(verified.id);
-          const still = this.store.get(verified.id) ?? verified;
-          const stillDescribed = this.router.describeConfig(still);
-          const stillSpawn = this.router.planRuntimeSpawn(still);
-          if (stillDescribed.model.value !== id || stillSpawn.model !== id) {
-            const rolled = rollback();
-            return fail(
-              `live model apply failed and the durable model is no longer ${id}.${mismatchSuffix(rolled)}`
-            );
-          }
-          message = `🧠 Model will be \`${id}\` on the next turn (session respawn).`;
-        }
+        // Model and its discovered default effort are one transaction. Retire
+        // the warm runtime so no live model switch can leave the old effort.
+        await this.router.invalidate(verified.id);
+        message = `🧠 Model will be \`${canonicalId}\` with effort \`${defaultEffort}\` on the next turn (session respawn).`;
       } else {
-        message = `🧠 Model will be \`${id}\` on the next turn.`;
+        message = `🧠 Model will be \`${canonicalId}\` with effort \`${defaultEffort}\` on the next turn.`;
       }
 
       await this.applyThreadName(this.store.get(verified.id) ?? verified);
@@ -12292,21 +12462,29 @@ export class Orchestrator {
     const cfg = this.store.readConfig(record);
     const current = cfg.reasoningEffort ?? "default";
 
-    // Gate by the active agent's effort capability. Not every agent exposes a
-    // settable reasoning effort: agy bakes it into the model choice; others have
-    // none. Showing the picker for those would be a false "✅ changed".
-    const profile = this.router.getProfile(record.agentId);
-    const eff = profile?.effort;
-    const supported = eff?.levels ?? [];
-    if (supported.length === 0) {
+    // Capability is model-specific and comes only from the operational catalog.
+    const described = this.router.describeConfig(record);
+    const catalogModel = this.modelCatalog.model(
+      { agentId: described.agent.value, location: described.location.value },
+      described.model.value
+    );
+    if (!catalogModel) {
+      await i.reply({
+        content: `The model catalog for \`${described.agent.value}@${described.location.value}\` is warming/unavailable.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    const supported = catalogModel.effort.choices.map((choice) => choice.id);
+    if (catalogModel.effort.mechanism === "none" || catalogModel.effort.mechanism === "modelBaked") {
       const msg =
-        eff?.mechanism === "modelBaked"
+        catalogModel.effort.mechanism === "modelBaked"
           ? `Effort for \`${record.agentId}\` is part of the **model** choice — pick a high/med/low model variant with \`/seam config model\`.`
           : `The active agent (\`${record.agentId}\`) doesn't support a reasoning-effort setting.`;
       await i.reply({ content: msg, flags: MessageFlags.Ephemeral });
       return;
     }
-    const effortChoices = EFFORT_CHOICES.filter((c) => supported.includes(c.value));
+    const effortChoices = catalogEffortChoices(supported).slice(0, 25);
     const supportedList = supported.map((l) => `\`${l}\``).join(", ");
 
     // No argument → interactive picker (falling back to a text report when the
@@ -13473,11 +13651,28 @@ export class Orchestrator {
       await this.router.invalidate(record.id);
       const live = this.store.get(record.id) ?? record;
       const cfg = this.store.readConfig(live);
+      const nextBinding = { agentId: parsed.agentId, location: nextLocation };
+      const catalogDefault = this.modelCatalog.models(nextBinding).find((model) => model.default);
+      if (!catalogDefault) {
+        throw new Error(`model catalog for ${parsed.agentId}@${nextLocation} is warming/unavailable`);
+      }
       if (!sameAgent) {
-        cfg.model = profile.defaultModel;
+        cfg.model = catalogDefault.id;
+        cfg.reasoningEffort = catalogDefault.effort.selectionDefault;
         delete cfg.lastContextUsage;
       }
-      const intendedModel = cfg.model ?? profile.defaultModel;
+      const intendedModel = cfg.model ?? catalogDefault.id;
+      const intendedEntry = this.modelCatalog.model(nextBinding, intendedModel);
+      if (!intendedEntry) {
+        throw new Error(`model ${intendedModel} is unavailable in the cached catalog for ${parsed.agentId}@${nextLocation}`);
+      }
+      if (!sameAgent && cfg.reasoningEffort === undefined) {
+        cfg.reasoningEffort = intendedEntry.effort.selectionDefault;
+      }
+      const intendedSelection = this.modelCatalog.resolve(nextBinding, {
+        model: intendedModel,
+        effort: cfg.reasoningEffort,
+      });
       this.store.upsert({
         ...live,
         agentId: parsed.agentId,
@@ -13507,7 +13702,8 @@ export class Orchestrator {
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
         changes: {
           agent: parsed.agentId,
-          model: intendedModel,
+          ...(!sameAgent ? { model: intendedModel } : {}),
+          ...(!sameAgent ? { effort: intendedEntry.effort.selectionDefault } : {}),
         },
         actor,
       });
@@ -13530,14 +13726,18 @@ export class Orchestrator {
         described.agent.value !== parsed.agentId ||
         described.model.value !== intendedModel ||
         spawn.agentId !== parsed.agentId ||
-        spawn.model !== intendedModel
+        spawn.model !== intendedSelection.raw.model ||
+        spawn.effort !== intendedSelection.raw.effort
       ) {
         const rolled = rollback();
         const suffix = rolled.acpRestored
           ? ""
           : " Previous ACP session was not restored because the effective agent/model/location no longer match.";
         return fail(
-          `the effective configuration did not match the requested agent/model.${suffix}`
+          `the effective configuration did not match the requested selection ` +
+          `(wanted ${parsed.agentId}@${nextLocation}/${intendedModel}/${intendedSelection.normalized.effort}; ` +
+          `got ${described.agent.value}@${described.location.value}/${described.model.value}/` +
+          `${described.effort.value ?? "default"}, runtime ${spawn.agentId}/${spawn.model}/${spawn.effort ?? "default"}).${suffix}`
         );
       }
 
@@ -13564,8 +13764,7 @@ export class Orchestrator {
       await i.reply({ content: "Use inside a thread.", flags: MessageFlags.Ephemeral });
       return;
     }
-    const cfg =
-      this.store.readConfig(record) ?? defaultSessionConfig(this.config.DEFAULT_MODEL);
+    const cfg = this.store.readConfig(record);
     await i.reply({
       content: this.renderer.codeBlock(JSON.stringify(cfg, null, 2), "json"),
       flags: MessageFlags.Ephemeral,
@@ -13668,13 +13867,12 @@ export class Orchestrator {
       : undefined;
     const cfg = this.store.readConfig(record);
     const agent = chan?.agent?.value ?? record.agentId;
-    const profile = this.router.getProfile(agent);
+    const location = resolveThreadLocation(this.config, record.channelRef);
+    const model = chan?.model?.value ?? cfg.model ??
+      this.modelCatalog.model({ agentId: agent, location }, "default")?.id ?? "default";
     const chanEffort = chan?.effort?.value;
-    const effortUsable = !!(
-      chanEffort &&
-      profile?.effort &&
-      profile.effort.mechanism !== "none" &&
-      profile.effort.levels.includes(chanEffort)
+    const effortUsable = Boolean(
+      chanEffort && this.modelCatalog.effortChoices({ agentId: agent, location: LOCAL_LOCATION }, model).includes(chanEffort)
     );
     const permission = (cfg.permissionPolicy ??
       this.config.DEFAULT_PERMISSION_POLICY ??
@@ -13682,7 +13880,7 @@ export class Orchestrator {
     return {
       location: LOCAL_LOCATION,
       agent,
-      model: chan?.model?.value ?? cfg.model ?? this.config.DEFAULT_MODEL,
+      model,
       effort: effortUsable ? chanEffort! : cfg.reasoningEffort ?? null,
       cwd: resolveSessionCwd({
         repoPath: record.repoPath,
@@ -13718,31 +13916,53 @@ export class Orchestrator {
     return this.router.getProfile(agentId)?.fastMode === undefined;
   }
 
-  private effortDisabledFor(draft: ThreadConfigDraft): boolean {
+  private catalogBindingForDraft(draft: ThreadConfigDraft): CatalogBinding {
     const channelScope = editScopeOf(draft) === "channel";
-    const agentId = channelScope
+    const selectedAgent = channelScope
       ? draft.overlay.channelAgent === undefined
         ? draft.snapshot.channelPins?.agent ?? draft.snapshot.withoutThread.agent
         : draft.overlay.channelAgent ?? draft.snapshot.withoutThread.agent
-      : draft.overlay.agent === undefined
-        ? draft.snapshot.agent.value
-        : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
-    const profile = this.router.getProfile(agentId);
-    const eff = profile?.effort;
-    return !eff || eff.mechanism === "none" || (eff.levels?.length ?? 0) === 0;
+      : effectiveAgentAtLocation(draft);
+    const parsed = parseAgentAtLocation(selectedAgent);
+    return {
+      agentId: parsed.agentId,
+      location: parsed.explicit ? parsed.location : draft.snapshot.location.value,
+    };
+  }
+
+  private catalogModelForDraft(draft: ThreadConfigDraft): string {
+    const channelScope = editScopeOf(draft) === "channel";
+    return channelScope
+      ? draft.overlay.channelModel === undefined
+        ? draft.snapshot.channelPins?.model ?? draft.snapshot.withoutThread.model
+        : draft.overlay.channelModel ?? draft.snapshot.withoutThread.model
+      : draft.overlay.model === undefined
+        ? draft.snapshot.model.value
+        : draft.overlay.model ?? draft.snapshot.withoutThread.model;
+  }
+
+  private effortDisabledFor(draft: ThreadConfigDraft): boolean {
+    const model = this.modelCatalog.model(
+      this.catalogBindingForDraft(draft),
+      this.catalogModelForDraft(draft)
+    );
+    return !model || model.effort.mechanism === "none" ||
+      model.effort.choices.every((choice) => choice.id === "default");
   }
 
   private capsForAgent = (agentId: string): DraftAgentCapabilities | undefined => {
     const profile = this.router.getProfile(agentId);
     if (!profile) return undefined;
+    const models = this.modelCatalog.models({ agentId, location: "local" });
     return {
-      ...(profile.staticModels
-        ? { staticModels: profile.staticModels.map((m) => ({ modelId: m.modelId })) }
-        : {}),
-      ...(profile.effort
+      ...(models.length
         ? {
-            effortMechanism: profile.effort.mechanism,
-            effortLevels: [...profile.effort.levels],
+            models: models.map((model) => ({
+              modelId: model.id,
+              effortMechanism: model.effort.mechanism,
+              effortLevels: model.effort.choices.map((choice) => choice.id),
+              effortDefault: model.effort.selectionDefault,
+            })),
           }
         : {}),
     };
@@ -14292,16 +14512,13 @@ export class Orchestrator {
         authorizedUserIds: owner,
       });
     } else if (action === "model") {
-      const agentId =
-        draft.overlay.agent === undefined
-          ? draft.snapshot.agent.value
-          : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
-      const profile = this.router.getProfile(agentId);
-      const models = profile?.staticModels ?? [];
+      const binding = this.catalogBindingForDraft(draft);
+      const agentId = binding.agentId;
+      const models = this.modelCatalog.models(binding);
       const choices = models.map((m) => ({
-        value: m.modelId,
-        label: m.name ?? m.modelId,
-        description: m.modelId,
+        value: m.id,
+        label: m.displayName,
+        description: m.id,
       }));
       if (choices.length === 0) {
         await this.adapter.sendMessage(
@@ -14320,12 +14537,11 @@ export class Orchestrator {
       });
     } else if (action === "effort") {
       if (this.effortDisabledFor(draft)) return;
-      const agentId =
-        draft.overlay.agent === undefined
-          ? draft.snapshot.agent.value
-          : draft.overlay.agent ?? draft.snapshot.withoutThread.agent;
-      const supported = this.router.getProfile(agentId)?.effort?.levels ?? [];
-      const effortChoices = EFFORT_CHOICES.filter((c) => supported.includes(c.value));
+      const supported = this.modelCatalog.effortChoices(
+        this.catalogBindingForDraft(draft),
+        this.catalogModelForDraft(draft)
+      );
+      const effortChoices = catalogEffortChoices(supported).slice(0, 24);
       picked = await this.adapter.sendChoicePicker!(channel, {
         panel: {
           color: 0x5865f2,
@@ -15341,29 +15557,33 @@ export class Orchestrator {
       }
 
       const cfg = this.store.readConfig(record);
-      const adapterModels =
-        typeof profile.describe === "function" ? profile.describe().models : undefined;
-      let pickerModels: AdapterModel[] | undefined;
-      const staticHit = profile.staticModels?.find((model) => {
-        const ids = [destinationModel];
-        if (destinationModel === "default" && profile.defaultModel) ids.push(profile.defaultModel);
-        return ids.includes(model.modelId) && model.contextLimit && model.contextLimit > 0;
+      const catalogModels = this.modelCatalog.models({
+        agentId,
+        location: described.location.value,
       });
-      if (!staticHit) {
-        pickerModels = await this.listRebuildPickerModels(profile, channel);
+      const catalogEntry = this.modelCatalog.model(
+        { agentId, location: described.location.value },
+        destinationModel
+      );
+      if (!catalogEntry) {
+        throw new ReconstructionUnavailableError(
+          `Model catalog for ${agentId}@${described.location.value} is warming/unavailable.`
+        );
       }
-      const metadata = this.getModelMetadata?.(destinationModel)
-        ?? (destinationModel === "default" && profile.defaultModel
-          ? this.getModelMetadata?.(profile.defaultModel)
-          : null);
+      const catalogDefault = this.modelCatalog.model(
+        { agentId, location: described.location.value },
+        "default"
+      );
+      const metadata = this.getModelMetadata?.(catalogEntry.id) ?? null;
       const resolved = resolveContextWindow({
         agentId,
-        model: destinationModel,
-        defaultModel: profile.defaultModel,
+        model: catalogEntry.id,
+        defaultModel: catalogDefault?.id,
         lastContextUsage: cfg.lastContextUsage,
-        staticModels: profile.staticModels,
-        adapterModels,
-        pickerModels,
+        catalogModels: catalogModels.map((model) => ({
+          modelId: model.id,
+          contextLimit: model.context.effective ?? undefined,
+        })),
         metadataWindow: metadata?.context_window ?? null,
       });
       const contextWindow = resolved.window;
@@ -15469,44 +15689,6 @@ export class Orchestrator {
     }
   }
 
-  /**
-   * Ask the destination host for its current picker catalog before falling
-   * back to the controller's profile. Codex uses this to read that host's
-   * `models_cache.json`, so a cold Rebuild does not need a sacrificial prompt
-   * just to learn the exact effective context window.
-   */
-  private async listRebuildPickerModels(
-    profile: AgentProfile,
-    channel: ChannelRef
-  ): Promise<AdapterModel[] | undefined> {
-    const location = resolveThreadLocation(this.config, channel.id);
-    if (this.bridgeHub) {
-      try {
-        const raw = await this.bridgeHub.rpc(location, "listPickerModels", {}, profile.id);
-        if (Array.isArray(raw)) {
-          const models = raw.filter((model): model is AdapterModel =>
-            !!model &&
-            typeof model === "object" &&
-            typeof (model as AdapterModel).modelId === "string" &&
-            typeof (model as AdapterModel).name === "string"
-          );
-          if (models.length > 0) return models;
-        }
-      } catch (err) {
-        this.logger.debug(
-          { err, agentId: profile.id, location },
-          "rebuild host model-catalog warm failed; trying controller profile"
-        );
-      }
-    }
-    if (typeof profile.listPickerModels !== "function") return undefined;
-    try {
-      return [...(await profile.listPickerModels())];
-    } catch {
-      return undefined;
-    }
-  }
-
   private async postRebuildPanel(
     channel: ChannelRef,
     panel: StructuredPanel
@@ -15584,8 +15766,10 @@ export class Orchestrator {
             this.refuseUnregisteredAgent(agentId, `Unknown agent \`${agentId}\`.`)
           );
         }
-        const model = modelOption?.trim() ||
-          (agentOption !== null ? profile.defaultModel : this.store.readConfig(record).model ?? profile.defaultModel);
+        const location = this.router.describeConfig(record).location.value;
+        const model = modelOption?.trim() || (agentOption !== null
+          ? this.modelCatalog.model({ agentId, location }, "default")?.id ?? "default"
+          : this.router.describeConfig(record).model.value);
         if (!model) throw new Error("Target model must be a non-empty string.");
         result = await this.migrateThreadAgentModelAndRebuild(channel, record, agentId, model);
       } else {
@@ -17290,7 +17474,23 @@ export class Orchestrator {
         await i.editReply(`Invalid JSON: ${(err as Error).message}`);
         return;
       }
-      if (!cfg.model) cfg.model = this.config.DEFAULT_MODEL;
+      const jsonDescription = this.router.describeConfig(record);
+      if (!cfg.model) cfg.model = jsonDescription.model.value;
+      const jsonBinding = {
+        agentId: jsonDescription.agent.value,
+        location: jsonDescription.location.value,
+      };
+      try {
+        const selected = this.modelCatalog.resolve(jsonBinding, {
+          model: cfg.model,
+          effort: cfg.reasoningEffort,
+        });
+        cfg.model = selected.normalized.model;
+        cfg.reasoningEffort = selected.normalized.effort;
+      } catch (err) {
+        await i.editReply(`Invalid catalog selection: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
       try {
         await this.router.invalidate(record.id);
         this.persistConfig(this.store.get(record.id) ?? record, cfg);
@@ -17340,19 +17540,6 @@ export class Orchestrator {
       await i.editReply("`effort` must be a level or `default`.");
       return;
     }
-    if (
-      requestedEffort &&
-      !clearEffort &&
-      !(profile.effort?.levels ?? []).includes(requestedEffort)
-    ) {
-      const supported = profile.effort?.levels ?? [];
-      await i.editReply(
-        `Effort \`${requestedEffort}\` is not supported by \`${nextAgentId}\`. ` +
-          `Choose ${supported.length ? supported.map((v) => `\`${v}\``).join(", ") : "`default`"}.`
-      );
-      return;
-    }
-
     const requestedRole = values.role?.trim();
     if (requestedRole && requestedRole.length > 64) {
       await i.editReply("`role` must be at most 64 characters.");
@@ -17382,6 +17569,34 @@ export class Orchestrator {
 
     const currentLocation = resolveThreadLocation(this.config, channel.id);
     const nextLocation = parsedAgent?.explicit ? parsedAgent.location : currentLocation;
+    const candidateModel = requestedModel
+      ?? (nextAgentId !== describedBefore.agent.value
+        ? this.modelCatalog.model({ agentId: nextAgentId, location: nextLocation }, "default")?.id ?? "default"
+        : describedBefore.model.value);
+    const catalogModel = this.modelCatalog.model(
+      { agentId: nextAgentId, location: nextLocation },
+      candidateModel
+    );
+    if (!catalogModel) {
+      await i.editReply(
+        `Model \`${candidateModel}\` is unavailable in the cached catalog for ` +
+          `\`${nextAgentId}@${nextLocation}\`; refresh the catalog and retry.`
+      );
+      return;
+    }
+    const effortChoices = catalogModel.effort.choices.map((choice) => choice.id);
+    const pinnedEffort = values.effort !== null
+      ? (clearEffort ? catalogModel.effort.selectionDefault : requestedEffort)
+      : (catalogModel.id !== describedBefore.model.value || nextAgentId !== describedBefore.agent.value
+          ? catalogModel.effort.selectionDefault
+          : undefined);
+    if (pinnedEffort && !effortChoices.includes(pinnedEffort)) {
+      await i.editReply(
+        `Effort \`${pinnedEffort}\` is not supported by \`${nextAgentId}/${catalogModel.id}\`. ` +
+          `Choose ${effortChoices.map((value) => `\`${value}\``).join(", ")}.`
+      );
+      return;
+    }
     let resolvedRepo: string | undefined;
     if (values.repo !== null) {
       const requestedRepo = values.repo?.trim();
@@ -17438,28 +17653,15 @@ export class Orchestrator {
         );
         return;
       }
-      if (
-        requestedEffort &&
-        !clearEffort &&
-        !(appliedProfile.effort?.levels ?? []).includes(requestedEffort)
-      ) {
-        await i.editReply(
-          `Effort \`${requestedEffort}\` is not supported by \`${appliedAgentId}\`.`
-        );
-        return;
-      }
       sessionBefore = { ...live };
       overlayBefore = this.configMutation.readThreadPresetEntry(channel.id);
       const cfg = this.store.readConfig(live);
       const agentChanged = appliedAgentId !== liveDescription.agent.value;
       const locationChanged = nextLocation !== liveDescription.location.value;
-      const model = requestedModel ?? (agentChanged ? appliedProfile.defaultModel : cfg.model);
+      const model = catalogModel.id;
       if (model !== undefined) cfg.model = model;
       if (values.model !== null || agentChanged) delete cfg.lastContextUsage;
-      if (values.effort !== null) {
-        if (clearEffort) delete cfg.reasoningEffort;
-        else cfg.reasoningEffort = requestedEffort;
-      }
+      if (pinnedEffort !== undefined) cfg.reasoningEffort = pinnedEffort;
       if (values.role !== null) {
         if (!requestedRole || requestedRole.toLowerCase() === "auto") delete cfg.role;
         else cfg.role = requestedRole;
@@ -17501,9 +17703,7 @@ export class Orchestrator {
       } else if (values.model !== null && model !== undefined) {
         overlayChanges.model = model;
       }
-      if (values.effort !== null) {
-        overlayChanges.effort = clearEffort ? null : requestedEffort;
-      }
+      if (pinnedEffort !== undefined) overlayChanges.effort = pinnedEffort;
       if (Object.keys(overlayChanges).length > 0) {
         const overlaid = this.configMutation.applyThreadOverlay({
           threadId: channel.id,
@@ -17524,9 +17724,7 @@ export class Orchestrator {
         ((values.model !== null || agentChanged) &&
           model !== undefined &&
           effective.model.value !== model) ||
-        (values.effort !== null &&
-          !clearEffort &&
-          effective.effort.value !== requestedEffort) ||
+        (pinnedEffort !== undefined && effective.effort.value !== pinnedEffort) ||
         (parsedAgent?.explicit === true && effective.location.value !== nextLocation);
       if (mismatch) {
         throw new Error("the effective agent/model/effort/location did not match the requested values");
@@ -19514,7 +19712,7 @@ export class Orchestrator {
         authoringSession,
         ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
         destLive,
-        defaultModel: this.config.DEFAULT_MODEL,
+        defaultModel: this.choiceDefaultModel(authoringSession),
       });
       if (emitted.ok) {
         this.store.setChoiceClickDelivery(card.id, evt.userId, emitted.dispatchId);
@@ -19564,7 +19762,7 @@ export class Orchestrator {
       authoringSession,
       ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
       destLive,
-      defaultModel: this.config.DEFAULT_MODEL,
+      defaultModel: this.choiceDefaultModel(authoringSession),
     });
     if (!planned.ok) {
       await evt.replyEphemeral(planned.error);
@@ -19606,7 +19804,7 @@ export class Orchestrator {
         authoringSession,
         ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
         destLive,
-        defaultModel: this.config.DEFAULT_MODEL,
+        defaultModel: this.choiceDefaultModel(authoringSession),
       });
       if (emitted.ok) {
         this.store.setChoiceClickDelivery(card.id, evt.userId, emitted.dispatchId);
@@ -19637,7 +19835,7 @@ export class Orchestrator {
       authoringSession,
       ...(authoringSession ? { cwd: this.effectiveCwd(authoringSession) } : {}),
       destLive,
-      defaultModel: this.config.DEFAULT_MODEL,
+      defaultModel: this.choiceDefaultModel(authoringSession),
     });
     if (!planned.ok) return { ok: false, error: planned.error };
     const option = card.options[optionIndex]!;
@@ -20360,13 +20558,14 @@ export class Orchestrator {
       disableThreadPrefix: existing?.disableThreadPrefix ?? null,
     };
 
-    // Do not start an ACP session in this builder. staticModels first; agy
-    // (and anyone else with listPickerModels) can fill from a cached catalog.
+    // Preset editing uses only the controller's cache; it never starts an ACP
+    // session or reads an adapter source.
     const loadModels = async (
       agentId: string | null
     ): Promise<ReadonlyArray<{ modelId: string; name: string }>> => {
       if (!agentId) return [];
-      return pickerModelsForProfile(this.router.getProfile(agentId), 24);
+      return this.modelCatalog.models({ agentId, location: "local" })
+        .map((model) => ({ modelId: model.id, name: model.displayName }));
     };
     let models = await loadModels(state.agentId);
     const repoDirs = (await this.listHostWorkspacePaths(i.channelId)) ?? [];
@@ -20448,12 +20647,18 @@ export class Orchestrator {
         });
       }
 
+      const effortLevels = state.agentId
+        ? this.modelCatalog.model(
+            { agentId: state.agentId, location: "local" },
+            state.model ?? "default"
+          )?.effort.choices.map((choice) => choice.id) ?? []
+        : [];
       const effortSelect = new StringSelectMenuBuilder()
         .setCustomId("preset:effort")
         .setPlaceholder("⚡ Effort")
         .addOptions(
           { label: "Default", value: "__default__", default: state.effort === null },
-          ...EFFORT_CHOICES.map((e) => ({
+          ...catalogEffortChoices(effortLevels.filter((value) => value !== "default")).slice(0, 24).map((e) => ({
             label: e.label,
             value: e.value,
             description: e.description,
@@ -20565,12 +20770,22 @@ export class Orchestrator {
           state.agentId = v === "__default__" ? null : v;
           // Model ids are agent-specific; a stale pick would be invalid.
           state.model = null;
+          state.effort = null;
           await c.deferUpdate();
           models = await loadModels(state.agentId);
           await c.editReply(render());
         } else if (c.isStringSelectMenu() && c.customId === "preset:model") {
           const v = c.values[0]!;
-          state.model = v === "__default__" ? null : v;
+          const nextModel = v === "__default__" ? null : v;
+          if (nextModel !== state.model) {
+            state.model = nextModel;
+            state.effort = nextModel && state.agentId
+              ? this.modelCatalog.model(
+                  { agentId: state.agentId, location: "local" },
+                  nextModel
+                )?.effort.selectionDefault ?? null
+              : null;
+          }
           await c.update(render());
         } else if (c.isStringSelectMenu() && c.customId === "preset:effort") {
           const v = c.values[0]!;
@@ -21025,9 +21240,18 @@ export class Orchestrator {
           `⚠️ ${this.refuseUnregisteredAgent(preset.agentId, `Unknown agent \`${preset.agentId}\``)} — agent left unchanged.`
         );
       } else {
+        const binding = {
+          agentId: preset.agentId,
+          location: resolveThreadLocation(this.config, channel.id),
+        };
+        const catalogDefault = this.modelCatalog.models(binding).find((model) => model.default);
+        if (!catalogDefault) {
+          notes.push(`⚠️ Catalog for \`${preset.agentId}@${binding.location}\` is warming/unavailable — agent left unchanged.`);
+        } else {
         await this.router.invalidate(record.id);
         const cfg = this.store.readConfig(record);
-        cfg.model = profile.defaultModel;
+        cfg.model = catalogDefault.id;
+        cfg.reasoningEffort = catalogDefault.effort.selectionDefault;
         // Different agent → different context window; cached usage is invalid.
         cfg.lastContextUsage = undefined;
         this.store.upsert({
@@ -21038,30 +21262,44 @@ export class Orchestrator {
           updatedUtc: new Date().toISOString(),
         });
         record = this.store.get(record.id) ?? record;
-        changes.push(`Agent → \`${preset.agentId}\` (model \`${profile.defaultModel}\`)`);
+        changes.push(
+          `Agent → \`${preset.agentId}\` (model \`${catalogDefault.id}\`, effort \`${catalogDefault.effort.selectionDefault}\`)`
+        );
+        }
       }
     }
 
     const cfg = this.store.readConfig(record);
+    const binding = {
+      agentId: record.agentId,
+      location: resolveThreadLocation(this.config, channel.id),
+    };
 
     if (preset.model) {
-      cfg.model = preset.model;
+      const catalogModel = this.modelCatalog.model(binding, preset.model);
+      if (!catalogModel) {
+        notes.push(`⚠️ Model \`${preset.model}\` skipped — unavailable in the cached catalog.`);
+      } else {
+      cfg.model = catalogModel.id;
+      if (!preset.effort) cfg.reasoningEffort = catalogModel.effort.selectionDefault;
       // Usage was measured under the previous model — don't seed the panel with
       // mismatched numbers. The runtime invalidation below makes the new model
       // take effect on respawn (covers backends where setModel() is rejected).
       cfg.lastContextUsage = undefined;
-      changes.push(`Model → \`${preset.model}\``);
+      changes.push(`Model → \`${catalogModel.id}\``);
+      if (!preset.effort) changes.push(`Effort → ${catalogModel.effort.selectionDefault}`);
+      }
     }
 
     if (preset.effort) {
       // Gate on the *effective* agent's capability, exactly like /seam effort —
       // otherwise the summary would claim a change that silently does nothing.
-      const profile = this.router.getProfile(record.agentId);
-      const supported = profile?.effort?.levels ?? [];
+      const selectedModel = this.modelCatalog.model(binding, cfg.model ?? "default");
+      const supported = selectedModel?.effort.choices.map((choice) => choice.id) ?? [];
       if (supported.includes(preset.effort)) {
         cfg.reasoningEffort = preset.effort;
         changes.push(`Effort → ${preset.effort}`);
-      } else if (profile?.effort?.mechanism === "modelBaked") {
+      } else if (selectedModel?.effort.mechanism === "modelBaked") {
         notes.push(
           `⚠️ Effort \`${preset.effort}\` skipped — \`${record.agentId}\` bakes effort into the model choice.`
         );

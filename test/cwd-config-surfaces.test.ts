@@ -13,6 +13,7 @@ import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { AgentProfile } from "@seam/adapters";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import type { SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
 import type { ChannelRef, IncomingMessage } from "../packages/core/src/platforms/chat-adapter.js";
@@ -69,6 +70,7 @@ function makeOrch() {
     logger: silent,
     store,
     profiles,
+    modelCatalog: fixtureModelCatalog(profiles),
     defaultAgentId: "copilot",
     defaultModel: "gpt-5.4",
     defaultPermissionMode: "ask",
@@ -93,6 +95,7 @@ function makeOrch() {
       SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
     } as any,
     adapter: {} as any,
+    modelCatalog: fixtureModelCatalog(profiles),
     router,
     store,
     renderer: {} as any,
@@ -159,6 +162,7 @@ describe("/seam config repo scope", () => {
       logger: silent,
       store,
       profiles,
+      modelCatalog: fixtureModelCatalog(profiles),
       defaultAgentId: "copilot",
       defaultModel: "gpt-5.4",
       defaultPermissionMode: "ask",
@@ -470,6 +474,7 @@ describe("#207 orchestrator live-turn spawn + status card", () => {
       logger: silent,
       store,
       profiles: runtimeProfiles,
+      modelCatalog: fixtureModelCatalog(runtimeProfiles),
       defaultAgentId: "copilot",
       defaultModel: "gpt-5.4",
       defaultPermissionMode: "ask",
@@ -503,6 +508,7 @@ describe("#207 orchestrator live-turn spawn + status card", () => {
         sendMessage: async () => ({ id: "m1", channel }),
         editMessage: async () => {},
       } as any,
+      modelCatalog: fixtureModelCatalog(runtimeProfiles),
       router,
       store,
       renderer: discordRenderer,

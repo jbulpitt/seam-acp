@@ -25,6 +25,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -471,11 +472,13 @@ async function renderBuilderCard(existing?: ScheduledPrompt): Promise<RenderedCa
         model: { value: "default", source: "default" },
         effort: { value: null, source: "default" },
         cwd: { value: "/repo", source: "session config" },
+        location: { value: "local", source: "default" },
       }),
       getProfile: (id: string) =>
         id === "claude" ? { id: "claude", defaultModel: "default", staticModels: [] } : undefined,
     },
     store: { readConfig: () => ({ model: null }), get: () => null },
+    modelCatalog: fixtureModelCatalog([{ id: "claude", defaultModel: "default" } as any]),
     logger: silent,
     // #159: the builder's first response goes through `respondInitial` so it
     // can also open on an interaction the list's Edit button already deferred.

@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { pino } from "pino";
 import type { AgentProfile } from "@seam/adapters";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import * as adapters from "@seam/adapters";
 import { makeCodexProfile } from "@seam/adapters";
 
@@ -108,10 +109,12 @@ function makeRouter(opts: {
   profiles?: AgentProfile[];
   ollamaCloudEnabled?: boolean;
 } = {}): SessionRouter {
+  const profiles = opts.profiles ?? [stubProfile("claude")];
   return new SessionRouter({
     logger: silent,
     store: stubStore(),
-    profiles: opts.profiles ?? [stubProfile("claude")],
+    profiles,
+    modelCatalog: fixtureModelCatalog(profiles),
     defaultAgentId: "claude",
     defaultModel: "opus",
     threadPresets: new Map(),

@@ -29,6 +29,7 @@ import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { ThreadPreset } from "../packages/core/src/config.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -156,6 +157,7 @@ interface Harness {
   router: SessionRouter;
   threadPresets: Map<string, ThreadPreset>;
   record: SessionRecord;
+  modelCatalog: ReturnType<typeof fixtureModelCatalog>;
 }
 
 function makeHarness(over: { repoPath?: string | null } = {}): Harness {
@@ -172,10 +174,12 @@ function makeHarness(over: { repoPath?: string | null } = {}): Harness {
       },
     ],
   ]);
+  const modelCatalog = fixtureModelCatalog(profiles);
   const router = new SessionRouter({
     logger: silent,
     store,
     profiles,
+    modelCatalog,
     defaultAgentId: "copilot",
     defaultModel: COPILOT_MODEL,
     defaultPermissionMode: "ask",
@@ -194,7 +198,7 @@ function makeHarness(over: { repoPath?: string | null } = {}): Harness {
     updatedUtc: "2026-01-01T00:00:00.000Z",
   };
   store.upsert(record);
-  return { dir, store, router, threadPresets, record };
+  return { dir, store, router, threadPresets, record, modelCatalog };
 }
 
 function noopLifecycle() {
@@ -262,6 +266,7 @@ async function renderBuilder(
       getProfile,
     },
     store: harness.store,
+    modelCatalog: harness.modelCatalog,
     logger: silent,
     attachListLifecycle: () => noopLifecycle(),
   });

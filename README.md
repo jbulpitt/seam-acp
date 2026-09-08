@@ -129,7 +129,7 @@ to its own command and its own fresh 8,000.
   `workflows` `queue`, plus the `config` (18), `info` (6) and `preset` (7) groups.
 - **`/seamadmin`** — operator surface. Top-level `rebuild`, `compact-thread`,
   and `recover`, plus the `schedule` (5), `project` (3), `upload` (3),
-  `bridge` (4), `debug` (6), `voice` (7) and `naming` (2) groups. Registered with `default_member_permissions =
+  `bridge` (4), `debug` (6), `voice` (7), `catalog` (1), and `naming` (2) groups. Registered with `default_member_permissions =
   ManageGuild` and `contexts = [Guild]`, so it does not appear in the command
   picker for non-admins and is unavailable in DMs.
 
@@ -157,7 +157,7 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seam config init` | Bind the current thread as a session and post the `/seam config edit` card (same surface as `/seam new`) |
 | `/seam config repo <path>` | Set the working repo (relative to `REPOS_ROOT` or absolute under it) |
 | `/seam config agent [id]` | With no id: posts an interactive picker of registered profiles. With id: switch directly. |
-| `/seam config model [id]` | With no id: starts the agent if needed and posts a picker of advertised models. With id: set directly (live if a runtime is active). |
+| `/seam config model [id]` | Uses the host-scoped cached operational catalog; with no id, posts a picker without starting an agent. A model change atomically pins that model's catalog default effort and applies via the adapter's live/reload/fresh-session mode. |
 | `/seam config mode <id>` | Set the agent operational mode (e.g. plan / agent / autopilot) |
 | `/seam config effort <low\|medium\|high>` | Set reasoning effort (model-dependent) |
 | `/seam config tools <allow\|exclude> [csv]` | Tool allow / exclude list (empty list = clear) |
@@ -183,6 +183,7 @@ All commands are restricted to users listed in `DISCORD_ALLOWED_USER_IDS` and (w
 | `/seamadmin bridge` | Pair remote bridges (`add` `rotate` `list` `remove`) |
 | `/seamadmin debug` | Host debug (`tail` `exec` `status`) and the live-help voice spike |
 | `/seamadmin voice` | Shared Voice Console V2 (`start` `add` `remove` `configure` `console` `status` `stop`) |
+| `/seamadmin catalog refresh <agent@location\|all>` | Force an operational catalog refresh and report generation, diff, scope, provenance, and retained/quarantined failures. |
 
 Session history recovery (four distinct operations):
 

@@ -31,7 +31,7 @@ export const SEAM_ADMIN_COMMAND_NAME = "seamadmin";
  *     config (18) model effort agent role mode repo tools card gif approve
  *                 reset init detach tts show edit set audit
  *
- *   /seamadmin  (10 slots)  operator surface — ManageGuild + guild-only
+ *   /seamadmin  (11 slots)  operator surface — ManageGuild + guild-only
  *     rebuild · compact-thread · recover
  *     project  (3)  new list remove
  *     upload   (3)  pull push secret
@@ -205,16 +205,9 @@ export function buildSeamCommand(): SlashCommandBuilder {
           .addStringOption((o) =>
             o
               .setName("level")
-              .setDescription("low | medium | high | xhigh | max | ultra — agent falls back if model doesn't support it")
+              .setDescription("Model-supported effort")
               .setRequired(false)
-              .addChoices(
-                { name: "low", value: "low" },
-                { name: "medium", value: "medium" },
-                { name: "high", value: "high" },
-                { name: "xhigh", value: "xhigh" },
-                { name: "max", value: "max" },
-                { name: "ultra", value: "ultra" }
-              )
+              .setAutocomplete(true)
           )
       )
       .addSubcommand((sub) =>
@@ -1019,6 +1012,24 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
               .setName("discard-pending")
               .setDescription("Delete undispatched finalized text")
               .setRequired(false)
+          )
+      )
+  );
+
+  cmd.addSubcommandGroup((g) =>
+    g
+      .setName("catalog")
+      .setDescription("Refresh cached model catalogs")
+      .addSubcommand((sub) =>
+        sub
+          .setName("refresh")
+          .setDescription("Refresh one agent@host or all catalogs")
+          .addStringOption((o) =>
+            o
+              .setName("agent")
+              .setDescription("agent@host or all")
+              .setRequired(true)
+              .setAutocomplete(true)
           )
       )
   );

@@ -62,8 +62,8 @@ describe("isForwardableFullModelId", () => {
   });
 });
 
-describe("makeClaudeProfile staticModels", () => {
-  it("stamps each picker entry with its canonical contextLimit", () => {
+describe("makeClaudeProfile catalog", () => {
+  it("stamps each manifest entry with its canonical context window", async () => {
     const profile = makeClaudeProfile({
       defaultModel: "default",
       staticModels: [
@@ -72,7 +72,13 @@ describe("makeClaudeProfile staticModels", () => {
         { modelId: "claude-fable-5", name: "Fable 5" },
       ],
     });
-    expect(profile.staticModels).toEqual([
+    const catalog = await profile.catalog.fetch();
+    expect(catalog.models.map((model) => ({
+      modelId: model.id,
+      name: model.displayName,
+      contextLimit: model.context.effective,
+      ...(model.visionMode !== "none" ? { visionMode: model.visionMode } : {}),
+    }))).toEqual([
       {
         modelId: "default",
         name: "Opus latest",
@@ -82,6 +88,6 @@ describe("makeClaudeProfile staticModels", () => {
       { modelId: "claude-fable-5-1", name: "Fable 5.1", contextLimit: 1_000_000 },
       { modelId: "claude-fable-5", name: "Fable 5", contextLimit: 1_000_000 },
     ]);
-    expect(profile.describe().models[0]?.visionMode).toBe("tool");
+    expect(catalog.models[0]?.visionMode).toBe("tool");
   });
 });

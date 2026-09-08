@@ -7,13 +7,22 @@ import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
 // Stub profiles: `claude` supports effort levels; `copilot` has no effort concept.
 const profiles = [
-  { id: "claude", effort: { mechanism: "configOption", levels: ["low", "medium", "high"] } },
-  { id: "copilot", effort: { mechanism: "none", levels: [] } },
+  {
+    id: "claude", defaultModel: "gpt-5.4",
+    staticModels: ["gpt-5.4", "opus", "sonnet"].map((modelId) => ({ modelId, name: modelId })),
+    effort: { mechanism: "configOption", levels: ["low", "medium", "high"] },
+  },
+  {
+    id: "copilot", defaultModel: "gpt-5.4",
+    staticModels: [{ modelId: "gpt-5.4", name: "gpt-5.4" }],
+    effort: { mechanism: "none", levels: [] },
+  },
 ] as unknown as AgentProfile[];
 
 /** A SessionStore stub that only implements what describeConfig reads. */
@@ -39,6 +48,7 @@ function makeRouter(opts?: {
     logger: silent,
     store: stubStore(),
     profiles,
+    modelCatalog: fixtureModelCatalog(profiles),
     defaultAgentId: "copilot",
     defaultModel: "gpt-5.4",
     defaultPermissionMode: "ask",

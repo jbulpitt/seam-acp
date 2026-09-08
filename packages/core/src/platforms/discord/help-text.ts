@@ -85,6 +85,7 @@ export function seamHelpSections(): string[] {
       "`/seamadmin bridge` — `add` `rotate` `list` `remove` `restart` (remote hosts + safe restart)",
       "`/seamadmin debug` — `tail` `exec` `status` `voice-ping` `voice-capture` `voice-live`",
       "`/seamadmin voice` — `start` `add` `remove` `configure` `console` `status` `stop`",
+      "`/seamadmin catalog refresh <agent@location|all>` — refresh the operational model catalog",
     ].join("\n"),
   ];
 }

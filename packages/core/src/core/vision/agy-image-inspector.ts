@@ -29,6 +29,8 @@ export interface AgyImageInspectorOptions {
   cliPath?: string;
   stagingRoot?: string;
   timeoutMs?: number;
+  /** Cache-only availability check supplied by the shared model catalog. */
+  isModelAvailable?: (model: string) => boolean;
   /** Test seam; production uses makeAgyProfile. */
   profileFactory?: (
     opts: Parameters<typeof makeAgyProfile>[0]
@@ -92,8 +94,7 @@ export function createAgyImageInspector(
       runtime.onEvent(async (event) => {
         if (event.kind === "agent-text") observations += event.text;
       });
-      const models = await profile.listPickerModels?.();
-      if (!models?.some((entry) => entry.modelId === model)) {
+      if (opts.isModelAvailable && !opts.isModelAvailable(model)) {
         throw new Error(`Agy vision model ${model} is unavailable`);
       }
       await runtime.start();

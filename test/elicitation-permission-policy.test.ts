@@ -14,6 +14,7 @@ import {
   type RequestPermissionRequest,
 } from "@agentclientprotocol/sdk";
 import type { AgentProfile } from "@seam/adapters";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import {
@@ -334,6 +335,7 @@ describe("SessionRouter permission vs elicitation wiring", () => {
       logger,
       store,
       profiles: [profile],
+      modelCatalog: fixtureModelCatalog([profile]),
       defaultAgentId: "codex",
       defaultModel: "gpt-test",
       defaultPermissionMode: "ask",

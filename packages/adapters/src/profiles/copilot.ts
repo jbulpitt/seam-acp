@@ -1,9 +1,22 @@
 import { spawn } from "node:child_process";
 import fs, { promises as fsp } from "node:fs";
 import path from "node:path";
+import { Readable, Writable } from "node:stream";
 import Database from "better-sqlite3";
-import type { McpServer } from "@agentclientprotocol/sdk";
+import {
+  ClientSideConnection,
+  PROTOCOL_VERSION,
+  ndJsonStream,
+  type Client,
+  type McpServer,
+  type SessionConfigOption,
+  type SessionConfigSelectGroup,
+  type SessionConfigSelectOption,
+  type SessionConfigSelectOptions,
+} from "@agentclientprotocol/sdk";
 import { asLocalAdapter, type AgentIdentity, type AgentProfile } from "../agent-profile.js";
+import { AGENT_ADAPTER_VERSION } from "../agent-profile.js";
+import { manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 
 interface SeamAcpSessionIdRow {
@@ -26,6 +39,134 @@ interface CopilotTurnRow {
   user_message?: string | null;
   assistant_response?: string | null;
   timestamp?: string | number | null;
+}
+
+export interface CopilotCatalogProbeModel {
+  modelId: string;
+  displayName: string;
+  effortChoices: string[];
+  effortDefault: string;
+  priceCategory: string | null;
+}
+
+export interface CopilotCatalogProbe {
+  defaultModel: string;
+  models: CopilotCatalogProbeModel[];
+}
+
+function flattenSelectOptions(options: SessionConfigSelectOptions): SessionConfigSelectOption[] {
+  return (options as Array<SessionConfigSelectOption | SessionConfigSelectGroup>).flatMap((option) =>
+    "options" in option ? option.options : [option]
+  );
+}
+
+function catalogConfigOptions(value: unknown): SessionConfigOption[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is SessionConfigOption =>
+        Boolean(entry && typeof entry === "object" && "id" in entry))
+    : [];
+}
+
+function selectOption(options: SessionConfigOption[], id: string): Extract<SessionConfigOption, { type: "select" }> | undefined {
+  const option = options.find((entry) => entry.id === id);
+  return option?.type === "select" ? option : undefined;
+}
+
+function copilotPriceCategory(option: SessionConfigSelectOption): string | null {
+  const meta = (option as SessionConfigSelectOption & { _meta?: Record<string, unknown> })._meta;
+  return typeof meta?.copilotPriceCategory === "string" ? meta.copilotPriceCategory : null;
+}
+
+function probeTimeout<T>(ms: number, message: string): Promise<T> {
+  return new Promise((_resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    timer.unref?.();
+  });
+}
+
+/** Adapter-owned ACP collector for model-specific model/effort capabilities. */
+export async function probeCopilotCatalog(options: {
+  cliPath?: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+} = {}): Promise<CopilotCatalogProbe> {
+  const child = spawn(options.cliPath ?? "copilot", ["--acp"], {
+    cwd: options.cwd ?? process.cwd(),
+    env: options.env ?? process.env,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => { stderr = (stderr + chunk).slice(-4000); });
+  const died = new Promise<never>((_resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) =>
+      reject(new Error(`copilot ACP exited early (code=${code}, signal=${signal}): ${stderr.trim()}`))
+    );
+  });
+  const connection = new ClientSideConnection(
+    () => ({
+      async requestPermission(request) {
+        const option = request.options.find((entry) => entry.kind?.startsWith("allow_"));
+        return option
+          ? { outcome: { outcome: "selected" as const, optionId: option.optionId } }
+          : { outcome: { outcome: "cancelled" as const } };
+      },
+      async sessionUpdate() {},
+    } satisfies Client),
+    ndJsonStream(
+      Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
+      Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>
+    )
+  );
+  const timeoutMs = options.timeoutMs ?? 45_000;
+  let sessionId: string | undefined;
+  try {
+    await Promise.race([
+      connection.initialize({
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+      }),
+      died,
+      probeTimeout<void>(timeoutMs, "copilot ACP initialize timed out"),
+    ]);
+    const session = await Promise.race([
+      connection.newSession({ cwd: options.cwd ?? process.cwd(), mcpServers: [] }),
+      died,
+      probeTimeout<never>(timeoutMs, "copilot ACP session/new timed out"),
+    ]);
+    sessionId = session.sessionId;
+    const initial = catalogConfigOptions(session.configOptions);
+    const modelSelect = selectOption(initial, "model");
+    const models = modelSelect ? flattenSelectOptions(modelSelect.options) : [];
+    if (!models.length) throw new Error("copilot ACP advertised no model config options");
+    const rows: CopilotCatalogProbeModel[] = [];
+    for (const model of models) {
+      const responseOptions = model.value === modelSelect!.currentValue
+        ? initial
+        : catalogConfigOptions((await Promise.race([
+            connection.setSessionConfigOption({ sessionId, configId: "model", value: model.value }),
+            died,
+            probeTimeout<never>(timeoutMs, `copilot ACP model probe timed out for ${model.value}`),
+          ])).configOptions);
+      const effort = selectOption(responseOptions, "reasoning_effort");
+      const effortChoices = effort ? flattenSelectOptions(effort.options).map((entry) => entry.value) : [];
+      rows.push({
+        modelId: model.value,
+        displayName: model.name,
+        effortChoices,
+        effortDefault: effort?.currentValue && effortChoices.includes(effort.currentValue)
+          ? effort.currentValue
+          : "default",
+        priceCategory: copilotPriceCategory(model),
+      });
+    }
+    return { defaultModel: modelSelect!.currentValue, models: rows };
+  } finally {
+    if (sessionId) await connection.closeSession({ sessionId }).catch(() => undefined);
+    child.kill("SIGKILL");
+  }
 }
 
 /**
@@ -61,6 +202,8 @@ export function makeCopilotProfile(opts: {
    */
   configDir?: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
+  /** Test/embedding seam; production probes the profile's ACP process. */
+  catalogProbe?: () => Promise<CopilotCatalogProbe>;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "copilot";
   const globalMcpServers = opts.mcpServers ?? [];
@@ -68,11 +211,50 @@ export function makeCopilotProfile(opts: {
 
   let identityCache: AgentIdentity | null | undefined;
 
+  const probeEnvironment = (): NodeJS.ProcessEnv => {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (configDir) {
+      const token = readCopilotTokenSync(configDir);
+      if (token) env.COPILOT_GITHUB_TOKEN = token;
+    }
+    return env;
+  };
+
   return asLocalAdapter({
     id: opts.id ?? "copilot",
     displayName: opts.displayName ?? "GitHub Copilot",
     defaultModel: opts.defaultModel,
-    staticModels: opts.staticModels,
+    catalog: {
+      async fetch() {
+        const probe = opts.catalogProbe
+          ? await opts.catalogProbe()
+          : await probeCopilotCatalog({
+              cliPath: cli,
+              env: probeEnvironment(),
+              ...(configDir ? { cwd: configDir } : {}),
+            });
+        const candidate = await manifestCatalogSource({
+          provider: "github-copilot",
+          credentialProfile: configDir ?? "default",
+          defaultModel: probe.defaultModel || opts.defaultModel,
+          models: () => probe.models.map((model) => ({
+            modelId: model.modelId,
+            name: model.displayName,
+            effort: {
+              mechanism: model.effortChoices.length ? "configOption" : "none",
+              ...(model.effortChoices.length ? { configId: "reasoning_effort" } : {}),
+              choices: model.effortChoices.length ? model.effortChoices : ["default"],
+              selectionDefault: model.effortDefault,
+            },
+          })),
+          adapterVersion: AGENT_ADAPTER_VERSION,
+          applicationMode: "live",
+          source: "copilot-acp-config-options",
+        }).fetch();
+        candidate.cliVersion = await readCliVersion(cli);
+        return candidate;
+      },
+    },
     configDir,
     mcpServersAtSpawn: true,
     // Copilot exposes reasoning effort as an ACP config option (verified via
@@ -95,15 +277,9 @@ export function makeCopilotProfile(opts: {
       if (additionalMcpJson) {
         args.push("--additional-mcp-config", additionalMcpJson);
       }
-      const env: NodeJS.ProcessEnv = { ...process.env };
-      if (configDir) {
-        // --config-dir is not a supported CLI flag. Instead, read the OAuth
-        // token from the profile's config.json and inject it via
-        // COPILOT_GITHUB_TOKEN, which the CLI checks before the system
-        // credential store — giving us true per-profile auth isolation.
-        const token = readCopilotTokenSync(configDir);
-        if (token) env.COPILOT_GITHUB_TOKEN = token;
-      }
+      // --config-dir is not a supported CLI flag. The same credential-scoped
+      // environment is used by runtime spawn and catalog collection.
+      const env = probeEnvironment();
       return spawn(cli, args, {
         stdio: ["pipe", "pipe", "pipe"],
         env,

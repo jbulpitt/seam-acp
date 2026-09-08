@@ -16,6 +16,7 @@ import {
   type FastModeOutcome,
 } from "./fast-mode.js";
 import type { SessionConfigState, SessionRecord } from "./types.js";
+import type { CatalogBinding, ModelCatalogService } from "./model-catalog/service.js";
 
 export interface ConfigureThreadInput {
   agent?: string;
@@ -169,6 +170,7 @@ export interface ThreadSessionControlDeps {
       actor: { id: string | null; name: string | null };
     }): { ok: true; message: string; auditId: string } | { ok: false; error: string };
   };
+  modelCatalog: Pick<ModelCatalogService, "models" | "model" | "effortChoices" | "resolve">;
   /** Single naming funnel, injected by the Discord integration layer. */
   applyThreadName?: (record: SessionRecord) => Promise<unknown>;
 }
@@ -219,25 +221,44 @@ export class ThreadSessionControlService {
     if (input.model !== undefined && !requestedModel) {
       return { ok: false, error: "`model` must be a non-empty string." };
     }
-    const nextModel = requestedModel ?? (agentChanged ? profile.defaultModel : before.model.value);
-    if (!agentChanged && nextModel === before.model.value) {
+    const catalogDefault = this.deps.modelCatalog.models({
+      agentId: nextAgent,
+      location: before.location.value,
+    }).find((model) => model.default);
+    const requestedTargetModel = requestedModel ?? (agentChanged ? catalogDefault?.id : before.model.value);
+    if (!requestedTargetModel) {
+      return {
+        ok: false,
+        error: `Model catalog for ${nextAgent}@${before.location.value} is warming/unavailable.`,
+      };
+    }
+    if (!agentChanged && requestedTargetModel === before.model.value) {
       return {
         ok: false,
         error: "Migration requires a different agent or model; the requested target already matches.",
       };
     }
 
-    const models = await this.advertisedModels(profile, target, agentChanged);
+    const models = await this.advertisedModels(
+      profile,
+      target,
+      agentChanged,
+      { agentId: nextAgent, location: before.location.value }
+    );
     if (models.length === 0) {
       return {
         ok: false,
         error: `Agent "${nextAgent}" did not advertise a model catalog; refusing an unvalidated model.`,
       };
     }
-    if (!models.includes(nextModel)) {
+    const catalogModel = this.deps.modelCatalog.model(
+      { agentId: nextAgent, location: before.location.value },
+      requestedTargetModel
+    );
+    if (!catalogModel || !models.includes(catalogModel.id)) {
       return {
         ok: false,
-        error: `Model "${nextModel}" is not advertised by "${nextAgent}". Valid models: ${models.join(", ")}.`,
+        error: `Model "${requestedTargetModel}" is not advertised by "${nextAgent}". Valid models: ${models.join(", ")}.`,
       };
     }
 
@@ -246,12 +267,21 @@ export class ThreadSessionControlService {
       return { ok: false, error: "`effort` must be a non-empty string or `auto`." };
     }
 
+    const desiredEffort = requestedEffort === "auto"
+      ? catalogModel.effort.selectionDefault
+      : requestedEffort ?? catalogModel.effort.selectionDefault;
+    if (!catalogModel.effort.choices.some((choice) => choice.id === desiredEffort)) {
+      return {
+        ok: false,
+        error: `Effort "${desiredEffort}" is not supported for ${nextAgent}/${catalogModel.id}.`,
+      };
+    }
     return {
       ok: true,
       migration: {
         agent: nextAgent,
-        model: nextModel,
-        ...(requestedEffort ? { effort: requestedEffort } : {}),
+        model: catalogModel.id,
+        effort: desiredEffort,
         previousAgent: before.agent.value,
         previousModel: before.model.value,
         previousSessionId: target.acpSessionId,
@@ -283,10 +313,7 @@ export class ThreadSessionControlService {
     }
 
     const snapshot: SessionRecord = { ...current };
-    const stored = this.deps.store.readConfig(current);
-    const desiredEffort = prepared.effort === "auto"
-      ? undefined
-      : prepared.effort ?? normalizeStoredEffort(stored.reasoningEffort);
+    const desiredEffort = prepared.effort;
     const warnings: string[] = [];
 
     try {
@@ -295,7 +322,7 @@ export class ThreadSessionControlService {
         {
           ...(prepared.agent !== before.agent.value ? { agent: prepared.agent } : {}),
           model: prepared.model,
-          effort: null,
+          effort: desiredEffort ?? null,
         },
         { id: null, name: `seam-mcp:self:${current.channelRef}` }
       );
@@ -312,26 +339,6 @@ export class ThreadSessionControlService {
       }
 
       const forged = await this.forgeFreshSession(current.id);
-      const effortValues = forged.runtime.getConfigSelectValues("reasoning_effort");
-      let appliedEffort = "auto";
-      if (desiredEffort && effortValues.includes(desiredEffort)) {
-        await forged.runtime.setConfigOption("reasoning_effort", desiredEffort);
-        const effortApplied = this.deps.mutation.applySessionConfig(
-          forged.record,
-          { effort: desiredEffort },
-          { id: null, name: `seam-mcp:self:${current.channelRef}` },
-          { effortValues }
-        );
-        if (!effortApplied.ok) throw new Error(effortApplied.error);
-        warnings.push(...effortApplied.result.warnings);
-        appliedEffort = desiredEffort;
-      } else if (desiredEffort) {
-        warnings.push(
-          `Effort "${desiredEffort}" is not advertised for ${prepared.agent}/${prepared.model}; ` +
-            `using auto. Valid values: ${effortValues.length ? effortValues.join(", ") : "none"}.`
-        );
-      }
-
       const info = forged.runtime.getSessionInfo();
       if (!info?.sessionId) throw new Error("Fresh runtime did not report a session id.");
       const fresh = this.deps.store.get(current.id);
@@ -342,7 +349,7 @@ export class ThreadSessionControlService {
         record: fresh,
         agent: prepared.agent,
         model: prepared.model,
-        effort: appliedEffort,
+        effort: desiredEffort ?? "auto",
         newSessionId: info.sessionId,
         warnings,
       };
@@ -389,18 +396,35 @@ export class ThreadSessionControlService {
     if (input.model !== undefined && !requestedModel) {
       return { ok: false, error: "`model` must be a non-empty string." };
     }
-    const nextModel = requestedModel ?? (agentChanged ? profile.defaultModel : before.model.value);
-    const modelChanged = nextModel !== before.model.value;
+    const catalogDefault = this.deps.modelCatalog.models({
+      agentId: nextAgentId,
+      location: before.location.value,
+    }).find((model) => model.default);
+    const requestedTargetModel = requestedModel ?? (agentChanged ? catalogDefault?.id : before.model.value);
+    if (!requestedTargetModel) {
+      return {
+        ok: false,
+        error: `Model catalog for ${nextAgentId}@${before.location.value} is warming/unavailable.`,
+      };
+    }
 
     if (requestedModel) {
-      const models = await this.advertisedModels(profile, target, agentChanged);
+      const models = await this.advertisedModels(
+        profile,
+        target,
+        agentChanged,
+        { agentId: nextAgentId, location: before.location.value }
+      );
       if (models.length === 0) {
         return {
           ok: false,
           error: `Agent "${nextAgentId}" did not advertise a model catalog; refusing an unvalidated model.`,
         };
       }
-      if (!models.includes(requestedModel)) {
+      if (!this.deps.modelCatalog.model(
+        { agentId: nextAgentId, location: before.location.value },
+        requestedModel
+      )) {
         return {
           ok: false,
           error: `Model "${requestedModel}" is not advertised by "${nextAgentId}". Valid models: ${models.join(", ")}.`,
@@ -412,11 +436,26 @@ export class ThreadSessionControlService {
     if (input.effort !== undefined && !requestedEffort) {
       return { ok: false, error: "`effort` must be a non-empty string or `auto`." };
     }
-    const effortMechanism = profile.effort?.mechanism ?? "none";
-    const staticEffortValues = profile.effort?.levels ?? [];
+    const catalogModel = this.deps.modelCatalog.model(
+      { agentId: nextAgentId, location: before.location.value },
+      requestedTargetModel
+    );
+    if (!catalogModel) {
+      return {
+        ok: false,
+        error: `Model "${requestedTargetModel}" is unavailable in the cached catalog for ${nextAgentId}@${before.location.value}.`,
+      };
+    }
+    const nextModel = catalogModel.id;
+    const modelChanged = nextModel !== before.model.value;
+    const effortMechanism = catalogModel.effort.mechanism;
+    const staticEffortValues = catalogModel.effort.choices.map((choice) => choice.id);
     let desiredEffort = requestedEffort === "auto"
-      ? undefined
-      : requestedEffort ?? normalizeStoredEffort(before.effort.value ?? undefined);
+      ? catalogModel.effort.selectionDefault
+      : requestedEffort ??
+        ((modelChanged || agentChanged)
+          ? catalogModel?.effort.selectionDefault
+          : normalizeStoredEffort(before.effort.value ?? undefined));
     const requestedRole = input.role?.trim();
     const nextRole = input.role === undefined
       ? undefined
@@ -455,6 +494,7 @@ export class ThreadSessionControlService {
       previousAgentId,
       nextAgentId,
       modelChanged,
+      modelApplicationMode: catalogModel.applicationMode,
       fastModeChanged: fastModeNeedsFreshSession({
         nextFastMode,
         fastModeChanged,
@@ -465,15 +505,16 @@ export class ThreadSessionControlService {
     const effortTouched = input.effort !== undefined || modelChanged || agentChanged;
     if (
       desiredEffort &&
-      (effortMechanism === "none" ||
-        effortMechanism === "modelBaked" ||
+      (((effortMechanism === "none" || effortMechanism === "modelBaked") &&
+        desiredEffort !== catalogModel.effort.selectionDefault) ||
         !staticEffortValues.includes(desiredEffort))
     ) {
-      warnings.push(
-        `Effort "${desiredEffort}" is not supported for ${nextAgentId}/${nextModel}; ` +
-          `using auto. Valid values: ${staticEffortValues.length ? staticEffortValues.join(", ") : "none"}.`
-      );
-      desiredEffort = undefined;
+      return {
+        ok: false,
+        error:
+          `Effort "${desiredEffort}" is not supported for ${nextAgentId}/${nextModel}. ` +
+          `Valid values: ${staticEffortValues.length ? staticEffortValues.join(", ") : "none"}.`,
+      };
     }
 
     const beforeIdentity = identityFromDescription(before);
@@ -559,6 +600,14 @@ export class ThreadSessionControlService {
       runtime = forged.runtime;
       newSessionId = runtime.getSessionInfo()?.sessionId;
     } else if (
+      modelChanged && catalogModel.applicationMode === "reload"
+    ) {
+      await this.deps.router.invalidate(target.id, { clearAcpSession: false });
+      const current = this.deps.store.get(target.id);
+      if (!current) return { ok: false, error: "Target session disappeared while reloading model." };
+      runtime = await this.deps.router.getOrStartRuntime(current);
+      runtimeReloaded = true;
+    } else if (
       plannedChanges.effort.changed &&
       (effortMechanism === "meta" ||
         effortMechanism === "spawnArgs" ||
@@ -575,36 +624,40 @@ export class ThreadSessionControlService {
     } else {
       const current = this.deps.store.get(target.id) ?? target;
       runtime = await this.deps.router.getOrStartRuntime(current);
-      if (modelChanged) await runtime.setModel(nextModel);
+      if (modelChanged) {
+        const selection = this.deps.modelCatalog.resolve(
+          { agentId: nextAgentId, location: before.location.value },
+          { model: nextModel, effort: desiredEffort }
+        );
+        await runtime.setModel(selection.raw.model);
+      }
     }
 
     // Config-option agents may advertise a model-dependent subset. Validate
     // against the live session before claiming success. Claude never enters
     // this branch: its effort is `_meta` and was applied by the reload above.
     if (effortTouched && desiredEffort && effortMechanism === "configOption") {
-      const configId = profile.effort?.configId ?? "reasoning_effort";
+      const configId = catalogModel.effort.configId;
+      if (!configId) {
+        return { ok: false, error: `Catalog is missing the config id for ${nextAgentId}/${nextModel}.` };
+      }
+      const rawEffort = this.deps.modelCatalog.resolve(
+        { agentId: nextAgentId, location: before.location.value },
+        { model: nextModel, effort: desiredEffort }
+      ).raw.effort;
       const liveValues = runtime.getConfigSelectValues(configId);
-      if (liveValues.includes(desiredEffort)) {
+      if (!rawEffort || liveValues.includes(rawEffort)) {
         if (!reset.sessionReset || plannedChanges.effort.changed) {
-          await runtime.setConfigOption(configId, desiredEffort);
+          if (rawEffort) await runtime.setConfigOption(configId, rawEffort);
         }
       } else {
-        warnings.push(
-          `Effort "${desiredEffort}" is not advertised by the live ${nextAgentId}/${nextModel} session; ` +
-            `using auto. Valid values: ${liveValues.length ? liveValues.join(", ") : "none"}.`
-        );
-        desiredEffort = undefined;
-        const cleared = this.applyTargetIdentity(
-          this.deps.store.get(target.id) ?? target,
-          { effort: null },
-          actor
-        );
-        if (!cleared.ok) return cleared;
-        await this.deps.router.invalidate(target.id, { clearAcpSession: false });
-        const current = this.deps.store.get(target.id);
-        if (!current) return { ok: false, error: "Target session disappeared while clearing effort." };
-        runtime = await this.deps.router.getOrStartRuntime(current);
-        runtimeReloaded = true;
+        return {
+          ok: false,
+          error:
+            `Runtime/catalog drift: effort "${desiredEffort}" is not advertised by the live ` +
+            `${nextAgentId}/${nextModel} session. Valid runtime values: ` +
+            `${liveValues.length ? liveValues.join(", ") : "none"}.`,
+        };
       }
     }
 
@@ -765,16 +818,13 @@ export class ThreadSessionControlService {
   private async advertisedModels(
     profile: AgentProfile,
     target: SessionRecord,
-    agentChanged: boolean
+    agentChanged: boolean,
+    binding?: CatalogBinding
   ): Promise<string[]> {
-    if (profile.staticModels?.length) return profile.staticModels.map((model) => model.modelId);
-    if (profile.listPickerModels) {
-      const models = await profile.listPickerModels();
-      if (models.length) return models.map((model) => model.modelId);
-    }
-    if (agentChanged) return [];
-    const runtime = await this.deps.router.getOrStartRuntime(target);
-    return runtime.getSessionInfo()?.availableModels.map((model) => model.modelId) ?? [];
+    void profile;
+    void target;
+    void agentChanged;
+    return binding ? this.deps.modelCatalog.models(binding).map((model) => model.id) : [];
   }
 
   private async forgeFreshSession(

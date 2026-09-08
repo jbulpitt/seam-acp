@@ -13,6 +13,7 @@ import type { AgentProfile } from "@seam/adapters";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -38,9 +39,28 @@ function makeRecord(over: Partial<SessionRecord> = {}): SessionRecord {
 // A profile whose effort supports "high"/"low" — enough to exercise Trap 2.
 const claudeProfile = {
   id: "claude",
+  defaultModel: "gpt-5.4",
+  staticModels: [
+    "gpt-5.4", "gpt-5.6-sol", "claude-opus-4.8", "kimi-k3:cloud", "m", "same", "thread-model", "x",
+  ].map((modelId) => ({ modelId, name: modelId })),
   effort: { mechanism: "meta", levels: ["low", "high"] },
 } as unknown as AgentProfile;
-const profiles = new Map<string, AgentProfile>([["claude", claudeProfile]]);
+const codexProfile = {
+  id: "codex",
+  defaultModel: "gpt-5.6-sol",
+  staticModels: [{ modelId: "gpt-5.6-sol", name: "GPT-5.6 SOL" }],
+  effort: { mechanism: "configOption", levels: ["low", "high"] },
+} as unknown as AgentProfile;
+const ollamaProfile = {
+  id: "ollama-cloud",
+  defaultModel: "kimi-k3:cloud",
+  staticModels: [{ modelId: "kimi-k3:cloud", name: "Kimi K3" }],
+  effort: { mechanism: "none", levels: [] },
+} as unknown as AgentProfile;
+const profiles = new Map<string, AgentProfile>([
+  ["claude", claudeProfile], ["codex", codexProfile], ["ollama-cloud", ollamaProfile],
+]);
+const modelCatalog = fixtureModelCatalog([...profiles.values()]);
 
 /** describeConfig stub that re-derives effective values from the CURRENT stored
  *  config, so before/after genuinely differ across an apply. */
@@ -102,6 +122,7 @@ function makeService(over: {
     store,
     describeConfig,
     profiles,
+    modelCatalog,
     defaultModel: "gpt-5.4",
     presetsFile: over.presetsFile,
     tierCEnabled: over.tierCEnabled ?? false,
@@ -127,6 +148,22 @@ afterEach(() => {
 // -------------------------------------------------------------------------
 
 describe("session config mutation (Tier A)", () => {
+  it("preserves explicit effort when the normalized model is reselected as a no-op", () => {
+    const record = makeRecord({
+      configJson: JSON.stringify({
+        model: "gpt-5.4",
+        reasoningEffort: "high",
+        permissionPolicy: "ask",
+      }),
+    });
+    store.upsert(record);
+    const built = makeService().buildProposal(record, { session: { model: "gpt-5.4" } });
+    expect(built.ok).toBe(false);
+    if (built.ok) return;
+    expect(built.error).toContain("No effective change");
+    expect(store.readConfig(store.get(record.id)!).reasoningEffort).toBe("high");
+  });
+
   it("buildProposal computes a before→after diff and writes NOTHING (D5)", () => {
     const record = makeRecord();
     store.upsert(record);
@@ -137,6 +174,7 @@ describe("session config mutation (Tier A)", () => {
     if (!built.ok) return;
     expect(built.proposal.fields).toEqual([
       { label: "model", before: "gpt-5.4", after: "claude-opus-4.8" },
+      { label: "effort", before: "(none)", after: "default" },
     ]);
     // Nothing applied yet — the stored config is unchanged.
     expect(store.readConfig(store.get(record.id)!).model).toBe("gpt-5.4");

@@ -21,6 +21,7 @@ import {
 } from "../packages/core/src/core/dispatch/turn-resume.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -54,6 +55,7 @@ function makeOrch(opts?: {
   loadSession: ReturnType<typeof vi.fn>;
   newSession: ReturnType<typeof vi.fn>;
 } {
+  const catalogProfile = { id: "claude", defaultModel: "default" } as any;
   const prompts: string[] = [];
   const announced: string[] = [];
   const loadSession = opts?.loadSession ?? vi.fn(async () => ({ sessionId: "acp-recorded" }));
@@ -112,6 +114,7 @@ function makeOrch(opts?: {
       async editMessage() {},
       getThreadLiveState: opts?.getThreadLiveState ?? (async () => ({ locked: false, archived: false })),
     } as any,
+    modelCatalog: fixtureModelCatalog([catalogProfile]),
     router: router as any,
     store,
     renderer: {} as any,

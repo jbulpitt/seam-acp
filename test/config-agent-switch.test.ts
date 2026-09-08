@@ -11,6 +11,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import type { SessionConfigState, SessionRecord } from "../packages/core/src/core/types.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const ADMIN = "1487094572696867019";
@@ -138,10 +139,12 @@ function makeOrch(opts?: {
     threadPresets.set(id, preset);
   }
   const store = new SessionStore(path.join(dir, "seam.db"));
+  const modelCatalog = fixtureModelCatalog(profiles);
   const router = new SessionRouter({
     logger: silent,
     store,
     profiles,
+    modelCatalog,
     defaultAgentId: "claude",
     defaultModel: "claude-opus-5",
     defaultPermissionMode: "ask",
@@ -176,6 +179,7 @@ function makeOrch(opts?: {
     router,
     store,
     renderer: {} as any,
+    modelCatalog,
   });
   return { orch, router, store, presetsFile, channelPresets, threadPresets, sent };
 }
@@ -212,7 +216,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     // configJson.model to claude-opus-5. This dies if that overwrite returns.
     expect(cfg.model).toBe("gpt-5.6-sol");
     expect(cfg.lastContextUsage).toBeUndefined();
-    expect(cfg.reasoningEffort).toBe("high");
+    expect(cfg.reasoningEffort).toBe("default");
     expect(cfg.role).toBe("worker");
     expect(cfg.permissionPolicy).toBe("ask");
 
@@ -351,7 +355,7 @@ describe("/seam config agent — #178 session/overlay split-brain", () => {
     expect(cfg.role).toBe("worker");
     expect(threadPresets.get(THREAD)?.location).toBe("mac");
     expect(threadPresets.get(THREAD)?.agent?.value).toBe("claude");
-    expect(threadPresets.get(THREAD)?.model?.value).toBe("claude-opus-5");
+    expect(threadPresets.get(THREAD)?.model).toBeUndefined();
 
     const described = router.describeConfig(rec);
     const spawn = router.planRuntimeSpawn(rec);

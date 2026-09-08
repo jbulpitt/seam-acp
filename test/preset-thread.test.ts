@@ -11,6 +11,7 @@ import { formatThreadOrdinal as formatKeycap } from "../packages/core/src/platfo
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { Preset, SessionRecord } from "../packages/core/src/core/types.js";
 import type { ChannelRef } from "../packages/core/src/platforms/chat-adapter.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -153,8 +154,22 @@ function makeOrch(over?: {
   const sent: Array<{ id: string; text: string }> = [];
   const openingTurns: Array<{ id: string; prompt: string; authorId: string }> = [];
   const threadNames = over?.threadNames ?? new Map<string, string>();
+  const testProfiles = [
+    {
+      id: "grok",
+      defaultModel: "grok-4",
+      staticModels: [{ modelId: "grok-4", name: "Grok 4" }],
+      effort: { mechanism: "configOption", levels: ["low", "medium", "high"] },
+    },
+    {
+      id: "copilot",
+      defaultModel: "default-model",
+      staticModels: [{ modelId: "default-model", name: "Default" }],
+      effort: { mechanism: "none", levels: [] },
+    },
+  ] as any[];
   const router = {
-    listProfiles: () => [{ id: "grok" }, { id: "copilot" }],
+    listProfiles: () => testProfiles,
     describeConfig: (record: SessionRecord) => {
       const cfg = store.readConfig(store.get(record.id) ?? record);
       const role = cfg.role
@@ -195,18 +210,10 @@ function makeOrch(over?: {
       store.upsert(rec);
       return rec;
     },
-    getProfile: (id: string) => {
-      if (id === "grok") {
-        return {
-          id: "grok",
-          defaultModel: "grok-4",
-          effort: { levels: ["low", "medium", "high"] },
-        };
-      }
-      return { id, defaultModel: "default-model", effort: { levels: [] } };
-    },
+    getProfile: (id: string) => testProfiles.find((profile) => profile.id === id),
     invalidate: vi.fn(async () => {}),
   };
+  const modelCatalog = fixtureModelCatalog(router.listProfiles() as any);
   let createdSeq = 0;
   const createThread =
     over?.createThread ??
@@ -257,6 +264,7 @@ function makeOrch(over?: {
       },
     } as any,
     router: router as any,
+    modelCatalog,
     store: over?.listPresetsForProject
       ? new Proxy(store, {
           get(target, prop, receiver) {

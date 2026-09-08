@@ -13,6 +13,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
 import type { AgentProfile } from "@seam/adapters";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { scanWorkspaces } from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { LoopbackHost } from "../packages/core/src/core/loopback-host.js";
@@ -88,6 +89,7 @@ describe("default location is local (#86)", () => {
       logger: silent,
       store: stubStore(),
       profiles: [stubProfile("claude", [])],
+      modelCatalog: fixtureModelCatalog([stubProfile("claude", [])]),
       defaultAgentId: "claude",
       defaultModel: "opus",
       threadPresets: new Map(),
@@ -102,6 +104,7 @@ describe("default location is local (#86)", () => {
       logger: silent,
       store: stubStore(),
       profiles: [stubProfile("claude", [])],
+      modelCatalog: fixtureModelCatalog([stubProfile("claude", [])]),
       defaultAgentId: "claude",
       defaultModel: "opus",
       threadPresets,
@@ -124,6 +127,7 @@ describe("markSessionBridge is called on start when location is a bridge id (#84
       logger: silent,
       store: stubStore(),
       profiles: [stubProfile("claude", localSpawnCalls)],
+      modelCatalog: fixtureModelCatalog([stubProfile("claude", [])]),
       defaultAgentId: "claude",
       defaultModel: "opus",
       threadPresets,
@@ -155,6 +159,7 @@ describe("markSessionBridge is called on start when location is a bridge id (#84
       logger: silent,
       store: stubStore(),
       profiles: [stubProfile("claude", localSpawnCalls)],
+      modelCatalog: fixtureModelCatalog([stubProfile("claude", [])]),
       defaultAgentId: "claude",
       defaultModel: "opus",
       threadPresets: new Map(),

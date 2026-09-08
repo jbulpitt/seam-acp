@@ -11,7 +11,7 @@ describe("command-bus rpc allow-list", () => {
   it("accepts adapter methods without dev mode", () => {
     expect(isAllowedRpcMethod("readAttachment", { devMode: false })).toBe(true);
     expect(isAllowedRpcMethod("prepare", { devMode: false })).toBe(true);
-    expect(isAdapterRpcMethod("listPickerModels")).toBe(true);
+    expect(isAdapterRpcMethod("fetchModelCatalog")).toBe(true);
     expect(isAdapterRpcMethod("install")).toBe(true);
   });
 
@@ -38,18 +38,17 @@ describe("command-bus rpc allow-list", () => {
     ).rejects.toThrow(/unknown rpc method/);
   });
 
-  it("dispatches picker-model warming through the host adapter", async () => {
-    const models = [{ modelId: "gpt-5.6-sol", name: "Sol", contextLimit: 258_400 }];
-    const result = await dispatchBridgeRpc("listPickerModels", {}, "codex", {
+  it("dispatches catalog refresh through the host adapter boundary", async () => {
+    const candidate = { schemaVersion: 1, scope: { fingerprint: "f".repeat(64), provider: "openai" }, models: [], source: "test", adapterVersion: 1, fetchedAt: new Date().toISOString() };
+    const result = await dispatchBridgeRpc("fetchModelCatalog", {}, "codex", {
       adapters: new Map([["codex", {
-        staticModels: undefined,
-        listPickerModels: async () => models,
+        catalog: { fetch: async () => candidate },
       } as any]]),
       workspaceRoot: "/tmp",
       cwd: "/tmp",
       devMode: false,
     });
-    expect(result).toEqual(models);
+    expect(result).toEqual(candidate);
   });
 
   it("protocol version is 1", () => {

@@ -40,7 +40,7 @@ export interface ChoiceIngestOpts {
   waitMs?: number;
   bodyMax?: number;
   ratePerMin?: number;
-  defaultModel?: string;
+  defaultModel?: string | ((record: SessionRecord | null) => string | undefined);
   now?: () => number;
 }
 
@@ -57,7 +57,7 @@ export class ChoiceIngest {
   private readonly waitMs: number;
   private readonly bodyMax: number;
   private readonly ratePerMin: number;
-  private readonly defaultModel?: string;
+  private readonly defaultModel?: ChoiceIngestOpts["defaultModel"];
   private readonly now: () => number;
   private readonly hits = new Map<string, number[]>();
 
@@ -80,6 +80,12 @@ export class ChoiceIngest {
 
   ingestUrl(): string {
     return `${this.publicBase().replace(/\/+$/, "")}${INGEST_PATH}`;
+  }
+
+  private resolveDefaultModel(record?: SessionRecord | null): string | undefined {
+    return typeof this.defaultModel === "function"
+      ? this.defaultModel(record ?? null)
+      : this.defaultModel;
   }
 
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -226,7 +232,7 @@ export class ChoiceIngest {
         ? { cwd: this.authoringCwd(authoringSession) }
         : {}),
       destLive,
-      defaultModel: this.defaultModel,
+      defaultModel: this.resolveDefaultModel(authoringSession),
       source: "http",
       ...(card.ingestWrapper ? { wrapper: card.ingestWrapper } : {}),
       ...(studentId ? { untrustedStudentId: studentId } : {}),
@@ -312,7 +318,7 @@ export class ChoiceIngest {
       endpoint,
       payload,
       ...(studentId ? { untrustedStudentId: studentId } : {}),
-      defaultModel: this.defaultModel,
+      defaultModel: this.resolveDefaultModel(),
     });
     await this.enqueue(spec);
     const now = new Date().toISOString();

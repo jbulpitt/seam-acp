@@ -18,6 +18,7 @@
  */
 import { describe, it, expect, vi } from "vitest";
 import type { AgentProfile } from "@seam/adapters";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { CLAUDE_FAST_MODE, makeClaudeProfile } from "@seam/adapters";
 import { AgentRuntime } from "../packages/core/src/agents/agent-runtime.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
@@ -869,6 +870,7 @@ function ctrlHarness(opts: {
       agent: { value: current.agentId, source: "session config" },
       model: { value: cfg.model ?? "claude-opus-5", source: "session config" },
       effort: { value: cfg.reasoningEffort ?? null, source: "default" },
+      location: { value: "local", source: "default" },
       role: { value: null, source: "default" },
       disableThreadPrefix: { value: false, source: "default" },
       fastMode: { value: fastPreset, source: fastPreset ? "thread preset" : "default" },
@@ -876,6 +878,7 @@ function ctrlHarness(opts: {
   };
 
   const deps: ThreadSessionControlDeps = {
+    modelCatalog: fixtureModelCatalog([...byId.values()]),
     store: {
       get: (id) => records.get(id),
       readConfig: (v) => JSON.parse(v.configJson || "{}") as SessionConfigState,

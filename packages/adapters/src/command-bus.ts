@@ -14,7 +14,7 @@ export const ADAPTER_RPC_METHODS = [
   "prepare",
   "install",
   "spawn",
-  "listPickerModels",
+  "fetchModelCatalog",
   "listWorkspaces",
   "listSessions",
   "getTranscript",

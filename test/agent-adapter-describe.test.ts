@@ -26,10 +26,10 @@ const bareProfile = (defaultModel: string) =>
 
 describe("AgentAdapter.describe()", () => {
   it("uses the current adapter contract version", () => {
-    expect(AGENT_ADAPTER_VERSION).toBe(2);
+    expect(AGENT_ADAPTER_VERSION).toBe(3);
   });
 
-  it("claude reports meta effort and static models (with contextLimit)", () => {
+  it("keeps describe non-authoritative while Claude catalog owns full context data", async () => {
     const profile = makeClaudeProfile({
       defaultModel: "default",
       staticModels: [
@@ -41,9 +41,11 @@ describe("AgentAdapter.describe()", () => {
     expect(d.version).toBe(AGENT_ADAPTER_VERSION);
     expect(d.effort.mechanism).toBe("meta");
     expect(d.effort.levels).toEqual(["low", "medium", "high", "xhigh", "max"]);
-    expect(d.models).toEqual([
-      { modelId: "default", name: "Opus latest", contextLimit: 1_000_000 },
-      { modelId: "claude-sonnet-4-6", name: "Sonnet 4.6", contextLimit: 200_000 },
+    expect(d.models).toEqual([{ modelId: "default", name: "default" }]);
+    const catalog = await profile.catalog.fetch();
+    expect(catalog.models.map(({ id, displayName, context }) => ({ id, displayName, limit: context.effective }))).toEqual([
+      { id: "default", displayName: "Opus latest", limit: 1_000_000 },
+      { id: "claude-sonnet-4-6", displayName: "Sonnet 4.6", limit: null },
     ]);
   });
 
@@ -105,16 +107,16 @@ describe("AgentAdapter.describe()", () => {
     expect(d.effort.configId).toBe("reasoning_effort");
   });
 
-  it("grok reports spawnArgs so describe() round-trips the CLI-flag mechanism", () => {
-    const d = makeGrokProfile({
+  it("grok describe reports execution effort while catalog owns the model manifest", async () => {
+    const profile = makeGrokProfile({
       defaultModel: "grok-4.6",
       staticModels: [{ modelId: "grok-4.6", name: "Grok 4.6", contextLimit: 500_000 }],
-    }).describe();
+    });
+    const d = profile.describe();
     expect(d.effort.mechanism).toBe("spawnArgs");
     expect(d.effort.levels).toEqual(["low", "medium", "high", "xhigh", "max"]);
-    expect(d.models).toEqual([
-      { modelId: "grok-4.6", name: "Grok 4.6", contextLimit: 500_000 },
-    ]);
+    expect(d.models).toEqual([{ modelId: "grok-4.6", name: "grok-4.6" }]);
+    expect((await profile.catalog.fetch()).models[0]?.context.effective).toBe(500_000);
   });
 });
 

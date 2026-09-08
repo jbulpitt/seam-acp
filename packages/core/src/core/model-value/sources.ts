@@ -1,15 +1,4 @@
-import { spawn } from "node:child_process";
-import { Readable, Writable } from "node:stream";
-import {
-  ClientSideConnection,
-  PROTOCOL_VERSION,
-  ndJsonStream,
-  type Client,
-  type SessionConfigOption,
-  type SessionConfigSelectOption,
-  type SessionConfigSelectOptions,
-  type SessionConfigSelectGroup,
-} from "@agentclientprotocol/sdk";
+import { probeCopilotCatalog } from "@seam/adapters";
 import type { CopilotModelMetadata, CopilotPricing } from "./types.js";
 export {
   AA_MODELS_URL,
@@ -117,42 +106,6 @@ export async function fetchCopilotPricing(fetchImpl: FetchLike = fetch): Promise
   return parseCopilotPricingMarkdown(await response.text());
 }
 
-function flattenSelectOptions(options: SessionConfigSelectOptions): SessionConfigSelectOption[] {
-  return (options as Array<SessionConfigSelectOption | SessionConfigSelectGroup>).flatMap((option) =>
-    "options" in option ? option.options : [option]
-  );
-}
-
-function configOptions(value: unknown): SessionConfigOption[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter(
-    (entry): entry is SessionConfigOption => Boolean(entry && typeof entry === "object" && "id" in entry)
-  );
-}
-
-function modelOptions(options: SessionConfigOption[]): SessionConfigSelectOption[] {
-  const model = options.find((option) => option.id === "model");
-  return model?.type === "select" ? flattenSelectOptions(model.options) : [];
-}
-
-function effortValues(options: SessionConfigOption[]): string[] {
-  const effort = options.find((option) => option.id === "reasoning_effort");
-  if (effort?.type !== "select") return [];
-  return flattenSelectOptions(effort.options).map((entry) => entry.value);
-}
-
-function priceCategory(option: SessionConfigSelectOption): string | null {
-  const meta = (option as SessionConfigSelectOption & { _meta?: Record<string, unknown> })._meta;
-  return typeof meta?.copilotPriceCategory === "string" ? meta.copilotPriceCategory : null;
-}
-
-function timeout<T>(ms: number, message: string): Promise<T> {
-  return new Promise((_resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
-    timer.unref?.();
-  });
-}
-
 export interface CopilotProbeOptions {
   cliPath?: string;
   cwd?: string;
@@ -164,82 +117,11 @@ export interface CopilotProbeOptions {
 export async function fetchCopilotModelMetadata(
   options: CopilotProbeOptions = {}
 ): Promise<CopilotModelMetadata[]> {
-  const child = spawn(options.cliPath ?? "copilot", ["--acp"], {
-    cwd: options.cwd ?? process.cwd(),
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  let stderr = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk: string) => {
-    stderr = (stderr + chunk).slice(-4000);
-  });
-  const died = new Promise<never>((_resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code, signal) =>
-      reject(new Error(`copilot ACP exited early (code=${code}, signal=${signal}): ${stderr.trim()}`))
-    );
-  });
-  const writable = Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>;
-  const readable = Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>;
-  const client: Client = {
-    async requestPermission(request) {
-      const option = request.options.find((entry) => entry.kind?.startsWith("allow_"));
-      return option
-        ? { outcome: { outcome: "selected", optionId: option.optionId } }
-        : { outcome: { outcome: "cancelled" } };
-    },
-    async sessionUpdate() {},
-  };
-  const connection = new ClientSideConnection(() => client, ndJsonStream(writable, readable));
-  const timeoutMs = options.timeoutMs ?? 45_000;
-  let sessionId: string | undefined;
-  try {
-    await Promise.race([
-      connection.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
-      }),
-      died,
-      timeout<void>(timeoutMs, "copilot ACP initialize timed out"),
-    ]);
-    const session = await Promise.race([
-      connection.newSession({ cwd: options.cwd ?? process.cwd(), mcpServers: [] }),
-      died,
-      timeout<never>(timeoutMs, "copilot ACP session/new timed out"),
-    ]);
-    sessionId = session.sessionId;
-    const models = modelOptions(configOptions(session.configOptions));
-    if (models.length === 0) throw new Error("copilot ACP advertised no model config options");
-    const rows: CopilotModelMetadata[] = [];
-    for (const model of models) {
-      if (model.value === "auto") {
-        rows.push({
-          modelId: model.value,
-          displayName: model.name,
-          validEffortTiers: [],
-          priceCategory: priceCategory(model),
-        });
-        continue;
-      }
-      const response = await Promise.race([
-        connection.setSessionConfigOption({
-          sessionId,
-          configId: "model",
-          value: model.value,
-        }),
-        died,
-        timeout<never>(timeoutMs, `copilot ACP model probe timed out for ${model.value}`),
-      ]);
-      rows.push({
-        modelId: model.value,
-        displayName: model.name,
-        validEffortTiers: effortValues(configOptions(response.configOptions)),
-        priceCategory: priceCategory(model),
-      });
-    }
-    return rows;
-  } finally {
-    if (sessionId) await connection.closeSession({ sessionId }).catch(() => undefined);
-    child.kill("SIGKILL");
-  }
+  const result = await probeCopilotCatalog(options);
+  return result.models.map((model) => ({
+    modelId: model.modelId,
+    displayName: model.displayName,
+    validEffortTiers: model.effortChoices,
+    priceCategory: model.priceCategory,
+  }));
 }

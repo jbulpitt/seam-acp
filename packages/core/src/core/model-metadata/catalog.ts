@@ -1,4 +1,3 @@
-import type { AgentProfile } from "@seam/adapters";
 import { canonicalModelId, chooseAaVariant, modelAliasForId } from "./aliases.js";
 import type {
   AgentModelAvailability,
@@ -6,28 +5,6 @@ import type {
   MetadataSourceModel,
   ModelMetadata,
 } from "./types.js";
-
-export async function collectAgentModelCatalog(
-  profiles: ReadonlyArray<AgentProfile>
-): Promise<AgentModelAvailability[]> {
-  const rows: AgentModelAvailability[] = [];
-  for (const profile of profiles) {
-    let models = profile.describe().models;
-    if ((!profile.staticModels || profile.staticModels.length === 0) && profile.listPickerModels) {
-      models = await profile.listPickerModels();
-    }
-    for (const model of models) {
-      rows.push({
-        agentId: profile.id,
-        modelId: model.modelId,
-        name: model.name,
-        contextWindow: model.contextLimit ?? null,
-        vision: model.visionMode ? model.visionMode === "native" : null,
-      });
-    }
-  }
-  return rows;
-}
 
 export interface BuildModelMetadataResult {
   rows: ModelMetadata[];

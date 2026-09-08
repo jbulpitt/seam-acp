@@ -3,7 +3,8 @@ import { createReadStream } from "node:fs";
 import { readdir, stat, readFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import { asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import { manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import type { ContextUsage, ISessionManager, SessionSummary } from "../session-manager.js";
 
 /**
@@ -132,25 +133,49 @@ export function makeGrokProfile(opts: {
   /** Default model id for sessions (e.g. "grok-build-0.1"). */
   defaultModel: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
+  /** Optional live provider collector. It is invoked only by catalog refresh. */
+  discoverModels?: () => Promise<ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>>;
   /** Override the effort descriptor. Defaults to spawnArgs + the CLI levels. */
   effort?: AgentProfile["effort"];
   /** Custom environment variables to inject into the spawned process. */
   extraEnv?: Record<string, string>;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "grok";
+  const catalogEffort = opts.effort ?? {
+    mechanism: "spawnArgs" as const,
+    levels: ["low", "medium", "high", "xhigh", "max"],
+  };
 
   return asLocalAdapter({
     id: opts.id ?? "grok",
     displayName: opts.displayName ?? "Grok Build",
     defaultModel: opts.defaultModel,
-    staticModels: opts.staticModels,
+    catalog: {
+      async fetch() {
+        const discovered = opts.discoverModels ? await opts.discoverModels() : undefined;
+        if (opts.discoverModels && !discovered?.length) {
+          throw new Error("xAI catalog discovery returned no text models");
+        }
+        const candidate = await manifestCatalogSource({
+          provider: "xai",
+          defaultModel: opts.defaultModel,
+          models: () => discovered ?? opts.staticModels ?? [{ modelId: opts.defaultModel, name: opts.defaultModel }],
+          effort: {
+            mechanism: catalogEffort.mechanism,
+            ...(catalogEffort.configId ? { configId: catalogEffort.configId } : {}),
+            choices: catalogEffort.levels,
+          },
+          adapterVersion: AGENT_ADAPTER_VERSION,
+          source: discovered ? "xai-models-api" : "validated-manifest",
+        }).fetch();
+        candidate.cliVersion = await readCliVersion(cli);
+        return candidate;
+      },
+    },
     // Reasoning effort: CLI flag at spawn (`--reasoning-effort`). Without
     // mechanism "spawnArgs", SessionRouter treats grok as having no effort
     // and silently ignores channel/thread preset pins.
-    effort: opts.effort ?? {
-      mechanism: "spawnArgs",
-      levels: ["low", "medium", "high", "xhigh", "max"],
-    },
+    effort: catalogEffort,
     spawn(modelOverride?: string, effortOverride?: string) {
       const env: NodeJS.ProcessEnv = { ...process.env };
       if (opts.extraEnv) {

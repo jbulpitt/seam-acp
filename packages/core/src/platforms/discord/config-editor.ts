@@ -159,9 +159,12 @@ export interface ThreadConfigDraft {
 }
 
 export interface DraftAgentCapabilities {
-  staticModels?: ReadonlyArray<{ modelId: string }>;
-  effortMechanism?: string;
-  effortLevels?: ReadonlyArray<string>;
+  models?: ReadonlyArray<{
+    modelId: string;
+    effortMechanism: string;
+    effortLevels: ReadonlyArray<string>;
+    effortDefault: string;
+  }>;
 }
 
 export interface HubRenderContext {
@@ -1178,7 +1181,7 @@ function dropUnsupported(
   const warnings = [...draft.warnings];
   const overlay = { ...draft.overlay };
 
-  const models = caps?.staticModels?.map((m) => m.modelId);
+  const models = caps?.models?.map((m) => m.modelId);
   if (models && models.length > 0 && overlay.model && overlay.model !== null) {
     if (!models.includes(overlay.model)) {
       overlay.model = null;
@@ -1199,8 +1202,9 @@ function dropUnsupported(
     );
   }
 
-  const mechanism = caps?.effortMechanism ?? "none";
-  const levels = caps?.effortLevels ?? [];
+  const selectedModel = caps?.models?.find((model) => model.modelId === next.model);
+  const mechanism = selectedModel?.effortMechanism ?? "none";
+  const levels = selectedModel?.effortLevels ?? [];
   const effort = overlay.effort === undefined ? next.effort : overlay.effort;
   const unsupported =
     mechanism === "none" ||
@@ -1253,10 +1257,27 @@ export function applyPickerValue(
       overlay.location = explicit ? value.slice(at + 1) : null;
       break;
     }
-    case "model":
+    case "model": {
+      const currentModel = channelScope
+        ? overlay.channelModel === undefined
+          ? draft.snapshot.channelPins?.model ?? null
+          : overlay.channelModel
+        : effectiveAfterDraft(draft).model;
       if (channelScope) overlay.channelModel = inherit ? null : value;
       else overlay.model = inherit ? null : value;
+      if (inherit) {
+        if (channelScope) overlay.channelEffort = null;
+        else overlay.effort = null;
+      } else if (value !== currentModel) {
+        const agentId = effectiveAfterDraft({ ...draft, overlay }).agent;
+        const model = capsForAgent(agentId)?.models?.find((entry) => entry.modelId === value);
+        if (model) {
+          if (channelScope) overlay.channelEffort = model.effortDefault;
+          else overlay.effort = model.effortDefault;
+        }
+      }
       break;
+    }
     case "effort":
       if (channelScope) overlay.channelEffort = inherit ? null : value;
       else overlay.effort = inherit ? null : value;

@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
 import type { AgentProfile } from "@seam/adapters";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import * as adapters from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import {
@@ -78,10 +79,12 @@ function makeRecord(over: Partial<SessionRecord> = {}): SessionRecord {
 }
 
 function makeRouter(): SessionRouter {
+  const profiles = [stubProfile("claude")];
   return new SessionRouter({
     logger: silent,
     store: stubStore(),
-    profiles: [stubProfile("claude")],
+    profiles,
+    modelCatalog: fixtureModelCatalog(profiles),
     defaultAgentId: "claude",
     defaultModel: "opus",
     threadPresets: new Map(),

@@ -54,7 +54,8 @@ import {
   type SetSessionModeRequest,
   type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
-import { asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import { manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import {
   discoverAgyLs,
   subscribeToAgyStream,
@@ -325,34 +326,44 @@ export function makeAgyProfile(opts: {
   const mappingFile = opts.dataDir
     ? path.join(opts.dataDir, "agy-sessions.json")
     : LEGACY_MAPPING_FILE;
-  // Warm the model catalog cache in the background — first /seam model call
-  // will read the cached promise instead of paying the ~5s spawn cost inline.
-  void getCatalog(cli);
   return asLocalAdapter({
     id: "agy",
     displayName: "Antigravity",
     defaultModel,
-    staticModels: opts.staticModels,
-    async listPickerModels() {
-      if (opts.staticModels && opts.staticModels.length > 0) {
-        if (!catalogRowsPromise) return opts.staticModels;
-        const rows = await getCatalog(cli);
-        const limits = new Map(
-          rows.filter((row) => row.maxTokens).map((row) => [row.modelId, row.maxTokens])
-        );
-        return opts.staticModels.map((model) => {
-          const contextLimit = model.contextLimit ?? limits.get(model.modelId);
-          return contextLimit ? { ...model, contextLimit } : model;
-        });
-      }
-      const rows = await getCatalog(cli);
-      const rec = rows.filter((r) => r.recommended);
-      const rest = rows.filter((r) => !r.recommended);
-      return [...rec, ...rest].map((r) => ({
-        modelId: r.modelId,
-        name: r.displayName,
-        ...(r.maxTokens ? { contextLimit: r.maxTokens } : {}),
-      }));
+    catalog: {
+      async fetch() {
+        let models: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
+        if (opts.staticModels && opts.staticModels.length > 0) {
+          const rows = opts.staticModels.some((model) => !model.contextLimit)
+            ? await getCatalog(cli).catch(() => [])
+            : [];
+          const limits = new Map(
+            rows.filter((row) => row.maxTokens).map((row) => [row.modelId, row.maxTokens])
+          );
+          models = opts.staticModels.map((model) => {
+            const contextLimit = model.contextLimit ?? limits.get(model.modelId);
+            return contextLimit ? { ...model, contextLimit } : model;
+          });
+        } else {
+          const rows = await getCatalog(cli);
+          models = [...rows.filter((row) => row.recommended), ...rows.filter((row) => !row.recommended)]
+            .map((row) => ({
+              modelId: row.modelId,
+              name: row.displayName,
+              ...(row.maxTokens ? { contextLimit: row.maxTokens } : {}),
+            }));
+        }
+        const candidate = await manifestCatalogSource({
+          provider: "google-antigravity",
+          defaultModel,
+          models: () => models,
+          effort: { mechanism: "modelBaked", choices: ["default"] },
+          adapterVersion: AGENT_ADAPTER_VERSION,
+          source: opts.staticModels?.length ? "validated-manifest+agy-catalog" : "agy-language-server",
+        }).fetch();
+        candidate.cliVersion = await readCliVersion(cli);
+        return candidate;
+      },
     },
     // agy bakes effort into the model choice (high/med/low model variants) —
     // there is no separate reasoning-effort knob, so the picker is suppressed.

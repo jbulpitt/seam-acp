@@ -94,14 +94,14 @@ function draft(over: Partial<ThreadConfigDraft> = {}): ThreadConfigDraft {
 }
 
 const copilotCaps: DraftAgentCapabilities = {
-  staticModels: [{ modelId: "gpt-5.4" }, { modelId: "gpt-5.5" }],
-  effortMechanism: "none",
-  effortLevels: [],
+  models: ["gpt-5.4", "gpt-5.5"].map((modelId) => ({
+    modelId, effortMechanism: "none", effortLevels: ["default"], effortDefault: "default",
+  })),
 };
 const claudeCaps: DraftAgentCapabilities = {
-  staticModels: [{ modelId: "claude-opus-4.6" }, { modelId: "claude-sonnet-4.6" }],
-  effortMechanism: "meta",
-  effortLevels: ["low", "medium", "high"],
+  models: ["claude-opus-4.6", "claude-sonnet-4.6"].map((modelId) => ({
+    modelId, effortMechanism: "meta", effortLevels: ["low", "medium", "high"], effortDefault: "high",
+  })),
 };
 
 function caps(agentId: string): DraftAgentCapabilities | undefined {
@@ -572,6 +572,21 @@ describe("Save writes only dirty fields; Cancel writes nothing", () => {
 });
 
 describe("host/agent change drops unsupported model/effort (D13)", () => {
+  it("pins a new model's catalog default but preserves effort on a same-model no-op", () => {
+    const started = draft({
+      snapshot: snapshot({
+        agent: setting("claude", "session config"),
+        model: setting("claude-opus-4.6", "session config"),
+        effort: setting("low", "session config"),
+        withoutThread: { ...WITHOUT, agent: "claude", model: "claude-opus-4.6", effort: "low" },
+      }),
+    });
+    const unchanged = applyPickerValue(started, "model", "claude-opus-4.6", caps);
+    expect(unchanged.overlay.effort).toBeUndefined();
+    const changed = applyPickerValue(started, "model", "claude-sonnet-4.6", caps);
+    expect(changed.overlay).toMatchObject({ model: "claude-sonnet-4.6", effort: "high" });
+  });
+
   it("switching to an agent with effort.mechanism none clears drafted effort", () => {
     const started = draft({
       snapshot: snapshot({
@@ -602,11 +617,12 @@ describe("host/agent change drops unsupported model/effort (D13)", () => {
     const started = draft({
       snapshot: snapshot({
         agent: setting("claude", "session config"),
+        model: setting("claude-opus-4.6", "session config"),
         effort: setting("high", "thread preset"),
         location: setting("local", "default"),
         withoutThread: { ...WITHOUT, agent: "claude" },
       }),
-      overlay: { effort: "high" },
+      overlay: { model: "claude-opus-4.6", effort: "high" },
     });
     const next = applyPickerValue(started, "agent", "claude@mac", () => claudeCaps);
     expect(next.overlay.effort).toBe("high");

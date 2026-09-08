@@ -20,6 +20,7 @@ import {
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { Preset, SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -99,6 +100,7 @@ function makeOrch(opts: {
   chunks?: string[];
   error?: string;
 }): Orchestrator {
+  const catalogProfile = { id: "claude", defaultModel: "default" } as any;
   const chunks = opts.chunks ?? ["Hello ", "world"];
   const router = {
     listProfiles: () => [],
@@ -135,6 +137,7 @@ function makeOrch(opts: {
       threadPresets: {},
     } as any,
     adapter: opts.adapter as any,
+    modelCatalog: fixtureModelCatalog([catalogProfile]),
     router: router as any,
     store: store as any,
     renderer: {} as any,

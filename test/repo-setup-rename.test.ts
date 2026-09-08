@@ -14,6 +14,7 @@ import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import {
   applyPickerValue,
   isDirty,
@@ -121,6 +122,7 @@ function makeOrch() {
     logger: silent,
     store,
     profiles,
+    modelCatalog: fixtureModelCatalog(profiles),
     defaultAgentId: "copilot",
     defaultModel: "gpt-5.4",
     defaultPermissionMode: "ask",
@@ -179,6 +181,7 @@ function makeOrch() {
       SEAM_CONFIG_ADMIN_USER_IDS: new Set([ADMIN]),
     } as any,
     adapter: adapter as any,
+    modelCatalog: fixtureModelCatalog(profiles),
     router,
     store,
     renderer: { codeBlock: (value: string) => value } as any,

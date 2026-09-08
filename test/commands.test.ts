@@ -281,7 +281,7 @@ describe("/seam — everyday surface", () => {
     expect(queue?.options?.[0]?.required).toBe(true);
   });
 
-  it("enables autocomplete on bounded free-form ids (not on enum addChoices)", () => {
+  it("enables autocomplete on host/model-scoped free-form ids", () => {
     const json = seam();
     const config = slot(json, "config");
     const cfg = (name: string) => config?.options?.find((o) => o.name === name);
@@ -289,7 +289,7 @@ describe("/seam — everyday surface", () => {
     expect(cfg("agent")?.options?.find((o) => o.name === "id")?.autocomplete).toBe(true);
     expect(cfg("mode")?.options?.find((o) => o.name === "id")?.autocomplete).toBe(true);
     expect(cfg("repo")?.options?.find((o) => o.name === "path")?.autocomplete).toBe(true);
-    expect(cfg("effort")?.options?.find((o) => o.name === "level")?.autocomplete ?? false).toBe(false);
+    expect(cfg("effort")?.options?.find((o) => o.name === "level")?.autocomplete).toBe(true);
     expect(cfg("repo")?.options?.find((o) => o.name === "scope")?.autocomplete ?? false).toBe(false);
 
     const workflows = slot(json, "workflows");
@@ -320,9 +320,9 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(() => buildSeamAdminCommand().toJSON()).not.toThrow();
   });
 
-  it("registers exactly 10 top-level slots (3 subcommands + 7 groups)", () => {
+  it("registers exactly 11 top-level slots (3 subcommands + 8 groups)", () => {
     const json = admin();
-    expect(json.options?.length ?? 0).toBe(10);
+    expect(json.options?.length ?? 0).toBe(11);
     expect(json.options?.length ?? 0).toBeLessThanOrEqual(25);
   });
 
@@ -341,8 +341,18 @@ describe("/seamadmin — operator surface (#151)", () => {
       "bridge",
       "debug",
       "voice",
+      "catalog",
       "naming",
     ]);
+  });
+
+  it("registers the cache refresh operator surface", () => {
+    const catalog = slot(admin(), "catalog");
+    expect(catalog?.type).toBe(SUB_COMMAND_GROUP);
+    expect(leafNames(admin(), "catalog")).toEqual(["refresh"]);
+    const refresh = catalog?.options?.find((o) => o.name === "refresh");
+    expect(refresh?.options?.map((o) => o.name)).toEqual(["agent"]);
+    expect(refresh?.options?.[0]).toMatchObject({ required: true, autocomplete: true });
   });
 
   it("declares the exact ManageGuild permission and Guild-only context", () => {

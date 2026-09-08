@@ -439,6 +439,41 @@ describe("ModelCatalogService", () => {
     opened.store.close();
   });
 
+  it("does not let a stale peer's shared in-flight candidate roll back the active owner", async () => {
+    const opened = db();
+    const local = { agentId: "fake", location: "local" };
+    const remote = { agentId: "fake", location: "remote-a" };
+    let localIds = ["nebula", "a"];
+    let holdRace = false;
+    let release: (() => void) | undefined;
+    const fetch = vi.fn(async (binding: typeof local) => {
+      if (holdRace) await new Promise<void>((resolve) => { release = resolve; });
+      return candidate(binding.location === "local" ? localIds : ["nebula", "a"]);
+    });
+    const catalog = service({
+      store: opened.store,
+      fetch,
+      scope: () => candidate().scope,
+    });
+    await catalog.refresh(local);
+    await catalog.refresh(remote);
+    localIds = ["nebula", "b"];
+    await catalog.refresh(local);
+    expect(catalog.lookup(local)).toMatchObject({ state: "ready", snapshot: { generation: 2 } });
+
+    holdRace = true;
+    const staleFirst = catalog.refresh(remote);
+    const ownerWaiter = catalog.refresh(local);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    release?.();
+    expect(await staleFirst).toMatchObject({ result: "quarantined", generation: 2 });
+    expect(await ownerWaiter).toMatchObject({ result: "quarantined", generation: 2 });
+    expect(catalog.lookup(remote).state).toBe("drift");
+    expect(catalog.lookup(local)).toMatchObject({ state: "ready", snapshot: { generation: 2 } });
+    expect(catalog.models(local).map((entry) => entry.id)).toEqual(["nebula", "b"]);
+    opened.store.close();
+  });
+
   it("never moves generation backwards when content returns to an earlier checksum", async () => {
     const opened = db();
     let ids = ["nebula", "a"];

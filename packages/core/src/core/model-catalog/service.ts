@@ -60,13 +60,19 @@ export interface AvailableCatalogModel {
   generation: number;
 }
 
+interface FetchedCatalogCandidate {
+  candidate: AdapterCatalogCandidate;
+  /** Binding whose adapter actually performed the scope-shared provider work. */
+  fetchedBy: string;
+}
+
 const DEFAULT_REFRESH_CRON = "17 */6 * * *";
 
 export class ModelCatalogService {
   private readonly snapshots = new Map<string, StoredCatalogSnapshot>();
   private readonly observations = new Map<string, CatalogObservationRow>();
   private readonly inFlight = new Map<string, Promise<CatalogRefreshResult>>();
-  private readonly fetchInFlight = new Map<string, Promise<AdapterCatalogCandidate>>();
+  private readonly fetchInFlight = new Map<string, Promise<FetchedCatalogCandidate>>();
   private readonly collapseConfirmations = new Map<string, string>();
   private readonly publicationListeners = new Set<(event: CatalogPublication) => void>();
   private job?: Cron;
@@ -223,25 +229,25 @@ export class ModelCatalogService {
       return { ...base, ok: Boolean(prior), result: "unavailable", error };
     }
     try {
-      const candidate = await this.fetchCandidate(binding);
+      const { candidate, fetchedBy } = await this.fetchCandidate(binding);
       validateCandidate(candidate);
       const checksum = candidateChecksum(candidate);
       const desiredScope = trustworthyFingerprint(candidate.scope.fingerprint)
         ? `scope:${candidate.scope.fingerprint}` : `binding:${key}`;
       const activeForScope = this.snapshots.get(desiredScope);
-      const currentObservation = this.observations.get(key);
-      // A binding that last observed the active generation is allowed to move
-      // the canonical scope forward. Peer observations may legitimately lag
-      // by several generations; treating those as conflicts made A→B→C fail
-      // as soon as another host still reported A. A binding that did *not*
-      // observe the active generation may only catch up to it; a divergent
-      // candidate is quarantined until equivalence is re-established.
-      const ownsActive = Boolean(
-        activeForScope && currentObservation?.scopeKey === desiredScope &&
-        currentObservation.checksum === activeForScope.checksum &&
-        !currentObservation.drift
+      const sourceObservation = this.observations.get(fetchedBy);
+      // A candidate fetched by a binding that last observed the active
+      // generation may move the canonical scope forward. Fetch provenance is
+      // load-bearing when equivalent bindings share one in-flight operation:
+      // a stale peer winning that race must not let an active waiter legitimize
+      // its old candidate. Lagging peers may catch up to the active checksum;
+      // any other divergence is quarantined until equivalence is re-established.
+      const fetchedFromActive = Boolean(
+        activeForScope && sourceObservation?.scopeKey === desiredScope &&
+        sourceObservation.checksum === activeForScope.checksum &&
+        !sourceObservation.drift
       );
-      const drift = activeForScope && checksum !== activeForScope.checksum && !ownsActive
+      const drift = activeForScope && checksum !== activeForScope.checksum && !fetchedFromActive
         ? `catalog conflicts with active generation ${activeForScope.generation}; binding quarantined`
         : null;
       const scopeKey = desiredScope;
@@ -256,9 +262,15 @@ export class ModelCatalogService {
           sourceVersion: candidate.sourceVersion ?? null,
           source: candidate.source, fetchedAt: candidate.fetchedAt, drift,
         };
-        this.options.store.recordObservation(observation);
+        // Only the binding whose adapter actually produced a conflicting
+        // shared candidate is a drift observation. Waiters retain their last
+        // known-good observation; otherwise one stale source could poison
+        // every healthy binding that happened to join its in-flight fetch.
+        if (fetchedBy === key) {
+          this.options.store.recordObservation(observation);
+          this.observations.set(key, observation);
+        }
         this.options.store.recordAttempt({ bindingKey: key, attemptedAt, result: "quarantined", error: drift, source: candidate.source, candidateChecksum: checksum });
-        this.observations.set(key, observation);
         return {
           ...base,
           ...diff,
@@ -319,7 +331,7 @@ export class ModelCatalogService {
     }
   }
 
-  private async fetchCandidate(binding: CatalogBinding): Promise<AdapterCatalogCandidate> {
+  private async fetchCandidate(binding: CatalogBinding): Promise<FetchedCatalogCandidate> {
     // Scope discovery is adapter-owned and provider-work-free, so equivalent
     // cold bindings share the very first provider/CLI fetch as well as all
     // later refreshes. Old embedders without the scope hook conservatively use
@@ -340,7 +352,7 @@ export class ModelCatalogService {
           `adapter catalog scope changed during fetch (${declared.fingerprint} → ${candidate.scope.fingerprint})`
         );
       }
-      return candidate;
+      return { candidate, fetchedBy: bindingKey(binding) };
     }).finally(() => this.fetchInFlight.delete(scopeKey));
     this.fetchInFlight.set(scopeKey, promise);
     return promise;

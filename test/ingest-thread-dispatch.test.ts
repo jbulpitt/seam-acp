@@ -121,6 +121,7 @@ function makeOrch(
     mode?: RuntimeMode;
     timeoutSeconds?: number;
     profile?: { id: string; defaultModel: string };
+    catalogProfile?: { id: string; defaultModel: string };
     profileLocation?: string;
   } = {}
 ): {
@@ -177,7 +178,13 @@ function makeOrch(
     router: router as never,
     store: store as never,
     renderer: discordRenderer as never,
-    modelCatalog: fixtureModelCatalog(opts.profile ? [opts.profile as any] : []),
+    modelCatalog: fixtureModelCatalog(
+      opts.catalogProfile
+        ? [opts.catalogProfile as any]
+        : opts.profile
+          ? [opts.profile as any]
+          : []
+    ),
   });
   return { orch, ensured, runtimeFor, profileLookups };
 }
@@ -455,8 +462,8 @@ describe("#224 isolated ingest routing", () => {
     expect(ensured).toHaveLength(0);
   });
 
-  it("uses the frozen remote host for a remote-only isolated ingest", async () => {
-    const profile = { id: "remote-only", defaultModel: "outlier-model" };
+  it("uses the frozen remote host and current catalog default for a remote-only isolated ingest", async () => {
+    const profile = { id: "remote-only", defaultModel: "configured-old" };
     const row = endpoint({
       thread: null,
       location: "studio",
@@ -468,6 +475,7 @@ describe("#224 isolated ingest routing", () => {
     const spec = planEndpointDispatch({ endpoint: row, payload: "hi" });
     const { orch, profileLookups } = makeOrch(dataDir, store, {
       profile,
+      catalogProfile: { id: profile.id, defaultModel: "catalog-current" },
       profileLocation: "studio",
     });
     const marked: Array<{ sessionId: string; location: string }> = [];
@@ -490,7 +498,7 @@ describe("#224 isolated ingest routing", () => {
     expect(marked).toEqual([{ sessionId: `dispatch:${spec.id}`, location: "studio" }]);
     expect(injected).toMatchObject({
       location: "studio",
-      model: "outlier-model",
+      model: "catalog-current",
       strictModel: true,
     });
     expect(typeof injected.spawnFn).toBe("function");

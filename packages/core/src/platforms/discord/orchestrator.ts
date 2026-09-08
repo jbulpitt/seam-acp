@@ -5785,8 +5785,10 @@ export class Orchestrator {
     // had no submit_result. Reuse the authoring thread's token (do not mint).
     const agentId = opts.profile?.id ?? opts.record.agentId;
     const binding = { agentId, location: opts.workerLocation };
+    // An omitted model is deliberately resolved against the binding's current
+    // published default at fire time. AgentProfile.defaultModel is bootstrap
+    // input to adapter discovery, not a second runtime selection authority.
     const requestedModel = opts.model
-      ?? this.modelCatalog.model(binding, opts.profile?.defaultModel ?? "default")?.id
       ?? this.modelCatalog.model(binding, "default")?.id;
     if (!requestedModel) {
       throw new Error(`dispatch ${opts.spec.id}: catalog has no default model for ${agentId}@${opts.workerLocation}`);

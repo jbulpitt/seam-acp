@@ -21,6 +21,7 @@ describe("model catalog architecture", () => {
     expect(authorityConsumers).not.toMatch(/pickerModelsForProfile|listPickerModels|\.staticModels/);
     expect(authorityConsumers).not.toMatch(/getSessionInfo\(\)\?\.availableModels/);
     expect(authorityConsumers).not.toMatch(/profile\??\.effort/);
+    expect(authorityConsumers).not.toMatch(/profile\??\.defaultModel/);
     expect(source("packages/core/src/platforms/discord/orchestrator.ts")).not.toContain("this.config.DEFAULT_MODEL");
     expect(source("packages/adapters/src/command-bus.ts")).not.toContain("listPickerModels");
     expect(source("packages/adapters/src/command-bus.ts")).toContain("fetchModelCatalog");

@@ -70,20 +70,38 @@ describe("Codex model catalog", () => {
             display_name: "GPT-5.6-Sol",
             context_window: 272_000,
             effective_context_window_percent: 95,
+            input_modalities: ["text", "image"],
+            default_reasoning_level: "high",
+            supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }],
           },
           { slug: "no-window", display_name: "No Window" },
         ],
       }));
-      await expect(readCodexModelCatalog(cachePath)).resolves.toEqual([
-        { modelId: "gpt-5.6-sol", name: "GPT-5.6-Sol", contextLimit: 258_400 },
-        { modelId: "no-window", name: "No Window" },
+      await expect(readCodexModelCatalog(cachePath)).resolves.toMatchObject([
+        {
+          modelId: "gpt-5.6-sol",
+          name: "GPT-5.6-Sol",
+          context: { native: 272_000, maximum: 272_000, effective: 258_400 },
+          modalities: { input: ["text", "image"], output: ["text"] },
+          effort: {
+            mechanism: "configOption",
+            choices: ["low", "high"],
+            selectionDefault: "high",
+          },
+        },
+        {
+          modelId: "no-window",
+          name: "No Window",
+          context: { native: null, maximum: null, effective: null },
+          effort: { mechanism: "none", choices: ["default"] },
+        },
       ]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it("lets the Codex profile warm picker models without starting ACP", async () => {
+  it("lets the Codex adapter fetch its catalog without starting ACP", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-profile-models-"));
     try {
       const cachePath = path.join(root, "models_cache.json");
@@ -93,6 +111,8 @@ describe("Codex model catalog", () => {
           display_name: "GPT-5.6-Sol",
           context_window: 272_000,
           effective_context_window_percent: 95,
+          default_reasoning_level: "xhigh",
+          supported_reasoning_levels: [{ effort: "medium" }, { effort: "xhigh" }],
         }],
       }));
       const profile = makeCodexProfile({
@@ -100,9 +120,16 @@ describe("Codex model catalog", () => {
         sessionsRoot: path.join(root, "sessions"),
         modelsCachePath: cachePath,
       });
-      await expect(profile.listPickerModels?.()).resolves.toEqual([
-        { modelId: "gpt-5.6-sol", name: "GPT-5.6-Sol", contextLimit: 258_400 },
-      ]);
+      const catalog = await profile.catalog.fetch();
+      expect(catalog.models.map((model) => ({
+        modelId: model.id,
+        name: model.displayName,
+        contextLimit: model.context.effective,
+      }))).toEqual([{ modelId: "gpt-5.6-sol", name: "GPT-5.6-Sol", contextLimit: 258_400 }]);
+      expect(catalog.models[0]?.effort).toMatchObject({
+        choices: [{ id: "medium", raw: "medium" }, { id: "xhigh", raw: "xhigh" }],
+        selectionDefault: "xhigh",
+      });
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

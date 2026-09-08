@@ -4,13 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
 import { MessageFlags } from "discord.js";
-import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
+import { Orchestrator, presetModelSelectOptions } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { PARTICIPANT_CONFIG_REFUSAL } from "../packages/core/src/config.js";
 import { formatThreadOrdinal as formatKeycap } from "../packages/core/src/platforms/discord/thread-namer.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { Preset, SessionRecord } from "../packages/core/src/core/types.js";
 import type { ChannelRef } from "../packages/core/src/platforms/chat-adapter.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -22,6 +23,20 @@ let dir: string;
 let store: SessionStore;
 
 const now = "2026-08-22T00:00:00.000Z";
+
+describe("preset model catalog select", () => {
+  it("stays within Discord's 25-option cap and routes overflow to the full picker", () => {
+    const models = Array.from({ length: 25 }, (_, index) => ({
+      modelId: `model-${index}`,
+      name: `Model ${index}`,
+    }));
+    const options = presetModelSelectOptions(models, "model-24");
+    expect(options).toHaveLength(25);
+    expect(options.at(-1)?.value).toBe("__more__");
+    expect(options.some((option) => option.value === "model-24" && option.default)).toBe(true);
+    expect(presetModelSelectOptions(models.slice(0, 24), null)).toHaveLength(25);
+  });
+});
 
 function preset(over: Partial<Preset> & { name: string }): Preset {
   return {
@@ -142,7 +157,7 @@ function makeOrch(over?: {
   locked?: boolean;
   listPresetsForProject?: SessionStore["listPresetsForProject"];
   channelPresets?: Map<string, { locked?: boolean; role?: { value: string }; disableThreadPrefix?: { value: boolean } }>;
-  threadPresets?: Map<string, { role?: { value: string }; disableThreadPrefix?: { value: boolean } }>;
+  threadPresets?: Map<string, { location?: string; role?: { value: string }; disableThreadPrefix?: { value: boolean } }>;
   threadNames?: Map<string, string>;
   getThreadName?: (ch: ChannelRef) => Promise<string | undefined>;
   addThreadMember?: (ch: ChannelRef, userId: string) => Promise<void>;
@@ -152,9 +167,24 @@ function makeOrch(over?: {
   const addedMembers: Array<{ id: string; userId: string }> = [];
   const sent: Array<{ id: string; text: string }> = [];
   const openingTurns: Array<{ id: string; prompt: string; authorId: string }> = [];
+  const profileLookups: Array<{ id: string; location?: string }> = [];
   const threadNames = over?.threadNames ?? new Map<string, string>();
+  const testProfiles = [
+    {
+      id: "grok",
+      defaultModel: "grok-4",
+      staticModels: [{ modelId: "grok-4", name: "Grok 4" }],
+      effort: { mechanism: "configOption", levels: ["low", "medium", "high"] },
+    },
+    {
+      id: "copilot",
+      defaultModel: "default-model",
+      staticModels: [{ modelId: "default-model", name: "Default" }],
+      effort: { mechanism: "none", levels: [] },
+    },
+  ] as any[];
   const router = {
-    listProfiles: () => [{ id: "grok" }, { id: "copilot" }],
+    listProfiles: () => testProfiles,
     describeConfig: (record: SessionRecord) => {
       const cfg = store.readConfig(store.get(record.id) ?? record);
       const role = cfg.role
@@ -167,6 +197,12 @@ function makeOrch(over?: {
       return {
         agent: { value: (store.get(record.id) ?? record).agentId, source: "session config" },
         model: { value: cfg.model ?? "default-model", source: "session config" },
+        location: {
+          value: over?.threadPresets?.get(record.channelRef)?.location ?? "local",
+          source: over?.threadPresets?.get(record.channelRef)?.location
+            ? "thread preset"
+            : "default",
+        },
         role: { value: role, source: cfg.role ? "session config" : "default" },
         disableThreadPrefix: {
           value: disableThreadPrefix,
@@ -195,18 +231,13 @@ function makeOrch(over?: {
       store.upsert(rec);
       return rec;
     },
-    getProfile: (id: string) => {
-      if (id === "grok") {
-        return {
-          id: "grok",
-          defaultModel: "grok-4",
-          effort: { levels: ["low", "medium", "high"] },
-        };
-      }
-      return { id, defaultModel: "default-model", effort: { levels: [] } };
+    getProfile: (id: string, location?: string) => {
+      profileLookups.push({ id, location });
+      return testProfiles.find((profile) => profile.id === id);
     },
     invalidate: vi.fn(async () => {}),
   };
+  const modelCatalog = fixtureModelCatalog(router.listProfiles() as any);
   let createdSeq = 0;
   const createThread =
     over?.createThread ??
@@ -257,6 +288,7 @@ function makeOrch(over?: {
       },
     } as any,
     router: router as any,
+    modelCatalog,
     store: over?.listPresetsForProject
       ? new Proxy(store, {
           get(target, prop, receiver) {
@@ -277,7 +309,17 @@ function makeOrch(over?: {
     if (!prompt) return;
     openingTurns.push({ id: thread.id, prompt, authorId });
   };
-  return { orch, created, renamed, addedMembers, sent, router, threadNames, openingTurns };
+  return {
+    orch,
+    created,
+    renamed,
+    addedMembers,
+    sent,
+    router,
+    threadNames,
+    openingTurns,
+    profileLookups,
+  };
 }
 
 beforeEach(() => {
@@ -674,6 +716,20 @@ describe("/seam preset thread data-driven auto-name", () => {
 });
 
 describe("applyPresetToSession naming safety", () => {
+  it("resolves a preset agent against the thread's remote host", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok" }));
+    store.upsert(sessionRow({ id: "thread-1", agentId: "copilot" }));
+    const { orch, profileLookups } = makeOrch({
+      threadPresets: new Map([["thread-1", { location: "studio" }]]),
+    });
+    await (orch as any).applyPresetToSession(
+      { platform: "discord", id: "thread-1", parentId: "chan-1" },
+      store.get("discord:thread-1")!,
+      store.getPresetByNameScoped("reviewer", "chan-1")!
+    );
+    expect(profileLookups).toContainEqual({ id: "grok", location: "studio" });
+  });
+
   it("does not auto-manage an existing thread with no stored prefix", async () => {
     store.upsertPreset(preset({ name: "reviewer", agentId: "grok", role: "analyst" }));
     const names = new Map<string, string>([["thread-1", "seam"]]);

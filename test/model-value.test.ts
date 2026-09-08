@@ -192,6 +192,44 @@ describe("model value sources and ranking", () => {
 });
 
 describe("model value refresh and MCP cache surface", () => {
+  it("reruns when publication lands during an in-flight enrichment", async () => {
+    const store = tempStore();
+    let release: (() => void) | undefined;
+    let first = true;
+    const fetchAa = vi.fn(async () => {
+      if (first) {
+        first = false;
+        await new Promise<void>((resolve) => { release = resolve; });
+      }
+      return parseAaModels(aaPayload);
+    });
+    const fetchCopilot = vi.fn(async () => [{
+      modelId: "gpt-5.6-sol",
+      displayName: "GPT-5.6 Sol",
+      validEffortTiers: ["low", "high"],
+      priceCategory: "medium",
+    }]);
+    const manager = new ModelValueManager({
+      store,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any,
+      aaApiKey: "test",
+      inputTokens: 8000,
+      outputTokens: 2000,
+      fetchAa,
+      fetchPricing: async () => parseCopilotPricingMarkdown(pricingMarkdown),
+      fetchCopilot,
+    });
+    const running = manager.refresh();
+    await vi.waitFor(() => expect(fetchAa).toHaveBeenCalledOnce());
+    manager.refreshForCatalogGeneration();
+    release?.();
+    await running;
+    await manager.drain();
+    expect(fetchAa).toHaveBeenCalledTimes(2);
+    expect(fetchCopilot).toHaveBeenCalledTimes(2);
+    store.close();
+  });
+
   it("notifies render consumers only after a successful snapshot is durable", async () => {
     const store = tempStore();
     const logger = {

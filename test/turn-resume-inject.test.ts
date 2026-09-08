@@ -11,6 +11,7 @@ import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -80,6 +81,7 @@ afterEach(() => {
 
 describe("injectTurn isolated resumeSessionId", () => {
   it("calls loadSession(recorded) and never newSession", async () => {
+    const catalogProfile = { id: "claude", defaultModel: "m" } as any;
     const orch = new Orchestrator({
       logger: silent,
       config: {
@@ -90,9 +92,10 @@ describe("injectTurn isolated resumeSessionId", () => {
         SEAM_DISPATCH_STATUS_PANEL: false,
       } as any,
       adapter: {} as any,
+      modelCatalog: fixtureModelCatalog([catalogProfile]),
       router: {
         listProfiles: () => [],
-        describeConfig: () => ({}),
+        describeConfig: () => ({ location: { value: "local" } }),
         ensureSessionRecord: () => record(),
         getProfile: () => ({ id: "claude", sessionManager: { deleteSession: async () => {} } }),
         getOrStartRuntime: async () => {

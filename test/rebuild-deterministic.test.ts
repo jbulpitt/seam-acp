@@ -4,6 +4,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { MessagePageItem } from "../packages/core/src/core/message-reader.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const SEAM = "seam-bot";
@@ -80,6 +81,7 @@ function makeOrch(over?: {
     ...(over?.listPickerModels ? { listPickerModels: over.listPickerModels } : {}),
   };
   const profiles = { claude: profile, ...(over?.profiles ?? {}) };
+  const modelCatalog = fixtureModelCatalog(Object.values(profiles));
   const orch = new Orchestrator({
     logger: silent,
     config: {
@@ -121,11 +123,13 @@ function makeOrch(over?: {
           model: { value: model, source: thread?.model ? "thread preset" : "session config" },
           effort: { value: over?.cfg?.reasoningEffort ?? null, source: "session config" },
           cwd: { value: session.repoPath ?? "/repo", source: "session config" },
+          location: { value: "local", source: "default" },
         };
       },
       getProfile: (id: string) => profiles[id],
       invalidate: async () => {},
     } as any,
+    modelCatalog,
     ...(over?.getModelMetadata ? { getModelMetadata: over.getModelMetadata } : {}),
     store: {
       readConfig: () => over?.cfg ?? { model: "claude-opus-4.8", reasoningEffort: "high" },
@@ -331,7 +335,7 @@ describe("reconstructSessionFromDiscord", () => {
   it("fails closed when the destination window cannot be resolved", async () => {
     const t = makeOrch({
       cfg: { model: "mystery-model" },
-      staticModels: null,
+      staticModels: [{ modelId: "mystery-model", name: "Mystery" }],
     });
     await expect(
       (t.orch as any).reconstructSessionFromDiscord({
@@ -349,7 +353,7 @@ describe("reconstructSessionFromDiscord", () => {
     expect(t.panels.at(-1)?.description).toMatch(/cannot resolve a context window/);
   });
 
-  it("warms a cold Codex context window from the picker catalog", async () => {
+  it("uses a cold-loaded Codex context window from the operational catalog", async () => {
     let pickerCalls = 0;
     const t = makeOrch({
       recordOver: { agentId: "codex" },
@@ -358,7 +362,7 @@ describe("reconstructSessionFromDiscord", () => {
         codex: {
           id: "codex",
           defaultModel: "gpt-5.6-sol",
-          staticModels: [],
+          staticModels: [{ modelId: "gpt-5.6-sol", name: "GPT-5.6-Sol", contextLimit: 258_400 }],
           sessionManager: { name: "mgr" },
           listPickerModels: async () => {
             pickerCalls += 1;
@@ -377,7 +381,7 @@ describe("reconstructSessionFromDiscord", () => {
       observedAtStart: "acp-active",
       attachIntent: "attach",
     });
-    expect(pickerCalls).toBe(1);
+    expect(pickerCalls).toBe(0);
     expect(res.destination).toEqual({
       agentId: "codex",
       model: "gpt-5.6-sol",
@@ -386,7 +390,7 @@ describe("reconstructSessionFromDiscord", () => {
     expect(res.seed.budgetTokens).toBe(Math.floor(258_400 * 0.6));
   });
 
-  it("warms the catalog on the destination host before the controller profile", async () => {
+  it("uses the controller's durable remote-host catalog without bridge work at lookup time", async () => {
     let controllerCalls = 0;
     const hostCalls: Array<{ location: string; method: string; agentId: string }> = [];
     const t = makeOrch({
@@ -396,7 +400,7 @@ describe("reconstructSessionFromDiscord", () => {
         codex: {
           id: "codex",
           defaultModel: "gpt-5.6-sol",
-          staticModels: [],
+          staticModels: [{ modelId: "gpt-5.6-sol", name: "Sol", contextLimit: 258_400 }],
           sessionManager: { name: "mgr" },
           listPickerModels: async () => {
             controllerCalls += 1;
@@ -417,9 +421,7 @@ describe("reconstructSessionFromDiscord", () => {
       observedAtStart: "acp-active",
       attachIntent: "attach",
     });
-    expect(hostCalls).toEqual([
-      { location: "local", method: "listPickerModels", agentId: "codex" },
-    ]);
+    expect(hostCalls).toEqual([]);
     expect(controllerCalls).toBe(0);
     expect(res.destination.contextWindow).toBe(258_400);
   });
@@ -433,7 +435,7 @@ describe("reconstructSessionFromDiscord", () => {
         observedAtStart: "acp-active",
         attachIntent: "attach",
       })
-    ).rejects.toThrow(/cannot resolve a context window/);
+    ).rejects.toThrow(/warming\/unavailable/);
     expect(t.seedCalls).toHaveLength(0);
     expect(t.fetchCalls).toHaveLength(0);
   });
@@ -493,7 +495,7 @@ describe("reconstructSessionFromDiscord", () => {
         grok: {
           id: "grok",
           defaultModel: "grok-4.6",
-          staticModels: [{ modelId: "grok-4.6", name: "Grok 4.6 (500k)" }],
+          staticModels: [{ modelId: "grok-4.6", name: "Grok 4.6 (500k)", contextLimit: 500_000 }],
           sessionManager: { name: "mgr" },
         },
       },
@@ -522,7 +524,7 @@ describe("reconstructSessionFromDiscord", () => {
         grok: {
           id: "grok",
           defaultModel: "grok-4.6",
-          staticModels: [{ modelId: "grok-4.6", name: "Grok 4.6 (500k)" }],
+          staticModels: [{ modelId: "grok-4.6", name: "Grok 4.6 (500k)", contextLimit: 500_000 }],
           sessionManager: { name: "mgr" },
         },
       },
@@ -541,7 +543,7 @@ describe("reconstructSessionFromDiscord", () => {
     expect(t.seedCalls[0].model).toBe("grok-4.6");
   });
 
-  it("uses AGY listPickerModels contextLimit without seeding first", async () => {
+  it("uses AGY operational-catalog context without lookup-time probing", async () => {
     let pickerCalls = 0;
     const t = makeOrch({
       recordOver: { agentId: "agy" },
@@ -550,7 +552,7 @@ describe("reconstructSessionFromDiscord", () => {
         agy: {
           id: "agy",
           defaultModel: "gemini-3.8-flash-high",
-          staticModels: [{ modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash High" }],
+          staticModels: [{ modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash High", contextLimit: 1_048_576 }],
           sessionManager: { name: "mgr" },
           listPickerModels: async () => {
             pickerCalls += 1;
@@ -567,7 +569,7 @@ describe("reconstructSessionFromDiscord", () => {
       observedAtStart: "acp-active",
       attachIntent: "attach",
     });
-    expect(pickerCalls).toBe(1);
+    expect(pickerCalls).toBe(0);
     expect(res.destination.contextWindow).toBe(1_048_576);
     expect(res.seed.budgetTokens).toBe(Math.floor(1_048_576 * 0.6));
   });
@@ -644,6 +646,7 @@ describe("reconstructSessionFromDiscord", () => {
         model: { value: "claude-opus-4.8", source: "session config" },
         effort: { value: "high", source: "session config" },
         cwd: { value: "/repo", source: "session config" },
+        location: { value: "local", source: "default" },
         statusCardStyle: { value: "simple", source: "session config" },
       }),
     });

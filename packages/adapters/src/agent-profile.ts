@@ -3,12 +3,13 @@ import type { Readable as NodeReadable, Writable as NodeWritable } from "node:st
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { ContextUsage, ISessionManager, SessionSummary } from "./session-manager.js";
 import type { FastModeDescriptor } from "./fast-mode.js";
+import type { AdapterCatalogCandidate, AdapterCatalogSource } from "./model-catalog.js";
 
 /**
  * Adapter contract version advertised by in-process local agents via
  * `describe()`. Bumped when the §4 surface itself changes (not per agent).
  */
-export const AGENT_ADAPTER_VERSION = 2;
+export const AGENT_ADAPTER_VERSION = 4;
 
 /** How an agent exposes reasoning effort. See `AgentAdapter.effort`. */
 export type EffortMechanism =
@@ -105,18 +106,8 @@ export interface AgentAdapter {
   /** Default model id this agent should use unless the session overrides it. */
   readonly defaultModel: string;
 
-  /**
-   * Optional static list of models to use for this profile. When provided,
-   * these override any models advertised dynamically by the agent via ACP.
-   */
-  readonly staticModels?: ReadonlyArray<AdapterModel>;
-
-  /**
-   * Optional async model list for pickers that must not spawn an ACP session
-   * (preset builder). Prefer `staticModels` when non-empty. Agy uses this to
-   * return its cached language-server catalog.
-   */
-  listPickerModels?(): Promise<ReadonlyArray<AdapterModel>>;
+  /** Required operational model/capability source and portable selection codec. */
+  readonly catalog: AdapterCatalogSource;
 
   /**
    * If true, the agent's host has network restrictions that block Discord
@@ -291,48 +282,20 @@ export type AgentProfileCore = Omit<
 
 /**
  * Fill the §4 surface on an in-process profile: `describe()` snapshots
- * models + effort (including `mechanism`), session verbs / `usage` /
+ * identity + legacy summary effort, session verbs / `usage` /
  * `writeAttachment` delegate to `sessionManager` when present, and the
  * remaining methods are safe no-ops.
  */
-/** Models for a Discord picker that must not start an ACP session. */
-export async function pickerModelsForProfile(
-  profile:
-    | {
-        staticModels?: ReadonlyArray<AdapterModel>;
-        listPickerModels?: () => Promise<ReadonlyArray<AdapterModel>>;
-      }
-    | null
-    | undefined,
-  cap = 24
-): Promise<ReadonlyArray<AdapterModel>> {
-  if (!profile) return [];
-  if (profile.staticModels && profile.staticModels.length > 0) {
-    return profile.staticModels.slice(0, cap);
-  }
-  if (typeof profile.listPickerModels === "function") {
-    try {
-      return (await profile.listPickerModels()).slice(0, cap);
-    } catch {
-      return [];
-    }
-  }
-  return [];
-}
-
 export function asLocalAdapter(core: AgentProfileCore): AgentAdapter {
   const adapter: AgentAdapter = {
     ...core,
     describe(): AdapterDescribe {
-      const models: AdapterModel[] =
-        adapter.staticModels && adapter.staticModels.length > 0
-          ? adapter.staticModels.map((m) => ({
-              modelId: m.modelId,
-              name: m.name,
-              ...(m.contextLimit != null ? { contextLimit: m.contextLimit } : {}),
-              ...(m.visionMode != null ? { visionMode: m.visionMode } : {}),
-            }))
-          : [{ modelId: adapter.defaultModel, name: adapter.defaultModel }];
+      // Host inventory is not an operational model authority. The catalog RPC
+      // carries the complete normalized set; describe keeps one compatibility
+      // row for older bridges that only render an agent summary.
+      const models: AdapterModel[] = [
+        { modelId: adapter.defaultModel, name: adapter.defaultModel },
+      ];
       const effort: EffortDescriptor = adapter.effort
         ? {
             mechanism: adapter.effort.mechanism,
@@ -404,6 +367,37 @@ export function asLocalAdapter(core: AgentProfileCore): AgentAdapter {
     },
   };
   return adapter;
+}
+
+/**
+ * Controller-side runtime descriptor for an adapter that exists only on a
+ * remote bridge. The bridge owns process creation and catalog collection; this
+ * object supplies the generic ACP client with the cached model/effort contract
+ * without pretending the controller can spawn the agent locally.
+ */
+export function asRemoteCatalogAdapter(
+  id: string,
+  candidate: AdapterCatalogCandidate
+): AgentAdapter {
+  const defaultModel = candidate.models.find((model) => model.default) ?? candidate.models[0];
+  if (!defaultModel) throw new Error(`remote catalog for ${id} has no models`);
+  return asLocalAdapter({
+    id,
+    displayName: id,
+    defaultModel: defaultModel.runtimeId,
+    catalog: {
+      scope: () => candidate.scope,
+      fetch: async () => candidate,
+    },
+    effort: {
+      mechanism: defaultModel.effort.mechanism,
+      ...(defaultModel.effort.configId ? { configId: defaultModel.effort.configId } : {}),
+      levels: defaultModel.effort.choices.map((choice) => choice.id),
+    },
+    spawn(): never {
+      throw new Error(`remote-only agent ${id} cannot be spawned on the controller`);
+    },
+  });
 }
 
 /** Identity of the account a profile is authenticated as. */

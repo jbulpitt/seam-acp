@@ -1,6 +1,6 @@
 import path from "node:path";
 import { AgentRuntime } from "../agents/agent-runtime.js";
-import type { AgentProfile } from "@seam/adapters";
+import { asRemoteCatalogAdapter, type AgentProfile } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore } from "./session-store.js";
 import type { SessionRecord, PermissionPolicyMode, StatusCardStyle } from "./types.js";
@@ -11,6 +11,8 @@ import type { ChannelPreset, ThreadPreset } from "../config.js";
 import { buildProjectMcpServers } from "../mcp.js";
 import { parkedAgentMessage } from "./parked-agents.js";
 import { retiredAgentMessage } from "./retired-agents.js";
+import type { ModelCatalogService } from "./model-catalog/service.js";
+import type { CatalogEffort } from "@seam/adapters";
 
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
 import type {
@@ -28,6 +30,8 @@ import {
   spawnRemoteSlot,
   type MuxHandle,
 } from "./remote-spawn.js";
+import { bindingKey } from "./model-catalog/service.js";
+import { isLocalLocation } from "./location.js";
 
 /**
  * Wiring for the per-session seam-MCP surface. The token identifies the
@@ -65,6 +69,7 @@ export interface RuntimeSpawnPlan {
   profile: AgentProfile;
   model: string;
   effort?: string;
+  effortDescriptor?: CatalogEffort;
   /** Claude Fast mode (#37). Only ever true when the profile declares Fast —
    *  the live session's advertised options are still the final authority. */
   fastMode: boolean;
@@ -200,6 +205,13 @@ export interface ConfigDescription {
    * omits `location`. Always a ResolvedSetting so config_describe can show it.
    */
   location: ResolvedSetting<string>;
+  /** Operational catalog provenance used by this effective selection. */
+  catalog: {
+    state: "ready" | "stale" | "warming" | "drift";
+    generation: number | null;
+    source: string | null;
+    fetchedAt: string | null;
+  };
   /**
    * Preamble riders (#90). Channel and thread riders STACK (channel first,
    * then thread) — they are not a single-winner overlay. `describeConfig`
@@ -258,8 +270,9 @@ export class SessionRouter {
   private readonly logger: Logger;
   private readonly store: SessionStore;
   private readonly profileById: Map<string, AgentProfile>;
+  private readonly remoteProfiles = new Map<string, { generation: number; profile: AgentProfile }>();
+  private readonly modelCatalog: ModelCatalogService;
   private readonly defaultAgentId: string;
-  private readonly defaultModel: string;
   private readonly defaultPermissionMode: PermissionPolicyMode;
   private readonly mcpServers: McpServer[];
   private readonly seamMcp?: SeamMcpWiring;
@@ -296,6 +309,7 @@ export class SessionRouter {
     logger: Logger;
     store: SessionStore;
     profiles: AgentProfile[];
+    modelCatalog: ModelCatalogService;
     defaultAgentId: string;
     defaultModel: string;
     defaultPermissionMode?: PermissionPolicyMode;
@@ -324,8 +338,8 @@ export class SessionRouter {
     this.logger = opts.logger.child({ comp: "session-router" });
     this.store = opts.store;
     this.profileById = new Map(opts.profiles.map((p) => [p.id, p]));
+    this.modelCatalog = opts.modelCatalog;
     this.defaultAgentId = opts.defaultAgentId;
-    this.defaultModel = opts.defaultModel;
     this.defaultPermissionMode = opts.defaultPermissionMode ?? "ask";
     this.mcpServers = opts.mcpServers ?? [];
     this.seamMcp = opts.seamMcp;
@@ -385,9 +399,19 @@ export class SessionRouter {
     return [...this.profileById.values()];
   }
 
-  /** Look up a registered profile by id, or undefined if not found. */
-  getProfile(id: string): AgentProfile | undefined {
-    return this.profileById.get(id);
+  /** Look up a local profile or synthesize a cache-backed remote-only one. */
+  getProfile(id: string, location = "local"): AgentProfile | undefined {
+    const local = this.profileById.get(id);
+    if (local || isLocalLocation(location)) return local;
+    const binding = { agentId: id, location };
+    const lookup = this.modelCatalog.lookup(binding);
+    if (!lookup.snapshot || lookup.state === "drift") return undefined;
+    const key = bindingKey(binding);
+    const cached = this.remoteProfiles.get(key);
+    if (cached?.generation === lookup.snapshot.generation) return cached.profile;
+    const profile = asRemoteCatalogAdapter(id, lookup.snapshot.candidate);
+    this.remoteProfiles.set(key, { generation: lookup.snapshot.generation, profile });
+    return profile;
   }
 
   /** Parked-select copy when ollama-cloud is disabled, else null. */
@@ -439,14 +463,23 @@ export class SessionRouter {
         ? { value: chan.agent.value, source: "channel preset" }
         : { value: record.agentId, source: "session config" };
 
-    // model — preset.model ?? cfg.model ?? defaultModel.
+    const locationValue = resolveThreadLocation(
+      { threadPresets: this.threadPresets },
+      record.channelRef
+    );
+    const catalogDefault = this.modelCatalog.model(
+      { agentId: agent.value, location: locationValue },
+      "default"
+    )?.id ?? "default";
+
+    // model — preset.model ?? cfg.model ?? catalog-designated default.
     const model: ResolvedSetting<string> = thread?.model
       ? { value: thread.model.value, source: "thread preset" }
       : chan?.model
         ? { value: chan.model.value, source: "channel preset" }
         : cfg.model
           ? { value: cfg.model, source: "session config" }
-          : { value: this.defaultModel, source: "default" };
+          : { value: catalogDefault, source: "default" };
 
     const sessionRole = normalizeRole(cfg.role);
     const threadRole = normalizeRole(thread?.role?.value);
@@ -462,7 +495,10 @@ export class SessionRouter {
     // effort — a preset effort only wins if the RESOLVED agent supports that
     // exact level; otherwise it is dropped and cfg.reasoningEffort applies
     // (Trap 2). Mirrors startRuntime's `presetEffortUsable` gate exactly.
-    const profile = this.profileById.get(agent.value);
+    const catalogEfforts = this.modelCatalog.effortChoices(
+      { agentId: agent.value, location: locationValue },
+      model.value
+    );
     const presetEffort = thread?.effort ?? chan?.effort;
     const presetEffortSource: ConfigLayer | undefined = thread?.effort
       ? "thread preset"
@@ -473,9 +509,7 @@ export class SessionRouter {
     const presetEffortUsable = !!(
       presetEffort?.value &&
       !presetEffortAuto &&
-      profile?.effort &&
-      profile.effort.mechanism !== "none" &&
-      profile.effort.levels.includes(presetEffort.value)
+      catalogEfforts.includes(presetEffort.value)
     );
     let effort: ResolvedSetting<string | null>;
     let effortIgnoredNote: string | undefined;
@@ -544,13 +578,19 @@ export class SessionRouter {
         ? { value: thread.ttsStyle, source: "thread preset" }
         : { value: "neutral", source: "default" };
 
-    const locationValue = resolveThreadLocation(
-      { threadPresets: this.threadPresets },
-      record.channelRef
-    );
     const location: ResolvedSetting<string> = thread?.location
       ? { value: locationValue, source: "thread preset" }
       : { value: locationValue, source: "default" };
+    const catalogLookup = this.modelCatalog.lookup({
+      agentId: agent.value,
+      location: locationValue,
+    });
+    const catalog = {
+      state: catalogLookup.state,
+      generation: catalogLookup?.snapshot?.generation ?? null,
+      source: catalogLookup?.snapshot?.candidate.source ?? null,
+      fetchedAt: catalogLookup?.snapshot?.candidate.fetchedAt ?? null,
+    };
 
     const rider: { channel?: string; thread?: string } = {
       ...(chan?.rider?.value ? { channel: chan.rider.value } : {}),
@@ -600,6 +640,7 @@ export class SessionRouter {
       ttsPace,
       ttsStyle,
       location,
+      catalog,
       rider,
       statusCardStyle,
       simpleCardGif,
@@ -637,10 +678,13 @@ export class SessionRouter {
       opts.parentRef ?? undefined,
       opts.channelRef
     );
-    const cfg = defaultSessionConfig(
-      preset.model?.value ?? this.defaultModel,
-      this.defaultPermissionMode
+    const agentId = preset.agent?.value ?? this.defaultAgentId;
+    const location = resolveThreadLocation(
+      { threadPresets: this.threadPresets },
+      opts.channelRef
     );
+    const catalogDefault = this.modelCatalog.model({ agentId, location }, "default")?.id ?? "default";
+    const cfg = defaultSessionConfig(preset.model?.value ?? catalogDefault, this.defaultPermissionMode);
     const now = new Date().toISOString();
     // We don't yet know the ACP session id — it will be filled in by the
     // first runtime start. Store an empty marker for now. `opts.cwd` is the
@@ -651,7 +695,7 @@ export class SessionRouter {
       platform: opts.platform,
       channelRef: opts.channelRef,
       parentRef: opts.parentRef ?? null,
-      agentId: preset.agent?.value ?? this.defaultAgentId,
+      agentId,
       acpSessionId: "",
       repoPath: null,
       configJson: JSON.stringify(cfg),
@@ -916,7 +960,7 @@ export class SessionRouter {
    * remote spawn path. `startRuntime` is the only production caller.
    */
   planRuntimeSpawn(record: SessionRecord): RuntimeSpawnPlan {
-    this.bindRecordLocation(record);
+    const location = this.bindRecordLocation(record);
     const preset = resolveChannelPreset(
       { channelPresets: this.channelPresets, threadPresets: this.threadPresets },
       record.parentRef ?? undefined,
@@ -924,7 +968,7 @@ export class SessionRouter {
     );
 
     const agentId = preset.agent?.value ?? record.agentId;
-    const profile = this.profileById.get(agentId);
+    const profile = this.getProfile(agentId, location);
     if (!profile) {
       // #220 / #12: a parked or retired agent gets a message that names the
       // state and the fix. We deliberately do NOT substitute the default
@@ -938,7 +982,12 @@ export class SessionRouter {
       );
     }
     const cfg = this.store.readConfig(record);
-    const model = preset.model?.value ?? cfg.model ?? this.defaultModel;
+    const selectedModel = preset.model?.value ?? cfg.model ??
+      this.modelCatalog.model({ agentId, location }, "default")?.id ?? "default";
+    const catalogEfforts = this.modelCatalog.effortChoices(
+      { agentId, location },
+      selectedModel
+    );
     // Only honor a preset effort if this agent actually supports that level —
     // e.g. a channel preset might set "medium" but the locked agent has no
     // effort concept at all, in which case we silently fall back instead of
@@ -947,14 +996,19 @@ export class SessionRouter {
     const presetEffortUsable =
       preset.effort?.value &&
       !presetEffortAuto &&
-      profile.effort &&
-      profile.effort.mechanism !== "none" &&
-      profile.effort.levels.includes(preset.effort.value);
-    const effort = presetEffortAuto
+      catalogEfforts.includes(preset.effort.value);
+    const selectedEffort = presetEffortAuto
       ? undefined
       : presetEffortUsable
         ? preset.effort!.value
         : cfg.reasoningEffort;
+    const catalogSelection = this.modelCatalog.resolve(
+      { agentId, location },
+      { model: selectedModel, effort: selectedEffort }
+    );
+    const model = catalogSelection.raw.model;
+    const effort = catalogSelection.raw.effort;
+    const effortDescriptor = catalogSelection.model.effort;
     const described = this.describeConfig(record);
     const cwd = described.cwd.value;
     // #37: never request Fast from an agent that has no such concept — that
@@ -1011,7 +1065,18 @@ export class SessionRouter {
         });
     }
 
-    return { agentId, profile, model, effort, fastMode, cwd, mcpServers, remote, spawnChild };
+    return {
+      agentId,
+      profile,
+      model,
+      effort,
+      ...(effortDescriptor ? { effortDescriptor } : {}),
+      fastMode,
+      cwd,
+      mcpServers,
+      remote,
+      spawnChild,
+    };
   }
 
   /**
@@ -1040,13 +1105,14 @@ export class SessionRouter {
     // whatever's in CHANNEL_PRESETS_FILE wins, regardless of what's in the
     // DB. See resolveChannelPreset in config.ts.
     const plan = this.planRuntimeSpawn(record);
-    const { profile, model, effort, fastMode, cwd, mcpServers } = plan;
+    const { profile, model, effort, effortDescriptor, fastMode, cwd, mcpServers } = plan;
 
     const runtime = new AgentRuntime({
       profile,
       logger: this.logger.child({ session: record.id }),
       mcpServers,
       spawnFn: plan.spawnChild,
+      ...(effortDescriptor ? { effortDescriptor } : {}),
       onDead: () => {
         // Involuntary death — #76: leave turn markers intact. This is an
         // interruption, not a cancellation. Recovery reattaches on the next

@@ -5,10 +5,12 @@ import crypto from "node:crypto";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import {
   asLocalAdapter,
+  AGENT_ADAPTER_VERSION,
   type AdapterModel,
   type AgentIdentity,
   type AgentProfile,
 } from "../agent-profile.js";
+import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 import { CLAUDE_FAST_MODE } from "../fast-mode.js";
 
@@ -126,22 +128,51 @@ export function makeClaudeProfile(opts: {
   const thinkingDisplay = opts.thinkingDisplay;
 
   let identityCache: AgentIdentity | null | undefined;
+  const catalogModels = opts.staticModels
+    ? withClaudeContextLimits(opts.staticModels)
+    : [{ modelId: opts.defaultModel, name: opts.defaultModel }];
+  const catalogEffort = opts.effort ?? {
+    mechanism: "meta" as const,
+    levels: ["low", "medium", "high", "xhigh", "max"],
+  };
 
   return asLocalAdapter({
     id: opts.id ?? "claude",
     displayName: opts.displayName ?? "Anthropic Claude",
     ...(opts.brand ? { brand: opts.brand } : {}),
     defaultModel: opts.defaultModel,
-    // Stamp each picker entry with its canonical contextLimit so the
-    // orchestrator's staticModels→modelContextFloor path (used by every other
-    // agent) also seeds the Claude display window.
-    staticModels: opts.staticModels
-      ? withClaudeContextLimits(opts.staticModels)
-      : undefined,
+    catalog: {
+      scope: () => manifestCatalogScope({
+        provider: opts.directAnthropic ? "anthropic" : (opts.brand ?? "claude-compatible"),
+        backend: opts.extraEnv?.CLAUDE_CODE_USE_VERTEX === "1" ? "vertex" : opts.extraEnv?.ANTHROPIC_BASE_URL,
+        credentialProfile: configDir ?? "default",
+        project: opts.extraEnv?.ANTHROPIC_VERTEX_PROJECT_ID,
+        region: opts.extraEnv?.CLOUD_ML_REGION,
+      }),
+      async fetch() {
+        const candidate = await manifestCatalogSource({
+          provider: opts.directAnthropic ? "anthropic" : (opts.brand ?? "claude-compatible"),
+          backend: opts.extraEnv?.CLAUDE_CODE_USE_VERTEX === "1" ? "vertex" : opts.extraEnv?.ANTHROPIC_BASE_URL,
+          credentialProfile: configDir ?? "default",
+          project: opts.extraEnv?.ANTHROPIC_VERTEX_PROJECT_ID,
+          region: opts.extraEnv?.CLOUD_ML_REGION,
+          defaultModel: opts.defaultModel,
+          models: () => catalogModels,
+          effort: {
+            mechanism: catalogEffort.mechanism,
+            ...(catalogEffort.configId ? { configId: catalogEffort.configId } : {}),
+            choices: catalogEffort.levels,
+          },
+          adapterVersion: AGENT_ADAPTER_VERSION,
+        }).fetch();
+        candidate.cliVersion = await readCliVersion(cli);
+        return candidate;
+      },
+    },
     configDir,
     // Effort is applied via `_meta.claudeCode.options.effort` in newSessionMeta.
     // Overridable for non-Anthropic backends (e.g. Ollama → mechanism "none").
-    effort: opts.effort ?? { mechanism: "meta", levels: ["low", "medium", "high", "xhigh", "max"] },
+    effort: catalogEffort,
     // Fast mode (#37) is a **direct-Anthropic** serving mode: upstream reports
     // `not_first_party` for Vertex / Bedrock / Foundry, and an Anthropic-compat
     // endpoint (Z.ai, Ollama Cloud) has no such concept at all.

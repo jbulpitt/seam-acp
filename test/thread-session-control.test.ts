@@ -11,6 +11,7 @@ import {
 } from "../packages/core/src/core/thread-session-control.js";
 import type { ConfigDescription } from "../packages/core/src/core/session-router.js";
 import type { SessionConfigState, SessionRecord } from "../packages/core/src/core/types.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 function record(over: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -56,6 +57,7 @@ function description(value: SessionRecord, defaults: Map<string, string>): Confi
       value: cfg.disableThreadPrefix === true,
       source: cfg.disableThreadPrefix === true ? "session config" : "default",
     },
+    location: { value: "local", source: "default" },
   } as ConfigDescription;
 }
 
@@ -137,7 +139,8 @@ function harness(opts: {
         const selected = byProfile.get(current.agentId)!;
         const runtime = makeRuntime(
           sessionId,
-          selected.staticModels?.map((entry) => entry.modelId) ?? [],
+          (selected as AgentProfile & { staticModels?: Array<{ modelId: string }> }).staticModels
+            ?.map((entry) => entry.modelId) ?? [],
           opts.efforts ?? ["low", "high"]
         );
         // Keep the fake's effective model represented in persistence like the
@@ -185,6 +188,7 @@ function harness(opts: {
         };
       },
     },
+    modelCatalog: fixtureModelCatalog(profiles),
     applyThreadName,
   };
 
@@ -204,16 +208,21 @@ function harness(opts: {
 
 describe("detectSessionReset", () => {
   it.each([
-    ["claude", "codex", false, true, "agent-switch"],
-    ["claude", "claude", true, false, undefined],
-    ["copilot", "copilot", true, false, undefined],
-    ["codex", "codex", true, true, "model-switch"],
-    ["ollama-cloud", "ollama-cloud", true, true, "model-switch"],
-    ["codex", "codex", false, false, undefined],
+    ["claude", "codex", false, undefined, true, "agent-switch"],
+    ["claude", "claude", true, "reload", false, undefined],
+    ["copilot", "copilot", true, "live", false, undefined],
+    ["codex", "codex", true, "freshSession", true, "model-switch"],
+    ["ollama-cloud", "ollama-cloud", true, "freshSession", true, "model-switch"],
+    ["codex", "codex", false, "freshSession", false, undefined],
   ])(
     "%s -> %s (modelChanged=%s) resets=%s",
-    (previousAgentId, nextAgentId, modelChanged, expected, reason) => {
-      expect(detectSessionReset({ previousAgentId, nextAgentId, modelChanged })).toEqual({
+    (previousAgentId, nextAgentId, modelChanged, modelApplicationMode, expected, reason) => {
+      expect(detectSessionReset({
+        previousAgentId,
+        nextAgentId,
+        modelChanged,
+        modelApplicationMode: modelApplicationMode as "live" | "reload" | "freshSession" | undefined,
+      })).toEqual({
         sessionReset: expected,
         ...(reason ? { resetReason: reason } : {}),
       });
@@ -253,29 +262,38 @@ describe("ThreadSessionControlService", () => {
 
     expect(result).toMatchObject({
       ok: true,
-      applied: { model: "gpt-new", effort: "low" },
+      applied: { model: "gpt-new", effort: "default" },
       sessionReset: true,
       resetReason: "model-switch",
       newSessionId: "session-new-1",
       runtimeReloaded: false,
     });
     expect(h.invalidated).toEqual([h.target.id]);
-    expect(h.overlays).toEqual([{ model: "gpt-new", effort: "low" }]);
+    expect(h.overlays).toEqual([{ model: "gpt-new", effort: "default" }]);
   });
 
-  it("falls back to auto without sending an unsupported effort", async () => {
+  it("fails closed instead of claiming an unsupported effort was applied", async () => {
     const h = harness({ efforts: ["low"] });
     const result = await h.service.configure(h.caller, h.target, { effort: "ultra" });
 
-    expect(result).toMatchObject({
-      ok: true,
-      applied: { agent: "claude", model: "claude-old", effort: "auto" },
-      sessionReset: false,
-      runtimeReloaded: true,
+    expect(result).toMatchObject({ ok: false });
+    expect(!result.ok && result.error).toContain("not supported");
+    expect(h.runtimes).toEqual([]);
+    expect(h.overlays).toEqual([]);
+  });
+
+  it("refuses runtime/catalog drift when live config options contradict the catalog", async () => {
+    const h = harness({
+      target: record({
+        agentId: "codex",
+        configJson: JSON.stringify({ model: "gpt-old", reasoningEffort: "low" }),
+      }),
+      efforts: ["low"],
     });
-    expect(result.ok && result.warnings.join(" ")).toContain("using auto");
-    expect(h.runtimes[0]!.optionCalls).toEqual([]);
-    expect(h.overlays).toEqual([{ effort: "auto" }]);
+    const result = await h.service.configure(h.caller, h.target, { effort: "high" });
+    expect(result).toMatchObject({ ok: false });
+    expect(!result.ok && result.error).toContain("Runtime/catalog drift");
+    expect(h.runtimes[0]?.optionCalls).toEqual([]);
   });
 
   it("agent switches always reset and default the model to the new profile", async () => {
@@ -284,13 +302,13 @@ describe("ThreadSessionControlService", () => {
 
     expect(result).toMatchObject({
       ok: true,
-      applied: { agent: "codex", model: "gpt-old", effort: "low" },
+      applied: { agent: "codex", model: "gpt-old", effort: "default" },
       sessionReset: true,
       resetReason: "agent-switch",
       newSessionId: "session-new-1",
       runtimeReloaded: false,
     });
-    expect(h.overlays[0]).toEqual({ agent: "codex", model: "gpt-old", effort: "low" });
+    expect(h.overlays[0]).toEqual({ agent: "codex", model: "gpt-old", effort: "default" });
   });
 
   it("returns an exact no-change identity without touching the runtime", async () => {
@@ -418,10 +436,9 @@ describe("ThreadSessionControlService", () => {
     });
     expect(h.invalidated).toEqual([h.target.id]);
     expect(h.mutations).toEqual([
-      { agent: "codex", model: "gpt-new", effort: null },
-      { effort: "high" },
+      { agent: "codex", model: "gpt-new", effort: "high" },
     ]);
-    expect(h.runtimes[0]!.optionCalls).toEqual([["reasoning_effort", "high"]]);
+    expect(h.runtimes[0]!.optionCalls).toEqual([]);
     expect(h.applyThreadName).toHaveBeenCalledOnce();
   });
 

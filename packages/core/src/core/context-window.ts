@@ -2,16 +2,10 @@
  * Authoritative, agent-agnostic context-window resolution (#209).
  *
  * Rebuild (and any other context-budget consumer) must use this instead of
- * reading raw session columns or a single staticModels entry. A cosmetic
+ * reading raw session columns or adapter/UI inventories. A cosmetic
  * picker label is never parsed for a token count, and a missing exact-model
  * match never borrows another model's window or a generic 200K default.
  */
-import { lookupClaudeNativeContextWindow } from "@seam/adapters";
-import {
-  GROK_STATIC_MODELS,
-  OLLAMA_CLOUD_STATIC_MODELS,
-  ZAI_STATIC_MODELS,
-} from "../config.js";
 import {
   ReconstructionUnavailableError,
   reconstructionBudgetTokens,
@@ -19,18 +13,12 @@ import {
 
 export type ContextWindowSourceId =
   | "live-usage"
-  | "static-profile"
-  | "adapter-descriptor"
-  | "picker-catalog"
-  | "curated-catalog"
+  | "operational-catalog"
   | "model-metadata";
 
 const SOURCE_ORDER: readonly ContextWindowSourceId[] = [
   "live-usage",
-  "static-profile",
-  "adapter-descriptor",
-  "picker-catalog",
-  "curated-catalog",
+  "operational-catalog",
   "model-metadata",
 ];
 
@@ -55,17 +43,9 @@ export interface ContextWindowResolveInput {
   /** Profile default, used only to look up catalogs when `model` is `"default"`. */
   defaultModel?: string;
   lastContextUsage?: { model: string; size: number };
-  staticModels?: ReadonlyArray<ContextWindowModel>;
-  adapterModels?: ReadonlyArray<ContextWindowModel>;
-  pickerModels?: ReadonlyArray<ContextWindowModel>;
+  catalogModels?: ReadonlyArray<ContextWindowModel>;
   /** Exact-id window from the durable model-metadata catalog. */
   metadataWindow?: number | null;
-  /**
-   * Extra curated exact-id tables. Combined with the built-in Grok / Z.ai /
-   * Ollama Cloud / Claude native tables unless `includeBuiltInCurated` is false.
-   */
-  curatedLimits?: ReadonlyArray<ContextWindowModel>;
-  includeBuiltInCurated?: boolean;
 }
 
 export function enrichModelListWithKnownLimits<T extends ContextWindowModel>(
@@ -82,14 +62,6 @@ export function enrichModelListWithKnownLimits<T extends ContextWindowModel>(
     const limit = byId.get(model.modelId);
     return limit ? { ...model, contextLimit: limit } : model;
   });
-}
-
-export function builtInCuratedContextLimits(): ContextWindowModel[] {
-  return [
-    ...GROK_STATIC_MODELS,
-    ...ZAI_STATIC_MODELS,
-    ...OLLAMA_CLOUD_STATIC_MODELS,
-  ].filter((model) => model.contextLimit && model.contextLimit > 0);
 }
 
 function exactLimit(
@@ -112,24 +84,6 @@ function catalogLookupIds(model: string, defaultModel?: string): string[] {
   return ids;
 }
 
-function isClaudeFamily(agentId: string): boolean {
-  return agentId === "claude" || agentId.startsWith("claude-");
-}
-
-function curatedLimitFor(
-  agentId: string,
-  modelId: string,
-  tables: ReadonlyArray<ContextWindowModel>
-): number | undefined {
-  const fromTable = exactLimit(modelId, tables);
-  if (fromTable) return fromTable;
-  if (modelId === "default" && !isClaudeFamily(agentId)) return undefined;
-  if (isClaudeFamily(agentId) || modelId.startsWith("claude-") || modelId === "default") {
-    return lookupClaudeNativeContextWindow(modelId);
-  }
-  return undefined;
-}
-
 export function resolveContextWindow(input: ContextWindowResolveInput): ContextWindowResolution {
   const agentId = input.agentId;
   const model = input.model;
@@ -141,10 +95,6 @@ export function resolveContextWindow(input: ContextWindowResolveInput): ContextW
 
   const sourcesChecked: ContextWindowSourceId[] = [];
   const lookupIds = catalogLookupIds(model, input.defaultModel);
-  const includeCurated = input.includeBuiltInCurated !== false;
-  const curated = includeCurated
-    ? [...builtInCuratedContextLimits(), ...(input.curatedLimits ?? [])]
-    : (input.curatedLimits ?? []);
 
   const take = (source: ContextWindowSourceId, window: number | undefined): ContextWindowResolution | undefined => {
     sourcesChecked.push(source);
@@ -184,14 +134,8 @@ export function resolveContextWindow(input: ContextWindowResolveInput): ContextW
     return take(source, window);
   };
 
-  const fromStatic = firstHit("static-profile", (id) => exactLimit(id, input.staticModels));
-  if (fromStatic) return fromStatic;
-  const fromAdapter = firstHit("adapter-descriptor", (id) => exactLimit(id, input.adapterModels));
-  if (fromAdapter) return fromAdapter;
-  const fromPicker = firstHit("picker-catalog", (id) => exactLimit(id, input.pickerModels));
-  if (fromPicker) return fromPicker;
-  const fromCurated = firstHit("curated-catalog", (id) => curatedLimitFor(agentId, id, curated));
-  if (fromCurated) return fromCurated;
+  const fromCatalog = firstHit("operational-catalog", (id) => exactLimit(id, input.catalogModels));
+  if (fromCatalog) return fromCatalog;
 
   const meta =
     input.metadataWindow && Number.isFinite(input.metadataWindow) && input.metadataWindow > 0
@@ -216,7 +160,7 @@ export function resolveDestinationContextWindow(opts: {
     agentId: "unknown",
     model: opts.destinationModel,
     lastContextUsage: opts.lastContextUsage,
-    staticModels: opts.staticContextLimit
+    catalogModels: opts.staticContextLimit
       ? [{ modelId: opts.destinationModel, contextLimit: opts.staticContextLimit }]
       : [],
   }).window;

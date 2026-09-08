@@ -76,8 +76,9 @@ import { ModelValueStore } from "./core/model-value/store.js";
 import { ModelValueManager } from "./core/model-value/manager.js";
 import { ModelMetadataStore } from "./core/model-metadata/store.js";
 import { ModelMetadataManager } from "./core/model-metadata/manager.js";
-import { collectAgentModelCatalog } from "./core/model-metadata/catalog.js";
 import { ArtificialAnalysisMetadataSource } from "./core/model-metadata/artificial-analysis.js";
+import { ModelCatalogService, ModelCatalogStore } from "./core/model-catalog/index.js";
+import type { AdapterCatalogCandidate, AgentProfile } from "@seam/adapters";
 import { ModelValueRankingsCard } from "./core/model-value/rankings-card.js";
 import { LiveMessageSearch, MessageReader } from "./core/message-reader.js";
 import {
@@ -143,6 +144,7 @@ async function main(): Promise<void> {
     outputTokens: config.MODEL_VALUE_STD_OUTPUT_TOKENS,
   });
   const modelMetadataStore = new ModelMetadataStore(seamDbPath);
+  const modelCatalogStore = new ModelCatalogStore(seamDbPath);
   const artificialAnalysis = new ArtificialAnalysisMetadataSource(config.AA_API_KEY);
   const { servers: mcpServers } = buildGlobalMcpServers(logger, {
     dataDir: config.DATA_DIR,
@@ -234,34 +236,23 @@ async function main(): Promise<void> {
     ? makeCodexProfile({
         ...(config.CODEX_CLI_PATH ? { cliPath: config.CODEX_CLI_PATH } : {}),
         defaultModel: config.CODEX_DEFAULT_MODEL,
-        // No static list: codex-acp advertises its current catalog in session/new,
-        // so the picker uses that live list (always up to date). CODEX_MODELS still
-        // overrides if an operator wants to pin a custom set.
+        // The background catalog collector reads Codex's bounded host-local
+        // model cache. CODEX_MODELS pins a validated operator manifest instead.
         staticModels: config.CODEX_MODELS,
       })
     : undefined;
 
-  // Optional xAI Grok Build agent — speaks ACP natively via `grok agent stdio`.
-  // When GROK_API_KEY is set and no explicit GROK_MODELS override, discover the
-  // live model list from xAI's /v1/models endpoint so the picker stays current.
-  let grokModels: Array<{ modelId: string; name: string; contextLimit?: number }> | undefined;
-  if (config.GROK_ENABLED && !config.GROK_MODELS && config.GROK_API_KEY) {
-    const discovered = await fetchXaiModels(config.GROK_API_KEY).catch((err) => {
-      logger.warn({ err }, "grok: xAI model discovery failed; using static list");
-      return [];
-    });
-    if (discovered.length > 0) {
-      grokModels = discovered;
-      logger.info({ count: discovered.length }, "grok: discovered xAI models");
-    }
-  }
+  // Optional xAI Grok Build agent — provider discovery belongs to the adapter
+  // catalog collector and runs only during background/manual refresh.
   const grok = config.GROK_ENABLED
     ? makeGrokProfile({
         ...(config.GROK_CLI_PATH ? { cliPath: config.GROK_CLI_PATH } : {}),
         defaultModel: config.GROK_DEFAULT_MODEL,
         staticModels: enrichModelListWithKnownLimits(config.GROK_MODELS, GROK_STATIC_MODELS)
-          ?? grokModels
           ?? GROK_STATIC_MODELS,
+        ...(!config.GROK_MODELS && config.GROK_API_KEY
+          ? { discoverModels: () => fetchXaiModels(config.GROK_API_KEY!) }
+          : {}),
         ...(config.GROK_API_KEY ? { extraEnv: { XAI_API_KEY: config.GROK_API_KEY } } : {}),
       })
     : undefined;
@@ -378,12 +369,57 @@ async function main(): Promise<void> {
   let serviceStatusView: ServiceStatusMcpView | undefined;
   let serviceStatusCard: ServiceStatusCard | undefined;
   let stopServiceStatus: (() => void) | undefined;
+  let stopCatalogBridgeRefresh: (() => void) | undefined;
+  let stopCatalogEnrichmentRefresh: (() => void) | undefined;
   let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
+
+  const profiles: AgentProfile[] = [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
+  const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
+  const modelCatalog = new ModelCatalogService({
+    store: modelCatalogStore,
+    logger: logger.child({ mod: "model-catalog" }),
+    bindings: () => {
+      const bindings = profiles.map((profile) => ({ agentId: profile.id, location: "local" }));
+      // Re-read durable observations on each orchestration pass so a
+      // remote-only adapter first seen during this process remains part of
+      // manual/scheduled refresh-all after its bridge disconnects.
+      bindings.push(...modelCatalogStore.loadObservations()
+        .map(({ agentId, location }) => ({ agentId, location })));
+      for (const bridge of bridgeHub?.listConnected() ?? []) {
+        for (const [agentId, info] of bridge.agents) {
+          if (info.installed) bindings.push({ agentId, location: bridge.bridgeId });
+        }
+      }
+      return bindings;
+    },
+    isOnline: ({ location }) => location === "local" || Boolean(bridgeHub?.isBridgeReady(location)),
+    scope: async ({ agentId, location }) => {
+      if (location === "local") {
+        const profile = profilesById.get(agentId);
+        if (!profile) throw new Error(`unknown local agent ${agentId}`);
+        return profile.catalog.scope();
+      }
+      if (!bridgeHub) throw new Error("bridge hub is not ready");
+      return await bridgeHub.rpc(location, "describeModelCatalog", {}, agentId) as ReturnType<AgentProfile["catalog"]["scope"]>;
+    },
+    fetch: async ({ agentId, location }): Promise<AdapterCatalogCandidate> => {
+      if (location === "local") {
+        const profile = profilesById.get(agentId);
+        if (!profile) throw new Error(`unknown local agent ${agentId}`);
+        const candidate = await profile.catalog.fetch();
+        profile.catalog.validate?.(candidate);
+        return candidate;
+      }
+      if (!bridgeHub) throw new Error("bridge hub is not ready");
+      return await bridgeHub.rpc(location, "fetchModelCatalog", {}, agentId) as AdapterCatalogCandidate;
+    },
+  });
 
   const router = new SessionRouter({
     logger,
     store,
-    profiles: [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])],
+    profiles,
+    modelCatalog,
     ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
     defaultAgentId: config.DEFAULT_AGENT,
     defaultModel: config.DEFAULT_MODEL,
@@ -437,7 +473,13 @@ async function main(): Promise<void> {
     store: modelMetadataStore,
     logger: logger.child({ mod: "model-metadata" }),
     source: artificialAnalysis,
-    getCatalog: () => collectAgentModelCatalog(router.listProfiles()),
+    getCatalog: async () => modelCatalog.availableModels().map(({ binding, model }) => ({
+      agentId: binding.agentId,
+      modelId: model.id,
+      name: model.displayName,
+      contextWindow: model.context.effective,
+      vision: model.modalities.input.includes("image"),
+    })),
   });
   const modelValueManager = new ModelValueManager({
     store: modelValueStore,
@@ -446,7 +488,28 @@ async function main(): Promise<void> {
     inputTokens: config.MODEL_VALUE_STD_INPUT_TOKENS,
     outputTokens: config.MODEL_VALUE_STD_OUTPUT_TOKENS,
     fetchAa: () => artificialAnalysis.fetch(),
-    ...(config.COPILOT_CLI_PATH ? { copilotCliPath: config.COPILOT_CLI_PATH } : {}),
+    // Operational model/effort data has one authority. Rankings enrich the
+    // current catalog snapshot instead of probing a second ACP session.
+    fetchCopilot: async () => [...new Map(
+      modelCatalog.availableModels()
+        .filter(({ binding }) => binding.agentId === copilot.id)
+        .map(({ model }) => [model.id, model] as const)
+    ).values()].map((model) => ({
+        modelId: model.id,
+        displayName: model.displayName,
+        validEffortTiers: model.effort.choices
+          .map((choice) => choice.id)
+          .filter((effort) => effort !== "default"),
+        priceCategory: model.pricingCategory,
+      })),
+  });
+  // Enrichment must follow the operational generation, not merely its own
+  // 12-hour clock. Each manager coalesces a publication behind any active
+  // source fetch so a cold startup cannot finish with the pre-publication
+  // empty catalog and remain stale until the next cron tick.
+  stopCatalogEnrichmentRefresh = modelCatalog.onPublication(() => {
+    modelMetadataManager.refreshForCatalogGeneration();
+    modelValueManager.refreshForCatalogGeneration();
   });
 
   const quotaRegistry = new QuotaRegistry();
@@ -483,6 +546,7 @@ async function main(): Promise<void> {
     store,
     renderer,
     quotaPoller,
+    modelCatalog,
     getModelMetadata: (idOrSlug) => modelMetadataStore.get(idOrSlug).model,
   });
 
@@ -524,7 +588,9 @@ async function main(): Promise<void> {
     waitMs: config.SEAM_INGEST_WAIT_MS,
     bodyMax: config.SEAM_INGEST_BODY_MAX,
     ratePerMin: config.SEAM_INGEST_RATE_PER_MIN,
-    defaultModel: config.DEFAULT_MODEL,
+    defaultModel: (record) => record
+      ? router.describeConfig(record).model.value
+      : modelCatalog.model({ agentId: config.DEFAULT_AGENT, location: "local" }, "default")?.id ?? "default",
   });
   orchestrator.setIngestUrl(() => choiceIngest.ingestUrl());
   ingestHttpHandle = (req, res) => choiceIngest.handle(req, res);
@@ -552,6 +618,12 @@ async function main(): Promise<void> {
       workspaceRoot: config.REPOS_ROOT,
     })
   );
+  stopCatalogBridgeRefresh = bridgeHub.onBridgeReady((location) => {
+    const bridge = bridgeHub?.get(location);
+    for (const [agentId, info] of bridge?.agents ?? []) {
+      if (info.installed) void modelCatalog.refresh({ agentId, location }, "startup");
+    }
+  });
 
   // Wire the ask-the-user callback now that both the router and the adapter
   // exist. Router calls this when a session's policy is "ask".
@@ -574,6 +646,9 @@ async function main(): Promise<void> {
   // Seed one normalized snapshot per configured agent before MCP/card startup,
   // then let each agent's own recent turn rate drive its recursive poll timer.
   await quotaPoller.start();
+  // Reads were available from SQLite before Discord connected. Provider/CLI
+  // work begins only now and is deliberately not awaited.
+  modelCatalog.start();
   modelMetadataManager.start();
   modelValueManager.start();
 
@@ -624,12 +699,14 @@ async function main(): Promise<void> {
     const agyImageInspector = createAgyImageInspector({
       model: config.AGY_VISION_MODEL,
       logger,
+      isModelAvailable: (model) => Boolean(modelCatalog.model({ agentId: "agy", location: "local" }, model)),
       ...(config.AGY_CLI_PATH ? { cliPath: config.AGY_CLI_PATH } : {}),
     });
     const threadSessionControl = new ThreadSessionControlService({
       store,
       router,
       mutation: orchestrator.getConfigMutation(),
+      modelCatalog,
       applyThreadName: (record) => orchestrator.applyThreadName(record),
     });
     orchestrator.setSelfMigrationHandler((target, prepared) =>
@@ -689,9 +766,9 @@ async function main(): Promise<void> {
       queryModelMetadata: (options) => modelMetadataStore.query(options),
       inspectImage: (record, req) => {
         const effective = router.describeConfig(record);
-        const effectiveProfile = router.getProfile(effective.agent.value);
-        const visionMode = effectiveProfile?.staticModels?.find(
-          (entry) => entry.modelId === effective.model.value
+        const visionMode = modelCatalog.model(
+          { agentId: effective.agent.value, location: effective.location.value },
+          effective.model.value
         )?.visionMode;
         if (
           !config.OLLAMA_CLOUD_ENABLED ||
@@ -1386,6 +1463,9 @@ async function main(): Promise<void> {
     quotaPoller.stop();
     modelMetadataManager.stop();
     modelValueManager.stop();
+    stopCatalogEnrichmentRefresh?.();
+    modelCatalog.stop();
+    stopCatalogBridgeRefresh?.();
     stopQuotaCard?.();
     stopRankingsCard?.();
     stopStatusCard?.();
@@ -1459,6 +1539,12 @@ async function main(): Promise<void> {
         (label, work) => bounded(label, config.SHUTDOWN_QUIESCE_TIMEOUT_MS, work)
       ))
     );
+    verdicts.push({
+      stage: "model-catalog",
+      drained: await bounded("model catalog drain", config.SHUTDOWN_QUIESCE_TIMEOUT_MS, () =>
+        modelCatalog.drain()
+      ),
+    });
     // #174 phase 1: quiesce BEFORE anything is torn down. `dispatchWatcher.stop()`
     // only closes intake; `quiesce()` is the barrier that waits for claimed
     // dispatches, active channel turns, and post-turn continuations to settle
@@ -1559,6 +1645,11 @@ async function main(): Promise<void> {
         }
         try {
           modelValueStore.close();
+        } catch {
+          /* ignore */
+        }
+        try {
+          modelCatalogStore.close();
         } catch {
           /* ignore */
         }

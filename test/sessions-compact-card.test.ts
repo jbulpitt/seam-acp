@@ -35,6 +35,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pino } from "pino";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 /**
  * Three branches read a prompt template from a hard-coded absolute path. Stub
@@ -260,15 +261,17 @@ function makeHarness(opts: HarnessOpts = {}) {
   const profile = {
     id: opts.agentId ?? "claude",
     displayName: "Claude",
+    defaultModel: "default",
     sessionManager: manager,
   };
-  const target = { id: "codex", displayName: "Codex", sessionManager: manager };
+  const target = { id: "codex", displayName: "Codex", defaultModel: "default", sessionManager: manager };
   const agy =
     opts.agy === false
       ? undefined
       : {
           id: "agy",
           displayName: "Antigravity",
+          defaultModel: "default",
           sessionManager: manager,
           listPickerModels: async () => [
             { modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
@@ -279,7 +282,12 @@ function makeHarness(opts: HarnessOpts = {}) {
   const upserts: SessionRecord[] = [];
   const router = {
     listProfiles: () => (agy ? [profile, target, agy] : [profile, target]),
-    describeConfig: () => ({}),
+    describeConfig: () => ({
+      agent: { value: record.agentId },
+      location: { value: "local" },
+      model: { value: "default" },
+      cwd: { value: "/repo" },
+    }),
     getProfile: (id?: string) => {
       if (id === "agy") return agy;
       if (id === "codex") return target;
@@ -378,7 +386,6 @@ function makeHarness(opts: HarnessOpts = {}) {
       DATA_DIR: opts.dataDir ?? dataDir,
       REPOS_ROOT: "/repo",
       DEFAULT_MODEL: "default",
-      CLAUDE_COMPACTION_MODEL: "claude-opus-4.8",
       REPO_EMOJIS: new Map<string, string>(),
       CHANNEL_PRESETS_FILE: undefined,
       SEAM_CONFIG_MUTATION_TIER_C_ENABLED: false,
@@ -389,6 +396,7 @@ function makeHarness(opts: HarnessOpts = {}) {
     router: router as any,
     store: store as any,
     renderer: {} as any,
+    modelCatalog: fixtureModelCatalog([profile, target, ...(agy ? [agy] : [])] as any),
   });
 
   // The compaction / rebuild pipelines are held open by explicit deferreds and
@@ -641,13 +649,13 @@ describe("#179 compaction attaches its result", () => {
     expect(b.compactCalls[0].opts.attachIntent).toBe("attach");
   });
 
-  it("shows Discord premium when AGY is available even if the destination has no compaction model", async () => {
+  it("enables ordinary compaction for an architectural-outlier catalog agent", async () => {
     const h = makeHarness({ agentId: "no-such-agent" });
     await h.open();
     const ids = customIds(h.last());
     expect(ids).toContain("sessions:premium_discord");
-    expect(ids).not.toContain("sessions:premium");
-    expect(ids).not.toContain("sessions:compact");
+    expect(ids).toContain("sessions:premium");
+    expect(ids).toContain("sessions:compact");
   });
 
   it("hides Discord premium when AGY is missing even if the destination can compact", async () => {

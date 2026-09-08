@@ -16,6 +16,7 @@ import { pino } from "pino";
 import { MessageFlags } from "discord.js";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import {
   CFG_EDIT_PREFIX,
   parseCustomId,
@@ -98,6 +99,11 @@ function makeOrch(over?: {
   addThreadMember?: (ch: ChannelRef, userId: string) => Promise<void>;
   threadPresets?: Map<string, unknown>;
 }) {
+  const catalogProfile = {
+    id: "copilot", displayName: "Copilot", defaultModel: "default-model",
+    staticModels: [{ modelId: "default-model", name: "Default model" }],
+    effort: { mechanism: "none", levels: [] },
+  } as any;
   const created: Array<{ parent: ChannelRef; name: string }> = [];
   const addedMembers: Array<{ id: string; userId: string }> = [];
   const sent: Array<{ id: string; text: string }> = [];
@@ -107,7 +113,7 @@ function makeOrch(over?: {
   const threadNames = new Map<string, string>();
 
   const router = {
-    listProfiles: () => [{ id: "copilot", displayName: "Copilot" }],
+    listProfiles: () => [catalogProfile],
     getProfile: (id: string) => ({
       id,
       defaultModel: "default-model",
@@ -220,6 +226,7 @@ function makeOrch(over?: {
       SEAM_PARTICIPANT_USER_IDS: undefined,
     } as any,
     adapter: adapter as any,
+    modelCatalog: fixtureModelCatalog([catalogProfile]),
     router: router as any,
     store,
     renderer: {} as any,

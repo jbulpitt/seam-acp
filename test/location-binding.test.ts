@@ -13,6 +13,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { pino } from "pino";
 import type { AgentProfile } from "@seam/adapters";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { scanWorkspaces } from "@seam/adapters";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { LoopbackHost } from "../packages/core/src/core/loopback-host.js";
@@ -36,6 +37,7 @@ function stubProfile(id: string, spawnCalls: unknown[]): AgentProfile {
   return {
     id,
     displayName: id,
+    defaultModel: id,
     spawn(model?: string, effort?: string, mcpServers = []) {
       spawnCalls.push({ model, effort, mcpServers });
       const stdin = new PassThrough();
@@ -88,6 +90,7 @@ describe("default location is local (#86)", () => {
       logger: silent,
       store: stubStore(),
       profiles: [stubProfile("claude", [])],
+      modelCatalog: fixtureModelCatalog([stubProfile("claude", [])]),
       defaultAgentId: "claude",
       defaultModel: "opus",
       threadPresets: new Map(),
@@ -102,6 +105,7 @@ describe("default location is local (#86)", () => {
       logger: silent,
       store: stubStore(),
       profiles: [stubProfile("claude", [])],
+      modelCatalog: fixtureModelCatalog([stubProfile("claude", [])]),
       defaultAgentId: "claude",
       defaultModel: "opus",
       threadPresets,
@@ -114,6 +118,40 @@ describe("default location is local (#86)", () => {
 });
 
 describe("markSessionBridge is called on start when location is a bridge id (#84)", () => {
+  it("plans a remote-only advertised agent without a controller-local profile", () => {
+    const remote = stubProfile("remote-grok", []);
+    const catalog = fixtureModelCatalog([remote]);
+    const threadPresets = new Map<string, ThreadPreset>([["thread-1", { location: "mac" }]]);
+    const router = new SessionRouter({
+      logger: silent,
+      store: stubStore(),
+      profiles: [],
+      modelCatalog: catalog,
+      defaultAgentId: "remote-grok",
+      defaultModel: "remote-grok",
+      threadPresets,
+      bindSessionLocation: () => {},
+      seamMcp: {
+        registry: new SeamTokenRegistry(),
+        getPort: () => undefined,
+        isRemoteSession: () => true,
+        muxForSession: () => ({}) as any,
+      },
+    });
+    const plan = router.planRuntimeSpawn(makeRecord({
+      agentId: "remote-grok",
+      configJson: JSON.stringify({ model: "remote-grok" }),
+    }));
+    expect(plan).toMatchObject({
+      agentId: "remote-grok",
+      model: "remote-grok",
+      remote: true,
+      profile: { id: "remote-grok" },
+    });
+    expect(router.getProfile("remote-grok", "mac")?.id).toBe("remote-grok");
+    expect(router.getProfile("remote-grok", "local")).toBeUndefined();
+  });
+
   it("binds the session to the thread-preset location before planning remote spawn", () => {
     const marked: Array<{ sessionId: string; location: string }> = [];
     const sessionBridge = new Map<string, string>();
@@ -124,6 +162,7 @@ describe("markSessionBridge is called on start when location is a bridge id (#84
       logger: silent,
       store: stubStore(),
       profiles: [stubProfile("claude", localSpawnCalls)],
+      modelCatalog: fixtureModelCatalog([stubProfile("claude", [])]),
       defaultAgentId: "claude",
       defaultModel: "opus",
       threadPresets,
@@ -155,6 +194,7 @@ describe("markSessionBridge is called on start when location is a bridge id (#84
       logger: silent,
       store: stubStore(),
       profiles: [stubProfile("claude", localSpawnCalls)],
+      modelCatalog: fixtureModelCatalog([stubProfile("claude", [])]),
       defaultAgentId: "claude",
       defaultModel: "opus",
       threadPresets: new Map(),
@@ -270,6 +310,22 @@ describe("flattened host-prefixed picker (D10)", () => {
       "copilot@local",
       "grok@local",
       "grok@media-server",
+    ]);
+  });
+
+  it("lists an advertised remote-only agent without inventing a local row", () => {
+    const hosts = listHosts({
+      bridges: [{ id: "gpu", emoji: "🖥️", shortName: "gpu", tokenHash: "d".repeat(64) }],
+      connected: new Set(["gpu"]),
+    });
+    const choices = listAgentLocationChoices({
+      profiles: [{ id: "claude", displayName: "Claude" }],
+      hosts,
+      agentsByHost: new Map([["gpu", new Set(["remote-zai"])]]),
+    });
+    expect(choices.map((choice) => choice.value)).toEqual([
+      "claude@local",
+      "remote-zai@gpu",
     ]);
   });
 

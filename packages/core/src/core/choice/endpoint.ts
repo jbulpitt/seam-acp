@@ -13,6 +13,8 @@ export interface IngestEndpoint {
   tokenHash: string;
   name: string;
   cwd: string | null;
+  /** Host binding captured at mint; remote-only profiles resolve there at fire. */
+  location: string | null;
   agentId: string | null;
   model: string | null;
   effort: string | null;
@@ -159,7 +161,6 @@ export function planEndpointDispatch(opts: {
   endpoint: IngestEndpoint;
   payload: string;
   untrustedStudentId?: string | null;
-  defaultModel?: string;
 }): DispatchSpec {
   const e = opts.endpoint;
   const id = cryptoRandomUuid();
@@ -200,10 +201,10 @@ export function planEndpointDispatch(opts: {
     createdUtc: new Date().toISOString(),
   };
   if (e.preset) spec.preset = e.preset;
+  if (e.location) spec.location = e.location;
   if (e.cwd) spec.cwd = e.cwd;
   if (e.agentId) spec.agentId = e.agentId;
   if (e.model) spec.model = e.model;
-  else if (!e.preset && opts.defaultModel) spec.model = opts.defaultModel;
   if (e.effort) spec.effort = e.effort;
   return spec;
 }

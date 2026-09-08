@@ -2408,6 +2408,14 @@ describe("#174 an ingest job stays registered through its durable tail", () => {
         mintMcpServersForSession: () => ({}),
         revokeMcpSession: () => {},
       },
+      modelCatalog: {
+        model: () => ({ id: "default" }),
+        resolve: () => ({
+          normalized: { model: "default", effort: "default" },
+          raw: { model: "default" },
+          model: { id: "default" },
+        }),
+      },
       store: {
         recordDelegation: () => {},
         updateDelegationStatus: () => {

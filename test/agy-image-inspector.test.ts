@@ -60,13 +60,10 @@ describe("Agy image inspector", () => {
       model: MODEL,
       logger: silent,
       stagingRoot: root,
+      isModelAvailable: (model) => model === MODEL,
       profileFactory: (options) => {
         profileOptions.push({ ...(options ?? {}) });
-        return {
-          listPickerModels: async () => [
-            { modelId: MODEL, name: "Gemini 3.7 Flash (High)" },
-          ],
-        } as unknown as AgentProfile;
+        return {} as AgentProfile;
       },
       runtimeFactory: () => ({
         onEvent: (handler) => {
@@ -114,11 +111,8 @@ describe("Agy image inspector", () => {
       model: MODEL,
       logger: silent,
       stagingRoot: root,
-      profileFactory: () => ({
-        listPickerModels: async () => [
-          { modelId: "gemini-other", name: "Other Gemini" },
-        ],
-      } as unknown as AgentProfile),
+      isModelAvailable: () => false,
+      profileFactory: () => ({} as AgentProfile),
       runtimeFactory: () => ({
         onEvent: () => {},
         start,
@@ -144,11 +138,8 @@ describe("Agy image inspector", () => {
       model: MODEL,
       logger: silent,
       stagingRoot: root,
-      profileFactory: () => ({
-        listPickerModels: async () => [
-          { modelId: MODEL, name: "Gemini 3.7 Flash (High)" },
-        ],
-      } as unknown as AgentProfile),
+      isModelAvailable: (model) => model === MODEL,
+      profileFactory: () => ({} as AgentProfile),
       runtimeFactory: () => ({
         onEvent: () => {},
         start: async () => {},

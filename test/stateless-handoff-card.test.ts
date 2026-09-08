@@ -20,6 +20,7 @@ import {
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { Preset, SessionRecord, StructuredPanel } from "../packages/core/src/core/types.js";
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -99,6 +100,7 @@ function makeOrch(opts: {
   chunks?: string[];
   error?: string;
 }): Orchestrator {
+  const catalogProfile = { id: "claude", defaultModel: "default" } as any;
   const chunks = opts.chunks ?? ["Hello ", "world"];
   const router = {
     listProfiles: () => [],
@@ -135,6 +137,7 @@ function makeOrch(opts: {
       threadPresets: {},
     } as any,
     adapter: opts.adapter as any,
+    modelCatalog: fixtureModelCatalog([catalogProfile]),
     router: router as any,
     store: store as any,
     renderer: {} as any,
@@ -289,6 +292,39 @@ describe("isStatelessHandoffWorker / shouldInlineCardReportBack", () => {
 });
 
 describe("stateless/preset handoff embed card", () => {
+  it("resolves a preset worker on the target host and plans a remote spawn", async () => {
+    const { adapter } = spyAdapter();
+    const orch = makeOrch({ dataDir, adapter });
+    (orch as any).config.threadPresets["thread-caller"] = { location: "studio" };
+    const lookups: Array<{ id: string; location?: string }> = [];
+    (orch as any).router.getProfile = (id: string, location?: string) => {
+      lookups.push({ id, location });
+      return location === "studio" ? { id, displayName: id } : undefined;
+    };
+    const marked: Array<{ sessionId: string; location: string }> = [];
+    orch.setBridgeHub({
+      markSessionBridge: (sessionId: string, location: string) => {
+        marked.push({ sessionId, location });
+      },
+      get: () => ({ mux: {} }),
+      mcpServersForRemoteSpawn: () => undefined,
+    } as any);
+    let injected: any;
+    (orch as any).injectTurn = async (_record: unknown, _prompt: string, opts: unknown) => {
+      injected = opts;
+      return { text: "remote result", stopReason: "end_turn" };
+    };
+
+    await orch.dispatchInjectTurn(presetSpec());
+
+    expect(lookups).toContainEqual({ id: "claude", location: "studio" });
+    expect(marked).toEqual([
+      { sessionId: "dispatch:disp-stateless", location: "studio" },
+    ]);
+    expect(injected.location).toBe("studio");
+    expect(typeof injected.spawnFn).toBe("function");
+  });
+
   it("posts a card (not messages) for a preset handoff", async () => {
     const { adapter, calls } = spyAdapter();
     const orch = makeOrch({ dataDir, adapter, chunks: ["Hello ", "world"] });

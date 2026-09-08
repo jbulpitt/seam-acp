@@ -3,6 +3,7 @@ import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import {
   DISCORD_COMPACTION_MODEL,
 } from "../packages/core/src/core/compaction/discord-executor.js";
@@ -47,6 +48,9 @@ function makePolicyOrch(opts: {
   const dest = {
     id: opts.destId,
     displayName: opts.destId,
+    defaultModel: opts.destModel,
+    staticModels: [{ modelId: opts.destModel, name: opts.destModel }],
+    effort: { mechanism: "configOption", levels: [opts.destEffort] },
     sessionManager: destMgr,
   };
   const agyEnabled = opts.agy !== false;
@@ -59,6 +63,9 @@ function makePolicyOrch(opts: {
     ? {
         id: "agy",
         displayName: "Antigravity",
+        defaultModel: DISCORD_COMPACTION_MODEL,
+        staticModels: agyModels.map((modelId) => ({ modelId, name: modelId })),
+        effort: { mechanism: "modelBaked", levels: [] },
         sessionManager: agyHasManager ? agyMgr : undefined,
         listPickerModels: async () => agyModels.map((modelId) => ({ modelId, name: modelId })),
       }
@@ -128,6 +135,7 @@ function makePolicyOrch(opts: {
       threadPresets: {},
     } as any,
     adapter: adapter as any,
+    modelCatalog: fixtureModelCatalog((agy ? [dest, agy] : [dest]) as any),
     router: router as any,
     store: store as any,
     renderer: {} as any,

@@ -11,6 +11,7 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { AgentProfile } from "@seam/adapters";
 import type { ChannelPreset, ThreadPreset } from "../packages/core/src/config.js";
 import type { SessionConfigState, SessionRecord } from "../packages/core/src/core/types.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const ADMIN = "1487094572696867019";
@@ -125,6 +126,7 @@ function makeOrch(opts?: {
     logger: silent,
     store,
     profiles,
+    modelCatalog: fixtureModelCatalog(profiles),
     defaultAgentId: "claude",
     defaultModel: "claude-opus-5",
     defaultPermissionMode: "ask",
@@ -156,6 +158,7 @@ function makeOrch(opts?: {
         ? vi.fn(opts.sendChoicePicker)
         : undefined,
     } as any,
+    modelCatalog: fixtureModelCatalog(profiles),
     router,
     store,
     renderer: {} as any,
@@ -193,7 +196,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
     const cfg = sessionConfig(store);
     expect(cfg.model).toBe("claude-sonnet-4.6");
     expect(cfg.lastContextUsage).toBeUndefined();
-    expect(cfg.reasoningEffort).toBe("high");
+    expect(cfg.reasoningEffort).toBe("default");
     expect(cfg.role).toBe("worker");
     expect(threadPresets.get(THREAD)?.model?.value).toBe("claude-sonnet-4.6");
 
@@ -400,7 +403,7 @@ describe("/seam config model — #191 failure-atomic commit", () => {
     })) as typeof router.getOrStartRuntime;
     const { i, replies } = slashI({ strings: { id: "claude-sonnet-4.6" } });
     await (orch as any).cmdModel(i);
-    expect(replies[0]?.content).toMatch(/Model will be `claude-sonnet-4\.6` on the next turn \(session respawn\)/);
+    expect(replies[0]?.content).toMatch(/Model will be `claude-sonnet-4\.6` with effort `default` on the next turn \(session respawn\)/);
     expect(sessionConfig(store).model).toBe("claude-sonnet-4.6");
     expect(router.describeConfig(store.get(`discord:${THREAD}`)!).model.value).toBe("claude-sonnet-4.6");
   });

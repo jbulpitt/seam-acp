@@ -13,6 +13,7 @@ import { WebSocket } from "ws";
 import { pino } from "pino";
 import { makeMux } from "@seam/adapters";
 import type { AgentProfile } from "@seam/adapters";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import { BridgeHub } from "../packages/core/src/core/bridge-hub.js";
 import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SeamTokenRegistry } from "../packages/core/src/core/mcp/token-registry.js";
@@ -162,10 +163,12 @@ describe("remote spawn drives token + reachable MCP URL (#84)", () => {
 
     h.markSessionBridge("discord:thread-remote", "mac");
 
+    const profile = stubProfile("claude", localSpawnCalls);
     const router = new SessionRouter({
       logger: silent,
       store: stubStore(),
-      profiles: [stubProfile("claude", localSpawnCalls)],
+      profiles: [profile],
+      modelCatalog: fixtureModelCatalog([profile]),
       defaultAgentId: "claude",
       defaultModel: "opus",
       seamMcp: {

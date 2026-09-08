@@ -5,7 +5,6 @@ import path from "node:path";
 import { z } from "zod";
 import { parkedAgentMessage } from "./core/parked-agents.js";
 import { retiredAgentConfigMessage } from "./core/retired-agents.js";
-import { DISCORD_COMPACTION_MODEL } from "./core/compaction/discord-executor.js";
 
 const ModelsListSchema = z
   .string()
@@ -252,16 +251,6 @@ const Schema = z.object({
    */
   AGY_AUTO_COMPACT_THRESHOLD: z.coerce.number().min(0).max(1).default(0.8),
   /**
-   * Exact AGY model used for every Premium Compact (Discord) bulk-analysis
-   * call. Literal by design: accepting another value could silently move a
-   * high-fan-out job onto an unintended model/provider. Existing deployments
-   * with an older override must update it before restart.
-   */
-  AGY_COMPACTION_MODEL: z.literal(DISCORD_COMPACTION_MODEL).default(DISCORD_COMPACTION_MODEL),
-  // "default" resolves to the latest Opus @ 1M on the configured Max account.
-  CLAUDE_COMPACTION_MODEL: z.string().default("default"),
-  COPILOT_COMPACTION_MODEL: z.string().default("gpt-5.5"),
-  /**
    * Same shape as COPILOT_PROFILES — register additional Claude profiles
    * each pinned to its own --config-dir (auth / settings). Format:
    *   id1:/abs/dir1,id2:/abs/dir2
@@ -319,8 +308,6 @@ const Schema = z.object({
   /** Default model id for the Codex profile (e.g. "o3", "gpt-5.5"). */
   CODEX_DEFAULT_MODEL: z.string().default("gpt-5.5"),
   CODEX_MODELS: ModelsListSchema,
-  /** Model used for /compact on Codex sessions. Defaults to same as Copilot. */
-  CODEX_COMPACTION_MODEL: z.string().default("gpt-5.5"),
 
   /**
    * Register the xAI Grok Build agent.  The `grok` CLI speaks ACP natively
@@ -446,8 +433,6 @@ const Schema = z.object({
   /** Default model id for the Grok profile (e.g. "grok-build-0.1"). */
   GROK_DEFAULT_MODEL: z.string().default("grok-4.6"),
   GROK_MODELS: ModelsListSchema,
-  /** Model used for /compact on Grok sessions. */
-  GROK_COMPACTION_MODEL: z.string().default("grok-4.5"),
   /** xAI API key.  When set, enables dynamic model discovery at startup via
    *  GET https://api.x.ai/v1/models and is passed to the grok CLI process. */
   GROK_API_KEY: z.string().optional(),
@@ -466,8 +451,6 @@ const Schema = z.object({
   /** Default model id for the Z.ai profile (e.g. "glm-5.2"). */
   ZAI_DEFAULT_MODEL: z.string().default("glm-5.2"),
   ZAI_MODELS: ModelsListSchema,
-  /** Model used for /compact on Z.ai sessions. */
-  ZAI_COMPACTION_MODEL: z.string().default("glm-5.2"),
 
   /**
    * Complete reversible park switch for Ollama Cloud (#220). When false the
@@ -496,8 +479,6 @@ const Schema = z.object({
   /** Default model id for Ollama Cloud sessions. */
   OLLAMA_CLOUD_DEFAULT_MODEL: z.string().default("glm-5.3:cloud"),
   OLLAMA_CLOUD_MODELS: ModelsListSchema,
-  /** Model used for /compact on Ollama Cloud sessions. */
-  OLLAMA_CLOUD_COMPACTION_MODEL: z.string().default("glm-5.3:cloud"),
 
   // #12: the opencode / LM Studio agent was RETIRED. Its OPENCODE_* keys are
   // gone from this schema. Zod's default object behaviour strips unknown env

@@ -16,6 +16,7 @@ export interface ModelMetadataManagerOptions {
 export class ModelMetadataManager {
   private job?: Cron;
   private inFlight?: Promise<void>;
+  private catalogRefreshPending = false;
   private stopped = false;
 
   constructor(private readonly options: ModelMetadataManagerOptions) {}
@@ -36,6 +37,7 @@ export class ModelMetadataManager {
 
   stop(): void {
     this.stopped = true;
+    this.catalogRefreshPending = false;
     this.job?.stop();
     this.job = undefined;
   }
@@ -53,11 +55,25 @@ export class ModelMetadataManager {
     void this.refresh();
   }
 
+  /** Coalesce a catalog-generation notification behind any active enrichment fetch. */
+  refreshForCatalogGeneration(): void {
+    if (this.stopped) return;
+    if (this.inFlight) {
+      this.catalogRefreshPending = true;
+      return;
+    }
+    void this.refresh();
+  }
+
   refresh(): Promise<void> {
     if (this.inFlight) return this.inFlight;
     if (this.stopped) return Promise.resolve();
     this.inFlight = this.refreshInner().finally(() => {
       this.inFlight = undefined;
+      if (this.catalogRefreshPending && !this.stopped) {
+        this.catalogRefreshPending = false;
+        void this.refresh();
+      }
     });
     return this.inFlight;
   }

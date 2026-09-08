@@ -4,6 +4,7 @@ import type { AgentProfile } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord, SessionConfigState } from "../packages/core/src/core/types.js";
 import type { SessionStore } from "../packages/core/src/core/session-store.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const runtimeState = vi.hoisted(() => ({
   instances: [] as Array<{
@@ -95,6 +96,7 @@ function makeRouter(record: SessionRecord): SessionRouter {
     logger: silent,
     store: makeStore(record),
     profiles: [profile],
+    modelCatalog: fixtureModelCatalog([profile]),
     defaultAgentId: "copilot",
     defaultModel: "gpt-test",
     runtimeIdleTtlMs: 1_000,

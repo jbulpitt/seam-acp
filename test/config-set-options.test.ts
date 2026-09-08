@@ -11,6 +11,7 @@ import { SessionRouter } from "../packages/core/src/core/session-router.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionConfigState, SessionRecord } from "../packages/core/src/core/types.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const THREAD = "333333333333333333";
@@ -25,7 +26,10 @@ const profiles = [
     id: "claude",
     displayName: "Claude",
     defaultModel: "claude-opus-5",
-    staticModels: [{ modelId: "claude-opus-5", name: "Opus 5" }],
+    staticModels: [
+      { modelId: "claude-opus-5", name: "Opus 5" },
+      { modelId: "gpt-5.4", name: "GPT-5.4 compatibility" },
+    ],
     effort: { mechanism: "meta", levels: ["low", "high"] },
   },
   {
@@ -94,6 +98,7 @@ function makeHarness(opts?: { channelPreset?: ChannelPreset }) {
     logger: silent,
     store,
     profiles,
+    modelCatalog: fixtureModelCatalog(profiles),
     defaultAgentId: "claude",
     defaultModel: "claude-opus-5",
     defaultPermissionMode: "ask",
@@ -116,6 +121,7 @@ function makeHarness(opts?: { channelPreset?: ChannelPreset }) {
       REPO_EMOJIS: new Map(),
     } as any,
     adapter: {} as any,
+    modelCatalog: fixtureModelCatalog(profiles),
     router,
     store,
     renderer: { codeBlock: (value: string) => value } as any,
@@ -295,7 +301,7 @@ describe("/seam config set named parameters", () => {
 
     const unsupported = interaction({ agent: "codex@local", effort: "ultra" });
     await (orch as any).cmdConfigSet(unsupported.i);
-    expect(unsupported.edits[0]).toMatch(/not supported by `codex`/);
+    expect(unsupported.edits[0]).toMatch(/not supported by `codex\/gpt-5\.6-sol`/);
     expect(read(store).record.agentId).toBe("claude");
     store.close();
   });
@@ -308,7 +314,7 @@ describe("/seam config set named parameters", () => {
     expect(call.edits.at(-1)).toMatch(/Config replaced/);
     const { record, cfg } = read(store);
     expect(record.acpSessionId).toBe("acp-old");
-    expect(cfg).toEqual({ role: "planner", permissionPolicy: "deny", model: "claude-opus-5" });
+    expect(cfg).toEqual({ role: "planner", permissionPolicy: "deny", model: "claude-opus-5", reasoningEffort: "default" });
     store.close();
   });
 

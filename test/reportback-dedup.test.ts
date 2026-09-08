@@ -14,6 +14,7 @@ import {
 } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -35,6 +36,7 @@ const record = (over: Partial<SessionRecord> = {}): SessionRecord => ({
 });
 
 function makeOrch(): Orchestrator {
+  const catalogProfile = { id: "claude", defaultModel: "default" } as any;
   const router = {
     listProfiles: () => [],
     describeConfig: () => ({}),
@@ -70,6 +72,7 @@ function makeOrch(): Orchestrator {
       },
       async editMessage() {},
     } as any,
+    modelCatalog: fixtureModelCatalog([catalogProfile]),
     router: router as any,
     store,
     renderer: {} as any,

@@ -33,6 +33,7 @@ function endpoint(over: Partial<IngestEndpoint> = {}): IngestEndpoint {
     tokenHash: hash,
     name: "essay-check",
     cwd: "/repo",
+    location: "local",
     agentId: "claude",
     model: "default",
     effort: null,
@@ -175,6 +176,7 @@ describe("planEndpointDispatch", () => {
     expect(spec.stream).toBe(false);
     expect(spec.target).toBe("ingest:ie_test1");
     expect(spec.cwd).toBe("/repo");
+    expect(spec.location).toBe("local");
     expect(spec.agentId).toBe("claude");
     expect(spec.prompt).toContain("hello");
     expect(spec.preset).toBeUndefined();
@@ -186,6 +188,14 @@ describe("planEndpointDispatch", () => {
     });
     expect(spec.preset).toBe("hist-grader");
     expect(spec.agentId).toBeUndefined();
+  });
+  it("carries the frozen authoring host for remote-only dispatch", () => {
+    const spec = planEndpointDispatch({
+      endpoint: endpoint({ location: "studio", agentId: "remote-only" }),
+      payload: "x",
+    });
+    expect(spec.location).toBe("studio");
+    expect(spec.agentId).toBe("remote-only");
   });
   it("uses notifyThread as target when it is a snowflake", () => {
     const spec = planEndpointDispatch({
@@ -207,7 +217,6 @@ describe("planEndpointDispatch", () => {
       }),
       payload: "hello",
       untrustedStudentId: "s1",
-      defaultModel: "should-be-ignored",
     });
     expect(spec.kind).toBe("ingest");
     expect(spec.session).toBe("live");
@@ -238,6 +247,10 @@ describe("ingest endpoint store", () => {
     store.insertIngestEndpoint(endpoint({ preset: "hist-grader" }));
     expect(store.getIngestEndpoint("ie_test1")?.preset).toBe("hist-grader");
   });
+  it("round-trips the authoring host", () => {
+    store.insertIngestEndpoint(endpoint({ location: "studio" }));
+    expect(store.getIngestEndpoint("ie_test1")?.location).toBe("studio");
+  });
   it("round-trips a live thread destination (#224)", () => {
     store.insertIngestEndpoint(endpoint({ thread: "1516907849349857421" }));
     expect(store.getIngestEndpoint("ie_test1")?.thread).toBe("1516907849349857421");
@@ -260,6 +273,55 @@ describe("ingest endpoint store", () => {
 });
 
 describe("POST /ingest headless endpoint (#95)", () => {
+  it("keeps an unpinned remote-only model unresolved until its binding fires", async () => {
+    const token = mintBridgeToken();
+    store.insertIngestEndpoint(
+      endpoint({
+        tokenHash: hashBridgeToken(token),
+        location: "studio",
+        agentId: "remote-only",
+        model: null,
+        effort: null,
+      })
+    );
+    const specs: DispatchSpec[] = [];
+    const ingest = new ChoiceIngest({
+      store,
+      results: new ChoiceResultHub({ store, logger: silent }),
+      logger: silent,
+      enqueue: async (spec) => {
+        specs.push(spec);
+      },
+      destLive: async () => "ok",
+      authoringSession: () => record(),
+      publicBase: () => "https://example.test",
+      waitMs: 50,
+      // A controller-local default must never leak into a remote binding.
+      defaultModel: () => "controller-local-default",
+    });
+    const server = createServer((req, res) => void ingest.handle(req, res));
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/ingest?wait=0`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ text: "score me" }),
+      });
+      expect(response.status).toBe(202);
+      expect(specs).toHaveLength(1);
+      expect(specs[0]).toMatchObject({
+        location: "studio",
+        agentId: "remote-only",
+        session: "isolated",
+      });
+      expect(specs[0]!.model).toBeUndefined();
+      expect(specs[0]!.effort).toBeUndefined();
+    } finally {
+      server.close();
+    }
+  });
+
   it("retries the same studentId by default", async () => {
     const token = mintBridgeToken();
     store.insertIngestEndpoint(endpoint({ tokenHash: hashBridgeToken(token) }));

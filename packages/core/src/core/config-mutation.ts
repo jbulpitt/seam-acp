@@ -33,8 +33,8 @@ import { PresetsFileSchema } from "../config.js";
 import { uniqueBridgeId } from "./bridge-pairing.js";
 import type { Logger } from "../lib/logger.js";
 import { parkedAgentMessage } from "./parked-agents.js";
-import type { AgentProfile } from "@seam/adapters";
 import type { ConfigDescription } from "./session-router.js";
+import type { ModelCatalogService } from "./model-catalog/service.js";
 import { validateCron, describeCron } from "./scheduled-prompts/cron.js";
 import { legacyAttachmentQuarantine } from "./scheduled-prompts/quarantine.js";
 import { FAST_MODE_COST_WARNING, FAST_MODE_RESET_NOTICE } from "./fast-mode.js";
@@ -266,6 +266,7 @@ export function detectSessionReset(input: {
   previousAgentId: string;
   nextAgentId: string;
   modelChanged: boolean;
+  modelApplicationMode?: "live" | "reload" | "freshSession";
   /** #37: Fast mode is a session-start dimension. Changing it MUST land on a
    *  fresh session so an already-accumulated conversation is never repriced at
    *  Fast rates by a mid-conversation enable. */
@@ -274,10 +275,7 @@ export function detectSessionReset(input: {
   if (input.previousAgentId !== input.nextAgentId) {
     return { sessionReset: true, resetReason: "agent-switch" };
   }
-  if (
-    input.modelChanged &&
-    (input.nextAgentId === "codex" || input.nextAgentId === "ollama-cloud")
-  ) {
+  if (input.modelChanged && input.modelApplicationMode === "freshSession") {
     return { sessionReset: true, resetReason: "model-switch" };
   }
   if (input.fastModeChanged) {
@@ -326,8 +324,8 @@ export interface ConfigMutationDeps {
   store: ConfigMutationStore;
   /** Re-derives effective config + which layer won (Trap 1). */
   describeConfig: (record: SessionRecord) => ConfigDescription;
-  profiles: Map<string, AgentProfile>;
-  defaultModel: string;
+  /** Sole cache-only authority for operational model capabilities. */
+  modelCatalog: Pick<ModelCatalogService, "model">;
   /**
    * #220: when false, refuse ollama-cloud as parked even if a stale profile
    * is still in `profiles`. Undefined keeps historical unknown-agent wording.
@@ -373,6 +371,10 @@ export class ConfigMutationService {
   constructor(deps: ConfigMutationDeps) {
     this.deps = deps;
     this.logger = deps.logger.child({ comp: "config-mutation" });
+  }
+
+  private catalogModel(agentId: string, model: string, location = "local") {
+    return this.deps.modelCatalog.model({ agentId, location }, model);
   }
 
   /**
@@ -887,17 +889,19 @@ export class ConfigMutationService {
     const fields: ProposedField[] = [];
     const warnings: string[] = [];
 
-    // agent — must be a registered profile, or the next start throws.
+    // Agent availability comes from the host-aware operational catalog.
     let nextAgentId = record.agentId;
     if (changes.agent !== undefined) {
-      const parked = parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select");
+      const parked = before.location.value === "local"
+        ? parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select")
+        : null;
       if (parked) {
         return { ok: false, error: parked };
       }
-      if (!this.deps.profiles.has(changes.agent)) {
+      if (!this.catalogModel(changes.agent, "default", before.location.value)) {
         return {
           ok: false,
-          error: `Unknown agent "${changes.agent}". Pick a registered agent profile.`,
+          error: `Unknown agent "${changes.agent}" at ${before.location.value}. Refresh its catalog first.`,
         };
       }
       nextAgentId = changes.agent;
@@ -917,8 +921,21 @@ export class ConfigMutationService {
 
     // model
     if (changes.model !== undefined) {
-      const m = changes.model.trim();
-      if (!m) return { ok: false, error: "`model` must be a non-empty string." };
+      const requested = changes.model.trim();
+      if (!requested) return { ok: false, error: "`model` must be a non-empty string." };
+      const discovered = this.catalogModel(
+        nextAgentId,
+        requested,
+        before.location.value
+      );
+      if (!discovered) {
+        return {
+          ok: false,
+          error: `Model "${requested}" is unavailable in the cached catalog for ` +
+            `${nextAgentId}@${before.location.value}.`,
+        };
+      }
+      const m = discovered.id;
       nextCfg.model = m;
       if (m !== before.model.value) {
         fields.push({ label: "model", before: before.model.value, after: m });
@@ -929,6 +946,18 @@ export class ConfigMutationService {
             `("${before.model.value}") — the write persists to session config but the ` +
             `preset still wins, so the effective model will not change.`
         );
+      }
+      if (changes.effort === undefined && m !== before.model.value) {
+        if (discovered) {
+          nextCfg.reasoningEffort = discovered.effort.selectionDefault;
+          if (discovered.effort.selectionDefault !== before.effort.value) {
+            fields.push({
+              label: "effort",
+              before: before.effort.value ?? "(none)",
+              after: discovered.effort.selectionDefault,
+            });
+          }
+        }
       }
     }
 
@@ -964,19 +993,20 @@ export class ConfigMutationService {
         fields.push({ label: "effort", before: before.effort.value ?? "(none)", after: "(none)" });
       } else {
         const level = changes.effort;
-        const profile = this.deps.profiles.get(nextAgentId);
+        const catalogChoices = this.catalogModel(
+          nextAgentId,
+          nextCfg.model ?? before.model.value,
+          before.location.value
+        )?.effort.choices.map((choice) => choice.id);
         const usable = opts.effortValues
           ? opts.effortValues.includes(level)
-          : Boolean(
-              profile?.effort &&
-              profile.effort.mechanism !== "none" &&
-              profile.effort.levels.includes(level)
-            );
+          : Boolean(catalogChoices?.includes(level));
         if (!usable) {
-          warnings.push(
-            `agent "${nextAgentId}" does not support effort "${level}" — it will be ` +
-              `ignored at runtime (Trap 2). Effort left unchanged.`
-          );
+          return {
+            ok: false,
+            error: `Agent "${nextAgentId}" does not support effort "${level}" for model ` +
+              `"${nextCfg.model ?? before.model.value}".`,
+          };
         } else {
           nextCfg.reasoningEffort = level;
           if (level !== before.effort.value) {
@@ -1178,6 +1208,7 @@ export class ConfigMutationService {
   ): BuildProposalResult {
     const name = changes.name?.trim();
     if (!name) return { ok: false, error: "`preset.name` is required." };
+    const before = this.deps.describeConfig(record);
 
     // Project scope = the calling thread's channel (#21) — never global by
     // default (a conversationally-created preset lands where it was made).
@@ -1188,10 +1219,12 @@ export class ConfigMutationService {
     }
 
     if (changes.agent !== undefined) {
-      const parked = parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select");
+      const parked = before.location.value === "local"
+        ? parkedAgentMessage(changes.agent, this.deps.ollamaCloudEnabled, "select")
+        : null;
       if (parked) return { ok: false, error: parked };
-      if (!this.deps.profiles.has(changes.agent)) {
-        return { ok: false, error: `Unknown agent "${changes.agent}".` };
+      if (!this.catalogModel(changes.agent, "default", before.location.value)) {
+        return { ok: false, error: `Unknown agent "${changes.agent}" at ${before.location.value}.` };
       }
     }
     if (changes.permission !== undefined && !PERMISSIONS.includes(changes.permission)) {
@@ -1203,13 +1236,33 @@ export class ConfigMutationService {
     const fields: ProposedField[] = [];
 
     const nextAgentId = changes.agent ?? existing?.agentId ?? null;
-    const nextModel = changes.model?.trim() || existing?.model || null;
-    const nextEffort =
+    let nextModel = changes.model?.trim() || existing?.model || null;
+    if (nextAgentId && nextModel && (changes.model !== undefined || changes.agent !== undefined)) {
+      const discovered = this.catalogModel(nextAgentId, nextModel, before.location.value);
+      if (!discovered) {
+        return { ok: false, error: `Model "${nextModel}" is unavailable in the cached catalog for ${nextAgentId}@${before.location.value}.` };
+      }
+      if (discovered) nextModel = discovered.id;
+    }
+    let nextEffort =
       changes.effort === null
         ? null
         : changes.effort !== undefined
           ? changes.effort
           : (existing?.effort ?? null);
+    if (
+      changes.model !== undefined &&
+      nextModel !== existing?.model &&
+      changes.effort === undefined &&
+      nextAgentId &&
+      nextModel
+    ) {
+      nextEffort = this.catalogModel(
+        nextAgentId,
+        nextModel,
+        before.location.value
+      )?.effort.selectionDefault ?? nextEffort;
+    }
     const nextDescription =
       changes.description === null
         ? null
@@ -1273,15 +1326,15 @@ export class ConfigMutationService {
         : changes.disableThreadPrefix;
 
     if (nextEffort) {
-      const profile = nextAgentId ? this.deps.profiles.get(nextAgentId) : undefined;
-      const usable =
-        profile?.effort &&
-        profile.effort.mechanism !== "none" &&
-        profile.effort.levels.includes(nextEffort);
+      const catalogChoices = nextAgentId && nextModel
+        ? this.catalogModel(nextAgentId, nextModel, before.location.value)?.effort.choices.map((choice) => choice.id)
+        : undefined;
+      const usable = Boolean(catalogChoices?.includes(nextEffort));
       if (nextAgentId && !usable) {
-        warnings.push(
-          `agent "${nextAgentId}" may not support effort "${nextEffort}" — it will be ignored when this preset runs.`
-        );
+        return {
+          ok: false,
+          error: `Agent "${nextAgentId}" does not support effort "${nextEffort}" for model "${nextModel}".`,
+        };
       }
     }
 
@@ -1501,6 +1554,26 @@ export class ConfigMutationService {
     };
     const channels = { ...(doc.channels ?? {}) };
     const current = { ...(channels[channelId] ?? {}) };
+    const effectiveChanges: ChannelPresetChanges = { ...changes };
+    if (changes.model) {
+      const agentId = changes.agent ?? ((current.agent as { value?: string } | undefined)?.value);
+      if (agentId) {
+        const discovered = this.catalogModel(agentId, changes.model, "local");
+        if (!discovered) {
+          return { ok: false, error: `Model "${changes.model}" is unavailable in the cached catalog for ${agentId}@local.` };
+        }
+        if (discovered) {
+          effectiveChanges.model = discovered.id;
+          const currentModel = (current.model as { value?: string } | undefined)?.value;
+          if (changes.effort === undefined && discovered.id !== currentModel) {
+            effectiveChanges.effort = discovered.effort.selectionDefault;
+          }
+          if (changes.effort && !discovered.effort.choices.some((choice) => choice.id === changes.effort)) {
+            return { ok: false, error: `Effort "${changes.effort}" is not supported for ${agentId}/${discovered.id}.` };
+          }
+        }
+      }
+    }
 
     const keys: Array<keyof ChannelPresetChanges> = [
       "agent",
@@ -1516,7 +1589,7 @@ export class ConfigMutationService {
     const fields: ProposedField[] = [];
     const next: Record<string, unknown> = { ...current };
     for (const key of keys) {
-      const val = changes[key];
+      const val = effectiveChanges[key];
       if (val === undefined) continue; // field not part of this proposal
       const beforeVal = (current[key] as { value?: unknown } | undefined)?.value ?? null;
       const clearsRole = key === "role" && typeof val === "string" && val.trim().toLowerCase() === "auto";
@@ -1699,6 +1772,35 @@ export class ConfigMutationService {
     const current = { ...(threads[threadId] ?? {}) };
     // The parent channel's entry, used ONLY to detect Trap-1 shadowing below.
     const channelEntry = parentRef ? doc.channels?.[parentRef] : undefined;
+    const effectiveChanges: ThreadPresetChanges = { ...changes };
+    if (changes.model) {
+      const agentId = changes.agent ??
+        ((current.agent as { value?: string } | undefined)?.value) ??
+        ((channelEntry?.agent as { value?: string } | undefined)?.value);
+      const requestedLocation = changes.location;
+      const location = requestedLocation === null || requestedLocation === ""
+        ? "local"
+        : requestedLocation ??
+          ((current.location as { value?: string } | undefined)?.value ?? "local");
+      if (agentId) {
+        const discovered = this.catalogModel(agentId, changes.model, location);
+        if (!discovered) {
+          return { ok: false, error: `Model "${changes.model}" is unavailable in the cached catalog for ${agentId}@${location}.` };
+        }
+        if (discovered) {
+          effectiveChanges.model = discovered.id;
+          const currentModel =
+            ((current.model as { value?: string } | undefined)?.value) ??
+            ((channelEntry?.model as { value?: string } | undefined)?.value);
+          if (changes.effort === undefined && discovered.id !== currentModel) {
+            effectiveChanges.effort = discovered.effort.selectionDefault;
+          }
+          if (changes.effort && !discovered.effort.choices.some((choice) => choice.id === changes.effort)) {
+            return { ok: false, error: `Effort "${changes.effort}" is not supported for ${agentId}/${discovered.id}.` };
+          }
+        }
+      }
+    }
 
     const keys = [
       "agent", "model", "role", "disableThreadPrefix", "cwd", "effort", "rider",
@@ -1708,7 +1810,7 @@ export class ConfigMutationService {
     const warnings: string[] = [];
     const next: Record<string, unknown> = { ...current };
     for (const key of keys) {
-      const val = changes[key];
+      const val = effectiveChanges[key];
       if (val === undefined) continue; // field not part of this proposal
       const beforeVal = (current[key] as { value?: unknown } | undefined)?.value ?? null;
       const clearsRole = key === "role" && typeof val === "string" && val.trim().toLowerCase() === "auto";

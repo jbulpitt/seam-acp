@@ -420,6 +420,37 @@ describe("model metadata durable cache", () => {
   });
 });
 
+describe("model metadata catalog generation refresh", () => {
+  it("reruns when publication lands during an in-flight enrichment", async () => {
+    const store = tempStore();
+    let release: (() => void) | undefined;
+    let first = true;
+    const source = vi.fn(async () => {
+      if (first) {
+        first = false;
+        await new Promise<void>((resolve) => { release = resolve; });
+      }
+      return parseAaModels(aaPayload);
+    });
+    const getCatalog = vi.fn(async () => catalog);
+    const manager = new ModelMetadataManager({
+      store,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as any,
+      source: { name: "fixture", fetch: source },
+      getCatalog,
+    });
+    const running = manager.refresh();
+    await vi.waitFor(() => expect(source).toHaveBeenCalledOnce());
+    manager.refreshForCatalogGeneration();
+    release?.();
+    await running;
+    await manager.drain();
+    expect(source).toHaveBeenCalledTimes(2);
+    expect(getCatalog).toHaveBeenCalledTimes(2);
+    store.close();
+  });
+});
+
 describe("model metadata MCP cache-only accessors", () => {
   it("returns structured content plus identical JSON text without a source dependency", async () => {
     const store = tempStore();

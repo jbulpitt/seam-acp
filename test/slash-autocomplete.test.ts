@@ -16,6 +16,7 @@ import { hashBridgeToken } from "../packages/core/src/core/bridge-pairing.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 import type { ChoiceCard } from "../packages/core/src/core/choice/types.js";
 import type { IngestEndpoint } from "../packages/core/src/core/choice/endpoint.js";
 import type { WakeEvent } from "../packages/core/src/core/wake/types.js";
@@ -180,6 +181,7 @@ function makeOrch(over?: {
       SEAM_CONFIG_ADMIN_USER_IDS: new Set(["admin"]),
     } as any,
     adapter: {} as any,
+    modelCatalog: fixtureModelCatalog([grokProfile, copilotProfile] as any),
     router: router as any,
     store,
     renderer: { codeBlock: (s: string) => s } as any,
@@ -244,7 +246,9 @@ describe("slash autocomplete responders", () => {
       ["/workflows/cancel-live", "opaque"],
       ["/workflows/cancel-wake", "opaque"],
       ["/workflows/cancel-watch", "opaque"],
+      ["catalog/refresh/agent", "canonical"],
       ["config/agent/id", "canonical"],
+      ["config/effort/level", "canonical"],
       ["config/mode/id", "canonical"],
       ["config/model/id", "canonical"],
       ["config/repo/path", "canonical"],
@@ -297,7 +301,7 @@ describe("slash autocomplete responders", () => {
     expect(responded[0]).toEqual([{ name: canonical, value: canonical }]);
   });
 
-  it("config model uses the thread agent's staticModels catalog", async () => {
+  it("config model uses the thread agent's operational catalog", async () => {
     store.upsert(session({ agentId: "grok" }));
     const { orch } = makeOrch();
     const { i, responded } = autocompleteI({
@@ -558,6 +562,7 @@ describe("slash autocomplete responders", () => {
       tokenHash: hashBridgeToken("tok"),
       name: "essay-check",
       cwd: "/repo",
+      location: "local",
       agentId: "claude",
       model: "default",
       effort: null,
@@ -566,6 +571,7 @@ describe("slash autocomplete responders", () => {
       corsOrigins: null,
       uniqueStudent: false,
       notifyThread: null,
+      thread: null,
       preset: null,
       status: "open",
       createdBy: "discord:thread-1",
@@ -728,6 +734,7 @@ describe("slash autocomplete responders", () => {
       tokenHash: hashBridgeToken("round-token"),
       name: "essay-check",
       cwd: "/repo",
+      location: "local",
       agentId: "grok",
       model: "grok-4",
       effort: null,
@@ -736,6 +743,7 @@ describe("slash autocomplete responders", () => {
       corsOrigins: null,
       uniqueStudent: false,
       notifyThread: null,
+      thread: null,
       preset: null,
       status: "open",
       createdBy: "discord:thread-1",

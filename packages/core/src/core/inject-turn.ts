@@ -50,6 +50,8 @@ export interface InjectTurnOptions {
   strictModel?: boolean;
   /** Reasoning effort for the turn (agent-specific scale). */
   effort?: string;
+  /** Host catalog scope for isolated turns. Defaults to target binding/local. */
+  location?: string;
   /** Working directory. Required for `"isolated"`; falls back to the target
    *  session's effective cwd (`describeConfig`) when the target is a session. */
   cwd?: string;

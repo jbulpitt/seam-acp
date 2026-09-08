@@ -92,9 +92,15 @@ The POST never selects an agent or model. At mint time choose one of:
 - **`preset`** (preferred for a named grader). It is resolved in the minting
   thread's project scope and re-resolved on every POST, so preset edits apply
   without reminting. It cannot be combined with `agent`, `model`, `effort`, or
-  `cwd`. Cross-channel preset names use `<parent-channel-snowflake>/<name>`.
+  `cwd`. The endpoint retains the minting thread's host, including a remote
+  bridge, and resolves the preset there at fire. Cross-channel preset names use
+  `<parent-channel-snowflake>/<name>`.
 - Pin `agent`, `model`, `effort`, and/or `cwd` on the endpoint.
-- Omit both to inherit the minting thread's runtime settings.
+- An `agent@location` pin explicitly selects a host; a bare agent uses the
+  minting thread's host. Remote-only agents never fall back to local.
+- Omit agent/cwd to inherit them from the minting thread. Omit model/effort to
+  resolve that agent/host catalog's model-specific defaults at fire; the live
+  thread's current model pin is not copied into an isolated endpoint.
 
 Keep the **assignment contract**—rubric, persistence path, and result shape—in
 `wrapper`. Keep the reusable **grader identity** in the preset.

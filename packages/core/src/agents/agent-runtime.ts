@@ -16,7 +16,11 @@ import {
   type SessionConfigOption,
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
-import { SEAM_AGY_JSON_SCHEMA_META, type AgentProfile } from "@seam/adapters";
+import {
+  SEAM_AGY_JSON_SCHEMA_META,
+  type AgentProfile,
+  type CatalogEffort,
+} from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { MessageAttachment } from "../platforms/chat-adapter.js";
 import {
@@ -197,6 +201,7 @@ export class AgentRuntime {
     model?: string,
     effort?: string
   ) => ReturnType<AgentProfile["spawn"]> | Promise<ReturnType<AgentProfile["spawn"]>>;
+  private readonly catalogEffort?: CatalogEffort;
 
   private child?: ReturnType<AgentProfile["spawn"]>;
   private connection?: ClientSideConnection;
@@ -309,6 +314,8 @@ export class AgentRuntime {
     logger: Logger;
     permissionPolicy?: PermissionPolicy;
     mcpServers?: McpServer[];
+    /** Model-specific transport declaration from the pinned catalog generation. */
+    effortDescriptor?: CatalogEffort;
     elicitationHandler?: ElicitationHandler;
     completeElicitationHandler?: (
       notification: CompleteElicitationNotification
@@ -328,6 +335,7 @@ export class AgentRuntime {
     this.profile = opts.profile;
     this.logger = opts.logger.child({ agent: opts.profile.id });
     this.mcpServers = opts.mcpServers ?? [];
+    this.catalogEffort = opts.effortDescriptor;
     this.onDead = opts.onDead;
     this.spawnFn = opts.spawnFn;
     this.elicitationHandler = opts.elicitationHandler;
@@ -939,17 +947,17 @@ export class AgentRuntime {
    *  newSessionMeta instead; modelBaked/none agents have nothing to set. Must
    *  run after the session exists — config options require a live session. */
   private async applyConfigOptionEffort(effort?: string): Promise<void> {
-    const eff = this.profile.effort;
+    const eff = this.catalogEffort;
     if (!eff || eff.mechanism !== "configOption" || !eff.configId) return;
-    if (!effort || effort === "default" || !eff.levels.includes(effort)) return;
-    try {
-      await this.setConfigOption(eff.configId, effort);
-    } catch (err) {
-      this.logger.warn(
-        { err, effort, configId: eff.configId },
-        "failed to apply reasoning-effort config option"
+    const declared = eff.choices.map((choice) => choice.raw ?? choice.id);
+    if (!effort || effort === "default" || !declared.includes(effort)) return;
+    const runtimeValues = this.getConfigSelectValues(eff.configId);
+    if (runtimeValues.length > 0 && !runtimeValues.includes(effort)) {
+      throw new Error(
+        `runtime/catalog drift: config option ${eff.configId} does not advertise pinned effort ${effort}`
       );
     }
+    await this.setConfigOption(eff.configId, effort);
   }
 
   /** Live current value of one ACP select option (e.g. `fast` → `"on"`). */
@@ -1516,12 +1524,8 @@ export class AgentRuntime {
       | null
       | undefined
   ): ReadonlyArray<AvailableModel> {
-    // Profile-declared static models win: they carry the picker labels and
-    // contextLimit the agent doesn't advertise (e.g. the Claude/Copilot
-    // pickers).
-    if (this.profile.staticModels && this.profile.staticModels.length > 0) {
-      return this.profile.staticModels;
-    }
+    // Runtime-advertised options are execution evidence only. Operational UI
+    // enumeration comes exclusively from ModelCatalogService.
     const opt = this.findModelOption(configOptions);
     if (!opt || opt.type !== "select") return [];
     return flattenConfigSelectOptions(opt.options).map((o) => ({

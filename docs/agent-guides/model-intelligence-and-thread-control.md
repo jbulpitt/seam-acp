@@ -26,8 +26,9 @@ There are three capability families:
 All three tools read a cache that a background job refreshes ~every 12h (and on
 boot). They **never** make a live API call or spawn a CLI, so they return in
 milliseconds and are safe to call as often as you like. Source: Artificial
-Analysis (benchmarks) + GitHub Copilot pricing + the Copilot CLI (valid effort
-tiers). Not every model is benchmarked — open-weight / proprietary ones (e.g.
+Analysis (benchmarks) + GitHub Copilot pricing, joined to Seam's current
+host-scoped operational catalog for runnable models and model-specific effort
+tiers. Not every model is benchmarked — open-weight / proprietary ones (e.g.
 MAI-Code, some Ollama models) appear with `null` benchmark/value; handle nulls.
 
 ### `model_value_rankings({ tier?, benchmark? })`
@@ -129,17 +130,19 @@ Discord reconstruction after any configuration change and is valid by itself.
   agent/model/effort, so a coordinator can verify the target without waking it.
   See "Reading a thread name" below.
 - **Reset is reported, not assumed.** Switching **agent** always starts a fresh
-  session (context lost). Switching **model** resets on backends that pin the
-  model at session start (codex, and ollama-cloud when enabled) but not on those that switch live
-  (claude). Switching **effort** never resets the ACP session. Config-option
-  agents update live; metadata/spawn-argument agents such as Claude reload the
-  runtime process with their ACP session and conversation context preserved.
+  session (context lost). Each model's adapter-owned catalog entry declares
+  whether switching it is live, reloads the runtime while preserving context,
+  or requires a fresh session. Switching **effort** never resets the ACP
+  session. Config-option agents update live; metadata/spawn-argument agents
+  reload the runtime process with their ACP session and conversation context preserved.
   The result distinguishes `sessionReset` from `runtimeReloaded`.
 - **Effort is validated per model.** Valid tiers differ by model
   (`minimal < low < medium < high < xhigh < max`); pass `auto` to let the backend
-  pick its default. An unsupported value is refused or coerced to `auto`, never
-  silently sent. (Get a model's valid tiers from `valid_effort_tiers` in
-  `model_value_rankings`, or the metadata tools.)
+  pin its current catalog default. An unsupported value is refused and runtime
+  disagreement is reported as catalog drift, never silently sent. (Get a
+  Copilot model's tiers from `valid_effort_tiers` in
+  `model_value_rankings`; Discord configuration pickers read the same
+  host-scoped operational catalog.)
 - **Preset shadowing is prevented.** The set is persisted as a per-thread
   overlay, so a channel preset cannot leave the runtime or `threads()` display
   on the old agent/model/effort. A compact authoritative identity stamp is also

@@ -155,6 +155,8 @@ Load only what the task needs:
   [HTTP ingest][interactive-ingest].
 - Model selection, another thread's runtime, or migrating your own thread →
   [Models and session control][model-intelligence].
+- Developing or operating Seam's host-scoped model source →
+  [Operational model catalog][model-catalog].
 - Gemini voice tutoring or conversational live audio → [Live Help][live-help].
 - Admin operation of the multi-thread Shared Voice Console →
   [Thread Voice V2][thread-voice].
@@ -184,6 +186,7 @@ another repository; they are not competing specifications:
 [interactive-prompts]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/interactive-prompts.md
 [interactive-ingest]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/interactive-ingest.md
 [model-intelligence]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/model-intelligence-and-thread-control.md
+[model-catalog]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/model-catalog.md
 [live-help]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/live-help.md
 [thread-voice]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/thread-voice.md
 [service-status]: https://raw.githubusercontent.com/jbulpitt/seam-acp/main/docs/agent-guides/service-status.md

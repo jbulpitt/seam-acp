@@ -117,10 +117,15 @@ export function listAgentLocationChoices(opts: {
   for (const host of opts.hosts) {
     const remoteIds =
       host.id === LOCAL_LOCATION ? undefined : opts.agentsByHost?.get(host.id);
-    const profiles =
-      host.id === LOCAL_LOCATION
-        ? opts.profiles
-        : opts.profiles.filter((p) => remoteIds?.has(p.id));
+    const profiles = host.id === LOCAL_LOCATION
+      ? [...opts.profiles]
+      : [
+          ...opts.profiles.filter((p) => remoteIds?.has(p.id)),
+          ...[...(remoteIds ?? [])]
+            .filter((id) => !opts.profiles.some((profile) => profile.id === id))
+            .sort()
+            .map((id) => ({ id, displayName: id })),
+        ];
     for (const p of profiles) {
       const value = formatAgentAtLocation(p.id, host.id);
       const offline = host.id !== LOCAL_LOCATION && !host.ready ? " (offline)" : "";

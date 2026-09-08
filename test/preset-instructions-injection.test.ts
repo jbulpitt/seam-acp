@@ -10,6 +10,7 @@ import type { ConfigDescription } from "../packages/core/src/core/session-router
 import type { AgentProfile } from "@seam/adapters";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -32,8 +33,12 @@ function makeRecord(over: Partial<SessionRecord> = {}): SessionRecord {
   };
 }
 
-const claudeProfile = { id: "claude" } as unknown as AgentProfile;
-const profiles = new Map<string, AgentProfile>([["claude", claudeProfile]]);
+const claudeProfile = {
+  id: "claude",
+  defaultModel: "gpt-5.4",
+  staticModels: [{ modelId: "gpt-5.4", name: "GPT-5.4" }],
+} as unknown as AgentProfile;
+const modelCatalog = fixtureModelCatalog([claudeProfile]);
 
 function describeConfig(record: SessionRecord): ConfigDescription {
   const cfg = store.readConfig(record);
@@ -62,7 +67,7 @@ function makeService(): ConfigMutationService {
   return new ConfigMutationService({
     store,
     describeConfig,
-    profiles,
+    modelCatalog,
     defaultModel: "gpt-5.4",
     presetsFile: undefined,
     tierCEnabled: false,

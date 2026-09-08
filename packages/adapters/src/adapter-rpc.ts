@@ -51,12 +51,16 @@ export async function invokeAdapterRpc(
     case "prepare":
       if (!adapter) throw new Error("no adapter for prepare");
       return adapter.prepare();
-    case "listPickerModels":
-      if (!adapter) throw new Error("no adapter for listPickerModels");
-      if (adapter.staticModels && adapter.staticModels.length > 0) {
-        return [...adapter.staticModels];
+    case "describeModelCatalog":
+      if (!adapter) throw new Error("no adapter for describeModelCatalog");
+      return adapter.catalog.scope();
+    case "fetchModelCatalog":
+      if (!adapter) throw new Error("no adapter for fetchModelCatalog");
+      {
+        const candidate = await adapter.catalog.fetch();
+        adapter.catalog.validate?.(candidate);
+        return candidate;
       }
-      return adapter.listPickerModels ? [...(await adapter.listPickerModels())] : [];
     case "install": {
       if (!adapter) throw new Error("no adapter for install");
       return adapter.install();

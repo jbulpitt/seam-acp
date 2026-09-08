@@ -1,7 +1,13 @@
 import { spawn } from "node:child_process";
-import { promises as fsp } from "node:fs";
 import path from "node:path";
-import { asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import {
+  manifestCatalogScope,
+  manifestCatalogSource,
+  readCliVersion,
+  readJsonFileBounded,
+  type ManifestCatalogModel,
+} from "../model-catalog.js";
 import {
   CodexSessionManager,
   defaultCodexSessionsRoot,
@@ -13,58 +19,100 @@ interface CodexCachedModel {
   slug?: unknown;
   display_name?: unknown;
   context_window?: unknown;
+  max_context_window?: unknown;
   effective_context_window_percent?: unknown;
+  input_modalities?: unknown;
+  default_reasoning_level?: unknown;
+  supported_reasoning_levels?: unknown;
+  default_service_tier?: unknown;
+  supported_in_api?: unknown;
+}
+
+interface CodexCatalogSnapshot {
+  models: ManifestCatalogModel[];
+  sourceVersion?: string;
+}
+
+async function readCodexCatalogSnapshot(modelsCachePath: string): Promise<CodexCatalogSnapshot> {
+  try {
+    const parsed = await readJsonFileBounded(modelsCachePath) as {
+      fetched_at?: unknown;
+      models?: unknown;
+    };
+    if (!Array.isArray(parsed.models)) return { models: [] };
+    const models: ManifestCatalogModel[] = [];
+    for (const raw of parsed.models as CodexCachedModel[]) {
+      if (!raw || typeof raw !== "object" || typeof raw.slug !== "string") continue;
+      const modelId = raw.slug.trim();
+      if (!modelId) continue;
+      const name = typeof raw.display_name === "string" && raw.display_name.trim()
+        ? raw.display_name.trim()
+        : modelId;
+      const native = typeof raw.context_window === "number" && Number.isFinite(raw.context_window) && raw.context_window > 0
+        ? raw.context_window
+        : null;
+      const maximum = typeof raw.max_context_window === "number" && Number.isFinite(raw.max_context_window) && raw.max_context_window > 0
+        ? raw.max_context_window
+        : native;
+      const percent = typeof raw.effective_context_window_percent === "number" &&
+        Number.isFinite(raw.effective_context_window_percent) && raw.effective_context_window_percent > 0
+        ? raw.effective_context_window_percent
+        : 100;
+      const effective = native ? Math.floor(native * percent / 100) : null;
+      const choices = Array.isArray(raw.supported_reasoning_levels)
+        ? raw.supported_reasoning_levels.flatMap((entry) => {
+            if (typeof entry === "string" && entry.trim()) return [entry.trim()];
+            if (entry && typeof entry === "object" && "effort" in entry &&
+              typeof (entry as { effort?: unknown }).effort === "string") {
+              const effort = (entry as { effort: string }).effort.trim();
+              return effort ? [effort] : [];
+            }
+            return [];
+          })
+        : [];
+      const declaredDefault = typeof raw.default_reasoning_level === "string" &&
+        choices.includes(raw.default_reasoning_level)
+        ? raw.default_reasoning_level
+        : undefined;
+      const input = Array.isArray(raw.input_modalities)
+        ? raw.input_modalities.filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+        : ["text"];
+      models.push({
+        modelId,
+        name,
+        context: { native, maximum, effective },
+        modalities: { input, output: ["text"] },
+        visionMode: input.includes("image") ? "native" : "none",
+        availability: raw.supported_in_api === false ? "unavailable" : "available",
+        serviceTiers: typeof raw.default_service_tier === "string" ? [raw.default_service_tier] : [],
+        effort: {
+          mechanism: choices.length ? "configOption" : "none",
+          ...(choices.length ? { configId: "reasoning_effort" } : {}),
+          choices: choices.length ? choices : ["default"],
+          ...(declaredDefault ? { selectionDefault: declaredDefault } : {}),
+        },
+      });
+    }
+    const sourceVersion = typeof parsed.fetched_at === "string" && parsed.fetched_at.trim()
+      ? parsed.fetched_at.trim().slice(0, 256)
+      : undefined;
+    return { models, ...(sourceVersion ? { sourceVersion } : {}) };
+  } catch {
+    return { models: [] };
+  }
 }
 
 /**
  * Read Codex's host-local model cache without starting a session. The effective
  * percentage is the same reduction Codex applies before reporting
  * `model_context_window` in rollout usage events (for example 272000 * 95% =
- * 258400). Missing or malformed caches fail soft so ACP discovery can remain
- * the picker fallback.
+ * 258400). Missing or malformed caches fail soft so the refresh retains its
+ * prior generation; this function is never called by a lookup path.
  */
 export async function readCodexModelCatalog(
   modelsCachePath: string
-): Promise<Array<{ modelId: string; name: string; contextLimit?: number }>> {
-  try {
-    const parsed = JSON.parse(await fsp.readFile(modelsCachePath, "utf8")) as {
-      models?: unknown;
-    };
-    if (!Array.isArray(parsed.models)) return [];
-    const out: Array<{ modelId: string; name: string; contextLimit?: number }> = [];
-    for (const raw of parsed.models as CodexCachedModel[]) {
-      if (!raw || typeof raw !== "object" || typeof raw.slug !== "string") continue;
-      const modelId = raw.slug.trim();
-      if (!modelId) continue;
-      const name =
-        typeof raw.display_name === "string" && raw.display_name.trim()
-          ? raw.display_name.trim()
-          : modelId;
-      const nativeWindow =
-        typeof raw.context_window === "number" &&
-        Number.isFinite(raw.context_window) &&
-        raw.context_window > 0
-          ? raw.context_window
-          : undefined;
-      const effectivePercent =
-        typeof raw.effective_context_window_percent === "number" &&
-        Number.isFinite(raw.effective_context_window_percent) &&
-        raw.effective_context_window_percent > 0
-          ? raw.effective_context_window_percent
-          : 100;
-      const contextLimit = nativeWindow
-        ? Math.floor(nativeWindow * effectivePercent / 100)
-        : undefined;
-      out.push({
-        modelId,
-        name,
-        ...(contextLimit && contextLimit > 0 ? { contextLimit } : {}),
-      });
-    }
-    return out;
-  } catch {
-    return [];
-  }
+): Promise<ManifestCatalogModel[]> {
+  return (await readCodexCatalogSnapshot(modelsCachePath)).models;
 }
 
 /**
@@ -110,24 +158,46 @@ export function makeCodexProfile(opts: {
   const modelsCachePath =
     opts.modelsCachePath ??
     path.join(path.dirname(sessionsRoot), "models_cache.json");
-
+  const catalogEffort = opts.effort ?? {
+    mechanism: "configOption" as const,
+    configId: "reasoning_effort",
+    levels: ["low", "medium", "high", "xhigh", "max", "ultra"],
+  };
   return asLocalAdapter({
     id: opts.id ?? "codex",
     displayName: opts.displayName ?? "OpenAI Codex",
     defaultModel: opts.defaultModel,
-    staticModels: opts.staticModels,
-    async listPickerModels() {
-      if (opts.staticModels && opts.staticModels.length > 0) return opts.staticModels;
-      return readCodexModelCatalog(modelsCachePath);
+    catalog: {
+      scope: () => manifestCatalogScope({
+        provider: opts.id === "ollama-cloud" ? "ollama-cloud" : "openai",
+        backend: opts.extraEnv?.OPENAI_BASE_URL,
+        credentialProfile: path.dirname(modelsCachePath),
+      }),
+      async fetch() {
+        const snapshot: CodexCatalogSnapshot = opts.staticModels?.length
+          ? { models: [...opts.staticModels] }
+          : await readCodexCatalogSnapshot(modelsCachePath);
+        const candidate = await manifestCatalogSource({
+          provider: opts.id === "ollama-cloud" ? "ollama-cloud" : "openai",
+          backend: opts.extraEnv?.OPENAI_BASE_URL,
+          credentialProfile: path.dirname(modelsCachePath),
+          defaultModel: opts.defaultModel,
+          models: () => snapshot.models,
+          effort: {
+            mechanism: catalogEffort.mechanism,
+            ...(catalogEffort.configId ? { configId: catalogEffort.configId } : {}),
+            choices: catalogEffort.levels,
+          },
+          adapterVersion: AGENT_ADAPTER_VERSION,
+          source: opts.staticModels?.length ? "validated-manifest" : "codex-model-cache",
+        }).fetch();
+        candidate.sourceVersion = snapshot.sourceVersion;
+        candidate.cliVersion = await readCliVersion(cli);
+        return candidate;
+      },
     },
     // Codex uses the same configOption effort mechanism as Copilot (both OpenAI).
-    effort: opts.effort ?? {
-      mechanism: "configOption",
-      configId: "reasoning_effort",
-      // codex-acp advertises six reasoning_effort levels (probed on 1.6.2);
-      // "ultra" (max reasoning + auto task delegation) is codex-only.
-      levels: ["low", "medium", "high", "xhigh", "max", "ultra"],
-    },
+    effort: catalogEffort,
     spawn() {
       const env: NodeJS.ProcessEnv = { ...process.env };
       if (opts.extraEnv) {

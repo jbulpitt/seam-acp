@@ -3325,6 +3325,8 @@ export class SeamMcpServer {
       line("tts pace:", d.ttsPace.value, d.ttsPace.source),
       line("tts style:", d.ttsStyle.value, d.ttsStyle.source),
       line("location:", d.location?.value ?? "local", d.location?.source ?? "default"),
+      `• catalog:    ${d.catalog?.state ?? "warming"}; generation ${d.catalog?.generation ?? "none"}; ` +
+        `source ${d.catalog?.source ?? "none"}; fetched ${d.catalog?.fetchedAt ?? "n/a"}`,
     ];
     if (d.rider?.channel || d.rider?.thread) {
       lines.push(

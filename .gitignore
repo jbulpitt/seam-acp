@@ -9,6 +9,7 @@ data/
 # Local docs (reports, plans, specs — not committed; tracked files unaffected).
 # Explicit exceptions keep new canonical agent entry points visible to Git.
 docs/*
+!docs/model-catalog.md
 !docs/agent-guides/
 docs/agent-guides/*
 !docs/agent-guides/README.md

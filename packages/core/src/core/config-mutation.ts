@@ -1327,7 +1327,7 @@ export class ConfigMutationService {
 
     if (nextEffort) {
       const catalogChoices = nextAgentId && nextModel
-        ? this.catalogModel(nextAgentId, nextModel, "local")?.effort.choices.map((choice) => choice.id)
+        ? this.catalogModel(nextAgentId, nextModel, before.location.value)?.effort.choices.map((choice) => choice.id)
         : undefined;
       const usable = Boolean(catalogChoices?.includes(nextEffort));
       if (nextAgentId && !usable) {

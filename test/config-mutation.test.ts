@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +14,7 @@ import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import type { ModelCatalogService } from "../packages/core/src/core/model-catalog/service.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -117,12 +118,13 @@ function makeService(over: {
   reloadPresets?: () => { ok: boolean; error?: string };
   reschedule?: (id: string) => void;
   defaultTimezone?: string;
+  describe?: (record: SessionRecord) => ConfigDescription;
+  catalog?: Pick<ModelCatalogService, "model">;
 } = {}): ConfigMutationService {
   return new ConfigMutationService({
     store,
-    describeConfig,
-    profiles,
-    modelCatalog,
+    describeConfig: over.describe ?? describeConfig,
+    modelCatalog: over.catalog ?? modelCatalog,
     defaultModel: "gpt-5.4",
     presetsFile: over.presetsFile,
     tierCEnabled: over.tierCEnabled ?? false,
@@ -235,6 +237,31 @@ describe("session config mutation (Tier A)", () => {
 // -------------------------------------------------------------------------
 
 describe("preset mutation (Tier B)", () => {
+  it("validates and pins defaults from a remote-only thread catalog", () => {
+    const record = makeRecord();
+    store.upsert(record);
+    const remoteCatalog = {
+      model: vi.fn((binding: { agentId: string; location: string }, id: string) =>
+        binding.agentId === "remote-zai" && binding.location === "gpu"
+          ? modelCatalog.model({ agentId: "claude", location: "local" }, id)
+          : null),
+    };
+    const svc = makeService({
+      catalog: remoteCatalog,
+      describe: (target) => ({
+        ...describeConfig(target),
+        location: { value: "gpu", source: "thread preset" },
+      }),
+    });
+    const built = svc.buildProposal(record, {
+      preset: { name: "remote-reviewer", agent: "remote-zai", model: "gpt-5.4" },
+    });
+    if (!built.ok) throw new Error(built.error);
+    expect(built.ok).toBe(true);
+    expect(remoteCatalog.model).toHaveBeenCalled();
+    expect(remoteCatalog.model.mock.calls.every(([binding]) => binding.location === "gpu")).toBe(true);
+  });
+
   it("creates a project-scoped preset with a naming role only on apply", () => {
     const record = makeRecord();
     store.upsert(record);

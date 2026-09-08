@@ -20563,7 +20563,16 @@ export class Orchestrator {
     createScope?: string | null,
     seedRole?: string | null
   ): Promise<void> {
-    const profiles = this.router.listProfiles();
+    const presetLocation = resolveThreadLocation(this.config, i.channelId);
+    const localProfiles = this.router.listProfiles();
+    const profiles = presetLocation === LOCAL_LOCATION
+      ? localProfiles
+      : [...(this.catalogAgentsByHost().get(presetLocation) ?? new Set<string>())]
+          .sort()
+          .map((id) => localProfiles.find((profile) => profile.id === id) ?? {
+            id,
+            displayName: id,
+          });
 
     // Scope is fixed at creation: editing preserves the preset's scope, while a
     // new preset takes `createScope` (the current project, or null for global).
@@ -20601,13 +20610,14 @@ export class Orchestrator {
       disableThreadPrefix: existing?.disableThreadPrefix ?? null,
     };
 
-    // Preset editing uses only the controller's cache; it never starts an ACP
-    // session or reads an adapter source.
+    // Preset editing uses only the controller's cache for this thread's host;
+    // it never starts an ACP session or reads an adapter source. Presets remain
+    // locationless, so applying one elsewhere revalidates against that host.
     const loadModels = async (
       agentId: string | null
     ): Promise<ReadonlyArray<{ modelId: string; name: string }>> => {
       if (!agentId) return [];
-      return this.modelCatalog.models({ agentId, location: "local" })
+      return this.modelCatalog.models({ agentId, location: presetLocation })
         .map((model) => ({ modelId: model.id, name: model.displayName }));
     };
     let models = await loadModels(state.agentId);
@@ -20685,7 +20695,7 @@ export class Orchestrator {
 
       const effortLevels = state.agentId
         ? this.modelCatalog.model(
-            { agentId: state.agentId, location: "local" },
+            { agentId: state.agentId, location: presetLocation },
             state.model ?? "default"
           )?.effort.choices.map((choice) => choice.id) ?? []
         : [];
@@ -20833,7 +20843,7 @@ export class Orchestrator {
               state.model = picked.value;
               state.effort = state.agentId
                 ? this.modelCatalog.model(
-                    { agentId: state.agentId, location: LOCAL_LOCATION },
+                    { agentId: state.agentId, location: presetLocation },
                     picked.value
                   )?.effort.selectionDefault ?? null
                 : null;
@@ -20846,7 +20856,7 @@ export class Orchestrator {
             state.model = nextModel;
             state.effort = nextModel && state.agentId
               ? this.modelCatalog.model(
-                  { agentId: state.agentId, location: "local" },
+                  { agentId: state.agentId, location: presetLocation },
                   nextModel
                 )?.effort.selectionDefault ?? null
               : null;

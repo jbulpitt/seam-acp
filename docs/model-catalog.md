@@ -65,11 +65,21 @@ the disagreeing binding instead of contaminating its peer.
 
 Offline remote hosts retain their snapshot and report it as `stale`. Remote-only
 agent ids remain selectable and use a catalog-backed controller descriptor while
-the actual process is spawned by the bridge. A binding
+the actual process is spawned by the bridge. Preset application, stateless
+workers, and isolated ingest carry the selected/authoring host through catalog
+validation and dispatch; they never fall back to a same-named local profile.
+A binding
 with no valid generation reports `warming`; selection fails closed. Runtime ACP
 configuration is execution evidence only: if a live config option contradicts
 the catalog's raw effort binding, Seam reports runtime/catalog drift and refuses
 to claim success.
+
+Ordinary compaction selects the available catalog model with the largest
+effective context window (declared default wins ties) and budgets transcripts
+from that same record. The former per-provider `*_COMPACTION_MODEL` settings
+and hardcoded context-window map are retired; leftover environment keys are
+inert. The separate Premium Compact (Discord) pipeline retains its fixed,
+catalog-validated analysis contract.
 
 ## Lifecycle and operations
 
@@ -109,4 +119,5 @@ immutable restart persistence, atomic failure retention, collapse quarantine,
 scope single-flight, remote stale behavior, disagreement quarantine,
 non-blocking startup, schema migration, all production profile sources, and the
 manual command. An architecture test prevents the deleted picker/static/live
-session authorities from returning to core selection consumers.
+session authorities, provider-specific ingest allowlists, and summary-model
+switches from returning to core selection consumers.

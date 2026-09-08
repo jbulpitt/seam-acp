@@ -864,7 +864,8 @@ export class SessionStore {
   }
 
   /** #95: named preset resolved at fire. #224: live handoff thread.
-   *  Fresh DBs get both from CREATE TABLE. */
+   *  #229: frozen authoring host for isolated remote dispatch.
+   *  Fresh DBs get all columns from CREATE TABLE. */
   private migrateIngestEndpointPreset(): void {
     try {
       const names = new Set(
@@ -878,6 +879,9 @@ export class SessionStore {
       }
       if (!names.has("thread")) {
         this.db.exec("ALTER TABLE ingest_endpoints ADD COLUMN thread TEXT");
+      }
+      if (!names.has("location")) {
+        this.db.exec("ALTER TABLE ingest_endpoints ADD COLUMN location TEXT");
       }
     } catch {
       /* table missing — CREATE TABLE runs first */
@@ -2832,12 +2836,12 @@ export class SessionStore {
     this.db
       .prepare(
         `INSERT INTO ingest_endpoints
-           (id, token_hash, name, cwd, agent_id, model, effort, wrapper,
+           (id, token_hash, name, cwd, location, agent_id, model, effort, wrapper,
             result_schema_json, cors_json, unique_student, notify_thread, thread, preset,
             status, created_by, created_utc, authoring_channel_ref,
             authoring_parent_ref, platform)
          VALUES
-           (@id, @tokenHash, @name, @cwd, @agentId, @model, @effort, @wrapper,
+           (@id, @tokenHash, @name, @cwd, @location, @agentId, @model, @effort, @wrapper,
             @resultSchemaJson, @corsJson, @uniqueStudent, @notifyThread, @thread, @preset,
             @status, @createdBy, @createdUtc, @authoringChannelRef,
             @authoringParentRef, @platform)`
@@ -2847,6 +2851,7 @@ export class SessionStore {
         tokenHash: e.tokenHash,
         name: e.name,
         cwd: e.cwd,
+        location: e.location,
         agentId: e.agentId,
         model: e.model,
         effort: e.effort,
@@ -6112,6 +6117,7 @@ CREATE TABLE IF NOT EXISTS ingest_endpoints (
   token_hash             TEXT NOT NULL UNIQUE,
   name                   TEXT NOT NULL,
   cwd                    TEXT,
+  location               TEXT,
   agent_id               TEXT,
   model                  TEXT,
   effort                 TEXT,
@@ -6847,6 +6853,7 @@ interface IngestEndpointRow {
   token_hash: string;
   name: string;
   cwd: string | null;
+  location: string | null;
   agent_id: string | null;
   model: string | null;
   effort: string | null;
@@ -6870,6 +6877,7 @@ const mapIngestEndpoint = (r: IngestEndpointRow): IngestEndpoint => ({
   tokenHash: r.token_hash,
   name: r.name,
   cwd: r.cwd,
+  location: r.location ?? null,
   agentId: r.agent_id,
   model: r.model,
   effort: r.effort,

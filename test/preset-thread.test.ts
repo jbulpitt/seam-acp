@@ -157,7 +157,7 @@ function makeOrch(over?: {
   locked?: boolean;
   listPresetsForProject?: SessionStore["listPresetsForProject"];
   channelPresets?: Map<string, { locked?: boolean; role?: { value: string }; disableThreadPrefix?: { value: boolean } }>;
-  threadPresets?: Map<string, { role?: { value: string }; disableThreadPrefix?: { value: boolean } }>;
+  threadPresets?: Map<string, { location?: string; role?: { value: string }; disableThreadPrefix?: { value: boolean } }>;
   threadNames?: Map<string, string>;
   getThreadName?: (ch: ChannelRef) => Promise<string | undefined>;
   addThreadMember?: (ch: ChannelRef, userId: string) => Promise<void>;
@@ -167,6 +167,7 @@ function makeOrch(over?: {
   const addedMembers: Array<{ id: string; userId: string }> = [];
   const sent: Array<{ id: string; text: string }> = [];
   const openingTurns: Array<{ id: string; prompt: string; authorId: string }> = [];
+  const profileLookups: Array<{ id: string; location?: string }> = [];
   const threadNames = over?.threadNames ?? new Map<string, string>();
   const testProfiles = [
     {
@@ -196,6 +197,12 @@ function makeOrch(over?: {
       return {
         agent: { value: (store.get(record.id) ?? record).agentId, source: "session config" },
         model: { value: cfg.model ?? "default-model", source: "session config" },
+        location: {
+          value: over?.threadPresets?.get(record.channelRef)?.location ?? "local",
+          source: over?.threadPresets?.get(record.channelRef)?.location
+            ? "thread preset"
+            : "default",
+        },
         role: { value: role, source: cfg.role ? "session config" : "default" },
         disableThreadPrefix: {
           value: disableThreadPrefix,
@@ -224,7 +231,10 @@ function makeOrch(over?: {
       store.upsert(rec);
       return rec;
     },
-    getProfile: (id: string) => testProfiles.find((profile) => profile.id === id),
+    getProfile: (id: string, location?: string) => {
+      profileLookups.push({ id, location });
+      return testProfiles.find((profile) => profile.id === id);
+    },
     invalidate: vi.fn(async () => {}),
   };
   const modelCatalog = fixtureModelCatalog(router.listProfiles() as any);
@@ -299,7 +309,17 @@ function makeOrch(over?: {
     if (!prompt) return;
     openingTurns.push({ id: thread.id, prompt, authorId });
   };
-  return { orch, created, renamed, addedMembers, sent, router, threadNames, openingTurns };
+  return {
+    orch,
+    created,
+    renamed,
+    addedMembers,
+    sent,
+    router,
+    threadNames,
+    openingTurns,
+    profileLookups,
+  };
 }
 
 beforeEach(() => {
@@ -696,6 +716,20 @@ describe("/seam preset thread data-driven auto-name", () => {
 });
 
 describe("applyPresetToSession naming safety", () => {
+  it("resolves a preset agent against the thread's remote host", async () => {
+    store.upsertPreset(preset({ name: "reviewer", agentId: "grok" }));
+    store.upsert(sessionRow({ id: "thread-1", agentId: "copilot" }));
+    const { orch, profileLookups } = makeOrch({
+      threadPresets: new Map([["thread-1", { location: "studio" }]]),
+    });
+    await (orch as any).applyPresetToSession(
+      { platform: "discord", id: "thread-1", parentId: "chan-1" },
+      store.get("discord:thread-1")!,
+      store.getPresetByNameScoped("reviewer", "chan-1")!
+    );
+    expect(profileLookups).toContainEqual({ id: "grok", location: "studio" });
+  });
+
   it("does not auto-manage an existing thread with no stored prefix", async () => {
     store.upsertPreset(preset({ name: "reviewer", agentId: "grok", role: "analyst" }));
     const names = new Map<string, string>([["thread-1", "seam"]]);

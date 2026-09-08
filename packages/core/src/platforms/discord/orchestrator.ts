@@ -71,6 +71,7 @@ import {
 } from "../../core/compaction/discord-executor.js";
 import { pinnedFactsPrompt, parseJsonOutput, mergePinnedFacts, coercePinnedFacts, PINNED_FACTS_JSON_SCHEMA, assembleNewSession, type PinnedFacts } from "../../core/compaction/prompts.js";
 import type { AgentProfile } from "@seam/adapters";
+import type { McpServer } from "@agentclientprotocol/sdk";
 import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import type { WakeManager } from "../../core/wake/manager.js";
@@ -487,10 +488,7 @@ import {
   parseIngestEndpointSpec,
   type IngestEndpoint,
 } from "../../core/choice/endpoint.js";
-import {
-  ingestMintStoredModel,
-  refuseIsolatedClaudeModel,
-} from "../../core/choice/ingest-model.js";
+import { ingestMintStoredModel } from "../../core/choice/ingest-model.js";
 import { mintBridgeToken, hashBridgeToken } from "../../core/bridge-pairing.js";
 import { renderMathPng } from "../../core/math-render.js";
 import {
@@ -4657,38 +4655,30 @@ export class Orchestrator {
     return typeof fn === "function" ? fn.call(this.router, agentId) : null;
   }
 
-  /** Returns the configured compaction model for an agent id, or "" if the
-   *  agent isn't supported. Compaction always uses a known-good high-context
-   *  summarizer rather than the session's own model — the latter can be too
-   *  small to fit a near-full transcript with any response headroom. */
-  private compactionModelFor(agentId: string): string {
-    if (agentId === "agy" || agentId.startsWith("agy-")) {
-      return this.config.AGY_COMPACTION_MODEL;
+  /** Generic compaction policy over the operational catalog: use the available
+   *  model with the largest effective context, preferring the declared default
+   *  on ties. Provider ids and model slugs never enter the decision. */
+  private compactionModelFor(agentId: string, location: string): string {
+    let selected: ReturnType<ModelCatalogService["model"]> = null;
+    let selectedWindow = -1;
+    for (const model of this.modelCatalog.models({ agentId, location })) {
+      if (model.availability !== "available" || model.lifecycle === "retired") continue;
+      const window = model.context.effective ?? model.context.maximum ?? model.context.native ?? 0;
+      if (
+        !selected ||
+        window > selectedWindow ||
+        (window === selectedWindow && model.default && !selected.default)
+      ) {
+        selected = model;
+        selectedWindow = window;
+      }
     }
-    if (agentId === "claude" || agentId.startsWith("claude-")) {
-      return this.config.CLAUDE_COMPACTION_MODEL;
-    }
-    if (
-      agentId === "copilot" ||
-      agentId.startsWith("copilot-") ||
-      agentId === "remote"
-    ) {
-      return this.config.COPILOT_COMPACTION_MODEL;
-    }
-    if (agentId === "codex" || agentId.startsWith("codex-")) {
-      return this.config.CODEX_COMPACTION_MODEL;
-    }
-    if (agentId === "grok" || agentId.startsWith("grok-")) {
-      return this.config.GROK_COMPACTION_MODEL;
-    }
-    if (agentId === "zai" || agentId.startsWith("zai-")) {
-      return this.config.ZAI_COMPACTION_MODEL;
-    }
-    if (agentId === "ollama-cloud" || agentId.startsWith("ollama-cloud-")) {
-      if (!this.config.OLLAMA_CLOUD_ENABLED) return "";
-      return this.config.OLLAMA_CLOUD_COMPACTION_MODEL;
-    }
-    return "";
+    return selected?.id ?? "";
+  }
+
+  private compactionWindowFor(agentId: string, location: string, modelId: string): number {
+    const model = this.modelCatalog.model({ agentId, location }, modelId);
+    return model?.context.effective ?? model?.context.maximum ?? model?.context.native ?? 200_000;
   }
 
   /** End-of-turn auto-compaction for agy. Mirrors the manual /compact flow
@@ -4702,7 +4692,8 @@ export class Orchestrator {
     refresh: (force?: boolean) => Promise<void>,
     tokensBefore: number
   ): Promise<void> {
-    const profile = this.router.getProfile(record.agentId);
+    const location = this.router.describeConfig(record).location.value;
+    const profile = this.router.getProfile(record.agentId, location);
     const manager = profile?.sessionManager;
     if (!profile || !manager?.getTranscript) {
       this.logger.debug({ agent: record.agentId }, "auto-compact skipped: missing manager methods");
@@ -4736,7 +4727,7 @@ export class Orchestrator {
     } catch { /* best-effort — don't block compaction on a failed card send */ }
 
     const cwd = this.effectiveCwd(record);
-    if (!this.compactionModelFor(record.agentId)) {
+    if (!this.compactionModelFor(record.agentId, location)) {
       this.logger.warn({ agent: record.agentId }, "auto-compact: no compaction model configured");
       return;
     }
@@ -4747,6 +4738,7 @@ export class Orchestrator {
         profile,
         manager,
         agentId: record.agentId,
+        location,
         cwd,
         sessionId: record.acpSessionId,
       });
@@ -5048,7 +5040,13 @@ export class Orchestrator {
   private makeCompactionRunAgent(
     profile: AgentProfile,
     manager: ISessionManager,
-    opts?: { model?: string; cwd?: string; effort?: string; strictModel?: boolean }
+    opts?: {
+      model?: string;
+      cwd?: string;
+      effort?: string;
+      strictModel?: boolean;
+      location?: string;
+    }
   ): RunAgent {
     const model = opts?.model ?? "default";
     const cwd = opts?.cwd ?? "/tmp";
@@ -5086,6 +5084,7 @@ export class Orchestrator {
           sessionManager: manager,
           cwd,
           model,
+          ...(opts?.location ? { location: opts.location } : {}),
           ...(strictModel ? { strictModel: true } : {}),
           ...(effort ? { effort } : {}),
           ...(runOpts?.jsonSchema ? { jsonSchema: runOpts.jsonSchema } : {}),
@@ -5119,9 +5118,10 @@ export class Orchestrator {
   private compactionEffortFor(
     profile: AgentProfile,
     model: string,
-    tier: "premium" | "cheap"
+    tier: "premium" | "cheap",
+    location = LOCAL_LOCATION
   ): string | undefined {
-    const entry = this.modelCatalog.model({ agentId: profile.id, location: "local" }, model);
+    const entry = this.modelCatalog.model({ agentId: profile.id, location }, model);
     const levels = entry?.effort.choices
       .map((choice) => choice.id)
       .filter((choice) => choice !== "default") ?? [];
@@ -5343,18 +5343,19 @@ export class Orchestrator {
     profile: AgentProfile;
     manager: ISessionManager;
     agentId: string;
+    location: string;
     cwd: string;
     sessionId: string;
     recentWindowTokens?: number;
     log?: (msg: string) => void;
   }): Promise<{ seed: string; keptTurns: number; summarizedTurns: number; pinnedCount: number } | null> {
-    const { profile, manager, agentId, cwd, sessionId } = args;
+    const { profile, manager, agentId, location, cwd, sessionId } = args;
     const log = args.log ?? (() => {});
     const recentWindowTokens = args.recentWindowTokens ?? 12_000;
 
     const transcript = await manager.getTranscript(cwd, sessionId);
     if (!transcript.trim()) return null;
-    const compactionModel = this.compactionModelFor(agentId);
+    const compactionModel = this.compactionModelFor(agentId, location);
     if (!compactionModel) return null;
 
     // Split into the verbatim recent window (kept word-for-word) and the older
@@ -5371,13 +5372,14 @@ export class Orchestrator {
     }
     const olderTurns = turns.slice(0, turns.length - recent.length);
     const recentVerbatim = recent.join("\n\n");
-    const window = compactionWindowFor(compactionModel);
+    const window = this.compactionWindowFor(agentId, location, compactionModel);
     // Cheap tier (single-pass summary): a notch below premium on each agent's
     // own scale (Claude high, Copilot medium).
     const runAgent = this.makeCompactionRunAgent(profile, manager, {
       model: compactionModel,
       cwd,
-      effort: this.compactionEffortFor(profile, compactionModel, "cheap"),
+      effort: this.compactionEffortFor(profile, compactionModel, "cheap", location),
+      location,
     });
 
     // Summary of the older prefix via the existing single-pass template.
@@ -5776,6 +5778,7 @@ export class Orchestrator {
     cwd: string;
     model?: string;
     effort?: string;
+    mcpServers?: McpServer[];
   }): Pick<InjectTurnOptions, "spawnFn" | "mcpServers" | "model" | "effort" | "location"> {
     if (opts.effectiveSession !== "isolated") return {};
     // Local isolated used to spawn with mcpServers: [] — ingest scoring then
@@ -5794,7 +5797,7 @@ export class Orchestrator {
     });
     if (isLocalLocation(opts.workerLocation)) {
       return {
-        mcpServers: this.router.reuseMcpServers(opts.record.id),
+        mcpServers: opts.mcpServers ?? this.router.reuseMcpServers(opts.record.id),
         model: selection.normalized.model,
         effort: selection.normalized.effort,
         location: opts.workerLocation,
@@ -5811,6 +5814,7 @@ export class Orchestrator {
       cwd: opts.cwd,
       model: selection.raw.model,
       ...(selection.raw.effort ? { effort: selection.raw.effort } : {}),
+      globalMcpServers: opts.mcpServers,
     });
     return {
       spawnFn: planned.spawnFn,
@@ -8179,19 +8183,26 @@ export class Orchestrator {
     // under its agent/model/effort/cwd, and prepend its instructions as cold-start
     // identity. `target` remains where output is posted for visibility.
     const preset = spec.preset ? this.store.getPresetByName(spec.preset) : null;
+    const threadLocation = resolveThreadLocation(this.config, spec.target);
+    const requestedWorkerLocation = spec.location ?? threadLocation;
     const agentOverride =
       spec.agentId ??
-      (!preset && spec.preset && this.router.getProfile(spec.preset) ? spec.preset : undefined);
+      (!preset && spec.preset && this.router.getProfile(spec.preset, requestedWorkerLocation)
+        ? spec.preset
+        : undefined);
     if (spec.preset && !preset && !agentOverride) {
       throw new Error(`dispatch: unknown preset "${spec.preset}"`);
     }
-    const presetProfile = (preset?.agentId ? this.router.getProfile(preset.agentId) : undefined)
-      ?? (agentOverride ? this.router.getProfile(agentOverride) : undefined);
-    let quotaAgentId = presetProfile?.id ?? record.agentId;
     const effectiveSession = preset || agentOverride ? "isolated" : spec.session;
-    const threadLocation = resolveThreadLocation(this.config, spec.target);
-    const workerLocation = spec.location
-      ?? (effectiveSession === "isolated" ? LOCAL_LOCATION : threadLocation);
+    const workerLocation = spec.location ?? threadLocation;
+    const requestedAgentId = preset?.agentId ?? agentOverride;
+    const presetProfile = requestedAgentId
+      ? this.router.getProfile(requestedAgentId, workerLocation)
+      : undefined;
+    if (requestedAgentId && !presetProfile) {
+      throw new Error(`dispatch: unknown agent "${requestedAgentId}" at ${workerLocation}`);
+    }
+    let quotaAgentId = presetProfile?.id ?? record.agentId;
     // #76: a resume is the SAME spec with two substitutions — prompt →
     // "continue", session acquisition → loadSession(recorded id). Everything
     // else (returnTo / correlationId / kind / chainId) rides along untouched
@@ -9007,11 +9018,12 @@ export class Orchestrator {
     if (presetName && !preset) {
       throw new Error(`dispatch ${spec.id}: unknown preset "${presetName}"`);
     }
+    const location = spec.location ?? endpoint?.location ?? LOCAL_LOCATION;
     const agentId = preset?.agentId ?? spec.agentId ?? this.config.DEFAULT_AGENT;
-    const profile = this.router.getProfile(agentId);
+    const profile = this.router.getProfile(agentId, location);
     if (!profile) {
       throw new Error(
-        `dispatch ${spec.id}: ${this.refuseUnregisteredAgent(agentId, `unknown agent "${agentId}"`)}`
+        `dispatch ${spec.id}: ${this.refuseUnregisteredAgent(agentId, `unknown agent "${agentId}" at "${location}"`)}`
       );
     }
     this.quotaPoller?.recordTurnStart(agentId);
@@ -9064,7 +9076,23 @@ export class Orchestrator {
         }
       }
 
-      const mcpServers = this.router.mintMcpServersForSession(spec.id);
+      // A remote plan mints its own reachable Seam MCP entry through BridgeHub.
+      // Feeding it the local entry would duplicate the server name and leak a
+      // loopback URL to the bridge. Local ingest keeps the direct mint path.
+      const mcpServers = isLocalLocation(location)
+        ? this.router.mintMcpServersForSession(spec.id)
+        : undefined;
+      const isolatedSpawn = this.remoteDispatchSpawnOpts({
+        spec,
+        record: synthetic,
+        effectiveSession: "isolated",
+        workerLocation: location,
+        profile,
+        cwd,
+        ...(model ? { model } : {}),
+        ...(effort ? { effort } : {}),
+        ...(mcpServers ? { mcpServers } : {}),
+      });
       if (this.choiceResults) {
         this.choiceResults.bindIngestWaiter(spec.id, {
           ...(notifyId ? { notifyThread: notifyId } : {}),
@@ -9078,10 +9106,8 @@ export class Orchestrator {
           session: "isolated",
           profile,
           cwd,
-          ...(model ? { model } : {}),
-          ...(effort ? { effort } : {}),
+          ...isolatedSpawn,
           strictModel: true,
-          mcpServers,
           ...(outputTo ? { outputTo } : {}),
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
           timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
@@ -15337,7 +15363,10 @@ export class Orchestrator {
     channelRef: { platform: string; id: string },
     record: SessionRecord
   ): Promise<{ newSessionId: string; summary: string }> {
-    const profile = this.router.getProfile(record.agentId);
+    const compactBinding = this.router.describeConfig(record);
+    const compactAgentId = compactBinding.agent.value;
+    const compactLocation = compactBinding.location.value;
+    const profile = this.router.getProfile(compactAgentId, compactLocation);
     if (!profile) throw new Error(`Agent profile "${record.agentId}" not found.`);
     const manager = profile.sessionManager;
     if (!manager) {
@@ -15372,7 +15401,7 @@ export class Orchestrator {
         )
         .join("\n");
 
-      const compactionModel = this.compactionModelFor(record.agentId);
+      const compactionModel = this.compactionModelFor(compactAgentId, compactLocation);
       if (!compactionModel) {
         throw new Error(`Compact from Thread is not supported for agent profile \`${record.agentId}\``);
       }
@@ -15391,7 +15420,7 @@ export class Orchestrator {
       sanitizedTranscript = fitTranscriptToWindow(
         sanitizedTranscript,
         templateOverhead,
-        compactionWindowFor(compactionModel)
+        this.compactionWindowFor(compactAgentId, compactLocation, compactionModel)
       );
       this.logger.info(
         {
@@ -15895,9 +15924,17 @@ export class Orchestrator {
       return;
     }
 
-    const profile = this.router.getProfile(record.agentId);
+    const described = this.router.describeConfig(record);
+    const sessionBinding = {
+      agentId: described.agent.value,
+      location: described.location.value,
+    };
+    const profile = this.router.getProfile(sessionBinding.agentId, sessionBinding.location);
     if (!profile) {
-      await i.reply({ content: `Agent profile "${record.agentId}" not found.`, flags: MessageFlags.Ephemeral });
+      await i.reply({
+        content: `Agent profile "${sessionBinding.agentId}" at "${sessionBinding.location}" not found.`,
+        flags: MessageFlags.Ephemeral,
+      });
       return;
     }
 
@@ -16049,7 +16086,10 @@ export class Orchestrator {
       // "Can compact" now means: there's a configured summarizer model for this
       // agent. (The write-back is a seedNewSession turn, which any agent with a
       // runtime supports — no special manager method required.)
-      const canCompact = this.compactionModelFor(record.agentId) !== "";
+      const canCompact = this.compactionModelFor(
+        sessionBinding.agentId,
+        sessionBinding.location
+      ) !== "";
       const canDiscordPremium = isDiscordPremiumCompactAvailable((id) =>
         this.router.getProfile(id)
       );
@@ -16742,10 +16782,10 @@ export class Orchestrator {
                 })
                 .join("\n");
 
-              let maxTranscriptLength = 50000;
-              if (record.agentId === "agy") {
-                maxTranscriptLength = 8000;
-              }
+              const summarySelection = this.modelCatalog.resolve(sessionBinding, {
+                model: "default",
+              });
+              const maxTranscriptLength = 50000;
               if (sanitizedTranscript.length > maxTranscriptLength) {
                 const keepHead = Math.floor(maxTranscriptLength * 0.3);
                 const keepTail = Math.floor(maxTranscriptLength * 0.6);
@@ -16755,31 +16795,25 @@ export class Orchestrator {
                   sanitizedTranscript.substring(sanitizedTranscript.length - keepTail);
               }
 
-              let summaryModel = "";
-              if (record.agentId === "copilot" || record.agentId.startsWith("copilot-")) {
-                summaryModel = "gpt-5-mini";
-              } else if (record.agentId === "remote") {
-                summaryModel = "gpt-5-mini";
-              } else if (record.agentId === "claude" || record.agentId.startsWith("claude-")) {
-                summaryModel = "haiku";
-              } else if (record.agentId === "agy") {
-                summaryModel = "gemini-3-flash";
-              } else {
-                throw new Error(`AI Summary is not supported for agent profile \`${record.agentId}\``);
-              }
-
               tempRuntime = new AgentRuntime({
                 profile,
                 logger: this.logger.child({ session: `temp-summary-${session.sessionId}` }),
                 mcpServers: [],
+                effortDescriptor: summarySelection.model.effort,
+                spawnFn: () => profile.spawn(
+                  summarySelection.raw.model,
+                  summarySelection.raw.effort,
+                  []
+                ),
               });
 
               await tempRuntime.start();
 
               await tempRuntime.newSession({
                 cwd,
-                model: summaryModel,
-                meta: { reasoningEffort: "low" },
+                model: summarySelection.raw.model,
+                ...(summarySelection.raw.effort ? { effort: summarySelection.raw.effort } : {}),
+                strictModel: true,
               });
 
               let summaryText = "";
@@ -16895,7 +16929,7 @@ export class Orchestrator {
               successTitle: "🗳️ Session Compacted",
               failureTitle: "❌ Compaction Failed",
               run: async () => {
-                if (!this.compactionModelFor(record.agentId)) {
+                if (!this.compactionModelFor(sessionBinding.agentId, sessionBinding.location)) {
                   throw new Error(
                     `Compaction is not supported for agent profile \`${record.agentId}\` (no summarizer model).`
                   );
@@ -16904,6 +16938,7 @@ export class Orchestrator {
                   profile,
                   manager,
                   agentId: record.agentId,
+                  location: sessionBinding.location,
                   cwd,
                   sessionId: session.sessionId,
                 });
@@ -16999,7 +17034,10 @@ export class Orchestrator {
       } else if (customId === "sessions:import_to_cwd") {
         const session = sessions[currentIndex];
         if (!session) return;
-        const compactionModel = this.compactionModelFor(record.agentId);
+        const compactionModel = this.compactionModelFor(
+          sessionBinding.agentId,
+          sessionBinding.location
+        );
         if (!compactionModel) {
           await btnInteraction.reply({
             content: `❌ Import is not supported for this agent.`,
@@ -17084,7 +17122,11 @@ export class Orchestrator {
             sanitizedTranscript = fitTranscriptToWindow(
               sanitizedTranscript,
               templateOverhead,
-              compactionWindowFor(compactionModel)
+              this.compactionWindowFor(
+                sessionBinding.agentId,
+                sessionBinding.location,
+                compactionModel
+              )
             );
             const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
 
@@ -17268,7 +17310,10 @@ export class Orchestrator {
                 })
                 .join("\n");
 
-              const compactionModel = this.compactionModelFor(record.agentId);
+              const compactionModel = this.compactionModelFor(
+                sessionBinding.agentId,
+                sessionBinding.location
+              );
               if (!compactionModel) {
                 throw new Error(`Migration compaction is not supported for source agent profile \`${record.agentId}\``);
               }
@@ -17277,7 +17322,11 @@ export class Orchestrator {
               sanitizedTranscript = fitTranscriptToWindow(
                 sanitizedTranscript,
                 templateOverhead,
-                compactionWindowFor(compactionModel)
+                this.compactionWindowFor(
+                  sessionBinding.agentId,
+                  sessionBinding.location,
+                  compactionModel
+                )
               );
               const compactionPrompt = `${promptTemplate}\n\nConversation Transcript:\n${sanitizedTranscript}`;
 
@@ -19369,11 +19418,17 @@ export class Orchestrator {
     const parsed = parseIngestEndpointSpec(specInput);
     if (!parsed.ok) return parsed;
     const spec = parsed.spec;
-    const cfg = this.store.readConfig(record);
-    let agentId: string | null = spec.agent ?? record.agentId ?? this.config.DEFAULT_AGENT;
+    const described = this.router.describeConfig(record);
+    const requestedAgent = parseAgentAtLocation(
+      spec.agent ?? described.agent.value ?? record.agentId ?? this.config.DEFAULT_AGENT
+    );
+    let location: string | null = requestedAgent.explicit
+      ? requestedAgent.location
+      : described.location.value ?? resolveThreadLocation(this.config, record.channelRef);
+    let agentId: string | null = requestedAgent.agentId;
     let cwd: string | null = spec.cwd ?? this.effectiveCwd(record);
     let model: string | null = ingestMintStoredModel(spec.model);
-    let effort: string | null = spec.effort ?? cfg.reasoningEffort ?? null;
+    let effort: string | null = spec.effort?.trim() || null;
     if (spec.thread) {
       // #224 live handoff. Same-channel only (the handoff rule), and the thread
       // must still exist right now — a mint against a dead thread would only
@@ -19405,6 +19460,7 @@ export class Orchestrator {
         };
       }
       agentId = null;
+      location = null;
       cwd = null;
       model = null;
       effort = null;
@@ -19417,14 +19473,32 @@ export class Orchestrator {
       cwd = null;
       model = null;
       effort = null;
-    } else if (!this.router.getProfile(agentId)) {
-      return {
-        ok: false,
-        error: this.refuseUnregisteredAgent(agentId, `Unknown agent "${agentId}".`),
-      };
     } else {
-      const modelErr = refuseIsolatedClaudeModel(agentId, model);
-      if (modelErr) return { ok: false, error: modelErr };
+      const profile = this.router.getProfile(agentId, location);
+      if (!profile) {
+        return {
+          ok: false,
+          error: this.refuseUnregisteredAgent(
+            agentId,
+            `Unknown agent "${agentId}" at "${location}".`
+          ),
+        };
+      }
+      try {
+        const selection = this.modelCatalog.resolve(
+          { agentId, location },
+          { model: model ?? "default", effort }
+        );
+        // Explicit pins are canonicalized now. Omitted pins remain null so the
+        // catalog default (model and effort) is deliberately resolved at fire.
+        if (model) model = selection.normalized.model;
+        if (effort) effort = selection.normalized.effort;
+      } catch (err) {
+        return {
+          ok: false,
+          error: `Invalid catalog selection: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
     }
     const ingestToken = mintBridgeToken();
     const row: IngestEndpoint = {
@@ -19432,6 +19506,7 @@ export class Orchestrator {
       tokenHash: hashBridgeToken(ingestToken),
       name: spec.name,
       cwd,
+      location,
       agentId,
       model,
       effort,
@@ -21309,37 +21384,37 @@ export class Orchestrator {
     // the model to the new agent's default, and clear the ACP session id so the
     // next message starts fresh against the new backend.
     if (preset.agentId && preset.agentId !== record.agentId) {
-      const profile = this.router.getProfile(preset.agentId);
+      const binding = {
+        agentId: preset.agentId,
+        location: resolveThreadLocation(this.config, channel.id),
+      };
+      const profile = this.router.getProfile(preset.agentId, binding.location);
       if (!profile) {
         notes.push(
           `⚠️ ${this.refuseUnregisteredAgent(preset.agentId, `Unknown agent \`${preset.agentId}\``)} — agent left unchanged.`
         );
       } else {
-        const binding = {
-          agentId: preset.agentId,
-          location: resolveThreadLocation(this.config, channel.id),
-        };
         const catalogDefault = this.modelCatalog.models(binding).find((model) => model.default);
         if (!catalogDefault) {
           notes.push(`⚠️ Catalog for \`${preset.agentId}@${binding.location}\` is warming/unavailable — agent left unchanged.`);
         } else {
-        await this.router.invalidate(record.id);
-        const cfg = this.store.readConfig(record);
-        cfg.model = catalogDefault.id;
-        cfg.reasoningEffort = catalogDefault.effort.selectionDefault;
-        // Different agent → different context window; cached usage is invalid.
-        cfg.lastContextUsage = undefined;
-        this.store.upsert({
-          ...record,
-          agentId: preset.agentId,
-          acpSessionId: "",
-          configJson: this.store.writeConfig(cfg),
-          updatedUtc: new Date().toISOString(),
-        });
-        record = this.store.get(record.id) ?? record;
-        changes.push(
-          `Agent → \`${preset.agentId}\` (model \`${catalogDefault.id}\`, effort \`${catalogDefault.effort.selectionDefault}\`)`
-        );
+          await this.router.invalidate(record.id);
+          const cfg = this.store.readConfig(record);
+          cfg.model = catalogDefault.id;
+          cfg.reasoningEffort = catalogDefault.effort.selectionDefault;
+          // Different agent → different context window; cached usage is invalid.
+          cfg.lastContextUsage = undefined;
+          this.store.upsert({
+            ...record,
+            agentId: preset.agentId,
+            acpSessionId: "",
+            configJson: this.store.writeConfig(cfg),
+            updatedUtc: new Date().toISOString(),
+          });
+          record = this.store.get(record.id) ?? record;
+          changes.push(
+            `Agent → \`${preset.agentId}\` (model \`${catalogDefault.id}\`, effort \`${catalogDefault.effort.selectionDefault}\`)`
+          );
         }
       }
     }
@@ -21632,26 +21707,6 @@ function usageLine(pct: number | null, label: string): string {
   const bar = pct !== null ? usageBar(pct) : "░░░░░░░░░░░░░░░░░░░░";
   const pctStr = pct !== null ? `${Math.round(pct)}%`.padStart(4) : "  — ";
   return `\`${bar}\`  ${pctStr}  ${label}`;
-}
-
-/** Hardcoded context windows for the models we use as compaction summarizers.
- *  Hardcoded rather than discovered because the call sites need the window
- *  BEFORE spawning the temp runtime that would learn it from usage_update. */
-const COMPACTION_MODEL_WINDOWS: Record<string, number> = {
-  default: 1_000_000, // resolves to latest Opus @ 1M on this account
-  "gpt-5.5": 400_000,
-  "Gemini 3.1 Pro (High)": 1_000_000,
-  "Claude Opus 4.6 (Thinking)": 250_000,
-  "gemini-3.8-flash-high": 1_000_000,
-  "glm-5.2": 1_000_000,
-  "qwen3-coder:480b-cloud": 256_000,
-  "glm-5.3:cloud": 1_000_000,
-  "glm-5.3-flash:cloud": 1_000_000,
-  "glm-5.2:cloud": 976_000,
-};
-
-function compactionWindowFor(modelId: string): number {
-  return COMPACTION_MODEL_WINDOWS[modelId] ?? 200_000;
 }
 
 /** Trim a sanitized transcript so that `template + transcript` fits within

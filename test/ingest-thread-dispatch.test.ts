@@ -26,6 +26,7 @@ import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 const THREAD = "1516907849349857421";
@@ -50,6 +51,7 @@ function endpoint(over: Partial<IngestEndpoint> = {}): IngestEndpoint {
     tokenHash: "hash",
     name: "site-questions",
     cwd: null,
+    location: null,
     agentId: null,
     model: null,
     effort: null,
@@ -114,13 +116,25 @@ function spyAdapter() {
 function makeOrch(
   dataDir: string,
   store: SessionStore,
-  opts: { answer?: string; mode?: RuntimeMode; timeoutSeconds?: number } = {}
-): { orch: Orchestrator; ensured: string[]; runtimeFor: string[] } {
+  opts: {
+    answer?: string;
+    mode?: RuntimeMode;
+    timeoutSeconds?: number;
+    profile?: { id: string; defaultModel: string };
+    profileLocation?: string;
+  } = {}
+): {
+  orch: Orchestrator;
+  ensured: string[];
+  runtimeFor: string[];
+  profileLookups: Array<{ id: string; location?: string }>;
+} {
   const ensured: string[] = [];
   const runtimeFor: string[] = [];
+  const profileLookups: Array<{ id: string; location?: string }> = [];
   const rt = fakeRuntime(opts.answer ?? "answered in-thread", opts.mode ?? "ok");
   const router = {
-    listProfiles: () => [],
+    listProfiles: () => (opts.profile ? [opts.profile] : []),
     describeConfig: () => ({}),
     ensureSessionRecord: ({ channelRef }: { channelRef: string }) => {
       ensured.push(channelRef);
@@ -128,11 +142,19 @@ function makeOrch(
     },
     // Deliberately undefined: the isolated ingest path resolves a profile and
     // throws on a miss, so reaching it would fail this test loudly.
-    getProfile: () => undefined,
+    getProfile: (id: string, location?: string) => {
+      profileLookups.push({ id, location });
+      return opts.profile?.id === id && (!opts.profileLocation || opts.profileLocation === location)
+        ? opts.profile
+        : undefined;
+    },
     getOrStartRuntime: async (rec: SessionRecord | string) => {
       runtimeFor.push(typeof rec === "string" ? rec : rec.id);
       return rt;
     },
+    reuseMcpServers: () => [],
+    mintMcpServersForSession: () => [],
+    revokeMcpSession: () => {},
   };
   const config = {
     DATA_DIR: dataDir,
@@ -155,8 +177,9 @@ function makeOrch(
     router: router as never,
     store: store as never,
     renderer: discordRenderer as never,
+    modelCatalog: fixtureModelCatalog(opts.profile ? [opts.profile as any] : []),
   });
-  return { orch, ensured, runtimeFor };
+  return { orch, ensured, runtimeFor, profileLookups };
 }
 
 let dataDir: string;
@@ -430,5 +453,46 @@ describe("#224 isolated ingest routing", () => {
     // so it throws there — which is exactly the branch we want to prove it took.
     await expect(orch.dispatchInjectTurn(spec)).rejects.toThrow(/unknown agent|claude/);
     expect(ensured).toHaveLength(0);
+  });
+
+  it("uses the frozen remote host for a remote-only isolated ingest", async () => {
+    const profile = { id: "remote-only", defaultModel: "outlier-model" };
+    const row = endpoint({
+      thread: null,
+      location: "studio",
+      agentId: profile.id,
+      model: null,
+      cwd: "/remote/repo",
+    });
+    store.insertIngestEndpoint(row);
+    const spec = planEndpointDispatch({ endpoint: row, payload: "hi" });
+    const { orch, profileLookups } = makeOrch(dataDir, store, {
+      profile,
+      profileLocation: "studio",
+    });
+    const marked: Array<{ sessionId: string; location: string }> = [];
+    orch.setBridgeHub({
+      markSessionBridge: (sessionId: string, location: string) => {
+        marked.push({ sessionId, location });
+      },
+      get: () => ({ mux: {} }),
+      mcpServersForRemoteSpawn: () => undefined,
+    } as any);
+    let injected: any;
+    (orch as any).injectTurn = async (_record: unknown, _prompt: string, opts: unknown) => {
+      injected = opts;
+      return { text: "remote score", stopReason: "end_turn" };
+    };
+
+    await orch.dispatchInjectTurn(spec);
+
+    expect(profileLookups).toContainEqual({ id: "remote-only", location: "studio" });
+    expect(marked).toEqual([{ sessionId: `dispatch:${spec.id}`, location: "studio" }]);
+    expect(injected).toMatchObject({
+      location: "studio",
+      model: "outlier-model",
+      strictModel: true,
+    });
+    expect(typeof injected.spawnFn).toBe("function");
   });
 });

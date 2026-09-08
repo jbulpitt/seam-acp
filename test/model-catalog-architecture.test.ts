@@ -33,9 +33,17 @@ describe("model catalog architecture", () => {
       "packages/core/src/core/session-router.ts",
       "packages/core/src/core/thread-session-control.ts",
       "packages/core/src/platforms/discord/config-editor.ts",
+      "packages/core/src/core/choice/ingest-model.ts",
     ].map(source).join("\n");
     expect(selectionCore).not.toMatch(/includes\(["'](?:claude|codex|copilot|agy|grok|zai|ollama-cloud)/);
     expect(selectionCore).not.toMatch(/===\s*["'](?:claude|codex|copilot|agy|grok|zai|ollama-cloud)["']/);
+    const legacySelectionLeaks = [
+      source("packages/core/src/core/choice/ingest-model.ts"),
+      source("packages/core/src/platforms/discord/orchestrator.ts"),
+    ].join("\n");
+    expect(legacySelectionLeaks).not.toMatch(/ISOLATED_SAFE_[A-Z_]+_MODELS/);
+    expect(legacySelectionLeaks).not.toMatch(/summaryModel\s*=|gpt-5-mini|gemini-3-flash/);
+    expect(legacySelectionLeaks).not.toMatch(/COMPACTION_MODEL_WINDOWS|config\.[A-Z_]+_COMPACTION_MODEL/);
   });
 
   it("requires every adapter to expose the single catalog boundary", () => {

@@ -13,6 +13,8 @@ export interface IngestEndpoint {
   tokenHash: string;
   name: string;
   cwd: string | null;
+  /** Host binding captured at mint; remote-only profiles resolve there at fire. */
+  location: string | null;
   agentId: string | null;
   model: string | null;
   effort: string | null;
@@ -200,6 +202,7 @@ export function planEndpointDispatch(opts: {
     createdUtc: new Date().toISOString(),
   };
   if (e.preset) spec.preset = e.preset;
+  if (e.location) spec.location = e.location;
   if (e.cwd) spec.cwd = e.cwd;
   if (e.agentId) spec.agentId = e.agentId;
   if (e.model) spec.model = e.model;

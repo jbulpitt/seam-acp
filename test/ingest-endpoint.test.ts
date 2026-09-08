@@ -33,6 +33,7 @@ function endpoint(over: Partial<IngestEndpoint> = {}): IngestEndpoint {
     tokenHash: hash,
     name: "essay-check",
     cwd: "/repo",
+    location: "local",
     agentId: "claude",
     model: "default",
     effort: null,
@@ -175,6 +176,7 @@ describe("planEndpointDispatch", () => {
     expect(spec.stream).toBe(false);
     expect(spec.target).toBe("ingest:ie_test1");
     expect(spec.cwd).toBe("/repo");
+    expect(spec.location).toBe("local");
     expect(spec.agentId).toBe("claude");
     expect(spec.prompt).toContain("hello");
     expect(spec.preset).toBeUndefined();
@@ -186,6 +188,14 @@ describe("planEndpointDispatch", () => {
     });
     expect(spec.preset).toBe("hist-grader");
     expect(spec.agentId).toBeUndefined();
+  });
+  it("carries the frozen authoring host for remote-only dispatch", () => {
+    const spec = planEndpointDispatch({
+      endpoint: endpoint({ location: "studio", agentId: "remote-only" }),
+      payload: "x",
+    });
+    expect(spec.location).toBe("studio");
+    expect(spec.agentId).toBe("remote-only");
   });
   it("uses notifyThread as target when it is a snowflake", () => {
     const spec = planEndpointDispatch({
@@ -237,6 +247,10 @@ describe("ingest endpoint store", () => {
   it("round-trips a preset name", () => {
     store.insertIngestEndpoint(endpoint({ preset: "hist-grader" }));
     expect(store.getIngestEndpoint("ie_test1")?.preset).toBe("hist-grader");
+  });
+  it("round-trips the authoring host", () => {
+    store.insertIngestEndpoint(endpoint({ location: "studio" }));
+    expect(store.getIngestEndpoint("ie_test1")?.location).toBe("studio");
   });
   it("round-trips a live thread destination (#224)", () => {
     store.insertIngestEndpoint(endpoint({ thread: "1516907849349857421" }));

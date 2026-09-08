@@ -318,7 +318,6 @@ export class ChoiceIngest {
       endpoint,
       payload,
       ...(studentId ? { untrustedStudentId: studentId } : {}),
-      defaultModel: this.resolveDefaultModel(),
     });
     await this.enqueue(spec);
     const now = new Date().toISOString();

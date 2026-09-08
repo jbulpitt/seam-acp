@@ -161,7 +161,6 @@ export function planEndpointDispatch(opts: {
   endpoint: IngestEndpoint;
   payload: string;
   untrustedStudentId?: string | null;
-  defaultModel?: string;
 }): DispatchSpec {
   const e = opts.endpoint;
   const id = cryptoRandomUuid();
@@ -206,7 +205,6 @@ export function planEndpointDispatch(opts: {
   if (e.cwd) spec.cwd = e.cwd;
   if (e.agentId) spec.agentId = e.agentId;
   if (e.model) spec.model = e.model;
-  else if (!e.preset && opts.defaultModel) spec.model = opts.defaultModel;
   if (e.effort) spec.effort = e.effort;
   return spec;
 }

@@ -250,10 +250,13 @@ async function main(): Promise<void> {
         defaultModel: config.GROK_DEFAULT_MODEL,
         staticModels: enrichModelListWithKnownLimits(config.GROK_MODELS, GROK_STATIC_MODELS)
           ?? GROK_STATIC_MODELS,
-        ...(!config.GROK_MODELS && config.GROK_API_KEY
+        catalogMode: config.GROK_CATALOG_MODE,
+        ...(config.GROK_CATALOG_MODE === "api-key" && config.GROK_API_KEY
           ? { discoverModels: () => fetchXaiModels(config.GROK_API_KEY!) }
           : {}),
-        ...(config.GROK_API_KEY ? { extraEnv: { XAI_API_KEY: config.GROK_API_KEY } } : {}),
+        ...(config.GROK_CATALOG_MODE === "api-key" && config.GROK_API_KEY
+          ? { apiKey: config.GROK_API_KEY }
+          : {}),
       })
     : undefined;
 

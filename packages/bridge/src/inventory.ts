@@ -5,6 +5,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { accessSync, constants } from "node:fs";
 import {
   AGENT_ADAPTER_VERSION,
   makeAgyProfile,
@@ -19,7 +20,14 @@ import {
 } from "@seam/adapters";
 
 function commandExists(cmd: string): boolean {
-  const bin = cmd.split(" ")[0]!;
+  try {
+    accessSync(cmd, constants.X_OK);
+    return true;
+  } catch {
+    // COPILOT_CMD historically permits fixed arguments; configured Grok paths
+    // are tried exactly above, including paths containing spaces.
+  }
+  const bin = cmd.trim().split(/\s+/, 1)[0]!;
   try {
     execFileSync("which", [bin], { stdio: "ignore" });
     return true;
@@ -28,20 +36,28 @@ function commandExists(cmd: string): boolean {
   }
 }
 
+export interface HostAdapterRuntimeOptions {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  exists?: (bin: string) => boolean;
+  copilotCatalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>;
+}
+
 export function resolveCopilotHostLaunch(
   copilotCmd: string,
   cwd: string,
-  extraEnv: NodeJS.ProcessEnv = {}
+  extraEnv: NodeJS.ProcessEnv = {},
+  baseEnv: NodeJS.ProcessEnv = process.env
 ): CopilotCatalogLaunch {
   const commandParts = copilotCmd.split(" ");
   const cliPath = commandParts[0]!;
   const args = [
     ...commandParts.slice(1),
-    ...(process.env.COPILOT_ARGS !== undefined
-      ? process.env.COPILOT_ARGS.split(" ").filter(Boolean)
+    ...(baseEnv.COPILOT_ARGS !== undefined
+      ? baseEnv.COPILOT_ARGS.split(" ").filter(Boolean)
       : ["--acp"]),
   ];
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  const env: NodeJS.ProcessEnv = { ...baseEnv };
   if (!env.GH_TOKEN) {
     try {
       env.GH_TOKEN = execFileSync("gh", ["auth", "token"], {
@@ -59,9 +75,10 @@ export function resolveCopilotHostLaunch(
 function copilotProfileForHost(
   copilotCmd: string,
   cwd: string,
+  env: NodeJS.ProcessEnv,
   catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>
 ): AgentAdapter {
-  const launch = resolveCopilotHostLaunch(copilotCmd, cwd);
+  const launch = resolveCopilotHostLaunch(copilotCmd, cwd, {}, env);
   const token = launch.env.GH_TOKEN || launch.env.COPILOT_GITHUB_TOKEN;
   const credentialProfile = token
     ? `github-token-sha256:${createHash("sha256").update(token).digest("hex")}`
@@ -77,20 +94,38 @@ function copilotProfileForHost(
   });
 }
 
+function parseConfiguredModels(raw: string | undefined): Array<{ modelId: string; name: string }> | undefined {
+  const models = (raw ?? "").split(",").map((entry) => entry.trim()).filter(Boolean).map((entry) => {
+    const separator = entry.indexOf(":");
+    return separator > 0 && separator < entry.length - 1
+      ? { modelId: entry.slice(0, separator).trim(), name: entry.slice(separator + 1).trim() }
+      : { modelId: entry, name: entry };
+  });
+  return models.length ? models : undefined;
+}
+
 export function loadHostAdapters(
   copilotCmd: string,
-  cwd: string,
-  exists: (bin: string) => boolean = commandExists,
-  copilotCatalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>
+  options: HostAdapterRuntimeOptions = {}
 ): Map<string, AgentAdapter> {
+  const env = options.env ?? process.env;
+  const exists = options.exists ?? commandExists;
+  const grokCli = env.GROK_CLI_PATH?.trim() || "grok";
+  const grokCatalogMode = env.GROK_CATALOG_MODE?.trim() || "subscription";
+  const grokModels = parseConfiguredModels(env.GROK_MODELS);
   const out = new Map<string, AgentAdapter>();
   // Resolved once so the existence probe and the profile use the SAME path.
-  const claudeCli = process.env.CLAUDE_CLI_PATH?.trim() || "claude-agent-acp";
+  const claudeCli = env.CLAUDE_CLI_PATH?.trim() || "claude-agent-acp";
   const factories: Array<{ id: string; bin: string; make: () => AgentAdapter }> = [
     {
       id: "copilot",
       bin: copilotCmd,
-      make: () => copilotProfileForHost(copilotCmd, cwd, copilotCatalogProbe),
+      make: () => copilotProfileForHost(
+        copilotCmd,
+        options.cwd ?? process.cwd(),
+        env,
+        options.copilotCatalogProbe
+      ),
     },
     {
       id: "claude",
@@ -108,11 +143,11 @@ export function loadHostAdapters(
         // wrapper always advertises, so it resolves without inventing one; a
         // configured id that this host cannot publish fails the fetch closed
         // rather than silently selecting some other model.
-        defaultModel: process.env.CLAUDE_DEFAULT_MODEL?.trim() || "default",
+        defaultModel: env.CLAUDE_DEFAULT_MODEL?.trim() || "default",
         // Credential scope parity: a host pinned to an alternate config dir
         // probes under that dir, exactly as its runtime spawn would.
-        ...(process.env.CLAUDE_CONFIG_DIR?.trim()
-          ? { configDir: process.env.CLAUDE_CONFIG_DIR.trim() }
+        ...(env.CLAUDE_CONFIG_DIR?.trim()
+          ? { configDir: env.CLAUDE_CONFIG_DIR.trim() }
           : {}),
       }),
     },
@@ -128,8 +163,23 @@ export function loadHostAdapters(
     },
     {
       id: "grok",
-      bin: "grok",
-      make: () => makeGrokProfile({ defaultModel: "grok-4" }),
+      bin: grokCli,
+      make: () => {
+        if (grokCatalogMode !== "subscription" && grokCatalogMode !== "api-key") {
+          throw new Error("GROK_CATALOG_MODE must be subscription or api-key");
+        }
+        return makeGrokProfile({
+          cliPath: grokCli,
+          defaultModel: env.GROK_DEFAULT_MODEL?.trim() || "grok-4.6",
+          catalogMode: grokCatalogMode,
+          ...(grokCatalogMode === "api-key" && env.GROK_API_KEY
+            ? { apiKey: env.GROK_API_KEY }
+            : {}),
+          ...(grokModels ? { staticModels: grokModels } : {}),
+          ...(options.cwd ? { cwd: options.cwd } : {}),
+          baseEnv: env,
+        });
+      },
     },
   ];
   for (const f of factories) {
@@ -147,14 +197,15 @@ export function loadHostAdapters(
 
 export function inventoryFromAdapters(
   adapters: Map<string, AgentAdapter>,
-  copilotCmd: string
+  copilotCmd: string,
+  env: NodeJS.ProcessEnv = process.env
 ): HelloAgentInventory[] {
   const bins: Record<string, string> = {
     copilot: copilotCmd,
-    claude: process.env.CLAUDE_CLI_PATH ?? "claude-agent-acp",
+    claude: env.CLAUDE_CLI_PATH ?? "claude-agent-acp",
     agy: "agy",
     codex: "codex-acp",
-    grok: "grok",
+    grok: env.GROK_CLI_PATH?.trim() || "grok",
   };
   const rows: HelloAgentInventory[] = [];
   for (const [id, adapter] of adapters) {

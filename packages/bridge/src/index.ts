@@ -652,7 +652,7 @@ async function runClientMode(
   bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
 ) {
   const { WebSocket } = await loadWs();
-  const adapters = loadHostAdapters(copilotCmd, localCwd);
+  const adapters = loadHostAdapters(copilotCmd, { cwd: localCwd });
   const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION });
   const mgr = makeSlotManager({
     copilotCmd,
@@ -712,7 +712,7 @@ async function runServerMode(
   bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
 ) {
   const { WebSocket, WebSocketServer } = await loadWs();
-  const adapters = loadHostAdapters(copilotCmd, localCwd);
+  const adapters = loadHostAdapters(copilotCmd, { cwd: localCwd });
   const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION });
   const mgr = makeSlotManager({
     copilotCmd,

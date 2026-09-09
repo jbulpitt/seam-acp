@@ -201,6 +201,9 @@ describe("production adapter catalog sources", () => {
       defaultModel: "grok-future",
       staticModels: [{ modelId: "grok-static", name: "Grok Static" }],
       discoverModels: discover,
+      catalogMode: "api-key",
+      apiKey: "test-only",
+      cliVersionProbe: async () => "grok test",
     });
     expect(discover).not.toHaveBeenCalled();
     const catalogs = (await Promise.all([codex, ollama, agy, grok].map((profile) => profile.catalog.fetch())))

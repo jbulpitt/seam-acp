@@ -124,6 +124,12 @@ export interface ProbeHandle {
   onClose(step: ProbeCloseStep, phase?: ProbeClosePhase): void;
   /** Rejects when the child exits early; race protocol waits against it. */
   readonly exited: Promise<never>;
+  /**
+   * Settles only when an explicitly allowed clean exit is observed. One-shot
+   * collectors await this together with their bounded stdout consumption.
+   * Every failure rejects it so their run callback also settles during cleanup.
+   */
+  readonly completed: Promise<{ code: 0; signal: null }>;
   /** Redacted trailing stderr, for tests and structured diagnostics. */
   stderrTail(): string;
 }
@@ -154,6 +160,8 @@ export interface BoundedProbeOptions<T> {
   finalizeDeadlineMs?: number;
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
+  /** Permit exit code 0 for bounded one-shot collectors. Default is false. */
+  allowCleanExit?: boolean;
   /** Label used in error detail. Must not carry secrets. */
   label?: string;
   /**
@@ -255,6 +263,13 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
    *  to observe the abort and finish registering its closes. */
   let runPromise: Promise<T> | undefined;
   let exitReject: ((err: Error) => void) | undefined;
+  let completionResolve: ((result: { code: 0; signal: null }) => void) | undefined;
+  let completionReject: ((err: Error) => void) | undefined;
+  const completed = new Promise<{ code: 0; signal: null }>((resolve, reject) => {
+    completionResolve = resolve;
+    completionReject = reject;
+  });
+  completed.catch(() => {});
 
   /**
    * Signal a failure. `exitReject` settles once, so the FIRST failure is the
@@ -262,6 +277,7 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
    */
   const fail = (error: ProbeError): void => {
     if (!controller.signal.aborted) controller.abort();
+    completionReject?.(error);
     exitReject?.(error);
   };
 
@@ -325,6 +341,7 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     // Only an ABNORMAL exit is a failure worth unblocking racers for.
     if (code === 0 && signalCode === null) {
       cleanExit = true;
+      if (options.allowCleanExit) completionResolve?.({ code: 0, signal: null });
       return;
     }
     // Raw child stderr is NEVER attached; only its redacted tail.
@@ -371,6 +388,7 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     pid: child.pid,
     signal: controller.signal,
     exited,
+    completed,
     stderrTail: () => redact(stderrTail),
     onClose: (step, phase = "connection") => {
       // Registration barrier. Before finalization a step is queued normally.

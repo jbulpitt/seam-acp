@@ -111,6 +111,24 @@ describe("AgentAdapter.describe()", () => {
     const profile = makeGrokProfile({
       defaultModel: "grok-4.6",
       staticModels: [{ modelId: "grok-4.6", name: "Grok 4.6", contextLimit: 500_000 }],
+      authIdentityProbe: () => ({ source: "subscription", fingerprint: "a".repeat(64) }),
+      catalogProbe: async () => ({
+        modelState: {
+          defaultModel: "grok-4.6",
+          models: [{
+            modelId: "grok-4.6",
+            name: "Grok 4.6",
+            description: null,
+            contextLimit: 500_000,
+            effortChoices: [],
+            effortDefault: "default",
+          }],
+        },
+        protocolVersion: "1",
+        authSource: "subscription",
+        authIdentity: { source: "subscription", fingerprint: "a".repeat(64) },
+      }),
+      cliVersionProbe: async () => "grok test",
     });
     const d = profile.describe();
     expect(d.effort.mechanism).toBe("spawnArgs");

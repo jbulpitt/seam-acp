@@ -433,8 +433,9 @@ const Schema = z.object({
   /** Default model id for the Grok profile (e.g. "grok-build-0.1"). */
   GROK_DEFAULT_MODEL: z.string().default("grok-4.6"),
   GROK_MODELS: ModelsListSchema,
-  /** xAI API key.  When set, enables dynamic model discovery at startup via
-   *  GET https://api.x.ai/v1/models and is passed to the grok CLI process. */
+  /** Catalog/runtime authentication authority. Subscription never inherits an ambient API key. */
+  GROK_CATALOG_MODE: z.enum(["subscription", "api-key"]).default("subscription"),
+  /** Used only when GROK_CATALOG_MODE=api-key. */
   GROK_API_KEY: z.string().optional(),
 
   /**

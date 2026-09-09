@@ -9,6 +9,7 @@ import { PassThrough, type Transform } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { pino } from "pino";
+import type { AgentProfile } from "@seam/adapters";
 import {
   AGY_ACP_UPSTREAM_COMMIT,
   AGY_ACP_UPSTREAM_VERSION,
@@ -23,11 +24,19 @@ import {
   verifyAgyRuntimeIdentity,
 } from "@seam/adapters";
 import {
+  AgentRuntime,
+  type AgentEvent,
+} from "../packages/core/src/agents/agent-runtime.js";
+import { DispatchStatusPanel } from "../packages/core/src/core/dispatch-status-panel.js";
+import {
   ModelCatalogService,
   validateCandidate,
 } from "../packages/core/src/core/model-catalog/service.js";
 import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store.js";
+import { TurnStatus } from "../packages/core/src/core/status-panel.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
+import { serializePanelText } from "../packages/core/src/platforms/renderer.js";
 
 const fakeWrapper = "/opt/agy/bin/antigravity-acp";
 const hash = agyAcpReleaseArtifact().sha256;
@@ -156,6 +165,209 @@ async function filterOutput(filter: Transform, chunks: string[]): Promise<string
   });
   return output;
 }
+
+function upstreamThinkNotification(
+  sessionId: string,
+  text: string,
+  over: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return {
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: `think-${sessionId}`,
+        title: "Think",
+        kind: "think",
+        status: "completed",
+        content: [{ type: "content", content: { type: "text", text } }],
+        ...over,
+      },
+    },
+  };
+}
+
+describe("package-backed agy thought normalization", () => {
+  it("normalizes only the pinned upstream completed Think shape", async () => {
+    const upstream = upstreamThinkNotification("agy-session-1", "Inspect fixture\n\nPlan fix");
+    const output = await filterOutput(
+      createAgyAcpOutputFilter({}),
+      [`${JSON.stringify(upstream)}\n`]
+    );
+    expect(JSON.parse(output)).toEqual({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "agy-session-1",
+        update: {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "Inspect fixture\n\nPlan fix" },
+        },
+      },
+    });
+  });
+
+  it("does not reinterpret ordinary tools, nontext content, updates, or native thoughts", async () => {
+    const messages = [
+      upstreamThinkNotification("s1", "ordinary by title", { kind: "execute" }),
+      upstreamThinkNotification("s1", "still running", { status: "in_progress" }),
+      upstreamThinkNotification("s1", "wrong title", { title: "Reason" }),
+      upstreamThinkNotification("s1", "extra block", {
+        content: [
+          { type: "content", content: { type: "text", text: "extra block" } },
+          { type: "content", content: { type: "text", text: "must stay a tool" } },
+        ],
+      }),
+      upstreamThinkNotification("s1", "not text", {
+        content: [{ type: "content", content: { type: "image", data: "AA==", mimeType: "image/png" } }],
+      }),
+      {
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "s1",
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "think-s1",
+            title: "Think",
+            kind: "think",
+            status: "completed",
+            content: [{ type: "content", content: { type: "text", text: "update" } }],
+          },
+        },
+      },
+      {
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "s1",
+          update: {
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: "native" },
+          },
+        },
+      },
+      { jsonrpc: "2.0", id: 9, result: { title: "Think", kind: "think" } },
+    ];
+    const wire = messages.map((message) => JSON.stringify(message)).join("\n") + "\n";
+    expect(await filterOutput(createAgyAcpOutputFilter({}), [wire])).toBe(wire);
+  });
+
+  it("preserves fragmented frame order, text boundaries, sessions, and upstream duplicates", async () => {
+    const first = JSON.stringify(upstreamThinkNotification("session-a", "first\n\nsecond"));
+    const duplicate = JSON.stringify(upstreamThinkNotification("session-a", "first\n\nsecond"));
+    const third = JSON.stringify(upstreamThinkNotification("session-b", "third"));
+    const wire = `${first}\n${duplicate}\n${third}\n`;
+    const splitA = Math.floor(first.length / 2);
+    const splitB = first.length + duplicate.length + 1;
+    const output = await filterOutput(createAgyAcpOutputFilter({}), [
+      wire.slice(0, splitA),
+      wire.slice(splitA, splitB),
+      wire.slice(splitB),
+    ]);
+    const parsed = output.trim().split("\n").map((line) => JSON.parse(line));
+    expect(parsed.map((message) => message.params.sessionId)).toEqual([
+      "session-a",
+      "session-a",
+      "session-b",
+    ]);
+    expect(parsed.map((message) => message.params.update.content.text)).toEqual([
+      "first\n\nsecond",
+      "first\n\nsecond",
+      "third",
+    ]);
+  });
+
+  it("drives the existing core thinking footer without surfacing ordinary tool text", async () => {
+    const runtime = new AgentRuntime({
+      profile: { id: "agy" } as unknown as AgentProfile,
+      logger: pino({ level: "silent" }) as unknown as Logger,
+    });
+    const events: AgentEvent[] = [];
+    const rendered: unknown[] = [];
+    const status = new TurnStatus({ model: "agy-model", repoDisplay: "repo" });
+    const panel = new DispatchStatusPanel(
+      discordRenderer,
+      status,
+      {
+        post: async (value) => {
+          rendered.push(value);
+          return "panel";
+        },
+        edit: async (_ref, value) => { rendered.push(value); },
+      },
+      { debounceMs: 0, heartbeatMs: 1_000_000 }
+    );
+    await panel.start();
+    runtime.onEvent((event) => {
+      events.push(event);
+      panel.handleEvent(event);
+    });
+
+    const thought = upstreamThinkNotification("live-session", "checking adapter boundary");
+    const ordinaryTool = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "live-session",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "ordinary-tool",
+          title: "Read file",
+          kind: "read",
+          status: "completed",
+          content: [{
+            type: "content",
+            content: { type: "text", text: "PRIVATE TOOL OUTPUT" },
+          }],
+        },
+      },
+    };
+    const answer = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "live-session",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "public answer" },
+        },
+      },
+    };
+    const wire = [thought, ordinaryTool, answer]
+      .map((message) => JSON.stringify(message))
+      .join("\n") + "\n";
+    const filtered = await filterOutput(createAgyAcpOutputFilter({}), [
+      wire.slice(0, 23),
+      wire.slice(23, 117),
+      wire.slice(117),
+    ]);
+    for (const line of filtered.trim().split("\n")) {
+      const notification = JSON.parse(line) as {
+        method?: string;
+        params?: { sessionId?: string; update?: Record<string, unknown> };
+      };
+      expect(notification.params?.sessionId).toBe("live-session");
+      await (runtime as unknown as {
+        handleSessionUpdate(update: Record<string, unknown>): Promise<void>;
+      }).handleSessionUpdate(notification.params!.update!);
+    }
+
+    expect(events.filter((event) => event.kind === "agent-thought"))
+      .toEqual([{ kind: "agent-thought", text: "checking adapter boundary" }]);
+    expect(events.filter((event) => event.kind === "agent-text"))
+      .toEqual([{ kind: "agent-text", text: "public answer" }]);
+    expect(JSON.stringify(events)).not.toContain("PRIVATE TOOL OUTPUT");
+    expect(status.thinkingWindow()).toEqual(["checking adapter boundary"]);
+    await panel.finalize("Done", "Completed");
+    const finalText = serializePanelText(rendered.at(-1) as Parameters<typeof serializePanelText>[0]);
+    expect(finalText).toContain("💡 checking adapter boundary");
+    expect(finalText).not.toContain("PRIVATE TOOL OUTPUT");
+    expect(finalText).not.toContain("Model info");
+  });
+});
 
 describe("package-backed agy profile", () => {
   it("requires explicit permission-risk acceptance", () => {

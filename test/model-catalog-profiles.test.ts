@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import os from "node:os";
 import {
   makeAgyProfile,
+  agyAcpReleaseArtifact,
   makeClaudeProfile,
   makeCodexProfile,
   makeCopilotProfile,
@@ -189,9 +191,24 @@ describe("production adapter catalog sources", () => {
       effort: { mechanism: "configOption", configId: "reasoning_effort", levels: ["low", "high"] },
     });
     const agy = makeAgyProfile({
-      cliPath: "false",
+      acpPath: "/bin/false",
+      agyBin: "/bin/false",
+      agyVersion: "false 1.0",
+      agySha256: "a".repeat(64),
       defaultModel: "gemini-high",
-      staticModels: [{ modelId: "gemini-high", name: "Gemini High", contextLimit: 1_000_000 }],
+      stateDir: `${os.homedir()}/.agy-acp`,
+      conversationsDir: "/tmp/conversations",
+      cwd: "/tmp",
+      credentialScope: "test",
+      wrapperVersion: "1.1.0",
+      wrapperSha256: agyAcpReleaseArtifact().sha256,
+      permissionRiskAcknowledged: true,
+      verifyWrapper: () => {},
+      verifyRuntime: () => {},
+      catalogProbe: async () => ({
+        agyVersion: "false 1.0",
+        models: [{ modelId: "gemini-high", displayName: "Gemini High" }],
+      }),
     });
     const discover = vi.fn(async () => [
       { modelId: "grok-future", name: "Grok Future", contextLimit: 654_321 },

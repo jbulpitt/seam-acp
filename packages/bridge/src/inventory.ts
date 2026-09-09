@@ -9,6 +9,7 @@ import { accessSync, constants } from "node:fs";
 import {
   AGENT_ADAPTER_VERSION,
   makeAgyProfile,
+  makeAgyOldProfile,
   makeClaudeProfile,
   makeCodexProfile,
   makeCopilotProfile,
@@ -18,6 +19,8 @@ import {
   type CopilotCatalogProbe,
   type HelloAgentInventory,
 } from "@seam/adapters";
+import path from "node:path";
+import os from "node:os";
 
 function commandExists(cmd: string): boolean {
   try {
@@ -116,6 +119,14 @@ export function loadHostAdapters(
   const out = new Map<string, AgentAdapter>();
   // Resolved once so the existence probe and the profile use the SAME path.
   const claudeCli = env.CLAUDE_CLI_PATH?.trim() || "claude-agent-acp";
+  const agyAcpPath = env.AGY_ACP_BIN?.trim();
+  const agyBin = env.AGY_BIN?.trim();
+  const agyVersion = env.AGY_VERSION?.trim();
+  const agySha256 = env.AGY_SHA256?.trim();
+  const agyDefaultModel = env.AGY_DEFAULT_MODEL?.trim();
+  const agyOldBin = env.AGY_OLD_CLI_PATH?.trim();
+  const agyEnabled = env.AGY_ENABLED === "true";
+  const agyRiskAcknowledged = env.AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED === "true";
   const factories: Array<{ id: string; bin: string; make: () => AgentAdapter }> = [
     {
       id: "copilot",
@@ -151,11 +162,32 @@ export function loadHostAdapters(
           : {}),
       }),
     },
-    {
+    ...(agyEnabled && agyAcpPath && agyBin && agyVersion && agySha256 && agyDefaultModel && agyRiskAcknowledged ? [{
       id: "agy",
-      bin: "agy",
-      make: () => makeAgyProfile({ defaultModel: "default" }),
-    },
+      bin: agyAcpPath,
+      make: () => makeAgyProfile({
+        acpPath: agyAcpPath,
+        agyBin,
+        agyVersion,
+        agySha256,
+        defaultModel: agyDefaultModel,
+        stateDir: env.AGY_ACP_STATE_DIR ?? path.join(env.HOME ?? os.homedir(), ".agy-acp"),
+        conversationsDir: env.AGY_CONVERSATIONS_DIR ?? path.join(env.HOME ?? os.homedir(), ".gemini", "antigravity-cli", "conversations"),
+        cwd: env.AGY_ACP_CWD ?? options.cwd ?? process.cwd(),
+        credentialScope: env.AGY_CREDENTIAL_SCOPE ?? "antigravity-oauth:default",
+        wrapperVersion: env.AGY_ACP_VERSION ?? "",
+        wrapperSha256: env.AGY_ACP_SHA256 ?? "",
+        permissionRiskAcknowledged: true,
+      }),
+    }] : []),
+    ...(env.AGY_OLD_ROLLBACK_ENABLED === "true" && agyOldBin ? [{
+      id: "agy-old",
+      bin: agyOldBin,
+      make: () => makeAgyOldProfile({
+        cliPath: agyOldBin,
+        defaultModel: agyDefaultModel || "antigravity",
+      }),
+    }] : []),
     {
       id: "codex",
       bin: "codex-acp",
@@ -183,8 +215,7 @@ export function loadHostAdapters(
     },
   ];
   for (const f of factories) {
-    // Skip before construct: agy's factory warms a catalog by spawning `agy`
-    // (ENOENT is an unhandled 'error' and kills the whole bridge process).
+    // Skip before construct so inventory never starts or refreshes an adapter.
     if (!exists(f.bin)) continue;
     try {
       out.set(f.id, f.make());
@@ -203,7 +234,8 @@ export function inventoryFromAdapters(
   const bins: Record<string, string> = {
     copilot: copilotCmd,
     claude: env.CLAUDE_CLI_PATH ?? "claude-agent-acp",
-    agy: "agy",
+    agy: env.AGY_ACP_BIN ?? "antigravity-acp",
+    "agy-old": env.AGY_OLD_CLI_PATH ?? "agy-old-disabled",
     codex: "codex-acp",
     grok: env.GROK_CLI_PATH?.trim() || "grok",
   };
@@ -216,7 +248,8 @@ export function inventoryFromAdapters(
     } catch {
       /* keep default */
     }
-    rows.push({ agentId: id, version, installed, ready: false });
+    const runtime = adapter.describe().runtime;
+    rows.push({ agentId: id, version, installed, ready: false, ...(runtime ? { runtime } : {}) });
   }
   return rows;
 }

@@ -3,9 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it, expect } from "vitest";
 import {
+  inventoryFromAdapters,
   loadHostAdapters,
   resolveCopilotHostLaunch,
 } from "../packages/bridge/src/inventory.js";
+import { agyAcpReleaseArtifact } from "@seam/adapters";
 
 describe("loadHostAdapters", () => {
   it("skips adapters whose CLI is not on PATH (agy must not spawn ENOENT)", () => {
@@ -115,5 +117,51 @@ fs.writeFileSync(process.env.GROK_BRIDGE_LOG, JSON.stringify({
     } finally {
       fs.rmSync(temporary, { recursive: true, force: true });
     }
+  });
+
+  it("keeps legacy disabled and advertises exact package runtime only when fully acknowledged", () => {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      AGY_ENABLED: "true",
+      AGY_ACP_BIN: "/opt/agy/antigravity-acp",
+      AGY_BIN: "/opt/agy/agy",
+      AGY_VERSION: "1.1.28",
+      AGY_SHA256: "a".repeat(64),
+      AGY_DEFAULT_MODEL: "gemini-high",
+      AGY_ACP_VERSION: "1.1.0",
+      AGY_ACP_SHA256: agyAcpReleaseArtifact().sha256,
+      AGY_CONVERSATIONS_DIR: "/srv/agy/conversations",
+      AGY_ACP_CWD: "/srv/workspaces",
+      AGY_CREDENTIAL_SCOPE: "antigravity-oauth:test",
+      AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED: "true",
+      AGY_OLD_ROLLBACK_ENABLED: "false",
+    };
+    const adapters = loadHostAdapters("copilot", { env, exists: () => true });
+    expect(adapters.has("agy")).toBe(true);
+    expect(adapters.has("agy-old")).toBe(false);
+    const row = inventoryFromAdapters(adapters, "copilot", env)
+      .find((item) => item.agentId === "agy");
+    expect(row?.runtime).toMatchObject({
+      executable: "/opt/agy/antigravity-acp",
+      cwd: "/srv/workspaces",
+      environment: {
+        AGY_BIN: "/opt/agy/agy",
+        AGY_SKIP_DOWNLOAD: "1",
+        AGY_CONVERSATIONS_DIR: "/srv/agy/conversations",
+      },
+      credentialScope: "antigravity-oauth:test",
+    });
+  });
+
+  it("registers agy-old only under the explicit rollback gate", () => {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      AGY_ENABLED: "false",
+      AGY_OLD_ROLLBACK_ENABLED: "true",
+      AGY_OLD_CLI_PATH: "/opt/agy/agy-old",
+    };
+    const adapters = loadHostAdapters("copilot", { env, exists: () => true });
+    expect(adapters.has("agy-old")).toBe(true);
+    expect(adapters.has("agy")).toBe(false);
   });
 });

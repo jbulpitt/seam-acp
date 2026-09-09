@@ -26,7 +26,7 @@ import {
 } from "./core/parked-agents.js";
 import { makeCopilotProfile } from "@seam/adapters";
 import { makeClaudeProfile } from "@seam/adapters";
-import { makeAgyProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
+import { makeAgyProfile, makeAgyOldProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
 import { makeCodexProfile } from "@seam/adapters";
 import { buildOllamaCodexCatalog } from "./agents/ollama-codex-catalog.js";
 import { makeGrokProfile, fetchXaiModels } from "@seam/adapters";
@@ -221,15 +221,34 @@ async function main(): Promise<void> {
       })
     : undefined;
 
-  const agy = makeAgyProfile({
-    ...(config.AGY_CLI_PATH ? { cliPath: config.AGY_CLI_PATH } : {}),
-    defaultModel: config.AGY_DEFAULT_MODEL,
-    staticModels: config.AGY_MODELS,
-    dataDir: config.DATA_DIR,
-    printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
-    mcpServers,
-  });
-  scrubStaleGlobalSeamStdio();
+  const agy = config.AGY_ENABLED
+    ? makeAgyProfile({
+        acpPath: config.AGY_ACP_BIN!,
+        agyBin: config.AGY_BIN!,
+        agyVersion: config.AGY_VERSION,
+        agySha256: config.AGY_SHA256,
+        defaultModel: config.AGY_DEFAULT_MODEL,
+        stateDir: config.AGY_ACP_STATE_DIR!,
+        conversationsDir: config.AGY_CONVERSATIONS_DIR!,
+        cwd: config.AGY_ACP_CWD!,
+        credentialScope: config.AGY_CREDENTIAL_SCOPE,
+        wrapperVersion: config.AGY_ACP_VERSION,
+        wrapperSha256: config.AGY_ACP_SHA256,
+        permissionRiskAcknowledged: config.AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED,
+        timeoutMs: Math.min(config.TURN_TIMEOUT_SECONDS * 1_000, 120_000),
+      })
+    : undefined;
+  const agyOld = config.AGY_OLD_ROLLBACK_ENABLED
+    ? makeAgyOldProfile({
+        cliPath: config.AGY_OLD_CLI_PATH!,
+        defaultModel: config.AGY_DEFAULT_MODEL,
+        staticModels: config.AGY_MODELS,
+        dataDir: config.DATA_DIR,
+        printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
+        mcpServers,
+      })
+    : undefined;
+  if (agyOld) scrubStaleGlobalSeamStdio();
 
   // Optional OpenAI Codex agent via @agentclientprotocol/codex-acp.
   const codex = config.CODEX_ENABLED
@@ -376,7 +395,7 @@ async function main(): Promise<void> {
   let stopCatalogEnrichmentRefresh: (() => void) | undefined;
   let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
 
-  const profiles: AgentProfile[] = [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), agy, ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
+  const profiles: AgentProfile[] = [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(agyOld ? [agyOld] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
   const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
   const modelCatalog = new ModelCatalogService({
     store: modelCatalogStore,
@@ -524,7 +543,7 @@ async function main(): Promise<void> {
     logger,
     registry: quotaRegistry,
     sources: createAgentQuotaSources(router.listProfiles(), {
-      agyCliPath: config.AGY_CLI_PATH,
+      agyCliPath: config.AGY_BIN,
       grokCliPath: config.GROK_CLI_PATH,
       ollamaUsageCliPath: config.OLLAMA_USAGE_CLI_PATH,
       ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
@@ -703,12 +722,25 @@ async function main(): Promise<void> {
         )
       : undefined;
     const messageSearch = messageReader ? new LiveMessageSearch(messageReader) : undefined;
-    const agyImageInspector = createAgyImageInspector({
-      model: config.AGY_VISION_MODEL,
-      logger,
-      isModelAvailable: (model) => Boolean(modelCatalog.model({ agentId: "agy", location: "local" }, model)),
-      ...(config.AGY_CLI_PATH ? { cliPath: config.AGY_CLI_PATH } : {}),
-    });
+    const agyImageInspector = agy
+      ? createAgyImageInspector({
+          model: config.AGY_VISION_MODEL,
+          logger,
+          isModelAvailable: (model) => Boolean(modelCatalog.model({ agentId: "agy", location: "local" }, model)),
+          profileOptions: {
+            acpPath: config.AGY_ACP_BIN!,
+            agyBin: config.AGY_BIN!,
+            agyVersion: config.AGY_VERSION,
+            agySha256: config.AGY_SHA256,
+            stateDir: config.AGY_ACP_STATE_DIR!,
+            conversationsDir: config.AGY_CONVERSATIONS_DIR!,
+            credentialScope: config.AGY_CREDENTIAL_SCOPE,
+            wrapperVersion: config.AGY_ACP_VERSION,
+            wrapperSha256: config.AGY_ACP_SHA256,
+            permissionRiskAcknowledged: config.AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED,
+          },
+        })
+      : undefined;
     const threadSessionControl = new ThreadSessionControlService({
       store,
       router,
@@ -784,6 +816,7 @@ async function main(): Promise<void> {
         ) {
           throw new Error("inspect_image is only available to tool-vision sessions");
         }
+        if (!agyImageInspector) throw new Error("inspect_image requires configured package-backed agy");
         return agyImageInspector({ ...req, ownerId: record.id });
       },
       // Agent-scheduled wake events (#59): arm/cancel a one-shot self-resumption

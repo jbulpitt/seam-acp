@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   makeAgyProfile,
   STAGING_ROOT,
+  type AgyProfileOptions,
   type AgentProfile,
 } from "@seam/adapters";
 import {
@@ -26,14 +27,14 @@ const MAX_OBSERVATION_CHARS = 20_000;
 export interface AgyImageInspectorOptions {
   model: string;
   logger: Logger;
-  cliPath?: string;
+  profileOptions: Omit<AgyProfileOptions, "defaultModel" | "cwd">;
   stagingRoot?: string;
   timeoutMs?: number;
   /** Cache-only availability check supplied by the shared model catalog. */
   isModelAvailable?: (model: string) => boolean;
   /** Test seam; production uses makeAgyProfile. */
   profileFactory?: (
-    opts: Parameters<typeof makeAgyProfile>[0]
+    opts: AgyProfileOptions
   ) => AgentProfile;
   /** Test seam; production creates a real isolated AgentRuntime. */
   runtimeFactory?: (profile: AgentProfile, logger: Logger) => AgyVisionRuntime;
@@ -78,14 +79,10 @@ export function createAgyImageInspector(
     try {
       await fsp.writeFile(imagePath, bytes, { mode: 0o600 });
       const profile = (opts.profileFactory ?? makeAgyProfile)({
-        ...(opts.cliPath ? { cliPath: opts.cliPath } : {}),
+        ...opts.profileOptions,
         defaultModel: model,
-        dataDir: tempDir,
-        printTimeoutSeconds: Math.max(1, Math.ceil(timeoutMs / 1_000)),
-        mcpServers: [],
-        sandbox: true,
-        exposeGlobalStaging: false,
-        persistModelSelection: false,
+        cwd: tempDir,
+        timeoutMs: Math.min(timeoutMs, 120_000),
       });
       const runtimeLogger = opts.logger.child({ vision: "agy", model });
       runtime = opts.runtimeFactory

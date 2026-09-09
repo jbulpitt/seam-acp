@@ -5,7 +5,7 @@ import {
   AGY_NO_SLASH_EXPANSION,
   buildAgyPromptArgs,
   type AgyExecutionPolicy,
-} from "../packages/adapters/src/profiles/agy.js";
+} from "../packages/adapters/src/profiles/agy-old.js";
 
 const STAGING_ROOT = path.join(os.tmpdir(), "seam-attachments");
 

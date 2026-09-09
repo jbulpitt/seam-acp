@@ -3,6 +3,7 @@ dotenv.config({ override: true });
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { agyAcpReleaseArtifact } from "@seam/adapters";
 import { parkedAgentMessage } from "./core/parked-agents.js";
 import { retiredAgentConfigMessage } from "./core/retired-agents.js";
 
@@ -285,10 +286,35 @@ const Schema = z.object({
   CLAUDE_VERTEX_PROJECT_ID: z.string().optional(),
   CLAUDE_VERTEX_REGION: z.string().default("us-central1"),
 
-  /** Path to the `agy` (Antigravity) binary. Defaults to `~/.local/bin/agy` if present, else `agy` on PATH. */
+  /** Package-backed Antigravity ACP is fail-closed until explicitly enabled. */
+  AGY_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
+  /** Exact compiled antigravity-acp v1.1.0 executable for this host. */
+  AGY_ACP_BIN: z.string().optional(),
+  /** Exact authenticated agy executable; forwarded to the wrapper as AGY_BIN. */
+  AGY_BIN: z.string().optional(),
+  /** Exact first line returned by AGY_BIN --version. */
+  AGY_VERSION: z.string().default(""),
+  /** Exact SHA-256 of AGY_BIN used for catalog evidence and runtime. */
+  AGY_SHA256: z.string().default(""),
+  AGY_ACP_VERSION: z.string().default(""),
+  /** Host/platform-specific SHA-256 of AGY_ACP_BIN. */
+  AGY_ACP_SHA256: z.string().default(""),
+  /** v1.1.0 stores sessions here; must describe the effective host-local directory. */
+  AGY_ACP_STATE_DIR: z.string().optional(),
+  AGY_CONVERSATIONS_DIR: z.string().optional(),
+  AGY_ACP_CWD: z.string().optional(),
+  /** Non-secret semantic auth scope, never an account name, email, token, or path. */
+  AGY_CREDENTIAL_SCOPE: z.string().default("antigravity-oauth:default"),
+  /** Security acceptance: v1.1.0 unconditionally runs agy with its bypass flag. */
+  AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
+  /** Operator-only rollback. Never enables or substitutes itself automatically. */
+  AGY_OLD_ROLLBACK_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
+  AGY_OLD_CLI_PATH: z.string().optional(),
+  /** Deprecated legacy alias, accepted only by explicitly enabled agy-old. */
   AGY_CLI_PATH: z.string().optional(),
-  /** Cosmetic model id reported by the Antigravity profile. */
-  AGY_DEFAULT_MODEL: z.string().default("antigravity"),
+  /** Exact model id; must be present in fresh discovery. */
+  AGY_DEFAULT_MODEL: z.string().default(""),
+  /** Retained for config compatibility; never used as fresh catalog evidence. */
   AGY_MODELS: ModelsListSchema,
   /** Sandboxed Agy model used by the tool-mediated image inspector. */
   AGY_VISION_MODEL: z.string().default("gemini-3.7-flash-high"),
@@ -1141,6 +1167,72 @@ export function loadConfig(): Config {
     );
   }
   cfg.REPOS_ROOT = reposRoot;
+
+  if (cfg.AGY_ENABLED) {
+    const missing = [
+      ["AGY_ACP_BIN", cfg.AGY_ACP_BIN],
+      ["AGY_BIN", cfg.AGY_BIN],
+      ["AGY_VERSION", cfg.AGY_VERSION],
+      ["AGY_SHA256", cfg.AGY_SHA256],
+      ["AGY_ACP_SHA256", cfg.AGY_ACP_SHA256],
+      ["AGY_CONVERSATIONS_DIR", cfg.AGY_CONVERSATIONS_DIR],
+      ["AGY_DEFAULT_MODEL", cfg.AGY_DEFAULT_MODEL],
+    ].filter(([, value]) => !value).map(([name]) => name);
+    if (missing.length) {
+      throw new Error(`Invalid configuration: AGY_ENABLED requires ${missing.join(", ")}`);
+    }
+    for (const [name, value] of [
+      ["AGY_ACP_BIN", cfg.AGY_ACP_BIN!],
+      ["AGY_BIN", cfg.AGY_BIN!],
+      ["AGY_CONVERSATIONS_DIR", cfg.AGY_CONVERSATIONS_DIR!],
+      ["AGY_ACP_CWD", cfg.AGY_ACP_CWD ?? cfg.REPOS_ROOT],
+    ] as const) {
+      if (!path.isAbsolute(value)) throw new Error(`Invalid configuration: ${name} must be an absolute path`);
+    }
+    if (cfg.AGY_ACP_VERSION !== "1.1.0") {
+      throw new Error("Invalid configuration: AGY_ACP_VERSION must be the reviewed immutable version 1.1.0");
+    }
+    if (cfg.AGY_VERSION.length > 256 || /[\r\n\0]/.test(cfg.AGY_VERSION)) {
+      throw new Error("Invalid configuration: AGY_VERSION must be the exact bounded first line from AGY_BIN --version");
+    }
+    if (!/^[a-f0-9]{64}$/.test(cfg.AGY_SHA256)) {
+      throw new Error("Invalid configuration: AGY_SHA256 must be 64 lowercase hex characters");
+    }
+    if (!/^[a-f0-9]{64}$/.test(cfg.AGY_ACP_SHA256)) {
+      throw new Error("Invalid configuration: AGY_ACP_SHA256 must be 64 lowercase hex characters");
+    }
+    const reviewedArtifact = agyAcpReleaseArtifact();
+    if (cfg.AGY_ACP_SHA256 !== reviewedArtifact.sha256) {
+      throw new Error(
+        `Invalid configuration: AGY_ACP_SHA256 must match reviewed v1.1.0 ${reviewedArtifact.name}`
+      );
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(cfg.AGY_CREDENTIAL_SCOPE)) {
+      throw new Error("Invalid configuration: AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
+    }
+    if (!cfg.AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED) {
+      throw new Error(
+        "Invalid configuration: antigravity-acp v1.1.0 unconditionally passes " +
+          "--dangerously-skip-permissions; set AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED=true only after explicit operator acceptance"
+      );
+    }
+    const effectiveStateDir = cfg.AGY_ACP_STATE_DIR ?? path.join(process.env.HOME ?? "", ".agy-acp");
+    if (!path.isAbsolute(effectiveStateDir)) {
+      throw new Error("Invalid configuration: AGY_ACP_STATE_DIR must resolve to an absolute path");
+    }
+    const wrapperStateDir = path.join(process.env.HOME ?? "", ".agy-acp");
+    if (path.normalize(effectiveStateDir) !== path.normalize(wrapperStateDir)) {
+      throw new Error(
+        `Invalid configuration: antigravity-acp v1.1.0 fixes state at ${wrapperStateDir}; ` +
+          "AGY_ACP_STATE_DIR may describe but cannot relocate it"
+      );
+    }
+    cfg.AGY_ACP_STATE_DIR = effectiveStateDir;
+    cfg.AGY_ACP_CWD = cfg.AGY_ACP_CWD ?? cfg.REPOS_ROOT;
+  }
+  if (cfg.AGY_OLD_ROLLBACK_ENABLED && !cfg.AGY_OLD_CLI_PATH) {
+    throw new Error("Invalid configuration: AGY_OLD_ROLLBACK_ENABLED requires exact AGY_OLD_CLI_PATH");
+  }
 
   // #12: DEFAULT_AGENT naming a RETIRED agent is a configuration error, refused
   // here rather than at the first turn. This is the bot-wide default, so every

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseAgyQuotaSummary } from "../packages/adapters/src/profiles/agy.js";
+import { parseAgyQuotaSummary } from "../packages/adapters/src/profiles/agy-old.js";
 import { parseOllamaCloudUsage } from "../packages/adapters/src/profiles/ollama-cloud.js";
 import type { AgentProfile } from "../packages/adapters/src/agent-profile.js";
 import {

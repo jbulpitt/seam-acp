@@ -12,9 +12,17 @@ function hello(overrides: Partial<HelloFrame["release"]> = {}): HelloFrame {
     host: { os: "darwin", arch: "x64" },
     agents: [{ agentId: "grok", version: 1, installed: true, ready: false }],
     release: {
+      formatVersion: 2,
+      activationId: "c".repeat(64),
+      stageId: "d".repeat(64),
+      bridgeId: "media-server",
       sourceSha: "a".repeat(40),
       artifactChecksum: "b".repeat(64),
       verificationAgent: "grok",
+      oldPid: 41,
+      pid: 57,
+      startedAt: new Date(Date.now() - 1_000).toISOString(),
+      deadlineAt: new Date(Date.now() + 60_000).toISOString(),
       ...overrides,
     },
   };

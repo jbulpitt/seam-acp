@@ -77,9 +77,17 @@ export interface HelloFrame {
   devMode?: boolean;
   /** Secret-free staged-release identity used only for rollout verification. */
   release?: {
+    formatVersion: 2;
+    activationId: string;
+    stageId: string;
+    bridgeId: string;
     sourceSha: string;
     artifactChecksum: string;
     verificationAgent: string;
+    oldPid: number;
+    pid: number;
+    startedAt: string;
+    deadlineAt: string;
   };
 }
 

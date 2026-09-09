@@ -27,6 +27,7 @@ import path from "node:path";
 const RELEASE_SHA = /^[0-9a-f]{40}$/;
 const RELEASE_CHECKSUM = /^[0-9a-f]{64}$/;
 const RELEASE_AGENT = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const RELEASE_INSTANCE = /^[A-Za-z0-9._-]{8,128}$/;
 
 export async function verifyStagedReleaseCatalogRpcs(
   hello: HelloFrame,
@@ -34,11 +35,29 @@ export async function verifyStagedReleaseCatalogRpcs(
   rpc: (method: string, params: unknown, options: { agentId: string }) => Promise<unknown>,
 ): Promise<string | null> {
   const release = hello.release;
+  const startedAt = Date.parse(release?.startedAt ?? "");
+  const deadlineAt = Date.parse(release?.deadlineAt ?? "");
+  const now = Date.now();
   if (
     !release ||
+    release.formatVersion !== 2 ||
+    release.bridgeId !== hello.bridgeId ||
+    !RELEASE_INSTANCE.test(hello.instanceId) ||
+    !RELEASE_CHECKSUM.test(release.activationId) ||
+    !RELEASE_CHECKSUM.test(release.stageId) ||
     !RELEASE_SHA.test(release.sourceSha) ||
     !RELEASE_CHECKSUM.test(release.artifactChecksum) ||
     !RELEASE_AGENT.test(release.verificationAgent) ||
+    !Number.isSafeInteger(release.oldPid) ||
+    !Number.isSafeInteger(release.pid) ||
+    release.oldPid < 2 ||
+    release.pid < 2 ||
+    release.oldPid === release.pid ||
+    !Number.isFinite(startedAt) ||
+    !Number.isFinite(deadlineAt) ||
+    startedAt > now ||
+    now > deadlineAt ||
+    deadlineAt - startedAt > 900_000 ||
     !agents.get(release.verificationAgent)?.installed
   ) return null;
   await rpc("describeModelCatalog", {}, { agentId: release.verificationAgent });
@@ -396,6 +415,10 @@ export class BridgeHub {
             type: "event",
             name: "release_verified",
             payload: {
+              activationId: hello.release.activationId,
+              bridgeId: expectedId,
+              instanceId: hello.instanceId,
+              pid: hello.release.pid,
               sourceSha: hello.release.sourceSha,
               artifactChecksum: hello.release.artifactChecksum,
               verificationAgent: verifiedAgent,

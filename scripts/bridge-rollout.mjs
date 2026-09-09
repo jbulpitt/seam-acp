@@ -1,18 +1,19 @@
 #!/usr/bin/env node
-import fs from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildArtifact, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, resolveTarget, rollbackPlan, runPreflight } from "./lib/bridge-rollout.mjs";
+import { buildArtifact, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, rollbackPlan, runPreflight } from "./lib/bridge-rollout.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
+const nonce = () => randomBytes(32).toString("hex");
 
 function usage() {
   console.log("Usage:");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id>");
   console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --stage --apply");
-  console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --activate --sha <40-hex> --checksum <64-hex> --apply");
-  console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --rollback --apply");
+  console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --activate --sha <40-hex> --checksum <64-hex> --stage-id <64-hex> --apply");
+  console.log("  node scripts/bridge-rollout.mjs --target <bridge-id> --rollback --activation-id <64-hex> --apply");
 }
 
 async function main() {
@@ -20,31 +21,37 @@ async function main() {
   if (options.help) return usage();
   const targets = await loadTargetMap(path.join(repoRoot, "ops/bridge/targets.json"));
   const target = resolveTarget(targets, options.target);
-  const remoteScript = await fs.readFile(path.join(scriptDir, "bridge-rollout-remote.sh"), "utf8");
+  const remoteScript = await renderRemoteScript(path.join(scriptDir, "bridge-rollout-remote.sh"), path.join(scriptDir, "bridge-rollout-remote.mjs"));
   const preflight = await runPreflight(target, remoteScript);
   process.stdout.write(preflight.stdout);
   if (options.action === "preflight") {
-    console.log("mode=dry-run");
-    console.log("remote_mutation=no");
+    console.log("mode=dry-run"); console.log("remote_mutation=no");
     console.log(`next_stage=npm run bridge:rollout -- --target ${target.bridgeId} --stage --apply`);
     return;
   }
   if (options.action === "stage") {
     const artifact = await buildArtifact(repoRoot);
-    await commandRunner(makeSshCommand(target, ["prepare-upload", target.pm2App, target.bridgeId, target.verifyAgent], remoteScript));
-    await commandRunner(makeScpCommand(target, artifact.archive, artifact.remoteName));
-    const staged = await commandRunner(makeSshCommand(target, ["stage", target.pm2App, target.bridgeId, target.verifyAgent, artifact.sha, artifact.checksum, artifact.remoteName], remoteScript));
+    const operationId = nonce();
+    await commandRunner(makeSshCommand(target, ["prepare-upload", operationId], remoteScript));
+    const uploadName = `${artifact.remoteName}.upload-${operationId}`;
+    await commandRunner(makeScpCommand(target, artifact.archive, uploadName));
+    const staged = await commandRunner(makeSshCommand(target, ["stage", artifact.sha, artifact.checksum, uploadName, operationId], remoteScript));
     process.stdout.write(staged.stdout);
-    console.log(`activate_command=npm run bridge:rollout -- --target ${target.bridgeId} --activate --sha ${artifact.sha} --checksum ${artifact.checksum} --apply`);
+    const stageId = parseKeyValues(staged.stdout).stage_id;
+    if (!/^[0-9a-f]{64}$/.test(stageId ?? "")) throw new Error("remote stage did not return an immutable stage id");
+    console.log(`activate_command=npm run bridge:rollout -- --target ${target.bridgeId} --activate --sha ${artifact.sha} --checksum ${artifact.checksum} --stage-id ${stageId} --apply`);
     return;
   }
   if (options.action === "activate") {
-    console.log(`rollback_command=${rollbackPlan(target).command}`);
-    const result = await commandRunner(makeSshCommand(target, ["activate", target.pm2App, target.bridgeId, target.verifyAgent, options.sha, options.checksum, String(options.timeoutSeconds)], remoteScript));
+    const activationId = nonce(); const operationId = nonce();
+    console.log(`activation_id=${activationId}`);
+    console.log(`rollback_command=${rollbackPlan(target, activationId).command}`);
+    const result = await commandRunner(makeSshCommand(target, ["activate", options.sha, options.checksum, options.stageId, activationId, String(options.timeoutSeconds), operationId], remoteScript));
     process.stdout.write(result.stdout);
     return;
   }
-  const result = await commandRunner(makeSshCommand(target, ["rollback", target.pm2App, target.bridgeId, target.verifyAgent, String(options.timeoutSeconds)], remoteScript));
+  const rollbackId = nonce(); const operationId = nonce();
+  const result = await commandRunner(makeSshCommand(target, ["rollback", options.activationId, rollbackId, String(options.timeoutSeconds), operationId], remoteScript));
   process.stdout.write(result.stdout);
 }
 

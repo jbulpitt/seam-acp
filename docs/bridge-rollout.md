@@ -1,138 +1,174 @@
 # Remote bridge rollout runbook
 
-This runbook is the only supported update path for PM2-managed Seam bridges.
-It stages committed artifacts without remote Git, drains with `SIGUSR2`, verifies
-the replacement through the bridge/controller protocol, and retains an explicit
-previous-good rollback. It does not apply to the systemd-managed Seam controller.
+This is the reviewed update mechanism for receipt-capable, PM2-managed Seam
+bridges. It ships an exact committed artifact without remote Git, drains only
+with `SIGUSR2`, proves the replacement on its exact controller connection, and
+keeps rollback explicit and version-bound. It never restarts the controller.
 
-Actual host mutation is a separate operator decision. A bare command is always a
-read-only preflight. Every mutating phase requires both one exact target and
-`--apply`; there is no all-host mode.
+A bare invocation is read-only. Every mutation requires `--apply`, one exact
+target, and one phase. There is no host loop, implicit rollback, PM2 restart or
+reload fallback, environment dump, provider authentication, or provider catalog
+parsing.
 
-## Operator-owned targets
+## Fixed deployment identities
 
-[`ops/bridge/targets.json`](../ops/bridge/targets.json) is the reviewed source of
-truth. Callers cannot override SSH aliases, PM2 app names, or the verification
-agent from the command line.
+[`ops/bridge/targets.json`](../ops/bridge/targets.json) is the only target map.
+For each enabled bridge it pins the bridge ID, SSH alias, PM2 app, verification
+agent, UID, checkout/cwd, stable PM2 entrypoint, exact PID file, Node executable,
+PM2 module, optional workspace argument, and rollout root. None is overridable
+on the command line.
 
-- `media-server`: SSH `media-server`, PM2 `remote-agent-bridge`, verification agent `grok`
-- `macbook-air`: SSH `macbook-air`, PM2 `seam-bridge`, verification agent `grok`
-- `jennifer-laptop`: SSH `macbook-air-j`, rollout disabled
-- `macbook-pro`: SSH `home-hub`, rollout disabled
-- `alaina-laptop`: SSH `laptop-alaina`, rollout disabled
-- `allie-laptop`: SSH `laptop-allie`, rollout disabled
+- `media-server` maps to SSH `media-server`, PM2 `remote-agent-bridge`, UID 501,
+  checkout `/Users/jesse/seam-acp`, and rollout root
+  `/Users/jesse/.seam/bridge-rollouts`.
+- `macbook-air` maps to SSH `macbook-air`, PM2 `seam-bridge`, UID 501, checkout
+  `/Users/jessebulpitt/.seam/seam-acp`, and rollout root
+  `/Users/jessebulpitt/.seam/bridge-rollouts`.
+- The four AGY-only hosts retain SSH aliases but deliberately have no rollout
+  identity and remain disabled.
 
-The disabled hosts currently advertise AGY only. Their SSH identities are recorded
-without guessing a PM2 app identity; AGY rollout remains outside issue #241.
-Names are restricted to lowercase letters, digits, dot, underscore, and hyphen.
-Unknown targets, mapping fields, command-line overrides, and shell metacharacters
-are rejected before SSH runs.
+Before any mutation, the remote program requires one PM2 record and proves that
+its PID equals the exact owned PID file; the process is alive, owned by the
+configured UID, running the exact Node executable, and has the exact checkout
+cwd; PM2 names the exact stable entrypoint, interpreter, bridge ID, and expected
+workspace argument; and all configured paths and owners are canonical. PM2
+arguments must match a supported bridge grammar. Secret argument values are
+compared in memory and never printed. Ambiguity, symlink escape, wrong owner,
+unexpected flags, or any mismatch refuses the phase.
 
-## Read-only preflight and dry run
+## State machine
 
-Run exactly one of:
+### 1. PREFLIGHT (read-only)
 
 ```bash
 npm run bridge:rollout -- --target media-server
 npm run bridge:rollout -- --target macbook-air
 ```
 
-The preflight streams a fixed checked-in shell program over SSH. It reports SSH
-reachability, platform details, Node and npm versions, available disk, the
-allowlisted PM2 app and live PID, the process working directory, deployed Git SHA
-or release SHA/checksum, bridge package/protocol versions, `SIGUSR2` support, and
-whether the installed bridge contains both catalog RPC method names.
+This performs only the identity proof above and reports non-secret paths,
+versions, IDs, and `remote_mutation=no`. Run it separately for each host. The
+canary remains `media-server`; observe and obtain separate authorization before
+doing anything to `macbook-air`.
 
-It reads PM2's app-specific PID file and the process cwd. It never reads process
-arguments, environment variables, pairing files, credentials, or provider state,
-and never invokes secret-bearing PM2 inspection commands.
-
-## Stage one exact committed artifact
-
-Staging is remote mutation but does not activate or signal the bridge:
+### 2. PREPARE + UPLOAD + STAGE
 
 ```bash
 npm run bridge:rollout -- --target media-server --stage --apply
 ```
 
-The command refuses any tracked or untracked source change, records `git rev-parse
-HEAD`, builds only `@seam/adapters` and `@seam/bridge`, and packages their emitted
-code with the committed workspace manifests and lockfile. It uploads a tarball to
-`~/.seam/bridge-rollouts/incoming/`, verifies its SHA-256 on the host, and expands
-it into a new `releases/<source-sha>-<archive-checksum>/` directory. It never uses
-remote Git and never writes into the active artifact.
+The local side refuses a dirty worktree, resolves `git rev-parse HEAD`, builds
+only adapters and bridge, creates a deterministic USTAR/gzip artifact, and
+records every member's path, size, and SHA-256 in its manifest. The upload uses
+an operation-random temporary name. No remote Git command runs.
 
-The remote host then runs the lockfile-bound command below inside that versioned
-release:
+After re-proving identity, PREPARE creates only the allowlisted rollout
+directories with mode 0700 and checks their canonical paths and owners. STAGE
+holds the target's exclusive lock while it consumes the upload. Before writing
+any archive member it checks the compressed/expanded/member/count limits and
+every tar header. Absolute, traversing, empty, ambiguous, control-bearing,
+duplicate, prefix-conflicting, unexpected, linked, device, FIFO, and other
+special members are refused.
 
-```bash
-npm ci --omit=dev --workspace=@seam/adapters --workspace=@seam/bridge --no-audit --no-fund
-```
+Extraction writes regular files one by one with exclusive create into a fresh
+private `.stage-*` directory. The manifest, all file hashes, package names, and
+lockfile workspace identities are checked again. `npm ci` receives a minimal
+secret-free environment and the committed lockfile. Links produced by npm are
+materialized only when their canonical targets remain inside the stage; links
+and special files are forbidden in the final release. A full-tree digest and
+random stage ID are placed in `release-receipt.json`, after which the directory
+is atomically published as `releases/<sha>-<archive-checksum>`.
 
-Assumptions: the host has Node 22 or newer with its matching npm, can reach the npm
-registry, and can use an audited prebuilt dependency or local compiler toolchain
-for any dependency install script. The committed lockfile fixes package versions
-and integrity; the archive checksum fixes the shipped Seam code. Dependency or
-checksum failure leaves the active process untouched and preserves the failed
-staging directory for audit rather than recursively deleting it.
+An existing release is never trusted by pathname or one state file. Reuse walks
+the entire tree, rechecks types, owners, exact top-level/package layout, source
+manifest hashes, stage receipt, and whole-tree digest. Interrupted/failed stage
+directories remain versioned under `failed-staging/` for audit.
 
-On success, the tool prints the exact `--activate --sha ... --checksum ... --apply`
-command. Copy that command; do not substitute a branch or moving tag.
+STAGE prints an exact activation command containing SHA, artifact checksum, and
+stage ID. Do not substitute a branch, tag, or different stage ID.
 
-## Graceful activation and verification
+### 3. ACTIVATE + VERIFY
 
-Example shape (use the exact values printed by staging):
+Use the exact command printed by STAGE. Shape:
 
 ```bash
 npm run bridge:rollout -- --target media-server --activate \
   --sha 0123456789abcdef0123456789abcdef01234567 \
   --checksum 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --stage-id 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   --apply
 ```
 
-Before signaling anything, activation rechecks the staged archive checksum,
-retains the current entrypoint as previous-good, and writes a mode-0600 state file
-containing the old/new targets and exact rollback command. It atomically switches
-the PM2 entrypoint pathname to the versioned release, then sends only `SIGUSR2` to
-the validated live PID. The old process drains active slots and exits; PM2 follows
-the new symlink on its normal restart. There is no immediate restart or reload
-fallback.
+ACTIVATE first proves the active deployment, lock roots, current managed release,
+and requested release, then takes the target lock and proves them again. It
+writes an immutable activation intent and a fresh random activation envelope
+bound to target, app, source SHA, checksum, stage ID, old PID, start time, and
+deadline. It atomically switches only the stable entrypoint and sends only
+`SIGUSR2` to the proven old PID.
 
-Success requires all of the following before the bounded timeout (420 seconds by
-default, configurable from 10 through 900):
+Within the bounded timeout, success requires positive observation that the old
+PID exited; a distinct, owned PID appeared in the exact PID file; PM2 still maps
+that PID to the exact app/interpreter/cwd/stable entrypoint/argv; the stable
+entrypoint resolves to the requested release; and that process presents the
+exact activation nonce and PID in its hello. The controller must accept that
+exact bridge ID and instance, call `describeModelCatalog` and `fetchModelCatalog`
+successfully on that same connection, and echo the nonce, bridge ID, instance ID,
+and PID. The bridge writes the ordered, in-window receipt. Only then is an
+immutable `.verified.json` activation record written. The activation ID and its
+exact rollback command are printed before signaling so they remain available if
+verification later fails. Once the replacement PID and entrypoint are proven, an
+immutable `.observed.json` is also written; it permits an explicit rollback of a
+replacement whose catalog/receipt verification timed out without guessing a PID.
 
-- PM2's allowlisted app records a live PID different from the old PID.
-- The new process writes a receipt for the exact committed SHA and archive checksum.
-- The controller accepts a fresh protocol-version handshake from that PID.
-- The controller directly and successfully calls both `describeModelCatalog` and
-  `fetchModelCatalog` on the new bridge for the mapped verification agent.
-- The bridge records the controller's acknowledgement after both RPC replies arrive.
+A stale/shared receipt, different process, different connection, missing RPC,
+old PID still alive, or timeout cannot satisfy the gate. The runner also bounds
+wall time and stdout/stderr bytes, kills and awaits an over-limit subprocess,
+cleans listeners/timers, and returns symbolic/redacted diagnostics.
 
-The receipt records only release/protocol identifiers and timestamps. It contains
-no catalog payload, provider parsing, model prompt, token, or environment data.
+### 4. ROLLBACK (explicit, never fleet-wide)
 
-Canary order is `media-server` first, then `macbook-air`, with an observation and
-independent authorization between hosts. Never stage or activate both as a loop.
-
-## Failure containment and rollback
-
-Any checksum, PID, handshake, or RPC failure stops the rollout. The tool does not
-automatically roll back and does not remove a release recursively. Inspect the
-reported state and obtain explicit rollback authorization before running the exact
-recorded command, for example:
+Use only the exact activation ID printed by the failed canary activation:
 
 ```bash
-npm run bridge:rollout -- --target media-server --rollback --apply
+npm run bridge:rollout -- --target media-server --rollback \
+  --activation-id 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --apply
 ```
 
-Rollback validates that the recorded previous-good entry is either a managed
-versioned release or the preserved legacy bridge entrypoint, atomically restores
-that target, sends `SIGUSR2` to drain, and bounds the wait for a different live
-PID. A first rollback to a legacy artifact can prove the replacement PID but cannot
-produce the new release receipt; confirm the bridge is connected before further
-work. Never replace this with an immediate PM2 restart.
+ROLLBACK takes the same target lock and loads that activation's immutable intent
+and verified outcome. It refuses unless the current PID and resolved release
+still match the failed activation. It fully revalidates both current and exact
+previous release receipts and trees, writes an immutable rollback intent, and
+atomically restores the exact previous entrypoint. It sends only `SIGUSR2`, then
+applies the same old-exit/new-PID/PM2/entrypoint/fresh-handshake/two-RPC proof to
+the previous SHA, checksum, stage ID, and a new rollback nonce. Success produces
+an immutable versioned rollback outcome; mutable target-only state is never used.
 
-The installer remains a bootstrap/pairing tool, not an updater. Do not authenticate
-or modify any provider CLI as part of this runbook. Provider-specific catalog
-correctness belongs to issues #231–#234, and production rollout remains gated by
-#236 and independent QA of each exact PR head.
+## Locks and recovery boundaries
+
+One atomic lock directory per target spans each STAGE/reuse, ACTIVATE, or
+ROLLBACK transaction. A live owner or a lock younger than 15 minutes refuses
+with `target_lock_busy`. A dead lock older than 15 minutes is atomically moved to
+`stale-locks/` with its operation ID and timestamp before retry; malformed or
+racing lock state refuses. Never delete a lock by hand while its owner is live.
+
+- Failure before the entrypoint switch: the active process is untouched. Inspect
+  the symbolic refusal and immutable stage/intent records; retry only after the
+  cause is understood.
+- Failure after the switch or `SIGUSR2`: there is no automatic rollback. Use the
+  exact activation ID. Rollback itself refuses if live state drifted.
+- An activation with `.observed.json` but no verified outcome may be rolled back
+  explicitly by its printed activation ID; rollback first requires that exact
+  observed PID and release still be active, and then fully proves the previous
+  release. An intent without either observed or verified state stopped before a
+  replacement identity was proven. It is evidence, not permission to guess a
+  PID or rollback target; a human must reconcile exact live state.
+- Legacy code cannot emit a nonce/PID/instance/two-RPC rollback receipt. Therefore
+  ACTIVATE fails closed with `legacy_previous_release_not_receipt_capable` until
+  the host has been explicitly enrolled with a reviewed receipt-capable managed
+  baseline. This tool does not weaken rollback proof or perform that bootstrap.
+- Never replace a refusal with `pm2 restart`, `pm2 reload`, a provider login, or
+  an environment/PM2 dump. Emergency/manual recovery is outside this automated
+  transaction and requires a separate operator plan.
+
+No command in this runbook deploys to both hosts. Independent QA is required for
+every exact PR head before any production use.

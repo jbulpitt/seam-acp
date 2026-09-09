@@ -43,6 +43,7 @@
  */
 
 import { spawn, execSync, execFileSync, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -134,7 +135,7 @@ const RECONNECT_DELAY_MS = 5_000;
 
 // Unique ID for this bridge process lifetime. Sent to seam-acp on every WS
 // connect so it can detect a bridge restart and evict stale runtimes.
-const BRIDGE_INSTANCE_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+const BRIDGE_INSTANCE_ID = randomUUID();
 
 /** Interval for sending WS ping frames to keep the tunnel/proxy alive. */
 const KEEPALIVE_PING_MS = 25_000;

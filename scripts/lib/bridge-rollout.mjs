@@ -1,59 +1,73 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 const SAFE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
-const SAFE_REMOTE_ARG = /^[a-z0-9][a-z0-9._-]{0,191}$/;
+const SAFE_PATH = /^\/[A-Za-z0-9._/-]{1,511}$/;
 const SHA = /^[0-9a-f]{40}$/;
 const CHECKSUM = /^[0-9a-f]{64}$/;
+const TOKEN = /^[0-9a-f]{64}$/;
+const TARGET_KEYS = new Set([
+  "sshAlias", "pm2App", "verifyAgent", "checkoutPath", "entrypointPath",
+  "pidFilePath", "expectedUid", "nodePath", "pm2ModulePath", "workspaceArg",
+  "devMode", "releaseRoot", "rolloutEnabled",
+]);
+
+function exactAbsolute(value, label) {
+  if (typeof value !== "string" || !SAFE_PATH.test(value) || path.posix.normalize(value) !== value || value.includes("//") || value.endsWith("/")) {
+    throw new Error(`unsafe ${label}`);
+  }
+  return value;
+}
 
 export function validateTargetMap(input) {
-  if (!input || input.schemaVersion !== 1 || !input.targets || typeof input.targets !== "object") {
+  if (!input || input.schemaVersion !== 2 || !input.targets || typeof input.targets !== "object" || Array.isArray(input.targets)) {
     throw new Error("invalid bridge rollout target map");
   }
   const targets = new Map();
   for (const [bridgeId, value] of Object.entries(input.targets)) {
-    if (!SAFE_NAME.test(bridgeId) || !value || typeof value !== "object") {
-      throw new Error(`unsafe bridge target ${JSON.stringify(bridgeId)}`);
+    if (!SAFE_NAME.test(bridgeId) || !value || typeof value !== "object" || Array.isArray(value)) throw new Error(`unsafe bridge target ${JSON.stringify(bridgeId)}`);
+    for (const key of Object.keys(value)) if (!TARGET_KEYS.has(key)) throw new Error(`unknown target property ${JSON.stringify(key)}`);
+    if (!SAFE_NAME.test(value.sshAlias ?? "")) throw new Error(`unsafe SSH alias for ${bridgeId}`);
+    if (typeof value.rolloutEnabled !== "boolean") throw new Error(`missing rolloutEnabled for ${bridgeId}`);
+    if (!value.rolloutEnabled) {
+      if (Object.keys(value).some((key) => !["sshAlias", "pm2App", "verifyAgent", "rolloutEnabled"].includes(key)) || value.pm2App !== null || value.verifyAgent !== null) {
+        throw new Error(`disabled target ${bridgeId} must not guess deployment identity`);
+      }
+      targets.set(bridgeId, { bridgeId, ...value });
+      continue;
     }
-    const allowedKeys = new Set(["sshAlias", "pm2App", "verifyAgent", "rolloutEnabled"]);
-    for (const key of Object.keys(value)) {
-      if (!allowedKeys.has(key)) throw new Error(`unknown target property ${JSON.stringify(key)}`);
+    if (!SAFE_NAME.test(value.pm2App ?? "")) throw new Error(`unsafe PM2 app for ${bridgeId}`);
+    if (!SAFE_NAME.test(value.verifyAgent ?? "")) throw new Error(`unsafe verification agent for ${bridgeId}`);
+    if (!Number.isInteger(value.expectedUid) || value.expectedUid < 1 || value.expectedUid > 0x7fffffff) throw new Error(`unsafe expected UID for ${bridgeId}`);
+    if (typeof value.devMode !== "boolean") throw new Error(`missing devMode identity for ${bridgeId}`);
+    for (const key of ["checkoutPath", "entrypointPath", "pidFilePath", "nodePath", "pm2ModulePath", "releaseRoot"]) exactAbsolute(value[key], `${key} for ${bridgeId}`);
+    if (value.workspaceArg !== null) exactAbsolute(value.workspaceArg, `workspaceArg for ${bridgeId}`);
+    if (value.entrypointPath !== `${value.checkoutPath}/packages/bridge/dist/index.js`) throw new Error(`entrypoint is not the managed stable launcher for ${bridgeId}`);
+    if (value.releaseRoot === value.checkoutPath || value.releaseRoot.startsWith(`${value.checkoutPath}/`) || value.checkoutPath.startsWith(`${value.releaseRoot}/`)) {
+      throw new Error(`checkout and release roots overlap for ${bridgeId}`);
     }
-    const { sshAlias, pm2App, verifyAgent, rolloutEnabled } = value;
-    if (!SAFE_NAME.test(sshAlias ?? "")) throw new Error(`unsafe SSH alias for ${bridgeId}`);
-    if (typeof rolloutEnabled !== "boolean") throw new Error(`missing rolloutEnabled for ${bridgeId}`);
-    if (rolloutEnabled) {
-      if (!SAFE_NAME.test(pm2App ?? "")) throw new Error(`unsafe PM2 app for ${bridgeId}`);
-      if (!SAFE_NAME.test(verifyAgent ?? "")) throw new Error(`unsafe verification agent for ${bridgeId}`);
-    } else if (pm2App !== null || verifyAgent !== null) {
-      throw new Error(`disabled target ${bridgeId} must not guess PM2 or agent identities`);
-    }
-    targets.set(bridgeId, { bridgeId, sshAlias, pm2App, verifyAgent, rolloutEnabled });
+    targets.set(bridgeId, { bridgeId, ...value });
   }
   return targets;
 }
 
-export async function loadTargetMap(file) {
-  return validateTargetMap(JSON.parse(await fs.readFile(file, "utf8")));
-}
+export async function loadTargetMap(file) { return validateTargetMap(JSON.parse(await fs.readFile(file, "utf8"))); }
 
 export function resolveTarget(targets, bridgeId) {
   if (!SAFE_NAME.test(bridgeId ?? "")) throw new Error("target contains unsafe characters");
   const target = targets.get(bridgeId);
   if (!target) throw new Error(`unknown bridge target ${JSON.stringify(bridgeId)}`);
-  if (!target.rolloutEnabled) {
-    throw new Error(`${bridgeId} is mapped but rollout is disabled (AGY-only hosts are outside #241)`);
-  }
+  if (!target.rolloutEnabled) throw new Error(`${bridgeId} is mapped but rollout is disabled (AGY-only hosts are outside #241)`);
   return target;
 }
 
 export function parseArgs(argv) {
   const values = new Map();
   const booleans = new Set();
-  const valueFlags = new Set(["--target", "--sha", "--checksum", "--timeout-seconds"]);
+  const valueFlags = new Set(["--target", "--sha", "--checksum", "--stage-id", "--activation-id", "--timeout-seconds"]);
   const boolFlags = new Set(["--apply", "--stage", "--activate", "--rollback", "--help"]);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -65,9 +79,7 @@ export function parseArgs(argv) {
     } else if (boolFlags.has(arg)) {
       if (booleans.has(arg)) throw new Error(`duplicate option ${arg}`);
       booleans.add(arg);
-    } else {
-      throw new Error(`unknown option ${JSON.stringify(arg)}`);
-    }
+    } else throw new Error(`unknown option ${JSON.stringify(arg)}`);
   }
   if (booleans.has("--help")) return { help: true };
   const target = values.get("--target");
@@ -80,89 +92,72 @@ export function parseArgs(argv) {
   if (action === "preflight" && apply) throw new Error("--apply requires --stage, --activate, or --rollback");
   const sha = values.get("--sha");
   const checksum = values.get("--checksum");
+  const stageId = values.get("--stage-id");
+  const activationId = values.get("--activation-id");
   if (action === "activate") {
     if (!SHA.test(sha ?? "")) throw new Error("--activate requires a lowercase 40-character --sha");
     if (!CHECKSUM.test(checksum ?? "")) throw new Error("--activate requires a lowercase 64-character --checksum");
-  } else if (sha || checksum) {
-    throw new Error("--sha and --checksum are valid only with --activate");
-  }
+    if (!TOKEN.test(stageId ?? "")) throw new Error("--activate requires the exact 64-character --stage-id printed by staging");
+  } else if (sha || checksum || stageId) throw new Error("--sha, --checksum, and --stage-id are valid only with --activate");
+  if (action === "rollback") {
+    if (!TOKEN.test(activationId ?? "")) throw new Error("--rollback requires an exact immutable --activation-id");
+  } else if (activationId) throw new Error("--activation-id is valid only with --rollback");
   const timeoutSeconds = Number(values.get("--timeout-seconds") ?? "420");
-  if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 10 || timeoutSeconds > 900) {
-    throw new Error("--timeout-seconds must be an integer from 10 through 900");
-  }
-  return { help: false, target, action, apply, sha, checksum, timeoutSeconds };
+  if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 10 || timeoutSeconds > 900) throw new Error("--timeout-seconds must be an integer from 10 through 900");
+  return { help: false, target, action, apply, sha, checksum, stageId, activationId, timeoutSeconds };
 }
 
-export function makeSshCommand(target, remoteArgs, remoteScript) {
-  for (const value of [target.sshAlias, target.pm2App, target.bridgeId, ...remoteArgs]) {
-    if (!SAFE_REMOTE_ARG.test(String(value))) throw new Error(`unsafe remote argument ${JSON.stringify(value)}`);
+function targetArgs(target) {
+  return [
+    target.bridgeId, target.pm2App, target.verifyAgent, String(target.expectedUid),
+    target.checkoutPath, target.entrypointPath, target.pidFilePath, target.nodePath,
+    target.pm2ModulePath, target.workspaceArg ?? "-", target.devMode ? "yes" : "no", target.releaseRoot,
+  ];
+}
+
+export function makeSshCommand(target, actionArgs, remoteScript) {
+  const args = [...targetArgs(target), ...actionArgs];
+  for (const value of args) {
+    if (typeof value !== "string" || value.length > 512 || /[\0-\x20\x7f'"`$;&|<>\\]/.test(value)) throw new Error(`unsafe remote argument ${JSON.stringify(value)}`);
   }
   return {
     file: "ssh",
-    args: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target.sshAlias,
-      "sh", "-s", "--", ...remoteArgs],
+    args: ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target.sshAlias, "sh", "-s", "--", target.nodePath, ...args],
     input: remoteScript,
-    mutates: remoteArgs[0] !== "preflight",
+    mutates: actionArgs[0] !== "preflight",
+    timeoutMs: actionArgs[0] === "preflight" ? 30_000 : 960_000,
   };
 }
 
 export function makeScpCommand(target, localArtifact, remoteName) {
-  if (!SAFE_NAME.test(target.sshAlias) || !/^bridge-[0-9a-f]{40}-[0-9a-f]{64}\.tgz$/.test(remoteName)) {
-    throw new Error("unsafe artifact delivery argument");
-  }
-  return {
-    file: "scp",
-    args: ["-q", "--", localArtifact, `${target.sshAlias}:.seam/bridge-rollouts/incoming/${remoteName}`],
-    mutates: true,
-  };
+  if (!SAFE_NAME.test(target.sshAlias) || !/^bridge-[0-9a-f]{40}-[0-9a-f]{64}\.tgz(?:\.upload-[0-9a-f]{64})?$/.test(remoteName)) throw new Error("unsafe artifact delivery argument");
+  return { file: "scp", args: ["-q", "--", localArtifact, `${target.sshAlias}:${target.releaseRoot}/incoming/${remoteName}`], mutates: true, timeoutMs: 120_000 };
 }
 
 export function parseKeyValues(stdout) {
   const result = {};
-  for (const line of stdout.split(/\r?\n/)) {
-    const offset = line.indexOf("=");
-    if (offset > 0) result[line.slice(0, offset)] = line.slice(offset + 1);
-  }
+  for (const line of stdout.split(/\r?\n/)) { const offset = line.indexOf("="); if (offset > 0) result[line.slice(0, offset)] = line.slice(offset + 1); }
   return result;
 }
 
 export function verifyChecksum(expected, actual) {
-  if (!CHECKSUM.test(expected) || !CHECKSUM.test(actual) || expected !== actual) {
-    throw new Error(`artifact checksum mismatch (expected ${expected}, got ${actual})`);
-  }
+  if (!CHECKSUM.test(expected) || !CHECKSUM.test(actual) || expected !== actual) throw new Error("artifact checksum mismatch");
   return true;
-}
-
-export async function waitForNewPid(readPid, options) {
-  const deadline = options.now() + options.timeoutMs;
-  while (options.now() <= deadline) {
-    const pid = await readPid();
-    if (Number.isInteger(pid) && pid > 0 && pid !== options.oldPid) return pid;
-    await options.sleep(options.intervalMs);
-  }
-  throw new Error(`timed out waiting for a new PID after ${options.timeoutMs}ms`);
 }
 
 export function validateReadyReceipt(receipt, expected) {
-  if (!receipt || receipt.sourceSha !== expected.sha || receipt.artifactChecksum !== expected.checksum) {
-    throw new Error("ready receipt does not identify the staged artifact");
-  }
-  if (receipt.pid !== expected.pid || !receipt.helloAcceptedAt || !receipt.controllerVerifiedAt || receipt.protocolVersion !== expected.protocolVersion) {
-    throw new Error("fresh bridge ready handshake was not proven");
-  }
+  const times = [receipt?.startedAt, receipt?.helloAcceptedAt, receipt?.controllerVerifiedAt, receipt?.completedAt].map(Date.parse);
+  if (!receipt || receipt.formatVersion !== 2 || receipt.activationId !== expected.activationId || receipt.bridgeId !== expected.bridgeId || receipt.sourceSha !== expected.sha || receipt.artifactChecksum !== expected.checksum || receipt.stageId !== expected.stageId) throw new Error("ready receipt does not identify this activation");
+  if (receipt.oldPid !== expected.oldPid || receipt.pid !== expected.pid || receipt.pid === receipt.oldPid || receipt.instanceId !== expected.instanceId || receipt.protocolVersion !== expected.protocolVersion) throw new Error("ready receipt process identity mismatch");
+  if (times.some((time) => !Number.isFinite(time)) || times.some((time, index) => index && time < times[index - 1]) || times[0] < expected.notBefore || times.at(-1) > expected.notAfter) throw new Error("ready receipt is stale or outside the activation window");
   const calls = receipt.catalogRpcs?.[expected.agentId];
-  if (!calls?.describeModelCatalogAt || !calls?.fetchModelCatalogAt) {
-    throw new Error(`catalog RPC verification failed for ${expected.agentId}`);
-  }
+  if (!calls?.describeModelCatalogAt || !calls?.fetchModelCatalogAt || receipt.controllerAck?.activationId !== expected.activationId || receipt.controllerAck?.bridgeId !== expected.bridgeId || receipt.controllerAck?.instanceId !== expected.instanceId || receipt.controllerAck?.pid !== expected.pid) throw new Error(`catalog/controller verification failed for ${expected.agentId}`);
   return true;
 }
 
-export function rollbackPlan(target) {
-  return {
-    target: target.bridgeId,
-    command: `npm run bridge:rollout -- --target ${target.bridgeId} --rollback --apply`,
-    automatic: false,
-  };
+export function rollbackPlan(target, activationId) {
+  if (!TOKEN.test(activationId ?? "")) throw new Error("an immutable activation id is required for rollback");
+  return { target: target.bridgeId, command: `npm run bridge:rollout -- --target ${target.bridgeId} --rollback --activation-id ${activationId} --apply`, automatic: false };
 }
 
 export function artifactName(sha, checksum) {
@@ -170,63 +165,97 @@ export function artifactName(sha, checksum) {
   return `bridge-${sha}-${checksum}.tgz`;
 }
 
-export function commandRunner(command) {
+function safeDiagnostic(value) {
+  return String(value).replace(/[\x00-\x1f\x7f]/g, " ").replace(/(token|secret|password|authorization|key)\s*[=:]\s*\S+/gi, "$1=[redacted]").slice(0, 2048).trim();
+}
+
+export function commandRunner(command, limits = {}) {
+  const timeoutMs = limits.timeoutMs ?? command.timeoutMs ?? 120_000;
+  const maxStdoutBytes = limits.maxStdoutBytes ?? 1_048_576;
+  const maxStderrBytes = limits.maxStderrBytes ?? 262_144;
   return new Promise((resolve, reject) => {
-    const child = spawn(command.file, command.args, {
-      cwd: command.cwd,
-      stdio: [command.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    const child = spawn(command.file, command.args, { cwd: command.cwd, stdio: [command.input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
+    const out = []; const err = [];
+    let outBytes = 0; let errBytes = 0; let terminalError; let closed = false;
+    const stop = (error) => { if (!terminalError) terminalError = error; if (!child.killed) child.kill("SIGKILL"); };
+    const timer = setTimeout(() => stop(new Error(`${command.file} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer.unref?.();
+    const onStdout = (chunk) => { outBytes += chunk.length; if (outBytes > maxStdoutBytes) stop(new Error(`${command.file} exceeded stdout limit`)); else out.push(chunk); };
+    const onStderr = (chunk) => { errBytes += chunk.length; if (errBytes > maxStderrBytes) stop(new Error(`${command.file} exceeded stderr limit`)); else err.push(chunk); };
+    const onError = (error) => { terminalError ??= error; };
+    child.stdout.on("data", onStdout); child.stderr.on("data", onStderr); child.on("error", onError);
+    child.on("close", (code, signal) => {
+      if (closed) return; closed = true; clearTimeout(timer);
+      child.stdout.off("data", onStdout); child.stderr.off("data", onStderr); child.off("error", onError); child.stdin?.removeAllListeners("error");
+      const stdout = Buffer.concat(out).toString("utf8"); const stderr = Buffer.concat(err).toString("utf8");
+      if (terminalError) reject(terminalError);
+      else if (code === 0) resolve({ stdout, stderr });
+      else reject(new Error(`${command.file} failed (${code ?? signal ?? "unknown"}): ${safeDiagnostic(stderr || stdout) || "no safe diagnostic"}`));
     });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`${command.file} failed with exit ${code}: ${stderr.trim() || stdout.trim()}`));
-    });
-    if (command.input !== undefined) child.stdin.end(command.input);
+    if (command.input !== undefined) {
+      child.stdin.on("error", (error) => { if (error.code !== "EPIPE") stop(error); });
+      child.stdin.end(command.input);
+    }
   });
 }
 
-async function copyArtifactFiles(repoRoot, payload) {
-  const files = ["package.json", "package-lock.json", "packages/adapters/package.json", "packages/bridge/package.json", "packages/core/package.json"];
-  for (const relative of files) {
-    const destination = path.join(payload, relative);
-    await fs.mkdir(path.dirname(destination), { recursive: true });
-    await fs.copyFile(path.join(repoRoot, relative), destination);
+async function collectArtifactFiles(repoRoot) {
+  const fixed = ["package.json", "package-lock.json", "packages/adapters/package.json", "packages/bridge/package.json", "packages/core/package.json"];
+  const result = [...fixed];
+  for (const dir of ["packages/adapters/dist", "packages/bridge/dist"]) {
+    const walk = async (relative) => {
+      const entries = await fs.readdir(path.join(repoRoot, relative), { withFileTypes: true });
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        const child = path.posix.join(relative, entry.name);
+        if (entry.isDirectory()) await walk(child);
+        else if (entry.isFile()) result.push(child);
+        else throw new Error(`artifact source contains a link or special file: ${child}`);
+      }
+    };
+    await walk(dir);
   }
-  for (const relative of ["packages/adapters/dist", "packages/bridge/dist"]) {
-    await fs.cp(path.join(repoRoot, relative), path.join(payload, relative), { recursive: true });
-  }
+  return result.sort();
 }
 
 export async function buildArtifact(repoRoot, run = commandRunner) {
-  const status = await run({ file: "git", args: ["status", "--porcelain", "--untracked-files=all"], mutates: false, cwd: repoRoot });
+  const status = await run({ file: "git", args: ["status", "--porcelain", "--untracked-files=all"], cwd: repoRoot });
   if (status.stdout.trim()) throw new Error("source worktree is dirty; commit every source change before staging");
-  const shaResult = await run({ file: "git", args: ["rev-parse", "HEAD"], mutates: false, cwd: repoRoot });
-  const sha = shaResult.stdout.trim();
+  const sha = (await run({ file: "git", args: ["rev-parse", "HEAD"], cwd: repoRoot })).stdout.trim();
   if (!SHA.test(sha)) throw new Error("could not resolve an exact committed source SHA");
-  await run({ file: "npm", args: ["run", "build", "-w", "@seam/adapters"], mutates: false, cwd: repoRoot });
-  await run({ file: "npm", args: ["run", "build", "-w", "@seam/bridge"], mutates: false, cwd: repoRoot });
-  const after = await run({ file: "git", args: ["status", "--porcelain", "--untracked-files=all"], mutates: false, cwd: repoRoot });
-  if (after.stdout.trim()) throw new Error("build changed tracked or untracked source; refusing artifact");
-
+  await run({ file: "npm", args: ["run", "build", "-w", "@seam/adapters"], cwd: repoRoot, timeoutMs: 300_000 });
+  await run({ file: "npm", args: ["run", "build", "-w", "@seam/bridge"], cwd: repoRoot, timeoutMs: 300_000 });
+  if ((await run({ file: "git", args: ["status", "--porcelain", "--untracked-files=all"], cwd: repoRoot })).stdout.trim()) throw new Error("build changed tracked or untracked source; refusing artifact");
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "seam-bridge-release-"));
-  const payload = path.join(temp, "payload");
-  await fs.mkdir(payload);
-  await copyArtifactFiles(repoRoot, payload);
-  await fs.writeFile(path.join(payload, "bridge-release.json"), JSON.stringify({ formatVersion: 1, sourceSha: sha }) + "\n");
+  const payload = path.join(temp, "payload"); await fs.mkdir(payload, { mode: 0o700 });
+  const files = await collectArtifactFiles(repoRoot);
+  const manifestFiles = [];
+  for (const relative of files) {
+    const bytes = await fs.readFile(path.join(repoRoot, relative));
+    const destination = path.join(payload, relative); await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 }); await fs.writeFile(destination, bytes, { mode: 0o600 });
+    manifestFiles.push({ path: relative, size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });
+  }
+  await fs.writeFile(path.join(payload, "bridge-release.json"), JSON.stringify({ formatVersion: 2, sourceSha: sha, files: manifestFiles }) + "\n", { mode: 0o600 });
   const archive = path.join(temp, `bridge-${sha}.tgz`);
-  await run({ file: "tar", args: ["--sort=name", "--mtime=@0", "--owner=0", "--group=0", "--numeric-owner", "-czf", archive, "-C", payload, "."], mutates: false });
+  await run({ file: "tar", args: ["--format=ustar", "--sort=name", "--mtime=@0", "--owner=0", "--group=0", "--numeric-owner", "-czf", archive, "-C", payload, "bridge-release.json", ...files], timeoutMs: 120_000 });
   const checksum = createHash("sha256").update(await fs.readFile(archive)).digest("hex");
   return { sha, checksum, archive, remoteName: artifactName(sha, checksum) };
 }
 
+export async function renderRemoteScript(shellTemplatePath, nodeProgramPath) {
+  const [shell, program] = await Promise.all([fs.readFile(shellTemplatePath, "utf8"), fs.readFile(nodeProgramPath, "utf8")]);
+  const marker = "__SEAM_BRIDGE_ROLLOUT_NODE_PROGRAM__";
+  if (shell.split(marker).length !== 2) throw new Error("remote shell template marker is missing or ambiguous");
+  if (program.includes("\nSEAM_REMOTE_NODE\n")) throw new Error("remote node program collides with shell delimiter");
+  return shell.replace(marker, program);
+}
+
 export async function runPreflight(target, remoteScript, run = commandRunner) {
-  const command = makeSshCommand(target, ["preflight", target.pm2App, target.bridgeId, target.verifyAgent], remoteScript);
+  const command = makeSshCommand(target, ["preflight"], remoteScript);
   const result = await run(command);
   const report = parseKeyValues(result.stdout);
-  if (report.pm2_app !== target.pm2App) throw new Error("remote PM2 app did not match the operator mapping");
+  if (report.bridge_id !== target.bridgeId || report.pm2_app !== target.pm2App || report.identity_bound !== "yes") throw new Error("remote deployment identity did not match the operator mapping");
   return { command, report, stdout: result.stdout };
 }
+
+export function newOperationId() { return randomBytes(32).toString("hex"); }

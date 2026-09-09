@@ -69,6 +69,7 @@ export interface AdapterRuntimeDescriptor {
   dependencies?: ReadonlyArray<{
     executable: string;
     version: string;
+    sha256?: string;
   }>;
 }
 

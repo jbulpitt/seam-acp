@@ -155,6 +155,7 @@ describe("production adapter catalog sources", () => {
       acpPath: "/bin/false",
       agyBin: "/bin/false",
       agyVersion: "false 1.0",
+      agySha256: "a".repeat(64),
       defaultModel: "gemini-high",
       stateDir: `${os.homedir()}/.agy-acp`,
       conversationsDir: "/tmp/conversations",
@@ -164,6 +165,7 @@ describe("production adapter catalog sources", () => {
       wrapperSha256: agyAcpReleaseArtifact().sha256,
       permissionRiskAcknowledged: true,
       verifyWrapper: () => {},
+      verifyRuntime: () => {},
       catalogProbe: async () => ({
         agyVersion: "false 1.0",
         models: [{ modelId: "gemini-high", displayName: "Gemini High" }],

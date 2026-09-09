@@ -21,6 +21,7 @@ const runtimeProfileOptions = {
   acpPath: "/bin/false",
   agyBin: "/bin/false",
   agyVersion: "false 1.0",
+  agySha256: "a".repeat(64),
   stateDir: "/tmp/.agy-acp",
   conversationsDir: "/tmp/conversations",
   credentialScope: "test",
@@ -28,6 +29,7 @@ const runtimeProfileOptions = {
   wrapperSha256: agyAcpReleaseArtifact().sha256,
   permissionRiskAcknowledged: true,
   verifyWrapper: () => {},
+  verifyRuntime: () => {},
 };
 
 describe("Agy image inspector", () => {

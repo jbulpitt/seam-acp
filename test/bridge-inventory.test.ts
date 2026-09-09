@@ -16,6 +16,7 @@ describe("loadHostAdapters", () => {
     vi.stubEnv("AGY_ACP_BIN", "/opt/agy/antigravity-acp");
     vi.stubEnv("AGY_BIN", "/opt/agy/agy");
     vi.stubEnv("AGY_VERSION", "1.1.28");
+    vi.stubEnv("AGY_SHA256", "a".repeat(64));
     vi.stubEnv("AGY_DEFAULT_MODEL", "gemini-high");
     vi.stubEnv("AGY_ACP_VERSION", "1.1.0");
     vi.stubEnv("AGY_ACP_SHA256", agyAcpReleaseArtifact().sha256);

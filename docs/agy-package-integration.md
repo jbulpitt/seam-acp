@@ -47,11 +47,21 @@ The adapter rejects a digest that is not the reviewed asset for the current
 OS/architecture and hashes the local file before every catalog refresh and
 session spawn (with a stat-keyed digest cache). Production supplies an exact
 absolute `AGY_ACP_BIN`, exact absolute `AGY_BIN`, exact `AGY_VERSION` (the first
-line from `AGY_BIN --version`), empty wrapper argv, exact cwd, and
-`AGY_SKIP_DOWNLOAD=1`. Catalog publication fails if the observed AGY version
-does not match. It never calls the wrapper as a version command:
+line from `AGY_BIN --version`), exact `AGY_SHA256`, empty wrapper argv, exact
+cwd, and `AGY_SKIP_DOWNLOAD=1`. Both direct commands use the shared bounded,
+redacting, TERM-to-KILL-and-reap lifecycle. Catalog publication fails if the
+observed AGY version or digest does not match. It never calls the wrapper as a
+version command:
 v1.1.0 is an ACP server, and doing so could enter its binary-resolution path.
 Installation and upgrades are offline operator actions outside Seam.
+
+The pinned upstream wrapper normally prefers an executable `agy` sibling beside
+its own compiled executable over `AGY_BIN`. Seam therefore requires
+`AGY_ACP_BIN` to be a real, non-symlinked path and checks the sibling location
+before every refresh and spawn. An executable sibling is accepted only when it
+resolves to the exact configured, digest-pinned `AGY_BIN`; any other sibling
+fails closed before the wrapper starts. Thus direct evidence and ACP sessions
+cannot select different AGY artifacts.
 
 ## Authentication and security acceptance
 
@@ -98,8 +108,10 @@ The wrapper's startup model option is not evidence. Its reviewed source:
 Seam instead invokes exact `AGY_BIN models` with the same allowlisted runtime
 environment, parses the exact first-column IDs, rejects empty/duplicate/oversize
 output, then starts a fresh wrapper through the shared bounded-probe lifecycle.
-It waits through an empty, cached, or fallback startup snapshot until an ACP
-`config_option_update` has exactly the same order-independent ID set. It then
+It never accepts `session/new` model options, even when they match direct
+discovery, because those rows can be startup cache. It waits for a positively
+identified later ACP `config_option_update` whose post-discovery rows have
+exactly the same order-independent ID set. It then
 selects every ID serially and requires exact `currentValue` acknowledgement.
 Timeout, disagreement, missing configured default, selection drift, output
 overflow, spawn failure, or unreaped process fails the candidate atomically;
@@ -141,7 +153,7 @@ Remote execution remains `controller -> Seam bridge -> antigravity-acp ->
 host-local agy`. Inventory carries the exact wrapper path, empty argv, cwd,
 allowlisted environment overlay, state/conversation directories, semantic
 credential scope, upstream version/commit/source, artifact digest, and exact
-underlying AGY executable/version. Core has
+underlying AGY executable/version/digest. Core has
 no host paths and adds no SSH-per-turn or alternate protocol.
 
 Before enabling a binding, verify read-only that its OS/architecture has a

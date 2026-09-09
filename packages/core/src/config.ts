@@ -294,6 +294,8 @@ const Schema = z.object({
   AGY_BIN: z.string().optional(),
   /** Exact first line returned by AGY_BIN --version. */
   AGY_VERSION: z.string().default(""),
+  /** Exact SHA-256 of AGY_BIN used for catalog evidence and runtime. */
+  AGY_SHA256: z.string().default(""),
   AGY_ACP_VERSION: z.string().default(""),
   /** Host/platform-specific SHA-256 of AGY_ACP_BIN. */
   AGY_ACP_SHA256: z.string().default(""),
@@ -1170,6 +1172,7 @@ export function loadConfig(): Config {
       ["AGY_ACP_BIN", cfg.AGY_ACP_BIN],
       ["AGY_BIN", cfg.AGY_BIN],
       ["AGY_VERSION", cfg.AGY_VERSION],
+      ["AGY_SHA256", cfg.AGY_SHA256],
       ["AGY_ACP_SHA256", cfg.AGY_ACP_SHA256],
       ["AGY_CONVERSATIONS_DIR", cfg.AGY_CONVERSATIONS_DIR],
       ["AGY_DEFAULT_MODEL", cfg.AGY_DEFAULT_MODEL],
@@ -1190,6 +1193,9 @@ export function loadConfig(): Config {
     }
     if (cfg.AGY_VERSION.length > 256 || /[\r\n\0]/.test(cfg.AGY_VERSION)) {
       throw new Error("Invalid configuration: AGY_VERSION must be the exact bounded first line from AGY_BIN --version");
+    }
+    if (!/^[a-f0-9]{64}$/.test(cfg.AGY_SHA256)) {
+      throw new Error("Invalid configuration: AGY_SHA256 must be 64 lowercase hex characters");
     }
     if (!/^[a-f0-9]{64}$/.test(cfg.AGY_ACP_SHA256)) {
       throw new Error("Invalid configuration: AGY_ACP_SHA256 must be 64 lowercase hex characters");

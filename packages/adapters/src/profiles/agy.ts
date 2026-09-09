@@ -22,10 +22,8 @@ import {
   type AgentProfile,
 } from "../agent-profile.js";
 import {
-  execFileBounded,
   manifestCatalogScope,
   manifestCatalogSource,
-  readCliVersion,
   type ManifestCatalogModel,
 } from "../model-catalog.js";
 import { redactProbeText, runBoundedProbe } from "../probe-process.js";
@@ -74,6 +72,8 @@ export interface AgyProfileOptions {
   agyBin: string;
   /** Exact first line returned by `AGY_BIN --version`. */
   agyVersion: string;
+  /** Exact SHA-256 of the configured AGY_BIN. */
+  agySha256: string;
   defaultModel: string;
   /** Effective upstream wrapper state directory (`$HOME/.agy-acp` in v1.1.0). */
   stateDir: string;
@@ -90,6 +90,8 @@ export interface AgyProfileOptions {
   catalogProbe?: () => Promise<AgyCatalogProbe>;
   /** Test seam for artifact verification. */
   verifyWrapper?: () => void;
+  /** Test seam for exact underlying-runtime verification. */
+  verifyRuntime?: () => void;
 }
 
 const AGY_SAFE_ENV_KEYS = [
@@ -99,6 +101,7 @@ const AGY_SAFE_ENV_KEYS = [
 
 const AGY_RUNTIME_STDERR_LIMIT = 256_000;
 const AGY_RUNTIME_LINE_LIMIT = 16_384;
+const AGY_VERSION_OUTPUT_LIMIT = 16_384;
 
 function requireAbsolute(name: string, value: string): string {
   const trimmed = value.trim();
@@ -270,6 +273,59 @@ export function parseAgyModelsOutput(output: string): AgyDiscoveredModel[] {
   return rows;
 }
 
+function abortFailure(signal: AbortSignal, exited: Promise<never>): Promise<never> {
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) resolve();
+    else signal.addEventListener("abort", () => resolve(), { once: true });
+  }).then(() => exited);
+}
+
+/** Run one finite AGY command through the shared #236 lifecycle. */
+export async function runBoundedAgyCommand(options: {
+  executable: string;
+  args: ReadonlyArray<string>;
+  /** Test-only argv inserted before the real AGY arguments. */
+  argsPrefix?: ReadonlyArray<string>;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  maxStdoutBytes: number;
+  label: string;
+  killGraceMs?: number;
+  finalizeDeadlineMs?: number;
+  spawnOverride?: () => ChildProcessWithoutNullStreams;
+}): Promise<string> {
+  return runBoundedProbe({
+    executable: options.executable,
+    args: [...(options.argsPrefix ?? []), ...options.args],
+    cwd: options.cwd,
+    env: options.env,
+    timeoutMs: options.timeoutMs,
+    maxStdoutBytes: options.maxStdoutBytes,
+    label: options.label,
+    killGraceMs: options.killGraceMs,
+    finalizeDeadlineMs: options.finalizeDeadlineMs,
+    allowCleanExit: true,
+    spawnOverride: options.spawnOverride,
+    async run(handle) {
+      handle.stdin.end();
+      let stdout = "";
+      const outputEnded = new Promise<void>((resolve, reject) => {
+        handle.stdout.setEncoding("utf8");
+        handle.stdout.on("data", (chunk: string) => { stdout += chunk; });
+        handle.stdout.once("end", resolve);
+        handle.stdout.once("error", reject);
+      });
+      await Promise.race([
+        Promise.all([outputEnded, handle.completed]),
+        abortFailure(handle.signal, handle.exited),
+        handle.exited,
+      ]);
+      return stdout;
+    },
+  });
+}
+
 function flattenSelectOptions(options: SessionConfigSelectOptions): SessionConfigSelectOption[] {
   return (options as Array<SessionConfigSelectOption | SessionConfigSelectGroup>).flatMap((option) =>
     "options" in option ? option.options : [option]
@@ -390,8 +446,9 @@ export async function reconcileAgyAcpModels(options: {
         handle.exited,
       ]);
       sessionId = session.sessionId;
-      const initial = modelOption(session.configOptions);
-      if (initial) pendingModelSnapshots.unshift(flattenSelectOptions(initial.options));
+      // Never certify session/new options: upstream populates those from its
+      // startup cache/fallback before asynchronous discovery. Only a later
+      // config_option_update is positive post-discovery evidence.
       let acpRows: SessionConfigSelectOption[] | undefined;
       while (!acpRows) {
         const candidate = pendingModelSnapshots.shift();
@@ -454,33 +511,38 @@ export async function probeAgyPackageCatalog(options: {
   env: NodeJS.ProcessEnv;
   defaultModel: string;
   timeoutMs?: number;
+  /** Test-only argv inserted before `--version` / `models`. */
+  agyArgsPrefix?: ReadonlyArray<string>;
 }): Promise<AgyCatalogProbe> {
   const timeoutMs = options.timeoutMs ?? 45_000;
-  const agyVersion = await readCliVersion(options.agyBin, ["--version"], {
+  const versionOutput = await runBoundedAgyCommand({
+    executable: options.agyBin,
+    args: ["--version"],
+    argsPrefix: options.agyArgsPrefix,
     cwd: options.cwd,
     env: options.env,
+    timeoutMs: Math.min(timeoutMs, 5_000),
+    maxStdoutBytes: AGY_VERSION_OUTPUT_LIMIT,
+    label: "agy version discovery",
   });
+  const agyVersion = versionOutput.trim().split(/\r?\n/, 1)[0]?.slice(0, 256);
   if (!agyVersion || agyVersion !== options.agyVersion) {
     throw new Error(
       `AGY_BIN version mismatch: expected ${JSON.stringify(options.agyVersion)}, ` +
         `observed ${JSON.stringify(agyVersion ?? "unavailable")}`
     );
   }
-  let directResult: { stdout: string; stderr: string };
-  try {
-    directResult = await execFileBounded(options.agyBin, ["models"], {
-      cwd: options.cwd,
-      env: options.env,
-      timeoutMs,
-      maxBytes: 1_000_000,
-    });
-  } catch (err) {
-    // execFile attaches child stdout/stderr to its Error. Replace it entirely
-    // with a redacted value and deliberately retain no raw `cause` object.
-    const safe = redactProbeText(err instanceof Error ? err.message : String(err), options.env);
-    throw new Error(`agy models discovery failed: ${safe}`);
-  }
-  const direct = parseAgyModelsOutput(directResult.stdout);
+  const directOutput = await runBoundedAgyCommand({
+    executable: options.agyBin,
+    args: ["models"],
+    argsPrefix: options.agyArgsPrefix,
+    cwd: options.cwd,
+    env: options.env,
+    timeoutMs,
+    maxStdoutBytes: 1_000_000,
+    label: "agy models discovery",
+  });
+  const direct = parseAgyModelsOutput(directOutput);
   // The wrapper is an ACP stdio server, not a conventional CLI. Invoking it
   // with `--version` would start normal runtime resolution and could download
   // before a no-download environment is established. Its configured version
@@ -499,19 +561,57 @@ export async function probeAgyPackageCatalog(options: {
 
 const digestCache = new Map<string, { key: string; digest: string }>();
 
-/** Verify the immutable compiled wrapper artifact before every spawn/refresh. */
-export function verifyAgyWrapperArtifact(file: string, expectedSha256: string): void {
+function verifyExecutableArtifact(
+  file: string,
+  expectedSha256: string,
+  name: "AGY_ACP_BIN" | "AGY_BIN"
+): void {
   const expected = expectedSha256.trim().toLowerCase();
-  if (!/^[a-f0-9]{64}$/.test(expected)) throw new Error("AGY_ACP_SHA256 must be 64 lowercase hex characters");
+  if (!/^[a-f0-9]{64}$/.test(expected)) {
+    throw new Error(`${name === "AGY_BIN" ? "AGY_SHA256" : "AGY_ACP_SHA256"} must be 64 lowercase hex characters`);
+  }
   const stat = fs.statSync(file);
-  if (!stat.isFile()) throw new Error("AGY_ACP_BIN is not a regular file");
+  if (!stat.isFile()) throw new Error(`${name} is not a regular file`);
+  fs.accessSync(file, fs.constants.X_OK);
   const key = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
   let digest = digestCache.get(file)?.key === key ? digestCache.get(file)!.digest : undefined;
   if (!digest) {
     digest = createHash("sha256").update(fs.readFileSync(file)).digest("hex");
     digestCache.set(file, { key, digest });
   }
-  if (digest !== expected) throw new Error("AGY_ACP_BIN sha256 does not match the configured immutable artifact");
+  if (digest !== expected) throw new Error(`${name} sha256 does not match the configured immutable artifact`);
+}
+
+/** Verify the immutable compiled wrapper artifact before every spawn/refresh. */
+export function verifyAgyWrapperArtifact(file: string, expectedSha256: string): void {
+  if (fs.realpathSync(file) !== path.normalize(file)) {
+    throw new Error("AGY_ACP_BIN must be the exact real wrapper path, not a symlinked path");
+  }
+  verifyExecutableArtifact(file, expectedSha256, "AGY_ACP_BIN");
+}
+
+/**
+ * Prove upstream's sibling-first resolver cannot select anything other than
+ * the configured, digest-pinned AGY_BIN. An executable sibling is permitted
+ * only when it resolves to that exact configured path (including a symlink).
+ */
+export function verifyAgyRuntimeIdentity(
+  acpPath: string,
+  agyBin: string,
+  expectedSha256: string
+): void {
+  verifyExecutableArtifact(agyBin, expectedSha256, "AGY_BIN");
+  const sibling = path.join(path.dirname(acpPath), process.platform === "win32" ? "agy.exe" : "agy");
+  try {
+    fs.accessSync(sibling, fs.constants.X_OK);
+  } catch {
+    return;
+  }
+  if (fs.realpathSync(sibling) !== fs.realpathSync(agyBin)) {
+    throw new Error(
+      "antigravity-acp would prefer an executable sibling agy over configured AGY_BIN; refusing runtime"
+    );
+  }
 }
 
 export function makeAgyProfile(opts: AgyProfileOptions): AgentProfile {
@@ -524,6 +624,10 @@ export function makeAgyProfile(opts: AgyProfileOptions): AgentProfile {
   const agyVersion = opts.agyVersion.trim();
   if (!agyVersion || agyVersion.length > 256 || /[\r\n\0]/.test(agyVersion)) {
     throw new Error("AGY_VERSION must be the exact bounded first line from AGY_BIN --version");
+  }
+  const agySha256 = opts.agySha256.trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(agySha256)) {
+    throw new Error("AGY_SHA256 must be 64 lowercase hex characters");
   }
   if (opts.wrapperVersion !== AGY_ACP_UPSTREAM_VERSION) {
     throw new Error(`AGY_ACP_VERSION must be pinned to ${AGY_ACP_UPSTREAM_VERSION}`);
@@ -546,6 +650,7 @@ export function makeAgyProfile(opts: AgyProfileOptions): AgentProfile {
     throw new Error("AGY_ACP_STATE_DIR must equal the wrapper's effective host-local ~/.agy-acp directory");
   }
   const verify = opts.verifyWrapper ?? (() => verifyAgyWrapperArtifact(acpPath, opts.wrapperSha256));
+  const verifyRuntime = opts.verifyRuntime ?? (() => verifyAgyRuntimeIdentity(acpPath, agyBin, agySha256));
   const runtime: AdapterRuntimeDescriptor = {
     executable: acpPath,
     argv: [],
@@ -564,7 +669,7 @@ export function makeAgyProfile(opts: AgyProfileOptions): AgentProfile {
       commit: AGY_ACP_UPSTREAM_COMMIT,
       sha256: opts.wrapperSha256.toLowerCase(),
     },
-    dependencies: [{ executable: agyBin, version: agyVersion }],
+    dependencies: [{ executable: agyBin, version: agyVersion, sha256: agySha256 }],
   };
 
   return asLocalAdapter({
@@ -581,6 +686,7 @@ export function makeAgyProfile(opts: AgyProfileOptions): AgentProfile {
       }),
       async fetch() {
         verify();
+        verifyRuntime();
         const observedAt = new Date().toISOString();
         const probe = opts.catalogProbe
           ? await opts.catalogProbe()
@@ -646,6 +752,7 @@ export function makeAgyProfile(opts: AgyProfileOptions): AgentProfile {
     },
     spawn() {
       verify();
+      verifyRuntime();
       return protectAgyRuntimeStreams(spawn(acpPath, [], {
         cwd,
         env,

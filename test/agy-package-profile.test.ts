@@ -1,10 +1,12 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { PassThrough, type Transform } from "node:stream";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { pino } from "pino";
 import {
@@ -16,7 +18,9 @@ import {
   createAgyRuntimeStderrFilter,
   makeAgyProfile,
   parseAgyModelsOutput,
+  probeAgyPackageCatalog,
   reconcileAgyAcpModels,
+  verifyAgyRuntimeIdentity,
 } from "@seam/adapters";
 import {
   ModelCatalogService,
@@ -27,11 +31,14 @@ import type { Logger } from "../packages/core/src/lib/logger.js";
 
 const fakeWrapper = "/opt/agy/bin/antigravity-acp";
 const hash = agyAcpReleaseArtifact().sha256;
+const AGY_COMMAND_CHILD = fileURLToPath(new URL("./fixtures/fake-agy-command.mjs", import.meta.url));
 
 function fakeAcpProcess(
   models: Array<{ value: string; name: string }>,
   acknowledge = true,
-  discoveredModels?: Array<{ value: string; name: string }>
+  discoveredModels?: Array<{ value: string; name: string }>,
+  discoveryDelayMs = 0,
+  onDiscovery?: () => void
 ): ChildProcessWithoutNullStreams {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
@@ -42,6 +49,7 @@ function fakeAcpProcess(
   let exitCode: number | null = null;
   let signalCode: NodeJS.Signals | null = null;
   let available = models;
+  let discoveryTimer: NodeJS.Timeout | undefined;
   const option = () => ({
     id: "model",
     name: "Model",
@@ -68,7 +76,8 @@ function fakeAcpProcess(
     } else if (message.method === "session/new") {
       result = { sessionId: "fake-session", configOptions: [option()] };
       if (discoveredModels) {
-        queueMicrotask(() => {
+        const publishDiscovery = () => {
+          onDiscovery?.();
           available = discoveredModels;
           current = discoveredModels[0]?.value;
           stdout.write(`${JSON.stringify({
@@ -79,7 +88,9 @@ function fakeAcpProcess(
               update: { sessionUpdate: "config_option_update", configOptions: [option()] },
             },
           })}\n`);
-        });
+        };
+        if (discoveryDelayMs > 0) discoveryTimer = setTimeout(publishDiscovery, discoveryDelayMs);
+        else queueMicrotask(publishDiscovery);
       }
     } else if (message.method === "session/set_config_option") {
       if (acknowledge) current = message.params?.value;
@@ -99,6 +110,7 @@ function fakeAcpProcess(
     kill(signal: NodeJS.Signals = "SIGTERM") {
       if (exited) return false;
       exited = true;
+      if (discoveryTimer) clearTimeout(discoveryTimer);
       signalCode = signal;
       queueMicrotask(() => emitter.emit("exit", exitCode, signalCode));
       return true;
@@ -113,6 +125,7 @@ function options(over: Record<string, unknown> = {}) {
     acpPath: fakeWrapper,
     agyBin: "/opt/agy/bin/agy",
     agyVersion: "agy 1.1.20",
+    agySha256: "a".repeat(64),
     defaultModel: "gemini-3.7-pro-high",
     stateDir: pathForState(),
     conversationsDir: "/srv/agy/conversations",
@@ -122,6 +135,7 @@ function options(over: Record<string, unknown> = {}) {
     wrapperSha256: hash,
     permissionRiskAcknowledged: true,
     verifyWrapper: () => {},
+    verifyRuntime: () => {},
     ...over,
   };
 }
@@ -166,7 +180,11 @@ describe("package-backed agy profile", () => {
         version: AGY_ACP_UPSTREAM_VERSION,
         commit: AGY_ACP_UPSTREAM_COMMIT,
       }),
-      dependencies: [{ executable: "/opt/agy/bin/agy", version: "agy 1.1.20" }],
+      dependencies: [{
+        executable: "/opt/agy/bin/agy",
+        version: "agy 1.1.20",
+        sha256: "a".repeat(64),
+      }],
     }));
     expect(JSON.stringify(profile.describe().runtime)).not.toMatch(/token|secret|credential=/i);
     expect(buildAgyAcpEnvironment({}, options())).toMatchObject({
@@ -216,6 +234,59 @@ describe("package-backed agy profile", () => {
       ["x".repeat(300_000)]
     );
     expect(flood).toBe("[agy diagnostic truncated]\n");
+  });
+
+  it("uses #236 TERM-to-KILL-and-reap lifecycle for a TERM-ignoring direct command", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-command-"));
+    const signalLog = path.join(dir, "signals.log");
+    try {
+      await expect(probeAgyPackageCatalog({
+        acpPath: fakeWrapper,
+        agyBin: process.execPath,
+        agyVersion: "agy-test 1.0",
+        agyArgsPrefix: [AGY_COMMAND_CHILD],
+        cwd: dir,
+        env: {
+          ...process.env,
+          FAKE_AGY_MODE: "ignore-sigterm",
+          FAKE_AGY_SIGNAL_LOG: signalLog,
+        },
+        timeoutMs: 200,
+        defaultModel: "model-a",
+      })).rejects.toMatchObject({ code: "timeout" });
+      const log = fs.readFileSync(signalLog, "utf8");
+      expect(log).toContain("SIGTERM-IGNORED");
+      const pid = Number(/^PID (\d+)$/m.exec(log)?.[1]);
+      expect(Number.isSafeInteger(pid)).toBe(true);
+      expect(() => process.kill(pid, 0)).toThrow();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an executable wrapper sibling unless it resolves to exact digest-pinned AGY_BIN", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-sibling-"));
+    const wrapper = path.join(dir, "antigravity-acp");
+    const configuredDir = path.join(dir, "configured");
+    const configured = path.join(configuredDir, "agy");
+    const sibling = path.join(dir, process.platform === "win32" ? "agy.exe" : "agy");
+    fs.mkdirSync(configuredDir);
+    fs.writeFileSync(wrapper, "wrapper");
+    fs.writeFileSync(configured, "configured-runtime");
+    fs.writeFileSync(sibling, "hostile-sibling");
+    fs.chmodSync(wrapper, 0o755);
+    fs.chmodSync(configured, 0o755);
+    fs.chmodSync(sibling, 0o755);
+    const digest = createHash("sha256").update(fs.readFileSync(configured)).digest("hex");
+    try {
+      expect(() => verifyAgyRuntimeIdentity(wrapper, configured, digest))
+        .toThrow(/prefer an executable sibling/);
+      fs.rmSync(sibling);
+      fs.symlinkSync(configured, sibling);
+      expect(() => verifyAgyRuntimeIdentity(wrapper, configured, digest)).not.toThrow();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("keeps more than 25 exact model-baked variants separate with default-only effort", async () => {
@@ -320,7 +391,7 @@ describe("fresh agy discovery is reconciled against ACP", () => {
     { modelId: "claude-thinking", displayName: "direct two" },
   ];
 
-  it("accepts exact agreement and acknowledges every selection serially", async () => {
+  it("accepts an exact post-discovery update and acknowledges every selection serially", async () => {
     const rows = await reconcileAgyAcpModels({
       acpPath: fakeWrapper,
       cwd: "/tmp",
@@ -329,10 +400,78 @@ describe("fresh agy discovery is reconciled against ACP", () => {
       defaultModel: direct[0]!.modelId,
       timeoutMs: 5_000,
       spawnOverride: () => fakeAcpProcess(
+        direct.map((row) => ({ value: row.modelId, name: `cached ${row.displayName}` })),
+        true,
         direct.map((row) => ({ value: row.modelId, name: row.displayName }))
       ),
     });
     expect(rows.map((row) => row.modelId)).toEqual(direct.map((row) => row.modelId));
+  });
+
+  it("rejects matching startup cache followed by divergent post-discovery rows", async () => {
+    let discoverySent = false;
+    await expect(reconcileAgyAcpModels({
+      acpPath: fakeWrapper,
+      cwd: "/tmp",
+      env: {},
+      direct,
+      defaultModel: direct[0]!.modelId,
+      timeoutMs: 150,
+      spawnOverride: () => fakeAcpProcess(
+        direct.map((row) => ({ value: row.modelId, name: `stale ${row.displayName}` })),
+        true,
+        [{ value: "actual-runtime-only", name: "Actual runtime" }],
+        25,
+        () => { discoverySent = true; }
+      ),
+    })).rejects.toThrow(/reconcile|timeout/);
+    expect(discoverySent).toBe(true);
+  });
+
+  it("retains LKG when matching startup cache is followed by divergent discovery", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-stale-lkg-"));
+    const store = new ModelCatalogStore(path.join(dir, "catalog.db"));
+    let attempt = 0;
+    const profile = makeAgyProfile(options({
+      catalogProbe: async () => {
+        attempt += 1;
+        const rows = await reconcileAgyAcpModels({
+          acpPath: fakeWrapper,
+          cwd: "/tmp",
+          env: {},
+          direct,
+          defaultModel: direct[0]!.modelId,
+          timeoutMs: 150,
+          spawnOverride: () => fakeAcpProcess(
+            direct.map((row) => ({ value: row.modelId, name: `stale ${row.displayName}` })),
+            true,
+            attempt === 1
+              ? direct.map((row) => ({ value: row.modelId, name: row.displayName }))
+              : [{ value: "actual-runtime-only", name: "Actual runtime" }],
+            20
+          ),
+        });
+        return { agyVersion: "agy 1.1.20", models: rows };
+      },
+    }));
+    const binding = { agentId: "agy", location: "local" };
+    const service = new ModelCatalogService({
+      store,
+      logger: pino({ level: "silent" }) as unknown as Logger,
+      bindings: () => [binding],
+      scope: () => profile.catalog.scope(),
+      fetch: () => profile.catalog.fetch(),
+      isOnline: () => true,
+      refreshCron: "0 0 1 1 *",
+    });
+    try {
+      expect(await service.refresh(binding)).toMatchObject({ result: "published", ok: true });
+      expect(await service.refresh(binding)).toMatchObject({ result: "retained", ok: false });
+      expect(service.models(binding).map((row) => row.id)).toEqual(direct.map((row) => row.modelId));
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("ignores a startup fallback and waits for a matching discovery update", async () => {
@@ -372,7 +511,8 @@ describe("fresh agy discovery is reconciled against ACP", () => {
       timeoutMs: 5_000,
       spawnOverride: () => fakeAcpProcess(
         direct.map((row) => ({ value: row.modelId, name: row.displayName })),
-        false
+        false,
+        direct.map((row) => ({ value: row.modelId, name: row.displayName }))
       ),
     })).rejects.toThrow(/did not acknowledge/);
   });

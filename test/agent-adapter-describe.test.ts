@@ -96,6 +96,7 @@ describe("AgentAdapter.describe()", () => {
       acpPath: "/bin/false",
       agyBin: "/bin/false",
       agyVersion: "false 1.0",
+      agySha256: "a".repeat(64),
       defaultModel: "gemini-high",
       stateDir: `${os.homedir()}/.agy-acp`,
       conversationsDir: "/tmp/conversations",
@@ -105,6 +106,7 @@ describe("AgentAdapter.describe()", () => {
       wrapperSha256: agyAcpReleaseArtifact().sha256,
       permissionRiskAcknowledged: true,
       verifyWrapper: () => {},
+      verifyRuntime: () => {},
     }).describe();
     expect(d.effort.mechanism).toBe("modelBaked");
     expect(d.effort.levels).toEqual([]);

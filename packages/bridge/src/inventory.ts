@@ -36,6 +36,7 @@ export function loadHostAdapters(
   const agyAcpPath = process.env.AGY_ACP_BIN?.trim();
   const agyBin = process.env.AGY_BIN?.trim();
   const agyVersion = process.env.AGY_VERSION?.trim();
+  const agySha256 = process.env.AGY_SHA256?.trim();
   const agyDefaultModel = process.env.AGY_DEFAULT_MODEL?.trim();
   const agyOldBin = process.env.AGY_OLD_CLI_PATH?.trim();
   const agyEnabled = process.env.AGY_ENABLED === "true";
@@ -51,13 +52,14 @@ export function loadHostAdapters(
       bin: process.env.CLAUDE_CLI_PATH ?? "claude-agent-acp",
       make: () => makeClaudeProfile({ defaultModel: "claude-sonnet-4.5" }),
     },
-    ...(agyEnabled && agyAcpPath && agyBin && agyVersion && agyDefaultModel && agyRiskAcknowledged ? [{
+    ...(agyEnabled && agyAcpPath && agyBin && agyVersion && agySha256 && agyDefaultModel && agyRiskAcknowledged ? [{
       id: "agy",
       bin: agyAcpPath,
       make: () => makeAgyProfile({
         acpPath: agyAcpPath,
         agyBin,
         agyVersion,
+        agySha256,
         defaultModel: agyDefaultModel,
         stateDir: process.env.AGY_ACP_STATE_DIR ?? path.join(os.homedir(), ".agy-acp"),
         conversationsDir: process.env.AGY_CONVERSATIONS_DIR ?? path.join(os.homedir(), ".gemini", "antigravity-cli", "conversations"),

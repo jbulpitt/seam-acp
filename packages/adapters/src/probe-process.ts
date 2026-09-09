@@ -124,6 +124,12 @@ export interface ProbeHandle {
   onClose(step: ProbeCloseStep, phase?: ProbeClosePhase): void;
   /** Rejects when the child exits early; race protocol waits against it. */
   readonly exited: Promise<never>;
+  /**
+   * Resolves only for an explicitly permitted clean command exit. Protocol
+   * probes leave `allowCleanExit` false and continue treating every exit as
+   * early. Direct bounded commands await this together with stdout EOF.
+   */
+  readonly completed: Promise<void>;
   /** Redacted trailing stderr, for tests and structured diagnostics. */
   stderrTail(): string;
 }
@@ -154,6 +160,8 @@ export interface BoundedProbeOptions<T> {
   finalizeDeadlineMs?: number;
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
+  /** Permit exit code 0 with no signal for a finite command-style probe. */
+  allowCleanExit?: boolean;
   /** Label used in error detail. Must not carry secrets. */
   label?: string;
   /**
@@ -253,6 +261,8 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
    *  to observe the abort and finish registering its closes. */
   let runPromise: Promise<T> | undefined;
   let exitReject: ((err: Error) => void) | undefined;
+  let completionResolve: (() => void) | undefined;
+  let completionReject: ((err: Error) => void) | undefined;
 
   /**
    * Signal a failure. `exitReject` settles once, so the FIRST failure is the
@@ -315,13 +325,24 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
    */
   const swallowLateError = (): void => {};
   child.on("error", swallowLateError);
+  const completed = new Promise<void>((resolve, reject) => {
+    completionResolve = resolve;
+    completionReject = reject;
+  });
+  completed.catch(() => {});
   const onExit = (code: number | null, signalCode: NodeJS.Signals | null): void => {
+    if (options.allowCleanExit && code === 0 && signalCode === null) {
+      completionResolve?.();
+      return;
+    }
     // Raw child stderr is NEVER attached; only its redacted tail.
     const tail = redact(stderrTail).trim();
-    fail(new ProbeError(
+    const error = new ProbeError(
       "exited_early",
       `${label} exited (code=${code}, signal=${signalCode})${tail ? `: ${tail}` : ""}`
-    ));
+    );
+    completionReject?.(error);
+    fail(error);
   };
 
   const exited = new Promise<never>((_resolve, reject) => { exitReject = reject; });
@@ -360,6 +381,7 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     pid: child.pid,
     signal: controller.signal,
     exited,
+    completed,
     stderrTail: () => redact(stderrTail),
     onClose: (step, phase = "connection") => {
       // Registration barrier. Before finalization a step is queued normally.

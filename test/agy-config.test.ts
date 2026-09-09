@@ -27,6 +27,7 @@ describe("package-backed agy configuration gates", () => {
       AGY_ACP_BIN: "/opt/agy/antigravity-acp",
       AGY_BIN: "/opt/agy/agy",
       AGY_VERSION: "1.1.28",
+      AGY_SHA256: "a".repeat(64),
       AGY_ACP_VERSION: "1.1.0",
       AGY_ACP_SHA256: agyAcpReleaseArtifact().sha256,
       AGY_ACP_STATE_DIR: path.join(os.homedir(), ".agy-acp"),
@@ -52,6 +53,7 @@ describe("package-backed agy configuration gates", () => {
       AGY_ENABLED: true,
       AGY_ACP_VERSION: "1.1.0",
       AGY_VERSION: "1.1.28",
+      AGY_SHA256: "a".repeat(64),
       AGY_ACP_SHA256: agyAcpReleaseArtifact().sha256,
       AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED: true,
     });
@@ -67,6 +69,8 @@ describe("package-backed agy configuration gates", () => {
 
     enabled({ AGY_VERSION: "" });
     expect(() => loadConfig()).toThrow(/AGY_VERSION/);
+    enabled({ AGY_SHA256: "" });
+    expect(() => loadConfig()).toThrow(/AGY_SHA256/);
     enabled({ AGY_DEFAULT_MODEL: "" });
     expect(() => loadConfig()).toThrow(/AGY_DEFAULT_MODEL/);
   });

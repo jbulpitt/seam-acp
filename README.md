@@ -50,7 +50,7 @@ Copy `.env.example` to `.env` and fill it in.
 | `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam config agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
 | `AGY_ENABLED` | no | Enables the package-backed public `agy` profile only when its exact wrapper/runtime configuration and permission-risk acknowledgement are also present. Default `false`. |
 | `AGY_ACP_BIN` / `AGY_ACP_SHA256` | with AGY | Exact compiled `antigravity-acp` v1.1.0 asset and reviewed platform digest. Seam never downloads it. |
-| `AGY_BIN` / `AGY_VERSION` | with AGY | Exact host-local authenticated `agy` executable and exact expected `--version` output passed to the wrapper. |
+| `AGY_BIN` / `AGY_VERSION` / `AGY_SHA256` | with AGY | Exact host-local authenticated `agy` executable, expected `--version` output, and digest used for catalog evidence and runtime. |
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
 | `CLAUDE_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `claude-<id>` profile pinned to its own `CLAUDE_CONFIG_DIR`. See "Multiple Claude accounts" below. |

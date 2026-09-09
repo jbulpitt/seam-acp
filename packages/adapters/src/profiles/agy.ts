@@ -183,6 +183,80 @@ export function createAgyRuntimeStderrFilter(env: NodeJS.ProcessEnv): Transform 
   });
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/**
+ * antigravity-acp v1.1.0's reviewed title translator represents only the
+ * title's post-heading thinking text as a completed `tool_call`. Normalize
+ * that exact shape at the package-backed adapter boundary so core receives the
+ * standard ACP thought notification. Everything else stays byte-for-byte on
+ * the original wire path, including ordinary tools and native thought chunks.
+ */
+function normalizeAgyTitleThought(
+  message: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  if (
+    message.jsonrpc !== "2.0" ||
+    message.method !== "session/update" ||
+    Object.hasOwn(message, "id")
+  ) return undefined;
+  const params = asRecord(message.params);
+  if (!params || typeof params.sessionId !== "string" || params.sessionId.length === 0) {
+    return undefined;
+  }
+  const update = asRecord(params.update);
+  if (!update) return undefined;
+  const expectedKeys = [
+    "sessionUpdate",
+    "toolCallId",
+    "title",
+    "kind",
+    "status",
+    "content",
+  ];
+  if (
+    Object.keys(update).length !== expectedKeys.length ||
+    !expectedKeys.every((key) => Object.hasOwn(update, key)) ||
+    update.sessionUpdate !== "tool_call" ||
+    typeof update.toolCallId !== "string" ||
+    update.toolCallId.length === 0 ||
+    update.title !== "Think" ||
+    update.kind !== "think" ||
+    update.status !== "completed" ||
+    !Array.isArray(update.content) ||
+    update.content.length !== 1
+  ) return undefined;
+  const entry = asRecord(update.content[0]);
+  if (
+    !entry ||
+    Object.keys(entry).length !== 2 ||
+    entry.type !== "content" ||
+    !Object.hasOwn(entry, "content")
+  ) return undefined;
+  const content = asRecord(entry.content);
+  if (
+    !content ||
+    Object.keys(content).length !== 2 ||
+    content.type !== "text" ||
+    typeof content.text !== "string" ||
+    content.text.length === 0
+  ) return undefined;
+  return {
+    ...message,
+    params: {
+      ...params,
+      update: {
+        sessionUpdate: "agent_thought_chunk",
+        content: { type: "text", text: content.text },
+      },
+    },
+  };
+}
+
 export function createAgyAcpOutputFilter(env: NodeJS.ProcessEnv): Transform {
   const decoder = new StringDecoder("utf8");
   let pending = "";
@@ -199,8 +273,11 @@ export function createAgyAcpOutputFilter(env: NodeJS.ProcessEnv): Transform {
   };
   const sanitize = (line: string): string => {
     try {
-      const message = JSON.parse(line) as { error?: unknown };
-      if (!message.error) return line;
+      const message = JSON.parse(line) as Record<string, unknown>;
+      if (!message.error) {
+        const normalized = normalizeAgyTitleThought(message);
+        return normalized ? JSON.stringify(normalized) : line;
+      }
       message.error = sanitizeValue(message.error);
       return JSON.stringify(message);
     } catch {

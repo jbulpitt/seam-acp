@@ -4,6 +4,7 @@
  * defaults — describe/prepare/install do not spawn.
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   AGENT_ADAPTER_VERSION,
   makeAgyProfile,
@@ -61,11 +62,16 @@ function copilotProfileForHost(
   catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>
 ): AgentAdapter {
   const launch = resolveCopilotHostLaunch(copilotCmd, cwd);
+  const token = launch.env.GH_TOKEN || launch.env.COPILOT_GITHUB_TOKEN;
+  const credentialProfile = token
+    ? `github-token-sha256:${createHash("sha256").update(token).digest("hex")}`
+    : "default";
   return makeCopilotProfile({
     cliPath: launch.cliPath,
     acpArgs: launch.args,
     cwd: launch.cwd,
     environment: launch.env,
+    credentialProfile,
     defaultModel: "gpt-5.4",
     ...(catalogProbe ? { catalogProbe } : {}),
   });

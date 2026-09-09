@@ -44,6 +44,8 @@ describe("loadHostAdapters", () => {
       );
       const candidate = await adapters.get("copilot")!.catalog.fetch();
       expect(candidate.models.map((model) => model.id)).toEqual(["remote-model"]);
+      expect(candidate.scope.credentialProfile).toMatch(/^github-token-sha256:[a-f0-9]{64}$/);
+      expect(candidate.scope.credentialProfile).not.toContain("remote-credential-token");
       const runtimeLaunch = resolveCopilotHostLaunch(command, "/remote/workspace");
       expect(launch).toEqual(runtimeLaunch);
       expect(runtimeLaunch).toMatchObject({

@@ -227,8 +227,12 @@ async function runCopilotAcpProbeSession<T>(opts: {
   const exitedPromise = new Promise<void>((resolve) => { resolveExit = resolve; });
   const died = new Promise<never>((_resolve, reject) => { rejectDied = reject; });
   const onChildError = (error: Error) => {
-    exited = true;
-    resolveExit();
+    // A post-spawn ChildProcess error does not imply the OS process exited.
+    // Only a spawn failure (no pid) is terminal without an exit event.
+    if (child.pid === undefined) {
+      exited = true;
+      resolveExit();
+    }
     rejectDied(error);
   };
   const onChildExit = (code: number | null, signal: NodeJS.Signals | null) => {
@@ -491,6 +495,8 @@ export function makeCopilotProfile(opts: {
   cwd?: string;
   /** Base environment shared by runtime sessions and catalog probes. */
   environment?: NodeJS.ProcessEnv;
+  /** Secret-safe identity for the authenticated catalog scope. */
+  credentialProfile?: string;
   defaultModel: string;
   mcpServers?: McpServer[];
   /**
@@ -508,6 +514,7 @@ export function makeCopilotProfile(opts: {
   const globalMcpServers = opts.mcpServers ?? [];
   const configDir = opts.configDir?.trim() || undefined;
   const runtimeCwd = opts.cwd ?? process.cwd();
+  const credentialProfile = opts.credentialProfile?.trim() || configDir || "default";
 
   let identityCache: AgentIdentity | null | undefined;
 
@@ -527,7 +534,7 @@ export function makeCopilotProfile(opts: {
     catalog: {
       scope: () => manifestCatalogScope({
         provider: "github-copilot",
-        credentialProfile: configDir ?? "default",
+        credentialProfile,
       }),
       async fetch() {
         const catalogLaunch: CopilotCatalogLaunch = {
@@ -541,7 +548,7 @@ export function makeCopilotProfile(opts: {
           : await probeCopilotCatalog(catalogLaunch);
         const candidate = await manifestCatalogSource({
           provider: "github-copilot",
-          credentialProfile: configDir ?? "default",
+          credentialProfile,
           defaultModel: probe.defaultModel || opts.defaultModel,
           models: () => probe.models.map((model) => ({
             modelId: model.modelId,

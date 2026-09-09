@@ -125,6 +125,7 @@ function fakeCopilotSpawner(opts: {
   ignoreTerm?: boolean;
   ignoreKill?: boolean;
   missingStdout?: boolean;
+  emitChildError?: boolean;
 } = {}) {
   const models = opts.models ?? modelFixtures();
   const calls: Array<{
@@ -170,6 +171,7 @@ function fakeCopilotSpawner(opts: {
       stdin,
       stdout: opts.missingStdout ? null : stdout,
       stderr,
+      pid: 42_000 + calls.length,
       killed: false,
       kill(signal?: NodeJS.Signals | number) {
         call.signals.push(signal);
@@ -236,6 +238,9 @@ function fakeCopilotSpawner(opts: {
           Readable.toWeb(stdin) as ReadableStream<Uint8Array>
         )
       );
+    if (opts.emitChildError) {
+      queueMicrotask(() => child.emit("error", new Error("forced post-spawn child error")));
+    }
     return child as unknown as ReturnType<typeof import("node:child_process").spawn>;
   };
 
@@ -527,6 +532,22 @@ describe("Copilot isolated catalog probing (#234)", () => {
     harness.forceCleanup();
     await Promise.resolve();
     expect(harness.active).toBe(0);
+  });
+
+  it("terminates a still-running process after a post-spawn child error", async () => {
+    const harness = fakeCopilotSpawner({ emitChildError: true });
+    await expect(probeCopilotCatalog({
+      spawnProcess: harness.spawnProcess,
+      timeoutMs: 100,
+      overallTimeoutMs: 500,
+      cleanupTimeoutMs: 10,
+    })).rejects.toThrow(/forced post-spawn child error/);
+    expect(harness.active).toBe(0);
+    expect(harness.calls).toHaveLength(1);
+    expect(harness.calls[0]!.signals).toContain("SIGTERM");
+    expect(harness.listenersRemoved).toBe(true);
+    expect(harness.transportsDestroyed).toBe(true);
+    expect(harness.stderrListenersRemoved).toBe(true);
   });
 
   it("normalizes identical local and bridged candidates with complete provenance", async () => {

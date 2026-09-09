@@ -742,7 +742,7 @@ EOF
 
   info "status:  pm2 status"
   info "logs:    pm2 logs $pm2_name"
-  info "restart: pm2 restart $pm2_name"
+  info "updates: use the dry-run-first docs/bridge-rollout.md procedure"
   info "login:   pm2 startup launchd    # then run the command it prints (once)"
 }
 

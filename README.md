@@ -302,6 +302,9 @@ update → verify the pristine install → verify against JSONL → confirm new/
 ### Remote agents
 
 Remote agents are being rebuilt as location bindings — see [`docs/seam-bridge-plan.md`](docs/seam-bridge-plan.md).
+Use the dry-run-first [`remote bridge rollout runbook`](docs/bridge-rollout.md)
+for PM2 bridge updates; it stages versioned artifacts without remote Git and
+requires an explicit one-host apply for activation or rollback.
 
 ### MCP servers
 

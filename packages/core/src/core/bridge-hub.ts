@@ -24,6 +24,28 @@ import type { LoopbackHost } from "./loopback-host.js";
 import fs from "node:fs";
 import path from "node:path";
 
+const RELEASE_SHA = /^[0-9a-f]{40}$/;
+const RELEASE_CHECKSUM = /^[0-9a-f]{64}$/;
+const RELEASE_AGENT = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+export async function verifyStagedReleaseCatalogRpcs(
+  hello: HelloFrame,
+  agents: ReadonlyMap<string, { installed: boolean }>,
+  rpc: (method: string, params: unknown, options: { agentId: string }) => Promise<unknown>,
+): Promise<string | null> {
+  const release = hello.release;
+  if (
+    !release ||
+    !RELEASE_SHA.test(release.sourceSha) ||
+    !RELEASE_CHECKSUM.test(release.artifactChecksum) ||
+    !RELEASE_AGENT.test(release.verificationAgent) ||
+    !agents.get(release.verificationAgent)?.installed
+  ) return null;
+  await rpc("describeModelCatalog", {}, { agentId: release.verificationAgent });
+  await rpc("fetchModelCatalog", {}, { agentId: release.verificationAgent });
+  return release.verificationAgent;
+}
+
 export interface ConnectedBridge {
   bridgeId: string;
   instanceId: string;
@@ -359,6 +381,31 @@ export class BridgeHub {
         this.logger.warn(
           { err, bridgeId: expectedId, agentId },
           "prepare() failed; agent not marked ready"
+        );
+      }
+    }
+    if (hello.release) {
+      try {
+        // Call the remote adapter methods directly. The normal catalog refresh
+        // may share provider work with another binding, which would not prove
+        // that this newly deployed bridge can dispatch both RPCs itself.
+        const verifiedAgent = await verifyStagedReleaseCatalogRpcs(hello, agents, mux.rpc);
+        if (verifiedAgent) {
+          mux.sendFrame({
+            v: PROTOCOL_VERSION,
+            type: "event",
+            name: "release_verified",
+            payload: {
+              sourceSha: hello.release.sourceSha,
+              artifactChecksum: hello.release.artifactChecksum,
+              verificationAgent: verifiedAgent,
+            },
+          });
+        }
+      } catch (err) {
+        this.logger.warn(
+          { err, bridgeId: expectedId, agentId: hello.release.verificationAgent, sourceSha: hello.release.sourceSha },
+          "staged bridge catalog RPC verification failed"
         );
       }
     }

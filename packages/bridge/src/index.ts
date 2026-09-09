@@ -51,6 +51,7 @@ import type { RawData, WebSocket as WsSocket } from "ws";
 import { PROTOCOL_VERSION, type AgentAdapter } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
 import { inventoryFromAdapters, loadHostAdapters } from "./inventory.js";
+import { createReleaseReceiptWriter, type ReleaseReceiptWriter } from "./release-receipt.js";
 
 type WsCtor = typeof import("ws").WebSocket;
 type WssCtor = typeof import("ws").WebSocketServer;
@@ -253,8 +254,9 @@ function makeSlotManager(opts: {
   bridgeId: string;
   devMode: boolean;
   adapters: Map<string, AgentAdapter>;
+  releaseReceipt?: ReleaseReceiptWriter | null;
 }): SlotManager {
-  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, devMode, adapters } = opts;
+  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, devMode, adapters, releaseReceipt } = opts;
   let currentWs: WsSocket | null = null;
   const slots = new Map<number, ChildProcess>();
   const slotConfigs = new Map<number, SlotSpawnConfig>();
@@ -281,6 +283,7 @@ function makeSlotManager(opts: {
             host: { os: process.platform, arch: process.arch },
             agents,
             devMode,
+            ...(releaseReceipt ? { release: releaseReceipt.helloMetadata() } : {}),
           })
         );
       } catch { /* ws may not be open yet — best effort */ }
@@ -525,6 +528,9 @@ function makeSlotManager(opts: {
         console.error(`[bridge] hello rejected: ${msg.error ?? "protocol mismatch"}`);
       } else {
         console.error("[bridge] hello_ack accepted");
+        void releaseReceipt?.recordHelloAccepted().catch((err) => {
+          console.error("[bridge] could not write release ready receipt:", err instanceof Error ? err.message : String(err));
+        });
       }
       return;
     }
@@ -543,6 +549,7 @@ function makeSlotManager(opts: {
               slotConfigs.set(slot, cfg);
             },
           });
+          await releaseReceipt?.recordCatalogRpc(method, msg.agentId);
           wsSend({ v: PROTOCOL_VERSION, type: "rpc_reply", id, ok: true, result });
         } catch (err: any) {
           console.error(`[bridge] rpc ${method} failed:`, err?.message ?? err);
@@ -555,6 +562,13 @@ function makeSlotManager(opts: {
           });
         }
       })();
+      return;
+    }
+
+    if (msg.type === "event" && msg.name === "release_verified") {
+      void releaseReceipt?.recordControllerVerification(msg.payload).catch((err) => {
+        console.error("[bridge] could not write controller verification receipt:", err instanceof Error ? err.message : String(err));
+      });
       return;
     }
 
@@ -642,6 +656,7 @@ async function runClientMode(
 ) {
   const { WebSocket } = await loadWs();
   const adapters = loadHostAdapters(copilotCmd);
+  const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION });
   const mgr = makeSlotManager({
     copilotCmd,
     localCwd,
@@ -650,6 +665,7 @@ async function runClientMode(
     bridgeId: bridgeOpts.bridgeId,
     devMode: bridgeOpts.devMode,
     adapters,
+    releaseReceipt,
   });
   activeMgr = mgr;
 
@@ -700,6 +716,7 @@ async function runServerMode(
 ) {
   const { WebSocket, WebSocketServer } = await loadWs();
   const adapters = loadHostAdapters(copilotCmd);
+  const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION });
   const mgr = makeSlotManager({
     copilotCmd,
     localCwd,
@@ -708,6 +725,7 @@ async function runServerMode(
     bridgeId: bridgeOpts.bridgeId,
     devMode: bridgeOpts.devMode,
     adapters,
+    releaseReceipt,
   });
   activeMgr = mgr;
 

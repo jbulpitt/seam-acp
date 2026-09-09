@@ -75,6 +75,12 @@ export interface HelloFrame {
   agents: HelloAgentInventory[];
   /** True when the bridge process registered dev-mode RPC handlers. */
   devMode?: boolean;
+  /** Secret-free staged-release identity used only for rollout verification. */
+  release?: {
+    sourceSha: string;
+    artifactChecksum: string;
+    verificationAgent: string;
+  };
 }
 
 export interface HelloAckFrame {

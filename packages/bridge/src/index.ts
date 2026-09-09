@@ -209,9 +209,7 @@ function spawnAgent(
   if (mcpJson) {
     cmdArgs.push("--additional-mcp-config", mcpJson);
   }
-  const tokenLabel = launch.env.GH_TOKEN
-    ? `${launch.env.GH_TOKEN.slice(0, 8)}...`
-    : "MISSING";
+  const tokenLabel = launch.env.GH_TOKEN ? "present" : "missing";
   console.error(`[bridge] Spawning agent: ${launch.cliPath} ${cmdArgs.filter((a) => a !== mcpJson).join(" ")} (GH_TOKEN: ${tokenLabel})`);
   return spawn(launch.cliPath, cmdArgs, {
     cwd: launch.cwd,

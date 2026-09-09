@@ -27,9 +27,12 @@ Production sources are explicit for every registered profile:
 - Claude, extra Claude profiles, Vertex Claude, and Z.ai use validated manifests
   with verified context limits. Their scope includes credentials/backend and,
   for Vertex, project and region.
-- Codex reads its bounded host-local model cache unless an operator manifest is
-  pinned, preserving per-model supported/default reasoning levels plus native,
-  maximum, and effective context data from that cache.
+- Codex queries `model/list` through the exact configured
+  `codex-acp cli app-server` runtime used for sessions. That live response exclusively controls
+  operational availability, raw ids/aliases, per-model supported/default
+  reasoning levels, and the live default. `~/.codex/models_cache.json` and a
+  configured model manifest may enrich an already-advertised exact id with
+  context metadata; neither can add or keep a selectable model.
 - Agy reads its segmented language-server catalog and preserves `modelBaked`;
   a complete configured manifest remains usable when discovery is unavailable.
 - Grok performs xAI discovery during refresh, never during startup readiness;
@@ -86,9 +89,10 @@ What it enforces:
   token-shaped strings, or an absolute/home/secret-bearing path.
 - **Scope labels are diagnostic; identity is the fingerprint.**
   `credentialProfile`, `backend`, `project`, `region` and `policy` legitimately
-  carry host-shaped values in production — Codex puts `~/.codex` in
-  `credentialProfile` — so refusing them would fail every real refresh and take
-  the catalog cold. An unsafe label is replaced with the CONSTANT sentinel
+  carry host-shaped values in production, so refusing them would fail every real
+  refresh and take the catalog cold. Codex uses a bounded digest of the
+  app-server account identity rather than a filesystem location. An unsafe
+  label is replaced with the CONSTANT sentinel
   `[redacted]`, or omitted. It is deliberately **not** derived from the input: a
   truncated digest of a low-entropy value like a home directory is
   dictionary-reversible, which would leak the very path the replacement exists

@@ -141,6 +141,21 @@ describe("production adapter catalog sources", () => {
       cliPath: "false",
       defaultModel: "gpt-5",
       staticModels: [{ modelId: "gpt-5", name: "GPT-5", contextLimit: 300_000 }],
+      catalogProbe: async () => ({
+        runtimeVersion: "codex-cli fixture",
+        wrapperVersion: "codex-acp fixture",
+        models: [{
+          id: "gpt-5",
+          model: "gpt-5",
+          displayName: "GPT-5",
+          hidden: false,
+          supportedReasoningEfforts: [{ reasoningEffort: "medium" }],
+          defaultReasoningEffort: "medium",
+          inputModalities: ["text", "image"],
+          serviceTiers: [],
+          isDefault: true,
+        }],
+      }),
     });
     const ollama = makeCodexProfile({
       id: "ollama-cloud",

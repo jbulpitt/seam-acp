@@ -90,6 +90,7 @@ import {
 } from "./core/service-status/index.js";
 import { ServiceStatusCard } from "./core/service-status-card.js";
 import { planAgyIdentityMigration, readAgyHandleOwnership } from "./core/agy-identity-migration.js";
+import { migrateAgyCatalogIdentity } from "./core/agy-catalog-migration.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -256,6 +257,7 @@ async function main(): Promise<void> {
     ? makeAgyProfile({
         cliPath: config.AGY_CLI_PATH!,
         defaultModel: config.AGY_DEFAULT_MODEL,
+        credentialScope: config.AGY_CREDENTIAL_SCOPE,
         staticModels: config.AGY_MODELS,
         dataDir: config.DATA_DIR,
         printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
@@ -410,6 +412,10 @@ async function main(): Promise<void> {
   let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
 
   const profiles: AgentProfile[] = [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(agyPackage ? [agyPackage] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
+  if (agyPackage && store.agyIdentityRestored()) {
+    const migration = migrateAgyCatalogIdentity(modelCatalogStore, await agyPackage.catalog.scope());
+    logger.info({ migration }, "local AGY catalog identity migration checked");
+  }
   const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
   const modelCatalog = new ModelCatalogService({
     store: modelCatalogStore,

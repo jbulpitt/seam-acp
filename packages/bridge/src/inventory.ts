@@ -124,6 +124,7 @@ export function loadHostAdapters(
   const agyVersion = env.AGY_VERSION?.trim();
   const agySha256 = env.AGY_SHA256?.trim();
   const agyDefaultModel = env.AGY_DEFAULT_MODEL?.trim();
+  const agyModels = parseConfiguredModels(env.AGY_MODELS);
   const agyNativeBin = env.AGY_CLI_PATH?.trim() || env.AGY_OLD_CLI_PATH?.trim() || agyBin;
   const agyEnabled = env.AGY_PACKAGE_ENABLED === "true";
   const agyRiskAcknowledged = env.AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED === "true";
@@ -186,6 +187,8 @@ export function loadHostAdapters(
       make: () => makeAgyProfile({
         cliPath: agyNativeBin,
         defaultModel: agyDefaultModel,
+        credentialScope: env.AGY_CREDENTIAL_SCOPE ?? "antigravity-oauth:default",
+        staticModels: agyModels,
       }),
     }] : []),
     {

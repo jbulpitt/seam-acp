@@ -20,7 +20,7 @@
  */
 
 import { spawn, type ChildProcess, type ChildProcessByStdio } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
@@ -55,7 +55,12 @@ import {
   type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
 import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
-import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
+import {
+  manifestCatalogScope,
+  manifestCatalogSource,
+  readCliVersion,
+  type CatalogScope,
+} from "../model-catalog.js";
 import {
   discoverAgyLs,
   subscribeToAgyStream,
@@ -292,6 +297,44 @@ async function clearPersistedSession(
   }
 }
 
+export interface AgyNativeCatalogScopeOptions {
+  credentialScope?: string;
+  defaultModel: string;
+  staticModels?: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
+}
+
+/**
+ * Semantic native-runtime identity. Location and paths are deliberately absent:
+ * equivalent hosts share, while account/default/configured-selection changes
+ * cannot contend for one canonical generation.
+ */
+export function agyNativeCatalogScope(opts: AgyNativeCatalogScopeOptions): CatalogScope {
+  const credentialProfile = opts.credentialScope?.trim() || "antigravity-oauth:default";
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(credentialProfile) || path.isAbsolute(credentialProfile)) {
+    throw new Error("AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
+  }
+  const selection = {
+    defaultModel: opts.defaultModel,
+    source: opts.staticModels?.length ? "configured+live-context" : "live-discovery",
+    models: (opts.staticModels ?? []).map((model) => ({
+      modelId: model.modelId,
+      contextLimit: model.contextLimit ?? null,
+    })).sort((a, b) =>
+      a.modelId.localeCompare(b.modelId) ||
+      (a.contextLimit ?? 0) - (b.contextLimit ?? 0)
+    ),
+  };
+  const selectionFingerprint = createHash("sha256")
+    .update(JSON.stringify(selection))
+    .digest("hex");
+  return manifestCatalogScope({
+    provider: "google-antigravity",
+    backend: "agy-native-language-server-v1",
+    credentialProfile,
+    policy: `configured-selection-v1:${selectionFingerprint}`,
+  });
+}
+
 export function makeAgyProfile(opts: {
   /** Override the agy binary location. Defaults to `agy` on PATH. */
   cliPath?: string;
@@ -303,6 +346,8 @@ export function makeAgyProfile(opts: {
    * has set in `~/.gemini/antigravity-cli/settings.json`).
    */
   defaultModel?: string;
+  /** Non-secret semantic account/profile label shared with the exact runtime. */
+  credentialScope?: string;
   /**
    * seam-acp's own state directory. The agy profile stores its ACP→cascade
    * mapping here, separate from agy's `~/.gemini/antigravity-cli/`. Defaults
@@ -323,6 +368,11 @@ export function makeAgyProfile(opts: {
 } = {}): AgentProfile {
   const cli = opts.cliPath?.trim() || resolveAgyBinary();
   const defaultModel = opts.defaultModel ?? "antigravity";
+  const catalogScope = agyNativeCatalogScope({
+    credentialScope: opts.credentialScope,
+    defaultModel,
+    staticModels: opts.staticModels,
+  });
   const mappingFile = opts.dataDir
     ? path.join(opts.dataDir, "agy-sessions.json")
     : LEGACY_MAPPING_FILE;
@@ -331,7 +381,7 @@ export function makeAgyProfile(opts: {
     displayName: "Antigravity",
     defaultModel,
     catalog: {
-      scope: () => manifestCatalogScope({ provider: "google-antigravity" }),
+      scope: () => catalogScope,
       async fetch() {
         let models: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
         if (opts.staticModels && opts.staticModels.length > 0) {
@@ -356,6 +406,9 @@ export function makeAgyProfile(opts: {
         }
         const candidate = await manifestCatalogSource({
           provider: "google-antigravity",
+          backend: catalogScope.backend,
+          credentialProfile: catalogScope.credentialProfile,
+          policy: catalogScope.policy,
           defaultModel,
           models: () => models,
           effort: { mechanism: "modelBaked", choices: ["default"] },

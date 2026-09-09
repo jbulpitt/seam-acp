@@ -1242,6 +1242,9 @@ export function loadConfig(): Config {
     if (!cfg.AGY_DEFAULT_MODEL.trim()) {
       throw new Error("Invalid configuration: native agy requires AGY_DEFAULT_MODEL");
     }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(cfg.AGY_CREDENTIAL_SCOPE)) {
+      throw new Error("Invalid configuration: AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");
+    }
   }
   if (cfg.AGY_NATIVE_RESTORE && !cfg.AGY_ENABLED) throw new Error("AGY_NATIVE_RESTORE requires native AGY_ENABLED");
 

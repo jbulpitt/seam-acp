@@ -26,6 +26,7 @@ import {
 } from "@seam/adapters";
 import type { Logger } from "../../lib/logger.js";
 import {
+  catalogBindingContinuityFingerprint,
   type CatalogObservationRow,
   type ModelCatalogStore,
   type StoredCatalogSnapshot,
@@ -327,6 +328,16 @@ export class ModelCatalogService {
         ? `scope:${candidate.scope.fingerprint}` : `binding:${key}`;
       const activeForScope = this.snapshots.get(desiredScope);
       const sourceObservation = this.observations.get(fetchedBy);
+      const bindingMigration = this.options.store.pendingBindingMigration(key);
+      const migrationProof = Boolean(
+        fetchedBy === key && activeForScope && bindingMigration &&
+        bindingMigration.targetBindingKey === key &&
+        bindingMigration.scopeKey === desiredScope &&
+        bindingMigration.source === candidate.source &&
+        bindingMigration.activeGeneration === activeForScope.generation &&
+        bindingMigration.activeChecksum === activeForScope.checksum &&
+        bindingMigration.continuityFingerprint === catalogBindingContinuityFingerprint(candidate)
+      );
       // A candidate fetched by a binding that last observed the active
       // generation may move the canonical scope forward. Fetch provenance is
       // load-bearing when equivalent bindings share one in-flight operation:
@@ -337,7 +348,7 @@ export class ModelCatalogService {
         activeForScope && sourceObservation?.scopeKey === desiredScope &&
         sourceObservation.checksum === activeForScope.checksum &&
         !sourceObservation.drift
-      );
+      ) || migrationProof;
       const drift = activeForScope && checksum !== activeForScope.checksum && !fetchedFromActive
         ? `catalog conflicts with active generation ${activeForScope.generation}; binding quarantined`
         : null;
@@ -428,13 +439,30 @@ export class ModelCatalogService {
         source: candidate.source,
         fetchedAt: candidate.fetchedAt, drift,
       };
+      const bindingMigrationProof = migrationProof && bindingMigration && activeForScope
+        ? {
+            migrationId: bindingMigration.migrationId,
+            targetBindingKey: key,
+            scopeKey,
+            activeGeneration: activeForScope.generation,
+            activeChecksum: activeForScope.checksum,
+            completedAt: attemptedAt,
+          }
+        : undefined;
       if (priorForScope?.checksum === checksum) {
-        this.options.store.recordObservation(observation);
+        this.options.store.recordObservation(observation, bindingMigrationProof);
         this.options.store.recordAttempt({ bindingKey: key, attemptedAt, result: "unchanged", error: drift, source: candidate.source, candidateChecksum: checksum });
         this.observations.set(key, observation);
         return { ...base, ok: !drift, result: "unchanged", source: candidate.source, scope: scopeKey, generation: priorForScope.generation, fetchedAt: candidate.fetchedAt, cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion, ...(drift ? { error: drift } : {}) };
       }
-      const snapshot = this.options.store.publish({ scopeKey, checksum, candidate, publishedAt: attemptedAt, observation });
+      const snapshot = this.options.store.publish({
+        scopeKey,
+        checksum,
+        candidate,
+        publishedAt: attemptedAt,
+        observation,
+        ...(bindingMigrationProof ? { bindingMigrationProof } : {}),
+      });
       // #236: an operator-accepted reduction is durably distinguishable from an
       // ordinary publication, so an audit can tell a bypass from a normal one.
       this.options.store.recordAttempt({

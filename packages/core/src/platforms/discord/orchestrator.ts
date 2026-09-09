@@ -11125,13 +11125,17 @@ export class Orchestrator {
       return;
     }
     const requested = i.options.getString("agent", true).trim();
-    await i.reply({ content: `🔄 Refreshing model catalog \`${requested}\`…` });
+    const acceptReduction = i.options.getBoolean("accept-reduction") === true;
+    await i.reply({
+      content: `🔄 Refreshing model catalog \`${requested}\`…` +
+        (acceptReduction ? " (accepting a quarantined reduction)" : ""),
+    });
     const results = requested === "all"
-      ? await this.modelCatalog.refreshAll("manual")
+      ? await this.modelCatalog.refreshAll("manual", { acceptReduction })
       : [await this.modelCatalog.refresh((() => {
           const parsed = parseAgentAtLocation(requested);
           return { agentId: parsed.agentId, location: parsed.location };
-        })(), "manual")];
+        })(), "manual", { acceptReduction })];
     const lines = results.map((result) => {
       const generation = `${result.previousGeneration ?? "none"} → ${result.generation ?? "none"}`;
       const detail = result.ok
@@ -11145,6 +11149,14 @@ export class Orchestrator {
         ...(result.scope ? [`scope ${result.scope}`] : []),
         ...(result.sourceVersion || result.cliVersion
           ? [`provider/CLI ${[result.sourceVersion, result.cliVersion].filter(Boolean).join(" / ")}`]
+          : []),
+        // #236: a quarantined reduction is not a failure — say what was held
+        // back and exactly how to admit it, or nobody can act on it.
+        ...(result.reduction
+          ? [
+              `⛔ held back: ${result.reduction.rule} rule — removes ${result.reduction.removed.join(", ")}`,
+              `to admit: repeat this refresh unchanged to confirm, or re-run with \`accept-reduction:true\``,
+            ]
           : []),
         ...(result.error ? [`failure: ${result.error}`] : []),
       ].join("\n");

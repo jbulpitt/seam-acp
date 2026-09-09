@@ -1031,6 +1031,13 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
               .setRequired(true)
               .setAutocomplete(true)
           )
+          // #236: the bounded operator escape hatch for a quarantined
+          // reduction. One refresh, one binding, never persisted.
+          .addBooleanOption((o) =>
+            o
+              .setName("accept-reduction")
+              .setDescription("Accept a quarantined model removal this once")
+          )
       )
   );
 

@@ -8,7 +8,16 @@ import type {
   RawCatalogSelection,
 } from "@seam/adapters";
 import { decodeCatalogSelection, encodeCatalogSelection } from "@seam/adapters";
-import { MODEL_CATALOG_SCHEMA_VERSION } from "@seam/adapters";
+import {
+  assessCatalogReduction,
+  CATALOG_EVIDENCE_MAX_RECORDS,
+  CATALOG_EVIDENCE_TEXT_MAX,
+  DEFAULT_CATALOG_REDUCTION_POLICY,
+  MODEL_CATALOG_MIN_SUPPORTED_SCHEMA_VERSION,
+  MODEL_CATALOG_SCHEMA_VERSION,
+  upgradeCatalogCandidate,
+  type CatalogReductionPolicy,
+} from "@seam/adapters";
 import type { Logger } from "../../lib/logger.js";
 import {
   type CatalogObservationRow,
@@ -18,6 +27,24 @@ import {
 
 export interface CatalogBinding { agentId: string; location: string }
 export type CatalogRefreshReason = "startup" | "scheduled" | "manual";
+
+export interface CatalogRefreshOptions {
+  /**
+   * Operator acceptance of a quarantined reduction (#236). Bounded by
+   * construction: it applies to this ONE refresh of this ONE binding and is
+   * never persisted, so a legitimate provider retirement can be admitted
+   * without permanently disarming the protection.
+   */
+  acceptReduction?: boolean;
+}
+
+/** Why a candidate was held back, surfaced to status and manual refresh. */
+export interface CatalogReductionReport {
+  removed: string[];
+  rule: "small-catalog" | "collapse";
+  reason: string;
+  confirmationRequired: boolean;
+}
 
 export interface CatalogRefreshResult {
   binding: CatalogBinding;
@@ -34,6 +61,8 @@ export interface CatalogRefreshResult {
   cliVersion?: string;
   sourceVersion?: string;
   error?: string;
+  /** Present when a reduction was assessed and held. */
+  reduction?: CatalogReductionReport;
 }
 
 export interface CatalogLookup {
@@ -73,7 +102,8 @@ export class ModelCatalogService {
   private readonly observations = new Map<string, CatalogObservationRow>();
   private readonly inFlight = new Map<string, Promise<CatalogRefreshResult>>();
   private readonly fetchInFlight = new Map<string, Promise<FetchedCatalogCandidate>>();
-  private readonly collapseConfirmations = new Map<string, string>();
+  private readonly reductionConfirmations = new Map<string, string>();
+  private readonly reductionPolicy: CatalogReductionPolicy;
   private readonly publicationListeners = new Set<(event: CatalogPublication) => void>();
   private job?: Cron;
   private stopped = false;
@@ -89,11 +119,18 @@ export class ModelCatalogService {
     now?: () => Date;
     refreshCron?: string;
     concurrency?: number;
+    /** Generic, provider-neutral reduction thresholds (#236). */
+    reductionPolicy?: CatalogReductionPolicy;
   }) {
+    this.reductionPolicy = options.reductionPolicy ?? DEFAULT_CATALOG_REDUCTION_POLICY;
     for (const snapshot of options.store.loadActive()) {
       try {
-        validateCandidate(snapshot.candidate);
-        this.snapshots.set(snapshot.scopeKey, deepFreeze(snapshot));
+        // Normalize forward before validating so a snapshot written by an older
+        // (still supported) schema keeps serving instead of cold-starting.
+        const upgraded = upgradeCatalogCandidate(snapshot.candidate);
+        if (!upgraded) throw new Error(`unsupported model catalog schema ${String(snapshot.candidate?.schemaVersion)}`);
+        validateCandidate(upgraded);
+        this.snapshots.set(snapshot.scopeKey, deepFreeze({ ...snapshot, candidate: upgraded }));
       } catch (err) {
         options.logger.warn({ err, scopeKey: snapshot.scopeKey }, "ignored incompatible stored model catalog generation");
       }
@@ -194,9 +231,16 @@ export class ModelCatalogService {
     return decodeCatalogSelection(this.models(binding), raw);
   }
 
-  refresh(binding: CatalogBinding, reason: CatalogRefreshReason = "manual"): Promise<CatalogRefreshResult> {
+  refresh(
+    binding: CatalogBinding,
+    reason: CatalogRefreshReason = "manual",
+    opts: CatalogRefreshOptions = {}
+  ): Promise<CatalogRefreshResult> {
     const key = bindingKey(binding);
-    const existing = this.inFlight.get(key);
+    // An accepting refresh must not be satisfied by an in-flight non-accepting
+    // one (or vice versa), so acceptance is part of the single-flight identity.
+    const flightKey = opts.acceptReduction ? `${key}|accept` : key;
+    const existing = this.inFlight.get(flightKey);
     if (existing) return existing;
     if (this.stopped) {
       const prior = this.lookup(binding).snapshot;
@@ -212,12 +256,15 @@ export class ModelCatalogService {
         error: "model catalog refresh is stopped",
       });
     }
-    const promise = this.refreshInner(binding, reason).finally(() => this.inFlight.delete(key));
-    this.inFlight.set(key, promise);
+    const promise = this.refreshInner(binding, reason, opts).finally(() => this.inFlight.delete(flightKey));
+    this.inFlight.set(flightKey, promise);
     return promise;
   }
 
-  async refreshAll(reason: CatalogRefreshReason = "manual"): Promise<CatalogRefreshResult[]> {
+  async refreshAll(
+    reason: CatalogRefreshReason = "manual",
+    opts: CatalogRefreshOptions = {}
+  ): Promise<CatalogRefreshResult[]> {
     if (this.stopped) return [];
     const bindings = uniqueBindings(this.options.bindings());
     const concurrency = Math.max(1, this.options.concurrency ?? 3);
@@ -226,15 +273,20 @@ export class ModelCatalogService {
     const worker = async (): Promise<void> => {
       while (cursor < bindings.length) {
         const binding = bindings[cursor++]!;
-        results.push(await this.refresh(binding, reason));
+        results.push(await this.refresh(binding, reason, opts));
       }
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, bindings.length) }, worker));
     return results;
   }
 
-  private async refreshInner(binding: CatalogBinding, _reason: CatalogRefreshReason): Promise<CatalogRefreshResult> {
+  private async refreshInner(
+    binding: CatalogBinding,
+    _reason: CatalogRefreshReason,
+    opts: CatalogRefreshOptions = {}
+  ): Promise<CatalogRefreshResult> {
     const key = bindingKey(binding);
+    const accepted = opts.acceptReduction === true;
     const prior = this.lookup(binding).snapshot;
     const attemptedAt = (this.options.now?.() ?? new Date()).toISOString();
     const base = { binding, previousGeneration: prior?.generation ?? null, generation: prior?.generation ?? null, added: 0, removed: 0, changed: 0 };
@@ -300,16 +352,31 @@ export class ModelCatalogService {
           error: drift,
         };
       }
-      if (isCollapsed(priorForScope?.candidate.models ?? [], candidate.models)) {
-        const priorConfirmation = this.collapseConfirmations.get(key) ?? this.options.store.getRefreshStatus(key)?.candidateChecksum;
+      // Reduction quarantine (#236). A candidate that DROPS a published model
+      // is held until a second, independent, identical refresh confirms it —
+      // or until an operator explicitly accepts it. Additions and
+      // metadata-only edits are never held. The comparison is against the
+      // durable active generation and lives here, in the service, so no
+      // provider can opt itself out.
+      const reduction = assessCatalogReduction(
+        priorForScope?.candidate.models ?? [],
+        candidate.models,
+        this.reductionPolicy
+      );
+      if (reduction && !accepted) {
+        const priorConfirmation =
+          this.reductionConfirmations.get(key) ?? this.options.store.getRefreshStatus(key)?.candidateChecksum;
         if (priorConfirmation !== checksum) {
-          this.collapseConfirmations.set(key, checksum);
-          const error = `candidate coverage collapsed (${candidate.models.length}/${priorForScope!.candidate.models.length}); repeat identical refresh required`;
+          this.reductionConfirmations.set(key, checksum);
+          const error =
+            `${reduction.reason}; quarantined pending confirmation — ` +
+            `repeat an identical refresh to confirm, or accept it explicitly ` +
+            `(\`/seamadmin catalog refresh … accept-reduction:true\`)`;
           this.options.store.recordAttempt({ bindingKey: key, attemptedAt, result: "quarantined", error, source: candidate.source, candidateChecksum: checksum });
-          return { ...base, ...diff, ok: false, result: "quarantined", source: candidate.source, scope: scopeKey, fetchedAt: candidate.fetchedAt, cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion, error };
+          return { ...base, ...diff, ok: false, result: "quarantined", source: candidate.source, scope: scopeKey, fetchedAt: candidate.fetchedAt, cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion, error, reduction: { ...reduction, confirmationRequired: true } };
         }
       }
-      this.collapseConfirmations.delete(key);
+      this.reductionConfirmations.delete(key);
       const observation: CatalogObservationRow = {
         bindingKey: key, agentId: binding.agentId, location: binding.location,
         scopeKey, checksum, adapterVersion: candidate.adapterVersion,
@@ -340,6 +407,11 @@ export class ModelCatalogService {
       return { ...base, ...diff, ok: !drift, result: "published", source: candidate.source, scope: scopeKey, generation: snapshot.generation, fetchedAt: candidate.fetchedAt, cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion, ...(drift ? { error: drift } : {}) };
     } catch (caught) {
       const error = caught instanceof Error ? caught.message : String(caught);
+      // A failed observation is NOT a confirmation. Clearing here is what makes
+      // "quarantine → transient failure → same reduced candidate" require two
+      // fresh identical observations again rather than sliding through on the
+      // strength of one earlier sighting.
+      this.reductionConfirmations.delete(key);
       this.options.store.recordAttempt({ bindingKey: key, attemptedAt, result: "retained", error, source: null, candidateChecksum: null });
       this.options.logger.warn({ err: caught, binding: key }, "model catalog refresh failed; previous snapshot retained");
       return { ...base, ok: false, result: "retained", error };
@@ -382,7 +454,14 @@ function uniqueBindings(bindings: ReadonlyArray<CatalogBinding>): CatalogBinding
 
 export function validateCandidate(candidate: AdapterCatalogCandidate): void {
   if (!candidate || typeof candidate !== "object") throw new Error("catalog candidate is malformed");
-  if (candidate.schemaVersion !== MODEL_CATALOG_SCHEMA_VERSION) {
+  // A RANGE, not an equality (#236). Accepting only the exact current version
+  // meant the next schema bump would discard every durable last-known-good
+  // snapshot on deploy and turn an upgrade into a cold-cache outage.
+  if (
+    !Number.isInteger(candidate.schemaVersion) ||
+    candidate.schemaVersion < MODEL_CATALOG_MIN_SUPPORTED_SCHEMA_VERSION ||
+    candidate.schemaVersion > MODEL_CATALOG_SCHEMA_VERSION
+  ) {
     throw new Error(`unsupported model catalog schema ${String(candidate.schemaVersion)}`);
   }
   if (!Array.isArray(candidate.models) || !candidate.models.length) throw new Error("active provider catalog candidate is empty");
@@ -413,6 +492,10 @@ export function validateCandidate(candidate: AdapterCatalogCandidate): void {
     if (typeof model.default !== "boolean" || !Array.isArray(model.aliases) || model.aliases.some((alias) => typeof alias !== "string")) {
       throw new Error(`malformed aliases for ${model.id}`);
     }
+    if (model.description !== undefined && !isBoundedText(model.description)) {
+      throw new Error(`malformed description for ${model.id}`);
+    }
+    validateEvidence(model.id, model.evidence);
     ids.add(model.id);
     for (const name of [model.id, ...model.aliases]) {
       const normalized = name.trim().toLowerCase();
@@ -473,6 +556,77 @@ export function validateCandidate(candidate: AdapterCatalogCandidate): void {
   if (defaults !== 1) throw new Error(`catalog requires exactly one default model (found ${defaults})`);
 }
 
+const EVIDENCE_KINDS = ["live-observation", "verified-record", "declared-manifest", "enrichment"];
+
+function isBoundedText(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= CATALOG_EVIDENCE_TEXT_MAX;
+}
+
+function optionalBoundedText(value: unknown): boolean {
+  return value === undefined || isBoundedText(value);
+}
+
+/**
+ * Generic evidence validation (#236). Core checks SHAPE only — it never reads a
+ * provider's model names or interprets what a record means.
+ *
+ * Known fields are strict (malformed evidence fails closed and the prior
+ * generation is retained); unknown fields are tolerated so a snapshot written
+ * by a newer build round-trips without corruption. Every text field is
+ * length-bounded and the field set is closed, which is the structural reason a
+ * record cannot carry a raw environment, credential, token, or PII.
+ */
+function validateEvidence(modelId: string, evidence: unknown): void {
+  if (evidence === undefined) return;
+  const malformed = (detail: string): never => {
+    throw new Error(`malformed evidence for ${modelId}: ${detail}`);
+  };
+  if (!Array.isArray(evidence)) malformed("expected an array");
+  const records = evidence as unknown[];
+  if (records.length > CATALOG_EVIDENCE_MAX_RECORDS) {
+    malformed(`more than ${CATALOG_EVIDENCE_MAX_RECORDS} records`);
+  }
+  for (const entry of records) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) malformed("record is not an object");
+    const record = entry as Record<string, unknown>;
+    if (typeof record.kind !== "string" || !EVIDENCE_KINDS.includes(record.kind)) {
+      malformed(`unknown evidence kind ${JSON.stringify(record.kind)}`);
+    }
+    if (!isBoundedText(record.source)) malformed("source must be bounded non-empty text");
+    for (const field of ["observedAt", "runtimeVersion", "scopeRef", "resolvedModel", "note"] as const) {
+      if (!optionalBoundedText(record[field])) malformed(`${field} must be bounded text`);
+    }
+    if (record.observedAt !== undefined && !Number.isFinite(Date.parse(String(record.observedAt)))) {
+      malformed("observedAt must be a timestamp");
+    }
+    if (
+      record.adapterVersion !== undefined &&
+      (!Number.isInteger(record.adapterVersion) || (record.adapterVersion as number) < 1)
+    ) {
+      malformed("adapterVersion must be a positive integer");
+    }
+    if (record.context !== undefined) {
+      const context = record.context as Record<string, unknown>;
+      if (!context || typeof context !== "object" || Array.isArray(context)) malformed("context must be an object");
+      for (const field of ["native", "maximum", "effective"] as const) {
+        const value = context[field];
+        if (value === undefined || value === null) continue;
+        if (!Number.isFinite(value) || (value as number) <= 0) malformed(`context.${field} must be a positive number`);
+      }
+      if (!optionalBoundedText(context.method)) malformed("context.method must be bounded text");
+    }
+    if (record.effort !== undefined) {
+      const effort = record.effort as Record<string, unknown>;
+      if (!effort || typeof effort !== "object" || Array.isArray(effort)) malformed("effort must be an object");
+      if (effort.choices !== undefined && !validStringList(effort.choices, false)) {
+        malformed("effort.choices must be unique non-empty strings");
+      }
+      if (!optionalBoundedText(effort.selectionDefault)) malformed("effort.selectionDefault must be bounded text");
+      if (!optionalBoundedText(effort.method)) malformed("effort.method must be bounded text");
+    }
+  }
+}
+
 function validStringList(value: unknown, requireNonEmpty: boolean): value is string[] {
   return Array.isArray(value) && (!requireNonEmpty || value.length > 0) &&
     value.every((entry) => typeof entry === "string" && Boolean(entry.trim())) &&
@@ -487,7 +641,6 @@ function candidateChecksum(candidate: AdapterCatalogCandidate): string {
     models: candidate.models,
   })).digest("hex");
 }
-function isCollapsed(before: ReadonlyArray<CatalogModel>, after: ReadonlyArray<CatalogModel>): boolean { return before.length >= 4 && after.length < Math.ceil(before.length / 2); }
 function diffModels(before: ReadonlyArray<CatalogModel>, after: ReadonlyArray<CatalogModel>): { added: number; removed: number; changed: number } {
   const a = new Map(before.map((model) => [model.id, JSON.stringify(model)]));
   const b = new Map(after.map((model) => [model.id, JSON.stringify(model)]));

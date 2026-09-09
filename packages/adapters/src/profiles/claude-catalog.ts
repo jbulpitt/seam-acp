@@ -516,15 +516,29 @@ export async function probeClaudeCatalog(options: {
       results.set(entry.value, probed);
     }
   };
-  // allSettled, not all: a bare `Promise.all` rejects the moment one worker
-  // fails, returning while its siblings are still holding wrapper processes.
-  // Abort them, then AWAIT every one so no session or child outlives this call.
-  const settled = await Promise.allSettled(Array.from({ length: concurrency }, worker));
-  const failure = settled.find((entry) => entry.status === "rejected");
-  if (failure && failure.status === "rejected") {
-    controller.abort();
-    throw failure.reason;
-  }
+  // Cancellation and draining are two separate obligations, in this order.
+  //
+  // 1. The FIRST failure aborts its siblings AT THE MOMENT IT HAPPENS. Raising
+  //    the abort after `allSettled` had already returned could not reach a
+  //    sibling that was still running: a wrapper that never answers
+  //    `initialize` sat for its entire session budget before the catalog gave
+  //    up on a collection that was already doomed.
+  // 2. Only then is every worker awaited — allSettled, not all — so no session
+  //    or child outlives this call, and the first genuine failure (not a
+  //    sibling's derived cancellation) is what the caller sees — `failures` is
+  //    chronological, so `failures[0]` is the one that raised the abort.
+  const failures: unknown[] = [];
+  const cancelOnFailure = async (): Promise<void> => {
+    try {
+      await worker();
+    } catch (error) {
+      failures.push(error);
+      controller.abort();
+      throw error;
+    }
+  };
+  await Promise.allSettled(Array.from({ length: concurrency }, cancelOnFailure));
+  if (failures.length > 0) throw failures[0];
   if (controller.signal.aborted) {
     throw new Error(`claude-agent-acp catalog probe exceeded its ${deadlineMs}ms catalog deadline`);
   }
@@ -775,12 +789,14 @@ function liveEvidence(input: {
       method: "provider-advertised",
     },
   };
-  // A live row whose resolution the wrapper did NOT report keeps the separately
-  // verified resolution as its own second record, so the two origins stay
-  // distinguishable instead of being flattened into one sentence.
-  return input.selfResolved || !input.verified
-    ? [live]
-    : [live, overlayEvidence(input.verified, input.scopeRef)];
+  // The verified record travels with EVERY row the overlay contributed to,
+  // including one whose identity the wrapper resolved for itself. The merged
+  // row's window comes only from that verification — ACP reports no window at
+  // discovery — so dropping the record on self-resolution left a 1M context
+  // standing on a live-observation that never established it. Self-resolution
+  // decides only what the LIVE record may claim (`resolvedModel` above), never
+  // whether the verification that supplied the window stays visible.
+  return input.verified ? [live, overlayEvidence(input.verified, input.scopeRef)] : [live];
 }
 
 /** The record carried forward from an out-of-band JSONL verification. */

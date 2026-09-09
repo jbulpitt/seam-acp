@@ -946,6 +946,114 @@ describe("#232 QA fixtures — direct regressions", () => {
     }
   }, 30_000);
 
+  /**
+   * QA blocker 2 (this round): the FIRST rejection must abort in-flight
+   * siblings immediately. Draining afterwards is not enough — a sibling that
+   * never answers `initialize` would otherwise burn its whole session budget
+   * before the shared abort is even raised.
+   */
+  it("a failing worker aborts a HUNG sibling promptly, not after its session budget", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-232-fanout-mixed-"));
+    try {
+      const log = path.join(dir, "acp.log");
+      fs.writeFileSync(log, "");
+      const base = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
+        ...process.env,
+        FAKE_ACP_LOG: log,
+        FAKE_ACP_MODELS: JSON.stringify(LIVE_ADVERTISED),
+        FAKE_ACP_CURRENT: "sonnet",
+        FAKE_ACP_EFFORT: JSON.stringify({ sonnet: FULL_EFFORT }),
+        ...over,
+      });
+      const sessionBudgetMs = 2_500;
+      const started = Date.now();
+      await expect(
+        probeClaudeCatalog({
+          cliPath: FAKE_ACP,
+          cwd: dir,
+          env: base(),
+          // One worker dies at once; every other worker is MUTE and would
+          // otherwise sit until its own timeout.
+          modelEnv: (model) =>
+            model === "default" ? base({ FAKE_ACP_FAIL: "1" }) : base({ FAKE_ACP_SILENT_INIT: "1" }),
+          timeoutMs: sessionBudgetMs,
+          overallTimeoutMs: 20_000,
+          concurrency: 2,
+        })
+      ).rejects.toMatchObject({ code: "exited_early" });
+      // The QA reproduction returned in 2614ms for a 2500ms hung sibling.
+      expect(Date.now() - started).toBeLessThan(sessionBudgetMs);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const pids = [...new Set(
+        fs.readFileSync(log, "utf8").split("\n").filter(Boolean)
+          .map((line) => JSON.parse(line) as { pid?: number })
+          .flatMap((row) => (typeof row.pid === "number" ? [row.pid] : []))
+      )];
+      expect(pids.length).toBeGreaterThan(1);
+      for (const pid of pids) {
+        expect(() => process.kill(pid, 0)).toThrow();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  /**
+   * QA blocker 1 (this round): the wrapper self-resolving `claude-fable-5-1[1m]`
+   * to `claude-fable-5-1` must not cost the row the verified record that
+   * established its 1M window. A live ACP session reports no window at all.
+   */
+  it("a SELF-RESOLVING live Fable row keeps the verified record behind its 1M window", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-232-fable-"));
+    try {
+      const log = path.join(dir, "acp.log");
+      fs.writeFileSync(log, "");
+      const env = (): NodeJS.ProcessEnv => ({
+        ...process.env,
+        FAKE_ACP_LOG: log,
+        // The installed shape: the wrapper comes up on `sonnet`, so Fable is
+        // probed in its own session spawned with ANTHROPIC_MODEL=claude-fable-5-1
+        // — which is exactly what makes the wrapper self-resolve its identity.
+        FAKE_ACP_MODELS: JSON.stringify(LIVE_ADVERTISED),
+        FAKE_ACP_CURRENT: "sonnet",
+        FAKE_ACP_EFFORT: JSON.stringify({ sonnet: FULL_EFFORT, "claude-fable-5-1": FULL_EFFORT }),
+      });
+      const probe = await probeClaudeCatalog({
+        cliPath: FAKE_ACP, cwd: dir, env: env(), modelEnv: env, timeoutMs: 15_000,
+      });
+      const fable = probe.models.find((model) => model.advertisedId === "claude-fable-5-1[1m]")!;
+      // The precondition the QA reproduction hit on the installed wrapper.
+      expect(fable.resolvedValue).toBe("claude-fable-5-1");
+      const merged = mergeClaudeCatalogModels({
+        probe,
+        overlay: CLAUDE_VERIFIED_OVERLAY,
+        effortMechanism: "meta",
+        credentialScope: "default",
+        scopeRef: "c".repeat(64),
+      });
+      const row = merged.find((model) => model.modelId === "claude-fable-5-1")!;
+      expect(row.context.native).toBe(1_000_000);
+      // A live-observation alone must never substantiate a 1M window.
+      const verified = row.evidence!.find((record) => record.kind === "verified-record");
+      expect(verified?.context).toEqual({ native: 1_000_000, method: "runbook-verified" });
+      const live = row.evidence!.find((record) => record.kind === "live-observation")!;
+      expect(live.context).toBeUndefined();
+      expect(live.resolvedModel).toBe("claude-fable-5-1");
+      // The whole-catalog invariant, not just this row: a published window is
+      // always attributable to the verified record that established it.
+      for (const model of merged) {
+        if (model.context.native === null) continue;
+        expect(
+          model.evidence!.some(
+            (record) => record.kind === "verified-record" && record.context?.native === model.context.native
+          )
+        ).toBe(true);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("enforces ONE catalog-wide deadline across concurrency waves", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-232-deadline-"));
     try {

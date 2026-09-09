@@ -88,7 +88,12 @@ level that model does not advertise.
   window and says so. A live-observation record therefore never carries a
   `context`: the window travels on the verified record that established it,
   rather than a global table's default-account value being relabelled as an
-  alternate scope's live measurement.
+  alternate scope's live measurement. That record is published on **every** row
+  the overlay contributed to, including one whose identity the wrapper resolved
+  for itself (`claude-fable-5-1[1m]` → `claude-fable-5-1`) — self-resolution
+  decides only what the live record may claim, never whether the verification
+  behind the window stays visible. A live observation alone never substantiates
+  a context window.
 - **The probe reproduces the runtime spawn exactly**: same executable, same
   credential-scoped environment, the same cwd a real turn uses, and the
   **canonical** model id both in `ANTHROPIC_MODEL` and in the in-session
@@ -111,8 +116,12 @@ level that model does not advertise.
   `exited_early` failed probes that had already succeeded, purely on whether the
   exit event beat the run's resolution. Only an abnormal exit fails a probe.
 - **Fanout is cancelled and drained, under one catalog deadline.** The first
-  worker failure aborts its siblings through a shared controller, and every
-  worker is awaited (`allSettled`) so no session or child outlives the call. A
+  worker failure aborts its siblings through a shared controller **at the moment
+  it fails** — not after the drain, which could no longer reach a sibling still
+  running and left a mute wrapper holding its full session budget — and only
+  then is every worker awaited (`allSettled`) so no session or child outlives
+  the call. The caller sees the first genuine failure, not a sibling's derived
+  cancellation. A
   single `overallTimeoutMs` bounds the whole collection; the per-session
   `timeoutMs` still bounds one session and is clamped by whatever catalog budget
   remains, so neither can silently widen the other.

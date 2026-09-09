@@ -251,7 +251,6 @@ export function makeClaudeProfile(opts: {
           const models = mergeClaudeCatalogModels({
             probe,
             overlay: CLAUDE_VERIFIED_OVERLAY,
-            nativeContextWindow: lookupClaudeNativeContextWindow,
             displayNames: configuredLabels,
             effortMechanism: catalogEffort.mechanism,
             // The overlay is filtered to THIS profile's credential scope, so an

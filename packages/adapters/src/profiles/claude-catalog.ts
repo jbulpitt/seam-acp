@@ -337,6 +337,24 @@ async function withProbeSession<T>(opts: {
           ),
         ]);
       }, "session");
+      // CONNECTION phase. `ClientSideConnection` exposes no close/dispose — an
+      // ACP connection IS its stream — so closing the connection means ending
+      // the writable side (the normal client disconnect) and awaiting the
+      // transport to finish, after the session close has had its turn.
+      handle.onClose(async (signal) => {
+        await new Promise<void>((resolve) => {
+          if (handle.stdin.writableEnded) { resolve(); return; }
+          signal.addEventListener("abort", () => resolve(), { once: true });
+          handle.stdin.end(() => resolve());
+        });
+        await new Promise<void>((resolve) => {
+          if (!handle.stdout.readable) { resolve(); return; }
+          signal.addEventListener("abort", () => resolve(), { once: true });
+          handle.stdout.once("end", () => resolve());
+          handle.stdout.once("close", () => resolve());
+          handle.stdout.resume();
+        });
+      }, "connection");
       try {
         return await opts.read({
           options: configOptions(session.configOptions),
@@ -404,6 +422,12 @@ export async function probeClaudeCatalog(options: {
   modelEnv?: (canonicalModelId: string) => NodeJS.ProcessEnv;
   timeoutMs?: number;
   concurrency?: number;
+  /**
+   * ONE deadline for the entire catalog collection, across every model and
+   * every concurrency wave. `timeoutMs` bounds a single session; without this
+   * a model-count fanout has no overall bound.
+   */
+  overallTimeoutMs?: number;
   /** Cancels the whole probe, including any in-flight session (#236). */
   signal?: AbortSignal;
 }): Promise<ClaudeCatalogProbe> {
@@ -412,10 +436,31 @@ export async function probeClaudeCatalog(options: {
   const cwd = options.cwd ?? process.cwd();
   const baseEnv = options.env ?? process.env;
   const timeoutMs = options.timeoutMs ?? 45_000;
+  // ONE deadline for the whole catalog, not one per process. A per-session
+  // timeout that restarts for every model means N models x C waves has no
+  // bound at all, so a slow wrapper could stall a refresh indefinitely while
+  // each individual session stayed "within budget".
+  const deadlineMs = options.overallTimeoutMs ?? Math.max(timeoutMs, timeoutMs * 4);
+  const started = Date.now();
+  /**
+   * Budget for ONE session: the per-session bound, further clamped by whatever
+   * remains of the catalog budget. Using the remaining catalog budget alone
+   * would silently widen a caller's explicit per-session timeout.
+   */
+  const sessionBudget = (): number =>
+    Math.max(1, Math.min(timeoutMs, deadlineMs - (Date.now() - started)));
+  // Shared cancellation: the caller's signal, the catalog deadline, and the
+  // first worker failure all abort every sibling session through one channel.
+  const controller = new AbortController();
+  const onOuterAbort = (): void => controller.abort();
+  options.signal?.addEventListener("abort", onOuterAbort, { once: true });
+  const deadlineTimer = setTimeout(() => controller.abort(), deadlineMs);
+  deadlineTimer.unref?.();
 
+  try {
   const base = await withProbeSession({
-    cli, env: baseEnv, cwd, timeoutMs,
-    ...(options.signal ? { signal: options.signal } : {}),
+    cli, env: baseEnv, cwd, timeoutMs: sessionBudget(),
+    signal: controller.signal,
     read: async (session) => {
       const modelOption = selectOption(session.options, "model");
       if (!modelOption) throw new Error("claude-agent-acp advertised no model config option");
@@ -439,32 +484,50 @@ export async function probeClaudeCatalog(options: {
   let cursor = 0;
   const worker = async (): Promise<void> => {
     while (cursor < pending.length) {
-      if (options.signal?.aborted) return;
+      if (controller.signal.aborted) return;
       const entry = pending[cursor++]!;
       // Canonical identity, because that is what a catalog selection spawns
       // with — the raw advertised value never reaches a real turn.
       const canonical = canonicalClaudeModelId(entry.value);
       const env = options.modelEnv ? options.modelEnv(canonical) : baseEnv;
       const probed = await withProbeSession({
-        cli, env, cwd, timeoutMs,
-        ...(options.signal ? { signal: options.signal } : {}),
+        cli, env, cwd, timeoutMs: sessionBudget(),
+        signal: controller.signal,
         read: async (session) => {
-          // `ANTHROPIC_MODEL` forwarding only covers canonical ids. An ALIAS
-          // (`default`, `opus[1m]`, `haiku`) is not selected by the
-          // environment, so a fresh session comes up on whatever the wrapper
-          // prefers — measured: `sonnet`. Reading that session as if it were
-          // the alias publishes one model's capabilities under another's name.
-          // Select it explicitly, ONCE, in this session that has selected
-          // nothing else; that is what keeps the observation isolated.
+          // Select the value the PUBLISHED RUNTIME BINDING uses — the canonical
+          // id — not the raw advertisement. `runtimeId`/`rawModel` are
+          // canonical, so a catalog-backed turn calls `setModel(canonical)`;
+          // measuring effort and defaults after selecting the suffixed
+          // advertisement instead would describe a selection runtime never
+          // makes. `ANTHROPIC_MODEL` forwarding has already registered the
+          // canonical id, so it is selectable here exactly as at runtime.
+          //
+          // An ALIAS (`default`, `opus[1m]`, `haiku`) canonicalizes to itself
+          // and is NOT selected by the environment, so a fresh session comes up
+          // on whatever the wrapper prefers — measured: `sonnet`. Reading that
+          // session as if it were the alias publishes one model's capabilities
+          // under another's name, so it is selected explicitly, ONCE, in a
+          // session that has selected nothing else.
           const current = selectOption(session.options, "model")?.currentValue;
-          const observed = current === entry.value ? session.options : await session.select(entry.value);
+          const observed = current === canonical ? session.options : await session.select(canonical);
           return readProbedModel(entry, observed);
         },
       });
       results.set(entry.value, probed);
     }
   };
-  await Promise.all(Array.from({ length: concurrency }, worker));
+  // allSettled, not all: a bare `Promise.all` rejects the moment one worker
+  // fails, returning while its siblings are still holding wrapper processes.
+  // Abort them, then AWAIT every one so no session or child outlives this call.
+  const settled = await Promise.allSettled(Array.from({ length: concurrency }, worker));
+  const failure = settled.find((entry) => entry.status === "rejected");
+  if (failure && failure.status === "rejected") {
+    controller.abort();
+    throw failure.reason;
+  }
+  if (controller.signal.aborted) {
+    throw new Error(`claude-agent-acp catalog probe exceeded its ${deadlineMs}ms catalog deadline`);
+  }
 
   // Advertised order is the wrapper's own preference order; keep it stable so a
   // refresh that changes nothing produces an identical checksum.
@@ -472,6 +535,11 @@ export async function probeClaudeCatalog(options: {
     models: base.advertised.map((entry) => results.get(entry.value)!).filter(Boolean),
     wrapperCurrentValue: base.wrapperCurrentValue,
   };
+  } finally {
+    clearTimeout(deadlineTimer);
+    options.signal?.removeEventListener("abort", onOuterAbort);
+    controller.abort();
+  }
 }
 
 const EFFORT_DEFAULT = "default";
@@ -492,8 +560,6 @@ function normalizeEffortChoices(choices: ReadonlyArray<string>): string[] {
 export interface ClaudeCatalogMergeInput {
   probe: ClaudeCatalogProbe;
   overlay: ReadonlyArray<ClaudeVerifiedOverlayEntry>;
-  /** Verified native window for a canonical id, or undefined when unproven. */
-  nativeContextWindow: (modelId: string) => number | undefined;
   /** Operator-configured labels, keyed by model id. Display text only. */
   displayNames?: ReadonlyMap<string, string>;
   /**
@@ -540,7 +606,14 @@ export function mergeClaudeCatalogModels(input: ClaudeCatalogMergeInput): Manife
     // That is not a resolution, so we never manufacture one: we quote the latest
     // verified resolution with its provenance, or say plainly that it is unknown.
     const selfResolved = Boolean(probed.resolvedValue && probed.resolvedValue !== probed.advertisedId);
-    const window = input.nativeContextWindow(id) ?? null;
+    // SCOPE-TRUTHFUL context. The window may come ONLY from a verification
+    // captured on the ACTIVE credential scope — i.e. from the already
+    // scope-filtered overlay. Reading a global table here handed an alternate
+    // credential profile the default account's 1M window and then published it
+    // inside a `live-observation`, as though ACP had reported it. ACP reports
+    // no window at discovery, so absent matching-scope verification this is
+    // null and the row is honestly unresolved.
+    const window = verified?.contextWindow ?? null;
     const effortChoices = probed.effortChoices.length ? normalizeEffortChoices(probed.effortChoices) : [EFFORT_DEFAULT];
     const selectionDefault =
       probed.effortCurrent && effortChoices.includes(probed.effortCurrent) ? probed.effortCurrent : EFFORT_DEFAULT;
@@ -556,7 +629,7 @@ export function mergeClaudeCatalogModels(input: ClaudeCatalogMergeInput): Manife
       // this is what flows through config inspection, the status card, the
       // audit trail and the metadata join.
       evidence: liveEvidence({
-        probed, canonicalId: id, window, effortChoices, selectionDefault,
+        probed, canonicalId: id, effortChoices, selectionDefault,
         verified, selfResolved, scopeRef: input.scopeRef,
       }),
       effort: {
@@ -673,7 +746,6 @@ export function claudeCredentialScope(configDir?: string): string {
 function liveEvidence(input: {
   probed: ClaudeProbedModel;
   canonicalId: string;
-  window: number | null;
   effortChoices: string[];
   selectionDefault: string;
   verified: ClaudeVerifiedOverlayEntry | undefined;
@@ -687,14 +759,15 @@ function liveEvidence(input: {
   const live: CatalogModelEvidence = {
     kind: "live-observation",
     source: "claude-agent-acp session config",
+    // No `context` here, ever. A live ACP session does not report a context
+    // window at discovery, so attaching one would attribute a verified-record
+    // fact to a live observation. The window travels on the verified record
+    // that actually established it.
     ...(input.scopeRef ? { scopeRef: input.scopeRef } : {}),
     // Only a GENUINE resolution is recorded. The wrapper echoing an alias back
     // at us (`default` -> `default`) is not one, so nothing is manufactured.
     ...(input.selfResolved && input.probed.resolvedValue
       ? { resolvedModel: input.probed.resolvedValue }
-      : {}),
-    ...(input.window !== null
-      ? { context: { native: input.window, method: "verified-window-table" } }
       : {}),
     effort: {
       choices: input.effortChoices,

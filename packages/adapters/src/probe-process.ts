@@ -247,6 +247,8 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   let thrownCode: ProbeErrorCode | undefined;
   /** Set once a post-spawn `error` is seen, which is NOT a spawn failure. */
   let postSpawnError: Error | undefined;
+  /** Set when the child ended normally; not a failure, but it IS reaped. */
+  let cleanExit = false;
   /** True once the OS has actually produced the process. */
   let spawned = child.pid !== undefined;
   /** The caller's own promise, so finalization can give it a bounded chance
@@ -316,6 +318,15 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   const swallowLateError = (): void => {};
   child.on("error", swallowLateError);
   const onExit = (code: number | null, signalCode: NodeJS.Signals | null): void => {
+    // A CLEAN exit (code 0, no signal) is ordinary teardown — a short-lived
+    // wrapper ending after its work, or ending because we closed its transport.
+    // Treating it as `exited_early` failed probes that had already succeeded,
+    // purely on whether the exit event beat the run's resolution to the race.
+    // Only an ABNORMAL exit is a failure worth unblocking racers for.
+    if (code === 0 && signalCode === null) {
+      cleanExit = true;
+      return;
+    }
     // Raw child stderr is NEVER attached; only its redacted tail.
     const tail = redact(stderrTail).trim();
     fail(new ProbeError(
@@ -465,7 +476,7 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     child.stdout.removeListener("end", onStdoutEnd);
     child.stderr.removeListener("data", onStderr);
     if (!stdout.destroyed) stdout.end();
-    const reaped = await terminate(child, killGraceMs);
+    const reaped = cleanExit || (await terminate(child, killGraceMs));
     // The protective error listener is the LAST thing removed, so a stray
     // `error` emitted during termination cannot become an uncaught exception.
     child.removeListener("error", swallowLateError);

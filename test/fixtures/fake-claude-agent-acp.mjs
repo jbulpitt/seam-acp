@@ -18,6 +18,9 @@
  *   FAKE_ACP_FAIL           when "1", exit non-zero immediately
  *   FAKE_ACP_SILENT_INIT    never answer `initialize` (stays alive, mute)
  *   FAKE_ACP_SILENT_CLOSE   answer everything EXCEPT `session/close`
+ *   FAKE_ACP_EXIT_ON_CLOSE  answer `session/close`, then exit(0) immediately —
+ *                           a NORMAL teardown, which must not be reported as an
+ *                           early exit
  */
 import { appendFileSync } from "node:fs";
 
@@ -114,6 +117,11 @@ process.stdin.on("data", (chunk) => {
       reply(message.id, { configOptions: configOptions() });
     } else {
       reply(message.id, {});
+      if (message.method === "session/close" && process.env.FAKE_ACP_EXIT_ON_CLOSE === "1") {
+        // A wrapper that ends once its session is closed. This is ordinary
+        // teardown, not a failure.
+        setTimeout(() => process.exit(0), 5);
+      }
     }
   }
 });

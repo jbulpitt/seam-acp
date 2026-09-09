@@ -17,6 +17,7 @@ import {
   CLAUDE_VERIFIED_OVERLAY,
   canonicalClaudeModelId,
   makeClaudeProfile,
+  manifestCatalogSource,
   mergeClaudeCatalogModels,
   probeClaudeCatalog,
   resolveClaudeDefaultModel,
@@ -504,12 +505,14 @@ describe("#232 probe isolation against a fake ACP agent", () => {
     }
     for (const [, selected] of selectionsByPid) expect(selected).toHaveLength(1);
     // Every advertised model is observed, each under its own identity.
-    // `claude-fable-5-1[1m]` is now selected explicitly too: its environment
-    // forwards the CANONICAL id, so the session comes up on `claude-fable-5-1`
-    // and the advertised suffixed value still has to be selected — exactly what
-    // a real turn does (canonical env, then setModel of the stored value).
+    // `claude-fable-5-1[1m]` needs NO explicit select: its environment forwards
+    // the CANONICAL id, the session therefore comes up already on
+    // `claude-fable-5-1`, and the canonical id is exactly what the published
+    // runtime binding uses. Selecting the suffixed advertisement instead would
+    // measure a selection runtime never performs. The aliases still need one,
+    // because the environment does not select them.
     expect([...selectionsByPid.values()].flat().sort()).toEqual(
-      ["claude-fable-5-1[1m]", "default", "haiku", "opus[1m]"].sort()
+      ["default", "haiku", "opus[1m]"].sort()
     );
   });
 
@@ -740,4 +743,235 @@ describe("#232 the probe uses the shared bounded lifecycle", () => {
     expect(source).not.toContain("probeTimeout");
     expect(source).toContain("runBoundedProbe");
   });
+});
+
+describe("#232 QA fixtures — direct regressions", () => {
+  /** QA blocker 1: default-scope context relabeled as alternate live evidence. */
+  it("an unresolved alias on an ALTERNATE scope has null context and no borrowed window", () => {
+    const probe: ClaudeCatalogProbe = {
+      wrapperCurrentValue: "sonnet",
+      models: [probed({ advertisedId: "default", advertisedName: "Default" })],
+    };
+    const merged = mergeClaudeCatalogModels({
+      probe,
+      overlay: CLAUDE_VERIFIED_OVERLAY,
+      effortMechanism: "meta",
+      credentialScope: "configured",
+      scopeRef: "a".repeat(64),
+    });
+    const row = merged[0]!;
+    // The QA reproduction emitted context.native = 1_000_000 here, sourced from
+    // the DEFAULT account's verification table, inside a live-observation
+    // carrying the alternate scopeRef.
+    expect(row.context).toEqual({ native: null, maximum: null, effective: null });
+    expect(row.contextLimit).toBeUndefined();
+    for (const record of row.evidence ?? []) {
+      expect(record.kind).toBe("live-observation");
+      // A live ACP session reports no window; attaching one would attribute a
+      // verified-record fact to a live observation.
+      expect(record.context).toBeUndefined();
+    }
+    expect(JSON.stringify(row)).not.toContain("1000000");
+  });
+
+  it("the SAME probe on the matching scope still carries its verified window", () => {
+    const probe: ClaudeCatalogProbe = {
+      wrapperCurrentValue: "sonnet",
+      models: [probed({ advertisedId: "default", advertisedName: "Default" })],
+    };
+    const merged = mergeClaudeCatalogModels({
+      probe,
+      overlay: CLAUDE_VERIFIED_OVERLAY,
+      effortMechanism: "meta",
+      credentialScope: "default",
+      scopeRef: "b".repeat(64),
+    });
+    expect(merged[0]!.context.native).toBe(1_000_000);
+    // …and the window is attributed to the record that established it.
+    const verified = merged[0]!.evidence!.find((r) => r.kind === "verified-record")!;
+    expect(verified.context?.native).toBe(1_000_000);
+    const live = merged[0]!.evidence!.find((r) => r.kind === "live-observation")!;
+    expect(live.context).toBeUndefined();
+  });
+
+  /** QA blocker 2: discovery selected a value runtime never uses. */
+  it("discovery selects exactly the value the published runtime binding uses", async () => {
+    const probe: ClaudeCatalogProbe = {
+      wrapperCurrentValue: "sonnet",
+      models: [probed({ advertisedId: "claude-fable-5-1[1m]", advertisedName: "Fable" })],
+    };
+    const models = mergeClaudeCatalogModels({
+      probe, overlay: [], effortMechanism: "meta", credentialScope: "default",
+    });
+    const candidate = await manifestCatalogSource({
+      provider: "anthropic",
+      defaultModel: models[0]!.modelId,
+      models: () => models,
+      adapterVersion: 4,
+    }).fetch();
+    const published = candidate.models[0]!;
+    // The binding runtime spawns and setModel()s with.
+    expect(published.runtimeId).toBe("claude-fable-5-1");
+    expect(published.bindings[0]!.rawModel).toBe("claude-fable-5-1");
+    // The raw advertisement stays resolvable as an alias, but is not the
+    // selection identity.
+    expect(published.aliases).toEqual(["claude-fable-5-1[1m]"]);
+    expect(canonicalClaudeModelId("claude-fable-5-1[1m]")).toBe(published.runtimeId);
+  });
+
+  /** QA blocker 3: clean code-0 teardown reclassified as a failure. */
+  it("a clean code-0 exit during completion is NOT exited_early", async () => {
+    const { runBoundedProbe } = await import("@seam/adapters");
+    const { EventEmitter } = await import("node:events");
+    const { PassThrough } = await import("node:stream");
+    const emitter = new EventEmitter();
+    const child = emitter as unknown as Record<string, unknown>;
+    child.pid = 4242;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    queueMicrotask(() => emitter.emit("spawn"));
+
+    const value = await runBoundedProbe<string>({
+      executable: "x",
+      spawnOverride: () => child as never,
+      timeoutMs: 5_000,
+      killGraceMs: 50,
+      run: async () => {
+        // A short-lived wrapper ends cleanly as part of ordinary teardown,
+        // BEFORE the run's own resolution is delivered. The QA reproduction
+        // turned this into `exited_early` and failed a successful probe.
+        child.exitCode = 0;
+        emitter.emit("exit", 0, null);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return "collected";
+      },
+    });
+    expect(value).toBe("collected");
+  });
+
+  it("an ABNORMAL exit is still exited_early", async () => {
+    const { runBoundedProbe } = await import("@seam/adapters");
+    const { EventEmitter } = await import("node:events");
+    const { PassThrough } = await import("node:stream");
+    const emitter = new EventEmitter();
+    const child = emitter as unknown as Record<string, unknown>;
+    child.pid = 4243;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    queueMicrotask(() => emitter.emit("spawn"));
+
+    await expect(
+      runBoundedProbe<string>({
+        executable: "x",
+        spawnOverride: () => child as never,
+        timeoutMs: 5_000,
+        killGraceMs: 50,
+        run: async () => {
+          child.exitCode = 7;
+          emitter.emit("exit", 7, null);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return "unreachable";
+        },
+      })
+    ).rejects.toMatchObject({ code: "exited_early" });
+  });
+
+  it("a wrapper that exits cleanly right after session/close still succeeds", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-232-clean-"));
+    try {
+      const log = path.join(dir, "acp.log");
+      fs.writeFileSync(log, "");
+      const env = (): NodeJS.ProcessEnv => ({
+        ...process.env,
+        FAKE_ACP_LOG: log,
+        FAKE_ACP_MODELS: JSON.stringify([{ value: "sonnet", name: "Sonnet" }]),
+        FAKE_ACP_CURRENT: "sonnet",
+        FAKE_ACP_EXIT_ON_CLOSE: "1",
+        FAKE_ACP_EFFORT: JSON.stringify({ sonnet: FULL_EFFORT }),
+      });
+      const result = await probeClaudeCatalog({
+        cliPath: FAKE_ACP, cwd: dir, env: env(), modelEnv: env, timeoutMs: 15_000,
+      });
+      expect(result.models.map((m) => m.advertisedId)).toEqual(["sonnet"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  /** QA blocker 3: fanout must cancel and drain siblings, under one deadline. */
+  it("one worker failure cancels siblings and leaves no wrapper behind", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-232-fanout-"));
+    try {
+      const log = path.join(dir, "acp.log");
+      fs.writeFileSync(log, "");
+      const base = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
+        ...process.env,
+        FAKE_ACP_LOG: log,
+        FAKE_ACP_MODELS: JSON.stringify(LIVE_ADVERTISED),
+        FAKE_ACP_CURRENT: "sonnet",
+        FAKE_ACP_EFFORT: JSON.stringify({ sonnet: FULL_EFFORT }),
+        ...over,
+      });
+      await expect(
+        probeClaudeCatalog({
+          cliPath: FAKE_ACP,
+          cwd: dir,
+          env: base(),
+          // Every per-model session refuses to start; the first failure must
+          // abort the rest rather than leaving them running behind a rejection.
+          modelEnv: () => base({ FAKE_ACP_FAIL: "1" }),
+          timeoutMs: 5_000,
+          concurrency: 2,
+        })
+      ).rejects.toBeTruthy();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const pids = [...new Set(
+        fs.readFileSync(log, "utf8").split("\n").filter(Boolean)
+          .map((line) => JSON.parse(line) as { pid?: number })
+          .flatMap((row) => (typeof row.pid === "number" ? [row.pid] : []))
+      )];
+      for (const pid of pids) {
+        expect(() => process.kill(pid, 0)).toThrow();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("enforces ONE catalog-wide deadline across concurrency waves", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-232-deadline-"));
+    try {
+      const log = path.join(dir, "acp.log");
+      fs.writeFileSync(log, "");
+      const env = (): NodeJS.ProcessEnv => ({
+        ...process.env,
+        FAKE_ACP_LOG: log,
+        FAKE_ACP_MODELS: JSON.stringify(LIVE_ADVERTISED),
+        FAKE_ACP_CURRENT: "sonnet",
+        FAKE_ACP_SILENT_INIT: "1",
+      });
+      const started = Date.now();
+      await expect(
+        probeClaudeCatalog({
+          cliPath: FAKE_ACP, cwd: dir, env: env(), modelEnv: env,
+          // A per-session budget alone would restart for every model; the
+          // catalog deadline is what bounds the whole collection.
+          timeoutMs: 10_000,
+          overallTimeoutMs: 400,
+          concurrency: 1,
+        })
+      ).rejects.toBeTruthy();
+      expect(Date.now() - started).toBeLessThan(9_000);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

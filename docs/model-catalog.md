@@ -82,10 +82,21 @@ level that model does not advertise.
   published only on a refresh running under that scope. An alternate credential
   profile therefore publishes only its own live list — fail closed, rather than
   inheriting evidence nobody measured there.
+- **Context windows are scope-truthful.** A row's window comes ONLY from a
+  verification captured on the ACTIVE scope. ACP reports no context window at
+  discovery, so a live row without matching-scope verification publishes a null
+  window and says so. A live-observation record therefore never carries a
+  `context`: the window travels on the verified record that established it,
+  rather than a global table's default-account value being relabelled as an
+  alternate scope's live measurement.
 - **The probe reproduces the runtime spawn exactly**: same executable, same
   credential-scoped environment, the same cwd a real turn uses, and the
-  **canonical** model id in `ANTHROPIC_MODEL` (the value a catalog selection
-  spawns with), with the advertised value then selected in-session. Using the
+  **canonical** model id both in `ANTHROPIC_MODEL` and in the in-session
+  selection — because `runtimeId`/`rawModel` are canonical, so a catalog-backed
+  turn calls `setModel(canonical)`. Selecting the raw advertisement instead
+  (`claude-fable-5-1[1m]`) would measure effort and defaults after a selection
+  runtime never performs. An alias canonicalizes to itself and is not selected
+  by the environment, so it is still selected explicitly, once, per session. Using the
   runtime cwd rather than a temp directory makes a refresh noticeably slower —
   the wrapper scans the project on session start — which is the accepted cost
   of observing what a real turn observes.
@@ -93,7 +104,18 @@ level that model does not advertise.
   output, phased session-before-connection close with an AbortSignal, sealed
   registration, SIGTERM→SIGKILL with an awaited exit, redacted structured
   errors, and cancellation. The collector keeps no private timeout or cleanup
-  path to drift from it.
+  path to drift from it. The connection phase ends the transport and awaits it:
+  `ClientSideConnection` exposes no close, so an ACP connection IS its stream.
+- **A clean exit is not a failure.** A code-0 exit with no signal is ordinary
+  teardown — a short-lived wrapper ending after its work. Classifying it as
+  `exited_early` failed probes that had already succeeded, purely on whether the
+  exit event beat the run's resolution. Only an abnormal exit fails a probe.
+- **Fanout is cancelled and drained, under one catalog deadline.** The first
+  worker failure aborts its siblings through a shared controller, and every
+  worker is awaited (`allSettled`) so no session or child outlives the call. A
+  single `overallTimeoutMs` bounds the whole collection; the per-session
+  `timeoutMs` still bounds one session and is clamped by whatever catalog budget
+  remains, so neither can silently widen the other.
 - **Nothing is inferred from a label, a display name, an id substring, or a
   model's self-report.** Context windows come from the JSONL-verified table
   only; a live model with no verified window publishes a null window rather than

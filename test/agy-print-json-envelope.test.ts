@@ -3,7 +3,7 @@ import {
   parseAgyPrintJsonEnvelope,
   readAgyJsonSchemaMeta,
   SEAM_AGY_JSON_SCHEMA_META,
-} from "../packages/adapters/src/profiles/agy-old.js";
+} from "../packages/adapters/src/profiles/agy.js";
 import {
   coercePinnedFacts,
   isPinnedFacts,

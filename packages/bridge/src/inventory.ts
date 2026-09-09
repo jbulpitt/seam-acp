@@ -8,8 +8,8 @@ import { createHash } from "node:crypto";
 import { accessSync, constants } from "node:fs";
 import {
   AGENT_ADAPTER_VERSION,
+  makeAgyPackageProfile,
   makeAgyProfile,
-  makeAgyOldProfile,
   makeClaudeProfile,
   makeCodexProfile,
   makeCopilotProfile,
@@ -124,8 +124,8 @@ export function loadHostAdapters(
   const agyVersion = env.AGY_VERSION?.trim();
   const agySha256 = env.AGY_SHA256?.trim();
   const agyDefaultModel = env.AGY_DEFAULT_MODEL?.trim();
-  const agyOldBin = env.AGY_OLD_CLI_PATH?.trim();
-  const agyEnabled = env.AGY_ENABLED === "true";
+  const agyNativeBin = env.AGY_CLI_PATH?.trim() || env.AGY_OLD_CLI_PATH?.trim() || agyBin;
+  const agyEnabled = env.AGY_PACKAGE_ENABLED === "true";
   const agyRiskAcknowledged = env.AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED === "true";
   const factories: Array<{ id: string; bin: string; make: () => AgentAdapter }> = [
     {
@@ -163,9 +163,9 @@ export function loadHostAdapters(
       }),
     },
     ...(agyEnabled && agyAcpPath && agyBin && agyVersion && agySha256 && agyDefaultModel && agyRiskAcknowledged ? [{
-      id: "agy",
+      id: "agy-package",
       bin: agyAcpPath,
-      make: () => makeAgyProfile({
+      make: () => makeAgyPackageProfile({
         acpPath: agyAcpPath,
         agyBin,
         agyVersion,
@@ -180,12 +180,12 @@ export function loadHostAdapters(
         permissionRiskAcknowledged: true,
       }),
     }] : []),
-    ...(env.AGY_OLD_ROLLBACK_ENABLED === "true" && agyOldBin ? [{
-      id: "agy-old",
-      bin: agyOldBin,
-      make: () => makeAgyOldProfile({
-        cliPath: agyOldBin,
-        defaultModel: agyDefaultModel || "antigravity",
+    ...((env.AGY_ENABLED === "true" || env.AGY_OLD_ROLLBACK_ENABLED === "true") && agyNativeBin && path.isAbsolute(agyNativeBin) && agyDefaultModel ? [{
+      id: "agy",
+      bin: agyNativeBin,
+      make: () => makeAgyProfile({
+        cliPath: agyNativeBin,
+        defaultModel: agyDefaultModel,
       }),
     }] : []),
     {
@@ -234,8 +234,8 @@ export function inventoryFromAdapters(
   const bins: Record<string, string> = {
     copilot: copilotCmd,
     claude: env.CLAUDE_CLI_PATH ?? "claude-agent-acp",
-    agy: env.AGY_ACP_BIN ?? "antigravity-acp",
-    "agy-old": env.AGY_OLD_CLI_PATH ?? "agy-old-disabled",
+    "agy-package": env.AGY_ACP_BIN ?? "antigravity-acp",
+    agy: env.AGY_CLI_PATH?.trim() || env.AGY_OLD_CLI_PATH?.trim() || env.AGY_BIN?.trim() || "agy",
     codex: "codex-acp",
     grok: env.GROK_CLI_PATH?.trim() || "grok",
   };

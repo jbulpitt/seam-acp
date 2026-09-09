@@ -286,8 +286,12 @@ const Schema = z.object({
   CLAUDE_VERTEX_PROJECT_ID: z.string().optional(),
   CLAUDE_VERTEX_REGION: z.string().default("us-central1"),
 
-  /** Package-backed Antigravity ACP is fail-closed until explicitly enabled. */
+  /** Native Seam Antigravity adapter (public agy identity). */
   AGY_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
+  /** Optional package-backed implementation; never enabled by AGY_ENABLED. */
+  AGY_PACKAGE_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
+  /** Owner-approved one-time local native restoration, applied before work admission. */
+  AGY_NATIVE_RESTORE: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
   /** Exact compiled antigravity-acp v1.1.0 executable for this host. */
   AGY_ACP_BIN: z.string().optional(),
   /** Exact authenticated agy executable; forwarded to the wrapper as AGY_BIN. */
@@ -307,16 +311,16 @@ const Schema = z.object({
   AGY_CREDENTIAL_SCOPE: z.string().default("antigravity-oauth:default"),
   /** Security acceptance: v1.1.0 unconditionally runs agy with its bypass flag. */
   AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
-  /** Operator-only rollback. Never enables or substitutes itself automatically. */
+  /** Deprecated native-adapter enable alias, retained for existing host config. */
   AGY_OLD_ROLLBACK_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
   AGY_OLD_CLI_PATH: z.string().optional(),
-  /** Deprecated legacy alias, accepted only by explicitly enabled agy-old. */
+  /** Exact executable for the native agy adapter. */
   AGY_CLI_PATH: z.string().optional(),
   /** Exact model id; must be present in fresh discovery. */
   AGY_DEFAULT_MODEL: z.string().default(""),
-  /** Retained for config compatibility; never used as fresh catalog evidence. */
+  /** Optional native static catalog; the package collector does not consume it. */
   AGY_MODELS: ModelsListSchema,
-  /** Sandboxed Agy model used by the tool-mediated image inspector. */
+  /** Package-backed model used by the tool-mediated image inspector. */
   AGY_VISION_MODEL: z.string().default("gemini-3.7-flash-high"),
 
   /**
@@ -1168,7 +1172,7 @@ export function loadConfig(): Config {
   }
   cfg.REPOS_ROOT = reposRoot;
 
-  if (cfg.AGY_ENABLED) {
+  if (cfg.AGY_PACKAGE_ENABLED) {
     const missing = [
       ["AGY_ACP_BIN", cfg.AGY_ACP_BIN],
       ["AGY_BIN", cfg.AGY_BIN],
@@ -1179,7 +1183,7 @@ export function loadConfig(): Config {
       ["AGY_DEFAULT_MODEL", cfg.AGY_DEFAULT_MODEL],
     ].filter(([, value]) => !value).map(([name]) => name);
     if (missing.length) {
-      throw new Error(`Invalid configuration: AGY_ENABLED requires ${missing.join(", ")}`);
+      throw new Error(`Invalid configuration: AGY_PACKAGE_ENABLED requires ${missing.join(", ")}`);
     }
     for (const [name, value] of [
       ["AGY_ACP_BIN", cfg.AGY_ACP_BIN!],
@@ -1230,9 +1234,16 @@ export function loadConfig(): Config {
     cfg.AGY_ACP_STATE_DIR = effectiveStateDir;
     cfg.AGY_ACP_CWD = cfg.AGY_ACP_CWD ?? cfg.REPOS_ROOT;
   }
-  if (cfg.AGY_OLD_ROLLBACK_ENABLED && !cfg.AGY_OLD_CLI_PATH) {
-    throw new Error("Invalid configuration: AGY_OLD_ROLLBACK_ENABLED requires exact AGY_OLD_CLI_PATH");
+  if (cfg.AGY_ENABLED || cfg.AGY_OLD_ROLLBACK_ENABLED) {
+    cfg.AGY_CLI_PATH = cfg.AGY_CLI_PATH?.trim() || cfg.AGY_OLD_CLI_PATH?.trim() || cfg.AGY_BIN?.trim();
+    if (!cfg.AGY_CLI_PATH || !path.isAbsolute(cfg.AGY_CLI_PATH)) {
+      throw new Error("Invalid configuration: native agy requires an absolute AGY_CLI_PATH (AGY_OLD_CLI_PATH / AGY_BIN accepted as aliases)");
+    }
+    if (!cfg.AGY_DEFAULT_MODEL.trim()) {
+      throw new Error("Invalid configuration: native agy requires AGY_DEFAULT_MODEL");
+    }
   }
+  if (cfg.AGY_NATIVE_RESTORE && !cfg.AGY_ENABLED) throw new Error("AGY_NATIVE_RESTORE requires native AGY_ENABLED");
 
   // #12: DEFAULT_AGENT naming a RETIRED agent is a configuration error, refused
   // here rather than at the first turn. This is the bot-wide default, so every

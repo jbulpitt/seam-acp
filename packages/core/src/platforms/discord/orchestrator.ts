@@ -74,6 +74,7 @@ import type { AgentProfile } from "@seam/adapters";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
+import { rebuildMigratedAgySession } from "../../core/agy-identity-migration.js";
 import type { WakeManager } from "../../core/wake/manager.js";
 import type { WakeEvent, WakeScheduleRequest } from "../../core/wake/types.js";
 import type { ParkedPromptManager } from "../../core/parked-prompts/manager.js";
@@ -3306,6 +3307,14 @@ export class Orchestrator {
     // existing finally below clears it even if runtime startup fails.
     if (msg.authorId) this.currentAuthorIds.set(record.channelRef, msg.authorId);
     try {
+      if (this.store.needsAgyIdentityRebuild(record.id)) {
+        const binding = this.router.describeConfig(record);
+        await rebuildMigratedAgySession(this.store, record,
+          { agent: binding.agent.value, location: binding.location.value },
+          () => this.rebuildThreadFromDiscord(record));
+        this.assertQueueFence(queueFence);
+        Object.assign(record, this.store.get(record.id));
+      }
       let activeRuntime = await this.router.getOrStartRuntime(record);
       this.assertQueueFence(queueFence);
       // #37: report what the LIVE session resolved Fast to, never what was

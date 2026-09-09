@@ -1,20 +1,53 @@
 # Package-backed Antigravity ACP
 
-Issue #228 cuts the public agent ID `agy` over to a reviewed
-[`antigravity-acp`](https://github.com/shubzkothekar/antigravity-acp) binary.
-The former in-process implementation is `agy-old`; it is a temporary,
-operator-only rollback profile and is disabled unless
-`AGY_OLD_ROLLBACK_ENABLED=true` and `AGY_OLD_CLI_PATH` names its executable.
-Failure of `agy` never activates `agy-old`.
+The reviewed [`antigravity-acp`](https://github.com/shubzkothekar/antigravity-acp)
+binary now registers as **`agy-package`**, enabled by `AGY_PACKAGE_ENABLED=true`.
+The original native Seam implementation is restored as **`agy`**, enabled by
+`AGY_ENABLED=true` with an absolute `AGY_CLI_PATH` and explicit default model.
+Neither profile activates the other on failure. `agy-old` is no longer registered;
+its deprecated enable/path variables are accepted only as native configuration
+aliases. Package artifacts, account state, pins and risk gates are unchanged.
 
-Existing thread, channel, preset, schedule, naming, role, repository, and model
-records keep the public ID `agy`, so the cutover needs no database rewrite.
-The two wrappers use different session stores. A legacy handle is not present
-in `antigravity-acp`'s `~/.agy-acp/sessions.json`, so load returns
-`resource_not_found`. Seam clears only that failed ACP handle; the thread's
-configuration and Discord history remain available for a fresh session or
-deterministic rebuild. `agy-old` retains its own durable handle when rollback is
-explicitly selected.
+This reverses the public identity choice made in #228; it does not make the two
+implementations' session handles interchangeable. Before deploying over the
+#228/#251 build, inventory local `agy` and `agy-old` bindings and their backend
+ownership. Package conversations can retain their backend by moving the binding
+to `agy-package`; switching them to native `agy` may require a fresh ACP session
+or explicit Discord reconstruction. Do not silently reinterpret handles or modify
+remote bindings. The operator must approve the migration policy before rollout.
+
+### Approved native restoration (2026-09-09)
+
+The owner selected switching existing local threads to native `agy`, retaining
+Discord history and configuration, and rebuilding incompatible ACP sessions.
+`AGY_NATIVE_RESTORE=true` enables a one-time startup migration before catalog
+collection or work admission. Native handles found in the current or legacy map
+are preserved; package/unrecognized nonempty handles are archived in SQLite
+before-images and cleared. Unbound sessions remain unbound. Remote rows and
+unrelated agents are excluded. Malformed maps, ambiguous ownership and conflicting
+overlays fail closed; explicit `agy-old` presets require separate config migration.
+
+The transaction records a completion marker and per-thread rebuild requirements.
+Retries do not reapply the migration. The next admitted thread turn uses the
+existing Discord reconstruction/compare-and-swap path before the user's prompt;
+failed reconstruction retains the marker and cannot silently start a blank
+conversation. No startup prompt fanout is scheduled. The migration only updates
+the agent/ACP columns; model, role, repo, timestamps and all config bytes stay
+unchanged. Rebuilt context remains subject to normal history availability and
+context-budget limits; this is not recovery of private provider-only thinking.
+
+Offline rollback is available through `SessionStore.rollbackAgyIdentityMigration`:
+it restores all before-images atomically only when every migrated row still
+matches its post-migration snapshot. A changed or rebuilt session refuses the
+entire rollback. Never invoke rollback while the running bot can admit work.
+Original package/native maps and conversation stores are neither modified nor
+deleted. Keep their data until the owner authorizes any later cleanup.
+
+The native implementation preserves its durable handle during reconstruction;
+package invalidation clears only its ACP handle, not Discord history/config.
+See [the native modernization backlog](agy-modernization-backlog.md) for the
+restoration gate and separately scoped upgrades. This package remains optional;
+its generated decoder does not provide native planner-thinking parity.
 
 ## Immutable supply chain
 

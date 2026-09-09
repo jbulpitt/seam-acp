@@ -17,7 +17,7 @@ import {
   buildAgyAcpEnvironment,
   createAgyAcpOutputFilter,
   createAgyRuntimeStderrFilter,
-  makeAgyProfile,
+  makeAgyPackageProfile,
   parseAgyModelsOutput,
   probeAgyPackageCatalog,
   reconcileAgyAcpModels,
@@ -371,13 +371,13 @@ describe("package-backed agy thought normalization", () => {
 
 describe("package-backed agy profile", () => {
   it("requires explicit permission-risk acceptance", () => {
-    expect(() => makeAgyProfile(options({ permissionRiskAcknowledged: false })))
+    expect(() => makeAgyPackageProfile(options({ permissionRiskAcknowledged: false })))
       .toThrow(/dangerously-skip-permissions/);
   });
 
   it("constructs exact no-download local/bridge launch metadata without credentials", () => {
-    const profile = makeAgyProfile(options());
-    expect(profile.id).toBe("agy");
+    const profile = makeAgyPackageProfile(options());
+    expect(profile.id).toBe("agy-package");
     expect(profile.describe().runtime).toEqual(expect.objectContaining({
       executable: fakeWrapper,
       argv: [],
@@ -506,7 +506,7 @@ describe("package-backed agy profile", () => {
       modelId: i === 7 ? "gemini-3.7-pro-high" : `raw-model-${i}`,
       displayName: `Raw Model ${i}`,
     }));
-    const profile = makeAgyProfile(options({
+    const profile = makeAgyPackageProfile(options({
       catalogProbe: async () => ({
         agyVersion: "agy 1.1.20",
         wrapperVersion: "antigravity-acp 1.1.0",
@@ -536,16 +536,16 @@ describe("package-backed agy profile", () => {
   });
 
   it("rejects empty and missing-default candidates atomically", async () => {
-    const empty = makeAgyProfile(options({ catalogProbe: async () => ({ agyVersion: "agy 1.1.20", models: [] }) }));
+    const empty = makeAgyPackageProfile(options({ catalogProbe: async () => ({ agyVersion: "agy 1.1.20", models: [] }) }));
     await expect(empty.catalog.fetch()).rejects.toThrow(/empty/);
-    const drift = makeAgyProfile(options({
+    const drift = makeAgyPackageProfile(options({
       catalogProbe: async () => ({ agyVersion: "agy 1.1.20", models: [{ modelId: "other", displayName: "Other" }] }),
     }));
     await expect(drift.catalog.fetch()).rejects.toThrow(/does not resolve/);
   });
 
   it("rejects drift in the exact underlying AGY runtime version", async () => {
-    const drift = makeAgyProfile(options({
+    const drift = makeAgyPackageProfile(options({
       catalogProbe: async () => ({
         agyVersion: "agy 1.1.21",
         models: [{ modelId: "gemini-3.7-pro-high", displayName: "Gemini High" }],
@@ -561,7 +561,7 @@ describe("package-backed agy profile", () => {
       { modelId: "gemini-3.7-pro-high", displayName: "Gemini High" },
       { modelId: "claude-thinking", displayName: "Claude Thinking" },
     ];
-    const profile = makeAgyProfile(options({ catalogProbe: async () => ({ agyVersion: "agy 1.1.20", models }) }));
+    const profile = makeAgyPackageProfile(options({ catalogProbe: async () => ({ agyVersion: "agy 1.1.20", models }) }));
     const binding = { agentId: "agy", location: "local" };
     const service = new ModelCatalogService({
       store,
@@ -644,7 +644,7 @@ describe("fresh agy discovery is reconciled against ACP", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-stale-lkg-"));
     const store = new ModelCatalogStore(path.join(dir, "catalog.db"));
     let attempt = 0;
-    const profile = makeAgyProfile(options({
+    const profile = makeAgyPackageProfile(options({
       catalogProbe: async () => {
         attempt += 1;
         const rows = await reconcileAgyAcpModels({

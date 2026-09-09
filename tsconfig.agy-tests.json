@@ -7,6 +7,7 @@
     "test/agy-package-profile.test.ts",
     "test/agy-config.test.ts",
     "test/agy-cutover.test.ts",
+    "test/agy-identity-migration.test.ts",
     "test/agy-image-inspector.test.ts",
     "test/bridge-inventory.test.ts"
   ]

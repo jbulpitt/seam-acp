@@ -4,6 +4,7 @@ import os from "node:os";
 import {
   AGENT_ADAPTER_VERSION,
   asLocalAdapter,
+  makeAgyPackageProfile,
   makeAgyProfile,
   agyAcpReleaseArtifact,
   makeClaudeProfile,
@@ -91,8 +92,14 @@ describe("AgentAdapter.describe()", () => {
     expect(d.effort.levels).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
-  it("agy reports modelBaked", () => {
-    const d = makeAgyProfile({
+  it("native agy retains its original modelBaked profile", () => {
+    const profile = makeAgyProfile({ cliPath: "/bin/false", defaultModel: "native-model-high" });
+    expect(profile.id).toBe("agy");
+    expect(profile.describe().effort.mechanism).toBe("modelBaked");
+  });
+
+  it("agy-package reports modelBaked", () => {
+    const d = makeAgyPackageProfile({
       acpPath: "/bin/false",
       agyBin: "/bin/false",
       agyVersion: "false 1.0",

@@ -16,6 +16,8 @@ describe("package-backed agy configuration gates", () => {
       REPOS_ROOT: process.cwd(),
       CHANNEL_PRESETS_FILE: undefined,
       AGY_ENABLED: "false",
+      AGY_PACKAGE_ENABLED: "false",
+      AGY_NATIVE_RESTORE: "false",
       AGY_OLD_ROLLBACK_ENABLED: "false",
       ...extra,
     } as NodeJS.ProcessEnv;
@@ -23,7 +25,7 @@ describe("package-backed agy configuration gates", () => {
 
   function enabled(extra: Record<string, string | undefined> = {}): void {
     base({
-      AGY_ENABLED: "true",
+      AGY_PACKAGE_ENABLED: "true",
       AGY_ACP_BIN: "/opt/agy/antigravity-acp",
       AGY_BIN: "/opt/agy/agy",
       AGY_VERSION: "1.1.28",
@@ -41,16 +43,17 @@ describe("package-backed agy configuration gates", () => {
   }
 
   it("keeps both implementations disabled by default", () => {
-    base({ AGY_ENABLED: undefined, AGY_OLD_ROLLBACK_ENABLED: undefined });
+    base({ AGY_ENABLED: undefined, AGY_PACKAGE_ENABLED: undefined, AGY_OLD_ROLLBACK_ENABLED: undefined });
     const config = loadConfig();
     expect(config.AGY_ENABLED).toBe(false);
+    expect(config.AGY_PACKAGE_ENABLED).toBe(false);
     expect(config.AGY_OLD_ROLLBACK_ENABLED).toBe(false);
   });
 
   it("accepts only the exact reviewed runtime and explicit security acknowledgement", () => {
     enabled();
     expect(loadConfig()).toMatchObject({
-      AGY_ENABLED: true,
+      AGY_PACKAGE_ENABLED: true,
       AGY_ACP_VERSION: "1.1.0",
       AGY_VERSION: "1.1.28",
       AGY_SHA256: "a".repeat(64),
@@ -75,10 +78,12 @@ describe("package-backed agy configuration gates", () => {
     expect(() => loadConfig()).toThrow(/AGY_DEFAULT_MODEL/);
   });
 
-  it("requires a separate exact executable for the legacy rollback", () => {
-    base({ AGY_OLD_ROLLBACK_ENABLED: "true", AGY_OLD_CLI_PATH: undefined });
-    expect(() => loadConfig()).toThrow(/AGY_OLD_CLI_PATH/);
-    base({ AGY_OLD_ROLLBACK_ENABLED: "true", AGY_OLD_CLI_PATH: "/opt/agy/agy-old" });
+  it("requires an explicit native path and default without requiring package configuration", () => {
+    base({ AGY_ENABLED: "true", AGY_CLI_PATH: undefined, AGY_OLD_CLI_PATH: undefined, AGY_BIN: undefined });
+    expect(() => loadConfig()).toThrow(/AGY_CLI_PATH/);
+    base({ AGY_ENABLED: "true", AGY_CLI_PATH: "/opt/agy/agy", AGY_DEFAULT_MODEL: "gemini-high" });
+    expect(loadConfig()).toMatchObject({ AGY_ENABLED: true, AGY_PACKAGE_ENABLED: false, AGY_CLI_PATH: "/opt/agy/agy" });
+    base({ AGY_OLD_ROLLBACK_ENABLED: "true", AGY_OLD_CLI_PATH: "/opt/agy/agy-old", AGY_DEFAULT_MODEL: "gemini-high", AGY_CLI_PATH: undefined });
     expect(loadConfig().AGY_OLD_ROLLBACK_ENABLED).toBe(true);
   });
 });

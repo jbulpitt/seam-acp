@@ -62,5 +62,15 @@ for (const model of candidate.models) {
       ` default=${model.effort.selectionDefault}`
   );
   if (model.aliases.length) console.log(`    aliases   : ${model.aliases.join(", ")}`);
-  console.log(`    provenance: ${model.provenance ?? "(none)"}`);
+  for (const record of model.evidence ?? []) {
+    const parts = [`${record.kind} via ${record.source}`];
+    if (record.observedAt) parts.push(record.observedAt);
+    if (record.runtimeVersion) parts.push(record.runtimeVersion);
+    if (record.resolvedModel) parts.push(`resolved ${record.resolvedModel}`);
+    if (record.context?.native != null) parts.push(`context ${record.context.native}`);
+    if (record.effort?.selectionDefault) parts.push(`effort default ${record.effort.selectionDefault}`);
+    if (record.note) parts.push(record.note);
+    console.log(`    evidence  : ${parts.join("; ")}`);
+  }
+  if (!model.evidence?.length) console.log("    evidence  : (none)");
 }

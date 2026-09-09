@@ -36,8 +36,6 @@
  *   Token-spending JSONL verification is a controlled maintenance operation that
  *   updates the overlay (runbook §4), never part of a refresh.
  */
-import { spawn } from "node:child_process";
-import os from "node:os";
 import { Readable, Writable } from "node:stream";
 import {
   ClientSideConnection,
@@ -49,7 +47,8 @@ import {
   type SessionConfigSelectOption,
   type SessionConfigSelectOptions,
 } from "@agentclientprotocol/sdk";
-import type { CatalogEffortMechanism, ManifestCatalogModel } from "../model-catalog.js";
+import type { CatalogEffortMechanism, CatalogModelEvidence, ManifestCatalogModel } from "../model-catalog.js";
+import { runBoundedProbe } from "../probe-process.js";
 
 /** One advertised model as observed in its own fresh ACP session. */
 export interface ClaudeProbedModel {
@@ -249,107 +248,113 @@ function selectOption(
   return option?.type === "select" ? option : undefined;
 }
 
-function probeTimeout<T>(ms: number, message: string): Promise<T> {
-  return new Promise((_resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
-    timer.unref?.();
-  });
-}
-
 interface ClaudeProbeSession {
   options: SessionConfigOption[];
   /** Select a model IN THIS FRESH SESSION and return what it then advertises. */
   select: (value: string) => Promise<SessionConfigOption[]>;
-  close: () => Promise<void>;
 }
 
 /**
  * One fresh `claude-agent-acp` session, opened only far enough to read what it
- * advertises. Never prompts, so it costs nothing. Always tears the child down.
+ * advertises, run inside the SHARED bounded probe lifecycle (#236).
+ *
+ * The lifecycle — bounded stdout/stderr, phased session-before-connection
+ * close with an AbortSignal, sealed registration, SIGTERM→SIGKILL with an
+ * awaited exit, redacted structured errors, cancellation — belongs to
+ * `runBoundedProbe`. This function contributes only the ACP protocol work, so
+ * there is no private timeout/cleanup path here to drift from the shared one.
  */
-async function openProbeSession(opts: {
+async function withProbeSession<T>(opts: {
   cli: string;
   env: NodeJS.ProcessEnv;
   cwd: string;
   timeoutMs: number;
-}): Promise<ClaudeProbeSession> {
-  const child = spawn(opts.cli, [], { cwd: opts.cwd, env: opts.env, stdio: ["pipe", "pipe", "pipe"] });
-  let stderr = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk: string) => { stderr = (stderr + chunk).slice(-4000); });
-  const died = new Promise<never>((_resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code, signal) =>
-      reject(new Error(`claude-agent-acp exited early (code=${code}, signal=${signal}): ${stderr.trim()}`))
-    );
-  });
-  const connection = new ClientSideConnection(
-    () => ({
-      async requestPermission() { return { outcome: { outcome: "cancelled" as const } }; },
-      async sessionUpdate() {},
-    } satisfies Client),
-    ndJsonStream(
-      Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
-      Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>
-    )
-  );
-  let sessionId: string | undefined;
-  try {
-    await Promise.race([
-      connection.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
-      }),
-      died,
-      probeTimeout<void>(opts.timeoutMs, "claude-agent-acp initialize timed out"),
-    ]);
-    const session = await Promise.race([
-      connection.newSession({ cwd: opts.cwd, mcpServers: [] }),
-      died,
-      probeTimeout<never>(opts.timeoutMs, "claude-agent-acp session/new timed out"),
-    ]);
-    sessionId = session.sessionId;
-    const activeSessionId = session.sessionId;
-    return {
-      options: configOptions(session.configOptions),
-      select: async (value: string) => {
-        const response = await Promise.race([
-          connection.setSessionConfigOption({ sessionId: activeSessionId, configId: "model", value }),
-          died,
-          probeTimeout<never>(opts.timeoutMs, `claude-agent-acp model select timed out for ${value}`),
+  killGraceMs?: number;
+  signal?: AbortSignal;
+  read: (session: ClaudeProbeSession) => Promise<T>;
+}): Promise<T> {
+  return runBoundedProbe<T>({
+    executable: opts.cli,
+    args: [],
+    cwd: opts.cwd,
+    env: opts.env,
+    timeoutMs: opts.timeoutMs,
+    // A catalog probe opens one wrapper per advertised model, so the per-session
+    // teardown budget is multiplied by the model count. The wrapper exits
+    // promptly on SIGTERM and answers `session/close` quickly when healthy, so
+    // a tight window keeps a healthy refresh fast while a wedged one is still
+    // bounded — it just reaches SIGKILL sooner.
+    killGraceMs: opts.killGraceMs ?? 1_000,
+    ...(opts.signal ? { signal: opts.signal } : {}),
+    label: "claude-agent-acp catalog probe",
+    run: async (handle) => {
+      // A dead wrapper surfaces two ways at once: the SDK rejects with a bare
+      // "ACP connection closed", and the helper's `exited` rejects with the
+      // real cause (exit code plus the redacted stderr tail). The SDK usually
+      // wins the race, so remember the exit cause and prefer it — otherwise a
+      // wrapper that refused to start is reported as a protocol error.
+      let exitCause: unknown;
+      handle.exited.catch((err: unknown) => { exitCause = err; });
+      const connection = new ClientSideConnection(
+        () => ({
+          async requestPermission() { return { outcome: { outcome: "cancelled" as const } }; },
+          async sessionUpdate() {},
+        } satisfies Client),
+        ndJsonStream(
+          Writable.toWeb(handle.stdin) as unknown as WritableStream<Uint8Array>,
+          Readable.toWeb(handle.stdout) as unknown as ReadableStream<Uint8Array>
+        )
+      );
+      // Racing `handle.exited` turns a dead wrapper into a diagnosable error
+      // instead of a hang; the helper adds the deadline and the redacted tail.
+      let session: Awaited<ReturnType<typeof connection.newSession>>;
+      try {
+        await Promise.race([
+          connection.initialize({
+            protocolVersion: PROTOCOL_VERSION,
+            clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+          }),
+          handle.exited,
         ]);
-        return configOptions(response.configOptions);
-      },
-      // Cleanup WAITS for the child to actually exit. A refresh opens one
-      // process per advertised model; returning while they are still dying
-      // would let a scheduled refresh pile wrappers up on the host.
-      close: async () => {
-        if (sessionId) await connection.closeSession({ sessionId }).catch(() => undefined);
-        await reap(child);
-      },
-    };
-  } catch (err) {
-    await reap(child);
-    // The SDK surfaces a dead wrapper as a bare "ACP connection closed", which
-    // tells an operator nothing. Carry the wrapper's own stderr into the error
-    // so a failed refresh is diagnosable from the log line alone.
-    const detail = stderr.trim();
-    const message = err instanceof Error ? err.message : String(err);
-    throw new Error(detail && !message.includes(detail) ? `${message}: ${detail}` : message);
-  }
-}
-
-/** SIGKILL and wait for the process to be reaped, bounded so a wedged child
- *  cannot hang a refresh. */
-function reap(child: ReturnType<typeof spawn>): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    const done = () => { clearTimeout(timer); resolve(); };
-    const timer = setTimeout(done, 2_000);
-    timer.unref?.();
-    child.once("exit", done);
-    child.once("error", done);
-    child.kill("SIGKILL");
+        session = await Promise.race([
+          connection.newSession({ cwd: opts.cwd, mcpServers: [] }),
+          handle.exited,
+        ]);
+      } catch (err) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        throw exitCause ?? err;
+      }
+      const sessionId = session.sessionId;
+      // Registered as the SESSION phase so it is closed while its transport is
+      // still up, and bounded by the helper's own window: a wrapper that stays
+      // alive but never answers `session/close` cannot hang a refresh, because
+      // the helper stops awaiting on its signal and proceeds to terminate.
+      handle.onClose(async (signal) => {
+        await Promise.race([
+          connection.closeSession({ sessionId }).catch(() => undefined),
+          new Promise<void>((resolve) =>
+            signal.addEventListener("abort", () => resolve(), { once: true })
+          ),
+        ]);
+      }, "session");
+      try {
+        return await opts.read({
+          options: configOptions(session.configOptions),
+          select: async (value: string) => {
+            const response = await Promise.race([
+              connection.setSessionConfigOption({ sessionId, configId: "model", value }),
+              handle.exited,
+            ]);
+            return configOptions(response.configOptions);
+          },
+        });
+      } catch (err) {
+        // Give the exit event a bounded moment to land, so the accurate cause
+        // wins deterministically rather than by race order.
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        throw exitCause ?? err;
+      }
+    },
   });
 }
 
@@ -382,59 +387,81 @@ function readProbedModel(
  */
 export async function probeClaudeCatalog(options: {
   cliPath?: string;
+  /**
+   * Working directory. Defaults to the SAME cwd runtime spawn uses (the Seam
+   * process cwd), so discovery observes what a real turn would rather than a
+   * temp directory the wrapper has never seen.
+   */
   cwd?: string;
   /** Base environment; the credential-scoped env runtime spawn would use. */
   env?: NodeJS.ProcessEnv;
-  /** Per-model `ANTHROPIC_MODEL` forwarding, mirroring the profile's spawn(). */
-  modelEnv?: (modelId: string) => NodeJS.ProcessEnv;
+  /**
+   * Per-model environment, keyed by the CANONICAL model id — the value a real
+   * catalog selection would spawn with. Probing with the raw advertised id
+   * (`claude-fable-5-1[1m]`) while runtime selects the canonical one
+   * (`claude-fable-5-1`) means the probe is not observing the runtime path.
+   */
+  modelEnv?: (canonicalModelId: string) => NodeJS.ProcessEnv;
   timeoutMs?: number;
   concurrency?: number;
+  /** Cancels the whole probe, including any in-flight session (#236). */
+  signal?: AbortSignal;
 }): Promise<ClaudeCatalogProbe> {
   const cli = options.cliPath?.trim() || "claude-agent-acp";
-  const cwd = options.cwd ?? os.tmpdir();
+  // Runtime spawn inherits the Seam process cwd; discovery must too.
+  const cwd = options.cwd ?? process.cwd();
   const baseEnv = options.env ?? process.env;
   const timeoutMs = options.timeoutMs ?? 45_000;
 
-  const base = await openProbeSession({ cli, env: baseEnv, cwd, timeoutMs });
-  let advertised: SessionConfigSelectOption[];
-  let wrapperCurrentValue: string | null;
-  let reusable: ClaudeProbedModel | null = null;
-  try {
-    const modelOption = selectOption(base.options, "model");
-    if (!modelOption) throw new Error("claude-agent-acp advertised no model config option");
-    advertised = flattenSelectOptions(modelOption.options);
-    if (!advertised.length) throw new Error("claude-agent-acp advertised an empty model list");
-    wrapperCurrentValue = typeof modelOption.currentValue === "string" ? modelOption.currentValue : null;
-    const onSelf = advertised.find((entry) => entry.value === wrapperCurrentValue);
-    if (onSelf) reusable = readProbedModel(onSelf, base.options);
-  } finally {
-    await base.close();
-  }
+  const base = await withProbeSession({
+    cli, env: baseEnv, cwd, timeoutMs,
+    ...(options.signal ? { signal: options.signal } : {}),
+    read: async (session) => {
+      const modelOption = selectOption(session.options, "model");
+      if (!modelOption) throw new Error("claude-agent-acp advertised no model config option");
+      const advertised = flattenSelectOptions(modelOption.options);
+      if (!advertised.length) throw new Error("claude-agent-acp advertised an empty model list");
+      const wrapperCurrentValue =
+        typeof modelOption.currentValue === "string" ? modelOption.currentValue : null;
+      const onSelf = advertised.find((entry) => entry.value === wrapperCurrentValue);
+      return {
+        advertised,
+        wrapperCurrentValue,
+        reusable: onSelf ? readProbedModel(onSelf, session.options) : null,
+      };
+    },
+  });
 
   const results = new Map<string, ClaudeProbedModel>();
-  if (reusable) results.set(reusable.advertisedId, reusable);
-  const pending = advertised.filter((entry) => !results.has(entry.value));
+  if (base.reusable) results.set(base.reusable.advertisedId, base.reusable);
+  const pending = base.advertised.filter((entry) => !results.has(entry.value));
   const concurrency = Math.max(1, Math.min(options.concurrency ?? 2, pending.length || 1));
   let cursor = 0;
   const worker = async (): Promise<void> => {
     while (cursor < pending.length) {
+      if (options.signal?.aborted) return;
       const entry = pending[cursor++]!;
-      const env = options.modelEnv ? options.modelEnv(entry.value) : baseEnv;
-      const session = await openProbeSession({ cli, env, cwd, timeoutMs });
-      try {
-        // `ANTHROPIC_MODEL` forwarding only covers canonical ids. An ALIAS
-        // (`default`, `opus[1m]`, `haiku`) is not selected by the environment,
-        // so a fresh session comes up on whatever the wrapper prefers —
-        // measured: `sonnet`. Reading that session as if it were the alias
-        // publishes one model's capabilities under another model's name.
-        // Select it explicitly, ONCE, in this session that has selected nothing
-        // else; that is what keeps the observation isolated.
-        const current = selectOption(session.options, "model")?.currentValue;
-        const observed = current === entry.value ? session.options : await session.select(entry.value);
-        results.set(entry.value, readProbedModel(entry, observed));
-      } finally {
-        await session.close();
-      }
+      // Canonical identity, because that is what a catalog selection spawns
+      // with — the raw advertised value never reaches a real turn.
+      const canonical = canonicalClaudeModelId(entry.value);
+      const env = options.modelEnv ? options.modelEnv(canonical) : baseEnv;
+      const probed = await withProbeSession({
+        cli, env, cwd, timeoutMs,
+        ...(options.signal ? { signal: options.signal } : {}),
+        read: async (session) => {
+          // `ANTHROPIC_MODEL` forwarding only covers canonical ids. An ALIAS
+          // (`default`, `opus[1m]`, `haiku`) is not selected by the
+          // environment, so a fresh session comes up on whatever the wrapper
+          // prefers — measured: `sonnet`. Reading that session as if it were
+          // the alias publishes one model's capabilities under another's name.
+          // Select it explicitly, ONCE, in this session that has selected
+          // nothing else; that is what keeps the observation isolated.
+          const current = selectOption(session.options, "model")?.currentValue;
+          const observed = current === entry.value ? session.options : await session.select(entry.value);
+          return readProbedModel(entry, observed);
+        },
+      });
+      results.set(entry.value, probed);
     }
   };
   await Promise.all(Array.from({ length: concurrency }, worker));
@@ -442,8 +469,8 @@ export async function probeClaudeCatalog(options: {
   // Advertised order is the wrapper's own preference order; keep it stable so a
   // refresh that changes nothing produces an identical checksum.
   return {
-    models: advertised.map((entry) => results.get(entry.value)!).filter(Boolean),
-    wrapperCurrentValue,
+    models: base.advertised.map((entry) => results.get(entry.value)!).filter(Boolean),
+    wrapperCurrentValue: base.wrapperCurrentValue,
   };
 }
 
@@ -476,6 +503,14 @@ export interface ClaudeCatalogMergeInput {
    */
   effortMechanism: CatalogEffortMechanism;
   effortConfigId?: string;
+  /**
+   * The credential scope this refresh is running under. An overlay entry is
+   * published ONLY when it was verified on this same scope — see
+   * {@link overlayForCredentialScope}.
+   */
+  credentialScope: string;
+  /** Non-secret scope fingerprint recorded on emitted evidence. */
+  scopeRef?: string;
 }
 
 /**
@@ -486,7 +521,13 @@ export interface ClaudeCatalogMergeInput {
  * unchanged overlay always checksum identically.
  */
 export function mergeClaudeCatalogModels(input: ClaudeCatalogMergeInput): ManifestCatalogModel[] {
-  const overlayById = new Map(input.overlay.map((entry) => [entry.modelId, entry]));
+  // FAIL CLOSED on credential scope. Every overlay entry records the scope its
+  // evidence was captured on; an entry verified on one credential set says
+  // nothing about another, so it is simply not published there. An alternate
+  // credential profile therefore publishes only what its OWN live probe
+  // advertised — an independently scoped snapshot, not a borrowed one.
+  const overlay = overlayForCredentialScope(input.overlay, input.credentialScope);
+  const overlayById = new Map(overlay.map((entry) => [entry.modelId, entry]));
   const merged: ManifestCatalogModel[] = [];
   const published = new Set<string>();
 
@@ -499,11 +540,6 @@ export function mergeClaudeCatalogModels(input: ClaudeCatalogMergeInput): Manife
     // That is not a resolution, so we never manufacture one: we quote the latest
     // verified resolution with its provenance, or say plainly that it is unknown.
     const selfResolved = Boolean(probed.resolvedValue && probed.resolvedValue !== probed.advertisedId);
-    const resolutionNote = selfResolved
-      ? `resolved=${probed.resolvedValue}`
-      : verified
-        ? `resolution unverified live — latest verified ${verified.resolvedModel} (${describeOverlayEvidence(verified)})`
-        : "resolution unverified";
     const window = input.nativeContextWindow(id) ?? null;
     const effortChoices = probed.effortChoices.length ? normalizeEffortChoices(probed.effortChoices) : [EFFORT_DEFAULT];
     const selectionDefault =
@@ -515,7 +551,14 @@ export function mergeClaudeCatalogModels(input: ClaudeCatalogMergeInput): Manife
       ...(id === probed.advertisedId ? {} : { aliases: [probed.advertisedId] }),
       context: { native: window, maximum: window, effective: window },
       contextLimit: window ?? undefined,
-      provenance: `acp-live; ${resolutionNote}`,
+      description: input.displayNames?.get(id) ? undefined : probed.advertisedName,
+      // Structured, shared evidence (#236) rather than a private prose string:
+      // this is what flows through config inspection, the status card, the
+      // audit trail and the metadata join.
+      evidence: liveEvidence({
+        probed, canonicalId: id, window, effortChoices, selectionDefault,
+        verified, selfResolved, scopeRef: input.scopeRef,
+      }),
       effort: {
         // Capability comes from the live session; the APPLICATION path is Seam's
         // `_meta` injection either way. A model advertising no effort option gets
@@ -528,7 +571,7 @@ export function mergeClaudeCatalogModels(input: ClaudeCatalogMergeInput): Manife
     });
   }
 
-  for (const entry of input.overlay) {
+  for (const entry of overlay) {
     if (published.has(entry.modelId)) continue;
     published.add(entry.modelId);
     const choices = normalizeEffortChoices(entry.effortChoices);
@@ -542,7 +585,7 @@ export function mergeClaudeCatalogModels(input: ClaudeCatalogMergeInput): Manife
         effective: entry.contextWindow,
       },
       contextLimit: entry.contextWindow,
-      provenance: `verified-overlay; absent from ACP; resolved=${entry.resolvedModel}; ${describeOverlayEvidence(entry)}`,
+      evidence: [overlayEvidence(entry, input.scopeRef)],
       effort: {
         mechanism: choices.length > 1 ? input.effortMechanism : "none",
         ...(choices.length > 1 && input.effortConfigId ? { configId: input.effortConfigId } : {}),
@@ -553,18 +596,6 @@ export function mergeClaudeCatalogModels(input: ClaudeCatalogMergeInput): Manife
   }
 
   return merged;
-}
-
-function describeOverlayEvidence(entry: ClaudeVerifiedOverlayEntry): string {
-  return [
-    `verified ${entry.verifiedOn}`,
-    entry.wrapperVersion,
-    entry.claudeCodeVersion,
-    `credential scope ${entry.credentialScope}`,
-    `context ${entry.contextWindow}`,
-    `effort [${entry.effortChoices.join(",")}]`,
-    entry.evidence,
-  ].join("; ");
 }
 
 /**
@@ -582,6 +613,121 @@ export function resolveClaudeDefaultModel(
 ): string {
   const configured = configuredDefault.trim();
   if (models.some((model) => model.modelId === configured)) return configured;
-  if (models.some((model) => model.modelId === EFFORT_DEFAULT)) return EFFORT_DEFAULT;
-  return models[0]?.modelId ?? configured;
+  // A DECLARED alias resolves it too, collision-safely — the same rule the
+  // shared manifest helper applies.
+  const byAlias = models.filter((model) => (model.aliases ?? []).includes(configured));
+  if (byAlias.length > 1) {
+    throw new Error(
+      `configured Claude default ${JSON.stringify(configured)} is ambiguous: declared as an alias by ` +
+        `${byAlias.map((model) => model.modelId).join(", ")}`
+    );
+  }
+  if (byAlias.length === 1) return byAlias[0]!.modelId;
+  // NO list-order fallback, and no substituting some other alias. Minting a
+  // default from position meant a thread would silently start on whichever
+  // model the wrapper happened to advertise first. An unresolved configured
+  // default fails candidate construction, so the service retains the previous
+  // generation instead.
+  throw new Error(
+    `configured Claude default ${JSON.stringify(configured)} is not published by this catalog ` +
+      `(have: ${models.map((model) => model.modelId).join(", ") || "none"})`
+  );
+}
+
+/**
+ * The subset of the verified overlay that is TRUE for a given credential scope.
+ *
+ * Each entry records the credential scope its JSONL verification was captured
+ * on. Publishing an entry outside that scope would assert, about a different
+ * credential set, something nobody measured there — the previous behavior,
+ * where every direct profile merged the same globally-scoped overlay and the
+ * mismatch survived only as prose in the provenance string.
+ *
+ * There is deliberately no "close enough" rule: an entry either matches the
+ * active scope or it is absent, and an absent model is simply not selectable.
+ * Re-verifying on another credential set is the documented maintenance
+ * operation (model-management runbook §13.4), not something a refresh can infer.
+ */
+export function overlayForCredentialScope(
+  overlay: ReadonlyArray<ClaudeVerifiedOverlayEntry>,
+  credentialScope: string
+): ClaudeVerifiedOverlayEntry[] {
+  return overlay.filter((entry) => entry.credentialScope === credentialScope);
+}
+
+/**
+ * The credential-scope identity a profile probes under.
+ *
+ * `default` is the ambient `~/.claude` credential set. Any explicit config
+ * directory is a DIFFERENT credential set; it deliberately gets an opaque,
+ * non-path label so a scope identity never carries a filesystem path into
+ * evidence, and so no configured directory can accidentally collide with the
+ * `default` scope the overlay was verified on.
+ */
+export function claudeCredentialScope(configDir?: string): string {
+  return configDir?.trim() ? "configured" : "default";
+}
+
+
+/** Records for a row the wrapper advertised in this refresh. */
+function liveEvidence(input: {
+  probed: ClaudeProbedModel;
+  canonicalId: string;
+  window: number | null;
+  effortChoices: string[];
+  selectionDefault: string;
+  verified: ClaudeVerifiedOverlayEntry | undefined;
+  selfResolved: boolean;
+  scopeRef?: string;
+}): CatalogModelEvidence[] {
+  // Deliberately NO per-record `observedAt`. A wall-clock stamp would differ on
+  // every refresh, so an otherwise identical catalog would change its content
+  // checksum and publish a new generation each time. The candidate-level
+  // `fetchedAt` already records when this observation was taken.
+  const live: CatalogModelEvidence = {
+    kind: "live-observation",
+    source: "claude-agent-acp session config",
+    ...(input.scopeRef ? { scopeRef: input.scopeRef } : {}),
+    // Only a GENUINE resolution is recorded. The wrapper echoing an alias back
+    // at us (`default` -> `default`) is not one, so nothing is manufactured.
+    ...(input.selfResolved && input.probed.resolvedValue
+      ? { resolvedModel: input.probed.resolvedValue }
+      : {}),
+    ...(input.window !== null
+      ? { context: { native: input.window, method: "verified-window-table" } }
+      : {}),
+    effort: {
+      choices: input.effortChoices,
+      selectionDefault: input.selectionDefault,
+      method: "provider-advertised",
+    },
+  };
+  // A live row whose resolution the wrapper did NOT report keeps the separately
+  // verified resolution as its own second record, so the two origins stay
+  // distinguishable instead of being flattened into one sentence.
+  return input.selfResolved || !input.verified
+    ? [live]
+    : [live, overlayEvidence(input.verified, input.scopeRef)];
+}
+
+/** The record carried forward from an out-of-band JSONL verification. */
+function overlayEvidence(
+  entry: ClaudeVerifiedOverlayEntry,
+  scopeRef?: string
+): CatalogModelEvidence {
+  return {
+    kind: "verified-record",
+    source: "operator JSONL verification",
+    observedAt: `${entry.verifiedOn}T00:00:00.000Z`,
+    runtimeVersion: entry.wrapperVersion,
+    ...(scopeRef ? { scopeRef } : {}),
+    resolvedModel: entry.resolvedModel,
+    context: { native: entry.contextWindow, method: "runbook-verified" },
+    effort: {
+      choices: [...entry.effortChoices],
+      selectionDefault: entry.effortChoices[0] ?? "default",
+      method: "runbook-verified",
+    },
+    note: `verified on credential scope ${entry.credentialScope}`,
+  };
 }

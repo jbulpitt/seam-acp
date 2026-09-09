@@ -77,6 +77,23 @@ level that model does not advertise.
   canonical ids — never for a bare alias, because stripping `opus[1m]` would
   mint `opus`, which the model-management runbook records as fuzzy-resolving to
   a different family.
+- **The overlay is scoped to the credential set that proved it.** Each entry
+  records the credential scope its JSONL verification was captured on, and is
+  published only on a refresh running under that scope. An alternate credential
+  profile therefore publishes only its own live list — fail closed, rather than
+  inheriting evidence nobody measured there.
+- **The probe reproduces the runtime spawn exactly**: same executable, same
+  credential-scoped environment, the same cwd a real turn uses, and the
+  **canonical** model id in `ANTHROPIC_MODEL` (the value a catalog selection
+  spawns with), with the advertised value then selected in-session. Using the
+  runtime cwd rather than a temp directory makes a refresh noticeably slower —
+  the wrapper scans the project on session start — which is the accepted cost
+  of observing what a real turn observes.
+- **The bounded lifecycle is the shared one** (`runBoundedProbe`, #236): bounded
+  output, phased session-before-connection close with an AbortSignal, sealed
+  registration, SIGTERM→SIGKILL with an awaited exit, redacted structured
+  errors, and cancellation. The collector keeps no private timeout or cleanup
+  path to drift from it.
 - **Nothing is inferred from a label, a display name, an id substring, or a
   model's self-report.** Context windows come from the JSONL-verified table
   only; a live model with no verified window publishes a null window rather than

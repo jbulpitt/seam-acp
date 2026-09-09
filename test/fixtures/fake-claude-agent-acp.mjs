@@ -15,7 +15,9 @@
  *   FAKE_ACP_MODELS     JSON [{value,name}] advertised by the model select
  *   FAKE_ACP_CURRENT    the model select's currentValue
  *   FAKE_ACP_EFFORT     JSON map of model value -> string[] (absent = no effort option)
- *   FAKE_ACP_FAIL       when "1", exit non-zero immediately
+ *   FAKE_ACP_FAIL           when "1", exit non-zero immediately
+ *   FAKE_ACP_SILENT_INIT    never answer `initialize` (stays alive, mute)
+ *   FAKE_ACP_SILENT_CLOSE   answer everything EXCEPT `session/close`
  */
 import { appendFileSync } from "node:fs";
 
@@ -88,6 +90,12 @@ process.stdin.on("data", (chunk) => {
     // Recording every received method is what lets a test prove the probe spends
     // no model tokens: `session/prompt` must never appear.
     if (log) appendFileSync(log, JSON.stringify({ pid: process.pid, method: message.method }) + "\n");
+    if (process.env.FAKE_ACP_SILENT_INIT === "1") continue;
+    if (process.env.FAKE_ACP_SILENT_CLOSE === "1" && message.method === "session/close") {
+      // Alive, but never replies. A collector that awaits this unbounded hangs
+      // the refresh and the shutdown drain.
+      continue;
+    }
     if (message.method === "initialize") {
       reply(message.id, {
         protocolVersion: message.params?.protocolVersion ?? 1,

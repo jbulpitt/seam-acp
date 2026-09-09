@@ -436,14 +436,11 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     }
     if (timer) clearTimeout(timer);
     if (options.signal && onOuterAbort) options.signal.removeEventListener("abort", onOuterAbort);
-    child.removeListener("error", onSpawnError);
-    child.removeListener("exit", onExit);
-    if (onStarted) child.removeListener("spawn", onStarted);
-    if (onStartError) child.removeListener("error", onStartError);
-    child.stdout.removeListener("data", onStdout);
-    child.stdout.removeListener("end", onStdoutEnd);
-    child.stderr.removeListener("data", onStderr);
-    if (!stdout.destroyed) stdout.end();
+    // Transport stays FULLY LIVE across the close drain — forwarding included.
+    // Removing the stdout listener or ending the republished stream here would
+    // make the session phase useless: a `session/close` written afterwards is
+    // either never delivered or never answered, which is the exact thing
+    // session-before-connection ordering exists to allow.
     // Drain in PHASE order, repeatedly: a close step may itself register another
     // one, and a step that arrived late still has to obey session-before-
     // connection. The registration phase stays OPEN across rounds so anything a
@@ -459,6 +456,15 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     }
     // Nothing may register from here on.
     registrationSealed = true;
+    // Transport down only once every session-phase close has had its turn.
+    child.removeListener("error", onSpawnError);
+    child.removeListener("exit", onExit);
+    if (onStarted) child.removeListener("spawn", onStarted);
+    if (onStartError) child.removeListener("error", onStartError);
+    child.stdout.removeListener("data", onStdout);
+    child.stdout.removeListener("end", onStdoutEnd);
+    child.stderr.removeListener("data", onStderr);
+    if (!stdout.destroyed) stdout.end();
     const reaped = await terminate(child, killGraceMs);
     // The protective error listener is the LAST thing removed, so a stray
     // `error` emitted during termination cannot become an uncaught exception.

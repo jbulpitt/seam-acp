@@ -14,6 +14,7 @@ import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../
 import {
   CLAUDE_VERIFIED_OVERLAY,
   CLAUDE_VERIFIED_OVERLAY_VERSION,
+  claudeCredentialScope,
   mergeClaudeCatalogModels,
   probeClaudeCatalog,
   resolveClaudeDefaultModel,
@@ -237,12 +238,15 @@ export function makeClaudeProfile(opts: {
         // previous generation on failure" requires. Quietly publishing a
         // narrower catalog instead would overwrite good live data with a guess.
         if (liveCatalog) {
+          const scope = manifestCatalogScope(common);
           const probe = opts.catalogProbe
             ? await opts.catalogProbe()
             : await probeClaudeCatalog({
                 cliPath: cli,
                 env: buildClaudeSpawnEnv(),
-                modelEnv: (modelId) => buildClaudeSpawnEnv(modelId),
+                // Canonical identity: the value a real catalog selection spawns
+                // with, not the raw advertised one.
+                modelEnv: (canonicalModelId) => buildClaudeSpawnEnv(canonicalModelId),
               });
           const models = mergeClaudeCatalogModels({
             probe,
@@ -250,6 +254,11 @@ export function makeClaudeProfile(opts: {
             nativeContextWindow: lookupClaudeNativeContextWindow,
             displayNames: configuredLabels,
             effortMechanism: catalogEffort.mechanism,
+            // The overlay is filtered to THIS profile's credential scope, so an
+            // alternate credential profile never inherits evidence captured on
+            // the default one.
+            credentialScope: claudeCredentialScope(configDir),
+            scopeRef: scope.fingerprint,
             ...(catalogEffort.configId ? { effortConfigId: catalogEffort.configId } : {}),
           });
           const candidate = await manifestCatalogSource({

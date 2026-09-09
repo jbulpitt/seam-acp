@@ -841,10 +841,18 @@ Do this only deliberately; **never** as part of a refresh.
 JSONL-verified turn once proved that model resolved and served as recorded.
 
 The recorded `credentialScope` is the scope the evidence was captured on
-(`default` = `~/.claude`). Extra credential profiles publish independently
-scoped snapshots and reuse the same overlay, so their rows carry provenance
-naming a scope that is not their own — verify a representative overlay model on
-an alternate profile before trusting it there.
+(`default` = `~/.claude`), and it is **enforced, not advisory**. An overlay
+entry is published only on a refresh running under that same credential scope;
+on any other scope it is simply absent, and an absent model is not selectable.
+
+So a profile pinned to an alternate `configDir` publishes **only what its own
+live probe advertised** — an independently scoped snapshot, not a borrowed one.
+Nothing infers that a model verified on `~/.claude` behaves the same under a
+different credential set, because nobody measured that.
+
+To make an overlay model available on another credential set, re-run §4/§4a
+under that credential set and add an entry recording its scope. That is a
+deliberate, token-spending maintenance operation; a refresh cannot do it.
 
 ### 13.5 Failure behavior
 

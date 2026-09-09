@@ -22,6 +22,9 @@ import {
   resolveClaudeDefaultModel,
   type ClaudeCatalogProbe,
   type ClaudeProbedModel,
+  claudeCredentialScope,
+  overlayForCredentialScope,
+  lookupClaudeNativeContextWindow,
 } from "@seam/adapters";
 import { validateCandidate } from "../packages/core/src/core/model-catalog/service.js";
 
@@ -105,7 +108,8 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
     validateCandidate(candidate);
     expect(candidate.source).toBe("claude-acp-live+verified-overlay");
 
-    const live = candidate.models.filter((model) => model.provenance?.startsWith("acp-live"));
+    const live = candidate.models.filter((model) =>
+      model.evidence?.some((record) => record.kind === "live-observation"));
     expect(live.map((model) => model.id)).toEqual([
       "default",
       "opus[1m]",
@@ -130,7 +134,8 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
   it("keeps JSONL-verified models that ACP does not advertise, with explicit provenance", async () => {
     const candidate = await directProfile(async () => liveProbe()).catalog.fetch();
     const overlayIds = candidate.models
-      .filter((model) => model.provenance?.startsWith("verified-overlay"))
+      .filter((model) =>
+        model.evidence?.every((record) => record.kind === "verified-record") === true)
       .map((model) => model.id);
     expect(overlayIds).toEqual([
       "claude-opus-5",
@@ -140,13 +145,17 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
       "claude-sonnet-5",
     ]);
     const opus5 = candidate.models.find((model) => model.id === "claude-opus-5")!;
-    expect(opus5.provenance).toContain("verified-overlay");
-    expect(opus5.provenance).toContain("absent from ACP");
-    expect(opus5.provenance).toContain("resolved=claude-opus-5");
-    expect(opus5.provenance).toContain("verified 2026-09-02");
-    expect(opus5.provenance).toContain("claude-agent-acp 0.73.0");
-    expect(opus5.provenance).toContain("credential scope default");
-    expect(opus5.provenance).toContain("effort [default,low,medium,high,xhigh,max]");
+    const record = opus5.evidence![0]!;
+    expect(record).toMatchObject({
+      kind: "verified-record",
+      source: "operator JSONL verification",
+      runtimeVersion: "claude-agent-acp 0.73.0",
+      resolvedModel: "claude-opus-5",
+    });
+    expect(record.observedAt).toContain("2026-09-02");
+    expect(record.context).toMatchObject({ native: 1_000_000 });
+    expect(record.effort?.choices).toEqual(["default", "low", "medium", "high", "xhigh", "max"]);
+    expect(record.note).toContain("credential scope default");
     // Existing verified models keep their proven native window.
     expect(opus5.context).toEqual({ native: 1_000_000, maximum: 1_000_000, effective: 1_000_000 });
     expect(candidate.sourceVersion).toBe("overlay-v1");
@@ -158,7 +167,7 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
     expect(fable).toHaveLength(1);
     // Live wins for a model ACP does advertise; the raw advertised id survives
     // as an alias so a live reading still resolves.
-    expect(fable[0]!.provenance).toContain("acp-live");
+    expect(fable[0]!.evidence?.[0]?.kind).toBe("live-observation");
     expect(fable[0]!.aliases).toEqual(["claude-fable-5-1[1m]"]);
     expect(fable[0]!.runtimeId).toBe("claude-fable-5-1");
     // …and its window still comes from the verified table, not the `[1m]` label.
@@ -181,10 +190,14 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
     const candidate = await directProfile(async () => liveProbe()).catalog.fetch();
     const fallback = candidate.models.find((model) => model.id === "default")!;
     // Measured: the wrapper echoes `default` back at us. That is not a
-    // resolution, so the row must not claim one of its own.
-    expect(fallback.provenance).toContain("resolution unverified live");
-    expect(fallback.provenance).toContain("latest verified claude-opus-5");
-    expect(fallback.provenance).toContain("verified 2026-09-02");
+    // resolution, so the LIVE record must not claim one — the separately
+    // verified resolution stays its own second record instead of being
+    // flattened into the live one.
+    const live = fallback.evidence!.find((r) => r.kind === "live-observation")!;
+    const verified = fallback.evidence!.find((r) => r.kind === "verified-record")!;
+    expect(live.resolvedModel).toBeUndefined();
+    expect(verified.resolvedModel).toBe("claude-opus-5");
+    expect(verified.observedAt).toContain("2026-09-02");
     expect(fallback.context.native).toBe(1_000_000);
   });
 
@@ -194,8 +207,11 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
       overlay: [],
       nativeContextWindow: () => undefined,
       effortMechanism: "meta",
+      credentialScope: "default",
     });
-    expect(merged[0]!.provenance).toBe("acp-live; resolution unverified");
+    expect(merged[0]!.evidence).toHaveLength(1);
+    expect(merged[0]!.evidence![0]).toMatchObject({ kind: "live-observation" });
+    expect(merged[0]!.evidence![0]!.resolvedModel).toBeUndefined();
     expect(merged[0]!.context).toEqual({ native: null, maximum: null, effective: null });
   });
 
@@ -208,8 +224,11 @@ describe("#232 direct Claude publishes the live list plus verified overlays", ()
       overlay: [],
       nativeContextWindow: () => undefined,
       effortMechanism: "meta",
+      credentialScope: "default",
     });
-    expect(merged[0]!.provenance).toBe("acp-live; resolved=claude-opus-6");
+    expect(merged[0]!.evidence![0]).toMatchObject({
+      kind: "live-observation", resolvedModel: "claude-opus-6",
+    });
   });
 });
 
@@ -232,15 +251,35 @@ describe("#232 default and effort defaults are never borrowed from another sessi
     ]);
   });
 
-  it("falls back deterministically when the configured default is absent", () => {
+  it("REFUSES to mint a default from list order", () => {
     const models = mergeClaudeCatalogModels({
       probe: liveProbe(),
       overlay: [],
       nativeContextWindow: () => undefined,
       effortMechanism: "meta",
+      credentialScope: "default",
     });
-    expect(resolveClaudeDefaultModel(models, "claude-not-real")).toBe("default");
-    expect(resolveClaudeDefaultModel(models.filter((m) => m.modelId !== "default"), "nope")).toBe("opus[1m]");
+    // An unresolved configured default fails candidate construction, so the
+    // service retains the previous generation. Selecting whichever model the
+    // wrapper happened to advertise first is exactly the silent mis-selection
+    // this replaced.
+    expect(() => resolveClaudeDefaultModel(models, "claude-not-real"))
+      .toThrow(/is not published by this catalog/);
+    expect(() => resolveClaudeDefaultModel(models.filter((m) => m.modelId !== "default"), "nope"))
+      .toThrow(/is not published by this catalog/);
+    // A configured id that IS published resolves, and so does a declared alias.
+    expect(resolveClaudeDefaultModel(models, "default")).toBe("default");
+    expect(resolveClaudeDefaultModel(
+      [{ modelId: "canonical", name: "C", aliases: ["recommended"] }],
+      "recommended"
+    )).toBe("canonical");
+    expect(() => resolveClaudeDefaultModel(
+      [
+        { modelId: "one", name: "One", aliases: ["shared"] },
+        { modelId: "two", name: "Two", aliases: ["shared"] },
+      ],
+      "shared"
+    )).toThrow(/ambiguous/);
   });
 
   it("takes each model's effort default from its OWN session", () => {
@@ -255,6 +294,7 @@ describe("#232 default and effort defaults are never borrowed from another sessi
       overlay: [],
       nativeContextWindow: () => undefined,
       effortMechanism: "meta",
+      credentialScope: "default",
     });
     expect(merged[0]!.effort?.selectionDefault).toBe("max");
     expect(merged[1]!.effort?.selectionDefault).toBe("low");
@@ -270,6 +310,7 @@ describe("#232 default and effort defaults are never borrowed from another sessi
       overlay: [],
       nativeContextWindow: () => undefined,
       effortMechanism: "meta",
+      credentialScope: "default",
     });
     expect(merged[0]!.effort?.selectionDefault).toBe("default");
   });
@@ -292,7 +333,24 @@ describe("#232 scope, determinism, and failure handling", () => {
     expect(alternate.scope.credentialProfile).toBe("/credentials/work");
     expect(alternate.scope.provider).toBe("anthropic");
     expect(alternate.source).toBe("claude-acp-live+verified-overlay");
-    expect(alternate.models.map((m) => m.id)).toEqual(base.models.map((m) => m.id));
+    // FAIL CLOSED on credential scope. The overlay was verified on the DEFAULT
+    // credential set, so an alternate credential profile does NOT inherit it:
+    // it publishes only what its own live probe advertised. Asserting the two
+    // profiles publish the same identities is exactly what let borrowed
+    // evidence look like an independently scoped snapshot.
+    expect(alternate.models.map((m) => m.id)).toEqual([
+      "default", "opus[1m]", "claude-fable-5-1", "sonnet", "haiku",
+    ]);
+    expect(base.models.map((m) => m.id)).toEqual([
+      "default", "opus[1m]", "claude-fable-5-1", "sonnet", "haiku",
+      "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-fable-5", "claude-sonnet-5",
+    ]);
+    // No row on the alternate profile carries evidence captured elsewhere.
+    for (const model of alternate.models) {
+      for (const record of model.evidence ?? []) {
+        expect(record.kind).toBe("live-observation");
+      }
+    }
   });
 
   it("throws on probe failure so the service retains the previous generation", async () => {
@@ -402,7 +460,9 @@ describe("#232 probe isolation against a fake ACP agent", () => {
     expect(runs).toHaveLength(LIVE_ADVERTISED.length);
     expect(new Set(runs.map((run) => run.pid)).size).toBe(runs.length);
     // Canonical ids are forwarded through ANTHROPIC_MODEL exactly as runtime spawn does.
-    expect(runs.map((run) => run.anthropicModel).filter(Boolean)).toEqual(["claude-fable-5-1[1m]"]);
+    // CANONICAL identity — the value a real catalog selection spawns with, not
+    // the raw advertised `claude-fable-5-1[1m]` that never reaches a turn.
+    expect(runs.map((run) => run.anthropicModel).filter(Boolean)).toEqual(["claude-fable-5-1"]);
     // Nothing is left running — cleanup waits for each child to be reaped.
     for (const run of runs) {
       expect(() => process.kill(run.pid, 0)).toThrow();
@@ -444,8 +504,12 @@ describe("#232 probe isolation against a fake ACP agent", () => {
     }
     for (const [, selected] of selectionsByPid) expect(selected).toHaveLength(1);
     // Every advertised model is observed, each under its own identity.
+    // `claude-fable-5-1[1m]` is now selected explicitly too: its environment
+    // forwards the CANONICAL id, so the session comes up on `claude-fable-5-1`
+    // and the advertised suffixed value still has to be selected — exactly what
+    // a real turn does (canonical env, then setModel of the stored value).
     expect([...selectionsByPid.values()].flat().sort()).toEqual(
-      ["default", "haiku", "opus[1m]"].sort()
+      ["claude-fable-5-1[1m]", "default", "haiku", "opus[1m]"].sort()
     );
   });
 
@@ -494,6 +558,7 @@ describe("#232 probe isolation against a fake ACP agent", () => {
       overlay: CLAUDE_VERIFIED_OVERLAY,
       nativeContextWindow: () => undefined,
       effortMechanism: "meta",
+      credentialScope: "default",
     });
     expect(resolveClaudeDefaultModel(models, "default")).toBe("default");
   });
@@ -519,7 +584,7 @@ describe("#232 probe isolation against a fake ACP agent", () => {
       })
       // The wrapper's own stderr must reach the operator; a bare
       // "ACP connection closed" is undiagnosable in a refresh log.
-    ).rejects.toThrow(/refusing to start/);
+    ).rejects.toMatchObject({ code: "exited_early" });
   });
 
   it("refuses a wrapper that advertises no models at all", async () => {
@@ -531,5 +596,148 @@ describe("#232 probe isolation against a fake ACP agent", () => {
         timeoutMs: 20_000,
       })
     ).rejects.toThrow(/advertised no model|empty model list/);
+  });
+});
+
+describe("#232 overlay evidence is scoped to the credential set that proved it", () => {
+  it("publishes an overlay entry only on its verified credential scope", () => {
+    const onDefault = mergeClaudeCatalogModels({
+      probe: liveProbe(),
+      overlay: CLAUDE_VERIFIED_OVERLAY,
+      nativeContextWindow: lookupClaudeNativeContextWindow,
+      effortMechanism: "meta",
+      credentialScope: "default",
+    });
+    const onConfigured = mergeClaudeCatalogModels({
+      probe: liveProbe(),
+      overlay: CLAUDE_VERIFIED_OVERLAY,
+      nativeContextWindow: lookupClaudeNativeContextWindow,
+      effortMechanism: "meta",
+      credentialScope: "configured",
+    });
+    expect(onDefault.length).toBeGreaterThan(onConfigured.length);
+    // Every overlay-only identity is absent from the non-matching scope.
+    for (const entry of CLAUDE_VERIFIED_OVERLAY) {
+      if (LIVE_ADVERTISED.some((live) => live.value.startsWith(entry.modelId))) continue;
+      expect(onConfigured.some((model) => model.modelId === entry.modelId)).toBe(false);
+    }
+  });
+
+  it("maps a config directory to a non-default, non-path credential scope", () => {
+    expect(claudeCredentialScope(undefined)).toBe("default");
+    expect(claudeCredentialScope("   ")).toBe("default");
+    const scoped = claudeCredentialScope("/home/ubuntu/.claude-work");
+    expect(scoped).not.toBe("default");
+    // Never a filesystem path: a scope identity must not carry one into evidence.
+    expect(scoped).not.toContain("/");
+    expect(scoped).not.toContain("home");
+  });
+
+  it("filters purely by recorded scope, with no near-miss rule", () => {
+    const entry = CLAUDE_VERIFIED_OVERLAY[0]!;
+    expect(overlayForCredentialScope([entry], entry.credentialScope)).toEqual([entry]);
+    expect(overlayForCredentialScope([entry], "configured")).toEqual([]);
+    expect(overlayForCredentialScope([entry], "")).toEqual([]);
+  });
+});
+
+describe("#232 the probe uses the shared bounded lifecycle", () => {
+  let dir: string;
+  let log: string;
+  const baseEnv = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
+    ...process.env,
+    FAKE_ACP_LOG: log,
+    FAKE_ACP_MODELS: JSON.stringify(LIVE_ADVERTISED),
+    FAKE_ACP_CURRENT: "sonnet",
+    FAKE_ACP_EFFORT: JSON.stringify({ sonnet: FULL_EFFORT }),
+    ...over,
+  });
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-232-life-"));
+    log = path.join(dir, "acp.log");
+    fs.writeFileSync(log, "");
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const pids = (): number[] => [
+    ...new Set(
+      fs.readFileSync(log, "utf8").split("\n").filter(Boolean)
+        .map((line) => JSON.parse(line) as { pid?: number })
+        .flatMap((row) => (typeof row.pid === "number" ? [row.pid] : []))
+    ),
+  ];
+  const gone = (pid: number): boolean => {
+    try { process.kill(pid, 0); return false; } catch { return true; }
+  };
+
+  it("bounds a wrapper that never answers session/close and still reaps it", async () => {
+    // The blocker: success cleanup awaited closeSession() with no timeout, so a
+    // wrapper that stays alive but never replies could hang refresh and the
+    // shutdown drain indefinitely.
+    // ONE advertised model: each unanswered close costs the helper's bounded
+    // close window, so the point is that it terminates at all, not how many
+    // windows a five-model fixture would serialize.
+    const single = JSON.stringify([{ value: "sonnet", name: "Sonnet" }]);
+    const env = () => baseEnv({ FAKE_ACP_SILENT_CLOSE: "1", FAKE_ACP_MODELS: single });
+    const started = Date.now();
+    await probeClaudeCatalog({
+      cliPath: FAKE_ACP,
+      cwd: dir,
+      env: env(),
+      modelEnv: env,
+      timeoutMs: 20_000,
+      concurrency: 1,
+    });
+    // Bounded by the shared helper's close window, not by the wrapper: without
+    // the bound this never returns at all.
+    expect(Date.now() - started).toBeLessThan(20_000);
+    for (const pid of pids()) expect(gone(pid)).toBe(true);
+  }, 30_000);
+
+  it("cancels through an AbortSignal and leaves no wrapper behind", async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 60);
+    await expect(
+      probeClaudeCatalog({
+        cliPath: FAKE_ACP,
+        cwd: dir,
+        env: baseEnv({ FAKE_ACP_SILENT_INIT: "1" }),
+        modelEnv: () => baseEnv({ FAKE_ACP_SILENT_INIT: "1" }),
+        timeoutMs: 20_000,
+        signal: controller.signal,
+      })
+    ).rejects.toMatchObject({ code: "cancelled" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    for (const pid of pids()) expect(gone(pid)).toBe(true);
+  });
+
+  it("times out a wrapper that never answers initialize, bounded", async () => {
+    const started = Date.now();
+    await expect(
+      probeClaudeCatalog({
+        cliPath: FAKE_ACP,
+        cwd: dir,
+        env: baseEnv({ FAKE_ACP_SILENT_INIT: "1" }),
+        modelEnv: () => baseEnv({ FAKE_ACP_SILENT_INIT: "1" }),
+        timeoutMs: 150,
+      })
+    ).rejects.toMatchObject({ code: "timeout" });
+    expect(Date.now() - started).toBeLessThan(10_000);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    for (const pid of pids()) expect(gone(pid)).toBe(true);
+  });
+
+  it("retains no private lifecycle: no spawn, timers, or reap in the collector", () => {
+    const source = fs.readFileSync(
+      new URL("../packages/adapters/src/profiles/claude-catalog.ts", import.meta.url),
+      "utf8"
+    );
+    // The whole point of consuming the shared helper is that there is no second
+    // implementation of bounding/cleanup here to drift from it.
+    expect(source).not.toContain("node:child_process");
+    expect(source).not.toContain("function reap");
+    expect(source).not.toContain("probeTimeout");
+    expect(source).toContain("runBoundedProbe");
   });
 });

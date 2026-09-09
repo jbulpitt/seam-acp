@@ -126,6 +126,8 @@ function fakeCopilotSpawner(opts: {
   ignoreKill?: boolean;
   missingStdout?: boolean;
   emitChildError?: boolean;
+  exitWithStderr?: string;
+  ignoreKillModel?: string;
 } = {}) {
   const models = opts.models ?? modelFixtures();
   const calls: Array<{
@@ -176,7 +178,7 @@ function fakeCopilotSpawner(opts: {
       kill(signal?: NodeJS.Signals | number) {
         call.signals.push(signal);
         this.killed = true;
-        if (opts.ignoreKill) return true;
+        if (opts.ignoreKill || selectedModel === opts.ignoreKillModel) return true;
         if (signal === "SIGTERM" && opts.ignoreTerm) return true;
         forceStop(signal);
         return true;
@@ -240,6 +242,12 @@ function fakeCopilotSpawner(opts: {
       );
     if (opts.emitChildError) {
       queueMicrotask(() => child.emit("error", new Error("forced post-spawn child error")));
+    }
+    if (opts.exitWithStderr) {
+      queueMicrotask(() => {
+        stderr.write(opts.exitWithStderr);
+        forceStop("SIGTERM");
+      });
     }
     return child as unknown as ReturnType<typeof import("node:child_process").spawn>;
   };
@@ -434,7 +442,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
       overallTimeoutMs: 5_000,
       cleanupTimeoutMs: 50,
     })).rejects.toThrow(/forced probe failure|fixture-05/);
-    expect(harness.calls).toHaveLength(9);
+    expect(harness.calls).toHaveLength(7);
     expect(harness.active).toBe(0);
     expect(harness.closedSessions).toEqual(harness.openedSessions);
     expect(harness.listenersRemoved).toBe(true);
@@ -532,6 +540,53 @@ describe("Copilot isolated catalog probing (#234)", () => {
     harness.forceCleanup();
     await Promise.resolve();
     expect(harness.active).toBe(0);
+  });
+
+  it("does not retry while an unreaped per-model child may still be alive", async () => {
+    const harness = fakeCopilotSpawner({
+      models: modelFixtures(8),
+      ignoreKillModel: "fixture-05",
+    });
+    await expect(probeCopilotCatalog({
+      spawnProcess: harness.spawnProcess,
+      timeoutMs: 100,
+      overallTimeoutMs: 1_000,
+      cleanupTimeoutMs: 10,
+    })).rejects.toThrow(/did not exit after SIGKILL/);
+    expect(harness.calls).toHaveLength(7);
+    expect(harness.active).toBe(1);
+    expect(harness.maxActive).toBe(1);
+    expect(harness.calls.at(-1)?.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(harness.listenersRemoved).toBe(true);
+    expect(harness.transportsDestroyed).toBe(true);
+    harness.forceCleanup();
+    await Promise.resolve();
+    expect(harness.active).toBe(0);
+  });
+
+  it("redacts configured credentials from child stderr failures", async () => {
+    const secret = "synthetic-copilot-credential-for-redaction";
+    const harness = fakeCopilotSpawner({
+      exitWithStderr: `authentication failed for ${secret}`,
+    });
+    let failure: unknown;
+    try {
+      await probeCopilotCatalog({
+        spawnProcess: harness.spawnProcess,
+        env: { GH_TOKEN: secret },
+        timeoutMs: 100,
+        overallTimeoutMs: 500,
+        cleanupTimeoutMs: 10,
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect(String(failure)).not.toContain(secret);
+    expect(String(failure)).toContain("[REDACTED]");
+    expect(harness.active).toBe(0);
+    expect(harness.listenersRemoved).toBe(true);
+    expect(harness.transportsDestroyed).toBe(true);
   });
 
   it("terminates a still-running process after a post-spawn child error", async () => {

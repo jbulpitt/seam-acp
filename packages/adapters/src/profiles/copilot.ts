@@ -90,6 +90,23 @@ interface CopilotAcpProbeSession {
 
 const COPILOT_MODEL_PROBE_ATTEMPTS = 3;
 const COPILOT_ACP_BASE_ARGS = ["--acp"] as const;
+const COPILOT_SECRET_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"] as const;
+
+class CopilotModelSelectionError extends Error {}
+
+function redactCopilotSecrets(value: string, env: NodeJS.ProcessEnv): string {
+  let redacted = value;
+  for (const key of COPILOT_SECRET_ENV_KEYS) {
+    const secret = env[key];
+    if (secret) redacted = redacted.split(secret).join("[REDACTED]");
+  }
+  return redacted;
+}
+
+function sanitizedCopilotProbeError(error: unknown, env: NodeJS.ProcessEnv): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  return new Error(redactCopilotSecrets(message, env));
+}
 
 function copilotAcpLaunchSpec(
   executable: string,
@@ -240,7 +257,8 @@ async function runCopilotAcpProbeSession<T>(opts: {
     resolveExit();
     if (!intentionalStop) {
       rejectDied(new Error(
-        `copilot ACP exited early (code=${code}, signal=${signal}): ${stderr.trim()}`
+        `copilot ACP exited early (code=${code}, signal=${signal}): ` +
+        redactCopilotSecrets(stderr.trim(), opts.env)
       ));
     }
   };
@@ -411,7 +429,7 @@ export async function probeCopilotCatalog(options: {
               }
               const selectedModel = selectOption(responseOptions, "model");
               if (selectedModel?.currentValue !== model.value) {
-                throw new Error(
+                throw new CopilotModelSelectionError(
                   `copilot ACP model probe did not select ${JSON.stringify(model.value)} ` +
                   `(returned ${JSON.stringify(selectedModel?.currentValue ?? null)})`
                 );
@@ -437,7 +455,7 @@ export async function probeCopilotCatalog(options: {
           break;
         } catch (error) {
           lastError = error;
-          if (controller.signal.aborted) break;
+          if (controller.signal.aborted || !(error instanceof CopilotModelSelectionError)) break;
           if (attempt < COPILOT_MODEL_PROBE_ATTEMPTS) {
             await waitForProbeRetry(attempt * 1_000, controller.signal);
           }
@@ -445,9 +463,7 @@ export async function probeCopilotCatalog(options: {
       }
       if (!rows[index]) {
         const detail = lastError instanceof Error ? lastError.message : String(lastError);
-        throw new Error(`copilot ACP model probe failed for ${model.value}: ${detail}`, {
-          cause: lastError,
-        });
+        throw new Error(`copilot ACP model probe failed for ${model.value}: ${detail}`);
       }
     }
     if (controller.signal.aborted) {
@@ -460,6 +476,8 @@ export async function probeCopilotCatalog(options: {
       defaultModel: discovery.defaultModel,
       models: rows as CopilotCatalogProbeModel[],
     };
+  } catch (error) {
+    throw sanitizedCopilotProbeError(error, env);
   } finally {
     clearTimeout(overallTimer);
   }

@@ -119,6 +119,13 @@ export interface CatalogModel {
   compatibility: string | null;
   applicationMode: CatalogApplicationMode;
   bindings: CatalogSelectionBinding[];
+  /**
+   * Optional, human-readable record of HOW this row was established — e.g.
+   * `acp-live` vs `verified-overlay (2026-09-02, …)`. A generic carrier only:
+   * the adapter owns its wording, core never parses it. Adapters that publish a
+   * single uniform source leave it unset.
+   */
+  provenance?: string;
 }
 
 export interface AdapterCatalogCandidate {
@@ -357,6 +364,7 @@ export interface ManifestCatalogModel {
   serviceTiers?: ReadonlyArray<string>;
   pricingCategory?: string | null;
   compatibility?: string | null;
+  provenance?: string;
   effort?: {
     mechanism: CatalogEffortMechanism;
     configId?: string;
@@ -462,6 +470,7 @@ export function manifestCatalogSource(opts: {
           effort,
           pricingCategory: raw.pricingCategory ?? null,
           compatibility: raw.compatibility ?? null,
+          ...(raw.provenance ? { provenance: raw.provenance } : {}),
           applicationMode: opts.applicationMode ?? "freshSession",
           bindings: choices.map((choice) => ({
             model: raw.modelId,

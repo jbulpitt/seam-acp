@@ -24,9 +24,13 @@ Production sources are explicit for every registered profile:
 - Copilot probes ACP model configuration and re-probes each model's available
   effort values and selected default. Extra credential profiles probe with the
   same credential-scoped environment as runtime spawn.
-- Claude, extra Claude profiles, Vertex Claude, and Z.ai use validated manifests
-  with verified context limits. Their scope includes credentials/backend and,
-  for Vertex, project and region.
+- Direct Anthropic Claude and extra direct credential profiles are **live-first**
+  (#232): they probe ACP for the advertised model list and each model's own
+  effort options, then re-add JSONL-verified canonical models the wrapper does
+  not advertise as a `verified-overlay`. See "Direct Claude" below.
+- Vertex Claude and Z.ai use validated manifests with verified context limits
+  and **do not inherit the direct catalog**. Their scope includes
+  credentials/backend and, for Vertex, project and region.
 - Codex reads its bounded host-local model cache unless an operator manifest is
   pinned, preserving per-model supported/default reasoning levels plus native,
   maximum, and effective context data from that cache.
@@ -36,6 +40,64 @@ Production sources are explicit for every registered profile:
   configured manifests are the validated no-discovery strategy.
 - Parked/optional Ollama Cloud uses its curated Codex manifest and a separate
   provider scope.
+
+## Direct Claude: live base + verified overlay (#232)
+
+Direct Anthropic is the one adapter where neither pure strategy is correct, so
+it runs both and merges them in the Claude adapter
+(`packages/adapters/src/profiles/claude-catalog.ts`). Core learns no Claude
+naming convention.
+
+**Why.** Measured on this subscription (2026-09-08, claude-agent-acp 0.73.0) the
+wrapper advertises exactly `default, opus[1m], claude-fable-5-1[1m], sonnet,
+haiku`. Five canonical models that are reachable and JSONL-verified —
+`claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-fable-5`,
+`claude-sonnet-5` — are **absent** from it; Seam reaches them by forwarding the
+canonical id through `ANTHROPIC_MODEL`. A live-only catalog would silently
+delete five working models. A static-only catalog (the pre-#232 behavior) never
+measures per-model capability — it would, for example, offer `haiku` an effort
+level that model does not advertise.
+
+**How.**
+
+- The live ACP list is the operational base. Each advertised model is observed
+  in its **own fresh session**, spawned with the same credential-scoped
+  environment runtime spawn uses for that model. A session selects at most one
+  model, so one model's state can never decide another's advertised default.
+- Discovery **spends no model tokens**: it never sends `session/prompt`. Only
+  `initialize`, `session/new`, one `session/set_config_option`, `session/close`.
+- `CLAUDE_VERIFIED_OVERLAY` re-adds a verified canonical model **only when
+  absent from ACP**, carrying verification date, wrapper and Claude Code
+  version, credential scope, resolved model, context window, and effort
+  evidence. Each published row records that in `provenance`
+  (`acp-live…` or `verified-overlay; absent from ACP; …`).
+- Merging is by **canonical identity**: `claude-fable-5-1[1m]` folds onto
+  `claude-fable-5-1` (raw id kept as an alias), so live and overlay never
+  publish the same model twice. The `[1m]` suffix is stripped only for full
+  canonical ids — never for a bare alias, because stripping `opus[1m]` would
+  mint `opus`, which the model-management runbook records as fuzzy-resolving to
+  a different family.
+- **Nothing is inferred from a label, a display name, an id substring, or a
+  model's self-report.** Context windows come from the JSONL-verified table
+  only; a live model with no verified window publishes a null window rather than
+  a guess. When ACP echoes an alias back unresolved (measured: `default` →
+  `default`), the row does not manufacture a resolution — it quotes the latest
+  verified resolution with its provenance, or says the resolution is unverified.
+- The **default** is the operator's configured `CLAUDE_DEFAULT_MODEL`, never the
+  bare wrapper session's `currentValue` (measured: `sonnet`), which would
+  silently move every new thread off the configured model.
+- A probe failure **throws**, so `ModelCatalogService` retains the previous
+  generation rather than overwriting good live data with a narrower guess. A
+  wrapper release that temporarily stops advertising a verified model does not
+  remove it: the overlay re-adds it.
+
+Refreshing the overlay is a controlled, token-spending maintenance operation
+(model-management runbook §4/§4a/§13), never part of a refresh. Inspect what a
+refresh would publish, for free, with:
+
+```bash
+npm run build && node scripts/claude-catalog-probe.mjs --clean-env
+```
 
 Remote bridges expose adapter-owned `describeModelCatalog` (scope-only) and
 `fetchModelCatalog` RPCs. The core

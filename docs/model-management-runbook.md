@@ -748,10 +748,109 @@ session that already has history:
   (`fastMode`), `config_describe`, `threads()`, the confirmation card, the
   status card footer (`⚡ fast …`), and the config audit trail.
 
-### 12.5 Verification boundary — do not spend credits casually
+### 12.5 Verification boundary — do not spend credits casually (Fast mode)
 
 The probe above proves **advertisement and acceptance** and costs nothing.
 Proving a completion was actually *served* in Fast mode requires a **paid**
 usage-credit turn and inspection of the resulting `fast_mode_state`. Do not run
 that without explicit authorization from the account owner; note in any report
 which of the two you actually did.
+
+---
+
+## 13. The live catalog and the verified overlay (#232)
+
+Since #232 the **direct** Anthropic Claude profiles (the base profile and any
+extra credential profiles) no longer publish a static model list. They publish a
+**live ACP-discovered catalog merged with a verified overlay**. Vertex, Z.ai,
+Ollama Cloud and every other Anthropic-compatible backend are explicitly
+deferred and still use validated manifests — they must not inherit this catalog.
+
+Nothing in this section changes the discipline of §4: **the overlay is only as
+good as the JSONL evidence behind it.**
+
+### 13.1 Why both halves exist
+
+Measured 2026-09-08 on claude-agent-acp 0.73.0, the wrapper advertises exactly:
+
+```
+default, opus[1m], claude-fable-5-1[1m], sonnet, haiku
+```
+
+Five canonical models in the §5 picker are **absent** from that list —
+`claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-fable-5`,
+`claude-sonnet-5` — and are reachable only because the Seam profile forwards the
+canonical id through `ANTHROPIC_MODEL` (§3a). So:
+
+- **live-only** would silently delete five verified, working models;
+- **static-only** (the pre-#232 behavior) never measures capability — it offered
+  `haiku` an effort level `haiku` does not advertise.
+
+The live list is therefore the operational base, and `CLAUDE_VERIFIED_OVERLAY`
+(`packages/adapters/src/profiles/claude-catalog.ts`) re-adds a verified model
+**only when ACP does not advertise it**.
+
+### 13.2 What discovery may and may not do
+
+- It **spends no tokens**. It sends `initialize`, `session/new`, at most one
+  `session/set_config_option`, `session/close`. It never sends `session/prompt`.
+- Each advertised model is observed in its **own fresh session**. A session
+  selects at most one model, so one model's state can never decide another
+  model's advertised effort or default. (An alias like `default` is *not*
+  selected by `ANTHROPIC_MODEL`, so it must be selected explicitly in its own
+  session — otherwise the probe reads whatever the wrapper started on, measured
+  as `sonnet`, and publishes it under the alias's name. That bug was caught live
+  during #232; the regression test is `test/claude-live-catalog.test.ts`.)
+- It **never infers** identity, context window, or effort from a label, a
+  display name, an id substring, or a model's self-report. Windows come from
+  `CLAUDE_CONTEXT_WINDOWS` (§6) alone; an unverified live model publishes a
+  **null** window rather than a guess.
+- When ACP echoes an alias back unresolved (`default` → `default`), the row does
+  **not** manufacture a resolution. It quotes the latest verified resolution with
+  full provenance, or states plainly that the resolution is unverified.
+
+### 13.3 Inspect a refresh for free
+
+```bash
+npm run build
+node scripts/claude-catalog-probe.mjs --clean-env            # default credentials
+node scripts/claude-catalog-probe.mjs --clean-env --config-dir /path/to/dir
+```
+
+This runs the shipped adapter code, so it cannot drift from what a real refresh
+publishes. `--clean-env` strips the `CLAUDECODE` / `CLAUDE_CODE_*` variables a
+parent Claude Code session leaks; systemd never sets them, and they change what
+the wrapper advertises. Read `provenance` on every row.
+
+### 13.4 Updating the overlay — a controlled, token-spending operation
+
+Do this only deliberately; **never** as part of a refresh.
+
+1. Run §4 (JSONL ground truth) and §4a (raw-CLI `/context`) for the model.
+2. Confirm §6 agrees for its window.
+3. Confirm §11 for the effort levels actually applied.
+4. Edit `CLAUDE_VERIFIED_OVERLAY` and update that entry's `verifiedOn`,
+   `wrapperVersion`, `claudeCodeVersion`, `credentialScope`, `resolvedModel`,
+   `contextWindow`, `effortChoices`, `evidence`.
+5. Bump `CLAUDE_VERIFIED_OVERLAY_VERSION`. It is published as the catalog's
+   `sourceVersion`, so an auditor can tell which generation of evidence a stored
+   snapshot carries.
+6. Re-run 13.3 and confirm the rows you expect, then `/seamadmin catalog refresh`.
+
+**Never edit a row to match a hope.** An overlay entry asserts that a paid,
+JSONL-verified turn once proved that model resolved and served as recorded.
+
+The recorded `credentialScope` is the scope the evidence was captured on
+(`default` = `~/.claude`). Extra credential profiles publish independently
+scoped snapshots and reuse the same overlay, so their rows carry provenance
+naming a scope that is not their own — verify a representative overlay model on
+an alternate profile before trusting it there.
+
+### 13.5 Failure behavior
+
+A probe failure **throws**, so `ModelCatalogService` retains the previous
+generation (`retained`) rather than overwriting good live data with a narrower
+guess. With no previous generation the binding reports `warming` and selection
+fails closed — the same contract every live-probing adapter has. A wrapper
+release that temporarily stops advertising a verified model does **not** drop
+it: the overlay re-adds it.

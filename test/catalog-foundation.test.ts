@@ -19,6 +19,8 @@ import {
   catalogReductionFingerprint,
   catalogScopeFingerprint,
   invokeAdapterRpc,
+  normalizeCatalogCandidate,
+  sortCatalogEvidence,
   manifestCatalogSource,
   upgradeCatalogCandidate,
   CATALOG_EVIDENCE_MAX_RECORDS,
@@ -299,7 +301,10 @@ describe("#236 per-model description and structured evidence", () => {
     });
     const loaded = reloaded.lookup(binding).snapshot!.candidate.models[0]!;
     expect(loaded.description).toBe("The outlier flagship.");
-    expect(loaded.evidence).toEqual(rows[0]!.evidence);
+    // Evidence is a SET stored in canonical order, so the round trip is
+    // compared against that order rather than the adapter's input order.
+    expect(loaded.evidence).toEqual(sortCatalogEvidence(rows[0]!.evidence!));
+    expect(loaded.evidence).toHaveLength(rows[0]!.evidence!.length);
     reopened.close();
   });
 });
@@ -1102,8 +1107,9 @@ describe("#236 evidence ordering is a TOTAL canonical order", () => {
   it("checksums identically when tied records arrive in either order", () => {
     const a = tied("alpha note");
     const b = tied("beta note");
-    const forward = candidate([model("nebula", { default: true, evidence: [a, b] })]);
-    const reverse = candidate([model("nebula", { default: true, evidence: [b, a] })]);
+    // The boundary both the bridge and core run: it normalizes, then validates.
+    const forward = normalizeCatalogCandidate(candidate([model("nebula", { default: true, evidence: [a, b] })]));
+    const reverse = normalizeCatalogCandidate(candidate([model("nebula", { default: true, evidence: [b, a] })]));
     validateCandidate(forward);
     validateCandidate(reverse);
     // The previous comparator stopped at the three primary keys, so these two
@@ -1127,7 +1133,7 @@ describe("#236 evidence ordering is a TOTAL canonical order", () => {
           );
     const checksums = new Set(
       permute(records).map((order) => {
-        const built = candidate([model("nebula", { default: true, evidence: order })]);
+        const built = normalizeCatalogCandidate(candidate([model("nebula", { default: true, evidence: order })]));
         validateCandidate(built);
         return catalogContentChecksum(built);
       })
@@ -1139,8 +1145,8 @@ describe("#236 evidence ordering is a TOTAL canonical order", () => {
   it("does NOT reorder arrays whose order is provider-meaningful", () => {
     // Models are a preference order and effort choices are a display order;
     // reordering them IS a real change and must surface as one.
-    const a = candidate([model("nebula", { default: true }), model("quasar")]);
-    const b = candidate([model("quasar"), model("nebula", { default: true })]);
+    const a = normalizeCatalogCandidate(candidate([model("nebula", { default: true }), model("quasar")]));
+    const b = normalizeCatalogCandidate(candidate([model("quasar"), model("nebula", { default: true })]));
     validateCandidate(a);
     validateCandidate(b);
     expect(catalogContentChecksum(a)).not.toBe(catalogContentChecksum(b));

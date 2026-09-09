@@ -18,6 +18,7 @@ import {
   MODEL_CATALOG_SCHEMA_VERSION,
   parseCatalogEvidenceList,
   assertCatalogDescription,
+  normalizeCatalogCandidate,
   upgradeCatalogCandidate,
   validateCatalogEvidence,
   type CatalogReductionPolicy,
@@ -139,8 +140,11 @@ export class ModelCatalogService {
         // (still supported) schema keeps serving instead of cold-starting.
         const upgraded = upgradeCatalogCandidate(snapshot.candidate);
         if (!upgraded) throw new Error(`unsupported model catalog schema ${String(snapshot.candidate?.schemaVersion)}`);
-        validateCandidate(upgraded);
-        this.snapshots.set(snapshot.scopeKey, deepFreeze({ ...snapshot, candidate: upgraded }));
+        // Same boundary on the way IN: a snapshot written before this policy
+        // existed is sanitized as it loads rather than serving a raw value.
+        const normalized = normalizeCatalogCandidate(upgraded);
+        validateCandidate(normalized);
+        this.snapshots.set(snapshot.scopeKey, deepFreeze({ ...snapshot, candidate: normalized }));
       } catch (err) {
         options.logger.warn({ err, scopeKey: snapshot.scopeKey }, "ignored incompatible stored model catalog generation");
       }
@@ -310,11 +314,12 @@ export class ModelCatalogService {
       return { ...base, ok: Boolean(prior), result: "unavailable", error };
     }
     try {
-      const { candidate, fetchedBy } = await this.fetchCandidate(binding);
+      const { candidate: fetched, fetchedBy } = await this.fetchCandidate(binding);
       // The portable screen runs again here: a candidate may have arrived over
       // the bridge, and a remote host is not a trust boundary we defer past.
-      // It also normalizes evidence into canonical order before checksumming.
-      validateCatalogEvidence(candidate);
+      // Normalization returns the sanitized, canonically ordered candidate that
+      // is what actually gets checksummed and persisted.
+      const candidate = normalizeCatalogCandidate(fetched);
       validateCandidate(candidate);
       const checksum = candidateChecksum(candidate);
       const desiredScope = trustworthyFingerprint(candidate.scope.fingerprint)
@@ -541,11 +546,10 @@ function uniqueBindings(bindings: ReadonlyArray<CatalogBinding>): CatalogBinding
 
 export function validateCandidate(candidate: AdapterCatalogCandidate): void {
   if (!candidate || typeof candidate !== "object") throw new Error("catalog candidate is malformed");
-  // Exact-key closure for the WHOLE graph AND canonical evidence normalization,
-  // at the CORE boundary too — not only at the bridge. Everything persisted or
-  // loaded goes through here, so an undeclared key cannot ride into a durable
-  // schema-1 snapshot, and evidence is put into its canonical total order
-  // BEFORE any checksum, diff, or reduction fingerprint is taken.
+  // Exact-key closure AND declared-value policy for the WHOLE graph, at the
+  // CORE boundary too — not only at the bridge. Strict by design: everything
+  // reaching here has already been through `normalizeCatalogCandidate`, so a
+  // surviving raw path/PII/credential value means the boundary was bypassed.
   validateCatalogEvidence(candidate);
   // A RANGE, not an equality (#236). Accepting only the exact current version
   // meant the next schema bump would discard every durable last-known-good

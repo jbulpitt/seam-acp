@@ -447,3 +447,348 @@ export function assertClosedCatalogShape(candidate: unknown): void {
     }
   });
 }
+
+// ---------------------------------------------------------------------------
+// Declared-VALUE validation for the whole candidate graph.
+//
+// Exact-key closure only says which keys may exist. Without value validation a
+// declared field still accepted anything: an object where a version string
+// belongs, a fractional context window, 5,000 aliases, or an e-mail address and
+// an `~/.ssh` path inside a scope field — all of which then crossed the bridge
+// and were serialized into a schema-1 snapshot.
+//
+// Everything here is shape/format/content policy only. No provider vocabulary.
+// ---------------------------------------------------------------------------
+
+import { createHash } from "node:crypto";
+
+/** Cardinality ceilings. Generous for real providers, fatal for a flood. */
+export const CATALOG_MAX_MODELS = 512;
+export const CATALOG_MAX_ALIASES = 32;
+export const CATALOG_MAX_EFFORT_CHOICES = 64;
+export const CATALOG_MAX_BINDINGS = 4_096;
+export const CATALOG_MAX_MODALITIES = 16;
+export const CATALOG_MAX_SERVICE_TIERS = 16;
+/** No real context window is larger than this; anything above is nonsense. */
+export const CATALOG_MAX_CONTEXT_TOKENS = 100_000_000;
+
+const VISION_MODES = ["native", "tool", "none"];
+const AVAILABILITY = ["available", "unavailable"];
+const LIFECYCLES = ["stable", "preview", "deprecated", "retired"];
+const APPLICATION_MODES = ["live", "reload", "freshSession"];
+const EFFORT_MECHANISMS = ["meta", "configOption", "spawnArgs", "modelBaked", "none"];
+
+/** Absolute or home-relative filesystem path, in any field. */
+const ABSOLUTE_PATH = /(^|[\s"'(=])(?:[a-zA-Z]:[\\/]|\/|~\/|\.\.\/)/;
+
+function fail(path: string, detail: string): never {
+  throw new CatalogEvidenceError(path, detail);
+}
+
+/** A required scalar string that must not be an object/array/number. */
+function requireLabel(path: string, value: unknown, max = CATALOG_EVIDENCE_TEXT_MAX): string {
+  if (typeof value !== "string") {
+    fail(path, `must be a string (got ${Array.isArray(value) ? "array" : typeof value})`);
+  }
+  return assertLabelValue(path, value, max);
+}
+
+function optionalLabel(path: string, value: unknown, max = CATALOG_EVIDENCE_TEXT_MAX): string | undefined {
+  if (value === undefined) return undefined;
+  return requireLabel(path, value, max);
+}
+
+function optionalNullableLabel(path: string, value: unknown, max = CATALOG_EVIDENCE_TEXT_MAX): void {
+  if (value === undefined || value === null) return;
+  requireLabel(path, value, max);
+}
+
+/** Shared label policy: bounded, charset-constrained, content-screened. */
+function assertLabelValue(path: string, value: string, max: number): string {
+  if (!value.length) fail(path, "must not be empty");
+  if (value.length > max) fail(path, `exceeds ${max} characters`);
+  if (!LABEL_CHARSET.test(value)) fail(path, "contains characters not allowed in an identifier");
+  if (ABSOLUTE_PATH.test(value)) fail(path, "must not contain a filesystem path");
+  const unsafe = looksUnsafeForCatalog(value, false);
+  if (unsafe) fail(path, `rejected content (${unsafe})`);
+  return value;
+}
+
+/** Human display text: wider than a label, still screened for secrets and PII. */
+function requireDisplayText(path: string, value: unknown, max: number): string {
+  if (typeof value !== "string") {
+    fail(path, `must be a string (got ${Array.isArray(value) ? "array" : typeof value})`);
+  }
+  if (!value.length) fail(path, "must not be empty");
+  if (value.length > max) fail(path, `exceeds ${max} characters`);
+  if (ABSOLUTE_PATH.test(value)) fail(path, "must not contain a filesystem path");
+  const unsafe = looksUnsafeForCatalog(value, true);
+  if (unsafe) fail(path, `rejected content (${unsafe})`);
+  return value;
+}
+
+/** A context window: finite, integral, positive, and not absurd. */
+function requireContextValue(path: string, value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number") fail(path, `must be a number or null (got ${typeof value})`);
+  if (!Number.isFinite(value)) fail(path, "must be finite");
+  if (!Number.isInteger(value)) fail(path, "must be an integer");
+  if (value <= 0) fail(path, "must be positive");
+  if (value > CATALOG_MAX_CONTEXT_TOKENS) fail(path, `exceeds ${CATALOG_MAX_CONTEXT_TOKENS}`);
+  return value;
+}
+
+function requireEnum(path: string, value: unknown, allowed: ReadonlyArray<string>): string {
+  if (typeof value !== "string" || !allowed.includes(value)) {
+    fail(path, `must be one of ${allowed.join(" | ")}`);
+  }
+  return value;
+}
+
+function requireBoundedList(
+  path: string,
+  value: unknown,
+  max: number,
+  itemMax: number,
+  opts: { requireNonEmpty?: boolean } = {}
+): string[] {
+  if (!Array.isArray(value)) fail(path, "must be an array");
+  if (opts.requireNonEmpty && value.length === 0) fail(path, "must not be empty");
+  if (value.length > max) fail(path, `exceeds ${max} entries`);
+  const items = value.map((entry, index) => requireLabel(`${path}[${index}]`, entry, itemMax));
+  if (new Set(items).size !== items.length) fail(path, "must be unique");
+  return items;
+}
+
+/**
+ * Scope identity fields carry operator-supplied values that are LEGITIMATELY
+ * host-shaped in production — a credential config directory, a base URL. They
+ * are sanitized rather than rejected: rejecting would fail every real refresh
+ * and take the catalog cold, while keeping the raw value would persist a home
+ * path into a durable snapshot that is then transported and rendered.
+ *
+ * A value that is already a safe identifier is kept verbatim. Anything else is
+ * replaced by a stable, non-reversible reference. Scope DISTINCTNESS is
+ * preserved because the reference is a function of the original value — and the
+ * scope `fingerprint` itself is computed by the adapter from the raw values
+ * before this runs, so semantic scope identity is untouched either way.
+ */
+export function sanitizeScopeIdentifier(value: string): string {
+  const safe =
+    value.length > 0 &&
+    value.length <= CATALOG_EVIDENCE_TEXT_MAX &&
+    LABEL_CHARSET.test(value) &&
+    !ABSOLUTE_PATH.test(value) &&
+    !looksUnsafeForCatalog(value, false);
+  if (safe) return value;
+  return `ref:${createHash("sha256").update(value).digest("hex").slice(0, 16)}`;
+}
+
+const HEX_FINGERPRINT = /^[a-f0-9]{64}$/;
+
+/**
+ * Validate every DECLARED value in the candidate. PURE — it never mutates.
+ *
+ * Mutating here was wrong: adapters memoize their scope object (and
+ * `asRemoteCatalogAdapter` memoizes the whole candidate), and the service
+ * deep-freezes what it publishes, so a second refresh would write to a frozen
+ * object. {@link normalizeCatalogCandidate} produces the sanitized COPY that is
+ * actually transported and persisted, and this assertion then holds that copy
+ * to the strict policy — so a raw unsafe value can never reach a snapshot, and
+ * a direct `validateCandidate` on a hostile candidate still refuses it.
+ */
+export function assertCatalogValues(candidate: unknown): void {
+  const root = candidate as Record<string, unknown>;
+  if (!root || typeof root !== "object" || Array.isArray(root)) fail("candidate", "must be an object");
+
+  if (!Number.isInteger(root.schemaVersion)) fail("candidate.schemaVersion", "must be an integer");
+  if (!Number.isInteger(root.adapterVersion) || (root.adapterVersion as number) < 1) {
+    fail("candidate.adapterVersion", "must be a positive integer");
+  }
+  requireLabel("candidate.source", root.source);
+  optionalLabel("candidate.sourceVersion", root.sourceVersion);
+  optionalLabel("candidate.cliVersion", root.cliVersion);
+  if (typeof root.fetchedAt !== "string" || !Number.isFinite(Date.parse(root.fetchedAt))) {
+    fail("candidate.fetchedAt", "must be an ISO-8601 timestamp");
+  }
+
+  const scope = root.scope as Record<string, unknown>;
+  if (!scope || typeof scope !== "object" || Array.isArray(scope)) fail("candidate.scope", "must be an object");
+  if (typeof scope.fingerprint !== "string" || !scope.fingerprint.length) {
+    fail("candidate.scope.fingerprint", "must be a non-empty string");
+  }
+  if (!HEX_FINGERPRINT.test(scope.fingerprint)) {
+    assertLabelValue("candidate.scope.fingerprint", scope.fingerprint, CATALOG_EVIDENCE_TEXT_MAX);
+  }
+  requireLabel("candidate.scope.provider", scope.provider);
+  for (const field of SCOPE_IDENTITY_FIELDS) {
+    const value = scope[field];
+    if (value === undefined) continue;
+    if (typeof value !== "string") {
+      fail(`candidate.scope.${field}`, `must be a string (got ${Array.isArray(value) ? "array" : typeof value})`);
+    }
+    // Strict here: by the time anything is validated it has been normalized, so
+    // a surviving path/PII/credential value means it bypassed the boundary.
+    assertLabelValue(`candidate.scope.${field}`, value, CATALOG_EVIDENCE_TEXT_MAX);
+  }
+
+  const models = root.models;
+  if (!Array.isArray(models)) fail("candidate.models", "must be an array");
+  if (models.length > CATALOG_MAX_MODELS) fail("candidate.models", `exceeds ${CATALOG_MAX_MODELS} entries`);
+  models.forEach((raw, index) => assertModelValues(`candidate.models[${index}]`, raw));
+}
+
+function assertModelValues(path: string, raw: unknown): void {
+  const model = raw as Record<string, unknown>;
+  if (!model || typeof model !== "object" || Array.isArray(model)) fail(path, "must be an object");
+
+  requireLabel(`${path}.id`, model.id);
+  requireLabel(`${path}.runtimeId`, model.runtimeId);
+  requireDisplayText(`${path}.displayName`, model.displayName, CATALOG_EVIDENCE_TEXT_MAX);
+  if (typeof model.default !== "boolean") fail(`${path}.default`, "must be a boolean");
+  requireBoundedList(`${path}.aliases`, model.aliases, CATALOG_MAX_ALIASES, CATALOG_EVIDENCE_TEXT_MAX);
+  requireEnum(`${path}.visionMode`, model.visionMode, VISION_MODES);
+  requireEnum(`${path}.availability`, model.availability, AVAILABILITY);
+  requireEnum(`${path}.lifecycle`, model.lifecycle, LIFECYCLES);
+  requireEnum(`${path}.applicationMode`, model.applicationMode, APPLICATION_MODES);
+  requireBoundedList(`${path}.serviceTiers`, model.serviceTiers, CATALOG_MAX_SERVICE_TIERS, CATALOG_EVIDENCE_TEXT_MAX);
+  optionalNullableLabel(`${path}.pricingCategory`, model.pricingCategory);
+  optionalNullableLabel(`${path}.compatibility`, model.compatibility);
+
+  const context = model.context as Record<string, unknown>;
+  if (!context || typeof context !== "object" || Array.isArray(context)) fail(`${path}.context`, "must be an object");
+  const native = requireContextValue(`${path}.context.native`, context.native);
+  const maximum = requireContextValue(`${path}.context.maximum`, context.maximum);
+  const effective = requireContextValue(`${path}.context.effective`, context.effective);
+  if (native !== null && maximum !== null && native > maximum) {
+    fail(`${path}.context`, "native exceeds maximum");
+  }
+  if (effective !== null && maximum !== null && effective > maximum) {
+    fail(`${path}.context`, "effective exceeds maximum");
+  }
+
+  const modalities = model.modalities as Record<string, unknown>;
+  if (!modalities || typeof modalities !== "object" || Array.isArray(modalities)) {
+    fail(`${path}.modalities`, "must be an object");
+  }
+  requireBoundedList(`${path}.modalities.input`, modalities.input, CATALOG_MAX_MODALITIES, CATALOG_EVIDENCE_LIST_ITEM_MAX, { requireNonEmpty: true });
+  requireBoundedList(`${path}.modalities.output`, modalities.output, CATALOG_MAX_MODALITIES, CATALOG_EVIDENCE_LIST_ITEM_MAX, { requireNonEmpty: true });
+
+  const effort = model.effort as Record<string, unknown>;
+  if (!effort || typeof effort !== "object" || Array.isArray(effort)) fail(`${path}.effort`, "must be an object");
+  const mechanism = requireEnum(`${path}.effort.mechanism`, effort.mechanism, EFFORT_MECHANISMS);
+  const configId = optionalLabel(`${path}.effort.configId`, effort.configId, CATALOG_EVIDENCE_LIST_ITEM_MAX);
+  if (mechanism === "configOption" && !configId) {
+    fail(`${path}.effort.configId`, "is required when mechanism is configOption");
+  }
+  if (!Array.isArray(effort.choices)) fail(`${path}.effort.choices`, "must be an array");
+  if (!effort.choices.length) fail(`${path}.effort.choices`, "must not be empty");
+  if (effort.choices.length > CATALOG_MAX_EFFORT_CHOICES) {
+    fail(`${path}.effort.choices`, `exceeds ${CATALOG_MAX_EFFORT_CHOICES} entries`);
+  }
+  const choiceIds = effort.choices.map((choice, index) => {
+    const entry = choice as Record<string, unknown>;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      fail(`${path}.effort.choices[${index}]`, "must be an object");
+    }
+    optionalLabel(`${path}.effort.choices[${index}].raw`, entry.raw, CATALOG_EVIDENCE_LIST_ITEM_MAX);
+    return requireLabel(`${path}.effort.choices[${index}].id`, entry.id, CATALOG_EVIDENCE_LIST_ITEM_MAX);
+  });
+  if (new Set(choiceIds).size !== choiceIds.length) fail(`${path}.effort.choices`, "ids must be unique");
+  const selectionDefault = requireLabel(
+    `${path}.effort.selectionDefault`, effort.selectionDefault, CATALOG_EVIDENCE_LIST_ITEM_MAX
+  );
+  if (!choiceIds.includes(selectionDefault)) {
+    fail(`${path}.effort.selectionDefault`, "is not among the declared choices");
+  }
+
+  if (!Array.isArray(model.bindings)) fail(`${path}.bindings`, "must be an array");
+  if (model.bindings.length > CATALOG_MAX_BINDINGS) {
+    fail(`${path}.bindings`, `exceeds ${CATALOG_MAX_BINDINGS} entries`);
+  }
+  model.bindings.forEach((binding, index) => {
+    const entry = binding as Record<string, unknown>;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      fail(`${path}.bindings[${index}]`, "must be an object");
+    }
+    requireLabel(`${path}.bindings[${index}].model`, entry.model);
+    requireLabel(`${path}.bindings[${index}].effort`, entry.effort, CATALOG_EVIDENCE_LIST_ITEM_MAX);
+    requireLabel(`${path}.bindings[${index}].rawModel`, entry.rawModel);
+    optionalLabel(`${path}.bindings[${index}].rawEffort`, entry.rawEffort, CATALOG_EVIDENCE_LIST_ITEM_MAX);
+  });
+}
+
+/** Scope fields that legitimately carry operator/host-shaped values. */
+export const SCOPE_IDENTITY_FIELDS = [
+  "credentialProfile", "backend", "project", "region", "policy",
+] as const;
+
+/**
+ * Produce the candidate that is actually transported and persisted: scope
+ * identity fields sanitized into safe references, evidence in canonical total
+ * order, everything else validated. Never mutates its input, and only copies
+ * the parts it must change.
+ *
+ * Run at BOTH boundaries — before a bridge returns, and before core persists or
+ * loads — so a raw home path, e-mail address, or credential can never reach a
+ * durable schema-1 snapshot even though the raw value is a legitimate thing for
+ * an adapter to have computed locally.
+ */
+export function normalizeCatalogCandidate<T>(candidate: T): T {
+  assertClosedCatalogShape(candidate);
+  const root = candidate as unknown as Record<string, unknown>;
+  const scope = root.scope as Record<string, unknown>;
+  let nextScope: Record<string, unknown> | undefined;
+  if (scope && typeof scope === "object" && !Array.isArray(scope)) {
+    if (typeof scope.fingerprint === "string" && !HEX_FINGERPRINT.test(scope.fingerprint)) {
+      const safe = sanitizeScopeIdentifier(scope.fingerprint);
+      if (safe !== scope.fingerprint) nextScope = { ...scope, fingerprint: safe };
+    }
+    for (const field of SCOPE_IDENTITY_FIELDS) {
+      const value = (nextScope ?? scope)[field];
+      if (typeof value !== "string") continue;
+      const safe = sanitizeScopeIdentifier(value);
+      if (safe !== value) nextScope = { ...(nextScope ?? scope), [field]: safe };
+    }
+  }
+
+  const models = root.models;
+  let nextModels: unknown[] | undefined;
+  if (Array.isArray(models)) {
+    models.forEach((raw, index) => {
+      const model = raw as Record<string, unknown>;
+      if (!model || typeof model !== "object" || Array.isArray(model)) return;
+      if (model.evidence === undefined) return;
+      const ordered = sortCatalogEvidence(
+        parseCatalogEvidenceList(`${String(model.id)}.evidence`, model.evidence)
+      );
+      const before = model.evidence as unknown[];
+      const changed =
+        !Array.isArray(before) ||
+        before.length !== ordered.length ||
+        ordered.some((record, i) => canonicalJson(record) !== canonicalJson(before[i]));
+      if (!changed) return;
+      nextModels ??= [...models];
+      nextModels[index] = { ...model, evidence: ordered };
+    });
+  }
+
+  const normalized = (nextScope || nextModels
+    ? { ...root, ...(nextScope ? { scope: nextScope } : {}), ...(nextModels ? { models: nextModels } : {}) }
+    : root) as unknown as T;
+  assertCatalogValues(normalized);
+  assertCatalogDescriptionsAndEvidence(normalized);
+  return normalized;
+}
+
+/** Description/evidence content policy, applied to the normalized candidate. */
+function assertCatalogDescriptionsAndEvidence(candidate: unknown): void {
+  const models = (candidate as Record<string, unknown>).models;
+  if (!Array.isArray(models)) return;
+  for (const raw of models) {
+    const model = raw as Record<string, unknown>;
+    const id = typeof model?.id === "string" ? model.id : "(unknown)";
+    if (model.description !== undefined) assertCatalogDescription(`${id}.description`, model.description);
+    if (model.evidence !== undefined) parseCatalogEvidenceList(`${id}.evidence`, model.evidence);
+  }
+}

@@ -64,6 +64,30 @@ malformed or secret-bearing content never crosses the wire in the first place.
 
 What it enforces:
 
+- **Declared-VALUE policy over the whole graph.** `assertCatalogValues` gives
+  every declared field an explicit type, format, range and content policy:
+  scalar version/config/source fields refuse object and array substitutions;
+  context windows must be finite positive integers within a sane ceiling (no
+  NaN, infinity, fractional or negative values); aliases, models, modalities,
+  service tiers, effort choices and bindings have cardinality and item-size
+  bounds with duplicate detection; enums are closed; and no field outside the
+  scope identity family may contain control characters, PII, credentials,
+  token-shaped strings, or an absolute/home/secret-bearing path.
+- **Scope identity fields are SANITIZED, not rejected.** `credentialProfile`,
+  `backend`, `project`, `region` and `policy` legitimately carry host-shaped
+  values in production — Codex puts `~/.codex` in `credentialProfile` — so
+  refusing them would fail every real refresh and take the catalog cold.
+  `normalizeCatalogCandidate` replaces an unsafe value with a stable,
+  non-reversible `ref:<digest>` before transport or persistence. Scope
+  DISTINCTNESS is preserved (the reference is a function of the original) and
+  semantic scope identity is untouched, because the `fingerprint` is computed by
+  the adapter from the raw values before normalization runs. Validation is then
+  strict, so a raw value reaching it means the boundary was bypassed.
+- **Normalization never mutates its input.** Adapters memoize their scope object
+  (and `asRemoteCatalogAdapter` memoizes the whole candidate) while the service
+  deep-freezes what it publishes, so an in-place sanitizer would throw on the
+  second refresh. `normalizeCatalogCandidate` returns a copy of only what it
+  must change.
 - **Exact-key closure over the WHOLE normalized graph.** `assertClosedCatalogShape`
   declares the complete key set for the candidate, `scope`, every model row,
   `context`, `modalities`, `effort`, each effort choice, each binding, and every
@@ -118,7 +142,10 @@ surfaces read — it is not itself an output. The surfaces are:
   the catalog state, generation, source, and the selected model's description
   and rendered evidence, so an audit entry can still explain a model choice
   after the catalog has moved on.
-- The **metadata enrichment join** carries the catalog-owned description.
+- The **metadata enrichment join** carries the catalog-owned description AND the
+  structured evidence, in its validated bounded representation, deduplicated by
+  canonical identity across agents advertising the same model and persisted in
+  the metadata cache.
 
 All three operator surfaces format through the one renderer in
 `packages/core/src/core/catalog-evidence-render.ts`, which bounds both the
@@ -202,18 +229,32 @@ writes to the child, so a catalog probe cannot spend model tokens.
 - **Close steps run in explicit phases: SESSION before CONNECTION**, never in
   registration order. A session is closed politely while its transport is still
   up.
-- **A finalization barrier means return actually means cleanup happened.** On
-  the deadline/abort path the helper aborts `handle.signal` first, then gives an
-  already-running `run` a *bounded* `closeGraceMs` to observe the abort and
-  finish registering its closes; late registrations are then drained to
-  quiescence before the helper settles. A cooperative provider returns
-  immediately — the grace is a ceiling, not a floor. Previously a late
-  registration was fired detached, so the helper could resolve while a session
-  close was still pending.
-- **Only an observed `exit` counts as reaped.** `terminate` no longer resolves
-  on `error`; a child that errors without exiting is reported `not_reaped`
-  rather than returned as a clean success, and both mutually raced listeners
-  (`spawn`/`error`, `exit`/`error`) are removed on every path.
+- **Settlement of `run` — not a fixed grace — is the authority for when
+  registration is complete.** On the deadline/abort path the helper aborts
+  `handle.signal`, then waits for the run to actually settle before closing the
+  registration phase and draining every registered close. A fixed grace was the
+  wrong authority: a registration that landed after it was fired detached, so
+  the helper could return while a session close was still pending.
+  `finalizeDeadlineMs` is only a ceiling so an uncooperative run cannot hang the
+  helper forever; hitting it terminates and reaps the child and then returns
+  `not_settled`.
+- **Registration phases are explicit.** While the phase is open a step is queued
+  and WILL be drained before return. Once it is closed — the helper has already
+  told its caller cleanup finished — a further registration is dropped and
+  counted (surfaced as a process warning), never run detached, so there are no
+  side effects after return.
+- **Pre-spawn and post-spawn `error` are different things.** Before a pid exists
+  an `error` is `spawn_failed`. After one exists the process is real and may
+  still be running, so it is a `protocol_error` that must still be terminated
+  and reaped; if no exit is observed the result is `not_reaped`. Classifying it
+  `spawn_failed` both misdescribed it and skipped the reaping question.
+- **Only an observed `exit` counts as reaped**, and `not_reaped` outranks every
+  other cause — a leaked process is the most actionable fact there is.
+- **A protective `error` listener is attached for the whole lifecycle and
+  removed last**, so an error emitted during teardown cannot become an uncaught
+  exception in the host (or an unhandled error in a test run). All other
+  listeners — including both mutually raced pairs, `spawn`/`error` and
+  `exit`/`error` — are removed on every path.
 - **`handle.signal`** aborts on every ending, so provider async work is
   cancelled too.
 - **Errors are structured codes** (`spawn_failed`, `exited_early`,

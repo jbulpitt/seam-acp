@@ -39,8 +39,13 @@ export const PROBE_STDERR_LIMIT_BYTES = 256_000;
 export const PROBE_DEFAULT_TIMEOUT_MS = 45_000;
 export const PROBE_DEFAULT_KILL_GRACE_MS = 2_000;
 export const PROBE_DEFAULT_REAP_MS = 2_000;
-/** Bounded window for a cancelled `run` to settle before finalization. */
-export const PROBE_DEFAULT_CLOSE_GRACE_MS = 2_000;
+/**
+ * Separate, bounded deadline for FINALIZATION: after cancellation, how long the
+ * provider run has to settle so its close registrations are complete. This is
+ * not the authority for "registration is done" — settlement of the run is. It
+ * exists only so a run that refuses to settle cannot hang the helper forever.
+ */
+export const PROBE_DEFAULT_FINALIZE_DEADLINE_MS = 10_000;
 /** How many times finalization re-drains newly registered close steps. */
 const LATE_CLOSE_DRAIN_ROUNDS = 8;
 
@@ -51,6 +56,7 @@ export type ProbeErrorCode =
   | "timeout"
   | "cancelled"
   | "not_reaped"
+  | "not_settled"
   | "protocol_error";
 
 /**
@@ -112,7 +118,12 @@ export interface BoundedProbeOptions<T> {
    * observe the abort and finish registering its close steps before we
    * finalize. Bounded on purpose: waiting forever would defeat the deadline.
    */
-  closeGraceMs?: number;
+  /**
+   * Bounded ceiling on finalization, NOT the signal that registration is
+   * complete — settlement of `run` is. A run that refuses to settle within it
+   * yields `not_settled`, after the child has been terminated and reaped.
+   */
+  finalizeDeadlineMs?: number;
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
   /** Label used in error detail. Must not carry secrets. */
@@ -175,7 +186,7 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   const stdoutLimit = options.maxStdoutBytes ?? PROBE_STDOUT_LIMIT_BYTES;
   const stderrLimit = options.maxStderrBytes ?? PROBE_STDERR_LIMIT_BYTES;
   const killGraceMs = options.killGraceMs ?? PROBE_DEFAULT_KILL_GRACE_MS;
-  const closeGraceMs = options.closeGraceMs ?? PROBE_DEFAULT_CLOSE_GRACE_MS;
+  const finalizeDeadlineMs = options.finalizeDeadlineMs ?? PROBE_DEFAULT_FINALIZE_DEADLINE_MS;
   const redact = (text: string): string => redactProbeText(text, options.env);
 
   if (options.signal?.aborted) {
@@ -196,8 +207,19 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   const controller = new AbortController();
   const closeSteps: CloseStep[] = [];
   let cleanupStarted = false;
-  let finalized = false;
+  /** True once the helper will accept no further close registrations. */
+  let registrationClosed = false;
+  /** Registrations that arrived after the phase closed (provider bug). */
+  let droppedRegistrations = 0;
   let succeeded = false;
+  /** Set when the run refused to settle inside the finalization deadline. */
+  let notSettled = false;
+  /** Code of the error currently unwinding, so finalization can rank causes. */
+  let thrownCode: ProbeErrorCode | undefined;
+  /** Set once a post-spawn `error` is seen, which is NOT a spawn failure. */
+  let postSpawnError: Error | undefined;
+  /** True once the OS has actually produced the process. */
+  let spawned = child.pid !== undefined;
   /** Close steps registered after cleanup began; drained before we return. */
   const lateWork: Promise<void>[] = [];
   /** The caller's own promise, so finalization can give it a bounded chance
@@ -244,9 +266,28 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   };
   child.stderr.on("data", onStderr);
 
+  /**
+   * A child `error` means two very different things depending on WHEN it
+   * arrives. Before the process exists it is a spawn failure (ENOENT, EACCES).
+   * AFTER a pid exists the process is real and may still be running, so
+   * classifying it `spawn_failed` both misdescribes it and skips the reaping
+   * question entirely — the child could be left alive.
+   */
   const onSpawnError = (err: Error): void => {
+    if (spawned || child.pid !== undefined) {
+      postSpawnError = err;
+      fail(new ProbeError("protocol_error", `${label}: ${redact(errorText(err))}`));
+      return;
+    }
     fail(new ProbeError("spawn_failed", `${label}: ${redact(errorText(err))}`));
   };
+  /**
+   * Kept attached for the WHOLE lifecycle and removed last, so an `error`
+   * emitted during teardown cannot surface as an uncaught exception in the
+   * host process (or as an unhandled error in a test run).
+   */
+  const swallowLateError = (): void => {};
+  child.on("error", swallowLateError);
   const onExit = (code: number | null, signalCode: NodeJS.Signals | null): void => {
     // Raw child stderr is NEVER attached; only its redacted tail.
     const tail = redact(stderrTail).trim();
@@ -263,12 +304,18 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   let onStarted: (() => void) | undefined;
   let onStartError: ((err: Error) => void) | undefined;
   const started = new Promise<void>((resolve, reject) => {
-    onStarted = () => resolve();
+    onStarted = () => { spawned = true; resolve(); };
     // Map to the CODED error here. Rejecting with Node's raw error would reach
     // `decorate` and be classified `protocol_error`, sending an operator to
     // debug a protocol when the executable is simply missing.
-    onStartError = (err: Error) =>
+    onStartError = (err: Error) => {
+      if (spawned || child.pid !== undefined) {
+        postSpawnError = err;
+        reject(new ProbeError("protocol_error", `${label}: ${redact(errorText(err))}`));
+        return;
+      }
       reject(new ProbeError("spawn_failed", `${label}: ${redact(errorText(err))}`));
+    };
     child.once("spawn", onStarted);
     child.once("error", onStartError);
   });
@@ -294,10 +341,14 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
       // its promise is tracked, so finalization drains it. Previously this was
       // a detached `void`, so `runBoundedProbe` could resolve while a session
       // close was still pending: return did not mean cleanup had happened.
-      if (finalized) {
-        // Past the barrier the caller has already been told cleanup is done, so
-        // this registration is a provider bug. Run it bounded and say so.
-        void withDeadline(step, killGraceMs);
+      // Explicit registration phases. While the phase is OPEN — including the
+      // whole finalization window, which stays open until `run` settles — a
+      // step is queued and WILL be drained before the helper returns. Once the
+      // phase is CLOSED the helper has already told its caller that cleanup
+      // finished, so running the step anyway would be a side effect after
+      // return; it is dropped and counted instead. Nothing is ever detached.
+      if (registrationClosed) {
+        droppedRegistrations += 1;
         return;
       }
       if (cleanupStarted) {
@@ -338,15 +389,25 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     succeeded = true;
     return value;
   } catch (err) {
-    throw decorate(err, label, redact);
+    const decorated = decorate(err, label, redact);
+    thrownCode = decorated.code;
+    throw decorated;
   } finally {
     cleanupStarted = true;
-    // Abort FIRST so a cooperative `run` observes cancellation, then give it a
-    // bounded chance to settle. Unbounded would reintroduce exactly the hang the
-    // deadline exists to prevent; bounded means a provider that honours the
-    // signal gets to finish registering its closes before we finalize.
+    // SETTLEMENT of the run — not a fixed grace — is what says registration is
+    // complete. Abort first so a cooperative `run` observes cancellation, then
+    // wait for it to actually settle. The deadline below is only a ceiling so a
+    // run that refuses to settle cannot hang the helper forever; when it is hit
+    // we terminate/reap the child and report `not_settled` rather than
+    // returning as though cleanup had completed.
     if (!controller.signal.aborted) controller.abort();
-    if (runPromise) await settledWithin(runPromise.then(() => undefined, () => undefined), closeGraceMs);
+    if (runPromise) {
+      const settled = await settledWithin(
+        runPromise.then(() => undefined, () => undefined),
+        finalizeDeadlineMs
+      );
+      if (!settled) notSettled = true;
+    }
     if (timer) clearTimeout(timer);
     if (options.signal && onOuterAbort) options.signal.removeEventListener("abort", onOuterAbort);
     child.removeListener("error", onSpawnError);
@@ -363,19 +424,50 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
         await withDeadline(entry.step, killGraceMs);
       }
     }
-    // Drain to quiescence: a close step may itself register another one.
+    // Drain to quiescence: a close step may itself register another one. The
+    // registration phase is still OPEN here, so anything a draining step
+    // registers is picked up by the next round rather than escaping.
     for (let round = 0; lateWork.length > 0 && round < LATE_CLOSE_DRAIN_ROUNDS; round++) {
       const pending = lateWork.splice(0, lateWork.length);
       await Promise.all(pending);
     }
-    finalized = true;
+    // Nothing may register from here on.
+    registrationClosed = true;
     const reaped = await terminate(child, killGraceMs);
-    // The documented guarantee is "awaited/reaped". If no exit was observed we
-    // must say so rather than return as though the host were left clean. Only
-    // on the success path: throwing here while already unwinding would mask the
-    // original cause with a symptom of it.
-    if (!reaped && succeeded) {
-      throw new ProbeError("not_reaped", `${label} child ${child.pid ?? "?"} did not exit after SIGKILL`);
+    // The protective error listener is the LAST thing removed, so a stray
+    // `error` emitted during termination cannot become an uncaught exception.
+    child.removeListener("error", swallowLateError);
+    if (droppedRegistrations > 0) {
+      // Not fatal — the closes it wanted are moot once the child is reaped —
+      // but it is a provider bug and must not be silent.
+      // eslint-disable-next-line no-console
+      logDroppedRegistrations(label, droppedRegistrations);
+    }
+    // A leaked process is the most actionable fact there is, so `not_reaped`
+    // wins over any in-flight cause and is reported on every path, not only
+    // after a successful run.
+    if (!reaped) {
+      throw new ProbeError(
+        "not_reaped",
+        `${label} child ${child.pid ?? "?"} did not exit after SIGKILL` +
+          (postSpawnError ? `; after error: ${redact(postSpawnError.message)}` : "")
+      );
+    }
+    // A run that ignored cancellation is the specific, actionable fact — more
+    // useful than the deadline that merely triggered it — so it takes
+    // precedence over the raced cause. (`succeeded` cannot be true here: a run
+    // that returned a value has settled by definition, which is why gating on
+    // it made this branch unreachable.)
+    // Ranked, so a specific cause is never masked by a symptom of it. Only the
+    // cancellation-triggered codes are replaced: if the probe already failed
+    // concretely (overflow, early exit, protocol error) that IS the cause, and
+    // the un-settled run is incidental to it.
+    if (notSettled && (thrownCode === undefined || thrownCode === "timeout" || thrownCode === "cancelled")) {
+      throw new ProbeError(
+        "not_settled",
+        `${label} run did not settle within ${finalizeDeadlineMs}ms of cancellation` +
+          (thrownCode ? ` (after ${thrownCode})` : "")
+      );
     }
   }
 }
@@ -442,4 +534,13 @@ function decorate(err: unknown, label: string, redact: (text: string) => string)
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Surfaced rather than swallowed: a registration after the phase closed is a
+ *  provider-side lifecycle bug, even though the step itself is now moot. */
+function logDroppedRegistrations(label: string, count: number): void {
+  process.emitWarning(
+    `${label}: ${count} probe close registration(s) arrived after the lifecycle finalized and were dropped`,
+    "SeamProbeLifecycleWarning"
+  );
 }

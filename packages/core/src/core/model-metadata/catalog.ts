@@ -1,3 +1,9 @@
+import {
+  canonicalJson,
+  sortCatalogEvidence,
+  CATALOG_EVIDENCE_MAX_RECORDS,
+  type CatalogModelEvidence,
+} from "@seam/adapters";
 import { canonicalModelId, chooseAaVariant, modelAliasForId } from "./aliases.js";
 import type {
   AgentModelAvailability,
@@ -65,6 +71,10 @@ export function buildModelMetadataSnapshot(input: {
       // The catalog owns this: prefer any published description over nothing,
       // and never let the external source overwrite an operational one.
       description: availability.find((row) => row.description)?.description ?? null,
+      // Structured provenance in its validated bounded form. Deduped by
+      // canonical identity so several agents advertising the same model do not
+      // multiply identical records, and capped so the row stays bounded.
+      evidence: dedupeEvidence(availability.flatMap((row) => row.evidence ?? [])),
       source: input.source,
       fetched_at: input.fetchedAt,
     } satisfies ModelMetadata;
@@ -75,4 +85,16 @@ export function buildModelMetadataSnapshot(input: {
     unmatchedModels: unmatchedModels.sort(),
     ignoredSourceVariants: [...new Set(ignoredSourceVariants)].sort(),
   };
+}
+
+/** Stable de-duplication for evidence merged across agents advertising one model. */
+function dedupeEvidence(
+  records: ReadonlyArray<CatalogModelEvidence>
+): CatalogModelEvidence[] {
+  const seen = new Map<string, CatalogModelEvidence>();
+  for (const record of sortCatalogEvidence(records)) {
+    const key = canonicalJson(record);
+    if (!seen.has(key)) seen.set(key, record);
+  }
+  return [...seen.values()].slice(0, CATALOG_EVIDENCE_MAX_RECORDS);
 }

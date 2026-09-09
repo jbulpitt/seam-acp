@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ProbeError,
+  type ProbeHandle,
   runBoundedProbe,
   PROBE_STDERR_CAPTURE_BYTES,
 } from "@seam/adapters";
@@ -76,7 +77,7 @@ interface FakeChild {
   child: ChildProcessWithoutNullStreams;
   exit: (code: number) => void;
 }
-function fakeChild(): FakeChild {
+function fakeChild(opts: { diesOnKill?: boolean } = {}): FakeChild {
   const emitter = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
   const mutable = emitter as unknown as Record<string, unknown>;
   mutable.pid = 4242;
@@ -85,7 +86,19 @@ function fakeChild(): FakeChild {
   mutable.stdin = new PassThrough();
   mutable.stdout = new PassThrough();
   mutable.stderr = new PassThrough();
-  mutable.kill = () => true;
+  // `diesOnKill` models a normal process: a signal ends it. Left off, the child
+  // is un-reapable, which is how the not_reaped path is exercised.
+  mutable.kill = () => {
+    if (opts.diesOnKill) {
+      queueMicrotask(() => {
+        if (mutable.exitCode === null) {
+          mutable.exitCode = 0;
+          emitter.emit("exit", 0, "SIGTERM");
+        }
+      });
+    }
+    return true;
+  };
   queueMicrotask(() => emitter.emit("spawn"));
   return {
     child: emitter,
@@ -233,11 +246,16 @@ describe("#236 bounded probe lifecycle", () => {
         args: [CHILD],
         env: env("silent"),
         timeoutMs: 200,
+        finalizeDeadlineMs: 150,
         label: "outlier",
         run: async (handle) => {
           pid = handle.pid;
           handle.onClose(() => { closed = true; });
-          return new Promise<string>(() => {});
+          // A real collector observes cancellation; ignoring it is its own
+          // reported failure (not_settled), covered separately.
+          return new Promise<string>((_resolve, reject) =>
+            handle.signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true })
+          );
         },
       })
     ).rejects.toMatchObject({ code: "timeout" });
@@ -268,11 +286,14 @@ describe("#236 bounded probe lifecycle", () => {
       args: [CHILD],
       env: env("silent"),
       timeoutMs: 10_000,
+      finalizeDeadlineMs: 150,
       signal: mid.signal,
       run: async (handle) => {
         pid = handle.pid;
         handle.onClose(() => { closed = true; });
-        return new Promise<string>(() => {});
+        return new Promise<string>((_resolve, reject) =>
+          handle.signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true })
+        );
       },
     });
     await settle();
@@ -325,6 +346,7 @@ describe("#236 bounded probe lifecycle", () => {
         executable: process.execPath,
         args: [flood],
         timeoutMs: 10_000,
+        finalizeDeadlineMs: 150,
         maxStdoutBytes: 256_000,
         label: "outlier",
         run: async (handle) => {
@@ -332,7 +354,9 @@ describe("#236 bounded probe lifecycle", () => {
           handle.onClose(() => { closed = true; }, "session");
           // A collector that never reads must still be protected: the ceiling
           // is enforced at the boundary, not by the consumer.
-          return new Promise<string>(() => {});
+          return new Promise<string>((_resolve, reject) =>
+            handle.signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true })
+          );
         },
       })
     ).rejects.toMatchObject({ code: "output_overflow" });
@@ -355,10 +379,13 @@ describe("#236 bounded probe lifecycle", () => {
         executable: process.execPath,
         args: [flood],
         timeoutMs: 10_000,
+        finalizeDeadlineMs: 150,
         maxStderrBytes: 128_000,
         run: async (handle) => {
           pid = handle.pid;
-          return new Promise<string>(() => {});
+          return new Promise<string>((_resolve, reject) =>
+            handle.signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true })
+          );
         },
       })
     ).rejects.toMatchObject({ code: "output_overflow" });
@@ -428,9 +455,11 @@ describe("#236 bounded probe lifecycle", () => {
         args: [CHILD],
         env: env("silent"),
         timeoutMs: 150,
+        finalizeDeadlineMs: 150,
         run: async (handle) => {
-          handle.signal.addEventListener("abort", () => { aborted = true; });
-          return new Promise<string>(() => {});
+          return new Promise<string>((_resolve, reject) =>
+            handle.signal.addEventListener("abort", () => { aborted = true; reject(new Error("cancelled")); }, { once: true })
+          );
         },
       })
     ).rejects.toMatchObject({ code: "timeout" });
@@ -498,7 +527,7 @@ describe("#236 bounded probe lifecycle", () => {
       env: env("silent"),
       timeoutMs: 75,
       killGraceMs: 200,
-      closeGraceMs: 2_000,
+      finalizeDeadlineMs: 2_000,
       run: async (handle) => {
         // Finishes construction well after the deadline, exactly as a slow ACP
         // connection would, then registers the session close it owns.
@@ -526,7 +555,7 @@ describe("#236 bounded probe lifecycle", () => {
         args: [CHILD],
         env: env("silent"),
         timeoutMs: 75,
-        closeGraceMs: 5_000,
+        finalizeDeadlineMs: 5_000,
         run: async (handle) => {
           await new Promise<void>((resolve) =>
             handle.signal.addEventListener("abort", () => resolve(), { once: true })
@@ -538,7 +567,7 @@ describe("#236 bounded probe lifecycle", () => {
     ).rejects.toMatchObject({ code: "timeout" });
     expect(closed).toBe(true);
     // The bounded grace is a ceiling, not a floor: honouring the signal returns
-    // immediately rather than burning the full closeGraceMs.
+    // immediately rather than burning the full finalization deadline.
     expect(Date.now() - started).toBeLessThan(2_000);
   });
 
@@ -595,8 +624,13 @@ describe("#236 bounded probe lifecycle", () => {
     const slow = fakeChild();
     await expect(runBoundedProbe({
       executable: "x", spawnOverride: () => slow.child, timeoutMs: 60, killGraceMs: 50,
-      closeGraceMs: 100,
-      run: async () => { setTimeout(() => slow.exit(0), 80); return new Promise<string>(() => {}); },
+      finalizeDeadlineMs: 100,
+      run: async (handle) => {
+        setTimeout(() => slow.exit(0), 80);
+        return new Promise<string>((_resolve, reject) =>
+          handle.signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true })
+        );
+      },
     })).rejects.toMatchObject({ code: "timeout" });
     expect(counts(slow)).toEqual(zero);
 
@@ -612,13 +646,146 @@ describe("#236 bounded probe lifecycle", () => {
     const loud = fakeChild();
     await expect(runBoundedProbe({
       executable: "x", spawnOverride: () => loud.child, timeoutMs: 2_000, killGraceMs: 50,
-      maxStdoutBytes: 16,
-      run: async () => {
+      maxStdoutBytes: 16, finalizeDeadlineMs: 100,
+      run: async (handle) => {
         setTimeout(() => { loud.child.stdout.emit("data", Buffer.alloc(64)); loud.exit(0); }, 10);
-        return new Promise<string>(() => {});
+        return new Promise<string>((_resolve, reject) =>
+          handle.signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true })
+        );
       },
     })).rejects.toMatchObject({ code: "output_overflow" });
     expect(counts(loud)).toEqual(zero);
+  });
+
+
+  it("registration LATER than any fixed grace still runs, proven at return", async () => {
+    // The exact independently reproduced case: timeout 20ms, old close grace
+    // 20ms, registration at 120ms. Under the old fixed-grace barrier the helper
+    // returned after ~42ms with registered:false/closed:false. Settlement of the
+    // run — not a fixed window — is now the authority.
+    let registered = false;
+    let closed = false;
+    const outcome = await runBoundedProbe({
+      executable: process.execPath,
+      args: [CHILD],
+      env: env("silent"),
+      timeoutMs: 20,
+      killGraceMs: 200,
+      finalizeDeadlineMs: 5_000,
+      run: async (handle) => {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        registered = true;
+        handle.onClose(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          closed = true;
+        }, "session");
+        return "late";
+      },
+    }).then(() => "resolved", (err: ProbeError) => err.code);
+    expect(outcome).toBe("timeout");
+    // Observed SYNCHRONOUSLY at return — no trailing wait permitted.
+    expect(registered).toBe(true);
+    expect(closed).toBe(true);
+  });
+
+  it("a never-settling run is bounded, reaped, and reported not_settled", async () => {
+    // Reaps normally, so the ONLY fault is the run refusing to settle — a
+    // leaked process would otherwise (correctly) outrank it.
+    const stuck = fakeChild({ diesOnKill: true });
+    let closed = false;
+    const started = Date.now();
+    const outcome = await runBoundedProbe({
+      executable: "x",
+      spawnOverride: () => stuck.child,
+      // A short deadline triggers cancellation; the SEPARATE finalization
+      // deadline then bounds how long the uncooperative run may stall teardown.
+      timeoutMs: 60,
+      killGraceMs: 30,
+      finalizeDeadlineMs: 120,
+      run: async (handle) => {
+        handle.onClose(() => { closed = true; }, "session");
+        // Deliberately ignores handle.signal and never settles.
+        return new Promise<string>(() => {});
+      },
+    }).then(() => "resolved", (err: ProbeError) => err.code);
+    // The run itself never failed, so the helper must name the real problem.
+    expect(outcome).toBe("not_settled");
+    expect(closed).toBe(true);
+    expect(Date.now() - started).toBeLessThan(4_000);
+    // Terminated and reaped BEFORE the failure was returned.
+    expect(stuck.child.listenerCount("exit")).toBe(0);
+    expect(stuck.child.listenerCount("error")).toBe(0);
+  });
+
+  it("a POST-spawn error without an exit is not_reaped, never spawn_failed", async () => {
+    // A pid already exists, so the process is real and may still be running.
+    // Classifying it spawn_failed both misdescribed it and skipped reaping.
+    const unreapable = fakeChild();
+    const outcome = await runBoundedProbe({
+      executable: "irrelevant",
+      spawnOverride: () => unreapable.child,
+      timeoutMs: 5_000,
+      killGraceMs: 40,
+      finalizeDeadlineMs: 500,
+      run: async (handle) => {
+        // Emitted while the lifecycle is live; never followed by `exit`.
+        setTimeout(() => unreapable.child.emit("error", new Error("post-spawn boom")), 10);
+        return handle.exited;
+      },
+    }).then(() => "resolved", (err: ProbeError) => err.code);
+    expect(outcome).toBe("not_reaped");
+    expect(unreapable.child.listenerCount("exit")).toBe(0);
+    expect(unreapable.child.listenerCount("error")).toBe(0);
+  });
+
+  it("a PRE-spawn error is still spawn_failed", async () => {
+    await expect(
+      runBoundedProbe({
+        executable: path.join(dir, "definitely-not-here"),
+        timeoutMs: 2_000,
+        finalizeDeadlineMs: 500,
+        run: async () => "unreachable",
+      })
+    ).rejects.toMatchObject({ code: "spawn_failed" });
+  });
+
+  it("an error emitted DURING teardown never escapes as an uncaught exception", async () => {
+    // The protective listener is removed last, so a stray error while the child
+    // is being terminated cannot surface as an unhandled error in the run.
+    const noisy = fakeChild();
+    await runBoundedProbe({
+      executable: "x",
+      spawnOverride: () => noisy.child,
+      timeoutMs: 2_000,
+      killGraceMs: 50,
+      finalizeDeadlineMs: 500,
+      run: async (handle) => {
+        handle.onClose(() => {
+          noisy.child.emit("error", new Error("teardown boom"));
+          noisy.exit(0);
+        }, "session");
+        return "ok";
+      },
+    });
+    expect(noisy.child.listenerCount("error")).toBe(0);
+  });
+
+  it("drops — never detaches — a registration after the phase closed", async () => {
+    // Nothing may run after the helper has told its caller cleanup is done.
+    const child = fakeChild();
+    let escaped = false;
+    let capture: ProbeHandle | undefined;
+    await runBoundedProbe({
+      executable: "x",
+      spawnOverride: () => child.child,
+      timeoutMs: 2_000,
+      killGraceMs: 50,
+      finalizeDeadlineMs: 500,
+      run: async (handle) => { capture = handle; child.exit(0); return "ok"; },
+    });
+    capture!.onClose(() => { escaped = true; }, "session");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(escaped).toBe(false);
   });
 
   it("does not let a wedged close step keep the process alive", async () => {

@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import {
+  assertCatalogValues,
   assertClosedCatalogShape,
   assertCatalogDescription,
   canonicalJson,
@@ -273,19 +274,21 @@ export function assessCatalogReduction(
  * whether that means "refuse the fetch" or "retain the previous generation".
  */
 export function validateCatalogEvidence(candidate: AdapterCatalogCandidate): void {
-  // Close the WHOLE graph first. Screening only description/evidence left every
-  // other level open, so an undeclared key at candidate/scope/model/context
-  // level crossed the bridge and was persisted inside schema 1.
+  // Keys, then VALUES, then description/evidence content. Closing only
+  // description/evidence left every other level open, so an undeclared key at
+  // candidate/scope/model/context crossed the bridge and was persisted inside
+  // schema 1; and closing only KEYS still admitted an object where a version
+  // string belongs, a fractional context window, or 5,000 aliases.
+  //
+  // PURE: normalization (sanitized scope, canonical evidence order) belongs to
+  // `normalizeCatalogCandidate`, which both boundaries run first.
   assertClosedCatalogShape(candidate);
+  assertCatalogValues(candidate);
   if (!candidate || !Array.isArray(candidate.models)) return;
   for (const model of candidate.models) {
     const id = typeof model?.id === "string" ? model.id : "(unknown)";
-    if (model.description !== undefined) {
-      model.description = assertCatalogDescription(`${id}.description`, model.description);
-    }
-    if (model.evidence !== undefined) {
-      model.evidence = sortCatalogEvidence(parseCatalogEvidenceList(`${id}.evidence`, model.evidence));
-    }
+    if (model.description !== undefined) assertCatalogDescription(`${id}.description`, model.description);
+    if (model.evidence !== undefined) parseCatalogEvidenceList(`${id}.evidence`, model.evidence);
   }
 }
 

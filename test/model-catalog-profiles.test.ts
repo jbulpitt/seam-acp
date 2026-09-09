@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import os from "node:os";
 import {
-  makeAgyProfile,
+  makeAgyPackageProfile,
   agyAcpReleaseArtifact,
   makeClaudeProfile,
   makeCodexProfile,
@@ -190,7 +190,7 @@ describe("production adapter catalog sources", () => {
       staticModels: [{ modelId: "qwen:cloud", name: "Qwen", contextLimit: 200_000 }],
       effort: { mechanism: "configOption", configId: "reasoning_effort", levels: ["low", "high"] },
     });
-    const agy = makeAgyProfile({
+    const agy = makeAgyPackageProfile({
       acpPath: "/bin/false",
       agyBin: "/bin/false",
       agyVersion: "false 1.0",

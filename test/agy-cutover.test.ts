@@ -32,11 +32,11 @@ function profile(id: string): AgentProfile {
 }
 
 describe("agy public identity cutover", () => {
-  it("clears only an incompatible public agy runtime handle and preserves thread state", async () => {
+  it("preserves native agy handles and clears only package handles on invalidation", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-cutover-"));
     dirs.push(dir);
     const store = new SessionStore(path.join(dir, "seam.db"));
-    const profiles = [profile("agy"), profile("agy-old")];
+    const profiles = [profile("agy-package"), profile("agy")];
     const router = new SessionRouter({
       logger,
       store,
@@ -58,14 +58,14 @@ describe("agy public identity cutover", () => {
       createdUtc: "2026-09-09T00:00:00.000Z",
       updatedUtc: "2026-09-09T00:00:00.000Z",
     });
-    insert("discord:new", "agy");
-    insert("discord:old", "agy-old");
+    insert("discord:new", "agy-package");
+    insert("discord:old", "agy");
 
     await router.invalidate("discord:new", { clearAcpSession: true });
     await router.invalidate("discord:old", { clearAcpSession: true });
 
     expect(store.get("discord:new")).toMatchObject({
-      agentId: "agy",
+      agentId: "agy-package",
       acpSessionId: "",
       repoPath: dir,
       configJson: JSON.stringify({ model: "raw-model-high", role: "worker" }),

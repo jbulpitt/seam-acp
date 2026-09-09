@@ -2,9 +2,9 @@ import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  makeAgyProfile,
+  makeAgyPackageProfile,
   STAGING_ROOT,
-  type AgyProfileOptions,
+  type AgyPackageProfileOptions,
   type AgentProfile,
 } from "@seam/adapters";
 import {
@@ -27,14 +27,14 @@ const MAX_OBSERVATION_CHARS = 20_000;
 export interface AgyImageInspectorOptions {
   model: string;
   logger: Logger;
-  profileOptions: Omit<AgyProfileOptions, "defaultModel" | "cwd">;
+  profileOptions: Omit<AgyPackageProfileOptions, "defaultModel" | "cwd">;
   stagingRoot?: string;
   timeoutMs?: number;
   /** Cache-only availability check supplied by the shared model catalog. */
   isModelAvailable?: (model: string) => boolean;
-  /** Test seam; production uses makeAgyProfile. */
+  /** Test seam; production uses makeAgyPackageProfile. */
   profileFactory?: (
-    opts: AgyProfileOptions
+    opts: AgyPackageProfileOptions
   ) => AgentProfile;
   /** Test seam; production creates a real isolated AgentRuntime. */
   runtimeFactory?: (profile: AgentProfile, logger: Logger) => AgyVisionRuntime;
@@ -49,9 +49,10 @@ export interface AgyVisionRuntime {
 }
 
 /**
- * Use a throwaway, sandboxed Agy turn as the visual sidecar. The validated
+ * Use a throwaway package-backed Agy turn as the visual sidecar. The validated
  * image is copied into a fresh private cwd; that runtime gets no MCP servers,
  * no shared staging directory, and no persistent/global model mutation.
+ * A private cwd is not a sandbox: upstream still bypasses CLI permissions.
  */
 export function createAgyImageInspector(
   opts: AgyImageInspectorOptions
@@ -78,7 +79,7 @@ export function createAgyImageInspector(
 
     try {
       await fsp.writeFile(imagePath, bytes, { mode: 0o600 });
-      const profile = (opts.profileFactory ?? makeAgyProfile)({
+      const profile = (opts.profileFactory ?? makeAgyPackageProfile)({
         ...opts.profileOptions,
         defaultModel: model,
         cwd: tempDir,

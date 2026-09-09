@@ -26,7 +26,7 @@ import {
 } from "./core/parked-agents.js";
 import { makeCopilotProfile } from "@seam/adapters";
 import { makeClaudeProfile } from "@seam/adapters";
-import { makeAgyProfile, makeAgyOldProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
+import { makeAgyPackageProfile, makeAgyProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
 import { makeCodexProfile } from "@seam/adapters";
 import { buildOllamaCodexCatalog } from "./agents/ollama-codex-catalog.js";
 import { makeGrokProfile, fetchXaiModels } from "@seam/adapters";
@@ -221,8 +221,8 @@ async function main(): Promise<void> {
       })
     : undefined;
 
-  const agy = config.AGY_ENABLED
-    ? makeAgyProfile({
+  const agyPackage = config.AGY_PACKAGE_ENABLED
+    ? makeAgyPackageProfile({
         acpPath: config.AGY_ACP_BIN!,
         agyBin: config.AGY_BIN!,
         agyVersion: config.AGY_VERSION,
@@ -238,9 +238,9 @@ async function main(): Promise<void> {
         timeoutMs: Math.min(config.TURN_TIMEOUT_SECONDS * 1_000, 120_000),
       })
     : undefined;
-  const agyOld = config.AGY_OLD_ROLLBACK_ENABLED
-    ? makeAgyOldProfile({
-        cliPath: config.AGY_OLD_CLI_PATH!,
+  const agy = config.AGY_ENABLED || config.AGY_OLD_ROLLBACK_ENABLED
+    ? makeAgyProfile({
+        cliPath: config.AGY_CLI_PATH!,
         defaultModel: config.AGY_DEFAULT_MODEL,
         staticModels: config.AGY_MODELS,
         dataDir: config.DATA_DIR,
@@ -248,7 +248,7 @@ async function main(): Promise<void> {
         mcpServers,
       })
     : undefined;
-  if (agyOld) scrubStaleGlobalSeamStdio();
+  if (agy) scrubStaleGlobalSeamStdio();
 
   // Optional OpenAI Codex agent via @agentclientprotocol/codex-acp.
   const codex = config.CODEX_ENABLED
@@ -395,7 +395,7 @@ async function main(): Promise<void> {
   let stopCatalogEnrichmentRefresh: (() => void) | undefined;
   let serviceStatusSources: ReturnType<typeof createDefaultServiceStatusSources> | undefined;
 
-  const profiles: AgentProfile[] = [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(agyOld ? [agyOld] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
+  const profiles: AgentProfile[] = [copilot, ...extraCopilots, claude, ...extraClaudes, ...(claudeVertex ? [claudeVertex] : []), ...(agy ? [agy] : []), ...(agyPackage ? [agyPackage] : []), ...(codex ? [codex] : []), ...(grok ? [grok] : []), ...(zai ? [zai] : []), ...(ollamaCloud ? [ollamaCloud] : [])];
   const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
   const modelCatalog = new ModelCatalogService({
     store: modelCatalogStore,
@@ -722,11 +722,11 @@ async function main(): Promise<void> {
         )
       : undefined;
     const messageSearch = messageReader ? new LiveMessageSearch(messageReader) : undefined;
-    const agyImageInspector = agy
+    const agyImageInspector = agyPackage
       ? createAgyImageInspector({
           model: config.AGY_VISION_MODEL,
           logger,
-          isModelAvailable: (model) => Boolean(modelCatalog.model({ agentId: "agy", location: "local" }, model)),
+          isModelAvailable: (model) => Boolean(modelCatalog.model({ agentId: "agy-package", location: "local" }, model)),
           profileOptions: {
             acpPath: config.AGY_ACP_BIN!,
             agyBin: config.AGY_BIN!,
@@ -816,7 +816,7 @@ async function main(): Promise<void> {
         ) {
           throw new Error("inspect_image is only available to tool-vision sessions");
         }
-        if (!agyImageInspector) throw new Error("inspect_image requires configured package-backed agy");
+        if (!agyImageInspector) throw new Error("inspect_image requires configured agy-package");
         return agyImageInspector({ ...req, ownerId: record.id });
       },
       // Agent-scheduled wake events (#59): arm/cancel a one-shot self-resumption

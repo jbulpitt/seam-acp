@@ -6,7 +6,7 @@ import {
   resolveAgyModel,
   selectAgyTurnModel,
   type AgyCatalogEntry,
-} from "../packages/adapters/src/profiles/agy-old.js";
+} from "../packages/adapters/src/profiles/agy.js";
 
 describe("agyExecutionPolicyArgs", () => {
   it("keeps normal chat compatibility with the shared staging directory", () => {

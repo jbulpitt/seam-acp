@@ -7,7 +7,7 @@ import {
   buildAgyMcpConfigJson,
   prepareAgyMcpHome,
   scrubStaleGlobalSeamStdio,
-} from "../packages/adapters/src/profiles/agy-old.js";
+} from "../packages/adapters/src/profiles/agy.js";
 
 const seamHttp: McpServer = {
   type: "http",

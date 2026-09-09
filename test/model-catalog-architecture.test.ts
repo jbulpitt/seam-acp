@@ -29,13 +29,22 @@ describe("model catalog architecture", () => {
   });
 
   it("keeps provider naming rules out of core model selection", () => {
+    // invalidate has a pre-existing native-session preservation rule, not a
+    // model-selection fallback. Restoring its profile ID from agy-old to agy
+    // must not accidentally broaden this guard to forbid lifecycle policy.
+    // agy-cutover.test exercises both sides of that preservation rule.
+    const router = source("packages/core/src/core/session-router.ts");
+    const invalidateStart = router.indexOf("  async invalidate(");
+    const invalidateEnd = router.indexOf("\n  }", invalidateStart) + "\n  }".length;
+    expect(invalidateStart).toBeGreaterThan(0);
+    expect(invalidateEnd).toBeGreaterThan(invalidateStart);
+    const selectionRouter = router.slice(0, invalidateStart) + router.slice(invalidateEnd);
     const selectionCore = [
       "packages/core/src/core/model-catalog/service.ts",
-      "packages/core/src/core/session-router.ts",
       "packages/core/src/core/thread-session-control.ts",
       "packages/core/src/platforms/discord/config-editor.ts",
       "packages/core/src/core/choice/ingest-model.ts",
-    ].map(source).join("\n");
+    ].map(source).concat(selectionRouter).join("\n");
     expect(selectionCore).not.toMatch(/includes\(["'](?:claude|codex|copilot|agy|grok|zai|ollama-cloud)/);
     expect(selectionCore).not.toMatch(/===\s*["'](?:claude|codex|copilot|agy|grok|zai|ollama-cloud)["']/);
     const legacySelectionLeaks = [
@@ -52,7 +61,7 @@ describe("model catalog architecture", () => {
     expect(contract).toContain("readonly catalog: AdapterCatalogSource");
     expect(source("packages/adapters/src/model-catalog.ts")).toContain("scope(): CatalogScope");
     expect(contract).not.toContain("readonly staticModels");
-    for (const profile of ["copilot", "claude", "codex", "agy", "grok"]) {
+    for (const profile of ["copilot", "claude", "codex", "agy", "agy-package", "grok"]) {
       expect(source(`packages/adapters/src/profiles/${profile}.ts`)).toMatch(/catalog:\s*(?:\{|manifestCatalogSource)/);
     }
   });

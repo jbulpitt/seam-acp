@@ -414,6 +414,61 @@ describe("Codex live model catalog", () => {
     expect(profile.catalog.scope()).toEqual(drifted.catalog.scope());
   });
 
+  it("redacts hostile wrapper-version stderr and paths from returned and durable failures", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-hostile-version-path-"));
+    roots.push(root);
+    const executable = path.join(root, "hostile-codex-acp.mjs");
+    const secret = "sk-hostile-wrapper-version-secret";
+    fs.writeFileSync(executable, `#!/usr/bin/env node
+if (process.argv[2] === "--version") {
+  process.stderr.write("OPENAI_API_KEY=" + process.env.OPENAI_API_KEY + "\\n");
+  process.exit(19);
+}
+process.exit(23);
+`);
+    fs.chmodSync(executable, 0o755);
+    const codexHome = path.join(root, "codex-home");
+    fs.mkdirSync(codexHome);
+    const profile = makeCodexProfile({
+      cliPath: executable,
+      defaultModel: "gpt-6-astra",
+      sessionsRoot: path.join(codexHome, "sessions"),
+      extraEnv: { CODEX_HOME: codexHome, OPENAI_API_KEY: secret },
+      catalogProbe: async () => ({
+        runtimeVersion: "codex-cli hostile-fixture",
+        models: [LIVE_MODELS[0]],
+      }),
+    });
+    const store = new ModelCatalogStore(path.join(root, "catalog.db"));
+    const binding = { agentId: "codex", location: "local" };
+    const service = new ModelCatalogService({
+      store,
+      logger: pino({ level: "silent" }) as unknown as Logger,
+      bindings: () => [binding],
+      fetch: () => profile.catalog.fetch(),
+      scope: () => profile.catalog.scope(),
+      refreshCron: "0 0 1 1 *",
+    });
+    try {
+      const result = await service.refresh(binding);
+      expect(result).toMatchObject({
+        ok: false,
+        result: "retained",
+        error: "exited_early: Codex ACP wrapper version command exited (code=19, signal=none)",
+      });
+      const persisted = store.getRefreshStatus("codex@local");
+      expect(persisted?.error).toBe(result.error);
+      for (const exposed of [result.error, persisted?.error]) {
+        expect(exposed).not.toContain(secret);
+        expect(exposed).not.toContain(executable);
+        expect(exposed).not.toContain(root);
+      }
+    } finally {
+      service.stop();
+      store.close();
+    }
+  });
+
   it.each([
     ["malformed", /malformed JSON/],
     ["empty", /no selectable models/],

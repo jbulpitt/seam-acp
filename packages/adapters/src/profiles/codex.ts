@@ -12,7 +12,12 @@ import {
   type CatalogModelEvidence,
   type ManifestCatalogModel,
 } from "../model-catalog.js";
-import { ProbeError, runBoundedProbe, type ProbeHandle } from "../probe-process.js";
+import {
+  ProbeError,
+  redactProbeText,
+  runBoundedProbe,
+  type ProbeHandle,
+} from "../probe-process.js";
 import {
   CodexSessionManager,
   defaultCodexSessionsRoot,
@@ -483,19 +488,50 @@ async function readCodexAcpVersion(
   runtime: CodexRuntimeCommand,
 ): Promise<string> {
   return await new Promise((resolve, reject) => {
-    execFile(runtime.executable, [...runtime.baseArgs, "--version"], {
+    const child = execFile(runtime.executable, [...runtime.baseArgs, "--version"], {
       cwd: runtime.cwd,
       env: runtime.env,
       timeout: 5_000,
       maxBuffer: 16_384,
     }, (error, stdout, stderr) => {
       if (error) {
-        return reject(new Error(
-          `configured Codex ACP runtime ${JSON.stringify(runtime.executable)} --version failed: ${error.message}`
+        const failure = error as Error & {
+          code?: string | number | null;
+          killed?: boolean;
+          signal?: NodeJS.Signals | null;
+        };
+        if (failure.code === "ENOENT" || failure.code === "EACCES") {
+          return reject(new ProbeError("spawn_failed", "Codex ACP wrapper version command could not start"));
+        }
+        if (failure.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+          return reject(new ProbeError("output_overflow", "Codex ACP wrapper version output exceeded 16384 bytes"));
+        }
+        if (child.pid === undefined) {
+          return reject(new ProbeError("spawn_failed", "Codex ACP wrapper version command could not start"));
+        }
+        if (failure.killed && failure.signal === "SIGTERM") {
+          return reject(new ProbeError("timeout", "Codex ACP wrapper version command timed out after 5000ms"));
+        }
+        const exitCode = typeof failure.code === "number" ? String(failure.code) : "unknown";
+        return reject(new ProbeError(
+          "exited_early",
+          `Codex ACP wrapper version command exited (code=${exitCode}, signal=${failure.signal ?? "none"})`
         ));
       }
-      const version = (String(stdout) || String(stderr)).trim().split(/\r?\n/, 1)[0]?.slice(0, 256);
-      if (!version) return reject(new Error("configured Codex ACP runtime returned an empty wrapper version"));
+      const rawVersion = (String(stdout) || String(stderr)).trim().split(/\r?\n/, 1)[0]?.slice(0, 256);
+      const version = rawVersion ? redactProbeText(rawVersion, runtime.env) : undefined;
+      if (!version) {
+        return reject(new ProbeError("protocol_error", "Codex ACP wrapper returned an empty version"));
+      }
+      const containsFilesystemPath = /(?:^|[\s=:'"])(?:\/(?:[^/\s]+\/)+[^\s]*|[A-Za-z]:[\\/][^\s]+)/
+        .test(rawVersion!);
+      const containsCredentialValue = Object.entries(runtime.env).some(([key, value]) =>
+        /(?:token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|access[_-]?key|authorization|credential)/i.test(key) &&
+        typeof value === "string" && value.length > 0 && rawVersion!.includes(value)
+      );
+      if (version !== rawVersion || containsFilesystemPath || containsCredentialValue) {
+        return reject(new ProbeError("protocol_error", "Codex ACP wrapper returned unsafe version output"));
+      }
       resolve(version);
     });
   });

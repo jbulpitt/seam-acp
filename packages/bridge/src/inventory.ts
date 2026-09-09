@@ -4,6 +4,7 @@
  * defaults — describe/prepare/install do not spawn.
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   AGENT_ADAPTER_VERSION,
   makeAgyProfile,
@@ -12,6 +13,8 @@ import {
   makeCopilotProfile,
   makeGrokProfile,
   type AgentAdapter,
+  type CopilotCatalogLaunch,
+  type CopilotCatalogProbe,
   type HelloAgentInventory,
 } from "@seam/adapters";
 
@@ -25,16 +28,67 @@ function commandExists(cmd: string): boolean {
   }
 }
 
+export function resolveCopilotHostLaunch(
+  copilotCmd: string,
+  cwd: string,
+  extraEnv: NodeJS.ProcessEnv = {}
+): CopilotCatalogLaunch {
+  const commandParts = copilotCmd.split(" ");
+  const cliPath = commandParts[0]!;
+  const args = [
+    ...commandParts.slice(1),
+    ...(process.env.COPILOT_ARGS !== undefined
+      ? process.env.COPILOT_ARGS.split(" ").filter(Boolean)
+      : ["--acp"]),
+  ];
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (!env.GH_TOKEN) {
+    try {
+      env.GH_TOKEN = execFileSync("gh", ["auth", "token"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      // The ACP probe will report auth failure without exposing credentials.
+    }
+  }
+  Object.assign(env, extraEnv);
+  return { cliPath, args, cwd, env };
+}
+
+function copilotProfileForHost(
+  copilotCmd: string,
+  cwd: string,
+  catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>
+): AgentAdapter {
+  const launch = resolveCopilotHostLaunch(copilotCmd, cwd);
+  const token = launch.env.GH_TOKEN || launch.env.COPILOT_GITHUB_TOKEN;
+  const credentialProfile = token
+    ? `github-token-sha256:${createHash("sha256").update(token).digest("hex")}`
+    : "default";
+  return makeCopilotProfile({
+    cliPath: launch.cliPath,
+    acpArgs: launch.args,
+    cwd: launch.cwd,
+    environment: launch.env,
+    credentialProfile,
+    defaultModel: "gpt-5.4",
+    ...(catalogProbe ? { catalogProbe } : {}),
+  });
+}
+
 export function loadHostAdapters(
   copilotCmd: string,
-  exists: (bin: string) => boolean = commandExists
+  cwd: string,
+  exists: (bin: string) => boolean = commandExists,
+  copilotCatalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>
 ): Map<string, AgentAdapter> {
   const out = new Map<string, AgentAdapter>();
   const factories: Array<{ id: string; bin: string; make: () => AgentAdapter }> = [
     {
       id: "copilot",
       bin: copilotCmd,
-      make: () => makeCopilotProfile({ defaultModel: "gpt-5.4" }),
+      make: () => copilotProfileForHost(copilotCmd, cwd, copilotCatalogProbe),
     },
     {
       id: "claude",

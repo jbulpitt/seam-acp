@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs, { promises as fsp } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -17,6 +17,7 @@ import {
 import { asLocalAdapter, type AgentIdentity, type AgentProfile } from "../agent-profile.js";
 import { AGENT_ADAPTER_VERSION } from "../agent-profile.js";
 import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
+import { ProbeError, redactProbeText, runBoundedProbe } from "../probe-process.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 
 interface SeamAcpSessionIdRow {
@@ -54,6 +55,60 @@ export interface CopilotCatalogProbe {
   models: CopilotCatalogProbeModel[];
 }
 
+type CopilotModelProbeAttempt =
+  | { kind: "selected"; row: CopilotCatalogProbeModel }
+  | { kind: "not-selected"; returned: string | null };
+
+export interface CopilotCatalogLaunch {
+  cliPath: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+}
+
+type CopilotAcpChild = ChildProcessWithoutNullStreams;
+interface CopilotAcpLaunchSpec {
+  executable: string;
+  args: string[];
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    stdio: ["pipe", "pipe", "pipe"];
+  };
+}
+
+type CopilotAcpSpawn = (
+  executable: string,
+  args: string[],
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    stdio: ["pipe", "pipe", "pipe"];
+  }
+) => CopilotAcpChild;
+
+interface CopilotAcpProbeSession {
+  connection: ClientSideConnection;
+  sessionId: string;
+  configOptions: SessionConfigOption[];
+}
+
+const COPILOT_MODEL_PROBE_ATTEMPTS = 3;
+const COPILOT_ACP_BASE_ARGS = ["--acp"] as const;
+
+function copilotAcpLaunchSpec(
+  executable: string,
+  args: readonly string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv
+): CopilotAcpLaunchSpec {
+  return {
+    executable,
+    args: [...args],
+    options: { cwd, env, stdio: ["pipe", "pipe", "pipe"] },
+  };
+}
+
 function flattenSelectOptions(options: SessionConfigSelectOptions): SessionConfigSelectOption[] {
   return (options as Array<SessionConfigSelectOption | SessionConfigSelectGroup>).flatMap((option) =>
     "options" in option ? option.options : [option]
@@ -77,95 +132,271 @@ function copilotPriceCategory(option: SessionConfigSelectOption): string | null 
   return typeof meta?.copilotPriceCategory === "string" ? meta.copilotPriceCategory : null;
 }
 
-function probeTimeout<T>(ms: number, message: string): Promise<T> {
-  return new Promise((_resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
-    timer.unref?.();
+function abortReason(signal: AbortSignal, fallback: string): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error(fallback);
+}
+
+async function withProbeSignal<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw abortReason(signal, "copilot ACP probe aborted");
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(abortReason(signal, "copilot ACP probe aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function waitForProbeRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw abortReason(signal, "copilot ACP catalog probe aborted");
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(abortReason(signal, "copilot ACP catalog probe aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
-/** Adapter-owned ACP collector for model-specific model/effort capabilities. */
+async function runCopilotAcpProbeSession<T>(opts: {
+  cliPath: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  cleanupTimeoutMs: number;
+  signal: AbortSignal;
+  spawnProcess?: CopilotAcpSpawn;
+  inspect: (
+    session: CopilotAcpProbeSession,
+    run: <R>(work: Promise<R>, message: string) => Promise<R>
+  ) => Promise<T>;
+}): Promise<T> {
+  const launch = copilotAcpLaunchSpec(opts.cliPath, opts.args, opts.cwd, opts.env);
+  return runBoundedProbe({
+    executable: launch.executable,
+    args: launch.args,
+    cwd: launch.options.cwd,
+    env: launch.options.env,
+    timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+    killGraceMs: opts.cleanupTimeoutMs,
+    finalizeDeadlineMs: opts.cleanupTimeoutMs,
+    label: "copilot ACP catalog probe",
+    ...(opts.spawnProcess
+      ? { spawnOverride: () => opts.spawnProcess!(launch.executable, launch.args, launch.options) }
+      : {}),
+    run: async (handle) => {
+      let sessionId: string | undefined;
+      const connection = new ClientSideConnection(
+        () => ({
+          async requestPermission(request) {
+            const option = request.options.find((entry) => entry.kind?.startsWith("allow_"));
+            return option
+              ? { outcome: { outcome: "selected" as const, optionId: option.optionId } }
+              : { outcome: { outcome: "cancelled" as const } };
+          },
+          async sessionUpdate() {},
+        } satisfies Client),
+        ndJsonStream(
+          Writable.toWeb(handle.stdin) as unknown as WritableStream<Uint8Array>,
+          Readable.toWeb(handle.stdout) as unknown as ReadableStream<Uint8Array>
+        )
+      );
+      handle.onClose(async (signal) => {
+        if (sessionId) {
+          await withProbeSignal(connection.closeSession({ sessionId }), signal);
+        }
+      }, "session");
+      handle.onClose(async (signal) => {
+        handle.stdin.destroy();
+        handle.stdout.destroy();
+        await withProbeSignal(connection.closed, signal);
+      }, "connection");
+      const run = <R>(work: Promise<R>, _message: string): Promise<R> =>
+        withProbeSignal(work, handle.signal);
+      await run(
+        connection.initialize({
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+        }),
+        "copilot ACP initialize timed out"
+      );
+      const session = await run(
+        connection.newSession({ cwd: opts.cwd, mcpServers: [] }),
+        "copilot ACP session/new timed out"
+      );
+      sessionId = session.sessionId;
+      return await opts.inspect({
+        connection,
+        sessionId,
+        configOptions: catalogConfigOptions(session.configOptions),
+      }, run);
+    },
+  });
+}
+
+/** Adapter-owned ACP collector with one fresh process/session per model. */
 export async function probeCopilotCatalog(options: {
   cliPath?: string;
+  args?: string[];
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  overallTimeoutMs?: number;
+  cleanupTimeoutMs?: number;
+  /** Test seam proving probe scheduling order cannot affect normalized output. */
+  probeOrder?: "forward" | "reverse";
+  /** Test seam; production always uses node:child_process spawn. */
+  spawnProcess?: CopilotAcpSpawn;
 } = {}): Promise<CopilotCatalogProbe> {
-  const child = spawn(options.cliPath ?? "copilot", ["--acp"], {
-    cwd: options.cwd ?? process.cwd(),
-    env: options.env ?? process.env,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  let stderr = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk: string) => { stderr = (stderr + chunk).slice(-4000); });
-  const died = new Promise<never>((_resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (code, signal) =>
-      reject(new Error(`copilot ACP exited early (code=${code}, signal=${signal}): ${stderr.trim()}`))
-    );
-  });
-  const connection = new ClientSideConnection(
-    () => ({
-      async requestPermission(request) {
-        const option = request.options.find((entry) => entry.kind?.startsWith("allow_"));
-        return option
-          ? { outcome: { outcome: "selected" as const, optionId: option.optionId } }
-          : { outcome: { outcome: "cancelled" as const } };
-      },
-      async sessionUpdate() {},
-    } satisfies Client),
-    ndJsonStream(
-      Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
-      Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>
-    )
-  );
+  const cliPath = options.cliPath ?? "copilot";
+  const args = options.args ? [...options.args] : [...COPILOT_ACP_BASE_ARGS];
+  const cwd = options.cwd ?? process.cwd();
+  const env = options.env ?? process.env;
   const timeoutMs = options.timeoutMs ?? 45_000;
-  let sessionId: string | undefined;
+  const cleanupTimeoutMs = options.cleanupTimeoutMs ?? 1_000;
+  const controller = new AbortController();
+  const overallTimeoutMs = options.overallTimeoutMs ?? 180_000;
+  const overallTimer = setTimeout(() => {
+    controller.abort(new Error(`copilot ACP catalog probe timed out after ${overallTimeoutMs}ms`));
+  }, Math.max(1, overallTimeoutMs));
+  overallTimer.unref?.();
+  const spawnProcess = options.spawnProcess;
   try {
-    await Promise.race([
-      connection.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
-      }),
-      died,
-      probeTimeout<void>(timeoutMs, "copilot ACP initialize timed out"),
-    ]);
-    const session = await Promise.race([
-      connection.newSession({ cwd: options.cwd ?? process.cwd(), mcpServers: [] }),
-      died,
-      probeTimeout<never>(timeoutMs, "copilot ACP session/new timed out"),
-    ]);
-    sessionId = session.sessionId;
-    const initial = catalogConfigOptions(session.configOptions);
-    const modelSelect = selectOption(initial, "model");
-    const models = modelSelect ? flattenSelectOptions(modelSelect.options) : [];
+    const discovery = await runCopilotAcpProbeSession({
+      cliPath, args, cwd, env, timeoutMs, cleanupTimeoutMs,
+      signal: controller.signal,
+      spawnProcess,
+      inspect: async (session) => {
+        const modelSelect = selectOption(session.configOptions, "model");
+        const models = modelSelect ? flattenSelectOptions(modelSelect.options) : [];
+        return { defaultModel: modelSelect?.currentValue ?? "", models };
+      },
+    });
+    const models = discovery.models;
     if (!models.length) throw new Error("copilot ACP advertised no model config options");
-    const rows: CopilotCatalogProbeModel[] = [];
-    for (const model of models) {
-      const responseOptions = model.value === modelSelect!.currentValue
-        ? initial
-        : catalogConfigOptions((await Promise.race([
-            connection.setSessionConfigOption({ sessionId, configId: "model", value: model.value }),
-            died,
-            probeTimeout<never>(timeoutMs, `copilot ACP model probe timed out for ${model.value}`),
-          ])).configOptions);
-      const effort = selectOption(responseOptions, "reasoning_effort");
-      const effortChoices = effort ? flattenSelectOptions(effort.options).map((entry) => entry.value) : [];
-      rows.push({
-        modelId: model.value,
-        displayName: model.name,
-        effortChoices,
-        effortDefault: effort?.currentValue && effortChoices.includes(effort.currentValue)
-          ? effort.currentValue
-          : "default",
-        priceCategory: copilotPriceCategory(model),
-      });
+    if (new Set(models.map((model) => model.value)).size !== models.length) {
+      throw new Error("copilot ACP advertised duplicate model config options");
     }
-    return { defaultModel: modelSelect!.currentValue, models: rows };
+    if (!models.some((model) => model.value === discovery.defaultModel)) {
+      throw new Error(
+        `copilot ACP default model ${JSON.stringify(discovery.defaultModel)} is not in its model list`
+      );
+    }
+    const indices = models.map((_model, index) => index);
+    if (options.probeOrder === "reverse") indices.reverse();
+    const rows: Array<CopilotCatalogProbeModel | undefined> = new Array(models.length);
+    // Copilot's configured credential scope contains mutable selection state
+    // shared even by separate CLI processes. Keep exactly one model probe in
+    // flight while giving every attempt its own fresh process and ACP session.
+    // Two bounded fresh retries cover the CLI's occasional failure to
+    // acknowledge an advertised model immediately after session creation.
+    for (const index of indices) {
+      const model = models[index]!;
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= COPILOT_MODEL_PROBE_ATTEMPTS; attempt += 1) {
+        try {
+          const result = await runCopilotAcpProbeSession<CopilotModelProbeAttempt>({
+            cliPath, args, cwd, env, timeoutMs, cleanupTimeoutMs,
+            signal: controller.signal,
+            spawnProcess,
+            inspect: async (session, run) => {
+              let responseOptions = session.configOptions;
+              const initialModel = selectOption(responseOptions, "model");
+              if (initialModel?.currentValue !== model.value) {
+                const response = await run(
+                  session.connection.setSessionConfigOption({
+                    sessionId: session.sessionId,
+                    configId: "model",
+                    value: model.value,
+                  }),
+                  `copilot ACP model probe timed out for ${model.value}`
+                );
+                responseOptions = catalogConfigOptions(response.configOptions);
+              }
+              const selectedModel = selectOption(responseOptions, "model");
+              if (selectedModel?.currentValue !== model.value) {
+                return {
+                  kind: "not-selected",
+                  returned: selectedModel?.currentValue ?? null,
+                };
+              }
+              const effort = selectOption(responseOptions, "reasoning_effort");
+              const effortChoices = effort
+                ? flattenSelectOptions(effort.options).map((entry) => entry.value)
+                : [];
+              if (effort && !effortChoices.length) {
+                throw new Error(`copilot ACP advertised an empty effort list for ${model.value}`);
+              }
+              return {
+                kind: "selected",
+                row: {
+                  modelId: model.value,
+                  displayName: model.name,
+                  effortChoices,
+                  effortDefault: effort?.currentValue && effortChoices.includes(effort.currentValue)
+                    ? effort.currentValue
+                    : "default",
+                  priceCategory: copilotPriceCategory(model),
+                },
+              };
+            },
+          });
+          if (result.kind === "not-selected") {
+            lastError = new Error(
+              `copilot ACP model probe did not select ${JSON.stringify(model.value)} ` +
+              `(returned ${JSON.stringify(result.returned)})`
+            );
+            if (attempt < COPILOT_MODEL_PROBE_ATTEMPTS) {
+              await waitForProbeRetry(attempt * 1_000, controller.signal);
+              continue;
+            }
+            break;
+          }
+          rows[index] = result.row;
+          break;
+        } catch (error) {
+          lastError = error;
+          break;
+        }
+      }
+      if (!rows[index]) {
+        if (lastError instanceof ProbeError && lastError.code === "not_reaped") throw lastError;
+        const detail = redactProbeText(
+          lastError instanceof Error ? lastError.message : String(lastError),
+          env
+        );
+        const modelLabel = redactProbeText(model.value, env);
+        throw new Error(`copilot ACP model probe failed for ${modelLabel}: ${detail}`);
+      }
+    }
+    if (controller.signal.aborted) {
+      throw abortReason(controller.signal, "copilot ACP catalog probe aborted");
+    }
+    if (rows.some((row) => !row)) {
+      throw new Error("copilot ACP catalog probe ended with partial model results");
+    }
+    return {
+      defaultModel: discovery.defaultModel,
+      models: rows as CopilotCatalogProbeModel[],
+    };
+  } catch (error) {
+    if (controller.signal.aborted && (!(error instanceof ProbeError) || error.code === "cancelled")) {
+      throw abortReason(controller.signal, "copilot ACP catalog probe aborted");
+    }
+    throw error;
   } finally {
-    if (sessionId) await connection.closeSession({ sessionId }).catch(() => undefined);
-    child.kill("SIGKILL");
+    clearTimeout(overallTimer);
   }
 }
 
@@ -193,6 +424,14 @@ export function makeCopilotProfile(opts: {
   /** Display name shown in pickers / status. Defaults to "GitHub Copilot". */
   displayName?: string;
   cliPath?: string;
+  /** Exact ACP argv prefix used by this configured Copilot runtime. */
+  acpArgs?: string[];
+  /** Spawn cwd shared by runtime sessions and catalog probes. */
+  cwd?: string;
+  /** Base environment shared by runtime sessions and catalog probes. */
+  environment?: NodeJS.ProcessEnv;
+  /** Secret-safe identity for the authenticated catalog scope. */
+  credentialProfile?: string;
   defaultModel: string;
   mcpServers?: McpServer[];
   /**
@@ -203,16 +442,19 @@ export function makeCopilotProfile(opts: {
   configDir?: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
   /** Test/embedding seam; production probes the profile's ACP process. */
-  catalogProbe?: () => Promise<CopilotCatalogProbe>;
+  catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "copilot";
+  const acpArgs = opts.acpArgs ? [...opts.acpArgs] : [...COPILOT_ACP_BASE_ARGS];
   const globalMcpServers = opts.mcpServers ?? [];
   const configDir = opts.configDir?.trim() || undefined;
+  const runtimeCwd = opts.cwd ?? process.cwd();
+  const credentialProfile = opts.credentialProfile?.trim() || configDir || "default";
 
   let identityCache: AgentIdentity | null | undefined;
 
   const probeEnvironment = (): NodeJS.ProcessEnv => {
-    const env: NodeJS.ProcessEnv = { ...process.env };
+    const env: NodeJS.ProcessEnv = { ...(opts.environment ?? process.env) };
     if (configDir) {
       const token = readCopilotTokenSync(configDir);
       if (token) env.COPILOT_GITHUB_TOKEN = token;
@@ -227,23 +469,26 @@ export function makeCopilotProfile(opts: {
     catalog: {
       scope: () => manifestCatalogScope({
         provider: "github-copilot",
-        credentialProfile: configDir ?? "default",
+        credentialProfile,
       }),
       async fetch() {
+        const catalogLaunch: CopilotCatalogLaunch = {
+          cliPath: cli,
+          args: [...acpArgs],
+          cwd: runtimeCwd,
+          env: probeEnvironment(),
+        };
         const probe = opts.catalogProbe
-          ? await opts.catalogProbe()
-          : await probeCopilotCatalog({
-              cliPath: cli,
-              env: probeEnvironment(),
-              ...(configDir ? { cwd: configDir } : {}),
-            });
+          ? await opts.catalogProbe(catalogLaunch)
+          : await probeCopilotCatalog(catalogLaunch);
         const candidate = await manifestCatalogSource({
           provider: "github-copilot",
-          credentialProfile: configDir ?? "default",
+          credentialProfile,
           defaultModel: probe.defaultModel || opts.defaultModel,
           models: () => probe.models.map((model) => ({
             modelId: model.modelId,
             name: model.displayName,
+            pricingCategory: model.priceCategory,
             effort: {
               mechanism: model.effortChoices.length ? "configOption" : "none",
               ...(model.effortChoices.length ? { configId: "reasoning_effort" } : {}),
@@ -256,6 +501,7 @@ export function makeCopilotProfile(opts: {
           source: "copilot-acp-config-options",
         }).fetch();
         candidate.cliVersion = await readCliVersion(cli);
+        candidate.sourceVersion = `acp/${PROTOCOL_VERSION}`;
         return candidate;
       },
     },
@@ -271,7 +517,8 @@ export function makeCopilotProfile(opts: {
       levels: ["low", "medium", "high", "xhigh", "max"],
     },
     spawn(_modelOverride?: string, _effortOverride?: string, sessionMcpServers?: McpServer[]) {
-      const args = ["--acp"];
+      const launch = copilotAcpLaunchSpec(cli, acpArgs, runtimeCwd, probeEnvironment());
+      const args = launch.args;
       // Copilot ignores ACP session/new + session/load `mcpServers`. Supply the
       // runtime-specific seam-MCP URL/token when the ACP *process* starts so a
       // resumed session after redeploy retains its coordination tools.
@@ -283,10 +530,8 @@ export function makeCopilotProfile(opts: {
       }
       // --config-dir is not a supported CLI flag. The same credential-scoped
       // environment is used by runtime spawn and catalog collection.
-      const env = probeEnvironment();
-      return spawn(cli, args, {
-        stdio: ["pipe", "pipe", "pipe"],
-        env,
+      return spawn(launch.executable, args, {
+        ...launch.options,
         detached: true,
       });
     },

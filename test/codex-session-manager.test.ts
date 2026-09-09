@@ -101,7 +101,7 @@ describe("Codex model catalog", () => {
     }
   });
 
-  it("lets the Codex adapter fetch its catalog without starting ACP", async () => {
+  it("uses a matching cache row only to enrich the live catalog", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-profile-models-"));
     try {
       const cachePath = path.join(root, "models_cache.json");
@@ -119,16 +119,34 @@ describe("Codex model catalog", () => {
         defaultModel: "gpt-5.6-sol",
         sessionsRoot: path.join(root, "sessions"),
         modelsCachePath: cachePath,
+        catalogProbe: async () => ({
+          runtimeVersion: "codex-cli fixture",
+          wrapperVersion: "codex-acp fixture",
+          models: [{
+            id: "gpt-5.6-sol",
+            model: "gpt-5.6-sol",
+            displayName: "GPT-5.6-Sol Live",
+            hidden: false,
+            supportedReasoningEfforts: [
+              { reasoningEffort: "low" },
+              { reasoningEffort: "high" },
+            ],
+            defaultReasoningEffort: "high",
+            inputModalities: ["text", "image"],
+            serviceTiers: [],
+            isDefault: true,
+          }],
+        }),
       });
       const catalog = await profile.catalog.fetch();
       expect(catalog.models.map((model) => ({
         modelId: model.id,
         name: model.displayName,
         contextLimit: model.context.effective,
-      }))).toEqual([{ modelId: "gpt-5.6-sol", name: "GPT-5.6-Sol", contextLimit: 258_400 }]);
+      }))).toEqual([{ modelId: "gpt-5.6-sol", name: "GPT-5.6-Sol Live", contextLimit: 258_400 }]);
       expect(catalog.models[0]?.effort).toMatchObject({
-        choices: [{ id: "medium", raw: "medium" }, { id: "xhigh", raw: "xhigh" }],
-        selectionDefault: "xhigh",
+        choices: [{ id: "low", raw: "low" }, { id: "high", raw: "high" }],
+        selectionDefault: "high",
       });
     } finally {
       fs.rmSync(root, { recursive: true, force: true });

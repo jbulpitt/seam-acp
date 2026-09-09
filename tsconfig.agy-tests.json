@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "packages/adapters/src/**/*.ts",
+    "packages/core/src/**/*.ts",
+    "packages/bridge/src/**/*.ts",
+    "test/agy-package-profile.test.ts",
+    "test/agy-config.test.ts",
+    "test/agy-cutover.test.ts",
+    "test/agy-image-inspector.test.ts",
+    "test/bridge-inventory.test.ts"
+  ]
+}

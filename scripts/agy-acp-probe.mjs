@@ -2,7 +2,7 @@
 /**
  * End-to-end smoke test for packages/adapters/src/profiles/agy.ts.
  *
- * Drives the fake-ChildProcess returned by `makeAgyProfile().spawn()` with a
+ * Legacy rollback diagnostic: drives `makeAgyOldProfile().spawn()` with a
  * real `ClientSideConnection`, the same way `AgentRuntime` does. Prints each
  * ACP `sessionUpdate` it receives so we can confirm the streaming → ACP
  * translation works before wiring this into the Discord orchestrator.
@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 
-const { makeAgyProfile } = await import(
+const { makeAgyOldProfile } = await import(
   pathToFileURL(path.join(repoRoot, "packages/adapters/src/profiles/agy.ts")).href
 );
 const acp = await import("@agentclientprotocol/sdk");
@@ -24,7 +24,7 @@ const acp = await import("@agentclientprotocol/sdk");
 const prompt = process.argv.slice(2).join(" ").trim() ||
   "view /etc/hostname, then run uname -a via bash. Announce each step.";
 
-const profile = makeAgyProfile({});
+const profile = makeAgyOldProfile({});
 const proc = profile.spawn();
 
 const t0 = Date.now();

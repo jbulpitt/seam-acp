@@ -48,7 +48,9 @@ Copy `.env.example` to `.env` and fill it in.
 | `MODEL_VALUE_STD_INPUT_TOKENS` | no | Fixed input-token count for model-value cost comparisons. Default `8000`. |
 | `MODEL_VALUE_STD_OUTPUT_TOKENS` | no | Fixed output-token count for model-value cost comparisons. Default `2000`. |
 | `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam config agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
-| `AGY_CLI_PATH` | no | If `agy` is not on `PATH` (checks `~/.local/bin/agy` first) |
+| `AGY_ENABLED` | no | Enables the package-backed public `agy` profile only when its exact wrapper/runtime configuration and permission-risk acknowledgement are also present. Default `false`. |
+| `AGY_ACP_BIN` / `AGY_ACP_SHA256` | with AGY | Exact compiled `antigravity-acp` v1.1.0 asset and reviewed platform digest. Seam never downloads it. |
+| `AGY_BIN` / `AGY_VERSION` / `AGY_SHA256` | with AGY | Exact host-local authenticated `agy` executable, expected `--version` output, and digest used for catalog evidence and runtime. |
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
 | `CLAUDE_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `claude-<id>` profile pinned to its own `CLAUDE_CONFIG_DIR`. See "Multiple Claude accounts" below. |
@@ -69,7 +71,14 @@ npm i -g @anthropic-ai/claude-code @agentclientprotocol/claude-agent-acp
 claude /login
 ```
 
-To use the **Google Antigravity (agy)** profile, install the Antigravity CLI binary from [github.com/google-antigravity/antigravity-cli](https://github.com/google-antigravity/antigravity-cli/releases) and run `agy /auth`. Each agent profile is independent — install only the ones you'll use.
+The **Google Antigravity (`agy`)** profile uses the pinned compiled
+`antigravity-acp` wrapper and an exact host-local `agy` binary. It is deliberately
+disabled until its artifact digest, directories, semantic credential scope, and
+permission-bypass acknowledgement are configured. Seam forces
+`AGY_SKIP_DOWNLOAD=1`; neither startup nor catalog refresh downloads or replaces
+either executable. Authentication is a separate operator action performed on
+the runtime host, never by Seam. Read the security and account-risk requirements
+in [the AGY integration runbook](docs/agy-package-integration.md) before enabling it.
 
 ## Run (local dev)
 
@@ -242,11 +251,15 @@ COPILOT_HOME=/Users/me/.copilot-personal copilot login
 Verify in a thread with `/seam info whoami` — the bot reads
 `<config-dir>/config.json` and reports the GitHub login.
 
-### Multiple agy accounts
+### Antigravity account scope
 
 > **Note:** agy (Antigravity CLI) is Google's official replacement for the deprecated Gemini CLI. The Gemini CLI service was sunset on June 18, 2026.
 
-The `agy` profile currently uses a single global agy session (`~/.gemini/antigravity-cli/`). Multi-account support for agy is not yet implemented — see `src/agents/profiles/agy.ts` for the current integration.
+Each `agy@location` binding uses that host's own `HOME`, wrapper state at
+`~/.agy-acp`, exact conversation directory, and a non-secret semantic scope
+label. Seam does not copy credentials between hosts or accept an account email
+as the scope. Multiple accounts on one host require separately isolated bridge
+services/HOMEs; automatic profile multiplexing is intentionally not provided.
 
 ### Multiple Claude accounts
 
@@ -302,6 +315,9 @@ update → verify the pristine install → verify against JSONL → confirm new/
 ### Remote agents
 
 Remote agents are being rebuilt as location bindings — see [`docs/seam-bridge-plan.md`](docs/seam-bridge-plan.md).
+Use the dry-run-first [`remote bridge rollout runbook`](docs/bridge-rollout.md)
+for PM2 bridge updates; it stages versioned artifacts without remote Git and
+requires an explicit one-host apply for activation or rollback.
 
 ### MCP servers
 
@@ -333,7 +349,7 @@ AgentProfile         (Copilot today, Claude Code tomorrow — adds via `src/agen
 - **`src/platforms/chat-adapter.ts`** — generic chat platform interface.
 - **`src/platforms/discord/`** — discord.js v14 implementation + slash commands + repo picker.
 - **`src/agents/agent-runtime.ts`** — wraps `@agentclientprotocol/sdk` + a child process running an ACP server. Handles `initialize`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, model / mode / config option setters, and emits typed events.
-- **`src/agents/profiles/copilot.ts`** — spawns `copilot --acp`. Supports `configDir` for multi-account use and exposes `whoami()`. Sibling profiles: `agy.ts` (Google Antigravity CLI, in-process ACP bridge), `claude.ts` (Anthropic Claude Code, via the `claude-agent-acp` adapter), `codex.ts` (OpenAI Codex via `codex-acp`). Add a new profile by writing one of these.
+- **`packages/adapters/src/profiles/copilot.ts`** — spawns `copilot --acp`. Sibling profiles include `agy.ts` (pinned package-backed Antigravity ACP), `agy-old.ts` (disabled rollback only), `claude.ts`, `codex.ts`, and `grok.ts`.
 - **`src/core/`** — pure utilities: text chunker, path safety, sqlite store, session router, status panel.
 
 ## Testing

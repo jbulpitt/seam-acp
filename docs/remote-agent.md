@@ -1,5 +1,10 @@
 # Remote agent profiles
 
+> This document describes the legacy topology and initial bootstrap. For updates
+> to an existing PM2-managed bridge, use the dry-run-first
+> [remote bridge rollout runbook](./bridge-rollout.md). Do not update an active
+> bridge by pulling its checkout or issuing an immediate PM2 restart.
+
 A remote agent profile lets you run an agent CLI (e.g. GitHub Copilot, Claude Code) on a **separate machine** — one that cannot accept inbound connections (e.g. a Mac behind a corporate NAT) — and expose it in seam-acp as a regular `/seam agent` option.
 
 The bridge script (`scripts/remote-agent-bridge.mjs`) runs on the remote machine, spawns the agent CLI, and pipes its ACP stdio over a WebSocket to seam-acp. Two topologies are supported:
@@ -301,4 +306,3 @@ Add `NODE_EXTRA_CA_CERTS` to the PM2 env or launchd `EnvironmentVariables` to ma
 - **No `/seam whoami` support.** Remote profiles always return unknown — the agent's local config files are not readable from the seam-acp host.
 - **Agent CLI must be pre-authenticated.** Run `copilot auth login` (or `claude /login`) on the remote machine before starting the bridge.
 - **One agent process per bridge.** A single bridge connection can serve multiple concurrent Discord threads (ACP supports multiple sessions per process). Run a separate bridge instance if you want separate agent processes.
-

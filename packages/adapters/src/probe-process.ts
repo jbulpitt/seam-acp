@@ -124,6 +124,12 @@ export interface ProbeHandle {
   onClose(step: ProbeCloseStep, phase?: ProbeClosePhase): void;
   /** Rejects when the child exits early; race protocol waits against it. */
   readonly exited: Promise<never>;
+  /**
+   * Settles only when an explicitly allowed clean exit is observed. One-shot
+   * collectors await this together with their bounded stdout consumption.
+   * Every failure rejects it so their run callback also settles during cleanup.
+   */
+  readonly completed: Promise<{ code: 0; signal: null }>;
   /** Redacted trailing stderr, for tests and structured diagnostics. */
   stderrTail(): string;
 }
@@ -154,6 +160,8 @@ export interface BoundedProbeOptions<T> {
   finalizeDeadlineMs?: number;
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
+  /** Permit exit code 0 for bounded one-shot collectors. Default is false. */
+  allowCleanExit?: boolean;
   /** Label used in error detail. Must not carry secrets. */
   label?: string;
   /**
@@ -247,12 +255,21 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   let thrownCode: ProbeErrorCode | undefined;
   /** Set once a post-spawn `error` is seen, which is NOT a spawn failure. */
   let postSpawnError: Error | undefined;
+  /** Set when the child ended normally; not a failure, but it IS reaped. */
+  let cleanExit = false;
   /** True once the OS has actually produced the process. */
   let spawned = child.pid !== undefined;
   /** The caller's own promise, so finalization can give it a bounded chance
    *  to observe the abort and finish registering its closes. */
   let runPromise: Promise<T> | undefined;
   let exitReject: ((err: Error) => void) | undefined;
+  let completionResolve: ((result: { code: 0; signal: null }) => void) | undefined;
+  let completionReject: ((err: Error) => void) | undefined;
+  const completed = new Promise<{ code: 0; signal: null }>((resolve, reject) => {
+    completionResolve = resolve;
+    completionReject = reject;
+  });
+  completed.catch(() => {});
 
   /**
    * Signal a failure. `exitReject` settles once, so the FIRST failure is the
@@ -260,6 +277,7 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
    */
   const fail = (error: ProbeError): void => {
     if (!controller.signal.aborted) controller.abort();
+    completionReject?.(error);
     exitReject?.(error);
   };
 
@@ -316,6 +334,16 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   const swallowLateError = (): void => {};
   child.on("error", swallowLateError);
   const onExit = (code: number | null, signalCode: NodeJS.Signals | null): void => {
+    // A CLEAN exit (code 0, no signal) is ordinary teardown — a short-lived
+    // wrapper ending after its work, or ending because we closed its transport.
+    // Treating it as `exited_early` failed probes that had already succeeded,
+    // purely on whether the exit event beat the run's resolution to the race.
+    // Only an ABNORMAL exit is a failure worth unblocking racers for.
+    if (code === 0 && signalCode === null) {
+      cleanExit = true;
+      if (options.allowCleanExit) completionResolve?.({ code: 0, signal: null });
+      return;
+    }
     // Raw child stderr is NEVER attached; only its redacted tail.
     const tail = redact(stderrTail).trim();
     fail(new ProbeError(
@@ -360,6 +388,7 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     pid: child.pid,
     signal: controller.signal,
     exited,
+    completed,
     stderrTail: () => redact(stderrTail),
     onClose: (step, phase = "connection") => {
       // Registration barrier. Before finalization a step is queued normally.
@@ -436,14 +465,11 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     }
     if (timer) clearTimeout(timer);
     if (options.signal && onOuterAbort) options.signal.removeEventListener("abort", onOuterAbort);
-    child.removeListener("error", onSpawnError);
-    child.removeListener("exit", onExit);
-    if (onStarted) child.removeListener("spawn", onStarted);
-    if (onStartError) child.removeListener("error", onStartError);
-    child.stdout.removeListener("data", onStdout);
-    child.stdout.removeListener("end", onStdoutEnd);
-    child.stderr.removeListener("data", onStderr);
-    if (!stdout.destroyed) stdout.end();
+    // Transport stays FULLY LIVE across the close drain — forwarding included.
+    // Removing the stdout listener or ending the republished stream here would
+    // make the session phase useless: a `session/close` written afterwards is
+    // either never delivered or never answered, which is the exact thing
+    // session-before-connection ordering exists to allow.
     // Drain in PHASE order, repeatedly: a close step may itself register another
     // one, and a step that arrived late still has to obey session-before-
     // connection. The registration phase stays OPEN across rounds so anything a
@@ -459,7 +485,16 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     }
     // Nothing may register from here on.
     registrationSealed = true;
-    const reaped = await terminate(child, killGraceMs);
+    // Transport down only once every session-phase close has had its turn.
+    child.removeListener("error", onSpawnError);
+    child.removeListener("exit", onExit);
+    if (onStarted) child.removeListener("spawn", onStarted);
+    if (onStartError) child.removeListener("error", onStartError);
+    child.stdout.removeListener("data", onStdout);
+    child.stdout.removeListener("end", onStdoutEnd);
+    child.stderr.removeListener("data", onStderr);
+    if (!stdout.destroyed) stdout.end();
+    const reaped = cleanExit || (await terminate(child, killGraceMs));
     // The protective error listener is the LAST thing removed, so a stray
     // `error` emitted during termination cannot become an uncaught exception.
     child.removeListener("error", swallowLateError);

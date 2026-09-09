@@ -18870,7 +18870,7 @@ export class Orchestrator {
       const configDir = profile?.configDir;
       if (isAgy) {
         const { fetchAgyUserStatus } = await import("@seam/adapters");
-        const data = await fetchAgyUserStatus(this.config.AGY_CLI_PATH);
+        const data = await fetchAgyUserStatus(this.config.AGY_BIN);
         await i.editReply({ content: formatAgyUsage(data) });
       } else if (isOllamaCloud) {
         const { fetchOllamaCloudUsage } = await import("@seam/adapters");

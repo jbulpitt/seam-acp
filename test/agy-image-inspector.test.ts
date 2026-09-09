@@ -3,7 +3,7 @@ import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import pino from "pino";
-import type { AgentProfile } from "@seam/adapters";
+import { agyAcpReleaseArtifact, type AgentProfile } from "@seam/adapters";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import {
   createAgyImageInspector,
@@ -17,6 +17,20 @@ import {
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
 const MODEL = "gemini-3.7-flash-high";
 const silent = pino({ level: "silent" }) as unknown as Logger;
+const runtimeProfileOptions = {
+  acpPath: "/bin/false",
+  agyBin: "/bin/false",
+  agyVersion: "false 1.0",
+  agySha256: "a".repeat(64),
+  stateDir: "/tmp/.agy-acp",
+  conversationsDir: "/tmp/conversations",
+  credentialScope: "test",
+  wrapperVersion: "1.1.0",
+  wrapperSha256: agyAcpReleaseArtifact().sha256,
+  permissionRiskAcknowledged: true,
+  verifyWrapper: () => {},
+  verifyRuntime: () => {},
+};
 
 describe("Agy image inspector", () => {
   const ownerId = "discord:agy-vision";
@@ -59,6 +73,7 @@ describe("Agy image inspector", () => {
     const inspect = createAgyImageInspector({
       model: MODEL,
       logger: silent,
+      profileOptions: runtimeProfileOptions,
       stagingRoot: root,
       isModelAvailable: (model) => model === MODEL,
       profileFactory: (options) => {
@@ -85,10 +100,8 @@ describe("Agy image inspector", () => {
     expect(profileOptions).toEqual([
       expect.objectContaining({
         defaultModel: MODEL,
-        mcpServers: [],
-        sandbox: true,
-        exposeGlobalStaging: false,
-        persistModelSelection: false,
+        acpPath: "/bin/false",
+        agyBin: "/bin/false",
       }),
     ]);
     expect(newSession).toHaveBeenCalledWith({
@@ -110,6 +123,7 @@ describe("Agy image inspector", () => {
     const inspect = createAgyImageInspector({
       model: MODEL,
       logger: silent,
+      profileOptions: runtimeProfileOptions,
       stagingRoot: root,
       isModelAvailable: () => false,
       profileFactory: () => ({} as AgentProfile),
@@ -137,6 +151,7 @@ describe("Agy image inspector", () => {
     const inspect = createAgyImageInspector({
       model: MODEL,
       logger: silent,
+      profileOptions: runtimeProfileOptions,
       stagingRoot: root,
       isModelAvailable: (model) => model === MODEL,
       profileFactory: () => ({} as AgentProfile),
@@ -163,9 +178,10 @@ describe("Agy image inspector", () => {
     const inspect = createAgyImageInspector({
       model: MODEL,
       logger: silent,
+      profileOptions: runtimeProfileOptions,
       stagingRoot: root,
       profileFactory: (options) => {
-        privateDir = String(options?.dataDir ?? "");
+        privateDir = String(options.cwd ?? "");
         throw new Error("sensitive setup failure");
       },
     });

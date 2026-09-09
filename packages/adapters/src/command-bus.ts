@@ -58,6 +58,8 @@ export interface HelloAgentInventory {
   version: number;
   installed: boolean;
   ready: boolean;
+  /** Optional non-secret resolved runtime/provenance inventory. */
+  runtime?: import("./agent-profile.js").AdapterRuntimeDescriptor;
 }
 
 export interface HelloHostInfo {
@@ -75,6 +77,20 @@ export interface HelloFrame {
   agents: HelloAgentInventory[];
   /** True when the bridge process registered dev-mode RPC handlers. */
   devMode?: boolean;
+  /** Secret-free staged-release identity used only for rollout verification. */
+  release?: {
+    formatVersion: 2;
+    activationId: string;
+    stageId: string;
+    bridgeId: string;
+    sourceSha: string;
+    artifactChecksum: string;
+    verificationAgent: string;
+    oldPid: number;
+    pid: number;
+    startedAt: string;
+    deadlineAt: string;
+  };
 }
 
 export interface HelloAckFrame {

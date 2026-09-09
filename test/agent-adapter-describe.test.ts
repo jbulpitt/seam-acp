@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { spawn } from "node:child_process";
+import os from "node:os";
 import {
   AGENT_ADAPTER_VERSION,
   asLocalAdapter,
   makeAgyProfile,
+  agyAcpReleaseArtifact,
   makeClaudeProfile,
   makeCodexProfile,
   makeCopilotProfile,
@@ -90,7 +92,22 @@ describe("AgentAdapter.describe()", () => {
   });
 
   it("agy reports modelBaked", () => {
-    const d = makeAgyProfile().describe();
+    const d = makeAgyProfile({
+      acpPath: "/bin/false",
+      agyBin: "/bin/false",
+      agyVersion: "false 1.0",
+      agySha256: "a".repeat(64),
+      defaultModel: "gemini-high",
+      stateDir: `${os.homedir()}/.agy-acp`,
+      conversationsDir: "/tmp/conversations",
+      cwd: "/tmp",
+      credentialScope: "test",
+      wrapperVersion: "1.1.0",
+      wrapperSha256: agyAcpReleaseArtifact().sha256,
+      permissionRiskAcknowledged: true,
+      verifyWrapper: () => {},
+      verifyRuntime: () => {},
+    }).describe();
     expect(d.effort.mechanism).toBe("modelBaked");
     expect(d.effort.levels).toEqual([]);
   });
@@ -111,6 +128,24 @@ describe("AgentAdapter.describe()", () => {
     const profile = makeGrokProfile({
       defaultModel: "grok-4.6",
       staticModels: [{ modelId: "grok-4.6", name: "Grok 4.6", contextLimit: 500_000 }],
+      authIdentityProbe: () => ({ source: "subscription", fingerprint: "a".repeat(64) }),
+      catalogProbe: async () => ({
+        modelState: {
+          defaultModel: "grok-4.6",
+          models: [{
+            modelId: "grok-4.6",
+            name: "Grok 4.6",
+            description: null,
+            contextLimit: 500_000,
+            effortChoices: [],
+            effortDefault: "default",
+          }],
+        },
+        protocolVersion: "1",
+        authSource: "subscription",
+        authIdentity: { source: "subscription", fingerprint: "a".repeat(64) },
+      }),
+      cliVersionProbe: async () => "grok test",
     });
     const d = profile.describe();
     expect(d.effort.mechanism).toBe("spawnArgs");

@@ -43,6 +43,7 @@
  */
 
 import { spawn, execSync, execFileSync, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -50,7 +51,12 @@ import type { IncomingMessage } from "node:http";
 import type { RawData, WebSocket as WsSocket } from "ws";
 import { PROTOCOL_VERSION, type AgentAdapter } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
-import { inventoryFromAdapters, loadHostAdapters } from "./inventory.js";
+import {
+  inventoryFromAdapters,
+  loadHostAdapters,
+  resolveCopilotHostLaunch,
+} from "./inventory.js";
+import { createReleaseReceiptWriter, type ReleaseReceiptWriter } from "./release-receipt.js";
 
 type WsCtor = typeof import("ws").WebSocket;
 type WssCtor = typeof import("ws").WebSocketServer;
@@ -133,7 +139,7 @@ const RECONNECT_DELAY_MS = 5_000;
 
 // Unique ID for this bridge process lifetime. Sent to seam-acp on every WS
 // connect so it can detect a bridge restart and evict stale runtimes.
-const BRIDGE_INSTANCE_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+const BRIDGE_INSTANCE_ID = randomUUID();
 
 /** Interval for sending WS ping frames to keep the tunnel/proxy alive. */
 const KEEPALIVE_PING_MS = 25_000;
@@ -198,27 +204,19 @@ function spawnAgent(
     return adapter.spawn(slotCfg?.model, slotCfg?.effort);
   }
 
-  const ghToken = process.env.GH_TOKEN || (() => {
-    try { return execSync("gh auth token", { stdio: ["pipe", "pipe", "ignore"] }).toString().trim(); }
-    catch { return ""; }
-  })();
-  const cmdParts = copilotCmd.split(" ");
-  const cmd = cmdParts[0]!;
-  const extraArgs = process.env.COPILOT_ARGS !== undefined
-    ? process.env.COPILOT_ARGS.split(" ").filter(Boolean)
-    : ["--acp"];
-  const cmdArgs = [...cmdParts.slice(1), ...extraArgs];
+  const cwd = slotCfg?.cwd || localCwd;
+  const launch = resolveCopilotHostLaunch(copilotCmd, cwd, slotCfg?.env);
+  const cmdArgs = [...launch.args];
   const mcpJson = additionalMcpConfigJson(slotCfg?.mcpServers);
   if (mcpJson) {
     cmdArgs.push("--additional-mcp-config", mcpJson);
   }
-  const cwd = slotCfg?.cwd || localCwd;
-  const extraEnv = slotCfg?.env ?? {};
-  console.error(`[bridge] Spawning agent: ${cmd} ${cmdArgs.filter((a) => a !== mcpJson).join(" ")} (GH_TOKEN: ${ghToken ? ghToken.slice(0, 8) + "..." : "MISSING"})`);
-  return spawn(cmd, cmdArgs, {
-    cwd,
+  const tokenLabel = launch.env.GH_TOKEN ? "present" : "missing";
+  console.error(`[bridge] Spawning agent: ${launch.cliPath} ${cmdArgs.filter((a) => a !== mcpJson).join(" ")} (GH_TOKEN: ${tokenLabel})`);
+  return spawn(launch.cliPath, cmdArgs, {
+    cwd: launch.cwd,
     stdio: ["pipe", "pipe", "inherit"],
-    env: { ...process.env, ...(ghToken ? { GH_TOKEN: ghToken } : {}), ...extraEnv },
+    env: launch.env,
   });
 }
 
@@ -253,8 +251,9 @@ function makeSlotManager(opts: {
   bridgeId: string;
   devMode: boolean;
   adapters: Map<string, AgentAdapter>;
+  releaseReceipt?: ReleaseReceiptWriter | null;
 }): SlotManager {
-  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, devMode, adapters } = opts;
+  const { copilotCmd, localCwd, workspaceRoot, WebSocket, bridgeId, devMode, adapters, releaseReceipt } = opts;
   let currentWs: WsSocket | null = null;
   const slots = new Map<number, ChildProcess>();
   const slotConfigs = new Map<number, SlotSpawnConfig>();
@@ -281,6 +280,7 @@ function makeSlotManager(opts: {
             host: { os: process.platform, arch: process.arch },
             agents,
             devMode,
+            ...(releaseReceipt ? { release: releaseReceipt.helloMetadata() } : {}),
           })
         );
       } catch { /* ws may not be open yet — best effort */ }
@@ -525,6 +525,9 @@ function makeSlotManager(opts: {
         console.error(`[bridge] hello rejected: ${msg.error ?? "protocol mismatch"}`);
       } else {
         console.error("[bridge] hello_ack accepted");
+        void releaseReceipt?.recordHelloAccepted().catch((err) => {
+          console.error("[bridge] could not write release ready receipt:", err instanceof Error ? err.message : String(err));
+        });
       }
       return;
     }
@@ -543,6 +546,7 @@ function makeSlotManager(opts: {
               slotConfigs.set(slot, cfg);
             },
           });
+          await releaseReceipt?.recordCatalogRpc(method, msg.agentId);
           wsSend({ v: PROTOCOL_VERSION, type: "rpc_reply", id, ok: true, result });
         } catch (err: any) {
           console.error(`[bridge] rpc ${method} failed:`, err?.message ?? err);
@@ -555,6 +559,13 @@ function makeSlotManager(opts: {
           });
         }
       })();
+      return;
+    }
+
+    if (msg.type === "event" && msg.name === "release_verified") {
+      void releaseReceipt?.recordControllerVerification(msg.payload).catch((err) => {
+        console.error("[bridge] could not write controller verification receipt:", err instanceof Error ? err.message : String(err));
+      });
       return;
     }
 
@@ -641,7 +652,8 @@ async function runClientMode(
   bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
 ) {
   const { WebSocket } = await loadWs();
-  const adapters = loadHostAdapters(copilotCmd);
+  const adapters = loadHostAdapters(copilotCmd, { cwd: localCwd });
+  const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION });
   const mgr = makeSlotManager({
     copilotCmd,
     localCwd,
@@ -650,6 +662,7 @@ async function runClientMode(
     bridgeId: bridgeOpts.bridgeId,
     devMode: bridgeOpts.devMode,
     adapters,
+    releaseReceipt,
   });
   activeMgr = mgr;
 
@@ -699,7 +712,8 @@ async function runServerMode(
   bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
 ) {
   const { WebSocket, WebSocketServer } = await loadWs();
-  const adapters = loadHostAdapters(copilotCmd);
+  const adapters = loadHostAdapters(copilotCmd, { cwd: localCwd });
+  const releaseReceipt = await createReleaseReceiptWriter({ bridgeId: bridgeOpts.bridgeId, instanceId: BRIDGE_INSTANCE_ID, protocolVersion: PROTOCOL_VERSION });
   const mgr = makeSlotManager({
     copilotCmd,
     localCwd,
@@ -708,6 +722,7 @@ async function runServerMode(
     bridgeId: bridgeOpts.bridgeId,
     devMode: bridgeOpts.devMode,
     adapters,
+    releaseReceipt,
   });
   activeMgr = mgr;
 

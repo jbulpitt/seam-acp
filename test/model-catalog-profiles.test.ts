@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import os from "node:os";
 import {
   makeAgyProfile,
+  agyAcpReleaseArtifact,
   makeClaudeProfile,
   makeCodexProfile,
   makeCopilotProfile,
@@ -84,11 +86,28 @@ describe("production adapter catalog sources", () => {
   });
 
   it("gives direct, alternate, Vertex, and Z.ai Claude profiles distinct semantic scopes", async () => {
+    // #232: direct-Anthropic profiles (including extra credential profiles) are
+    // live-first, so they take an injected probe here instead of spawning the
+    // wrapper. Vertex and Z.ai deliberately stay on the validated manifest.
+    const directProbe = async () => ({
+      wrapperCurrentValue: "sonnet",
+      models: [
+        {
+          advertisedId: "claude-opus-5",
+          advertisedName: "Opus 5",
+          resolvedValue: "claude-opus-5",
+          effortChoices: ["default", "low", "high"],
+          effortCurrent: "default",
+          configIds: ["mode", "model", "effort"],
+        },
+      ],
+    });
     const direct = makeClaudeProfile({
       cliPath: "false",
       directAnthropic: true,
       defaultModel: "claude-opus-5",
       staticModels: [{ modelId: "claude-opus-5", name: "Opus 5" }],
+      catalogProbe: directProbe,
     });
     const alternate = makeClaudeProfile({
       id: "claude-work",
@@ -97,6 +116,7 @@ describe("production adapter catalog sources", () => {
       configDir: "/credentials/work",
       defaultModel: "claude-opus-5",
       staticModels: [{ modelId: "claude-opus-5", name: "Opus 5" }],
+      catalogProbe: directProbe,
     });
     const vertex = makeClaudeProfile({
       id: "claude-vertex",
@@ -134,6 +154,12 @@ describe("production adapter catalog sources", () => {
     expect(new Set(catalogs.map((c) => c.scope.fingerprint)).size).toBe(4);
     expect(catalogs[2]?.scope).toMatchObject({ backend: "vertex", project: "project-7", region: "us-east5" });
     expect(catalogs[3]?.scope).toMatchObject({ provider: "z-ai", backend: "https://api.z.ai/api/anthropic" });
+    // Strategy split (#232): live-first for direct Anthropic and its extra
+    // credential profiles; validated manifest for the deferred backends.
+    expect(catalogs[0]?.source).toBe("claude-acp-live+verified-overlay");
+    expect(catalogs[1]?.source).toBe("claude-acp-live+verified-overlay");
+    expect(catalogs[2]?.source).toBe("validated-manifest");
+    expect(catalogs[3]?.source).toBe("validated-manifest");
   });
 
   it("covers Codex, parked Ollama Cloud, segmented Agy, and deferred Grok discovery", async () => {
@@ -141,6 +167,21 @@ describe("production adapter catalog sources", () => {
       cliPath: "false",
       defaultModel: "gpt-5",
       staticModels: [{ modelId: "gpt-5", name: "GPT-5", contextLimit: 300_000 }],
+      catalogProbe: async () => ({
+        runtimeVersion: "codex-cli fixture",
+        wrapperVersion: "codex-acp fixture",
+        models: [{
+          id: "gpt-5",
+          model: "gpt-5",
+          displayName: "GPT-5",
+          hidden: false,
+          supportedReasoningEfforts: [{ reasoningEffort: "medium" }],
+          defaultReasoningEffort: "medium",
+          inputModalities: ["text", "image"],
+          serviceTiers: [],
+          isDefault: true,
+        }],
+      }),
     });
     const ollama = makeCodexProfile({
       id: "ollama-cloud",
@@ -150,9 +191,24 @@ describe("production adapter catalog sources", () => {
       effort: { mechanism: "configOption", configId: "reasoning_effort", levels: ["low", "high"] },
     });
     const agy = makeAgyProfile({
-      cliPath: "false",
+      acpPath: "/bin/false",
+      agyBin: "/bin/false",
+      agyVersion: "false 1.0",
+      agySha256: "a".repeat(64),
       defaultModel: "gemini-high",
-      staticModels: [{ modelId: "gemini-high", name: "Gemini High", contextLimit: 1_000_000 }],
+      stateDir: `${os.homedir()}/.agy-acp`,
+      conversationsDir: "/tmp/conversations",
+      cwd: "/tmp",
+      credentialScope: "test",
+      wrapperVersion: "1.1.0",
+      wrapperSha256: agyAcpReleaseArtifact().sha256,
+      permissionRiskAcknowledged: true,
+      verifyWrapper: () => {},
+      verifyRuntime: () => {},
+      catalogProbe: async () => ({
+        agyVersion: "false 1.0",
+        models: [{ modelId: "gemini-high", displayName: "Gemini High" }],
+      }),
     });
     const discover = vi.fn(async () => [
       { modelId: "grok-future", name: "Grok Future", contextLimit: 654_321 },
@@ -162,6 +218,9 @@ describe("production adapter catalog sources", () => {
       defaultModel: "grok-future",
       staticModels: [{ modelId: "grok-static", name: "Grok Static" }],
       discoverModels: discover,
+      catalogMode: "api-key",
+      apiKey: "test-only",
+      cliVersionProbe: async () => "grok test",
     });
     expect(discover).not.toHaveBeenCalled();
     const catalogs = (await Promise.all([codex, ollama, agy, grok].map((profile) => profile.catalog.fetch())))

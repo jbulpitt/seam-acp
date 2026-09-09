@@ -96,9 +96,11 @@ class CopilotModelSelectionError extends Error {}
 
 function redactCopilotSecrets(value: string, env: NodeJS.ProcessEnv): string {
   let redacted = value;
-  for (const key of COPILOT_SECRET_ENV_KEYS) {
-    const secret = env[key];
-    if (secret) redacted = redacted.split(secret).join("[REDACTED]");
+  const secrets = [...new Set(
+    COPILOT_SECRET_ENV_KEYS.map((key) => env[key]).filter((secret): secret is string => Boolean(secret))
+  )].sort((left, right) => right.length - left.length);
+  for (const secret of secrets) {
+    redacted = redacted.split(secret).join("[REDACTED]");
   }
   return redacted;
 }

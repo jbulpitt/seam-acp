@@ -565,15 +565,21 @@ describe("Copilot isolated catalog probing (#234)", () => {
   });
 
   it("redacts configured credentials from child stderr failures", async () => {
-    const secret = "synthetic-copilot-credential-for-redaction";
+    const secret = "synthetic-copilot-credential";
+    const githubSecret = `${secret}-github-suffix`;
+    const copilotSecret = `${githubSecret}-copilot-suffix`;
     const harness = fakeCopilotSpawner({
-      exitWithStderr: `authentication failed for ${secret}`,
+      exitWithStderr: `authentication failed for ${secret} ${githubSecret} ${copilotSecret}`,
     });
     let failure: unknown;
     try {
       await probeCopilotCatalog({
         spawnProcess: harness.spawnProcess,
-        env: { GH_TOKEN: secret },
+        env: {
+          GH_TOKEN: secret,
+          GITHUB_TOKEN: githubSecret,
+          COPILOT_GITHUB_TOKEN: copilotSecret,
+        },
         timeoutMs: 100,
         overallTimeoutMs: 500,
         cleanupTimeoutMs: 10,
@@ -583,6 +589,8 @@ describe("Copilot isolated catalog probing (#234)", () => {
     }
     expect(failure).toBeInstanceOf(Error);
     expect(String(failure)).not.toContain(secret);
+    expect(String(failure)).not.toContain("github-suffix");
+    expect(String(failure)).not.toContain("copilot-suffix");
     expect(String(failure)).toContain("[REDACTED]");
     expect(harness.active).toBe(0);
     expect(harness.listenersRemoved).toBe(true);

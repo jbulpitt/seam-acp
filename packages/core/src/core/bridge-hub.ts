@@ -6,8 +6,13 @@
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, Server as HttpServer } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
-import { makeMux, PROTOCOL_VERSION, type HelloFrame } from "@seam/adapters";
-import type { WorkspaceInfo } from "@seam/adapters";
+import {
+  makeMux,
+  PROTOCOL_VERSION,
+  type AdapterRuntimeDescriptor,
+  type HelloFrame,
+  type WorkspaceInfo,
+} from "@seam/adapters";
 import { buildSeamMcpServerEntry } from "./mcp/seam-mcp-server.js";
 import {
   publicBaseFromBridgeWsUrl,
@@ -29,7 +34,12 @@ export interface ConnectedBridge {
   instanceId: string;
   host: { os: string; arch: string };
   devMode: boolean;
-  agents: Map<string, { version: number; installed: boolean; ready: boolean }>;
+  agents: Map<string, {
+    version: number;
+    installed: boolean;
+    ready: boolean;
+    runtime?: AdapterRuntimeDescriptor;
+  }>;
   mux: ReturnType<typeof makeMux>;
   connectedAt: number;
 }
@@ -321,12 +331,18 @@ export class BridgeHub {
     }
     mux.helloAck(true);
 
-    const agents = new Map<string, { version: number; installed: boolean; ready: boolean }>();
+    const agents = new Map<string, {
+      version: number;
+      installed: boolean;
+      ready: boolean;
+      runtime?: AdapterRuntimeDescriptor;
+    }>();
     for (const a of hello.agents ?? []) {
       agents.set(a.agentId, {
         version: a.version,
         installed: a.installed,
         ready: false,
+        ...(a.runtime ? { runtime: a.runtime } : {}),
       });
     }
 

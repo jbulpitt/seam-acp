@@ -529,12 +529,17 @@ export function resolveManifestDefault(
 export function execFileBounded(
   executable: string,
   args: ReadonlyArray<string>,
-  opts: { timeoutMs?: number; maxBytes?: number; cwd?: string } = {}
+  opts: { timeoutMs?: number; maxBytes?: number; cwd?: string; env?: NodeJS.ProcessEnv } = {}
 ): Promise<{ stdout: string; stderr: string }> {
   const timeoutMs = opts.timeoutMs ?? 15_000;
   const maxBytes = opts.maxBytes ?? 1_000_000;
   return new Promise((resolve, reject) => {
-    execFile(executable, [...args], { cwd: opts.cwd, timeout: timeoutMs, maxBuffer: maxBytes }, (err, stdout, stderr) => {
+    execFile(executable, [...args], {
+      cwd: opts.cwd,
+      env: opts.env,
+      timeout: timeoutMs,
+      maxBuffer: maxBytes,
+    }, (err, stdout, stderr) => {
       if (err) reject(err);
       else resolve({ stdout: String(stdout), stderr: String(stderr) });
     });
@@ -543,12 +548,14 @@ export function execFileBounded(
 
 export async function readCliVersion(
   executable: string,
-  args: ReadonlyArray<string> = ["--version"]
+  args: ReadonlyArray<string> = ["--version"],
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}
 ): Promise<string | undefined> {
   try {
     const { stdout, stderr } = await execFileBounded(executable, args, {
       timeoutMs: 5_000,
       maxBytes: 16_384,
+      ...opts,
     });
     return (stdout || stderr).trim().split(/\r?\n/, 1)[0]?.slice(0, 256) || undefined;
   } catch {

@@ -58,6 +58,8 @@ export interface HelloAgentInventory {
   version: number;
   installed: boolean;
   ready: boolean;
+  /** Optional non-secret resolved runtime/provenance inventory. */
+  runtime?: import("./agent-profile.js").AdapterRuntimeDescriptor;
 }
 
 export interface HelloHostInfo {

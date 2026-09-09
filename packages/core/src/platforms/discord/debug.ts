@@ -73,7 +73,13 @@ async function cmdStatus(
   }
   const lines = rows.map((c) => {
     const agents = [...c.agents.entries()]
-      .map(([id, s]) => `${id}${s.ready ? " ready" : s.installed ? " installed" : " missing"}`)
+      .map(([id, s]) => {
+        const state = s.ready ? "ready" : s.installed ? "installed" : "missing";
+        const provenance = s.runtime
+          ? ` ${s.runtime.provenance.version}@${s.runtime.provenance.commit?.slice(0, 8) ?? "release"}`
+          : "";
+        return `${id} ${state}${provenance}`;
+      })
       .join(", ");
     return `**${c.bridgeId}** ${c.host.os}/${c.host.arch} dev=${c.devMode ? "on" : "off"} — ${agents || "no agents"}`;
   });

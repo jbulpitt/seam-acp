@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { spawn } from "node:child_process";
+import os from "node:os";
 import {
   AGENT_ADAPTER_VERSION,
   asLocalAdapter,
   makeAgyProfile,
+  agyAcpReleaseArtifact,
   makeClaudeProfile,
   makeCodexProfile,
   makeCopilotProfile,
@@ -90,7 +92,20 @@ describe("AgentAdapter.describe()", () => {
   });
 
   it("agy reports modelBaked", () => {
-    const d = makeAgyProfile().describe();
+    const d = makeAgyProfile({
+      acpPath: "/bin/false",
+      agyBin: "/bin/false",
+      agyVersion: "false 1.0",
+      defaultModel: "gemini-high",
+      stateDir: `${os.homedir()}/.agy-acp`,
+      conversationsDir: "/tmp/conversations",
+      cwd: "/tmp",
+      credentialScope: "test",
+      wrapperVersion: "1.1.0",
+      wrapperSha256: agyAcpReleaseArtifact().sha256,
+      permissionRiskAcknowledged: true,
+      verifyWrapper: () => {},
+    }).describe();
     expect(d.effort.mechanism).toBe("modelBaked");
     expect(d.effort.levels).toEqual([]);
   });

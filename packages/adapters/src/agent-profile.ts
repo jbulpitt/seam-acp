@@ -47,6 +47,29 @@ export interface AdapterDescribe {
   models: ReadonlyArray<AdapterModel>;
   effort: EffortDescriptor;
   promptCaps?: Record<string, unknown>;
+  /** Non-secret, host-resolved launch/provenance facts for bridge inventory. */
+  runtime?: AdapterRuntimeDescriptor;
+}
+
+export interface AdapterRuntimeDescriptor {
+  executable: string;
+  argv: ReadonlyArray<string>;
+  cwd: string;
+  environment: Readonly<Record<string, string>>;
+  stateDir?: string;
+  conversationDir?: string;
+  credentialScope?: string;
+  provenance: {
+    source: string;
+    version: string;
+    commit?: string;
+    sha256?: string;
+  };
+  /** Additional exact host runtimes required by the adapter. */
+  dependencies?: ReadonlyArray<{
+    executable: string;
+    version: string;
+  }>;
 }
 
 /** Idempotent startup/pre-spawn hook declared by `prepare()`. */
@@ -108,6 +131,9 @@ export interface AgentAdapter {
 
   /** Required operational model/capability source and portable selection codec. */
   readonly catalog: AdapterCatalogSource;
+
+  /** Optional non-secret host launch descriptor, transported in bridge inventory. */
+  readonly runtime?: AdapterRuntimeDescriptor;
 
   /**
    * If true, the agent's host has network restrictions that block Discord
@@ -305,7 +331,12 @@ export function asLocalAdapter(core: AgentProfileCore): AgentAdapter {
             levels: [...adapter.effort.levels],
           }
         : { mechanism: "none", levels: [] };
-      return { version: AGENT_ADAPTER_VERSION, models, effort };
+      return {
+        version: AGENT_ADAPTER_VERSION,
+        models,
+        effort,
+        ...(adapter.runtime ? { runtime: adapter.runtime } : {}),
+      };
     },
     prepare(): PrepareStep[] {
       return [];

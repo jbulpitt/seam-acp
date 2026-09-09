@@ -84,11 +84,28 @@ describe("production adapter catalog sources", () => {
   });
 
   it("gives direct, alternate, Vertex, and Z.ai Claude profiles distinct semantic scopes", async () => {
+    // #232: direct-Anthropic profiles (including extra credential profiles) are
+    // live-first, so they take an injected probe here instead of spawning the
+    // wrapper. Vertex and Z.ai deliberately stay on the validated manifest.
+    const directProbe = async () => ({
+      wrapperCurrentValue: "sonnet",
+      models: [
+        {
+          advertisedId: "claude-opus-5",
+          advertisedName: "Opus 5",
+          resolvedValue: "claude-opus-5",
+          effortChoices: ["default", "low", "high"],
+          effortCurrent: "default",
+          configIds: ["mode", "model", "effort"],
+        },
+      ],
+    });
     const direct = makeClaudeProfile({
       cliPath: "false",
       directAnthropic: true,
       defaultModel: "claude-opus-5",
       staticModels: [{ modelId: "claude-opus-5", name: "Opus 5" }],
+      catalogProbe: directProbe,
     });
     const alternate = makeClaudeProfile({
       id: "claude-work",
@@ -97,6 +114,7 @@ describe("production adapter catalog sources", () => {
       configDir: "/credentials/work",
       defaultModel: "claude-opus-5",
       staticModels: [{ modelId: "claude-opus-5", name: "Opus 5" }],
+      catalogProbe: directProbe,
     });
     const vertex = makeClaudeProfile({
       id: "claude-vertex",
@@ -134,6 +152,12 @@ describe("production adapter catalog sources", () => {
     expect(new Set(catalogs.map((c) => c.scope.fingerprint)).size).toBe(4);
     expect(catalogs[2]?.scope).toMatchObject({ backend: "vertex", project: "project-7", region: "us-east5" });
     expect(catalogs[3]?.scope).toMatchObject({ provider: "z-ai", backend: "https://api.z.ai/api/anthropic" });
+    // Strategy split (#232): live-first for direct Anthropic and its extra
+    // credential profiles; validated manifest for the deferred backends.
+    expect(catalogs[0]?.source).toBe("claude-acp-live+verified-overlay");
+    expect(catalogs[1]?.source).toBe("claude-acp-live+verified-overlay");
+    expect(catalogs[2]?.source).toBe("validated-manifest");
+    expect(catalogs[3]?.source).toBe("validated-manifest");
   });
 
   it("covers Codex, parked Ollama Cloud, segmented Agy, and deferred Grok discovery", async () => {

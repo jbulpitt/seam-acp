@@ -11,6 +11,15 @@ import {
   type AgentProfile,
 } from "../agent-profile.js";
 import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
+import {
+  CLAUDE_VERIFIED_OVERLAY,
+  CLAUDE_VERIFIED_OVERLAY_VERSION,
+  claudeCredentialScope,
+  mergeClaudeCatalogModels,
+  probeClaudeCatalog,
+  resolveClaudeDefaultModel,
+  type ClaudeCatalogProbe,
+} from "./claude-catalog.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 import { CLAUDE_FAST_MODE } from "../fast-mode.js";
 
@@ -121,6 +130,11 @@ export function makeClaudeProfile(opts: {
    * ever offered for a backend that cannot serve it.
    */
   directAnthropic?: boolean;
+  /**
+   * Test/embedding seam for the #232 live catalog probe. Production leaves it
+   * unset and probes this profile's own `claude-agent-acp`.
+   */
+  catalogProbe?: () => Promise<ClaudeCatalogProbe>;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "claude-agent-acp";
   const configDir = opts.configDir?.trim() || undefined;
@@ -135,6 +149,66 @@ export function makeClaudeProfile(opts: {
     mechanism: "meta" as const,
     levels: ["low", "medium", "high", "xhigh", "max"],
   };
+  // #232 is scoped to DIRECT Anthropic subscription profiles (the base profile
+  // and any extra credential profiles). Vertex, Z.ai, Ollama Cloud and every
+  // other Anthropic-compatible backend keep the validated-manifest strategy:
+  // they answer a different API whose advertised list, effort support and
+  // context windows were never verified against this account's evidence, so
+  // they must not inherit the direct catalog as a side effect.
+  const liveCatalog = opts.directAnthropic === true;
+  const configuredLabels = new Map(catalogModels.map((model) => [model.modelId, model.name]));
+
+  /**
+   * The one environment builder for this profile. Runtime spawn and #232
+   * catalog discovery share it so a probe observes exactly what a real turn
+   * would get: the same config dir (credentials), the same extra env, and the
+   * same `ANTHROPIC_MODEL` forwarding decision for the model in question.
+   * Probing under a different environment would publish capabilities the
+   * runtime never sees.
+   */
+  function buildClaudeSpawnEnv(modelOverride?: string): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
+    if (maxThinkingTokens && maxThinkingTokens > 0) {
+      env.MAX_THINKING_TOKENS = String(maxThinkingTokens);
+    }
+    if (opts.extraEnv) {
+      for (const [k, v] of Object.entries(opts.extraEnv)) {
+        if (v !== undefined) {
+          env[k] = v;
+        }
+      }
+      if (opts.extraEnv.CLAUDE_CODE_USE_VERTEX === "1") {
+        delete env.ANTHROPIC_API_KEY;
+      }
+    }
+    // For non-Anthropic backends (Ollama Cloud, Z.ai, etc.): override the
+    // model env vars so the adapter sends the right model to the backend.
+    // setModel() (ACP config option) is rejected by claude-agent-acp for
+    // non-Claude model IDs, so this is the only way to switch models.
+    if (modelOverride && opts.extraEnv?.ANTHROPIC_BASE_URL) {
+      env.ANTHROPIC_MODEL = modelOverride;
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL = modelOverride;
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL = modelOverride;
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL = modelOverride;
+    } else if (modelOverride && isForwardableFullModelId(modelOverride)) {
+      // Direct Anthropic backend: this account's claude-agent-acp advertises
+      // only a fixed alias set. A full
+      // canonical ID that isn't advertised (e.g. a model that shipped after
+      // this CLI version) is REJECTED by setSessionConfigOption("model", …)
+      // with "Invalid value for config option model", and the session
+      // silently falls back to the wrapper's default (observed: Sonnet). The
+      // API itself can serve the model the day it ships, so forward it via
+      // ANTHROPIC_MODEL — this both REGISTERS it in availableModels (so the
+      // later set_config_option succeeds) AND selects it, no CLI upgrade
+      // needed. Only ANTHROPIC_MODEL (the primary model) is set; the
+      // small/fast/subagent model envs are left alone. Aliases like `default`
+      // are intentionally excluded so Anthropic can keep pointing them at the
+      // newest model server-side.
+      env.ANTHROPIC_MODEL = modelOverride;
+    }
+    return env;
+  }
 
   return asLocalAdapter({
     id: opts.id ?? "claude",
@@ -150,12 +224,54 @@ export function makeClaudeProfile(opts: {
         region: opts.extraEnv?.CLOUD_ML_REGION,
       }),
       async fetch() {
-        const candidate = await manifestCatalogSource({
+        const common = {
           provider: opts.directAnthropic ? "anthropic" : (opts.brand ?? "claude-compatible"),
           backend: opts.extraEnv?.CLAUDE_CODE_USE_VERTEX === "1" ? "vertex" : opts.extraEnv?.ANTHROPIC_BASE_URL,
           credentialProfile: configDir ?? "default",
           project: opts.extraEnv?.ANTHROPIC_VERTEX_PROJECT_ID,
           region: opts.extraEnv?.CLOUD_ML_REGION,
+          adapterVersion: AGENT_ADAPTER_VERSION,
+        };
+        // #232 live-first, direct Anthropic only. A probe failure THROWS rather
+        // than degrading to the overlay: ModelCatalogService retains the
+        // previous generation on a thrown fetch, which is what "preserve the
+        // previous generation on failure" requires. Quietly publishing a
+        // narrower catalog instead would overwrite good live data with a guess.
+        if (liveCatalog) {
+          const scope = manifestCatalogScope(common);
+          const probe = opts.catalogProbe
+            ? await opts.catalogProbe()
+            : await probeClaudeCatalog({
+                cliPath: cli,
+                env: buildClaudeSpawnEnv(),
+                // Canonical identity: the value a real catalog selection spawns
+                // with, not the raw advertised one.
+                modelEnv: (canonicalModelId) => buildClaudeSpawnEnv(canonicalModelId),
+              });
+          const models = mergeClaudeCatalogModels({
+            probe,
+            overlay: CLAUDE_VERIFIED_OVERLAY,
+            displayNames: configuredLabels,
+            effortMechanism: catalogEffort.mechanism,
+            // The overlay is filtered to THIS profile's credential scope, so an
+            // alternate credential profile never inherits evidence captured on
+            // the default one.
+            credentialScope: claudeCredentialScope(configDir),
+            scopeRef: scope.fingerprint,
+            ...(catalogEffort.configId ? { effortConfigId: catalogEffort.configId } : {}),
+          });
+          const candidate = await manifestCatalogSource({
+            ...common,
+            defaultModel: resolveClaudeDefaultModel(models, opts.defaultModel),
+            models: () => models,
+            source: "claude-acp-live+verified-overlay",
+          }).fetch();
+          candidate.cliVersion = await readCliVersion(cli);
+          candidate.sourceVersion = `overlay-v${CLAUDE_VERIFIED_OVERLAY_VERSION}`;
+          return candidate;
+        }
+        const candidate = await manifestCatalogSource({
+          ...common,
           defaultModel: opts.defaultModel,
           models: () => catalogModels,
           effort: {
@@ -163,7 +279,6 @@ export function makeClaudeProfile(opts: {
             ...(catalogEffort.configId ? { configId: catalogEffort.configId } : {}),
             choices: catalogEffort.levels,
           },
-          adapterVersion: AGENT_ADAPTER_VERSION,
         }).fetch();
         candidate.cliVersion = await readCliVersion(cli);
         return candidate;
@@ -187,49 +302,9 @@ export function makeClaudeProfile(opts: {
     // live session to advertise config id `fast` before applying anything.
     ...(opts.directAnthropic ? { fastMode: CLAUDE_FAST_MODE } : {}),
     spawn(modelOverride?: string, _effortOverride?: string) {
-      const env: NodeJS.ProcessEnv = { ...process.env };
-      if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
-      if (maxThinkingTokens && maxThinkingTokens > 0) {
-        env.MAX_THINKING_TOKENS = String(maxThinkingTokens);
-      }
-      if (opts.extraEnv) {
-        for (const [k, v] of Object.entries(opts.extraEnv)) {
-          if (v !== undefined) {
-            env[k] = v;
-          }
-        }
-        if (opts.extraEnv.CLAUDE_CODE_USE_VERTEX === "1") {
-          delete env.ANTHROPIC_API_KEY;
-        }
-      }
-      // For non-Anthropic backends (Ollama Cloud, Z.ai, etc.): override the
-      // model env vars so the adapter sends the right model to the backend.
-      // setModel() (ACP config option) is rejected by claude-agent-acp for
-      // non-Claude model IDs, so this is the only way to switch models.
-      if (modelOverride && opts.extraEnv?.ANTHROPIC_BASE_URL) {
-        env.ANTHROPIC_MODEL = modelOverride;
-        env.ANTHROPIC_DEFAULT_SONNET_MODEL = modelOverride;
-        env.ANTHROPIC_DEFAULT_HAIKU_MODEL = modelOverride;
-        env.ANTHROPIC_DEFAULT_OPUS_MODEL = modelOverride;
-      } else if (modelOverride && isForwardableFullModelId(modelOverride)) {
-        // Direct Anthropic backend: this account's claude-agent-acp advertises
-        // only a fixed alias set. A full
-        // canonical ID that isn't advertised (e.g. a model that shipped after
-        // this CLI version) is REJECTED by setSessionConfigOption("model", …)
-        // with "Invalid value for config option model", and the session
-        // silently falls back to the wrapper's default (observed: Sonnet). The
-        // API itself can serve the model the day it ships, so forward it via
-        // ANTHROPIC_MODEL — this both REGISTERS it in availableModels (so the
-        // later set_config_option succeeds) AND selects it, no CLI upgrade
-        // needed. Only ANTHROPIC_MODEL (the primary model) is set; the
-        // small/fast/subagent model envs are left alone. Aliases like `default`
-        // are intentionally excluded so Anthropic can keep pointing them at the
-        // newest model server-side.
-        env.ANTHROPIC_MODEL = modelOverride;
-      }
       return spawn(cli, [], {
         stdio: ["pipe", "pipe", "pipe"],
-        env,
+        env: buildClaudeSpawnEnv(modelOverride),
         detached: true,
       });
     },

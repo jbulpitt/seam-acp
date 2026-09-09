@@ -9,6 +9,9 @@
  * "The probe returned" must always mean "the process is gone", so each case
  * asserts the child was actually reaped rather than merely signalled.
  */
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -64,6 +67,33 @@ function ready(stdout: NodeJS.ReadableStream): Promise<void> {
     };
     stdout.on("data", onData);
   });
+}
+
+
+/** A controllable stand-in for a spawned child, for paths a real OS process
+ *  cannot exhibit (an un-reapable child; exact listener accounting). */
+interface FakeChild {
+  child: ChildProcessWithoutNullStreams;
+  exit: (code: number) => void;
+}
+function fakeChild(): FakeChild {
+  const emitter = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
+  const mutable = emitter as unknown as Record<string, unknown>;
+  mutable.pid = 4242;
+  mutable.exitCode = null;
+  mutable.signalCode = null;
+  mutable.stdin = new PassThrough();
+  mutable.stdout = new PassThrough();
+  mutable.stderr = new PassThrough();
+  mutable.kill = () => true;
+  queueMicrotask(() => emitter.emit("spawn"));
+  return {
+    child: emitter,
+    exit: (code: number) => {
+      mutable.exitCode = code;
+      emitter.emit("exit", code, null);
+    },
+  };
 }
 
 describe("#236 bounded probe lifecycle", () => {
@@ -456,18 +486,139 @@ describe("#236 bounded probe lifecycle", () => {
     expect(outer.signal.aborted).toBe(false);
   });
 
-  it("reports not_reaped rather than claiming a clean exit", async () => {
-    // Proven at the seam: a child the helper cannot observe exiting must not
-    // return as though the host were left clean.
-    const { terminate } = await import("@seam/adapters");
-    const stubborn = {
-      pid: 999_999,
-      exitCode: null,
-      signalCode: null,
-      once: () => stubborn,
-      kill: () => true,
-    } as unknown as Parameters<typeof terminate>[0];
-    expect(await terminate(stubborn, 50)).toBe(false);
+  it("a LATE close is drained BEFORE runBoundedProbe settles, not after", async () => {
+    // The previous head detached the late step with `void`, so the helper
+    // resolved with registered:false/closed:false and only became true ~550ms
+    // later. Return must MEAN cleanup happened.
+    let registered = false;
+    let closed = false;
+    const outcome = await runBoundedProbe({
+      executable: process.execPath,
+      args: [CHILD],
+      env: env("silent"),
+      timeoutMs: 75,
+      killGraceMs: 200,
+      closeGraceMs: 2_000,
+      run: async (handle) => {
+        // Finishes construction well after the deadline, exactly as a slow ACP
+        // connection would, then registers the session close it owns.
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        registered = true;
+        handle.onClose(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          closed = true;
+        }, "session");
+        return "late";
+      },
+    }).then(() => "resolved", (err: ProbeError) => err.code);
+    expect(outcome).toBe("timeout");
+    // Observed synchronously after settle — no extra waiting allowed.
+    expect(registered).toBe(true);
+    expect(closed).toBe(true);
+  });
+
+  it("a cooperative run that honours handle.signal finalizes promptly", async () => {
+    let closed = false;
+    const started = Date.now();
+    await expect(
+      runBoundedProbe({
+        executable: process.execPath,
+        args: [CHILD],
+        env: env("silent"),
+        timeoutMs: 75,
+        closeGraceMs: 5_000,
+        run: async (handle) => {
+          await new Promise<void>((resolve) =>
+            handle.signal.addEventListener("abort", () => resolve(), { once: true })
+          );
+          handle.onClose(() => { closed = true; }, "session");
+          return "aborted-cleanly";
+        },
+      })
+    ).rejects.toMatchObject({ code: "timeout" });
+    expect(closed).toBe(true);
+    // The bounded grace is a ceiling, not a floor: honouring the signal returns
+    // immediately rather than burning the full closeGraceMs.
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("an error WITHOUT an exit is not_reaped, not a clean return", async () => {
+    // SIGKILL cannot be caught by a real process, so the un-reapable path is
+    // only reachable through the documented spawn seam.
+    const fake = fakeChild();
+    await expect(
+      runBoundedProbe({
+        executable: "irrelevant",
+        spawnOverride: () => fake.child,
+        timeoutMs: 5_000,
+        killGraceMs: 50,
+        run: async () => {
+          // Emit `error` only — never `exit`. The previous terminate() treated
+          // that as reaped and returned true while the child was still alive.
+          setTimeout(() => fake.child.emit("error", new Error("boom")), 10);
+          return "done";
+        },
+      })
+    ).rejects.toMatchObject({ code: "not_reaped" });
+    expect(fake.child.listenerCount("exit")).toBe(0);
+    expect(fake.child.listenerCount("error")).toBe(0);
+  });
+
+  it("leaves EXACT zero listeners on the child on every path", async () => {
+    const counts = (c: FakeChild): Record<string, number> => ({
+      exit: c.child.listenerCount("exit"),
+      error: c.child.listenerCount("error"),
+      spawn: c.child.listenerCount("spawn"),
+      stdoutData: c.child.stdout.listenerCount("data"),
+      stdoutEnd: c.child.stdout.listenerCount("end"),
+      stderrData: c.child.stderr.listenerCount("data"),
+    });
+    const zero = { exit: 0, error: 0, spawn: 0, stdoutData: 0, stdoutEnd: 0, stderrData: 0 };
+
+    // success
+    const ok = fakeChild();
+    await runBoundedProbe({
+      executable: "x", spawnOverride: () => ok.child, timeoutMs: 2_000, killGraceMs: 50,
+      run: async () => { ok.exit(0); return "ok"; },
+    });
+    expect(counts(ok)).toEqual(zero);
+
+    // early exit
+    const early = fakeChild();
+    await expect(runBoundedProbe({
+      executable: "x", spawnOverride: () => early.child, timeoutMs: 2_000, killGraceMs: 50,
+      run: async (handle) => { setTimeout(() => early.exit(3), 10); return handle.exited; },
+    })).rejects.toMatchObject({ code: "exited_early" });
+    expect(counts(early)).toEqual(zero);
+
+    // timeout
+    const slow = fakeChild();
+    await expect(runBoundedProbe({
+      executable: "x", spawnOverride: () => slow.child, timeoutMs: 60, killGraceMs: 50,
+      closeGraceMs: 100,
+      run: async () => { setTimeout(() => slow.exit(0), 80); return new Promise<string>(() => {}); },
+    })).rejects.toMatchObject({ code: "timeout" });
+    expect(counts(slow)).toEqual(zero);
+
+    // protocol error
+    const bad = fakeChild();
+    await expect(runBoundedProbe({
+      executable: "x", spawnOverride: () => bad.child, timeoutMs: 2_000, killGraceMs: 50,
+      run: async () => { bad.exit(0); throw new Error("bad frame"); },
+    })).rejects.toMatchObject({ code: "protocol_error" });
+    expect(counts(bad)).toEqual(zero);
+
+    // output overflow
+    const loud = fakeChild();
+    await expect(runBoundedProbe({
+      executable: "x", spawnOverride: () => loud.child, timeoutMs: 2_000, killGraceMs: 50,
+      maxStdoutBytes: 16,
+      run: async () => {
+        setTimeout(() => { loud.child.stdout.emit("data", Buffer.alloc(64)); loud.exit(0); }, 10);
+        return new Promise<string>(() => {});
+      },
+    })).rejects.toMatchObject({ code: "output_overflow" });
+    expect(counts(loud)).toEqual(zero);
   });
 
   it("does not let a wedged close step keep the process alive", async () => {

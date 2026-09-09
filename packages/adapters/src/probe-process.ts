@@ -39,6 +39,10 @@ export const PROBE_STDERR_LIMIT_BYTES = 256_000;
 export const PROBE_DEFAULT_TIMEOUT_MS = 45_000;
 export const PROBE_DEFAULT_KILL_GRACE_MS = 2_000;
 export const PROBE_DEFAULT_REAP_MS = 2_000;
+/** Bounded window for a cancelled `run` to settle before finalization. */
+export const PROBE_DEFAULT_CLOSE_GRACE_MS = 2_000;
+/** How many times finalization re-drains newly registered close steps. */
+const LATE_CLOSE_DRAIN_ROUNDS = 8;
 
 export type ProbeErrorCode =
   | "spawn_failed"
@@ -103,10 +107,25 @@ export interface BoundedProbeOptions<T> {
   timeoutMs?: number;
   signal?: AbortSignal;
   killGraceMs?: number;
+  /**
+   * After the deadline or an abort, how long an already-running `run` gets to
+   * observe the abort and finish registering its close steps before we
+   * finalize. Bounded on purpose: waiting forever would defeat the deadline.
+   */
+  closeGraceMs?: number;
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
   /** Label used in error detail. Must not carry secrets. */
   label?: string;
+  /**
+   * Test seam (same precedent as the adapters' `catalogProbe` injections).
+   * Production leaves it unset and the helper spawns the real executable. It
+   * exists so the un-reapable and listener-accounting paths — which a real OS
+   * process cannot be made to exhibit, since SIGKILL is not catchable — are
+   * provable through `runBoundedProbe` itself rather than only through
+   * `terminate`.
+   */
+  spawnOverride?: () => ChildProcessWithoutNullStreams;
   run: (handle: ProbeHandle) => Promise<T>;
 }
 
@@ -156,6 +175,7 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   const stdoutLimit = options.maxStdoutBytes ?? PROBE_STDOUT_LIMIT_BYTES;
   const stderrLimit = options.maxStderrBytes ?? PROBE_STDERR_LIMIT_BYTES;
   const killGraceMs = options.killGraceMs ?? PROBE_DEFAULT_KILL_GRACE_MS;
+  const closeGraceMs = options.closeGraceMs ?? PROBE_DEFAULT_CLOSE_GRACE_MS;
   const redact = (text: string): string => redactProbeText(text, options.env);
 
   if (options.signal?.aborted) {
@@ -164,7 +184,7 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
 
   let child: ChildProcessWithoutNullStreams;
   try {
-    child = spawn(options.executable, [...(options.args ?? [])], {
+    child = options.spawnOverride ? options.spawnOverride() : spawn(options.executable, [...(options.args ?? [])], {
       ...(options.cwd ? { cwd: options.cwd } : {}),
       ...(options.env ? { env: options.env } : {}),
       stdio: ["pipe", "pipe", "pipe"],
@@ -176,7 +196,13 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   const controller = new AbortController();
   const closeSteps: CloseStep[] = [];
   let cleanupStarted = false;
+  let finalized = false;
   let succeeded = false;
+  /** Close steps registered after cleanup began; drained before we return. */
+  const lateWork: Promise<void>[] = [];
+  /** The caller's own promise, so finalization can give it a bounded chance
+   *  to observe the abort and finish registering its closes. */
+  let runPromise: Promise<T> | undefined;
   let exitReject: ((err: Error) => void) | undefined;
 
   /**
@@ -232,14 +258,19 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
 
   const exited = new Promise<never>((_resolve, reject) => { exitReject = reject; });
   exited.catch(() => {});
+  // Named so BOTH can be removed: these are mutually raced, so whichever does
+  // not fire would otherwise stay attached for the lifetime of the child.
+  let onStarted: (() => void) | undefined;
+  let onStartError: ((err: Error) => void) | undefined;
   const started = new Promise<void>((resolve, reject) => {
-    child.once("spawn", resolve);
+    onStarted = () => resolve();
     // Map to the CODED error here. Rejecting with Node's raw error would reach
     // `decorate` and be classified `protocol_error`, sending an operator to
     // debug a protocol when the executable is simply missing.
-    child.once("error", (err: Error) =>
-      reject(new ProbeError("spawn_failed", `${label}: ${redact(errorText(err))}`))
-    );
+    onStartError = (err: Error) =>
+      reject(new ProbeError("spawn_failed", `${label}: ${redact(errorText(err))}`));
+    child.once("spawn", onStarted);
+    child.once("error", onStartError);
   });
   started.catch(() => {});
   child.on("error", onSpawnError);
@@ -257,11 +288,20 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     exited,
     stderrTail: () => redact(stderrTail),
     onClose: (step, phase = "connection") => {
-      // A late registration means a connection finished constructing after the
-      // deadline. Dropping it would leak exactly the session we are trying to
-      // close, so run it now instead — still bounded.
-      if (cleanupStarted) {
+      // Registration barrier. Before finalization a step is queued normally.
+      // AFTER cleanup has begun but BEFORE finalization — a connection that
+      // finished constructing past the deadline — the step runs immediately AND
+      // its promise is tracked, so finalization drains it. Previously this was
+      // a detached `void`, so `runBoundedProbe` could resolve while a session
+      // close was still pending: return did not mean cleanup had happened.
+      if (finalized) {
+        // Past the barrier the caller has already been told cleanup is done, so
+        // this registration is a provider bug. Run it bounded and say so.
         void withDeadline(step, killGraceMs);
+        return;
+      }
+      if (cleanupStarted) {
+        lateWork.push(withDeadline(step, killGraceMs));
         return;
       }
       closeSteps.push({ step, phase });
@@ -290,18 +330,29 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     // returns without touching the child would otherwise report success for a
     // missing executable.
     await Promise.race([started, bounded, exited]);
-    const value = await Promise.race([options.run(handle), bounded, exited]);
+    runPromise = options.run(handle);
+    // Never leave the caller's promise unhandled: on the timeout/abort path we
+    // stop awaiting it here, but finalization still observes it below.
+    runPromise.catch(() => undefined);
+    const value = await Promise.race([runPromise, bounded, exited]);
     succeeded = true;
     return value;
   } catch (err) {
     throw decorate(err, label, redact);
   } finally {
     cleanupStarted = true;
+    // Abort FIRST so a cooperative `run` observes cancellation, then give it a
+    // bounded chance to settle. Unbounded would reintroduce exactly the hang the
+    // deadline exists to prevent; bounded means a provider that honours the
+    // signal gets to finish registering its closes before we finalize.
     if (!controller.signal.aborted) controller.abort();
+    if (runPromise) await settledWithin(runPromise.then(() => undefined, () => undefined), closeGraceMs);
     if (timer) clearTimeout(timer);
     if (options.signal && onOuterAbort) options.signal.removeEventListener("abort", onOuterAbort);
     child.removeListener("error", onSpawnError);
     child.removeListener("exit", onExit);
+    if (onStarted) child.removeListener("spawn", onStarted);
+    if (onStartError) child.removeListener("error", onStartError);
     child.stdout.removeListener("data", onStdout);
     child.stdout.removeListener("end", onStdoutEnd);
     child.stderr.removeListener("data", onStderr);
@@ -312,6 +363,12 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
         await withDeadline(entry.step, killGraceMs);
       }
     }
+    // Drain to quiescence: a close step may itself register another one.
+    for (let round = 0; lateWork.length > 0 && round < LATE_CLOSE_DRAIN_ROUNDS; round++) {
+      const pending = lateWork.splice(0, lateWork.length);
+      await Promise.all(pending);
+    }
+    finalized = true;
     const reaped = await terminate(child, killGraceMs);
     // The documented guarantee is "awaited/reaped". If no exit was observed we
     // must say so rather than return as though the host were left clean. Only
@@ -348,14 +405,23 @@ export async function terminate(
 ): Promise<boolean> {
   if (child.pid === undefined) return true;
   if (child.exitCode !== null || child.signalCode !== null) return true;
+  // ONLY `exit` counts as reaped. Resolving on `error` too meant a child that
+  // errored without ever exiting reported success while still running, and the
+  // complementary once-listener stayed attached forever.
+  let onExit: (() => void) | undefined;
   const exit = new Promise<void>((resolve) => {
-    child.once("exit", () => resolve());
-    child.once("error", () => resolve());
+    onExit = () => resolve();
+    child.once("exit", onExit);
   });
-  child.kill("SIGTERM");
-  if (await settledWithin(exit, graceMs)) return true;
-  child.kill("SIGKILL");
-  return settledWithin(exit, PROBE_DEFAULT_REAP_MS);
+  try {
+    child.kill("SIGTERM");
+    if (await settledWithin(exit, graceMs)) return true;
+    child.kill("SIGKILL");
+    return await settledWithin(exit, PROBE_DEFAULT_REAP_MS);
+  } finally {
+    // Whether or not it fired, this listener is ours to remove.
+    if (onExit) child.removeListener("exit", onExit);
+  }
 }
 
 function settledWithin(promise: Promise<void>, ms: number): Promise<boolean> {

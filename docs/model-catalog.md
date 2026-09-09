@@ -60,14 +60,17 @@ Each record declares `kind` (`live-observation`, `verified-record`,
 `packages/adapters/src/catalog-evidence.ts` is the single screen. It runs
 **before a remote bridge returns a candidate** and **again before core persists
 or loads one** — a remote host is not a trust boundary we can defer past, so
-malformed or secret-bearing evidence never crosses the wire in the first place.
+malformed or secret-bearing content never crosses the wire in the first place.
 
 What it enforces:
 
-- **Exact-key closure at every depth.** An unknown key — top level, inside
-  `context`, inside `effort` — is a rejection, not a passthrough. Tolerating
-  unknown keys defeated the closed shape entirely: a 50 KB payload rode through
-  validation inside a key nobody had declared.
+- **Exact-key closure over the WHOLE normalized graph.** `assertClosedCatalogShape`
+  declares the complete key set for the candidate, `scope`, every model row,
+  `context`, `modalities`, `effort`, each effort choice, each binding, and every
+  evidence record and its nested `context`/`effort`. An unknown key at ANY of
+  those levels is a rejection, not a passthrough. Closing only
+  description/evidence left the rest open, so an undeclared key — including a
+  50 KB payload — crossed the bridge and was persisted inside schema 1.
 - **Content screens, because length is not sanitization.** A 40-character token
   fits every bound. Free text (`note`, `description`) is screened for
   assignments, bearer tokens, credential words, key prefixes, JWTs, PEM blocks,
@@ -82,15 +85,44 @@ What it enforces:
   that exceeds its own maximum, or an effort default that is not among its own
   choices, is rejected.
 
-Per-model fields participate in the **canonical** checksum and diff, so key
-insertion order is never an authority, and evidence arrays are re-emitted in
-semantic order (`kind`, `source`, `observedAt`) so array order is not one
-either. They survive SQLite, bridge RPC, and the metadata enrichment join.
+### Array semantics
 
-They also reach the paths a human actually looks at: `describeConfig` carries
-the **selected** model's description and evidence, MCP `config_describe` renders
-them, and the metadata snapshot carries the catalog-owned description. All of
-those reads are cache-only.
+Per-model fields participate in the **canonical** checksum and diff, so key
+insertion order is never an authority. Array order is defined per field:
+
+- **`evidence` is an unordered SET.** It is re-emitted in a canonical **total**
+  order — `kind`, then `source`, then `observedAt`, then the full canonical
+  serialization of the record as the final tiebreaker. The tiebreaker is
+  load-bearing: without it two valid records agreeing on the first three keys
+  kept their input order, so the transport order of an evidence array leaked
+  into the content checksum, the per-row diff, and the reduction-confirmation
+  fingerprint.
+- **`models`, `effort.choices`, and `bindings` are ORDERED sequences** whose
+  order is provider-meaningful (preference order, display order, and the codec
+  rows derived from them). They are preserved as given, and reordering them is a
+  real change that surfaces as one.
+- `aliases`, `serviceTiers`, and `modalities` are preserved as given; their
+  contents are uniqueness-checked, and no consumer treats their order as
+  meaningful.
+
+### Surfaces that carry it
+
+`SessionRouter.describeConfig` is the shared **input** the operator-facing
+surfaces read — it is not itself an output. The surfaces are:
+
+- **MCP `config_describe`** renders a `model info` line plus one line per
+  evidence record.
+- **The turn status card**: `TurnStatus` → `StatusPanelInput`/`StatusPanel` →
+  the Discord renderer's `Model info` field (full cards only).
+- **The config audit trail**: `ConfigMutationService.effectiveSnapshot` records
+  the catalog state, generation, source, and the selected model's description
+  and rendered evidence, so an audit entry can still explain a model choice
+  after the catalog has moved on.
+- The **metadata enrichment join** carries the catalog-owned description.
+
+All three operator surfaces format through the one renderer in
+`packages/core/src/core/catalog-evidence-render.ts`, which bounds both the
+number of lines and each line's length. Every read is cache-only.
 
 ## Schema evolution and durable snapshots (#236)
 
@@ -169,9 +201,19 @@ writes to the child, so a catalog probe cannot spend model tokens.
   is still protected.
 - **Close steps run in explicit phases: SESSION before CONNECTION**, never in
   registration order. A session is closed politely while its transport is still
-  up. A close registered *late* — by a connection that finished constructing
-  after the deadline — still runs, bounded, instead of leaking the session it
-  was meant to close.
+  up.
+- **A finalization barrier means return actually means cleanup happened.** On
+  the deadline/abort path the helper aborts `handle.signal` first, then gives an
+  already-running `run` a *bounded* `closeGraceMs` to observe the abort and
+  finish registering its closes; late registrations are then drained to
+  quiescence before the helper settles. A cooperative provider returns
+  immediately — the grace is a ceiling, not a floor. Previously a late
+  registration was fired detached, so the helper could resolve while a session
+  close was still pending.
+- **Only an observed `exit` counts as reaped.** `terminate` no longer resolves
+  on `error`; a child that errors without exiting is reported `not_reaped`
+  rather than returned as a clean success, and both mutually raced listeners
+  (`spawn`/`error`, `exit`/`error`) are removed on every path.
 - **`handle.signal`** aborts on every ending, so provider async work is
   cancelled too.
 - **Errors are structured codes** (`spawn_failed`, `exited_early`,

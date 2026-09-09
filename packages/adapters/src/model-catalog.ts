@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import {
+  assertClosedCatalogShape,
   assertCatalogDescription,
   canonicalJson,
   parseCatalogEvidenceList,
@@ -272,6 +273,10 @@ export function assessCatalogReduction(
  * whether that means "refuse the fetch" or "retain the previous generation".
  */
 export function validateCatalogEvidence(candidate: AdapterCatalogCandidate): void {
+  // Close the WHOLE graph first. Screening only description/evidence left every
+  // other level open, so an undeclared key at candidate/scope/model/context
+  // level crossed the bridge and was persisted inside schema 1.
+  assertClosedCatalogShape(candidate);
   if (!candidate || !Array.isArray(candidate.models)) return;
   for (const model of candidate.models) {
     const id = typeof model?.id === "string" ? model.id : "(unknown)";

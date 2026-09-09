@@ -156,6 +156,22 @@ export const discordRenderer: Renderer = {
     const fields: StructuredPanel["fields"] = [
       { name: "Repo", value: trim(state.repoDisplay, 80), inline: true },
       { name: "Action", value: trim(state.action, 220), inline: true },
+      // #236: catalog provenance for the selected model. Full cards only — a
+      // simple card returns above — and bounded, so a large evidence set cannot
+      // flood the panel. The lines arrive pre-rendered and already screened.
+      ...(state.modelDescription || state.modelEvidence?.length
+        ? [{
+            name: "Model info",
+            value: trim(
+              [
+                ...(state.modelDescription ? [state.modelDescription] : []),
+                ...(state.modelEvidence ?? []).map((line) => `↳ ${line}`),
+              ].join("\n"),
+              400
+            ),
+            inline: false,
+          }]
+        : []),
       // Dispatched turns say what the work is and where it came from (#153);
       // a normal user turn has no origin and this adds nothing.
       ...originFields(state),

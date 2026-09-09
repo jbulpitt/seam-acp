@@ -302,11 +302,21 @@ export function assertCatalogDescription(path: string, raw: unknown): string {
 export function sortCatalogEvidence<T extends { kind: string; source: string; observedAt?: string }>(
   records: ReadonlyArray<T>
 ): T[] {
-  return [...records].sort((a, b) =>
-    a.kind.localeCompare(b.kind) ||
-    a.source.localeCompare(b.source) ||
-    (a.observedAt ?? "").localeCompare(b.observedAt ?? "")
-  );
+  // kind/source/observedAt first so the rendered order stays human-meaningful,
+  // then the FULL canonical serialization as the final tiebreaker. Without that
+  // last term the order is not total: two valid records that agree on the three
+  // primary keys but differ elsewhere kept their input order, so the transport
+  // order of an evidence array leaked into the content checksum, the per-row
+  // diff, and the reduction-confirmation fingerprint.
+  return [...records]
+    .map((record) => ({ record, key: canonicalJson(record) }))
+    .sort((a, b) =>
+      a.record.kind.localeCompare(b.record.kind) ||
+      a.record.source.localeCompare(b.record.source) ||
+      (a.record.observedAt ?? "").localeCompare(b.record.observedAt ?? "") ||
+      a.key.localeCompare(b.key)
+    )
+    .map((entry) => entry.record);
 }
 
 /**
@@ -360,4 +370,80 @@ function stripVolatile(value: unknown): unknown {
     return out;
   }
   return value;
+}
+
+// ---------------------------------------------------------------------------
+// Exact-key closure for the WHOLE normalized candidate graph.
+//
+// Closing only description/evidence left the rest of the graph open: undeclared
+// keys at candidate, scope, model, context, modalities, effort, choice and
+// binding level all crossed the bridge and were persisted inside schema 1. The
+// key sets below are the complete, provider-neutral shape; anything else is a
+// rejection, at every nesting level.
+// ---------------------------------------------------------------------------
+
+const CANDIDATE_KEYS = [
+  "schemaVersion", "scope", "models", "source", "sourceVersion",
+  "adapterVersion", "cliVersion", "fetchedAt",
+] as const;
+const SCOPE_KEYS = [
+  "fingerprint", "provider", "credentialProfile", "backend", "project", "region", "policy",
+] as const;
+const MODEL_KEYS = [
+  "id", "runtimeId", "displayName", "description", "evidence", "aliases", "default",
+  "context", "modalities", "visionMode", "availability", "lifecycle", "serviceTiers",
+  "effort", "pricingCategory", "compatibility", "applicationMode", "bindings",
+] as const;
+const MODEL_CONTEXT_KEYS = ["native", "maximum", "effective"] as const;
+const MODALITIES_KEYS = ["input", "output"] as const;
+const MODEL_EFFORT_KEYS = ["mechanism", "configId", "choices", "selectionDefault"] as const;
+const EFFORT_CHOICE_KEYS = ["id", "raw"] as const;
+const BINDING_KEYS = ["model", "effort", "rawModel", "rawEffort"] as const;
+
+/**
+ * Reject any key the normalized shape does not declare, everywhere in the graph.
+ *
+ * Shape only: this never inspects what a value MEANS, so it stays free of any
+ * provider vocabulary. Semantic validation (required fields, uniqueness, raw
+ * binding coverage) remains core's `validateCandidate`; content screening
+ * remains {@link parseCatalogEvidenceList}.
+ *
+ * Applied before a bridge returns a candidate AND before core persists or loads
+ * one, because a remote host is not a trust boundary we can defer past.
+ */
+export function assertClosedCatalogShape(candidate: unknown): void {
+  const root = assertExactKeys("candidate", candidate, CANDIDATE_KEYS);
+  assertExactKeys("candidate.scope", root.scope, SCOPE_KEYS);
+  if (!Array.isArray(root.models)) {
+    throw new CatalogEvidenceError("candidate.models", "must be an array");
+  }
+  root.models.forEach((raw, index) => {
+    const path = `candidate.models[${index}]`;
+    const model = assertExactKeys(path, raw, MODEL_KEYS);
+    if (model.context !== undefined) {
+      assertExactKeys(`${path}.context`, model.context, MODEL_CONTEXT_KEYS);
+    }
+    if (model.modalities !== undefined) {
+      assertExactKeys(`${path}.modalities`, model.modalities, MODALITIES_KEYS);
+    }
+    if (model.effort !== undefined) {
+      const effort = assertExactKeys(`${path}.effort`, model.effort, MODEL_EFFORT_KEYS);
+      if (effort.choices !== undefined) {
+        if (!Array.isArray(effort.choices)) {
+          throw new CatalogEvidenceError(`${path}.effort.choices`, "must be an array");
+        }
+        effort.choices.forEach((choice, choiceIndex) =>
+          assertExactKeys(`${path}.effort.choices[${choiceIndex}]`, choice, EFFORT_CHOICE_KEYS)
+        );
+      }
+    }
+    if (model.bindings !== undefined) {
+      if (!Array.isArray(model.bindings)) {
+        throw new CatalogEvidenceError(`${path}.bindings`, "must be an array");
+      }
+      model.bindings.forEach((binding, bindingIndex) =>
+        assertExactKeys(`${path}.bindings[${bindingIndex}]`, binding, BINDING_KEYS)
+      );
+    }
+  });
 }

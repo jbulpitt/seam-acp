@@ -141,6 +141,7 @@ import {
   type AttachIntent,
   type AttachOutcome,
 } from "../../core/session-attach.js";
+import { renderCatalogEvidenceLines } from "../../core/catalog-evidence-render.js";
 import { DispatchWatcher } from "../../core/dispatch/watcher.js";
 import {
   CONTINUE_PROMPT,
@@ -2980,6 +2981,15 @@ export class Orchestrator {
     const status = new TurnStatus({
       model: described.model.value,
       repoDisplay,
+      // #236: the selected model's catalog provenance travels with the turn
+      // status, so the surface an operator actually watches can show WHY the
+      // row says what it says. Cache-only and already screened.
+      ...(described.catalog?.model?.description
+        ? { modelDescription: described.catalog.model.description }
+        : {}),
+      ...(described.catalog?.model?.evidence?.length
+        ? { modelEvidence: renderCatalogEvidenceLines(described.catalog.model.evidence) }
+        : {}),
       ...(described.effort.value ? { effort: described.effort.value } : {}),
       style: cardStyle,
       ...(brandAsset ? { brandFilename: brandAsset.filename } : {}),

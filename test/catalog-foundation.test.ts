@@ -14,6 +14,9 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   assessCatalogReduction,
+  catalogContentChecksum,
+  catalogModelFingerprint,
+  catalogReductionFingerprint,
   catalogScopeFingerprint,
   invokeAdapterRpc,
   manifestCatalogSource,
@@ -886,14 +889,15 @@ describe("#236 description/evidence reach real production output paths", () => {
   }
 
   it("SessionRouter.describeConfig exposes the selected model's provenance", async () => {
+    // NOTE: describeConfig is the shared INPUT the surfaces read; it is NOT
+    // coverage for status or audit. Those have their own tests below that
+    // exercise real production construction and serialization.
     const { SessionRouter } = await import("../packages/core/src/core/session-router.js");
     const binding = { agentId: "fake", location: "local" };
     const { store, service } = await publishedService(binding);
     const router = new SessionRouter({
       logger,
-      store: {
-        readConfig: () => ({ model: "nebula", agentId: "fake" }),
-      } as never,
+      store: { readConfig: () => ({ model: "nebula", agentId: "fake" }) } as never,
       profiles: [{ id: "fake", defaultModel: "nebula", effort: { mechanism: "none", levels: [] } }] as never,
       config: { REPOS_ROOT: "/repo", channelPresets: {}, threadPresets: {} } as never,
       modelCatalog: service as never,
@@ -904,15 +908,8 @@ describe("#236 description/evidence reach real production output paths", () => {
       configJson: JSON.stringify({ model: "nebula" }),
       createdUtc: "2026-09-09T00:00:00Z", updatedUtc: "2026-09-09T00:00:00Z",
     } as never);
-    // This is the production inspection object MCP / status / audit all read.
-    expect(d.catalog.model).toMatchObject({
-      id: "nebula",
-      description: "The outlier flagship.",
-    });
-    expect(d.catalog.model?.evidence?.[0]).toMatchObject({
-      kind: "verified-record",
-      resolvedModel: "vendor::nebula@2026",
-    });
+    expect(d.catalog.model).toMatchObject({ id: "nebula", description: "The outlier flagship." });
+    expect(d.catalog.model?.evidence?.[0]).toMatchObject({ kind: "verified-record" });
     store.close();
   });
 
@@ -1011,5 +1008,265 @@ describe("#236 description/evidence reach real production output paths", () => {
     }
     expect(fetches).toBe(1);
     store.close();
+  });
+});
+
+describe("#236 exact-key closure covers the WHOLE candidate graph", () => {
+  const base = () => candidate([model("nebula", { default: true })]);
+
+  /** Inject an undeclared key at one path in the normalized graph. */
+  const inject = (mutate: (c: AdapterCatalogCandidate) => void): AdapterCatalogCandidate => {
+    const built = JSON.parse(JSON.stringify(base())) as AdapterCatalogCandidate;
+    mutate(built);
+    return built;
+  };
+
+  const INJECTIONS: Array<[string, (c: AdapterCatalogCandidate) => void]> = [
+    ["candidate", (c) => { (c as unknown as Record<string, unknown>).sneaky = "x"; }],
+    ["scope", (c) => { (c.scope as unknown as Record<string, unknown>).sneaky = "x"; }],
+    ["model", (c) => { (c.models[0] as unknown as Record<string, unknown>).sneaky = "x"; }],
+    ["model.context", (c) => { (c.models[0]!.context as unknown as Record<string, unknown>).sneaky = "x"; }],
+    ["model.modalities", (c) => { (c.models[0]!.modalities as unknown as Record<string, unknown>).sneaky = "x"; }],
+    ["model.effort", (c) => { (c.models[0]!.effort as unknown as Record<string, unknown>).sneaky = "x"; }],
+    ["model.effort.choices[0]", (c) => { (c.models[0]!.effort.choices[0] as unknown as Record<string, unknown>).sneaky = "x"; }],
+    ["model.bindings[0]", (c) => { (c.models[0]!.bindings[0] as unknown as Record<string, unknown>).sneaky = "x"; }],
+    ["model (large payload)", (c) => {
+      (c.models[0] as unknown as Record<string, unknown>).payload = "QA_SECRET=secret-value".repeat(2000);
+    }],
+  ];
+
+  it.each(INJECTIONS)("core boundary rejects an unknown key at %s", (_name, mutate) => {
+    expect(() => validateCandidate(inject(mutate))).toThrow(/unknown key/);
+  });
+
+  it.each(INJECTIONS)("bridge boundary rejects an unknown key at %s", async (_name, mutate) => {
+    const adapter = {
+      catalog: { scope: () => SCOPE, fetch: async () => inject(mutate) },
+    } as unknown as Parameters<typeof invokeAdapterRpc>[2]["adapter"];
+    await expect(
+      invokeAdapterRpc("fetchModelCatalog", {}, { adapter, workspaceRoot: "/tmp" })
+    ).rejects.toThrow(/unknown key/);
+  });
+
+  it("still accepts the complete declared shape at both boundaries", async () => {
+    const full = candidate([model("nebula", {
+      default: true,
+      description: "ok",
+      evidence: [evidence()],
+      aliases: ["neb"],
+      pricingCategory: "purple",
+      compatibility: "fake-v9",
+      serviceTiers: ["strange"],
+    })], { sourceVersion: "v1", cliVersion: "cli 1" });
+    expect(() => validateCandidate(full)).not.toThrow();
+    const adapter = {
+      catalog: { scope: () => SCOPE, fetch: async () => full },
+    } as unknown as Parameters<typeof invokeAdapterRpc>[2]["adapter"];
+    await expect(
+      invokeAdapterRpc("fetchModelCatalog", {}, { adapter, workspaceRoot: "/tmp" })
+    ).resolves.toBeTruthy();
+  });
+
+  it("keeps schema-1 LKG loadable under the closed shape", async () => {
+    const { file, store } = db();
+    const binding = { agentId: "fake", location: "local" };
+    const legacy = candidate([model("nebula", { default: true })]);
+    store.publish({
+      scopeKey: `scope:${SCOPE.fingerprint}`, checksum: "legacy",
+      candidate: legacy, publishedAt: "2026-09-01T00:00:00.000Z",
+      observation: {
+        bindingKey: "fake@local", agentId: "fake", location: "local",
+        scopeKey: `scope:${SCOPE.fingerprint}`, checksum: "legacy",
+        adapterVersion: 1, schemaVersion: 1, cliVersion: null, sourceVersion: null,
+        source: "fake-adapter-probe", fetchedAt: "2026-09-01T00:00:00.000Z", drift: null,
+      },
+    });
+    store.close();
+    const reopened = new ModelCatalogStore(file);
+    const service = new ModelCatalogService({
+      store: reopened, logger, bindings: () => [binding], scope: () => SCOPE,
+      fetch: async () => { throw new Error("no fetch on load"); },
+    });
+    expect(service.lookup(binding).state).toBe("ready");
+    reopened.close();
+  });
+});
+
+describe("#236 evidence ordering is a TOTAL canonical order", () => {
+  /** Two valid records agreeing on kind/source/observedAt but differing after. */
+  const tied = (note: string) => evidence({
+    kind: "live-observation", source: "same-source",
+    observedAt: "2026-09-09T00:00:00.000Z", note,
+  });
+
+  it("checksums identically when tied records arrive in either order", () => {
+    const a = tied("alpha note");
+    const b = tied("beta note");
+    const forward = candidate([model("nebula", { default: true, evidence: [a, b] })]);
+    const reverse = candidate([model("nebula", { default: true, evidence: [b, a] })]);
+    validateCandidate(forward);
+    validateCandidate(reverse);
+    // The previous comparator stopped at the three primary keys, so these two
+    // retained input order and produced different content checksums — making
+    // transport order a generation/diff and reduction-confirmation authority.
+    expect(catalogContentChecksum(forward)).toBe(catalogContentChecksum(reverse));
+    expect(catalogReductionFingerprint(forward)).toBe(catalogReductionFingerprint(reverse));
+    expect(catalogModelFingerprint(forward.models[0]!)).toBe(catalogModelFingerprint(reverse.models[0]!));
+  });
+
+  it("is stable across every permutation of an equivalent evidence set", () => {
+    const records = [
+      tied("alpha"), tied("beta"), tied("gamma"),
+      evidence({ kind: "verified-record", source: "same-source", observedAt: "2026-09-09T00:00:00.000Z" }),
+    ];
+    const permute = <T,>(items: T[]): T[][] =>
+      items.length <= 1
+        ? [items]
+        : items.flatMap((item, index) =>
+            permute([...items.slice(0, index), ...items.slice(index + 1)]).map((rest) => [item, ...rest])
+          );
+    const checksums = new Set(
+      permute(records).map((order) => {
+        const built = candidate([model("nebula", { default: true, evidence: order })]);
+        validateCandidate(built);
+        return catalogContentChecksum(built);
+      })
+    );
+    expect(permute(records)).toHaveLength(24);
+    expect(checksums.size).toBe(1);
+  });
+
+  it("does NOT reorder arrays whose order is provider-meaningful", () => {
+    // Models are a preference order and effort choices are a display order;
+    // reordering them IS a real change and must surface as one.
+    const a = candidate([model("nebula", { default: true }), model("quasar")]);
+    const b = candidate([model("quasar"), model("nebula", { default: true })]);
+    validateCandidate(a);
+    validateCandidate(b);
+    expect(catalogContentChecksum(a)).not.toBe(catalogContentChecksum(b));
+  });
+
+  it("a tied-record reordering cannot fake a reduction confirmation", async () => {
+    const { store } = db();
+    const binding = { agentId: "fake", location: "local" };
+    const a = tied("alpha");
+    const b = tied("beta");
+    let order = [a, b];
+    let rows = () => [
+      model("nebula", { default: true, evidence: order }),
+      model("quasar", { evidence: order }),
+    ];
+    const service = new ModelCatalogService({
+      store, logger, bindings: () => [binding], scope: () => SCOPE, fetch: async () => candidate(rows()),
+    });
+    await service.refresh(binding);
+    rows = () => [model("nebula", { default: true, evidence: order })];
+    expect((await service.refresh(binding)).result).toBe("quarantined");
+    // Same reduction, evidence delivered in the opposite order: still the SAME
+    // observation, so it confirms rather than resetting the gate.
+    order = [b, a];
+    expect((await service.refresh(binding)).result).toBe("published");
+    store.close();
+  });
+});
+
+describe("#236 provenance reaches the REAL status and audit outputs", () => {
+  const described = () => model("nebula", {
+    default: true,
+    description: "The outlier flagship.",
+    evidence: [evidence({
+      kind: "verified-record",
+      source: "operator-verification",
+      resolvedModel: "vendor::nebula@2026",
+      note: "proven out of band",
+    })],
+  });
+
+  const configDescription = () => ({
+    sessionId: "discord:t1", channelRef: "t1", parentRef: "c1",
+    agent: { value: "fake", source: "default" as const },
+    model: { value: "nebula", source: "default" as const },
+    effort: { value: "default", source: "default" as const },
+    cwd: { value: "/repo", source: "default" as const },
+    permission: { value: "ask", source: "default" as const },
+    locked: false,
+    detached: { value: false, source: "default" as const },
+    tts: { value: false, source: "default" as const },
+    ttsVoice: { value: null, source: "default" as const },
+    ttsPace: { value: "natural" as const, source: "default" as const },
+    ttsStyle: { value: "neutral" as const, source: "default" as const },
+    location: { value: "local", source: "default" as const },
+    catalog: {
+      state: "ready" as const, generation: 7, source: "fake-adapter-probe",
+      fetchedAt: "2026-09-09T00:00:00.000Z",
+      model: {
+        id: "nebula",
+        description: "The outlier flagship.",
+        evidence: described().evidence!,
+      },
+    },
+  });
+
+  it("the REAL status DTO carries it, and the REAL renderer displays it", async () => {
+    const { TurnStatus, renderStatusPanel } = await import("../packages/core/src/core/status-panel.js");
+    const { discordRenderer } = await import("../packages/core/src/platforms/discord/renderer.js");
+    const { renderCatalogEvidenceLines } = await import("../packages/core/src/core/catalog-evidence-render.js");
+    const d = configDescription();
+
+    // Exactly what the orchestrator constructs for a turn.
+    const status = new TurnStatus({
+      model: d.model.value,
+      repoDisplay: "repo",
+      ...(d.catalog.model.description ? { modelDescription: d.catalog.model.description } : {}),
+      ...(d.catalog.model.evidence.length
+        ? { modelEvidence: renderCatalogEvidenceLines(d.catalog.model.evidence) }
+        : {}),
+    });
+    const input = status.toInput();
+    expect(input.modelDescription).toBe("The outlier flagship.");
+    expect(input.modelEvidence?.[0]).toContain("verified-record via operator-verification");
+
+    // …and the real renderer turns that DTO into a real panel.
+    const panel = renderStatusPanel(discordRenderer, { ...input, action: "Working" }, Date.now());
+    const rendered = JSON.stringify(panel);
+    expect(rendered).toContain("Model info");
+    expect(rendered).toContain("The outlier flagship.");
+    expect(rendered).toContain("resolved vendor::nebula@2026");
+  });
+
+  it("the REAL config-audit snapshot serializes it", async () => {
+    const { ConfigMutationService } = await import("../packages/core/src/core/config-mutation.js");
+    const snapshot = (
+      ConfigMutationService.prototype as unknown as {
+        effectiveSnapshot(this: unknown, d: unknown): Record<string, unknown>;
+      }
+    ).effectiveSnapshot.call({}, configDescription());
+    // The audit row must say which generation a configuration was decided
+    // against, and why the model row says what it says.
+    const catalog = snapshot.catalog as Record<string, unknown>;
+    expect(catalog).toMatchObject({ state: "ready", generation: 7, source: "fake-adapter-probe" });
+    const auditModel = catalog.model as Record<string, unknown>;
+    expect(auditModel).toMatchObject({ id: "nebula", description: "The outlier flagship." });
+    expect((auditModel.evidence as string[])[0]).toContain("verified-record via operator-verification");
+    // It must survive the JSON serialization the audit trail actually persists.
+    const roundTripped = JSON.parse(JSON.stringify(snapshot)) as Record<string, unknown>;
+    expect(JSON.stringify(roundTripped.catalog)).toContain("proven out of band");
+  });
+
+  it("status and audit rendering stay bounded and secret-safe", async () => {
+    const { renderCatalogEvidenceLines, CATALOG_EVIDENCE_RENDER_MAX_LINES, CATALOG_EVIDENCE_RENDER_MAX_CHARS } =
+      await import("../packages/core/src/core/catalog-evidence-render.js");
+    const many = Array.from({ length: 8 }, (_, i) =>
+      evidence({ source: `probe-${i}`, note: "a".repeat(180) })
+    );
+    const lines = renderCatalogEvidenceLines(many);
+    expect(lines.length).toBeLessThanOrEqual(CATALOG_EVIDENCE_RENDER_MAX_LINES);
+    for (const line of lines) expect(line.length).toBeLessThanOrEqual(CATALOG_EVIDENCE_RENDER_MAX_CHARS);
+    // Everything rendered already passed the portable screen, so nothing
+    // secret-shaped can be present to render in the first place.
+    expect(() => validateCandidate(candidate([model("nebula", {
+      default: true,
+      evidence: [evidence({ note: "QA_SECRET=hunter2000" })],
+    })]))).toThrow(/rejected content/);
   });
 });

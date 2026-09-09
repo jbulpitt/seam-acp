@@ -541,6 +541,12 @@ function uniqueBindings(bindings: ReadonlyArray<CatalogBinding>): CatalogBinding
 
 export function validateCandidate(candidate: AdapterCatalogCandidate): void {
   if (!candidate || typeof candidate !== "object") throw new Error("catalog candidate is malformed");
+  // Exact-key closure for the WHOLE graph AND canonical evidence normalization,
+  // at the CORE boundary too — not only at the bridge. Everything persisted or
+  // loaded goes through here, so an undeclared key cannot ride into a durable
+  // schema-1 snapshot, and evidence is put into its canonical total order
+  // BEFORE any checksum, diff, or reduction fingerprint is taken.
+  validateCatalogEvidence(candidate);
   // A RANGE, not an equality (#236). Accepting only the exact current version
   // meant the next schema bump would discard every durable last-known-good
   // snapshot on deploy and turn an upgrade into a cold-cache outage.

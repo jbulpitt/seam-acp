@@ -1213,7 +1213,7 @@ describe("#236 provenance reaches the REAL status and audit outputs", () => {
     },
   });
 
-  it("the REAL status DTO carries it, and the REAL renderer displays it", async () => {
+  it("retains catalog metadata internally without displaying it on the turn card", async () => {
     const { TurnStatus, renderStatusPanel } = await import("../packages/core/src/core/status-panel.js");
     const { discordRenderer } = await import("../packages/core/src/platforms/discord/renderer.js");
     const { renderCatalogEvidenceLines } = await import("../packages/core/src/core/catalog-evidence-render.js");
@@ -1232,12 +1232,15 @@ describe("#236 provenance reaches the REAL status and audit outputs", () => {
     expect(input.modelDescription).toBe("The outlier flagship.");
     expect(input.modelEvidence?.[0]).toContain("verified-record via operator-verification");
 
-    // …and the real renderer turns that DTO into a real panel.
-    const panel = renderStatusPanel(discordRenderer, { ...input, action: "Working" }, Date.now());
+    // Catalog details must not crowd the turn card or displace thinking.
+    const panel = renderStatusPanel(discordRenderer, {
+      ...input, action: "Working", thinking: ["Checking the current change"],
+    }, Date.now());
     const rendered = JSON.stringify(panel);
-    expect(rendered).toContain("Model info");
-    expect(rendered).toContain("The outlier flagship.");
-    expect(rendered).toContain("resolved vendor::nebula@2026");
+    expect(rendered).not.toContain("Model info");
+    expect(rendered).not.toContain("The outlier flagship.");
+    expect(rendered).not.toContain("resolved vendor::nebula@2026");
+    expect(panel.footer).toContain("Checking the current change");
   });
 
   it("the REAL config-audit snapshot serializes it", async () => {

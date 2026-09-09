@@ -267,8 +267,6 @@ surfaces read — it is not itself an output. The surfaces are:
 
 - **MCP `config_describe`** renders a `model info` line plus one line per
   evidence record.
-- **The turn status card**: `TurnStatus` → `StatusPanelInput`/`StatusPanel` →
-  the Discord renderer's `Model info` field (full cards only).
 - **The config audit trail**: `ConfigMutationService.effectiveSnapshot` records
   the catalog state, generation, source, and the selected model's description
   and rendered evidence, so an audit entry can still explain a model choice
@@ -278,7 +276,10 @@ surfaces read — it is not itself an output. The surfaces are:
   canonical identity across agents advertising the same model and persisted in
   the metadata cache.
 
-All three operator surfaces format through the one renderer in
+The turn status card does not display catalog descriptions or evidence. Its
+existing model identity, activity, and thinking output remain unchanged.
+
+MCP configuration output and the config audit trail format through the shared renderer in
 `packages/core/src/core/catalog-evidence-render.ts`, which bounds both the
 number of lines and each line's length. Every read is cache-only.
 

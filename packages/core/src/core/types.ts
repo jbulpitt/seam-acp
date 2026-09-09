@@ -229,6 +229,14 @@ export interface StatusPanel {
   model: string;
   /** Resolved API model id (e.g. "claude-opus-4-8"), if different from model alias. */
   resolvedModel?: string;
+  /** Catalog-owned description of the selected model (#236). Display only. */
+  modelDescription?: string;
+  /**
+   * Pre-rendered, bounded per-model provenance lines (#236) from the published
+   * catalog generation. Rendered upstream so the panel never has to interpret a
+   * provider's evidence shape; already screened, so safe to display.
+   */
+  modelEvidence?: string[];
   /** Reasoning effort for this turn, if set (low|medium|high|xhigh|max). */
   effort?: string;
   /** Claude Fast mode (#37) as it RESOLVED on the live session — `"on"`, or a

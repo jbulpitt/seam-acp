@@ -141,6 +141,7 @@ import {
   type AttachIntent,
   type AttachOutcome,
 } from "../../core/session-attach.js";
+import { renderCatalogEvidenceLines } from "../../core/catalog-evidence-render.js";
 import { DispatchWatcher } from "../../core/dispatch/watcher.js";
 import {
   CONTINUE_PROMPT,
@@ -2980,6 +2981,15 @@ export class Orchestrator {
     const status = new TurnStatus({
       model: described.model.value,
       repoDisplay,
+      // #236: the selected model's catalog provenance travels with the turn
+      // status, so the surface an operator actually watches can show WHY the
+      // row says what it says. Cache-only and already screened.
+      ...(described.catalog?.model?.description
+        ? { modelDescription: described.catalog.model.description }
+        : {}),
+      ...(described.catalog?.model?.evidence?.length
+        ? { modelEvidence: renderCatalogEvidenceLines(described.catalog.model.evidence) }
+        : {}),
       ...(described.effort.value ? { effort: described.effort.value } : {}),
       style: cardStyle,
       ...(brandAsset ? { brandFilename: brandAsset.filename } : {}),
@@ -11125,13 +11135,29 @@ export class Orchestrator {
       return;
     }
     const requested = i.options.getString("agent", true).trim();
-    await i.reply({ content: `🔄 Refreshing model catalog \`${requested}\`…` });
+    const acceptReduction = i.options.getBoolean("accept-reduction") === true;
+    // #236: the bypass is bounded to ONE explicit binding. `agent:all` with
+    // accept-reduction would let a single click admit every simultaneous fleet
+    // reduction — exactly the blast radius the quarantine exists to prevent.
+    if (acceptReduction && requested === "all") {
+      await i.reply({
+        content:
+          "🔒 `accept-reduction:true` requires one explicit `agent@host`; it cannot be combined with `all`. " +
+          "Accept each quarantined binding individually.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await i.reply({
+      content: `🔄 Refreshing model catalog \`${requested}\`…` +
+        (acceptReduction ? " (accepting a quarantined reduction)" : ""),
+    });
     const results = requested === "all"
-      ? await this.modelCatalog.refreshAll("manual")
+      ? await this.modelCatalog.refreshAll("manual", {})
       : [await this.modelCatalog.refresh((() => {
           const parsed = parseAgentAtLocation(requested);
           return { agentId: parsed.agentId, location: parsed.location };
-        })(), "manual")];
+        })(), "manual", { acceptReduction, actor: i.user.id })];
     const lines = results.map((result) => {
       const generation = `${result.previousGeneration ?? "none"} → ${result.generation ?? "none"}`;
       const detail = result.ok
@@ -11146,6 +11172,20 @@ export class Orchestrator {
         ...(result.sourceVersion || result.cliVersion
           ? [`provider/CLI ${[result.sourceVersion, result.cliVersion].filter(Boolean).join(" / ")}`]
           : []),
+        // #236: a quarantined reduction is not a failure — say what was held
+        // back and exactly how to admit it, or nobody can act on it. An
+        // ACCEPTED reduction stays visible in the response as an override.
+        ...(result.acceptedReduction && result.reduction
+          ? [
+              `⚠️ operator-accepted reduction — removed ${result.reduction.removed.join(", ")}` +
+                (result.acceptedBy ? ` (accepted by <@${result.acceptedBy}>)` : ""),
+            ]
+          : result.reduction
+            ? [
+                `⛔ held back: ${result.reduction.rule} rule — removes ${result.reduction.removed.join(", ")}`,
+                `to admit: repeat this refresh unchanged to confirm, or re-run with \`accept-reduction:true\``,
+              ]
+            : []),
         ...(result.error ? [`failure: ${result.error}`] : []),
       ].join("\n");
     });

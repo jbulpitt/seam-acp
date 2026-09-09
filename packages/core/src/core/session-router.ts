@@ -1,6 +1,6 @@
 import path from "node:path";
 import { AgentRuntime } from "../agents/agent-runtime.js";
-import { asRemoteCatalogAdapter, type AgentProfile } from "@seam/adapters";
+import { asRemoteCatalogAdapter, type AgentProfile, type CatalogModelEvidence } from "@seam/adapters";
 import type { Logger } from "../lib/logger.js";
 import type { SessionStore } from "./session-store.js";
 import type { SessionRecord, PermissionPolicyMode, StatusCardStyle } from "./types.js";
@@ -211,6 +211,19 @@ export interface ConfigDescription {
     generation: number | null;
     source: string | null;
     fetchedAt: string | null;
+    /**
+     * The SELECTED model's per-model description/evidence (#236), read
+     * cache-only from the published generation. This is the production
+     * inspection path config_describe / status / audit render, so provenance is
+     * visible where a human actually looks instead of only inside the snapshot.
+     * Evidence was screened by the portable parser before persistence, so it is
+     * safe to render.
+     */
+    model: {
+      id: string;
+      description: string | null;
+      evidence: ReadonlyArray<CatalogModelEvidence>;
+    } | null;
   };
   /**
    * Preamble riders (#90). Channel and thread riders STACK (channel first,
@@ -585,11 +598,22 @@ export class SessionRouter {
       agentId: agent.value,
       location: locationValue,
     });
+    const catalogModel = this.modelCatalog.model(
+      { agentId: agent.value, location: locationValue },
+      model.value
+    );
     const catalog = {
       state: catalogLookup.state,
       generation: catalogLookup?.snapshot?.generation ?? null,
       source: catalogLookup?.snapshot?.candidate.source ?? null,
       fetchedAt: catalogLookup?.snapshot?.candidate.fetchedAt ?? null,
+      model: catalogModel
+        ? {
+            id: catalogModel.id,
+            description: catalogModel.description ?? null,
+            evidence: catalogModel.evidence ?? [],
+          }
+        : null,
     };
 
     const rider: { channel?: string; thread?: string } = {

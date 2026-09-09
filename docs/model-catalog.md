@@ -43,6 +43,256 @@ service applies identical generic validation and persistence to local and remote
 candidates; adapter-specific validation runs on the host before an RPC result is
 returned.
 
+## Per-model description and evidence (#236)
+
+A normalized row may carry an optional `description` and an optional `evidence`
+array of structured, provider-neutral provenance records. Candidate-wide
+`source`/`sourceVersion` still describe the fetch as a whole, but they cannot
+represent a catalog whose rows have *different* origins — a live-advertised
+model beside one carried forward from an out-of-band verification.
+
+Each record declares `kind` (`live-observation`, `verified-record`,
+`declared-manifest`, `enrichment`) and a `source`, plus optional `observedAt`,
+`runtimeVersion`, `adapterVersion`, `scopeRef`, `resolvedModel`, `context`, and
+`effort`. Core validates and renders; it never interprets a provider's names.
+
+**One portable validator, applied at two boundaries.**
+`packages/adapters/src/catalog-evidence.ts` is the single screen. It runs
+**before a remote bridge returns a candidate** and **again before core persists
+or loads one** — a remote host is not a trust boundary we can defer past, so
+malformed or secret-bearing content never crosses the wire in the first place.
+
+What it enforces:
+
+- **Cross-row semantics at BOTH boundaries.** `assertCatalogSemantics` is the
+  shared provider-neutral rule for identity that cannot be judged one field at a
+  time: duplicate model ids, an id colliding with another row's alias, a reverse
+  binding two rows both claim, and exactly-one-default. It lived only in core, so
+  a colliding candidate crossed the bridge and was refused only after transport.
+  Evidence is documented as a SET, so an exact duplicate record is rejected too.
+- **Declared-VALUE policy over the whole graph.** `assertCatalogValues` gives
+  every declared field an explicit type, format, range and content policy:
+  scalar version/config/source fields refuse object and array substitutions;
+  context windows must be positive SAFE integers within a generous documented
+  ceiling (`CATALOG_MAX_CONTEXT_TOKENS`, two orders of magnitude above anything
+  shipping today) — no NaN, infinity, fractional, negative, or precision-losing
+  values; adapter versions are positive safe integers under
+  `CATALOG_MAX_ADAPTER_VERSION`; `sourceVersion`/`cliVersion` keep their declared
+  string format rather than accepting numbers or objects; aliases, models,
+  modalities,
+  service tiers, effort choices and bindings have cardinality and item-size
+  bounds with duplicate detection; enums are closed; and no field outside the
+  scope identity family may contain control characters, PII, credentials,
+  token-shaped strings, or an absolute/home/secret-bearing path.
+- **Scope labels are diagnostic; identity is the fingerprint.**
+  `credentialProfile`, `backend`, `project`, `region` and `policy` legitimately
+  carry host-shaped values in production — Codex puts `~/.codex` in
+  `credentialProfile` — so refusing them would fail every real refresh and take
+  the catalog cold. An unsafe label is replaced with the CONSTANT sentinel
+  `[redacted]`, or omitted. It is deliberately **not** derived from the input: a
+  truncated digest of a low-entropy value like a home directory is
+  dictionary-reversible, which would leak the very path the replacement exists
+  to remove. Nothing keys off the label, so a constant costs nothing.
+- **The adapter-produced `fingerprint` is never rewritten.** It is validated for
+  safe format (a digest, or a bounded safe identifier) and otherwise refused —
+  silently changing it would fork the scope and split its generation history.
+  Scope distinctness therefore survives label redaction intact.
+- **Not in this issue:** a salted/HMAC scheme that could keep labels distinct
+  *and* non-reversible is deliberately out of scope for #236 and tracked as
+  follow-up hardening, along with threat models beyond validated adapter output.
+- **Normalization never mutates its input.** Adapters memoize their scope object
+  (and `asRemoteCatalogAdapter` memoizes the whole candidate) while the service
+  deep-freezes what it publishes, so an in-place sanitizer would throw on the
+  second refresh. `normalizeCatalogCandidate` returns a copy of only what it
+  must change.
+- **Exact-key closure over the WHOLE normalized graph.** `assertClosedCatalogShape`
+  declares the complete key set for the candidate, `scope`, every model row,
+  `context`, `modalities`, `effort`, each effort choice, each binding, and every
+  evidence record and its nested `context`/`effort`. An unknown key at ANY of
+  those levels is a rejection, not a passthrough. Closing only
+  description/evidence left the rest open, so an undeclared key — including a
+  50 KB payload — crossed the bridge and was persisted inside schema 1.
+- **Content screens, because length is not sanitization.** A 40-character token
+  fits every bound. Free text (`note`, `description`) is screened for
+  assignments, bearer tokens, credential words, key prefixes, JWTs, PEM blocks,
+  long opaque runs, e-mail addresses, home paths, and credential-bearing paths.
+  Identifier/label fields (`source`, `runtimeVersion`, `resolvedModel`, methods,
+  effort choices) are constrained by a **charset** that cannot spell `KEY=VALUE`
+  at all, so a legitimate raw model id such as `vendor::nebula@2026` is accepted
+  while an environment fragment is not.
+- **`scopeRef` must be a scope fingerprint or a short sanitized identifier** —
+  never a path, URL, or account.
+- **Bounds on lists and items**, and **semantic consistency**: a context window
+  that exceeds its own maximum, or an effort default that is not among its own
+  choices, is rejected.
+
+### Array semantics
+
+Per-model fields participate in the **canonical** checksum and diff, so key
+insertion order is never an authority. Array order is defined per field:
+
+- **`evidence` is an unordered SET.** It is re-emitted in a canonical **total**
+  order — `kind`, then `source`, then `observedAt`, then the full canonical
+  serialization of the record as the final tiebreaker. The tiebreaker is
+  load-bearing: without it two valid records agreeing on the first three keys
+  kept their input order, so the transport order of an evidence array leaked
+  into the content checksum, the per-row diff, and the reduction-confirmation
+  fingerprint.
+- **`models`, `effort.choices`, and `bindings` are ORDERED sequences** whose
+  order is provider-meaningful (preference order, display order, and the codec
+  rows derived from them). They are preserved as given, and reordering them is a
+  real change that surfaces as one.
+- `aliases`, `serviceTiers`, and `modalities` are preserved as given; their
+  contents are uniqueness-checked, and no consumer treats their order as
+  meaningful.
+
+### Surfaces that carry it
+
+`SessionRouter.describeConfig` is the shared **input** the operator-facing
+surfaces read — it is not itself an output. The surfaces are:
+
+- **MCP `config_describe`** renders a `model info` line plus one line per
+  evidence record.
+- **The turn status card**: `TurnStatus` → `StatusPanelInput`/`StatusPanel` →
+  the Discord renderer's `Model info` field (full cards only).
+- **The config audit trail**: `ConfigMutationService.effectiveSnapshot` records
+  the catalog state, generation, source, and the selected model's description
+  and rendered evidence, so an audit entry can still explain a model choice
+  after the catalog has moved on.
+- The **metadata enrichment join** carries the catalog-owned description AND the
+  structured evidence, in its validated bounded representation, deduplicated by
+  canonical identity across agents advertising the same model and persisted in
+  the metadata cache.
+
+All three operator surfaces format through the one renderer in
+`packages/core/src/core/catalog-evidence-render.ts`, which bounds both the
+number of lines and each line's length. Every read is cache-only.
+
+## Schema evolution and durable snapshots (#236)
+
+Loading accepts a schema RANGE
+(`MODEL_CATALOG_MIN_SUPPORTED_SCHEMA_VERSION`…`MODEL_CATALOG_SCHEMA_VERSION`)
+and normalizes older rows forward through `upgradeCatalogCandidate`. Accepting
+only the current exact version meant the next bump would discard every durable
+last-known-good snapshot and turn a deploy into a cold-cache outage. Prefer
+additive optional fields (as `description` and `evidence` are) so no bump is
+needed at all; when one is unavoidable, extend the upgrade hook rather than
+widening the version check. A malformed stored row is ignored, never deleted;
+a malformed *refresh* candidate retains the active generation.
+
+## Honest defaults (#236)
+
+A publishable catalog requires exactly one default row, and nothing invents one.
+
+- `manifestCatalogSource` resolves the configured default by **exact model id**,
+  or failing that by a **declared alias** on exactly one row. Two rows claiming
+  the same alias is ambiguous and fails rather than guessing.
+- `asRemoteCatalogAdapter` no longer falls back to `models[0]`; a remote
+  candidate that does not declare exactly one default fails closed.
+- An adapter may publish a literal unresolved alias row (`id`/`runtimeId` =
+  `default`). A separately established resolution belongs in that row's
+  `evidence.resolvedModel` — informational only. It must never rewrite the raw
+  binding, and a row that does collide is refused as an ambiguous reverse
+  binding.
+
+## Small-catalog reduction quarantine (#236)
+
+The service — not provider parsing — compares each candidate with the durable
+active generation.
+
+- **Small catalogs** (at or below `smallCatalogMaxModels`, default 3): **any
+  removal** is held, including a same-size replacement `{a,b}` → `{a,c}`. A
+  provider with two or three models has no margin, and a same-size swap is
+  indistinguishable from a partial fetch that substituted a placeholder.
+- **Larger catalogs** (from `collapseMinModels`, default 4): the proportional
+  more-than-half collapse rule.
+- Pure additions and metadata-only edits are never held.
+
+Publication requires a second **independent, identical** observation. The
+confirmation identity is a **substantive fingerprint** that excludes volatile
+`observedAt`/`fetchedAt`, because two genuine observations of the same reduced
+catalog differ only in when they were taken — a plain checksum would make
+confirmation impossible.
+
+Confirmation state is **typed and durable** (`model_catalog_reduction_quarantine`),
+tied to the binding, the scope, the prior generation, the rule, and the removed
+set. Only a matching prior reduction quarantine can confirm; an unrelated
+attempt's recorded checksum cannot. It is cleared on **every** non-qualifying
+attempt — offline/unavailable, drift, failure, or a different candidate — so
+`quarantine → offline → identical candidate` quarantines again rather than
+publishing.
+
+`/seamadmin catalog refresh <agent@host> accept-reduction:true` is the bounded
+operator override. It **rejects `agent:all`** (one click must not admit every
+simultaneous fleet reduction), applies to a single refresh of a single binding,
+is never persisted as a setting, and is recorded durably as
+`published-accepted-reduction` with the accepting operator, so an audit can tell
+a bypass from an ordinary publication. The refresh response names what was held
+and how to admit it.
+
+## Shared bounded probe lifecycle (#236)
+
+`runBoundedProbe` in `packages/adapters/src/probe-process.ts` is the one
+child-process lifecycle for stdio/ACP collectors, and it is **enforcing**, not
+advisory. The adapter supplies executable, argv, cwd and env and does its own
+protocol work in `run`; the helper knows no agent, CLI, or model name, and never
+writes to the child, so a catalog probe cannot spend model tokens.
+
+- **stdout and stderr are bounded at the stream boundary.** The helper owns the
+  only consumer of the raw stdout and republishes a bounded view, so nothing is
+  lost to a late listener and nothing can exceed the ceiling. Overflow fails the
+  probe (`output_overflow`) and kills the child — a collector that never reads
+  is still protected.
+- **Close steps run in explicit phases: SESSION before CONNECTION**, never in
+  registration order. A session is closed politely while its transport is still
+  up.
+- **Settlement of `run` — not a fixed grace — is the authority for when
+  registration is complete.** On the deadline/abort path the helper aborts
+  `handle.signal`, then waits for the run to actually settle before closing the
+  registration phase and draining every registered close. A fixed grace was the
+  wrong authority: a registration that landed after it was fired detached, so
+  the helper could return while a session close was still pending.
+  `finalizeDeadlineMs` is only a ceiling so an uncooperative run cannot hang the
+  helper forever; hitting it terminates and reaps the child and then returns
+  `not_settled`.
+- **Registration phases are explicit, and late steps obey them.** While the
+  phase is open a step is QUEUED with its declared phase and drained by the
+  phase loop — never executed on arrival, which previously discarded the phase
+  and could run a connection close before a session close. The loop repeats
+  until a full round adds nothing new, then SEALS. A registration after the seal
+  is refused outright: not executed, not detached, so nothing acts after return.
+- **What "bounded" means, exactly.** Each close step is handed an `AbortSignal`
+  and a bounded window; a cooperative step observes it and stops, and the helper
+  AWAITS it before returning. The helper cannot preempt arbitrary JavaScript that
+  ignores cancellation — no mechanism in the language can — so a deliberately
+  non-cooperative callback may still mutate state after its promise is
+  abandoned. That adversarial case is outside this contract. What IS guaranteed:
+  every close implementation in this repository cooperates (enforced by test),
+  and the helper itself schedules no work after return.
+- **Pre-spawn and post-spawn `error` are different things.** Before a pid exists
+  an `error` is `spawn_failed`. After one exists the process is real and may
+  still be running, so it is a `protocol_error` that must still be terminated
+  and reaped; if no exit is observed the result is `not_reaped`. Classifying it
+  `spawn_failed` both misdescribed it and skipped the reaping question.
+- **Only an observed `exit` counts as reaped**, and `not_reaped` outranks every
+  other cause — a leaked process is the most actionable fact there is.
+- **A protective `error` listener is attached for the whole lifecycle and
+  removed last**, so an error emitted during teardown cannot become an uncaught
+  exception in the host (or an unhandled error in a test run). All other
+  listeners — including both mutually raced pairs, `spawn`/`error` and
+  `exit`/`error` — are removed on every path.
+- **`handle.signal`** aborts on every ending, so provider async work is
+  cancelled too.
+- **Errors are structured codes** (`spawn_failed`, `exited_early`,
+  `output_overflow`, `timeout`, `cancelled`, `not_reaped`, `protocol_error`)
+  with **redacted** detail. Raw child stderr is never persisted or rendered:
+  every supplied env value and every credential-shaped pattern is stripped.
+- **The exit is awaited**, and failing to observe one is reported as
+  `not_reaped` rather than returned as a clean success.
+- `run` is invoked only after the child has actually spawned: Node reports
+  ENOENT asynchronously, so without that gate a probe against a missing
+  executable reported success.
+
 ## Persistence and publication
 
 `ModelCatalogStore` migrates four tables in the shared `seam.db`:

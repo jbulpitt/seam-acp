@@ -6,6 +6,7 @@ import {
   makeCopilotProfile,
   makeGrokProfile,
   manifestCatalogSource,
+  normalizeCatalogCandidate,
 } from "@seam/adapters";
 import { validateCandidate } from "../packages/core/src/core/model-catalog/service.js";
 
@@ -73,7 +74,7 @@ describe("production adapter catalog sources", () => {
         ],
       }),
     });
-    const catalog = await profile.catalog.fetch();
+    const catalog = normalizeCatalogCandidate(await profile.catalog.fetch());
     validateCandidate(catalog);
     expect(catalog.source).toBe("copilot-acp-config-options");
     expect(catalog.models.find((model) => model.id === "gpt-odd")?.effort).toMatchObject({
@@ -118,11 +119,19 @@ describe("production adapter catalog sources", () => {
       effort: { mechanism: "none", levels: [] },
       extraEnv: { ANTHROPIC_BASE_URL: "https://api.z.ai/api/anthropic" },
     });
-    const catalogs = await Promise.all([direct, alternate, vertex, zai].map((profile) => profile.catalog.fetch()));
+    // Production never validates a RAW fetch: both boundaries normalize first
+    // (#236), which is what sanitizes host-shaped scope identity values.
+    const catalogs = (await Promise.all([direct, alternate, vertex, zai].map((profile) => profile.catalog.fetch())))
+      .map(normalizeCatalogCandidate);
     catalogs.forEach(validateCandidate);
     expect(new Set(catalogs.map((catalog) => catalog.scope.fingerprint)).size).toBe(4);
     expect(catalogs[0]?.scope.provider).toBe("anthropic");
-    expect(catalogs[1]?.scope.credentialProfile).toBe("/credentials/work");
+    // A host path is a diagnostic LABEL, not identity, so it is replaced with a
+    // constant sentinel rather than transported. Scope distinctness is
+    // unaffected: the fingerprint is the identity and is never rewritten.
+    expect(catalogs[1]?.scope.credentialProfile).toBe("[redacted]");
+    expect(catalogs[1]?.scope.credentialProfile).not.toContain("/credentials/work");
+    expect(new Set(catalogs.map((c) => c.scope.fingerprint)).size).toBe(4);
     expect(catalogs[2]?.scope).toMatchObject({ backend: "vertex", project: "project-7", region: "us-east5" });
     expect(catalogs[3]?.scope).toMatchObject({ provider: "z-ai", backend: "https://api.z.ai/api/anthropic" });
   });
@@ -155,7 +164,8 @@ describe("production adapter catalog sources", () => {
       discoverModels: discover,
     });
     expect(discover).not.toHaveBeenCalled();
-    const catalogs = await Promise.all([codex, ollama, agy, grok].map((profile) => profile.catalog.fetch()));
+    const catalogs = (await Promise.all([codex, ollama, agy, grok].map((profile) => profile.catalog.fetch())))
+      .map(normalizeCatalogCandidate);
     catalogs.forEach(validateCandidate);
     expect(catalogs.map((catalog) => catalog.scope.provider)).toEqual([
       "openai", "ollama-cloud", "google-antigravity", "xai",

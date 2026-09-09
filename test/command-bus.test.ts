@@ -40,7 +40,24 @@ describe("command-bus rpc allow-list", () => {
   });
 
   it("dispatches catalog refresh through the host adapter boundary", async () => {
-    const candidate = { schemaVersion: 1, scope: { fingerprint: "f".repeat(64), provider: "openai" }, models: [], source: "test", adapterVersion: 1, fetchedAt: new Date().toISOString() };
+    // A valid single-model candidate: the bridge boundary now enforces the same
+    // provider-neutral semantics as core (#236), so an empty model list is
+    // refused before transport rather than after it.
+    const candidate = {
+      schemaVersion: 1,
+      scope: { fingerprint: "f".repeat(64), provider: "openai" },
+      models: [{
+        id: "m1", runtimeId: "m1", displayName: "M1", aliases: [], default: true,
+        context: { native: null, maximum: null, effective: null },
+        modalities: { input: ["text"], output: ["text"] },
+        visionMode: "none", availability: "available", lifecycle: "stable",
+        serviceTiers: [], pricingCategory: null, compatibility: null,
+        applicationMode: "live",
+        effort: { mechanism: "none", choices: [{ id: "default" }], selectionDefault: "default" },
+        bindings: [{ model: "m1", effort: "default", rawModel: "m1" }],
+      }],
+      source: "test", adapterVersion: 1, fetchedAt: new Date().toISOString(),
+    };
     const result = await dispatchBridgeRpc("fetchModelCatalog", {}, "codex", {
       adapters: new Map([["codex", {
         catalog: { fetch: async () => candidate },

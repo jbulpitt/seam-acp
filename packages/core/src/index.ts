@@ -479,6 +479,10 @@ async function main(): Promise<void> {
       name: model.displayName,
       contextWindow: model.context.effective,
       vision: model.modalities.input.includes("image"),
+      // #236: carry the catalog's own per-model description AND structured
+      // provenance into the join, in the validated bounded representation.
+      ...(model.description ? { description: model.description } : {}),
+      ...(model.evidence?.length ? { evidence: model.evidence } : {}),
     })),
   });
   const modelValueManager = new ModelValueManager({

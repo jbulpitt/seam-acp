@@ -30,6 +30,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { PresetsFileSchema } from "../config.js";
+import { renderCatalogEvidenceLines } from "./catalog-evidence-render.js";
 import { uniqueBridgeId } from "./bridge-pairing.js";
 import type { Logger } from "../lib/logger.js";
 import { parkedAgentMessage } from "./parked-agents.js";
@@ -2458,6 +2459,23 @@ export class ConfigMutationService {
       disableThreadPrefix: d.disableThreadPrefix
         ? { value: d.disableThreadPrefix.value, source: d.disableThreadPrefix.source }
         : { value: false, source: "default" },
+      // #236: the audit trail records WHICH catalog generation a configuration
+      // was decided against, and the selected model's provenance. Without it an
+      // audit entry cannot explain a model choice after the catalog moves on.
+      catalog: d.catalog
+        ? {
+            state: d.catalog.state,
+            generation: d.catalog.generation,
+            source: d.catalog.source,
+            model: d.catalog.model
+              ? {
+                  id: d.catalog.model.id,
+                  description: d.catalog.model.description,
+                  evidence: renderCatalogEvidenceLines(d.catalog.model.evidence),
+                }
+              : null,
+          }
+        : null,
     };
   }
 

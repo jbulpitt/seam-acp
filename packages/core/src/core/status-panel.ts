@@ -19,6 +19,10 @@ export interface StatusPanelInput {
   model: string;
   /** Resolved API model id (e.g. "claude-opus-4-8"), if different from model alias. */
   resolvedModel?: string;
+  /** Catalog-owned description of the selected model (#236). */
+  modelDescription?: string;
+  /** Pre-rendered, bounded per-model provenance lines (#236). */
+  modelEvidence?: string[];
   /** Reasoning effort for this turn, if set. */
   effort?: string;
   /** Resolved Claude Fast-mode state for this turn (#37), if worth showing. */
@@ -59,6 +63,8 @@ export function renderStatusPanel(
     repoDisplay: input.repoDisplay,
     model: input.model,
     ...(input.resolvedModel ? { resolvedModel: input.resolvedModel } : {}),
+    ...(input.modelDescription ? { modelDescription: input.modelDescription } : {}),
+    ...(input.modelEvidence?.length ? { modelEvidence: [...input.modelEvidence] } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
     ...(input.fastMode ? { fastMode: input.fastMode } : {}),
     ...(input.titlePrefix ? { titlePrefix: input.titlePrefix } : {}),
@@ -118,6 +124,9 @@ export class TurnStatus {
   state: TurnState = "Working";
   action = "Starting…";
   model: string;
+  /** Catalog-owned provenance for the selected model (#236), display only. */
+  private modelDescription?: string;
+  private modelEvidence?: string[];
   /** Resolved API model id returned by getUsage (e.g. "claude-opus-4-8").
    *  Set after the turn completes; cleared on each new TurnStatus instance. */
   resolvedModel?: string;
@@ -163,6 +172,8 @@ export class TurnStatus {
   constructor(opts: {
     model: string;
     repoDisplay: string;
+    modelDescription?: string;
+    modelEvidence?: string[];
     effort?: string;
     titlePrefix?: string;
     origin?: PanelOrigin;
@@ -172,6 +183,8 @@ export class TurnStatus {
   }) {
     this.model = opts.model;
     this.repoDisplay = opts.repoDisplay;
+    if (opts.modelDescription) this.modelDescription = opts.modelDescription;
+    if (opts.modelEvidence?.length) this.modelEvidence = [...opts.modelEvidence];
     if (opts.effort) this.effort = opts.effort;
     if (opts.titlePrefix) this.titlePrefix = opts.titlePrefix;
     if (opts.origin && hasOrigin(opts.origin)) this.origin = opts.origin;
@@ -271,6 +284,8 @@ export class TurnStatus {
       repoDisplay: this.repoDisplay,
       model: this.model,
       ...(this.resolvedModel ? { resolvedModel: this.resolvedModel } : {}),
+      ...(this.modelDescription ? { modelDescription: this.modelDescription } : {}),
+      ...(this.modelEvidence?.length ? { modelEvidence: [...this.modelEvidence] } : {}),
       ...(this.effort ? { effort: this.effort } : {}),
       ...(this.fastMode ? { fastMode: this.fastMode } : {}),
       ...(this.titlePrefix ? { titlePrefix: this.titlePrefix } : {}),

@@ -1,6 +1,17 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fsp } from "node:fs";
+import {
+  assertCatalogSemantics,
+  assertCatalogValues,
+  assertClosedCatalogShape,
+  assertCatalogDescription,
+  canonicalJson,
+  parseCatalogEvidenceList,
+  sortCatalogEvidence,
+  substantiveJson,
+  type ParsedCatalogEvidence,
+} from "./catalog-evidence.js";
 
 export type CatalogEffortMechanism =
   | "meta"
@@ -11,7 +22,37 @@ export type CatalogEffortMechanism =
 
 export type CatalogApplicationMode = "live" | "reload" | "freshSession";
 export type CatalogVisionMode = "native" | "tool" | "none";
+
+/** Version this build WRITES. */
 export const MODEL_CATALOG_SCHEMA_VERSION = 1;
+/**
+ * Oldest version this build can LOAD. Durable last-known-good snapshots are the
+ * only thing standing between a deploy and a cold-cache outage, so loading
+ * accepts a RANGE and {@link upgradeCatalogCandidate} normalizes older rows
+ * forward. Raising the write version without raising this deliberately is what
+ * would throw away every stored generation on upgrade.
+ */
+export const MODEL_CATALOG_MIN_SUPPORTED_SCHEMA_VERSION = 1;
+
+/**
+ * Where a per-model fact came from. Deliberately generic: core renders and
+ * validates these, and never interprets a provider's model names.
+ *
+ * - `live-observation` — read from the provider/CLI during this fetch.
+ * - `verified-record` — proven out of band earlier and carried forward.
+ * - `declared-manifest` — operator/adapter configuration.
+ * - `enrichment` — joined from an external metadata source.
+ */
+/**
+ * The per-model provenance record. Its exact-key schema, bounds, content
+ * screens, and canonical ordering all live in `catalog-evidence.ts`, which is
+ * the ONE portable validator applied before bridge return and again before
+ * persistence — so this is a type alias, not a second definition to drift from.
+ */
+export type CatalogModelEvidence = ParsedCatalogEvidence;
+export type CatalogEvidenceKind = CatalogModelEvidence["kind"];
+export type CatalogContextEvidence = NonNullable<CatalogModelEvidence["context"]>;
+export type CatalogEffortEvidence = NonNullable<CatalogModelEvidence["effort"]>;
 
 export interface CatalogScope {
   /** Stable, non-secret semantic identity. Equal fingerprints may share a generation. */
@@ -53,6 +94,14 @@ export interface CatalogModel {
   id: string;
   runtimeId: string;
   displayName: string;
+  /** Optional human-readable summary of the model. Display only. */
+  description?: string;
+  /**
+   * Structured per-model provenance. A row may carry several records — a live
+   * advertisement PLUS a separately verified resolution, say — which is exactly
+   * what candidate-wide `source` cannot express for a mixed catalog.
+   */
+  evidence?: CatalogModelEvidence[];
   aliases: string[];
   default: boolean;
   context: {
@@ -132,6 +181,153 @@ export function decodeCatalogSelection(
   return null;
 }
 
+/**
+ * Normalize a durably stored candidate forward to the current schema version.
+ *
+ * Today every supported version is 1, so this is a structural identity — but it
+ * is the hook a future bump MUST extend instead of widening the accepted
+ * version check. Unknown//future fields are carried through untouched: a
+ * snapshot written by a newer build that this build can still read must not be
+ * corrupted by round-tripping through here.
+ *
+ * Returns null when the snapshot is too old to understand, which the caller
+ * treats as "ignore this row", never as "delete it".
+ */
+export function upgradeCatalogCandidate(candidate: AdapterCatalogCandidate): AdapterCatalogCandidate | null {
+  const version = candidate?.schemaVersion;
+  if (!Number.isInteger(version)) return null;
+  if (version < MODEL_CATALOG_MIN_SUPPORTED_SCHEMA_VERSION) return null;
+  if (version > MODEL_CATALOG_SCHEMA_VERSION) return null;
+  return candidate;
+}
+
+/**
+ * Generic protection against publishing a partial catalog.
+ *
+ * Two independent rules, no provider knowledge in either:
+ *
+ * 1. **Small catalogs.** At or below `smallCatalogMaxModels`, ANY removal is
+ *    held — including a same-size replacement (`{a,b}` → `{a,c}`). A provider
+ *    with two or three models has no margin: losing one is not a "collapse" by
+ *    any proportional measure, yet it silently deletes a model the operator
+ *    was using, and a same-size swap is indistinguishable from a partial fetch
+ *    that substituted a placeholder. This covers 2→1, 3→1/2, and 2→2-by-swap.
+ * 2. **Large catalogs.** The pre-existing proportional rule: from
+ *    `collapseMinModels` upward, losing more than half is suspicious.
+ *
+ * Deliberately NOT held: pure additions and metadata-only edits, which remove
+ * nothing.
+ */
+export interface CatalogReductionPolicy {
+  smallCatalogMaxModels: number;
+  collapseMinModels: number;
+}
+
+export const DEFAULT_CATALOG_REDUCTION_POLICY: CatalogReductionPolicy = {
+  smallCatalogMaxModels: 3,
+  collapseMinModels: 4,
+};
+
+export interface CatalogReductionAssessment {
+  removed: string[];
+  rule: "small-catalog" | "collapse";
+  reason: string;
+}
+
+export function assessCatalogReduction(
+  before: ReadonlyArray<Pick<CatalogModel, "id">>,
+  after: ReadonlyArray<Pick<CatalogModel, "id">>,
+  policy: CatalogReductionPolicy = DEFAULT_CATALOG_REDUCTION_POLICY
+): CatalogReductionAssessment | null {
+  if (before.length === 0) return null;
+  const next = new Set(after.map((model) => model.id));
+  const removed = before.map((model) => model.id).filter((id) => !next.has(id));
+  if (removed.length === 0) return null;
+  if (before.length <= policy.smallCatalogMaxModels) {
+    return {
+      removed,
+      rule: "small-catalog",
+      reason:
+        `candidate drops ${removed.length} of ${before.length} published model(s) ` +
+        `(${removed.join(", ")}) from a small catalog`,
+    };
+  }
+  if (after.length >= before.length) return null;
+  if (before.length >= policy.collapseMinModels && after.length < Math.ceil(before.length / 2)) {
+    return {
+      removed,
+      rule: "collapse",
+      reason: `candidate coverage collapsed (${after.length}/${before.length})`,
+    };
+  }
+  return null;
+}
+
+/**
+ * The ONE portable, provider-neutral screen for per-model description and
+ * evidence. Applied at BOTH boundaries — before a remote bridge returns a
+ * candidate, and again before core persists or loads one — so a bridge cannot
+ * be used to smuggle unbounded or secret-bearing content past validation.
+ *
+ * Normalizes as it validates: evidence records are re-emitted in canonical
+ * semantic order so array order can never become an identity authority.
+ * Throws {@link CatalogEvidenceError} on any violation; the caller decides
+ * whether that means "refuse the fetch" or "retain the previous generation".
+ */
+export function validateCatalogEvidence(candidate: AdapterCatalogCandidate): void {
+  // Keys, then VALUES, then description/evidence content. Closing only
+  // description/evidence left every other level open, so an undeclared key at
+  // candidate/scope/model/context crossed the bridge and was persisted inside
+  // schema 1; and closing only KEYS still admitted an object where a version
+  // string belongs, a fractional context window, or 5,000 aliases.
+  //
+  // PURE: normalization (sanitized scope, canonical evidence order) belongs to
+  // `normalizeCatalogCandidate`, which both boundaries run first.
+  assertClosedCatalogShape(candidate);
+  assertCatalogValues(candidate);
+  assertCatalogSemantics(candidate);
+  if (!candidate || !Array.isArray(candidate.models)) return;
+  for (const model of candidate.models) {
+    const id = typeof model?.id === "string" ? model.id : "(unknown)";
+    if (model.description !== undefined) assertCatalogDescription(`${id}.description`, model.description);
+    if (model.evidence !== undefined) parseCatalogEvidenceList(`${id}.evidence`, model.evidence);
+  }
+}
+
+/**
+ * Canonical content identity for a candidate. Key-order independent, so a
+ * property reordering cannot masquerade as a new generation, and vice versa.
+ */
+export function catalogContentChecksum(candidate: AdapterCatalogCandidate): string {
+  return createHash("sha256").update(canonicalJson({
+    schemaVersion: candidate.schemaVersion,
+    scope: candidate.scope,
+    models: candidate.models,
+  })).digest("hex");
+}
+
+/**
+ * Identity used to decide whether two reduction observations are "the same".
+ *
+ * Deliberately EXCLUDES volatile observation timestamps (`observedAt`,
+ * `fetchedAt`). Two independent observations of the same reduced catalog differ
+ * only in when they were taken; including those would give them different
+ * fingerprints, so no reduction could ever be confirmed by repetition and the
+ * quarantine would be a permanent block rather than a confirmation gate.
+ */
+export function catalogReductionFingerprint(candidate: AdapterCatalogCandidate): string {
+  return createHash("sha256").update(substantiveJson({
+    schemaVersion: candidate.schemaVersion,
+    scope: candidate.scope,
+    models: candidate.models,
+  })).digest("hex");
+}
+
+/** Stable per-model identity for diffing, independent of key order. */
+export function catalogModelFingerprint(model: CatalogModel): string {
+  return canonicalJson(model);
+}
+
 export function catalogScopeFingerprint(fields: Record<string, string | undefined>): string {
   const canonical = Object.entries(fields)
     .filter((entry): entry is [string, string] => Boolean(entry[1]))
@@ -145,6 +341,8 @@ export interface ManifestCatalogModel {
   modelId: string;
   runtimeId?: string;
   name: string;
+  description?: string;
+  evidence?: ReadonlyArray<CatalogModelEvidence>;
   aliases?: ReadonlyArray<string>;
   contextLimit?: number;
   context?: {
@@ -242,6 +440,8 @@ export function manifestCatalogSource(opts: {
           id: raw.modelId,
           runtimeId: raw.runtimeId ?? raw.modelId,
           displayName: raw.name,
+          ...(raw.description ? { description: raw.description } : {}),
+          ...(raw.evidence?.length ? { evidence: raw.evidence.map((entry) => ({ ...entry })) } : {}),
           aliases: [...(raw.aliases ?? [])],
           default: raw.modelId === opts.defaultModel,
           context: raw.context ?? {
@@ -271,12 +471,12 @@ export function manifestCatalogSource(opts: {
           })),
         };
       });
-      // A configured default alias may intentionally not be listed. Give it a
-      // concrete row so generic validation and selection stay deterministic.
-      if (!normalized.some((model) => model.default) && opts.defaultModel === "default") {
-        const fallback = normalized[0];
-        if (fallback) fallback.default = true;
-      }
+      // Honest defaults (#236): the configured default must resolve to a row
+      // that actually exists, by exact id or by a declared alias. Silently
+      // promoting row zero produced a catalog that claimed a default nobody
+      // chose — a thread would start on whichever model happened to sort
+      // first. Failing candidate construction keeps the previous generation.
+      resolveManifestDefault(normalized, opts.defaultModel);
       return {
         schemaVersion: MODEL_CATALOG_SCHEMA_VERSION,
         scope,
@@ -287,6 +487,42 @@ export function manifestCatalogSource(opts: {
       };
     },
   };
+}
+
+/**
+ * Resolve a configured default to exactly one row and mark it, collision-safely.
+ *
+ * Exact id wins outright. Failing that, a DECLARED alias may resolve it — an
+ * adapter that publishes `{ modelId: "canonical", aliases: ["recommended"] }`
+ * and configures `recommended` means that row. Two rows claiming the same
+ * alias is ambiguous, and guessing which one the operator meant is exactly the
+ * class of silent mis-selection this replaced; it fails instead.
+ */
+export function resolveManifestDefault(
+  models: ReadonlyArray<CatalogModel>,
+  defaultModel: string
+): CatalogModel {
+  const wanted = defaultModel.trim();
+  const known = models.map((model) => model.id).join(", ") || "none";
+  const exact = models.filter((model) => model.id === wanted);
+  if (exact.length === 1) {
+    for (const model of models) model.default = model === exact[0];
+    return exact[0]!;
+  }
+  const byAlias = models.filter((model) => model.aliases.includes(wanted));
+  if (byAlias.length > 1) {
+    throw new Error(
+      `catalog default ${JSON.stringify(wanted)} is ambiguous: declared as an alias by ` +
+        `${byAlias.map((model) => model.id).join(", ")}`
+    );
+  }
+  if (byAlias.length === 1) {
+    for (const model of models) model.default = model === byAlias[0];
+    return byAlias[0]!;
+  }
+  throw new Error(
+    `catalog default ${JSON.stringify(wanted)} does not resolve to a published model row or declared alias (have: ${known})`
+  );
 }
 
 /** Bounded adapter helper; Discord input can never choose the executable or args. */

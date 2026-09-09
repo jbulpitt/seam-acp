@@ -2,7 +2,9 @@
 export { makeMux } from "./mux.js";
 export type { MuxSpawnOpts, MuxChild } from "./mux.js";
 export * from "./agent-profile.js";
+export * from "./catalog-evidence.js";
 export * from "./model-catalog.js";
+export * from "./probe-process.js";
 export * from "./fast-mode.js";
 export * from "./session-manager.js";
 export * from "./attachment-staging.js";

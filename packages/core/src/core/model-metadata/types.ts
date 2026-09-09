@@ -1,3 +1,4 @@
+import type { CatalogModelEvidence } from "@seam/adapters";
 export const DEFAULT_METADATA_BENCHMARK = "artificial_analysis_intelligence_index";
 
 export interface ModelCreator {
@@ -36,6 +37,14 @@ export interface AgentModelAvailability {
   name: string;
   contextWindow: number | null;
   vision: boolean | null;
+  /** Catalog-owned per-model description (#236), carried into the join. */
+  description?: string | null;
+  /**
+   * Catalog-owned structured provenance (#236), in its validated bounded
+   * representation. Carried through the join so metadata consumers can explain
+   * a row without re-deriving it or contacting a provider.
+   */
+  evidence?: ReadonlyArray<CatalogModelEvidence> | null;
 }
 
 export interface CachedAgentModel {
@@ -60,6 +69,13 @@ export interface ModelMetadata {
   benchmarks: Record<string, number>;
   pricing: ModelPricing | null;
   released_at: string | null;
+  /**
+   * Catalog-owned description (#236). The operational catalog is authoritative
+   * for it; the external metadata source never overwrites it.
+   */
+  description: string | null;
+  /** Catalog-owned structured provenance (#236), already validated and bounded. */
+  evidence: CatalogModelEvidence[];
   source: string;
   fetched_at: string;
 }

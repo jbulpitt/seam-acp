@@ -4,6 +4,13 @@ import readline from "node:readline";
 const logPath = process.env.GROK_FAKE_LOG;
 const mode = process.env.GROK_FAKE_MODE ?? "success";
 const argv = process.argv.slice(2);
+if (mode === "hang") setInterval(() => {}, 60_000);
+if (process.env.GROK_FAKE_SIGNAL_LOG) {
+  process.on("SIGTERM", () => {
+    fs.appendFileSync(process.env.GROK_FAKE_SIGNAL_LOG, "SIGTERM\n");
+    process.exit(0);
+  });
+}
 const appendLog = (method) => {
   if (!logPath) return;
   fs.appendFileSync(logPath, JSON.stringify({
@@ -26,12 +33,28 @@ Available models:
 `);
   process.exit(0);
 }
+if (mode === "early-exit") {
+  process.stderr.write(`early failure ${process.env.GROK_FAKE_SECRET ?? ""}\n`);
+  process.exit(7);
+}
 const input = readline.createInterface({ input: process.stdin });
 
 input.on("line", (line) => {
   const request = JSON.parse(line);
   appendLog(request.method);
   if (mode === "hang") return;
+  if (mode === "malformed-protocol") {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: { code: -32600, message: "malformed initialize response" },
+    }) + "\n");
+    return;
+  }
+  if (mode === "stdout-flood") {
+    process.stdout.write("x".repeat(1_100_000));
+    return;
+  }
   if (request.method !== "initialize") {
     process.stdout.write(JSON.stringify({
       jsonrpc: "2.0",

@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
+import { createReadStream, lstatSync, readFileSync } from "node:fs";
 import { readdir, stat, readFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as readline from "node:readline";
@@ -11,7 +11,13 @@ import {
   type Client,
 } from "@agentclientprotocol/sdk";
 import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
-import { manifestCatalogScope, manifestCatalogSource } from "../model-catalog.js";
+import {
+  catalogScopeFingerprint,
+  manifestCatalogSource,
+  type CatalogModelEvidence,
+  type CatalogScope,
+} from "../model-catalog.js";
+import { runBoundedProbe } from "../probe-process.js";
 import type { ContextUsage, ISessionManager, SessionSummary } from "../session-manager.js";
 
 /**
@@ -55,6 +61,12 @@ type DiscoveredModel = {
 
 export type GrokAuthSource = "subscription" | "api-key" | "unknown";
 
+export interface GrokAuthIdentity {
+  source: Exclude<GrokAuthSource, "unknown">;
+  /** One-way semantic identity. Raw account/key material is never returned. */
+  fingerprint: string;
+}
+
 export interface GrokCatalogEffortChoice {
   id: string;
   raw: string;
@@ -71,17 +83,25 @@ export interface GrokCatalogProbeModel {
 }
 
 export interface GrokCatalogProbe {
-  defaultModel: string;
-  models: GrokCatalogProbeModel[];
+  modelState: Pick<GrokCatalogProbeState, "defaultModel" | "models"> | null;
   protocolVersion: string;
   authSource: GrokAuthSource;
+  authIdentity: GrokAuthIdentity;
+}
+
+export interface GrokCatalogProbeState {
+  defaultModel: string;
+  models: GrokCatalogProbeModel[];
 }
 
 export interface GrokModelsProbe {
   defaultModel: string;
   modelIds: string[];
   authSource: GrokAuthSource;
+  authIdentity: GrokAuthIdentity;
 }
+
+type GrokModelsOutput = Omit<GrokModelsProbe, "authIdentity">;
 
 function objectRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -94,7 +114,7 @@ function nonEmptyString(value: unknown): string | null {
 }
 
 /** Grok-specific normalization of initialize `_meta.modelState`. */
-export function parseGrokModelState(raw: unknown): Pick<GrokCatalogProbe, "defaultModel" | "models"> {
+export function parseGrokModelState(raw: unknown): GrokCatalogProbeState {
   const state = objectRecord(raw);
   if (!state) throw new Error("Grok ACP modelState is malformed");
   const defaultModel = nonEmptyString(state.currentModelId);
@@ -168,12 +188,7 @@ export function parseGrokModelState(raw: unknown): Pick<GrokCatalogProbe, "defau
   return { defaultModel, models };
 }
 
-function configuredAuthSource(env: NodeJS.ProcessEnv): GrokAuthSource {
-  return nonEmptyString(env.XAI_API_KEY) ? "api-key" : "subscription";
-}
-
-function initializeAuthSource(raw: unknown, env: NodeJS.ProcessEnv): GrokAuthSource {
-  if (nonEmptyString(env.XAI_API_KEY)) return "api-key";
+function initializeAuthSource(raw: unknown): GrokAuthSource {
   const response = objectRecord(raw);
   const ids = Array.isArray(response?.authMethods)
     ? response.authMethods.flatMap((entry) => {
@@ -184,6 +199,91 @@ function initializeAuthSource(raw: unknown, env: NodeJS.ProcessEnv): GrokAuthSou
   return ids.some((id) => id === "cached_token" || id === "grok.com")
     ? "subscription"
     : "unknown";
+}
+
+function grokHome(env: NodeJS.ProcessEnv): string {
+  const configured = nonEmptyString(env.GROK_HOME);
+  if (configured) return configured;
+  const home = nonEmptyString(env.HOME);
+  if (!home) throw new Error("Grok subscription credential home is not configured");
+  return path.join(home, ".grok");
+}
+
+/**
+ * Derive a stable, non-secret account identity from Grok's cached credential
+ * metadata. The path locates evidence only; neither it nor raw account fields
+ * cross the adapter boundary. Multiple distinct accounts fail closed because
+ * the CLI's active choice would otherwise be ambiguous.
+ */
+export function resolveGrokSubscriptionIdentity(env: NodeJS.ProcessEnv): GrokAuthIdentity {
+  const authPath = path.join(grokHome(env), "auth.json");
+  let raw: unknown;
+  try {
+    const stat = lstatSync(authPath);
+    if (!stat.isFile() || stat.size > 256_000) {
+      throw new Error("credential evidence is not a bounded regular file");
+    }
+    raw = JSON.parse(readFileSync(authPath, "utf8"));
+  } catch {
+    // Do not surface the credential path or parser detail; refresh failures can
+    // be recorded durably by the catalog service.
+    throw new Error("Grok subscription account identity is unavailable");
+  }
+  const root = objectRecord(raw);
+  if (!root) throw new Error("Grok subscription account identity is malformed");
+  const identities = new Set<string>();
+  for (const [recordKey, value] of Object.entries(root)) {
+    const record = objectRecord(value);
+    if (!record) continue;
+    const issuer = nonEmptyString(record.oidc_issuer) ?? nonEmptyString(recordKey.split("::", 1)[0]);
+    const principalId = nonEmptyString(record.principal_id);
+    const userId = nonEmptyString(record.user_id);
+    const teamId = nonEmptyString(record.team_id);
+    if (!issuer || (!principalId && !userId)) continue;
+    identities.add(catalogScopeFingerprint({
+      issuer,
+      principalId: principalId ?? undefined,
+      userId: userId ?? undefined,
+      teamId: teamId ?? undefined,
+    }));
+  }
+  if (identities.size !== 1) {
+    throw new Error(`Grok subscription account identity is ${identities.size ? "ambiguous" : "unavailable"}`);
+  }
+  return { source: "subscription", fingerprint: [...identities][0]! };
+}
+
+function apiKeyIdentity(apiKey: string): GrokAuthIdentity {
+  return {
+    source: "api-key",
+    fingerprint: catalogScopeFingerprint({ provider: "xai", source: "api-key", credential: apiKey }),
+  };
+}
+
+function sameAuthIdentity(left: GrokAuthIdentity, right: GrokAuthIdentity): boolean {
+  return left.source === right.source && left.fingerprint === right.fingerprint;
+}
+
+function grokCatalogScope(identity: GrokAuthIdentity): CatalogScope {
+  return {
+    fingerprint: catalogScopeFingerprint({
+      provider: "xai",
+      authSource: identity.source,
+      accountIdentity: identity.fingerprint,
+    }),
+    provider: "xai",
+    credentialProfile: identity.source === "subscription" ? "subscription-account" : "api-key-account",
+  };
+}
+
+function abortOn(signal: AbortSignal): Promise<never> {
+  return new Promise((_resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("Grok ACP initialize cancelled"));
+      return;
+    }
+    signal.addEventListener("abort", () => reject(new Error("Grok ACP initialize cancelled")), { once: true });
+  });
 }
 
 /**
@@ -197,86 +297,61 @@ export async function probeGrokCatalog(options: {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
-}): Promise<GrokCatalogProbe | null> {
+  signal?: AbortSignal;
+}): Promise<GrokCatalogProbe> {
   const cli = options.cliPath?.trim() || "grok";
   const env = options.env ?? process.env;
   const args = grokAgentArgs(options.baseArgs ?? [], options.defaultModel);
-  const child = spawn(cli, args, {
+  const expectedIdentity = resolveGrokSubscriptionIdentity(env);
+  return runBoundedProbe({
+    executable: cli,
+    args,
     cwd: options.cwd ?? process.cwd(),
     env,
-    stdio: ["pipe", "pipe", "pipe"],
-    detached: true,
-  });
-  let stderr = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk: string) => { stderr = (stderr + chunk).slice(-4000); });
-  let rejectDied: (error: Error) => void = () => undefined;
-  const died = new Promise<never>((_resolve, reject) => { rejectDied = reject; });
-  const onError = (error: Error) => rejectDied(error);
-  const onExit = (code: number | null, signal: NodeJS.Signals | null) => rejectDied(
-    new Error(`Grok ACP exited before initialize (code=${code}, signal=${signal}): ${stderr.trim()}`)
-  );
-  child.once("error", onError);
-  child.once("exit", onExit);
-  let timeout: NodeJS.Timeout | undefined;
-  const timedOut = new Promise<never>((_resolve, reject) => {
-    timeout = setTimeout(
-      () => reject(new Error("Grok ACP initialize timed out")),
-      options.timeoutMs ?? 30_000
-    );
-    timeout.unref?.();
-  });
-  const connection = new ClientSideConnection(
-    () => ({
-      async requestPermission() {
-        return { outcome: { outcome: "cancelled" as const } };
-      },
-      async sessionUpdate() {},
-    } satisfies Client),
-    ndJsonStream(
-      Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
-      Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>
-    )
-  );
-  try {
-    const response = await Promise.race([
-      connection.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
-      }),
-      died,
-      timedOut,
-    ]);
-    const responseRecord = response as unknown as Record<string, unknown>;
-    const meta = objectRecord(responseRecord._meta);
-    if (!("modelState" in (meta ?? {}))) return null;
-    const parsed = parseGrokModelState(meta?.modelState);
-    return {
-      ...parsed,
-      protocolVersion: String(response.protocolVersion),
-      authSource: initializeAuthSource(responseRecord, env),
-    };
-  } finally {
-    if (timeout) clearTimeout(timeout);
-    child.off("error", onError);
-    child.off("exit", onExit);
-    if (child.exitCode === null && child.signalCode === null) {
-      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
-      if (child.kill("SIGKILL")) {
-        let cleanupTimer: NodeJS.Timeout | undefined;
-        const cleanupDeadline = new Promise<void>((resolve) => {
-          cleanupTimer = setTimeout(resolve, 1_000);
-          cleanupTimer.unref?.();
-        });
-        await Promise.race([exited, cleanupDeadline]);
-        if (cleanupTimer) clearTimeout(cleanupTimer);
+    timeoutMs: options.timeoutMs ?? 30_000,
+    ...(options.signal ? { signal: options.signal } : {}),
+    label: "Grok ACP initialize",
+    async run(handle) {
+      const connection = new ClientSideConnection(
+        () => ({
+          async requestPermission() {
+            return { outcome: { outcome: "cancelled" as const } };
+          },
+          async sessionUpdate() {},
+        } satisfies Client),
+        ndJsonStream(
+          Writable.toWeb(handle.stdin) as unknown as WritableStream<Uint8Array>,
+          Readable.toWeb(handle.stdout) as unknown as ReadableStream<Uint8Array>
+        )
+      );
+      // The legacy ACP connection has no public close(); closing its writable
+      // transport rejects pending requests before the shared lifecycle reaps.
+      handle.onClose(() => { handle.stdin.destroy(); }, "connection");
+      const response = await Promise.race([
+        connection.initialize({
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+        }),
+        abortOn(handle.signal),
+      ]);
+      const responseRecord = response as unknown as Record<string, unknown>;
+      const meta = objectRecord(responseRecord._meta);
+      const authSource = initializeAuthSource(responseRecord);
+      if (authSource !== "subscription") {
+        throw new Error(`Grok ACP initialize did not corroborate subscription authentication (${authSource})`);
       }
-    }
-    child.removeAllListeners();
-    child.stdin.destroy();
-    child.stdout.destroy();
-    child.stderr.destroy();
-  }
+      const observedIdentity = resolveGrokSubscriptionIdentity(env);
+      if (!sameAuthIdentity(expectedIdentity, observedIdentity)) {
+        throw new Error("Grok subscription account identity changed during ACP initialize");
+      }
+      return {
+        modelState: "modelState" in (meta ?? {}) ? parseGrokModelState(meta?.modelState) : null,
+        protocolVersion: String(response.protocolVersion),
+        authSource,
+        authIdentity: observedIdentity,
+      };
+    },
+  });
 }
 
 function execGrokBounded(
@@ -300,7 +375,7 @@ function execGrokBounded(
 }
 
 /** Parse the subscription-scoped, human-readable `grok models` output. */
-export function parseGrokModelsOutput(raw: string): GrokModelsProbe {
+export function parseGrokModelsOutput(raw: string): GrokModelsOutput {
   const output = raw.replace(/\u001b\[[0-9;]*m/g, "");
   const defaultModel = output.match(/^Default model:\s*(\S+)\s*$/im)?.[1]?.trim();
   const modelIds: string[] = [];
@@ -323,16 +398,30 @@ export async function probeGrokModels(options: {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  expectedAuthIdentity?: GrokAuthIdentity;
 } = {}): Promise<GrokModelsProbe> {
   const cli = options.cliPath?.trim() || "grok";
+  const env = options.env ?? process.env;
+  const before = resolveGrokSubscriptionIdentity(env);
+  if (options.expectedAuthIdentity && !sameAuthIdentity(options.expectedAuthIdentity, before)) {
+    throw new Error("Grok subscription account identity changed before grok models fallback");
+  }
   const result = await execGrokBounded(
     cli,
     [...(options.baseArgs ?? []), "models"],
-    options.env ?? process.env,
+    env,
     options.cwd ?? process.cwd(),
     options.timeoutMs ?? 15_000
   );
-  return parseGrokModelsOutput(result.stdout || result.stderr);
+  const parsed = parseGrokModelsOutput(result.stdout || result.stderr);
+  if (parsed.authSource !== "subscription") {
+    throw new Error(`grok models did not corroborate subscription authentication (${parsed.authSource})`);
+  }
+  const after = resolveGrokSubscriptionIdentity(env);
+  if (!sameAuthIdentity(before, after)) {
+    throw new Error("Grok subscription account identity changed during grok models fallback");
+  }
+  return { ...parsed, authIdentity: after };
 }
 
 function grokAgentArgs(baseArgs: ReadonlyArray<string>, model?: string, effort?: string): string[] {
@@ -439,42 +528,59 @@ export function makeGrokProfile(opts: {
   discoverModels?: () => Promise<ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>>;
   /** Subscription ACP/CLI by default; API discovery requires an explicit mode. */
   catalogMode?: "subscription" | "api-key";
+  /** Required only for explicit API-key catalog/runtime mode. */
+  apiKey?: string;
   /** Test/embedding seam; production initializes the configured ACP runtime. */
-  catalogProbe?: () => Promise<GrokCatalogProbe | null>;
+  catalogProbe?: () => Promise<GrokCatalogProbe>;
   /** Test/embedding seam for the same-account `grok models` fallback. */
   modelsProbe?: () => Promise<GrokModelsProbe>;
   /** Test/embedding seam for CLI provenance. */
   cliVersionProbe?: () => Promise<string | undefined>;
+  /** Test/embedding seam for semantic credential identity. */
+  authIdentityProbe?: () => GrokAuthIdentity;
   /** Override the effort descriptor. Defaults to spawnArgs + the CLI levels. */
   effort?: AgentProfile["effort"];
   /** Custom environment variables to inject into the spawned process. */
   extraEnv?: Record<string, string | undefined>;
+  /** Complete inherited environment; production defaults to process.env. */
+  baseEnv?: NodeJS.ProcessEnv;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "grok";
   const baseArgs = [...(opts.baseArgs ?? [])];
   const runtimeCwd = opts.cwd ?? process.cwd();
   const catalogMode = opts.catalogMode ?? "subscription";
+  const apiKey = nonEmptyString(opts.apiKey);
+  if (catalogMode === "api-key" && !apiKey) {
+    throw new Error("explicit Grok API-key mode requires an API key");
+  }
   const catalogEffort = opts.effort ?? {
     mechanism: "spawnArgs" as const,
     levels: ["low", "medium", "high", "xhigh", "max"],
   };
   const profileEnvironment = (): NodeJS.ProcessEnv => {
-    const env: NodeJS.ProcessEnv = { ...process.env };
+    const env: NodeJS.ProcessEnv = { ...(opts.baseEnv ?? process.env) };
     if (opts.extraEnv) {
       for (const [key, value] of Object.entries(opts.extraEnv)) {
         if (value === undefined) delete env[key];
         else env[key] = value;
       }
     }
+    // Source mode is an explicit authority. A legacy ambient/configured key
+    // must never silently replace the cached subscription that ACP sessions use.
+    if (catalogMode === "subscription") delete env.XAI_API_KEY;
+    else env.XAI_API_KEY = apiKey!;
     return env;
   };
-  const env = profileEnvironment();
-  const authProfile = configuredAuthSource(env);
-  const grokHome = nonEmptyString(env.GROK_HOME)
-    ?? (nonEmptyString(env.HOME) ? path.join(env.HOME!, ".grok") : "default");
-  const scopeOptions = {
-    provider: "xai",
-    credentialProfile: `${authProfile}:${grokHome}`,
+  const currentAuthIdentity = (): GrokAuthIdentity => {
+    const identity = opts.authIdentityProbe
+      ? opts.authIdentityProbe()
+      : catalogMode === "api-key"
+        ? apiKeyIdentity(apiKey!)
+        : resolveGrokSubscriptionIdentity(profileEnvironment());
+    if (identity.source !== catalogMode || !/^[a-f0-9]{64}$/.test(identity.fingerprint)) {
+      throw new Error("Grok credential identity does not match the configured source mode");
+    }
+    return identity;
   };
 
   return asLocalAdapter({
@@ -482,15 +588,31 @@ export function makeGrokProfile(opts: {
     displayName: opts.displayName ?? "Grok Build",
     defaultModel: opts.defaultModel,
     catalog: {
-      scope: () => manifestCatalogScope(scopeOptions),
+      scope: () => grokCatalogScope(currentAuthIdentity()),
       async fetch() {
+        const expectedIdentity = currentAuthIdentity();
+        const scope = grokCatalogScope(expectedIdentity);
+        const fetchedAt = new Date().toISOString();
+        const cliVersion = opts.cliVersionProbe
+          ? await opts.cliVersionProbe()
+          : (await execGrokBounded(
+              cli,
+              [...baseArgs, "--version"],
+              profileEnvironment(),
+              runtimeCwd,
+              5_000
+            ).then(({ stdout, stderr }) => (stdout || stderr).trim().split(/\r?\n/, 1)[0]?.slice(0, 256))
+              .catch(() => undefined));
+        if (!cliVersion) throw new Error("Grok CLI version probe failed");
         let source: string;
         let sourceVersion: string;
         let defaultModel: string;
         let models: Array<{
           modelId: string;
           name: string;
+          description?: string;
           contextLimit?: number;
+          evidence?: ReadonlyArray<CatalogModelEvidence>;
           effort: {
             mechanism: "spawnArgs" | "none";
             choices: ReadonlyArray<string | { id: string; raw?: string }>;
@@ -498,21 +620,38 @@ export function makeGrokProfile(opts: {
           };
         }>;
         if (catalogMode === "api-key") {
-          if (!nonEmptyString(profileEnvironment().XAI_API_KEY)) {
-            throw new Error("explicit Grok API catalog mode requires XAI_API_KEY");
-          }
-          if (!opts.discoverModels) {
-            throw new Error("explicit Grok API catalog mode requires an API discovery source");
-          }
-          const discovered = await opts.discoverModels();
+          const discovered = opts.discoverModels
+            ? await opts.discoverModels()
+            : await fetchXaiModels(apiKey!);
           if (!discovered.length) throw new Error("xAI API catalog discovery returned no text models");
           source = "xai-models-api";
-          sourceVersion = "xai-v1/models; auth=api-key";
-          defaultModel = discovered.some((model) => model.modelId === opts.defaultModel)
-            ? opts.defaultModel
-            : discovered[0]!.modelId;
+          sourceVersion = "xai-v1/models auth api-key";
+          defaultModel = opts.defaultModel;
           models = discovered.map((model) => ({
             ...model,
+            evidence: [
+              {
+                kind: "live-observation",
+                source: "xai-models-api",
+                runtimeVersion: cliVersion,
+                adapterVersion: AGENT_ADAPTER_VERSION,
+                scopeRef: scope.fingerprint,
+                resolvedModel: model.modelId,
+              },
+              ...(model.contextLimit ? [{
+                kind: "verified-record" as const,
+                source: "grok-context-metadata",
+                adapterVersion: AGENT_ADAPTER_VERSION,
+                scopeRef: scope.fingerprint,
+                resolvedModel: model.modelId,
+                context: {
+                  native: model.contextLimit,
+                  maximum: model.contextLimit,
+                  effective: model.contextLimit,
+                  method: "exact model id",
+                },
+              }] : []),
+            ],
             effort: {
               mechanism: catalogEffort.mechanism === "spawnArgs" ? "spawnArgs" : "none",
               choices: catalogEffort.levels.length ? catalogEffort.levels : ["default"],
@@ -520,7 +659,7 @@ export function makeGrokProfile(opts: {
             },
           }));
         } else {
-          const acp = opts.catalogProbe
+          const initialized = opts.catalogProbe
             ? await opts.catalogProbe()
             : await probeGrokCatalog({
                 cliPath: cli,
@@ -529,14 +668,41 @@ export function makeGrokProfile(opts: {
                 cwd: runtimeCwd,
                 env: profileEnvironment(),
               });
-          if (acp) {
+          if (!sameAuthIdentity(expectedIdentity, initialized.authIdentity)) {
+            throw new Error("Grok ACP catalog authentication does not match the configured subscription account");
+          }
+          if (initialized.authSource !== "subscription") {
+            throw new Error(`Grok ACP catalog did not use subscription authentication (${initialized.authSource})`);
+          }
+          if (initialized.modelState) {
+            const acp = initialized.modelState;
             source = "grok-acp-model-state";
-            sourceVersion = `acp/${acp.protocolVersion}; auth=${acp.authSource}`;
+            sourceVersion = `acp/${initialized.protocolVersion} auth subscription`;
             defaultModel = acp.defaultModel;
             models = acp.models.map((model) => ({
               modelId: model.modelId,
               name: model.name,
+              ...(model.description ? { description: model.description } : {}),
               contextLimit: model.contextLimit,
+              evidence: [{
+                kind: "live-observation",
+                source: "grok-acp-model-state",
+                runtimeVersion: cliVersion,
+                adapterVersion: AGENT_ADAPTER_VERSION,
+                scopeRef: scope.fingerprint,
+                resolvedModel: model.modelId,
+                context: {
+                  native: model.contextLimit,
+                  maximum: model.contextLimit,
+                  effective: model.contextLimit,
+                  method: "ACP initialize modelState",
+                },
+                ...(model.effortChoices.length ? { effort: {
+                  choices: model.effortChoices.map((choice) => choice.id),
+                  selectionDefault: model.effortDefault,
+                  method: "ACP initialize modelState",
+                } } : {}),
+              }],
               effort: model.effortChoices.length
                 ? {
                     mechanism: "spawnArgs",
@@ -553,19 +719,60 @@ export function makeGrokProfile(opts: {
                   baseArgs,
                   cwd: runtimeCwd,
                   env: profileEnvironment(),
+                  expectedAuthIdentity: initialized.authIdentity,
                 });
+            if (command.authSource !== "subscription" ||
+                !sameAuthIdentity(initialized.authIdentity, command.authIdentity)) {
+              throw new Error("grok models fallback did not use the same subscription account as ACP initialize");
+            }
             const configured = new Map((opts.staticModels ?? []).map((model) => [model.modelId, model]));
             source = "grok-models-cli";
-            sourceVersion = `grok-models; auth=${command.authSource}`;
+            sourceVersion = "grok-models auth subscription";
             defaultModel = command.defaultModel;
             models = command.modelIds.map((modelId) => {
               const known = configured.get(modelId);
+              const contextLimit = known?.contextLimit ?? KNOWN_CONTEXT_WINDOWS[modelId];
               return {
                 modelId,
                 name: known?.name ?? modelLabel(modelId),
-                ...(known?.contextLimit ?? KNOWN_CONTEXT_WINDOWS[modelId]
-                  ? { contextLimit: known?.contextLimit ?? KNOWN_CONTEXT_WINDOWS[modelId] }
-                  : {}),
+                ...(contextLimit ? { contextLimit } : {}),
+                evidence: [
+                  {
+                    kind: "live-observation",
+                    source: "grok-models-cli",
+                    runtimeVersion: cliVersion,
+                    adapterVersion: AGENT_ADAPTER_VERSION,
+                    scopeRef: scope.fingerprint,
+                    resolvedModel: modelId,
+                  },
+                  ...(contextLimit ? [{
+                    kind: known?.contextLimit ? "declared-manifest" as const : "verified-record" as const,
+                    source: known?.contextLimit ? "grok-configured-model" : "grok-context-metadata",
+                    adapterVersion: AGENT_ADAPTER_VERSION,
+                    scopeRef: scope.fingerprint,
+                    resolvedModel: modelId,
+                    context: {
+                      native: contextLimit,
+                      maximum: contextLimit,
+                      effective: contextLimit,
+                      method: "exact model id",
+                    },
+                  }] : []),
+                  {
+                    kind: "declared-manifest",
+                    source: "grok-runtime-config",
+                    adapterVersion: AGENT_ADAPTER_VERSION,
+                    scopeRef: scope.fingerprint,
+                    resolvedModel: modelId,
+                    effort: {
+                      choices: catalogEffort.levels.length
+                        ? ["default", ...catalogEffort.levels.filter((level) => level !== "default")]
+                        : ["default"],
+                      selectionDefault: "default",
+                      method: "configured spawn arguments",
+                    },
+                  },
+                ],
                 effort: {
                   mechanism: catalogEffort.mechanism === "spawnArgs" ? "spawnArgs" : "none",
                   choices: catalogEffort.levels.length ? catalogEffort.levels : ["default"],
@@ -576,24 +783,17 @@ export function makeGrokProfile(opts: {
           }
         }
         const candidate = await manifestCatalogSource({
-          ...scopeOptions,
+          provider: "xai",
+          credentialProfile: scope.credentialProfile,
           defaultModel,
           models: () => models,
           adapterVersion: AGENT_ADAPTER_VERSION,
           applicationMode: "freshSession",
           source,
         }).fetch();
-        candidate.cliVersion = opts.cliVersionProbe
-          ? await opts.cliVersionProbe()
-          : (await execGrokBounded(
-              cli,
-              [...baseArgs, "--version"],
-              profileEnvironment(),
-              runtimeCwd,
-              5_000
-            ).then(({ stdout, stderr }) => (stdout || stderr).trim().split(/\r?\n/, 1)[0]?.slice(0, 256))
-              .catch(() => undefined));
-        if (!candidate.cliVersion) throw new Error("Grok CLI version probe failed");
+        candidate.scope = scope;
+        candidate.fetchedAt = fetchedAt;
+        candidate.cliVersion = cliVersion;
         candidate.sourceVersion = sourceVersion;
         return candidate;
       },

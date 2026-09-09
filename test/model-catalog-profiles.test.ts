@@ -163,7 +163,7 @@ describe("production adapter catalog sources", () => {
       staticModels: [{ modelId: "grok-static", name: "Grok Static" }],
       discoverModels: discover,
       catalogMode: "api-key",
-      extraEnv: { XAI_API_KEY: "test-only" },
+      apiKey: "test-only",
       cliVersionProbe: async () => "grok test",
     });
     expect(discover).not.toHaveBeenCalled();

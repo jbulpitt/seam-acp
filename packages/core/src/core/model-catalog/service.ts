@@ -10,12 +10,16 @@ import type {
 import { decodeCatalogSelection, encodeCatalogSelection } from "@seam/adapters";
 import {
   assessCatalogReduction,
-  CATALOG_EVIDENCE_MAX_RECORDS,
-  CATALOG_EVIDENCE_TEXT_MAX,
+  catalogContentChecksum,
+  catalogModelFingerprint,
+  catalogReductionFingerprint,
   DEFAULT_CATALOG_REDUCTION_POLICY,
   MODEL_CATALOG_MIN_SUPPORTED_SCHEMA_VERSION,
   MODEL_CATALOG_SCHEMA_VERSION,
+  parseCatalogEvidenceList,
+  assertCatalogDescription,
   upgradeCatalogCandidate,
+  validateCatalogEvidence,
   type CatalogReductionPolicy,
 } from "@seam/adapters";
 import type { Logger } from "../../lib/logger.js";
@@ -36,6 +40,8 @@ export interface CatalogRefreshOptions {
    * without permanently disarming the protection.
    */
   acceptReduction?: boolean;
+  /** Operator identity recorded on an accepted reduction, for the audit trail. */
+  actor?: string;
 }
 
 /** Why a candidate was held back, surfaced to status and manual refresh. */
@@ -61,8 +67,12 @@ export interface CatalogRefreshResult {
   cliVersion?: string;
   sourceVersion?: string;
   error?: string;
-  /** Present when a reduction was assessed and held. */
+  /** Present when a reduction was assessed (held, or accepted by an operator). */
   reduction?: CatalogReductionReport;
+  /** True only when an operator explicitly bypassed a reduction quarantine. */
+  acceptedReduction?: true;
+  /** Who accepted it, for the audit trail. */
+  acceptedBy?: string;
 }
 
 export interface CatalogLookup {
@@ -292,11 +302,19 @@ export class ModelCatalogService {
     const base = { binding, previousGeneration: prior?.generation ?? null, generation: prior?.generation ?? null, added: 0, removed: 0, changed: 0 };
     if (this.options.isOnline && !this.options.isOnline(binding)) {
       const error = "host offline; previous snapshot retained";
+      // An unavailable host is NOT an independent confirming observation.
+      // Without this, quarantine -> offline -> identical candidate published
+      // immediately, defeating the whole confirmation gate.
+      this.clearReductionConfirmation(key);
       this.options.store.recordAttempt({ bindingKey: key, attemptedAt, result: "unavailable", error, source: null, candidateChecksum: null });
       return { ...base, ok: Boolean(prior), result: "unavailable", error };
     }
     try {
       const { candidate, fetchedBy } = await this.fetchCandidate(binding);
+      // The portable screen runs again here: a candidate may have arrived over
+      // the bridge, and a remote host is not a trust boundary we defer past.
+      // It also normalizes evidence into canonical order before checksumming.
+      validateCatalogEvidence(candidate);
       validateCandidate(candidate);
       const checksum = candidateChecksum(candidate);
       const desiredScope = trustworthyFingerprint(candidate.scope.fingerprint)
@@ -337,6 +355,9 @@ export class ModelCatalogService {
           this.options.store.recordObservation(observation);
           this.observations.set(key, observation);
         }
+        // A drift quarantine is not an independent confirming observation of a
+        // reduction either.
+        this.clearReductionConfirmation(key);
         this.options.store.recordAttempt({ bindingKey: key, attemptedAt, result: "quarantined", error: drift, source: candidate.source, candidateChecksum: checksum });
         return {
           ...base,
@@ -363,11 +384,26 @@ export class ModelCatalogService {
         candidate.models,
         this.reductionPolicy
       );
-      if (reduction && !accepted) {
-        const priorConfirmation =
-          this.reductionConfirmations.get(key) ?? this.options.store.getRefreshStatus(key)?.candidateChecksum;
-        if (priorConfirmation !== checksum) {
-          this.reductionConfirmations.set(key, checksum);
+      let acceptedReduction: CatalogReductionReport | undefined;
+      if (reduction) {
+        // Confirmation identity EXCLUDES volatile observation timestamps, so
+        // two independent sightings of the same reduced catalog match. A plain
+        // checksum never would: `observedAt`/`fetchedAt` move every fetch.
+        const fingerprint = catalogReductionFingerprint(candidate);
+        const priorGeneration = priorForScope?.generation ?? 0;
+        if (accepted) {
+          acceptedReduction = { ...reduction, confirmationRequired: false };
+          this.clearReductionConfirmation(key);
+        } else if (!this.matchesReductionQuarantine(key, {
+          scopeKey, priorGeneration, rule: reduction.rule, removed: reduction.removed, fingerprint,
+        })) {
+          // Typed state, not a bare checksum: only a PRIOR reduction quarantine
+          // of the SAME reduction against the SAME prior generation may confirm.
+          this.reductionConfirmations.set(key, fingerprint);
+          this.options.store.recordReductionQuarantine({
+            bindingKey: key, scopeKey, priorGeneration, rule: reduction.rule,
+            removed: reduction.removed, fingerprint, observedAt: attemptedAt,
+          });
           const error =
             `${reduction.reason}; quarantined pending confirmation — ` +
             `repeat an identical refresh to confirm, or accept it explicitly ` +
@@ -376,7 +412,7 @@ export class ModelCatalogService {
           return { ...base, ...diff, ok: false, result: "quarantined", source: candidate.source, scope: scopeKey, fetchedAt: candidate.fetchedAt, cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion, error, reduction: { ...reduction, confirmationRequired: true } };
         }
       }
-      this.reductionConfirmations.delete(key);
+      this.clearReductionConfirmation(key);
       const observation: CatalogObservationRow = {
         bindingKey: key, agentId: binding.agentId, location: binding.location,
         scopeKey, checksum, adapterVersion: candidate.adapterVersion,
@@ -393,7 +429,16 @@ export class ModelCatalogService {
         return { ...base, ok: !drift, result: "unchanged", source: candidate.source, scope: scopeKey, generation: priorForScope.generation, fetchedAt: candidate.fetchedAt, cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion, ...(drift ? { error: drift } : {}) };
       }
       const snapshot = this.options.store.publish({ scopeKey, checksum, candidate, publishedAt: attemptedAt, observation });
-      this.options.store.recordAttempt({ bindingKey: key, attemptedAt, result: "published", error: drift, source: candidate.source, candidateChecksum: checksum });
+      // #236: an operator-accepted reduction is durably distinguishable from an
+      // ordinary publication, so an audit can tell a bypass from a normal one.
+      this.options.store.recordAttempt({
+        bindingKey: key, attemptedAt,
+        result: acceptedReduction ? "published-accepted-reduction" : "published",
+        error: acceptedReduction
+          ? `operator accepted reduction${opts.actor ? ` by ${opts.actor}` : ""}: ${acceptedReduction.reason}`
+          : drift,
+        source: candidate.source, candidateChecksum: checksum,
+      });
       this.snapshots.set(scopeKey, deepFreeze(snapshot));
       this.observations.set(key, observation);
       for (const listener of this.publicationListeners) {
@@ -404,18 +449,60 @@ export class ModelCatalogService {
         }
       }
       this.options.logger.info({ binding: key, scopeKey, generation: snapshot.generation, ...diff, drift }, "model catalog published");
-      return { ...base, ...diff, ok: !drift, result: "published", source: candidate.source, scope: scopeKey, generation: snapshot.generation, fetchedAt: candidate.fetchedAt, cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion, ...(drift ? { error: drift } : {}) };
+      return {
+        ...base, ...diff, ok: !drift, result: "published", source: candidate.source, scope: scopeKey,
+        generation: snapshot.generation, fetchedAt: candidate.fetchedAt,
+        cliVersion: candidate.cliVersion, sourceVersion: candidate.sourceVersion,
+        ...(acceptedReduction
+          ? {
+              reduction: acceptedReduction,
+              acceptedReduction: true as const,
+              ...(opts.actor ? { acceptedBy: opts.actor } : {}),
+            }
+          : {}),
+        ...(drift ? { error: drift } : {}),
+      };
     } catch (caught) {
       const error = caught instanceof Error ? caught.message : String(caught);
       // A failed observation is NOT a confirmation. Clearing here is what makes
       // "quarantine → transient failure → same reduced candidate" require two
       // fresh identical observations again rather than sliding through on the
       // strength of one earlier sighting.
-      this.reductionConfirmations.delete(key);
+      this.clearReductionConfirmation(key);
       this.options.store.recordAttempt({ bindingKey: key, attemptedAt, result: "retained", error, source: null, candidateChecksum: null });
       this.options.logger.warn({ err: caught, binding: key }, "model catalog refresh failed; previous snapshot retained");
       return { ...base, ok: false, result: "retained", error };
     }
+  }
+
+  /**
+   * A stored quarantine confirms a candidate only when EVERY dimension matches:
+   * same scope, same prior generation, same rule, same removed set, same
+   * substantive fingerprint. A bare checksum comparison (the previous shape)
+   * would let an unrelated attempt's recorded checksum act as a confirmation.
+   */
+  private matchesReductionQuarantine(
+    key: string,
+    want: { scopeKey: string; priorGeneration: number; rule: string; removed: string[]; fingerprint: string }
+  ): boolean {
+    const inMemory = this.reductionConfirmations.get(key);
+    const stored = this.options.store.getReductionQuarantine(key);
+    if (!stored) return false;
+    return (
+      stored.fingerprint === want.fingerprint &&
+      stored.scopeKey === want.scopeKey &&
+      stored.priorGeneration === want.priorGeneration &&
+      stored.rule === want.rule &&
+      stored.removed.length === want.removed.length &&
+      stored.removed.every((id, index) => id === want.removed[index]) &&
+      (inMemory === undefined || inMemory === want.fingerprint)
+    );
+  }
+
+  /** Called on EVERY non-qualifying attempt: offline, drift, failure, different. */
+  private clearReductionConfirmation(key: string): void {
+    this.reductionConfirmations.delete(key);
+    this.options.store.clearReductionQuarantine(key);
   }
 
   private async fetchCandidate(binding: CatalogBinding): Promise<FetchedCatalogCandidate> {
@@ -492,9 +579,7 @@ export function validateCandidate(candidate: AdapterCatalogCandidate): void {
     if (typeof model.default !== "boolean" || !Array.isArray(model.aliases) || model.aliases.some((alias) => typeof alias !== "string")) {
       throw new Error(`malformed aliases for ${model.id}`);
     }
-    if (model.description !== undefined && !isBoundedText(model.description)) {
-      throw new Error(`malformed description for ${model.id}`);
-    }
+    if (model.description !== undefined) assertCatalogDescription(`${model.id}.description`, model.description);
     validateEvidence(model.id, model.evidence);
     ids.add(model.id);
     for (const name of [model.id, ...model.aliases]) {
@@ -556,75 +641,14 @@ export function validateCandidate(candidate: AdapterCatalogCandidate): void {
   if (defaults !== 1) throw new Error(`catalog requires exactly one default model (found ${defaults})`);
 }
 
-const EVIDENCE_KINDS = ["live-observation", "verified-record", "declared-manifest", "enrichment"];
-
-function isBoundedText(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= CATALOG_EVIDENCE_TEXT_MAX;
-}
-
-function optionalBoundedText(value: unknown): boolean {
-  return value === undefined || isBoundedText(value);
-}
-
 /**
- * Generic evidence validation (#236). Core checks SHAPE only — it never reads a
- * provider's model names or interprets what a record means.
- *
- * Known fields are strict (malformed evidence fails closed and the prior
- * generation is retained); unknown fields are tolerated so a snapshot written
- * by a newer build round-trips without corruption. Every text field is
- * length-bounded and the field set is closed, which is the structural reason a
- * record cannot carry a raw environment, credential, token, or PII.
+ * Per-model description/evidence validation delegates to the ONE portable
+ * parser in adapters (#236), so core, the bridge boundary, and any future
+ * consumer cannot drift into three slightly different screens.
  */
 function validateEvidence(modelId: string, evidence: unknown): void {
   if (evidence === undefined) return;
-  const malformed = (detail: string): never => {
-    throw new Error(`malformed evidence for ${modelId}: ${detail}`);
-  };
-  if (!Array.isArray(evidence)) malformed("expected an array");
-  const records = evidence as unknown[];
-  if (records.length > CATALOG_EVIDENCE_MAX_RECORDS) {
-    malformed(`more than ${CATALOG_EVIDENCE_MAX_RECORDS} records`);
-  }
-  for (const entry of records) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) malformed("record is not an object");
-    const record = entry as Record<string, unknown>;
-    if (typeof record.kind !== "string" || !EVIDENCE_KINDS.includes(record.kind)) {
-      malformed(`unknown evidence kind ${JSON.stringify(record.kind)}`);
-    }
-    if (!isBoundedText(record.source)) malformed("source must be bounded non-empty text");
-    for (const field of ["observedAt", "runtimeVersion", "scopeRef", "resolvedModel", "note"] as const) {
-      if (!optionalBoundedText(record[field])) malformed(`${field} must be bounded text`);
-    }
-    if (record.observedAt !== undefined && !Number.isFinite(Date.parse(String(record.observedAt)))) {
-      malformed("observedAt must be a timestamp");
-    }
-    if (
-      record.adapterVersion !== undefined &&
-      (!Number.isInteger(record.adapterVersion) || (record.adapterVersion as number) < 1)
-    ) {
-      malformed("adapterVersion must be a positive integer");
-    }
-    if (record.context !== undefined) {
-      const context = record.context as Record<string, unknown>;
-      if (!context || typeof context !== "object" || Array.isArray(context)) malformed("context must be an object");
-      for (const field of ["native", "maximum", "effective"] as const) {
-        const value = context[field];
-        if (value === undefined || value === null) continue;
-        if (!Number.isFinite(value) || (value as number) <= 0) malformed(`context.${field} must be a positive number`);
-      }
-      if (!optionalBoundedText(context.method)) malformed("context.method must be bounded text");
-    }
-    if (record.effort !== undefined) {
-      const effort = record.effort as Record<string, unknown>;
-      if (!effort || typeof effort !== "object" || Array.isArray(effort)) malformed("effort must be an object");
-      if (effort.choices !== undefined && !validStringList(effort.choices, false)) {
-        malformed("effort.choices must be unique non-empty strings");
-      }
-      if (!optionalBoundedText(effort.selectionDefault)) malformed("effort.selectionDefault must be bounded text");
-      if (!optionalBoundedText(effort.method)) malformed("effort.method must be bounded text");
-    }
-  }
+  parseCatalogEvidenceList(`${modelId}.evidence`, evidence);
 }
 
 function validStringList(value: unknown, requireNonEmpty: boolean): value is string[] {
@@ -634,16 +658,14 @@ function validStringList(value: unknown, requireNonEmpty: boolean): value is str
 }
 
 function trustworthyFingerprint(value: string): boolean { return /^[a-f0-9]{64}$/.test(value); }
+/** Canonical, key-order-independent content identity (#236). */
 function candidateChecksum(candidate: AdapterCatalogCandidate): string {
-  return createHash("sha256").update(JSON.stringify({
-    schemaVersion: candidate.schemaVersion,
-    scope: candidate.scope,
-    models: candidate.models,
-  })).digest("hex");
+  return catalogContentChecksum(candidate);
 }
 function diffModels(before: ReadonlyArray<CatalogModel>, after: ReadonlyArray<CatalogModel>): { added: number; removed: number; changed: number } {
-  const a = new Map(before.map((model) => [model.id, JSON.stringify(model)]));
-  const b = new Map(after.map((model) => [model.id, JSON.stringify(model)]));
+  // Canonical per-model identity: a property reordering is not a change.
+  const a = new Map(before.map((model) => [model.id, catalogModelFingerprint(model)]));
+  const b = new Map(after.map((model) => [model.id, catalogModelFingerprint(model)]));
   return {
     added: [...b.keys()].filter((id) => !a.has(id)).length,
     removed: [...a.keys()].filter((id) => !b.has(id)).length,

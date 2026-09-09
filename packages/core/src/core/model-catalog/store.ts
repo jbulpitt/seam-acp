@@ -33,6 +33,18 @@ export interface CatalogRefreshStatusRow {
   candidateChecksum: string | null;
 }
 
+export interface CatalogReductionQuarantineRow {
+  bindingKey: string;
+  scopeKey: string;
+  /** The generation the reduction was assessed AGAINST. */
+  priorGeneration: number;
+  rule: string;
+  removed: string[];
+  /** Substantive fingerprint, excluding volatile observation timestamps. */
+  fingerprint: string;
+  observedAt: string;
+}
+
 export class ModelCatalogStore {
   private readonly db: Database.Database;
 
@@ -73,6 +85,20 @@ export class ModelCatalogStore {
         error TEXT,
         source TEXT,
         candidate_checksum TEXT
+      );
+      -- #236: typed reduction-confirmation state. Deliberately its own table
+      -- rather than reusing refresh_status.candidate_checksum, which is written
+      -- by every attempt of any kind: a confirmation must only ever be honoured
+      -- when the PREVIOUS attempt was a reduction quarantine of the SAME
+      -- reduction against the SAME prior generation.
+      CREATE TABLE IF NOT EXISTS model_catalog_reduction_quarantine (
+        binding_key TEXT PRIMARY KEY,
+        scope_key TEXT NOT NULL,
+        prior_generation INTEGER NOT NULL,
+        rule TEXT NOT NULL,
+        removed_json TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        observed_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_model_catalog_generations_scope
         ON model_catalog_generations(scope_key, generation DESC);
@@ -177,6 +203,45 @@ export class ModelCatalogStore {
         source_version=excluded.source_version, source=excluded.source,
         fetched_at=excluded.fetched_at, drift=excluded.drift
     `).run(row);
+  }
+
+  /** The reduction quarantine a confirmation must match, if any. */
+  getReductionQuarantine(bindingKey: string): CatalogReductionQuarantineRow | null {
+    const row = this.db
+      .prepare("SELECT * FROM model_catalog_reduction_quarantine WHERE binding_key = ?")
+      .get(bindingKey) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    let removed: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(String(row.removed_json));
+      if (Array.isArray(parsed)) removed = parsed.map(String);
+    } catch { return null; }
+    return {
+      bindingKey: String(row.binding_key),
+      scopeKey: String(row.scope_key),
+      priorGeneration: Number(row.prior_generation),
+      rule: String(row.rule),
+      removed,
+      fingerprint: String(row.fingerprint),
+      observedAt: String(row.observed_at),
+    };
+  }
+
+  recordReductionQuarantine(row: CatalogReductionQuarantineRow): void {
+    this.db.prepare(`
+      INSERT INTO model_catalog_reduction_quarantine(
+        binding_key, scope_key, prior_generation, rule, removed_json, fingerprint, observed_at
+      ) VALUES (@bindingKey, @scopeKey, @priorGeneration, @rule, @removedJson, @fingerprint, @observedAt)
+      ON CONFLICT(binding_key) DO UPDATE SET
+        scope_key=excluded.scope_key, prior_generation=excluded.prior_generation,
+        rule=excluded.rule, removed_json=excluded.removed_json,
+        fingerprint=excluded.fingerprint, observed_at=excluded.observed_at
+    `).run({ ...row, removedJson: JSON.stringify(row.removed) });
+  }
+
+  /** Called on EVERY attempt that is not an identical repeat of the quarantine. */
+  clearReductionQuarantine(bindingKey: string): void {
+    this.db.prepare("DELETE FROM model_catalog_reduction_quarantine WHERE binding_key = ?").run(bindingKey);
   }
 
   recordAttempt(row: CatalogRefreshStatusRow): void {

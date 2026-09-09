@@ -479,6 +479,8 @@ async function main(): Promise<void> {
       name: model.displayName,
       contextWindow: model.context.effective,
       vision: model.modalities.input.includes("image"),
+      // #236: carry the catalog's own per-model description into the join.
+      ...(model.description ? { description: model.description } : {}),
     })),
   });
   const modelValueManager = new ModelValueManager({

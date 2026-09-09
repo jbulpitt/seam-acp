@@ -136,16 +136,16 @@ describe("#236 per-model description and structured evidence", () => {
         evidence: [{ ...evidence(), ...over } as CatalogModelEvidence],
       })]));
     expect(bad({ kind: "invented-kind" })).toThrow(/unknown evidence kind/);
-    expect(bad({ source: "" })).toThrow(/source must be bounded/);
-    expect(bad({ observedAt: "not-a-time" })).toThrow(/observedAt must be a timestamp/);
+    expect(bad({ source: "" })).toThrow(/must not be empty/);
+    expect(bad({ observedAt: "not-a-time" })).toThrow(/observedAt: must be an ISO-8601 timestamp/);
     expect(bad({ adapterVersion: 0 })).toThrow(/adapterVersion/);
     expect(bad({ context: { native: -5 } })).toThrow(/context.native/);
     expect(bad({ effort: { choices: ["a", "a"] } })).toThrow(/effort.choices/);
-    expect(bad({ note: "x".repeat(CATALOG_EVIDENCE_TEXT_MAX + 1) })).toThrow(/note must be bounded/);
+    expect(bad({ note: "x".repeat(CATALOG_EVIDENCE_TEXT_MAX + 1) })).toThrow(/exceeds \d+ characters/);
     expect(() => validateCandidate(candidate([model("nebula", {
       default: true,
       evidence: Array.from({ length: CATALOG_EVIDENCE_MAX_RECORDS + 1 }, () => evidence()),
-    })]))).toThrow(/more than/);
+    })]))).toThrow(/exceeds 8 records/);
   });
 
   it("bounds every text field, so no record can carry an environment dump", () => {
@@ -162,12 +162,88 @@ describe("#236 per-model description and structured evidence", () => {
     }
   });
 
-  it("tolerates unknown future evidence fields without corrupting the row", () => {
-    const forward = model("nebula", {
-      default: true,
-      evidence: [{ ...evidence(), somethingNewInV2: { nested: true } } as unknown as CatalogModelEvidence],
+  it("REJECTS unknown and nested-unknown evidence keys (exact-key closure)", () => {
+    // Tolerating unknown keys defeated the closed shape: a 50KB payload rode
+    // through validation inside a key nobody declared.
+    const withUnknown = (evidenceOver: Record<string, unknown>) =>
+      () => validateCandidate(candidate([model("nebula", {
+        default: true,
+        evidence: [{ ...evidence(), ...evidenceOver } as unknown as CatalogModelEvidence],
+      })]));
+    expect(withUnknown({ somethingNewInV2: { nested: true } })).toThrow(/unknown key/);
+    expect(withUnknown({ payload: "QA_SECRET=secret-value".repeat(2000) })).toThrow(/unknown key/);
+    expect(withUnknown({ context: { native: 10, sneaky: "x" } })).toThrow(/context.sneaky: unknown key/);
+    expect(withUnknown({ effort: { choices: ["a"], sneaky: "x" } })).toThrow(/effort.sneaky: unknown key/);
+  });
+
+  it("rejects secrets, PII, and secret-bearing paths regardless of length", () => {
+    // Length is not sanitization: a short token fits every bound.
+    const withNote = (note: string) =>
+      () => validateCandidate(candidate([model("nebula", {
+        default: true,
+        evidence: [{ ...evidence(), note } as CatalogModelEvidence],
+      })]));
+    expect(withNote("QA_SECRET=hunter2000")).toThrow(/rejected content/);
+    expect(withNote("token is sk-live_abcdefghijklmnop")).toThrow(/rejected content/);
+    expect(withNote("contact jesse@example.com")).toThrow(/rejected content/);
+    expect(withNote("see /home/ubuntu/.claude/.credentials.json")).toThrow(/rejected content/);
+    expect(withNote("bearer abcdefghijklmno")).toThrow(/rejected content/);
+    expect(withNote("read the api_key from settings")).toThrow(/rejected content/);
+    // A legitimate operational note still passes.
+    expect(withNote("verified against the runbook probe")).not.toThrow();
+  });
+
+  it("bounds list sizes and item sizes inside evidence", () => {
+    const withEffort = (effortValue: unknown) =>
+      () => validateCandidate(candidate([model("nebula", {
+        default: true,
+        evidence: [{ ...evidence(), effort: effortValue } as CatalogModelEvidence],
+      })]));
+    expect(withEffort({ choices: Array.from({ length: 25 }, (_, i) => `e${i}`) })).toThrow(/exceeds 24 entries/);
+    expect(withEffort({ choices: ["x".repeat(65)] })).toThrow(/exceeds 64 characters/);
+    expect(withEffort({ choices: ["low"], selectionDefault: "high" }))
+      .toThrow(/selectionDefault is not among choices/);
+  });
+
+  it("rejects semantically inconsistent context evidence", () => {
+    const withContext = (context: unknown) =>
+      () => validateCandidate(candidate([model("nebula", {
+        default: true,
+        evidence: [{ ...evidence(), context } as CatalogModelEvidence],
+      })]));
+    expect(withContext({ native: 2_000_000, maximum: 1_000_000 })).toThrow(/native exceeds maximum/);
+    expect(withContext({ effective: 2_000_000, maximum: 1_000_000 })).toThrow(/effective exceeds maximum/);
+    expect(withContext({ native: 1_000_000, maximum: 1_000_000 })).not.toThrow();
+  });
+
+  it("requires scopeRef to be a fingerprint or a bounded sanitized identifier", () => {
+    const withScope = (scopeRef: string) =>
+      () => validateCandidate(candidate([model("nebula", {
+        default: true,
+        evidence: [{ ...evidence(), scopeRef } as CatalogModelEvidence],
+      })]));
+    expect(withScope(SCOPE.fingerprint)).not.toThrow();
+    expect(withScope("work-account")).not.toThrow();
+    expect(withScope("/home/ubuntu/.claude")).toThrow(/scope fingerprint or a bounded sanitized identifier/);
+    expect(withScope("x".repeat(65))).toThrow(/scope fingerprint or a bounded sanitized identifier/);
+  });
+
+  it("is order-insensitive: reordering keys or evidence is not a change", async () => {
+    const { store } = db();
+    const binding = { agentId: "fake", location: "local" };
+    const a = evidence({ kind: "live-observation", source: "probe-a" });
+    const b = evidence({ kind: "verified-record", source: "probe-b" });
+    let rows = [model("nebula", { default: true, description: "d", evidence: [a, b] })];
+    const service = new ModelCatalogService({
+      store, logger, bindings: () => [binding], scope: () => SCOPE, fetch: async () => candidate(rows),
     });
-    expect(() => validateCandidate(candidate([forward]))).not.toThrow();
+    expect((await service.refresh(binding)).generation).toBe(1);
+    // Same content, different evidence order and different key insertion order.
+    rows = [model("nebula", { evidence: [b, a], description: "d", default: true })];
+    const second = await service.refresh(binding);
+    expect(second.result).toBe("unchanged");
+    expect(second.generation).toBe(1);
+    store.close();
   });
 
   it("includes description and evidence in checksum and diff detection", () => {
@@ -464,8 +540,14 @@ describe("#236 small-catalog reduction policy", () => {
     expect(assessCatalogReduction(ids(["a"]), ids(["a", "b"]))).toBeNull();
     expect(assessCatalogReduction(ids(["a", "b"]), ids(["a", "b"]))).toBeNull();
     expect(assessCatalogReduction([], ids(["a"]))).toBeNull();
-    // A same-size swap keeps coverage and is not the shape of a partial fetch.
-    expect(assessCatalogReduction(ids(["a", "b"]), ids(["a", "c"]))).toBeNull();
+    // A same-size replacement in a SMALL catalog is still a removal, and is
+    // indistinguishable from a partial fetch that substituted a placeholder.
+    expect(assessCatalogReduction(ids(["a", "b"]), ids(["a", "c"]))?.rule).toBe("small-catalog");
+    expect(assessCatalogReduction(ids(["a", "b"]), ids(["a", "c"]))?.removed).toEqual(["b"]);
+    expect(assessCatalogReduction(ids(["a", "b", "c"]), ids(["a", "b", "d"]))?.rule).toBe("small-catalog");
+    // Above the small-catalog threshold the proportional rule governs, so a
+    // same-size swap in a large catalog still publishes.
+    expect(assessCatalogReduction(ids(["a", "b", "c", "d"]), ids(["a", "b", "c", "e"]))).toBeNull();
     // Large catalogs keep the proportional rule.
     expect(assessCatalogReduction(ids(["a", "b", "c", "d"]), ids(["a"]))?.rule).toBe("collapse");
     expect(assessCatalogReduction(ids(["a", "b", "c", "d"]), ids(["a", "b", "c"]))).toBeNull();
@@ -594,6 +676,340 @@ describe("#236 small-catalog reduction policy", () => {
     expect(grown.result).toBe("published");
     expect(grown.added).toBe(1);
     expect(grown.removed).toBe(0);
+    store.close();
+  });
+});
+
+describe("#236 confirmation is consecutive-safe across every attempt kind", () => {
+  const reduced = () => [model("nebula", { default: true })];
+  const full = () => [model("nebula", { default: true }), model("quasar")];
+
+  it("quarantine -> offline -> identical candidate quarantines AGAIN, never publishes", async () => {
+    const { store } = db();
+    const binding = { agentId: "fake", location: "local" };
+    let rows = full();
+    let online = true;
+    const service = new ModelCatalogService({
+      store, logger, bindings: () => [binding], scope: () => SCOPE,
+      isOnline: () => online,
+      fetch: async () => candidate(rows),
+    });
+    await service.refresh(binding);
+    rows = reduced();
+    const sequence: string[] = [];
+    sequence.push((await service.refresh(binding)).result);
+    online = false;
+    sequence.push((await service.refresh(binding)).result);
+    online = true;
+    sequence.push((await service.refresh(binding)).result);
+    // The exact reproduction that failed before: an intervening unavailable
+    // observation must NOT count as the independent confirmation.
+    expect(sequence).toEqual(["quarantined", "unavailable", "quarantined"]);
+    expect((await service.refresh(binding)).result).toBe("published");
+    store.close();
+  });
+
+  it("does not accept a stored refresh checksum that was never a reduction quarantine", async () => {
+    const { store } = db();
+    const binding = { agentId: "fake", location: "local" };
+    let rows = full();
+    const service = new ModelCatalogService({
+      store, logger, bindings: () => [binding], scope: () => SCOPE, fetch: async () => candidate(rows),
+    });
+    await service.refresh(binding);
+    // A plain successful attempt records a candidate checksum; it must not be
+    // mistakable for a reduction confirmation.
+    expect(store.getReductionQuarantine("fake@local")).toBeNull();
+    rows = reduced();
+    expect((await service.refresh(binding)).result).toBe("quarantined");
+    const stored = store.getReductionQuarantine("fake@local");
+    expect(stored).toMatchObject({ rule: "small-catalog", removed: ["quasar"], priorGeneration: 1 });
+    store.close();
+  });
+
+  it("survives a restart: the confirmation is durable, typed, and generation-tied", async () => {
+    const { file, store } = db();
+    const binding = { agentId: "fake", location: "local" };
+    let rows = full();
+    const first = new ModelCatalogService({
+      store, logger, bindings: () => [binding], scope: () => SCOPE, fetch: async () => candidate(rows),
+    });
+    await first.refresh(binding);
+    rows = reduced();
+    expect((await first.refresh(binding)).result).toBe("quarantined");
+    store.close();
+
+    const reopened = new ModelCatalogStore(file);
+    const second = new ModelCatalogService({
+      store: reopened, logger, bindings: () => [binding], scope: () => SCOPE, fetch: async () => candidate(reduced()),
+    });
+    expect((await second.refresh(binding)).result).toBe("published");
+    reopened.close();
+  });
+
+  it("uses a substantive fingerprint, so a new observedAt still confirms", async () => {
+    const { store } = db();
+    const binding = { agentId: "fake", location: "local" };
+    let stamp = "2026-09-09T00:00:00.000Z";
+    let rows = full();
+    const service = new ModelCatalogService({
+      store, logger, bindings: () => [binding], scope: () => SCOPE,
+      fetch: async () => candidate(
+        rows.map((row) => ({ ...row, evidence: [evidence({ observedAt: stamp })] })),
+        { fetchedAt: stamp }
+      ),
+    });
+    await service.refresh(binding);
+    rows = reduced();
+    stamp = "2026-09-09T01:00:00.000Z";
+    expect((await service.refresh(binding)).result).toBe("quarantined");
+    // A NEW observation of the same reduced catalog: only the timestamps moved.
+    stamp = "2026-09-09T02:00:00.000Z";
+    expect((await service.refresh(binding)).result).toBe("published");
+    store.close();
+  });
+});
+
+describe("#236 portable validation runs before bridge transport", () => {
+  const hostile = (over: Record<string, unknown>) => candidate([model("nebula", {
+    default: true,
+    evidence: [{ kind: "live-observation", source: "probe", ...over } as unknown as CatalogModelEvidence],
+  })]);
+
+  const adapterFor = (built: AdapterCatalogCandidate) => ({
+    catalog: { scope: () => SCOPE, fetch: async () => built },
+  } as unknown as Parameters<typeof invokeAdapterRpc>[2]["adapter"]);
+
+  it("refuses to TRANSPORT unknown keys, secrets, or oversized evidence", async () => {
+    for (const bad of [
+      { unknownKey: "x".repeat(50_000) },
+      { note: "QA_SECRET=secret-value" },
+      { note: "reach me at jesse@example.com" },
+      { scopeRef: "/home/ubuntu/.claude/.credentials.json" },
+      { effort: { choices: Array.from({ length: 40 }, (_, i) => `e${i}`) } },
+      { context: { native: 9, maximum: 5 } },
+    ]) {
+      await expect(
+        invokeAdapterRpc("fetchModelCatalog", {}, { adapter: adapterFor(hostile(bad)), workspaceRoot: "/tmp" })
+      ).rejects.toThrow(/evidence /);
+    }
+  });
+
+  it("normalizes evidence order before it crosses the bridge", async () => {
+    const a = evidence({ kind: "verified-record", source: "zeta" });
+    const b = evidence({ kind: "live-observation", source: "alpha" });
+    const built = candidate([model("nebula", { default: true, evidence: [a, b] })]);
+    const returned = await invokeAdapterRpc(
+      "fetchModelCatalog", {}, { adapter: adapterFor(built), workspaceRoot: "/tmp" }
+    ) as AdapterCatalogCandidate;
+    // Semantic order, so array order can never become an identity authority.
+    expect(returned.models[0]!.evidence!.map((r) => r.kind)).toEqual(["live-observation", "verified-record"]);
+  });
+});
+
+describe("#236 configured defaults resolve by id or declared alias, collision-safely", () => {
+  const build = (models: Array<{ modelId: string; name: string; aliases?: string[] }>, defaultModel: string) =>
+    manifestCatalogSource({
+      provider: "architectural-outlier",
+      defaultModel,
+      models: () => models,
+      adapterVersion: 1,
+    }).fetch();
+
+  it("resolves a default that names a row's DECLARED alias", async () => {
+    const built = await build(
+      [{ modelId: "canonical", name: "Canonical", aliases: ["recommended"] }, { modelId: "other", name: "Other" }],
+      "recommended"
+    );
+    validateCandidate(built);
+    expect(built.models.filter((m) => m.default).map((m) => m.id)).toEqual(["canonical"]);
+  });
+
+  it("refuses an ambiguous alias claimed by two rows", async () => {
+    await expect(build(
+      [
+        { modelId: "one", name: "One", aliases: ["shared"] },
+        { modelId: "two", name: "Two", aliases: ["shared"] },
+      ],
+      "shared"
+    )).rejects.toThrow(/ambiguous/);
+  });
+
+  it("prefers an exact id over another row's alias of the same name", async () => {
+    const built = await build(
+      [
+        { modelId: "recommended", name: "Literal" },
+        { modelId: "canonical", name: "Canonical", aliases: ["recommended"] },
+      ],
+      "recommended"
+    );
+    // An exact id is unambiguous even when a peer declares it as an alias, so
+    // this must not be reported as a collision.
+    expect(built.models.filter((m) => m.default).map((m) => m.id)).toEqual(["recommended"]);
+  });
+
+  it("removes the remote row-zero fallback entirely", async () => {
+    const { asRemoteCatalogAdapter } = await import("@seam/adapters");
+    const noDefault = candidate([model("nebula"), model("quasar")]);
+    expect(() => asRemoteCatalogAdapter("remote-agent", noDefault))
+      .toThrow(/exactly one default model \(found 0 of 2\)/);
+    const twoDefaults = candidate([model("nebula", { default: true }), model("quasar", { default: true })]);
+    expect(() => asRemoteCatalogAdapter("remote-agent", twoDefaults))
+      .toThrow(/exactly one default model \(found 2 of 2\)/);
+    // A well-formed remote catalog still builds.
+    expect(asRemoteCatalogAdapter("remote-agent", candidate([model("nebula", { default: true })])).id)
+      .toBe("remote-agent");
+  });
+});
+
+describe("#236 description/evidence reach real production output paths", () => {
+  const described = () => model("nebula", {
+    default: true,
+    description: "The outlier flagship.",
+    evidence: [evidence({
+      kind: "verified-record",
+      source: "operator-verification",
+      resolvedModel: "vendor::nebula@2026",
+      note: "proven out of band",
+    })],
+  });
+
+  /** A real service over real SQLite with a real published generation. */
+  async function publishedService(binding: { agentId: string; location: string }) {
+    const { store } = db();
+    const service = new ModelCatalogService({
+      store, logger, bindings: () => [binding], scope: () => SCOPE,
+      fetch: async () => candidate([described()]),
+    });
+    await service.refresh(binding);
+    return { store, service };
+  }
+
+  it("SessionRouter.describeConfig exposes the selected model's provenance", async () => {
+    const { SessionRouter } = await import("../packages/core/src/core/session-router.js");
+    const binding = { agentId: "fake", location: "local" };
+    const { store, service } = await publishedService(binding);
+    const router = new SessionRouter({
+      logger,
+      store: {
+        readConfig: () => ({ model: "nebula", agentId: "fake" }),
+      } as never,
+      profiles: [{ id: "fake", defaultModel: "nebula", effort: { mechanism: "none", levels: [] } }] as never,
+      config: { REPOS_ROOT: "/repo", channelPresets: {}, threadPresets: {} } as never,
+      modelCatalog: service as never,
+    } as never);
+    const d = router.describeConfig({
+      id: "discord:t1", platform: "discord", channelRef: "t1", parentRef: "c1",
+      agentId: "fake", acpSessionId: "", repoPath: "/repo",
+      configJson: JSON.stringify({ model: "nebula" }),
+      createdUtc: "2026-09-09T00:00:00Z", updatedUtc: "2026-09-09T00:00:00Z",
+    } as never);
+    // This is the production inspection object MCP / status / audit all read.
+    expect(d.catalog.model).toMatchObject({
+      id: "nebula",
+      description: "The outlier flagship.",
+    });
+    expect(d.catalog.model?.evidence?.[0]).toMatchObject({
+      kind: "verified-record",
+      resolvedModel: "vendor::nebula@2026",
+    });
+    store.close();
+  });
+
+  it("MCP config_describe RENDERS the provenance (production output, not a projection)", async () => {
+    const { SeamMcpServer } = await import("../packages/core/src/core/mcp/seam-mcp-server.js");
+    const record = {
+      id: "discord:t1", platform: "discord", channelRef: "t1", parentRef: "c1",
+      agentId: "fake", acpSessionId: "", repoPath: "/repo", configJson: "{}",
+      createdUtc: "2026-09-09T00:00:00Z", updatedUtc: "2026-09-09T00:00:00Z",
+    };
+    const server = new SeamMcpServer({
+      logger,
+      resolveSession: (token: string) => (token === "tok" ? record : undefined),
+      enqueueDispatch: async () => {},
+      describeConfig: () => ({
+        sessionId: "discord:t1", channelRef: "t1", parentRef: "c1",
+        agent: { value: "fake", source: "default" },
+        model: { value: "nebula", source: "default" },
+        effort: { value: "default", source: "default" },
+        cwd: { value: "/repo", source: "default" },
+        permission: { value: "ask", source: "default" },
+        locked: false,
+        detached: { value: false, source: "default" },
+        tts: { value: false, source: "default" },
+        ttsVoice: { value: null, source: "default" },
+        ttsPace: { value: "natural", source: "default" },
+        ttsStyle: { value: "neutral", source: "default" },
+        location: { value: "local", source: "default" },
+        catalog: {
+          state: "ready", generation: 1, source: "fake-adapter-probe",
+          fetchedAt: "2026-09-09T00:00:00.000Z",
+          model: {
+            id: "nebula",
+            description: "The outlier flagship.",
+            evidence: described().evidence!,
+          },
+        },
+      }),
+    } as never);
+    await server.start();
+    const res = await fetch(`http://127.0.0.1:${server.port}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-seam-session": "tok" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "config_describe", arguments: {} },
+      }),
+    });
+    const body = (await res.json()) as { result: { content: Array<{ text: string }> } };
+    const text = body.result.content[0]!.text;
+    expect(text).toContain("model info: nebula — The outlier flagship.");
+    expect(text).toContain("verified-record via operator-verification");
+    expect(text).toContain("resolved vendor::nebula@2026");
+    expect(text).toContain("proven out of band");
+    await server.stop();
+  });
+
+  it("the metadata join carries the catalog description into real snapshot rows", async () => {
+    const { buildModelMetadataSnapshot } = await import("../packages/core/src/core/model-metadata/catalog.js");
+    const binding = { agentId: "fake", location: "local" };
+    const { store, service } = await publishedService(binding);
+    // The exact production projection from packages/core/src/index.ts.
+    const catalogRows = service.availableModels().map(({ binding: b, model: m }) => ({
+      agentId: b.agentId,
+      modelId: m.id,
+      name: m.displayName,
+      contextWindow: m.context.effective,
+      vision: m.modalities.input.includes("image"),
+      ...(m.description ? { description: m.description } : {}),
+    }));
+    const snapshot = buildModelMetadataSnapshot({
+      catalog: catalogRows,
+      sourceModels: [],
+      source: "test",
+      fetchedAt: "2026-09-09T00:00:00.000Z",
+    });
+    expect(snapshot.rows[0]).toMatchObject({ id: "nebula", description: "The outlier flagship." });
+    store.close();
+  });
+
+  it("keeps those reads cache-only — no fetch is triggered by inspection", async () => {
+    const binding = { agentId: "fake", location: "local" };
+    const { store } = db();
+    let fetches = 0;
+    const service = new ModelCatalogService({
+      store, logger, bindings: () => [binding], scope: () => SCOPE,
+      fetch: async () => { fetches += 1; return candidate([described()]); },
+    });
+    await service.refresh(binding);
+    expect(fetches).toBe(1);
+    for (let i = 0; i < 5; i++) {
+      service.lookup(binding);
+      service.models(binding);
+      service.model(binding, "nebula");
+      service.availableModels();
+    }
+    expect(fetches).toBe(1);
     store.close();
   });
 });

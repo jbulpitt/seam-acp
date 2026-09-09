@@ -36,6 +36,8 @@ export interface AgentModelAvailability {
   name: string;
   contextWindow: number | null;
   vision: boolean | null;
+  /** Catalog-owned per-model description (#236), carried into the join. */
+  description?: string | null;
 }
 
 export interface CachedAgentModel {
@@ -60,6 +62,11 @@ export interface ModelMetadata {
   benchmarks: Record<string, number>;
   pricing: ModelPricing | null;
   released_at: string | null;
+  /**
+   * Catalog-owned description (#236). The operational catalog is authoritative
+   * for it; the external metadata source never overwrites it.
+   */
+  description: string | null;
   source: string;
   fetched_at: string;
 }

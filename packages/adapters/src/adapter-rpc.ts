@@ -7,6 +7,7 @@
  * slot path (remote: rpc spawn after mux.spawn; local: unbound profile.spawn).
  */
 import { isAdapterRpcMethod } from "./command-bus.js";
+import { validateCatalogEvidence } from "./model-catalog.js";
 import { scanWorkspaces } from "./workspace-scan.js";
 import { readAttachmentWithinRoot } from "./read-attachment.js";
 import type { AgentAdapter } from "./agent-profile.js";
@@ -58,6 +59,12 @@ export async function invokeAdapterRpc(
       if (!adapter) throw new Error("no adapter for fetchModelCatalog");
       {
         const candidate = await adapter.catalog.fetch();
+        // #236: the portable generic screen runs BEFORE the candidate crosses
+        // the bridge, not only when core persists it. A remote host is not a
+        // trust boundary we can defer past — unbounded or secret-bearing
+        // evidence must never be transported in the first place. Core applies
+        // the same validator again on receipt.
+        validateCatalogEvidence(candidate);
         adapter.catalog.validate?.(candidate);
         return candidate;
       }

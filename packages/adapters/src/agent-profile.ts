@@ -379,8 +379,17 @@ export function asRemoteCatalogAdapter(
   id: string,
   candidate: AdapterCatalogCandidate
 ): AgentAdapter {
-  const defaultModel = candidate.models.find((model) => model.default) ?? candidate.models[0];
-  if (!defaultModel) throw new Error(`remote catalog for ${id} has no models`);
+  // #236: NO list-order fallback. A remote candidate that declares no default
+  // is not a catalog we can silently pick a default for — taking models[0]
+  // rewrote the agent's identity to whichever row sorted first. Fail closed;
+  // the service retains the previous generation.
+  const defaults = candidate.models.filter((model) => model.default);
+  if (defaults.length !== 1) {
+    throw new Error(
+      `remote catalog for ${id} must declare exactly one default model (found ${defaults.length} of ${candidate.models.length})`
+    );
+  }
+  const defaultModel = defaults[0]!;
   return asLocalAdapter({
     id,
     displayName: id,

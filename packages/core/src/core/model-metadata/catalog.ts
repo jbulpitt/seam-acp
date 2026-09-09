@@ -62,6 +62,9 @@ export function buildModelMetadataSnapshot(input: {
       benchmarks: source?.benchmarks ?? {},
       pricing: source?.pricing ?? null,
       released_at: source?.releaseDate ?? null,
+      // The catalog owns this: prefer any published description over nothing,
+      // and never let the external source overwrite an operational one.
+      description: availability.find((row) => row.description)?.description ?? null,
       source: input.source,
       fetched_at: input.fetchedAt,
     } satisfies ModelMetadata;

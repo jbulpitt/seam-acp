@@ -15,8 +15,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  ProbeCancelledError,
-  ProbeTimeoutError,
+  ProbeError,
   runBoundedProbe,
   PROBE_STDERR_CAPTURE_BYTES,
 } from "@seam/adapters";
@@ -78,15 +77,17 @@ describe("#236 bounded probe lifecycle", () => {
       timeoutMs: 5_000,
       run: async (handle) => {
         pid = handle.pid;
-        handle.onClose(() => { closed.push("session"); });
-        handle.onClose(() => { closed.push("connection"); });
+        // Registered connection-FIRST on purpose: order must come from the
+        // declared phase, not from when the provider happened to register.
+        handle.onClose(() => { closed.push("connection"); }, "connection");
+        handle.onClose(() => { closed.push("session"); }, "session");
         return "collected";
       },
     });
     expect(value).toBe("collected");
-    // Close steps run in reverse registration order — a connection is torn
-    // down after the session that rides on it.
-    expect(closed).toEqual(["connection", "session"]);
+    // A session is closed politely while its transport is still up, so every
+    // session step runs before every connection step.
+    expect(closed).toEqual(["session", "connection"]);
     await settle();
     expect(gone(pid)).toBe(true);
   });
@@ -134,7 +135,7 @@ describe("#236 bounded probe lifecycle", () => {
         timeoutMs: 2_000,
         run: async () => "unreachable",
       })
-    ).rejects.toThrow(/ENOENT|could not spawn|process error/);
+    ).rejects.toMatchObject({ code: "spawn_failed" });
     try {
       await runBoundedProbe({
         executable: path.join(dir, "does-not-exist"),
@@ -165,7 +166,7 @@ describe("#236 bounded probe lifecycle", () => {
           return "unreachable";
         },
       })
-    ).rejects.toThrow(/refused to start/);
+    ).rejects.toMatchObject({ code: "exited_early" });
     await settle();
     expect(gone(pid)).toBe(true);
   });
@@ -186,7 +187,7 @@ describe("#236 bounded probe lifecycle", () => {
           throw new Error("malformed provider output");
         },
       })
-    ).rejects.toThrow(/malformed provider output/);
+    ).rejects.toMatchObject({ code: "protocol_error" });
     expect(closed).toBe(true);
     await settle();
     expect(gone(pid)).toBe(true);
@@ -209,7 +210,7 @@ describe("#236 bounded probe lifecycle", () => {
           return new Promise<string>(() => {});
         },
       })
-    ).rejects.toThrow(ProbeTimeoutError);
+    ).rejects.toMatchObject({ code: "timeout" });
     expect(Date.now() - started).toBeGreaterThanOrEqual(150);
     expect(closed).toBe(true);
     await settle();
@@ -227,7 +228,7 @@ describe("#236 bounded probe lifecycle", () => {
         signal: pre.signal,
         run: async () => "unreachable",
       })
-    ).rejects.toThrow(ProbeCancelledError);
+    ).rejects.toMatchObject({ code: "cancelled" });
 
     const mid = new AbortController();
     let pid: number | undefined;
@@ -246,17 +247,20 @@ describe("#236 bounded probe lifecycle", () => {
     });
     await settle();
     mid.abort();
-    await expect(running).rejects.toThrow(ProbeCancelledError);
+    await expect(running).rejects.toMatchObject({ code: "cancelled" });
     expect(closed).toBe(true);
     await settle();
     expect(gone(pid)).toBe(true);
   });
 
-  it("bounds captured stderr instead of buffering without limit", async () => {
+  it("keeps only a bounded tail of stderr", async () => {
     const noisy = path.join(dir, "noisy.mjs");
+    // Distinct, non-secret-shaped lines: a run of identical characters would be
+    // redacted as one opaque blob and prove nothing about the bound.
     fs.writeFileSync(
       noisy,
-      `process.stderr.write("x".repeat(200000));\nsetInterval(() => {}, 1 << 30);\n`
+      `for (let i = 0; i < 800; i++) process.stderr.write("warn line " + i + "\\n");\n` +
+      `setInterval(() => {}, 1 << 30);\n`
     );
     let tail = "";
     await runBoundedProbe({
@@ -264,8 +268,6 @@ describe("#236 bounded probe lifecycle", () => {
       args: [noisy],
       timeoutMs: 10_000,
       run: async (handle) => {
-        // Poll rather than sleep a fixed interval: under a loaded full-suite
-        // run the child may not have flushed 200KB in any fixed window.
         const until = Date.now() + 8_000;
         while (Date.now() < until) {
           tail = handle.stderrTail();
@@ -275,8 +277,197 @@ describe("#236 bounded probe lifecycle", () => {
         return null;
       },
     });
-    // 200KB written, at most the capture window retained.
     expect(tail.length).toBe(PROBE_STDERR_CAPTURE_BYTES);
+  });
+
+  it("fails and kills on a 2MB stdout flood instead of buffering it", async () => {
+    const flood = path.join(dir, "flood.mjs");
+    fs.writeFileSync(
+      flood,
+      `const chunk = "d".repeat(64 * 1024);\n` +
+      `for (let i = 0; i < 32; i++) process.stdout.write(chunk);\n` +
+      `setInterval(() => {}, 1 << 30);\n`
+    );
+    let pid: number | undefined;
+    let closed = false;
+    await expect(
+      runBoundedProbe({
+        executable: process.execPath,
+        args: [flood],
+        timeoutMs: 10_000,
+        maxStdoutBytes: 256_000,
+        label: "outlier",
+        run: async (handle) => {
+          pid = handle.pid;
+          handle.onClose(() => { closed = true; }, "session");
+          // A collector that never reads must still be protected: the ceiling
+          // is enforced at the boundary, not by the consumer.
+          return new Promise<string>(() => {});
+        },
+      })
+    ).rejects.toMatchObject({ code: "output_overflow" });
+    expect(closed).toBe(true);
+    await settle();
+    expect(gone(pid)).toBe(true);
+  });
+
+  it("fails and kills on a stderr flood", async () => {
+    const flood = path.join(dir, "flood-err.mjs");
+    fs.writeFileSync(
+      flood,
+      `const chunk = "e".repeat(64 * 1024);\n` +
+      `for (let i = 0; i < 32; i++) process.stderr.write(chunk);\n` +
+      `setInterval(() => {}, 1 << 30);\n`
+    );
+    let pid: number | undefined;
+    await expect(
+      runBoundedProbe({
+        executable: process.execPath,
+        args: [flood],
+        timeoutMs: 10_000,
+        maxStderrBytes: 128_000,
+        run: async (handle) => {
+          pid = handle.pid;
+          return new Promise<string>(() => {});
+        },
+      })
+    ).rejects.toMatchObject({ code: "output_overflow" });
+    await settle();
+    expect(gone(pid)).toBe(true);
+  });
+
+
+  it("HOSTILE: a child echoing its own env never leaks it into a diagnostic", async () => {
+    const leaky = path.join(dir, "leaky.mjs");
+    fs.writeFileSync(
+      leaky,
+      `process.stderr.write("dumping env: SUPER_SECRET_TOKEN=" + process.env.SUPER_SECRET_TOKEN + "\\n");\n` +
+      `process.stderr.write("also sk-live_abcdefghijklmnop and jesse@example.com\\n");\n` +
+      `process.exit(7);\n`
+    );
+    let seen = "";
+    await expect(
+      runBoundedProbe({
+        executable: process.execPath,
+        args: [leaky],
+        env: { ...process.env, SUPER_SECRET_TOKEN: "s3cr3t-value-abc" },
+        timeoutMs: 5_000,
+        run: async (handle) => {
+          await handle.exited.catch((err: Error) => { seen = String(err); throw err; });
+          return "unreachable";
+        },
+      })
+    ).rejects.toMatchObject({ code: "exited_early" });
+    // Neither the supplied env value, nor credential-shaped content the helper
+    // never saw in the env, may survive into anything renderable or durable.
+    for (const text of [seen]) {
+      expect(text).not.toContain("s3cr3t-value-abc");
+      expect(text).not.toContain("sk-live_abcdefghijklmnop");
+      expect(text).not.toContain("jesse@example.com");
+      expect(text).toContain("[redacted]");
+    }
+  });
+
+  it("runs a LATE close registration instead of dropping it", async () => {
+    // A connection that finishes constructing after the deadline used to
+    // register its close into an already-drained list and leak the session.
+    let lateClosed = false;
+    await expect(
+      runBoundedProbe({
+        executable: process.execPath,
+        args: [CHILD],
+        env: env("silent"),
+        timeoutMs: 150,
+        killGraceMs: 200,
+        run: async (handle) => {
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          handle.onClose(() => { lateClosed = true; }, "session");
+          return "late";
+        },
+      })
+    ).rejects.toMatchObject({ code: "timeout" });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(lateClosed).toBe(true);
+  });
+
+  it("aborts handle.signal so provider async work is cancelled too", async () => {
+    let aborted = false;
+    await expect(
+      runBoundedProbe({
+        executable: process.execPath,
+        args: [CHILD],
+        env: env("silent"),
+        timeoutMs: 150,
+        run: async (handle) => {
+          handle.signal.addEventListener("abort", () => { aborted = true; });
+          return new Promise<string>(() => {});
+        },
+      })
+    ).rejects.toMatchObject({ code: "timeout" });
+    expect(aborted).toBe(true);
+  });
+
+  it("removes every listener and timer it added", async () => {
+    // A leaked 'data'/'exit' listener or abort subscription per refresh is how
+    // a long-lived process turns a scheduled catalog job into a memory leak.
+    const outer = new AbortController();
+    let added = 0;
+    let removed = 0;
+    const realAdd = outer.signal.addEventListener.bind(outer.signal);
+    const realRemove = outer.signal.removeEventListener.bind(outer.signal);
+    Object.defineProperty(outer.signal, "addEventListener", {
+      configurable: true,
+      value: (...args: Parameters<typeof realAdd>) => { added += 1; return realAdd(...args); },
+    });
+    Object.defineProperty(outer.signal, "removeEventListener", {
+      configurable: true,
+      value: (...args: Parameters<typeof realRemove>) => { removed += 1; return realRemove(...args); },
+    });
+
+    let childListeners = 0;
+    await runBoundedProbe({
+      executable: process.execPath,
+      args: [CHILD],
+      env: env("ready"),
+      timeoutMs: 5_000,
+      signal: outer.signal,
+      run: async (handle) => {
+        await ready(handle.stdout);
+        return null;
+      },
+    });
+    expect(added).toBeGreaterThan(0);
+    // Every abort subscription this probe made was torn down again.
+    expect(removed).toBe(added);
+
+    // And nothing accumulates across repeated probes on the same controller.
+    for (let i = 0; i < 3; i++) {
+      await runBoundedProbe({
+        executable: process.execPath,
+        args: [CHILD],
+        env: env("ready"),
+        timeoutMs: 5_000,
+        signal: outer.signal,
+        run: async () => { childListeners += 1; return null; },
+      });
+    }
+    expect(childListeners).toBe(3);
+    expect(removed).toBe(added);
+    expect(outer.signal.aborted).toBe(false);
+  });
+
+  it("reports not_reaped rather than claiming a clean exit", async () => {
+    // Proven at the seam: a child the helper cannot observe exiting must not
+    // return as though the host were left clean.
+    const { terminate } = await import("@seam/adapters");
+    const stubborn = {
+      pid: 999_999,
+      exitCode: null,
+      signalCode: null,
+      once: () => stubborn,
+      kill: () => true,
+    } as unknown as Parameters<typeof terminate>[0];
+    expect(await terminate(stubborn, 50)).toBe(false);
   });
 
   it("does not let a wedged close step keep the process alive", async () => {

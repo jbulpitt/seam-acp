@@ -422,17 +422,17 @@ describe("ModelCatalogService", () => {
     const opened = db();
     const local = { agentId: "fake", location: "local" };
     const remote = { agentId: "fake", location: "remote-a" };
-    let localIds = ["nebula", "a"];
+    let localIds = ["nebula", "keep1", "keep2", "a"];
     const catalog = service({
       store: opened.store,
-      fetch: async (binding) => candidate(binding.location === "local" ? localIds : ["nebula", "a"]),
+      fetch: async (binding) => candidate(binding.location === "local" ? localIds : ["nebula", "keep1", "keep2", "a"]),
       scope: () => candidate().scope,
     });
     expect(await catalog.refresh(local)).toMatchObject({ generation: 1, result: "published" });
     expect(await catalog.refresh(remote)).toMatchObject({ generation: 1, result: "unchanged" });
-    localIds = ["nebula", "b"];
+    localIds = ["nebula", "keep1", "keep2", "b"];
     expect(await catalog.refresh(local)).toMatchObject({ generation: 2, result: "published" });
-    localIds = ["nebula", "c"];
+    localIds = ["nebula", "keep1", "keep2", "c"];
     expect(await catalog.refresh(local)).toMatchObject({ generation: 3, result: "published" });
     expect(catalog.lookup(local).state).toBe("ready");
     expect(catalog.lookup(remote).observation?.checksum).not.toBe(catalog.lookup(local).snapshot?.checksum);
@@ -443,12 +443,12 @@ describe("ModelCatalogService", () => {
     const opened = db();
     const local = { agentId: "fake", location: "local" };
     const remote = { agentId: "fake", location: "remote-a" };
-    let localIds = ["nebula", "a"];
+    let localIds = ["nebula", "keep1", "keep2", "a"];
     let holdRace = false;
     let release: (() => void) | undefined;
     const fetch = vi.fn(async (binding: typeof local) => {
       if (holdRace) await new Promise<void>((resolve) => { release = resolve; });
-      return candidate(binding.location === "local" ? localIds : ["nebula", "a"]);
+      return candidate(binding.location === "local" ? localIds : ["nebula", "keep1", "keep2", "a"]);
     });
     const catalog = service({
       store: opened.store,
@@ -457,7 +457,7 @@ describe("ModelCatalogService", () => {
     });
     await catalog.refresh(local);
     await catalog.refresh(remote);
-    localIds = ["nebula", "b"];
+    localIds = ["nebula", "keep1", "keep2", "b"];
     await catalog.refresh(local);
     expect(catalog.lookup(local)).toMatchObject({ state: "ready", snapshot: { generation: 2 } });
 
@@ -470,19 +470,22 @@ describe("ModelCatalogService", () => {
     expect(await ownerWaiter).toMatchObject({ result: "quarantined", generation: 2 });
     expect(catalog.lookup(remote).state).toBe("drift");
     expect(catalog.lookup(local)).toMatchObject({ state: "ready", snapshot: { generation: 2 } });
-    expect(catalog.models(local).map((entry) => entry.id)).toEqual(["nebula", "b"]);
+    expect(catalog.models(local).map((entry) => entry.id)).toEqual(["nebula", "keep1", "keep2", "b"]);
     opened.store.close();
   });
 
   it("never moves generation backwards when content returns to an earlier checksum", async () => {
     const opened = db();
-    let ids = ["nebula", "a"];
+    // Four models keeps this focused on generation monotonicity: a same-size
+    // swap below the small-catalog threshold is (correctly) quarantined by the
+    // #236 reduction policy, which is covered in catalog-foundation.test.ts.
+    let ids = ["nebula", "keep1", "keep2", "a"];
     const catalog = service({ store: opened.store, fetch: async () => candidate(ids) });
     const binding = { agentId: "fake", location: "local" };
     expect((await catalog.refresh(binding)).generation).toBe(1);
-    ids = ["nebula", "b"];
+    ids = ["nebula", "keep1", "keep2", "b"];
     expect((await catalog.refresh(binding)).generation).toBe(2);
-    ids = ["nebula", "a"];
+    ids = ["nebula", "keep1", "keep2", "a"];
     expect((await catalog.refresh(binding)).generation).toBe(3);
     opened.store.close();
   });

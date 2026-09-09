@@ -27,6 +27,7 @@ interface DbRow {
   benchmarks_json: string;
   pricing_json: string | null;
   released_at: string | null;
+  description: string | null;
   source: string;
   fetched_at: string;
 }
@@ -54,11 +55,15 @@ export class ModelMetadataStore {
         benchmarks_json TEXT NOT NULL,
         pricing_json TEXT,
         released_at TEXT,
+        description TEXT,
         source TEXT NOT NULL,
         fetched_at TEXT NOT NULL
       );
     `);
     this.dropLegacyModalitiesColumn();
+    // #236: additive column so an existing metadata cache upgrades in place
+    // rather than failing to read its own rows after a deploy.
+    this.ensureMetadataColumn("description", "TEXT");
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_model_metadata_aa_slug
         ON model_metadata(aa_slug) WHERE aa_slug IS NOT NULL;
@@ -69,6 +74,13 @@ export class ModelMetadataStore {
 
   /** #139: modality is host-scoped, so remove the legacy cache column without
    * discarding a valid snapshot from an already-deployed database. */
+  private ensureMetadataColumn(column: string, declaration: string): void {
+    const columns = this.db.prepare("PRAGMA table_info(model_metadata)").all() as Array<{ name: string }>;
+    if (!columns.some((entry) => entry.name === column)) {
+      this.db.exec(`ALTER TABLE model_metadata ADD COLUMN ${column} ${declaration}`);
+    }
+  }
+
   private dropLegacyModalitiesColumn(): void {
     const columns = this.db
       .prepare<[], { name: string }>("PRAGMA table_info(model_metadata)")
@@ -128,12 +140,12 @@ export class ModelMetadataStore {
         model_id, name, aliases_json, aa_slug, source_id, source_name, provider,
         creator_json, agents_json, agent_models_json,
         context_window, intelligence_index, benchmarks_json, pricing_json,
-        released_at, source, fetched_at
+        released_at, description, source, fetched_at
       ) VALUES (
         @model_id, @name, @aliases_json, @aa_slug, @source_id, @source_name, @provider,
         @creator_json, @agents_json, @agent_models_json,
         @context_window, @intelligence_index, @benchmarks_json, @pricing_json,
-        @released_at, @source, @fetched_at
+        @released_at, @description, @source, @fetched_at
       )
     `);
     this.db.transaction((snapshot: ModelMetadata[]) => {
@@ -155,6 +167,7 @@ export class ModelMetadataStore {
           benchmarks_json: JSON.stringify(row.benchmarks),
           pricing_json: row.pricing ? JSON.stringify(row.pricing) : null,
           released_at: row.released_at,
+          description: row.description ?? null,
           source: row.source,
           fetched_at: row.fetched_at,
         });
@@ -337,6 +350,7 @@ function fromDbRow(row: DbRow): ModelMetadata {
     benchmarks: parseNumberMap(row.benchmarks_json),
     pricing: parseObject<ModelPricing>(row.pricing_json),
     released_at: row.released_at,
+    description: row.description ?? null,
     source: row.source,
     fetched_at: row.fetched_at,
   };

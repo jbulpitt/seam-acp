@@ -23,6 +23,7 @@ import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
 import type { HttpHeader, McpServer } from "@agentclientprotocol/sdk";
+import type { CatalogModelEvidence } from "@seam/adapters";
 import type { Logger } from "../../lib/logger.js";
 import type { SessionRecord } from "../types.js";
 import type { DispatchSpec } from "../dispatch/types.js";
@@ -1796,6 +1797,25 @@ const INSTRUCTIONS = [
  * The shared seam-MCP HTTP server. `start()` binds an ephemeral loopback port;
  * read `.port` afterwards to build per-session injection entries.
  */
+
+/**
+ * Render one evidence record as a single compact, human-readable line (#236).
+ * Generic by construction: it names fields, never providers or models. The
+ * record was screened by the portable parser before persistence, so every
+ * field here is already bounded and secret-free.
+ */
+export function formatCatalogEvidence(record: CatalogModelEvidence): string {
+  const parts: string[] = [`${record.kind} via ${record.source}`];
+  if (record.observedAt) parts.push(record.observedAt);
+  if (record.runtimeVersion) parts.push(record.runtimeVersion);
+  if (record.scopeRef) parts.push(`scope ${record.scopeRef.slice(0, 12)}`);
+  if (record.resolvedModel) parts.push(`resolved ${record.resolvedModel}`);
+  if (record.context?.native != null) parts.push(`context ${record.context.native}`);
+  if (record.effort?.selectionDefault) parts.push(`effort default ${record.effort.selectionDefault}`);
+  if (record.note) parts.push(record.note);
+  return parts.join("; ");
+}
+
 export class SeamMcpServer {
   private readonly deps: SeamMcpServerDeps;
   private readonly logger: Logger;
@@ -3327,6 +3347,15 @@ export class SeamMcpServer {
       line("location:", d.location?.value ?? "local", d.location?.source ?? "default"),
       `• catalog:    ${d.catalog?.state ?? "warming"}; generation ${d.catalog?.generation ?? "none"}; ` +
         `source ${d.catalog?.source ?? "none"}; fetched ${d.catalog?.fetchedAt ?? "n/a"}`,
+      // #236: per-model description/evidence for the SELECTED model, so an
+      // agent inspecting its own configuration can see WHY its model row says
+      // what it says. Cache-only; already screened before persistence.
+      ...(d.catalog?.model
+        ? [
+            `• model info: ${d.catalog.model.id}${d.catalog.model.description ? ` — ${d.catalog.model.description}` : ""}`,
+            ...d.catalog.model.evidence.map((record) => `    ↳ ${formatCatalogEvidence(record)}`),
+          ]
+        : []),
     ];
     if (d.rider?.channel || d.rider?.thread) {
       lines.push(

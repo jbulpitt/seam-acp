@@ -31,6 +31,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "bridge:rollout": "node scripts/bridge-rollout.mjs",
     "relocate-repo": "tsx scripts/relocate-repo.ts"
   },
   "devDependencies": {

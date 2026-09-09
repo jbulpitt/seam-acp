@@ -85,6 +85,20 @@ describe("command-bus rpc allow-list", () => {
   it("protocol version is 1", () => {
     expect(PROTOCOL_VERSION).toBe(1);
   });
+
+  it("keeps release verification metadata secret-free", () => {
+    const hello = {
+      v: PROTOCOL_VERSION,
+      type: "hello" as const,
+      bridgeId: "media-server",
+      instanceId: "instance",
+      protocolVersion: PROTOCOL_VERSION,
+      host: { os: "darwin", arch: "arm64" },
+      agents: [],
+      release: { sourceSha: "a".repeat(40), artifactChecksum: "b".repeat(64), verificationAgent: "grok" },
+    };
+    expect(Object.keys(hello.release)).toEqual(["sourceSha", "artifactChecksum", "verificationAgent"]);
+  });
 });
 
 describe("makeMux still exports the slot mux", () => {

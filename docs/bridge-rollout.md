@@ -45,10 +45,21 @@ npm run bridge:rollout -- --target media-server
 npm run bridge:rollout -- --target macbook-air
 ```
 
-This performs only the identity proof above and reports non-secret paths,
-versions, IDs, and `remote_mutation=no`. Run it separately for each host. The
-canary remains `media-server`; observe and obtain separate authorization before
-doing anything to `macbook-air`.
+This performs only the identity proof above and reports `remote_mutation=no`.
+It fails closed unless it can read and report the deployed platform,
+checkout or managed-release source SHA, managed artifact checksum when present,
+entrypoint SHA-256, bridge package version, protocol version 1, configured Node
+and adjacent npm versions, available bytes on the rollout filesystem,
+`SIGUSR2` drain handler, and both `describeModelCatalog` and `fetchModelCatalog`
+RPC capabilities from the exact resolved deployment tree. Capability values are
+reported as `yes` or `no`, with their conjunction in `rollout_ready`; this keeps
+an old bridge inspectable while ACTIVATE and ROLLBACK refuse unless readiness is
+`yes`. STAGE remains available because it does not change the running process.
+Legacy checkout identity is read directly from Git metadata without invoking
+remote Git; a
+managed release is fully revalidated before its receipt is reported. Run the
+preflight separately for each host. The canary remains `media-server`; observe
+and obtain separate authorization before doing anything to `macbook-air`.
 
 ### 2. PREPARE + UPLOAD + STAGE
 
@@ -112,7 +123,10 @@ entrypoint resolves to the requested release; and that process presents the
 exact activation nonce and PID in its hello. The controller must accept that
 exact bridge ID and instance, call `describeModelCatalog` and `fetchModelCatalog`
 successfully on that same connection, and echo the nonce, bridge ID, instance ID,
-and PID. The bridge writes the ordered, in-window receipt. Only then is an
+and PID, plus the exact source SHA and artifact checksum it received from that
+connection. The bridge rejects an acknowledgement whose artifact identity does
+not exactly equal its activation envelope. It writes the ordered, in-window
+receipt. Only then is an
 immutable `.verified.json` activation record written. The activation ID and its
 exact rollback command are printed before signaling so they remain available if
 verification later fails. Once the replacement PID and entrypoint are proven, an
@@ -134,14 +148,20 @@ npm run bridge:rollout -- --target media-server --rollback \
   --apply
 ```
 
-ROLLBACK takes the same target lock and loads that activation's immutable intent
-and verified outcome. It refuses unless the current PID and resolved release
-still match the failed activation. It fully revalidates both current and exact
-previous release receipts and trees, writes an immutable rollback intent, and
-atomically restores the exact previous entrypoint. It sends only `SIGUSR2`, then
-applies the same old-exit/new-PID/PM2/entrypoint/fresh-handshake/two-RPC proof to
-the previous SHA, checksum, stage ID, and a new rollback nonce. Success produces
-an immutable versioned rollback outcome; mutable target-only state is never used.
+ROLLBACK takes the same target lock and selects that activation's immutable
+verified, observed, or pre-switch intent record, in that order. It refuses
+unless the stable entrypoint still resolves to the exact failed SHA/checksum
+release and the current PM2 identity is consistent with that record. For an
+intent-only interruption, the original PID may still be live; if a different
+PID appeared before observation, its exact activation envelope and receipt PID
+must bind it to the same failed activation. The current failed release, its
+activation envelope, and the exact previous release receipt/tree are fully
+revalidated before any switch. ROLLBACK then writes an immutable rollback
+intent, atomically restores the exact previous entrypoint, and sends only
+`SIGUSR2` to the currently proven PID. It applies the same old-exit/new-PID/PM2/
+entrypoint/fresh-handshake/two-RPC proof to the previous SHA, checksum, stage ID,
+and a new rollback nonce. Success produces an immutable versioned rollback
+outcome; mutable target-only state is never used.
 
 ## Locks and recovery boundaries
 
@@ -158,10 +178,13 @@ racing lock state refuses. Never delete a lock by hand while its owner is live.
   exact activation ID. Rollback itself refuses if live state drifted.
 - An activation with `.observed.json` but no verified outcome may be rolled back
   explicitly by its printed activation ID; rollback first requires that exact
-  observed PID and release still be active, and then fully proves the previous
-  release. An intent without either observed or verified state stopped before a
-  replacement identity was proven. It is evidence, not permission to guess a
-  PID or rollback target; a human must reconcile exact live state.
+  observed PID and release still be active. If interruption occurred after the
+  stable pointer switch but before `.observed.json`, the immutable intent is the
+  recovery boundary: rollback requires the pointer at the exact intended failed
+  release, the exact activation envelope, the fully valid failed and previous
+  release trees, and either the unchanged recorded old PID or a receipt-bound
+  replacement PID. If the pointer never switched, drifted elsewhere, or any
+  identity is ambiguous, rollback refuses. No record permits guessing.
 - Legacy code cannot emit a nonce/PID/instance/two-RPC rollback receipt. Therefore
   ACTIVATE fails closed with `legacy_previous_release_not_receipt_capable` until
   the host has been explicitly enrolled with a reviewed receipt-capable managed

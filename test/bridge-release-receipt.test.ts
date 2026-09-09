@@ -16,11 +16,13 @@ describe("bridge activation receipt (#241)", () => {
     const writer = await createReleaseReceiptWriter({ bridgeId: "media-server", instanceId: "new-instance", protocolVersion: 1, activationEnvelopePath: activation, receiptPath: receipt });
     expect(writer?.helloMetadata()).toMatchObject({ activationId: envelope.activationId, bridgeId: "media-server", oldPid: 41, pid: process.pid });
     await writer!.recordHelloAccepted(); await writer!.recordCatalogRpc("describeModelCatalog", "grok"); await writer!.recordCatalogRpc("fetchModelCatalog", "grok");
-    await writer!.recordControllerVerification({ activationId: envelope.activationId, bridgeId: "media-server", instanceId: "wrong", pid: process.pid });
+    await writer!.recordControllerVerification({ activationId: envelope.activationId, bridgeId: "media-server", instanceId: "wrong", pid: process.pid, sourceSha: stage.sourceSha, artifactChecksum: stage.artifactChecksum });
     expect(JSON.parse(await fs.readFile(receipt, "utf8")).completedAt).toBeUndefined();
-    await writer!.recordControllerVerification({ activationId: envelope.activationId, bridgeId: "media-server", instanceId: "new-instance", pid: process.pid });
+    await writer!.recordControllerVerification({ activationId: envelope.activationId, bridgeId: "media-server", instanceId: "new-instance", pid: process.pid, sourceSha: "f".repeat(40), artifactChecksum: stage.artifactChecksum });
+    expect(JSON.parse(await fs.readFile(receipt, "utf8")).completedAt).toBeUndefined();
+    await writer!.recordControllerVerification({ activationId: envelope.activationId, bridgeId: "media-server", instanceId: "new-instance", pid: process.pid, sourceSha: stage.sourceSha, artifactChecksum: stage.artifactChecksum });
     const saved = JSON.parse(await fs.readFile(receipt, "utf8"));
-    expect(saved).toMatchObject({ ...stage, ...envelope, pid: process.pid, instanceId: "new-instance", protocolVersion: 1, controllerAck: { activationId: envelope.activationId, bridgeId: "media-server", instanceId: "new-instance", pid: process.pid } });
+    expect(saved).toMatchObject({ ...stage, ...envelope, pid: process.pid, instanceId: "new-instance", protocolVersion: 1, controllerAck: { activationId: envelope.activationId, bridgeId: "media-server", instanceId: "new-instance", pid: process.pid, sourceSha: stage.sourceSha, artifactChecksum: stage.artifactChecksum } });
     expect(saved.catalogRpcs.grok.describeModelCatalogAt).toBeTruthy(); expect(saved.catalogRpcs.grok.fetchModelCatalogAt).toBeTruthy(); expect(saved.completedAt).toBeTruthy();
     await fs.rm(dir, { recursive: true, force: true });
   });

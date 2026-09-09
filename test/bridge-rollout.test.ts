@@ -50,7 +50,7 @@ describe("bridge rollout gating and verification (#241)", () => {
 
   it("dry-run accepts only a fully bound identity response", async () => {
     const target = resolveTarget(targets, "macbook-air");
-    const fake = vi.fn(async (command: { mutates: boolean }) => { expect(command.mutates).toBe(false); return { stdout: "reachable=yes\nbridge_id=macbook-air\npm2_app=seam-bridge\nidentity_bound=yes\npid=123\n", stderr: "" }; });
+    const fake = vi.fn(async (command: { mutates: boolean }) => { expect(command.mutates).toBe(false); return { stdout: `reachable=yes\nbridge_id=macbook-air\npm2_app=seam-bridge\nidentity_bound=yes\nremote_mutation=no\npid=123\nplatform=darwin-arm64\nartifact_mode=managed\nartifact_identity=${"a".repeat(40)}:${"b".repeat(64)}\nartifact_source_sha=${"a".repeat(40)}\ncheckout_source_sha=not-applicable\nartifact_checksum=${"b".repeat(64)}\nentrypoint_sha256=${"c".repeat(64)}\nbridge_version=0.1.0\nprotocol_version=1\ndrain_SIGUSR2=yes\ndescribeModelCatalog=yes\nfetchModelCatalog=yes\nrollout_ready=yes\nnode_path=${target.nodePath}\nnode_version=v24.15.0\nnpm_version=11.6.2\ndisk_path=${target.checkoutPath}\ndisk_bytes_available=1024\n`, stderr: "" }; });
     expect((await runPreflight(target, "fixed-script", fake)).report.pid).toBe("123");
     const mismatch = vi.fn(async () => ({ stdout: "bridge_id=other\npm2_app=seam-bridge\nidentity_bound=yes\n", stderr: "" }));
     await expect(runPreflight(target, "fixed-script", mismatch)).rejects.toThrow(/identity/);
@@ -66,12 +66,13 @@ describe("bridge rollout gating and verification (#241)", () => {
   it("requires nonce, target, PIDs, instance, ordered fresh window, controller ack and both RPCs", () => {
     const t0 = Date.parse("2026-09-08T00:00:00.000Z");
     const expected = { activationId: "a".repeat(64), bridgeId: "media-server", sha: "b".repeat(40), checksum: "c".repeat(64), stageId: "d".repeat(64), oldPid: 41, pid: 57, instanceId: "instance", protocolVersion: 1, agentId: "grok", notBefore: t0, notAfter: t0 + 10_000 };
-    const good = { formatVersion: 2, activationId: expected.activationId, bridgeId: expected.bridgeId, sourceSha: expected.sha, artifactChecksum: expected.checksum, stageId: expected.stageId, oldPid: 41, pid: 57, instanceId: "instance", protocolVersion: 1, startedAt: "2026-09-08T00:00:00.000Z", helloAcceptedAt: "2026-09-08T00:00:01.000Z", controllerVerifiedAt: "2026-09-08T00:00:04.000Z", completedAt: "2026-09-08T00:00:04.000Z", catalogRpcs: { grok: { describeModelCatalogAt: "2026-09-08T00:00:02.000Z", fetchModelCatalogAt: "2026-09-08T00:00:03.000Z" } }, controllerAck: { activationId: expected.activationId, bridgeId: expected.bridgeId, instanceId: "instance", pid: 57 } };
+    const good = { formatVersion: 2, activationId: expected.activationId, bridgeId: expected.bridgeId, sourceSha: expected.sha, artifactChecksum: expected.checksum, stageId: expected.stageId, oldPid: 41, pid: 57, instanceId: "instance", protocolVersion: 1, startedAt: "2026-09-08T00:00:00.000Z", helloAcceptedAt: "2026-09-08T00:00:01.000Z", controllerVerifiedAt: "2026-09-08T00:00:04.000Z", completedAt: "2026-09-08T00:00:04.000Z", catalogRpcs: { grok: { describeModelCatalogAt: "2026-09-08T00:00:02.000Z", fetchModelCatalogAt: "2026-09-08T00:00:03.000Z" } }, controllerAck: { activationId: expected.activationId, bridgeId: expected.bridgeId, instanceId: "instance", pid: 57, sourceSha: expected.sha, artifactChecksum: expected.checksum } };
     expect(validateReadyReceipt(good, expected)).toBe(true);
     expect(() => validateReadyReceipt({ ...good, activationId: "e".repeat(64) }, expected)).toThrow(/this activation/);
     expect(() => validateReadyReceipt({ ...good, pid: 41 }, expected)).toThrow(/process identity/);
     expect(() => validateReadyReceipt({ ...good, completedAt: "2026-09-09T00:00:00.000Z" }, expected)).toThrow(/stale/);
     expect(() => validateReadyReceipt({ ...good, controllerAck: undefined }, expected)).toThrow(/controller/);
+    expect(() => validateReadyReceipt({ ...good, controllerAck: { ...good.controllerAck, artifactChecksum: "e".repeat(64) } }, expected)).toThrow(/controller/);
   });
 
   it("bounds subprocess duration/output and redacts diagnostics", async () => {
@@ -89,5 +90,6 @@ describe("bridge rollout gating and verification (#241)", () => {
     expect(source).not.toMatch(/pm2\s+(?:restart|reload|jlist|prettylist|env)\b/i);
     expect(source).not.toMatch(/SIGTERM|SIGKILL.*oldPid/);
     expect(source).toContain('process.kill(before.pid, "SIGUSR2")');
+    expect(source).toContain('preflight.report.rollout_ready !== "yes"');
   });
 });

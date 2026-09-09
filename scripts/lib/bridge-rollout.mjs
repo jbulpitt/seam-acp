@@ -151,7 +151,7 @@ export function validateReadyReceipt(receipt, expected) {
   if (receipt.oldPid !== expected.oldPid || receipt.pid !== expected.pid || receipt.pid === receipt.oldPid || receipt.instanceId !== expected.instanceId || receipt.protocolVersion !== expected.protocolVersion) throw new Error("ready receipt process identity mismatch");
   if (times.some((time) => !Number.isFinite(time)) || times.some((time, index) => index && time < times[index - 1]) || times[0] < expected.notBefore || times.at(-1) > expected.notAfter) throw new Error("ready receipt is stale or outside the activation window");
   const calls = receipt.catalogRpcs?.[expected.agentId];
-  if (!calls?.describeModelCatalogAt || !calls?.fetchModelCatalogAt || receipt.controllerAck?.activationId !== expected.activationId || receipt.controllerAck?.bridgeId !== expected.bridgeId || receipt.controllerAck?.instanceId !== expected.instanceId || receipt.controllerAck?.pid !== expected.pid) throw new Error(`catalog/controller verification failed for ${expected.agentId}`);
+  if (!calls?.describeModelCatalogAt || !calls?.fetchModelCatalogAt || receipt.controllerAck?.activationId !== expected.activationId || receipt.controllerAck?.bridgeId !== expected.bridgeId || receipt.controllerAck?.instanceId !== expected.instanceId || receipt.controllerAck?.pid !== expected.pid || receipt.controllerAck?.sourceSha !== expected.sha || receipt.controllerAck?.artifactChecksum !== expected.checksum) throw new Error(`catalog/controller verification failed for ${expected.agentId}`);
   return true;
 }
 
@@ -254,7 +254,14 @@ export async function runPreflight(target, remoteScript, run = commandRunner) {
   const command = makeSshCommand(target, ["preflight"], remoteScript);
   const result = await run(command);
   const report = parseKeyValues(result.stdout);
-  if (report.bridge_id !== target.bridgeId || report.pm2_app !== target.pm2App || report.identity_bound !== "yes") throw new Error("remote deployment identity did not match the operator mapping");
+  if (report.bridge_id !== target.bridgeId || report.pm2_app !== target.pm2App || report.identity_bound !== "yes" || report.remote_mutation !== "no") throw new Error("remote deployment identity did not match the operator mapping");
+  if (!/^[a-z0-9._-]+$/.test(report.platform ?? "") || !/^(managed|legacy-checkout)$/.test(report.artifact_mode ?? "") || !CHECKSUM.test(report.entrypoint_sha256 ?? "")) throw new Error("remote artifact identity evidence is incomplete");
+  if (report.artifact_mode === "managed" && (!SHA.test(report.artifact_source_sha ?? "") || !CHECKSUM.test(report.artifact_checksum ?? "") || report.checkout_source_sha !== "not-applicable" || report.artifact_identity !== `${report.artifact_source_sha}:${report.artifact_checksum}`)) throw new Error("managed artifact checksum evidence is incomplete");
+  if (report.artifact_mode === "legacy-checkout" && (report.artifact_source_sha !== "unmanaged" || report.artifact_checksum !== "unmanaged" || !SHA.test(report.checkout_source_sha ?? "") || report.artifact_identity !== `entrypoint-sha256:${report.entrypoint_sha256}`)) throw new Error("legacy checkout artifact evidence is incomplete");
+  if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(report.bridge_version ?? "") || !/^(?:\d+|unknown)$/.test(report.protocol_version ?? "") || ![report.drain_SIGUSR2,report.describeModelCatalog,report.fetchModelCatalog,report.rollout_ready].every((value)=>value === "yes" || value === "no")) throw new Error("remote bridge capability evidence is incomplete");
+  const expectedReadiness = report.protocol_version === "1" && report.drain_SIGUSR2 === "yes" && report.describeModelCatalog === "yes" && report.fetchModelCatalog === "yes" ? "yes" : "no";
+  if (report.rollout_ready !== expectedReadiness) throw new Error("remote bridge readiness evidence is inconsistent");
+  if (report.node_path !== target.nodePath || !/^v(?:2[2-9]|[3-9]\d)\.\d+\.\d+/.test(report.node_version ?? "") || !/^\d+\.\d+\.\d+/.test(report.npm_version ?? "") || report.disk_path !== target.checkoutPath || !/^\d+$/.test(report.disk_bytes_available ?? "") || BigInt(report.disk_bytes_available) <= 0n) throw new Error("remote runtime capacity evidence is incomplete");
   return { command, report, stdout: result.stdout };
 }
 

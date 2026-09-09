@@ -42,6 +42,7 @@ async function main() {
     console.log(`activate_command=npm run bridge:rollout -- --target ${target.bridgeId} --activate --sha ${artifact.sha} --checksum ${artifact.checksum} --stage-id ${stageId} --apply`);
     return;
   }
+  if (preflight.report.rollout_ready !== "yes") throw new Error("active bridge lacks the verified drain/protocol/catalog capabilities required for activation or rollback");
   if (options.action === "activate") {
     const activationId = nonce(); const operationId = nonce();
     console.log(`activation_id=${activationId}`);

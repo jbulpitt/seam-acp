@@ -440,7 +440,7 @@ async function verifyActivationReceipt(release, expected) {
     try {
       const value = parseJson(await fsp.readFile(receiptPath), "activation_receipt_invalid");
       const sequence = [value.startedAt,value.helloAcceptedAt,value.catalogRpcs?.[verifyAgent]?.describeModelCatalogAt,value.catalogRpcs?.[verifyAgent]?.fetchModelCatalogAt,value.controllerVerifiedAt,value.completedAt].map(Date.parse);
-      if (value.formatVersion === 2 && value.activationId === expected.activationId && value.bridgeId === bridgeId && value.sourceSha === expected.sourceSha && value.artifactChecksum === expected.artifactChecksum && value.stageId === expected.stageId && value.oldPid === expected.oldPid && value.pid === expected.newPid && INSTANCE.test(value.instanceId ?? "") && value.protocolVersion === 1 && sequence.every(Number.isFinite) && sequence.every((time,index) => !index || time >= sequence[index-1]) && sequence[0] >= expected.started && sequence.at(-1) <= expected.deadline && value.controllerAck?.activationId === expected.activationId && value.controllerAck?.bridgeId === bridgeId && value.controllerAck?.instanceId === value.instanceId && value.controllerAck?.pid === expected.newPid) return value;
+      if (value.formatVersion === 2 && value.activationId === expected.activationId && value.bridgeId === bridgeId && value.sourceSha === expected.sourceSha && value.artifactChecksum === expected.artifactChecksum && value.stageId === expected.stageId && value.oldPid === expected.oldPid && value.pid === expected.newPid && INSTANCE.test(value.instanceId ?? "") && value.protocolVersion === 1 && sequence.every(Number.isFinite) && sequence.every((time,index) => !index || time >= sequence[index-1]) && sequence[0] >= expected.started && sequence.at(-1) <= expected.deadline && value.controllerAck?.activationId === expected.activationId && value.controllerAck?.bridgeId === bridgeId && value.controllerAck?.instanceId === value.instanceId && value.controllerAck?.pid === expected.newPid && value.controllerAck?.sourceSha === expected.sourceSha && value.controllerAck?.artifactChecksum === expected.artifactChecksum) return value;
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
@@ -453,12 +453,85 @@ async function switchEntrypoint(target) {
   const real = await fsp.realpath(entrypointPath); if (real !== target) fail("entrypoint_switch_not_atomic");
 }
 
+async function readCheckoutSourceSha() {
+  const dotGit = `${checkoutPath}/.git`;
+  const dotGitStat = await fsp.lstat(dotGit).catch(() => fail("checkout_source_identity_unavailable"));
+  let gitDir = dotGit;
+  if (dotGitStat.isFile() && !dotGitStat.isSymbolicLink()) {
+    const pointer = (await fsp.readFile(dotGit,"utf8")).trim();
+    const match = /^gitdir: ([^\x00-\x1f\x7f]+)$/.exec(pointer); if (!match) fail("checkout_source_identity_unavailable");
+    gitDir = path.resolve(checkoutPath, match[1]);
+  } else if (!dotGitStat.isDirectory() || dotGitStat.isSymbolicLink()) fail("checkout_source_identity_unavailable");
+  const gitDirReal = await fsp.realpath(gitDir).catch(() => fail("checkout_source_identity_unavailable"));
+  const gitDirStat = await fsp.lstat(gitDirReal); if (!gitDirStat.isDirectory() || gitDirStat.isSymbolicLink()) fail("checkout_source_identity_unavailable"); assertUid(gitDirStat,expectedUid,"checkout_git_wrong_owner");
+  const readGitFile = async (file) => {
+    const stat = await fsp.lstat(file).catch(()=>fail("checkout_source_identity_unavailable"));
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4 * 1024 * 1024) fail("checkout_source_identity_unavailable"); assertUid(stat,expectedUid,"checkout_git_wrong_owner");
+    return fsp.readFile(file,"utf8");
+  };
+  const head = (await readGitFile(`${gitDirReal}/HEAD`)).trim();
+  if (SHA.test(head)) return head;
+  const match = /^ref: (refs\/[A-Za-z0-9._/-]+)$/.exec(head);
+  if (!match || match[1].split("/").some((part)=>!part || part === "." || part === "..") || path.posix.normalize(match[1]) !== match[1]) fail("checkout_source_identity_unavailable");
+  const loosePath = `${gitDirReal}/${match[1]}`; const loose = fs.existsSync(loosePath) ? await readGitFile(loosePath) : null;
+  if (loose && SHA.test(loose.trim())) return loose.trim();
+  const packedPath = `${gitDirReal}/packed-refs`; const packed = fs.existsSync(packedPath) ? await readGitFile(packedPath) : "";
+  const values = packed.split(/\r?\n/).filter((line)=>!line.startsWith("#") && !line.startsWith("^")).map((line)=>line.split(" ")).filter((parts)=>parts.length === 2 && parts[1] === match[1] && SHA.test(parts[0]));
+  if (values.length !== 1) fail("checkout_source_identity_unavailable");
+  return values[0][0];
+}
+
+async function readCapabilityFile(root, relative, code) {
+  const file = path.join(root,...relative.split("/")); exactFileInside(root,file,code);
+  const stat = await fsp.lstat(file).catch(()=>fail(code));
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8 * 1024 * 1024) fail(code);
+  assertUid(stat,expectedUid,`${code}_wrong_owner`);
+  return fsp.readFile(file);
+}
+
 async function preflight() {
   if (actionArgs.length) fail("preflight_argument_count");
   const identity = await readLiveIdentity();
+  let artifactMode; let artifactSourceSha = "unmanaged"; let checkoutSourceSha = "not-applicable"; let artifactChecksum = "unmanaged"; let activeRoot;
+  if (identity.legacy) {
+    artifactMode = "legacy-checkout"; checkoutSourceSha = await readCheckoutSourceSha(); activeRoot = checkoutPath;
+  } else {
+    artifactMode = "managed"; activeRoot = path.resolve(identity.entryReal,"../../../..");
+    const match = /^([0-9a-f]{40})-([0-9a-f]{64})$/.exec(path.basename(activeRoot)); if (!match) fail("active_release_name_invalid");
+    const receipt = await validateRelease(activeRoot,match[1],match[2]); artifactSourceSha = receipt.sourceSha; artifactChecksum = receipt.artifactChecksum;
+  }
+  const [entryBytes, bridgePackageBytes, commandBusBytes, rpcBytes] = await Promise.all([
+    readCapabilityFile(activeRoot,"packages/bridge/dist/index.js","deployed_entrypoint_invalid"),
+    readCapabilityFile(activeRoot,"packages/bridge/package.json","deployed_bridge_package_invalid"),
+    readCapabilityFile(activeRoot,"packages/adapters/dist/command-bus.js","deployed_protocol_invalid"),
+    readCapabilityFile(activeRoot,"packages/bridge/dist/rpc.js","deployed_rpc_invalid"),
+  ]);
+  const bridgePackage = parseJson(bridgePackageBytes,"deployed_bridge_package_invalid");
+  if (bridgePackage.name !== "@seam/bridge" || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(bridgePackage.version ?? "")) fail("deployed_bridge_package_invalid");
+  const protocolMatch = /\bPROTOCOL_VERSION\s*=\s*(\d+)\b/.exec(commandBusBytes.toString("utf8"));
+  const entrySource = entryBytes.toString("utf8"); const commandBusSource = commandBusBytes.toString("utf8"); const rpcSource = rpcBytes.toString("utf8");
+  const protocolVersion = protocolMatch?.[1] ?? "unknown";
+  const drainSupport = /process\.on\(\s*["']SIGUSR2["']/.test(entrySource) ? "yes" : "no";
+  const rpcDispatch = rpcSource.includes("isAllowedRpcMethod") && rpcSource.includes("dispatchAdapter");
+  const describeSupport = rpcDispatch && commandBusSource.includes('"describeModelCatalog"') ? "yes" : "no";
+  const fetchSupport = rpcDispatch && commandBusSource.includes('"fetchModelCatalog"') ? "yes" : "no";
+  const rolloutReady = protocolVersion === "1" && drainSupport === "yes" && describeSupport === "yes" && fetchSupport === "yes" ? "yes" : "no";
+  const npmPath = `${path.dirname(nodePath)}/npm`; const npmReal = await fsp.realpath(npmPath).catch(()=>fail("configured_npm_missing"));
+  const npmStat = await fsp.stat(npmReal); if (!npmStat.isFile()) fail("configured_npm_wrong_type"); assertUid(npmStat,expectedUid,"configured_npm_wrong_owner"); await fsp.access(npmReal,fs.constants.X_OK).catch(()=>fail("configured_npm_not_executable"));
+  const runtimeEnv = { PATH: `${path.dirname(nodePath)}:/usr/bin:/bin`, HOME: process.env.HOME ?? checkoutPath };
+  const nodeVersion = (await runBounded(nodePath,["--version"],{timeoutMs:10_000,stdoutLimit:1024,stderrLimit:1024,env:runtimeEnv})).stdout.trim();
+  const npmVersion = (await runBounded(npmPath,["--version"],{timeoutMs:10_000,stdoutLimit:1024,stderrLimit:1024,env:runtimeEnv})).stdout.trim();
+  if (!/^v(?:2[2-9]|[3-9]\d)\.\d+\.\d+/.test(nodeVersion)) fail("configured_node_version_unsupported");
+  if (!/^\d+\.\d+\.\d+/.test(npmVersion)) fail("configured_npm_version_invalid");
+  const disk = await fsp.statfs(checkoutPath).catch(()=>fail("release_disk_unavailable")); const diskBytesAvailable = BigInt(disk.bavail) * BigInt(disk.bsize);
+  if (diskBytesAvailable <= 0n) fail("release_disk_unavailable");
   console.log("reachable=yes"); console.log(`bridge_id=${bridgeId}`); console.log(`pm2_app=${pm2App}`); console.log(`pid=${identity.pid}`);
   console.log(`cwd=${identity.cwd}`); console.log(`entrypoint=${entrypointPath}`); console.log(`entrypoint_target=${identity.entryReal}`);
-  console.log(`expected_uid=${expectedUid}`); console.log(`node_path=${nodePath}`); console.log(`release_root=${releaseRoot}`); console.log("identity_bound=yes"); console.log("remote_mutation=no");
+  console.log(`expected_uid=${expectedUid}`); console.log(`release_root=${releaseRoot}`); console.log(`platform=${process.platform}-${process.arch}`);
+  const entrypointSha256 = hash(entryBytes); const artifactIdentity = artifactMode === "managed" ? `${artifactSourceSha}:${artifactChecksum}` : `entrypoint-sha256:${entrypointSha256}`;
+  console.log(`artifact_mode=${artifactMode}`); console.log(`artifact_identity=${artifactIdentity}`); console.log(`artifact_source_sha=${artifactSourceSha}`); console.log(`checkout_source_sha=${checkoutSourceSha}`); console.log(`artifact_checksum=${artifactChecksum}`); console.log(`entrypoint_sha256=${entrypointSha256}`);
+  console.log(`bridge_version=${bridgePackage.version}`); console.log(`protocol_version=${protocolVersion}`); console.log(`drain_SIGUSR2=${drainSupport}`); console.log(`describeModelCatalog=${describeSupport}`); console.log(`fetchModelCatalog=${fetchSupport}`); console.log(`rollout_ready=${rolloutReady}`);
+  console.log(`node_path=${nodePath}`); console.log(`node_version=${nodeVersion}`); console.log(`npm_version=${npmVersion}`); console.log(`disk_path=${checkoutPath}`); console.log(`disk_bytes_available=${diskBytesAvailable}`); console.log("identity_bound=yes"); console.log("remote_mutation=no");
 }
 
 async function prepareUpload() {
@@ -563,18 +636,28 @@ async function rollback() {
   if (![failedActivationId,rollbackId,operationId].every((v) => HASH.test(v)) || !Number.isInteger(timeout) || timeout < 10 || timeout > 900) fail("rollback_identity_invalid");
   await readLiveIdentity(); await requireManagedDirectory(releaseRoot); await requireManagedDirectory(`${releaseRoot}/activations`); await requireManagedDirectory(`${releaseRoot}/rollbacks`); await requireManagedDirectory(`${releaseRoot}/releases`); await requireManagedDirectory(`${releaseRoot}/locks`); await requireManagedDirectory(`${releaseRoot}/stale-locks`);
   await withLock(operationId, async () => {
-    let record; let recordKind; const verifiedRecordPath = `${releaseRoot}/activations/${failedActivationId}.verified.json`;
+    let record; let recordKind; const verifiedRecordPath = `${releaseRoot}/activations/${failedActivationId}.verified.json`; const observedRecordPath = `${releaseRoot}/activations/${failedActivationId}.observed.json`;
     if (fs.existsSync(verifiedRecordPath)) { record = parseJson(await fsp.readFile(verifiedRecordPath), "verified_activation_record_invalid"); recordKind = "verified"; }
-    else { record = parseJson(await fsp.readFile(`${releaseRoot}/activations/${failedActivationId}.observed.json`).catch(() => fail("activation_observation_missing")), "activation_observation_invalid"); recordKind = "observed"; }
-    if (record.formatVersion !== 2 || record.activationId !== failedActivationId || record.bridgeId !== bridgeId || record.pm2App !== pm2App || !SHA.test(record.sourceSha) || !HASH.test(record.artifactChecksum) || !HASH.test(record.stageId) || !Number.isSafeInteger(record.oldPid) || !Number.isSafeInteger(record.newPid)) fail("verified_activation_record_mismatch");
+    else if (fs.existsSync(observedRecordPath)) { record = parseJson(await fsp.readFile(observedRecordPath), "activation_observation_invalid"); recordKind = "observed"; }
+    else { record = parseJson(await fsp.readFile(`${releaseRoot}/activations/${failedActivationId}.intent.json`).catch(() => fail("activation_intent_missing")), "activation_intent_invalid"); recordKind = "intent"; }
+    const expectedActivatedEntrypoint = `${releaseRoot}/releases/${record.sourceSha}-${record.artifactChecksum}/packages/bridge/dist/index.js`;
+    if (record.formatVersion !== 2 || record.kind !== "activate" || record.activationId !== failedActivationId || record.bridgeId !== bridgeId || record.pm2App !== pm2App || !SHA.test(record.sourceSha) || !HASH.test(record.artifactChecksum) || !HASH.test(record.stageId) || !Number.isSafeInteger(record.oldPid) || record.oldPid < 2 || record.activatedEntrypoint !== expectedActivatedEntrypoint || (recordKind !== "intent" && (!Number.isSafeInteger(record.newPid) || record.newPid < 2 || record.newPid === record.oldPid))) fail("verified_activation_record_mismatch");
     const current = await readLiveIdentity();
-    if (current.pid !== record.newPid || current.entryReal !== record.activatedEntrypoint) fail("rollback_current_activation_mismatch");
+    if (current.entryReal !== record.activatedEntrypoint || current.legacy || (recordKind !== "intent" && current.pid !== record.newPid)) fail("rollback_current_activation_mismatch");
     const currentDir = path.resolve(current.entryReal,"../../../.."); await validateRelease(currentDir, record.sourceSha, record.artifactChecksum, record.stageId);
+    const failedEnvelope = parseJson(await fsp.readFile(`${currentDir}/activation-envelope.json`).catch(()=>fail("failed_activation_envelope_missing")),"failed_activation_envelope_invalid");
+    if (failedEnvelope.formatVersion !== 2 || failedEnvelope.activationId !== failedActivationId || failedEnvelope.bridgeId !== bridgeId || failedEnvelope.sourceSha !== record.sourceSha || failedEnvelope.artifactChecksum !== record.artifactChecksum || failedEnvelope.stageId !== record.stageId || failedEnvelope.oldPid !== record.oldPid || failedEnvelope.startedAt !== record.startedAt || failedEnvelope.deadlineAt !== record.deadlineAt) fail("failed_activation_envelope_mismatch");
+    if (recordKind === "intent" && current.pid !== record.oldPid) {
+      const unobserved = parseJson(await fsp.readFile(`${currentDir}/release-receipt.json`),"unobserved_activation_receipt_invalid");
+      if (unobserved.activationId !== failedActivationId || unobserved.sourceSha !== record.sourceSha || unobserved.artifactChecksum !== record.artifactChecksum || unobserved.stageId !== record.stageId || unobserved.oldPid !== record.oldPid || unobserved.pid !== current.pid || !INSTANCE.test(unobserved.instanceId ?? "")) fail("rollback_unobserved_pid_mismatch");
+    }
     if (recordKind === "verified" && (!HASH.test(record.readyReceiptSha256 ?? "") || hash(await fsp.readFile(record.readyReceipt)) !== record.readyReceiptSha256)) fail("activation_ready_receipt_changed");
     const previous = record.previous; assertObject(previous,"rollback_previous_invalid");
+    const expectedPreviousEntrypoint = `${releaseRoot}/releases/${previous.sourceSha}-${previous.artifactChecksum}/packages/bridge/dist/index.js`;
+    if (!SHA.test(previous.sourceSha ?? "") || !HASH.test(previous.artifactChecksum ?? "") || !HASH.test(previous.stageId ?? "") || previous.entrypoint !== expectedPreviousEntrypoint) fail("rollback_previous_invalid");
     const previousDir = path.resolve(previous.entrypoint,"../../../.."); const previousReceipt = await validateRelease(previousDir, previous.sourceSha, previous.artifactChecksum, previous.stageId);
     const started = Date.now(); const deadline = started + timeout * 1000;
-    const intent = { formatVersion: 2, kind: "rollback", rollbackId, failedActivationId, failedActivationRecordKind: recordKind, bridgeId, pm2App, from: { sourceSha: record.sourceSha, artifactChecksum: record.artifactChecksum, stageId: record.stageId, entrypoint: record.activatedEntrypoint, pid: record.newPid, readyReceiptSha256: record.readyReceiptSha256 ?? null }, to: previous, oldPid: current.pid, startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString() };
+    const intent = { formatVersion: 2, kind: "rollback", rollbackId, failedActivationId, failedActivationRecordKind: recordKind, bridgeId, pm2App, from: { sourceSha: record.sourceSha, artifactChecksum: record.artifactChecksum, stageId: record.stageId, entrypoint: record.activatedEntrypoint, pid: current.pid, readyReceiptSha256: record.readyReceiptSha256 ?? null }, to: previous, oldPid: current.pid, startedAt: new Date(started).toISOString(), deadlineAt: new Date(deadline).toISOString() };
     await fsp.writeFile(`${releaseRoot}/rollbacks/${failedActivationId}-${rollbackId}.intent.json`, safeJson(intent), { flag: "wx", mode: 0o600 });
     await writeActivationEnvelope(previousDir, { formatVersion: 2, activationId: rollbackId, bridgeId, sourceSha: previous.sourceSha, artifactChecksum: previous.artifactChecksum, verificationAgent: verifyAgent, stageId: previousReceipt.stageId, oldPid: current.pid, startedAt: intent.startedAt, deadlineAt: intent.deadlineAt });
     await switchEntrypoint(previous.entrypoint); process.kill(current.pid,"SIGUSR2");

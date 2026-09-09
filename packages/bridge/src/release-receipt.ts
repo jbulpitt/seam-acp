@@ -32,7 +32,7 @@ interface ReadyReceipt extends StageReceipt, ActivationEnvelope {
   helloAcceptedAt?: string;
   controllerVerifiedAt?: string;
   completedAt?: string;
-  controllerAck?: { activationId: string; bridgeId: string; instanceId: string; pid: number };
+  controllerAck?: { activationId: string; bridgeId: string; instanceId: string; pid: number; sourceSha: string; artifactChecksum: string };
   catalogRpcs: Record<string, { describeModelCatalogAt?: string; fetchModelCatalogAt?: string }>;
 }
 
@@ -81,9 +81,9 @@ export class ReleaseReceiptWriter {
 
   recordControllerVerification(payload: unknown): Promise<void> {
     if (!payload || typeof payload !== "object") return Promise.resolve();
-    const value = payload as { activationId?: string; bridgeId?: string; instanceId?: string; pid?: number };
-    if (value.activationId !== this.receipt.activationId || value.bridgeId !== this.receipt.bridgeId || value.instanceId !== this.receipt.instanceId || value.pid !== this.receipt.pid) return Promise.resolve();
-    this.receipt.controllerAck = { activationId: value.activationId, bridgeId: value.bridgeId, instanceId: value.instanceId, pid: value.pid };
+    const value = payload as { activationId?: string; bridgeId?: string; instanceId?: string; pid?: number; sourceSha?: string; artifactChecksum?: string };
+    if (value.activationId !== this.receipt.activationId || value.bridgeId !== this.receipt.bridgeId || value.instanceId !== this.receipt.instanceId || value.pid !== this.receipt.pid || value.sourceSha !== this.receipt.sourceSha || value.artifactChecksum !== this.receipt.artifactChecksum) return Promise.resolve();
+    this.receipt.controllerAck = { activationId: value.activationId, bridgeId: value.bridgeId, instanceId: value.instanceId, pid: value.pid, sourceSha: value.sourceSha, artifactChecksum: value.artifactChecksum };
     this.receipt.controllerVerifiedAt = new Date().toISOString();
     this.receipt.completedAt = this.receipt.controllerVerifiedAt;
     return this.write();

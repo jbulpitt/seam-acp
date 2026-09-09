@@ -651,4 +651,99 @@ Available models:
       fs.rmSync(temporary, { recursive: true, force: true });
     }
   });
+
+  it("redacts hostile grok models failures from returned and durable refresh errors", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "seam-grok-models-redaction-"));
+    const grokHome = path.join(temporary, "grok-home");
+    const fixture = path.join(process.cwd(), "test/fixtures/grok/fake-acp.mjs");
+    const secret = "qa-supplied-credential-938475";
+    writeAuth(grokHome, "models-redaction-test");
+    const resolvedIdentity = resolveGrokSubscriptionIdentity({ GROK_HOME: grokHome });
+    const profile = makeGrokProfile({
+      cliPath: process.execPath,
+      baseArgs: [fixture],
+      cwd: temporary,
+      defaultModel: "grok-test",
+      baseEnv: {
+        ...process.env,
+        GROK_HOME: grokHome,
+        GROK_FAKE_MODE: "models-error",
+        GROK_FAKE_SECRET: secret,
+        XAI_API_KEY: undefined,
+      },
+      authIdentityProbe: () => resolvedIdentity,
+      catalogProbe: async () => ({
+        modelState: null,
+        protocolVersion: "1",
+        authSource: "subscription",
+        authIdentity: resolvedIdentity,
+      }),
+      cliVersionProbe: async () => "grok 1.0.24",
+    });
+    const store = new ModelCatalogStore(path.join(temporary, "catalog.db"));
+    const binding = { agentId: "grok", location: "bridge-a" };
+    const service = new ModelCatalogService({
+      store,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as never,
+      bindings: () => [binding],
+      scope: () => profile.catalog.scope(),
+      fetch: async () => profile.catalog.fetch(),
+    });
+    try {
+      const result = await service.refresh(binding);
+      const durable = store.getRefreshStatus("grok@bridge-a");
+      expect(result.error).toContain("exited_early");
+      expect(durable?.error).toBe(result.error);
+      for (const exposed of [secret, temporary, process.execPath, fixture]) {
+        expect(result.error).not.toContain(exposed);
+        expect(durable?.error).not.toContain(exposed);
+      }
+      expect(result.error).not.toContain("credential=");
+      expect(result.error).not.toContain("cwd=");
+      expect(result.error).not.toContain("executable=");
+    } finally {
+      service.stop();
+      await service.drain();
+      store.close();
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds and reaps a grok models child that ignores SIGTERM", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "seam-grok-models-reap-"));
+    const grokHome = path.join(temporary, "grok-home");
+    const logPath = path.join(temporary, "requests.jsonl");
+    const signalLog = path.join(temporary, "signals.log");
+    const fixture = path.join(process.cwd(), "test/fixtures/grok/fake-acp.mjs");
+    let childPid: number | undefined;
+    try {
+      writeAuth(grokHome, "models-reap-test");
+      const started = Date.now();
+      const operation = probeGrokModels({
+        cliPath: process.execPath,
+        baseArgs: [fixture],
+        cwd: temporary,
+        env: {
+          ...process.env,
+          GROK_HOME: grokHome,
+          GROK_FAKE_MODE: "models-ignore-term",
+          GROK_FAKE_LOG: logPath,
+          GROK_FAKE_SIGNAL_LOG: signalLog,
+          XAI_API_KEY: undefined,
+        },
+        timeoutMs: 200,
+      });
+      await vi.waitFor(() => expect(fs.existsSync(logPath)).toBe(true));
+      childPid = JSON.parse(fs.readFileSync(logPath, "utf8").trim()).pid;
+      await expect(operation).rejects.toMatchObject({ code: "timeout" });
+      expect(Date.now() - started).toBeLessThan(1_200);
+      expect(fs.readFileSync(signalLog, "utf8")).toContain("SIGTERM-IGNORED");
+      expect(() => process.kill(childPid!, 0)).toThrow();
+    } finally {
+      if (childPid) {
+        try { process.kill(childPid, "SIGKILL"); } catch {}
+      }
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  });
 });

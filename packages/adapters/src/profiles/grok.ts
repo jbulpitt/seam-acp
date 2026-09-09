@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createReadStream, lstatSync, readFileSync } from "node:fs";
 import { readdir, stat, readFile } from "node:fs/promises";
 import * as path from "node:path";
@@ -17,7 +17,7 @@ import {
   type CatalogModelEvidence,
   type CatalogScope,
 } from "../model-catalog.js";
-import { runBoundedProbe } from "../probe-process.js";
+import { ProbeError, runBoundedProbe } from "../probe-process.js";
 import type { ContextUsage, ISessionManager, SessionSummary } from "../session-manager.js";
 
 /**
@@ -359,18 +359,44 @@ function execGrokBounded(
   args: ReadonlyArray<string>,
   env: NodeJS.ProcessEnv,
   cwd: string,
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal
 ): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    execFile(cliPath, [...args], {
-      env,
-      cwd,
-      timeout: timeoutMs,
-      maxBuffer: 256_000,
-    }, (error, stdout, stderr) => {
-      if (error) reject(error);
-      else resolve({ stdout: String(stdout), stderr: String(stderr) });
-    });
+  const operation = runBoundedProbe({
+    executable: cliPath,
+    args,
+    env,
+    cwd,
+    timeoutMs,
+    ...(signal ? { signal } : {}),
+    // One-shot CLI commands get a short cooperative window, then the shared
+    // lifecycle escalates to SIGKILL and requires an observed exit.
+    killGraceMs: Math.min(250, Math.max(25, Math.floor(timeoutMs / 4))),
+    finalizeDeadlineMs: Math.min(250, Math.max(25, Math.floor(timeoutMs / 4))),
+    maxStdoutBytes: 256_000,
+    maxStderrBytes: 256_000,
+    allowCleanExit: true,
+    label: "Grok CLI command",
+    async run(handle) {
+      const chunks: Buffer[] = [];
+      const readStdout = (async () => {
+        for await (const chunk of handle.stdout) chunks.push(Buffer.from(chunk));
+      })();
+      await Promise.race([
+        Promise.all([readStdout, handle.completed]),
+        abortOn(handle.signal),
+      ]);
+      return { stdout: Buffer.concat(chunks).toString("utf8"), stderr: handle.stderrTail() };
+    },
+  });
+  return operation.catch((error: unknown) => {
+    // The catalog service persists Error.message. Preserve only the shared
+    // lifecycle code: child stderr, executable, cwd, argv, and env values are
+    // deliberately not propagated into returned or durable refresh errors.
+    if (error instanceof ProbeError) {
+      throw new ProbeError(error.code, "Grok CLI command failed safely");
+    }
+    throw new ProbeError("protocol_error", "Grok CLI command failed safely");
   });
 }
 
@@ -398,6 +424,7 @@ export async function probeGrokModels(options: {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  signal?: AbortSignal;
   expectedAuthIdentity?: GrokAuthIdentity;
 } = {}): Promise<GrokModelsProbe> {
   const cli = options.cliPath?.trim() || "grok";
@@ -411,7 +438,8 @@ export async function probeGrokModels(options: {
     [...(options.baseArgs ?? []), "models"],
     env,
     options.cwd ?? process.cwd(),
-    options.timeoutMs ?? 15_000
+    options.timeoutMs ?? 15_000,
+    options.signal
   );
   const parsed = parseGrokModelsOutput(result.stdout || result.stderr);
   if (parsed.authSource !== "subscription") {

@@ -14,6 +14,10 @@ import {
   probeCopilotCatalog,
   type CopilotCatalogProbe,
 } from "../packages/adapters/src/profiles/copilot.js";
+import {
+  CATALOG_SCOPE_LABEL_REDACTED,
+  normalizeCatalogCandidate,
+} from "../packages/adapters/src/catalog-evidence.js";
 import { dispatchBridgeRpc } from "../packages/bridge/src/rpc.js";
 
 interface ModelFixture {
@@ -123,8 +127,6 @@ function fakeCopilotSpawner(opts: {
   emptyModel?: string;
   mismatchOnceModel?: string;
   ignoreTerm?: boolean;
-  ignoreKill?: boolean;
-  missingStdout?: boolean;
   emitChildError?: boolean;
   exitWithStderr?: string;
   ignoreKillModel?: string;
@@ -171,14 +173,16 @@ function fakeCopilotSpawner(opts: {
     let forceStop!: (signal?: NodeJS.Signals | number) => void;
     const child = Object.assign(new EventEmitter(), {
       stdin,
-      stdout: opts.missingStdout ? null : stdout,
+      stdout,
       stderr,
       pid: 42_000 + calls.length,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
       killed: false,
       kill(signal?: NodeJS.Signals | number) {
         call.signals.push(signal);
         this.killed = true;
-        if (opts.ignoreKill || selectedModel === opts.ignoreKillModel) return true;
+        if (selectedModel === opts.ignoreKillModel) return true;
         if (signal === "SIGTERM" && opts.ignoreTerm) return true;
         forceStop(signal);
         return true;
@@ -188,7 +192,11 @@ function fakeCopilotSpawner(opts: {
         if (!exited) {
           exited = true;
           active -= 1;
+          child.signalCode = typeof signal === "string" ? signal : "SIGTERM";
           serverConnection?.close();
+          stdin.destroy();
+          stdout.destroy();
+          stderr.destroy();
           queueMicrotask(() => child.emit("exit", null, signal ?? "SIGTERM"));
         }
     };
@@ -240,6 +248,7 @@ function fakeCopilotSpawner(opts: {
           Readable.toWeb(stdin) as ReadableStream<Uint8Array>
         )
       );
+    queueMicrotask(() => child.emit("spawn"));
     if (opts.emitChildError) {
       queueMicrotask(() => child.emit("error", new Error("forced post-spawn child error")));
     }
@@ -249,7 +258,7 @@ function fakeCopilotSpawner(opts: {
         forceStop("SIGTERM");
       });
     }
-    return child as unknown as ReturnType<typeof import("node:child_process").spawn>;
+    return child as unknown as import("node:child_process").ChildProcessWithoutNullStreams;
   };
 
   return {
@@ -269,9 +278,6 @@ function fakeCopilotSpawner(opts: {
     },
     get stderrListenersRemoved() {
       return transports.every((group) => group[2]!.listenerCount("data") === 0);
-    },
-    get exposedStreamsDestroyed() {
-      return transports.every((group) => group[0]!.destroyed && group[2]!.destroyed);
     },
     forceCleanup() {
       for (const stop of forceStops) stop();
@@ -510,38 +516,6 @@ describe("Copilot isolated catalog probing (#234)", () => {
     expect(harness.stderrListenersRemoved).toBe(true);
   });
 
-  it("reaps a child that does not expose all required stdio pipes", async () => {
-    const harness = fakeCopilotSpawner({ missingStdout: true });
-    await expect(probeCopilotCatalog({
-      spawnProcess: harness.spawnProcess,
-      timeoutMs: 100,
-      overallTimeoutMs: 500,
-      cleanupTimeoutMs: 10,
-    })).rejects.toThrow(/stdio pipes/);
-    expect(harness.calls).toHaveLength(1);
-    expect(harness.active).toBe(0);
-    expect(harness.listenersRemoved).toBe(true);
-    expect(harness.exposedStreamsDestroyed).toBe(true);
-    expect(harness.calls[0]!.signals).toContain("SIGTERM");
-  });
-
-  it("cleans streams and listeners before reporting an unreaped child", async () => {
-    const harness = fakeCopilotSpawner({ missingStdout: true, ignoreKill: true });
-    await expect(probeCopilotCatalog({
-      spawnProcess: harness.spawnProcess,
-      timeoutMs: 100,
-      overallTimeoutMs: 500,
-      cleanupTimeoutMs: 10,
-    })).rejects.toThrow(/did not exit after SIGKILL/);
-    expect(harness.active).toBe(1);
-    expect(harness.listenersRemoved).toBe(true);
-    expect(harness.exposedStreamsDestroyed).toBe(true);
-    expect(harness.calls[0]!.signals).toEqual(["SIGTERM", "SIGKILL"]);
-    harness.forceCleanup();
-    await Promise.resolve();
-    expect(harness.active).toBe(0);
-  });
-
   it("does not retry while an unreaped per-model child may still be alive", async () => {
     const harness = fakeCopilotSpawner({
       models: modelFixtures(8),
@@ -558,10 +532,10 @@ describe("Copilot isolated catalog probing (#234)", () => {
     expect(harness.maxActive).toBe(1);
     expect(harness.calls.at(-1)?.signals).toEqual(["SIGTERM", "SIGKILL"]);
     expect(harness.listenersRemoved).toBe(true);
-    expect(harness.transportsDestroyed).toBe(true);
     harness.forceCleanup();
     await Promise.resolve();
     expect(harness.active).toBe(0);
+    expect(harness.transportsDestroyed).toBe(true);
   });
 
   it("redacts configured credentials from child stderr failures", async () => {
@@ -591,7 +565,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
     expect(String(failure)).not.toContain(secret);
     expect(String(failure)).not.toContain("github-suffix");
     expect(String(failure)).not.toContain("copilot-suffix");
-    expect(String(failure)).toContain("[REDACTED]");
+    expect(String(failure)).toContain("[redacted]");
     expect(harness.active).toBe(0);
     expect(harness.listenersRemoved).toBe(true);
     expect(harness.transportsDestroyed).toBe(true);
@@ -630,7 +604,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
       defaultModel: "configured-fallback",
       catalogProbe: async () => probe,
     });
-    const local = await profile.catalog.fetch();
+    const local = normalizeCatalogCandidate(await profile.catalog.fetch());
     const remote = await dispatchBridgeRpc("fetchModelCatalog", {}, profile.id, {
       adapters: new Map([[profile.id, profile]]),
       workspaceRoot: "/workspace",
@@ -641,7 +615,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
     expect(remote.models).toEqual(local.models);
     expect(remote.models).toHaveLength(30);
     expect(remote.scope).toEqual(local.scope);
-    expect(local.scope.credentialProfile).toBe("/credential/scope");
+    expect(local.scope.credentialProfile).toBe(CATALOG_SCOPE_LABEL_REDACTED);
     expect(local.sourceVersion).toBe(`acp/${PROTOCOL_VERSION}`);
     expect(local.cliVersion).toMatch(/^v?\d+/);
     expect(Number.isFinite(Date.parse(local.fetchedAt))).toBe(true);

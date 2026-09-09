@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs, { promises as fsp } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -17,6 +17,7 @@ import {
 import { asLocalAdapter, type AgentIdentity, type AgentProfile } from "../agent-profile.js";
 import { AGENT_ADAPTER_VERSION } from "../agent-profile.js";
 import { manifestCatalogScope, manifestCatalogSource, readCliVersion } from "../model-catalog.js";
+import { ProbeError, redactProbeText, runBoundedProbe } from "../probe-process.js";
 import type { SessionSummary, SessionSummaryLine } from "../session-manager.js";
 
 interface SeamAcpSessionIdRow {
@@ -54,6 +55,10 @@ export interface CopilotCatalogProbe {
   models: CopilotCatalogProbeModel[];
 }
 
+type CopilotModelProbeAttempt =
+  | { kind: "selected"; row: CopilotCatalogProbeModel }
+  | { kind: "not-selected"; returned: string | null };
+
 export interface CopilotCatalogLaunch {
   cliPath: string;
   args: string[];
@@ -61,7 +66,7 @@ export interface CopilotCatalogLaunch {
   env: NodeJS.ProcessEnv;
 }
 
-type CopilotAcpChild = ReturnType<typeof spawn>;
+type CopilotAcpChild = ChildProcessWithoutNullStreams;
 interface CopilotAcpLaunchSpec {
   executable: string;
   args: string[];
@@ -90,25 +95,6 @@ interface CopilotAcpProbeSession {
 
 const COPILOT_MODEL_PROBE_ATTEMPTS = 3;
 const COPILOT_ACP_BASE_ARGS = ["--acp"] as const;
-const COPILOT_SECRET_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"] as const;
-
-class CopilotModelSelectionError extends Error {}
-
-function redactCopilotSecrets(value: string, env: NodeJS.ProcessEnv): string {
-  let redacted = value;
-  const secrets = [...new Set(
-    COPILOT_SECRET_ENV_KEYS.map((key) => env[key]).filter((secret): secret is string => Boolean(secret))
-  )].sort((left, right) => right.length - left.length);
-  for (const secret of secrets) {
-    redacted = redacted.split(secret).join("[REDACTED]");
-  }
-  return redacted;
-}
-
-function sanitizedCopilotProbeError(error: unknown, env: NodeJS.ProcessEnv): Error {
-  const message = error instanceof Error ? error.message : String(error);
-  return new Error(redactCopilotSecrets(message, env));
-}
 
 function copilotAcpLaunchSpec(
   executable: string,
@@ -150,55 +136,18 @@ function abortReason(signal: AbortSignal, fallback: string): Error {
   return signal.reason instanceof Error ? signal.reason : new Error(fallback);
 }
 
-function boundedProbe<T>(
-  work: Promise<T>,
-  timeoutMs: number,
-  timeoutMessage: string,
-  signal: AbortSignal
-): Promise<T> {
-  if (signal.aborted) return Promise.reject(abortReason(signal, timeoutMessage));
-  return new Promise<T>((resolve, reject) => {
-    let settled = false;
-    let timer: NodeJS.Timeout;
-    const cleanup = () => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", onAbort);
-    };
-    const succeed = (value: T) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(value);
-    };
-    const fail = (error: unknown) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(error instanceof Error ? error : new Error(String(error)));
-    };
-    const onAbort = () => fail(abortReason(signal, timeoutMessage));
-    timer = setTimeout(() => fail(new Error(timeoutMessage)), Math.max(1, timeoutMs));
-    timer.unref?.();
+async function withProbeSignal<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw abortReason(signal, "copilot ACP probe aborted");
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(abortReason(signal, "copilot ACP probe aborted"));
     signal.addEventListener("abort", onAbort, { once: true });
-    work.then(succeed, fail);
   });
-}
-
-async function settleWithin(work: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  let timer: NodeJS.Timeout | undefined;
-  let settled = false;
-  await Promise.race([
-    work.then(
-      () => { settled = true; },
-      () => { settled = true; }
-    ),
-    new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, Math.max(1, timeoutMs));
-      timer.unref?.();
-    }),
-  ]);
-  if (timer) clearTimeout(timer);
-  return settled;
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
 }
 
 async function waitForProbeRetry(delayMs: number, signal: AbortSignal): Promise<void> {
@@ -226,127 +175,74 @@ async function runCopilotAcpProbeSession<T>(opts: {
   timeoutMs: number;
   cleanupTimeoutMs: number;
   signal: AbortSignal;
-  spawnProcess: CopilotAcpSpawn;
+  spawnProcess?: CopilotAcpSpawn;
   inspect: (
     session: CopilotAcpProbeSession,
     run: <R>(work: Promise<R>, message: string) => Promise<R>
   ) => Promise<T>;
 }): Promise<T> {
   const launch = copilotAcpLaunchSpec(opts.cliPath, opts.args, opts.cwd, opts.env);
-  const child = opts.spawnProcess(launch.executable, launch.args, launch.options);
-  const stdin = child.stdin;
-  const stdout = child.stdout;
-  const stderrStream = child.stderr;
-  let stderr = "";
-  const onStderrData = (chunk: string) => { stderr = (stderr + chunk).slice(-4000); };
-  let exited = false;
-  let intentionalStop = false;
-  let resolveExit!: () => void;
-  let rejectDied!: (error: Error) => void;
-  const exitedPromise = new Promise<void>((resolve) => { resolveExit = resolve; });
-  const died = new Promise<never>((_resolve, reject) => { rejectDied = reject; });
-  const onChildError = (error: Error) => {
-    // A post-spawn ChildProcess error does not imply the OS process exited.
-    // Only a spawn failure (no pid) is terminal without an exit event.
-    if (child.pid === undefined) {
-      exited = true;
-      resolveExit();
-    }
-    rejectDied(error);
-  };
-  const onChildExit = (code: number | null, signal: NodeJS.Signals | null) => {
-    exited = true;
-    resolveExit();
-    if (!intentionalStop) {
-      rejectDied(new Error(
-        `copilot ACP exited early (code=${code}, signal=${signal}): ` +
-        redactCopilotSecrets(stderr.trim(), opts.env)
-      ));
-    }
-  };
-  child.once("error", onChildError);
-  child.once("exit", onChildExit);
-  void died.catch(() => undefined);
-  if (stderrStream) {
-    stderrStream.setEncoding("utf8");
-    stderrStream.on("data", onStderrData);
-  }
-  const deadline = Date.now() + opts.timeoutMs;
-  let connection: ClientSideConnection | undefined;
-  let sessionId: string | undefined;
-  try {
-    if (!stdin || !stdout || !stderrStream) {
-      throw new Error("copilot ACP probe did not expose stdio pipes");
-    }
-    connection = new ClientSideConnection(
-      () => ({
-        async requestPermission(request) {
-          const option = request.options.find((entry) => entry.kind?.startsWith("allow_"));
-          return option
-            ? { outcome: { outcome: "selected" as const, optionId: option.optionId } }
-            : { outcome: { outcome: "cancelled" as const } };
-        },
-        async sessionUpdate() {},
-      } satisfies Client),
-      ndJsonStream(
-        Writable.toWeb(stdin) as unknown as WritableStream<Uint8Array>,
-        Readable.toWeb(stdout) as unknown as ReadableStream<Uint8Array>
-      )
-    );
-    const run = <R>(work: Promise<R>, message: string): Promise<R> => boundedProbe(
-      Promise.race([work, died]),
-      deadline - Date.now(),
-      message,
-      opts.signal
-    );
-    await run(
-      connection.initialize({
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
-      }),
-      "copilot ACP initialize timed out"
-    );
-    const session = await run(
-      connection.newSession({ cwd: opts.cwd, mcpServers: [] }),
-      "copilot ACP session/new timed out"
-    );
-    sessionId = session.sessionId;
-    return await opts.inspect({
-      connection,
-      sessionId,
-      configOptions: catalogConfigOptions(session.configOptions),
-    }, run);
-  } finally {
-    intentionalStop = true;
-    if (sessionId && connection && !exited) {
-      try {
-        await settleWithin(connection.closeSession({ sessionId }), opts.cleanupTimeoutMs);
-      } catch {
-        // Process termination below remains authoritative cleanup.
-      }
-    }
-    if (!exited) {
-      try { child.kill("SIGTERM"); } catch { /* continue to SIGKILL */ }
-      await settleWithin(exitedPromise, opts.cleanupTimeoutMs);
-    }
-    if (!exited) {
-      try { child.kill("SIGKILL"); } catch { /* report after local cleanup */ }
-      await settleWithin(exitedPromise, opts.cleanupTimeoutMs);
-    }
-    stdin?.destroy();
-    stdout?.destroy();
-    stderrStream?.destroy();
-    const connectionClosed = connection
-      ? await settleWithin(connection.closed, opts.cleanupTimeoutMs)
-      : true;
-    stderrStream?.removeListener("data", onStderrData);
-    child.removeListener("error", onChildError);
-    child.removeListener("exit", onChildExit);
-    if (!exited) throw new Error("copilot ACP probe process did not exit after SIGKILL");
-    if (connection && (!connectionClosed || !connection.signal.aborted)) {
-      throw new Error("copilot ACP probe connection did not close");
-    }
-  }
+  return runBoundedProbe({
+    executable: launch.executable,
+    args: launch.args,
+    cwd: launch.options.cwd,
+    env: launch.options.env,
+    timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+    killGraceMs: opts.cleanupTimeoutMs,
+    finalizeDeadlineMs: opts.cleanupTimeoutMs,
+    label: "copilot ACP catalog probe",
+    ...(opts.spawnProcess
+      ? { spawnOverride: () => opts.spawnProcess!(launch.executable, launch.args, launch.options) }
+      : {}),
+    run: async (handle) => {
+      let sessionId: string | undefined;
+      const connection = new ClientSideConnection(
+        () => ({
+          async requestPermission(request) {
+            const option = request.options.find((entry) => entry.kind?.startsWith("allow_"));
+            return option
+              ? { outcome: { outcome: "selected" as const, optionId: option.optionId } }
+              : { outcome: { outcome: "cancelled" as const } };
+          },
+          async sessionUpdate() {},
+        } satisfies Client),
+        ndJsonStream(
+          Writable.toWeb(handle.stdin) as unknown as WritableStream<Uint8Array>,
+          Readable.toWeb(handle.stdout) as unknown as ReadableStream<Uint8Array>
+        )
+      );
+      handle.onClose(async (signal) => {
+        if (sessionId) {
+          await withProbeSignal(connection.closeSession({ sessionId }), signal);
+        }
+      }, "session");
+      handle.onClose(async (signal) => {
+        handle.stdin.destroy();
+        handle.stdout.destroy();
+        await withProbeSignal(connection.closed, signal);
+      }, "connection");
+      const run = <R>(work: Promise<R>, _message: string): Promise<R> =>
+        withProbeSignal(work, handle.signal);
+      await run(
+        connection.initialize({
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+        }),
+        "copilot ACP initialize timed out"
+      );
+      const session = await run(
+        connection.newSession({ cwd: opts.cwd, mcpServers: [] }),
+        "copilot ACP session/new timed out"
+      );
+      sessionId = session.sessionId;
+      return await opts.inspect({
+        connection,
+        sessionId,
+        configOptions: catalogConfigOptions(session.configOptions),
+      }, run);
+    },
+  });
 }
 
 /** Adapter-owned ACP collector with one fresh process/session per model. */
@@ -375,8 +271,7 @@ export async function probeCopilotCatalog(options: {
     controller.abort(new Error(`copilot ACP catalog probe timed out after ${overallTimeoutMs}ms`));
   }, Math.max(1, overallTimeoutMs));
   overallTimer.unref?.();
-  const spawnProcess: CopilotAcpSpawn = options.spawnProcess ?? ((executable, args, spawnOpts) =>
-    spawn(executable, args, spawnOpts));
+  const spawnProcess = options.spawnProcess;
   try {
     const discovery = await runCopilotAcpProbeSession({
       cliPath, args, cwd, env, timeoutMs, cleanupTimeoutMs,
@@ -411,7 +306,7 @@ export async function probeCopilotCatalog(options: {
       let lastError: unknown;
       for (let attempt = 1; attempt <= COPILOT_MODEL_PROBE_ATTEMPTS; attempt += 1) {
         try {
-          rows[index] = await runCopilotAcpProbeSession({
+          const result = await runCopilotAcpProbeSession<CopilotModelProbeAttempt>({
             cliPath, args, cwd, env, timeoutMs, cleanupTimeoutMs,
             signal: controller.signal,
             spawnProcess,
@@ -431,10 +326,10 @@ export async function probeCopilotCatalog(options: {
               }
               const selectedModel = selectOption(responseOptions, "model");
               if (selectedModel?.currentValue !== model.value) {
-                throw new CopilotModelSelectionError(
-                  `copilot ACP model probe did not select ${JSON.stringify(model.value)} ` +
-                  `(returned ${JSON.stringify(selectedModel?.currentValue ?? null)})`
-                );
+                return {
+                  kind: "not-selected",
+                  returned: selectedModel?.currentValue ?? null,
+                };
               }
               const effort = selectOption(responseOptions, "reasoning_effort");
               const effortChoices = effort
@@ -444,28 +339,45 @@ export async function probeCopilotCatalog(options: {
                 throw new Error(`copilot ACP advertised an empty effort list for ${model.value}`);
               }
               return {
-                modelId: model.value,
-                displayName: model.name,
-                effortChoices,
-                effortDefault: effort?.currentValue && effortChoices.includes(effort.currentValue)
-                  ? effort.currentValue
-                  : "default",
-                priceCategory: copilotPriceCategory(model),
+                kind: "selected",
+                row: {
+                  modelId: model.value,
+                  displayName: model.name,
+                  effortChoices,
+                  effortDefault: effort?.currentValue && effortChoices.includes(effort.currentValue)
+                    ? effort.currentValue
+                    : "default",
+                  priceCategory: copilotPriceCategory(model),
+                },
               };
             },
           });
+          if (result.kind === "not-selected") {
+            lastError = new Error(
+              `copilot ACP model probe did not select ${JSON.stringify(model.value)} ` +
+              `(returned ${JSON.stringify(result.returned)})`
+            );
+            if (attempt < COPILOT_MODEL_PROBE_ATTEMPTS) {
+              await waitForProbeRetry(attempt * 1_000, controller.signal);
+              continue;
+            }
+            break;
+          }
+          rows[index] = result.row;
           break;
         } catch (error) {
           lastError = error;
-          if (controller.signal.aborted || !(error instanceof CopilotModelSelectionError)) break;
-          if (attempt < COPILOT_MODEL_PROBE_ATTEMPTS) {
-            await waitForProbeRetry(attempt * 1_000, controller.signal);
-          }
+          break;
         }
       }
       if (!rows[index]) {
-        const detail = lastError instanceof Error ? lastError.message : String(lastError);
-        throw new Error(`copilot ACP model probe failed for ${model.value}: ${detail}`);
+        if (lastError instanceof ProbeError && lastError.code === "not_reaped") throw lastError;
+        const detail = redactProbeText(
+          lastError instanceof Error ? lastError.message : String(lastError),
+          env
+        );
+        const modelLabel = redactProbeText(model.value, env);
+        throw new Error(`copilot ACP model probe failed for ${modelLabel}: ${detail}`);
       }
     }
     if (controller.signal.aborted) {
@@ -479,7 +391,10 @@ export async function probeCopilotCatalog(options: {
       models: rows as CopilotCatalogProbeModel[],
     };
   } catch (error) {
-    throw sanitizedCopilotProbeError(error, env);
+    if (controller.signal.aborted && (!(error instanceof ProbeError) || error.code === "cancelled")) {
+      throw abortReason(controller.signal, "copilot ACP catalog probe aborted");
+    }
+    throw error;
   } finally {
     clearTimeout(overallTimer);
   }

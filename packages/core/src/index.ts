@@ -89,6 +89,7 @@ import {
   ServiceStatusStore,
 } from "./core/service-status/index.js";
 import { ServiceStatusCard } from "./core/service-status-card.js";
+import { planAgyIdentityMigration, readAgyHandleOwnership } from "./core/agy-identity-migration.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -139,6 +140,19 @@ async function main(): Promise<void> {
 
   const seamDbPath = path.join(config.DATA_DIR, "seam.db");
   const store = new SessionStore(seamDbPath);
+  if (config.AGY_NATIVE_RESTORE && !store.agyIdentityRestored()) {
+    const changes = planAgyIdentityMigration(
+      store.list(store.countSessions()),
+      readAgyHandleOwnership(config.DATA_DIR, process.env.HOME ?? "", config.AGY_ACP_STATE_DIR ?? path.join(process.env.HOME ?? "", ".agy-acp")),
+      (record) => {
+        const explicitAgent = config.threadPresets.get(record.channelRef)?.agent?.value
+          ?? (record.parentRef ? config.channelPresets.get(record.parentRef)?.agent?.value : undefined);
+        return { agent: explicitAgent ?? record.agentId, explicitAgent, location: resolveThreadLocation(config, record.channelRef) };
+      },
+    );
+    store.applyAgyIdentityMigration(changes);
+    logger.info({ total: changes.length, rebuildRequired: changes.filter((change) => change.rebuild).length }, "local AGY native identity restoration applied");
+  }
   const modelValueStore = new ModelValueStore(seamDbPath, {
     inputTokens: config.MODEL_VALUE_STD_INPUT_TOKENS,
     outputTokens: config.MODEL_VALUE_STD_OUTPUT_TOKENS,

@@ -52,6 +52,7 @@ function stubProfile(id: string): AgentProfile {
 
 function stubStore(): SessionStore {
   return {
+    needsAgyIdentityRebuild: () => false,
     readConfig: (record: SessionRecord): SessionConfigState => {
       try {
         return record.configJson ? (JSON.parse(record.configJson) as SessionConfigState) : {};

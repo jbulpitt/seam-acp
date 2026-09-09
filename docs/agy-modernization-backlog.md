@@ -64,6 +64,11 @@ contracts rather than introduce a second job framework. R7 recovery depends on
 
 ## R0 — Restore unambiguous public identities (P0, immediate)
 
+**Owner decision (2026-09-09):** existing local package-backed threads switch
+to native `agy`; preserve Discord/configuration and rebuild incompatible handles.
+PR #254 implements an opt-in, atomic, one-shot boot migration with before-images
+and a next-admitted-turn reconstruction gate. No remote identity migration.
+
 **Outcome:** native profile/factory/file are `agy` / `makeAgyProfile` / `agy.ts`;
 external are `agy-package` / `makeAgyPackageProfile` / `agy-package.ts`.
 

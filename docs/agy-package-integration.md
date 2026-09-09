@@ -16,6 +16,33 @@ to `agy-package`; switching them to native `agy` may require a fresh ACP session
 or explicit Discord reconstruction. Do not silently reinterpret handles or modify
 remote bindings. The operator must approve the migration policy before rollout.
 
+### Approved native restoration (2026-09-09)
+
+The owner selected switching existing local threads to native `agy`, retaining
+Discord history and configuration, and rebuilding incompatible ACP sessions.
+`AGY_NATIVE_RESTORE=true` enables a one-time startup migration before catalog
+collection or work admission. Native handles found in the current or legacy map
+are preserved; package/unrecognized nonempty handles are archived in SQLite
+before-images and cleared. Unbound sessions remain unbound. Remote rows and
+unrelated agents are excluded. Malformed maps, ambiguous ownership and conflicting
+overlays fail closed; explicit `agy-old` presets require separate config migration.
+
+The transaction records a completion marker and per-thread rebuild requirements.
+Retries do not reapply the migration. The next admitted thread turn uses the
+existing Discord reconstruction/compare-and-swap path before the user's prompt;
+failed reconstruction retains the marker and cannot silently start a blank
+conversation. No startup prompt fanout is scheduled. The migration only updates
+the agent/ACP columns; model, role, repo, timestamps and all config bytes stay
+unchanged. Rebuilt context remains subject to normal history availability and
+context-budget limits; this is not recovery of private provider-only thinking.
+
+Offline rollback is available through `SessionStore.rollbackAgyIdentityMigration`:
+it restores all before-images atomically only when every migrated row still
+matches its post-migration snapshot. A changed or rebuilt session refuses the
+entire rollback. Never invoke rollback while the running bot can admit work.
+Original package/native maps and conversation stores are neither modified nor
+deleted. Keep their data until the owner authorizes any later cleanup.
+
 The native implementation preserves its durable handle during reconstruction;
 package invalidation clears only its ACP handle, not Discord history/config.
 See [the native modernization backlog](agy-modernization-backlog.md) for the

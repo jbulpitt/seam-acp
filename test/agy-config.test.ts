@@ -17,6 +17,7 @@ describe("package-backed agy configuration gates", () => {
       CHANNEL_PRESETS_FILE: undefined,
       AGY_ENABLED: "false",
       AGY_PACKAGE_ENABLED: "false",
+      AGY_NATIVE_RESTORE: "false",
       AGY_OLD_ROLLBACK_ENABLED: "false",
       ...extra,
     } as NodeJS.ProcessEnv;

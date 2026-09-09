@@ -986,6 +986,9 @@ export class SessionRouter {
    * remote spawn path. `startRuntime` is the only production caller.
    */
   planRuntimeSpawn(record: SessionRecord): RuntimeSpawnPlan {
+    if (this.store.needsAgyIdentityRebuild(record.id)) {
+      throw new Error("Native restoration requires Discord reconstruction before this session can run");
+    }
     const location = this.bindRecordLocation(record);
     const preset = resolveChannelPreset(
       { channelPresets: this.channelPresets, threadPresets: this.threadPresets },

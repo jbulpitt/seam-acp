@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import type { AgyIdentityChange } from "./agy-identity-migration.js";
 import {
   defaultSessionConfig,
   type ActiveProject,
@@ -94,6 +95,12 @@ import type {
 } from "./elicitation/types.js";
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS agy_identity_restore (
+  id TEXT PRIMARY KEY,
+  before_json TEXT NOT NULL,
+  after_json TEXT NOT NULL,
+  rebuild_required INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS sessions (
   id              TEXT PRIMARY KEY,
   platform        TEXT NOT NULL,
@@ -1073,6 +1080,54 @@ export class SessionStore {
       )
       .all(limit);
     return rows.map(mapRow);
+  }
+
+  agyIdentityRestored(): boolean {
+    return !!this.db.prepare("SELECT 1 FROM agy_identity_restore WHERE id = '@complete'").get();
+  }
+
+  /** Atomic before-images + narrow updates + completion marker. Boot-only. */
+  applyAgyIdentityMigration(changes: readonly AgyIdentityChange[]): boolean {
+    return this.db.transaction(() => {
+      if (this.agyIdentityRestored()) return false;
+      for (const change of changes) {
+        if (JSON.stringify(this.get(change.before.id)) !== JSON.stringify(change.before)) throw new Error("AGY migration snapshot changed");
+        this.db.prepare("INSERT INTO agy_identity_restore VALUES (?, ?, ?, ?)").run(
+          change.before.id, JSON.stringify(change.before), JSON.stringify(change.after), change.rebuild ? 1 : 0);
+        this.db.prepare("UPDATE sessions SET agent_id = ?, acp_session_id = ? WHERE id = ?").run(
+          change.after.agentId, change.after.acpSessionId, change.before.id);
+      }
+      this.db.prepare("INSERT INTO agy_identity_restore VALUES ('@complete', '{}', '{}', 0)").run();
+      return true;
+    })();
+  }
+
+  needsAgyIdentityRebuild(id: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM agy_identity_restore WHERE id = ? AND rebuild_required = 1").get(id);
+  }
+
+  completeAgyIdentityRebuild(id: string, acpSessionId: string): boolean {
+    if (!acpSessionId) return false;
+    return this.db.prepare(`UPDATE agy_identity_restore SET rebuild_required = 0
+      WHERE id = ? AND rebuild_required = 1 AND EXISTS
+        (SELECT 1 FROM sessions WHERE id = ? AND agent_id = 'agy' AND acp_session_id = ?)`)
+      .run(id, id, acpSessionId).changes === 1;
+  }
+
+  /** Offline recovery only. Refuse the whole rollback if any migrated row changed. */
+  rollbackAgyIdentityMigration(): void {
+    this.db.transaction(() => {
+      const rows = this.db.prepare("SELECT before_json, after_json FROM agy_identity_restore WHERE id != '@complete'").all() as Array<{ before_json: string; after_json: string }>;
+      for (const row of rows) {
+        const after = JSON.parse(row.after_json) as SessionRecord;
+        if (JSON.stringify(this.get(after.id)) !== JSON.stringify(after)) throw new Error("AGY rollback refused: session changed since migration");
+      }
+      for (const row of rows) {
+        const before = JSON.parse(row.before_json) as SessionRecord;
+        this.db.prepare("UPDATE sessions SET agent_id = ?, acp_session_id = ? WHERE id = ?").run(before.agentId, before.acpSessionId, before.id);
+      }
+      this.db.prepare("DELETE FROM agy_identity_restore").run();
+    })();
   }
 
   /** Total session rows — uncapped, unlike {@link list}. */

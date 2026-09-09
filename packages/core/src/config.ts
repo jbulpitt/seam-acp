@@ -290,6 +290,8 @@ const Schema = z.object({
   AGY_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
   /** Optional package-backed implementation; never enabled by AGY_ENABLED. */
   AGY_PACKAGE_ENABLED: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
+  /** Owner-approved one-time local native restoration, applied before work admission. */
+  AGY_NATIVE_RESTORE: z.enum(["true", "false"]).default("false").transform((v) => v === "true"),
   /** Exact compiled antigravity-acp v1.1.0 executable for this host. */
   AGY_ACP_BIN: z.string().optional(),
   /** Exact authenticated agy executable; forwarded to the wrapper as AGY_BIN. */
@@ -1241,6 +1243,7 @@ export function loadConfig(): Config {
       throw new Error("Invalid configuration: native agy requires AGY_DEFAULT_MODEL");
     }
   }
+  if (cfg.AGY_NATIVE_RESTORE && !cfg.AGY_ENABLED) throw new Error("AGY_NATIVE_RESTORE requires native AGY_ENABLED");
 
   // #12: DEFAULT_AGENT naming a RETIRED agent is a configuration error, refused
   // here rather than at the first turn. This is the bot-wide default, so every

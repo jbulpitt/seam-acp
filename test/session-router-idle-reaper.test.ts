@@ -87,6 +87,7 @@ function makeStore(record: SessionRecord): SessionStore {
     upsert: (next: SessionRecord) => {
       row = { ...next };
     },
+    needsAgyIdentityRebuild: () => false,
     readConfig: (input: SessionRecord) => JSON.parse(input.configJson) as SessionConfigState,
   } as unknown as SessionStore;
 }

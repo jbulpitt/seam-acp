@@ -28,6 +28,7 @@ const profiles = [
 /** A SessionStore stub that only implements what describeConfig reads. */
 function stubStore(): SessionStore {
   return {
+    needsAgyIdentityRebuild: () => false,
     readConfig: (record: SessionRecord): SessionConfigState => {
       if (!record.configJson) return {};
       try {

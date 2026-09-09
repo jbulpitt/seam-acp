@@ -2,7 +2,13 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { agent, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+import {
+  agent,
+  ClientSideConnection,
+  methods,
+  ndJsonStream,
+  PROTOCOL_VERSION,
+} from "@agentclientprotocol/sdk";
 import {
   makeCopilotProfile,
   probeCopilotCatalog,
@@ -22,6 +28,24 @@ function modelFixtures(count = 30): ModelFixture[] {
   return Array.from({ length: count }, (_unused, index) => {
     if (index === 0) {
       return {
+        id: "default-model",
+        name: "Default Model",
+        choices: ["low", "medium", "high"],
+        defaultEffort: "medium",
+        priceCategory: "standard",
+      };
+    }
+    if (index === 1) {
+      return {
+        id: "contamination-seed",
+        name: "Contamination Seed",
+        choices: ["medium", "high"],
+        defaultEffort: "high",
+        priceCategory: "standard",
+      };
+    }
+    if (index === 2) {
+      return {
         id: "gpt-6-astra",
         name: "GPT-6 Astra",
         choices: ["low", "medium", "high", "xhigh"],
@@ -29,16 +53,16 @@ function modelFixtures(count = 30): ModelFixture[] {
         priceCategory: "premium",
       };
     }
-    if (index === 1) {
+    if (index === 3) {
       return {
         id: "grok-4.6",
         name: "Grok 4.6",
         choices: ["low", "medium", "high"],
-        defaultEffort: "high",
+        defaultEffort: "medium",
         priceCategory: "standard",
       };
     }
-    if (index === 2) {
+    if (index === 4) {
       return {
         id: "gpt-5-mini",
         name: "GPT-5 Mini",
@@ -231,6 +255,63 @@ function probeChecksum(probe: CopilotCatalogProbe): string {
   return createHash("sha256").update(JSON.stringify(probe)).digest("hex");
 }
 
+async function reusedSessionDefaults(
+  spawnProcess: ReturnType<typeof fakeCopilotSpawner>["spawnProcess"]
+): Promise<Map<string, string>> {
+  const child = spawnProcess("copilot", ["--acp"], {
+    cwd: "/credential/scope",
+    env: {},
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const connection = new ClientSideConnection(
+    () => ({
+      async requestPermission() {
+        return { outcome: { outcome: "cancelled" as const } };
+      },
+      async sessionUpdate() {},
+    }),
+    ndJsonStream(
+      Writable.toWeb(child.stdin!) as unknown as WritableStream<Uint8Array>,
+      Readable.toWeb(child.stdout!) as unknown as ReadableStream<Uint8Array>
+    )
+  );
+  let sessionId: string | undefined;
+  try {
+    await connection.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+    });
+    const session = await connection.newSession({ cwd: "/credential/scope", mcpServers: [] });
+    sessionId = session.sessionId;
+    const initial = session.configOptions ?? [];
+    const modelSelect = initial.find((option) => option.id === "model");
+    if (modelSelect?.type !== "select") throw new Error("fake model select missing");
+    const models = modelSelect.options.flatMap((option) =>
+      "options" in option ? option.options : [option]
+    );
+    const defaults = new Map<string, string>();
+    for (const model of models) {
+      const options = model.value === modelSelect.currentValue
+        ? initial
+        : (await connection.setSessionConfigOption({
+            sessionId,
+            configId: "model",
+            value: model.value,
+          })).configOptions ?? [];
+      const effort = options.find((option) => option.id === "reasoning_effort");
+      defaults.set(model.value, effort?.type === "select" ? effort.currentValue : "default");
+    }
+    return defaults;
+  } finally {
+    if (sessionId) await connection.closeSession({ sessionId });
+    child.kill("SIGTERM");
+    child.stdin?.destroy();
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    await connection.closed;
+  }
+}
+
 async function candidateChecksum(probe: CopilotCatalogProbe): Promise<string> {
   const profile = makeCopilotProfile({
     cliPath: process.execPath,
@@ -247,6 +328,28 @@ async function candidateChecksum(probe: CopilotCatalogProbe): Promise<string> {
 }
 
 describe("Copilot isolated catalog probing (#234)", () => {
+  it("reproduces the reused-session outlier while isolated probes stay model-correct", async () => {
+    const contaminatedHarness = fakeCopilotSpawner({ models: modelFixtures(6) });
+    const contaminated = await reusedSessionDefaults(contaminatedHarness.spawnProcess);
+    expect(contaminated.get("gpt-6-astra")).toBe("high");
+    expect(contaminated.get("grok-4.6")).toBe("high");
+    expect(contaminatedHarness.active).toBe(0);
+
+    const isolatedHarness = fakeCopilotSpawner({ models: modelFixtures(6) });
+    const isolated = await probeCopilotCatalog({
+      spawnProcess: isolatedHarness.spawnProcess,
+      timeoutMs: 1_000,
+      overallTimeoutMs: 10_000,
+      cleanupTimeoutMs: 50,
+    });
+    expect(isolated.models.find((model) => model.modelId === "gpt-6-astra")?.effortDefault)
+      .toBe("medium");
+    expect(isolated.models.find((model) => model.modelId === "grok-4.6")?.effortDefault)
+      .toBe("medium");
+    expect(isolatedHarness.active).toBe(0);
+    expect(isolatedHarness.closedSessions).toEqual(isolatedHarness.openedSessions);
+  });
+
   it("collects all >25 models with order-invariant model-specific defaults", async () => {
     const forwardHarness = fakeCopilotSpawner();
     const reverseHarness = fakeCopilotSpawner();
@@ -280,7 +383,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
     });
     expect(forward.models.find((model) => model.modelId === "grok-4.6")).toMatchObject({
       effortChoices: ["low", "medium", "high"],
-      effortDefault: "high",
+      effortDefault: "medium",
     });
     expect(forward.models.find((model) => model.modelId === "gpt-5-mini")).toMatchObject({
       effortChoices: [],
@@ -304,14 +407,14 @@ describe("Copilot isolated catalog probing (#234)", () => {
   });
 
   it("fails atomically and cleans every process/session on a partial probe error", async () => {
-    const harness = fakeCopilotSpawner({ models: modelFixtures(10), failModel: "fixture-03" });
+    const harness = fakeCopilotSpawner({ models: modelFixtures(10), failModel: "fixture-05" });
     await expect(probeCopilotCatalog({
       spawnProcess: harness.spawnProcess,
       timeoutMs: 1_000,
       overallTimeoutMs: 5_000,
       cleanupTimeoutMs: 50,
-    })).rejects.toThrow(/forced probe failure|fixture-03/);
-    expect(harness.calls).toHaveLength(7);
+    })).rejects.toThrow(/forced probe failure|fixture-05/);
+    expect(harness.calls).toHaveLength(9);
     expect(harness.active).toBe(0);
     expect(harness.closedSessions).toEqual(harness.openedSessions);
     expect(harness.listenersRemoved).toBe(true);
@@ -323,7 +426,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
   it("retries an unacknowledged model in a new isolated process/session", async () => {
     const harness = fakeCopilotSpawner({
       models: modelFixtures(8),
-      mismatchOnceModel: "fixture-03",
+      mismatchOnceModel: "fixture-05",
     });
     const probe = await probeCopilotCatalog({
       spawnProcess: harness.spawnProcess,
@@ -344,7 +447,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
   it("bounds a hung probe, closes its session, and escalates process cleanup", async () => {
     const harness = fakeCopilotSpawner({
       models: modelFixtures(6),
-      hangModel: "fixture-03",
+      hangModel: "fixture-05",
       ignoreTerm: true,
     });
     await expect(probeCopilotCatalog({
@@ -353,7 +456,7 @@ describe("Copilot isolated catalog probing (#234)", () => {
       overallTimeoutMs: 1_000,
       cleanupTimeoutMs: 20,
     })).rejects.toThrow(/timed out/);
-    expect(harness.calls).toHaveLength(5);
+    expect(harness.calls).toHaveLength(7);
     expect(harness.active).toBe(0);
     expect(harness.closedSessions).toEqual(harness.openedSessions);
     expect(harness.listenersRemoved).toBe(true);
@@ -364,14 +467,14 @@ describe("Copilot isolated catalog probing (#234)", () => {
   });
 
   it("rejects empty per-model output instead of returning a half-probed catalog", async () => {
-    const harness = fakeCopilotSpawner({ models: modelFixtures(7), emptyModel: "fixture-03" });
+    const harness = fakeCopilotSpawner({ models: modelFixtures(7), emptyModel: "fixture-05" });
     await expect(probeCopilotCatalog({
       spawnProcess: harness.spawnProcess,
       timeoutMs: 1_000,
       overallTimeoutMs: 5_000,
       cleanupTimeoutMs: 50,
-    })).rejects.toThrow(/did not select|fixture-03/);
-    expect(harness.calls).toHaveLength(7);
+    })).rejects.toThrow(/did not select|fixture-05/);
+    expect(harness.calls).toHaveLength(9);
     expect(harness.active).toBe(0);
     expect(harness.closedSessions).toEqual(harness.openedSessions);
     expect(harness.listenersRemoved).toBe(true);

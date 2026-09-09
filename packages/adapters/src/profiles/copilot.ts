@@ -54,7 +54,24 @@ export interface CopilotCatalogProbe {
   models: CopilotCatalogProbeModel[];
 }
 
+export interface CopilotCatalogLaunch {
+  cliPath: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+}
+
 type CopilotAcpChild = ReturnType<typeof spawn>;
+interface CopilotAcpLaunchSpec {
+  executable: string;
+  args: string[];
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    stdio: ["pipe", "pipe", "pipe"];
+  };
+}
+
 type CopilotAcpSpawn = (
   executable: string,
   args: string[],
@@ -72,6 +89,20 @@ interface CopilotAcpProbeSession {
 }
 
 const COPILOT_MODEL_PROBE_ATTEMPTS = 3;
+const COPILOT_ACP_BASE_ARGS = ["--acp"] as const;
+
+function copilotAcpLaunchSpec(
+  executable: string,
+  args: readonly string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv
+): CopilotAcpLaunchSpec {
+  return {
+    executable,
+    args: [...args],
+    options: { cwd, env, stdio: ["pipe", "pipe", "pipe"] },
+  };
+}
 
 function flattenSelectOptions(options: SessionConfigSelectOptions): SessionConfigSelectOption[] {
   return (options as Array<SessionConfigSelectOption | SessionConfigSelectGroup>).flatMap((option) =>
@@ -134,16 +165,21 @@ function boundedProbe<T>(
   });
 }
 
-async function settleWithin(work: Promise<unknown>, timeoutMs: number): Promise<void> {
+async function settleWithin(work: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   let timer: NodeJS.Timeout | undefined;
+  let settled = false;
   await Promise.race([
-    work.catch(() => undefined),
+    work.then(
+      () => { settled = true; },
+      () => { settled = true; }
+    ),
     new Promise<void>((resolve) => {
       timer = setTimeout(resolve, Math.max(1, timeoutMs));
       timer.unref?.();
     }),
   ]);
   if (timer) clearTimeout(timer);
+  return settled;
 }
 
 async function waitForProbeRetry(delayMs: number, signal: AbortSignal): Promise<void> {
@@ -165,6 +201,7 @@ async function waitForProbeRetry(delayMs: number, signal: AbortSignal): Promise<
 
 async function runCopilotAcpProbeSession<T>(opts: {
   cliPath: string;
+  args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
@@ -176,11 +213,8 @@ async function runCopilotAcpProbeSession<T>(opts: {
     run: <R>(work: Promise<R>, message: string) => Promise<R>
   ) => Promise<T>;
 }): Promise<T> {
-  const child = opts.spawnProcess(opts.cliPath, ["--acp"], {
-    cwd: opts.cwd,
-    env: opts.env,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  const launch = copilotAcpLaunchSpec(opts.cliPath, opts.args, opts.cwd, opts.env);
+  const child = opts.spawnProcess(launch.executable, launch.args, launch.options);
   const stdin = child.stdin;
   const stdout = child.stdout;
   const stderrStream = child.stderr;
@@ -190,19 +224,20 @@ async function runCopilotAcpProbeSession<T>(opts: {
   }
   let stderr = "";
   stderrStream.setEncoding("utf8");
-  stderrStream.on("data", (chunk: string) => { stderr = (stderr + chunk).slice(-4000); });
+  const onStderrData = (chunk: string) => { stderr = (stderr + chunk).slice(-4000); };
+  stderrStream.on("data", onStderrData);
   let exited = false;
   let intentionalStop = false;
   let resolveExit!: () => void;
   let rejectDied!: (error: Error) => void;
   const exitedPromise = new Promise<void>((resolve) => { resolveExit = resolve; });
   const died = new Promise<never>((_resolve, reject) => { rejectDied = reject; });
-  child.once("error", (error) => {
+  const onChildError = (error: Error) => {
     exited = true;
     resolveExit();
     rejectDied(error);
-  });
-  child.once("exit", (code, signal) => {
+  };
+  const onChildExit = (code: number | null, signal: NodeJS.Signals | null) => {
     exited = true;
     resolveExit();
     if (!intentionalStop) {
@@ -210,7 +245,9 @@ async function runCopilotAcpProbeSession<T>(opts: {
         `copilot ACP exited early (code=${code}, signal=${signal}): ${stderr.trim()}`
       ));
     }
-  });
+  };
+  child.once("error", onChildError);
+  child.once("exit", onChildExit);
   const connection = new ClientSideConnection(
     () => ({
       async requestPermission(request) {
@@ -266,12 +303,23 @@ async function runCopilotAcpProbeSession<T>(opts: {
       await settleWithin(exitedPromise, opts.cleanupTimeoutMs);
     }
     if (!exited) throw new Error("copilot ACP probe process did not exit after SIGKILL");
+    stdin.destroy();
+    stdout.destroy();
+    stderrStream.destroy();
+    const connectionClosed = await settleWithin(connection.closed, opts.cleanupTimeoutMs);
+    stderrStream.removeListener("data", onStderrData);
+    child.removeListener("error", onChildError);
+    child.removeListener("exit", onChildExit);
+    if (!connectionClosed || !connection.signal.aborted) {
+      throw new Error("copilot ACP probe connection did not close");
+    }
   }
 }
 
 /** Adapter-owned ACP collector with one fresh process/session per model. */
 export async function probeCopilotCatalog(options: {
   cliPath?: string;
+  args?: string[];
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
@@ -283,6 +331,7 @@ export async function probeCopilotCatalog(options: {
   spawnProcess?: CopilotAcpSpawn;
 } = {}): Promise<CopilotCatalogProbe> {
   const cliPath = options.cliPath ?? "copilot";
+  const args = options.args ? [...options.args] : [...COPILOT_ACP_BASE_ARGS];
   const cwd = options.cwd ?? process.cwd();
   const env = options.env ?? process.env;
   const timeoutMs = options.timeoutMs ?? 45_000;
@@ -297,7 +346,7 @@ export async function probeCopilotCatalog(options: {
     spawn(executable, args, spawnOpts));
   try {
     const discovery = await runCopilotAcpProbeSession({
-      cliPath, cwd, env, timeoutMs, cleanupTimeoutMs,
+      cliPath, args, cwd, env, timeoutMs, cleanupTimeoutMs,
       signal: controller.signal,
       spawnProcess,
       inspect: async (session) => {
@@ -330,7 +379,7 @@ export async function probeCopilotCatalog(options: {
       for (let attempt = 1; attempt <= COPILOT_MODEL_PROBE_ATTEMPTS; attempt += 1) {
         try {
           rows[index] = await runCopilotAcpProbeSession({
-            cliPath, cwd, env, timeoutMs, cleanupTimeoutMs,
+            cliPath, args, cwd, env, timeoutMs, cleanupTimeoutMs,
             signal: controller.signal,
             spawnProcess,
             inspect: async (session, run) => {
@@ -427,6 +476,12 @@ export function makeCopilotProfile(opts: {
   /** Display name shown in pickers / status. Defaults to "GitHub Copilot". */
   displayName?: string;
   cliPath?: string;
+  /** Exact ACP argv prefix used by this configured Copilot runtime. */
+  acpArgs?: string[];
+  /** Spawn cwd shared by runtime sessions and catalog probes. */
+  cwd?: string;
+  /** Base environment shared by runtime sessions and catalog probes. */
+  environment?: NodeJS.ProcessEnv;
   defaultModel: string;
   mcpServers?: McpServer[];
   /**
@@ -437,16 +492,18 @@ export function makeCopilotProfile(opts: {
   configDir?: string;
   staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
   /** Test/embedding seam; production probes the profile's ACP process. */
-  catalogProbe?: () => Promise<CopilotCatalogProbe>;
+  catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>;
 }): AgentProfile {
   const cli = opts.cliPath?.trim() || "copilot";
+  const acpArgs = opts.acpArgs ? [...opts.acpArgs] : [...COPILOT_ACP_BASE_ARGS];
   const globalMcpServers = opts.mcpServers ?? [];
   const configDir = opts.configDir?.trim() || undefined;
+  const runtimeCwd = opts.cwd ?? process.cwd();
 
   let identityCache: AgentIdentity | null | undefined;
 
   const probeEnvironment = (): NodeJS.ProcessEnv => {
-    const env: NodeJS.ProcessEnv = { ...process.env };
+    const env: NodeJS.ProcessEnv = { ...(opts.environment ?? process.env) };
     if (configDir) {
       const token = readCopilotTokenSync(configDir);
       if (token) env.COPILOT_GITHUB_TOKEN = token;
@@ -464,13 +521,15 @@ export function makeCopilotProfile(opts: {
         credentialProfile: configDir ?? "default",
       }),
       async fetch() {
+        const catalogLaunch: CopilotCatalogLaunch = {
+          cliPath: cli,
+          args: [...acpArgs],
+          cwd: runtimeCwd,
+          env: probeEnvironment(),
+        };
         const probe = opts.catalogProbe
-          ? await opts.catalogProbe()
-          : await probeCopilotCatalog({
-              cliPath: cli,
-              env: probeEnvironment(),
-              ...(configDir ? { cwd: configDir } : {}),
-            });
+          ? await opts.catalogProbe(catalogLaunch)
+          : await probeCopilotCatalog(catalogLaunch);
         const candidate = await manifestCatalogSource({
           provider: "github-copilot",
           credentialProfile: configDir ?? "default",
@@ -507,7 +566,8 @@ export function makeCopilotProfile(opts: {
       levels: ["low", "medium", "high", "xhigh", "max"],
     },
     spawn(_modelOverride?: string, _effortOverride?: string, sessionMcpServers?: McpServer[]) {
-      const args = ["--acp"];
+      const launch = copilotAcpLaunchSpec(cli, acpArgs, runtimeCwd, probeEnvironment());
+      const args = launch.args;
       // Copilot ignores ACP session/new + session/load `mcpServers`. Supply the
       // runtime-specific seam-MCP URL/token when the ACP *process* starts so a
       // resumed session after redeploy retains its coordination tools.
@@ -519,10 +579,8 @@ export function makeCopilotProfile(opts: {
       }
       // --config-dir is not a supported CLI flag. The same credential-scoped
       // environment is used by runtime spawn and catalog collection.
-      const env = probeEnvironment();
-      return spawn(cli, args, {
-        stdio: ["pipe", "pipe", "pipe"],
-        env,
+      return spawn(launch.executable, args, {
+        ...launch.options,
         detached: true,
       });
     },

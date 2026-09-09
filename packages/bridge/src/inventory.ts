@@ -12,6 +12,8 @@ import {
   makeCopilotProfile,
   makeGrokProfile,
   type AgentAdapter,
+  type CopilotCatalogLaunch,
+  type CopilotCatalogProbe,
   type HelloAgentInventory,
 } from "@seam/adapters";
 
@@ -25,16 +27,52 @@ function commandExists(cmd: string): boolean {
   }
 }
 
+function copilotProfileForHost(
+  copilotCmd: string,
+  cwd: string,
+  catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>
+): AgentAdapter {
+  const commandParts = copilotCmd.split(" ");
+  const cliPath = commandParts[0]!;
+  const args = [
+    ...commandParts.slice(1),
+    ...(process.env.COPILOT_ARGS !== undefined
+      ? process.env.COPILOT_ARGS.split(" ").filter(Boolean)
+      : ["--acp"]),
+  ];
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (!env.GH_TOKEN) {
+    try {
+      env.GH_TOKEN = execFileSync("gh", ["auth", "token"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      // The ACP probe will report auth failure without exposing credentials.
+    }
+  }
+  return makeCopilotProfile({
+    cliPath,
+    acpArgs: args,
+    cwd,
+    environment: env,
+    defaultModel: "gpt-5.4",
+    ...(catalogProbe ? { catalogProbe } : {}),
+  });
+}
+
 export function loadHostAdapters(
   copilotCmd: string,
-  exists: (bin: string) => boolean = commandExists
+  cwd: string,
+  exists: (bin: string) => boolean = commandExists,
+  copilotCatalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>
 ): Map<string, AgentAdapter> {
   const out = new Map<string, AgentAdapter>();
   const factories: Array<{ id: string; bin: string; make: () => AgentAdapter }> = [
     {
       id: "copilot",
       bin: copilotCmd,
-      make: () => makeCopilotProfile({ defaultModel: "gpt-5.4" }),
+      make: () => copilotProfileForHost(copilotCmd, cwd, copilotCatalogProbe),
     },
     {
       id: "claude",

@@ -641,7 +641,7 @@ async function runClientMode(
   bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
 ) {
   const { WebSocket } = await loadWs();
-  const adapters = loadHostAdapters(copilotCmd);
+  const adapters = loadHostAdapters(copilotCmd, localCwd);
   const mgr = makeSlotManager({
     copilotCmd,
     localCwd,
@@ -699,7 +699,7 @@ async function runServerMode(
   bridgeOpts: { bridgeId: string; devMode: boolean; workspaceRoot: string }
 ) {
   const { WebSocket, WebSocketServer } = await loadWs();
-  const adapters = loadHostAdapters(copilotCmd);
+  const adapters = loadHostAdapters(copilotCmd, localCwd);
   const mgr = makeSlotManager({
     copilotCmd,
     localCwd,

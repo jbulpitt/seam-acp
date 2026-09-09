@@ -110,6 +110,8 @@ function fakeCopilotSpawner(opts: {
   }> = [];
   const openedSessions = new Set<string>();
   const closedSessions = new Set<string>();
+  const children: EventEmitter[] = [];
+  const transports: PassThrough[][] = [];
   let active = 0;
   let maxActive = 0;
   let mismatches = 0;
@@ -154,6 +156,8 @@ function fakeCopilotSpawner(opts: {
         return true;
       },
     });
+    children.push(child);
+    transports.push([stdin, stdout, stderr]);
     serverConnection = agent({ name: "fake-copilot-acp" })
       .onRequest(methods.agent.initialize, () => ({
         protocolVersion: PROTOCOL_VERSION,
@@ -210,6 +214,16 @@ function fakeCopilotSpawner(opts: {
     closedSessions,
     get active() { return active; },
     get maxActive() { return maxActive; },
+    get listenersRemoved() {
+      return children.every((child) =>
+        child.listenerCount("error") === 0 && child.listenerCount("exit") === 0);
+    },
+    get transportsDestroyed() {
+      return transports.every((group) => group.every((stream) => stream.destroyed));
+    },
+    get stderrListenersRemoved() {
+      return transports.every((group) => group[2]!.listenerCount("data") === 0);
+    },
   };
 }
 
@@ -278,6 +292,9 @@ describe("Copilot isolated catalog probing (#234)", () => {
       expect(harness.maxActive).toBe(1);
       expect(harness.active).toBe(0);
       expect(harness.closedSessions).toEqual(harness.openedSessions);
+      expect(harness.listenersRemoved).toBe(true);
+      expect(harness.transportsDestroyed).toBe(true);
+      expect(harness.stderrListenersRemoved).toBe(true);
       expect(harness.calls.every((call) => call.executable === "/configured/bin/copilot")).toBe(true);
       expect(harness.calls.every((call) => call.args.join(" ") === "--acp")).toBe(true);
       expect(harness.calls.every((call) => call.cwd === "/credential/scope")).toBe(true);
@@ -297,6 +314,9 @@ describe("Copilot isolated catalog probing (#234)", () => {
     expect(harness.calls).toHaveLength(7);
     expect(harness.active).toBe(0);
     expect(harness.closedSessions).toEqual(harness.openedSessions);
+    expect(harness.listenersRemoved).toBe(true);
+    expect(harness.transportsDestroyed).toBe(true);
+    expect(harness.stderrListenersRemoved).toBe(true);
     expect(harness.calls.every((call) => call.signals.length > 0)).toBe(true);
   });
 
@@ -316,6 +336,9 @@ describe("Copilot isolated catalog probing (#234)", () => {
     expect(harness.maxActive).toBe(1);
     expect(harness.active).toBe(0);
     expect(harness.closedSessions).toEqual(harness.openedSessions);
+    expect(harness.listenersRemoved).toBe(true);
+    expect(harness.transportsDestroyed).toBe(true);
+    expect(harness.stderrListenersRemoved).toBe(true);
   });
 
   it("bounds a hung probe, closes its session, and escalates process cleanup", async () => {
@@ -333,6 +356,9 @@ describe("Copilot isolated catalog probing (#234)", () => {
     expect(harness.calls).toHaveLength(5);
     expect(harness.active).toBe(0);
     expect(harness.closedSessions).toEqual(harness.openedSessions);
+    expect(harness.listenersRemoved).toBe(true);
+    expect(harness.transportsDestroyed).toBe(true);
+    expect(harness.stderrListenersRemoved).toBe(true);
     expect(harness.calls.every((call) => call.signals.includes("SIGTERM"))).toBe(true);
     expect(harness.calls.every((call) => call.signals.includes("SIGKILL"))).toBe(true);
   });
@@ -348,6 +374,9 @@ describe("Copilot isolated catalog probing (#234)", () => {
     expect(harness.calls).toHaveLength(7);
     expect(harness.active).toBe(0);
     expect(harness.closedSessions).toEqual(harness.openedSessions);
+    expect(harness.listenersRemoved).toBe(true);
+    expect(harness.transportsDestroyed).toBe(true);
+    expect(harness.stderrListenersRemoved).toBe(true);
   });
 
   it("normalizes identical local and bridged candidates with complete provenance", async () => {

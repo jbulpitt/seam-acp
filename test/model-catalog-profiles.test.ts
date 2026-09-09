@@ -126,11 +126,12 @@ describe("production adapter catalog sources", () => {
     catalogs.forEach(validateCandidate);
     expect(new Set(catalogs.map((catalog) => catalog.scope.fingerprint)).size).toBe(4);
     expect(catalogs[0]?.scope.provider).toBe("anthropic");
-    // A host path is sanitized into a stable non-reversible reference rather
-    // than persisted verbatim; scope DISTINCTNESS is unaffected because the
-    // fingerprint is computed by the adapter from the raw values.
-    expect(catalogs[1]?.scope.credentialProfile).toMatch(/^ref:[a-f0-9]{16}$/);
+    // A host path is a diagnostic LABEL, not identity, so it is replaced with a
+    // constant sentinel rather than transported. Scope distinctness is
+    // unaffected: the fingerprint is the identity and is never rewritten.
+    expect(catalogs[1]?.scope.credentialProfile).toBe("[redacted]");
     expect(catalogs[1]?.scope.credentialProfile).not.toContain("/credentials/work");
+    expect(new Set(catalogs.map((c) => c.scope.fingerprint)).size).toBe(4);
     expect(catalogs[2]?.scope).toMatchObject({ backend: "vertex", project: "project-7", region: "us-east5" });
     expect(catalogs[3]?.scope).toMatchObject({ provider: "z-ai", backend: "https://api.z.ai/api/anthropic" });
   });

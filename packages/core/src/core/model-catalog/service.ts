@@ -9,6 +9,7 @@ import type {
 } from "@seam/adapters";
 import { decodeCatalogSelection, encodeCatalogSelection } from "@seam/adapters";
 import {
+  assertCatalogSemantics,
   assessCatalogReduction,
   catalogContentChecksum,
   catalogModelFingerprint,
@@ -573,6 +574,12 @@ export function validateCandidate(candidate: AdapterCatalogCandidate): void {
   }
   if (!Number.isInteger(candidate.adapterVersion) || candidate.adapterVersion < 1) throw new Error("invalid adapter version");
   if (!candidate.fetchedAt || !Number.isFinite(Date.parse(candidate.fetchedAt))) throw new Error("invalid catalog fetch time");
+  // Cross-row identity (duplicate ids, id/alias collisions, ambiguous reverse
+  // bindings, exactly-one-default) is the SHARED provider-neutral rule that the
+  // bridge boundary also applies, so a collision can never reach transport and
+  // then be caught only here. The per-row checks below stay as a defence in
+  // depth against a caller that reached validateCandidate directly.
+  assertCatalogSemantics(candidate);
   const ids = new Set<string>();
   const names = new Set<string>();
   const rawSelections = new Set<string>();

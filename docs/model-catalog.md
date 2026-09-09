@@ -64,25 +64,42 @@ malformed or secret-bearing content never crosses the wire in the first place.
 
 What it enforces:
 
+- **Cross-row semantics at BOTH boundaries.** `assertCatalogSemantics` is the
+  shared provider-neutral rule for identity that cannot be judged one field at a
+  time: duplicate model ids, an id colliding with another row's alias, a reverse
+  binding two rows both claim, and exactly-one-default. It lived only in core, so
+  a colliding candidate crossed the bridge and was refused only after transport.
+  Evidence is documented as a SET, so an exact duplicate record is rejected too.
 - **Declared-VALUE policy over the whole graph.** `assertCatalogValues` gives
   every declared field an explicit type, format, range and content policy:
   scalar version/config/source fields refuse object and array substitutions;
-  context windows must be finite positive integers within a sane ceiling (no
-  NaN, infinity, fractional or negative values); aliases, models, modalities,
+  context windows must be positive SAFE integers within a generous documented
+  ceiling (`CATALOG_MAX_CONTEXT_TOKENS`, two orders of magnitude above anything
+  shipping today) — no NaN, infinity, fractional, negative, or precision-losing
+  values; adapter versions are positive safe integers under
+  `CATALOG_MAX_ADAPTER_VERSION`; `sourceVersion`/`cliVersion` keep their declared
+  string format rather than accepting numbers or objects; aliases, models,
+  modalities,
   service tiers, effort choices and bindings have cardinality and item-size
   bounds with duplicate detection; enums are closed; and no field outside the
   scope identity family may contain control characters, PII, credentials,
   token-shaped strings, or an absolute/home/secret-bearing path.
-- **Scope identity fields are SANITIZED, not rejected.** `credentialProfile`,
-  `backend`, `project`, `region` and `policy` legitimately carry host-shaped
-  values in production — Codex puts `~/.codex` in `credentialProfile` — so
-  refusing them would fail every real refresh and take the catalog cold.
-  `normalizeCatalogCandidate` replaces an unsafe value with a stable,
-  non-reversible `ref:<digest>` before transport or persistence. Scope
-  DISTINCTNESS is preserved (the reference is a function of the original) and
-  semantic scope identity is untouched, because the `fingerprint` is computed by
-  the adapter from the raw values before normalization runs. Validation is then
-  strict, so a raw value reaching it means the boundary was bypassed.
+- **Scope labels are diagnostic; identity is the fingerprint.**
+  `credentialProfile`, `backend`, `project`, `region` and `policy` legitimately
+  carry host-shaped values in production — Codex puts `~/.codex` in
+  `credentialProfile` — so refusing them would fail every real refresh and take
+  the catalog cold. An unsafe label is replaced with the CONSTANT sentinel
+  `[redacted]`, or omitted. It is deliberately **not** derived from the input: a
+  truncated digest of a low-entropy value like a home directory is
+  dictionary-reversible, which would leak the very path the replacement exists
+  to remove. Nothing keys off the label, so a constant costs nothing.
+- **The adapter-produced `fingerprint` is never rewritten.** It is validated for
+  safe format (a digest, or a bounded safe identifier) and otherwise refused —
+  silently changing it would fork the scope and split its generation history.
+  Scope distinctness therefore survives label redaction intact.
+- **Not in this issue:** a salted/HMAC scheme that could keep labels distinct
+  *and* non-reversible is deliberately out of scope for #236 and tracked as
+  follow-up hardening, along with threat models beyond validated adapter output.
 - **Normalization never mutates its input.** Adapters memoize their scope object
   (and `asRemoteCatalogAdapter` memoizes the whole candidate) while the service
   deep-freezes what it publishes, so an in-place sanitizer would throw on the
@@ -238,11 +255,20 @@ writes to the child, so a catalog probe cannot spend model tokens.
   `finalizeDeadlineMs` is only a ceiling so an uncooperative run cannot hang the
   helper forever; hitting it terminates and reaps the child and then returns
   `not_settled`.
-- **Registration phases are explicit.** While the phase is open a step is queued
-  and WILL be drained before return. Once it is closed — the helper has already
-  told its caller cleanup finished — a further registration is dropped and
-  counted (surfaced as a process warning), never run detached, so there are no
-  side effects after return.
+- **Registration phases are explicit, and late steps obey them.** While the
+  phase is open a step is QUEUED with its declared phase and drained by the
+  phase loop — never executed on arrival, which previously discarded the phase
+  and could run a connection close before a session close. The loop repeats
+  until a full round adds nothing new, then SEALS. A registration after the seal
+  is refused outright: not executed, not detached, so nothing acts after return.
+- **What "bounded" means, exactly.** Each close step is handed an `AbortSignal`
+  and a bounded window; a cooperative step observes it and stops, and the helper
+  AWAITS it before returning. The helper cannot preempt arbitrary JavaScript that
+  ignores cancellation — no mechanism in the language can — so a deliberately
+  non-cooperative callback may still mutate state after its promise is
+  abandoned. That adversarial case is outside this contract. What IS guaranteed:
+  every close implementation in this repository cooperates (enforced by test),
+  and the helper itself schedules no work after return.
 - **Pre-spawn and post-spawn `error` are different things.** Before a pid exists
   an `error` is `spawn_failed`. After one exists the process is real and may
   still be running, so it is a `protocol_error` that must still be terminated

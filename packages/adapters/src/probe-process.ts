@@ -17,15 +17,32 @@
  * - stdout AND stderr are bounded AT THE STREAM BOUNDARY; overflow fails the
  *   probe and kills the child rather than buffering an unbounded payload
  * - close steps run in explicit phases — SESSION before CONNECTION — never in
- *   registration order, which every provider would otherwise get to guess at
- * - a close registered LATE (after cleanup began, e.g. by a connection that
- *   finished constructing after the timeout fired) still runs
+ *   registration order, and that holds for a step registered LATE as well: it
+ *   is queued and drained by the phase loop, never executed on arrival
+ * - the registration phase stays open until the provider run settles (bounded
+ *   by `finalizeDeadlineMs`), then SEALS; a registration after the seal is
+ *   rejected outright rather than run, so nothing acts after return
  * - `handle.signal` aborts, so the caller's own async work is cancelled too
  * - every listener and timer this module adds is removed
  * - SIGTERM, then a bounded SIGKILL, then the exit is AWAITED; failing to
  *   observe an exit is itself an error, not a silent success
  * - errors are structured codes with REDACTED detail: supplied env values and
  *   credential-shaped content never reach a log, a card, or a durable row
+ *
+ * ## What "bounded" does and does not mean
+ *
+ * The helper is bounded and it WAITS for cooperative close completion. Each
+ * close step is given an AbortSignal and a bounded window; a cooperative step
+ * observes the signal and stops, and the helper awaits it before returning.
+ *
+ * It CANNOT preempt arbitrary JavaScript that ignores cancellation. There is no
+ * mechanism in the language to abort a running promise, so a deliberately
+ * non-cooperative callback can still mutate state after its promise is
+ * abandoned. That adversarial case is outside this contract: every close
+ * implementation in this repository cooperates, and a provider adding one is
+ * expected to do the same. What IS guaranteed is that the helper itself
+ * schedules no work after return — nothing is detached, and a post-seal
+ * registration is refused rather than run.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { PassThrough, type Readable, type Writable } from "node:stream";
@@ -48,6 +65,8 @@ export const PROBE_DEFAULT_REAP_MS = 2_000;
 export const PROBE_DEFAULT_FINALIZE_DEADLINE_MS = 10_000;
 /** How many times finalization re-drains newly registered close steps. */
 const LATE_CLOSE_DRAIN_ROUNDS = 8;
+/** Session is always closed before the connection that carries it. */
+const CLOSE_PHASES = ["session", "connection"] as const;
 
 export type ProbeErrorCode =
   | "spawn_failed"
@@ -76,6 +95,15 @@ export class ProbeError extends Error {
 
 export type ProbeClosePhase = "session" | "connection";
 
+/**
+ * A teardown step. It receives an AbortSignal that fires when its bounded
+ * window elapses; a cooperative implementation stops there.
+ *
+ * The helper CANNOT preempt a promise that ignores the signal — nothing in
+ * JavaScript can. See the contract note on {@link runBoundedProbe}.
+ */
+export type ProbeCloseStep = (signal: AbortSignal) => void | Promise<void>;
+
 export interface ProbeHandle {
   stdin: Writable;
   /** Bounded view of the child's stdout. Overflow destroys it and fails the probe. */
@@ -93,7 +121,7 @@ export interface ProbeHandle {
    * must be closed politely while its transport is still up. Registering after
    * cleanup has begun still runs the step (bounded) rather than dropping it.
    */
-  onClose(step: () => void | Promise<void>, phase?: ProbeClosePhase): void;
+  onClose(step: ProbeCloseStep, phase?: ProbeClosePhase): void;
   /** Rejects when the child exits early; race protocol waits against it. */
   readonly exited: Promise<never>;
   /** Redacted trailing stderr, for tests and structured diagnostics. */
@@ -172,7 +200,7 @@ export function redactProbeText(text: string, env?: NodeJS.ProcessEnv): string {
   return out;
 }
 
-interface CloseStep { step: () => void | Promise<void>; phase: ProbeClosePhase }
+interface CloseStep { step: ProbeCloseStep; phase: ProbeClosePhase }
 
 /**
  * Run `run` against a freshly spawned child and tear everything down.
@@ -206,9 +234,10 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
 
   const controller = new AbortController();
   const closeSteps: CloseStep[] = [];
+  // Phase order is a property of the CONTRACT, not of registration order.
   let cleanupStarted = false;
   /** True once the helper will accept no further close registrations. */
-  let registrationClosed = false;
+  let registrationSealed = false;
   /** Registrations that arrived after the phase closed (provider bug). */
   let droppedRegistrations = 0;
   let succeeded = false;
@@ -220,8 +249,6 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   let postSpawnError: Error | undefined;
   /** True once the OS has actually produced the process. */
   let spawned = child.pid !== undefined;
-  /** Close steps registered after cleanup began; drained before we return. */
-  const lateWork: Promise<void>[] = [];
   /** The caller's own promise, so finalization can give it a bounded chance
    *  to observe the abort and finish registering its closes. */
   let runPromise: Promise<T> | undefined;
@@ -343,16 +370,15 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
       // close was still pending: return did not mean cleanup had happened.
       // Explicit registration phases. While the phase is OPEN — including the
       // whole finalization window, which stays open until `run` settles — a
-      // step is queued and WILL be drained before the helper returns. Once the
-      // phase is CLOSED the helper has already told its caller that cleanup
-      // finished, so running the step anyway would be a side effect after
-      // return; it is dropped and counted instead. Nothing is ever detached.
-      if (registrationClosed) {
+      // step is QUEUED with its declared phase and drained by the phase loop
+      // like any other. It is never executed on arrival: doing that discarded
+      // the phase and could run a connection close before a session close.
+      //
+      // Once the phase is SEALED the helper has already told its caller that
+      // cleanup finished, so the step is rejected outright — not executed, not
+      // detached — because anything it did would be a side effect after return.
+      if (registrationSealed) {
         droppedRegistrations += 1;
-        return;
-      }
-      if (cleanupStarted) {
-        lateWork.push(withDeadline(step, killGraceMs));
         return;
       }
       closeSteps.push({ step, phase });
@@ -418,21 +444,21 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
     child.stdout.removeListener("end", onStdoutEnd);
     child.stderr.removeListener("data", onStderr);
     if (!stdout.destroyed) stdout.end();
-    // Explicit phases: a session is closed while its transport is still up.
-    for (const phase of ["session", "connection"] as const) {
-      for (const entry of closeSteps.filter((step) => step.phase === phase)) {
-        await withDeadline(entry.step, killGraceMs);
+    // Drain in PHASE order, repeatedly: a close step may itself register another
+    // one, and a step that arrived late still has to obey session-before-
+    // connection. The registration phase stays OPEN across rounds so anything a
+    // draining step registers is picked up by the next round rather than
+    // escaping; it seals only once a full round adds nothing new.
+    for (let round = 0; closeSteps.length > 0 && round < LATE_CLOSE_DRAIN_ROUNDS; round++) {
+      const pending = closeSteps.splice(0, closeSteps.length);
+      for (const phase of CLOSE_PHASES) {
+        for (const entry of pending.filter((step) => step.phase === phase)) {
+          await withDeadline(entry.step, killGraceMs);
+        }
       }
     }
-    // Drain to quiescence: a close step may itself register another one. The
-    // registration phase is still OPEN here, so anything a draining step
-    // registers is picked up by the next round rather than escaping.
-    for (let round = 0; lateWork.length > 0 && round < LATE_CLOSE_DRAIN_ROUNDS; round++) {
-      const pending = lateWork.splice(0, lateWork.length);
-      await Promise.all(pending);
-    }
     // Nothing may register from here on.
-    registrationClosed = true;
+    registrationSealed = true;
     const reaped = await terminate(child, killGraceMs);
     // The protective error listener is the LAST thing removed, so a stray
     // `error` emitted during termination cannot become an uncaught exception.
@@ -472,18 +498,26 @@ export async function runBoundedProbe<T>(options: BoundedProbeOptions<T>): Promi
   }
 }
 
-async function withDeadline(step: () => void | Promise<void>, ms: number): Promise<void> {
+/**
+ * Run one close step under a bounded window, handing it a signal so it can stop
+ * itself. We stop AWAITING when the window elapses; a cooperative step will
+ * already have stopped. A step that ignores the signal cannot be preempted —
+ * see the contract note on {@link runBoundedProbe}.
+ */
+async function withDeadline(step: ProbeCloseStep, ms: number): Promise<void> {
+  const controller = new AbortController();
   let timer: NodeJS.Timeout | undefined;
   try {
     await Promise.race([
-      Promise.resolve().then(step).catch(() => undefined),
+      Promise.resolve().then(() => step(controller.signal)).catch(() => undefined),
       new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, ms);
+        timer = setTimeout(() => { controller.abort(); resolve(); }, ms);
         timer.unref?.();
       }),
     ]);
   } finally {
     if (timer) clearTimeout(timer);
+    if (!controller.signal.aborted) controller.abort();
   }
 }
 

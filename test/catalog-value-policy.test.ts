@@ -15,6 +15,7 @@ import {
   catalogScopeFingerprint,
   invokeAdapterRpc,
   normalizeCatalogCandidate,
+  CATALOG_SCOPE_LABEL_REDACTED,
   type AdapterCatalogCandidate,
   type CatalogModel,
   type CatalogModelEvidence,
@@ -208,6 +209,7 @@ describe("#236 declared-VALUE policy at both boundaries", () => {
       "fetchModelCatalog", {}, { adapter, workspaceRoot: "/tmp" }
     ) as AdapterCatalogCandidate;
     expect(JSON.stringify(transported)).not.toContain(secret);
+    expect(JSON.stringify(transported)).toContain(CATALOG_SCOPE_LABEL_REDACTED);
     expect(() => validateCandidate(transported)).not.toThrow();
   });
 
@@ -229,24 +231,47 @@ describe("#236 declared-VALUE policy at both boundaries", () => {
     store.close();
   });
 
-  it("sanitizes legitimate host-shaped scope values instead of failing the refresh", () => {
+  it("replaces an unsafe scope LABEL with a constant sentinel, never a digest", () => {
     // Production genuinely puts a credential config directory here (Codex uses
-    // ~/.codex), so rejecting would take every real catalog cold. It is
-    // replaced with a stable non-reversible reference; distinctness is kept.
+    // ~/.codex), so rejecting would take every real catalog cold. The label is
+    // diagnostic only — identity is the fingerprint — so it is replaced with a
+    // CONSTANT. A truncated digest of a low-entropy path is dictionary
+    // reversible, which would leak the very path the replacement removes.
     const raw = candidate([model("nebula", { default: true })]);
     raw.scope = { ...raw.scope, credentialProfile: "/home/ubuntu/.codex" };
     const normalized = normalizeCatalogCandidate(raw);
-    expect(normalized.scope.credentialProfile).toMatch(/^ref:[a-f0-9]{16}$/);
+    expect(normalized.scope.credentialProfile).toBe(CATALOG_SCOPE_LABEL_REDACTED);
     expect(JSON.stringify(normalized)).not.toContain("/home/ubuntu");
     expect(() => validateCandidate(normalized)).not.toThrow();
 
+    // Not derived from the input: two different unsafe paths give the SAME
+    // sentinel, so nothing can be recovered by guessing.
     const other = { ...raw, scope: { ...raw.scope, credentialProfile: "/home/ubuntu/.claude" } };
     expect(normalizeCatalogCandidate(other).scope.credentialProfile)
-      .not.toBe(normalized.scope.credentialProfile);
+      .toBe(normalized.scope.credentialProfile);
+    // Distinctness is unaffected because identity is the fingerprint.
+    expect(normalized.scope.fingerprint).toBe(raw.scope.fingerprint);
+    // A safe label is left exactly alone.
+    const safe = { ...raw, scope: { ...raw.scope, credentialProfile: "team-prod_1" } };
+    expect(normalizeCatalogCandidate(safe).scope.credentialProfile).toBe("team-prod_1");
     // And it never mutates the caller's object — adapters memoize their scope,
     // and the service deep-freezes what it publishes.
     expect(raw.scope.credentialProfile).toBe("/home/ubuntu/.codex");
     expect(Object.isFrozen(raw.scope)).toBe(false);
+  });
+
+  it("never rewrites the adapter-produced scope fingerprint", () => {
+    const raw = candidate([model("nebula", { default: true })]);
+    // A valid digest survives byte for byte.
+    expect(normalizeCatalogCandidate(raw).scope.fingerprint).toBe(raw.scope.fingerprint);
+    // A short stable identifier is also a legitimate adapter choice.
+    const named = { ...raw, scope: { ...raw.scope, fingerprint: "team-prod_1" } };
+    expect(normalizeCatalogCandidate(named).scope.fingerprint).toBe("team-prod_1");
+    // An UNSAFE fingerprint is refused, not silently changed — rewriting it
+    // would fork the scope and split the generation history in two.
+    const unsafe = { ...raw, scope: { ...raw.scope, fingerprint: "/home/ubuntu/private-scope" } };
+    expect(() => normalizeCatalogCandidate(unsafe)).toThrow(/fingerprint/);
+    expect(unsafe.scope.fingerprint).toBe("/home/ubuntu/private-scope");
   });
 
   it("normalization survives a frozen input candidate", () => {
@@ -257,7 +282,8 @@ describe("#236 declared-VALUE policy at both boundaries", () => {
     raw.scope = { ...raw.scope, credentialProfile: "/home/ubuntu/.codex" };
     const frozen = Object.freeze({ ...raw, scope: Object.freeze({ ...raw.scope }) });
     expect(() => normalizeCatalogCandidate(frozen)).not.toThrow();
-    expect(normalizeCatalogCandidate(frozen).scope.credentialProfile).toMatch(/^ref:/);
+    expect(normalizeCatalogCandidate(frozen).scope.credentialProfile)
+      .toBe(CATALOG_SCOPE_LABEL_REDACTED);
   });
 
   it("rejection is atomic and the previous generation is retained", async () => {

@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import {
+  assertCatalogSemantics,
   assertCatalogValues,
   assertClosedCatalogShape,
   assertCatalogDescription,
@@ -284,6 +285,7 @@ export function validateCatalogEvidence(candidate: AdapterCatalogCandidate): voi
   // `normalizeCatalogCandidate`, which both boundaries run first.
   assertClosedCatalogShape(candidate);
   assertCatalogValues(candidate);
+  assertCatalogSemantics(candidate);
   if (!candidate || !Array.isArray(candidate.models)) return;
   for (const model of candidate.models) {
     const id = typeof model?.id === "string" ? model.id : "(unknown)";

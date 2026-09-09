@@ -109,6 +109,16 @@ function fakeChild(opts: { diesOnKill?: boolean } = {}): FakeChild {
   };
 }
 
+
+/** A sleep that stops when its close window elapses — the cooperative shape
+ *  every close callback is expected to have. */
+function cooperativeSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+}
+
 describe("#236 bounded probe lifecycle", () => {
   it("returns the caller's value and reaps the child", async () => {
     let pid: number | undefined;
@@ -533,8 +543,8 @@ describe("#236 bounded probe lifecycle", () => {
         // connection would, then registers the session close it owns.
         await new Promise((resolve) => setTimeout(resolve, 400));
         registered = true;
-        handle.onClose(async () => {
-          await new Promise((resolve) => setTimeout(resolve, 50));
+        handle.onClose(async (signal) => {
+          await cooperativeSleep(50, signal);
           closed = true;
         }, "session");
         return "late";
@@ -675,8 +685,8 @@ describe("#236 bounded probe lifecycle", () => {
       run: async (handle) => {
         await new Promise((resolve) => setTimeout(resolve, 120));
         registered = true;
-        handle.onClose(async () => {
-          await new Promise((resolve) => setTimeout(resolve, 30));
+        handle.onClose(async (signal) => {
+          await cooperativeSleep(30, signal);
           closed = true;
         }, "session");
         return "late";
@@ -788,6 +798,129 @@ describe("#236 bounded probe lifecycle", () => {
     expect(escaped).toBe(false);
   });
 
+
+  it("a LATE registration still obeys session-before-connection ordering", async () => {
+    // Reproduction: register connection THEN session, both after the abort. The
+    // old code ran each on arrival, producing
+    // ["connection-start", "session", "connection-end"].
+    const order: string[] = [];
+    await expect(
+      runBoundedProbe({
+        executable: process.execPath,
+        args: [CHILD],
+        env: env("silent"),
+        timeoutMs: 20,
+        killGraceMs: 300,
+        finalizeDeadlineMs: 3_000,
+        run: async (handle) => {
+          await new Promise<void>((resolve) =>
+            handle.signal.addEventListener("abort", () => resolve(), { once: true })
+          );
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          handle.onClose(async (signal) => {
+            order.push("connection-start");
+            await cooperativeSleep(30, signal);
+            order.push("connection-end");
+          }, "connection");
+          handle.onClose(() => { order.push("session"); }, "session");
+          throw new Error("cancelled");
+        },
+      })
+    ).rejects.toMatchObject({ code: "timeout" });
+    expect(order).toEqual(["session", "connection-start", "connection-end"]);
+  });
+
+  it("a cooperative close observes its signal and finishes before return", async () => {
+    // The helper hands each close step a signal and awaits it. A cooperative
+    // step stops when the window elapses, so return means it is done.
+    let sawSignal = false;
+    let finished = false;
+    const child = fakeChild({ diesOnKill: true });
+    await runBoundedProbe({
+      executable: "x",
+      spawnOverride: () => child.child,
+      timeoutMs: 2_000,
+      killGraceMs: 40,
+      finalizeDeadlineMs: 500,
+      run: async (handle) => {
+        handle.onClose(async (signal) => {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, 5_000);
+            signal.addEventListener("abort", () => {
+              sawSignal = true;
+              clearTimeout(timer);
+              resolve();
+            }, { once: true });
+          });
+          finished = true;
+        }, "session");
+        return "ok";
+      },
+    });
+    // Asserted synchronously at return: the cooperative step completed.
+    expect(sawSignal).toBe(true);
+    expect(finished).toBe(true);
+  });
+
+  it("seals registration: a post-return registration is refused, not run", async () => {
+    const child = fakeChild({ diesOnKill: true });
+    let escaped = false;
+    let capture: ProbeHandle | undefined;
+    await runBoundedProbe({
+      executable: "x",
+      spawnOverride: () => child.child,
+      timeoutMs: 2_000,
+      killGraceMs: 40,
+      finalizeDeadlineMs: 500,
+      run: async (handle) => { capture = handle; return "ok"; },
+    });
+    capture!.onClose(() => { escaped = true; }, "session");
+    capture!.onClose(() => { escaped = true; }, "connection");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    // Refused outright — not executed, not detached, no post-return side effect.
+    expect(escaped).toBe(false);
+  });
+
+  it("every close registration in this repository is cooperative", async () => {
+    // The helper cannot preempt a callback that ignores its signal, so the
+    // guarantee is only as good as the callbacks. Every in-repo registration
+    // must therefore either be synchronous (nothing to cancel) or observe the
+    // signal it is handed.
+    const roots = ["packages", "test"];
+    const files: string[] = [];
+    const walk = (base: string): void => {
+      for (const entry of fs.readdirSync(base, { withFileTypes: true })) {
+        const full = path.join(base, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === "node_modules" || entry.name === "dist") continue;
+          walk(full);
+        } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".d.ts")) {
+          files.push(full);
+        }
+      }
+    };
+    for (const root of roots) walk(path.join(process.cwd(), root));
+
+    const offenders: string[] = [];
+    for (const file of files) {
+      const text = fs.readFileSync(file, "utf8");
+      if (!text.includes("onClose(")) continue;
+      for (const match of text.matchAll(/onClose\(\s*(async\s*)?\(([^)]*)\)\s*=>/g)) {
+        const isAsync = Boolean(match[1]);
+        const takesSignal = (match[2] ?? "").trim().length > 0;
+        // An async close that never looks at its signal cannot be stopped.
+        if (isAsync && !takesSignal) {
+          const body = text.slice(match.index ?? 0, (match.index ?? 0) + 400);
+          // Deliberately-adversarial fixtures are exempt and say so.
+          if (!body.includes("wedged") && !body.includes("never settles")) {
+            offenders.push(`${path.relative(process.cwd(), file)}: ${match[0]}`);
+          }
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
   it("does not let a wedged close step keep the process alive", async () => {
     let pid: number | undefined;
     await runBoundedProbe({
@@ -798,8 +931,9 @@ describe("#236 bounded probe lifecycle", () => {
       killGraceMs: 100,
       run: async (handle) => {
         pid = handle.pid;
-        // A close that never settles, and one that throws. Neither may block
-        // teardown; a collector that hangs here would leak a process per refresh.
+        // A deliberately WEDGED close that never settles, and one that throws.
+        // Neither may block teardown. This is the adversarial case the contract
+        // explicitly excludes from the cooperation guarantee.
         handle.onClose(() => new Promise<void>(() => {}));
         handle.onClose(() => { throw new Error("close failed"); });
         return null;

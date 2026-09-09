@@ -171,12 +171,34 @@ function assertScopeRef(path: string, value: unknown): string {
   return value;
 }
 
+/**
+ * A context window: a positive SAFE integer under a generous ceiling.
+ *
+ * `Number.isInteger` alone accepted 1e20 — beyond safe-integer precision, so
+ * the value that round-trips is not the value that was asserted. The ceiling is
+ * deliberately generous (see {@link CATALOG_MAX_CONTEXT_TOKENS}) so a realistic
+ * future catalog is never blocked by it.
+ */
 function assertPositiveWindow(path: string, value: unknown): number | null {
   if (value === null || value === undefined) return null;
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || !Number.isInteger(value)) {
-    throw new CatalogEvidenceError(path, "must be a positive integer or null");
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new CatalogEvidenceError(path, "must be a positive safe integer or null");
+  }
+  if (value > CATALOG_MAX_CONTEXT_TOKENS) {
+    throw new CatalogEvidenceError(path, `exceeds ${CATALOG_MAX_CONTEXT_TOKENS}`);
   }
   return value;
+}
+
+/** Adapter contract version: a small positive safe integer. */
+function assertAdapterVersion(path: string, value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new CatalogEvidenceError(path, "must be a positive safe integer");
+  }
+  if ((value as number) > CATALOG_MAX_ADAPTER_VERSION) {
+    throw new CatalogEvidenceError(path, `exceeds ${CATALOG_MAX_ADAPTER_VERSION}`);
+  }
+  return value as number;
 }
 
 export interface ParsedCatalogEvidence {
@@ -214,10 +236,7 @@ export function parseCatalogEvidenceRecord(path: string, raw: unknown): ParsedCa
     parsed.runtimeVersion = assertLabel(`${path}.runtimeVersion`, record.runtimeVersion, CATALOG_EVIDENCE_TEXT_MAX);
   }
   if (record.adapterVersion !== undefined) {
-    if (!Number.isInteger(record.adapterVersion) || (record.adapterVersion as number) < 1) {
-      throw new CatalogEvidenceError(`${path}.adapterVersion`, "must be a positive integer");
-    }
-    parsed.adapterVersion = record.adapterVersion as number;
+    parsed.adapterVersion = assertAdapterVersion(`${path}.adapterVersion`, record.adapterVersion);
   }
   if (record.scopeRef !== undefined) parsed.scopeRef = assertScopeRef(`${path}.scopeRef`, record.scopeRef);
   if (record.resolvedModel !== undefined) {
@@ -287,7 +306,17 @@ export function parseCatalogEvidenceList(path: string, raw: unknown): ParsedCata
   if (raw.length > CATALOG_EVIDENCE_MAX_RECORDS) {
     throw new CatalogEvidenceError(path, `exceeds ${CATALOG_EVIDENCE_MAX_RECORDS} records`);
   }
-  return raw.map((entry, index) => parseCatalogEvidenceRecord(`${path}[${index}]`, entry));
+  const parsed = raw.map((entry, index) => parseCatalogEvidenceRecord(`${path}[${index}]`, entry));
+  // Documented as an unordered SET, so an exact duplicate is not a second
+  // observation — it is the same one twice, and persisting both would let a
+  // provider inflate a row without changing what it asserts.
+  const seen = new Set<string>();
+  parsed.forEach((record, index) => {
+    const key = canonicalJson(record);
+    if (seen.has(key)) throw new CatalogEvidenceError(`${path}[${index}]`, "duplicate evidence record");
+    seen.add(key);
+  });
+  return parsed;
 }
 
 export function assertCatalogDescription(path: string, raw: unknown): string {
@@ -460,7 +489,6 @@ export function assertClosedCatalogShape(candidate: unknown): void {
 // Everything here is shape/format/content policy only. No provider vocabulary.
 // ---------------------------------------------------------------------------
 
-import { createHash } from "node:crypto";
 
 /** Cardinality ceilings. Generous for real providers, fatal for a flood. */
 export const CATALOG_MAX_MODELS = 512;
@@ -469,8 +497,14 @@ export const CATALOG_MAX_EFFORT_CHOICES = 64;
 export const CATALOG_MAX_BINDINGS = 4_096;
 export const CATALOG_MAX_MODALITIES = 16;
 export const CATALOG_MAX_SERVICE_TIERS = 16;
-/** No real context window is larger than this; anything above is nonsense. */
+/**
+ * Generous ceiling on a declared context window. Two orders of magnitude above
+ * anything shipping today, so a realistic future catalog is never blocked, while
+ * still refusing a value that is plainly nonsense or a precision artefact.
+ */
 export const CATALOG_MAX_CONTEXT_TOKENS = 100_000_000;
+/** Generous ceiling on the adapter contract version (currently single digits). */
+export const CATALOG_MAX_ADAPTER_VERSION = 1_000_000;
 
 const VISION_MODES = ["native", "tool", "none"];
 const AVAILABILITY = ["available", "unavailable"];
@@ -532,7 +566,7 @@ function requireContextValue(path: string, value: unknown): number | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "number") fail(path, `must be a number or null (got ${typeof value})`);
   if (!Number.isFinite(value)) fail(path, "must be finite");
-  if (!Number.isInteger(value)) fail(path, "must be an integer");
+  if (!Number.isSafeInteger(value)) fail(path, "must be a safe integer");
   if (value <= 0) fail(path, "must be positive");
   if (value > CATALOG_MAX_CONTEXT_TOKENS) fail(path, `exceeds ${CATALOG_MAX_CONTEXT_TOKENS}`);
   return value;
@@ -561,27 +595,35 @@ function requireBoundedList(
 }
 
 /**
+ * Constant stand-in for a scope label we will not transport or persist.
+ *
  * Scope identity fields carry operator-supplied values that are LEGITIMATELY
  * host-shaped in production — a credential config directory, a base URL. They
- * are sanitized rather than rejected: rejecting would fail every real refresh
- * and take the catalog cold, while keeping the raw value would persist a home
- * path into a durable snapshot that is then transported and rendered.
+ * are DIAGNOSTIC LABELS, not identity: semantic scope identity lives entirely
+ * in the adapter-computed `fingerprint`.
  *
- * A value that is already a safe identifier is kept verbatim. Anything else is
- * replaced by a stable, non-reversible reference. Scope DISTINCTNESS is
- * preserved because the reference is a function of the original value — and the
- * scope `fingerprint` itself is computed by the adapter from the raw values
- * before this runs, so semantic scope identity is untouched either way.
+ * So an unsafe label is replaced with this constant, or omitted. It is
+ * deliberately NOT a hash of the original: a truncated digest of a
+ * low-entropy value like a home directory is dictionary-reversible, which
+ * would leak exactly the path the replacement exists to remove. A constant
+ * leaks nothing, and costs nothing real, because nothing keys off the label.
+ * (A salted/HMAC scheme that could safely keep labels distinct is deliberately
+ * out of scope for #236 — see the follow-up note in docs/model-catalog.md.)
  */
-export function sanitizeScopeIdentifier(value: string): string {
+export const CATALOG_SCOPE_LABEL_REDACTED = "[redacted]";
+
+/**
+ * Return a safe diagnostic label for a scope field, or the constant sentinel.
+ * Never derived from the input, so it is not reversible by construction.
+ */
+export function safeScopeLabel(value: string): string {
   const safe =
     value.length > 0 &&
     value.length <= CATALOG_EVIDENCE_TEXT_MAX &&
     LABEL_CHARSET.test(value) &&
     !ABSOLUTE_PATH.test(value) &&
     !looksUnsafeForCatalog(value, false);
-  if (safe) return value;
-  return `ref:${createHash("sha256").update(value).digest("hex").slice(0, 16)}`;
+  return safe ? value : CATALOG_SCOPE_LABEL_REDACTED;
 }
 
 const HEX_FINGERPRINT = /^[a-f0-9]{64}$/;
@@ -601,9 +643,12 @@ export function assertCatalogValues(candidate: unknown): void {
   const root = candidate as Record<string, unknown>;
   if (!root || typeof root !== "object" || Array.isArray(root)) fail("candidate", "must be an object");
 
-  if (!Number.isInteger(root.schemaVersion)) fail("candidate.schemaVersion", "must be an integer");
-  if (!Number.isInteger(root.adapterVersion) || (root.adapterVersion as number) < 1) {
-    fail("candidate.adapterVersion", "must be a positive integer");
+  assertAdapterVersion("candidate.adapterVersion", root.adapterVersion);
+  // Type/precision only. The supported RANGE is the caller's contract
+  // (`validateCandidate`), and it owns that error message so an out-of-range
+  // snapshot still reports "unsupported model catalog schema".
+  if (!Number.isSafeInteger(root.schemaVersion)) {
+    fail("candidate.schemaVersion", "must be a safe integer");
   }
   requireLabel("candidate.source", root.source);
   optionalLabel("candidate.sourceVersion", root.sourceVersion);
@@ -617,6 +662,9 @@ export function assertCatalogValues(candidate: unknown): void {
   if (typeof scope.fingerprint !== "string" || !scope.fingerprint.length) {
     fail("candidate.scope.fingerprint", "must be a non-empty string");
   }
+  // Identity: validated, never rewritten. A digest is the normal shape; a
+  // bounded safe identifier is also accepted so an adapter that scopes by a
+  // short stable name is not forced to hash. Anything unsafe is refused.
   if (!HEX_FINGERPRINT.test(scope.fingerprint)) {
     assertLabelValue("candidate.scope.fingerprint", scope.fingerprint, CATALOG_EVIDENCE_TEXT_MAX);
   }
@@ -629,6 +677,7 @@ export function assertCatalogValues(candidate: unknown): void {
     }
     // Strict here: by the time anything is validated it has been normalized, so
     // a surviving path/PII/credential value means it bypassed the boundary.
+    if (value === CATALOG_SCOPE_LABEL_REDACTED) continue;
     assertLabelValue(`candidate.scope.${field}`, value, CATALOG_EVIDENCE_TEXT_MAX);
   }
 
@@ -740,14 +789,13 @@ export function normalizeCatalogCandidate<T>(candidate: T): T {
   const scope = root.scope as Record<string, unknown>;
   let nextScope: Record<string, unknown> | undefined;
   if (scope && typeof scope === "object" && !Array.isArray(scope)) {
-    if (typeof scope.fingerprint === "string" && !HEX_FINGERPRINT.test(scope.fingerprint)) {
-      const safe = sanitizeScopeIdentifier(scope.fingerprint);
-      if (safe !== scope.fingerprint) nextScope = { ...scope, fingerprint: safe };
-    }
+    // The fingerprint is IDENTITY and is never rewritten. It is validated for
+    // safe format by `assertCatalogValues` below; an unsafe one is refused
+    // rather than replaced, because silently changing it would fork the scope.
     for (const field of SCOPE_IDENTITY_FIELDS) {
       const value = (nextScope ?? scope)[field];
       if (typeof value !== "string") continue;
-      const safe = sanitizeScopeIdentifier(value);
+      const safe = safeScopeLabel(value);
       if (safe !== value) nextScope = { ...(nextScope ?? scope), [field]: safe };
     }
   }
@@ -778,6 +826,9 @@ export function normalizeCatalogCandidate<T>(candidate: T): T {
     : root) as unknown as T;
   assertCatalogValues(normalized);
   assertCatalogDescriptionsAndEvidence(normalized);
+  // Cross-row identity too, so duplicates and collisions are refused BEFORE
+  // transport rather than only after it.
+  assertCatalogSemantics(normalized);
   return normalized;
 }
 
@@ -790,5 +841,73 @@ function assertCatalogDescriptionsAndEvidence(candidate: unknown): void {
     const id = typeof model?.id === "string" ? model.id : "(unknown)";
     if (model.description !== undefined) assertCatalogDescription(`${id}.description`, model.description);
     if (model.evidence !== undefined) parseCatalogEvidenceList(`${id}.evidence`, model.evidence);
+  }
+}
+
+/**
+ * Cross-row semantic identity for the whole candidate (#236).
+ *
+ * These are the checks that cannot be made looking at one field or one row:
+ * duplicate model ids, an id colliding with another row's alias, a reverse
+ * binding that two rows both claim, and the exactly-one-default rule. They
+ * lived only in core, so a malformed candidate crossed the bridge and was only
+ * caught after transport. This is the ONE provider-neutral implementation both
+ * boundaries call — it knows no provider vocabulary, only identity structure.
+ */
+export function assertCatalogSemantics(candidate: unknown): void {
+  const models = (candidate as Record<string, unknown>)?.models;
+  if (!Array.isArray(models)) fail("candidate.models", "must be an array");
+
+  const ids = new Set<string>();
+  const names = new Set<string>();
+  const rawSelections = new Set<string>();
+  let defaults = 0;
+
+  models.forEach((raw, index) => {
+    const model = raw as Record<string, unknown>;
+    const path = `candidate.models[${index}]`;
+    const id = String(model.id);
+    if (ids.has(id)) fail(path, `duplicate model id ${JSON.stringify(id)}`);
+    ids.add(id);
+
+    // An id and an alias share one namespace: whichever a caller types must
+    // resolve to exactly one row.
+    const aliases = Array.isArray(model.aliases) ? model.aliases.map(String) : [];
+    for (const name of [id, ...aliases]) {
+      const normalized = name.trim().toLowerCase();
+      if (!normalized) fail(path, "empty model id/alias");
+      if (names.has(normalized)) fail(path, `duplicate model id/alias ${JSON.stringify(name)}`);
+      names.add(normalized);
+    }
+
+    if (model.default === true) defaults += 1;
+
+    const effort = model.effort as Record<string, unknown>;
+    const choices = Array.isArray(effort?.choices)
+      ? (effort.choices as Array<Record<string, unknown>>).map((choice) => String(choice.id))
+      : [];
+    const bindings = Array.isArray(model.bindings)
+      ? (model.bindings as Array<Record<string, unknown>>)
+      : [];
+    if (bindings.length !== choices.length) {
+      fail(`${path}.bindings`, `must declare exactly one binding per effort choice (${bindings.length} vs ${choices.length})`);
+    }
+    for (const choice of choices) {
+      const matches = bindings.filter((binding) => binding.model === id && binding.effort === choice);
+      if (matches.length !== 1) {
+        fail(`${path}.bindings`, `expected exactly one binding for ${id}/${choice}`);
+      }
+      // The reverse codec must be unambiguous: one raw pair, one normalized
+      // selection. Two rows claiming the same raw pair makes decode a coin flip.
+      const rawKey = JSON.stringify([matches[0]!.rawModel, matches[0]!.rawEffort ?? null]);
+      if (rawSelections.has(rawKey)) {
+        fail(`${path}.bindings`, `ambiguous reverse binding for ${id}/${choice}`);
+      }
+      rawSelections.add(rawKey);
+    }
+  });
+
+  if (defaults !== 1) {
+    fail("candidate.models", `catalog requires exactly one default model (found ${defaults})`);
   }
 }

@@ -42,7 +42,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import { spawn, execSync, execFileSync, type ChildProcess } from "node:child_process";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { homedir } from "node:os";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -50,7 +50,11 @@ import type { IncomingMessage } from "node:http";
 import type { RawData, WebSocket as WsSocket } from "ws";
 import { PROTOCOL_VERSION, type AgentAdapter } from "@seam/adapters";
 import { dispatchBridgeRpc, type SlotSpawnConfig } from "./rpc.js";
-import { inventoryFromAdapters, loadHostAdapters } from "./inventory.js";
+import {
+  inventoryFromAdapters,
+  loadHostAdapters,
+  resolveCopilotHostLaunch,
+} from "./inventory.js";
 
 type WsCtor = typeof import("ws").WebSocket;
 type WssCtor = typeof import("ws").WebSocketServer;
@@ -198,27 +202,21 @@ function spawnAgent(
     return adapter.spawn(slotCfg?.model, slotCfg?.effort);
   }
 
-  const ghToken = process.env.GH_TOKEN || (() => {
-    try { return execSync("gh auth token", { stdio: ["pipe", "pipe", "ignore"] }).toString().trim(); }
-    catch { return ""; }
-  })();
-  const cmdParts = copilotCmd.split(" ");
-  const cmd = cmdParts[0]!;
-  const extraArgs = process.env.COPILOT_ARGS !== undefined
-    ? process.env.COPILOT_ARGS.split(" ").filter(Boolean)
-    : ["--acp"];
-  const cmdArgs = [...cmdParts.slice(1), ...extraArgs];
+  const cwd = slotCfg?.cwd || localCwd;
+  const launch = resolveCopilotHostLaunch(copilotCmd, cwd, slotCfg?.env);
+  const cmdArgs = [...launch.args];
   const mcpJson = additionalMcpConfigJson(slotCfg?.mcpServers);
   if (mcpJson) {
     cmdArgs.push("--additional-mcp-config", mcpJson);
   }
-  const cwd = slotCfg?.cwd || localCwd;
-  const extraEnv = slotCfg?.env ?? {};
-  console.error(`[bridge] Spawning agent: ${cmd} ${cmdArgs.filter((a) => a !== mcpJson).join(" ")} (GH_TOKEN: ${ghToken ? ghToken.slice(0, 8) + "..." : "MISSING"})`);
-  return spawn(cmd, cmdArgs, {
-    cwd,
+  const tokenLabel = launch.env.GH_TOKEN
+    ? `${launch.env.GH_TOKEN.slice(0, 8)}...`
+    : "MISSING";
+  console.error(`[bridge] Spawning agent: ${launch.cliPath} ${cmdArgs.filter((a) => a !== mcpJson).join(" ")} (GH_TOKEN: ${tokenLabel})`);
+  return spawn(launch.cliPath, cmdArgs, {
+    cwd: launch.cwd,
     stdio: ["pipe", "pipe", "inherit"],
-    env: { ...process.env, ...(ghToken ? { GH_TOKEN: ghToken } : {}), ...extraEnv },
+    env: launch.env,
   });
 }
 

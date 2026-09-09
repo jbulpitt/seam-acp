@@ -27,11 +27,11 @@ function commandExists(cmd: string): boolean {
   }
 }
 
-function copilotProfileForHost(
+export function resolveCopilotHostLaunch(
   copilotCmd: string,
   cwd: string,
-  catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>
-): AgentAdapter {
+  extraEnv: NodeJS.ProcessEnv = {}
+): CopilotCatalogLaunch {
   const commandParts = copilotCmd.split(" ");
   const cliPath = commandParts[0]!;
   const args = [
@@ -51,11 +51,21 @@ function copilotProfileForHost(
       // The ACP probe will report auth failure without exposing credentials.
     }
   }
+  Object.assign(env, extraEnv);
+  return { cliPath, args, cwd, env };
+}
+
+function copilotProfileForHost(
+  copilotCmd: string,
+  cwd: string,
+  catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>
+): AgentAdapter {
+  const launch = resolveCopilotHostLaunch(copilotCmd, cwd);
   return makeCopilotProfile({
-    cliPath,
-    acpArgs: args,
-    cwd,
-    environment: env,
+    cliPath: launch.cliPath,
+    acpArgs: launch.args,
+    cwd: launch.cwd,
+    environment: launch.env,
     defaultModel: "gpt-5.4",
     ...(catalogProbe ? { catalogProbe } : {}),
   });

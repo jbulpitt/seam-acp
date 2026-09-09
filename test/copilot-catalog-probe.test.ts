@@ -123,6 +123,8 @@ function fakeCopilotSpawner(opts: {
   emptyModel?: string;
   mismatchOnceModel?: string;
   ignoreTerm?: boolean;
+  ignoreKill?: boolean;
+  missingStdout?: boolean;
 } = {}) {
   const models = opts.models ?? modelFixtures();
   const calls: Array<{
@@ -136,6 +138,7 @@ function fakeCopilotSpawner(opts: {
   const closedSessions = new Set<string>();
   const children: EventEmitter[] = [];
   const transports: PassThrough[][] = [];
+  const forceStops: Array<() => void> = [];
   let active = 0;
   let maxActive = 0;
   let mismatches = 0;
@@ -162,24 +165,30 @@ function fakeCopilotSpawner(opts: {
     let modelSwitches = 0;
     let exited = false;
     let serverConnection: { close(): void } | undefined;
+    let forceStop!: (signal?: NodeJS.Signals | number) => void;
     const child = Object.assign(new EventEmitter(), {
       stdin,
-      stdout,
+      stdout: opts.missingStdout ? null : stdout,
       stderr,
       killed: false,
       kill(signal?: NodeJS.Signals | number) {
         call.signals.push(signal);
         this.killed = true;
+        if (opts.ignoreKill) return true;
         if (signal === "SIGTERM" && opts.ignoreTerm) return true;
+        forceStop(signal);
+        return true;
+      },
+    });
+    forceStop = (signal) => {
         if (!exited) {
           exited = true;
           active -= 1;
           serverConnection?.close();
-          queueMicrotask(() => this.emit("exit", null, signal ?? "SIGTERM"));
+          queueMicrotask(() => child.emit("exit", null, signal ?? "SIGTERM"));
         }
-        return true;
-      },
-    });
+    };
+    forceStops.push(() => forceStop("SIGKILL"));
     children.push(child);
     transports.push([stdin, stdout, stderr]);
     serverConnection = agent({ name: "fake-copilot-acp" })
@@ -247,6 +256,12 @@ function fakeCopilotSpawner(opts: {
     },
     get stderrListenersRemoved() {
       return transports.every((group) => group[2]!.listenerCount("data") === 0);
+    },
+    get exposedStreamsDestroyed() {
+      return transports.every((group) => group[0]!.destroyed && group[2]!.destroyed);
+    },
+    forceCleanup() {
+      for (const stop of forceStops) stop();
     },
   };
 }
@@ -480,6 +495,38 @@ describe("Copilot isolated catalog probing (#234)", () => {
     expect(harness.listenersRemoved).toBe(true);
     expect(harness.transportsDestroyed).toBe(true);
     expect(harness.stderrListenersRemoved).toBe(true);
+  });
+
+  it("reaps a child that does not expose all required stdio pipes", async () => {
+    const harness = fakeCopilotSpawner({ missingStdout: true });
+    await expect(probeCopilotCatalog({
+      spawnProcess: harness.spawnProcess,
+      timeoutMs: 100,
+      overallTimeoutMs: 500,
+      cleanupTimeoutMs: 10,
+    })).rejects.toThrow(/stdio pipes/);
+    expect(harness.calls).toHaveLength(1);
+    expect(harness.active).toBe(0);
+    expect(harness.listenersRemoved).toBe(true);
+    expect(harness.exposedStreamsDestroyed).toBe(true);
+    expect(harness.calls[0]!.signals).toContain("SIGTERM");
+  });
+
+  it("cleans streams and listeners before reporting an unreaped child", async () => {
+    const harness = fakeCopilotSpawner({ missingStdout: true, ignoreKill: true });
+    await expect(probeCopilotCatalog({
+      spawnProcess: harness.spawnProcess,
+      timeoutMs: 100,
+      overallTimeoutMs: 500,
+      cleanupTimeoutMs: 10,
+    })).rejects.toThrow(/did not exit after SIGKILL/);
+    expect(harness.active).toBe(1);
+    expect(harness.listenersRemoved).toBe(true);
+    expect(harness.exposedStreamsDestroyed).toBe(true);
+    expect(harness.calls[0]!.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    harness.forceCleanup();
+    await Promise.resolve();
+    expect(harness.active).toBe(0);
   });
 
   it("normalizes identical local and bridged candidates with complete provenance", async () => {

@@ -218,14 +218,8 @@ async function runCopilotAcpProbeSession<T>(opts: {
   const stdin = child.stdin;
   const stdout = child.stdout;
   const stderrStream = child.stderr;
-  if (!stdin || !stdout || !stderrStream) {
-    child.kill("SIGKILL");
-    throw new Error("copilot ACP probe did not expose stdio pipes");
-  }
   let stderr = "";
-  stderrStream.setEncoding("utf8");
   const onStderrData = (chunk: string) => { stderr = (stderr + chunk).slice(-4000); };
-  stderrStream.on("data", onStderrData);
   let exited = false;
   let intentionalStop = false;
   let resolveExit!: () => void;
@@ -248,30 +242,39 @@ async function runCopilotAcpProbeSession<T>(opts: {
   };
   child.once("error", onChildError);
   child.once("exit", onChildExit);
-  const connection = new ClientSideConnection(
-    () => ({
-      async requestPermission(request) {
-        const option = request.options.find((entry) => entry.kind?.startsWith("allow_"));
-        return option
-          ? { outcome: { outcome: "selected" as const, optionId: option.optionId } }
-          : { outcome: { outcome: "cancelled" as const } };
-      },
-      async sessionUpdate() {},
-    } satisfies Client),
-    ndJsonStream(
-      Writable.toWeb(stdin) as unknown as WritableStream<Uint8Array>,
-      Readable.toWeb(stdout) as unknown as ReadableStream<Uint8Array>
-    )
-  );
+  void died.catch(() => undefined);
+  if (stderrStream) {
+    stderrStream.setEncoding("utf8");
+    stderrStream.on("data", onStderrData);
+  }
   const deadline = Date.now() + opts.timeoutMs;
-  const run = <R>(work: Promise<R>, message: string): Promise<R> => boundedProbe(
-    Promise.race([work, died]),
-    deadline - Date.now(),
-    message,
-    opts.signal
-  );
+  let connection: ClientSideConnection | undefined;
   let sessionId: string | undefined;
   try {
+    if (!stdin || !stdout || !stderrStream) {
+      throw new Error("copilot ACP probe did not expose stdio pipes");
+    }
+    connection = new ClientSideConnection(
+      () => ({
+        async requestPermission(request) {
+          const option = request.options.find((entry) => entry.kind?.startsWith("allow_"));
+          return option
+            ? { outcome: { outcome: "selected" as const, optionId: option.optionId } }
+            : { outcome: { outcome: "cancelled" as const } };
+        },
+        async sessionUpdate() {},
+      } satisfies Client),
+      ndJsonStream(
+        Writable.toWeb(stdin) as unknown as WritableStream<Uint8Array>,
+        Readable.toWeb(stdout) as unknown as ReadableStream<Uint8Array>
+      )
+    );
+    const run = <R>(work: Promise<R>, message: string): Promise<R> => boundedProbe(
+      Promise.race([work, died]),
+      deadline - Date.now(),
+      message,
+      opts.signal
+    );
     await run(
       connection.initialize({
         protocolVersion: PROTOCOL_VERSION,
@@ -291,26 +294,32 @@ async function runCopilotAcpProbeSession<T>(opts: {
     }, run);
   } finally {
     intentionalStop = true;
-    if (sessionId && !exited) {
-      await settleWithin(connection.closeSession({ sessionId }), opts.cleanupTimeoutMs);
+    if (sessionId && connection && !exited) {
+      try {
+        await settleWithin(connection.closeSession({ sessionId }), opts.cleanupTimeoutMs);
+      } catch {
+        // Process termination below remains authoritative cleanup.
+      }
     }
     if (!exited) {
-      child.kill("SIGTERM");
+      try { child.kill("SIGTERM"); } catch { /* continue to SIGKILL */ }
       await settleWithin(exitedPromise, opts.cleanupTimeoutMs);
     }
     if (!exited) {
-      child.kill("SIGKILL");
+      try { child.kill("SIGKILL"); } catch { /* report after local cleanup */ }
       await settleWithin(exitedPromise, opts.cleanupTimeoutMs);
     }
-    if (!exited) throw new Error("copilot ACP probe process did not exit after SIGKILL");
-    stdin.destroy();
-    stdout.destroy();
-    stderrStream.destroy();
-    const connectionClosed = await settleWithin(connection.closed, opts.cleanupTimeoutMs);
-    stderrStream.removeListener("data", onStderrData);
+    stdin?.destroy();
+    stdout?.destroy();
+    stderrStream?.destroy();
+    const connectionClosed = connection
+      ? await settleWithin(connection.closed, opts.cleanupTimeoutMs)
+      : true;
+    stderrStream?.removeListener("data", onStderrData);
     child.removeListener("error", onChildError);
     child.removeListener("exit", onChildExit);
-    if (!connectionClosed || !connection.signal.aborted) {
+    if (!exited) throw new Error("copilot ACP probe process did not exit after SIGKILL");
+    if (connection && (!connectionClosed || !connection.signal.aborted)) {
       throw new Error("copilot ACP probe connection did not close");
     }
   }

@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { loadHostAdapters } from "../packages/bridge/src/inventory.js";
+import {
+  loadHostAdapters,
+  resolveCopilotHostLaunch,
+} from "../packages/bridge/src/inventory.js";
 
 describe("loadHostAdapters", () => {
   it("skips adapters whose CLI is not on PATH (agy must not spawn ENOENT)", () => {
@@ -41,12 +44,22 @@ describe("loadHostAdapters", () => {
       );
       const candidate = await adapters.get("copilot")!.catalog.fetch();
       expect(candidate.models.map((model) => model.id)).toEqual(["remote-model"]);
-      expect(launch).toMatchObject({
-        cliPath: "/configured/bin/copilot",
-        args: ["--tenant", "enterprise", "--acp", "--remote-mode"],
-        cwd: "/remote/workspace",
+      const runtimeLaunch = resolveCopilotHostLaunch(command, "/remote/workspace");
+      expect(launch).toEqual(runtimeLaunch);
+      expect(runtimeLaunch).toMatchObject({
+          cliPath: "/configured/bin/copilot",
+          args: ["--tenant", "enterprise", "--acp", "--remote-mode"],
+          cwd: "/remote/workspace",
+        });
+      expect(runtimeLaunch.env.GH_TOKEN).toBe("remote-credential-token");
+
+      const slotLaunch = resolveCopilotHostLaunch(command, "/remote/repository", {
+        GH_TOKEN: "slot-credential-token",
       });
-      expect(launch?.env.GH_TOKEN).toBe("remote-credential-token");
+      expect(slotLaunch.cliPath).toBe(runtimeLaunch.cliPath);
+      expect(slotLaunch.args).toEqual(runtimeLaunch.args);
+      expect(slotLaunch.cwd).toBe("/remote/repository");
+      expect(slotLaunch.env.GH_TOKEN).toBe("slot-credential-token");
     } finally {
       if (priorArgs === undefined) delete process.env.COPILOT_ARGS;
       else process.env.COPILOT_ARGS = priorArgs;

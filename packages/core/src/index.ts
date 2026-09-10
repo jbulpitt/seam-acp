@@ -60,7 +60,10 @@ import { watchChannelPresets } from "./core/config-reload.js";
 import { BridgeHub } from "./core/bridge-hub.js";
 import { ServerStatusCard } from "./core/server-status-card.js";
 import type { BridgeAgent } from "./core/server-status.js";
-import { ChoiceResultHub } from "./core/choice/result.js";
+import {
+  ChoiceResultHub,
+  reconcileInterruptedChoiceAdmissions,
+} from "./core/choice/result.js";
 import { ChoiceIngest } from "./core/choice/ingest.js";
 import { CardGifCatalog } from "./core/card-gifs.js";
 import { resolveIngestPublicBase, resolvePublicBridgeWsUrl } from "./core/mcp-url.js";
@@ -1105,6 +1108,22 @@ async function main(): Promise<void> {
     },
   });
   orchestrator.setDispatchWatcher(dispatchWatcher);
+
+  // #247: result identity/schema is durable before dispatch publication. A
+  // crash can therefore leave an `admitting` row. Reconcile only against the
+  // exact artifact state before the watcher starts; never execute/replay here.
+  const admissionRecovery = await reconcileInterruptedChoiceAdmissions({
+    store,
+    logger: logger.child({ mod: "choice-result-recovery" }),
+    dataDir: config.DATA_DIR,
+  });
+  if (
+    admissionRecovery.failed > 0 ||
+    admissionRecovery.deferred > 0 ||
+    admissionRecovery.truncated
+  ) {
+    logger.warn(admissionRecovery, "ingest admission boot reconciliation reported work or deferral");
+  }
 
   const voiceConsoleController = new VoiceConsoleController({
     store,

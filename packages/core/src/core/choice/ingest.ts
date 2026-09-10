@@ -9,7 +9,7 @@ import type { Logger } from "../../lib/logger.js";
 import type { SessionStore } from "../session-store.js";
 import type { DispatchSpec } from "../dispatch/types.js";
 import type { SessionRecord } from "../types.js";
-import { emitChoice, type ChoiceActor } from "./emit.js";
+import { planChoiceDispatch, type ChoiceActor } from "./emit.js";
 import { ChoiceResultHub } from "./result.js";
 import type { ChoiceCard } from "./types.js";
 import {
@@ -140,7 +140,7 @@ export class ChoiceIngest {
       json(res, 404, { error: "unknown job" });
       return;
     }
-    if (row.status === "pending") {
+    if (row.status === "admitting" || row.status === "pending") {
       json(res, 202, { jobId: dispatchId, status: "pending" });
       return;
     }
@@ -221,7 +221,7 @@ export class ChoiceIngest {
       return;
     }
     const authoringSession = this.authoringSession(card.channelRef);
-    const emitted = await emitChoice({
+    const emitted = planChoiceDispatch({
       card: claimed.card,
       optionIndex,
       actor,
@@ -241,24 +241,28 @@ export class ChoiceIngest {
       json(res, 409, { error: emitted.error });
       return;
     }
-    this.store.setChoiceClickDelivery(card.id, actor.id, emitted.dispatchId);
-    const now = new Date().toISOString();
-    this.store.insertChoiceResult({
-      dispatchId: emitted.dispatchId,
-      choiceId: card.id,
-      status: "pending",
-      body: null,
-      error: null,
-      schema: card.resultSchema,
-      createdUtc: now,
-      finishedUtc: null,
-    });
-    const pending = this.results.expect({
+    const pending = this.results.beginAdmission({
       dispatchId: emitted.dispatchId,
       choiceId: card.id,
       schema: card.resultSchema,
     });
-    const timed = await withTimeout(pending, waitMs);
+    // Attach the rejection observer before any publication failure can settle
+    // the waiter, avoiding an unhandled-rejection gap.
+    const timedPending = withTimeout(pending, waitMs);
+    try {
+      this.store.setChoiceClickDelivery(card.id, actor.id, emitted.dispatchId);
+      await this.enqueue(emitted.spec);
+    } catch {
+      this.results.failAdmission(emitted.dispatchId);
+      this.respondNoResult(res, emitted.dispatchId);
+      return;
+    }
+    // Keep the acknowledgement outside the enqueue catch: production enqueue
+    // ends with the atomic rename, so an acknowledgement fault after that
+    // point must leave `admitting` for evidence-based boot repair, not falsely
+    // claim that a runnable artifact was never published.
+    this.results.publishAdmission(emitted.dispatchId);
+    const timed = await timedPending;
     if (timed.status === "ok") {
       json(res, 200, timed.value);
       return;
@@ -319,24 +323,21 @@ export class ChoiceIngest {
       payload,
       ...(studentId ? { untrustedStudentId: studentId } : {}),
     });
-    await this.enqueue(spec);
-    const now = new Date().toISOString();
-    this.store.insertChoiceResult({
-      dispatchId: spec.id,
-      choiceId: endpoint.id,
-      status: "pending",
-      body: null,
-      error: null,
-      schema: endpoint.resultSchema,
-      createdUtc: now,
-      finishedUtc: null,
-    });
-    const pending = this.results.expect({
+    const pending = this.results.beginAdmission({
       dispatchId: spec.id,
       choiceId: endpoint.id,
       schema: endpoint.resultSchema,
     });
-    const timed = await withTimeout(pending, waitMs);
+    const timedPending = withTimeout(pending, waitMs);
+    try {
+      await this.enqueue(spec);
+    } catch {
+      this.results.failAdmission(spec.id);
+      this.respondNoResult(res, spec.id);
+      return;
+    }
+    this.results.publishAdmission(spec.id);
+    const timed = await timedPending;
     if (timed.status === "ok") {
       json(res, 200, timed.value);
       return;

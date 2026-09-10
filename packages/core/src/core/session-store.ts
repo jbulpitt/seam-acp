@@ -5701,23 +5701,45 @@ export class SessionStore {
     return row ? mapChoiceResult(row) : null;
   }
 
+  listAdmittingChoiceResults(limit = 500): ChoiceResultRow[] {
+    return this.db
+      .prepare<[number], ChoiceResultDbRow>(
+        `SELECT * FROM choice_results
+          WHERE status = 'admitting'
+          ORDER BY created_utc ASC, dispatch_id ASC
+          LIMIT ?`
+      )
+      .all(Math.max(1, Math.floor(limit)))
+      .map(mapChoiceResult);
+  }
+
+  /** Publish acknowledgement. A fast worker may already have terminalized. */
+  publishChoiceResult(dispatchId: string): boolean {
+    return this.db
+      .prepare(
+        `UPDATE choice_results SET status = 'pending'
+          WHERE dispatch_id = ? AND status = 'admitting'`
+      )
+      .run(dispatchId).changes > 0;
+  }
+
   finishChoiceResult(
     dispatchId: string,
     status: ChoiceResultStatus,
     body: unknown | null,
     error: string | null
-  ): void {
+  ): boolean {
     const now = new Date().toISOString();
     const existing = this.getChoiceResult(dispatchId);
-    if (!existing) return;
-    if (existing.status === "ok") return;
-    this.db
+    if (!existing) return false;
+    if (existing.status === "ok") return false;
+    return this.db
       .prepare(
         `UPDATE choice_results
             SET status = ?, body_json = ?, error = ?, finished_utc = ?
-          WHERE dispatch_id = ? AND status = 'pending'`
+          WHERE dispatch_id = ? AND status IN ('admitting', 'pending')`
       )
-      .run(status, body == null ? null : JSON.stringify(body), error, now, dispatchId);
+      .run(status, body == null ? null : JSON.stringify(body), error, now, dispatchId).changes > 0;
   }
 
   // --- agent-defined watches (#60) ------------------------------------------

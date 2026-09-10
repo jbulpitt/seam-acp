@@ -68,6 +68,7 @@ import { ChoiceIngest } from "./core/choice/ingest.js";
 import { CardGifCatalog } from "./core/card-gifs.js";
 import { resolveIngestPublicBase, resolvePublicBridgeWsUrl } from "./core/mcp-url.js";
 import fs from "node:fs";
+import { projectAttemptCompletions } from "./core/dispatch/attempt-recovery.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { QuotaRegistry } from "./core/quota/quota-registry.js";
 import {
@@ -1100,6 +1101,7 @@ async function main(): Promise<void> {
     // Flag-on: mark stale running specs in place (orchestrator stagger-
     // requeues after preconditions). Flag-off: today's recoverStale replay.
     resumeEnabled: config.SEAM_TURN_RESUME_ENABLED,
+    retainForRecovery: (id) => store.turnAttempts.get(id) !== null,
     // A stale ledger row terminalized by #137 must never be resurrected by the
     // filesystem at-least-once recovery path, regardless of resume flag.
     mayRecover: (id) => {
@@ -1213,6 +1215,13 @@ async function main(): Promise<void> {
   // This deliberately runs BEFORE the #137 stale and #75 orphan passes below.
   // A done-backed row is a completed turn awaiting side effects, not stale
   // work to abandon or interrupted work to resume.
+  // #250 ownership repair is deliberately outside the best-effort legacy
+  // scan: a broken winning output must stop intake, never allow provider replay.
+  store.turnAttempts.retireDeadOwners();
+  await projectAttemptCompletions(config.DATA_DIR, store.turnAttempts, (id) => {
+    const row = store.getDelegation(id);
+    return !row || !DELEGATION_TERMINAL_STATUSES.includes(row.status);
+  });
   try {
     const repaired = await reconcileCompletedDoneFiles({
       dataDir: config.DATA_DIR,
@@ -1641,6 +1650,9 @@ async function main(): Promise<void> {
         }
       );
     verdicts.push({ stage: "pre-dispose-quiesce", drained: quiesceDrained });
+    // #250: drain may let a worker finish. Teardown must not impersonate that
+    // completion: persist suspension before any runtime/voice/MCP disposal.
+    orchestrator.suspendForRestart();
     // Voice console teardown settles bindings and posts closing state, so an
     // unfinished one is late work that reaches the store and the adapter.
     verdicts.push({

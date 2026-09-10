@@ -3,6 +3,9 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
+import { DispatchSuspendedError } from "../../core/dispatch/attempt-store.js";
+import type { DispatchResult } from "../../core/dispatch/types.js";
+import { executionIdentity } from "../../core/dispatch/execution-identity.js";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
 import type { Config } from "../../config.js";
@@ -389,7 +392,7 @@ import {
   DISPATCH_CARD_WINDOW_CHARS,
   rollingLineWindow,
 } from "../../core/rolling-line-window.js";
-import type { CompletionRoute } from "../../core/dispatch/done-reconcile.js";
+import { completionRoute, type CompletionRoute } from "../../core/dispatch/done-reconcile.js";
 import { promptExcerpt } from "../../core/prompt-excerpt.js";
 import { buildSeamHelpPages } from "./help-text.js";
 import { frameSteerPrompt, frameInterruptPrompt } from "../../core/steer.js";
@@ -800,6 +803,15 @@ export class Orchestrator {
   private readonly adapter: ChatAdapter;
   private readonly router: SessionRouter;
   private readonly store: SessionStore;
+  private readonly attemptBoot = randomUUID();
+  private restartCutoff = false;
+
+  /** Final restart cutoff, NOT ordinary drain/admission or intentional cancel.
+   * Synchronous durable winner before teardown is allowed to reject prompts. */
+  suspendForRestart(): void {
+    this.restartCutoff = true;
+    this.store.turnAttempts.suspendBoot(this.attemptBoot);
+  }
   private readonly renderer: Renderer;
   private readonly quotaPoller?: AgentQuotaPoller;
   private readonly modelCatalog: ModelCatalogService;
@@ -4844,6 +4856,7 @@ export class Orchestrator {
 
     let text = "";
     const handler: AgentEventHandler = async (event) => {
+      if (opts.lifecycle && !opts.lifecycle.isCurrent()) return;
       if (event.kind === "agent-text") {
         text += event.text;
       } else if (event.kind === "agent-file") {
@@ -4867,13 +4880,19 @@ export class Orchestrator {
 
     const attachments =
       opts.attachments && opts.attachments.length > 0 ? opts.attachments : undefined;
-    const runPrompt = async (rt: AgentRuntime): Promise<PromptOutcome | "timeout"> =>
-      opts.timeoutMs === undefined
+    const settle = (result: InjectTurnResult): InjectTurnResult => {
+      opts.lifecycle?.onOutcome(result);
+      return result;
+    };
+    const runPrompt = async (rt: AgentRuntime): Promise<PromptOutcome | "timeout"> => {
+      opts.lifecycle?.beforePrompt();
+      return opts.timeoutMs === undefined
         ? await rt.prompt(prompt, attachments, opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : undefined)
         : await raceWithTimeout(
             rt.prompt(prompt, attachments, opts.jsonSchema ? { jsonSchema: opts.jsonSchema } : undefined),
             opts.timeoutMs
           );
+    };
 
     if (opts.session === "isolated") {
       const profile = opts.profile ?? this.profileForTarget(target);
@@ -4913,14 +4932,18 @@ export class Orchestrator {
           )),
         });
         await rt.start();
+        opts.lifecycle?.onRuntime?.(rt.getProcessId?.(), rt.getProviderIdentity?.());
         if (opts.resumeSessionId) {
+          if (opts.lifecycle && !rt.supportsSessionLoad?.()) {
+            throw new DispatchSuspendedError(opts.logContext?.dispatch as string ?? "unknown");
+          }
           // #76: resume against the recorded session, never newSession().
           await rt.loadSession({
             sessionId: opts.resumeSessionId,
             cwd,
             model: selection.raw.model,
             ...(selection.raw.effort ? { effort: selection.raw.effort } : {}),
-            ...(opts.strictModel ? { strictModel: true } : {}),
+            ...((opts.strictModel || opts.lifecycle) ? { strictModel: true } : {}),
           });
           sessionId = opts.resumeSessionId;
         } else {
@@ -4938,6 +4961,7 @@ export class Orchestrator {
           try {
             await opts.onSession?.(sessionId);
           } catch (err) {
+            if (opts.lifecycle) throw err;
             logger.warn({ err, sessionId }, "injectTurn: onSession failed");
           }
         }
@@ -4946,37 +4970,38 @@ export class Orchestrator {
         rt.onEvent(handler);
         const outcome = await runPrompt(rt);
         if (outcome === "timeout") {
-          return {
+          return settle({
             text,
             timedOut: true,
             error: `timed out after ${opts.timeoutMs! / 1000}s`,
             ...(sessionId ? { sessionId } : {}),
             ...correlation,
-          };
+          });
         }
         if (opts.awaitIdle) await rt.idle();
-        return {
+        return settle({
           text,
           stopReason: outcome.stopReason,
           cancelled: outcome.cancelled,
           ...(sessionId ? { sessionId } : {}),
           ...correlation,
-        };
+        });
       } catch (err) {
-        return {
+        if (err instanceof DispatchSuspendedError) throw err;
+        return settle({
           text,
           error: (err as Error).message,
           cause: err,
           ...(sessionId ? { sessionId } : {}),
           ...correlation,
-        };
+        });
       } finally {
         // Isolated runs guarantee teardown: kill the child, then drop the
         // throwaway session so it never clutters `/seam sessions`.
         if (rt) {
           const sid = rt.getSessionInfo()?.sessionId;
           await rt.dispose().catch(() => {});
-          if (sid && manager?.deleteSession) {
+          if (sid && manager?.deleteSession && (!opts.lifecycle || opts.lifecycle.mayDeleteSession())) {
             await manager.deleteSession(cwd, sid).catch(() => {});
           }
         }
@@ -4996,42 +5021,47 @@ export class Orchestrator {
           cwd: opts.cwd ?? this.config.REPOS_ROOT,
         });
     try {
-      const rt = await this.router.getOrStartRuntime(record);
+      const rt = opts.resumeSessionId
+        ? await this.router.getOrStartRuntime(record, { resumeSessionId: opts.resumeSessionId })
+        : await this.router.getOrStartRuntime(record);
+      opts.lifecycle?.onRuntime?.(rt.getProcessId?.(), rt.getProviderIdentity?.());
       const liveSessionId = record.acpSessionId || rt.getSessionInfo()?.sessionId;
       if (liveSessionId) {
         try {
           await opts.onSession?.(liveSessionId);
         } catch (err) {
+          if (opts.lifecycle) throw err;
           logger.warn({ err, sessionId: liveSessionId }, "injectTurn: onSession failed");
         }
       }
       rt.onEvent(handler);
       const outcome = await runPrompt(rt);
       if (outcome === "timeout") {
-        return {
+        return settle({
           text,
           timedOut: true,
           error: `timed out after ${opts.timeoutMs! / 1000}s`,
           sessionId: record.acpSessionId,
           ...correlation,
-        };
+        });
       }
       if (opts.awaitIdle) await rt.idle();
-      return {
+      return settle({
         text,
         stopReason: outcome.stopReason,
         cancelled: outcome.cancelled,
         sessionId: record.acpSessionId,
         ...correlation,
-      };
+      });
     } catch (err) {
-      return {
+      if (err instanceof DispatchSuspendedError) throw err;
+      return settle({
         text,
         error: (err as Error).message,
         cause: err,
         sessionId: record.acpSessionId,
         ...correlation,
-      };
+      });
     }
   }
 
@@ -6179,7 +6209,13 @@ export class Orchestrator {
     // cancelled run() is guaranteed to find the flag set when it reaches the
     // onward-delivery branch. No live dispatch running ⇒ nothing to suppress.
     const activeId = this.activeLiveDispatch.get(target);
-    if (activeId) this.interruptedDispatches.add(activeId);
+    if (activeId) {
+      this.interruptedDispatches.add(activeId);
+      // Cancellation must beat a simultaneous restart durably, not just via
+      // the old in-memory reporting flag. Preserve a completed-output winner.
+      const cancelled = this.store.turnAttempts?.cancel(activeId);
+      if (cancelled) await this.dispatchWatcher?.cancelRunning({ id: activeId });
+    }
 
     // (a) Cancel — the steer-now canceller, escalated to force so a wedged turn
     // can't block the redirect. "idle" ⇒ there was no active turn (degrade to
@@ -8181,6 +8217,64 @@ export class Orchestrator {
    * scheduled-prompt runner posts it afterwards for the same reason.)
    */
   async dispatchInjectTurn(spec: DispatchSpec): Promise<{ output: string; stopReason: string }> {
+    const prior = this.store.turnAttempts?.get(spec.id);
+    if (prior?.state === "completed") {
+      // Completed-output ownership never re-enters a provider. Boot projection
+      // normally settles this before queue intake; this is the last race gate.
+      this.logger.debug({ dispatch: spec.id }, "dispatch: already ledgered (durable output); skipping execution");
+      if (!prior.outcome) throw new DispatchSuspendedError(spec.id);
+      if (prior.outcome.error) throw new DispatchTurnError(prior.outcome.error,
+        prior.outcome.output ?? "", prior.outcome.stopReason, prior.outcome.workerStatus,
+        prior.outcome.workerError, true, prior.outcome.suppressedOnward);
+      return { output: prior.outcome.output ?? "", stopReason: prior.outcome.stopReason ?? "" };
+    }
+    if (prior?.state === "cancelled" || this.restartCutoff) throw new DispatchSuspendedError(spec.id);
+    try {
+      return await this.dispatchInjectTurnOwned(prior ? { ...prior.spec, resume: prior.promptStarted } : spec);
+    } catch (err) {
+      let current;
+      try { current = this.store.turnAttempts?.get(spec.id); }
+      catch { throw new DispatchSuspendedError(spec.id); }
+      if (current?.state === "cancelled") {
+        this.interruptedDispatches.delete(spec.id);
+        let completionPending = false;
+        try { this.store.updateDelegationStatus(spec.id, "failed"); }
+        catch { completionPending = true; }
+        throw new DispatchTurnError("cancelled by operator", "", "cancelled", "failed",
+          "cancelled by operator", completionPending, true);
+      }
+      if (current?.state === "active" && current.ownerBoot === this.attemptBoot &&
+          !this.restartCutoff && !(err instanceof DispatchSuspendedError)) {
+        // A genuine setup/visibility exception from the living owner is not a
+        // restart. Capture its terminal outcome; reuse existing onward claims.
+        const workerError = err instanceof Error ? err.message : String(err);
+        const outcome: DispatchResult = {
+          id: spec.id, target: spec.target, kind: spec.kind,
+          returnTo: spec.returnTo, chainId: spec.chainId, correlationId: spec.correlationId,
+          status: "failed", workerStatus: "failed", error: workerError, workerError,
+          output: "", finishedUtc: new Date().toISOString(),
+        };
+        let won = false;
+        try { won = this.store.turnAttempts.complete(current, outcome); }
+        catch { throw new DispatchSuspendedError(spec.id); }
+        if (!won) throw new DispatchSuspendedError(spec.id);
+        try {
+          await this.replayCompletedDispatch(outcome, completionRoute(outcome, this.store.getDelegation(spec.id)));
+        } catch {
+          throw new DispatchTurnError(workerError, "", "", "failed", workerError, true);
+        }
+        throw new DispatchTurnError(workerError, "", "", "failed", workerError);
+      }
+      if (current && current.state !== "completed") {
+        // Includes pre-provider acquisition failure on recovery. Retain its
+        // identity/history for inspection; never turn load failure into replay.
+        throw new DispatchSuspendedError(spec.id);
+      }
+      throw err;
+    }
+  }
+
+  private async dispatchInjectTurnOwned(spec: DispatchSpec): Promise<{ output: string; stopReason: string }> {
     // Compact dispatches don't inject a turn — they run the compaction pipeline
     // on the target thread and post a result card there. Same start-indicator +
     // ledger + done-file plumbing, different body (see dispatchCompact).
@@ -8204,7 +8298,8 @@ export class Orchestrator {
     // under its agent/model/effort/cwd, and prepend its instructions as cold-start
     // identity. `target` remains where output is posted for visibility.
     const preset = spec.preset ? this.store.getPresetByName(spec.preset) : null;
-    const threadLocation = resolveThreadLocation(this.config, spec.target);
+    const threadLocation = this.router.describeConfig?.(record).location?.value
+      ?? resolveThreadLocation(this.config, spec.target);
     const requestedWorkerLocation = spec.location ?? threadLocation;
     const agentOverride =
       spec.agentId ??
@@ -8215,7 +8310,7 @@ export class Orchestrator {
       throw new Error(`dispatch: unknown preset "${spec.preset}"`);
     }
     const effectiveSession = preset || agentOverride ? "isolated" : spec.session;
-    const workerLocation = spec.location ?? threadLocation;
+    const workerLocation = effectiveSession === "live" ? threadLocation : spec.location ?? threadLocation;
     const requestedAgentId = preset?.agentId ?? agentOverride;
     const presetProfile = requestedAgentId
       ? this.router.getProfile(requestedAgentId, workerLocation)
@@ -8230,13 +8325,24 @@ export class Orchestrator {
     // so report-back and chain succession come free on completion.
     const isResume = spec.resume === true;
     const ledger = isResume ? this.store.getDelegation(spec.id) : null;
-    const resumeSessionId =
+    const previousAttempt = this.store.turnAttempts?.get(spec.id);
+    if (isResume && !previousAttempt) {
+      // Legacy ACP pointers have no frozen provider/account/host identity.
+      // Retain for explicit reconciliation; do not certify a guessed identity.
+      throw new DispatchSuspendedError(spec.id);
+    }
+    const resumeSessionId = previousAttempt?.acpSessionId ??
       (ledger?.acpSessionId && ledger.acpSessionId.length > 0
         ? ledger.acpSessionId
         : undefined) ??
       (record.acpSessionId && record.acpSessionId.length > 0 ? record.acpSessionId : undefined);
-    if (isResume && resumeSessionId && !record.acpSessionId) {
-      record.acpSessionId = resumeSessionId;
+    if (isResume && !resumeSessionId) throw new DispatchSuspendedError(spec.id);
+    if (previousAttempt && previousAttempt.promptStarted &&
+      (!resumeSessionId || !isLocalLocation(workerLocation) || (presetProfile?.id ?? record.agentId) !== "codex")) {
+      // Initial auto-recovery scope is local Codex (live acceptance is a
+      // separate gate). Other providers/remote slots
+      // remain visible and retained, not silently replayed or fallback-local.
+      throw new DispatchSuspendedError(spec.id);
     }
     // Handoff feedback channel (#62): when the dispatch opts into watchFeedback,
     // append the standing poll_inbox instruction AFTER any preset-identity
@@ -8274,13 +8380,6 @@ export class Orchestrator {
           seamFences: false,
           ...(runtimePrompt.provenance ? { provenance: runtimePrompt.provenance } : {}),
         });
-    if (isResume) {
-      try {
-        await this.adapter.sendMessage?.(target, RESUME_ANNOUNCE);
-      } catch (err) {
-        this.logger.warn({ err, dispatch: spec.id }, "dispatch: resume announce failed");
-      }
-    }
 
     // Ledger: record the dispatch as a handoff (operator-originated, so no
     // source thread). Best-effort — a ledger write must never break a dispatch.
@@ -8357,6 +8456,60 @@ export class Orchestrator {
 
     const run = async (queueFence?: ChannelQueueFence): Promise<{ output: string; stopReason: string }> => {
       this.assertQueueFence(queueFence);
+      if (this.restartCutoff) throw new DispatchSuspendedError(spec.id);
+      const described = this.router.describeConfig?.(record);
+      const selectedProfile = presetProfile ?? this.router.getProfile?.(described?.agent?.value ?? record.agentId, workerLocation);
+      const identity = executionIdentity({
+        agentId: presetProfile?.id ?? described?.agent?.value ?? record.agentId,
+        location: workerLocation, session: effectiveSession,
+        model: preset?.model ?? (effectiveSession === "isolated" ? spec.model : described?.model?.value),
+        effort: preset?.effort ?? (effectiveSession === "isolated" ? spec.effort : described?.effort?.value),
+        cwd: effectiveSession === "live" ? described?.cwd?.value ?? record.repoPath : preset?.repoPath ?? spec.cwd ?? described?.cwd?.value ?? record.repoPath,
+        config: record.configJson, preset: preset ?? null,
+        runtime: selectedProfile?.runtime,
+        // Adapter-declared scope includes profile-specific backend/account
+        // overrides that need not appear in the daemon's process environment.
+        providerScope: selectedProfile?.catalog?.scope?.(),
+      });
+      this.store.turnAttempts?.registerOwner(this.attemptBoot);
+      const attempt = this.store.turnAttempts?.claim(spec, identity, this.attemptBoot);
+      let outcomeOwned = false;
+      let submittedThisAttempt = false;
+      const lifecycle: InjectTurnOptions["lifecycle"] = attempt ? {
+        isCurrent: () => !this.restartCutoff && this.store.turnAttempts.isCurrent(attempt),
+        onRuntime: (pid, providerIdentity) => {
+          try { this.store.turnAttempts.bindRuntime(attempt, pid, providerIdentity); }
+          catch { throw new DispatchSuspendedError(spec.id); }
+        },
+        beforePrompt: () => {
+          try {
+            if (this.restartCutoff) throw new DispatchSuspendedError(spec.id);
+            this.assertQueueFence(queueFence);
+            this.store.turnAttempts.startPrompt(attempt);
+            submittedThisAttempt = true;
+          } catch { throw new DispatchSuspendedError(spec.id); }
+        },
+        onOutcome: (outcome) => {
+          if (this.restartCutoff) throw new DispatchSuspendedError(spec.id);
+          if (isResume && !submittedThisAttempt) throw new DispatchSuspendedError(spec.id);
+          const suppressed = Boolean(outcome.cancelled || this.interruptedDispatches.has(spec.id) || !this.queueFenceCurrent(queueFence));
+          const workerStatus = outcome.timedOut ? "timed_out" : outcome.error ? "failed" : "completed";
+          // Winner and full onward plan captured BEFORE finally/result callbacks,
+          // history deletion, delivery claims, or terminal ledger publication.
+          try {
+            outcomeOwned = this.store.turnAttempts.complete(attempt, {
+              id: spec.id, target: spec.target, status: outcome.error ? "failed" : "completed",
+              output: outcome.text, stopReason: outcome.stopReason, error: outcome.error,
+              workerStatus, workerError: outcome.error, kind: spec.kind,
+              returnTo: spec.returnTo, chainId: spec.chainId, correlationId: spec.correlationId,
+              inlinedReportBack: shouldInlineCardReportBack(spec), suppressedOnward: suppressed,
+              finishedUtc: new Date().toISOString(),
+            });
+          } catch { throw new DispatchSuspendedError(spec.id); }
+          if (!outcomeOwned) throw new DispatchSuspendedError(spec.id);
+        },
+        mayDeleteSession: () => outcomeOwned || this.store.turnAttempts.get(spec.id)?.state === "cancelled",
+      } : undefined;
       if (spec.kind === "migrate_self") {
         if (!spec.migration || !this.selfMigrationHandler) {
           throw new Error("dispatch: self migration is not wired");
@@ -8611,9 +8764,10 @@ export class Orchestrator {
           ...(preset?.effort ? { effort: preset.effort } : spec.effort ? { effort: spec.effort } : {}),
           ...(preset?.repoPath ? { cwd: preset.repoPath } : spec.cwd ? { cwd: spec.cwd } : {}),
           ...(presetProfile ? { profile: presetProfile } : {}),
-          ...(isResume && resumeSessionId && effectiveSession === "isolated"
+          ...((isResume || previousAttempt?.acpSessionId) && resumeSessionId
             ? { resumeSessionId }
             : {}),
+          ...(lifecycle ? { lifecycle } : {}),
           ...isolatedSpawn,
           outputTo: target,
           ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
@@ -8622,7 +8776,11 @@ export class Orchestrator {
           // transition. Write the session id now, before prompt(), so a
           // SIGKILL still leaves a pointer on the ledger (#75).
           onSession: (sessionId) => {
-            if (!this.queueFenceCurrent(queueFence)) return;
+            if (!this.queueFenceCurrent(queueFence)) throw new DispatchSuspendedError(spec.id);
+            if (attempt) {
+              try { this.store.turnAttempts.bind(attempt, sessionId); }
+              catch { throw new DispatchSuspendedError(spec.id); }
+            }
             try {
               this.store.updateDelegationStatus(spec.id, "running", {
                 acpSessionId: sessionId,
@@ -8664,7 +8822,13 @@ export class Orchestrator {
           awaitIdle: true,
           logContext: { dispatch: spec.id },
         });
+        if (lifecycle && !outcomeOwned) lifecycle.onOutcome(result);
         this.assertQueueFence(queueFence);
+      } catch (err) {
+        if (!(err instanceof DispatchSuspendedError) && lifecycle && !outcomeOwned) {
+          lifecycle.onOutcome({ text: "", error: err instanceof Error ? err.message : String(err) });
+        }
+        throw err;
       } finally {
         // The turn is over — no more `schedule_wake` calls can nest under it.
         if (isWake) this.activeWakeDepth.delete(spec.target);
@@ -8672,7 +8836,8 @@ export class Orchestrator {
         if (isLiveDispatch && this.activeLiveDispatch.get(spec.target) === spec.id) {
           this.activeLiveDispatch.delete(spec.target);
         }
-        if (bindsResult && this.choiceResults) {
+        if (bindsResult && this.choiceResults &&
+          (!attempt || outcomeOwned || this.store.turnAttempts.get(spec.id)?.state === "cancelled")) {
           if (result?.text) {
             const harvested = extractSeamResultFromText(result.text);
             if (harvested.ok) this.choiceResults.submitFromDispatch(spec.id, harvested.value);
@@ -8753,7 +8918,7 @@ export class Orchestrator {
       // reach whoever it was reporting to; the interrupt already issued a fresh
       // directive in its place. Consuming here (not at the gate) also means a
       // throw in the visibility/finalize code below can never leak the flag.
-      const wasInterrupted = this.interruptedDispatches.delete(spec.id);
+      const wasInterrupted = this.interruptedDispatches.delete(spec.id) || result.cancelled === true;
 
       // Finalize the STATUS PANEL to its terminal state. It is an INDEPENDENT
       // message from the plain-output stream (its own throttle + SerialQueue), so
@@ -12893,6 +13058,13 @@ export class Orchestrator {
     status: "cancelled",
     opts?: { preserveDispatch?: boolean }
   ): Promise<void> {
+    if (!opts?.preserveDispatch) {
+      for (const state of ["active", "suspended"] as const) {
+        for (const a of this.store.turnAttempts?.list(state) ?? []) {
+          if (a.spec.target === channelRef) this.store.turnAttempts.cancel(a.id);
+        }
+      }
+    }
     const now = new Date().toISOString();
     const liveId = this.liveTurnByChannel.get(channelRef);
     if (liveId) this.liveTurnByChannel.delete(channelRef);
@@ -12920,6 +13092,9 @@ export class Orchestrator {
 
   /** `/seam cancel scope:all` — finalize every live marker and running spec. */
   private async clearAllTurnMarkers(status: "cancelled"): Promise<void> {
+    for (const state of ["active", "suspended"] as const) {
+      for (const a of this.store.turnAttempts?.list(state) ?? []) this.store.turnAttempts.cancel(a.id);
+    }
     const now = new Date().toISOString();
     this.liveTurnByChannel.clear();
     const markers = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
@@ -13117,6 +13292,15 @@ export class Orchestrator {
           id: spec.target,
         });
         const ledger = this.store.getDelegation(spec.id);
+        const owned = this.store.turnAttempts?.get(spec.id);
+        if (owned) {
+          // SQL owns modern attempts. Keep exceptional identities and disabled
+          // recovery visible; age/transport failure is not cancellation intent.
+          if (owned.state !== "suspended" || pre !== "ok") continue;
+          if (owned.promptStarted && !owned.acpSessionId) continue;
+          await this.dispatchWatcher.requeueStale(spec.id);
+          continue;
+        }
         const decided = decideResume({
           startedUtc: spec.createdUtc,
           maxAgeSeconds: maxAge,

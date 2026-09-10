@@ -12,6 +12,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -20,6 +21,7 @@ const calls: { load: string[]; neu: number; prompts: string[] } = {
   neu: 0,
   prompts: [],
 };
+let beforeOutcome: (() => void) | undefined;
 
 vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../packages/core/src/agents/agent-runtime.js")>();
@@ -27,6 +29,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
     ...actual,
     AgentRuntime: class {
       async start(): Promise<void> {}
+      supportsSessionLoad(): boolean { return true; }
       async newSession(): Promise<{ sessionId: string }> {
         calls.neu++;
         return { sessionId: "acp-NEW" };
@@ -38,6 +41,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
       onEvent(): void {}
       async prompt(p: string): Promise<{ stopReason: string }> {
         calls.prompts.push(p);
+        beforeOutcome?.();
         return { stopReason: "end_turn" };
       }
       async idle(): Promise<void> {}
@@ -72,6 +76,7 @@ beforeEach(() => {
   calls.load = [];
   calls.neu = 0;
   calls.prompts = [];
+  beforeOutcome = undefined;
 });
 
 afterEach(() => {
@@ -80,6 +85,52 @@ afterEach(() => {
 });
 
 describe("injectTurn isolated resumeSessionId", () => {
+  it("suspension retains isolated provider material; completion deletes it only after winning", async () => {
+    const deleteSession = vi.fn(async () => {});
+    const profile = { id: "codex", defaultModel: "m", sessionManager: { deleteSession } } as any;
+    const orch = new Orchestrator({
+      logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
+      adapter: {} as any, renderer: {} as any,
+      modelCatalog: fixtureModelCatalog([profile]),
+      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }) } as any,
+    });
+    let active = true, completed = false;
+    beforeOutcome = () => { active = false; };
+    const lifecycle = {
+      isCurrent: () => active,
+      beforePrompt: () => {},
+      onOutcome: () => { if (!active) throw new DispatchSuspendedError("job"); completed = true; },
+      mayDeleteSession: () => completed,
+    };
+    await expect(orch.injectTurn(record(), "continue", { session: "isolated", profile, cwd: dir,
+      resumeSessionId: "same-acp", lifecycle })).rejects.toBeInstanceOf(DispatchSuspendedError);
+    expect(deleteSession).not.toHaveBeenCalled();
+    active = true; beforeOutcome = undefined;
+    await orch.injectTurn(record(), "continue", { session: "isolated", profile, cwd: dir,
+      resumeSessionId: "same-acp", lifecycle });
+    expect(completed).toBe(true);
+    expect(deleteSession).toHaveBeenCalledExactlyOnceWith(dir, "same-acp");
+    expect(calls.neu).toBe(0);
+    expect(calls.load).toEqual(["same-acp", "same-acp"]);
+  });
+
+  it("onSession persistence failure prevents prompt submission and cleanup", async () => {
+    const deleteSession = vi.fn(async () => {});
+    const profile = { id: "codex", defaultModel: "m", sessionManager: { deleteSession } } as any;
+    const orch = new Orchestrator({
+      logger: silent, store, config: { REPOS_ROOT: dir, DATA_DIR: dir } as any,
+      adapter: {} as any, renderer: {} as any, modelCatalog: fixtureModelCatalog([profile]),
+      router: { listProfiles: () => [], describeConfig: () => ({ location: { value: "local" } }) } as any,
+    });
+    await expect(orch.injectTurn(record(), "original", {
+      session: "isolated", profile, cwd: dir,
+      onSession: () => { throw new DispatchSuspendedError("db-write-failed"); },
+      lifecycle: { isCurrent: () => true, beforePrompt: () => {}, onOutcome: () => {}, mayDeleteSession: () => false },
+    })).rejects.toBeInstanceOf(DispatchSuspendedError);
+    expect(calls.prompts).toEqual([]);
+    expect(deleteSession).not.toHaveBeenCalled();
+  });
+
   it("calls loadSession(recorded) and never newSession", async () => {
     const catalogProfile = { id: "claude", defaultModel: "m" } as any;
     const orch = new Orchestrator({

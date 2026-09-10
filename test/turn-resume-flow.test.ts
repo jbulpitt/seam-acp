@@ -22,6 +22,8 @@ import {
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
+import type { InjectTurnOptions } from "../packages/core/src/core/inject-turn.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -33,7 +35,7 @@ const record = (over: Partial<SessionRecord> = {}): SessionRecord => ({
   platform: "discord",
   channelRef: "thread-worker",
   parentRef: "channel-1",
-  agentId: "claude",
+  agentId: "codex",
   acpSessionId: "acp-recorded",
   repoPath: "/repo",
   configJson: "{}",
@@ -45,8 +47,8 @@ const record = (over: Partial<SessionRecord> = {}): SessionRecord => ({
 function makeOrch(opts?: {
   enabled?: boolean;
   getThreadLiveState?: (ch: { id: string }) => Promise<{ locked: boolean; archived: boolean } | undefined>;
-  loadSession?: ReturnType<typeof vi.fn>;
-  newSession?: ReturnType<typeof vi.fn>;
+  loadSession?: ReturnType<typeof vi.fn<(opts: { sessionId: string }) => Promise<{ sessionId: string }>>>;
+  newSession?: ReturnType<typeof vi.fn<() => Promise<{ sessionId: string }>>>;
   handleInner?: ReturnType<typeof vi.fn>;
 }): {
   orch: Orchestrator;
@@ -55,7 +57,7 @@ function makeOrch(opts?: {
   loadSession: ReturnType<typeof vi.fn>;
   newSession: ReturnType<typeof vi.fn>;
 } {
-  const catalogProfile = { id: "claude", defaultModel: "default" } as any;
+  const catalogProfile = { id: "codex", defaultModel: "default" } as any;
   const prompts: string[] = [];
   const announced: string[] = [];
   const loadSession = opts?.loadSession ?? vi.fn(async () => ({ sessionId: "acp-recorded" }));
@@ -67,7 +69,7 @@ function makeOrch(opts?: {
     ensureSessionRecord: (o: { channelRef: string }) =>
       record({ id: `discord:${o.channelRef}`, channelRef: o.channelRef }),
     getProfile: () => ({
-      id: "claude",
+      id: "codex",
       sessionManager: { deleteSession: async () => {} },
     }),
     getOrStartRuntime: async () => ({
@@ -142,6 +144,25 @@ function handoffSpec(over: Partial<DispatchSpec> = {}): DispatchSpec {
   };
 }
 
+async function seedInterrupted(spec: DispatchSpec = handoffSpec()): Promise<void> {
+  // Synthetic process boundary; separate ownership tests verify actual PID
+  // liveness. The production dispatcher captures the exact spec/identity.
+  vi.spyOn(store.turnAttempts, "registerOwner").mockImplementation(() => {});
+  const { orch } = makeOrch({ enabled: true });
+  (orch as any).injectTurn = async (_t: unknown, _p: string, opts: InjectTurnOptions) => {
+    await opts.onSession?.("acp-recorded");
+    opts.lifecycle?.beforePrompt();
+    orch.suspendForRestart();
+    throw new DispatchSuspendedError(spec.id);
+  };
+  await expect(orch.dispatchInjectTurn({ ...spec, resume: false })).rejects.toBeInstanceOf(DispatchSuspendedError);
+}
+
+async function syntheticStart(opts: InjectTurnOptions): Promise<void> {
+  await opts.onSession?.("acp-recorded");
+  opts.lifecycle?.beforePrompt();
+}
+
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-turn-resume-flow-"));
   store = new SessionStore(path.join(dir, "test.db"));
@@ -153,6 +174,14 @@ afterEach(() => {
 });
 
 describe("dispatch-path resume: continue + loadSession (#76)", () => {
+  it("retains legacy ACP-only jobs whose provider identity cannot be proven (#250)", async () => {
+    store.recordDelegation({ id: "disp-1", kind: "handoff", targetRef: "thread-worker", acpSessionId: "acp-recorded", status: "interrupted" });
+    const { orch } = makeOrch({ enabled: true });
+    const inject = vi.spyOn(orch, "injectTurn");
+    await expect(orch.dispatchInjectTurn(handoffSpec({ resume: true }))).rejects.toBeInstanceOf(DispatchSuspendedError);
+    expect(inject).not.toHaveBeenCalled();
+    expect(store.getDelegation("disp-1")?.status).toBe("interrupted");
+  });
   it("swaps the prompt to continue and loadSession(recorded id), never newSession", async () => {
     store.recordDelegation({
       id: "disp-1",
@@ -162,9 +191,11 @@ describe("dispatch-path resume: continue + loadSession (#76)", () => {
       acpSessionId: "acp-recorded",
       status: "interrupted",
     });
+    await seedInterrupted();
     const { orch, loadSession, newSession } = makeOrch({ enabled: true });
     const seen: string[] = [];
-    (orch as any).injectTurn = async (_t: unknown, prompt: string, opts: { resumeSessionId?: string }) => {
+    (orch as any).injectTurn = async (_t: unknown, prompt: string, opts: InjectTurnOptions) => {
+      await syntheticStart(opts);
       seen.push(prompt);
       expect(opts.resumeSessionId).toBe("acp-recorded");
       return { text: "picked up where I left off", error: undefined, stopReason: "end_turn" };
@@ -175,7 +206,7 @@ describe("dispatch-path resume: continue + loadSession (#76)", () => {
     void loadSession;
   });
 
-  it("announces the resume in-thread", async () => {
+  it("does not announce an intermediate restart state (#250)", async () => {
     store.recordDelegation({
       id: "disp-1",
       kind: "handoff",
@@ -183,14 +214,17 @@ describe("dispatch-path resume: continue + loadSession (#76)", () => {
       acpSessionId: "acp-recorded",
       status: "interrupted",
     });
+    await seedInterrupted();
     const { orch, announced } = makeOrch({ enabled: true });
-    (orch as any).injectTurn = async () => ({
+    (orch as any).injectTurn = async (_t: unknown, _p: string, opts: InjectTurnOptions) => {
+      await syntheticStart(opts);
+      return ({
       text: "ok",
       error: undefined,
       stopReason: "end_turn",
-    });
+    }); };
     await orch.dispatchInjectTurn(handoffSpec({ resume: true }));
-    expect(announced.some((t) => t.includes("resuming after restart"))).toBe(true);
+    expect(announced.some((t) => t.includes("resuming after restart"))).toBe(false);
   });
 
   it("a resumed turn's report-back is delivered to returnTo exactly once", async () => {
@@ -202,12 +236,15 @@ describe("dispatch-path resume: continue + loadSession (#76)", () => {
       acpSessionId: "acp-recorded",
       status: "interrupted",
     });
+    await seedInterrupted();
     const { orch } = makeOrch({ enabled: true });
-    (orch as any).injectTurn = async () => ({
+    (orch as any).injectTurn = async (_t: unknown, _p: string, opts: InjectTurnOptions) => {
+      await syntheticStart(opts);
+      return ({
       text: "finished after continue",
       error: undefined,
       stopReason: "end_turn",
-    });
+    }); };
     await orch.dispatchInjectTurn(handoffSpec({ resume: true }));
     const pending = fs
       .readdirSync(dispatchDirs(dir).pending)
@@ -244,12 +281,15 @@ describe("dispatch-path resume: continue + loadSession (#76)", () => {
       acpSessionId: "acp-recorded",
       status: "interrupted",
     });
+    await seedInterrupted(handoffSpec({ id: "spec-a", target: "thread-origin", chainId: "chain-1", kind: "forward", correlationId: "chain-1" }));
     const { orch } = makeOrch({ enabled: true });
-    (orch as any).injectTurn = async () => ({
+    (orch as any).injectTurn = async (_t: unknown, _p: string, opts: InjectTurnOptions) => {
+      await syntheticStart(opts);
+      return ({
       text: "output of a after continue",
       error: undefined,
       stopReason: "end_turn",
-    });
+    }); };
     await orch.dispatchInjectTurn({
       id: "spec-a",
       target: "thread-origin",

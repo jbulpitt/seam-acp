@@ -734,21 +734,34 @@ export class SessionRouter {
    * Get (or start) the runtime for a session. Honors the per-session creation
    * lock and the post-failure cooldown.
    */
-  async getOrStartRuntime(record: SessionRecord): Promise<AgentRuntime> {
+  async getOrStartRuntime(record: SessionRecord, recovery?: { resumeSessionId: string }): Promise<AgentRuntime> {
+    const verify = (rt: AgentRuntime): AgentRuntime => {
+      const current = recovery ? this.store.get(record.id) : undefined;
+      if (recovery && current?.acpSessionId && current.acpSessionId !== recovery.resumeSessionId) {
+        throw new Error("Strict resume refused: thread session changed during acquisition");
+      }
+      if (recovery && rt.getSessionInfo()?.sessionId !== recovery.resumeSessionId) {
+        throw new Error("Strict resume refused: cached runtime has a different ACP session");
+      }
+      return rt;
+    };
+    if (recovery && record.acpSessionId && record.acpSessionId !== recovery.resumeSessionId) {
+      throw new Error("Strict resume refused: thread now belongs to a different ACP session");
+    }
     const retiring = this.retirements.get(record.id);
     if (retiring) {
       await retiring;
-      return this.getOrStartRuntime(record);
+      return this.getOrStartRuntime(record, recovery);
     }
 
     const cached = this.runtimes.get(record.id);
     if (cached) {
       cached.markActivity();
-      return cached;
+      return verify(cached);
     }
 
     const inflight = this.creationLocks.get(record.id);
-    if (inflight) return inflight;
+    if (inflight) return verify(await inflight);
 
     const lastFail = this.lastStartFailure.get(record.id);
     if (lastFail && Date.now() - lastFail < this.startFailureCooldownMs) {
@@ -760,7 +773,7 @@ export class SessionRouter {
       );
     }
 
-    const promise = this.startRuntime(record).then(
+    const promise = this.startRuntime(record, recovery).then(
       (rt) => {
         this.runtimes.set(record.id, rt);
         this.creationLocks.delete(record.id);
@@ -1127,7 +1140,7 @@ export class SessionRouter {
     return resolvePermissionMode(this.store.readConfig(live), this.defaultPermissionMode);
   }
 
-  private async startRuntime(record: SessionRecord): Promise<AgentRuntime> {
+  private async startRuntime(record: SessionRecord, recovery?: { resumeSessionId: string }): Promise<AgentRuntime> {
     // Channel/thread presets are the source of truth for locked-down
     // channels: re-resolved on every runtime start (not just session
     // creation) so a stored record can never drift from the config file —
@@ -1208,8 +1221,11 @@ export class SessionRouter {
     runtime.effortOverride = effort;
     try {
       await runtime.start();
+      if (recovery && !runtime.supportsSessionLoad()) {
+        throw new Error("Strict resume refused: provider does not advertise session/load");
+      }
 
-      if (record.acpSessionId) {
+      if (record.acpSessionId || recovery?.resumeSessionId) {
         // Resume with a couple short retries. Right after a redeploy the agent
         // subprocess can still be spinning up when the first message lands, so
         // the first loadSession can fail transiently — and falling straight
@@ -1221,7 +1237,7 @@ export class SessionRouter {
         for (let attempt = 1; attempt <= RESUME_ATTEMPTS; attempt++) {
           try {
             await runtime.loadSession({
-              sessionId: record.acpSessionId,
+              sessionId: recovery?.resumeSessionId ?? record.acpSessionId,
               cwd,
               model,
               ...(effort ? { effort } : {}),
@@ -1229,7 +1245,21 @@ export class SessionRouter {
               // never applies Fast — re-enabling it on a session that already
               // has history is the repricing case the design forbids.
               ...(fastMode ? { fastMode: true } : {}),
+              ...(recovery ? { strictModel: true } : {}),
             });
+            if (recovery && runtime.getSessionInfo()?.sessionId !== recovery.resumeSessionId) {
+              throw new Error("Strict resume refused: loaded runtime has a different ACP session");
+            }
+            if (recovery) {
+              const current = this.store.get(record.id);
+              if (current?.acpSessionId && current.acpSessionId !== recovery.resumeSessionId) {
+                throw new Error("Strict resume refused: thread session changed during acquisition");
+              }
+              if (!record.acpSessionId) {
+                record.acpSessionId = recovery.resumeSessionId;
+                this.store.upsert({ ...record, updatedUtc: new Date().toISOString() });
+              }
+            }
             this.logger.debug(
               { sessionId: record.id, acpSessionId: record.acpSessionId, attempt },
               "resumed acp session"
@@ -1237,6 +1267,7 @@ export class SessionRouter {
             return runtime;
           } catch (err) {
             const lastAttempt = attempt === RESUME_ATTEMPTS;
+            if (lastAttempt && recovery) throw err;
             this.logger.warn(
               { err, sessionId: record.id, attempt, lastAttempt },
               lastAttempt

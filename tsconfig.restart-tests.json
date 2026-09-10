@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "packages/adapters/src/**/*.ts",
+    "packages/core/src/**/*.ts",
+    "packages/bridge/src/**/*.ts",
+    "test/restart-attempt.test.ts",
+    "test/restart-dispatch-lifecycle.test.ts",
+    "test/turn-resume-inject.test.ts",
+    "test/turn-resume-flow.test.ts",
+    "test/session-router-idle-reaper.test.ts",
+    "test/durability-prereqs.test.ts",
+    "test/inbox-interrupt.test.ts"
+  ]
+}

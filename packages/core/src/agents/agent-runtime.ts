@@ -228,6 +228,8 @@ export class AgentRuntime {
    *  child exit, which otherwise wedges the turn (and the channel queue) forever. */
   private rejectInFlightPrompt?: (err: Error) => void;
   private promptCapabilities?: PromptCapabilities;
+  private loadSessionSupported = false;
+  private providerIdentity?: string;
   private sessionCwd?: string;
   /** Model override applied at spawn time for non-Anthropic backends where
    *  `setModel()` (ACP config option) is rejected by the adapter. Set by the
@@ -499,6 +501,8 @@ export class AgentRuntime {
     ]);
     this.promptCapabilities =
       initResult.agentCapabilities?.promptCapabilities ?? undefined;
+    this.loadSessionSupported = initResult.agentCapabilities?.loadSession === true;
+    this.providerIdentity = JSON.stringify(initResult.agentInfo ?? null);
     this.logger.debug(
       { promptCapabilities: this.promptCapabilities },
       "acp initialized"
@@ -509,6 +513,12 @@ export class AgentRuntime {
   getPromptCapabilities(): PromptCapabilities | undefined {
     return this.promptCapabilities;
   }
+
+  supportsSessionLoad(): boolean { return this.loadSessionSupported; }
+
+  /** Local transport process identity only; never an environment/process dump. */
+  getProcessId(): number | undefined { return this.child?.pid; }
+  getProviderIdentity(): string | undefined { return this.providerIdentity; }
 
   /** Send an arbitrary ACP JSON-RPC method on the live connection (e.g. grok
    *  `_x.ai/billing`). The session need not exist — initialize is enough. */

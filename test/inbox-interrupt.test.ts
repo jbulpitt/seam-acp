@@ -13,6 +13,7 @@ import {
 import { completionRoute } from "../packages/core/src/core/dispatch/done-reconcile.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -57,6 +58,7 @@ function makeOrch(opts?: {
     invalidate,
   };
   const orch = new Orchestrator({
+    modelCatalog: fixtureModelCatalog([]),
     logger: silent,
     config: {
       DATA_DIR: dir,
@@ -208,7 +210,11 @@ describe("dispatchInjectTurn report-back suppression on interrupt (#67)", () => 
       correlationId: "corr-original",
       createdUtc: new Date().toISOString(),
     };
-    await orch.dispatchInjectTurn(original);
+    // #250 cancellation is now a durable terminal winner, not successful
+    // completion of the superseded task. Its empty outcome suppresses onward.
+    await expect(orch.dispatchInjectTurn(original)).rejects.toMatchObject({
+      name: "DispatchTurnError", suppressedOnward: true, stopReason: "cancelled",
+    });
 
     // The cancel machinery ran against the target...
     expect(abortTurn).toHaveBeenCalledWith("discord:thread-worker", { force: true });
@@ -317,7 +323,7 @@ describe("dispatchInjectTurn report-back suppression on interrupt (#67)", () => 
 
   it("a normal (un-interrupted) handoff still reports back to its returnTo (no regression)", async () => {
     const { orch } = makeOrch();
-    const reportBack = vi.fn(async () => {});
+    const reportBack = vi.fn(async (_spec: DispatchSpec) => {});
     (orch as any).enqueueReportBack = reportBack;
     (orch as any).injectTurn = async () => ({ text: "clean result", error: undefined, stopReason: "end_turn" });
 

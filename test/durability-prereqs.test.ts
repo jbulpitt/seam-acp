@@ -224,7 +224,10 @@ describe("isolated dispatch persists ACP session id at running (#75)", () => {
     expect(deletedSessions).toEqual([]);
     expect(fs.existsSync(sessionFileFor(ISOLATED_SESSION_ID))).toBe(true);
 
-    // Process dies: close the store without letting injectTurn finish.
+    // Explicit restart cutoff precedes teardown (#250). Closing SQLite in the
+    // SAME still-live test process alone is no longer evidence of owner death.
+    orch.suspendForRestart();
+    // Close the store without letting injectTurn finish.
     store.close();
 
     // Next boot: reopen + reconcile (what index.ts does). No session cleanup.

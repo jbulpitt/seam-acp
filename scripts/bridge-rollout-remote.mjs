@@ -552,6 +552,33 @@ const MAX_BASELINE_ENTRIES = 120_000;
 const MAX_BASELINE_BYTES = 1024 * 1024 * 1024;
 
 /**
+ * Hash a file incrementally. Resident memory is one chunk regardless of file
+ * size, so a large-but-permitted file does not have to be materialized to be
+ * accepted, and a file that GREW past the size already charged for it is caught
+ * during the read rather than silently mis-accounted.
+ */
+const BASELINE_HASH_CHUNK = 1024 * 1024;
+async function hashFile(file, chargedSize) {
+  const digest = createHash("sha256");
+  const handle = await fsp.open(file, "r").catch(() => fail("baseline_runtime_file_unreadable"));
+  try {
+    const buffer = Buffer.allocUnsafe(BASELINE_HASH_CHUNK);
+    let read = 0;
+    while (true) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      read += bytesRead;
+      if (read > chargedSize) fail("baseline_runtime_file_grew");
+      digest.update(buffer.subarray(0, bytesRead));
+    }
+    if (read !== chargedSize) fail("baseline_runtime_file_changed");
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  return digest.digest("hex");
+}
+
+/**
  * Digest the whole runtime scope, by CONTENT.
  *
  * A symlink is a reference, and a reference that is only recorded as link text
@@ -582,14 +609,16 @@ async function runtimeTreeSnapshot() {
   const externalRoots = [];
 
   /**
-   * The single charging point. Every digest line goes through here, so nothing
-   * can be traversed or serialized without being counted.
+   * The single charging point. Every entry is charged and both ceilings tested
+   * HERE, before any work that depends on the entry's content. Charging inside
+   * an argument expression would have let the content be read and hashed first —
+   * a 4 GiB file would exhaust memory before the controlled refusal could run.
    */
-  const push = (line, size = 0) => {
+  const charge = (size = 0) => {
     entryCount += 1; bytes += size;
     if (entryCount > MAX_BASELINE_ENTRIES || bytes > MAX_BASELINE_BYTES) fail("baseline_runtime_tree_too_large");
-    lines.push(line);
   };
+  const push = (line, size = 0) => { charge(size); lines.push(line); };
   const labelFor = (canonical) => {
     if (canonical === checkoutPath) return ".";
     if (canonical.startsWith(`${checkoutPath}/`)) return canonical.slice(checkoutPath.length + 1);
@@ -604,14 +633,27 @@ async function runtimeTreeSnapshot() {
     const stat = await fsp.lstat(canonical);
     if (stat.isDirectory()) {
       push(`d ${label}`);
-      const entries = await fsp.readdir(canonical, { withFileTypes: true });
-      entries.sort((a, b) => a.name.localeCompare(b.name));
-      for (const entry of entries) await visit(`${label}/${entry.name}`, path.join(canonical, entry.name));
+      // Enumerated with a bound, not read wholesale. A directory's listing has
+      // to be materialized to sort it — the digest is order-independent only
+      // because the order is fixed — so enumeration stops as soon as this
+      // directory alone cannot fit in the remaining budget. At most
+      // `remaining + 1` names are ever resident, so a pathological directory
+      // refuses instead of allocating its whole listing.
+      const names = [];
+      for await (const entry of await fsp.opendir(canonical, { bufferSize: 1024 })) {
+        names.push(entry.name);
+        if (entryCount + names.length > MAX_BASELINE_ENTRIES) fail("baseline_runtime_tree_too_large");
+      }
+      names.sort((a, b) => a.localeCompare(b));
+      for (const name of names) await visit(`${label}/${name}`, path.join(canonical, name));
       return;
     }
     if (!stat.isFile()) fail("baseline_runtime_special_file");
     fileCount += 1;
-    push(`f ${label} ${stat.size} ${hash(await fsp.readFile(canonical))}`, stat.size);
+    // Charge first, read second: an over-limit file is refused without ever
+    // being opened, let alone materialized.
+    charge(stat.size);
+    lines.push(`f ${label} ${stat.size} ${await hashFile(canonical, stat.size)}`);
   };
 
   const visit = async (label, full) => {

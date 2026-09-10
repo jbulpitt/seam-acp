@@ -126,7 +126,19 @@ an `lstat`, a sort position and a digest line. Charging regular files alone left
 a symlink- or reference-heavy tree free to walk past the advertised limit. The
 byte bound is separate and bounds content, so work that carries no bytes (an
 empty file, a directory, a reference) is bounded by the entry ceiling instead of
-escaping both. Measured on this checkout with links followed: 16,421 entries
+escaping both.
+
+Both ceilings are tested **before** the work they bound. An entry is charged and
+checked before its content is opened, so an over-limit file is refused without
+ever being read — charging inside the expression that read the file meant a
+multi-gigabyte file could exhaust memory before the controlled refusal ran.
+File hashing is incremental, so resident memory is one chunk regardless of file
+size and a file that grew past its charged size is caught during the read.
+Directory enumeration is bounded the same way: a listing must be materialized to
+be sorted (the digest is stable only because the order is fixed), so enumeration
+stops as soon as that directory alone cannot fit the remaining budget, leaving at
+most `remaining + 1` names resident. So the entry ceiling bounds enumeration and
+serialization, not merely the accepted digest. Measured on this checkout with links followed: 16,421 entries
 (14,396 files, 1,969 directories, 28 symlinks, 28 references) and 247.06 MiB,
 against the 120,000-entry / 1-GiB bounds. A declared scope root that does not
 exist — a host whose bridge has not been built yet — is recorded as absent

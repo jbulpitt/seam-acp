@@ -100,8 +100,9 @@ async function makeFixture(options: { capable?: boolean; withGit?: boolean } = {
   return value;
 }
 
-/** Mirrors MAX_BASELINE_ENTRIES in scripts/bridge-rollout-remote.mjs. */
+/** Mirror the bounds in scripts/bridge-rollout-remote.mjs. */
 const MAX_BASELINE_ENTRIES = 120_000;
+const MAX_BASELINE_BYTES = 1024 * 1024 * 1024;
 
 const baselineDir = (f: Fixture) => path.join(f.releaseRoot, "baselines");
 const enroll = async (f: Fixture, id = H("1"), operation = H("2"), timeoutMs?: number) =>
@@ -443,13 +444,38 @@ describe.sequential("#281 restoring the recorded baseline", () => {
     // bounds it. Directories nest rather than fan out, so empty files make the
     // same point with far fewer inodes.
     const f = await makeFixture();
+    // This is also the wide-directory case: 120,001 entries in one directory,
+    // which is what the bounded enumeration has to stop part-way through.
     const empties = path.join(f.checkout, "node_modules/empties");
     await fs.mkdir(empties, { recursive: true });
     await createMany(MAX_BASELINE_ENTRIES + 1, (index) => fs.writeFile(path.join(empties, `e${index}`), ""));
 
     await expect(enroll(f, H("1"), H("2"), 300_000)).rejects.toThrow(/baseline_runtime_tree_too_large/);
+    // Both absences, matching the symlink ceiling test. Earlier this asserted
+    // only the pointer, which made a report of "both tests assert both" wrong.
+    await expect(fs.stat(path.join(baselineDir(f), `${H("1")}.baseline.json`))).rejects.toThrow();
     await expect(fs.stat(path.join(baselineDir(f), "current.json"))).rejects.toThrow();
   }, 600_000);
+
+  it("refuses an over-limit file BEFORE opening it, not after reading it", async () => {
+    // The ceiling must be reachable without materializing content. This file is
+    // sparse (0 blocks on disk) and its contents are unreadable, so the two
+    // orderings are distinguishable by error code alone and neither costs disk
+    // nor memory: charging first refuses on size; reading first hits EACCES and
+    // reports an unexpected failure instead. A real multi-GiB file would
+    // discriminate the same way by exhausting memory, which is precisely what
+    // must not happen in CI.
+    const f = await makeFixture();
+    const huge = path.join(f.checkout, "node_modules/huge.bin");
+    await fs.writeFile(huge, "");
+    await fs.truncate(huge, MAX_BASELINE_BYTES + 1);
+    expect((await fs.stat(huge)).blocks).toBe(0);
+    await fs.chmod(huge, 0o000);
+
+    await expect(enroll(f)).rejects.toThrow(/baseline_runtime_tree_too_large/);
+    await expect(fs.stat(path.join(baselineDir(f), `${H("1")}.baseline.json`))).rejects.toThrow();
+    await expect(fs.stat(path.join(baselineDir(f), "current.json"))).rejects.toThrow();
+  }, 60_000);
 
   it("records an absent declared-scope root as absent rather than ignoring it", async () => {
     // "Not built" and "missing" are the same observation to the traversal, and

@@ -73,6 +73,7 @@ function makeOrch(over?: {
   const seedCalls: any[] = [];
   const injectCalls: any[] = [];
   const casCalls: any[] = [];
+  const attachCalls: any[] = [];
   const compactCalls: string[] = [];
   const describeCalls: SessionRecord[] = [];
   const fetchCalls: number[] = [];
@@ -180,7 +181,12 @@ function makeOrch(over?: {
     if (over?.seedError) throw over.seedError;
     return "sess-new";
   };
-  return { orch, rec, seedCalls, injectCalls, casCalls, bound, compactCalls, describeCalls, fetchCalls, panels };
+  const attachCompactedSession = (orch as any).attachCompactedSession.bind(orch);
+  (orch as any).attachCompactedSession = async (args: unknown) => {
+    attachCalls.push(args);
+    return attachCompactedSession(args);
+  };
+  return { orch, rec, seedCalls, injectCalls, casCalls, attachCalls, bound, compactCalls, describeCalls, fetchCalls, panels };
 }
 
 describe("reconstructSessionFromDiscord", () => {
@@ -268,6 +274,30 @@ describe("reconstructSessionFromDiscord", () => {
       })
     ).rejects.toThrow(/exceed the .* destination budget/);
     expect(t.seedCalls).toHaveLength(0);
+    expect(t.casCalls).toHaveLength(0);
+    expect(t.bound.value).toBe("acp-active");
+  });
+
+  it("refuses an opening-only rebuild before seeding, attaching, or CAS", async () => {
+    const posts = [
+      ...Array.from({ length: 20 }, (_, index) => {
+        const id = index + 1;
+        return post(String(id), `opening ${id}`, id % 2 === 0 ? { authorType: "bot" } : {});
+      }),
+      post("21", "recent oversized message ".repeat(5_000)),
+    ];
+    const t = makeOrch({ posts, staticContextLimit: 2_000 });
+
+    await expect(
+      (t.orch as any).reconstructSessionFromDiscord({
+        record: t.rec,
+        channel: { platform: "discord", id: "thread-r" },
+        observedAtStart: "acp-active",
+        attachIntent: "attach",
+      })
+    ).rejects.toThrow(/cannot preserve both the opening and recent history/);
+    expect(t.seedCalls).toHaveLength(0);
+    expect(t.attachCalls).toHaveLength(0);
     expect(t.casCalls).toHaveLength(0);
     expect(t.bound.value).toBe("acp-active");
   });

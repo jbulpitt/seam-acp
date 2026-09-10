@@ -344,6 +344,22 @@ describe("selectReconstructionRanges", () => {
       })
     ).toThrow(ReconstructionBudgetError);
   });
+
+  it("refuses an opening-only selection when newer history cannot fit", () => {
+    const messages = [
+      ...conversation(10),
+      msg("21", "user", "recent oversized message ".repeat(5_000)),
+    ];
+
+    expect(() =>
+      selectReconstructionRanges({
+        messages,
+        contextWindow: 2_000,
+        budgetTokens: reconstructionBudgetTokens(2_000),
+        sourcePostCount: messages.length,
+      })
+    ).toThrow(ReconstructionBudgetError);
+  });
 });
 
 describe("riders", () => {

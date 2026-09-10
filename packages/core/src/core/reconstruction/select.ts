@@ -83,5 +83,12 @@ export function selectReconstructionRanges(opts: {
     if (trial.complete) return trial;
   }
 
+  if (rest.length > 0 && recent.length === 0) {
+    throw new ReconstructionBudgetError(
+      `Rebuild cannot preserve both the opening and recent history within the ${opts.budgetTokens}-token ` +
+        `(60% of ${opts.contextWindow}) destination budget. Nothing was changed.`
+    );
+  }
+
   return { opening, recent, omitted, complete: omitted.length === 0 };
 }

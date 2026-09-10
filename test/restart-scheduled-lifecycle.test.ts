@@ -11,7 +11,7 @@ import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompt
 import { scheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
 import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
 
-const transport = vi.hoisted(() => ({ prompt: vi.fn(), load: vi.fn(), fresh: vi.fn(), delete: vi.fn() }));
+const transport = vi.hoisted(() => ({ prompt: vi.fn(), load: vi.fn(), fresh: vi.fn(), delete: vi.fn(), dispose: vi.fn() }));
 vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../packages/core/src/agents/agent-runtime.js")>();
   return { ...actual, AgentRuntime: class {
@@ -22,7 +22,7 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async importOriginal => 
     onEvent() {} async prompt(p: string) { return transport.prompt(p); } async idle() {}
     getSessionInfo() { return { sessionId: this.sessionId }; }
     getProviderIdentity() { return "synthetic-codex"; } getProcessId() { return undefined; }
-    async dispose() {}
+    async dispose() { await transport.dispose(); }
   } };
 });
 const cleanups: (() => void)[] = [];
@@ -30,6 +30,7 @@ afterEach(() => { for (const f of cleanups.splice(0).reverse()) f(); vi.clearAll
 function setup(mode: "live" | "isolated" = "isolated") {
   transport.prompt.mockReset();
   transport.delete.mockResolvedValue(undefined);
+  transport.dispose.mockResolvedValue(undefined);
   const dir = mkdtempSync(path.join(tmpdir(), "seam-252-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const store = new SessionStore(path.join(dir, "test.db")); cleanups.push(() => store.close());
@@ -45,6 +46,7 @@ function setup(mode: "live" | "isolated" = "isolated") {
   store.upsertScheduled(row);
   const profile = { id: "codex", defaultModel: "test", displayName: "Codex", sessionManager: { deleteSession: transport.delete } } as any;
   const router = { ensureSessionRecord: () => ({ ...record }), listProfiles: () => [profile], getProfile: () => profile,
+    isBusy: () => false,
     getOrStartRuntime: vi.fn(async (_record: unknown, _resume?: unknown) => ({
       getSessionInfo: () => ({ sessionId: record.acpSessionId }), getProcessId: () => undefined,
       getProviderIdentity: () => "synthetic-codex", getFastModeOutcome: () => undefined,
@@ -207,5 +209,83 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     expect(transport.fresh).toHaveBeenCalledTimes(1);
     expect(transport.prompt).toHaveBeenCalledTimes(1);
     expect(transport.delete).not.toHaveBeenCalled();
+  });
+
+  it("#253 identifies held isolated work while its live thread stays idle, without crossing channel scope", async () => {
+    const h = setup(); const orch = h.make();
+    let entered!: () => void; let release!: () => void;
+    const started = new Promise<void>(r => { entered = r; });
+    const gate = new Promise<void>(r => { release = r; });
+    transport.prompt.mockImplementationOnce(async () => { entered(); await gate; return { stopReason: "end_turn" }; });
+    const key = scheduledOccurrenceKey(h.row.id);
+    const run = orch.runScheduledPrompt(h.row.id, key); await started;
+    try {
+      expect(orch.activeTurnCount()).toBe(1);
+      expect(orch.isChannelBusy(h.row.channelRef)).toBe(false);
+      const own = (orch as any).scheduledWorkForCaller(h.store.get("discord:worker"));
+      expect(own).toMatchObject({ total: 1, entries: [{ occurrenceId: key.id, scheduleId: h.row.id,
+        channelRef: "worker", mode: "isolated", phase: "provider" }] });
+      const other = (orch as any).scheduledWorkForCaller({ platform: "discord", parentRef: "other-channel", channelRef: "other-thread" });
+      expect(other).toEqual({ total: 1, entries: [] });
+      expect(JSON.stringify(own)).not.toContain(h.row.promptText);
+      expect(JSON.stringify(own)).not.toContain("/synthetic");
+      const current = h.store.get("discord:worker")!;
+      h.store.upsert({ ...current, parentRef: "moved-parent" });
+      expect(orch.scheduledWorkForCaller(current).entries).toEqual([]);
+      expect(orch.scheduledWorkForCaller({ ...current, parentRef: "moved-parent" }).entries).toEqual([]);
+    } finally { release(); await run; }
+    expect((orch as any).scheduledWorkForCaller(h.store.get("discord:worker"))).toEqual({ total: 0, entries: [] });
+  });
+
+  it("#253 remains attributed through isolated runtime cleanup and output delivery", async () => {
+    const h = setup(); const orch = h.make();
+    let releaseCleanup!: () => void; let enteredCleanup!: () => void;
+    const cleanupStarted = new Promise<void>(r => { enteredCleanup = r; });
+    const cleanupGate = new Promise<void>(r => { releaseCleanup = r; });
+    let releaseOutput!: () => void; let enteredOutput!: () => void;
+    const outputStarted = new Promise<void>(r => { enteredOutput = r; });
+    const outputGate = new Promise<void>(r => { releaseOutput = r; });
+    transport.prompt.mockResolvedValueOnce({ stopReason: "end_turn" });
+    transport.dispose.mockImplementationOnce(async () => { enteredCleanup(); await cleanupGate; });
+    h.adapter.sendPanel.mockImplementationOnce(async channel => ({ channel, id: "start" }))
+      .mockImplementationOnce(async channel => { enteredOutput(); await outputGate; return { channel, id: "output" }; });
+    const run = orch.runScheduledPrompt(h.row.id); await cleanupStarted;
+    expect(orch.scheduledWorkForCaller(h.store.get("discord:worker")!).entries[0]?.phase).toBe("cleanup");
+    expect(orch.activeTurnCount()).toBe(1);
+    releaseCleanup(); await outputStarted;
+    expect(orch.scheduledWorkForCaller(h.store.get("discord:worker")!).entries[0]?.phase).toBe("output");
+    expect(orch.activeTurnCount()).toBe(1);
+    releaseOutput(); await run;
+    expect(orch.activeScheduledOccurrenceCount()).toBe(0); expect(orch.activeTurnCount()).toBe(0);
+  });
+
+  it("#253 counts a live schedule once even while it owns two drain tokens", async () => {
+    const h = setup("live"); const orch = h.make();
+    transport.prompt.mockImplementationOnce(async () => {
+      expect(orch.activeTurnCount()).toBe(2);
+      expect(orch.activeScheduledOccurrenceCount()).toBe(1);
+      expect(orch.scheduledWorkForCaller(h.store.get("discord:worker")!).entries[0]?.phase).toBe("provider");
+      return { stopReason: "end_turn" };
+    });
+    await orch.runScheduledPrompt(h.row.id);
+    expect(orch.activeScheduledOccurrenceCount()).toBe(0); expect(orch.activeTurnCount()).toBe(0);
+  });
+
+  it("#253 attributes startup before async preconditions and releases after failure", async () => {
+    const h = setup(); const orch = h.make();
+    Object.assign(h.adapter, { getThreadLiveState: async () => {
+      expect(orch.activeScheduledOccurrenceCount()).toBe(1);
+      expect(orch.scheduledWorkForCaller(h.store.get("discord:worker")!).entries[0]?.phase).toBe("startup");
+      throw new Error("synthetic precondition outage");
+    } });
+    await orch.runScheduledPrompt(h.row.id);
+    expect(orch.activeScheduledOccurrenceCount()).toBe(0); expect(orch.activeTurnCount()).toBe(0);
+  });
+
+  it("#253 cannot leak a drain token when metadata registration fails", async () => {
+    const h = setup(); const orch = h.make();
+    vi.spyOn((orch as any).scheduledActivity, "begin").mockImplementation(() => { throw new Error("synthetic metadata failure"); });
+    await expect(orch.runScheduledPrompt(h.row.id)).rejects.toThrow("synthetic metadata failure");
+    expect(orch.activeTurnCount()).toBe(0);
   });
 });

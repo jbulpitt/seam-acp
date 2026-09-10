@@ -411,6 +411,7 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(leafNames(json, "upload")).toEqual(["pull", "push", "secret"]);
     expect(leafNames(json, "bridge")).toEqual(["add", "rotate", "list", "remove", "restart"]);
     expect(leafNames(json, "debug")).toEqual([
+      "work",
       "tail",
       "exec",
       "status",

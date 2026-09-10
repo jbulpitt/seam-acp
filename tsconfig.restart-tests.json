@@ -8,6 +8,8 @@
     "test/restart-dispatch-lifecycle.test.ts",
     "test/restart-inbound-lifecycle.test.ts",
     "test/restart-scheduled-lifecycle.test.ts",
+    "test/scheduled-activity.test.ts",
+    "test/commands.test.ts",
     "test/scheduled-manager.test.ts",
     "test/scheduled-attachment-removal.test.ts",
     "test/shutdown-quiesce.test.ts",

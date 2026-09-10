@@ -112,6 +112,8 @@ export interface InjectTurnOptions {
     onRuntime?(pid: number | undefined, providerIdentity?: string): void;
     beforePrompt(): void;
     onOutcome(result: InjectTurnResult): void;
+    /** Read-only attribution hook before isolated disposal, including failures. */
+    onCleanup?(): void;
     mayDeleteSession(): boolean;
   };
 

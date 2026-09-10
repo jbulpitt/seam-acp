@@ -79,6 +79,7 @@ import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manage
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
 import { scheduledOccurrenceKey, type ScheduledOccurrenceKey, type ScheduledOccurrence,
   type ScheduledExecutionIdentity } from "../../core/scheduled-prompts/occurrence-store.js";
+import { ScheduledActivityRegistry, scheduledActivityLine, type ScheduledActivitySnapshot } from "../../core/scheduled-prompts/activity.js";
 import { rebuildMigratedAgySession } from "../../core/agy-identity-migration.js";
 import type { WakeManager } from "../../core/wake/manager.js";
 import type { WakeEvent, WakeScheduleRequest } from "../../core/wake/types.js";
@@ -871,6 +872,7 @@ export class Orchestrator {
   /** Set by index.ts after construction; used by /seamadmin schedule handlers to
    *  arm/disarm timers and by the fire runner to drop deleted-thread schedules. */
   private scheduledManager?: ScheduledPromptManager;
+  private scheduledActivity = new ScheduledActivityRegistry();
   /** Set by index.ts after construction; the DB sweeper for agent-scheduled
    *  wake events (#59). Held only so shutdown/diagnostics can reach it. */
   private wakeManager?: WakeManager;
@@ -1887,6 +1889,23 @@ export class Orchestrator {
     return this.activeTurns;
   }
 
+  /** Counts logical occurrences, not the live schedule's nested drain tokens. */
+  activeScheduledOccurrenceCount(): number { return this.scheduledActivity?.snapshot().length ?? 0; }
+
+  /** Token-resolved scope only. Require both frozen and current channel
+   * membership so a moved/deleted thread cannot leak work to its former parent. */
+  scheduledWorkForCaller(caller: Pick<SessionRecord, "platform" | "channelRef" | "parentRef">): ScheduledActivitySnapshot {
+    const all = this.scheduledActivity?.snapshot() ?? [];
+    return { total: all.length, entries: all.filter(work => {
+      if (work.platform !== caller.platform) return false;
+      const current = this.store.getByChannel(work.platform, work.channelRef);
+      if (!current) return false;
+      return caller.parentRef
+        ? work.parentRef === caller.parentRef && current.parentRef === caller.parentRef
+        : work.channelRef === caller.channelRef;
+    }) };
+  }
+
   /**
    * What the restart-sentinel drain waits on: turns PLUS admitted gateway
    * handlers.
@@ -2069,7 +2088,10 @@ export class Orchestrator {
         `♻️ Restart requested — waiting for ${outstanding} in-flight ${word} to finish.`
       );
       this.logger.info(
-        { activeTurns: this.activeTurns, inboundWork: this.inboundWork.size },
+        { activeTurns: this.activeTurns, inboundWork: this.inboundWork.size,
+          scheduledOccurrences: this.activeScheduledOccurrenceCount(),
+          scheduledBlockers: this.scheduledActivity?.snapshot().slice(0, 20).map(({ occurrenceId, scheduleId, channelRef, mode, phase, elapsedMs }) =>
+            ({ occurrenceId, scheduleId, channelRef, mode, phase, elapsedMs })) ?? [] },
         "restart pending, draining turns and admitted handlers"
       );
 
@@ -2088,6 +2110,9 @@ export class Orchestrator {
             outstanding: drain.activeTurns,
             activeTurns: this.activeTurns,
             inboundWork: this.inboundWork.size,
+            scheduledOccurrences: this.activeScheduledOccurrenceCount(),
+            scheduledBlockers: this.scheduledActivity?.snapshot().slice(0, 20).map(({ occurrenceId, scheduleId, channelRef, mode, phase, elapsedMs }) =>
+              ({ occurrenceId, scheduleId, channelRef, mode, phase, elapsedMs })) ?? [],
             timeoutMs: drainTimeoutMs,
           },
           "restart drain timed out; continuing through force restart path"
@@ -3026,6 +3051,7 @@ export class Orchestrator {
         output: humanOutput, error, stopReason, finishedUtc: new Date().toISOString(),
       });
       if (!humanOutcomeOwned) throw new DispatchSuspendedError(humanAttempt.id);
+      if (scheduledAttempt) this.scheduledActivity?.phase(scheduledAttempt.id, "output");
     };
     this.quotaPoller?.recordTurnStart(record.agentId);
 
@@ -3948,6 +3974,7 @@ export class Orchestrator {
         if (humanAttempt) {
           if (!humanCurrent()) throw new DispatchSuspendedError(humanAttempt.id);
           this.store.turnAttempts.startPrompt(humanAttempt);
+          if (scheduledAttempt) this.scheduledActivity?.phase(scheduledAttempt.id, "provider");
           humanPromptSubmitted = true;
           // SQL owns this phase. The file is a recoverable inventory projection.
           await patchLiveMarker(this.config.DATA_DIR, liveMarkerId, { promptStarted: true });
@@ -4296,6 +4323,7 @@ export class Orchestrator {
         humanDelivered = this.store.turnAttempts.get(humanAttempt.id)?.outcome?.status === "failed";
       }
     } finally {
+      if (scheduledAttempt) this.scheduledActivity?.phase(scheduledAttempt.id, "cleanup");
       if (!this.queueFenceCurrent(queueFence) || (humanAttempt && !humanOutcomeOwned)) {
         turnFinalized = true;
         clearInterval(heartbeat);
@@ -4653,6 +4681,7 @@ export class Orchestrator {
       });
     }
     if (interaction.options.getSubcommandGroup(false) === "debug") {
+      if (sub === "work") return this.cmdScheduledWork(interaction);
       return handleDebugSlash(interaction, {
         mutation: this.configMutation,
         hub: this.bridgeHub,
@@ -5140,6 +5169,8 @@ export class Orchestrator {
         // Isolated runs guarantee teardown: kill the child, then drop the
         // throwaway session so it never clutters `/seam sessions`.
         if (rt) {
+          // An observability callback must never prevent runtime disposal.
+          try { opts.lifecycle?.onCleanup?.(); } catch { logger.warn("injectTurn cleanup attribution failed"); }
           const sid = rt.getSessionInfo()?.sessionId;
           await rt.dispose().catch(() => {});
           if (sid && manager?.deleteSession && (!opts.lifecycle || opts.lifecycle.mayDeleteSession())) {
@@ -10654,10 +10685,15 @@ export class Orchestrator {
     // also counted by queueOnChannel once admitted there, but this outer token
     // covers the otherwise invisible interval before queue registration.
     const endTurn = this.beginTurn();
+    let endActivity = () => {};
     try {
+      endActivity = (this.scheduledActivity ??= new ScheduledActivityRegistry()).begin({
+        occurrenceId: key.id, scheduleId: row.id, name: row.name, platform: row.platform,
+        channelRef: row.channelRef, parentRef: row.parentRef, mode: row.sessionMode,
+      });
       await this.runDurableScheduledPrompt(row, key, manualResume);
     } finally {
-      endTurn();
+      try { endActivity(); } finally { endTurn(); }
     }
   }
 
@@ -10731,6 +10767,7 @@ export class Orchestrator {
   /** Delivery-only recovery. Disable/delete stops future ticks, not an already
    * admitted occurrence or its captured output. Never rerun a provider here. */
   private async deliverScheduledCompletion(occurrence: ScheduledOccurrence, attempt: TurnAttempt): Promise<void> {
+    this.scheduledActivity?.phase(occurrence.id, "output");
     if (!attempt.outcome) return;
     if (!attempt.deliveryDone) {
       const row = occurrence.row;
@@ -10741,7 +10778,7 @@ export class Orchestrator {
       if (result.status === "failed") {
         await this.sendResultCard(target, `⏰ ${row.name} — failed`, "Scheduled execution failed.", 0xe74c3c);
       } else await this.postScheduledVisibleResult(target, row.id, row.name, result.output ?? "", row.outputType,
-        row.sessionMode === "isolated" ? this.isolatedScheduleIdentityFields(occurrence.execution) : []);
+        row.sessionMode === "isolated" ? this.isolatedScheduleIdentityFields(occurrence.execution) : [], occurrence.id);
       this.store.turnAttempts.markDeliveryDone(attempt.id);
       this.patchScheduledStatus(row.id, result.status === "failed" ? "error: scheduled execution failed" : "ok");
     }
@@ -10828,10 +10865,12 @@ export class Orchestrator {
       };
       let aborted = false;
       try {
+        if (owned) this.scheduledActivity?.phase(owned.attempt.id, "queued");
         // D2: queue behind user turns / other schedules on this channel; never
         // pre-empt. `queueOnChannel` (not `handleIncomingMessage`) — the latter
         // would bump the generation and abort whatever is running.
         await this.queueOnChannel(row.channelRef, async (fence) => {
+          if (owned) this.scheduledActivity?.phase(owned.attempt.id, "startup");
           // D4: a user message arriving mid-turn bumps this channel's generation
           // and force-aborts our turn. `handleIncomingMessageInner` swallows the
           // cancellation and returns void (D5), so detect the abort by comparing
@@ -10920,6 +10959,7 @@ export class Orchestrator {
 
     // 5. Post result as NEW message(s) + record status. Result cards carry
     //    the same identity the isolated runtime actually received.
+    if (owned) this.scheduledActivity?.phase(owned.attempt.id, "output");
     if (result.error) {
       this.patchScheduledStatus(id, `error: ${result.error.slice(0, 200)}`);
       await this.sendResultCard(
@@ -10931,7 +10971,7 @@ export class Orchestrator {
       );
     } else {
       this.patchScheduledStatus(id, "ok");
-      await this.postScheduledVisibleResult(target, id, row.name, result.text, row.outputType, identityFields);
+      await this.postScheduledVisibleResult(target, id, row.name, result.text, row.outputType, identityFields, owned?.occurrence.id);
     }
     if (owned) this.store.turnAttempts.markDeliveryDone(owned.attempt.id);
   }
@@ -10944,7 +10984,8 @@ export class Orchestrator {
     name: string,
     text: string,
     outputType: "card" | "messages",
-    identityFields: StructuredPanel["fields"] = []
+    identityFields: StructuredPanel["fields"] = [],
+    occurrenceId?: string
   ): Promise<void> {
     const speech = text.trim()
       ? this.voiceConsole?.beginVisibleTurn(target.id, `scheduled:${scheduleId}:${Date.now()}`) ?? null
@@ -10953,6 +10994,7 @@ export class Orchestrator {
     try {
       await this.postScheduledResult(target, name, text, outputType, identityFields);
     } finally {
+      if (occurrenceId) this.scheduledActivity?.phase(occurrenceId, "cleanup");
       if (speech) {
         await this.voiceConsole?.finishVisibleTurn(speech).catch((err) =>
           this.logger.warn(
@@ -11007,6 +11049,7 @@ export class Orchestrator {
           beforePrompt: () => {
             if (this.restartCutoff) throw new DispatchSuspendedError(attempt!.id);
             this.store.turnAttempts.startPrompt(attempt!); submitted = true;
+            this.scheduledActivity?.phase(attempt!.id, "provider");
           },
           onOutcome: (outcome: InjectTurnResult) => {
             if (this.restartCutoff || !this.store.turnAttempts.isCurrent(attempt!) || resume && !submitted) {
@@ -11019,6 +11062,7 @@ export class Orchestrator {
             if (!completed) throw new DispatchSuspendedError(attempt!.id);
           },
           mayDeleteSession: () => completed || this.store.turnAttempts.get(attempt!.id)?.state === "cancelled",
+          onCleanup: () => this.scheduledActivity?.phase(attempt!.id, "cleanup"),
         },
       } : {}),
       ...(model ? { model } : {}),
@@ -16499,6 +16543,28 @@ export class Orchestrator {
       { succeeded, failed, total: outcomes.length },
       "boot thread migration complete"
     );
+  }
+
+  /** Privileged, ephemeral global metadata. Never reachable through a model's
+   * caller-supplied thread/scope argument; recheck the Discord actor here. */
+  private async cmdScheduledWork(i: ChatInputCommandInteraction): Promise<void> {
+    if (isBridgeAdminRefused(this.config, i.user.id)) {
+      await i.reply({ content: BRIDGE_ADMIN_REFUSAL, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const work = this.scheduledActivity?.snapshot() ?? [];
+    const lines = [
+      `Restart ${this.restartPending ? "draining" : "not pending"}: ${this.activeTurns} turn accounting token(s), ${this.inboundWork.size} admitted handler(s).`,
+      `${work.length} active scheduled occurrence(s), included in those tokens; live schedules may have nested queue tokens.`,
+      ...work.map(scheduledActivityLine),
+      "This view attributes scheduled work; other turn/handler tokens may also block drain. Cron remains open during drain.",
+    ];
+    const content = lines.join("\n");
+    await i.reply(content.length <= 1800 ? { content, flags: MessageFlags.Ephemeral } : {
+      content: "Scheduled blocker metadata attached (admin-only).",
+      files: [new AttachmentBuilder(Buffer.from(content), { name: "scheduled-work.txt" })],
+      flags: MessageFlags.Ephemeral,
+    });
   }
 
   private async cmdSessions(i: ChatInputCommandInteraction): Promise<void> {

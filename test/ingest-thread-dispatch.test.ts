@@ -12,7 +12,7 @@
  * `SessionStore`, so "which path ran" is observed from the ledger row and the
  * session the runtime was started for, not from source text.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer } from "node:http";
 import fs from "node:fs";
 import os from "node:os";
@@ -32,7 +32,9 @@ import {
 } from "../packages/core/src/core/dispatch/types.js";
 import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
 import { reconcileCompletedDoneFiles } from "../packages/core/src/core/dispatch/done-reconcile.js";
+import { DispatchSuspendedError } from "../packages/core/src/core/dispatch/attempt-store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import type { InjectTurnOptions } from "../packages/core/src/core/inject-turn.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
@@ -515,6 +517,210 @@ describe("#224 isolated ingest routing", () => {
 });
 
 describe("#246 isolated ingest owns every terminal transition", () => {
+  it("restarts pre-prompt work from the original spec only after durable ownership", async () => {
+    const row = endpoint({
+      thread: null,
+      notifyThread: THREAD,
+      agentId: "codex",
+      model: null,
+    });
+    store.insertIngestEndpoint(row);
+    const spec = planEndpointDispatch({ endpoint: row, payload: "synthetic pre-prompt input" });
+    const results = new ChoiceResultHub({ store, logger: silent });
+    expectJob(results, spec.id, row.resultSchema);
+    vi.spyOn(store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    const first = makeOrch(dataDir, store, {
+      profile: { id: "codex", defaultModel: "default" },
+    }).orch;
+    first.setChoiceResults(results);
+    let entered!: () => void;
+    let release!: () => void;
+    const atPreflight = new Promise<void>((resolve) => { entered = resolve; });
+    const preflightGate = new Promise<void>((resolve) => { release = resolve; });
+    (first as any).adapter.getThreadLiveState = async () => {
+      entered();
+      await preflightGate;
+      return { locked: false, archived: false };
+    };
+    let firstExecutions = 0;
+    (first as any).injectTurn = async () => {
+      firstExecutions++;
+      return { text: "must not execute" };
+    };
+
+    const interrupted = first.dispatchInjectTurn(spec);
+    await atPreflight;
+    first.suspendForRestart();
+    release();
+    await expect(interrupted).rejects.toBeInstanceOf(DispatchSuspendedError);
+    expect(firstExecutions).toBe(0);
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({
+      state: "suspended",
+      acpSessionId: null,
+      promptStarted: false,
+      outcome: null,
+    });
+    expect(store.getChoiceResult(spec.id)?.status).toBe("pending");
+    expect(store.getDelegation(spec.id)?.status).toBe("dispatched");
+
+    const restarted = makeOrch(dataDir, store, {
+      profile: { id: "codex", defaultModel: "default" },
+    }).orch;
+    restarted.setChoiceResults(results);
+    const seen: Array<{ prompt: string; resumeSessionId?: string }> = [];
+    (restarted as any).injectTurn = async (
+      _target: unknown,
+      prompt: string,
+      opts: InjectTurnOptions
+    ) => {
+      seen.push({ prompt, resumeSessionId: opts.resumeSessionId });
+      opts.lifecycle?.onRuntime?.(undefined, "fixture-local-codex");
+      await opts.onSession?.("acp-preprompt-fresh");
+      opts.lifecycle?.beforePrompt();
+      return {
+        text: '```seam-result\n{"answer":"fresh"}\n```',
+        stopReason: "end_turn",
+      };
+    };
+    await restarted.dispatchInjectTurn({ ...spec, resume: true });
+    expect(seen).toEqual([{ prompt: spec.prompt, resumeSessionId: undefined }]);
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({
+      state: "completed",
+      generation: 2,
+      acpSessionId: "acp-preprompt-fresh",
+      promptStarted: true,
+    });
+    expect(store.getChoiceResult(spec.id)?.status).toBe("ok");
+    expect(store.getDelegation(spec.id)?.status).toBe("completed");
+  });
+
+  it("keeps an in-flight HTTP job pending across restart and resumes exact local Codex with continue", async () => {
+    const row = endpoint({ thread: null, agentId: "codex", model: null });
+    store.insertIngestEndpoint(row);
+    const spec = planEndpointDispatch({ endpoint: row, payload: "synthetic original input" });
+    const results = new ChoiceResultHub({ store, logger: silent });
+    const pending = expectJob(results, spec.id, row.resultSchema);
+
+    // Model a process boundary without pretending the still-running test PID
+    // is dead. PID/boot ownership is exercised by #250's store tests; this
+    // fixture follows the production isolated-ingest lifecycle around it.
+    const ownerSpy = vi.spyOn(store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    const first = makeOrch(dataDir, store, {
+      profile: { id: "codex", defaultModel: "default" },
+    }).orch;
+    first.setChoiceResults(results);
+    let revocations = 0;
+    let quotaCompletions = 0;
+    (first as any).router.revokeMcpSession = () => { revocations++; };
+    (first as any).quotaPoller = {
+      recordTurnStart: () => {},
+      turnCompleted: async () => { quotaCompletions++; },
+    };
+    (first as any).injectTurn = async (
+      _target: unknown,
+      _prompt: string,
+      opts: InjectTurnOptions
+    ) => {
+      opts.lifecycle?.onRuntime?.(undefined, "fixture-local-codex");
+      await opts.onSession?.("acp-ingest-recorded");
+      opts.lifecycle?.beforePrompt();
+      first.suspendForRestart();
+      opts.lifecycle?.onOutcome({ text: "obsolete callback" });
+      return { text: "unreachable" };
+    };
+
+    await expect(first.dispatchInjectTurn(spec)).rejects.toBeInstanceOf(DispatchSuspendedError);
+    expect(store.getChoiceResult(spec.id)?.status).toBe("pending");
+    expect(store.getDelegation(spec.id)).toMatchObject({
+      status: "running",
+      acpSessionId: "acp-ingest-recorded",
+    });
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({
+      state: "suspended",
+      acpSessionId: "acp-ingest-recorded",
+      promptStarted: true,
+      outcome: null,
+    });
+    expect(revocations).toBe(0);
+    expect(quotaCompletions).toBe(0);
+
+    const resumed = makeOrch(dataDir, store, {
+      profile: { id: "codex", defaultModel: "default" },
+    }).orch;
+    resumed.setChoiceResults(results);
+    const seen: Array<{ prompt: string; resumeSessionId?: string }> = [];
+    (resumed as any).injectTurn = async (
+      _target: unknown,
+      prompt: string,
+      opts: InjectTurnOptions
+    ) => {
+      seen.push({ prompt, resumeSessionId: opts.resumeSessionId });
+      opts.lifecycle?.onRuntime?.(undefined, "fixture-local-codex");
+      await opts.onSession?.("acp-ingest-recorded");
+      opts.lifecycle?.beforePrompt();
+      return {
+        text: '```seam-result\n{"answer":9}\n```',
+        stopReason: "end_turn",
+      };
+    };
+
+    await expect(resumed.dispatchInjectTurn({ ...spec, resume: true })).resolves.toMatchObject({
+      stopReason: "end_turn",
+    });
+    expect(seen).toEqual([{ prompt: "continue", resumeSessionId: "acp-ingest-recorded" }]);
+    await expect(pending).resolves.toEqual({ answer: 9 });
+    expect(store.getChoiceResult(spec.id)).toMatchObject({ status: "ok", body: { answer: 9 } });
+    expect(store.getDelegation(spec.id)?.status).toBe("completed");
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({ state: "completed", generation: 2 });
+    ownerSpy.mockRestore();
+  });
+
+  it("retains a submitted non-Codex HTTP job for explicit recovery without a fresh execution", async () => {
+    const row = endpoint({ thread: null, agentId: "claude", model: null });
+    store.insertIngestEndpoint(row);
+    const spec = planEndpointDispatch({ endpoint: row, payload: "synthetic original input" });
+    const results = new ChoiceResultHub({ store, logger: silent });
+    expectJob(results, spec.id, row.resultSchema);
+    vi.spyOn(store.turnAttempts, "registerOwner").mockImplementation(() => {});
+    const first = makeOrch(dataDir, store, {
+      profile: { id: "claude", defaultModel: "default" },
+    }).orch;
+    first.setChoiceResults(results);
+    (first as any).injectTurn = async (
+      _target: unknown,
+      _prompt: string,
+      opts: InjectTurnOptions
+    ) => {
+      opts.lifecycle?.onRuntime?.(undefined, "fixture-local-claude");
+      await opts.onSession?.("acp-claude-recorded");
+      opts.lifecycle?.beforePrompt();
+      first.suspendForRestart();
+      throw new DispatchSuspendedError(spec.id);
+    };
+    await expect(first.dispatchInjectTurn(spec)).rejects.toBeInstanceOf(DispatchSuspendedError);
+
+    const restarted = makeOrch(dataDir, store, {
+      profile: { id: "claude", defaultModel: "default" },
+    }).orch;
+    restarted.setChoiceResults(results);
+    let executions = 0;
+    (restarted as any).injectTurn = async () => {
+      executions++;
+      return { text: "must not execute" };
+    };
+    await expect(restarted.dispatchInjectTurn({ ...spec, resume: true }))
+      .rejects.toBeInstanceOf(DispatchSuspendedError);
+    expect(executions).toBe(0);
+    expect(store.getChoiceResult(spec.id)?.status).toBe("pending");
+    expect(store.getDelegation(spec.id)?.status).toBe("running");
+    expect(store.turnAttempts.get(spec.id)).toMatchObject({
+      state: "suspended",
+      acpSessionId: "acp-claude-recorded",
+      promptStarted: true,
+      outcome: null,
+    });
+  });
+
   it("terminalizes catalog preflight failure and permits the next HTTP job and ordinary turn", async () => {
     const token = mintBridgeToken();
     const row = endpoint({

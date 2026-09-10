@@ -3,8 +3,7 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import { DispatchSuspendedError } from "../../core/dispatch/attempt-store.js";
-import type { DispatchResult } from "../../core/dispatch/types.js";
+import { DispatchSuspendedError, type TurnAttempt } from "../../core/dispatch/attempt-store.js";
 import { executionIdentity } from "../../core/dispatch/execution-identity.js";
 import { MessageFlags, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, AttachmentBuilder, type ChatInputCommandInteraction, type AutocompleteInteraction, type MessageComponentInteraction, type Message, type InteractionEditReplyOptions } from "discord.js";
 import type { Logger } from "../../lib/logger.js";
@@ -9214,7 +9213,18 @@ export class Orchestrator {
     let completed: { output: string; stopReason: string } | undefined;
     let failure: unknown;
     let resultSettlementFailed = false;
+    let attempt: TurnAttempt | undefined;
+    let lifecycle: InjectTurnOptions["lifecycle"];
+    let outcomeOwned = false;
+    let submittedThisAttempt = false;
+    let previousAttempt: TurnAttempt | null | undefined;
+    const attemptStore = (this.store as unknown as {
+      turnAttempts?: SessionStore["turnAttempts"];
+    }).turnAttempts;
+    const isResume = spec.resume === true;
     try {
+      previousAttempt = attemptStore?.get(spec.id);
+      if (this.restartCutoff) throw new DispatchSuspendedError(spec.id);
       const notifyId = isDiscordSnowflake(spec.target) ? spec.target : undefined;
       const endpoint = spec.correlationId ? this.store.getIngestEndpoint(spec.correlationId) : null;
       const presetName = endpoint?.preset ?? spec.preset;
@@ -9275,14 +9285,6 @@ export class Orchestrator {
       };
       this.ingestJobs.set(spec.id, synthetic);
 
-      let outputTo: ChannelRef | undefined;
-      if (notifyId) {
-        const live = await this.threadLiveState(notifyId);
-        if (live === "ok") {
-          outputTo = { platform: PLATFORM, id: notifyId };
-        }
-      }
-
       // A remote plan mints its own reachable Seam MCP entry through BridgeHub.
       // Feeding it the local entry would duplicate the server name and leak a
       // loopback URL to the bridge. Local ingest keeps the direct mint path.
@@ -9300,6 +9302,96 @@ export class Orchestrator {
         ...(effort ? { effort } : {}),
         ...(mcpServers ? { mcpServers } : {}),
       });
+      const resumeSessionId = previousAttempt?.acpSessionId ?? undefined;
+      if (isResume && !resumeSessionId) throw new DispatchSuspendedError(spec.id);
+      if (
+        previousAttempt?.promptStarted &&
+        (!isResume || !resumeSessionId || !isLocalLocation(location) || profile.id !== "codex")
+      ) {
+        // Initial automatic continuation scope is the same as generic #250:
+        // exact local Codex with a durable ACP handle. Other provider/host
+        // attempts remain suspended for explicit operator reconciliation.
+        throw new DispatchSuspendedError(spec.id);
+      }
+      const identity = executionIdentity({
+        agentId,
+        location,
+        session: "isolated",
+        model: isolatedSpawn.model,
+        effort: isolatedSpawn.effort,
+        cwd,
+        config: synthetic.configJson,
+        preset: preset ?? null,
+        runtime: profile.runtime,
+        ingest: {
+          endpointId: endpoint?.id ?? null,
+          presetName: presetName ?? null,
+          notifyId: notifyId ?? null,
+        },
+      });
+      if (attemptStore) {
+        attemptStore.registerOwner(this.attemptBoot);
+        attempt = attemptStore.claim(spec, identity, this.attemptBoot);
+        lifecycle = {
+          isCurrent: () =>
+            !this.restartCutoff && Boolean(attempt && attemptStore.isCurrent(attempt)),
+          onRuntime: (pid, providerIdentity) => {
+            try {
+              if (!attempt) throw new DispatchSuspendedError(spec.id);
+              attemptStore.bindRuntime(attempt, pid, providerIdentity);
+            } catch {
+              throw new DispatchSuspendedError(spec.id);
+            }
+          },
+          beforePrompt: () => {
+            try {
+              if (this.restartCutoff || !attempt) throw new DispatchSuspendedError(spec.id);
+              attemptStore.startPrompt(attempt);
+              submittedThisAttempt = true;
+            } catch {
+              throw new DispatchSuspendedError(spec.id);
+            }
+          },
+          onOutcome: (outcome) => {
+            if (this.restartCutoff || !attempt) throw new DispatchSuspendedError(spec.id);
+            if (isResume && !submittedThisAttempt) throw new DispatchSuspendedError(spec.id);
+            const workerStatus = outcome.timedOut
+              ? "timed_out"
+              : outcome.error || outcome.cancelled
+                ? "failed"
+                : "completed";
+            const error = outcome.error ??
+              (outcome.timedOut ? "ingest turn timed out" : outcome.cancelled ? "ingest turn was cancelled" : undefined);
+            try {
+              outcomeOwned = attemptStore.complete(attempt, {
+                id: spec.id,
+                target: spec.target,
+                status: workerStatus === "completed" ? "completed" : "failed",
+                output: outcome.text,
+                stopReason: outcome.stopReason,
+                ...(error ? { error, workerError: error } : {}),
+                workerStatus,
+                kind: "ingest",
+                correlationId: spec.correlationId,
+                finishedUtc: new Date().toISOString(),
+              });
+            } catch {
+              throw new DispatchSuspendedError(spec.id);
+            }
+            if (!outcomeOwned) throw new DispatchSuspendedError(spec.id);
+          },
+          mayDeleteSession: () =>
+            outcomeOwned || attemptStore.get(spec.id)?.state === "cancelled",
+        };
+      }
+      let outputTo: ChannelRef | undefined;
+      if (notifyId) {
+        const live = await this.threadLiveState(notifyId);
+        if (this.restartCutoff) throw new DispatchSuspendedError(spec.id);
+        if (live === "ok") {
+          outputTo = { platform: PLATFORM, id: notifyId };
+        }
+      }
       if (this.choiceResults) {
         this.choiceResults.bindIngestWaiter(spec.id, {
           ...(notifyId ? { notifyThread: notifyId } : {}),
@@ -9307,16 +9399,26 @@ export class Orchestrator {
         });
       }
 
-      result = await this.injectTurn(null, prompt, {
+      result = await this.injectTurn(null, isResume ? CONTINUE_PROMPT : prompt, {
         session: "isolated",
         profile,
         cwd,
         ...isolatedSpawn,
         strictModel: true,
+        ...(isResume && resumeSessionId ? { resumeSessionId } : {}),
+        ...(lifecycle ? { lifecycle } : {}),
         ...(outputTo ? { outputTo } : {}),
         ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
         timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
         onSession: (sessionId) => {
+          if (attemptStore) {
+            if (!attempt) throw new DispatchSuspendedError(spec.id);
+            try {
+              attemptStore.bind(attempt, sessionId);
+            } catch {
+              throw new DispatchSuspendedError(spec.id);
+            }
+          }
           try {
             this.store.updateDelegationStatus(spec.id, "running", { acpSessionId: sessionId });
           } catch {
@@ -9327,6 +9429,7 @@ export class Orchestrator {
         awaitIdle: true,
         logContext: { dispatch: spec.id, kind: "ingest" },
       });
+      if (!outcomeOwned) lifecycle?.onOutcome(result);
       if (!result) throw new Error("ingest: injectTurn returned no result");
       if (outputTo) {
         await this.postDispatchOutput(outputTo, spec, result.text, result.error).catch((err) =>
@@ -9339,12 +9442,31 @@ export class Orchestrator {
       completed = { output: result.text, stopReason: result.stopReason ?? "" };
     } catch (err) {
       failure = err;
+      if (!(err instanceof DispatchSuspendedError) && lifecycle && !outcomeOwned) {
+        try {
+          lifecycle.onOutcome({
+            text: result?.text ?? "",
+            error: ingestFailureText(err),
+          });
+        } catch (ownerErr) {
+          failure = ownerErr;
+        }
+      }
     } finally {
+      let attemptState: TurnAttempt["state"] | undefined;
+      try {
+        attemptState = attemptStore?.get(spec.id)?.state;
+      } catch {
+        if (attempt) failure = new DispatchSuspendedError(spec.id);
+      }
+      const cancelled = attemptState === "cancelled";
+      const suspended = failure instanceof DispatchSuspendedError && !cancelled;
+      const terminalFailure = cancelled ? new Error("cancelled by operator") : failure;
       // Result settlement owns every exit. Harvest and terminalization are
       // separate guarded steps so one failure cannot skip the other. A result
       // already accepted as `ok` remains immutable through later failures.
-      if (this.choiceResults) {
-        if (result?.text) {
+      if (!suspended && this.choiceResults) {
+        if (!cancelled && result?.text) {
           try {
             const harvested = extractSeamResultFromText(result.text);
             if (harvested.ok) this.choiceResults.submitFromDispatch(spec.id, harvested.value);
@@ -9355,8 +9477,8 @@ export class Orchestrator {
         try {
           this.choiceResults.turnEnded(
             spec.id,
-            failure
-              ? { error: `ingest dispatch failed: ${ingestFailureText(failure)}` }
+            terminalFailure
+              ? { error: `ingest dispatch failed: ${ingestFailureText(terminalFailure)}` }
               : undefined
           );
         } catch (err) {
@@ -9364,20 +9486,22 @@ export class Orchestrator {
           failure ??= err;
         }
       }
-      if (quotaStarted && agentId) {
+      if (!suspended && quotaStarted && agentId) {
         void this.quotaPoller?.turnCompleted(agentId).catch((err) =>
           this.logger.warn({ err, agentId, dispatch: spec.id }, "ingest: quota completion failed")
         );
       }
-      try {
-        this.router.revokeMcpSession(spec.id);
-      } catch (err) {
-        failure ??= err;
+      if (!suspended) {
+        try {
+          this.router.revokeMcpSession(spec.id);
+        } catch (err) {
+          failure ??= err;
+        }
       }
       // Ledger terminalization is deliberately after HTTP result settlement.
       // If it fails, the watcher writes a done artifact and boot replay retries
       // only these completion effects; it never reruns the submitted input.
-      if (!resultSettlementFailed) {
+      if (!suspended && !resultSettlementFailed) {
         try {
           this.store.updateDelegationStatus(
             spec.id,

@@ -13,6 +13,7 @@
     "test/scheduled-manager.test.ts",
     "test/scheduled-attachment-removal.test.ts",
     "test/shutdown-quiesce.test.ts",
+    "test/shutdown-manager-drain.test.ts",
     "test/channel-queue-recovery.test.ts",
     "test/turn-resume-inject.test.ts",
     "test/turn-resume-flow.test.ts",

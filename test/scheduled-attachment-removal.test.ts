@@ -7,6 +7,7 @@
  * pre-removal row must never arm, and its bytes must never be deleted.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { scheduledAdmissionFixture, syntheticScheduleExecution } from "./scheduled-admission-fixture.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -195,6 +196,7 @@ describe("#158 scheduler arming boundary", () => {
     const byId = new Map(rows.map((r) => [r.id, { ...r }]));
     const upserts: ScheduledPrompt[] = [];
     const store = {
+      scheduledOccurrences: scheduledAdmissionFixture(),
       getScheduled: (id: string) => {
         const r = byId.get(id);
         return r ? { ...r } : null;
@@ -211,7 +213,7 @@ describe("#158 scheduler arming boundary", () => {
   it("refuses to arm an enabled legacy row and stamps an actionable status", () => {
     const { store, upserts } = makeStore([schedule({ id: "sch_legacy", cron: "* * * * *", legacyAttachmentCount: 1 })]);
     const onFire = vi.fn(async () => {});
-    const mgr = new ScheduledPromptManager({ store, onFire, logger: silent });
+    const mgr = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silent });
 
     mgr.start();
 
@@ -232,7 +234,7 @@ describe("#158 scheduler arming boundary", () => {
       }),
     ]);
     const onFire = vi.fn(async () => {});
-    const mgr = new ScheduledPromptManager({ store, onFire, logger: silent });
+    const mgr = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silent });
 
     mgr.start();
 
@@ -243,7 +245,7 @@ describe("#158 scheduler arming boundary", () => {
   it("refuses a manual Run now on a legacy row", async () => {
     const { store, upserts } = makeStore([schedule({ id: "sch_legacy", legacyAttachmentCount: 3 })]);
     const onFire = vi.fn(async () => {});
-    const mgr = new ScheduledPromptManager({ store, onFire, logger: silent });
+    const mgr = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silent });
 
     await mgr.runNow("sch_legacy");
 
@@ -255,7 +257,7 @@ describe("#158 scheduler arming boundary", () => {
   it("still arms and fires a clean row (the quarantine is not a blanket stop)", async () => {
     const { store } = makeStore([schedule({ id: "sch_ok", cron: "* * * * *" })]);
     const onFire = vi.fn(async () => {});
-    const mgr = new ScheduledPromptManager({ store, onFire, logger: silent });
+    const mgr = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silent });
 
     mgr.start();
     expect(mgr.armedCount).toBe(1);
@@ -267,7 +269,7 @@ describe("#158 scheduler arming boundary", () => {
 
   it("re-arms once the manifest is cleared", () => {
     const { store, byId } = makeStore([schedule({ id: "sch_legacy", cron: "* * * * *", legacyAttachmentCount: 1 })]);
-    const mgr = new ScheduledPromptManager({ store, onFire: vi.fn(async () => {}), logger: silent });
+    const mgr = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire: vi.fn(async () => {}), logger: silent });
 
     mgr.start();
     expect(mgr.armedCount).toBe(0);

@@ -11,7 +11,7 @@
 import { Cron } from "croner";
 import type { SessionStore } from "../session-store.js";
 import type { ScheduledPrompt } from "./types.js";
-import { scheduledOccurrenceKey, type ScheduledOccurrenceKey } from "./occurrence-store.js";
+import { scheduledOccurrenceKey, type ScheduledOccurrenceKey, type ScheduledExecutionIdentity } from "./occurrence-store.js";
 import { legacyAttachmentQuarantine, legacyAttachmentStatus } from "./quarantine.js";
 import type { Logger } from "../../lib/logger.js";
 
@@ -19,6 +19,9 @@ export interface ScheduledPromptManagerOpts {
   store: SessionStore;
   /** Run the schedule now. Updates last_run/last_status; must NOT touch next_run. */
   onFire: (id: string, occurrence: ScheduledOccurrenceKey) => Promise<void>;
+  /** Synchronous, fallible identity resolution, after durable intent admission
+   * but before runnable publication. Must not start a provider or post output. */
+  resolveExecution: (row: ScheduledPrompt) => ScheduledExecutionIdentity;
   logger: Logger;
 }
 
@@ -35,11 +38,13 @@ export class ScheduledPromptManager {
   private stopped = false;
   private readonly store: SessionStore;
   private readonly onFire: ScheduledPromptManagerOpts["onFire"];
+  private readonly resolveExecution: ScheduledPromptManagerOpts["resolveExecution"];
   private readonly logger: Logger;
 
   constructor(opts: ScheduledPromptManagerOpts) {
     this.store = opts.store;
     this.onFire = opts.onFire;
+    this.resolveExecution = opts.resolveExecution;
     this.logger = opts.logger;
   }
 
@@ -63,7 +68,7 @@ export class ScheduledPromptManager {
         this.armFromRow(row); // reports + stamps the row; arms nothing
         continue;
       }
-      this.catchUp(row); // uses the pre-downtime next_run_utc; may fire once
+      if (!this.catchUp(row)) continue; // failed admission retains its due slot
       this.armFromRow(row); // sets a fresh forward next_run_utc
     }
     this.logger.info(
@@ -143,9 +148,11 @@ export class ScheduledPromptManager {
     if (this.stopped) return;
     const due = this.nextDue.get(id);
     if (!due) return; // no stable scheduled-for identity: do not guess Date.now
-    void this.fire(id, scheduledOccurrenceKey(id, due));
-    // onFire synchronously admits the occurrence before its first await. Keep
-    // the next scheduled slot distinct even while this occurrence is running.
+    let admittedOrSkipped = false;
+    void this.fire(id, scheduledOccurrenceKey(id, due), () => { admittedOrSkipped = true; });
+    // Advance only after durable intent (or intentional overlap/quarantine
+    // skip), never because a fallible onFire callback was merely invoked.
+    if (!admittedOrSkipped) return;
     const job = this.jobs.get(id);
     if (job) {
       const next = job.nextRun()?.toISOString() ?? null;
@@ -171,24 +178,26 @@ export class ScheduledPromptManager {
 
   // --- internals ------------------------------------------------------------
 
-  private catchUp(row: ScheduledPrompt): void {
-    if (!row.nextRunUtc) return; // never armed before — nothing was due
+  private catchUp(row: ScheduledPrompt): boolean {
+    if (!row.nextRunUtc) return true; // never armed before — nothing was due
     const due = Date.parse(row.nextRunUtc);
-    if (isNaN(due) || due > Date.now()) return; // not missed
+    if (isNaN(due) || due > Date.now()) return true; // not missed
     const missedBySec = Math.round((Date.now() - due) / 1000);
     this.logger.info({ id: row.id, missedBySec }, "scheduled prompt: catch-up firing");
-    void this.fire(row.id, scheduledOccurrenceKey(row.id, row.nextRunUtc));
+    let admittedOrSkipped = false;
+    void this.fire(row.id, scheduledOccurrenceKey(row.id, row.nextRunUtc), () => { admittedOrSkipped = true; });
+    return admittedOrSkipped;
   }
 
   /** Execute one fire: run the job, then refresh next_run from the armed timer. */
-  private fire(id: string, occurrence = scheduledOccurrenceKey(id)): Promise<void> {
-    const running = this.fireInner(id, occurrence);
+  private fire(id: string, occurrence = scheduledOccurrenceKey(id), onAdmittedOrSkipped?: () => void): Promise<void> {
+    const running = this.fireInner(id, occurrence, onAdmittedOrSkipped);
     const tracked = running.finally(() => this.activeFires.delete(tracked));
     this.activeFires.add(tracked);
     return tracked;
   }
 
-  private async fireInner(id: string, occurrence: ScheduledOccurrenceKey): Promise<void> {
+  private async fireInner(id: string, occurrence: ScheduledOccurrenceKey, onAdmittedOrSkipped?: () => void): Promise<void> {
     // #158: last line of defence. `armFromRow` never arms a quarantined row, but
     // catch-up and manual "Run now" reach `fire` directly — refuse there too so
     // there is exactly one answer for a legacy attachment-bearing schedule.
@@ -198,6 +207,7 @@ export class ScheduledPromptManager {
       if (quarantine) {
         this.logger.warn({ id, files: current.legacyAttachmentCount }, quarantine);
         this.patchRow(id, { lastStatus: legacyAttachmentStatus(current) });
+        onAdmittedOrSkipped?.();
         return;
       }
     }
@@ -207,13 +217,24 @@ export class ScheduledPromptManager {
     if (this.inFlight.has(id)) {
       this.logger.info({ id }, "scheduled prompt: still running, skipping overlap");
       this.patchRow(id, { lastStatus: "skipped: still running" });
+      onAdmittedOrSkipped?.();
       return;
     }
     this.inFlight.add(id);
+    let admitted = false;
     try {
+      if (!current) { onAdmittedOrSkipped?.(); return; }
+      const intent = this.store.scheduledOccurrences.reserve(occurrence, current);
+      admitted = intent !== null;
+      onAdmittedOrSkipped?.(); // committed intent or intentional durable overlap skip
+      if (!intent) { this.patchRow(id, { lastStatus: "skipped: still running" }); return; }
+      if (intent.settled) return;
+      const prepared = this.store.scheduledOccurrences.prepare(occurrence, intent.row, this.resolveExecution);
+      if (!prepared) { this.patchRow(id, { lastStatus: "retained: scheduled identity unavailable" }); return; }
       await this.onFire(id, occurrence);
     } catch (err) {
       this.logger.error({ id, err }, "scheduled fire failed");
+      this.patchRow(id, { lastStatus: admitted ? "error: scheduled occurrence retained" : "error: scheduled occurrence admission failed" });
     } finally {
       this.inFlight.delete(id);
       const job = this.jobs.get(id);

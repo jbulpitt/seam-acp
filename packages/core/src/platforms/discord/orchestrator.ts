@@ -77,7 +77,7 @@ import type { AgentProfile } from "@seam/adapters";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
-import { scheduledOccurrenceKey, type ScheduledOccurrenceKey, type ScheduledOccurrence,
+import { scheduledOccurrenceKey, type ScheduledOccurrenceKey, type ScheduledOccurrence, type PreparedScheduledOccurrence,
   type ScheduledExecutionIdentity } from "../../core/scheduled-prompts/occurrence-store.js";
 import { ScheduledActivityRegistry, scheduledActivityLine, type ScheduledActivitySnapshot } from "../../core/scheduled-prompts/activity.js";
 import { rebuildMigratedAgySession } from "../../core/agy-identity-migration.js";
@@ -10687,6 +10687,11 @@ export class Orchestrator {
   async runScheduledPrompt(id: string, key = scheduledOccurrenceKey(id), manualResume = false): Promise<void> {
     const row = this.store.scheduledOccurrences?.get(key.id)?.row ?? this.store.getScheduled(id);
     if (!row) return;
+    // Direct/manual recovery callers have the same durable admission boundary
+    // as the manager, including failure while registering local activity.
+    if (!this.store.scheduledOccurrences.reserve(key, row)) {
+      this.patchScheduledStatus(id, "skipped: still running"); return;
+    }
     // Register before the first asynchronous precondition check. Live mode is
     // also counted by queueOnChannel once admitted there, but this outer token
     // covers the otherwise invisible interval before queue registration.
@@ -10703,7 +10708,7 @@ export class Orchestrator {
     }
   }
 
-  private scheduleExecution(row: ScheduledPrompt): ScheduledExecutionIdentity {
+  scheduleExecution(row: ScheduledPrompt): ScheduledExecutionIdentity {
     const record = this.router.ensureSessionRecord({ platform: PLATFORM, channelRef: row.channelRef,
       ...(row.parentRef ? { parentRef: row.parentRef } : {}), cwd: this.config.REPOS_ROOT });
     const d = this.router.describeConfig(record);
@@ -10723,12 +10728,12 @@ export class Orchestrator {
     if (saved?.settled) return;
     if (saved && prior?.state === "completed") { await this.deliverScheduledCompletion(saved, prior); return; }
     if (saved && prior?.state === "cancelled") { await this.settleScheduleCancellation(saved); return; }
-    const execution = this.scheduleExecution(row);
-    const occurrence = this.store.scheduledOccurrences.reserve(key, row, execution);
+    const occurrence = this.store.scheduledOccurrences.prepare(key, row, row => this.scheduleExecution(row));
     if (!occurrence) { this.patchScheduledStatus(row.id, "skipped: still running"); return; }
     if (occurrence.settled) return;
     if (prior?.state === "completed") { await this.deliverScheduledCompletion(occurrence, prior); return; }
     if (prior?.state === "cancelled") { await this.settleScheduleCancellation(occurrence); return; }
+    const execution = this.scheduleExecution(occurrence.row);
     if (execution.fingerprint !== occurrence.execution.fingerprint || this.restartCutoff) return;
     if (prior?.promptStarted && ((!manualResume && !this.config.SEAM_TURN_RESUME_ENABLED) || execution.agentId !== "codex" ||
       !isLocalLocation(execution.location) || !prior.acpSessionId)) return;
@@ -10775,6 +10780,7 @@ export class Orchestrator {
   private async deliverScheduledCompletion(occurrence: ScheduledOccurrence, attempt: TurnAttempt): Promise<void> {
     this.scheduledActivity?.phase(occurrence.id, "output");
     if (!attempt.outcome) return;
+    if (!occurrence.execution) return; // unknown identity is not permission to reconstruct it
     if (!attempt.deliveryDone) {
       const row = occurrence.row;
       const target: ChannelRef = { platform: PLATFORM,
@@ -10793,7 +10799,7 @@ export class Orchestrator {
       id: occurrence.id, status: "completed", channelRef: occurrence.row.channelRef, finishedUtc: new Date().toISOString() });
   }
 
-  private async runScheduledPromptInner(row: ScheduledPrompt, owned?: { occurrence: ScheduledOccurrence; attempt: TurnAttempt }): Promise<void> {
+  private async runScheduledPromptInner(row: ScheduledPrompt, owned?: { occurrence: PreparedScheduledOccurrence; attempt: TurnAttempt }): Promise<void> {
     const assertOwned = (): void => {
       if (owned && (this.restartCutoff || !this.store.turnAttempts.isCurrent(owned.attempt) ||
         this.scheduleExecution(row).fingerprint !== owned.occurrence.execution.fingerprint)) {
@@ -11029,7 +11035,7 @@ export class Orchestrator {
     effort?: string;
     channel: ChannelRef;
     promptText: string;
-    owned?: { occurrence: ScheduledOccurrence; attempt: TurnAttempt };
+    owned?: { occurrence: PreparedScheduledOccurrence; attempt: TurnAttempt };
   }): Promise<{ text: string; error?: string }> {
     const { profile, record, cwd, model, effort, channel, promptText } = args;
     const owned = args.owned;

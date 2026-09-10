@@ -1036,6 +1036,7 @@ async function main(): Promise<void> {
   // job and posts output to the thread.
   const scheduledManager = new ScheduledPromptManager({
     store,
+    resolveExecution: row => orchestrator.scheduleExecution(row),
     logger: logger.child({ mod: "scheduled" }),
     onFire: (id, occurrence) => orchestrator.runScheduledPrompt(id, occurrence),
   });

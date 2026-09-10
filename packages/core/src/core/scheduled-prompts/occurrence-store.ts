@@ -11,8 +11,9 @@ export interface ScheduledExecutionIdentity {
   agentId: string; location: string; model: string; effort: string | null; cwd: string; fingerprint: string;
 }
 export interface ScheduledOccurrence extends ScheduledOccurrenceKey {
-  scheduleId: string; row: ScheduledPrompt; execution: ScheduledExecutionIdentity; settled: boolean;
+  scheduleId: string; row: ScheduledPrompt; execution: ScheduledExecutionIdentity | null; settled: boolean;
 }
+export type PreparedScheduledOccurrence = ScheduledOccurrence & { execution: ScheduledExecutionIdentity };
 
 /** Admission/linkage for #250's shared attempt store, not another job engine.
  * Frozen snapshots are private; diagnostics may project selected metadata only. */
@@ -30,7 +31,7 @@ export class ScheduledOccurrenceStore {
       row: JSON.parse(r.snapshot_json), execution: JSON.parse(r.execution_json), settled: r.settled === 1 } : null;
   }
   /** Per-schedule durable overlap guard, preserving skip-not-stack policy. */
-  reserve(key: ScheduledOccurrenceKey, row: ScheduledPrompt, execution: ScheduledExecutionIdentity): ScheduledOccurrence | null {
+  reserve(key: ScheduledOccurrenceKey, row: ScheduledPrompt, execution: ScheduledExecutionIdentity | null = null): ScheduledOccurrence | null {
     return this.db.transaction(() => {
       const old = this.get(key.id);
       if (old) return old.scheduleId === row.id ? old : null;
@@ -39,6 +40,23 @@ export class ScheduledOccurrenceStore {
         .run(key.id, row.id, key.scheduledFor, JSON.stringify(row), JSON.stringify(execution));
       return this.get(key.id)!;
     }).immediate();
+  }
+  /** Commit intent before fallible resolution. JSON null is an admitted but
+   * non-runnable occurrence, never evidence that submitted work can be replayed.
+   * Existing ready snapshots are immutable; unknown prior execution fails closed. */
+  prepare(key: ScheduledOccurrenceKey, row: ScheduledPrompt,
+    resolve: (row: ScheduledPrompt) => ScheduledExecutionIdentity): PreparedScheduledOccurrence | null {
+    const occurrence = this.reserve(key, row);
+    if (!occurrence) return null;
+    if (occurrence.execution) return occurrence as PreparedScheduledOccurrence;
+    if (occurrence.settled || this.db.prepare("SELECT 1 FROM turn_attempts WHERE id=?").get(key.id)) return null;
+    const execution = resolve(occurrence.row);
+    this.db.prepare(`UPDATE scheduled_occurrences SET execution_json=?
+      WHERE id=? AND execution_json='null' AND settled=0
+      AND NOT EXISTS (SELECT 1 FROM turn_attempts WHERE id=?)`)
+      .run(JSON.stringify(execution), key.id, key.id);
+    const saved = this.get(key.id);
+    return saved?.execution ? saved as PreparedScheduledOccurrence : null;
   }
   pending(): ScheduledOccurrence[] {
     return (this.db.prepare("SELECT id FROM scheduled_occurrences WHERE settled=0 ORDER BY rowid").all() as { id: string }[])

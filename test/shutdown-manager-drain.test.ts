@@ -6,6 +6,7 @@
  * safe-to-close predicate decides whether SQLite may close.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { scheduledAdmissionFixture, syntheticScheduleExecution } from "./scheduled-admission-fixture.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -420,7 +421,7 @@ describe("#192 manager admission after stop", () => {
     const row = makeScheduledRow();
     const { store, upserts } = makeScheduledStore(row);
     const onFire = vi.fn(async () => {});
-    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
+    const manager = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silentLogger });
     manager.stop();
     (manager as unknown as { onCronTick(id: string): void }).onCronTick(row.id);
     await flush();
@@ -435,7 +436,7 @@ describe("#192 manager admission after stop", () => {
     const { store } = makeScheduledStore(row);
     const gate = deferred();
     const onFire = vi.fn(async () => gate.promise);
-    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
+    const manager = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silentLogger });
     manager.stop();
     const running = manager.runNow(row.id);
     let drained = false;
@@ -545,6 +546,7 @@ function makeScheduledRow(): ScheduledPrompt {
 function makeScheduledStore(row: ScheduledPrompt) {
   const upserts: ScheduledPrompt[] = [];
   const store = {
+    scheduledOccurrences: scheduledAdmissionFixture(),
     getScheduled: (id: string) => (id === row.id ? { ...row } : null),
     upsertScheduled: (s: ScheduledPrompt) => {
       upserts.push(s);

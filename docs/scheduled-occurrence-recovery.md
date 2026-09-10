@@ -7,10 +7,25 @@ attribution separately. This document does not certify real provider reload.
 ## Durable contract
 
 `scheduled_occurrences` is admission metadata, not another scheduler/queue.
-It freezes the schedule snapshot, resolved agent/location/model/effort/cwd and
-private execution fingerprint. Its id is the shared `turn_attempts` key.
-Both records exist before asynchronous preconditions and runnable publication.
-ACP binding and prompt-start commit before prompt submission via #250's lifecycle.
+Admission first commits the exact cron/manual key and schedule snapshot, before
+fallible session/config/profile resolution. `execution_json` containing JSON
+`null` explicitly denotes unresolved, non-runnable intent (the SQL column remains
+NOT NULL; no schema rewrite is needed). Resolution then freezes the effective
+agent/location/model/effort/cwd and private fingerprint before manager `onFire`
+publication. The occurrence id is the shared `turn_attempts` key; the attempt is
+claimed before asynchronous execution preconditions, and ACP binding/prompt-start
+commit before submission via #250's lifecycle. A ready snapshot is immutable.
+
+Setup failure before publication retains unresolved intent with an error status;
+failure after publication retains the ready snapshot. Both survive restart and
+schedule disable/delete. Recovery resolves an unresolved identity only when no
+attempt exists; any existing owner with missing identity is retained, not guessed.
+No immediate retry loop or failure report-back is emitted for this setup gap.
+Cron advances only after committed intent or a deliberate overlap/quarantine
+skip. If admission itself cannot commit, the due timestamp remains for recovery.
+Direct orchestrator calls use the same admission/prepare primitive, including
+local activity-registration failure. This corrects the #271/#275 QA finding:
+publishing a key before the first durable insert was not durable admission.
 
 - Cron identities derive from schedule id + the armed scheduled-for timestamp.
   Boot catch-up uses the same persisted due timestamp. Manual runs get distinct

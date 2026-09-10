@@ -67,6 +67,87 @@ function setup(mode: "live" | "isolated" = "isolated") {
 }
 
 describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () => {
+  it.each((['live', 'isolated'] as const).flatMap(mode => (['manual', 'cron'] as const)
+    .flatMap(trigger => (['record', 'config', 'read-config'] as const).map(stage => ({ mode, trigger, stage })))))
+    ("admits $mode $trigger intent before $stage failure and recovers only its first submission", async ({ mode, trigger, stage }) => {
+      const h = setup(mode); const orch = h.make();
+      const failed = () => { throw new Error("synthetic snapshot failure"); };
+      if (stage === 'record') vi.spyOn(h.router, 'ensureSessionRecord').mockImplementationOnce(failed);
+      if (stage === 'config') vi.spyOn(h.router, 'describeConfig').mockImplementationOnce(failed);
+      if (stage === 'read-config') vi.spyOn(h.store, 'readConfig').mockImplementationOnce(failed);
+      const onFire = vi.fn((id: string, key: ReturnType<typeof scheduledOccurrenceKey>) => orch.runScheduledPrompt(id, key));
+      const manager = new ScheduledPromptManager({ store: h.store, logger: pino({ level: 'silent' }) as any,
+        resolveExecution: row => orch.scheduleExecution(row), onFire });
+      try {
+        if (trigger === 'manual') await manager.runNow(h.row.id);
+        else { manager.start(); (manager as any).onCronTick(h.row.id); await manager.drain(); }
+      } finally { manager.stop(); }
+      const pending = h.store.scheduledOccurrences.pending();
+      expect(pending).toHaveLength(1);
+      const occurrence = pending[0]!;
+      expect(occurrence).toMatchObject({ execution: null, settled: false, row: { promptText: h.row.promptText } });
+      expect(Boolean(occurrence.scheduledFor)).toBe(trigger === 'cron');
+      expect(h.store.getScheduled(h.row.id)?.lastStatus).toContain('retained');
+      expect(onFire).not.toHaveBeenCalled();
+      expect(h.store.turnAttempts.get(occurrence.id)).toBeNull();
+      expect(transport.prompt).not.toHaveBeenCalled();
+      expect(h.adapter.sendPanel).not.toHaveBeenCalled();
+      // Accepted snapshot survives deletion; no later schedule edit supplies a
+      // new prompt. The unresolved identity is resolved before runnable onFire.
+      h.store.deleteScheduled(h.row.id);
+      const next = h.make();
+      const recovery = new ScheduledPromptManager({ store: h.store, logger: pino({ level: 'silent' }) as any,
+        resolveExecution: row => next.scheduleExecution(row), onFire: async (id, key) => {
+          expect(h.store.scheduledOccurrences.get(key.id)?.execution).not.toBeNull();
+          await next.runScheduledPrompt(id, key);
+        } });
+      transport.prompt.mockResolvedValue({ stopReason: 'end_turn' });
+      try { recovery.start(); await recovery.drain(); } finally { recovery.stop(); }
+      expect(transport.prompt).toHaveBeenCalledTimes(1);
+      expect(transport.prompt.mock.calls[0]?.[0]).toContain(h.row.promptText);
+      expect(h.store.scheduledOccurrences.get(occurrence.id)?.settled).toBe(true);
+      await next.runScheduledPrompt(h.row.id, occurrence);
+      expect(transport.prompt).toHaveBeenCalledTimes(1);
+    });
+
+  it.each(['live', 'isolated'] as const)("retains submitted %s work through resumed precondition failure without replay", async mode => {
+    const h = setup(mode); simulateRetiredOwnerProcess();
+    const first = h.make(); const key = scheduledOccurrenceKey(h.row.id);
+    transport.prompt.mockImplementationOnce(async () => { first.suspendForRestart(); throw new Error('cutoff'); });
+    await first.runScheduledPrompt(h.row.id, key);
+    Object.assign(h.adapter, { getThreadLiveState: async () => { throw new Error('synthetic precondition outage'); } });
+    await h.make().runScheduledPrompt(h.row.id, key);
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: 'suspended', promptStarted: true });
+    expect(h.store.scheduledOccurrences.get(key.id)?.settled).toBe(false);
+    expect(transport.prompt).toHaveBeenCalledTimes(1);
+    Object.assign(h.adapter, { getThreadLiveState: async () => ({ locked: false, archived: false }) });
+    transport.prompt.mockResolvedValue({ stopReason: 'end_turn' });
+    await h.make().runScheduledPrompt(h.row.id, key);
+    expect(transport.prompt.mock.calls[1]?.[0]).toBe('continue');
+  });
+
+  it("freezes identity before publication even if the later runner setup fails", async () => {
+    const h = setup(); const orch = h.make(); const config = h.router.describeConfig();
+    vi.spyOn(h.router, 'describeConfig').mockReturnValueOnce(config)
+      .mockImplementationOnce(() => { throw new Error('synthetic post-publication setup failure'); });
+    const onFire = vi.fn((id: string, key: ReturnType<typeof scheduledOccurrenceKey>) => {
+      expect(h.store.scheduledOccurrences.get(key.id)?.execution).toMatchObject({ model: 'test' });
+      return orch.runScheduledPrompt(id, key);
+    });
+    const manager = new ScheduledPromptManager({ store: h.store, logger: pino({ level: 'silent' }) as any,
+      resolveExecution: row => orch.scheduleExecution(row), onFire });
+    try { await manager.runNow(h.row.id); } finally { manager.stop(); }
+    expect(onFire).toHaveBeenCalledTimes(1);
+    const saved = h.store.scheduledOccurrences.pending()[0]!;
+    expect(saved.execution?.model).toBe('test');
+    expect(h.store.turnAttempts.get(saved.id)).toBeNull();
+    expect(transport.prompt).not.toHaveBeenCalled();
+    h.router.describeConfig = () => ({ ...config, model: { value: 'changed' } });
+    await h.make().runScheduledPrompt(h.row.id, saved);
+    expect(transport.prompt).not.toHaveBeenCalled();
+    expect(h.store.scheduledOccurrences.get(saved.id)?.execution?.model).toBe('test');
+  });
+
   it("persists occurrence/session/start before an isolated prompt can be interrupted", async () => {
     const h = setup(); const orch = h.make();
     let entered!: () => void; let release!: () => void;
@@ -161,6 +242,7 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     transport.prompt.mockResolvedValue({ stopReason: "end_turn" });
     const fresh = h.make();
     const manager = new ScheduledPromptManager({ store: h.store, logger: pino({ level: "silent" }) as any,
+      resolveExecution: row => fresh.scheduleExecution(row),
       onFire: (id, occurrence) => fresh.runScheduledPrompt(id, occurrence) });
     manager.start(); await manager.drain(); manager.stop();
     expect(transport.prompt).toHaveBeenCalledTimes(2);
@@ -288,5 +370,23 @@ describe("#252 actual isolated scheduler + injectTurn, synthetic transport", () 
     vi.spyOn((orch as any).scheduledActivity, "begin").mockImplementation(() => { throw new Error("synthetic metadata failure"); });
     await expect(orch.runScheduledPrompt(h.row.id)).rejects.toThrow("synthetic metadata failure");
     expect(orch.activeTurnCount()).toBe(0);
+    expect(h.store.scheduledOccurrences.pending()).toHaveLength(1);
+    expect(h.store.scheduledOccurrences.pending()[0]?.execution).toBeNull();
+  });
+
+  it("does not invent identity for unresolved intent with any existing execution owner", async () => {
+    const h = setup(); const key = scheduledOccurrenceKey(h.row.id);
+    h.store.scheduledOccurrences.reserve(key, h.row);
+    h.store.turnAttempts.registerOwner('synthetic-owner');
+    h.store.turnAttempts.claim({ id: key.id, target: h.row.channelRef, session: 'isolated',
+      prompt: 'never replay', kind: 'scheduled', createdUtc: new Date().toISOString() }, 'unknown-frozen-identity', 'synthetic-owner', 'schedule');
+    const resolveExecution = vi.fn(() => h.make().scheduleExecution(h.row));
+    const onFire = vi.fn(async () => {});
+    const manager = new ScheduledPromptManager({ store: h.store, logger: pino({ level: 'silent' }) as any, resolveExecution, onFire });
+    h.store.deleteScheduled(h.row.id);
+    try { manager.start(); await manager.drain(); } finally { manager.stop(); }
+    expect(resolveExecution).not.toHaveBeenCalled(); expect(onFire).not.toHaveBeenCalled();
+    expect(h.store.scheduledOccurrences.get(key.id)?.execution).toBeNull();
+    expect(h.store.turnAttempts.get(key.id)).toMatchObject({ state: 'active', generation: 1 });
   });
 });

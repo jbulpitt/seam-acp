@@ -12,6 +12,9 @@
  * rather than raced.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { scheduledAdmissionFixture } from "./scheduled-admission-fixture.js";
+import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
+import type { ScheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
 import { mkdtemp, mkdir, rm, writeFile, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -1957,6 +1960,7 @@ describe("#174 recovery contract is bounded and honest", () => {
  */
 function makeClosableStore() {
   const violations: string[] = [];
+  const occurrences = scheduledAdmissionFixture();
   let closed = false;
   const ledger = makeLedger();
   const scheduled = new Map<string, Record<string, unknown>>();
@@ -1975,6 +1979,14 @@ function makeClosableStore() {
       closed = true;
     },
     scheduled,
+    // Keep the real admission boundary and the existing post-close guard;
+    // schedule execution remains stubbed in these wrapper/barrier tests.
+    scheduledOccurrences: {
+      get: (id: string) => (guard("occurrences.get"), occurrences.get(id)),
+      reserve: (key: ScheduledOccurrenceKey, row: ScheduledPrompt) => (
+        guard("occurrences.reserve"), occurrences.reserve(key, row)
+      ),
+    },
     getScheduled: (id: string) => (guard("getScheduled"), scheduled.get(id)),
     patchScheduled: (id: string, patch: Record<string, unknown>) => {
       guard("patchScheduled");
@@ -2288,6 +2300,10 @@ describe("#174 post-dispose drain covers an ISOLATED dispatch", () => {
     // And the damage is worse than a missing side effect: the store error
     // propagates out of the completion, so the watcher records the dispatch as
     // FAILED even though the agent had produced the answer.
+    // The bad shutdown already closed the store and caused the violation.
+    // Await the resulting failure artifact now, not before close: a fixed
+    // number of event-loop flushes cannot guarantee its filesystem rename.
+    await watcher.drain();
     const done = JSON.parse(await readFile(path.join(dirs.done, "w-iso2.json"), "utf8"));
     expect(done.status).toBe("failed");
     expect(done.output).toBeUndefined();

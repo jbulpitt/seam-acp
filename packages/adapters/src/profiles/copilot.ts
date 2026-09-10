@@ -440,7 +440,6 @@ export function makeCopilotProfile(opts: {
    * `<dir>/config.json`. When omitted, the CLI uses its default (~/.copilot).
    */
   configDir?: string;
-  staticModels?: ReadonlyArray<{ modelId: string; name: string }>;
   /** Test/embedding seam; production probes the profile's ACP process. */
   catalogProbe?: (launch: CopilotCatalogLaunch) => Promise<CopilotCatalogProbe>;
 }): AgentProfile {

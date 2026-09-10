@@ -200,13 +200,19 @@ before running any procedure in this runbook:
 - CLI binary: `copilot --acp` (env: `COPILOT_CLI_PATH`)
 - Multi-account: `COPILOT_PROFILES` env var — each profile gets OAuth token injected via `COPILOT_GITHUB_TOKEN` env var (read from `<configDir>/config.json`). No `--config-dir` CLI flag — uses env var workaround.
 - Default model: `DEFAULT_MODEL` env var (e.g., `gpt-5.4`)
-- Model picker: `COPILOT_MODELS` env var
-- Effort: via ACP `setSessionConfigOption` with `configId: "reasoning_effort"` (levels: `low`, `medium`, `high`)
+- Model picker: the durable catalog fetched from that profile's exact configured
+  `copilot --acp` runtime is the sole authority. There is no static Copilot model
+  list to maintain. Models appear or disappear after a successful catalog refresh
+  as that credential-scoped runtime changes what it advertises; refresh with
+  `/seamadmin catalog refresh` and inspect the reported generation and diff.
+- Effort: each model's supported choices and default are discovered from its own
+  fresh ACP session and stored in the durable catalog; runtime selection uses
+  `setSessionConfigOption` with `configId: "reasoning_effort"`.
 - MCP injection: Copilot ignores `mcpServers` on ACP `session/new` — only loads from `~/.copilot/mcp-config.json` or `--additional-mcp-config`. seam-acp translates its `McpServer[]` to Copilot's JSON shape and injects at spawn.
 - Identity: reads `<configDir>/config.json` → `lastLoggedInUser.login`
 - Quota: `https://api.github.com/copilot_internal/user`
 - Session storage: SQLite at `<configDir>/session-store.db`
-- Profile source: [`copilot.ts`](../src/agents/profiles/copilot.ts) (450 lines)
+- Profile source: [`copilot.ts`](../packages/adapters/src/profiles/copilot.ts)
 
 #### Copilot in VS Code
 
@@ -315,7 +321,9 @@ and the [Gateway intent reference](https://docs.discord.com/developers/events/ga
 **seam-acp integration points**:
 - WebSocket bridge: `scripts/remote-agent-bridge.mjs` (37KB)
 - Config: `REMOTE_COPILOT_PROFILES` env var (`id:port:token` server mode, `id:wss://url:token` client mode)
-- Hardcoded models in `config.ts` as `REMOTE_MAC_MODELS`
+- Remote Copilot model availability comes from the durable catalog fetched from
+  the exact `copilot --acp` runtime configured on that bridge host; it has no
+  separate hardcoded model list.
 - Tunnel URL publishing: `TUNNEL_GIST_ID` env var (GitHub Gist)
 - Profile source: [`remote.ts`](../src/agents/profiles/remote.ts) (470 lines)
 
@@ -608,11 +616,19 @@ When writing a new issue, always include:
 1. **Identify the model ID** exactly as the provider specifies it.
 2. **For Claude models**: Follow [`model-management-runbook.md`](model-management-runbook.md) §4 (probe against JSONL) before adding the **bare full ID** to `CLAUDE_MODELS` (no `[1m]` suffix). Add its native context window to `CLAUDE_CONTEXT_WINDOWS` in `claude.ts` (or confirm the `claudeContextWindowFamily` heuristic covers it). Confirm the ID is advertised — an un-advertised full ID is REJECTED by 0.54.1's `setSessionConfigOption` (account caveat). Check if it supports adaptive thinking.
 3. **For Gemini models** (legacy — deprecated): No longer actively maintained. If still using Gemini CLI, test with `gemini --acp`.
-4. **For Copilot models**: Test with `copilot --acp` that the model is available. Add to `COPILOT_MODELS` in `.env`.
+4. **For Copilot models**: Verify the model against the exact configured
+   `copilot --acp` runtime, then run the sanctioned catalog refresh and inspect
+   its generation and diff. The accepted durable catalog is the sole picker
+   authority; do not add a static model row to `.env` or `.env.example`. Models
+   appear and disappear when the credential-scoped runtime advertises a changed
+   catalog and that refresh succeeds.
 5. **For Antigravity models**: Models are fetched dynamically from agy's language server — usually no code change needed. If the model naming convention changes, update `AGY_MODELS` or the model catalog logic in [`agy.ts`](../packages/adapters/src/profiles/agy.ts).
-6. Update `.env.example` with the new model entry.
+6. Update `.env.example` only for providers that still maintain a configured
+   static model list. Never add Copilot model rows there.
 7. Consider updating `*_DEFAULT_MODEL` if the new model is a clear upgrade.
-8. Update `REMOTE_MAC_MODELS` in `config.ts` if the model should be available for remote profiles.
+8. For remote profiles, follow that provider's own catalog contract. Remote
+   Copilot profiles use the bridge host's exact configured runtime and durable
+   catalog; they do not have a separate model manifest to update.
 
 ### 5.2 `claude-agent-acp` or `@anthropic-ai/claude-code` updated
 

@@ -43,7 +43,7 @@ const STALE_MODEL = "claude-sonnet-4.6";
 const EFFECTIVE_MODEL = "grok-4.6";
 const COPILOT_MODEL = "gpt-5.4";
 
-const COPILOT_MODELS = [
+const COPILOT_FIXTURE_MODELS = [
   { modelId: COPILOT_MODEL, name: "GPT-5.4" },
   { modelId: STALE_MODEL, name: "Claude Sonnet 4.6" },
 ];
@@ -57,7 +57,7 @@ const profiles = [
     id: "copilot",
     displayName: "Copilot",
     defaultModel: COPILOT_MODEL,
-    staticModels: COPILOT_MODELS,
+    staticModels: COPILOT_FIXTURE_MODELS,
     effort: { mechanism: "none", levels: [] },
   },
   {

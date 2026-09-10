@@ -6,6 +6,49 @@ autocomplete, validation, runtime planning, isolated work, reconstruction,
 vision routing, model metadata joins, and status/audit output read this catalog
 only. A read path never spawns an ACP process or contacts a provider.
 
+## Coordinated model intelligence (#249)
+
+The full operator and matching contract is in
+[`model-intelligence.md`](model-intelligence.md).
+
+Metadata and value rankings are enrichments of this operational catalog, not
+parallel availability catalogs. One coordinator captures the complete
+ready/stale fleet view, the active Artificial Analysis source snapshot, the
+active GitHub Copilot pricing snapshot, and the configured cost scenario. It
+then publishes metadata and value rows behind one SQLite generation pointer.
+MCP and the pinned rankings card read that durable generation only.
+Turn status cards are unchanged: model intelligence is deliberately not added
+to their per-turn surface.
+
+External matching is automatic and deterministic: exact opaque ids, display
+names, and catalog aliases are compared through punctuation/case normalization;
+known effort suffixes are considered only against the catalog's model-specific
+effort capabilities. Ambiguous matches and unknown effort vocabulary remain
+explicitly unresolved. The matcher contains only a few documented spelling
+exceptions and no release allowlist, so a newly advertised model does not need
+a Seam deployment before it can be enriched.
+
+Artificial Analysis and GitHub pricing have independent, rolling append-log source
+snapshots with source URL, parser version, attempt time, success time, all
+normalized records, and failure status. One source failure retains only that
+source's LKG. A catalog publication re-enriches from cached sources; scheduled
+and startup refreshes update both sources first. Operators can force that same
+coordinated path with `/seamadmin catalog refresh … refresh-sources:true`.
+The newest 96 attempts per source, refresh attempts, and generations are kept,
+along with every source snapshot still referenced by retained generations.
+
+The default value scenario is 8,000 uncached input tokens and 2,000 output
+tokens. Cached input, cache writes, output, and the long-context threshold are
+separate settings. GitHub pricing alone drives Copilot credits; an absent rate
+needed by the scenario makes a row unrankable rather than inventing zero cost.
+Pricing and benchmark effort selection are shown in cached diagnostics.
+
+The migration is additive. Previous `model_metadata` and
+`model_value_snapshot` tables are retained for rollback/history and continue to
+serve until the first coordinated generation is published. A legacy marker is
+recorded with `legacy-unknown` provenance; old independent timestamps are never
+presented as a coordinated source capture.
+
 ## Ownership boundary
 
 Each `AgentAdapter` owns a `catalog` source. Its synchronous `scope()` declares

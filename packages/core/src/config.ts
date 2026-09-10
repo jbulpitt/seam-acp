@@ -215,7 +215,10 @@ const Schema = z.object({
   AA_API_KEY: z.string().default(""),
   /** Fixed standard coding task used to compare per-token model cost (#130). */
   MODEL_VALUE_STD_INPUT_TOKENS: z.coerce.number().int().positive().default(8000),
+  MODEL_VALUE_STD_CACHED_INPUT_TOKENS: z.coerce.number().int().nonnegative().default(0),
+  MODEL_VALUE_STD_CACHE_WRITE_TOKENS: z.coerce.number().int().nonnegative().default(0),
   MODEL_VALUE_STD_OUTPUT_TOKENS: z.coerce.number().int().positive().default(2000),
+  MODEL_VALUE_LONG_CONTEXT_THRESHOLD_TOKENS: z.coerce.number().int().positive().default(200000),
 
   /** Path to the `claude-agent-acp` binary. Defaults to looking it up on PATH. */
   CLAUDE_CLI_PATH: z.string().optional(),

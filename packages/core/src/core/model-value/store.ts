@@ -100,6 +100,16 @@ export class ModelValueStore {
   }
 
   getLatestRows(): ModelValueSnapshotRow[] {
+    const hasCoordinated = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_intelligence_active'").get();
+    const coordinated = hasCoordinated ? this.db.prepare(`
+      SELECT g.values_json FROM model_intelligence_generations g
+      JOIN model_intelligence_active a ON a.generation = g.generation
+      WHERE a.singleton = 1 AND g.catalog_signature != 'legacy-unknown'
+    `).get() as { values_json: string } | undefined : undefined;
+    if (coordinated) {
+      try { return JSON.parse(coordinated.values_json) as ModelValueSnapshotRow[]; }
+      catch { return []; }
+    }
     const latest = this.db
       .prepare("SELECT MAX(fetched_at) AS fetched_at FROM model_value_snapshot")
       .get() as { fetched_at: string | null } | undefined;
@@ -133,11 +143,27 @@ export class ModelValueStore {
     const benchmark = options.benchmark?.trim() || DEFAULT_MODEL_VALUE_BENCHMARK;
     let rankings = rankSnapshotRows(rows, benchmark);
     if (options.tier) rankings = rankings.filter((row) => row.tier === options.tier);
+    const hasGeneration = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_intelligence_active'").get();
+    const generation = hasGeneration ? this.db.prepare(`
+      SELECT g.generation, g.matching_policy_version, g.published_at, g.source_snapshots_json, g.scenario_json, g.diagnostics_json
+      FROM model_intelligence_generations g JOIN model_intelligence_active a ON a.generation = g.generation
+      WHERE a.singleton = 1 AND g.catalog_signature != 'legacy-unknown'
+    `).get() as Record<string, unknown> | undefined : undefined;
     return {
       benchmark: benchmark === "intelligence_index" ? DEFAULT_MODEL_VALUE_BENCHMARK : benchmark,
       fetched_at: rows[0]?.fetchedAt ?? null,
       standard_task: { input_tokens: this.inputTokens, output_tokens: this.outputTokens },
       rankings,
+      ...(generation ? {
+        generation: Number(generation.generation),
+        matching_policy_version: String(generation.matching_policy_version),
+        published_at: String(generation.published_at),
+        source_snapshots: JSON.parse(String(generation.source_snapshots_json)),
+        source_fetched_at: rows[0]?.sourceFetchedAt,
+        scenario: JSON.parse(String(generation.scenario_json)),
+        degraded: (JSON.parse(String(generation.diagnostics_json)) as string[]).length > 0,
+        diagnostics: JSON.parse(String(generation.diagnostics_json)),
+      } : {}),
     };
   }
 

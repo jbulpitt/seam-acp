@@ -16,13 +16,16 @@ export interface StoreWritingManagers {
   wake: DrainableManager;
   watch: DrainableManager;
   parked: DrainableManager;
-  modelMetadata: DrainableManager;
-  modelValue: DrainableManager;
+  modelIntelligence?: DrainableManager;
+  /** Legacy embedder compatibility; production #249 uses modelIntelligence. */
+  modelMetadata?: DrainableManager;
+  modelValue?: DrainableManager;
 }
 
 export const MANAGER_CALLBACKS_STAGE = "manager-callbacks";
 export const MODEL_METADATA_REFRESH_STAGE = "model-metadata-refresh";
 export const MODEL_VALUE_REFRESH_STAGE = "model-value-refresh";
+export const MODEL_INTELLIGENCE_REFRESH_STAGE = "model-intelligence-refresh";
 
 /**
  * Await every store-writing manager drain under one bounded group, then
@@ -35,23 +38,28 @@ export async function drainStoreWritingManagers(
 ): Promise<DrainVerdict[]> {
   let metadataOk = false;
   let valueOk = false;
+  let intelligenceOk = false;
   const groupOk = await runGroup("manager callbacks", async () => {
     await Promise.all([
       managers.scheduled.drain(),
       managers.wake.drain(),
       managers.watch.drain(),
       managers.parked.drain(),
-      managers.modelMetadata.drain().then(() => {
+      managers.modelMetadata?.drain().then(() => {
         metadataOk = true;
-      }),
-      managers.modelValue.drain().then(() => {
+      }) ?? Promise.resolve(),
+      managers.modelValue?.drain().then(() => {
         valueOk = true;
-      }),
+      }) ?? Promise.resolve(),
+      managers.modelIntelligence?.drain().then(() => {
+        intelligenceOk = true;
+      }) ?? Promise.resolve(),
     ]);
   });
   return [
     { stage: MANAGER_CALLBACKS_STAGE, drained: groupOk },
-    { stage: MODEL_METADATA_REFRESH_STAGE, drained: groupOk && metadataOk },
-    { stage: MODEL_VALUE_REFRESH_STAGE, drained: groupOk && valueOk },
+    ...(managers.modelMetadata ? [{ stage: MODEL_METADATA_REFRESH_STAGE, drained: groupOk && metadataOk }] : []),
+    ...(managers.modelValue ? [{ stage: MODEL_VALUE_REFRESH_STAGE, drained: groupOk && valueOk }] : []),
+    ...(managers.modelIntelligence ? [{ stage: MODEL_INTELLIGENCE_REFRESH_STAGE, drained: groupOk && intelligenceOk }] : []),
   ];
 }

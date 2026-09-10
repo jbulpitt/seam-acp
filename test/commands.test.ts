@@ -352,9 +352,10 @@ describe("/seamadmin — operator surface (#151)", () => {
     expect(leafNames(admin(), "catalog")).toEqual(["refresh"]);
     const refresh = catalog?.options?.find((o) => o.name === "refresh");
     // #236 added the bounded operator acceptance for a quarantined reduction.
-    expect(refresh?.options?.map((o) => o.name)).toEqual(["agent", "accept-reduction"]);
+    expect(refresh?.options?.map((o) => o.name)).toEqual(["agent", "accept-reduction", "refresh-sources"]);
     expect(refresh?.options?.[0]).toMatchObject({ required: true, autocomplete: true });
     expect(refresh?.options?.[1]).toMatchObject({ required: false });
+    expect(refresh?.options?.[2]).toMatchObject({ required: false });
   });
 
   it("declares the exact ManageGuild permission and Guild-only context", () => {

@@ -1,4 +1,4 @@
-import type { CatalogModelEvidence } from "@seam/adapters";
+import type { CatalogApplicationMode, CatalogModelEvidence, CatalogSelectionBinding } from "@seam/adapters";
 export const DEFAULT_METADATA_BENCHMARK = "artificial_analysis_intelligence_index";
 
 export interface ModelCreator {
@@ -28,7 +28,58 @@ export interface MetadataSourceModel {
 /** Swappable provider boundary. Accessor reads never receive this interface. */
 export interface MetadataSource {
   readonly name: string;
-  fetch(): Promise<MetadataSourceModel[]>;
+  fetch(signal?: AbortSignal): Promise<MetadataSourceModel[]>;
+}
+
+export type IntelligenceBindingState = "ready" | "stale" | "warming" | "drift";
+
+export interface IntelligenceBindingRef {
+  agent: string;
+  location: string;
+  model_id: string;
+  runtime_id: string;
+  catalog_generation: number;
+  catalog_scope: string;
+  catalog_state: IntelligenceBindingState;
+  catalog_fetched_at: string;
+  model_default: boolean;
+  aliases: string[];
+  application_mode: CatalogApplicationMode;
+  effort_choices: string[];
+  effort_default: string;
+  effort_mechanism: string;
+  execution_bindings: CatalogSelectionBinding[];
+}
+
+export type ExternalMatchStatus =
+  | "matched"
+  | "no-source-record"
+  | "ambiguous"
+  | "missing-benchmark"
+  | "unresolved-effort"
+  | "source-unavailable"
+  | "intentionally-unrankable";
+
+export interface ExternalMatchDiagnostic {
+  status: ExternalMatchStatus;
+  source: string;
+  snapshot_id: string | null;
+  record_id: string | null;
+  record_name: string | null;
+  selected_effort: string | null;
+  policy: string;
+  candidates: string[];
+  stale: boolean;
+  detail: string | null;
+}
+
+export interface MetadataBenchmarkVariant {
+  source_id: string;
+  slug: string;
+  name: string;
+  effort: string | null;
+  intelligence_index: number | null;
+  benchmarks: Record<string, number>;
 }
 
 export interface AgentModelAvailability {
@@ -45,12 +96,32 @@ export interface AgentModelAvailability {
    * a row without re-deriving it or contacting a provider.
    */
   evidence?: ReadonlyArray<CatalogModelEvidence> | null;
+  runtimeId?: string;
+  aliases?: string[];
+  effortChoices?: string[];
+  effortDefault?: string;
+  effortMechanism?: string;
+  location?: string;
+  catalogGeneration?: number;
+  catalogScope?: string;
+  catalogState?: IntelligenceBindingState;
+  catalogFetchedAt?: string;
+  priceCategory?: string | null;
+  catalogProvider?: string;
+  modelDefault?: boolean;
+  applicationMode?: CatalogApplicationMode;
+  executionBindings?: CatalogSelectionBinding[];
 }
 
 export interface CachedAgentModel {
   agent: string;
   id: string;
   name: string;
+  location?: string;
+  runtime_id?: string;
+  catalog_generation?: number;
+  catalog_scope?: string;
+  catalog_state?: IntelligenceBindingState;
 }
 
 export interface ModelMetadata {
@@ -78,10 +149,27 @@ export interface ModelMetadata {
   evidence: CatalogModelEvidence[];
   source: string;
   fetched_at: string;
+  /** Stable execution-variant identity. `id` remains the opaque catalog id. */
+  variant_id?: string;
+  runtime_id?: string;
+  bindings?: IntelligenceBindingRef[];
+  catalog_state?: IntelligenceBindingState;
+  catalog_generation?: number;
+  catalog_scope?: string;
+  catalog_fetched_at?: string;
+  enrichment_generation?: number;
+  source_snapshots?: Record<string, string | null>;
+  source_fetched_at?: Record<string, string | null>;
+  matching?: {
+    artificial_analysis: ExternalMatchDiagnostic;
+    github_copilot_pricing: ExternalMatchDiagnostic | null;
+  };
+  benchmark_variants?: MetadataBenchmarkVariant[];
 }
 
 export interface ModelMetadataGetResult {
   model: ModelMetadata | null;
+  ambiguous_variant_ids?: string[];
 }
 
 export interface ModelMetadataFilters {
@@ -119,6 +207,8 @@ export interface ModelMetadataQuery {
 
 export interface ModelMetadataQueryResult {
   fetched_at: string | null;
+  generation?: number | null;
+  matching_policy_version?: string | null;
   count: number;
   models: ModelMetadata[];
 }

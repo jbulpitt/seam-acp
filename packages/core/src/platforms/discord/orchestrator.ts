@@ -46,6 +46,7 @@ import type {
 import { AgentRuntime, type AgentEventHandler, type PromptOutcome } from "../../agents/agent-runtime.js";
 import { cleanTextForPreview, scanWorkspaces, type SessionSummary, type SessionSummaryLine, type ISessionManager } from "@seam/adapters";
 import type { ModelCatalogService, CatalogBinding } from "../../core/model-catalog/service.js";
+import type { ModelIntelligenceRefreshResult } from "../../core/model-intelligence/manager.js";
 import { readRichHistory, renderHistory, type HistoryEvent, type RichHistory } from "../../core/compaction/source-reader.js";
 import { MessageReader } from "../../core/message-reader.js";
 import {
@@ -803,6 +804,7 @@ export class Orchestrator {
   private readonly renderer: Renderer;
   private readonly quotaPoller?: AgentQuotaPoller;
   private readonly modelCatalog: ModelCatalogService;
+  private readonly refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
   private readonly getModelMetadata?: (idOrSlug: string) => { context_window: number | null } | null;
   /** Installed by index.ts only while the upstream-status subsystem is active. */
   private serviceStatusRefresh?: () => Promise<RefreshResult>;
@@ -964,6 +966,7 @@ export class Orchestrator {
     renderer: Renderer;
     quotaPoller?: AgentQuotaPoller;
     modelCatalog: ModelCatalogService;
+    refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
     restartProcess?: () => Promise<void>;
     getModelMetadata?: (idOrSlug: string) => { context_window: number | null } | null;
   }) {
@@ -975,6 +978,7 @@ export class Orchestrator {
     this.renderer = opts.renderer;
     this.quotaPoller = opts.quotaPoller;
     this.modelCatalog = opts.modelCatalog;
+    this.refreshModelIntelligence = opts.refreshModelIntelligence;
     this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
     this.getModelMetadata = opts.getModelMetadata;
     this.threadNamerConfig = new ThreadNamerConfigStore(
@@ -11145,6 +11149,7 @@ export class Orchestrator {
     }
     const requested = i.options.getString("agent", true).trim();
     const acceptReduction = i.options.getBoolean("accept-reduction") === true;
+    const refreshSources = i.options.getBoolean("refresh-sources") === true;
     // #236: the bypass is bounded to ONE explicit binding. `agent:all` with
     // accept-reduction would let a single click admit every simultaneous fleet
     // reduction — exactly the blast radius the quarantine exists to prevent.
@@ -11198,6 +11203,22 @@ export class Orchestrator {
         ...(result.error ? [`failure: ${result.error}`] : []),
       ].join("\n");
     });
+    if (refreshSources && this.refreshModelIntelligence) {
+      const intelligence = await this.refreshModelIntelligence(true);
+      lines.push([
+        `**model intelligence** — ${intelligence.result}; generation ${intelligence.generation ?? "none"}; ` +
+          `policy ${intelligence.matchingPolicyVersion ?? "unknown"}`,
+        `AA ${intelligence.sources["artificial-analysis"].status} (snapshot ${intelligence.sources["artificial-analysis"].snapshot ?? "none"}); ` +
+          `GitHub pricing ${intelligence.sources["github-copilot-pricing"].status} (snapshot ${intelligence.sources["github-copilot-pricing"].snapshot ?? "none"})`,
+        `coverage ${intelligence.coverage.benchmarkMatched}/${intelligence.coverage.models} benchmarked; ` +
+          `${intelligence.coverage.pricingMatched}/${intelligence.coverage.models} priced; next ${intelligence.nextRunAt ?? "not armed"}`,
+        `AA attempt/success ${intelligence.sources["artificial-analysis"].lastAttemptAt ?? "never"} / ` +
+          `${intelligence.sources["artificial-analysis"].lastSuccessAt ?? "never"}; GitHub attempt/success ` +
+          `${intelligence.sources["github-copilot-pricing"].lastAttemptAt ?? "never"} / ` +
+          `${intelligence.sources["github-copilot-pricing"].lastSuccessAt ?? "never"}`,
+        ...intelligence.diagnostics.slice(0, 3).map((detail) => `diagnostic: ${detail}`),
+      ].join("\n"));
+    }
     await i.editReply({
       content: `🗂️ Model catalog refresh finished.\n\n${lines.join("\n\n").slice(0, 1950)}`,
     });

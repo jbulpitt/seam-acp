@@ -66,8 +66,10 @@ export function parseCopilotPricingMarkdown(markdown: string): CopilotPricing[] 
           `Copilot pricing table shape changed: expected ${headers.length} cells, got ${cells.length}`
         );
       }
-      if (tierIndex >= 0 && !/^(?:default|)$/i.test(cleanMarkdown(cells[tierIndex]!))) continue;
-      const modelName = cleanMarkdown(cells[modelIndex]!).replace(/\s*\([^)]*(?:preview|retired)[^)]*\)\s*$/i, "");
+      const tierText = tierIndex >= 0 ? cleanMarkdown(cells[tierIndex]!) : "";
+      const tier = /long[ -]?context/i.test(tierText) ? "long-context" as const : "default" as const;
+      if (tierIndex >= 0 && !/^(?:default)?$/i.test(tierText) && tier !== "long-context") continue;
+      const modelName = cleanMarkdown(cells[modelIndex]!);
       if (!modelName) continue;
       const inputRate = parseDollarRate(cells[inputIndex]!);
       const outputRate = parseDollarRate(cells[outputIndex]!);
@@ -80,8 +82,10 @@ export function parseCopilotPricingMarkdown(markdown: string): CopilotPricing[] 
         cachedInputRate: cachedIndex >= 0 ? parseDollarRate(cells[cachedIndex]!) : null,
         cacheWriteRate: cacheWriteIndex >= 0 ? parseDollarRate(cells[cacheWriteIndex]!) : null,
         outputRate,
+        ...(tierIndex >= 0 ? { tier } : {}),
+        ...(tier === "long-context" ? { thresholdTokens: parseTierThreshold(tierText) } : {}),
       };
-      const key = modelName.toLowerCase();
+      const key = `${modelName.toLowerCase()}|${tier}`;
       const prior = byName.get(key);
       if (prior && JSON.stringify(prior) !== JSON.stringify(row)) {
         throw new Error(`conflicting default Copilot pricing rows for ${modelName}`);
@@ -96,10 +100,18 @@ export function parseCopilotPricingMarkdown(markdown: string): CopilotPricing[] 
   return [...byName.values()];
 }
 
-export async function fetchCopilotPricing(fetchImpl: FetchLike = fetch): Promise<CopilotPricing[]> {
+function parseTierThreshold(value: string): number | null {
+  const match = cleanMarkdown(value).match(/([0-9][0-9,]*(?:\.[0-9]+)?)\s*([km])?/i);
+  if (!match) return null;
+  const amount = Number(match[1]!.replace(/,/g, ""));
+  const multiplier = match[2]?.toLowerCase() === "m" ? 1_000_000 : match[2]?.toLowerCase() === "k" ? 1_000 : 1;
+  return Number.isFinite(amount) ? amount * multiplier : null;
+}
+
+export async function fetchCopilotPricing(fetchImpl: FetchLike = fetch, signal?: AbortSignal): Promise<CopilotPricing[]> {
   const response = await fetchImpl(COPILOT_PRICING_URL, {
     headers: { accept: "text/markdown" },
-    signal: AbortSignal.timeout(30_000),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
   });
   if (!response.ok) throw new Error(`Copilot pricing request failed: HTTP ${response.status}`);
   return parseCopilotPricingMarkdown(await response.text());

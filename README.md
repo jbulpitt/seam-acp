@@ -44,9 +44,12 @@ Copy `.env.example` to `.env` and fill it in.
 | `DEFAULT_AGENT` | no | `copilot` (default), `agy`, or `claude`. Plus any `copilot-<id>` / `agy-<id>` / `claude-<id>` registered via the `*_PROFILES` vars. |
 | `DEFAULT_MODEL` | no | Default Copilot model. Applies to **all** Copilot profiles (including extras from `COPILOT_PROFILES`). e.g. `gpt-5.4`, `claude-sonnet-4.5`, `claude-opus-4.7`, `auto` |
 | `COPILOT_CLI_PATH` | no | If `copilot` is not on `PATH` |
-| `AA_API_KEY` | no | Artificial Analysis Data API key. Required for the 12-hour Copilot model-value snapshot refresh; the prior snapshot remains available when absent. |
-| `MODEL_VALUE_STD_INPUT_TOKENS` | no | Fixed input-token count for model-value cost comparisons. Default `8000`. |
-| `MODEL_VALUE_STD_OUTPUT_TOKENS` | no | Fixed output-token count for model-value cost comparisons. Default `2000`. |
+| `AA_API_KEY` | no | Artificial Analysis Data API key. The coordinated model-intelligence refresh retains its independent source LKG when absent or unavailable. |
+| `MODEL_VALUE_STD_INPUT_TOKENS` | no | Uncached input-token count for value comparisons. Default `8000`. |
+| `MODEL_VALUE_STD_CACHED_INPUT_TOKENS` | no | Cached input-token count for value comparisons. Default `0`. |
+| `MODEL_VALUE_STD_CACHE_WRITE_TOKENS` | no | Cache-write token count for value comparisons. Default `0`. |
+| `MODEL_VALUE_STD_OUTPUT_TOKENS` | no | Output-token count for value comparisons. Default `2000`. |
+| `MODEL_VALUE_LONG_CONTEXT_THRESHOLD_TOKENS` | no | Total input threshold selecting explicit long-context pricing. Default `200000`. Missing required tier rates remain unranked. |
 | `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam config agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
 | `AGY_ENABLED` / `AGY_CLI_PATH` | no | Enables native Seam `agy` with an absolute CLI path and explicit default model. Default `false`. |
 | `AGY_PACKAGE_ENABLED` | no | Separately enables `agy-package` with exact wrapper/runtime pins and permission-risk acknowledgement. Default `false`. |

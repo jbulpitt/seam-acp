@@ -8,6 +8,36 @@ const configured = JSON.parse(fs.readFileSync(path.join(root, "ops/bridge/target
 const targets = validateTargetMap(configured);
 const token = "c".repeat(64);
 
+function preflightReport(target: ReturnType<typeof resolveTarget>, overrides: Record<string, string> = {}): string {
+  return Object.entries({
+    reachable: "yes",
+    bridge_id: target.bridgeId,
+    pm2_app: target.pm2App,
+    identity_bound: "yes",
+    remote_mutation: "no",
+    pid: "123",
+    platform: "darwin-arm64",
+    artifact_mode: "managed",
+    artifact_identity: `${"a".repeat(40)}:${"b".repeat(64)}`,
+    artifact_source_sha: "a".repeat(40),
+    checkout_source_sha: "not-applicable",
+    artifact_checksum: "b".repeat(64),
+    entrypoint_sha256: "c".repeat(64),
+    bridge_version: "0.1.0",
+    protocol_version: "1",
+    drain_SIGUSR2: "yes",
+    describeModelCatalog: "yes",
+    fetchModelCatalog: "yes",
+    rollout_ready: "yes",
+    node_path: target.nodePath,
+    node_version: "v24.15.0",
+    npm_version: "11.6.2",
+    disk_path: target.checkoutPath,
+    disk_bytes_available: "1024",
+    ...overrides,
+  }).map(([key, value]) => `${key}=${value}`).join("\n") + "\n";
+}
+
 describe("bridge rollout target safety (#241)", () => {
   it("pins the full operator-owned deployment identity", () => {
     expect(resolveTarget(targets, "media-server")).toMatchObject({ bridgeId: "media-server", sshAlias: "media-server", pm2App: "remote-agent-bridge", expectedUid: 501, checkoutPath: "/Users/jesse/seam-acp", entrypointPath: "/Users/jesse/seam-acp/packages/bridge/dist/index.js", pidFilePath: "/Users/jesse/.pm2/pids/remote-agent-bridge-0.pid", releaseRoot: "/Users/jesse/.seam/bridge-rollouts" });
@@ -19,13 +49,30 @@ describe("bridge rollout target safety (#241)", () => {
     expect(() => resolveTarget(targets, "jennifer-laptop")).toThrow(/AGY-only/);
   });
 
+  it("keeps macbook-pro explicitly unmanaged and refuses every mutating phase before command construction (#282)", () => {
+    const target = targets.get("macbook-pro")!;
+    expect(target.sshAlias).toBeNull();
+    expect(target.unmanagedReason).toMatch(/no verified SSH management path/);
+    for (const argv of [
+      ["--target", "macbook-pro", "--stage", "--apply"],
+      ["--target", "macbook-pro", "--activate", "--sha", "a".repeat(40), "--checksum", "b".repeat(64), "--stage-id", token, "--apply"],
+    ]) {
+      const parsed = parseArgs(argv);
+      expect(() => resolveTarget(targets, parsed.target)).toThrow(/explicitly unmanaged.*home-hub is a distinct bridge/);
+    }
+    expect(() => makeSshCommand(target, ["preflight"], "fixed-script")).toThrow(/explicitly unmanaged/);
+    expect(() => makeScpCommand(target, "/tmp/release.tgz", `${artifactName("a".repeat(40), "b".repeat(64))}.upload-${token}`)).toThrow(/explicitly unmanaged/);
+  });
+
   it("rejects unknown fields, shell characters, path ambiguity, and incomplete identities", () => {
     expect(() => resolveTarget(targets, "unknown-host")).toThrow(/unknown/);
     expect(() => parseArgs(["--target", "media-server", "--app", "anything"])).toThrow(/unknown option/);
     const base = { ...configured.targets["media-server"] };
-    expect(() => validateTargetMap({ schemaVersion: 2, targets: { ok: { ...base, sshAlias: "host;id" } } })).toThrow(/unsafe SSH/);
-    expect(() => validateTargetMap({ schemaVersion: 2, targets: { ok: { ...base, checkoutPath: "/safe/../escape", entrypointPath: "/safe/../escape/packages/bridge/dist/index.js" } } })).toThrow(/unsafe checkout/);
-    expect(() => validateTargetMap({ schemaVersion: 2, targets: { ok: { ...base, surprise: "x" } } })).toThrow(/unknown target property/);
+    expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, sshAlias: "host;id" } } })).toThrow(/unsafe SSH/);
+    expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, checkoutPath: "/safe/../escape", entrypointPath: "/safe/../escape/packages/bridge/dist/index.js" } } })).toThrow(/unsafe checkout/);
+    expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { ...base, surprise: "x" } } })).toThrow(/unknown target property/);
+    expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { sshAlias: null, pm2App: null, verifyAgent: null, rolloutEnabled: false } } })).toThrow(/requires a safe reason/);
+    expect(() => validateTargetMap({ schemaVersion: 3, targets: { ok: { sshAlias: "known-host", pm2App: null, verifyAgent: null, rolloutEnabled: false, unmanagedReason: "wrong state" } } })).toThrow(/must not declare an unmanaged reason/);
   });
 
   it("constructs argv directly with every pinned identity field", () => {
@@ -50,10 +97,25 @@ describe("bridge rollout gating and verification (#241)", () => {
 
   it("dry-run accepts only a fully bound identity response", async () => {
     const target = resolveTarget(targets, "macbook-air");
-    const fake = vi.fn(async (command: { mutates: boolean }) => { expect(command.mutates).toBe(false); return { stdout: `reachable=yes\nbridge_id=macbook-air\npm2_app=seam-bridge\nidentity_bound=yes\nremote_mutation=no\npid=123\nplatform=darwin-arm64\nartifact_mode=managed\nartifact_identity=${"a".repeat(40)}:${"b".repeat(64)}\nartifact_source_sha=${"a".repeat(40)}\ncheckout_source_sha=not-applicable\nartifact_checksum=${"b".repeat(64)}\nentrypoint_sha256=${"c".repeat(64)}\nbridge_version=0.1.0\nprotocol_version=1\ndrain_SIGUSR2=yes\ndescribeModelCatalog=yes\nfetchModelCatalog=yes\nrollout_ready=yes\nnode_path=${target.nodePath}\nnode_version=v24.15.0\nnpm_version=11.6.2\ndisk_path=${target.checkoutPath}\ndisk_bytes_available=1024\n`, stderr: "" }; });
+    const fake = vi.fn(async (command: { mutates: boolean }) => { expect(command.mutates).toBe(false); return { stdout: preflightReport(target), stderr: "" }; });
     expect((await runPreflight(target, "fixed-script", fake)).report.pid).toBe("123");
     const mismatch = vi.fn(async () => ({ stdout: "bridge_id=other\npm2_app=seam-bridge\nidentity_bound=yes\n", stderr: "" }));
     await expect(runPreflight(target, "fixed-script", mismatch)).rejects.toThrow(/identity/);
+  });
+
+  it("refuses a mapped SSH host whose reported bridge id differs from the target before mutation (#282)", async () => {
+    const media = configured.targets["media-server"];
+    const mapped = validateTargetMap({
+      schemaVersion: 3,
+      targets: { "macbook-pro": { ...media, sshAlias: "home-hub" } },
+    });
+    const target = resolveTarget(mapped, "macbook-pro");
+    const fake = vi.fn(async (command: { mutates: boolean }) => {
+      expect(command.mutates).toBe(false);
+      return { stdout: preflightReport(target, { bridge_id: "home-hub" }), stderr: "" };
+    });
+    await expect(runPreflight(target, "fixed-script", fake)).rejects.toThrow(/remote deployment identity did not match/);
+    expect(fake).toHaveBeenCalledOnce();
   });
 
   it("refuses checksum mismatch and dirty artifact sources", async () => {

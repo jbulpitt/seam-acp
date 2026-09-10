@@ -31,6 +31,30 @@ import { validateCandidate } from "../packages/core/src/core/model-catalog/servi
 
 const FAKE_ACP = fileURLToPath(new URL("./fixtures/fake-claude-agent-acp.mjs", import.meta.url));
 
+/**
+ * The fake wrapper's environment floor — deliberately NOT `process.env` (#279).
+ *
+ * The fake honours `ANTHROPIC_MODEL` on purpose: that is exactly how the probe
+ * pins a canonical identity, and these tests assert on it. So inheriting the
+ * runner's environment handed the fake whatever model the RUNNER was configured
+ * with. On a Claude-family runner (which exports `ANTHROPIC_MODEL`) the bare
+ * session came up on the runner's own model instead of `FAKE_ACP_CURRENT`, that
+ * model was not one of the five advertised entries, the fanout opened a sixth
+ * session, and four isolation assertions failed — none of it caused by the code
+ * under test. The same inheritance could equally MASK a real probe regression by
+ * supplying a value the test never set.
+ *
+ * Only what the child genuinely needs is carried: `PATH`, because the fixture's
+ * `#!/usr/bin/env node` shebang resolves through it, and `HOME`. Every provider
+ * variable — `ANTHROPIC_MODEL`, `CLAUDE_CONFIG_DIR`, credentials, base URLs —
+ * must be passed by name, by the test that wants it. Anything a future runner
+ * exports is excluded by construction rather than by an ever-growing denylist.
+ */
+const FAKE_ACP_ENV_FLOOR: NodeJS.ProcessEnv = {
+  PATH: process.env.PATH,
+  HOME: process.env.HOME,
+};
+
 /** The real advertised list, measured on this subscription. */
 const LIVE_ADVERTISED: ReadonlyArray<{ value: string; name: string }> = [
   { value: "default", name: "Default (recommended)" },
@@ -414,7 +438,7 @@ describe("#232 probe isolation against a fake ACP agent", () => {
   let log: string;
 
   const baseEnv = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
-    ...process.env,
+    ...FAKE_ACP_ENV_FLOOR,
     FAKE_ACP_LOG: log,
     FAKE_ACP_MODELS: JSON.stringify(LIVE_ADVERTISED),
     FAKE_ACP_CURRENT: "sonnet",
@@ -600,6 +624,70 @@ describe("#232 probe isolation against a fake ACP agent", () => {
       })
     ).rejects.toThrow(/advertised no model|empty model list/);
   });
+
+  /**
+   * #279 — the isolation this whole describe asserts must belong to the CODE,
+   * not to whoever happens to run it. These fail if the parent environment is
+   * ever spread back into the fake wrapper's env.
+   */
+  describe("is hermetic against the runner's own provider environment", () => {
+    const hostile = {
+      ANTHROPIC_MODEL: "claude-opus-5",
+      CLAUDE_CONFIG_DIR: "/tmp/hostile-credential-scope",
+      ANTHROPIC_BASE_URL: "https://hostile.example",
+      ANTHROPIC_API_KEY: "sk-hostile",
+    };
+    const saved = new Map<string, string | undefined>();
+
+    beforeEach(() => {
+      for (const [key, value] of Object.entries(hostile)) {
+        saved.set(key, process.env[key]);
+        process.env[key] = value;
+      }
+    });
+    afterEach(() => {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      saved.clear();
+    });
+
+    it("carries no provider variable into the wrapper's environment", () => {
+      const built = baseEnv();
+      for (const key of Object.keys(hostile)) expect(built[key]).toBeUndefined();
+      // Not a denylist check: nothing ambient survives at all, so a variable
+      // invented after this test was written cannot slip through either.
+      expect(Object.keys(built).filter((key) => /^(ANTHROPIC_|CLAUDE)/.test(key))).toEqual([]);
+    });
+
+    it("starts the bare session on FAKE_ACP_CURRENT, not the runner's model", async () => {
+      // The exact reproduction from #279: with an ambient `ANTHROPIC_MODEL`, the
+      // bare session used to come up on the RUNNER's model, which is not one of
+      // the five advertised entries — so the fanout opened a sixth session and
+      // four assertions in this describe failed on a runner-dependent basis.
+      const probe = await probeClaudeCatalog({
+        cliPath: FAKE_ACP,
+        cwd: dir,
+        env: baseEnv(),
+        modelEnv: (modelId) =>
+          /^claude-[a-z]+-\d/.test(modelId) ? baseEnv({ ANTHROPIC_MODEL: modelId }) : baseEnv(),
+        timeoutMs: 20_000,
+        concurrency: 2,
+      });
+
+      expect(probe.wrapperCurrentValue).toBe("sonnet");
+      expect(probe.models.map((model) => model.advertisedId)).toEqual(
+        LIVE_ADVERTISED.map((entry) => entry.value)
+      );
+      const runs = invocations();
+      expect(runs).toHaveLength(LIVE_ADVERTISED.length);
+      // Only the deliberate per-model forward appears — never the runner's.
+      expect(runs.map((run) => run.anthropicModel).filter(Boolean)).toEqual(["claude-fable-5-1"]);
+      // And the ambient credential scope never reached the wrapper either.
+      expect(runs.every((run) => run.configDir === null)).toBe(true);
+    });
+  });
 });
 
 describe("#232 overlay evidence is scoped to the credential set that proved it", () => {
@@ -648,7 +736,7 @@ describe("#232 the probe uses the shared bounded lifecycle", () => {
   let dir: string;
   let log: string;
   const baseEnv = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
-    ...process.env,
+    ...FAKE_ACP_ENV_FLOOR,
     FAKE_ACP_LOG: log,
     FAKE_ACP_MODELS: JSON.stringify(LIVE_ADVERTISED),
     FAKE_ACP_CURRENT: "sonnet",
@@ -890,7 +978,7 @@ describe("#232 QA fixtures — direct regressions", () => {
       const log = path.join(dir, "acp.log");
       fs.writeFileSync(log, "");
       const env = (): NodeJS.ProcessEnv => ({
-        ...process.env,
+        ...FAKE_ACP_ENV_FLOOR,
         FAKE_ACP_LOG: log,
         FAKE_ACP_MODELS: JSON.stringify([{ value: "sonnet", name: "Sonnet" }]),
         FAKE_ACP_CURRENT: "sonnet",
@@ -913,7 +1001,7 @@ describe("#232 QA fixtures — direct regressions", () => {
       const log = path.join(dir, "acp.log");
       fs.writeFileSync(log, "");
       const base = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
-        ...process.env,
+        ...FAKE_ACP_ENV_FLOOR,
         FAKE_ACP_LOG: log,
         FAKE_ACP_MODELS: JSON.stringify(LIVE_ADVERTISED),
         FAKE_ACP_CURRENT: "sonnet",
@@ -958,7 +1046,7 @@ describe("#232 QA fixtures — direct regressions", () => {
       const log = path.join(dir, "acp.log");
       fs.writeFileSync(log, "");
       const base = (over: Record<string, string> = {}): NodeJS.ProcessEnv => ({
-        ...process.env,
+        ...FAKE_ACP_ENV_FLOOR,
         FAKE_ACP_LOG: log,
         FAKE_ACP_MODELS: JSON.stringify(LIVE_ADVERTISED),
         FAKE_ACP_CURRENT: "sonnet",
@@ -1009,7 +1097,7 @@ describe("#232 QA fixtures — direct regressions", () => {
       const log = path.join(dir, "acp.log");
       fs.writeFileSync(log, "");
       const env = (): NodeJS.ProcessEnv => ({
-        ...process.env,
+        ...FAKE_ACP_ENV_FLOOR,
         FAKE_ACP_LOG: log,
         // The installed shape: the wrapper comes up on `sonnet`, so Fable is
         // probed in its own session spawned with ANTHROPIC_MODEL=claude-fable-5-1
@@ -1060,7 +1148,7 @@ describe("#232 QA fixtures — direct regressions", () => {
       const log = path.join(dir, "acp.log");
       fs.writeFileSync(log, "");
       const env = (): NodeJS.ProcessEnv => ({
-        ...process.env,
+        ...FAKE_ACP_ENV_FLOOR,
         FAKE_ACP_LOG: log,
         FAKE_ACP_MODELS: JSON.stringify(LIVE_ADVERTISED),
         FAKE_ACP_CURRENT: "sonnet",

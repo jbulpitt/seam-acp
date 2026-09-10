@@ -106,6 +106,19 @@ lines.on("line", (line) => {
   return { executable, callsPath };
 }
 
+/**
+ * Provider credentials the Codex scope resolver consults at RUNTIME (#279).
+ *
+ * `codexCredentialProfile` correctly prefers a runtime API key over the stored
+ * `auth.json` account id — a runtime key IS the operative credential. But these
+ * fixtures exist to prove that distinct ACCOUNTS get distinct scopes, so a
+ * runner that exports `OPENAI_API_KEY` collapsed both fixtures onto one
+ * api-key identity and failed two tests for reasons unrelated to the code.
+ * Empty values are falsy to the resolver, so this pins the account path without
+ * inventing a credential. Any test that wants the api-key path sets it itself.
+ */
+const NO_AMBIENT_CREDENTIALS = { OPENAI_API_KEY: "", CODEX_API_KEY: "" };
+
 function setup(
   mode = "ok",
   signal?: AbortSignal,
@@ -154,6 +167,7 @@ function setup(
       { modelId: "gpt-5.6-sol", name: "Configured Sol", contextLimit: 200_000 },
     ],
     extraEnv: {
+      ...NO_AMBIENT_CREDENTIALS,
       CODEX_HOME: codexHome,
       CODEX_TEST_MARKER: "same-session-environment",
       FAKE_CODEX_CALLS: runtime.callsPath,
@@ -237,6 +251,7 @@ lines.on("close", () => process.exit(0));
     defaultModel: "gpt-6-astra",
     sessionsRoot: path.join(codexHome, "sessions"),
     extraEnv: {
+      ...NO_AMBIENT_CREDENTIALS,
       CODEX_HOME: codexHome,
       CODEX_PATH: codexPath,
       FAKE_CODEX_CALLS: callsPath,
@@ -396,6 +411,29 @@ describe("Codex live model catalog", () => {
     expect(second.profile.catalog.scope().credentialProfile).not.toContain(second.root);
   });
 
+  it("separates those accounts identically when the RUNNER exports a Codex credential", () => {
+    // #279: an ambient `OPENAI_API_KEY` took precedence over each fixture's
+    // `auth.json` account id, collapsing both scopes onto one api-key identity
+    // and failing the test above for whoever ran it — not for what it tests.
+    const saved = { OPENAI_API_KEY: process.env.OPENAI_API_KEY, CODEX_API_KEY: process.env.CODEX_API_KEY };
+    process.env.OPENAI_API_KEY = "sk-runner-ambient-key";
+    process.env.CODEX_API_KEY = "sk-runner-ambient-codex-key";
+    try {
+      const first = setup("ok", undefined, "account-a");
+      const second = setup("ok", undefined, "account-b");
+      expect(first.profile.catalog.scope().credentialProfile).toMatch(/^account-[a-f0-9]{24}$/);
+      expect(first.profile.catalog.scope().fingerprint).not.toBe(second.profile.catalog.scope().fingerprint);
+      expect(first.profile.catalog.scope().credentialProfile).not.toBe(
+        second.profile.catalog.scope().credentialProfile
+      );
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it("rejects a stale or misspelled configured default as drift", async () => {
     const { profile, root, executable, modelsPath, modePath, callsPath } = setup();
     const drifted = makeCodexProfile({
@@ -403,6 +441,9 @@ describe("Codex live model catalog", () => {
       defaultModel: "gpt-6-astrra",
       modelsCachePath: path.join(root, ".codex", "models_cache.json"),
       extraEnv: {
+        // Same account, same scope — which is only true if the ambient
+        // environment cannot supply a competing credential (#279).
+        ...NO_AMBIENT_CREDENTIALS,
         CODEX_HOME: path.join(root, ".codex"),
         FAKE_CODEX_CALLS: callsPath,
         FAKE_CODEX_MODE_FILE: modePath,

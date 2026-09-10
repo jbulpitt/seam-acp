@@ -89,9 +89,15 @@ function rankingLine(row: ModelValueSnapshotRow, rank: number | null): string {
   const efforts = effortValues.length
     ? effortValues.join("/")
     : "none advertised";
+  const selectedEffort = row.selectedBenchmarkEffort
+    ? ` · benchmark effort ${inertRankingsText(row.selectedBenchmarkEffort, 24)}`
+    : "";
+  const bindings = row.bindings?.length
+    ? ` · ${row.bindings.length} binding${row.bindings.length === 1 ? "" : "s"}`
+    : "";
   return truncateUtf16(
     `${ordinal} **${inertRankingsText(row.copilotModel)}** · value ${displayNumber(row.valueScore)} · ` +
-      `${benchmark} · price ${price} · effort ${efforts}`,
+      `${benchmark} · price ${price} · effort ${efforts}${selectedEffort}${bindings}`,
     900
   );
 }
@@ -105,7 +111,8 @@ function sortedSectionRows(
     .sort((a, b) => {
       if (a.valueScore === null && b.valueScore !== null) return 1;
       if (a.valueScore !== null && b.valueScore === null) return -1;
-      return (b.valueScore ?? 0) - (a.valueScore ?? 0) || a.copilotModel.localeCompare(b.copilotModel);
+      return (b.valueScore ?? 0) - (a.valueScore ?? 0) || a.copilotModel.localeCompare(b.copilotModel) ||
+        (a.variantId ?? a.copilotModel).localeCompare(b.variantId ?? b.copilotModel);
     });
 }
 
@@ -115,7 +122,23 @@ function snapshotDescription(rows: readonly ModelValueSnapshotRow[]): string {
   const parsed = Date.parse(fetchedAt);
   if (!Number.isFinite(parsed)) return "Cached snapshot timestamp is unavailable.";
   const unix = Math.floor(parsed / 1_000);
-  return `As of <t:${unix}:R> · <t:${unix}:f> · higher value is better`;
+  const row = rows[0]!;
+  const scenario = row.scenario
+    ? `${row.scenario.uncached_input_tokens.toLocaleString()} uncached in + ${row.scenario.output_tokens.toLocaleString()} out`
+    : "legacy standard task";
+  const generation = row.enrichmentGeneration ? `generation ${row.enrichmentGeneration}` : "legacy generation";
+  const sourceCount = Object.values(row.sourceSnapshots ?? {}).filter(Boolean).length;
+  const sourceAges = Object.entries(row.sourceFetchedAt ?? {}).flatMap(([source, value]) => {
+    const timestamp = value ? Date.parse(value) : Number.NaN;
+    return Number.isFinite(timestamp)
+      ? [`${source === "artificial-analysis" ? "AA" : "GitHub"} <t:${Math.floor(timestamp / 1_000)}:R>`]
+      : [];
+  });
+  const degraded = Object.values(row.sourceStatus ?? {}).some((status) => status !== "fresh") ||
+    (row.generationDiagnostics?.length ?? 0) > 0;
+  return `Published <t:${unix}:R> · <t:${unix}:f> · ${generation} · ${scenario} · ${sourceCount} source snapshots` +
+    `${sourceAges.length ? ` (${sourceAges.join(", ")})` : ""}` +
+    `${degraded ? " · ⚠ degraded (see diagnostics/MCP)" : ""} · higher value is better`;
 }
 
 function chunkLines(lines: readonly string[], maxUnits: number): string[] {

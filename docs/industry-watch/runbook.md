@@ -40,6 +40,9 @@ retroactive inclusion test.
 web search and `site:x.com` plus named handles. Use Seam MCP
 `model_metadata_query` / `model_metadata_get` for Artificial Analysis numbers
 (cached; do not treat missing AA coverage as "the model does not exist").
+The coordinated model-intelligence refresh automatically matches new catalog
+rows. This job must not edit or request a source-code model/alias allowlist;
+report an unresolved match as a parser/matching diagnostic instead.
 If you are `agy` on this Discord bridge, **do not spawn subagents** — they
 are killed when the turn ends. Work inline.
 

@@ -76,10 +76,11 @@ import {
 } from "./core/quota/quota-poller.js";
 import { AgentQuotaCard } from "./core/quota/agent-quota-card.js";
 import { ModelValueStore } from "./core/model-value/store.js";
-import { ModelValueManager } from "./core/model-value/manager.js";
 import { ModelMetadataStore } from "./core/model-metadata/store.js";
-import { ModelMetadataManager } from "./core/model-metadata/manager.js";
 import { ArtificialAnalysisMetadataSource } from "./core/model-metadata/artificial-analysis.js";
+import { fetchCopilotPricing } from "./core/model-value/sources.js";
+import { ModelIntelligenceStore } from "./core/model-intelligence/store.js";
+import { ModelIntelligenceManager } from "./core/model-intelligence/manager.js";
 import { ModelCatalogService, ModelCatalogStore } from "./core/model-catalog/index.js";
 import type { AdapterCatalogCandidate, AgentProfile } from "@seam/adapters";
 import { ModelValueRankingsCard } from "./core/model-value/rankings-card.js";
@@ -162,6 +163,7 @@ async function main(): Promise<void> {
     outputTokens: config.MODEL_VALUE_STD_OUTPUT_TOKENS,
   });
   const modelMetadataStore = new ModelMetadataStore(seamDbPath);
+  const modelIntelligenceStore = new ModelIntelligenceStore(seamDbPath);
   const modelCatalogStore = new ModelCatalogStore(seamDbPath);
   const artificialAnalysis = new ArtificialAnalysisMetadataSource(config.AA_API_KEY);
   const { servers: mcpServers } = buildGlobalMcpServers(logger, {
@@ -511,54 +513,28 @@ async function main(): Promise<void> {
   });
   router.startIdleReaper();
 
-  // #130 and #134 intentionally share one AA source and the same 12-hour
-  // cadence. Their back-to-back refreshes therefore share each in-flight HTTP
-  // request while retaining independent atomic caches and failure handling.
-  const modelMetadataManager = new ModelMetadataManager({
-    store: modelMetadataStore,
-    logger: logger.child({ mod: "model-metadata" }),
+  // #249: one coordinator captures the operational catalog plus independent
+  // source LKGs and atomically publishes metadata and value from exact inputs.
+  const modelIntelligenceManager = new ModelIntelligenceManager({
+    store: modelIntelligenceStore,
+    logger: logger.child({ mod: "model-intelligence" }),
     source: artificialAnalysis,
-    getCatalog: async () => modelCatalog.availableModels().map(({ binding, model }) => ({
-      agentId: binding.agentId,
-      modelId: model.id,
-      name: model.displayName,
-      contextWindow: model.context.effective,
-      vision: model.modalities.input.includes("image"),
-      // #236: carry the catalog's own per-model description AND structured
-      // provenance into the join, in the validated bounded representation.
-      ...(model.description ? { description: model.description } : {}),
-      ...(model.evidence?.length ? { evidence: model.evidence } : {}),
-    })),
-  });
-  const modelValueManager = new ModelValueManager({
-    store: modelValueStore,
-    logger: logger.child({ mod: "model-value" }),
-    aaApiKey: config.AA_API_KEY,
-    inputTokens: config.MODEL_VALUE_STD_INPUT_TOKENS,
-    outputTokens: config.MODEL_VALUE_STD_OUTPUT_TOKENS,
-    fetchAa: () => artificialAnalysis.fetch(),
-    // Operational model/effort data has one authority. Rankings enrich the
-    // current catalog snapshot instead of probing a second ACP session.
-    fetchCopilot: async () => [...new Map(
-      modelCatalog.availableModels()
-        .filter(({ binding }) => binding.agentId === copilot.id)
-        .map(({ model }) => [model.id, model] as const)
-    ).values()].map((model) => ({
-        modelId: model.id,
-        displayName: model.displayName,
-        validEffortTiers: model.effort.choices
-          .map((choice) => choice.id)
-          .filter((effort) => effort !== "default"),
-        priceCategory: model.pricingCategory,
-      })),
+    fetchPricing: (signal) => fetchCopilotPricing(fetch, signal),
+    getCatalog: () => modelCatalog.fleetSnapshot(),
+    scenario: {
+      uncached_input_tokens: config.MODEL_VALUE_STD_INPUT_TOKENS,
+      cached_input_tokens: config.MODEL_VALUE_STD_CACHED_INPUT_TOKENS,
+      cache_write_tokens: config.MODEL_VALUE_STD_CACHE_WRITE_TOKENS,
+      output_tokens: config.MODEL_VALUE_STD_OUTPUT_TOKENS,
+      long_context_threshold_tokens: config.MODEL_VALUE_LONG_CONTEXT_THRESHOLD_TOKENS,
+    },
   });
   // Enrichment must follow the operational generation, not merely its own
   // 12-hour clock. Each manager coalesces a publication behind any active
   // source fetch so a cold startup cannot finish with the pre-publication
   // empty catalog and remain stale until the next cron tick.
   stopCatalogEnrichmentRefresh = modelCatalog.onPublication(() => {
-    modelMetadataManager.refreshForCatalogGeneration();
-    modelValueManager.refreshForCatalogGeneration();
+    modelIntelligenceManager.refreshForCatalogGeneration();
   });
 
   const quotaRegistry = new QuotaRegistry();
@@ -596,6 +572,7 @@ async function main(): Promise<void> {
     renderer,
     quotaPoller,
     modelCatalog,
+    refreshModelIntelligence: (forceSources) => modelIntelligenceManager.refresh({ forceSources }),
     getModelMetadata: (idOrSlug) => modelMetadataStore.get(idOrSlug).model,
   });
 
@@ -698,8 +675,7 @@ async function main(): Promise<void> {
   // Reads were available from SQLite before Discord connected. Provider/CLI
   // work begins only now and is deliberately not awaited.
   modelCatalog.start();
-  modelMetadataManager.start();
-  modelValueManager.start();
+  modelIntelligenceManager.start();
 
   // Upstream service-status subsystem (#182). Built here, ahead of the MCP
   // server, because two independent consumers need it: the pinned Discord card
@@ -1372,9 +1348,9 @@ async function main(): Promise<void> {
       dataDir: config.DATA_DIR,
       collect: () => modelValueStore.getLatestRows(),
     });
-    modelValueManager.setOnUpdate(() => rankingsCard.poke());
+    modelIntelligenceManager.setOnUpdate(() => rankingsCard.poke());
     stopRankingsCard = () => {
-      modelValueManager.setOnUpdate(undefined);
+      modelIntelligenceManager.setOnUpdate(undefined);
       rankingsCard.stop();
     };
     void rankingsCard.start().catch((err) =>
@@ -1540,8 +1516,7 @@ async function main(): Promise<void> {
     orchestrator.stopSentinelWatcher();
     delegationReconciler.stop();
     quotaPoller.stop();
-    modelMetadataManager.stop();
-    modelValueManager.stop();
+    modelIntelligenceManager.stop();
     stopCatalogEnrichmentRefresh?.();
     modelCatalog.stop();
     stopCatalogBridgeRefresh?.();
@@ -1612,8 +1587,7 @@ async function main(): Promise<void> {
           wake: wakeManager,
           watch: watchManager,
           parked: parkedManager,
-          modelMetadata: modelMetadataManager,
-          modelValue: modelValueManager,
+          modelIntelligence: modelIntelligenceManager,
         },
         (label, work) => bounded(label, config.SHUTDOWN_QUIESCE_TIMEOUT_MS, work)
       ))
@@ -1724,6 +1698,11 @@ async function main(): Promise<void> {
         }
         try {
           modelValueStore.close();
+        } catch {
+          /* ignore */
+        }
+        try {
+          modelIntelligenceStore.close();
         } catch {
           /* ignore */
         }

@@ -183,13 +183,16 @@ export class ModelMetadataStore {
   get(idOrSlug: string): ModelMetadataGetResult {
     const wanted = idOrSlug.trim().toLowerCase();
     if (!wanted) throw new Error("idOrSlug is required");
-    const model = this.getAll().find(
+    const matches = this.getAll().filter(
       (row) =>
+        row.variant_id?.toLowerCase() === wanted ||
         row.id.toLowerCase() === wanted ||
         row.slug?.toLowerCase() === wanted ||
         row.aliases.some((alias) => alias.toLowerCase() === wanted)
     );
-    return { model: model ?? null };
+    return matches.length === 1
+      ? { model: matches[0]! }
+      : { model: null, ...(matches.length > 1 ? { ambiguous_variant_ids: matches.map((row) => row.variant_id ?? row.id) } : {}) };
   }
 
   query(input: ModelMetadataQuery = {}): ModelMetadataQueryResult {
@@ -244,16 +247,37 @@ export class ModelMetadataStore {
     }
     rows.sort(sorter(input.sort));
     if (input.limit !== undefined) rows = rows.slice(0, input.limit);
+    const activeGeneration = this.activeIntelligenceGeneration();
     return {
       fetched_at: allRows[0]?.fetched_at ?? null,
+      generation: activeGeneration?.generation ?? null,
+      matching_policy_version: activeGeneration?.matchingPolicyVersion ?? null,
       count: rows.length,
       models: rows,
     };
   }
 
   getAll(): ModelMetadata[] {
+    const hasCoordinated = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_intelligence_active'").get();
+    const coordinated = hasCoordinated ? this.db.prepare(`
+      SELECT g.metadata_json FROM model_intelligence_generations g
+      JOIN model_intelligence_active a ON a.generation = g.generation
+      WHERE a.singleton = 1 AND g.catalog_signature != 'legacy-unknown'
+    `).get() as { metadata_json: string } | undefined : undefined;
+    if (coordinated) return parseArray<ModelMetadata>(coordinated.metadata_json);
     const rows = this.db.prepare("SELECT * FROM model_metadata ORDER BY model_id").all() as DbRow[];
     return rows.map(fromDbRow);
+  }
+
+  private activeIntelligenceGeneration(): { generation: number; matchingPolicyVersion: string } | null {
+    const has = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_intelligence_active'").get();
+    if (!has) return null;
+    const row = this.db.prepare(`
+      SELECT g.generation, g.matching_policy_version FROM model_intelligence_generations g
+      JOIN model_intelligence_active a ON a.generation = g.generation
+      WHERE a.singleton = 1 AND g.catalog_signature != 'legacy-unknown'
+    `).get() as { generation: number; matching_policy_version: string } | undefined;
+    return row ? { generation: row.generation, matchingPolicyVersion: row.matching_policy_version } : null;
   }
 
   close(): void {

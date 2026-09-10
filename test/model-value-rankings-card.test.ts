@@ -27,8 +27,9 @@ const silent = pino({ level: "silent" }) as unknown as Logger;
 function ranking(
   over: Partial<ModelValueSnapshotRow> & { copilotModel: string }
 ): ModelValueSnapshotRow {
+  const { copilotModel, ...rest } = over;
   return {
-    copilotModel: over.copilotModel,
+    copilotModel,
     aaSlug: "fixture-model",
     tier: "flagship",
     intelligenceIndex: 50,
@@ -42,7 +43,7 @@ function ranking(
     validEffortTiers: ["low", "high"],
     priceCategory: "medium",
     fetchedAt: "2026-09-01T12:00:00.000Z",
-    ...over,
+    ...rest,
   };
 }
 
@@ -78,7 +79,7 @@ describe("model value rankings rendering", () => {
     const text = layoutText(renderModelValueRankingsLayout(result));
     const fetchedUnix = Math.floor(Date.parse(result[0]!.fetchedAt) / 1_000);
 
-    expect(text).toContain(`As of <t:${fetchedUnix}:R>`);
+    expect(text).toContain(`Published <t:${fetchedUnix}:R>`);
     expect(text).toContain(`1. **flagship-high**`);
     expect(text).toContain(`2. **flagship-low**`);
     expect(text.indexOf("🚀 Flagship")).toBeLessThan(text.indexOf("⚖️ Balanced"));
@@ -112,11 +113,13 @@ describe("model value rankings rendering", () => {
     }
 
     const panel = renderModelValueRankingsPanel(snapshot(rows));
-    expect(panel.title.length).toBeLessThanOrEqual(256);
-    expect(panel.description.length).toBeLessThanOrEqual(4_096);
+    const title = panel.title ?? "";
+    const description = panel.description ?? "";
+    expect(title.length).toBeLessThanOrEqual(256);
+    expect(description.length).toBeLessThanOrEqual(4_096);
     expect(panel.fields.length).toBeLessThanOrEqual(25);
     expect(panel.fields.every((field) => field.name.length <= 256 && field.value.length <= 1_024)).toBe(true);
-    const aggregate = panel.title.length + panel.description.length + panel.fields.reduce(
+    const aggregate = title.length + description.length + panel.fields.reduce(
       (total, field) => total + field.name.length + field.value.length,
       0
     );
@@ -153,7 +156,7 @@ describe("model value rankings card lifecycle", () => {
       async editLayout() { calls.edits += 1; },
       async pinMessage() { calls.pins += 1; },
       async bumpThread() { calls.bumps += 1; },
-    } as ChatAdapter;
+    } as unknown as ChatAdapter;
     const card = new ModelValueRankingsCard({
       logger: silent,
       adapter,
@@ -204,7 +207,7 @@ describe("model value rankings card lifecycle", () => {
           return { channel, id: "rankings-card" };
         },
         async editLayout() { edits += 1; },
-      } as ChatAdapter;
+      } as unknown as ChatAdapter;
       const card = new ModelValueRankingsCard({
         logger: silent,
         adapter,

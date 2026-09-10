@@ -52,10 +52,10 @@ describe("production adapter catalog sources", () => {
     expect(source.scope()).toEqual(catalog.scope);
   });
 
-  it("collects Copilot's model-specific effort choices and defaults", async () => {
+  it("uses only Copilot's ACP catalog with model-specific effort choices and defaults", async () => {
     const profile = makeCopilotProfile({
       cliPath: "false",
-      defaultModel: "auto",
+      defaultModel: "configured-only-fallback",
       catalogProbe: async () => ({
         defaultModel: "auto",
         models: [
@@ -79,6 +79,9 @@ describe("production adapter catalog sources", () => {
     const catalog = normalizeCatalogCandidate(await profile.catalog.fetch());
     validateCandidate(catalog);
     expect(catalog.source).toBe("copilot-acp-config-options");
+    expect(catalog.models.map((model) => model.id)).toEqual(["auto", "gpt-odd"]);
+    expect(catalog.models.find((model) => model.default)?.id).toBe("auto");
+    expect(catalog.models.some((model) => model.id === "configured-only-fallback")).toBe(false);
     expect(catalog.models.find((model) => model.id === "gpt-odd")?.effort).toMatchObject({
       selectionDefault: "astronomical",
       choices: [{ id: "low", raw: "low" }, { id: "astronomical", raw: "astronomical" }],

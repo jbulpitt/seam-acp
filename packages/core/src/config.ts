@@ -210,7 +210,6 @@ const Schema = z.object({
       }
       return out;
     }),
-  COPILOT_MODELS: ModelsListSchema,
   /** Artificial Analysis Data API key used only by the 12-hour model-value refresh. */
   AA_API_KEY: z.string().default(""),
   /** Fixed standard coding task used to compare per-token model cost (#130). */

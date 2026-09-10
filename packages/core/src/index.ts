@@ -174,7 +174,6 @@ async function main(): Promise<void> {
   const copilot = makeCopilotProfile({
     ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
     defaultModel: config.DEFAULT_MODEL,
-    staticModels: config.COPILOT_MODELS,
     mcpServers,
   });
 
@@ -185,7 +184,6 @@ async function main(): Promise<void> {
       configDir: p.configDir,
       ...(config.COPILOT_CLI_PATH ? { cliPath: config.COPILOT_CLI_PATH } : {}),
       defaultModel: config.DEFAULT_MODEL,
-      staticModels: config.COPILOT_MODELS,
       mcpServers,
     })
   );

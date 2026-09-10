@@ -3,7 +3,7 @@ import type {
   RequestPermissionRequest,
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
-import type { MessagePageItem, MessagePageRequest } from "../core/message-reader.js";
+import type { MessagePage, MessagePageRequest } from "../core/message-reader.js";
 
 /** Reference to a channel or thread on a chat platform. */
 export interface ChannelRef {
@@ -119,8 +119,12 @@ export interface ChatAdapter {
     channel: ChannelRef
   ): Promise<Array<{ authorIsBot: boolean; text: string; authorName?: string }>>;
 
-  /** Optional: one cursor-addressed page of raw conversational messages. */
-  fetchMessagePage?(threadId: string, request: MessagePageRequest): Promise<MessagePageItem[]>;
+  /**
+   * Optional: one cursor-addressed page. Returns the eligible messages plus
+   * the raw-page cursor/count facts pagination needs, because content
+   * filtering must never be read as end-of-history (#278).
+   */
+  fetchMessagePage?(threadId: string, request: MessagePageRequest): Promise<MessagePage>;
 
   /** Optional: this application's bot user id, used to identify Seam assistant posts. */
   getBotUserId?(): string | undefined;

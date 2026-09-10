@@ -82,7 +82,7 @@ import {
   makeChoiceModalId,
   makeChoiceSelectId,
 } from "../../core/choice/types.js";
-import type { MessagePageItem, MessagePageRequest } from "../../core/message-reader.js";
+import type { MessagePage, MessagePageItem, MessagePageRequest } from "../../core/message-reader.js";
 import {
   SEAM_ADMIN_COMMAND_NAME,
   SEAM_COMMAND_NAME,
@@ -358,6 +358,17 @@ export type DiscordInteractionRoute =
  *  schedule-id / bridge / voice pickers go blank with no error anywhere. */
 export function isSeamCommandName(name: string | undefined): boolean {
   return name === SEAM_COMMAND_NAME || name === SEAM_ADMIN_COMMAND_NAME;
+}
+
+/**
+ * Snowflake tie-break for two rows sharing a millisecond: ids are numeric and
+ * monotonic, so the smaller id is older. A non-numeric id (test fixtures,
+ * future formats) falls back to string order rather than guessing.
+ */
+function isOlderSnowflake(candidate: string, incumbent: string | null): boolean {
+  if (incumbent === null) return true;
+  if (/^\d+$/.test(candidate) && /^\d+$/.test(incumbent)) return BigInt(candidate) < BigInt(incumbent);
+  return candidate.localeCompare(incumbent) < 0;
 }
 
 export function classifyDiscordInteraction(interaction: {
@@ -1508,7 +1519,7 @@ export class DiscordAdapter implements ChatAdapter {
   async fetchMessagePage(
     threadId: string,
     request: MessagePageRequest
-  ): Promise<MessagePageItem[]> {
+  ): Promise<MessagePage> {
     const ch = await this.fetchSendableChannel(threadId);
     if (!ch.isThread()) throw new Error("Channel is not a thread.");
     const options: {
@@ -1524,7 +1535,26 @@ export class DiscordAdapter implements ChatAdapter {
     };
     const chunk = await ch.messages.fetch(options);
     const messages: MessagePageItem[] = [];
+    // Raw-page facts, recorded BEFORE any content filtering (#278). Discord
+    // ships pages newest→oldest, but the pagination cursor must not depend on
+    // that: take the genuine minimum so a reordered or partially cached page
+    // still advances correctly.
+    let rawCount = 0;
+    let oldestRawId: string | null = null;
+    let oldestRawTimestampMs: number | null = null;
     for (const msg of chunk.values()) {
+      rawCount += 1;
+      if (
+        oldestRawTimestampMs === null ||
+        msg.createdTimestamp < oldestRawTimestampMs ||
+        (msg.createdTimestamp === oldestRawTimestampMs && isOlderSnowflake(msg.id, oldestRawId))
+      ) {
+        oldestRawId = msg.id;
+        oldestRawTimestampMs = msg.createdTimestamp;
+      }
+      // Content filtering: system rows (joins, pins, thread-started) are never
+      // conversation. Dropping them here is intentional and stays intentional —
+      // it just no longer decides pagination.
       if (msg.type !== MessageType.Default && msg.type !== MessageType.Reply) continue;
       const attachmentNames = msg.attachments.map((attachment) => attachment.name);
       const embedText = msg.embeds
@@ -1550,7 +1580,7 @@ export class DiscordAdapter implements ChatAdapter {
         hasComponents: msg.components.length > 0,
       });
     }
-    return messages;
+    return { messages, rawCount, oldestRawId, oldestRawTimestampMs };
   }
 
   async getThreadLiveState(

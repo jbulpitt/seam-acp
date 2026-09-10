@@ -3,7 +3,7 @@ import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
-import type { MessagePageItem } from "../packages/core/src/core/message-reader.js";
+import type { MessagePage, MessagePageItem, MessagePageRequest } from "../packages/core/src/core/message-reader.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
@@ -37,6 +37,18 @@ function post(id: string, content: string, over: Partial<MessagePageItem> = {}):
   };
 }
 
+/** A transport page whose raw facts match its rows (nothing filtered). */
+function page(rows: readonly MessagePageItem[], over: Partial<MessagePage> = {}): MessagePage {
+  const oldest = [...rows].sort((a, b) => a.timestampMs - b.timestampMs)[0];
+  return {
+    messages: [...rows],
+    rawCount: rows.length,
+    oldestRawId: oldest?.messageId ?? null,
+    oldestRawTimestampMs: oldest?.timestampMs ?? null,
+    ...over,
+  };
+}
+
 function makeOrch(over?: {
   posts?: MessagePageItem[];
   cfg?: { model?: string; reasoningEffort?: string; lastContextUsage?: { model: string; size: number } };
@@ -48,6 +60,8 @@ function makeOrch(over?: {
   duringSeed?: (bound: { value: string }) => void;
   seedError?: Error;
   alwaysFullPage?: boolean;
+  /** Full control of the transport page, for #278 pagination coverage. */
+  pageSource?: (request: MessagePageRequest) => MessagePage;
   recordOver?: Partial<SessionRecord>;
   profiles?: Record<string, any>;
   describeConfig?: (record: SessionRecord) => any;
@@ -59,6 +73,7 @@ function makeOrch(over?: {
   const seedCalls: any[] = [];
   const injectCalls: any[] = [];
   const casCalls: any[] = [];
+  const attachCalls: any[] = [];
   const compactCalls: string[] = [];
   const describeCalls: SessionRecord[] = [];
   const fetchCalls: number[] = [];
@@ -95,12 +110,15 @@ function makeOrch(over?: {
     } as any,
     adapter: {
       getBotUserId: () => ("botId" in (over ?? {}) ? over!.botId : SEAM),
-      fetchMessagePage: async () => {
+      fetchMessagePage: async (_threadId: string, request: MessagePageRequest) => {
         fetchCalls.push(1);
+        if (over?.pageSource) return over.pageSource(request);
         if (over?.alwaysFullPage) {
-          return Array.from({ length: 100 }, (_, i) => post(String(i + 1), `page-item ${i + 1}`));
+          // The same full page forever: a source that never advances its
+          // cursor. Rebuild must refuse rather than walk to the cap (#278).
+          return page(Array.from({ length: 100 }, (_, i) => post(String(i + 1), `page-item ${i + 1}`)));
         }
-        return posts;
+        return page(posts);
       },
       sendPanel: async (_ch: unknown, panel: unknown) => {
         panels.push(panel as { title?: string; description?: string; footer?: string; fields: unknown[] });
@@ -163,7 +181,12 @@ function makeOrch(over?: {
     if (over?.seedError) throw over.seedError;
     return "sess-new";
   };
-  return { orch, rec, seedCalls, injectCalls, casCalls, bound, compactCalls, describeCalls, fetchCalls, panels };
+  const attachCompactedSession = (orch as any).attachCompactedSession.bind(orch);
+  (orch as any).attachCompactedSession = async (args: unknown) => {
+    attachCalls.push(args);
+    return attachCompactedSession(args);
+  };
+  return { orch, rec, seedCalls, injectCalls, casCalls, attachCalls, bound, compactCalls, describeCalls, fetchCalls, panels };
 }
 
 describe("reconstructSessionFromDiscord", () => {
@@ -251,6 +274,30 @@ describe("reconstructSessionFromDiscord", () => {
       })
     ).rejects.toThrow(/exceed the .* destination budget/);
     expect(t.seedCalls).toHaveLength(0);
+    expect(t.casCalls).toHaveLength(0);
+    expect(t.bound.value).toBe("acp-active");
+  });
+
+  it("refuses an opening-only rebuild before seeding, attaching, or CAS", async () => {
+    const posts = [
+      ...Array.from({ length: 20 }, (_, index) => {
+        const id = index + 1;
+        return post(String(id), `opening ${id}`, id % 2 === 0 ? { authorType: "bot" } : {});
+      }),
+      post("21", "recent oversized message ".repeat(5_000)),
+    ];
+    const t = makeOrch({ posts, staticContextLimit: 2_000 });
+
+    await expect(
+      (t.orch as any).reconstructSessionFromDiscord({
+        record: t.rec,
+        channel: { platform: "discord", id: "thread-r" },
+        observedAtStart: "acp-active",
+        attachIntent: "attach",
+      })
+    ).rejects.toThrow(/cannot preserve both the opening and recent history/);
+    expect(t.seedCalls).toHaveLength(0);
+    expect(t.attachCalls).toHaveLength(0);
     expect(t.casCalls).toHaveLength(0);
     expect(t.bound.value).toBe("acp-active");
   });
@@ -440,7 +487,7 @@ describe("reconstructSessionFromDiscord", () => {
     expect(t.fetchCalls).toHaveLength(0);
   });
 
-  it("fails closed when Discord history is truncated by the page cap", async () => {
+  it("fails closed when Discord stops advancing through history", async () => {
     const t = makeOrch({ alwaysFullPage: true });
     await expect(
       (t.orch as any).reconstructSessionFromDiscord({
@@ -449,9 +496,140 @@ describe("reconstructSessionFromDiscord", () => {
         observedAtStart: "acp-active",
         attachIntent: "attach",
       })
-    ).rejects.toThrow(/page cap/);
+      // An incomplete fetch is refused outright: partial history is never
+      // attached as if it were the whole thread (#278).
+    ).rejects.toThrow(/stopped advancing through thread history/);
     expect(t.seedCalls).toHaveLength(0);
     expect(t.bound.value).toBe("acp-active");
+    // And it stops immediately rather than spinning through the 500-page cap.
+    expect(t.fetchCalls.length).toBeLessThan(5);
+  });
+
+  /**
+   * #278 — the owner's requirement is full retrieval FIRST, trimming second.
+   * These drive the whole combined path: raw Discord pages → adapter filtering
+   * → reader pagination → projection → budget selection → seed.
+   */
+  describe("multi-page retrieval feeds reconstruction", () => {
+    const OPENING = "OPENING_SENTINEL";
+    const TRAILING = "TRAILING_SENTINEL";
+
+    /** 250 posts across three raw pages, alternating human and Seam turns. */
+    const history = (): MessagePageItem[] =>
+      Array.from({ length: 250 }, (_, index) => {
+        const id = index + 1;
+        const isHuman = id % 2 === 1;
+        // Enough body that a realistic destination budget cannot hold all 250,
+        // so the selector must actually choose.
+        const filler = " context ".repeat(40).trim();
+        const content =
+          id === 1
+            ? `${OPENING} how do we start this project?`
+            : id === 249
+              ? `${TRAILING} where did we land?`
+              : `${isHuman ? "question" : "answer"} ${id} ${filler}`;
+        return post(String(id), content, isHuman ? {} : { authorType: "bot" });
+      });
+
+    /**
+     * A transport source that pages honestly and filters system rows, exactly
+     * as the Discord adapter does: `filtered` rows shrink `messages` but never
+     * `rawCount` or the cursor.
+     */
+    const pagedSource = (all: MessagePageItem[], filtered: ReadonlySet<string> = new Set()) =>
+      (request: MessagePageRequest): MessagePage => {
+        const before = request.before ? BigInt(request.before) : undefined;
+        const rawRows = [...all]
+          .sort((a, b) => b.timestampMs - a.timestampMs)
+          .filter((message) => before === undefined || BigInt(message.messageId) < before)
+          .slice(0, request.limit);
+        const oldest = rawRows.at(-1);
+        return {
+          messages: rawRows.filter((message) => !filtered.has(message.messageId)),
+          rawCount: rawRows.length,
+          oldestRawId: oldest?.messageId ?? null,
+          oldestRawTimestampMs: oldest?.timestampMs ?? null,
+        };
+      };
+
+    it("seeds the real opening AND the trailing messages across filtered pages", async () => {
+      const all = history();
+      const t = makeOrch({
+        // One system row in the newest raw page — the exact shape that used to
+        // stop the walk at 99 posts and hand Rebuild the thread's tail as if it
+        // were its beginning.
+        pageSource: pagedSource(all, new Set(["225"])),
+        staticContextLimit: 1_000_000,
+      });
+
+      const res = await (t.orch as any).reconstructSessionFromDiscord({
+        record: t.rec,
+        channel: { platform: "discord", id: "thread-r" },
+        observedAtStart: "acp-active",
+        attachIntent: "attach",
+      });
+
+      expect(t.fetchCalls.length).toBeGreaterThan(1);
+      expect(t.seedCalls).toHaveLength(1);
+      const summary: string = t.seedCalls[0].summary;
+      expect(summary).toContain(OPENING);
+      expect(summary).toContain(TRAILING);
+      // Ample budget: nothing was dropped, and the filtered row never appears.
+      expect(summary).not.toContain("question 225");
+      expect(summary.indexOf(OPENING)).toBeLessThan(summary.indexOf(TRAILING));
+      expect(res.newSessionId).toBe("sess-new");
+    });
+
+    it("omits only the MIDDLE when the destination budget forces a choice", async () => {
+      const all = history();
+      const t = makeOrch({
+        pageSource: pagedSource(all, new Set(["225"])),
+        staticContextLimit: 12_000,
+      });
+
+      await (t.orch as any).reconstructSessionFromDiscord({
+        record: t.rec,
+        channel: { platform: "discord", id: "thread-r" },
+        observedAtStart: "acp-active",
+        attachIntent: "attach",
+      });
+
+      const summary: string = t.seedCalls[0].summary;
+      // Both ends survive; the gap is in between, not at the beginning.
+      expect(summary).toContain(OPENING);
+      expect(summary).toContain(TRAILING);
+      expect(summary).toContain("question 3");
+      expect(summary).not.toContain("question 125");
+      // Budget omission is reported as omission — separately from retrieval,
+      // which completed. A truncated fetch would have thrown instead.
+      const omitted: string = t.panels
+        .map((panel) => JSON.stringify(panel))
+        .find((panel) => panel.includes("omitted"))!;
+      expect(omitted).toBeTruthy();
+      expect(omitted).not.toMatch(/page cap|stopped advancing/);
+    });
+
+    it("refuses to seed at all when retrieval itself is incomplete", async () => {
+      const all = history();
+      const stalled = pagedSource(all);
+      const t = makeOrch({
+        // Advancing pages, then a source that stops moving: history was never
+        // established as complete, so nothing may be attached.
+        pageSource: (request) => ({ ...stalled(request), oldestRawId: all.at(-1)!.messageId }),
+      });
+
+      await expect(
+        (t.orch as any).reconstructSessionFromDiscord({
+          record: t.rec,
+          channel: { platform: "discord", id: "thread-r" },
+          observedAtStart: "acp-active",
+          attachIntent: "attach",
+        })
+      ).rejects.toThrow(/stopped advancing through thread history/);
+      expect(t.seedCalls).toHaveLength(0);
+      expect(t.casCalls).toHaveLength(0);
+      expect(t.bound.value).toBe("acp-active");
+    });
   });
 
   it("labels a thread-only rider as thread, not channel", async () => {

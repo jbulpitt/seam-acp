@@ -16524,9 +16524,16 @@ export class Orchestrator {
         { logger: this.logger, interPageDelayMs: 180 }
       );
       const walked = await reader.walkThread(channel.id, { maxPages: 500 });
+      // Completeness of RETRIEVAL, judged before anything is projected. An
+      // incomplete walk is refused outright: attaching the tail of a thread as
+      // if it were the whole thing is worse than not rebuilding. This is a
+      // separate question from budget omission below, which happens only after
+      // the full history is in hand and is reported on its own line.
       if (walked.truncated) {
         throw new ReconstructionUnavailableError(
-          "Rebuild stopped: Discord history exceeded the page cap before the thread was exhausted."
+          walked.truncatedReason === "cursor-stalled"
+            ? "Rebuild stopped: Discord stopped advancing through thread history before it was exhausted."
+            : "Rebuild stopped: Discord history exceeded the page cap before the thread was exhausted."
         );
       }
       log(`fetched ${walked.messages.length} Discord post(s)`);

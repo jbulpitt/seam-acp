@@ -48,10 +48,15 @@ describe("DiscordAdapter.fetchMessagePage", () => {
       messages: { fetch },
     }));
 
-    const rows = await adapter.fetchMessagePage("thread-1", { around: "hit", limit: 75 });
+    const page = await adapter.fetchMessagePage("thread-1", { around: "hit", limit: 75 });
 
     expect(fetch).toHaveBeenCalledWith({ around: "hit", limit: 75 });
-    expect(rows).toEqual([
+    // Raw-page facts travel with the eligible rows (#278). Here nothing was
+    // filtered, so the counts agree and the oldest raw row is m1.
+    expect(page.rawCount).toBe(2);
+    expect(page.oldestRawId).toBe("m1");
+    expect(page.oldestRawTimestampMs).toBe(1_000);
+    expect(page.messages).toEqual([
       expect.objectContaining({
         messageId: "m2",
         authorType: "bot",
@@ -72,6 +77,48 @@ describe("DiscordAdapter.fetchMessagePage", () => {
         hasComponents: false,
       }),
     ]);
+  });
+
+  it("reports raw cursor facts for rows it filters out (#278)", async () => {
+    const logger = { child: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    logger.child.mockReturnValue(logger);
+    const adapter = new DiscordAdapter({
+      config: {
+        DISCORD_ALLOWED_USER_IDS: new Set(["human"]),
+        DISCORD_USER_NAMES: new Map(),
+      } as any,
+      logger: logger as any,
+    });
+    const row = (id: string, type: MessageType, createdTimestamp: number) => [id, {
+      id,
+      type,
+      createdTimestamp,
+      author: { id: "human", bot: false, username: "jesse", globalName: "Jesse" },
+      member: { displayName: "Jesse" },
+      content: `content ${id}`,
+      attachments: { map: () => [] },
+      embeds: [],
+      components: [],
+    }] as const;
+    const fetch = vi.fn(async () => new Map([
+      row("m3", MessageType.Default, 3_000),
+      row("m2", MessageType.Reply, 2_000),
+      // The OLDEST raw row is a system post. Pagination must still be able to
+      // continue from it, so it has to survive as cursor metadata even though
+      // it is (correctly) withheld from callers.
+      row("m1", MessageType.ChannelPinnedMessage, 1_000),
+    ] as any));
+    (adapter as any).fetchSendableChannel = vi.fn(async () => ({
+      isThread: () => true,
+      messages: { fetch },
+    }));
+
+    const page = await adapter.fetchMessagePage("thread-1", { limit: 100 });
+
+    expect(page.messages.map((message) => message.messageId)).toEqual(["m3", "m2"]);
+    expect(page.rawCount).toBe(3);
+    expect(page.oldestRawId).toBe("m1");
+    expect(page.oldestRawTimestampMs).toBe(1_000);
   });
 
   it("forces the platform lookup when checking whether a thread still exists", async () => {

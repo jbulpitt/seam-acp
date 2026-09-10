@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "targets": {
     "media-server": {
       "sshAlias": "media-server",
@@ -32,7 +32,13 @@
       "rolloutEnabled": true
     },
     "jennifer-laptop": { "sshAlias": "macbook-air-j", "pm2App": null, "verifyAgent": null, "rolloutEnabled": false },
-    "macbook-pro": { "sshAlias": "home-hub", "pm2App": null, "verifyAgent": null, "rolloutEnabled": false },
+    "macbook-pro": {
+      "sshAlias": null,
+      "pm2App": null,
+      "verifyAgent": null,
+      "rolloutEnabled": false,
+      "unmanagedReason": "no verified SSH management path; home-hub is a distinct bridge"
+    },
     "alaina-laptop": { "sshAlias": "laptop-alaina", "pm2App": null, "verifyAgent": null, "rolloutEnabled": false },
     "allie-laptop": { "sshAlias": "laptop-allie", "pm2App": null, "verifyAgent": null, "rolloutEnabled": false }
   }

@@ -24,8 +24,13 @@ on the command line.
 - `macbook-air` maps to SSH `macbook-air`, PM2 `seam-bridge`, UID 501, checkout
   `/Users/jessebulpitt/.seam/seam-acp`, and rollout root
   `/Users/jessebulpitt/.seam/bridge-rollouts`.
-- The four AGY-only hosts retain SSH aliases but deliberately have no rollout
-  identity and remain disabled.
+- Three AGY-only hosts retain SSH aliases but deliberately have no rollout
+  identity and remain disabled. `macbook-pro` is explicitly unmanaged: the
+  previously recorded `home-hub` alias reaches a simultaneously connected,
+  distinct `home-hub` bridge, and no verified SSH management path for
+  `macbook-pro` is known. Every rollout phase therefore refuses that target.
+  Do not restore an alias until a read-only preflight proves that the remote
+  process reports `bridge_id=macbook-pro`.
 
 Before any mutation, the remote program requires one PM2 record and proves that
 its PID equals the exact owned PID file; the process is alive, owned by the
@@ -35,6 +40,11 @@ workspace argument; and all configured paths and owners are canonical. PM2
 arguments must match a supported bridge grammar. Secret argument values are
 compared in memory and never printed. Ambiguity, symlink escape, wrong owner,
 unexpected flags, or any mismatch refuses the phase.
+
+An SSH alias is not identity evidence by itself. The preflight response must
+report the same bridge ID as the selected inventory key; a response such as
+`bridge_id=home-hub` for target `macbook-pro` refuses before build, upload,
+staging, signaling, or activation.
 
 ## State machine
 

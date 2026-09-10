@@ -12,8 +12,9 @@ const TOKEN = /^[0-9a-f]{64}$/;
 const TARGET_KEYS = new Set([
   "sshAlias", "pm2App", "verifyAgent", "checkoutPath", "entrypointPath",
   "pidFilePath", "expectedUid", "nodePath", "pm2ModulePath", "workspaceArg",
-  "devMode", "releaseRoot", "rolloutEnabled",
+  "devMode", "releaseRoot", "rolloutEnabled", "unmanagedReason",
 ]);
+const SAFE_REASON = /^[A-Za-z0-9][A-Za-z0-9 .,:;#/_()-]{0,255}$/;
 
 function exactAbsolute(value, label) {
   if (typeof value !== "string" || !SAFE_PATH.test(value) || path.posix.normalize(value) !== value || value.includes("//") || value.endsWith("/")) {
@@ -23,22 +24,31 @@ function exactAbsolute(value, label) {
 }
 
 export function validateTargetMap(input) {
-  if (!input || input.schemaVersion !== 2 || !input.targets || typeof input.targets !== "object" || Array.isArray(input.targets)) {
+  if (!input || input.schemaVersion !== 3 || !input.targets || typeof input.targets !== "object" || Array.isArray(input.targets)) {
     throw new Error("invalid bridge rollout target map");
   }
   const targets = new Map();
   for (const [bridgeId, value] of Object.entries(input.targets)) {
     if (!SAFE_NAME.test(bridgeId) || !value || typeof value !== "object" || Array.isArray(value)) throw new Error(`unsafe bridge target ${JSON.stringify(bridgeId)}`);
     for (const key of Object.keys(value)) if (!TARGET_KEYS.has(key)) throw new Error(`unknown target property ${JSON.stringify(key)}`);
-    if (!SAFE_NAME.test(value.sshAlias ?? "")) throw new Error(`unsafe SSH alias for ${bridgeId}`);
     if (typeof value.rolloutEnabled !== "boolean") throw new Error(`missing rolloutEnabled for ${bridgeId}`);
     if (!value.rolloutEnabled) {
-      if (Object.keys(value).some((key) => !["sshAlias", "pm2App", "verifyAgent", "rolloutEnabled"].includes(key)) || value.pm2App !== null || value.verifyAgent !== null) {
+      if (Object.keys(value).some((key) => !["sshAlias", "pm2App", "verifyAgent", "rolloutEnabled", "unmanagedReason"].includes(key)) || value.pm2App !== null || value.verifyAgent !== null) {
         throw new Error(`disabled target ${bridgeId} must not guess deployment identity`);
+      }
+      if (value.sshAlias === null) {
+        if (typeof value.unmanagedReason !== "string" || !SAFE_REASON.test(value.unmanagedReason)) {
+          throw new Error(`explicitly unmanaged target ${bridgeId} requires a safe reason`);
+        }
+      } else {
+        if (!SAFE_NAME.test(value.sshAlias ?? "")) throw new Error(`unsafe SSH alias for ${bridgeId}`);
+        if (value.unmanagedReason !== undefined) throw new Error(`mapped disabled target ${bridgeId} must not declare an unmanaged reason`);
       }
       targets.set(bridgeId, { bridgeId, ...value });
       continue;
     }
+    if (!SAFE_NAME.test(value.sshAlias ?? "")) throw new Error(`unsafe SSH alias for ${bridgeId}`);
+    if (value.unmanagedReason !== undefined) throw new Error(`enabled target ${bridgeId} must not declare an unmanaged reason`);
     if (!SAFE_NAME.test(value.pm2App ?? "")) throw new Error(`unsafe PM2 app for ${bridgeId}`);
     if (!SAFE_NAME.test(value.verifyAgent ?? "")) throw new Error(`unsafe verification agent for ${bridgeId}`);
     if (!Number.isInteger(value.expectedUid) || value.expectedUid < 1 || value.expectedUid > 0x7fffffff) throw new Error(`unsafe expected UID for ${bridgeId}`);
@@ -60,8 +70,18 @@ export function resolveTarget(targets, bridgeId) {
   if (!SAFE_NAME.test(bridgeId ?? "")) throw new Error("target contains unsafe characters");
   const target = targets.get(bridgeId);
   if (!target) throw new Error(`unknown bridge target ${JSON.stringify(bridgeId)}`);
-  if (!target.rolloutEnabled) throw new Error(`${bridgeId} is mapped but rollout is disabled (AGY-only hosts are outside #241)`);
+  requireManagedTarget(target);
   return target;
+}
+
+function requireManagedTarget(target) {
+  if (!target?.rolloutEnabled) {
+    if (target?.sshAlias === null) {
+      throw new Error(`${target.bridgeId} is explicitly unmanaged: ${target.unmanagedReason}`);
+    }
+    throw new Error(`${target?.bridgeId ?? "target"} is mapped but rollout is disabled (AGY-only hosts are outside #241)`);
+  }
+  if (!SAFE_NAME.test(target.sshAlias ?? "")) throw new Error(`target ${target.bridgeId ?? "unknown"} has no verified SSH management path`);
 }
 
 export function parseArgs(argv) {
@@ -116,6 +136,7 @@ function targetArgs(target) {
 }
 
 export function makeSshCommand(target, actionArgs, remoteScript) {
+  requireManagedTarget(target);
   const args = [...targetArgs(target), ...actionArgs];
   for (const value of args) {
     if (typeof value !== "string" || value.length > 512 || /[\0-\x20\x7f'"`$;&|<>\\]/.test(value)) throw new Error(`unsafe remote argument ${JSON.stringify(value)}`);
@@ -130,6 +151,7 @@ export function makeSshCommand(target, actionArgs, remoteScript) {
 }
 
 export function makeScpCommand(target, localArtifact, remoteName) {
+  requireManagedTarget(target);
   if (!SAFE_NAME.test(target.sshAlias) || !/^bridge-[0-9a-f]{40}-[0-9a-f]{64}\.tgz(?:\.upload-[0-9a-f]{64})?$/.test(remoteName)) throw new Error("unsafe artifact delivery argument");
   return { file: "scp", args: ["-q", "--", localArtifact, `${target.sshAlias}:${target.releaseRoot}/incoming/${remoteName}`], mutates: true, timeoutMs: 120_000 };
 }
@@ -156,6 +178,7 @@ export function validateReadyReceipt(receipt, expected) {
 }
 
 export function rollbackPlan(target, activationId) {
+  requireManagedTarget(target);
   if (!TOKEN.test(activationId ?? "")) throw new Error("an immutable activation id is required for rollback");
   return { target: target.bridgeId, command: `npm run bridge:rollout -- --target ${target.bridgeId} --rollback --activation-id ${activationId} --apply`, automatic: false };
 }

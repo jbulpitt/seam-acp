@@ -51,10 +51,10 @@ Copy `.env.example` to `.env` and fill it in.
 | `MODEL_VALUE_STD_OUTPUT_TOKENS` | no | Output-token count for value comparisons. Default `2000`. |
 | `MODEL_VALUE_LONG_CONTEXT_THRESHOLD_TOKENS` | no | Total input threshold selecting explicit long-context pricing. Default `200000`. Missing required tier rates remain unranked. |
 | `COPILOT_PROFILES` | no | Register additional Copilot profiles, each with its own auth / config dir. Format: `id1:/abs/dir1,id2:/abs/dir2`. Each becomes an agent profile named `copilot-<id>` in `/seam config agent`. Lets one bot serve multiple GitHub accounts; see "Multiple Copilot accounts" below. |
-| `AGY_ENABLED` / `AGY_CLI_PATH` | no | Enables native Seam `agy` with an absolute CLI path and explicit default model. Default `false`. |
+| `AGY_ENABLED` / `AGY_CLI_PATH` | no | Enables native Seam `agy` with an exact managed CLI path, release pins, and explicit default model. Default `false`. |
 | `AGY_PACKAGE_ENABLED` | no | Separately enables `agy-package` with exact wrapper/runtime pins and permission-risk acknowledgement. Default `false`. |
 | `AGY_ACP_BIN` / `AGY_ACP_SHA256` | with AGY | Exact compiled `antigravity-acp` v1.1.0 asset and reviewed platform digest. Seam never downloads it. |
-| `AGY_BIN` / `AGY_VERSION` / `AGY_SHA256` | with AGY | Exact host-local authenticated `agy` executable, expected `--version` output, and digest used for catalog evidence and runtime. |
+| `AGY_BIN` / `AGY_VERSION` / `AGY_SHA256` / `AGY_RUNTIME_ROOT` | with AGY | Exact authenticated `agy` executable, coupled version/digest, and non-writable content-addressed root outside the auto-updater. See `docs/agy-native-runtime.md`. |
 | `CLAUDE_CLI_PATH` | no | If `claude-agent-acp` is not on `PATH` |
 | `CLAUDE_DEFAULT_MODEL` | no | Default Claude model — applied even when `DEFAULT_AGENT` is `copilot`. Default `claude-sonnet-4.5`. |
 | `CLAUDE_PROFILES` | no | Same shape as `COPILOT_PROFILES`. Each entry registers a `claude-<id>` profile pinned to its own `CLAUDE_CONFIG_DIR`. See "Multiple Claude accounts" below. |

@@ -29,6 +29,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import type { AdapterRuntimeDescriptor } from "@seam/adapters";
 import { PresetsFileSchema } from "../config.js";
 import { renderCatalogEvidenceLines } from "./catalog-evidence-render.js";
 import { uniqueBridgeId } from "./bridge-pairing.js";
@@ -59,7 +60,8 @@ export type ConfigMutationTier =
   | "channel-preset"
   | "thread-preset"
   | "schedule"
-  | "bridge";
+  | "bridge"
+  | "runtime-provenance";
 
 /** Tier A — the calling thread's own session config. */
 export interface SessionConfigChanges {
@@ -364,6 +366,39 @@ const SCHEDULE_ATTACHMENT_KEYS = [
   "addFile",
   "removeFile",
 ] as const;
+
+export function safeNativeAgyRuntimeProvenance(runtime: AdapterRuntimeDescriptor): {
+  identity: string;
+  topology: "virtual-acp-native-cli";
+  cwdPolicy: "session";
+  environmentKeys: string[];
+  provenance: AdapterRuntimeDescriptor["provenance"];
+} {
+  if (
+    runtime.topology !== "virtual-acp-native-cli" ||
+    runtime.executable !== "managed-artifact" ||
+    runtime.cwd !== "session-workspace" ||
+    runtime.cwdPolicy !== "session" ||
+    runtime.argv.length !== 0 ||
+    Object.keys(runtime.environment).length !== 0 ||
+    !runtime.identity || !/^[a-f0-9]{64}$/.test(runtime.identity) ||
+    runtime.immutableRoot !== undefined ||
+    runtime.credentialScope !== undefined ||
+    runtime.environmentFingerprint !== undefined ||
+    runtime.stateDir !== undefined ||
+    runtime.conversationDir !== undefined ||
+    runtime.dependencies !== undefined
+  ) {
+    throw new Error("native AGY runtime provenance contains private or invalid launch data");
+  }
+  return {
+    identity: runtime.identity,
+    topology: runtime.topology,
+    cwdPolicy: runtime.cwdPolicy,
+    environmentKeys: [...(runtime.environmentKeys ?? [])].sort(),
+    provenance: { ...runtime.provenance },
+  };
+}
 
 export class ConfigMutationService {
   private readonly deps: ConfigMutationDeps;
@@ -719,6 +754,24 @@ export class ConfigMutationService {
       summary: opts.action,
       before: {},
       after: { bridgeId: opts.bridgeId, action: opts.action, ...(opts.extra ?? {}) },
+    });
+  }
+
+  /** Persist verified host runtime identity without storing environment values. */
+  recordRuntimeProvenance(opts: {
+    agentId: string;
+    location: string;
+    runtime: AdapterRuntimeDescriptor;
+  }): ConfigAuditEntry {
+    const safeRuntime = safeNativeAgyRuntimeProvenance(opts.runtime);
+    return this.writeAudit({
+      tier: "runtime-provenance",
+      scope: `runtime:${opts.agentId}@${opts.location}`,
+      correlationId: randomUUID(),
+      actor: { id: "seam-runtime", name: "Seam runtime verifier" },
+      summary: `verified ${opts.agentId}@${opts.location} runtime provenance`,
+      before: {},
+      after: { agentId: opts.agentId, location: opts.location, runtime: safeRuntime },
     });
   }
 

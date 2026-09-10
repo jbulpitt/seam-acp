@@ -459,7 +459,7 @@ export interface ConfigAuditEntry {
   appliedUtc: string;
 }
 
-/** Caller-supplied shape for `recordConfigMutation`; `appliedUtc` defaults to now. */
+/** Caller-supplied shape for audit records; `appliedUtc` defaults to now. */
 export interface ConfigAuditInput {
   id: string;
   tier: string;

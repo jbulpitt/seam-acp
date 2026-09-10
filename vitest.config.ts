@@ -8,6 +8,7 @@ export default defineConfig({
   test: {
     include: ["test/**/*.test.ts"],
     environment: "node",
+    setupFiles: [path.join(root, "test/non-live-env.ts")],
   },
   resolve: {
     alias: {

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { McpServer } from "@agentclientprotocol/sdk";
-import { makeAgyProfile } from "@seam/adapters";
+import { makeAgyNativeRuntime, makeAgyProfile } from "@seam/adapters";
 import { pino } from "pino";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -20,6 +20,7 @@ import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrato
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
 import { serializePanelText } from "../packages/core/src/platforms/renderer.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
+import { createManagedAgyFixture, type ManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtureDir = path.join(here, "fixtures", "agy-native-capabilities");
@@ -42,6 +43,7 @@ interface Invocation {
   } | null;
   jsonSchema?: Record<string, unknown> | null;
   args?: string[];
+  cwd?: string;
   signal?: string;
 }
 
@@ -71,6 +73,7 @@ const seamMcp: McpServer = {
 let root: string;
 let invocationLog: string;
 let mappingDir: string;
+let managedCli: ManagedAgyFixture;
 const sessionHomes = new Set<string>();
 
 function readInvocations(): Invocation[] {
@@ -96,7 +99,19 @@ async function waitForInvocation(
 
 function makeRuntime(dataDir = mappingDir): AgentRuntime {
   const profile = makeAgyProfile({
-    cliPath: fakeCli,
+    runtime: makeAgyNativeRuntime({
+      executable: managedCli.executable,
+      runtimeRoot: managedCli.runtimeRoot,
+      version: "agy fixture 1.1.28",
+      sha256: managedCli.sha256,
+      credentialScope: "antigravity-oauth:test",
+      cwd: os.tmpdir(),
+      baseEnv: process.env,
+      approvedEnvironment: {
+        SEAM_AGY_CAPABILITY_FIXTURE_DIR: process.env.SEAM_AGY_CAPABILITY_FIXTURE_DIR!,
+        SEAM_AGY_CAPABILITY_INVOCATIONS: invocationLog,
+      },
+    }),
     dataDir,
     defaultModel: "Fixture Native Model",
     persistModelSelection: false,
@@ -222,12 +237,22 @@ describe.sequential("native AGY R1 capability contract", () => {
     fs.mkdirSync(mappingDir);
     process.env.SEAM_AGY_CAPABILITY_FIXTURE_DIR = fixtureDir;
     process.env.SEAM_AGY_CAPABILITY_INVOCATIONS = invocationLog;
+    managedCli = createManagedAgyFixture({
+      source: fakeCli,
+      version: "agy fixture 1.1.28",
+      cwd: root,
+      approvedEnvironment: {
+        SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtureDir,
+        SEAM_AGY_CAPABILITY_INVOCATIONS: invocationLog,
+      },
+    });
   });
 
   afterAll(() => {
     delete process.env.SEAM_AGY_CAPABILITY_FIXTURE_DIR;
     delete process.env.SEAM_AGY_CAPABILITY_INVOCATIONS;
     for (const home of sessionHomes) fs.rmSync(home, { recursive: true, force: true });
+    managedCli.cleanup();
     fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -262,6 +287,38 @@ describe.sequential("native AGY R1 capability contract", () => {
       expect(entry.evidence).toContain("offline-reproduced");
       expect(entry.liveVerified).toBe(false);
     }
+  });
+
+  it("binds the native behavior gate to the R2 virtual-runtime descriptor", () => {
+    const profile = makeAgyProfile({
+      runtime: makeAgyNativeRuntime({
+        executable: managedCli.executable,
+        runtimeRoot: managedCli.runtimeRoot,
+        version: "agy fixture 1.1.28",
+        sha256: managedCli.sha256,
+        credentialScope: "antigravity-oauth:test",
+        cwd: root,
+        approvedEnvironment: {
+          SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtureDir,
+          SEAM_AGY_CAPABILITY_INVOCATIONS: invocationLog,
+        },
+      }),
+      defaultModel: "Fixture Native Model",
+    });
+    expect(profile.describe().runtime).toMatchObject({
+      identity: expect.stringMatching(/^[a-f0-9]{64}$/),
+      executable: "managed-artifact",
+      argv: [],
+      cwd: "session-workspace",
+      environment: {},
+      topology: "virtual-acp-native-cli",
+      cwdPolicy: "session",
+      provenance: {
+        source: "google:antigravity-native-cli",
+        version: "agy fixture 1.1.28",
+        sha256: managedCli.sha256,
+      },
+    });
   });
 
   it("replays native thinking, message, tool, usage, resume, attachment, schema, and interruption behavior end to end", async () => {
@@ -353,6 +410,8 @@ describe.sequential("native AGY R1 capability contract", () => {
 
     const firstInvocation = readInvocations().find((entry) => entry.scenario === "turn-one");
     expect(firstInvocation).toBeDefined();
+    expect(firstInvocation?.cwd).toBe(root);
+    expect(firstInvocation?.cwd).not.toBe(os.tmpdir());
     expect(firstInvocation?.prompt).toContain("[Attached file: notes.txt]\nembedded fixture text");
     expect(firstInvocation?.prompt).toContain("[Attached file: payload.bin — binary content not inlined]");
     expect(firstInvocation?.prompt).not.toContain("AAEC");
@@ -362,7 +421,11 @@ describe.sequential("native AGY R1 capability contract", () => {
       headers: { "X-Seam-Session": "synthetic-session-token" },
     });
     expect(firstInvocation?.home).toMatch(/seam-agy-homes/);
-    if (firstInvocation?.home) sessionHomes.add(firstInvocation.home);
+    if (firstInvocation?.home) {
+      sessionHomes.add(firstInvocation.home);
+      expect(fs.statSync(firstInvocation.home).mode & 0o077).toBe(0);
+      expect(fs.statSync(path.join(firstInvocation.home, ".gemini", "config", "mcp_config.json")).mode & 0o077).toBe(0);
+    }
 
     const sessionId = session.sessionId;
     await runtime.dispose();
@@ -467,7 +530,19 @@ describe.sequential("native AGY R1 capability contract", () => {
     const turnMappingDir = fs.mkdtempSync(path.join(root, "orchestrator-mapping-"));
     const store = new SessionStore(path.join(dataDir, "seam.db"));
     const profile = makeAgyProfile({
-      cliPath: fakeCli,
+      runtime: makeAgyNativeRuntime({
+        executable: managedCli.executable,
+        runtimeRoot: managedCli.runtimeRoot,
+        version: "agy fixture 1.1.28",
+        sha256: managedCli.sha256,
+        credentialScope: "antigravity-oauth:test",
+        cwd: root,
+        baseEnv: process.env,
+        approvedEnvironment: {
+          SEAM_AGY_CAPABILITY_FIXTURE_DIR: fixtureDir,
+          SEAM_AGY_CAPABILITY_INVOCATIONS: invocationLog,
+        },
+      }),
       dataDir: turnMappingDir,
       defaultModel: "Fixture Native Model",
       persistModelSelection: false,

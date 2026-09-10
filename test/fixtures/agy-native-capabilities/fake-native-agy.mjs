@@ -76,6 +76,7 @@ appendInvocation({
   mcpConfig: mcpConfig ?? null,
   jsonSchema: jsonSchema ?? null,
   args,
+  cwd: process.cwd(),
 });
 
 const envelope = (flag, value) => {
@@ -118,6 +119,25 @@ const server = http.createServer(async (request, response) => {
           }
         }
       }
+    }));
+    return;
+  }
+
+  if (request.url?.endsWith("/RetrieveUserQuotaSummary")) {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({
+      response: {
+        description: "Sanitized fixture quota",
+        groups: [{
+          displayName: "Fixture plan",
+          buckets: [{
+            bucketId: "fixture-weekly",
+            displayName: "Weekly",
+            window: "weekly",
+            remainingFraction: 0.75,
+          }],
+        }],
+      },
     }));
     return;
   }

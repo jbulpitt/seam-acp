@@ -19,7 +19,7 @@
  * agent picks up where it left off.
  */
 
-import { spawn, type ChildProcess, type ChildProcessByStdio } from "node:child_process";
+import { type ChildProcess, type ChildProcessByStdio } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fsSync from "node:fs";
@@ -55,10 +55,10 @@ import {
   type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
 import { AGENT_ADAPTER_VERSION, asLocalAdapter, type AgentProfile } from "../agent-profile.js";
+import { AgyNativeRuntime } from "../agy-native-runtime.js";
 import {
   manifestCatalogScope,
   manifestCatalogSource,
-  readCliVersion,
   type CatalogScope,
 } from "../model-catalog.js";
 import {
@@ -154,7 +154,10 @@ export async function prepareAgyMcpHome(
   const home = path.join(os.tmpdir(), "seam-agy-homes", sessionId);
   const gemini = path.join(home, ".gemini");
   const cfgDir = path.join(gemini, "config");
-  await fs.mkdir(cfgDir, { recursive: true });
+  await fs.mkdir(cfgDir, { recursive: true, mode: 0o700 });
+  await fs.chmod(home, 0o700);
+  await fs.chmod(gemini, 0o700);
+  await fs.chmod(cfgDir, 0o700);
   try {
     const ents = await fs.readdir(realGemini, { withFileTypes: true });
     for (const ent of ents) {
@@ -174,7 +177,7 @@ export async function prepareAgyMcpHome(
   } catch {
     /* optional userSettings */
   }
-  await fs.writeFile(path.join(cfgDir, "mcp_config.json"), `${buildAgyMcpConfigJson(servers)}\n`);
+  await fs.writeFile(path.join(cfgDir, "mcp_config.json"), `${buildAgyMcpConfigJson(servers)}\n`, { mode: 0o600 });
   return home;
 }
 /**
@@ -336,8 +339,8 @@ export function agyNativeCatalogScope(opts: AgyNativeCatalogScopeOptions): Catal
 }
 
 export function makeAgyProfile(opts: {
-  /** Override the agy binary location. Defaults to `agy` on PATH. */
-  cliPath?: string;
+  /** One verified launch identity shared by catalog, quota, turns and helpers. */
+  runtime: AgyNativeRuntime;
   /** Global managed MCP servers (playwright, …). Per-session seam-mcp arrives on newSession. */
   mcpServers?: McpServer[];
   /**
@@ -346,8 +349,6 @@ export function makeAgyProfile(opts: {
    * has set in `~/.gemini/antigravity-cli/settings.json`).
    */
   defaultModel?: string;
-  /** Non-secret semantic account/profile label shared with the exact runtime. */
-  credentialScope?: string;
   /**
    * seam-acp's own state directory. The agy profile stores its ACP→cascade
    * mapping here, separate from agy's `~/.gemini/antigravity-cli/`. Defaults
@@ -365,11 +366,11 @@ export function makeAgyProfile(opts: {
   /** Persist model picks into agy's process-global settings file. Defaults
    *  true for normal interactive sessions; isolated helpers must disable it. */
   persistModelSelection?: boolean;
-} = {}): AgentProfile {
-  const cli = opts.cliPath?.trim() || resolveAgyBinary();
+}): AgentProfile {
+  const runtime = opts.runtime;
   const defaultModel = opts.defaultModel ?? "antigravity";
   const catalogScope = agyNativeCatalogScope({
-    credentialScope: opts.credentialScope,
+    credentialScope: runtime.credentialScope,
     defaultModel,
     staticModels: opts.staticModels,
   });
@@ -386,7 +387,7 @@ export function makeAgyProfile(opts: {
         let models: ReadonlyArray<{ modelId: string; name: string; contextLimit?: number }>;
         if (opts.staticModels && opts.staticModels.length > 0) {
           const rows = opts.staticModels.some((model) => !model.contextLimit)
-            ? await getCatalog(cli).catch(() => [])
+            ? await getCatalog(runtime).catch(() => [])
             : [];
           const limits = new Map(
             rows.filter((row) => row.maxTokens).map((row) => [row.modelId, row.maxTokens])
@@ -396,7 +397,7 @@ export function makeAgyProfile(opts: {
             return contextLimit ? { ...model, contextLimit } : model;
           });
         } else {
-          const rows = await getCatalog(cli);
+          const rows = await getCatalog(runtime);
           models = [...rows.filter((row) => row.recommended), ...rows.filter((row) => !row.recommended)]
             .map((row) => ({
               modelId: row.modelId,
@@ -415,16 +416,18 @@ export function makeAgyProfile(opts: {
           adapterVersion: AGENT_ADAPTER_VERSION,
           source: opts.staticModels?.length ? "validated-manifest+agy-catalog" : "agy-language-server",
         }).fetch();
-        candidate.cliVersion = await readCliVersion(cli);
+        runtime.verify(process.cwd());
+        candidate.cliVersion = runtime.descriptor.provenance.version;
         return candidate;
       },
     },
     // agy bakes effort into the model choice (high/med/low model variants) —
     // there is no separate reasoning-effort knob, so the picker is suppressed.
     effort: { mechanism: "modelBaked", levels: [] },
+    runtime: runtime.descriptor,
     spawn() {
       return makeFakeAgyProcess(
-        cli,
+        runtime,
         mappingFile,
         defaultModel,
         opts.printTimeoutSeconds,
@@ -728,7 +731,7 @@ export function makeAgyProfile(opts: {
 type FakeProc = ChildProcessByStdio<Writable, Readable, Readable>;
 
 function makeFakeAgyProcess(
-  cli: string,
+  runtime: AgyNativeRuntime,
   mappingFile: string,
   defaultModel: string,
   printTimeoutSeconds?: number,
@@ -742,7 +745,7 @@ function makeFakeAgyProcess(
   let killed = false;
 
   const agent = new AgyAgent(
-    cli,
+    runtime,
     mappingFile,
     defaultModel,
     printTimeoutSeconds,
@@ -971,7 +974,7 @@ class AgyAgent implements Agent {
   private active?: ActiveRun;
 
   constructor(
-    private readonly cli: string,
+    private readonly runtime: AgyNativeRuntime,
     private readonly mappingFile: string,
     private readonly defaultModel: string,
     private readonly printTimeoutSeconds?: number,
@@ -1009,7 +1012,7 @@ class AgyAgent implements Agent {
     const mcpServers = params.mcpServers?.length ? params.mcpServers : this.defaultMcpServers;
     const mcpHome = await prepareAgyMcpHome(id, mcpServers);
     this.sessions.set(id, { cwd: params.cwd, maxStepIndex: -1, mcpServers, mcpHome });
-    const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
+    const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
     if (catalog.length === 0) {
       return { sessionId: id };
     }
@@ -1030,7 +1033,7 @@ class AgyAgent implements Agent {
       mcpServers,
       mcpHome,
     });
-    const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
+    const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
     if (catalog.length === 0) {
       return {};
     }
@@ -1048,7 +1051,7 @@ class AgyAgent implements Agent {
   async setSessionConfigOption(
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
-    const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
+    const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
     // Only the "model" selector is advertised; anything else is a no-op that
     // still echoes the current option set back per the ACP contract.
     if (params.configId !== "model" || typeof params.value !== "string") {
@@ -1115,7 +1118,7 @@ class AgyAgent implements Agent {
     const agyLogPath = await newSpawnLogPath();
     const agyStart = Date.now();
 
-    const catalog = await getCatalog(this.cli).catch(() => [] as AgyCatalogEntry[]);
+    const catalog = await getCatalog(this.runtime).catch(() => [] as AgyCatalogEntry[]);
     const selected = selectAgyTurnModel({
       catalog,
       sessionModelId: sess.modelId,
@@ -1166,12 +1169,11 @@ class AgyAgent implements Agent {
 
     if (process.env.AGY_PROFILE_DEBUG) {
       // eslint-disable-next-line no-console
-      console.error(`[agy] spawn ${this.cli} cwd=${sess.cwd} useStdin=${useStdin} args=${JSON.stringify(args)}`);
+      console.error(`[agy] spawning verified native runtime useStdin=${useStdin} argvCount=${args.length}`);
     }
-    const proc = spawn(this.cli, args, {
-      cwd: sess.cwd,
+    const proc = await this.runtime.spawn(args, sess.cwd, {
+      mcpHome: sess.mcpHome,
       stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
-      ...(sess.mcpHome ? { env: { ...process.env, HOME: sess.mcpHome } } : {}),
     });
 
     if (useStdin && proc.stdin) {
@@ -1214,7 +1216,7 @@ class AgyAgent implements Agent {
     });
     proc.once("error", (e) => {
       // eslint-disable-next-line no-console
-      console.error(`[agy] child spawn/process error:`, e);
+      console.error(`[agy] child spawn/process error code=${(e as NodeJS.ErrnoException).code ?? "unknown"}`);
       cancelAbort.abort();
       if (this.active === runRef) this.active = undefined;
     });
@@ -1970,24 +1972,6 @@ function transformAgyText(text: string, cwd: string): string {
   return text;
 }
 
-/**
- * Locate the agy binary. The official installer (`agy install`) puts it at
- * `~/.local/bin/agy` and updates the user's shell rc, but the bot often runs
- * under a daemon (systemd / pm2) where that PATH isn't loaded. Fall back to
- * the known install path so the profile works out of the box; let the user
- * override via `cliPath` if their install is elsewhere.
- */
-function resolveAgyBinary(): string {
-  const home = process.env.HOME ?? os.homedir();
-  const candidate = path.join(home, ".local/bin/agy");
-  try {
-    if (fsSync.statSync(candidate).isFile()) return candidate;
-  } catch {
-    /* fall through */
-  }
-  return "agy";
-}
-
 // ---------------------------------------------------------------------------
 // Model catalog
 // ---------------------------------------------------------------------------
@@ -2035,75 +2019,67 @@ export function parseAgyAcceptedModels(output: string): Set<string> {
  * deliberately invalid model exits non-zero; that exit is expected. Spawn,
  * timeout, and oversized-output failures return an empty set and never throw.
  */
-export async function fetchAgyAcceptedModels(cli: string): Promise<Set<string>> {
+export async function fetchAgyAcceptedModels(runtime: AgyNativeRuntime): Promise<Set<string>> {
+  const args = [
+      "-p",
+      "ok",
+      AGY_NO_SLASH_EXPANSION,
+      "--model",
+      "__seam_probe_invalid__",
+      "--print-timeout",
+      "15s",
+      "--dangerously-skip-permissions",
+    ];
   return new Promise((resolve) => {
-    let proc: ReturnType<typeof spawn>;
-    try {
-      proc = spawn(
-        cli,
-        [
-          "-p",
-          "ok",
-          AGY_NO_SLASH_EXPANSION,
-          "--model",
-          "__seam_probe_invalid__",
-          "--print-timeout",
-          "15s",
-          "--dangerously-skip-permissions",
-        ],
-        {
-          cwd: "/tmp",
-          stdio: ["ignore", "pipe", "pipe"],
-        }
-      );
-    } catch {
-      resolve(new Set());
-      return;
-    }
+    void runtime.spawn(args, "/tmp", { stdio: ["ignore", "pipe", "pipe"] })
+      .then((proc) => {
 
-    let output = "";
-    let settled = false;
-    const finish = (models: Set<string>): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      resolve(models);
-    };
-    const timeout = setTimeout(() => {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        /* already gone */
-      }
-      finish(new Set());
-    }, 15_000);
-    timeout.unref?.();
-    const capture = (chunk: Buffer | string): void => {
-      output += chunk.toString();
-      if (Buffer.byteLength(output) > 1_000_000) {
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          /* already gone */
-        }
-        finish(new Set());
-      }
-    };
-    proc.stdout?.on("data", capture);
-    proc.stderr?.on("data", capture);
-    proc.once("error", () => finish(new Set()));
-    proc.once("close", () => finish(parseAgyAcceptedModels(output)));
+        let output = "";
+        let settled = false;
+        const finish = (models: Set<string>): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          resolve(models);
+        };
+        const timeout = setTimeout(() => {
+          try {
+            proc.kill("SIGKILL");
+          } catch {
+            /* already gone */
+          }
+          finish(new Set());
+        }, 15_000);
+        timeout.unref?.();
+        const capture = (chunk: Buffer | string): void => {
+          output += chunk.toString();
+          if (Buffer.byteLength(output) > 1_000_000) {
+            try {
+              proc.kill("SIGKILL");
+            } catch {
+              /* already gone */
+            }
+            finish(new Set());
+          }
+        };
+        proc.stdout?.on("data", capture);
+        proc.stderr?.on("data", capture);
+        proc.once("error", () => finish(new Set()));
+        proc.once("close", () => finish(parseAgyAcceptedModels(output)));
+      })
+      .catch(() => resolve(new Set()));
   });
 }
 
-let acceptedModelsPromise: Promise<Set<string>> | null = null;
+const acceptedModelsPromises = new Map<string, Promise<Set<string>>>();
 
-function getAcceptedModels(cli: string): Promise<Set<string>> {
-  if (acceptedModelsPromise) return acceptedModelsPromise;
-  const p = fetchAgyAcceptedModels(cli)
+function getAcceptedModels(runtime: AgyNativeRuntime): Promise<Set<string>> {
+  const cached = acceptedModelsPromises.get(runtime.identityKey);
+  if (cached) return cached;
+  const p = fetchAgyAcceptedModels(runtime)
     .then((models) => {
       if (models.size === 0) {
-        acceptedModelsPromise = null;
+        acceptedModelsPromises.delete(runtime.identityKey);
         console.warn(
           "[agy] accepted-model probe returned no models — not caching; will retry"
         );
@@ -2111,12 +2087,12 @@ function getAcceptedModels(cli: string): Promise<Set<string>> {
       return models;
     })
     .catch((err) => {
-      acceptedModelsPromise = null;
+      acceptedModelsPromises.delete(runtime.identityKey);
       console.warn("[agy] accepted-model probe failed:", err);
       return new Set<string>();
     });
-  acceptedModelsPromise = p;
-  return acceptedModelsPromise;
+  acceptedModelsPromises.set(runtime.identityKey, p);
+  return p;
 }
 
 /** Keep only LS rows the CLI validator accepts, with fail-open guards. */
@@ -2185,11 +2161,12 @@ export function selectAgyTurnModel(opts: {
   return { entry };
 }
 
-let catalogRowsPromise: Promise<AgyCatalogEntry[]> | null = null;
+const catalogRowsPromises = new Map<string, Promise<AgyCatalogEntry[]>>();
 
-function getCatalogRows(cli: string): Promise<AgyCatalogEntry[]> {
-  if (catalogRowsPromise) return catalogRowsPromise;
-  const p = fetchAgyCatalog(cli)
+function getCatalogRows(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
+  const cached = catalogRowsPromises.get(runtime.identityKey);
+  if (cached) return cached;
+  const p = fetchAgyCatalog(runtime)
     .then((rows) => {
       // Don't PIN an empty result. A cold-start LS (or any transient empty
       // response) would otherwise poison this module-level cache for the whole
@@ -2197,25 +2174,25 @@ function getCatalogRows(cli: string): Promise<AgyCatalogEntry[]> {
       // agy session — direct /seam model AND the new-thread wizard both read it.
       // Only memoize a real catalog; reset so the next caller retries.
       if (rows.length === 0) {
-        catalogRowsPromise = null;
+        catalogRowsPromises.delete(runtime.identityKey);
         console.error("[agy] catalog fetch returned no usable models — not caching; will retry");
       }
       return rows;
     })
     .catch((err) => {
       // Don't pin the cache to an error — let the next caller retry.
-      catalogRowsPromise = null;
+      catalogRowsPromises.delete(runtime.identityKey);
       console.error("[agy] catalog fetch failed:", err);
       return [];
     });
-  catalogRowsPromise = p;
-  return catalogRowsPromise;
+  catalogRowsPromises.set(runtime.identityKey, p);
+  return p;
 }
 
-async function getCatalog(cli: string): Promise<AgyCatalogEntry[]> {
-  const rows = await getCatalogRows(cli);
+async function getCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
+  const rows = await getCatalogRows(runtime);
   if (rows.length === 0) return rows;
-  const accepted = await getAcceptedModels(cli);
+  const accepted = await getAcceptedModels(runtime);
   return filterAgyCatalogByAcceptedModels(rows, accepted);
 }
 
@@ -2293,7 +2270,7 @@ export function parseAgyQuotaSummary(json: UserQuotaSummaryResponse): AgyUsage {
 // Cache the usage snapshot briefly so repeated `/seam usage` calls don't pay
 // the ~5s LS spawn cost. 60s strikes a balance between freshness and snappiness.
 const USAGE_CACHE_TTL_MS = 60_000;
-let usageCache: { at: number; data: AgyUsage } | null = null;
+const usageCache = new Map<string, { at: number; data: AgyUsage }>();
 
 /**
  * Fetch the current user's Antigravity usage snapshot. Spawns a transient
@@ -2301,14 +2278,13 @@ let usageCache: { at: number; data: AgyUsage } | null = null;
  * parses the response. Cached for {@link USAGE_CACHE_TTL_MS} after a successful
  * call.
  */
-export async function fetchAgyUserStatus(cliPath?: string): Promise<AgyUsage> {
-  if (usageCache && Date.now() - usageCache.at < USAGE_CACHE_TTL_MS) {
-    return usageCache.data;
+export async function fetchAgyUserStatus(runtime: AgyNativeRuntime): Promise<AgyUsage> {
+  const cached = usageCache.get(runtime.identityKey);
+  if (cached && Date.now() - cached.at < USAGE_CACHE_TTL_MS) {
+    return cached.data;
   }
-  const cli = cliPath?.trim() || resolveAgyBinary();
   const logFile = await newSpawnLogPath();
-  const proc = spawn(cli, ["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], {
-    cwd: "/tmp",
+  const proc = await runtime.spawn(["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], "/tmp", {
     stdio: ["ignore", "ignore", "ignore"],
   });
   // Missing binary would otherwise emit unhandled 'error' and crash the process.
@@ -2332,7 +2308,7 @@ export async function fetchAgyUserStatus(cliPath?: string): Promise<AgyUsage> {
       if (res.ok) {
         const json = (await res.json()) as UserQuotaSummaryResponse;
         const data = parseAgyQuotaSummary(json);
-        usageCache = { at: Date.now(), data };
+        usageCache.set(runtime.identityKey, { at: Date.now(), data });
         return data;
       }
       lastStatus = res.status;
@@ -2346,13 +2322,12 @@ export async function fetchAgyUserStatus(cliPath?: string): Promise<AgyUsage> {
   }
 }
 
-async function fetchAgyCatalog(cli: string): Promise<AgyCatalogEntry[]> {
+async function fetchAgyCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEntry[]> {
   // Spawn a tiny agy turn just to bring the LS up. The "ok" prompt produces
   // a few tokens of throwaway output; the cost is acceptable given the result
   // is cached for the process lifetime.
   const logFile = await newSpawnLogPath();
-  const proc = spawn(cli, ["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], {
-    cwd: "/tmp",
+  const proc = await runtime.spawn(["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], "/tmp", {
     stdio: ["ignore", "ignore", "ignore"],
   });
   // Missing binary would otherwise emit unhandled 'error' and crash the process.

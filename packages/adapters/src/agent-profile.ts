@@ -52,10 +52,22 @@ export interface AdapterDescribe {
 }
 
 export interface AdapterRuntimeDescriptor {
+  /** Opaque, non-reversible identity of the complete private launch tuple. */
+  identity?: string;
   executable: string;
   argv: ReadonlyArray<string>;
   cwd: string;
   environment: Readonly<Record<string, string>>;
+  /** Allowlisted variable names; values are deliberately never inventoried. */
+  environmentKeys?: ReadonlyArray<string>;
+  /** SHA-256 of the ordered approved environment, never the values themselves. */
+  environmentFingerprint?: string;
+  /** How this descriptor maps onto the process actually advertised over ACP. */
+  topology?: "native-acp" | "virtual-acp-native-cli";
+  /** Managed root that contains content-addressed, non-writable releases. */
+  immutableRoot?: string;
+  /** Native AGY runs each child in the admitted session workspace. */
+  cwdPolicy?: "fixed" | "session";
   stateDir?: string;
   conversationDir?: string;
   credentialScope?: string;

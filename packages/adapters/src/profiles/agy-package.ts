@@ -27,6 +27,7 @@ import {
   type ManifestCatalogModel,
 } from "../model-catalog.js";
 import { redactProbeText, runBoundedProbe } from "../probe-process.js";
+import { verifyAgyManagedRuntimeArtifact, verifyAgyManagedRuntimeIdentity } from "../agy-native-runtime.js";
 
 /** Immutable upstream source reviewed for issue #228. */
 export const AGY_ACP_UPSTREAM_VERSION = "1.1.0";
@@ -74,6 +75,8 @@ export interface AgyPackageProfileOptions {
   agyVersion: string;
   /** Exact SHA-256 of the configured AGY_BIN. */
   agySha256: string;
+  /** Non-writable root containing `<sha256>/agy`; required in production. */
+  runtimeRoot?: string;
   defaultModel: string;
   /** Effective upstream wrapper state directory (`$HOME/.agy-acp` in v1.1.0). */
   stateDir: string;
@@ -675,9 +678,11 @@ export function verifyAgyWrapperArtifact(file: string, expectedSha256: string): 
 export function verifyAgyRuntimeIdentity(
   acpPath: string,
   agyBin: string,
-  expectedSha256: string
+  expectedSha256: string,
+  runtimeRoot?: string
 ): void {
-  verifyExecutableArtifact(agyBin, expectedSha256, "AGY_BIN");
+  if (runtimeRoot) verifyAgyManagedRuntimeArtifact(agyBin, runtimeRoot, expectedSha256);
+  else verifyExecutableArtifact(agyBin, expectedSha256, "AGY_BIN");
   const sibling = path.join(path.dirname(acpPath), process.platform === "win32" ? "agy.exe" : "agy");
   try {
     fs.accessSync(sibling, fs.constants.X_OK);
@@ -706,6 +711,9 @@ export function makeAgyPackageProfile(opts: AgyPackageProfileOptions): AgentProf
   if (!/^[a-f0-9]{64}$/.test(agySha256)) {
     throw new Error("AGY_SHA256 must be 64 lowercase hex characters");
   }
+  if (!opts.runtimeRoot && !opts.verifyRuntime) {
+    throw new Error("AGY_RUNTIME_ROOT is required for the production agy-package runtime");
+  }
   if (opts.wrapperVersion !== AGY_ACP_UPSTREAM_VERSION) {
     throw new Error(`AGY_ACP_VERSION must be pinned to ${AGY_ACP_UPSTREAM_VERSION}`);
   }
@@ -727,7 +735,21 @@ export function makeAgyPackageProfile(opts: AgyPackageProfileOptions): AgentProf
     throw new Error("AGY_ACP_STATE_DIR must equal the wrapper's effective host-local ~/.agy-acp directory");
   }
   const verify = opts.verifyWrapper ?? (() => verifyAgyWrapperArtifact(acpPath, opts.wrapperSha256));
-  const verifyRuntime = opts.verifyRuntime ?? (() => verifyAgyRuntimeIdentity(acpPath, agyBin, agySha256));
+  const verifyRuntime = opts.verifyRuntime ?? (() => {
+    if (opts.runtimeRoot) {
+      verifyAgyManagedRuntimeIdentity({
+        executable: agyBin,
+        runtimeRoot: opts.runtimeRoot,
+        sha256: agySha256,
+        version: agyVersion,
+        cwd,
+        env,
+      });
+      verifyAgyRuntimeIdentity(acpPath, agyBin, agySha256, opts.runtimeRoot);
+      return;
+    }
+    verifyAgyRuntimeIdentity(acpPath, agyBin, agySha256);
+  });
   const runtime: AdapterRuntimeDescriptor = {
     executable: acpPath,
     argv: [],
@@ -740,6 +762,7 @@ export function makeAgyPackageProfile(opts: AgyPackageProfileOptions): AgentProf
     stateDir,
     conversationDir: conversationsDir,
     credentialScope,
+    ...(opts.runtimeRoot ? { immutableRoot: path.normalize(opts.runtimeRoot) } : {}),
     provenance: {
       source: AGY_ACP_UPSTREAM_SOURCE,
       version: AGY_ACP_UPSTREAM_VERSION,

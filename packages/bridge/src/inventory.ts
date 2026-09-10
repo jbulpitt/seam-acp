@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { accessSync, constants } from "node:fs";
 import {
   AGENT_ADAPTER_VERSION,
+  makeAgyNativeRuntime,
   makeAgyPackageProfile,
   makeAgyProfile,
   makeClaudeProfile,
@@ -123,12 +124,13 @@ export function loadHostAdapters(
   const agyBin = env.AGY_BIN?.trim();
   const agyVersion = env.AGY_VERSION?.trim();
   const agySha256 = env.AGY_SHA256?.trim();
+  const agyRuntimeRoot = env.AGY_RUNTIME_ROOT?.trim();
   const agyDefaultModel = env.AGY_DEFAULT_MODEL?.trim();
   const agyModels = parseConfiguredModels(env.AGY_MODELS);
   const agyNativeBin = env.AGY_CLI_PATH?.trim() || env.AGY_OLD_CLI_PATH?.trim() || agyBin;
   const agyEnabled = env.AGY_PACKAGE_ENABLED === "true";
   const agyRiskAcknowledged = env.AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED === "true";
-  const factories: Array<{ id: string; bin: string; make: () => AgentAdapter }> = [
+  const factories: Array<{ id: string; bin: string; make: () => AgentAdapter; strict?: boolean }> = [
     {
       id: "copilot",
       bin: copilotCmd,
@@ -163,7 +165,7 @@ export function loadHostAdapters(
           : {}),
       }),
     },
-    ...(agyEnabled && agyAcpPath && agyBin && agyVersion && agySha256 && agyDefaultModel && agyRiskAcknowledged ? [{
+    ...(agyEnabled && agyAcpPath && agyBin && agyVersion && agySha256 && agyRuntimeRoot && path.isAbsolute(agyRuntimeRoot) && agyDefaultModel && agyRiskAcknowledged ? [{
       id: "agy-package",
       bin: agyAcpPath,
       make: () => makeAgyPackageProfile({
@@ -171,6 +173,7 @@ export function loadHostAdapters(
         agyBin,
         agyVersion,
         agySha256,
+        runtimeRoot: agyRuntimeRoot,
         defaultModel: agyDefaultModel,
         stateDir: env.AGY_ACP_STATE_DIR ?? path.join(env.HOME ?? os.homedir(), ".agy-acp"),
         conversationsDir: env.AGY_CONVERSATIONS_DIR ?? path.join(env.HOME ?? os.homedir(), ".gemini", "antigravity-cli", "conversations"),
@@ -181,13 +184,21 @@ export function loadHostAdapters(
         permissionRiskAcknowledged: true,
       }),
     }] : []),
-    ...((env.AGY_ENABLED === "true" || env.AGY_OLD_ROLLBACK_ENABLED === "true") && agyNativeBin && path.isAbsolute(agyNativeBin) && agyDefaultModel ? [{
+    ...((env.AGY_ENABLED === "true" || env.AGY_OLD_ROLLBACK_ENABLED === "true") && agyNativeBin && path.isAbsolute(agyNativeBin) && agyDefaultModel && agyVersion && agySha256 && agyRuntimeRoot && path.isAbsolute(agyRuntimeRoot) ? [{
       id: "agy",
       bin: agyNativeBin,
+      strict: true,
       make: () => makeAgyProfile({
-        cliPath: agyNativeBin,
+        runtime: makeAgyNativeRuntime({
+          executable: agyNativeBin,
+          runtimeRoot: agyRuntimeRoot,
+          version: agyVersion,
+          sha256: agySha256,
+          credentialScope: env.AGY_CREDENTIAL_SCOPE ?? "antigravity-oauth:default",
+          cwd: options.cwd ?? process.cwd(),
+          baseEnv: env,
+        }),
         defaultModel: agyDefaultModel,
-        credentialScope: env.AGY_CREDENTIAL_SCOPE ?? "antigravity-oauth:default",
         staticModels: agyModels,
       }),
     }] : []),
@@ -222,8 +233,9 @@ export function loadHostAdapters(
     if (!exists(f.bin)) continue;
     try {
       out.set(f.id, f.make());
-    } catch {
+    } catch (error) {
       // Factory threw (missing optional deps) — skip.
+      if (f.strict) throw error;
     }
   }
   return out;

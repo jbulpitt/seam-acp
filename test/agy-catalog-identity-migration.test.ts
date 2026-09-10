@@ -21,11 +21,14 @@ import { ModelCatalogService } from "../packages/core/src/core/model-catalog/ser
 import { ModelCatalogStore } from "../packages/core/src/core/model-catalog/store.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import { loadHostAdapters } from "../packages/bridge/src/inventory.js";
+import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
 
 const logger = pino({ level: "silent" }) as unknown as Logger;
 const dirs: string[] = [];
+const cleanups: Array<() => void> = [];
 
 afterEach(() => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -227,15 +230,27 @@ describe("AGY native semantic catalog scope", () => {
     expect(agyNativeCatalogScope({ ...common, staticModels: common.staticModels.slice(0, 1) }).fingerprint)
       .not.toBe(direct.fingerprint);
 
-    const profile = makeAgyProfile({ cliPath: "/bin/false", ...common });
+    const managed = createManagedAgyFixture({ credentialScope: common.credentialScope });
+    cleanups.push(managed.cleanup);
+    const profile = makeAgyProfile({
+      runtime: managed.runtime,
+      defaultModel: common.defaultModel,
+      staticModels: common.staticModels,
+    });
     expect(await profile.catalog.scope()).toEqual(direct);
     expect((await profile.catalog.fetch()).scope).toEqual(direct);
 
     const bridged = loadHostAdapters("/bin/false", {
       exists: () => true,
       env: {
+        HOME: os.homedir(),
+        PATH: process.env.PATH,
         AGY_ENABLED: "true",
-        AGY_CLI_PATH: "/bin/false",
+        AGY_CLI_PATH: managed.executable,
+        AGY_BIN: managed.executable,
+        AGY_RUNTIME_ROOT: managed.runtimeRoot,
+        AGY_VERSION: "agy-test 1.0",
+        AGY_SHA256: managed.sha256,
         AGY_DEFAULT_MODEL: common.defaultModel,
         AGY_CREDENTIAL_SCOPE: common.credentialScope,
         AGY_MODELS: "gemini-high:Gemini High,claude-thinking:Claude Thinking",

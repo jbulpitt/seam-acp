@@ -1,7 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
+import { scheduledAdmissionFixture, syntheticScheduleExecution } from "./scheduled-admission-fixture.js";
 import { ScheduledPromptManager } from "../packages/core/src/core/scheduled-prompts/manager.js";
 import type { SessionStore } from "../packages/core/src/core/session-store.js";
 import type { ScheduledPrompt } from "../packages/core/src/core/scheduled-prompts/types.js";
+import { scheduledOccurrenceKey, type ScheduledOccurrenceKey } from "../packages/core/src/core/scheduled-prompts/occurrence-store.js";
 
 const silentLogger = {
   info() {},
@@ -44,6 +46,7 @@ function makeRow(over: Partial<ScheduledPrompt> = {}): ScheduledPrompt {
 function makeStore(row: ScheduledPrompt) {
   const upserts: ScheduledPrompt[] = [];
   const store = {
+    scheduledOccurrences: scheduledAdmissionFixture(),
     getScheduled: (id: string) => (id === row.id ? { ...row } : null),
     upsertScheduled: (s: ScheduledPrompt) => {
       upserts.push(s);
@@ -60,7 +63,7 @@ describe("ScheduledPromptManager overlap guard (D3)", () => {
     const { store } = makeStore(row);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    const manager = new ScheduledPromptManager({
+    const manager = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution,
       store,
       onFire: async () => gate,
       logger: silentLogger,
@@ -82,9 +85,11 @@ describe("ScheduledPromptManager overlap guard (D3)", () => {
     const { store, upserts } = makeStore(row);
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
-    const onFire = vi.fn(async () => { await gate; });
+    const onFire = vi.fn(async (_id: string, key: ScheduledOccurrenceKey) => {
+      await gate; store.scheduledOccurrences.settle(key.id);
+    });
 
-    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
+    const manager = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silentLogger });
     const fire = (manager as unknown as { fire(id: string): Promise<void> }).fire.bind(manager);
 
     // First fire enters and suspends on the gate (onFire called once, id marked
@@ -106,33 +111,74 @@ describe("ScheduledPromptManager overlap guard (D3)", () => {
     const row = makeRow();
     const { store } = makeStore(row);
     const onFire = vi
-      .fn<[string], Promise<void>>()
+      .fn<(id: string) => Promise<void>>()
       .mockRejectedValueOnce(new Error("boom"))
       .mockResolvedValueOnce(undefined);
 
-    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
-    const fire = (manager as unknown as { fire(id: string): Promise<void> }).fire.bind(manager);
-
-    await fire(row.id); // rejects internally, guard released in finally
-    await fire(row.id); // not blocked by a stuck guard
+    const manager = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silentLogger });
+    const fire = (manager as unknown as { fire(id: string, key: ScheduledOccurrenceKey): Promise<void> }).fire.bind(manager);
+    const key = scheduledOccurrenceKey(row.id);
+    await fire(row.id, key); // rejected callback retains this exact occurrence
+    expect(store.scheduledOccurrences.pending()).toHaveLength(1);
+    await fire(row.id, key); // same occurrence recovery is not blocked by a stuck guard
     expect(onFire).toHaveBeenCalledTimes(2);
   });
 });
 
 describe("ScheduledPromptManager.runNow", () => {
+  it("keys cron callbacks by the armed slot while manual fires remain distinct", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-09-09T00:00:00.000Z"));
+    const row = makeRow({ timezone: "UTC" });
+    const { store } = makeStore(row);
+    const onFire = vi.fn(async (_id: string, occurrence: ScheduledOccurrenceKey) => {
+      store.scheduledOccurrences.settle(occurrence.id);
+    });
+    const manager = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silentLogger });
+    try {
+      manager.start(); await manager.runNow(row.id);
+      await vi.advanceTimersByTimeAsync(60000);
+      await vi.advanceTimersByTimeAsync(60000);
+      expect(onFire.mock.calls.map(c => c[1])).toEqual([
+        { id: expect.stringMatching(/^scheduled-/), scheduledFor: null },
+        { id: expect.stringMatching(/^scheduled-/), scheduledFor: "2026-09-09T00:01:00.000Z" },
+        { id: expect.stringMatching(/^scheduled-/), scheduledFor: "2026-09-09T00:02:00.000Z" },
+      ]);
+      expect(new Set(onFire.mock.calls.map(c => (c[1] as { id: string }).id)).size).toBe(3);
+    } finally { manager.stop(); vi.useRealTimers(); }
+  });
   it("invokes onFire and does not require the row to be enabled", async () => {
     const row = makeRow({ enabled: false, cron: "0 9 * * *" });
     const { store } = makeStore(row);
     const onFire = vi.fn(async () => {});
-    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
+    const manager = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silentLogger });
     await manager.runNow(row.id);
     expect(onFire).toHaveBeenCalledTimes(1);
-    expect(onFire).toHaveBeenCalledWith(row.id);
+    expect(onFire).toHaveBeenCalledWith(row.id, { id: expect.stringMatching(/^scheduled-/), scheduledFor: null });
     manager.stop();
   });
 });
 
 describe("ScheduledPromptManager catch-up", () => {
+  it.each(['cron', 'catch-up'] as const)("does not consume a %s slot if durable admission itself fails", async trigger => {
+    const due = '2026-09-09T00:01:00.000Z';
+    const row = makeRow({ nextRunUtc: due });
+    const { store } = makeStore(row);
+    const onFire = vi.fn(async () => {});
+    vi.spyOn(store.scheduledOccurrences, 'reserve').mockImplementation(() => { throw new Error('synthetic admission write failure'); });
+    const manager = new ScheduledPromptManager({ store, onFire, resolveExecution: syntheticScheduleExecution, logger: silentLogger });
+    try {
+      if (trigger === 'cron') {
+        (manager as any).nextDue.set(row.id, due);
+        (manager as any).onCronTick(row.id);
+      } else manager.start();
+      await manager.drain();
+      expect(onFire).not.toHaveBeenCalled();
+      expect(row.nextRunUtc).toBe(due);
+      expect(row.lastStatus).toBe('error: scheduled occurrence admission failed');
+      expect(store.scheduledOccurrences.pending()).toEqual([]);
+    } finally { manager.stop(); }
+  });
+
   it("fires once on start when nextRunUtc is in the past, even far outside catchupSeconds", async () => {
     const row = makeRow({
       cron: "0 9 * * *",
@@ -141,7 +187,7 @@ describe("ScheduledPromptManager catch-up", () => {
     });
     const { store } = makeStore(row);
     const onFire = vi.fn(async () => {});
-    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
+    const manager = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silentLogger });
     manager.start();
     await vi.waitFor(() => expect(onFire).toHaveBeenCalledTimes(1));
     manager.stop();
@@ -154,7 +200,7 @@ describe("ScheduledPromptManager catch-up", () => {
     });
     const { store } = makeStore(row);
     const onFire = vi.fn(async () => {});
-    const manager = new ScheduledPromptManager({ store, onFire, logger: silentLogger });
+    const manager = new ScheduledPromptManager({ resolveExecution: syntheticScheduleExecution, store, onFire, logger: silentLogger });
     manager.start();
     await new Promise((r) => setTimeout(r, 30));
     expect(onFire).not.toHaveBeenCalled();

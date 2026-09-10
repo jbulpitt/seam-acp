@@ -1,0 +1,24 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "packages/adapters/src/**/*.ts",
+    "packages/core/src/**/*.ts",
+    "packages/bridge/src/**/*.ts",
+    "test/restart-attempt.test.ts",
+    "test/restart-dispatch-lifecycle.test.ts",
+    "test/restart-inbound-lifecycle.test.ts",
+    "test/restart-scheduled-lifecycle.test.ts",
+    "test/scheduled-activity.test.ts",
+    "test/commands.test.ts",
+    "test/scheduled-manager.test.ts",
+    "test/scheduled-attachment-removal.test.ts",
+    "test/shutdown-quiesce.test.ts",
+    "test/shutdown-manager-drain.test.ts",
+    "test/channel-queue-recovery.test.ts",
+    "test/turn-resume-inject.test.ts",
+    "test/turn-resume-flow.test.ts",
+    "test/session-router-idle-reaper.test.ts",
+    "test/durability-prereqs.test.ts",
+    "test/inbox-interrupt.test.ts"
+  ]
+}

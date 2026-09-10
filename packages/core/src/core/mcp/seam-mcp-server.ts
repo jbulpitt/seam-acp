@@ -54,6 +54,7 @@ import type {
   ModelMetadataQuery,
   ModelMetadataQueryResult,
 } from "../model-metadata/types.js";
+import { scheduledActivityLine, type ScheduledActivitySnapshot } from "../scheduled-prompts/activity.js";
 import {
   parseSince,
   type ReadMessagesInput,
@@ -209,6 +210,8 @@ export interface SeamMcpServerDeps {
    * discovery is unsupported on this deployment.
    */
   listThreads?: (record: SessionRecord) => Promise<ThreadEntry[]>;
+  /** Token-scoped work metadata, separate from thread busy and global counters. */
+  getScheduledWork?: (record: SessionRecord) => ScheduledActivitySnapshot;
   /** Resolve one target thread. The tool independently enforces same-channel scope. */
   resolveThread?: (threadId: string) => SessionRecord | null | undefined;
   /** Authoritative platform existence check for an addressed thread. Undefined
@@ -2722,7 +2725,8 @@ export class SeamMcpServer {
     }
 
     const entries = await this.deps.listThreads(caller);
-    if (entries.length === 0) {
+    const scheduled = this.deps.getScheduledWork?.(caller);
+    if (entries.length === 0 && !scheduled) {
       return textResult("No threads found in your channel.");
     }
 
@@ -2750,6 +2754,15 @@ export class SeamMcpServer {
           (cfg ? `\n    identity: ${cfg}${t.cwd ? ` @ ${t.cwd}` : ""}` : "") +
           `\n    last active ${formatLocalTime(t.lastActivityUtc)}`
       );
+    }
+    if (scheduled) {
+      // Defense in depth: only addressable current siblings from the already
+      // scoped discovery result. Never accept a foreign thread from this hook.
+      const visible = scheduled.entries.filter(w => w.platform === caller.platform &&
+        w.parentRef === caller.parentRef && entries.some(t => t.id === w.channelRef && t.status !== "gone"));
+      lines.push("", `Scheduled activity (separate from busy): ${visible.length} in this channel; ${scheduled.total} bot-wide.`,
+        ...visible.map(scheduledActivityLine),
+        `${Math.max(0, scheduled.total - visible.length)} occurrence(s) outside this visible scope; channel idleness is not global idleness.`);
     }
     lines.push(
       "",

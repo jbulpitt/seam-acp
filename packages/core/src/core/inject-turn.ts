@@ -104,6 +104,19 @@ export interface InjectTurnOptions {
    */
   onSession?: (sessionId: string) => void | Promise<void>;
 
+  /** Durable owner hooks (#250). No best-effort writes: a failure prevents
+   * prompt submission/settlement. Outcome is captured before isolated cleanup.
+   * An obsolete/suspended owner may neither forward files nor delete history. */
+  lifecycle?: {
+    isCurrent(): boolean;
+    onRuntime?(pid: number | undefined, providerIdentity?: string): void;
+    beforePrompt(): void;
+    onOutcome(result: InjectTurnResult): void;
+    /** Read-only attribution hook before isolated disposal, including failures. */
+    onCleanup?(): void;
+    mayDeleteSession(): boolean;
+  };
+
   /**
    * Isolated-run resume (#76): `loadSession(resumeSessionId)` instead of
    * `newSession()`. The id is the one persisted on the ledger at the

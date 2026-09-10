@@ -7,6 +7,7 @@ import type { SessionStore } from "../packages/core/src/core/session-store.js";
 import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const runtimeState = vi.hoisted(() => ({
+  failLoad: false,
   instances: [] as Array<{
     busy: boolean;
     lastActivityAtMs: number;
@@ -36,12 +37,15 @@ vi.mock("../packages/core/src/agents/agent-runtime.js", async (importOriginal) =
       modelOverride?: string;
       effortOverride?: string;
       async start(): Promise<void> {}
+      supportsSessionLoad(): boolean { return true; }
       markActivity(): void {
         this.lastActivityAtMs = Date.now();
       }
       async loadSession(opts: { sessionId: string }): Promise<void> {
         this.loadCalls.push({ sessionId: opts.sessionId });
+        if (runtimeState.failLoad) throw new Error("synthetic session unavailable");
       }
+      getSessionInfo() { return { sessionId: this.loadCalls.at(-1)?.sessionId ?? `new-${runtimeState.instances.length}` }; }
       async newSession(): Promise<{ sessionId: string }> {
         this.newCalls += 1;
         return { sessionId: `new-${runtimeState.instances.length}` };
@@ -106,9 +110,38 @@ function makeRouter(record: SessionRecord): SessionRouter {
 
 beforeEach(() => {
   runtimeState.instances.length = 0;
+  runtimeState.failLoad = false;
 });
 
 describe("SessionRouter idle runtime reaping", () => {
+  it("strict recovery never replaces a different nonempty thread session", async () => {
+    const record = makeRecord();
+    const router = makeRouter(record);
+    await expect(router.getOrStartRuntime(record, { resumeSessionId: "dispatch-session" })).rejects.toThrow(/different ACP/);
+    expect(runtimeState.instances).toHaveLength(0);
+    expect(record.acpSessionId).toBe("acp-durable-1");
+  });
+
+  it("strict recovery verifies the warm runtime as well as the thread row", async () => {
+    const record = makeRecord();
+    const router = makeRouter(record);
+    await router.getOrStartRuntime(record);
+    runtimeState.instances[0]!.loadCalls[0]!.sessionId = "warm-other-session";
+    await expect(router.getOrStartRuntime(record, { resumeSessionId: record.acpSessionId })).rejects.toThrow(/cached runtime/);
+    expect(runtimeState.instances[0]!.newCalls).toBe(0);
+    await router.disposeAll();
+  });
+
+  it("strict load failure disposes the replacement, never falls back to newSession", async () => {
+    const record = makeRecord();
+    const router = makeRouter(record);
+    runtimeState.failLoad = true;
+    await expect(router.getOrStartRuntime(record, { resumeSessionId: record.acpSessionId })).rejects.toThrow(/session unavailable/);
+    expect(runtimeState.instances[0]!.newCalls).toBe(0);
+    expect(runtimeState.instances[0]!.disposed).toBe(true);
+    expect(record.acpSessionId).toBe("acp-durable-1");
+    expect(router.hasRuntime(record.id)).toBe(false);
+  });
   it("retires only the warm process and resumes the same durable ACP session", async () => {
     const record = makeRecord();
     const router = makeRouter(record);

@@ -39,6 +39,25 @@ Treat the redeploy as successful only after the PID changes, the sentinel is
 gone, and `/health` responds; the fallback line alone is not evidence of a
 crash.
 
+### Supervisor stop ordering
+
+`seam-acp.service` uses `KillMode=mixed` so systemd sends the initial SIGTERM
+only to Seam's main process. That gives Seam an ordering boundary in which to
+persist its restart cutoff before agent-child teardown errors can be processed.
+After the main process exits, or when the stop timeout expires, the explicitly
+pinned `FinalKillSignal=SIGKILL` and `SendSIGKILL=yes` remove any remaining
+processes in the service cgroup. `TimeoutStopSec` remains 120 seconds; the
+application's five-second hard-exit fallback is unchanged.
+
+This policy was checked in ten disposable, zero-provider transient-unit trials.
+The `KillMode=control-group` control produced a child-error-before-cutoff
+counterexample and a premature terminal/report path. The otherwise identical
+`KillMode=mixed` trials persisted the cutoff first, produced no premature
+terminal/report, and bounded teardown even with a deliberately hung child.
+This is supervisor-only evidence: it does not certify application shutdown
+ordering, provider-session recovery, schedule admission, or end-to-end report
+delivery. Those gates must be verified against the exact application release.
+
 Read-only status and logs:
 
 ```bash

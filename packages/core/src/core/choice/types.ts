@@ -121,7 +121,12 @@ export interface ChoiceCard {
   ingestCors: string[] | null;
 }
 
-export type ChoiceResultStatus = "pending" | "ok" | "missing" | "error";
+/**
+ * `admitting` is durable but not yet runnable. HTTP ingest writes this state
+ * before publishing the dispatch artifact, then advances it to `pending`.
+ * A worker may still win that tiny post-rename window and finish it directly.
+ */
+export type ChoiceResultStatus = "admitting" | "pending" | "ok" | "missing" | "error";
 
 export interface ChoiceResultRow {
   dispatchId: string;

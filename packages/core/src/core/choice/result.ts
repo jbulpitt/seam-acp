@@ -4,6 +4,7 @@
  */
 import type { SessionStore } from "../session-store.js";
 import type { Logger } from "../../lib/logger.js";
+import { dispatchArtifactState } from "../dispatch/types.js";
 
 export type JsonSchema = {
   type?: string | string[];
@@ -122,6 +123,52 @@ export class ChoiceResultHub {
     this.logger = opts.logger;
   }
 
+  /**
+   * Durably register the result identity and exact schema before its dispatch
+   * can become runnable. `admitting` lets boot recovery distinguish a crash
+   * before publication from an ordinary in-flight job without replaying work.
+   */
+  beginAdmission(opts: { dispatchId: string; choiceId: string; schema: unknown }): Promise<unknown> {
+    this.store.insertChoiceResult({
+      dispatchId: opts.dispatchId,
+      choiceId: opts.choiceId,
+      status: "admitting",
+      body: null,
+      error: null,
+      schema: opts.schema,
+      createdUtc: new Date().toISOString(),
+      finishedUtc: null,
+    });
+    try {
+      return this.expect(opts);
+    } catch (err) {
+      this.store.finishChoiceResult(
+        opts.dispatchId,
+        "error",
+        null,
+        "ingest result waiter registration failed"
+      );
+      throw err;
+    }
+  }
+
+  /** Acknowledge that enqueue atomically published the dispatch artifact. */
+  publishAdmission(dispatchId: string): void {
+    this.store.publishChoiceResult(dispatchId);
+  }
+
+  /** Compensate a publication error without exposing the underlying cause. */
+  failAdmission(dispatchId: string): void {
+    const message = "dispatch admission failed before publication";
+    const changed = this.store.finishChoiceResult(dispatchId, "error", null, message);
+    const w = this.waiters.get(dispatchId);
+    if (changed && w && !w.settled) {
+      w.settled = true;
+      w.reject(new Error(message));
+    }
+    this.unbind(dispatchId);
+  }
+
   expect(opts: { dispatchId: string; choiceId: string; schema: unknown }): Promise<unknown> {
     const existing = this.waiters.get(opts.dispatchId);
     if (existing && !existing.settled) {
@@ -210,10 +257,17 @@ export class ChoiceResultHub {
   ): { ok: true; dispatchId: string } | { ok: false; error: string } {
     const w = this.waiters.get(dispatchId);
     const row = this.store.getChoiceResult(dispatchId);
-    const schema = w?.schema ?? row?.schema ?? null;
+    if (!row) {
+      return { ok: false, error: "No admitted ingest result exists for this turn." };
+    }
     if (row?.status === "ok") {
       return { ok: false, error: "A result was already submitted for this turn (first call wins)." };
     }
+    if (row.status !== "admitting" && row.status !== "pending") {
+      return { ok: false, error: "This ingest result is already terminal." };
+    }
+    // The durable schema is authoritative across waiter loss/restart.
+    const schema = row.schema;
     const checked = validateAgainstSchema(schema, value);
     if (!checked.ok) return checked;
     this.store.finishChoiceResult(dispatchId, "ok", value, null);
@@ -282,6 +336,63 @@ export class ChoiceResultHub {
       if (id === dispatchId) this.channelToDispatch.delete(ch);
     }
   }
+}
+
+export interface InterruptedAdmissionReconcileResult {
+  inspected: number;
+  published: number;
+  failed: number;
+  deferred: number;
+  truncated: boolean;
+}
+
+/**
+ * Repair the only cross-resource crash window in HTTP admission. No artifact
+ * means publication never happened and the row is terminalized. Any exact
+ * pending/running/done artifact proves publication, so the row becomes the
+ * ordinary `pending` lifecycle owner; this pass never executes or requeues it.
+ */
+export async function reconcileInterruptedChoiceAdmissions(opts: {
+  store: SessionStore;
+  logger: Logger;
+  dataDir: string;
+  limit?: number;
+  artifactState?: (dataDir: string, dispatchId: string) => Promise<"pending" | "running" | "done" | null>;
+}): Promise<InterruptedAdmissionReconcileResult> {
+  const limit = Math.max(1, Math.floor(opts.limit ?? 500));
+  const rows = opts.store.listAdmittingChoiceResults(limit + 1);
+  const truncated = rows.length > limit;
+  const inspect = rows.slice(0, limit);
+  const stateFor = opts.artifactState ?? dispatchArtifactState;
+  const result: InterruptedAdmissionReconcileResult = {
+    inspected: 0,
+    published: 0,
+    failed: 0,
+    deferred: 0,
+    truncated,
+  };
+  for (const row of inspect) {
+    result.inspected++;
+    try {
+      const state = await stateFor(opts.dataDir, row.dispatchId);
+      if (state) {
+        if (opts.store.publishChoiceResult(row.dispatchId)) result.published++;
+      } else if (
+        opts.store.finishChoiceResult(
+          row.dispatchId,
+          "error",
+          null,
+          "ingest admission interrupted before dispatch publication"
+        )
+      ) {
+        result.failed++;
+      }
+    } catch (err) {
+      result.deferred++;
+      opts.logger.warn({ err, dispatchId: row.dispatchId }, "ingest admission recovery deferred");
+    }
+  }
+  return result;
 }
 
 export function parseResultFence(content: string): { ok: true; value: unknown } | { ok: false; error: string } {

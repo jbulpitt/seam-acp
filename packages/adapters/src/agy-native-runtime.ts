@@ -16,6 +16,7 @@ const SAFE_ENV_KEYS = [
 const VERSION_TIMEOUT_MS = 5_000;
 const VERSION_OUTPUT_LIMIT = 16_384;
 const VERIFICATION_CACHE_LIMIT = 32;
+const SNAPSHOT_CACHE_LIMIT = 4;
 
 export interface AgyNativeRuntimeOptions {
   executable: string;
@@ -57,6 +58,14 @@ interface VerifiedSnapshot extends VerificationEntry {
   argvPrefix: string[];
   close(): void;
 }
+
+interface CachedSnapshot {
+  fd: number;
+  executable: string;
+  argvPrefix: string[];
+}
+
+const snapshotCache = new Map<string, CachedSnapshot>();
 
 const NODE_FD_MODULE_LOADER = [
   "import fs from 'node:fs';",
@@ -173,6 +182,51 @@ function fdExecutable(fd: number): string {
   throw new Error("native AGY requires descriptor-bound executable launch support");
 }
 
+function duplicateCachedSnapshot(
+  verified: VerificationEntry,
+  cached: CachedSnapshot,
+): VerifiedSnapshot {
+  const fd = fs.openSync(fdExecutable(cached.fd), fs.constants.O_RDONLY);
+  let closed = false;
+  return {
+    ...verified,
+    digest: verified.digest,
+    fd,
+    executable: cached.executable,
+    argvPrefix: [...cached.argvPrefix],
+    close() {
+      if (closed) return;
+      closed = true;
+      fs.closeSync(fd);
+    },
+  };
+}
+
+function retainSnapshot(
+  digest: string,
+  snapshot: CachedSnapshot,
+  verified: VerificationEntry,
+): VerifiedSnapshot {
+  const prior = snapshotCache.get(digest);
+  if (prior) fs.closeSync(prior.fd);
+  snapshotCache.delete(digest);
+  snapshotCache.set(digest, snapshot);
+  while (snapshotCache.size > SNAPSHOT_CACHE_LIMIT) {
+    const oldestDigest = snapshotCache.keys().next().value as string | undefined;
+    if (!oldestDigest) break;
+    const oldest = snapshotCache.get(oldestDigest);
+    snapshotCache.delete(oldestDigest);
+    if (oldest) fs.closeSync(oldest.fd);
+  }
+  try {
+    return duplicateCachedSnapshot(verified, snapshot);
+  } catch (error) {
+    snapshotCache.delete(digest);
+    fs.closeSync(snapshot.fd);
+    throw error;
+  }
+}
+
 /**
  * Snapshot the candidate into a private file, hash those exact bytes, then
  * unlink the name while retaining a read-only descriptor. The configured path
@@ -186,6 +240,17 @@ function openVerifiedSnapshot(
   expectedSha256: string,
 ): VerifiedSnapshot {
   const verified = verifyAgyManagedRuntimeArtifact(executable, runtimeRoot, expectedSha256);
+  const retained = snapshotCache.get(expectedSha256);
+  if (retained) {
+    snapshotCache.delete(expectedSha256);
+    snapshotCache.set(expectedSha256, retained);
+    try {
+      return duplicateCachedSnapshot(verified, retained);
+    } catch {
+      snapshotCache.delete(expectedSha256);
+      try { fs.closeSync(retained.fd); } catch { /* already unavailable */ }
+    }
+  }
   const bytes = fs.readFileSync(executable);
   const sourceDigest = createHash("sha256").update(bytes).digest("hex");
   if (sourceDigest !== expectedSha256) {
@@ -211,6 +276,9 @@ function openVerifiedSnapshot(
     if (digest !== expectedSha256) {
       throw new Error("AGY executable snapshot sha256 does not match the configured artifact");
     }
+    // Validate descriptor execution support even for the Node-only fixture
+    // loader branch. Production AGY is an ELF binary and executes fd 3 itself.
+    fdExecutable(fd);
     const nodeFixture = bytes.subarray(0, 64).toString("utf8").startsWith("#!/usr/bin/env node\n");
     const executableFd = nodeFixture ? process.execPath : fdExecutable(3);
     const argvPrefix = nodeFixture
@@ -220,19 +288,11 @@ function openVerifiedSnapshot(
     fs.rmdirSync(dir);
     const ownedFd = fd;
     fd = undefined;
-    let closed = false;
-    return {
-      ...verified,
-      digest,
+    return retainSnapshot(digest, {
       fd: ownedFd,
       executable: executableFd,
       argvPrefix,
-      close() {
-        if (closed) return;
-        closed = true;
-        fs.closeSync(ownedFd);
-      },
-    };
+    }, verified);
   } catch (error) {
     if (fd !== undefined) fs.closeSync(fd);
     try { fs.unlinkSync(snapshotPath); } catch { /* absent or already unlinked */ }

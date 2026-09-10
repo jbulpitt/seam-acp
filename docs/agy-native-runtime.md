@@ -19,19 +19,29 @@ writable by the Seam service user. The executable must be a regular,
 non-symlink file. These layout checks are policy and operator-error defenses;
 they are not the native check-to-use guarantee.
 
-For every native launch, Seam reads the candidate into a fresh mode-0700 private
-directory, writes a mode-0500 snapshot, opens it read-only, hashes the bytes
-from that descriptor, and unlinks the snapshot before any child can run. The
-bounded `--version` probe and real child both receive that descriptor as fd 3;
-Linux executes `/proc/self/fd/3` and macOS uses `/dev/fd/3`. The configured
-pathname is never executed after verification. Renaming or replacing the
-configured root after preparation therefore cannot substitute different bytes.
-Unsupported descriptor-launch platforms fail closed.
+For the first use of an artifact digest in a process, Seam reads the candidate
+into a fresh mode-0700 private directory, writes a mode-0500 snapshot, opens it
+read-only, hashes the bytes from that descriptor, and unlinks the snapshot
+before any child can run. A bounded cache retains that anonymous master
+descriptor by digest. Each launch first revalidates the configured artifact
+identity, then opens the master descriptor through the platform fd namespace to
+obtain an independent file description. Concurrent children therefore cannot
+share or advance one another's offset.
 
-The bounded 32-entry cache retains digest/version evidence. It may skip a
-repeat version probe only after a new anonymous snapshot independently hashes
-to the configured digest. It never turns an earlier pathname check into launch
-authority.
+The bounded `--version` probe and real child both receive the launch duplicate
+as fd 3; Linux executes `/proc/self/fd/3` and macOS uses `/dev/fd/3`. The
+configured pathname is never executed after verification. Renaming or replacing
+the configured root after preparation therefore cannot substitute different
+bytes. Unsupported descriptor-launch platforms fail closed.
+
+The descriptor cache holds at most four digests and closes an evicted master;
+prepared launches keep independent duplicates and are unaffected by eviction.
+The normal deployment has one configured digest, so it pins one 192.5 MiB
+unlinked inode for the process lifetime. The measured ~500 ms copy, 192.5 MiB
+write, and ~385 MiB peak RSS occur once per admitted digest instead of on every
+turn, catalog probe, and quota probe. The separate 32-entry evidence cache may
+skip a repeat version probe only after current path identity revalidation. No
+cache entry turns a pathname into launch authority.
 
 `AGY_VERSION` is the exact bounded first line of `agy --version`, and
 `AGY_SHA256` is the exact artifact digest. They are one release identity. A
@@ -109,7 +119,6 @@ agy_sha=77dc197a05ca2a47d143ad135a4679b28ef85976cfd268569233d2f3d08ce999
 agy_release="$agy_root/$agy_sha"
 agy_target="$agy_release/agy"
 env_backup=".env.pre-agy-r2.$(date -u +%Y%m%dT%H%M%SZ)"
-env_next="$(mktemp .env.agy-r2.XXXXXX)"
 
 test "$(sha256sum "$agy_source" | awk '{print $1}')" = "$agy_sha"
 test "$($agy_source --version | head -n 1)" = "$agy_version"
@@ -118,6 +127,8 @@ sudo install -o root -g root -m 0555 "$agy_source" "$agy_target"
 test "$(sha256sum "$agy_target" | awk '{print $1}')" = "$agy_sha"
 test "$($agy_target --version | head -n 1)" = "$agy_version"
 cp -p .env "$env_backup"
+printf 'Exact rollback: cp -p %q .env && npm run redeploy\n' "$env_backup"
+env_next="$(mktemp .env.agy-r2.XXXXXX)"
 awk -v root="$agy_root" -v bin="$agy_target" -v version="$agy_version" -v sha="$agy_sha" '
 BEGIN { value["AGY_RUNTIME_ROOT"]=root; value["AGY_CLI_PATH"]=bin; value["AGY_BIN"]=bin; value["AGY_VERSION"]=version; value["AGY_SHA256"]=sha }
 { key=$0; sub(/=.*/, "", key); if (key in value) { print key "=" value[key]; seen[key]=1 } else print }
@@ -135,6 +146,7 @@ drain-style deployment path; do not partially edit individual pins:
 
 ```bash
 set -euo pipefail
+env_backup="${env_backup:-$(find . -maxdepth 1 -type f -name '.env.pre-agy-r2.*' -printf '%T@ %f\n' | sort -nr | sed -n '1s/^[^ ]* //p')}"
 test -n "${env_backup:-}"
 test -f "$env_backup"
 cp -p "$env_backup" .env

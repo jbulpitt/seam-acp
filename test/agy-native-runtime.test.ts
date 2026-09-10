@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import type { ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -29,6 +30,14 @@ const logger = pino({ level: "silent" }) as unknown as Logger;
 const here = path.dirname(fileURLToPath(import.meta.url));
 const capabilityFixtureDir = path.join(here, "fixtures", "agy-native-capabilities");
 const capabilityCli = path.join(capabilityFixtureDir, "fake-native-agy.mjs");
+const shellCli = path.join(here, "fixtures", "fake-agy-shell.sh");
+
+async function childOutput(proc: ChildProcess): Promise<string> {
+  let stdout = "";
+  proc.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
+  await once(proc, "close");
+  return stdout;
+}
 
 describe("native AGY R2 runtime identity", () => {
   it("drives local and bridge inventory from the same verified native tuple", async () => {
@@ -182,6 +191,73 @@ describe("native AGY R2 runtime identity", () => {
     }
   });
 
+  it("binds the production fd-executable branch to verified non-Node bytes", async () => {
+    const fixture = createManagedAgyFixture({
+      source: shellCli,
+      version: "agy-shell-test 1.0",
+    });
+    const marker = path.join(os.tmpdir(), `agy-r2-shell-replacement-${process.pid}-${Date.now()}`);
+    const originalRoot = `${fixture.runtimeRoot}-verified`;
+    try {
+      const prepared = fixture.runtime.prepare(["models"], "/tmp", {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      fs.renameSync(fixture.runtimeRoot, originalRoot);
+      const replacementExecutable = path.join(
+        fixture.runtimeRoot,
+        fixture.sha256,
+        process.platform === "win32" ? "agy.exe" : "agy",
+      );
+      fs.mkdirSync(path.dirname(replacementExecutable), { recursive: true });
+      fs.writeFileSync(
+        replacementExecutable,
+        `#!/bin/sh\nprintf touched > ${JSON.stringify(marker)}\n`,
+        { mode: 0o500 },
+      );
+      const stdout = await childOutput(prepared.spawn());
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(stdout).toBe("shell-model Shell Model\n");
+    } finally {
+      fs.rmSync(marker, { force: true });
+      if (fs.existsSync(originalRoot)) {
+        fs.rmSync(fixture.runtimeRoot, { recursive: true, force: true });
+        fs.renameSync(originalRoot, fixture.runtimeRoot);
+      }
+      fixture.cleanup();
+    }
+  });
+
+  it("reuses one retained verified artifact through independent concurrent descriptors", async () => {
+    const fixture = createManagedAgyFixture({
+      source: shellCli,
+      version: "agy-shell-test 1.0",
+    });
+    const writes = vi.spyOn(fs, "writeFileSync");
+    try {
+      const first = fixture.runtime.prepare(["models"], "/tmp", {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const second = fixture.runtime.prepare(["models"], "/tmp", {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const output = await Promise.all([
+        childOutput(first.spawn()),
+        childOutput(second.spawn()),
+      ]);
+      expect(output).toEqual([
+        "shell-model Shell Model\n",
+        "shell-model Shell Model\n",
+      ]);
+      const snapshotWrites = writes.mock.calls.filter(([file]) =>
+        typeof file === "string" && file.includes("seam-agy-exec-")
+      );
+      expect(snapshotWrites).toEqual([]);
+    } finally {
+      writes.mockRestore();
+      fixture.cleanup();
+    }
+  });
+
   it("rejects replacement bytes present before a descriptor-bound launch", async () => {
     const fixture = createManagedAgyFixture({ version: "agy-test 1.0" });
     try {
@@ -313,7 +389,13 @@ describe("native AGY R2 runtime identity", () => {
   });
 
   it("publishes redacted provenance through local startup and bridge hello into the rendered audit", async () => {
-    const fixture = createManagedAgyFixture({ version: "audited-version" });
+    const auditSentinel = "raw-audit-environment-value";
+    const auditScope = "antigravity-oauth:raw-audit-scope";
+    const fixture = createManagedAgyFixture({
+      version: "audited-version",
+      credentialScope: auditScope,
+      approvedEnvironment: { SEAM_AGY_AUDIT_SENTINEL: auditSentinel },
+    });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-r2-audit-"));
     const store = new SessionStore(path.join(dir, "seam.db"));
     const server = createServer();
@@ -380,7 +462,7 @@ describe("native AGY R2 runtime identity", () => {
         actorId: "seam-runtime",
         summary: "verified agy@local runtime provenance",
       });
-      const after = JSON.parse(localRow.afterJson) as Record<string, unknown>;
+      const after = JSON.parse(localRow.afterJson) as Record<string, any>;
       expect(after).toMatchObject({
         agentId: "agy",
         location: "local",
@@ -391,15 +473,42 @@ describe("native AGY R2 runtime identity", () => {
           provenance: { version: "audited-version", sha256: fixture.sha256 },
         },
       });
+      for (const row of rows) {
+        expect(row.beforeJson).toBe("{}");
+        const persisted = JSON.parse(row.afterJson) as Record<string, any>;
+        expect(Object.keys(persisted).sort()).toEqual(["agentId", "location", "runtime"]);
+        expect(Object.keys(persisted.runtime).sort()).toEqual([
+          "cwdPolicy",
+          "environmentKeys",
+          "identity",
+          "provenance",
+          "topology",
+        ]);
+        expect(Object.keys(persisted.runtime.provenance).sort()).toEqual([
+          "sha256",
+          "source",
+          "version",
+        ]);
+        expect(persisted.runtime.environmentKeys).toContain("SEAM_AGY_AUDIT_SENTINEL");
+      }
       const rendered = rows.map((row) =>
         formatConfigAuditDetail(row, new Date("2026-09-10T12:00:00.000Z")).after
       ).join("\n");
+      const durableBytes = rows.map((row) => [
+        row.beforeJson,
+        row.afterJson,
+        row.summary,
+        row.scope,
+      ].join("\n")).join("\n");
       for (const privateValue of [
         fixture.executable,
+        path.dirname(fixture.executable),
         fixture.runtimeRoot,
-        "antigravity-oauth:test",
+        auditScope,
+        auditSentinel,
         os.tmpdir(),
       ]) {
+        expect(durableBytes).not.toContain(privateValue);
         expect(rendered).not.toContain(privateValue);
       }
       expect(() => mutation.recordRuntimeProvenance({

@@ -64,12 +64,13 @@ model self-report or a claim of live correctness.
   root and cwd paths, raw credential scope, environment fingerprint, and
   environment values stay private. Local and bridge construction use the same
   runtime tuple.
-- Every native child executes an anonymous descriptor-bound snapshot whose
-  bytes were hashed from that descriptor. Digest verification precedes bounded
-  version execution; both the version probe and real child receive the same fd,
-  so a post-verification pathname replacement cannot change executed bytes.
-  Local startup and bridge hello append only the reduced provenance record to
-  the durable audit ledger.
+- Every native child executes an independent duplicate of a cached anonymous
+  descriptor-bound snapshot whose bytes were hashed from the retained master.
+  Digest verification precedes bounded version execution; both the version
+  probe and real child receive the launch duplicate as fd 3, so a
+  post-verification pathname replacement cannot change executed bytes and
+  concurrent launches cannot share an offset. Local startup and bridge hello
+  append only the reduced provenance record to the durable audit ledger.
 - Structured turns pass the reserved schema through `AgentRuntime`, create the
   native schema argument, accept only the CLI's `structured_output` envelope,
   suppress planner progress as the result, and remove the temporary schema.

@@ -13,6 +13,7 @@
  * session the runtime was started for, not from source text.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { createServer } from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,9 +21,17 @@ import { pino } from "pino";
 import { Orchestrator } from "../packages/core/src/platforms/discord/orchestrator.js";
 import { SessionStore } from "../packages/core/src/core/session-store.js";
 import { ChoiceResultHub } from "../packages/core/src/core/choice/result.js";
+import { ChoiceIngest } from "../packages/core/src/core/choice/ingest.js";
+import { hashBridgeToken, mintBridgeToken } from "../packages/core/src/core/bridge-pairing.js";
 import { planEndpointDispatch, type IngestEndpoint } from "../packages/core/src/core/choice/endpoint.js";
 import { discordRenderer } from "../packages/core/src/platforms/discord/renderer.js";
-import type { DispatchSpec } from "../packages/core/src/core/dispatch/types.js";
+import {
+  dispatchDirs,
+  enqueueDispatchSpec,
+  type DispatchSpec,
+} from "../packages/core/src/core/dispatch/types.js";
+import { DispatchWatcher } from "../packages/core/src/core/dispatch/watcher.js";
+import { reconcileCompletedDoneFiles } from "../packages/core/src/core/dispatch/done-reconcile.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
 import type { SessionRecord } from "../packages/core/src/core/types.js";
 import type { ChannelRef, MessageRef } from "../packages/core/src/platforms/chat-adapter.js";
@@ -502,5 +511,448 @@ describe("#224 isolated ingest routing", () => {
       strictModel: true,
     });
     expect(typeof injected.spawnFn).toBe("function");
+  });
+});
+
+describe("#246 isolated ingest owns every terminal transition", () => {
+  it("terminalizes catalog preflight failure and permits the next HTTP job and ordinary turn", async () => {
+    const token = mintBridgeToken();
+    const row = endpoint({
+      tokenHash: hashBridgeToken(token),
+      thread: null,
+      agentId: "claude",
+      model: null,
+      resultSchema: {
+        type: "object",
+        required: ["answer"],
+        properties: { answer: { type: "number" } },
+      },
+    });
+    store.insertIngestEndpoint(row);
+    const results = new ChoiceResultHub({ store, logger: silent });
+    const broken = makeOrch(dataDir, store, {
+      profile: { id: "claude", defaultModel: "default" },
+      // A different catalog binding leaves claude@local genuinely unavailable.
+      catalogProfile: { id: "other", defaultModel: "other-default" },
+    });
+    broken.orch.setChoiceResults(results);
+    let preflightRevocations = 0;
+    let preflightQuotaStarts = 0;
+    let preflightQuotaCompletions = 0;
+    (broken.orch as any).router.revokeMcpSession = () => { preflightRevocations++; };
+    (broken.orch as any).quotaPoller = {
+      recordTurnStart: () => { preflightQuotaStarts++; },
+      turnCompleted: async () => { preflightQuotaCompletions++; },
+    };
+    const failedWatcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: (spec) => broken.orch.dispatchInjectTurn(spec),
+    });
+    const ingest = new ChoiceIngest({
+      store,
+      results,
+      logger: silent,
+      enqueue: (spec) => enqueueDispatchSpec(dataDir, spec),
+      destLive: async () => "ok",
+      authoringSession: () => sessionRecord(),
+      publicBase: () => "http://127.0.0.1",
+      waitMs: 2_000,
+    });
+    const server = createServer((req, res) => void ingest.handle(req, res));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    const headers = {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    };
+    try {
+      const admitted = await fetch(`http://127.0.0.1:${port}/ingest?wait=0`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ text: "synthetic first job" }),
+      });
+      expect(admitted.status).toBe(202);
+      const first = (await admitted.json()) as { jobId: string };
+
+      await failedWatcher.start();
+      failedWatcher.stop();
+      expect(failedWatcher.inFlightCount).toBe(0);
+      expect(broken.orch.resolveIngestJob(first.jobId)).toBeUndefined();
+      const failedDone = JSON.parse(
+        fs.readFileSync(path.join(dispatchDirs(dataDir).done, `${first.jobId}.json`), "utf8")
+      ) as { status: string; error?: string };
+      expect(failedDone).toMatchObject({
+        status: "failed",
+        error: expect.stringMatching(/catalog has no default model/),
+      });
+
+      const failedPoll = await fetch(`http://127.0.0.1:${port}/ingest/jobs/${first.jobId}`, {
+        headers,
+      });
+      expect(failedPoll.status).toBe(422);
+      expect(await failedPoll.json()).toMatchObject({
+        jobId: first.jobId,
+        status: "missing",
+        error: expect.stringMatching(/catalog has no default model/),
+      });
+      expect(store.getDelegation(first.jobId)).toMatchObject({
+        kind: "ingest",
+        status: "failed",
+      });
+      expect(preflightRevocations).toBe(1);
+      expect(preflightQuotaStarts).toBe(1);
+      expect(preflightQuotaCompletions).toBe(1);
+
+      // Same durable endpoint, no replay of the first input: a fresh synthetic
+      // POST completes after catalog readiness is restored.
+      const admittedSecond = await fetch(`http://127.0.0.1:${port}/ingest?wait=0`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ text: "synthetic second job" }),
+      });
+      expect(admittedSecond.status).toBe(202);
+      const second = (await admittedSecond.json()) as { jobId: string };
+      const healthy = makeOrch(dataDir, store, {
+        profile: { id: "claude", defaultModel: "default" },
+      });
+      healthy.orch.setChoiceResults(results);
+      (healthy.orch as unknown as {
+        injectTurn: () => Promise<{ text: string; stopReason: string }>;
+      }).injectTurn = async () => ({
+        text: 'fixture transcript\n```seam-result\n{"answer":42}\n```',
+        stopReason: "end_turn",
+      });
+      const healthyWatcher = new DispatchWatcher({
+        dataDir,
+        logger: silent,
+        onDispatch: (spec) => healthy.orch.dispatchInjectTurn(spec),
+      });
+      await healthyWatcher.start();
+      healthyWatcher.stop();
+      expect(healthyWatcher.inFlightCount).toBe(0);
+
+      const completedPoll = await fetch(
+        `http://127.0.0.1:${port}/ingest/jobs/${second.jobId}`,
+        { headers }
+      );
+      expect(completedPoll.status).toBe(200);
+      expect(await completedPoll.json()).toEqual({ answer: 42 });
+
+      const ordinaryHost = makeOrch(dataDir, store, {
+        profile: { id: "claude", defaultModel: "default" },
+      });
+      const ordinary = await ordinaryHost.orch.dispatchInjectTurn({
+        id: "ordinary-after-ingest-failure",
+        target: THREAD,
+        prompt: "ordinary synthetic turn",
+        session: "live",
+        kind: "handoff",
+        createdUtc: new Date().toISOString(),
+      });
+      expect(ordinary.output).toContain("answered in-thread");
+    } finally {
+      failedWatcher.stop();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it.each([
+    {
+      name: "spawn exception",
+      run: () => {
+        throw new Error("spawn exploded");
+      },
+      error: /spawn exploded/,
+      ledger: "failed",
+    },
+    {
+      name: "execution error",
+      run: async () => ({ text: "", error: "execution exploded" }),
+      error: /execution exploded/,
+      ledger: "failed",
+    },
+    {
+      name: "timeout without a separate error",
+      run: async () => ({ text: "", timedOut: true }),
+      error: /timed out/,
+      ledger: "timed_out",
+    },
+    {
+      name: "cancellation without a separate error",
+      run: async () => ({ text: "", cancelled: true }),
+      error: /cancelled/,
+      ledger: "failed",
+    },
+  ])("terminalizes $name and releases token/quota/session ownership", async ({ run, error, ledger }) => {
+    const row = endpoint({ thread: null, agentId: "claude", model: null });
+    store.insertIngestEndpoint(row);
+    const spec = planEndpointDispatch({ endpoint: row, payload: "synthetic" });
+    const results = new ChoiceResultHub({ store, logger: silent });
+    const pending = expectJob(results, spec.id, row.resultSchema);
+    const { orch } = makeOrch(dataDir, store, {
+      profile: { id: "claude", defaultModel: "default" },
+    });
+    orch.setChoiceResults(results);
+    let revocations = 0;
+    let quotaStarts = 0;
+    let quotaCompletions = 0;
+    (orch as any).router.revokeMcpSession = (id: string) => {
+      expect(id).toBe(spec.id);
+      revocations++;
+    };
+    (orch as any).quotaPoller = {
+      recordTurnStart: () => { quotaStarts++; },
+      turnCompleted: async () => { quotaCompletions++; },
+    };
+    (orch as any).injectTurn = run;
+
+    await expect(orch.dispatchInjectTurn(spec)).rejects.toThrow(error);
+    await expect(pending).rejects.toThrow(error);
+    expect(store.getChoiceResult(spec.id)).toMatchObject({
+      status: "missing",
+      error: expect.stringMatching(error),
+    });
+    expect(store.getDelegation(spec.id)?.status).toBe(ledger);
+    expect(orch.resolveIngestJob(spec.id)).toBeUndefined();
+    expect(revocations).toBe(1);
+    expect(quotaStarts).toBe(1);
+    expect(quotaCompletions).toBe(1);
+  });
+
+  it("preserves a submitted success when later token cleanup fails", async () => {
+    const row = endpoint({ thread: null, agentId: "claude", model: null });
+    store.insertIngestEndpoint(row);
+    const spec = planEndpointDispatch({ endpoint: row, payload: "synthetic" });
+    const results = new ChoiceResultHub({ store, logger: silent });
+    const pending = expectJob(results, spec.id, row.resultSchema);
+    const { orch } = makeOrch(dataDir, store, {
+      profile: { id: "claude", defaultModel: "default" },
+    });
+    orch.setChoiceResults(results);
+    (orch as any).injectTurn = async () => ({
+      text: '```seam-result\n{"overallScore":4,"prose":"kept"}\n```',
+      stopReason: "end_turn",
+    });
+    (orch as any).router.revokeMcpSession = () => {
+      throw new Error("token cleanup exploded");
+    };
+
+    await expect(orch.dispatchInjectTurn(spec)).rejects.toThrow(/token cleanup exploded/);
+    await expect(pending).resolves.toEqual({ overallScore: 4, prose: "kept" });
+    expect(store.getChoiceResult(spec.id)).toMatchObject({
+      status: "ok",
+      body: { overallScore: 4, prose: "kept" },
+      error: null,
+    });
+    expect(store.getDelegation(spec.id)?.status).toBe("failed");
+    expect(orch.resolveIngestJob(spec.id)).toBeUndefined();
+  });
+
+  it("leaves result-store failure recoverable from done evidence instead of replaying", async () => {
+    const row = endpoint({ thread: null, agentId: "claude", model: null });
+    store.insertIngestEndpoint(row);
+    const spec = planEndpointDispatch({ endpoint: row, payload: "synthetic" });
+    const results = new ChoiceResultHub({ store, logger: silent });
+    const pending = expectJob(results, spec.id, row.resultSchema);
+    const { orch } = makeOrch(dataDir, store, {
+      profile: { id: "claude", defaultModel: "default" },
+    });
+    orch.setChoiceResults(results);
+    (orch as any).injectTurn = async () => ({ text: "completed without declaration", stopReason: "end_turn" });
+    const originalFinish = store.finishChoiceResult.bind(store);
+    (store as any).finishChoiceResult = () => {
+      throw new Error("result store unavailable");
+    };
+    let executions = 0;
+    const watcher = new DispatchWatcher({
+      dataDir,
+      logger: silent,
+      onDispatch: async (queued) => {
+        executions++;
+        return orch.dispatchInjectTurn(queued);
+      },
+    });
+    await enqueueDispatchSpec(dataDir, spec);
+    await watcher.start();
+    watcher.stop();
+    expect(executions).toBe(1);
+    expect(store.getChoiceResult(spec.id)?.status).toBe("pending");
+    expect(store.getDelegation(spec.id)?.status).toBe("dispatched");
+    expect(JSON.parse(
+      fs.readFileSync(path.join(dispatchDirs(dataDir).done, `${spec.id}.json`), "utf8")
+    )).toMatchObject({ status: "failed", error: "result store unavailable", kind: "ingest" });
+
+    (store as any).finishChoiceResult = originalFinish;
+    const repaired = await reconcileCompletedDoneFiles({
+      dataDir,
+      logger: silent,
+      getDelegation: (id) => store.getDelegation(id),
+      listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit),
+      replay: (done, route) => orch.replayCompletedDispatch(done, route),
+    });
+    expect(repaired.reconciled).toBe(1);
+    await expect(pending).rejects.toThrow(/result store unavailable/);
+    expect(store.getChoiceResult(spec.id)?.status).toBe("missing");
+    expect(store.getDelegation(spec.id)?.status).toBe("failed");
+    expect(executions).toBe(1);
+  });
+
+  it("repairs a done-backed pending HTTP result without replaying the input", async () => {
+    const dispatchId = "failed-before-result-settlement";
+    const endpointId = "ie_recovery";
+    store.insertIngestEndpoint(endpoint({ id: endpointId, thread: null }));
+    store.insertChoiceResult({
+      dispatchId,
+      choiceId: endpointId,
+      status: "pending",
+      body: null,
+      error: null,
+      schema: { type: "object" },
+      createdUtc: "2026-09-09T00:00:00.000Z",
+      finishedUtc: null,
+    });
+    store.recordDelegation({
+      id: dispatchId,
+      kind: "ingest",
+      sourceRef: null,
+      targetRef: null,
+      worker: null,
+      promptPreview: "private input is deliberately absent from this fixture",
+      correlationId: endpointId,
+      status: "dispatched",
+    });
+    fs.mkdirSync(dispatchDirs(dataDir).done, { recursive: true });
+    fs.writeFileSync(
+      path.join(dispatchDirs(dataDir).done, `${dispatchId}.json`),
+      JSON.stringify({
+        id: dispatchId,
+        target: `ingest:${endpointId}`,
+        status: "failed",
+        error: "catalog preflight unavailable",
+        kind: "ingest",
+        correlationId: endpointId,
+        finishedUtc: "2026-09-09T00:00:01.000Z",
+      })
+    );
+    const { orch } = makeOrch(dataDir, store);
+    const results = new ChoiceResultHub({ store, logger: silent });
+    orch.setChoiceResults(results);
+    let replayCalls = 0;
+
+    const summary = await reconcileCompletedDoneFiles({
+      dataDir,
+      logger: silent,
+      getDelegation: (id) => store.getDelegation(id),
+      listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit),
+      replay: async (done, route) => {
+        replayCalls++;
+        await orch.replayCompletedDispatch(done, route);
+      },
+    });
+
+    expect(replayCalls).toBe(1);
+    expect(summary.reconciled).toBe(1);
+    expect(store.getChoiceResult(dispatchId)).toMatchObject({
+      status: "missing",
+      error: "ingest dispatch failed: catalog preflight unavailable",
+    });
+    expect(store.getDelegation(dispatchId)?.status).toBe("failed");
+
+    // Idempotent second boot: terminal ledger rows are outside the recovery
+    // index, and the already-terminal HTTP result remains byte-for-byte equal.
+    const before = store.getChoiceResult(dispatchId);
+    const again = await reconcileCompletedDoneFiles({
+      dataDir,
+      logger: silent,
+      getDelegation: (id) => store.getDelegation(id),
+      listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit),
+      replay: async (done, route) => {
+        replayCalls++;
+        await orch.replayCompletedDispatch(done, route);
+      },
+    });
+    expect(again.reconciled).toBe(0);
+    expect(replayCalls).toBe(1);
+    expect(store.getChoiceResult(dispatchId)).toEqual(before);
+  });
+
+  it("keeps uncertain artifact-free work pending and recovers a durable declared result", async () => {
+    const uncertainId = "uncertain-no-done";
+    store.insertChoiceResult({
+      dispatchId: uncertainId,
+      choiceId: "ie_thread1",
+      status: "pending",
+      body: null,
+      error: null,
+      schema: null,
+      createdUtc: "2026-09-09T00:00:00.000Z",
+      finishedUtc: null,
+    });
+    store.recordDelegation({
+      id: uncertainId,
+      kind: "ingest",
+      sourceRef: null,
+      targetRef: null,
+      worker: null,
+      promptPreview: "not replayed",
+      correlationId: "ie_thread1",
+      status: "dispatched",
+    });
+    const summary = await reconcileCompletedDoneFiles({
+      dataDir,
+      logger: silent,
+      getDelegation: (id) => store.getDelegation(id),
+      listRecoveryCandidates: (after, limit) => store.listNonTerminalDelegations(after, limit),
+      replay: async () => {
+        throw new Error("artifact-free work must not replay");
+      },
+    });
+    expect(summary.reconciled).toBe(0);
+    expect(store.getChoiceResult(uncertainId)?.status).toBe("pending");
+    expect(store.getDelegation(uncertainId)?.status).toBe("dispatched");
+
+    const successId = "declared-before-cleanup-failure";
+    store.insertChoiceResult({
+      dispatchId: successId,
+      choiceId: "ie_thread1",
+      status: "pending",
+      body: null,
+      error: null,
+      schema: null,
+      createdUtc: "2026-09-09T00:00:00.000Z",
+      finishedUtc: null,
+    });
+    store.recordDelegation({
+      id: successId,
+      kind: "ingest",
+      sourceRef: null,
+      targetRef: null,
+      worker: null,
+      promptPreview: "already handled",
+      correlationId: "ie_thread1",
+      status: "dispatched",
+    });
+    const restarted = makeOrch(dataDir, store).orch;
+    restarted.setChoiceResults(new ChoiceResultHub({ store, logger: silent }));
+    await restarted.replayCompletedDispatch(
+      {
+        id: successId,
+        target: "ingest:ie_thread1",
+        status: "failed",
+        output: 'durable output\n```seam-result\n{"answer":7}\n```',
+        error: "cleanup failed after submit_result",
+        kind: "ingest",
+        correlationId: "ie_thread1",
+        finishedUtc: "2026-09-09T00:00:02.000Z",
+      },
+      { action: "terminalize" }
+    );
+    expect(store.getChoiceResult(successId)).toMatchObject({
+      status: "ok",
+      body: { answer: 7 },
+      error: null,
+    });
+    expect(store.getDelegation(successId)?.status).toBe("failed");
   });
 });

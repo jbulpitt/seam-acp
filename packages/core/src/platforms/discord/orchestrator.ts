@@ -386,6 +386,7 @@ import {
   findQueuedReportBackSpec,
   isStatelessHandoffWorker,
   shouldInlineCardReportBack,
+  type DispatchResult,
   type DispatchSpec,
 } from "../../core/dispatch/types.js";
 import {
@@ -555,6 +556,12 @@ import {
 const STATUS_EDIT_DEBOUNCE_MS = 2500;
 const STATUS_HEARTBEAT_MS = 5000;
 const PLATFORM = "discord";
+
+/** Stable bounded HTTP-facing failure text; never retain an Error/cause chain. */
+function ingestFailureText(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  return (raw.trim() || "unknown failure").replace(/\s+/g, " ").slice(0, 1_000);
+}
 
 export type ChannelQueueState = "idle" | "runtime_busy" | "queued" | "wedged";
 
@@ -9195,64 +9202,78 @@ export class Orchestrator {
   private async dispatchIngestEndpoint(
     spec: DispatchSpec
   ): Promise<{ output: string; stopReason: string }> {
-    const notifyId = isDiscordSnowflake(spec.target) ? spec.target : undefined;
-    const endpoint = spec.correlationId ? this.store.getIngestEndpoint(spec.correlationId) : null;
-    const presetName = endpoint?.preset ?? spec.preset;
-    const preset = presetName
-      ? this.store.getPresetByNameScoped(presetName, endpoint?.authoringParentRef ?? null)
-      : null;
-    if (presetName && !preset) {
-      throw new Error(`dispatch ${spec.id}: unknown preset "${presetName}"`);
-    }
-    const location = spec.location ?? endpoint?.location ?? LOCAL_LOCATION;
-    const agentId = preset?.agentId ?? spec.agentId ?? this.config.DEFAULT_AGENT;
-    const profile = this.router.getProfile(agentId, location);
-    if (!profile) {
-      throw new Error(
-        `dispatch ${spec.id}: ${this.refuseUnregisteredAgent(agentId, `unknown agent "${agentId}" at "${location}"`)}`
-      );
-    }
-    this.quotaPoller?.recordTurnStart(agentId);
-    const cwd = preset?.repoPath ?? spec.cwd ?? this.config.REPOS_ROOT;
-    const model = preset?.model ?? spec.model;
-    const effort = preset?.effort ?? spec.effort;
-    const prompt = applyPresetIdentity(spec.prompt, preset);
-    const synthetic: SessionRecord = {
-      id: spec.id,
-      platform: PLATFORM,
-      channelRef: notifyId ?? spec.correlationId ?? spec.id,
-      parentRef: endpoint?.authoringParentRef ?? null,
-      agentId,
-      acpSessionId: "",
-      repoPath: cwd,
-      configJson: JSON.stringify({
-        ...(model ? { model } : {}),
-        ...(effort ? { reasoningEffort: effort } : {}),
-      }),
-      createdUtc: spec.createdUtc,
-      updatedUtc: spec.createdUtc,
-    };
-    this.ingestJobs.set(spec.id, synthetic);
     // #174: registered around the WHOLE body, not just `injectTurn`. The turn's
     // durable tail — the output post and the ledger status write below — runs
     // after the agent is done, and releasing before it would hide exactly that
-    // work from the shutdown barrier.
+    // work from the shutdown barrier. #246 extends that ownership to every
+    // synchronous preflight above injectTurn as well.
     const endTurn = this.beginTurn();
+    let agentId: string | undefined;
+    let quotaStarted = false;
+    let result: InjectTurnResult | undefined;
+    let completed: { output: string; stopReason: string } | undefined;
+    let failure: unknown;
+    let resultSettlementFailed = false;
     try {
+      const notifyId = isDiscordSnowflake(spec.target) ? spec.target : undefined;
+      const endpoint = spec.correlationId ? this.store.getIngestEndpoint(spec.correlationId) : null;
+      const presetName = endpoint?.preset ?? spec.preset;
+      const preset = presetName
+        ? this.store.getPresetByNameScoped(presetName, endpoint?.authoringParentRef ?? null)
+        : null;
+
+      // Establish the durable lifecycle row before any agent/catalog/spawn
+      // preflight can fail. Re-entry with the exact id keeps the original row.
       try {
-        this.store.recordDelegation({
-          id: spec.id,
-          kind: "ingest",
-          sourceRef: null,
-          targetRef: notifyId ?? null,
-          worker: preset?.name ?? null,
-          promptPreview: spec.prompt,
-          correlationId: spec.correlationId ?? null,
-          status: "dispatched",
-        });
+        if (!this.store.getDelegation(spec.id)) {
+          this.store.recordDelegation({
+            id: spec.id,
+            kind: "ingest",
+            sourceRef: null,
+            targetRef: notifyId ?? null,
+            worker: preset?.name ?? presetName ?? null,
+            promptPreview: spec.prompt,
+            correlationId: spec.correlationId ?? null,
+            status: "dispatched",
+          });
+        }
       } catch (err) {
         this.logger.warn({ err, dispatch: spec.id }, "ingest: ledger record failed");
       }
+
+      if (presetName && !preset) {
+        throw new Error(`dispatch ${spec.id}: unknown preset "${presetName}"`);
+      }
+      const location = spec.location ?? endpoint?.location ?? LOCAL_LOCATION;
+      agentId = preset?.agentId ?? spec.agentId ?? this.config.DEFAULT_AGENT;
+      const profile = this.router.getProfile(agentId, location);
+      if (!profile) {
+        throw new Error(
+          `dispatch ${spec.id}: ${this.refuseUnregisteredAgent(agentId, `unknown agent "${agentId}" at "${location}"`)}`
+        );
+      }
+      this.quotaPoller?.recordTurnStart(agentId);
+      quotaStarted = true;
+      const cwd = preset?.repoPath ?? spec.cwd ?? this.config.REPOS_ROOT;
+      const model = preset?.model ?? spec.model;
+      const effort = preset?.effort ?? spec.effort;
+      const prompt = applyPresetIdentity(spec.prompt, preset);
+      const synthetic: SessionRecord = {
+        id: spec.id,
+        platform: PLATFORM,
+        channelRef: notifyId ?? spec.correlationId ?? spec.id,
+        parentRef: endpoint?.authoringParentRef ?? null,
+        agentId,
+        acpSessionId: "",
+        repoPath: cwd,
+        configJson: JSON.stringify({
+          ...(model ? { model } : {}),
+          ...(effort ? { reasoningEffort: effort } : {}),
+        }),
+        createdUtc: spec.createdUtc,
+        updatedUtc: spec.createdUtc,
+      };
+      this.ingestJobs.set(spec.id, synthetic);
 
       let outputTo: ChannelRef | undefined;
       if (notifyId) {
@@ -9286,57 +9307,92 @@ export class Orchestrator {
         });
       }
 
-      let result: InjectTurnResult | undefined;
-      try {
-        result = await this.injectTurn(null, prompt, {
-          session: "isolated",
-          profile,
-          cwd,
-          ...isolatedSpawn,
-          strictModel: true,
-          ...(outputTo ? { outputTo } : {}),
-          ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
-          timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
-          onSession: (sessionId) => {
-            try {
-              this.store.updateDelegationStatus(spec.id, "running", { acpSessionId: sessionId });
-            } catch {
-              /* best-effort */
-            }
-            this.choiceResults?.bindSession(sessionId, spec.id);
-          },
-          awaitIdle: true,
-          logContext: { dispatch: spec.id, kind: "ingest" },
-        });
-      } finally {
-        void this.quotaPoller?.turnCompleted(agentId);
-        if (this.choiceResults) {
-          if (result?.text) {
-            const harvested = extractSeamResultFromText(result.text);
-            if (harvested.ok) this.choiceResults.submitFromDispatch(spec.id, harvested.value);
+      result = await this.injectTurn(null, prompt, {
+        session: "isolated",
+        profile,
+        cwd,
+        ...isolatedSpawn,
+        strictModel: true,
+        ...(outputTo ? { outputTo } : {}),
+        ...(spec.correlationId ? { correlationId: spec.correlationId } : {}),
+        timeoutMs: this.config.TURN_TIMEOUT_SECONDS * 1000,
+        onSession: (sessionId) => {
+          try {
+            this.store.updateDelegationStatus(spec.id, "running", { acpSessionId: sessionId });
+          } catch {
+            /* best-effort */
           }
-          this.choiceResults.turnEnded(spec.id);
-        }
-        this.router.revokeMcpSession(spec.id);
-      }
+          this.choiceResults?.bindSession(sessionId, spec.id);
+        },
+        awaitIdle: true,
+        logContext: { dispatch: spec.id, kind: "ingest" },
+      });
       if (!result) throw new Error("ingest: injectTurn returned no result");
       if (outputTo) {
         await this.postDispatchOutput(outputTo, spec, result.text, result.error).catch((err) =>
           this.logger.warn({ err, dispatch: spec.id }, "ingest: notify post failed")
         );
       }
-      const ledgerStatus = result.timedOut ? "timed_out" : result.error ? "failed" : "completed";
-      try {
-        this.store.updateDelegationStatus(spec.id, ledgerStatus);
-      } catch {
-        /* best-effort */
-      }
+      if (result.timedOut) throw new Error(result.error ?? "ingest turn timed out");
+      if (result.cancelled) throw new Error(result.error ?? "ingest turn was cancelled");
       if (result.error) throw new Error(result.error);
-      return { output: result.text, stopReason: result.stopReason ?? "" };
+      completed = { output: result.text, stopReason: result.stopReason ?? "" };
+    } catch (err) {
+      failure = err;
     } finally {
+      // Result settlement owns every exit. Harvest and terminalization are
+      // separate guarded steps so one failure cannot skip the other. A result
+      // already accepted as `ok` remains immutable through later failures.
+      if (this.choiceResults) {
+        if (result?.text) {
+          try {
+            const harvested = extractSeamResultFromText(result.text);
+            if (harvested.ok) this.choiceResults.submitFromDispatch(spec.id, harvested.value);
+          } catch (err) {
+            failure ??= err;
+          }
+        }
+        try {
+          this.choiceResults.turnEnded(
+            spec.id,
+            failure
+              ? { error: `ingest dispatch failed: ${ingestFailureText(failure)}` }
+              : undefined
+          );
+        } catch (err) {
+          resultSettlementFailed = true;
+          failure ??= err;
+        }
+      }
+      if (quotaStarted && agentId) {
+        void this.quotaPoller?.turnCompleted(agentId).catch((err) =>
+          this.logger.warn({ err, agentId, dispatch: spec.id }, "ingest: quota completion failed")
+        );
+      }
+      try {
+        this.router.revokeMcpSession(spec.id);
+      } catch (err) {
+        failure ??= err;
+      }
+      // Ledger terminalization is deliberately after HTTP result settlement.
+      // If it fails, the watcher writes a done artifact and boot replay retries
+      // only these completion effects; it never reruns the submitted input.
+      if (!resultSettlementFailed) {
+        try {
+          this.store.updateDelegationStatus(
+            spec.id,
+            result?.timedOut ? "timed_out" : failure ? "failed" : "completed"
+          );
+        } catch (err) {
+          failure ??= err;
+        }
+      }
       this.ingestJobs.delete(spec.id);
       endTurn();
     }
+    if (failure) throw failure;
+    if (!completed) throw new Error("ingest: completed without a dispatch result");
+    return completed;
   }
 
   private async threadLiveState(threadId: string): Promise<"ok" | "gone" | "archived"> {
@@ -9676,22 +9732,10 @@ export class Orchestrator {
    * that already has a ledger row, and `advanceChain` refuses a chain that is
    * not `running`.
    */
-  async replayCompletedDispatch(result: {
-    id: string;
-    target: string;
-    status: "completed" | "failed";
-    output?: string;
-    error?: string;
-    correlationId?: string;
-    returnTo?: string;
-    chainId?: string;
-    originPrompt?: string;
-    workerStatus?: "completed" | "failed" | "timed_out";
-    workerError?: string;
-    completionError?: string;
-  }, route: CompletionRoute): Promise<void> {
+  async replayCompletedDispatch(result: DispatchResult, route: CompletionRoute): Promise<void> {
     const text = result.output ?? "";
     const workerError = result.workerError ?? (result.completionError ? undefined : result.error);
+    const ledger = this.store.getDelegation(result.id);
     // The ROUTE is authoritative for the onward address, not the done-file.
     //
     // Keeping the route authoritative prevents a classifier/replay mismatch:
@@ -9738,6 +9782,34 @@ export class Orchestrator {
       await this.advanceChain(spec, text, workerError);
     } else if (route.action === "report_back") {
       await this.enqueueReportBack(spec, text, workerError);
+    }
+
+    // #246: ingest's HTTP result is a completion side effect just like the
+    // ledger transition. A definitive done artifact can settle a stranded
+    // pending row without replaying the submitted prompt. Genuine uncertainty
+    // (no done artifact) never reaches this method and remains pending.
+    const kind = result.kind ?? ledger?.kind;
+    if (kind === "ingest" && this.choiceResults) {
+      const endpoint = result.correlationId
+        ? this.store.getIngestEndpoint(result.correlationId)
+        : null;
+      const failed = result.status === "failed";
+      if (text) {
+        const harvested = extractSeamResultFromText(text);
+        if (harvested.ok) this.choiceResults.submitFromDispatch(result.id, harvested.value);
+      }
+      this.choiceResults.turnEnded(
+        result.id,
+        failed
+          ? {
+              error: `ingest dispatch failed: ${ingestFailureText(
+                workerError ?? result.error ?? "durable dispatch failure"
+              )}`,
+            }
+          : endpoint?.thread
+            ? { resultOptional: true }
+            : undefined
+      );
     }
 
     // Only now is the completion fully recorded. A throw above propagates to

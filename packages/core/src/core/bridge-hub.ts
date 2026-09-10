@@ -22,7 +22,11 @@ import {
 import { tokenMatchesHash } from "./bridge-pairing.js";
 import type { BridgeHostConfig, Config } from "../config.js";
 import type { Logger } from "../lib/logger.js";
-import type { ConfigMutationService, MutationActor } from "./config-mutation.js";
+import {
+  safeNativeAgyRuntimeProvenance,
+  type ConfigMutationService,
+  type MutationActor,
+} from "./config-mutation.js";
 import type { SeamTokenRegistry } from "./mcp/token-registry.js";
 import { isLocalLocation, normalizeLocation } from "./location.js";
 import type { LoopbackHost } from "./loopback-host.js";
@@ -371,13 +375,13 @@ export class BridgeHub {
       return;
     }
     for (const a of hello.agents ?? []) {
-      if (
-        a.agentId === "agy" &&
-        a.runtime?.topology === "virtual-acp-native-cli" &&
-        Object.keys(a.runtime.environment).length > 0
-      ) {
-        mux.helloAck(false, "native AGY runtime inventory must not contain environment values");
-        return;
+      if (a.agentId === "agy" && a.runtime?.topology === "virtual-acp-native-cli") {
+        try {
+          safeNativeAgyRuntimeProvenance(a.runtime);
+        } catch {
+          mux.helloAck(false, "native AGY runtime inventory contains private or invalid launch data");
+          return;
+        }
       }
     }
     mux.helloAck(true);

@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import {
+  spawn,
+  spawnSync,
+  type ChildProcess,
+} from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { AdapterRuntimeDescriptor } from "./agent-profile.js";
 
@@ -24,12 +29,18 @@ export interface AgyNativeRuntimeOptions {
   approvedEnvironment?: Readonly<Record<string, string>>;
 }
 
-export interface AgyNativeLaunchSpec {
-  executable: string;
-  argv: ReadonlyArray<string>;
-  cwd: string;
-  env: NodeJS.ProcessEnv;
-  identityKey: string;
+export interface AgyNativeSpawnOptions {
+  mcpHome?: string;
+  stdio: readonly [
+    "pipe" | "ignore" | "inherit",
+    "pipe" | "ignore" | "inherit",
+    "pipe" | "ignore" | "inherit",
+  ];
+}
+
+export interface AgyNativePreparedLaunch {
+  spawn(): ChildProcess;
+  close(): void;
 }
 
 interface VerificationEntry {
@@ -39,6 +50,19 @@ interface VerificationEntry {
 }
 
 const verificationCache = new Map<string, VerificationEntry>();
+
+interface VerifiedSnapshot extends VerificationEntry {
+  fd: number;
+  executable: string;
+  argvPrefix: string[];
+  close(): void;
+}
+
+const NODE_FD_MODULE_LOADER = [
+  "import fs from 'node:fs';",
+  "const source=fs.readFileSync(3,'utf8').replace(/^#![^\\n]*(?:\\n|$)/,'');",
+  "await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));",
+].join("");
 
 function requireAbsolute(name: string, value: string): string {
   const normalized = path.normalize(value.trim());
@@ -143,6 +167,80 @@ export function verifyAgyManagedRuntimeArtifact(
   return entry;
 }
 
+function fdExecutable(fd: number): string {
+  if (process.platform === "linux") return `/proc/self/fd/${fd}`;
+  if (process.platform === "darwin") return `/dev/fd/${fd}`;
+  throw new Error("native AGY requires descriptor-bound executable launch support");
+}
+
+/**
+ * Snapshot the candidate into a private file, hash those exact bytes, then
+ * unlink the name while retaining a read-only descriptor. The configured path
+ * remains a policy/input location only: every version probe and real child is
+ * launched from this descriptor, so a post-verification rename cannot swap the
+ * executed artifact.
+ */
+function openVerifiedSnapshot(
+  executable: string,
+  runtimeRoot: string,
+  expectedSha256: string,
+): VerifiedSnapshot {
+  const verified = verifyAgyManagedRuntimeArtifact(executable, runtimeRoot, expectedSha256);
+  const bytes = fs.readFileSync(executable);
+  const sourceDigest = createHash("sha256").update(bytes).digest("hex");
+  if (sourceDigest !== expectedSha256) {
+    throw new Error("AGY executable sha256 does not match the configured immutable artifact");
+  }
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "seam-agy-exec-"));
+  fs.chmodSync(dir, 0o700);
+  const snapshotPath = path.join(dir, "agy");
+  let fd: number | undefined;
+  try {
+    fs.writeFileSync(snapshotPath, bytes, { flag: "wx", mode: 0o500 });
+    fs.chmodSync(snapshotPath, 0o500);
+    fd = fs.openSync(snapshotPath, fs.constants.O_RDONLY);
+    const snapshotBytes = Buffer.allocUnsafe(bytes.length);
+    let offset = 0;
+    while (offset < snapshotBytes.length) {
+      const read = fs.readSync(fd, snapshotBytes, offset, snapshotBytes.length - offset, offset);
+      if (read === 0) throw new Error("AGY executable snapshot ended before its declared size");
+      offset += read;
+    }
+    const digest = createHash("sha256").update(snapshotBytes).digest("hex");
+    if (digest !== expectedSha256) {
+      throw new Error("AGY executable snapshot sha256 does not match the configured artifact");
+    }
+    const nodeFixture = bytes.subarray(0, 64).toString("utf8").startsWith("#!/usr/bin/env node\n");
+    const executableFd = nodeFixture ? process.execPath : fdExecutable(3);
+    const argvPrefix = nodeFixture
+      ? ["--input-type=module", "--eval", NODE_FD_MODULE_LOADER, "agy"]
+      : [];
+    fs.unlinkSync(snapshotPath);
+    fs.rmdirSync(dir);
+    const ownedFd = fd;
+    fd = undefined;
+    let closed = false;
+    return {
+      ...verified,
+      digest,
+      fd: ownedFd,
+      executable: executableFd,
+      argvPrefix,
+      close() {
+        if (closed) return;
+        closed = true;
+        fs.closeSync(ownedFd);
+      },
+    };
+  } catch (error) {
+    if (fd !== undefined) fs.closeSync(fd);
+    try { fs.unlinkSync(snapshotPath); } catch { /* absent or already unlinked */ }
+    try { fs.rmdirSync(dir); } catch { /* retain no public launch surface */ }
+    throw error;
+  }
+}
+
 function buildApprovedEnvironment(
   base: NodeJS.ProcessEnv,
   additions: Readonly<Record<string, string>>
@@ -173,36 +271,44 @@ export function verifyAgyManagedRuntimeIdentity(options: {
   cwd: string;
   env: NodeJS.ProcessEnv;
 }): VerificationEntry {
-  const verified = verifyAgyManagedRuntimeArtifact(
+  const snapshot = openVerifiedSnapshot(
     options.executable,
     options.runtimeRoot,
     options.sha256
   );
-  if (verified.version === options.version) return verified;
-  const result = spawnSync(options.executable, ["--version"], {
-    cwd: options.cwd,
-    env: options.env,
-    encoding: "utf8",
-    timeout: VERSION_TIMEOUT_MS,
-    killSignal: "SIGKILL",
-    maxBuffer: VERSION_OUTPUT_LIMIT,
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  if (result.error || result.status !== 0 || result.signal) {
-    throw new Error("AGY executable version verification failed within the bounded probe");
+  try {
+    const cached = verificationCache.get(options.executable);
+    if (cached?.digest === snapshot.digest && cached.version === options.version) {
+      return { ...snapshot, version: options.version };
+    }
+    const result = spawnSync(snapshot.executable, [...snapshot.argvPrefix, "--version"], {
+      cwd: options.cwd,
+      env: options.env,
+      encoding: "utf8",
+      timeout: VERSION_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+      maxBuffer: VERSION_OUTPUT_LIMIT,
+      stdio: ["ignore", "pipe", "ignore", snapshot.fd],
+    });
+    if (result.error || result.status !== 0 || result.signal) {
+      throw new Error("AGY executable version verification failed within the bounded probe");
+    }
+    const observed = result.stdout.trim().split(/\r?\n/, 1)[0]?.slice(0, 256) ?? "";
+    if (observed !== options.version) {
+      throw new Error("AGY executable version does not match AGY_VERSION");
+    }
+    const current = verificationCache.get(options.executable);
+    if (current?.digest === snapshot.digest) current.version = observed;
+    return { ...snapshot, version: observed };
+  } finally {
+    snapshot.close();
   }
-  const observed = result.stdout.trim().split(/\r?\n/, 1)[0]?.slice(0, 256) ?? "";
-  if (observed !== options.version) {
-    throw new Error("AGY executable version does not match AGY_VERSION");
-  }
-  const current = verificationCache.get(options.executable);
-  if (current?.fingerprint === verified.fingerprint) current.version = observed;
-  return { ...verified, version: observed };
 }
 
 export class AgyNativeRuntime {
   readonly descriptor: AdapterRuntimeDescriptor;
   readonly identityKey: string;
+  readonly credentialScope: string;
   private readonly executable: string;
   private readonly runtimeRoot: string;
   private readonly expectedVersion: string;
@@ -216,6 +322,7 @@ export class AgyNativeRuntime {
     this.expectedVersion = validateExpectedVersion(options.version);
     this.expectedSha256 = validateExpectedDigest(options.sha256);
     const credentialScope = requireSemanticScope(options.credentialScope);
+    this.credentialScope = credentialScope;
     const cwd = requireAbsolute("AGY runtime cwd", options.cwd);
     this.baseEnv = { ...(options.baseEnv ?? process.env) };
     this.approvedEnvironment = { ...(options.approvedEnvironment ?? {}) };
@@ -240,15 +347,13 @@ export class AgyNativeRuntime {
       environmentFingerprint,
     })).digest("hex");
     this.descriptor = {
-      executable: this.executable,
+      identity: this.identityKey,
+      executable: "managed-artifact",
       argv: [],
-      cwd,
+      cwd: "session-workspace",
       environment: {},
       environmentKeys: Object.keys(env).sort(),
-      environmentFingerprint,
-      credentialScope,
       topology: "virtual-acp-native-cli",
-      immutableRoot: this.runtimeRoot,
       cwdPolicy: "session",
       provenance: {
         source: "google:antigravity-native-cli",
@@ -258,11 +363,11 @@ export class AgyNativeRuntime {
     };
   }
 
-  async resolve(
+  prepare(
     argv: ReadonlyArray<string>,
     cwd: string,
-    options: { mcpHome?: string } = {}
-  ): Promise<AgyNativeLaunchSpec> {
+    options: AgyNativeSpawnOptions,
+  ): AgyNativePreparedLaunch {
     const normalizedCwd = requireAbsolute("AGY launch cwd", cwd);
     if (argv.some((arg) => arg.includes("\0"))) throw new Error("AGY launch argv contains NUL");
     const env = buildApprovedEnvironment(this.baseEnv, this.approvedEnvironment);
@@ -278,6 +383,75 @@ export class AgyNativeRuntime {
       env.HOME = home;
       delete env.USERPROFILE;
     }
+    if (!Array.isArray(options.stdio) || options.stdio.length !== 3) {
+      throw new Error("native AGY descriptor-bound launch requires exactly three stdio entries");
+    }
+    const snapshot = openVerifiedSnapshot(this.executable, this.runtimeRoot, this.expectedSha256);
+    try {
+      const cached = verificationCache.get(this.executable);
+      if (cached?.digest !== snapshot.digest || cached.version !== this.expectedVersion) {
+        const result = spawnSync(snapshot.executable, [...snapshot.argvPrefix, "--version"], {
+          cwd: normalizedCwd,
+          env,
+          encoding: "utf8",
+          timeout: VERSION_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+          maxBuffer: VERSION_OUTPUT_LIMIT,
+          stdio: ["ignore", "pipe", "ignore", snapshot.fd],
+        });
+        if (result.error || result.status !== 0 || result.signal) {
+          throw new Error("AGY executable version verification failed within the bounded probe");
+        }
+        const observed = result.stdout.trim().split(/\r?\n/, 1)[0]?.slice(0, 256) ?? "";
+        if (observed !== this.expectedVersion) {
+          throw new Error("AGY executable version does not match AGY_VERSION");
+        }
+        const current = verificationCache.get(this.executable);
+        if (current?.digest === snapshot.digest) current.version = observed;
+      }
+      let consumed = false;
+      return {
+        spawn(): ChildProcess {
+          if (consumed) throw new Error("native AGY prepared launch was already consumed");
+          consumed = true;
+          let proc: ChildProcess;
+          try {
+            proc = spawn(snapshot.executable, [...snapshot.argvPrefix, ...argv], {
+              cwd: normalizedCwd,
+              env,
+              stdio: [...options.stdio, snapshot.fd],
+            });
+          } catch (error) {
+            snapshot.close();
+            throw error;
+          }
+          // libuv has duplicated fd 3 into the child before spawn() returns.
+          // The parent retains no descriptor or named snapshot afterward.
+          snapshot.close();
+          return proc;
+        },
+        close(): void {
+          consumed = true;
+          snapshot.close();
+        },
+      };
+    } catch (error) {
+      snapshot.close();
+      throw error;
+    }
+  }
+
+  async spawn(
+    argv: ReadonlyArray<string>,
+    cwd: string,
+    options: AgyNativeSpawnOptions,
+  ): Promise<ChildProcess> {
+    return this.prepare(argv, cwd, options).spawn();
+  }
+
+  verify(cwd: string): void {
+    const normalizedCwd = requireAbsolute("AGY verification cwd", cwd);
+    const env = buildApprovedEnvironment(this.baseEnv, this.approvedEnvironment);
     verifyAgyManagedRuntimeIdentity({
       executable: this.executable,
       runtimeRoot: this.runtimeRoot,
@@ -286,13 +460,6 @@ export class AgyNativeRuntime {
       cwd: normalizedCwd,
       env,
     });
-    return {
-      executable: this.executable,
-      argv: [...argv],
-      cwd: normalizedCwd,
-      env,
-      identityKey: this.identityKey,
-    };
   }
 }
 

@@ -76,6 +76,7 @@ import {
   createAgentQuotaSources,
 } from "./core/quota/quota-poller.js";
 import { AgentQuotaCard } from "./core/quota/agent-quota-card.js";
+import { publishLocalAgyRuntimeProvenance } from "./core/agy-runtime-provenance.js";
 import { ModelValueStore } from "./core/model-value/store.js";
 import { ModelMetadataStore } from "./core/model-metadata/store.js";
 import { ArtificialAnalysisMetadataSource } from "./core/model-metadata/artificial-analysis.js";
@@ -587,13 +588,7 @@ async function main(): Promise<void> {
     getModelMetadata: (idOrSlug) => modelMetadataStore.get(idOrSlug).model,
   });
 
-  if (agyRuntime) {
-    orchestrator.getConfigMutation().recordRuntimeProvenance({
-      agentId: "agy",
-      location: "local",
-      runtime: agyRuntime.descriptor,
-    });
-  }
+  publishLocalAgyRuntimeProvenance(orchestrator, agyRuntime);
 
   orchestrator.install();
 

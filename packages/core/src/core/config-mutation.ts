@@ -367,6 +367,39 @@ const SCHEDULE_ATTACHMENT_KEYS = [
   "removeFile",
 ] as const;
 
+export function safeNativeAgyRuntimeProvenance(runtime: AdapterRuntimeDescriptor): {
+  identity: string;
+  topology: "virtual-acp-native-cli";
+  cwdPolicy: "session";
+  environmentKeys: string[];
+  provenance: AdapterRuntimeDescriptor["provenance"];
+} {
+  if (
+    runtime.topology !== "virtual-acp-native-cli" ||
+    runtime.executable !== "managed-artifact" ||
+    runtime.cwd !== "session-workspace" ||
+    runtime.cwdPolicy !== "session" ||
+    runtime.argv.length !== 0 ||
+    Object.keys(runtime.environment).length !== 0 ||
+    !runtime.identity || !/^[a-f0-9]{64}$/.test(runtime.identity) ||
+    runtime.immutableRoot !== undefined ||
+    runtime.credentialScope !== undefined ||
+    runtime.environmentFingerprint !== undefined ||
+    runtime.stateDir !== undefined ||
+    runtime.conversationDir !== undefined ||
+    runtime.dependencies !== undefined
+  ) {
+    throw new Error("native AGY runtime provenance contains private or invalid launch data");
+  }
+  return {
+    identity: runtime.identity,
+    topology: runtime.topology,
+    cwdPolicy: runtime.cwdPolicy,
+    environmentKeys: [...(runtime.environmentKeys ?? [])].sort(),
+    provenance: { ...runtime.provenance },
+  };
+}
+
 export class ConfigMutationService {
   private readonly deps: ConfigMutationDeps;
   private readonly logger: Logger;
@@ -730,9 +763,7 @@ export class ConfigMutationService {
     location: string;
     runtime: AdapterRuntimeDescriptor;
   }): ConfigAuditEntry {
-    if (Object.keys(opts.runtime.environment).length > 0) {
-      throw new Error("runtime provenance must not persist environment values");
-    }
+    const safeRuntime = safeNativeAgyRuntimeProvenance(opts.runtime);
     return this.writeAudit({
       tier: "runtime-provenance",
       scope: `runtime:${opts.agentId}@${opts.location}`,
@@ -740,7 +771,7 @@ export class ConfigMutationService {
       actor: { id: "seam-runtime", name: "Seam runtime verifier" },
       summary: `verified ${opts.agentId}@${opts.location} runtime provenance`,
       before: {},
-      after: { agentId: opts.agentId, location: opts.location, runtime: opts.runtime },
+      after: { agentId: opts.agentId, location: opts.location, runtime: safeRuntime },
     });
   }
 

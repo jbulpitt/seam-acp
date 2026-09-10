@@ -58,16 +58,18 @@ model self-report or a claim of live correctness.
   exact supplied server reaches the spawned native CLI. It does not become a
   global MCP write. R2 additionally requires mode-0700 session HOME directories,
   a mode-0600 MCP file, and resolution through the same verified runtime tuple.
-- Native inventory identifies the real content-addressed AGY executable as a
-  `virtual-acp-native-cli` topology, including exact version/digest, semantic
-  credential scope, session cwd policy, immutable root, and environment key
-  names. It carries no environment values. Local and bridge construction use
-  the same resolver and tuple.
-- Every native child path verifies the non-writable managed artifact before
-  execution. Digest verification precedes bounded version execution; cache
-  identity includes the executable and credential scope. Local startup and
-  bridge hello append the verified value-free descriptor to the durable audit
-  ledger.
+- Native inventory identifies the runtime as `virtual-acp-native-cli` and
+  carries only an opaque launch-identity digest, exact artifact source/version/
+  digest, session cwd policy, and approved environment key names. Executable,
+  root and cwd paths, raw credential scope, environment fingerprint, and
+  environment values stay private. Local and bridge construction use the same
+  runtime tuple.
+- Every native child executes an anonymous descriptor-bound snapshot whose
+  bytes were hashed from that descriptor. Digest verification precedes bounded
+  version execution; both the version probe and real child receive the same fd,
+  so a post-verification pathname replacement cannot change executed bytes.
+  Local startup and bridge hello append only the reduced provenance record to
+  the durable audit ledger.
 - Structured turns pass the reserved schema through `AgentRuntime`, create the
   native schema argument, accept only the CLI's `structured_output` envelope,
   suppress planner progress as the result, and remove the temporary schema.

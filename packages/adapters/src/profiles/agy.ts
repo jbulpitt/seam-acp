@@ -19,7 +19,7 @@
  * agent picks up where it left off.
  */
 
-import { spawn, type ChildProcess, type ChildProcessByStdio } from "node:child_process";
+import { type ChildProcess, type ChildProcessByStdio } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fsSync from "node:fs";
@@ -370,7 +370,7 @@ export function makeAgyProfile(opts: {
   const runtime = opts.runtime;
   const defaultModel = opts.defaultModel ?? "antigravity";
   const catalogScope = agyNativeCatalogScope({
-    credentialScope: runtime.descriptor.credentialScope,
+    credentialScope: runtime.credentialScope,
     defaultModel,
     staticModels: opts.staticModels,
   });
@@ -416,7 +416,7 @@ export function makeAgyProfile(opts: {
           adapterVersion: AGENT_ADAPTER_VERSION,
           source: opts.staticModels?.length ? "validated-manifest+agy-catalog" : "agy-language-server",
         }).fetch();
-        await runtime.resolve([], runtime.descriptor.cwd);
+        runtime.verify(process.cwd());
         candidate.cliVersion = runtime.descriptor.provenance.version;
         return candidate;
       },
@@ -1171,11 +1171,9 @@ class AgyAgent implements Agent {
       // eslint-disable-next-line no-console
       console.error(`[agy] spawning verified native runtime useStdin=${useStdin} argvCount=${args.length}`);
     }
-    const launch = await this.runtime.resolve(args, sess.cwd, { mcpHome: sess.mcpHome });
-    const proc = spawn(launch.executable, [...launch.argv], {
-      cwd: launch.cwd,
+    const proc = await this.runtime.spawn(args, sess.cwd, {
+      mcpHome: sess.mcpHome,
       stdio: [useStdin ? "pipe" : "ignore", "pipe", "pipe"],
-      env: launch.env,
     });
 
     if (useStdin && proc.stdin) {
@@ -2022,8 +2020,7 @@ export function parseAgyAcceptedModels(output: string): Set<string> {
  * timeout, and oversized-output failures return an empty set and never throw.
  */
 export async function fetchAgyAcceptedModels(runtime: AgyNativeRuntime): Promise<Set<string>> {
-  const launch = await runtime.resolve(
-    [
+  const args = [
       "-p",
       "ok",
       AGY_NO_SLASH_EXPANSION,
@@ -2032,58 +2029,45 @@ export async function fetchAgyAcceptedModels(runtime: AgyNativeRuntime): Promise
       "--print-timeout",
       "15s",
       "--dangerously-skip-permissions",
-    ],
-    "/tmp"
-  );
+    ];
   return new Promise((resolve) => {
-    let proc: ReturnType<typeof spawn>;
-    try {
-      proc = spawn(
-        launch.executable,
-        [...launch.argv],
-        {
-          cwd: launch.cwd,
-          env: launch.env,
-          stdio: ["ignore", "pipe", "pipe"],
-        }
-      );
-    } catch {
-      resolve(new Set());
-      return;
-    }
+    void runtime.spawn(args, "/tmp", { stdio: ["ignore", "pipe", "pipe"] })
+      .then((proc) => {
 
-    let output = "";
-    let settled = false;
-    const finish = (models: Set<string>): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      resolve(models);
-    };
-    const timeout = setTimeout(() => {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        /* already gone */
-      }
-      finish(new Set());
-    }, 15_000);
-    timeout.unref?.();
-    const capture = (chunk: Buffer | string): void => {
-      output += chunk.toString();
-      if (Buffer.byteLength(output) > 1_000_000) {
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          /* already gone */
-        }
-        finish(new Set());
-      }
-    };
-    proc.stdout?.on("data", capture);
-    proc.stderr?.on("data", capture);
-    proc.once("error", () => finish(new Set()));
-    proc.once("close", () => finish(parseAgyAcceptedModels(output)));
+        let output = "";
+        let settled = false;
+        const finish = (models: Set<string>): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          resolve(models);
+        };
+        const timeout = setTimeout(() => {
+          try {
+            proc.kill("SIGKILL");
+          } catch {
+            /* already gone */
+          }
+          finish(new Set());
+        }, 15_000);
+        timeout.unref?.();
+        const capture = (chunk: Buffer | string): void => {
+          output += chunk.toString();
+          if (Buffer.byteLength(output) > 1_000_000) {
+            try {
+              proc.kill("SIGKILL");
+            } catch {
+              /* already gone */
+            }
+            finish(new Set());
+          }
+        };
+        proc.stdout?.on("data", capture);
+        proc.stderr?.on("data", capture);
+        proc.once("error", () => finish(new Set()));
+        proc.once("close", () => finish(parseAgyAcceptedModels(output)));
+      })
+      .catch(() => resolve(new Set()));
   });
 }
 
@@ -2300,10 +2284,7 @@ export async function fetchAgyUserStatus(runtime: AgyNativeRuntime): Promise<Agy
     return cached.data;
   }
   const logFile = await newSpawnLogPath();
-  const launch = await runtime.resolve(["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], "/tmp");
-  const proc = spawn(launch.executable, [...launch.argv], {
-    cwd: launch.cwd,
-    env: launch.env,
+  const proc = await runtime.spawn(["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], "/tmp", {
     stdio: ["ignore", "ignore", "ignore"],
   });
   // Missing binary would otherwise emit unhandled 'error' and crash the process.
@@ -2346,10 +2327,7 @@ async function fetchAgyCatalog(runtime: AgyNativeRuntime): Promise<AgyCatalogEnt
   // a few tokens of throwaway output; the cost is acceptable given the result
   // is cached for the process lifetime.
   const logFile = await newSpawnLogPath();
-  const launch = await runtime.resolve(["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], "/tmp");
-  const proc = spawn(launch.executable, [...launch.argv], {
-    cwd: launch.cwd,
-    env: launch.env,
+  const proc = await runtime.spawn(["-p", "ok", AGY_NO_SLASH_EXPANSION, "--log-file", logFile, "--print-timeout", "30s", "--dangerously-skip-permissions"], "/tmp", {
     stdio: ["ignore", "ignore", "ignore"],
   });
   // Missing binary would otherwise emit unhandled 'error' and crash the process.

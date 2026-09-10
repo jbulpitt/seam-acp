@@ -43,6 +43,7 @@ interface Invocation {
   } | null;
   jsonSchema?: Record<string, unknown> | null;
   args?: string[];
+  cwd?: string;
   signal?: string;
 }
 
@@ -104,7 +105,7 @@ function makeRuntime(dataDir = mappingDir): AgentRuntime {
       version: "agy fixture 1.1.28",
       sha256: managedCli.sha256,
       credentialScope: "antigravity-oauth:test",
-      cwd: root,
+      cwd: os.tmpdir(),
       baseEnv: process.env,
       approvedEnvironment: {
         SEAM_AGY_CAPABILITY_FIXTURE_DIR: process.env.SEAM_AGY_CAPABILITY_FIXTURE_DIR!,
@@ -305,14 +306,13 @@ describe.sequential("native AGY R1 capability contract", () => {
       defaultModel: "Fixture Native Model",
     });
     expect(profile.describe().runtime).toMatchObject({
-      executable: managedCli.executable,
+      identity: expect.stringMatching(/^[a-f0-9]{64}$/),
+      executable: "managed-artifact",
       argv: [],
-      cwd: root,
+      cwd: "session-workspace",
       environment: {},
       topology: "virtual-acp-native-cli",
-      immutableRoot: managedCli.runtimeRoot,
       cwdPolicy: "session",
-      credentialScope: "antigravity-oauth:test",
       provenance: {
         source: "google:antigravity-native-cli",
         version: "agy fixture 1.1.28",
@@ -410,6 +410,8 @@ describe.sequential("native AGY R1 capability contract", () => {
 
     const firstInvocation = readInvocations().find((entry) => entry.scenario === "turn-one");
     expect(firstInvocation).toBeDefined();
+    expect(firstInvocation?.cwd).toBe(root);
+    expect(firstInvocation?.cwd).not.toBe(os.tmpdir());
     expect(firstInvocation?.prompt).toContain("[Attached file: notes.txt]\nembedded fixture text");
     expect(firstInvocation?.prompt).toContain("[Attached file: payload.bin — binary content not inlined]");
     expect(firstInvocation?.prompt).not.toContain("AAEC");

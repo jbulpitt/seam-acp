@@ -52,6 +52,8 @@ export interface AdapterDescribe {
 }
 
 export interface AdapterRuntimeDescriptor {
+  /** Opaque, non-reversible identity of the complete private launch tuple. */
+  identity?: string;
   executable: string;
   argv: ReadonlyArray<string>;
   cwd: string;

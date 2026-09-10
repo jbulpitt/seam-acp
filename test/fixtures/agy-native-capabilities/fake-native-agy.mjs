@@ -76,6 +76,7 @@ appendInvocation({
   mcpConfig: mcpConfig ?? null,
   jsonSchema: jsonSchema ?? null,
   args,
+  cwd: process.cwd(),
 });
 
 const envelope = (flag, value) => {

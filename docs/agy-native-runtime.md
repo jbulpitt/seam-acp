@@ -16,14 +16,22 @@ location managed by Google's background updater. The configured executable is:
 
 (`agy.exe` on Windows.) The root, digest directory, and executable must not be
 writable by the Seam service user. The executable must be a regular,
-non-symlink file. This makes an updater replacing `~/.local/bin/agy` irrelevant
-to an admitted Seam runtime.
+non-symlink file. These layout checks are policy and operator-error defenses;
+they are not the native check-to-use guarantee.
 
-Every launch hashes the managed executable before it can execute. A bounded
-cache is keyed by device, inode, size, modification time, and change time, so a
-replacement invalidates the cached verification. Only after the digest matches
-does Seam run the bounded `--version` verification. A changed binary therefore
-cannot run even as a version probe.
+For every native launch, Seam reads the candidate into a fresh mode-0700 private
+directory, writes a mode-0500 snapshot, opens it read-only, hashes the bytes
+from that descriptor, and unlinks the snapshot before any child can run. The
+bounded `--version` probe and real child both receive that descriptor as fd 3;
+Linux executes `/proc/self/fd/3` and macOS uses `/dev/fd/3`. The configured
+pathname is never executed after verification. Renaming or replacing the
+configured root after preparation therefore cannot substitute different bytes.
+Unsupported descriptor-launch platforms fail closed.
+
+The bounded 32-entry cache retains digest/version evidence. It may skip a
+repeat version probe only after a new anonymous snapshot independently hashes
+to the configured digest. It never turns an earlier pathname check into launch
+authority.
 
 `AGY_VERSION` is the exact bounded first line of `agy --version`, and
 `AGY_SHA256` is the exact artifact digest. They are one release identity. A
@@ -50,7 +58,7 @@ another updater-controlled path.
 
 ## Launch and environment contract
 
-One native resolver supplies the executable, arguments, workspace cwd,
+One native runtime supplies the verified descriptor, arguments, workspace cwd,
 semantic credential scope, and environment for catalog discovery, quota,
 normal turns, and native helpers. Runtime identity includes executable,
 version, digest, credential scope, and a digest of the allowlisted environment,
@@ -61,8 +69,9 @@ Only the portable process keys `HOME`, `USERPROFILE`, `PATH`, temporary-director
 keys, locale keys, timezone, and required Windows process keys are inherited.
 An embedding caller may explicitly approve additional non-secret keys;
 credential-shaped key names are refused. Environment values are never included
-in bridge inventory or runtime provenance; only their names and a one-way tuple
-fingerprint travel. Per-session MCP configuration still
+in bridge inventory or runtime provenance. Inventory carries only an opaque
+launch-identity digest, topology, cwd policy, approved environment key names,
+and artifact source/version/digest. Per-session MCP configuration still
 uses a private mode-0700 HOME with a mode-0600 MCP file, while the authenticated
 Antigravity configuration remains linked from the real Gemini home.
 
@@ -73,12 +82,69 @@ change executable identity would combine proposal authority with code-execution
 authority. Instead, once the exact tuple has passed construction-time artifact
 verification, local startup appends a `runtime-provenance` row to the existing
 immutable `config_audit` ledger. A bridge hello does the same for its location.
-The row records the exact executable, managed root, topology, version, digest,
-credential scope, and environment key names, but no environment values.
+The row records the opaque launch-identity digest, topology, cwd policy,
+artifact source/version/digest, and approved environment key names. It records
+no executable path, cwd, managed root, credential scope, environment
+fingerprint, or environment value. Bridge hello validates that reduced shape
+before accepting or persisting it.
 
 This gives pin changes a durable before/after chronology without treating bare
 environment edits as sanctioned conversational mutations. Artifact staging,
 promotion, and rollback remain R9 work.
+
+## Pre-deployment migration for the current 1.2.0 host
+
+This is a prerequisite, not an action performed by R2. Run it from the checkout
+in the deployment window before starting a build containing this contract. It
+stages the already validated installed bytes under a root-owned
+content-addressed location and keeps a complete `.env` rollback copy without
+printing it:
+
+```bash
+set -euo pipefail
+agy_source=/home/ubuntu/.local/bin/agy
+agy_root=/opt/seam/agy-runtime
+agy_version=1.2.0
+agy_sha=77dc197a05ca2a47d143ad135a4679b28ef85976cfd268569233d2f3d08ce999
+agy_release="$agy_root/$agy_sha"
+agy_target="$agy_release/agy"
+env_backup=".env.pre-agy-r2.$(date -u +%Y%m%dT%H%M%SZ)"
+env_next="$(mktemp .env.agy-r2.XXXXXX)"
+
+test "$(sha256sum "$agy_source" | awk '{print $1}')" = "$agy_sha"
+test "$($agy_source --version | head -n 1)" = "$agy_version"
+sudo install -d -o root -g root -m 0755 /opt/seam "$agy_root" "$agy_release"
+sudo install -o root -g root -m 0555 "$agy_source" "$agy_target"
+test "$(sha256sum "$agy_target" | awk '{print $1}')" = "$agy_sha"
+test "$($agy_target --version | head -n 1)" = "$agy_version"
+cp -p .env "$env_backup"
+awk -v root="$agy_root" -v bin="$agy_target" -v version="$agy_version" -v sha="$agy_sha" '
+BEGIN { value["AGY_RUNTIME_ROOT"]=root; value["AGY_CLI_PATH"]=bin; value["AGY_BIN"]=bin; value["AGY_VERSION"]=version; value["AGY_SHA256"]=sha }
+{ key=$0; sub(/=.*/, "", key); if (key in value) { print key "=" value[key]; seen[key]=1 } else print }
+END { for (key in value) if (!(key in seen)) print key "=" value[key] }
+' .env > "$env_next"
+chmod --reference=.env "$env_next"
+mv "$env_next" .env
+npm run typecheck
+npm run build
+```
+
+If validation or service admission fails, restore all five pins together by
+restoring the complete pre-migration environment, then use the normal
+drain-style deployment path; do not partially edit individual pins:
+
+```bash
+set -euo pipefail
+test -n "${env_backup:-}"
+test -f "$env_backup"
+cp -p "$env_backup" .env
+npm run redeploy
+```
+
+The staged root may remain for inspection; it is inactive after rollback. R2
+deliberately keeps this host mutation outside conversational `config_propose`.
+The accepted reduced runtime identity is recorded by the immutable runtime
+provenance audit at startup; artifact promotion/rollback automation remains R9.
 
 ## Deliberate exclusions
 

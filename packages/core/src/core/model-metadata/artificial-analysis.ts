@@ -85,19 +85,19 @@ export class ArtificialAnalysisMetadataSource implements MetadataSource {
     private readonly fetchImpl: FetchLike = fetch
   ) {}
 
-  fetch(): Promise<MetadataSourceModel[]> {
+  fetch(signal?: AbortSignal): Promise<MetadataSourceModel[]> {
     if (this.inFlight) return this.inFlight;
-    this.inFlight = this.fetchInner().finally(() => {
+    this.inFlight = this.fetchInner(signal).finally(() => {
       this.inFlight = undefined;
     });
     return this.inFlight;
   }
 
-  private async fetchInner(): Promise<MetadataSourceModel[]> {
+  private async fetchInner(signal?: AbortSignal): Promise<MetadataSourceModel[]> {
     if (!this.apiKey.trim()) throw new Error("AA_API_KEY is not configured");
     const response = await this.fetchImpl(AA_MODELS_URL, {
       headers: { "x-api-key": this.apiKey },
-      signal: AbortSignal.timeout(30_000),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
     });
     if (!response.ok) throw new Error(`Artificial Analysis request failed: HTTP ${response.status}`);
     return parseAaModels(await response.json());

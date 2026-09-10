@@ -102,6 +102,12 @@ export interface AvailableCatalogModel {
   generation: number;
 }
 
+export interface CatalogFleetBinding {
+  binding: CatalogBinding;
+  state: CatalogLookup["state"];
+  snapshot: StoredCatalogSnapshot | null;
+}
+
 interface FetchedCatalogCandidate {
   candidate: AdapterCatalogCandidate;
   /** Binding whose adapter actually performed the scope-shared provider work. */
@@ -191,6 +197,18 @@ export class ModelCatalogService {
       }
     }
     return rows;
+  }
+
+  /** Complete cache-only input for coordinated enrichment (#249). */
+  fleetSnapshot(): CatalogFleetBinding[] {
+    const configured = uniqueBindings([
+      ...this.options.bindings(),
+      ...this.knownBindings(),
+    ]);
+    return configured.map((binding) => {
+      const lookup = this.lookup(binding);
+      return { binding, state: lookup.state, snapshot: lookup.snapshot };
+    }).sort((a, b) => bindingKey(a.binding).localeCompare(bindingKey(b.binding)));
   }
 
   onPublication(listener: (event: CatalogPublication) => void): () => void {

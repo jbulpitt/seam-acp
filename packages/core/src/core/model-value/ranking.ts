@@ -7,25 +7,9 @@ import {
   type ModelValueSnapshotRow,
   type ModelValueTier,
 } from "./types.js";
-import {
-  MODEL_METADATA_ALIASES,
-  chooseAaVariant,
-  normalizeAaEffort,
-  normalizeModelName,
-  type ModelAlias,
-} from "../model-metadata/aliases.js";
+import { matchArtificialAnalysis, matchCopilotPricing, normalizeAaEffort, normalizeExternalModelName } from "../model-intelligence/matching.js";
 
-export {
-  MODEL_METADATA_ALIASES as COPILOT_MODEL_VALUE_ALIASES,
-  normalizeAaEffort,
-  normalizeModelName,
-};
-
-function choosePricing(alias: ModelAlias | undefined, pricing: CopilotPricing[]): CopilotPricing | null {
-  if (!alias) return null;
-  const wanted = new Set(alias.pricingNames.map(normalizeModelName));
-  return pricing.find((row) => wanted.has(normalizeModelName(row.modelName))) ?? null;
-}
+export { normalizeAaEffort, normalizeExternalModelName as normalizeModelName };
 
 export function creditsPerTask(
   inputTokens: number,
@@ -66,12 +50,22 @@ export function buildModelValueSnapshot(input: {
   pricing: CopilotPricing[];
   inputTokens: number;
   outputTokens: number;
+  cachedInputTokens?: number;
+  cacheWriteTokens?: number;
+  longContextThresholdTokens?: number;
   fetchedAt: string;
 }): BuildSnapshotResult {
   const intermediate = input.copilotModels.map((model) => {
-    const alias = MODEL_METADATA_ALIASES[model.modelId];
-    const aa = chooseAaVariant(alias, input.aaModels, model.validEffortTiers);
-    return { model, aa, pricing: choosePricing(alias, input.pricing), alias };
+    const matchable = {
+      modelId: model.modelId, displayName: model.displayName, aliases: model.aliases,
+      effortChoices: model.validEffortTiers, effortDefault: model.effortDefault,
+      effortMechanism: model.effortMechanism,
+    };
+    const aa = matchArtificialAnalysis(matchable, input.aaModels);
+    const totalInput = input.inputTokens + (input.cachedInputTokens ?? 0) + (input.cacheWriteTokens ?? 0);
+    const priceTier = totalInput > (input.longContextThresholdTokens ?? 200_000) ? "long-context" : "default";
+    const priceMatch = matchCopilotPricing(matchable, input.pricing, priceTier);
+    return { model, aa, priceMatch, pricing: priceMatch.row };
   });
   const thresholds = tierThresholds(
     intermediate.flatMap((entry) =>
@@ -80,9 +74,12 @@ export function buildModelValueSnapshot(input: {
   );
   const matchedAa = new Set(intermediate.flatMap((entry) => (entry.aa.row ? [entry.aa.row.slug] : [])));
   return {
-    rows: intermediate.map(({ model, aa, pricing }) => {
-      const credits = pricing
-        ? creditsPerTask(input.inputTokens, input.outputTokens, pricing.inputRate, pricing.outputRate)
+    rows: intermediate.map(({ model, aa, pricing, priceMatch }) => {
+      const cached = input.cachedInputTokens ?? 0;
+      const writes = input.cacheWriteTokens ?? 0;
+      const credits = pricing && (cached === 0 || pricing.cachedInputRate !== null) && (writes === 0 || pricing.cacheWriteRate !== null)
+        ? (input.inputTokens * pricing.inputRate + cached * (pricing.cachedInputRate ?? 0) +
+          writes * (pricing.cacheWriteRate ?? 0) + input.outputTokens * pricing.outputRate) / 1_000_000 / 0.01
         : null;
       const intelligence = aa.row?.intelligenceIndex ?? null;
       return {
@@ -100,14 +97,35 @@ export function buildModelValueSnapshot(input: {
         validEffortTiers: model.validEffortTiers,
         priceCategory: model.priceCategory,
         fetchedAt: input.fetchedAt,
+        variantId: model.variantId ?? model.modelId,
+        displayName: model.displayName,
+        selectedBenchmarkEffort: aa.selectedEffort,
+        benchmarkSourceName: aa.row?.name ?? null,
+        benchmarkMatchStatus: aa.status === "matched" && intelligence === null
+          ? "missing-benchmark" : aa.status,
+        pricingMatchStatus: model.modelId === "auto" ? "intentionally-unrankable" : priceMatch.status,
+        pricingMatchCandidates: priceMatch.candidates,
+        pricingMatchRecordName: pricing?.modelName ?? null,
+        pricingTier: pricing?.tier ?? null,
+        scenario: {
+          uncached_input_tokens: input.inputTokens,
+          cached_input_tokens: cached,
+          cache_write_tokens: writes,
+          output_tokens: input.outputTokens,
+          long_context_threshold_tokens: input.longContextThresholdTokens ?? 200_000,
+        },
+        effortDefault: model.effortDefault,
+        effortMechanism: model.effortMechanism,
       };
     }),
-    unmatchedCopilotModels: intermediate.filter((entry) => !entry.alias).map((entry) => entry.model.modelId),
+    unmatchedCopilotModels: intermediate
+      .filter((entry) => !entry.aa.row && !entry.pricing)
+      .map((entry) => entry.model.modelId),
     unmatchedPricingModels: intermediate
       .filter((entry) => entry.model.modelId !== "auto" && !entry.pricing)
       .map((entry) => entry.model.modelId),
     unmatchedAaModels: intermediate
-      .filter((entry) => entry.alias && entry.alias.aaSlugPrefixes.length > 0 && !entry.aa.row)
+      .filter((entry) => !entry.aa.row)
       .map((entry) => entry.model.modelId),
     ignoredAaVariants: intermediate.flatMap((entry) => entry.aa.ignored),
   };
@@ -143,6 +161,25 @@ export function rankSnapshotRows(
             },
       valid_effort_tiers: row.validEffortTiers,
       price_category: row.priceCategory,
+      variant_id: row.variantId,
+      display_name: row.displayName,
+      bindings: row.bindings,
+      catalog_generation: row.catalogGeneration,
+      enrichment_generation: row.enrichmentGeneration,
+      selected_benchmark_effort: row.selectedBenchmarkEffort,
+      benchmark_source_name: row.benchmarkSourceName,
+      diagnostics: {
+        benchmark: row.benchmarkMatchStatus ?? "legacy-unknown",
+        pricing: row.pricingMatchStatus ?? "legacy-unknown",
+      },
+      pricing_tier: row.pricingTier,
+      source_snapshots: row.sourceSnapshots,
+      source_fetched_at: row.sourceFetchedAt,
+      source_status: row.sourceStatus,
+      generation_diagnostics: row.generationDiagnostics,
+      catalog_default: row.catalogDefault,
+      effort_default: row.effortDefault,
+      effort_mechanism: row.effortMechanism,
     };
     return result;
   });
@@ -152,7 +189,8 @@ export function rankSnapshotRows(
     if (tierDelta !== 0) return tierDelta;
     if (a.value_score === null && b.value_score !== null) return 1;
     if (a.value_score !== null && b.value_score === null) return -1;
-    return (b.value_score ?? 0) - (a.value_score ?? 0) || a.model.localeCompare(b.model);
+    return (b.value_score ?? 0) - (a.value_score ?? 0) || a.model.localeCompare(b.model) ||
+      (a.variant_id ?? a.model).localeCompare(b.variant_id ?? b.model);
   });
   return ranked;
 }

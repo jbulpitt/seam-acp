@@ -1039,6 +1039,11 @@ export function buildSeamAdminCommand(): SlashCommandBuilder {
               .setName("accept-reduction")
               .setDescription("Accept a quarantined model removal this once")
           )
+          .addBooleanOption((o) =>
+            o
+              .setName("refresh-sources")
+              .setDescription("Also force intelligence sources and publish")
+          )
       )
   );
 

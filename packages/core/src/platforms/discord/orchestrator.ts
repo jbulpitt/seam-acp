@@ -77,6 +77,8 @@ import type { AgentProfile } from "@seam/adapters";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import type { ScheduledPromptManager } from "../../core/scheduled-prompts/manager.js";
 import type { ScheduledPrompt } from "../../core/scheduled-prompts/types.js";
+import { scheduledOccurrenceKey, type ScheduledOccurrenceKey, type ScheduledOccurrence,
+  type ScheduledExecutionIdentity } from "../../core/scheduled-prompts/occurrence-store.js";
 import { rebuildMigratedAgySession } from "../../core/agy-identity-migration.js";
 import type { WakeManager } from "../../core/wake/manager.js";
 import type { WakeEvent, WakeScheduleRequest } from "../../core/wake/types.js";
@@ -2932,12 +2934,14 @@ export class Orchestrator {
 
   private async handleIncomingMessageInner(
     msg: IncomingMessage,
-    queueFence?: ChannelQueueFence
+    queueFence?: ChannelQueueFence,
+    scheduledAttempt?: TurnAttempt
   ): Promise<void> {
     try {
-      await this.executeIncomingMessage(msg, queueFence);
+      await this.executeIncomingMessage(msg, queueFence, scheduledAttempt);
     } catch (err) {
-      const a = msg.messageId ? this.store.turnAttempts?.get(inboundAttemptId(msg.messageId)) : null;
+      const a = scheduledAttempt ? this.store.turnAttempts.get(scheduledAttempt.id)
+        : msg.messageId ? this.store.turnAttempts?.get(inboundAttemptId(msg.messageId)) : null;
       // Setup before the streaming finalizer exists can fail too (e.g. initial
       // Discord panel). Persist that genuine unsubmitted failure; restart and
       // strict-resume refusal must never become an ordinary terminal result.
@@ -2952,9 +2956,13 @@ export class Orchestrator {
 
   private async executeIncomingMessage(
     msg: IncomingMessage,
-    queueFence?: ChannelQueueFence
+    queueFence?: ChannelQueueFence,
+    scheduledAttempt?: TurnAttempt
   ): Promise<void> {
     this.assertQueueFence(queueFence);
+    if (scheduledAttempt && (this.restartCutoff || !this.store.turnAttempts.isCurrent(scheduledAttempt))) {
+      throw new DispatchSuspendedError(scheduledAttempt.id);
+    }
     // #80 v1: detach is a handleMessage gate only. Schedules / wakes / watches
     // / handoffs / steer synthesize an IncomingMessage and enter HERE, so they
     // still run in a detached thread. Do not treat detach as a full mute.
@@ -2966,14 +2974,14 @@ export class Orchestrator {
       cwd: this.config.REPOS_ROOT,
     });
     const admission = msg.messageId ? this.store.getInbound?.(msg.messageId) : null;
-    let humanAttempt: TurnAttempt | undefined;
+    let humanAttempt: TurnAttempt | undefined = scheduledAttempt;
     let humanOutcomeOwned = false;
     let humanDelivered = false;
     let humanPromptSubmitted = false;
     let humanOutput = "";
-    const priorHuman = admission ? this.store.turnAttempts.get(inboundAttemptId(admission.messageId)) : null;
+    const priorHuman = scheduledAttempt ?? (admission ? this.store.turnAttempts.get(inboundAttemptId(admission.messageId)) : null);
     const humanResume = priorHuman?.promptStarted === true;
-    if (admission) {
+    if (admission || scheduledAttempt) {
       if (priorHuman?.state === "completed" || priorHuman?.state === "cancelled") return;
       if (priorHuman?.acpSessionId && record.acpSessionId && priorHuman.acpSessionId !== record.acpSessionId) {
         throw new DispatchSuspendedError(priorHuman.id);
@@ -2981,21 +2989,25 @@ export class Orchestrator {
       const d = this.router.describeConfig(record);
       const p = this.router.getProfile(d.agent.value, d.location.value);
       if (humanResume && (d.agent.value !== "codex" || !isLocalLocation(d.location.value) || !priorHuman?.acpSessionId)) {
-        throw new DispatchSuspendedError(inboundAttemptId(admission.messageId));
+        throw new DispatchSuspendedError(priorHuman!.id);
       }
       const { lastContextUsage: _usage, ...identityConfig } = this.store.readConfig(record);
-      const identity = executionIdentity({ source: "inbound", agent: d.agent.value,
+      const identity = executionIdentity({ source: scheduledAttempt ? "schedule" : "inbound", agent: d.agent.value,
         location: d.location.value, model: d.model.value, effort: d.effort.value,
         cwd: d.cwd.value, config: identityConfig, providerScope: p?.catalog?.scope?.(), runtime: p?.runtime });
-      this.store.turnAttempts.registerOwner(this.attemptBoot);
-      humanAttempt = this.store.turnAttempts.claim({
+      if (scheduledAttempt) {
+        if (identity !== scheduledAttempt.identity) throw new DispatchSuspendedError(scheduledAttempt.id);
+      } else if (admission) {
+        this.store.turnAttempts.registerOwner(this.attemptBoot);
+        humanAttempt = this.store.turnAttempts.claim({
         id: inboundAttemptId(admission.messageId), target: admission.channelRef,
         prompt: admission.text, session: "live", kind: "parked",
         createdUtc: admission.createdUtc,
-      }, identity, this.attemptBoot, "inbound");
+        }, identity, this.attemptBoot, "inbound");
+      }
       if (this.restartCutoff) {
         this.store.turnAttempts.suspendBoot(this.attemptBoot);
-        throw new DispatchSuspendedError(humanAttempt.id);
+        throw new DispatchSuspendedError(humanAttempt!.id);
       }
       // Never restage old attachments, re-transcribe voice or rebuild the
       // original brief while resuming a submitted human turn.
@@ -3036,6 +3048,7 @@ export class Orchestrator {
         ...(channel.parentId ? { parentRef: channel.parentId } : {}),
         sessionRecordId: record.id,
         ...(admission ? { inboundMessageId: admission.messageId, promptStarted: humanAttempt?.promptStarted ?? false } : {}),
+        ...(scheduledAttempt ? { scheduleOccurrenceId: scheduledAttempt.id, promptStarted: scheduledAttempt.promptStarted } : {}),
         ...(record.acpSessionId ? { acpSessionId: record.acpSessionId } : {}),
         ...(msg.authorId ? { authorId: msg.authorId } : {}),
         startedUtc: new Date().toISOString(),
@@ -10634,21 +10647,117 @@ export class Orchestrator {
    *  per-schedule model/cwd overrides) and post the output to the thread as
    *  blue cards. Owns last_run/last_status only — the manager owns next_run.
    *  Read-only w.r.t. the thread's live session. */
-  async runScheduledPrompt(id: string): Promise<void> {
-    const row = this.store.getScheduled(id);
+  async runScheduledPrompt(id: string, key = scheduledOccurrenceKey(id), manualResume = false): Promise<void> {
+    const row = this.store.scheduledOccurrences?.get(key.id)?.row ?? this.store.getScheduled(id);
     if (!row) return;
     // Register before the first asynchronous precondition check. Live mode is
     // also counted by queueOnChannel once admitted there, but this outer token
     // covers the otherwise invisible interval before queue registration.
     const endTurn = this.beginTurn();
     try {
-      await this.runScheduledPromptInner(row);
+      await this.runDurableScheduledPrompt(row, key, manualResume);
     } finally {
       endTurn();
     }
   }
 
-  private async runScheduledPromptInner(row: ScheduledPrompt): Promise<void> {
+  private scheduleExecution(row: ScheduledPrompt): ScheduledExecutionIdentity {
+    const record = this.router.ensureSessionRecord({ platform: PLATFORM, channelRef: row.channelRef,
+      ...(row.parentRef ? { parentRef: row.parentRef } : {}), cwd: this.config.REPOS_ROOT });
+    const d = this.router.describeConfig(record);
+    const p = this.router.getProfile(d.agent.value, d.location.value);
+    const { lastContextUsage: _usage, ...config } = this.store.readConfig(record);
+    const model = row.sessionMode === "live" ? d.model.value : row.model?.trim() || d.model.value;
+    const cwd = row.sessionMode === "live" ? d.cwd.value : row.cwd?.trim() || d.cwd.value;
+    const fingerprint = executionIdentity({ source: "schedule", agent: d.agent.value,
+      location: d.location.value, model, effort: d.effort.value, cwd, config,
+      providerScope: p?.catalog?.scope?.(), runtime: p?.runtime });
+    return { agentId: d.agent.value, location: d.location.value, model, effort: d.effort.value, cwd, fingerprint };
+  }
+
+  private async runDurableScheduledPrompt(row: ScheduledPrompt, key: ScheduledOccurrenceKey, manualResume = false): Promise<void> {
+    const saved = this.store.scheduledOccurrences.get(key.id);
+    const prior = this.store.turnAttempts.get(key.id);
+    if (saved?.settled) return;
+    if (saved && prior?.state === "completed") { await this.deliverScheduledCompletion(saved, prior); return; }
+    if (saved && prior?.state === "cancelled") { await this.settleScheduleCancellation(saved); return; }
+    const execution = this.scheduleExecution(row);
+    const occurrence = this.store.scheduledOccurrences.reserve(key, row, execution);
+    if (!occurrence) { this.patchScheduledStatus(row.id, "skipped: still running"); return; }
+    if (occurrence.settled) return;
+    if (prior?.state === "completed") { await this.deliverScheduledCompletion(occurrence, prior); return; }
+    if (prior?.state === "cancelled") { await this.settleScheduleCancellation(occurrence); return; }
+    if (execution.fingerprint !== occurrence.execution.fingerprint || this.restartCutoff) return;
+    if (prior?.promptStarted && ((!manualResume && !this.config.SEAM_TURN_RESUME_ENABLED) || execution.agentId !== "codex" ||
+      !isLocalLocation(execution.location) || !prior.acpSessionId)) return;
+    try {
+      this.store.turnAttempts.registerOwner(this.attemptBoot);
+      const attempt = this.store.turnAttempts.claim({ id: key.id, target: row.channelRef,
+        prompt: row.promptText, session: row.sessionMode, kind: "scheduled", createdUtc: new Date().toISOString(),
+        agentId: execution.agentId, location: execution.location, model: execution.model,
+        cwd: execution.cwd, ...(execution.effort ? { effort: execution.effort } : {}),
+      }, occurrence.execution.fingerprint, this.attemptBoot, "schedule");
+      try {
+        await this.runScheduledPromptInner(occurrence.row, { occurrence, attempt });
+      } catch (err) {
+        if (err instanceof DispatchSuspendedError) {
+          this.store.turnAttempts.suspend(attempt.id, this.attemptBoot);
+          return;
+        }
+        if (!this.store.turnAttempts.isCurrent(attempt) || this.restartCutoff) return;
+        if (this.store.turnAttempts.get(attempt.id)?.state !== "completed") {
+          this.store.turnAttempts.complete(attempt, { id: attempt.id, target: row.channelRef,
+            status: "failed", error: "scheduled execution failed", finishedUtc: new Date().toISOString() });
+        }
+        throw err;
+      }
+      const terminal = this.store.turnAttempts.get(key.id)!;
+      if (terminal.state === "cancelled") await this.settleScheduleCancellation(occurrence);
+      else if (terminal.state === "completed" && terminal.deliveryDone) {
+        this.store.scheduledOccurrences.settle(key.id);
+      }
+    } catch (err) {
+      if (!(err instanceof DispatchSuspendedError)) throw err;
+    }
+  }
+
+  private async settleScheduleCancellation(occurrence: ScheduledOccurrence): Promise<void> {
+    if (occurrence.row.sessionMode === "live") await finishLiveTurn(this.config.DATA_DIR, {
+      id: occurrence.id, status: "cancelled", channelRef: occurrence.row.channelRef,
+      finishedUtc: new Date().toISOString(), reason: "durable cancellation" });
+    this.store.scheduledOccurrences.settle(occurrence.id);
+  }
+
+  /** Delivery-only recovery. Disable/delete stops future ticks, not an already
+   * admitted occurrence or its captured output. Never rerun a provider here. */
+  private async deliverScheduledCompletion(occurrence: ScheduledOccurrence, attempt: TurnAttempt): Promise<void> {
+    if (!attempt.outcome) return;
+    if (!attempt.deliveryDone) {
+      const row = occurrence.row;
+      const target: ChannelRef = { platform: PLATFORM,
+        id: row.sessionMode === "live" ? row.channelRef : row.targetChannel || row.channelRef };
+      if (await this.checkResumePreconditions(target) !== "ok") return;
+      const result = attempt.outcome;
+      if (result.status === "failed") {
+        await this.sendResultCard(target, `⏰ ${row.name} — failed`, "Scheduled execution failed.", 0xe74c3c);
+      } else await this.postScheduledVisibleResult(target, row.id, row.name, result.output ?? "", row.outputType,
+        row.sessionMode === "isolated" ? this.isolatedScheduleIdentityFields(occurrence.execution) : []);
+      this.store.turnAttempts.markDeliveryDone(attempt.id);
+      this.patchScheduledStatus(row.id, result.status === "failed" ? "error: scheduled execution failed" : "ok");
+    }
+    this.store.scheduledOccurrences.settle(occurrence.id);
+    if (occurrence.row.sessionMode === "live") await finishLiveTurn(this.config.DATA_DIR, {
+      id: occurrence.id, status: "completed", channelRef: occurrence.row.channelRef, finishedUtc: new Date().toISOString() });
+  }
+
+  private async runScheduledPromptInner(row: ScheduledPrompt, owned?: { occurrence: ScheduledOccurrence; attempt: TurnAttempt }): Promise<void> {
+    const assertOwned = (): void => {
+      if (owned && (this.restartCutoff || !this.store.turnAttempts.isCurrent(owned.attempt) ||
+        this.scheduleExecution(row).fingerprint !== owned.occurrence.execution.fingerprint)) {
+        throw new DispatchSuspendedError(owned.attempt.id);
+      }
+    };
+    assertOwned();
     const id = row.id;
     const bindingThread: ChannelRef = {
       platform: PLATFORM,
@@ -10656,9 +10765,17 @@ export class Orchestrator {
       ...(row.parentRef ? { parentId: row.parentRef } : {}),
     };
     // Output goes to the configured target channel, or the schedule's own thread.
-    const target: ChannelRef = row.targetChannel
+    const target: ChannelRef = row.sessionMode !== "live" && row.targetChannel
       ? { platform: PLATFORM, id: row.targetChannel }
       : bindingThread;
+    const skip = (): void => {
+      if (!owned) return;
+      const a = owned.attempt;
+      if (a.promptStarted) throw new DispatchSuspendedError(a.id);
+      if (!this.store.turnAttempts.complete(a, { id: a.id, target: row.channelRef,
+        status: "completed", output: "", finishedUtc: new Date().toISOString() })) throw new DispatchSuspendedError(a.id);
+      this.store.turnAttempts.markDeliveryDone(a.id);
+    };
 
     // 1. Can we post to the output target? run / skip-locked / drop-deleted.
     if (typeof this.adapter.getThreadLiveState === "function") {
@@ -10668,6 +10785,7 @@ export class Orchestrator {
       } catch (err) {
         this.logger.warn({ id, err }, "scheduled: target state check failed (transient); skipping");
         this.patchScheduledStatus(id, "skipped: target unreachable");
+        skip();
         return;
       }
       if (state === undefined) {
@@ -10679,14 +10797,17 @@ export class Orchestrator {
         } else {
           this.patchScheduledStatus(id, "skipped: target deleted");
         }
+        skip();
         return;
       }
       if (state.locked) {
         this.patchScheduledStatus(id, "skipped: target locked");
+        skip();
         return;
       }
     }
 
+    assertOwned();
     // 1b. Live mode (M3): run as a real turn *inside* the bound thread. Synthesize
     //     an IncomingMessage and drive it through the same FIFO + turn pipeline a
     //     user message uses, so it streams identically — status panel, live text,
@@ -10716,14 +10837,21 @@ export class Orchestrator {
           // cancellation and returns void (D5), so detect the abort by comparing
           // the generation across the turn rather than from a return value.
           const genAtStart = this.channelGenerations.get(row.channelRef) ?? 0;
-          await this.handleIncomingMessageInner(synthetic, fence);
+          if (owned) await this.handleIncomingMessageInner(synthetic, fence, owned.attempt);
+          else await this.handleIncomingMessageInner(synthetic, fence);
           aborted = (this.channelGenerations.get(row.channelRef) ?? 0) > genAtStart;
         });
         // D4: record the abort; do NOT auto-retry (it would fight the user).
         // D5: otherwise we can only record "ok" — the inner path owns its own
         // turn-level error reporting and does not surface it here.
-        this.patchScheduledStatus(id, aborted ? "aborted: user turn" : "ok");
+        if (owned) {
+          const done = this.store.turnAttempts.get(owned.attempt.id)!;
+          if (done.state === "active" || done.state === "suspended") throw new DispatchSuspendedError(done.id);
+          this.patchScheduledStatus(id, done.state === "cancelled" ? "aborted: user turn"
+            : done.outcome?.status === "failed" ? "error: live turn failed" : "ok");
+        } else this.patchScheduledStatus(id, aborted ? "aborted: user turn" : "ok");
       } catch (err) {
+        if (owned && err instanceof DispatchSuspendedError) throw err;
         const emsg = err instanceof Error ? err.message : String(err);
         this.patchScheduledStatus(id, `error: ${emsg.slice(0, 200)}`);
       }
@@ -10749,6 +10877,7 @@ export class Orchestrator {
     });
     if (!identity.ok) {
       this.patchScheduledStatus(id, `error: ${identity.error}`);
+      skip();
       return;
     }
     const { profile, agentId, cwd, model, effort } = identity;
@@ -10777,6 +10906,7 @@ export class Orchestrator {
     //    schedule carries no files, so there is nothing to load, partition or
     //    stage. Substantial instructions belong in a repository runbook the
     //    prompt asks the agent to read.
+    assertOwned();
     const result = await this.runIsolatedScheduledJob({
       profile,
       record: live,
@@ -10785,6 +10915,7 @@ export class Orchestrator {
       ...(effort ? { effort } : {}),
       channel: target,
       promptText: row.promptText,
+      ...(owned ? { owned } : {}),
     });
 
     // 5. Post result as NEW message(s) + record status. Result cards carry
@@ -10802,6 +10933,7 @@ export class Orchestrator {
       this.patchScheduledStatus(id, "ok");
       await this.postScheduledVisibleResult(target, id, row.name, result.text, row.outputType, identityFields);
     }
+    if (owned) this.store.turnAttempts.markDeliveryDone(owned.attempt.id);
   }
 
   /** Non-streamed scheduled output still participates in the one shared
@@ -10849,15 +10981,46 @@ export class Orchestrator {
     effort?: string;
     channel: ChannelRef;
     promptText: string;
+    owned?: { occurrence: ScheduledOccurrence; attempt: TurnAttempt };
   }): Promise<{ text: string; error?: string }> {
     const { profile, record, cwd, model, effort, channel, promptText } = args;
+    const owned = args.owned;
+    const attempt = owned?.attempt;
+    const resume = attempt?.promptStarted === true;
+    let submitted = false;
+    let completed = false;
     // Target = the binding thread's session (what the job belongs to);
     // outputTo = where the run reports, which may be a different channel when
     // the schedule sets an explicit target.
-    const result = await this.injectTurn(record, promptText, {
+    const result = await this.injectTurn(record, resume ? CONTINUE_PROMPT : promptText, {
       session: "isolated",
       profile,
       cwd,
+      ...(owned ? {
+        location: owned.occurrence.execution.location,
+        strictModel: true,
+        ...(attempt?.acpSessionId ? { resumeSessionId: attempt.acpSessionId } : {}),
+        onSession: (sessionId: string) => this.store.turnAttempts.bind(attempt!, sessionId),
+        lifecycle: {
+          isCurrent: () => !this.restartCutoff && this.store.turnAttempts.isCurrent(attempt!),
+          onRuntime: (pid: number | undefined, providerIdentity?: string) => this.store.turnAttempts.bindRuntime(attempt!, pid, providerIdentity),
+          beforePrompt: () => {
+            if (this.restartCutoff) throw new DispatchSuspendedError(attempt!.id);
+            this.store.turnAttempts.startPrompt(attempt!); submitted = true;
+          },
+          onOutcome: (outcome: InjectTurnResult) => {
+            if (this.restartCutoff || !this.store.turnAttempts.isCurrent(attempt!) || resume && !submitted) {
+              throw new DispatchSuspendedError(attempt!.id);
+            }
+            if (outcome.cancelled) { this.store.turnAttempts.cancel(attempt!.id); throw new DispatchSuspendedError(attempt!.id); }
+            completed = this.store.turnAttempts.complete(attempt!, { id: attempt!.id, target: record.channelRef,
+              status: outcome.error ? "failed" : "completed", output: outcome.text, error: outcome.error,
+              stopReason: outcome.stopReason, finishedUtc: new Date().toISOString() });
+            if (!completed) throw new DispatchSuspendedError(attempt!.id);
+          },
+          mayDeleteSession: () => completed || this.store.turnAttempts.get(attempt!.id)?.state === "cancelled",
+        },
+      } : {}),
       ...(model ? { model } : {}),
       ...(effort ? { effort } : {}),
       outputTo: channel,
@@ -13189,6 +13352,9 @@ export class Orchestrator {
     if (!opts?.preserveDispatch) {
       for (const state of ["active", "suspended"] as const) {
         for (const a of this.store.turnAttempts?.list(state) ?? []) {
+          // A normal user turn replaces the active live schedule, not an
+          // independent isolated occurrence or a schedule still queued behind it.
+          if (a.source === "schedule" && (a.spec.session === "isolated" || this.liveTurnByChannel.get(channelRef) !== a.id)) continue;
           if (a.spec.target === channelRef) this.store.turnAttempts.cancel(a.id);
         }
       }
@@ -13268,6 +13434,9 @@ export class Orchestrator {
   }
 
   private async abandonLiveMarker(marker: LiveTurnMarker, reason: string): Promise<void> {
+    if (marker.scheduleOccurrenceId) {
+      if (this.store.turnAttempts.cancel(marker.scheduleOccurrenceId)) this.store.scheduledOccurrences.settle(marker.scheduleOccurrenceId);
+    }
     if (marker.inboundMessageId) {
       this.store.turnAttempts.cancel(marker.id);
       this.store.settleInboundExecution(marker.inboundMessageId);
@@ -13382,7 +13551,7 @@ export class Orchestrator {
     await this.recoverInboundOutput();
     const liveJobs: Array<Promise<void>> = [];
     for (const marker of live) {
-      if (marker.inboundMessageId || inboundChannels.has(marker.channelRef)) continue;
+      if (marker.inboundMessageId || marker.scheduleOccurrenceId || inboundChannels.has(marker.channelRef)) continue;
       const pre = await this.checkResumePreconditions({
         platform: PLATFORM,
         id: marker.channelRef,
@@ -13566,6 +13735,14 @@ export class Orchestrator {
     const live = await listLiveMarkers(this.config.DATA_DIR).catch(() => [] as LiveTurnMarker[]);
     const marker = live.find((m) => m.id === id);
     if (marker) {
+      if (marker.scheduleOccurrenceId) {
+        const occurrence = this.store.scheduledOccurrences.get(marker.scheduleOccurrenceId);
+        const attempt = this.store.turnAttempts.get(marker.scheduleOccurrenceId);
+        if (!occurrence || attempt?.state !== "suspended") return `Cannot resume \`${id}\` — no suspended occurrence.`;
+        void this.runScheduledPrompt(occurrence.scheduleId, occurrence, true).catch(err =>
+          this.logger.warn({ id, err }, "manual scheduled continuation deferred"));
+        return `Continuation requested for \`${id}\`; ownership and provider guards still apply.`;
+      }
       if (marker.inboundMessageId) {
         const a = this.store.turnAttempts.get(id);
         const row = this.store.getInbound(marker.inboundMessageId);

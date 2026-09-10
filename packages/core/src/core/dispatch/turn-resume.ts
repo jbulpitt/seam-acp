@@ -72,6 +72,7 @@ export interface LiveTurnMarker {
   location?: string;
   /** Human input linkage; absent on legacy markers and synthetic turns. */
   inboundMessageId?: string;
+  scheduleOccurrenceId?: string;
   promptStarted?: boolean;
 }
 
@@ -297,6 +298,7 @@ export function parseLiveMarker(id: string, raw: string): LiveTurnMarker {
     startedUtc: json.startedUtc,
     ...(json.location ? { location: json.location } : {}),
     ...(typeof json.inboundMessageId === "string" ? { inboundMessageId: json.inboundMessageId } : {}),
+    ...(typeof json.scheduleOccurrenceId === "string" ? { scheduleOccurrenceId: json.scheduleOccurrenceId } : {}),
     ...(typeof json.promptStarted === "boolean" ? { promptStarted: json.promptStarted } : {}),
   };
 }

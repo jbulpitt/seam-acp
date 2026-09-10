@@ -261,7 +261,7 @@ describe("#158 scheduler arming boundary", () => {
     expect(mgr.armedCount).toBe(1);
 
     await mgr.runNow("sch_ok");
-    expect(onFire).toHaveBeenCalledWith("sch_ok");
+    expect(onFire).toHaveBeenCalledWith("sch_ok", { id: expect.stringMatching(/^scheduled-/), scheduledFor: null });
     mgr.stop();
   });
 
@@ -305,8 +305,7 @@ describe("#158 config_propose schedule mutations", () => {
     return new ConfigMutationService({
       store,
       describeConfig: (() => ({})) as never,
-      profiles: new Map(),
-      defaultModel: "default",
+      modelCatalog: fixtureModelCatalog([]),
       presetsFile: undefined,
       tierCEnabled: false,
       reloadPresets: () => ({ ok: true }),

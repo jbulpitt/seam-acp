@@ -1036,7 +1036,7 @@ async function main(): Promise<void> {
   const scheduledManager = new ScheduledPromptManager({
     store,
     logger: logger.child({ mod: "scheduled" }),
-    onFire: (id) => orchestrator.runScheduledPrompt(id),
+    onFire: (id, occurrence) => orchestrator.runScheduledPrompt(id, occurrence),
   });
   orchestrator.setScheduledManager(scheduledManager);
 

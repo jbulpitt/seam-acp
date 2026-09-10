@@ -20,7 +20,7 @@ export interface TurnAttempt {
   outcome: DispatchResult | null;
   runtimeOwner: ProcessOwner | null;
   providerIdentity: string | null;
-  source: "dispatch" | "inbound";
+  source: "dispatch" | "inbound" | "schedule";
   deliveryDone: boolean;
 }
 

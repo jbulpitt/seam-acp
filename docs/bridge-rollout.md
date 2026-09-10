@@ -83,44 +83,82 @@ entrance to the safe path: it records a baseline, and nothing else.
 
 It proves the same deployment identity every other phase does, then captures —
 from live state — the checkout revision (read from Git metadata, never by
-invoking remote Git), the size and SHA-256 of every file whose bytes decide
-behaviour, the entrypoint's own bytes and mode, the PM2 identity (app, cwd,
-exec path, interpreter, argv), and the runtime (Node path and version, platform,
-UID). Anything unreadable fails closed: a baseline that cannot be restored to is
-worse than none, because it looks like one. The capture is then re-taken and
-compared, and enrollment refuses `enrollment_live_state_drift` if the host moved
-while it was being read.
+invoking remote Git), a digest of the **whole declared runtime scope**, the
+entrypoint's own bytes and mode, the PM2 identity (app, cwd, exec path,
+interpreter, argv), and the runtime (Node path and version, platform, UID).
+Anything unreadable fails closed: a baseline that cannot be restored to is worse
+than none, because it looks like one. The capture is then re-taken and compared,
+and enrollment refuses `enrollment_live_state_drift` if the host moved while it
+was being read.
+
+The runtime scope is `packages/adapters/dist`, `packages/bridge/dist`,
+`node_modules`, and the package manifests, recorded in the baseline itself. It
+is deliberately a whole-tree digest rather than a walk of the entrypoint's
+import graph: closure tracking is more precise, but its failure mode is silent —
+a dynamic `import()`, a bare specifier resolved through conditional exports, a
+`require` inside a dependency or a native addon the walker does not model is
+simply absent, and an absent file is exactly the defect this guards against.
+Hashing everything in scope can only over-capture, which fails loudly. The
+stable entrypoint is excluded from that digest because during managed operation
+it is a symlink into a release; its bytes are held and verified separately as
+the preserved baseline copy.
 
 Enrollment preserves the one artifact a later activation would replace — the
 stable entrypoint file — inside the baseline directory, verified against its
 recorded hash. That is what makes the baseline a restore target rather than a
-description of one. `--restore-baseline --enrollment-id <64-hex>` puts those
-exact bytes back at the exact path and mode and withdraws the enrollment; the
-immutable record and preserved copy remain for audit.
+description of one.
 
-Enrollment **sends no signal, switches no pointer, and installs nothing**. The
-running process and the bytes it would run after any restart are untouched, so
-enrollment can never silently upgrade a host. Activation stays a separate,
-later, explicitly invoked phase.
+`--restore-baseline --enrollment-id <64-hex>` **verifies before it changes
+anything**: the recorded revision and every recorded non-entrypoint runtime file
+must still match. Only then does it put the preserved bytes back at the exact
+path and mode, re-prove the result, and withdraw the enrollment pointer; the
+immutable record and preserved copy remain for audit. If the surrounding tree
+drifted, restore refuses and leaves both the current entrypoint and the
+enrollment pointer exactly as it found them. Restoring only the entrypoint onto
+a drifted checkout would report success while leaving the host to start a
+combination that never existed, so it is not treated as a restore at all.
 
-Re-running is idempotent: an unchanged host re-reports its existing baseline and
-mutates nothing. A host whose deployed bytes changed since enrollment refuses
-with `enrollment_baseline_drift` rather than overwriting the evidence, and a
-pointer with no record behind it refuses with `enrollment_record_missing`.
+Enrollment **does not alter or signal the runnable deployment**: no entrypoint
+switch, no install, no signal other than `kill(pid, 0)` for liveness. It is not
+a filesystem no-op — it creates and chmods rollout metadata under the release
+root and takes and releases the target lock — but the running process and the
+bytes it would run after any restart are untouched, so enrollment can never
+silently upgrade a host. Activation stays a separate, later, explicitly invoked
+phase.
+
+Re-running is idempotent in durable state: an unchanged host re-reports its
+existing baseline and every recorded artifact stays byte-identical. The rerun
+does still take and release the target lock and re-apply 0700 to the metadata
+directories. A host whose runtime tree changed since enrollment refuses with
+`enrollment_baseline_drift` rather than overwriting the evidence, and a pointer
+with no record behind it refuses with `enrollment_record_missing`.
 
 PREFLIGHT reports `enrolled` (`yes`, `no`, or `drifted`), the enrollment ID, the
 baseline digest, and `baseline_receipt_capable`. `drifted` is re-derived from
 live state, never trusted from the file.
 
+A target that is explicitly unmanaged (`sshAlias: null` with an
+`unmanagedReason`, #282) is refused before any command is constructed, for
+enrollment exactly as for every other phase: recording a baseline for a host
+with no verified management path would produce a rollback target nobody could
+restore to.
+
 **Enrollment is not permission to activate.** A rollback onto bytes that cannot
 emit the nonce/PID/instance/two-RPC receipt still cannot be proven, so ACTIVATE
-continues to refuse for every legacy host — now naming the actual situation:
+continues to refuse for every legacy host — now naming the actual situation,
+both in the remote program and in the local capability gate that runs first:
 `legacy_previous_release_not_receipt_capable` when nothing is enrolled,
 `enrolled_baseline_state_drift` when the recorded baseline no longer matches the
 host, `enrolled_baseline_not_receipt_capable` when the recorded baseline could
 not emit that receipt, and `enrolled_baseline_activation_not_enabled` when it
 could — consuming an enrolled baseline as an activation's previous release is a
 separate reviewed change, not something enrollment grants itself.
+
+The baseline record is `formatVersion: 1`, `kind: "enrolled-baseline"`. Version 1
+hardwires PM2, a Node runtime, a JavaScript checkout entrypoint and this exact
+runtime scope. A host that does not fit that shape — native artifacts, a
+different process manager — needs a genuinely separate version-2 capture and
+restore path, not extra fields bolted onto version 1.
 
 Enrollment changes nothing about drain semantics and makes no claim about
 mid-turn safety. `SIGUSR2` still exits after ten seconds without output or a

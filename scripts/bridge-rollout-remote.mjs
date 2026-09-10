@@ -520,6 +520,81 @@ async function readDeployedCapabilities(root) {
   return { bytes, files, bridgePackage, protocolVersion, drainSupport, describeSupport, fetchSupport, rolloutReady };
 }
 
+/**
+ * The declared runtime scope of a legacy checkout: every path the deployed
+ * process can load. Recorded in the baseline itself so a reviewer sees exactly
+ * what was covered.
+ *
+ * This is a WHOLE-TREE scope, deliberately, rather than a walk of the
+ * entrypoint's import graph. Closure tracking is more precise but its failure
+ * mode is silent: a dynamic `import()`, a bare specifier resolved through
+ * conditional exports, a CJS `require` inside a dependency or a native addon
+ * that the walker does not model is simply absent from the baseline, and an
+ * absent file is exactly the defect this guards against — a restore that
+ * reports success while the next start runs a combination that never existed.
+ * Hashing everything in scope can only over-capture, which fails loudly (a
+ * refusal a human can read) instead of quietly.
+ */
+const RUNTIME_SCOPE = {
+  directories: ["packages/adapters/dist", "packages/bridge/dist", "node_modules"],
+  files: ["package.json", "package-lock.json", "packages/adapters/package.json", "packages/bridge/package.json"],
+};
+const MAX_BASELINE_FILES = 120_000;
+const MAX_BASELINE_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * Digest the whole runtime scope. The stable entrypoint is excluded on purpose:
+ * during managed operation it is a symlink into a release, and its bytes are
+ * held (and verified) separately as the preserved baseline copy.
+ */
+async function runtimeTreeSnapshot() {
+  const lines = []; let fileCount = 0; let bytes = 0;
+  const record = async (rel, full) => {
+    if (full === entrypointPath) return;
+    const stat = await fsp.lstat(full);
+    if (stat.isSymbolicLink()) { lines.push(`l ${rel} ${await fsp.readlink(full)}`); return; }
+    if (stat.isDirectory()) { lines.push(`d ${rel}`); await walk(full, rel); return; }
+    if (!stat.isFile()) fail("baseline_runtime_special_file");
+    fileCount += 1; bytes += stat.size;
+    if (fileCount > MAX_BASELINE_FILES || bytes > MAX_BASELINE_BYTES) fail("baseline_runtime_tree_too_large");
+    lines.push(`f ${rel} ${stat.size} ${hash(await fsp.readFile(full))}`);
+  };
+  const walk = async (directory, relative) => {
+    const entries = await fsp.readdir(directory, { withFileTypes: true });
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) await record(`${relative}/${entry.name}`, path.join(directory, entry.name));
+  };
+  for (const relative of RUNTIME_SCOPE.directories) {
+    const full = path.join(checkoutPath, ...relative.split("/"));
+    if (!fs.existsSync(full)) { lines.push(`- ${relative}`); continue; }
+    const stat = await fsp.lstat(full);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) fail("baseline_runtime_scope_wrong_type");
+    lines.push(`d ${relative}`); await walk(full, relative);
+  }
+  for (const relative of RUNTIME_SCOPE.files) {
+    const full = path.join(checkoutPath, ...relative.split("/"));
+    if (!fs.existsSync(full)) { lines.push(`- ${relative}`); continue; }
+    await record(relative, full);
+  }
+  return { digest: hash(Buffer.from(`${lines.join("\n")}\n`, "utf8")), fileCount, bytes };
+}
+
+/**
+ * Everything about the deployment that does NOT depend on the entrypoint's
+ * current form, so it can be measured identically at enrollment (a plain file)
+ * and during managed operation (a symlink into a release).
+ */
+async function measureRuntime() {
+  const checkoutSourceSha = await readCheckoutSourceSha();
+  const files = [];
+  for (const [relative, code] of CAPABILITY_FILES) {
+    if (path.join(checkoutPath, ...relative.split("/")) === entrypointPath) continue;
+    const bytes = await readCapabilityFile(checkoutPath, relative, code);
+    files.push({ path: relative, size: bytes.length, sha256: hash(bytes) });
+  }
+  return { checkoutSourceSha, files, tree: await runtimeTreeSnapshot() };
+}
+
 const baselineRoot = `${releaseRoot}/baselines`;
 const currentBaselinePath = `${baselineRoot}/current.json`;
 
@@ -533,7 +608,8 @@ const currentBaselinePath = `${baselineRoot}/current.json`;
  */
 async function captureBaseline(identity) {
   if (!identity.legacy) fail("enroll_requires_legacy_checkout");
-  const checkoutSourceSha = await readCheckoutSourceSha();
+  const measured = await measureRuntime();
+  const checkoutSourceSha = measured.checkoutSourceSha;
   const capabilities = await readDeployedCapabilities(checkoutPath);
   const entryStat = await fsp.lstat(entrypointPath).catch(() => fail("baseline_entrypoint_unreadable"));
   if (!entryStat.isFile() || entryStat.isSymbolicLink()) fail("baseline_entrypoint_wrong_type");
@@ -552,6 +628,12 @@ async function captureBaseline(identity) {
     entrypointSize: capabilities.files[0].size,
     entrypointMode: entryStat.mode & 0o7777,
     files: capabilities.files,
+    // The integrity anchor: every file the deployment can load, not a chosen
+    // few. A dormant dependency that drifts changes this digest.
+    runtimeScope: [...RUNTIME_SCOPE.directories, ...RUNTIME_SCOPE.files],
+    runtimeTreeDigest: measured.tree.digest,
+    runtimeFileCount: measured.tree.fileCount,
+    runtimeBytes: measured.tree.bytes,
     bridgeVersion: capabilities.bridgePackage.version,
     protocolVersion: capabilities.protocolVersion,
     drainSigusr2: capabilities.drainSupport,
@@ -594,15 +676,41 @@ async function enrollmentState() {
   return { status: "recorded", pointer, record, preservedBytes };
 }
 
+/**
+ * Does the host still match its recorded baseline?
+ *
+ * Entrypoint-independent, so it answers the same question during managed
+ * operation as at enrollment: the recorded revision, every recorded
+ * non-entrypoint capability file, and the whole recorded runtime tree. When the
+ * entrypoint is still the checkout's own file its bytes are checked too.
+ */
+async function verifyBaseline(record, identity) {
+  const baseline = record.baseline;
+  let measured;
+  try { measured = await measureRuntime(); }
+  catch (error) { return { ok: false, reason: typeof error?.code === "string" ? error.code : "baseline_runtime_unreadable" }; }
+  if (measured.checkoutSourceSha !== baseline.checkoutSourceSha) return { ok: false, reason: "baseline_source_sha_mismatch" };
+  const recorded = new Map((baseline.files ?? []).map((file) => [file.path, file]));
+  for (const file of measured.files) {
+    const expected = recorded.get(file.path);
+    if (!expected || expected.size !== file.size || expected.sha256 !== file.sha256) return { ok: false, reason: "baseline_runtime_file_mismatch" };
+  }
+  if (measured.tree.digest !== baseline.runtimeTreeDigest) return { ok: false, reason: "baseline_runtime_tree_mismatch" };
+  if (identity?.legacy) {
+    const entryStat = await fsp.lstat(entrypointPath).catch(() => null);
+    if (!entryStat?.isFile() || entryStat.isSymbolicLink()) return { ok: false, reason: "baseline_entrypoint_wrong_type" };
+    if (hash(await fsp.readFile(entrypointPath)) !== baseline.entrypointSha256) return { ok: false, reason: "baseline_entrypoint_mismatch" };
+  }
+  return { ok: true };
+}
+
 /** Enrollment state PLUS whether the host still looks like what was recorded. */
 async function enrollmentStatus(identity) {
   const state = await enrollmentState();
   if (state.status === "none") return { status: "none" };
-  let live;
-  try { live = await captureBaseline(identity); }
-  catch { return { ...state, status: "drifted" }; }
-  if (live.digest !== state.record.baselineDigest) return { ...state, status: "drifted" };
-  return { ...state, status: "enrolled", live };
+  const verified = await verifyBaseline(state.record, identity);
+  if (!verified.ok) return { ...state, status: "drifted", reason: verified.reason };
+  return { ...state, status: "enrolled" };
 }
 
 async function enroll() {
@@ -654,8 +762,10 @@ async function enroll() {
     await fsp.writeFile(temp, safeJson(pointer), { flag: "wx", mode: 0o600 });
     await fsp.rename(temp, currentBaselinePath);
     safePhase = "enroll_verify";
-    // Final proof that recording changed nothing about the host: same process,
-    // same bytes at the same path, entrypoint still the checkout's own file.
+    // Final proof that recording did not alter the RUNNABLE deployment: same
+    // process, same bytes at the same path, entrypoint still the checkout's own
+    // file. (Rollout metadata under the release root did change — that is what
+    // enrollment is — and the target lock is released by the caller.)
     const final = await readLiveIdentity();
     if (final.pid !== after.pid || !final.legacy || final.entryReal !== entrypointPath) fail("enrollment_process_changed");
     const published = await enrollmentStatus(final);
@@ -684,6 +794,14 @@ async function restoreBaseline() {
     if (state.record.enrollmentId !== enrollmentId) fail("enrollment_id_mismatch");
     const identity = await readLiveIdentity();
     if (identity.pm2.cwd !== state.record.baseline.processManager.cwd || identity.pm2.execPath !== state.record.baseline.processManager.execPath || identity.pm2.interpreter !== state.record.baseline.processManager.interpreter) fail("restore_process_manager_mismatch");
+    safePhase = "restore_verify";
+    // BEFORE anything is changed. Restoring only the entrypoint onto a checkout
+    // whose other runtime files have drifted would report success while leaving
+    // the host to start a combination that never existed. If the surrounding
+    // tree no longer matches the baseline, this is not a restore, and both the
+    // current entrypoint and the enrollment pointer are left exactly as found.
+    const verified = await verifyBaseline(state.record, null);
+    if (!verified.ok) fail(verified.reason);
     safePhase = "restore_entrypoint";
     // Put the recorded bytes back at the exact recorded path and mode. This is
     // the whole point of the baseline: the pre-enrollment artifact is restorable
@@ -694,7 +812,8 @@ async function restoreBaseline() {
     await fsp.rename(temp, entrypointPath);
     const restored = await readLiveIdentity();
     if (!restored.legacy || restored.entryReal !== entrypointPath) fail("restore_entrypoint_mismatch");
-    if (hash(await fsp.readFile(entrypointPath)) !== state.record.baseline.entrypointSha256) fail("restore_entrypoint_mismatch");
+    const reproved = await verifyBaseline(state.record, restored);
+    if (!reproved.ok) fail(reproved.reason);
     safePhase = "restore_publish";
     // The immutable record and its preserved copy stay for audit; only the
     // published pointer is withdrawn, so the host is unenrolled but not amnesic.

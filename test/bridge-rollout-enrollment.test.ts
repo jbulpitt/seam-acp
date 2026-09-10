@@ -61,6 +61,13 @@ async function makeFixture(options: { capable?: boolean; withGit?: boolean } = {
   await fs.writeFile(path.join(checkout, "packages/bridge/package.json"), JSON.stringify({ name: "@seam/bridge", version: "0.1.0" }));
   await fs.writeFile(path.join(checkout, "packages/adapters/dist/command-bus.js"), COMMAND_BUS_SOURCE(capable));
   await fs.writeFile(path.join(checkout, "packages/bridge/dist/rpc.js"), RPC_SOURCE);
+  // Files the entrypoint's graph reaches that are NOT among the four recorded
+  // capability files — the gap the whole-tree baseline exists to close.
+  await fs.writeFile(path.join(checkout, "packages/bridge/dist/inventory.js"), "export const inventory = [];\n");
+  await fs.writeFile(path.join(checkout, "packages/bridge/dist/release-receipt.js"), "export function receipt(){}\n");
+  await fs.mkdir(path.join(checkout, "node_modules/ws"), { recursive: true });
+  await fs.writeFile(path.join(checkout, "node_modules/ws/index.js"), "module.exports = {};\n");
+  await fs.writeFile(path.join(checkout, "package.json"), JSON.stringify({ name: "seam-acp", version: "0.1.0" }));
   if (options.withGit ?? true) {
     await fs.mkdir(path.join(checkout, ".git"));
     await fs.writeFile(path.join(checkout, ".git/HEAD"), `${checkoutSha}\n`);
@@ -146,7 +153,14 @@ describe.sequential("#281 legacy baseline enrollment", () => {
     const f = await makeFixture();
     const first = parseKeyValues((await enroll(f)).stdout);
     const recordPath = path.join(baselineDir(f), `${H("1")}.baseline.json`);
+    const pointerPath = path.join(baselineDir(f), "current.json");
+    const preservedPath = path.join(baselineDir(f), H("1"), "entrypoint/index.js");
     const stamp = (await fs.stat(recordPath)).mtimeMs;
+    const recordBytes = await fs.readFile(recordPath, "utf8");
+    const pointerBytes = await fs.readFile(pointerPath, "utf8");
+    const preservedBytes = await fs.readFile(preservedPath);
+    const baselineEntries = (await fs.readdir(baselineDir(f))).sort();
+    const entryBytes = await fs.readFile(f.entry);
 
     const second = parseKeyValues((await enroll(f, H("3"), H("4"))).stdout);
     expect(second.enrollment).toBe("unchanged");
@@ -155,8 +169,19 @@ describe.sequential("#281 legacy baseline enrollment", () => {
     expect(second.enrollment_id).toBe(H("1"));
     expect(second.baseline_digest).toBe(first.baseline_digest);
     expect(second.process_signaled).toBe("no");
+
+    // What idempotent actually means here, asserted rather than assumed: every
+    // durable artifact is byte-identical and no second baseline appears. A
+    // rerun is NOT a no-op at the syscall level — it takes and releases the
+    // target lock and re-applies 0700 to the metadata directories — so the
+    // claim is about durable state, and the lock is proven released below.
+    expect(await fs.readFile(recordPath, "utf8")).toBe(recordBytes);
     expect((await fs.stat(recordPath)).mtimeMs).toBe(stamp);
-    await expect(fs.stat(path.join(baselineDir(f), `${H("3")}.baseline.json`))).rejects.toThrow();
+    expect(await fs.readFile(pointerPath, "utf8")).toBe(pointerBytes);
+    expect(await fs.readFile(preservedPath)).toEqual(preservedBytes);
+    expect((await fs.readdir(baselineDir(f))).sort()).toEqual(baselineEntries);
+    await expect(fs.stat(path.join(f.releaseRoot, "locks/fixture"))).rejects.toThrow();
+    expect(await fs.readFile(f.entry)).toEqual(entryBytes);
   }, 60_000);
 
   it("refuses to re-enroll a host whose deployed bytes changed since the baseline", async () => {
@@ -250,6 +275,51 @@ describe.sequential("#281 restoring the recorded baseline", () => {
     expect(preflight.enrollment_id).toBe("none");
     await expect(fs.stat(path.join(baselineDir(f), `${H("1")}.baseline.json`))).resolves.toBeTruthy();
     await expect(fs.stat(path.join(baselineDir(f), `${H("1")}.restored.json`))).resolves.toBeTruthy();
+  }, 60_000);
+
+  it("refuses when a DORMANT checkout dependency drifted during managed operation", async () => {
+    // The QA counterexample. The preserved entrypoint is still byte-exact, so
+    // an entrypoint-only check reports success — and the next start then runs
+    // that entrypoint against a drifted dependency: a combination that never
+    // existed. The baseline covers the whole runtime tree precisely so this is
+    // a refusal, not a "restore".
+    const f = await makeFixture();
+    await enroll(f);
+    const managed = path.join(f.releaseRoot, "releases", `${"a".repeat(40)}-${H("b")}`, "packages/bridge/dist/index.js");
+    await fs.mkdir(path.dirname(managed), { recursive: true });
+    await fs.writeFile(managed, BRIDGE_SOURCE(true));
+    await fs.rm(f.entry);
+    await fs.symlink(managed, f.entry);
+    const pointerBefore = await fs.readFile(path.join(baselineDir(f), "current.json"), "utf8");
+
+    const dependency = path.join(f.checkout, "packages/adapters/dist/command-bus.js");
+    await fs.writeFile(dependency, `${COMMAND_BUS_SOURCE(false)}// drifted while dormant\n`);
+
+    await expect(f.run(["restore-baseline", H("1"), H("5")])).rejects.toThrow(/baseline_runtime_file_mismatch|baseline_runtime_tree_mismatch/);
+    // Nothing was touched: the managed symlink and the enrollment pointer are
+    // exactly as they were, so the operator can still act on a known state.
+    expect(await fs.realpath(f.entry)).toBe(managed);
+    expect((await fs.lstat(f.entry)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(baselineDir(f), "current.json"), "utf8")).toBe(pointerBefore);
+  }, 60_000);
+
+  it("refuses when a dormant node_modules file drifted, not just a recorded one", async () => {
+    // The recorded capability files are only four; the runtime tree is what
+    // makes an unlisted transitive dependency count too.
+    const f = await makeFixture();
+    await enroll(f);
+    await fs.writeFile(path.join(f.checkout, "node_modules/ws/index.js"), "// drifted transitive dependency\n");
+    await expect(f.run(["restore-baseline", H("1"), H("5")])).rejects.toThrow(/baseline_runtime_tree_mismatch/);
+    const preflight = parseKeyValues((await f.run(["preflight"])).stdout);
+    expect(preflight.enrolled).toBe("drifted");
+  }, 60_000);
+
+  it("refuses when the recorded checkout revision moved", async () => {
+    const f = await makeFixture();
+    await enroll(f);
+    await fs.writeFile(path.join(f.checkout, ".git/HEAD"), `${"d".repeat(39)}9\n`);
+    await expect(f.run(["restore-baseline", H("1"), H("5")])).rejects.toThrow(/baseline_source_sha_mismatch/);
+    await expect(fs.stat(path.join(baselineDir(f), "current.json"))).resolves.toBeTruthy();
   }, 60_000);
 
   it("refuses a restore that does not name the exact recorded enrollment", async () => {

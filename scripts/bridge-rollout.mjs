@@ -2,7 +2,7 @@
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildArtifact, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, rollbackPlan, runPreflight } from "./lib/bridge-rollout.mjs";
+import { activationRefusal, buildArtifact, commandRunner, loadTargetMap, makeScpCommand, makeSshCommand, parseArgs, parseKeyValues, renderRemoteScript, resolveTarget, rollbackPlan, runPreflight } from "./lib/bridge-rollout.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -48,8 +48,10 @@ async function main() {
     // Enrollment records a baseline for the host as it is. It deliberately does
     // NOT require rollout readiness: an unmanaged host that is not yet
     // receipt-capable is exactly the host that needs a recorded baseline. It
-    // also changes nothing about what runs — no signal, no entrypoint switch —
-    // so activation stays a separate, later, explicitly invoked phase.
+    // does not alter or signal the RUNNABLE deployment — no entrypoint switch,
+    // no install, no signal beyond a liveness probe — though it does write
+    // rollout metadata and take the target lock, so activation stays a
+    // separate, later, explicitly invoked phase.
     const enrollmentId = nonce(); const operationId = nonce();
     const result = await commandRunner(makeSshCommand(target, ["enroll", enrollmentId, operationId], remoteScript));
     process.stdout.write(result.stdout);
@@ -64,7 +66,7 @@ async function main() {
     process.stdout.write(result.stdout);
     return;
   }
-  if (preflight.report.rollout_ready !== "yes") throw new Error("active bridge lacks the verified drain/protocol/catalog capabilities required for activation or rollback");
+  if (preflight.report.rollout_ready !== "yes") throw new Error(activationRefusal(preflight.report));
   if (options.action === "activate") {
     const activationId = nonce(); const operationId = nonce();
     console.log(`activation_id=${activationId}`);

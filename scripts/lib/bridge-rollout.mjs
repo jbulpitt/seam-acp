@@ -299,3 +299,19 @@ export async function runPreflight(target, remoteScript, run = commandRunner) {
 }
 
 export function newOperationId() { return randomBytes(32).toString("hex"); }
+
+/**
+ * The capability gate is unchanged — it still refuses — but the operator sees
+ * WHY, from the enrollment evidence already in the preflight report. Before
+ * this the local gate short-circuited first and every legacy host got the same
+ * generic capability message, so the remote program's specific refusals were
+ * unreachable in normal operation (#281 QA).
+ */
+export function activationRefusal(report) {
+  const generic = "active bridge lacks the verified drain/protocol/catalog capabilities required for activation or rollback";
+  if (report.artifact_mode !== "legacy-checkout") return generic;
+  if (report.enrolled === "no") return `${generic}; nothing is enrolled on this host, so no rollback target exists yet (legacy_previous_release_not_receipt_capable) — run --enroll --apply first`;
+  if (report.enrolled === "drifted") return `${generic}; the recorded baseline no longer matches this host (enrolled_baseline_state_drift)`;
+  if (report.baseline_receipt_capable !== "yes") return `${generic}; the enrolled baseline cannot emit a rollback receipt (enrolled_baseline_not_receipt_capable)`;
+  return `${generic}; activating from an enrolled baseline is a separate reviewed change (enrolled_baseline_activation_not_enabled)`;
+}

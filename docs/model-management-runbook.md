@@ -54,8 +54,7 @@ before running any procedure in this runbook:
      `getClaudeContextWindow()` (compaction threshold + `contextLimit` seed),
      `withClaudeContextLimits()` (stamps every picker entry's `contextLimit`), and
      `newSessionMeta()` (how `_meta` is built)
-   - `packages/core/src/config.ts` — env var validation, `REMOTE_MAC_MODELS` (remote Copilot
-     agent, separate ID format)
+   - `packages/core/src/config.ts` — environment-variable validation
    - **No patch script.** The former `scripts/patch-claude-agent-acp.mjs` and the
      `npm run patch-acp` script were retired at 0.54.1 and no longer exist.
 4. **The "Current verified picture" table** above — the last-known-good mapping

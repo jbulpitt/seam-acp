@@ -10,10 +10,11 @@ separately named `agy-package` adapter remains optional and is neither removed
 nor used as evidence for native behavior. Package title metadata and private
 conversation SQLite are not thinking sources for this contract.
 
-R1 freezes observed behavior so later AGY stories have a regression gate. It
-does not introduce a runtime abstraction or change launch, model selection,
-catalog, lifecycle, persistence, helper routing, deployment, or production
-state. R0's restoration ledger and next-turn rebuild gates remain untouched.
+R1 freezes observed behavior so later AGY stories have a regression gate. R2
+now extends that gate with the launch/provenance rules in
+`docs/agy-native-runtime.md`; it does not change model selection, catalog,
+lifecycle, persistence, helper routing, deployment, or production state. R0's
+restoration ledger and next-turn rebuild gates remain untouched.
 
 The executable fixture and sanitized traces live in
 `test/fixtures/agy-native-capabilities/`. `provenance.json` records the CLI,
@@ -55,7 +56,18 @@ model self-report or a claim of live correctness.
   belongs to R8 ([#264](https://github.com/jbulpitt/seam-acp/issues/264)).
 - MCP configuration is written under the ACP session's private HOME and the
   exact supplied server reaches the spawned native CLI. It does not become a
-  global MCP write.
+  global MCP write. R2 additionally requires mode-0700 session HOME directories,
+  a mode-0600 MCP file, and resolution through the same verified runtime tuple.
+- Native inventory identifies the real content-addressed AGY executable as a
+  `virtual-acp-native-cli` topology, including exact version/digest, semantic
+  credential scope, session cwd policy, immutable root, and environment key
+  names. It carries no environment values. Local and bridge construction use
+  the same resolver and tuple.
+- Every native child path verifies the non-writable managed artifact before
+  execution. Digest verification precedes bounded version execution; cache
+  identity includes the executable and credential scope. Local startup and
+  bridge hello append the verified value-free descriptor to the durable audit
+  ledger.
 - Structured turns pass the reserved schema through `AgentRuntime`, create the
   native schema argument, accept only the CLI's `structured_output` envelope,
   suppress planner progress as the result, and remove the temporary schema.
@@ -77,14 +89,12 @@ remain opaque. A later compatibility gate may add separately approved
 disposable live observations; R1 does not infer provider or model correctness
 from fixture output.
 
-The observed production warning that `AGY_BIN` does not match the configured
-immutable artifact concerns `agy-package` launch identity and artifact
-verification, not native behavioral translation. This contract records the
-runtime names and versions used as evidence, but it deliberately does not make
-an artifact-verification claim or alter that optional adapter. Runtime tuple,
-digest, and provenance enforcement belongs to R2
-([#258](https://github.com/jbulpitt/seam-acp/issues/258)); lifecycle/redaction
-enforcement belongs to R5
+The observed production warning that `AGY_BIN` did not match the configured
+artifact was caused by an updater-controlled in-place path. R2
+([#258](https://github.com/jbulpitt/seam-acp/issues/258)) now requires both
+profiles' production configuration to use a non-writable content-addressed AGY
+artifact and binds native launches to its version, digest, account scope, and
+approved environment. Lifecycle/redaction enforcement still belongs to R5
 ([#261](https://github.com/jbulpitt/seam-acp/issues/261)).
 
 Restart attempt ownership and continuation remain governed by

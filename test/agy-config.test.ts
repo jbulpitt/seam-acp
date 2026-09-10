@@ -30,6 +30,7 @@ describe("package-backed agy configuration gates", () => {
       AGY_BIN: "/opt/agy/agy",
       AGY_VERSION: "1.1.28",
       AGY_SHA256: "a".repeat(64),
+      AGY_RUNTIME_ROOT: "/opt/agy/runtime",
       AGY_ACP_VERSION: "1.1.0",
       AGY_ACP_SHA256: agyAcpReleaseArtifact().sha256,
       AGY_ACP_STATE_DIR: path.join(os.homedir(), ".agy-acp"),
@@ -57,6 +58,7 @@ describe("package-backed agy configuration gates", () => {
       AGY_ACP_VERSION: "1.1.0",
       AGY_VERSION: "1.1.28",
       AGY_SHA256: "a".repeat(64),
+      AGY_RUNTIME_ROOT: "/opt/agy/runtime",
       AGY_ACP_SHA256: agyAcpReleaseArtifact().sha256,
       AGY_DANGEROUS_PERMISSIONS_ACKNOWLEDGED: true,
     });
@@ -81,9 +83,9 @@ describe("package-backed agy configuration gates", () => {
   it("requires an explicit native path and default without requiring package configuration", () => {
     base({ AGY_ENABLED: "true", AGY_CLI_PATH: undefined, AGY_OLD_CLI_PATH: undefined, AGY_BIN: undefined });
     expect(() => loadConfig()).toThrow(/AGY_CLI_PATH/);
-    base({ AGY_ENABLED: "true", AGY_CLI_PATH: "/opt/agy/agy", AGY_DEFAULT_MODEL: "gemini-high" });
-    expect(loadConfig()).toMatchObject({ AGY_ENABLED: true, AGY_PACKAGE_ENABLED: false, AGY_CLI_PATH: "/opt/agy/agy" });
-    base({ AGY_OLD_ROLLBACK_ENABLED: "true", AGY_OLD_CLI_PATH: "/opt/agy/agy-old", AGY_DEFAULT_MODEL: "gemini-high", AGY_CLI_PATH: undefined });
+    base({ AGY_ENABLED: "true", AGY_CLI_PATH: "/opt/agy/runtime/" + "a".repeat(64) + "/agy", AGY_BIN: undefined, AGY_DEFAULT_MODEL: "gemini-high", AGY_VERSION: "1.1.28", AGY_SHA256: "a".repeat(64), AGY_RUNTIME_ROOT: "/opt/agy/runtime" });
+    expect(loadConfig()).toMatchObject({ AGY_ENABLED: true, AGY_PACKAGE_ENABLED: false, AGY_CLI_PATH: "/opt/agy/runtime/" + "a".repeat(64) + "/agy" });
+    base({ AGY_OLD_ROLLBACK_ENABLED: "true", AGY_OLD_CLI_PATH: "/opt/agy/runtime/" + "a".repeat(64) + "/agy", AGY_BIN: undefined, AGY_DEFAULT_MODEL: "gemini-high", AGY_CLI_PATH: undefined, AGY_VERSION: "1.1.28", AGY_SHA256: "a".repeat(64), AGY_RUNTIME_ROOT: "/opt/agy/runtime" });
     expect(loadConfig().AGY_OLD_ROLLBACK_ENABLED).toBe(true);
   });
 });

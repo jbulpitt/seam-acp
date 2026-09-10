@@ -29,6 +29,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import type { AdapterRuntimeDescriptor } from "@seam/adapters";
 import { PresetsFileSchema } from "../config.js";
 import { renderCatalogEvidenceLines } from "./catalog-evidence-render.js";
 import { uniqueBridgeId } from "./bridge-pairing.js";
@@ -59,7 +60,8 @@ export type ConfigMutationTier =
   | "channel-preset"
   | "thread-preset"
   | "schedule"
-  | "bridge";
+  | "bridge"
+  | "runtime-provenance";
 
 /** Tier A — the calling thread's own session config. */
 export interface SessionConfigChanges {
@@ -719,6 +721,26 @@ export class ConfigMutationService {
       summary: opts.action,
       before: {},
       after: { bridgeId: opts.bridgeId, action: opts.action, ...(opts.extra ?? {}) },
+    });
+  }
+
+  /** Persist verified host runtime identity without storing environment values. */
+  recordRuntimeProvenance(opts: {
+    agentId: string;
+    location: string;
+    runtime: AdapterRuntimeDescriptor;
+  }): ConfigAuditEntry {
+    if (Object.keys(opts.runtime.environment).length > 0) {
+      throw new Error("runtime provenance must not persist environment values");
+    }
+    return this.writeAudit({
+      tier: "runtime-provenance",
+      scope: `runtime:${opts.agentId}@${opts.location}`,
+      correlationId: randomUUID(),
+      actor: { id: "seam-runtime", name: "Seam runtime verifier" },
+      summary: `verified ${opts.agentId}@${opts.location} runtime provenance`,
+      before: {},
+      after: { agentId: opts.agentId, location: opts.location, runtime: opts.runtime },
     });
   }
 

@@ -302,6 +302,8 @@ const Schema = z.object({
   AGY_VERSION: z.string().default(""),
   /** Exact SHA-256 of AGY_BIN used for catalog evidence and runtime. */
   AGY_SHA256: z.string().default(""),
+  /** Non-writable content-addressed root managed outside agy's auto-updater. */
+  AGY_RUNTIME_ROOT: z.string().optional(),
   AGY_ACP_VERSION: z.string().default(""),
   /** Host/platform-specific SHA-256 of AGY_ACP_BIN. */
   AGY_ACP_SHA256: z.string().default(""),
@@ -1180,6 +1182,7 @@ export function loadConfig(): Config {
       ["AGY_BIN", cfg.AGY_BIN],
       ["AGY_VERSION", cfg.AGY_VERSION],
       ["AGY_SHA256", cfg.AGY_SHA256],
+      ["AGY_RUNTIME_ROOT", cfg.AGY_RUNTIME_ROOT],
       ["AGY_ACP_SHA256", cfg.AGY_ACP_SHA256],
       ["AGY_CONVERSATIONS_DIR", cfg.AGY_CONVERSATIONS_DIR],
       ["AGY_DEFAULT_MODEL", cfg.AGY_DEFAULT_MODEL],
@@ -1192,6 +1195,7 @@ export function loadConfig(): Config {
       ["AGY_BIN", cfg.AGY_BIN!],
       ["AGY_CONVERSATIONS_DIR", cfg.AGY_CONVERSATIONS_DIR!],
       ["AGY_ACP_CWD", cfg.AGY_ACP_CWD ?? cfg.REPOS_ROOT],
+      ["AGY_RUNTIME_ROOT", cfg.AGY_RUNTIME_ROOT!],
     ] as const) {
       if (!path.isAbsolute(value)) throw new Error(`Invalid configuration: ${name} must be an absolute path`);
     }
@@ -1243,6 +1247,26 @@ export function loadConfig(): Config {
     }
     if (!cfg.AGY_DEFAULT_MODEL.trim()) {
       throw new Error("Invalid configuration: native agy requires AGY_DEFAULT_MODEL");
+    }
+    const missing = [
+      ["AGY_VERSION", cfg.AGY_VERSION],
+      ["AGY_SHA256", cfg.AGY_SHA256],
+      ["AGY_RUNTIME_ROOT", cfg.AGY_RUNTIME_ROOT],
+    ].filter(([, value]) => !value).map(([name]) => name);
+    if (missing.length) {
+      throw new Error(`Invalid configuration: native agy requires ${missing.join(", ")}`);
+    }
+    if (!path.isAbsolute(cfg.AGY_RUNTIME_ROOT!)) {
+      throw new Error("Invalid configuration: AGY_RUNTIME_ROOT must be an absolute path");
+    }
+    if (cfg.AGY_VERSION.length > 256 || /[\r\n\0]/.test(cfg.AGY_VERSION)) {
+      throw new Error("Invalid configuration: AGY_VERSION must be the exact bounded first line from AGY_BIN --version");
+    }
+    if (!/^[a-f0-9]{64}$/.test(cfg.AGY_SHA256)) {
+      throw new Error("Invalid configuration: AGY_SHA256 must be 64 lowercase hex characters");
+    }
+    if (cfg.AGY_BIN?.trim() && path.normalize(cfg.AGY_BIN.trim()) !== path.normalize(cfg.AGY_CLI_PATH)) {
+      throw new Error("Invalid configuration: native AGY_BIN and AGY_CLI_PATH must identify the same executable");
     }
     if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$/.test(cfg.AGY_CREDENTIAL_SCOPE)) {
       throw new Error("Invalid configuration: AGY_CREDENTIAL_SCOPE must be a non-secret semantic identifier");

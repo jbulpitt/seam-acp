@@ -370,6 +370,16 @@ export class BridgeHub {
       );
       return;
     }
+    for (const a of hello.agents ?? []) {
+      if (
+        a.agentId === "agy" &&
+        a.runtime?.topology === "virtual-acp-native-cli" &&
+        Object.keys(a.runtime.environment).length > 0
+      ) {
+        mux.helloAck(false, "native AGY runtime inventory must not contain environment values");
+        return;
+      }
+    }
     mux.helloAck(true);
 
     const agents = new Map<string, {
@@ -385,6 +395,13 @@ export class BridgeHub {
         ready: false,
         ...(a.runtime ? { runtime: a.runtime } : {}),
       });
+      if (a.agentId === "agy" && a.runtime?.topology === "virtual-acp-native-cli") {
+        this.mutation.recordRuntimeProvenance({
+          agentId: a.agentId,
+          location: expectedId,
+          runtime: a.runtime,
+        });
+      }
     }
 
     const conn: ConnectedBridge = {

@@ -8,6 +8,7 @@ import {
   fetchOllamaCloudUsage,
   type AgentProfile,
 } from "@seam/adapters";
+import type { AgyNativeRuntime } from "@seam/adapters";
 import type { Logger } from "../../lib/logger.js";
 import { isOllamaCloudAgentId } from "../parked-agents.js";
 import {
@@ -46,7 +47,7 @@ export interface AgentQuotaSource extends QuotaAgentIdentity {
 export function createAgentQuotaSources(
   profiles: AgentProfile[],
   opts: {
-    agyCliPath?: string;
+    agyRuntime?: AgyNativeRuntime;
     grokCliPath?: string;
     ollamaUsageCliPath?: string;
     /**
@@ -65,10 +66,13 @@ export function createAgentQuotaSources(
   return live.map((profile) => {
     const identity = { agentId: profile.id, displayName: profile.displayName };
     if (profile.id === "agy") {
+      if (!opts.agyRuntime) {
+        throw new Error("native agy quota requires the configured verified runtime");
+      }
       return {
         ...identity,
         eventDriven: false,
-        fetch: async () => mapAgyQuota(identity, await fetchAgyUserStatus(opts.agyCliPath)),
+        fetch: async () => mapAgyQuota(identity, await fetchAgyUserStatus(opts.agyRuntime!)),
       };
     }
     if (profile.id === "ollama-cloud") {

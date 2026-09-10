@@ -506,6 +506,7 @@ import {
   resolveModelVisionRouting,
 } from "../../agents/attachments.js";
 import { stageAttachment, sweepStagedAttachments } from "@seam/adapters";
+import type { AgyNativeRuntime } from "@seam/adapters";
 import {
   authorizeStagedImage,
   stagedAttachmentOwnerKey,
@@ -978,6 +979,7 @@ export class Orchestrator {
     concurrency: TURN_RESUME_CONCURRENCY,
     staggerMs: TURN_RESUME_STAGGER_MS,
   });
+  private readonly agyRuntime?: AgyNativeRuntime;
 
   constructor(opts: {
     logger: Logger;
@@ -988,6 +990,7 @@ export class Orchestrator {
     renderer: Renderer;
     quotaPoller?: AgentQuotaPoller;
     modelCatalog: ModelCatalogService;
+    agyRuntime?: AgyNativeRuntime;
     refreshModelIntelligence?: (forceSources: boolean) => Promise<ModelIntelligenceRefreshResult>;
     restartProcess?: () => Promise<void>;
     getModelMetadata?: (idOrSlug: string) => { context_window: number | null } | null;
@@ -1000,6 +1003,7 @@ export class Orchestrator {
     this.renderer = opts.renderer;
     this.quotaPoller = opts.quotaPoller;
     this.modelCatalog = opts.modelCatalog;
+    this.agyRuntime = opts.agyRuntime;
     this.refreshModelIntelligence = opts.refreshModelIntelligence;
     this.restartProcess = opts.restartProcess ?? restartSeamAcpProcess;
     this.getModelMetadata = opts.getModelMetadata;
@@ -19713,8 +19717,9 @@ export class Orchestrator {
       const profile = this.router.getProfile(record.agentId);
       const configDir = profile?.configDir;
       if (isAgy) {
+        if (!this.agyRuntime) throw new Error("native agy runtime is unavailable");
         const { fetchAgyUserStatus } = await import("@seam/adapters");
-        const data = await fetchAgyUserStatus(this.config.AGY_BIN);
+        const data = await fetchAgyUserStatus(this.agyRuntime);
         await i.editReply({ content: formatAgyUsage(data) });
       } else if (isOllamaCloud) {
         const { fetchOllamaCloudUsage } = await import("@seam/adapters");

@@ -12,6 +12,7 @@ import {
   makeCopilotProfile,
   makeGrokProfile,
 } from "@seam/adapters";
+import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
 
 /** A bare local adapter: no sessionManager, no effort, no staticModels.
  *  #12 retired opencode, which used to be the stand-in for this shape — but the
@@ -93,9 +94,14 @@ describe("AgentAdapter.describe()", () => {
   });
 
   it("native agy retains its original modelBaked profile", () => {
-    const profile = makeAgyProfile({ cliPath: "/bin/false", defaultModel: "native-model-high" });
-    expect(profile.id).toBe("agy");
-    expect(profile.describe().effort.mechanism).toBe("modelBaked");
+    const managed = createManagedAgyFixture();
+    try {
+      const profile = makeAgyProfile({ runtime: managed.runtime, defaultModel: "native-model-high" });
+      expect(profile.id).toBe("agy");
+      expect(profile.describe().effort.mechanism).toBe("modelBaked");
+    } finally {
+      managed.cleanup();
+    }
   });
 
   it("agy-package reports modelBaked", () => {

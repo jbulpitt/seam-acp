@@ -26,7 +26,7 @@ import {
 } from "./core/parked-agents.js";
 import { makeCopilotProfile } from "@seam/adapters";
 import { makeClaudeProfile } from "@seam/adapters";
-import { makeAgyPackageProfile, makeAgyProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
+import { makeAgyNativeRuntime, makeAgyPackageProfile, makeAgyProfile, scrubStaleGlobalSeamStdio } from "@seam/adapters";
 import { makeCodexProfile } from "@seam/adapters";
 import { buildOllamaCodexCatalog } from "./agents/ollama-codex-catalog.js";
 import { makeGrokProfile, fetchXaiModels } from "@seam/adapters";
@@ -246,6 +246,7 @@ async function main(): Promise<void> {
         agyBin: config.AGY_BIN!,
         agyVersion: config.AGY_VERSION,
         agySha256: config.AGY_SHA256,
+        runtimeRoot: config.AGY_RUNTIME_ROOT!,
         defaultModel: config.AGY_DEFAULT_MODEL,
         stateDir: config.AGY_ACP_STATE_DIR!,
         conversationsDir: config.AGY_CONVERSATIONS_DIR!,
@@ -257,11 +258,21 @@ async function main(): Promise<void> {
         timeoutMs: Math.min(config.TURN_TIMEOUT_SECONDS * 1_000, 120_000),
       })
     : undefined;
-  const agy = config.AGY_ENABLED || config.AGY_OLD_ROLLBACK_ENABLED
-    ? makeAgyProfile({
-        cliPath: config.AGY_CLI_PATH!,
-        defaultModel: config.AGY_DEFAULT_MODEL,
+  const agyRuntime = config.AGY_ENABLED || config.AGY_OLD_ROLLBACK_ENABLED
+    ? makeAgyNativeRuntime({
+        executable: config.AGY_CLI_PATH!,
+        runtimeRoot: config.AGY_RUNTIME_ROOT!,
+        version: config.AGY_VERSION,
+        sha256: config.AGY_SHA256,
         credentialScope: config.AGY_CREDENTIAL_SCOPE,
+        cwd: process.cwd(),
+        baseEnv: process.env,
+      })
+    : undefined;
+  const agy = agyRuntime
+    ? makeAgyProfile({
+        runtime: agyRuntime,
+        defaultModel: config.AGY_DEFAULT_MODEL,
         staticModels: config.AGY_MODELS,
         dataDir: config.DATA_DIR,
         printTimeoutSeconds: config.TURN_TIMEOUT_SECONDS,
@@ -541,7 +552,7 @@ async function main(): Promise<void> {
     logger,
     registry: quotaRegistry,
     sources: createAgentQuotaSources(router.listProfiles(), {
-      agyCliPath: config.AGY_BIN,
+      agyRuntime,
       grokCliPath: config.GROK_CLI_PATH,
       ollamaUsageCliPath: config.OLLAMA_USAGE_CLI_PATH,
       ollamaCloudEnabled: config.OLLAMA_CLOUD_ENABLED,
@@ -571,9 +582,18 @@ async function main(): Promise<void> {
     renderer,
     quotaPoller,
     modelCatalog,
+    agyRuntime,
     refreshModelIntelligence: (forceSources) => modelIntelligenceManager.refresh({ forceSources }),
     getModelMetadata: (idOrSlug) => modelMetadataStore.get(idOrSlug).model,
   });
+
+  if (agyRuntime) {
+    orchestrator.getConfigMutation().recordRuntimeProvenance({
+      agentId: "agy",
+      location: "local",
+      runtime: agyRuntime.descriptor,
+    });
+  }
 
   orchestrator.install();
 
@@ -730,6 +750,7 @@ async function main(): Promise<void> {
             agyBin: config.AGY_BIN!,
             agyVersion: config.AGY_VERSION,
             agySha256: config.AGY_SHA256,
+            runtimeRoot: config.AGY_RUNTIME_ROOT!,
             stateDir: config.AGY_ACP_STATE_DIR!,
             conversationsDir: config.AGY_CONVERSATIONS_DIR!,
             credentialScope: config.AGY_CREDENTIAL_SCOPE,

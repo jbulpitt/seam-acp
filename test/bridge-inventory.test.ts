@@ -8,6 +8,7 @@ import {
   resolveCopilotHostLaunch,
 } from "../packages/bridge/src/inventory.js";
 import { agyAcpReleaseArtifact } from "@seam/adapters";
+import { createManagedAgyFixture } from "./helpers/agy-runtime-fixture.js";
 
 describe("loadHostAdapters", () => {
   it("skips adapters whose CLI is not on PATH (agy must not spawn ENOENT)", () => {
@@ -120,6 +121,7 @@ fs.writeFileSync(process.env.GROK_BRIDGE_LOG, JSON.stringify({
   });
 
   it("advertises the package runtime under agy-package only when explicitly acknowledged", () => {
+    const managed = createManagedAgyFixture({ version: "1.1.28" });
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       AGY_ENABLED: "false",
@@ -128,6 +130,7 @@ fs.writeFileSync(process.env.GROK_BRIDGE_LOG, JSON.stringify({
       AGY_BIN: "/opt/agy/agy",
       AGY_VERSION: "1.1.28",
       AGY_SHA256: "a".repeat(64),
+      AGY_RUNTIME_ROOT: "/opt/agy/runtime",
       AGY_DEFAULT_MODEL: "gemini-high",
       AGY_ACP_VERSION: "1.1.0",
       AGY_ACP_SHA256: agyAcpReleaseArtifact().sha256,
@@ -155,7 +158,14 @@ fs.writeFileSync(process.env.GROK_BRIDGE_LOG, JSON.stringify({
     });
 
     const both = loadHostAdapters("copilot", {
-      env: { ...env, AGY_ENABLED: "true", AGY_CLI_PATH: "/opt/native/agy" },
+      env: {
+        ...env,
+        AGY_ENABLED: "true",
+        AGY_CLI_PATH: managed.executable,
+        AGY_VERSION: "1.1.28",
+        AGY_SHA256: managed.sha256,
+        AGY_RUNTIME_ROOT: managed.runtimeRoot,
+      },
       exists: () => true,
     });
     expect(both.get("agy")?.id).toBe("agy");
@@ -167,15 +177,22 @@ fs.writeFileSync(process.env.GROK_BRIDGE_LOG, JSON.stringify({
     });
     expect(neither.has("agy")).toBe(false);
     expect(neither.has("agy-package")).toBe(false);
+    managed.cleanup();
   });
 
   it("the deprecated rollback flag registers native agy, never agy-old", () => {
+    const managed = createManagedAgyFixture({ version: "1.1.28" });
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       AGY_ENABLED: "false",
       AGY_PACKAGE_ENABLED: "false",
       AGY_OLD_ROLLBACK_ENABLED: "true",
-      AGY_OLD_CLI_PATH: "/opt/agy/agy-old",
+      AGY_CLI_PATH: undefined,
+      AGY_BIN: undefined,
+      AGY_OLD_CLI_PATH: managed.executable,
+      AGY_VERSION: "1.1.28",
+      AGY_SHA256: managed.sha256,
+      AGY_RUNTIME_ROOT: managed.runtimeRoot,
       AGY_DEFAULT_MODEL: "gemini-high",
     };
     const adapters = loadHostAdapters("copilot", { env, exists: () => true });
@@ -187,5 +204,6 @@ fs.writeFileSync(process.env.GROK_BRIDGE_LOG, JSON.stringify({
       exists: () => true,
     });
     expect(missing.has("agy")).toBe(false);
+    managed.cleanup();
   });
 });

@@ -15,6 +15,13 @@ occurrences remain #252; isolated HTTP ingest adoption remains the ingest lane.
 - A running legacy admission or existing marker without frozen attempt identity
   is retained. Boot does not reset its phase or consume its only marker.
   Never-started pending admissions still run normally even with auto-resume off.
+- Missing attempt metadata is never terminal proof. If the current fenced
+  invocation observes setup fail before an attempt exists, an epoch-CAS returns
+  only that never-submitted admission to pending. It does not immediately retry,
+  emit a terminal answer, or reset legacy/ambiguous running input. A subsequent
+  boot or explicit scoped recovery can start that original input for the first
+  time. Any existing attempt (including unstarted/suspended) blocks this release;
+  its durable attempt owner still governs continuation or completion.
 - Submitted automatic continuation is limited to local Codex, with #268's
   strict ACP, capability, provider/store/account and proven-dead-owner guards.
   A different nonempty thread ACP fails closed before a new claim. Other

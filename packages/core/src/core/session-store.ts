@@ -2680,6 +2680,17 @@ export class SessionStore {
     return result.changes === 1;
   }
 
+  /** The current queue invocation observed setup fail before execution was
+   * claimed. Retain that never-submitted input; never reset a legacy running
+   * row at boot or an admission with any recorded attempt. */
+  releaseUnstartedInbound(messageId: string, queueEpoch: number, updatedUtc: string): boolean {
+    return this.db.prepare(`UPDATE inbound_admissions
+      SET state='pending', queue_epoch=NULL, updated_utc=?
+      WHERE message_id=? AND state='running' AND queue_epoch=?
+      AND NOT EXISTS (SELECT 1 FROM turn_attempts WHERE id=?)`)
+      .run(updatedUtc, messageId, queueEpoch, inboundAttemptId(messageId)).changes === 1;
+  }
+
   /** Epoch is part of the ownership claim. A late promise from an invalidated
    * queue cannot terminalize the row after recovery has re-claimed it. */
   completeInbound(messageId: string, queueEpoch: number, updatedUtc: string): boolean {

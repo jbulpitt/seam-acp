@@ -2414,7 +2414,7 @@ export class Orchestrator {
 
   private inboundExecutionTerminal(messageId: string): boolean {
     const a = this.store.turnAttempts?.get(inboundAttemptId(messageId));
-    return !a || a.state === "completed" || a.state === "cancelled";
+    return a?.state === "completed" || a?.state === "cancelled";
   }
 
   /** Enqueue an already-durable row without passing back through duplicate
@@ -2967,6 +2967,12 @@ export class Orchestrator {
     } catch (err) {
       const a = scheduledAttempt ? this.store.turnAttempts.get(scheduledAttempt.id)
         : msg.messageId ? this.store.turnAttempts?.get(inboundAttemptId(msg.messageId)) : null;
+      // Only this still-current invocation can prove its setup failed before
+      // an execution claim (and therefore before any provider prompt). Missing
+      // attempt metadata alone is never a terminal result or boot replay proof.
+      if (!a && !scheduledAttempt && msg.messageId && queueFence && this.queueFenceCurrent(queueFence)) {
+        this.store.releaseUnstartedInbound(msg.messageId, queueFence.epoch, new Date().toISOString());
+      }
       // Setup before the streaming finalizer exists can fail too (e.g. initial
       // Discord panel). Persist that genuine unsubmitted failure; restart and
       // strict-resume refusal must never become an ordinary terminal result.

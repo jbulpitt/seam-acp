@@ -231,6 +231,14 @@ describe("#180 channel queue fencing", () => {
 
   it("runs a Discord gateway redelivery only once", async () => {
     const { host } = makeHost();
+    // The synthetic inner handler must capture a real terminal winner; returning
+    // void alone is no longer (and was never valid) durable completion evidence.
+    (host as any).handleIncomingMessageInner.mockImplementation(async () => {
+      store.turnAttempts.registerOwner("synthetic-owner");
+      const a = store.turnAttempts.claim({ id: "inbound-301", target: "100", prompt: "once",
+        session: "live", kind: "parked", createdUtc: new Date().toISOString() }, "synthetic-identity", "synthetic-owner", "inbound");
+      store.turnAttempts.complete(a, { id: a.id, target: "100", status: "completed", finishedUtc: new Date().toISOString() });
+    });
     const message = {
       messageId: "301",
       channel: { platform: "discord", id: "100", parentId: "10" },
@@ -243,6 +251,15 @@ describe("#180 channel queue fencing", () => {
     await (host as any).handleIncomingMessage(message);
     expect((host as any).handleIncomingMessageInner).toHaveBeenCalledOnce();
     expect(store.getInbound("301")?.state).toBe("completed");
+  });
+
+  it("does not interpret a handler returning without an attempt as terminal proof", async () => {
+    const { host } = makeHost();
+    await (host as any).handleIncomingMessage({ messageId: "302",
+      channel: { platform: "discord", id: "100", parentId: "10" }, authorId: "200",
+      authorIsBot: false, text: "retained synthetic input" });
+    expect(store.turnAttempts.get("inbound-302")).toBeNull();
+    expect(store.getInbound("302")?.state).toBe("running");
   });
 
   it("terminalizes an admission when the second availability check parks it", async () => {

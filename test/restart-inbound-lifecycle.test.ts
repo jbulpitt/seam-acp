@@ -67,6 +67,71 @@ function setup() {
 }
 
 describe("#250 human turn production pipeline, synthetic transport only", () => {
+  it("does not let a stale epoch or superseded invocation release input", () => {
+    const h = setup();
+    expect(h.store.releaseUnstartedInbound("1", 1, new Date().toISOString())).toBe(false);
+    expect(h.store.getInbound("1")?.state).toBe("running");
+    expect(h.store.releaseUnstartedInbound("1", 0, new Date().toISOString())).toBe(true);
+    h.store.claimInbound("1", 2, new Date().toISOString());
+    const old = h.store.getInbound("1")!;
+    h.store.admitInbound({ ...old, messageId: "2", text: "replacement" });
+    expect(h.store.releaseUnstartedInbound("1", 2, new Date().toISOString())).toBe(false);
+    expect(h.store.getInbound("1")?.state).toBe("completed");
+    expect(h.store.getInbound("2")?.state).toBe("pending");
+  });
+
+  it.each(["active", "suspended", "completed", "cancelled"] as const)("never releases input owned by an existing %s attempt", state => {
+    const h = setup();
+    const attempts = h.store.turnAttempts;
+    attempts.registerOwner("synthetic-owner");
+    const a = attempts.claim({ id: "inbound-1", target: "worker", prompt: "synthetic",
+      session: "live", kind: "parked", createdUtc: new Date().toISOString() }, "synthetic-identity", "synthetic-owner", "inbound");
+    if (state === "suspended") attempts.suspendBoot("synthetic-owner");
+    if (state === "completed") attempts.complete(a, { id: a.id, target: "worker", status: "completed", finishedUtc: new Date().toISOString() });
+    if (state === "cancelled") attempts.cancel(a.id);
+    expect(h.store.releaseUnstartedInbound("1", 0, new Date().toISOString())).toBe(false);
+    expect(h.store.getInbound("1")?.state).toBe("running");
+    expect(attempts.get(a.id)?.state).toBe(state);
+  });
+
+  it("retains a recovered pre-attempt setup failure without a retry loop", async () => {
+    const h = setup();
+    h.store.admitInbound({ ...h.store.getInbound("1")!, messageId: "2", text: "never submitted" });
+    vi.spyOn(h.router, "ensureSessionRecord").mockImplementationOnce(() => { throw new Error("synthetic recovery setup failure"); });
+    await h.orch.recoverInterruptedTurns();
+    await (h.orch as any).channelQueues.get("worker");
+    expect(h.store.getInbound("2")).toMatchObject({ state: "pending", queueEpoch: null });
+    expect(h.store.turnAttempts.get("inbound-2")).toBeNull();
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+    expect(h.adapter.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["record", "config", "read-config"])("retains admitted input after pre-attempt %s failure and starts it once on recovery", async stage => {
+    const h = setup();
+    const record = h.router.ensureSessionRecord();
+    if (stage === "record") vi.spyOn(h.router, "ensureSessionRecord")
+      .mockReturnValueOnce(record).mockImplementationOnce(() => { throw new Error("synthetic pre-attempt failure"); });
+    if (stage === "config") vi.spyOn(h.router, "describeConfig")
+      .mockImplementationOnce(() => { throw new Error("synthetic pre-attempt failure"); });
+    if (stage === "read-config") vi.spyOn(h.store, "readConfig")
+      .mockImplementationOnce(() => { throw new Error("synthetic pre-attempt failure"); });
+    const msg = { messageId: "2", channel: { platform: "discord", id: "worker" },
+      authorId: "user", authorIsBot: false, text: "NEW NEVER-SUBMITTED DISPOSABLE WORK" };
+    await (h.orch as any).handleIncomingMessage(msg);
+    expect(h.store.getInbound("2")).toMatchObject({ state: "pending", queueEpoch: null, text: msg.text });
+    expect(h.store.turnAttempts.get("inbound-2")).toBeNull();
+    expect(h.runtime.prompt).not.toHaveBeenCalled();
+    expect(h.adapter.sendMessage).not.toHaveBeenCalled();
+    h.runtime.prompt.mockImplementationOnce(async () => ({ stopReason: "end_turn" }));
+    const next = h.make();
+    await next.recoverInterruptedTurns();
+    await (next as any).channelQueues.get("worker");
+    expect(h.runtime.prompt).toHaveBeenCalledTimes(1);
+    expect(h.runtime.prompt.mock.calls[0]?.[0]).toContain(msg.text);
+    expect(h.store.turnAttempts.get("inbound-2")).toMatchObject({ state: "completed", promptStarted: true });
+    expect(h.store.getInbound("2")?.state).toBe("completed");
+  });
+
   it("retains the inbound execution and marker on cutoff, then submits only continue to the same ACP", async () => {
     const h = setup();
     // In-process boot simulation; real PID retirement has separate offline tests.

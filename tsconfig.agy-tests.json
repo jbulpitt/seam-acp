@@ -10,6 +10,7 @@
     "test/agy-identity-migration.test.ts",
     "test/agy-catalog-identity-migration.test.ts",
     "test/agy-image-inspector.test.ts",
+    "test/agy-native-capability-contract.test.ts",
     "test/bridge-inventory.test.ts"
   ]
 }

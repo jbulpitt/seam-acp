@@ -65,8 +65,17 @@ async function makeFixture(options: { capable?: boolean; withGit?: boolean } = {
   // capability files — the gap the whole-tree baseline exists to close.
   await fs.writeFile(path.join(checkout, "packages/bridge/dist/inventory.js"), "export const inventory = [];\n");
   await fs.writeFile(path.join(checkout, "packages/bridge/dist/release-receipt.js"), "export function receipt(){}\n");
-  await fs.mkdir(path.join(checkout, "node_modules/ws"), { recursive: true });
-  await fs.writeFile(path.join(checkout, "node_modules/ws/index.js"), "module.exports = {};\n");
+  // `ws` is a symlink OUT of every declared scope, the way a workspace or
+  // store-backed install links. The bridge dynamically imports it, so its bytes
+  // are runtime content no matter where they live.
+  await fs.mkdir(path.join(root, "external-ws"), { recursive: true });
+  await fs.writeFile(path.join(root, "external-ws/index.js"), "module.exports = {};\n");
+  await fs.mkdir(path.join(checkout, "node_modules"), { recursive: true });
+  await fs.symlink(path.join(root, "external-ws"), path.join(checkout, "node_modules/ws"));
+  // A `.bin` shim pointing at the stable entrypoint: real checkouts have these,
+  // and following it would make the digest depend on activation state.
+  await fs.mkdir(path.join(checkout, "node_modules/.bin"), { recursive: true });
+  await fs.symlink(entry, path.join(checkout, "node_modules/.bin/seam-bridge"));
   await fs.writeFile(path.join(checkout, "package.json"), JSON.stringify({ name: "seam-acp", version: "0.1.0" }));
   if (options.withGit ?? true) {
     await fs.mkdir(path.join(checkout, ".git"));
@@ -308,10 +317,91 @@ describe.sequential("#281 restoring the recorded baseline", () => {
     // makes an unlisted transitive dependency count too.
     const f = await makeFixture();
     await enroll(f);
-    await fs.writeFile(path.join(f.checkout, "node_modules/ws/index.js"), "// drifted transitive dependency\n");
+    await fs.writeFile(path.join(f.root, "external-ws/index.js"), "// drifted transitive dependency\n");
     await expect(f.run(["restore-baseline", H("1"), H("5")])).rejects.toThrow(/baseline_runtime_tree_mismatch/);
     const preflight = parseKeyValues((await f.run(["preflight"])).stdout);
     expect(preflight.enrolled).toBe("drifted");
+  }, 60_000);
+
+  it("refuses when bytes behind an ESCAPING symlink drift during managed operation", async () => {
+    // QA round 2. The link text never changes, so recording `l <path> <text>`
+    // reported success while the restored entrypoint would import bytes the
+    // baseline never represented — the same absent-runtime-file failure the
+    // whole-tree design exists to eliminate, relocated to the scope boundary.
+    const f = await makeFixture();
+    await enroll(f);
+    const managed = path.join(f.releaseRoot, "releases", `${"a".repeat(40)}-${H("b")}`, "packages/bridge/dist/index.js");
+    await fs.mkdir(path.dirname(managed), { recursive: true });
+    await fs.writeFile(managed, BRIDGE_SOURCE(true));
+    await fs.rm(f.entry);
+    await fs.symlink(managed, f.entry);
+    const pointerBefore = await fs.readFile(path.join(baselineDir(f), "current.json"), "utf8");
+    const linkTextBefore = await fs.readlink(path.join(f.checkout, "node_modules/ws"));
+
+    await fs.writeFile(path.join(f.root, "external-ws/index.js"), "module.exports = { HOSTILE: true };\n");
+
+    await expect(f.run(["restore-baseline", H("1"), H("5")])).rejects.toThrow(/baseline_runtime_tree_mismatch/);
+    expect(await fs.readlink(path.join(f.checkout, "node_modules/ws"))).toBe(linkTextBefore);
+    expect(await fs.realpath(f.entry)).toBe(managed);
+    expect((await fs.lstat(f.entry)).isSymbolicLink()).toBe(true);
+    expect(await fs.readFile(path.join(baselineDir(f), "current.json"), "utf8")).toBe(pointerBefore);
+  }, 60_000);
+
+  it("records escaping link targets as external roots rather than hiding them", async () => {
+    const f = await makeFixture();
+    await enroll(f);
+    const record = JSON.parse(await fs.readFile(path.join(baselineDir(f), `${H("1")}.baseline.json`), "utf8"));
+    // Inclusion is explicit: a reader can see what came from outside scope.
+    expect(record.baseline.runtimeExternalRoots).toContain(await fs.realpath(path.join(f.root, "external-ws")));
+    expect(record.baseline.runtimeLinkCount).toBeGreaterThanOrEqual(2);
+  }, 60_000);
+
+  it("does not let a .bin shim make the digest depend on activation state", async () => {
+    // The shim resolves to the stable entrypoint, which becomes a release
+    // symlink during managed operation. Following it would change the digest on
+    // activation alone and make every restore refuse.
+    const f = await makeFixture();
+    await enroll(f);
+    const managed = path.join(f.releaseRoot, "releases", `${"a".repeat(40)}-${H("b")}`, "packages/bridge/dist/index.js");
+    await fs.mkdir(path.dirname(managed), { recursive: true });
+    await fs.writeFile(managed, `${BRIDGE_SOURCE(true)}// a DIFFERENT release\n`);
+    await fs.rm(f.entry);
+    await fs.symlink(managed, f.entry);
+
+    const restored = parseKeyValues((await f.run(["restore-baseline", H("1"), H("5")])).stdout);
+    expect(restored.baseline).toBe("restored");
+  }, 60_000);
+
+  it("refuses a runtime-scope symlink that cannot be resolved at all", async () => {
+    const f = await makeFixture();
+    await fs.rm(path.join(f.root, "external-ws"), { recursive: true, force: true });
+    await expect(enroll(f)).rejects.toThrow(/baseline_runtime_link_unresolvable/);
+    await expect(fs.stat(path.join(baselineDir(f), "current.json"))).rejects.toThrow();
+  }, 60_000);
+
+  it("refuses a special file in runtime scope instead of recording a reference", async () => {
+    const f = await makeFixture();
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("mkfifo", [path.join(f.checkout, "node_modules/a-fifo")]);
+    await expect(enroll(f)).rejects.toThrow(/baseline_runtime_special_file/);
+    await expect(fs.stat(path.join(baselineDir(f), "current.json"))).rejects.toThrow();
+  }, 60_000);
+
+  it("terminates on a symlink cycle instead of walking forever", async () => {
+    const f = await makeFixture();
+    await fs.symlink(path.join(f.checkout, "node_modules"), path.join(f.checkout, "node_modules/self"));
+    const report = parseKeyValues((await enroll(f)).stdout);
+    expect(report.enrollment).toBe("recorded");
+  }, 60_000);
+
+  it("hashes hardlinked content rather than treating it as a reference", async () => {
+    const f = await makeFixture();
+    await fs.link(path.join(f.root, "external-ws/index.js"), path.join(f.checkout, "node_modules/hardlinked.js"));
+    await enroll(f);
+    // A hardlink is indistinguishable from a regular file, so its bytes are in
+    // the digest: changing them through EITHER name is caught.
+    await fs.writeFile(path.join(f.checkout, "node_modules/hardlinked.js"), "// drifted through the hardlink\n");
+    await expect(f.run(["restore-baseline", H("1"), H("5")])).rejects.toThrow(/baseline_runtime_tree_mismatch/);
   }, 60_000);
 
   it("refuses when the recorded checkout revision moved", async () => {

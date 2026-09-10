@@ -103,6 +103,24 @@ stable entrypoint is excluded from that digest because during managed operation
 it is a symlink into a release; its bytes are held and verified separately as
 the preserved baseline copy.
 
+Symlinks are followed and their targets hashed, not recorded as link text. A
+reference recorded only by name is a hole: the bytes it resolves to are what the
+process loads, so a dependency linked out of `node_modules` could drift while
+the link text stayed identical. Refusing escaping links instead is not an
+option — a real checkout's `node_modules` contains workspace links
+(`@seam/adapters`, `@seam/bridge`, `@seam/core` resolve into `packages/`) and
+`.bin` shims that link across packages, so that rule would refuse every real
+host. Following is bounded rather than trusted: targets are canonicalized
+first, a target already hashed is referenced instead of re-hashed (which also
+terminates cycles), targets outside the checkout are recorded in the baseline as
+`runtimeExternalRoots` so the inclusion is explicit, and the file/byte limits
+apply to the whole traversal. A link pointing at the stable entrypoint (the
+`.bin` launcher shims do) is recorded as such rather than followed, so the
+digest does not change merely because the host is currently activated. Special
+files are refused outright; a hardlink is an ordinary file and its content is
+hashed. Measured on this checkout: 14,426 files / 247 MB with links followed,
+against the 120,000-file / 1-GiB bounds.
+
 Enrollment preserves the one artifact a later activation would replace — the
 stable entrypoint file — inside the baseline directory, verified against its
 recorded hash. That is what makes the baseline a restore target rather than a

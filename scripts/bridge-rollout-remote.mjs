@@ -543,40 +543,90 @@ const MAX_BASELINE_FILES = 120_000;
 const MAX_BASELINE_BYTES = 1024 * 1024 * 1024;
 
 /**
- * Digest the whole runtime scope. The stable entrypoint is excluded on purpose:
- * during managed operation it is a symlink into a release, and its bytes are
- * held (and verified) separately as the preserved baseline copy.
+ * Digest the whole runtime scope, by CONTENT.
+ *
+ * A symlink is a reference, and a reference that is only recorded as link text
+ * is a hole: the bytes it resolves to are what the process actually loads. So
+ * every link is canonicalized and its target hashed, not merely named. This
+ * checkout's own `node_modules` proves why rejecting escapes instead is not an
+ * option — `@seam/adapters`, `@seam/bridge` and `@seam/core` are workspace
+ * links that resolve out of `node_modules` into `packages/`, and `.bin` entries
+ * link across packages, so a rule that refused escaping links would refuse
+ * every real host and be a guarantee nobody could satisfy.
+ *
+ * Following is bounded rather than trusted: canonical identity is resolved
+ * first, a target already hashed is referenced instead of re-hashed (which also
+ * terminates cycles), targets outside the declared scope are recorded
+ * explicitly as external roots so a later reader can see what was pulled in,
+ * and the same file/byte limits apply to the whole traversal.
+ *
+ * The stable entrypoint is excluded on purpose: during managed operation it is
+ * a symlink into a release, and its bytes are held and verified separately as
+ * the preserved baseline copy. A link that points AT the entrypoint (the `.bin`
+ * launcher shims do) is recorded as such rather than followed, so the digest
+ * does not change merely because the host is currently activated.
  */
 async function runtimeTreeSnapshot() {
-  const lines = []; let fileCount = 0; let bytes = 0;
-  const record = async (rel, full) => {
+  const lines = []; let fileCount = 0; let bytes = 0; let linkCount = 0;
+  /** canonical path -> the label its content was hashed under. */
+  const hashed = new Map();
+  const externalRoots = [];
+
+  const account = (size) => {
+    fileCount += 1; bytes += size;
+    if (fileCount > MAX_BASELINE_FILES || bytes > MAX_BASELINE_BYTES) fail("baseline_runtime_tree_too_large");
+  };
+  const labelFor = (canonical) => {
+    if (canonical === checkoutPath) return ".";
+    if (canonical.startsWith(`${checkoutPath}/`)) return canonical.slice(checkoutPath.length + 1);
+    return `external:${canonical}`;
+  };
+
+  const emit = async (label, canonical) => {
+    const already = hashed.get(canonical);
+    // Duplicate suppression AND cycle termination: reached again, referenced once.
+    if (already !== undefined) { lines.push(`= ${label} -> ${already}`); return; }
+    hashed.set(canonical, label);
+    const stat = await fsp.lstat(canonical);
+    if (stat.isDirectory()) {
+      lines.push(`d ${label}`);
+      const entries = await fsp.readdir(canonical, { withFileTypes: true });
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) await visit(`${label}/${entry.name}`, path.join(canonical, entry.name));
+      return;
+    }
+    if (!stat.isFile()) fail("baseline_runtime_special_file");
+    account(stat.size);
+    lines.push(`f ${label} ${stat.size} ${hash(await fsp.readFile(canonical))}`);
+  };
+
+  const visit = async (label, full) => {
     if (full === entrypointPath) return;
     const stat = await fsp.lstat(full);
-    if (stat.isSymbolicLink()) { lines.push(`l ${rel} ${await fsp.readlink(full)}`); return; }
-    if (stat.isDirectory()) { lines.push(`d ${rel}`); await walk(full, rel); return; }
-    if (!stat.isFile()) fail("baseline_runtime_special_file");
-    fileCount += 1; bytes += stat.size;
-    if (fileCount > MAX_BASELINE_FILES || bytes > MAX_BASELINE_BYTES) fail("baseline_runtime_tree_too_large");
-    lines.push(`f ${rel} ${stat.size} ${hash(await fsp.readFile(full))}`);
+    if (!stat.isSymbolicLink()) { await emit(label, full); return; }
+    linkCount += 1;
+    const raw = path.resolve(path.dirname(full), await fsp.readlink(full));
+    if (raw === entrypointPath) { lines.push(`l ${label} -> <entrypoint>`); return; }
+    let target;
+    try { target = await fsp.realpath(full); } catch { fail("baseline_runtime_link_unresolvable"); }
+    const targetLabel = labelFor(target);
+    lines.push(`l ${label} -> ${targetLabel}`);
+    if (targetLabel.startsWith("external:") && !hashed.has(target)) externalRoots.push(target);
+    await emit(targetLabel, target);
   };
-  const walk = async (directory, relative) => {
-    const entries = await fsp.readdir(directory, { withFileTypes: true });
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-    for (const entry of entries) await record(`${relative}/${entry.name}`, path.join(directory, entry.name));
-  };
+
   for (const relative of RUNTIME_SCOPE.directories) {
     const full = path.join(checkoutPath, ...relative.split("/"));
     if (!fs.existsSync(full)) { lines.push(`- ${relative}`); continue; }
-    const stat = await fsp.lstat(full);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) fail("baseline_runtime_scope_wrong_type");
-    lines.push(`d ${relative}`); await walk(full, relative);
+    await visit(relative, full);
   }
   for (const relative of RUNTIME_SCOPE.files) {
     const full = path.join(checkoutPath, ...relative.split("/"));
     if (!fs.existsSync(full)) { lines.push(`- ${relative}`); continue; }
-    await record(relative, full);
+    await visit(relative, full);
   }
-  return { digest: hash(Buffer.from(`${lines.join("\n")}\n`, "utf8")), fileCount, bytes };
+  externalRoots.sort();
+  return { digest: hash(Buffer.from(`${lines.join("\n")}\n`, "utf8")), fileCount, bytes, linkCount, externalRoots };
 }
 
 /**
@@ -634,6 +684,11 @@ async function captureBaseline(identity) {
     runtimeTreeDigest: measured.tree.digest,
     runtimeFileCount: measured.tree.fileCount,
     runtimeBytes: measured.tree.bytes,
+    // Symlinks are followed and their targets hashed; these two fields make the
+    // inclusion explicit, so a reader can see how much of the baseline came
+    // from outside the declared scope rather than having to infer it.
+    runtimeLinkCount: measured.tree.linkCount,
+    runtimeExternalRoots: measured.tree.externalRoots,
     bridgeVersion: capabilities.bridgePackage.version,
     protocolVersion: capabilities.protocolVersion,
     drainSigusr2: capabilities.drainSupport,

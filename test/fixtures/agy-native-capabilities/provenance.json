@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "contract": "agy-native-r1",
+  "sanitized": true,
+  "shapeOrigin": {
+    "kind": "observed-native-structural-snapshot",
+    "repository": "jbulpitt/seam-acp",
+    "sourceCommit": "3345a14fee2ac7e3e09aeffd5add6a450c72d0df",
+    "backlogCommit": "b455b0d49650f434848fdda24b7c3d3ab29541d5",
+    "notes": "Field names and cumulative update behavior come from the native StreamAgentStateUpdates subset documented as observed in packages/adapters/src/agy-stream.ts. All text, identifiers, paths, tokens, and binary bytes in these fixtures are synthetic."
+  },
+  "runtime": {
+    "cli": "agy",
+    "cliVersion": "1.1.28",
+    "adapter": "Seam native agy",
+    "adapterProtocol": "in-process ACP facade over native language-server events",
+    "modelId": "fixture-native-model",
+    "modelName": "Fixture Native Model",
+    "modelEvidence": "offline fixture identity only; not a model self-report or live correctness claim"
+  },
+  "evidenceLevels": {
+    "source-confirmed": "The named field or path exists in the reviewed native implementation/source snapshot.",
+    "offline-reproduced": "The production adapter/core path is exercised with this disposable fake runtime and sanitized replay.",
+    "live-verified": "A separately approved disposable provider session observed the behavior. No R1 fixture has this level."
+  },
+  "capabilities": [
+    { "id": "thinking", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
+    { "id": "message-deltas-finalization", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
+    { "id": "read-edit-execute-tools", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
+    { "id": "tool-error-status", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
+    { "id": "usage-context-input", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
+    { "id": "interruption", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
+    { "id": "resume-high-water", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
+    { "id": "embedded-text-binary-attachments", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
+    { "id": "session-scoped-mcp", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false },
+    { "id": "structured-result", "evidence": ["source-confirmed", "offline-reproduced"], "liveVerified": false }
+  ]
+}

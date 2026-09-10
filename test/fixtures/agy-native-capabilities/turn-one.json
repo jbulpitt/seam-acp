@@ -1,0 +1,219 @@
+{
+  "scenario": "turn-one",
+  "conversationId": "11111111-1111-4111-8111-111111111111",
+  "updates": [
+    {
+      "conversationId": "11111111-1111-4111-8111-111111111111",
+      "status": "CASCADE_RUN_STATUS_RUNNING"
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [0],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_USER_INPUT",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "content": "sanitized user input"
+          }]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [1],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_GENERATING",
+            "plannerResponse": {
+              "thinking": "Inspect fixture 🧭",
+              "modifiedResponse": "Res",
+              "messageId": "fixture-message-one"
+            },
+            "metadata": {
+              "generatorModel": "fixture-native-model",
+              "modelUsage": {
+                "model": "fixture-native-model",
+                "inputTokens": "120",
+                "outputTokens": "8",
+                "thinkingOutputTokens": "5",
+                "responseOutputTokens": "3"
+              }
+            }
+          }]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [1],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_GENERATING",
+            "plannerResponse": {
+              "thinking": "Inspect fixture 🧭\nPlan",
+              "modifiedResponse": "Result ",
+              "messageId": "fixture-message-one"
+            },
+            "metadata": {
+              "generatorModel": "fixture-native-model",
+              "modelUsage": {
+                "model": "fixture-native-model",
+                "inputTokens": "140",
+                "outputTokens": "20"
+              }
+            }
+          }]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [1],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_GENERATING",
+            "plannerResponse": {
+              "thinking": "Inspect fixture 🧭\nPlan",
+              "modifiedResponse": "Result ",
+              "messageId": "fixture-message-one"
+            },
+            "metadata": {
+              "generatorModel": "fixture-native-model",
+              "modelUsage": {
+                "model": "fixture-native-model",
+                "inputTokens": "140",
+                "outputTokens": "20"
+              }
+            }
+          }]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [1],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_GENERATING",
+            "plannerResponse": {
+              "thinking": "Inspect fixture 🧭\nPlan",
+              "modifiedResponse": "Result ",
+              "messageId": "fixture-message-one"
+            },
+            "metadata": {
+              "generatorModel": "fixture-native-model",
+              "modelUsage": {
+                "model": "fixture-native-model",
+                "inputTokens": "80",
+                "outputTokens": "20"
+              }
+            }
+          }]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [2],
+          "steps": [{
+            "type": "CORTEX_STEP_TYPE_VIEW_FILE",
+            "status": "CORTEX_STEP_STATUS_RUNNING",
+            "viewFile": {
+              "path": "/sanitized/project/input.txt",
+              "content": "SANITIZED PRIVATE READ OUTPUT"
+            }
+          }]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [2, 3],
+          "steps": [
+            {
+              "type": "CORTEX_STEP_TYPE_VIEW_FILE",
+              "status": "CORTEX_STEP_STATUS_DONE",
+              "viewFile": { "content": "SANITIZED PRIVATE READ OUTPUT" }
+            },
+            {
+              "type": "CORTEX_STEP_TYPE_EDIT_FILE",
+              "status": "CORTEX_STEP_STATUS_WAITING",
+              "editFile": { "patch": "SANITIZED PRIVATE EDIT BODY" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [3, 4],
+          "steps": [
+            {
+              "type": "CORTEX_STEP_TYPE_EDIT_FILE",
+              "status": "CORTEX_STEP_STATUS_DONE",
+              "editFile": { "patch": "SANITIZED PRIVATE EDIT BODY" }
+            },
+            {
+              "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+              "status": "CORTEX_STEP_STATUS_RUNNING",
+              "runCommand": {
+                "command": "printf sanitized",
+                "stdout": "SANITIZED PRIVATE COMMAND OUTPUT"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "mainTrajectoryUpdate": {
+        "stepsUpdate": {
+          "indices": [4, 1],
+          "steps": [
+            {
+              "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+              "status": "CORTEX_STEP_STATUS_ERROR",
+              "runCommand": {
+                "command": "printf sanitized",
+                "stderr": "SANITIZED PRIVATE COMMAND ERROR"
+              }
+            },
+            {
+              "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+              "status": "CORTEX_STEP_STATUS_DONE",
+              "plannerResponse": {
+                "thinking": "Inspect fixture 🧭\nPlan safely\n",
+                "modifiedResponse": "Result one.",
+                "messageId": "fixture-message-one",
+                "stopReason": "end_turn"
+              },
+              "metadata": {
+                "generatorModel": "fixture-native-model",
+                "modelUsage": {
+                  "model": "fixture-native-model",
+                  "inputTokens": "160",
+                  "outputTokens": "40",
+                  "thinkingOutputTokens": "24",
+                  "responseOutputTokens": "16"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "status": "CASCADE_RUN_STATUS_IDLE",
+      "fullyIdle": true,
+      "executableStatus": "EXECUTABLE_STATUS_IDLE",
+      "executorLoopStatus": "EXECUTOR_LOOP_STATUS_IDLE"
+    }
+  ]
+}

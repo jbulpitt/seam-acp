@@ -14,6 +14,8 @@ import {
 import { stageRestartSentinel } from "../packages/core/src/core/restart-sentinel.js";
 import { DELEGATION_TERMINAL_STATUSES } from "../packages/core/src/core/types.js";
 import type { Logger } from "../packages/core/src/lib/logger.js";
+import { writeLiveMarker, listLiveMarkers } from "../packages/core/src/core/dispatch/turn-resume.js";
+import { fixtureModelCatalog } from "./model-catalog-fixture.js";
 
 const silent = pino({ level: "silent" }) as unknown as Logger;
 
@@ -114,6 +116,7 @@ describe("#180 channel queue fencing", () => {
       invalidate: vi.fn(async () => undefined),
     };
     const host = new Orchestrator({
+      modelCatalog: fixtureModelCatalog([]),
       logger: silent,
       config: {
         DATA_DIR: dir,
@@ -433,6 +436,25 @@ describe("#180 channel queue fencing", () => {
       expect.objectContaining({ messageId: "8", text: "boot replay", state: "pending" })
     );
   });
+
+  it("does not replay a started human prompt or consume its only session marker (#250)", async () => {
+    const { host } = makeHost();
+    expect(admit("9", "already submitted original work")).toBe(true);
+    store.claimInbound("9", 0, new Date().toISOString());
+    await writeLiveMarker(dir, {
+      id: "live-started", kind: "live", channelRef: "100", sessionRecordId: "discord:100",
+      acpSessionId: "acp-1", startedUtc: new Date().toISOString(),
+      inboundMessageId: "9", promptStarted: true,
+    } as any);
+    const recovered = vi.fn();
+    (host as any).startRecoveredInbound = recovered;
+    await host.recoverInterruptedTurns();
+    // Without a durable execution identity, retain the legacy job for explicit
+    // reconciliation; neither repeat its original task nor discard the marker.
+    expect(recovered).not.toHaveBeenCalled();
+    expect((await listLiveMarkers(dir)).map(m => m.id)).toContain("live-started");
+    expect(store.getInbound("9")?.state).not.toBe("completed");
+  });
 });
 
 describe("#180 dispatch and restart recovery", () => {
@@ -491,6 +513,7 @@ describe("#180 dispatch and restart recovery", () => {
 
     const { host, router } = (() => {
       const host = new Orchestrator({
+        modelCatalog: fixtureModelCatalog([]),
         logger: silent,
         config: {
           DATA_DIR: dir,
@@ -802,6 +825,7 @@ describe("#180 dispatch and restart recovery", () => {
     };
     store.upsert(record);
     const host = new Orchestrator({
+      modelCatalog: fixtureModelCatalog([]),
       logger: silent,
       config: {
         DATA_DIR: dir,
@@ -844,6 +868,7 @@ describe("#180 dispatch and restart recovery", () => {
   it("allows the established ManageGuild fallback when config-admin ids are unset", async () => {
     const { host } = (() => {
       const host = new Orchestrator({
+        modelCatalog: fixtureModelCatalog([]),
         logger: silent,
         config: {
           DATA_DIR: dir,

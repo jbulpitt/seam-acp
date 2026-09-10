@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { TurnAttemptStore } from "./dispatch/attempt-store.js";
+import { TurnAttemptStore, inboundAttemptId } from "./dispatch/attempt-store.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -2621,6 +2621,11 @@ export class SessionStore {
       // A normal Discord message is a priority replacement, not FIFO. Make
       // that intent durable in the same commit as the new admission so boot
       // recovery cannot resurrect the turn it superseded.
+      for (const old of this.db.prepare(`SELECT message_id FROM inbound_admissions
+        WHERE channel_ref=? AND message_id<>? AND state IN ('pending','running')`)
+        .all(input.channelRef, input.messageId) as { message_id: string }[]) {
+        this.turnAttempts.cancel(inboundAttemptId(old.message_id));
+      }
       this.db
         .prepare(
           `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?
@@ -2685,6 +2690,14 @@ export class SessionStore {
     return result.changes === 1;
   }
 
+  /** Boot settlement requires the durable execution winner, not a stale queue epoch. */
+  settleInboundExecution(messageId: string): void {
+    const a = this.turnAttempts.get(inboundAttemptId(messageId));
+    if (!a || (a.state !== "completed" && a.state !== "cancelled")) return;
+    this.db.prepare("UPDATE inbound_admissions SET state='completed', updated_utc=? WHERE message_id=?")
+      .run(new Date().toISOString(), messageId);
+  }
+
   /**
    * Reconcile one thread after a crash or an operator fence. Ordinary user
    * messages are replacement semantics, so only the newest nonterminal row is
@@ -2701,6 +2714,9 @@ export class SessionStore {
         .all(channelRef);
       const newest = rows.at(-1);
       if (!newest) return null;
+      for (const old of rows) {
+        if (old.message_id !== newest.message_id) this.turnAttempts.cancel(inboundAttemptId(old.message_id));
+      }
       this.db
         .prepare(
           `UPDATE inbound_admissions SET state = 'completed', updated_utc = ?

@@ -6,6 +6,8 @@
     "packages/bridge/src/**/*.ts",
     "test/restart-attempt.test.ts",
     "test/restart-dispatch-lifecycle.test.ts",
+    "test/restart-inbound-lifecycle.test.ts",
+    "test/channel-queue-recovery.test.ts",
     "test/turn-resume-inject.test.ts",
     "test/turn-resume-flow.test.ts",
     "test/session-router-idle-reaper.test.ts",
